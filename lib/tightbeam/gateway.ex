@@ -164,7 +164,14 @@ defmodule Tightbeam.Gateway do
     provision_host_endpoints(db, config, cli_token)
     cli_bin = install_cli_bin(config.base_dir)
     defaults = defaults(config, db)
-    on_terminal = fn session_key, seq -> Supervision.notify_terminal(session_key, seq) end
+    # Post-commit recognition, in order: the bubble production first (a failed
+    # turn may need telling upward; spec production-machine-v1 §Fault
+    # bubbling), then the turn-end shift. Both recognize the same committed
+    # terminal; neither depends on the other.
+    on_terminal = fn session_key, seq ->
+      Tightbeam.Productions.Bubble.recognize_terminal(db, seq)
+      Supervision.notify_terminal(session_key, seq)
+    end
 
     on_retired = fn session_key ->
       Supervision.notify_retired(session_key)
@@ -976,7 +983,8 @@ defmodule Tightbeam.Gateway do
             role_ref: role_ref || opts[:role_ref],
             role_fallback: role_fallback || opts[:role_fallback] || false,
             assignment_id: assignment_id,
-            job_ref: job_ref
+            job_ref: job_ref,
+            request_ref: opts[:request_ref]
           })
 
         case enqueued do

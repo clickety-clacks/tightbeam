@@ -63,25 +63,25 @@ defmodule Tightbeam.ConditionFacts do
   end
 
   defp file_admitted_in_txn(txn, kind, origin, input) do
-      ts = System.system_time(:millisecond)
-      scope = Map.get(input, :scope)
+    ts = System.system_time(:millisecond)
+    scope = Map.get(input, :scope)
 
-      Txn.q(
-        txn,
-        "INSERT INTO condition_facts (ts, kind, scope, origin) VALUES (?1, ?2, ?3, ?4)",
-        [ts, kind, scope, origin]
-      )
+    Txn.q(
+      txn,
+      "INSERT INTO condition_facts (ts, kind, scope, origin) VALUES (?1, ?2, ?3, ?4)",
+      [ts, kind, scope, origin]
+    )
 
-      [[fact_id]] = Txn.q(txn, "SELECT last_insert_rowid()")
+    [[fact_id]] = Txn.q(txn, "SELECT last_insert_rowid()")
 
-      EventLog.lifecycle_in_txn(
-        txn,
-        "condition_fact_filed",
-        to_string(fact_id),
-        "kind=#{kind} scope=#{scope || "nil"} by=#{origin}"
-      )
+    EventLog.lifecycle_in_txn(
+      txn,
+      "condition_fact_filed",
+      to_string(fact_id),
+      "kind=#{kind} scope=#{scope || "nil"} by=#{origin}"
+    )
 
-      %{fact_id: fact_id, ts: ts, kind: kind, scope: scope, origin: origin}
+    %{fact_id: fact_id, ts: ts, kind: kind, scope: scope, origin: origin}
   end
 
   @spec file_idempotent(DB.server(), GenServer.server(), map()) :: map() | {:error, map()}

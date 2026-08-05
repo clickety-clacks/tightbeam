@@ -25,3 +25,4 @@ tightbeam-*.tar
 
 
 doc/
+.claude/worktrees/

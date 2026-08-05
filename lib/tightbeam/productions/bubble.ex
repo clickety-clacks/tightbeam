@@ -1,0 +1,273 @@
+defmodule Tightbeam.Productions.Bubble do
+  @moduledoc """
+  The fault-bubbling production (spec production-machine-v1 §Fault bubbling).
+
+  This module is one rule of a Newell production machine: a declared left-hand
+  side over durable working memory (`bubble_production_matches?/4`) and a
+  procedural right-hand side (`climb/3`). It is NOT an obligation of the
+  failing turn — the turn's own session already has the row, the reason and
+  the marker by the time this fires; deleting this module would not touch
+  those three. It RECOGNIZES a terminal row and tells someone who can act.
+
+  Who can act is never guessed — it is demonstrated. A notice to a parent is
+  itself a turn; its terminal state is the evidence. `delivered` ends the
+  climb (the recipient demonstrably ran a turn; what to do next is its
+  judgment). `failed`, `canceled` and `failed_unknown` all continue it — each
+  is a recipient not SHOWN able. The climb carries its cause as
+  `turns.requestRef = "bubble:<cause_seq>"`, and every rung re-derives the
+  prose from the cause turn's row: no prose is ever parsed, prose is
+  presentation. Exactly-once per (cause, recipient) rides `turns.wakeId`
+  UNIQUE with a deterministic key.
+
+  The terminal rung is not a turn. When the lineage is exhausted, the alert
+  to the owner is a substrate-authored wire message — store-and-push, no
+  model, no tokens, structurally incapable of sharing the failure mode that
+  caused the climb — and the standing `user-alerted` fact (scope: the owner
+  USER id, never a composed session key) records that the user has been told.
+  While it stands, failures under that owner do not re-climb. The first
+  DELIVERED turn for any of the owner's sessions is the observed proof that
+  capacity exists, and retracts it. Recovery is recognized, never declared.
+  """
+
+  alias Tightbeam.{ConditionFacts, DB, EventLog, Gateway}
+
+  require Logger
+
+  @bubbling_terminals ~w(failed failed_unknown)
+  @climbing_notice_terminals ~w(failed canceled failed_unknown)
+  @lineage_hop_limit 32
+
+  @doc """
+  Post-commit recognition site for every terminal transition, wired through
+  the lane's existing `on_terminal` hook — which also fires from the
+  republish sweep, so boot-recovered `failed_unknown` rows and retire-drained
+  `canceled` rows are recognized without their own sites. The row is already
+  committed truth; this only recognizes it. Safe to call for every terminal
+  and safe to call twice: the LHS decides, and the enqueue dedupes.
+  """
+  @spec recognize_terminal(DB.server(), integer()) :: :ok
+  def recognize_terminal(db, seq) do
+    case turn_context(db, seq) do
+      %{status: status} = turn -> recognize(db, seq, status, turn)
+      nil -> :ok
+    end
+  end
+
+  defp recognize(db, seq, "delivered", turn) do
+    # Retraction is observed, not declared: a delivered turn is proof the
+    # owner has capacity. Guarded by the cheap any?/2 read because almost
+    # every database has never filed a user-alerted fact and this runs on
+    # every delivered turn.
+    if ConditionFacts.any?(db, "user-alerted") and
+         ConditionFacts.standing?(db, "user-alerted", turn.owner) do
+      file_fact(db, "user-alert-cleared", turn.owner)
+
+      EventLog.lifecycle(
+        db,
+        "user_alert_cleared",
+        turn.owner,
+        "observed delivered turn seq=#{seq}"
+      )
+    end
+
+    :ok
+  end
+
+  defp recognize(db, seq, terminal, turn) do
+    if bubble_production_matches?(db, seq, terminal, turn) do
+      climb(db, seq, turn)
+    else
+      :ok
+    end
+  end
+
+  @doc """
+  The production's complete LHS, in one site, over durable state only (spec
+  production-machine-v1 §Legibility): the terminal starts or continues a
+  bubble ∧ the turn's session exists (the context read answered) ∧ no
+  standing `user-alerted` fact for the owner. Where to climb TO is the RHS's
+  problem — a parentless cause session matches and then ends silently,
+  because its own marker already told the only audience there is.
+
+  Terminal admission, decided per state: `failed` and `failed_unknown` start
+  a bubble — the work not happening with nobody having decided that. A
+  `canceled` CAUSE turn never starts one: cancellation IS a decision, made by
+  an authority, and bubbling it would report a decision as a fault. A
+  `canceled` NOTICE still climbs — the underlying fault remains untold.
+  """
+  @spec bubble_production_matches?(DB.server(), integer(), String.t(), map()) :: boolean()
+  def bubble_production_matches?(db, _seq, terminal, turn) do
+    terminal_admits?(terminal, turn.notice?) and
+      not ConditionFacts.standing?(db, "user-alerted", turn.owner)
+  end
+
+  defp terminal_admits?(terminal, notice?) do
+    if notice?,
+      do: terminal in @climbing_notice_terminals,
+      else: terminal in @bubbling_terminals
+  end
+
+  # RHS. Find the nearest ACTIVE ancestor of the session the terminal landed
+  # in and enqueue the notice there; with none left, the terminal rung fires.
+  # A parentless cause session is its own terminal rung MINUS the alert: the
+  # marker already in its stream IS the user notice (spec §Fault bubbling 2),
+  # so a fresh bubble with no parent ends silently — but a NOTICE that died in
+  # a parentless session means the climb exhausted, and that is the alert.
+  defp climb(db, _seq, turn) do
+    case next_active_ancestor(db, turn.session_key) do
+      nil ->
+        if turn.notice?, do: terminal_alert(db, turn), else: :ok
+
+      recipient ->
+        enqueue_notice(db, turn, recipient)
+    end
+  end
+
+  defp enqueue_notice(db, turn, recipient) do
+    cause = cause_row(db, turn.cause_seq)
+
+    prompt =
+      "Turn #{turn.cause_seq} in #{cause.session_key} could not run: " <>
+        "#{cause.error || "reason unrecorded"}. You are the nearest ancestor " <>
+        "shown able to run a turn. What to do about it is your judgment."
+
+    result =
+      Gateway.deliver_prompt(recipient, "process:tightbeam", prompt,
+        db: db,
+        sender: "process:tightbeam",
+        device_id: "process:tightbeam",
+        client_message_id: "bubble:#{turn.cause_seq}:#{recipient}",
+        wake_id: "bubble:#{turn.cause_seq}:#{recipient}",
+        request_ref: "bubble:#{turn.cause_seq}"
+      )
+
+    case result do
+      # :duplicate is the dedupe working — a crash between recognition and
+      # enqueue re-attempted into the UNIQUE key, exactly as designed.
+      r when r in [:appended, :duplicate] -> :ok
+      # :skipped means the target evaporated between our read and the
+      # delivery transaction. The notice turn was never created, so nothing
+      # will terminalize and continue the climb — do it now.
+      :skipped -> climb(db, turn.cause_seq, %{turn | session_key: recipient, notice?: true})
+      _ -> :ok
+    end
+  end
+
+  # The terminal rung. Ordering is deliberate: the user is TOLD first, the
+  # fact files second — a crash between them re-alerts on the next failure (a
+  # duplicate sentence), where the other order would file suppression without
+  # anyone having been told (a silent fault, the one unforgivable outcome).
+  defp terminal_alert(db, turn) do
+    cause = cause_row(db, turn.cause_seq)
+
+    EventLog.notice(
+      db,
+      "lineage_exhausted",
+      turn.owner,
+      "cause_seq=#{turn.cause_seq} session=#{cause.session_key}",
+      audience: {:ambient, turn.owner},
+      message:
+        "[no agent can act]\n\nWork owned by you cannot run, and no agent in " <>
+          "its lineage could be told: every ancestor's notice turn also " <>
+          "failed. Original failure — turn #{turn.cause_seq} in " <>
+          "#{cause.session_key}: #{cause.error || "reason unrecorded"}. " <>
+          "Tightbeam will not repeat this alert until a turn is observed to " <>
+          "run; fix the cause (credentials, quota, model) and any turn " <>
+          "delivering clears it.",
+      attention: :high
+    )
+
+    file_fact(db, "user-alerted", turn.owner)
+    :ok
+  end
+
+  # One read serving both the LHS and the RHS: the turn row joined to its
+  # session's lineage and owner. `cause_seq` is the ORIGINAL failed turn —
+  # this turn's own seq unless its requestRef marks it as a rung of an
+  # existing climb.
+  defp turn_context(db, seq) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT t.sessionKey, t.requestRef, s.ownerUserId, t.status
+        FROM turns AS t JOIN sessions AS s ON s.sessionKey = t.sessionKey
+        WHERE t.seq = ?1
+        """,
+        [seq]
+      )
+
+    case rows do
+      [[session_key, request_ref, owner, status]] ->
+        cause_seq = parse_cause_seq(request_ref, seq)
+
+        %{
+          session_key: session_key,
+          owner: owner,
+          status: status,
+          cause_seq: cause_seq,
+          notice?: cause_seq != seq
+        }
+
+      [] ->
+        nil
+    end
+  end
+
+  defp parse_cause_seq("bubble:" <> cause, seq) do
+    case Integer.parse(cause) do
+      {cause_seq, ""} -> cause_seq
+      # A malformed marker is dirt: report it, treat the turn as its own
+      # cause rather than climbing on a reference that names nothing.
+      _ -> seq
+    end
+  end
+
+  defp parse_cause_seq(_other, seq), do: seq
+
+  defp cause_row(db, cause_seq) do
+    {:ok, rows} =
+      DB.query(db, "SELECT sessionKey, error FROM turns WHERE seq = ?1", [cause_seq])
+
+    case rows do
+      [[session_key, error]] -> %{session_key: session_key, error: error}
+      [] -> %{session_key: "unknown", error: nil}
+    end
+  end
+
+  # First ancestor with an ACTIVE session row, walking spawnedBy. A missing
+  # or retired rung is climbed past — it can never run a turn, which is the
+  # same fact a canceled notice proves, learned one enqueue cheaper.
+  defp next_active_ancestor(db, session_key, hops \\ 0)
+  defp next_active_ancestor(_db, _session_key, hops) when hops > @lineage_hop_limit, do: nil
+
+  defp next_active_ancestor(db, session_key, hops) do
+    case DB.query(db, "SELECT spawnedBy FROM sessions WHERE sessionKey = ?1", [session_key]) do
+      {:ok, [[parent]]} when is_binary(parent) ->
+        case DB.query(db, "SELECT state FROM sessions WHERE sessionKey = ?1", [parent]) do
+          {:ok, [["active"]]} -> parent
+          _ -> next_active_ancestor(db, parent, hops + 1)
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  defp file_fact(db, kind, scope) do
+    case DB.transaction(db, fn txn ->
+           ConditionFacts.file_in_txn(txn, %{
+             kind: kind,
+             scope: scope,
+             origin: "process:tightbeam"
+           })
+         end) do
+      {:ok, %{fact_id: _}} ->
+        :ok
+
+      other ->
+        Logger.error("bubble could not file #{kind} for #{scope}: #{inspect(other)}")
+        :ok
+    end
+  end
+end

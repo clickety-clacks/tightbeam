@@ -47,10 +47,11 @@ defmodule Tightbeam.TurnObservations do
   because that read is itself long enough to cross the deadline.
 
   The window is DELIBERATELY NOT DURABLE. A window that outlives the turn that
-  opened it has no value, so `turns.requestRef` — the ledger's declared-unused
-  slot named as its possible durable home — stays unused: restart-survival would
-  buy nothing, and the slot is keyed by turn while a window must be keyed by
-  session and outlive its own turn's terminalization.
+  opened it has no value, so it never took `turns.requestRef` (once named as
+  its possible durable home; since claimed by the fault bubble,
+  production-machine-v1): restart-survival would buy nothing, and the slot is
+  keyed by turn while a window must be keyed by session and outlive its own
+  turn's terminalization.
 
   Unavailability degrades to a weaker evidence class and never to a refusal.
   `artifact-record` fails OPEN (R1): if this process is gone, the record still

@@ -109,8 +109,8 @@ defmodule Tightbeam.Ledger do
         """
           INSERT INTO turns
             (sessionKey, messageId, wakeId, origin, prompt, roleRef, roleFallback,
-             assignmentId, jobRef, createdAt)
-          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             assignmentId, jobRef, requestRef, createdAt)
+          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
         """,
         [
           session_key,
@@ -122,6 +122,7 @@ defmodule Tightbeam.Ledger do
           if(Map.get(attrs, :role_fallback, false), do: 1, else: 0),
           Map.get(attrs, :assignment_id),
           Map.get(attrs, :job_ref),
+          Map.get(attrs, :request_ref),
           now
         ]
       )
