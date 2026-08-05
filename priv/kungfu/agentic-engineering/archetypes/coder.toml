@@ -10,5 +10,7 @@ text = """
 
 #include "preferred-models.md"
 
+#include "model-policy.md"
+
 #include "coder.md"
 """
