@@ -1327,7 +1327,10 @@ defmodule Tightbeam.ModelCatalogTest do
       # Only selectable models survive, and the fixture's refused ones are gone.
       assert "claude-haiku-4-5-20251001" in families
       refute "claude-opus-5" in families
-      refute "claude-fable-5" in families
+      # Re-measured 2026-08-05 on gibson (CLI 2.1.221, production grant):
+      # fable answers a real prompt; the July REJECTED row was one
+      # environment's snapshot. Fable is now offered.
+      assert "claude-fable-5" in families
       refute "claude-sonnet-4-6" in families
 
       assert Enum.all?(families, &(&1 in Tightbeam.Harness.Claude.adapter_selectable_models())),

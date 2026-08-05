@@ -151,15 +151,19 @@ defmodule Tightbeam.HarnessSeamTest do
   test "the recorded claude model vocabulary never substitutes a refused model" do
     selectable = Tightbeam.Harness.Claude.adapter_selectable_models()
 
-    # Recorded live 2026-07-26 (claude CLI 2.1.220 / claude-agent-acp 0.59.0):
-    # the four aliases plus exactly the three ids those aliases resolve to.
+    # Recorded live 2026-07-26 (claude CLI 2.1.220 / claude-agent-acp 0.59.0);
+    # fable added 2026-08-05 after a live re-measurement on gibson (CLI 2.1.221,
+    # the production grant) answered a real prompt on claude-fable-5 — the July
+    # REJECTED row was one environment's snapshot, not an account property.
     assert Enum.sort(selectable) ==
-             Enum.sort(~w(default sonnet opus haiku claude-sonnet-5 claude-opus-4-8
-                          claude-haiku-4-5-20251001))
+             Enum.sort(~w(default sonnet opus haiku fable claude-sonnet-5 claude-opus-4-8
+                          claude-haiku-4-5-20251001 claude-fable-5))
 
     # Values the adapter REFUSES must never appear here — listing one would make the
-    # gateway offer a model the adapter cannot select.
-    for refused <- ~w(fable claude-fable-5 claude-opus-5 claude-opus-4-7 claude-sonnet-4-6
+    # gateway offer a model the adapter cannot select. Fable left this list
+    # 2026-08-05: measured answering a real prompt on gibson with the production
+    # grant, so the July refusal was environmental, not categorical.
+    for refused <- ~w(claude-opus-5 claude-opus-4-7 claude-sonnet-4-6
                       claude-opus-4-6 claude-opus-4-5-20251101 claude-sonnet-4-5-20250929
                       claude-opus-4-1-20250805) do
       refute refused in selectable,

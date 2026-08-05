@@ -74,8 +74,16 @@ defmodule Tightbeam.Harness.Claude do
   # set_config_option (-32602 for `gpt-5.1-codex`) while accepting codex-native
   # slugs (`gpt-5.6-sol` ran a real turn). Codex's api-key catalog now carries
   # its own `@adapter_selectable_models` guard on this precedent.
-  @adapter_selectable_models ~w(default sonnet opus haiku claude-sonnet-5 claude-opus-4-8
-                                claude-haiku-4-5-20251001)
+  # RE-MEASURED 2026-08-05 on gibson (claude CLI 2.1.221, the production grant):
+  # `claude -p --model claude-fable-5` answered a real prompt — the 2026-07-26
+  # REJECTED row for fable was one environment's snapshot, not a property of the
+  # account or the CLI (Flynn was literally talking to Fable while this table
+  # said his account could not). The offered list is environment-dependent
+  # (JOURNAL.md:804); the projected-home model pin (ops-hardening-v1 §3) is what
+  # makes it deterministic. Keep re-probing per the note above before trusting
+  # any row here, in either direction.
+  @adapter_selectable_models ~w(default sonnet opus haiku fable claude-sonnet-5
+                                claude-opus-4-8 claude-haiku-4-5-20251001 claude-fable-5)
 
   @doc """
   Model values this adapter version accepts at `session/set_config_option`.
@@ -237,11 +245,31 @@ defmodule Tightbeam.Harness.Claude do
 
   @impl true
   def reconcile_home(target, home, desired) do
+    # THE FABLE FIX (ops-hardening-v1 §3): claude's offered-model list is
+    # environment-dependent — the same home and auth offers fable at a cwd whose
+    # settings file pins it and not at a bare one (JOURNAL.md:804) — so every
+    # projected home pins the org's default model, making the offered list
+    # deterministic. Harness-owned, because WHICH config key means "model" and
+    # how a model is spelled there is this harness's business and nobody
+    # else's (the seam scan enforces exactly that). Merged with the rails hooks
+    # because both land in the same file; either side may be absent.
+    #
+    # Hash consequence: homes regenerate once on the deploy that first carries
+    # this (identity change — context-reset markers will show; expected).
+    # Binary rails are OPAQUE — the pre-map contract, still used by tests — and
+    # pass through untouched (no pin can be merged into bytes we do not parse).
+    # The production path always arrives here as a map (Rails.hook_settings/0)
+    # or nil, and those take the pin.
     rails =
-      case desired.rails do
-        nil -> nil
-        bytes when is_binary(bytes) -> bytes
-        settings -> JSON.encode!(settings)
+      case {desired.rails, Map.get(desired, :default_model)} do
+        {bytes, _model} when is_binary(bytes) ->
+          bytes
+
+        {map_or_nil, nil} ->
+          map_or_nil && JSON.encode!(map_or_nil)
+
+        {map_or_nil, model} ->
+          JSON.encode!(Map.put(map_or_nil || %{}, "model", packed_model(model)))
       end
 
     desired = %{desired | rails: rails}
@@ -251,6 +279,9 @@ defmodule Tightbeam.Harness.Claude do
       rails_filename: "settings.json"
     )
   end
+
+  defp packed_model(%Model{family: family, context: nil}), do: family
+  defp packed_model(%Model{family: family, context: context}), do: "#{family}[#{context}]"
 
   @impl true
   def materialize_skills(target, cwd, snapshot) do

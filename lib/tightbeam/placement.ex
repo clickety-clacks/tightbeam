@@ -1176,6 +1176,7 @@ defmodule Tightbeam.Placement do
         harness: harness,
         machine: host,
         rails: Rails.hook_settings(),
+        default_model: Map.get(config, :default_model),
         auth_dir:
           Tightbeam.Credentials.store_dir(
             host_config.base_dir,
