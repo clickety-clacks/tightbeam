@@ -1717,6 +1717,9 @@ defmodule Tightbeam.ClientE2ETest do
         harness: harness,
         provider: :anthropic,
         adapter: :present,
+        # The executability axis (O5/I6) is a mandatory row key now; these gate
+        # fixtures block on the adapter axis, so the binary stays runnable.
+        binary: :runnable,
         credential: :live,
         model: :selectable,
         runnable?: true
