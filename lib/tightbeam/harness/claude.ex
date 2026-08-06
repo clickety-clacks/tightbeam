@@ -18,7 +18,7 @@ defmodule Tightbeam.Harness.Claude do
   #
   # The derived catalog for claude comes from the Anthropic API (`fetch_catalog/1` hits
   # `/v1/models`), which currently lists 11 models. The claude ACP adapter's
-  # `session/set_config_option {configId: "model"}` accepts only SEVEN values, and the
+  # `session/set_config_option {configId: "model"}` accepts only TEN values, and the
   # adapter seam renders the identity verbatim — family plus the vendor's context variant,
   # with our effort on its own config option — so there is NO translation layer to fix. A model
   # the adapter refuses fails the apply, which runs after EVERY `session/new` and every
@@ -37,11 +37,17 @@ defmodule Tightbeam.Harness.Claude do
   #   ACCEPTED  id `claude-sonnet-5`
   #   ACCEPTED  id `claude-opus-4-8`
   #   ACCEPTED  id `claude-haiku-4-5-20251001`
-  #   REJECTED  claude-opus-5, claude-fable-5, claude-opus-4-7, claude-sonnet-4-6,
-  #             claude-opus-4-6, claude-opus-4-5-20251101, claude-sonnet-4-5-20250929,
-  #             claude-opus-4-1-20250805, and the bare alias `fable`
+  #   ACCEPTED  alias `fable` / id `claude-fable-5`  (re-measured 2026-08-05; July
+  #             refusal was environmental — the projected-home pin offers it)
+  #   ACCEPTED  id `claude-opus-5`  (re-measured 2026-08-06; the REJECTED row below
+  #             measured the DEFAULT-PIN vocabulary, not the grant — a pin-probed
+  #             home offered+accepted it and a live prompt answered as Opus 5)
+  #   REJECTED  claude-opus-4-7, claude-sonnet-4-6, claude-opus-4-6,
+  #             claude-opus-4-5-20251101, claude-sonnet-4-5-20250929,
+  #             claude-opus-4-1-20250805
   #
-  # The accepted ids are EXACTLY the three models the aliases currently resolve to. So
+  # The accepted ids were EXACTLY the models the aliases resolved to until the pin
+  # lesson (fable, then opus-5) showed the offered set follows the HOME PIN. So
   # this is not an API-vs-CLI version lag that a mapping table can paper over: the
   # adapter only accepts the models it is presently offering, by either name.
   #
@@ -82,8 +88,17 @@ defmodule Tightbeam.Harness.Claude do
   # (JOURNAL.md:804); the projected-home model pin (ops-hardening-v1 §3) is what
   # makes it deterministic. Keep re-probing per the note above before trusting
   # any row here, in either direction.
+  # RE-MEASURED 2026-08-06 on gibson (adapter 0.59.0, the production grant):
+  # a pin-probe home (settings.json model=claude-opus-5) OFFERED and ACCEPTED
+  # claude-opus-5, and a live prompt through the production adapter+credential
+  # answered as Opus 5 — the 2026-07-26 REJECTED row for opus-5 was, like
+  # fable's, one environment's snapshot ("refused on this grant" measured a
+  # default-pin vocabulary, not the grant; the operator's own picker offered
+  # Opus 5 all along). Same lesson, second occurrence: re-probe from a second
+  # vantage before trusting any row here, in either direction.
   @adapter_selectable_models ~w(default sonnet opus haiku fable claude-sonnet-5
-                                claude-opus-4-8 claude-haiku-4-5-20251001 claude-fable-5)
+                                claude-opus-4-8 claude-haiku-4-5-20251001 claude-fable-5
+                                claude-opus-5)
 
   @doc """
   Model values this adapter version accepts at `session/set_config_option`.
