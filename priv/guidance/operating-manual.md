@@ -114,8 +114,8 @@ with `tightbeam assignments --role <your-role>`.
 
 - Record what you produced OUTSIDE your workdir as an artifact:
 
-    tightbeam artifact-record --kind report --title "nginx config on shrdlu" \
-      --path "shrdlu:/etc/nginx/sites-enabled/app" --work-item <workItemId>
+    tightbeam artifact-record --kind report --title "nginx config on host-b" \
+      --path "host-b:/etc/nginx/sites-enabled/app" --work-item <workItemId>
 
 Tightbeam sees the files you write in your own workdir. Work on another machine, in a
 service, or in a conversation is invisible until you point at it — an artifact row is how

@@ -1,5 +1,4 @@
 name = "recon"
-where = ["eezo", "racter"]
 skills = ["recon-first-investigation", "recon-lifecycle", "bug-provenance"]
 
 [guidance]
