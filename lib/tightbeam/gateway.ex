@@ -390,13 +390,14 @@ defmodule Tightbeam.Gateway do
   (`credential_child/4`), invoked by `credentials.ex` at onboarding-commit
   success with the committed provider. On a credential commit for
   `{machine, provider}` it files the substrate-observed `credential-present`
-  condition-fact — the durable transition record (I5) — and pokes the catalog
-  to re-derive that provider's harnesses NOW (O4). Filed via a plain
-  transaction, never `Wakes.fire_matching`: this fact drives a GenServer
-  re-derivation, not a session wake. Public and parameterized by the catalog
-  server so the injector is exercisable without driving a full ceremony; the
-  fact is best-effort (a dropped one self-heals via the catalog's TTL sweep),
-  so a filing error is logged, not raised into the commit.
+  condition-fact — the durable transition record (I5) — via a plain transaction
+  (never `Wakes.fire_matching`, which targets sessions), then POST-COMMIT hands
+  the fact to the `CatalogRederive` production, which recognizes it and
+  re-derives the catalog. The credential code triggers the PRODUCTION, never
+  `ModelCatalog` directly — that is the I5 line. Public and parameterized by the
+  catalog server so the injector is exercisable without driving a full ceremony;
+  the fact is best-effort (a dropped edge self-heals via the catalog's TTL
+  sweep), so a filing error is logged, not raised into the commit.
   """
   @spec credential_present_hook(DB.server(), String.t(), GenServer.server()) :: (atom() -> :ok)
   def credential_present_hook(db, machine, catalog \\ ModelCatalog) do
@@ -410,14 +411,13 @@ defmodule Tightbeam.Gateway do
                origin: "process:tightbeam"
              })
            end) do
-        {:ok, %{fact_id: _}} ->
-          :ok
+        {:ok, %{fact_id: fact_id}} ->
+          Tightbeam.Productions.CatalogRederive.recognize(db, catalog, fact_id)
 
         other ->
           Logger.error("credential-present fact for #{scope} not filed: #{inspect(other)}")
       end
 
-      ModelCatalog.credential_present(machine, provider, catalog)
       :ok
     end
   end

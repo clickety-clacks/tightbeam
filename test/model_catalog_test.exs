@@ -1645,6 +1645,74 @@ defmodule Tightbeam.ModelCatalogTest do
       # ...and placement is usable within T_derive, no restart, no TTL wait.
       await(fn -> match?({:ok, _}, ModelCatalog.route(@host, "claude", opus_high, catalog)) end)
     end
+
+    # F1 (build-to-spec): the re-derivation is a NAMED PRODUCTION that RECOGNIZES
+    # the credential-present fact (Tightbeam.Productions.CatalogRederive), never an
+    # imperative refresh. Proof it is fact-driven, not the imperative refusal
+    # I5/N2 decline: recognition re-derives ONLY when the fact is present — its
+    # LHS gates on the durable fact. An imperative design would re-derive
+    # regardless of the fact; this does not (refute below), and does once the
+    # fact is filed (assert below).
+    test "CatalogRederive re-derives only when the credential-present fact is present (fact-driven)",
+         ctx do
+      Tightbeam.Schema.ensure_all(ctx.db)
+      test_pid = self()
+
+      present? =
+        start_supervised!(%{
+          id: unique_name(:present),
+          start: {Agent, :start_link, [fn -> false end]}
+        })
+
+      status = fn _provider ->
+        if Agent.get(present?, & &1), do: :onboarded, else: {:needs_onboarding, :missing}
+      end
+
+      probing_fetch = fn path, headers ->
+        send(test_pid, {:claude_probed, path})
+        ctx.claude_fetch.(path, headers)
+      end
+
+      catalog =
+        start_catalog(ctx,
+          ttl_ms: :timer.minutes(15),
+          now: fn -> 0 end,
+          credential_status: status,
+          claude_fetch: probing_fetch
+        )
+
+      await(fn ->
+        match?(
+          {[], {:unavailable, {:needs_onboarding, :missing}}},
+          ModelCatalog.get(@host, "claude", catalog)
+        )
+      end)
+
+      Agent.update(present?, fn _ -> true end)
+
+      # No credential-present fact exists: recognizing a fact id that names none
+      # reads no row, so the LHS does NOT match and recognition is a no-op — NO
+      # re-derivation, even though the credential is now live. An imperative
+      # refresh would fire here regardless; a fact-driven production does not.
+      assert :ok = Tightbeam.Productions.CatalogRederive.recognize(ctx.db, catalog, 999_999)
+      refute_receive {:claude_probed, _}, 300
+
+      # File the credential-present fact; recognizing its id re-derives — and the
+      # {host, provider} come FROM the fact, not the caller. The FACT is the
+      # trigger and the source.
+      {:ok, %{fact_id: fact_id}} =
+        Tightbeam.DB.transaction(ctx.db, fn txn ->
+          Tightbeam.ConditionFacts.file_in_txn(txn, %{
+            kind: "credential-present",
+            scope: "#{@host}:anthropic",
+            origin: "process:tightbeam"
+          })
+        end)
+
+      Tightbeam.Productions.CatalogRederive.recognize(ctx.db, catalog, fact_id)
+
+      assert_receive {:claude_probed, "/v1/models?limit=100"}, 2_000
+    end
   end
 
   defp await(_fun, 0), do: flunk("condition did not become true")
