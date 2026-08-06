@@ -6,7 +6,7 @@ it. Capsule characterizations and effort brackets live in `preferred-models.md`.
 
 | Task class | Model (effort) |
 | --- | --- |
-| Hard problems, novel patterns, critical-path work | claude-opus-5 [high] |
+| Hard problems, novel patterns, critical-path work | claude-opus-4-8 [high] |
 | Well-bounded work following an established pattern | gpt-5.6-sol [medium] |
 | Spec review | claude-fable-5 |
 | Quick mechanical checks | the cheapest available tier |
