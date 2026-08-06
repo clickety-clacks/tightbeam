@@ -2269,9 +2269,8 @@ defmodule Tightbeam.GatewayTest do
 
     assert message =~ "no host in archetype default's where can run codex"
 
-    for {host, base} <- [{"eurisko", "/srv/eurisko"}, {"racter", "/srv/racter"}] do
+    for {host, _base} <- [{"eurisko", "/srv/eurisko"}, {"racter", "/srv/racter"}] do
       assert message =~ "Tightbeam has no credential for openai on #{host}"
-      assert message =~ Path.join(base, "auth")
       assert message =~ "Run on #{host}: tightbeam onboard openai --as-user <userId>"
     end
   end
@@ -2292,8 +2291,11 @@ defmodule Tightbeam.GatewayTest do
 
     assert GenServer.whereis(Credentials.server(machine)) == nil
 
+    # r4.2: the `:credential_server_unavailable` transient ("could not ASK") must NOT be
+    # misrouted into an onboard remedy — the shared credential_remedy function names retry.
     expected_message =
-      "claude on #{machine} needs onboarding: :credential_server_unavailable; run tightbeam onboard anthropic on #{machine}"
+      "Tightbeam could not reach the credential server for anthropic on #{machine}. " <>
+        "This is transient — retry shortly. Do not re-onboard; the credential may be fine."
 
     assert %{
              code: "placement_denied",
@@ -2440,8 +2442,7 @@ defmodule Tightbeam.GatewayTest do
              })
 
     assert message =~ "Tightbeam has no credential for anthropic on #{machine}"
-    assert message =~ "normal claude CLI login"
-    assert message =~ "under /remote/new-tb/auth"
+    assert message =~ "normal CLI login"
 
     assert message =~
              "Run on #{machine}: tightbeam onboard anthropic --as-user <userId>"

@@ -4109,20 +4109,70 @@ defmodule Tightbeam.Gateway do
         :ok
 
       {:needs_onboarding, reason} ->
-        message =
-          if reason == :missing do
-            missing_credential_message(config, provider, harness, machine)
-          else
-            "#{harness} on #{machine} needs onboarding: " <>
-              "#{inspect(reason)}; run tightbeam onboard #{provider} on #{machine}"
-          end
-
         {:error,
          %{
            code: "needs_onboarding",
-           message: message
+           message: credential_remedy(reason, provider, machine)
          }}
     end
+  end
+
+  # Single source of truth: a credential-failure `reason` -> the actionable remedy
+  # sentence. Every credential-refusal seam (spawn `validate_credential`, the turn
+  # `unonboarded_refusal`, and `error_sentence` flattening) names through this one
+  # function, so the r4.2 discipline lives in exactly one place: onboarding is named
+  # ONLY for reasons onboarding can actually fix (missing/expired/revoked). A transient
+  # server outage says retry (NOT onboard), an unsupported plan says onboarding won't
+  # help, an in-progress ceremony says wait. This replaces the two divergent seams the
+  # incident exposed: the spawn seam OVER-named (every reason -> "run onboard") and the
+  # turn seam UNDER-named (only `:missing`), so an expired/transient turn got a raw
+  # error or a misdirect instead of an actionable remedy.
+  defp credential_remedy(reason, provider, host) do
+    onboard = "Run on #{host}: tightbeam onboard #{provider} --as-user <userId>"
+
+    case reason do
+      :missing ->
+        "Tightbeam has no credential for #{provider} on #{host}. It does not use or " <>
+          "import your normal CLI login; Tightbeam keeps its own. #{onboard}"
+
+      :expired ->
+        "Tightbeam's credential for #{provider} on #{host} has expired. #{onboard}"
+
+      :revoked ->
+        "Tightbeam's credential for #{provider} on #{host} is no longer valid " <>
+          "(revoked, or rejected in flight). #{onboard}"
+
+      :credential_server_unavailable ->
+        "Tightbeam could not reach the credential server for #{provider} on #{host}. " <>
+          "This is transient — retry shortly. Do not re-onboard; the credential may be fine."
+
+      :in_progress ->
+        "Onboarding for #{provider} on #{host} is already in progress. Wait for it to " <>
+          "finish, then retry."
+
+      :unsupported ->
+        unsupported_credential_message(provider, host)
+
+      {:unsupported, _detail} ->
+        unsupported_credential_message(provider, host)
+
+      other ->
+        "Tightbeam cannot use the credential for #{provider} on #{host}: " <>
+          "#{credential_reason_phrase(other)}."
+    end
+  end
+
+  defp unsupported_credential_message(provider, host) do
+    "The #{provider} account on #{host} is not usable here (no supported subscription). " <>
+      "Onboarding will not help; the account needs a supported plan."
+  end
+
+  # A bounded, human phrase for an unexpected reason — never a raw `inspect` of a large
+  # ACP error map in an operator's chat (G3). Atoms and short tuples read plainly.
+  defp credential_reason_phrase(reason) when is_atom(reason), do: to_string(reason)
+
+  defp credential_reason_phrase(reason) do
+    reason |> inspect() |> String.slice(0, 200)
   end
 
   # :checkout and :session are the stages a missing credential kills; a fault in
@@ -4167,20 +4217,6 @@ defmodule Tightbeam.Gateway do
     "Tightbeam has no credential for #{provider} on #{host}. It does not use or " <>
       "import your normal #{harness} CLI login; Tightbeam keeps its own. " <>
       "Run on #{host}: tightbeam onboard #{provider} --as-user <userId>"
-  end
-
-  defp missing_credential_message(config, provider, harness, machine) do
-    auth_dir =
-      config.base_dir
-      |> Placement.hosts(gateway_db(config))
-      |> Map.fetch!(machine)
-      |> Map.fetch!(:base_dir)
-      |> Path.join("auth")
-
-    "Tightbeam has no credential for #{provider} on #{machine}. It does not use or " <>
-      "import your normal #{harness} CLI login; Tightbeam keeps its own credential " <>
-      "under #{auth_dir}. Run on #{machine}: tightbeam onboard #{provider} " <>
-      "--as-user <userId>"
   end
 
   defp credential_status(%{credential_status: status}, provider, _machine)
