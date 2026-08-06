@@ -231,7 +231,8 @@ defmodule Tightbeam.Wire.RouterTest do
     assert JSON.decode!(incompatible.resp_body) == %{
              "error" => %{
                "code" => "incompatible_cli",
-               "message" => "your CLI offered 0.2.0; this gateway requires #{Tightbeam.CliCompatibility.required_version()}"
+               "message" =>
+                 "your CLI offered 0.2.0; this gateway requires #{Tightbeam.CliCompatibility.required_version()}"
              }
            }
 
