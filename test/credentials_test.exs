@@ -630,6 +630,46 @@ defmodule Tightbeam.CredentialsTest do
     refute File.exists?(abandoned)
   end
 
+  test "an abandoned onboarding lease expires server-side at a read seam", ctx do
+    owner = self()
+
+    # A counter, not a sleep: the lease is compared at read seams against `now`,
+    # so the test moves time instead of spending it (the module's stated posture).
+    clock = :counters.new(1, [])
+    :counters.put(clock, 1, 1_000)
+
+    {:ok, server} =
+      Credentials.start_link(
+        name: nil,
+        base_dir: ctx.base,
+        machine: "eezo",
+        onboarding_lease_ms: 60_000,
+        now: fn -> :counters.get(clock, 1) end,
+        log_event: fn kind, subject, detail ->
+          send(owner, {:event, kind, subject, detail})
+        end
+      )
+
+    assert {:ok, staging, _lease_id} = Credentials.begin_onboard(:openai, server)
+    assert Credentials.status(:openai, server) == {:needs_onboarding, :in_progress}
+
+    # The CLI dies here — it never calls finish, and never calls cancel. Cancel is
+    # client-driven, so nothing on this side has been told the ceremony is over.
+    # Before the server-side lease this wedged as :in_progress until a gateway restart.
+    :counters.add(clock, 1, 61)
+
+    # A read seam (status) sweeps the expired lease: the provider heals into exactly
+    # the condition an explicit cancel would have left — staging gone, pending cleared —
+    # and the expiry is logged as its own lifecycle event carrying `lease_expired`.
+    assert Credentials.status(:openai, server) == {:needs_onboarding, :missing}
+    assert_received {:event, "credential_lease_expired", "openai@eezo", nil}
+    refute File.exists?(staging)
+
+    # And the next begin succeeds on fresh staging without a restart.
+    assert {:ok, fresh, _fresh_id} = Credentials.begin_onboard(:openai, server)
+    assert fresh != staging
+  end
+
   test "machine contexts never share credential bytes", ctx do
     other = ctx.base <> "-other"
     on_exit(fn -> File.rm_rf!(other) end)
