@@ -149,8 +149,12 @@ Other agents edit at the same time.
   clean away, and it is not a blocker to stall on. Reconcile it: identify who or what created
   it, and either ask that owner to clean it up, or, once you have established it is safe to
   remove (abandoned, yours, or the owner agrees), remove it yourself.
-- Do your own work only in your own worktree, created inside your own workdir — an
-  assignment's workdir holds everything the assignment produces, the worktree included.
+- Do your own work in a worktree that is yours to write — by default one you create inside
+  your own workdir, or one handed to you for the job by the agent that assigned it (an
+  orchestrator passing a worktree down to a coder). Either way an assignment's workdir holds
+  everything the assignment produces, the worktree included. A worktree that is merely
+  nearby — a cousin's, or one you found unattended — is not yours to commandeer uninvited
+  (above).
 
 ## When a rule stops a command
 A rule can stop a command and name itself. Do not route around it. Take a path that does not
