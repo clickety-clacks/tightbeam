@@ -805,7 +805,11 @@ fn discover_session_from(cwd: &Path) -> Result<Option<Endpoint>, String> {
             .and_then(Value::as_str)
             .ok_or_else(|| format!("malformed session file '{}': missing token", path.display()))?;
         return Ok(Some(Endpoint {
-            base: base.to_owned(),
+            // A satellite's session file carries the gateway's ADVERTISED (websocket)
+            // url; this base roots an HTTP `/agent/dispatch`. Same normalization the
+            // gateway.json reader applies (815d27e) -- the two readers of one url must
+            // agree, and this one was missed.
+            base: http_scheme(base),
             token: token.to_owned(),
             origin: Origin::Session(path),
         }));
@@ -2159,6 +2163,53 @@ mod tests {
             )
         );
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // MIRROR of `a_satellite_url_written_as_a_websocket_scheme_dispatches_over_http`,
+    // one call-site over. That test guards gateway.json's reader; this guards the
+    // SESSION-CREDENTIAL reader. A satellite's `.tightbeam-session` carries the
+    // gateway's ADVERTISED (websocket) url, so the first agent to file from a
+    // satellite hit "Unknown Scheme: unknown scheme 'ws'" rooting `/agent/dispatch`
+    // -- `discover_session_from` handed the ws:// base through untouched while the
+    // gateway.json reader (815d27e) normalized it. One url, two readers; 815d27e
+    // fixed one. The sibling session test above hardcodes https:// and can never
+    // catch this: its warning that fixtures encoding an assumption production
+    // violates cannot fail came true here, one call-site over.
+    #[test]
+    fn a_session_url_written_as_a_websocket_scheme_dispatches_over_http() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("tightbeam_cli_session_ws_{unique}"));
+        let cases = [
+            ("ws", "ws://gibson:11373", "http://gibson:11373"),
+            ("wss", "wss://gibson:11373", "https://gibson:11373"),
+            // http and https are already the dispatch scheme and pass through whole.
+            ("http", "http://gibson:11373", "http://gibson:11373"),
+            ("https", "https://gibson:11373", "https://gibson:11373"),
+        ];
+        for (name, written, expected) in cases {
+            let dir = root.join(name);
+            fs::create_dir_all(&dir).unwrap();
+            let session = dir.join(".tightbeam-session");
+            fs::write(
+                &session,
+                format!(r#"{{"url":"{written}","token":"tbs_org"}}"#),
+            )
+            .unwrap();
+
+            assert_eq!(
+                discover_session_from(&dir),
+                Ok(Some(Endpoint {
+                    base: expected.to_owned(),
+                    token: "tbs_org".to_owned(),
+                    origin: Origin::Session(session),
+                })),
+                "{name}"
+            );
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
