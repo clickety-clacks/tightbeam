@@ -371,6 +371,7 @@ defmodule Tightbeam.Gateway do
         publish_sessions: fn captured, transition ->
           publish_credential_sessions(db, captured, transition)
         end,
+        on_credential_present: credential_present_hook(db, machine),
         onboarding_lease_ms: config.onboarding_lease_ms,
         log_event: fn kind, subject, detail ->
           Tightbeam.EventLog.lifecycle(db, kind, subject, detail)
@@ -382,6 +383,43 @@ defmodule Tightbeam.Gateway do
       id: {Tightbeam.Credentials, machine},
       start: {Tightbeam.Credentials, :start_link, [opts]}
     }
+  end
+
+  @doc """
+  The `on_credential_present/1` hook wired into the credential lifecycle owner
+  (`credential_child/4`), invoked by `credentials.ex` at onboarding-commit
+  success with the committed provider. On a credential commit for
+  `{machine, provider}` it files the substrate-observed `credential-present`
+  condition-fact — the durable transition record (I5) — and pokes the catalog
+  to re-derive that provider's harnesses NOW (O4). Filed via a plain
+  transaction, never `Wakes.fire_matching`: this fact drives a GenServer
+  re-derivation, not a session wake. Public and parameterized by the catalog
+  server so the injector is exercisable without driving a full ceremony; the
+  fact is best-effort (a dropped one self-heals via the catalog's TTL sweep),
+  so a filing error is logged, not raised into the commit.
+  """
+  @spec credential_present_hook(DB.server(), String.t(), GenServer.server()) :: (atom() -> :ok)
+  def credential_present_hook(db, machine, catalog \\ ModelCatalog) do
+    fn provider ->
+      scope = "#{machine}:#{provider}"
+
+      case DB.transaction(db, fn txn ->
+             ConditionFacts.file_in_txn(txn, %{
+               kind: "credential-present",
+               scope: scope,
+               origin: "process:tightbeam"
+             })
+           end) do
+        {:ok, %{fact_id: _}} ->
+          :ok
+
+        other ->
+          Logger.error("credential-present fact for #{scope} not filed: #{inspect(other)}")
+      end
+
+      ModelCatalog.credential_present(machine, provider, catalog)
+      :ok
+    end
   end
 
   defp start_credential_child(config, db, machine, previous_host, host) do

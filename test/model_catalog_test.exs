@@ -1540,6 +1540,57 @@ defmodule Tightbeam.ModelCatalogTest do
       # Placement succeeds NOW — within derivation latency, not a TTL later.
       await(fn -> match?({:ok, _}, ModelCatalog.route(@host, "claude", opus_high, catalog)) end)
     end
+
+    # The injector seam (O4's mechanism half): the gateway `on_credential_present`
+    # hook credentials.ex invokes at commit success. It files the durable
+    # `credential-present` fact AND pokes the catalog, so placement becomes usable
+    # within T_derive — exactly the end-to-end effect once O1 wires the one-line
+    # invocation at finish_onboard (O1 owns the trigger-point; this proves the
+    # mechanism against the published on_credential_present/1 contract).
+    test "the gateway on_credential_present hook files the fact and makes placement usable",
+         ctx do
+      # The fact-filing transaction also writes a lifecycle event, so the full
+      # schema is needed, not just the condition_facts table.
+      Tightbeam.Schema.ensure_all(ctx.db)
+
+      present? =
+        start_supervised!(%{
+          id: unique_name(:present),
+          start: {Agent, :start_link, [fn -> false end]}
+        })
+
+      status = fn _provider ->
+        if Agent.get(present?, & &1), do: :onboarded, else: {:needs_onboarding, :missing}
+      end
+
+      catalog =
+        start_catalog(ctx,
+          ttl_ms: :timer.minutes(15),
+          now: fn -> 0 end,
+          credential_status: status
+        )
+
+      opus_high = Model.new("claude-opus-5", effort: "high")
+
+      await(fn ->
+        match?(
+          {:error, %Unroutable{cause: :no_catalog}},
+          ModelCatalog.route(@host, "claude", opus_high, catalog)
+        )
+      end)
+
+      # Credential commits; the hook fires with the provider (as O1's finish_onboard will).
+      Agent.update(present?, fn _ -> true end)
+      hook = Gateway.credential_present_hook(ctx.db, @host, catalog)
+      assert hook.(:anthropic) == :ok
+
+      # The durable transition fact is filed for {host, provider}, by the substrate...
+      assert %{scope: "testhost:anthropic", origin: "process:tightbeam"} =
+               Tightbeam.ConditionFacts.latest(ctx.db, "credential-present", "#{@host}:anthropic")
+
+      # ...and placement is usable within T_derive, no restart, no TTL wait.
+      await(fn -> match?({:ok, _}, ModelCatalog.route(@host, "claude", opus_high, catalog)) end)
+    end
   end
 
   defp await(_fun, 0), do: flunk("condition did not become true")
