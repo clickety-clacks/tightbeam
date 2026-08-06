@@ -2187,7 +2187,7 @@ mod tests {
   }
 }
 "#
-            .replace("PROBE_VERSION", env!("CARGO_PKG_VERSION"))
+                .replace("PROBE_VERSION", env!("CARGO_PKG_VERSION"))
             )
             .unwrap()
         );
@@ -2361,7 +2361,7 @@ mod tests {
   }
 }
 "#
-            .replace("PROBE_VERSION", env!("CARGO_PKG_VERSION"))
+                .replace("PROBE_VERSION", env!("CARGO_PKG_VERSION"))
             )
             .unwrap()
         );
