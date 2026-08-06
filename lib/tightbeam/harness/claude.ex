@@ -82,8 +82,17 @@ defmodule Tightbeam.Harness.Claude do
   # (JOURNAL.md:804); the projected-home model pin (ops-hardening-v1 §3) is what
   # makes it deterministic. Keep re-probing per the note above before trusting
   # any row here, in either direction.
+  # RE-MEASURED 2026-08-06 on gibson (adapter 0.59.0, the production grant):
+  # a pin-probe home (settings.json model=claude-opus-5) OFFERED and ACCEPTED
+  # claude-opus-5, and a live prompt through the production adapter+credential
+  # answered as Opus 5 — the 2026-07-26 REJECTED row for opus-5 was, like
+  # fable's, one environment's snapshot ("refused on this grant" measured a
+  # default-pin vocabulary, not the grant; the operator's own picker offered
+  # Opus 5 all along). Same lesson, second occurrence: re-probe from a second
+  # vantage before trusting any row here, in either direction.
   @adapter_selectable_models ~w(default sonnet opus haiku fable claude-sonnet-5
-                                claude-opus-4-8 claude-haiku-4-5-20251001 claude-fable-5)
+                                claude-opus-4-8 claude-haiku-4-5-20251001 claude-fable-5
+                                claude-opus-5)
 
   @doc """
   Model values this adapter version accepts at `session/set_config_option`.

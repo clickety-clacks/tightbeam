@@ -1326,7 +1326,10 @@ defmodule Tightbeam.ModelCatalogTest do
 
       # Only selectable models survive, and the fixture's refused ones are gone.
       assert "claude-haiku-4-5-20251001" in families
-      refute "claude-opus-5" in families
+      # Re-measured 2026-08-06 on gibson (production grant): a pin-probed home
+      # offered and accepted claude-opus-5 and it answered a live prompt — the
+      # earlier REJECTED row was the default-pin vocabulary, not the grant.
+      assert "claude-opus-5" in families
       # Re-measured 2026-08-05 on gibson (CLI 2.1.221, production grant):
       # fable answers a real prompt; the July REJECTED row was one
       # environment's snapshot. Fable is now offered.
