@@ -5676,6 +5676,111 @@ defmodule Tightbeam.GatewayTest do
     refute reason =~ "--as-user"
   end
 
+  # O6 reactive fix (spec 1ae8fa52) — THE INCIDENT PATH. Guards A/B/C all force :checkout,
+  # but the incident 401s at :prompt: an expired/rejected credential 401s at API-call time,
+  # so checkout AND session SUCCEED (the harness holds a token) and catalog health is still
+  # `:fresh` — a health lookup is blind to it (reviewer-3 confirmed real expiry is
+  # storage-blind). The turn must detect the auth-fault by SHAPE at :prompt and name the
+  # re-onboard remedy instead of rendering the raw ACP error map. RED-before-green: without
+  # auth-fault detection the operator gets the flattened raw ACP error (no remedy); with it,
+  # the named re-onboard remedy.
+  test "an expired-credential turn 401ing at :prompt (fresh health) names the re-onboard remedy",
+       ctx do
+    exact_registry =
+      start_supervised!(%{
+        id: :o6_prompt401_conn_registry,
+        start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+      })
+
+    # A REAL adapter: checkout + session succeed; the 401 lands at :prompt. AdapterStub
+    # returns the auth-expired ACP error for the prompt "fail this turn" (gateway_test:162).
+    adapter = start_supervised!({AdapterStub, self()})
+    start_supervised!({CoordinatorStub, {adapter, self()}})
+
+    {:ok, _ref, nil} =
+      ConnRegistry.register(exact_registry, %{
+        pid: self(),
+        user_id: "flynn",
+        device_id: "o6-prompt401",
+        is_admin: false,
+        subscriptions: MapSet.new(["chat"])
+      })
+
+    base = gateway_children_base!()
+
+    config = %{
+      base_dir: base,
+      cwd: "/tmp",
+      port: 0,
+      default_harness: :claude,
+      default_model: Model.new("claude-fable-5"),
+      max_live_sessions_per_user: 50,
+      wake_tick_ms: 1_000,
+      onboarding_lease_ms: 1_800_000,
+      db: ctx.db
+    }
+
+    children = Gateway.children(config)
+
+    {Tightbeam.LaneManager, lane_opts} =
+      Enum.find(children, &match?({Tightbeam.LaneManager, _}, &1))
+
+    runner = Keyword.fetch!(lane_opts, :runner)
+
+    # Incident-faithful: catalog LEFT FRESH — real expiry is storage-blind, so health gives
+    # NO signal. The only signal is the :prompt auth-fault shape.
+    assert {_entries, :fresh} = ModelCatalog.get("testhost", "claude", ModelCatalog)
+
+    assert :appended =
+             Gateway.deliver_prompt("k1", "user:flynn", "fail this turn",
+               db: ctx.db,
+               conn_registry: exact_registry,
+               lane_manager: ctx.lane,
+               device_id: "o6-prompt401",
+               client_message_id: "c_o6_prompt401"
+             )
+
+    assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
+
+    assert {:error, %{reason: reason, terminal_publish: publish, record_in_txn: record}} =
+             runner.(Map.put(turn, :session_key, "k1"))
+
+    # The auth-fault at :prompt is NAMED with the re-onboard remedy — not the raw ACP map.
+    assert reason =~ "tightbeam onboard anthropic --as-user <userId>"
+    assert reason =~ "no longer valid"
+    refute reason =~ "Internal error"
+    refute reason =~ "auth expired"
+
+    # It genuinely failed at :prompt — checkout + session succeeded (the incident path, not a
+    # pre-engine refusal). The record keeps the stage.
+    assert {:ok, true} =
+             DB.transaction(ctx.db, fn txn ->
+               assert Ledger.finish_in_txn(txn, turn.seq, "failed", reason)
+               record.(txn)
+               true
+             end)
+
+    publish.("failed")
+
+    lifecycle =
+      Enum.find(EventLog.lifecycle_events(ctx.db), fn event ->
+        event.kind == "harness_turn_error" and event.subject == "k1"
+      end)
+
+    assert lifecycle, "the :prompt auth-fault refusal must record a harness_turn_error"
+    assert lifecycle.detail =~ "prompt"
+
+    # The operator reads the remedy in chat, never a raw inspected ACP map (G3).
+    marker =
+      ctx.db
+      |> Projection.list_after("k1", nil, 100)
+      |> Enum.find(&String.starts_with?(&1.content || "", "[turn failed]"))
+
+    assert marker, "a :prompt auth-fault must speak the remedy in chat"
+    assert marker.content =~ "tightbeam onboard anthropic --as-user <userId>"
+    refute marker.content =~ "\"details\""
+  end
+
   test "identity relearn reports a non-conflict git failure legibly", ctx do
     base_dir = role_test_base("identity-relearn-failure")
     Identity.init!(base_dir)
