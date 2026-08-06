@@ -1,6 +1,6 @@
 name = "orchestrator"
 where = ["eezo", "racter"]
-skills = ["feature-cycle", "work-tracking", "unblocking", "tightbeam-law-minting", "tightbeam-guidance-authoring"]
+skills = ["feature-cycle", "work-tracking", "unblocking", "tightbeam-law-minting", "tightbeam-guidance-authoring", "human-communication"]
 
 [guidance]
 text = """

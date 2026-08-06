@@ -1,6 +1,6 @@
 name = "reviewer"
 where = ["eezo", "racter"]
-skills = ["reviewing-code", "reviewing-specs", "spec-conformance", "review-for-completeness", "review-for-yagni", "tightbeam-law-minting", "tightbeam-guidance-authoring"]
+skills = ["reviewing-code", "reviewing-specs", "spec-conformance", "review-for-completeness", "review-for-yagni", "tightbeam-law-minting", "tightbeam-guidance-authoring", "human-communication"]
 
 [guidance]
 text = """

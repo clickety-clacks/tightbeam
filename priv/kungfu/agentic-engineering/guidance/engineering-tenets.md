@@ -27,3 +27,8 @@
   prose, guidance, review, test, lint, compile error, unrepresentable; take the highest you can
   afford and say which you took. A rule only prose enforces is violated by the next agent that
   pattern-matches on the surrounding code.
+- Match the register to the reader. Writing to a HUMAN: use the
+  `human-communication` skill — active voice, simple tense, one instruction
+  per sentence, plain words (STE-derived). Writing to another AGENT: be
+  token-efficient and concise, and preserve every nuance — dense is fine,
+  lossy is not; drop pleasantries, never qualifiers, conditions, or ids.

@@ -152,7 +152,11 @@ defmodule Tightbeam.ArchetypesTest do
     assert Map.keys(loaded) |> Enum.sort() ==
              ~w(coder default orchestrator product-owner recon reviewer spec-writer)
 
-    assert loaded["product-owner"].skills == ["tightbeam-dispatching", "product-discovery"]
+    assert loaded["product-owner"].skills == [
+             "tightbeam-dispatching",
+             "product-discovery",
+             "human-communication"
+           ]
 
     coder =
       Identity.snapshot_at!(

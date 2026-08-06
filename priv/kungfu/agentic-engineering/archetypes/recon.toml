@@ -1,6 +1,6 @@
 name = "recon"
 where = ["eezo", "racter"]
-skills = ["recon-first-investigation", "recon-lifecycle", "bug-provenance"]
+skills = ["recon-first-investigation", "recon-lifecycle", "bug-provenance", "human-communication"]
 
 [guidance]
 text = """

@@ -1,6 +1,6 @@
 name = "coder"
 where = ["eezo", "racter"]
-skills = ["worktree-session", "committing-and-pushing"]
+skills = ["worktree-session", "committing-and-pushing", "human-communication"]
 
 [guidance]
 text = """
