@@ -1833,7 +1833,7 @@ defmodule Tightbeam.Gateway do
             raw_reason = reason
 
             reason =
-              case turn_credential_refusal(session, failed_stage, raw_reason) do
+              case turn_credential_refusal(session) do
                 {:refused, message} -> message
                 :not_applicable -> reason
               end
@@ -4122,11 +4122,18 @@ defmodule Tightbeam.Gateway do
   # `unonboarded_refusal`, and `error_sentence` flattening) names through this one
   # function, so the r4.2 discipline lives in exactly one place: onboarding is named
   # ONLY for reasons onboarding can actually fix (missing/expired/revoked). A transient
-  # server outage says retry (NOT onboard), an unsupported plan says onboarding won't
-  # help, an in-progress ceremony says wait. This replaces the two divergent seams the
-  # incident exposed: the spawn seam OVER-named (every reason -> "run onboard") and the
-  # turn seam UNDER-named (only `:missing`), so an expired/transient turn got a raw
-  # error or a misdirect instead of an actionable remedy.
+  # server outage says retry (NOT onboard), an unsupported plan says onboarding won't help.
+  # This replaces the two divergent seams the incident exposed: the spawn seam OVER-named
+  # (every reason -> "run onboard") and the turn seam UNDER-named (only `:missing`), so an
+  # expired/transient turn got a raw error or a misdirect instead of an actionable remedy.
+  #
+  # `:in_progress` has NO bespoke remedy here (it flattens via the catch-all). The PO's
+  # refinement — NAME the live ceremony (origin session + started-at), consistent with
+  # outcome 2 — needs the lease's `origin_session`/`started_at`, which do NOT exist at this
+  # base (the lease is `%{id, path, expires_at}`); those fields are outcome 2's deliverable.
+  # So the bespoke `:in_progress` remedy is DEFERRED to outcome 2, which owns that data; the
+  # interim flatten still removes the old false "run onboard" (the r4.2 fix). This mirrors the
+  # :prompt-401 deferral to Card 2 — defer the precise naming to the card that owns the signal.
   defp credential_remedy(reason, provider, host) do
     onboard = "Run on #{host}: tightbeam onboard #{provider} --as-user <userId>"
 
@@ -4145,10 +4152,6 @@ defmodule Tightbeam.Gateway do
       :credential_server_unavailable ->
         "Tightbeam could not reach the credential server for #{provider} on #{host}. " <>
           "This is transient — retry shortly. Do not re-onboard; the credential may be fine."
-
-      :in_progress ->
-        "Onboarding for #{provider} on #{host} is already in progress. Wait for it to " <>
-          "finish, then retry."
 
       :unsupported ->
         unsupported_credential_message(provider, host)
@@ -4176,39 +4179,23 @@ defmodule Tightbeam.Gateway do
   end
 
   # A credential failure at the turn seam, named through the one shared remedy function.
-  # Two triggers, because a credential dies in two shapes:
+  # Read the credential health for {host, harness}; when it AFFIRMATIVELY reports a
+  # needs-onboarding reason (missing/expired/revoked/unsupported/in_progress), name the
+  # per-reason remedy — at every stage, including :prompt. We do NOT name
+  # `:credential_server_unavailable`: it means "could not ASK" (a transient), and at a turn
+  # failure the real fault is usually the adapter/host; overriding it with a bogus credential
+  # sentence is the could-not-ask misroute this codebase keeps punishing (29 adapter-heal
+  # arenas run without a Credentials server). The transient IS named at the spawn seam, where
+  # the check is deliberate — that seam policy difference is intentional; the wording is shared.
   #
-  #  - AUTH-FAULT AT :prompt (the incident). An expired/rejected credential 401s at API-call
-  #    time — checkout and session SUCCEED (the harness already holds a token), so catalog
-  #    health is still `:fresh` (real expiry is storage-blind) and a health read tells us
-  #    nothing. The only signal is the auth-error SHAPE itself, so we detect it and name the
-  #    re-onboard remedy. This fires FIRST, before the stage guard, because it is exactly the
-  #    later-stage fault the old code dismissed as "a real adjudication whatever the catalog
-  #    thinks" — for an auth fault the catalog is right to be silent and the shape is the truth.
-  #
-  #  - AFFIRMATIVE NEEDS-ONBOARDING AT :checkout/:session. A missing/expired/revoked/unsupported/
-  #    in-progress credential kills these pre-engine stages; the catalog health carries the
-  #    reason, and we name per-reason. We do NOT name `:credential_server_unavailable` here — it
-  #    means "could not ASK" (a transient), and at a checkout/session failure the real fault is
-  #    usually the adapter/host; overriding it with a bogus credential sentence is the
-  #    could-not-ask misroute this codebase keeps punishing (29 adapter-heal arenas run without a
-  #    Credentials server). The transient IS named at the spawn seam, where the check is
-  #    deliberate — that seam policy difference is intentional; the remedy WORDING stays shared.
-  defp turn_credential_refusal(session, failed_stage, raw_reason) do
-    cond do
-      auth_fault?(raw_reason) ->
-        provider = Harness.parse!(session.harness).credential_provider()
-        {:refused, credential_remedy(:revoked, provider, session.host)}
-
-      failed_stage in [:checkout, :session] ->
-        turn_health_refusal(session)
-
-      true ->
-        :not_applicable
-    end
-  end
-
-  defp turn_health_refusal(session) do
+  # HELD (pending the PO's a-vs-b scope ruling): a credential that expires and 401s IN FLIGHT
+  # fails at :prompt with catalog health still `:fresh` — real expiry is storage-blind, so no
+  # health signal names it; only the :prompt ACP auth-error SHAPE does. That own-detection
+  # (Card-1 fragile string-match vs Card-2 401-observed health) is deferred; it lands on top of
+  # this seam without changing it (preserved on branch o6-prompt401-naming-built). Until then,
+  # G3 flatten (error_sentence) still ensures such a turn renders human prose, never a raw
+  # inspected map.
+  defp turn_credential_refusal(session) do
     health =
       try do
         {_entries, health} =
@@ -4239,49 +4226,25 @@ defmodule Tightbeam.Gateway do
   defp affirmative_credential_reason?(:missing), do: true
   defp affirmative_credential_reason?(:expired), do: true
   defp affirmative_credential_reason?(:revoked), do: true
-  defp affirmative_credential_reason?(:in_progress), do: true
   defp affirmative_credential_reason?(:unsupported), do: true
   defp affirmative_credential_reason?({:unsupported, _}), do: true
   defp affirmative_credential_reason?(_), do: false
 
-  # A provider rejecting the credential in flight (a 401 / auth error at :prompt). No health
-  # signal exists for it (see turn_credential_refusal), so it is detected by content: the
-  # auth-error shape reviewer-3 reproduced (`%{"message"=>"Internal error","data"=>%{"details"
-  # =>"auth expired"}}`) plus the common 401/unauthorized/api-key markers. Conservative — it
-  # keys on auth-specific phrases, not bare "auth" (which would catch "author"). NOTE: keyed on
-  # the reproduced + common shapes; refine when real per-harness 401 payloads are captured.
-  @auth_fault_markers [
-    "auth expired",
-    "auth error",
-    "auth failed",
-    "authentication",
-    "unauthorized",
-    "401",
-    "invalid api key",
-    "invalid_api_key",
-    "invalid x-api-key",
-    "token expired",
-    "expired token",
-    "api key expired"
-  ]
-  defp auth_fault?(reason) do
-    text = reason |> auth_fault_text() |> String.downcase()
-    Enum.any?(@auth_fault_markers, &String.contains?(text, &1))
-  end
+  # Extract an error map's human-readable text (message + details) for G3 flattening — never a
+  # raw `inspect` of a large ACP error map in an operator's chat.
+  defp error_map_text(reason) when is_binary(reason), do: reason
 
-  defp auth_fault_text(reason) when is_binary(reason), do: reason
-
-  defp auth_fault_text(reason) when is_map(reason) do
+  defp error_map_text(reason) when is_map(reason) do
     message = map_get_any(reason, ["message", :message]) || ""
     data = map_get_any(reason, ["data", :data]) || %{}
 
     details =
       if is_map(data), do: map_get_any(data, ["details", :details]) || "", else: to_string(data)
 
-    "#{message} #{details}"
+    String.trim("#{message} #{details}")
   end
 
-  defp auth_fault_text(reason), do: inspect(reason)
+  defp error_map_text(reason), do: inspect(reason)
 
   defp map_get_any(map, keys) do
     Enum.find_value(keys, fn key ->
@@ -5009,7 +4972,7 @@ defmodule Tightbeam.Gateway do
   # error map is flattened to the human message/details it carries, falling back to a bounded
   # inspect only when it has no readable text.
   defp error_sentence(reason) when is_map(reason) do
-    case String.trim(auth_fault_text(reason)) do
+    case error_map_text(reason) do
       "" -> reason |> inspect() |> String.slice(0, 300)
       text -> text
     end
