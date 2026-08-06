@@ -5676,15 +5676,17 @@ defmodule Tightbeam.GatewayTest do
     refute reason =~ "--as-user"
   end
 
-  # O6 reactive fix (spec 1ae8fa52) — THE INCIDENT PATH. Guards A/B/C all force :checkout,
-  # but the incident 401s at :prompt: an expired/rejected credential 401s at API-call time,
-  # so checkout AND session SUCCEED (the harness holds a token) and catalog health is still
-  # `:fresh` — a health lookup is blind to it (reviewer-3 confirmed real expiry is
-  # storage-blind). The turn must detect the auth-fault by SHAPE at :prompt and name the
-  # re-onboard remedy instead of rendering the raw ACP error map. RED-before-green: without
-  # auth-fault detection the operator gets the flattened raw ACP error (no remedy); with it,
-  # the named re-onboard remedy.
-  test "an expired-credential turn 401ing at :prompt (fresh health) names the re-onboard remedy",
+  # O6 reactive fix (spec 1ae8fa52) — THE INCIDENT PATH (G3 flatten). Guards A/B/C all force
+  # :checkout, but the incident 401s at :prompt: an expired/rejected credential 401s at
+  # API-call time, so checkout AND session SUCCEED (the harness holds a token) and catalog
+  # health is still `:fresh` — a health lookup is blind to it (reviewer-3 confirmed real expiry
+  # is storage-blind). The common-path guarantee here: the operator reads the auth error as
+  # human PROSE, never a raw inspected ACP map (G3 error_sentence flatten). RED-before-green:
+  # without the flatten, error_sentence inspects the map (`=>`/`%{` markers reach chat). The
+  # precise re-onboard NAMING of this health-blind :prompt 401 is the HELD option-a piece
+  # (auth-shape detection), pending the PO's a-vs-b ruling; it lands on top without changing
+  # this seam (preserved on branch o6-prompt401-naming-built).
+  test "an expired-credential turn 401ing at :prompt (fresh health) flattens the raw ACP map to prose (G3)",
        ctx do
     exact_registry =
       start_supervised!(%{
@@ -5745,17 +5747,15 @@ defmodule Tightbeam.GatewayTest do
     assert {:error, %{reason: reason, terminal_publish: publish, record_in_txn: record}} =
              runner.(Map.put(turn, :session_key, "k1"))
 
-    # The auth-fault at :prompt is NAMED with the re-onboard remedy — not the raw ACP map.
-    assert reason =~ "tightbeam onboard anthropic --as-user <userId>"
-    assert reason =~ "no longer valid"
-    refute reason =~ "Internal error"
-    refute reason =~ "auth expired"
-
     # It genuinely failed at :prompt — checkout + session succeeded (the incident path, not a
     # pre-engine refusal). The record keeps the stage.
+    # reason is the raw ACP map here (health :fresh -> :not_applicable, no reclassify); the lane
+    # stringifies it via error_text before the ledger, and the OPERATOR-facing marker flattens
+    # it via error_sentence (asserted below). Finish with a stand-in string, as SessionLane's
+    # error_text would produce one.
     assert {:ok, true} =
              DB.transaction(ctx.db, fn txn ->
-               assert Ledger.finish_in_txn(txn, turn.seq, "failed", reason)
+               assert Ledger.finish_in_txn(txn, turn.seq, "failed", "prompt auth 401")
                record.(txn)
                true
              end)
@@ -5767,18 +5767,23 @@ defmodule Tightbeam.GatewayTest do
         event.kind == "harness_turn_error" and event.subject == "k1"
       end)
 
-    assert lifecycle, "the :prompt auth-fault refusal must record a harness_turn_error"
+    assert lifecycle, "the :prompt turn failure must record a harness_turn_error"
     assert lifecycle.detail =~ "prompt"
 
-    # The operator reads the remedy in chat, never a raw inspected ACP map (G3).
+    # G3: the operator reads the human message/details as PROSE, never a raw inspected ACP
+    # error map. The auth detail survives as text; the map's inspect markers (`=>`, `%{`) do
+    # NOT. (The precise re-onboard NAMING for this health-blind :prompt 401 is the held
+    # option-a piece, pending the PO's a-vs-b ruling; the common path guarantees only that no
+    # raw map reaches chat.)
     marker =
       ctx.db
       |> Projection.list_after("k1", nil, 100)
       |> Enum.find(&String.starts_with?(&1.content || "", "[turn failed]"))
 
-    assert marker, "a :prompt auth-fault must speak the remedy in chat"
-    assert marker.content =~ "tightbeam onboard anthropic --as-user <userId>"
-    refute marker.content =~ "\"details\""
+    assert marker, "a :prompt failure must speak in chat"
+    assert marker.content =~ "auth expired"
+    refute marker.content =~ "=>"
+    refute marker.content =~ "%{"
   end
 
   test "identity relearn reports a non-conflict git failure legibly", ctx do
