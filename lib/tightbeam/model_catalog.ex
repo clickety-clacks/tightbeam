@@ -344,16 +344,19 @@ defmodule Tightbeam.ModelCatalog do
 
   def handle_info({:catalog_refresh, key, {:ok, entries}}, state) do
     now = now_ms(state)
+    recheck? = match?(%{recheck: true}, state.entries[key])
 
     cache = %{
       entries: entries,
       derived_at: now,
       attempted_at: now,
       reason: nil,
-      refreshing: false
+      refreshing: false,
+      recheck: false
     }
 
-    {:noreply, put_in(state, [:entries, key], cache)}
+    state = put_in(state, [:entries, key], cache)
+    {:noreply, maybe_recheck(state, key, recheck?)}
   end
 
   def handle_info({:catalog_refresh, {host, harness} = key, {:error, reason}}, state) do
@@ -398,12 +401,16 @@ defmodule Tightbeam.ModelCatalog do
   defp enumerate_hosts(%{hosts: fun}) when is_function(fun, 0), do: fun.()
   defp enumerate_hosts(state), do: Placement.hosts(state.base_dir, state.db)
 
-  defp refresh_key(state, key, host_config) do
+  # `force?` re-derives regardless of freshness (a credential-present arrived);
+  # it is gated at the derivation, not by mutating `derived_at`, so an entry
+  # that still holds fresh models keeps serving them (and `health/3` never reads
+  # a nil `derived_at`) while the fresh derive runs.
+  defp refresh_key(state, key, host_config, force? \\ false) do
     now = now_ms(state)
     cache = Map.get(state.entries, key) || new_cache()
     state = put_in(state, [:entries, key], cache)
 
-    if not cache.refreshing and expired?(cache, now, state.ttl_ms) do
+    if not cache.refreshing and (force? or expired?(cache, now, state.ttl_ms)) do
       owner = self()
       probe = probe_state(state, key, host_config)
       snapshot = state
@@ -421,13 +428,14 @@ defmodule Tightbeam.ModelCatalog do
     end
   end
 
-  # A credential-present recognition re-derives one {host, harness} now. A
-  # needs_onboarding entry is already expired (expired?/3), so refresh_key
-  # re-derives it against current world-state. If a derive is already in flight
-  # it may have read PRE-commit world-state (the credential had not landed when
-  # it started), so rather than race a second task past it, the entry is flagged
-  # to re-check when that derive completes — the wired edge has no periodic sweep
-  # to fall back on, so it must not drop the re-recognition.
+  # A credential-present recognition re-derives one {host, harness} now,
+  # forced (freshness is irrelevant — the world just changed). If a derive is
+  # already in flight it may have read PRE-commit world-state (the credential
+  # had not landed when it started), so rather than race a second task past it,
+  # the entry is flagged to re-check when that derive completes — honored on
+  # BOTH the success and error completion paths (`maybe_recheck`), because the
+  # wired edge has no periodic sweep to fall back on and must not drop the
+  # re-recognition on either outcome.
   defp force_rederive(state, {host, _harness} = key) do
     case Map.get(enumerate_hosts(state), host) do
       nil ->
@@ -439,7 +447,7 @@ defmodule Tightbeam.ModelCatalog do
             put_in(state, [:entries, key], Map.put(cache, :recheck, true))
 
           _ ->
-            refresh_key(state, key, host_config)
+            refresh_key(state, key, host_config, true)
         end
     end
   end
@@ -449,7 +457,7 @@ defmodule Tightbeam.ModelCatalog do
   defp maybe_recheck(state, {host, _harness} = key, true) do
     case Map.get(enumerate_hosts(state), host) do
       nil -> state
-      host_config -> refresh_key(state, key, host_config)
+      host_config -> refresh_key(state, key, host_config, true)
     end
   end
 

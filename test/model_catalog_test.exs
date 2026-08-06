@@ -1463,12 +1463,18 @@ defmodule Tightbeam.ModelCatalogTest do
         ctx.claude_fetch.(path, headers)
       end
 
+      probing_codex = fn command ->
+        send(test_pid, {:codex_probed, command})
+        ctx.codex_sh.(command)
+      end
+
       catalog =
         start_catalog(ctx,
           ttl_ms: :timer.minutes(15),
           now: fn -> 0 end,
           credential_status: status,
-          claude_fetch: probing_fetch
+          claude_fetch: probing_fetch,
+          sh: probing_codex
         )
 
       # Drain boot: needs_onboarding short-circuits before the probe, so no fetch
@@ -1488,6 +1494,54 @@ defmodule Tightbeam.ModelCatalogTest do
       ModelCatalog.credential_present(@host, :anthropic, catalog)
 
       assert_receive {:claude_probed, "/v1/models?limit=100"}, 2_000
+
+      # Provider-scoped: an anthropic recognition re-derives the harness that
+      # spends anthropic (claude) only — codex (openai) is never probed.
+      refute_receive {:codex_probed, _}, 300
+    end
+
+    # F2 regression: a credential-present arriving WHILE a derive is in flight
+    # must still re-derive once that derive completes — on the SUCCESS path too,
+    # not only on error. Without the fix the {:ok} handler dropped the pending
+    # recheck, so a credential replaced mid-derive stayed stale until the TTL.
+    test "a credential-present mid-derive re-derives after a successful completion (recheck honored)",
+         ctx do
+      test_pid = self()
+
+      gate =
+        start_supervised!(%{
+          id: unique_name(:gate),
+          start: {Agent, :start_link, [fn -> false end]}
+        })
+
+      count =
+        start_supervised!(%{id: unique_name(:count), start: {Agent, :start_link, [fn -> 0 end]}})
+
+      gated_fetch = fn path, headers ->
+        n = Agent.get_and_update(count, fn c -> {c + 1, c + 1} end)
+        send(test_pid, {:fetch_started, n})
+        # Hold ONLY the first derive open, so a credential-present can land while
+        # it is in flight; later derives pass straight through.
+        if n == 1, do: await(fn -> Agent.get(gate, & &1) end, 400)
+        ctx.claude_fetch.(path, headers)
+      end
+
+      catalog =
+        start_catalog(ctx,
+          credential_status: fn _provider -> :onboarded end,
+          claude_fetch: gated_fetch
+        )
+
+      # Derive #1 (boot) is in flight and blocked.
+      assert_receive {:fetch_started, 1}, 2_000
+
+      # A credential-present lands while #1 is in flight -> recheck is set.
+      ModelCatalog.credential_present(@host, :anthropic, catalog)
+
+      # Release #1; it completes {:ok}. The recheck must force derive #2 — the
+      # success path honoring it, symmetric with the error path.
+      Agent.update(gate, fn _ -> true end)
+      assert_receive {:fetch_started, 2}, 2_000
     end
 
     # The eezo production repro (orchestrator, 2026-08-06): a CLEAN one-shot
