@@ -2143,14 +2143,14 @@ mod tests {
         assert_eq!(
             encoded,
             serde_json::from_str::<Value>(
-                r#"{
+                &r#"{
   "schema": "tightbeam.probe.v1",
   "probed_at_ms": 1000,
   "collection_ms": 5,
   "host": {
     "hostname": "host",
     "platform": "linux",
-    "probe_version": "0.1.0"
+    "probe_version": "PROBE_VERSION"
   },
   "base_dir": {
     "path": "/missing",
@@ -2187,6 +2187,7 @@ mod tests {
   }
 }
 "#
+            .replace("PROBE_VERSION", env!("CARGO_PKG_VERSION"))
             )
             .unwrap()
         );
@@ -2242,14 +2243,14 @@ mod tests {
         assert_eq!(
             encoded,
             serde_json::from_str::<Value>(
-                r#"{
+                &r#"{
   "schema": "tightbeam.probe.v1",
   "probed_at_ms": 10000,
   "collection_ms": 7,
   "host": {
     "hostname": "eezo",
     "platform": "linux",
-    "probe_version": "0.1.0"
+    "probe_version": "PROBE_VERSION"
   },
   "base_dir": {
     "path": "/srv/tightbeam",
@@ -2360,6 +2361,7 @@ mod tests {
   }
 }
 "#
+            .replace("PROBE_VERSION", env!("CARGO_PKG_VERSION"))
             )
             .unwrap()
         );
