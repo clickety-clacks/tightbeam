@@ -231,14 +231,14 @@ defmodule Tightbeam.Wire.RouterTest do
     assert JSON.decode!(incompatible.resp_body) == %{
              "error" => %{
                "code" => "incompatible_cli",
-               "message" => "your CLI offered 0.2.0; this gateway requires 0.1.0"
+               "message" => "your CLI offered 0.2.0; this gateway requires #{Tightbeam.CliCompatibility.required_version()}"
              }
            }
 
     auth_failure =
       conn(:post, "/agent/dispatch", body)
       |> put_req_header("authorization", "Bearer wrong")
-      |> put_req_header("x-tightbeam-cli-version", "0.1.0")
+      |> put_req_header("x-tightbeam-cli-version", Tightbeam.CliCompatibility.required_version())
       |> Router.call(Router.init(ctx.opts))
 
     assert auth_failure.status == 401
