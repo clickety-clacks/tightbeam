@@ -5403,7 +5403,7 @@ defmodule Tightbeam.GatewayTest do
            )
   end
 
-  # AC6 (spec 0b13f0d3 §O6/I7+I9). O6 RATIFIES the existing turn-path refuse-by-name
+  # AC6 (spec 1ae8fa52 §O6/I7+I9). O6 RATIFIES the existing turn-path refuse-by-name
   # (`unonboarded_refusal`): a turn onto a {host, harness} whose catalog health is
   # `unavailable({:needs_onboarding, :missing})` is refused with the EXACT
   # `tightbeam onboard <provider> --as-user <userId>` remedy — the same sentence boot
@@ -5519,16 +5519,16 @@ defmodule Tightbeam.GatewayTest do
     refute_received {:prompt_started, _}
   end
 
-  # AC6 (spec 0b13f0d3 §O6), the present-but-unverified clause: a host whose credential
+  # AC6 (spec 1ae8fa52 §O6), the present-but-unverified clause: a host whose credential
   # is present-and-live but whose harness cannot execute surfaces as catalog `fresh` +
   # broken executability (spec O1/AC1), which is NOT `needs_onboarding`. Such a turn MUST
   # NOT be refused with the onboarding remedy — "run onboard" would be false, the
   # credential is already present. Here the observable precondition is reproduced directly:
   # a FRESH catalog for testhost/claude while checkout is broken. `unonboarded_refusal`
   # reads `fresh`, returns `:not_applicable`, and the turn's reason stays its real
-  # executability/adapter gap. This is the guard the narrow `:missing` match provides; the
-  # `:credential_server_unavailable` transient it also excludes is covered by the
-  # adapter-heal suite (29 arenas run without a Credentials server).
+  # executability/adapter gap. This guards the `:fresh` axis of I7's narrow `:missing`
+  # match; the `:credential_server_unavailable` transient axis is guarded by the next test
+  # (the two together pin that I7 refuses on `:missing` specifically, never the wildcard).
   test "a turn on a fresh-but-unexecutable host is not misrouted to the onboarding remedy",
        ctx do
     exact_registry =
@@ -5588,6 +5588,88 @@ defmodule Tightbeam.GatewayTest do
 
     # The refusal names the REAL gap (executability/adapter degraded), never the
     # onboarding remedy — the credential is present, so "run onboard" would be false.
+    assert reason =~ "is degraded"
+    refute reason =~ "tightbeam onboard"
+    refute reason =~ "--as-user"
+  end
+
+  # AC6 / I7 (spec 1ae8fa52 §O6), the r4.2 narrowing guard: I7 refuses ONLY on `:missing`
+  # (the credential store AFFIRMATIVELY answering "absent"), NEVER on the wildcard
+  # `{:needs_onboarding, _}`. The `:credential_server_unavailable` transient means "could
+  # not ASK" — the Credentials server was momentarily unreachable — and MUST NOT be
+  # misrouted into a false onboarding remedy: telling an operator to `onboard` when the
+  # real fault is a down credential server aims them at the wrong repair (the misrouting
+  # hazard r4.2 names, and gateway.ex:4108-4116 guards with the narrow match). A turn whose
+  # turn-seam catalog health is that transient (checkout also broken) is refused by its
+  # real executability gap, never the onboarding remedy. This is the turn-seam axis Test A
+  # (`:missing`) and Test B (`:fresh`) leave uncovered: a regression reverting
+  # gateway.ex:4117 `:missing` back to the wildcard `{:needs_onboarding, _}` passes both of
+  # them but goes RED here. (The 29 adapter-heal arenas cover the SPAWN path's
+  # credential_status, gateway.ex:4160 — a different seam from unonboarded_refusal.)
+  test "a turn on a credential-server-unavailable transient is not misrouted to the onboarding remedy",
+       ctx do
+    exact_registry =
+      start_supervised!(%{
+        id: :o6_transient_conn_registry,
+        start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+      })
+
+    start_supervised!({CoordinatorStub, {fn _key -> {:error, :degraded} end, self()}})
+
+    {:ok, _ref, nil} =
+      ConnRegistry.register(exact_registry, %{
+        pid: self(),
+        user_id: "flynn",
+        device_id: "o6-transient",
+        is_admin: false,
+        subscriptions: MapSet.new(["chat"])
+      })
+
+    base = gateway_children_base!()
+
+    config = %{
+      base_dir: base,
+      cwd: "/tmp",
+      port: 0,
+      default_harness: :claude,
+      default_model: Model.new("claude-fable-5"),
+      max_live_sessions_per_user: 50,
+      wake_tick_ms: 1_000,
+      onboarding_lease_ms: 1_800_000,
+      db: ctx.db
+    }
+
+    children = Gateway.children(config)
+
+    {Tightbeam.LaneManager, lane_opts} =
+      Enum.find(children, &match?({Tightbeam.LaneManager, _}, &1))
+
+    runner = Keyword.fetch!(lane_opts, :runner)
+
+    # The transient: "could not ASK" (credential server unreachable), NOT an affirmative
+    # "absent". Health becomes {:unavailable, {:needs_onboarding, :credential_server_unavailable}},
+    # which is NOT :missing, so unonboarded_refusal returns :not_applicable.
+    degrade_host_catalog(
+      "testhost",
+      "claude",
+      {:needs_onboarding, :credential_server_unavailable}
+    )
+
+    assert :appended =
+             Gateway.deliver_prompt("k1", "user:flynn", "hi",
+               db: ctx.db,
+               conn_registry: exact_registry,
+               lane_manager: ctx.lane,
+               device_id: "o6-transient",
+               client_message_id: "c_o6_transient"
+             )
+
+    assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
+
+    assert {:error, %{reason: reason}} = runner.(Map.put(turn, :session_key, "k1"))
+
+    # Refused by its real (executability/adapter) gap, never the onboarding remedy —
+    # a "could not ask" transient is not a "you have no credential" verdict.
     assert reason =~ "is degraded"
     refute reason =~ "tightbeam onboard"
     refute reason =~ "--as-user"
