@@ -8,10 +8,11 @@ description: The worktree is the isolation boundary when many agents edit one re
 Other agents edit the same repository at the same time. The worktree is the isolation
 boundary.
 
-1. Prefer to work in a worktree of your own whenever the project is in a git repo.
-   Create it at the start of the assignment, **inside your own workdir**
-   (`<workdir>/<branch-name>/`), on a branch named for the work — your workdir holds
-   everything the assignment produces, the worktree included.
+1. Work in a worktree that is yours to write whenever the project is in a git repo: by
+   default one you create at the start of the assignment, **inside your own workdir**
+   (`<workdir>/<branch-name>/`), on a branch named for the work; or one the assigning
+   agent hands you for the job (an orchestrator passing a worktree down to you). Either
+   way it lives in a durable assignment workdir — never system temp or your home.
 2. A repo below your session root does not announce its conventions: its `AGENTS.md`
    and committed skills do not load into your session. Read them when you enter it.
 3. Declare the files your goal touches on the assignment (`--files '["path", ...]'`).
