@@ -275,6 +275,19 @@ defmodule Tightbeam.ModelCatalog do
   def offers_effort?(%{efforts: []}, effort), do: is_nil(effort)
   def offers_effort?(%{efforts: efforts}, effort), do: effort in efforts
 
+  @doc """
+  The wired edge from a credential commit (O4/I5): re-recognize NOW that a
+  credential became present for `{host, provider}`, re-deriving the catalog for
+  every harness that spends `provider` on `host` without waiting for the TTL.
+  World-state stays the authority the re-derivation re-reads; this fact is only
+  the injector that says "re-recognize now."
+  """
+  @spec credential_present(String.t(), atom(), GenServer.server()) :: :ok
+  def credential_present(host, provider, server \\ __MODULE__)
+      when is_binary(host) and is_atom(provider) do
+    GenServer.cast(server, {:credential_present, host, provider})
+  end
+
   @impl true
   def init(opts) do
     state = %{
@@ -311,6 +324,21 @@ defmodule Tightbeam.ModelCatalog do
     {:reply, answer, state}
   end
 
+  # The RHS of the credential-present recognition (O4/I5): re-derive the catalog
+  # for every harness that spends `provider` on `host`, NOW, reading current
+  # world-state. Provider-scoped by the same rule the runtime uses — a harness
+  # spends exactly one provider's credential — so a claude re-derivation is never
+  # gated on codex, and vice-versa.
+  @impl true
+  def handle_cast({:credential_present, host, provider}, state) do
+    keys =
+      for harness <- harness_names(),
+          Harness.parse!(harness).credential_provider() == provider,
+          do: {host, harness}
+
+    {:noreply, Enum.reduce(keys, state, &force_rederive(&2, &1))}
+  end
+
   @impl true
   def handle_info(:refresh_due, state), do: {:noreply, refresh_due(state)}
 
@@ -336,8 +364,16 @@ defmodule Tightbeam.ModelCatalog do
         {:noreply, state}
 
       cache ->
-        cache = cache |> Map.put(:reason, reason) |> Map.put(:refreshing, false)
-        {:noreply, put_in(state, [:entries, key], cache)}
+        recheck? = Map.get(cache, :recheck, false)
+
+        cache =
+          cache
+          |> Map.put(:reason, reason)
+          |> Map.put(:refreshing, false)
+          |> Map.put(:recheck, false)
+
+        state = put_in(state, [:entries, key], cache)
+        {:noreply, maybe_recheck(state, key, recheck?)}
     end
   end
 
@@ -382,6 +418,38 @@ defmodule Tightbeam.ModelCatalog do
       |> put_in([:entries, key, :attempted_at], now)
     else
       state
+    end
+  end
+
+  # A credential-present recognition re-derives one {host, harness} now. A
+  # needs_onboarding entry is already expired (expired?/3), so refresh_key
+  # re-derives it against current world-state. If a derive is already in flight
+  # it may have read PRE-commit world-state (the credential had not landed when
+  # it started), so rather than race a second task past it, the entry is flagged
+  # to re-check when that derive completes — the wired edge has no periodic sweep
+  # to fall back on, so it must not drop the re-recognition.
+  defp force_rederive(state, {host, _harness} = key) do
+    case Map.get(enumerate_hosts(state), host) do
+      nil ->
+        state
+
+      host_config ->
+        case state.entries[key] do
+          %{refreshing: true} = cache ->
+            put_in(state, [:entries, key], Map.put(cache, :recheck, true))
+
+          _ ->
+            refresh_key(state, key, host_config)
+        end
+    end
+  end
+
+  defp maybe_recheck(state, _key, false), do: state
+
+  defp maybe_recheck(state, {host, _harness} = key, true) do
+    case Map.get(enumerate_hosts(state), host) do
+      nil -> state
+      host_config -> refresh_key(state, key, host_config)
     end
   end
 
@@ -492,6 +560,14 @@ defmodule Tightbeam.ModelCatalog do
   defp health(cache, now, ttl) do
     if now - cache.derived_at < ttl, do: :fresh, else: :stale
   end
+
+  # A needs_onboarding outcome is world-state that can change at any instant (a
+  # credential lands mid-TTL), so it is NEVER cached as durable truth: it stays
+  # eligible to re-derive, so the next refresh pass — a read, or the
+  # credential-present recognition — reaches the new world-state rather than
+  # waiting a full TTL later (O4/I5, the DELETE). The `refreshing` guard still
+  # bounds this to one in-flight derive per key.
+  defp expired?(%{reason: {:needs_onboarding, _}}, _now, _ttl), do: true
 
   defp expired?(%{derived_at: nil, attempted_at: nil}, _now, _ttl), do: true
 

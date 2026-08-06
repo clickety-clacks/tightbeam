@@ -267,6 +267,34 @@ defmodule Tightbeam.ConditionFactsTest do
            }).code == "reserved_kind"
   end
 
+  test "credential-present is a substrate-only transition fact scoped host:provider (O4/I5)",
+       ctx do
+    # It marks the credential-commit transition, so only the substrate may file
+    # it — an agent forging it would fake a re-derivation trigger.
+    assert {:error, %{code: "reserved_kind"}} =
+             ConditionFacts.file(ctx.db, ctx.scheduler, %{
+               kind: "credential-present",
+               scope: "gibson:anthropic",
+               origin: "agent:someone"
+             })
+
+    filed =
+      ConditionFacts.file(ctx.db, ctx.scheduler, %{
+        kind: "credential-present",
+        scope: "gibson:anthropic",
+        origin: "process:tightbeam"
+      })
+
+    assert filed.kind == "credential-present"
+    assert filed.scope == "gibson:anthropic"
+
+    # It is an occurrence, not a standing pair: asking standing?/3 of it is a
+    # category error, so it must not have been mistaken for a retractable flag.
+    assert_raise KeyError, fn ->
+      ConditionFacts.standing?(ctx.db, "credential-present", "gibson:anthropic")
+    end
+  end
+
   test "facts-read returns the latest fact by kind and optional scope", ctx do
     first =
       ConditionFacts.file(ctx.db, ctx.scheduler, %{

@@ -1383,6 +1383,165 @@ defmodule Tightbeam.ModelCatalogTest do
     end
   end
 
+  # O4/I5/AC4 — a credential commit re-derives the catalog immediately, without
+  # waiting for the TTL. Two behaviors, tested apart: the DELETE (a
+  # needs_onboarding outcome is not cached under the full TTL, so the pull
+  # backstop re-derives on the next read) and the PUSH (the wired
+  # `credential-present` recognition re-derives with no read at all).
+  describe "credential-present re-derivation (O4/I5/AC4)" do
+    # AC4 fail-before: today a needs_onboarding outcome is cached under the full
+    # TTL via `attempted_at`, so a read after the credential lands — but before
+    # the TTL lapses — still returns the stale needs_onboarding entry. The clock
+    # never advances here; only the world-state (credential presence) changes.
+    test "a needs_onboarding outcome is not cached under the full TTL — the next read re-derives",
+         ctx do
+      present? =
+        start_supervised!(%{
+          id: unique_name(:present),
+          start: {Agent, :start_link, [fn -> false end]}
+        })
+
+      status = fn _provider ->
+        if Agent.get(present?, & &1), do: :onboarded, else: {:needs_onboarding, :missing}
+      end
+
+      catalog =
+        start_catalog(ctx,
+          ttl_ms: :timer.minutes(15),
+          now: fn -> 0 end,
+          credential_status: status
+        )
+
+      # First boot: no credential in the home yet → catalog is needs_onboarding.
+      await(fn ->
+        match?(
+          {[], {:unavailable, {:needs_onboarding, :missing}}},
+          ModelCatalog.get(@host, "claude", catalog)
+        )
+      end)
+
+      # The credential lands in the home (world-state flips) well under the TTL;
+      # the clock does NOT move, so any re-derivation is driven by the changed
+      # world-state, never by a timer.
+      Agent.update(present?, fn _ -> true end)
+
+      await_fresh(catalog, "claude")
+      {claude, :fresh} = ModelCatalog.get(@host, "claude", catalog)
+      assert claude != []
+
+      # End-to-end bar: placement is USABLE, not merely fresh.
+      assert {:ok, %{harness: "claude"}} =
+               ModelCatalog.route(
+                 @host,
+                 "claude",
+                 Model.new("claude-sonnet-5", effort: "high"),
+                 catalog
+               )
+    end
+
+    # The PUSH: the wired edge itself. A credential commit files the
+    # `credential-present` fact, whose recognition re-derives NOW — proven by the
+    # derivation probe running with no `get/3` (no read) ever forcing it. The
+    # probe (a claude `/v1/models` fetch) runs ONLY past the credential gate, so
+    # its arrival is the signal that a re-derivation started from the recognition.
+    test "the credential-present recognition re-derives with no read, and is provider-scoped",
+         ctx do
+      test_pid = self()
+
+      present? =
+        start_supervised!(%{
+          id: unique_name(:present),
+          start: {Agent, :start_link, [fn -> false end]}
+        })
+
+      status = fn _provider ->
+        if Agent.get(present?, & &1), do: :onboarded, else: {:needs_onboarding, :missing}
+      end
+
+      probing_fetch = fn path, headers ->
+        send(test_pid, {:claude_probed, path})
+        ctx.claude_fetch.(path, headers)
+      end
+
+      catalog =
+        start_catalog(ctx,
+          ttl_ms: :timer.minutes(15),
+          now: fn -> 0 end,
+          credential_status: status,
+          claude_fetch: probing_fetch
+        )
+
+      # Drain boot: needs_onboarding short-circuits before the probe, so no fetch
+      # runs while the credential is absent.
+      await(fn ->
+        match?(
+          {[], {:unavailable, {:needs_onboarding, :missing}}},
+          ModelCatalog.get(@host, "claude", catalog)
+        )
+      end)
+
+      refute_received {:claude_probed, _}
+
+      # The credential lands, then the wired recognition fires. No get/3 follows —
+      # so a probe can only come from the recognition re-deriving.
+      Agent.update(present?, fn _ -> true end)
+      ModelCatalog.credential_present(@host, :anthropic, catalog)
+
+      assert_receive {:claude_probed, "/v1/models?limit=100"}, 2_000
+    end
+
+    # The eezo production repro (orchestrator, 2026-08-06): a CLEAN one-shot
+    # ceremony, yet placement refused with `:in_progress` MINUTES after `status`
+    # read onboarded. `credential_status/2` returns `:in_progress` only while the
+    # onboarding lease stands (credentials.ex), and `finish_onboard` clears the
+    # lease on completion — so the refusal minutes later is the CATALOG holding
+    # the during-ceremony `{:needs_onboarding, :in_progress}` under the full TTL,
+    # not a live status. The credential-present recognition must make placement
+    # usable immediately, whatever needs_onboarding sub-reason was cached.
+    test "placement is usable right after the recognition, even when the cached refusal was :in_progress",
+         ctx do
+      present? =
+        start_supervised!(%{
+          id: unique_name(:present),
+          start: {Agent, :start_link, [fn -> false end]}
+        })
+
+      status = fn _provider ->
+        if Agent.get(present?, & &1), do: :onboarded, else: {:needs_onboarding, :in_progress}
+      end
+
+      catalog =
+        start_catalog(ctx,
+          ttl_ms: :timer.minutes(15),
+          now: fn -> 0 end,
+          credential_status: status
+        )
+
+      opus_high = Model.new("claude-opus-5", effort: "high")
+
+      # During the ceremony the catalog cached the lease's `:in_progress`, so
+      # placement refuses — naming the catalog, on the stale reason.
+      await(fn ->
+        match?(
+          {:error,
+           %Unroutable{
+             cause: :no_catalog,
+             health: [{"claude", {:unavailable, {:needs_onboarding, :in_progress}}}]
+           }},
+          ModelCatalog.route(@host, "claude", opus_high, catalog)
+        )
+      end)
+
+      # Ceremony completes: lease cleared, credential live. The wired recognition
+      # fires; the clock never moves, so nothing but the fact drives this.
+      Agent.update(present?, fn _ -> true end)
+      ModelCatalog.credential_present(@host, :anthropic, catalog)
+
+      # Placement succeeds NOW — within derivation latency, not a TTL later.
+      await(fn -> match?({:ok, _}, ModelCatalog.route(@host, "claude", opus_high, catalog)) end)
+    end
+  end
+
   defp await(_fun, 0), do: flunk("condition did not become true")
   defp unique_name(label), do: String.to_atom("#{label}_#{System.unique_integer([:positive])}")
 

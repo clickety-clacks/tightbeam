@@ -16,7 +16,7 @@ defmodule Tightbeam.ConditionFacts do
   alias Tightbeam.{DB, EventLog, Idempotency, Wakes}
   alias Tightbeam.DB.Txn
 
-  @reserved_kinds ~w(quota-recovered escalation-ruled user-alerted user-alert-cleared)
+  @reserved_kinds ~w(quota-recovered escalation-ruled user-alerted user-alert-cleared credential-present)
   @agent_only_kinds ~w(work-blocked work-unblocked)
 
   @standing_pairs %{
