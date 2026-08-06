@@ -48,7 +48,17 @@ defmodule Tightbeam.ReadinessTest do
 
     %{
       base: base,
-      config: %{base_dir: base, db: db, default_model: Model.new("m", effort: "medium")}
+      config: %{
+        base_dir: base,
+        db: db,
+        default_model: Model.new("m", effort: "medium"),
+        # HERMETIC by default: the executability axis reuses the real
+        # `Placement.harness_binary_probe`, which spawns a `--version` subprocess.
+        # Tests that care about executability override this; every other test gets
+        # a runnable stub so the summary stays the pure assembly its design
+        # promises. A test wanting a broken binary passes its own probe.
+        harness_binary_probe: fn _id, _cli_bin -> {:ok, %{bin: "stub", version: "stub 1.0"}} end
+      }
     }
   end
 
@@ -95,7 +105,7 @@ defmodule Tightbeam.ReadinessTest do
     assert Enum.any?(lines, &(&1 =~ "serving"))
   end
 
-  test "a fully ready install says so in ONE line and says nothing else", ctx do
+  test "a fully ready install says READY and adds ONLY the mandated pre-expiry advisory", ctx do
     for module <- Harness.all(), do: install_adapter!(ctx.base, module)
     catalog = catalog!(Map.new(Harness.all(), &{&1.wire_name(), live("m")}))
 
@@ -109,12 +119,22 @@ defmodule Tightbeam.ReadinessTest do
     assert summary.runnable?
     names = Enum.map_join(Harness.all(), ", ", &"#{&1.wire_name()} on testhost")
 
-    # EXACT output, not "does not contain". A working install states it and stops.
-    # "Does not nag" is guarded twice — the ready harness is rejected before
-    # rendering, AND a gapless row renders nothing — so an assertion that only
-    # forbids certain substrings passes when EITHER guard holds and cannot tell
-    # you the other has gone. Pinning the whole render makes both load-bearing.
-    assert Readiness.render(summary, ctx.config) == ["READY: #{names} can run turns."]
+    [first | rest] = Readiness.render(summary, ctx.config)
+
+    # The verdict is still one clean line and still FIRST — the anti-nag guarantee
+    # for GAPS holds: no adapter/credential/model/foreground line leaks here.
+    assert first == "READY: #{names} can run turns."
+
+    # …but O7/I8 (PO ruling) require the pre-expiry-absence to be NAMED for every
+    # onboarded credential, so a healthy install is no longer literally one line:
+    # it carries exactly one advisory per live credential, and NOTHING else.
+    advisory = Enum.reject(rest, &(&1 == ""))
+    assert length(advisory) == length(Harness.all())
+
+    assert Enum.all?(advisory, &(&1 =~ "no pre-expiry warning is available")),
+           "the only thing a ready install adds is the O7 pre-expiry advisory"
+
+    refute Enum.any?(advisory, &(&1 =~ "FOREGROUND")), "supervised: no foreground line"
   end
 
   test "a ready install with NO service manager says so — the install is not finished", ctx do
@@ -396,21 +416,28 @@ defmodule Tightbeam.ReadinessTest do
 
     rows =
       for adapter <- [:present, {:missing, "/p"}, {:unknown, :not_probed_on_satellite}],
+          binary <- [
+            :runnable,
+            {:broken, {:exec_failed, "boom"}},
+            {:unknown, :not_probed_on_satellite}
+          ],
           credential <- [:live, {:absent, :missing}, {:unknown, :x}, {:degraded, :y}],
           model <- [:selectable, :unset, {:unroutable, unroutable}, :unknown] do
         %{
           host: "somehost",
           base_dir: "/some/base",
           harness: "h",
-          # Rows here are built directly rather than through harness_row/3, so a
+          # Rows here are built directly rather than through harness_row/6, so a
           # new key must be mirrored or every row crashes instead of rendering —
           # which this test would report as a silence failure, correctly.
           provider: :a_provider,
           adapter: adapter,
+          binary: binary,
           credential: credential,
           model: model,
           runnable?:
-            not match?({:missing, _}, adapter) and credential == :live and model == :selectable
+            not match?({:missing, _}, adapter) and not match?({:broken, _}, binary) and
+              credential == :live and model == :selectable
         }
       end
 
@@ -420,12 +447,187 @@ defmodule Tightbeam.ReadinessTest do
         |> Readiness.render(ctx.config)
         |> Enum.drop(3)
         |> Enum.reject(
-          &(&1 == "" or String.starts_with?(&1, "Diagnose") or &1 =~ ~r/^  h on somehost:$/)
+          # The O7 pre-expiry advisory is a standing note about a PRESENT
+          # credential, not a gap explanation — rejecting it keeps this test's
+          # teeth on the GAP-explanation invariant it exists for.
+          &(&1 == "" or String.starts_with?(&1, "Diagnose") or &1 =~ "no pre-expiry warning" or
+              &1 =~ ~r/^  h on somehost:$/)
         )
 
       refute explanation == [],
              "blocked row renders no explanation: #{inspect(Map.drop(row, [:harness]))}"
     end
+  end
+
+  ## Executability is a distinct axis (O5/I6), and the pre-expiry absence is named (O7/I8)
+
+  # AC5, the real fail-before: with the vendor CLI installed but unable to
+  # execute (the gibson codex-as-`.js`-without-node incident), boot said only
+  # "Tightbeam has no credential for openai" — true and useless, since onboarding
+  # a credential cannot start a binary that cannot run. Readiness must name the
+  # EXECUTABILITY gap and must NOT lead with the credential remedy.
+  test "an installed-but-unrunnable harness names the executability gap, not 'no credential'",
+       ctx do
+    [module | _] = Harness.all()
+    install_adapter!(ctx.base, module)
+
+    # Credential absent (catalog empty, needs_onboarding) AND the vendor CLI is
+    # installed but cannot execute.
+    catalog =
+      catalog!(%{module.wire_name() => {[], {:unavailable, {:needs_onboarding, :missing}}}})
+
+    config =
+      Map.put(ctx.config, :harness_binary_probe, fn _id, _cli_bin ->
+        {:error, {:exec_failed, "node: not found"}}
+      end)
+
+    summary = Readiness.summary(config, catalog)
+    row = Enum.find(summary.harnesses, &(&1.harness == module.wire_name()))
+    refute row.runnable?
+
+    lines = Readiness.render(summary, config)
+    exec_line = Enum.find(lines, &(&1 =~ "CANNOT RUN"))
+
+    assert exec_line, "the executability gap must be named"
+    assert exec_line =~ module.wire_name()
+    assert exec_line =~ "onboarding a credential cannot help"
+
+    # onboarding cannot help an unrunnable harness — the credential remedy is
+    # suppressed so the operator is sent to the gap they can actually act on.
+    refute Enum.any?(lines, &(&1 =~ "Tightbeam has no credential")),
+           "must not lead with 'no credential' for a harness that cannot execute"
+  end
+
+  # AC5, the can-execute half: precedence must not swing the other way — a harness
+  # that CAN run but has no credential is still sent to onboarding, not blamed on
+  # executability.
+  test "a runnable harness with no credential still names onboarding", ctx do
+    [module | _] = Harness.all()
+    install_adapter!(ctx.base, module)
+
+    catalog =
+      catalog!(%{module.wire_name() => {[], {:unavailable, {:needs_onboarding, :missing}}}})
+
+    config =
+      Map.put(ctx.config, :harness_binary_probe, fn _id, _cli_bin ->
+        {:ok, %{bin: "/fake", version: "1.0"}}
+      end)
+
+    lines = config |> Readiness.summary(catalog) |> Readiness.render(config)
+
+    assert Enum.any?(lines, &(&1 =~ "tightbeam onboard #{module.credential_provider()}"))
+    refute Enum.any?(lines, &(&1 =~ "CANNOT RUN"))
+  end
+
+  # The runnable? fold (present-but-unverified shape, supports O1/AC1): a live
+  # credential and a fresh catalog do NOT make a harness runnable if its CLI cannot
+  # execute. This is the exact case AC1 needs readiness to render as an
+  # executability gap rather than as "no credential" or needs_onboarding.
+  test "runnable? is false when the CLI cannot run despite a live credential and fresh catalog",
+       ctx do
+    [module | _] = Harness.all()
+    install_adapter!(ctx.base, module)
+    catalog = catalog!(%{module.wire_name() => live("m")})
+
+    config =
+      Map.put(ctx.config, :harness_binary_probe, fn _id, _cli_bin ->
+        {:error, {:exec_failed, "node: not found"}}
+      end)
+
+    summary = Readiness.summary(config, catalog)
+    row = Enum.find(summary.harnesses, &(&1.harness == module.wire_name()))
+
+    assert row.credential == :live, "the credential IS present and live here"
+
+    refute row.runnable?,
+           "a harness whose CLI cannot run is not runnable even with a live credential"
+
+    lines = Readiness.render(summary, config)
+    assert Enum.any?(lines, &(&1 =~ "CANNOT RUN")), "the executability gap must be named"
+
+    # It is NOT a needs-onboarding refusal — the credential is present and live,
+    # so sending the operator to onboard would be false.
+    refute Enum.any?(lines, &(&1 =~ "tightbeam onboard")),
+           "a present-but-unverified host must not be sent to onboarding"
+  end
+
+  # A satellite whose executability boot cannot probe stays UNKNOWN and does not
+  # veto runnability — the standing rule (no guessing on satellites) applies to the
+  # executability axis exactly as it does to the adapter axis.
+  test "executability boot cannot probe (satellite) stays unknown and does not veto", ctx do
+    [module | _] = Harness.all()
+    # Register a non-local host so its row is built as a satellite.
+    {:ok, _} =
+      Tightbeam.Placement.register_host(ctx.config.db, "faraway", %{
+        ssh: "faraway",
+        base_dir: "/remote/base",
+        cli_bin: "/remote/bin"
+      })
+
+    catalog = catalog!(%{{"faraway", module.wire_name()} => live("m")})
+
+    # A probe that would FAIL if it were ever called on the satellite — the point
+    # is that it is not, so executability is unknown, not broken.
+    config =
+      Map.put(ctx.config, :harness_binary_probe, fn _id, _cli_bin ->
+        {:error, {:exec_failed, "should not be probed on a satellite"}}
+      end)
+
+    row =
+      Readiness.summary(config, catalog).harnesses
+      |> Enum.find(&(&1.host == "faraway" and &1.harness == module.wire_name()))
+
+    assert match?({:unknown, _}, row.binary),
+           "satellite executability is unknowable from boot, so it must be unknown"
+
+    # unknown does not veto: a live credential + fresh catalog + present-or-unknown
+    # adapter on a satellite is still reported runnable, not blocked on a probe boot
+    # could not run.
+    assert row.runnable?
+  end
+
+  # AC7 (absence named): O7's positive deliverable. For each onboarded (live)
+  # credential, readiness states plainly that no pre-expiry warning is available —
+  # the credential self-rotates or never expires, so an observed 401 is its only
+  # failure signal, not an advance courtesy.
+  test "readiness names that no pre-expiry warning is available for each onboarded credential",
+       ctx do
+    [module | _] = Harness.all()
+    install_adapter!(ctx.base, module)
+    catalog = catalog!(%{module.wire_name() => live("m")})
+
+    config =
+      Map.put(ctx.config, :harness_binary_probe, fn _id, _cli_bin ->
+        {:ok, %{bin: "/fake", version: "1.0"}}
+      end)
+
+    lines = config |> Readiness.summary(catalog) |> Readiness.render(config)
+    line = Enum.find(lines, &(&1 =~ "pre-expiry"))
+
+    assert line, "the absence of a pre-expiry warning must be named for an onboarded credential"
+    assert line =~ module.wire_name()
+    assert line =~ "401", "the only real failure signal (an observed 401) must be named"
+  end
+
+  # The absence line is for CREDENTIALS THAT EXIST. A host with no credential is
+  # being told to onboard; naming a pre-expiry absence there would be noise about a
+  # credential that is not present.
+  test "the pre-expiry absence is NOT named for a host with no credential", ctx do
+    [module | _] = Harness.all()
+    install_adapter!(ctx.base, module)
+
+    catalog =
+      catalog!(%{module.wire_name() => {[], {:unavailable, {:needs_onboarding, :missing}}}})
+
+    config =
+      Map.put(ctx.config, :harness_binary_probe, fn _id, _cli_bin ->
+        {:ok, %{bin: "/fake", version: "1.0"}}
+      end)
+
+    lines = config |> Readiness.summary(catalog) |> Readiness.render(config)
+
+    refute Enum.any?(lines, &(&1 =~ "pre-expiry")),
+           "no pre-expiry line for a credential that is not present"
   end
 
   ## The derivation this module rests on

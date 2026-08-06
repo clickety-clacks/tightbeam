@@ -13,15 +13,25 @@ defmodule Tightbeam.Readiness do
   This does not refuse a boot, gate anything, or return a status. It only makes
   the closing statement true.
 
-  ASSEMBLED, NOT PROBED. Every fact here is one boot already has:
+  ASSEMBLED FROM CHEAP LOCAL FACTS, NEVER FROM AN INFERENCE TURN. Every fact
+  here is one boot already establishes for itself:
 
   - the model catalog's per-harness `{entries, health}`, already cached by the
     refresh that runs during boot — a GenServer read, no network;
-  - one `File.exists?` per harness on the adapter path.
+  - one `File.exists?` per harness on the adapter path;
+  - one harness-CLI version probe per LOCAL harness — the executability axis
+    (O5/I6). It reuses `Placement.harness_binary_probe`, the SAME probe boot's
+    own preflight already runs, so readiness reads the executability taxonomy
+    `doctor` surfaces as `harness_binary:*` rather than forking a parallel one.
+    A bounded `--version` call is not free, but it is nothing like the gate
+    probe: no inference turn, no socket, no network. It is run only for the
+    local host; a satellite's executability is unknowable from here and stays
+    unknown, never reported as a failure.
 
-  Nothing here starts a process, opens a socket, or runs a turn. In particular
-  it must never grow anything shaped like the gate probe, which costs ~9.5s
-  because it is a real inference turn.
+  It must never grow anything shaped like the gate probe, which costs ~9.5s
+  because it is a real inference turn. A live model turn, a socket, a network
+  round-trip are all out; the local, bounded facts above — which boot already
+  pays for — are in.
 
   AND IT DOES NOT GUESS. `credential_server_unavailable` is the diagnostic being
   unable to look, not a dead credential — the same trap `mix tightbeam.doctor`
@@ -37,6 +47,7 @@ defmodule Tightbeam.Readiness do
           base_dir: String.t(),
           harness: String.t(),
           adapter: :present | {:missing, String.t()} | {:unknown, atom()},
+          binary: :runnable | {:broken, term()} | {:unknown, atom()},
           credential: :live | {:absent, atom()} | {:unknown, term()} | {:degraded, term()},
           model: :selectable | :unset | {:unroutable, Unroutable.t()} | :unknown,
           runnable?: boolean()
@@ -131,6 +142,7 @@ defmodule Tightbeam.Readiness do
     {entries, health} = ModelCatalog.get(host, wire, catalog)
 
     adapter = adapter_state(module, local?, config)
+    binary = binary_state(module, local?, config)
     credential = credential_state(entries, health)
     model = model_state(host, wire, credential, config, catalog)
 
@@ -145,15 +157,21 @@ defmodule Tightbeam.Readiness do
       # operator is told to act on. The harness already knows its own provider.
       provider: module.credential_provider(),
       adapter: adapter,
+      binary: binary,
       credential: credential,
       model: model,
-      # An UNKNOWN adapter does not veto. Boot establishes adapter presence with
-      # one local File.exists?, which cannot see a satellite, and this module's
-      # rule is that a fact it cannot establish is never reported as a failure of
-      # the thing it names — vetoing on it would print that failure on every
-      # healthy satellite, on every boot.
+      # An UNKNOWN adapter or an UNKNOWN binary does not veto. Boot establishes
+      # both with local checks that cannot see a satellite, and this module's rule
+      # is that a fact it cannot establish is never reported as a failure of the
+      # thing it names — vetoing on it would print that failure on every healthy
+      # satellite, on every boot. A binary that is KNOWN broken does veto: a
+      # harness whose vendor CLI cannot run is not runnable regardless of a live
+      # credential or a fresh catalog (O5/I6) — this is what makes a
+      # present-but-unverified host (credential live, catalog fresh, runtime dead)
+      # render as an executability gap rather than as READY.
       runnable?:
-        not match?({:missing, _}, adapter) and credential == :live and model == :selectable
+        not match?({:missing, _}, adapter) and not match?({:broken, _}, binary) and
+          credential == :live and model == :selectable
     }
   end
 
@@ -174,6 +192,27 @@ defmodule Tightbeam.Readiness do
       ])
 
     if File.exists?(path), do: :present, else: {:missing, path}
+  end
+
+  # The executability axis (O5/I6): can this harness actually RUN here? The vendor
+  # CLI must be runnable, checked with the SAME probe boot's preflight already
+  # runs (`Placement.harness_binary_probe`) and `doctor` surfaces as
+  # `harness_binary:*` — readiness reads that taxonomy, it does not fork one. Like
+  # the adapter, the CLI is probed only on the local host; a satellite's
+  # executability is unknowable from boot and reported unknown, never as a
+  # failure. Injectable via `config.harness_binary_probe`, exactly as `doctor`
+  # injects it, so the summary stays hermetic in tests.
+  defp binary_state(_module, false, _config), do: {:unknown, :not_probed_on_satellite}
+
+  defp binary_state(module, true, config) do
+    probe = Map.get(config, :harness_binary_probe, &Placement.harness_binary_probe/2)
+
+    case probe.(module.id(), Path.join(config.base_dir, "bin")) do
+      # The version string is doctor's to display; readiness needs only the
+      # runnable/broken verdict, so it keeps the axis a plain three-state fact.
+      {:ok, %{version: _version}} -> :runnable
+      {:error, reason} -> {:broken, reason}
+    end
   end
 
   # A non-empty inventory IS the credential working: the catalog was fetched
@@ -243,6 +282,7 @@ defmodule Tightbeam.Readiness do
 
     ["READY: #{ready} can run turns."] ++
       Enum.flat_map(blocked, &harness_lines/1) ++
+      pre_expiry_lines(rows) ++
       archetype_lines(summary) ++
       supervision_lines()
   end
@@ -254,8 +294,34 @@ defmodule Tightbeam.Readiness do
       "gaps below are closed."
     ] ++
       Enum.flat_map(rows, &harness_lines/1) ++
+      pre_expiry_lines(rows) ++
       archetype_lines(summary) ++
       ["", "Diagnose further with: mix tightbeam.doctor (base_dir #{config.base_dir})"]
+  end
+
+  # O7/I8 (PO ruling 2026-08-06): no credential kind carries a readable expiry, so
+  # there is NO pre-expiry wake — and this module is where that subtraction is made
+  # HONEST rather than silent. For every credential that is present and working (a
+  # live inventory), readiness states plainly that no pre-expiry warning is
+  # available: the credential self-rotates or never expires, so an observed 401 in
+  # flight is its only failure signal, not an advance courtesy. It builds no wake
+  # and no horizon, reads no expiry value, and asserts nothing about current health
+  # (which stays 401-observed, I3/I8) — it only names the absence so the operator
+  # learns the credential's one real failure signal.
+  defp pre_expiry_lines(rows) do
+    case Enum.filter(rows, &(&1.credential == :live)) do
+      [] ->
+        []
+
+      live ->
+        [""] ++
+          Enum.map(live, fn row ->
+            "#{row.harness} on #{row.host}: no pre-expiry warning is available for this " <>
+              "credential kind — it self-rotates or never expires, so Tightbeam reads no " <>
+              "expiry and an observed 401 in flight is its only failure signal, not an " <>
+              "advance warning."
+          end)
+    end
   end
 
   # `Map.get`, not a pattern: tests build summary maps by hand and a summary
@@ -306,8 +372,21 @@ defmodule Tightbeam.Readiness do
   end
 
   defp harness_lines(row) do
+    # PRECEDENCE (O5/I6): when a harness cannot EXECUTE, the actionable gap is
+    # executability, not the credential — onboarding a credential cannot start a
+    # binary that will not run. So the executability gap leads (binary_line is
+    # first) and the ONBOARDING remedy is suppressed; the onboarding remedy is
+    # named only when the harness CAN execute but has no working credential. Only
+    # the onboarding remedy (an ABSENT credential) is suppressed — a degraded or
+    # unknown-credential DIAGNOSIS is not a "no credential" claim and stays, since
+    # it never misdirects the operator to onboard.
+    credential =
+      if executability_broken?(row) and match?({:absent, _}, row.credential),
+        do: nil,
+        else: credential_line(row)
+
     gaps =
-      [adapter_line(row), credential_line(row), model_line(row)]
+      [binary_line(row), adapter_line(row), credential, model_line(row)]
       |> Enum.reject(&is_nil/1)
 
     case gaps do
@@ -321,8 +400,9 @@ defmodule Tightbeam.Readiness do
           "",
           "  #{row.harness} on #{row.host}:",
           "    cannot run turns, and boot could not say why " <>
-            "(adapter=#{inspect(row.adapter)} credential=#{inspect(row.credential)} " <>
-            "model=#{inspect(row.model)}) — please report this, it is a gap in the summary itself"
+            "(adapter=#{inspect(row.adapter)} binary=#{inspect(row.binary)} " <>
+            "credential=#{inspect(row.credential)} model=#{inspect(row.model)}) — please " <>
+            "report this, it is a gap in the summary itself"
         ]
 
       [] ->
@@ -332,6 +412,38 @@ defmodule Tightbeam.Readiness do
         ["", "  #{row.harness} on #{row.host}:"] ++ Enum.map(lines, &("    " <> &1))
     end
   end
+
+  # Executability is broken when a fact boot CAN establish says the harness cannot
+  # run: its vendor CLI is known-broken, or its ACP adapter is missing. An UNKNOWN
+  # binary (a satellite boot cannot probe) is not "broken" — the standing rule
+  # forbids reporting an un-establishable fact as a failure — so it does not
+  # suppress the credential remedy or veto runnability.
+  defp executability_broken?(row) do
+    match?({:broken, _}, row.binary) or match?({:missing, _}, row.adapter)
+  end
+
+  # The executability gap the vendor CLI cannot cover. `:not_found` (not on PATH)
+  # and `{:exec_failed, _}` (on PATH but will not run — the gibson
+  # codex-as-`.js`-without-node incident) are both executability failures a
+  # credential cannot fix; naming them here is O5's whole point.
+  defp binary_line(%{binary: :runnable}), do: nil
+  defp binary_line(%{binary: {:unknown, _reason}}), do: nil
+
+  defp binary_line(%{harness: wire, host: host, binary: {:broken, reason}}) do
+    "#{wire} CLI on #{host} CANNOT RUN (#{describe_binary_failure(reason)}). No turn can " <>
+      "be placed on it, and onboarding a credential cannot help until the binary runs — the " <>
+      "credential remedy is not the fix here. Repair the #{wire} CLI (ensure it is on PATH " <>
+      "and its interpreter is available), then re-check with: mix tightbeam.doctor"
+  end
+
+  # Mirrors `gateway.ex`'s boot-time `describe_probe_failure` so the executability
+  # story reads the same whether it surfaces at preflight or in this summary.
+  defp describe_binary_failure(:not_found), do: "its CLI is not on PATH"
+
+  defp describe_binary_failure({:exec_failed, detail}),
+    do: "its CLI is on PATH but failed to execute: #{String.trim(to_string(detail))}"
+
+  defp describe_binary_failure(other), do: inspect(other)
 
   defp adapter_line(%{adapter: :present}), do: nil
   defp adapter_line(%{adapter: {:unknown, _reason}}), do: nil

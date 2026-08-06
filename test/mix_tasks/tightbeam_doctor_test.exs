@@ -347,6 +347,39 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
     assert Enum.all?(checks, &is_binary(&1["level"]))
   end
 
+  # AC5, doctor's half: an installed-but-unrunnable harness (on PATH but fails to
+  # execute — the gibson codex-as-`.js`-without-node incident) must have its
+  # EXECUTABILITY gap named as its own row, distinct from the credential axis —
+  # doctor is O5's REFERENCE three-way taxonomy that readiness reflects, so it must
+  # not collapse an unrunnable harness into "merely no credential." Regression
+  # guard: this behavior already holds and must stay.
+  test "an installed-but-unrunnable harness names the executability gap, distinct from credential",
+       ctx do
+    probe = fn
+      :claude, _cli_bin -> {:ok, %{bin: "/fake/claude", version: "claude 1.0"}}
+      :codex, _cli_bin -> {:error, {:exec_failed, "node: not found"}}
+      :fixture, _cli_bin -> {:ok, %{bin: "/fake/fixture", version: "fixture 1.0"}}
+    end
+
+    inputs =
+      ctx.inputs
+      |> put(:harness_binary_probe, probe)
+      |> put(:credential_state, fn _provider -> :missing end)
+
+    {_status, report} = Doctor.evaluate(ctx.catalog, inputs)
+
+    # The executability gap is named on its OWN row and points at the exec failure.
+    binary = find(report, "harness_binary:codex")
+    refute binary.ok, "an unrunnable codex CLI must not read as OK"
+    assert binary.detail =~ "exec_failed", "the executability gap must name the exec failure"
+
+    # …and it is DISTINCT from the credential axis: the credential row still exists
+    # and speaks for itself, so codex's problem is never reported as merely
+    # "no credential." A runnable harness's binary row stays a PASS.
+    assert find(report, "harness_auth:codex"), "the credential axis is a separate row"
+    assert find(report, "harness_binary:claude").ok
+  end
+
   defp put(inputs, key, value), do: Keyword.put(inputs, key, value)
 
   defp entry(family, efforts) do
