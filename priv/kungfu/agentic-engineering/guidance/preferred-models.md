@@ -9,6 +9,12 @@ a model not listed here is NOT IN USE — adding one is an intake/release-ceremo
 
 - **claude-fable-5** — deepest judgment and breadth; load-bearing rulings, adversarial
   whole-system review, wisdom-level authoring. Expensive; reserve for what needs it.
+- **claude-opus-5** — INTENDED coding alternate (mike's ruling 2026-08-06: the
+  step-right after sol[medium] for implementation). NOT YET ENTITLED on this
+  account — live-probed refused 2026-08-06 (adapter+grant; positive controls
+  accepted); a daily entitlement watch re-probes and the interim below dies the
+  day it flips. INTERIM: claude-opus-4-8 stands in wherever this capsule is
+  named, as a MARKED temporary substitution, not a silent one.
 - **claude-opus-4-8** — strong general reasoning and composition; coordination,
   drafting under rulings, reviewing another model's code.
 - **claude-sonnet-5** — the everyday mind: conversation, general agency, light
