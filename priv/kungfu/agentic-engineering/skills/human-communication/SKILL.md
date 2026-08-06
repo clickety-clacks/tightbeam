@@ -7,8 +7,9 @@ description: Write to a HUMAN in controlled plain English (derived from ASD-STE1
 
 Your reader is a human with no debugger and no patience for jargon. Write so a
 tired reader parses every sentence exactly one way. Derived from ASD-STE100
-(via danyuchn/asd-ste100-skill, MIT); the discipline, not the certified
-dictionary.
+via danyuchn/asd-ste100-skill — Copyright (c) 2026 Dustin Yuchen Teng, MIT
+License (full text in LICENSE-asd-ste100-skill beside this file); the
+discipline, not the certified dictionary.
 
 Rules, imperative:
 
