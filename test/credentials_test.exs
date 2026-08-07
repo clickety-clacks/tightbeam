@@ -790,21 +790,56 @@ defmodule Tightbeam.CredentialsTest do
         ~s({"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0,"scopes":[]}})
       )
 
-      error =
-        assert_raise RuntimeError, fn ->
-          Tightbeam.Homes.sweep_auth(ctx.base, :claude)
-        end
+      # THE SWEEP SURVIVES IT. This runs on the gateway boot path, where a raise is not a
+      # refusal anyone reads -- it is a kernel panic and a gateway that will not start.
+      # Refusing to bank is the requirement; taking the org down to announce it is not.
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert :ok = Tightbeam.Homes.sweep_auth(ctx.base, :claude)
+        end)
 
       # NAMED, not merely refused: the operator has to be able to find the file. The home
       # rather than the file itself, because the credential FILENAME is private to each
       # harness module and exposing it would mean a new behaviour callback on every
       # harness — a wider change than this fix earns. The home holds one credential.
-      assert error.message =~ home
-      assert error.message =~ "accessToken"
+      assert log =~ home
+      assert log =~ "accessToken"
 
       # And the good credential is still standing. This is the half that matters:
       # refusing to bank is worthless if the store was already overwritten.
       assert File.read!(store) == good
+    end
+
+    # ONE POISONED HOME MUST NOT COST THE OTHERS. `sweep_auth/2` globs `homes/*/<harness>`,
+    # so an exception escaping one iteration would abort the `Enum.each` over every
+    # remaining home -- and, one level up, over every remaining harness.
+    test "a hollow home does not stop the sweep from harvesting the healthy ones", ctx do
+      store = Path.join([ctx.base, "auth", "claude", ".credentials.json"])
+      File.mkdir_p!(Path.dirname(store))
+      File.write!(store, ~s({"claudeAiOauth":{"accessToken":"old","expiresAt":1}}))
+
+      # `aaa` sorts before `zzz`, so the poisoned home is swept FIRST and the healthy one
+      # only lands if the sweep kept going.
+      hollow_home = Path.join([ctx.base, "homes", "aaa", "claude"])
+      healthy_home = Path.join([ctx.base, "homes", "zzz", "claude"])
+      File.mkdir_p!(hollow_home)
+      File.mkdir_p!(healthy_home)
+
+      File.write!(
+        Path.join(hollow_home, ".credentials.json"),
+        ~s({"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0}})
+      )
+
+      rotated =
+        ~s({"claudeAiOauth":{"accessToken":"sk-ant-oat01-fresh","refreshToken":"sk-ant-ort01-fresh","expiresAt":4102444800000}})
+
+      File.write!(Path.join(healthy_home, ".credentials.json"), rotated)
+
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert :ok = Tightbeam.Homes.sweep_auth(ctx.base, :claude)
+      end)
+
+      assert File.read!(store) == rotated
     end
 
     test "store_harvested refuses hollow bytes rather than writing them", ctx do
@@ -865,6 +900,78 @@ defmodule Tightbeam.CredentialsTest do
 
       assert :ok = Tightbeam.Homes.sweep_auth(ctx.base, :claude)
       assert File.read!(store) == rotated
+    end
+
+    # ROUTE 2 OF 3: the ceremony's own bank. Proved by test rather than by construction --
+    # this one goes through `write_credential!/3` and `atomic_write!`, a different mechanism
+    # from the harvest route above, and a guard that is never exercised is not a guard.
+    test "the onboarding ceremony refuses to bank a hollow credential", ctx do
+      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
+      {:ok, staging, lease_id} = Credentials.begin_onboard(:anthropic, server)
+
+      File.write!(
+        Path.join(staging, ".credentials.json"),
+        ~s({"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0}})
+      )
+
+      # A REFUSAL, not a crash. Writing this test is what caught that a raise here killed
+      # the Credentials GenServer and reached the operator as an exit instead of a sentence
+      # — the guard "worked" and reported nothing anyone could act on.
+      assert {:error, {:hollow_credential, %{found: found}}} =
+               Credentials.finish_onboard(:anthropic, :subscription, lease_id, server)
+
+      assert found =~ "accessToken"
+      assert Process.alive?(server)
+      refute File.exists?(Path.join([ctx.base, "auth", "claude", ".credentials.json"]))
+    end
+
+    # ROUTE 3 OF 3: `harvest_auth_back/4`, reached through home reconciliation. This is the
+    # door that most needed its own test: it is `File.read!` + `File.cp!` in a loop, NOT
+    # `atomic_write!`, so "the good credential survives" rests on a different mechanism than
+    # the route that was already covered.
+    test "reconciling a home refuses to copy a hollow credential over the store", ctx do
+      store_dir = Path.join([ctx.base, "auth", "claude"])
+      store = Path.join(store_dir, ".credentials.json")
+      File.mkdir_p!(store_dir)
+
+      good =
+        ~s({"claudeAiOauth":{"accessToken":"sk-ant-oat01-good","refreshToken":"sk-ant-ort01-good","expiresAt":4102444800000}})
+
+      File.write!(store, good)
+
+      home = Tightbeam.Homes.home_path(ctx.base, "eezo", :claude)
+      File.mkdir_p!(home)
+
+      # A REGULAR file in the home, not the symlink reconcile normally leaves: that is
+      # exactly the "left by runtime rotation" state harvest exists to pick up.
+      File.write!(
+        Path.join(home, ".credentials.json"),
+        ~s({"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0}})
+      )
+
+      assert_raise RuntimeError, fn ->
+        Tightbeam.Homes.project(ctx.base, %{harness: :claude, machine: "eezo", rails: nil})
+      end
+
+      assert File.read!(store) == good
+    end
+
+    # F3: the shapes the `is_map` guard let through. A PRESENT `claudeAiOauth` that carries
+    # no record is hollow by the same reasoning as an empty token — it announces an OAuth
+    # credential and holds nothing to authenticate with.
+    test "a claudeAiOauth key that is not an OAuth record is hollow", ctx do
+      File.mkdir_p!(Path.join([ctx.base, "auth", "claude"]))
+
+      for bytes <- [
+            ~s({"claudeAiOauth":null}),
+            ~s({"claudeAiOauth":""}),
+            ~s({"claudeAiOauth":[]}),
+            ~s({"claudeAiOauth":"sk-ant-oat01-looks-like-a-token"})
+          ] do
+        assert_raise RuntimeError, fn ->
+          Credentials.store_harvested(ctx.base, :anthropic, bytes)
+        end
+      end
     end
   end
 

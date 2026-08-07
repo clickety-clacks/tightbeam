@@ -184,16 +184,36 @@ defmodule Tightbeam.Credentials do
   """
   @spec refuse_hollow!(provider(), binary(), String.t()) :: :ok
   def refuse_hollow!(provider, bytes, source) do
+    case refuse_hollow(provider, bytes, source) do
+      :ok -> :ok
+      {:error, {:hollow_credential, %{sentence: sentence}}} -> raise sentence
+    end
+  end
+
+  @doc """
+  The same judgement on the ordinary error channel, for callers that have one.
+
+  The onboarding ceremony threads `with :ok <- write_credential!(...)`, and a RAISE there
+  does not reach the operator as a refusal -- it kills the `Credentials` GenServer, and the
+  caller sees an exit rather than the sentence. Which is the same lesson as the boot path,
+  arriving from a different direction: the refusal has to travel by whatever route the
+  caller already uses to report failure, or announcing it costs more than the dirt did.
+  """
+  @spec refuse_hollow(provider(), binary(), String.t()) :: :ok | {:error, term()}
+  def refuse_hollow(provider, bytes, source) do
     case hollow(provider, bytes) do
       nil ->
         :ok
 
       found ->
-        raise "refusing to bank a hollow #{provider} credential from #{source}: #{found}. " <>
-                "Nothing was banked — the credential on this host is unchanged. A credential " <>
-                "with no usable token cannot authenticate a turn, and writing it would report " <>
-                "success now and fail every session later. Delete that file and re-run " <>
-                "`tightbeam onboard #{provider}`."
+        sentence =
+          "refusing to bank a hollow #{provider} credential from #{source}: #{found}. " <>
+            "Nothing was banked — the credential on this host is unchanged. A credential " <>
+            "with no usable token cannot authenticate a turn, and writing it would report " <>
+            "success now and fail every session later. Delete that file and re-run " <>
+            "`tightbeam onboard #{provider}`."
+
+        {:error, {:hollow_credential, %{source: source, found: found, sentence: sentence}}}
     end
   end
 
@@ -207,10 +227,28 @@ defmodule Tightbeam.Credentials do
     end
   end
 
+  # A PRESENT `claudeAiOauth` that is not a usable object is hollow for the same reason an
+  # empty token is: the key says "this is an OAuth record" and then carries nothing to
+  # authenticate with. Keying on the key's PRESENCE rather than on its type is what closes
+  # `null`, `""` and any other non-map value, and it invents no structure -- it is the same
+  # field the check already turns on.
+  #
+  # NOT CLAIMED, deliberately: an UNWRAPPED record (a top-level `accessToken` with no
+  # `claudeAiOauth` around it). That is not a shape the vendor writes, and refusing it would
+  # assert a credential format nobody has observed -- the mistake `anthropic_oauth.rs` warns
+  # about where it declines to invent structure a file never had. If it is ever seen in the
+  # wild it earns a check with evidence behind it. Until then this is a named narrow scope,
+  # not an oversight.
   defp deep_hollow(:anthropic, bytes) do
     case JSON.decode(bytes) do
-      {:ok, %{"claudeAiOauth" => oauth}} when is_map(oauth) -> hollow_oauth(oauth)
-      _ -> nil
+      {:ok, %{"claudeAiOauth" => oauth}} when is_map(oauth) ->
+        hollow_oauth(oauth)
+
+      {:ok, %{"claudeAiOauth" => _unusable}} ->
+        "claudeAiOauth is present but is not an OAuth record"
+
+      _ ->
+        nil
     end
   end
 
@@ -675,28 +713,35 @@ defmodule Tightbeam.Credentials do
     end)
   end
 
+  # The hollow check returns rather than raises here: both callers thread
+  # `with :ok <- write_credential!(...)`, so an error tuple reaches the operator as the
+  # refusal it is, while a raise would kill this GenServer and surface as an exit.
   defp write_credential!(state, :openai, credential) do
-    path = credential_store_path(state, :openai)
-    refuse_hollow!(:openai, credential.bytes, "the onboarding ceremony")
-    atomic_write!(path, credential.bytes)
-    reconcile_provider_homes(state, :openai)
-    :ok
+    with :ok <- refuse_hollow(:openai, credential.bytes, "the onboarding ceremony") do
+      atomic_write!(credential_store_path(state, :openai), credential.bytes)
+      reconcile_provider_homes(state, :openai)
+      :ok
+    end
   end
 
   defp write_credential!(state, :anthropic, credential) do
-    path = credential_store_path(state, :anthropic)
-    refuse_hollow!(:anthropic, credential.bytes, "the onboarding ceremony")
-    atomic_write!(path, String.trim(credential.bytes) <> "\n")
-    reconcile_provider_homes(state, :anthropic)
-    :ok
+    with :ok <- refuse_hollow(:anthropic, credential.bytes, "the onboarding ceremony") do
+      atomic_write!(
+        credential_store_path(state, :anthropic),
+        String.trim(credential.bytes) <> "\n"
+      )
+
+      reconcile_provider_homes(state, :anthropic)
+      :ok
+    end
   end
 
   defp write_credential!(state, :fixture_provider, credential) do
-    path = credential_store_path(state, :fixture_provider)
-    refuse_hollow!(:fixture_provider, credential.bytes, "the onboarding ceremony")
-    atomic_write!(path, credential.bytes)
-    reconcile_provider_homes(state, :fixture_provider)
-    :ok
+    with :ok <- refuse_hollow(:fixture_provider, credential.bytes, "the onboarding ceremony") do
+      atomic_write!(credential_store_path(state, :fixture_provider), credential.bytes)
+      reconcile_provider_homes(state, :fixture_provider)
+      :ok
+    end
   end
 
   defp reconcile_provider_homes(state, provider) do
