@@ -1,5 +1,4 @@
 name = "spec-writer"
-where = ["eezo", "racter"]
 skills = ["drafting-requirements", "spec-homing", "spec-handoff", "tightbeam-law-minting", "tightbeam-guidance-authoring", "human-communication"]
 
 [guidance]
