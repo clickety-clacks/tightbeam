@@ -772,6 +772,27 @@ defmodule Tightbeam.CredentialsTest do
   # auth store without ever looking at them. So one agent's hollow home file poisoned the
   # credential for every agent on the next boot — and the reboot was what re-applied the
   # poison, which is why restarting never healed it.
+  # THE ARTIFACT, NOT AN IDEALISED VERSION OF IT.
+  #
+  # The key SET is captured from the vendor's own writer, not invented: three independent
+  # Claude-Code-written `.credentials.json` files on gibson (the live one plus the two
+  # rename-aside backups `.pre-harvest-*` and `.stale-*`) carry exactly these seven keys, in
+  # this order. An earlier version of these tests used a four-key subset, which is a
+  # hand-drawn fixture wearing the incident's clothes: it would stay green against a guard
+  # that only ever handled the tidy shape, and the file that actually broke eezo has three
+  # more keys than that.
+  #
+  # PROVENANCE, stated exactly. File-verified from the incident: `accessToken` empty,
+  # `refreshToken` empty, `expiresAt` 0. Captured from the vendor's live key set: the
+  # remaining four keys and their types. The zeroed/emptied VALUES for those four are the
+  # inference — a cleared record keeps its keys — and they are deliberately the part under
+  # test, because the guard must not depend on which of them happen to be present.
+  @hollow_vendor_record ~s({"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0,"refreshTokenExpiresAt":0,"scopes":[],"subscriptionType":"","rateLimitTier":""}})
+
+  # The same seven keys, populated — so a test that expects harvesting to SUCCEED is not
+  # quietly passing because it used a different shape from the one that must fail.
+  @healthy_vendor_record ~s({"claudeAiOauth":{"accessToken":"sk-ant-oat01-fresh","refreshToken":"sk-ant-ort01-fresh","expiresAt":4102444800000,"refreshTokenExpiresAt":4102444800000,"scopes":["user:inference","user:sessions:claude_code"],"subscriptionType":"max","rateLimitTier":"default_claude_max_20x"}})
+
   describe "banking refuses a hollow credential" do
     test "harvesting a hollow vendor record refuses, names it, and banks nothing", ctx do
       store = Path.join([ctx.base, "auth", "claude", ".credentials.json"])
@@ -787,7 +808,7 @@ defmodule Tightbeam.CredentialsTest do
       # The shape observed on gibson: every key present, every value empty or zero.
       File.write!(
         Path.join(home, ".credentials.json"),
-        ~s({"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0,"scopes":[]}})
+        @hollow_vendor_record
       )
 
       # THE SWEEP SURVIVES IT. This runs on the gateway boot path, where a raise is not a
@@ -827,11 +848,10 @@ defmodule Tightbeam.CredentialsTest do
 
       File.write!(
         Path.join(hollow_home, ".credentials.json"),
-        ~s({"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0}})
+        @hollow_vendor_record
       )
 
-      rotated =
-        ~s({"claudeAiOauth":{"accessToken":"sk-ant-oat01-fresh","refreshToken":"sk-ant-ort01-fresh","expiresAt":4102444800000}})
+      rotated = @healthy_vendor_record
 
       File.write!(Path.join(healthy_home, ".credentials.json"), rotated)
 
@@ -851,7 +871,7 @@ defmodule Tightbeam.CredentialsTest do
         Credentials.store_harvested(
           ctx.base,
           :anthropic,
-          ~s({"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0}})
+          @hollow_vendor_record
         )
       end
 
@@ -893,13 +913,56 @@ defmodule Tightbeam.CredentialsTest do
         ~s({"claudeAiOauth":{"accessToken":"old","refreshToken":"r","expiresAt":1}})
       )
 
-      rotated =
-        ~s({"claudeAiOauth":{"accessToken":"sk-ant-oat01-new","refreshToken":"sk-ant-ort01-new","expiresAt":4102444800000}})
+      rotated = @healthy_vendor_record
 
       File.write!(Path.join(home, ".credentials.json"), rotated)
 
       assert :ok = Tightbeam.Homes.sweep_auth(ctx.base, :claude)
       assert File.read!(store) == rotated
+    end
+
+    # THE REGRESSION AT ITS REAL ALTITUDE: not `sweep_auth/2`, but the function
+    # `Application.start/2` actually calls.
+    #
+    # `sweep_auth/2` returning `:ok` proves the sweep survives; it does NOT prove the BOOT
+    # survives, and the two are different claims — `children_after_preflight/1` is where the
+    # sweep is invoked (gateway.ex), and `application.ex` runs it with no rescue around it.
+    # Asserting at the boot function is what would also catch a NEW raising call added to
+    # this path later, which a test aimed at `sweep_auth` alone would sail straight past.
+    test "a hollow home does not stop the gateway from composing its boot children", ctx do
+      store = Path.join([ctx.base, "auth", "claude", ".credentials.json"])
+      home = Path.join([ctx.base, "homes", "eezo", "claude"])
+      File.mkdir_p!(Path.dirname(store))
+      File.mkdir_p!(home)
+      File.write!(store, @healthy_vendor_record)
+      File.write!(Path.join(home, ".credentials.json"), @hollow_vendor_record)
+
+      db = :"credentials_boot_#{System.unique_integer([:positive])}"
+      start_supervised!({Tightbeam.DB, path: ":memory:", name: db})
+      :ok = Tightbeam.Schema.ensure_all(db)
+
+      config = %{
+        db: db,
+        base_dir: ctx.base,
+        port: 4_321,
+        cwd: ctx.base,
+        default_harness: :claude,
+        default_model: Tightbeam.Model.new("claude-fable-5"),
+        max_live_sessions_per_user: 50,
+        wake_tick_ms: 60_000,
+        onboarding_lease_ms: 1_800_000
+      }
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert [_ | _] = Tightbeam.Gateway.children_after_preflight(config)
+        end)
+
+      # It refused, and it said so where an operator looks.
+      assert log =~ home
+
+      # And the credential every OTHER agent depends on is untouched.
+      assert File.read!(store) == @healthy_vendor_record
     end
 
     # ROUTE 2 OF 3: the ceremony's own bank. Proved by test rather than by construction --
@@ -911,7 +974,7 @@ defmodule Tightbeam.CredentialsTest do
 
       File.write!(
         Path.join(staging, ".credentials.json"),
-        ~s({"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0}})
+        @hollow_vendor_record
       )
 
       # A REFUSAL, not a crash. Writing this test is what caught that a raise here killed
@@ -946,7 +1009,7 @@ defmodule Tightbeam.CredentialsTest do
       # exactly the "left by runtime rotation" state harvest exists to pick up.
       File.write!(
         Path.join(home, ".credentials.json"),
-        ~s({"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0}})
+        @hollow_vendor_record
       )
 
       assert_raise RuntimeError, fn ->
