@@ -2060,26 +2060,30 @@ defmodule Tightbeam.Gateway do
           revision = Identity.live_revision!(config.base_dir)
           snapshot = served_snapshot(config, session, harness, revision)
 
-          # Re-pin the shared home to THIS session's model before session/new.
-          # The harness re-reads its projected home at every session/new (proven
-          # live, wi_263814d3), so pinning the selected model here is what makes
-          # the adapter offer and accept it — acceptance tracks selection by
-          # construction, killing the accepted-then-dead class for spawn.
-          pin_home_to_session_model(config, session, harness)
+          with_home_pin_lock(harness, session.host, fn ->
+            # Pin the shared home to THIS session's model, then session/new,
+            # ATOMICALLY per adapter. The harness re-reads its projected home at
+            # every session/new (proven live, wi_263814d3), so pinning the
+            # selected model here is what makes the adapter offer and accept it —
+            # acceptance tracks selection, killing accepted-then-dead for spawn.
+            # The lock keeps a concurrent session's pin from clobbering ours in
+            # the window before the adapter reads the file (asg_6508eff5).
+            pin_home_to_session_model(config, session, harness)
 
-          with {:ok, sid} <-
-                 new_harness_session(
-                   db,
-                   adapter,
-                   session,
-                   cwd,
-                   mcp_servers,
-                   snapshot.guidance
-                 ) do
-            Org.append_pointer(db, session.session_key, sid, "created")
-            Org.set_identity_revision(db, session.session_key, snapshot.revision)
-            {:ok, sid}
-          end
+            with {:ok, sid} <-
+                   new_harness_session(
+                     db,
+                     adapter,
+                     session,
+                     cwd,
+                     mcp_servers,
+                     snapshot.guidance
+                   ) do
+              Org.append_pointer(db, session.session_key, sid, "created")
+              Org.set_identity_revision(db, session.session_key, snapshot.revision)
+              {:ok, sid}
+            end
+          end)
 
         pointer ->
           # The adapter PROCESS is the authority on residency: stamped
@@ -2096,68 +2100,77 @@ defmodule Tightbeam.Gateway do
 
               snapshot = served_snapshot(config, session, harness, revision)
 
-              # Same re-pin as the fresh-session branch: session/load also
-              # re-reads the projected home, so the resumed session's model is
-              # offered and accepted rather than dying on an org-default pin.
-              pin_home_to_session_model(config, session, harness)
+              with_home_pin_lock(harness, session.host, fn ->
+                # Same atomic [pin -> provision] as the fresh-session branch;
+                # session/load also re-reads the projected home, so the resumed
+                # session's model is offered and accepted rather than dying on an
+                # org-default pin. Held across the load (and its new-session
+                # fallback) so no concurrent session re-pins the shared home mid
+                # provision (asg_6508eff5).
+                pin_home_to_session_model(config, session, harness)
 
-              AdapterCoordinator.with_load_slot(Tightbeam.AdapterCoordinator, session.host, fn ->
-                case Adapter.load_session(
-                       adapter,
-                       pointer.harness_session_id,
-                       session.model,
-                       cwd,
-                       mcp_servers,
-                       snapshot.guidance
-                     ) do
-                  {:ok, _pushed_or_unknown} ->
-                    Org.append_pointer(
-                      db,
-                      session.session_key,
-                      pointer.harness_session_id,
-                      "loaded"
-                    )
+                AdapterCoordinator.with_load_slot(
+                  Tightbeam.AdapterCoordinator,
+                  session.host,
+                  fn ->
+                    case Adapter.load_session(
+                           adapter,
+                           pointer.harness_session_id,
+                           session.model,
+                           cwd,
+                           mcp_servers,
+                           snapshot.guidance
+                         ) do
+                      {:ok, _pushed_or_unknown} ->
+                        Org.append_pointer(
+                          db,
+                          session.session_key,
+                          pointer.harness_session_id,
+                          "loaded"
+                        )
 
-                    Org.set_identity_revision(db, session.session_key, snapshot.revision)
-                    {:ok, pointer.harness_session_id}
+                        Org.set_identity_revision(db, session.session_key, snapshot.revision)
+                        {:ok, pointer.harness_session_id}
 
-                  {:error, {:model_apply_failed, _reason}} = error ->
-                    error
+                      {:error, {:model_apply_failed, _reason}} = error ->
+                        error
 
-                  # An adapter that could not answer has NOT told us the harness
-                  # lost the session; falling back would forfeit the model
-                  # context over an adapter fault and record a false
-                  # pointer_fallback.
-                  {:error, {:adapter_unavailable, _reason}} = error ->
-                    error
+                      # An adapter that could not answer has NOT told us the harness
+                      # lost the session; falling back would forfeit the model
+                      # context over an adapter fault and record a false
+                      # pointer_fallback.
+                      {:error, {:adapter_unavailable, _reason}} = error ->
+                        error
 
-                  {:error, lost} ->
-                    # Spec §pointer chain: reason "fallback" — the harness lost
-                    # the session; start fresh, on the record, model context
-                    # forfeited but chat history substrate-side and intact.
-                    # A fallback is a memory loss: the WHY goes on the record.
-                    Tightbeam.EventLog.lifecycle(
-                      db,
-                      "pointer_fallback",
-                      session.session_key,
-                      inspect(lost)
-                    )
+                      {:error, lost} ->
+                        # Spec §pointer chain: reason "fallback" — the harness lost
+                        # the session; start fresh, on the record, model context
+                        # forfeited but chat history substrate-side and intact.
+                        # A fallback is a memory loss: the WHY goes on the record.
+                        Tightbeam.EventLog.lifecycle(
+                          db,
+                          "pointer_fallback",
+                          session.session_key,
+                          inspect(lost)
+                        )
 
-                    with {:ok, sid} <-
-                           new_harness_session(
-                             db,
-                             adapter,
-                             session,
-                             cwd,
-                             mcp_servers,
-                             snapshot.guidance
-                           ) do
-                      Org.append_pointer(db, session.session_key, sid, "fallback")
-                      Org.set_identity_revision(db, session.session_key, snapshot.revision)
-                      append_context_reset_marker(db, session)
-                      {:ok, sid}
+                        with {:ok, sid} <-
+                               new_harness_session(
+                                 db,
+                                 adapter,
+                                 session,
+                                 cwd,
+                                 mcp_servers,
+                                 snapshot.guidance
+                               ) do
+                          Org.append_pointer(db, session.session_key, sid, "fallback")
+                          Org.set_identity_revision(db, session.session_key, snapshot.revision)
+                          append_context_reset_marker(db, session)
+                          {:ok, sid}
+                        end
                     end
-                end
+                  end
+                )
               end)
 
             {:error, _reason} = error ->
@@ -3953,6 +3966,19 @@ defmodule Tightbeam.Gateway do
 
   defp with_session_mutation_lock(session_key, fun) do
     :global.trans({{__MODULE__, :session_mutation, session_key}, self()}, fun)
+  end
+
+  # Serialize the [re-pin the shared home -> session/new|load] window per ADAPTER
+  # ({harness, host}). The adapter binds its offered model set by re-reading the
+  # shared home at session/new|load, and the pin is now session-varying, so
+  # without this lock two sessions with different models provisioning on one host
+  # clobber each other's pin before the adapter reads it — reintroducing
+  # accepted-then-dead as a race (asg_6508eff5). Session mutation locks are keyed
+  # by session_key and lanes are one-per-session, so they do NOT cover this
+  # cross-session shared resource. Only the create/resume-after-loss branches
+  # take this lock; the resident-turn common path holds no pin and never blocks.
+  defp with_home_pin_lock(harness, host, fun) do
+    :global.trans({{__MODULE__, :home_pin, harness, host}, self()}, fun)
   end
 
   defp apply_model_change(config, db, _call, session, new_ref) do

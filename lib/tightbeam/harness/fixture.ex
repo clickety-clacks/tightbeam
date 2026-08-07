@@ -87,13 +87,32 @@ defmodule Tightbeam.Harness.Fixture do
 
   @impl true
   def reconcile_home(target, home, desired) do
-    rails = if is_map(desired.rails), do: JSON.encode!(desired.rails), else: desired.rails
+    # Mirror the claude harness: pin the desired model into the rails artifact so
+    # the projected home tracks the session's selection. Binary rails pass
+    # through opaque; a map takes the pin when a model is present. This keeps the
+    # fixture a faithful double for the provisioning seam that pins per session.
+    rails =
+      case {desired.rails, Map.get(desired, :default_model)} do
+        {bytes, _model} when is_binary(bytes) ->
+          bytes
+
+        {map_or_nil, nil} ->
+          map_or_nil && JSON.encode!(map_or_nil)
+
+        {map_or_nil, model} ->
+          JSON.encode!(Map.put(map_or_nil || %{}, "model", packed_model(model)))
+      end
 
     Tightbeam.Homes.reconcile(target, home, %{desired | rails: rails},
       credential_names: ["fixture.json"],
       rails_filename: "fixture.rails"
     )
   end
+
+  defp packed_model(%Tightbeam.Model{family: family, context: nil}), do: family
+
+  defp packed_model(%Tightbeam.Model{family: family, context: context}),
+    do: "#{family}[#{context}]"
 
   @impl true
   def materialize_skills(target, cwd, snapshot) do
