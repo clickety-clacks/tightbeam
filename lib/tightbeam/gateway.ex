@@ -3893,6 +3893,15 @@ defmodule Tightbeam.Gateway do
     :global.trans({{__MODULE__, :home_pin, harness, host}, self()}, fun)
   end
 
+  defp at_session_turn_boundary(config, session_key, fun) do
+    LaneManager.ensure_lane_quiet(config[:lane_manager] || LaneManager, session_key)
+
+    case Tightbeam.SessionLane.at_turn_boundary(session_key, fun) do
+      {:ok, result} -> {:ok, result}
+      boundary when boundary in [:busy, :no_lane] -> {:error, :turn_in_progress}
+    end
+  end
+
   defp apply_harness_change(
          config,
          db,
@@ -4014,10 +4023,8 @@ defmodule Tightbeam.Gateway do
   # :no_lane can only mean the lane died in the gap, which we treat as busy: retry.
   defp apply_model_change(config, db, _call, session, new_ref) do
     with {:ok, routed} <- validate_catalog_model(session.host, session.harness, new_ref, false) do
-      LaneManager.ensure_lane_quiet(config[:lane_manager] || LaneManager, session.session_key)
-
       boundary =
-        Tightbeam.SessionLane.at_turn_boundary(session.session_key, fn ->
+        at_session_turn_boundary(config, session.session_key, fn ->
           run_session_mutation(session.session_key, fn ->
             apply_tuned_model(config, db, session, new_ref, routed.provider)
           end)
@@ -4044,7 +4051,7 @@ defmodule Tightbeam.Gateway do
         # was NOT applied. The honest remedy after this fix is to retry at the
         # boundary -- never "start a new session" (the reload replaces that old escape),
         # and never a false intake/validation claim (the intake gate is a different axis).
-        boundary when boundary in [:busy, :no_lane] ->
+        {:error, :turn_in_progress} ->
           %{
             ok: false,
             code: "turn_in_progress",
