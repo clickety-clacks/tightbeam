@@ -1277,7 +1277,7 @@ defmodule Tightbeam.Wire.RouterTest do
     assert_receive {:call, %{origin: "agent:held", principal: {:session, "holder-token"}}}
 
     assert dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", asUser: "flynn"}).status == 200
-    assert_receive {:call, %{origin: "user:flynn", principal: {:session, "holder-token"}}}
+    assert_receive {:call, %{origin: "user:flynn", principal: {:user, "flynn"}}}
 
     # Registering a satellite also provisions its operator endpoint over ssh; this
     # test is about the identity ladder, so the reach is stubbed and the gateway
