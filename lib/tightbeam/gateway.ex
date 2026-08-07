@@ -2060,6 +2060,13 @@ defmodule Tightbeam.Gateway do
           revision = Identity.live_revision!(config.base_dir)
           snapshot = served_snapshot(config, session, harness, revision)
 
+          # Re-pin the shared home to THIS session's model before session/new.
+          # The harness re-reads its projected home at every session/new (proven
+          # live, wi_263814d3), so pinning the selected model here is what makes
+          # the adapter offer and accept it — acceptance tracks selection by
+          # construction, killing the accepted-then-dead class for spawn.
+          pin_home_to_session_model(config, session, harness)
+
           with {:ok, sid} <-
                  new_harness_session(
                    db,
@@ -2088,6 +2095,11 @@ defmodule Tightbeam.Gateway do
               revision = session.identity_revision || Identity.live_revision!(config.base_dir)
 
               snapshot = served_snapshot(config, session, harness, revision)
+
+              # Same re-pin as the fresh-session branch: session/load also
+              # re-reads the projected home, so the resumed session's model is
+              # offered and accepted rather than dying on an org-default pin.
+              pin_home_to_session_model(config, session, harness)
 
               AdapterCoordinator.with_load_slot(Tightbeam.AdapterCoordinator, session.host, fn ->
                 case Adapter.load_session(
@@ -2161,6 +2173,27 @@ defmodule Tightbeam.Gateway do
       error ->
         error
     end
+  end
+
+  # Re-pin the shared {harness, host} home to the session's resolved model so the
+  # harness adapter offers and accepts it at the next session/new or session/load
+  # (both re-read the projected home — proven live, wi_263814d3). Called only on
+  # the two branches that push a fresh model to the adapter (create,
+  # resume-after-adapter-loss), never the resident-turn common path, so most
+  # turns pay nothing. Idempotent when the model is unchanged: the home reconcile
+  # is manifest-gated, so an unchanged pin writes nothing, and a change rewrites
+  # only the home's owned projection (sessions and history are preserved
+  # byte-for-byte). A nil session model falls back to the org default, matching
+  # adapter cold-boot. WHICH file the pin lands in and how the model is spelled
+  # there stays the harness's business (Harness.reconcile_home/3).
+  defp pin_home_to_session_model(config, session, harness) do
+    deliver_opts = if config[:sh], do: [sh: config.sh], else: []
+
+    Placement.deliver_home(
+      config,
+      {harness, "shared", session.host},
+      Keyword.put(deliver_opts, :model, session.model)
+    )
   end
 
   # `:noproc` means the adapter died before this call went out, so the call
@@ -3691,10 +3724,13 @@ defmodule Tightbeam.Gateway do
                    ) do
               deliver_opts = if config[:sh], do: [sh: config.sh], else: []
 
+              # Pin the shared home to the model this session will run on the new
+              # harness, not the org default, so the next turn's session/new
+              # offers and accepts it (wi_263814d3).
               Placement.deliver_home(
                 config,
                 {harness_atom, "shared", session.host},
-                deliver_opts
+                Keyword.put(deliver_opts, :model, model)
               )
 
               Org.set_harness(
