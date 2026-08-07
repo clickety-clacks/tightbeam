@@ -210,13 +210,18 @@ defmodule Tightbeam.GatewayTest do
       {:reply, Keyword.get(opts, :resident, true), state}
     end
 
+    def handle_call({:close_session, sid}, _from, {parent, _opts} = state) do
+      send(parent, {:tune_session_closed, sid})
+      {:reply, :ok, state}
+    end
+
     def handle_call(
-          {:apply_model, sid, model},
+          {:load_session, sid, model, cwd, mcp_servers, guidance},
           _from,
           {parent, opts} = state
         ) do
-      send(parent, {:tune_model_applied, sid, model})
-      {:reply, Keyword.get(opts, :apply_result, :ok), state}
+      send(parent, {:tune_session_loaded, sid, model, cwd, mcp_servers, guidance})
+      {:reply, Keyword.get(opts, :load_result, {:ok, model}), state}
     end
   end
 
@@ -3149,7 +3154,7 @@ defmodule Tightbeam.GatewayTest do
              )
   end
 
-  test "set_model applies a resident harness session before recording the selection", ctx do
+  test "set_model reloads a resident harness session before recording the selection", ctx do
     base_dir = role_test_base("override-set-model")
     put_skill!(base_dir, "review", "# Review")
     base = Archetypes.load!(base_dir)["default"]
@@ -3160,10 +3165,14 @@ defmodule Tightbeam.GatewayTest do
     config = gateway_config(base_dir, ctx.db, 0)
     identity_name = Placement.identity_name(config, base, overrides, :claude)
     Org.set_identity(ctx.db, "k1", overrides, identity_name)
+    local_host = Placement.local_host_name()
+    Org.set_host(ctx.db, "k1", local_host)
     Org.append_pointer(ctx.db, "k1", "existing-session", "created")
+    start_lane!(ctx.db, "k1")
 
     adapter = start_supervised!({TuneAdapterStub, {self(), resident: true}})
     start_supervised!({CoordinatorStub, {adapter, self()}})
+    put_host_catalog(local_host, "claude", ["claude-sonnet-4-6"])
 
     assert %{ok: true} =
              Gateway.handlers(config)["tune"].(%{
@@ -3172,29 +3181,39 @@ defmodule Tightbeam.GatewayTest do
                params: %{setting: "set_model", model: "claude-sonnet-4-6"}
              })
 
-    assert_receive {:adapter_key, {:claude, "shared", "testhost"}}
+    assert_receive {:adapter_key, {:claude, "shared", ^local_host}}
     assert_receive {:tune_residency_checked, "existing-session"}
-    assert_receive {:tune_model_applied, "existing-session", %Model{family: "claude-sonnet-4-6"}}
+
+    assert_receive {:tune_session_closed, "existing-session"}
+
+    assert_receive {:tune_session_loaded, "existing-session", %Model{family: "claude-sonnet-4-6"},
+                    _cwd, _mcp_servers, guidance}
+
+    assert guidance =~ "Tightbeam · default"
     assert Org.get(ctx.db, "k1").model == Model.new("claude-sonnet-4-6")
   end
 
-  test "set_model records a resident apply failure and leaves the selected model unchanged",
+  test "set_model reports a resident reload failure and leaves the selected model unchanged",
        ctx do
     base_dir = role_test_base("resident-set-model-failure")
     Archetypes.load!(base_dir)
     config = gateway_config(base_dir, ctx.db, 0)
     before = Org.get(ctx.db, "k1").model
+    local_host = Placement.local_host_name()
+    Org.set_host(ctx.db, "k1", local_host)
     Org.append_pointer(ctx.db, "k1", "resident-session", "created")
+    start_lane!(ctx.db, "k1")
 
     adapter =
       start_supervised!(
-        {TuneAdapterStub, {self(), resident: true, apply_result: {:error, :model_unavailable}}}
+        {TuneAdapterStub, {self(), resident: true, load_result: {:error, :model_unavailable}}}
       )
 
     start_supervised!({CoordinatorStub, adapter})
+    put_host_catalog(local_host, "claude", ["claude-sonnet-4-6"])
 
-    # The reason rides the MESSAGE now. It used to ride a `reason:` key the wire
-    # does not emit, so this refusal reached clients as a bare `ok: false` (#68).
+    # The reason rides an honest sentence. The frozen offered-set refusal is gone;
+    # this case is a real reload failure and the selected model stays unchanged.
     assert %{ok: false, code: "model_apply_failed", message: message} =
              Gateway.handlers(config)["tune"].(%{
                origin: "user:flynn",
@@ -3203,9 +3222,55 @@ defmodule Tightbeam.GatewayTest do
              })
 
     assert message =~ "model_unavailable"
+    assert message =~ "reload did not complete"
 
-    assert_receive {:tune_model_applied, "resident-session", %Model{family: "claude-sonnet-4-6"}}
+    assert_receive {:tune_session_closed, "resident-session"}
+
+    assert_receive {:tune_session_loaded, "resident-session", %Model{family: "claude-sonnet-4-6"},
+                    _cwd, _mcp_servers, _guidance}
+
     assert Org.get(ctx.db, "k1").model == before
+  end
+
+  test "set_model refuses while the lane owns a running turn", ctx do
+    base_dir = role_test_base("resident-set-model-busy")
+    Archetypes.load!(base_dir)
+    config = gateway_config(base_dir, ctx.db, 0)
+    before = Org.get(ctx.db, "k1").model
+    local_host = Placement.local_host_name()
+    Org.set_host(ctx.db, "k1", local_host)
+    put_host_catalog(local_host, "claude", ["claude-sonnet-4-6"])
+
+    assert {:ok, _seq} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: "k1",
+               message_id: "set-model-running",
+               origin: "user:flynn",
+               prompt: "hold the boundary"
+             })
+
+    parent = self()
+
+    start_lane!(ctx.db, "k1", fn _turn ->
+      send(parent, {:set_model_turn_started, self()})
+
+      receive do
+        :finish_set_model_turn -> {:ok, %{}}
+      end
+    end)
+
+    assert_receive {:set_model_turn_started, runner}
+
+    assert %{ok: false, code: "turn_in_progress", message: message} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: "user:flynn",
+               session_key: "k1",
+               params: %{setting: "set_model", model: "claude-sonnet-4-6"}
+             })
+
+    assert message =~ "Try again once the current turn finishes"
+    assert Org.get(ctx.db, "k1").model == before
+    send(runner, :finish_set_model_turn)
   end
 
   describe "session status reports its host's credential kind" do
