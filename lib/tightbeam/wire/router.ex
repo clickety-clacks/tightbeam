@@ -476,52 +476,46 @@ defmodule Tightbeam.Wire.Router do
 
   defp agent_identity(body, {:session, session}, conn) do
     roles = Roles.for_session(db(conn), session.session_key)
+    session_principal = {:session, session.session_key}
 
-    result =
-      cond do
-        is_binary(body["as"]) and body["as"] != "" ->
-          role = body["as"]
+    cond do
+      is_binary(body["as"]) and body["as"] != "" ->
+        role = body["as"]
 
-          case Roles.resolve(db(conn), role) do
-            {:ok, key, false} when key == session.session_key ->
-              {:ok, "agent:#{role}"}
+        case Roles.resolve(db(conn), role) do
+          {:ok, key, false} when key == session.session_key ->
+            {:ok, "agent:#{role}", session_principal}
 
-            _ ->
-              held = if roles == [], do: "none", else: Enum.join(roles, ", ")
+          _ ->
+            held = if roles == [], do: "none", else: Enum.join(roles, ", ")
 
-              {:error, 403, "role_not_held",
-               "role #{role} is not held by this session; held roles: #{held}"}
-          end
+            {:error, 403, "role_not_held",
+             "role #{role} is not held by this session; held roles: #{held}"}
+        end
 
-        is_binary(body["asUser"]) and body["asUser"] != "" ->
-          if body["asUser"] == session.owner_user_id do
-            {:ok, "user:#{session.owner_user_id}"}
-          else
-            {:error, 403, "identity_not_yours",
-             "this session belongs to #{session.owner_user_id}"}
-          end
+      is_binary(body["asUser"]) and body["asUser"] != "" ->
+        if body["asUser"] == session.owner_user_id do
+          {:ok, "user:#{session.owner_user_id}", {:user, session.owner_user_id}}
+        else
+          {:error, 403, "identity_not_yours", "this session belongs to #{session.owner_user_id}"}
+        end
 
-        is_binary(body["asProcess"]) and body["asProcess"] != "" ->
-          {:error, 403, "identity_not_yours", "a session token cannot act as a process"}
+      is_binary(body["asProcess"]) and body["asProcess"] != "" ->
+        {:error, 403, "identity_not_yours", "a session token cannot act as a process"}
 
-        length(roles) == 1 ->
-          {:ok, "agent:#{hd(roles)}"}
+      length(roles) == 1 ->
+        {:ok, "agent:#{hd(roles)}", session_principal}
 
-        roles == [] and session.is_built_in ->
-          {:ok, "user:#{session.owner_user_id}"}
+      roles == [] and session.is_built_in ->
+        {:ok, "user:#{session.owner_user_id}", session_principal}
 
-        roles == [] ->
-          {:error, 403, "no_role",
-           "this session holds no role; its owner must bind one, or pass --as-user #{session.owner_user_id}"}
+      roles == [] ->
+        {:error, 403, "no_role",
+         "this session holds no role; its owner must bind one, or pass --as-user #{session.owner_user_id}"}
 
-        true ->
-          {:error, 400, "ambiguous_identity",
-           "this session holds several roles (#{Enum.join(roles, ", ")}); pass --as <role>"}
-      end
-
-    case result do
-      {:ok, origin} -> {:ok, origin, {:session, session.session_key}}
-      error -> error
+      true ->
+        {:error, 400, "ambiguous_identity",
+         "this session holds several roles (#{Enum.join(roles, ", ")}); pass --as <role>"}
     end
   end
 

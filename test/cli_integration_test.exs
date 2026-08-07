@@ -240,11 +240,108 @@ defmodule Tightbeam.CliIntegrationTest do
         stderr_to_stdout: true
       )
 
-    assert_receive {:cli_call, %{origin: "user:flynn", principal: {:session, "cli-holder"}}}
+    assert_receive {:cli_call, %{origin: "user:flynn", principal: {:user, "flynn"}}}
 
     Org.retire(ctx.db, ctx.session.session_key)
     {refused, 1} = System.cmd(ctx.binary, ["list"], cd: ctx.workdir, stderr_to_stdout: true)
     assert refused =~ "auth_failed"
+  end
+
+  test "session-auth --as-user attributes verdicts to the user and grants admin revocation",
+       ctx do
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('other', 0, 1)"
+      )
+
+    other =
+      Org.create(ctx.db, %{
+        session_key: "cli-other",
+        display_name: "CLI Other",
+        owner_user_id: "other",
+        origin: "user:other",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+
+    Roles.create!(ctx.db, "cli-other", "other", other.session_key)
+    other_dir = session_workdir!(ctx, other)
+
+    {assigned, 0} =
+      System.cmd(
+        ctx.binary,
+        ["assign", "--subject", "admin revocation", "--session", "cli-worker"],
+        cd: other_dir,
+        stderr_to_stdout: true
+      )
+
+    assignment_id = JSON.decode!(assigned)["id"]
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "assign",
+                      principal: {:session, "cli-other"},
+                      session_key: "cli-worker"
+                    }}
+
+    {verdicted, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "attest",
+          assignment_id,
+          "--kind",
+          "verdict",
+          "--verdict",
+          "tests-passed",
+          "--as-user",
+          "flynn"
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert verdicted =~ "tests-passed"
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "attest",
+                      origin: "user:flynn",
+                      principal: {:user, "flynn"}
+                    }}
+
+    assert {:ok, [["flynn", nil]]} =
+             DB.query(
+               ctx.db,
+               "SELECT byUser, bySession FROM attests WHERE assignmentId = ?1 AND verdictKind = 'tests-passed'",
+               [assignment_id]
+             )
+
+    {revoked, 0} =
+      System.cmd(
+        ctx.binary,
+        ["revoke-assignment", assignment_id, "--as-user", "flynn"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert revoked =~ "revoked"
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "revoke-assignment",
+                      origin: "user:flynn",
+                      principal: {:user, "flynn"}
+                    }}
+
+    assert {:ok, [["closed", "revoked"]]} =
+             DB.query(ctx.db, "SELECT state, outcome FROM assignments WHERE id = ?1", [
+               assignment_id
+             ])
   end
 
   test "real CLI round-trips assign, dispatch, and attest through gateway handlers", ctx do
