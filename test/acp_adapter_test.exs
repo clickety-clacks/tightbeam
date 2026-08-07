@@ -151,6 +151,8 @@ defmodule Tightbeam.Acp.AdapterTest do
   ] });
   const capture = (m) => fs.appendFileSync(capturePath, JSON.stringify({ method: m.method, mcpServers: m.params.mcpServers, modeId: m.params.modeId, configId: m.params.configId, value: m.params.value, cwd: m.params.cwd, sessionId: m.params.sessionId, prompt: m.params.prompt, meta: m.params._meta }) + "\n");
   let pendingPrompt = null;
+  let stalledPrompt = null;
+  let stalledSession = null;
   rl.on("line", (line) => {
     if (!line.trim()) return;
     const m = JSON.parse(line);
@@ -233,12 +235,22 @@ defmodule Tightbeam.Acp.AdapterTest do
       case "session/prompt": {
         const sid = m.params.sessionId;
         capture(m);
-        if (gateMode === "stall-turn") return;
+        if (gateMode === "stall-turn") {
+          stalledPrompt = m.id;
+          stalledSession = sid;
+          return;
+        }
         if (gateMode === "delay-turn") {
           return setTimeout(() => {
             send({ method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "delayed" } } } });
             send({ id: m.id, result: { stopReason: "end_turn" } });
           }, 75);
+        }
+        if (gateMode === "progress-turn") {
+          send({ method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "agent_thought_chunk" } } });
+          send({ method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "tool_call", title: "Read config/runtime.exs" } } });
+          send({ method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "progressed" } } } });
+          return setTimeout(() => send({ id: m.id, result: { stopReason: "end_turn" } }), 75);
         }
         if (sid === "probe-sess") {
           if (gateMode === "pass-message") {
@@ -275,6 +287,14 @@ defmodule Tightbeam.Acp.AdapterTest do
         send({ method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "ng" } } } });
         pendingPrompt = m.id;
         send({ id: 500, method: "session/request_permission", params: { options: [ { optionId: "reject", kind: "reject_once" }, { optionId: "allow-once", kind: "allow_once" } ] } });
+        return;
+      }
+      case "session/cancel": {
+        if (stalledPrompt !== null && m.params.sessionId === stalledSession) {
+          send({ id: stalledPrompt, error: { code: -32800, message: "canceled" } });
+          stalledPrompt = null;
+          stalledSession = null;
+        }
         return;
       }
     }
@@ -422,6 +442,29 @@ defmodule Tightbeam.Acp.AdapterTest do
       remaining == 0 -> false
       true -> Process.sleep(10) && prompt_count?(adapter, expected, remaining - 1)
     end
+  end
+
+  defp pending_count?(conn, expected, remaining \\ 500) do
+    cond do
+      map_size(:sys.get_state(conn).pending) == expected -> true
+      remaining == 0 -> false
+      true -> Process.sleep(10) && pending_count?(conn, expected, remaining - 1)
+    end
+  end
+
+  defp prompt_entry(adapter) do
+    adapter
+    |> :sys.get_state()
+    |> Map.fetch!(:prompts)
+    |> Map.values()
+    |> List.first()
+  end
+
+  defp refute_prompt_monitors(adapter, conn, prompt) do
+    {:monitors, monitors} = Process.info(adapter, :monitors)
+    refute {:process, prompt.worker} in monitors
+    refute {:process, elem(prompt.from, 0)} in monitors
+    refute {:process, conn} in monitors
   end
 
   defp queued_at?(adapter, request) do
@@ -599,12 +642,16 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     prompt = Task.async(fn -> Adapter.prompt(adapter, "sess-1", "never acknowledged") end)
     assert prompt_count?(adapter, 1)
+    prompt_entry = prompt_entry(adapter)
     assert Task.yield(prompt, 50) == nil
 
     send(inert_conn, :stop)
     assert {:error, :prompt_dispatch_failed} = Task.await(prompt)
 
     assert Adapter.conn(adapter) == inert_conn
+    assert prompt_count?(adapter, 0)
+    refute Process.alive?(prompt_entry.worker)
+    refute_prompt_monitors(adapter, inert_conn, prompt_entry)
   end
 
   test "caller death ends a connected silent prompt and orphans its ACP request" do
@@ -613,16 +660,77 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     prompt = Task.async(fn -> Adapter.prompt(adapter, sid, "stall") end)
     assert prompt_count?(adapter, 1)
+    prompt_entry = prompt_entry(adapter)
+    conn = Adapter.conn(adapter)
     assert Task.yield(prompt, 50) == nil
 
     Task.shutdown(prompt, :brutal_kill)
     assert prompt_count?(adapter, 0)
+    assert pending_count?(conn, 0)
+    refute Process.alive?(prompt_entry.worker)
+    refute_prompt_monitors(adapter, conn, prompt_entry)
+  end
 
-    assert [%{orphaned: true, replied: true, session_id: ^sid}] =
-             Adapter.conn(adapter)
-             |> :sys.get_state()
-             |> Map.fetch!(:pending)
-             |> Map.values()
+  test "prompt worker death reports the process edge and resolves ACP quiescence" do
+    {adapter, _capture_path} = start_adapter(gate_mode: "stall-turn", probe: false)
+    assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+
+    caller = Task.async(fn -> Adapter.prompt(adapter, sid, "stall") end)
+    assert prompt_count?(adapter, 1)
+    prompt = prompt_entry(adapter)
+    assert pending_count?(Adapter.conn(adapter), 1)
+
+    Process.exit(prompt.worker, :kill)
+
+    assert {:error, {:prompt_worker_down, ":killed"}} = Task.await(caller)
+    assert prompt_count?(adapter, 0)
+    assert pending_count?(Adapter.conn(adapter), 0)
+    refute Process.alive?(prompt.worker)
+    refute_prompt_monitors(adapter, Adapter.conn(adapter), prompt)
+  end
+
+  test "adapter death tears down its prompt worker and connection" do
+    {adapter, _capture_path} = start_adapter(gate_mode: "stall-turn", probe: false)
+    assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+
+    caller = Task.async(fn -> Adapter.prompt(adapter, sid, "stall") end)
+    assert prompt_count?(adapter, 1)
+    prompt = prompt_entry(adapter)
+    conn = Adapter.conn(adapter)
+    worker_monitor = Process.monitor(prompt.worker)
+    conn_monitor = Process.monitor(conn)
+
+    GenServer.stop(adapter, :normal)
+
+    assert {:error, {:adapter_unavailable, _reason}} = Task.await(caller)
+    assert_receive {:DOWN, ^worker_monitor, :process, _worker, _reason}
+    assert_receive {:DOWN, ^conn_monitor, :process, ^conn, :shutdown}
+  end
+
+  test "thought and tool progress stay routed while an unbounded prompt runs" do
+    {adapter, _capture_path} = start_adapter(gate_mode: "progress-turn", probe: false)
+    assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+    owner = self()
+
+    caller =
+      Task.async(fn ->
+        Adapter.prompt(adapter, sid, "report progress",
+          progress: fn status, seq -> send(owner, {:progress, status, seq}) end
+        )
+      end)
+
+    assert prompt_count?(adapter, 1)
+    prompt = prompt_entry(adapter)
+    conn = Adapter.conn(adapter)
+
+    assert {:ok, %{stop_reason: "end_turn", text: "progressed"}} = Task.await(caller)
+
+    assert_receive {:progress, "Thinking…", 1}
+    assert_receive {:progress, "Read config/runtime.exs", 2}
+    assert prompt_count?(adapter, 0)
+    assert pending_count?(conn, 0)
+    refute Process.alive?(prompt.worker)
+    refute_prompt_monitors(adapter, conn, prompt)
   end
 
   test "close_session sends ACP session/close with the harness session id" do

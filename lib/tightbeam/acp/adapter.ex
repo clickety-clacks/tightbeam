@@ -690,6 +690,24 @@ defmodule Tightbeam.Acp.Adapter do
 
   def handle_info(_msg, state), do: {:noreply, state}
 
+  @impl true
+  def terminate(_reason, %__MODULE__{} = state) do
+    # The adapter owns both sides of each prompt. A normal adapter exit would
+    # otherwise leave linked processes alive, so teardown explicitly removes
+    # every worker and the connection that owns their pending ACP entries.
+    Enum.each(state.prompts, fn {_prompt_ref, prompt} ->
+      Process.exit(prompt.worker, :kill)
+    end)
+
+    if is_pid(state.conn) and Process.alive?(state.conn) do
+      Process.exit(state.conn, :shutdown)
+    end
+
+    :ok
+  end
+
+  def terminate(_reason, _state), do: :ok
+
   defp complete_prompt(state, prompt_ref, result) do
     case Map.fetch(state.prompts, prompt_ref) do
       :error ->
