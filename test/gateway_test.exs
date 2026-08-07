@@ -2269,9 +2269,8 @@ defmodule Tightbeam.GatewayTest do
 
     assert message =~ "no host in archetype default's where can run codex"
 
-    for {host, base} <- [{"eurisko", "/srv/eurisko"}, {"racter", "/srv/racter"}] do
+    for {host, _base} <- [{"eurisko", "/srv/eurisko"}, {"racter", "/srv/racter"}] do
       assert message =~ "Tightbeam has no credential for openai on #{host}"
-      assert message =~ Path.join(base, "auth")
       assert message =~ "Run on #{host}: tightbeam onboard openai --as-user <userId>"
     end
   end
@@ -2292,8 +2291,11 @@ defmodule Tightbeam.GatewayTest do
 
     assert GenServer.whereis(Credentials.server(machine)) == nil
 
+    # r4.2: the `:credential_server_unavailable` transient ("could not ASK") must NOT be
+    # misrouted into an onboard remedy — the shared credential_remedy function names retry.
     expected_message =
-      "claude on #{machine} needs onboarding: :credential_server_unavailable; run tightbeam onboard anthropic on #{machine}"
+      "Tightbeam could not reach the credential server for anthropic on #{machine}. " <>
+        "This is transient — retry shortly. Do not re-onboard; the credential may be fine."
 
     assert %{
              code: "placement_denied",
@@ -2440,8 +2442,7 @@ defmodule Tightbeam.GatewayTest do
              })
 
     assert message =~ "Tightbeam has no credential for anthropic on #{machine}"
-    assert message =~ "normal claude CLI login"
-    assert message =~ "under /remote/new-tb/auth"
+    assert message =~ "normal CLI login"
 
     assert message =~
              "Run on #{machine}: tightbeam onboard anthropic --as-user <userId>"
@@ -5492,6 +5493,388 @@ defmodule Tightbeam.GatewayTest do
                &1
              )
            )
+  end
+
+  # AC6 (spec 1ae8fa52 §O6/I7+I9). O6 RATIFIES the existing turn-path refuse-by-name
+  # (`unonboarded_refusal`): a turn onto a {host, harness} whose catalog health is
+  # `unavailable({:needs_onboarding, :missing})` is refused with the EXACT
+  # `tightbeam onboard <provider> --as-user <userId>` remedy — the same sentence boot
+  # prints — and that refusal FAILS-TELLS-RECORDS (I9): a failed turn (the runner returns
+  # an error with a terminal publish, never a hold/park), the named reason in the
+  # `[turn failed]` chat marker, and a `harness_turn_error` lifecycle event, with the
+  # engine never reaching the session/prompt stages (it dies at :checkout, the pre-engine
+  # stage a missing credential kills). The spawn seam is pinned separately
+  # (spinup_test / "spawn refusal names every where host, harness, cause, and remedy");
+  # this pins the turn seam — the AC6 intersection that previously had only generic
+  # turn-failure coverage (see "a failed turn publishes its reason as a chat marker").
+  test "a turn onto a needs_onboarding host is refused by name and fails-tells-records", ctx do
+    exact_registry =
+      start_supervised!(%{
+        id: :o6_refuse_conn_registry,
+        start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+      })
+
+    # Checkout DEGRADES — the engine cannot start — so the turn fails at the :checkout
+    # stage. No AdapterStub: the coordinator never yields an adapter, so no session/prompt
+    # engine call is ever made (the "never launch a dead engine" half of I7).
+    start_supervised!({CoordinatorStub, {fn _key -> {:error, :degraded} end, self()}})
+
+    {:ok, _ref, nil} =
+      ConnRegistry.register(exact_registry, %{
+        pid: self(),
+        user_id: "flynn",
+        device_id: "o6-refuse",
+        is_admin: false,
+        subscriptions: MapSet.new(["chat"])
+      })
+
+    base = gateway_children_base!()
+
+    config = %{
+      base_dir: base,
+      cwd: "/tmp",
+      port: 0,
+      default_harness: :claude,
+      default_model: Model.new("claude-fable-5"),
+      max_live_sessions_per_user: 50,
+      wake_tick_ms: 1_000,
+      onboarding_lease_ms: 1_800_000,
+      db: ctx.db
+    }
+
+    children = Gateway.children(config)
+
+    {Tightbeam.LaneManager, lane_opts} =
+      Enum.find(children, &match?({Tightbeam.LaneManager, _}, &1))
+
+    runner = Keyword.fetch!(lane_opts, :runner)
+
+    # testhost/claude has NO credential: the catalog affirmatively answers "missing"
+    # (`:missing`, not the `:credential_server_unavailable` transient — see the guard test).
+    degrade_host_catalog("testhost", "claude", {:needs_onboarding, :missing})
+
+    assert :appended =
+             Gateway.deliver_prompt("k1", "user:flynn", "hi",
+               db: ctx.db,
+               conn_registry: exact_registry,
+               lane_manager: ctx.lane,
+               device_id: "o6-refuse",
+               client_message_id: "c_o6_refuse"
+             )
+
+    assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
+
+    # FAILS (not parks): the runner returns an error with a terminal publish + record,
+    # never a hold/episode/queue.
+    assert {:error, %{reason: reason, terminal_publish: publish, record_in_txn: record}} =
+             runner.(Map.put(turn, :session_key, "k1"))
+
+    # TELLS: the EXACT remedy, on the host, naming the provider — NOT the raw
+    # "adapter is degraded" checkout fault (that fault is kept in the record instead).
+    assert reason =~ "tightbeam onboard anthropic --as-user <userId>"
+    assert reason =~ "on testhost"
+    refute reason =~ "is degraded"
+
+    # RECORDS: the failed row and the lifecycle event, one transaction. The record keeps
+    # the STAGE (:checkout — pre-engine) and the raw fault the user-facing sentence flattened.
+    assert {:ok, true} =
+             DB.transaction(ctx.db, fn txn ->
+               assert Ledger.finish_in_txn(txn, turn.seq, "failed", reason)
+               record.(txn)
+               true
+             end)
+
+    publish.("failed")
+
+    lifecycle =
+      Enum.find(EventLog.lifecycle_events(ctx.db), fn event ->
+        event.kind == "harness_turn_error" and event.subject == "k1"
+      end)
+
+    assert lifecycle, "the refusal must record a harness_turn_error lifecycle event"
+    assert lifecycle.detail =~ "checkout"
+
+    # TELLS (chat channel): the remedy reaches the user durably as the `[turn failed]`
+    # marker, read from the projection rather than a brittle push count.
+    marker =
+      ctx.db
+      |> Projection.list_after("k1", nil, 100)
+      |> Enum.find(&String.starts_with?(&1.content || "", "[turn failed]"))
+
+    assert marker, "a refused turn must speak its reason in chat"
+    assert marker.content =~ "tightbeam onboard anthropic --as-user <userId>"
+
+    # NEVER LAUNCHES A DEAD ENGINE: checkout failed pre-engine, so the session/prompt
+    # stages never ran — no engine was asked to serve (belt-and-suspenders to the
+    # :checkout stage recorded above).
+    refute_received {:new_session_mcp_servers, _}
+    refute_received {:prompt_started, _}
+  end
+
+  # AC6 (spec 1ae8fa52 §O6), the present-but-unverified clause: a host whose credential
+  # is present-and-live but whose harness cannot execute surfaces as catalog `fresh` +
+  # broken executability (spec O1/AC1), which is NOT `needs_onboarding`. Such a turn MUST
+  # NOT be refused with the onboarding remedy — "run onboard" would be false, the
+  # credential is already present. Here the observable precondition is reproduced directly:
+  # a FRESH catalog for testhost/claude while checkout is broken. `unonboarded_refusal`
+  # reads `fresh`, returns `:not_applicable`, and the turn's reason stays its real
+  # executability/adapter gap. This guards the `:fresh` axis of I7's narrow `:missing`
+  # match; the `:credential_server_unavailable` transient axis is guarded by the next test
+  # (the two together pin that I7 refuses on `:missing` specifically, never the wildcard).
+  test "a turn on a fresh-but-unexecutable host is not misrouted to the onboarding remedy",
+       ctx do
+    exact_registry =
+      start_supervised!(%{
+        id: :o6_pbu_conn_registry,
+        start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+      })
+
+    start_supervised!({CoordinatorStub, {fn _key -> {:error, :degraded} end, self()}})
+
+    {:ok, _ref, nil} =
+      ConnRegistry.register(exact_registry, %{
+        pid: self(),
+        user_id: "flynn",
+        device_id: "o6-pbu",
+        is_admin: false,
+        subscriptions: MapSet.new(["chat"])
+      })
+
+    base = gateway_children_base!()
+
+    config = %{
+      base_dir: base,
+      cwd: "/tmp",
+      port: 0,
+      default_harness: :claude,
+      default_model: Model.new("claude-fable-5"),
+      max_live_sessions_per_user: 50,
+      wake_tick_ms: 1_000,
+      onboarding_lease_ms: 1_800_000,
+      db: ctx.db
+    }
+
+    children = Gateway.children(config)
+
+    {Tightbeam.LaneManager, lane_opts} =
+      Enum.find(children, &match?({Tightbeam.LaneManager, _}, &1))
+
+    runner = Keyword.fetch!(lane_opts, :runner)
+
+    # No `degrade_host_catalog`: the setup left testhost/claude FRESH (await_catalog).
+    # A live credential is present; only executability (checkout) is broken.
+    assert {_entries, :fresh} = ModelCatalog.get("testhost", "claude", ModelCatalog)
+
+    assert :appended =
+             Gateway.deliver_prompt("k1", "user:flynn", "hi",
+               db: ctx.db,
+               conn_registry: exact_registry,
+               lane_manager: ctx.lane,
+               device_id: "o6-pbu",
+               client_message_id: "c_o6_pbu"
+             )
+
+    assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
+
+    assert {:error, %{reason: reason}} = runner.(Map.put(turn, :session_key, "k1"))
+
+    # The refusal names the REAL gap (executability/adapter degraded), never the
+    # onboarding remedy — the credential is present, so "run onboard" would be false.
+    assert reason =~ "is degraded"
+    refute reason =~ "tightbeam onboard"
+    refute reason =~ "--as-user"
+  end
+
+  # AC6 / I7 (spec 1ae8fa52 §O6), the r4.2 narrowing guard: I7 refuses ONLY on `:missing`
+  # (the credential store AFFIRMATIVELY answering "absent"), NEVER on the wildcard
+  # `{:needs_onboarding, _}`. The `:credential_server_unavailable` transient means "could
+  # not ASK" — the Credentials server was momentarily unreachable — and MUST NOT be
+  # misrouted into a false onboarding remedy: telling an operator to `onboard` when the
+  # real fault is a down credential server aims them at the wrong repair (the misrouting
+  # hazard r4.2 names, and gateway.ex:4108-4116 guards with the narrow match). A turn whose
+  # turn-seam catalog health is that transient (checkout also broken) is refused by its
+  # real executability gap, never the onboarding remedy. This is the turn-seam axis Test A
+  # (`:missing`) and Test B (`:fresh`) leave uncovered: a regression reverting
+  # gateway.ex:4117 `:missing` back to the wildcard `{:needs_onboarding, _}` passes both of
+  # them but goes RED here. (The 29 adapter-heal arenas cover the SPAWN path's
+  # credential_status, gateway.ex:4160 — a different seam from unonboarded_refusal.)
+  test "a turn on a credential-server-unavailable transient is not misrouted to the onboarding remedy",
+       ctx do
+    exact_registry =
+      start_supervised!(%{
+        id: :o6_transient_conn_registry,
+        start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+      })
+
+    start_supervised!({CoordinatorStub, {fn _key -> {:error, :degraded} end, self()}})
+
+    {:ok, _ref, nil} =
+      ConnRegistry.register(exact_registry, %{
+        pid: self(),
+        user_id: "flynn",
+        device_id: "o6-transient",
+        is_admin: false,
+        subscriptions: MapSet.new(["chat"])
+      })
+
+    base = gateway_children_base!()
+
+    config = %{
+      base_dir: base,
+      cwd: "/tmp",
+      port: 0,
+      default_harness: :claude,
+      default_model: Model.new("claude-fable-5"),
+      max_live_sessions_per_user: 50,
+      wake_tick_ms: 1_000,
+      onboarding_lease_ms: 1_800_000,
+      db: ctx.db
+    }
+
+    children = Gateway.children(config)
+
+    {Tightbeam.LaneManager, lane_opts} =
+      Enum.find(children, &match?({Tightbeam.LaneManager, _}, &1))
+
+    runner = Keyword.fetch!(lane_opts, :runner)
+
+    # The transient: "could not ASK" (credential server unreachable), NOT an affirmative
+    # "absent". Health becomes {:unavailable, {:needs_onboarding, :credential_server_unavailable}},
+    # which is NOT :missing, so unonboarded_refusal returns :not_applicable.
+    degrade_host_catalog(
+      "testhost",
+      "claude",
+      {:needs_onboarding, :credential_server_unavailable}
+    )
+
+    assert :appended =
+             Gateway.deliver_prompt("k1", "user:flynn", "hi",
+               db: ctx.db,
+               conn_registry: exact_registry,
+               lane_manager: ctx.lane,
+               device_id: "o6-transient",
+               client_message_id: "c_o6_transient"
+             )
+
+    assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
+
+    assert {:error, %{reason: reason}} = runner.(Map.put(turn, :session_key, "k1"))
+
+    # Refused by its real (executability/adapter) gap, never the onboarding remedy —
+    # a "could not ask" transient is not a "you have no credential" verdict.
+    assert reason =~ "is degraded"
+    refute reason =~ "tightbeam onboard"
+    refute reason =~ "--as-user"
+  end
+
+  # O6 reactive fix (spec 1ae8fa52) — THE INCIDENT PATH (G3 flatten). Guards A/B/C all force
+  # :checkout, but the incident 401s at :prompt: an expired/rejected credential 401s at
+  # API-call time, so checkout AND session SUCCEED (the harness holds a token) and catalog
+  # health is still `:fresh` — a health lookup is blind to it (reviewer-3 confirmed real expiry
+  # is storage-blind). The common-path guarantee here: the operator reads the auth error as
+  # human PROSE, never a raw inspected ACP map (G3 error_sentence flatten). RED-before-green:
+  # without the flatten, error_sentence inspects the map (`=>`/`%{` markers reach chat). The
+  # precise re-onboard NAMING of this health-blind :prompt 401 is the HELD option-a piece
+  # (auth-shape detection), pending the PO's a-vs-b ruling; it lands on top without changing
+  # this seam (preserved on branch o6-prompt401-naming-built).
+  test "an expired-credential turn 401ing at :prompt (fresh health) flattens the raw ACP map to prose (G3)",
+       ctx do
+    exact_registry =
+      start_supervised!(%{
+        id: :o6_prompt401_conn_registry,
+        start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+      })
+
+    # A REAL adapter: checkout + session succeed; the 401 lands at :prompt. AdapterStub
+    # returns the auth-expired ACP error for the prompt "fail this turn" (gateway_test:162).
+    adapter = start_supervised!({AdapterStub, self()})
+    start_supervised!({CoordinatorStub, {adapter, self()}})
+
+    {:ok, _ref, nil} =
+      ConnRegistry.register(exact_registry, %{
+        pid: self(),
+        user_id: "flynn",
+        device_id: "o6-prompt401",
+        is_admin: false,
+        subscriptions: MapSet.new(["chat"])
+      })
+
+    base = gateway_children_base!()
+
+    config = %{
+      base_dir: base,
+      cwd: "/tmp",
+      port: 0,
+      default_harness: :claude,
+      default_model: Model.new("claude-fable-5"),
+      max_live_sessions_per_user: 50,
+      wake_tick_ms: 1_000,
+      onboarding_lease_ms: 1_800_000,
+      db: ctx.db
+    }
+
+    children = Gateway.children(config)
+
+    {Tightbeam.LaneManager, lane_opts} =
+      Enum.find(children, &match?({Tightbeam.LaneManager, _}, &1))
+
+    runner = Keyword.fetch!(lane_opts, :runner)
+
+    # Incident-faithful: catalog LEFT FRESH — real expiry is storage-blind, so health gives
+    # NO signal. The only signal is the :prompt auth-fault shape.
+    assert {_entries, :fresh} = ModelCatalog.get("testhost", "claude", ModelCatalog)
+
+    assert :appended =
+             Gateway.deliver_prompt("k1", "user:flynn", "fail this turn",
+               db: ctx.db,
+               conn_registry: exact_registry,
+               lane_manager: ctx.lane,
+               device_id: "o6-prompt401",
+               client_message_id: "c_o6_prompt401"
+             )
+
+    assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
+
+    assert {:error, %{reason: reason, terminal_publish: publish, record_in_txn: record}} =
+             runner.(Map.put(turn, :session_key, "k1"))
+
+    # It genuinely failed at :prompt — checkout + session succeeded (the incident path, not a
+    # pre-engine refusal). The record keeps the stage.
+    # reason is the raw ACP map here (health :fresh -> :not_applicable, no reclassify); the lane
+    # stringifies it via error_text before the ledger, and the OPERATOR-facing marker flattens
+    # it via error_sentence (asserted below). Finish with a stand-in string, as SessionLane's
+    # error_text would produce one.
+    assert {:ok, true} =
+             DB.transaction(ctx.db, fn txn ->
+               assert Ledger.finish_in_txn(txn, turn.seq, "failed", "prompt auth 401")
+               record.(txn)
+               true
+             end)
+
+    publish.("failed")
+
+    lifecycle =
+      Enum.find(EventLog.lifecycle_events(ctx.db), fn event ->
+        event.kind == "harness_turn_error" and event.subject == "k1"
+      end)
+
+    assert lifecycle, "the :prompt turn failure must record a harness_turn_error"
+    assert lifecycle.detail =~ "prompt"
+
+    # G3: the operator reads the human message/details as PROSE, never a raw inspected ACP
+    # error map. The auth detail survives as text; the map's inspect markers (`=>`, `%{`) do
+    # NOT. (The precise re-onboard NAMING for this health-blind :prompt 401 is the held
+    # option-a piece, pending the PO's a-vs-b ruling; the common path guarantees only that no
+    # raw map reaches chat.)
+    marker =
+      ctx.db
+      |> Projection.list_after("k1", nil, 100)
+      |> Enum.find(&String.starts_with?(&1.content || "", "[turn failed]"))
+
+    assert marker, "a :prompt failure must speak in chat"
+    assert marker.content =~ "auth expired"
+    refute marker.content =~ "=>"
+    refute marker.content =~ "%{"
   end
 
   test "identity relearn reports a non-conflict git failure legibly", ctx do
