@@ -25,6 +25,8 @@ defmodule Tightbeam.Homes do
   Homes never mint or otherwise write credential contents.
   """
 
+  require Logger
+
   alias Tightbeam.Harness
   alias Tightbeam.Harness.Support
 
@@ -241,16 +243,52 @@ defmodule Tightbeam.Homes do
           :ok
 
         bytes ->
-          Tightbeam.Credentials.store_harvested(
-            base_dir,
-            module.credential_provider(),
-            bytes,
-            "the #{module.id()} harness home #{home}"
-          )
+          harvest_one(base_dir, module, home, bytes)
       end
     end)
 
     :ok
+  end
+
+  # ONE BAD HOME MUST NOT TAKE THE GATEWAY WITH IT.
+  #
+  # This runs on the BOOT path -- gateway.ex calls `sweep_auth/2` for every harness inside
+  # `children_after_preflight`, which `Application.start/2` invokes with no rescue around it
+  # (it catches only `{:no_harness_cli, _}`). So a raise here is not a refusal an operator
+  # reads; in a release it is `Kernel pid terminated` and an `erl_crash.dump`, and the
+  # gateway does not boot. The sweep also globs `homes/*/<harness>`, so the raise would
+  # abort the `Enum.each` over every OTHER home and harness too.
+  #
+  # That would defeat the very invariant the refusal exists to protect. `refuse_hollow!/3`
+  # keeps a good store credential alive; a dead gateway makes that credential unreachable
+  # and leaves the box crash-looping every boot until someone hand-deletes a file the VENDOR
+  # wrote. Silent poisoning was the bug; an outage is not the fix for it.
+  #
+  # The distinction against `reload_law!` two lines above, which does stop the boot: law is
+  # org-AUTHORED, global by nature, and has no prior-good value to fall back on -- the author
+  # fixes their own manifest. A harness credential is EXTERNAL data the vendor rotates in
+  # place, scoped to one provider on one home, and there is a known-good value already
+  # banked. Same mechanism, different category.
+  #
+  # So the refusal still REFUSES -- nothing hollow is banked, the good credential stands --
+  # and it still NAMES itself, at :error where an operator and the log both see it. What it
+  # no longer does is take the org down to say so. The affected provider then reports
+  # `needs_onboarding` through the ordinary credential status path, which is the org's
+  # existing word for "this credential cannot serve".
+  defp harvest_one(base_dir, module, home, bytes) do
+    Tightbeam.Credentials.store_harvested(
+      base_dir,
+      module.credential_provider(),
+      bytes,
+      "the #{module.id()} harness home #{home}"
+    )
+  rescue
+    error in RuntimeError ->
+      Logger.error(
+        "#{module.id()} credential in #{home} was NOT harvested: #{Exception.message(error)}"
+      )
+
+      :ok
   end
 
   @doc "Canonical shared home path."
