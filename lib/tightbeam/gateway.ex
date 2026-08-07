@@ -4030,7 +4030,7 @@ defmodule Tightbeam.Gateway do
   end
 
   # A live model-switch on a RESIDENT session used to hit set_config_option, which
-  # cannot re-read settings.json, so the harness refused any model its offered set
+  # cannot re-read the projected home, so the harness refused any model its offered set
   # did not already hold (mike's opus-5 picker-pain) and the raw refusal reached the
   # client as `inspect(reason)` term soup. The fix (apply_tuned_model's resident
   # branch) reloads the session so the offered set is rebuilt from the home -- but a
