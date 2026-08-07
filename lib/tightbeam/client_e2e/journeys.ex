@@ -45,7 +45,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
           required(:main_key) => String.t() | nil,
           required(:gateway) => Tightbeam.ClientE2E.LegGateway.t() | nil,
           required(:leg) => map(),
-          required(:turn_timeout_ms) => pos_integer(),
+          required(:turn_wait_ms) => pos_integer(),
           required(:settle_ms) => pos_integer(),
           optional(atom()) => term()
         }
@@ -413,7 +413,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
            client,
            watermark,
            &(&1["type"] == "typing" and &1["active"] == true and &1["sessionKey"] == ctx.main_key),
-           ctx.turn_timeout_ms
+           ctx.turn_wait_ms
          ) do
       {:error, reason, client} ->
         {%{ctx | client: client},
@@ -440,7 +440,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
                  &(&1["type"] == "event" and &1["event"] == "prompt_turn_state" and
                      get_in(&1, ["payload", "messageId"]) == cmid and
                      get_in(&1, ["payload", "state"]) == "canceled"),
-                 ctx.turn_timeout_ms
+                 ctx.turn_wait_ms
                ) do
             {:ok, frame, client} -> {frame, client}
             {:error, _reason, client} -> {nil, client}
@@ -556,7 +556,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
               watermark,
               &(&1["type"] == "message" and &1["role"] == "assistant" and
                   &1["replyToClientMessageId"] == id),
-              ctx.turn_timeout_ms
+              ctx.turn_wait_ms
             )
 
           %{ctx | client: client}
@@ -714,9 +714,9 @@ defmodule Tightbeam.ClientE2E.Journeys do
           # frame would fail the healthy run for want of a frame nobody read.
           #
           # ONE deadline across all six, not six of them: six waits that each
-          # restart the turn timeout let a socket that has gone quiet hold J5
-          # for six times as long as any single turn is allowed to take.
-          deadline = System.monotonic_time(:millisecond) + ctx.turn_timeout_ms
+          # restart the turn wait let a socket that has gone quiet hold J5
+          # for six times the observer's one-turn wait.
+          deadline = System.monotonic_time(:millisecond) + ctx.turn_wait_ms
 
           Enum.reduce([b_id, slow_id, done_id], ctx, fn id, ctx ->
             ctx
@@ -1439,7 +1439,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
         client,
         watermark,
         &(&1["type"] == "typing" and &1["active"] == true and &1["sessionKey"] == ctx.main_key),
-        ctx.turn_timeout_ms
+        ctx.turn_wait_ms
       )
 
     ctx = %{ctx | client: client}
@@ -1630,7 +1630,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
           {:ok, ctx} ->
             # NOTHING is re-sent here. That is the assertion.
             second_turn =
-              case Substrate.await_turn_terminal(ctx.base_dir, second, ctx.turn_timeout_ms) do
+              case Substrate.await_turn_terminal(ctx.base_dir, second, ctx.turn_wait_ms) do
                 {:ok, row} -> row
                 {:error, :timeout, row} -> row
               end
@@ -1717,7 +1717,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
          Scorecard.fail("16", "wakes", "wake dispatch failed: #{inspect(reason)}", journey: "J8")}
 
       {:ok, result} ->
-        j8_verdict(ctx, watermark, wake_id(result), "16", "wakes", ctx.turn_timeout_ms)
+        j8_verdict(ctx, watermark, wake_id(result), "16", "wakes", ctx.turn_wait_ms)
     end
   end
 
@@ -1860,7 +1860,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
             id,
             "16b",
             "scheduled wake",
-            delay_ms + ctx.turn_timeout_ms
+            delay_ms + ctx.turn_wait_ms
           )
         else
           {ctx,
@@ -2145,7 +2145,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
         session_key: session_key,
         client_message_id: cmid,
         turn: turn,
-        timeout_ms: ctx.turn_timeout_ms
+        timeout_ms: ctx.turn_wait_ms
       })
 
     {ctx,
@@ -2165,7 +2165,7 @@ defmodule Tightbeam.ClientE2E.Journeys do
       &(&1["type"] == "message" and &1["role"] == "assistant" and
           &1["replyToClientMessageId"] == cmid)
 
-    deadline = System.monotonic_time(:millisecond) + ctx.turn_timeout_ms
+    deadline = System.monotonic_time(:millisecond) + ctx.turn_wait_ms
     await_reply(client, watermark, cmid, ctx, predicate, deadline)
   end
 

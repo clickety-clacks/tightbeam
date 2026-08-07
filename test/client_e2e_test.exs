@@ -1671,7 +1671,7 @@ defmodule Tightbeam.ClientE2ETest do
         main_key: "agent:main:x",
         gateway: nil,
         leg: %{},
-        turn_timeout_ms: 1_000,
+        turn_wait_ms: 1_000,
         settle_ms: 1
       }
 
@@ -1837,7 +1837,7 @@ defmodule Tightbeam.ClientE2ETest do
       main_key: nil,
       gateway: nil,
       leg: %{harness: "claude", host: "testhost", model: "fable"},
-      turn_timeout_ms: 10_000,
+      turn_wait_ms: 10_000,
       settle_ms: 250
     }
   end

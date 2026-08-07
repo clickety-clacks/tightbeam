@@ -59,7 +59,10 @@ defmodule FeatureSmoke do
   # that provoked it, so this covers scheduling, not model time.
   @episode_settle_ms 30_000
 
-  # Slack over one turn ceiling: lane queueing, adapter spawn, and the poll interval.
+  # This smoke-owned wait stops only the observer. It never reaches runtime execution.
+  @turn_observer_wait_ms :timer.minutes(10)
+
+  # Slack over one observer wait: lane queueing, adapter spawn, and the poll interval.
   @lane_slack_ms 60_000
 
   def run do
@@ -1322,24 +1325,9 @@ defmodule FeatureSmoke do
     )
   end
 
-  # The REAL runtime turn ceiling, read from the same env var the runtime reads.
-  # `config/runtime.exs:27` maps `TIGHTBEAM_TURN_TIMEOUT_MS` onto `:turn_timeout_ms`, whose
-  # default is 600s at `Tightbeam.ACP.Adapter.prompt/5`. Deriving the budget from that env
-  # var rather than restating a number keeps ONE source of truth: a runner who tightens the
-  # ceiling for a run tightens these waits with it, and a runner who does not gets the
-  # ceiling the adapter will actually enforce. The client-e2e driver's 180s is a DRIVER's
-  # wait budget, not the runtime ceiling, and using it here would expire while the
-  # substrate was still behaving correctly.
-  defp turn_ceiling_ms do
-    case System.get_env("TIGHTBEAM_TURN_TIMEOUT_MS") do
-      nil -> 600_000
-      value -> String.to_integer(value)
-    end
-  end
-
   # ONE turn's worth, because this group serializes: the statute's remedy turn is drained
   # before the prompted wake is issued, so nothing is queued behind the turn being awaited.
-  defp turn_budget_ms, do: turn_ceiling_ms() + @lane_slack_ms
+  defp turn_observer_budget_ms, do: @turn_observer_wait_ms + @lane_slack_ms
 
   # Wait for the holder's lane to go quiet.
   #
@@ -1357,7 +1345,7 @@ defmodule FeatureSmoke do
       state,
       session_key,
       label,
-      System.monotonic_time(:millisecond) + turn_budget_ms()
+      System.monotonic_time(:millisecond) + turn_observer_budget_ms()
     )
   end
 
@@ -1374,7 +1362,7 @@ defmodule FeatureSmoke do
           false,
           "artifact closure: the holder's lane never went quiet #{label} — #{turns} turn(s) " <>
             "queued or running and #{wakes} wake(s) due but not yet fired, after " <>
-            "#{div(turn_budget_ms(), 1000)}s. This group serializes turns on purpose; it will " <>
+            "#{div(turn_observer_budget_ms(), 1000)}s. This group serializes turns on purpose; it will " <>
             "not run its assertions beside one."
         )
 
@@ -1506,7 +1494,7 @@ defmodule FeatureSmoke do
       work_item_id,
       assignment_id,
       proof,
-      System.monotonic_time(:millisecond) + turn_budget_ms()
+      System.monotonic_time(:millisecond) + turn_observer_budget_ms()
     )
   end
 
@@ -1566,7 +1554,7 @@ defmodule FeatureSmoke do
           state,
           false,
           "artifact closure: no artifact was bound to the prompted turn on #{work_item_id} " <>
-            "within #{div(turn_budget_ms(), 1000)}s, with #{assignment_id} still open and the " <>
+            "within #{div(turn_observer_budget_ms(), 1000)}s, with #{assignment_id} still open and the " <>
             "turn still going. Either the real CLI `artifact-record` refused (the §1.1 defect " <>
             "this carrier fixed) or the prompted turn never ran it. " <>
             marker_diagnosis(reports, proof)

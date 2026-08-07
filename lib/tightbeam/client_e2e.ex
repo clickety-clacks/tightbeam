@@ -19,7 +19,7 @@ defmodule Tightbeam.ClientE2E do
   alias Tightbeam.ClientE2E.{Journeys, Scorecard, SimClient}
   alias Tightbeam.ClientE2E.Scorecard.Leg
 
-  @default_turn_timeout_ms 180_000
+  @default_turn_wait_ms 180_000
   @default_settle_ms 2_500
 
   @doc """
@@ -55,7 +55,7 @@ defmodule Tightbeam.ClientE2E do
           journeys: [String.t()],
           gateway: Tightbeam.ClientE2E.LegGateway.t() | nil,
           preflight_row: Scorecard.Row.t() | nil,
-          turn_timeout_ms: pos_integer(),
+          turn_wait_ms: pos_integer(),
           settle_ms: pos_integer()
         ]
 
@@ -107,7 +107,7 @@ defmodule Tightbeam.ClientE2E do
           # reports itself incomplete rather than pretending.
           gateway: Keyword.get(opts, :gateway),
           leg: %{harness: harness, host: host_name, model: Keyword.get(opts, :model)},
-          turn_timeout_ms: Keyword.get(opts, :turn_timeout_ms, @default_turn_timeout_ms),
+          turn_wait_ms: Keyword.get(opts, :turn_wait_ms, @default_turn_wait_ms),
           settle_ms: Keyword.get(opts, :settle_ms, @default_settle_ms)
         }
 
