@@ -759,6 +759,115 @@ defmodule Tightbeam.CredentialsTest do
     end
   end
 
+  # A HOLLOW CREDENTIAL IS DIRT, AND DIRT IS REPORTED, NOT BANKED.
+  #
+  # The incident these pin: a re-onboard left `accessToken: ""`, `refreshToken: ""`,
+  # `expiresAt: 0` in BOTH tightbeam stores while the vendor's own credential was fine,
+  # and every session afterwards read "expired", tried to refresh, and died
+  # `authentication_failed`. Two coder sessions were killed by it before it was traced.
+  #
+  # The writer was never the ceremony. Claude Code OWNS the `.credentials.json` inside a
+  # harness home and rotates it in place; `Homes.sweep_auth/2` harvests that file at every
+  # gateway boot (gateway.ex:193) and `store_harvested/3` wrote the bytes over the SHARED
+  # auth store without ever looking at them. So one agent's hollow home file poisoned the
+  # credential for every agent on the next boot — and the reboot was what re-applied the
+  # poison, which is why restarting never healed it.
+  describe "banking refuses a hollow credential" do
+    test "harvesting a hollow vendor record refuses, names it, and banks nothing", ctx do
+      store = Path.join([ctx.base, "auth", "claude", ".credentials.json"])
+      home = Path.join([ctx.base, "homes", "eezo", "claude"])
+      File.mkdir_p!(Path.dirname(store))
+      File.mkdir_p!(home)
+
+      good =
+        ~s({"claudeAiOauth":{"accessToken":"sk-ant-oat01-good","refreshToken":"sk-ant-ort01-good","expiresAt":4102444800000}})
+
+      File.write!(store, good)
+
+      # The shape observed on gibson: every key present, every value empty or zero.
+      File.write!(
+        Path.join(home, ".credentials.json"),
+        ~s({"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0,"scopes":[]}})
+      )
+
+      error =
+        assert_raise RuntimeError, fn ->
+          Tightbeam.Homes.sweep_auth(ctx.base, :claude)
+        end
+
+      # NAMED, not merely refused: the operator has to be able to find the file. The home
+      # rather than the file itself, because the credential FILENAME is private to each
+      # harness module and exposing it would mean a new behaviour callback on every
+      # harness — a wider change than this fix earns. The home holds one credential.
+      assert error.message =~ home
+      assert error.message =~ "accessToken"
+
+      # And the good credential is still standing. This is the half that matters:
+      # refusing to bank is worthless if the store was already overwritten.
+      assert File.read!(store) == good
+    end
+
+    test "store_harvested refuses hollow bytes rather than writing them", ctx do
+      store = Path.join([ctx.base, "auth", "claude", ".credentials.json"])
+      File.mkdir_p!(Path.dirname(store))
+      File.write!(store, ~s({"claudeAiOauth":{"accessToken":"sk-ant-oat01-good"}}))
+
+      assert_raise RuntimeError, fn ->
+        Credentials.store_harvested(
+          ctx.base,
+          :anthropic,
+          ~s({"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0}})
+        )
+      end
+
+      assert File.read!(store) == ~s({"claudeAiOauth":{"accessToken":"sk-ant-oat01-good"}})
+    end
+
+    test "an empty credential file is refused too", ctx do
+      File.mkdir_p!(Path.join([ctx.base, "auth", "claude"]))
+
+      assert_raise RuntimeError, fn ->
+        Credentials.store_harvested(ctx.base, :anthropic, "")
+      end
+    end
+
+    # THE REGRESSION THIS GUARD COULD EASILY CAUSE. An anthropic `.credentials.json` is
+    # not always an OAuth record: `bank_anthropic_api_key` (ceremonies.rs:775) writes a
+    # BARE KEY STRING to the same filename. A validator that assumed JSON would refuse
+    # every api_key install on this path.
+    test "a bare api key still harvests — it is not an OAuth record", ctx do
+      store = Path.join([ctx.base, "auth", "claude", ".credentials.json"])
+      home = Path.join([ctx.base, "homes", "eezo", "claude"])
+      File.mkdir_p!(Path.dirname(store))
+      File.mkdir_p!(home)
+      File.write!(store, "sk-ant-api03-old")
+      File.write!(Path.join(home, ".credentials.json"), "sk-ant-api03-rotated")
+
+      assert :ok = Tightbeam.Homes.sweep_auth(ctx.base, :claude)
+      assert File.read!(store) == "sk-ant-api03-rotated"
+    end
+
+    test "a healthy vendor rotation still harvests", ctx do
+      store = Path.join([ctx.base, "auth", "claude", ".credentials.json"])
+      home = Path.join([ctx.base, "homes", "eezo", "claude"])
+      File.mkdir_p!(Path.dirname(store))
+      File.mkdir_p!(home)
+
+      File.write!(
+        store,
+        ~s({"claudeAiOauth":{"accessToken":"old","refreshToken":"r","expiresAt":1}})
+      )
+
+      rotated =
+        ~s({"claudeAiOauth":{"accessToken":"sk-ant-oat01-new","refreshToken":"sk-ant-ort01-new","expiresAt":4102444800000}})
+
+      File.write!(Path.join(home, ".credentials.json"), rotated)
+
+      assert :ok = Tightbeam.Homes.sweep_auth(ctx.base, :claude)
+      assert File.read!(store) == rotated
+    end
+  end
+
   defp credential_metadata(base, harness) do
     [base, "auth", harness, ".tightbeam", "credential.json"]
     |> Path.join()

@@ -109,7 +109,9 @@ defmodule Tightbeam.Homes do
 
     File.mkdir_p!(home)
 
-    if harvest_auth?, do: harvest_auth_back(auth_dir, home, credential_names)
+    if harvest_auth?,
+      do: harvest_auth_back(auth_dir, home, credential_names, provider_of(desired))
+
     Enum.each(credential_names, &File.rm(Path.join(home, &1)))
 
     unless File.read(manifest_path) == {:ok, manifest} do
@@ -242,7 +244,8 @@ defmodule Tightbeam.Homes do
           Tightbeam.Credentials.store_harvested(
             base_dir,
             module.credential_provider(),
-            bytes
+            bytes,
+            "the #{module.id()} harness home #{home}"
           )
       end
     end)
@@ -288,7 +291,7 @@ defmodule Tightbeam.Homes do
     end
   end
 
-  defp harvest_auth_back(auth_dir, home, credential_names) do
+  defp harvest_auth_back(auth_dir, home, credential_names, provider) do
     auth_dir
     |> credential_store_files(credential_names)
     |> Enum.each(fn file ->
@@ -296,6 +299,14 @@ defmodule Tightbeam.Homes do
 
       case File.lstat(entry) do
         {:ok, %File.Stat{type: :regular}} ->
+          # The THIRD door onto the shared store, and it has to be guarded like the other
+          # two: a copy is a bank.
+          Tightbeam.Credentials.refuse_hollow!(
+            provider,
+            File.read!(entry),
+            "the harness home #{home}"
+          )
+
           File.cp!(entry, Path.join(auth_dir, file))
           File.chmod!(Path.join(auth_dir, file), 0o600)
 
@@ -304,6 +315,13 @@ defmodule Tightbeam.Homes do
       end
     end)
   end
+
+  # The harness owns the pairing, so it is ASKED rather than restated here. Mapping the
+  # credential FILENAME to a provider in this module read fine and was wrong: it put harness
+  # mechanic literals outside `Tightbeam.Harness.*`, which the seam scan and the provider
+  # literal inventory both refuse -- and they caught it, which is the whole point of them.
+  defp provider_of(%{harness: harness}),
+    do: Harness.module!(harness).credential_provider()
 
   defp link_auth(auth_dir, home, credential_names) do
     auth_dir
