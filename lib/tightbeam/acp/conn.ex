@@ -8,9 +8,10 @@ defmodule Tightbeam.Acp.Conn do
     `from` and replies when the Port answers ({:noreply, ...} + later
     GenServer.reply). Callers (TurnTasks) may block on the call — they are
     designed to wait and are monitored.
-  - Per-request timeout via Process.send_after; on timeout the caller gets
+  - Finite per-request timeout via Process.send_after; on timeout the caller gets
     {:error, :timeout} and the pending entry is KEPT (awaiting the adapter's
     eventual answer) until resolution, for quiescence accounting.
+    A live session/prompt explicitly uses :infinity and gets no timer.
   - Requester death: each pending request monitors its caller; on :DOWN a
     session/cancel notification is sent for that request's session. The
     pending entry is retained until the adapter's terminal response arrives —
@@ -50,7 +51,8 @@ defmodule Tightbeam.Acp.Conn do
   @doc """
   JSON-RPC request; blocks the CALLER (never this GenServer) until the adapter
   answers, the per-request timeout fires, or the Port closes. opts: `:timeout`
-  (ms, default 60_000), `:session_id` (enables cancel-on-caller-death).
+  (ms or `:infinity`, default 60_000), `:session_id` (enables
+  cancel-on-caller-death).
   """
   @spec request(conn(), String.t(), map(), keyword()) :: {:ok, term()} | {:error, term()}
   def request(conn, method, params, opts \\ []) do
@@ -96,7 +98,10 @@ defmodule Tightbeam.Acp.Conn do
       notify_dispatched(opts)
       send_json(state.port, %{jsonrpc: "2.0", id: id, method: method, params: params})
       timeout = Keyword.get(opts, :timeout, 60_000)
-      Process.send_after(self(), {:req_timeout, id}, timeout)
+
+      if timeout != :infinity do
+        Process.send_after(self(), {:req_timeout, id}, timeout)
+      end
 
       entry = %{
         from: from,

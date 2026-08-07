@@ -80,6 +80,23 @@ defmodule Tightbeam.Acp.ConnTest do
     assert eventually(fn -> map_size(:sys.get_state(conn).pending) == 0 end)
   end
 
+  test "an unbounded prompt request stays pending until an event resolves it" do
+    conn = start_conn("unbounded")
+    assert {:ok, %{"protocolVersion" => 1}} = Conn.request(conn, "initialize", %{})
+
+    task =
+      Task.async(fn ->
+        Conn.request(conn, "never", %{}, session_id: "sess-unbounded", timeout: :infinity)
+      end)
+
+    assert eventually(fn -> map_size(:sys.get_state(conn).pending) == 1 end)
+    assert Task.yield(task, 150) == nil
+
+    Task.shutdown(task, :brutal_kill)
+    assert_receive {:acp_orphan_resolved, "sess-unbounded"}, 2_000
+    assert map_size(:sys.get_state(conn).pending) == 0
+  end
+
   test "requester death sends session/cancel; adapter's eventual answer is the quiescence signal" do
     conn = start_conn("orphan")
     # Same boot barrier as the notification test: everything below is sub-millisecond once

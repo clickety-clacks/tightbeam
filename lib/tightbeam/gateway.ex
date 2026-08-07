@@ -1782,7 +1782,6 @@ defmodule Tightbeam.Gateway do
                    adapter,
                    harness_session_id,
                    turn.prompt,
-                   600_000,
                    progress:
                      progress_fun(db, turn.session_key, session.owner_user_id, correlation)
                  )

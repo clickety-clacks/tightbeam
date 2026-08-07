@@ -31,10 +31,6 @@ if value = System.get_env("TIGHTBEAM_WAKE_TICK_MS") do
   config :tightbeam, :wake_tick_ms, String.to_integer(value)
 end
 
-if value = System.get_env("TIGHTBEAM_TURN_TIMEOUT_MS") do
-  config :tightbeam, :turn_timeout_ms, String.to_integer(value)
-end
-
 if value = System.get_env("TIGHTBEAM_PROD_LIMIT") do
   config :tightbeam, :prod_limit, String.to_integer(value)
 end

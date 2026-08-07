@@ -234,6 +234,12 @@ defmodule Tightbeam.Acp.AdapterTest do
         const sid = m.params.sessionId;
         capture(m);
         if (gateMode === "stall-turn") return;
+        if (gateMode === "delay-turn") {
+          return setTimeout(() => {
+            send({ method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "delayed" } } } });
+            send({ id: m.id, result: { stopReason: "end_turn" } });
+          }, 75);
+        }
         if (sid === "probe-sess") {
           if (gateMode === "pass-message") {
             send({ method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Command blocked [gate: tightbeam-probe]" } } } });
@@ -410,6 +416,14 @@ defmodule Tightbeam.Acp.AdapterTest do
     end
   end
 
+  defp prompt_count?(adapter, expected, remaining \\ 500) do
+    cond do
+      map_size(:sys.get_state(adapter).prompts) == expected -> true
+      remaining == 0 -> false
+      true -> Process.sleep(10) && prompt_count?(adapter, expected, remaining - 1)
+    end
+  end
+
   defp queued_at?(adapter, request) do
     case Process.info(adapter, :messages) do
       {:messages, messages} ->
@@ -570,16 +584,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert Adapter.conn(adapter) == dead_conn
   end
 
-  test "a missing prompt dispatch acknowledgement times out without wedging the adapter" do
-    old_timeout = Application.get_env(:tightbeam, :prompt_dispatch_timeout_ms)
-
-    on_exit(fn ->
-      if old_timeout,
-        do: Application.put_env(:tightbeam, :prompt_dispatch_timeout_ms, old_timeout),
-        else: Application.delete_env(:tightbeam, :prompt_dispatch_timeout_ms)
-    end)
-
-    Application.put_env(:tightbeam, :prompt_dispatch_timeout_ms, 25)
+  test "a missing prompt dispatch acknowledgement stays live until the connection dies" do
     {adapter, _capture_path} = start_adapter()
 
     inert_conn =
@@ -592,10 +597,32 @@ defmodule Tightbeam.Acp.AdapterTest do
     on_exit(fn -> send(inert_conn, :stop) end)
     :sys.replace_state(adapter, &%{&1 | conn: inert_conn})
 
-    assert {:error, :prompt_dispatch_failed} =
-             Adapter.prompt(adapter, "sess-1", "never acknowledged", 100)
+    prompt = Task.async(fn -> Adapter.prompt(adapter, "sess-1", "never acknowledged") end)
+    assert prompt_count?(adapter, 1)
+    assert Task.yield(prompt, 50) == nil
+
+    send(inert_conn, :stop)
+    assert {:error, :prompt_dispatch_failed} = Task.await(prompt)
 
     assert Adapter.conn(adapter) == inert_conn
+  end
+
+  test "caller death ends a connected silent prompt and orphans its ACP request" do
+    {adapter, _capture_path} = start_adapter(gate_mode: "stall-turn", probe: false)
+    assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+
+    prompt = Task.async(fn -> Adapter.prompt(adapter, sid, "stall") end)
+    assert prompt_count?(adapter, 1)
+    assert Task.yield(prompt, 50) == nil
+
+    Task.shutdown(prompt, :brutal_kill)
+    assert prompt_count?(adapter, 0)
+
+    assert [%{orphaned: true, replied: true, session_id: ^sid}] =
+             Adapter.conn(adapter)
+             |> :sys.get_state()
+             |> Map.fetch!(:pending)
+             |> Map.values()
   end
 
   test "close_session sends ACP session/close with the harness session id" do
@@ -1432,20 +1459,16 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert {:ok, %{text: "pong[allow-once]"}} = Adapter.prompt(a, "sess-1", "two")
   end
 
-  test "turn timeout config reaches the session prompt request" do
-    old_timeout = Application.get_env(:tightbeam, :turn_timeout_ms)
-
-    on_exit(fn ->
-      if old_timeout,
-        do: Application.put_env(:tightbeam, :turn_timeout_ms, old_timeout),
-        else: Application.delete_env(:tightbeam, :turn_timeout_ms)
-    end)
-
-    Application.put_env(:tightbeam, :turn_timeout_ms, 25)
-
-    {adapter, _capture_path} = start_adapter(gate_mode: "stall-turn", probe: false)
+  test "a delayed prompt completes without an elapsed-duration failure" do
+    {adapter, _capture_path} = start_adapter(gate_mode: "delay-turn", probe: false)
     assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
-    assert {:error, :timeout} = Adapter.prompt(adapter, sid, "stall")
+
+    started = System.monotonic_time(:millisecond)
+
+    assert {:ok, %{stop_reason: "end_turn", text: "delayed"}} =
+             Adapter.prompt(adapter, sid, "wait")
+
+    assert System.monotonic_time(:millisecond) - started >= 50
   end
 
   test "preset modes are pinned for both harnesses" do
