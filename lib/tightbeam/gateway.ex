@@ -3734,16 +3734,32 @@ defmodule Tightbeam.Gateway do
                      session.host,
                      spinup_opts(config, db)
                    ) do
-              apply_harness_change(
-                config,
-                db,
-                call,
-                session,
-                harness,
-                harness_atom,
-                model,
-                routed.provider
-              )
+              case at_session_turn_boundary(config, session.session_key, fn ->
+                     run_session_mutation(session.session_key, fn ->
+                       apply_harness_change(
+                         config,
+                         db,
+                         call,
+                         session,
+                         harness,
+                         harness_atom,
+                         model,
+                         routed.provider
+                       )
+                     end)
+                   end) do
+                {:ok, result} ->
+                  result
+
+                {:error, :turn_in_progress} ->
+                  %{
+                    ok: false,
+                    code: "turn_in_progress",
+                    message:
+                      "this session is running a turn, so switching its harness to #{harness} " <>
+                        "was not applied; it needs a turn boundary. Try again once the current turn finishes."
+                  }
+              end
             else
               {:error, denial} ->
                 denial
@@ -3917,11 +3933,13 @@ defmodule Tightbeam.Gateway do
     # Pin the shared home to the model this session will run on the new
     # harness, not the org default, so the next turn's session/new
     # offers and accepts it (wi_263814d3).
-    Placement.deliver_home(
-      config,
-      {harness_atom, "shared", session.host},
-      Keyword.put(deliver_opts, :model, model)
-    )
+    with_home_pin_lock(harness_atom, session.host, fn ->
+      Placement.deliver_home(
+        config,
+        {harness_atom, "shared", session.host},
+        Keyword.put(deliver_opts, :model, model)
+      )
+    end)
 
     Org.set_harness(
       db,

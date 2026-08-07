@@ -1663,6 +1663,7 @@ defmodule Tightbeam.GatewayTest do
       |> Map.put(:default_model, Model.new("fixture-model"))
 
     handlers = Gateway.handlers(config)
+    start_lane!(ctx.db, "k1")
 
     assert %{session_key: spawned_key} =
              handlers["spawn"].(%{
@@ -1729,6 +1730,8 @@ defmodule Tightbeam.GatewayTest do
       provider: "anthropic",
       model: Model.new("before-model")
     })
+
+    start_lane!(ctx.db, "swapme")
 
     # Real prior conversation, so the barrier has something to bury.
     for body <- ["first", "second"] do
@@ -1803,6 +1806,8 @@ defmodule Tightbeam.GatewayTest do
       provider: "anthropic",
       model: Model.new("before-model")
     })
+
+    start_lane!(ctx.db, "atomic")
 
     for body <- ["first", "second"] do
       Projection.append(ctx.db, %{
@@ -4484,6 +4489,115 @@ defmodule Tightbeam.GatewayTest do
     assert Org.get(ctx.db, "k1") == before
   end
 
+  test "set_harness changes the engine and projects its home at a turn boundary", ctx do
+    base_dir = role_test_base("harness-turn-boundary")
+    codex_auth = Path.join([base_dir, "auth", "codex"])
+    File.mkdir_p!(codex_auth)
+    File.write!(Path.join(codex_auth, "auth.json"), "test-token")
+    Archetypes.load!(base_dir)
+    ensure_global_registry()
+
+    config =
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.put(:conn_registry, ctx.registry)
+      |> Map.put(:lane_manager, ctx.lane)
+
+    local_host = Placement.local_host_name()
+    Org.set_host(ctx.db, "k1", local_host)
+    put_host_catalog(local_host, "codex", [])
+
+    put_host_catalog_entry(local_host, "codex", %{
+      family: "gpt-5.6-sol",
+      efforts: ["medium"],
+      provider: :openai
+    })
+
+    start_lane!(ctx.db, "k1")
+
+    assert %{ok: true, harness: "codex", model: "gpt-5.6-sol", effort: "medium"} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: "user:flynn",
+               session_key: "k1",
+               params: %{
+                 setting: "set_harness",
+                 harness: "codex",
+                 model: "gpt-5.6-sol",
+                 effort: "medium"
+               }
+             })
+
+    assert %{harness: "codex", provider: "openai", model: model} = Org.get(ctx.db, "k1")
+    assert model == Model.new("gpt-5.6-sol", effort: "medium")
+
+    home = Tightbeam.Homes.home_path(base_dir, local_host, :codex)
+
+    assert JSON.decode!(File.read!(Path.join([home, ".tightbeam", "manifest"])))["harness"] ==
+             "codex"
+  end
+
+  test "set_harness refuses before writing the new home while a turn runs", ctx do
+    base_dir = role_test_base("harness-running-turn")
+    codex_auth = Path.join([base_dir, "auth", "codex"])
+    File.mkdir_p!(codex_auth)
+    File.write!(Path.join(codex_auth, "auth.json"), "test-token")
+    Archetypes.load!(base_dir)
+
+    config =
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.put(:conn_registry, ctx.registry)
+      |> Map.put(:lane_manager, ctx.lane)
+
+    local_host = Placement.local_host_name()
+    Org.set_host(ctx.db, "k1", local_host)
+    before = Org.get(ctx.db, "k1")
+    put_host_catalog(local_host, "codex", [])
+
+    put_host_catalog_entry(local_host, "codex", %{
+      family: "gpt-5.6-sol",
+      efforts: ["medium"],
+      provider: :openai
+    })
+
+    assert {:ok, _seq} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: "k1",
+               message_id: "set-harness-running",
+               origin: "user:flynn",
+               prompt: "hold the harness boundary"
+             })
+
+    parent = self()
+
+    start_lane!(ctx.db, "k1", fn _turn ->
+      send(parent, {:set_harness_turn_started, self()})
+
+      receive do
+        :finish_set_harness_turn -> {:ok, %{}}
+      end
+    end)
+
+    assert_receive {:set_harness_turn_started, runner}
+    home = Tightbeam.Homes.home_path(base_dir, local_host, :codex)
+    refute File.exists?(home)
+
+    assert %{ok: false, code: "turn_in_progress", message: message} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: "user:flynn",
+               session_key: "k1",
+               params: %{
+                 setting: "set_harness",
+                 harness: "codex",
+                 model: "gpt-5.6-sol",
+                 effort: "medium"
+               }
+             })
+
+    assert message =~ "Try again once the current turn finishes"
+    assert Org.get(ctx.db, "k1") == before
+    refute File.exists?(home)
+    send(runner, :finish_set_harness_turn)
+  end
+
   # The value a client is TOLD to send must be a value this accepts. `setModel.options`
   # and `modelCatalog.models` advertise one row per model with a base ref, deliberately
   # — the effort tier belongs to the reasoning picker — while the catalog only holds an
@@ -4506,6 +4620,8 @@ defmodule Tightbeam.GatewayTest do
       id: :harness_bare_model_conn_registry,
       start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
     })
+
+    start_lane!(ctx.db, "k1")
 
     assert %{ok: true, harness: "codex"} =
              Gateway.handlers(config)["tune"].(%{
@@ -4553,6 +4669,7 @@ defmodule Tightbeam.GatewayTest do
     identity_name = Placement.identity_name(config, base, overrides, :claude)
     assert Placement.identity_name(config, base, overrides, :codex) == identity_name
     Org.set_identity(ctx.db, "k1", overrides, identity_name)
+    start_lane!(ctx.db, "k1")
 
     assert %{ok: true, harness: "codex"} =
              Gateway.handlers(config)["tune"].(%{
