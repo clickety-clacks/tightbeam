@@ -3735,103 +3735,16 @@ defmodule Tightbeam.Gateway do
                      session.host,
                      spinup_opts(config, db)
                    ) do
-              deliver_opts = if config[:sh], do: [sh: config.sh], else: []
-
-              # Pin the shared home to the model this session will run on the new
-              # harness, not the org default, so the next turn's session/new
-              # offers and accepts it (wi_263814d3).
-              Placement.deliver_home(
+              apply_harness_change(
                 config,
-                {harness_atom, "shared", session.host},
-                Keyword.put(deliver_opts, :model, model)
-              )
-
-              Org.set_harness(
                 db,
-                call.session_key,
+                call,
+                session,
                 harness,
-                routed.provider,
-                model
+                harness_atom,
+                model,
+                routed.provider
               )
-
-              # History barrier (product ruling): a new engine gets a fresh
-              # visible slate. Rows are RETAINED (never deleted) but replay
-              # stops at the barrier, and live clients are told to drop their
-              # local view. No pointer surgery: the old harness session can't
-              # load on the new engine → fallback pointer, fresh context.
-              #
-              # ONE TRANSACTION, both writes. The barrier and its tombstone are a
-              # single fact: history stopped being shown, and here is why. Split
-              # across two transactions, a crash between them left the barrier
-              # moved with no marker — which is precisely the silent burial the
-              # tombstone exists to prevent, just rarer. The MAX(seq) read moved
-              # inside too, so a message landing between the read and the barrier
-              # cannot be buried without being counted.
-              # DB.transaction CATCHES a raise and RETURNS {:error, exception}. A
-              # hard {:ok, _} match here is a MatchError that crashes the wire
-              # call instead of denying it — the trap already documented at
-              # `ruling_transaction/2`, and one this very test caught.
-              barrier =
-                DB.transaction(db, fn txn ->
-                  [[max_seq]] =
-                    Txn.q(
-                      txn,
-                      "SELECT COALESCE(MAX(seq), 0) FROM messages WHERE sessionKey = ?1",
-                      [call.session_key]
-                    )
-
-                  Org.set_cleared_through_in_txn(txn, call.session_key, max_seq)
-
-                  # Probe seam (same idiom as `on_work_item_interlock`): lets a
-                  # test fail the transaction BETWEEN the two writes and prove the
-                  # barrier rolls back with them. Absent in production.
-                  case Map.get(call, :on_swap_interlock) do
-                    fun when is_function(fun, 1) -> fun.(txn)
-                    _ -> :ok
-                  end
-
-                  Projection.append_marker_in_txn(
-                    txn,
-                    call.session_key,
-                    swap_tombstone(session, harness, model)
-                  )
-                end)
-
-              case barrier do
-                {:error, error} ->
-                  # Rolled back: the barrier did NOT move and the history is
-                  # still shown. The session is already on the new engine, which
-                  # is the safe direction to fail in — an operator sees their
-                  # conversation and a refused swap, never an empty chat with no
-                  # account of why. No broadcast either: there is nothing to tell
-                  # clients to drop.
-                  %{
-                    ok: false,
-                    code: "swap_barrier_failed",
-                    message: describe_error(error)
-                  }
-
-                {:ok, _} ->
-                  broadcast(
-                    db,
-                    session.owner_user_id,
-                    Payloads.stream_history_cleared(call.session_key)
-                  )
-
-                  published_identity(model)
-                  |> Map.merge(%{
-                    ok: true,
-                    harness: harness,
-                    # The swap may have crossed providers, and the new provider's
-                    # credential on this host may be a different kind. This is
-                    # the one moment the value changes without the client polling
-                    # status. The router camelizes the key to `credentialKind`,
-                    # matching the session-status shape.
-                    credential_kind: credential_kind(Map.put(session, :harness, harness)),
-                    note:
-                      "engine swapped; chat cleared (rows retained); model context starts fresh"
-                  })
-              end
             else
               {:error, denial} ->
                 denial
@@ -3979,6 +3892,114 @@ defmodule Tightbeam.Gateway do
   # take this lock; the resident-turn common path holds no pin and never blocks.
   defp with_home_pin_lock(harness, host, fun) do
     :global.trans({{__MODULE__, :home_pin, harness, host}, self()}, fun)
+  end
+
+  defp apply_harness_change(
+         config,
+         db,
+         call,
+         session,
+         harness,
+         harness_atom,
+         model,
+         provider
+       ) do
+    deliver_opts = if config[:sh], do: [sh: config.sh], else: []
+
+    # Pin the shared home to the model this session will run on the new
+    # harness, not the org default, so the next turn's session/new
+    # offers and accepts it (wi_263814d3).
+    Placement.deliver_home(
+      config,
+      {harness_atom, "shared", session.host},
+      Keyword.put(deliver_opts, :model, model)
+    )
+
+    Org.set_harness(
+      db,
+      call.session_key,
+      harness,
+      provider,
+      model
+    )
+
+    # History barrier (product ruling): a new engine gets a fresh
+    # visible slate. Rows are RETAINED (never deleted) but replay
+    # stops at the barrier, and live clients are told to drop their
+    # local view. No pointer surgery: the old harness session can't
+    # load on the new engine → fallback pointer, fresh context.
+    #
+    # ONE TRANSACTION, both writes. The barrier and its tombstone are a
+    # single fact: history stopped being shown, and here is why. Split
+    # across two transactions, a crash between them left the barrier
+    # moved with no marker — which is precisely the silent burial the
+    # tombstone exists to prevent, just rarer. The MAX(seq) read moved
+    # inside too, so a message landing between the read and the barrier
+    # cannot be buried without being counted.
+    # DB.transaction CATCHES a raise and RETURNS {:error, exception}. A
+    # hard {:ok, _} match here is a MatchError that crashes the wire
+    # call instead of denying it — the trap already documented at
+    # `ruling_transaction/2`, and one this very test caught.
+    barrier =
+      DB.transaction(db, fn txn ->
+        [[max_seq]] =
+          Txn.q(
+            txn,
+            "SELECT COALESCE(MAX(seq), 0) FROM messages WHERE sessionKey = ?1",
+            [call.session_key]
+          )
+
+        Org.set_cleared_through_in_txn(txn, call.session_key, max_seq)
+
+        # Probe seam (same idiom as `on_work_item_interlock`): lets a
+        # test fail the transaction BETWEEN the two writes and prove the
+        # barrier rolls back with them. Absent in production.
+        case Map.get(call, :on_swap_interlock) do
+          fun when is_function(fun, 1) -> fun.(txn)
+          _ -> :ok
+        end
+
+        Projection.append_marker_in_txn(
+          txn,
+          call.session_key,
+          swap_tombstone(session, harness, model)
+        )
+      end)
+
+    case barrier do
+      {:error, error} ->
+        # Rolled back: the barrier did NOT move and the history is
+        # still shown. The session is already on the new engine, which
+        # is the safe direction to fail in — an operator sees their
+        # conversation and a refused swap, never an empty chat with no
+        # account of why. No broadcast either: there is nothing to tell
+        # clients to drop.
+        %{
+          ok: false,
+          code: "swap_barrier_failed",
+          message: describe_error(error)
+        }
+
+      {:ok, _} ->
+        broadcast(
+          db,
+          session.owner_user_id,
+          Payloads.stream_history_cleared(call.session_key)
+        )
+
+        published_identity(model)
+        |> Map.merge(%{
+          ok: true,
+          harness: harness,
+          # The swap may have crossed providers, and the new provider's
+          # credential on this host may be a different kind. This is
+          # the one moment the value changes without the client polling
+          # status. The router camelizes the key to `credentialKind`,
+          # matching the session-status shape.
+          credential_kind: credential_kind(Map.put(session, :harness, harness)),
+          note: "engine swapped; chat cleared (rows retained); model context starts fresh"
+        })
+    end
   end
 
   # A live model-switch on a RESIDENT session used to hit set_config_option, which
