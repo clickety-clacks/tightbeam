@@ -342,14 +342,30 @@ fn parse_credential(body: &str) -> Result<Credential, String> {
             .map(str::to_owned)
     };
 
-    let access_token =
-        text("access_token").ok_or_else(|| "token exchange returned no access_token".to_owned())?;
+    // BLANK IS ABSENT. `text` answers `Some("")` for `"access_token": ""`, so asking only
+    // whether the key EXISTS banked a credential with no token in it -- which is the exact
+    // failure `renewed_credential` below was already fixed for, on the refresh leg, and this
+    // leg never was. A token that is present and empty authenticates nothing; it reports a
+    // successful onboarding and then fails every session afterwards.
+    let text = |key: &str| text(key).filter(|value| !value.trim().is_empty());
+
+    let access_token = text("access_token")
+        .ok_or_else(|| "token exchange returned no usable access_token".to_owned())?;
     let refresh_token = text("refresh_token")
-        .ok_or_else(|| "token exchange returned no refresh_token".to_owned())?;
+        .ok_or_else(|| "token exchange returned no usable refresh_token".to_owned())?;
     let expires_in = json
         .get("expires_in")
         .and_then(serde_json::Value::as_i64)
         .ok_or_else(|| "token exchange returned no expires_in".to_owned())?;
+    // A lifetime of zero is a credential born expired: `needs_renewal` answers yes on the
+    // first read, and the refresh it triggers is the only thing standing between the user
+    // and a permanent 401. Refuse it here, where the exchange can still be re-run.
+    if expires_in <= 0 {
+        return Err(format!(
+            "token exchange returned expires_in {expires_in}, so the credential is already \
+             expired; it was NOT banked"
+        ));
+    }
 
     let scopes = match json.get("scope").and_then(serde_json::Value::as_str) {
         Some(scope) => scope.split_whitespace().map(str::to_owned).collect(),
@@ -570,5 +586,41 @@ mod tests {
         assert_eq!(oauth["subscriptionType"], "max");
         assert_eq!(oauth["scopes"][1], "user:sessions:claude_code");
         assert!(oauth["expiresAt"].as_i64().unwrap() > now_ms());
+    }
+
+    /// THE SAME RULE THE REFRESH LEG ALREADY LEARNED, ON THE LEG THAT NEVER GOT IT.
+    ///
+    /// `renewed_credential` was fixed once for exactly this — an empty-string token being
+    /// ACCEPTED and written to disk — but the authorization_code path kept asking only
+    /// whether the key existed. A present-but-empty token banks a credential that reports a
+    /// successful onboarding and then fails every session afterwards with
+    /// `authentication_failed`, hours later, with nothing pointing back at the write.
+    #[test]
+    fn a_present_but_empty_token_is_refused_like_an_absent_one() {
+        for body in [
+            r#"{"access_token":"","refresh_token":"rt","expires_in":60,
+                "scope":"user:sessions:claude_code"}"#,
+            r#"{"access_token":"   ","refresh_token":"rt","expires_in":60,
+                "scope":"user:sessions:claude_code"}"#,
+            r#"{"access_token":"at","refresh_token":"","expires_in":60,
+                "scope":"user:sessions:claude_code"}"#,
+        ] {
+            let error = parse_credential(body).unwrap_err();
+            assert!(error.contains("no usable"), "{error}");
+        }
+    }
+
+    /// A credential whose lifetime is zero is expired before it is written: the first read
+    /// calls `needs_renewal` true, and only the refresh stands between it and a permanent
+    /// 401. The exchange can still be re-run at this point; a month later it cannot.
+    #[test]
+    fn a_credential_born_expired_is_refused() {
+        let error = parse_credential(
+            r#"{"access_token":"at","refresh_token":"rt","expires_in":0,
+                "scope":"user:sessions:claude_code"}"#,
+        )
+        .unwrap_err();
+        assert!(error.contains("already expired"), "{error}");
+        assert!(error.contains("NOT banked"), "{error}");
     }
 }

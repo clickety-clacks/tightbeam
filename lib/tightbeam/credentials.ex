@@ -146,7 +146,7 @@ defmodule Tightbeam.Credentials do
   end
 
   @doc false
-  def store_harvested(base_dir, provider, bytes) do
+  def store_harvested(base_dir, provider, bytes, source \\ "a harness home") do
     path =
       case provider do
         :openai -> Path.join([base_dir, "auth", "codex", "auth.json"])
@@ -154,9 +154,91 @@ defmodule Tightbeam.Credentials do
         :fixture_provider -> Path.join([base_dir, "auth", "fixture", "fixture.json"])
       end
 
+    refuse_hollow!(provider, bytes, source)
     atomic_write!(path, bytes)
     :ok
   end
+
+  @doc """
+  Refuse a credential that is present but carries nothing usable.
+
+  A hollow record — keys there, values empty or zero — is the one shape that survives every
+  existing check and then fails at the only moment nobody is watching: the next turn, as
+  `authentication_failed`, hours later, with no path back to the write that caused it. It
+  cost two coder sessions before it was traced. So it is refused HERE, at the write, where
+  the file that produced it can still be named.
+
+  The vendor owns the credential inside a harness home and rotates it in place, and
+  `Homes.sweep_auth/2` harvests every home into the ONE shared store at gateway boot. That
+  makes an unvalidated harvest a poisoning: one agent's hollow file becomes every agent's
+  credential, and the reboot re-applies it. Refusing to write is therefore only half of it —
+  the existing good credential must survive the refusal, which is why this runs BEFORE the
+  write rather than validating after.
+
+  The deep check is anthropic-only ON PURPOSE. That is the record shape this incident
+  produced and the one shape verified against a live file; openai and fixture get the blank
+  check alone, because inventing structure a file never had is how this area breaks. And an
+  anthropic credential is not always an OAuth record — an api key is banked as a BARE STRING
+  under the same filename — so only bytes that actually parse as a `claudeAiOauth` object
+  face the deep test.
+  """
+  @spec refuse_hollow!(provider(), binary(), String.t()) :: :ok
+  def refuse_hollow!(provider, bytes, source) do
+    case hollow(provider, bytes) do
+      nil ->
+        :ok
+
+      found ->
+        raise "refusing to bank a hollow #{provider} credential from #{source}: #{found}. " <>
+                "Nothing was banked — the credential on this host is unchanged. A credential " <>
+                "with no usable token cannot authenticate a turn, and writing it would report " <>
+                "success now and fail every session later. Delete that file and re-run " <>
+                "`tightbeam onboard #{provider}`."
+    end
+  end
+
+  defp hollow(_provider, bytes) when not is_binary(bytes), do: "it is not readable bytes"
+
+  defp hollow(provider, bytes) do
+    if String.trim(bytes) == "" do
+      "the credential is empty"
+    else
+      deep_hollow(provider, bytes)
+    end
+  end
+
+  defp deep_hollow(:anthropic, bytes) do
+    case JSON.decode(bytes) do
+      {:ok, %{"claudeAiOauth" => oauth}} when is_map(oauth) -> hollow_oauth(oauth)
+      _ -> nil
+    end
+  end
+
+  defp deep_hollow(_provider, _bytes), do: nil
+
+  # Each answer names the FIELD, not just "invalid": the operator reading this has a file in
+  # front of them and needs to know which value went missing.
+  defp hollow_oauth(oauth) do
+    cond do
+      blank_token?(Map.get(oauth, "accessToken")) ->
+        "claudeAiOauth.accessToken is empty"
+
+      # Present-but-empty only. An OMITTED refresh token is a different record (a setup
+      # token has none), and refusing it here would reject credentials that work.
+      Map.has_key?(oauth, "refreshToken") and blank_token?(Map.get(oauth, "refreshToken")) ->
+        "claudeAiOauth.refreshToken is present but empty, so the credential could never renew"
+
+      match?(expiry when is_integer(expiry) and expiry <= 0, Map.get(oauth, "expiresAt")) ->
+        "claudeAiOauth.expiresAt is #{Map.get(oauth, "expiresAt")}, so the credential is born expired"
+
+      true ->
+        nil
+    end
+  end
+
+  defp blank_token?(nil), do: true
+  defp blank_token?(token) when is_binary(token), do: String.trim(token) == ""
+  defp blank_token?(_other), do: true
 
   @doc false
   def store_dir(base_dir, provider), do: Path.join([base_dir, "auth", harness_name(provider)])
@@ -595,6 +677,7 @@ defmodule Tightbeam.Credentials do
 
   defp write_credential!(state, :openai, credential) do
     path = credential_store_path(state, :openai)
+    refuse_hollow!(:openai, credential.bytes, "the onboarding ceremony")
     atomic_write!(path, credential.bytes)
     reconcile_provider_homes(state, :openai)
     :ok
@@ -602,6 +685,7 @@ defmodule Tightbeam.Credentials do
 
   defp write_credential!(state, :anthropic, credential) do
     path = credential_store_path(state, :anthropic)
+    refuse_hollow!(:anthropic, credential.bytes, "the onboarding ceremony")
     atomic_write!(path, String.trim(credential.bytes) <> "\n")
     reconcile_provider_homes(state, :anthropic)
     :ok
@@ -609,6 +693,7 @@ defmodule Tightbeam.Credentials do
 
   defp write_credential!(state, :fixture_provider, credential) do
     path = credential_store_path(state, :fixture_provider)
+    refuse_hollow!(:fixture_provider, credential.bytes, "the onboarding ceremony")
     atomic_write!(path, credential.bytes)
     reconcile_provider_homes(state, :fixture_provider)
     :ok
