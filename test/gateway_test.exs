@@ -5068,6 +5068,97 @@ defmodule Tightbeam.GatewayTest do
     publish.("delivered")
   end
 
+  # wi_263814d3 — the PROVISIONING SEAM, not just deliver_home: a real turn that
+  # provisions a fresh harness session must pin the shared home to the SESSION'S
+  # selected model (not the org default), so the adapter offers+accepts it at
+  # session/new. Deleting the harness_session pin calls leaves settings.json
+  # unwritten on the turn path and fails this — the coverage the deliver_home
+  # unit tests alone do not give (asg_6508eff5 finding #2).
+  @tag timeout: 180_000
+  test "provisioning a turn pins the shared home to the session's selected model", ctx do
+    exact_registry =
+      start_supervised!(%{
+        id: :home_pin_conn_registry,
+        start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+      })
+
+    adapter = start_supervised!({AdapterStub, self()})
+    start_supervised!({CoordinatorStub, adapter})
+
+    {:ok, _ref, nil} =
+      ConnRegistry.register(exact_registry, %{
+        pid: self(),
+        user_id: "flynn",
+        device_id: "home-pin",
+        is_admin: false,
+        subscriptions: MapSet.new(["chat"])
+      })
+
+    base =
+      Path.join(System.tmp_dir!(), "gateway_home_pin_#{System.unique_integer([:positive])}")
+
+    File.rm_rf!(base)
+    Identity.init!(base)
+    Rails.load!(base)
+
+    manifest_path = Path.join([base, "identity", "archetypes", "default.toml"])
+
+    manifest =
+      manifest_path
+      |> File.read!()
+      |> String.replace("name = \"default\"", "name = \"default\"\nwhere = [\"testhost\"]")
+
+    Identity.edit!(base, "default", :manifest, manifest, "test")
+
+    on_exit(fn ->
+      File.rm_rf!(base)
+      :persistent_term.erase(Archetypes)
+      :persistent_term.erase(Tightbeam.Rails)
+    end)
+
+    # Org default is claude-fable-5 (gateway_config); the session SELECTED a
+    # different catalog model. The provisioned home must follow the selection.
+    _ = Org.set_model(ctx.db, "k1", Model.new("claude-sonnet-4-6"), "anthropic")
+    assert Org.get(ctx.db, "k1").model == Model.new("claude-sonnet-4-6")
+
+    config = gateway_config(base, ctx.db, 0)
+    assert config.default_model.family == "claude-fable-5"
+
+    children = Gateway.children(config)
+
+    {Tightbeam.LaneManager, lane_opts} =
+      Enum.find(children, &match?({Tightbeam.LaneManager, _}, &1))
+
+    runner = Keyword.fetch!(lane_opts, :runner)
+
+    assert :appended =
+             Gateway.deliver_prompt("k1", "user:flynn", "ping",
+               db: ctx.db,
+               conn_registry: exact_registry,
+               lane_manager: ctx.lane,
+               device_id: "home-pin",
+               client_message_id: "c_home_pin"
+             )
+
+    assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
+    task = Task.async(fn -> runner.(Map.put(turn, :session_key, "k1")) end)
+
+    # new_session having been reached proves harness_session ran the pin first.
+    assert_receive {:new_session_mcp_servers, _}, @cold_runner_prompt_timeout
+
+    settings =
+      [base, "homes", "testhost", "claude", "settings.json"]
+      |> Path.join()
+      |> File.read!()
+      |> JSON.decode!()
+
+    assert settings["model"] == "claude-sonnet-4-6"
+
+    assert_receive {:prompt_started, ^adapter}, @cold_runner_prompt_timeout
+    send(adapter, :continue_prompt)
+    assert {:ok, _} = Task.await(task)
+  end
+
   # @cold_runner_prompt_timeout is 60_000 and ExUnit's default per-test timeout is
   # also 60_000, so the budget would be capped by the test timeout and would report
   # as "test timed out" rather than naming the wait that actually ran out. Raise the

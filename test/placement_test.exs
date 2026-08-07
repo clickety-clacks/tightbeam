@@ -973,6 +973,57 @@ defmodule Tightbeam.PlacementTest do
            }
   end
 
+  # wi_263814d3 — accepted-then-dead: the claude adapter's offered/accepted model
+  # set follows the projected home's settings.json "model" pin (proven live —
+  # scripts/probe-opus5.mjs + scripts/probe-reread.mjs: a session/new re-reads the
+  # pin, so a home pinned to model X offers+accepts X and refuses everything
+  # else non-alias).
+  # The durable fix pins the SESSION'S RESOLVED model, not the fixed org default,
+  # so acceptance tracks selection by construction. deliver_home must honour a
+  # per-session :model; without it a session that SELECTED opus-5 gets a
+  # sonnet-pinned home and every turn dies on "Invalid value for config option
+  # model".
+  test "deliver_home pins the session's selected model, not the org default", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    config = %{
+      base_dir: base_dir,
+      db: db,
+      cwd: "/work",
+      cli_bin: "/local/bin",
+      default_model: Model.new("claude-sonnet-5", effort: "medium")
+    }
+
+    selected = Model.new("claude-opus-5")
+
+    home =
+      Placement.deliver_home(config, {:claude, "shared", "testhost"}, model: selected)
+
+    settings = home |> Path.join("settings.json") |> File.read!() |> JSON.decode!()
+    assert settings["model"] == "claude-opus-5"
+  end
+
+  # Regression guard on the fallback: with no per-session model (adapter
+  # cold-boot has no session context), the org default stays the baseline pin.
+  test "deliver_home falls back to the org default model when no session model is given", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    config = %{
+      base_dir: base_dir,
+      db: db,
+      cwd: "/work",
+      cli_bin: "/local/bin",
+      default_model: Model.new("claude-sonnet-5", effort: "medium")
+    }
+
+    home = Placement.deliver_home(config, {:claude, "shared", "testhost"})
+
+    settings = home |> Path.join("settings.json") |> File.read!() |> JSON.decode!()
+    assert settings["model"] == "claude-sonnet-5"
+  end
+
   defp collect_commands(acc) do
     receive do
       {:command, command} -> collect_commands([command | acc])

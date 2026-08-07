@@ -1155,7 +1155,10 @@ defmodule Tightbeam.Placement do
   Materialize the home for an adapter key on its host per the moduledoc.
   Returns the home path AS SEEN BY THE ADAPTER PROCESS (local path for
   local, remote path for remote). opts: :sh (injectable runner,
-  `(cmd :: [String.t()]) -> {output :: String.t(), exit :: integer()}`).
+  `(cmd :: [String.t()]) -> {output :: String.t(), exit :: integer()}`);
+  :model (a `Model.t()` to pin instead of the org default — the caller passes
+  the provisioning session's resolved model so adapter acceptance tracks
+  selection).
   """
   @spec deliver_home(map(), adapter_key(), keyword()) :: String.t()
   def deliver_home(config, {harness, _identity_name, host}, opts \\ []) do
@@ -1176,7 +1179,13 @@ defmodule Tightbeam.Placement do
         harness: harness,
         machine: host,
         rails: Rails.hook_settings(),
-        default_model: Map.get(config, :default_model),
+        # The pinned model tracks the SESSION'S resolved selection when the caller
+        # supplies one (`:model`), falling back to the org default only when there
+        # is no session context (adapter cold-boot). The claude adapter's offered
+        # /accepted model set follows this home pin (wi_263814d3), so pinning the
+        # selected model is what makes the adapter accept it at session/new — the
+        # cure for the accepted-then-dead class.
+        default_model: Keyword.get(opts, :model) || Map.get(config, :default_model),
         auth_dir:
           Tightbeam.Credentials.store_dir(
             host_config.base_dir,
