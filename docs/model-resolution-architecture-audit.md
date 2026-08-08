@@ -1,6 +1,6 @@
 # Model-resolution architecture audit
 
-Status: revised after independent review `att_a61ecc41` for
+Status: revised after independent review `att_509f6e28` for
 `wi_4e1d39f7-0425-4607-bebb-7f81b2f30eb9`.
 
 ## Ruling
@@ -17,7 +17,7 @@ The design has two ordered authorities with different jobs:
    it is not yet enforced at every creation, fallback, and harness-change seam.
 
 The catalog and adapter are not competing resolvers. The shared architecture is
-present, but four local contract gaps prevent a claim of complete conformance.
+present, but five local contract gaps prevent a claim of complete conformance.
 
 ## Seam matrix
 
@@ -31,6 +31,7 @@ present, but four local contract gaps prevent a claim of complete conformance.
 | Live harness change | Resolves and composes against the destination catalog, projects the destination, then restarts residency | Gap F2: the command reports success before a destination adapter exists to read back applied state |
 | Session status and in-session picker catalog | Projects `ModelCatalog` through the same `wire_model` identity used for inbound resolution | Catalog choices are shared; Gap F3 hides catalog health, and F1 can leave the current stored runtime unverified |
 | Clawline web in-session picker | Uses `sessionStatus.modelCatalog.models[].ref` | Tightbeam session-status payload |
+| Clawline web harness control | Server publishes `setHarness` capability | Gap F5: the web client has no capability field, request action, or footer control for harness change |
 | Clawline iOS in-session picker | Uses the same model rows and provider effort capabilities | Tightbeam session-status payload |
 | Clawline iOS spawn picker | Receives `/api/org-options.models` | Gap F4: Tightbeam emits host-first data while iOS decodes harness-first data |
 | Future `tightbeam tune` CLI | Calls the existing gateway `tune` verb | Must preserve these seams and must not add a second resolver |
@@ -110,6 +111,18 @@ it by selected harness. See `lib/tightbeam/gateway.ex:1211-1268` and Clawline
 This is a local wire-contract mismatch in one consumer. It does not justify another
 catalog or resolver.
 
+### F5 — Clawline web omits live harness control
+
+Tightbeam publishes `setHarness` in the session capability payload, but Clawline web
+does not decode that capability, define the matching request action, or render a harness
+control in the session footer. See `lib/tightbeam/gateway.ex:1381-1388` and Clawline
+`src/features/chat/stream-api.ts:69-117`,
+`src/features/chat/SessionStatusFooter.tsx:85-127` at commit
+`159097742b7c4faa81da9d75d2b6a39304ae8f51`.
+
+The model picker already consumes the shared session catalog. The missing harness action
+is a local client integration gap, not evidence for another resolver or catalog.
+
 ## Test evidence and limitation
 
 After removing the active session's `TIGHTBEAM_LOCAL_HOST_NAME=gibson` override so the
@@ -124,7 +137,7 @@ review artifact `art_a0fc4221`.
 ## Product consequence
 
 Keep the existing catalog, selection pipeline, and adapter boundary. Do not fund a
-broad unification rewrite. Track F1-F4 as local conformance gaps with their own scope
+broad unification rewrite. Track F1-F5 as local conformance gaps with their own scope
 and authority. Until they close, do not claim that every model-resolution consumer is
 freshness-aware or that every successful spawn, fallback, or harness change has matching
 live readback.
