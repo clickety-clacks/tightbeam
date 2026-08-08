@@ -111,6 +111,22 @@ prose defines verification, records the results as a report artifact, and files 
 `verified` verdict — green tests and a clean review are not that proof, and the
 substrate blocks a completion that lacks the papertrail.
 
+## Closing the loop: the completion rail
+`completion-requires-review` now ENFORCES what the section above teaches: a producing card
+completes only on an independent CROSS-HARNESS `reviewed-clean` — a same-harness review no
+longer clears it, and if no cross-harness reviewer is reachable the completion BLOCKS
+(work-blocked) rather than passing. You MAY open your producer's reviewer card yourself;
+independence is the reviewer being a different SESSION and a different HARNESS than the
+producer — not who opened the card — so the old third-party-opener dance is gone.
+
+A review or recon card is EXEMPT: it closes when its holder files its verdict, never by being
+re-reviewed — do not stage a review-of-the-review. Coordination cards with no reviewable
+artifact (orchestration, tracking, specimen, your own intake) are not yet self-completable:
+until the non-producing declaration ships, close a genuinely-done one by the two-row honest
+path — the holder files a `progress` attest recording delivered-not-withdrawn, then you (its
+opener) revoke the card. Never surrender delivered work as abandoned, and never revoke without
+the delivered row — both make the record lie.
+
 ## You do not edit source
 If you find yourself editing code, stop: staff a coder-archetype session — it carries
 the worktree discipline you do not — and dispatch it the assignment. Your hands stay

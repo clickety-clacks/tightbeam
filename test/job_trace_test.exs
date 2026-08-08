@@ -106,6 +106,23 @@ defmodule Tightbeam.JobTraceTest do
                commit_refs: commit_refs
              })
 
+    assert %{attest: %{verdictKind: "reviewed-clean", commitRefs: ^commit_refs}} =
+             attest(db, {:session, "reviewer"}, "asg_review", "verdict", %{
+               verdict_kind: "reviewed-clean",
+               commit_refs: commit_refs
+             })
+
+    assert %{code: "invalid_commit_refs"} =
+             attest(db, {:session, "holder"}, "asg_bad", "verdict", %{
+               verdict_kind: "reviewed-clean",
+               commit_refs: commit_refs
+             })
+
+    assert %{code: "invalid_commit_refs"} =
+             attest(db, {:session, "reviewer"}, "asg_review", "completion", %{
+               commit_refs: commit_refs
+             })
+
     assert %{attest: %{verdictKind: "changes-requested"}} =
              attest(db, {:user, "admin"}, "asg_review", "verdict", %{
                verdict_kind: "changes-requested"
@@ -171,6 +188,19 @@ defmodule Tightbeam.JobTraceTest do
            end)
 
     assert Enum.any?(trace.timeline, fn
+             %{
+               type: "attest",
+               assignmentId: "asg_review",
+               verdict: "reviewed-clean",
+               commitRefs: ^commit_refs
+             } ->
+               true
+
+             _ ->
+               false
+           end)
+
+    assert Enum.any?(trace.timeline, fn
              %{type: "wake_fired", id: "w_condition", matchedFactAt: 90} -> true
              _ -> false
            end)
@@ -197,6 +227,7 @@ defmodule Tightbeam.JobTraceTest do
              "wake_fired",
              "decision_request",
              "effort_generation",
+             "attest",
              "attest",
              "attest",
              "turn_end"

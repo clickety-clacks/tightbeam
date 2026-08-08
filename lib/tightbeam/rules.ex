@@ -24,9 +24,9 @@ defmodule Tightbeam.Rules do
 
   Check-tier facts are `attest.kind` (raw string on attest calls),
   `assignment.verdicts` (distinct filed verdict kinds),
-  `assignment.holder_archetype`, and `assignment.caller_is_holder`. The three
-  assignment facts resolve from the call's assignmentId and are nil when that
-  assignment cannot be resolved.
+  `assignment.is_producing_card`, `assignment.holder_archetype`, and
+  `assignment.caller_is_holder`. The assignment facts resolve from the call's
+  assignmentId and are nil when that assignment cannot be resolved.
 
   Work-item facts are `work_item.is_bug` (the org-set work-item attribute) and
   `assignment.prior_completed_fix_count` (completed, non-review assignments on
@@ -115,6 +115,7 @@ defmodule Tightbeam.Rules do
     "caller.verb_count_24h" => :int,
     "attest.kind" => :string,
     "assignment.verdicts" => {:list, :string},
+    "assignment.is_producing_card" => :bool,
     "assignment.independent_verdict_kinds" => {:list, :string},
     "assignment.cross_harness_verdict_kinds" => {:list, :string},
     "assignment.cross_provider_verdict_kinds" => {:list, :string},
@@ -1068,6 +1069,13 @@ defmodule Tightbeam.Rules do
     end)
   end
 
+  defp compute_fact("assignment.is_producing_card", db, call, cache) do
+    with_dependency("$assignment", db, call, cache, fn
+      nil, cache -> {nil, cache}
+      assignment, cache -> {is_nil(assignment.reviews_assignment_id), cache}
+    end)
+  end
+
   defp compute_fact("assignment.independent_verdict_kinds", db, call, cache) do
     with_dependency("$verdict_authors", db, call, cache, fn
       nil, cache -> {nil, cache}
@@ -1378,7 +1386,7 @@ defmodule Tightbeam.Rules do
     case DB.query(
            db,
            """
-           SELECT a.id, a.workItemId, a.holderKey, s.archetype,
+           SELECT a.id, a.workItemId, a.reviewsAssignmentId, a.holderKey, s.archetype,
                   a.holderHarness, a.holderProvider
            FROM assignments a
            JOIN sessions s ON s.sessionKey = a.holderKey
@@ -1391,6 +1399,7 @@ defmodule Tightbeam.Rules do
          [
            assignment_id,
            work_item_id,
+           reviews_assignment_id,
            holder_key,
            holder_archetype,
            holder_harness,
@@ -1400,6 +1409,7 @@ defmodule Tightbeam.Rules do
         %{
           id: assignment_id,
           work_item_id: work_item_id,
+          reviews_assignment_id: reviews_assignment_id,
           holder_key: holder_key,
           holder_archetype: holder_archetype,
           holder_harness: holder_harness,

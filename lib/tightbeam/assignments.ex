@@ -261,7 +261,6 @@ defmodule Tightbeam.Assignments do
         WHERE r.reviewsAssignmentId = ?1
           AND v.kind = 'verdict'
           AND v.bySession = r.holderKey
-          AND (r.openedBySession IS NULL OR r.openedBySession != ?2)
           AND v.bySession != ?2
         ORDER BY v.ts ASC, v.id ASC
         """,
@@ -1336,7 +1335,8 @@ defmodule Tightbeam.Assignments do
 
   defp valid_commit_refs(_db, _kind, nil), do: :ok
 
-  defp valid_commit_refs(db, "completion", refs) when is_list(refs) do
+  defp valid_commit_refs(db, kind, refs)
+       when kind in ["completion", "verdict"] and is_list(refs) do
     Enum.reduce_while(refs, :ok, fn ref, :ok ->
       case validate_commit_ref(db, ref) do
         :ok -> {:cont, :ok}
@@ -1345,33 +1345,63 @@ defmodule Tightbeam.Assignments do
     end)
   end
 
-  defp valid_commit_refs(_db, "completion", _refs),
+  defp valid_commit_refs(_db, kind, _refs) when kind in ["completion", "verdict"],
     do: error("invalid_commit_refs", "commitRefs must be an array")
 
   defp valid_commit_refs(_db, _kind, _refs),
-    do: error("invalid_commit_refs", "commitRefs are only valid on completion attests")
+    do:
+      error(
+        "invalid_commit_refs",
+        "commitRefs are only valid on producing completion or review-link verdict attests"
+      )
 
   defp commit_ref_filing_allowed(db, call) do
-    if is_nil(call.params[:commit_refs]) or call.params[:kind] != "completion" do
-      :ok
-    else
-      assignment_id = call.params[:assignment_id]
+    case {call.params[:kind], call.params[:commit_refs]} do
+      {_kind, nil} ->
+        :ok
 
-      case DB.query(db, "SELECT holderKey, state FROM assignments WHERE id = ?1", [
-             assignment_id
-           ]) do
-        {:ok, []} ->
-          error("unknown_assignment", "unknown assignment: #{assignment_id}")
+      {kind, _refs} when kind in ["completion", "verdict"] ->
+        commit_ref_filing_allowed_for_assignment(db, call, kind)
 
-        {:ok, [[holder, _state]]} when call.principal != {:session, holder} ->
-          error("not_holder", "assignment is held by session #{holder}")
+      {_kind, _refs} ->
+        :ok
+    end
+  end
 
-        {:ok, [[_holder, state]]} when state != "open" ->
-          assignment_closed()
+  defp commit_ref_filing_allowed_for_assignment(db, call, kind) do
+    assignment_id = call.params[:assignment_id]
 
-        {:ok, [[_holder, "open"]]} ->
-          :ok
-      end
+    case DB.query(
+           db,
+           "SELECT holderKey, state, reviewsAssignmentId FROM assignments WHERE id = ?1",
+           [assignment_id]
+         ) do
+      {:ok, []} ->
+        error("unknown_assignment", "unknown assignment: #{assignment_id}")
+
+      {:ok, [[holder, _state, _reviews_assignment_id]]}
+      when kind == "completion" and call.principal != {:session, holder} ->
+        error("not_holder", "assignment is held by session #{holder}")
+
+      {:ok, [[_holder, state, _reviews_assignment_id]]}
+      when kind == "completion" and state != "open" ->
+        assignment_closed()
+
+      {:ok, [[_holder, "open", reviews_assignment_id]]}
+      when kind == "completion" and not is_nil(reviews_assignment_id) ->
+        error(
+          "invalid_commit_refs",
+          "commitRefs are not allowed on non-producing completion attests"
+        )
+
+      {:ok, [[_holder, _state, nil]]} when kind == "verdict" ->
+        error(
+          "invalid_commit_refs",
+          "commitRefs on verdict attests require a review-linked assignment"
+        )
+
+      {:ok, [[_holder, _state, _reviews_assignment_id]]} ->
+        :ok
     end
   end
 

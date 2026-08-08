@@ -178,12 +178,10 @@ defmodule Tightbeam.VerificationPapertrailTest do
     assert %{status: "closed"} = RailRemedy.episode(ctx.db, @verification_rule, work.id)
     assert %{status: "closed"} = RailRemedy.episode(ctx.db, @artifact_rule, work.id)
 
-    # A reviewer's completion is not verification- or artifact-gated: the
-    # statutes narrow to implementation archetypes (per-statute scope, §Open 3).
-    # The reviewer's own completion still meets the pre-existing review-loop
-    # statute (evaluated first), so what this asserts is that the denial comes
-    # from THAT rule and no verification or artifact episode ever opens for it.
-    assert {:error, %{rule: "completion-requires-review"}} =
+    # A review card is non-producing by construction, so its holder can close
+    # it without a review-of-the-review. The implementation-only verification
+    # and artifact statutes also stay out of scope.
+    assert {:ok, %{assignment: %{state: "closed"}}} =
              Dispatch.dispatch(
                ctx.db,
                ctx.handlers,

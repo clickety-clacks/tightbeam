@@ -751,6 +751,11 @@ defmodule Tightbeam.AssignmentsTest do
                verdict_kind: valid.attest.verdictKind,
                by_harness: "codex",
                by_provider: "openai"
+             },
+             %{
+               verdict_kind: "self-commissioned",
+               by_harness: "claude",
+               by_provider: "anthropic"
              }
            ]
   end

@@ -531,6 +531,22 @@ defmodule Tightbeam.RulesTest do
       Rules.load!(ctx.base_dir, ["assign"])
     end
 
+    put_rule(
+      ctx,
+      rule("producing", "attest", "assignment.is_producing_card", "eq", true)
+    )
+
+    assert [_] = Rules.load!(ctx.base_dir, ["attest"])
+
+    put_rule(
+      ctx,
+      rule("bad-producing", "attest", "assignment.is_producing_card", "eq", "true")
+    )
+
+    assert_raise ArgumentError, ~r/does not match bool/, fn ->
+      Rules.load!(ctx.base_dir, ["attest"])
+    end
+
     put_rule(ctx, rule("removed", "attest", "assignment.verdict_kinds_any", "in", ["x"]))
 
     assert_raise ArgumentError, ~r/unknown fact/, fn ->
@@ -572,6 +588,7 @@ defmodule Tightbeam.RulesTest do
   test "P3 fact nil, empty-list, and overlap presence matrix", ctx do
     holder = session(ctx.db, "p3-holder", "flynn", archetype: "coder")
     assignment = assignment(ctx, holder.session_key, {:user, "flynn"})
+    review = assignment(ctx, holder.session_key, {:user, "flynn"}, reviews: assignment.id)
 
     list_facts = [
       "assignment.independent_verdict_kinds",
@@ -610,6 +627,39 @@ defmodule Tightbeam.RulesTest do
                  p3_call("attest", nil, %{assignment_id: assignment.id, kind: "completion"})
                )
     end
+
+    put_rule(
+      ctx,
+      rule("producing", "attest", "assignment.is_producing_card", "eq", true)
+    )
+
+    Rules.load!(ctx.base_dir, ["attest"])
+
+    for params <- [
+          %{kind: "completion"},
+          %{assignment_id: 123, kind: "completion"},
+          %{assignment_id: "unknown", kind: "completion"}
+        ] do
+      assert :ok = Rules.evaluate(ctx.db, p3_call("attest", nil, params))
+    end
+
+    assert {:deny, %{rule: "producing"}} =
+             Rules.evaluate(
+               ctx.db,
+               p3_call("attest", nil, %{assignment_id: assignment.id, kind: "completion"})
+             )
+
+    assert :ok =
+             Rules.evaluate(
+               ctx.db,
+               p3_call("attest", nil, %{assignment_id: review.id, kind: "completion"})
+             )
+
+    assert {:deny, %{code: "rule_error", fact: "assignment.is_producing_card"}} =
+             Rules.evaluate(
+               :missing_db,
+               p3_call("attest", nil, %{assignment_id: assignment.id, kind: "completion"})
+             )
 
     {:ok, _} =
       DB.query(
@@ -802,18 +852,19 @@ defmodule Tightbeam.RulesTest do
       {"assignment.independent_verdict_kinds", "direct", false},
       {"assignment.independent_verdict_kinds", "third-session", false},
       {"assignment.independent_verdict_kinds", "user-on-review", false},
-      {"assignment.independent_verdict_kinds", "self-commissioned", false},
+      {"assignment.independent_verdict_kinds", "self-commissioned", true},
       {"assignment.independent_verdict_kinds", "wrong-link", false},
       {"assignment.independent_verdict_kinds", "reviewed-clean", true},
       {"assignment.independent_verdict_kinds", "same-harness", true},
       {"assignment.cross_harness_verdict_kinds", "direct", false},
       {"assignment.cross_harness_verdict_kinds", "third-session", false},
       {"assignment.cross_harness_verdict_kinds", "user-on-review", false},
-      {"assignment.cross_harness_verdict_kinds", "self-commissioned", false},
+      {"assignment.cross_harness_verdict_kinds", "self-commissioned", true},
       {"assignment.cross_harness_verdict_kinds", "wrong-link", false},
       {"assignment.cross_harness_verdict_kinds", "reviewed-clean", true},
       {"assignment.cross_harness_verdict_kinds", "same-harness", false},
       {"assignment.cross_provider_verdict_kinds", "reviewed-clean", true},
+      {"assignment.cross_provider_verdict_kinds", "self-commissioned", true},
       {"assignment.cross_provider_verdict_kinds", "wrong-link", false},
       {"assignment.cross_provider_verdict_kinds", "same-harness", false}
     ]

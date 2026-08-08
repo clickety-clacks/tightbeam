@@ -5,13 +5,14 @@
 [[rule]]
 name = "completion-requires-review"
 verb = "attest"
-text = "completion requires a reviewed-clean verdict from an independent reviewer"
+text = "completion needs a qualifying reviewed-clean verdict: check that it is on a card linked with --reviews, filed by that card's holder, not filed by this work's author, and cross-harness; if the linked verdict is changes-requested, address it and have the reviewer re-file reviewed-clean"
 external_producer = false
 edges = ["verb"]
 effect = "remedy"
 deny_when = [
   { fact = "attest.kind", op = "eq", value = "completion" },
-  { fact = "assignment.independent_verdict_kinds", op = "not_in", value = ["reviewed-clean"] },
+  { fact = "assignment.is_producing_card", op = "eq", value = true },
+  { fact = "assignment.cross_harness_verdict_kinds", op = "not_in", value = ["reviewed-clean"] },
 ]
 [rule.remedy]
 action = "assign"
