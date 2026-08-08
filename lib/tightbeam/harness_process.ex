@@ -526,6 +526,17 @@ defmodule Tightbeam.HarnessProcess do
     end
   end
 
+  defp await_identity(row, :infinity) do
+    case read_identity(row, command_timeout_ms()) do
+      {:ok, _pid, _process_group_id, _boot_identity, _identity_token} = identity ->
+        identity
+
+      {:error, _reason} ->
+        Process.sleep(25)
+        await_identity(row, :infinity)
+    end
+  end
+
   defp await_identity(row, deadline) do
     remaining_ms = max(deadline - System.monotonic_time(:millisecond), 0)
 

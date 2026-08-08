@@ -166,12 +166,15 @@ defmodule Tightbeam.Acp.AdapterTest do
       return;
     }
     switch (m.method) {
-      case "initialize": return send({ id: m.id, result: { protocolVersion: 1 } });
+      case "initialize":
+        if (gateMode === "delay-setup") return setTimeout(() => send({ id: m.id, result: { protocolVersion: 1 } }), 75);
+        return send({ id: m.id, result: { protocolVersion: 1 } });
       case "session/new": {
         newCalls += 1;
         capture(m);
-        const sid = gateMode !== "none" && newCalls === 1 ? "probe-sess" : "sess-1";
+        const sid = gateMode !== "none" && gateMode !== "delay-setup" && newCalls === 1 ? "probe-sess" : "sess-1";
         models[sid] = models[sid] || "haiku";
+        if (gateMode === "delay-setup") return setTimeout(() => send({ id: m.id, result: { sessionId: sid, ...configOptions(sid) } }), 75);
         return send({ id: m.id, result: { sessionId: sid, ...configOptions(sid) } });
       }
       case "session/load": {
@@ -182,6 +185,11 @@ defmodule Tightbeam.Acp.AdapterTest do
       case "session/close": capture(m); return send({ id: m.id, result: {} });
       case "session/set_config_option": {
         capture(m);
+        if (gateMode === "delay-setup") {
+          if (m.params.configId === "model") models[m.params.sessionId] = m.params.value;
+          if (m.params.configId === "effort" || m.params.configId === "reasoning_effort") efforts[m.params.sessionId] = m.params.value;
+          return setTimeout(() => send({ id: m.id, result: configOptions(m.params.sessionId) }), 75);
+        }
         if (failMode === "slow-strict-success" &&
             m.params.configId === "model" &&
             m.params.value === "gpt-new") {
@@ -227,6 +235,7 @@ defmodule Tightbeam.Acp.AdapterTest do
       }
       case "session/set_mode": {
         capture(m);
+        if (gateMode === "delay-setup") return setTimeout(() => send({ id: m.id, result: {} }), 75);
         if (failMode === "fail") {
           return send({ id: m.id, error: { code: -32000, message: "mode refused" } });
         }
@@ -351,10 +360,6 @@ defmodule Tightbeam.Acp.AdapterTest do
           |> Keyword.put(
             :probe_model,
             Keyword.get(opts, :probe_model, Model.new("gpt-5.6-sol", effort: "medium"))
-          )
-          |> Keyword.put(
-            :gate_attestation_timeout,
-            Keyword.get(opts, :gate_attestation_timeout, 2_000)
           )
         else
           adapter_opts
@@ -488,20 +493,6 @@ defmodule Tightbeam.Acp.AdapterTest do
   defp assert_down(adapter, monitor) do
     receive do
       {:DOWN, ^monitor, :process, ^adapter, reason} -> reason
-    end
-  end
-
-  # Wall-clock stamp the fake harness writes for itself as it starts, so a test can time
-  # something the adapter does after the spawn without the spawn in the measurement.
-  defp harness_started_at(capture_path) do
-    path = capture_path <> ".boot"
-
-    case File.read(path) do
-      {:ok, stamp} ->
-        String.to_integer(String.trim(stamp))
-
-      {:error, reason} ->
-        flunk("the fake harness never recorded its start at #{path}: #{inspect(reason)}")
     end
   end
 
@@ -1579,6 +1570,24 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert System.monotonic_time(:millisecond) - started >= 50
   end
 
+  test "delayed live-turn setup completes after an observer returns" do
+    {adapter, _capture_path} = start_adapter(gate_mode: "delay-setup", probe: false)
+
+    setup =
+      Task.async(fn ->
+        Adapter.new_session_for_turn(
+          adapter,
+          Model.new("haiku"),
+          "/tmp",
+          [],
+          "guidance"
+        )
+      end)
+
+    refute Task.yield(setup, 25)
+    assert {:ok, "sess-1"} = Task.await(setup, 2_000)
+  end
+
   test "preset modes are pinned for both harnesses" do
     for {harness, expected} <- [claude: "bypassPermissions", codex: "agent-full-access"] do
       {adapter, capture_path} = start_adapter(harness: harness)
@@ -1800,43 +1809,22 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert log =~ ~r/Last message(?: \(from .+?\))?: :redacted/
   end
 
-  test "gate wiring-check enforces one absolute deadline and serves no queued session" do
-    {adapter, capture_path} =
-      start_adapter(
-        harness: :codex,
-        gate_mode: "stall",
-        gate_attestation_timeout: 75
-      )
+  test "gate wiring-check has no elapsed-time failure" do
+    {adapter, _capture_path} = start_adapter(harness: :codex, gate_mode: "stall")
 
     monitor = Process.monitor(adapter)
 
     queued =
       Task.async(fn ->
-        Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+        Adapter.new_session_for_turn(adapter, Model.new("haiku"), "/tmp", [], "guidance")
       end)
 
-    assert assert_down(adapter, monitor) == {:gate_attestation_failed, :deadline}
-    died_at = System.system_time(:millisecond)
+    refute Task.yield(queued, 75)
+    assert Process.alive?(adapter)
 
-    # The claim is that the 75ms attestation deadline is ABSOLUTE — so the clock starts
-    # where that deadline does, once the harness is up. Timing from before start_adapter/1
-    # billed a `node` spawn to the deadline, and a spawn's duration is the runner's load,
-    # not the adapter's behavior (#83).
-    #
-    # MEASURED 2026-07-29 under a four-file load on an idle 16-core mac: 83, 85,
-    # 95, 101, 140 ms — the 75ms deadline plus 10-65ms of harness startup and two
-    # round trips. ~7x headroom, so this budget stays; the `.boot` stamp is what
-    # keeps it that tight, and widening it would only hide a regression in the
-    # deadline itself.
-    assert died_at - harness_started_at(capture_path) < 1_000
-
-    assert {:error, {:adapter_unavailable, reason}} = Task.await(queued)
-
-    # Same either-side-of-the-race contract as the fails-closed test above.
-    case reason do
-      :noproc -> :ok
-      text when is_binary(text) -> assert text =~ "deadline"
-    end
+    Process.exit(adapter, :kill)
+    assert_receive {:DOWN, ^monitor, :process, ^adapter, :killed}
+    assert {:error, {:adapter_unavailable, _reason}} = Task.await(queued)
   end
 
   test "boot without probe opts sends no probe request" do

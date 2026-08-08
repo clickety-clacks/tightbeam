@@ -72,6 +72,12 @@ defmodule Tightbeam.AdapterCoordinator do
     GenServer.call(server, {:adapter_for, key}, 30_000)
   end
 
+  @doc "The adapter checkout used by a claimed turn; it has no elapsed-time failure."
+  @spec adapter_for_turn(GenServer.server(), adapter_key()) :: checkout()
+  def adapter_for_turn(server \\ __MODULE__, key) do
+    GenServer.call(server, {:adapter_for, key}, :infinity)
+  end
+
   @doc """
   Start or return an adapter using context already captured by the caller.
 

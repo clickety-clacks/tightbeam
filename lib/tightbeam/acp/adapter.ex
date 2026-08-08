@@ -24,7 +24,6 @@ defmodule Tightbeam.Acp.Adapter do
   alias Tightbeam.{Harness, Model}
   alias Tightbeam.Acp.Conn
 
-  @gate_attestation_timeout 120_000
   # Boot may spend 60s initializing ACP before the separate 120s gate
   # deadline starts. Residency calls queue behind handle_continue, so their
   # caller budget must clear the full boot boundary.
@@ -100,11 +99,22 @@ defmodule Tightbeam.Acp.Adapter do
   def new_session(adapter, model, cwd, mcp_servers, guidance),
     do: call(adapter, {:new_session, model, cwd, mcp_servers, guidance}, 30_000)
 
+  def new_session_for_turn(adapter, model, cwd, mcp_servers, guidance),
+    do: call(adapter, {:new_session, model, cwd, mcp_servers, guidance, :infinity}, :infinity)
+
   @doc "Adopt an existing harness session and push the canonical model when it is known."
   @spec load_session(adapter(), String.t(), model_ref() | nil, String.t(), [map()], String.t()) ::
           {:ok, model_ref() | :unknown} | {:error, term()}
   def load_session(adapter, session_id, model, cwd, mcp_servers, guidance),
     do: call(adapter, {:load_session, session_id, model, cwd, mcp_servers, guidance}, 30_000)
+
+  def load_session_for_turn(adapter, session_id, model, cwd, mcp_servers, guidance),
+    do:
+      call(
+        adapter,
+        {:load_session, session_id, model, cwd, mcp_servers, guidance, :infinity},
+        :infinity
+      )
 
   @doc "Best-effort ACP teardown for one harness session; adapter failures never escape the caller."
   @spec close_session(adapter(), String.t()) :: :ok | {:error, term()}
@@ -188,6 +198,9 @@ defmodule Tightbeam.Acp.Adapter do
   def apply_model(adapter, session_id, model),
     do: GenServer.call(adapter, {:apply_model, session_id, model}, 30_000)
 
+  def apply_model_for_turn(adapter, session_id, model),
+    do: call(adapter, {:apply_model, session_id, model, :infinity}, :infinity)
+
   @doc """
   Run a turn: sends session/prompt, accumulates agent_message_chunk text while
   this GenServer keeps routing updates, replies when the harness finishes.
@@ -249,6 +262,12 @@ defmodule Tightbeam.Acp.Adapter do
     :exit, reason -> {:error, {:adapter_unavailable, unavailable_reason(reason)}}
   end
 
+  def knows_session_for_turn?(adapter, session_id),
+    do: call(adapter, {:knows_session?, session_id}, :infinity)
+
+  def current_model_for_turn(adapter, session_id),
+    do: call(adapter, {:current_model, session_id}, :infinity)
+
   @doc "The underlying Acp.Conn."
   @spec conn(adapter()) :: pid()
   def conn(adapter), do: GenServer.call(adapter, :conn)
@@ -308,7 +327,8 @@ defmodule Tightbeam.Acp.Adapter do
       {:ok, launch_id} ->
         case Tightbeam.HarnessProcess.capture_identity(
                Keyword.get(opts, :db, Tightbeam.DB),
-               launch_id
+               launch_id,
+               :infinity
              ) do
           :ok -> :ok
           {:error, reason} -> raise "harness process identity unavailable: #{inspect(reason)}"
@@ -332,10 +352,15 @@ defmodule Tightbeam.Acp.Adapter do
     # A binary that cannot execute still opens the port (the spawn is `sh -c`),
     # so the failure surfaces HERE as {:error, :closed} — no exception to
     # translate. Naming it explicitly is what carries the spawn error out.
-    case Conn.request(conn, "initialize", %{
-           protocolVersion: 1,
-           clientCapabilities: %{fs: %{readTextFile: false, writeTextFile: false}}
-         }) do
+    case Conn.request(
+           conn,
+           "initialize",
+           %{
+             protocolVersion: 1,
+             clientCapabilities: %{fs: %{readTextFile: false, writeTextFile: false}}
+           },
+           timeout: :infinity
+         ) do
       {:ok, %{"protocolVersion" => 1}} ->
         gate(opts, state)
 
@@ -347,11 +372,7 @@ defmodule Tightbeam.Acp.Adapter do
   defp gate(opts, state) do
     case Keyword.fetch(opts, :probe_cwd) do
       {:ok, probe_cwd} ->
-        deadline =
-          System.monotonic_time(:millisecond) +
-            Keyword.get(opts, :gate_attestation_timeout, @gate_attestation_timeout)
-
-        case gate_attestation(state, probe_cwd, Keyword.fetch!(opts, :probe_model), deadline) do
+        case gate_attestation(state, probe_cwd, Keyword.fetch!(opts, :probe_model)) do
           {:ok, output} ->
             gate_log(
               opts,
@@ -390,65 +411,27 @@ defmodule Tightbeam.Acp.Adapter do
 
   @impl true
   def handle_call({:new_session, model, cwd, mcp_servers, guidance}, _from, state) do
-    with {:ok, result} <-
-           Conn.request(state.conn, "session/new", %{
-             cwd: cwd,
-             mcpServers: mcp_servers,
-             _meta: Harness.module!(state.harness).session_config(%{}, guidance).meta
-           }),
-         sid = result["sessionId"],
-         {:ok, applied_model} <- establish_new_session_model(state, sid, model, result),
-         :ok <- set_mode(state, sid) do
-      state =
-        state
-        |> put_in([Access.key(:known)], MapSet.put(state.known, sid))
-        |> remember_model(sid, applied_model)
+    new_session_reply(state, model, cwd, mcp_servers, guidance, 60_000)
+  end
 
-      {:reply, {:ok, sid}, put_in(state.chunks[sid], [])}
-    else
-      # Refused config (e.g. an unavailable model) is a turn failure with a
-      # reason — never a crash of the shared adapter's caller chain.
-      {:error, error} -> {:reply, {:error, error}, state}
-    end
+  def handle_call(
+        {:new_session, model, cwd, mcp_servers, guidance, request_timeout},
+        _from,
+        state
+      ) do
+    new_session_reply(state, model, cwd, mcp_servers, guidance, request_timeout)
   end
 
   def handle_call({:load_session, sid, model, cwd, mcp_servers, guidance}, _from, state) do
-    case Conn.request(state.conn, "session/load", %{
-           sessionId: sid,
-           cwd: cwd,
-           mcpServers: mcp_servers,
-           _meta: Harness.module!(state.harness).session_config(%{}, guidance).meta
-         }) do
-      {:ok, _result} ->
-        state =
-          state
-          |> put_in([Access.key(:known)], MapSet.put(state.known, sid))
-          |> put_in([Access.key(:models)], Map.delete(state.models, sid))
-          |> put_in([Access.key(:chunks), sid], [])
+    load_session_reply(state, sid, model, cwd, mcp_servers, guidance, 60_000)
+  end
 
-        case model do
-          %Model{} = model ->
-            case apply_model_to_session(state, sid, model) do
-              {:ok, applied_model} ->
-                {:reply, {:ok, applied_model}, put_in(state.models[sid], applied_model)}
-
-              {:error, reason} ->
-                {:reply, {:error, {:model_apply_failed, reason}},
-                 drop_model_residency(state, sid)}
-            end
-
-          _unknown ->
-            # No canonical value means no push. The session is resident, but
-            # its model remains deliberately absent from the adapter cache.
-            {:reply, {:ok, :unknown}, state}
-        end
-
-      {:error, error} ->
-        # The harness no longer has this session (lost files, other host…).
-        # The caller falls back to a fresh session (pointer reason
-        # "fallback") — never a crash, never a silent retry.
-        {:reply, {:error, error}, state}
-    end
+  def handle_call(
+        {:load_session, sid, model, cwd, mcp_servers, guidance, request_timeout},
+        _from,
+        state
+      ) do
+    load_session_reply(state, sid, model, cwd, mcp_servers, guidance, request_timeout)
   end
 
   def handle_call({:close_session, sid}, _from, state) do
@@ -494,6 +477,13 @@ defmodule Tightbeam.Acp.Adapter do
     end
   end
 
+  def handle_call({:apply_model, sid, model, request_timeout}, _from, state) do
+    case apply_model_to_session(state, sid, model, request_timeout) do
+      {:ok, applied_model} -> {:reply, :ok, put_in(state.models[sid], applied_model)}
+      error -> {:reply, error, drop_model_residency(state, sid)}
+    end
+  end
+
   def handle_call({:knows_session?, sid}, _from, state),
     do: {:reply, MapSet.member?(state.known, sid), state}
 
@@ -512,6 +502,72 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   def handle_call(:conn, _from, state), do: {:reply, state.conn, state}
+
+  defp new_session_reply(state, model, cwd, mcp_servers, guidance, request_timeout) do
+    with {:ok, result} <-
+           Conn.request(
+             state.conn,
+             "session/new",
+             %{
+               cwd: cwd,
+               mcpServers: mcp_servers,
+               _meta: Harness.module!(state.harness).session_config(%{}, guidance).meta
+             },
+             timeout: request_timeout
+           ),
+         sid = result["sessionId"],
+         {:ok, applied_model} <-
+           establish_new_session_model(state, sid, model, result, request_timeout),
+         :ok <- set_mode(state, sid, request_timeout) do
+      state =
+        state
+        |> put_in([Access.key(:known)], MapSet.put(state.known, sid))
+        |> remember_model(sid, applied_model)
+
+      {:reply, {:ok, sid}, put_in(state.chunks[sid], [])}
+    else
+      {:error, error} -> {:reply, {:error, error}, state}
+    end
+  end
+
+  defp load_session_reply(state, sid, model, cwd, mcp_servers, guidance, request_timeout) do
+    case Conn.request(
+           state.conn,
+           "session/load",
+           %{
+             sessionId: sid,
+             cwd: cwd,
+             mcpServers: mcp_servers,
+             _meta: Harness.module!(state.harness).session_config(%{}, guidance).meta
+           },
+           timeout: request_timeout
+         ) do
+      {:ok, _result} ->
+        state =
+          state
+          |> put_in([Access.key(:known)], MapSet.put(state.known, sid))
+          |> put_in([Access.key(:models)], Map.delete(state.models, sid))
+          |> put_in([Access.key(:chunks), sid], [])
+
+        case model do
+          %Model{} = model ->
+            case apply_model_to_session(state, sid, model, request_timeout) do
+              {:ok, applied_model} ->
+                {:reply, {:ok, applied_model}, put_in(state.models[sid], applied_model)}
+
+              {:error, reason} ->
+                {:reply, {:error, {:model_apply_failed, reason}},
+                 drop_model_residency(state, sid)}
+            end
+
+          _unknown ->
+            {:reply, {:ok, :unknown}, state}
+        end
+
+      {:error, error} ->
+        {:reply, {:error, error}, state}
+    end
+  end
 
   @impl true
   def handle_cast(:close, state) do
@@ -700,6 +756,7 @@ defmodule Tightbeam.Acp.Adapter do
     end)
 
     if is_pid(state.conn) and Process.alive?(state.conn) do
+      Process.unlink(state.conn)
       Process.exit(state.conn, :shutdown)
     end
 
@@ -838,10 +895,10 @@ defmodule Tightbeam.Acp.Adapter do
 
   ## Model application (the fable-trap rule)
 
-  defp establish_new_session_model(state, sid, %Model{} = model, _result),
-    do: apply_model_to_session(state, sid, model)
+  defp establish_new_session_model(state, sid, %Model{} = model, _result, request_timeout),
+    do: apply_model_to_session(state, sid, model, request_timeout)
 
-  defp establish_new_session_model(state, _sid, _unknown, result) do
+  defp establish_new_session_model(state, _sid, _unknown, result, _request_timeout) do
     case model_ref_from_config(result, state.preset.effort_config) do
       {:ok, reported_model} -> {:ok, reported_model}
       :error -> {:ok, :unknown}
@@ -855,8 +912,13 @@ defmodule Tightbeam.Acp.Adapter do
     do: put_in(state.models, Map.delete(state.models, sid))
 
   defp apply_model_to_session(state, sid, model_ref) do
+    apply_model_to_session(state, sid, model_ref, 60_000)
+  end
+
+  defp apply_model_to_session(state, sid, model_ref, request_timeout)
+       when is_integer(request_timeout) or request_timeout == :infinity do
     apply_model_to_session(state, sid, model_ref, fn method, params ->
-      Conn.request(state.conn, method, params)
+      Conn.request(state.conn, method, params, timeout: request_timeout)
     end)
   end
 
@@ -1009,12 +1071,17 @@ defmodule Tightbeam.Acp.Adapter do
     end
   end
 
-  defp set_mode(state, sid) do
+  defp set_mode(state, sid, request_timeout) do
     _ =
-      Conn.request(state.conn, "session/set_mode", %{
-        sessionId: sid,
-        modeId: state.preset.permission_mode
-      })
+      Conn.request(
+        state.conn,
+        "session/set_mode",
+        %{
+          sessionId: sid,
+          modeId: state.preset.permission_mode
+        },
+        timeout: request_timeout
+      )
 
     :ok
   end
@@ -1025,8 +1092,10 @@ defmodule Tightbeam.Acp.Adapter do
     with ready when is_function(ready, 0) <- Keyword.get(opts, :on_ready), do: ready.()
   end
 
-  defp gate_attestation(state, probe_cwd, probe_model, deadline) do
-    request = fn method, params -> gate_request(state.conn, method, params, deadline) end
+  defp gate_attestation(state, probe_cwd, probe_model) do
+    request = fn method, params ->
+      Conn.request(state.conn, method, params, timeout: :infinity)
+    end
 
     with {:ok, result} <- request.("session/new", %{cwd: probe_cwd, mcpServers: []}),
          sid = result["sessionId"],
@@ -1036,57 +1105,35 @@ defmodule Tightbeam.Acp.Adapter do
              sessionId: sid,
              modeId: state.preset.permission_mode
            }) do
-      gate_prompt(state.conn, sid, deadline)
+      gate_prompt(state.conn, sid)
     else
-      {:error, :deadline} -> {:error, :deadline, "", []}
       {:error, _error} -> {:error, :turn_error, "", []}
     end
   end
 
-  defp gate_request(conn, method, params, deadline) do
-    case gate_remaining(deadline) do
-      remaining when remaining <= 0 ->
-        {:error, :deadline}
+  defp gate_prompt(conn, sid) do
+    parent = self()
 
-      remaining ->
-        case Conn.request(conn, method, params, timeout: remaining) do
-          {:error, :timeout} -> {:error, :deadline}
-          result -> result
-        end
-    end
+    Task.start(fn ->
+      result =
+        Conn.request(
+          conn,
+          "session/prompt",
+          %{sessionId: sid, prompt: [%{type: "text", text: @gate_prompt}]},
+          timeout: :infinity
+        )
+
+      send(parent, {:gate_attestation_prompt_done, sid, result})
+    end)
+
+    gate_prompt_wait(sid, {[], []})
   end
 
-  defp gate_prompt(conn, sid, deadline) do
-    case gate_remaining(deadline) do
-      remaining when remaining <= 0 ->
-        {:error, :deadline, "", []}
-
-      remaining ->
-        parent = self()
-
-        Task.start(fn ->
-          result =
-            gate_request(
-              conn,
-              "session/prompt",
-              %{sessionId: sid, prompt: [%{type: "text", text: @gate_prompt}]},
-              deadline
-            )
-
-          send(parent, {:gate_attestation_prompt_done, sid, result})
-        end)
-
-        timer = Process.send_after(self(), :gate_attestation_deadline, remaining)
-        gate_prompt_wait(sid, timer, {[], []})
-    end
-  end
-
-  defp gate_prompt_wait(sid, timer, {output, raw_updates}) do
+  defp gate_prompt_wait(sid, {output, raw_updates}) do
     receive do
       {:acp_notification, "session/update", %{"sessionId" => ^sid, "update" => update}} ->
         gate_prompt_wait(
           sid,
-          timer,
           {
             gate_update_output(update) ++ output,
             [update | raw_updates] |> Enum.take(@gate_raw_update_limit)
@@ -1094,10 +1141,9 @@ defmodule Tightbeam.Acp.Adapter do
         )
 
       {:acp_notification, _method, _params} ->
-        gate_prompt_wait(sid, timer, {output, raw_updates})
+        gate_prompt_wait(sid, {output, raw_updates})
 
       {:gate_attestation_prompt_done, ^sid, result} ->
-        cancel_gate_timer(timer)
         collected = output |> Enum.reverse() |> Enum.join()
 
         case result do
@@ -1106,18 +1152,11 @@ defmodule Tightbeam.Acp.Adapter do
               do: {:ok, collected},
               else: {:error, :no_marker, collected, raw_updates}
 
-          {:error, :deadline} ->
-            {:error, :deadline, collected, raw_updates}
-
           {:error, _error} ->
             {:error, :turn_error, collected, raw_updates}
         end
 
-      :gate_attestation_deadline ->
-        {:error, :deadline, output |> Enum.reverse() |> Enum.join(), raw_updates}
-
       {:acp_exit, _status} ->
-        cancel_gate_timer(timer)
         {:error, :turn_error, output |> Enum.reverse() |> Enum.join(), raw_updates}
     end
   end
@@ -1177,18 +1216,6 @@ defmodule Tightbeam.Acp.Adapter do
       end
     else
       _ -> nil
-    end
-  end
-
-  defp gate_remaining(deadline), do: deadline - System.monotonic_time(:millisecond)
-
-  defp cancel_gate_timer(timer) do
-    Process.cancel_timer(timer)
-
-    receive do
-      :gate_attestation_deadline -> :ok
-    after
-      0 -> :ok
     end
   end
 

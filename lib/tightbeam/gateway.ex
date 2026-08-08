@@ -2017,7 +2017,7 @@ defmodule Tightbeam.Gateway do
   defp checkout_adapter(session) do
     key = {Harness.parse!(session.harness).id(), "shared", session.host}
 
-    case AdapterCoordinator.adapter_for(Tightbeam.AdapterCoordinator, key) do
+    case AdapterCoordinator.adapter_for_turn(Tightbeam.AdapterCoordinator, key) do
       {:ok, adapter, generation} ->
         {:ok, adapter, generation}
 
@@ -2087,9 +2087,9 @@ defmodule Tightbeam.Gateway do
         pointer ->
           # The adapter PROCESS is the authority on residency: stamped
           # generations reset across boots and can spuriously match.
-          case Adapter.knows_session?(adapter, pointer.harness_session_id) do
+          case Adapter.knows_session_for_turn?(adapter, pointer.harness_session_id) do
             true ->
-              case push_known_model(adapter, pointer.harness_session_id, session.model) do
+              case push_known_model_for_turn(adapter, pointer.harness_session_id, session.model) do
                 :ok -> {:ok, pointer.harness_session_id}
                 {:error, _reason} = error -> error
               end
@@ -2112,7 +2112,7 @@ defmodule Tightbeam.Gateway do
                   Tightbeam.AdapterCoordinator,
                   session.host,
                   fn ->
-                    case Adapter.load_session(
+                    case Adapter.load_session_for_turn(
                            adapter,
                            pointer.harness_session_id,
                            session.model,
@@ -2243,7 +2243,7 @@ defmodule Tightbeam.Gateway do
 
   defp new_harness_session(db, adapter, session, cwd, mcp_servers, guidance) do
     with {:ok, sid} <-
-           Adapter.new_session(adapter, session.model, cwd, mcp_servers, guidance),
+           Adapter.new_session_for_turn(adapter, session.model, cwd, mcp_servers, guidance),
          :ok <- capture_created_model(db, adapter, session, sid) do
       {:ok, sid}
     end
@@ -2253,7 +2253,7 @@ defmodule Tightbeam.Gateway do
     do: :ok
 
   defp capture_created_model(db, adapter, session, sid) do
-    case Adapter.current_model(adapter, sid) do
+    case Adapter.current_model_for_turn(adapter, sid) do
       {:ok, %Model{} = reported_model} ->
         _ = Org.set_model(db, session.session_key, reported_model, session.provider)
         :ok
@@ -4995,10 +4995,10 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp push_known_model(_adapter, _sid, nil), do: :ok
+  defp push_known_model_for_turn(_adapter, _sid, nil), do: :ok
 
-  defp push_known_model(adapter, sid, model) do
-    case Adapter.apply_model(adapter, sid, model) do
+  defp push_known_model_for_turn(adapter, sid, model) do
+    case Adapter.apply_model_for_turn(adapter, sid, model) do
       :ok -> :ok
       {:error, reason} -> {:error, {:model_apply_failed, reason}}
     end
