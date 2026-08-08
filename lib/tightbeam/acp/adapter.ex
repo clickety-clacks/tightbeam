@@ -60,7 +60,8 @@ defmodule Tightbeam.Acp.Adapter do
     subagent_tasks: %{},
     known: MapSet.new(),
     models: %{},
-    unprompted: MapSet.new()
+    unprompted: MapSet.new(),
+    switchable_models: %{}
   ]
 
   ## Client
@@ -140,6 +141,13 @@ defmodule Tightbeam.Acp.Adapter do
         {:switch_model_session, session_id, model, cwd, mcp_servers, guidance},
         @boot_boundary_timeout
       )
+
+  @doc "Canonical models the harness currently offers for a history-preserving session switch."
+  @spec switchable_models(adapter(), String.t()) ::
+          {:ok, [model_ref()]}
+          | {:error, :model_capability_unavailable | {:adapter_unavailable, term()}}
+  def switchable_models(adapter, session_id),
+    do: call(adapter, {:switchable_models, session_id}, @boot_boundary_timeout)
 
   @doc "Best-effort ACP teardown for one harness session; adapter failures never escape the caller."
   @spec close_session(adapter(), String.t()) :: :ok | {:error, term()}
@@ -485,6 +493,7 @@ defmodule Tightbeam.Acp.Adapter do
           | known: MapSet.delete(state.known, sid),
             models: Map.delete(state.models, sid),
             unprompted: MapSet.delete(state.unprompted, sid),
+            switchable_models: Map.delete(state.switchable_models, sid),
             chunks: Map.delete(state.chunks, sid),
             progress: Map.delete(state.progress, sid)
         }
@@ -535,6 +544,13 @@ defmodule Tightbeam.Acp.Adapter do
     case Map.fetch(state.models, sid) do
       {:ok, model} -> {:reply, {:ok, model}, state}
       :error -> {:reply, {:error, :model_readback_unavailable}, state}
+    end
+  end
+
+  def handle_call({:switchable_models, sid}, _from, state) do
+    case Map.fetch(state.switchable_models, sid) do
+      {:ok, models} -> {:reply, {:ok, models}, state}
+      :error -> {:reply, {:error, :model_capability_unavailable}, state}
     end
   end
 
@@ -599,6 +615,7 @@ defmodule Tightbeam.Acp.Adapter do
         state
         |> put_in([Access.key(:known)], MapSet.put(state.known, sid))
         |> remember_model(sid, applied_model)
+        |> remember_switchable_models(sid, result)
         |> put_in([Access.key(:unprompted)], MapSet.put(state.unprompted, sid))
 
       {:reply, {:ok, sid}, put_in(state.chunks[sid], [])}
@@ -619,12 +636,13 @@ defmodule Tightbeam.Acp.Adapter do
            },
            timeout: request_timeout
          ) do
-      {:ok, _result} ->
+      {:ok, result} ->
         state =
           state
           |> put_in([Access.key(:known)], MapSet.put(state.known, sid))
           |> put_in([Access.key(:models)], Map.delete(state.models, sid))
           |> put_in([Access.key(:unprompted)], MapSet.delete(state.unprompted, sid))
+          |> remember_switchable_models(sid, result)
           |> put_in([Access.key(:chunks), sid], [])
 
         case model do
@@ -675,6 +693,7 @@ defmodule Tightbeam.Acp.Adapter do
             state
             |> put_in([Access.key(:known)], MapSet.put(state.known, new_sid))
             |> remember_model(new_sid, applied_model)
+            |> remember_switchable_models(new_sid, result)
             |> put_in([Access.key(:chunks), new_sid], [])
 
           {:reply, {:ok, new_sid}, state}
@@ -1131,6 +1150,8 @@ defmodule Tightbeam.Acp.Adapter do
          sid,
          %{"sessionUpdate" => "config_option_update", "configOptions" => options}
        ) do
+    state = remember_switchable_models(state, sid, %{"configOptions" => options})
+
     case Map.fetch(state.models, sid) do
       {:ok, %Model{} = cached} ->
         if config_confirms_model?(options, state.preset, cached) do
@@ -1154,8 +1175,19 @@ defmodule Tightbeam.Acp.Adapter do
       state
       | known: MapSet.delete(state.known, sid),
         models: Map.delete(state.models, sid),
-        unprompted: MapSet.delete(state.unprompted, sid)
+        unprompted: MapSet.delete(state.unprompted, sid),
+        switchable_models: Map.delete(state.switchable_models, sid)
     }
+  end
+
+  defp remember_switchable_models(state, sid, result) do
+    models = canonical_offered_models(state.preset, result)
+
+    if models == [] do
+      state
+    else
+      put_in(state.switchable_models[sid], models)
+    end
   end
 
   defp offered_model_value(preset, result, %Model{} = model) do
@@ -1168,6 +1200,15 @@ defmodule Tightbeam.Acp.Adapter do
       nil -> {:error, :model_unavailable}
       value -> {:ok, value}
     end
+  end
+
+  defp canonical_offered_models(preset, result) do
+    result
+    |> model_option_values()
+    |> Enum.map(&canonical_option_ref(preset, &1))
+    |> Enum.reject(&is_nil/1)
+    |> Enum.uniq()
+    |> Enum.map(&Model.parse_ref/1)
   end
 
   defp model_option_values(%{"configOptions" => options}) when is_list(options) do

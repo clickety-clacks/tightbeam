@@ -647,6 +647,11 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     assert {:ok, ^switched_model} = Adapter.current_model(adapter, "sess-fork-1")
 
+    assert {:ok, switchable} = Adapter.switchable_models(adapter, "sess-fork-1")
+    assert Model.new("claude-opus-4-8", context: "1m") in switchable
+    assert Model.new("claude-sonnet-5") in switchable
+    refute Model.new("claude-opus-5") in switchable
+
     requests = captured_requests(capture_path)
 
     assert Enum.any?(requests, fn request ->
