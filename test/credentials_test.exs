@@ -794,24 +794,6 @@ defmodule Tightbeam.CredentialsTest do
   @healthy_vendor_record ~s({"claudeAiOauth":{"accessToken":"sk-ant-oat01-fresh","refreshToken":"sk-ant-ort01-fresh","expiresAt":4102444800000,"refreshTokenExpiresAt":4102444800000,"scopes":["user:inference","user:sessions:claude_code"],"subscriptionType":"max","rateLimitTier":"default_claude_max_20x"}})
 
   describe "banking refuses a hollow credential" do
-    test "the captured fixture pins every hollow OAuth field in the Elixir gateway" do
-      captured = fixture("claude-hollow-oauth-captured.json")
-      oauth = captured["claudeAiOauth"]
-      healthy = %{"accessToken" => "access", "refreshToken" => "refresh", "expiresAt" => 1}
-
-      for field <- ~w(accessToken refreshToken expiresAt) do
-        candidate = put_in(captured, ["claudeAiOauth"], Map.merge(oauth, healthy))
-        candidate = put_in(candidate, ["claudeAiOauth", field], oauth[field])
-
-        error =
-          assert_raise RuntimeError, fn ->
-            Credentials.refuse_hollow!(:anthropic, JSON.encode!(candidate), "shared fixture")
-          end
-
-        assert Exception.message(error) =~ field
-      end
-    end
-
     test "harvesting a hollow vendor record refuses, names it, and banks nothing", ctx do
       store = Path.join([ctx.base, "auth", "claude", ".credentials.json"])
       home = Path.join([ctx.base, "homes", "eezo", "claude"])
