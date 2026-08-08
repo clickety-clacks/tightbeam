@@ -77,7 +77,10 @@ defmodule Tightbeam.Harness.Fixture do
       guidance: guidance,
       meta: %{instructions: guidance},
       permission_mode: "full",
-      effort_config: "effort"
+      effort_config: "effort",
+      resident_model_switch: :in_place,
+      model_option_aliases: %{},
+      canonical_model_prefixes: ["fixture-"]
     }
   end
 

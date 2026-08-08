@@ -236,7 +236,10 @@ defmodule Tightbeam.Harness.Codex do
       guidance: guidance,
       meta: %{developerInstructions: guidance},
       permission_mode: "agent-full-access",
-      effort_config: "reasoning_effort"
+      effort_config: "reasoning_effort",
+      resident_model_switch: :in_place,
+      model_option_aliases: %{},
+      canonical_model_prefixes: ["gpt-"]
     }
   end
 
