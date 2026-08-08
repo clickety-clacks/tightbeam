@@ -25,6 +25,8 @@ defmodule Tightbeam.Homes do
   Homes never mint or otherwise write credential contents.
   """
 
+  require Logger
+
   alias Tightbeam.Harness
   alias Tightbeam.Harness.Support
 
@@ -42,6 +44,7 @@ defmodule Tightbeam.Homes do
         }
 
   @manifest_relative Path.join(".tightbeam", "manifest")
+  @remote_credential_absent_exit 42
 
   @baseline_skill_names [
     "tightbeam-dispatching",
@@ -109,7 +112,9 @@ defmodule Tightbeam.Homes do
 
     File.mkdir_p!(home)
 
-    if harvest_auth?, do: harvest_auth_back(auth_dir, home, credential_names)
+    if harvest_auth?,
+      do: harvest_auth_back(auth_dir, home, credential_names, provider_of(desired))
+
     Enum.each(credential_names, &File.rm(Path.join(home, &1)))
 
     unless File.read(manifest_path) == {:ok, manifest} do
@@ -160,18 +165,20 @@ defmodule Tightbeam.Homes do
     rails = Path.join(remote_home, rails_filename)
     manifest_dir = Path.join(remote_home, ".tightbeam")
 
-    harvest =
+    if remote_stamp != staged_stamp do
       if Map.get(desired, :harvest_auth, true) do
-        "if [ -f \"#{entry}\" ] && [ ! -L \"#{entry}\" ]; then " <>
-          "cp \"#{entry}\" \"#{store}\" && chmod 600 \"#{store}\"; fi; "
-      else
-        ""
+        harvest_remote_auth_back(
+          target,
+          remote_home,
+          entry,
+          store,
+          provider_of(desired)
+        )
       end
 
-    if remote_stamp != staged_stamp do
       script =
         "mkdir -p \"#{desired.auth_dir}\" \"#{remote_home}\"; " <>
-          harvest <> "rm -f \"#{rails}\"; rm -rf \"#{manifest_dir}\"; "
+          "rm -f \"#{rails}\"; rm -rf \"#{manifest_dir}\"; "
 
       Support.run!(
         target,
@@ -209,6 +216,86 @@ defmodule Tightbeam.Homes do
     }
   end
 
+  # Freeze first, judge the exact frozen bytes on the gateway, promote last.
+  #
+  # A plain remote `cat`, followed by a validated `cp`, has a TOCTOU hole: the harness may
+  # rotate the regular file between those commands and the copy can bank bytes the gateway
+  # never judged. The private stage makes the bytes read back and the bytes promoted the
+  # same file. It is outside the authoritative auth store, mode 0600, and its pathname --
+  # never its contents -- is all that crosses a command or a log line.
+  defp harvest_remote_auth_back(target, remote_home, entry, store, provider) do
+    nonce = :crypto.strong_rand_bytes(12) |> Base.url_encode64(padding: false)
+
+    stage =
+      Path.join([
+        target.host_config.base_dir,
+        "staging",
+        "credential-harvest",
+        "#{provider}-#{nonce}"
+      ])
+
+    entry_q = Support.shell_quote(entry)
+    stage_q = Support.shell_quote(stage)
+    stage_dir_q = stage |> Path.dirname() |> Support.shell_quote()
+
+    read_script =
+      "if [ -f #{entry_q} ] && [ ! -L #{entry_q} ]; then " <>
+        "mkdir -p #{stage_dir_q} && cp #{entry_q} #{stage_q} && " <>
+        "chmod 600 #{stage_q} && cat #{stage_q}; " <>
+        "else exit #{@remote_credential_absent_exit}; fi"
+
+    read_command = remote_script(target, read_script)
+
+    # SSH diagnostic chatter must not be spliced into the credential body: a warning prefix
+    # would make a hollow JSON record undecodable and therefore appear healthy. Production
+    # targets provide the stdout-only runner; injected test targets fall back to `:sh`.
+    case Map.get(target, :sh_out, target.sh).(read_command) do
+      {bytes, 0} ->
+        try do
+          Tightbeam.Credentials.refuse_hollow!(
+            provider,
+            bytes,
+            "the harness home #{remote_home}"
+          )
+
+          promote_script =
+            "mkdir -p #{store |> Path.dirname() |> Support.shell_quote()} && " <>
+              "mv -f #{stage_q} #{Support.shell_quote(store)}"
+
+          Support.run!(target, remote_script(target, promote_script))
+        after
+          remove_remote_harvest_stage(target, stage)
+        end
+
+      {_output, @remote_credential_absent_exit} ->
+        :ok
+
+      {_output, status} ->
+        remove_remote_harvest_stage(target, stage)
+        raise "remote credential read failed with exit #{status}"
+    end
+  end
+
+  defp remove_remote_harvest_stage(target, stage) do
+    case target.sh.(remote_script(target, "rm -f #{Support.shell_quote(stage)}")) do
+      {_output, 0} ->
+        :ok
+
+      {_output, status} ->
+        Logger.error("remote credential harvest cleanup failed with exit #{status}")
+        :ok
+    end
+  rescue
+    _error ->
+      Logger.error("remote credential harvest cleanup could not run")
+      :ok
+  end
+
+  defp remote_script(target, script) do
+    ["ssh" | Support.ssh_opts()] ++
+      [target.host_config.ssh, "sh", "-c", Support.shell_quote(script)]
+  end
+
   @doc "Canonical manifest bytes for the owned projection."
   @spec manifest_bytes(spec()) :: binary()
   def manifest_bytes(spec) do
@@ -239,15 +326,65 @@ defmodule Tightbeam.Homes do
           :ok
 
         bytes ->
-          Tightbeam.Credentials.store_harvested(
-            base_dir,
-            module.credential_provider(),
-            bytes
-          )
+          harvest_one(base_dir, module, home, bytes)
       end
     end)
 
     :ok
+  end
+
+  # ONE BAD HOME MUST NOT TAKE THE GATEWAY WITH IT.
+  #
+  # This runs on the BOOT path -- gateway.ex calls `sweep_auth/2` for every harness inside
+  # `children_after_preflight`, which `Application.start/2` invokes with no rescue around it
+  # (it catches only `{:no_harness_cli, _}`). So a raise here is not a refusal an operator
+  # reads; in a release it is `Kernel pid terminated` and an `erl_crash.dump`, and the
+  # gateway does not boot. The sweep also globs `homes/*/<harness>`, so the raise would
+  # abort the `Enum.each` over every OTHER home and harness too.
+  #
+  # That would defeat the very invariant the refusal exists to protect. `refuse_hollow!/3`
+  # keeps a good store credential alive; a dead gateway makes that credential unreachable
+  # and leaves the box crash-looping every boot until someone hand-deletes a file the VENDOR
+  # wrote. Silent poisoning was the bug; an outage is not the fix for it.
+  #
+  # The distinction against `reload_law!` two lines above, which does stop the boot: law is
+  # org-AUTHORED, global by nature, and has no prior-good value to fall back on -- the author
+  # fixes their own manifest. A harness credential is EXTERNAL data the vendor rotates in
+  # place, scoped to one provider on one home, and there is a known-good value already
+  # banked. Same mechanism, different category.
+  #
+  # So the refusal still REFUSES -- nothing hollow is banked, the good credential stands --
+  # and it still NAMES itself, at :error where an operator and the log both see it. What it
+  # no longer does is take the org down to say so.
+  #
+  # The provider's STATUS IS UNCHANGED BY THIS, deliberately. The store credential still
+  # authenticates, so `Credentials.status/2` keeps answering `:onboarded` -- which is true.
+  # Reporting `needs_onboarding` here would tell an operator to re-onboard a credential that
+  # works, and writing a false status into the org's own state is the same class of mistake
+  # as banking a hollow one.
+  #
+  # What IS degraded is the one home, and it does NOT heal itself. `reconcile_local/3` calls
+  # `harvest_auth_back/4` BEFORE the `File.rm` that would clear the vendor's file, so
+  # reconciling that home raises there and never reaches the relink -- session placement into
+  # it fails, by name, until someone deletes the file. That is the right failure: a session
+  # started against a hollow credential dies with `authentication_failed` an hour later and
+  # points at nothing, while this refuses at the door and says which home. But it is manual
+  # to clear, not transient. A health surface that can be QUERIED for it belongs to the
+  # doctor check (wi_8b89e50c), not here.
+  defp harvest_one(base_dir, module, home, bytes) do
+    Tightbeam.Credentials.store_harvested(
+      base_dir,
+      module.credential_provider(),
+      bytes,
+      "the #{module.id()} harness home #{home}"
+    )
+  rescue
+    error in RuntimeError ->
+      Logger.error(
+        "#{module.id()} credential in #{home} was NOT harvested: #{Exception.message(error)}"
+      )
+
+      :ok
   end
 
   @doc "Canonical shared home path."
@@ -288,7 +425,7 @@ defmodule Tightbeam.Homes do
     end
   end
 
-  defp harvest_auth_back(auth_dir, home, credential_names) do
+  defp harvest_auth_back(auth_dir, home, credential_names, provider) do
     auth_dir
     |> credential_store_files(credential_names)
     |> Enum.each(fn file ->
@@ -296,6 +433,14 @@ defmodule Tightbeam.Homes do
 
       case File.lstat(entry) do
         {:ok, %File.Stat{type: :regular}} ->
+          # The THIRD door onto the shared store, and it has to be guarded like the other
+          # two: a copy is a bank.
+          Tightbeam.Credentials.refuse_hollow!(
+            provider,
+            File.read!(entry),
+            "the harness home #{home}"
+          )
+
           File.cp!(entry, Path.join(auth_dir, file))
           File.chmod!(Path.join(auth_dir, file), 0o600)
 
@@ -304,6 +449,13 @@ defmodule Tightbeam.Homes do
       end
     end)
   end
+
+  # The harness owns the pairing, so it is ASKED rather than restated here. Mapping the
+  # credential FILENAME to a provider in this module read fine and was wrong: it put harness
+  # mechanic literals outside `Tightbeam.Harness.*`, which the seam scan and the provider
+  # literal inventory both refuse -- and they caught it, which is the whole point of them.
+  defp provider_of(%{harness: harness}),
+    do: Harness.module!(harness).credential_provider()
 
   defp link_auth(auth_dir, home, credential_names) do
     auth_dir

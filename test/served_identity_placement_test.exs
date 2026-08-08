@@ -48,6 +48,11 @@ defmodule Tightbeam.ServedIdentityPlacementTest do
         ["ssh", _opt, _batch, _opt2, _timeout, "agent@worker", "cat", _manifest] ->
           {"stale", 0}
 
+        command when is_list(command) ->
+          if Enum.any?(command, &String.contains?(&1, "credential-harvest")),
+            do: {"", 42},
+            else: {"", 0}
+
         _ ->
           {"", 0}
       end
@@ -58,20 +63,24 @@ defmodule Tightbeam.ServedIdentityPlacementTest do
     commands = collect_commands([])
     assert home == "/srv/tightbeam/homes/worker/codex"
 
+    harvest =
+      Enum.find(commands, fn command ->
+        Enum.any?(command, &String.contains?(&1, "credential-harvest"))
+      end)
+
     regeneration =
       Enum.find(commands, fn command ->
-        Enum.any?(command, &String.contains?(&1, "runtime-rotated"))
-      end) ||
-        Enum.find(commands, fn command ->
-          Enum.any?(command, &String.contains?(&1, "auth.json"))
-        end)
+        Enum.any?(command, &String.contains?(&1, ".tightbeam")) and
+          Enum.any?(command, &String.contains?(&1, "rm -f"))
+      end)
 
-    script = Enum.join(regeneration, " ")
-    assert script =~ "cp"
-    assert script =~ "chmod 600"
-    assert script =~ "rm -f"
-    assert script =~ ".tightbeam"
-    refute script =~ "rm -rf \"#{home}\""
+    harvest_script = Enum.join(harvest, " ")
+    regeneration_script = Enum.join(regeneration, " ")
+    assert harvest_script =~ "cp"
+    assert harvest_script =~ "chmod 600"
+    assert regeneration_script =~ "rm -f"
+    assert regeneration_script =~ ".tightbeam"
+    refute regeneration_script =~ "rm -rf \"#{home}\""
     refute Enum.any?(commands, &(Enum.join(&1, " ") =~ "rm -rf #{home}"))
   end
 
@@ -104,14 +113,14 @@ defmodule Tightbeam.ServedIdentityPlacementTest do
         "cat" in command ->
           {File.read!(Path.join(home, ".tightbeam/manifest")), 0}
 
-        String.contains?(joined, "chmod 600") ->
-          File.cp!(Path.join(home, "auth.json"), store)
-          File.chmod!(store, 0o600)
+        String.contains?(joined, "credential-harvest") and String.contains?(joined, "cat") ->
+          run_local_ssh(command)
+
+        String.contains?(joined, "mv -f") ->
+          result = run_local_ssh(command)
           File.rm!(Path.join(home, "auth.json"))
-          File.rm(Path.join(home, "hooks.json"))
-          File.rm_rf!(Path.join(home, ".tightbeam"))
           send(owner, :harvested)
-          {"", 0}
+          result
 
         hd(command) == "rsync" ->
           source = Enum.at(command, -2) |> String.trim_trailing("/")
@@ -124,11 +133,10 @@ defmodule Tightbeam.ServedIdentityPlacementTest do
           {"", 0}
 
         String.contains?(joined, "ln -s") ->
-          File.ln_s!(store, Path.join(home, "auth.json"))
-          {"", 0}
+          run_local_ssh(command)
 
         true ->
-          {"", 0}
+          run_local_ssh(command)
       end
     end
 
@@ -207,5 +215,12 @@ defmodule Tightbeam.ServedIdentityPlacementTest do
     after
       0 -> Enum.reverse(acc)
     end
+  end
+
+  defp run_local_ssh(command) do
+    command
+    |> Enum.drop(6)
+    |> Enum.join(" ")
+    |> then(&System.cmd("sh", ["-c", &1], stderr_to_stdout: true))
   end
 end

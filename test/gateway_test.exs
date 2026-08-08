@@ -5455,13 +5455,23 @@ defmodule Tightbeam.GatewayTest do
         end
       end
 
-      {"", 0}
+      if Enum.any?(command, &String.contains?(&1, "credential-harvest")) and
+           Enum.any?(command, &String.contains?(&1, "cat")),
+         do: {"", 42},
+         else: {"", 0}
+    end
+
+    sh_out = fn command ->
+      if Enum.any?(command, &String.contains?(&1, "credential-harvest")) and
+           Enum.any?(command, &String.contains?(&1, "cat")),
+         do: {"", 42},
+         else: {"", 0}
     end
 
     config =
       gateway_config(base, ctx.db, 4_321)
       |> Map.put(:sh, sh)
-      |> Map.put(:sh_out, fn _ -> {"", 0} end)
+      |> Map.put(:sh_out, sh_out)
 
     children = Gateway.children(config)
 

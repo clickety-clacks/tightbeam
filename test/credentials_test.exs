@@ -759,6 +759,285 @@ defmodule Tightbeam.CredentialsTest do
     end
   end
 
+  # A HOLLOW CREDENTIAL IS DIRT, AND DIRT IS REPORTED, NOT BANKED.
+  #
+  # The incident these pin: a re-onboard left `accessToken: ""`, `refreshToken: ""`,
+  # `expiresAt: 0` in BOTH tightbeam stores while the vendor's own credential was fine,
+  # and every session afterwards read "expired", tried to refresh, and died
+  # `authentication_failed`. Two coder sessions were killed by it before it was traced.
+  #
+  # The writer was never the ceremony. Claude Code OWNS the `.credentials.json` inside a
+  # harness home and rotates it in place; `Homes.sweep_auth/2` harvests that file at every
+  # gateway boot (gateway.ex:193) and `store_harvested/3` wrote the bytes over the SHARED
+  # auth store without ever looking at them. So one agent's hollow home file poisoned the
+  # credential for every agent on the next boot — and the reboot was what re-applied the
+  # poison, which is why restarting never healed it.
+  # THE ARTIFACT, NOT AN IDEALISED VERSION OF IT.
+  #
+  # The key SET is captured from the vendor's own writer, not invented: three independent
+  # Claude-Code-written `.credentials.json` files on gibson (the live one plus the two
+  # rename-aside backups `.pre-harvest-*` and `.stale-*`) carry exactly these seven keys, in
+  # this order. An earlier version of these tests used a four-key subset, which is a
+  # hand-drawn fixture wearing the incident's clothes: it would stay green against a guard
+  # that only ever handled the tidy shape, and the file that actually broke eezo has three
+  # more keys than that.
+  #
+  # PROVENANCE, stated exactly. File-verified from the incident: `accessToken` empty,
+  # `refreshToken` empty, `expiresAt` 0. Captured from the vendor's live key set: the
+  # remaining four keys and their types. The zeroed/emptied VALUES for those four are the
+  # inference — a cleared record keeps its keys — and they are deliberately the part under
+  # test, because the guard must not depend on which of them happen to be present.
+  @hollow_vendor_record ~s({"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0,"refreshTokenExpiresAt":0,"scopes":[],"subscriptionType":"","rateLimitTier":""}})
+
+  # The same seven keys, populated — so a test that expects harvesting to SUCCEED is not
+  # quietly passing because it used a different shape from the one that must fail.
+  @healthy_vendor_record ~s({"claudeAiOauth":{"accessToken":"sk-ant-oat01-fresh","refreshToken":"sk-ant-ort01-fresh","expiresAt":4102444800000,"refreshTokenExpiresAt":4102444800000,"scopes":["user:inference","user:sessions:claude_code"],"subscriptionType":"max","rateLimitTier":"default_claude_max_20x"}})
+
+  describe "banking refuses a hollow credential" do
+    test "harvesting a hollow vendor record refuses, names it, and banks nothing", ctx do
+      store = Path.join([ctx.base, "auth", "claude", ".credentials.json"])
+      home = Path.join([ctx.base, "homes", "eezo", "claude"])
+      File.mkdir_p!(Path.dirname(store))
+      File.mkdir_p!(home)
+
+      good =
+        ~s({"claudeAiOauth":{"accessToken":"sk-ant-oat01-good","refreshToken":"sk-ant-ort01-good","expiresAt":4102444800000}})
+
+      File.write!(store, good)
+
+      # The shape observed on gibson: every key present, every value empty or zero.
+      File.write!(
+        Path.join(home, ".credentials.json"),
+        @hollow_vendor_record
+      )
+
+      # THE SWEEP SURVIVES IT. This runs on the gateway boot path, where a raise is not a
+      # refusal anyone reads -- it is a kernel panic and a gateway that will not start.
+      # Refusing to bank is the requirement; taking the org down to announce it is not.
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert :ok = Tightbeam.Homes.sweep_auth(ctx.base, :claude)
+        end)
+
+      # NAMED, not merely refused: the operator has to be able to find the file. The home
+      # rather than the file itself, because the credential FILENAME is private to each
+      # harness module and exposing it would mean a new behaviour callback on every
+      # harness — a wider change than this fix earns. The home holds one credential.
+      assert log =~ home
+      assert log =~ "accessToken"
+
+      # And the good credential is still standing. This is the half that matters:
+      # refusing to bank is worthless if the store was already overwritten.
+      assert File.read!(store) == good
+    end
+
+    # ONE POISONED HOME MUST NOT COST THE OTHERS. `sweep_auth/2` globs `homes/*/<harness>`,
+    # so an exception escaping one iteration would abort the `Enum.each` over every
+    # remaining home -- and, one level up, over every remaining harness.
+    test "a hollow home does not stop the sweep from harvesting the healthy ones", ctx do
+      store = Path.join([ctx.base, "auth", "claude", ".credentials.json"])
+      File.mkdir_p!(Path.dirname(store))
+      File.write!(store, ~s({"claudeAiOauth":{"accessToken":"old","expiresAt":1}}))
+
+      # `aaa` sorts before `zzz`, so the poisoned home is swept FIRST and the healthy one
+      # only lands if the sweep kept going.
+      hollow_home = Path.join([ctx.base, "homes", "aaa", "claude"])
+      healthy_home = Path.join([ctx.base, "homes", "zzz", "claude"])
+      File.mkdir_p!(hollow_home)
+      File.mkdir_p!(healthy_home)
+
+      File.write!(
+        Path.join(hollow_home, ".credentials.json"),
+        @hollow_vendor_record
+      )
+
+      rotated = @healthy_vendor_record
+
+      File.write!(Path.join(healthy_home, ".credentials.json"), rotated)
+
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert :ok = Tightbeam.Homes.sweep_auth(ctx.base, :claude)
+      end)
+
+      assert File.read!(store) == rotated
+    end
+
+    test "store_harvested refuses hollow bytes rather than writing them", ctx do
+      store = Path.join([ctx.base, "auth", "claude", ".credentials.json"])
+      File.mkdir_p!(Path.dirname(store))
+      File.write!(store, ~s({"claudeAiOauth":{"accessToken":"sk-ant-oat01-good"}}))
+
+      assert_raise RuntimeError, fn ->
+        Credentials.store_harvested(
+          ctx.base,
+          :anthropic,
+          @hollow_vendor_record
+        )
+      end
+
+      assert File.read!(store) == ~s({"claudeAiOauth":{"accessToken":"sk-ant-oat01-good"}})
+    end
+
+    test "an empty credential file is refused too", ctx do
+      File.mkdir_p!(Path.join([ctx.base, "auth", "claude"]))
+
+      assert_raise RuntimeError, fn ->
+        Credentials.store_harvested(ctx.base, :anthropic, "")
+      end
+    end
+
+    # THE REGRESSION THIS GUARD COULD EASILY CAUSE. An anthropic `.credentials.json` is
+    # not always an OAuth record: `bank_anthropic_api_key` (ceremonies.rs:775) writes a
+    # BARE KEY STRING to the same filename. A validator that assumed JSON would refuse
+    # every api_key install on this path.
+    test "a bare api key still harvests — it is not an OAuth record", ctx do
+      store = Path.join([ctx.base, "auth", "claude", ".credentials.json"])
+      home = Path.join([ctx.base, "homes", "eezo", "claude"])
+      File.mkdir_p!(Path.dirname(store))
+      File.mkdir_p!(home)
+      File.write!(store, "sk-ant-api03-old")
+      File.write!(Path.join(home, ".credentials.json"), "sk-ant-api03-rotated")
+
+      assert :ok = Tightbeam.Homes.sweep_auth(ctx.base, :claude)
+      assert File.read!(store) == "sk-ant-api03-rotated"
+    end
+
+    test "a healthy vendor rotation still harvests", ctx do
+      store = Path.join([ctx.base, "auth", "claude", ".credentials.json"])
+      home = Path.join([ctx.base, "homes", "eezo", "claude"])
+      File.mkdir_p!(Path.dirname(store))
+      File.mkdir_p!(home)
+
+      File.write!(
+        store,
+        ~s({"claudeAiOauth":{"accessToken":"old","refreshToken":"r","expiresAt":1}})
+      )
+
+      rotated = @healthy_vendor_record
+
+      File.write!(Path.join(home, ".credentials.json"), rotated)
+
+      assert :ok = Tightbeam.Homes.sweep_auth(ctx.base, :claude)
+      assert File.read!(store) == rotated
+    end
+
+    # THE REGRESSION AT ITS REAL ALTITUDE: not `sweep_auth/2`, but the function
+    # `Application.start/2` actually calls.
+    #
+    # `sweep_auth/2` returning `:ok` proves the sweep survives; it does NOT prove the BOOT
+    # survives, and the two are different claims — `children_after_preflight/1` is where the
+    # sweep is invoked (gateway.ex), and `application.ex` runs it with no rescue around it.
+    # Asserting at the boot function is what would also catch a NEW raising call added to
+    # this path later, which a test aimed at `sweep_auth` alone would sail straight past.
+    test "a hollow home does not stop the gateway from composing its boot children", ctx do
+      store = Path.join([ctx.base, "auth", "claude", ".credentials.json"])
+      home = Path.join([ctx.base, "homes", "eezo", "claude"])
+      File.mkdir_p!(Path.dirname(store))
+      File.mkdir_p!(home)
+      File.write!(store, @healthy_vendor_record)
+      File.write!(Path.join(home, ".credentials.json"), @hollow_vendor_record)
+
+      db = :"credentials_boot_#{System.unique_integer([:positive])}"
+      start_supervised!({Tightbeam.DB, path: ":memory:", name: db})
+      :ok = Tightbeam.Schema.ensure_all(db)
+
+      config = %{
+        db: db,
+        base_dir: ctx.base,
+        port: 4_321,
+        cwd: ctx.base,
+        default_harness: :claude,
+        default_model: Tightbeam.Model.new("claude-fable-5"),
+        max_live_sessions_per_user: 50,
+        wake_tick_ms: 60_000,
+        onboarding_lease_ms: 1_800_000
+      }
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert [_ | _] = Tightbeam.Gateway.children_after_preflight(config)
+        end)
+
+      # It refused, and it said so where an operator looks.
+      assert log =~ home
+
+      # And the credential every OTHER agent depends on is untouched.
+      assert File.read!(store) == @healthy_vendor_record
+    end
+
+    # ROUTE 2 OF 3: the ceremony's own bank. Proved by test rather than by construction --
+    # this one goes through `write_credential!/3` and `atomic_write!`, a different mechanism
+    # from the harvest route above, and a guard that is never exercised is not a guard.
+    test "the onboarding ceremony refuses to bank a hollow credential", ctx do
+      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
+      {:ok, staging, lease_id} = Credentials.begin_onboard(:anthropic, server)
+
+      File.write!(
+        Path.join(staging, ".credentials.json"),
+        @hollow_vendor_record
+      )
+
+      # A REFUSAL, not a crash. Writing this test is what caught that a raise here killed
+      # the Credentials GenServer and reached the operator as an exit instead of a sentence
+      # — the guard "worked" and reported nothing anyone could act on.
+      assert {:error, {:hollow_credential, %{found: found}}} =
+               Credentials.finish_onboard(:anthropic, :subscription, lease_id, server)
+
+      assert found =~ "accessToken"
+      assert Process.alive?(server)
+      refute File.exists?(Path.join([ctx.base, "auth", "claude", ".credentials.json"]))
+    end
+
+    # ROUTE 3 OF 3: `harvest_auth_back/4`, reached through home reconciliation. This is the
+    # door that most needed its own test: it is `File.read!` + `File.cp!` in a loop, NOT
+    # `atomic_write!`, so "the good credential survives" rests on a different mechanism than
+    # the route that was already covered.
+    test "reconciling a home refuses to copy a hollow credential over the store", ctx do
+      store_dir = Path.join([ctx.base, "auth", "claude"])
+      store = Path.join(store_dir, ".credentials.json")
+      File.mkdir_p!(store_dir)
+
+      good =
+        ~s({"claudeAiOauth":{"accessToken":"sk-ant-oat01-good","refreshToken":"sk-ant-ort01-good","expiresAt":4102444800000}})
+
+      File.write!(store, good)
+
+      home = Tightbeam.Homes.home_path(ctx.base, "eezo", :claude)
+      File.mkdir_p!(home)
+
+      # A REGULAR file in the home, not the symlink reconcile normally leaves: that is
+      # exactly the "left by runtime rotation" state harvest exists to pick up.
+      File.write!(
+        Path.join(home, ".credentials.json"),
+        @hollow_vendor_record
+      )
+
+      assert_raise RuntimeError, fn ->
+        Tightbeam.Homes.project(ctx.base, %{harness: :claude, machine: "eezo", rails: nil})
+      end
+
+      assert File.read!(store) == good
+    end
+
+    # F3: the shapes the `is_map` guard let through. A PRESENT `claudeAiOauth` that carries
+    # no record is hollow by the same reasoning as an empty token — it announces an OAuth
+    # credential and holds nothing to authenticate with.
+    test "a claudeAiOauth key that is not an OAuth record is hollow", ctx do
+      File.mkdir_p!(Path.join([ctx.base, "auth", "claude"]))
+
+      for bytes <- [
+            ~s({"claudeAiOauth":null}),
+            ~s({"claudeAiOauth":""}),
+            ~s({"claudeAiOauth":[]}),
+            ~s({"claudeAiOauth":"sk-ant-oat01-looks-like-a-token"})
+          ] do
+        assert_raise RuntimeError, fn ->
+          Credentials.store_harvested(ctx.base, :anthropic, bytes)
+        end
+      end
+    end
+  end
+
   defp credential_metadata(base, harness) do
     [base, "auth", harness, ".tightbeam", "credential.json"]
     |> Path.join()

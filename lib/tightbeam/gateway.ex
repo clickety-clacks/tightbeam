@@ -473,8 +473,10 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp maybe_put_credential_runner(opts, %{sh: sh}), do: Keyword.put(opts, :sh, sh)
-  defp maybe_put_credential_runner(opts, _config), do: opts
+  defp maybe_put_credential_runner(opts, config) do
+    opts = if config[:sh], do: Keyword.put(opts, :sh, config.sh), else: opts
+    if config[:sh_out], do: Keyword.put(opts, :sh_out, config.sh_out), else: opts
+  end
 
   defp provision_opts(config), do: if(config[:sh], do: [sh: config.sh], else: [])
 
