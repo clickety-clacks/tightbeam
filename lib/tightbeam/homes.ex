@@ -44,6 +44,7 @@ defmodule Tightbeam.Homes do
         }
 
   @manifest_relative Path.join(".tightbeam", "manifest")
+  @remote_credential_absent_exit 42
 
   @baseline_skill_names [
     "tightbeam-dispatching",
@@ -164,18 +165,20 @@ defmodule Tightbeam.Homes do
     rails = Path.join(remote_home, rails_filename)
     manifest_dir = Path.join(remote_home, ".tightbeam")
 
-    harvest =
+    if remote_stamp != staged_stamp do
       if Map.get(desired, :harvest_auth, true) do
-        "if [ -f \"#{entry}\" ] && [ ! -L \"#{entry}\" ]; then " <>
-          "cp \"#{entry}\" \"#{store}\" && chmod 600 \"#{store}\"; fi; "
-      else
-        ""
+        harvest_remote_auth_back(
+          target,
+          remote_home,
+          entry,
+          store,
+          provider_of(desired)
+        )
       end
 
-    if remote_stamp != staged_stamp do
       script =
         "mkdir -p \"#{desired.auth_dir}\" \"#{remote_home}\"; " <>
-          harvest <> "rm -f \"#{rails}\"; rm -rf \"#{manifest_dir}\"; "
+          "rm -f \"#{rails}\"; rm -rf \"#{manifest_dir}\"; "
 
       Support.run!(
         target,
@@ -211,6 +214,86 @@ defmodule Tightbeam.Homes do
       manifest_path: remote_manifest,
       linked_auth_files: [credential]
     }
+  end
+
+  # Freeze first, judge the exact frozen bytes on the gateway, promote last.
+  #
+  # A plain remote `cat`, followed by a validated `cp`, has a TOCTOU hole: the harness may
+  # rotate the regular file between those commands and the copy can bank bytes the gateway
+  # never judged. The private stage makes the bytes read back and the bytes promoted the
+  # same file. It is outside the authoritative auth store, mode 0600, and its pathname --
+  # never its contents -- is all that crosses a command or a log line.
+  defp harvest_remote_auth_back(target, remote_home, entry, store, provider) do
+    nonce = :crypto.strong_rand_bytes(12) |> Base.url_encode64(padding: false)
+
+    stage =
+      Path.join([
+        target.host_config.base_dir,
+        "staging",
+        "credential-harvest",
+        "#{provider}-#{nonce}"
+      ])
+
+    entry_q = Support.shell_quote(entry)
+    stage_q = Support.shell_quote(stage)
+    stage_dir_q = stage |> Path.dirname() |> Support.shell_quote()
+
+    read_script =
+      "if [ -f #{entry_q} ] && [ ! -L #{entry_q} ]; then " <>
+        "mkdir -p #{stage_dir_q} && cp #{entry_q} #{stage_q} && " <>
+        "chmod 600 #{stage_q} && cat #{stage_q}; " <>
+        "else exit #{@remote_credential_absent_exit}; fi"
+
+    read_command = remote_script(target, read_script)
+
+    # SSH diagnostic chatter must not be spliced into the credential body: a warning prefix
+    # would make a hollow JSON record undecodable and therefore appear healthy. Production
+    # targets provide the stdout-only runner; injected test targets fall back to `:sh`.
+    case Map.get(target, :sh_out, target.sh).(read_command) do
+      {bytes, 0} ->
+        try do
+          Tightbeam.Credentials.refuse_hollow!(
+            provider,
+            bytes,
+            "the harness home #{remote_home}"
+          )
+
+          promote_script =
+            "mkdir -p #{store |> Path.dirname() |> Support.shell_quote()} && " <>
+              "mv -f #{stage_q} #{Support.shell_quote(store)}"
+
+          Support.run!(target, remote_script(target, promote_script))
+        after
+          remove_remote_harvest_stage(target, stage)
+        end
+
+      {_output, @remote_credential_absent_exit} ->
+        :ok
+
+      {_output, status} ->
+        remove_remote_harvest_stage(target, stage)
+        raise "remote credential read failed with exit #{status}"
+    end
+  end
+
+  defp remove_remote_harvest_stage(target, stage) do
+    case target.sh.(remote_script(target, "rm -f #{Support.shell_quote(stage)}")) do
+      {_output, 0} ->
+        :ok
+
+      {_output, status} ->
+        Logger.error("remote credential harvest cleanup failed with exit #{status}")
+        :ok
+    end
+  rescue
+    _error ->
+      Logger.error("remote credential harvest cleanup could not run")
+      :ok
+  end
+
+  defp remote_script(target, script) do
+    ["ssh" | Support.ssh_opts()] ++
+      [target.host_config.ssh, "sh", "-c", Support.shell_quote(script)]
   end
 
   @doc "Canonical manifest bytes for the owned projection."

@@ -297,6 +297,12 @@ defmodule Tightbeam.Credentials do
        machine: machine,
        ssh: Keyword.get(opts, :ssh),
        sh: Keyword.get(opts, :sh, &system_cmd/1),
+       sh_out:
+         Keyword.get_lazy(opts, :sh_out, fn ->
+           if Keyword.has_key?(opts, :sh),
+             do: Keyword.fetch!(opts, :sh),
+             else: &system_cmd_out/1
+         end),
        now: Keyword.get(opts, :now, fn -> System.system_time(:second) end),
        onboarders: Keyword.get(opts, :onboarders, default_onboarders()),
        gate: Keyword.get(opts, :gate, fn _provider -> :ok end),
@@ -804,7 +810,8 @@ defmodule Tightbeam.Credentials do
       base_dir: state.staging_base_dir,
       host_config: %{ssh: state.ssh, base_dir: state.base_dir},
       host_name: state.machine,
-      sh: state.sh
+      sh: state.sh,
+      sh_out: state.sh_out
     }
 
   # No anthropic entry: the subscription ceremony lives in the Rust CLI
@@ -1158,6 +1165,8 @@ defmodule Tightbeam.Credentials do
   defp system_cmd([binary | args]) do
     System.cmd(binary, args, stderr_to_stdout: true)
   end
+
+  defp system_cmd_out([binary | args]), do: System.cmd(binary, args)
 
   defp shell_quote(value) do
     "'" <> String.replace(value, "'", "'\"'\"'") <> "'"

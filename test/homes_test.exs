@@ -3,6 +3,9 @@ defmodule Tightbeam.HomesTest do
 
   alias Tightbeam.Homes
 
+  @hollow_vendor_record ~s({"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0,"refreshTokenExpiresAt":0,"scopes":[],"subscriptionType":"","rateLimitTier":""}})
+  @healthy_vendor_record ~s({"claudeAiOauth":{"accessToken":"sk-ant-oat01-fresh","refreshToken":"sk-ant-ort01-fresh","expiresAt":4102444800000,"refreshTokenExpiresAt":4102444800000,"scopes":["user:inference","user:sessions:claude_code"],"subscriptionType":"max","rateLimitTier":"default_claude_max_20x"}})
+
   setup do
     base_dir = Path.join(System.tmp_dir!(), "tb-homes-#{System.unique_integer([:positive])}")
     on_exit(fn -> File.rm_rf!(base_dir) end)
@@ -180,9 +183,11 @@ defmodule Tightbeam.HomesTest do
     sh = fn command ->
       send(parent, {:command, command})
 
-      if "cat" in command,
-        do: {"stale-manifest", 0},
-        else: {"", 0}
+      cond do
+        "cat" in command -> {"stale-manifest", 0}
+        Enum.any?(command, &String.contains?(&1, "credential-harvest")) -> {"", 42}
+        true -> {"", 0}
+      end
     end
 
     Tightbeam.Harness.Codex.reconcile_home(
@@ -197,11 +202,17 @@ defmodule Tightbeam.HomesTest do
     )
 
     commands = collect_commands([])
-    assert [stamp, cleanup, rsync, link] = commands
+    assert [stamp, read_back, cleanup, rsync, link] = commands
     assert "cat" in stamp
 
+    read_back_script = List.last(read_back)
+    assert read_back_script =~ "credential-harvest"
+    assert read_back_script =~ "cp"
+    assert read_back_script =~ "/remote/tb/homes/worker/codex/auth.json"
+    assert read_back_script =~ "cat"
+
     cleanup_script = List.last(cleanup)
-    assert cleanup_script =~ "cp \"/remote/tb/homes/worker/codex/auth.json\""
+    refute cleanup_script =~ "cp \"/remote/tb/homes/worker/codex/auth.json\""
     refute cleanup_script =~ "rm -f \"/remote/tb/homes/worker/codex/auth.json\""
     refute cleanup_script =~ "rm -rf \"/remote/tb/homes/worker/codex\""
     refute cleanup_script =~ "sessions"
@@ -210,6 +221,122 @@ defmodule Tightbeam.HomesTest do
     refute cleanup_script =~ "memory"
     refute "--delete" in rsync
     assert List.last(link) =~ "ln -s"
+  end
+
+  test "remote reconciliation refuses a hollow vendor record before it reaches the store", %{
+    base_dir: base_dir
+  } do
+    remote = Path.join(base_dir, "remote-hollow")
+    home = Path.join([remote, "homes", "worker", "claude"])
+    store = Path.join([remote, "auth", "claude", ".credentials.json"])
+    manifest = Path.join(home, ".tightbeam/manifest")
+    entry = Path.join(home, ".credentials.json")
+    good = String.replace(@healthy_vendor_record, "fresh", "standing")
+    File.mkdir_p!(Path.dirname(manifest))
+    File.mkdir_p!(Path.dirname(store))
+    File.write!(manifest, "stale")
+    File.write!(entry, @hollow_vendor_record)
+    File.write!(store, good)
+    parent = self()
+
+    sh = fn command ->
+      send(parent, {:command, command})
+
+      if Enum.any?(command, &String.contains?(&1, "credential-harvest")) and
+           Enum.any?(command, &String.contains?(&1, "cat")) do
+        flunk("credential bytes must use the stdout-only runner")
+      else
+        run_local_ssh(command)
+      end
+    end
+
+    sh_out = fn command ->
+      send(parent, {:command, command})
+      run_local_ssh(command)
+    end
+
+    assert_raise RuntimeError, ~r/accessToken is empty/, fn ->
+      Tightbeam.Harness.Claude.reconcile_home(
+        %{
+          base_dir: base_dir,
+          host_name: "worker",
+          host_config: %{ssh: "worker", base_dir: remote},
+          sh: sh,
+          sh_out: sh_out
+        },
+        home,
+        %{harness: :claude, machine: "worker", rails: "v1", auth_dir: Path.dirname(store)}
+      )
+    end
+
+    assert File.read!(store) == good
+    assert File.read!(entry) == @hollow_vendor_record
+    assert Path.wildcard(Path.join([remote, "staging", "credential-harvest", "*"])) == []
+
+    commands = collect_commands([])
+    joined = Enum.map_join(commands, "\n", &Enum.join(&1, " "))
+    refute joined =~ "sk-ant-"
+    refute joined =~ @hollow_vendor_record
+  end
+
+  test "remote reconciliation promotes the bytes it judged even if the vendor file rotates", %{
+    base_dir: base_dir
+  } do
+    remote = Path.join(base_dir, "remote-race")
+    home = Path.join([remote, "homes", "worker", "claude"])
+    store = Path.join([remote, "auth", "claude", ".credentials.json"])
+    manifest = Path.join(home, ".tightbeam/manifest")
+    entry = Path.join(home, ".credentials.json")
+    File.mkdir_p!(Path.dirname(manifest))
+    File.mkdir_p!(Path.dirname(store))
+    File.write!(manifest, "stale")
+    File.write!(entry, @healthy_vendor_record)
+    File.write!(store, "standing")
+    parent = self()
+
+    sh = fn command ->
+      send(parent, {:command, command})
+
+      cond do
+        hd(command) == "rsync" ->
+          {"", 0}
+
+        Enum.any?(command, &String.contains?(&1, "credential-harvest")) and
+            Enum.any?(command, &String.contains?(&1, "cat")) ->
+          result = run_local_ssh(command)
+          File.write!(entry, @hollow_vendor_record)
+          result
+
+        true ->
+          run_local_ssh(command)
+      end
+    end
+
+    assert %{home_path: ^home} =
+             Tightbeam.Harness.Claude.reconcile_home(
+               %{
+                 base_dir: base_dir,
+                 host_name: "worker",
+                 host_config: %{ssh: "worker", base_dir: remote},
+                 sh: sh
+               },
+               home,
+               %{
+                 harness: :claude,
+                 machine: "worker",
+                 rails: "v1",
+                 auth_dir: Path.dirname(store)
+               }
+             )
+
+    assert File.read!(store) == @healthy_vendor_record
+    assert File.read!(entry) == @hollow_vendor_record
+    assert Path.wildcard(Path.join([remote, "staging", "credential-harvest", "*"])) == []
+
+    commands = collect_commands([])
+    joined = Enum.map_join(commands, "\n", &Enum.join(&1, " "))
+    refute joined =~ "sk-ant-"
+    refute joined =~ @healthy_vendor_record
   end
 
   test "unchanged remote reconciliation preserves the credential link when rsync fails", %{
@@ -265,6 +392,13 @@ defmodule Tightbeam.HomesTest do
     after
       0 -> Enum.reverse(acc)
     end
+  end
+
+  defp run_local_ssh(command) do
+    command
+    |> Enum.drop(6)
+    |> Enum.join(" ")
+    |> then(&System.cmd("sh", ["-c", &1], stderr_to_stdout: true))
   end
 
   defp snapshot_files(root) do

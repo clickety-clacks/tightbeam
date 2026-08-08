@@ -910,7 +910,11 @@ defmodule Tightbeam.Placement do
       cli_bin: config.cli_bin
     }
 
-    deliver_opts = if config[:sh], do: [sh: config.sh], else: []
+    deliver_opts =
+      []
+      |> then(&if(config[:sh], do: Keyword.put(&1, :sh, config.sh), else: &1))
+      |> then(&if(config[:sh_out], do: Keyword.put(&1, :sh_out, config.sh_out), else: &1))
+
     home = deliver_home(config, key, deliver_opts)
 
     stderr_path =
@@ -1156,6 +1160,7 @@ defmodule Tightbeam.Placement do
   Returns the home path AS SEEN BY THE ADAPTER PROCESS (local path for
   local, remote path for remote). opts: :sh (injectable runner,
   `(cmd :: [String.t()]) -> {output :: String.t(), exit :: integer()}`);
+  :sh_out (the corresponding stdout-only runner for credential bytes);
   :model (a `Model.t()` to pin instead of the org default — the caller passes
   the provisioning session's resolved model so adapter acceptance tracks
   selection).
@@ -1167,12 +1172,18 @@ defmodule Tightbeam.Placement do
     home = Homes.home_path(host_config.base_dir, host, harness)
     sh = Keyword.get(opts, :sh, &system_cmd/1)
 
+    sh_out =
+      Keyword.get_lazy(opts, :sh_out, fn ->
+        if Keyword.has_key?(opts, :sh), do: sh, else: &system_cmd_out/1
+      end)
+
     module.reconcile_home(
       %{
         base_dir: config.base_dir,
         host_config: host_config,
         host_name: host,
-        sh: sh
+        sh: sh,
+        sh_out: sh_out
       },
       home,
       %{

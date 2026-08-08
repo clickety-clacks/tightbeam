@@ -809,7 +809,12 @@ defmodule Tightbeam.PlacementTest do
       }
     })
 
-    sh = fn _command -> {"", 0} end
+    sh = fn command ->
+      if Enum.any?(command, &String.contains?(&1, "credential-harvest")) and
+           Enum.any?(command, &String.contains?(&1, "cat")),
+         do: {"", 42},
+         else: {"", 0}
+    end
 
     config = %{
       base_dir: base_dir,
@@ -876,7 +881,11 @@ defmodule Tightbeam.PlacementTest do
 
     sh = fn command ->
       send(parent, {:remote_gate_command, command})
-      {"", 0}
+
+      if Enum.any?(command, &String.contains?(&1, "credential-harvest")) and
+           Enum.any?(command, &String.contains?(&1, "cat")),
+         do: {"", 42},
+         else: {"", 0}
     end
 
     config = %{
