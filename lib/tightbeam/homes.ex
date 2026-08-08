@@ -286,11 +286,8 @@ defmodule Tightbeam.Homes do
   # it fails, by name, until someone deletes the file. That is the right failure: a session
   # started against a hollow credential dies with `authentication_failed` an hour later and
   # points at nothing, while this refuses at the door and says which home. But it is manual
-  # to clear, not transient. Both signals for it are INCIDENTAL -- this `:error` line when a
-  # sweep happens to run, and the named placement failure when a session happens to be
-  # started there. Neither can be asked; nothing reports the condition until something else
-  # trips over it. A surface that can be QUERIED belongs to the doctor check (wi_8b89e50c),
-  # not here.
+  # to clear, not transient. A health surface that can be QUERIED for it belongs to the
+  # doctor check (wi_8b89e50c), not here.
   defp harvest_one(base_dir, module, home, bytes) do
     Tightbeam.Credentials.store_harvested(
       base_dir,
