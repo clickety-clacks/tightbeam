@@ -179,30 +179,62 @@ defmodule Tightbeam.Application do
   @spec draining?() :: boolean()
   def draining?, do: :persistent_term.get({__MODULE__, :draining}, false)
 
-  # THE DEFAULTS COME FROM WHAT THE BOX HAS, not from a constant.
+  # THE DEFAULTS COME FROM WHAT THE BOX CAN ACTUALLY RUN — a harness whose CLI
+  # is installed AND whose credential is onboarded — not merely what is on PATH.
   #
   # `default_harness` was `hd(Harness.all())` — registry order — and
   # `default_model` was the literal claude-sonnet-5, whatever harness that
   # implied. A codex-only machine therefore placed its first turn on a harness
   # it had never installed, with a model it cannot run, and refused naming a
   # vendor the operator never chose (Flynn, 2026-08-04: "what if i'm a codex
-  # only user"). An operator's explicit choice still wins; this only decides
-  # what "no preference" means, and it now means "the harness you installed".
+  # only user"). The first repair special-cased exactly one INSTALLED binary,
+  # but a tester with BOTH CLIs on PATH and ONLY codex onboarded still fell to
+  # registry-order claude + claude-sonnet-5 — a dead default whose first turn
+  # cannot run (mike repro 2026-08-06, wi_24028d10). Installed is not runnable;
+  # installed-AND-onboarded is. Onboarded-ness is read synchronously from disk
+  # here (Credentials.kind_at), before the async catalog exists.
   #
-  # With BOTH installed and no preference, registry order still decides — but
-  # that is a real choice between two working harnesses, not a broken install.
-  defp apply_installed_defaults(config, installed) do
+  # An operator's explicit choice still wins; this only decides what "no
+  # preference" means, and it now means "the harness you can actually run".
+  # With NONE of the installed harnesses onboarded we keep the installed-based
+  # fallback so boot does not crash — readiness then reports NOT READY and names
+  # the gap rather than this code guessing. With two or more runnable, registry
+  # order still decides — a real choice between working harnesses, not a broken
+  # install.
+  @doc false
+  @spec apply_installed_defaults(map(), [atom()]) :: map()
+  def apply_installed_defaults(config, installed) do
+    onboarded = Enum.filter(installed, &onboarded_harness?(config.base_dir, &1))
+    runnable = if onboarded == [], do: installed, else: onboarded
+
     chosen =
       cond do
         Application.get_env(:tightbeam, :default_harness) -> Tightbeam.Harness.default()
-        match?([_only], installed) -> Tightbeam.Harness.module!(hd(installed))
+        match?([_only], runnable) -> Tightbeam.Harness.module!(hd(runnable))
         true -> Tightbeam.Harness.default()
       end
 
     model =
       Application.get_env(:tightbeam, :default_model) || chosen.default_model()
 
+    if match?([_only], onboarded) and
+         is_nil(Application.get_env(:tightbeam, :default_harness)) do
+      Logger.info(
+        "Boot default derived from onboarding: #{chosen.id()} is the only onboarded " <>
+          "harness on this machine, so a no-preference boot defaults to #{chosen.id()} " <>
+          "with its default model. An explicit default-harness preference overrides this."
+      )
+    end
+
     %{config | default_harness: chosen.id(), default_model: model}
+  end
+
+  # Onboarded == a credential is present on disk for this harness's provider on
+  # THIS machine (synchronous read, boot-safe). `kind_at` returns `:none` when
+  # no onboarded credential metadata exists for the provider.
+  defp onboarded_harness?(base_dir, id) do
+    provider = Tightbeam.Harness.module!(id).credential_provider()
+    Tightbeam.Credentials.kind_at(base_dir, provider) != :none
   end
 
   defp production_config do
