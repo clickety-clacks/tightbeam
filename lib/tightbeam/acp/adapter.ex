@@ -714,30 +714,60 @@ defmodule Tightbeam.Acp.Adapter do
     end
   end
 
-  # Claude ACP 0.59.0 advertises aliases (sonnet, opus[1m], haiku) in a fork
-  # even when Tightbeam's catalog names the canonical vendor model. A canonical
-  # value can receive a success-shaped set response while the fork remains on
-  # its old model. Resolve only through the fork's offered values, then require
-  # the response to read that exact value back before the caller may project
-  # the requested canonical identity into the database.
+  # Claude's alias vocabulary changes meaning across adapter releases. The
+  # canonical model is therefore always the first candidate; offered aliases
+  # are fallback candidates only. Neither a successful RPC nor the static alias
+  # table proves what ran. Only the public config readback -- currentValue plus
+  # the selected option's init-derived name/description -- may confirm the
+  # requested canonical identity before the caller projects it into the DB.
   defp apply_fork_model(state, sid, %Model{} = model, offered, request_timeout) do
-    with {:ok, value} <- offered_model_value(state.preset, offered, model),
-         {:ok, model_result} <-
-           map_switch_model_refusal(
-             Conn.request(
-               state.conn,
-               "session/set_config_option",
-               %{sessionId: sid, configId: "model", value: value},
-               timeout: request_timeout
-             )
-           ),
-         true <- read_back?(model_result, "model", value),
+    with {:ok, model_result} <-
+           apply_fork_model_candidates(state, sid, model, offered, request_timeout),
          {:ok, _verified_result} <-
            apply_verified_effort(state, sid, model.effort, model_result, request_timeout) do
       {:ok, model}
-    else
-      false -> {:error, :model_verification_failed}
-      {:error, _reason} = error -> error
+    end
+  end
+
+  defp apply_fork_model_candidates(state, sid, model, offered, request_timeout) do
+    state.preset
+    |> model_value_candidates(offered, model)
+    |> try_fork_model_candidates(state, sid, model, request_timeout)
+  end
+
+  defp try_fork_model_candidates([], _state, _sid, _model, _request_timeout),
+    do: {:error, :model_unavailable}
+
+  defp try_fork_model_candidates(
+         [value | remaining],
+         state,
+         sid,
+         model,
+         request_timeout
+       ) do
+    result =
+      map_switch_model_refusal(
+        Conn.request(
+          state.conn,
+          "session/set_config_option",
+          %{sessionId: sid, configId: "model", value: value},
+          timeout: request_timeout
+        )
+      )
+
+    case result do
+      {:ok, model_result} ->
+        if readback_confirms_model?(model_result, state.preset, model) do
+          {:ok, model_result}
+        else
+          try_fork_model_candidates(remaining, state, sid, model, request_timeout)
+        end
+
+      {:error, :model_unavailable} ->
+        try_fork_model_candidates(remaining, state, sid, model, request_timeout)
+
+      {:error, _reason} = error ->
+        error
     end
   end
 
@@ -1154,7 +1184,7 @@ defmodule Tightbeam.Acp.Adapter do
 
     case Map.fetch(state.models, sid) do
       {:ok, %Model{} = cached} ->
-        if config_confirms_model?(options, state.preset, cached) do
+        if readback_confirms_model?(%{"configOptions" => options}, state.preset, cached) do
           remember_confirmed_config_model(state, sid, cached, options)
         else
           remember_reported_config_model(state, sid, options)
@@ -1190,26 +1220,57 @@ defmodule Tightbeam.Acp.Adapter do
     end
   end
 
-  defp offered_model_value(preset, result, %Model{} = model) do
-    values = model_option_values(result)
+  defp model_value_candidates(preset, result, %Model{} = model) do
     canonical_ref = Model.to_ref(model)
 
-    case Enum.find(values, fn value ->
-           value == canonical_ref or canonical_option_ref(preset, value) == canonical_ref
-         end) do
-      nil -> {:error, :model_unavailable}
-      value -> {:ok, value}
-    end
+    aliases =
+      result
+      |> model_option_values()
+      |> Enum.filter(&(Map.get(preset.model_option_aliases, &1) == canonical_ref))
+
+    Enum.uniq([canonical_ref | aliases])
   end
 
   defp canonical_offered_models(preset, result) do
     result
-    |> model_option_values()
-    |> Enum.map(&canonical_option_ref(preset, &1))
-    |> Enum.reject(&is_nil/1)
+    |> model_option_entries()
+    |> Enum.flat_map(&confirmed_option_models(preset, &1))
     |> Enum.uniq()
-    |> Enum.map(&Model.parse_ref/1)
   end
+
+  defp confirmed_option_models(preset, option) do
+    public_model = public_option_model(preset, option)
+
+    mapped_candidates =
+      case Map.get(preset.model_option_aliases, option["value"]) do
+        value when is_binary(value) -> [Model.parse_ref(value)]
+        _ -> []
+      end
+
+    confirmed_candidates =
+      Enum.filter(mapped_candidates, &public_option_confirms_model?(option, public_model, &1))
+
+    case {confirmed_candidates, public_model} do
+      {[], %Model{} = model} -> [model]
+      {models, _} -> models
+    end
+  end
+
+  defp model_option_entries(%{"configOptions" => options}) when is_list(options) do
+    case Enum.find(options, &((&1["id"] || &1["configId"]) == "model")) do
+      %{"options" => values} when is_list(values) ->
+        Enum.flat_map(values, fn
+          %{"value" => value} = option when is_binary(value) -> [option]
+          value when is_binary(value) -> [%{"value" => value, "name" => value}]
+          _ -> []
+        end)
+
+      _ ->
+        []
+    end
+  end
+
+  defp model_option_entries(_result), do: []
 
   defp model_option_values(%{"configOptions" => options}) when is_list(options) do
     case Enum.find(options, &((&1["id"] || &1["configId"]) == "model")) do
@@ -1227,21 +1288,81 @@ defmodule Tightbeam.Acp.Adapter do
 
   defp model_option_values(_result), do: []
 
-  defp canonical_option_ref(_preset, "default"), do: nil
-
-  defp canonical_option_ref(preset, value) when is_binary(value) do
-    case Map.fetch(preset.model_option_aliases, value) do
-      {:ok, canonical} ->
-        canonical
-
-      :error ->
-        if Enum.any?(preset.canonical_model_prefixes, &String.starts_with?(value, &1)),
-          do: value,
-          else: nil
+  defp readback_confirms_model?(result, preset, %Model{} = model) do
+    with %{} = config <- model_config_option(result),
+         value when is_binary(value) <- config["currentValue"] || config["value"],
+         %{} = option <- selected_model_option(config, value),
+         %Model{} = public_model <- public_option_model(preset, option) do
+      public_option_confirms_model?(option, public_model, model)
+    else
+      _ -> false
     end
   end
 
-  defp canonical_option_ref(_preset, _value), do: nil
+  defp model_config_option(%{"configOptions" => options}) when is_list(options),
+    do: Enum.find(options, &((&1["id"] || &1["configId"]) == "model"))
+
+  defp model_config_option(_result), do: nil
+
+  defp selected_model_option(config, value) do
+    config
+    |> Map.get("options", [])
+    |> Enum.flat_map(fn
+      %{"options" => nested} when is_list(nested) -> nested
+      option -> [option]
+    end)
+    |> Enum.find_value(fn
+      %{"value" => ^value} = option -> option
+      ^value -> %{"value" => value, "name" => value}
+      _ -> nil
+    end)
+    |> case do
+      nil -> %{"value" => value, "name" => value}
+      option -> option
+    end
+  end
+
+  defp public_option_model(preset, %{"value" => value} = option) when is_binary(value) do
+    if Enum.any?(preset.canonical_model_prefixes, &String.starts_with?(value, &1)) do
+      Model.parse_ref(value)
+    else
+      public_model_from_label(option)
+    end
+  end
+
+  defp public_option_model(_preset, _option), do: nil
+
+  defp public_model_from_label(option) do
+    label = Enum.join([option["name"], option["description"]], " ")
+
+    case Regex.run(~r/\b(opus|sonnet|haiku|fable)\s+(\d+)(?:[. -](\d+))?/i, label) do
+      [_, family, major, minor] when minor not in [nil, ""] ->
+        Model.new("claude-#{String.downcase(family)}-#{major}-#{minor}")
+
+      [_, family, major | _] ->
+        Model.new("claude-#{String.downcase(family)}-#{major}")
+
+      _ ->
+        nil
+    end
+  end
+
+  defp public_option_confirms_model?(_option, nil, _requested), do: false
+
+  defp public_option_confirms_model?(option, %Model{} = public, %Model{} = requested) do
+    public.family == requested.family and
+      context_confirmed?(option, public.context, requested.context)
+  end
+
+  defp context_confirmed?(_option, context, context), do: true
+  defp context_confirmed?(_option, _public_context, nil), do: true
+
+  defp context_confirmed?(option, _public_context, requested_context) do
+    option
+    |> then(&Enum.join([&1["value"], &1["name"], &1["description"]], " "))
+    |> String.downcase()
+    |> String.contains?(String.downcase(requested_context))
+  end
 
   defp remember_reported_config_model(state, sid, options) do
     case model_ref_from_config(%{"configOptions" => options}, state.preset.effort_config) do
@@ -1259,17 +1380,6 @@ defmodule Tightbeam.Acp.Adapter do
       end
 
     put_in(state.models[sid], model)
-  end
-
-  defp config_confirms_model?(options, preset, %Model{} = model) do
-    case config_value(options, "model") do
-      value when is_binary(value) ->
-        value == Model.to_ref(model) or
-          canonical_option_ref(preset, value) == Model.to_ref(model)
-
-      _ ->
-        false
-    end
   end
 
   defp model_ref_from_config(%{"configOptions" => options}, effort_id)
