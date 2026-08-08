@@ -147,12 +147,26 @@ defmodule Tightbeam.GatewayTest do
       {:reply, {:ok, "harness-1"}, parent}
     end
 
+    def handle_call(
+          {:new_session, model, cwd, mcp_servers, guidance, _request_timeout},
+          from,
+          parent
+        ),
+        do: handle_call({:new_session, model, cwd, mcp_servers, guidance}, from, parent)
+
     def handle_call(:conn, _from, parent), do: {:reply, parent, parent}
 
     def handle_call({:knows_session?, _sid}, _from, parent), do: {:reply, false, parent}
 
     def handle_call({:load_session, _sid, _model, _cwd, _mcp_servers, _guidance}, _from, parent),
       do: {:reply, {:error, %{"code" => -32602, "message" => "Invalid params"}}, parent}
+
+    def handle_call(
+          {:load_session, sid, model, cwd, mcp_servers, guidance, _request_timeout},
+          from,
+          parent
+        ),
+        do: handle_call({:load_session, sid, model, cwd, mcp_servers, guidance}, from, parent)
 
     def handle_call({:close_session, sid}, _from, parent) do
       send(parent, {:close_session, sid})
@@ -363,6 +377,13 @@ defmodule Tightbeam.GatewayTest do
       {:reply, {:ok, model}, parent}
     end
 
+    def handle_call(
+          {:load_session, sid, model, cwd, mcp, guidance, _request_timeout},
+          from,
+          parent
+        ),
+        do: handle_call({:load_session, sid, model, cwd, mcp, guidance}, from, parent)
+
     def handle_call({:new_session, _model, _cwd, _mcp, _guidance}, _from, parent) do
       send(parent, :unexpected_load_apply_new_session)
       {:reply, {:ok, "unexpected"}, parent}
@@ -385,12 +406,26 @@ defmodule Tightbeam.GatewayTest do
       {:reply, {:ok, "default-session"}, parent}
     end
 
+    def handle_call(
+          {:new_session, model, cwd, mcp, guidance, _request_timeout},
+          from,
+          parent
+        ),
+        do: handle_call({:new_session, model, cwd, mcp, guidance}, from, parent)
+
     def handle_call({:knows_session?, _sid}, _from, parent), do: {:reply, false, parent}
 
     def handle_call({:load_session, sid, model, _cwd, _mcp, _guidance}, _from, parent) do
       send(parent, {:unknown_load_lost, sid, model})
       {:reply, {:error, :session_lost}, parent}
     end
+
+    def handle_call(
+          {:load_session, sid, model, cwd, mcp, guidance, _request_timeout},
+          from,
+          parent
+        ),
+        do: handle_call({:load_session, sid, model, cwd, mcp, guidance}, from, parent)
 
     def handle_call({:current_model, "default-session"}, _from, parent) do
       send(parent, :default_model_captured)

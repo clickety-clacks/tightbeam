@@ -70,11 +70,28 @@ defmodule Tightbeam.AttentionTierTest do
 
     def handle_call({:apply_model, _sid, _model}, _from, state), do: {:reply, :ok, state}
 
+    def handle_call({:apply_model, sid, model, _request_timeout}, from, state),
+      do: handle_call({:apply_model, sid, model}, from, state)
+
     def handle_call({:load_session, _sid, model, _cwd, _mcp, _guidance}, _from, state),
       do: {:reply, {:ok, model}, state}
 
+    def handle_call(
+          {:load_session, sid, model, cwd, mcp, guidance, _request_timeout},
+          from,
+          state
+        ),
+        do: handle_call({:load_session, sid, model, cwd, mcp, guidance}, from, state)
+
     def handle_call({:new_session, _model, _cwd, _mcp, _guidance}, _from, state),
       do: {:reply, {:ok, "harness-session"}, state}
+
+    def handle_call(
+          {:new_session, model, cwd, mcp, guidance, _request_timeout},
+          from,
+          state
+        ),
+        do: handle_call({:new_session, model, cwd, mcp, guidance}, from, state)
 
     def handle_call(:conn, _from, state), do: {:reply, self(), state}
     def handle_call({:close_session, _sid}, _from, state), do: {:reply, :ok, state}
