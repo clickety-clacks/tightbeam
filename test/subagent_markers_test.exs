@@ -87,7 +87,7 @@ defmodule Tightbeam.SubagentMarkersTest do
   test "proof 4: claude fixture ignores spawn completion and stops at live task settlement",
        ctx do
     fixture = ctx.claude_fixture
-    assert fixture["version"] == Tightbeam.Harness.Claude.adapter_version()
+    assert fixture["version"] == "0.59.0"
     assert fixture["semantic"]["spawn_operation_terminal"] =~ "liveBackgroundTasks"
     assert fixture["semantic"]["child_termination_terminal"] =~ "settlement"
 

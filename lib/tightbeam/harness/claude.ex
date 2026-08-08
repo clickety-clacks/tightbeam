@@ -7,7 +7,7 @@ defmodule Tightbeam.Harness.Claude do
 
   require Logger
 
-  @adapter_version "0.59.0"
+  @adapter_version "0.66.0"
   @adapter_package "claude-agent-acp"
   @adapter_bundle "acp-agent.js"
   @warm_timeout_ms 30_000
@@ -96,6 +96,13 @@ defmodule Tightbeam.Harness.Claude do
   # default-pin vocabulary, not the grant; the operator's own picker offered
   # Opus 5 all along). Same lesson, second occurrence: re-probe from a second
   # vantage before trusting any row here, in either direction.
+  # UPGRADED 2026-08-08 on gibson to claude-agent-acp 0.66.0 / SDK 0.3.220.
+  # Its public picker still exposes aliases, but their meaning changed: opus[1m]
+  # now identifies Opus 5. Tightbeam therefore tries a requested canonical id
+  # first and treats this table only as fallback candidates. The selected
+  # configOption's public currentValue plus init-derived name/description is the
+  # switch-time authority; a real next-turn modelUsage probe is the release gate.
+
   @adapter_selectable_models ~w(default sonnet opus haiku fable claude-sonnet-5
                                 claude-opus-4-8 claude-haiku-4-5-20251001 claude-fable-5
                                 claude-opus-5)
@@ -245,6 +252,10 @@ defmodule Tightbeam.Harness.Claude do
       if Map.get(session, :identity) == true and not String.starts_with?(guidance, prefix),
         do: prefix <> "\n\n" <> guidance,
         else: guidance
+
+    # Candidate vocabulary only. Adapter readback, never this static map,
+    # decides which canonical model an alias means in the running version.
+    # Keeping the 0.59 mappings here preserves fallback on old satellites.
 
     %{
       guidance: guidance,

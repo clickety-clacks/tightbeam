@@ -169,7 +169,7 @@ defmodule Tightbeam.HarnessSeamTest do
                       claude-opus-4-6 claude-opus-4-5-20251101 claude-sonnet-4-5-20250929
                       claude-opus-4-1-20250805) do
       refute refused in selectable,
-             "#{refused} is refused by claude-agent-acp 0.59.0 and must not be listed " <>
+             "#{refused} is refused by claude-agent-acp 0.66.0 and must not be listed " <>
                "as selectable; if a newer adapter accepts it, re-probe and update the " <>
                "note in claude.ex together with the version stamp"
     end
@@ -178,6 +178,7 @@ defmodule Tightbeam.HarnessSeamTest do
     source = File.read!(Path.join(File.cwd!(), "lib/tightbeam/harness/claude.ex"))
     assert source =~ "claude CLI 2.1.220"
     assert source =~ "claude-agent-acp 0.59.0"
+    assert source =~ ~s(@adapter_version "0.66.0")
     assert source =~ "silent downgrade"
 
     # The codex half is PROBED now, and kind-scoped: the 2026-07-28 api-key
