@@ -1004,6 +1004,11 @@ defmodule Tightbeam.HarnessProcess do
   defp identity_wait_ms,
     do: Application.get_env(:tightbeam, :harness_process_identity_wait_ms, @command_timeout_ms)
 
+  # An unbounded wait has no deadline to compute. `await_identity/2` already
+  # matches `:infinity` as its own clause; adding it to a timestamp raised
+  # ArithmeticError before that clause could ever be reached, so every adapter
+  # boot died in `capture_identity/3`.
+  defp deadline(:infinity), do: :infinity
   defp deadline(timeout_ms), do: System.monotonic_time(:millisecond) + timeout_ms
   defp now, do: System.system_time(:millisecond)
   defp one_line(value), do: value |> String.trim() |> String.replace(~r/\s+/, " ")

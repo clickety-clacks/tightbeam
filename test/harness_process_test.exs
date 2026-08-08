@@ -248,6 +248,31 @@ defmodule Tightbeam.HarnessProcessTest do
     assert HarnessProcess.list(ctx.db) == [resolved]
   end
 
+  # The adapter boot path captures identity with `:infinity` — an unbounded wait
+  # is the whole point of the no-duration backstop. Computing a deadline from it
+  # raised ArithmeticError, so EVERY adapter boot died before the `:infinity`
+  # clause of `await_identity/2` could match. Unit tests all passed over a build
+  # that could not start a single adapter; this is the one that fails first.
+  test "identity capture accepts an unbounded wait", ctx do
+    opts =
+      HarnessProcess.prepare_launch(
+        [
+          cmd: [System.find_executable("false")],
+          stderr_path: Path.join(ctx.test_dir, "unbounded-capture.stderr"),
+          process_helper: @helper
+        ],
+        ctx.db,
+        {:claude, "shared", "testhost"}
+      )
+
+    launch_id = Keyword.fetch!(opts, :harness_process_launch_id)
+    [row] = HarnessProcess.list(ctx.db)
+    # See the forged-pgid note above: 999999123 is unallocatable by construction.
+    File.write!(row.identity_path, "999999123\t999999123\tboot-marker\t#{launch_id}\n")
+
+    assert :ok = HarnessProcess.capture_identity(ctx.db, launch_id, :infinity)
+  end
+
   test "kill delivery failure remains fenced and the reconcile sweep retries it", ctx do
     {_port, row} = launch_stubborn(ctx, {:claude, "shared", "testhost"})
     assert {:ok, fenced} = HarnessProcess.begin_park(ctx.db, {:claude, "shared", "testhost"})
