@@ -3,8 +3,10 @@
 Status: implementation authority for `wi_6435c199-16aa-480e-8381-4c471e2ed35a`.
 This revision supersedes commits `f031a51e84579d23daa25aea201974b9be007847`,
 `413ea350d54375912e0b97ab3cbb794d215badfa`, and
-`4cef7773c1bafd9339cf5f23a8881dccca16b42f`, plus their authority addenda, where
-they conflict.
+`4cef7773c1bafd9339cf5f23a8881dccca16b42f`, plus consolidated commit
+`057a4940d468e82ddd8e09e75175a1fbf6dd26a4` and their authority addenda, where
+they conflict. This revision removes assumptions about lifecycle mechanisms that the
+repository does not contain.
 
 ## Spirit
 
@@ -52,7 +54,10 @@ Success has four observable outcomes:
 7. A failure never claims that the prior runtime remains active after an in-place change
    may have reached the harness.
 8. Fast uses the live option advertised by the resident adapter and has no stored intent.
-9. Every managed-runtime cleanup failure leaves cause and principal in a durable row.
+9. A possible unverified model mutation makes the stored projection durably non-authoritative
+   before another turn, status response, or tune can use it.
+10. Every managed-runtime cleanup attempt has one durable owner, cause, principal, deadline,
+    and retry identity before Tightbeam can lose the runtime reference.
 
 ## Terms
 
@@ -62,8 +67,13 @@ Success has four observable outcomes:
   reported by the resident harness.
 - **Stored projection**: Tightbeam's database fields that describe verified runtime
   state.
+- **Runtime verification state**: the durable `verified`, `mutating`, or `unknown` marker,
+  cause, principal, and update time that state whether the stored model projection is
+  authoritative and why it changed.
 - **Candidate runtime**: a destination harness session prepared before a cross-harness
   swap.
+- **Cleanup obligation**: a durable record that owns closure of one candidate or superseded
+  harness session until closure is verified or operator action is required.
 - **Control fence**: the existing per-session lane boundary while a tune operation
   checks queued work and mutates runtime state.
 - **Eligible catalog snapshot**: a prior live catalog result for the same host, harness,
@@ -72,12 +82,11 @@ Success has four observable outcomes:
 ## Assumptions
 
 1. The same-harness switch or fork path can return exact live model and effort readback.
-2. The managed replacement seam can own and close both accepted and rejected
-   cross-harness candidates.
+2. A candidate session id is available after successful external creation, and a source
+   session id is known before the database swaps the current pointer.
 3. The gateway can report a verified runtime value when a later projection commit fails.
-4. Claude Agent ACP 0.66.0 advertises Fast as `fast`, and Codex ACP 1.1.4 advertises Fast
-   as `fast-mode`, when the account and model support it. Both accept the live-advertised
-   values that correspond to `on` and `off`.
+4. Each resident adapter can identify a live-advertised Fast option and map its advertised
+   values to Tightbeam `on` and `off` without a fixed harness-name table in the gateway.
 5. The session lane can hold a control fence while it inspects durable queued work.
 
 If code or live smoke disproves an assumption, the producer pauses and files the exact
@@ -89,12 +98,14 @@ evidence. The producer does not invent a second lifecycle, queue, or rollback me
 
 - Keep the native gateway `tune` verb. Deleting it loses the supported operator surface;
   accepting client-only control would split authority.
-- Add no rollback engine. Context preservation requires in-place writes, so named actual
-  or unknown runtime state is smaller and more honest.
+- Add no rollback engine. Context preservation requires in-place writes, so one durable
+  verification marker and exact recovery are smaller and more honest. Deleting in-place
+  changes loses same-harness context; accepting an old stored projection would lie.
 - Use the existing session lane for ordering. Deleting queued-work protection lets tune
   jump ahead of filed work; accepting that race violates the session contract.
-- Use the existing managed replacement owner for cleanup. A second lifecycle mechanism
-  would duplicate ownership; silent cleanup failure would lose observability.
+- Add one durable cleanup-obligation seam because no existing component owns candidate or
+  superseded harness sessions. Deleting cross-harness replacement misses the requested
+  harness outcome; accepting an unmanaged leak violates reliability and observability.
 - Translate only a live-advertised Fast option at the adapter boundary. Deleting Fast
   misses the requested outcome; accepting one fixed id lies on the other harness.
 
@@ -174,23 +185,45 @@ The gateway resolves the request against the target host and resident harness. A
 attempt is permitted only from an eligible catalog snapshot. Live apply and readback still
 decide the outcome.
 
+Before the first external write, one database transaction changes the session's runtime
+verification state from `verified` to `mutating`. A gateway or adapter restart treats a
+persisted `mutating` value as `unknown`; process memory is never the marker. If the harness
+refuses before any field can change, the gateway restores `verified` without changing the
+stored projection.
+
+The session row stores `runtimeConfigState`, `runtimeConfigCause`,
+`runtimeConfigPrincipal`, and `runtimeConfigUpdatedAt`. Existing rows migrate to
+`verified`. Every state transition writes all four fields together. The cause identifies
+the tune operation or recovery attempt. The principal identifies the authorized caller or
+the startup reconciler.
+
 The adapter applies the model fields through the existing context-preserving path and then
-reads the complete runtime configuration. If readback exactly matches, the gateway commits
-the stored projection. If a field applied but the verified configuration differs from the
-request, the gateway reconciles the projection to the verified configuration and returns
-nonzero `runtime_config_mismatch` with those values. It does not claim the prior runtime.
-If that reconciliation commit fails, it returns `runtime_projection_failed` with the
-verified active configuration.
+reads the complete runtime configuration. If readback exactly matches, one transaction
+commits the stored projection and `verified`. If a field applied but the verified
+configuration differs from the request, that transaction reconciles the projection to the
+verified configuration and marks it `verified`; the command returns nonzero
+`runtime_config_mismatch` with those values. It does not claim the prior runtime. If that
+reconciliation transaction fails, the durable state remains `unknown` and the command
+returns `runtime_projection_failed` with the verified active configuration.
 
 If exact readback fails after mutation may have started, the gateway returns nonzero
-`runtime_config_unknown`. It marks the resident projection stale through the existing
-residency mechanism. The next status or tune operation must read the live runtime before
-it reports or changes it.
+`runtime_config_unknown`. It durably changes `mutating` to `unknown`. The stored model,
+context, effort, and provider fields remain historical values and no response presents them
+as active.
+
+A turn, status request, or later tune that sees `mutating` or `unknown` enters recovery
+before it pushes stored model fields or reports them. Recovery loads the existing harness
+session without applying the stored projection, reads the complete live configuration, and
+commits the verified actual projection plus `verified`. If exact recovery readback is not
+available, status reports `runtimeConfigStatus: "unknown"` with actual model fields `null`,
+and a turn or tune refuses with `runtime_config_unknown`. Restart cannot reassert the stale
+stored projection.
 
 If exact readback succeeds but the projection commit fails, the gateway returns nonzero
 `runtime_projection_failed`. It includes the verified active configuration and
-`projectionCommitted: false`. Repeating the request reads the runtime and retries the
-projection commit. Tightbeam adds no automatic rollback.
+`projectionCommitted: false`, while the durable verification state remains non-authoritative
+as `mutating` or `unknown`. Both values enter the same recovery path. Repeating the request
+runs recovery and retries the projection commit. Tightbeam adds no automatic rollback.
 
 An idempotent same-harness request first reads the runtime. If it already matches, the
 gateway reconciles a stale stored projection if necessary and returns success with
@@ -199,20 +232,48 @@ gateway reconciles a stale stored projection if necessary and returns success wi
 ### Harness replacement
 
 The gateway validates the destination credential, host readiness, harness, model, context,
-and effort before it changes the session row or history barrier. It creates the candidate
-through the existing managed replacement seam, applies the requested fields, and verifies
-the complete live readback. Only then does one database transaction change the harness,
-provider, model fields, pointer, visible-history barrier, and swap tombstone.
+and effort before it changes the session row or history barrier. Before external candidate
+creation, it inserts one cleanup obligation in `creating` state with the operation id,
+target session key, destination harness and host, caller principal, cause, creation time,
+and a 24-hour deadline. The external session id starts as null. The gateway creates the
+candidate, immediately stores its returned session id, applies the requested fields, and
+verifies the complete live readback. Only then does one database transaction change the
+harness, provider, model fields, runtime verification state, pointer, visible-history
+barrier, and swap tombstone, and marks the candidate obligation `adopted`.
+
+If the process stops after external creation but before it records the returned session id,
+startup reconciliation changes the `creating` obligation to `unidentified` and requires
+operator action. It never retries candidate creation from that row. This named state accepts
+the external atomicity limit without pretending that Tightbeam can close an unidentified
+runtime.
 
 A pre-commit failure keeps the source runtime active and requests candidate teardown. The
 gateway verifies teardown. If teardown cannot be verified, it returns
-`destination_cleanup_failed`, reports the source as active, and leaves the candidate with
-the existing lifecycle owner and a durable cause/principal marker.
+`destination_cleanup_failed`, reports the source as active, and leaves the candidate
+obligation `pending`.
 
-After a successful commit, the destination runtime is active. The managed replacement seam
-closes the superseded source runtime and verifies closure. If closure cannot be verified,
-the command returns nonzero `source_cleanup_failed`, reports the destination as active, and
-leaves the source with that same lifecycle owner and a durable cause/principal marker.
+After a successful commit, the destination runtime is active. That same transaction inserts
+the superseded source's `pending` cleanup obligation with its known session id. Tightbeam
+then closes the source and verifies closure. If closure cannot be verified, the command
+returns nonzero `source_cleanup_failed`, reports the destination as active, and leaves the
+source obligation pending.
+
+One supervised runtime-cleanup worker owns pending obligations after the command returns and
+after restart. It retries immediately, then after 1 minute, 5 minutes, 30 minutes, and hourly
+until the 24-hour deadline. The row stores the attempt count, next attempt, last error, and
+updated time. At the deadline it becomes `manual_required`; Tightbeam does not delete it.
+An active-row uniqueness constraint on the harness session id deduplicates retries. Before
+each close, the worker checks the current pointer in the same claim transaction. It marks a
+runtime that became current as `adopted` and never closes it. A successful close marks the
+row `closed` and records the verification time. Session status exposes pending,
+unidentified, and manual-required obligations without raw harness errors.
+
+The cleanup table stores `id`, `operationId`, `targetSessionKey`, `kind`, `harness`, `host`,
+nullable `harnessSessionId`, `state`, `principal`, `cause`, `deadlineAt`, `attemptCount`,
+`nextAttemptAt`, `lastError`, `createdAt`, and `updatedAt`. `kind` is `candidate` or
+`superseded_source`. `state` is `creating`, `pending`, `adopted`, `closed`, `unidentified`,
+or `manual_required`. Session status returns `runtimeCleanup.obligations` with only each
+obligation's id, kind, state, deadline, next attempt, and attempt count.
 
 On success, the session key and all substrate relationships remain unchanged. The visible
 chat resets at the tombstone because the destination engine has a new private context.
@@ -232,8 +293,9 @@ or `fastStatus: "unknown"` with `fast: null` when live readback is unavailable. 
 harness change makes no retention promise and reports the live value it can verify.
 
 If readback fails after the Fast write may have started, the gateway returns
-`runtime_config_unknown` and does not claim the prior Fast value. Fast has no stored
-projection commit. A verified live value that differs from the request returns
+`runtime_config_unknown` with `runtimeControl: "fast"` and does not claim the prior Fast
+value. This does not change the durable model verification state because Fast has no stored
+projection. A verified live value that differs from the request returns
 `runtime_config_mismatch` with that value.
 
 ### Result
@@ -243,6 +305,7 @@ Success exits zero and prints one JSON object built from verified state:
 ```json
 {
   "ok": true,
+  "runtimeControl": "model",
   "sessionKey": "agent:coder:auth s_1234",
   "harness": "codex",
   "model": "gpt-5.6-sol",
@@ -252,6 +315,7 @@ Success exits zero and prints one JSON object built from verified state:
   "fastStatus": "known",
   "fastPersistence": "ephemeral",
   "projectionCommitted": true,
+  "runtimeConfigStatus": "verified",
   "engineContext": "preserved"
 }
 ```
@@ -260,7 +324,10 @@ Success exits zero and prints one JSON object built from verified state:
 `reset` for a cross-harness change. Failure JSON includes verified actual fields whenever
 they are known. `fastPersistence` is always `ephemeral`. `projectionCommitted` is `true`
 for model or harness success and `null` for Fast, which has no stored projection. The
-response never echoes an unverified requested value as actual state.
+response includes `runtimeConfigStatus: "verified"|"unknown"` for model and harness
+operations. `runtimeControl` is `model`, `harness`, or `fast`, so control-specific nulls are
+unambiguous. Cleanup failures also include `cleanupObligationId`. The response never echoes
+an unverified requested value as actual state.
 
 ### Stable refusals
 
@@ -278,11 +345,12 @@ runtime is active may make that claim.
 - `model_apply_failed`: the harness refused before any runtime field could change.
 - `fast_unsupported`: the resident adapter did not expose an advertised Fast control.
 - `runtime_config_mismatch`: verified active fields differ from the request.
-- `runtime_config_unknown`: mutation may have occurred and exact live state is unavailable.
+- `runtime_config_unknown`: mutation may have occurred and exact live state is unavailable;
+  the response identifies `model` or `fast` as the affected control.
 - `runtime_projection_failed`: verified runtime is active, but its stored projection failed.
 - `session_config_commit_failed`: a staged cross-harness commit failed; source stays active.
-- `destination_cleanup_failed`: source stays active; rejected candidate cleanup is pending.
-- `source_cleanup_failed`: destination is active; superseded source cleanup is pending.
+- `destination_cleanup_failed`: source stays active; the named candidate obligation is pending.
+- `source_cleanup_failed`: destination is active; the named source obligation is pending.
 
 Harness errors become one concise operator sentence. Raw Elixir terms, ACP payload dumps,
 and inferred fallback models never reach the user.
@@ -293,10 +361,12 @@ The CLI adds one `Tune` command and sends the existing `tune` gateway verb with 
 `set_harness`, `set_model`, `set_reasoning`, or `set_fast_mode`. It does not call the
 client-only `/api/session-control` facade.
 
-The gateway uses the existing session lane and managed replacement seam. The adapter adds
-one normalized, verified live-config operation for options the harness advertises. It
-normalizes current Claude `fast` and Codex `fast-mode` at the adapter boundary. No gateway
-Fast table and no parallel runtime lifecycle mechanism are added.
+The gateway uses the existing session lane. The session row gains one runtime verification
+state. One cleanup-obligation table and one supervised cleanup worker own candidate and
+superseded harness sessions; no other component may retry those closes. The adapter adds one
+normalized, verified live-config operation for options the harness advertises. It
+normalizes the observed Claude `fast` and Codex `fast-mode` options at the adapter boundary.
+No gateway Fast table or global resolver is added.
 
 Session status and tune use the same live runtime readback. The CLI, Clawline, and future
 clients do not maintain separate capability guesses. This slice applies the unified model
@@ -327,23 +397,28 @@ resolution ruling only at the seams it touches.
 1. Exact model and effort readback commits the exact family, context, effort, and provider.
 2. A partial in-place apply returns verified actual state as `runtime_config_mismatch` or
    returns `runtime_config_unknown`; it never claims the prior state.
-3. A projection failure returns `runtime_projection_failed` with actual values. A repeated
+3. A kill at each boundary from durable `mutating` through readback and projection commit
+   proves restart reports or recovers `unknown` without reapplying stored model fields.
+4. A projection failure returns `runtime_projection_failed` with actual values. A repeated
    request reconciles the projection without another pointer.
-4. A stale catalog attempt requires every eligible-snapshot field. A missing or mismatched
+5. A stale catalog attempt requires every eligible-snapshot field. A missing or mismatched
    field returns `catalog_unavailable` before mutation.
-5. A same-harness `--harness` refuses without a pointer, barrier, or tombstone.
-6. A cross-harness switch verifies a destination before one transaction commits runtime,
+6. A same-harness `--harness` refuses without a pointer, barrier, or tombstone.
+7. A cross-harness switch verifies a destination before one transaction commits runtime,
    pointer, barrier, and tombstone fields.
-7. Candidate teardown failure returns `destination_cleanup_failed` with a managed cleanup
-   marker. Superseded source teardown failure returns `source_cleanup_failed` with the new
-   runtime reported active and the same marker form.
-8. A successful cross-harness switch keeps the session key, roles, assignments, work-item
+8. Candidate teardown failure returns `destination_cleanup_failed` with one durable
+   obligation. Superseded source teardown failure returns `source_cleanup_failed` with the
+   new runtime reported active and one durable obligation.
+9. Restart, retry, dedupe, current-pointer fencing, deadline expiry, and an interrupted
+   candidate-id write produce the specified cleanup states without closing a current runtime.
+10. A successful cross-harness switch keeps the session key, roles, assignments, work-item
    links, spawn lineage, workdir, identity revision, and overrides.
 
 ### Fast
 
-1. Captured real Claude Agent ACP 0.66.0 and Codex ACP 1.1.4 responses prove each normalized
-   option id, option type, and accepted values.
+1. Captured real Claude and Codex responses prove each normalized option id, option type,
+   and accepted value. Each fixture records the actual harness CLI version, adapter package
+   and version, ACP SDK or protocol version, host, and capture time.
 2. Fast on and off use the live advertised option and require exact readback.
 3. A missing option returns `fast_unsupported` without a guessed config id.
 4. Failed readback after a possible write returns `runtime_config_unknown`.
@@ -354,7 +429,8 @@ resolution ruling only at the seams it touches.
 ### Reality gate
 
 Before merge, run the feature-smoke matrix against fresh Claude and Codex sessions with the
-installed adapter versions. Capture the real config responses as fixtures. Prove
+installed harness CLI, adapter package, and ACP SDK or protocol versions recorded in each
+fixture. Capture the real config responses as fixtures. Prove
 same-harness model and effort continuity on both harnesses. Prove Fast on and off on each
 advertising harness. Prove both cross-harness directions preserve the Tightbeam session key
 and work relationships while resetting only engine context. Prove the next real turn runs
