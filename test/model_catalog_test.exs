@@ -390,7 +390,7 @@ defmodule Tightbeam.ModelCatalogTest do
     end
   end
 
-  test "routing carries fresh, stale, and unavailable health", ctx do
+  test "routing serves populated stale inventories and refuses unavailable ones", ctx do
     clock =
       start_supervised!(%{id: unique_name(:clock), start: {Agent, :start_link, [fn -> 0 end]}})
 
@@ -417,7 +417,8 @@ defmodule Tightbeam.ModelCatalogTest do
 
     opus_high = Model.new("claude-opus-5", effort: "high")
 
-    assert {:ok, %{harness: "claude"}} = ModelCatalog.route(@host, "claude", opus_high, catalog)
+    assert {:ok, %{harness: "claude", health: :fresh}} =
+             ModelCatalog.route(@host, "claude", opus_high, catalog)
 
     assert {:error, %Unroutable{cause: :family_absent, health: [{"claude", :fresh}]}} =
              ModelCatalog.route(@host, "claude", Model.new("absent"), catalog)
@@ -425,13 +426,19 @@ defmodule Tightbeam.ModelCatalogTest do
     Agent.update(clock, fn _ -> 11 end)
     Agent.update(failures, fn _ -> true end)
 
-    # ONLY A FRESH INVENTORY CAN ROUTE. A stale one is not evidence that a model
-    # is absent — it is evidence of nothing — so the same selection that routed a
-    # moment ago is now refused, and the refusal blames the CATALOG, not the model.
-    assert {:error, %Unroutable{cause: :no_catalog, health: [{"claude", :stale}]}} =
+    await(fn -> ModelCatalog.get(@host, "claude", catalog) |> elem(1) == :stale end)
+
+    assert {:ok, %{harness: "claude", health: :stale}} =
              ModelCatalog.route(@host, "claude", opus_high, catalog)
 
-    await(fn -> ModelCatalog.get(@host, "claude", catalog) |> elem(1) == :stale end)
+    assert {:error,
+            %Unroutable{
+              cause: :family_absent,
+              health: [{"claude", :stale}],
+              offered: offered
+            }} = ModelCatalog.route(@host, "claude", Model.new("absent"), catalog)
+
+    assert Enum.any?(offered, &match?(%{entry: %{family: "claude-opus-5"}}, &1))
 
     missing = unique_name(:missing_catalog)
 

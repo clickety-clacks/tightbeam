@@ -1694,6 +1694,39 @@ defmodule Tightbeam.GatewayTest do
     assert Idempotency.get(ctx.db, "flynn", "spawn", "spawn-taken") == nil
   end
 
+  test "spawn serves a populated stale catalog while preserving its health", ctx do
+    base_dir = role_test_base("spawn-stale-populated")
+    Archetypes.load!(base_dir)
+
+    start_supervised!(%{
+      id: :spawn_stale_conn_registry,
+      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+    })
+
+    put_host_catalog("testhost", "claude", ["claude-fable-5"])
+    stale_host_catalog("testhost", "claude")
+
+    assert {[_entry], :stale} = ModelCatalog.get("testhost", "claude", ModelCatalog)
+
+    assert {:ok, %{health: :stale}} =
+             ModelCatalog.route("testhost", "claude", Model.new("claude-fable-5"))
+
+    spawn = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["spawn"]
+
+    assert %{session_key: session_key} =
+             spawn.(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{
+                 display_name: "Stale catalog builder",
+                 handle: "stale-catalog-builder",
+                 idempotency_key: "spawn-stale-catalog-builder"
+               }
+             })
+
+    assert Org.get(ctx.db, session_key).model == Model.new("claude-fable-5")
+  end
+
   test "registered fixture is selectable as the default spawn path and by tune", ctx do
     base_dir = role_test_base("fixture-default")
     auth_dir = Path.join([base_dir, "auth", "fixture"])
@@ -5159,6 +5192,22 @@ defmodule Tightbeam.GatewayTest do
         reason: reason,
         refreshing: true
       })
+    end)
+  end
+
+  defp stale_host_catalog(host, harness) do
+    :sys.replace_state(ModelCatalog, fn state ->
+      now = state.now.()
+
+      update_in(state.entries[{host, harness}], fn cache ->
+        %{
+          cache
+          | derived_at: now - state.ttl_ms - 1,
+            attempted_at: now,
+            reason: :refresh_failed,
+            refreshing: true
+        }
+      end)
     end)
   end
 

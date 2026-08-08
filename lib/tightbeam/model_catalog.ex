@@ -93,16 +93,21 @@ defmodule Tightbeam.ModelCatalog do
   end
 
   @typedoc "A routed selection: which harness runs it, on whose grant, and the entry that says so."
-  @type routed :: %{harness: String.t(), provider: String.t(), entry: entry()}
+  @type routed :: %{
+          harness: String.t(),
+          provider: String.t(),
+          entry: entry(),
+          health: :fresh | :stale
+        }
 
   @doc """
   THE ONE ANSWER to "can this selection be routed on this host, and if not why".
 
   Routability is a question about the WHOLE fleet on a host — one harness tiering
   a model says nothing while another offers it untiered — so this gathers every
-  fresh entry naming the model BEFORE anything is refused. A second gate deciding
-  the same thing from a narrower view is what refused a valid untiered ruling on
-  the strength of the first tiered entry it happened to find.
+  usable cached entry naming the model BEFORE anything is refused. A second gate
+  deciding the same thing from a narrower view is what refused a valid untiered
+  ruling on the strength of the first tiered entry it happened to find.
 
   This is a READ of the already-cached catalog. It starts nothing, waits on
   nothing, and does no provider I/O, so it can sit on the prompt path.
@@ -116,9 +121,10 @@ defmodule Tightbeam.ModelCatalog do
   about this selection. `route/2` is a fold over this — one derivation, two
   quantifiers.
 
-  Only a FRESH inventory can route. A stale one is not evidence that a model is
-  absent, it is evidence of nothing, so it refuses as `:no_catalog` rather than
-  implying the fleet does not have the model.
+  A populated inventory can route while stale: those cached entitlements remain
+  usable during a refresh outage, and the routed answer carries `health: :stale`
+  so its caller can surface the degradation. Only an empty or unavailable
+  inventory refuses as `:no_catalog`.
   """
   @spec route(String.t(), String.t(), Model.t()) :: {:ok, routed()} | {:error, Unroutable.t()}
   @spec route(String.t(), Model.t(), GenServer.server()) ::
@@ -162,14 +168,20 @@ defmodule Tightbeam.ModelCatalog do
     end
 
     cond do
-      health != :fresh ->
+      entries == [] or match?({:unavailable, _reason}, health) ->
         refuse.(:no_catalog, [])
 
       is_nil(entry) ->
         refuse.(:family_absent, offers(harness, entries))
 
       offers_effort?(entry, selection.effort) ->
-        {:ok, %{harness: harness, provider: Atom.to_string(entry.provider), entry: entry}}
+        {:ok,
+         %{
+           harness: harness,
+           provider: Atom.to_string(entry.provider),
+           entry: entry,
+           health: health
+         }}
 
       is_nil(selection.effort) ->
         refuse.(:needs_effort, offers(harness, [entry]))
@@ -229,11 +241,11 @@ defmodule Tightbeam.ModelCatalog do
     }
   end
 
-  # A routed answer is fresh by construction; a refused one carries the health it
-  # was refused on.
+  # A routed answer carries the health it used; a refused one carries that same
+  # health on the refusal.
   defp consulted_health(answers) do
     Enum.flat_map(answers, fn
-      {harness, {:ok, _routed}} -> [{harness, :fresh}]
+      {harness, {:ok, routed}} -> [{harness, routed.health}]
       {_harness, {:error, unroutable}} -> unroutable.health
     end)
   end
