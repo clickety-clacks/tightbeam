@@ -1,19 +1,29 @@
 # Live-session tune CLI
 
 Status: implementation authority for `wi_6435c199-16aa-480e-8381-4c471e2ed35a`.
-This revision supersedes the earlier version and its authority addenda where they
-conflict.
+This revision supersedes commits `f031a51e84579d23daa25aea201974b9be007847`,
+`413ea350d54375912e0b97ab3cbb794d215badfa`, and
+`4cef7773c1bafd9339cf5f23a8881dccca16b42f`, plus their authority addenda, where
+they conflict.
 
 ## Spirit
-
-### Goal
 
 An owner or administrator can deliberately change one runtime control on an active
 Tightbeam session through the supported CLI. The Tightbeam session keeps its identity,
 roles, work, lineage, and graph position. The command reports only state that the live
 harness accepted, or a named failure that states what Tightbeam knows.
 
-### Outcomes
+Correctness, security, reliability, and observability are hard requirements. A slower
+verified change is preferable to an unverified success. Compatibility covers the live
+installed adapter versions captured by the reality gate. This slice does not optimize
+throughput or generalize unrelated model-selection code.
+
+## Goal
+
+The supported `tune` command changes one requested runtime control on an existing
+Tightbeam session while preserving its durable identity and relationships.
+
+Success has four observable outcomes:
 
 1. The operator can change the harness, model, thinking effort, or Fast setting.
 2. The operator can tell whether the runtime changed and whether Tightbeam stored the
@@ -22,7 +32,7 @@ harness accepted, or a named failure that states what Tightbeam knows.
    replaces it.
 4. Authorization, turn ordering, and non-identifying refusals remain intact.
 
-### Non-goals
+## Non-Goals
 
 - Automatic fallback, host movement, role rebinding, succession, or broad picker work.
 - Conversation continuity across different harnesses.
@@ -31,12 +41,18 @@ harness accepted, or a named failure that states what Tightbeam knows.
 - A rollback engine for an in-place runtime change.
 - Static catalog guesses about live harness capabilities.
 
-### Quality stance
+## Invariants
 
-Correctness, security, reliability, and observability are hard requirements. A slower
-verified change is preferable to an unverified success. Compatibility covers the live
-installed adapter versions captured by the reality gate. This slice does not optimize
-throughput or generalize unrelated model-selection code.
+1. One invocation changes one control dimension.
+2. The live harness owns runtime vocabulary. Exact readback owns success.
+3. The session key and every substrate relationship survive each successful change.
+4. Authorization occurs before target existence, readiness, or mutation becomes visible.
+5. A queued or running turn prevents mutation.
+6. A cross-harness database commit never occurs before destination verification.
+7. A failure never claims that the prior runtime remains active after an in-place change
+   may have reached the harness.
+8. Fast uses the live option advertised by the resident adapter and has no stored intent.
+9. Every managed-runtime cleanup failure leaves cause and principal in a durable row.
 
 ## Terms
 
@@ -53,7 +69,7 @@ throughput or generalize unrelated model-selection code.
 - **Eligible catalog snapshot**: a prior live catalog result for the same host, harness,
   adapter version, and credential scope that contains the exact requested model row.
 
-## Falsifiable assumptions
+## Assumptions
 
 1. The same-harness switch or fork path can return exact live model and effort readback.
 2. The managed replacement seam can own and close both accepted and rejected
@@ -67,20 +83,22 @@ throughput or generalize unrelated model-selection code.
 If code or live smoke disproves an assumption, the producer pauses and files the exact
 evidence. The producer does not invent a second lifecycle, queue, or rollback mechanism.
 
-## Invariants
+## Architecture
 
-1. One invocation changes one control dimension.
-2. The live harness owns runtime vocabulary. Exact readback owns success.
-3. The session key and every substrate relationship survive each successful change.
-4. Authorization occurs before target existence, readiness, or mutation becomes visible.
-5. A queued or running turn prevents mutation.
-6. A cross-harness database commit never occurs before destination verification.
-7. A failure never claims that the prior runtime remains active after an in-place change
-   may have reached the harness.
-8. Fast uses the live option advertised by the resident adapter and has no stored intent.
-9. Every managed-runtime cleanup failure leaves cause and principal in a durable row.
+### Subtraction rulings
 
-## Supported command
+- Keep the native gateway `tune` verb. Deleting it loses the supported operator surface;
+  accepting client-only control would split authority.
+- Add no rollback engine. Context preservation requires in-place writes, so named actual
+  or unknown runtime state is smaller and more honest.
+- Use the existing session lane for ordering. Deleting queued-work protection lets tune
+  jump ahead of filed work; accepting that race violates the session contract.
+- Use the existing managed replacement owner for cleanup. A second lifecycle mechanism
+  would duplicate ownership; silent cleanup failure would lose observability.
+- Translate only a live-advertised Fast option at the adapter boundary. Deleting Fast
+  misses the requested outcome; accepting one fixed id lies on the other harness.
+
+### Supported command
 
 The public verb is `tune`:
 
@@ -119,7 +137,7 @@ If `--harness` names the current harness, the gateway returns `same_harness`. Th
 uses the same-harness model form without `--harness`. This refusal avoids ambiguous engine
 context and creates no pointer, barrier, or tombstone.
 
-## Field meanings
+### Field meanings
 
 - `--model` selects the vendor model family.
 - `--context` selects the vendor context-window variant. Omission selects the issuing
@@ -130,8 +148,6 @@ context and creates no pointer, barrier, or tombstone.
   the live advertised Fast capability. The current Claude adapter maps `fast`; the current
   Codex adapter maps `fast-mode`. The gateway never guesses an option id from the harness
   name and never stores Fast as a model, effort, catalog, or durable intent field.
-
-## Architecture and apply semantics
 
 ### Authority and privacy seam
 
@@ -163,6 +179,8 @@ reads the complete runtime configuration. If readback exactly matches, the gatew
 the stored projection. If a field applied but the verified configuration differs from the
 request, the gateway reconciles the projection to the verified configuration and returns
 nonzero `runtime_config_mismatch` with those values. It does not claim the prior runtime.
+If that reconciliation commit fails, it returns `runtime_projection_failed` with the
+verified active configuration.
 
 If exact readback fails after mutation may have started, the gateway returns nonzero
 `runtime_config_unknown`. It marks the resident projection stale through the existing
@@ -215,7 +233,8 @@ harness change makes no retention promise and reports the live value it can veri
 
 If readback fails after the Fast write may have started, the gateway returns
 `runtime_config_unknown` and does not claim the prior Fast value. Fast has no stored
-projection commit.
+projection commit. A verified live value that differs from the request returns
+`runtime_config_mismatch` with that value.
 
 ### Result
 
@@ -231,6 +250,7 @@ Success exits zero and prints one JSON object built from verified state:
   "context": null,
   "fast": "on",
   "fastStatus": "known",
+  "fastPersistence": "ephemeral",
   "projectionCommitted": true,
   "engineContext": "preserved"
 }
@@ -238,7 +258,9 @@ Success exits zero and prints one JSON object built from verified state:
 
 `engineContext` is `preserved` for same-harness model, effort, and Fast changes. It is
 `reset` for a cross-harness change. Failure JSON includes verified actual fields whenever
-they are known. The response never echoes an unverified requested value as actual state.
+they are known. `fastPersistence` is always `ephemeral`. `projectionCommitted` is `true`
+for model or harness success and `null` for Fast, which has no stored projection. The
+response never echoes an unverified requested value as actual state.
 
 ### Stable refusals
 
@@ -338,11 +360,11 @@ advertising harness. Prove both cross-harness directions preserve the Tightbeam 
 and work relationships while resetting only engine context. Prove the next real turn runs
 on the accepted runtime. A mocked adapter cannot satisfy this gate.
 
-## Open questions
+## Open Questions
 
 None. A disproved assumption reopens this spec before implementation continues.
 
-## Specification homes
+## Operating Pattern and Specification Homes
 
 - Public CLI and behavior: this document.
 - Wire request types: the CLI and gateway source types.
