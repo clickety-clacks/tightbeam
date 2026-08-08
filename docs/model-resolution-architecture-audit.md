@@ -66,11 +66,10 @@ present, but five local contract gaps prevent a claim of complete conformance.
 
 ### F1 — New and load do not require matching readback
 
-`Adapter.apply_initial_config` returns any readable model from
-`session/current_mode` without comparing it with the request. If config is unreadable,
-it returns the requested model as success. New/load cache that result, and Gateway can
-accept the pointer without a second readback. See
-`lib/tightbeam/acp/adapter.ex:605-667`, `:1116-1140`, and
+`Adapter.apply_model_to_session/4` accepts model values from
+`session/set_config_option` replies without comparing them with the requested model.
+New/load cache that result, and Gateway can accept the pointer without a second
+readback. See `lib/tightbeam/acp/adapter.ex:605-667`, `:1116-1140`, `:1422-1439`, and
 `lib/tightbeam/gateway.ex:2110-2198`, `:2274-2296`.
 
 The independent review reproduced a request for `gpt-new/high` that created and loaded
@@ -116,7 +115,7 @@ catalog or resolver.
 Tightbeam publishes `setHarness` in the session capability payload, but Clawline web
 does not decode that capability, define the matching request action, or render a harness
 control in the session footer. See `lib/tightbeam/gateway.ex:1381-1388` and Clawline
-`src/features/chat/stream-api.ts:69-117`,
+`src/protocol/stream-api.ts:69-117`,
 `src/features/chat/SessionStatusFooter.tsx:85-127` at commit
 `159097742b7c4faa81da9d75d2b6a39304ae8f51`.
 
