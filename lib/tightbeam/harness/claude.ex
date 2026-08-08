@@ -250,7 +250,17 @@ defmodule Tightbeam.Harness.Claude do
       guidance: guidance,
       meta: %{systemPrompt: %{type: "preset", preset: "claude_code", append: guidance}},
       permission_mode: "bypassPermissions",
-      effort_config: "effort"
+      effort_config: "effort",
+      resident_model_switch: :fork,
+      model_option_aliases: %{
+        "sonnet" => "claude-sonnet-5",
+        "haiku" => "claude-haiku-4-5-20251001",
+        "opus" => "claude-opus-4-8",
+        "opus[1m]" => "claude-opus-4-8[1m]",
+        "fable" => "claude-fable-5",
+        "fable[1m]" => "claude-fable-5[1m]"
+      },
+      canonical_model_prefixes: ["claude-"]
     }
   end
 

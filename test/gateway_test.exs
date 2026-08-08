@@ -224,13 +224,33 @@ defmodule Tightbeam.GatewayTest do
       {:reply, Keyword.get(opts, :resident, true), state}
     end
 
+    def handle_call({:close_session, sid}, _from, {parent, _opts} = state) do
+      send(parent, {:tune_session_closed, sid})
+      {:reply, :ok, state}
+    end
+
     def handle_call(
-          {:apply_model, sid, model},
+          {:switch_model_session, sid, model, cwd, mcp_servers, guidance},
           _from,
           {parent, opts} = state
         ) do
-      send(parent, {:tune_model_applied, sid, model})
-      {:reply, Keyword.get(opts, :apply_result, :ok), state}
+      send(parent, {:tune_session_switched, sid, model, cwd, mcp_servers, guidance})
+
+      result =
+        Keyword.get_lazy(opts, :switch_result, fn ->
+          {:ok, Keyword.get(opts, :switched_sid, "switched-session")}
+        end)
+
+      {:reply, result, state}
+    end
+
+    def handle_call(
+          {:load_session, sid, model, cwd, mcp_servers, guidance},
+          _from,
+          {parent, opts} = state
+        ) do
+      send(parent, {:tune_session_loaded, sid, model, cwd, mcp_servers, guidance})
+      {:reply, Keyword.get(opts, :load_result, {:ok, model}), state}
     end
   end
 
@@ -1693,6 +1713,7 @@ defmodule Tightbeam.GatewayTest do
       |> Map.put(:default_model, Model.new("fixture-model"))
 
     handlers = Gateway.handlers(config)
+    start_lane!(ctx.db, "k1")
 
     assert %{session_key: spawned_key} =
              handlers["spawn"].(%{
@@ -1759,6 +1780,8 @@ defmodule Tightbeam.GatewayTest do
       provider: "anthropic",
       model: Model.new("before-model")
     })
+
+    start_lane!(ctx.db, "swapme")
 
     # Real prior conversation, so the barrier has something to bury.
     for body <- ["first", "second"] do
@@ -1833,6 +1856,8 @@ defmodule Tightbeam.GatewayTest do
       provider: "anthropic",
       model: Model.new("before-model")
     })
+
+    start_lane!(ctx.db, "atomic")
 
     for body <- ["first", "second"] do
       Projection.append(ctx.db, %{
@@ -2872,6 +2897,7 @@ defmodule Tightbeam.GatewayTest do
     # good and the satellite's is not — tune, because it judges the ref against
     # the session's host without going through spinup.
     tune = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["tune"]
+    start_lane!(ctx.db, "k1")
 
     retune = fn model ->
       tune.(%{
@@ -3184,7 +3210,7 @@ defmodule Tightbeam.GatewayTest do
              )
   end
 
-  test "set_model applies a resident harness session before recording the selection", ctx do
+  test "set_model moves a resident harness session before recording the selection", ctx do
     base_dir = role_test_base("override-set-model")
     put_skill!(base_dir, "review", "# Review")
     base = Archetypes.load!(base_dir)["default"]
@@ -3195,10 +3221,14 @@ defmodule Tightbeam.GatewayTest do
     config = gateway_config(base_dir, ctx.db, 0)
     identity_name = Placement.identity_name(config, base, overrides, :claude)
     Org.set_identity(ctx.db, "k1", overrides, identity_name)
+    local_host = Placement.local_host_name()
+    Org.set_host(ctx.db, "k1", local_host)
     Org.append_pointer(ctx.db, "k1", "existing-session", "created")
+    start_lane!(ctx.db, "k1")
 
     adapter = start_supervised!({TuneAdapterStub, {self(), resident: true}})
     start_supervised!({CoordinatorStub, {adapter, self()}})
+    put_host_catalog(local_host, "claude", ["claude-sonnet-4-6"])
 
     assert %{ok: true} =
              Gateway.handlers(config)["tune"].(%{
@@ -3207,29 +3237,41 @@ defmodule Tightbeam.GatewayTest do
                params: %{setting: "set_model", model: "claude-sonnet-4-6"}
              })
 
-    assert_receive {:adapter_key, {:claude, "shared", "testhost"}}
+    assert_receive {:adapter_key, {:claude, "shared", ^local_host}}
     assert_receive {:tune_residency_checked, "existing-session"}
-    assert_receive {:tune_model_applied, "existing-session", %Model{family: "claude-sonnet-4-6"}}
+
+    assert_receive {:tune_session_switched, "existing-session",
+                    %Model{family: "claude-sonnet-4-6"}, _cwd, _mcp_servers, guidance}
+
+    assert guidance =~ "Tightbeam · default"
+    assert_receive {:tune_session_closed, "existing-session"}
     assert Org.get(ctx.db, "k1").model == Model.new("claude-sonnet-4-6")
+
+    assert %{harness_session_id: "switched-session", reason: "loaded"} =
+             Org.current_pointer(ctx.db, "k1")
   end
 
-  test "set_model records a resident apply failure and leaves the selected model unchanged",
+  test "set_model reports a resident switch failure and leaves the selected model unchanged",
        ctx do
     base_dir = role_test_base("resident-set-model-failure")
     Archetypes.load!(base_dir)
     config = gateway_config(base_dir, ctx.db, 0)
     before = Org.get(ctx.db, "k1").model
+    local_host = Placement.local_host_name()
+    Org.set_host(ctx.db, "k1", local_host)
     Org.append_pointer(ctx.db, "k1", "resident-session", "created")
+    start_lane!(ctx.db, "k1")
 
     adapter =
       start_supervised!(
-        {TuneAdapterStub, {self(), resident: true, apply_result: {:error, :model_unavailable}}}
+        {TuneAdapterStub, {self(), resident: true, switch_result: {:error, :model_unavailable}}}
       )
 
     start_supervised!({CoordinatorStub, adapter})
+    put_host_catalog(local_host, "claude", ["claude-sonnet-4-6"])
 
-    # The reason rides the MESSAGE now. It used to ride a `reason:` key the wire
-    # does not emit, so this refusal reached clients as a bare `ok: false` (#68).
+    # The reason rides an honest sentence. The frozen offered-set refusal is gone;
+    # this case is a real reload failure and the selected model stays unchanged.
     assert %{ok: false, code: "model_apply_failed", message: message} =
              Gateway.handlers(config)["tune"].(%{
                origin: "user:flynn",
@@ -3238,9 +3280,55 @@ defmodule Tightbeam.GatewayTest do
              })
 
     assert message =~ "model_unavailable"
+    assert message =~ "could not prepare the new model"
 
-    assert_receive {:tune_model_applied, "resident-session", %Model{family: "claude-sonnet-4-6"}}
+    assert_receive {:tune_session_switched, "resident-session",
+                    %Model{family: "claude-sonnet-4-6"}, _cwd, _mcp_servers, _guidance}
+
     assert Org.get(ctx.db, "k1").model == before
+    assert Org.current_pointer(ctx.db, "k1").harness_session_id == "resident-session"
+    refute_receive {:tune_session_closed, "resident-session"}
+  end
+
+  test "set_model refuses while the lane owns a running turn", ctx do
+    base_dir = role_test_base("resident-set-model-busy")
+    Archetypes.load!(base_dir)
+    config = gateway_config(base_dir, ctx.db, 0)
+    before = Org.get(ctx.db, "k1").model
+    local_host = Placement.local_host_name()
+    Org.set_host(ctx.db, "k1", local_host)
+    put_host_catalog(local_host, "claude", ["claude-sonnet-4-6"])
+
+    assert {:ok, _seq} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: "k1",
+               message_id: "set-model-running",
+               origin: "user:flynn",
+               prompt: "hold the boundary"
+             })
+
+    parent = self()
+
+    start_lane!(ctx.db, "k1", fn _turn ->
+      send(parent, {:set_model_turn_started, self()})
+
+      receive do
+        :finish_set_model_turn -> {:ok, %{}}
+      end
+    end)
+
+    assert_receive {:set_model_turn_started, runner}
+
+    assert %{ok: false, code: "turn_in_progress", message: message} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: "user:flynn",
+               session_key: "k1",
+               params: %{setting: "set_model", model: "claude-sonnet-4-6"}
+             })
+
+    assert message =~ "Try again once the current turn finishes"
+    assert Org.get(ctx.db, "k1").model == before
+    send(runner, :finish_set_model_turn)
   end
 
   describe "session status reports its host's credential kind" do
@@ -3649,6 +3737,7 @@ defmodule Tightbeam.GatewayTest do
     config = gateway_config(role_test_base("wire-named-fields-in"), ctx.db, 0)
     adapter = start_supervised!({AdapterStub, self()})
     start_supervised!({CoordinatorStub, {adapter, self()}})
+    start_lane!(ctx.db, "k-wire")
 
     assert %{ok: true} =
              Gateway.handlers(config)["tune"].(%{
@@ -3696,6 +3785,7 @@ defmodule Tightbeam.GatewayTest do
     config = gateway_config(role_test_base("wire-default-context-in"), ctx.db, 0)
     adapter = start_supervised!({AdapterStub, self()})
     start_supervised!({CoordinatorStub, {adapter, self()}})
+    start_lane!(ctx.db, "k-wide")
 
     assert %{ok: true} =
              Gateway.handlers(config)["tune"].(%{
@@ -3747,6 +3837,7 @@ defmodule Tightbeam.GatewayTest do
     config = gateway_config(role_test_base("wire-echo-in"), ctx.db, 0)
     adapter = start_supervised!({AdapterStub, self()})
     start_supervised!({CoordinatorStub, {adapter, self()}})
+    start_lane!(ctx.db, "k-echo")
 
     assert %{ok: true} =
              Gateway.handlers(config)["tune"].(%{
@@ -3817,6 +3908,16 @@ defmodule Tightbeam.GatewayTest do
     assert status.display.reasoningLevel == "medium"
   end
 
+  test "session_status publishes the live harness switch capability", ctx do
+    Archetypes.load!(role_test_base("session-status-harness-switch"))
+    status = Gateway.session_status("k1", ctx.db)
+
+    assert %{supported: true, options: harness_options} = status.capabilities.setHarness
+
+    assert Enum.map(harness_options, & &1.value) ==
+             Enum.map(Tightbeam.Harness.all(), & &1.wire_name())
+  end
+
   test "session_status marks setReasoning unsupported for a model with no effort tiers", ctx do
     Archetypes.load!(role_test_base("session-status-untiered"))
 
@@ -3863,6 +3964,8 @@ defmodule Tightbeam.GatewayTest do
                params: %{setting: "set_reasoning", reasoningLevel: "high"}
              })
 
+    start_lane!(ctx.db, "k1")
+
     assert %{ok: true} =
              tune.(%{
                origin: "user:flynn",
@@ -3892,6 +3995,7 @@ defmodule Tightbeam.GatewayTest do
 
     adapter = start_supervised!({AdapterStub, self()})
     start_supervised!({CoordinatorStub, {adapter, self()}})
+    start_lane!(ctx.db, "k-round-trip")
 
     # The client sends modelCatalog.models[].ref back as the set_model value.
     emitted = Gateway.session_status("k-round-trip", ctx.db).modelCatalog.models
@@ -3929,6 +4033,7 @@ defmodule Tightbeam.GatewayTest do
 
     adapter = start_supervised!({AdapterStub, self()})
     start_supervised!({CoordinatorStub, {adapter, self()}})
+    start_lane!(ctx.db, "k-codex")
 
     assert %{ok: true} =
              Gateway.handlers(config)["tune"].(%{
@@ -3960,6 +4065,7 @@ defmodule Tightbeam.GatewayTest do
 
     adapter = start_supervised!({AdapterStub, self()})
     start_supervised!({CoordinatorStub, {adapter, self()}})
+    start_lane!(ctx.db, "k-codex-fallback")
 
     assert %{ok: true} =
              Gateway.handlers(config)["tune"].(%{
@@ -3994,6 +4100,7 @@ defmodule Tightbeam.GatewayTest do
 
     adapter = start_supervised!({AdapterStub, self()})
     start_supervised!({CoordinatorStub, {adapter, self()}})
+    start_lane!(ctx.db, "k-codex-medium")
 
     assert %{ok: true} =
              Gateway.handlers(config)["tune"].(%{
@@ -4027,6 +4134,7 @@ defmodule Tightbeam.GatewayTest do
 
     adapter = start_supervised!({AdapterStub, self()})
     start_supervised!({CoordinatorStub, {adapter, self()}})
+    start_lane!(ctx.db, "k-codex-untiered")
 
     assert %{ok: true} =
              Gateway.handlers(config)["tune"].(%{
@@ -4060,6 +4168,7 @@ defmodule Tightbeam.GatewayTest do
 
     adapter = start_supervised!({AdapterStub, self()})
     start_supervised!({CoordinatorStub, {adapter, self()}})
+    start_lane!(ctx.db, "k-codex-full-ref")
 
     assert %{ok: true} =
              Gateway.handlers(config)["tune"].(%{
@@ -4090,6 +4199,7 @@ defmodule Tightbeam.GatewayTest do
 
     adapter = start_supervised!({AdapterStub, self()})
     start_supervised!({CoordinatorStub, {adapter, self()}})
+    start_lane!(ctx.db, "k-codex-reasoning")
 
     assert %{ok: true} =
              Gateway.handlers(config)["tune"].(%{
@@ -4454,6 +4564,148 @@ defmodule Tightbeam.GatewayTest do
     assert Org.get(ctx.db, "k1") == before
   end
 
+  test "set_harness changes the engine and projects its home at a turn boundary", ctx do
+    base_dir = role_test_base("harness-turn-boundary")
+    codex_auth = Path.join([base_dir, "auth", "codex"])
+    File.mkdir_p!(codex_auth)
+    File.write!(Path.join(codex_auth, "auth.json"), "test-token")
+    Archetypes.load!(base_dir)
+    ensure_global_registry()
+
+    config =
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.put(:conn_registry, ctx.registry)
+      |> Map.put(:lane_manager, ctx.lane)
+
+    {Tightbeam.LaneManager, lane_opts} =
+      config
+      |> Gateway.children()
+      |> Enum.find(&match?({Tightbeam.LaneManager, _}, &1))
+
+    runner = Keyword.fetch!(lane_opts, :runner)
+    adapter = start_supervised!({AdapterStub, self()})
+    start_supervised!({CoordinatorStub, {adapter, self()}})
+
+    local_host = Placement.local_host_name()
+    Org.set_host(ctx.db, "k1", local_host)
+    put_host_catalog(local_host, "codex", [])
+
+    put_host_catalog_entry(local_host, "codex", %{
+      family: "gpt-5.6-sol",
+      efforts: ["medium"],
+      provider: :openai
+    })
+
+    start_lane!(ctx.db, "k1", runner)
+
+    assert %{ok: true, harness: "codex", model: "gpt-5.6-sol", effort: "medium"} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: "user:flynn",
+               session_key: "k1",
+               params: %{
+                 setting: "set_harness",
+                 harness: "codex",
+                 model: "gpt-5.6-sol",
+                 effort: "medium"
+               }
+             })
+
+    assert %{harness: "codex", provider: "openai", model: model} = Org.get(ctx.db, "k1")
+    assert model == Model.new("gpt-5.6-sol", effort: "medium")
+
+    home = Tightbeam.Homes.home_path(base_dir, local_host, :codex)
+
+    assert JSON.decode!(File.read!(Path.join([home, ".tightbeam", "manifest"])))["harness"] ==
+             "codex"
+
+    assert :appended =
+             Gateway.deliver_prompt("k1", "user:flynn", "next turn",
+               db: ctx.db,
+               conn_registry: ctx.registry,
+               lane_manager: ctx.lane,
+               device_id: "d1",
+               client_message_id: "after-harness-switch"
+             )
+
+    assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
+    task = Task.async(fn -> runner.(Map.put(turn, :session_key, "k1")) end)
+
+    assert_receive {:adapter_key, {:codex, "shared", ^local_host}}
+    assert_receive {:new_session_mcp_servers, _mcp_servers}, @cold_runner_prompt_timeout
+    assert_receive {:prompt_started, ^adapter}, @cold_runner_prompt_timeout
+
+    send(adapter, :continue_prompt)
+    assert {:ok, %{terminal_publish: publish}} = Task.await(task)
+    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
+    publish.("delivered")
+
+    assert %{harness_session_id: "harness-1", harness: "codex"} =
+             Org.current_pointer(ctx.db, "k1")
+  end
+
+  test "set_harness refuses before writing the new home while a turn runs", ctx do
+    base_dir = role_test_base("harness-running-turn")
+    codex_auth = Path.join([base_dir, "auth", "codex"])
+    File.mkdir_p!(codex_auth)
+    File.write!(Path.join(codex_auth, "auth.json"), "test-token")
+    Archetypes.load!(base_dir)
+
+    config =
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.put(:conn_registry, ctx.registry)
+      |> Map.put(:lane_manager, ctx.lane)
+
+    local_host = Placement.local_host_name()
+    Org.set_host(ctx.db, "k1", local_host)
+    before = Org.get(ctx.db, "k1")
+    put_host_catalog(local_host, "codex", [])
+
+    put_host_catalog_entry(local_host, "codex", %{
+      family: "gpt-5.6-sol",
+      efforts: ["medium"],
+      provider: :openai
+    })
+
+    assert {:ok, _seq} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: "k1",
+               message_id: "set-harness-running",
+               origin: "user:flynn",
+               prompt: "hold the harness boundary"
+             })
+
+    parent = self()
+
+    start_lane!(ctx.db, "k1", fn _turn ->
+      send(parent, {:set_harness_turn_started, self()})
+
+      receive do
+        :finish_set_harness_turn -> {:ok, %{}}
+      end
+    end)
+
+    assert_receive {:set_harness_turn_started, runner}
+    home = Tightbeam.Homes.home_path(base_dir, local_host, :codex)
+    refute File.exists?(home)
+
+    assert %{ok: false, code: "turn_in_progress", message: message} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: "user:flynn",
+               session_key: "k1",
+               params: %{
+                 setting: "set_harness",
+                 harness: "codex",
+                 model: "gpt-5.6-sol",
+                 effort: "medium"
+               }
+             })
+
+    assert message =~ "Try again once the current turn finishes"
+    assert Org.get(ctx.db, "k1") == before
+    refute File.exists?(home)
+    send(runner, :finish_set_harness_turn)
+  end
+
   # The value a client is TOLD to send must be a value this accepts. `setModel.options`
   # and `modelCatalog.models` advertise one row per model with a base ref, deliberately
   # — the effort tier belongs to the reasoning picker — while the catalog only holds an
@@ -4476,6 +4728,8 @@ defmodule Tightbeam.GatewayTest do
       id: :harness_bare_model_conn_registry,
       start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
     })
+
+    start_lane!(ctx.db, "k1")
 
     assert %{ok: true, harness: "codex"} =
              Gateway.handlers(config)["tune"].(%{
@@ -4523,6 +4777,7 @@ defmodule Tightbeam.GatewayTest do
     identity_name = Placement.identity_name(config, base, overrides, :claude)
     assert Placement.identity_name(config, base, overrides, :codex) == identity_name
     Org.set_identity(ctx.db, "k1", overrides, identity_name)
+    start_lane!(ctx.db, "k1")
 
     assert %{ok: true, harness: "codex"} =
              Gateway.handlers(config)["tune"].(%{

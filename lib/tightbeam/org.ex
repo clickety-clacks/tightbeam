@@ -668,40 +668,46 @@ defmodule Tightbeam.Org do
   @spec append_pointer(db(), String.t(), String.t(), String.t()) :: pointer()
   def append_pointer(db \\ Tightbeam.DB, session_key, harness_session_id, reason) do
     transaction!(db, fn txn ->
-      session = must_get(txn, session_key)
-      created_at = now()
-
-      source_session_ref =
-        source_session_ref(session.harness, session.host, harness_session_id)
-
-      Txn.q(
-        txn,
-        """
-          INSERT INTO harness_pointers
-            (sessionKey, harnessSessionId, sourceSessionRef, harness, machine, reason, createdAt)
-          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-        """,
-        [
-          session_key,
-          harness_session_id,
-          source_session_ref,
-          session.harness,
-          session.host,
-          reason,
-          created_at
-        ]
-      )
-
-      %{
-        session_key: session_key,
-        harness_session_id: harness_session_id,
-        source_session_ref: source_session_ref,
-        harness: session.harness,
-        machine: session.host,
-        reason: reason,
-        created_at: created_at
-      }
+      append_pointer_in_txn(txn, session_key, harness_session_id, reason)
     end)
+  end
+
+  @doc false
+  @spec append_pointer_in_txn(Txn.t(), String.t(), String.t(), String.t()) :: pointer()
+  def append_pointer_in_txn(txn, session_key, harness_session_id, reason) do
+    session = must_get(txn, session_key)
+    created_at = now()
+
+    source_session_ref =
+      source_session_ref(session.harness, session.host, harness_session_id)
+
+    Txn.q(
+      txn,
+      """
+        INSERT INTO harness_pointers
+          (sessionKey, harnessSessionId, sourceSessionRef, harness, machine, reason, createdAt)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+      """,
+      [
+        session_key,
+        harness_session_id,
+        source_session_ref,
+        session.harness,
+        session.host,
+        reason,
+        created_at
+      ]
+    )
+
+    %{
+      session_key: session_key,
+      harness_session_id: harness_session_id,
+      source_session_ref: source_session_ref,
+      harness: session.harness,
+      machine: session.host,
+      reason: reason,
+      created_at: created_at
+    }
   end
 
   @doc "The newest pointer for a session (where it currently lives), or nil."

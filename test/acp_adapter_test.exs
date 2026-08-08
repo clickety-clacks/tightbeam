@@ -142,10 +142,20 @@ defmodule Tightbeam.Acp.AdapterTest do
   // be timed from here; timing it from before the spawn bills `node` startup to it.
   fs.writeFileSync(capturePath + ".boot", String(Date.now()));
   let newCalls = 0;
+  let forkCalls = 0;
   const models = {};
   const efforts = {};
+  const offeredModels = {};
+  const defaultOfferedModels = [
+    "default", "opus[1m]", "claude-fable-5[1m]", "sonnet", "haiku",
+    "gpt-old", "gpt-new", "gpt-blocking", "gpt-5.6-sol"
+  ];
   const configOptions = (sid) => ({ configOptions: [
-    { id: "model", currentValue: models[sid] || "haiku" },
+    {
+      id: "model",
+      currentValue: models[sid] || "haiku",
+      options: (offeredModels[sid] || defaultOfferedModels).map(value => ({ value, name: value }))
+    },
     { id: "effort", currentValue: efforts[sid] || "default" },
     { id: "reasoning_effort", currentValue: efforts[sid] || "medium" }
   ] });
@@ -174,13 +184,26 @@ defmodule Tightbeam.Acp.AdapterTest do
         capture(m);
         const sid = gateMode !== "none" && gateMode !== "delay-setup" && newCalls === 1 ? "probe-sess" : "sess-1";
         models[sid] = models[sid] || "haiku";
+        offeredModels[sid] = [...defaultOfferedModels];
         if (gateMode === "delay-setup") return setTimeout(() => send({ id: m.id, result: { sessionId: sid, ...configOptions(sid) } }), 75);
         return send({ id: m.id, result: { sessionId: sid, ...configOptions(sid) } });
       }
       case "session/load": {
         capture(m);
         models[m.params.sessionId] = failMode === "load-owner" ? "owner-model" : (models[m.params.sessionId] || "haiku");
+        offeredModels[m.params.sessionId] = [...defaultOfferedModels];
         return send({ id: m.id, result: configOptions(m.params.sessionId) });
+      }
+      case "session/fork": {
+        capture(m);
+        if (failMode === "fork-unprompted-owner") {
+          return send({ id: m.id, error: { code: -32002, message: "Resource not found" } });
+        }
+        forkCalls += 1;
+        const sid = "sess-fork-" + forkCalls;
+        models[sid] = models[m.params.sessionId] || "haiku";
+        offeredModels[sid] = [...defaultOfferedModels];
+        return send({ id: m.id, result: { sessionId: sid, ...configOptions(sid) } });
       }
       case "session/close": capture(m); return send({ id: m.id, result: {} });
       case "session/set_config_option": {
@@ -229,6 +252,9 @@ defmodule Tightbeam.Acp.AdapterTest do
             m.params.value === "high") {
           return send({ id: m.id, error: { code: -32000, message: "effort refused" } });
         }
+        if (failMode === "silent-model-no-take" && m.params.configId === "model") {
+          return send({ id: m.id, result: configOptions(m.params.sessionId) });
+        }
         if (m.params.configId === "model") models[m.params.sessionId] = m.params.value;
         if (m.params.configId === "effort" || m.params.configId === "reasoning_effort") efforts[m.params.sessionId] = m.params.value;
         return send({ id: m.id, result: configOptions(m.params.sessionId) });
@@ -244,6 +270,7 @@ defmodule Tightbeam.Acp.AdapterTest do
       case "session/prompt": {
         const sid = m.params.sessionId;
         capture(m);
+        const text = m.params.prompt?.[0]?.text;
         if (gateMode === "stall-turn") {
           stalledPrompt = m.id;
           stalledSession = sid;
@@ -592,6 +619,211 @@ defmodule Tightbeam.Acp.AdapterTest do
              session_requests(capture_path)
 
     assert {:ok, %{stop_reason: "end_turn"}} = Adapter.prompt(a, "sess-1", "again")
+  end
+
+  test "Claude model switch forks the conversation and applies the model to the new session" do
+    {adapter, capture_path} = start_adapter(harness: :claude)
+
+    assert {:ok, "sess-1"} =
+             Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "old guidance")
+
+    assert {:ok, %{stop_reason: "end_turn"}} =
+             Adapter.prompt(adapter, "sess-1", "persist this conversation")
+
+    switched_model = Model.new("claude-opus-4-8", context: "1m", effort: "high")
+
+    assert {:ok, "sess-fork-1"} =
+             Adapter.switch_model_session(
+               adapter,
+               "sess-1",
+               switched_model,
+               "/tmp",
+               [],
+               "new guidance"
+             )
+
+    assert Adapter.knows_session?(adapter, "sess-1")
+    assert Adapter.knows_session?(adapter, "sess-fork-1")
+
+    assert {:ok, ^switched_model} = Adapter.current_model(adapter, "sess-fork-1")
+
+    assert {:ok, switchable} = Adapter.switchable_models(adapter, "sess-fork-1")
+    assert Model.new("claude-opus-4-8", context: "1m") in switchable
+    assert Model.new("claude-sonnet-5") in switchable
+    refute Model.new("claude-opus-5") in switchable
+
+    requests = captured_requests(capture_path)
+
+    assert Enum.any?(requests, fn request ->
+             request["method"] == "session/fork" and request["sessionId"] == "sess-1" and
+               request["cwd"] == "/tmp"
+           end)
+
+    assert Enum.any?(requests, fn request ->
+             request["method"] == "session/set_config_option" and
+               request["sessionId"] == "sess-fork-1" and request["configId"] == "model" and
+               request["value"] == "opus[1m]"
+           end)
+  end
+
+  test "Claude model switch refuses a canonical model absent from the fork vocabulary" do
+    {adapter, capture_path} = start_adapter(harness: :claude)
+
+    assert {:ok, "sess-1"} =
+             Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+
+    assert {:ok, _turn} = Adapter.prompt(adapter, "sess-1", "persist this conversation")
+
+    assert {:error, {:model_apply_failed, :model_unavailable}} =
+             Adapter.switch_model_session(
+               adapter,
+               "sess-1",
+               Model.new("claude-opus-5", effort: "high"),
+               "/tmp",
+               [],
+               "guidance"
+             )
+
+    refute Enum.any?(captured_requests(capture_path), fn request ->
+             request["method"] == "session/set_config_option" and
+               request["sessionId"] == "sess-fork-1" and request["configId"] == "model"
+           end)
+
+    assert Enum.any?(captured_requests(capture_path), fn request ->
+             request["method"] == "session/close" and
+               request["sessionId"] == "sess-fork-1"
+           end)
+  end
+
+  test "Claude model switch rejects a success-shaped response that did not take" do
+    {adapter, capture_path} =
+      start_adapter(harness: :claude, fail_mode: "silent-model-no-take")
+
+    assert {:ok, "sess-1"} =
+             Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+
+    assert {:ok, _turn} = Adapter.prompt(adapter, "sess-1", "persist this conversation")
+
+    assert {:error, {:model_apply_failed, :model_verification_failed}} =
+             Adapter.switch_model_session(
+               adapter,
+               "sess-1",
+               Model.new("claude-opus-4-8", context: "1m", effort: "high"),
+               "/tmp",
+               [],
+               "guidance"
+             )
+
+    assert {:error, :model_readback_unavailable} =
+             Adapter.current_model(adapter, "sess-fork-1")
+
+    assert Enum.any?(captured_requests(capture_path), fn request ->
+             request["method"] == "session/close" and
+               request["sessionId"] == "sess-fork-1"
+           end)
+  end
+
+  test "Claude model switch guards a fresh parent with no persisted turn" do
+    {adapter, capture_path} = start_adapter(harness: :claude)
+
+    assert {:ok, "sess-1"} =
+             Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+
+    assert {:error, :fork_requires_prompted_session} =
+             Adapter.switch_model_session(
+               adapter,
+               "sess-1",
+               Model.new("claude-sonnet-5"),
+               "/tmp",
+               [],
+               "guidance"
+             )
+
+    refute Enum.any?(captured_requests(capture_path), &(&1["method"] == "session/fork"))
+  end
+
+  test "Claude model switch names a loaded parent's -32002 fork precondition" do
+    {adapter, capture_path} =
+      start_adapter(harness: :claude, fail_mode: "fork-unprompted-owner")
+
+    assert {:ok, %Model{}} =
+             Adapter.load_session(
+               adapter,
+               "loaded-session",
+               Model.new("haiku"),
+               "/tmp",
+               [],
+               "guidance"
+             )
+
+    assert {:error, :fork_requires_prompted_session} =
+             Adapter.switch_model_session(
+               adapter,
+               "loaded-session",
+               Model.new("claude-sonnet-5"),
+               "/tmp",
+               [],
+               "guidance"
+             )
+
+    assert Enum.any?(captured_requests(capture_path), &(&1["method"] == "session/fork"))
+  end
+
+  test "Codex model switch updates the resident session without forking" do
+    {adapter, capture_path} = start_adapter(harness: :codex)
+
+    assert {:ok, "sess-1"} =
+             Adapter.new_session(adapter, Model.new("gpt-old"), "/tmp", [], "guidance")
+
+    assert {:ok, "sess-1"} =
+             Adapter.switch_model_session(
+               adapter,
+               "sess-1",
+               Model.new("gpt-new", effort: "high"),
+               "/tmp",
+               [],
+               "guidance"
+             )
+
+    refute Enum.any?(captured_requests(capture_path), &(&1["method"] == "session/fork"))
+  end
+
+  test "Codex model switch rejects a success-shaped response that did not take" do
+    {adapter, capture_path} =
+      start_adapter(harness: :codex, fail_mode: "silent-model-no-take")
+
+    assert {:ok, "sess-1"} =
+             Adapter.new_session(adapter, Model.new("gpt-old"), "/tmp", [], "guidance")
+
+    assert {:error, :model_verification_failed} =
+             Adapter.switch_model_session(
+               adapter,
+               "sess-1",
+               Model.new("gpt-new", effort: "high"),
+               "/tmp",
+               [],
+               "guidance"
+             )
+
+    assert {:error, :model_readback_unavailable} = Adapter.current_model(adapter, "sess-1")
+    refute Enum.any?(captured_requests(capture_path), &(&1["method"] == "session/fork"))
+  end
+
+  test "Codex model switch preserves the model-unavailable refusal vocabulary" do
+    {adapter, _capture_path} =
+      start_adapter(harness: :codex, fail_mode: "model-invalid-params")
+
+    assert {:ok, "sess-1"} = Adapter.new_session(adapter, nil, "/tmp", [], "guidance")
+
+    assert {:error, :model_unavailable} =
+             Adapter.switch_model_session(
+               adapter,
+               "sess-1",
+               Model.new("gpt-new"),
+               "/tmp",
+               [],
+               "guidance"
+             )
   end
 
   test "a prompt worker that dies before dispatch returns an error without wedging the adapter" do

@@ -1376,6 +1376,14 @@ defmodule Tightbeam.Gateway do
             setReasoning: reasoning_capability,
             setFastMode: unsupported.("not supported"),
             setMode: unsupported.("sessions run YOLO"),
+            setHarness: %{
+              supported: true,
+              options:
+                Enum.map(Harness.all(), fn module ->
+                  harness = module.wire_name()
+                  %{title: harness, value: harness, enabled: true}
+                end)
+            },
             setVerbosity: unsupported.("not supported"),
             canCancelCurrentRun: true,
             canChangeModel: true,
@@ -3734,102 +3742,31 @@ defmodule Tightbeam.Gateway do
                      session.host,
                      spinup_opts(config, db)
                    ) do
-              deliver_opts = if config[:sh], do: [sh: config.sh], else: []
+              case at_session_turn_boundary(config, session.session_key, fn ->
+                     run_session_mutation(session.session_key, fn ->
+                       apply_harness_change(
+                         config,
+                         db,
+                         call,
+                         session,
+                         harness,
+                         harness_atom,
+                         model,
+                         routed.provider
+                       )
+                     end)
+                   end) do
+                {:ok, result} ->
+                  result
 
-              # Pin the shared home to the model this session will run on the new
-              # harness, not the org default, so the next turn's session/new
-              # offers and accepts it (wi_263814d3).
-              Placement.deliver_home(
-                config,
-                {harness_atom, "shared", session.host},
-                Keyword.put(deliver_opts, :model, model)
-              )
-
-              Org.set_harness(
-                db,
-                call.session_key,
-                harness,
-                routed.provider,
-                model
-              )
-
-              # History barrier (product ruling): a new engine gets a fresh
-              # visible slate. Rows are RETAINED (never deleted) but replay
-              # stops at the barrier, and live clients are told to drop their
-              # local view. No pointer surgery: the old harness session can't
-              # load on the new engine → fallback pointer, fresh context.
-              #
-              # ONE TRANSACTION, both writes. The barrier and its tombstone are a
-              # single fact: history stopped being shown, and here is why. Split
-              # across two transactions, a crash between them left the barrier
-              # moved with no marker — which is precisely the silent burial the
-              # tombstone exists to prevent, just rarer. The MAX(seq) read moved
-              # inside too, so a message landing between the read and the barrier
-              # cannot be buried without being counted.
-              # DB.transaction CATCHES a raise and RETURNS {:error, exception}. A
-              # hard {:ok, _} match here is a MatchError that crashes the wire
-              # call instead of denying it — the trap already documented at
-              # `ruling_transaction/2`, and one this very test caught.
-              barrier =
-                DB.transaction(db, fn txn ->
-                  [[max_seq]] =
-                    Txn.q(
-                      txn,
-                      "SELECT COALESCE(MAX(seq), 0) FROM messages WHERE sessionKey = ?1",
-                      [call.session_key]
-                    )
-
-                  Org.set_cleared_through_in_txn(txn, call.session_key, max_seq)
-
-                  # Probe seam (same idiom as `on_work_item_interlock`): lets a
-                  # test fail the transaction BETWEEN the two writes and prove the
-                  # barrier rolls back with them. Absent in production.
-                  case Map.get(call, :on_swap_interlock) do
-                    fun when is_function(fun, 1) -> fun.(txn)
-                    _ -> :ok
-                  end
-
-                  Projection.append_marker_in_txn(
-                    txn,
-                    call.session_key,
-                    swap_tombstone(session, harness, model)
-                  )
-                end)
-
-              case barrier do
-                {:error, error} ->
-                  # Rolled back: the barrier did NOT move and the history is
-                  # still shown. The session is already on the new engine, which
-                  # is the safe direction to fail in — an operator sees their
-                  # conversation and a refused swap, never an empty chat with no
-                  # account of why. No broadcast either: there is nothing to tell
-                  # clients to drop.
+                {:error, :turn_in_progress} ->
                   %{
                     ok: false,
-                    code: "swap_barrier_failed",
-                    message: describe_error(error)
+                    code: "turn_in_progress",
+                    message:
+                      "this session is running a turn, so switching its harness to #{harness} " <>
+                        "was not applied; it needs a turn boundary. Try again once the current turn finishes."
                   }
-
-                {:ok, _} ->
-                  broadcast(
-                    db,
-                    session.owner_user_id,
-                    Payloads.stream_history_cleared(call.session_key)
-                  )
-
-                  published_identity(model)
-                  |> Map.merge(%{
-                    ok: true,
-                    harness: harness,
-                    # The swap may have crossed providers, and the new provider's
-                    # credential on this host may be a different kind. This is
-                    # the one moment the value changes without the client polling
-                    # status. The router camelizes the key to `credentialKind`,
-                    # matching the session-status shape.
-                    credential_kind: credential_kind(Map.put(session, :harness, harness)),
-                    note:
-                      "engine swapped; chat cleared (rows retained); model context starts fresh"
-                  })
               end
             else
               {:error, denial} ->
@@ -3980,34 +3917,175 @@ defmodule Tightbeam.Gateway do
     :global.trans({{__MODULE__, :home_pin, harness, host}, self()}, fun)
   end
 
+  defp at_session_turn_boundary(config, session_key, fun) do
+    LaneManager.ensure_lane_quiet(config[:lane_manager] || LaneManager, session_key)
+
+    case Tightbeam.SessionLane.at_turn_boundary(session_key, fun) do
+      {:ok, result} -> {:ok, result}
+      boundary when boundary in [:busy, :no_lane] -> {:error, :turn_in_progress}
+    end
+  end
+
+  defp apply_harness_change(
+         config,
+         db,
+         call,
+         session,
+         harness,
+         harness_atom,
+         model,
+         provider
+       ) do
+    deliver_opts = if config[:sh], do: [sh: config.sh], else: []
+
+    # Pin the shared home to the model this session will run on the new
+    # harness, not the org default, so the next turn's session/new
+    # offers and accepts it (wi_263814d3).
+    with_home_pin_lock(harness_atom, session.host, fn ->
+      Placement.deliver_home(
+        config,
+        {harness_atom, "shared", session.host},
+        Keyword.put(deliver_opts, :model, model)
+      )
+    end)
+
+    Org.set_harness(
+      db,
+      call.session_key,
+      harness,
+      provider,
+      model
+    )
+
+    # History barrier (product ruling): a new engine gets a fresh
+    # visible slate. Rows are RETAINED (never deleted) but replay
+    # stops at the barrier, and live clients are told to drop their
+    # local view. No pointer surgery: the old harness session can't
+    # load on the new engine → fallback pointer, fresh context.
+    #
+    # ONE TRANSACTION, both writes. The barrier and its tombstone are a
+    # single fact: history stopped being shown, and here is why. Split
+    # across two transactions, a crash between them left the barrier
+    # moved with no marker — which is precisely the silent burial the
+    # tombstone exists to prevent, just rarer. The MAX(seq) read moved
+    # inside too, so a message landing between the read and the barrier
+    # cannot be buried without being counted.
+    # DB.transaction CATCHES a raise and RETURNS {:error, exception}. A
+    # hard {:ok, _} match here is a MatchError that crashes the wire
+    # call instead of denying it — the trap already documented at
+    # `ruling_transaction/2`, and one this very test caught.
+    barrier =
+      DB.transaction(db, fn txn ->
+        [[max_seq]] =
+          Txn.q(
+            txn,
+            "SELECT COALESCE(MAX(seq), 0) FROM messages WHERE sessionKey = ?1",
+            [call.session_key]
+          )
+
+        Org.set_cleared_through_in_txn(txn, call.session_key, max_seq)
+
+        # Probe seam (same idiom as `on_work_item_interlock`): lets a
+        # test fail the transaction BETWEEN the two writes and prove the
+        # barrier rolls back with them. Absent in production.
+        case Map.get(call, :on_swap_interlock) do
+          fun when is_function(fun, 1) -> fun.(txn)
+          _ -> :ok
+        end
+
+        Projection.append_marker_in_txn(
+          txn,
+          call.session_key,
+          swap_tombstone(session, harness, model)
+        )
+      end)
+
+    case barrier do
+      {:error, error} ->
+        # Rolled back: the barrier did NOT move and the history is
+        # still shown. The session is already on the new engine, which
+        # is the safe direction to fail in — an operator sees their
+        # conversation and a refused swap, never an empty chat with no
+        # account of why. No broadcast either: there is nothing to tell
+        # clients to drop.
+        %{
+          ok: false,
+          code: "swap_barrier_failed",
+          message: describe_error(error)
+        }
+
+      {:ok, _} ->
+        broadcast(
+          db,
+          session.owner_user_id,
+          Payloads.stream_history_cleared(call.session_key)
+        )
+
+        published_identity(model)
+        |> Map.merge(%{
+          ok: true,
+          harness: harness,
+          # The swap may have crossed providers, and the new provider's
+          # credential on this host may be a different kind. This is
+          # the one moment the value changes without the client polling
+          # status. The router camelizes the key to `credentialKind`,
+          # matching the session-status shape.
+          credential_kind: credential_kind(Map.put(session, :harness, harness)),
+          note: "engine swapped; chat cleared (rows retained); model context starts fresh"
+        })
+    end
+  end
+
+  # A live model-switch on a RESIDENT session used to hit set_config_option, which
+  # cannot re-read the projected home, so the harness refused any model its offered set
+  # did not already hold (mike's opus-5 picker-pain) and the raw refusal reached the
+  # client as `inspect(reason)` term soup. The fix (apply_tuned_model's resident
+  # branch) forks the conversation, resolves the requested canonical model
+  # through that fork's offered alias vocabulary, and verifies the readback
+  # before projection -- but that move must never land mid-turn, so it runs at
+  # the turn boundary. Ordering is
+  # `at_turn_boundary` OUTER, `run_session_mutation` INNER: the lane IS the
+  # serialization, and this is the only deadlock-safe nesting -- mutation-outer would
+  # wedge a reload that waits on the lane while the lane's bounce waits on the mutation
+  # lock (see repoint_main_session, the same shape). `ensure_lane_quiet` first so
+  # :no_lane can only mean the lane died in the gap, which we treat as busy: retry.
   defp apply_model_change(config, db, _call, session, new_ref) do
     with {:ok, routed} <- validate_catalog_model(session.host, session.harness, new_ref, false) do
-      result =
-        run_session_mutation(session.session_key, fn ->
-          apply_tuned_model(
-            config,
-            db,
-            session,
-            new_ref,
-            routed.provider
-          )
+      boundary =
+        at_session_turn_boundary(config, session.session_key, fn ->
+          run_session_mutation(session.session_key, fn ->
+            apply_tuned_model(config, db, session, new_ref, routed.provider)
+          end)
         end)
 
-      case result do
-        :ok ->
+      case boundary do
+        {:ok, :ok} ->
           %{ok: true}
 
-        {:error, reason} ->
-          # `reason:` is not a key the wire carries. `control_json` emits only `code`
-          # and `message`, so this returned `ok: false` with NEITHER -- and dropped
-          # the reason on the floor on the way out. A client saw a bare false and
-          # could not tell a refusal from a fault, which is the one thing a control
-          # response exists to say.
+        # A real fault from the switch (adapter down, context move could not complete) -- NOT
+        # the old frozen-offered-set refusal, which no longer exists. `apply_failure`
+        # prefers the harness's own message and never emits a raw term as a sentence.
+        {:ok, {:error, reason}} ->
           %{
             ok: false,
             code: "model_apply_failed",
             message:
-              "the live session did not accept #{Model.describe(new_ref)}: #{inspect(reason)}"
+              "could not switch this session to #{Model.describe(new_ref)}: " <>
+                "#{apply_failure(reason)} (the session could not prepare the new model " <>
+                "for its next turn)"
+          }
+
+        # Busy = a turn is in flight; the switch cannot land mid-turn, so the change
+        # was NOT applied. The honest remedy after this fix is to retry at the
+        # boundary -- never "start a new session" (the live switch replaces that old escape),
+        # and never a false intake/validation claim (the intake gate is a different axis).
+        {:error, :turn_in_progress} ->
+          %{
+            ok: false,
+            code: "turn_in_progress",
+            message:
+              "this session is running a turn, so switching to #{Model.describe(new_ref)} " <>
+                "was not applied; it needs a turn boundary. Try again once the current turn finishes."
           }
       end
     else
@@ -4032,41 +4110,75 @@ defmodule Tightbeam.Gateway do
                  {harness, "shared", session.host}
                ) do
           case Adapter.knows_session?(adapter, pointer.harness_session_id) do
+            # RESIDENT: Claude bound its offered-model set when it created this
+            # session. The adapter moves the conversation to a fresh fork,
+            # chooses only an alias that fork actually advertises, and returns
+            # success only after the harness reads that alias back. Harnesses
+            # with a live model set update in place. The caller holds the turn
+            # boundary, so no switch can land mid-turn. The old Claude session
+            # remains resident until the verified model and replacement
+            # pointer commit together below.
             true ->
-              apply_and_project_tuned_model(
-                db,
-                session,
-                adapter,
-                pointer.harness_session_id,
-                new_ref,
-                provider
-              )
+              cwd = Placement.holder_workdir(config, session)
+              revision = session.identity_revision || Identity.live_revision!(config.base_dir)
+              snapshot = served_snapshot(config, session, harness, revision)
+
+              with_home_pin_lock(harness, session.host, fn ->
+                pin_home_to_session_model(config, Map.put(session, :model, new_ref), harness)
+
+                with {:ok, switched_sid} <-
+                       AdapterCoordinator.with_load_slot(coordinator, session.host, fn ->
+                         Adapter.switch_model_session(
+                           adapter,
+                           pointer.harness_session_id,
+                           new_ref,
+                           cwd,
+                           mcp_servers_for_archetype(session.archetype),
+                           snapshot.guidance
+                         )
+                       end) do
+                  project_tuned_model(
+                    db,
+                    session,
+                    adapter,
+                    pointer.harness_session_id,
+                    switched_sid,
+                    new_ref,
+                    provider
+                  )
+                end
+              end)
 
             false ->
               cwd = Placement.holder_workdir(config, session)
               revision = session.identity_revision || Identity.live_revision!(config.base_dir)
               snapshot = served_snapshot(config, session, harness, revision)
 
-              with {:ok, ^new_ref} <-
-                     AdapterCoordinator.with_load_slot(coordinator, session.host, fn ->
-                       Adapter.load_session(
-                         adapter,
-                         pointer.harness_session_id,
-                         new_ref,
-                         cwd,
-                         mcp_servers_for_archetype(session.archetype),
-                         snapshot.guidance
-                       )
-                     end) do
-                project_tuned_model(
-                  db,
-                  session,
-                  adapter,
-                  pointer.harness_session_id,
-                  new_ref,
-                  provider
-                )
-              end
+              with_home_pin_lock(harness, session.host, fn ->
+                pin_home_to_session_model(config, Map.put(session, :model, new_ref), harness)
+
+                with {:ok, ^new_ref} <-
+                       AdapterCoordinator.with_load_slot(coordinator, session.host, fn ->
+                         Adapter.load_session(
+                           adapter,
+                           pointer.harness_session_id,
+                           new_ref,
+                           cwd,
+                           mcp_servers_for_archetype(session.archetype),
+                           snapshot.guidance
+                         )
+                       end) do
+                  project_tuned_model(
+                    db,
+                    session,
+                    adapter,
+                    pointer.harness_session_id,
+                    pointer.harness_session_id,
+                    new_ref,
+                    provider
+                  )
+                end
+              end)
 
             {:error, _reason} = error ->
               error
@@ -4075,18 +4187,6 @@ defmodule Tightbeam.Gateway do
           false -> {:error, :adapter_unavailable}
           {:error, reason} -> {:error, reason}
         end
-    end
-  end
-
-  defp apply_and_project_tuned_model(db, session, adapter, sid, new_ref, provider) do
-    # The per-session mutation lock is held by the caller. Adapter work finishes
-    # before the DB transaction begins; the DB owner never calls upward.
-    case Adapter.apply_model(adapter, sid, new_ref) do
-      :ok ->
-        project_tuned_model(db, session, adapter, sid, new_ref, provider)
-
-      {:error, _reason} = error ->
-        error
     end
   end
 
@@ -4107,7 +4207,15 @@ defmodule Tightbeam.Gateway do
     {family && %Model{family: family, effort: effort, context: context}, harness}
   end
 
-  defp project_tuned_model(db, session, adapter, sid, new_ref, provider) do
+  defp project_tuned_model(
+         db,
+         session,
+         adapter,
+         prior_sid,
+         switched_sid,
+         new_ref,
+         provider
+       ) do
     result =
       DB.transaction(db, fn txn ->
         {record_model, record_harness} = read_recorded_model(txn, session.session_key)
@@ -4122,15 +4230,53 @@ defmodule Tightbeam.Gateway do
           {:duplicate, _} -> :ok
           :stale -> raise("model mutation race inside serialized tune")
         end
+
+        if switched_sid != prior_sid do
+          Org.append_pointer_in_txn(txn, session.session_key, switched_sid, "loaded")
+        end
+
+        :ok
       end)
 
     case result do
       {:ok, :ok} ->
+        close_superseded_model_session(adapter, session.session_key, prior_sid, switched_sid)
         :ok
 
       {:error, error} ->
-        :ok = Adapter.forget_model_residency(adapter, sid)
+        reject_tuned_session(adapter, prior_sid, switched_sid)
         raise error
+    end
+  end
+
+  defp close_superseded_model_session(_adapter, _session_key, sid, sid), do: :ok
+
+  defp close_superseded_model_session(adapter, session_key, prior_sid, _switched_sid) do
+    case Adapter.close_session(adapter, prior_sid) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "model switch committed for #{session_key}, but superseded session #{prior_sid} " <>
+            "could not close: #{inspect(reason)}"
+        )
+    end
+  end
+
+  defp reject_tuned_session(adapter, sid, sid),
+    do: :ok = Adapter.forget_model_residency(adapter, sid)
+
+  defp reject_tuned_session(adapter, _prior_sid, switched_sid) do
+    case Adapter.close_session(adapter, switched_sid) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "model switch database projection failed, and replacement session #{switched_sid} " <>
+            "could not close: #{inspect(reason)}"
+        )
     end
   end
 
