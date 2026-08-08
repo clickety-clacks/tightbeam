@@ -299,6 +299,7 @@ defmodule Tightbeam.Acp.AdapterTest do
         return;
       }
       case "session/cancel": {
+        capture(m);
         if (stalledPrompt !== null && m.params.sessionId === stalledSession) {
           send({ id: stalledPrompt, error: { code: -32800, message: "canceled" } });
           stalledPrompt = null;
@@ -441,37 +442,6 @@ defmodule Tightbeam.Acp.AdapterTest do
     end
   end
 
-  defp prompt_count?(adapter, expected, remaining \\ 500) do
-    cond do
-      map_size(:sys.get_state(adapter).prompts) == expected -> true
-      remaining == 0 -> false
-      true -> Process.sleep(10) && prompt_count?(adapter, expected, remaining - 1)
-    end
-  end
-
-  defp pending_count?(conn, expected, remaining \\ 500) do
-    cond do
-      map_size(:sys.get_state(conn).pending) == expected -> true
-      remaining == 0 -> false
-      true -> Process.sleep(10) && pending_count?(conn, expected, remaining - 1)
-    end
-  end
-
-  defp prompt_entry(adapter) do
-    adapter
-    |> :sys.get_state()
-    |> Map.fetch!(:prompts)
-    |> Map.values()
-    |> List.first()
-  end
-
-  defp refute_prompt_monitors(adapter, conn, prompt) do
-    {:monitors, monitors} = Process.info(adapter, :monitors)
-    refute {:process, prompt.worker} in monitors
-    refute {:process, elem(prompt.from, 0)} in monitors
-    refute {:process, conn} in monitors
-  end
-
   defp queued_at?(adapter, request) do
     case Process.info(adapter, :messages) do
       {:messages, messages} ->
@@ -488,6 +458,24 @@ defmodule Tightbeam.Acp.AdapterTest do
       {nil, _} -> flunk("caller died before its call armed a timer")
       _ -> false
     end
+  end
+
+  defp pending_count?(conn, expected, remaining \\ 500) do
+    cond do
+      map_size(:sys.get_state(conn).pending) == expected -> true
+      remaining == 0 -> false
+      true -> Process.sleep(10) && pending_count?(conn, expected, remaining - 1)
+    end
+  end
+
+  defp prompt_requester(conn) do
+    conn
+    |> :sys.get_state()
+    |> Map.fetch!(:pending)
+    |> Map.values()
+    |> List.first()
+    |> Map.fetch!(:from)
+    |> elem(0)
   end
 
   defp assert_down(adapter, monitor) do
@@ -632,70 +620,67 @@ defmodule Tightbeam.Acp.AdapterTest do
     :sys.replace_state(adapter, &%{&1 | conn: inert_conn})
 
     prompt = Task.async(fn -> Adapter.prompt(adapter, "sess-1", "never acknowledged") end)
-    assert prompt_count?(adapter, 1)
-    prompt_entry = prompt_entry(adapter)
     assert Task.yield(prompt, 50) == nil
 
     send(inert_conn, :stop)
     assert {:error, :prompt_dispatch_failed} = Task.await(prompt)
 
     assert Adapter.conn(adapter) == inert_conn
-    assert prompt_count?(adapter, 0)
-    refute Process.alive?(prompt_entry.worker)
-    refute_prompt_monitors(adapter, inert_conn, prompt_entry)
   end
 
-  test "caller death ends a connected silent prompt and orphans its ACP request" do
-    {adapter, _capture_path} = start_adapter(gate_mode: "stall-turn", probe: false)
+  test "caller death preserves existing monitor ownership and requires explicit cancel" do
+    {adapter, capture_path} = start_adapter(gate_mode: "stall-turn", probe: false)
     assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
-
-    prompt = Task.async(fn -> Adapter.prompt(adapter, sid, "stall") end)
-    assert prompt_count?(adapter, 1)
-    prompt_entry = prompt_entry(adapter)
     conn = Adapter.conn(adapter)
-    assert Task.yield(prompt, 50) == nil
 
-    Task.shutdown(prompt, :brutal_kill)
-    assert prompt_count?(adapter, 0)
+    caller = Task.async(fn -> Adapter.prompt(adapter, sid, "stall") end)
+    assert pending_count?(conn, 1)
+    Task.shutdown(caller, :brutal_kill)
+
+    assert pending_count?(conn, 1)
+    refute Enum.any?(captured_requests(capture_path), &(&1["method"] == "session/cancel"))
+
+    Tightbeam.Acp.Conn.notify(conn, "session/cancel", %{sessionId: sid})
     assert pending_count?(conn, 0)
-    refute Process.alive?(prompt_entry.worker)
-    refute_prompt_monitors(adapter, conn, prompt_entry)
+    assert Enum.any?(captured_requests(capture_path), &(&1["method"] == "session/cancel"))
   end
 
-  test "prompt worker death reports the process edge and resolves ACP quiescence" do
-    {adapter, _capture_path} = start_adapter(gate_mode: "stall-turn", probe: false)
+  test "prompt worker death preserves existing monitor ownership and quiesces on explicit cancel" do
+    {adapter, capture_path} = start_adapter(gate_mode: "stall-turn", probe: false)
     assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
-
-    caller = Task.async(fn -> Adapter.prompt(adapter, sid, "stall") end)
-    assert prompt_count?(adapter, 1)
-    prompt = prompt_entry(adapter)
-    assert pending_count?(Adapter.conn(adapter), 1)
-
-    Process.exit(prompt.worker, :kill)
-
-    assert {:error, {:prompt_worker_down, ":killed"}} = Task.await(caller)
-    assert prompt_count?(adapter, 0)
-    assert pending_count?(Adapter.conn(adapter), 0)
-    refute Process.alive?(prompt.worker)
-    refute_prompt_monitors(adapter, Adapter.conn(adapter), prompt)
-  end
-
-  test "adapter death tears down its prompt worker and connection" do
-    {adapter, _capture_path} = start_adapter(gate_mode: "stall-turn", probe: false)
-    assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
-
-    caller = Task.async(fn -> Adapter.prompt(adapter, sid, "stall") end)
-    assert prompt_count?(adapter, 1)
-    prompt = prompt_entry(adapter)
     conn = Adapter.conn(adapter)
-    worker_monitor = Process.monitor(prompt.worker)
+
+    caller = Task.async(fn -> Adapter.prompt(adapter, sid, "stall") end)
+    assert pending_count?(conn, 1)
+    Process.exit(prompt_requester(conn), :kill)
+
+    assert pending_count?(conn, 1)
+    refute Enum.any?(captured_requests(capture_path), &(&1["method"] == "session/cancel"))
+
+    Tightbeam.Acp.Conn.notify(conn, "session/cancel", %{sessionId: sid})
+    assert pending_count?(conn, 0)
+    assert Enum.any?(captured_requests(capture_path), &(&1["method"] == "session/cancel"))
+
+    Process.exit(adapter, :kill)
+    assert {:error, {:adapter_unavailable, _reason}} = Task.await(caller)
+  end
+
+  test "adapter death tears down its prompt worker and connection through existing links" do
+    {adapter, _capture_path} = start_adapter(gate_mode: "stall-turn", probe: false)
+    assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+    conn = Adapter.conn(adapter)
+
+    caller = Task.async(fn -> Adapter.prompt(adapter, sid, "stall") end)
+    assert pending_count?(conn, 1)
+    worker = prompt_requester(conn)
+    worker_monitor = Process.monitor(worker)
     conn_monitor = Process.monitor(conn)
 
-    GenServer.stop(adapter, :normal)
+    Process.exit(adapter, :kill)
 
     assert {:error, {:adapter_unavailable, _reason}} = Task.await(caller)
-    assert_receive {:DOWN, ^worker_monitor, :process, _worker, _reason}
-    assert_receive {:DOWN, ^conn_monitor, :process, ^conn, :shutdown}
+    assert_receive {:DOWN, ^worker_monitor, :process, ^worker, _reason}
+    assert_receive {:DOWN, ^conn_monitor, :process, ^conn, :killed}
   end
 
   test "thought and tool progress stay routed while an unbounded prompt runs" do
@@ -710,18 +695,10 @@ defmodule Tightbeam.Acp.AdapterTest do
         )
       end)
 
-    assert prompt_count?(adapter, 1)
-    prompt = prompt_entry(adapter)
-    conn = Adapter.conn(adapter)
-
     assert {:ok, %{stop_reason: "end_turn", text: "progressed"}} = Task.await(caller)
 
     assert_receive {:progress, "Thinking…", 1}
     assert_receive {:progress, "Read config/runtime.exs", 2}
-    assert prompt_count?(adapter, 0)
-    assert pending_count?(conn, 0)
-    refute Process.alive?(prompt.worker)
-    refute_prompt_monitors(adapter, conn, prompt)
   end
 
   test "close_session sends ACP session/close with the harness session id" do
