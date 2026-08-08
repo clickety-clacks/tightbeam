@@ -1,25 +1,84 @@
 # Live-session tune CLI
 
 Status: implementation authority for `wi_6435c199-16aa-480e-8381-4c471e2ed35a`.
+This revision supersedes the earlier version and its authority addenda where they
+conflict.
 
 ## Spirit
 
-An operator must be able to change the engine of an existing Tightbeam session
-without replacing the session or moving its work to a successor. The supported
-CLI must preserve the session key, roles, assignments, work-item links, spawn
-lineage, and graph position. It must report the runtime configuration that the
-harness accepted. It must never claim success from a catalog guess or an
-unverified write.
+### Goal
 
-The command serves a deliberate operator change. It does not implement automatic
-fallback, succession, role rebinding, host movement, or a global rewrite of every
-model-selection consumer.
+An owner or administrator can deliberately change one runtime control on an active
+Tightbeam session through the supported CLI. The Tightbeam session keeps its identity,
+roles, work, lineage, and graph position. The command reports only state that the live
+harness accepted, or a named failure that states what Tightbeam knows.
 
-A harness change cannot preserve one harness's private conversation context in a
-different harness. The operation retains every substrate transcript row, moves the
-visible-history barrier with its existing tombstone, and starts a fresh engine
-context. A model or effort change inside one harness preserves the harness
-conversation through the existing verified switch or fork path.
+### Outcomes
+
+1. The operator can change the harness, model, thinking effort, or Fast setting.
+2. The operator can tell whether the runtime changed and whether Tightbeam stored the
+   verified projection.
+3. A cross-harness change keeps the source engine active until a verified destination
+   replaces it.
+4. Authorization, turn ordering, and non-identifying refusals remain intact.
+
+### Non-goals
+
+- Automatic fallback, host movement, role rebinding, succession, or broad picker work.
+- Conversation continuity across different harnesses.
+- Fast persistence across adapter or gateway restart.
+- Fast retention across a model or harness change.
+- A rollback engine for an in-place runtime change.
+- Static catalog guesses about live harness capabilities.
+
+### Quality stance
+
+Correctness, security, reliability, and observability are hard requirements. A slower
+verified change is preferable to an unverified success. Compatibility covers the live
+installed adapter versions captured by the reality gate. This slice does not optimize
+throughput or generalize unrelated model-selection code.
+
+## Terms
+
+- **Tightbeam session**: the durable session key and its substrate relationships.
+- **Engine context**: one harness's private conversation state behind that key.
+- **Runtime configuration**: the model, context variant, effort, and live Fast value
+  reported by the resident harness.
+- **Stored projection**: Tightbeam's database fields that describe verified runtime
+  state.
+- **Candidate runtime**: a destination harness session prepared before a cross-harness
+  swap.
+- **Control fence**: the existing per-session lane boundary while a tune operation
+  checks queued work and mutates runtime state.
+- **Eligible catalog snapshot**: a prior live catalog result for the same host, harness,
+  adapter version, and credential scope that contains the exact requested model row.
+
+## Falsifiable assumptions
+
+1. The same-harness switch or fork path can return exact live model and effort readback.
+2. The managed replacement seam can own and close both accepted and rejected
+   cross-harness candidates.
+3. The gateway can report a verified runtime value when a later projection commit fails.
+4. Claude Agent ACP 0.66.0 advertises Fast as `fast`, and Codex ACP 1.1.4 advertises Fast
+   as `fast-mode`, when the account and model support it. Both accept the live-advertised
+   values that correspond to `on` and `off`.
+5. The session lane can hold a control fence while it inspects durable queued work.
+
+If code or live smoke disproves an assumption, the producer pauses and files the exact
+evidence. The producer does not invent a second lifecycle, queue, or rollback mechanism.
+
+## Invariants
+
+1. One invocation changes one control dimension.
+2. The live harness owns runtime vocabulary. Exact readback owns success.
+3. The session key and every substrate relationship survive each successful change.
+4. Authorization occurs before target existence, readiness, or mutation becomes visible.
+5. A queued or running turn prevents mutation.
+6. A cross-harness database commit never occurs before destination verification.
+7. A failure never claims that the prior runtime remains active after an in-place change
+   may have reached the harness.
+8. Fast uses the live option advertised by the resident adapter and has no stored intent.
+9. Every managed-runtime cleanup failure leaves cause and principal in a durable row.
 
 ## Supported command
 
@@ -37,115 +96,128 @@ tightbeam tune --session <key> --effort <level>
 tightbeam tune --session <key> --fast on|off
 ```
 
-The normal identity flags apply: `--as <role>` and `--as-user <id>`. Session
-credential discovery also applies when the caller omits an identity flag.
+The normal identity flags apply: `--as <role>` and `--as-user <id>`. Session credential
+discovery applies when the caller omits an identity flag.
 
-One invocation changes one control dimension. A model's `model`, `effort`, and
-`context` fields form one dimension. A harness change includes its destination
-model because a model from the old harness is not a valid destination default.
-The CLI parser refuses all other combinations before it calls the gateway. This
-keeps partial multi-control application unrepresentable instead of adding a
-rollback mechanism.
+One invocation changes one control dimension. A model's `model`, `effort`, and `context`
+fields form one dimension. A harness change includes its destination model. Fast is a
+separate dimension. The CLI parser refuses invalid combinations before network I/O.
 
 The parser rules are:
 
 1. `--session` is required and targets one exact active session key.
 2. `--harness` requires `--model`. It may include `--effort` and `--context`.
 3. `--model` may include `--effort` and `--context`.
-4. `--effort` may appear alone and then applies to the current model.
+4. `--effort` may appear alone and applies to the current model.
 5. `--context` never appears without `--model`.
-6. `--fast` accepts only `on` or `off` and is mutually exclusive with the model
-   and harness fields.
-7. Model identity uses separate fields. The CLI never accepts a packed
-   `model[effort]` value. A vendor context variant may still appear in a catalog
-   row's issued reference and resolves through the catalog that issued it.
-8. At least one control is required. Unknown flags and empty required values are
-   usage errors and cause no request.
+6. `--fast` accepts only `on` or `off` and is mutually exclusive with all model fields.
+7. The CLI does not accept packed `model[effort]` syntax.
+8. At least one control is required. Unknown flags and empty required values are usage
+   errors.
 
-Examples:
-
-```text
-tightbeam tune --session "agent:coder:auth s_1234" \
-  --model gpt-5.6-sol --effort high
-
-tightbeam tune --session "agent:reviewer:auth s_5678" \
-  --harness codex --model gpt-5.6-sol --effort high
-
-tightbeam tune --session "agent:reviewer:auth s_5678" --fast on
-```
+If `--harness` names the current harness, the gateway returns `same_harness`. The operator
+uses the same-harness model form without `--harness`. This refusal avoids ambiguous engine
+context and creates no pointer, barrier, or tombstone.
 
 ## Field meanings
 
 - `--model` selects the vendor model family.
-- `--context` selects the vendor's context-window variant. Omission selects the
-  catalog row's default variant for a newly named model. An issued catalog
-  reference resolves back to the exact row that issued it.
-- `--effort` is Tightbeam's public name for the thinking or reasoning level. The
-  adapter translates it to the harness-owned config option. The current adapters
-  use `effort` for Claude and `reasoning_effort` for Codex.
-- `--fast` maps only to the live ACP session config option whose id is `fast`.
-  With the current Tightbeam ACP client capability, Claude Agent ACP 0.66.0
-  exposes that option as the select values `on` and `off`. Fast is a per-session
-  Claude runtime preference. It is not part of `Tightbeam.Model`, not an effort
-  tier, and not a model-catalog field. A harness or current model that does not
-  advertise the live `fast` option does not support this control.
+- `--context` selects the vendor context-window variant. Omission selects the issuing
+  catalog row's default variant for a newly named model.
+- `--effort` is Tightbeam's name for the thinking or reasoning level. The adapter
+  translates it to the harness-owned config option.
+- `--fast` is Tightbeam's harness-neutral on/off control. The resident adapter normalizes
+  the live advertised Fast capability. The current Claude adapter maps `fast`; the current
+  Codex adapter maps `fast-mode`. The gateway never guesses an option id from the harness
+  name and never stores Fast as a model, effort, catalog, or durable intent field.
 
-## Authority
+## Architecture and apply semantics
 
-The gateway resolves the caller before it mutates anything. The caller's user
-must own the target session, or the caller must be an admin. This matches the
-existing owner-scoped client control path. A process identity cannot tune a
-session. An unauthorized or unknown target returns the same non-identifying
-`not_found` result and performs no readiness probe or mutation.
+### Authority and privacy seam
 
-## Apply semantics
+The gateway resolves the caller before it probes or mutates the target. The caller's user
+must own the target session, or the caller must be an administrator. A process identity
+cannot tune a session.
 
-Every mode runs at a session turn boundary. A queued or running turn causes an
-immediate `turn_in_progress` refusal. The command never waits behind the turn and
-never lands a change mid-turn. The operator retries after the turn finishes.
+For `tune`, `/agent/dispatch` parses the typed target but defers session-key resolution to
+the gateway authorization seam. Unknown and foreign targets therefore return the same
+byte-equivalent, non-identifying `not_found` result. Other verbs keep their current router
+behavior.
 
-### Model and effort
+### Turn boundary
 
-The gateway resolves the requested fields against the target session's host and
-current harness. Catalog freshness may permit a degraded attempt, but catalog
-membership never proves success. The adapter applies the model and effort through
-the existing resident switch or fork path. It reads the harness config back and
-commits the model fields and replacement pointer only after the readback matches.
-Failure leaves the stored model and pointer unchanged and closes or forgets any
-rejected replacement session.
+The tune operation acquires the existing per-session lane as its control fence. While it
+holds that fence, it checks both the active task reference and the durable queued-turn
+ledger. Either condition returns `turn_in_progress` without waiting or mutation. The fence
+is the linearization point: a turn queued after acquisition waits for the accepted tune;
+a turn filed before acquisition causes refusal. Tune does not add a second queue or lock.
 
-### Harness
+### Model and effort inside one harness
 
-The gateway validates the destination credential, host readiness, harness, model,
-context, and effort before it changes the session row or visible-history barrier.
-It projects the destination home, starts a destination harness session, applies
-the requested model fields, and verifies the harness readback. Only then does one
-database transaction change the harness, provider, model fields, pointer,
-visible-history barrier, and swap tombstone. If validation, startup, application,
-readback, or commit fails, the original harness, model, pointer, and visible
-history remain active. The gateway closes the rejected destination session.
+The gateway resolves the request against the target host and resident harness. A degraded
+attempt is permitted only from an eligible catalog snapshot. Live apply and readback still
+decide the outcome.
 
-On success, the session key and all substrate relationships remain unchanged.
-The visible chat resets at the tombstone because the destination engine has a new
-private context. Transcript rows remain readable through the transcript command.
+The adapter applies the model fields through the existing context-preserving path and then
+reads the complete runtime configuration. If readback exactly matches, the gateway commits
+the stored projection. If a field applied but the verified configuration differs from the
+request, the gateway reconciles the projection to the verified configuration and returns
+nonzero `runtime_config_mismatch` with those values. It does not claim the prior runtime.
+
+If exact readback fails after mutation may have started, the gateway returns nonzero
+`runtime_config_unknown`. It marks the resident projection stale through the existing
+residency mechanism. The next status or tune operation must read the live runtime before
+it reports or changes it.
+
+If exact readback succeeds but the projection commit fails, the gateway returns nonzero
+`runtime_projection_failed`. It includes the verified active configuration and
+`projectionCommitted: false`. Repeating the request reads the runtime and retries the
+projection commit. Tightbeam adds no automatic rollback.
+
+An idempotent same-harness request first reads the runtime. If it already matches, the
+gateway reconciles a stale stored projection if necessary and returns success with
+`engineContext: "preserved"`. It creates no pointer, barrier, or tombstone.
+
+### Harness replacement
+
+The gateway validates the destination credential, host readiness, harness, model, context,
+and effort before it changes the session row or history barrier. It creates the candidate
+through the existing managed replacement seam, applies the requested fields, and verifies
+the complete live readback. Only then does one database transaction change the harness,
+provider, model fields, pointer, visible-history barrier, and swap tombstone.
+
+A pre-commit failure keeps the source runtime active and requests candidate teardown. The
+gateway verifies teardown. If teardown cannot be verified, it returns
+`destination_cleanup_failed`, reports the source as active, and leaves the candidate with
+the existing lifecycle owner and a durable cause/principal marker.
+
+After a successful commit, the destination runtime is active. The managed replacement seam
+closes the superseded source runtime and verifies closure. If closure cannot be verified,
+the command returns nonzero `source_cleanup_failed`, reports the destination as active, and
+leaves the source with that same lifecycle owner and a durable cause/principal marker.
+
+On success, the session key and all substrate relationships remain unchanged. The visible
+chat resets at the tombstone because the destination engine has a new private context.
+Transcript rows remain available through the transcript command.
 
 ### Fast
 
-The gateway asks the resident harness session for its live config options. It
-refuses `fast_unsupported` unless that response contains the `fast` option. It
-sends `session/set_config_option` with `configId: "fast"` and `value: "on"` or
-`"off"`, then reads the returned option value. Success requires an exact
-readback. Fast does not use the derived model catalog and does not silently map
-to a model, effort, or provider flag.
+The resident adapter exposes a canonical Fast control only when its live config response
+advertises the adapter's supported Fast option and live values. The gateway sends the value
+that the adapter maps from `on` or `off`, then reads the option back. Exact readback owns
+success. A missing option returns `fast_unsupported` without a guessed config id.
 
-The current Claude adapter retains the user's Fast intent across supported model
-switches inside that adapter session. A harness switch starts a new engine context,
-so Fast starts from the destination harness's reported value. The operator can run
-a separate `--fast` command after the harness switch. Tightbeam does not claim
-Fast persistence across gateway or adapter restart until a live resume test proves
-that property.
+Fast is intentionally ephemeral. Tightbeam stores no Fast intent and does not reapply it
+after adapter or gateway restart. Session status queries the resident adapter. It reports
+`fastStatus: "known"` with `fast: "on"|"off"`, `fastStatus: "unsupported"` with `fast: null`,
+or `fastStatus: "unknown"` with `fast: null` when live readback is unavailable. A model or
+harness change makes no retention promise and reports the live value it can verify.
 
-## Result
+If readback fails after the Fast write may have started, the gateway returns
+`runtime_config_unknown` and does not claim the prior Fast value. Fast has no stored
+projection commit.
+
+### Result
 
 Success exits zero and prints one JSON object built from verified state:
 
@@ -157,118 +229,127 @@ Success exits zero and prints one JSON object built from verified state:
   "model": "gpt-5.6-sol",
   "effort": "high",
   "context": null,
-  "fast": null,
+  "fast": "on",
+  "fastStatus": "known",
+  "projectionCommitted": true,
   "engineContext": "preserved"
 }
 ```
 
-`fast` is `"on"`, `"off"`, or `null` when the live harness does not advertise
-it. `engineContext` is `preserved` for model, effort, and Fast changes. It is
-`reset` for a harness change. The response reports the actual accepted values,
-not the request echoed back.
+`engineContext` is `preserved` for same-harness model, effort, and Fast changes. It is
+`reset` for a cross-harness change. Failure JSON includes verified actual fields whenever
+they are known. The response never echoes an unverified requested value as actual state.
 
-An idempotent request whose verified state already matches returns success with
-the same shape. This command does not need an idempotency key because a repeated
-single-control request converges on the same verified state and does not create a
-new substrate identity or work record.
+### Stable refusals
 
-## Refusals
-
-All refusals exit nonzero, print the gateway error JSON, and leave the prior
-configuration active.
+Every refusal exits nonzero and prints gateway error JSON. Only codes that state the source
+runtime is active may make that claim.
 
 - `not_found`: the session is unknown, retired, or not visible to the caller.
-- `turn_in_progress`: a turn is queued or running; retry at the boundary.
+- `turn_in_progress`: a turn was queued or running at the control fence.
+- `same_harness`: `--harness` named the resident harness; use `--model` instead.
 - `unknown_harness`: the harness name is not registered.
-- `host_unready`: the target host cannot run the selected harness.
+- `host_unready`: the target host cannot run the destination harness.
 - `credential_unavailable`: the destination credential is absent or unusable.
-- `catalog_unavailable`: the host cannot supply enough model facts to attempt
-  the change honestly.
+- `catalog_unavailable`: no fresh catalog or eligible snapshot can support the attempt.
 - `model_unavailable`: the requested model, context, or effort is not offered.
-- `model_apply_failed`: the harness refused or could not verify the model fields.
-- `fast_unsupported`: the live session does not advertise the `fast` option.
-- `fast_apply_failed`: the harness refused Fast or returned a mismatched readback.
-- `session_config_commit_failed`: verified runtime state could not be committed;
-  the replacement runtime is rejected and the original state remains active.
+- `model_apply_failed`: the harness refused before any runtime field could change.
+- `fast_unsupported`: the resident adapter did not expose an advertised Fast control.
+- `runtime_config_mismatch`: verified active fields differ from the request.
+- `runtime_config_unknown`: mutation may have occurred and exact live state is unavailable.
+- `runtime_projection_failed`: verified runtime is active, but its stored projection failed.
+- `session_config_commit_failed`: a staged cross-harness commit failed; source stays active.
+- `destination_cleanup_failed`: source stays active; rejected candidate cleanup is pending.
+- `source_cleanup_failed`: destination is active; superseded source cleanup is pending.
 
-Harness errors must be translated into one concise operator sentence. Raw Elixir
-terms, ACP payload dumps, and inferred fallback models never reach the user.
+Harness errors become one concise operator sentence. Raw Elixir terms, ACP payload dumps,
+and inferred fallback models never reach the user.
 
-## Implementation boundary
+### Implementation boundary
 
-The CLI adds one `Tune` command and sends the existing `tune` gateway verb with
-one of `set_harness`, `set_model`, `set_reasoning`, or `set_fast_mode`. It does not
-call the client-only `/api/session-control` facade. The gateway keeps one mutation
-lock and one turn-boundary mechanism per session.
+The CLI adds one `Tune` command and sends the existing `tune` gateway verb with one of
+`set_harness`, `set_model`, `set_reasoning`, or `set_fast_mode`. It does not call the
+client-only `/api/session-control` facade.
 
-The adapter adds a generalized verified live-config operation for options that
-the harness actually advertises. Model and effort keep their current specialized
-path. Fast uses the generalized path. No static Fast support table is added.
+The gateway uses the existing session lane and managed replacement seam. The adapter adds
+one normalized, verified live-config operation for options the harness advertises. It
+normalizes current Claude `fast` and Codex `fast-mode` at the adapter boundary. No gateway
+Fast table and no parallel runtime lifecycle mechanism are added.
 
-The session-status projection must source Fast availability and current value
-from the same live config readback used by the mutation. The CLI, Clawline, and
-future clients must not maintain separate Fast capability guesses.
+Session status and tune use the same live runtime readback. The CLI, Clawline, and future
+clients do not maintain separate capability guesses. This slice applies the unified model
+resolution ruling only at the seams it touches.
 
-This slice applies the unified model-resolution ruling at every seam it touches:
-fields remain separate, the live harness owns its vocabulary, and readback decides
-success. It does not authorize a broad refactor of unrelated spawn, fallback, or
-picker code under `wi_4e1d39f7-0425-4607-bebb-7f81b2f30eb9`.
-
-## Acceptance tests
+## Acceptance
 
 ### CLI parser and wire
 
-1. Each of the four supported forms parses and produces the exact typed `tune`
-   request with separate model fields.
-2. Missing `--session`, missing destination `--model`, `--context` alone,
-   `--fast` with another control, invalid Fast values, packed effort syntax, and
-   no control all fail before network I/O.
-3. Help lists the command, field meanings, continuity rule, and Fast limitation.
+1. Each supported form produces the exact typed `tune` request with separate model fields.
+2. Missing required fields, invalid combinations, packed effort syntax, and no control fail
+   before network I/O.
+3. Help lists the field meanings, context continuity, Fast behavior, and same-harness rule.
 4. Session-file identity, `--as`, and `--as-user` use the ordinary identity path.
-5. A successful response prints verified fields. A gateway refusal exits nonzero
-   and preserves its structured code and message.
+5. A gateway refusal exits nonzero and preserves its structured code and message.
 
-### Gateway and authorization
+### Authorization and ordering
 
-1. The owner and an admin can tune. Another owner and a process get non-identifying
-   `not_found` without a mutation or readiness call.
-2. Unknown and retired sessions refuse.
-3. Every mode refuses at a queued or running turn and leaves all state unchanged.
-4. Repeating an already-applied request succeeds without creating another pointer,
-   barrier, or tombstone.
+1. The owner and an administrator can tune. Another owner and a process get byte-equivalent
+   `not_found` results without readiness or mutation calls.
+2. Unknown and retired sessions refuse without revealing existence.
+3. An idle lane with a durable queued turn refuses before mutation.
+4. A running turn refuses before mutation.
+5. A turn queued after the accepted control fence starts only after tune releases the lane.
 
 ### Model, effort, and harness
 
-1. Model and effort readback success commits the exact family, context, effort,
-   provider, and pointer.
-2. A stale catalog can permit an attempt, but a mismatched live readback refuses
-   and leaves the prior selection intact.
-3. A harness switch verifies a fresh destination runtime before one transaction
-   commits the harness, provider, model, pointer, barrier, and tombstone.
-4. Each failure before that transaction keeps the original engine usable and
-   closes the destination session.
-5. A successful harness switch keeps the session key, roles, assignments,
-   work-item links, spawn lineage, workdir, identity revision, and overrides.
-6. A successful harness switch reports `engineContext: "reset"`; same-harness
-   changes report `"preserved"`.
+1. Exact model and effort readback commits the exact family, context, effort, and provider.
+2. A partial in-place apply returns verified actual state as `runtime_config_mismatch` or
+   returns `runtime_config_unknown`; it never claims the prior state.
+3. A projection failure returns `runtime_projection_failed` with actual values. A repeated
+   request reconciles the projection without another pointer.
+4. A stale catalog attempt requires every eligible-snapshot field. A missing or mismatched
+   field returns `catalog_unavailable` before mutation.
+5. A same-harness `--harness` refuses without a pointer, barrier, or tombstone.
+6. A cross-harness switch verifies a destination before one transaction commits runtime,
+   pointer, barrier, and tombstone fields.
+7. Candidate teardown failure returns `destination_cleanup_failed` with a managed cleanup
+   marker. Superseded source teardown failure returns `source_cleanup_failed` with the new
+   runtime reported active and the same marker form.
+8. A successful cross-harness switch keeps the session key, roles, assignments, work-item
+   links, spawn lineage, workdir, identity revision, and overrides.
 
 ### Fast
 
-1. A captured real Claude Agent ACP 0.66.0 config response contains the `fast`
-   option for a Fast-capable model and records its exact option type and values.
-2. `--fast on` and `--fast off` send the live option's accepted value and require
-   exact readback before success.
-3. A missing option refuses `fast_unsupported` without sending a guessed config id.
-4. A refusal, timeout, or mismatched readback returns `fast_apply_failed` and does
-   not report a changed value.
-5. Session status and CLI output use the same cached live readback.
+1. Captured real Claude Agent ACP 0.66.0 and Codex ACP 1.1.4 responses prove each normalized
+   option id, option type, and accepted values.
+2. Fast on and off use the live advertised option and require exact readback.
+3. A missing option returns `fast_unsupported` without a guessed config id.
+4. Failed readback after a possible write returns `runtime_config_unknown`.
+5. Status and tune use one live readback and distinguish known, unsupported, and unknown.
+6. Restart tests prove that Tightbeam does not reapply Fast intent. A model change reports
+   the post-change live value without a retention assertion.
 
 ### Reality gate
 
-Before merge, run the live feature-smoke matrix against fresh Claude and Codex
-sessions with the installed adapter versions. Capture the real config responses as
-fixtures. Prove same-harness model and effort continuity on both harnesses. Prove a
-Claude Fast toggle on and off when the account and model advertise it. Prove the
-Codex session refuses Fast honestly. Prove both cross-harness directions preserve
-the Tightbeam session key and work relationships while resetting only engine
-context. A mocked adapter cannot satisfy this gate.
+Before merge, run the feature-smoke matrix against fresh Claude and Codex sessions with the
+installed adapter versions. Capture the real config responses as fixtures. Prove
+same-harness model and effort continuity on both harnesses. Prove Fast on and off on each
+advertising harness. Prove both cross-harness directions preserve the Tightbeam session key
+and work relationships while resetting only engine context. Prove the next real turn runs
+on the accepted runtime. A mocked adapter cannot satisfy this gate.
+
+## Open questions
+
+None. A disproved assumption reopens this spec before implementation continues.
+
+## Specification homes
+
+- Public CLI and behavior: this document.
+- Wire request types: the CLI and gateway source types.
+- Live capability evidence: captured real fixtures and the feature-smoke record.
+- Architecture principles: `wi_4e1d39f7-0425-4607-bebb-7f81b2f30eb9`.
+- Agent operating guidance: no new operating pattern. The command follows the existing
+  session-control and assignment practices.
+
+Tests, fixtures, catalogs, and comments are evidence or implementation. They do not override
+this product authority.
