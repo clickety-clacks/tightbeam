@@ -272,9 +272,22 @@ defmodule Tightbeam.Homes do
   #
   # So the refusal still REFUSES -- nothing hollow is banked, the good credential stands --
   # and it still NAMES itself, at :error where an operator and the log both see it. What it
-  # no longer does is take the org down to say so. The affected provider then reports
-  # `needs_onboarding` through the ordinary credential status path, which is the org's
-  # existing word for "this credential cannot serve".
+  # no longer does is take the org down to say so.
+  #
+  # The provider's STATUS IS UNCHANGED BY THIS, deliberately. The store credential still
+  # authenticates, so `Credentials.status/2` keeps answering `:onboarded` -- which is true.
+  # Reporting `needs_onboarding` here would tell an operator to re-onboard a credential that
+  # works, and writing a false status into the org's own state is the same class of mistake
+  # as banking a hollow one.
+  #
+  # What IS degraded is the one home, and it does NOT heal itself. `reconcile_local/3` calls
+  # `harvest_auth_back/4` BEFORE the `File.rm` that would clear the vendor's file, so
+  # reconciling that home raises there and never reaches the relink -- session placement into
+  # it fails, by name, until someone deletes the file. That is the right failure: a session
+  # started against a hollow credential dies with `authentication_failed` an hour later and
+  # points at nothing, while this refuses at the door and says which home. But it is manual
+  # to clear, not transient, and the `:error` line is the only signal. A durable health
+  # surface for it belongs to the doctor check (wi_8b89e50c), not here.
   defp harvest_one(base_dir, module, home, bytes) do
     Tightbeam.Credentials.store_harvested(
       base_dir,
