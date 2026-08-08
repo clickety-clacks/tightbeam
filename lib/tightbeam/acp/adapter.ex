@@ -236,7 +236,8 @@ defmodule Tightbeam.Acp.Adapter do
 
   @doc """
   Run a turn: sends session/prompt, accumulates agent_message_chunk text while
-  this GenServer keeps routing updates, replies when the harness finishes.
+  this GenServer keeps routing updates, and preserves the public ACP messageId
+  boundary between distinct assistant messages before the harness finishes.
 
   A harness that dies MID-PROMPT kills this adapter before it can reply, so the
   call must be caught like every other adapter-boundary call: otherwise the turn
@@ -245,7 +246,13 @@ defmodule Tightbeam.Acp.Adapter do
   (cross-review F1; the spec names runtime failures an adapter-fault form).
   """
   @spec prompt(adapter(), String.t(), String.t(), keyword()) ::
-          {:ok, %{stop_reason: String.t(), text: String.t()}} | {:error, term()}
+          {:ok,
+           %{
+             stop_reason: String.t(),
+             text: String.t(),
+             messages: [%{message_id: String.t() | nil, text: String.t()}]
+           }}
+          | {:error, term()}
   def prompt(adapter, session_id, text, opts \\ []),
     do: call(adapter, {:prompt, session_id, text, opts}, :infinity)
 
@@ -879,9 +886,11 @@ defmodule Tightbeam.Acp.Adapter do
 
     if update["sessionUpdate"] == "agent_message_chunk" do
       text = get_in(update, ["content", "text"])
+      message_id = assistant_message_id(update)
 
       if is_binary(text) and Map.has_key?(state.chunks, sid) do
-        {:noreply, update_in(state.chunks[sid], &[text | &1])}
+        {:noreply,
+         update_in(state.chunks[sid], &accumulate_assistant_chunk(&1, message_id, text))}
       else
         {:noreply, state}
       end
@@ -891,12 +900,14 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   def handle_info({:prompt_done, sid, from, result}, state) do
-    text = state.chunks |> Map.get(sid, []) |> Enum.reverse() |> Enum.join()
+    messages = state.chunks |> Map.get(sid, []) |> assistant_messages()
+    text = Enum.map_join(messages, & &1.text)
 
     reply =
       case result do
         {:ok, response} ->
-          {:ok, %{stop_reason: response["stopReason"] || "unknown", text: text}}
+          {:ok,
+           %{stop_reason: response["stopReason"] || "unknown", text: text, messages: messages}}
 
         {:error, reason} ->
           {:error, reason}
@@ -965,6 +976,32 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   def handle_info(_msg, state), do: {:noreply, state}
+  # ACP's public `messageId` is the only boundary authority. Claude and Codex
+  # stamp every chunk from one assistant message with the same stable id. A
+  # changed id starts a new message record; an absent id preserves the legacy
+  # one-message accumulator instead of guessing from content or tool traffic.
+  defp assistant_message_id(%{"messageId" => id}) when is_binary(id) and id != "", do: id
+  defp assistant_message_id(_update), do: nil
+
+  defp accumulate_assistant_chunk(
+         [%{message_id: message_id, chunks: chunks} | rest],
+         message_id,
+         text
+       ),
+       do: [%{message_id: message_id, chunks: [text | chunks]} | rest]
+
+  defp accumulate_assistant_chunk(groups, message_id, text),
+    do: [%{message_id: message_id, chunks: [text]} | groups]
+
+  defp assistant_messages([]), do: [%{message_id: nil, text: ""}]
+
+  defp assistant_messages(groups) do
+    groups
+    |> Enum.reverse()
+    |> Enum.map(fn %{message_id: message_id, chunks: chunks} ->
+      %{message_id: message_id, text: chunks |> Enum.reverse() |> Enum.join()}
+    end)
+  end
 
   @impl GenServer
   def format_status(status) do

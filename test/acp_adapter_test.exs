@@ -353,6 +353,13 @@ defmodule Tightbeam.Acp.AdapterTest do
           }
           if (gateMode === "stall") return;
         }
+        if (gateMode === "message-boundaries") {
+          send({ method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "agent_message_chunk", messageId: "msg-1", content: { type: "text", text: "first " } } } });
+          send({ method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "tool_call", title: "boundary-preserving tool" } } });
+          send({ method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "agent_message_chunk", messageId: "msg-1", content: { type: "text", text: "message" } } } });
+          send({ method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "agent_message_chunk", messageId: "msg-2", content: { type: "text", text: "second message" } } } });
+          return send({ id: m.id, result: { stopReason: "end_turn" } });
+        }
         send({ method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "po" } } } });
         send({ method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "ng" } } } });
         pendingPrompt = m.id;
@@ -587,8 +594,12 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert [%{"method" => "session/new", "mcpServers" => ^mcp_servers}] =
              session_requests(capture_path)
 
-    assert {:ok, %{stop_reason: "end_turn", text: "pong[allow-once]"}} =
-             Adapter.prompt(a, "sess-1", "say pong")
+    assert {:ok,
+            %{
+              stop_reason: "end_turn",
+              text: "pong[allow-once]",
+              messages: [%{message_id: nil, text: "pong[allow-once]"}]
+            }} = Adapter.prompt(a, "sess-1", "say pong")
   end
 
   test "new_session with an unknown record keeps and captures the harness default" do
@@ -1869,6 +1880,24 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert log =~ "subagent event ingestion failed"
     assert log =~ "retry=false"
     assert Process.alive?(adapter)
+  end
+
+  test "prompt preserves distinct ACP assistant message ids across chunk and tool updates" do
+    {adapter, _capture_path} =
+      start_adapter(gate_mode: "message-boundaries", probe: false)
+
+    assert {:ok, sid} =
+             Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+
+    assert {:ok,
+            %{
+              stop_reason: "end_turn",
+              text: "first messagesecond message",
+              messages: [
+                %{message_id: "msg-1", text: "first message"},
+                %{message_id: "msg-2", text: "second message"}
+              ]
+            }} = Adapter.prompt(adapter, sid, "preserve boundaries")
   end
 
   test "consecutive prompts reset the accumulator" do

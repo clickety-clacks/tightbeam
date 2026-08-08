@@ -182,10 +182,27 @@ defmodule Tightbeam.GatewayTest do
     def handle_call({:prompt, _sid, prompt, _opts}, from, parent) do
       send(parent, {:prompt_started, self()})
 
+      messages =
+        case prompt do
+          "split assistant messages" ->
+            [
+              %{message_id: "fake-message-1", text: "FIRST"},
+              %{message_id: "fake-message-2", text: "SECOND"}
+            ]
+
+          _ ->
+            [%{message_id: "fake-message", text: String.upcase(prompt)}]
+        end
+
       receive do: (:continue_prompt ->
                      GenServer.reply(
                        from,
-                       {:ok, %{text: String.upcase(prompt), stop_reason: "end_turn"}}
+                       {:ok,
+                        %{
+                          text: Enum.map_join(messages, & &1.text),
+                          messages: messages,
+                          stop_reason: "end_turn"
+                        }}
                      ))
 
       {:noreply, parent}
@@ -4908,6 +4925,94 @@ defmodule Tightbeam.GatewayTest do
   # also 60_000, so the budget would be capped by the test timeout and would report
   # as "test timed out" rather than naming the wait that actually ran out. Raise the
   # ceiling above the budget it contains.
+  @tag timeout: 180_000
+  test "one turn stores and publishes distinct ACP assistant messages as separate records", ctx do
+    exact_registry =
+      start_supervised!(%{
+        id: :boundary_conn_registry,
+        start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+      })
+
+    adapter = start_supervised!({AdapterStub, self()})
+    start_supervised!({CoordinatorStub, {adapter, self()}})
+
+    {:ok, _ref, nil} =
+      ConnRegistry.register(exact_registry, %{
+        pid: self(),
+        user_id: "flynn",
+        device_id: "boundaries",
+        is_admin: false,
+        subscriptions: MapSet.new(["chat"])
+      })
+
+    config = %{
+      base_dir: gateway_children_base!(),
+      cwd: "/tmp",
+      port: 0,
+      default_harness: :claude,
+      default_model: Model.new("claude-fable-5"),
+      max_live_sessions_per_user: 50,
+      wake_tick_ms: 1_000,
+      onboarding_lease_ms: 1_800_000,
+      db: ctx.db
+    }
+
+    {Tightbeam.LaneManager, lane_opts} =
+      config
+      |> Gateway.children()
+      |> Enum.find(&match?({Tightbeam.LaneManager, _}, &1))
+
+    runner = Keyword.fetch!(lane_opts, :runner)
+
+    assert :appended =
+             Gateway.deliver_prompt("k1", "user:flynn", "split assistant messages",
+               db: ctx.db,
+               conn_registry: exact_registry,
+               lane_manager: ctx.lane,
+               device_id: "boundaries",
+               client_message_id: "c_boundaries"
+             )
+
+    assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
+    echo = Projection.get(ctx.db, turn.message_id)
+    task = Task.async(fn -> runner.(Map.put(turn, :session_key, "k1")) end)
+
+    assert_receive {:prompt_started, ^adapter}, @cold_runner_prompt_timeout
+    send(adapter, :continue_prompt)
+    assert {:ok, %{terminal_publish: publish}} = Task.await(task)
+    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
+    publish.("delivered")
+
+    replies =
+      ctx.db
+      |> Projection.list_after("k1", echo.id, 10)
+      |> Enum.filter(&(&1.sender == "tightbeam"))
+
+    assert Enum.map(replies, & &1.content) == ["FIRST", "SECOND"]
+    assert Enum.map(replies, & &1.reply_to_message_id) == [echo.id, echo.id]
+    assert Enum.map(replies, & &1.reply_to_client_message_id) == ["c_boundaries", "c_boundaries"]
+    assert Enum.map(replies, & &1.seq) == Enum.sort(Enum.map(replies, & &1.seq))
+
+    frames = collect_pushes(10, [])
+
+    assert Enum.map(frames, &frame_name/1) == [
+             "message:user",
+             "turn:accepted",
+             "turn:running",
+             "typing:true",
+             "activity:true",
+             "message:assistant",
+             "message:assistant",
+             "turn:delivered",
+             "typing:false",
+             "activity:false"
+           ]
+
+    assert frames
+           |> Enum.filter(&(&1["type"] == "message" and &1["role"] == "assistant"))
+           |> Enum.map(& &1["content"]) == ["FIRST", "SECOND"]
+  end
+
   @tag timeout: 180_000
   test "one fake-adapter turn uses the MCP fallback and publishes the golden frame order", ctx do
     exact_registry =

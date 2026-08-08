@@ -29,9 +29,9 @@ defmodule Tightbeam.Gateway do
      the session's pointer generation is stale, session/load under the load
      semaphore, appending pointer reason "loaded".
   3. No pointer yet → Adapter.new_session, append pointer "created".
-  4. Adapter.prompt; on {:ok, %{text: _}} append the assistant message to
-     Projection (sender "tightbeam", reply_to the echo) and publish via
-     ConnRegistry (seq-ordered, from the commit path).
+  4. Adapter.prompt; append each distinct ACP assistant message to Projection
+     (sender "tightbeam", reply_to the echo) in one transaction, then publish
+     each committed row via ConnRegistry in seq order.
   5. Terminal: Ledger.finish CAS in the lane; broadcast terminal
      prompt_turn_state + typing(off) + activity(off). Golden frame order for
      the canonical turn: echo → accepted → running → typing(on) →
@@ -1794,22 +1794,7 @@ defmodule Tightbeam.Gateway do
                      progress_fun(db, turn.session_key, session.owner_user_id, correlation)
                  )
                ) do
-          # THE reply seam. The agent elected an attention tier for this turn (or
-          # elected nothing, which is normal); the substrate copies the election
-          # onto the reply it is appending. Marker and credential-transition
-          # appends are not this seam and stay normal.
-          case Projection.append(db, %{
-                 session_key: turn.session_key,
-                 role: "assistant",
-                 content: result.text,
-                 sender: "tightbeam",
-                 reply_to_message_id: echo && echo.id,
-                 reply_to_client_message_id: echo && echo.client_message_id,
-                 attention_tier: elected_attention(db, turn.seq)
-               }) do
-            {:appended, reply} -> publish_message(db, turn.session_key, reply)
-            _ -> :ok
-          end
+          append_assistant_messages(db, turn, echo, result)
 
           {:ok, %{terminal_publish: terminal_publish}}
         else
@@ -1900,6 +1885,41 @@ defmodule Tightbeam.Gateway do
       outcome
     end
   end
+
+  # The adapter groups chunks by ACP's public messageId. Commit the whole set
+  # before publishing any row so a crash cannot expose half of one turn's
+  # assistant messages. Legacy adapters and test doubles return only `text`;
+  # they keep the historical one-row behavior through the fallback below.
+  defp append_assistant_messages(db, turn, echo, result) do
+    texts = assistant_message_texts(result)
+    attention_tier = elected_attention(db, turn.seq)
+
+    {:ok, replies} =
+      DB.transaction(db, fn txn ->
+        Enum.map(texts, fn text ->
+          {:appended, reply} =
+            Projection.append_in_txn(txn, %{
+              session_key: turn.session_key,
+              role: "assistant",
+              content: text,
+              sender: "tightbeam",
+              reply_to_message_id: echo && echo.id,
+              reply_to_client_message_id: echo && echo.client_message_id,
+              attention_tier: attention_tier
+            })
+
+          reply
+        end)
+      end)
+
+    Enum.each(replies, &publish_message(db, turn.session_key, &1))
+  end
+
+  defp assistant_message_texts(%{messages: messages}) when is_list(messages) and messages != [] do
+    Enum.map(messages, &Map.fetch!(&1, :text))
+  end
+
+  defp assistant_message_texts(%{text: text}) when is_binary(text), do: [text]
 
   defp stage(stage, {:error, reason}), do: {:error, {stage, reason}}
   defp stage(_stage, result), do: result
