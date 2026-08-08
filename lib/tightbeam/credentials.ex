@@ -177,10 +177,14 @@ defmodule Tightbeam.Credentials do
 
   The deep check is anthropic-only ON PURPOSE. That is the record shape this incident
   produced and the one shape verified against a live file; openai and fixture get the blank
-  check alone, because inventing structure a file never had is how this area breaks. And an
-  anthropic credential is not always an OAuth record — an api key is banked as a BARE STRING
-  under the same filename — so only bytes that actually parse as a `claudeAiOauth` object
-  face the deep test.
+  check alone, because inventing structure a file never had is how this area breaks.
+
+  What decides the deep test is the PRESENCE of the `claudeAiOauth` key, not its type. A
+  populated object is inspected field by field; a present but unusable one — `null`, `""`, a
+  list, a bare string — is hollow on its face, because the key announces an OAuth record and
+  carries nothing to authenticate with. Bytes with no such key are left alone, which is what
+  keeps an api key working: it is banked as a BARE STRING under this same filename, so a
+  check that assumed JSON would refuse every api_key install.
   """
   @spec refuse_hollow!(provider(), binary(), String.t()) :: :ok
   def refuse_hollow!(provider, bytes, source) do
