@@ -2565,7 +2565,7 @@ defmodule Tightbeam.GatewayTest do
 
     set =
       handlers["host-env-set"].(%{
-        origin: "agent:operator",
+        origin: "user:flynn",
         params: %{
           host: host,
           harness: "claude",
@@ -2578,7 +2578,7 @@ defmodule Tightbeam.GatewayTest do
     assert set.harness == "claude"
     assert set.name == "EXAMPLE_OVERLAY_VAR"
     assert set.value == "example"
-    assert set.set_by == "agent:operator"
+    assert set.set_by == "user:flynn"
     assert is_integer(set.set_at)
     assert set.effect == "takes effect on next claude adapter start on #{host}"
 
@@ -2592,7 +2592,7 @@ defmodule Tightbeam.GatewayTest do
 
     assert %{host: ^host, harness: "claude", name: "EXAMPLE_OVERLAY_VAR", removed: true} =
              handlers["host-env-unset"].(%{
-               origin: "agent:operator",
+               origin: "user:flynn",
                params: %{host: host, harness: "claude", name: "EXAMPLE_OVERLAY_VAR"}
              })
 
@@ -2621,7 +2621,7 @@ defmodule Tightbeam.GatewayTest do
     for name <- reserved_names do
       assert %{code: "reserved_env_name", message: message} =
                set.(%{
-                 origin: "user:operator",
+                 origin: "user:flynn",
                  params: %{
                    host: host,
                    harness: "claude",
@@ -2636,7 +2636,7 @@ defmodule Tightbeam.GatewayTest do
 
     assert %{code: "invalid_env_name", message: invalid_message} =
              set.(%{
-               origin: "user:operator",
+               origin: "user:flynn",
                params: %{
                  host: host,
                  harness: "claude",
@@ -2649,7 +2649,7 @@ defmodule Tightbeam.GatewayTest do
 
     assert %{code: "unknown_host", message: host_message} =
              set.(%{
-               origin: "user:operator",
+               origin: "user:flynn",
                params: %{
                  host: "missing-host",
                  harness: "claude",
@@ -2663,7 +2663,7 @@ defmodule Tightbeam.GatewayTest do
 
     assert %{code: "unknown_harness", message: harness_message} =
              set.(%{
-               origin: "user:operator",
+               origin: "user:flynn",
                params: %{
                  host: host,
                  harness: "unknown-harness",
@@ -2674,6 +2674,58 @@ defmodule Tightbeam.GatewayTest do
 
     assert harness_message =~ "unknown_harness rule"
     assert Placement.env_overlays(ctx.db) == []
+  end
+
+  test "host env writes refuse a resolved non-admin agent while list stays readable", ctx do
+    handlers = Gateway.handlers(%{db: ctx.db})
+    host = Placement.local_host_name()
+
+    {:pending, _operator_device} =
+      Devices.pair(ctx.db, %{
+        device_id: "operator-device",
+        claimed_name: "Operator",
+        platform: nil,
+        model: nil
+      })
+
+    assert %{is_admin: false} = Devices.user(ctx.db, "operator")
+
+    operator = create_session(ctx.db, "operator-session", "operator")
+    Roles.create!(ctx.db, "operator", "operator", operator.session_key)
+
+    assert %{set_by: "user:flynn"} =
+             handlers["host-env-set"].(%{
+               origin: "user:flynn",
+               params: %{
+                 host: host,
+                 harness: "claude",
+                 name: "EXAMPLE_OVERLAY_VAR",
+                 value: "example"
+               }
+             })
+
+    assert %{code: "forbidden", message: "admin required"} =
+             handlers["host-env-set"].(%{
+               origin: "agent:operator",
+               params: %{
+                 host: host,
+                 harness: "claude",
+                 name: "NODE_OPTIONS",
+                 value: "--require=example"
+               }
+             })
+
+    assert %{code: "forbidden", message: "admin required"} =
+             handlers["host-env-unset"].(%{
+               origin: "agent:operator",
+               params: %{host: host, harness: "claude", name: "EXAMPLE_OVERLAY_VAR"}
+             })
+
+    assert %{overlays: [%{name: "EXAMPLE_OVERLAY_VAR", value: "example"}]} =
+             handlers["host-env-list"].(%{
+               origin: "agent:operator",
+               params: %{host: host, harness: "claude"}
+             })
   end
 
   test "update-clients refuses non-admin callers and enumerates satellites for admins", ctx do
