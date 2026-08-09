@@ -566,22 +566,22 @@ defmodule Tightbeam.Supervision do
   end
 
   def liveness_trigger_in_txn(txn, {:work_item, work_item_id}) do
-    assignment_trigger =
-      txn
-      |> query(
-        "SELECT id FROM assignments WHERE workItemId=?1 AND state='open' ORDER BY openedAt, id",
-        [work_item_id]
-      )
-      |> Enum.reduce_while(:none, fn [assignment_id], _acc ->
-        case assignment_trigger_in_txn(txn, assignment_id) do
-          :none -> {:cont, :none}
-          result -> {:halt, result}
-        end
-      end)
+    case work_item_bracket_trigger_in_txn(txn, work_item_id) do
+      :none ->
+        txn
+        |> query(
+          "SELECT id FROM assignments WHERE workItemId=?1 AND state='open' ORDER BY openedAt, id",
+          [work_item_id]
+        )
+        |> Enum.reduce_while(:none, fn [assignment_id], _acc ->
+          case assignment_trigger_in_txn(txn, assignment_id) do
+            :none -> {:cont, :none}
+            result -> {:halt, result}
+          end
+        end)
 
-    case assignment_trigger do
-      :none -> work_item_bracket_trigger_in_txn(txn, work_item_id)
-      result -> result
+      result ->
+        result
     end
   end
 
