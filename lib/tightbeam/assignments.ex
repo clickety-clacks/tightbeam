@@ -6,7 +6,7 @@ defmodule Tightbeam.Assignments do
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
   alias Tightbeam.Harness.Support
-  alias Tightbeam.{EffortCheckin, Org, Placement, Projection, Wakes}
+  alias Tightbeam.{EffortCheckin, Org, Placement, Projection, Supervision, Wakes}
 
   defmodule TransitionRace do
     @moduledoc false
@@ -123,8 +123,9 @@ defmodule Tightbeam.Assignments do
   end
 
   @doc "Close every open assignment held by a retiring session and record why."
-  @spec interrupt_for_retire_in_txn(Txn.t(), String.t(), String.t()) :: [map()]
-  def interrupt_for_retire_in_txn(%Txn{} = txn, session_key, owner_user_id) do
+  @spec interrupt_for_retire_in_txn(Txn.t(), String.t(), String.t(), String.t()) :: [map()]
+  def interrupt_for_retire_in_txn(%Txn{} = txn, session_key, owner_user_id, principal)
+      when is_binary(principal) and principal != "" do
     assignments =
       Txn.q(
         txn,
@@ -166,11 +167,34 @@ defmodule Tightbeam.Assignments do
       )
 
       append_marker(txn, session_key, "[assignment interrupted by retire: #{assignment_id}]")
-      EffortCheckin.cancel_in_txn(txn, assignment_id)
       Tightbeam.WorkItems.arm_slate_in_txn(txn, work_item_id)
+
+      liveness_trigger = disposition_liveness_trigger!(txn, work_item_id)
+
+      supervision_transition!(txn, :terminal_disposition, %{
+        kind: "terminal_disposition",
+        assignment_id: assignment_id,
+        cause: "holder_retired",
+        principal: principal,
+        requester_id: "tightbeam:retirement"
+      })
+
+      EffortCheckin.cancel_in_txn(
+        txn,
+        assignment_id,
+        assignment_disposition_command(
+          assignment_id,
+          "tightbeam:retirement",
+          liveness_trigger
+        )
+      )
     end)
 
     assignments
+  end
+
+  def interrupt_for_retire_in_txn(%Txn{}, _session_key, _owner_user_id, _principal) do
+    raise ArgumentError, "retirement interruption requires a durable principal"
   end
 
   @doc "Count open assignments pinned to a holder session."
@@ -530,6 +554,7 @@ defmodule Tightbeam.Assignments do
        ) do
     with :ok <- principal_allowed(call.principal, verb),
          :ok <- valid_subject(call.params[:subject]),
+         :ok <- valid_supervision_interval(call[:supervision_interval_ms]),
          :ok <- valid_idempotency_key(call.params[:idempotency_key]),
          {:ok, files} <- assignment_files(verb, call.params),
          :ok <- extra_validation.() do
@@ -899,9 +924,29 @@ defmodule Tightbeam.Assignments do
           )
         end)
 
+        supervision_transition!(txn, :armed, %{
+          kind: "assignment_open",
+          assignment_id: id,
+          opened_at: now,
+          supervision_interval_ms: call.supervision_interval_ms,
+          principal: principal_id(call.principal)
+        })
+
+        entitlement_trigger = liveness_trigger!(txn, {:assignment, id})
+
         # This assign/dispatch routed the item: cancel bracket 1 (and bracket 2
         # if a prior last-close armed a slate wake — the slate is no longer clear).
-        if work_item_id, do: Tightbeam.WorkItems.cancel_brackets_in_txn(txn, work_item_id)
+        if work_item_id do
+          Tightbeam.WorkItems.cancel_brackets_in_txn(txn, work_item_id, %{
+            causal_source: %{kind: "assignment_transition", id: id},
+            outcome: %{
+              kind: "disposition",
+              disposition_kind: "assignment_transition",
+              disposition_id: id,
+              liveness_trigger: entitlement_trigger
+            }
+          })
+        end
 
         if key do
           # ownerUserId and sessionKey are historical column names: for assign
@@ -1029,9 +1074,30 @@ defmodule Tightbeam.Assignments do
                 )
 
                 if Txn.changes(txn) != 1, do: raise(TransitionRace)
-                EffortCheckin.cancel_in_txn(txn, assignment_id)
                 closed_assignment = fetch_assignment!(txn, assignment_id)
                 Tightbeam.WorkItems.arm_slate_in_txn(txn, closed_assignment.workItemId)
+
+                liveness_trigger =
+                  disposition_liveness_trigger!(txn, closed_assignment.workItemId)
+
+                supervision_transition!(txn, :terminal_disposition, %{
+                  kind: "terminal_disposition",
+                  assignment_id: assignment_id,
+                  cause: "terminal_disposition",
+                  principal: principal_id(call.principal),
+                  requester_id: "tightbeam:assignments"
+                })
+
+                EffortCheckin.cancel_in_txn(
+                  txn,
+                  assignment_id,
+                  assignment_disposition_command(
+                    assignment_id,
+                    "tightbeam:assignments",
+                    liveness_trigger
+                  )
+                )
+
                 append_attest_marker(txn, attest)
                 append_assignment_marker(txn, closed_assignment, :closed)
                 %{assignment: closed_assignment, attest: attest}
@@ -1098,9 +1164,30 @@ defmodule Tightbeam.Assignments do
             )
 
             if Txn.changes(txn) != 1, do: raise(TransitionRace)
-            EffortCheckin.cancel_in_txn(txn, assignment_id)
             revoked_assignment = fetch_assignment!(txn, assignment_id)
             Tightbeam.WorkItems.arm_slate_in_txn(txn, revoked_assignment.workItemId)
+
+            liveness_trigger =
+              disposition_liveness_trigger!(txn, revoked_assignment.workItemId)
+
+            supervision_transition!(txn, :terminal_disposition, %{
+              kind: "terminal_disposition",
+              assignment_id: assignment_id,
+              cause: "terminal_disposition",
+              principal: principal_id(call.principal),
+              requester_id: "tightbeam:assignments"
+            })
+
+            EffortCheckin.cancel_in_txn(
+              txn,
+              assignment_id,
+              assignment_disposition_command(
+                assignment_id,
+                "tightbeam:assignments",
+                liveness_trigger
+              )
+            )
+
             append_assignment_marker(txn, revoked_assignment, :revoked)
             revoked_assignment
         end
@@ -1300,6 +1387,16 @@ defmodule Tightbeam.Assignments do
 
   defp valid_subject(_),
     do: error("invalid_subject", "subject must be 1..2000 non-blank characters")
+
+  defp valid_supervision_interval(interval) when is_integer(interval) and interval > 0,
+    do: :ok
+
+  defp valid_supervision_interval(_interval),
+    do:
+      error(
+        "invalid_supervision_interval",
+        "supervisionIntervalMs must be a positive integer"
+      )
 
   defp valid_brief(brief) when is_binary(brief) and brief != "", do: :ok
   defp valid_brief(_), do: error("invalid", "a dispatch must carry a brief")
@@ -1559,6 +1656,52 @@ defmodule Tightbeam.Assignments do
   defp principal_id({:user, user}), do: "user:" <> user
   defp principal_id({:session, session}), do: "session:" <> session
   defp principal_id({:remedy, %{owner: owner}}), do: "user:" <> owner
+
+  defp supervision_transition!(txn, expected, observation) do
+    case Supervision.transition_in_txn(txn, observation) do
+      ^expected -> expected
+      {:error, reason} -> raise "supervision transition refused: #{inspect(reason)}"
+      other -> raise "invalid supervision transition result: #{inspect(other)}"
+    end
+  end
+
+  defp disposition_liveness_trigger!(_txn, nil), do: nil
+
+  defp disposition_liveness_trigger!(txn, work_item_id) do
+    case Supervision.liveness_trigger_in_txn(txn, {:work_item, work_item_id}) do
+      {:ok, trigger} when is_map(trigger) -> trigger
+      :none -> raise "open work item #{work_item_id} has no liveness trigger"
+      {:error, reason} -> raise "invalid liveness trigger: #{inspect(reason)}"
+    end
+  end
+
+  defp liveness_trigger!(txn, primary) do
+    case Supervision.liveness_trigger_in_txn(txn, primary) do
+      {:ok, trigger} when is_map(trigger) -> trigger
+      :none -> raise "#{inspect(primary)} has no liveness trigger"
+      {:error, reason} -> raise "invalid liveness trigger: #{inspect(reason)}"
+    end
+  end
+
+  defp assignment_disposition_command(assignment_id, requester_id, liveness_trigger) do
+    outcome = %{
+      kind: "disposition",
+      disposition_kind: "assignment_transition",
+      disposition_id: assignment_id
+    }
+
+    %{
+      requester: %{kind: "process", id: requester_id},
+      reason_kind: "obligation_disposed",
+      causal_source: %{kind: "assignment_transition", id: assignment_id},
+      outcome:
+        if(is_map(liveness_trigger),
+          do: Map.put(outcome, :liveness_trigger, liveness_trigger),
+          else: outcome
+        )
+    }
+  end
+
   defp opener({:user, user}), do: {user, nil}
   defp opener({:session, session}), do: {nil, session}
   defp opener({:remedy, %{owner: owner}}), do: {owner, nil}
