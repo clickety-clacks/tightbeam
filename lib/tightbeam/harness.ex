@@ -37,6 +37,7 @@ defmodule Tightbeam.Harness do
   @callback id() :: atom()
   @callback wire_name() :: String.t()
   @callback credential_provider() :: atom()
+  @callback credential_env_vars() :: [String.t()]
 
   @doc """
   The model a fresh org runs on this harness when nobody has chosen one.

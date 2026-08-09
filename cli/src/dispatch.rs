@@ -709,6 +709,52 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 string_field("value", value),
             ],
         )),
+        Command::HostEnvSet {
+            identity,
+            host,
+            harness,
+            name,
+            value,
+        } => Ok(request(
+            identity,
+            "host-env-set",
+            vec![],
+            vec![
+                string_field("host", host),
+                string_field("harness", harness),
+                string_field("name", name),
+                string_field("value", value),
+            ],
+        )),
+        Command::HostEnvList {
+            identity,
+            host,
+            harness,
+        } => {
+            let mut params = Vec::new();
+            if let Some(value) = host {
+                params.push(string_field("host", value));
+            }
+            if let Some(value) = harness {
+                params.push(string_field("harness", value));
+            }
+            Ok(request(identity, "host-env-list", vec![], params))
+        }
+        Command::HostEnvUnset {
+            identity,
+            host,
+            harness,
+            name,
+        } => Ok(request(
+            identity,
+            "host-env-unset",
+            vec![],
+            vec![
+                string_field("host", host),
+                string_field("harness", harness),
+                string_field("name", name),
+            ],
+        )),
         Command::HarnessProcesses { identity } => {
             Ok(request(identity, "harness-processes", vec![], vec![]))
         }
@@ -1307,6 +1353,9 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::AddUser { identity, .. }
         | Command::ConfigGet { identity, .. }
         | Command::ConfigSet { identity, .. }
+        | Command::HostEnvSet { identity, .. }
+        | Command::HostEnvList { identity, .. }
+        | Command::HostEnvUnset { identity, .. }
         | Command::HarnessProcesses { identity } => Some(identity),
         Command::Help
         | Command::CommandHelp(_)
@@ -1878,6 +1927,48 @@ mod tests {
                 "flynn",
             ]),
             r#"{"asUser":"flynn","verb":"config","params":{"action":"set","setting":"default-archetype","value":"coder"}}"#
+        );
+    }
+
+    #[test]
+    fn builds_byte_exact_host_env_bodies() {
+        assert_eq!(
+            body(&[
+                "host-env-set",
+                "--host",
+                "gibson",
+                "--harness",
+                "claude",
+                "EXAMPLE_OVERLAY_VAR=example",
+                "--as",
+                "operator",
+            ]),
+            r#"{"as":"operator","verb":"host-env-set","params":{"host":"gibson","harness":"claude","name":"EXAMPLE_OVERLAY_VAR","value":"example"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "host-env-list",
+                "--host",
+                "gibson",
+                "--harness",
+                "claude",
+                "--as-user",
+                "flynn",
+            ]),
+            r#"{"asUser":"flynn","verb":"host-env-list","params":{"host":"gibson","harness":"claude"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "host-env-unset",
+                "--host",
+                "gibson",
+                "--harness",
+                "claude",
+                "EXAMPLE_OVERLAY_VAR",
+                "--as-user",
+                "flynn",
+            ]),
+            r#"{"asUser":"flynn","verb":"host-env-unset","params":{"host":"gibson","harness":"claude","name":"EXAMPLE_OVERLAY_VAR"}}"#
         );
     }
 

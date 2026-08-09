@@ -759,6 +759,39 @@ defmodule Tightbeam.Gateway do
           Devices.revoke(db, p.device_id)
           %{revoked: p.device_id}
         end),
+      "host-env-set" =>
+        admin_call_handler(db, fn call ->
+          p = call.params
+
+          case Placement.set_env_overlay(
+                 db,
+                 p.host,
+                 p.harness,
+                 p.name,
+                 p.value,
+                 call.origin
+               ) do
+            {:ok, row} ->
+              Map.put(
+                row,
+                :effect,
+                "takes effect on next #{p.harness} adapter start on #{p.host}"
+              )
+
+            {:error, denial} ->
+              denial
+          end
+        end),
+      "host-env-list" => fn call ->
+        %{
+          overlays: Placement.env_overlays(db, call.params[:host], call.params[:harness])
+        }
+      end,
+      "host-env-unset" =>
+        admin_call_handler(db, fn call ->
+          p = call.params
+          Placement.unset_env_overlay(db, p.host, p.harness, p.name)
+        end),
       "register-host" =>
         admin_handler(db, fn p ->
           # The dumb half of assimilation (spec §Placement): the CLI ceremony

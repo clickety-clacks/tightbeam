@@ -51,6 +51,7 @@
   "constant_accessor_callbacks": [
     "cli_binary",
     "conformance_vectors",
+    "credential_env_vars",
     "credential_provider",
     "default_model",
     "id",
