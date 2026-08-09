@@ -5147,12 +5147,18 @@ defmodule Tightbeam.GatewayTest do
 
     local_host = Placement.local_host_name()
     Org.set_host(ctx.db, "k1", local_host)
+    Org.set_model(ctx.db, "k1", Model.new("source-claude", effort: "high"), "anthropic")
+
+    stable_identity =
+      ctx.db
+      |> Org.get("k1")
+      |> Map.take([:session_key, :display_name, :owner_user_id, :origin, :archetype])
 
     put_host_catalog(local_host, "codex", [])
 
     put_host_catalog_entry(local_host, "codex", %{
       family: "gpt-5.6-sol",
-      efforts: ["medium"],
+      efforts: ["low", "high"],
       provider: :openai
     })
 
@@ -5166,7 +5172,7 @@ defmodule Tightbeam.GatewayTest do
 
     put_host_catalog_entry(local_host, "claude", %{
       family: "claude-sonnet-5",
-      efforts: ["medium"],
+      efforts: [],
       provider: :anthropic
     })
 
@@ -5198,12 +5204,25 @@ defmodule Tightbeam.GatewayTest do
                "display" => %{
                  "harness" => "codex",
                  "modelFamily" => "gpt-5.6-sol",
-                 "reasoningLevel" => "medium"
+                 "reasoningLevel" => "low"
                }
              }
            } = post.(%{"action" => "set_harness", "harness" => "codex"})
 
-    assert Org.get(ctx.db, "k1").model == Model.new("gpt-5.6-sol", effort: "medium")
+    assert Org.get(ctx.db, "k1").model == Model.new("gpt-5.6-sol", effort: "low")
+
+    [codex_marker] =
+      Projection.list_after(
+        ctx.db,
+        "k1",
+        nil,
+        50,
+        Org.get(ctx.db, "k1").cleared_through_seq
+      )
+
+    assert codex_marker.content =~
+             "changed from claude (source-claude (effort high)) to " <>
+               "codex (gpt-5.6-sol (effort low))"
 
     assert %{
              "ok" => true,
@@ -5211,12 +5230,57 @@ defmodule Tightbeam.GatewayTest do
                "display" => %{
                  "harness" => "claude",
                  "modelFamily" => "claude-sonnet-5",
-                 "reasoningLevel" => "medium"
+                 "reasoningLevel" => nil
                }
              }
            } = post.(%{"action" => "set_harness", "harness" => "claude"})
 
-    assert Org.get(ctx.db, "k1").model == Model.new("claude-sonnet-5", effort: "medium")
+    assert Org.get(ctx.db, "k1").model == Model.new("claude-sonnet-5")
+
+    before_missing_default = Org.get(ctx.db, "k1")
+
+    {:ok, [[before_message_count]]} =
+      DB.query(ctx.db, "SELECT COUNT(*) FROM messages WHERE sessionKey = ?1", ["k1"])
+
+    put_host_catalog(local_host, "codex", [{"other-codex-model", ["low"]}])
+
+    assert %{"ok" => false, "code" => "model_unavailable"} =
+             post.(%{"action" => "set_harness", "harness" => "codex"})
+
+    assert Org.get(ctx.db, "k1") == before_missing_default
+
+    assert {:ok, [[^before_message_count]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM messages WHERE sessionKey = ?1", ["k1"])
+
+    put_host_catalog(local_host, "codex", [])
+
+    put_host_catalog_entry(local_host, "codex", %{
+      family: "gpt-5.6-sol",
+      efforts: ["low", "high"],
+      provider: :openai
+    })
+
+    put_host_catalog_entry(local_host, "codex", %{
+      family: "gpt-explicit",
+      efforts: ["high"],
+      provider: :openai
+    })
+
+    assert %{
+             "ok" => true,
+             "status" => %{
+               "display" => %{"harness" => "codex"},
+               "configuredProjection" => %{
+                 "context" => nil,
+                 "effort" => "low",
+                 "model" => "gpt-5.6-sol"
+               }
+             }
+           } = post.(%{"action" => "set_harness", "harness" => "codex"})
+
+    assert Org.get(ctx.db, "k1").model == Model.new("gpt-5.6-sol", effort: "low")
+
+    assert %{"ok" => true} = post.(%{"action" => "set_harness", "harness" => "claude"})
 
     assert %{
              "ok" => true,
@@ -5236,6 +5300,11 @@ defmodule Tightbeam.GatewayTest do
              })
 
     assert Org.get(ctx.db, "k1").model == Model.new("gpt-explicit", effort: "high")
+
+    assert ctx.db
+           |> Org.get("k1")
+           |> Map.take([:session_key, :display_name, :owner_user_id, :origin, :archetype]) ==
+             stable_identity
 
     before_refusal = Org.get(ctx.db, "k1")
 

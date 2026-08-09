@@ -3886,16 +3886,21 @@ defmodule Tightbeam.Gateway do
               true ->
                 harness_atom = module.id()
 
+                # A harness boundary never inherits the source model or effort.
+                # The target catalog composes its own supported default effort.
+
+                named = Model.named_fields(p)
+
                 selection_base =
-                  if Map.has_key?(Model.named_fields(p), :family),
+                  if Map.has_key?(named, :family),
                     do: nil,
-                    else: module.default_model()
+                    else: %{module.default_model() | effort: nil}
 
                 model =
                   compose_model_selection(
                     session.host,
                     harness,
-                    session.model,
+                    nil,
                     resolve_selection(session.host, harness, p, selection_base)
                   )
 
