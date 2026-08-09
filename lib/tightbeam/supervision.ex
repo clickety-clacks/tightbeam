@@ -2963,12 +2963,8 @@ defmodule Tightbeam.Supervision do
   end
 
   defp validate_preactivation_transfer(db_or_txn, candidate) do
-    case query(
-           db_or_txn,
-           "SELECT activatedAt FROM supervision_liveness_epoch WHERE id=0",
-           []
-         ) do
-      [[activated_at]]
+    case liveness_epoch(db_or_txn) do
+      {:ok, activated_at}
       when is_integer(candidate.created_at) and is_integer(candidate.fired_at) and
              candidate.created_at <= activated_at and candidate.fired_at <= activated_at ->
         if ladder_target(
@@ -2987,8 +2983,7 @@ defmodule Tightbeam.Supervision do
   end
 
   defp migrate_legacy_parent_retirements_in_txn(txn) do
-    [[activation_epoch]] =
-      Txn.q(txn, "SELECT activatedAt FROM supervision_liveness_epoch WHERE id=0")
+    activation_epoch = liveness_epoch!(txn)
 
     assignments =
       Txn.q(
@@ -3369,13 +3364,7 @@ defmodule Tightbeam.Supervision do
     legacy? =
       cause == "legacy_parent_target_retired" and principal == "process:tightbeam" and
         outcome_kind == "main_elevation" and action_needed == 1 and target == owner_main and
-        query(
-          db_or_txn,
-          "SELECT 1 FROM supervision_liveness_epoch WHERE id=0 AND activatedAt=?1",
-          [
-            epoch
-          ]
-        ) != []
+        liveness_epoch_matches?(db_or_txn, epoch)
 
     if shared? and (runtime? or legacy?) do
       {:ok,
@@ -3390,6 +3379,39 @@ defmodule Tightbeam.Supervision do
     else
       :error
     end
+  end
+
+  defp liveness_epoch(db_or_txn) do
+    case query(
+           db_or_txn,
+           """
+           SELECT id, activatedAt, cause, principal
+           FROM supervision_liveness_epoch
+           ORDER BY id
+           """,
+           []
+         ) do
+      [[0, activated_at, "schema_activation", "process:tightbeam"]]
+      when is_integer(activated_at) and activated_at >= 0 ->
+        {:ok, activated_at}
+
+      _ ->
+        :error
+    end
+  end
+
+  defp liveness_epoch!(db_or_txn) do
+    case liveness_epoch(db_or_txn) do
+      {:ok, activated_at} ->
+        activated_at
+
+      :error ->
+        raise "invalid supervision_liveness_epoch: expected exactly row 0 with a nonnegative activatedAt, schema_activation cause, and process:tightbeam principal"
+    end
+  end
+
+  defp liveness_epoch_matches?(db_or_txn, activated_at) do
+    liveness_epoch(db_or_txn) == {:ok, activated_at}
   end
 
   defp session_exists?(db_or_txn, session_key) do
