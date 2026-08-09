@@ -17,8 +17,9 @@ defmodule Tightbeam.Wakes do
   between — never reorder this legacy path. Condition/fallback wakes instead
   use a single CAS-gated transaction that atomically marks and enqueues.
 
-  States: pending → fired | canceled. Cancel requires the CALLER's origin to
-  match the wake's origin (you cancel your own wakes only).
+  States: pending → fired | canceled. Every new cancellation is one typed,
+  attributed transition. Public callers retain the scheduling-origin guard;
+  the closed substrate process set uses the same mutation seam without it.
   """
 
   use GenServer
@@ -195,61 +196,764 @@ defmodule Tightbeam.Wakes do
     wake
   end
 
-  @doc "Cancel a pending wake IF `origin` scheduled it. True if a row transitioned."
-  @spec cancel(db(), String.t(), String.t()) :: boolean()
-  def cancel(db \\ Tightbeam.DB, wake_id, origin) do
-    transaction!(db, fn txn ->
-      canceled = cancel_in_txn(txn, wake_id, origin)
+  @doc false
+  @spec retarget_in_txn(Txn.t(), String.t(), String.t()) :: wake() | :error
+  def retarget_in_txn(%Txn{} = txn, wake_id, replacement_target)
+      when is_binary(wake_id) and is_binary(replacement_target) do
+    replacement_id = "w_" <> Tightbeam.Id.uuid4()
+    created_at = now()
 
-      if canceled do
-        case Txn.q(txn, "SELECT conditionKind FROM wakes WHERE wakeId = ?1", [wake_id]) do
-          [[kind]] when is_binary(kind) ->
-            EventLog.lifecycle_in_txn(
-              txn,
-              "wake_condition_canceled",
-              wake_id,
-              "by=#{origin}"
-            )
+    case Txn.q(
+           txn,
+           "SELECT 1 FROM sessions WHERE sessionKey=?1 AND state='active'",
+           [replacement_target]
+         ) do
+      [[1]] ->
+        Txn.q(
+          txn,
+          """
+          INSERT INTO wakes
+            (wakeId, sessionKey, targetRole, origin, prompt, consumer, dueAt, state,
+             createdAt, firedAt, reresolve, reresolveSeed, reresolveRung,
+             conditionKind, conditionScope, conditionAfterId, firedBy,
+             creatorSessionKey, rumination, work_item_id, assignmentId, canceledAt,
+             targetGate)
+          SELECT ?2, ?3, targetRole, origin, prompt, consumer, dueAt, 'pending', ?4, NULL,
+                 reresolve, reresolveSeed, reresolveRung, conditionKind,
+                 conditionScope, conditionAfterId, NULL, creatorSessionKey,
+                 rumination, work_item_id, assignmentId, NULL, targetGate
+          FROM wakes
+          WHERE wakeId=?1 AND state='pending' AND targetGate=1
+          """,
+          [wake_id, replacement_id, replacement_target, created_at]
+        )
 
-          _ ->
-            :ok
+        if Txn.changes(txn) == 1 do
+          case Txn.q(
+                 txn,
+                 """
+                 SELECT assignmentId, controllerOrigin, wakeKind, chargedGeneration
+                 FROM supervision_liveness_sidecar
+                 WHERE wakeId=?1 AND controllerOrigin='scheduled'
+                   AND controllerState='pending'
+                 """,
+                 [wake_id]
+               ) do
+            [[assignment_id, controller_origin, wake_kind, charged_generation]] ->
+              Txn.q(
+                txn,
+                """
+                UPDATE supervision_liveness_sidecar
+                SET controllerState='settled'
+                WHERE wakeId=?1 AND controllerState='pending'
+                """,
+                [wake_id]
+              )
+
+              Txn.q(
+                txn,
+                """
+                INSERT INTO supervision_liveness_sidecar
+                  (wakeId, assignmentId, controllerOrigin, wakeKind,
+                   controllerState, chargedGeneration)
+                VALUES (?1, ?2, ?3, ?4, 'pending', ?5)
+                """,
+                [
+                  replacement_id,
+                  assignment_id,
+                  controller_origin,
+                  wake_kind,
+                  charged_generation
+                ]
+              )
+
+            [] ->
+              :ok
+          end
+
+          [row] = Txn.q(txn, select_wake_sql() <> " WHERE wakeId=?1", [replacement_id])
+          to_wake(row)
+        else
+          :error
         end
-      end
 
-      canceled
-    end)
+      [] ->
+        :error
+    end
   end
 
-  @doc "Cancel a pending wake inside an existing transaction when its origin matches."
-  @spec cancel_in_txn(Txn.t(), String.t(), String.t()) :: boolean()
-  def cancel_in_txn(%Txn{} = txn, wake_id, origin) do
+  def retarget_in_txn(%Txn{}, _wake_id, _replacement_target), do: :error
+
+  @requester_kinds ~w(user session process)
+  @reason_kinds ~w(requester_withdrew superseded obligation_disposed routing_bracket_satisfied target_retired production_unmatched consumer_unavailable target_unresolvable)
+  @source_kinds ~w(verb_call wake progress_attest condition_fact assignment_transition work_item_transition decision_request monitor_generation routing_bracket session_transition scheduler_delivery)
+  @disposition_kinds ~w(assignment_transition work_item_transition decision_request_transition monitor_generation_transition)
+  @liveness_kinds ~w(supervision_entitlement supervision_transfer pending_wake routing_bracket)
+
+  @process_reasons %{
+    "tightbeam:wake-scheduler" =>
+      ~w(production_unmatched consumer_unavailable target_unresolvable),
+    "tightbeam:work-items" => ~w(routing_bracket_satisfied),
+    "tightbeam:assignments" => ~w(obligation_disposed),
+    "tightbeam:effort-checkin" => ~w(superseded obligation_disposed),
+    "tightbeam:supervision" => ~w(superseded),
+    "tightbeam:retirement" => ~w(target_retired obligation_disposed)
+  }
+
+  @reason_matrix %{
+    "requester_withdrew" => {~w(verb_call), ~w(no_replacement)},
+    "superseded" =>
+      {~w(wake progress_attest monitor_generation decision_request),
+       ~w(replacement no_replacement)},
+    "obligation_disposed" =>
+      {~w(assignment_transition work_item_transition decision_request monitor_generation),
+       ~w(disposition)},
+    "routing_bracket_satisfied" =>
+      {~w(assignment_transition work_item_transition routing_bracket),
+       ~w(replacement disposition)},
+    "target_retired" => {~w(session_transition), ~w(replacement no_replacement)},
+    "production_unmatched" => {~w(condition_fact), ~w(no_replacement)},
+    "consumer_unavailable" => {~w(scheduler_delivery), ~w(no_replacement)},
+    "target_unresolvable" => {~w(scheduler_delivery), ~w(no_replacement)}
+  }
+
+  @doc """
+  Cancel one pending wake through the typed provenance seam.
+
+  Commands use atom keys and closed string classifications. They contain
+  `:wake_id`, optional `:expected_origin`, `:requester`, `:reason_kind`,
+  `:causal_source`, and one tagged `:outcome`. This function derives linked
+  work impact and the action-needed bit from durable rows.
+  """
+  @spec cancel_in_txn(Txn.t(), map()) :: boolean()
+  def cancel_in_txn(%Txn{} = txn, command), do: cancel_in_txn(txn, command, &now/0)
+
+  @doc false
+  @spec cancel_in_txn(Txn.t(), map(), (-> non_neg_integer())) :: boolean()
+  def cancel_in_txn(%Txn{} = txn, command, clock)
+      when is_map(command) and is_function(clock, 0) do
+    with {:ok, wake} <- pending_wake(txn, command),
+         :ok <- authorize_cancel(command, wake),
+         {:ok, primary} <- primary_work(txn, wake),
+         {:ok, canceled_at} <- capture_clock(clock),
+         {:ok, cancellation} <-
+           validate_cancellation(txn, command, wake, primary, canceled_at) do
+      commit_cancellation(txn, wake, cancellation)
+    else
+      _ -> false
+    end
+  end
+
+  def cancel_in_txn(%Txn{}, _command, _clock), do: false
+
+  defp capture_clock(clock) do
+    case clock.() do
+      value when is_integer(value) and value >= 0 -> {:ok, value}
+      _ -> :error
+    end
+  end
+
+  defp pending_wake(txn, %{wake_id: wake_id}) when is_binary(wake_id) do
+    case Txn.q(
+           txn,
+           "SELECT wakeId, origin, state, conditionKind, work_item_id, assignmentId FROM wakes WHERE wakeId=?1",
+           [wake_id]
+         ) do
+      [[^wake_id, origin, "pending", condition_kind, work_item_id, assignment_id]] ->
+        {:ok,
+         %{
+           wake_id: wake_id,
+           origin: origin,
+           condition_kind: condition_kind,
+           work_item_id: work_item_id,
+           assignment_id: assignment_id
+         }}
+
+      _ ->
+        :error
+    end
+  end
+
+  defp pending_wake(_txn, _command), do: :error
+
+  defp authorize_cancel(
+         %{expected_origin: expected, requester: %{kind: kind, id: id}, reason_kind: reason},
+         %{origin: expected}
+       )
+       when kind in @requester_kinds and is_binary(id) and id != "" and
+              reason == "requester_withdrew",
+       do: :ok
+
+  defp authorize_cancel(
+         %{requester: %{kind: "process", id: id}, reason_kind: reason} = command,
+         _wake
+       )
+       when is_binary(id) and is_binary(reason) do
+    if not Map.has_key?(command, :expected_origin) and
+         reason in Map.get(@process_reasons, id, []),
+       do: :ok,
+       else: :error
+  end
+
+  defp authorize_cancel(_command, _wake), do: :error
+
+  defp primary_work(_txn, %{assignment_id: nil, work_item_id: nil}),
+    do: {:ok, %{kind: nil, id: nil, impact: "no_linked_work"}}
+
+  defp primary_work(txn, %{assignment_id: nil, work_item_id: work_item_id}) do
+    case work_item(txn, work_item_id) do
+      {:ok, state} ->
+        {:ok,
+         %{
+           kind: "work_item",
+           id: work_item_id,
+           impact: if(state == "open", do: "linked_work_open", else: "linked_work_not_open")
+         }}
+
+      :error ->
+        :error
+    end
+  end
+
+  defp primary_work(txn, %{assignment_id: assignment_id, work_item_id: direct_work_item}) do
+    case Txn.q(txn, "SELECT state, workItemId FROM assignments WHERE id=?1", [assignment_id]) do
+      [[assignment_state, assignment_work_item]]
+      when is_nil(direct_work_item) or direct_work_item == assignment_work_item ->
+        cond do
+          assignment_state == "open" ->
+            with :ok <- validate_optional_work_item(txn, assignment_work_item) do
+              {:ok, %{kind: "assignment", id: assignment_id, impact: "linked_work_open"}}
+            end
+
+          is_binary(assignment_work_item) ->
+            case work_item(txn, assignment_work_item) do
+              {:ok, state} ->
+                {:ok,
+                 %{
+                   kind: "work_item",
+                   id: assignment_work_item,
+                   impact:
+                     if(state == "open",
+                       do: "linked_work_open",
+                       else: "linked_work_not_open"
+                     )
+                 }}
+
+              :error ->
+                :error
+            end
+
+          true ->
+            {:ok, %{kind: "assignment", id: assignment_id, impact: "linked_work_not_open"}}
+        end
+
+      _ ->
+        :error
+    end
+  end
+
+  defp validate_optional_work_item(_txn, nil), do: :ok
+
+  defp validate_optional_work_item(txn, work_item_id) do
+    case work_item(txn, work_item_id) do
+      {:ok, _state} -> :ok
+      :error -> :error
+    end
+  end
+
+  defp work_item(txn, work_item_id) when is_binary(work_item_id) do
+    case Txn.q(txn, "SELECT state FROM work_items WHERE id=?1", [work_item_id]) do
+      [[state]] -> {:ok, state}
+      _ -> :error
+    end
+  end
+
+  defp work_item(_txn, _work_item_id), do: :error
+
+  defp validate_cancellation(
+         txn,
+         %{
+           requester: %{kind: requester_kind, id: requester_id},
+           reason_kind: reason_kind,
+           causal_source: %{kind: source_kind, id: source_id},
+           outcome: %{kind: outcome_kind} = outcome
+         } = command,
+         wake,
+         primary,
+         canceled_at
+       )
+       when requester_kind in @requester_kinds and reason_kind in @reason_kinds and
+              source_kind in @source_kinds and
+              outcome_kind in ["replacement", "disposition", "no_replacement"] and
+              is_binary(requester_id) and requester_id != "" do
+    with :ok <- compatible?(requester_id, reason_kind, source_kind, outcome_kind),
+         {:ok, tagged} <- validate_outcome(txn, outcome_kind, outcome, wake, primary),
+         {:ok, durable_source_id} <-
+           durable_source(txn, command, source_kind, source_id, wake, canceled_at) do
+      {:ok,
+       Map.merge(tagged, %{
+         requester_kind: requester_kind,
+         requester_id: requester_id,
+         reason_kind: reason_kind,
+         source_kind: source_kind,
+         source_id: durable_source_id,
+         canceled_at: canceled_at,
+         primary_kind: primary.kind,
+         primary_id: primary.id,
+         work_impact: primary.impact
+       })}
+    end
+  end
+
+  defp validate_cancellation(_txn, _command, _wake, _primary, _canceled_at), do: :error
+
+  defp durable_source(txn, _command, source_kind, source_id, wake, _canceled_at)
+       when is_binary(source_id) and source_id != "" do
+    case validate_source(txn, source_kind, source_id, wake) do
+      :ok -> {:ok, source_id}
+      :error -> :error
+    end
+  end
+
+  defp durable_source(
+         txn,
+         %{
+           expected_origin: expected_origin,
+           requester: requester,
+           accepted_event: %{
+             verb: "wake",
+             origin: event_origin,
+             session_key: session_key,
+             payload: payload,
+             principal: principal
+           }
+         },
+         "verb_call",
+         nil,
+         wake,
+         canceled_at
+       ) do
+    with true <- event_origin == expected_origin and event_origin == wake.origin,
+         true <- requester_principal?(requester, principal),
+         true <- accepted_cancel_payload?(payload, wake.wake_id) do
+      event_id =
+        EventLog.append_event_in_txn(
+          txn,
+          "verb",
+          "wake",
+          event_origin,
+          session_key,
+          payload,
+          principal,
+          canceled_at
+        )
+
+      {:ok, Integer.to_string(event_id)}
+    else
+      _ -> :error
+    end
+  end
+
+  defp durable_source(_txn, _command, _source_kind, _source_id, _wake, _canceled_at),
+    do: :error
+
+  defp requester_principal?(%{kind: "user", id: id}, {:user, id}), do: true
+  defp requester_principal?(%{kind: "session", id: id}, {:session, id}), do: true
+  defp requester_principal?(%{kind: "process", id: id}, {:process, id}), do: true
+  defp requester_principal?(_requester, _principal), do: false
+
+  defp accepted_cancel_payload?(payload, wake_id) when is_map(payload) do
+    cancel_wake_id = Map.get(payload, :cancel_wake_id, Map.get(payload, "cancel_wake_id"))
+    canceled = Map.get(payload, :canceled, Map.get(payload, "canceled"))
+    cancel_wake_id == wake_id and canceled == true
+  end
+
+  defp accepted_cancel_payload?(_payload, _wake_id), do: false
+
+  defp compatible?(requester_id, reason, source, outcome) do
+    {sources, outcomes} = Map.fetch!(@reason_matrix, reason)
+
+    cond do
+      source not in sources or outcome not in outcomes ->
+        :error
+
+      requester_id == "tightbeam:supervision" ->
+        if reason == "superseded" and source == "progress_attest" and
+             outcome == "no_replacement",
+           do: :ok,
+           else: :error
+
+      reason == "superseded" and outcome == "no_replacement" ->
+        :error
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_source(txn, "verb_call", source_id, wake) do
+    case Txn.q(
+           txn,
+           "SELECT kind, verb, payload FROM events WHERE CAST(id AS TEXT)=?1",
+           [source_id]
+         ) do
+      [["verb", "wake", payload]] ->
+        case JSON.decode(payload) do
+          {:ok, %{"cancel_wake_id" => wake_id, "canceled" => true}}
+          when wake_id == wake.wake_id ->
+            :ok
+
+          _ ->
+            :error
+        end
+
+      _ ->
+        :error
+    end
+  end
+
+  defp validate_source(txn, "wake", source_id, _wake),
+    do: row_exists(txn, "SELECT 1 FROM wakes WHERE wakeId=?1", source_id)
+
+  defp validate_source(txn, "scheduler_delivery", source_id, wake) do
+    if source_id == wake.wake_id,
+      do: row_exists(txn, "SELECT 1 FROM wakes WHERE wakeId=?1", source_id),
+      else: :error
+  end
+
+  defp validate_source(txn, "progress_attest", source_id, wake) do
+    case Txn.q(
+           txn,
+           """
+           SELECT 1
+           FROM attests a
+           JOIN supervision_entitlements e ON e.assignmentId=a.assignmentId
+           WHERE a.id=?1 AND a.kind='progress' AND a.assignmentId=?2
+             AND e.basisKind='progress' AND e.basisId=a.id
+           """,
+           [source_id, wake.assignment_id]
+         ) do
+      [[1]] -> :ok
+      _ -> :error
+    end
+  end
+
+  defp validate_source(txn, "condition_fact", source_id, _wake),
+    do: row_exists(txn, "SELECT 1 FROM condition_facts WHERE CAST(id AS TEXT)=?1", source_id)
+
+  defp validate_source(txn, "assignment_transition", source_id, _wake),
+    do: row_exists(txn, "SELECT 1 FROM assignments WHERE id=?1", source_id)
+
+  defp validate_source(txn, "work_item_transition", source_id, _wake),
+    do:
+      row_exists(
+        txn,
+        "SELECT 1 FROM causal_events WHERE CAST(seq AS TEXT)=?1 AND kind='disposition_transition'",
+        source_id
+      )
+
+  defp validate_source(txn, "decision_request", source_id, _wake),
+    do: row_exists(txn, "SELECT 1 FROM decision_requests WHERE id=?1", source_id)
+
+  defp validate_source(txn, "monitor_generation", source_id, _wake),
+    do: generation_exists(txn, source_id)
+
+  defp validate_source(txn, "routing_bracket", source_id, _wake),
+    do: row_exists(txn, "SELECT 1 FROM work_items WHERE id=?1", source_id)
+
+  defp validate_source(txn, "session_transition", source_id, _wake),
+    do: row_exists(txn, "SELECT 1 FROM sessions WHERE sessionKey=?1", source_id)
+
+  defp validate_outcome(txn, "replacement", outcome, wake, primary) do
+    replacement_id = Map.get(outcome, :replacement_wake_id)
+
+    with true <- primary.impact != "linked_work_not_open",
+         true <- is_binary(replacement_id) and replacement_id != wake.wake_id,
+         :ok <- replacement_matches(txn, replacement_id, primary),
+         true <- is_nil(Map.get(outcome, :disposition_kind)),
+         true <- is_nil(Map.get(outcome, :disposition_id)),
+         true <- is_nil(Map.get(outcome, :liveness_trigger)) do
+      {:ok,
+       %{
+         outcome_kind: "replacement",
+         replacement_wake_id: replacement_id,
+         disposition_kind: nil,
+         disposition_id: nil,
+         liveness_kind: nil,
+         liveness_id: nil,
+         action_needed: 0
+       }}
+    else
+      _ -> :error
+    end
+  end
+
+  defp validate_outcome(txn, "disposition", outcome, wake, primary) do
+    disposition_kind = Map.get(outcome, :disposition_kind)
+    disposition_id = Map.get(outcome, :disposition_id)
+
+    with true <- disposition_kind in @disposition_kinds and is_binary(disposition_id),
+         :ok <- validate_disposition(txn, disposition_kind, disposition_id),
+         true <- is_nil(Map.get(outcome, :replacement_wake_id)),
+         {:ok, liveness} <- validate_required_liveness(txn, outcome, wake, primary) do
+      {:ok,
+       Map.merge(liveness, %{
+         outcome_kind: "disposition",
+         replacement_wake_id: nil,
+         disposition_kind: disposition_kind,
+         disposition_id: disposition_id
+       })}
+    else
+      _ -> :error
+    end
+  end
+
+  defp validate_outcome(txn, "no_replacement", outcome, wake, primary) do
+    with true <- is_nil(Map.get(outcome, :replacement_wake_id)),
+         true <- is_nil(Map.get(outcome, :disposition_kind)),
+         true <- is_nil(Map.get(outcome, :disposition_id)),
+         {:ok, liveness} <- validate_required_liveness(txn, outcome, wake, primary) do
+      {:ok,
+       Map.merge(liveness, %{
+         outcome_kind: "no_replacement",
+         replacement_wake_id: nil,
+         disposition_kind: nil,
+         disposition_id: nil
+       })}
+    else
+      _ -> :error
+    end
+  end
+
+  defp validate_required_liveness(_txn, outcome, _wake, %{impact: impact})
+       when impact != "linked_work_open" do
+    if is_nil(Map.get(outcome, :liveness_trigger)) do
+      {:ok, %{liveness_kind: nil, liveness_id: nil, action_needed: 0}}
+    else
+      :error
+    end
+  end
+
+  defp validate_required_liveness(txn, outcome, wake, primary) do
+    case Map.get(outcome, :liveness_trigger) do
+      %{kind: kind, id: id} when kind in @liveness_kinds and is_binary(id) ->
+        case validate_liveness(txn, kind, id, wake, primary) do
+          :ok -> {:ok, %{liveness_kind: kind, liveness_id: id, action_needed: 1}}
+          :error -> :error
+        end
+
+      _ ->
+        :error
+    end
+  end
+
+  defp replacement_matches(txn, replacement_id, primary) do
+    case Txn.q(
+           txn,
+           "SELECT wakeId, origin, state, conditionKind, work_item_id, assignmentId FROM wakes WHERE wakeId=?1",
+           [replacement_id]
+         ) do
+      [[^replacement_id, origin, "pending", condition_kind, work_item_id, assignment_id]] ->
+        replacement = %{
+          wake_id: replacement_id,
+          origin: origin,
+          condition_kind: condition_kind,
+          work_item_id: work_item_id,
+          assignment_id: assignment_id
+        }
+
+        case primary_work(txn, replacement) do
+          {:ok, replacement_primary} ->
+            if is_nil(primary.kind) or
+                 {replacement_primary.kind, replacement_primary.id} == {primary.kind, primary.id},
+               do: :ok,
+               else: :error
+
+          :error ->
+            :error
+        end
+
+      _ ->
+        :error
+    end
+  end
+
+  defp validate_disposition(txn, "assignment_transition", id),
+    do: row_exists(txn, "SELECT 1 FROM assignments WHERE id=?1", id)
+
+  defp validate_disposition(txn, "work_item_transition", id),
+    do:
+      row_exists(
+        txn,
+        "SELECT 1 FROM causal_events WHERE CAST(seq AS TEXT)=?1 AND kind='disposition_transition'",
+        id
+      )
+
+  defp validate_disposition(txn, "decision_request_transition", id),
+    do: row_exists(txn, "SELECT 1 FROM decision_requests WHERE id=?1", id)
+
+  defp validate_disposition(txn, "monitor_generation_transition", id),
+    do: generation_exists(txn, id)
+
+  defp validate_liveness(txn, "supervision_entitlement", id, _wake, primary) do
+    with {:ok, assignment_id, generation} <- split_generation(id),
+         [[work_item_id]] <-
+           Txn.q(
+             txn,
+             """
+             SELECT a.workItemId
+             FROM supervision_entitlements e
+             JOIN assignments a ON a.id=e.assignmentId
+             JOIN sessions s ON s.sessionKey=a.holderKey
+             WHERE e.assignmentId=?1 AND e.generation=?2
+               AND e.state IN ('armed','claimed') AND a.state='open' AND s.state='active'
+             """,
+             [assignment_id, generation]
+           ),
+         true <-
+           {primary.kind, primary.id} == {"assignment", assignment_id} or
+             ({primary.kind, primary.id} == {"work_item", work_item_id} and
+                is_binary(work_item_id)) do
+      :ok
+    else
+      _ -> :error
+    end
+  end
+
+  defp validate_liveness(txn, "supervision_transfer", id, _wake, primary),
+    do: Tightbeam.Supervision.accepted_transfer?(txn, id, primary)
+
+  defp validate_liveness(txn, "pending_wake", id, wake, primary) do
+    with true <- id != wake.wake_id,
+         :ok <- replacement_matches(txn, id, primary),
+         [] <-
+           Txn.q(
+             txn,
+             "SELECT 1 FROM work_items WHERE id=?1 AND (routingWakeId=?2 OR slateWakeId=?2)",
+             [primary.id, id]
+           ) do
+      :ok
+    else
+      _ -> :error
+    end
+  end
+
+  defp validate_liveness(txn, "routing_bracket", id, _wake, %{kind: "work_item", id: id}) do
+    case Txn.q(
+           txn,
+           """
+           SELECT 1
+           FROM work_items wi
+           JOIN wakes w ON w.wakeId=wi.routingWakeId OR w.wakeId=wi.slateWakeId
+           WHERE wi.id=?1 AND w.state='pending'
+           """,
+           [id]
+         ) do
+      [[1]] -> :ok
+      _ -> :error
+    end
+  end
+
+  defp validate_liveness(_txn, _kind, _id, _wake, _primary), do: :error
+
+  defp generation_exists(txn, id) do
+    with {:ok, assignment_id, generation} <- split_generation(id) do
+      row_exists(
+        txn,
+        "SELECT 1 FROM effort_checkin_generations WHERE assignmentId=?1 AND generation=?2",
+        [assignment_id, generation]
+      )
+    end
+  end
+
+  defp split_generation(id) do
+    case String.split(id, "#", parts: 2) do
+      [assignment_id, generation] ->
+        case Integer.parse(generation) do
+          {value, ""} -> {:ok, assignment_id, value}
+          _ -> :error
+        end
+
+      _ ->
+        :error
+    end
+  end
+
+  defp row_exists(txn, sql, value) when not is_list(value),
+    do: row_exists(txn, sql, [value])
+
+  defp row_exists(txn, sql, params) do
+    case Txn.q(txn, sql, params) do
+      [[1]] -> :ok
+      _ -> :error
+    end
+  end
+
+  defp commit_cancellation(txn, wake, cancellation) do
+    canceled_at = cancellation.canceled_at
+
     Txn.q(
       txn,
       """
-        UPDATE wakes SET state = 'canceled', canceledAt = ?3
-        WHERE wakeId = ?1 AND origin = ?2 AND state = 'pending'
+      INSERT INTO wake_cancellations
+        (wakeId, wakeState, canceledAt, requesterKind, requesterId, reasonKind,
+         causalSourceKind, causalSourceId, outcomeKind, replacementWakeId,
+         dispositionKind, dispositionId, primaryWorkKind, primaryWorkId,
+         workImpactKind, livenessTriggerKind, livenessTriggerId, actionNeeded)
+      VALUES (?1, 'canceled', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+              ?12, ?13, ?14, ?15, ?16, ?17)
       """,
-      [wake_id, origin, now()]
+      [
+        wake.wake_id,
+        canceled_at,
+        cancellation.requester_kind,
+        cancellation.requester_id,
+        cancellation.reason_kind,
+        cancellation.source_kind,
+        cancellation.source_id,
+        cancellation.outcome_kind,
+        cancellation.replacement_wake_id,
+        cancellation.disposition_kind,
+        cancellation.disposition_id,
+        cancellation.primary_kind,
+        cancellation.primary_id,
+        cancellation.work_impact,
+        cancellation.liveness_kind,
+        cancellation.liveness_id,
+        cancellation.action_needed
+      ]
     )
 
-    Txn.changes(txn) == 1
-  end
-
-  @doc """
-  Cancel a pending wake regardless of origin, stamping `canceledAt`. For
-  substrate-internal retargeting (an escalation moving its owner wake up a rung,
-  a park superseded by a recovery already recorded) where the canceller is the
-  substrate itself, not the scheduling origin. Returns true if a row transitioned.
-  """
-  @spec cancel_pending_in_txn(Txn.t(), String.t()) :: boolean()
-  def cancel_pending_in_txn(%Txn{} = txn, wake_id) do
     Txn.q(
       txn,
-      "UPDATE wakes SET state = 'canceled', canceledAt = ?2 WHERE wakeId = ?1 AND state = 'pending'",
-      [wake_id, now()]
+      "UPDATE wakes SET state='canceled', canceledAt=?2 WHERE wakeId=?1 AND state='pending'",
+      [wake.wake_id, canceled_at]
     )
 
-    Txn.changes(txn) == 1
+    if Txn.changes(txn) == 1 do
+      Txn.q(
+        txn,
+        """
+        UPDATE supervision_liveness_sidecar
+        SET controllerState='settled'
+        WHERE wakeId=?1 AND controllerOrigin='scheduled' AND controllerState='pending'
+        """,
+        [wake.wake_id]
+      )
+
+      if is_binary(wake.condition_kind) do
+        EventLog.lifecycle_in_txn(
+          txn,
+          "wake_condition_canceled",
+          wake.wake_id,
+          "by=#{cancellation.requester_kind}:#{cancellation.requester_id}"
+        )
+      end
+
+      true
+    else
+      false
+    end
   end
 
   @spec get(db(), String.t()) :: wake() | nil
@@ -519,30 +1223,75 @@ defmodule Tightbeam.Wakes do
         "supervision wake #{wake.wake_id} suppressed: work-blocked stands for #{holder}"
       )
 
-      transaction!(db, fn txn ->
-        cancel_pending_in_txn(txn, wake.wake_id)
+      canceled =
+        transaction!(db, fn txn ->
+          with [[fact_id]] <- standing_block(txn, holder),
+               [[generation]] <-
+                 Txn.q(
+                   txn,
+                   "SELECT generation FROM supervision_entitlements WHERE assignmentId=?1 AND state IN ('armed','claimed')",
+                   [wake.assignment_id]
+                 ),
+               true <-
+                 cancel_in_txn(txn, %{
+                   wake_id: wake.wake_id,
+                   requester: %{kind: "process", id: "tightbeam:wake-scheduler"},
+                   reason_kind: "production_unmatched",
+                   causal_source: %{kind: "condition_fact", id: to_string(fact_id)},
+                   outcome: %{
+                     kind: "no_replacement",
+                     liveness_trigger: %{
+                       kind: "supervision_entitlement",
+                       id: "#{wake.assignment_id}##{generation}"
+                     }
+                   }
+                 }) do
+            # REFUND THE RUNG. The prodder's bookkeeping increments prodCount
+            # when the wake is scheduled, but suppression voids that act.
+            Txn.q(
+              txn,
+              "UPDATE assignment_prods SET prodCount = MAX(prodCount - 1, 0) WHERE assignmentId = ?1",
+              [wake.assignment_id]
+            )
 
-        # REFUND THE RUNG. The prodder's bookkeeping increments prodCount when
-        # the wake is SCHEDULED (success_clear, for BOTH branches — escalation
-        # rungs advance the same counter), but the act is the DELIVERY — and
-        # this delivery did not happen. Without the refund, three suppressed
-        # prods would consume the ladder and ESCALATE to the spawner about a
-        # holder that was blocked the whole time (caught by SMOKE 42 on
-        # shrdlu, whose slower ticks let a prod be claimed before the block
-        # landed and fired after it). The refund is symmetric with the
-        # increment: schedule claims, fire settles, suppression voids.
-        Txn.q(
-          txn,
-          "UPDATE assignment_prods SET prodCount = MAX(prodCount - 1, 0) WHERE assignmentId = ?1",
-          [wake.assignment_id]
+            true
+          else
+            _ -> false
+          end
+        end)
+
+      if canceled do
+        best_effort_lifecycle(
+          db,
+          "supervision_wake_suppressed",
+          wake.wake_id,
+          "holder=#{holder}"
         )
-      end)
+      end
 
-      best_effort_lifecycle(db, "supervision_wake_suppressed", wake.wake_id, "holder=#{holder}")
-      true
+      canceled
     else
       false
     end
+  end
+
+  defp standing_block(txn, holder) do
+    Txn.q(
+      txn,
+      """
+      SELECT blocked.id
+      FROM condition_facts blocked
+      WHERE blocked.kind='work-blocked' AND blocked.scope=?1
+        AND blocked.id > COALESCE((
+          SELECT MAX(cleared.id)
+          FROM condition_facts cleared
+          WHERE cleared.kind='work-unblocked' AND cleared.scope=?1
+        ), 0)
+      ORDER BY blocked.id DESC
+      LIMIT 1
+      """,
+      [holder]
+    )
   end
 
   # A wake nobody can deliver is still CONSUMED — leaving it pending would spin the
@@ -558,8 +1307,19 @@ defmodule Tightbeam.Wakes do
   # `Supervision.safe_evaluate/3`.
   defp undeliverable(db, wake, reason) do
     Logger.error("wake #{wake.wake_id} undeliverable: #{reason}")
-    transaction!(db, fn txn -> cancel_pending_in_txn(txn, wake.wake_id) end)
-    best_effort_lifecycle(db, "wake_undeliverable", wake.wake_id, reason)
+
+    canceled =
+      transaction!(db, fn txn ->
+        cancel_in_txn(txn, %{
+          wake_id: wake.wake_id,
+          requester: %{kind: "process", id: "tightbeam:wake-scheduler"},
+          reason_kind: "consumer_unavailable",
+          causal_source: %{kind: "scheduler_delivery", id: wake.wake_id},
+          outcome: %{kind: "no_replacement"}
+        })
+      end)
+
+    if canceled, do: best_effort_lifecycle(db, "wake_undeliverable", wake.wake_id, reason)
   end
 
   # An internal consumer that RAISES keeps its wake pending, so the next tick

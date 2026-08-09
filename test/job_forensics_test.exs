@@ -11,11 +11,13 @@ defmodule Tightbeam.JobForensicsTest do
 
   alias Tightbeam.{
     CausalEvents,
+    ConditionFacts,
     DB,
     EffortCheckin,
     Gateway,
     Ledger,
     Org,
+    Roles,
     SubagentMarkers,
     Supervision,
     Wakes,
@@ -23,6 +25,13 @@ defmodule Tightbeam.JobForensicsTest do
   }
 
   alias Tightbeam.DB.Txn
+
+  @cancellation_projection_keys ~w(
+    provenanceStatus schedulingOrigin requesterKind requesterId reasonKind
+    causalSourceKind causalSourceId outcomeKind replacementWakeId dispositionKind
+    dispositionId primaryWorkKind primaryWorkId workImpactKind livenessTriggerKind
+    livenessTriggerId actionNeeded
+  )a
 
   defmodule LaneDoorbell do
     @moduledoc false
@@ -77,6 +86,41 @@ defmodule Tightbeam.JobForensicsTest do
     indexes = indexes(db, "causal_events")
     assert "causal_events_job" in indexes
     assert "causal_events_assignment" in indexes
+  end
+
+  test "cancellation activation creates one typed carrier and the shared epoch", %{db: db} do
+    assert "wake_cancellations" in tables(db)
+    assert "supervision_liveness_epoch" in tables(db)
+    refute "wake_cancellation_legacy" in tables(db)
+    refute "wake_cancellation_epoch" in tables(db)
+
+    assert columns(db, "wake_cancellations") ==
+             ~w(
+               wakeId wakeState canceledAt requesterKind requesterId reasonKind
+               causalSourceKind causalSourceId outcomeKind replacementWakeId
+               dispositionKind dispositionId primaryWorkKind primaryWorkId
+               workImpactKind livenessTriggerKind livenessTriggerId actionNeeded
+             )
+
+    assert columns(db, "supervision_liveness_epoch") ==
+             ~w(id activatedAt cause principal)
+
+    assert {:ok, [[0, activated_at, "schema_activation", "process:tightbeam"]]} =
+             DB.query(
+               db,
+               "SELECT id, activatedAt, cause, principal FROM supervision_liveness_epoch"
+             )
+
+    assert is_integer(activated_at) and activated_at >= 0
+  end
+
+  test "the typed cancellation command is the only exported cancellation mutation surface" do
+    Code.ensure_loaded!(Wakes)
+
+    assert function_exported?(Wakes, :cancel_in_txn, 2)
+    assert function_exported?(Wakes, :cancel_in_txn, 3)
+    refute function_exported?(Wakes, :cancel, 3)
+    refute function_exported?(Wakes, :cancel_pending_in_txn, 2)
   end
 
   ## Proof 1 — atomicity
@@ -208,21 +252,36 @@ defmodule Tightbeam.JobForensicsTest do
   test "proof 6: every cancel path stamps canceledAt", %{db: db} do
     session(db, "k1")
 
-    # Path 1: the origin-guarded helper (the one most callers use).
+    # Path 1: an origin-guarded authenticated requester.
     a = Wakes.schedule(db, %{session_key: "k1", origin: "user:flynn", prompt: "a", due_at: 1})
-    assert Wakes.cancel(db, a.wake_id, "user:flynn")
+    assert public_cancel(db, a.wake_id, "user:flynn", %{kind: "user", id: "flynn"})
     assert is_integer(Wakes.get(db, a.wake_id).canceled_at)
 
-    # Path 2: the substrate-internal cancel (escalation retarget, park supersede).
+    # Path 2: a closed-set substrate process cancellation.
     b =
-      Wakes.schedule(db, %{session_key: "k1", origin: "process:tightbeam", prompt: "b", due_at: 1})
+      Wakes.schedule(db, %{
+        session_key: "k1",
+        origin: "process:tightbeam",
+        consumer: "missing-consumer",
+        due_at: 1
+      })
 
-    {:ok, true} = DB.transaction(db, fn txn -> Wakes.cancel_pending_in_txn(txn, b.wake_id) end)
+    {:ok, true} =
+      DB.transaction(db, fn txn ->
+        Wakes.cancel_in_txn(txn, %{
+          wake_id: b.wake_id,
+          requester: %{kind: "process", id: "tightbeam:wake-scheduler"},
+          reason_kind: "consumer_unavailable",
+          causal_source: %{kind: "scheduler_delivery", id: b.wake_id},
+          outcome: %{kind: "no_replacement"}
+        })
+      end)
+
     assert is_integer(Wakes.get(db, b.wake_id).canceled_at)
 
     # A refused cancel stamps nothing.
     c = Wakes.schedule(db, %{session_key: "k1", origin: "user:flynn", prompt: "c", due_at: 1})
-    refute Wakes.cancel(db, c.wake_id, "user:someone-else")
+    refute public_cancel(db, c.wake_id, "user:someone-else", %{kind: "user", id: "flynn"})
     assert is_nil(Wakes.get(db, c.wake_id).canceled_at)
     assert Wakes.get(db, c.wake_id).state == "pending"
 
@@ -248,7 +307,25 @@ defmodule Tightbeam.JobForensicsTest do
         assignment_id: "asg_cancel"
       })
 
-    {:ok, true} = DB.transaction(db, fn txn -> Wakes.cancel_pending_in_txn(txn, wake.wake_id) end)
+    replacement =
+      Wakes.schedule(db, %{
+        session_key: "k1",
+        origin: "process:tightbeam",
+        prompt: "replacement",
+        due_at: 2,
+        assignment_id: "asg_cancel"
+      })
+
+    {:ok, true} =
+      DB.transaction(db, fn txn ->
+        Wakes.cancel_in_txn(txn, %{
+          wake_id: wake.wake_id,
+          requester: %{kind: "process", id: "tightbeam:effort-checkin"},
+          reason_kind: "superseded",
+          causal_source: %{kind: "wake", id: replacement.wake_id},
+          outcome: %{kind: "replacement", replacement_wake_id: replacement.wake_id}
+        })
+      end)
 
     entry =
       db
@@ -261,6 +338,550 @@ defmodule Tightbeam.JobForensicsTest do
     assert is_integer(entry.at)
     assert is_integer(entry.seqTiebreak)
     assert is_nil(entry.reason)
+  end
+
+  test "cancellation trace separates scheduling origin from requester and preserves first provenance",
+       %{db: db} do
+    work_item(db, "wi_requester")
+    :ok = DB.execute(db, "UPDATE work_items SET state='closed' WHERE id='wi_requester'")
+    session(db, "requester-session")
+
+    wake =
+      Wakes.schedule(db, %{
+        session_key: "requester-session",
+        origin: "agent:reviewer",
+        creator_session_key: "requester-session",
+        prompt: "cancel me",
+        due_at: 1,
+        work_item_id: "wi_requester"
+      })
+
+    assert %{canceled: false} =
+             cancel_via_gateway(
+               db,
+               wake.wake_id,
+               "agent:another-role",
+               {:session, "requester-session"}
+             )
+
+    refute Enum.any?(trace(db, "wi_requester").timeline, &(&1.type == "wake_canceled"))
+
+    assert %{canceled: true} =
+             cancel_via_gateway(
+               db,
+               wake.wake_id,
+               "agent:reviewer",
+               {:session, "requester-session"}
+             )
+
+    first = canceled_entry(db, "wi_requester", wake.wake_id)
+
+    assert_proven_cancellation(first, %{
+      schedulingOrigin: "agent:reviewer",
+      requesterKind: "session",
+      requesterId: "requester-session",
+      reasonKind: "requester_withdrew",
+      causalSourceKind: "verb_call",
+      outcomeKind: "no_replacement",
+      primaryWorkKind: "work_item",
+      primaryWorkId: "wi_requester",
+      workImpactKind: "linked_work_not_open",
+      actionNeeded: false
+    })
+
+    assert is_binary(first.causalSourceId) and first.causalSourceId != ""
+
+    assert {:ok, [["verb", "wake", payload]]} =
+             DB.query(
+               db,
+               "SELECT kind, verb, payload FROM events WHERE CAST(id AS TEXT)=?1",
+               [first.causalSourceId]
+             )
+
+    assert payload =~ ~s(cancel_wake_id: "#{wake.wake_id}")
+    assert payload =~ "canceled: true"
+    refute payload =~ "prompt"
+
+    assert {:ok, [[shared_ts, shared_ts, shared_ts]]} =
+             DB.query(
+               db,
+               """
+               SELECT e.ts, c.canceledAt, w.canceledAt
+               FROM events e
+               JOIN wake_cancellations c ON CAST(e.id AS TEXT)=c.causalSourceId
+               JOIN wakes w ON w.wakeId=c.wakeId
+               WHERE c.wakeId=?1
+               """,
+               [wake.wake_id]
+             )
+
+    assert %{canceled: false} =
+             cancel_via_gateway(
+               db,
+               wake.wake_id,
+               "agent:reviewer",
+               {:session, "requester-session"}
+             )
+
+    assert canceled_entry(db, "wi_requester", wake.wake_id) == first
+  end
+
+  test "internal consumer cancellation records process provenance without firing", %{db: db} do
+    work_item(db, "wi_consumer")
+    :ok = DB.execute(db, "UPDATE work_items SET state='closed' WHERE id='wi_consumer'")
+
+    scheduler = :consumer_cancellation_scheduler
+
+    start_supervised!(
+      {Wakes,
+       db: db,
+       name: scheduler,
+       tick_ms: 60_000,
+       deliver: fn _wake -> flunk("an internal wake must not reach prompt delivery") end,
+       internal_consumers: %{}}
+    )
+
+    wake =
+      Wakes.schedule(db, %{
+        session_key: "internal-target",
+        origin: "process:tightbeam",
+        consumer: "missing-consumer",
+        due_at: 0,
+        work_item_id: "wi_consumer"
+      })
+
+    assert :ok = Wakes.fire_due(scheduler)
+    assert %{state: "canceled", fired_at: nil} = Wakes.get(db, wake.wake_id)
+
+    entry = canceled_entry(db, "wi_consumer", wake.wake_id)
+
+    assert_proven_cancellation(entry, %{
+      schedulingOrigin: "process:tightbeam",
+      requesterKind: "process",
+      requesterId: "tightbeam:wake-scheduler",
+      reasonKind: "consumer_unavailable",
+      causalSourceKind: "scheduler_delivery",
+      outcomeKind: "no_replacement",
+      primaryWorkKind: "work_item",
+      primaryWorkId: "wi_consumer",
+      workImpactKind: "linked_work_not_open",
+      actionNeeded: false
+    })
+  end
+
+  test "cancel and fire ordering has one winner and never writes losing provenance", %{db: db} do
+    work_item(db, "wi_cancel_first")
+    work_item(db, "wi_fire_first")
+
+    :ok =
+      DB.execute(
+        db,
+        "UPDATE work_items SET state='closed' WHERE id IN ('wi_cancel_first','wi_fire_first')"
+      )
+
+    test_pid = self()
+    scheduler = :cancellation_order_scheduler
+
+    start_supervised!(
+      {Wakes,
+       db: db,
+       name: scheduler,
+       tick_ms: 60_000,
+       deliver: fn wake -> send(test_pid, {:delivered, wake.wake_id}) end}
+    )
+
+    cancel_first =
+      Wakes.schedule(db, %{
+        session_key: "target",
+        origin: "user:flynn",
+        prompt: "cancel first",
+        due_at: 0,
+        work_item_id: "wi_cancel_first"
+      })
+
+    assert %{canceled: true} =
+             cancel_via_gateway(db, cancel_first.wake_id, "user:flynn", {:user, "flynn"})
+
+    assert :ok = Wakes.fire_due(scheduler)
+    cancel_first_id = cancel_first.wake_id
+    refute_received {:delivered, ^cancel_first_id}
+
+    cancel_entry = canceled_entry(db, "wi_cancel_first", cancel_first.wake_id)
+    assert Map.get(cancel_entry, :provenanceStatus) == "proven"
+    refute Enum.any?(trace(db, "wi_cancel_first").timeline, &(&1.type == "wake_fired"))
+
+    fire_first =
+      Wakes.schedule(db, %{
+        session_key: "target",
+        origin: "user:flynn",
+        prompt: "fire first",
+        due_at: 0,
+        work_item_id: "wi_fire_first"
+      })
+
+    assert :ok = Wakes.fire_due(scheduler)
+    assert_received {:delivered, fire_id}
+    assert fire_id == fire_first.wake_id
+
+    assert %{canceled: false} =
+             cancel_via_gateway(db, fire_first.wake_id, "user:flynn", {:user, "flynn"})
+
+    fire_timeline = trace(db, "wi_fire_first").timeline
+    assert Enum.count(fire_timeline, &(&1.type == "wake_fired")) == 1
+    refute Enum.any?(fire_timeline, &(&1.type == "wake_canceled"))
+  end
+
+  test "replacement and cancellation commit or roll back as one fact", %{db: db} do
+    work_item(db, "wi_replace")
+
+    original =
+      Wakes.schedule(db, %{
+        session_key: "target",
+        origin: "process:tightbeam",
+        prompt: "original",
+        due_at: 10,
+        work_item_id: "wi_replace"
+      })
+
+    {:ok, replacement} =
+      DB.transaction(db, fn txn ->
+        replacement =
+          Wakes.schedule_in_txn(txn, %{
+            session_key: "target",
+            origin: "process:tightbeam",
+            prompt: "replacement",
+            due_at: 20,
+            work_item_id: "wi_replace"
+          })
+
+        assert typed_cancel_in_txn(txn, original.wake_id, %{
+                 requester: %{kind: "process", id: "tightbeam:effort-checkin"},
+                 reason_kind: "superseded",
+                 causal_source: %{kind: "wake", id: replacement.wake_id},
+                 outcome: %{kind: "replacement", replacement_wake_id: replacement.wake_id}
+               })
+
+        replacement
+      end)
+
+    entry = canceled_entry(db, "wi_replace", original.wake_id)
+
+    assert_proven_cancellation(entry, %{
+      requesterKind: "process",
+      requesterId: "tightbeam:effort-checkin",
+      reasonKind: "superseded",
+      causalSourceKind: "wake",
+      causalSourceId: replacement.wake_id,
+      outcomeKind: "replacement",
+      replacementWakeId: replacement.wake_id,
+      primaryWorkKind: "work_item",
+      primaryWorkId: "wi_replace",
+      workImpactKind: "linked_work_open",
+      actionNeeded: false
+    })
+
+    rollback_original =
+      Wakes.schedule(db, %{
+        session_key: "target",
+        origin: "process:tightbeam",
+        prompt: "rollback original",
+        due_at: 30,
+        work_item_id: "wi_replace"
+      })
+
+    rollback_replacement_id = "w_rollback_replacement"
+
+    assert {:error, _} =
+             DB.transaction(db, fn txn ->
+               Wakes.schedule_in_txn(txn, %{
+                 wake_id: rollback_replacement_id,
+                 session_key: "target",
+                 origin: "process:tightbeam",
+                 prompt: "must roll back",
+                 due_at: 40,
+                 work_item_id: "wi_replace"
+               })
+
+               assert typed_cancel_in_txn(txn, rollback_original.wake_id, %{
+                        requester: %{kind: "process", id: "tightbeam:effort-checkin"},
+                        reason_kind: "superseded",
+                        causal_source: %{kind: "wake", id: rollback_replacement_id},
+                        outcome: %{
+                          kind: "replacement",
+                          replacement_wake_id: rollback_replacement_id
+                        }
+                      })
+
+               raise "crash before commit"
+             end)
+
+    assert Wakes.get(db, rollback_original.wake_id).state == "pending"
+    assert Wakes.get(db, rollback_replacement_id) == nil
+  end
+
+  test "work-item disposition cancellation names the durable disposition", %{db: db} do
+    work_item(db, "wi_dispose_wake")
+
+    wake =
+      Wakes.schedule(db, %{
+        session_key: "target",
+        origin: "process:tightbeam",
+        prompt: "routing bracket",
+        due_at: 10,
+        work_item_id: "wi_dispose_wake"
+      })
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "UPDATE work_items SET routingWakeId=?2 WHERE id=?1",
+        ["wi_dispose_wake", wake.wake_id]
+      )
+
+    assert %{workItem: %{state: "closed"}} =
+             dispose(db, "work-item-close", "wi_dispose_wake")
+
+    entry = canceled_entry(db, "wi_dispose_wake", wake.wake_id)
+
+    assert_proven_cancellation(entry, %{
+      requesterKind: "process",
+      requesterId: "tightbeam:work-items",
+      reasonKind: "routing_bracket_satisfied",
+      causalSourceKind: "work_item_transition",
+      outcomeKind: "disposition",
+      dispositionKind: "work_item_transition",
+      primaryWorkKind: "work_item",
+      primaryWorkId: "wi_dispose_wake",
+      workImpactKind: "linked_work_not_open",
+      actionNeeded: false
+    })
+
+    assert is_binary(entry.causalSourceId) and entry.causalSourceId != ""
+    assert is_binary(entry.dispositionId) and entry.dispositionId != ""
+  end
+
+  test "linked open work cannot be canceled without liveness and action-needed evidence", %{
+    db: db
+  } do
+    work_item(db, "wi_open_cancel")
+    session(db, "open-holder")
+    assignment(db, "asg_open_cancel", "wi_open_cancel", "open-holder")
+
+    wake =
+      Wakes.schedule(db, %{
+        session_key: "open-holder",
+        origin: "process:tightbeam",
+        prompt: "only future trigger",
+        due_at: 10,
+        assignment_id: "asg_open_cancel"
+      })
+
+    {:ok, %{fact_id: fact_id}} =
+      DB.transaction(db, fn txn ->
+        ConditionFacts.file_in_txn(txn, %{
+          kind: "work-blocked",
+          scope: "open-holder",
+          origin: "session:open-holder"
+        })
+      end)
+
+    command = %{
+      requester: %{kind: "process", id: "tightbeam:wake-scheduler"},
+      reason_kind: "production_unmatched",
+      causal_source: %{kind: "condition_fact", id: Integer.to_string(fact_id)},
+      outcome: %{kind: "no_replacement"}
+    }
+
+    {:ok, canceled} =
+      DB.transaction(db, fn txn -> typed_cancel_in_txn(txn, wake.wake_id, command) end)
+
+    refute canceled,
+           "no-replacement cancellation must refuse linked open work without a trigger"
+
+    assert Wakes.get(db, wake.wake_id).state == "pending"
+    refute Enum.any?(trace(db, "wi_open_cancel").timeline, &(&1.type == "wake_canceled"))
+
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO supervision_entitlements
+          (assignmentId, generation, dueAt, state, lastAttemptGeneration, claimClock,
+           basisKind, basisId, terminusAt, cause, principal, supervisionIntervalMs)
+        VALUES ('asg_open_cancel', 1, 1000, 'armed', NULL, NULL,
+                'assignment_open', 'asg_open_cancel', NULL, 'assignment_open',
+                'process:tightbeam', 1000)
+        """
+      )
+
+    valid_command =
+      put_in(command, [:outcome, :liveness_trigger], %{
+        kind: "supervision_entitlement",
+        id: "asg_open_cancel#1"
+      })
+
+    {:ok, true} =
+      DB.transaction(db, fn txn -> typed_cancel_in_txn(txn, wake.wake_id, valid_command) end)
+
+    assert_proven_cancellation(canceled_entry(db, "wi_open_cancel", wake.wake_id), %{
+      requesterKind: "process",
+      requesterId: "tightbeam:wake-scheduler",
+      reasonKind: "production_unmatched",
+      causalSourceKind: "condition_fact",
+      causalSourceId: Integer.to_string(fact_id),
+      outcomeKind: "no_replacement",
+      primaryWorkKind: "assignment",
+      primaryWorkId: "asg_open_cancel",
+      workImpactKind: "linked_work_open",
+      livenessTriggerKind: "supervision_entitlement",
+      livenessTriggerId: "asg_open_cancel#1",
+      actionNeeded: true
+    })
+  end
+
+  test "session retirement cancels direct and role-targeted wakes with typed outcomes", %{db: db} do
+    work_item(db, "wi_retire_wakes")
+    :ok = DB.execute(db, "UPDATE work_items SET state='closed' WHERE id='wi_retire_wakes'")
+    retiring = session(db, "retiring-target")
+    Roles.create!(db, "retiring-role", "flynn", retiring.session_key)
+
+    direct =
+      Wakes.schedule(db, %{
+        session_key: retiring.session_key,
+        origin: "process:tightbeam",
+        prompt: "direct",
+        due_at: 10,
+        work_item_id: "wi_retire_wakes"
+      })
+
+    role =
+      Wakes.schedule(db, %{
+        session_key: retiring.session_key,
+        target_role: "retiring-role",
+        origin: "process:tightbeam",
+        prompt: "role",
+        due_at: 10,
+        work_item_id: "wi_retire_wakes"
+      })
+
+    Org.retire(db, retiring.session_key, "user:flynn", 1_000)
+
+    for wake <- [direct, role] do
+      assert Wakes.get(db, wake.wake_id).state == "canceled"
+
+      entry = canceled_entry(db, "wi_retire_wakes", wake.wake_id)
+
+      assert_proven_cancellation(entry, %{
+        requesterKind: "process",
+        requesterId: "tightbeam:retirement",
+        reasonKind: "target_retired",
+        causalSourceKind: "session_transition",
+        outcomeKind: "no_replacement",
+        primaryWorkKind: "work_item",
+        primaryWorkId: "wi_retire_wakes",
+        workImpactKind: "linked_work_not_open",
+        actionNeeded: false
+      })
+    end
+  end
+
+  test "committed cancellation survives restart and legacy cancellation remains not proven", %{
+    db: db
+  } do
+    work_item(db, "wi_restart_cancel")
+    :ok = DB.execute(db, "UPDATE work_items SET state='closed' WHERE id='wi_restart_cancel'")
+
+    proven =
+      Wakes.schedule(db, %{
+        session_key: "target",
+        origin: "user:flynn",
+        prompt: "proven",
+        due_at: 10,
+        work_item_id: "wi_restart_cancel"
+      })
+
+    assert %{canceled: true} =
+             cancel_via_gateway(db, proven.wake_id, "user:flynn", {:user, "flynn"})
+
+    before_restart = canceled_entry(db, "wi_restart_cancel", proven.wake_id)
+
+    scheduler = :cancellation_restart_scheduler
+
+    start_supervised!(
+      {Wakes, db: db, name: scheduler, tick_ms: 60_000, deliver: fn _wake -> :ok end}
+    )
+
+    stop_supervised(Wakes)
+
+    start_supervised!(
+      {Wakes, db: db, name: scheduler, tick_ms: 60_000, deliver: fn _wake -> :ok end}
+    )
+
+    assert canceled_entry(db, "wi_restart_cancel", proven.wake_id) == before_restart
+    assert_proven_cancellation(before_restart, %{provenanceStatus: "proven"})
+
+    # Capture the real current wake-table blueprint and seed the preserved
+    # production specimen before activation. Historical absence remains absence;
+    # the shared epoch proves chronology without a per-wake marker.
+    assert {:ok, [[wakes_ddl]]} =
+             DB.query(db, "SELECT sql FROM sqlite_master WHERE type='table' AND name='wakes'")
+
+    legacy_db = :"legacy_cancellation_db_#{System.unique_integer([:positive])}"
+
+    start_supervised!(%{
+      id: legacy_db,
+      start: {DB, :start_link, [[path: ":memory:", name: legacy_db]]}
+    })
+
+    :ok = DB.execute(legacy_db, wakes_ddl <> ";")
+
+    :ok =
+      DB.execute(
+        legacy_db,
+        """
+        INSERT INTO wakes
+          (wakeId, sessionKey, origin, prompt, consumer, dueAt, state, createdAt,
+           canceledAt, work_item_id, targetGate)
+        VALUES
+          ('w_eca7e8a2-646b-4ada-8760-685db9df622c', 'legacy-target',
+           'process:legacy', 'preserved production specimen', 'prompt',
+           1786352503252, 'canceled', 1786266103252, 1786266112203,
+           'wi_legacy_cancel', 1)
+        """
+      )
+
+    :ok = Tightbeam.Schema.ensure_all(legacy_db)
+
+    :ok =
+      DB.execute(legacy_db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn',1,1)")
+
+    work_item(legacy_db, "wi_legacy_cancel")
+
+    :ok =
+      DB.execute(legacy_db, "UPDATE work_items SET state='closed' WHERE id='wi_legacy_cancel'")
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               legacy_db,
+               "SELECT count(*) FROM wake_cancellations WHERE wakeId='w_eca7e8a2-646b-4ada-8760-685db9df622c'"
+             )
+
+    assert {:ok, [[activated_at]]} =
+             DB.query(
+               legacy_db,
+               "SELECT activatedAt FROM supervision_liveness_epoch WHERE id=0"
+             )
+
+    assert activated_at >= 1_786_266_112_203
+
+    assert_legacy_cancellation(
+      canceled_entry(
+        legacy_db,
+        "wi_legacy_cancel",
+        "w_eca7e8a2-646b-4ada-8760-685db9df622c"
+      ),
+      scheduling_origin: "process:legacy"
+    )
   end
 
   ## Proofs 2 + 3 — supervision prods, and prod-turn attribution end to end
@@ -680,6 +1301,85 @@ defmodule Tightbeam.JobForensicsTest do
       ])
 
     Enum.map(rows, &hd/1)
+  end
+
+  defp cancel_via_gateway(db, wake_id, origin, principal) do
+    {requester_kind, requester_id} = principal
+
+    %{
+      canceled:
+        public_cancel(db, wake_id, origin, %{
+          kind: Atom.to_string(requester_kind),
+          id: requester_id
+        })
+    }
+  end
+
+  defp public_cancel(db, wake_id, expected_origin, requester) do
+    principal = requester_principal(requester)
+    session_key = if requester.kind == "session", do: requester.id
+    payload = %{cancel_wake_id: wake_id, canceled: true}
+
+    case DB.transaction(db, fn txn ->
+           if Wakes.cancel_in_txn(txn, %{
+                wake_id: wake_id,
+                expected_origin: expected_origin,
+                requester: requester,
+                reason_kind: "requester_withdrew",
+                causal_source: %{kind: "verb_call", id: nil},
+                accepted_event: %{
+                  verb: "wake",
+                  origin: expected_origin,
+                  session_key: session_key,
+                  payload: payload,
+                  principal: principal
+                },
+                outcome: %{kind: "no_replacement"}
+              }) do
+             true
+           else
+             raise "typed cancellation refused"
+           end
+         end) do
+      {:ok, true} -> true
+      {:error, _} -> false
+    end
+  end
+
+  defp requester_principal(%{kind: "user", id: id}), do: {:user, id}
+  defp requester_principal(%{kind: "session", id: id}), do: {:session, id}
+  defp requester_principal(%{kind: "process", id: id}), do: {:process, id}
+
+  defp typed_cancel_in_txn(%Txn{} = txn, wake_id, command) do
+    apply(Wakes, :cancel_in_txn, [txn, Map.put(command, :wake_id, wake_id)])
+  end
+
+  defp canceled_entry(db, work_item_id, wake_id) do
+    db
+    |> trace(work_item_id)
+    |> Map.fetch!(:timeline)
+    |> Enum.find(&(&1.type == "wake_canceled" and &1.id == wake_id))
+  end
+
+  defp assert_proven_cancellation(entry, expected) do
+    missing = Enum.reject(@cancellation_projection_keys, &Map.has_key?(entry, &1))
+    assert missing == [], "missing cancellation projection keys: #{inspect(missing)}"
+    assert entry.reason == nil
+    assert entry.provenanceStatus == "proven"
+    assert Map.take(entry, Map.keys(expected)) == expected
+  end
+
+  defp assert_legacy_cancellation(entry, scheduling_origin: scheduling_origin) do
+    expected =
+      @cancellation_projection_keys
+      |> Map.new(&{&1, nil})
+      |> Map.merge(%{
+        provenanceStatus: "not_proven",
+        schedulingOrigin: scheduling_origin
+      })
+
+    assert Map.take(entry, @cancellation_projection_keys) == expected
+    assert entry.reason == nil
   end
 
   defp assert_keys(map, keys), do: assert(Map.keys(map) |> Enum.sort() == Enum.sort(keys))
