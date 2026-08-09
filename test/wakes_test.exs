@@ -164,7 +164,9 @@ defmodule Tightbeam.WakesTest do
     assert carrier_canceled_at == canceled_at
   end
 
-  test "retarget and typed cancellation atomically carry the charged controller", %{db: db} do
+  test "retarget preserves the wake and typed cancellation atomically carries the controller", %{
+    db: db
+  } do
     :ok =
       DB.execute(
         db,
@@ -178,9 +180,14 @@ defmodule Tightbeam.WakesTest do
            'anthropic', 'fable', 'eezo', 'active', 1, 1),
           ('replacement', 'replacement', 'flynn', 'user:flynn', 'default',
            'claude', 'anthropic', 'fable', 'eezo', 'active', 1, 1);
+        INSERT INTO work_items
+          (id, title, ownerUserId, state, createdByUser, createdAt)
+        VALUES ('wi_retarget', 'Retarget work', 'flynn', 'open', 'flynn', 1);
         INSERT INTO assignments
-          (id, subject, holderKey, openedByUser, openedAt)
-        VALUES ('asg_retarget', 'retarget me', 'retiring', 'flynn', 1);
+          (id, subject, holderKey, openedByUser, openedAt, workItemId)
+        VALUES
+          ('asg_retarget', 'retarget me', 'retiring', 'flynn', 1,
+           'wi_retarget');
         INSERT INTO supervision_entitlements
           (assignmentId, generation, dueAt, state, lastAttemptGeneration,
            claimClock, basisKind, basisId, terminusAt, cause, principal,
@@ -197,12 +204,22 @@ defmodule Tightbeam.WakesTest do
         target_role: "reviewer",
         origin: "process:tightbeam",
         prompt: "continue",
+        consumer: "prompt",
         due_at: 4_000,
+        condition_kind: "retirement",
+        condition_scope: "retiring",
+        creator_session_key: "retiring",
+        rumination: true,
+        work_item_id: "wi_retarget",
         assignment_id: "asg_retarget",
+        target_gate: 0,
         reresolve: "lineage",
         reresolve_seed: "retiring",
         reresolve_rung: 1
       })
+
+    {:ok, _} = DB.query(db, "UPDATE wakes SET createdAt=100 WHERE wakeId=?1", [original.wake_id])
+    original = Wakes.get(db, original.wake_id)
 
     {:ok, _} =
       DB.query(
@@ -251,11 +268,28 @@ defmodule Tightbeam.WakesTest do
              state: "pending",
              session_key: "replacement",
              target_role: "reviewer",
+             origin: "process:tightbeam",
+             prompt: "continue",
+             consumer: "prompt",
+             due_at: 4_000,
+             fired_at: nil,
+             canceled_at: nil,
+             condition_kind: "retirement",
+             condition_scope: "retiring",
+             condition_after_id: 0,
+             fired_by: nil,
+             creator_session_key: "retiring",
+             rumination: true,
+             work_item_id: "wi_retarget",
              assignment_id: "asg_retarget",
+             target_gate: 0,
              reresolve: "lineage",
              reresolve_seed: "retiring",
              reresolve_rung: 1
            } = Wakes.get(db, replacement.wake_id)
+
+    assert replacement.wake_id != original.wake_id
+    assert replacement.created_at > original.created_at
 
     assert {:ok, sidecars} =
              DB.query(
