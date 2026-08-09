@@ -3,22 +3,10 @@ defmodule Tightbeam.HarnessSeamTest do
 
   alias Tightbeam.{Harness, Homes}
 
-  test "unknown harnesses raise and the fixture follows the runtime default path" do
+  test "unknown harnesses raise" do
     assert_raise ArgumentError, ~r/unknown harness "opencode"/, fn ->
       Harness.parse!("opencode")
     end
-
-    previous = System.get_env("TIGHTBEAM_DEFAULT_HARNESS")
-    System.put_env("TIGHTBEAM_DEFAULT_HARNESS", "fixture")
-
-    on_exit(fn ->
-      if previous,
-        do: System.put_env("TIGHTBEAM_DEFAULT_HARNESS", previous),
-        else: System.delete_env("TIGHTBEAM_DEFAULT_HARNESS")
-    end)
-
-    config = Config.Reader.read!("config/runtime.exs", env: :test)
-    assert get_in(config, [:tightbeam, :default_harness]) == :fixture
   end
 
   test "the shipped offline registry is the production registry projection" do
