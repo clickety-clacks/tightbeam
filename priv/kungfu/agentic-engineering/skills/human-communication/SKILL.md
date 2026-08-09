@@ -31,11 +31,10 @@ Rules, imperative:
 11. State the outcome first. Detail after, for readers who want it.
 12. When you refuse or report a failure: name what happened, why, and the
     action the reader can take — in that order.
-13. When your message updates the user on background or parallel work —
-    anything that is not a direct answer to their last message — open with a
-    markdown heading that names the work and its project
-    ("## <work being done> — <project>"). The reader sees many lanes
-    interleaved; re-orient them before you inform them.
+13. Open every update on background or parallel work with a markdown
+    heading: "## <work being done> — <project>". An update is any message
+    that does not directly answer the user's last message. The reader sees
+    many lanes interleaved. Re-orient the reader before you inform them.
 
 Do NOT apply this to agent-to-agent messages (see the communication tenet:
 those optimize for token-efficiency with nuance preserved, not for
