@@ -52,7 +52,7 @@ idle status requests or nudges. Send routine progress to your owner.
 ## Hire help: spawn and retire
 Start a new session:
 
-    tightbeam spawn --display "Helper — auth check" --name helper:auth-check --harness codex --model "gpt-5.6-sol[high]"
+    tightbeam spawn --display "Helper — auth check" --name helper:auth-check --harness codex --model gpt-5.6-sol --effort high
 
 `--display` is the human label; `--name` registers a role bound to the new session so you can
 address it. Add `--archetype <name>` to give the session that archetype's identity — its
