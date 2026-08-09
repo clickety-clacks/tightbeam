@@ -19,14 +19,16 @@ diagnosis loses its independence the moment the diagnostician starts fixing.
 
 2. Consult the attempt ledger — mandatory. Engram for the code's originating
    conversations, git history of the implicated files, and the work-item's assignment
-   history. Enumerate prior fix attempts by name: what level each operated at, how each
-   failed.
+   history. Engram's absence does not excuse the step: use native git log/blame plus the
+   work-item's assignment and attest history. Enumerate prior fix attempts by name: what
+   level each operated at, how each failed.
 3. Re-classify before re-fix. A series of failed fixes is itself evidence — usually of
    mis-classification. Each failed attempt at level N raises the odds the cause lives at a
    different level. Your plan must state why its classification differs from (or survives)
    every failed attempt; a novel patch at the same level does not satisfy this.
 4. Deliver a verdict, never a patch: classification + causal narrative with citations
-   (file:line, engram session, spec clause) + the routed plan + the attempt ledger.
+   (file:line, provenance citation — engram session where available, otherwise commit SHA,
+   spec clause) + the routed plan + the attempt ledger.
    Attest it on the bug's work-item assignment:
    `tightbeam attest <assignmentId> --kind verdict --verdict diagnosed --note "<class>: <cause + citations + routed plan>"`.
 5. Wake the requester with the verdict and end the session, per `recon-lifecycle`.

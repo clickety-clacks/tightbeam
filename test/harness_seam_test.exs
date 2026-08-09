@@ -17,7 +17,7 @@ defmodule Tightbeam.HarnessSeamTest do
         else: System.delete_env("TIGHTBEAM_DEFAULT_HARNESS")
     end)
 
-    config = Config.Reader.read!("config/runtime.exs", env: :test)
+    config = Config.Reader.read!("config/runtime.exs", env: :prod)
     assert get_in(config, [:tightbeam, :default_harness]) == :fixture
   end
 
