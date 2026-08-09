@@ -1,3 +1,52 @@
+# An authoritative run must come through scripts/verify_mix.sh.  Focused developer
+# runs do not set this marker and remain ordinary `mix test test/file.exs` commands.
+# The wrapper names this VM through argv instead of an inherited Erlang flag, forces
+# OS-owned port allocation, and supplies the expected name so this seam can prove it
+# received the isolated invocation rather than merely trusting a marker.
+if System.get_env("TIGHTBEAM_AUTHORITATIVE_GATE") == "1" do
+  expected_node = System.get_env("TIGHTBEAM_GATE_NODE")
+  actual_node = node() |> Atom.to_string() |> String.split("@", parts: 2) |> hd()
+  port = Application.get_env(:tightbeam, :port)
+
+  problems =
+    []
+    |> then(fn acc ->
+      if is_binary(expected_node) and String.starts_with?(expected_node, "tightbeam_mix_gate_"),
+        do: acc,
+        else: ["TIGHTBEAM_GATE_NODE is missing or invalid" | acc]
+    end)
+    |> then(fn acc ->
+      if actual_node == expected_node,
+        do: acc,
+        else: ["suite node is #{actual_node}, expected #{inspect(expected_node)}" | acc]
+    end)
+    |> then(fn acc ->
+      if port == 0,
+        do: acc,
+        else: ["test gateway port is #{inspect(port)}, expected 0" | acc]
+    end)
+
+  if problems != [] do
+    IO.puts(:stderr, """
+
+    This authoritative Mix gate is not isolated:
+
+    #{problems |> Enum.reverse() |> Enum.map_join("\n", &"  - #{&1}")}
+
+    Run scripts/verify_mix.sh instead of marking a direct mix test as authoritative.
+    """)
+
+    System.halt(1)
+  end
+
+  # The claim is consumed by this top-level VM. Some conformance tests launch
+  # nested focused Mix tests, and an argv-level node name deliberately does not
+  # propagate to them. Leaving the claim in the environment would make those
+  # ordinary child runs impersonate an authoritative gate and refuse correctly.
+  System.delete_env("TIGHTBEAM_AUTHORITATIVE_GATE")
+  System.delete_env("TIGHTBEAM_GATE_NODE")
+end
+
 # The suite is not hermetic, and every dependency it has on the machine around it
 # is named here. It was silent before, and silence is what let a macOS-only suite
 # look green for the project's whole life: on a dev mac the developer's own
