@@ -4,6 +4,7 @@ defmodule Tightbeam.WakesTest do
   import ExUnit.CaptureLog
 
   alias Tightbeam.{DB, EventLog, Wakes}
+  alias Tightbeam.DB.Txn
 
   setup do
     name = :"db_#{System.unique_integer([:positive])}"
@@ -13,7 +14,7 @@ defmodule Tightbeam.WakesTest do
     %{db: name, scheduler: scheduler}
   end
 
-  test "schedule persists a pending wake and cancel requires its origin", %{db: db} do
+  test "schedule persists a pending wake and typed public cancel requires its origin", %{db: db} do
     wake =
       Wakes.schedule(db, %{
         session_key: "k1",
@@ -24,10 +25,223 @@ defmodule Tightbeam.WakesTest do
 
     assert wake.wake_id =~ ~r/^w_[0-9a-f-]{36}$/
     assert [^wake] = Wakes.list_pending(db)
-    refute Wakes.cancel(db, wake.wake_id, "agent:b")
-    assert Wakes.cancel(db, wake.wake_id, "agent:a")
+    refute public_cancel(db, wake.wake_id, "agent:b")
+    assert public_cancel(db, wake.wake_id, "agent:a")
     assert Wakes.get(db, wake.wake_id).state == "canceled"
-    refute Wakes.cancel(db, wake.wake_id, "agent:a")
+    refute public_cancel(db, wake.wake_id, "agent:a")
+  end
+
+  test "typed cancellation validates the closed process matrix and preserves first provenance", %{
+    db: db
+  } do
+    wake =
+      Wakes.schedule(db, %{
+        session_key: "internal",
+        origin: "process:tightbeam",
+        consumer: "missing-consumer",
+        due_at: 0
+      })
+
+    invalid = %{
+      wake_id: wake.wake_id,
+      requester: %{kind: "process", id: "tightbeam:supervision"},
+      reason_kind: "consumer_unavailable",
+      causal_source: %{kind: "scheduler_delivery", id: wake.wake_id},
+      outcome: %{kind: "no_replacement"}
+    }
+
+    assert {:ok, false} =
+             DB.transaction(db, fn txn -> apply(Wakes, :cancel_in_txn, [txn, invalid]) end)
+
+    assert Wakes.get(db, wake.wake_id).state == "pending"
+
+    valid = put_in(invalid, [:requester, :id], "tightbeam:wake-scheduler")
+
+    assert {:ok, true} =
+             DB.transaction(db, fn txn -> apply(Wakes, :cancel_in_txn, [txn, valid]) end)
+
+    assert {:ok, [first]} =
+             DB.query(
+               db,
+               "SELECT requesterKind, requesterId, reasonKind, causalSourceKind, causalSourceId, outcomeKind, workImpactKind, actionNeeded FROM wake_cancellations WHERE wakeId=?1",
+               [wake.wake_id]
+             )
+
+    assert first == [
+             "process",
+             "tightbeam:wake-scheduler",
+             "consumer_unavailable",
+             "scheduler_delivery",
+             wake.wake_id,
+             "no_replacement",
+             "no_linked_work",
+             0
+           ]
+
+    duplicate = put_in(valid, [:reason_kind], "target_unresolvable")
+
+    assert {:ok, false} =
+             DB.transaction(db, fn txn -> apply(Wakes, :cancel_in_txn, [txn, duplicate]) end)
+
+    assert {:ok, [^first]} =
+             DB.query(
+               db,
+               "SELECT requesterKind, requesterId, reasonKind, causalSourceKind, causalSourceId, outcomeKind, workImpactKind, actionNeeded FROM wake_cancellations WHERE wakeId=?1",
+               [wake.wake_id]
+             )
+  end
+
+  test "a canceled wake and its one provenance carrier must agree at commit", %{db: db} do
+    wake =
+      Wakes.schedule(db, %{
+        session_key: "internal",
+        origin: "process:tightbeam",
+        consumer: "missing-consumer",
+        due_at: 0
+      })
+
+    assert {:error, _} =
+             DB.transaction(db, fn txn ->
+               Txn.q(
+                 txn,
+                 "UPDATE wakes SET state='canceled', canceledAt=10 WHERE wakeId=?1",
+                 [wake.wake_id]
+               )
+
+               :ok
+             end)
+
+    assert Wakes.get(db, wake.wake_id).state == "pending"
+
+    command = %{
+      wake_id: wake.wake_id,
+      requester: %{kind: "process", id: "tightbeam:wake-scheduler"},
+      reason_kind: "consumer_unavailable",
+      causal_source: %{kind: "scheduler_delivery", id: wake.wake_id},
+      outcome: %{kind: "no_replacement"}
+    }
+
+    cancellation_clock = 12_345
+
+    assert {:ok, true} =
+             DB.transaction(db, fn txn ->
+               Wakes.cancel_in_txn(txn, command, fn -> cancellation_clock end)
+             end)
+
+    assert %{state: "canceled", canceled_at: canceled_at} = Wakes.get(db, wake.wake_id)
+
+    assert {:ok, [[wake_id, "canceled", carrier_canceled_at]]} =
+             DB.query(db, "SELECT wakeId, wakeState, canceledAt FROM wake_cancellations")
+
+    assert wake_id == wake.wake_id
+    assert canceled_at == cancellation_clock
+    assert carrier_canceled_at == canceled_at
+  end
+
+  test "retarget and typed cancellation atomically carry the charged controller", %{db: db} do
+    :ok =
+      DB.execute(
+        db,
+        """
+        INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1);
+        INSERT INTO sessions
+          (sessionKey, displayName, ownerUserId, origin, archetype, harness,
+           provider, model, host, state, createdAt, updatedAt)
+        VALUES
+          ('retiring', 'retiring', 'flynn', 'user:flynn', 'default', 'claude',
+           'anthropic', 'fable', 'eezo', 'active', 1, 1),
+          ('replacement', 'replacement', 'flynn', 'user:flynn', 'default',
+           'claude', 'anthropic', 'fable', 'eezo', 'active', 1, 1);
+        INSERT INTO assignments
+          (id, subject, holderKey, openedByUser, openedAt)
+        VALUES ('asg_retarget', 'retarget me', 'retiring', 'flynn', 1);
+        INSERT INTO supervision_entitlements
+          (assignmentId, generation, dueAt, state, lastAttemptGeneration,
+           claimClock, basisKind, basisId, terminusAt, cause, principal,
+           supervisionIntervalMs)
+        VALUES
+          ('asg_retarget', 2, 5000, 'armed', NULL, NULL, 'prod_scheduled',
+           'pending-seed', NULL, 'prod_scheduled', 'process:tightbeam', 1000);
+        """
+      )
+
+    original =
+      Wakes.schedule(db, %{
+        session_key: "retiring",
+        target_role: "reviewer",
+        origin: "process:tightbeam",
+        prompt: "continue",
+        due_at: 4_000,
+        assignment_id: "asg_retarget",
+        reresolve: "lineage",
+        reresolve_seed: "retiring",
+        reresolve_rung: 1
+      })
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "UPDATE supervision_entitlements SET basisId=?2 WHERE assignmentId=?1",
+        ["asg_retarget", original.wake_id]
+      )
+
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO supervision_liveness_sidecar
+          (wakeId, assignmentId, controllerOrigin, wakeKind, controllerState,
+           chargedGeneration)
+        VALUES (?1, 'asg_retarget', 'scheduled', 'prod', 'pending', 2)
+        """,
+        [original.wake_id]
+      )
+
+    assert {:ok, replacement} =
+             DB.transaction(db, fn txn ->
+               replacement = Wakes.retarget_in_txn(txn, original.wake_id, "replacement")
+
+               assert Wakes.cancel_in_txn(
+                        txn,
+                        %{
+                          wake_id: original.wake_id,
+                          requester: %{kind: "process", id: "tightbeam:retirement"},
+                          reason_kind: "target_retired",
+                          causal_source: %{kind: "session_transition", id: "retiring"},
+                          outcome: %{
+                            kind: "replacement",
+                            replacement_wake_id: replacement.wake_id
+                          }
+                        },
+                        fn -> 6_000 end
+                      )
+
+               replacement
+             end)
+
+    assert %{state: "canceled", canceled_at: 6_000} = Wakes.get(db, original.wake_id)
+
+    assert %{
+             state: "pending",
+             session_key: "replacement",
+             target_role: "reviewer",
+             assignment_id: "asg_retarget",
+             reresolve: "lineage",
+             reresolve_seed: "retiring",
+             reresolve_rung: 1
+           } = Wakes.get(db, replacement.wake_id)
+
+    assert {:ok, sidecars} =
+             DB.query(
+               db,
+               "SELECT wakeId, controllerState, chargedGeneration FROM supervision_liveness_sidecar"
+             )
+
+    states =
+      Map.new(sidecars, fn [wake_id, state, generation] -> {wake_id, {state, generation}} end)
+
+    assert states[original.wake_id] == {"settled", 2}
+    assert states[replacement.wake_id] == {"pending", 2}
   end
 
   test "fire_due claims each due wake once across synchronous passes", %{
@@ -223,7 +437,7 @@ defmodule Tightbeam.WakesTest do
 
            :ok = Wakes.fire_due(self())
            send(test_pid, {:self_fire_returned, wake.wake_id, nested.wake_id})
-           Wakes.cancel(db, wake.wake_id, wake.origin)
+           public_cancel(db, wake.wake_id, wake.origin, %{kind: "process", id: "tightbeam"})
          end
        }}
     )
@@ -306,4 +520,44 @@ defmodule Tightbeam.WakesTest do
     refute Wakes.rumination_exists?(db, "wi_other", "caller")
     refute Wakes.rumination_exists?(db, "wi_one", "other-caller")
   end
+
+  defp public_cancel(
+         db,
+         wake_id,
+         expected_origin,
+         requester \\ %{kind: "session", id: "test-session"}
+       ) do
+    principal = requester_principal(requester)
+    session_key = if requester.kind == "session", do: requester.id
+    payload = %{cancel_wake_id: wake_id, canceled: true}
+
+    case DB.transaction(db, fn txn ->
+           if Wakes.cancel_in_txn(txn, %{
+                wake_id: wake_id,
+                expected_origin: expected_origin,
+                requester: requester,
+                reason_kind: "requester_withdrew",
+                causal_source: %{kind: "verb_call", id: nil},
+                accepted_event: %{
+                  verb: "wake",
+                  origin: expected_origin,
+                  session_key: session_key,
+                  payload: payload,
+                  principal: principal
+                },
+                outcome: %{kind: "no_replacement"}
+              }) do
+             true
+           else
+             raise "typed cancellation refused"
+           end
+         end) do
+      {:ok, true} -> true
+      {:error, _} -> false
+    end
+  end
+
+  defp requester_principal(%{kind: "user", id: id}), do: {:user, id}
+  defp requester_principal(%{kind: "session", id: id}), do: {:session, id}
+  defp requester_principal(%{kind: "process", id: id}), do: {:process, id}
 end

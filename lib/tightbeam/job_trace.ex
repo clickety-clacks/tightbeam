@@ -3,6 +3,15 @@ defmodule Tightbeam.JobTrace do
 
   alias Tightbeam.{CausalEvents, DB}
 
+  defmodule MissingCancellationProvenance do
+    @moduledoc false
+    defexception [:wake_id]
+
+    @impl true
+    def message(%__MODULE__{wake_id: wake_id}),
+      do: "wake #{wake_id} is canceled without required typed cancellation provenance"
+  end
+
   # Every type needs an explicit rank — the sorter uses Map.fetch!/2, so an
   # unranked type raises rather than sorting arbitrarily. The v2 types are
   # INSERTED; the relative order of the v1 types is unchanged.
@@ -189,7 +198,13 @@ defmodule Tightbeam.JobTrace do
         db,
         """
         SELECT w.wakeId, NULL, w.createdAt, w.dueAt, w.firedAt, w.firedBy,
-               matched_fact_at, w.canceledAt, w.rid
+               matched_fact_at, w.canceledAt, w.rid, w.origin,
+               c.canceledAt, c.requesterKind, c.requesterId, c.reasonKind,
+               c.causalSourceKind, c.causalSourceId, c.outcomeKind,
+               c.replacementWakeId, c.dispositionKind, c.dispositionId,
+               c.primaryWorkKind, c.primaryWorkId, c.workImpactKind,
+               c.livenessTriggerKind, c.livenessTriggerId, c.actionNeeded,
+               (SELECT activatedAt FROM supervision_liveness_epoch WHERE id=0)
         FROM (
           SELECT w.*, w.rowid AS rid,
                  CASE WHEN w.firedBy = 'condition' THEN (
@@ -201,6 +216,7 @@ defmodule Tightbeam.JobTrace do
                  ) END AS matched_fact_at
           FROM wakes AS w
         ) AS w
+        LEFT JOIN wake_cancellations AS c ON c.wakeId=w.wakeId
         WHERE w.work_item_id = ?1
         """,
         [work_item_id]
@@ -235,9 +251,16 @@ defmodule Tightbeam.JobTrace do
                        AND (w.conditionScope IS NULL OR f.scope = w.conditionScope)
                      ORDER BY f.id ASC LIMIT 1
                    ) END,
-                   w.canceledAt, w.rowid
+                   w.canceledAt, w.rowid, w.origin,
+                   c.canceledAt, c.requesterKind, c.requesterId, c.reasonKind,
+                   c.causalSourceKind, c.causalSourceId, c.outcomeKind,
+                   c.replacementWakeId, c.dispositionKind, c.dispositionId,
+                   c.primaryWorkKind, c.primaryWorkId, c.workImpactKind,
+                   c.livenessTriggerKind, c.livenessTriggerId, c.actionNeeded,
+                   (SELECT activatedAt FROM supervision_liveness_epoch WHERE id=0)
             FROM wakes AS w
             JOIN links ON links.wakeId = w.wakeId
+            LEFT JOIN wake_cancellations AS c ON c.wakeId=w.wakeId
             """,
             params
           )
@@ -261,7 +284,25 @@ defmodule Tightbeam.JobTrace do
                         fired_by,
                         matched_fact_at,
                         canceled,
-                        rid
+                        rid,
+                        scheduling_origin,
+                        carrier_canceled_at,
+                        requester_kind,
+                        requester_id,
+                        reason_kind,
+                        source_kind,
+                        source_id,
+                        outcome_kind,
+                        replacement_wake_id,
+                        disposition_kind,
+                        disposition_id,
+                        primary_work_kind,
+                        primary_work_id,
+                        work_impact_kind,
+                        liveness_trigger_kind,
+                        liveness_trigger_id,
+                        action_needed,
+                        activated_at
                       ] ->
       scheduled = %{
         at: created,
@@ -287,20 +328,41 @@ defmodule Tightbeam.JobTrace do
           []
         end
 
-      # `reason` is pinned nullable because no cancel path has a durable reason
-      # carrier — cancellation writes state and, now, a timestamp. Inventing one
-      # is a spec question, not an implementation liberty.
       canceled_entry =
         if canceled do
+          projection =
+            cancellation_projection(
+              id,
+              canceled,
+              scheduling_origin,
+              carrier_canceled_at,
+              requester_kind,
+              requester_id,
+              reason_kind,
+              source_kind,
+              source_id,
+              outcome_kind,
+              replacement_wake_id,
+              disposition_kind,
+              disposition_id,
+              primary_work_kind,
+              primary_work_id,
+              work_impact_kind,
+              liveness_trigger_kind,
+              liveness_trigger_id,
+              action_needed,
+              activated_at
+            )
+
           [
-            %{
+            Map.merge(projection, %{
               at: canceled,
               seqTiebreak: rid,
               type: "wake_canceled",
               id: id,
               assignmentId: assignment_id,
               reason: nil
-            }
+            })
           ]
         else
           []
@@ -309,6 +371,119 @@ defmodule Tightbeam.JobTrace do
       {id, [scheduled] ++ fired_entry ++ canceled_entry}
     end)
   end
+
+  defp cancellation_projection(
+         _wake_id,
+         canceled_at,
+         scheduling_origin,
+         canceled_at,
+         requester_kind,
+         requester_id,
+         reason_kind,
+         source_kind,
+         source_id,
+         outcome_kind,
+         replacement_wake_id,
+         disposition_kind,
+         disposition_id,
+         primary_work_kind,
+         primary_work_id,
+         work_impact_kind,
+         liveness_trigger_kind,
+         liveness_trigger_id,
+         action_needed,
+         _activated_at
+       )
+       when is_integer(canceled_at) do
+    %{
+      provenanceStatus: "proven",
+      schedulingOrigin: scheduling_origin,
+      requesterKind: requester_kind,
+      requesterId: requester_id,
+      reasonKind: reason_kind,
+      causalSourceKind: source_kind,
+      causalSourceId: source_id,
+      outcomeKind: outcome_kind,
+      replacementWakeId: replacement_wake_id,
+      dispositionKind: disposition_kind,
+      dispositionId: disposition_id,
+      primaryWorkKind: primary_work_kind,
+      primaryWorkId: primary_work_id,
+      workImpactKind: work_impact_kind,
+      livenessTriggerKind: liveness_trigger_kind,
+      livenessTriggerId: liveness_trigger_id,
+      actionNeeded: action_needed == 1
+    }
+  end
+
+  defp cancellation_projection(
+         _wake_id,
+         canceled_at,
+         scheduling_origin,
+         nil,
+         _requester_kind,
+         _requester_id,
+         _reason_kind,
+         _source_kind,
+         _source_id,
+         _outcome_kind,
+         _replacement_wake_id,
+         _disposition_kind,
+         _disposition_id,
+         _primary_work_kind,
+         _primary_work_id,
+         _work_impact_kind,
+         _liveness_trigger_kind,
+         _liveness_trigger_id,
+         _action_needed,
+         activated_at
+       )
+       when is_integer(canceled_at) and is_integer(activated_at) and
+              canceled_at <= activated_at do
+    %{
+      provenanceStatus: "not_proven",
+      schedulingOrigin: scheduling_origin,
+      requesterKind: nil,
+      requesterId: nil,
+      reasonKind: nil,
+      causalSourceKind: nil,
+      causalSourceId: nil,
+      outcomeKind: nil,
+      replacementWakeId: nil,
+      dispositionKind: nil,
+      dispositionId: nil,
+      primaryWorkKind: nil,
+      primaryWorkId: nil,
+      workImpactKind: nil,
+      livenessTriggerKind: nil,
+      livenessTriggerId: nil,
+      actionNeeded: nil
+    }
+  end
+
+  defp cancellation_projection(
+         wake_id,
+         _canceled_at,
+         _scheduling_origin,
+         _carrier_canceled_at,
+         _requester_kind,
+         _requester_id,
+         _reason_kind,
+         _source_kind,
+         _source_id,
+         _outcome_kind,
+         _replacement_wake_id,
+         _disposition_kind,
+         _disposition_id,
+         _primary_work_kind,
+         _primary_work_id,
+         _work_impact_kind,
+         _liveness_trigger_kind,
+         _liveness_trigger_id,
+         _action_needed,
+         _activated_at
+       ),
+       do: raise(MissingCancellationProvenance, wake_id: wake_id)
 
   defp decision_entries(_db, []), do: []
 
