@@ -96,7 +96,8 @@ defmodule Tightbeam.CliIntegrationTest do
     gateway_config = %{
       db: db,
       base_dir: base_dir,
-      cwd: base_dir
+      cwd: base_dir,
+      wake_tick_ms: 1_000
     }
 
     Archetypes.load!(base_dir)

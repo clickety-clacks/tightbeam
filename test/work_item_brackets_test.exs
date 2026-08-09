@@ -85,7 +85,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
 
     base = Path.join(System.tmp_dir!(), "tb-brackets-#{System.unique_integer([:positive])}")
     File.mkdir_p!(base)
-    handlers = Gateway.handlers(%{db: db})
+    handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
     Rules.load!(base, Map.keys(handlers))
     on_exit(fn -> File.rm_rf!(base) end)
 
