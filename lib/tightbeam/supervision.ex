@@ -87,29 +87,618 @@ defmodule Tightbeam.Supervision do
 
   @spec prod_state(DB.server(), String.t()) :: map() | nil
   def prod_state(db, assignment_id) do
-    {:ok, rows} =
+    {:ok, prod_rows} =
       DB.query(
         db,
         "SELECT assignmentId, attemptCount, prodCount, deniedStreak, attestCount, lastProdAt, stalledAt, strandedAt FROM assignment_prods WHERE assignmentId = ?1",
         [assignment_id]
       )
 
-    case rows do
-      [[id, attempts, prods, denied, attests, last_prod, stalled, stranded]] ->
-        %{
-          assignmentId: id,
-          attemptCount: attempts,
-          prodCount: prods,
-          deniedStreak: denied,
-          attestCount: attests,
-          lastProdAt: last_prod,
-          stalledAt: stalled,
-          strandedAt: stranded
-        }
+    counters =
+      case prod_rows do
+        [[id, attempts, prods, denied, attests, last_prod, stalled, stranded]] ->
+          %{
+            assignmentId: id,
+            attemptCount: attempts,
+            prodCount: prods,
+            deniedStreak: denied,
+            attestCount: attests,
+            lastProdAt: last_prod,
+            stalledAt: stalled,
+            strandedAt: stranded
+          }
+
+        [] ->
+          nil
+      end
+
+    {:ok, entitlement_rows} =
+      DB.query(
+        db,
+        """
+        SELECT generation, dueAt, state, basisKind, basisId, terminusAt, cause,
+               principal, supervisionIntervalMs
+        FROM supervision_entitlements
+        WHERE assignmentId=?1
+        """,
+        [assignment_id]
+      )
+
+    supervision =
+      case entitlement_rows do
+        [
+          [
+            generation,
+            due_at,
+            state,
+            basis_kind,
+            basis_id,
+            terminus_at,
+            cause,
+            principal,
+            interval
+          ]
+        ] ->
+          %{
+            supervisionState: state,
+            supervisionGeneration: generation,
+            supervisionDueAt: due_at,
+            supervisionIntervalMs: interval,
+            supervisionBasisKind: basis_kind,
+            supervisionBasisId: basis_id,
+            supervisionCause: cause,
+            supervisionPrincipal: principal,
+            supervisionTerminusAt: terminus_at,
+            supervisionTransferWakeId: nil,
+            supervisionTransferSessionKey: nil,
+            supervisionRetirementEpoch: nil,
+            supervisionRetirementOutcomeKind: nil,
+            supervisionRetirementOutcomeId: nil,
+            supervisionActionNeeded: nil
+          }
+
+        [] ->
+          transfer_projection(db, assignment_id)
+      end
+
+    case {counters, supervision} do
+      {nil, nil} -> nil
+      {nil, projection} -> Map.merge(zero_state(assignment_id), projection)
+      {state, nil} -> state
+      {state, projection} -> Map.merge(state, projection)
+    end
+  end
+
+  @doc """
+  Validate an existing accepted parent-transfer reference without creating
+  ownership state. The cancellation seam uses this read-only predicate.
+  """
+  @spec accepted_transfer?(DB.server() | Txn.t(), String.t(), map()) :: :ok | :error
+  def accepted_transfer?(db_or_txn, transfer_id, primary) do
+    with {:ok, assignment_id, turn_seq} <- split_transfer_id(transfer_id),
+         true <-
+           {primary.kind, primary.id} == {"assignment", assignment_id} or
+             assignment_belongs_to_work?(db_or_txn, assignment_id, primary),
+         {:ok, _projection} <- accepted_transfer(db_or_txn, assignment_id, turn_seq) do
+      :ok
+    else
+      _ -> :error
+    end
+  end
+
+  @doc """
+  The one in-transaction mutation seam used by assignment and Gateway callers.
+  Every observation includes a positive `:supervision_interval_ms` when it
+  creates a generation.
+  """
+  @spec transition_in_txn(Txn.t(), map()) ::
+          :armed
+          | :parent_elevated
+          | :terminal_disposition
+          | :duplicate
+          | :canceled
+          | {:armed, pos_integer()}
+          | {:admit, String.t()}
+          | {:error, term()}
+  def transition_in_txn(%Txn{} = txn, %{
+        kind: "assignment_open",
+        assignment_id: assignment_id,
+        opened_at: opened_at,
+        principal: principal,
+        supervision_interval_ms: interval
+      })
+      when is_integer(opened_at) and opened_at >= 0 and is_integer(interval) and interval > 0 do
+    Txn.q(
+      txn,
+      """
+      INSERT INTO supervision_entitlements
+        (assignmentId, generation, dueAt, state, lastAttemptGeneration, claimClock,
+         basisKind, basisId, terminusAt, cause, principal, supervisionIntervalMs)
+      VALUES (?1, 1, ?2, 'armed', NULL, NULL, 'assignment_open', ?1, NULL,
+              'assignment_open', ?3, ?4)
+      ON CONFLICT(assignmentId) DO NOTHING
+      """,
+      [assignment_id, opened_at + interval, principal, interval]
+    )
+
+    if Txn.changes(txn) == 1, do: :armed, else: :duplicate
+  end
+
+  def transition_in_txn(%Txn{} = txn, %{
+        kind: "terminal_disposition",
+        assignment_id: assignment_id,
+        cause: cause,
+        principal: principal,
+        requester_id: requester_id
+      }) do
+    cancel_assignment_controllers_in_txn(txn, assignment_id, requester_id)
+    clear_entitlement_in_txn(txn, assignment_id, cause, principal)
+    :terminal_disposition
+  end
+
+  def transition_in_txn(%Txn{} = txn, %{
+        kind: "parent_target_retired",
+        session_key: session_key,
+        retirement_epoch: retirement_epoch,
+        supervision_interval_ms: supervision_interval_ms,
+        principal: principal
+      })
+      when is_integer(retirement_epoch) and retirement_epoch >= 0 and
+             is_integer(supervision_interval_ms) and supervision_interval_ms > 0 and
+             is_binary(principal) do
+    outcomes =
+      transferred_assignments_in_txn(txn, session_key)
+      |> Enum.map(fn {assignment_id, transfer} ->
+        recover_retired_target_in_txn(
+          txn,
+          assignment_id,
+          transfer,
+          retirement_epoch,
+          supervision_interval_ms,
+          principal
+        )
+      end)
+
+    cond do
+      :armed in outcomes -> :armed
+      :parent_elevated in outcomes -> :parent_elevated
+      true -> :duplicate
+    end
+  end
+
+  def transition_in_txn(%Txn{} = txn, %{
+        kind: "parent_elevated",
+        assignment_id: assignment_id,
+        wake_id: wake_id,
+        turn_seq: turn_seq,
+        target_session_key: target
+      }) do
+    Txn.q(
+      txn,
+      """
+      UPDATE supervision_liveness_sidecar
+      SET controllerState='settled'
+      WHERE wakeId=?1 AND assignmentId=?2 AND controllerOrigin='scheduled'
+        AND wakeKind='escalation' AND controllerState='pending'
+      """,
+      [wake_id, assignment_id]
+    )
+
+    clear_entitlement_in_txn(txn, assignment_id, "parent_elevated")
+
+    EventLog.lifecycle_in_txn(
+      txn,
+      "supervision_entitlement_transferred",
+      assignment_id,
+      "wakeId=#{wake_id} transfer=#{assignment_id}##{turn_seq} target=#{target}"
+    )
+
+    :parent_elevated
+  end
+
+  def transition_in_txn(%Txn{} = txn, %{
+        kind: "controller_scheduled",
+        wake_id: wake_id,
+        assignment_id: assignment_id,
+        wake_kind: wake_kind
+      })
+      when wake_kind in ["prod", "escalation"] do
+    case Txn.q(
+           txn,
+           """
+           SELECT generation, claimClock, supervisionIntervalMs
+           FROM supervision_entitlements
+           WHERE assignmentId=?1 AND state='claimed'
+           """,
+           [assignment_id]
+         ) do
+      [[generation, evaluation_clock, interval]] ->
+        next_generation = generation + 1
+        basis_kind = "#{wake_kind}_scheduled"
+
+        case Txn.q(
+               txn,
+               """
+               SELECT state, origin, assignmentId
+               FROM wakes
+               WHERE wakeId=?1
+               """,
+               [wake_id]
+             ) do
+          [["pending", "process:tightbeam", ^assignment_id]] -> :ok
+          _ -> raise "incompatible_supervision_liveness_v1: invalid scheduled controller"
+        end
+
+        Txn.q(
+          txn,
+          """
+          INSERT INTO supervision_liveness_sidecar
+            (wakeId, assignmentId, controllerOrigin, wakeKind, controllerState,
+             chargedGeneration)
+          VALUES (?1, ?2, 'scheduled', ?3, 'pending', ?4)
+          """,
+          [wake_id, assignment_id, wake_kind, next_generation]
+        )
+
+        Txn.q(
+          txn,
+          """
+          UPDATE supervision_entitlements
+          SET generation=?2, dueAt=?3, state='armed', lastAttemptGeneration=NULL,
+              claimClock=NULL, basisKind=?4, basisId=?5, cause=?4,
+              principal='process:tightbeam'
+          WHERE assignmentId=?1 AND generation=?6 AND state='claimed'
+          """,
+          [
+            assignment_id,
+            next_generation,
+            evaluation_clock + interval,
+            basis_kind,
+            wake_id,
+            generation
+          ]
+        )
+
+        if Txn.changes(txn) != 1 do
+          raise "incompatible_supervision_liveness_v1: stale controller schedule"
+        end
+
+        EventLog.lifecycle_in_txn(
+          txn,
+          "supervision_entitlement_rearmed",
+          assignment_id,
+          "generation=#{next_generation} basis=#{basis_kind}:#{wake_id} cause=#{basis_kind} principal=process:tightbeam"
+        )
+
+        {:armed, next_generation}
 
       [] ->
-        nil
+        :duplicate
     end
+  end
+
+  def transition_in_txn(%Txn{} = txn, %{
+        kind: "policy_denied",
+        assignment_id: assignment_id,
+        event_id: event_id,
+        evaluation_clock: evaluation_clock
+      })
+      when is_integer(event_id) and event_id > 0 and is_integer(evaluation_clock) and
+             evaluation_clock >= 0 do
+    case Txn.q(
+           txn,
+           """
+           SELECT e.generation, e.claimClock, e.supervisionIntervalMs, a.holderKey
+           FROM supervision_entitlements e
+           JOIN assignments a ON a.id=e.assignmentId
+           WHERE e.assignmentId=?1 AND e.state='claimed'
+           """,
+           [assignment_id]
+         ) do
+      [[generation, ^evaluation_clock, interval, holder]]
+      when is_integer(interval) and interval > 0 ->
+        principal =
+          case Txn.q(
+                 txn,
+                 "SELECT principal FROM events WHERE id=?1 AND kind='denied'",
+                 [event_id]
+               ) do
+            [[principal]] when is_binary(principal) and principal != "" -> principal
+            _ -> raise "incompatible_supervision_liveness_v1: invalid policy denial event"
+          end
+
+        Txn.q(
+          txn,
+          """
+          UPDATE supervision_watermarks
+          SET pendingBranch=NULL, pendingAssignment=NULL, pendingK=NULL, pendingN=NULL
+          WHERE sessionKey=?1 AND pendingAssignment=?2 AND pendingBranch IS NOT NULL
+          """,
+          [holder, assignment_id]
+        )
+
+        if Txn.changes(txn) != 1 do
+          raise "incompatible_supervision_liveness_v1: missing policy denial branch"
+        end
+
+        Txn.q(
+          txn,
+          "UPDATE assignment_prods SET deniedStreak=deniedStreak + 1 WHERE assignmentId=?1",
+          [assignment_id]
+        )
+
+        if Txn.changes(txn) != 1 do
+          raise "incompatible_supervision_liveness_v1: missing policy denial counters"
+        end
+
+        next_generation = generation + 1
+
+        Txn.q(
+          txn,
+          """
+          UPDATE supervision_entitlements
+          SET generation=?2, dueAt=?3, state='armed', lastAttemptGeneration=NULL,
+              claimClock=NULL, basisKind='policy_denied', basisId=?4,
+              cause='policy_denied', principal=?5
+          WHERE assignmentId=?1 AND generation=?6 AND state='claimed' AND claimClock=?7
+          """,
+          [
+            assignment_id,
+            next_generation,
+            evaluation_clock + interval,
+            to_string(event_id),
+            principal,
+            generation,
+            evaluation_clock
+          ]
+        )
+
+        if Txn.changes(txn) != 1 do
+          raise "incompatible_supervision_liveness_v1: stale policy denial"
+        end
+
+        EventLog.lifecycle_in_txn(
+          txn,
+          "supervision_entitlement_rearmed",
+          assignment_id,
+          "generation=#{next_generation} basis=policy_denied:#{event_id} cause=policy_denied principal=#{principal}"
+        )
+
+        {:armed, next_generation}
+
+      [] ->
+        :duplicate
+
+      _ ->
+        raise "incompatible_supervision_liveness_v1: invalid policy denial claim"
+    end
+  end
+
+  def transition_in_txn(
+        %Txn{} = txn,
+        %{
+          kind: "controller_fire",
+          wake_id: wake_id,
+          assignment_id: assignment_id,
+          target_session_key: target
+        } = observation
+      ) do
+    turn_seq = Map.get(observation, :turn_seq)
+
+    case Txn.q(
+           txn,
+           """
+           SELECT s.wakeKind, s.chargedGeneration, e.generation, e.basisKind,
+                  e.basisId, e.supervisionIntervalMs
+           FROM supervision_liveness_sidecar s
+           LEFT JOIN supervision_entitlements e ON e.assignmentId=s.assignmentId
+           WHERE s.wakeId=?1 AND s.assignmentId=?2 AND s.controllerOrigin='scheduled'
+             AND s.controllerState='pending'
+           """,
+           [wake_id, assignment_id]
+         ) do
+      [[wake_kind, charged_generation, generation, _basis_kind, _basis_id, interval]]
+      when generation == charged_generation ->
+        case absorb_progress_in_txn(txn, assignment_id, interval) do
+          :rebased ->
+            :canceled
+
+          :duplicate ->
+            if is_integer(turn_seq) and turn_seq > 0 do
+              Txn.q(
+                txn,
+                "UPDATE supervision_liveness_sidecar SET controllerState='settled' WHERE wakeId=?1 AND controllerState='pending'",
+                [wake_id]
+              )
+
+              if wake_kind == "escalation" do
+                transition_in_txn(txn, %{
+                  kind: "parent_elevated",
+                  assignment_id: assignment_id,
+                  wake_id: wake_id,
+                  turn_seq: turn_seq,
+                  target_session_key: target
+                })
+              end
+            end
+
+            {:admit, wake_kind}
+        end
+
+      [[_wake_kind, _charged_generation, generation, "progress", basis_id, _interval]]
+      when is_integer(generation) ->
+        if Wakes.cancel_in_txn(txn, %{
+             wake_id: wake_id,
+             requester: %{kind: "process", id: "tightbeam:supervision"},
+             reason_kind: "superseded",
+             causal_source: %{kind: "progress_attest", id: basis_id},
+             outcome: %{
+               kind: "no_replacement",
+               liveness_trigger: %{
+                 kind: "supervision_entitlement",
+                 id: "#{assignment_id}##{generation}"
+               }
+             }
+           }) do
+          Txn.q(
+            txn,
+            "UPDATE supervision_liveness_sidecar SET controllerState='settled' WHERE wakeId=?1",
+            [wake_id]
+          )
+        end
+
+        :canceled
+
+      [[_wake_kind, _charged_generation, _generation, _basis_kind, _basis_id, _interval]] ->
+        raise "incompatible_supervision_liveness_v1: stale controller generation"
+
+      [] ->
+        raise "incompatible_supervision_liveness_v1: missing scheduled controller"
+    end
+  end
+
+  def transition_in_txn(%Txn{}, _observation), do: :duplicate
+
+  @spec liveness_trigger_in_txn(Txn.t(), {:assignment | :work_item, String.t()}) ::
+          {:ok, %{kind: String.t(), id: String.t()}} | :none | {:error, atom()}
+  def liveness_trigger_in_txn(txn, {:assignment, assignment_id}) do
+    assignment_trigger_in_txn(txn, assignment_id)
+  end
+
+  def liveness_trigger_in_txn(txn, {:work_item, work_item_id}) do
+    assignment_trigger =
+      txn
+      |> query(
+        "SELECT id FROM assignments WHERE workItemId=?1 AND state='open' ORDER BY openedAt, id",
+        [work_item_id]
+      )
+      |> Enum.reduce_while(:none, fn [assignment_id], _acc ->
+        case assignment_trigger_in_txn(txn, assignment_id) do
+          :none -> {:cont, :none}
+          result -> {:halt, result}
+        end
+      end)
+
+    case assignment_trigger do
+      :none -> work_item_bracket_trigger_in_txn(txn, work_item_id)
+      result -> result
+    end
+  end
+
+  defp work_item_bracket_trigger_in_txn(txn, work_item_id) do
+    case query(
+           txn,
+           """
+           SELECT 1
+           FROM work_items wi
+           JOIN wakes w ON w.wakeId=wi.routingWakeId OR w.wakeId=wi.slateWakeId
+           WHERE wi.id=?1 AND wi.state='open' AND w.state='pending'
+           LIMIT 1
+           """,
+           [work_item_id]
+         ) do
+      [[1]] -> {:ok, %{kind: "routing_bracket", id: work_item_id}}
+      [] -> :none
+    end
+  end
+
+  defp cancel_assignment_controllers_in_txn(txn, assignment_id, requester_id) do
+    trigger =
+      case query(txn, "SELECT workItemId FROM assignments WHERE id=?1", [assignment_id]) do
+        [[work_item_id]] when is_binary(work_item_id) ->
+          case liveness_trigger_in_txn(txn, {:work_item, work_item_id}) do
+            {:ok, value} -> value
+            :none -> nil
+            {:error, reason} -> raise "invalid liveness trigger: #{inspect(reason)}"
+          end
+
+        _ ->
+          nil
+      end
+
+    outcome = %{
+      kind: "disposition",
+      disposition_kind: "assignment_transition",
+      disposition_id: assignment_id
+    }
+
+    outcome = if trigger, do: Map.put(outcome, :liveness_trigger, trigger), else: outcome
+
+    Txn.q(
+      txn,
+      """
+      SELECT s.wakeId
+      FROM supervision_liveness_sidecar s
+      JOIN wakes w ON w.wakeId=s.wakeId
+      WHERE s.assignmentId=?1 AND s.controllerOrigin='scheduled'
+        AND s.controllerState='pending' AND w.state='pending'
+      ORDER BY w.createdAt, w.wakeId
+      """,
+      [assignment_id]
+    )
+    |> Enum.each(fn [wake_id] ->
+      unless Wakes.cancel_in_txn(txn, %{
+               wake_id: wake_id,
+               requester: %{kind: "process", id: requester_id},
+               reason_kind: "obligation_disposed",
+               causal_source: %{kind: "assignment_transition", id: assignment_id},
+               outcome: outcome
+             }) do
+        raise "typed supervision cancellation refused for #{wake_id}"
+      end
+    end)
+  end
+
+  defp assignment_trigger_in_txn(txn, assignment_id) do
+    case query(
+           txn,
+           "SELECT generation, state FROM supervision_entitlements WHERE assignmentId=?1",
+           [assignment_id]
+         ) do
+      [[generation, state]] when state in ["armed", "claimed"] ->
+        {:ok, %{kind: "supervision_entitlement", id: "#{assignment_id}##{generation}"}}
+
+      [[_generation, "terminus"]] ->
+        :none
+
+      [] ->
+        case accepted_transfer(txn, assignment_id, nil) do
+          {:ok, %{turn_seq: turn_seq}} ->
+            {:ok, %{kind: "supervision_transfer", id: "#{assignment_id}##{turn_seq}"}}
+
+          :none ->
+            :none
+
+          {:error, _reason} ->
+            {:error, :incompatible_supervision_liveness_v1}
+        end
+    end
+  end
+
+  defp clear_entitlement_in_txn(txn, assignment_id, cause, principal \\ "process:tightbeam") do
+    Txn.q(txn, "DELETE FROM supervision_entitlements WHERE assignmentId=?1", [assignment_id])
+    changed? = Txn.changes(txn) == 1
+
+    Txn.q(
+      txn,
+      """
+      UPDATE supervision_watermarks
+      SET pendingBranch=NULL, pendingAssignment=NULL, pendingK=NULL, pendingN=NULL
+      WHERE pendingAssignment=?1
+      """,
+      [assignment_id]
+    )
+
+    if changed? and cause != "parent_elevated" do
+      EventLog.lifecycle_in_txn(
+        txn,
+        "supervision_entitlement_cleared",
+        assignment_id,
+        "cause=#{cause} principal=#{principal}"
+      )
+    end
+
+    changed?
   end
 
   @spec watermark(DB.server(), String.t()) :: map() | nil
@@ -181,6 +770,8 @@ defmodule Tightbeam.Supervision do
           | :blocked
           | :duplicate
           | :coalesced
+          | :rebased
+          | :not_due
           | {:prodded, pos_integer()}
           | {:escalated, pos_integer(), String.t()}
           | :terminus
@@ -190,12 +781,16 @@ defmodule Tightbeam.Supervision do
           | {:retry, :rail_escalate}
           | {:refused, String.t()}
   def evaluate(db, handlers, n, session_key, terminal_seq) do
+    evaluate_with_interval(db, handlers, n, session_key, terminal_seq, nil)
+  end
+
+  defp evaluate_with_interval(db, handlers, n, session_key, terminal_seq, interval) do
     case drain(db, handlers, session_key) do
       {:pending, result} ->
         result
 
       {:cleared, _prior_result} ->
-        evaluate_terminal(db, handlers, n, session_key, terminal_seq)
+        evaluate_terminal(db, handlers, n, session_key, terminal_seq, interval)
     end
   end
 
@@ -234,7 +829,8 @@ defmodule Tightbeam.Supervision do
   @spec prod_production_matches?(DB.server(), String.t(), integer() | nil) ::
           {:match, map()} | {:no_match, atom()} | {:no_match, atom(), map()}
   def prod_production_matches?(db, session_key, terminal_seq) do
-    case Assignments.oldest_open(db, session_key) do
+    case oldest_supervised_assignment(db, session_key) ||
+           Assignments.oldest_open(db, session_key) do
       nil ->
         {:no_match, :no_open_obligation}
 
@@ -255,6 +851,24 @@ defmodule Tightbeam.Supervision do
           :no_terminal -> {:no_match, :no_terminal, assignment}
           :blocked -> {:no_match, :work_blocked, assignment}
         end
+    end
+  end
+
+  defp oldest_supervised_assignment(db, session_key) do
+    case query(
+           db,
+           """
+           SELECT a.id, a.subject, a.holderKey
+           FROM assignments a
+           JOIN supervision_entitlements e ON e.assignmentId=a.id
+           WHERE a.holderKey=?1 AND a.state='open' AND e.state IN ('armed','claimed')
+           ORDER BY a.openedAt, a.id
+           LIMIT 1
+           """,
+           [session_key]
+         ) do
+      [[id, subject, holder]] -> %{id: id, subject: subject, holderKey: holder}
+      [] -> nil
     end
   end
 
@@ -289,6 +903,7 @@ defmodule Tightbeam.Supervision do
 
   @impl true
   def handle_continue(:recovery_sweep, state) do
+    recover_liveness(state)
     sweep(state)
     {:noreply, state}
   end
@@ -296,7 +911,14 @@ defmodule Tightbeam.Supervision do
   @impl true
   def handle_cast({:terminal, session_key, terminal_seq}, state) do
     safe_evaluate(state, session_key, fn ->
-      evaluate(state.db, state.handlers, state.n, session_key, terminal_seq)
+      evaluate_with_interval(
+        state.db,
+        state.handlers,
+        state.n,
+        session_key,
+        terminal_seq,
+        state.sweep_ms
+      )
     end)
 
     {:noreply, state}
@@ -327,7 +949,7 @@ defmodule Tightbeam.Supervision do
   # Recognize, then act: the production's complete LHS is evaluated once, at
   # cycle start, and everything downstream — including the schedule's gates —
   # consults that verdict rather than re-reading working memory mid-cycle.
-  defp evaluate_terminal(db, handlers, n, session_key, terminal_seq) do
+  defp evaluate_terminal(db, handlers, n, session_key, terminal_seq, interval) do
     case prod_production_matches?(db, session_key, terminal_seq) do
       {:no_match, :no_open_obligation} ->
         :idle
@@ -351,7 +973,7 @@ defmodule Tightbeam.Supervision do
         :stranded
 
       verdict ->
-        evaluate_live(db, handlers, n, session_key, terminal_seq, verdict)
+        evaluate_live(db, handlers, n, session_key, terminal_seq, verdict, interval)
     end
   end
 
@@ -403,7 +1025,7 @@ defmodule Tightbeam.Supervision do
   @doc "The end-of-turn shift, in execution order. Pinned by test; amend both."
   def turn_end_schedule, do: @turn_end_schedule
 
-  defp evaluate_live(db, handlers, n, session_key, terminal_seq, verdict) do
+  defp evaluate_live(db, handlers, n, session_key, terminal_seq, verdict, interval) do
     # Every verdict that reaches the schedule still carries the obligation:
     # the rail production outranks the prod ladder and needs it even when the
     # prod production did not match.
@@ -420,7 +1042,8 @@ defmodule Tightbeam.Supervision do
       session_key: session_key,
       terminal_seq: terminal_seq,
       assignment: assignment,
-      verdict: verdict
+      verdict: verdict,
+      supervision_interval_ms: interval
     }
 
     run_schedule(@turn_end_schedule, ctx)
@@ -462,15 +1085,18 @@ defmodule Tightbeam.Supervision do
         {:halt, :blocked}
 
       {:match, assignment} ->
-        {:halt,
-         claim_and_act(
-           ctx.db,
-           ctx.handlers,
-           ctx.n,
-           ctx.session_key,
-           ctx.terminal_seq,
-           assignment
-         )}
+        result =
+          terminal_prod_ladder(
+            ctx.db,
+            ctx.handlers,
+            ctx.n,
+            ctx.session_key,
+            ctx.terminal_seq,
+            assignment,
+            ctx.supervision_interval_ms
+          )
+
+        {:halt, result}
     end
   end
 
@@ -638,7 +1264,275 @@ defmodule Tightbeam.Supervision do
     end
   end
 
+  defp terminal_prod_ladder(
+         db,
+         handlers,
+         n,
+         session_key,
+         terminal_seq,
+         assignment,
+         replacement_interval
+       ) do
+    evaluation_clock = now()
+
+    outcome =
+      transaction!(db, fn txn ->
+        case Txn.q(
+               txn,
+               """
+               SELECT generation, dueAt, state, lastAttemptGeneration,
+                      supervisionIntervalMs, basisKind, basisId
+               FROM supervision_entitlements
+               WHERE assignmentId=?1
+               """,
+               [assignment.id]
+             ) do
+          [] ->
+            :legacy
+
+          [[generation, due_at, state, last_attempt, stored_interval, basis_kind, basis_id]] ->
+            interval =
+              if is_integer(replacement_interval) and replacement_interval > 0,
+                do: replacement_interval,
+                else: stored_interval
+
+            case absorb_progress_in_txn(txn, assignment.id, interval) do
+              :rebased ->
+                write_terminal_watermark_in_txn(txn, session_key, terminal_seq)
+                :rebased
+
+              :duplicate when state == "claimed" ->
+                write_terminal_watermark_in_txn(txn, session_key, terminal_seq)
+                :claimed
+
+              :duplicate when state == "armed" and due_at > evaluation_clock ->
+                write_terminal_watermark_in_txn(txn, session_key, terminal_seq)
+                :not_due
+
+              :duplicate when state == "armed" ->
+                if due_gate?(txn, assignment.id, session_key) do
+                  :controlled
+                else
+                  case claim_entitlement_in_txn(
+                         txn,
+                         assignment,
+                         generation,
+                         due_at,
+                         last_attempt,
+                         basis_kind,
+                         basis_id,
+                         evaluation_clock,
+                         n,
+                         terminal_seq,
+                         "new_terminal"
+                       ) do
+                    :ok -> :claimed
+                    :stale -> :duplicate
+                  end
+                end
+
+              :duplicate ->
+                write_terminal_watermark_in_txn(txn, session_key, terminal_seq)
+                :duplicate
+            end
+        end
+      end)
+
+    case outcome do
+      :legacy ->
+        claim_and_act(db, handlers, n, session_key, terminal_seq, assignment)
+
+      :claimed ->
+        case drain(db, handlers, session_key) do
+          {:pending, result} -> result
+          {:cleared, result} -> result
+        end
+
+      :rebased ->
+        :rebased
+
+      :not_due ->
+        :not_due
+
+      :controlled ->
+        :continuation
+
+      :duplicate ->
+        :duplicate
+    end
+  end
+
+  defp write_terminal_watermark_in_txn(_txn, _session_key, nil), do: :ok
+
+  defp write_terminal_watermark_in_txn(txn, session_key, terminal_seq) do
+    Txn.q(
+      txn,
+      """
+      INSERT INTO supervision_watermarks
+        (sessionKey, lastEvaluatedTerminal, pendingBranch, pendingAssignment, pendingK, pendingN)
+      VALUES (?1, ?2, NULL, NULL, NULL, NULL)
+      ON CONFLICT(sessionKey) DO UPDATE SET
+        lastEvaluatedTerminal=excluded.lastEvaluatedTerminal
+      """,
+      [session_key, terminal_seq]
+    )
+
+    :ok
+  end
+
+  defp claim_entitlement_in_txn(
+         txn,
+         assignment,
+         generation,
+         due_at,
+         last_attempt_generation,
+         basis_kind,
+         basis_id,
+         evaluation_clock,
+         n,
+         terminal_seq,
+         cause
+       ) do
+    current = counter_state_in_txn(txn, assignment.id)
+
+    attempt_count =
+      if last_attempt_generation == generation,
+        do: current.attemptCount,
+        else: current.attemptCount + 1
+
+    {branch, k} = branch_for_claim(txn, assignment.holderKey, current.prodCount, n)
+
+    stalled_at =
+      if branch in ["escalation", "terminus"],
+        do: current.stalledAt || evaluation_clock,
+        else: current.stalledAt
+
+    Txn.q(
+      txn,
+      """
+      UPDATE supervision_entitlements
+      SET state='claimed', claimClock=?3, lastAttemptGeneration=?2,
+          cause=?5, principal='process:tightbeam'
+      WHERE assignmentId=?1 AND generation=?2 AND dueAt=?4 AND state='armed'
+      """,
+      [assignment.id, generation, evaluation_clock, due_at, cause]
+    )
+
+    if Txn.changes(txn) == 1 do
+      Txn.q(
+        txn,
+        """
+        INSERT INTO supervision_watermarks
+          (sessionKey, lastEvaluatedTerminal, pendingBranch, pendingAssignment, pendingK, pendingN)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        ON CONFLICT(sessionKey) DO UPDATE SET
+          lastEvaluatedTerminal=excluded.lastEvaluatedTerminal,
+          pendingBranch=excluded.pendingBranch,
+          pendingAssignment=excluded.pendingAssignment,
+          pendingK=excluded.pendingK,
+          pendingN=excluded.pendingN
+        """,
+        [assignment.holderKey, terminal_seq, branch, assignment.id, k, n]
+      )
+
+      [[attest_count]] =
+        Txn.q(txn, "SELECT count(*) FROM attests WHERE assignmentId=?1", [assignment.id])
+
+      Txn.q(
+        txn,
+        """
+        INSERT INTO assignment_prods
+          (assignmentId, attemptCount, prodCount, deniedStreak, attestCount,
+           lastProdAt, stalledAt, strandedAt)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        ON CONFLICT(assignmentId) DO UPDATE SET
+          attemptCount=excluded.attemptCount,
+          prodCount=excluded.prodCount,
+          deniedStreak=excluded.deniedStreak,
+          attestCount=excluded.attestCount,
+          lastProdAt=excluded.lastProdAt,
+          stalledAt=excluded.stalledAt,
+          strandedAt=excluded.strandedAt
+        """,
+        [
+          assignment.id,
+          attempt_count,
+          current.prodCount,
+          current.deniedStreak,
+          attest_count,
+          current.lastProdAt,
+          stalled_at,
+          current.strandedAt
+        ]
+      )
+
+      EventLog.lifecycle_in_txn(
+        txn,
+        "supervision_entitlement_claimed",
+        assignment.id,
+        "generation=#{generation} basis=#{basis_kind}:#{basis_id} cause=#{cause} principal=process:tightbeam"
+      )
+
+      :ok
+    else
+      :stale
+    end
+  end
+
+  defp counter_state_in_txn(txn, assignment_id) do
+    case Txn.q(
+           txn,
+           """
+           SELECT attemptCount, prodCount, deniedStreak, attestCount, lastProdAt,
+                  stalledAt, strandedAt
+           FROM assignment_prods
+           WHERE assignmentId=?1
+           """,
+           [assignment_id]
+         ) do
+      [[attempts, prods, denied, attests, last_prod, stalled, stranded]] ->
+        %{
+          attemptCount: attempts,
+          prodCount: prods,
+          deniedStreak: denied,
+          attestCount: attests,
+          lastProdAt: last_prod,
+          stalledAt: stalled,
+          strandedAt: stranded
+        }
+
+      [] ->
+        zero_state(assignment_id)
+    end
+  end
+
+  defp branch_for_claim(txn, holder, prod_count, n) do
+    if prod_count < n do
+      {"prod", prod_count + 1}
+    else
+      rung = prod_count - n + 1
+
+      case ladder_target(txn, holder, rung) do
+        nil -> {"terminus", rung}
+        ^holder -> {"terminus", rung}
+        _target -> {"escalation", rung}
+      end
+    end
+  end
+
   defp claim_and_act(db, handlers, n, session_key, terminal_seq, assignment) do
+    claim_and_act(db, handlers, n, session_key, terminal_seq, assignment, true)
+  end
+
+  defp claim_and_act(
+         db,
+         handlers,
+         n,
+         session_key,
+         terminal_seq,
+         assignment,
+         count_attempt?
+       ) do
     prior = prod_state(db, assignment.id) || zero_state(assignment.id)
     attest_count = Assignments.attest_count(db, assignment.id)
 
@@ -649,7 +1543,7 @@ defmodule Tightbeam.Supervision do
         prior
       end
 
-    attempt_count = current.attemptCount + 1
+    attempt_count = if count_attempt?, do: current.attemptCount + 1, else: current.attemptCount
 
     {branch, k} =
       if current.prodCount < n do
@@ -685,6 +1579,19 @@ defmodule Tightbeam.Supervision do
         else: current.stalledAt
 
     transaction!(db, fn txn ->
+      if count_attempt? do
+        Txn.q(
+          txn,
+          """
+          UPDATE supervision_entitlements
+          SET state='claimed', claimClock=?2, lastAttemptGeneration=generation,
+              cause='new_terminal', principal='process:tightbeam'
+          WHERE assignmentId=?1 AND state='armed' AND dueAt <= ?2
+          """,
+          [assignment.id, now()]
+        )
+      end
+
       Txn.q(
         txn,
         """
@@ -769,8 +1676,66 @@ defmodule Tightbeam.Supervision do
         {:cleared, nil}
 
       assignment ->
-        drain_open(db, handlers, pending, assignment)
+        case prepare_drain(db, pending) do
+          :ready -> drain_open(db, handlers, pending, assignment)
+          :legacy -> drain_open(db, handlers, pending, assignment)
+          :deferred -> {:cleared, :deferred}
+          :stale -> {:cleared, nil}
+        end
     end
+  end
+
+  defp prepare_drain(db, pending) do
+    transaction!(db, fn txn ->
+      case Txn.q(
+             txn,
+             """
+             SELECT generation, state, lastAttemptGeneration, basisKind, basisId
+             FROM supervision_entitlements
+             WHERE assignmentId=?1
+             """,
+             [pending.pendingAssignment]
+           ) do
+        [] ->
+          :legacy
+
+        [[generation, "claimed", generation, basis_kind, basis_id]] ->
+          case gate_reason_in_txn(txn, pending.pendingAssignment, pending.sessionKey) do
+            nil ->
+              :ready
+
+            cause ->
+              Txn.q(
+                txn,
+                """
+                UPDATE supervision_entitlements
+                SET state='armed', claimClock=NULL, cause=?3,
+                    principal='process:tightbeam'
+                WHERE assignmentId=?1 AND generation=?2 AND state='claimed'
+                  AND lastAttemptGeneration=?2
+                """,
+                [pending.pendingAssignment, generation, cause]
+              )
+
+              if Txn.changes(txn) == 1 do
+                clear_pending_in_txn(txn, pending)
+
+                EventLog.lifecycle_in_txn(
+                  txn,
+                  "supervision_entitlement_deferred",
+                  pending.pendingAssignment,
+                  "generation=#{generation} basis=#{basis_kind}:#{basis_id} cause=#{cause} principal=process:tightbeam"
+                )
+              end
+
+              :deferred
+          end
+
+        [_stale] ->
+          clear_pending_in_txn(txn, pending)
+          :stale
+      end
+    end)
   end
 
   defp drain_open(db, handlers, %{pendingBranch: "prod"} = pending, assignment) do
@@ -815,14 +1780,42 @@ defmodule Tightbeam.Supervision do
     attempt_count =
       (prod_state(db, pending.pendingAssignment) || zero_state(pending.pendingAssignment)).attemptCount
 
-    EventLog.lifecycle(
-      db,
-      "supervision_terminus",
-      pending.pendingAssignment,
-      "holder=#{pending.sessionKey} attemptCount=#{attempt_count}"
-    )
+    transaction!(db, fn txn ->
+      if clear_pending_in_txn(txn, pending) do
+        terminus_at = now()
 
-    clear_pending(db, pending)
+        Txn.q(
+          txn,
+          """
+          UPDATE supervision_entitlements
+          SET dueAt=NULL, state='terminus', lastAttemptGeneration=NULL, claimClock=NULL,
+              terminusAt=?2, cause='terminus', principal='process:tightbeam',
+              supervisionIntervalMs=NULL
+          WHERE assignmentId=?1 AND state='claimed'
+          """,
+          [pending.pendingAssignment, terminus_at]
+        )
+
+        terminated? = Txn.changes(txn) == 1
+
+        EventLog.lifecycle_in_txn(
+          txn,
+          "supervision_terminus",
+          pending.pendingAssignment,
+          "holder=#{pending.sessionKey} attemptCount=#{attempt_count}"
+        )
+
+        if terminated? do
+          EventLog.lifecycle_in_txn(
+            txn,
+            "supervision_entitlement_terminated",
+            pending.pendingAssignment,
+            "cause=terminus principal=process:tightbeam terminusAt=#{terminus_at}"
+          )
+        end
+      end
+    end)
+
     {:cleared, :terminus}
   end
 
@@ -923,6 +1916,8 @@ defmodule Tightbeam.Supervision do
   defp success_clear(db, pending) do
     transaction!(db, fn txn ->
       if clear_pending_in_txn(txn, pending) do
+        schedule_controller_fallback_in_txn(txn, pending)
+
         Txn.q(
           txn,
           "UPDATE assignment_prods SET prodCount = prodCount + 1, lastProdAt = ?2, deniedStreak = 0 WHERE assignmentId = ?1",
@@ -942,6 +1937,33 @@ defmodule Tightbeam.Supervision do
         end
       end
     end)
+  end
+
+  defp schedule_controller_fallback_in_txn(txn, pending) do
+    case Txn.q(
+           txn,
+           """
+           SELECT w.wakeId
+           FROM wakes w
+           LEFT JOIN supervision_liveness_sidecar s ON s.wakeId=w.wakeId
+           WHERE w.assignmentId=?1 AND w.origin='process:tightbeam' AND w.state='pending'
+             AND s.wakeId IS NULL
+           ORDER BY w.createdAt DESC, w.wakeId DESC
+           LIMIT 1
+           """,
+           [pending.pendingAssignment]
+         ) do
+      [[wake_id]] ->
+        transition_in_txn(txn, %{
+          kind: "controller_scheduled",
+          wake_id: wake_id,
+          assignment_id: pending.pendingAssignment,
+          wake_kind: pending.pendingBranch
+        })
+
+      [] ->
+        :duplicate
+    end
   end
 
   defp denied_clear(db, pending) do
@@ -1059,7 +2081,579 @@ defmodule Tightbeam.Supervision do
     end
   end
 
-  defp sweep(state) do
+  defp recover_liveness(%{sweep_ms: interval} = state)
+       when is_integer(interval) and interval > 0 do
+    recovery_clock = now()
+
+    transaction!(state.db, fn txn ->
+      retired_holders =
+        Txn.q(
+          txn,
+          """
+          SELECT DISTINCT s.sessionKey, s.ownerUserId
+          FROM sessions s
+          JOIN assignments a ON a.holderKey=s.sessionKey
+          WHERE s.state='retired' AND a.state='open'
+          ORDER BY s.sessionKey
+          """
+        )
+
+      Enum.each(retired_holders, fn [session_key, owner_user_id] ->
+        Assignments.interrupt_for_retire_in_txn(
+          txn,
+          session_key,
+          owner_user_id,
+          "process:tightbeam"
+        )
+      end)
+
+      Txn.q(
+        txn,
+        """
+        DELETE FROM supervision_entitlements
+        WHERE assignmentId IN (SELECT id FROM assignments WHERE state='closed')
+        """
+      )
+
+      migrate_legacy_parent_retirements_in_txn(txn)
+
+      existing =
+        Txn.q(
+          txn,
+          """
+          SELECT e.assignmentId
+          FROM supervision_entitlements e
+          JOIN assignments a ON a.id=e.assignmentId
+          JOIN sessions s ON s.sessionKey=a.holderKey
+          WHERE e.state IN ('armed','claimed') AND a.state='open' AND s.state='active'
+          ORDER BY a.openedAt, a.id
+          """
+        )
+
+      Enum.each(existing, fn [assignment_id] ->
+        absorb_progress_in_txn(txn, assignment_id, interval)
+      end)
+
+      missing =
+        Txn.q(
+          txn,
+          """
+          SELECT a.id
+          FROM assignments a
+          JOIN sessions s ON s.sessionKey=a.holderKey
+          LEFT JOIN supervision_entitlements e ON e.assignmentId=a.id
+          WHERE a.state='open' AND s.state='active' AND e.assignmentId IS NULL
+          ORDER BY a.openedAt, a.id
+          """
+        )
+
+      Enum.each(missing, fn [assignment_id] ->
+        case accepted_transfer(txn, assignment_id, nil) do
+          {:ok, _projection} ->
+            :ok
+
+          :none ->
+            baseline_progress_in_txn(txn, assignment_id)
+
+            Txn.q(
+              txn,
+              """
+              INSERT INTO supervision_entitlements
+                (assignmentId, generation, dueAt, state, lastAttemptGeneration, claimClock,
+                 basisKind, basisId, terminusAt, cause, principal, supervisionIntervalMs)
+              VALUES (?1, 1, ?2, 'armed', NULL, NULL, 'recovery_backfill', ?1, NULL,
+                      'recovery_backfill', 'process:tightbeam', ?3)
+              """,
+              [assignment_id, recovery_clock + interval, interval]
+            )
+
+            EventLog.lifecycle_in_txn(
+              txn,
+              "supervision_entitlement_armed",
+              assignment_id,
+              "generation=1 basis=recovery_backfill:#{assignment_id} cause=recovery_backfill principal=process:tightbeam"
+            )
+
+          {:error, reason} ->
+            raise "incompatible_supervision_liveness_v1: #{reason}"
+        end
+      end)
+    end)
+  end
+
+  defp recover_liveness(_state), do: :ok
+
+  defp baseline_progress_in_txn(txn, assignment_id) do
+    rows =
+      Txn.q(
+        txn,
+        """
+        SELECT id, ts
+        FROM attests
+        WHERE assignmentId=?1 AND kind='progress'
+        ORDER BY ts, id
+        """,
+        [assignment_id]
+      )
+
+    Enum.each(rows, fn [attest_id, attest_ts] ->
+      Txn.q(
+        txn,
+        """
+        INSERT OR IGNORE INTO supervision_progress_absorptions
+          (attestId, assignmentId, attestTs, generation, recoveryBaseline, cause, principal)
+        VALUES (?1, ?2, ?3, 1, 1, 'recovery_backfill', 'process:tightbeam')
+        """,
+        [attest_id, assignment_id, attest_ts]
+      )
+    end)
+  end
+
+  defp liveness_cycle(%{sweep_ms: interval} = state, terminal_rebases)
+       when is_integer(interval) and interval > 0 do
+    evaluation_clock = now()
+
+    outcome =
+      transaction!(state.db, fn txn ->
+        assignments =
+          Txn.q(
+            txn,
+            """
+            SELECT e.assignmentId
+            FROM supervision_entitlements e
+            JOIN assignments a ON a.id=e.assignmentId
+            JOIN sessions s ON s.sessionKey=a.holderKey
+            WHERE e.state IN ('armed','claimed') AND a.state='open' AND s.state='active'
+            ORDER BY a.openedAt, a.id
+            """
+          )
+
+        rebased =
+          Enum.reduce(assignments, terminal_rebases, fn [assignment_id], acc ->
+            if MapSet.member?(acc, assignment_id) do
+              acc
+            else
+              case absorb_progress_in_txn(txn, assignment_id, interval) do
+                :rebased -> MapSet.put(acc, assignment_id)
+                :duplicate -> acc
+              end
+            end
+          end)
+
+        claim_due_in_txn(txn, evaluation_clock, rebased, state.n)
+      end)
+
+    case outcome do
+      {:claimed, holder} ->
+        case drain(state.db, state.handlers, holder) do
+          {:pending, result} -> result
+          {:cleared, result} -> result
+        end
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp liveness_cycle(_state, _terminal_rebases), do: :ok
+
+  defp absorb_progress_in_txn(txn, assignment_id, interval) do
+    unseen =
+      Txn.q(
+        txn,
+        """
+        SELECT a.id, a.ts, a.bySession
+        FROM attests a
+        LEFT JOIN supervision_progress_absorptions p ON p.attestId=a.id
+        WHERE a.assignmentId=?1 AND a.kind='progress' AND p.attestId IS NULL
+        ORDER BY a.ts, a.id
+        """,
+        [assignment_id]
+      )
+
+    case unseen do
+      [] ->
+        :duplicate
+
+      rows ->
+        [[generation, state]] =
+          Txn.q(
+            txn,
+            "SELECT generation, state FROM supervision_entitlements WHERE assignmentId=?1",
+            [assignment_id]
+          )
+
+        if state in ["armed", "claimed"] do
+          next_generation = generation + 1
+          [basis_id, basis_ts, by_session] = List.last(rows)
+          principal = "session:#{by_session}"
+
+          Enum.each(rows, fn [attest_id, attest_ts, attest_session] ->
+            Txn.q(
+              txn,
+              """
+              INSERT INTO supervision_progress_absorptions
+                (attestId, assignmentId, attestTs, generation, recoveryBaseline, cause, principal)
+              VALUES (?1, ?2, ?3, ?4, 0, 'progress', ?5)
+              """,
+              [
+                attest_id,
+                assignment_id,
+                attest_ts,
+                next_generation,
+                "session:#{attest_session}"
+              ]
+            )
+          end)
+
+          [[attest_count]] =
+            Txn.q(txn, "SELECT count(*) FROM attests WHERE assignmentId=?1", [assignment_id])
+
+          Txn.q(
+            txn,
+            """
+            INSERT INTO assignment_prods
+              (assignmentId, attemptCount, prodCount, deniedStreak, attestCount, stalledAt)
+            VALUES (?1, 0, 0, 0, ?2, NULL)
+            ON CONFLICT(assignmentId) DO UPDATE SET
+              attemptCount=0, prodCount=0, deniedStreak=0,
+              attestCount=excluded.attestCount, stalledAt=NULL
+            """,
+            [assignment_id, attest_count]
+          )
+
+          Txn.q(
+            txn,
+            """
+            UPDATE supervision_entitlements
+            SET generation=?2, dueAt=?3, state='armed', lastAttemptGeneration=NULL,
+                claimClock=NULL, basisKind='progress', basisId=?4, terminusAt=NULL,
+                cause='progress', principal=?5, supervisionIntervalMs=?6
+            WHERE assignmentId=?1 AND generation=?7 AND state IN ('armed','claimed')
+            """,
+            [
+              assignment_id,
+              next_generation,
+              basis_ts + interval,
+              basis_id,
+              principal,
+              interval,
+              generation
+            ]
+          )
+
+          settle_stale_controller_in_txn(
+            txn,
+            assignment_id,
+            next_generation,
+            basis_id
+          )
+
+          EventLog.lifecycle_in_txn(
+            txn,
+            "supervision_entitlement_rebased",
+            assignment_id,
+            "generation=#{next_generation} basis=progress:#{basis_id} cause=progress principal=#{principal}"
+          )
+
+          :rebased
+        else
+          :duplicate
+        end
+    end
+  end
+
+  defp settle_stale_controller_in_txn(txn, assignment_id, generation, basis_id) do
+    rows =
+      Txn.q(
+        txn,
+        """
+        SELECT s.wakeId
+        FROM supervision_liveness_sidecar s
+        JOIN wakes w ON w.wakeId=s.wakeId
+        WHERE s.assignmentId=?1 AND s.controllerOrigin='scheduled'
+          AND s.controllerState='pending' AND s.chargedGeneration < ?2
+          AND w.state='pending'
+        """,
+        [assignment_id, generation]
+      )
+
+    Enum.each(rows, fn [wake_id] ->
+      if Wakes.cancel_in_txn(txn, %{
+           wake_id: wake_id,
+           requester: %{kind: "process", id: "tightbeam:supervision"},
+           reason_kind: "superseded",
+           causal_source: %{kind: "progress_attest", id: basis_id},
+           outcome: %{
+             kind: "no_replacement",
+             liveness_trigger: %{
+               kind: "supervision_entitlement",
+               id: "#{assignment_id}##{generation}"
+             }
+           }
+         }) do
+        Txn.q(
+          txn,
+          "UPDATE supervision_liveness_sidecar SET controllerState='settled' WHERE wakeId=?1",
+          [wake_id]
+        )
+      end
+    end)
+  end
+
+  defp claim_due_in_txn(txn, evaluation_clock, rebased, n) do
+    candidates =
+      Txn.q(
+        txn,
+        """
+        SELECT e.assignmentId, e.generation, e.dueAt, e.lastAttemptGeneration,
+               e.supervisionIntervalMs, e.basisKind, e.basisId,
+               a.subject, a.holderKey
+        FROM supervision_entitlements e
+        JOIN assignments a ON a.id=e.assignmentId
+        JOIN sessions s ON s.sessionKey=a.holderKey
+        WHERE e.state='armed' AND e.dueAt <= ?1
+          AND a.state='open' AND s.state='active'
+        ORDER BY e.dueAt, a.openedAt, a.id
+        """,
+        [evaluation_clock]
+      )
+
+    Enum.reduce_while(candidates, :not_due, fn
+      [
+        assignment_id,
+        generation,
+        due_at,
+        last_attempt_generation,
+        interval,
+        basis_kind,
+        basis_id,
+        subject,
+        holder
+      ],
+      _acc ->
+        cond do
+          MapSet.member?(rebased, assignment_id) ->
+            {:cont, :not_due}
+
+          due_gate?(txn, assignment_id, holder) ->
+            {:cont, :deferred}
+
+          true ->
+            case last_terminal_in_txn(txn, holder) do
+              nil ->
+                next_generation = generation + 1
+
+                Txn.q(
+                  txn,
+                  """
+                  UPDATE supervision_entitlements
+                  SET generation=?2, dueAt=?3, state='armed', lastAttemptGeneration=NULL,
+                      claimClock=NULL, basisKind='no_terminal', basisId=?4,
+                      cause='no_terminal', principal='process:tightbeam'
+                  WHERE assignmentId=?1 AND generation=?5 AND state='armed'
+                  """,
+                  [
+                    assignment_id,
+                    next_generation,
+                    evaluation_clock + interval,
+                    "#{assignment_id}##{generation}",
+                    generation
+                  ]
+                )
+
+                EventLog.lifecycle_in_txn(
+                  txn,
+                  "supervision_entitlement_rearmed",
+                  assignment_id,
+                  "generation=#{next_generation} basis=no_terminal:#{assignment_id}##{generation} cause=no_terminal principal=process:tightbeam"
+                )
+
+                {:halt, :deferred}
+
+              terminal_seq ->
+                assignment = %{id: assignment_id, subject: subject, holderKey: holder}
+
+                case claim_entitlement_in_txn(
+                       txn,
+                       assignment,
+                       generation,
+                       due_at,
+                       last_attempt_generation,
+                       basis_kind,
+                       basis_id,
+                       evaluation_clock,
+                       n,
+                       terminal_seq,
+                       "deadline"
+                     ) do
+                  :ok -> {:halt, {:claimed, holder}}
+                  :stale -> {:cont, :not_due}
+                end
+            end
+        end
+    end)
+  end
+
+  defp due_gate?(txn, assignment_id, holder) do
+    not is_nil(gate_reason_in_txn(txn, assignment_id, holder))
+  end
+
+  defp gate_reason_in_txn(txn, assignment_id, holder) do
+    cond do
+      Txn.q(
+        txn,
+        "SELECT 1 FROM turns WHERE sessionKey=?1 AND status IN ('queued','running') LIMIT 1",
+        [holder]
+      ) != [] ->
+        "pending_turn"
+
+      Txn.q(
+        txn,
+        "SELECT 1 FROM wakes WHERE sessionKey=?1 AND consumer='prompt' AND state='pending' LIMIT 1",
+        [holder]
+      ) != [] ->
+        "pending_wake"
+
+      Txn.q(
+        txn,
+        """
+        SELECT 1
+        FROM supervision_liveness_sidecar
+        WHERE assignmentId=?1 AND controllerOrigin='scheduled' AND controllerState='pending'
+        LIMIT 1
+        """,
+        [assignment_id]
+      ) != [] ->
+        "pending_wake"
+
+      Txn.q(
+        txn,
+        """
+        SELECT 1
+        FROM condition_facts blocked
+        WHERE blocked.kind='work-blocked' AND blocked.scope=?1
+          AND blocked.id > COALESCE((
+            SELECT MAX(cleared.id)
+            FROM condition_facts cleared
+            WHERE cleared.kind='work-unblocked' AND cleared.scope=?1
+          ), 0)
+        LIMIT 1
+        """,
+        [holder]
+      ) != [] ->
+        "work_blocked"
+
+      true ->
+        nil
+    end
+  end
+
+  defp last_terminal_in_txn(txn, holder) do
+    case Txn.q(
+           txn,
+           """
+           SELECT seq
+           FROM turns
+           WHERE sessionKey=?1 AND endedAt IS NOT NULL
+           ORDER BY seq DESC
+           LIMIT 1
+           """,
+           [holder]
+         ) do
+      [[seq]] -> seq
+      [] -> nil
+    end
+  end
+
+  defp sweep(%{sweep_ms: interval} = state) when is_integer(interval) and interval > 0 do
+    terminal_rebases = sweep_new_terminals(state)
+    liveness_cycle(state, terminal_rebases)
+
+    {:ok, pending_rows} =
+      DB.query(
+        state.db,
+        "SELECT sessionKey FROM supervision_watermarks WHERE pendingBranch IS NOT NULL"
+      )
+
+    Enum.each(pending_rows, fn [session_key] ->
+      safe_evaluate(state, session_key, fn -> drain(state.db, state.handlers, session_key) end)
+    end)
+  rescue
+    error ->
+      best_effort_lifecycle(
+        state.db,
+        "supervision_evaluate_failed",
+        "sweep",
+        Exception.message(error)
+      )
+  catch
+    kind, reason ->
+      best_effort_lifecycle(
+        state.db,
+        "supervision_evaluate_failed",
+        "sweep",
+        inspect({kind, reason})
+      )
+  end
+
+  defp sweep(state), do: legacy_sweep(state)
+
+  defp sweep_new_terminals(state) do
+    open_holders =
+      state.db
+      |> Assignments.list(%{state: "open"})
+      |> Enum.map(& &1.holderKey)
+      |> Enum.reject(&ConditionFacts.standing?(state.db, "work-blocked", &1))
+
+    {:ok, pending_rows} =
+      DB.query(
+        state.db,
+        "SELECT sessionKey FROM supervision_watermarks WHERE pendingBranch IS NOT NULL"
+      )
+
+    pending_sessions = Enum.map(pending_rows, fn [session_key] -> session_key end)
+
+    open_holders
+    |> Kernel.++(pending_sessions)
+    |> Enum.uniq()
+    |> Enum.reduce(MapSet.new(), fn session_key, rebased ->
+      terminal_seq = Ledger.last_terminal_seq(state.db, session_key)
+
+      if new_terminal?(watermark(state.db, session_key), terminal_seq) do
+        result =
+          safe_evaluate(state, session_key, fn ->
+            evaluate_with_interval(
+              state.db,
+              state.handlers,
+              state.n,
+              session_key,
+              terminal_seq,
+              state.sweep_ms
+            )
+          end)
+
+        if result == :rebased do
+          case oldest_supervised_assignment(state.db, session_key) do
+            %{id: assignment_id} -> MapSet.put(rebased, assignment_id)
+            nil -> rebased
+          end
+        else
+          rebased
+        end
+      else
+        rebased
+      end
+    end)
+  end
+
+  defp new_terminal?(_watermark, nil), do: false
+  defp new_terminal?(nil, _terminal_seq), do: true
+
+  defp new_terminal?(%{lastEvaluatedTerminal: prior}, terminal_seq),
+    do: terminal_seq > prior
+
+  defp legacy_sweep(state) do
     # Blocked holders are pre-filtered at sweep granularity (review N11): the
     # per-terminal evaluation would decline them anyway, but re-declining
     # every tick writes a rail_sweep lifecycle row per tick, and work-blocked
@@ -1160,6 +2754,959 @@ defmodule Tightbeam.Supervision do
           Enum.reverse(acc)
       end
     end
+  end
+
+  defp split_transfer_id(transfer_id) when is_binary(transfer_id) do
+    case String.split(transfer_id, "#", parts: 2) do
+      [assignment_id, encoded_seq] when assignment_id != "" ->
+        case Integer.parse(encoded_seq) do
+          {turn_seq, ""} when turn_seq > 0 -> {:ok, assignment_id, turn_seq}
+          _ -> :error
+        end
+
+      _ ->
+        :error
+    end
+  end
+
+  defp split_transfer_id(_transfer_id), do: :error
+
+  defp assignment_belongs_to_work?(db_or_txn, assignment_id, %{kind: "work_item", id: id}) do
+    query(
+      db_or_txn,
+      "SELECT 1 FROM assignments WHERE id=?1 AND workItemId=?2 AND state='open'",
+      [assignment_id, id]
+    ) != []
+  end
+
+  defp assignment_belongs_to_work?(_db_or_txn, _assignment_id, _primary), do: false
+
+  defp transfer_projection(db_or_txn, assignment_id) do
+    case accepted_transfer(db_or_txn, assignment_id, nil) do
+      {:ok, transfer} ->
+        %{
+          supervisionState: "parent_elevated",
+          supervisionGeneration: transfer.generation,
+          supervisionDueAt: nil,
+          supervisionIntervalMs: nil,
+          supervisionBasisKind: nil,
+          supervisionBasisId: nil,
+          supervisionCause: transfer.cause,
+          supervisionPrincipal: transfer.principal,
+          supervisionTerminusAt: nil,
+          supervisionTransferWakeId: transfer.wake_id,
+          supervisionTransferSessionKey: transfer.session_key,
+          supervisionRetirementEpoch: transfer.retirement_epoch,
+          supervisionRetirementOutcomeKind: transfer.retirement_outcome_kind,
+          supervisionRetirementOutcomeId: transfer.retirement_outcome_id,
+          supervisionActionNeeded: transfer.action_needed
+        }
+
+      :none ->
+        nil
+
+      {:error, reason} ->
+        raise "incompatible_supervision_liveness_v1: #{reason}"
+    end
+  end
+
+  defp accepted_transfer(db_or_txn, assignment_id, requested_turn_seq) do
+    candidates =
+      query(
+        db_or_txn,
+        """
+        SELECT t.seq, t.sessionKey, t.assignmentId,
+               w.wakeId, w.state, w.assignmentId, w.origin, w.createdAt, w.firedAt,
+               w.reresolve, w.reresolveSeed, w.reresolveRung,
+               s.assignmentId, s.controllerOrigin, s.wakeKind, s.controllerState,
+               s.chargedGeneration, s.transferEvidenceId
+        FROM turns t
+        JOIN wakes w ON w.wakeId=t.wakeId
+        LEFT JOIN supervision_liveness_sidecar s ON s.wakeId=w.wakeId
+        WHERE t.assignmentId=?1 AND w.assignmentId=?1
+          AND (?2 IS NULL OR t.seq=?2)
+          AND (w.reresolve='lineage' OR s.wakeKind='escalation')
+        ORDER BY t.seq
+        """,
+        [assignment_id, requested_turn_seq]
+      )
+      |> Enum.map(&decode_transfer_row/1)
+      |> Enum.reject(fn candidate ->
+        candidate.transfer_evidence_id == "#{assignment_id}##{candidate.turn_seq}"
+      end)
+
+    case candidates do
+      [] ->
+        :none
+
+      [candidate] ->
+        validate_transfer(db_or_txn, assignment_id, candidate)
+
+      _many ->
+        {:error, :ambiguous_parent_transfer}
+    end
+  end
+
+  defp decode_transfer_row([
+         turn_seq,
+         session_key,
+         turn_assignment_id,
+         wake_id,
+         wake_state,
+         wake_assignment_id,
+         origin,
+         created_at,
+         fired_at,
+         reresolve,
+         reresolve_seed,
+         reresolve_rung,
+         sidecar_assignment_id,
+         controller_origin,
+         wake_kind,
+         controller_state,
+         charged_generation,
+         transfer_evidence_id
+       ]) do
+    %{
+      turn_seq: turn_seq,
+      session_key: session_key,
+      turn_assignment_id: turn_assignment_id,
+      wake_id: wake_id,
+      wake_state: wake_state,
+      wake_assignment_id: wake_assignment_id,
+      origin: origin,
+      created_at: created_at,
+      fired_at: fired_at,
+      reresolve: reresolve,
+      reresolve_seed: reresolve_seed,
+      reresolve_rung: reresolve_rung,
+      sidecar_assignment_id: sidecar_assignment_id,
+      controller_origin: controller_origin,
+      wake_kind: wake_kind,
+      controller_state: controller_state,
+      charged_generation: charged_generation,
+      transfer_evidence_id: transfer_evidence_id
+    }
+  end
+
+  defp validate_transfer(db_or_txn, assignment_id, candidate) do
+    evidence_id = "#{assignment_id}##{candidate.turn_seq}"
+
+    common? =
+      candidate.turn_assignment_id == assignment_id and
+        candidate.wake_assignment_id == assignment_id and
+        candidate.wake_state == "fired" and candidate.origin == "process:tightbeam" and
+        candidate.reresolve == "lineage" and is_integer(candidate.reresolve_rung) and
+        candidate.reresolve_rung > 0 and is_binary(candidate.reresolve_seed) and
+        session_exists?(db_or_txn, candidate.session_key) and
+        candidate.transfer_evidence_id != evidence_id
+
+    branch =
+      cond do
+        not common? ->
+          :error
+
+        candidate.controller_origin == "scheduled" ->
+          validate_scheduled_transfer(db_or_txn, candidate)
+
+        candidate.controller_origin == "retirement_elevation" ->
+          validate_retirement_transfer(db_or_txn, assignment_id, evidence_id, candidate)
+
+        is_nil(candidate.controller_origin) and is_nil(candidate.sidecar_assignment_id) ->
+          validate_preactivation_transfer(db_or_txn, candidate)
+
+        true ->
+          :error
+      end
+
+    case branch do
+      {:ok, predecessor} ->
+        {:ok,
+         Map.merge(
+           %{
+             assignment_id: assignment_id,
+             turn_seq: candidate.turn_seq,
+             session_key: candidate.session_key,
+             wake_id: candidate.wake_id,
+             generation: candidate.charged_generation,
+             reresolve_seed: candidate.reresolve_seed,
+             reresolve_rung: candidate.reresolve_rung,
+             evidence_id: evidence_id,
+             cause: "parent_elevated",
+             principal: "process:tightbeam",
+             retirement_epoch: nil,
+             retirement_outcome_kind: nil,
+             retirement_outcome_id: nil,
+             action_needed: nil
+           },
+           predecessor
+         )}
+
+      :error ->
+        {:error, :invalid_parent_transfer}
+    end
+  end
+
+  defp validate_scheduled_transfer(db_or_txn, candidate) do
+    if candidate.sidecar_assignment_id == candidate.turn_assignment_id and
+         candidate.controller_state == "settled" and candidate.wake_kind == "escalation" and
+         is_integer(candidate.charged_generation) and candidate.charged_generation > 0 and
+         ladder_target(
+           db_or_txn,
+           candidate.reresolve_seed,
+           candidate.reresolve_rung
+         ) == candidate.session_key do
+      {:ok, %{}}
+    else
+      :error
+    end
+  end
+
+  defp validate_preactivation_transfer(db_or_txn, candidate) do
+    case query(
+           db_or_txn,
+           "SELECT activatedAt FROM supervision_liveness_epoch WHERE id=0",
+           []
+         ) do
+      [[activated_at]]
+      when is_integer(candidate.created_at) and is_integer(candidate.fired_at) and
+             candidate.created_at <= activated_at and candidate.fired_at <= activated_at ->
+        if ladder_target(
+             db_or_txn,
+             candidate.reresolve_seed,
+             candidate.reresolve_rung
+           ) == candidate.session_key do
+          {:ok, %{}}
+        else
+          :error
+        end
+
+      _ ->
+        :error
+    end
+  end
+
+  defp migrate_legacy_parent_retirements_in_txn(txn) do
+    [[activation_epoch]] =
+      Txn.q(txn, "SELECT activatedAt FROM supervision_liveness_epoch WHERE id=0")
+
+    assignments =
+      Txn.q(
+        txn,
+        """
+        SELECT a.id
+        FROM assignments a
+        LEFT JOIN supervision_entitlements e ON e.assignmentId=a.id
+        WHERE a.state='open' AND e.assignmentId IS NULL
+        ORDER BY a.openedAt, a.id
+        """
+      )
+
+    Enum.each(assignments, fn [assignment_id] ->
+      case legacy_outcomes_in_txn(txn, assignment_id) do
+        [] ->
+          migrate_legacy_candidate_in_txn(txn, assignment_id, activation_epoch)
+
+        [_outcome] ->
+          case accepted_transfer(txn, assignment_id, nil) do
+            {:ok, %{cause: "legacy_parent_target_retired"}} -> :ok
+            _ -> legacy_refusal!(assignment_id, "legacy_parent_successor_conflict")
+          end
+
+        _many ->
+          legacy_refusal!(assignment_id, "legacy_parent_successor_conflict")
+      end
+    end)
+  end
+
+  defp legacy_outcomes_in_txn(txn, assignment_id) do
+    Txn.q(
+      txn,
+      """
+      SELECT wakeId
+      FROM supervision_liveness_sidecar
+      WHERE assignmentId=?1 AND retirementCause='legacy_parent_target_retired'
+      ORDER BY wakeId
+      """,
+      [assignment_id]
+    )
+  end
+
+  defp migrate_legacy_candidate_in_txn(txn, assignment_id, activation_epoch) do
+    candidates =
+      transfer_candidates(txn, assignment_id)
+      |> Enum.filter(
+        &potential_legacy_candidate?(
+          txn,
+          assignment_id,
+          activation_epoch,
+          &1
+        )
+      )
+
+    case candidates do
+      [] ->
+        :ok
+
+      [candidate] ->
+        migrate_one_legacy_transfer_in_txn(
+          txn,
+          assignment_id,
+          candidate,
+          activation_epoch
+        )
+
+      _many ->
+        legacy_refusal!(assignment_id, "legacy_parent_transfer_ambiguous")
+    end
+  end
+
+  defp transfer_candidates(txn, assignment_id) do
+    Txn.q(
+      txn,
+      """
+      SELECT t.seq, t.sessionKey, t.assignmentId,
+             w.wakeId, w.state, w.assignmentId, w.origin, w.createdAt, w.firedAt,
+             w.reresolve, w.reresolveSeed, w.reresolveRung,
+             s.assignmentId, s.controllerOrigin, s.wakeKind, s.controllerState,
+             s.chargedGeneration, s.transferEvidenceId
+      FROM turns t
+      JOIN wakes w ON w.wakeId=t.wakeId
+      LEFT JOIN supervision_liveness_sidecar s ON s.wakeId=w.wakeId
+      WHERE t.assignmentId=?1 AND w.assignmentId=?1
+        AND (w.reresolve='lineage' OR s.wakeKind='escalation')
+      ORDER BY t.seq
+      """,
+      [assignment_id]
+    )
+    |> Enum.map(&decode_transfer_row/1)
+  end
+
+  defp potential_legacy_candidate?(
+         txn,
+         assignment_id,
+         activation_epoch,
+         candidate
+       ) do
+    structural? =
+      candidate.turn_assignment_id == assignment_id and
+        candidate.wake_assignment_id == assignment_id and
+        candidate.wake_state == "fired" and candidate.origin == "process:tightbeam" and
+        candidate.reresolve == "lineage" and is_integer(candidate.reresolve_rung) and
+        candidate.reresolve_rung > 0 and is_binary(candidate.reresolve_seed) and
+        is_nil(candidate.transfer_evidence_id) and
+        legacy_source_shape?(assignment_id, activation_epoch, candidate)
+
+    structural? and
+      ladder_target(
+        txn,
+        candidate.reresolve_seed,
+        candidate.reresolve_rung
+      ) != candidate.session_key
+  rescue
+    _ -> false
+  end
+
+  defp legacy_source_shape?(assignment_id, _activation_epoch, candidate)
+       when candidate.controller_origin == "scheduled" do
+    candidate.sidecar_assignment_id == assignment_id and
+      candidate.controller_state == "settled" and candidate.wake_kind == "escalation" and
+      is_integer(candidate.charged_generation) and candidate.charged_generation > 0
+  end
+
+  defp legacy_source_shape?(_assignment_id, activation_epoch, candidate)
+       when is_nil(candidate.controller_origin) and is_nil(candidate.sidecar_assignment_id) do
+    is_integer(candidate.created_at) and is_integer(candidate.fired_at) and
+      candidate.created_at <= activation_epoch and candidate.fired_at <= activation_epoch
+  end
+
+  defp legacy_source_shape?(_assignment_id, _activation_epoch, _candidate), do: false
+
+  defp migrate_one_legacy_transfer_in_txn(txn, assignment_id, candidate, activation_epoch) do
+    case Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey=?1", [
+           candidate.session_key
+         ]) do
+      [] ->
+        legacy_refusal!(
+          assignment_id,
+          "legacy_parent_target_missing",
+          candidate
+        )
+
+      [["retired"]] ->
+        :ok
+
+      [[_state]] ->
+        legacy_refusal!(
+          assignment_id,
+          "legacy_parent_target_not_retired",
+          candidate
+        )
+    end
+
+    [[subject]] =
+      Txn.q(txn, "SELECT subject FROM assignments WHERE id=?1 AND state='open'", [
+        assignment_id
+      ])
+
+    target = legacy_owner_main_in_txn(txn, assignment_id, candidate)
+
+    transfer =
+      candidate
+      |> Map.put(:assignment_id, assignment_id)
+      |> Map.put(:evidence_id, "#{assignment_id}##{candidate.turn_seq}")
+
+    invalidate_transfer_turn_in_txn(txn, transfer, activation_epoch)
+
+    wake =
+      Wakes.schedule_in_txn(txn, %{
+        session_key: target,
+        origin: "process:tightbeam",
+        prompt:
+          escalation_prompt(
+            assignment_id,
+            subject,
+            candidate.reresolve_seed,
+            0,
+            candidate.reresolve_rung
+          ),
+        due_at: activation_epoch,
+        assignment_id: assignment_id,
+        reresolve: "lineage",
+        reresolve_seed: candidate.reresolve_seed,
+        reresolve_rung: candidate.reresolve_rung
+      })
+
+    case Gateway.deliver_prompt_in_txn(
+           txn,
+           target,
+           wake.origin,
+           wake.prompt,
+           wake_id: wake.wake_id,
+           sender: wake.origin,
+           fire_wake_in_txn: true,
+           assignment_id: assignment_id
+         ) do
+      {:appended, ^target, _message, _opts} ->
+        :ok
+
+      other ->
+        legacy_refusal!(
+          assignment_id,
+          "legacy_parent_successor_conflict delivery=#{inspect(other)}",
+          candidate
+        )
+    end
+
+    [[turn_seq]] = Txn.q(txn, "SELECT seq FROM turns WHERE wakeId=?1", [wake.wake_id])
+    outcome_id = "#{assignment_id}##{turn_seq}"
+
+    Txn.q(
+      txn,
+      """
+      INSERT INTO supervision_liveness_sidecar
+        (wakeId, assignmentId, controllerOrigin, wakeKind, controllerState,
+         chargedGeneration)
+      VALUES (?1, ?2, 'retirement_elevation', 'escalation', 'settled', NULL)
+      """,
+      [wake.wake_id, assignment_id]
+    )
+
+    store_legacy_retirement_outcome_in_txn(
+      txn,
+      transfer,
+      activation_epoch,
+      outcome_id,
+      target
+    )
+  end
+
+  defp legacy_owner_main_in_txn(txn, assignment_id, candidate) do
+    rows =
+      Txn.q(
+        txn,
+        """
+        SELECT s.sessionKey
+        FROM assignments a
+        JOIN work_items wi ON wi.id=a.workItemId
+        JOIN sessions s ON s.ownerUserId=wi.ownerUserId
+        WHERE a.id=?1 AND s.kind='main' AND s.isBuiltIn=1 AND s.state='active'
+        ORDER BY s.sessionKey
+        """,
+        [assignment_id]
+      )
+
+    case rows do
+      [[target]] -> target
+      _ -> legacy_refusal!(assignment_id, "legacy_parent_successor_conflict", candidate)
+    end
+  end
+
+  defp store_legacy_retirement_outcome_in_txn(
+         txn,
+         transfer,
+         activation_epoch,
+         outcome_id,
+         target
+       ) do
+    Txn.q(
+      txn,
+      """
+      INSERT INTO supervision_liveness_sidecar
+        (wakeId, assignmentId, transferEvidenceId, retirementEpoch,
+         retiringSessionKey, retirementOutcomeKind, retirementOutcomeId,
+         retirementTargetSessionKey, retirementCause, retirementPrincipal,
+         retirementActionNeeded)
+      VALUES (?1, ?2, ?3, ?4, ?5, 'main_elevation', ?6, ?7,
+              'legacy_parent_target_retired', 'process:tightbeam', 1)
+      ON CONFLICT(wakeId) DO UPDATE SET
+        transferEvidenceId=excluded.transferEvidenceId,
+        retirementEpoch=excluded.retirementEpoch,
+        retiringSessionKey=excluded.retiringSessionKey,
+        retirementOutcomeKind=excluded.retirementOutcomeKind,
+        retirementOutcomeId=excluded.retirementOutcomeId,
+        retirementTargetSessionKey=excluded.retirementTargetSessionKey,
+        retirementCause=excluded.retirementCause,
+        retirementPrincipal=excluded.retirementPrincipal,
+        retirementActionNeeded=excluded.retirementActionNeeded
+      WHERE supervision_liveness_sidecar.transferEvidenceId IS NULL
+      """,
+      [
+        transfer.wake_id,
+        transfer.assignment_id,
+        transfer.evidence_id,
+        activation_epoch,
+        transfer.session_key,
+        outcome_id,
+        target
+      ]
+    )
+
+    if Txn.changes(txn) != 1 do
+      legacy_refusal!(
+        transfer.assignment_id,
+        "legacy_parent_successor_conflict",
+        transfer
+      )
+    end
+  end
+
+  defp legacy_refusal!(assignment_id, detail, candidate \\ nil) do
+    suffix =
+      if is_map(candidate) do
+        " assignment=#{assignment_id} evidence=#{assignment_id}##{candidate.turn_seq} target=#{candidate.session_key}"
+      else
+        " assignment=#{assignment_id}"
+      end
+
+    raise "incompatible_supervision_liveness_v1: #{detail}#{suffix}"
+  end
+
+  defp validate_retirement_transfer(db_or_txn, assignment_id, evidence_id, candidate) do
+    if candidate.sidecar_assignment_id == assignment_id and
+         candidate.controller_state == "settled" and candidate.wake_kind == "escalation" and
+         is_nil(candidate.charged_generation) do
+      predecessors =
+        query(
+          db_or_txn,
+          """
+          SELECT wakeId, transferEvidenceId, retirementEpoch, retiringSessionKey,
+                 retirementOutcomeKind, retirementOutcomeId, retirementTargetSessionKey,
+                 retirementCause, retirementPrincipal, retirementActionNeeded
+          FROM supervision_liveness_sidecar
+          WHERE retirementOutcomeId=?1 AND wakeId<>?2
+          """,
+          [evidence_id, candidate.wake_id]
+        )
+
+      case predecessors do
+        [predecessor] ->
+          validate_retirement_predecessor(
+            db_or_txn,
+            assignment_id,
+            evidence_id,
+            candidate,
+            predecessor
+          )
+
+        _ ->
+          :error
+      end
+    else
+      :error
+    end
+  end
+
+  defp validate_retirement_predecessor(
+         db_or_txn,
+         assignment_id,
+         evidence_id,
+         candidate,
+         [
+           _source_wake_id,
+           invalidated_evidence_id,
+           epoch,
+           _retiring_session_key,
+           outcome_kind,
+           predecessor_outcome_id,
+           target,
+           cause,
+           principal,
+           action_needed
+         ]
+       ) do
+    owner_main = assignment_owner_main(db_or_txn, assignment_id)
+
+    shared? =
+      predecessor_outcome_id == evidence_id and invalidated_evidence_id != evidence_id and
+        is_integer(epoch) and epoch >= 0 and target == candidate.session_key
+
+    runtime? =
+      cause == "parent_target_retired" and
+        ((outcome_kind == "parent_elevation" and action_needed == 0 and target != owner_main) or
+           (outcome_kind == "main_elevation" and action_needed == 1 and target == owner_main))
+
+    legacy? =
+      cause == "legacy_parent_target_retired" and principal == "process:tightbeam" and
+        outcome_kind == "main_elevation" and action_needed == 1 and target == owner_main and
+        query(
+          db_or_txn,
+          "SELECT 1 FROM supervision_liveness_epoch WHERE id=0 AND activatedAt=?1",
+          [
+            epoch
+          ]
+        ) != []
+
+    if shared? and (runtime? or legacy?) do
+      {:ok,
+       %{
+         cause: cause,
+         principal: principal,
+         retirement_epoch: epoch,
+         retirement_outcome_kind: outcome_kind,
+         retirement_outcome_id: evidence_id,
+         action_needed: action_needed == 1
+       }}
+    else
+      :error
+    end
+  end
+
+  defp session_exists?(db_or_txn, session_key) do
+    query(db_or_txn, "SELECT 1 FROM sessions WHERE sessionKey=?1", [session_key]) != []
+  end
+
+  defp assignment_owner_main(db_or_txn, assignment_id) do
+    case query(
+           db_or_txn,
+           """
+           SELECT wi.ownerUserId
+           FROM assignments a
+           JOIN work_items wi ON wi.id=a.workItemId
+           WHERE a.id=?1
+           """,
+           [assignment_id]
+         ) do
+      [[owner_user_id]] -> Org.personal_session_key(owner_user_id)
+      [] -> nil
+    end
+  end
+
+  defp transferred_assignments_in_txn(txn, target_session_key) do
+    query(
+      txn,
+      """
+      SELECT a.id
+      FROM assignments a
+      LEFT JOIN supervision_entitlements e ON e.assignmentId=a.id
+      WHERE a.state='open' AND e.assignmentId IS NULL
+      ORDER BY a.openedAt, a.id
+      """,
+      []
+    )
+    |> Enum.reduce([], fn [assignment_id], acc ->
+      case accepted_transfer(txn, assignment_id, nil) do
+        {:ok, %{session_key: ^target_session_key} = transfer} ->
+          [{assignment_id, transfer} | acc]
+
+        {:ok, _other_target} ->
+          acc
+
+        :none ->
+          acc
+
+        {:error, reason} ->
+          raise "incompatible_supervision_liveness_v1: #{reason}"
+      end
+    end)
+    |> Enum.reverse()
+  end
+
+  defp recover_retired_target_in_txn(
+         txn,
+         assignment_id,
+         transfer,
+         retirement_epoch,
+         supervision_interval_ms,
+         principal
+       ) do
+    [[holder, subject]] =
+      query(txn, "SELECT holderKey, subject FROM assignments WHERE id=?1 AND state='open'", [
+        assignment_id
+      ])
+
+    if active_session?(txn, holder) do
+      generation = (transfer.generation || 0) + 1
+      outcome_id = "#{assignment_id}##{generation}"
+
+      invalidate_transfer_turn_in_txn(txn, transfer, retirement_epoch)
+
+      Txn.q(
+        txn,
+        """
+        INSERT INTO supervision_entitlements
+          (assignmentId, generation, dueAt, state, lastAttemptGeneration, claimClock,
+           basisKind, basisId, terminusAt, cause, principal, supervisionIntervalMs)
+        VALUES (?1, ?2, ?3, 'armed', NULL, NULL, 'parent_retirement', ?4, NULL,
+                'parent_target_retired', ?5, ?6)
+        """,
+        [
+          assignment_id,
+          generation,
+          retirement_epoch + supervision_interval_ms,
+          "#{transfer.evidence_id}##{retirement_epoch}",
+          principal,
+          supervision_interval_ms
+        ]
+      )
+
+      store_retirement_outcome_in_txn(
+        txn,
+        transfer,
+        retirement_epoch,
+        "child_rearm",
+        outcome_id,
+        nil,
+        principal,
+        false
+      )
+
+      EventLog.lifecycle_in_txn(
+        txn,
+        "supervision_entitlement_rearmed",
+        assignment_id,
+        "generation=#{generation} basis=parent_retirement:#{transfer.evidence_id}##{retirement_epoch} cause=parent_target_retired principal=#{principal}"
+      )
+
+      :armed
+    else
+      target = retirement_successor(txn, transfer, assignment_id)
+      main = assignment_owner_main(txn, assignment_id)
+      outcome_kind = if target == main, do: "main_elevation", else: "parent_elevation"
+      action_needed = outcome_kind == "main_elevation"
+
+      invalidate_transfer_turn_in_txn(txn, transfer, retirement_epoch)
+
+      wake =
+        Wakes.schedule_in_txn(txn, %{
+          session_key: target,
+          origin: "process:tightbeam",
+          prompt:
+            escalation_prompt(
+              assignment_id,
+              subject,
+              transfer.reresolve_seed,
+              0,
+              transfer.reresolve_rung
+            ),
+          due_at: retirement_epoch,
+          assignment_id: assignment_id,
+          reresolve: "lineage",
+          reresolve_seed: transfer.reresolve_seed,
+          reresolve_rung: transfer.reresolve_rung
+        })
+
+      case Gateway.deliver_prompt_in_txn(
+             txn,
+             target,
+             wake.origin,
+             wake.prompt,
+             wake_id: wake.wake_id,
+             sender: wake.origin,
+             fire_wake_in_txn: true,
+             assignment_id: assignment_id
+           ) do
+        {:appended, ^target, _message, _opts} ->
+          :ok
+
+        other ->
+          raise "incompatible_supervision_liveness_v1: retirement delivery #{inspect(other)}"
+      end
+
+      [[turn_seq]] = Txn.q(txn, "SELECT seq FROM turns WHERE wakeId=?1", [wake.wake_id])
+      outcome_id = "#{assignment_id}##{turn_seq}"
+
+      Txn.q(
+        txn,
+        """
+        INSERT INTO supervision_liveness_sidecar
+          (wakeId, assignmentId, controllerOrigin, wakeKind, controllerState,
+           chargedGeneration)
+        VALUES (?1, ?2, 'retirement_elevation', 'escalation', 'settled', NULL)
+        """,
+        [wake.wake_id, assignment_id]
+      )
+
+      store_retirement_outcome_in_txn(
+        txn,
+        transfer,
+        retirement_epoch,
+        outcome_kind,
+        outcome_id,
+        target,
+        principal,
+        action_needed
+      )
+
+      EventLog.lifecycle_in_txn(
+        txn,
+        "supervision_entitlement_transferred",
+        assignment_id,
+        "wakeId=#{wake.wake_id} transfer=#{outcome_id} target=#{target} cause=parent_target_retired principal=#{principal}"
+      )
+
+      :parent_elevated
+    end
+  end
+
+  defp invalidate_transfer_turn_in_txn(txn, transfer, retirement_epoch) do
+    Txn.q(
+      txn,
+      "UPDATE turns SET status='canceled', endedAt=?2 WHERE seq=?1 AND status='queued'",
+      [transfer.turn_seq, retirement_epoch]
+    )
+  end
+
+  defp store_retirement_outcome_in_txn(
+         txn,
+         transfer,
+         retirement_epoch,
+         outcome_kind,
+         outcome_id,
+         target,
+         principal,
+         action_needed
+       ) do
+    Txn.q(
+      txn,
+      """
+      INSERT INTO supervision_liveness_sidecar
+        (wakeId, assignmentId, transferEvidenceId, retirementEpoch,
+         retiringSessionKey, retirementOutcomeKind, retirementOutcomeId,
+         retirementTargetSessionKey, retirementCause, retirementPrincipal,
+         retirementActionNeeded)
+      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+              'parent_target_retired', ?9, ?10)
+      ON CONFLICT(wakeId) DO UPDATE SET
+        transferEvidenceId=excluded.transferEvidenceId,
+        retirementEpoch=excluded.retirementEpoch,
+        retiringSessionKey=excluded.retiringSessionKey,
+        retirementOutcomeKind=excluded.retirementOutcomeKind,
+        retirementOutcomeId=excluded.retirementOutcomeId,
+        retirementTargetSessionKey=excluded.retirementTargetSessionKey,
+        retirementCause=excluded.retirementCause,
+        retirementPrincipal=excluded.retirementPrincipal,
+        retirementActionNeeded=excluded.retirementActionNeeded
+      WHERE supervision_liveness_sidecar.transferEvidenceId IS NULL
+      """,
+      [
+        transfer.wake_id,
+        transfer.assignment_id,
+        transfer.evidence_id,
+        retirement_epoch,
+        transfer.session_key,
+        outcome_kind,
+        outcome_id,
+        target,
+        principal,
+        if(action_needed, do: 1, else: 0)
+      ]
+    )
+
+    if Txn.changes(txn) != 1 do
+      raise "incompatible_supervision_liveness_v1: parent retirement outcome conflict"
+    end
+  end
+
+  defp retirement_successor(txn, transfer, assignment_id) do
+    owner_main = assignment_owner_main(txn, assignment_id)
+
+    candidate =
+      ladder_target_excluding(
+        txn,
+        transfer.reresolve_seed,
+        transfer.reresolve_rung,
+        transfer.session_key
+      )
+
+    cond do
+      is_binary(candidate) and candidate != owner_main -> candidate
+      is_binary(owner_main) and active_session?(txn, owner_main) -> owner_main
+      true -> raise "incompatible_supervision_liveness_v1: parent retirement target missing"
+    end
+  end
+
+  defp ladder_target_excluding(db_or_txn, holder_key, rung, excluded) do
+    [[owner, spawned_by]] =
+      query(db_or_txn, "SELECT ownerUserId, spawnedBy FROM sessions WHERE sessionKey=?1", [
+        holder_key
+      ])
+
+    chain = lineage_excluding(db_or_txn, spawned_by, excluded, MapSet.new([holder_key]), [])
+
+    case Enum.at(chain, rung - 1) do
+      nil ->
+        main = Org.personal_session_key(owner)
+        if main != excluded and active_session?(db_or_txn, main), do: main
+
+      target ->
+        target
+    end
+  end
+
+  defp lineage_excluding(_db_or_txn, nil, _excluded, _visited, acc), do: Enum.reverse(acc)
+
+  defp lineage_excluding(db_or_txn, session_key, excluded, visited, acc) do
+    if MapSet.member?(visited, session_key) do
+      Enum.reverse(acc)
+    else
+      case query(db_or_txn, "SELECT state, spawnedBy FROM sessions WHERE sessionKey=?1", [
+             session_key
+           ]) do
+        [[state, spawned_by]] ->
+          next_acc =
+            if state == "active" and session_key != excluded,
+              do: [session_key | acc],
+              else: acc
+
+          lineage_excluding(
+            db_or_txn,
+            spawned_by,
+            excluded,
+            MapSet.put(visited, session_key),
+            next_acc
+          )
+
+        [] ->
+          Enum.reverse(acc)
+      end
+    end
+  end
+
+  defp active_session?(db_or_txn, session_key) do
+    query(db_or_txn, "SELECT 1 FROM sessions WHERE sessionKey=?1 AND state='active'", [
+      session_key
+    ]) != []
   end
 
   defp query(%Txn{} = txn, sql, params), do: Txn.q(txn, sql, params)
