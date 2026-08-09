@@ -398,8 +398,11 @@ defmodule Tightbeam.JobForensicsTest do
                [first.causalSourceId]
              )
 
-    assert payload =~ ~s(cancel_wake_id: "#{wake.wake_id}")
-    assert payload =~ "canceled: true"
+    assert JSON.decode!(payload) == %{
+             "cancel_wake_id" => wake.wake_id,
+             "canceled" => true
+           }
+
     refute payload =~ "prompt"
 
     assert {:ok, [[shared_ts, shared_ts, shared_ts]]} =
@@ -1318,7 +1321,6 @@ defmodule Tightbeam.JobForensicsTest do
   defp public_cancel(db, wake_id, expected_origin, requester) do
     principal = requester_principal(requester)
     session_key = if requester.kind == "session", do: requester.id
-    payload = %{cancel_wake_id: wake_id, canceled: true}
 
     case DB.transaction(db, fn txn ->
            if Wakes.cancel_in_txn(txn, %{
@@ -1326,13 +1328,13 @@ defmodule Tightbeam.JobForensicsTest do
                 expected_origin: expected_origin,
                 requester: requester,
                 reason_kind: "requester_withdrew",
-                causal_source: %{kind: "verb_call", id: nil},
-                accepted_event: %{
-                  verb: "wake",
-                  origin: expected_origin,
-                  session_key: session_key,
-                  payload: payload,
-                  principal: principal
+                causal_source: %{
+                  kind: "verb_call",
+                  accepted_event: %{
+                    origin: expected_origin,
+                    session_key: session_key,
+                    principal: principal
+                  }
                 },
                 outcome: %{kind: "no_replacement"}
               }) do
