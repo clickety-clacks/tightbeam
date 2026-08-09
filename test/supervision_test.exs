@@ -148,6 +148,20 @@ defmodule Tightbeam.SupervisionTest do
     refute "pendingTarget" in names
   end
 
+  test "startup refuses noncanonical liveness epoch provenance", ctx do
+    {:ok, _} = DB.query(ctx.db, "DELETE FROM supervision_liveness_epoch")
+
+    exit_reason =
+      catch_exit(
+        start_liveness!(ctx,
+          name: :invalid_liveness_epoch_supervision,
+          sweep_ms: 60_000
+        )
+      )
+
+    assert Exception.format_exit(exit_reason) =~ "invalid supervision_liveness_epoch"
+  end
+
   test "work-item liveness selects its current bracket before another assignment", ctx do
     :ok =
       DB.execute(
