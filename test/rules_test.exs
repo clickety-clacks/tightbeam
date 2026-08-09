@@ -304,7 +304,7 @@ defmodule Tightbeam.RulesTest do
 
     active = session(ctx.db, "active", "flynn")
     retired = session(ctx.db, "retired", "mike")
-    Org.retire(ctx.db, retired.session_key)
+    Org.retire(ctx.db, retired.session_key, "user:mike", 1_000)
     Roles.create!(ctx.db, "alpha", "flynn", active.session_key)
     Roles.create!(ctx.db, "beta", "flynn", active.session_key)
     Roles.create!(ctx.db, "vacant", "mike", nil)
@@ -355,7 +355,7 @@ defmodule Tightbeam.RulesTest do
     dm = session(ctx.db, "dm", "mike", kind: "dm")
     custom = session(ctx.db, "custom", "mike")
     retired = session(ctx.db, "retired", "flynn")
-    Org.retire(ctx.db, retired.session_key)
+    Org.retire(ctx.db, retired.session_key, "user:flynn", 1_000)
 
     assertions = [
       {active.session_key, "target.owner", "flynn", true},
@@ -1063,7 +1063,8 @@ defmodule Tightbeam.RulesTest do
       session_key: nil,
       params: params,
       target_role: nil,
-      role_fallback: false
+      role_fallback: false,
+      supervision_interval_ms: 1_000
     }
   end
 

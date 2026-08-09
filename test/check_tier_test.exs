@@ -447,6 +447,7 @@ defmodule Tightbeam.CheckTierTest do
       origin: origin(principal),
       principal: principal,
       session_key: nil,
+      supervision_interval_ms: 1_000,
       params: params
     }
   end

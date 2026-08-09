@@ -120,6 +120,7 @@ defmodule Tightbeam.RetireOwnershipTest do
         session_key: "holder",
         target_role: nil,
         role_fallback: false,
+        supervision_interval_ms: 1_000,
         params: %{subject: "menu check", brief: "menu check"},
         effort_config: %{db: ctx.db, base_dir: System.tmp_dir!()}
       })
@@ -166,6 +167,7 @@ defmodule Tightbeam.RetireOwnershipTest do
         session_key: "kays-holder",
         target_role: nil,
         role_fallback: false,
+        supervision_interval_ms: 1_000,
         params: %{subject: "foreign"}
       })
 

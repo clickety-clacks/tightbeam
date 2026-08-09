@@ -2173,7 +2173,7 @@ defmodule Tightbeam.ConformanceSupport do
 
       try do
         ids = materialize_world(db, sample["world"])
-        Org.retire(db, "holder")
+        Org.retire(db, "holder", "process:tightbeam", 1_000)
         terminal_seq = ids.turns["holder"]
 
         assert :stranded =
@@ -2768,6 +2768,7 @@ defmodule Tightbeam.ConformanceSupport do
             session_key: assignment["holder"],
             target_role: nil,
             role_fallback: false,
+            supervision_interval_ms: 1_000,
             params: %{
               subject: assignment["id"],
               idempotency_key: nil,
@@ -3064,6 +3065,7 @@ defmodule Tightbeam.ConformanceSupport do
         session_key: holder,
         target_role: nil,
         role_fallback: false,
+        supervision_interval_ms: 1_000,
         params: %{subject: subject, idempotency_key: nil}
       })
 

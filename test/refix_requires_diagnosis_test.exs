@@ -251,6 +251,7 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
       session_key: holder_key,
       target_role: nil,
       role_fallback: false,
+      supervision_interval_ms: 1_000,
       params: %{
         subject: subject,
         work_item_id: work_item_id,

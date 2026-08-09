@@ -53,7 +53,7 @@ defmodule Tightbeam.WorkStateTest do
     revoke(ctx, abandoned.id)
 
     stranded = assign(ctx, "retiring", "stranded")
-    Org.retire(ctx.db, "retiring")
+    Org.retire(ctx.db, "retiring", "user:flynn", 1_000)
 
     assert WorkState.status(ctx.db, open.id) == "open"
     assert WorkState.status(ctx.db, active.id) == "active"
@@ -446,6 +446,7 @@ defmodule Tightbeam.WorkStateTest do
       session_key: holder,
       target_role: nil,
       role_fallback: false,
+      supervision_interval_ms: 1_000,
       params: %{subject: subject, work_item_id: work_item_id},
       on_assignment_change: ctx.assignment_change,
       on_work_item_change: ctx.item_change
@@ -459,6 +460,7 @@ defmodule Tightbeam.WorkStateTest do
       session_key: holder,
       target_role: nil,
       role_fallback: false,
+      supervision_interval_ms: 1_000,
       params: %{subject: subject, work_item_id: work_item_id}
     }
   end

@@ -320,7 +320,7 @@ defmodule Tightbeam.EscalationTest do
 
     assert :allow = Escalation.resolve(ctx.db, call, statute())
 
-    Org.retire(ctx.db, ctx.raiser.session_key)
+    Org.retire(ctx.db, ctx.raiser.session_key, "user:flynn", 1_000)
 
     assert {:needs_request, nil} = Escalation.resolve(ctx.db, call, statute())
 
@@ -383,7 +383,7 @@ defmodule Tightbeam.EscalationTest do
     assert [%{id: ^id}] = Escalation.list(ctx.db, call, "open")
     assert %{id: ^id, context: %{"verb" => "attest"}} = Escalation.get(ctx.db, call, id)
 
-    Org.retire(ctx.db, ctx.raiser.session_key)
+    Org.retire(ctx.db, ctx.raiser.session_key, "user:flynn", 1_000)
     :ok = Escalation.recover_retired(ctx.db)
     assert request(ctx, id).status == "withdrawn"
   end

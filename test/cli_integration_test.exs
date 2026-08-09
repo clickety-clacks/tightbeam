@@ -243,7 +243,7 @@ defmodule Tightbeam.CliIntegrationTest do
 
     assert_receive {:cli_call, %{origin: "user:flynn", principal: {:user, "flynn"}}}
 
-    Org.retire(ctx.db, ctx.session.session_key)
+    Org.retire(ctx.db, ctx.session.session_key, "user:flynn", 1_000)
     {refused, 1} = System.cmd(ctx.binary, ["list"], cd: ctx.workdir, stderr_to_stdout: true)
     assert refused =~ "auth_failed"
   end
