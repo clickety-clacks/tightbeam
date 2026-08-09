@@ -26,7 +26,8 @@ a model not listed here is NOT IN USE — adding one is an intake/release-ceremo
 
 Capsule names are the CANONICAL catalog base ids (what `tightbeam list` shows);
 activity tables use the parenthetical nickname + an effort bracket — expand to
-`<canonical-base>[effort]` when you spawn (e.g. sonnet[medium] -> claude-sonnet-5[medium]).
+`--model <canonical-base> --effort <effort>` when you spawn (e.g. sonnet[medium] ->
+`--model claude-sonnet-5 --effort medium`).
 
 Effort brackets (claude-x[low..max], sol[low..xhigh]) tune depth within a capsule;
 `tightbeam list` shows the live legal forms.
