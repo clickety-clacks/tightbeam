@@ -664,6 +664,23 @@ defmodule Tightbeam.CliIntegrationTest do
 
     work_id = JSON.decode!(assigned)["id"]
 
+    {_receipt, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "attest",
+          work_id,
+          "--kind",
+          "verdict",
+          "--verdict",
+          "tests-passed",
+          "--note",
+          "testhost:fixture/repo fixture-commit; verification papertrail fixture; passed: 1 test, 0 failures"
+        ],
+        cd: coder_dir,
+        stderr_to_stdout: true
+      )
+
     # The review link, through the real CLI. This was the last hop that was not:
     # `--reviews` reached the handler as the wire word `reviews`, which no
     # handler reads, so a CLI-created review link was silently dropped (#112).
