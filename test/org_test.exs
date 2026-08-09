@@ -4,12 +4,12 @@ defmodule Tightbeam.OrgTest do
 
   doctest Tightbeam.Org
 
-  alias Tightbeam.{DB, Org}
+  alias Tightbeam.{DB, Org, Roles, Wakes}
 
   setup do
     name = :"db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: name})
-    :ok = Org.ensure_schema(name)
+    :ok = Tightbeam.Schema.ensure_all(name)
     %{db: name}
   end
 
@@ -91,7 +91,7 @@ defmodule Tightbeam.OrgTest do
         db,
         base(%{session_key: "retired-id", identity_name: "default--fedcba9876543210"})
       )
-      |> then(&Org.retire(db, &1.session_key))
+      |> then(&Org.retire(db, &1.session_key, "user:flynn", 1_000))
 
     assert retired.state == "retired"
     assert Org.active_by_identity_name(db, retired.identity_name) == nil
@@ -127,7 +127,7 @@ defmodule Tightbeam.OrgTest do
     assert Org.by_cli_token(db, first.cli_token).session_key == first.session_key
     assert Org.by_cli_token(db, "tbs_unknown") == nil
 
-    Org.retire(db, first.session_key)
+    Org.retire(db, first.session_key, "user:flynn", 1_000)
     assert Org.by_cli_token(db, first.cli_token) == nil
 
     {:ok, [[index_sql]]} =
@@ -147,11 +147,176 @@ defmodule Tightbeam.OrgTest do
     assert Enum.map(Org.list_for_user(db, "flynn", false), & &1.session_key) == ["k1", "k2"]
     assert length(Org.list_for_user(db, "flynn", true)) == 3
 
-    retired = Org.retire(db, "k1")
+    retired = Org.retire(db, "k1", "user:flynn", 1_000)
     assert retired.state == "retired"
     assert Enum.map(Org.list_for_user(db, "flynn", false), & &1.session_key) == ["k2"]
 
     {:ok, [["retired"]]} = DB.query(db, "SELECT state FROM sessions WHERE sessionKey = 'k1'")
+  end
+
+  test "retirement cancels gated direct and role targets, replaces the role, and preserves ungated delivery",
+       %{db: db} do
+    main_key = Org.personal_session_key("flynn")
+    Org.create(db, base(%{session_key: main_key, kind: "main", is_built_in: true}))
+    Org.create(db, base(%{session_key: "retiring"}))
+    Roles.create!(db, "reviewer", "flynn", "retiring")
+
+    direct =
+      Wakes.schedule(db, %{
+        session_key: "retiring",
+        origin: "user:flynn",
+        prompt: "direct",
+        due_at: 9_000
+      })
+
+    role =
+      Wakes.schedule(db, %{
+        session_key: "retiring",
+        target_role: "reviewer",
+        origin: "user:flynn",
+        prompt: "role",
+        due_at: 9_001
+      })
+
+    ungated =
+      Wakes.schedule(db, %{
+        session_key: "retiring",
+        origin: "user:flynn",
+        prompt: "ungated",
+        due_at: 9_002,
+        target_gate: 0
+      })
+
+    assert %{state: "retired"} = Org.retire(db, "retiring", "user:flynn", 1_000)
+    assert %{state: "canceled"} = Wakes.get(db, direct.wake_id)
+
+    assert %{
+             requester: "tightbeam:retirement",
+             reason: "target_retired",
+             source_kind: "session_transition",
+             source_id: "retiring",
+             outcome: "no_replacement",
+             replacement_wake_id: nil,
+             work_impact: "no_linked_work",
+             action_needed: 0
+           } = cancellation(db, direct.wake_id)
+
+    assert %{state: "canceled"} = Wakes.get(db, role.wake_id)
+
+    assert %{
+             requester: "tightbeam:retirement",
+             reason: "target_retired",
+             outcome: "replacement",
+             replacement_wake_id: replacement_wake_id
+           } = cancellation(db, role.wake_id)
+
+    assert %{
+             state: "pending",
+             session_key: ^main_key,
+             target_role: "reviewer",
+             prompt: "role",
+             due_at: 9_001
+           } = Wakes.get(db, replacement_wake_id)
+
+    assert %{state: "pending"} = Wakes.get(db, ungated.wake_id)
+    assert cancellation(db, ungated.wake_id) == nil
+
+    {:ok, [[wake_count]]} = DB.query(db, "SELECT count(*) FROM wakes")
+    {:ok, [[cancellation_count]]} = DB.query(db, "SELECT count(*) FROM wake_cancellations")
+
+    assert %{state: "retired"} = Org.retire(db, "retiring", "user:flynn", 1_000)
+    assert {:ok, [[^wake_count]]} = DB.query(db, "SELECT count(*) FROM wakes")
+
+    assert {:ok, [[^cancellation_count]]} =
+             DB.query(db, "SELECT count(*) FROM wake_cancellations")
+  end
+
+  test "retirement validates its explicit caller context before state or wake mutation", %{db: db} do
+    session = Org.create(db, base(%{session_key: "retiring"}))
+
+    wake =
+      Wakes.schedule(db, %{
+        session_key: "retiring",
+        origin: "user:flynn",
+        prompt: "still pending",
+        due_at: 9_000
+      })
+
+    for {principal, interval} <- [
+          {"", 1_000},
+          {nil, 1_000},
+          {"user:flynn", 0},
+          {"user:flynn", -1}
+        ] do
+      assert_raise ArgumentError, ~r/non-empty principal and positive supervision interval/, fn ->
+        Org.retire(db, "retiring", principal, interval)
+      end
+
+      assert %{state: "active", updated_at: updated_at} = Org.get(db, "retiring")
+      assert updated_at == session.updated_at
+      assert Wakes.get(db, wake.wake_id).state == "pending"
+      assert cancellation(db, wake.wake_id) == nil
+    end
+  end
+
+  test "concurrent retirement commits one state transition and one cancellation carrier", %{
+    db: db
+  } do
+    Org.create(db, base(%{session_key: "retiring"}))
+
+    wake =
+      Wakes.schedule(db, %{
+        session_key: "retiring",
+        origin: "user:flynn",
+        prompt: "cancel once",
+        due_at: 9_000
+      })
+
+    results =
+      for _ <- 1..2 do
+        Task.async(fn -> Org.retire(db, "retiring", "user:flynn", 1_000) end)
+      end
+      |> Task.await_many()
+
+    assert Enum.all?(results, &(&1.state == "retired"))
+    assert Wakes.get(db, wake.wake_id).state == "canceled"
+
+    assert {:ok, [[1]]} =
+             DB.query(db, "SELECT COUNT(*) FROM wake_cancellations WHERE wakeId=?1", [
+               wake.wake_id
+             ])
+
+    assert {:ok, [[1]]} =
+             DB.query(db, "SELECT COUNT(*) FROM sessions WHERE sessionKey='retiring'")
+  end
+
+  test "retirement refuses and rolls back when linked open work has no surviving liveness", %{
+    db: db
+  } do
+    Org.create(db, base(%{session_key: "retiring"}))
+
+    :ok =
+      DB.execute(
+        db,
+        "INSERT INTO work_items (id,title,ownerUserId,state,createdByUser,createdContextKnown,createdAt) VALUES ('orphan','orphan','flynn','open','flynn',0,1)"
+      )
+
+    wake =
+      Wakes.schedule(db, %{
+        session_key: "retiring",
+        origin: "user:flynn",
+        prompt: "linked",
+        due_at: 9_000,
+        work_item_id: "orphan"
+      })
+
+    assert_raise RuntimeError, ~r/no liveness trigger/, fn ->
+      Org.retire(db, "retiring", "user:flynn", 1_000)
+    end
+
+    assert Org.get(db, "retiring").state == "active"
+    assert Wakes.get(db, wake.wake_id).state == "pending"
+    assert cancellation(db, wake.wake_id) == nil
   end
 
   test "spawned-by provenance is retained", %{db: db} do
@@ -244,6 +409,45 @@ defmodule Tightbeam.OrgTest do
 
     assert_raise ArgumentError, "unknown session: missing", fn ->
       Org.rename(db, "missing", "Nope")
+    end
+  end
+
+  defp cancellation(db, wake_id) do
+    case DB.query(
+           db,
+           """
+           SELECT requesterId,reasonKind,causalSourceKind,causalSourceId,outcomeKind,
+                  replacementWakeId,workImpactKind,actionNeeded
+           FROM wake_cancellations WHERE wakeId=?1
+           """,
+           [wake_id]
+         ) do
+      {:ok, []} ->
+        nil
+
+      {:ok,
+       [
+         [
+           requester,
+           reason,
+           source_kind,
+           source_id,
+           outcome,
+           replacement_wake_id,
+           work_impact,
+           action_needed
+         ]
+       ]} ->
+        %{
+          requester: requester,
+          reason: reason,
+          source_kind: source_kind,
+          source_id: source_id,
+          outcome: outcome,
+          replacement_wake_id: replacement_wake_id,
+          work_impact: work_impact,
+          action_needed: action_needed
+        }
     end
   end
 end

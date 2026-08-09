@@ -4,7 +4,7 @@ defmodule Tightbeam.Org do
   and append-only harness-session pointer chains.
   """
 
-  alias Tightbeam.DB
+  alias Tightbeam.{DB, Supervision, Wakes}
   alias Tightbeam.DB.Txn
   alias Tightbeam.Model
 
@@ -506,23 +506,291 @@ defmodule Tightbeam.Org do
   Retire a session — soft state flip, never a delete: history, provenance, and
   the pointer chain remain queryable. Returns the updated session.
   """
-  @spec retire(db(), String.t()) :: session()
-  def retire(db \\ Tightbeam.DB, session_key) do
-    update(db, session_key, "state = 'retired'", [])
+  @spec retire(db(), String.t(), String.t(), pos_integer()) :: session()
+  def retire(db \\ Tightbeam.DB, session_key, principal, supervision_interval_ms) do
+    transaction!(db, fn txn ->
+      retire_in_txn(txn, session_key, principal, supervision_interval_ms)
+    end)
   end
 
   @doc false
-  @spec retire_in_txn(Txn.t(), String.t()) :: session()
-  def retire_in_txn(%Txn{} = txn, session_key) do
-    must_get(txn, session_key)
+  @spec retire_in_txn(Txn.t(), String.t(), String.t(), pos_integer()) :: session()
+  def retire_in_txn(%Txn{} = txn, session_key, principal, supervision_interval_ms)
+      when is_binary(principal) and principal != "" and is_integer(supervision_interval_ms) and
+             supervision_interval_ms > 0 do
+    case must_get(txn, session_key) do
+      %{state: "retired"} = session ->
+        session
 
-    Txn.q(txn, "UPDATE sessions SET state = 'retired', updatedAt = ?2 WHERE sessionKey = ?1", [
-      session_key,
-      now()
-    ])
+      %{state: "active"} ->
+        retire_active_in_txn(
+          txn,
+          session_key,
+          principal,
+          supervision_interval_ms
+        )
+    end
+  end
+
+  def retire_in_txn(%Txn{}, _session_key, _principal, _supervision_interval_ms) do
+    raise ArgumentError,
+          "retirement requires a non-empty principal and positive supervision interval"
+  end
+
+  defp retire_active_in_txn(txn, session_key, principal, supervision_interval_ms) do
+    retirement_epoch = now()
+
+    case Supervision.transition_in_txn(txn, %{
+           kind: "parent_target_retired",
+           session_key: session_key,
+           retirement_epoch: retirement_epoch,
+           principal: principal,
+           supervision_interval_ms: supervision_interval_ms
+         }) do
+      outcome when outcome in [:armed, :parent_elevated, :duplicate] -> :ok
+      {:error, reason} -> raise "parent-target retirement refused: #{inspect(reason)}"
+      other -> raise "invalid parent-target retirement result: #{inspect(other)}"
+    end
+
+    Txn.q(
+      txn,
+      "UPDATE sessions SET state = 'retired', updatedAt = ?2 WHERE sessionKey = ?1 AND state = 'active'",
+      [session_key, retirement_epoch]
+    )
+
+    if Txn.changes(txn) != 1, do: raise("retirement state changed before commit")
+
+    cancel_retirement_wakes_in_txn(txn, session_key)
 
     must_get(txn, session_key)
   end
+
+  defp cancel_retirement_wakes_in_txn(txn, session_key) do
+    Txn.q(
+      txn,
+      """
+      SELECT w.wakeId, w.sessionKey, w.targetRole, w.reresolve, w.reresolveSeed,
+             w.reresolveRung, w.work_item_id, w.assignmentId
+      FROM wakes w
+      LEFT JOIN roles r ON r.name=w.targetRole
+      WHERE w.state='pending' AND w.targetGate=1
+        AND (w.sessionKey=?1 OR r.boundSessionKey=?1)
+      ORDER BY w.createdAt, w.wakeId
+      """,
+      [session_key]
+    )
+    |> Enum.each(fn row -> cancel_retirement_wake_in_txn!(txn, session_key, row) end)
+
+    :ok
+  end
+
+  defp cancel_retirement_wake_in_txn!(
+         txn,
+         session_key,
+         [
+           wake_id,
+           _recorded_session_key,
+           target_role,
+           reresolve,
+           reresolve_seed,
+           reresolve_rung,
+           work_item_id,
+           assignment_id
+         ]
+       ) do
+    command =
+      if retirement_assignment_disposition?(txn, assignment_id, session_key) do
+        assignment_disposition_command(
+          txn,
+          assignment_id,
+          work_item_id
+        )
+      else
+        target_retirement_command(
+          txn,
+          session_key,
+          wake_id,
+          target_role,
+          reresolve,
+          reresolve_seed,
+          reresolve_rung,
+          work_item_id,
+          assignment_id
+        )
+      end
+
+    if not Wakes.cancel_in_txn(txn, Map.put(command, :wake_id, wake_id)) do
+      raise "typed retirement cancellation refused for #{wake_id}"
+    end
+  end
+
+  defp retirement_assignment_disposition?(_txn, nil, _session_key), do: false
+
+  defp retirement_assignment_disposition?(txn, assignment_id, session_key) do
+    Txn.q(
+      txn,
+      """
+      SELECT 1
+      FROM assignments a
+      JOIN assignment_interruptions i ON i.assignmentId=a.id
+      WHERE a.id=?1 AND a.state='closed' AND a.outcome='revoked'
+        AND i.sessionKey=?2 AND i.reason='interrupted-by-retire'
+      """,
+      [assignment_id, session_key]
+    ) == [[1]]
+  end
+
+  defp assignment_disposition_command(txn, assignment_id, direct_work_item_id) do
+    outcome = %{
+      kind: "disposition",
+      disposition_kind: "assignment_transition",
+      disposition_id: assignment_id
+    }
+
+    %{
+      requester: %{kind: "process", id: "tightbeam:retirement"},
+      reason_kind: "obligation_disposed",
+      causal_source: %{kind: "assignment_transition", id: assignment_id},
+      outcome:
+        put_liveness_trigger(
+          outcome,
+          liveness_trigger_in_txn!(txn, direct_work_item_id, assignment_id)
+        )
+    }
+  end
+
+  defp target_retirement_command(
+         txn,
+         session_key,
+         wake_id,
+         target_role,
+         reresolve,
+         reresolve_seed,
+         reresolve_rung,
+         work_item_id,
+         assignment_id
+       ) do
+    outcome =
+      case retirement_replacement_target(
+             txn,
+             target_role,
+             reresolve,
+             reresolve_seed,
+             reresolve_rung
+           ) do
+        nil ->
+          put_liveness_trigger(
+            %{kind: "no_replacement"},
+            liveness_trigger_in_txn!(txn, work_item_id, assignment_id)
+          )
+
+        replacement_target ->
+          case Wakes.retarget_in_txn(txn, wake_id, replacement_target) do
+            %{wake_id: replacement_wake_id} ->
+              %{kind: "replacement", replacement_wake_id: replacement_wake_id}
+
+            :error ->
+              raise "retirement replacement refused for #{wake_id}"
+          end
+      end
+
+    %{
+      requester: %{kind: "process", id: "tightbeam:retirement"},
+      reason_kind: "target_retired",
+      causal_source: %{kind: "session_transition", id: session_key},
+      outcome: outcome
+    }
+  end
+
+  defp retirement_replacement_target(txn, target_role, _reresolve, _seed, _rung)
+       when is_binary(target_role) do
+    case Txn.q(
+           txn,
+           "SELECT boundSessionKey, ownerUserId FROM roles WHERE name=?1",
+           [target_role]
+         ) do
+      [[bound_session_key, owner_user_id]] ->
+        active_session_or_main(txn, bound_session_key, owner_user_id)
+
+      [] ->
+        nil
+    end
+  end
+
+  defp retirement_replacement_target(txn, _role, "lineage", seed, rung)
+       when is_binary(seed) and is_integer(rung) and rung > 0 do
+    Supervision.ladder_target(txn, seed, rung)
+  end
+
+  defp retirement_replacement_target(_txn, _role, _reresolve, _seed, _rung), do: nil
+
+  defp active_session_or_main(txn, bound_session_key, owner_user_id) do
+    cond do
+      active_session?(txn, bound_session_key) ->
+        bound_session_key
+
+      active_session?(txn, personal_session_key(owner_user_id)) ->
+        personal_session_key(owner_user_id)
+
+      true ->
+        nil
+    end
+  end
+
+  defp active_session?(_txn, nil), do: false
+
+  defp active_session?(txn, session_key) do
+    Txn.q(txn, "SELECT 1 FROM sessions WHERE sessionKey=?1 AND state='active'", [session_key]) ==
+      [
+        [1]
+      ]
+  end
+
+  defp liveness_trigger_in_txn!(txn, direct_work_item_id, assignment_id) do
+    case primary_liveness_ref(txn, direct_work_item_id, assignment_id) do
+      nil ->
+        nil
+
+      primary ->
+        case Supervision.liveness_trigger_in_txn(txn, primary) do
+          {:ok, trigger} when is_map(trigger) -> trigger
+          :none -> raise "#{inspect(primary)} has no liveness trigger"
+          {:error, reason} -> raise "invalid liveness trigger: #{inspect(reason)}"
+        end
+    end
+  end
+
+  defp primary_liveness_ref(txn, direct_work_item_id, assignment_id)
+       when is_binary(assignment_id) do
+    case Txn.q(txn, "SELECT state, workItemId FROM assignments WHERE id=?1", [assignment_id]) do
+      [["open", _work_item_id]] ->
+        {:assignment, assignment_id}
+
+      [[_state, assignment_work_item_id]] ->
+        open_work_item_ref(txn, assignment_work_item_id || direct_work_item_id)
+
+      [] ->
+        nil
+    end
+  end
+
+  defp primary_liveness_ref(txn, direct_work_item_id, nil),
+    do: open_work_item_ref(txn, direct_work_item_id)
+
+  defp open_work_item_ref(_txn, nil), do: nil
+
+  defp open_work_item_ref(txn, work_item_id) do
+    if Txn.q(txn, "SELECT 1 FROM work_items WHERE id=?1 AND state='open'", [work_item_id]) == [
+         [1]
+       ],
+       do: {:work_item, work_item_id},
+       else: nil
+  end
+
+  defp put_liveness_trigger(outcome, trigger) when is_map(trigger),
+    do: Map.put(outcome, :liveness_trigger, trigger)
+
+  defp put_liveness_trigger(outcome, nil), do: outcome
 
   @doc "Repoint a retired session to another archetype and its base identity."
   @spec repoint_retired_archetype(db(), String.t(), String.t()) ::
