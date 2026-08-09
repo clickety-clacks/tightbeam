@@ -141,10 +141,44 @@ defmodule Tightbeam.AssignmentsTest do
                assign_call({:user, "flynn"}, "x", String.duplicate("k", 201))
              )
 
+    baseline = assignment_count(ctx.db)
+
+    for interval <- [nil, 0, -1] do
+      call =
+        Map.put(assign_call({:user, "flynn"}, "no interval"), :supervision_interval_ms, interval)
+
+      assert %{code: "invalid_supervision_interval"} =
+               Assignments.__handle__(ctx.db, "assign", call)
+    end
+
+    assert assignment_count(ctx.db) == baseline
+
     user_opened = handle(ctx, "assign", assign_call({:user, "flynn"}, "user work"))
     assert user_opened.openedByUser == "flynn"
     assert user_opened.openedBySession == nil
     assert user_opened.workItemId == nil
+
+    assert {:ok,
+            [
+              [
+                1,
+                due_at,
+                "armed",
+                "assignment_open",
+                user_assignment_id,
+                "assignment_open",
+                "user:flynn",
+                1_000
+              ]
+            ]} =
+             DB.query(
+               ctx.db,
+               "SELECT generation,dueAt,state,basisKind,basisId,cause,principal,supervisionIntervalMs FROM supervision_entitlements WHERE assignmentId=?1",
+               [user_opened.id]
+             )
+
+    assert user_assignment_id == user_opened.id
+    assert due_at == user_opened.openedAt + 1_000
 
     session_opened = handle(ctx, "assign", assign_call({:session, "holder"}, "session work"))
     assert session_opened.openedBySession == "holder"
@@ -158,7 +192,7 @@ defmodule Tightbeam.AssignmentsTest do
     assert role_opened.holderRole == "builder"
     assert role_opened.holderFallback
 
-    Org.retire(ctx.db, "other-session")
+    Org.retire(ctx.db, "other-session", "user:other", 1_000)
 
     assert %{code: "session_retired"} =
              handle(ctx, "assign", %{assign_call({:user, "flynn"}) | session_key: "other-session"})
@@ -170,6 +204,26 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert {:ok, [[1]]} =
              DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE subject = 'once'")
+  end
+
+  test "raw dispatch precheck leaves supervision interval validation to the mutation seam", ctx do
+    baseline = assignment_count(ctx.db)
+    raw_call = assign_call({:user, "flynn"}, "Gateway will attach interval")
+
+    assert :proceed = Assignments.dispatch_precheck(ctx.db, raw_call)
+
+    for invalid <- [nil, 0, -1, "1000"] do
+      assert :proceed =
+               Assignments.dispatch_precheck(
+                 ctx.db,
+                 Map.put(raw_call, :supervision_interval_ms, invalid)
+               )
+    end
+
+    assert assignment_count(ctx.db) == baseline
+
+    assert %{code: "invalid_supervision_interval"} =
+             Assignments.__handle__(ctx.db, "assign", raw_call)
   end
 
   test "dispatch atomically opens an assignment and enqueues its brief with the card id", ctx do
@@ -1123,7 +1177,18 @@ defmodule Tightbeam.AssignmentsTest do
               "revoke-assignment",
               "assignments"
             ],
-       do: Assignments.__handle__(ctx.db, verb, %{call | verb: verb})
+       do:
+         Assignments.__handle__(
+           ctx.db,
+           verb,
+           call
+           |> Map.put(:verb, verb)
+           |> then(fn routed ->
+             if verb in ["assign", "dispatch"],
+               do: Map.put_new(routed, :supervision_interval_ms, 1_000),
+               else: routed
+           end)
+         )
 
   defp handle(ctx, verb, call), do: WorkItems.__handle__(ctx.db, verb, %{call | verb: verb})
 
@@ -1144,6 +1209,11 @@ defmodule Tightbeam.AssignmentsTest do
     db
     |> Projection.list_after(session_key, nil, 100)
     |> Enum.map(& &1.content)
+  end
+
+  defp assignment_count(db) do
+    {:ok, [[count]]} = DB.query(db, "SELECT count(*) FROM assignments")
+    count
   end
 
   defp assign_call(principal, subject \\ "work", key \\ nil, work_item_id \\ nil) do
