@@ -37,8 +37,10 @@ defmodule Tightbeam.AssignmentsTest do
 
     holder = session(db, "holder", "flynn")
     other = session(db, "other-session", "other")
-    Rules.load!(System.tmp_dir!(), Map.keys(Gateway.handlers(%{db: db})))
-    %{db: db, holder: holder, other: other, handlers: Gateway.handlers(%{db: db})}
+    gateway_config = %{db: db, wake_tick_ms: 1_000}
+    handlers = Gateway.handlers(gateway_config)
+    Rules.load!(System.tmp_dir!(), Map.keys(handlers))
+    %{db: db, holder: holder, other: other, handlers: handlers}
   end
 
   test "schema pins every assignment consistency CHECK", %{db: db} do
