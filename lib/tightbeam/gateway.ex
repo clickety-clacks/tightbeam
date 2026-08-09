@@ -3886,12 +3886,17 @@ defmodule Tightbeam.Gateway do
               true ->
                 harness_atom = module.id()
 
+                selection_base =
+                  if Map.has_key?(Model.named_fields(p), :family),
+                    do: nil,
+                    else: module.default_model()
+
                 model =
                   compose_model_selection(
                     session.host,
                     harness,
                     session.model,
-                    resolve_selection(session.host, harness, p, config.default_model)
+                    resolve_selection(session.host, harness, p, selection_base)
                   )
 
                 with :ok <- validate_credential(config, harness, session.host),

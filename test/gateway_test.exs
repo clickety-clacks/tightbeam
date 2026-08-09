@@ -609,7 +609,7 @@ defmodule Tightbeam.GatewayTest do
       File.rm_rf!(catalog_base)
     end)
 
-    {:paired, _device} =
+    {:paired, device} =
       Devices.pair(db, %{
         device_id: "flynn-device",
         claimed_name: "Flynn",
@@ -638,7 +638,7 @@ defmodule Tightbeam.GatewayTest do
         subscriptions: MapSet.new(["chat"])
       })
 
-    %{db: db, registry: registry, lane: lane, catalog_base: catalog_base}
+    %{db: db, registry: registry, lane: lane, catalog_base: catalog_base, device: device}
   end
 
   test "retire refuses built-in mains — the fallback target is permanent", ctx do
@@ -5130,6 +5130,124 @@ defmodule Tightbeam.GatewayTest do
 
     assert message =~ "Tightbeam has no credential for openai on testhost"
     assert Org.get(ctx.db, "k1") == before
+  end
+
+  test "model-free session-control round trip uses each destination harness default", ctx do
+    base_dir = role_test_base("harness-destination-default-round-trip")
+    codex_auth = Path.join([base_dir, "auth", "codex"])
+    File.mkdir_p!(codex_auth)
+    File.write!(Path.join(codex_auth, "auth.json"), "test-token")
+    Archetypes.load!(base_dir)
+    ensure_global_registry()
+
+    config =
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.put(:conn_registry, ctx.registry)
+      |> Map.put(:lane_manager, ctx.lane)
+
+    local_host = Placement.local_host_name()
+    Org.set_host(ctx.db, "k1", local_host)
+
+    put_host_catalog(local_host, "codex", [])
+
+    put_host_catalog_entry(local_host, "codex", %{
+      family: "gpt-5.6-sol",
+      efforts: ["medium"],
+      provider: :openai
+    })
+
+    put_host_catalog_entry(local_host, "codex", %{
+      family: "gpt-explicit",
+      efforts: ["high"],
+      provider: :openai
+    })
+
+    put_host_catalog(local_host, "claude", [])
+
+    put_host_catalog_entry(local_host, "claude", %{
+      family: "claude-sonnet-5",
+      efforts: ["medium"],
+      provider: :anthropic
+    })
+
+    candidate = start_supervised!({CandidateAdapterStub, self()})
+    start_supervised!({CoordinatorStub, candidate})
+    start_lane!(ctx.db, "k1")
+
+    router_opts = [
+      db: ctx.db,
+      base_dir: base_dir,
+      handlers: Gateway.handlers(config),
+      session_status: fn session_key -> Gateway.session_status(session_key, ctx.db) end
+    ]
+
+    post = fn body ->
+      Plug.Test.conn(
+        :post,
+        "/api/session-control",
+        JSON.encode!(Map.put(body, "sessionKey", "k1"))
+      )
+      |> Plug.Conn.put_req_header("authorization", "Bearer #{ctx.device.token}")
+      |> Tightbeam.Wire.Router.call(Tightbeam.Wire.Router.init(router_opts))
+      |> then(&JSON.decode!(&1.resp_body))
+    end
+
+    assert %{
+             "ok" => true,
+             "status" => %{
+               "display" => %{
+                 "harness" => "codex",
+                 "modelFamily" => "gpt-5.6-sol",
+                 "reasoningLevel" => "medium"
+               }
+             }
+           } = post.(%{"action" => "set_harness", "harness" => "codex"})
+
+    assert Org.get(ctx.db, "k1").model == Model.new("gpt-5.6-sol", effort: "medium")
+
+    assert %{
+             "ok" => true,
+             "status" => %{
+               "display" => %{
+                 "harness" => "claude",
+                 "modelFamily" => "claude-sonnet-5",
+                 "reasoningLevel" => "medium"
+               }
+             }
+           } = post.(%{"action" => "set_harness", "harness" => "claude"})
+
+    assert Org.get(ctx.db, "k1").model == Model.new("claude-sonnet-5", effort: "medium")
+
+    assert %{
+             "ok" => true,
+             "status" => %{
+               "configuredProjection" => %{
+                 "model" => "gpt-explicit",
+                 "context" => nil,
+                 "effort" => "high"
+               }
+             }
+           } =
+             post.(%{
+               "action" => "set_harness",
+               "harness" => "codex",
+               "model" => "gpt-explicit",
+               "effort" => "high"
+             })
+
+    assert Org.get(ctx.db, "k1").model == Model.new("gpt-explicit", effort: "high")
+
+    before_refusal = Org.get(ctx.db, "k1")
+
+    assert %{"ok" => false, "code" => "model_unavailable"} =
+             post.(%{
+               "action" => "set_harness",
+               "harness" => "claude",
+               "model" => "not-a-claude-model",
+               "effort" => "high"
+             })
+
+    assert Org.get(ctx.db, "k1") == before_refusal
   end
 
   test "set_harness changes the engine and projects its home at a turn boundary", ctx do
