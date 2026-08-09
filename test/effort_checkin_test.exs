@@ -146,6 +146,9 @@ defmodule Tightbeam.EffortCheckinTest do
 
     retired = dispatch(ctx, {:session, "parent"}, "holder", "retired")
     retired_open = escalate(ctx, retired.id)
+    generation_state_before_refusal = bracket_state(ctx.db, retired.id)
+
+    assert generation_state_before_refusal == "probed"
 
     assert {:error,
             %ArgumentError{message: "retirement interruption requires a durable principal"}} =
@@ -154,7 +157,7 @@ defmodule Tightbeam.EffortCheckinTest do
              end)
 
     assert rows(ctx.db, "SELECT state FROM assignments WHERE id=?1", [retired.id]) == [["open"]]
-    assert bracket_state(ctx.db, retired.id) == "armed"
+    assert bracket_state(ctx.db, retired.id) == generation_state_before_refusal
     assert request(ctx.db, retired_open.id).status == "open"
     assert Wakes.get(ctx.db, retired_open.deadline_wake_id).state == "pending"
 
