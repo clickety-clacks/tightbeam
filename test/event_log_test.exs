@@ -42,6 +42,50 @@ defmodule Tightbeam.EventLogTest do
     assert msg =~ "CHECK constraint"
   end
 
+  test "an accepted event can share its caller transaction and exact clock", %{db: db} do
+    assert {:ok, event_id} =
+             DB.transaction(db, fn txn ->
+               EventLog.append_event_in_txn(
+                 txn,
+                 "verb",
+                 "wake",
+                 "user:mike",
+                 nil,
+                 %{cancel_wake_id: "w_public", canceled: true},
+                 {:user, "mike"},
+                 12_345
+               )
+             end)
+
+    assert is_integer(event_id) and event_id > 0
+
+    assert {:ok, [[^event_id, 12_345, "verb", "wake", "user:mike", "user:mike", nil, payload]]} =
+             DB.query(
+               db,
+               "SELECT id,ts,kind,verb,origin,principal,sessionKey,payload FROM events"
+             )
+
+    assert payload == "%{cancel_wake_id: \"w_public\", canceled: true}"
+
+    assert {:error, %RuntimeError{message: "forced rollback"}} =
+             DB.transaction(db, fn txn ->
+               EventLog.append_event_in_txn(
+                 txn,
+                 "verb",
+                 "wake",
+                 "user:mike",
+                 nil,
+                 %{cancel_wake_id: "w_rolled_back", canceled: true},
+                 {:user, "mike"},
+                 12_346
+               )
+
+               raise "forced rollback"
+             end)
+
+    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM events")
+  end
+
   test "boot epochs: clean shutdown leaves no dirty-exit; missing stamp infers one", %{db: db} do
     e1 = EventLog.boot(db)
     :ok = EventLog.clean_shutdown(db, e1)

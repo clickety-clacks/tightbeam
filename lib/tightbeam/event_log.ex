@@ -110,17 +110,57 @@ defmodule Tightbeam.EventLog do
         principal \\ nil
       )
       when kind in ~w(verb denied) do
-    {:ok, _} =
-      DB.query(
-        db,
-        """
-          INSERT INTO events (ts, kind, verb, origin, principal, sessionKey, payload)
-          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-        """,
-        [now(), kind, verb, origin, serialize_principal(principal), session_key, encode(payload)]
-      )
+    {:ok, _event_id} =
+      DB.transaction(db, fn txn ->
+        append_event_in_txn(
+          txn,
+          kind,
+          verb,
+          origin,
+          session_key,
+          payload,
+          principal,
+          now()
+        )
+      end)
 
     :ok
+  end
+
+  @doc "Append an event inside its caller's transaction and return its durable id."
+  @spec append_event_in_txn(
+          Txn.t(),
+          String.t(),
+          String.t(),
+          String.t(),
+          String.t() | nil,
+          term(),
+          term(),
+          non_neg_integer()
+        ) :: pos_integer()
+  def append_event_in_txn(
+        %Txn{} = txn,
+        kind,
+        verb,
+        origin,
+        session_key,
+        payload,
+        principal,
+        ts
+      )
+      when kind in ~w(verb denied) and is_integer(ts) and ts >= 0 do
+    [[event_id]] =
+      Txn.q(
+        txn,
+        """
+        INSERT INTO events (ts, kind, verb, origin, principal, sessionKey, payload)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        RETURNING id
+        """,
+        [ts, kind, verb, origin, serialize_principal(principal), session_key, encode(payload)]
+      )
+
+    event_id
   end
 
   @doc "Verb events with id > `after_id`, oldest first — the advance/inspect feed."
