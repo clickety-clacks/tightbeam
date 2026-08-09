@@ -116,7 +116,7 @@ defmodule Tightbeam.SupervisionTest do
       Path.join(String.trim(tmp), "tb-supervision-rules-#{System.unique_integer([:positive])}")
 
     File.mkdir_p!(base)
-    handlers = Gateway.handlers(%{db: db})
+    handlers = Gateway.handlers(%{db: db, wake_tick_ms: 60_000})
     Rules.load!(base, Map.keys(handlers))
     on_exit(fn -> File.rm_rf!(base) end)
 
@@ -2159,7 +2159,7 @@ defmodule Tightbeam.SupervisionTest do
   defp cancel_wake!(db, wake) do
     {requester, principal, session_key} = cancellation_requester(wake.origin)
 
-    assert {:ok, true} =
+    assert {:ok, {:accepted_in_txn, event_id, %{canceled: true}}} =
              DB.transaction(db, fn txn ->
                trigger = ensure_cancellation_trigger_in_txn(txn, wake)
 
@@ -2188,6 +2188,8 @@ defmodule Tightbeam.SupervisionTest do
                  outcome: outcome
                })
              end)
+
+    assert event_id > 0
 
     :ok
   end
