@@ -49,6 +49,134 @@ defmodule Tightbeam.SchemaShapeTest do
     assert {:ok, [["model-identity-v1"]]} = DB.query(db, "SELECT shape FROM schema_stamp")
   end
 
+  test "the shared liveness activation creates one exact additive shape", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    assert table_columns(db, "supervision_entitlements") ==
+             ~w(assignmentId generation dueAt state lastAttemptGeneration claimClock basisKind basisId terminusAt cause principal supervisionIntervalMs)
+
+    assert table_columns(db, "supervision_progress_absorptions") ==
+             ~w(attestId assignmentId attestTs generation recoveryBaseline cause principal)
+
+    assert table_columns(db, "supervision_liveness_sidecar") ==
+             ~w(wakeId assignmentId controllerOrigin wakeKind controllerState chargedGeneration transferEvidenceId retirementEpoch retiringSessionKey retirementOutcomeKind retirementOutcomeId retirementTargetSessionKey retirementCause retirementPrincipal retirementActionNeeded)
+
+    assert table_columns(db, "wake_cancellations") ==
+             ~w(wakeId wakeState canceledAt requesterKind requesterId reasonKind causalSourceKind causalSourceId outcomeKind replacementWakeId dispositionKind dispositionId primaryWorkKind primaryWorkId workImpactKind livenessTriggerKind livenessTriggerId actionNeeded)
+
+    assert table_columns(db, "supervision_liveness_epoch") ==
+             ~w(id activatedAt cause principal)
+
+    assert length(owned_activation_objects(db)) == 16
+
+    assert {:ok, [[0, activated_at, "schema_activation", "process:tightbeam"]]} =
+             DB.query(
+               db,
+               "SELECT id,activatedAt,cause,principal FROM supervision_liveness_epoch"
+             )
+
+    assert is_integer(activated_at) and activated_at >= 0
+    refute table?(db, "wake_cancellation_legacy")
+    refute table?(db, "wake_cancellation_epoch")
+
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:ok, [[1, ^activated_at]]} =
+             DB.query(db, "SELECT COUNT(*),MIN(activatedAt) FROM supervision_liveness_epoch")
+  end
+
+  test "a malformed additive object refuses without partial activation", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+    drop_liveness_activation(db)
+
+    :ok =
+      DB.execute(db, "CREATE TABLE supervision_liveness_sidecar (wakeId TEXT PRIMARY KEY)")
+
+    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
+    assert error.message =~ "incompatible_supervision_liveness_v1"
+    assert error.message =~ "supervision_liveness_sidecar"
+    assert table_columns(db, "supervision_liveness_sidecar") == ["wakeId"]
+    refute table?(db, "supervision_entitlements")
+    refute table?(db, "wake_cancellations")
+    refute table?(db, "supervision_liveness_epoch")
+  end
+
+  test "every interrupted activation statement rolls back and retries once", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    for statement <- 1..17 do
+      drop_liveness_activation(db)
+
+      assert {:error, %RuntimeError{message: "forced activation interruption"}} =
+               DB.transaction(db, fn txn ->
+                 Schema.ensure_supervision_liveness_v1_in_txn(txn, 40_000,
+                   fail_after_statement: statement
+                 )
+               end)
+
+      assert owned_activation_objects(db) == []
+
+      assert {:ok, :ok} =
+               DB.transaction(db, fn txn ->
+                 Schema.ensure_supervision_liveness_v1_in_txn(txn, 40_000 + statement)
+               end)
+
+      assert {:ok, [[activated_at]]} =
+               DB.query(db, "SELECT activatedAt FROM supervision_liveness_epoch")
+
+      assert activated_at == 40_000 + statement
+    end
+  end
+
+  test "an incomplete activation and an empty epoch refuse without repair", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    :ok = DB.execute(db, "DROP INDEX supervision_liveness_assignment")
+    objects_before = owned_activation_objects(db)
+
+    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
+    assert error.message =~ "incompatible_supervision_liveness_v1"
+    assert error.message =~ "supervision_liveness_assignment"
+    assert owned_activation_objects(db) == objects_before
+
+    :ok =
+      DB.execute(
+        db,
+        "CREATE INDEX supervision_liveness_assignment ON supervision_liveness_sidecar(assignmentId, wakeId)"
+      )
+
+    :ok = DB.execute(db, "DELETE FROM supervision_liveness_epoch")
+
+    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
+    assert error.message =~ "incompatible_supervision_liveness_v1"
+    assert error.message =~ "supervision_liveness_epoch row"
+    assert {:ok, []} = DB.query(db, "SELECT id FROM supervision_liveness_epoch")
+  end
+
+  test "upgraded historical wake rows stay byte-stable and gain no inferred carrier", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+    drop_liveness_activation(db)
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO wakes
+        (wakeId,sessionKey,origin,prompt,dueAt,state,createdAt,firedAt,canceledAt)
+      VALUES
+        ('w_pending','session-a','process:tightbeam','pending',90,'pending',10,NULL,NULL),
+        ('w_fired','session-a','process:tightbeam','fired',90,'fired',11,91,NULL),
+        ('w_canceled','session-a','process:tightbeam','canceled',90,'canceled',12,NULL,92)
+      """)
+
+    {:ok, before_rows} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
+
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:ok, ^before_rows} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
+    assert {:ok, []} = DB.query(db, "SELECT wakeId FROM wake_cancellations")
+
+    assert {:ok, [["model-identity-v1"]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+  end
+
   # The defect this refuses: `CREATE TABLE IF NOT EXISTS` is SILENT about a
   # table that already exists in an older shape. It adds no column, so the
   # first query naming `modelContext` dies as an accidental `no such column` —
@@ -129,5 +257,66 @@ defmodule Tightbeam.SchemaShapeTest do
 
     assert error.message =~ "some-later-shape"
     assert error.message =~ "model-identity-v1"
+  end
+
+  defp table?(db, name) do
+    {:ok, rows} =
+      DB.query(db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1", [name])
+
+    rows == [[1]]
+  end
+
+  defp table_columns(db, name) do
+    {:ok, rows} = DB.query(db, "PRAGMA table_info(#{name})")
+    Enum.map(rows, fn [_cid, column | _] -> column end)
+  end
+
+  defp owned_activation_objects(db) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT name FROM sqlite_master
+        WHERE name IN (
+          'supervision_entitlements',
+          'supervision_progress_absorptions',
+          'supervision_liveness_sidecar',
+          'wake_cancellations',
+          'supervision_liveness_epoch',
+          'supervision_progress_assignment',
+          'supervision_liveness_assignment',
+          'supervision_liveness_pending_controller',
+          'supervision_liveness_retirement_dedupe',
+          'wakes_cancellation_state',
+          'wake_cancellations_pending_insert',
+          'wakes_typed_cancellation_required',
+          'wake_cancellations_append_only_update',
+          'wake_cancellations_append_only_delete',
+          'supervision_liveness_retirement_immutable_update',
+          'supervision_liveness_retirement_immutable_delete'
+        )
+        ORDER BY name
+        """
+      )
+
+    List.flatten(rows)
+  end
+
+  defp drop_liveness_activation(db) do
+    :ok =
+      DB.execute(db, """
+      DROP TRIGGER IF EXISTS supervision_liveness_retirement_immutable_delete;
+      DROP TRIGGER IF EXISTS supervision_liveness_retirement_immutable_update;
+      DROP TRIGGER IF EXISTS wake_cancellations_append_only_delete;
+      DROP TRIGGER IF EXISTS wake_cancellations_append_only_update;
+      DROP TRIGGER IF EXISTS wakes_typed_cancellation_required;
+      DROP TRIGGER IF EXISTS wake_cancellations_pending_insert;
+      DROP TABLE IF EXISTS wake_cancellations;
+      DROP TABLE IF EXISTS supervision_liveness_sidecar;
+      DROP TABLE IF EXISTS supervision_progress_absorptions;
+      DROP TABLE IF EXISTS supervision_entitlements;
+      DROP TABLE IF EXISTS supervision_liveness_epoch;
+      DROP INDEX IF EXISTS wakes_cancellation_state;
+      """)
   end
 end
