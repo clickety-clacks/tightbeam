@@ -53,6 +53,7 @@ defmodule Tightbeam.GatewayTest do
     Credentials,
     DB,
     Devices,
+    Dispatch,
     EventLog,
     EffortCheckin,
     Gateway,
@@ -580,6 +581,62 @@ defmodule Tightbeam.GatewayTest do
     %{db: db, registry: registry, lane: lane, catalog_base: catalog_base}
   end
 
+  test "assignment handlers inject the configured supervision interval before mutation", ctx do
+    ensure_global_registry()
+    base_dir = role_test_base("gateway-supervision-interval")
+
+    register_hosts(ctx.db, %{
+      "testhost" => %{ssh: "testhost", base_dir: base_dir, cli_bin: nil}
+    })
+
+    handlers =
+      Gateway.handlers(
+        gateway_config(base_dir, ctx.db, 0)
+        |> Map.put(:wake_tick_ms, 1_234)
+      )
+
+    common = %{
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      session_key: "k1",
+      target_role: nil,
+      role_fallback: false
+    }
+
+    assert %{id: assign_id} =
+             handlers["assign"].(
+               Map.merge(common, %{
+                 verb: "assign",
+                 params: %{subject: "gateway interval assign"}
+               })
+             )
+
+    assert %{id: dispatch_id} =
+             handlers["dispatch"].(
+               Map.merge(common, %{
+                 verb: "dispatch",
+                 params: %{
+                   subject: "gateway interval dispatch",
+                   brief: "prove the configured interval"
+                 }
+               })
+             )
+
+    for assignment_id <- [assign_id, dispatch_id] do
+      assert {:ok, [[1_234, 1_234]]} =
+               DB.query(
+                 ctx.db,
+                 """
+                 SELECT e.dueAt - a.openedAt, e.supervisionIntervalMs
+                 FROM assignments a
+                 JOIN supervision_entitlements e ON e.assignmentId=a.id
+                 WHERE a.id=?1
+                 """,
+                 [assignment_id]
+               )
+    end
+  end
+
   test "retire refuses built-in mains — the fallback target is permanent", ctx do
     Org.create(ctx.db, %{
       session_key: Org.personal_session_key("flynn"),
@@ -659,6 +716,7 @@ defmodule Tightbeam.GatewayTest do
     handlers =
       Gateway.handlers(%{
         db: ctx.db,
+        wake_tick_ms: 1_000,
         on_retired: fn key -> send(parent, {:retired, key}) end
       })
 
@@ -698,7 +756,7 @@ defmodule Tightbeam.GatewayTest do
 
   test "retiring the last live session closes its harness session and shared adapter", ctx do
     ensure_global_registry()
-    Org.retire(ctx.db, "k1")
+    Org.retire(ctx.db, "k1", "test:gateway", 1_000)
     session = create_session(ctx.db, "reap-last", "flynn")
     session = Org.set_identity(ctx.db, session.session_key, nil, "reap-last-identity")
     Org.append_pointer(ctx.db, session.session_key, "harness-last", "created")
@@ -714,7 +772,11 @@ defmodule Tightbeam.GatewayTest do
     monitor = Process.monitor(adapter)
 
     result =
-      Gateway.handlers(%{db: ctx.db, adapter_coordinator: coordinator})["retire"].(%{
+      Gateway.handlers(%{
+        db: ctx.db,
+        wake_tick_ms: 1_000,
+        adapter_coordinator: coordinator
+      })["retire"].(%{
         origin: "user:flynn",
         session_key: session.session_key,
         params: %{}
@@ -799,7 +861,7 @@ defmodule Tightbeam.GatewayTest do
       })
 
     result =
-      Gateway.handlers(%{db: ctx.db, base_dir: base_dir})["retire"].(%{
+      Gateway.handlers(%{db: ctx.db, base_dir: base_dir, wake_tick_ms: 1_000})["retire"].(%{
         origin: "user:flynn",
         session_key: session.session_key,
         params: %{}
@@ -837,7 +899,11 @@ defmodule Tightbeam.GatewayTest do
     coordinator = start_supervised!({CoordinatorStub, {adapter, self()}})
 
     result =
-      Gateway.handlers(%{db: ctx.db, adapter_coordinator: coordinator})["retire"].(%{
+      Gateway.handlers(%{
+        db: ctx.db,
+        wake_tick_ms: 1_000,
+        adapter_coordinator: coordinator
+      })["retire"].(%{
         origin: "user:flynn",
         session_key: retired.session_key,
         params: %{}
@@ -857,7 +923,7 @@ defmodule Tightbeam.GatewayTest do
 
   test "a harness session close error cannot fail the committed retire", ctx do
     ensure_global_registry()
-    Org.retire(ctx.db, "k1")
+    Org.retire(ctx.db, "k1", "test:gateway", 1_000)
     session = create_session(ctx.db, "reap-close-error", "flynn")
     session = Org.set_identity(ctx.db, session.session_key, nil, "reap-error-identity")
     Org.append_pointer(ctx.db, session.session_key, "harness-close-error", "created")
@@ -872,7 +938,11 @@ defmodule Tightbeam.GatewayTest do
     coordinator = start_supervised!({CoordinatorStub, {adapter, self()}})
 
     result =
-      Gateway.handlers(%{db: ctx.db, adapter_coordinator: coordinator})["retire"].(%{
+      Gateway.handlers(%{
+        db: ctx.db,
+        wake_tick_ms: 1_000,
+        adapter_coordinator: coordinator
+      })["retire"].(%{
         origin: "user:flynn",
         session_key: session.session_key,
         params: %{}
@@ -887,7 +957,13 @@ defmodule Tightbeam.GatewayTest do
   test "critical lease renewal is hard-capped and defers the entire cascade idempotently", ctx do
     root = create_session(ctx.db, "leased-root", "flynn")
     child = create_session(ctx.db, "leased-child", "flynn", root.session_key)
-    handlers = Gateway.handlers(%{db: ctx.db, critical_lease_hard_cap_ms: 2_000})
+
+    handlers =
+      Gateway.handlers(%{
+        db: ctx.db,
+        wake_tick_ms: 1_000,
+        critical_lease_hard_cap_ms: 2_000
+      })
 
     first =
       handlers["critical"].(%{
@@ -1478,22 +1554,107 @@ defmodule Tightbeam.GatewayTest do
         due_at: 2_000
       })
 
-    wake = Gateway.handlers(gateway_config("/tmp", ctx.db, 0))["wake"]
+    handlers = Gateway.handlers(gateway_config("/tmp", ctx.db, 0))
+    Rules.load!(System.tmp_dir!(), Map.keys(handlers))
 
-    assert wake.(%{
-             origin: "process:scheduler",
-             session_key: nil,
-             params: %{cancel_wake_id: own.wake_id}
-           }) == %{canceled: true}
+    assert {:ok, %{canceled: true}} =
+             Dispatch.dispatch(ctx.db, handlers, %{
+               verb: "wake",
+               origin: "process:scheduler",
+               principal: {:process, "scheduler"},
+               session_key: nil,
+               params: %{cancel_wake_id: own.wake_id}
+             })
 
-    assert wake.(%{
-             origin: "process:scheduler",
-             session_key: nil,
-             params: %{cancel_wake_id: other.wake_id}
-           }) == %{canceled: false}
+    assert {:ok, [[event_id, causal_source_id]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT e.id, c.causalSourceId
+               FROM events e
+               JOIN wake_cancellations c ON c.causalSourceId=CAST(e.id AS TEXT)
+               WHERE c.wakeId=?1 AND e.kind='verb' AND e.verb='wake'
+               """,
+               [own.wake_id]
+             )
+
+    assert causal_source_id == Integer.to_string(event_id)
+
+    assert {:ok, %{canceled: false}} =
+             Dispatch.dispatch(ctx.db, handlers, %{
+               verb: "wake",
+               origin: "process:scheduler",
+               principal: {:process, "scheduler"},
+               session_key: nil,
+               params: %{cancel_wake_id: other.wake_id}
+             })
 
     assert Wakes.get(ctx.db, own.wake_id).state == "canceled"
     assert Wakes.get(ctx.db, other.wake_id).state == "pending"
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wake_cancellations WHERE wakeId=?1",
+               [other.wake_id]
+             )
+  end
+
+  test "public cancel rolls its accepted event and carrier back with the wake transition", ctx do
+    wake =
+      Wakes.schedule(ctx.db, %{
+        session_key: "k1",
+        origin: "process:scheduler",
+        prompt: "rollback wake",
+        due_at: 1_000
+      })
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        """
+        CREATE TRIGGER force_gateway_cancel_rollback
+        BEFORE UPDATE OF state ON wakes
+        WHEN OLD.wakeId='#{wake.wake_id}' AND NEW.state='canceled'
+        BEGIN
+          SELECT RAISE(ABORT, 'forced gateway cancellation rollback');
+        END;
+        """
+      )
+
+    handlers = Gateway.handlers(gateway_config("/tmp", ctx.db, 0))
+    Rules.load!(System.tmp_dir!(), Map.keys(handlers))
+
+    assert {:error, %{code: "server_error", message: message}} =
+             Dispatch.dispatch(ctx.db, handlers, %{
+               verb: "wake",
+               origin: "process:scheduler",
+               principal: {:process, "scheduler"},
+               session_key: nil,
+               params: %{cancel_wake_id: wake.wake_id}
+             })
+
+    assert message =~ "forced gateway cancellation rollback"
+
+    assert Wakes.get(ctx.db, wake.wake_id).state == "pending"
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wake_cancellations WHERE wakeId=?1",
+               [wake.wake_id]
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT COUNT(*) FROM events
+               WHERE verb='wake' AND json_valid(payload)
+                 AND json_extract(payload, '$.canceled')=1
+               """,
+               []
+             )
   end
 
   test "role wakes late-bind at fire time and deleted roles fail visibly", ctx do
@@ -6577,7 +6738,7 @@ defmodule Tightbeam.GatewayTest do
         provider: "anthropic",
         model: Model.new("fable")
       })
-      |> then(&Org.retire(ctx.db, &1.session_key))
+      |> then(&Org.retire(ctx.db, &1.session_key, "test:gateway", 1_000))
 
     assert %{
              state: "referenced",
@@ -6693,7 +6854,7 @@ defmodule Tightbeam.GatewayTest do
         provider: "anthropic",
         model: Model.new("fable")
       })
-      |> then(&Org.retire(ctx.db, &1.session_key))
+      |> then(&Org.retire(ctx.db, &1.session_key, "test:gateway", 1_000))
 
     main =
       Org.create(ctx.db, %{
@@ -7769,7 +7930,7 @@ defmodule Tightbeam.GatewayTest do
     parent = self()
 
     park = fn :openai ->
-      Org.retire(ctx.db, first.session_key)
+      Org.retire(ctx.db, first.session_key, "test:gateway", 1_000)
 
       Org.create(ctx.db, %{
         session_key: "agent:credential-late",

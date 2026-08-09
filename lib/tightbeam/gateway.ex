@@ -639,7 +639,7 @@ defmodule Tightbeam.Gateway do
 
         cond do
           is_binary(p[:cancel_wake_id]) ->
-            %{canceled: Wakes.cancel(db, p.cancel_wake_id, call.origin)}
+            cancel_wake_result(db, call, p.cancel_wake_id)
 
           not (is_binary(p[:prompt]) and p.prompt != "") ->
             %{code: "invalid", message: "a wake must carry a prompt"}
@@ -914,6 +914,7 @@ defmodule Tightbeam.Gateway do
       "assign" => fn call ->
         call =
           call
+          |> Map.put(:supervision_interval_ms, Map.fetch!(config, :wake_tick_ms))
           |> Map.put(:on_assignment_change, assignment_change)
           |> Map.put(:on_work_item_change, item_change)
 
@@ -922,6 +923,7 @@ defmodule Tightbeam.Gateway do
       "dispatch" => fn call ->
         call =
           call
+          |> Map.put(:supervision_interval_ms, Map.fetch!(config, :wake_tick_ms))
           |> Map.put(:on_assignment_change, assignment_change)
           |> Map.put(:on_work_item_change, item_change)
           |> Map.put(:effort_config, config)
@@ -934,6 +936,7 @@ defmodule Tightbeam.Gateway do
           db,
           "attest",
           call
+          |> maybe_put_progress_interval(config)
           |> Map.put(:on_assignment_change, assignment_change)
           # Referent verification reaches hosts, so it needs the same placement
           # config (and the same injectable runner) the effort probe uses.
@@ -3255,6 +3258,60 @@ defmodule Tightbeam.Gateway do
     end
   end
 
+  defp maybe_put_progress_interval(%{params: %{kind: "progress"}} = call, config) do
+    Map.put(call, :supervision_interval_ms, Map.fetch!(config, :wake_tick_ms))
+  end
+
+  defp maybe_put_progress_interval(call, _config), do: call
+
+  defp cancel_wake_result(db, call, wake_id) do
+    with {:ok, requester} <- cancellation_requester(call[:principal]) do
+      command = %{
+        wake_id: wake_id,
+        expected_origin: call.origin,
+        requester: requester,
+        reason_kind: "requester_withdrew",
+        causal_source: %{
+          kind: "verb_call",
+          accepted_event: %{
+            origin: call.origin,
+            session_key: call.session_key,
+            principal: call.principal
+          }
+        },
+        outcome: %{kind: "no_replacement"}
+      }
+
+      case DB.transaction(db, fn txn -> Wakes.cancel_in_txn(txn, command) end) do
+        {:ok, {:accepted_in_txn, event_id, %{canceled: true}}}
+        when is_integer(event_id) and event_id > 0 ->
+          {:accepted_in_txn, event_id, %{canceled: true}}
+
+        {:ok, false} ->
+          %{canceled: false}
+
+        {:ok, other} ->
+          raise "invalid public wake cancellation result: #{inspect(other)}"
+
+        {:error, error} ->
+          raise error
+      end
+    else
+      :error -> %{canceled: false}
+    end
+  end
+
+  defp cancellation_requester({:user, id}) when is_binary(id) and id != "",
+    do: {:ok, %{kind: "user", id: id}}
+
+  defp cancellation_requester({:session, id}) when is_binary(id) and id != "",
+    do: {:ok, %{kind: "session", id: id}}
+
+  defp cancellation_requester({:process, id}) when is_binary(id) and id != "",
+    do: {:ok, %{kind: "process", id: id}}
+
+  defp cancellation_requester(_principal), do: :error
+
   defp wake_result(config, db, call) do
     p = call.params
 
@@ -4821,6 +4878,8 @@ defmodule Tightbeam.Gateway do
                       txn,
                       session.session_key,
                       owner,
+                      call.origin,
+                      Map.fetch!(config, :wake_tick_ms),
                       "retired: session retired before execution"
                     )
 
@@ -4930,7 +4989,14 @@ defmodule Tightbeam.Gateway do
     walk.(walk, root_key)
   end
 
-  defp retire_cascade_in_txn(txn, root_key, owner, drain_reason) do
+  defp retire_cascade_in_txn(
+         txn,
+         root_key,
+         owner,
+         principal,
+         supervision_interval_ms,
+         drain_reason
+       ) do
     # Invariant: this spawnedBy walk visits each active member of the target's
     # transitive subtree exactly once, parent-last. This is the lifecycle
     # seam's canonical subtree ordering; do not duplicate it.
@@ -4949,7 +5015,14 @@ defmodule Tightbeam.Gateway do
       retired =
         Enum.map(subtree, fn member ->
           assignments =
-            retire_session_in_txn(txn, member.session_key, owner, drain_reason)
+            retire_session_in_txn(
+              txn,
+              member.session_key,
+              owner,
+              principal,
+              supervision_interval_ms,
+              drain_reason
+            )
 
           %{session_key: member.session_key, assignments: assignments}
         end)
@@ -5001,9 +5074,16 @@ defmodule Tightbeam.Gateway do
     "w_retire_" <> digest
   end
 
-  defp retire_session_in_txn(txn, session_key, owner, drain_reason) do
-    assignments = Assignments.interrupt_for_retire_in_txn(txn, session_key, owner)
-    Org.retire_in_txn(txn, session_key)
+  defp retire_session_in_txn(
+         txn,
+         session_key,
+         owner,
+         principal,
+         supervision_interval_ms,
+         drain_reason
+       ) do
+    assignments = Assignments.interrupt_for_retire_in_txn(txn, session_key, owner, principal)
+    Org.retire_in_txn(txn, session_key, principal, supervision_interval_ms)
     Ledger.drain_queued_for_retire_in_txn(txn, session_key, drain_reason)
     assignments
   end
