@@ -33,6 +33,27 @@ a clause you're implementing demands one, STOP and report it as a finding for
 adjudication. Parity refactors owe byte-parity except changes the spec names as
 intentional.
 
+## Verification
+
+- `.github/workflows/ci.yml` defines the verification gate. When it and this
+  section disagree, `ci.yml` is right and this section is a bug.
+- Run the halves your change touches; run both when unsure. Run each applicable half
+  exactly as CI defines it:
+  - Elixir: `mix format --check-formatted && scripts/verify_mix.sh`.
+  - Rust, from `cli/`: `cargo fmt --check && cargo test`.
+- The canonical gate handles environment hygiene. For ad-hoc Mix runs outside the
+  script, such as `mix test path/to/file.exs`, use `env -u NAME` to remove every
+  inherited `TIGHTBEAM_*` and `RELEASE_*` variable.
+  After `wi_8f90c5b3` merges, the suite is immune to the
+  known `TIGHTBEAM_*` config leaks. Keep stripping both prefixes: that proof covers
+  only config, while `RELEASE_ROOT` is read directly from the environment in `lib/`.
+- First run the applicable gates on an unmodified tree in a clean environment and
+  record the counts on the card. Repeat after the change and record those counts too.
+  Accept only a green gate with both records; `tests pass` without a baseline is a
+  claim a reviewer cannot check.
+- A docs-only change (`*.md`) skips these gates. Run `sh packaging/assemble.sh`
+  instead; it must succeed.
+
 ## Tests — a green run is not the goal, a correct one is
 
 **Green tests < correct tests.** A suite that passes because its assertions were removed is
