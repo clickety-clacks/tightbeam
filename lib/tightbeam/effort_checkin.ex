@@ -20,7 +20,7 @@ defmodule Tightbeam.EffortCheckin do
   wake.
   """
 
-  alias Tightbeam.{CausalEvents, DB, Org, Placement, Wakes}
+  alias Tightbeam.{CausalEvents, DB, Org, Placement, Supervision, Wakes}
   alias Tightbeam.DB.Txn
 
   @origin "process:tightbeam"
@@ -172,15 +172,15 @@ defmodule Tightbeam.EffortCheckin do
     end)
   end
 
-  @spec cancel_in_txn(Txn.t(), String.t()) :: :ok
-  def cancel_in_txn(%Txn{} = txn, assignment_id) do
+  @spec cancel_in_txn(Txn.t(), String.t(), map()) :: :ok
+  def cancel_in_txn(%Txn{} = txn, assignment_id, command) do
     case current_generation(txn, assignment_id) do
       nil ->
         :ok
 
       generation ->
         if generation.state == "armed" do
-          Wakes.cancel_in_txn(txn, generation.wake_id, @origin)
+          cancel_pending_wake_in_txn!(txn, generation.wake_id, command)
         end
 
         Txn.q(
@@ -192,7 +192,7 @@ defmodule Tightbeam.EffortCheckin do
         :ok
     end
 
-    supersede_requests_in_txn(txn, assignment_id)
+    dispose_requests_in_txn(txn, assignment_id, command)
     :ok
   end
 
@@ -208,13 +208,20 @@ defmodule Tightbeam.EffortCheckin do
                  [item.assignment_id, holder_key]
                ) do
             [[1]] ->
-              cancel_in_txn(txn, item.assignment_id)
+              replacement =
+                arm_in_txn(
+                  txn,
+                  config,
+                  %{id: item.assignment_id, holderKey: holder_key},
+                  item.arm
+                )
 
-              arm_in_txn(
+              replace_monitor_in_txn(
                 txn,
-                config,
-                %{id: item.assignment_id, holderKey: holder_key},
-                item.arm
+                item.assignment_id,
+                current_generation_number: generation,
+                current_wake_id: wake_id,
+                replacement: replacement
               )
 
             [] ->
@@ -226,6 +233,31 @@ defmodule Tightbeam.EffortCheckin do
       end
     end)
 
+    :ok
+  end
+
+  defp replace_monitor_in_txn(txn, assignment_id, opts) do
+    replacement = Keyword.fetch!(opts, :replacement)
+    current_generation_number = Keyword.fetch!(opts, :current_generation_number)
+    current_wake_id = Keyword.fetch!(opts, :current_wake_id)
+    source_id = "#{assignment_id}##{replacement.generation}"
+
+    command = %{
+      requester: %{kind: "process", id: "tightbeam:effort-checkin"},
+      reason_kind: "superseded",
+      causal_source: %{kind: "monitor_generation", id: source_id},
+      outcome: %{kind: "replacement", replacement_wake_id: replacement.wake_id}
+    }
+
+    cancel_pending_wake_in_txn!(txn, current_wake_id, command)
+
+    Txn.q(
+      txn,
+      "UPDATE effort_checkin_generations SET state = 'canceled' WHERE assignmentId = ?1 AND generation = ?2 AND state IN ('armed','probed')",
+      [assignment_id, current_generation_number]
+    )
+
+    supersede_requests_in_txn(txn, assignment_id, command)
     :ok
   end
 
@@ -532,7 +564,28 @@ defmodule Tightbeam.EffortCheckin do
           arm_notification_in_txn(txn, advanced)
           advanced
         else
-          Wakes.cancel_in_txn(txn, replacement.wake_id, @origin)
+          winner = request_for_id(txn, request.id)
+
+          command =
+            if winner.status == "open" and winner.deadline_wake_id != replacement.wake_id do
+              %{
+                requester: %{kind: "process", id: "tightbeam:effort-checkin"},
+                reason_kind: "superseded",
+                causal_source: %{kind: "wake", id: winner.deadline_wake_id},
+                outcome: %{
+                  kind: "replacement",
+                  replacement_wake_id: winner.deadline_wake_id
+                }
+              }
+            else
+              decision_disposition_command(
+                txn,
+                winner,
+                liveness_trigger_in_txn!(txn, winner.assignment_id)
+              )
+            end
+
+          cancel_pending_wake_in_txn!(txn, replacement.wake_id, command)
           nil
         end
     end
@@ -558,15 +611,27 @@ defmodule Tightbeam.EffortCheckin do
         error("stale_effort_snapshot", "holder effort state changed; retry the ruling")
 
       current.status == "open" ->
-        Wakes.cancel_in_txn(txn, current.deadline_wake_id, @origin)
+        ruled_at = now()
 
         Txn.q(
           txn,
           "UPDATE decision_requests SET status = 'ruled', decision = ?2, ruledBy = ?3, ruledAt = ?4 WHERE id = ?1 AND status = 'open'",
-          [current.id, action, origin, now()]
+          [current.id, action, origin, ruled_at]
         )
 
         if Txn.changes(txn) == 1 do
+          ruled = request_for_id(txn, current.id)
+
+          cancel_pending_wake_in_txn!(
+            txn,
+            current.deadline_wake_id,
+            decision_disposition_command(
+              txn,
+              ruled,
+              liveness_trigger_in_txn!(txn, ruled.assignment_id)
+            )
+          )
+
           generation =
             generation_for_assignment_in_txn(
               txn,
@@ -669,15 +734,39 @@ defmodule Tightbeam.EffortCheckin do
       arm_notification_in_txn(txn, request)
       request
     else
-      Wakes.cancel_in_txn(txn, deadline.wake_id, @origin)
-
       case Txn.q(
              txn,
              "SELECT id FROM decision_requests WHERE kind = 'effort' AND assignmentId = ?1 AND effortGeneration = ?2",
              [generation.assignment_id, generation.generation]
            ) do
-        [[id]] -> request_for_id(txn, id)
-        [] -> nil
+        [[id]] ->
+          winner = request_for_id(txn, id)
+
+          command =
+            if winner.status == "open" do
+              %{
+                requester: %{kind: "process", id: "tightbeam:effort-checkin"},
+                reason_kind: "superseded",
+                causal_source: %{kind: "decision_request", id: winner.id},
+                outcome: %{
+                  kind: "replacement",
+                  replacement_wake_id: winner.deadline_wake_id
+                }
+              }
+            else
+              decision_disposition_command(
+                txn,
+                winner,
+                liveness_trigger_in_txn!(txn, winner.assignment_id)
+              )
+            end
+
+          cancel_pending_wake_in_txn!(txn, deadline.wake_id, command)
+
+          winner
+
+        [] ->
+          raise "decision request conflict has no durable winner"
       end
     end
   end
@@ -747,19 +836,122 @@ defmodule Tightbeam.EffortCheckin do
     generation_for_assignment_in_txn(txn, assignment_id, generation)
   end
 
-  defp supersede_requests_in_txn(txn, assignment_id) do
-    Txn.q(
-      txn,
-      "SELECT deadlineWakeId FROM decision_requests WHERE kind = 'effort' AND assignmentId = ?1 AND status = 'open'",
-      [assignment_id]
-    )
-    |> Enum.each(fn [wake_id] -> Wakes.cancel_in_txn(txn, wake_id, @origin) end)
+  defp supersede_requests_in_txn(txn, assignment_id, command) do
+    wake_ids =
+      Txn.q(
+        txn,
+        "SELECT deadlineWakeId FROM decision_requests WHERE kind = 'effort' AND assignmentId = ?1 AND status = 'open'",
+        [assignment_id]
+      )
+      |> List.flatten()
 
     Txn.q(
       txn,
       "UPDATE decision_requests SET status = 'superseded' WHERE kind = 'effort' AND assignmentId = ?1 AND status = 'open'",
       [assignment_id]
     )
+
+    Enum.each(wake_ids, &cancel_pending_wake_in_txn!(txn, &1, command))
+    :ok
+  end
+
+  defp dispose_requests_in_txn(txn, assignment_id, command) do
+    wake_ids =
+      Txn.q(
+        txn,
+        "SELECT deadlineWakeId FROM decision_requests WHERE kind = 'effort' AND assignmentId = ?1 AND status = 'open'",
+        [assignment_id]
+      )
+      |> List.flatten()
+
+    Txn.q(
+      txn,
+      "UPDATE decision_requests SET status = 'superseded' WHERE kind = 'effort' AND assignmentId = ?1 AND status = 'open'",
+      [assignment_id]
+    )
+
+    Enum.each(wake_ids, &cancel_pending_wake_in_txn!(txn, &1, command))
+
+    :ok
+  end
+
+  defp cancel_pending_wake_in_txn!(txn, wake_id, command) do
+    case Txn.q(txn, "SELECT state FROM wakes WHERE wakeId = ?1", [wake_id]) do
+      [["pending"]] ->
+        if not Wakes.cancel_in_txn(txn, Map.put(command, :wake_id, wake_id)) do
+          raise "typed effort cancellation refused for #{wake_id}"
+        end
+
+      [[state]] when state in ["fired", "canceled"] ->
+        :ok
+
+      [] ->
+        raise "effort state references missing wake #{wake_id}"
+    end
+  end
+
+  defp decision_disposition_command(_txn, request, liveness_trigger) do
+    outcome = %{
+      kind: "disposition",
+      disposition_kind: "decision_request_transition",
+      disposition_id: request.id
+    }
+
+    %{
+      requester: %{kind: "process", id: "tightbeam:effort-checkin"},
+      reason_kind: "obligation_disposed",
+      causal_source: %{kind: "decision_request", id: request.id},
+      outcome: put_liveness_trigger(outcome, liveness_trigger)
+    }
+  end
+
+  defp put_liveness_trigger(outcome, trigger) when is_map(trigger),
+    do: Map.put(outcome, :liveness_trigger, trigger)
+
+  defp put_liveness_trigger(outcome, nil), do: outcome
+
+  defp liveness_trigger_in_txn!(txn, assignment_id) do
+    primary = decision_liveness_primary_in_txn(txn, assignment_id)
+
+    case primary do
+      nil ->
+        nil
+
+      primary ->
+        fetch_liveness_trigger_in_txn!(txn, primary)
+    end
+  end
+
+  defp decision_liveness_primary_in_txn(txn, assignment_id) do
+    case Txn.q(
+           txn,
+           "SELECT state,workItemId FROM assignments WHERE id=?1",
+           [assignment_id]
+         ) do
+      [["open", _work_item_id]] ->
+        {:assignment, assignment_id}
+
+      [[_state, work_item_id]] when is_binary(work_item_id) ->
+        case Txn.q(txn, "SELECT state FROM work_items WHERE id=?1", [work_item_id]) do
+          [["open"]] -> {:work_item, work_item_id}
+          [[_terminal]] -> nil
+          [] -> raise "assignment #{assignment_id} references missing work item #{work_item_id}"
+        end
+
+      [[_state, nil]] ->
+        nil
+
+      [] ->
+        raise "decision request references missing assignment #{assignment_id}"
+    end
+  end
+
+  defp fetch_liveness_trigger_in_txn!(txn, primary) do
+    case Supervision.liveness_trigger_in_txn(txn, primary) do
+      {:ok, trigger} when is_map(trigger) -> trigger
+      :none -> raise "#{inspect(primary)} has no liveness trigger"
+      {:error, reason} -> raise "invalid liveness trigger: #{inspect(reason)}"
+    end
   end
 
   defp initial_expecter(txn, assignment) do
