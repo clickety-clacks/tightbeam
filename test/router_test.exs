@@ -197,6 +197,76 @@ defmodule Tightbeam.Wire.RouterTest do
            }
   end
 
+  test "agent tune preserves public control keys and structured failure fields", ctx do
+    parent = self()
+
+    handlers =
+      Map.put(ctx.opts[:handlers], "tune", fn call ->
+        send(parent, {:call, call})
+
+        %{
+          ok: false,
+          code: "runtime_config_mismatch",
+          message: "readback differed",
+          model: "gpt-5.6-sol",
+          effort: "high",
+          projection_committed: false,
+          cleanup_status: "unverified",
+          lifecycle_event_id: "le_123",
+          warnings: ["candidate close unverified"]
+        }
+      end)
+
+    ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, handlers)}
+
+    response =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "tune",
+        asUser: "flynn",
+        sessionKey: "live-session",
+        params: %{setting: "set_fast_mode", fastMode: "on"}
+      })
+
+    assert response.status == 400
+
+    assert_receive {:call,
+                    %{
+                      verb: "tune",
+                      session_key: "live-session",
+                      params: %{setting: "set_fast_mode", fastMode: "on"}
+                    }}
+
+    assert JSON.decode!(response.resp_body) == %{
+             "error" => %{
+               "code" => "runtime_config_mismatch",
+               "message" => "readback differed",
+               "model" => "gpt-5.6-sol",
+               "effort" => "high",
+               "projectionCommitted" => false,
+               "cleanupStatus" => "unverified",
+               "lifecycleEventId" => "le_123",
+               "warnings" => ["candidate close unverified"]
+             }
+           }
+
+    effort =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "tune",
+        asUser: "flynn",
+        sessionKey: "live-session",
+        params: %{setting: "set_reasoning", reasoningLevel: "high"}
+      })
+
+    assert effort.status == 400
+
+    assert_receive {:call,
+                    %{
+                      verb: "tune",
+                      session_key: "live-session",
+                      params: %{setting: "set_reasoning", reasoningLevel: "high"}
+                    }}
+  end
+
   test "an empty org cannot use the local first-user exception over the wire", ctx do
     db = :"empty_wire_add_user_db_#{System.unique_integer([:positive])}"
 

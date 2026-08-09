@@ -1004,13 +1004,20 @@ fn tune_refusal_json(encoded: &str) -> String {
         Err(error) => return error.to_string(),
     };
     let error = parsed.get("error").unwrap_or(&parsed);
+    let mut refusal = match error.as_object() {
+        Some(fields) => fields.clone(),
+        None => {
+            return serde_json::to_string(&serde_json::json!({
+                "ok": false,
+                "code": "undefined",
+                "message": ""
+            }))
+            .expect("JSON value serializes");
+        }
+    };
+    refusal.insert("ok".to_owned(), Value::Bool(false));
 
-    serde_json::to_string(&serde_json::json!({
-        "ok": false,
-        "code": error.get("code").and_then(Value::as_str).unwrap_or("undefined"),
-        "message": error.get("message").and_then(Value::as_str).unwrap_or("")
-    }))
-    .expect("JSON value serializes")
+    serde_json::to_string(&Value::Object(refusal)).expect("JSON value serializes")
 }
 
 pub(crate) fn gateway_request(
@@ -1361,6 +1368,28 @@ mod tests {
         assert_eq!(
             tune_refusal_json(r#"{"error":{"code":"same_harness","message":"omit --harness"}}"#),
             r#"{"code":"same_harness","message":"omit --harness","ok":false}"#
+        );
+    }
+
+    #[test]
+    fn tune_refusals_preserve_verified_runtime_and_cleanup_fields() {
+        let refusal = tune_refusal_json(
+            r#"{"error":{"code":"runtime_config_mismatch","message":"readback differed","model":"gpt-5.6-sol","effort":"high","projectionCommitted":false,"cleanupStatus":"unverified","lifecycleEventId":"le_123","warnings":["candidate close unverified"]}}"#,
+        );
+
+        assert_eq!(
+            serde_json::from_str::<Value>(&refusal).unwrap(),
+            serde_json::json!({
+                "ok": false,
+                "code": "runtime_config_mismatch",
+                "message": "readback differed",
+                "model": "gpt-5.6-sol",
+                "effort": "high",
+                "projectionCommitted": false,
+                "cleanupStatus": "unverified",
+                "lifecycleEventId": "le_123",
+                "warnings": ["candidate close unverified"]
+            })
         );
     }
 

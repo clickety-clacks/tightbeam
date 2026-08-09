@@ -57,6 +57,8 @@ defmodule Tightbeam.CliIntegrationTest do
     # did not.
     :ok = Tightbeam.Schema.ensure_all(db)
 
+    register_hosts(db, %{"testhost" => %{ssh: nil, base_dir: base_dir, cli_bin: nil}})
+
     {:ok, _} =
       DB.query(
         db,
@@ -105,12 +107,20 @@ defmodule Tightbeam.CliIntegrationTest do
     test_pid = self()
 
     handlers =
-      Map.new(real_handlers, fn {verb, handler} ->
-        {verb,
-         fn call ->
-           send(test_pid, {:cli_call, call})
-           handler.(call)
-         end}
+      Map.new(real_handlers, fn
+        {"tune", _handler} ->
+          {"tune",
+           fn call ->
+             send(test_pid, {:cli_call, call})
+             %{ok: false, code: "same_harness", message: "omit --harness"}
+           end}
+
+        {verb, handler} ->
+          {verb,
+           fn call ->
+             send(test_pid, {:cli_call, call})
+             handler.(call)
+           end}
       end)
 
     router_opts =
@@ -195,6 +205,36 @@ defmodule Tightbeam.CliIntegrationTest do
                       origin: "agent:cli-holder",
                       session_key: "cli-worker",
                       params: %{setting: "set_harness", harness: "claude", model: "fable"}
+                    }}
+
+    {_effort, 1} =
+      System.cmd(
+        ctx.binary,
+        ["tune", "--session", ctx.worker.session_key, "--effort", "high"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "tune",
+                      session_key: "cli-worker",
+                      params: %{setting: "set_reasoning", reasoningLevel: "high"}
+                    }}
+
+    {_fast, 1} =
+      System.cmd(
+        ctx.binary,
+        ["tune", "--session", ctx.worker.session_key, "--fast", "on"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "tune",
+                      session_key: "cli-worker",
+                      params: %{setting: "set_fast_mode", fastMode: "on"}
                     }}
 
     {usage, 1} =

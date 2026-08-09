@@ -847,7 +847,7 @@ defmodule Tightbeam.Wire.Router do
         json(conn, success_status, shape.(result))
 
       {:error, result} ->
-        error(conn, error_status(result[:code]), result[:code], result[:message])
+        dispatch_error(conn, call, error_status(result[:code]), result)
 
       {:decision_pending, decision_request_id} ->
         decision_pending(conn, decision_request_id)
@@ -1003,7 +1003,11 @@ defmodule Tightbeam.Wire.Router do
   # `:reviews_assignment_id`"). Underscoring alone yields `:reviews`, which no
   # handler reads, so the link silently never landed.
   @param_aliases %{
-    "assign" => %{reviews: :reviews_assignment_id}
+    "assign" => %{reviews: :reviews_assignment_id},
+    "tune" => %{
+      reasoning_level: :reasoningLevel,
+      fast_mode: :fastMode
+    }
   }
 
   @doc false
@@ -1032,6 +1036,14 @@ defmodule Tightbeam.Wire.Router do
   defp error(conn, status, code, message \\ nil) do
     detail = %{"code" => code} |> put_optional("message", message)
     json(conn, status, %{"error" => detail})
+  end
+
+  defp dispatch_error(conn, %{verb: "tune"}, status, result) do
+    json(conn, status, %{"error" => Map.delete(result, :ok)})
+  end
+
+  defp dispatch_error(conn, _call, status, result) do
+    error(conn, status, result[:code], result[:message])
   end
 
   defp put_optional(map, _key, nil), do: map
