@@ -248,6 +248,24 @@ pub enum Command {
         setting: String,
         value: String,
     },
+    HostEnvSet {
+        identity: Identity,
+        host: String,
+        harness: String,
+        name: String,
+        value: String,
+    },
+    HostEnvList {
+        identity: Identity,
+        host: Option<String>,
+        harness: Option<String>,
+    },
+    HostEnvUnset {
+        identity: Identity,
+        host: String,
+        harness: String,
+        name: String,
+    },
     HarnessProcesses {
         identity: Identity,
     },
@@ -482,6 +500,13 @@ COMMANDS:
       created directly and becomes admin by the existing cold-start rule.
   config get default-archetype                   read the default spawn archetype
   config set default-archetype <name>            set the default spawn archetype
+  host-env-set --host <host> --harness <harness> NAME=VALUE
+      Set one host- and harness-scoped environment overlay. The result states
+      when the adapter will observe the new value.
+  host-env-list [--host <host>] [--harness <harness>]
+      List environment overlays, optionally filtered by exact host and harness.
+  host-env-unset --host <host> --harness <harness> NAME
+      Remove one exact environment overlay.
   harness-process list
       List the durable harness launch ledger, newest launch first.
 
@@ -1354,6 +1379,9 @@ fn parse_with_optional_catalog(
             })
         }
         "config" => parse_config(&parsed, flags),
+        "host-env-set" => parse_host_env_set(&parsed, flags),
+        "host-env-list" => parse_host_env_list(&parsed, flags),
+        "host-env-unset" => parse_host_env_unset(&parsed, flags),
         "update-clients" => {
             if parsed.positional.len() != 1 {
                 return Err("usage: tightbeam update-clients --as-user <adminUserId>".to_owned());
@@ -1396,9 +1424,60 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
         )),
     }
+}
+
+fn parse_host_env_set(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Command, String> {
+    let usage = "usage: tightbeam host-env-set --host <host> --harness <harness> NAME=VALUE";
+    let assignment = parsed
+        .positional
+        .get(1)
+        .filter(|_| parsed.positional.len() == 2)
+        .ok_or_else(|| usage.to_owned())?;
+    let (name, value) = assignment.split_once('=').ok_or_else(|| usage.to_owned())?;
+
+    Ok(Command::HostEnvSet {
+        identity: identity(flags)?,
+        host: nonempty(flags, "host").ok_or_else(|| usage.to_owned())?,
+        harness: nonempty(flags, "harness").ok_or_else(|| usage.to_owned())?,
+        name: name.to_owned(),
+        value: value.to_owned(),
+    })
+}
+
+fn parse_host_env_list(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Command, String> {
+    if parsed.positional.len() != 1 {
+        return Err(
+            "usage: tightbeam host-env-list [--host <host>] [--harness <harness>]".to_owned(),
+        );
+    }
+
+    Ok(Command::HostEnvList {
+        identity: identity(flags)?,
+        host: nonempty(flags, "host"),
+        harness: nonempty(flags, "harness"),
+    })
+}
+
+fn parse_host_env_unset(
+    parsed: &Flags,
+    flags: &HashMap<String, String>,
+) -> Result<Command, String> {
+    let usage = "usage: tightbeam host-env-unset --host <host> --harness <harness> NAME";
+    let name = parsed
+        .positional
+        .get(1)
+        .filter(|_| parsed.positional.len() == 2)
+        .ok_or_else(|| usage.to_owned())?;
+
+    Ok(Command::HostEnvUnset {
+        identity: identity(flags)?,
+        host: nonempty(flags, "host").ok_or_else(|| usage.to_owned())?,
+        harness: nonempty(flags, "harness").ok_or_else(|| usage.to_owned())?,
+        name: name.clone(),
+    })
 }
 
 fn parse_harness_process(
@@ -1577,6 +1656,94 @@ mod tests {
         );
     }
 
+    #[test]
+    fn host_env_commands_parse_exact_keys_and_preserve_values() {
+        assert_eq!(
+            parse(strings(&[
+                "host-env-set",
+                "--host",
+                "gibson",
+                "--harness",
+                "claude",
+                "EXAMPLE_OVERLAY_VAR=value=with=equals",
+                "--as",
+                "operator",
+            ])),
+            Ok(Command::HostEnvSet {
+                identity: Identity::Role("operator".to_owned()),
+                host: "gibson".to_owned(),
+                harness: "claude".to_owned(),
+                name: "EXAMPLE_OVERLAY_VAR".to_owned(),
+                value: "value=with=equals".to_owned(),
+            })
+        );
+
+        assert_eq!(
+            parse(strings(&[
+                "host-env-list",
+                "--host",
+                "gibson",
+                "--harness",
+                "claude",
+                "--as-user",
+                "flynn",
+            ])),
+            Ok(Command::HostEnvList {
+                identity: Identity::User("flynn".to_owned()),
+                host: Some("gibson".to_owned()),
+                harness: Some("claude".to_owned()),
+            })
+        );
+
+        assert_eq!(
+            parse(strings(&[
+                "host-env-unset",
+                "--host",
+                "gibson",
+                "--harness",
+                "claude",
+                "EXAMPLE_OVERLAY_VAR",
+                "--as-user",
+                "flynn",
+            ])),
+            Ok(Command::HostEnvUnset {
+                identity: Identity::User("flynn".to_owned()),
+                host: "gibson".to_owned(),
+                harness: "claude".to_owned(),
+                name: "EXAMPLE_OVERLAY_VAR".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn host_env_set_requires_host_harness_and_assignment() {
+        for args in [
+            strings(&["host-env-set", "EXAMPLE_OVERLAY_VAR=value"]),
+            strings(&[
+                "host-env-set",
+                "--host",
+                "gibson",
+                "EXAMPLE_OVERLAY_VAR=value",
+            ]),
+            strings(&[
+                "host-env-set",
+                "--host",
+                "gibson",
+                "--harness",
+                "claude",
+                "EXAMPLE_OVERLAY_VAR",
+            ]),
+        ] {
+            assert_eq!(
+                parse(args),
+                Err(
+                    "usage: tightbeam host-env-set --host <host> --harness <harness> NAME=VALUE"
+                        .to_owned()
+                )
+            );
+        }
+    }
+
     /// `--help` was consumed before the command was ever looked at, so every
     /// subcommand answered with the whole manual — the operator asking about one
     /// command got 150 lines and had to find the answer themselves.
@@ -1725,6 +1892,9 @@ mod tests {
                 "doctor",
                 "effort-rule",
                 "harness-process",
+                "host-env-list",
+                "host-env-set",
+                "host-env-unset",
                 "identity",
                 "kungfu",
                 "learn",
@@ -1760,6 +1930,9 @@ mod tests {
             "add-user <userId> [--admin]",
             "config get default-archetype",
             "config set default-archetype <name>",
+            "host-env-set --host <host> --harness <harness> NAME=VALUE",
+            "host-env-list [--host <host>] [--harness <harness>]",
+            "host-env-unset --host <host> --harness <harness> NAME",
             "harness-process list",
             "kungfu list",
         ] {
@@ -2047,7 +2220,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, doctor, assimilate, harness-process".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned())
         );
     }
 

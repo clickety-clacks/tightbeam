@@ -107,9 +107,26 @@ defmodule Tightbeam.Placement do
   )
   """
 
-  @doc "Create the host registry schema."
+  @harness_env_overlays_ddl """
+  CREATE TABLE IF NOT EXISTS harness_env_overlays (
+    host    TEXT NOT NULL,
+    harness TEXT NOT NULL,
+    name    TEXT NOT NULL,
+    value   TEXT NOT NULL,
+    setBy   TEXT NOT NULL,
+    setAt   INTEGER NOT NULL,
+    PRIMARY KEY (host, harness, name)
+  )
+  """
+
+  @env_name ~r/^[A-Z_][A-Z0-9_]*$/
+
+  @doc "Create the placement schema."
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
-  def ensure_schema(db \\ DB), do: DB.execute(db, @hosts_ddl)
+  def ensure_schema(db \\ DB) do
+    with :ok <- DB.execute(db, @hosts_ddl),
+         do: DB.execute(db, @harness_env_overlays_ddl)
+  end
 
   @doc """
   The known hosts map with the gateway's own machine always present under
@@ -151,6 +168,105 @@ defmodule Tightbeam.Placement do
         "host #{host} is not configured#{harness_scope}; run tightbeam assimilate " <>
           "<ssh-dest> --name #{host} --as-user <adminUserId>"
     }
+  end
+
+  @doc "Set one host- and harness-scoped environment overlay after write-time validation."
+  @spec set_env_overlay(
+          DB.server(),
+          String.t(),
+          String.t(),
+          String.t(),
+          String.t(),
+          String.t()
+        ) :: {:ok, map()} | {:error, map()}
+  def set_env_overlay(db, host, harness, name, value, set_by) do
+    with :ok <- valid_env_name(name),
+         {:ok, _module} <- known_harness(harness),
+         :ok <- unreserved_env_name(name) do
+      set_at = System.system_time(:millisecond)
+
+      case DB.transaction(db, fn txn ->
+             if known_host_in_txn?(txn, host) do
+               DB.Txn.q(
+                 txn,
+                 """
+                 INSERT INTO harness_env_overlays (host, harness, name, value, setBy, setAt)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(host, harness, name) DO UPDATE SET
+                   value = excluded.value,
+                   setBy = excluded.setBy,
+                   setAt = excluded.setAt
+                 """,
+                 [host, harness, name, value, set_by, set_at]
+               )
+
+               {:ok,
+                %{
+                  host: host,
+                  harness: harness,
+                  name: name,
+                  value: value,
+                  set_by: set_by,
+                  set_at: set_at
+                }}
+             else
+               denial = unknown_host_denial(host, harness)
+
+               {:error, %{denial | message: "unknown_host rule: " <> denial.message}}
+             end
+           end) do
+        {:ok, result} -> result
+        {:error, error} -> raise error
+      end
+    end
+  end
+
+  @doc "List stored overlay rows, optionally filtered by exact host and harness."
+  @spec env_overlays(DB.server(), String.t() | nil, String.t() | nil) :: [map()]
+  def env_overlays(db, host \\ nil, harness \\ nil) do
+    {where, params} =
+      case {host, harness} do
+        {nil, nil} -> {"", []}
+        {host, nil} -> {" WHERE host = ?1", [host]}
+        {nil, harness} -> {" WHERE harness = ?1", [harness]}
+        {host, harness} -> {" WHERE host = ?1 AND harness = ?2", [host, harness]}
+      end
+
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT host, harness, name, value, setBy, setAt FROM harness_env_overlays" <>
+          where <> " ORDER BY host, harness, name",
+        params
+      )
+
+    Enum.map(rows, fn [row_host, row_harness, name, value, set_by, set_at] ->
+      %{
+        host: row_host,
+        harness: row_harness,
+        name: name,
+        value: value,
+        set_by: set_by,
+        set_at: set_at
+      }
+    end)
+  end
+
+  @doc "Remove one exact overlay row."
+  @spec unset_env_overlay(DB.server(), String.t(), String.t(), String.t()) :: map()
+  def unset_env_overlay(db, host, harness, name) do
+    {:ok, removed} =
+      DB.transaction(db, fn txn ->
+        DB.Txn.q(
+          txn,
+          "DELETE FROM harness_env_overlays WHERE host = ?1 AND harness = ?2 AND name = ?3",
+          [host, harness, name]
+        )
+
+        DB.Txn.changes(txn) == 1
+      end)
+
+    %{host: host, harness: harness, name: name, removed: removed}
   end
 
   @doc """
@@ -610,6 +726,63 @@ defmodule Tightbeam.Placement do
     )
   end
 
+  defp valid_env_name(name) when is_binary(name) do
+    if Regex.match?(@env_name, name) do
+      :ok
+    else
+      {:error,
+       %{
+         code: "invalid_env_name",
+         message: "invalid_env_name rule: #{inspect(name)} must match [A-Z_][A-Z0-9_]*"
+       }}
+    end
+  end
+
+  defp valid_env_name(name) do
+    {:error,
+     %{
+       code: "invalid_env_name",
+       message: "invalid_env_name rule: #{inspect(name)} must match [A-Z_][A-Z0-9_]*"
+     }}
+  end
+
+  defp known_harness(wire_name) do
+    case Enum.find(Harness.all(), &(&1.wire_name() == wire_name)) do
+      nil ->
+        {:error,
+         %{
+           code: "unknown_harness",
+           message:
+             "unknown_harness rule: #{inspect(wire_name)} is not registered; expected one of: " <>
+               Enum.map_join(Harness.all(), ", ", & &1.wire_name())
+         }}
+
+      module ->
+        {:ok, module}
+    end
+  end
+
+  defp unreserved_env_name(name) do
+    credential_env_names = Enum.flat_map(Harness.all(), & &1.credential_env_vars())
+
+    if String.starts_with?(name, "TIGHTBEAM_") or
+         name in Tightbeam.Harness.Support.reserved_overlay_env_vars() or
+         name in credential_env_names do
+      {:error,
+       %{
+         code: "reserved_env_name",
+         message: "reserved_env_name rule: Tightbeam owns #{name}; it cannot be an overlay"
+       }}
+    else
+      :ok
+    end
+  end
+
+  defp known_host_in_txn?(txn, host) do
+    host == local_host_name() or
+      DB.Txn.q(txn, "SELECT 1 FROM hosts WHERE name = ?1", [host]) != []
+  end
+
   # No missing-table fallback. A registry table that is not there is a broken
   # substrate, and reading it as "no hosts registered" would deny every spawn
   # while looking like an empty fleet.
@@ -920,12 +1093,19 @@ defmodule Tightbeam.Placement do
     stderr_path =
       Path.join(config.base_dir, "adapter-#{harness}:#{identity_name}@#{host}.stderr.log")
 
-    common_env = [
-      {"TIGHTBEAM_HOME", config.base_dir},
-      {"TIGHTBEAM_MACHINE", host},
-      {"PATH", config.cli_bin <> ":" <> (System.get_env("PATH") || "")},
-      {"TIGHTBEAM_LINEAGE", lineage}
-    ]
+    overlay_env =
+      config
+      |> Map.get(:db, DB)
+      |> env_overlays(host, module.wire_name())
+      |> Enum.map(&{&1.name, &1.value})
+
+    common_env =
+      [
+        {"TIGHTBEAM_HOME", config.base_dir},
+        {"TIGHTBEAM_MACHINE", host},
+        {"PATH", config.cli_bin <> ":" <> (System.get_env("PATH") || "")},
+        {"TIGHTBEAM_LINEAGE", lineage}
+      ] ++ overlay_env
 
     remote_env =
       if host_config.ssh do
@@ -935,7 +1115,10 @@ defmodule Tightbeam.Placement do
           "TIGHTBEAM_URL=#{Application.fetch_env!(:tightbeam, :advertised_url)}",
           "PATH=#{host_config[:cli_bin] || ""}:$PATH",
           "TIGHTBEAM_LINEAGE=#{lineage}"
-        ]
+        ] ++
+          Enum.map(overlay_env, fn {name, value} ->
+            "#{name}=#{Tightbeam.Harness.Support.shell_quote(value)}"
+          end)
       else
         []
       end

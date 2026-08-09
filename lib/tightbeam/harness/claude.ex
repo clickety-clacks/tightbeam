@@ -11,6 +11,10 @@ defmodule Tightbeam.Harness.Claude do
   @adapter_package "claude-agent-acp"
   @adapter_bundle "acp-agent.js"
   @warm_timeout_ms 30_000
+  @credential_env_vars %{
+    subscription: "CLAUDE_CODE_OAUTH_TOKEN",
+    api_key: "ANTHROPIC_API_KEY"
+  }
 
   @api_base "https://api.anthropic.com"
 
@@ -139,6 +143,9 @@ defmodule Tightbeam.Harness.Claude do
   def credential_provider, do: :anthropic
 
   @impl true
+  def credential_env_vars, do: @credential_env_vars |> Map.values() |> Enum.sort()
+
+  @impl true
   def default_model, do: Tightbeam.Model.new("claude-sonnet-5", effort: "medium")
 
   @impl true
@@ -215,8 +222,7 @@ defmodule Tightbeam.Harness.Claude do
   # `fetch!` and no default: a launch that cannot say which kind it is launching
   # is a programming error, and defaulting it would quietly run part of the fleet
   # on the wrong variable.
-  defp credential_env_var(:subscription), do: "CLAUDE_CODE_OAUTH_TOKEN"
-  defp credential_env_var(:api_key), do: "ANTHROPIC_API_KEY"
+  defp credential_env_var(kind), do: Map.fetch!(@credential_env_vars, kind)
 
   # ONE file per provider, holding whichever kind is active, and the name is Claude Code's
   # own: the file is LINKED into the harness home, where the harness reads it directly.

@@ -19,6 +19,9 @@ defmodule Tightbeam.Harness.Fixture do
   def credential_provider, do: :fixture_provider
 
   @impl true
+  def credential_env_vars, do: []
+
+  @impl true
   def default_model, do: Tightbeam.Model.new("fixture-model", effort: "medium")
 
   @impl true

@@ -90,6 +90,20 @@ defmodule Tightbeam.PlacementTest do
     assert hosts["remote"].ssh == "worker"
   end
 
+  test "harness env overlay schema is exact and a fresh store has zero rows", %{db: db} do
+    assert {:ok,
+            [
+              [0, "host", "TEXT", 1, nil, 1],
+              [1, "harness", "TEXT", 1, nil, 2],
+              [2, "name", "TEXT", 1, nil, 3],
+              [3, "value", "TEXT", 1, nil, 0],
+              [4, "setBy", "TEXT", 1, nil, 0],
+              [5, "setAt", "INTEGER", 1, nil, 0]
+            ]} = DB.query(db, "PRAGMA table_info(harness_env_overlays)")
+
+    assert Placement.env_overlays(db) == []
+  end
+
   test "resolve defaults to first allowed host and explains denials" do
     archetype = %{Archetypes.builtin_default() | where: ["work-1", "work-2"]}
     hosts = %{"work-1" => %{ssh: "e", base_dir: "/e"}}
@@ -723,6 +737,126 @@ defmodule Tightbeam.PlacementTest do
     assert {"CODEX_CONFIG", ~s({"bypass_hook_trust":true})} in opts[:env]
     refute Enum.any?(opts[:env], fn {key, _value} -> key == "CODEX_PATH" end)
     refute_receive {:unexpected_sh, _}
+  end
+
+  test "adapter_opts appends a local overlay and absent rows leave env unchanged", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    config = %{
+      base_dir: base_dir,
+      db: db,
+      cwd: "/work",
+      cli_bin: "/local/bin",
+      default_model: Model.new("fable")
+    }
+
+    baseline = Placement.adapter_opts(config, {:claude, "default", "testhost"})[:env]
+    refute {"EXAMPLE_OVERLAY_VAR", "example-local"} in baseline
+
+    assert {:ok, _row} =
+             Placement.set_env_overlay(
+               db,
+               "testhost",
+               "claude",
+               "EXAMPLE_OVERLAY_VAR",
+               "example-local",
+               "agent:test"
+             )
+
+    assert Placement.adapter_opts(config, {:claude, "default", "testhost"})[:env] ==
+             baseline ++ [{"EXAMPLE_OVERLAY_VAR", "example-local"}]
+  end
+
+  test "adapter_opts appends an ssh overlay to remote_env", %{base_dir: base_dir, db: db} do
+    Application.put_env(:tightbeam, :advertised_url, "http://gateway.example:4000")
+
+    assert {:ok, _} =
+             Placement.register_host(db, "worker", %{
+               ssh: "codex@worker",
+               base_dir: "/srv/tb",
+               cli_bin: "/srv/tb/bin"
+             })
+
+    assert {:ok, _row} =
+             Placement.set_env_overlay(
+               db,
+               "worker",
+               "codex",
+               "EXAMPLE_OVERLAY_VAR",
+               "example remote",
+               "user:operator"
+             )
+
+    sh = fn command ->
+      if Enum.any?(command, &String.contains?(&1, "credential-harvest")) and
+           Enum.any?(command, &String.contains?(&1, "cat")),
+         do: {"", 42},
+         else: {"", 0}
+    end
+
+    config = %{
+      base_dir: base_dir,
+      db: db,
+      cwd: "/work",
+      cli_bin: "/local/bin",
+      default_model: Model.new("fable"),
+      sh: sh
+    }
+
+    command = Placement.adapter_opts(config, {:codex, "default", "worker"})[:cmd]
+    assignment = "EXAMPLE_OVERLAY_VAR='example remote'"
+    assert assignment in command
+
+    assert Enum.find_index(command, &(&1 == assignment)) >
+             Enum.find_index(command, &String.starts_with?(&1, "TIGHTBEAM_LINEAGE="))
+  end
+
+  test "an overlay is isolated by both host and harness", %{base_dir: base_dir, db: db} do
+    Application.put_env(:tightbeam, :advertised_url, "http://gateway.example:4000")
+
+    for host <- ["gibson", "other-host"] do
+      assert {:ok, _} =
+               Placement.register_host(db, host, %{
+                 ssh: host,
+                 base_dir: "/srv/#{host}",
+                 cli_bin: "/srv/#{host}/bin"
+               })
+    end
+
+    assert {:ok, _row} =
+             Placement.set_env_overlay(
+               db,
+               "gibson",
+               "claude",
+               "EXAMPLE_OVERLAY_VAR",
+               "isolated",
+               "user:operator"
+             )
+
+    sh = fn command ->
+      if Enum.any?(command, &String.contains?(&1, "credential-harvest")) and
+           Enum.any?(command, &String.contains?(&1, "cat")),
+         do: {"", 42},
+         else: {"", 0}
+    end
+
+    config = %{
+      base_dir: base_dir,
+      db: db,
+      cwd: "/work",
+      cli_bin: "/local/bin",
+      default_model: Model.new("fable"),
+      sh: sh
+    }
+
+    gibson_claude = Placement.adapter_opts(config, {:claude, "default", "gibson"})[:cmd]
+    gibson_codex = Placement.adapter_opts(config, {:codex, "default", "gibson"})[:cmd]
+    other_claude = Placement.adapter_opts(config, {:claude, "default", "other-host"})[:cmd]
+
+    assert "EXAMPLE_OVERLAY_VAR='isolated'" in gibson_claude
+    refute Enum.any?(gibson_codex, &String.starts_with?(&1, "EXAMPLE_OVERLAY_VAR="))
+    refute Enum.any?(other_claude, &String.starts_with?(&1, "EXAMPLE_OVERLAY_VAR="))
   end
 
   test "adapter_opts prepares a local codex gate probe with the trust-bypass CODEX_CONFIG", %{

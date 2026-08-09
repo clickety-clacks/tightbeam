@@ -2558,6 +2558,124 @@ defmodule Tightbeam.GatewayTest do
              "Run on #{machine}: tightbeam onboard anthropic --as-user <userId>"
   end
 
+  test "host env verbs set, list, and unset one identity-attributed row with explicit timing",
+       ctx do
+    handlers = Gateway.handlers(%{db: ctx.db})
+    host = Placement.local_host_name()
+
+    set =
+      handlers["host-env-set"].(%{
+        origin: "agent:operator",
+        params: %{
+          host: host,
+          harness: "claude",
+          name: "EXAMPLE_OVERLAY_VAR",
+          value: "example"
+        }
+      })
+
+    assert set.host == host
+    assert set.harness == "claude"
+    assert set.name == "EXAMPLE_OVERLAY_VAR"
+    assert set.value == "example"
+    assert set.set_by == "agent:operator"
+    assert is_integer(set.set_at)
+    assert set.effect == "takes effect on next claude adapter start on #{host}"
+
+    assert %{overlays: [listed]} =
+             handlers["host-env-list"].(%{
+               origin: "agent:operator",
+               params: %{host: host, harness: "claude"}
+             })
+
+    assert listed == Map.delete(set, :effect)
+
+    assert %{host: ^host, harness: "claude", name: "EXAMPLE_OVERLAY_VAR", removed: true} =
+             handlers["host-env-unset"].(%{
+               origin: "agent:operator",
+               params: %{host: host, harness: "claude", name: "EXAMPLE_OVERLAY_VAR"}
+             })
+
+    assert %{overlays: []} =
+             handlers["host-env-list"].(%{origin: "agent:operator", params: %{}})
+  end
+
+  test "host-env-set names every reserved and malformed boundary refusal", ctx do
+    set = Gateway.handlers(%{db: ctx.db})["host-env-set"]
+    host = Placement.local_host_name()
+
+    declared_credentials =
+      Tightbeam.Harness.all()
+      |> Enum.flat_map(& &1.credential_env_vars())
+
+    reserved_names =
+      ([
+         "TIGHTBEAM_EXAMPLE",
+         "PATH",
+         "CLAUDE_CONFIG_DIR",
+         "CODEX_HOME",
+         "TIGHTBEAM_URL"
+       ] ++ declared_credentials)
+      |> Enum.uniq()
+
+    for name <- reserved_names do
+      assert %{code: "reserved_env_name", message: message} =
+               set.(%{
+                 origin: "user:operator",
+                 params: %{
+                   host: host,
+                   harness: "claude",
+                   name: name,
+                   value: "example"
+                 }
+               })
+
+      assert message =~ "reserved_env_name rule"
+      assert message =~ name
+    end
+
+    assert %{code: "invalid_env_name", message: invalid_message} =
+             set.(%{
+               origin: "user:operator",
+               params: %{
+                 host: host,
+                 harness: "claude",
+                 name: "lowercase",
+                 value: "example"
+               }
+             })
+
+    assert invalid_message =~ "invalid_env_name rule"
+
+    assert %{code: "unknown_host", message: host_message} =
+             set.(%{
+               origin: "user:operator",
+               params: %{
+                 host: "missing-host",
+                 harness: "claude",
+                 name: "EXAMPLE_OVERLAY_VAR",
+                 value: "example"
+               }
+             })
+
+    assert host_message =~ "unknown_host rule"
+    assert host_message =~ "host missing-host is not configured for claude"
+
+    assert %{code: "unknown_harness", message: harness_message} =
+             set.(%{
+               origin: "user:operator",
+               params: %{
+                 host: host,
+                 harness: "unknown-harness",
+                 name: "EXAMPLE_OVERLAY_VAR",
+                 value: "example"
+               }
+             })
+
+    assert harness_message =~ "unknown_harness rule"
+    assert Placement.env_overlays(ctx.db) == []
+  end
+
   test "update-clients refuses non-admin callers and enumerates satellites for admins", ctx do
     register_hosts(ctx.db, %{
       "alpha" => %{
