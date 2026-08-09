@@ -25,6 +25,32 @@ defmodule Tightbeam.WakesTest do
 
     assert wake.wake_id =~ ~r/^w_[0-9a-f-]{36}$/
     assert [^wake] = Wakes.list_pending(db)
+
+    caller_supplied_event = %{
+      wake_id: wake.wake_id,
+      expected_origin: "agent:a",
+      requester: %{kind: "session", id: "test-session"},
+      reason_kind: "requester_withdrew",
+      causal_source: %{
+        kind: "verb_call",
+        id: "1",
+        accepted_event: %{
+          origin: "agent:a",
+          session_key: "test-session",
+          principal: {:session, "test-session"},
+          payload: %{cancel_wake_id: wake.wake_id, canceled: true},
+          ts: 1
+        }
+      },
+      outcome: %{kind: "no_replacement"}
+    }
+
+    assert {:ok, false} =
+             DB.transaction(db, fn txn -> Wakes.cancel_in_txn(txn, caller_supplied_event) end)
+
+    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM events")
+    assert Wakes.get(db, wake.wake_id).state == "pending"
+
     refute public_cancel(db, wake.wake_id, "agent:b")
     assert public_cancel(db, wake.wake_id, "agent:a")
     assert Wakes.get(db, wake.wake_id).state == "canceled"
@@ -529,7 +555,6 @@ defmodule Tightbeam.WakesTest do
        ) do
     principal = requester_principal(requester)
     session_key = if requester.kind == "session", do: requester.id
-    payload = %{cancel_wake_id: wake_id, canceled: true}
 
     case DB.transaction(db, fn txn ->
            if Wakes.cancel_in_txn(txn, %{
@@ -537,13 +562,13 @@ defmodule Tightbeam.WakesTest do
                 expected_origin: expected_origin,
                 requester: requester,
                 reason_kind: "requester_withdrew",
-                causal_source: %{kind: "verb_call", id: nil},
-                accepted_event: %{
-                  verb: "wake",
-                  origin: expected_origin,
-                  session_key: session_key,
-                  payload: payload,
-                  principal: principal
+                causal_source: %{
+                  kind: "verb_call",
+                  accepted_event: %{
+                    origin: expected_origin,
+                    session_key: session_key,
+                    principal: principal
+                  }
                 },
                 outcome: %{kind: "no_replacement"}
               }) do
