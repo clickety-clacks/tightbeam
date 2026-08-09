@@ -3773,13 +3773,19 @@ defmodule Tightbeam.Gateway do
             # Composed against the NEW harness, exactly as `set_model` composes
             # against the current one: the wire names a vendor model, and the
             # effort tier — owned by the reasoning picker — is carried over or
-            # chosen from what the new harness offers (#69).
+            # chosen from what the new harness offers (#69). When the wire names
+            # no model, the destination harness owns the default.
             model =
               compose_model_selection(
                 session.host,
                 harness,
                 session.model,
-                resolve_selection(session.host, harness, p, config.default_model)
+                resolve_selection(
+                  session.host,
+                  harness,
+                  p,
+                  if(from_default?(p), do: module.default_model(), else: config.default_model)
+                )
               )
 
             with :ok <- validate_credential(config, harness, session.host),

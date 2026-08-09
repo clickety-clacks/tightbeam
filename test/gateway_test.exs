@@ -4973,6 +4973,33 @@ defmodule Tightbeam.GatewayTest do
     refute Enum.any?(advertised, &String.contains?(&1, "["))
   end
 
+  test "set_harness chooses the destination default when restoring Claude to Codex", ctx do
+    base_dir = role_test_base("harness-destination-default")
+    codex_auth = Path.join([base_dir, "auth", "codex"])
+    File.mkdir_p!(codex_auth)
+    File.write!(Path.join(codex_auth, "auth.json"), "test-token")
+    Archetypes.load!(base_dir)
+
+    config = gateway_config(base_dir, ctx.db, 0)
+
+    start_supervised!(%{
+      id: :harness_destination_default_conn_registry,
+      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+    })
+
+    start_lane!(ctx.db, "k1")
+
+    assert %{ok: true, harness: "codex", model: "gpt-5.6-sol", effort: "medium"} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: "user:flynn",
+               session_key: "k1",
+               params: %{setting: "set_harness", harness: "codex"}
+             })
+
+    assert %{harness: "codex", provider: "openai", model: model} = Org.get(ctx.db, "k1")
+    assert model == Model.new("gpt-5.6-sol", effort: "medium")
+  end
+
   test "set_harness keeps an overridden identity name and projects the new harness home", ctx do
     base_dir = role_test_base("harness-override")
     codex_auth = Path.join([base_dir, "auth", "codex"])
