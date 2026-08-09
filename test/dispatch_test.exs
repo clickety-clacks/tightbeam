@@ -25,6 +25,64 @@ defmodule Tightbeam.DispatchTest do
              EventLog.events_after(db, 0, 10)
   end
 
+  test "transactional accepted result reuses its committed event without a second append", %{
+    db: db
+  } do
+    call = %{
+      verb: "cancel-wake",
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      session_key: "s1",
+      params: %{wake_id: "wake-1"}
+    }
+
+    handlers = %{
+      "cancel-wake" => fn _call ->
+        {:ok, envelope} =
+          DB.transaction(db, fn txn ->
+            event_id =
+              EventLog.append_event_in_txn(
+                txn,
+                "verb",
+                "cancel-wake",
+                "user:flynn",
+                "s1",
+                %{canceled: true},
+                {:user, "flynn"},
+                1
+              )
+
+            {:accepted_in_txn, event_id, %{canceled: true}}
+          end)
+
+        envelope
+      end
+    }
+
+    assert {:ok, %{canceled: true}} = Dispatch.dispatch(db, handlers, call)
+
+    assert [%{id: event_id, kind: "verb", verb: "cancel-wake"}] =
+             EventLog.events_after(db, 0, 10)
+
+    assert event_id > 0
+  end
+
+  test "only the exact transactional accepted result bypasses the ordinary append", %{db: db} do
+    call = %{
+      verb: "cancel-wake",
+      origin: "user:flynn",
+      session_key: "s1",
+      params: %{wake_id: "wake-1"}
+    }
+
+    malformed = {:accepted_in_txn, 1, %{canceled: true, extra: true}}
+    handlers = %{"cancel-wake" => fn _call -> malformed end}
+
+    assert {:ok, ^malformed} = Dispatch.dispatch(db, handlers, call)
+
+    assert [%{kind: "verb", verb: "cancel-wake"}] = EventLog.events_after(db, 0, 10)
+  end
+
   test "onboarding lease identities are returned but not written to the event log", %{db: db} do
     result = %{status: "ready", staging_path: "/tmp/onboard", lease_id: "lease-secret"}
     call = %{verb: "onboard", origin: "user:flynn", session_key: nil, params: %{}}

@@ -53,8 +53,11 @@ defmodule Tightbeam.Dispatch do
             | nil
         }
 
+  @typedoc "An accepted result whose event was committed by the handler transaction."
+  @type accepted_in_txn :: {:accepted_in_txn, pos_integer(), %{canceled: true}}
+
   @typedoc "A handler: pure-ish fun; returns a result map, or %{code: _} to deny."
-  @type handler :: (call() -> map())
+  @type handler :: (call() -> map() | accepted_in_txn())
 
   @type handlers :: %{optional(String.t()) => handler()}
 
@@ -185,6 +188,10 @@ defmodule Tightbeam.Dispatch do
           {:returned, %{code: _} = error} ->
             :ok = EventLog.append_event(db, "denied", verb, origin, session_key, error, principal)
             {:error, error}
+
+          {:returned, {:accepted_in_txn, event_id, %{canceled: true} = result}}
+          when is_integer(event_id) and event_id > 0 and map_size(result) == 1 ->
+            {:ok, result}
 
           {:returned, result} ->
             payload = outcome_payload(verb, call, {:returned, result})
