@@ -1557,6 +1557,109 @@ defmodule Tightbeam.GatewayTest do
     assert Wakes.get(ctx.db, other.wake_id).state == "pending"
   end
 
+  test "assignment liveness calls receive the configured supervision interval", ctx do
+    parent = self()
+
+    assignments_handle = fn _db, verb, call ->
+      send(parent, {:assignment_call, verb, call})
+      %{handled: verb}
+    end
+
+    handlers =
+      "/tmp"
+      |> gateway_config(ctx.db, 0)
+      |> Map.put(:wake_tick_ms, 2_400)
+      |> Map.put(:assignments_handle, assignments_handle)
+      |> Gateway.handlers()
+
+    calls = [
+      {"assign", %{subject: "work"}},
+      {"dispatch", %{subject: "work", brief: "brief"}},
+      {"attest", %{assignment_id: "asg_missing", kind: "progress"}}
+    ]
+
+    for {verb, params} <- calls do
+      call = %{
+        origin: "agent:holder",
+        principal: {:session, "holder"},
+        session_key: "holder",
+        params: params
+      }
+
+      assert handlers[verb].(call) == %{handled: verb}
+      assert_receive {:assignment_call, ^verb, forwarded}
+      assert forwarded.supervision_interval_ms == 2_400
+    end
+  end
+
+  test "terminal assignment calls need no interval and invalid required intervals refuse", ctx do
+    parent = self()
+    tag = make_ref()
+
+    assignments_handle = fn _db, verb, call ->
+      send(parent, {tag, verb, call})
+      %{handled: verb}
+    end
+
+    without_interval =
+      "/tmp"
+      |> gateway_config(ctx.db, 0)
+      |> Map.delete(:wake_tick_ms)
+      |> Map.put(:assignments_handle, assignments_handle)
+      |> Gateway.handlers()
+
+    terminal_calls = [
+      {"attest", %{assignment_id: "asg_missing", kind: "completion"}},
+      {"attest", %{assignment_id: "asg_missing", kind: "surrender"}},
+      {"revoke-assignment", %{assignment_id: "asg_missing"}}
+    ]
+
+    for {verb, params} <- terminal_calls do
+      call = %{
+        origin: "agent:holder",
+        principal: {:session, "holder"},
+        session_key: nil,
+        params: params
+      }
+
+      assert without_interval[verb].(call) == %{handled: verb}
+      assert_receive {^tag, ^verb, forwarded}
+      refute Map.has_key?(forwarded, :supervision_interval_ms)
+    end
+
+    required_calls = [
+      {"assign", %{subject: "work"}},
+      {"dispatch", %{subject: "work", brief: "brief"}},
+      {"attest", %{assignment_id: "asg_missing", kind: "progress"}}
+    ]
+
+    for interval <- [:missing, 0, -1, 1.5],
+        {verb, params} <- required_calls do
+      config =
+        gateway_config("/tmp", ctx.db, 0)
+        |> Map.put(:assignments_handle, assignments_handle)
+        |> then(fn config ->
+          if interval == :missing,
+            do: Map.delete(config, :wake_tick_ms),
+            else: Map.put(config, :wake_tick_ms, interval)
+        end)
+
+      call = %{
+        origin: "agent:holder",
+        principal: {:session, "holder"},
+        session_key: "holder",
+        params: params
+      }
+
+      assert Gateway.handlers(config)[verb].(call) == %{
+               code: "invalid_supervision_interval",
+               message: "wake_tick_ms must be a positive integer"
+             }
+
+      refute_receive {^tag, ^verb, _call}, 0
+    end
+  end
+
   test "role wakes late-bind at fire time and deleted roles fail visibly", ctx do
     base_dir = role_test_base("late-bind")
     config = gateway_config(base_dir, ctx.db, 0)

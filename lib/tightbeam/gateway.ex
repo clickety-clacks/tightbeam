@@ -611,6 +611,7 @@ defmodule Tightbeam.Gateway do
   @spec handlers(config()) :: Tightbeam.Dispatch.handlers()
   def handlers(config) do
     db = Map.get(config, :db, Tightbeam.DB)
+    assignments_handle = Map.get(config, :assignments_handle, &Assignments.__handle__/3)
 
     assignment_change = fn assignment_id, from ->
       emit_assignment_change(db, assignment_id, from)
@@ -917,7 +918,9 @@ defmodule Tightbeam.Gateway do
           |> Map.put(:on_assignment_change, assignment_change)
           |> Map.put(:on_work_item_change, item_change)
 
-        Assignments.__handle__(db, "assign", call)
+        with_supervision_interval(config, call, fn call ->
+          assignments_handle.(db, "assign", call)
+        end)
       end,
       "dispatch" => fn call ->
         call =
@@ -927,29 +930,36 @@ defmodule Tightbeam.Gateway do
           |> Map.put(:effort_config, config)
           |> Map.put(:on_dispatch_delivery, fn delivery, _ -> complete_delivery(db, delivery) end)
 
-        Assignments.__handle__(db, "dispatch", call)
+        with_supervision_interval(config, call, fn call ->
+          assignments_handle.(db, "dispatch", call)
+        end)
       end,
       "attest" => fn call ->
-        Assignments.__handle__(
-          db,
-          "attest",
+        call =
           call
           |> Map.put(:on_assignment_change, assignment_change)
           # Referent verification reaches hosts, so it needs the same placement
           # config (and the same injectable runner) the effort probe uses.
           |> Map.put(:effort_config, config)
-        )
+
+        if call.params[:kind] == "progress" do
+          with_supervision_interval(config, call, fn call ->
+            assignments_handle.(db, "attest", call)
+          end)
+        else
+          assignments_handle.(db, "attest", call)
+        end
       end,
-      "attests" => fn call -> Assignments.__handle__(db, "attests", call) end,
-      "assignment-get" => fn call -> Assignments.__handle__(db, "assignment-get", call) end,
+      "attests" => fn call -> assignments_handle.(db, "attests", call) end,
+      "assignment-get" => fn call -> assignments_handle.(db, "assignment-get", call) end,
       "revoke-assignment" => fn call ->
-        Assignments.__handle__(
+        assignments_handle.(
           db,
           "revoke-assignment",
           Map.put(call, :on_assignment_change, assignment_change)
         )
       end,
-      "assignments" => fn call -> Assignments.__handle__(db, "assignments", call) end,
+      "assignments" => fn call -> assignments_handle.(db, "assignments", call) end,
       "inspect" => fn call -> inspect_result(config, db, call) end,
       "cancel" => fn call -> cancel_result(db, call) end,
       "critical" => fn call -> critical_result(config, db, call) end,
@@ -957,6 +967,19 @@ defmodule Tightbeam.Gateway do
       "tune" => fn call -> tune_result(config, db, call) end,
       "retire" => fn call -> retire_result(config, db, call) end
     }
+  end
+
+  defp with_supervision_interval(config, call, continuation) do
+    case Map.fetch(config, :wake_tick_ms) do
+      {:ok, interval} when is_integer(interval) and interval > 0 ->
+        continuation.(Map.put(call, :supervision_interval_ms, interval))
+
+      _ ->
+        %{
+          code: "invalid_supervision_interval",
+          message: "wake_tick_ms must be a positive integer"
+        }
+    end
   end
 
   # A terminal-disposition handler routes the owner doorbell through the same
