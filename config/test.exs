@@ -23,3 +23,4 @@ config :tightbeam, :autostart, false
 config :tightbeam, :local_host_name, "testhost"
 config :tightbeam, :fixture_harness, true
 config :tightbeam, :test_suite_tmp, suite_tmp
+config :tightbeam, :port, 0
