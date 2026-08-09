@@ -475,7 +475,7 @@ defmodule Tightbeam.Wakes do
          %{
            requester: %{kind: requester_kind, id: requester_id},
            reason_kind: reason_kind,
-           causal_source: %{kind: source_kind, id: source_id},
+           causal_source: %{kind: source_kind} = causal_source,
            outcome: %{kind: outcome_kind} = outcome
          } = command,
          wake,
@@ -486,6 +486,8 @@ defmodule Tightbeam.Wakes do
               source_kind in @source_kinds and
               outcome_kind in ["replacement", "disposition", "no_replacement"] and
               is_binary(requester_id) and requester_id != "" do
+    source_id = Map.get(causal_source, :id)
+
     with :ok <- compatible?(requester_id, reason_kind, source_kind, outcome_kind),
          {:ok, tagged} <- validate_outcome(txn, outcome_kind, outcome, wake, primary),
          {:ok, durable_source_id} <-
@@ -508,7 +510,7 @@ defmodule Tightbeam.Wakes do
   defp validate_cancellation(_txn, _command, _wake, _primary, _canceled_at), do: :error
 
   defp durable_source(txn, _command, source_kind, source_id, wake, _canceled_at)
-       when is_binary(source_id) and source_id != "" do
+       when source_kind != "verb_call" and is_binary(source_id) and source_id != "" do
     case validate_source(txn, source_kind, source_id, wake) do
       :ok -> {:ok, source_id}
       :error -> :error
@@ -520,22 +522,27 @@ defmodule Tightbeam.Wakes do
          %{
            expected_origin: expected_origin,
            requester: requester,
-           accepted_event: %{
-             verb: "wake",
-             origin: event_origin,
-             session_key: session_key,
-             payload: payload,
-             principal: principal
+           causal_source: %{
+             kind: "verb_call",
+             accepted_event:
+               %{
+                 origin: event_origin,
+                 session_key: session_key,
+                 principal: principal
+               } = accepted_event
            }
-         },
+         } = command,
          "verb_call",
          nil,
          wake,
          canceled_at
        ) do
     with true <- event_origin == expected_origin and event_origin == wake.origin,
+         true <- map_size(command.causal_source) == 2,
+         true <- map_size(accepted_event) == 3,
+         true <- is_nil(session_key) or is_binary(session_key),
          true <- requester_principal?(requester, principal),
-         true <- accepted_cancel_payload?(payload, wake.wake_id) do
+         payload = JSON.encode!(%{cancel_wake_id: wake.wake_id, canceled: true}) do
       event_id =
         EventLog.append_event_in_txn(
           txn,
@@ -562,14 +569,6 @@ defmodule Tightbeam.Wakes do
   defp requester_principal?(%{kind: "process", id: id}, {:process, id}), do: true
   defp requester_principal?(_requester, _principal), do: false
 
-  defp accepted_cancel_payload?(payload, wake_id) when is_map(payload) do
-    cancel_wake_id = Map.get(payload, :cancel_wake_id, Map.get(payload, "cancel_wake_id"))
-    canceled = Map.get(payload, :canceled, Map.get(payload, "canceled"))
-    cancel_wake_id == wake_id and canceled == true
-  end
-
-  defp accepted_cancel_payload?(_payload, _wake_id), do: false
-
   defp compatible?(requester_id, reason, source, outcome) do
     {sources, outcomes} = Map.fetch!(@reason_matrix, reason)
 
@@ -588,27 +587,6 @@ defmodule Tightbeam.Wakes do
 
       true ->
         :ok
-    end
-  end
-
-  defp validate_source(txn, "verb_call", source_id, wake) do
-    case Txn.q(
-           txn,
-           "SELECT kind, verb, payload FROM events WHERE CAST(id AS TEXT)=?1",
-           [source_id]
-         ) do
-      [["verb", "wake", payload]] ->
-        case JSON.decode(payload) do
-          {:ok, %{"cancel_wake_id" => wake_id, "canceled" => true}}
-          when wake_id == wake.wake_id ->
-            :ok
-
-          _ ->
-            :error
-        end
-
-      _ ->
-        :error
     end
   end
 
