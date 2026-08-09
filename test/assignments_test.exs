@@ -7,9 +7,11 @@ defmodule Tightbeam.AssignmentsTest do
     DB,
     Dispatch,
     Gateway,
+    Ledger,
     Org,
     Projection,
     Rules,
+    Supervision,
     Wakes,
     WorkItems,
     WorkState
@@ -210,7 +212,10 @@ defmodule Tightbeam.AssignmentsTest do
 
   test "raw dispatch precheck leaves supervision interval validation to the mutation seam", ctx do
     baseline = assignment_count(ctx.db)
-    raw_call = assign_call({:user, "flynn"}, "Gateway will attach interval")
+
+    raw_call =
+      assign_call({:user, "flynn"}, "Gateway will attach interval")
+      |> Map.delete(:supervision_interval_ms)
 
     assert :proceed = Assignments.dispatch_precheck(ctx.db, raw_call)
 
@@ -226,6 +231,96 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert %{code: "invalid_supervision_interval"} =
              Assignments.__handle__(ctx.db, "assign", raw_call)
+  end
+
+  test "same-assignment public cancellation and progress re-drive a forced due entitlement",
+       ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "liveness re-drive"))
+
+    canceled =
+      Wakes.schedule(ctx.db, %{
+        session_key: "holder",
+        origin: "agent:holder",
+        prompt: "withdraw this reminder",
+        due_at: 9_000_000_000_000,
+        assignment_id: assignment.id
+      })
+
+    assert {:ok, {:accepted_in_txn, event_id, %{canceled: true}}} =
+             DB.transaction(ctx.db, fn txn ->
+               Wakes.cancel_in_txn(txn, %{
+                 wake_id: canceled.wake_id,
+                 expected_origin: "agent:holder",
+                 requester: %{kind: "session", id: "holder"},
+                 reason_kind: "requester_withdrew",
+                 causal_source: %{
+                   kind: "verb_call",
+                   accepted_event: %{
+                     origin: "agent:holder",
+                     session_key: "holder",
+                     principal: {:session, "holder"}
+                   }
+                 },
+                 outcome: %{
+                   kind: "no_replacement",
+                   liveness_trigger: %{
+                     kind: "supervision_entitlement",
+                     id: "#{assignment.id}#1"
+                   }
+                 }
+               })
+             end)
+
+    assert is_integer(event_id)
+    assert Wakes.get(ctx.db, canceled.wake_id).state == "canceled"
+
+    {:ok, turn_seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: "holder",
+        message_id: "m_liveness_re_drive",
+        origin: "user:flynn",
+        prompt: "finish the assignment",
+        assignment_id: assignment.id
+      })
+
+    assert {:ok, %{seq: ^turn_seq}} = Ledger.claim_next(ctx.db, "holder", "test")
+    assert :ok = Ledger.finish(ctx.db, turn_seq, "delivered")
+
+    liveness = start_liveness!(ctx)
+
+    first = handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "progress"))
+    first_attest_id = first.attest.id
+    sweep_liveness!(liveness)
+
+    assert %{
+             supervisionGeneration: 2,
+             supervisionBasisKind: "progress",
+             supervisionBasisId: ^first_attest_id
+           } = Supervision.prod_state(ctx.db, assignment.id)
+
+    second = handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "progress"))
+    second_attest_id = second.attest.id
+    sweep_liveness!(liveness)
+
+    assert %{
+             supervisionGeneration: 3,
+             supervisionBasisKind: "progress",
+             supervisionBasisId: ^second_attest_id
+           } = Supervision.prod_state(ctx.db, assignment.id)
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE supervision_entitlements SET dueAt=0 WHERE assignmentId=?1",
+               [assignment.id]
+             )
+
+    sweep_liveness!(liveness)
+
+    assert [%{assignment_id: assignment_id, origin: "process:tightbeam", state: "pending"}] =
+             Wakes.list_pending(ctx.db)
+
+    assert assignment_id == assignment.id
   end
 
   test "dispatch atomically opens an assignment and enqueues its brief with the card id", ctx do
@@ -1162,7 +1257,11 @@ defmodule Tightbeam.AssignmentsTest do
     {:ok, _} = DB.query(ctx.db, "DROP TABLE events")
 
     assert_raise MatchError, fn ->
-      Dispatch.dispatch(ctx.db, ctx.handlers, assign_call({:session, "holder"}, "committed"))
+      Dispatch.dispatch(
+        ctx.db,
+        ctx.handlers,
+        Map.put(assign_call({:session, "holder"}, "committed"), :supervision_interval_ms, 1_000)
+      )
     end
 
     assert {:ok, [[0]]} =
@@ -1203,7 +1302,13 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   defp dispatch!(ctx, call) do
-    assert {:ok, result} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
+    assert {:ok, result} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               Map.put_new(call, :supervision_interval_ms, 1_000)
+             )
+
     result
   end
 
@@ -1234,7 +1339,7 @@ defmodule Tightbeam.AssignmentsTest do
       idempotency_key: key,
       work_item_id: work_item_id
     })
-    |> Map.merge(%{target_role: nil, role_fallback: false})
+    |> Map.merge(%{target_role: nil, role_fallback: false, supervision_interval_ms: 1_000})
   end
 
   defp work_item_call(verb, principal, params), do: call(verb, principal, nil, params)
@@ -1265,6 +1370,24 @@ defmodule Tightbeam.AssignmentsTest do
   defp origin({:user, user}), do: "user:#{user}"
   defp origin({:process, process}), do: "process:#{process}"
   defp origin(nil), do: "agent:declared"
+
+  defp start_liveness!(ctx) do
+    name = :"assignments_liveness_#{System.unique_integer([:positive])}"
+
+    start_supervised!(
+      {Supervision,
+       db: ctx.db, handlers: ctx.handlers, prod_limit: 2, sweep_ms: 1_000, name: name}
+    )
+
+    :sys.get_state(name)
+    name
+  end
+
+  defp sweep_liveness!(name) do
+    Supervision.request_sweep(name)
+    :sys.get_state(name)
+    :ok
+  end
 
   defp session(db, key, owner, overrides \\ %{}) do
     input = %{

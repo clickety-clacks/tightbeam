@@ -200,7 +200,7 @@ defmodule Tightbeam.WorkStateTest do
         subscriptions: MapSet.new(["work_state"])
       })
 
-    handlers = Gateway.handlers(%{db: ctx.db})
+    handlers = Gateway.handlers(%{db: ctx.db, wake_tick_ms: 1_000})
     item = create_item(ctx, "Emitted")
 
     call =
@@ -245,7 +245,7 @@ defmodule Tightbeam.WorkStateTest do
         subscriptions: MapSet.new(["work_state"])
       })
 
-    handlers = Gateway.handlers(%{db: ctx.db})
+    handlers = Gateway.handlers(%{db: ctx.db, wake_tick_ms: 1_000})
     assignment = handlers["assign"].(assign_call("holder", "closed"))
     handlers["attest"].(attest_call(assignment.id, "completion", "holder"))
     flush_pushes()
@@ -266,7 +266,7 @@ defmodule Tightbeam.WorkStateTest do
     assignment = assign(ctx, "holder", "failure", item.id)
     assert :ok = stop_supervised(ConnRegistry)
 
-    handlers = Gateway.handlers(%{db: ctx.db})
+    handlers = Gateway.handlers(%{db: ctx.db, wake_tick_ms: 1_000})
 
     assert %{assignment: %{id: assignment_id}, attest: %{kind: "progress"}} =
              handlers["attest"].(attest_call(assignment.id, "progress", "holder"))
@@ -297,7 +297,7 @@ defmodule Tightbeam.WorkStateTest do
         subscriptions: MapSet.new(["work_state"])
       })
 
-    handlers = Gateway.handlers(%{db: ctx.db})
+    handlers = Gateway.handlers(%{db: ctx.db, wake_tick_ms: 1_000})
     item = create_item(ctx, "Original")
     assignment_snapshot = WorkState.list(ctx.db, %{state: "all"})
     item_snapshot = WorkState.item_detail(ctx.db, item.id)
@@ -386,7 +386,11 @@ defmodule Tightbeam.WorkStateTest do
     parent = self()
 
     handlers =
-      Gateway.handlers(%{db: ctx.db, on_retired: fn key -> send(parent, {:retired, key}) end})
+      Gateway.handlers(%{
+        db: ctx.db,
+        wake_tick_ms: 1_000,
+        on_retired: fn key -> send(parent, {:retired, key}) end
+      })
 
     open = handlers["assign"].(assign_call("retiring", "open"))
     active = handlers["assign"].(assign_call("retiring", "active"))
