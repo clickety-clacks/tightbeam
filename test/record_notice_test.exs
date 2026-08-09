@@ -143,7 +143,7 @@ defmodule Tightbeam.RecordNoticeTest do
   end
 
   test "a retired session is not an audience", ctx do
-    Org.retire(ctx.db, "work")
+    Org.retire(ctx.db, "work", "user:flynn", 1_000)
 
     capture_log(fn ->
       :ok =

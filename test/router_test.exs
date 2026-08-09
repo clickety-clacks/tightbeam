@@ -320,6 +320,7 @@ defmodule Tightbeam.Wire.RouterTest do
         session_key: "holder",
         target_role: nil,
         role_fallback: false,
+        supervision_interval_ms: 1_000,
         params: %{subject: "Build it", work_item_id: item.id}
       })
 
@@ -1047,7 +1048,7 @@ defmodule Tightbeam.Wire.RouterTest do
     retired = create_session(ctx.db, "assign-retired", "flynn")
     Roles.create!(ctx.db, "bound-assignment", "flynn", holder.session_key)
     Roles.create!(ctx.db, "fallback-assignment", "flynn", nil)
-    Org.retire(ctx.db, retired.session_key)
+    Org.retire(ctx.db, retired.session_key, "user:flynn", 1_000)
 
     assert dispatch_cli(ctx, "tbc_test", %{
              verb: "assign",
@@ -1399,7 +1400,7 @@ defmodule Tightbeam.Wire.RouterTest do
     assert ambiguous.resp_body =~ "beta"
 
     assert dispatch_cli(ctx, "tbs_unknown", %{verb: "inspect"}).status == 401
-    Org.retire(ctx.db, holder.session_key)
+    Org.retire(ctx.db, holder.session_key, "user:flynn", 1_000)
     assert dispatch_cli(ctx, holder.cli_token, %{verb: "inspect"}).status == 401
 
     {:ok, principals} =

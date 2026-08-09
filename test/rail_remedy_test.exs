@@ -351,7 +351,7 @@ defmodule Tightbeam.RailRemedyTest do
 
     assert %{session_key: ^producer} = Wakes.get(ctx.db, first_wake_id)
 
-    Org.retire(ctx.db, producer)
+    Org.retire(ctx.db, producer, "user:flynn", 1_000)
 
     assert {:error, %{producer: ^producer}} =
              Dispatch.dispatch(ctx.db, ctx.handlers, completion_call(assignment.id))
@@ -1021,6 +1021,7 @@ defmodule Tightbeam.RailRemedyTest do
       session_key: ctx.holder.session_key,
       target_role: nil,
       role_fallback: false,
+      supervision_interval_ms: 1_000,
       params: %{subject: subject, idempotency_key: nil}
     })
   end

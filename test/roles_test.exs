@@ -7,14 +7,16 @@ defmodule Tightbeam.RolesTest do
   setup do
     db = :"roles_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
-    :ok = Org.ensure_schema(db)
-    :ok = Roles.ensure_schema(db)
+    :ok = Tightbeam.Schema.ensure_all(db)
     %{db: db}
   end
 
   test "create validates names, uniqueness, and active bindings", %{db: db} do
     active = session(db, "agent:active", "flynn")
-    retired = session(db, "agent:retired", "flynn") |> then(&Org.retire(db, &1.session_key))
+
+    retired =
+      session(db, "agent:retired", "flynn")
+      |> then(&Org.retire(db, &1.session_key, "user:flynn", 1_000))
 
     assert %{name: "builder", bound_session_key: nil, owner_user_id: "flynn"} =
              Roles.create!(db, "builder", "flynn", nil)
@@ -44,7 +46,11 @@ defmodule Tightbeam.RolesTest do
 
   test "bind, remove, get, and sorted list return every documented branch", %{db: db} do
     session(db, "agent:a", "flynn")
-    retired = session(db, "agent:r", "flynn") |> then(&Org.retire(db, &1.session_key))
+
+    retired =
+      session(db, "agent:r", "flynn")
+      |> then(&Org.retire(db, &1.session_key, "user:flynn", 1_000))
+
     Roles.create!(db, "zeta", "flynn", nil)
     Roles.create!(db, "alpha", "flynn", nil)
 
@@ -75,7 +81,7 @@ defmodule Tightbeam.RolesTest do
     assert {:ok, active.session_key, false} == Roles.resolve(db, "held")
     assert {:ok, main, true} == Roles.resolve(db, "unbound")
 
-    Org.retire(db, stale.session_key)
+    Org.retire(db, stale.session_key, "user:flynn", 1_000)
     assert {:ok, main, true} == Roles.resolve(db, "stale")
 
     {:ok, _} = DB.query(db, "DELETE FROM sessions WHERE sessionKey = ?1", [stale.session_key])
