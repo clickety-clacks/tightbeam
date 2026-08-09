@@ -52,6 +52,18 @@ defmodule Tightbeam.WakesTest do
     assert Wakes.get(db, wake.wake_id).state == "pending"
 
     refute public_cancel(db, wake.wake_id, "agent:b")
+    assert cancellation_event_count(db, wake.wake_id) == 0
+
+    :ok =
+      EventLog.append_event(
+        db,
+        "denied",
+        "wake",
+        "agent:seed",
+        nil,
+        %{seed: true},
+        {:process, "tightbeam"}
+      )
 
     assert {:accepted_in_txn, event_id, %{canceled: true}} =
              public_cancel(db, wake.wake_id, "agent:a")
@@ -69,8 +81,53 @@ defmodule Tightbeam.WakesTest do
              )
 
     assert causal_source_id == Integer.to_string(event_id)
+
+    assert {:ok, [[carrier_rowid]]} =
+             DB.query(db, "SELECT rowid FROM wake_cancellations WHERE wakeId=?1", [wake.wake_id])
+
+    refute carrier_rowid == event_id,
+           "the returned identity must be the EventLog id, not the later carrier rowid"
+
+    assert cancellation_event_count(db, wake.wake_id) == 1
     assert Wakes.get(db, wake.wake_id).state == "canceled"
     refute public_cancel(db, wake.wake_id, "agent:a")
+    assert cancellation_event_count(db, wake.wake_id) == 1
+  end
+
+  test "public cancellation event, carrier, and CAS share one rollback boundary", %{db: db} do
+    wake =
+      Wakes.schedule(db, %{
+        session_key: "rollback-session",
+        origin: "agent:rollback",
+        prompt: "roll every cancellation row back",
+        due_at: 1
+      })
+
+    command =
+      public_cancel_command(
+        wake.wake_id,
+        "agent:rollback",
+        %{kind: "session", id: "rollback-session"}
+      )
+
+    assert {:error, %RuntimeError{message: "force public cancellation rollback"}} =
+             DB.transaction(db, fn txn ->
+               assert {:accepted_in_txn, event_id, %{canceled: true}} =
+                        Wakes.cancel_in_txn(txn, command)
+
+               assert event_id > 0
+               assert [[1]] = Txn.q(txn, "SELECT COUNT(*) FROM events")
+               assert [[1]] = Txn.q(txn, "SELECT COUNT(*) FROM wake_cancellations")
+
+               assert [["canceled"]] =
+                        Txn.q(txn, "SELECT state FROM wakes WHERE wakeId=?1", [wake.wake_id])
+
+               raise "force public cancellation rollback"
+             end)
+
+    assert cancellation_event_count(db, wake.wake_id) == 0
+    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM wake_cancellations")
+    assert Wakes.get(db, wake.wake_id).state == "pending"
   end
 
   test "typed cancellation validates the closed process matrix and preserves first provenance", %{
@@ -603,29 +660,50 @@ defmodule Tightbeam.WakesTest do
          expected_origin,
          requester \\ %{kind: "session", id: "test-session"}
        ) do
-    principal = requester_principal(requester)
-    session_key = if requester.kind == "session", do: requester.id
-
     case DB.transaction(db, fn txn ->
-           Wakes.cancel_in_txn(txn, %{
-             wake_id: wake_id,
-             expected_origin: expected_origin,
-             requester: requester,
-             reason_kind: "requester_withdrew",
-             causal_source: %{
-               kind: "verb_call",
-               accepted_event: %{
-                 origin: expected_origin,
-                 session_key: session_key,
-                 principal: principal
-               }
-             },
-             outcome: %{kind: "no_replacement"}
-           })
+           Wakes.cancel_in_txn(txn, public_cancel_command(wake_id, expected_origin, requester))
          end) do
       {:ok, result} -> result
       {:error, _} -> false
     end
+  end
+
+  defp public_cancel_command(wake_id, expected_origin, requester) do
+    principal = requester_principal(requester)
+    session_key = if requester.kind == "session", do: requester.id
+
+    %{
+      wake_id: wake_id,
+      expected_origin: expected_origin,
+      requester: requester,
+      reason_kind: "requester_withdrew",
+      causal_source: %{
+        kind: "verb_call",
+        accepted_event: %{
+          origin: expected_origin,
+          session_key: session_key,
+          principal: principal
+        }
+      },
+      outcome: %{kind: "no_replacement"}
+    }
+  end
+
+  defp cancellation_event_count(db, wake_id) do
+    {:ok, [[count]]} =
+      DB.query(
+        db,
+        """
+        SELECT COUNT(*)
+        FROM events
+        WHERE kind='verb' AND verb='wake'
+          AND json_extract(payload, '$.cancel_wake_id')=?1
+          AND json_extract(payload, '$.canceled')=1
+        """,
+        [wake_id]
+      )
+
+    count
   end
 
   defp requester_principal(%{kind: "user", id: id}), do: {:user, id}
