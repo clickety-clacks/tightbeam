@@ -24,6 +24,7 @@ defmodule Tightbeam.MergeGateIsolationTest do
     refute first_node == second_node
 
     for capture <- [first, second] do
+      assert capture =~ "Elixir 1.19.5 (OTP 28)\n"
       assert capture =~ "TIGHTBEAM_PORT=0\n"
       assert capture =~ "TIGHTBEAM_AUTHORITATIVE_GATE=1\n"
       assert capture =~ "TIGHTBEAM_GATE_NODE=#{captured_node(capture)}\n"
@@ -79,6 +80,10 @@ defmodule Tightbeam.MergeGateIsolationTest do
 
     File.write!(fake_elixir, """
     #!/bin/sh
+    if [ "${1:-}" = "--version" ]; then
+      printf 'Elixir 1.19.5 (OTP 28)\\n'
+      exit 0
+    fi
     env | sort
     for arg in "$@"; do
       printf 'ARG=%s\\n' "$arg"

@@ -13,6 +13,9 @@ for name in $(
 done
 unset ROOTDIR BINDIR
 
+# Every authoritative gate records the exact BEAM toolchain that executes it.
+elixir --version
+
 # mktemp owns uniqueness across concurrent invocations.  The directory lives
 # for the whole run, so another gate cannot reuse this node name while it is
 # active.  `--sname` is an argv option on this VM only; exporting ERL_FLAGS or
