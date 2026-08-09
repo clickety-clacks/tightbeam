@@ -52,7 +52,23 @@ defmodule Tightbeam.WakesTest do
     assert Wakes.get(db, wake.wake_id).state == "pending"
 
     refute public_cancel(db, wake.wake_id, "agent:b")
-    assert public_cancel(db, wake.wake_id, "agent:a")
+
+    assert {:accepted_in_txn, event_id, %{canceled: true}} =
+             public_cancel(db, wake.wake_id, "agent:a")
+
+    assert {:ok, [[^event_id, causal_source_id]]} =
+             DB.query(
+               db,
+               """
+               SELECT e.id, c.causalSourceId
+               FROM events e
+               JOIN wake_cancellations c ON c.causalSourceId=CAST(e.id AS TEXT)
+               WHERE c.wakeId=?1
+               """,
+               [wake.wake_id]
+             )
+
+    assert causal_source_id == Integer.to_string(event_id)
     assert Wakes.get(db, wake.wake_id).state == "canceled"
     refute public_cancel(db, wake.wake_id, "agent:a")
   end
@@ -591,27 +607,23 @@ defmodule Tightbeam.WakesTest do
     session_key = if requester.kind == "session", do: requester.id
 
     case DB.transaction(db, fn txn ->
-           if Wakes.cancel_in_txn(txn, %{
-                wake_id: wake_id,
-                expected_origin: expected_origin,
-                requester: requester,
-                reason_kind: "requester_withdrew",
-                causal_source: %{
-                  kind: "verb_call",
-                  accepted_event: %{
-                    origin: expected_origin,
-                    session_key: session_key,
-                    principal: principal
-                  }
-                },
-                outcome: %{kind: "no_replacement"}
-              }) do
-             true
-           else
-             raise "typed cancellation refused"
-           end
+           Wakes.cancel_in_txn(txn, %{
+             wake_id: wake_id,
+             expected_origin: expected_origin,
+             requester: requester,
+             reason_kind: "requester_withdrew",
+             causal_source: %{
+               kind: "verb_call",
+               accepted_event: %{
+                 origin: expected_origin,
+                 session_key: session_key,
+                 principal: principal
+               }
+             },
+             outcome: %{kind: "no_replacement"}
+           })
          end) do
-      {:ok, true} -> true
+      {:ok, result} -> result
       {:error, _} -> false
     end
   end
