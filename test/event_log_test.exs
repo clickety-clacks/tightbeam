@@ -65,7 +65,7 @@ defmodule Tightbeam.EventLogTest do
                "SELECT id,ts,kind,verb,origin,principal,sessionKey,payload FROM events"
              )
 
-    assert payload == "%{canceled: true, cancel_wake_id: \"w_public\"}"
+    assert payload == "%{cancel_wake_id: \"w_public\", canceled: true}"
 
     assert {:error, %RuntimeError{message: "forced rollback"}} =
              DB.transaction(db, fn txn ->
