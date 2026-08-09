@@ -2367,8 +2367,21 @@ defmodule Tightbeam.Gateway do
   defp served_snapshot(config, session, harness, revision) do
     snapshot =
       Identity.snapshot_at!(config.base_dir, revision, session.archetype, harness)
+      |> Map.update!(:guidance, &append_transcript_self_inspection(&1, session.session_key))
 
     Placement.materialize_identity(config, session, snapshot)
+  end
+
+  defp append_transcript_self_inspection(guidance, session_key) do
+    transcript_command =
+      "tightbeam transcript --session #{inspect(session_key)} --limit 50"
+
+    guidance <>
+      "\n\n## Inspect recent Tightbeam transcript\n\n" <>
+      "Before continuing, inspect this session's recent Tightbeam transcript. " <>
+      "Run `#{transcript_command}` and read only the bounded result you need. " <>
+      "Do not replay or inject earlier messages, and do not assume another " <>
+      "harness's private memory transferred."
   end
 
   defp role_create_result(db, call) do

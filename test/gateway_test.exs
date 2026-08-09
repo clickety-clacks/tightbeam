@@ -220,9 +220,10 @@ defmodule Tightbeam.GatewayTest do
     def start_link(parent), do: GenServer.start_link(__MODULE__, {parent, %{}})
     def init(state), do: {:ok, state}
 
-    def handle_call({:new_session, model, _cwd, _mcp, _guidance}, _from, {parent, models}) do
+    def handle_call({:new_session, model, _cwd, _mcp, guidance}, _from, {parent, models}) do
       sid = "candidate-#{map_size(models) + 1}"
       send(parent, {:candidate_created, sid, model})
+      send(parent, {:candidate_guidance, sid, guidance})
       {:reply, {:ok, sid}, {parent, Map.put(models, sid, model)}}
     end
 
@@ -1872,7 +1873,7 @@ defmodule Tightbeam.GatewayTest do
     File.mkdir_p!(Path.dirname(adapter))
     File.write!(adapter, "#!/bin/sh\n")
     File.chmod!(adapter, 0o755)
-    Archetypes.load!(base_dir)
+    learn_engineering_identity!(base_dir)
     candidate = start_supervised!({CandidateAdapterStub, self()})
     start_supervised!({CoordinatorStub, candidate})
 
@@ -1888,7 +1889,7 @@ defmodule Tightbeam.GatewayTest do
       display_name: "Swap me",
       owner_user_id: "flynn",
       origin: "user:flynn",
-      archetype: "default",
+      archetype: "coder",
       host: "testhost",
       harness: "claude",
       provider: "anthropic",
@@ -1898,7 +1899,7 @@ defmodule Tightbeam.GatewayTest do
     start_lane!(ctx.db, "swapme")
 
     # Real prior conversation, so the barrier has something to bury.
-    for body <- ["first", "second"] do
+    for body <- ["REPLAY_SENTINEL_ONE", "REPLAY_SENTINEL_TWO"] do
       Projection.append(ctx.db, %{
         session_key: "swapme",
         role: "user",
@@ -1913,6 +1914,18 @@ defmodule Tightbeam.GatewayTest do
                session_key: "swapme",
                params: %{setting: "set_harness", harness: "fixture", model: "fixture-model"}
              })
+
+    assert_receive {:candidate_guidance, "candidate-1", guidance}
+    assert guidance =~ "tightbeam transcript --session \"swapme\" --limit 50"
+    assert guidance =~ "Do not replay or inject earlier messages"
+    refute guidance =~ "REPLAY_SENTINEL_ONE"
+    refute guidance =~ "REPLAY_SENTINEL_TWO"
+
+    cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), Org.get(ctx.db, "swapme"))
+
+    assert File.read!(Path.join(cwd, ".fixture/skills/tightbeam__worktree-session/SKILL.md"))
+
+    refute guidance =~ "[engine swap]"
 
     barrier = Org.get(ctx.db, "swapme").cleared_through_seq
     visible = Projection.list_after(ctx.db, "swapme", nil, 50, barrier)
@@ -5144,6 +5157,9 @@ defmodule Tightbeam.GatewayTest do
 
     assert Org.get(ctx.db, "k1").identity_name == identity_name
     home = Tightbeam.Homes.home_path(base_dir, "testhost", :codex)
+    assert_receive {:candidate_guidance, "candidate-1", guidance}
+    assert guidance =~ "Codex developer message"
+    assert guidance =~ "tightbeam transcript --session \"k1\" --limit 50"
     refute File.exists?(Path.join(home, "AGENTS.md"))
 
     assert JSON.decode!(File.read!(Path.join([home, ".tightbeam", "manifest"])))["harness"] ==

@@ -1174,23 +1174,28 @@ defmodule Tightbeam.Acp.AdapterTest do
            ] = session_requests(capture_path)
   end
 
-  test "guidance uses the harness-accurate ACP metadata channel on new and load" do
+  test "bounded continuity guidance uses the harness-accurate metadata channel on new and load" do
+    guidance =
+      "served guidance\n\n" <>
+        "Run `tightbeam transcript --session \"same-key\" --limit 50`. " <>
+        "Do not replay or inject earlier messages."
+
     for {harness, expected} <- [
-          {:codex, %{"developerInstructions" => "served guidance"}},
+          {:codex, %{"developerInstructions" => guidance}},
           {:claude,
            %{
              "systemPrompt" => %{
                "type" => "preset",
                "preset" => "claude_code",
-               "append" => "served guidance"
+               "append" => guidance
              }
            }},
-          {:fixture, %{"instructions" => "served guidance"}}
+          {:fixture, %{"instructions" => guidance}}
         ] do
       {adapter, capture_path} = start_adapter(harness: harness)
 
       assert {:ok, "sess-1"} =
-               Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "served guidance")
+               Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], guidance)
 
       assert {:ok, _pushed_model} =
                Adapter.load_session(
@@ -1199,7 +1204,7 @@ defmodule Tightbeam.Acp.AdapterTest do
                  "haiku",
                  "/tmp",
                  [],
-                 "served guidance"
+                 guidance
                )
 
       assert Enum.all?(session_requests(capture_path), &(&1["meta"] == expected))
