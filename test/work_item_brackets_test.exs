@@ -137,12 +137,53 @@ defmodule Tightbeam.WorkItemBracketsTest do
     assert routing_wake_id(ctx.db, a_item.id) == nil
     assert Wakes.get(ctx.db, a_routing).state == "canceled"
 
+    assert [
+             "tightbeam:work-items",
+             "routing_bracket_satisfied",
+             "assignment_transition",
+             source_assignment_id,
+             "disposition",
+             "assignment_transition",
+             disposition_assignment_id,
+             "work_item",
+             assignment_work_item,
+             "linked_work_open",
+             "supervision_entitlement",
+             entitlement_id,
+             1
+           ] = cancellation(ctx.db, a_routing)
+
+    assert source_assignment_id == assignment.id
+    assert disposition_assignment_id == assignment.id
+    assert assignment_work_item == a_item.id
+    assert entitlement_id == "#{assignment.id}#1"
+
     d_item = create(ctx, {:user, "flynn"}, %{title: "Dispatch path"})
     d_routing = routing_wake_id(ctx.db, d_item.id)
     {:ok, dispatched} = disp_dispatch(ctx, {:user, "flynn"}, "holder", "work", d_item.id)
     assert dispatched.workItemId == d_item.id
     assert routing_wake_id(ctx.db, d_item.id) == nil
     assert Wakes.get(ctx.db, d_routing).state == "canceled"
+    assert Enum.at(cancellation(ctx.db, d_routing), 0) == "tightbeam:work-items"
+  end
+
+  test "typed bracket refusal rolls back the caller transaction", ctx do
+    item = create(ctx, {:user, "flynn"}, %{title: "Refused bracket"})
+    routing = routing_wake_id(ctx.db, item.id)
+
+    assert {:error, %WorkItems.CancellationRefused{wake_id: ^routing}} =
+             DB.transaction(ctx.db, fn txn ->
+               WorkItems.cancel_brackets_in_txn(txn, item.id, %{
+                 causal_source: %{kind: "session_transition", id: "missing-session"},
+                 outcome: %{kind: "no_replacement"}
+               })
+             end)
+
+    assert routing_wake_id(ctx.db, item.id) == routing
+    assert Wakes.get(ctx.db, routing).state == "pending"
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "SELECT wakeId FROM wake_cancellations WHERE wakeId=?1", [routing])
   end
 
   ## Proof 3 — bracket-1 fire re-arms; icebox cancels and stops the nag.
@@ -169,6 +210,24 @@ defmodule Tightbeam.WorkItemBracketsTest do
 
     assert routing_wake_id(ctx.db, item.id) == nil
     assert Wakes.get(ctx.db, new).state == "canceled"
+
+    assert [
+             "tightbeam:work-items",
+             "routing_bracket_satisfied",
+             "work_item_transition",
+             _source_id,
+             "disposition",
+             "work_item_transition",
+             _disposition_id,
+             "work_item",
+             item_id,
+             "linked_work_not_open",
+             nil,
+             nil,
+             0
+           ] = cancellation(ctx.db, new)
+
+    assert item_id == item.id
   end
 
   ## Proof 4 — last-close of a non-terminal item arms the slate wake in the close txn
@@ -217,7 +276,12 @@ defmodule Tightbeam.WorkItemBracketsTest do
 
     {:ok, _} =
       DB.transaction(ctx.db, fn txn ->
-        Assignments.interrupt_for_retire_in_txn(txn, strand_holder.session_key, "flynn")
+        Assignments.interrupt_for_retire_in_txn(
+          txn,
+          strand_holder.session_key,
+          "flynn",
+          "user:flynn"
+        )
       end)
 
     assert is_binary(slate_wake_id(ctx.db, retire_item.id))
@@ -529,8 +593,26 @@ defmodule Tightbeam.WorkItemBracketsTest do
         # (cancel both brackets, set state). The substrate is one BEGIN IMMEDIATE
         # connection, so this txn seam is how a committed disposition interleaves;
         # a literal second connection would serialize behind this transaction.
-        WorkItems.cancel_brackets_in_txn(txn, item.id)
         Txn.q(txn, "UPDATE work_items SET state = 'closed' WHERE id = ?1", [item.id])
+
+        Tightbeam.CausalEvents.append_in_txn(txn, %{
+          kind: "disposition_transition",
+          job_ref: item.id,
+          assignment_id: nil,
+          session_key: nil,
+          detail: %{workItemId: item.id, fromState: "open", toState: "closed"}
+        })
+
+        [[transition_id]] = Txn.q(txn, "SELECT last_insert_rowid()")
+
+        WorkItems.cancel_brackets_in_txn(txn, item.id, %{
+          causal_source: %{kind: "work_item_transition", id: to_string(transition_id)},
+          outcome: %{
+            kind: "disposition",
+            disposition_kind: "work_item_transition",
+            disposition_id: to_string(transition_id)
+          }
+        })
       end)
 
     # Driven through the chokepoint: precheck saw open, only the in-txn interlock
@@ -661,6 +743,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
       session_key: holder,
       target_role: nil,
       role_fallback: false,
+      supervision_interval_ms: 1_000,
       params: params
     }
   end
@@ -677,6 +760,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
       session_key: holder,
       target_role: nil,
       role_fallback: false,
+      supervision_interval_ms: 1_000,
       params: params
     }
 
@@ -735,6 +819,23 @@ defmodule Tightbeam.WorkItemBracketsTest do
       )
 
     count
+  end
+
+  defp cancellation(db, wake_id) do
+    {:ok, [row]} =
+      DB.query(
+        db,
+        """
+        SELECT requesterId,reasonKind,causalSourceKind,causalSourceId,
+               outcomeKind,dispositionKind,dispositionId,primaryWorkKind,
+               primaryWorkId,workImpactKind,livenessTriggerKind,
+               livenessTriggerId,actionNeeded
+        FROM wake_cancellations WHERE wakeId=?1
+        """,
+        [wake_id]
+      )
+
+    row
   end
 
   defp rumination_wake_count(db) do

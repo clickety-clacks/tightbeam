@@ -22,6 +22,15 @@ defmodule Tightbeam.WorkItems do
   @origin "process:tightbeam"
   @default_triage_deadline_ms 86_400_000
 
+  defmodule CancellationRefused do
+    @moduledoc false
+    defexception [:wake_id]
+
+    @impl true
+    def message(%__MODULE__{wake_id: wake_id}),
+      do: "typed routing-bracket cancellation refused for #{wake_id}"
+  end
+
   @ddl """
   CREATE TABLE IF NOT EXISTS work_items (
     id TEXT PRIMARY KEY,
@@ -127,10 +136,10 @@ defmodule Tightbeam.WorkItems do
         # unassigned item). A keyed replay created nothing, so it stays silent.
         {:created, item} ->
           best_effort(fn -> on_change(call).(item.id, "metadata") end)
-          item
+          public_work_item(item)
 
         {:replayed, item} ->
-          item
+          public_work_item(item)
       end
     end
   end
@@ -168,7 +177,7 @@ defmodule Tightbeam.WorkItems do
       case result do
         {:updated, item, changed?} ->
           if changed?, do: best_effort(fn -> on_change(call).(item.id, "metadata") end)
-          item
+          public_work_item(item)
 
         error ->
           error
@@ -280,7 +289,7 @@ defmodule Tightbeam.WorkItems do
       case result do
         {:disposed, item, changed?} ->
           if changed?, do: best_effort(fn -> on_change(call).(item.id, "metadata") end)
-          %{ok: true, workItem: item}
+          %{ok: true, workItem: public_work_item(item)}
 
         error ->
           error
@@ -339,6 +348,19 @@ defmodule Tightbeam.WorkItems do
               }
             })
 
+            [[transition_id]] = Txn.q(txn, "SELECT last_insert_rowid()")
+
+            if verb != :reopen do
+              cancel_brackets_in_txn(txn, id, %{
+                causal_source: %{kind: "work_item_transition", id: to_string(transition_id)},
+                outcome: %{
+                  kind: "disposition",
+                  disposition_kind: "work_item_transition",
+                  disposition_id: to_string(transition_id)
+                }
+              })
+            end
+
             {:disposed, disposed, true}
         end
     end
@@ -346,7 +368,10 @@ defmodule Tightbeam.WorkItems do
 
   defp apply_disposition(txn, item, :reopen, "open", _reason) do
     # iceboxed → open re-arms bracket 1 (the routing deadline resumes).
-    cancel_brackets_in_txn(txn, item.id)
+    if is_binary(item.routingWakeId) or is_binary(item.slateWakeId) do
+      raise "terminal work item #{item.id} retained a live bracket reference"
+    end
+
     Txn.q(txn, "UPDATE work_items SET state = 'open', failReason = NULL WHERE id = ?1", [item.id])
     arm_routing_in_txn(txn, item.id, item.ownerUserId, item.title)
   end
@@ -354,7 +379,6 @@ defmodule Tightbeam.WorkItems do
   defp apply_disposition(txn, item, verb, target, reason) do
     # icebox/close/fail all cancel BOTH brackets (after a last-close a slate
     # wake may exist, so every disposition must cancel bracket 2 too).
-    cancel_brackets_in_txn(txn, item.id)
     fail_reason = if verb == :fail, do: reason, else: nil
 
     Txn.q(
@@ -423,17 +447,22 @@ defmodule Tightbeam.WorkItems do
     end
   end
 
-  @doc "Cancel both bracket wakes and clear their ids (first assign / disposition)."
-  @spec cancel_brackets_in_txn(Txn.t(), String.t()) :: :ok
-  def cancel_brackets_in_txn(%Txn{} = txn, work_item_id) do
+  @doc "Cancel both bracket wakes through one typed transition and clear their ids."
+  @spec cancel_brackets_in_txn(Txn.t(), String.t(), map()) :: :ok
+  def cancel_brackets_in_txn(%Txn{} = txn, work_item_id, transition) do
     case Txn.q(
            txn,
            "SELECT routingWakeId, slateWakeId FROM work_items WHERE id = ?1",
            [work_item_id]
          ) do
       [[routing, slate]] ->
-        if is_binary(routing), do: Wakes.cancel_in_txn(txn, routing, @origin)
-        if is_binary(slate), do: Wakes.cancel_in_txn(txn, slate, @origin)
+        Enum.each([routing, slate], fn
+          wake_id when is_binary(wake_id) ->
+            cancel_bracket_in_txn(txn, wake_id, transition)
+
+          nil ->
+            :ok
+        end)
 
         if is_binary(routing) or is_binary(slate) do
           Txn.q(
@@ -448,6 +477,27 @@ defmodule Tightbeam.WorkItems do
     end
 
     :ok
+  end
+
+  defp cancel_bracket_in_txn(txn, wake_id, transition) do
+    case Txn.q(txn, "SELECT state FROM wakes WHERE wakeId = ?1", [wake_id]) do
+      [["pending"]] ->
+        command =
+          Map.merge(transition, %{
+            wake_id: wake_id,
+            requester: %{kind: "process", id: "tightbeam:work-items"},
+            reason_kind: "routing_bracket_satisfied"
+          })
+
+        if not Wakes.cancel_in_txn(txn, command),
+          do: raise(CancellationRefused, wake_id: wake_id)
+
+      [[state]] when state in ["fired", "canceled"] ->
+        :ok
+
+      [] ->
+        raise "work-item bracket references missing wake #{wake_id}"
+    end
   end
 
   @doc """
@@ -564,7 +614,10 @@ defmodule Tightbeam.WorkItems do
           unknown(call.params[:work_item_id])
 
         item ->
-          %{workItem: item, assignments: Tightbeam.Assignments.__for_work_item__(db, item.id)}
+          %{
+            workItem: public_work_item(item),
+            assignments: Tightbeam.Assignments.__for_work_item__(db, item.id)
+          }
       end
     end
   end
@@ -618,7 +671,7 @@ defmodule Tightbeam.WorkItems do
       {:ok, rows} =
         DB.query(db, "SELECT #{columns()} FROM work_items ORDER BY createdAt DESC, id DESC")
 
-      %{workItems: Enum.map(rows, &work_item/1)}
+      %{workItems: Enum.map(rows, &(work_item(&1) |> public_work_item()))}
     end
   end
 
@@ -732,7 +785,7 @@ defmodule Tightbeam.WorkItems do
   # response object (§Response shapes).
   defp columns do
     "id, title, specRefName, specRefSha256, isBug, ownerUserId, state, failReason, " <>
-      "createdByUser, createdBySession, createdAt"
+      "routingWakeId, slateWakeId, createdByUser, createdBySession, createdAt"
   end
 
   defp work_item([
@@ -744,6 +797,8 @@ defmodule Tightbeam.WorkItems do
          owner_user_id,
          state,
          fail_reason,
+         routing_wake_id,
+         slate_wake_id,
          user,
          session,
          created_at
@@ -757,11 +812,15 @@ defmodule Tightbeam.WorkItems do
       ownerUserId: owner_user_id,
       state: state,
       failReason: fail_reason,
+      routingWakeId: routing_wake_id,
+      slateWakeId: slate_wake_id,
       createdByUser: user,
       createdBySession: session,
       createdAt: created_at
     }
   end
+
+  defp public_work_item(item), do: Map.drop(item, [:routingWakeId, :slateWakeId])
 
   defp bool_to_int(true), do: 1
   defp bool_to_int(false), do: 0
