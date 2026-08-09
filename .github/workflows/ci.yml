@@ -127,7 +127,7 @@ jobs:
         run: mix format --check-formatted
 
       - name: mix test
-        run: mix test
+        run: scripts/verify_mix.sh
 
       - name: cargo fmt --check
         working-directory: cli
