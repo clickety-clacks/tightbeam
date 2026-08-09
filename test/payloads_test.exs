@@ -67,7 +67,9 @@ defmodule Tightbeam.Wire.PayloadsTest do
       reply_to_client_message_id: nil,
       llm_visible_message_id: "client-1",
       attachments: [],
-      attention_tier: 0
+      attention_tier: 0,
+      message_type: nil,
+      marker: nil
     }
 
     user = Payloads.server_message(base)
@@ -76,6 +78,8 @@ defmodule Tightbeam.Wire.PayloadsTest do
     assert user["clientMessageId"] == "client-1"
     refute Map.has_key?(user, "sender")
     refute Map.has_key?(user, "replyToMessageId")
+    refute Map.has_key?(user, "messageType")
+    refute Map.has_key?(user, "marker")
 
     assistant =
       Payloads.server_message(%{
@@ -85,13 +89,38 @@ defmodule Tightbeam.Wire.PayloadsTest do
           device_id: nil,
           client_message_id: nil,
           reply_to_message_id: "m1",
-          reply_to_client_message_id: "client-1"
+          reply_to_client_message_id: "client-1",
+          message_type: "assistant"
       })
 
     assert assistant["sender"] == "tightbeam"
     assert assistant["replyToMessageId"] == "m1"
     assert assistant["replyToClientMessageId"] == "client-1"
+    assert assistant["messageType"] == "assistant"
     refute Map.has_key?(assistant, "deviceId")
+
+    marker =
+      Payloads.server_message(%{
+        base
+        | role: "assistant",
+          sender: "process:tightbeam",
+          device_id: nil,
+          client_message_id: nil,
+          message_type: "marker",
+          marker: %{kind: "harness-switch", from: "claude", to: "codex"}
+      })
+
+    assert marker["type"] == "message"
+    assert marker["messageType"] == "marker"
+
+    assert marker["marker"] == %{
+             "kind" => "harness-switch",
+             "from" => "claude",
+             "to" => "codex"
+           }
+
+    future = Payloads.server_message(%{base | message_type: "future-class"})
+    assert future["messageType"] == "future-class"
   end
 
   test "wire error and prompt state omit optional nil keys" do

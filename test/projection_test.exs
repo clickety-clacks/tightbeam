@@ -25,6 +25,8 @@ defmodule Tightbeam.ProjectionTest do
     assert message.id =~ ~r/^s_[0-9a-f-]{36}$/
     assert message.llm_visible_message_id == "c_abc"
     assert message.attachments == [%{"type" => "image", "name" => "pic.png"}]
+    assert message.message_type == nil
+    assert message.marker == nil
 
     {:ok, rows} =
       DB.query(
@@ -84,25 +86,94 @@ defmodule Tightbeam.ProjectionTest do
     assert assistant.reply_to_message_id == user.id
     assert assistant.reply_to_client_message_id == "c_1"
     assert assistant.llm_visible_message_id == assistant.id
+    assert assistant.message_type == "assistant"
     assert Projection.get(db, assistant.id) == assistant
   end
 
-  test "transaction markers use the ordinary anti-forgery transcript row shape", %{db: db} do
+  test "structured markers persist facts and derive readable content from a kind template", %{
+    db: db
+  } do
+    facts = %{kind: "session-restart", from: "old-session", to: "new-session"}
+
     assert {:ok, {:appended, marker}} =
              DB.transaction(db, fn txn ->
-               Projection.append_marker_in_txn(txn, "k1", "[context reset]")
+               Projection.append_marker_in_txn(txn, "k1", facts)
              end)
 
     assert marker.session_key == "k1"
     assert marker.role == "assistant"
-    assert marker.content == "[context reset]"
+    assert marker.content =~ "[context reset]"
+    assert marker.content =~ "old-session"
+    assert marker.content =~ "new-session"
     assert marker.sender == "process:tightbeam"
+    assert marker.message_type == "marker"
+    assert marker.marker == facts
     assert marker.llm_visible_message_id == marker.id
     assert marker.attachments == []
     assert marker.device_id == nil
     assert marker.client_message_id == nil
     assert marker.reply_to_message_id == nil
     assert marker.reply_to_client_message_id == nil
+    assert Projection.get(db, marker.id) == marker
+  end
+
+  test "free text and unknown kinds cannot enter the structural marker seam", %{db: db} do
+    assert {:error, %ArgumentError{message: free_text_error}} =
+             DB.transaction(db, fn txn ->
+               Projection.append_marker_in_txn(txn, "k1", "[free text]")
+             end)
+
+    assert free_text_error =~ "marker must be"
+
+    assert {:error, %ArgumentError{message: unknown_kind_error}} =
+             DB.transaction(db, fn txn ->
+               Projection.append_marker_in_txn(txn, "k1", %{
+                 kind: "turn-failed",
+                 from: nil,
+                 to: nil
+               })
+             end)
+
+    assert unknown_kind_error =~ "marker must be"
+
+    assert_raise ArgumentError, ~r/message_type=marker requires/, fn ->
+      Projection.append(db, %{
+        session_key: "k1",
+        role: "assistant",
+        content: "missing facts",
+        message_type: "marker"
+      })
+    end
+  end
+
+  test "origin classes stamp additive message types without parsing content", %{db: db} do
+    rows = [
+      {%{role: "user", sender: "agent:reviewer"}, "agent"},
+      {%{role: "user", sender: "process:cron"}, "substrate"},
+      {%{role: "user", sender: "remedy:lease"}, "substrate"},
+      {%{role: "user", sender: "user:flynn"}, nil}
+    ]
+
+    Enum.each(rows, fn {attrs, expected} ->
+      {:appended, message} =
+        Projection.append(
+          db,
+          Map.merge(%{session_key: "k1", content: "same text"}, attrs)
+        )
+
+      assert message.message_type == expected
+    end)
+
+    {:appended, future} =
+      Projection.append(db, %{
+        session_key: "k1",
+        role: "assistant",
+        sender: "process:tightbeam",
+        content: "future",
+        message_type: "future-class"
+      })
+
+    assert future.message_type == "future-class"
   end
 
   test "after replays in order and an unknown cursor replays from the start", %{db: db} do

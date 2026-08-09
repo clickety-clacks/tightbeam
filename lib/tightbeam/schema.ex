@@ -33,7 +33,7 @@ defmodule Tightbeam.Schema do
   # The shape this build writes. Bump it when a production table changes in a
   # way that makes an older database unreadable, and give the refusal below a
   # sentence saying what changed.
-  @shape "model-identity-v1"
+  @shape "model-identity-message-envelope-v1"
 
   defmodule ShapeError do
     @moduledoc "A database whose shape this build cannot read. Never repaired in place."
@@ -96,6 +96,9 @@ defmodule Tightbeam.Schema do
 
           stamped: #{found}
           this build: #{@shape}
+
+        This build stores the optional messageType discriminator and structured
+        marker kind/from/to fields. An older stamped database lacks those columns.
 
         There is no migration. Move the database aside and let it be recreated.
         """

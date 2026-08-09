@@ -306,7 +306,7 @@ defmodule Tightbeam.EventLog do
 
             owner ->
               {:appended, marker} =
-                Projection.append_marker_in_txn(txn, session_key, message, attention)
+                Projection.append_substrate_in_txn(txn, session_key, message, attention)
 
               {[{session_key, owner, marker} | appended], undeliverable}
           end

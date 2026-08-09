@@ -17,11 +17,12 @@ defmodule Tightbeam.Wire.Payloads do
     class already collapsed for rendering, TOTAL, classified in
     `Tightbeam.Origin`. `origin` stays beside it as the detailed provenance;
     clients render from `startedBy` and never parse the origin string.
-  - A message's class is derivable from wire fields alone:
-    role=user + deviceId/clientMessageId, no sender → typed on a device;
-    role=user + sender=<origin> → delivered by wake (colleague DM,
-    operator CLI action, or automation, per the sender's class prefix);
-    role=assistant (+ sender "tightbeam") → the session's own output.
+  - A message may carry optional `messageType`: assistant | substrate |
+    marker | agent. The value is OPEN for additive compatibility. A missing
+    or unknown value means assistant to a client. The outer frame `type`
+    remains "message".
+  - Older rows omit `messageType`. Their role and sender provenance remain
+    intact so an unchanged OpenClaw client decodes the stream exactly as before.
   - Wake-delivered messages carry a first-line `[from <origin>]` stamp in
     BOTH stored content and the model prompt — one string, three
     audiences: readable text in any client, a rendering cue in aware ones
@@ -30,22 +31,13 @@ defmodule Tightbeam.Wire.Payloads do
     return address. Only the first line is provenance; any `[from ...]`
     deeper in a body is quoted text.
 
-  MARKER MESSAGES (normative): substrate-authored notices that mark a POINT
-  in the stream, not speech — role=assistant + sender="process:tightbeam" +
-  a bracketed first line naming the marker kind. The sender is the
-  anti-forgery: real model output always commits with sender "tightbeam",
-  so no session can emit a marker by typing one. Aware clients render a
-  matching marker per its kind (divider, error bubble, chip), never as an
-  agent bubble; unaware clients show readable text. Marker kinds:
-  - `[context reset]` — a harness session fell back (pointer reason
-    "fallback"); the agent's memory begins at the message the marker
-    directly follows.
-  - `[turn failed]` — the turn reached a terminal failure and no reply is
-    coming; the body carries the human-readable reason. Covers both
-    in-band failures and crash-recovered "interrupted: outcome unknown".
-  - `[adapter down]` — the harness engine this session runs on died and took
-    the running turn with it; `[adapter recovered]` follows when the
-    replacement is ready.
+  MARKER MESSAGES (normative): structural boundaries carry
+  `messageType=marker` plus a `marker` object with exactly `kind`, `from`,
+  and `to`. Current kinds are harness-switch, model-retune, and
+  session-restart. Writers supply those facts; `Tightbeam.Projection` owns
+  each readable content template. Never infer a marker from content. Ordinary
+  Tightbeam notices, including turn failures and adapter state, carry
+  `messageType=substrate` and remain readable records rather than boundaries.
 
   Markers carry `attentionTier` like any other message. The substrate elects
   it the way an agent elects its reply's, over the SAME vocabulary, and -1
@@ -133,6 +125,14 @@ defmodule Tightbeam.Wire.Payloads do
     |> put_if_present("sender", Map.get(m, :sender))
     |> put_if_present("replyToMessageId", Map.get(m, :reply_to_message_id))
     |> put_if_present("replyToClientMessageId", Map.get(m, :reply_to_client_message_id))
+    |> put_if_present("messageType", Map.get(m, :message_type))
+    |> put_if_present("marker", marker_payload(Map.get(m, :marker)))
+  end
+
+  defp marker_payload(nil), do: nil
+
+  defp marker_payload(%{kind: kind, from: from, to: to}) do
+    %{"kind" => kind, "from" => from, "to" => to}
   end
 
   @spec ack(String.t()) :: payload()

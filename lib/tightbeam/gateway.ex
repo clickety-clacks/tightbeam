@@ -2194,7 +2194,14 @@ defmodule Tightbeam.Gateway do
                                ) do
                           Org.append_pointer(db, session.session_key, sid, "fallback")
                           Org.set_identity_revision(db, session.session_key, snapshot.revision)
-                          append_context_reset_marker(db, session)
+
+                          append_session_restart_marker(
+                            db,
+                            session.session_key,
+                            pointer.harness_session_id,
+                            sid
+                          )
+
                           {:ok, sid}
                         end
                     end
@@ -4015,11 +4022,11 @@ defmodule Tightbeam.Gateway do
           _ -> :ok
         end
 
-        Projection.append_marker_in_txn(
-          txn,
-          call.session_key,
-          swap_tombstone(session, harness, model)
-        )
+        Projection.append_marker_in_txn(txn, call.session_key, %{
+          kind: "harness-switch",
+          from: describe_engine(session.harness, session.model),
+          to: describe_engine(harness, model)
+        })
       end)
 
     case barrier do
@@ -4036,12 +4043,14 @@ defmodule Tightbeam.Gateway do
           message: describe_error(error)
         }
 
-      {:ok, _} ->
+      {:ok, {:appended, marker}} ->
         broadcast(
           db,
           session.owner_user_id,
           Payloads.stream_history_cleared(call.session_key)
         )
+
+        publish_stored_message(db, call.session_key, marker)
 
         published_identity(model)
         |> Map.merge(%{
@@ -4118,8 +4127,40 @@ defmodule Tightbeam.Gateway do
   defp apply_tuned_model(config, db, session, new_ref, provider) do
     case Org.current_pointer(db, session.session_key) do
       nil ->
-        Org.set_model(db, session.session_key, new_ref, provider)
-        :ok
+        result =
+          DB.transaction(db, fn txn ->
+            case Org.swap_model_in_txn(
+                   txn,
+                   session.session_key,
+                   {session.model, session.harness},
+                   {new_ref, session.harness, provider}
+                 ) do
+              {:ok, _updated} ->
+                Projection.append_marker_in_txn(txn, session.session_key, %{
+                  kind: "model-retune",
+                  from: Model.describe(session.model),
+                  to: Model.describe(new_ref)
+                })
+
+              {:duplicate, _current} ->
+                :duplicate
+
+              :stale ->
+                raise("model mutation race inside serialized tune")
+            end
+          end)
+
+        case result do
+          {:ok, {:appended, marker}} ->
+            publish_stored_message(db, session.session_key, marker)
+            :ok
+
+          {:ok, :duplicate} ->
+            :ok
+
+          {:error, error} ->
+            raise error
+        end
 
       pointer ->
         coordinator = Process.whereis(Tightbeam.AdapterCoordinator)
@@ -4248,20 +4289,39 @@ defmodule Tightbeam.Gateway do
                {record_model, record_harness},
                {new_ref, record_harness, provider}
              ) do
-          {:ok, _} -> :ok
-          {:duplicate, _} -> :ok
-          :stale -> raise("model mutation race inside serialized tune")
-        end
+          {:ok, _updated} ->
+            if switched_sid != prior_sid do
+              Org.append_pointer_in_txn(txn, session.session_key, switched_sid, "loaded")
+            end
 
-        if switched_sid != prior_sid do
-          Org.append_pointer_in_txn(txn, session.session_key, switched_sid, "loaded")
-        end
+            {:appended, marker} =
+              Projection.append_marker_in_txn(txn, session.session_key, %{
+                kind: "model-retune",
+                from: Model.describe(session.model),
+                to: Model.describe(new_ref)
+              })
 
-        :ok
+            {:changed, marker}
+
+          {:duplicate, _current} ->
+            if switched_sid != prior_sid do
+              Org.append_pointer_in_txn(txn, session.session_key, switched_sid, "loaded")
+            end
+
+            :duplicate
+
+          :stale ->
+            raise("model mutation race inside serialized tune")
+        end
       end)
 
     case result do
-      {:ok, :ok} ->
+      {:ok, {:changed, marker}} ->
+        close_superseded_model_session(adapter, session.session_key, prior_sid, switched_sid)
+        publish_stored_message(db, session.session_key, marker)
+        :ok
+
+      {:ok, :duplicate} ->
         close_superseded_model_session(adapter, session.session_key, prior_sid, switched_sid)
         :ok
 
@@ -4638,7 +4698,12 @@ defmodule Tightbeam.Gateway do
         File.rm_rf!(Path.join([config.base_dir, "identity", "pinned", session.identity_name]))
       end
 
-      append_context_reset_marker(db, updated)
+      append_session_restart_marker(
+        db,
+        updated.session_key,
+        session.identity_name,
+        updated.identity_name
+      )
 
       prompt = "Your override \"#{removed}\" was removed by the operator; disregard it."
       notify_session(config, db, session.session_key, prompt)
@@ -5077,22 +5142,6 @@ defmodule Tightbeam.Gateway do
     count > 0
   end
 
-  # Says four things and nothing more: the engine changed, from what to what,
-  # that earlier history is RETAINED rather than deleted, and that this is
-  # expected. `Projection.list_after/5` floors at the barrier — it never deletes
-  # — so "retained but not shown" is literally what happened.
-  defp swap_tombstone(session, harness, model) do
-    from = describe_engine(session.harness, session.model)
-    to = describe_engine(harness, model)
-
-    "[engine swap]\n\n" <>
-      "This session's engine changed from #{from} to #{to}.\n\n" <>
-      "Earlier messages are RETAINED and are not deleted, but they are no longer " <>
-      "shown here: a new engine cannot load the previous engine's session, so the " <>
-      "visible transcript starts fresh from this point. This is expected after a " <>
-      "harness swap, not a fault."
-  end
-
   defp describe_error(error) when is_exception(error), do: Exception.message(error)
   defp describe_error(error), do: inspect(error)
 
@@ -5172,21 +5221,19 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  # A fallback is a substrate event a reader of the CHAT must see: the
-  # model's working memory ended here while the visible history did not —
-  # without a line, the boundary is invisible and the next reply reads as a
-  # bug. Position is the truth: fallback is discovered lazily at turn
-  # start, AFTER this turn's echo committed, so the marker lands between
-  # echo and reply — the message directly above IS delivered to the fresh
-  # context, everything before it is not.
-  defp append_context_reset_marker(db, session) do
-    append_marker(
-      db,
-      session.session_key,
-      "[context reset]\n\n" <>
-        "The agent's working memory was reset while handling the message above. " <>
-        "Earlier messages stay visible here, but the agent no longer remembers them."
-    )
+  # A fallback is a structural boundary a reader of the CHAT must see: the
+  # model's working memory ended here while the visible history did not.
+  # Position is the truth: fallback is discovered lazily at turn start, AFTER
+  # this turn's echo committed, so the marker lands between echo and reply.
+  defp append_session_restart_marker(db, session_key, from, to) do
+    case Projection.append_marker(db, session_key, %{
+           kind: "session-restart",
+           from: from,
+           to: to
+         }) do
+      {:appended, marker} -> publish_stored_message(db, session_key, marker)
+      _ -> :ok
+    end
   end
 
   # A failed turn with no marker is a prompt that silently vanishes: the
@@ -5210,7 +5257,7 @@ defmodule Tightbeam.Gateway do
   defp error_sentence(reason), do: inspect(reason)
 
   defp append_turn_failed_marker(db, session_key, reason) do
-    append_marker(
+    append_substrate(
       db,
       session_key,
       "[turn failed]\n\nThe agent could not answer the message above: #{reason}" <>
@@ -5234,21 +5281,34 @@ defmodule Tightbeam.Gateway do
 
   defp unknown_outcome_warning(_reason), do: ""
 
-  # MARKER MESSAGES (the normative convention lives in Payloads — the seam
-  # clients render from): an ordinary appended message so it rides replay
-  # and live push with no new frame type. sender "process:tightbeam" is the
-  # anti-forgery — real model output always commits with sender
-  # "tightbeam", so no session can emit a marker by typing one.
-  defp append_marker(db, session_key, content) do
+  # Substrate notices ride replay and live push as ordinary records. They
+  # are not structural markers; only Projection.append_marker stamps one of
+  # the three structured boundary kinds.
+  defp append_substrate(db, session_key, content) do
     case Projection.append(db, %{
            session_key: session_key,
            role: "assistant",
            content: content,
-           sender: "process:tightbeam"
+           sender: "process:tightbeam",
+           message_type: "substrate"
          }) do
-      {:appended, marker} -> publish_message(db, session_key, marker)
+      {:appended, notice} -> publish_message(db, session_key, notice)
       _ -> :ok
     end
+  end
+
+  # The record is already committed. A missing connection registry delays
+  # delivery until replay; it must not undo or fail the tune that produced it.
+  defp publish_stored_message(db, session_key, message) do
+    publish_message(db, session_key, message)
+  catch
+    :exit, reason ->
+      Logger.warning(
+        "live push of #{session_key} seq #{message.seq} failed (#{inspect(reason)}); " <>
+          "the message is stored and replays on the next connect"
+      )
+
+      :ok
   end
 
   defp publish_message(db, session_key, message, registry \\ Tightbeam.ConnRegistry) do

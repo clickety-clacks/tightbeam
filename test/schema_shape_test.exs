@@ -42,11 +42,15 @@ defmodule Tightbeam.SchemaShapeTest do
 
   test "a fresh database is created and stamped", %{db: db} do
     assert :ok = Schema.ensure_all(db)
-    assert {:ok, [["model-identity-v1"]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok, [["model-identity-message-envelope-v1"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
 
     # Idempotent: booting twice is the ordinary case, not a shape change.
     assert :ok = Schema.ensure_all(db)
-    assert {:ok, [["model-identity-v1"]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok, [["model-identity-message-envelope-v1"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
   end
 
   # The defect this refuses: `CREATE TABLE IF NOT EXISTS` is SILENT about a
@@ -128,6 +132,6 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "some-later-shape"
-    assert error.message =~ "model-identity-v1"
+    assert error.message =~ "model-identity-message-envelope-v1"
   end
 end
