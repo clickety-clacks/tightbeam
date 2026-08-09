@@ -223,7 +223,7 @@ defmodule Tightbeam.Wakes do
                  conditionScope, conditionAfterId, NULL, creatorSessionKey,
                  rumination, work_item_id, assignmentId, NULL, targetGate
           FROM wakes
-          WHERE wakeId=?1 AND state='pending' AND targetGate=1
+          WHERE wakeId=?1 AND state='pending'
           """,
           [wake_id, replacement_id, replacement_target, created_at]
         )
