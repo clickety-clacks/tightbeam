@@ -45,6 +45,10 @@ defmodule Tightbeam.Wire.RouterTest do
         send(parent, {:call, call})
         %{sessions: [], wakes: []}
       end,
+      "tune" => fn call ->
+        send(parent, {:call, call})
+        %{ok: false, code: "not_found", message: "session not found"}
+      end,
       "assign" => fn call ->
         send(parent, {:call, call})
         %{id: "asg_test"}
@@ -167,6 +171,30 @@ defmodule Tightbeam.Wire.RouterTest do
                       origin: "user:flynn",
                       params: %{}
                     }}
+  end
+
+  test "agent tune defers an unknown session key to the gateway privacy seam", ctx do
+    response =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "tune",
+        asUser: "flynn",
+        sessionKey: "unknown-private-target",
+        params: %{setting: "set_model", model: "claude-fable-5"}
+      })
+
+    assert response.status == 404
+
+    assert_receive {:call,
+                    %{
+                      verb: "tune",
+                      origin: "user:flynn",
+                      session_key: "unknown-private-target",
+                      params: %{setting: "set_model", model: "claude-fable-5"}
+                    }}
+
+    assert JSON.decode!(response.resp_body) == %{
+             "error" => %{"code" => "not_found", "message" => "session not found"}
+           }
   end
 
   test "an empty org cannot use the local first-user exception over the wire", ctx do

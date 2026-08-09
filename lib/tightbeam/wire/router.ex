@@ -611,15 +611,23 @@ defmodule Tightbeam.Wire.Router do
         {:ok, nil, %{role: nil, fallback: false}}
 
       given == ["sessionKey"] ->
-        case Org.get(db(conn), body["sessionKey"]) do
-          nil ->
-            {:error, 404, "not_found", "unknown sessionKey: #{body["sessionKey"]}"}
+        if verb == "tune" do
+          # Runtime tuning authorizes before existence can become visible. The
+          # gateway receives the opaque key and returns the same not_found for
+          # unknown, retired, foreign, and process callers. Other verbs retain
+          # the router's existing eager target semantics.
+          {:ok, body["sessionKey"], %{role: nil, fallback: false}}
+        else
+          case Org.get(db(conn), body["sessionKey"]) do
+            nil ->
+              {:error, 404, "not_found", "unknown sessionKey: #{body["sessionKey"]}"}
 
-          %{state: "retired"} when verb in ["assign", "dispatch"] ->
-            {:error, 400, "session_retired", "assignments require an active holder session"}
+            %{state: "retired"} when verb in ["assign", "dispatch"] ->
+              {:error, 400, "session_retired", "assignments require an active holder session"}
 
-          session ->
-            {:ok, session.session_key, %{role: nil, fallback: false}}
+            session ->
+              {:ok, session.session_key, %{role: nil, fallback: false}}
+          end
         end
 
       given == ["userId"] ->

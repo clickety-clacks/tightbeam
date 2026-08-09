@@ -169,6 +169,46 @@ defmodule Tightbeam.CliIntegrationTest do
     assert version == CliCompatibility.required_version()
   end
 
+  test "real tune CLI uses session identity, typed fields, and structured refusals", ctx do
+    {output, 1} =
+      System.cmd(
+        ctx.binary,
+        [
+          "tune",
+          "--session",
+          ctx.worker.session_key,
+          "--harness",
+          "claude",
+          "--model",
+          "fable"
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert String.starts_with?(output, "{"), output
+    assert %{"code" => "same_harness", "ok" => false} = JSON.decode!(output)
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "tune",
+                      origin: "agent:cli-holder",
+                      session_key: "cli-worker",
+                      params: %{setting: "set_harness", harness: "claude", model: "fable"}
+                    }}
+
+    {usage, 1} =
+      System.cmd(
+        ctx.binary,
+        ["tune", "--session", ctx.worker.session_key, "--fast", "on", "--effort", "high"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert usage =~ "--fast is mutually exclusive"
+    refute_receive {:cli_call, %{verb: "tune"}}
+  end
+
   test "version refusal is distinguishable from auth and network failures", ctx do
     session_file = Path.join(ctx.base_dir, "work/session/.tightbeam-session")
 

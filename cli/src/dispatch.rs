@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use crate::args::{Command, Identity, Target, ToplineSelection};
+use crate::args::{Command, Identity, Target, ToplineSelection, TuneControl};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestSpec {
@@ -238,6 +238,39 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             Ok(request(
                 identity,
                 "retire",
+                vec![string_field("sessionKey", session_key)],
+                params,
+            ))
+        }
+        Command::Tune {
+            identity,
+            session_key,
+            control,
+        } => {
+            let params = match control {
+                TuneControl::Harness {
+                    harness,
+                    model,
+                    effort,
+                    context,
+                } => tune_model_params("set_harness", Some(harness), model, effort, context),
+                TuneControl::Model {
+                    model,
+                    effort,
+                    context,
+                } => tune_model_params("set_model", None, model, effort, context),
+                TuneControl::Effort(effort) => vec![
+                    string_field("setting", "set_reasoning"),
+                    string_field("reasoningLevel", effort),
+                ],
+                TuneControl::Fast(value) => vec![
+                    string_field("setting", "set_fast_mode"),
+                    string_field("fastMode", value),
+                ],
+            };
+            Ok(request(
+                identity,
+                "tune",
                 vec![string_field("sessionKey", session_key)],
                 params,
             ))
@@ -959,7 +992,25 @@ fn send_to_with_timeout(
         Err(ureq::Error::Transport(error)) => return Err(error.to_string()),
     };
     let encoded = response.into_string().map_err(|error| error.to_string())?;
+    if !(200..300).contains(&status) && request.body_json.contains(r#""verb":"tune""#) {
+        return Err(tune_refusal_json(&encoded));
+    }
     parse_response(status, &encoded)
+}
+
+fn tune_refusal_json(encoded: &str) -> String {
+    let parsed: Value = match serde_json::from_str(encoded) {
+        Ok(parsed) => parsed,
+        Err(error) => return error.to_string(),
+    };
+    let error = parsed.get("error").unwrap_or(&parsed);
+
+    serde_json::to_string(&serde_json::json!({
+        "ok": false,
+        "code": error.get("code").and_then(Value::as_str).unwrap_or("undefined"),
+        "message": error.get("message").and_then(Value::as_str).unwrap_or("")
+    }))
+    .expect("JSON value serializes")
 }
 
 pub(crate) fn gateway_request(
@@ -1216,6 +1267,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::Spawn { identity, .. }
         | Command::List { identity }
         | Command::Retire { identity, .. }
+        | Command::Tune { identity, .. }
         | Command::Assign { identity, .. }
         | Command::Dispatch { identity, .. }
         | Command::EffortRule { identity, .. }
@@ -1258,6 +1310,29 @@ fn command_identity(command: &Command) -> Option<&Identity> {
     }
 }
 
+fn tune_model_params(
+    setting: &str,
+    harness: Option<&String>,
+    model: &String,
+    effort: &Option<String>,
+    context: &Option<String>,
+) -> Vec<String> {
+    let mut params = vec![
+        string_field("setting", setting),
+        string_field("model", model),
+    ];
+    if let Some(harness) = harness {
+        params.push(string_field("harness", harness));
+    }
+    if let Some(effort) = effort {
+        params.push(string_field("effort", effort));
+    }
+    if let Some(context) = context {
+        params.push(string_field("context", context));
+    }
+    params
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1278,6 +1353,14 @@ mod tests {
         assert_eq!(
             body(&["harness-process", "list", "--as-user", "flynn"]),
             r#"{"asUser":"flynn","verb":"harness-processes","params":{}}"#
+        );
+    }
+
+    #[test]
+    fn tune_refusals_remain_machine_readable_json() {
+        assert_eq!(
+            tune_refusal_json(r#"{"error":{"code":"same_harness","message":"omit --harness"}}"#),
+            r#"{"code":"same_harness","message":"omit --harness","ok":false}"#
         );
     }
 

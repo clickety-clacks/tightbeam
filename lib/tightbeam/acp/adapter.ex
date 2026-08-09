@@ -61,7 +61,8 @@ defmodule Tightbeam.Acp.Adapter do
     known: MapSet.new(),
     models: %{},
     unprompted: MapSet.new(),
-    switchable_models: %{}
+    switchable_models: %{},
+    config_options: %{}
   ]
 
   ## Client
@@ -99,6 +100,16 @@ defmodule Tightbeam.Acp.Adapter do
           {:ok, String.t()} | {:error, term()}
   def new_session(adapter, model, cwd, mcp_servers, guidance),
     do: call(adapter, {:new_session, model, cwd, mcp_servers, guidance}, 30_000)
+
+  @doc "Prepare a candidate and report the close outcome when post-create verification fails."
+  @spec new_candidate_session(adapter(), model_ref(), String.t(), [map()], String.t()) ::
+          {:ok, String.t()}
+          | {:error,
+             {:session_prepare_failed, term(), String.t(),
+              %{status: String.t(), reason: term() | nil}}}
+          | {:error, term()}
+  def new_candidate_session(adapter, model, cwd, mcp_servers, guidance),
+    do: call(adapter, {:new_candidate_session, model, cwd, mcp_servers, guidance}, 30_000)
 
   def new_session_for_turn(adapter, model, cwd, mcp_servers, guidance),
     do: call(adapter, {:new_session, model, cwd, mcp_servers, guidance, :infinity}, :infinity)
@@ -148,6 +159,46 @@ defmodule Tightbeam.Acp.Adapter do
           | {:error, :model_capability_unavailable | {:adapter_unavailable, term()}}
   def switchable_models(adapter, session_id),
     do: call(adapter, {:switchable_models, session_id}, @boot_boundary_timeout)
+
+  @doc "One live config option from the latest harness readback for this resident session."
+  @spec live_config_option(adapter(), String.t(), String.t()) ::
+          {:ok, map()}
+          | {:error, :config_option_unsupported | {:adapter_unavailable, term()}}
+  def live_config_option(adapter, session_id, config_id),
+    do: call(adapter, {:live_config_option, session_id, config_id}, @boot_boundary_timeout)
+
+  @doc "Apply one advertised live config option and require exact harness readback."
+  @spec apply_live_config_option(adapter(), String.t(), String.t(), String.t()) ::
+          {:ok, map()}
+          | {:error,
+             :config_option_unsupported
+             | {:config_option_verification_failed, map() | nil}
+             | term()}
+  def apply_live_config_option(adapter, session_id, config_id, value),
+    do:
+      call(
+        adapter,
+        {:apply_live_config_option, session_id, config_id, value},
+        @boot_boundary_timeout
+      )
+
+  @doc "Canonical Fast state from the resident harness's latest live config response."
+  @spec fast_status(adapter(), String.t()) ::
+          {:ok, %{fast: String.t(), option_id: String.t()}}
+          | {:error, :fast_unsupported | :runtime_config_unknown | {:adapter_unavailable, term()}}
+  def fast_status(adapter, session_id),
+    do: call(adapter, {:fast_status, session_id}, @boot_boundary_timeout)
+
+  @doc "Apply canonical Fast on/off through the live option advertised by this adapter."
+  @spec apply_fast(adapter(), String.t(), String.t()) ::
+          {:ok, %{fast: String.t(), option_id: String.t()}}
+          | {:error,
+             :fast_unsupported
+             | :runtime_config_unknown
+             | {:runtime_config_mismatch, String.t()}
+             | term()}
+  def apply_fast(adapter, session_id, value) when value in ["on", "off"],
+    do: call(adapter, {:apply_fast, session_id, value}, @boot_boundary_timeout)
 
   @doc "Best-effort ACP teardown for one harness session; adapter failures never escape the caller."
   @spec close_session(adapter(), String.t()) :: :ok | {:error, term()}
@@ -451,7 +502,11 @@ defmodule Tightbeam.Acp.Adapter do
 
   @impl true
   def handle_call({:new_session, model, cwd, mcp_servers, guidance}, _from, state) do
-    new_session_reply(state, model, cwd, mcp_servers, guidance, 60_000)
+    new_session_reply(state, model, cwd, mcp_servers, guidance, 60_000, false)
+  end
+
+  def handle_call({:new_candidate_session, model, cwd, mcp_servers, guidance}, _from, state) do
+    new_session_reply(state, model, cwd, mcp_servers, guidance, 60_000, true)
   end
 
   def handle_call(
@@ -459,7 +514,7 @@ defmodule Tightbeam.Acp.Adapter do
         _from,
         state
       ) do
-    new_session_reply(state, model, cwd, mcp_servers, guidance, request_timeout)
+    new_session_reply(state, model, cwd, mcp_servers, guidance, request_timeout, false)
   end
 
   def handle_call({:load_session, sid, model, cwd, mcp_servers, guidance}, _from, state) do
@@ -501,6 +556,7 @@ defmodule Tightbeam.Acp.Adapter do
             models: Map.delete(state.models, sid),
             unprompted: MapSet.delete(state.unprompted, sid),
             switchable_models: Map.delete(state.switchable_models, sid),
+            config_options: Map.delete(state.config_options, sid),
             chunks: Map.delete(state.chunks, sid),
             progress: Map.delete(state.progress, sid)
         }
@@ -561,6 +617,79 @@ defmodule Tightbeam.Acp.Adapter do
     end
   end
 
+  def handle_call({:live_config_option, sid, config_id}, _from, state) do
+    case cached_config_option(state, sid, config_id) do
+      nil -> {:reply, {:error, :config_option_unsupported}, state}
+      option -> {:reply, {:ok, option}, state}
+    end
+  end
+
+  def handle_call({:apply_live_config_option, sid, config_id, value}, _from, state) do
+    case cached_config_option(state, sid, config_id) do
+      nil ->
+        {:reply, {:error, :config_option_unsupported}, state}
+
+      _advertised ->
+        case Conn.request(
+               state.conn,
+               "session/set_config_option",
+               %{sessionId: sid, configId: config_id, value: value},
+               timeout: 30_000
+             ) do
+          {:ok, result} ->
+            state = remember_config_options(state, sid, result)
+
+            case cached_config_option(state, sid, config_id) do
+              %{} = option ->
+                if (option["currentValue"] || option["value"]) == value do
+                  {:reply, {:ok, option}, state}
+                else
+                  {:reply, {:error, {:config_option_verification_failed, option}}, state}
+                end
+
+              actual ->
+                {:reply, {:error, {:config_option_verification_failed, actual}}, state}
+            end
+
+          {:error, reason} ->
+            {:reply, {:error, reason}, state}
+        end
+    end
+  end
+
+  def handle_call({:fast_status, sid}, _from, state) do
+    {:reply, canonical_fast_status(state, sid), state}
+  end
+
+  def handle_call({:apply_fast, sid, requested}, _from, state) do
+    with {:ok, option} <- advertised_fast_option(state, sid),
+         {:ok, wire_value} <- fast_wire_value(option, requested) do
+      case Conn.request(
+             state.conn,
+             "session/set_config_option",
+             %{sessionId: sid, configId: option_id(option), value: wire_value},
+             timeout: 30_000
+           ) do
+        {:ok, result} ->
+          state = remember_config_options(state, sid, result)
+
+          reply =
+            case canonical_fast_status(state, sid) do
+              {:ok, %{fast: ^requested} = actual} -> {:ok, actual}
+              {:ok, %{fast: actual}} -> {:error, {:runtime_config_mismatch, actual}}
+              {:error, _reason} -> {:error, :runtime_config_unknown}
+            end
+
+          {:reply, reply, state}
+
+        {:error, reason} ->
+          {:reply, {:error, reason}, state}
+      end
+    else
+      {:error, reason} -> {:reply, {:error, reason}, state}
+    end
+  end
+
   def handle_call({:forget_model_residency, sid}, _from, state),
     do: {:reply, :ok, drop_model_residency(state, sid)}
 
@@ -575,59 +704,106 @@ defmodule Tightbeam.Acp.Adapter do
       {:ok, applied_model} ->
         {:reply, {:ok, sid}, put_in(state.models[sid], applied_model)}
 
-      error ->
-        {:reply, error, drop_model_residency(state, sid)}
+      {:error, {:runtime_config_mismatch, %Model{} = actual}} = error ->
+        {:reply, error, put_in(state.models[sid], actual)}
+
+      {:error, :model_unavailable} = error ->
+        {:reply, error, state}
+
+      {:error, reason} ->
+        {:reply, {:error, {:runtime_config_unknown, reason}}, drop_model_residency(state, sid)}
     end
   end
 
   defp apply_verified_in_place_model(state, sid, %Model{} = model, request_timeout) do
     value = Model.to_ref(model)
 
-    with {:ok, model_result} <-
-           map_switch_model_refusal(
-             Conn.request(
-               state.conn,
-               "session/set_config_option",
-               %{sessionId: sid, configId: "model", value: value},
-               timeout: request_timeout
-             )
-           ),
-         true <- read_back?(model_result, "model", value),
-         {:ok, _verified_result} <-
-           apply_verified_effort(state, sid, model.effort, model_result, request_timeout) do
-      {:ok, model}
-    else
-      false -> {:error, :model_verification_failed}
-      {:error, _reason} = error -> error
+    case map_switch_model_refusal(
+           Conn.request(
+             state.conn,
+             "session/set_config_option",
+             %{sessionId: sid, configId: "model", value: value},
+             timeout: request_timeout
+           )
+         ) do
+      {:ok, model_result} ->
+        cond do
+          not read_back?(model_result, "model", value) ->
+            verified_model_mismatch(model_result, state.preset)
+
+          true ->
+            case apply_verified_effort(
+                   state,
+                   sid,
+                   model.effort,
+                   model_result,
+                   request_timeout
+                 ) do
+              {:ok, _verified_result} -> {:ok, model}
+              {:error, {:runtime_config_mismatch, %Model{}}} = mismatch -> mismatch
+              {:error, _reason} = error -> error
+            end
+        end
+
+      {:error, _reason} = error ->
+        error
     end
   end
 
-  defp new_session_reply(state, model, cwd, mcp_servers, guidance, request_timeout) do
-    with {:ok, result} <-
-           Conn.request(
-             state.conn,
-             "session/new",
-             %{
-               cwd: cwd,
-               mcpServers: mcp_servers,
-               _meta: Harness.module!(state.harness).session_config(%{}, guidance).meta
-             },
-             timeout: request_timeout
-           ),
-         sid = result["sessionId"],
-         {:ok, applied_model} <-
-           establish_new_session_model(state, sid, model, result, request_timeout),
-         :ok <- set_mode(state, sid, request_timeout) do
-      state =
-        state
-        |> put_in([Access.key(:known)], MapSet.put(state.known, sid))
-        |> remember_model(sid, applied_model)
-        |> remember_switchable_models(sid, result)
-        |> put_in([Access.key(:unprompted)], MapSet.put(state.unprompted, sid))
+  defp new_session_reply(
+         state,
+         model,
+         cwd,
+         mcp_servers,
+         guidance,
+         request_timeout,
+         report_cleanup?
+       ) do
+    case Conn.request(
+           state.conn,
+           "session/new",
+           %{
+             cwd: cwd,
+             mcpServers: mcp_servers,
+             _meta: Harness.module!(state.harness).session_config(%{}, guidance).meta
+           },
+           timeout: request_timeout
+         ) do
+      {:ok, %{"sessionId" => sid} = result} when is_binary(sid) ->
+        with {:ok, applied_model} <-
+               establish_new_session_model(state, sid, model, result, request_timeout),
+             :ok <- set_mode(state, sid, request_timeout) do
+          state =
+            state
+            |> put_in([Access.key(:known)], MapSet.put(state.known, sid))
+            |> remember_model(sid, applied_model)
+            |> remember_switchable_models(sid, result)
+            |> remember_config_options(sid, result)
+            |> put_in([Access.key(:unprompted)], MapSet.put(state.unprompted, sid))
 
-      {:reply, {:ok, sid}, put_in(state.chunks[sid], [])}
-    else
-      {:error, error} -> {:reply, {:error, error}, state}
+          {:reply, {:ok, sid}, put_in(state.chunks[sid], [])}
+        else
+          {:error, error} ->
+            if report_cleanup? do
+              cleanup = close_failed_new_session(state, sid)
+              {:reply, {:error, {:session_prepare_failed, error, sid, cleanup}}, state}
+            else
+              {:reply, {:error, error}, state}
+            end
+        end
+
+      {:ok, result} ->
+        {:reply, {:error, {:invalid_new_session_response, result}}, state}
+
+      {:error, error} ->
+        {:reply, {:error, error}, state}
+    end
+  end
+
+  defp close_failed_new_session(state, sid) do
+    case Conn.request(state.conn, "session/close", %{sessionId: sid}) do
+      {:ok, _result} -> %{status: "verified", reason: nil}
+      {:error, reason} -> %{status: "unverified", reason: reason}
     end
   end
 
@@ -650,6 +826,7 @@ defmodule Tightbeam.Acp.Adapter do
           |> put_in([Access.key(:models)], Map.delete(state.models, sid))
           |> put_in([Access.key(:unprompted)], MapSet.delete(state.unprompted, sid))
           |> remember_switchable_models(sid, result)
+          |> remember_config_options(sid, result)
           |> put_in([Access.key(:chunks), sid], [])
 
         case model do
@@ -701,6 +878,7 @@ defmodule Tightbeam.Acp.Adapter do
             |> put_in([Access.key(:known)], MapSet.put(state.known, new_sid))
             |> remember_model(new_sid, applied_model)
             |> remember_switchable_models(new_sid, result)
+            |> remember_config_options(new_sid, result)
             |> put_in([Access.key(:chunks), new_sid], [])
 
           {:reply, {:ok, new_sid}, state}
@@ -782,18 +960,26 @@ defmodule Tightbeam.Acp.Adapter do
     do: {:ok, model_result}
 
   defp apply_verified_effort(state, sid, effort, _model_result, request_timeout) do
-    with {:ok, effort_result} <-
-           Conn.request(
-             state.conn,
-             "session/set_config_option",
-             %{sessionId: sid, configId: state.preset.effort_config, value: effort},
-             timeout: request_timeout
-           ),
-         true <- read_back?(effort_result, state.preset.effort_config, effort) do
-      {:ok, effort_result}
-    else
-      false -> {:error, :model_verification_failed}
-      {:error, _reason} = error -> error
+    case Conn.request(
+           state.conn,
+           "session/set_config_option",
+           %{sessionId: sid, configId: state.preset.effort_config, value: effort},
+           timeout: request_timeout
+         ) do
+      {:ok, effort_result} ->
+        if read_back?(effort_result, state.preset.effort_config, effort),
+          do: {:ok, effort_result},
+          else: verified_model_mismatch(effort_result, state.preset)
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp verified_model_mismatch(result, preset) do
+    case model_ref_from_config(result, preset.effort_config) do
+      {:ok, actual} -> {:error, {:runtime_config_mismatch, actual}}
+      :error -> {:error, :model_readback_unavailable}
     end
   end
 
@@ -1136,7 +1322,7 @@ defmodule Tightbeam.Acp.Adapter do
             end) do
       case model_ref_from_config(effort_result, state.preset.effort_config) do
         {:ok, applied_model} -> {:ok, applied_model}
-        :error -> {:ok, model_ref}
+        :error -> {:error, :model_readback_unavailable}
       end
     end
   end
@@ -1217,7 +1403,10 @@ defmodule Tightbeam.Acp.Adapter do
          sid,
          %{"sessionUpdate" => "config_option_update", "configOptions" => options}
        ) do
-    state = remember_switchable_models(state, sid, %{"configOptions" => options})
+    state =
+      state
+      |> remember_switchable_models(sid, %{"configOptions" => options})
+      |> remember_config_options(sid, %{"configOptions" => options})
 
     case Map.fetch(state.models, sid) do
       {:ok, %Model{} = cached} ->
@@ -1243,7 +1432,8 @@ defmodule Tightbeam.Acp.Adapter do
       | known: MapSet.delete(state.known, sid),
         models: Map.delete(state.models, sid),
         unprompted: MapSet.delete(state.unprompted, sid),
-        switchable_models: Map.delete(state.switchable_models, sid)
+        switchable_models: Map.delete(state.switchable_models, sid),
+        config_options: Map.delete(state.config_options, sid)
     }
   end
 
@@ -1255,6 +1445,71 @@ defmodule Tightbeam.Acp.Adapter do
     else
       put_in(state.switchable_models[sid], models)
     end
+  end
+
+  defp remember_config_options(state, sid, %{"configOptions" => options})
+       when is_list(options),
+       do: put_in(state.config_options[sid], options)
+
+  defp remember_config_options(state, sid, _result),
+    do: put_in(state.config_options, Map.delete(state.config_options, sid))
+
+  defp cached_config_option(state, sid, config_id) do
+    state.config_options
+    |> Map.get(sid, [])
+    |> Enum.find(&((&1["id"] || &1["configId"]) == config_id))
+  end
+
+  defp advertised_fast_option(state, sid) do
+    with {:ok, options} <- Map.fetch(state.config_options, sid),
+         %{} = option <-
+           Enum.find(options, &(option_id(&1) in ["fast", "fast-mode"])) do
+      {:ok, option}
+    else
+      nil -> {:error, :fast_unsupported}
+      :error -> {:error, :runtime_config_unknown}
+      _ -> {:error, :fast_unsupported}
+    end
+  end
+
+  defp canonical_fast_status(state, sid) do
+    with {:ok, option} <- advertised_fast_option(state, sid),
+         {:ok, fast} <- canonical_fast_value(option_current_value(option)) do
+      {:ok, %{fast: fast, option_id: option_id(option)}}
+    else
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp fast_wire_value(option, requested) do
+    offered = option["options"] || []
+
+    case Enum.find_value(offered, fn candidate ->
+           value = candidate["value"]
+
+           case canonical_fast_value(value) do
+             {:ok, ^requested} -> {:found, value}
+             _ -> nil
+           end
+         end) do
+      {:found, value} ->
+        {:ok, value}
+
+      nil ->
+        if option["type"] in ["boolean", "bool"] or is_boolean(option["currentValue"]),
+          do: {:ok, requested == "on"},
+          else: {:ok, requested}
+    end
+  end
+
+  defp canonical_fast_value(value) when value in [true, "on", "enabled"], do: {:ok, "on"}
+  defp canonical_fast_value(value) when value in [false, "off", "disabled"], do: {:ok, "off"}
+  defp canonical_fast_value(_value), do: {:error, :runtime_config_unknown}
+
+  defp option_id(option), do: option["id"] || option["configId"]
+
+  defp option_current_value(option) do
+    if Map.has_key?(option, "currentValue"), do: option["currentValue"], else: option["value"]
   end
 
   defp model_value_candidates(preset, result, %Model{} = model) do
