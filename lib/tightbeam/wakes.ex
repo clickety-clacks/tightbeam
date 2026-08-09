@@ -57,6 +57,9 @@ defmodule Tightbeam.Wakes do
   @typedoc "Delivery fun injected by the composition root: fires the prompt into the turn pipeline."
   @type deliver :: (wake() -> any())
 
+  @type cancellation_result ::
+          false | true | {:accepted_in_txn, pos_integer(), %{canceled: true}}
+
   @ddl """
   CREATE TABLE IF NOT EXISTS wakes (
     wakeId     TEXT PRIMARY KEY,
@@ -323,13 +326,15 @@ defmodule Tightbeam.Wakes do
   Commands use atom keys and closed string classifications. They contain
   `:wake_id`, optional `:expected_origin`, `:requester`, `:reason_kind`,
   `:causal_source`, and one tagged `:outcome`. This function derives linked
-  work impact and the action-needed bit from durable rows.
+  work impact and the action-needed bit from durable rows. A successful public
+  verb cancellation returns `{:accepted_in_txn, event_id, %{canceled: true}}`;
+  a successful internal cancellation returns `true`, and refusal returns `false`.
   """
-  @spec cancel_in_txn(Txn.t(), map()) :: boolean()
+  @spec cancel_in_txn(Txn.t(), map()) :: cancellation_result()
   def cancel_in_txn(%Txn{} = txn, command), do: cancel_in_txn(txn, command, &now/0)
 
   @doc false
-  @spec cancel_in_txn(Txn.t(), map(), (-> non_neg_integer())) :: boolean()
+  @spec cancel_in_txn(Txn.t(), map(), (-> non_neg_integer())) :: cancellation_result()
   def cancel_in_txn(%Txn{} = txn, command, clock)
       when is_map(command) and is_function(clock, 0) do
     with {:ok, wake} <- pending_wake(txn, command),
@@ -490,7 +495,7 @@ defmodule Tightbeam.Wakes do
 
     with :ok <- compatible?(requester_id, reason_kind, source_kind, outcome_kind),
          {:ok, tagged} <- validate_outcome(txn, outcome_kind, outcome, wake, primary),
-         {:ok, durable_source_id} <-
+         {:ok, durable_source_id, accepted_event_id} <-
            durable_source(txn, command, source_kind, source_id, wake, canceled_at) do
       {:ok,
        Map.merge(tagged, %{
@@ -499,6 +504,7 @@ defmodule Tightbeam.Wakes do
          reason_kind: reason_kind,
          source_kind: source_kind,
          source_id: durable_source_id,
+         accepted_event_id: accepted_event_id,
          canceled_at: canceled_at,
          primary_kind: primary.kind,
          primary_id: primary.id,
@@ -512,7 +518,7 @@ defmodule Tightbeam.Wakes do
   defp durable_source(txn, _command, source_kind, source_id, wake, _canceled_at)
        when source_kind != "verb_call" and is_binary(source_id) and source_id != "" do
     case validate_source(txn, source_kind, source_id, wake) do
-      :ok -> {:ok, source_id}
+      :ok -> {:ok, source_id, nil}
       :error -> :error
     end
   end
@@ -555,7 +561,7 @@ defmodule Tightbeam.Wakes do
           canceled_at
         )
 
-      {:ok, Integer.to_string(event_id)}
+      {:ok, Integer.to_string(event_id), event_id}
     else
       _ -> :error
     end
@@ -928,11 +934,17 @@ defmodule Tightbeam.Wakes do
         )
       end
 
-      true
+      cancellation_result(cancellation)
     else
       false
     end
   end
+
+  defp cancellation_result(%{accepted_event_id: event_id})
+       when is_integer(event_id) and event_id > 0,
+       do: {:accepted_in_txn, event_id, %{canceled: true}}
+
+  defp cancellation_result(_cancellation), do: true
 
   @spec get(db(), String.t()) :: wake() | nil
   def get(db \\ Tightbeam.DB, wake_id) do
