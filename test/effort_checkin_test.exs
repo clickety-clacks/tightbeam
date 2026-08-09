@@ -121,6 +121,19 @@ defmodule Tightbeam.EffortCheckinTest do
       assert bracket_state(ctx.db, item.id) == "canceled"
       assert request(ctx.db, open.id).status == "superseded"
       assert Wakes.get(ctx.db, open.deadline_wake_id).state == "canceled"
+
+      assert %{
+               requester: "tightbeam:assignments",
+               reason: "obligation_disposed",
+               source_kind: "assignment_transition",
+               source_id: source_assignment_id,
+               outcome: "disposition",
+               disposition_kind: "assignment_transition",
+               disposition_id: disposition_assignment_id
+             } = cancellation(ctx.db, open.deadline_wake_id)
+
+      assert source_assignment_id == item.id
+      assert disposition_assignment_id == item.id
     end
 
     revoked = dispatch(ctx, {:session, "parent"}, "holder", "revoked")
@@ -134,14 +147,38 @@ defmodule Tightbeam.EffortCheckinTest do
     retired = dispatch(ctx, {:session, "parent"}, "holder", "retired")
     retired_open = escalate(ctx, retired.id)
 
+    assert {:error,
+            %ArgumentError{message: "retirement interruption requires a durable principal"}} =
+             DB.transaction(ctx.db, fn txn ->
+               Assignments.interrupt_for_retire_in_txn(txn, "holder", "h2", nil)
+             end)
+
+    assert rows(ctx.db, "SELECT state FROM assignments WHERE id=?1", [retired.id]) == [["open"]]
+    assert bracket_state(ctx.db, retired.id) == "armed"
+    assert request(ctx.db, retired_open.id).status == "open"
+    assert Wakes.get(ctx.db, retired_open.deadline_wake_id).state == "pending"
+
     {:ok, _} =
       DB.transaction(ctx.db, fn txn ->
-        Assignments.interrupt_for_retire_in_txn(txn, "holder", "h2")
+        Assignments.interrupt_for_retire_in_txn(txn, "holder", "h2", "user:h2")
       end)
 
     assert bracket_state(ctx.db, retired.id) == "canceled"
     assert request(ctx.db, retired_open.id).status == "superseded"
     assert Wakes.get(ctx.db, retired_open.deadline_wake_id).state == "canceled"
+
+    assert %{
+             requester: "tightbeam:retirement",
+             reason: "obligation_disposed",
+             source_kind: "assignment_transition",
+             source_id: retired_source_id,
+             outcome: "disposition",
+             disposition_kind: "assignment_transition",
+             disposition_id: retired_disposition_id
+           } = cancellation(ctx.db, retired_open.deadline_wake_id)
+
+    assert retired_source_id == retired.id
+    assert retired_disposition_id == retired.id
   end
 
   test "acceptance 4 and 5: writes are detected with no git anywhere; a stall is not effect",
@@ -380,6 +417,23 @@ defmodule Tightbeam.EffortCheckinTest do
                ctx.config,
                effort_call(first.id, "continue", {:session, "parent"})
              )
+
+    assert %{
+             requester: "tightbeam:effort-checkin",
+             reason: "obligation_disposed",
+             source_kind: "decision_request",
+             source_id: first_source_id,
+             outcome: "disposition",
+             disposition_kind: "decision_request_transition",
+             disposition_id: first_disposition_id,
+             liveness_kind: "supervision_entitlement",
+             liveness_id: first_liveness_id,
+             action_needed: 1
+           } = cancellation(ctx.db, first.deadline_wake_id)
+
+    assert first_source_id == first.id
+    assert first_disposition_id == first.id
+    assert first_liveness_id == "#{item.id}#1"
 
     # The agent was prodded once at the top of this silent streak; every later
     # bracket in the same streak goes straight to the owner.
@@ -1165,6 +1219,17 @@ defmodule Tightbeam.EffortCheckinTest do
     assert request(ctx.db, open.id).status == "superseded"
     assert bracket_state(ctx.db, item.id) == "armed"
 
+    replacement_wake = current_wake(ctx.db, item.id)
+
+    assert %{
+             requester: "tightbeam:effort-checkin",
+             reason: "superseded",
+             outcome: "replacement",
+             replacement_wake_id: replacement_wake_id
+           } = cancellation(ctx.db, open.deadline_wake_id)
+
+    assert replacement_wake_id == replacement_wake.wake_id
+
     assert rows(ctx.db, "SELECT COUNT(*) FROM effort_checkin_generations WHERE assignmentId=?1", [
              bare.id
            ]) == [[0]]
@@ -1262,7 +1327,8 @@ defmodule Tightbeam.EffortCheckinTest do
       target_role: nil,
       role_fallback: false,
       params: params,
-      effort_config: ctx.config
+      effort_config: ctx.config,
+      supervision_interval_ms: ctx.config.wake_tick_ms
     }
 
     Assignments.__handle__(ctx.db, verb, call)
@@ -1399,6 +1465,48 @@ defmodule Tightbeam.EffortCheckinTest do
   defp rows(db, sql, params) do
     {:ok, rows} = DB.query(db, sql, params)
     rows
+  end
+
+  defp cancellation(db, wake_id) do
+    [
+      [
+        requester,
+        reason,
+        source_kind,
+        source_id,
+        outcome,
+        replacement_wake_id,
+        disposition_kind,
+        disposition_id,
+        liveness_kind,
+        liveness_id,
+        action_needed
+      ]
+    ] =
+      rows(
+        db,
+        """
+        SELECT requesterId,reasonKind,causalSourceKind,causalSourceId,outcomeKind,
+               replacementWakeId,dispositionKind,dispositionId,livenessTriggerKind,
+               livenessTriggerId,actionNeeded
+        FROM wake_cancellations WHERE wakeId=?1
+        """,
+        [wake_id]
+      )
+
+    %{
+      requester: requester,
+      reason: reason,
+      source_kind: source_kind,
+      source_id: source_id,
+      outcome: outcome,
+      replacement_wake_id: replacement_wake_id,
+      disposition_kind: disposition_kind,
+      disposition_id: disposition_id,
+      liveness_kind: liveness_kind,
+      liveness_id: liveness_id,
+      action_needed: action_needed
+    }
   end
 
   # Notification wakes are the ungated (targetGate = 0) prompt wakes.
