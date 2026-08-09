@@ -148,6 +148,47 @@ defmodule Tightbeam.SupervisionTest do
     refute "pendingTarget" in names
   end
 
+  test "work-item liveness selects its current bracket before another assignment", ctx do
+    :ok =
+      DB.execute(
+        ctx.db,
+        """
+        INSERT INTO work_items
+          (id, title, ownerUserId, state, createdByUser, createdAt)
+        VALUES ('wi_bracket_first', 'Bracket first', 'flynn', 'open', 'flynn', 1);
+        UPDATE assignments SET workItemId='wi_bracket_first' WHERE id='asg_1';
+        INSERT INTO supervision_entitlements
+          (assignmentId, generation, dueAt, state, lastAttemptGeneration,
+           claimClock, basisKind, basisId, terminusAt, cause, principal,
+           supervisionIntervalMs)
+        VALUES
+          ('asg_1', 4, 5000, 'armed', NULL, NULL, 'assignment_open',
+           'asg_1', NULL, 'assignment_open', 'user:flynn', 1000);
+        """
+      )
+
+    bracket =
+      Wakes.schedule(ctx.db, %{
+        session_key: ctx.holder.session_key,
+        origin: "process:tightbeam",
+        prompt: "route the remaining work",
+        due_at: 4_000,
+        work_item_id: "wi_bracket_first"
+      })
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE work_items SET slateWakeId=?2 WHERE id=?1",
+        ["wi_bracket_first", bracket.wake_id]
+      )
+
+    assert {:ok, {:ok, %{kind: "routing_bracket", id: "wi_bracket_first"}}} =
+             DB.transaction(ctx.db, fn txn ->
+               Supervision.liveness_trigger_in_txn(txn, {:work_item, "wi_bracket_first"})
+             end)
+  end
+
   test "prod claims once, counts delivery once, and freezes its outbox numbers", ctx do
     seq = terminal!(ctx.db, "holder")
 
@@ -2122,13 +2163,13 @@ defmodule Tightbeam.SupervisionTest do
                  expected_origin: wake.origin,
                  requester: requester,
                  reason_kind: "requester_withdrew",
-                 causal_source: %{kind: "verb_call", id: nil},
-                 accepted_event: %{
-                   verb: "wake",
-                   origin: wake.origin,
-                   session_key: session_key,
-                   payload: %{cancel_wake_id: wake.wake_id, canceled: true},
-                   principal: principal
+                 causal_source: %{
+                   kind: "verb_call",
+                   accepted_event: %{
+                     origin: wake.origin,
+                     session_key: session_key,
+                     principal: principal
+                   }
                  },
                  outcome: outcome
                })
