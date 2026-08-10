@@ -6375,7 +6375,7 @@ defmodule Tightbeam.GatewayTest do
       VALUES ('wi_process_cause', 'Process cause', 'flynn', 'flynn', 1)
       """)
 
-    for assignment_id <- ["asg_codex", "asg_claude", "asg_unknown"] do
+    for assignment_id <- ["asg_codex", "asg_claude", "asg_unknown", "asg_credential_known"] do
       {:ok, _} =
         DB.query(
           ctx.db,
@@ -6440,8 +6440,7 @@ defmodule Tightbeam.GatewayTest do
 
       after_commit.(notice)
       publish.("failed")
-      frame_count = if assignment_id == "asg_unknown", do: 9, else: 10
-      {turn, collect_pushes(frame_count, [])}
+      {turn, collect_pushes_until_failed("c_#{assignment_id}", [])}
     end
 
     {codex_turn, codex_frames} = run_failure.("known codex failure", "asg_codex")
@@ -6507,16 +6506,18 @@ defmodule Tightbeam.GatewayTest do
     assert Enum.at(target_markers, 0).content =~ "Codex usage limit reached"
     assert Enum.at(target_markers, 1).content =~ "Claude rate limit reached"
 
-    failed_state_error = fn frames ->
+    failed_state_error = fn frames, assignment_id ->
       frames
-      |> Enum.find(
-        &match?(%{"event" => "prompt_turn_state", "payload" => %{"state" => "failed"}}, &1)
-      )
+      |> Enum.find(fn frame ->
+        frame["event"] == "prompt_turn_state" and
+          get_in(frame, ["payload", "messageId"]) == "c_#{assignment_id}" and
+          get_in(frame, ["payload", "state"]) == "failed"
+      end)
       |> get_in(["payload", "error"])
     end
 
-    assert failed_state_error.(codex_frames) == "Codex usage limit reached"
-    assert failed_state_error.(claude_frames) == "Claude rate limit reached"
+    assert failed_state_error.(codex_frames, "asg_codex") == "Codex usage limit reached"
+    assert failed_state_error.(claude_frames, "asg_claude") == "Claude rate limit reached"
 
     {:ok, stored_errors} =
       DB.query(
@@ -6529,8 +6530,8 @@ defmodule Tightbeam.GatewayTest do
 
     public_known_output =
       Enum.map_join(Enum.take(target_markers, 2), & &1.content) <>
-        failed_state_error.(codex_frames) <>
-        failed_state_error.(claude_frames) <>
+        failed_state_error.(codex_frames, "asg_codex") <>
+        failed_state_error.(claude_frames, "asg_claude") <>
         Enum.map_join(stored_errors, fn [error] -> error end)
 
     refute public_known_output =~ "provider-secret"
@@ -6545,6 +6546,36 @@ defmodule Tightbeam.GatewayTest do
              EventLog.lifecycle_events(ctx.db),
              &(&1.kind == "harness_turn_error" and &1.subject == "k1")
            ) == 3
+
+    degrade_host_catalog("testhost", "claude", {:needs_onboarding, :missing})
+
+    {credential_turn, credential_frames} =
+      run_failure.("known codex failure", "asg_credential_known")
+
+    credential_marker =
+      ctx.db
+      |> Projection.list_after("k1", nil, 100)
+      |> Enum.filter(&String.starts_with?(&1.content || "", "[turn failed]"))
+      |> List.last()
+
+    assert credential_marker.content =~ "tightbeam onboard anthropic --as-user <userId>"
+    refute credential_marker.content =~ "Codex usage limit reached"
+
+    credential_state_error = failed_state_error.(credential_frames, "asg_credential_known")
+    assert credential_state_error =~ "tightbeam onboard anthropic --as-user <userId>"
+    refute credential_state_error =~ "Codex usage limit reached"
+
+    {:ok, [[credential_stored_error]]} =
+      DB.query(ctx.db, "SELECT error FROM turns WHERE seq=?1", [credential_turn.seq])
+
+    assert credential_stored_error =~ "tightbeam onboard anthropic --as-user <userId>"
+    refute credential_stored_error =~ "Codex usage limit reached"
+
+    assert Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
+             event.kind == "assignment_process_failure" and
+               event.subject == "asg_credential_known" and
+               JSON.decode!(event.detail)["safeCause"]["code"] == "codex_usage_limit"
+           end)
   end
 
   test "process cause recording rolls back with the failed turn finalization", ctx do
@@ -8790,6 +8821,33 @@ defmodule Tightbeam.GatewayTest do
       {:ensure_lane, _key} -> collect_pushes(n, acc)
     after
       1_000 -> flunk("timed out collecting golden frames")
+    end
+  end
+
+  defp collect_pushes_until_failed(message_id, acc) do
+    receive do
+      {:push, payload} ->
+        collect_push_until_failed(payload, message_id, acc)
+
+      {:push_message, _key, _seq, payload} ->
+        collect_push_until_failed(payload, message_id, acc)
+
+      {:ensure_lane, _key} ->
+        collect_pushes_until_failed(message_id, acc)
+    after
+      1_000 -> flunk("timed out collecting failed turn frames")
+    end
+  end
+
+  defp collect_push_until_failed(payload, message_id, acc) do
+    frames = [payload | acc]
+
+    if payload["event"] == "prompt_turn_state" and
+         get_in(payload, ["payload", "messageId"]) == message_id and
+         get_in(payload, ["payload", "state"]) == "failed" do
+      Enum.reverse(frames)
+    else
+      collect_pushes_until_failed(message_id, frames)
     end
   end
 

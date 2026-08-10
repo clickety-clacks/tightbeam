@@ -1971,18 +1971,25 @@ defmodule Tightbeam.Gateway do
             raw_reason = reason
             safe_failure = safe_process_failure(failed_stage, raw_reason)
 
-            reason =
+            {reason, credential_refused?} =
               case turn_credential_refusal(session) do
-                {:refused, message} -> message
-                :not_applicable -> reason
+                {:refused, message} -> {message, true}
+                :not_applicable -> {reason, false}
               end
 
             # A reviewed concrete cause is the whole public reason. The raw ACP
             # term remains only in `harness_turn_error`, the existing internal
             # diagnostic below; arbitrary provider prose must not ride the
             # target marker, terminal state, or stored turn error.
-            public_reason = if safe_failure, do: safe_failure.message, else: reason
-            public_state_error = if safe_failure, do: safe_failure.message, else: inspect(reason)
+            public_reason =
+              if not is_nil(safe_failure) and not credential_refused?,
+                do: safe_failure.message,
+                else: reason
+
+            public_state_error =
+              if not is_nil(safe_failure) and not credential_refused?,
+                do: safe_failure.message,
+                else: inspect(reason)
 
             failure_publish = fn _terminal ->
               # THE ERROR MUST REACH THE CHAT. Every failed turn gets the marker
