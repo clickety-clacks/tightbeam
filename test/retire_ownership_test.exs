@@ -42,7 +42,10 @@ defmodule Tightbeam.RetireOwnershipTest do
     session!(db, "agent:worker:app", "flynn")
     Roles.create!(db, "worker", "flynn", "agent:worker:app")
 
-    %{db: db, handlers: Gateway.handlers(%{db: db, base_dir: System.tmp_dir!()})}
+    %{
+      db: db,
+      handlers: Gateway.handlers(%{db: db, base_dir: System.tmp_dir!(), wake_tick_ms: 1_000})
+    }
   end
 
   test "a role-origin agent retires a session its own owner owns", ctx do

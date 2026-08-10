@@ -45,7 +45,7 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
     assert {:ok, _revision} = Identity.learn!(base_dir, "agentic-engineering", "flynn")
     _archetypes = Archetypes.load!(base_dir)
 
-    handlers = Gateway.handlers(%{db: db})
+    handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
     rules = Rules.load!(base_dir, Map.keys(handlers))
 
     on_exit(fn ->
