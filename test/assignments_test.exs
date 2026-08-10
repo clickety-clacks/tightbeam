@@ -991,11 +991,29 @@ defmodule Tightbeam.AssignmentsTest do
 
     _ =
       attest_call({:session, "other-session"}, review.id, "verdict")
+      |> put_in([:params, :verdict_kind], "reviewed-clean")
+      |> then(&handle(ctx, "attest", &1))
+
+    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == [
+             "reviewed-clean"
+           ]
+
+    _ =
+      attest_call({:session, "other-session"}, review.id, "verdict")
       |> put_in([:params, :verdict_kind], "changes-requested")
       |> then(&handle(ctx, "attest", &1))
 
     assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == [
              "changes-requested"
+           ]
+
+    _ =
+      attest_call({:session, "other-session"}, review.id, "verdict")
+      |> put_in([:params, :verdict_kind], "reviewed-clean")
+      |> then(&handle(ctx, "attest", &1))
+
+    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == [
+             "reviewed-clean"
            ]
 
     second_review =
