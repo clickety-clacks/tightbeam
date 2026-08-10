@@ -487,5 +487,5 @@ defmodule Tightbeam.EventLog do
 
   defp encode(nil), do: "null"
   defp encode(term) when is_binary(term), do: term
-  defp encode(term), do: inspect(term, custom_options: [sort_maps: true])
+  defp encode(term), do: inspect(term)
 end
