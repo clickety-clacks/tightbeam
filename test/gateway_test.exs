@@ -6360,6 +6360,15 @@ defmodule Tightbeam.GatewayTest do
     owner_session = Org.personal_session_key("flynn")
     create_session(ctx.db, owner_session, "flynn")
 
+    {:ok, _ref, nil} =
+      ConnRegistry.register(exact_registry, %{
+        pid: self(),
+        user_id: "flynn",
+        device_id: "process-cause",
+        is_admin: false,
+        subscriptions: MapSet.new(["chat"])
+      })
+
     :ok =
       DB.execute(ctx.db, """
       INSERT INTO work_items (id, title, ownerUserId, createdByUser, createdAt)
@@ -6424,17 +6433,19 @@ defmodule Tightbeam.GatewayTest do
 
       assert {:ok, notice} =
                DB.transaction(ctx.db, fn txn ->
-                 assert Ledger.finish_in_txn(txn, turn.seq, "failed", inspect(reason))
+                 stored_error = if is_binary(reason), do: reason, else: inspect(reason)
+                 assert Ledger.finish_in_txn(txn, turn.seq, "failed", stored_error)
                  record.(txn)
                end)
 
       after_commit.(notice)
       publish.("failed")
-      turn
+      frame_count = if assignment_id == "asg_unknown", do: 9, else: 10
+      {turn, collect_pushes(frame_count, [])}
     end
 
-    codex_turn = run_failure.("known codex failure", "asg_codex")
-    claude_turn = run_failure.("known claude failure", "asg_claude")
+    {codex_turn, codex_frames} = run_failure.("known codex failure", "asg_codex")
+    {claude_turn, claude_frames} = run_failure.("known claude failure", "asg_claude")
     run_failure.("fail this turn", "asg_unknown")
 
     typed_events =
@@ -6487,6 +6498,45 @@ defmodule Tightbeam.GatewayTest do
     refute safe_output =~ "/private/"
     refute safe_output =~ "provider.invalid"
     refute safe_output =~ "payload"
+
+    target_markers =
+      ctx.db
+      |> Projection.list_after("k1", nil, 100)
+      |> Enum.filter(&String.starts_with?(&1.content || "", "[turn failed]"))
+
+    assert Enum.at(target_markers, 0).content =~ "Codex usage limit reached"
+    assert Enum.at(target_markers, 1).content =~ "Claude rate limit reached"
+
+    failed_state_error = fn frames ->
+      frames
+      |> Enum.find(
+        &match?(%{"event" => "prompt_turn_state", "payload" => %{"state" => "failed"}}, &1)
+      )
+      |> get_in(["payload", "error"])
+    end
+
+    assert failed_state_error.(codex_frames) == "Codex usage limit reached"
+    assert failed_state_error.(claude_frames) == "Claude rate limit reached"
+
+    {:ok, stored_errors} =
+      DB.query(
+        ctx.db,
+        "SELECT error FROM turns WHERE seq IN (?1, ?2) ORDER BY seq",
+        [codex_turn.seq, claude_turn.seq]
+      )
+
+    assert stored_errors == [["Codex usage limit reached"], ["Claude rate limit reached"]]
+
+    public_known_output =
+      Enum.map_join(Enum.take(target_markers, 2), & &1.content) <>
+        failed_state_error.(codex_frames) <>
+        failed_state_error.(claude_frames) <>
+        Enum.map_join(stored_errors, fn [error] -> error end)
+
+    refute public_known_output =~ "provider-secret"
+    refute public_known_output =~ "/private/"
+    refute public_known_output =~ "provider.invalid"
+    refute public_known_output =~ "payload"
 
     refute Enum.any?(typed_events, &(&1.subject == "asg_unknown"))
     refute Enum.any?(owner_markers, &String.contains?(&1.content, "asg_unknown"))

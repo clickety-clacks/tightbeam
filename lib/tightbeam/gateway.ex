@@ -1969,6 +1969,7 @@ defmodule Tightbeam.Gateway do
             # record keeps, because the sentence is a flattening and the next
             # misclassification will be diagnosed from what it flattened.
             raw_reason = reason
+            safe_failure = safe_process_failure(failed_stage, raw_reason)
 
             reason =
               case turn_credential_refusal(session) do
@@ -1976,13 +1977,28 @@ defmodule Tightbeam.Gateway do
                 :not_applicable -> reason
               end
 
+            # A reviewed concrete cause is the whole public reason. The raw ACP
+            # term remains only in `harness_turn_error`, the existing internal
+            # diagnostic below; arbitrary provider prose must not ride the
+            # target marker, terminal state, or stored turn error.
+            public_reason = if safe_failure, do: safe_failure.message, else: reason
+            public_state_error = if safe_failure, do: safe_failure.message, else: inspect(reason)
+
             failure_publish = fn _terminal ->
               # THE ERROR MUST REACH THE CHAT. Every failed turn gets the marker
               # now; the adjudication path used to skip it because the brief was
               # its message, and a failure that lost its brief showed Flynn
               # "agent progress interrupted" with no reason attached.
-              append_turn_failed_marker(db, turn.session_key, error_sentence(reason))
-              publish_turn_state(db, turn.session_key, correlation, "failed", inspect(reason))
+              append_turn_failed_marker(db, turn.session_key, error_sentence(public_reason))
+
+              publish_turn_state(
+                db,
+                turn.session_key,
+                correlation,
+                "failed",
+                public_state_error
+              )
+
               publish_session_indicator(db, turn.session_key, session.owner_user_id)
 
               broadcast(
@@ -2022,14 +2038,13 @@ defmodule Tightbeam.Gateway do
               assignment_process_failure_notice_in_txn(
                 txn,
                 turn.seq,
-                failed_stage,
-                raw_reason
+                safe_failure
               )
             end
 
             {:error,
              %{
-               reason: reason,
+               reason: public_reason,
                terminal_publish: failure_publish,
                record_in_txn: record_in_txn,
                after_commit: fn notice ->
@@ -2044,9 +2059,8 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp assignment_process_failure_notice_in_txn(txn, turn_seq, failed_stage, raw_reason) do
-    with %{code: code, message: message, reported_at_layer: layer} <-
-           safe_process_failure(failed_stage, raw_reason),
+  defp assignment_process_failure_notice_in_txn(txn, turn_seq, safe_failure) do
+    with %{code: code, message: message, reported_at_layer: layer} <- safe_failure,
          [[assignment_id, owner_user_id]] <-
            Txn.q(
              txn,
