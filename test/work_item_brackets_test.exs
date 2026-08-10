@@ -186,6 +186,55 @@ defmodule Tightbeam.WorkItemBracketsTest do
              DB.query(ctx.db, "SELECT wakeId FROM wake_cancellations WHERE wakeId=?1", [routing])
   end
 
+  test "linked assign and dispatch roll back the complete accepted bundle", ctx do
+    for {verb, dispatch_fun} <- [
+          {"assign", &disp_assign(&1, {:user, "flynn"}, "holder", &2, &3)},
+          {"dispatch", &disp_dispatch(&1, {:user, "flynn"}, "holder", &2, &3)}
+        ] do
+      subject = "forced #{verb} rollback"
+      item = create(ctx, {:user, "flynn"}, %{title: subject})
+      routing = routing_wake_id(ctx.db, item.id)
+
+      :ok =
+        DB.execute(
+          ctx.db,
+          """
+          CREATE TRIGGER force_#{verb}_bracket_rollback
+          BEFORE UPDATE OF state ON wakes
+          WHEN OLD.wakeId='#{routing}' AND NEW.state='canceled'
+          BEGIN
+            SELECT RAISE(ABORT, 'forced #{verb} bracket rollback');
+          END;
+          """
+        )
+
+      assert {:error, %{code: "server_error", message: message}} =
+               dispatch_fun.(ctx, subject, item.id)
+
+      assert message =~ "forced #{verb} bracket rollback"
+      assert routing_wake_id(ctx.db, item.id) == routing
+      assert Wakes.get(ctx.db, routing).state == "pending"
+
+      assert {:ok, [[0, 0, 0, 0, 0, 0]]} =
+               DB.query(
+                 ctx.db,
+                 """
+                 SELECT
+                   (SELECT count(*) FROM assignments WHERE subject=?1),
+                   (SELECT count(*) FROM supervision_entitlements e
+                      JOIN assignments a ON a.id=e.assignmentId WHERE a.subject=?1),
+                   (SELECT count(*) FROM effort_checkin_generations g
+                      JOIN assignments a ON a.id=g.assignmentId WHERE a.subject=?1),
+                   (SELECT count(*) FROM wake_cancellations WHERE wakeId=?2),
+                   (SELECT count(*) FROM events
+                      WHERE verb=?3 AND payload LIKE '%' || ?1 || '%'),
+                   (SELECT count(*) FROM turns WHERE prompt LIKE '%' || ?1 || '%')
+                 """,
+                 [subject, routing, verb]
+               )
+    end
+  end
+
   ## Proof 3 — bracket-1 fire re-arms; icebox cancels and stops the nag.
 
   test "Proof 3: an ignored bracket-1 wake re-arms on fire; icebox stops the nag", ctx do
