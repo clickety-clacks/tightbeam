@@ -8,6 +8,9 @@ defmodule Tightbeam.Assignments do
   alias Tightbeam.Harness.Support
   alias Tightbeam.{EffortCheckin, EventLog, Org, Placement, Projection, Supervision, Wakes}
 
+  @effect_kinds ~w(code policy release live_mutation evidence review coordination)
+  @effect_kind_sql Enum.map_join(@effect_kinds, ", ", &"'#{&1}'")
+
   defmodule TransitionRace do
     @moduledoc false
     defexception message: "assignment closed"
@@ -101,6 +104,13 @@ defmodule Tightbeam.Assignments do
   CREATE INDEX IF NOT EXISTS assignment_files_path ON assignment_files(path)
   """
 
+  @assignment_effects_ddl """
+  CREATE TABLE IF NOT EXISTS assignment_effects (
+    assignmentId TEXT PRIMARY KEY REFERENCES assignments(id),
+    effectKind TEXT NOT NULL CHECK(effectKind IN (#{@effect_kind_sql}))
+  )
+  """
+
   @interruptions_ddl """
   CREATE TABLE IF NOT EXISTS assignment_interruptions (
     assignmentId TEXT PRIMARY KEY REFERENCES assignments(id),
@@ -118,6 +128,7 @@ defmodule Tightbeam.Assignments do
     :ok = DB.execute(db, @assignments_ddl)
     :ok = DB.execute(db, @attests_ddl)
     :ok = DB.execute(db, @assignment_files_ddl)
+    :ok = DB.execute(db, @assignment_effects_ddl)
     :ok = DB.execute(db, @interruptions_ddl)
     Tightbeam.EffortCheckin.ensure_schema(db)
   end
@@ -296,6 +307,36 @@ defmodule Tightbeam.Assignments do
     end)
   end
 
+  @doc "Return the sole independent linked review card holder's latest verdict kind."
+  @spec qualifying_review_verdict_kinds(DB.server(), String.t(), String.t()) :: [String.t()]
+  def qualifying_review_verdict_kinds(db, assignment_id, assignment_holder_key) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT (
+          SELECT v.verdictKind
+          FROM attests AS v
+          WHERE v.assignmentId = r.id
+            AND v.kind = 'verdict'
+            AND v.bySession = r.holderKey
+          ORDER BY v.ts DESC, v.rowid DESC
+          LIMIT 1
+        )
+        FROM assignments AS r
+        WHERE r.reviewsAssignmentId = ?1
+          AND r.holderKey != ?2
+        ORDER BY r.openedAt, r.id
+        """,
+        [assignment_id, assignment_holder_key]
+      )
+
+    case rows do
+      [[verdict_kind]] when is_binary(verdict_kind) -> [verdict_kind]
+      _ -> []
+    end
+  end
+
   @doc "Return the declared file paths for an assignment."
   @spec declared_files(DB.server(), String.t()) :: [String.t()]
   def declared_files(db, assignment_id) do
@@ -429,6 +470,7 @@ defmodule Tightbeam.Assignments do
     with :ok <- principal_allowed(call.principal, verb),
          :ok <- valid_subject(call.params[:subject]),
          :ok <- valid_idempotency_key(call.params[:idempotency_key]),
+         :ok <- valid_effect_kind(call.params[:effect_kind]),
          {:ok, _files} <- assignment_files(verb, call.params) do
       key = call.params[:idempotency_key]
       replay = if is_binary(key), do: replayed_assignment(db, call), else: nil
@@ -556,6 +598,7 @@ defmodule Tightbeam.Assignments do
          :ok <- valid_subject(call.params[:subject]),
          :ok <- valid_supervision_interval(call[:supervision_interval_ms]),
          :ok <- valid_idempotency_key(call.params[:idempotency_key]),
+         :ok <- valid_effect_kind(call.params[:effect_kind]),
          {:ok, files} <- assignment_files(verb, call.params),
          :ok <- extra_validation.() do
       owner = principal_id(call.principal)
@@ -940,6 +983,12 @@ defmodule Tightbeam.Assignments do
             harness,
             provider
           ]
+        )
+
+        Txn.q(
+          txn,
+          "INSERT INTO assignment_effects (assignmentId, effectKind) VALUES (?1, ?2)",
+          [id, effective_effect_kind(reviews_assignment_id, call.params[:effect_kind])]
         )
 
         Enum.each(files, fn path ->
@@ -1414,6 +1463,20 @@ defmodule Tightbeam.Assignments do
   defp valid_subject(_),
     do: error("invalid_subject", "subject must be 1..2000 non-blank characters")
 
+  defp valid_effect_kind(nil), do: :ok
+  defp valid_effect_kind(kind) when kind in @effect_kinds, do: :ok
+
+  defp valid_effect_kind(_),
+    do:
+      error("invalid_effect_kind", "effectKind must be one of #{Enum.join(@effect_kinds, ", ")}")
+
+  defp effective_effect_kind(reviews_assignment_id, _requested)
+       when not is_nil(reviews_assignment_id),
+       do: "review"
+
+  defp effective_effect_kind(nil, nil), do: "code"
+  defp effective_effect_kind(nil, requested), do: requested
+
   defp valid_supervision_interval(interval) when is_integer(interval) and interval > 0,
     do: :ok
 
@@ -1773,7 +1836,9 @@ defmodule Tightbeam.Assignments do
   defp columns do
     "id, subject, holderKey, holderRole, holderFallback, openedByUser, openedBySession, " <>
       "openedAt, state, outcome, closedAt, closedByUser, closedBySession, closingAttestId" <>
-      ", workItemId, reviewsAssignmentId, holderHarness, holderProvider"
+      ", workItemId, reviewsAssignmentId, holderHarness, holderProvider, " <>
+      "COALESCE((SELECT effectKind FROM assignment_effects WHERE assignmentId = assignments.id), " <>
+      "CASE WHEN reviewsAssignmentId IS NULL THEN 'code' ELSE 'review' END)"
   end
 
   defp assignment([
@@ -1794,7 +1859,8 @@ defmodule Tightbeam.Assignments do
          work_item_id,
          reviews_assignment_id,
          holder_harness,
-         holder_provider
+         holder_provider,
+         effect_kind
        ]) do
     %{
       id: id,
@@ -1814,7 +1880,8 @@ defmodule Tightbeam.Assignments do
       workItemId: work_item_id,
       reviewsAssignmentId: reviews_assignment_id,
       holderHarness: holder_harness,
-      holderProvider: holder_provider
+      holderProvider: holder_provider,
+      effectKind: effect_kind
     }
   end
 

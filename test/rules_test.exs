@@ -982,7 +982,7 @@ defmodule Tightbeam.RulesTest do
 
   test "P3 review and artifact statutes deny before attest and allow after proof", ctx do
     holder = session(ctx.db, "gate-holder", "flynn", archetype: "coder")
-    reviewer = session(ctx.db, "gate-reviewer", "other", harness: "codex", provider: "openai")
+    reviewer = session(ctx.db, "gate-reviewer", "other", archetype: "reviewer")
     assignment = assignment(ctx, holder.session_key, {:user, "flynn"})
     parent = self()
     actual_attest = ctx.handlers["attest"]
@@ -1002,7 +1002,7 @@ defmodule Tightbeam.RulesTest do
         kind: "completion"
       })
 
-    assert {:error, %{code: "rule_denied", rule: "needs-cross-review"}} =
+    assert {:error, %{code: "rule_denied", rule: "needs-independent-review"}} =
              Dispatch.dispatch(ctx.db, handlers, completion)
 
     refute_received :attest_handler_invoked
@@ -1017,6 +1017,27 @@ defmodule Tightbeam.RulesTest do
              Dispatch.dispatch(ctx.db, handlers, completion)
 
     assert_received :attest_handler_invoked
+
+    review_completion =
+      p3_call("attest", {:session, reviewer.session_key}, %{
+        assignment_id: review.id,
+        kind: "completion"
+      })
+
+    assert {:ok, %{assignment: %{state: "closed", effectKind: "review"}}} =
+             Dispatch.dispatch(ctx.db, handlers, review_completion)
+
+    evidence_assignment =
+      assignment(ctx, holder.session_key, {:user, "flynn"}, effect_kind: "evidence")
+
+    evidence_completion =
+      p3_call("attest", {:session, holder.session_key}, %{
+        assignment_id: evidence_assignment.id,
+        kind: "completion"
+      })
+
+    assert {:ok, %{assignment: %{state: "closed", effectKind: "evidence"}}} =
+             Dispatch.dispatch(ctx.db, handlers, evidence_completion)
 
     artifact_assignment = assignment(ctx, holder.session_key, {:user, "flynn"})
     attach_work_item(ctx, artifact_assignment.id, "wi_artifact_gate")
@@ -1074,6 +1095,7 @@ defmodule Tightbeam.RulesTest do
         subject: "P3 assignment #{System.unique_integer([:positive])}",
         idempotency_key: nil,
         reviews_assignment_id: opts[:reviews],
+        effect_kind: opts[:effect_kind],
         files: opts[:files]
       })
 
@@ -1154,14 +1176,14 @@ defmodule Tightbeam.RulesTest do
   defp review_gate_rule do
     """
     [[rule]]
-    name = "needs-cross-review"
+    name = "needs-independent-review"
     verb = "attest"
-    text = "completion requires cross-harness review"
+    text = "producing completion requires exactly one independent linked review"
     external_producer = true
     deny_when = [
       { fact = "attest.kind", op = "eq", value = "completion" },
-      { fact = "assignment.holder_archetype", op = "eq", value = "coder" },
-      { fact = "assignment.cross_harness_verdict_kinds", op = "not_in", value = ["reviewed-clean"] }
+      { fact = "assignment.effect_kind", op = "in", value = ["code", "policy", "release", "live_mutation"] },
+      { fact = "assignment.qualifying_review_verdict_kinds", op = "not_in", value = ["reviewed-clean"] }
     ]
     """
   end

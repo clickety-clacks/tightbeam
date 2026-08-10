@@ -249,6 +249,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             idempotency_key,
             work_item_id,
             reviews,
+            effect_kind,
             files,
         } => {
             let target = match target {
@@ -266,6 +267,9 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             if let Some(value) = reviews {
                 params.push(string_field("reviews", value));
             }
+            if let Some(value) = effect_kind {
+                params.push(string_field("effectKind", value));
+            }
             if let Some(value) = files {
                 params.push(format!(
                     "\"files\":{}",
@@ -279,6 +283,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             subject,
             holder,
             work_item_id,
+            effect_kind,
             workdir_root,
             brief,
             idempotency_key,
@@ -289,6 +294,9 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             ];
             if let Some(value) = work_item_id {
                 params.push(string_field("workItemId", value));
+            }
+            if let Some(value) = effect_kind {
+                params.push(string_field("effectKind", value));
             }
             if let Some(value) = workdir_root {
                 params.push(string_field("workdirRoot", value));
@@ -1627,12 +1635,14 @@ mod tests {
                 "wi_1",
                 "--reviews",
                 "asg_parent",
+                "--effect-kind",
+                "policy",
                 "--files",
                 "[\"lib/a.ex\",\"test/a_test.exs\"]",
                 "--as-user",
                 "flynn",
             ]),
-            r#"{"asUser":"flynn","verb":"assign","role":"builder","params":{"subject":"ship","idempotencyKey":"idem","workItemId":"wi_1","reviews":"asg_parent","files":["lib/a.ex","test/a_test.exs"]}}"#
+            r#"{"asUser":"flynn","verb":"assign","role":"builder","params":{"subject":"ship","idempotencyKey":"idem","workItemId":"wi_1","reviews":"asg_parent","effectKind":"policy","files":["lib/a.ex","test/a_test.exs"]}}"#
         );
         assert_eq!(
             body(&[
@@ -1645,6 +1655,8 @@ mod tests {
                 "Please ship it.",
                 "--work-item",
                 "wi_1",
+                "--effect-kind",
+                "release",
                 "--workdir-root",
                 "checkout",
                 "--key",
@@ -1652,7 +1664,7 @@ mod tests {
                 "--as-user",
                 "flynn",
             ]),
-            r#"{"asUser":"flynn","verb":"dispatch","sessionKey":"agent:builder","params":{"subject":"ship","brief":"Please ship it.","workItemId":"wi_1","workdirRoot":"checkout","idempotencyKey":"idem"}}"#
+            r#"{"asUser":"flynn","verb":"dispatch","sessionKey":"agent:builder","params":{"subject":"ship","brief":"Please ship it.","workItemId":"wi_1","effectKind":"release","workdirRoot":"checkout","idempotencyKey":"idem"}}"#
         );
         assert_eq!(
             body(&[

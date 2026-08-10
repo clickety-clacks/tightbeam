@@ -15,6 +15,7 @@ defmodule Tightbeam.Rules do
   ["reviewed-clean"]` fires for an assignment with no verdicts. List facts are
   `caller.roles`, `assignment.verdicts`,
   `assignment.independent_verdict_kinds`,
+  `assignment.qualifying_review_verdict_kinds`,
   `assignment.cross_harness_verdict_kinds`,
   `assignment.cross_provider_verdict_kinds`, and
   `assignment.artifact_kinds` (the distinct artifact kinds the assignment's
@@ -24,9 +25,10 @@ defmodule Tightbeam.Rules do
 
   Check-tier facts are `attest.kind` (raw string on attest calls),
   `assignment.verdicts` (distinct filed verdict kinds),
-  `assignment.is_producing_card`, `assignment.holder_archetype`, and
-  `assignment.caller_is_holder`. The assignment facts resolve from the call's
-  assignmentId and are nil when that assignment cannot be resolved.
+  `assignment.is_producing_card`, `assignment.effect_kind`,
+  `assignment.holder_archetype`, and `assignment.caller_is_holder`. The
+  assignment facts resolve from the call's assignmentId and are nil when that
+  assignment cannot be resolved.
 
   Work-item facts are `work_item.is_bug` (the org-set work-item attribute) and
   `assignment.prior_completed_fix_count` (completed, non-review assignments on
@@ -91,12 +93,14 @@ defmodule Tightbeam.Rules do
   @verdict_facts ~w(
     assignment.verdicts
     assignment.independent_verdict_kinds
+    assignment.qualifying_review_verdict_kinds
     assignment.cross_harness_verdict_kinds
     assignment.cross_provider_verdict_kinds
     work_item.verdict_kinds
   )
   @independence_facts ~w(
     assignment.independent_verdict_kinds
+    assignment.qualifying_review_verdict_kinds
     assignment.cross_harness_verdict_kinds
     assignment.cross_provider_verdict_kinds
   )
@@ -116,7 +120,9 @@ defmodule Tightbeam.Rules do
     "attest.kind" => :string,
     "assignment.verdicts" => {:list, :string},
     "assignment.is_producing_card" => :bool,
+    "assignment.effect_kind" => :string,
     "assignment.independent_verdict_kinds" => {:list, :string},
+    "assignment.qualifying_review_verdict_kinds" => {:list, :string},
     "assignment.cross_harness_verdict_kinds" => {:list, :string},
     "assignment.cross_provider_verdict_kinds" => {:list, :string},
     "assignment.artifact_kinds" => {:list, :string},
@@ -1076,10 +1082,31 @@ defmodule Tightbeam.Rules do
     end)
   end
 
+  defp compute_fact("assignment.effect_kind", db, call, cache) do
+    with_dependency("$assignment", db, call, cache, fn
+      nil, cache -> {nil, cache}
+      assignment, cache -> {assignment.effect_kind, cache}
+    end)
+  end
+
   defp compute_fact("assignment.independent_verdict_kinds", db, call, cache) do
     with_dependency("$verdict_authors", db, call, cache, fn
       nil, cache -> {nil, cache}
       authors, cache -> {distinct_verdict_kinds(authors), cache}
+    end)
+  end
+
+  defp compute_fact("assignment.qualifying_review_verdict_kinds", db, call, cache) do
+    with_dependency("$assignment", db, call, cache, fn
+      nil, cache ->
+        {nil, cache}
+
+      assignment, cache ->
+        {Assignments.qualifying_review_verdict_kinds(
+           db,
+           assignment.id,
+           assignment.holder_key
+         ), cache}
     end)
   end
 
@@ -1387,9 +1414,12 @@ defmodule Tightbeam.Rules do
            db,
            """
            SELECT a.id, a.workItemId, a.reviewsAssignmentId, a.holderKey, s.archetype,
-                  a.holderHarness, a.holderProvider
+                  a.holderHarness, a.holderProvider,
+                  COALESCE(e.effectKind,
+                    CASE WHEN a.reviewsAssignmentId IS NULL THEN 'code' ELSE 'review' END)
            FROM assignments a
            JOIN sessions s ON s.sessionKey = a.holderKey
+           LEFT JOIN assignment_effects e ON e.assignmentId = a.id
            #{where}
            """,
            params
@@ -1403,7 +1433,8 @@ defmodule Tightbeam.Rules do
            holder_key,
            holder_archetype,
            holder_harness,
-           holder_provider
+           holder_provider,
+           effect_kind
          ]
        ]} ->
         %{
@@ -1413,7 +1444,8 @@ defmodule Tightbeam.Rules do
           holder_key: holder_key,
           holder_archetype: holder_archetype,
           holder_harness: holder_harness,
-          holder_provider: holder_provider
+          holder_provider: holder_provider,
+          effect_kind: effect_kind
         }
 
       {:ok, []} ->

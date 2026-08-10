@@ -594,6 +594,7 @@ defmodule Tightbeam.AssignmentsTest do
     reviewed = handle(ctx, "assign", assign_call({:user, "flynn"}, "producer"))
 
     assert reviewed.reviewsAssignmentId == nil
+    assert reviewed.effectKind == "code"
     assert reviewed.holderHarness == "claude"
     assert reviewed.holderProvider == "anthropic"
 
@@ -610,10 +611,12 @@ defmodule Tightbeam.AssignmentsTest do
     review_call =
       assign_call({:user, "flynn"}, "review")
       |> put_in([:params, :reviews_assignment_id], reviewed.id)
+      |> put_in([:params, :effect_kind], "policy")
       |> Map.put(:session_key, "other-session")
 
     review = handle(ctx, "assign", review_call)
     assert review.reviewsAssignmentId == reviewed.id
+    assert review.effectKind == "review"
     assert review.holderHarness == "claude"
     assert review.holderProvider == "anthropic"
 
@@ -625,6 +628,53 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert {:ok, [[0]]} =
              DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE subject = 'unknown review'")
+  end
+
+  test "assign and dispatch stamp valid effects while legacy rows resolve conservatively", ctx do
+    effects =
+      for kind <- ~w(code policy release live_mutation evidence review coordination), into: %{} do
+        assignment =
+          assign_call({:user, "flynn"}, "#{kind} effect")
+          |> put_in([:params, :effect_kind], kind)
+          |> then(&handle(ctx, "assign", &1))
+
+        assert assignment.effectKind == kind
+        {kind, assignment}
+      end
+
+    evidence = effects["evidence"]
+
+    release_call =
+      dispatch_call({:user, "flynn"}, "release", "ship it")
+      |> put_in([:params, :effect_kind], "release")
+
+    release = handle(ctx, "dispatch", release_call)
+    assert release.effectKind == "release"
+
+    before = assignment_count(ctx.db)
+
+    invalid =
+      assign_call({:user, "flynn"}, "invalid")
+      |> put_in([:params, :effect_kind], "source")
+
+    assert %{code: "invalid_effect_kind"} = handle(ctx, "assign", invalid)
+    assert assignment_count(ctx.db) == before
+
+    review =
+      assign_call({:user, "flynn"}, "legacy review")
+      |> put_in([:params, :reviews_assignment_id], evidence.id)
+      |> Map.put(:session_key, "other-session")
+      |> then(&handle(ctx, "assign", &1))
+
+    {:ok, _} =
+      DB.query(ctx.db, "DELETE FROM assignment_effects WHERE assignmentId IN (?1, ?2)", [
+        evidence.id,
+        review.id
+      ])
+
+    legacy = Assignments.list(ctx.db, %{state: "all"})
+    assert Enum.find(legacy, &(&1.id == evidence.id)).effectKind == "code"
+    assert Enum.find(legacy, &(&1.id == review.id)).effectKind == "review"
   end
 
   test "Proof 1: a conflicting review-assignment create is refused with review_item_conflict",
@@ -909,6 +959,57 @@ defmodule Tightbeam.AssignmentsTest do
                by_provider: "anthropic"
              }
            ]
+  end
+
+  test "qualifying review verdict requires exactly one independent card and its latest holder verdict",
+       ctx do
+    producer = handle(ctx, "assign", assign_call({:user, "flynn"}, "qualifying producer"))
+
+    review =
+      assign_call({:user, "flynn"}, "qualifying review")
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :reviews_assignment_id], producer.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == []
+
+    _ =
+      attest_call({:session, "holder"}, review.id, "verdict")
+      |> put_in([:params, :verdict_kind], "third-party")
+      |> then(&handle(ctx, "attest", &1))
+
+    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == []
+
+    _ =
+      attest_call({:session, "other-session"}, review.id, "verdict")
+      |> put_in([:params, :verdict_kind], "reviewed-clean")
+      |> then(&handle(ctx, "attest", &1))
+
+    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == [
+             "reviewed-clean"
+           ]
+
+    _ =
+      attest_call({:session, "other-session"}, review.id, "verdict")
+      |> put_in([:params, :verdict_kind], "changes-requested")
+      |> then(&handle(ctx, "attest", &1))
+
+    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == [
+             "changes-requested"
+           ]
+
+    second_review =
+      assign_call({:user, "flynn"}, "second qualifying review")
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :reviews_assignment_id], producer.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    _ =
+      attest_call({:session, "other-session"}, second_review.id, "verdict")
+      |> put_in([:params, :verdict_kind], "reviewed-clean")
+      |> then(&handle(ctx, "attest", &1))
+
+    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == []
   end
 
   test "prefixed idempotency scopes disjoint equal user and session strings", ctx do

@@ -32,7 +32,7 @@ defmodule Tightbeam.RailRemedyTest do
       )
 
     holder = session(db, "holder", "flynn", "claude", "coder")
-    reviewer = session(db, "reviewer-session", "flynn", "codex", "reviewer")
+    reviewer = session(db, "reviewer-session", "flynn", "claude", "reviewer")
     Roles.create!(db, "reviewer", "flynn", reviewer.session_key)
 
     # Canonicalize the tmp base: Darwin's System.tmp_dir!/0 sits under the /var
@@ -764,7 +764,8 @@ defmodule Tightbeam.RailRemedyTest do
     effect = "remedy"
     deny_when = [
       { fact = "attest.kind", op = "eq", value = "completion" },
-      { fact = "assignment.cross_harness_verdict_kinds", op = "not_in", value = ["reviewed-clean"] }
+      { fact = "assignment.effect_kind", op = "in", value = ["code", "policy", "release", "live_mutation"] },
+      { fact = "assignment.qualifying_review_verdict_kinds", op = "not_in", value = ["reviewed-clean"] }
     ]
     [rule.remedy]
     action = "assign"

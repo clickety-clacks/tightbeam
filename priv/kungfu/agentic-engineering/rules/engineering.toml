@@ -1,18 +1,18 @@
-# Flagship enforced loop (roadmap P7): completion requires an independent review.
-# A coder attesting completion without a reviewed-clean verdict is not denied — the
+# Flagship enforced loop (roadmap P7): producing effects require one independent review.
+# A holder attesting qualifying completion without a reviewed-clean verdict is not denied — the
 # substrate assigns a reviewer (the remedy), blocks the completion until the review
 # lands, and self-releases. This is the reviewer-loop worked example, enforced.
 [[rule]]
 name = "completion-requires-review"
 verb = "attest"
-text = "completion needs a qualifying reviewed-clean verdict: check that it is on a card linked with --reviews, filed by that card's holder, not filed by this work's author, and cross-harness; if the linked verdict is changes-requested, address it and have the reviewer re-file reviewed-clean"
+text = "code, policy, release, and live-mutation completion needs exactly one --reviews-linked card held by a different session whose latest holder-filed verdict is reviewed-clean; evidence, review, and coordination effects do not require review, and harness, provider, model, and effort guide reviewer selection only"
 external_producer = false
 edges = ["verb"]
 effect = "remedy"
 deny_when = [
   { fact = "attest.kind", op = "eq", value = "completion" },
-  { fact = "assignment.is_producing_card", op = "eq", value = true },
-  { fact = "assignment.cross_harness_verdict_kinds", op = "not_in", value = ["reviewed-clean"] },
+  { fact = "assignment.effect_kind", op = "in", value = ["code", "policy", "release", "live_mutation"] },
+  { fact = "assignment.qualifying_review_verdict_kinds", op = "not_in", value = ["reviewed-clean"] },
 ]
 [rule.remedy]
 action = "assign"
