@@ -85,6 +85,12 @@ defmodule Tightbeam.Supervision do
     :ok = DB.execute(db, @watermarks_ddl)
   end
 
+  @doc false
+  @spec recover_liveness!(DB.server(), pos_integer()) :: :ok
+  def recover_liveness!(db, interval) when is_integer(interval) and interval > 0 do
+    recover_liveness(%{db: db, sweep_ms: interval})
+  end
+
   @spec prod_state(DB.server(), String.t()) :: map() | nil
   def prod_state(db, assignment_id) do
     {:ok, prod_rows} =
@@ -897,13 +903,13 @@ defmodule Tightbeam.Supervision do
       delivery_opts: Keyword.take(opts, [:conn_registry, :lane_manager])
     }
 
+    if Keyword.get(opts, :recover, true), do: recover_liveness(state)
     schedule_sweep(state.sweep_ms)
-    {:ok, state, {:continue, :recovery_sweep}}
+    {:ok, state, {:continue, :initial_sweep}}
   end
 
   @impl true
-  def handle_continue(:recovery_sweep, state) do
-    recover_liveness(state)
+  def handle_continue(:initial_sweep, state) do
     sweep(state)
     {:noreply, state}
   end

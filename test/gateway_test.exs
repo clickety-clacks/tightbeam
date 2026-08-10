@@ -1013,6 +1013,46 @@ defmodule Tightbeam.GatewayTest do
     assert File.stat!(Path.join(base_dir, "gateway.json")).mode |> Bitwise.band(0o777) == 0o600
   end
 
+  test "children recovers liveness before any runtime child can start", ctx do
+    :ok =
+      DB.execute(
+        ctx.db,
+        "INSERT INTO assignments (id, subject, holderKey, openedByUser, openedAt) VALUES ('asg_boot_recovery', 'boot recovery', 'k1', 'flynn', 1)"
+      )
+
+    children =
+      Gateway.children(
+        gateway_config(gateway_children_base!(), ctx.db, 0)
+        |> Map.put(:wake_tick_ms, 1_234)
+      )
+
+    assert {:ok,
+            [
+              [
+                1,
+                "armed",
+                "recovery_backfill",
+                "asg_boot_recovery",
+                "recovery_backfill",
+                "process:tightbeam",
+                1_234
+              ]
+            ]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT generation,state,basisKind,basisId,cause,principal,supervisionIntervalMs
+               FROM supervision_entitlements
+               WHERE assignmentId='asg_boot_recovery'
+               """
+             )
+
+    {Tightbeam.Supervision, supervision_opts} =
+      Enum.find(children, &match?({Tightbeam.Supervision, _}, &1))
+
+    assert Keyword.fetch!(supervision_opts, :recover) == false
+  end
+
   # Hosts assimilated before the endpoint file existed, and hosts whose org token
   # has since been rotated, must not need a second ceremony: boot re-provisions
   # every registered satellite, so the operator shell heals on restart.

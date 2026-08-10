@@ -148,6 +148,10 @@ defmodule Tightbeam.Gateway do
 
     :ok = Assignments.audit_review_item_conflicts(db)
 
+    # Recover durable liveness before any runtime child can consume wakes or
+    # accept traffic. The Supervision child skips its duplicate recovery below.
+    :ok = Supervision.recover_liveness!(db, config.wake_tick_ms)
+
     gateway_path = Path.join(config.base_dir, "gateway.json")
 
     cli_token =
@@ -298,6 +302,7 @@ defmodule Tightbeam.Gateway do
          db: db,
          handlers: handler_table,
          prod_limit: prod_limit,
+         recover: false,
          sweep_ms: config.wake_tick_ms,
          name: Tightbeam.Supervision},
         {Tightbeam.Spinup.Flight, name: Tightbeam.Spinup.Flight},
