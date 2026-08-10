@@ -351,7 +351,7 @@ defmodule Tightbeam.ConditionFactsTest do
     first = condition_wake(ctx, "release-ready", "prod")
     second = condition_wake(ctx, "release-ready", "prod")
     canceled = condition_wake(ctx, "release-ready", "prod")
-    assert Wakes.cancel(ctx.db, canceled.wake_id, canceled.origin)
+    assert {:accepted_in_txn, _event_id, %{canceled: true}} = cancel_wake(ctx.db, canceled)
 
     ConditionFacts.file(ctx.db, ctx.scheduler, %{
       kind: "release-ready",
@@ -459,6 +459,29 @@ defmodule Tightbeam.ConditionFactsTest do
       condition_scope: scope,
       creator_session_key: "agent:owner:app"
     })
+  end
+
+  defp cancel_wake(db, wake) do
+    {:ok, result} =
+      DB.transaction(db, fn txn ->
+        Wakes.cancel_in_txn(txn, %{
+          wake_id: wake.wake_id,
+          expected_origin: wake.origin,
+          requester: %{kind: "session", id: "agent:owner:app"},
+          reason_kind: "requester_withdrew",
+          causal_source: %{
+            kind: "verb_call",
+            accepted_event: %{
+              origin: wake.origin,
+              session_key: "agent:owner:app",
+              principal: {:session, "agent:owner:app"}
+            }
+          },
+          outcome: %{kind: "no_replacement"}
+        })
+      end)
+
+    result
   end
 
   defp turn_count(db, wake_id) do

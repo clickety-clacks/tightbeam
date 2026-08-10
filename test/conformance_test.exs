@@ -860,7 +860,7 @@ defmodule Tightbeam.ConformanceSupport do
       try do
         ids = materialize_world(db, Map.get(kase, "world", %{}))
         call = build_call(kase["call"], ids)
-        handlers = Gateway.handlers(%{db: db})
+        handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
         {:ok, [[before_count]]} = DB.query(db, "SELECT count(*) FROM assignments")
         overlap? = Assignments.open_assignments_touching(db, call.params[:files] || []) != []
 
@@ -1026,7 +1026,7 @@ defmodule Tightbeam.ConformanceSupport do
         try do
           ids = materialize_world(db, kase["world"])
           call = build_call(kase["call"], ids)
-          handlers = Gateway.handlers(%{db: db})
+          handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
           statute = fixture_rule_name(fixture)
           assignment_id = call.params.assignment_id
 
@@ -1188,7 +1188,7 @@ defmodule Tightbeam.ConformanceSupport do
 
     try do
       ids = materialize_world(db, hd(fixture["cases"])["world"])
-      handlers = Gateway.handlers(%{db: db})
+      handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
       original = ids.assignments["work"]
       call = completion_call(original)
 
@@ -1481,7 +1481,7 @@ defmodule Tightbeam.ConformanceSupport do
           ids = materialize_world(db, kase["world"])
           call = build_call(kase["call"], ids)
           turn_call = sweep_call(fixture, call)
-          handlers = Gateway.handlers(%{db: db})
+          handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
           session_key = elem(call.principal, 1)
           statute = fixture_rule_name(fixture)
 
@@ -1668,7 +1668,7 @@ defmodule Tightbeam.ConformanceSupport do
         try do
           ids = materialize_world(db, kase["world"])
           call = build_call(kase["call"], ids)
-          handlers = Gateway.handlers(%{db: db})
+          handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
           session_key = elem(call.principal, 1)
 
           assert {:acted, :rail_escalate} =
@@ -1734,7 +1734,7 @@ defmodule Tightbeam.ConformanceSupport do
           ids = materialize_world(db, kase["world"])
           call = build_call(kase["call"], ids)
           turn_call = sweep_call(fixture, call)
-          handlers = Gateway.handlers(%{db: db})
+          handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
           session_key = elem(call.principal, 1)
           assignment_id = call.params.assignment_id
           statute = fixture_rule_name(fixture)
@@ -1790,7 +1790,7 @@ defmodule Tightbeam.ConformanceSupport do
 
               assert RailRemedy.episode(db, statute, assignment_id) == nil
               assert review_effect_count(db, assignment_id) == 0
-              assert Supervision.prod_state(db, assignment_id) == nil
+              assert %{supervisionState: "armed"} = Supervision.prod_state(db, assignment_id)
 
             "schedule-order-legible" ->
               assert {:acted, :rail_remedy} =
@@ -1837,7 +1837,7 @@ defmodule Tightbeam.ConformanceSupport do
           ids = materialize_world(db, kase["world"])
           call = build_call(kase["call"], ids)
           turn_call = sweep_call(fixture, call)
-          handlers = Gateway.handlers(%{db: db})
+          handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
           session_key = elem(call.principal, 1)
           statute_name = fixture_rule_name(fixture)
 
@@ -1936,7 +1936,7 @@ defmodule Tightbeam.ConformanceSupport do
       call = build_call(sample["call"], ids)
       session_key = elem(call.principal, 1)
       terminal_seq = Map.fetch!(ids.turns, session_key)
-      handlers = Gateway.handlers(%{db: db})
+      handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
 
       assert {:acted, :rail_escalate} =
                Supervision.evaluate(db, handlers, 3, session_key, terminal_seq)
@@ -1951,7 +1951,7 @@ defmodule Tightbeam.ConformanceSupport do
                Escalation.rule(db, escalation_rule_call(request_id, "allow"), authorized: true)
 
       park_wake = Wakes.get(db, park_wake_id)
-      assert Wakes.cancel(db, park_wake_id, park_wake.origin)
+      assert {:accepted_in_txn, _event_id, %{canceled: true}} = cancel_wake(db, park_wake)
 
       ids =
         materialize_world(
@@ -2013,7 +2013,7 @@ defmodule Tightbeam.ConformanceSupport do
 
       try do
         ids = materialize_world(db, missing["world"])
-        handlers = Gateway.handlers(%{db: db})
+        handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
         call = build_call(missing["call"], ids)
         assignment_id = ids.assignments["work"]
 
@@ -2050,7 +2050,7 @@ defmodule Tightbeam.ConformanceSupport do
           call = build_call(wrong["call"], ids)
 
           assert {:error, %{reason: "remedy_fired"}} =
-                   Dispatch.dispatch(db, Gateway.handlers(%{db: db}), call)
+                   Dispatch.dispatch(db, Gateway.handlers(%{db: db, wake_tick_ms: 1_000}), call)
         after
           GenServer.stop(pid)
         end
@@ -2065,7 +2065,7 @@ defmodule Tightbeam.ConformanceSupport do
           assert {:acted, :rail_remedy} =
                    Supervision.evaluate(
                      db,
-                     Gateway.handlers(%{db: db}),
+                     Gateway.handlers(%{db: db, wake_tick_ms: 1_000}),
                      3,
                      "holder",
                      ids.turns["holder"]
@@ -2091,7 +2091,7 @@ defmodule Tightbeam.ConformanceSupport do
           call = build_call(missing["call"], ids)
 
           assert {:error, %{reason: "remedy_fired", producer: nil}} =
-                   Dispatch.dispatch(db, Gateway.handlers(%{db: db}), call)
+                   Dispatch.dispatch(db, Gateway.handlers(%{db: db, wake_tick_ms: 1_000}), call)
 
           assert review_effect_count(db, ids.assignments["work"]) == 0
 
@@ -2129,12 +2129,12 @@ defmodule Tightbeam.ConformanceSupport do
         call = build_call(missing["call"], ids)
 
         assert {:error, %{code: "rule_denied"}} =
-                 Dispatch.dispatch(db, Gateway.handlers(%{db: db}), call)
+                 Dispatch.dispatch(db, Gateway.handlers(%{db: db, wake_tick_ms: 1_000}), call)
 
         assert {:prodded, 1} =
                  Supervision.evaluate(
                    db,
-                   Gateway.handlers(%{db: db}),
+                   Gateway.handlers(%{db: db, wake_tick_ms: 1_000}),
                    3,
                    "holder",
                    ids.turns["holder"]
@@ -2150,7 +2150,9 @@ defmodule Tightbeam.ConformanceSupport do
         ids = materialize_world(db, release["world"])
         seed_script_checkout!(base, fixture, release, db)
         call = build_call(release["call"], ids)
-        assert {:ok, _} = Dispatch.dispatch(db, Gateway.handlers(%{db: db}), call)
+
+        assert {:ok, _} =
+                 Dispatch.dispatch(db, Gateway.handlers(%{db: db, wake_tick_ms: 1_000}), call)
       after
         GenServer.stop(pid)
       end
@@ -2179,14 +2181,14 @@ defmodule Tightbeam.ConformanceSupport do
         assert :stranded =
                  Supervision.evaluate(
                    db,
-                   Gateway.handlers(%{db: db}),
+                   Gateway.handlers(%{db: db, wake_tick_ms: 1_000}),
                    3,
                    "holder",
                    terminal_seq
                  )
 
         assert %{lastEvaluatedTerminal: ^terminal_seq} = Supervision.watermark(db, "holder")
-        assert Wakes.pending_count(db, "holder") == 1
+        assert Wakes.pending_count(db, "holder") == 0
         assert RailRemedy.episode(db, fixture_rule_name(fixture), ids.assignments["work"]) == nil
         refute lifecycle_kind?(db, "rail_sweep")
       after
@@ -2202,7 +2204,7 @@ defmodule Tightbeam.ConformanceSupport do
         assert {:acted, :rail_remedy} =
                  Supervision.evaluate(
                    db,
-                   Gateway.handlers(%{db: db}),
+                   Gateway.handlers(%{db: db, wake_tick_ms: 1_000}),
                    3,
                    "holder",
                    ids.turns["holder"]
@@ -2232,7 +2234,13 @@ defmodule Tightbeam.ConformanceSupport do
         materialize_world(db, nil_case["world"])
 
         assert :idle =
-                 Supervision.evaluate(db, Gateway.handlers(%{db: db}), 3, "holder", nil)
+                 Supervision.evaluate(
+                   db,
+                   Gateway.handlers(%{db: db, wake_tick_ms: 1_000}),
+                   3,
+                   "holder",
+                   nil
+                 )
 
         assert Supervision.watermark(db, "holder") == nil
         refute lifecycle_kind?(db, "rail_sweep")
@@ -2246,7 +2254,7 @@ defmodule Tightbeam.ConformanceSupport do
       try do
         ids = materialize_world(db, fresh["world"])
         terminal_seq = ids.turns["holder"]
-        handlers = Gateway.handlers(%{db: db})
+        handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
         assert {:prodded, 1} = Supervision.evaluate(db, handlers, 3, "holder", terminal_seq)
         lifecycle_count = length(EventLog.lifecycle_events(db))
         assert :duplicate = Supervision.evaluate(db, handlers, 3, "holder", terminal_seq)
@@ -2272,7 +2280,7 @@ defmodule Tightbeam.ConformanceSupport do
         Enum.find(fixture["cases"], &(&1["case"] == "needs-request-nil-opens-and-parks"))
 
       ids = materialize_world(db, sample["world"])
-      handlers = Gateway.handlers(%{db: db})
+      handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
 
       assert {:acted, :rail_escalate} =
                Supervision.evaluate(db, handlers, 3, "holder", ids.turns["holder"])
@@ -2393,6 +2401,8 @@ defmodule Tightbeam.ConformanceSupport do
         end)
       ]
       |> Enum.reject(&is_nil/1)
+
+    await_catalog!("codex", 100)
 
     handlers =
       Gateway.handlers(%{
@@ -2536,7 +2546,7 @@ defmodule Tightbeam.ConformanceSupport do
           ids = materialize_world(db, Map.get(kase, "world", %{}))
           seed_script_checkout!(base, fixture, kase, db)
           call = build_call(kase["call"], ids)
-          handlers = Gateway.handlers(%{db: db})
+          handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
           assignment_id = call.params.assignment_id
 
           case kase["expect"] do
@@ -2626,7 +2636,7 @@ defmodule Tightbeam.ConformanceSupport do
           ids = materialize_world(db, Map.get(kase, "world", %{}))
           seed_script_checkout!(base, fixture, kase, db)
           call = build_call(kase["call"], ids)
-          handlers = Gateway.handlers(%{db: db})
+          handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
           session_key = call.principal |> elem(1)
           assignment_id = call.params.assignment_id
           terminal_seq = Map.fetch!(ids.turns, session_key)
@@ -2638,7 +2648,7 @@ defmodule Tightbeam.ConformanceSupport do
               assert result == {:acted, :rail_remedy}
               assert %{status: "live"} = RailRemedy.episode(db, rule, assignment_id)
               assert review_effect_count(db, assignment_id) == 1
-              assert Supervision.prod_state(db, assignment_id) == nil
+              assert %{supervisionState: "armed"} = Supervision.prod_state(db, assignment_id)
               assert sweep_decision?(db, session_key, rule, "run-remedy")
 
             "re-obligate" ->
@@ -2653,12 +2663,12 @@ defmodule Tightbeam.ConformanceSupport do
               cond do
                 fixture["name"] == "busy-or-queued-no-sweep" ->
                   assert result == :busy
-                  assert Supervision.prod_state(db, assignment_id) == nil
+                  assert %{supervisionState: "armed"} = Supervision.prod_state(db, assignment_id)
                   refute lifecycle_kind?(db, "rail_sweep")
 
                 self_wake?(db, call) ->
                   assert result == :continuation
-                  assert Supervision.prod_state(db, assignment_id) == nil
+                  assert %{supervisionState: "armed"} = Supervision.prod_state(db, assignment_id)
                   refute lifecycle_kind?(db, "rail_sweep")
 
                 true ->
@@ -2867,6 +2877,9 @@ defmodule Tightbeam.ConformanceSupport do
       end
     end)
 
+    {:ok, _} =
+      DB.query(db, "UPDATE supervision_entitlements SET dueAt=0 WHERE state='armed'")
+
     %{
       assignments: assignments,
       work_items: work_items,
@@ -3071,6 +3084,48 @@ defmodule Tightbeam.ConformanceSupport do
 
     assert is_binary(result.id)
     result.id
+  end
+
+  defp await_catalog!(harness, attempts) when attempts > 0 do
+    case ModelCatalog.get(Placement.local_host_name(), harness, ModelCatalog) do
+      {[_ | _], :fresh} ->
+        :ok
+
+      _ ->
+        Process.sleep(5)
+        await_catalog!(harness, attempts - 1)
+    end
+  end
+
+  defp await_catalog!(_harness, 0), do: flunk("model catalog did not become fresh")
+
+  defp cancel_wake(db, wake) do
+    {:ok, result} =
+      DB.transaction(db, fn txn ->
+        [[assignment_id]] =
+          DB.Txn.q(txn, "SELECT assignmentId FROM wakes WHERE wakeId=?1", [wake.wake_id])
+
+        {:ok, liveness_trigger} =
+          Supervision.liveness_trigger_in_txn(txn, {:assignment, assignment_id})
+
+        Wakes.cancel_in_txn(txn, %{
+          wake_id: wake.wake_id,
+          expected_origin: wake.origin,
+          requester: %{kind: "process", id: "conformance"},
+          reason_kind: "requester_withdrew",
+          causal_source: %{
+            kind: "verb_call",
+            accepted_event: %{
+              origin: wake.origin,
+              session_key: nil,
+              principal: {:process, "conformance"}
+            }
+          },
+          outcome: %{kind: "no_replacement", liveness_trigger: liveness_trigger}
+        })
+      end)
+
+    result
   end
 
   defp attest_verdict!(db, assignment_id, by_session, verdict_kind) do
