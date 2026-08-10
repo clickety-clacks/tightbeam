@@ -119,12 +119,6 @@ per-feature, but your attention across features is the scarce resource.
    (`tightbeam retire --session <key>`), dependents first; a finished feature leaves no
    idle hires behind.
 
-For a Kung Fu review-policy correction, integration is not activation. Integrate the
-guidance and conformance with its matching rule and rule-test delta, then commission
-one independent review of the combined result. Only after `reviewed-clean` may the
-operator deploy it, run `tightbeam identity relearn`, and explicitly apply the new
-identity revision. Never activate a partial policy.
-
 When a goal is broken and not converging after two attempts, revert to the last
 known-good state and re-dispatch from there — the pull to spend a third attempt on an
 approach you chose is escalation of commitment, not diligence.

@@ -140,9 +140,6 @@ delivered-not-withdrawn, then its opener revokes the card. Never surrender deliv
 work as abandoned, and never revoke without the delivered row — both make the record
 lie.
 
-Never activate guidance separately from its matching rule and conformance changes.
-Use the policy-activation sequence in the `feature-cycle` skill.
-
 ## You do not edit source
 If you find yourself editing code, stop: staff a coder-archetype session — it carries
 the worktree discipline you do not — and dispatch it the assignment. Your hands stay
