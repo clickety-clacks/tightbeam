@@ -32,7 +32,7 @@ defmodule Tightbeam.RailRemedyTest do
       )
 
     holder = session(db, "holder", "flynn", "claude", "coder")
-    reviewer = session(db, "reviewer-session", "flynn", "codex", "reviewer")
+    reviewer = session(db, "reviewer-session", "flynn", "claude", "reviewer")
     Roles.create!(db, "reviewer", "flynn", reviewer.session_key)
 
     # Canonicalize the tmp base: Darwin's System.tmp_dir!/0 sits under the /var
@@ -194,6 +194,26 @@ defmodule Tightbeam.RailRemedyTest do
              |> Map.fetch!(:detail)
              |> JSON.decode!()
 
+    assert [%{"outcome" => "blocked", "producer_id" => nil}] = remedy_events(ctx.db)
+  end
+
+  test "surface policy returns a differently named nested rule denial without a producer", ctx do
+    assignment = assignment(ctx, "surfaced-producer")
+    put_rules(ctx, surfaced_review_gate() <> conditional_blocker())
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    assert {:error,
+            %{
+              reason: "remedy_blocked",
+              producer: nil,
+              rule: "conditional-remedy-blocker",
+              ref: producer_id,
+              message: message
+            }} = Dispatch.dispatch(ctx.db, ctx.handlers, completion_call(assignment.id))
+
+    assert producer_id == assignment.id
+    assert message == "conditional-remedy-blocker: runtime quota"
+    assert RailRemedy.episode(ctx.db, "completion-needs-review", assignment.id) == nil
     assert [%{"outcome" => "blocked", "producer_id" => nil}] = remedy_events(ctx.db)
   end
 
@@ -576,6 +596,52 @@ defmodule Tightbeam.RailRemedyTest do
              )
   end
 
+  test "foreign linked verdict keeps the re-wake on the pending review holder", ctx do
+    assignment = assignment(ctx, "foreign verdict")
+    load_review_gate(ctx)
+
+    assert {:error, %{producer: review_id}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, completion_call(assignment.id))
+
+    verdict_from(ctx, ctx.holder.session_key, review_id, "reviewed-clean")
+
+    assert {:error, %{producer: ^review_id}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, completion_call(assignment.id))
+
+    assert latest_rewake_target(ctx, assignment.id) == ctx.reviewer.session_key
+  end
+
+  test "verdict on an extra linked card keeps the episode re-wake on its review holder", ctx do
+    assignment = assignment(ctx, "extra linked card")
+    load_review_gate(ctx)
+
+    assert {:error, %{producer: review_id}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, completion_call(assignment.id))
+
+    extra_review = linked_review(ctx, assignment.id, "extra review")
+    verdict(ctx, extra_review.id, "reviewed-clean")
+
+    assert {:error, %{producer: ^review_id}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, completion_call(assignment.id))
+
+    assert latest_rewake_target(ctx, assignment.id) == ctx.reviewer.session_key
+  end
+
+  test "sole linked card holder verdict redirects the re-wake to the producer holder", ctx do
+    assignment = assignment(ctx, "holder verdict")
+    load_review_gate(ctx)
+
+    assert {:error, %{producer: review_id}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, completion_call(assignment.id))
+
+    verdict(ctx, review_id, "changes-requested")
+
+    assert {:error, %{producer: ^review_id}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, completion_call(assignment.id))
+
+    assert latest_rewake_target(ctx, assignment.id) == ctx.holder.session_key
+  end
+
   test "unbound role and token fail closed without dispatch", ctx do
     assignment = assignment(ctx, "unbound")
     :ok = Roles.rm(ctx.db, "reviewer")
@@ -724,6 +790,11 @@ defmodule Tightbeam.RailRemedyTest do
          ~s(subject = "review {assignment_id}"),
          ~s(subject = "review {unknown}")
        ), "unknown binding token"},
+      {String.replace(
+         review_gate(),
+         ~s(action = "assign"),
+         ~s(action = "assign"\non_rule_denied = "retry")
+       ), "on_rule_denied must be block or surface"},
       {"""
        [[rule]]
        name = "bad-external"
@@ -746,6 +817,18 @@ defmodule Tightbeam.RailRemedyTest do
     end)
   end
 
+  test "remedy rule-denial policy defaults to block and accepts explicit block", ctx do
+    put_rules(ctx, review_gate())
+
+    assert [%{remedy: %{on_rule_denied: "block"}}] =
+             Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    put_rules(ctx, explicit_block_review_gate())
+
+    assert [%{remedy: %{on_rule_denied: "block"}}] =
+             Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+  end
+
   defp load_review_gate(ctx) do
     put_rules(ctx, review_gate())
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
@@ -764,7 +847,8 @@ defmodule Tightbeam.RailRemedyTest do
     effect = "remedy"
     deny_when = [
       { fact = "attest.kind", op = "eq", value = "completion" },
-      { fact = "assignment.cross_harness_verdict_kinds", op = "not_in", value = ["reviewed-clean"] }
+      { fact = "assignment.effect_kind", op = "in", value = ["code", "policy", "release", "live_mutation"] },
+      { fact = "assignment.qualifying_review_verdict_kinds", op = "not_in", value = ["reviewed-clean"] }
     ]
     [rule.remedy]
     action = "assign"
@@ -774,6 +858,22 @@ defmodule Tightbeam.RailRemedyTest do
     subject = "review {assignment_id}"
     reviews = "{assignment_id}"
     """
+  end
+
+  defp explicit_block_review_gate do
+    String.replace(
+      review_gate(),
+      ~s(action = "assign"),
+      ~s(action = "assign"\non_rule_denied = "block")
+    )
+  end
+
+  defp surfaced_review_gate do
+    String.replace(
+      review_gate(),
+      ~s(action = "assign"),
+      ~s(action = "assign"\non_rule_denied = "surface")
+    )
   end
 
   defp script_assign_gate do
@@ -1026,14 +1126,54 @@ defmodule Tightbeam.RailRemedyTest do
     })
   end
 
+  defp linked_review(ctx, assignment_id, subject) do
+    Assignments.__handle__(ctx.db, "assign", %{
+      verb: "assign",
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      session_key: ctx.reviewer.session_key,
+      target_role: nil,
+      role_fallback: false,
+      supervision_interval_ms: 1_000,
+      params: %{
+        subject: subject,
+        reviews_assignment_id: assignment_id,
+        idempotency_key: nil
+      }
+    })
+  end
+
   defp verdict(ctx, assignment_id, kind) do
+    verdict_from(ctx, ctx.reviewer.session_key, assignment_id, kind)
+  end
+
+  defp verdict_from(ctx, session_key, assignment_id, kind) do
     Assignments.__handle__(ctx.db, "attest", %{
       verb: "attest",
-      origin: "agent:reviewer",
-      principal: {:session, ctx.reviewer.session_key},
+      origin: "agent:#{session_key}",
+      principal: {:session, session_key},
       session_key: nil,
       params: %{assignment_id: assignment_id, kind: "verdict", verdict_kind: kind}
     })
+  end
+
+  defp latest_rewake_target(ctx, assignment_id) do
+    {:ok, [[session_key]]} =
+      DB.query(
+        ctx.db,
+        """
+        SELECT w.sessionKey
+        FROM wire_idempotency i
+        JOIN wakes w ON w.wakeId = i.sessionKey
+        WHERE i.operation = 'wake'
+          AND i.idempotencyKey LIKE ?1
+        ORDER BY w.createdAt DESC, w.wakeId DESC
+        LIMIT 1
+        """,
+        ["rail-rewake:completion-needs-review:#{assignment_id}:%"]
+      )
+
+    session_key
   end
 
   defp revoke(ctx, assignment_id) do
@@ -1152,7 +1292,7 @@ defmodule Tightbeam.RailRemedyTest do
       owner_user_id: owner,
       origin: "user:#{owner}",
       archetype: archetype,
-      host: "eezo",
+      host: Tightbeam.Placement.local_host_name(),
       harness: harness,
       provider: if(harness == "codex", do: "openai", else: "anthropic"),
       model: Model.new("test")

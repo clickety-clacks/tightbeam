@@ -135,6 +135,22 @@ defmodule Tightbeam.IdentityTest do
     assert {:noop, ^revision} = Identity.learn!(ctx.base, "agentic-engineering", "operator")
   end
 
+  test "shipped engineering bundle imports the test receipt rule and coder guidance", ctx do
+    shipped = Path.expand("priv/kungfu/agentic-engineering")
+    Application.put_env(:tightbeam, :identity_source_dir, shipped)
+    base = Path.join(ctx.root, "shipped-runtime")
+
+    assert {:ok, _revision} = Identity.learn!(base, "agentic-engineering", "operator")
+
+    engineering_rule = File.read!(Path.join(base, "identity/rules/engineering.toml"))
+    assert engineering_rule =~ ~s(name = "code-review-requires-passing-tests")
+    assert engineering_rule =~ ~s(on_rule_denied = "surface")
+
+    coder = Identity.snapshot!(base, "coder", :codex)
+    assert coder.guidance =~ "Before the ready-for-review progress attest"
+    assert coder.guidance =~ "--verdict tests-passed"
+  end
+
   test "init refuses an identity repository missing the live ref with repair guidance", ctx do
     assert :initialized = Identity.init!(ctx.base)
     dir = Path.join(ctx.base, "identity")

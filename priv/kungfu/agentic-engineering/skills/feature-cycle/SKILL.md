@@ -25,10 +25,13 @@ per-feature, but your attention across features is the scarce resource.
    and non-goals. An open question that decides the nature of the product goes to the
    user (`tightbeam wake --user <id> --prompt "<the question>"`) before spec review;
    an implementation-detail question does not.
-2. **Adversarial spec review.** Spawn a reviewer on a different model family than the
-   spec-writer, thinking hard; when one family is available, spawn a fresh session at a
-   higher thinking level. Link the review to the work it reviews so the substrate can
-   witness the independence:
+2. **Adversarial spec review.** A spec is authoritative policy, so it requires review.
+   Select the first qualified permitted candidate from the ordered spec-review row in
+   `preferred-models.md`. Try each candidate once; on an unavailable candidate, step
+   right once. Send ambiguous qualification to your parent, and when the row is
+   exhausted have the parent record `work-blocked` or surface the missing credential.
+   Spawn the selected reviewer as a fresh session. Link the review to the work it
+   reviews so the substrate can witness the independence:
    `tightbeam assign --subject "review of spec <id>" --role reviewer:<slug> --work-item <id> --reviews <specAssignmentId>`.
    The reviewer works per `reviewing-specs`. On `changes-requested`, wake the
    spec-writer to revise; repeat until `reviewed-clean`. The spec-writer then pins (or
@@ -47,15 +50,28 @@ per-feature, but your attention across features is the scarce resource.
    verdict is `reviewed-clean`, the verification papertrail is recorded, and
    integration is proven (a completion closes the assignment, and verdicts land only
    on open ones).
-5. **Code review.** Every goal ready for review goes to an independent reviewer: a
-   session that did not produce the work, on a different model family than the
-   producer, thinking hard; when one family is available, a fresh session at a higher
-   thinking level. Link it to the reviewed work:
+5. **Effect review.** Classify the effect, not the holder's role. Exactly one review is
+   required when a goal changes code or source behavior; authoritative specs, policy,
+   Kung Fu, or rails; a release artifact or promotion; or live runtime, configuration,
+   or identity state. One goal that carries several qualifying effects still gets one
+   review. Review verdicts and review-card lifecycle, read-only recon or advice,
+   status/accountability work, and coordination are evidence-only and get no review.
+
+   For a review-required effect, select the first qualified permitted candidate from
+   the ordered code-review row in `preferred-models.md`. Try each candidate once. An
+   unavailable candidate advances the selection one place to the right; never retry
+   the same candidate. Send ambiguous qualification to your parent. If the row is
+   exhausted, the parent records `work-blocked` or surfaces the credential need. Spawn
+   the selected reviewer as a fresh session with the capability the effect requires.
+   Same model, provider, or harness remains eligible. Link the single review card to
+   the reviewed work:
    `tightbeam assign --subject "review of <goal>" --role reviewer:<slug> --work-item <id> --reviews <coderAssignmentId>`.
-   The `--reviews` link is what lets the substrate compute whether a verdict came from
-   a different provider than produced the work; a verdict filed without it is a claim
-   of independence the rows cannot confirm. On `changes-requested`, wake the coder to
-   iterate; repeat until `reviewed-clean`.
+   The `--reviews` link and the verdict by that card's different-session holder are
+   what let the substrate compute independence. Harness and provider differences stay
+   observable selection evidence; they do not gate completion. A verdict filed
+   without the link is a claim the rows cannot confirm. On `changes-requested`, wake
+   the producer to iterate and have the same reviewer re-file on the same review card
+   until `reviewed-clean`; do not multiply review cards for review rounds.
 6. **Spirit review (substantial changes).** A goal is substantial when it produces
    product behavior with no product-owner-gated spec authority behind it —
    behavior an agent or user experiences, an authority moved between homes, or a

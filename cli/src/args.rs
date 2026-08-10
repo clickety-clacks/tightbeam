@@ -94,6 +94,7 @@ pub enum Command {
         idempotency_key: Option<String>,
         work_item_id: Option<String>,
         reviews: Option<String>,
+        effect_kind: Option<String>,
         files: Option<Vec<String>>,
     },
     Dispatch {
@@ -101,6 +102,7 @@ pub enum Command {
         subject: String,
         holder: String,
         work_item_id: Option<String>,
+        effect_kind: Option<String>,
         workdir_root: Option<String>,
         brief: String,
         idempotency_key: Option<String>,
@@ -436,12 +438,13 @@ COMMANDS:
       Rule an item failed (→ failed); --reason is recorded on the item.
   assign --subject "<work>" (--session <key> | --role <name>)
          [--key <key>] [--work-item <workItemId>]
-         [--reviews <assignmentId>] [--files '["lib/a.ex","test/a_test.exs"]']
+         [--reviews <assignmentId>] [--effect-kind <kind>]
+         [--files '["lib/a.ex","test/a_test.exs"]']
       Open an obligation held by a session; a work item is the durable thread
       across assignments.
   dispatch (--to <sessionKey> | --holder <sessionKey>) --subject "<work>"
            --brief "<one sentence>" [--work-item <workItemId>]
-           [--workdir-root <relativePath>] [--key <key>]
+           [--effect-kind <kind>] [--workdir-root <relativePath>] [--key <key>]
       Atomically open an assignment and wake its holder with the card id.
   effort-rule --request <decisionRequestId> --action continue|dismiss
       Rule an effort-without-effect check-in routed to your principal.
@@ -1025,6 +1028,7 @@ fn parse_with_optional_catalog(
                 idempotency_key: nonempty(flags, "key"),
                 work_item_id: nonempty(flags, "work-item"),
                 reviews: nonempty(flags, "reviews"),
+                effect_kind: nonempty(flags, "effect-kind"),
                 files,
             })
         }
@@ -1044,6 +1048,7 @@ fn parse_with_optional_catalog(
                 subject,
                 holder: holders.into_iter().next().expect("exactly one holder"),
                 work_item_id: nonempty(flags, "work-item"),
+                effect_kind: nonempty(flags, "effect-kind"),
                 workdir_root: nonempty(flags, "workdir-root"),
                 brief,
                 idempotency_key: nonempty(flags, "key"),

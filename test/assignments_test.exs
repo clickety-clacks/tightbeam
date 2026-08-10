@@ -594,6 +594,7 @@ defmodule Tightbeam.AssignmentsTest do
     reviewed = handle(ctx, "assign", assign_call({:user, "flynn"}, "producer"))
 
     assert reviewed.reviewsAssignmentId == nil
+    assert reviewed.effectKind == "code"
     assert reviewed.holderHarness == "claude"
     assert reviewed.holderProvider == "anthropic"
 
@@ -610,10 +611,12 @@ defmodule Tightbeam.AssignmentsTest do
     review_call =
       assign_call({:user, "flynn"}, "review")
       |> put_in([:params, :reviews_assignment_id], reviewed.id)
+      |> put_in([:params, :effect_kind], "policy")
       |> Map.put(:session_key, "other-session")
 
     review = handle(ctx, "assign", review_call)
     assert review.reviewsAssignmentId == reviewed.id
+    assert review.effectKind == "review"
     assert review.holderHarness == "claude"
     assert review.holderProvider == "anthropic"
 
@@ -625,6 +628,53 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert {:ok, [[0]]} =
              DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE subject = 'unknown review'")
+  end
+
+  test "assign and dispatch stamp valid effects while legacy rows resolve conservatively", ctx do
+    effects =
+      for kind <- ~w(code policy release live_mutation evidence review coordination), into: %{} do
+        assignment =
+          assign_call({:user, "flynn"}, "#{kind} effect")
+          |> put_in([:params, :effect_kind], kind)
+          |> then(&handle(ctx, "assign", &1))
+
+        assert assignment.effectKind == kind
+        {kind, assignment}
+      end
+
+    evidence = effects["evidence"]
+
+    release_call =
+      dispatch_call({:user, "flynn"}, "release", "ship it")
+      |> put_in([:params, :effect_kind], "release")
+
+    release = handle(ctx, "dispatch", release_call)
+    assert release.effectKind == "release"
+
+    before = assignment_count(ctx.db)
+
+    invalid =
+      assign_call({:user, "flynn"}, "invalid")
+      |> put_in([:params, :effect_kind], "source")
+
+    assert %{code: "invalid_effect_kind"} = handle(ctx, "assign", invalid)
+    assert assignment_count(ctx.db) == before
+
+    review =
+      assign_call({:user, "flynn"}, "legacy review")
+      |> put_in([:params, :reviews_assignment_id], evidence.id)
+      |> Map.put(:session_key, "other-session")
+      |> then(&handle(ctx, "assign", &1))
+
+    {:ok, _} =
+      DB.query(ctx.db, "DELETE FROM assignment_effects WHERE assignmentId IN (?1, ?2)", [
+        evidence.id,
+        review.id
+      ])
+
+    legacy = Assignments.list(ctx.db, %{state: "all"})
+    assert Enum.find(legacy, &(&1.id == evidence.id)).effectKind == "code"
+    assert Enum.find(legacy, &(&1.id == review.id)).effectKind == "review"
   end
 
   test "Proof 1: a conflicting review-assignment create is refused with review_item_conflict",
@@ -651,9 +701,9 @@ defmodule Tightbeam.AssignmentsTest do
              )
   end
 
-  test "Proof 2: a NULL-workItemId review assignment resolves transitively for RESOLVED readers and counts exactly once",
+  test "Proof 2: a review assignment cannot itself be reviewed",
        ctx do
-    item = create_work_item(ctx, "Transitive story")
+    item = create_work_item(ctx, "Review boundary")
     reviewed = handle(ctx, "assign", assign_call({:user, "flynn"}, "base", nil, item.id))
 
     first_review =
@@ -661,20 +711,22 @@ defmodule Tightbeam.AssignmentsTest do
       |> put_in([:params, :reviews_assignment_id], reviewed.id)
       |> then(&handle(ctx, "assign", &1))
 
-    second_review =
+    nested_review =
       assign_call({:user, "flynn"}, "second review")
       |> put_in([:params, :reviews_assignment_id], first_review.id)
       |> then(&handle(ctx, "assign", &1))
 
     assert first_review.workItemId == nil
-    assert second_review.workItemId == nil
-    assert Assignments.resolved_work_item_id(ctx.db, second_review.id) == item.id
+    assert Assignments.resolved_work_item_id(ctx.db, first_review.id) == item.id
 
-    # "Counts exactly once" must be proven against the PRODUCTION resolved
-    # reader, not against a list that is already one row per primary key. The
-    # reader is `work-item-trace`, whose recursive CTE (job_trace.ex:68) is the
-    # second implementation of this same edge relation — so this also pins the
-    # two against each other and fails on drift.
+    assert %{
+             code: "review_of_review",
+             message: "a review assignment cannot itself be reviewed"
+           } = nested_review
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE subject = 'second review'")
+
     trace =
       Tightbeam.WorkItems.__handle__(ctx.db, "work-item-trace", %{
         verb: "work-item-trace",
@@ -686,14 +738,8 @@ defmodule Tightbeam.AssignmentsTest do
 
     traced_ids = Enum.map(trace.assignments, & &1.id)
 
-    assert Enum.count(traced_ids, &(&1 == second_review.id)) == 1
     assert Enum.count(traced_ids, &(&1 == first_review.id)) == 1
-    assert Enum.sort(traced_ids) == Enum.sort([reviewed.id, first_review.id, second_review.id])
-
-    # The CTE and resolved_work_item_id/2 must agree on every member.
-    for id <- traced_ids do
-      assert Assignments.resolved_work_item_id(ctx.db, id) == item.id
-    end
+    assert Enum.sort(traced_ids) == Enum.sort([reviewed.id, first_review.id])
   end
 
   test "Proof 3: an assignment with neither key resolves to NONE", ctx do
@@ -909,6 +955,71 @@ defmodule Tightbeam.AssignmentsTest do
                by_provider: "anthropic"
              }
            ]
+  end
+
+  test "qualifying review verdict requires exactly one independent card and its latest holder verdict",
+       ctx do
+    producer = handle(ctx, "assign", assign_call({:user, "flynn"}, "qualifying producer"))
+
+    review =
+      assign_call({:user, "flynn"}, "qualifying review")
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :reviews_assignment_id], producer.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == []
+
+    _ =
+      attest_call({:session, "holder"}, review.id, "verdict")
+      |> put_in([:params, :verdict_kind], "third-party")
+      |> then(&handle(ctx, "attest", &1))
+
+    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == []
+
+    _ =
+      attest_call({:session, "other-session"}, review.id, "verdict")
+      |> put_in([:params, :verdict_kind], "reviewed-clean")
+      |> then(&handle(ctx, "attest", &1))
+
+    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == [
+             "reviewed-clean"
+           ]
+
+    _ =
+      attest_call({:session, "other-session"}, review.id, "verdict")
+      |> put_in([:params, :verdict_kind], "reviewed-clean")
+      |> then(&handle(ctx, "attest", &1))
+
+    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == [
+             "reviewed-clean"
+           ]
+
+    _ =
+      attest_call({:session, "other-session"}, review.id, "verdict")
+      |> put_in([:params, :verdict_kind], "changes-requested")
+      |> then(&handle(ctx, "attest", &1))
+
+    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == []
+
+    second_review =
+      assign_call({:user, "flynn"}, "second qualifying review")
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :reviews_assignment_id], producer.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    _ =
+      attest_call({:session, "other-session"}, second_review.id, "verdict")
+      |> put_in([:params, :verdict_kind], "reviewed-clean")
+      |> then(&handle(ctx, "attest", &1))
+
+    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == []
+
+    _ =
+      attest_call({:session, "other-session"}, review.id, "verdict")
+      |> put_in([:params, :verdict_kind], "reviewed-clean")
+      |> then(&handle(ctx, "attest", &1))
+
+    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == []
   end
 
   test "prefixed idempotency scopes disjoint equal user and session strings", ctx do

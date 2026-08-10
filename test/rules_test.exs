@@ -30,7 +30,11 @@ defmodule Tightbeam.RulesTest do
       Rules.load!(System.tmp_dir!() <> "/missing-rules-reset", [])
     end)
 
-    %{db: db, base_dir: base_dir, handlers: Gateway.handlers(%{db: db})}
+    %{
+      db: db,
+      base_dir: base_dir,
+      handlers: Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
+    }
   end
 
   test "missing and empty directories load zero rules and an empty load clears prior rules",
@@ -485,9 +489,7 @@ defmodule Tightbeam.RulesTest do
 
   test "P3 fact registry has exact names and load-time types", ctx do
     list_facts = [
-      "assignment.independent_verdict_kinds",
-      "assignment.cross_harness_verdict_kinds",
-      "assignment.cross_provider_verdict_kinds",
+      "assignment.qualifying_review_verdict_kinds",
       "assignment.artifact_kinds"
     ]
 
@@ -504,6 +506,18 @@ defmodule Tightbeam.RulesTest do
       put_rule(ctx, rule("bad-list-value", "attest", fact, "not_in", []))
 
       assert_raise ArgumentError, ~r/non-empty flat list/, fn ->
+        Rules.load!(ctx.base_dir, ["attest"])
+      end
+    end
+
+    for removed <- [
+          "assignment.independent_verdict_kinds",
+          "assignment.cross_harness_verdict_kinds",
+          "assignment.cross_provider_verdict_kinds"
+        ] do
+      put_rule(ctx, rule("removed-review-fact", "attest", removed, "in", ["reviewed-clean"]))
+
+      assert_raise ArgumentError, ~r/unknown fact/, fn ->
         Rules.load!(ctx.base_dir, ["attest"])
       end
     end
@@ -574,7 +588,7 @@ defmodule Tightbeam.RulesTest do
       rule(
         "bad-list-member",
         "attest",
-        "assignment.independent_verdict_kinds",
+        "assignment.qualifying_review_verdict_kinds",
         "in",
         [1]
       )
@@ -591,9 +605,7 @@ defmodule Tightbeam.RulesTest do
     review = assignment(ctx, holder.session_key, {:user, "flynn"}, reviews: assignment.id)
 
     list_facts = [
-      "assignment.independent_verdict_kinds",
-      "assignment.cross_harness_verdict_kinds",
-      "assignment.cross_provider_verdict_kinds",
+      "assignment.qualifying_review_verdict_kinds",
       "assignment.artifact_kinds"
     ]
 
@@ -660,27 +672,6 @@ defmodule Tightbeam.RulesTest do
                :missing_db,
                p3_call("attest", nil, %{assignment_id: assignment.id, kind: "completion"})
              )
-
-    {:ok, _} =
-      DB.query(
-        ctx.db,
-        "UPDATE assignments SET holderHarness = NULL, holderProvider = NULL WHERE id = ?1",
-        [assignment.id]
-      )
-
-    for fact <- [
-          "assignment.cross_harness_verdict_kinds",
-          "assignment.cross_provider_verdict_kinds"
-        ] do
-      put_rule(ctx, rule("unstamped", "attest", fact, "not_in", ["required"]))
-      Rules.load!(ctx.base_dir, ["attest"])
-
-      assert :ok =
-               Rules.evaluate(
-                 ctx.db,
-                 p3_call("attest", nil, %{assignment_id: assignment.id, kind: "completion"})
-               )
-    end
 
     _existing = assignment(ctx, holder.session_key, {:user, "flynn"}, files: ["lib/a.ex"])
 
@@ -813,13 +804,12 @@ defmodule Tightbeam.RulesTest do
     assert {:deny, %{rule: "needs-review"}} = Rules.evaluate(ctx.db, completion)
   end
 
-  test "independence facts enforce commissioned-review provenance and frozen stamps", ctx do
+  test "qualifying review is the sole public review fact and ignores harness/provider", ctx do
     {:ok, _} =
       DB.query(ctx.db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1)")
 
     holder = session(ctx.db, "producer", "flynn", archetype: "coder")
-    reviewer = session(ctx.db, "reviewer", "other", harness: "codex", provider: "openai")
-    same = session(ctx.db, "same-reviewer", "other")
+    reviewer = session(ctx.db, "reviewer", "other", harness: "claude", provider: "anthropic")
     third = session(ctx.db, "third", "other", harness: "codex", provider: "openai")
     producer = assignment(ctx, holder.session_key, {:user, "flynn"})
 
@@ -830,91 +820,13 @@ defmodule Tightbeam.RulesTest do
 
     verdict(ctx, third.session_key, valid_review.id, "third-session")
     user_verdict(ctx, "flynn", valid_review.id, "user-on-review")
-    verdict(ctx, reviewer.session_key, valid_review.id, "reviewed-clean")
-    verdict(ctx, reviewer.session_key, valid_review.id, "reviewed-clean")
-
-    same_review = assignment(ctx, same.session_key, {:user, "flynn"}, reviews: producer.id)
-    verdict(ctx, same.session_key, same_review.id, "same-harness")
-
-    self_review =
-      assignment(ctx, third.session_key, {:session, holder.session_key}, reviews: producer.id)
-
-    verdict(ctx, third.session_key, self_review.id, "self-commissioned")
-
-    other_producer = assignment(ctx, holder.session_key, {:user, "flynn"})
-
-    wrong_review =
-      assignment(ctx, reviewer.session_key, {:user, "flynn"}, reviews: other_producer.id)
-
-    verdict(ctx, reviewer.session_key, wrong_review.id, "wrong-link")
-
-    assertions = [
-      {"assignment.independent_verdict_kinds", "direct", false},
-      {"assignment.independent_verdict_kinds", "third-session", false},
-      {"assignment.independent_verdict_kinds", "user-on-review", false},
-      {"assignment.independent_verdict_kinds", "self-commissioned", true},
-      {"assignment.independent_verdict_kinds", "wrong-link", false},
-      {"assignment.independent_verdict_kinds", "reviewed-clean", true},
-      {"assignment.independent_verdict_kinds", "same-harness", true},
-      {"assignment.cross_harness_verdict_kinds", "direct", false},
-      {"assignment.cross_harness_verdict_kinds", "third-session", false},
-      {"assignment.cross_harness_verdict_kinds", "user-on-review", false},
-      {"assignment.cross_harness_verdict_kinds", "self-commissioned", true},
-      {"assignment.cross_harness_verdict_kinds", "wrong-link", false},
-      {"assignment.cross_harness_verdict_kinds", "reviewed-clean", true},
-      {"assignment.cross_harness_verdict_kinds", "same-harness", false},
-      {"assignment.cross_provider_verdict_kinds", "reviewed-clean", true},
-      {"assignment.cross_provider_verdict_kinds", "self-commissioned", true},
-      {"assignment.cross_provider_verdict_kinds", "wrong-link", false},
-      {"assignment.cross_provider_verdict_kinds", "same-harness", false}
-    ]
-
-    for {fact, kind, fires?} <- assertions do
-      put_rule(ctx, rule("matrix", "attest", fact, "in", [kind]))
-      Rules.load!(ctx.base_dir, ["attest"])
-
-      result =
-        Rules.evaluate(
-          ctx.db,
-          p3_call("attest", nil, %{assignment_id: producer.id, kind: "completion"})
-        )
-
-      assert match_result(result) == fires?
-    end
-
-    put_raw(ctx, """
-    [[rule]]
-    name = "cached-authors"
-    verb = "attest"
-    text = "all projections derive from one cached author list"
-    deny_when = [
-      { fact = "assignment.independent_verdict_kinds", op = "in", value = ["reviewed-clean"] },
-      { fact = "assignment.cross_harness_verdict_kinds", op = "in", value = ["reviewed-clean"] },
-      { fact = "assignment.cross_provider_verdict_kinds", op = "in", value = ["reviewed-clean"] }
-    ]
-    """)
-
-    Rules.load!(ctx.base_dir, ["attest"])
-
-    assert {:deny, %{rule: "cached-authors"}} =
-             Rules.evaluate(
-               ctx.db,
-               p3_call("attest", nil, %{assignment_id: producer.id, kind: "completion"})
-             )
-
-    {:ok, _} =
-      DB.query(
-        ctx.db,
-        "UPDATE sessions SET harness = 'codex', provider = 'openai' WHERE sessionKey = ?1",
-        [holder.session_key]
-      )
 
     put_rule(
       ctx,
       rule(
-        "frozen",
+        "qualified",
         "attest",
-        "assignment.cross_harness_verdict_kinds",
+        "assignment.qualifying_review_verdict_kinds",
         "in",
         ["reviewed-clean"]
       )
@@ -922,7 +834,23 @@ defmodule Tightbeam.RulesTest do
 
     Rules.load!(ctx.base_dir, ["attest"])
 
-    assert {:deny, %{rule: "frozen"}} =
+    assert :ok =
+             Rules.evaluate(
+               ctx.db,
+               p3_call("attest", nil, %{assignment_id: producer.id, kind: "completion"})
+             )
+
+    verdict(ctx, reviewer.session_key, valid_review.id, "changes-requested")
+
+    assert :ok =
+             Rules.evaluate(
+               ctx.db,
+               p3_call("attest", nil, %{assignment_id: producer.id, kind: "completion"})
+             )
+
+    verdict(ctx, reviewer.session_key, valid_review.id, "reviewed-clean")
+
+    assert {:deny, %{rule: "qualified"}} =
              Rules.evaluate(
                ctx.db,
                p3_call("attest", nil, %{assignment_id: producer.id, kind: "completion"})
@@ -982,7 +910,7 @@ defmodule Tightbeam.RulesTest do
 
   test "P3 review and artifact statutes deny before attest and allow after proof", ctx do
     holder = session(ctx.db, "gate-holder", "flynn", archetype: "coder")
-    reviewer = session(ctx.db, "gate-reviewer", "other", harness: "codex", provider: "openai")
+    reviewer = session(ctx.db, "gate-reviewer", "other", archetype: "reviewer")
     assignment = assignment(ctx, holder.session_key, {:user, "flynn"})
     parent = self()
     actual_attest = ctx.handlers["attest"]
@@ -1002,7 +930,7 @@ defmodule Tightbeam.RulesTest do
         kind: "completion"
       })
 
-    assert {:error, %{code: "rule_denied", rule: "needs-cross-review"}} =
+    assert {:error, %{code: "rule_denied", rule: "needs-independent-review"}} =
              Dispatch.dispatch(ctx.db, handlers, completion)
 
     refute_received :attest_handler_invoked
@@ -1017,6 +945,27 @@ defmodule Tightbeam.RulesTest do
              Dispatch.dispatch(ctx.db, handlers, completion)
 
     assert_received :attest_handler_invoked
+
+    review_completion =
+      p3_call("attest", {:session, reviewer.session_key}, %{
+        assignment_id: review.id,
+        kind: "completion"
+      })
+
+    assert {:ok, %{assignment: %{state: "closed", effectKind: "review"}}} =
+             Dispatch.dispatch(ctx.db, handlers, review_completion)
+
+    evidence_assignment =
+      assignment(ctx, holder.session_key, {:user, "flynn"}, effect_kind: "evidence")
+
+    evidence_completion =
+      p3_call("attest", {:session, holder.session_key}, %{
+        assignment_id: evidence_assignment.id,
+        kind: "completion"
+      })
+
+    assert {:ok, %{assignment: %{state: "closed", effectKind: "evidence"}}} =
+             Dispatch.dispatch(ctx.db, handlers, evidence_completion)
 
     artifact_assignment = assignment(ctx, holder.session_key, {:user, "flynn"})
     attach_work_item(ctx, artifact_assignment.id, "wi_artifact_gate")
@@ -1042,6 +991,135 @@ defmodule Tightbeam.RulesTest do
 
     assert {:ok, %{assignment: %{state: "closed"}}} =
              Dispatch.dispatch(ctx.db, ctx.handlers, artifact_completion)
+  end
+
+  test "shipped code-review rail requires the open coder holder's nonblank test receipt", ctx do
+    holder = session(ctx.db, "receipt-holder", "flynn", archetype: "coder")
+    other = session(ctx.db, "receipt-other", "other", archetype: "coder")
+    reviewer = session(ctx.db, "receipt-reviewer", "reviewer", archetype: "reviewer")
+    producer = assignment(ctx, holder.session_key, {:user, "flynn"})
+
+    {:ok, _} =
+      DB.query(ctx.db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1)")
+
+    put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    review_call =
+      p3_call("assign", {:user, "reviewer"}, %{
+        subject: "review receipt producer",
+        reviews_assignment_id: producer.id,
+        idempotency_key: nil,
+        files: nil
+      })
+      |> Map.put(:session_key, reviewer.session_key)
+
+    assert {:error,
+            %{
+              code: "rule_denied",
+              rule: "code-review-requires-passing-tests",
+              ref: producer_id
+            }} = Dispatch.dispatch(ctx.db, ctx.handlers, review_call)
+
+    assert producer_id == producer.id
+    assert review_count(ctx.db, producer.id) == 0
+
+    user_verdict(ctx, "flynn", producer.id, "tests-passed", "user claim")
+    verdict(ctx, other.session_key, producer.id, "tests-passed", "other session claim")
+    verdict(ctx, holder.session_key, producer.id, "tests-passed")
+
+    assert {:error, %{rule: "code-review-requires-passing-tests", ref: ^producer_id}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, review_call)
+
+    assert review_count(ctx.db, producer.id) == 0
+
+    verdict(
+      ctx,
+      holder.session_key,
+      producer.id,
+      "tests-passed",
+      "gibson:/repo abc123; mix test test/rules_test.exs; passed: 1 test"
+    )
+
+    assert {:ok, %{reviewsAssignmentId: ^producer_id, effectKind: "review"}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, review_call)
+
+    assert review_count(ctx.db, producer.id) == 1
+  end
+
+  test "typed completion keeps code reviewed while receipt exemptions stay narrow", ctx do
+    coder = session(ctx.db, "receipt-closed", "flynn", archetype: "coder")
+    noncoder = session(ctx.db, "receipt-orchestrator", "flynn", archetype: "orchestrator")
+    reviewer = session(ctx.db, "receipt-exempt-reviewer", "reviewer", archetype: "reviewer")
+    closed = assignment(ctx, coder.session_key, {:user, "flynn"})
+    open_coder = assignment(ctx, coder.session_key, {:user, "flynn"})
+    noncode = assignment(ctx, noncoder.session_key, {:user, "flynn"})
+
+    orchestration =
+      assignment(ctx, noncoder.session_key, {:user, "flynn"}, effect_kind: "evidence")
+
+    assert %{assignment: %{state: "closed"}} =
+             Assignments.__handle__(
+               ctx.db,
+               "attest",
+               p3_call("attest", {:session, coder.session_key}, %{
+                 assignment_id: closed.id,
+                 kind: "completion"
+               })
+             )
+
+    put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    coder_completion =
+      p3_call("attest", {:session, coder.session_key}, %{
+        assignment_id: open_coder.id,
+        kind: "completion"
+      })
+
+    evidence_completion =
+      p3_call("attest", {:session, noncoder.session_key}, %{
+        assignment_id: orchestration.id,
+        kind: "completion"
+      })
+
+    assert {:deny, %{rule: "completion-requires-review"}} =
+             Rules.evaluate(ctx.db, coder_completion)
+
+    assert orchestration.reviewsAssignmentId == nil
+    assert orchestration.effectKind == "evidence"
+
+    assert {:ok, %{assignment: %{id: orchestration_id, state: "closed"}}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, evidence_completion)
+
+    assert orchestration_id == orchestration.id
+
+    ordinary =
+      p3_call("assign", {:user, "reviewer"}, %{
+        subject: "ordinary assignment",
+        idempotency_key: nil,
+        files: nil
+      })
+      |> Map.put(:session_key, reviewer.session_key)
+
+    assert {:ok, %{reviewsAssignmentId: nil}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, ordinary)
+
+    for producer <- [noncode, closed] do
+      call =
+        p3_call("assign", {:user, "reviewer"}, %{
+          subject: "exempt review",
+          reviews_assignment_id: producer.id,
+          idempotency_key: nil,
+          files: nil
+        })
+        |> Map.put(:session_key, reviewer.session_key)
+
+      assert {:ok, %{reviewsAssignmentId: reviewed}} =
+               Dispatch.dispatch(ctx.db, ctx.handlers, call)
+
+      assert reviewed == producer.id
+    end
   end
 
   defp call(origin \\ "user:flynn") do
@@ -1074,34 +1152,46 @@ defmodule Tightbeam.RulesTest do
         subject: "P3 assignment #{System.unique_integer([:positive])}",
         idempotency_key: nil,
         reviews_assignment_id: opts[:reviews],
+        effect_kind: opts[:effect_kind],
         files: opts[:files]
       })
 
     Assignments.__handle__(ctx.db, "assign", %{call | session_key: holder_key})
   end
 
-  defp verdict(ctx, session_key, assignment_id, verdict_kind) do
+  defp verdict(ctx, session_key, assignment_id, verdict_kind, note \\ nil) do
     Assignments.__handle__(
       ctx.db,
       "attest",
       p3_call("attest", {:session, session_key}, %{
         assignment_id: assignment_id,
         kind: "verdict",
-        verdict_kind: verdict_kind
+        verdict_kind: verdict_kind,
+        note: note
       })
     )
   end
 
-  defp user_verdict(ctx, user, assignment_id, verdict_kind) do
+  defp user_verdict(ctx, user, assignment_id, verdict_kind, note \\ nil) do
     Assignments.__handle__(
       ctx.db,
       "attest",
       p3_call("attest", {:user, user}, %{
         assignment_id: assignment_id,
         kind: "verdict",
-        verdict_kind: verdict_kind
+        verdict_kind: verdict_kind,
+        note: note
       })
     )
+  end
+
+  defp review_count(db, producer_id) do
+    {:ok, [[count]]} =
+      DB.query(db, "SELECT count(*) FROM assignments WHERE reviewsAssignmentId = ?1", [
+        producer_id
+      ])
+
+    count
   end
 
   defp attach_work_item(ctx, assignment_id, work_item_id) do
@@ -1154,14 +1244,14 @@ defmodule Tightbeam.RulesTest do
   defp review_gate_rule do
     """
     [[rule]]
-    name = "needs-cross-review"
+    name = "needs-independent-review"
     verb = "attest"
-    text = "completion requires cross-harness review"
+    text = "producing completion requires exactly one independent linked review"
     external_producer = true
     deny_when = [
       { fact = "attest.kind", op = "eq", value = "completion" },
-      { fact = "assignment.holder_archetype", op = "eq", value = "coder" },
-      { fact = "assignment.cross_harness_verdict_kinds", op = "not_in", value = ["reviewed-clean"] }
+      { fact = "assignment.effect_kind", op = "in", value = ["code", "policy", "release", "live_mutation"] },
+      { fact = "assignment.qualifying_review_verdict_kinds", op = "not_in", value = ["reviewed-clean"] }
     ]
     """
   end
@@ -1200,9 +1290,7 @@ defmodule Tightbeam.RulesTest do
       if op == "not_in" and
            fact in [
              "assignment.verdicts",
-             "assignment.independent_verdict_kinds",
-             "assignment.cross_harness_verdict_kinds",
-             "assignment.cross_provider_verdict_kinds"
+             "assignment.qualifying_review_verdict_kinds"
            ] do
         "external_producer = true"
       else

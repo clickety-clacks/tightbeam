@@ -34,17 +34,20 @@ Effort brackets (claude-x[low..max], sol[low..xhigh]) tune depth within a capsul
 
 ## How to read the activity tables
 
-ONE column of minds per activity, IN ORDER: use the first available, step rightward
-if it is not. If NONE is available, the work is BLOCKED — the end of the list IS the
-floor; nothing off-list may do the work. `any` = no floor: any available mind may do
-it.
+ONE column of minds per activity, IN ORDER: use the first qualified candidate that
+the live catalog permits. A candidate is available only when its model and effort are
+selectable on an allowed host, its credential can run, and it has the capability the
+activity requires. If NONE is available, the work is BLOCKED — the end of the list IS
+the floor; nothing off-list may do the work. `any` = no floor: any available mind may
+do it.
 
-Decide at spawn AND again whenever a mind fails you mid-work — a refused spawn names
-its reason, a harness out of tokens is a reason to step rightward; switch and continue
-rather than stop. When no mind on the list is available, follow `model-policy.md`'s
-three moves: switch is off the table by definition, so assert `work-blocked` over the
-affected session and report up, or surface the credential need to the user. Never a
-silent stall, never a retry loop against a wall.
+Decide at spawn AND again whenever a mind fails you mid-work. Try each candidate once:
+a refused spawn or a harness out of tokens advances you one place to the right, never
+back to the same candidate. If qualification is ambiguous, stop and ask your parent to
+adjudicate it; do not guess. When no mind on the list is available, follow
+`model-policy.md`'s three moves: switch is off the table by definition, so have your
+parent assert `work-blocked` over the affected session and report up, or surface the
+credential need to the user. Never a silent stall, never a retry loop against a wall.
 
 ## Substrate activities
 

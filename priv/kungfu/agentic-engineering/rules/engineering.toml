@@ -1,42 +1,43 @@
-# Flagship enforced loop (roadmap P7): completion requires an independent review.
-# A coder attesting completion without a reviewed-clean verdict is not denied — the
+# Flagship enforced loop (roadmap P7): producing effects require one independent review.
+# A holder attesting qualifying completion without a reviewed-clean verdict is not denied — the
 # substrate assigns a reviewer (the remedy), blocks the completion until the review
 # lands, and self-releases. This is the reviewer-loop worked example, enforced.
 [[rule]]
 name = "completion-requires-review"
 verb = "attest"
-text = "completion needs a qualifying reviewed-clean verdict: check that it is on a card linked with --reviews, filed by that card's holder, not filed by this work's author, and cross-harness; if the linked verdict is changes-requested, address it and have the reviewer re-file reviewed-clean"
+text = "code, policy, release, and live-mutation completion needs exactly one --reviews-linked card held by a different session whose latest holder-filed verdict is reviewed-clean; evidence, review, and coordination effects do not require review, and harness, provider, model, and effort guide reviewer selection only"
 external_producer = false
 edges = ["verb"]
 effect = "remedy"
 deny_when = [
   { fact = "attest.kind", op = "eq", value = "completion" },
-  { fact = "assignment.is_producing_card", op = "eq", value = true },
-  { fact = "assignment.cross_harness_verdict_kinds", op = "not_in", value = ["reviewed-clean"] },
+  { fact = "assignment.effect_kind", op = "in", value = ["code", "policy", "release", "live_mutation"] },
+  { fact = "assignment.qualifying_review_verdict_kinds", op = "not_in", value = ["reviewed-clean"] },
 ]
 [rule.remedy]
 action = "assign"
 produces = "reviewed-clean"
 target_role = "reviewer"
+on_rule_denied = "surface"
 [rule.remedy.params]
 subject = "review of assignment {assignment_id}"
 reviews = "{assignment_id}"
 
 # Re-entry twin of completion-requires-review: after one completed fix on a bug
-# work item, the next implementation dispatch first commissions an independent
+# work item, the next implementation dispatch first commissions a dedicated
 # recon. The recon archetype elects bug-provenance; its diagnosed verdict releases
 # the work-item-grain remedy episode and permits the re-fix dispatch.
 [[rule]]
 name = "refix-requires-diagnosis"
 verb = "dispatch"
-text = "a repeated bug fix requires an independent diagnosed verdict"
+text = "a repeated bug fix requires a diagnosed verdict on its work item"
 external_producer = false
 edges = ["verb"]
 effect = "remedy"
 deny_when = [
   { fact = "work_item.is_bug", op = "eq", value = true },
   { fact = "assignment.prior_completed_fix_count", op = "gte", value = 1 },
-  { fact = "assignment.independent_verdict_kinds", op = "not_in", value = ["diagnosed"] },
+  { fact = "work_item.verdict_kinds", op = "not_in", value = ["diagnosed"] },
 ]
 [rule.remedy]
 action = "assign"
@@ -46,6 +47,19 @@ target_role = "recon"
 subject = "diagnosis of prior fix for work item {work_item_id}"
 reviews = "{assignment_id}"
 work_item = "{work_item_id}"
+
+[[rule]]
+name = "code-review-requires-passing-tests"
+verb = "assign"
+text = "code review needs the code author's passing-test receipt: the assignment holder must file a tests-passed verdict with the tested repository, commit, command or suite, and passing result"
+edges = ["verb"]
+effect = "deny"
+deny_when = [
+  { fact = "assignment.is_producing_card", op = "eq", value = true },
+  { fact = "assignment.state", op = "eq", value = "open" },
+  { fact = "assignment.holder_archetype", op = "eq", value = "coder" },
+  { fact = "assignment.holder_noted_verdict_kinds", op = "not_in", value = ["tests-passed"] },
+]
 
 # Spec-backed work is a slice of product: before its implementation
 # dispatches, the product owner has rendered a spirit verdict on the spec.

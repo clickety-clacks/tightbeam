@@ -119,6 +119,16 @@ saying what you ran and what you observed. If the repository never defines verif
 say so and escalate — being hounded to verify against a repo that defines no verification
 is a process gap for a human, not something to guess around.
 
+Before the ready-for-review progress attest, run the tests that are relevant to the
+change and file the passing-test receipt:
+
+    tightbeam attest <assignment> --kind verdict --verdict tests-passed \
+      --note "<host:absolute-repo> <commit>; <test command or suite>; passed: <result>"
+
+If the repository does not define relevant tests or you cannot run them, report that gap
+and do not file `tests-passed`. The receipt does not replace the later `verified` verdict,
+the report artifact, or independent review.
+
 Before declaring ready for review, re-read your own diff cold and write the walkthrough
 into your progress attest — what changed, why, where the risk lives. Authors who annotate
 their change first hand reviewers dramatically fewer defects, because the annotation pass

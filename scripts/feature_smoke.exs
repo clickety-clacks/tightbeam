@@ -525,9 +525,10 @@ defmodule FeatureSmoke do
   end
 
   # --- P7 flagship enforced loop: completion requires an independent review ---
-  # Proves the whole enforcement spine live over HTTP: a coder attesting completion
-  # WITHOUT a reviewed-clean verdict is not denied — the substrate assigns a reviewer
-  # (the remedy), blocks the completion, and self-releases once the review lands.
+  # Proves the whole enforcement spine live over HTTP with two fresh sessions on this
+  # same selected harness: a coder attesting completion WITHOUT a reviewed-clean verdict
+  # triggers the remedy, which assigns a reviewer and blocks completion; the gate
+  # self-releases once the linked review-holder verdict lands.
   # Requires the `completion-requires-review` rail loaded (identity/rules/engineering.toml).
   defp check_flagship_review_loop(state) do
     u = unique()
@@ -551,6 +552,13 @@ defmodule FeatureSmoke do
       ok!(state, "spawn", %{"displayName" => "smoke-coder-#{u}", "idempotencyKey" => "cd-#{u}"})
 
     coder_key = get_in(coder, ["stream", "sessionKey"]) || coder["sessionKey"]
+
+    assert(
+      state,
+      coder_key != reviewer_key,
+      "flagship: producer and reviewer must be different sessions"
+    )
+
     # A session needs a role bound to act (attest) under its own credential.
     post(state, "role-create", %{"name" => "coder-#{u}"})
     ok!(state, "role-bind", %{"name" => "coder-#{u}", "sessionKey" => coder_key})
@@ -625,7 +633,7 @@ defmodule FeatureSmoke do
 
     pass(
       state,
-      "flagship reviewer-loop enforced end-to-end: blocked → reviewer assigned → verdict → completes"
+      "flagship reviewer-loop enforced end-to-end on same harness with different sessions: blocked → reviewer assigned → verdict → completes"
     )
   end
 

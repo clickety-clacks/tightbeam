@@ -23,6 +23,7 @@ defmodule Tightbeam.RailRemedy do
   """
 
   @type outcome :: %{
+          optional(:denial) => map(),
           outcome: String.t(),
           producer_id: String.t() | nil
         }
@@ -245,6 +246,11 @@ defmodule Tightbeam.RailRemedy do
           %{outcome: "claimed-dispatched", producer_id: nil}
         end
       else
+        {:error, %{code: "rule_denied"} = denial}
+        when rule.remedy.on_rule_denied == "surface" ->
+          release_dispatch(db, rule.name, subject, token)
+          %{outcome: "blocked", producer_id: nil, denial: denial}
+
         _ ->
           release_dispatch(db, rule.name, subject, token)
           %{outcome: "blocked", producer_id: nil}
@@ -452,7 +458,7 @@ defmodule Tightbeam.RailRemedy do
   defp producer_id(_action, _result, _hint), do: nil
 
   defp rewake_target(db, "assign", subject, context, _resolved, producer_key) do
-    if latest_linked_verdict(db, subject) do
+    if latest_episode_review_holder_verdict(db, subject, producer_key) do
       context.holder_key
     else
       case DB.query(db, "SELECT holderKey FROM assignments WHERE id = ?1", [producer_key]) do
@@ -475,17 +481,25 @@ defmodule Tightbeam.RailRemedy do
   defp rewake_target(_db, _action, _subject, _context, _resolved, producer_key),
     do: producer_key
 
-  defp latest_linked_verdict(db, subject) do
+  defp latest_episode_review_holder_verdict(db, subject, producer_key) do
     case DB.query(
            db,
            """
            SELECT v.verdictKind
-           FROM attests v
-           JOIN assignments r ON r.id = v.assignmentId
-           WHERE r.reviewsAssignmentId = ?1 AND v.kind = 'verdict'
-           ORDER BY v.ts DESC, v.id DESC LIMIT 1
+           FROM assignments r
+           JOIN attests v ON v.assignmentId = r.id
+           WHERE r.id = ?2
+             AND r.reviewsAssignmentId = ?1
+             AND v.kind = 'verdict'
+             AND v.bySession = r.holderKey
+             AND (
+               SELECT COUNT(*)
+               FROM assignments linked
+               WHERE linked.reviewsAssignmentId = ?1
+             ) = 1
+           ORDER BY v.ts DESC, v.rowid DESC LIMIT 1
            """,
-           [subject]
+           [subject, producer_key]
          ) do
       {:ok, [[kind]]} -> kind
       _ -> nil

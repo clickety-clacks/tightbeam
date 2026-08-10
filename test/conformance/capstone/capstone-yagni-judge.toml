@@ -9,10 +9,10 @@ legibility = "event:denied(rule=capstone-yagni-judge);lifecycle:rail_remedy"
 [[fixture.rule]]
 name = "capstone-yagni-judge"
 verb = "attest"
-text = "a commissioned YAGNI-clean verdict releases the gate"
+text = "a YAGNI-clean verdict on the work item releases the gate"
 edges = ["verb"]
 effect = "remedy"
-deny_when = [{ fact = "assignment.independent_verdict_kinds", op = "not_in", value = ["yagni-clean"] }]
+deny_when = [{ fact = "work_item.verdict_kinds", op = "not_in", value = ["yagni-clean"] }]
 [fixture.rule.remedy]
 action = "assign"
 produces = "yagni-clean"
@@ -20,3 +20,4 @@ target_role = "reviewer"
 [fixture.rule.remedy.params]
 subject = "judge YAGNI for {assignment_id}"
 reviews = "{assignment_id}"
+work_item = "{work_item_id}"

@@ -4,7 +4,7 @@ name = "independence-author-only"
 phase = "pending"
 blocking_phase = "P3"
 kind = "dispatch-rule"
-source = "p3 §4A assignment.independent_verdict_kinds"
+source = "assignment.qualifying_review_verdict_kinds"
 legibility = "event:denied(rule=commissioned-author-only)"
 
 [[fixture.rule]]
@@ -14,5 +14,5 @@ external_producer = true
 text = "completion needs a verdict authored by the commissioned review holder"
 deny_when = [
   { fact = "attest.kind", op = "eq", value = "completion" },
-  { fact = "assignment.independent_verdict_kinds", op = "not_in", value = ["reviewed-clean"] },
+  { fact = "assignment.qualifying_review_verdict_kinds", op = "not_in", value = ["reviewed-clean"] },
 ]
