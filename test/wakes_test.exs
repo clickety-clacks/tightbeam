@@ -251,7 +251,7 @@ defmodule Tightbeam.WakesTest do
         INSERT INTO supervision_liveness_sidecar
           (wakeId, assignmentId, controllerOrigin, wakeKind, controllerState,
            chargedGeneration)
-        VALUES (?1, 'asg_retarget', 'scheduled', 'prod', 'pending', 2)
+        VALUES (?1, 'asg_retarget', 'scheduled', 'escalation', 'pending', 2)
         """,
         [original.wake_id]
       )

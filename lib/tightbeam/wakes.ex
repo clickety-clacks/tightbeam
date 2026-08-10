@@ -779,21 +779,24 @@ defmodule Tightbeam.Wakes do
   defp validate_disposition(txn, "monitor_generation_transition", id),
     do: generation_exists(txn, id)
 
-  defp validate_liveness(txn, "supervision_entitlement", id, _wake, primary) do
+  defp validate_liveness(txn, "supervision_entitlement", id, wake, primary) do
     with {:ok, assignment_id, generation} <- split_generation(id),
-         [[work_item_id]] <-
+         [[work_item_id, holder_state]] <-
            Txn.q(
              txn,
              """
-             SELECT a.workItemId
+             SELECT a.workItemId, s.state
              FROM supervision_entitlements e
              JOIN assignments a ON a.id=e.assignmentId
              JOIN sessions s ON s.sessionKey=a.holderKey
              WHERE e.assignmentId=?1 AND e.generation=?2
-               AND e.state IN ('armed','claimed') AND a.state='open' AND s.state='active'
+               AND e.state IN ('armed','claimed') AND a.state='open'
              """,
              [assignment_id, generation]
            ),
+         true <-
+           holder_state == "active" or
+             current_controller_carries_entitlement?(txn, wake, assignment_id, generation),
          true <-
            {primary.kind, primary.id} == {"assignment", assignment_id} or
              ({primary.kind, primary.id} == {"work_item", work_item_id} and
@@ -839,6 +842,22 @@ defmodule Tightbeam.Wakes do
   end
 
   defp validate_liveness(_txn, _kind, _id, _wake, _primary), do: :error
+
+  # When the target disappears between scheduling and delivery, the controller
+  # being canceled is itself the proof that this exact entitlement survives the
+  # cancellation. This is narrower than treating every inactive holder's
+  # entitlement as actionable: only its current pending controller qualifies.
+  defp current_controller_carries_entitlement?(txn, wake, assignment_id, generation) do
+    Txn.q(
+      txn,
+      """
+      SELECT 1 FROM supervision_liveness_sidecar
+      WHERE wakeId=?1 AND assignmentId=?2 AND controllerOrigin='scheduled'
+        AND controllerState='pending' AND chargedGeneration=?3
+      """,
+      [wake.wake_id, assignment_id, generation]
+    ) == [[1]]
+  end
 
   defp generation_exists(txn, id) do
     with {:ok, assignment_id, generation} <- split_generation(id) do

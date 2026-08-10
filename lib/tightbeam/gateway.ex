@@ -1019,26 +1019,39 @@ defmodule Tightbeam.Gateway do
 
     case delivery_target(txn, session_key, opts[:target_gate]) do
       nil ->
+        cancel_unavailable_supervision_controller_in_txn(txn, opts, session_key)
         :skipped
 
       {target, role_ref, role_fallback} when not is_nil(target) ->
         if Ledger.enqueueable_in_txn?(txn, target) do
-          append_and_enqueue_in_txn(
-            txn,
-            target,
-            role_ref,
-            role_fallback,
-            origin,
-            stamped,
-            opts
-          )
+          case admit_supervision_controller_in_txn(txn, opts, target) do
+            :canceled ->
+              :skipped
+
+            controller ->
+              append_and_enqueue_in_txn(
+                txn,
+                target,
+                role_ref,
+                role_fallback,
+                origin,
+                stamped,
+                Keyword.put(opts, :supervision_controller, controller)
+              )
+          end
         else
-          # Asked BEFORE the echo, because the echo commits in this same
-          # transaction and a raise is not available to take it back (it would
-          # roll the caller's wake `fired` mark back with it). The ledger still
-          # refuses independently — it is the single writer — but a message with
-          # no turn is history nobody can answer, so nothing is written at all.
-          refuse_undeliverable_turn(txn, target, origin, opts)
+          case cancel_unavailable_supervision_controller_in_txn(txn, opts, target) do
+            :canceled ->
+              :skipped
+
+            :ordinary ->
+              # Asked BEFORE the echo, because the echo commits in this same
+              # transaction and a raise is not available to take it back (it would
+              # roll the caller's wake `fired` mark back with it). The ledger still
+              # refuses independently — it is the single writer — but a message with
+              # no turn is history nobody can answer, so nothing is written at all.
+              refuse_undeliverable_turn(txn, target, origin, opts)
+          end
         end
     end
   end
@@ -1073,7 +1086,8 @@ defmodule Tightbeam.Gateway do
           })
 
         case enqueued do
-          {:ok, _seq} ->
+          {:ok, seq} ->
+            settle_supervision_controller_in_txn(txn, opts, target, seq)
             fire_wake_in_txn(txn, opts)
 
             # Nag-by-re-arm: a bracket wake that just fired re-arms its
@@ -1118,6 +1132,95 @@ defmodule Tightbeam.Gateway do
         "UPDATE wakes SET state = 'fired', firedAt = ?2 WHERE wakeId = ?1 AND state = 'pending'",
         [opts[:wake_id], System.system_time(:millisecond)]
       )
+    end
+  end
+
+  defp admit_supervision_controller_in_txn(txn, opts, target) do
+    case opts[:wake_id] do
+      wake_id when is_binary(wake_id) ->
+        case DB.Txn.q(
+               txn,
+               "SELECT assignmentId FROM supervision_liveness_sidecar WHERE wakeId=?1 AND controllerOrigin='scheduled' AND controllerState='pending'",
+               [wake_id]
+             ) do
+          [[assignment_id]] ->
+            case Supervision.transition_in_txn(txn, %{
+                   kind: "controller_fire",
+                   wake_id: wake_id,
+                   assignment_id: assignment_id,
+                   target_session_key: target
+                 }) do
+              {:admit, wake_kind} -> {assignment_id, wake_kind}
+              :canceled -> :canceled
+            end
+
+          [] ->
+            :ordinary
+        end
+
+      _ ->
+        :ordinary
+    end
+  end
+
+  defp settle_supervision_controller_in_txn(txn, opts, target, turn_seq) do
+    case opts[:supervision_controller] do
+      {assignment_id, wake_kind} ->
+        case Supervision.transition_in_txn(txn, %{
+               kind: "controller_fire",
+               wake_id: opts[:wake_id],
+               assignment_id: assignment_id,
+               target_session_key: target,
+               turn_seq: turn_seq
+             }) do
+          {:admit, ^wake_kind} ->
+            :ok
+
+          other ->
+            raise "incompatible_supervision_liveness_v1: controller settlement #{inspect(other)}"
+        end
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp cancel_unavailable_supervision_controller_in_txn(txn, opts, target) do
+    case opts[:wake_id] do
+      wake_id when is_binary(wake_id) ->
+        case DB.Txn.q(
+               txn,
+               "SELECT assignmentId,wakeKind FROM supervision_liveness_sidecar WHERE wakeId=?1 AND controllerOrigin='scheduled' AND controllerState='pending'",
+               [wake_id]
+             ) do
+          [[assignment_id, wake_kind]] ->
+            {:ok, liveness_trigger} =
+              Supervision.liveness_trigger_in_txn(txn, {:assignment, assignment_id})
+
+            true =
+              Wakes.cancel_in_txn(txn, %{
+                wake_id: wake_id,
+                requester: %{kind: "process", id: "tightbeam:wake-scheduler"},
+                reason_kind: "target_unresolvable",
+                causal_source: %{kind: "scheduler_delivery", id: wake_id},
+                outcome: %{kind: "no_replacement", liveness_trigger: liveness_trigger}
+              })
+
+            EventLog.lifecycle_in_txn(
+              txn,
+              "supervision_controller_unavailable",
+              assignment_id,
+              "wakeId=#{wake_id} kind=#{wake_kind} target=#{target}"
+            )
+
+            :canceled
+
+          [] ->
+            :ordinary
+        end
+
+      _ ->
+        :ordinary
     end
   end
 
@@ -3423,28 +3526,71 @@ defmodule Tightbeam.Gateway do
        ) do
     p = call.params
 
-    Wakes.schedule_in_txn(txn, %{
-      session_key: session_key,
-      target_role: Map.get(call, :target_role),
-      origin: call.origin,
-      prompt: p.prompt,
-      due_at: due_at,
-      condition_kind: condition_kind,
-      condition_scope: condition_scope,
-      creator_session_key: creator_session_key(call[:principal]),
-      reresolve: p[:reresolve],
-      reresolve_seed: p[:reresolve_seed],
-      reresolve_rung: p[:reresolve_rung],
-      # SUBSTRATE-ONLY carrier. `wake` is an agent-callable verb, so an arbitrary
-      # params value here would let an agent stamp a conversational wake with any
-      # assignment and have delivery promote that forged carrier into the turn and
-      # the trace — agent-authored attribution, which Law 0 forbids (F6). Only the
-      # substrate's own principal may set it; the router reserves
-      # process:tightbeam, so it cannot be claimed over the wire. Conversational
-      # and owner wakes stay NULL, as the spec requires.
-      assignment_id: substrate_assignment_id(call)
-    })
+    wake =
+      Wakes.schedule_in_txn(txn, %{
+        session_key: session_key,
+        target_role: Map.get(call, :target_role),
+        origin: call.origin,
+        prompt: p.prompt,
+        due_at: due_at,
+        condition_kind: condition_kind,
+        condition_scope: condition_scope,
+        creator_session_key: creator_session_key(call[:principal]),
+        reresolve: p[:reresolve],
+        reresolve_seed: p[:reresolve_seed],
+        reresolve_rung: p[:reresolve_rung],
+        # SUBSTRATE-ONLY carrier. `wake` is an agent-callable verb, so an arbitrary
+        # params value here would let an agent stamp a conversational wake with any
+        # assignment and have delivery promote that forged carrier into the turn and
+        # the trace — agent-authored attribution, which Law 0 forbids (F6). Only the
+        # substrate's own principal may set it; the router reserves
+        # process:tightbeam, so it cannot be claimed over the wire. Conversational
+        # and owner wakes stay NULL, as the spec requires.
+        assignment_id: substrate_assignment_id(call)
+      })
+
+    schedule_supervision_controller_in_txn(txn, call, wake)
+    wake
   end
+
+  # The controller row is part of the supervision wake, not follow-up
+  # bookkeeping. Keeping both writes under the wake handler's transaction means
+  # a crash can commit both rows or neither, never a lineage wake that boot later
+  # has to guess about. The kind is trusted only from Tightbeam's reserved process
+  # principal, just like the assignment carrier above.
+  defp schedule_supervision_controller_in_txn(
+         txn,
+         %{principal: {:process, "tightbeam"}, params: %{supervision_wake_kind: wake_kind}},
+         wake
+       )
+       when wake_kind in ["prod", "escalation"] do
+    case Supervision.transition_in_txn(txn, %{
+           kind: "controller_scheduled",
+           wake_id: wake.wake_id,
+           assignment_id: wake.assignment_id,
+           wake_kind: wake_kind
+         }) do
+      {:armed, _generation} ->
+        :ok
+
+      :duplicate ->
+        # An internal supervision marker is a claim that this wake is a typed
+        # controller. If no entitlement can arm its sidecar, committing the wake
+        # would strand an unfireable controller. Roll the handler transaction
+        # back so wake and sidecar remain all-or-nothing.
+        raise "incompatible_supervision_liveness_v1: controller schedule :duplicate"
+    end
+  end
+
+  defp schedule_supervision_controller_in_txn(
+         _txn,
+         %{principal: {:process, "tightbeam"}, params: %{supervision_wake_kind: wake_kind}},
+         _wake
+       ) do
+    raise "incompatible_supervision_liveness_v1: unknown controller kind #{inspect(wake_kind)}"
+  end
+
+  defp schedule_supervision_controller_in_txn(_txn, _call, _wake), do: :ok
 
   defp substrate_assignment_id(%{principal: {:process, "tightbeam"}} = call),
     do: call.params[:assignment_id]

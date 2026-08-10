@@ -67,7 +67,10 @@ defmodule Tightbeam.SchemaShapeTest do
     assert table_columns(db, "supervision_liveness_epoch") ==
              ~w(id activatedAt cause principal)
 
-    assert length(owned_activation_objects(db)) == 16
+    assert table_columns(db, "supervision_liveness_migrations") ==
+             ~w(migrationId appliedAt affectedRows cause principal)
+
+    assert length(owned_activation_objects(db)) == 24
 
     assert {:ok, [[0, activated_at, "schema_activation", "process:tightbeam"]]} =
              DB.query(
@@ -101,10 +104,52 @@ defmodule Tightbeam.SchemaShapeTest do
     refute table?(db, "supervision_liveness_epoch")
   end
 
+  test "an existing liveness activation gains the lineage firing invariant", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    :ok = DB.execute(db, "DROP TRIGGER supervision_lineage_fire_requires_sidecar")
+    refute "supervision_lineage_fire_requires_sidecar" in owned_activation_objects(db)
+
+    assert :ok = Schema.ensure_all(db)
+    assert "supervision_lineage_fire_requires_sidecar" in owned_activation_objects(db)
+  end
+
+  test "only Tightbeam supervision lineage firing requires a sidecar", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO wakes
+        (wakeId,sessionKey,origin,prompt,consumer,dueAt,state,createdAt,
+         reresolve,reresolveSeed,reresolveRung,assignmentId)
+      VALUES
+        ('w_supervision','target','process:tightbeam','escalate','prompt',0,'pending',1,
+         'lineage','holder',1,'asg_1'),
+        ('w_other','target','process:ci','route','prompt',0,'pending',1,
+         'lineage','holder',1,'asg_1')
+      """)
+
+    assert {:error, %DB.Error{message: message}} =
+             DB.query(
+               db,
+               "UPDATE wakes SET state='fired', firedAt=2 WHERE wakeId='w_supervision'"
+             )
+
+    assert message =~ "supervision lineage wake requires controller sidecar"
+
+    assert {:ok, [["pending"]]} =
+             DB.query(db, "SELECT state FROM wakes WHERE wakeId='w_supervision'")
+
+    assert {:ok, []} =
+             DB.query(db, "UPDATE wakes SET state='fired', firedAt=2 WHERE wakeId='w_other'")
+
+    assert {:ok, [["fired"]]} = DB.query(db, "SELECT state FROM wakes WHERE wakeId='w_other'")
+  end
+
   test "every interrupted activation statement rolls back and retries once", %{db: db} do
     assert :ok = Schema.ensure_all(db)
 
-    for statement <- 1..17 do
+    for statement <- 1..15 do
       drop_liveness_activation(db)
 
       assert {:error, %RuntimeError{message: "forced activation interruption"}} =
@@ -290,10 +335,18 @@ defmodule Tightbeam.SchemaShapeTest do
           'wakes_cancellation_state',
           'wake_cancellations_pending_insert',
           'wakes_typed_cancellation_required',
-          'wake_cancellations_append_only_update',
-          'wake_cancellations_append_only_delete',
           'supervision_liveness_retirement_immutable_update',
-          'supervision_liveness_retirement_immutable_delete'
+          'supervision_liveness_retirement_immutable_delete',
+          'supervision_liveness_migrations',
+          'supervision_liveness_sidecar_insert_coherent',
+          'supervision_pending_controller_sidecar_update',
+          'supervision_pending_controller_sidecar_delete',
+          'supervision_pending_controller_wake_identity_immutable',
+          'supervision_lineage_fire_requires_sidecar',
+          'supervision_fired_lineage_sidecar_required_delete',
+          'supervision_fired_lineage_sidecar_identity_immutable',
+          'supervision_fired_lineage_turn_immutable_update',
+          'supervision_fired_lineage_turn_immutable_delete'
         )
         ORDER BY name
         """
@@ -307,8 +360,15 @@ defmodule Tightbeam.SchemaShapeTest do
       DB.execute(db, """
       DROP TRIGGER IF EXISTS supervision_liveness_retirement_immutable_delete;
       DROP TRIGGER IF EXISTS supervision_liveness_retirement_immutable_update;
-      DROP TRIGGER IF EXISTS wake_cancellations_append_only_delete;
-      DROP TRIGGER IF EXISTS wake_cancellations_append_only_update;
+      DROP TRIGGER IF EXISTS supervision_pending_controller_wake_identity_immutable;
+      DROP TRIGGER IF EXISTS supervision_pending_controller_sidecar_delete;
+      DROP TRIGGER IF EXISTS supervision_pending_controller_sidecar_update;
+      DROP TRIGGER IF EXISTS supervision_liveness_sidecar_insert_coherent;
+      DROP TRIGGER IF EXISTS supervision_fired_lineage_turn_immutable_delete;
+      DROP TRIGGER IF EXISTS supervision_fired_lineage_turn_immutable_update;
+      DROP TRIGGER IF EXISTS supervision_fired_lineage_sidecar_identity_immutable;
+      DROP TRIGGER IF EXISTS supervision_fired_lineage_sidecar_required_delete;
+      DROP TRIGGER IF EXISTS supervision_lineage_fire_requires_sidecar;
       DROP TRIGGER IF EXISTS wakes_typed_cancellation_required;
       DROP TRIGGER IF EXISTS wake_cancellations_pending_insert;
       DROP TABLE IF EXISTS wake_cancellations;
@@ -316,6 +376,7 @@ defmodule Tightbeam.SchemaShapeTest do
       DROP TABLE IF EXISTS supervision_progress_absorptions;
       DROP TABLE IF EXISTS supervision_entitlements;
       DROP TABLE IF EXISTS supervision_liveness_epoch;
+      DROP TABLE IF EXISTS supervision_liveness_migrations;
       DROP INDEX IF EXISTS wakes_cancellation_state;
       """)
   end

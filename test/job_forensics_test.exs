@@ -896,6 +896,7 @@ defmodule Tightbeam.JobForensicsTest do
     session(db, "supervisor")
     session(db, "holder", "supervisor")
     assignment(db, "asg_prod", "wi_prod", "holder")
+    insert_entitlement!(db, "asg_prod")
     handlers = Gateway.handlers(%{db: db, base_dir: System.tmp_dir!(), default_harness: :claude})
 
     seq = turn(db, "holder", status: "delivered")
@@ -945,6 +946,7 @@ defmodule Tightbeam.JobForensicsTest do
     session(db, "supervisor")
     session(db, "holder", "supervisor")
     assignment(db, "asg_answer", "wi_answer", "holder")
+    insert_entitlement!(db, "asg_answer")
     handlers = Gateway.handlers(%{db: db, base_dir: System.tmp_dir!(), default_harness: :claude})
 
     assert {:prodded, 1} = evaluate(db, handlers, "holder")
@@ -1056,6 +1058,7 @@ defmodule Tightbeam.JobForensicsTest do
     session(db, "supervisor")
     session(db, "holder", "supervisor")
     assignment(db, "asg_pre", "wi_pre", "holder")
+    insert_entitlement!(db, "asg_pre")
     handlers = Gateway.handlers(%{db: db, base_dir: System.tmp_dir!(), default_harness: :claude})
 
     # The v2-epoch cutoff is when causal_events was created; PRE-v2 attests are the
@@ -1088,6 +1091,7 @@ defmodule Tightbeam.JobForensicsTest do
     session(db, "supervisor")
     session(db, "holder", "supervisor")
     assignment(db, "asg_stale", "wi_stale", "holder")
+    insert_entitlement!(db, "asg_stale")
     handlers = Gateway.handlers(%{db: db, base_dir: System.tmp_dir!(), default_harness: :claude})
 
     cutoff = CausalEvents.epoch(db)
@@ -1163,6 +1167,23 @@ defmodule Tightbeam.JobForensicsTest do
   end
 
   ## Helpers
+
+  defp insert_entitlement!(db, assignment_id) do
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO supervision_entitlements
+          (assignmentId,generation,dueAt,state,lastAttemptGeneration,claimClock,
+           basisKind,basisId,terminusAt,cause,principal,supervisionIntervalMs)
+        VALUES (?1,1,0,'armed',NULL,NULL,'assignment_open',?1,NULL,
+                'assignment_open','process:tightbeam',60000)
+        """,
+        [assignment_id]
+      )
+
+    :ok
+  end
 
   # One turn-end shift. A prod leaves a PENDING wake, and the turn-end schedule's
   # pending-wake gate halts before the ladder while one exists — delivery is what

@@ -1294,13 +1294,15 @@ defmodule Tightbeam.Supervision do
                [assignment.id]
              ) do
           [] ->
-            :legacy
+            :unarmed
 
           [[generation, due_at, state, last_attempt, stored_interval, basis_kind, basis_id]] ->
             interval =
               if is_integer(replacement_interval) and replacement_interval > 0,
                 do: replacement_interval,
                 else: stored_interval
+
+            record_prod_answers_in_txn(txn, assignment.id, session_key)
 
             case absorb_progress_in_txn(txn, assignment.id, interval) do
               :rebased ->
@@ -1345,8 +1347,8 @@ defmodule Tightbeam.Supervision do
       end)
 
     case outcome do
-      :legacy ->
-        claim_and_act(db, handlers, n, session_key, terminal_seq, assignment)
+      :unarmed ->
+        :idle
 
       :claimed ->
         case drain(db, handlers, session_key) do
@@ -1485,6 +1487,45 @@ defmodule Tightbeam.Supervision do
     end
   end
 
+  # An attestation answers the outstanding prod even when it is not itself a
+  # progress attestation. Keep that causal edge in the typed entitlement path;
+  # progress-specific rebasing remains the separate operation below.
+  defp record_prod_answers_in_txn(txn, assignment_id, session_key) do
+    current = counter_state_in_txn(txn, assignment_id)
+
+    [[attest_count]] =
+      Txn.q(txn, "SELECT count(*) FROM attests WHERE assignmentId=?1", [assignment_id])
+
+    if attest_count > current.attestCount do
+      job_ref = job_ref_in_txn(txn, assignment_id)
+
+      for attest_id <- CausalEvents.unseen_attest_ids_in_txn(txn, assignment_id) do
+        CausalEvents.append_in_txn(txn, %{
+          kind: "prod_answered",
+          assignment_id: assignment_id,
+          job_ref: job_ref,
+          session_key: session_key,
+          detail: %{byAttestId: attest_id}
+        })
+      end
+
+      Txn.q(
+        txn,
+        """
+        INSERT INTO assignment_prods
+          (assignmentId, attemptCount, prodCount, deniedStreak, attestCount, stalledAt)
+        VALUES (?1, 0, 0, 0, ?2, NULL)
+        ON CONFLICT(assignmentId) DO UPDATE SET
+          attemptCount=0, prodCount=0, deniedStreak=0,
+          attestCount=excluded.attestCount, stalledAt=NULL
+        """,
+        [assignment_id, attest_count]
+      )
+    end
+
+    :ok
+  end
+
   defp counter_state_in_txn(txn, assignment_id) do
     case Txn.q(
            txn,
@@ -1523,145 +1564,6 @@ defmodule Tightbeam.Supervision do
         ^holder -> {"terminus", rung}
         _target -> {"escalation", rung}
       end
-    end
-  end
-
-  defp claim_and_act(db, handlers, n, session_key, terminal_seq, assignment) do
-    claim_and_act(db, handlers, n, session_key, terminal_seq, assignment, true)
-  end
-
-  defp claim_and_act(
-         db,
-         handlers,
-         n,
-         session_key,
-         terminal_seq,
-         assignment,
-         count_attempt?
-       ) do
-    prior = prod_state(db, assignment.id) || zero_state(assignment.id)
-    attest_count = Assignments.attest_count(db, assignment.id)
-
-    current =
-      if attest_count > prior.attestCount do
-        %{prior | attemptCount: 0, prodCount: 0, deniedStreak: 0, stalledAt: nil}
-      else
-        prior
-      end
-
-    attempt_count = if count_attempt?, do: current.attemptCount + 1, else: current.attemptCount
-
-    {branch, k} =
-      if current.prodCount < n do
-        {"prod", current.prodCount + 1}
-      else
-        rung = current.prodCount - n + 1
-
-        case ladder_target(db, session_key, rung) do
-          # Nobody above to escalate to is what terminus MEANS — but the ruling
-          # wants the loss NAMED, and terminus's own record says only holder and
-          # attempt count. This is the common way an escalation finds no owner;
-          # the drain-time race below is the rare one.
-          nil ->
-            Logger.error(
-              "supervision escalation for assignment #{assignment.id} is undeliverable: " <>
-                "the lineage ladder from #{session_key} rung #{rung} is exhausted and its " <>
-                "owner has no active main session"
-            )
-
-            {"terminus", rung}
-
-          ^session_key ->
-            {"terminus", rung}
-
-          _target ->
-            {"escalation", rung}
-        end
-      end
-
-    stalled_at =
-      if branch in ["escalation", "terminus"],
-        do: current.stalledAt || now(),
-        else: current.stalledAt
-
-    transaction!(db, fn txn ->
-      if count_attempt? do
-        Txn.q(
-          txn,
-          """
-          UPDATE supervision_entitlements
-          SET state='claimed', claimClock=?2, lastAttemptGeneration=generation,
-              cause='new_terminal', principal='process:tightbeam'
-          WHERE assignmentId=?1 AND state='armed' AND dueAt <= ?2
-          """,
-          [assignment.id, now()]
-        )
-      end
-
-      Txn.q(
-        txn,
-        """
-        INSERT INTO supervision_watermarks
-          (sessionKey, lastEvaluatedTerminal, pendingBranch, pendingAssignment, pendingK, pendingN)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-        ON CONFLICT(sessionKey) DO UPDATE SET
-          lastEvaluatedTerminal = excluded.lastEvaluatedTerminal,
-          pendingBranch = excluded.pendingBranch,
-          pendingAssignment = excluded.pendingAssignment,
-          pendingK = excluded.pendingK,
-          pendingN = excluded.pendingN
-        """,
-        [session_key, terminal_seq, branch, assignment.id, k, n]
-      )
-
-      # prod_answered: attestCount is a bare COUNT, so which attest answered the
-      # prods is unrecoverable from it. causal_events is its own watermark — every
-      # attest not yet named by an event gets one, in attest-id order, so several
-      # attests arriving between evaluations each keep their edge.
-      if attest_count > prior.attestCount do
-        job_ref = job_ref_in_txn(txn, assignment.id)
-
-        for attest_id <- CausalEvents.unseen_attest_ids_in_txn(txn, assignment.id) do
-          CausalEvents.append_in_txn(txn, %{
-            kind: "prod_answered",
-            assignment_id: assignment.id,
-            job_ref: job_ref,
-            session_key: session_key,
-            detail: %{byAttestId: attest_id}
-          })
-        end
-      end
-
-      Txn.q(
-        txn,
-        """
-        INSERT INTO assignment_prods
-          (assignmentId, attemptCount, prodCount, deniedStreak, attestCount, lastProdAt, stalledAt, strandedAt)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-        ON CONFLICT(assignmentId) DO UPDATE SET
-          attemptCount = excluded.attemptCount,
-          prodCount = excluded.prodCount,
-          deniedStreak = excluded.deniedStreak,
-          attestCount = excluded.attestCount,
-          lastProdAt = excluded.lastProdAt,
-          stalledAt = excluded.stalledAt
-        """,
-        [
-          assignment.id,
-          attempt_count,
-          current.prodCount,
-          current.deniedStreak,
-          attest_count,
-          current.lastProdAt,
-          stalled_at,
-          current.strandedAt
-        ]
-      )
-    end)
-
-    case drain(db, handlers, session_key) do
-      {:pending, result} -> result
-      {:cleared, result} -> result
     end
   end
 
@@ -1864,7 +1766,8 @@ defmodule Tightbeam.Supervision do
       prompt: prompt,
       after_ms: 0,
       nudge: false,
-      assignment_id: pending.pendingAssignment
+      assignment_id: pending.pendingAssignment,
+      supervision_wake_kind: pending.pendingBranch
     }
 
     params =
@@ -1922,8 +1825,6 @@ defmodule Tightbeam.Supervision do
   defp success_clear(db, pending) do
     transaction!(db, fn txn ->
       if clear_pending_in_txn(txn, pending) do
-        schedule_controller_fallback_in_txn(txn, pending)
-
         Txn.q(
           txn,
           "UPDATE assignment_prods SET prodCount = prodCount + 1, lastProdAt = ?2, deniedStreak = 0 WHERE assignmentId = ?1",
@@ -1943,33 +1844,6 @@ defmodule Tightbeam.Supervision do
         end
       end
     end)
-  end
-
-  defp schedule_controller_fallback_in_txn(txn, pending) do
-    case Txn.q(
-           txn,
-           """
-           SELECT w.wakeId
-           FROM wakes w
-           LEFT JOIN supervision_liveness_sidecar s ON s.wakeId=w.wakeId
-           WHERE w.assignmentId=?1 AND w.origin='process:tightbeam' AND w.state='pending'
-             AND s.wakeId IS NULL
-           ORDER BY w.createdAt DESC, w.wakeId DESC
-           LIMIT 1
-           """,
-           [pending.pendingAssignment]
-         ) do
-      [[wake_id]] ->
-        transition_in_txn(txn, %{
-          kind: "controller_scheduled",
-          wake_id: wake_id,
-          assignment_id: pending.pendingAssignment,
-          wake_kind: pending.pendingBranch
-        })
-
-      [] ->
-        :duplicate
-    end
   end
 
   defp denied_clear(db, pending) do
@@ -2121,6 +1995,7 @@ defmodule Tightbeam.Supervision do
         """
       )
 
+      normalize_legacy_lineage_markers_in_txn(txn)
       migrate_legacy_parent_retirements_in_txn(txn)
 
       existing =
@@ -2213,6 +2088,63 @@ defmodule Tightbeam.Supervision do
         [attest_id, assignment_id, attest_ts]
       )
     end)
+  end
+
+  # The interrupted additive rollout could install the liveness schema and
+  # then return to the old writer. Those old wakes carry the generic lineage
+  # delivery marker but cannot be supervision transfers: the assignment never
+  # had an entitlement, and therefore no controller generation ever existed.
+  # Normalize only that self-identifying legacy shape. Clearing the routing
+  # discriminator preserves the wake, turn, and message history. The durable
+  # migration receipt makes this an upgrade step, not a startup repair loop:
+  # after 0.1.6 has considered the existing ledger once, later malformed data
+  # is not silently cleaned by normal writer or recovery paths.
+  defp normalize_legacy_lineage_markers_in_txn(txn) do
+    migration_id = "0.1.6/normalize-sidecarless-lineage-v1"
+
+    case Txn.q(
+           txn,
+           "SELECT 1 FROM supervision_liveness_migrations WHERE migrationId=?1",
+           [migration_id]
+         ) do
+      [[1]] ->
+        :ok
+
+      [] ->
+        Txn.q(
+          txn,
+          """
+          UPDATE wakes AS w
+          SET reresolve=NULL, reresolveSeed=NULL, reresolveRung=NULL
+          WHERE w.state='fired' AND w.origin='process:tightbeam'
+            AND w.reresolve='lineage' AND w.assignmentId IS NOT NULL
+            AND NOT EXISTS (
+              SELECT 1 FROM supervision_liveness_sidecar s WHERE s.wakeId=w.wakeId
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM supervision_entitlements e WHERE e.assignmentId=w.assignmentId
+            )
+            AND EXISTS (
+              SELECT 1 FROM turns t
+              WHERE t.wakeId=w.wakeId AND t.assignmentId=w.assignmentId
+            )
+          """
+        )
+
+        affected_rows = Txn.changes(txn)
+
+        Txn.q(
+          txn,
+          """
+          INSERT INTO supervision_liveness_migrations
+            (migrationId, appliedAt, affectedRows, cause, principal)
+          VALUES (?1, ?2, ?3, 'release_upgrade', 'process:tightbeam')
+          """,
+          [migration_id, now(), affected_rows]
+        )
+
+        :ok
+    end
   end
 
   defp liveness_cycle(%{sweep_ms: interval} = state, terminal_rebases)
@@ -2922,9 +2854,6 @@ defmodule Tightbeam.Supervision do
         candidate.controller_origin == "retirement_elevation" ->
           validate_retirement_transfer(db_or_txn, assignment_id, evidence_id, candidate)
 
-        is_nil(candidate.controller_origin) and is_nil(candidate.sidecar_assignment_id) ->
-          validate_preactivation_transfer(db_or_txn, candidate)
-
         true ->
           :error
       end
@@ -2969,26 +2898,6 @@ defmodule Tightbeam.Supervision do
       {:ok, %{}}
     else
       :error
-    end
-  end
-
-  defp validate_preactivation_transfer(db_or_txn, candidate) do
-    case liveness_epoch(db_or_txn) do
-      {:ok, activated_at}
-      when is_integer(candidate.created_at) and is_integer(candidate.fired_at) and
-             candidate.created_at <= activated_at and candidate.fired_at <= activated_at ->
-        if ladder_target(
-             db_or_txn,
-             candidate.reresolve_seed,
-             candidate.reresolve_rung
-           ) == candidate.session_key do
-          {:ok, %{}}
-        else
-          :error
-        end
-
-      _ ->
-        :error
     end
   end
 
@@ -3119,12 +3028,6 @@ defmodule Tightbeam.Supervision do
       is_integer(candidate.charged_generation) and candidate.charged_generation > 0
   end
 
-  defp legacy_source_shape?(_assignment_id, activation_epoch, candidate)
-       when is_nil(candidate.controller_origin) and is_nil(candidate.sidecar_assignment_id) do
-    is_integer(candidate.created_at) and is_integer(candidate.fired_at) and
-      candidate.created_at <= activation_epoch and candidate.fired_at <= activation_epoch
-  end
-
   defp legacy_source_shape?(_assignment_id, _activation_epoch, _candidate), do: false
 
   defp migrate_one_legacy_transfer_in_txn(txn, assignment_id, candidate, activation_epoch) do
@@ -3182,6 +3085,17 @@ defmodule Tightbeam.Supervision do
         reresolve_rung: candidate.reresolve_rung
       })
 
+    Txn.q(
+      txn,
+      """
+      INSERT INTO supervision_liveness_sidecar
+        (wakeId, assignmentId, controllerOrigin, wakeKind, controllerState,
+         chargedGeneration)
+      VALUES (?1, ?2, 'retirement_elevation', 'escalation', 'settled', NULL)
+      """,
+      [wake.wake_id, assignment_id]
+    )
+
     case Gateway.deliver_prompt_in_txn(
            txn,
            target,
@@ -3205,17 +3119,6 @@ defmodule Tightbeam.Supervision do
 
     [[turn_seq]] = Txn.q(txn, "SELECT seq FROM turns WHERE wakeId=?1", [wake.wake_id])
     outcome_id = "#{assignment_id}##{turn_seq}"
-
-    Txn.q(
-      txn,
-      """
-      INSERT INTO supervision_liveness_sidecar
-        (wakeId, assignmentId, controllerOrigin, wakeKind, controllerState,
-         chargedGeneration)
-      VALUES (?1, ?2, 'retirement_elevation', 'escalation', 'settled', NULL)
-      """,
-      [wake.wake_id, assignment_id]
-    )
 
     store_legacy_retirement_outcome_in_txn(
       txn,
@@ -3558,6 +3461,17 @@ defmodule Tightbeam.Supervision do
           reresolve_rung: transfer.reresolve_rung
         })
 
+      Txn.q(
+        txn,
+        """
+        INSERT INTO supervision_liveness_sidecar
+          (wakeId, assignmentId, controllerOrigin, wakeKind, controllerState,
+           chargedGeneration)
+        VALUES (?1, ?2, 'retirement_elevation', 'escalation', 'settled', NULL)
+        """,
+        [wake.wake_id, assignment_id]
+      )
+
       case Gateway.deliver_prompt_in_txn(
              txn,
              target,
@@ -3577,17 +3491,6 @@ defmodule Tightbeam.Supervision do
 
       [[turn_seq]] = Txn.q(txn, "SELECT seq FROM turns WHERE wakeId=?1", [wake.wake_id])
       outcome_id = "#{assignment_id}##{turn_seq}"
-
-      Txn.q(
-        txn,
-        """
-        INSERT INTO supervision_liveness_sidecar
-          (wakeId, assignmentId, controllerOrigin, wakeKind, controllerState,
-           chargedGeneration)
-        VALUES (?1, ?2, 'retirement_elevation', 'escalation', 'settled', NULL)
-        """,
-        [wake.wake_id, assignment_id]
-      )
 
       store_retirement_outcome_in_txn(
         txn,

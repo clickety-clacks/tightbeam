@@ -353,28 +353,6 @@ defmodule Tightbeam.Schema do
     },
     %{
       type: "trigger",
-      name: "wake_cancellations_append_only_update",
-      sql: """
-      CREATE TRIGGER IF NOT EXISTS wake_cancellations_append_only_update
-      BEFORE UPDATE ON wake_cancellations
-      BEGIN
-        SELECT RAISE(ABORT, 'wake cancellation provenance is append-only');
-      END
-      """
-    },
-    %{
-      type: "trigger",
-      name: "wake_cancellations_append_only_delete",
-      sql: """
-      CREATE TRIGGER IF NOT EXISTS wake_cancellations_append_only_delete
-      BEFORE DELETE ON wake_cancellations
-      BEGIN
-        SELECT RAISE(ABORT, 'wake cancellation provenance is append-only');
-      END
-      """
-    },
-    %{
-      type: "trigger",
       name: "supervision_liveness_retirement_immutable_update",
       sql: """
       CREATE TRIGGER IF NOT EXISTS supervision_liveness_retirement_immutable_update
@@ -394,6 +372,243 @@ defmodule Tightbeam.Schema do
       WHEN OLD.transferEvidenceId IS NOT NULL
       BEGIN
         SELECT RAISE(ABORT, 'supervision retirement outcome is immutable');
+      END
+      """
+    }
+  ]
+
+  # Added after the v1 activation shipped, so this cannot join the all-or-none
+  # activation list above: existing v1 databases legitimately have every base
+  # object and not this trigger. It is still owned and shape-validated, and is
+  # installed in the same schema transaction on the next boot.
+  @supervision_liveness_enforcement_objects [
+    %{
+      type: "table",
+      name: "supervision_liveness_migrations",
+      sql: """
+      CREATE TABLE IF NOT EXISTS supervision_liveness_migrations (
+        migrationId TEXT PRIMARY KEY,
+        appliedAt INTEGER NOT NULL,
+        affectedRows INTEGER NOT NULL CHECK (affectedRows >= 0),
+        cause TEXT NOT NULL,
+        principal TEXT NOT NULL
+      )
+      """
+    },
+    %{
+      type: "trigger",
+      name: "supervision_liveness_sidecar_insert_coherent",
+      sql: """
+      CREATE TRIGGER IF NOT EXISTS supervision_liveness_sidecar_insert_coherent
+      BEFORE INSERT ON supervision_liveness_sidecar
+      WHEN NOT EXISTS (
+        SELECT 1 FROM wakes w
+        WHERE w.wakeId=NEW.wakeId AND w.assignmentId=NEW.assignmentId
+          AND w.consumer='prompt' AND w.origin='process:tightbeam'
+      )
+      OR (
+        NEW.controllerOrigin IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM wakes w
+          WHERE w.wakeId=NEW.wakeId AND w.assignmentId=NEW.assignmentId
+            AND w.state='pending' AND w.consumer='prompt'
+            AND w.origin='process:tightbeam'
+            AND (
+              (NEW.wakeKind='prod' AND w.reresolve IS NULL
+               AND w.reresolveSeed IS NULL AND w.reresolveRung IS NULL)
+              OR
+              (NEW.wakeKind='escalation' AND w.reresolve='lineage'
+               AND w.reresolveSeed IS NOT NULL AND w.reresolveRung > 0)
+            )
+        )
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'supervision sidecar requires coherent pending wake');
+      END
+      """
+    },
+    %{
+      type: "trigger",
+      name: "supervision_pending_controller_sidecar_update",
+      sql: """
+      CREATE TRIGGER IF NOT EXISTS supervision_pending_controller_sidecar_update
+      BEFORE UPDATE ON supervision_liveness_sidecar
+      WHEN OLD.controllerOrigin='scheduled' AND OLD.controllerState='pending'
+        AND EXISTS (
+          SELECT 1 FROM wakes w
+          WHERE w.wakeId=OLD.wakeId AND w.assignmentId=OLD.assignmentId
+            AND w.state='pending'
+        )
+        AND NOT (
+          NEW.wakeId IS OLD.wakeId AND NEW.assignmentId IS OLD.assignmentId
+          AND NEW.controllerOrigin IS OLD.controllerOrigin
+          AND NEW.wakeKind IS OLD.wakeKind
+          AND NEW.chargedGeneration IS OLD.chargedGeneration
+          AND NEW.transferEvidenceId IS OLD.transferEvidenceId
+          AND NEW.retirementEpoch IS OLD.retirementEpoch
+          AND NEW.retiringSessionKey IS OLD.retiringSessionKey
+          AND NEW.retirementOutcomeKind IS OLD.retirementOutcomeKind
+          AND NEW.retirementOutcomeId IS OLD.retirementOutcomeId
+          AND NEW.retirementTargetSessionKey IS OLD.retirementTargetSessionKey
+          AND NEW.retirementCause IS OLD.retirementCause
+          AND NEW.retirementPrincipal IS OLD.retirementPrincipal
+          AND NEW.retirementActionNeeded IS OLD.retirementActionNeeded
+          AND NEW.controllerState='settled'
+        )
+      BEGIN
+        SELECT RAISE(ABORT, 'pending supervision controller permits settlement only');
+      END
+      """
+    },
+    %{
+      type: "trigger",
+      name: "supervision_pending_controller_sidecar_delete",
+      sql: """
+      CREATE TRIGGER IF NOT EXISTS supervision_pending_controller_sidecar_delete
+      BEFORE DELETE ON supervision_liveness_sidecar
+      WHEN OLD.controllerOrigin='scheduled' AND OLD.controllerState='pending'
+        AND EXISTS (
+          SELECT 1 FROM wakes w
+          WHERE w.wakeId=OLD.wakeId AND w.assignmentId=OLD.assignmentId
+            AND w.state='pending'
+        )
+      BEGIN
+        SELECT RAISE(ABORT, 'pending supervision controller sidecar is required');
+      END
+      """
+    },
+    %{
+      type: "trigger",
+      name: "supervision_pending_controller_wake_identity_immutable",
+      sql: """
+      CREATE TRIGGER IF NOT EXISTS supervision_pending_controller_wake_identity_immutable
+      BEFORE UPDATE OF wakeId, sessionKey, origin, consumer, assignmentId,
+                       reresolve, reresolveSeed, reresolveRung
+      ON wakes
+      WHEN OLD.state='pending'
+        AND EXISTS (
+          SELECT 1 FROM supervision_liveness_sidecar s
+          WHERE s.wakeId=OLD.wakeId AND s.assignmentId=OLD.assignmentId
+            AND s.controllerOrigin='scheduled' AND s.controllerState='pending'
+        )
+        AND (
+          NEW.wakeId IS NOT OLD.wakeId OR NEW.sessionKey IS NOT OLD.sessionKey
+          OR NEW.origin IS NOT OLD.origin OR NEW.consumer IS NOT OLD.consumer
+          OR NEW.assignmentId IS NOT OLD.assignmentId
+          OR NEW.reresolve IS NOT OLD.reresolve
+          OR NEW.reresolveSeed IS NOT OLD.reresolveSeed
+          OR NEW.reresolveRung IS NOT OLD.reresolveRung
+        )
+      BEGIN
+        SELECT RAISE(ABORT, 'pending supervision controller wake identity is immutable');
+      END
+      """
+    },
+    %{
+      type: "trigger",
+      name: "supervision_lineage_fire_requires_sidecar",
+      sql: """
+      CREATE TRIGGER IF NOT EXISTS supervision_lineage_fire_requires_sidecar
+      BEFORE UPDATE OF state ON wakes
+      WHEN OLD.state = 'pending' AND NEW.state = 'fired'
+        AND NEW.consumer = 'prompt'
+        AND NEW.origin = 'process:tightbeam'
+        AND NEW.assignmentId IS NOT NULL
+        AND NEW.reresolve = 'lineage'
+        AND (
+          NOT EXISTS (
+            SELECT 1 FROM supervision_liveness_sidecar s
+            WHERE s.wakeId = NEW.wakeId AND s.assignmentId = NEW.assignmentId
+              AND s.wakeKind = 'escalation'
+              AND (
+                (s.controllerOrigin = 'scheduled' AND s.controllerState = 'settled'
+                 AND s.chargedGeneration > 0)
+                OR
+                (s.controllerOrigin = 'retirement_elevation' AND s.controllerState = 'settled'
+                 AND s.chargedGeneration IS NULL)
+              )
+          )
+          OR NOT EXISTS (
+            SELECT 1 FROM turns t
+            WHERE t.wakeId = NEW.wakeId AND t.assignmentId = NEW.assignmentId
+          )
+        )
+      BEGIN
+        SELECT RAISE(ABORT, 'supervision lineage wake requires controller sidecar');
+      END
+      """
+    },
+    %{
+      type: "trigger",
+      name: "supervision_fired_lineage_sidecar_required_delete",
+      sql: """
+      CREATE TRIGGER IF NOT EXISTS supervision_fired_lineage_sidecar_required_delete
+      BEFORE DELETE ON supervision_liveness_sidecar
+      WHEN EXISTS (
+        SELECT 1 FROM wakes w
+        WHERE w.wakeId = OLD.wakeId AND w.assignmentId = OLD.assignmentId
+          AND w.state = 'fired' AND w.consumer = 'prompt'
+          AND w.origin = 'process:tightbeam' AND w.reresolve = 'lineage'
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'fired supervision lineage sidecar is required');
+      END
+      """
+    },
+    %{
+      type: "trigger",
+      name: "supervision_fired_lineage_sidecar_identity_immutable",
+      sql: """
+      CREATE TRIGGER IF NOT EXISTS supervision_fired_lineage_sidecar_identity_immutable
+      BEFORE UPDATE OF wakeId, assignmentId, controllerOrigin, wakeKind, controllerState,
+                       chargedGeneration
+      ON supervision_liveness_sidecar
+      WHEN EXISTS (
+        SELECT 1 FROM wakes w
+        WHERE w.wakeId = OLD.wakeId AND w.assignmentId = OLD.assignmentId
+          AND w.state = 'fired' AND w.consumer = 'prompt'
+          AND w.origin = 'process:tightbeam' AND w.reresolve = 'lineage'
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'fired supervision lineage sidecar identity is immutable');
+      END
+      """
+    },
+    %{
+      type: "trigger",
+      name: "supervision_fired_lineage_turn_immutable_update",
+      sql: """
+      CREATE TRIGGER IF NOT EXISTS supervision_fired_lineage_turn_immutable_update
+      BEFORE UPDATE OF seq, sessionKey, wakeId, assignmentId ON turns
+      WHEN EXISTS (
+        SELECT 1 FROM wakes w
+        WHERE w.wakeId = OLD.wakeId AND w.assignmentId = OLD.assignmentId
+          AND w.state = 'fired' AND w.consumer = 'prompt'
+          AND w.origin = 'process:tightbeam' AND w.reresolve = 'lineage'
+      )
+        AND (
+          NEW.seq IS NOT OLD.seq OR NEW.sessionKey IS NOT OLD.sessionKey
+          OR NEW.wakeId IS NOT OLD.wakeId OR NEW.assignmentId IS NOT OLD.assignmentId
+        )
+      BEGIN
+        SELECT RAISE(ABORT, 'fired supervision lineage turn attribution is immutable');
+      END
+      """
+    },
+    %{
+      type: "trigger",
+      name: "supervision_fired_lineage_turn_immutable_delete",
+      sql: """
+      CREATE TRIGGER IF NOT EXISTS supervision_fired_lineage_turn_immutable_delete
+      BEFORE DELETE ON turns
+      WHEN EXISTS (
+        SELECT 1 FROM wakes w
+        WHERE w.wakeId = OLD.wakeId AND w.assignmentId = OLD.assignmentId
+          AND w.state = 'fired' AND w.consumer = 'prompt'
+          AND w.origin = 'process:tightbeam' AND w.reresolve = 'lineage'
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'fired supervision lineage turn is required');
       END
       """
     }
@@ -502,6 +717,16 @@ defmodule Tightbeam.Schema do
     end
 
     validate_activation_epoch!(txn)
+
+    Enum.each(@supervision_liveness_enforcement_objects, fn object ->
+      if owned_object_present?(txn, object) do
+        validate_owned_object!(txn, object)
+      else
+        :ok = Txn.exec(txn, object.sql)
+        validate_owned_object!(txn, object)
+      end
+    end)
+
     :ok
   end
 
