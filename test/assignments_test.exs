@@ -701,9 +701,9 @@ defmodule Tightbeam.AssignmentsTest do
              )
   end
 
-  test "Proof 2: a NULL-workItemId review assignment resolves transitively for RESOLVED readers and counts exactly once",
+  test "Proof 2: a review assignment cannot itself be reviewed",
        ctx do
-    item = create_work_item(ctx, "Transitive story")
+    item = create_work_item(ctx, "Review boundary")
     reviewed = handle(ctx, "assign", assign_call({:user, "flynn"}, "base", nil, item.id))
 
     first_review =
@@ -711,20 +711,22 @@ defmodule Tightbeam.AssignmentsTest do
       |> put_in([:params, :reviews_assignment_id], reviewed.id)
       |> then(&handle(ctx, "assign", &1))
 
-    second_review =
+    nested_review =
       assign_call({:user, "flynn"}, "second review")
       |> put_in([:params, :reviews_assignment_id], first_review.id)
       |> then(&handle(ctx, "assign", &1))
 
     assert first_review.workItemId == nil
-    assert second_review.workItemId == nil
-    assert Assignments.resolved_work_item_id(ctx.db, second_review.id) == item.id
+    assert Assignments.resolved_work_item_id(ctx.db, first_review.id) == item.id
 
-    # "Counts exactly once" must be proven against the PRODUCTION resolved
-    # reader, not against a list that is already one row per primary key. The
-    # reader is `work-item-trace`, whose recursive CTE (job_trace.ex:68) is the
-    # second implementation of this same edge relation — so this also pins the
-    # two against each other and fails on drift.
+    assert %{
+             code: "review_of_review",
+             message: "a review assignment cannot itself be reviewed"
+           } = nested_review
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE subject = 'second review'")
+
     trace =
       Tightbeam.WorkItems.__handle__(ctx.db, "work-item-trace", %{
         verb: "work-item-trace",
@@ -736,14 +738,8 @@ defmodule Tightbeam.AssignmentsTest do
 
     traced_ids = Enum.map(trace.assignments, & &1.id)
 
-    assert Enum.count(traced_ids, &(&1 == second_review.id)) == 1
     assert Enum.count(traced_ids, &(&1 == first_review.id)) == 1
-    assert Enum.sort(traced_ids) == Enum.sort([reviewed.id, first_review.id, second_review.id])
-
-    # The CTE and resolved_work_item_id/2 must agree on every member.
-    for id <- traced_ids do
-      assert Assignments.resolved_work_item_id(ctx.db, id) == item.id
-    end
+    assert Enum.sort(traced_ids) == Enum.sort([reviewed.id, first_review.id])
   end
 
   test "Proof 3: an assignment with neither key resolves to NONE", ctx do

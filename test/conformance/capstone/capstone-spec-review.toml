@@ -9,10 +9,10 @@ legibility = "event:denied(rule=capstone-spec-review);lifecycle:rail_remedy"
 [[fixture.rule]]
 name = "capstone-spec-review"
 verb = "attest"
-text = "a commissioned spec-reviewed verdict releases the gate"
+text = "a spec-reviewed verdict on the work item releases the gate"
 edges = ["verb"]
 effect = "remedy"
-deny_when = [{ fact = "assignment.independent_verdict_kinds", op = "not_in", value = ["spec-reviewed"] }]
+deny_when = [{ fact = "work_item.verdict_kinds", op = "not_in", value = ["spec-reviewed"] }]
 [fixture.rule.remedy]
 action = "assign"
 produces = "spec-reviewed"
@@ -20,3 +20,4 @@ target_role = "reviewer"
 [fixture.rule.remedy.params]
 subject = "review spec for {assignment_id}"
 reviews = "{assignment_id}"
+work_item = "{work_item_id}"

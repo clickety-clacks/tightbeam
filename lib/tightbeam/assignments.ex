@@ -933,9 +933,22 @@ defmodule Tightbeam.Assignments do
         reviews_assignment_id =
           if verb == "assign", do: call.params[:reviews_assignment_id], else: nil
 
-        if reviews_assignment_id &&
-             Txn.q(txn, "SELECT 1 FROM assignments WHERE id = ?1", [reviews_assignment_id]) == [],
-           do: raise(UnknownReviewTarget, assignment_id: reviews_assignment_id)
+        if reviews_assignment_id do
+          case Txn.q(
+                 txn,
+                 "SELECT reviewsAssignmentId FROM assignments WHERE id = ?1",
+                 [reviews_assignment_id]
+               ) do
+            [] ->
+              raise UnknownReviewTarget, assignment_id: reviews_assignment_id
+
+            [[nil]] ->
+              :ok
+
+            [[_reviews_assignment_id]] ->
+              throw(:review_of_review)
+          end
+        end
 
         if reviews_assignment_id do
           reviewed_item_id =
@@ -1056,6 +1069,9 @@ defmodule Tightbeam.Assignments do
         "review_item_conflict",
         "a review assignment must belong to the item it reviews"
       )
+
+    :review_of_review ->
+      error("review_of_review", "a review assignment cannot itself be reviewed")
   end
 
   defp resolve_work_item_id_in_txn(txn, assignment_id, visited) do

@@ -14,10 +14,7 @@ defmodule Tightbeam.Rules do
   for a caller holding no roles, and `assignment.verdicts not_in
   ["reviewed-clean"]` fires for an assignment with no verdicts. List facts are
   `caller.roles`, `assignment.verdicts`,
-  `assignment.independent_verdict_kinds`,
-  `assignment.qualifying_review_verdict_kinds`,
-  `assignment.cross_harness_verdict_kinds`,
-  `assignment.cross_provider_verdict_kinds`, and
+  `assignment.qualifying_review_verdict_kinds`, and
   `assignment.artifact_kinds` (the distinct artifact kinds the assignment's
   holder recorded on its work item, in every artifact state). Assignment
   caller identity comes from the optional dispatch principal rather than the
@@ -94,18 +91,10 @@ defmodule Tightbeam.Rules do
   @whole_fields ~w(target_role target_session reviews work_item name harness model effort context archetype host after at)
   @verdict_facts ~w(
     assignment.verdicts
-    assignment.independent_verdict_kinds
     assignment.qualifying_review_verdict_kinds
-    assignment.cross_harness_verdict_kinds
-    assignment.cross_provider_verdict_kinds
     work_item.verdict_kinds
   )
-  @independence_facts ~w(
-    assignment.independent_verdict_kinds
-    assignment.qualifying_review_verdict_kinds
-    assignment.cross_harness_verdict_kinds
-    assignment.cross_provider_verdict_kinds
-  )
+  @linked_review_facts ~w(assignment.qualifying_review_verdict_kinds)
   @name_re ~r/^[a-z0-9][a-z0-9-]*$/
   @facts %{
     "caller.origin_class" => :string,
@@ -125,10 +114,7 @@ defmodule Tightbeam.Rules do
     "assignment.effect_kind" => :string,
     "assignment.state" => :string,
     "assignment.holder_noted_verdict_kinds" => {:list, :string},
-    "assignment.independent_verdict_kinds" => {:list, :string},
     "assignment.qualifying_review_verdict_kinds" => {:list, :string},
-    "assignment.cross_harness_verdict_kinds" => {:list, :string},
-    "assignment.cross_provider_verdict_kinds" => {:list, :string},
     "assignment.artifact_kinds" => {:list, :string},
     "assignment.holder_archetype" => :string,
     "assignment.caller_is_holder" => :bool,
@@ -482,9 +468,9 @@ defmodule Tightbeam.Rules do
 
     if is_nil(check) and
          Enum.any?(requirements, fn {fact, kinds} ->
-           fact in @independence_facts and produces in kinds
+           fact in @linked_review_facts and produces in kinds
          end) and params["reviews"] != "{assignment_id}" do
-      fail.("independence-fact remedy requires reviews = \"{assignment_id}\"")
+      fail.("linked-review-fact remedy requires reviews = \"{assignment_id}\"")
     end
 
     if "remedy" not in effects, do: fail.("[rule.remedy] requires a remedy effect")
@@ -650,7 +636,7 @@ defmodule Tightbeam.Rules do
 
   defp remedy_covers?(remedy, fact, kinds) do
     remedy.produces in kinds and
-      (fact not in @independence_facts or remedy.params[:reviews] == "{assignment_id}")
+      (fact not in @linked_review_facts or remedy.params[:reviews] == "{assignment_id}")
   end
 
   defp validate_remedy_reachability!(%{remedy: nil}, _rules, _valid_verbs), do: :ok
@@ -1131,13 +1117,6 @@ defmodule Tightbeam.Rules do
     end)
   end
 
-  defp compute_fact("assignment.independent_verdict_kinds", db, call, cache) do
-    with_dependency("$verdict_authors", db, call, cache, fn
-      nil, cache -> {nil, cache}
-      authors, cache -> {distinct_verdict_kinds(authors), cache}
-    end)
-  end
-
   defp compute_fact("assignment.qualifying_review_verdict_kinds", db, call, cache) do
     with_dependency("$assignment", db, call, cache, fn
       nil, cache ->
@@ -1149,50 +1128,6 @@ defmodule Tightbeam.Rules do
            assignment.id,
            assignment.holder_key
          ), cache}
-    end)
-  end
-
-  defp compute_fact("assignment.cross_harness_verdict_kinds", db, call, cache) do
-    with_dependency("$assignment", db, call, cache, fn
-      nil, cache ->
-        {nil, cache}
-
-      %{holder_harness: nil}, cache ->
-        {nil, cache}
-
-      assignment, cache ->
-        with_dependency("$verdict_authors", db, call, cache, fn authors, cache ->
-          kinds =
-            authors
-            |> Enum.filter(
-              &(not is_nil(&1.by_harness) and &1.by_harness != assignment.holder_harness)
-            )
-            |> distinct_verdict_kinds()
-
-          {kinds, cache}
-        end)
-    end)
-  end
-
-  defp compute_fact("assignment.cross_provider_verdict_kinds", db, call, cache) do
-    with_dependency("$assignment", db, call, cache, fn
-      nil, cache ->
-        {nil, cache}
-
-      %{holder_provider: nil}, cache ->
-        {nil, cache}
-
-      assignment, cache ->
-        with_dependency("$verdict_authors", db, call, cache, fn authors, cache ->
-          kinds =
-            authors
-            |> Enum.filter(
-              &(not is_nil(&1.by_provider) and &1.by_provider != assignment.holder_provider)
-            )
-            |> distinct_verdict_kinds()
-
-          {kinds, cache}
-        end)
     end)
   end
 
@@ -1418,16 +1353,6 @@ defmodule Tightbeam.Rules do
     {assignment, cache}
   end
 
-  defp compute_fact("$verdict_authors", db, call, cache) do
-    with_dependency("$assignment", db, call, cache, fn
-      nil, cache ->
-        {nil, cache}
-
-      assignment, cache ->
-        {Assignments.commissioned_review_authors(db, assignment.id, assignment.holder_key), cache}
-    end)
-  end
-
   defp resolve_dispatch_assignment(db, call) do
     case {call.verb, Map.get(call.params, :work_item_id)} do
       {"dispatch", work_item_id} when is_binary(work_item_id) ->
@@ -1454,12 +1379,6 @@ defmodule Tightbeam.Rules do
       {:ok, value, cache} -> fun.(value, cache)
       :error -> throw({:dependency_error, fact})
     end
-  end
-
-  defp distinct_verdict_kinds(authors) do
-    authors
-    |> Enum.map(& &1.verdict_kind)
-    |> Enum.uniq()
   end
 
   defp assignment_context(db, where, params) do

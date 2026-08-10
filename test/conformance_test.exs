@@ -69,7 +69,7 @@ defmodule Tightbeam.ConformanceSupport do
     "sessions" => ~w(key owner archetype harness provider host model),
     "roles" => ~w(name session),
     "work_items" => ~w(id title),
-    "assignments" => ~w(id holder creator reviews files),
+    "assignments" => ~w(id holder creator reviews work_item files),
     "attests" => ~w(assignment kind by verdict_kind),
     "retune" => ~w(session harness provider),
     "ledger" => ~w(session pending),
@@ -114,9 +114,9 @@ defmodule Tightbeam.ConformanceSupport do
     {"Cap", "capstone-real-run-before-ship"} =>
       ~w(missing-real-run-denies produced-real-run-releases idle-sweep-reobligates real-run-loop-legible),
     {"Cap", "capstone-yagni-judge"} =>
-      ~w(missing-yagni-judge-fires-remedy wrong-author-verdict-stays-denied commissioned-yagni-clean-passes yagni-loop-legible),
+      ~w(missing-yagni-judge-fires-remedy wrong-work-item-verdict-stays-denied commissioned-yagni-clean-passes yagni-loop-legible),
     {"Cap", "capstone-spec-review"} =>
-      ~w(missing-spec-review-fires-remedy wrong-author-verdict-stays-denied commissioned-spec-reviewed-passes spec-review-loop-legible)
+      ~w(missing-spec-review-fires-remedy wrong-work-item-verdict-stays-denied commissioned-spec-reviewed-passes spec-review-loop-legible)
   }
 
   def corpus_root do
@@ -2042,12 +2042,14 @@ defmodule Tightbeam.ConformanceSupport do
       end
 
       unless iterate? do
-        wrong = Enum.find(fixture["cases"], &String.contains?(&1["case"], "wrong-author"))
+        wrong_item =
+          Enum.find(fixture["cases"], &String.contains?(&1["case"], "wrong-work-item"))
+
         {db, pid} = memory_db!()
 
         try do
-          ids = materialize_world(db, wrong["world"])
-          call = build_call(wrong["call"], ids)
+          ids = materialize_world(db, wrong_item["world"])
+          call = build_call(wrong_item["call"], ids)
 
           assert {:error, %{reason: "remedy_fired"}} =
                    Dispatch.dispatch(db, Gateway.handlers(%{db: db, wake_tick_ms: 1_000}), call)

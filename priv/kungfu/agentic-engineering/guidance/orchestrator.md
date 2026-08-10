@@ -127,15 +127,16 @@ and the substrate blocks a completion that lacks the papertrail.
 
 ## Closing the loop: the completion rail
 `completion-requires-review` backstops the evidence shape; it never chooses a model.
-A review-required card completes only when `assignment.independent_verdict_kinds`
-contains `reviewed-clean`: the verdict is on a card linked by `--reviews`, its holder
-filed it, and that holder is a different session from the work's author. Who opened
-the review card and which harness or provider ran it do not change that fact.
+A review-required card completes only when
+`assignment.qualifying_review_verdict_kinds` contains `reviewed-clean`: exactly one
+card is linked by `--reviews`, its latest holder-filed verdict is clean, and that
+holder is a different session from the work's author. Who opened the review card and
+which harness or provider ran it do not change that fact.
 
-The substrate does not yet carry a typed review-required-effect marker. Until it
-does, inference performs the effect classification above. A review-linked card files
-its verdict and then its holder completes it; the rail exempts it. For unlinked
-evidence-only work, the holder files a `progress` attest recording
+The assignment's durable `effectKind` supplies the classification above. A linked
+review card is always `effectKind = review`, so its completion is exempt and cannot
+recursively require review. For unlinked evidence-only work, the holder files a
+`progress` attest recording
 delivered-not-withdrawn, then its opener revokes the card. Never surrender delivered
 work as abandoned, and never revoke without the delivered row — both make the record
 lie.
