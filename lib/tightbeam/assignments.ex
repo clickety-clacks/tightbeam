@@ -6,7 +6,7 @@ defmodule Tightbeam.Assignments do
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
   alias Tightbeam.Harness.Support
-  alias Tightbeam.{EffortCheckin, Org, Placement, Projection, Supervision, Wakes}
+  alias Tightbeam.{EffortCheckin, EventLog, Org, Placement, Projection, Supervision, Wakes}
 
   defmodule TransitionRace do
     @moduledoc false
@@ -564,29 +564,22 @@ defmodule Tightbeam.Assignments do
       result =
         transaction(db, fn txn ->
           case open_assignment_in_txn(txn, call, owner, key, files, verb) do
-            {:created, assignment} -> after_create.(txn, assignment)
-            other -> other
+            {:created, assignment} ->
+              created = after_create.(txn, assignment)
+              accept_assignment_in_txn(created, txn, call)
+
+            other ->
+              other
           end
         end)
 
       case result do
+        {:accepted_in_txn, event_id, {:created, assignment, delivery}} ->
+          assignment = finalize_created_assignment(call, assignment, delivery)
+          {:accepted_in_txn, event_id, %{assignment: assignment}}
+
         {:created, assignment, delivery} ->
-          best_effort(fn -> notify(call, :on_assignment_change, assignment.id, nil) end)
-
-          # Work-item-grain composition doorbell (observability-v1 §work_item_events,
-          # kind="composition"): a work item gained a child assignment. observability-v1
-          # OWNS work_item_events; work-item-v1's "no new event kinds" refers to the
-          # Dispatch AUDIT stream, not this doorbell — do not conflate them again.
-          if assignment.workItemId,
-            do:
-              best_effort(fn ->
-                notify(call, :on_work_item_change, assignment.workItemId, "composition")
-              end)
-
-          if delivery,
-            do: best_effort(fn -> notify(call, :on_dispatch_delivery, delivery, nil) end)
-
-          assignment
+          finalize_created_assignment(call, assignment, delivery)
 
         {:replayed, assignment} ->
           assignment
@@ -598,6 +591,39 @@ defmodule Tightbeam.Assignments do
   rescue
     error in UnknownWorkItem -> error("unknown_work_item", Exception.message(error))
     error in UnknownReviewTarget -> error("unknown_review_target", Exception.message(error))
+  end
+
+  defp finalize_created_assignment(call, assignment, delivery) do
+    best_effort(fn -> notify(call, :on_assignment_change, assignment.id, nil) end)
+
+    if assignment.workItemId do
+      best_effort(fn ->
+        notify(call, :on_work_item_change, assignment.workItemId, "composition")
+      end)
+    end
+
+    if delivery, do: best_effort(fn -> notify(call, :on_dispatch_delivery, delivery, nil) end)
+    assignment
+  end
+
+  defp accept_assignment_in_txn({:created, assignment, _delivery} = result, txn, call) do
+    if call[:accepted_event_in_txn] do
+      event_id =
+        EventLog.append_event_in_txn(
+          txn,
+          "verb",
+          call.verb,
+          call.origin,
+          call.session_key,
+          assignment,
+          call.principal,
+          now()
+        )
+
+      {:accepted_in_txn, event_id, result}
+    else
+      result
+    end
   end
 
   defp open_assignment_in_txn(txn, call, owner, key, files, verb) do

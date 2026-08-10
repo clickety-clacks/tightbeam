@@ -54,7 +54,8 @@ defmodule Tightbeam.Dispatch do
         }
 
   @typedoc "An accepted result whose event was committed by the handler transaction."
-  @type accepted_in_txn :: {:accepted_in_txn, pos_integer(), %{canceled: true}}
+  @type accepted_in_txn ::
+          {:accepted_in_txn, pos_integer(), %{canceled: true} | %{assignment: map()}}
 
   @typedoc "A handler: pure-ish fun; returns a result map, or %{code: _} to deny."
   @type handler :: (call() -> map() | accepted_in_txn())
@@ -184,7 +185,12 @@ defmodule Tightbeam.Dispatch do
         {:error, error}
 
       {:ok, handler} ->
-        case invoke(handler, call) do
+        handler_call =
+          if verb in ["assign", "dispatch"],
+            do: Map.put(call, :accepted_event_in_txn, true),
+            else: call
+
+        case invoke(handler, handler_call) do
           {:returned, %{code: _} = error} ->
             :ok = EventLog.append_event(db, "denied", verb, origin, session_key, error, principal)
             {:error, error}
@@ -192,6 +198,11 @@ defmodule Tightbeam.Dispatch do
           {:returned, {:accepted_in_txn, event_id, %{canceled: true} = result}}
           when is_integer(event_id) and event_id > 0 and map_size(result) == 1 ->
             {:ok, result}
+
+          {:returned, {:accepted_in_txn, event_id, %{assignment: assignment} = envelope}}
+          when is_integer(event_id) and event_id > 0 and map_size(envelope) == 1 and
+                 is_map(assignment) ->
+            {:ok, assignment}
 
           {:returned, result} ->
             payload = outcome_payload(verb, call, {:returned, result})
