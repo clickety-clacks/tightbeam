@@ -235,6 +235,58 @@ defmodule Tightbeam.WorkItemBracketsTest do
     end
   end
 
+  test "linked assign and dispatch roll back the complete bundle when event append fails", ctx do
+    for {verb, dispatch_fun} <- [
+          {"assign", &disp_assign(&1, {:user, "flynn"}, "holder", &2, &3)},
+          {"dispatch", &disp_dispatch(&1, {:user, "flynn"}, "holder", &2, &3)}
+        ] do
+      subject = "forced #{verb} event rollback"
+      item = create(ctx, {:user, "flynn"}, %{title: subject})
+      routing = routing_wake_id(ctx.db, item.id)
+
+      :ok =
+        DB.execute(
+          ctx.db,
+          """
+          CREATE TRIGGER force_#{verb}_event_rollback
+          BEFORE INSERT ON events
+          WHEN NEW.verb='#{verb}' AND NEW.payload LIKE '%#{subject}%'
+          BEGIN
+            SELECT RAISE(ABORT, 'forced #{verb} event rollback');
+          END;
+          """
+        )
+
+      error =
+        assert_raise MatchError, fn ->
+          dispatch_fun.(ctx, subject, item.id)
+        end
+
+      assert {:error, %DB.Error{message: message}} = error.term
+      assert message =~ "forced #{verb} event rollback"
+      assert routing_wake_id(ctx.db, item.id) == routing
+      assert Wakes.get(ctx.db, routing).state == "pending"
+
+      assert {:ok, [[0, 0, 0, 0, 0, 0]]} =
+               DB.query(
+                 ctx.db,
+                 """
+                 SELECT
+                   (SELECT count(*) FROM assignments WHERE subject=?1),
+                   (SELECT count(*) FROM supervision_entitlements e
+                      JOIN assignments a ON a.id=e.assignmentId WHERE a.subject=?1),
+                   (SELECT count(*) FROM effort_checkin_generations g
+                      JOIN assignments a ON a.id=g.assignmentId WHERE a.subject=?1),
+                   (SELECT count(*) FROM wake_cancellations WHERE wakeId=?2),
+                   (SELECT count(*) FROM events
+                      WHERE verb=?3 AND payload LIKE '%' || ?1 || '%'),
+                   (SELECT count(*) FROM turns WHERE prompt LIKE '%' || ?1 || '%')
+                 """,
+                 [subject, routing, verb]
+               )
+    end
+  end
+
   ## Proof 3 — bracket-1 fire re-arms; icebox cancels and stops the nag.
 
   test "Proof 3: an ignored bracket-1 wake re-arms on fire; icebox stops the nag", ctx do
