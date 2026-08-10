@@ -319,6 +319,11 @@ defmodule Tightbeam.Assignments do
         WHERE r.reviewsAssignmentId = ?1
           AND r.holderKey != ?2
           AND (
+          SELECT COUNT(*)
+          FROM assignments AS linked
+          WHERE linked.reviewsAssignmentId = ?1
+          ) = 1
+          AND (
           SELECT v.verdictKind
           FROM attests AS v
           WHERE v.assignmentId = r.id

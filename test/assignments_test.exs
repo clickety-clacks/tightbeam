@@ -1012,9 +1012,7 @@ defmodule Tightbeam.AssignmentsTest do
       |> put_in([:params, :verdict_kind], "reviewed-clean")
       |> then(&handle(ctx, "attest", &1))
 
-    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == [
-             "reviewed-clean"
-           ]
+    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == []
 
     _ =
       attest_call({:session, "other-session"}, review.id, "verdict")

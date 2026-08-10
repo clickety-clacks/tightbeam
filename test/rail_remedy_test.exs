@@ -596,6 +596,52 @@ defmodule Tightbeam.RailRemedyTest do
              )
   end
 
+  test "foreign linked verdict keeps the re-wake on the pending review holder", ctx do
+    assignment = assignment(ctx, "foreign verdict")
+    load_review_gate(ctx)
+
+    assert {:error, %{producer: review_id}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, completion_call(assignment.id))
+
+    verdict_from(ctx, ctx.holder.session_key, review_id, "reviewed-clean")
+
+    assert {:error, %{producer: ^review_id}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, completion_call(assignment.id))
+
+    assert latest_rewake_target(ctx, assignment.id) == ctx.reviewer.session_key
+  end
+
+  test "verdict on an extra linked card keeps the episode re-wake on its review holder", ctx do
+    assignment = assignment(ctx, "extra linked card")
+    load_review_gate(ctx)
+
+    assert {:error, %{producer: review_id}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, completion_call(assignment.id))
+
+    extra_review = linked_review(ctx, assignment.id, "extra review")
+    verdict(ctx, extra_review.id, "reviewed-clean")
+
+    assert {:error, %{producer: ^review_id}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, completion_call(assignment.id))
+
+    assert latest_rewake_target(ctx, assignment.id) == ctx.reviewer.session_key
+  end
+
+  test "sole linked card holder verdict redirects the re-wake to the producer holder", ctx do
+    assignment = assignment(ctx, "holder verdict")
+    load_review_gate(ctx)
+
+    assert {:error, %{producer: review_id}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, completion_call(assignment.id))
+
+    verdict(ctx, review_id, "changes-requested")
+
+    assert {:error, %{producer: ^review_id}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, completion_call(assignment.id))
+
+    assert latest_rewake_target(ctx, assignment.id) == ctx.holder.session_key
+  end
+
   test "unbound role and token fail closed without dispatch", ctx do
     assignment = assignment(ctx, "unbound")
     :ok = Roles.rm(ctx.db, "reviewer")
@@ -1080,14 +1126,54 @@ defmodule Tightbeam.RailRemedyTest do
     })
   end
 
+  defp linked_review(ctx, assignment_id, subject) do
+    Assignments.__handle__(ctx.db, "assign", %{
+      verb: "assign",
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      session_key: ctx.reviewer.session_key,
+      target_role: nil,
+      role_fallback: false,
+      supervision_interval_ms: 1_000,
+      params: %{
+        subject: subject,
+        reviews_assignment_id: assignment_id,
+        idempotency_key: nil
+      }
+    })
+  end
+
   defp verdict(ctx, assignment_id, kind) do
+    verdict_from(ctx, ctx.reviewer.session_key, assignment_id, kind)
+  end
+
+  defp verdict_from(ctx, session_key, assignment_id, kind) do
     Assignments.__handle__(ctx.db, "attest", %{
       verb: "attest",
-      origin: "agent:reviewer",
-      principal: {:session, ctx.reviewer.session_key},
+      origin: "agent:#{session_key}",
+      principal: {:session, session_key},
       session_key: nil,
       params: %{assignment_id: assignment_id, kind: "verdict", verdict_kind: kind}
     })
+  end
+
+  defp latest_rewake_target(ctx, assignment_id) do
+    {:ok, [[session_key]]} =
+      DB.query(
+        ctx.db,
+        """
+        SELECT w.sessionKey
+        FROM wire_idempotency i
+        JOIN wakes w ON w.wakeId = i.sessionKey
+        WHERE i.operation = 'wake'
+          AND i.idempotencyKey LIKE ?1
+        ORDER BY w.createdAt DESC, w.wakeId DESC
+        LIMIT 1
+        """,
+        ["rail-rewake:completion-needs-review:#{assignment_id}:%"]
+      )
+
+    session_key
   end
 
   defp revoke(ctx, assignment_id) do
