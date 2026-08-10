@@ -107,13 +107,18 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
     }
   end
 
-  defp verdict_call(session_key, assignment_id, kind) do
+  defp verdict_call(session_key, assignment_id, kind, note \\ nil) do
     %{
       verb: "attest",
       origin: "session:#{session_key}",
       principal: {:session, session_key},
       session_key: session_key,
-      params: %{assignment_id: assignment_id, kind: "verdict", verdict_kind: kind}
+      params: %{
+        assignment_id: assignment_id,
+        kind: "verdict",
+        verdict_kind: kind,
+        note: note
+      }
     }
   end
 
@@ -215,6 +220,18 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
         }
       }
     end
+
+    assert {:ok, _} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               verdict_call(
+                 ctx.holder.session_key,
+                 subject.id,
+                 "tests-passed",
+                 "testhost:/repo abc123; mix test test/spec_dispatch_requires_spirit_test.exs; passed"
+               )
+             )
 
     {:ok, r1} = Dispatch.dispatch(ctx.db, ctx.handlers, review_call.(1))
 
