@@ -4718,8 +4718,7 @@ defmodule Tightbeam.GatewayTest do
     task_sup = start_supervised!({Task.Supervisor, name: :dead_cancel_tasks})
     ensure_global_registry()
 
-    dead_adapter = spawn(fn -> :ok end)
-    monitor = Process.monitor(dead_adapter)
+    {dead_adapter, monitor} = spawn_monitor(fn -> :ok end)
     assert_receive {:DOWN, ^monitor, :process, ^dead_adapter, :normal}
     start_supervised!({CoordinatorStub, dead_adapter})
 
