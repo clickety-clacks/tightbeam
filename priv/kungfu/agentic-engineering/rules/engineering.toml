@@ -18,6 +18,7 @@ deny_when = [
 action = "assign"
 produces = "reviewed-clean"
 target_role = "reviewer"
+on_rule_denied = "surface"
 [rule.remedy.params]
 subject = "review of assignment {assignment_id}"
 reviews = "{assignment_id}"
@@ -46,6 +47,19 @@ target_role = "recon"
 subject = "diagnosis of prior fix for work item {work_item_id}"
 reviews = "{assignment_id}"
 work_item = "{work_item_id}"
+
+[[rule]]
+name = "code-review-requires-passing-tests"
+verb = "assign"
+text = "code review needs the code author's passing-test receipt: the assignment holder must file a tests-passed verdict with the tested repository, commit, command or suite, and passing result"
+edges = ["verb"]
+effect = "deny"
+deny_when = [
+  { fact = "assignment.is_producing_card", op = "eq", value = true },
+  { fact = "assignment.state", op = "eq", value = "open" },
+  { fact = "assignment.holder_archetype", op = "eq", value = "coder" },
+  { fact = "assignment.holder_noted_verdict_kinds", op = "not_in", value = ["tests-passed"] },
+]
 
 # Spec-backed work is a slice of product: before its implementation
 # dispatches, the product owner has rendered a spirit verdict on the spec.

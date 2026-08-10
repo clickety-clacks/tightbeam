@@ -25,10 +25,11 @@ defmodule Tightbeam.Rules do
 
   Check-tier facts are `attest.kind` (raw string on attest calls),
   `assignment.verdicts` (distinct filed verdict kinds),
-  `assignment.is_producing_card`, `assignment.effect_kind`,
-  `assignment.holder_archetype`, and `assignment.caller_is_holder`. The
-  assignment facts resolve from the call's assignmentId and are nil when that
-  assignment cannot be resolved.
+  `assignment.is_producing_card`, `assignment.effect_kind`, `assignment.state`,
+  `assignment.holder_noted_verdict_kinds`, `assignment.holder_archetype`, and
+  `assignment.caller_is_holder`. The assignment facts resolve from the call's
+  assignmentId, or from the reviewed assignment on an assign call, and are nil
+  when that assignment cannot be resolved.
 
   Work-item facts are `work_item.is_bug` (the org-set work-item attribute) and
   `assignment.prior_completed_fix_count` (completed, non-review assignments on
@@ -85,6 +86,7 @@ defmodule Tightbeam.Rules do
                  "context",
                  "archetype",
                  "host",
+                 "on_rule_denied",
                  "params"
                ])
   @binding_tokens ~w(assignment_id work_item_id holder_key holder_role holder_archetype caller_origin)
@@ -121,6 +123,8 @@ defmodule Tightbeam.Rules do
     "assignment.verdicts" => {:list, :string},
     "assignment.is_producing_card" => :bool,
     "assignment.effect_kind" => :string,
+    "assignment.state" => :string,
+    "assignment.holder_noted_verdict_kinds" => {:list, :string},
     "assignment.independent_verdict_kinds" => {:list, :string},
     "assignment.qualifying_review_verdict_kinds" => {:list, :string},
     "assignment.cross_harness_verdict_kinds" => {:list, :string},
@@ -393,6 +397,11 @@ defmodule Tightbeam.Rules do
     params = Map.get(remedy, "params", %{})
     unless is_map(params), do: fail.("remedy params must be a table")
 
+    on_rule_denied = Map.get(remedy, "on_rule_denied", "block")
+
+    unless on_rule_denied in ~w(block surface),
+      do: fail.("remedy on_rule_denied must be block or surface")
+
     {required_top, allowed_top, required_params, allowed_params} =
       case action do
         "assign" ->
@@ -409,7 +418,7 @@ defmodule Tightbeam.Rules do
     present_top =
       remedy
       |> Map.keys()
-      |> Enum.filter(&(&1 not in ~w(action produces params)))
+      |> Enum.filter(&(&1 not in ~w(action produces on_rule_denied params)))
 
     missing_top = required_top -- present_top
     if missing_top != [], do: fail.("remedy #{action} is missing #{Enum.join(missing_top, ", ")}")
@@ -483,6 +492,7 @@ defmodule Tightbeam.Rules do
     %{
       action: action,
       produces: produces,
+      on_rule_denied: on_rule_denied,
       target:
         remedy
         |> Map.take(allowed_top)
@@ -912,8 +922,8 @@ defmodule Tightbeam.Rules do
   defp gated_ref(call) do
     params = Map.fetch!(call, :params)
 
-    params[:assignment_id] || params[:work_item_id] || params["assignment_id"] ||
-      params["work_item_id"]
+    params[:assignment_id] || params["assignment_id"] || params[:reviews_assignment_id] ||
+      params["reviews_assignment_id"] || params[:work_item_id] || params["work_item_id"]
   end
 
   # The position rides the entry so the ACTOR can hand recovery to the writer; the writer,
@@ -1086,6 +1096,38 @@ defmodule Tightbeam.Rules do
     with_dependency("$assignment", db, call, cache, fn
       nil, cache -> {nil, cache}
       assignment, cache -> {assignment.effect_kind, cache}
+    end)
+  end
+
+  defp compute_fact("assignment.state", db, call, cache) do
+    with_dependency("$assignment", db, call, cache, fn
+      nil, cache -> {nil, cache}
+      assignment, cache -> {assignment.state, cache}
+    end)
+  end
+
+  defp compute_fact("assignment.holder_noted_verdict_kinds", db, call, cache) do
+    with_dependency("$assignment", db, call, cache, fn
+      nil, cache ->
+        {nil, cache}
+
+      assignment, cache ->
+        {:ok, rows} =
+          DB.query(
+            db,
+            """
+            SELECT DISTINCT verdictKind FROM attests
+            WHERE assignmentId = ?1
+              AND kind = 'verdict'
+              AND bySession = ?2
+              AND note IS NOT NULL
+              AND length(trim(note)) > 0
+            ORDER BY verdictKind
+            """,
+            [assignment.id, assignment.holder_key]
+          )
+
+        {Enum.map(rows, fn [kind] -> kind end), cache}
     end)
   end
 
@@ -1354,7 +1396,7 @@ defmodule Tightbeam.Rules do
 
   defp compute_fact("$assignment", db, call, cache) do
     assignment =
-      case Map.get(call.params, :assignment_id) do
+      case Map.get(call.params, :assignment_id) || Map.get(call.params, "assignment_id") do
         id when is_binary(id) ->
           assignment_context(
             db,
@@ -1363,23 +1405,13 @@ defmodule Tightbeam.Rules do
           )
 
         _ ->
-          case {call.verb, Map.get(call.params, :work_item_id)} do
-            {"dispatch", work_item_id} when is_binary(work_item_id) ->
-              assignment_context(
-                db,
-                """
-                WHERE a.workItemId = ?1
-                  AND a.reviewsAssignmentId IS NULL
-                  AND a.state = 'closed'
-                  AND a.outcome = 'completed'
-                ORDER BY a.closedAt DESC, a.id DESC
-                LIMIT 1
-                """,
-                [work_item_id]
-              )
+          case Map.get(call.params, :reviews_assignment_id) ||
+                 Map.get(call.params, "reviews_assignment_id") do
+            id when call.verb == "assign" and is_binary(id) ->
+              assignment_context(db, "WHERE a.id = ?1", [id])
 
             _ ->
-              nil
+              resolve_dispatch_assignment(db, call)
           end
       end
 
@@ -1394,6 +1426,27 @@ defmodule Tightbeam.Rules do
       assignment, cache ->
         {Assignments.commissioned_review_authors(db, assignment.id, assignment.holder_key), cache}
     end)
+  end
+
+  defp resolve_dispatch_assignment(db, call) do
+    case {call.verb, Map.get(call.params, :work_item_id)} do
+      {"dispatch", work_item_id} when is_binary(work_item_id) ->
+        assignment_context(
+          db,
+          """
+          WHERE a.workItemId = ?1
+            AND a.reviewsAssignmentId IS NULL
+            AND a.state = 'closed'
+            AND a.outcome = 'completed'
+          ORDER BY a.closedAt DESC, a.id DESC
+          LIMIT 1
+          """,
+          [work_item_id]
+        )
+
+      _ ->
+        nil
+    end
   end
 
   defp with_dependency(fact, db, call, cache, fun) do
@@ -1413,7 +1466,7 @@ defmodule Tightbeam.Rules do
     case DB.query(
            db,
            """
-           SELECT a.id, a.workItemId, a.reviewsAssignmentId, a.holderKey, s.archetype,
+           SELECT a.id, a.workItemId, a.reviewsAssignmentId, a.holderKey, a.state, s.archetype,
                   a.holderHarness, a.holderProvider,
                   COALESCE(e.effectKind,
                     CASE WHEN a.reviewsAssignmentId IS NULL THEN 'code' ELSE 'review' END)
@@ -1431,6 +1484,7 @@ defmodule Tightbeam.Rules do
            work_item_id,
            reviews_assignment_id,
            holder_key,
+           state,
            holder_archetype,
            holder_harness,
            holder_provider,
@@ -1442,6 +1496,7 @@ defmodule Tightbeam.Rules do
           work_item_id: work_item_id,
           reviews_assignment_id: reviews_assignment_id,
           holder_key: holder_key,
+          state: state,
           holder_archetype: holder_archetype,
           holder_harness: holder_harness,
           holder_provider: holder_provider,

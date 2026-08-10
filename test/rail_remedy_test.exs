@@ -197,6 +197,26 @@ defmodule Tightbeam.RailRemedyTest do
     assert [%{"outcome" => "blocked", "producer_id" => nil}] = remedy_events(ctx.db)
   end
 
+  test "surface policy returns a differently named nested rule denial without a producer", ctx do
+    assignment = assignment(ctx, "surfaced-producer")
+    put_rules(ctx, surfaced_review_gate() <> conditional_blocker())
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    assert {:error,
+            %{
+              reason: "remedy_blocked",
+              producer: nil,
+              rule: "conditional-remedy-blocker",
+              ref: producer_id,
+              message: message
+            }} = Dispatch.dispatch(ctx.db, ctx.handlers, completion_call(assignment.id))
+
+    assert producer_id == assignment.id
+    assert message == "conditional-remedy-blocker: runtime quota"
+    assert RailRemedy.episode(ctx.db, "completion-needs-review", assignment.id) == nil
+    assert [%{"outcome" => "blocked", "producer_id" => nil}] = remedy_events(ctx.db)
+  end
+
   test "TTL reclaim racing a live original dispatch produces exactly one external effect", ctx do
     assignment = assignment(ctx, "ttl")
     load_review_gate(ctx)
@@ -724,6 +744,11 @@ defmodule Tightbeam.RailRemedyTest do
          ~s(subject = "review {assignment_id}"),
          ~s(subject = "review {unknown}")
        ), "unknown binding token"},
+      {String.replace(
+         review_gate(),
+         ~s(action = "assign"),
+         ~s(action = "assign"\non_rule_denied = "retry")
+       ), "on_rule_denied must be block or surface"},
       {"""
        [[rule]]
        name = "bad-external"
@@ -744,6 +769,18 @@ defmodule Tightbeam.RailRemedyTest do
 
       assert error.message =~ message
     end)
+  end
+
+  test "remedy rule-denial policy defaults to block and accepts explicit block", ctx do
+    put_rules(ctx, review_gate())
+
+    assert [%{remedy: %{on_rule_denied: "block"}}] =
+             Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    put_rules(ctx, explicit_block_review_gate())
+
+    assert [%{remedy: %{on_rule_denied: "block"}}] =
+             Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
   end
 
   defp load_review_gate(ctx) do
@@ -775,6 +812,22 @@ defmodule Tightbeam.RailRemedyTest do
     subject = "review {assignment_id}"
     reviews = "{assignment_id}"
     """
+  end
+
+  defp explicit_block_review_gate do
+    String.replace(
+      review_gate(),
+      ~s(action = "assign"),
+      ~s(action = "assign"\non_rule_denied = "block")
+    )
+  end
+
+  defp surfaced_review_gate do
+    String.replace(
+      review_gate(),
+      ~s(action = "assign"),
+      ~s(action = "assign"\non_rule_denied = "surface")
+    )
   end
 
   defp script_assign_gate do
@@ -1153,7 +1206,7 @@ defmodule Tightbeam.RailRemedyTest do
       owner_user_id: owner,
       origin: "user:#{owner}",
       archetype: archetype,
-      host: "eezo",
+      host: Tightbeam.Placement.local_host_name(),
       harness: harness,
       provider: if(harness == "codex", do: "openai", else: "anthropic"),
       model: Model.new("test")

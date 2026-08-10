@@ -23,6 +23,7 @@ defmodule Tightbeam.RailRemedy do
   """
 
   @type outcome :: %{
+          optional(:denial) => map(),
           outcome: String.t(),
           producer_id: String.t() | nil
         }
@@ -245,6 +246,11 @@ defmodule Tightbeam.RailRemedy do
           %{outcome: "claimed-dispatched", producer_id: nil}
         end
       else
+        {:error, %{code: "rule_denied"} = denial}
+        when rule.remedy.on_rule_denied == "surface" ->
+          release_dispatch(db, rule.name, subject, token)
+          %{outcome: "blocked", producer_id: nil, denial: denial}
+
         _ ->
           release_dispatch(db, rule.name, subject, token)
           %{outcome: "blocked", producer_id: nil}

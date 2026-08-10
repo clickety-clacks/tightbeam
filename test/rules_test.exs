@@ -30,7 +30,11 @@ defmodule Tightbeam.RulesTest do
       Rules.load!(System.tmp_dir!() <> "/missing-rules-reset", [])
     end)
 
-    %{db: db, base_dir: base_dir, handlers: Gateway.handlers(%{db: db})}
+    %{
+      db: db,
+      base_dir: base_dir,
+      handlers: Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
+    }
   end
 
   test "missing and empty directories load zero rules and an empty load clears prior rules",
@@ -1065,6 +1069,135 @@ defmodule Tightbeam.RulesTest do
              Dispatch.dispatch(ctx.db, ctx.handlers, artifact_completion)
   end
 
+  test "shipped code-review rail requires the open coder holder's nonblank test receipt", ctx do
+    holder = session(ctx.db, "receipt-holder", "flynn", archetype: "coder")
+    other = session(ctx.db, "receipt-other", "other", archetype: "coder")
+    reviewer = session(ctx.db, "receipt-reviewer", "reviewer", archetype: "reviewer")
+    producer = assignment(ctx, holder.session_key, {:user, "flynn"})
+
+    {:ok, _} =
+      DB.query(ctx.db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1)")
+
+    put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    review_call =
+      p3_call("assign", {:user, "reviewer"}, %{
+        subject: "review receipt producer",
+        reviews_assignment_id: producer.id,
+        idempotency_key: nil,
+        files: nil
+      })
+      |> Map.put(:session_key, reviewer.session_key)
+
+    assert {:error,
+            %{
+              code: "rule_denied",
+              rule: "code-review-requires-passing-tests",
+              ref: producer_id
+            }} = Dispatch.dispatch(ctx.db, ctx.handlers, review_call)
+
+    assert producer_id == producer.id
+    assert review_count(ctx.db, producer.id) == 0
+
+    user_verdict(ctx, "flynn", producer.id, "tests-passed", "user claim")
+    verdict(ctx, other.session_key, producer.id, "tests-passed", "other session claim")
+    verdict(ctx, holder.session_key, producer.id, "tests-passed")
+
+    assert {:error, %{rule: "code-review-requires-passing-tests", ref: ^producer_id}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, review_call)
+
+    assert review_count(ctx.db, producer.id) == 0
+
+    verdict(
+      ctx,
+      holder.session_key,
+      producer.id,
+      "tests-passed",
+      "gibson:/repo abc123; mix test test/rules_test.exs; passed: 1 test"
+    )
+
+    assert {:ok, %{reviewsAssignmentId: ^producer_id, effectKind: "review"}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, review_call)
+
+    assert review_count(ctx.db, producer.id) == 1
+  end
+
+  test "typed completion keeps code reviewed while receipt exemptions stay narrow", ctx do
+    coder = session(ctx.db, "receipt-closed", "flynn", archetype: "coder")
+    noncoder = session(ctx.db, "receipt-orchestrator", "flynn", archetype: "orchestrator")
+    reviewer = session(ctx.db, "receipt-exempt-reviewer", "reviewer", archetype: "reviewer")
+    closed = assignment(ctx, coder.session_key, {:user, "flynn"})
+    open_coder = assignment(ctx, coder.session_key, {:user, "flynn"})
+    noncode = assignment(ctx, noncoder.session_key, {:user, "flynn"})
+
+    orchestration =
+      assignment(ctx, noncoder.session_key, {:user, "flynn"}, effect_kind: "evidence")
+
+    assert %{assignment: %{state: "closed"}} =
+             Assignments.__handle__(
+               ctx.db,
+               "attest",
+               p3_call("attest", {:session, coder.session_key}, %{
+                 assignment_id: closed.id,
+                 kind: "completion"
+               })
+             )
+
+    put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    coder_completion =
+      p3_call("attest", {:session, coder.session_key}, %{
+        assignment_id: open_coder.id,
+        kind: "completion"
+      })
+
+    evidence_completion =
+      p3_call("attest", {:session, noncoder.session_key}, %{
+        assignment_id: orchestration.id,
+        kind: "completion"
+      })
+
+    assert {:deny, %{rule: "completion-requires-review"}} =
+             Rules.evaluate(ctx.db, coder_completion)
+
+    assert orchestration.reviewsAssignmentId == nil
+    assert orchestration.effectKind == "evidence"
+
+    assert {:ok, %{assignment: %{id: orchestration_id, state: "closed"}}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, evidence_completion)
+
+    assert orchestration_id == orchestration.id
+
+    ordinary =
+      p3_call("assign", {:user, "reviewer"}, %{
+        subject: "ordinary assignment",
+        idempotency_key: nil,
+        files: nil
+      })
+      |> Map.put(:session_key, reviewer.session_key)
+
+    assert {:ok, %{reviewsAssignmentId: nil}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, ordinary)
+
+    for producer <- [noncode, closed] do
+      call =
+        p3_call("assign", {:user, "reviewer"}, %{
+          subject: "exempt review",
+          reviews_assignment_id: producer.id,
+          idempotency_key: nil,
+          files: nil
+        })
+        |> Map.put(:session_key, reviewer.session_key)
+
+      assert {:ok, %{reviewsAssignmentId: reviewed}} =
+               Dispatch.dispatch(ctx.db, ctx.handlers, call)
+
+      assert reviewed == producer.id
+    end
+  end
+
   defp call(origin \\ "user:flynn") do
     %{verb: "post", origin: origin, session_key: nil, params: %{}}
   end
@@ -1102,28 +1235,39 @@ defmodule Tightbeam.RulesTest do
     Assignments.__handle__(ctx.db, "assign", %{call | session_key: holder_key})
   end
 
-  defp verdict(ctx, session_key, assignment_id, verdict_kind) do
+  defp verdict(ctx, session_key, assignment_id, verdict_kind, note \\ nil) do
     Assignments.__handle__(
       ctx.db,
       "attest",
       p3_call("attest", {:session, session_key}, %{
         assignment_id: assignment_id,
         kind: "verdict",
-        verdict_kind: verdict_kind
+        verdict_kind: verdict_kind,
+        note: note
       })
     )
   end
 
-  defp user_verdict(ctx, user, assignment_id, verdict_kind) do
+  defp user_verdict(ctx, user, assignment_id, verdict_kind, note \\ nil) do
     Assignments.__handle__(
       ctx.db,
       "attest",
       p3_call("attest", {:user, user}, %{
         assignment_id: assignment_id,
         kind: "verdict",
-        verdict_kind: verdict_kind
+        verdict_kind: verdict_kind,
+        note: note
       })
     )
+  end
+
+  defp review_count(db, producer_id) do
+    {:ok, [[count]]} =
+      DB.query(db, "SELECT count(*) FROM assignments WHERE reviewsAssignmentId = ?1", [
+        producer_id
+      ])
+
+    count
   end
 
   defp attach_work_item(ctx, assignment_id, work_item_id) do

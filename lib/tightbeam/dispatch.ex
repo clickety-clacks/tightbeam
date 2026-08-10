@@ -115,7 +115,7 @@ defmodule Tightbeam.Dispatch do
 
       {:remedy, statute, ref, error} ->
         outcome = RailRemedy.fire(db, handlers, statute, ref, call)
-        error = %{error | reason: "remedy_fired", producer: outcome.producer_id}
+        error = remedy_error(error, outcome)
         best_effort_denial(db, verb, origin, principal, session_key, error)
         {:error, error}
 
@@ -304,9 +304,19 @@ defmodule Tightbeam.Dispatch do
   defp gated_ref(call) do
     params = Map.fetch!(call, :params)
 
-    params[:assignment_id] || params[:work_item_id] || params["assignment_id"] ||
-      params["work_item_id"]
+    params[:assignment_id] || params["assignment_id"] || params[:reviews_assignment_id] ||
+      params["reviews_assignment_id"] || params[:work_item_id] || params["work_item_id"]
   end
+
+  defp remedy_error(error, %{denial: denial}) do
+    error
+    |> Map.merge(Map.take(denial, [:rule, :ref, :message]))
+    |> Map.put(:reason, "remedy_blocked")
+    |> Map.put(:producer, nil)
+  end
+
+  defp remedy_error(error, outcome),
+    do: %{error | reason: "remedy_fired", producer: outcome.producer_id}
 
   defp ruling_statute(db, ruling_id) do
     case DB.query(db, "SELECT statuteName FROM decision_requests WHERE id = ?1", [ruling_id]) do
