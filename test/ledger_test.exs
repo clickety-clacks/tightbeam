@@ -1,7 +1,7 @@
 defmodule Tightbeam.LedgerTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Ledger}
+  alias Tightbeam.{DB, Ledger, Projection}
 
   setup do
     name = :"db_#{System.unique_integer([:positive])}"
@@ -99,6 +99,82 @@ defmodule Tightbeam.LedgerTest do
     enqueue!(db, "k1", "next")
     {:ok, t2} = Ledger.claim_next(db, "k1", "lane")
     assert t2.prompt == "next"
+  end
+
+  test "ordered descriptors remain addressable through the turn's pinned durable message", %{
+    db: db
+  } do
+    attachments = [
+      %{"type" => "image", "mimeType" => "image/png", "data" => Base.encode64("png-a")},
+      %{"type" => "asset", "assetId" => "a_image", "mimeType" => "image/png", "size" => 5}
+    ]
+
+    assert {:ok, {:ok, seq}} =
+             DB.transaction(db, fn txn ->
+               {:appended, message} =
+                 Projection.append_in_txn(txn, %{
+                   session_key: "k1",
+                   role: "user",
+                   content: "inspect",
+                   attachments: attachments
+                 })
+
+               Ledger.enqueue_in_txn(txn, %{
+                 session_key: "k1",
+                 message_id: message.id,
+                 origin: "user:flynn",
+                 prompt: "inspect"
+               })
+             end)
+
+    assert {:ok, %{seq: ^seq, message_id: message_id}} = Ledger.claim_next(db, "k1", "lane")
+    assert {:ok, ^attachments} = Ledger.attachment_descriptors(db, message_id)
+  end
+
+  test "a file-backed restart cannot turn an attached queued turn into text-only work" do
+    path =
+      Path.join(
+        System.tmp_dir!(),
+        "tightbeam-ledger-attachments-#{System.unique_integer([:positive])}.sqlite3"
+      )
+
+    name = :"ledger_restart_#{System.unique_integer([:positive])}"
+    on_exit(fn -> File.rm(path) end)
+    {:ok, first_db} = DB.start_link(path: path, name: name)
+    :ok = Tightbeam.Schema.ensure_all(name)
+    create_test_sessions(name)
+
+    attachments = [
+      %{"type" => "image", "mimeType" => "image/png", "data" => Base.encode64("png-a")}
+    ]
+
+    assert {:ok, {:ok, seq}} =
+             DB.transaction(name, fn txn ->
+               {:appended, message} =
+                 Projection.append_in_txn(txn, %{
+                   session_key: "k1",
+                   role: "user",
+                   content: "inspect",
+                   attachments: attachments
+                 })
+
+               Ledger.enqueue_in_txn(txn, %{
+                 session_key: "k1",
+                 message_id: message.id,
+                 origin: "user:flynn",
+                 prompt: "inspect"
+               })
+             end)
+
+    GenServer.stop(first_db)
+    {:ok, second_db} = DB.start_link(path: path, name: name)
+
+    assert {:ok, %{seq: ^seq, prompt: "inspect", message_id: message_id}} =
+             Ledger.claim_next(name, "k1", "lane-after-restart")
+
+    assert {:ok, ^attachments} = Ledger.attachment_descriptors(name, message_id)
+
+    GenServer.stop(second_db)
   end
 
   # The stamp is the WHOLE identity, in fields. A context variant and a

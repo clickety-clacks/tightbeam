@@ -56,7 +56,7 @@ defmodule Tightbeam.Wire.Socket do
 
   @behaviour WebSock
 
-  alias Tightbeam.{ConnRegistry, DB, Devices, Dispatch, Org, Projection}
+  alias Tightbeam.{Assets, ConnRegistry, DB, Devices, Dispatch, Org, Projection}
   alias Tightbeam.Wire.Payloads
 
   @max_content_bytes 64 * 1024
@@ -423,34 +423,43 @@ defmodule Tightbeam.Wire.Socket do
         push(Payloads.wire_error("not_found", nil, id), state)
 
       true ->
-        call = %{
-          verb: "post",
-          origin: "user:#{state.user_id}",
-          session_key: session_key,
-          params: %{
-            content: content,
-            device_id: state.device_id,
-            client_message_id: id,
-            attachments: msg["attachments"] || []
-          }
-        }
+        case Assets.normalize_attachments(db(state), state.user_id, msg["attachments"] || []) do
+          {:ok, attachments} ->
+            call = %{
+              verb: "post",
+              origin: "user:#{state.user_id}",
+              session_key: session_key,
+              params: %{
+                content: content,
+                device_id: state.device_id,
+                client_message_id: id,
+                attachments: attachments
+              }
+            }
 
-        case Dispatch.dispatch(db(state), state.deps.handlers, call) do
-          {:ok, %{dedupe: dedupe}} when dedupe in [:conflict, "conflict"] ->
-            push(
-              Payloads.wire_error(
-                "invalid_message",
-                "clientMessageId reused with different content",
-                id
-              ),
-              state
-            )
+            case Dispatch.dispatch(db(state), state.deps.handlers, call) do
+              {:ok, %{dedupe: dedupe}} when dedupe in [:conflict, "conflict"] ->
+                push(
+                  Payloads.wire_error(
+                    "invalid_message",
+                    "clientMessageId reused with different payload",
+                    id
+                  ),
+                  state
+                )
 
-          {:ok, _result} ->
-            push(Payloads.ack(id), state)
+              {:ok, _result} ->
+                push(Payloads.ack(id), state)
+
+              {:error, error} ->
+                push(
+                  Payloads.wire_error(error[:code] || "server_error", error[:message], id),
+                  state
+                )
+            end
 
           {:error, error} ->
-            push(Payloads.wire_error(error[:code] || "server_error", error[:message], id), state)
+            push(Payloads.wire_error(error.code, error.message, id), state)
         end
     end
   end

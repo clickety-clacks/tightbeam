@@ -10,7 +10,7 @@ defmodule Tightbeam.Projection do
   older ever wrote a -1, and nothing older reads this table.
   """
 
-  alias Tightbeam.DB
+  alias Tightbeam.{Assets, DB}
   alias Tightbeam.DB.Txn
 
   @type db :: GenServer.server()
@@ -86,10 +86,10 @@ defmodule Tightbeam.Projection do
   @doc """
   Append a message, idempotently per client send. Dedupe scope is
   `(session_key, device_id, client_message_id)` — when both ids are present
-  and a row already exists: same content → `{:duplicate, msg}` (safe client
-  retry), different content → `{:conflict, msg}` (id reuse; caller rejects).
-  Otherwise inserts and returns `{:appended, msg}`. Runs in one transaction so
-  the check and insert are atomic.
+  and a row already exists: the same content and ordered validated attachment
+  union → `{:duplicate, msg}` (safe client retry); any payload difference →
+  `{:conflict, msg}` (id reuse; caller rejects). Otherwise inserts and returns
+  `{:appended, msg}`. Runs in one transaction so the check and insert are atomic.
   """
   @spec append(db(), map()) ::
           {:appended, message()} | {:duplicate, message()} | {:conflict, message()}
@@ -125,7 +125,7 @@ defmodule Tightbeam.Projection do
       [row] ->
         message = to_message(row)
 
-        if message.content == Map.fetch!(input, :content),
+        if same_client_payload?(message, input),
           do: {:duplicate, message},
           else: {:conflict, message}
 
@@ -310,6 +310,23 @@ defmodule Tightbeam.Projection do
       [id]
     )
   end
+
+  defp same_client_payload?(message, input) do
+    message.content == Map.fetch!(input, :content) and
+      same_attachments?(message.attachments, Map.get(input, :attachments, []))
+  end
+
+  defp same_attachments?(left, right) when length(left) == length(right) do
+    Enum.zip(left, right)
+    |> Enum.all?(fn {stored, candidate} ->
+      case {Assets.attachment_identity(stored), Assets.attachment_identity(candidate)} do
+        {{:ok, identity}, {:ok, identity}} -> true
+        _ -> false
+      end
+    end)
+  end
+
+  defp same_attachments?(_left, _right), do: false
 
   defp to_message([
          seq,

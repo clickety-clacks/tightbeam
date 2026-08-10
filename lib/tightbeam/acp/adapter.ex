@@ -54,6 +54,7 @@ defmodule Tightbeam.Acp.Adapter do
     :stderr_path,
     :on_auth_event,
     :on_subagent_event,
+    prompt_capabilities: %{},
     stderr_offset: 0,
     chunks: %{},
     progress: %{},
@@ -245,7 +246,9 @@ defmodule Tightbeam.Acp.Adapter do
   adjudication closure entirely — no hold, no cause, nothing to heal
   (cross-review F1; the spec names runtime failures an adapter-fault form).
   """
-  @spec prompt(adapter(), String.t(), String.t(), keyword()) ::
+  @type content_block :: map()
+
+  @spec prompt(adapter(), String.t(), String.t() | [content_block()], keyword()) ::
           {:ok,
            %{
              stop_reason: String.t(),
@@ -253,8 +256,13 @@ defmodule Tightbeam.Acp.Adapter do
              messages: [%{message_id: String.t() | nil, text: String.t()}]
            }}
           | {:error, term()}
-  def prompt(adapter, session_id, text, opts \\ []),
-    do: call(adapter, {:prompt, session_id, text, opts}, :infinity)
+  def prompt(adapter, session_id, content, opts \\ []),
+    do: call(adapter, {:prompt, session_id, content, opts}, :infinity)
+
+  @doc "The prompt capabilities retained from this adapter's initialize result."
+  @spec prompt_capabilities(adapter()) :: map() | {:error, {:adapter_unavailable, term()}}
+  def prompt_capabilities(adapter),
+    do: call(adapter, :prompt_capabilities, @boot_boundary_timeout)
 
   @doc """
   Map one ACP session/update to a typing-indicator status line, or :skip.
@@ -401,8 +409,11 @@ defmodule Tightbeam.Acp.Adapter do
            },
            timeout: :infinity
          ) do
-      {:ok, %{"protocolVersion" => 1}} ->
-        gate(opts, state)
+      {:ok, %{"protocolVersion" => 1} = initialize_result} ->
+        capabilities =
+          get_in(initialize_result, ["agentCapabilities", "promptCapabilities"]) || %{}
+
+        gate(opts, %{state | prompt_capabilities: capabilities})
 
       other ->
         {:stop, adapter_failure_reason({:initialize_failed, other}, stderr_path, offset), state}
@@ -561,11 +572,14 @@ defmodule Tightbeam.Acp.Adapter do
     end
   end
 
+  def handle_call(:prompt_capabilities, _from, state),
+    do: {:reply, state.prompt_capabilities, state}
+
   def handle_call({:forget_model_residency, sid}, _from, state),
     do: {:reply, :ok, drop_model_residency(state, sid)}
 
-  def handle_call({:prompt, sid, text, opts}, from, state) do
-    start_prompt(state, sid, text, opts, from)
+  def handle_call({:prompt, sid, content, opts}, from, state) do
+    start_prompt(state, sid, content, opts, from)
   end
 
   def handle_call(:conn, _from, state), do: {:reply, state.conn, state}
@@ -828,7 +842,16 @@ defmodule Tightbeam.Acp.Adapter do
     {:stop, :normal, state}
   end
 
-  defp start_prompt(state, sid, text, opts, from) do
+  defp start_prompt(state, sid, content, opts, from) do
+    with {:ok, blocks} <- prompt_blocks(content),
+         :ok <- attachment_capabilities(state, blocks) do
+      dispatch_prompt(state, sid, blocks, opts, from)
+    else
+      {:error, error} -> {:reply, {:error, error}, state}
+    end
+  end
+
+  defp dispatch_prompt(state, sid, blocks, opts, from) do
     state = put_in(state.chunks[sid], [])
     # Per-turn progress channel: {fun, last_status, seq}. Deduped on text so
     # per-token thought chunks emit ONE "Thinking…" until something changes.
@@ -850,7 +873,7 @@ defmodule Tightbeam.Acp.Adapter do
           Conn.request(
             state.conn,
             "session/prompt",
-            %{sessionId: sid, prompt: [%{type: "text", text: text}]},
+            %{sessionId: sid, prompt: blocks},
             timeout: :infinity,
             notify_dispatched: {parent, {:prompt_dispatched, dispatched}}
           )
@@ -869,6 +892,44 @@ defmodule Tightbeam.Acp.Adapter do
 
     {:noreply, state}
   end
+
+  defp prompt_blocks(text) when is_binary(text),
+    do: {:ok, [%{type: "text", text: text}]}
+
+  defp prompt_blocks(blocks) when is_list(blocks) and blocks != [], do: {:ok, blocks}
+
+  defp prompt_blocks(_content),
+    do: {:error, %{code: "invalid_prompt", message: "prompt content blocks are malformed"}}
+
+  defp attachment_capabilities(state, blocks) do
+    case Enum.find_value(blocks, &unsupported_attachment(state, &1)) do
+      nil ->
+        :ok
+
+      attachment_class ->
+        {:error,
+         %{
+           code: "unsupported_attachment",
+           attachment_class: attachment_class,
+           message: "#{attachment_class} attachments are unsupported by this adapter"
+         }}
+    end
+  end
+
+  defp unsupported_attachment(state, block) do
+    case block_type(block) do
+      "text" -> nil
+      "image" -> if capability?(state.prompt_capabilities, "image"), do: nil, else: "image"
+      type when is_binary(type) and type != "" -> type
+      _ -> "unknown"
+    end
+  end
+
+  defp block_type(block) when is_map(block), do: block[:type] || block["type"]
+  defp block_type(_block), do: nil
+
+  defp capability?(capabilities, "image"),
+    do: capabilities["image"] == true or capabilities[:image] == true
 
   @impl true
   def handle_info({:acp_notification, "account/updated", params}, state) do

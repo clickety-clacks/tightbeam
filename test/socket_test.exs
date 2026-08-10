@@ -3,6 +3,7 @@ defmodule Tightbeam.Wire.SocketTest do
   alias Tightbeam.Model
 
   alias Tightbeam.{
+    Assets,
     ConnRegistry,
     DB,
     Devices,
@@ -150,9 +151,99 @@ defmodule Tightbeam.Wire.SocketTest do
     assert JSON.decode!(conflict) == %{
              "type" => "error",
              "code" => "invalid_message",
-             "message" => "clientMessageId reused with different content",
+             "message" => "clientMessageId reused with different payload",
              "messageId" => "c_once"
            }
+
+    png =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Z2S8AAAAASUVORK5CYII="
+
+    asset =
+      Assets.put(
+        ctx.db,
+        config.base_dir,
+        device.user_id,
+        "IMAGE/PNG",
+        "fixture.png",
+        Base.decode64!(png)
+      )
+
+    attached =
+      Map.merge(message, %{
+        "id" => "c_attached",
+        "content" => "inspect",
+        "attachments" => [
+          %{
+            "type" => "image",
+            "mimeType" => " Image/PNG ",
+            "data" => String.trim_trailing(png, "=")
+          },
+          %{"type" => "asset", "assetId" => asset.asset_id}
+        ]
+      })
+
+    {:push, {:text, attached_ack}, live} =
+      Socket.handle_in({JSON.encode!(attached), opcode: :text}, live)
+
+    assert JSON.decode!(attached_ack) == %{"type" => "ack", "id" => "c_attached"}
+
+    {:push, {:text, attached_duplicate_ack}, live} =
+      Socket.handle_in({JSON.encode!(attached), opcode: :text}, live)
+
+    assert JSON.decode!(attached_duplicate_ack) == %{"type" => "ack", "id" => "c_attached"}
+
+    assert {:ok, [[encoded_attachments]]} =
+             DB.query(
+               ctx.db,
+               "SELECT attachments FROM messages WHERE clientMessageId='c_attached'"
+             )
+
+    assert JSON.decode!(encoded_attachments) == [
+             %{"type" => "image", "mimeType" => "image/png", "data" => png},
+             %{
+               "type" => "asset",
+               "assetId" => asset.asset_id,
+               "mimeType" => "image/png",
+               "filename" => "fixture.png",
+               "size" => byte_size(Base.decode64!(png))
+             }
+           ]
+
+    reordered = %{attached | "attachments" => Enum.reverse(attached["attachments"])}
+
+    {:push, {:text, attachment_conflict}, live} =
+      Socket.handle_in({JSON.encode!(reordered), opcode: :text}, live)
+
+    assert JSON.decode!(attachment_conflict) == %{
+             "type" => "error",
+             "code" => "invalid_message",
+             "message" => "clientMessageId reused with different payload",
+             "messageId" => "c_attached"
+           }
+
+    foreign = Assets.put(ctx.db, config.base_dir, "other", "image/png", "private.png", "bytes")
+
+    foreign_message = %{
+      attached
+      | "id" => "c_foreign_attachment",
+        "attachments" => [%{"type" => "asset", "assetId" => foreign.asset_id}]
+    }
+
+    {:push, {:text, foreign_error}, live} =
+      Socket.handle_in({JSON.encode!(foreign_message), opcode: :text}, live)
+
+    assert JSON.decode!(foreign_error) == %{
+             "type" => "error",
+             "code" => "invalid_message",
+             "message" => "attachment is unknown",
+             "messageId" => "c_foreign_attachment"
+           }
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM messages WHERE clientMessageId='c_foreign_attachment'"
+             )
 
     {:push, {:text, bad_prefix}, live} =
       Socket.handle_in(

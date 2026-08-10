@@ -271,6 +271,21 @@ defmodule Tightbeam.Ledger do
     result
   end
 
+  @doc """
+  Return the ordered attachment descriptors persisted with a claimed turn's
+  pinned message. A missing message is a durable-reference violation, not an
+  empty attachment list.
+  """
+  @spec attachment_descriptors(db(), String.t()) ::
+          {:ok, [map()]} | {:error, :message_not_found | term()}
+  def attachment_descriptors(db \\ Tightbeam.DB, message_id) do
+    case DB.query(db, "SELECT attachments FROM messages WHERE id = ?1", [message_id]) do
+      {:ok, [[attachments]]} -> {:ok, JSON.decode!(attachments)}
+      {:ok, []} -> {:error, :message_not_found}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
   # Nothing moved. Either the queue is empty, or it holds work whose session
   # cannot host a turn — the same read the claim UPDATE's EXISTS clause makes,
   # asked as a question instead of collapsed into a nil result.

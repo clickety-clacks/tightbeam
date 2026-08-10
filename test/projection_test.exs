@@ -61,6 +61,54 @@ defmodule Tightbeam.ProjectionTest do
     assert count == 1
   end
 
+  test "client dedupe compares the complete ordered validated attachment union", %{db: db} do
+    png_a =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Z2S8AAAAASUVORK5CYII="
+
+    png_b =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+
+    inline_a = %{"type" => "image", "mimeType" => "image/png", "data" => png_a}
+    inline_b = %{"type" => "image", "mimeType" => "image/png", "data" => png_b}
+    asset_a = %{"type" => "asset", "assetId" => "a_first"}
+    asset_b = %{"type" => "asset", "assetId" => "a_second"}
+
+    input = %{
+      session_key: "k1",
+      role: "user",
+      content: "inspect",
+      device_id: "d",
+      client_message_id: "c_attachments",
+      attachments: [inline_a, asset_a]
+    }
+
+    assert {:appended, first} = Projection.append(db, input)
+    assert {:duplicate, %{id: duplicate_id}} = Projection.append(db, input)
+    assert duplicate_id == first.id
+
+    equivalent_base64 =
+      put_in(input, [:attachments, Access.at(0), "data"], String.trim_trailing(png_a, "="))
+
+    assert {:duplicate, %{id: ^duplicate_id}} = Projection.append(db, equivalent_base64)
+
+    conflicts = [
+      %{input | attachments: [inline_b, asset_a]},
+      put_in(input, [:attachments, Access.at(0), "mimeType"], "image/jpeg"),
+      %{input | attachments: [asset_a, asset_a]},
+      %{input | attachments: [inline_a, asset_b]},
+      %{input | attachments: [inline_a]},
+      %{input | attachments: [asset_a, inline_a]},
+      %{input | content: "different"}
+    ]
+
+    for changed <- conflicts do
+      assert {:conflict, %{id: ^duplicate_id}} = Projection.append(db, changed)
+    end
+
+    assert Projection.get(db, first.id).attachments == [inline_a, asset_a]
+    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM messages")
+  end
+
   test "assistant reply correlation defaults llm-visible id to its own id", %{db: db} do
     {:appended, user} =
       Projection.append(db, %{
