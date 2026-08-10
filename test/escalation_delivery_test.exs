@@ -490,6 +490,10 @@ defmodule Tightbeam.EscalationDeliveryTest do
               "enqueue_notice/4"} => 1,
              {"lib/tightbeam/supervision.ex", "Gateway.deliver_prompt/4",
               "notify_stranded_ancestor/2"} => 1,
+             {"lib/tightbeam/supervision.ex", "Gateway.deliver_prompt_in_txn/5",
+              "migrate_one_legacy_transfer_in_txn/4"} => 1,
+             {"lib/tightbeam/supervision.ex", "Gateway.deliver_prompt_in_txn/5",
+              "recover_retired_target_in_txn/6"} => 1,
              {"lib/tightbeam/gateway.ex", "Gateway.notify_session/4", "remove_override_result/3"} =>
                1,
              {"lib/tightbeam/assignments.ex", "Gateway.deliver_prompt_in_txn/5",

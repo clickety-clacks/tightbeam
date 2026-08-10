@@ -59,8 +59,8 @@ defmodule Tightbeam.RailRemedyTest do
     handlers =
       Gateway.handlers(%{
         db: db,
+        wake_tick_ms: 1_000,
         credential_status: fn _provider -> :onboarded end,
-        credential_kind: fn _provider -> :subscription end,
         credential_kind: fn _provider -> :subscription end,
         patch_adapter: fn _harness, _path -> :ok end
       })
