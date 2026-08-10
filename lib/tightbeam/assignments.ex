@@ -314,7 +314,11 @@ defmodule Tightbeam.Assignments do
       DB.query(
         db,
         """
-        SELECT (
+        SELECT 'reviewed-clean'
+        FROM assignments AS r
+        WHERE r.reviewsAssignmentId = ?1
+          AND r.holderKey != ?2
+          AND (
           SELECT v.verdictKind
           FROM attests AS v
           WHERE v.assignmentId = r.id
@@ -322,10 +326,7 @@ defmodule Tightbeam.Assignments do
             AND v.bySession = r.holderKey
           ORDER BY v.ts DESC, v.rowid DESC
           LIMIT 1
-        )
-        FROM assignments AS r
-        WHERE r.reviewsAssignmentId = ?1
-          AND r.holderKey != ?2
+          ) = 'reviewed-clean'
         ORDER BY r.openedAt, r.id
         """,
         [assignment_id, assignment_holder_key]
