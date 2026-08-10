@@ -96,36 +96,52 @@ You own the outcome, so you verify it — but you verify against the criteria yo
 when you dispatched, not by re-driving how the agent got there. A different path to
 the same proven outcome is fine; a different outcome is not. A holder's "done" is a
 claim — the substrate itself scores a completion as `claims-done` until a verifying
-verdict lands — so verify from rows, never from a worker's self-report. Send every
-piece of work to an INDEPENDENT reviewer: ALWAYS a fresh session (the session that
-produced work never reviews it), on a DIFFERENT harness and model family than the
-producer, at a different thinking level — cross-harness, cross-family review is the
-load-bearing axis of independence. The reviewer's capability tier comes from the
-preferred-models review row, not from stepping up the producer's tier.
-The largest model is not the target and the top thinking levels overthink — judge by
-the findings. The substrate records which family filed each
-verdict; link the review to the work it reviews (`--reviews`, see feature-cycle) so
-that independence is a fact on the record, not a claim. Real proof of working behavior
-is the verification statute's papertrail: the holder verifies the way the repository's
-prose defines verification, records the results as a report artifact, and files the
-`verified` verdict — green tests and a clean review are not that proof, and the
-substrate blocks a completion that lacks the papertrail.
+verdict lands — so verify from rows, never from a worker's self-report.
+
+Classify the EFFECT before you commission review; never infer it from the holder's
+role. Exactly one linked independent `reviewed-clean` is required when a card changes
+code or source behavior; authoritative specs, policy, Kung Fu, or rails; a release
+artifact or promotion; or live runtime, configuration, or identity state. One card
+that carries several of those effects still gets one review, not one per effect.
+Review verdicts and review-card lifecycle, read-only recon or advice,
+status/accountability work, and coordination are evidence-only and get no review.
+Never stage a review of a review.
+
+For a review-required effect, choose the first qualified permitted candidate in the
+ordered code-review row of `preferred-models.md`. Try each candidate once. If a spawn
+or harness reports that candidate unavailable, advance one place to the right; never
+retry-loop. Send ambiguous qualification to your parent for an explicit adjudication.
+When the row is exhausted, have your parent record `work-blocked` over the affected
+session or surface the missing credential to the user. The reviewer is always a fresh
+session with the capability the effect requires. Same-model, same-provider, and
+same-harness sessions remain eligible; those differences are preferences and
+observability, not constitutional gates.
+
+Link the single review card to the work it reviews (`--reviews`, see feature-cycle).
+The review-card holder files the verdict. That exact link plus the different-session
+holder makes independence a fact on the record, not a claim. Real proof of working
+behavior is the verification statute's papertrail: the holder verifies the way the
+repository's prose defines verification, records the results as a report artifact,
+and files the `verified` verdict — green tests and a clean review are not that proof,
+and the substrate blocks a completion that lacks the papertrail.
 
 ## Closing the loop: the completion rail
-`completion-requires-review` now ENFORCES what the section above teaches: a producing card
-completes only on an independent CROSS-HARNESS `reviewed-clean` — a same-harness review no
-longer clears it, and if no cross-harness reviewer is reachable the completion BLOCKS
-(work-blocked) rather than passing. You MAY open your producer's reviewer card yourself;
-independence is the reviewer being a different SESSION and a different HARNESS than the
-producer — not who opened the card — so the old third-party-opener dance is gone.
+`completion-requires-review` backstops the evidence shape; it never chooses a model.
+A review-required card completes only when `assignment.independent_verdict_kinds`
+contains `reviewed-clean`: the verdict is on a card linked by `--reviews`, its holder
+filed it, and that holder is a different session from the work's author. Who opened
+the review card and which harness or provider ran it do not change that fact.
 
-A review or recon card is EXEMPT: it closes when its holder files its verdict, never by being
-re-reviewed — do not stage a review-of-the-review. Coordination cards with no reviewable
-artifact (orchestration, tracking, specimen, your own intake) are not yet self-completable:
-until the non-producing declaration ships, close a genuinely-done one by the two-row honest
-path — the holder files a `progress` attest recording delivered-not-withdrawn, then you (its
-opener) revoke the card. Never surrender delivered work as abandoned, and never revoke without
-the delivered row — both make the record lie.
+The substrate does not yet carry a typed review-required-effect marker. Until it
+does, inference performs the effect classification above. A review-linked card files
+its verdict and then its holder completes it; the rail exempts it. For unlinked
+evidence-only work, the holder files a `progress` attest recording
+delivered-not-withdrawn, then its opener revokes the card. Never surrender delivered
+work as abandoned, and never revoke without the delivered row — both make the record
+lie.
+
+Never activate guidance separately from its matching rule and conformance changes.
+Use the policy-activation sequence in the `feature-cycle` skill.
 
 ## You do not edit source
 If you find yourself editing code, stop: staff a coder-archetype session — it carries

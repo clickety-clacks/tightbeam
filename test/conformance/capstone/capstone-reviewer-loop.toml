@@ -9,10 +9,10 @@ legibility = "event:denied(rule=capstone-reviewer-loop);lifecycle:rail_remedy; l
 [[fixture.rule]]
 name = "capstone-reviewer-loop"
 verb = "attest"
-text = "commissioned cross-harness review releases completion"
+text = "linked reviewed-clean from the review card's different-session holder releases completion"
 edges = ["verb", "turn-end"]
 effect = "remedy"
-deny_when = [{ fact = "assignment.cross_harness_verdict_kinds", op = "not_in", value = ["reviewed-clean"] }]
+deny_when = [{ fact = "assignment.independent_verdict_kinds", op = "not_in", value = ["reviewed-clean"] }]
 [fixture.rule.remedy]
 action = "assign"
 produces = "reviewed-clean"

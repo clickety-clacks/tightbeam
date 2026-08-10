@@ -4,15 +4,15 @@ name = "re-tuned-after-filing"
 phase = "pending"
 blocking_phase = "P3"
 kind = "dispatch-rule"
-source = "p3 stamp-at-filing; review finding-14"
-legibility = "event:denied(rule=frozen-filing-harness)"
+source = "assignment.independent_verdict_kinds; review policy ringdown correction"
+legibility = "event:denied(rule=filing-provenance-independent)"
 
 [[fixture.rule]]
-name = "frozen-filing-harness"
+name = "filing-provenance-independent"
 verb = "attest"
 external_producer = true
-text = "completion needs a cross-harness verdict as stamped when filed"
+text = "completion needs a linked reviewed-clean verdict by the review card's different-session holder"
 deny_when = [
   { fact = "attest.kind", op = "eq", value = "completion" },
-  { fact = "assignment.cross_harness_verdict_kinds", op = "not_in", value = ["reviewed-clean"] },
+  { fact = "assignment.independent_verdict_kinds", op = "not_in", value = ["reviewed-clean"] },
 ]

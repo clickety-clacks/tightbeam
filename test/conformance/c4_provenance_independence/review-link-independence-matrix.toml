@@ -11,8 +11,8 @@ legibility = "event:denied(rule=coder-completion-needs-independent-review)"
 name = "coder-completion-needs-independent-review"
 verb = "attest"
 external_producer = true
-text = "completion needs a reviewed-clean verdict from a commissioned cross-harness reviewer"
+text = "completion needs a linked reviewed-clean verdict by the review card's different-session holder"
 deny_when = [
   { fact = "attest.kind", op = "eq", value = "completion" },
-  { fact = "assignment.cross_harness_verdict_kinds", op = "not_in", value = ["reviewed-clean"] },
+  { fact = "assignment.independent_verdict_kinds", op = "not_in", value = ["reviewed-clean"] },
 ]
