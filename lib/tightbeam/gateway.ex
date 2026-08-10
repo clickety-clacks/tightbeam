@@ -2018,19 +2018,97 @@ defmodule Tightbeam.Gateway do
                 end
 
               EventLog.lifecycle_in_txn(txn, "harness_turn_error", turn.session_key, detail)
+
+              assignment_process_failure_notice_in_txn(
+                txn,
+                turn.seq,
+                failed_stage,
+                raw_reason
+              )
             end
 
             {:error,
              %{
                reason: reason,
                terminal_publish: failure_publish,
-               record_in_txn: record_in_txn
+               record_in_txn: record_in_txn,
+               after_commit: fn notice ->
+                 EventLog.complete_notice(notice,
+                   conn_registry: Map.get(config, :conn_registry, ConnRegistry)
+                 )
+               end
              }}
         end
 
       outcome
     end
   end
+
+  defp assignment_process_failure_notice_in_txn(txn, turn_seq, failed_stage, raw_reason) do
+    with %{code: code, message: message, reported_at_layer: layer} <-
+           safe_process_failure(failed_stage, raw_reason),
+         [[assignment_id, owner_user_id]] <-
+           Txn.q(
+             txn,
+             """
+             SELECT t.assignmentId, COALESCE(w.ownerUserId, s.ownerUserId)
+             FROM turns t
+             JOIN assignments a ON a.id = t.assignmentId
+             JOIN sessions s ON s.sessionKey = a.holderKey
+             LEFT JOIN work_items w ON w.id = a.workItemId
+             WHERE t.seq = ?1
+             """,
+             [turn_seq]
+           ) do
+      detail =
+        JSON.encode!(%{
+          schemaVersion: 1,
+          turnSeq: turn_seq,
+          actionNeeded: true,
+          reportedAtLayer: layer,
+          causeSpecificity: "concrete",
+          safeCause: %{code: code, message: message}
+        })
+
+      EventLog.notice_in_txn(
+        txn,
+        "assignment_process_failure",
+        assignment_id,
+        detail,
+        audience: {:ambient, owner_user_id},
+        message: "[assignment action needed]\n\nReview assignment #{assignment_id}: #{message}.",
+        attention: :high
+      )
+    else
+      _ -> nil
+    end
+  end
+
+  defp safe_process_failure(:prompt, reason) when is_map(reason) do
+    data = map_get_any(reason, ["data", :data])
+
+    cond do
+      is_map(data) and
+          map_get_any(data, ["codexErrorInfo", :codexErrorInfo]) == "usageLimitExceeded" ->
+        %{
+          code: "codex_usage_limit",
+          message: "Codex usage limit reached",
+          reported_at_layer: "acp"
+        }
+
+      is_map(data) and map_get_any(data, ["errorKind", :errorKind]) == "rate_limit" ->
+        %{
+          code: "claude_rate_limit",
+          message: "Claude rate limit reached",
+          reported_at_layer: "acp"
+        }
+
+      true ->
+        nil
+    end
+  end
+
+  defp safe_process_failure(_failed_stage, _reason), do: nil
 
   # The adapter groups chunks by ACP's public messageId. Commit the whole set
   # before publishing any row so a crash cannot expose half of one turn's
