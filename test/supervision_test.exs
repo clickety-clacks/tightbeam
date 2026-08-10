@@ -688,6 +688,41 @@ defmodule Tightbeam.SupervisionTest do
              DB.query(ctx.db, "SELECT 1 FROM supervision_entitlements WHERE assignmentId='asg_1'")
   end
 
+  test "startup uses the newest valid parent transfer when history has earlier transfers", ctx do
+    first_terminal_seq = terminal!(ctx.db, "holder")
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
+
+    assert {:escalated, 1, "supervisor"} =
+             Supervision.evaluate(ctx.db, ctx.handlers, 0, "holder", first_terminal_seq)
+
+    assert [first_wake] = Wakes.list_pending(ctx.db)
+    assert :appended = admit_supervision_wake!(ctx.db, first_wake)
+
+    second_terminal_seq = terminal!(ctx.db, "holder")
+    insert_entitlement!(ctx.db, "asg_1", generation: 2, due_at: 0)
+
+    assert {:escalated, 2, main_session_key} =
+             Supervision.evaluate(ctx.db, ctx.handlers, 0, "holder", second_terminal_seq)
+
+    assert main_session_key == ctx.main.session_key
+
+    assert [second_wake] = Wakes.list_pending(ctx.db)
+    assert :appended = admit_supervision_wake!(ctx.db, second_wake)
+
+    name = start_liveness!(ctx, sweep_ms: 60_000)
+
+    assert is_pid(Process.whereis(name))
+
+    assert %{
+             supervisionState: "parent_elevated",
+             supervisionTransferWakeId: transfer_wake,
+             supervisionTransferSessionKey: ^main_session_key
+           } = Supervision.prod_state(ctx.db, "asg_1")
+
+    assert transfer_wake == second_wake.wake_id
+    refute transfer_wake == first_wake.wake_id
+  end
+
   test "startup migrates one legacy retired parent transfer to Main exactly once", ctx do
     {:ok, _} =
       DB.query(

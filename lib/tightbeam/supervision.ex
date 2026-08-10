@@ -2845,11 +2845,15 @@ defmodule Tightbeam.Supervision do
       [] ->
         :none
 
-      [candidate] ->
-        validate_transfer(db_or_txn, assignment_id, candidate)
-
-      _many ->
-        {:error, :ambiguous_parent_transfer}
+      _ ->
+        candidates
+        |> Enum.reverse()
+        |> Enum.reduce_while({:error, :invalid_parent_transfer}, fn candidate, _result ->
+          case validate_transfer(db_or_txn, assignment_id, candidate) do
+            {:ok, transfer} -> {:halt, {:ok, transfer}}
+            {:error, :invalid_parent_transfer} -> {:cont, {:error, :invalid_parent_transfer}}
+          end
+        end)
     end
   end
 
