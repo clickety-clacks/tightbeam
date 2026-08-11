@@ -352,6 +352,22 @@ defmodule Tightbeam.CliIntegrationTest do
         "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('other', 0, 1)"
       )
 
+    other_main_key = Org.personal_session_key("other")
+
+    Org.create(ctx.db, %{
+      session_key: other_main_key,
+      display_name: "Other Main",
+      kind: "main",
+      is_built_in: true,
+      owner_user_id: "other",
+      origin: "user:other",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("fable")
+    })
+
     other =
       Org.create(ctx.db, %{
         session_key: "cli-other",

@@ -618,12 +618,28 @@ defmodule Tightbeam.GatewayTest do
         model: nil
       })
 
+    main_key = Org.personal_session_key("flynn")
+
     Org.create(db, %{
-      session_key: "k1",
+      session_key: main_key,
       display_name: "Main",
+      kind: "main",
+      is_built_in: true,
       owner_user_id: "flynn",
       origin: "user:flynn",
-      operational_parent: "k1",
+      archetype: "default",
+      host: "mainhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("fable")
+    })
+
+    Org.create(db, %{
+      session_key: "k1",
+      display_name: "Test session",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      operational_parent: main_key,
       archetype: "default",
       host: "testhost",
       harness: "claude",
@@ -640,7 +656,14 @@ defmodule Tightbeam.GatewayTest do
         subscriptions: MapSet.new(["chat"])
       })
 
-    %{db: db, registry: registry, lane: lane, catalog_base: catalog_base, device: device}
+    %{
+      db: db,
+      registry: registry,
+      lane: lane,
+      catalog_base: catalog_base,
+      device: device,
+      main_key: main_key
+    }
   end
 
   test "assignment handlers inject the configured supervision interval before mutation", ctx do
@@ -700,20 +723,6 @@ defmodule Tightbeam.GatewayTest do
   end
 
   test "retire refuses built-in mains — the fallback target is permanent", ctx do
-    Org.create(ctx.db, %{
-      session_key: Org.personal_session_key("flynn"),
-      display_name: "Main",
-      kind: "main",
-      is_built_in: true,
-      owner_user_id: "flynn",
-      origin: "user:flynn",
-      archetype: "default",
-      host: "testhost",
-      harness: "claude",
-      provider: "anthropic",
-      model: Model.new("fable")
-    })
-
     handlers =
       Gateway.handlers(%{
         db: ctx.db,
@@ -726,12 +735,12 @@ defmodule Tightbeam.GatewayTest do
     assert %{code: "denied", message: message} =
              handlers["retire"].(%{
                origin: "user:flynn",
-               session_key: Org.personal_session_key("flynn"),
+               session_key: ctx.main_key,
                params: %{}
              })
 
     assert message =~ "permanent"
-    assert Org.get(ctx.db, Org.personal_session_key("flynn")).state == "active"
+    assert Org.get(ctx.db, ctx.main_key).state == "active"
   end
 
   test "admin operator handler lists durable harness launches", ctx do
@@ -1384,7 +1393,9 @@ defmodule Tightbeam.GatewayTest do
         params: %{}
       })
 
-    assert [%{created_at: created_at}] = inspect.sessions
+    assert %{created_at: created_at} =
+             Enum.find(inspect.sessions, &(&1.session_key == session.session_key))
+
     assert created_at == session.created_at
 
     projections = [
@@ -2063,7 +2074,7 @@ defmodule Tightbeam.GatewayTest do
     spawn =
       base_dir
       |> gateway_config(ctx.db, 0)
-      |> Map.put(:max_live_sessions_per_user, 2)
+      |> Map.put(:max_live_sessions_per_user, 3)
       |> Map.put(:credential_status, fn _provider ->
         send(parent, {:past_cap_precheck, self()})
 
@@ -2109,7 +2120,7 @@ defmodule Tightbeam.GatewayTest do
              "spawn-cap-race-#{rejected_index}"
            ) == nil
 
-    assert length(Org.list_for_user(ctx.db, "flynn", false)) == 2
+    assert length(Org.list_for_user(ctx.db, "flynn", false)) == 3
   end
 
   test "spawn serves a populated stale catalog while preserving its health", ctx do

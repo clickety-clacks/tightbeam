@@ -37,6 +37,8 @@ defmodule Tightbeam.AssignmentsTest do
         "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('admin', 1, 1), ('flynn', 0, 1), ('other', 0, 1)"
       )
 
+    Enum.each(~w(admin flynn other), &ensure_main_session(db, &1))
+
     holder = session(db, "holder", "flynn")
     other = session(db, "other-session", "other")
     gateway_config = %{db: db, wake_tick_ms: 1_000}

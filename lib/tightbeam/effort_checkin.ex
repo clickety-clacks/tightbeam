@@ -1065,38 +1065,73 @@ defmodule Tightbeam.EffortCheckin do
     })
   end
 
+  defp escalate_parent_in_txn(_txn, _config, _generation, _evidence, %{kind: "main"}, _baseline),
+    do: nil
+
   defp escalate_parent_in_txn(txn, config, generation, evidence, session, baseline) do
     chain = active_operational_chain!(txn, session)
-    target = Enum.at(chain, generation.agent_prodded - 1) || List.last(chain)
-    target_session = session_in_txn(txn, target)
+    visited = parent_targets_in_streak(txn, generation)
 
-    Wakes.schedule_in_txn(txn, %{
-      session_key: target,
-      origin: @origin,
-      prompt:
-        "[effort escalation] Child session #{generation.holder_key} remains inactive on " <>
-          "assignment #{generation.assignment_id} after its prod: " <>
-          channel_sentence(evidence) <>
-          " Act through your ordinary session powers. Main is the terminal agent rung; " <>
-          "only Main may ask its operator for a real decision.",
-      due_at: now(),
-      assignment_id: generation.assignment_id
-    })
+    case Enum.find(chain, &(not MapSet.member?(visited, &1))) do
+      nil ->
+        nil
 
-    if target_session.kind == "main" do
-      nil
-    else
-      insert_generation(
-        txn,
-        config,
-        generation.assignment_id,
-        session,
-        generation.root,
-        baseline,
-        generation.generation + 1,
-        generation.multiplier,
-        generation.agent_prodded + 1
+      target ->
+        target_session = session_in_txn(txn, target)
+
+        Wakes.schedule_in_txn(txn, %{
+          session_key: target,
+          origin: @origin,
+          prompt:
+            "[effort escalation] Child session #{generation.holder_key} remains inactive on " <>
+              "assignment #{generation.assignment_id} after its prod: " <>
+              channel_sentence(evidence) <>
+              " Act through your ordinary session powers. Main is the terminal agent rung; " <>
+              "only Main may ask its operator for a real decision.",
+          due_at: now(),
+          assignment_id: generation.assignment_id
+        })
+
+        if target_session.kind == "main" do
+          nil
+        else
+          insert_generation(
+            txn,
+            config,
+            generation.assignment_id,
+            session,
+            generation.root,
+            baseline,
+            generation.generation + 1,
+            generation.multiplier,
+            generation.agent_prodded + 1
+          )
+        end
+    end
+  end
+
+  # The count brackets the current silent streak; the wake rows preserve the
+  # identities already notified in it. Re-reading the live chain and choosing
+  # its first unvisited member makes a concurrent reparent observable here.
+  defp parent_targets_in_streak(txn, generation) do
+    count = generation.agent_prodded - 1
+
+    if count > 0 do
+      txn
+      |> Txn.q(
+        """
+        SELECT sessionKey
+        FROM wakes
+        WHERE assignmentId=?1 AND prompt LIKE '[effort escalation]%'
+        ORDER BY rowid DESC
+        LIMIT ?2
+        """,
+        [generation.assignment_id, count]
       )
+      |> Enum.map(fn [session_key] -> session_key end)
+      |> MapSet.new()
+    else
+      MapSet.new()
     end
   end
 
