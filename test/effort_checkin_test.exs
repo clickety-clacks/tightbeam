@@ -9,7 +9,6 @@ defmodule Tightbeam.EffortCheckinTest do
     ConnRegistry,
     DB,
     EffortCheckin,
-    Escalation,
     Gateway,
     Ledger,
     Org,
@@ -56,6 +55,15 @@ defmodule Tightbeam.EffortCheckinTest do
       )
 
     host = Placement.local_host_name()
+    main_key = Org.personal_session_key("h1")
+
+    main =
+      session(db, main_key, "h1", host, %{
+        kind: "main",
+        is_built_in: true,
+        operational_parent: main_key
+      })
+
     parent = session(db, "parent", "h1", host)
     holder = session(db, "holder", "h2", host, %{spawned_by: "parent"})
     # The extra keys are what `Gateway.children_after_preflight/1` reads: the
@@ -78,7 +86,15 @@ defmodule Tightbeam.EffortCheckinTest do
     root = Placement.workdir_path(config, holder)
     init_workspace(root)
 
-    %{db: db, base_dir: base_dir, config: config, parent: parent, holder: holder, root: root}
+    %{
+      db: db,
+      base_dir: base_dir,
+      config: config,
+      main: main,
+      parent: parent,
+      holder: holder,
+      root: root
+    }
   end
 
   test "proof 1: dispatch arms one bracket; bare assign does not; roots validate; all closes cancel",
@@ -116,24 +132,12 @@ defmodule Tightbeam.EffortCheckinTest do
 
     for kind <- ["completion", "surrender"] do
       item = dispatch(ctx, {:session, "parent"}, "holder", kind)
-      open = escalate(ctx, item.id)
       assignment(ctx, "attest", {:session, "holder"}, nil, %{assignment_id: item.id, kind: kind})
       assert bracket_state(ctx.db, item.id) == "canceled"
-      assert request(ctx.db, open.id).status == "superseded"
-      assert Wakes.get(ctx.db, open.deadline_wake_id).state == "canceled"
 
-      assert %{
-               requester: "tightbeam:assignments",
-               reason: "obligation_disposed",
-               source_kind: "assignment_transition",
-               source_id: source_assignment_id,
-               outcome: "disposition",
-               disposition_kind: "assignment_transition",
-               disposition_id: disposition_assignment_id
-             } = cancellation(ctx.db, open.deadline_wake_id)
-
-      assert source_assignment_id == item.id
-      assert disposition_assignment_id == item.id
+      assert rows(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE assignmentId=?1", [
+               item.id
+             ]) == [[0]]
     end
 
     revoked = dispatch(ctx, {:session, "parent"}, "holder", "revoked")
@@ -145,10 +149,10 @@ defmodule Tightbeam.EffortCheckinTest do
     assert bracket_state(ctx.db, revoked.id) == "canceled"
 
     retired = dispatch(ctx, {:session, "parent"}, "holder", "retired")
-    retired_open = escalate(ctx, retired.id)
+    fire_probe(ctx, retired.id)
     generation_state_before_refusal = bracket_state(ctx.db, retired.id)
 
-    assert generation_state_before_refusal == "probed"
+    assert generation_state_before_refusal == "armed"
 
     assert {:error,
             %ArgumentError{message: "retirement interruption requires a durable principal"}} =
@@ -158,8 +162,6 @@ defmodule Tightbeam.EffortCheckinTest do
 
     assert rows(ctx.db, "SELECT state FROM assignments WHERE id=?1", [retired.id]) == [["open"]]
     assert bracket_state(ctx.db, retired.id) == generation_state_before_refusal
-    assert request(ctx.db, retired_open.id).status == "open"
-    assert Wakes.get(ctx.db, retired_open.deadline_wake_id).state == "pending"
 
     {:ok, _} =
       DB.transaction(ctx.db, fn txn ->
@@ -167,21 +169,6 @@ defmodule Tightbeam.EffortCheckinTest do
       end)
 
     assert bracket_state(ctx.db, retired.id) == "canceled"
-    assert request(ctx.db, retired_open.id).status == "superseded"
-    assert Wakes.get(ctx.db, retired_open.deadline_wake_id).state == "canceled"
-
-    assert %{
-             requester: "tightbeam:retirement",
-             reason: "obligation_disposed",
-             source_kind: "assignment_transition",
-             source_id: retired_source_id,
-             outcome: "disposition",
-             disposition_kind: "assignment_transition",
-             disposition_id: retired_disposition_id
-           } = cancellation(ctx.db, retired_open.deadline_wake_id)
-
-    assert retired_source_id == retired.id
-    assert retired_disposition_id == retired.id
   end
 
   test "acceptance 4 and 5: writes are detected with no git anywhere; a stall is not effect",
@@ -252,39 +239,25 @@ defmodule Tightbeam.EffortCheckinTest do
     assert [stall_prod] = Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == stalled.id))
     assert stall_prod.prompt =~ "3 turns taken"
 
-    request = fire_probe(ctx, stalled.id)
-    assert request.context["outcome"] == "zero_effect"
-
-    assert request.context["channels"] == %{
-             "writes" => "none",
-             "artifacts" => 0,
-             "attests" => 0,
-             "workItems" => 0
-           }
-
-    assert request.context["actions"] == [
-             "wake",
-             "continue",
-             "dismiss",
-             "revoke-assignment",
-             "dispatch"
-           ]
+    fire_probe(ctx, stalled.id)
+    assert [parent_escalation] = escalation_wakes(ctx.db, stalled.id)
+    assert parent_escalation.session_key == "parent"
+    assert parent_escalation.prompt =~ "no writes, artifacts, attests, or work-item updates"
 
     # A replayed probe of an already-probed generation is inert.
     assert :ok = EffortCheckin.probe(ctx.db, ctx.config, wake)
 
     assert rows(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE assignmentId=?1", [
              stalled.id
-           ]) == [[1]]
+           ]) == [[0]]
 
     # An absent workspace is stated as a fact on the channel it belongs to, not
     # raised as its own alarm.
     missing = dispatch(ctx, {:session, "parent"}, "holder", "missing")
     File.rm_rf!(ctx.root)
-    request = escalate(ctx, missing.id)
-    assert request.context["outcome"] == "zero_effect"
-    assert request.context["channels"]["writes"] == "unobservable"
-    assert request.question =~ "workspace writes: unobservable"
+    parent_escalation = escalate(ctx, missing.id)
+    assert parent_escalation.session_key == "parent"
+    assert parent_escalation.prompt =~ "workspace #{ctx.root}: unobservable"
   end
 
   test "proof 4: internal wakes create no turn and stay out of pending/inspection", ctx do
@@ -305,10 +278,7 @@ defmodule Tightbeam.EffortCheckinTest do
     assert after_count == before
   end
 
-  test "job-linked initial and deadline effort notifications stamp assignment and job", ctx do
-    personal_key = Org.personal_session_key("h1")
-    session(ctx.db, personal_key, "h1", Placement.local_host_name())
-
+  test "job-linked holder and parent notifications stamp assignment and job", ctx do
     item =
       WorkItems.__handle__(ctx.db, "work-item-create", %{
         verb: "work-item-create",
@@ -325,30 +295,33 @@ defmodule Tightbeam.EffortCheckinTest do
         work_item_id: item.id
       })
 
-    request = escalate(ctx, assignment.id)
-    first_deadline = request.deadline_wake_id
-    :ok = EffortCheckin.deadline(ctx.db, ctx.config, Wakes.get(ctx.db, first_deadline))
+    assert %{session_key: "parent"} = escalate(ctx, assignment.id)
+    assert nil == fire_probe(ctx, assignment.id)
 
-    # `assignmentId` on the notification wake is the carrier that replaced the
-    # deleted explicit `assignment_id`/`job_ref` delivery opts.
-    assert [assignment.id, assignment.id] ==
+    # `assignmentId` on each prompt wake carries the work attribution through
+    # the holder prod, the immediate parent, and terminal Main.
+    assert [assignment.id, assignment.id, assignment.id] ==
              Enum.map(notification_wakes(ctx.db), & &1.assignment_id)
+
+    assert Enum.map(escalation_wakes(ctx.db, assignment.id), & &1.session_key) == [
+             "parent",
+             ctx.main.session_key
+           ]
+
+    assert no_effort_requests?(ctx.db, assignment.id)
 
     drain_notifications!(ctx)
 
     # Delivery derives the SAME attribution through `wake_attribution/2` — for
-    # the agent prod that opened the bracket's first rung as well as for the two
-    # owner notifications.
-    assert rows(
-             ctx.db,
-             """
-             SELECT assignmentId, jobRef
-             FROM turns
-             WHERE prompt LIKE '%effort check-in%'
-             ORDER BY seq
-             """,
-             []
-           ) == [
+    # the agent prod and both operational-parent rungs.
+    assert Enum.map(notification_wakes(ctx.db), fn wake ->
+             [attribution] =
+               rows(ctx.db, "SELECT assignmentId,jobRef FROM turns WHERE wakeId=?1", [
+                 wake.wake_id
+               ])
+
+             attribution
+           end) == [
              [assignment.id, item.id],
              [assignment.id, item.id],
              [assignment.id, item.id]
@@ -409,263 +382,81 @@ defmodule Tightbeam.EffortCheckinTest do
     assert prods(ctx.db, "holder") == []
   end
 
-  test "proofs 5 and 8b: continue doubles/caps, effect resets, dismiss refreshes, close supersedes",
-       ctx do
-    item = dispatch(ctx, {:session, "parent"}, "holder", "rulings")
-    first = escalate(ctx, item.id)
+  test "proofs 5 and 8b: effect resets the parent rung and Main terminates escalation", ctx do
+    item = dispatch(ctx, {:session, "parent"}, "holder", "parent ladder")
 
-    assert %{status: "ruled", decision: "continue"} =
-             EffortCheckin.rule(
+    assert %{session_key: "parent"} = escalate(ctx, item.id)
+
+    assert [[3, 1, "armed", 2]] =
+             rows(
                ctx.db,
-               ctx.config,
-               effort_call(first.id, "continue", {:session, "parent"})
+               "SELECT generation,multiplier,state,agentProdded FROM effort_checkin_generations WHERE assignmentId=?1 ORDER BY generation DESC LIMIT 1",
+               [item.id]
              )
 
-    assert %{
-             requester: "tightbeam:effort-checkin",
-             reason: "obligation_disposed",
-             source_kind: "decision_request",
-             source_id: first_source_id,
-             outcome: "disposition",
-             disposition_kind: "decision_request_transition",
-             disposition_id: first_disposition_id,
-             liveness_kind: "supervision_entitlement",
-             liveness_id: first_liveness_id,
-             action_needed: 1
-           } = cancellation(ctx.db, first.deadline_wake_id)
-
-    assert first_source_id == first.id
-    assert first_disposition_id == first.id
-    assert first_liveness_id == "#{item.id}#1"
-
-    # The agent was prodded once at the top of this silent streak; every later
-    # bracket in the same streak goes straight to the owner.
-    assert current_multiplier(ctx.db, item.id) == 2
-    second = fire_probe(ctx, item.id)
-
-    EffortCheckin.rule(
-      ctx.db,
-      ctx.config,
-      effort_call(second.id, "continue", {:session, "parent"})
-    )
-
-    assert current_multiplier(ctx.db, item.id) == 4
-    third = fire_probe(ctx, item.id)
-
-    EffortCheckin.rule(
-      ctx.db,
-      ctx.config,
-      effort_call(third.id, "continue", {:session, "parent"})
-    )
-
-    assert current_multiplier(ctx.db, item.id) == 4
-
-    # Effect resets the backoff AND the prod rung: a working agent that goes
-    # quiet again is prodded before its owner is asked anything.
+    # Any real effect resets the streak, including its parent-ladder position.
     File.write!(Path.join(ctx.root, "src/tracked.txt"), "reset\n")
     assert nil == fire_probe(ctx, item.id)
-    assert current_multiplier(ctx.db, item.id) == 1
+    assert silent_rearm(ctx.db, item.id, 4)
 
-    later = escalate(ctx, item.id)
-    assert later.id != first.id
+    assert %{session_key: "parent"} = escalate(ctx, item.id)
+    assert nil == fire_probe(ctx, item.id)
 
-    File.write!(Path.join(ctx.root, "src/tracked.txt"), "changed before dismiss\n")
-    EffortCheckin.rule(ctx.db, ctx.config, effort_call(later.id, "dismiss", {:session, "parent"}))
-    assert current_multiplier(ctx.db, item.id) == 1
-    assert Wakes.get(ctx.db, later.deadline_wake_id).state == "canceled"
-
-    open = escalate(ctx, item.id)
-    assignment(ctx, "revoke-assignment", {:session, "parent"}, nil, %{assignment_id: item.id})
-    assert request(ctx.db, open.id).status == "superseded"
-    assert Wakes.get(ctx.db, open.deadline_wake_id).state == "canceled"
-
-    first_sibling = dispatch(ctx, {:session, "parent"}, "holder", "holder reset A")
-    second_sibling = dispatch(ctx, {:session, "parent"}, "holder", "holder reset B")
-    first_request = escalate(ctx, first_sibling.id)
-    second_request = escalate(ctx, second_sibling.id)
-
-    assert %{status: "ruled", decision: "dismiss"} =
-             EffortCheckin.rule(
-               ctx.db,
-               ctx.config,
-               effort_call(first_request.id, "dismiss", {:session, "parent"})
-             )
-
-    assert request(ctx.db, second_request.id).status == "superseded"
-    assert Wakes.get(ctx.db, second_request.deadline_wake_id).state == "canceled"
-    assert bracket_state(ctx.db, first_sibling.id) == "armed"
-    assert bracket_state(ctx.db, second_sibling.id) == "armed"
-  end
-
-  test "proofs 6, 11, 12, 13: expecter authority, self/user routing, deadlines and exact menu",
-       ctx do
-    item = dispatch(ctx, {:session, "parent"}, "holder", "session opener")
-    request = escalate(ctx, item.id)
-
-    assert request.expecter_session_key == "parent"
-
-    assert %{code: "not_authorized"} =
-             EffortCheckin.rule(
-               ctx.db,
-               ctx.config,
-               effort_call(request.id, "continue", {:session, "holder"})
-             )
-
-    assert %{code: "not_authorized"} =
-             EffortCheckin.rule(
-               ctx.db,
-               ctx.config,
-               %{effort_call(request.id, "continue", {:session, "parent"}) | principal: nil}
-             )
-
-    assert %{status: "ruled"} =
-             EffortCheckin.rule(
-               ctx.db,
-               ctx.config,
-               effort_call(request.id, "continue", {:session, "parent"})
-             )
-
-    assert %{code: "invalid"} =
-             Escalation.withdraw(ctx.db, %{
-               origin: "process:tightbeam",
-               principal: nil,
-               params: %{request_id: request.id, reason: "generic path"}
-             })
-
-    self = dispatch(ctx, {:session, "holder"}, "holder", "self")
-    self_request = escalate(ctx, self.id)
-    assert self_request.expecter_session_key == "parent"
-
-    retired_parent =
-      session(ctx.db, "retired-parent", "h1", Placement.local_host_name(), %{
-        spawned_by: "parent"
-      })
-
-    :ok =
-      DB.execute(
-        ctx.db,
-        "UPDATE sessions SET state='retired' WHERE sessionKey='retired-parent'"
-      )
-
-    retired_opener =
-      dispatch(ctx, {:session, retired_parent.session_key}, "holder", "retired opener")
-
-    retired_request = escalate(ctx, retired_opener.id)
-    assert retired_request.expecter_session_key == "parent"
-
-    user_item = dispatch(ctx, {:user, "h1"}, "holder", "user")
-    user_request = escalate(ctx, user_item.id)
-    assert user_request.expecter_user_id == "h1"
-
-    assert Enum.any?(
-             Escalation.list(
-               ctx.db,
-               %{principal: {:user, "h1"}, origin: "user:h1", params: %{}}
-             ),
-             &(&1.id == user_request.id)
-           )
-
-    old_deadline = user_request.deadline_wake_id
-    EffortCheckin.deadline(ctx.db, ctx.config, Wakes.get(ctx.db, old_deadline))
-    advanced = request(ctx.db, user_request.id)
-    assert advanced.expecter_user_id == "h1"
-    assert advanced.lineage_rung == user_request.lineage_rung
-    assert advanced.deadline_wake_id != old_deadline
-    EffortCheckin.deadline(ctx.db, ctx.config, Wakes.get(ctx.db, old_deadline))
-    assert request(ctx.db, user_request.id).deadline_wake_id == advanced.deadline_wake_id
-
-    assert %{status: "ruled"} =
-             EffortCheckin.rule(
-               ctx.db,
-               ctx.config,
-               effort_call(user_request.id, "dismiss", {:user, "h1"})
-             )
-
-    mid =
-      session(ctx.db, "mid", "h1", Placement.local_host_name(), %{spawned_by: "parent"})
-
-    chained = dispatch(ctx, {:session, mid.session_key}, "holder", "chain")
-    chained_request = escalate(ctx, chained.id)
-    assert chained_request.expecter_session_key == "mid"
-    assert Wakes.get(ctx.db, chained_request.deadline_wake_id).state == "pending"
-
-    EffortCheckin.deadline(
-      ctx.db,
-      ctx.config,
-      Wakes.get(ctx.db, chained_request.deadline_wake_id)
-    )
-
-    parent_rung = request(ctx.db, chained_request.id)
-    assert parent_rung.expecter_session_key == "parent"
-    assert Wakes.get(ctx.db, parent_rung.deadline_wake_id).state == "pending"
-
-    assert %{code: "not_authorized"} =
-             EffortCheckin.rule(
-               ctx.db,
-               ctx.config,
-               effort_call(parent_rung.id, "dismiss", {:session, "mid"})
-             )
-
-    assert %{status: "ruled"} =
-             EffortCheckin.rule(
-               ctx.db,
-               ctx.config,
-               effort_call(parent_rung.id, "dismiss", {:session, "parent"})
-             )
-
-    skipped = dispatch(ctx, {:session, mid.session_key}, "holder", "held chain")
-    skipped_request = escalate(ctx, skipped.id)
-
-    :ok =
-      DB.execute(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey='parent'")
-
-    EffortCheckin.deadline(
-      ctx.db,
-      ctx.config,
-      Wakes.get(ctx.db, skipped_request.deadline_wake_id)
-    )
-
-    assert request(ctx.db, skipped_request.id).expecter_user_id == "h1"
-
-    :ok =
-      DB.execute(ctx.db, "UPDATE sessions SET state='active' WHERE sessionKey='parent'")
-
-    pinned = dispatch(ctx, {:session, "parent"}, "holder", "pinned")
-    pinned_request = escalate(ctx, pinned.id)
-
-    assert pinned_request.context["actions"] == [
-             "wake",
-             "continue",
-             "dismiss",
-             "revoke-assignment",
-             "dispatch"
+    assert Enum.map(escalation_wakes(ctx.db, item.id), & &1.session_key) == [
+             "parent",
+             "parent",
+             ctx.main.session_key
            ]
 
-    # Rotate to H1, who does not own holder H2: each power is intersected independently.
-    EffortCheckin.deadline(ctx.db, ctx.config, Wakes.get(ctx.db, pinned_request.deadline_wake_id))
-    human = request(ctx.db, pinned_request.id)
-    assert human.expecter_user_id == "h1"
+    assert bracket_state(ctx.db, item.id) == "probed"
+    assert no_effort_requests?(ctx.db, item.id)
 
-    assert human.context["actions"] == ["wake", "continue", "dismiss"]
+    assignment(ctx, "revoke-assignment", {:session, "parent"}, nil, %{assignment_id: item.id})
+    assert bracket_state(ctx.db, item.id) == "canceled"
+  end
 
-    assert %{code: "not_authorized"} =
-             EffortCheckin.rule(
-               ctx.db,
-               ctx.config,
-               effort_call(human.id, "continue", {:session, "parent"})
-             )
+  test "proofs 6, 11, 12, 13: escalation follows operational parents and terminates at Main",
+       ctx do
+    mid =
+      session(ctx.db, "mid", "h1", Placement.local_host_name(), %{
+        spawned_by: ctx.main.session_key,
+        operational_parent: "parent"
+      })
 
-    assert %{code: "not_authorized"} =
-             assignment(ctx, "revoke-assignment", {:user, "h1"}, nil, %{
-               assignment_id: pinned.id
-             })
+    assert %{spawned_by: "parent"} = Org.set_operational_parent(ctx.db, "holder", mid.session_key)
 
-    assert %{status: "ruled"} =
-             EffortCheckin.rule(
-               ctx.db,
-               ctx.config,
-               effort_call(human.id, "continue", {:user, "h1"})
-             )
+    item = dispatch(ctx, {:user, "h1"}, "holder", "operational ladder")
+    assert %{session_key: "mid"} = escalate(ctx, item.id)
+    assert nil == fire_probe(ctx, item.id)
+    assert nil == fire_probe(ctx, item.id)
+
+    assert Enum.map(escalation_wakes(ctx.db, item.id), & &1.session_key) == [
+             "mid",
+             "parent",
+             ctx.main.session_key
+           ]
+
+    assert no_effort_requests?(ctx.db, item.id)
+    assert bracket_state(ctx.db, item.id) == "probed"
+
+    # Retired sessions stay in the parent graph but are skipped as escalation targets.
+    retired =
+      session(ctx.db, "retired-parent", "h1", Placement.local_host_name(), %{
+        spawned_by: ctx.main.session_key,
+        operational_parent: "parent"
+      })
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [
+        retired.session_key
+      ])
+
+    Org.set_operational_parent(ctx.db, "holder", retired.session_key)
+
+    skipped = dispatch(ctx, {:session, retired.session_key}, "holder", "retired rung")
+    assert %{session_key: "parent"} = escalate(ctx, skipped.id)
+    assert Enum.map(escalation_wakes(ctx.db, skipped.id), & &1.session_key) == ["parent"]
+    assert no_effort_requests?(ctx.db, skipped.id)
   end
 
   test "proof 7: placement satellite probe is bounded and SSH failure is unobservable", ctx do
@@ -754,9 +545,10 @@ defmodule Tightbeam.EffortCheckinTest do
         brief: "remote failure"
       })
 
-    request = escalate(%{ctx | config: failed_config}, failed.id)
-    assert request.context["channels"]["writes"] == "unobservable"
-    assert request.context["outcome"] == "zero_effect"
+    escalation = escalate(%{ctx | config: failed_config}, failed.id)
+    assert escalation.session_key == "parent"
+    assert escalation.prompt =~ "unobservable"
+    assert no_effort_requests?(ctx.db, failed.id)
   end
 
   test "acceptance 1: turns without effect prod the agent; one recorded artifact is silence",
@@ -891,7 +683,7 @@ defmodule Tightbeam.EffortCheckinTest do
            ]) == [[0]]
   end
 
-  test "acceptance 3: silence after the prod escalates to the owner naming all four channels",
+  test "acceptance 3: silence after the prod escalates to the parent naming all channels",
        ctx do
     item = work_item!(ctx.db, "acceptance three")
 
@@ -900,23 +692,13 @@ defmodule Tightbeam.EffortCheckinTest do
     assert nil == fire_probe(ctx, silent.id)
     assert [_prod] = prods(ctx.db, "holder")
 
-    request = fire_probe(ctx, silent.id)
-    assert request.expecter_session_key == "parent"
-    assert request.context["outcome"] == "zero_effect"
-    assert request.context["agentProdded"] == true
-
-    assert request.context["channels"] == %{
-             "writes" => "none",
-             "artifacts" => 0,
-             "attests" => 0,
-             "workItems" => 0
-           }
-
-    assert request.question =~ "The holder was prodded and stayed silent"
-    assert request.question =~ "workspace writes: none"
-    assert request.question =~ "artifacts recorded: 0"
-    assert request.question =~ "attests: 0"
-    assert request.question =~ "work-item updates: 0"
+    assert nil == fire_probe(ctx, silent.id)
+    assert [escalation] = escalation_wakes(ctx.db, silent.id)
+    assert escalation.session_key == "parent"
+    assert escalation.prompt =~ "Child session holder remains inactive"
+    assert escalation.prompt =~ "no writes, artifacts, attests, or work-item updates"
+    assert escalation.prompt =~ "workspace #{ctx.root}: none"
+    assert no_effort_requests?(ctx.db, silent.id)
 
     # One prod per silent streak, not one per bracket.
     assert length(prods(ctx.db, "holder")) == 1
@@ -1107,68 +889,61 @@ defmodule Tightbeam.EffortCheckinTest do
     assert prods(ctx.db, "holder") == []
   end
 
-  test "proofs 6 and 8b: request and notification commit together and stay pending until delivered",
-       ctx do
-    personal_key = Org.personal_session_key("h1")
-    session(ctx.db, personal_key, "h1", Placement.local_host_name())
-
+  test "proofs 6 and 8b: parent notification and next rung commit before delivery", ctx do
     item = dispatch(ctx, {:session, "parent"}, "holder", "notify durability")
 
-    # Rung one is the agent prod; the owner's request is rung two.
-    :ok = EffortCheckin.probe(ctx.db, ctx.config, current_wake(ctx.db, item.id))
-    :ok = EffortCheckin.probe(ctx.db, ctx.config, current_wake(ctx.db, item.id))
+    first_probe = current_wake(ctx.db, item.id)
+    assert nil == fire_probe(ctx, item.id)
 
-    [[request_id, old_deadline_id]] =
-      rows(
-        ctx.db,
-        "SELECT id,deadlineWakeId FROM decision_requests WHERE assignmentId=?1 AND status='open'",
-        [item.id]
-      )
+    assert %{session_key: "parent", state: "pending", target_gate: 1} =
+             parent_wake = fire_parent_probe(ctx, item.id)
 
-    # Proof 6: the notification committed WITH the request. Nothing has been
-    # delivered — a death here still leaves the intent durable and pending.
-    assert [%{state: "pending", target_gate: 0} = opened] = notification_wakes(ctx.db)
-    assert opened.prompt =~ "Effort check-in #{request_id}"
-    assert Wakes.get(ctx.db, old_deadline_id).state == "pending"
-    assert rows(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [opened.wake_id]) == [[0]]
-    assert Enum.any?(Wakes.list_pending(ctx.db), &(&1.wake_id == opened.wake_id))
+    assert [[3, "armed", next_probe_id, 2]] =
+             rows(
+               ctx.db,
+               "SELECT generation,state,wakeId,agentProdded FROM effort_checkin_generations WHERE assignmentId=?1 ORDER BY generation DESC LIMIT 1",
+               [item.id]
+             )
+
+    assert Wakes.get(ctx.db, next_probe_id).state == "pending"
+
+    assert rows(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [parent_wake.wake_id]) == [
+             [0]
+           ]
+
+    assert Enum.any?(Wakes.list_pending(ctx.db), &(&1.wake_id == parent_wake.wake_id))
+    assert no_effort_requests?(ctx.db, item.id)
 
     # Ordinary wake recovery surfaces it without waiting for the deadline.
     scheduler = drain_notifications!(ctx)
-    assert Wakes.get(ctx.db, opened.wake_id).state == "fired"
-    assert rows(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [opened.wake_id]) == [[1]]
-    assert Wakes.get(ctx.db, old_deadline_id).state == "pending"
+    assert Wakes.get(ctx.db, parent_wake.wake_id).state == "fired"
 
-    # Proof 8b: the winning deadline advance commits the new rung, its
-    # replacement deadline wake, and the new-rung notification atomically.
-    :ok = EffortCheckin.deadline(ctx.db, ctx.config, Wakes.get(ctx.db, old_deadline_id))
-    advanced = request(ctx.db, request_id)
-    assert advanced.deadline_wake_id != old_deadline_id
-    assert Wakes.get(ctx.db, advanced.deadline_wake_id).state == "pending"
-    assert Wakes.get(ctx.db, old_deadline_id).state == "fired"
+    assert rows(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [parent_wake.wake_id]) == [
+             [1]
+           ]
 
-    assert [%{state: "fired"}, %{state: "pending", target_gate: 0} = rung] =
-             notification_wakes(ctx.db)
+    # The scheduler also fires the already-due next internal probe. It reaches
+    # Main, which closes the ladder without another monitor.
+    assert [%{session_key: "parent"}, %{session_key: main_key}] =
+             escalation_wakes(ctx.db, item.id)
 
-    assert rung.session_key == (advanced.expecter_session_key || personal_key)
-    assert rung.prompt =~ "Effort check-in #{request_id}"
+    assert main_key == ctx.main.session_key
+    assert bracket_state(ctx.db, item.id) == "probed"
 
-    :ok = Wakes.fire_due(scheduler)
-    assert Wakes.get(ctx.db, rung.wake_id).state == "fired"
-    assert rows(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [rung.wake_id]) == [[1]]
-
-    # A stale deadline replay still no-ops on deadlineWakeId mismatch: no rung
-    # rotation, no third notification.
-    :ok = EffortCheckin.deadline(ctx.db, ctx.config, Wakes.get(ctx.db, old_deadline_id))
-    assert request(ctx.db, request_id).deadline_wake_id == advanced.deadline_wake_id
-    assert Enum.map(notification_wakes(ctx.db), & &1.wake_id) == [opened.wake_id, rung.wake_id]
+    # A stale probe replay stays inert and cannot produce another escalation.
+    before_replay = Enum.map(escalation_wakes(ctx.db, item.id), & &1.wake_id)
+    assert :ok = EffortCheckin.probe(ctx.db, ctx.config, first_probe)
+    assert Enum.map(escalation_wakes(ctx.db, item.id), & &1.wake_id) == before_replay
+    assert no_effort_requests?(ctx.db, item.id)
+    assert :ok = Wakes.fire_due(scheduler)
   end
 
   test "proof 10: workspace motion supersedes old evidence and re-arms on the new holder/host",
        ctx do
     bare = assignment(ctx, "assign", {:user, "h1"}, "holder", %{subject: "bare motion"})
     item = dispatch(ctx, {:session, "parent"}, "holder", "motion")
-    open = escalate(ctx, item.id)
+    assert nil == fire_probe(ctx, item.id)
+    old_probe = current_wake(ctx.db, item.id)
 
     manifests = Path.join([ctx.base_dir, "identity", "archetypes"])
     File.mkdir_p!(manifests)
@@ -1219,7 +994,6 @@ defmodule Tightbeam.EffortCheckinTest do
 
     assert_receive {:raced_assignment, raced_assignment_id}
 
-    assert request(ctx.db, open.id).status == "superseded"
     assert bracket_state(ctx.db, item.id) == "armed"
 
     replacement_wake = current_wake(ctx.db, item.id)
@@ -1229,7 +1003,7 @@ defmodule Tightbeam.EffortCheckinTest do
              reason: "superseded",
              outcome: "replacement",
              replacement_wake_id: replacement_wake_id
-           } = cancellation(ctx.db, open.deadline_wake_id)
+           } = cancellation(ctx.db, old_probe.wake_id)
 
     assert replacement_wake_id == replacement_wake.wake_id
 
@@ -1254,8 +1028,8 @@ defmodule Tightbeam.EffortCheckinTest do
                [raced_assignment_id]
              )
 
-    reopened = escalate(%{ctx | config: moved_config}, item.id)
-    assert reopened.status == "open"
+    assert %{session_key: "parent"} = escalate(%{ctx | config: moved_config}, item.id)
+    assert no_effort_requests?(ctx.db, item.id)
 
     replacement = session(ctx.db, "replacement", "h2", Placement.local_host_name())
 
@@ -1338,33 +1112,40 @@ defmodule Tightbeam.EffortCheckinTest do
   end
 
   defp fire_probe(ctx, assignment_id) do
-    before = latest_request_id(ctx.db, assignment_id)
     wake = current_wake(ctx.db, assignment_id)
     :ok = EffortCheckin.probe(ctx.db, ctx.config, wake)
+    nil
+  end
 
-    case latest_request_id(ctx.db, assignment_id) do
-      ^before -> nil
-      nil -> nil
-      id -> request(ctx.db, id)
+  defp fire_parent_probe(ctx, assignment_id) do
+    before = Enum.map(escalation_wakes(ctx.db, assignment_id), & &1.wake_id)
+    fire_probe(ctx, assignment_id)
+
+    case Enum.reject(escalation_wakes(ctx.db, assignment_id), &(&1.wake_id in before)) do
+      [wake] -> wake
+      other -> flunk("expected one new operational-parent wake, got: #{inspect(other)}")
     end
   end
 
-  # Zero effect prods the AGENT first; the owner's request is the NEXT bracket.
-  # Every proof that is about the request, not the rung order, walks both.
+  # Zero effect prods the holder first; the next bracket wakes its operational parent.
   defp escalate(ctx, assignment_id) do
-    fire_probe(ctx, assignment_id) || fire_probe(ctx, assignment_id)
+    fire_probe(ctx, assignment_id)
+    fire_parent_probe(ctx, assignment_id)
   end
 
-  defp latest_request_id(db, assignment_id) do
-    case rows(
-           db,
-           "SELECT id FROM decision_requests WHERE kind='effort' AND assignmentId=?1 ORDER BY rowid DESC LIMIT 1",
-           [assignment_id]
-         ) do
-      [[id]] -> id
-      [] -> nil
-    end
+  defp escalation_wakes(db, assignment_id) do
+    db
+    |> rows(
+      "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND prompt LIKE '[effort escalation]%' ORDER BY rowid",
+      [assignment_id]
+    )
+    |> Enum.map(fn [wake_id] -> Wakes.get(db, wake_id) end)
   end
+
+  defp no_effort_requests?(db, assignment_id),
+    do:
+      rows(db, "SELECT COUNT(*) FROM decision_requests WHERE assignmentId=?1", [assignment_id]) ==
+        [[0]]
 
   defp current_wake(db, assignment_id) do
     [[wake_id]] =
@@ -1377,61 +1158,6 @@ defmodule Tightbeam.EffortCheckinTest do
     Wakes.get(db, wake_id)
   end
 
-  defp request(db, id) do
-    call = %{principal: {:session, "parent"}, origin: "agent:parent", params: %{}}
-    Escalation.get(db, call, id, owner_user_id: "h1") || raw_request(db, id)
-  end
-
-  defp raw_request(db, id) do
-    [
-      [
-        id,
-        kind,
-        assignment_id,
-        expecter_session,
-        expecter_user,
-        rung,
-        generation,
-        wake_id,
-        question,
-        options,
-        context,
-        status,
-        decision
-      ]
-    ] =
-      rows(
-        db,
-        "SELECT id,kind,assignmentId,expecterSessionKey,expecterUserId,lineageRung,effortGeneration,deadlineWakeId,question,options,context,status,decision FROM decision_requests WHERE id=?1",
-        [id]
-      )
-
-    %{
-      id: id,
-      kind: kind,
-      assignment_id: assignment_id,
-      expecter_session_key: expecter_session,
-      expecter_user_id: expecter_user,
-      lineage_rung: rung,
-      effort_generation: generation,
-      deadline_wake_id: wake_id,
-      question: question,
-      options: JSON.decode!(options),
-      context: JSON.decode!(context),
-      status: status,
-      decision: decision
-    }
-  end
-
-  defp effort_call(id, action, principal) do
-    %{
-      verb: "effort-rule",
-      origin: origin(principal),
-      principal: principal,
-      params: %{request_id: id, action: action}
-    }
-  end
-
   defp silent_rearm(db, assignment_id, generation \\ 2) do
     rows(db, "SELECT COUNT(*) FROM decision_requests WHERE assignmentId=?1", [assignment_id]) == [
       [0]
@@ -1441,17 +1167,6 @@ defmodule Tightbeam.EffortCheckinTest do
         "SELECT generation,multiplier,state,agentProdded FROM effort_checkin_generations WHERE assignmentId=?1 ORDER BY generation DESC LIMIT 1",
         [assignment_id]
       ) == [[generation, 1, "armed", 0]]
-  end
-
-  defp current_multiplier(db, assignment_id) do
-    [[multiplier]] =
-      rows(
-        db,
-        "SELECT multiplier FROM effort_checkin_generations WHERE assignmentId=?1 AND state='armed' ORDER BY generation DESC LIMIT 1",
-        [assignment_id]
-      )
-
-    multiplier
   end
 
   defp bracket_state(db, assignment_id) do
@@ -1512,10 +1227,13 @@ defmodule Tightbeam.EffortCheckinTest do
     }
   end
 
-  # Notification wakes are the ungated (targetGate = 0) prompt wakes.
+  # Effort notifications are ordinary prompt wakes with assignment attribution.
   defp notification_wakes(db) do
     db
-    |> rows("SELECT wakeId FROM wakes WHERE targetGate = 0 ORDER BY rowid", [])
+    |> rows(
+      "SELECT wakeId FROM wakes WHERE assignmentId IS NOT NULL AND prompt LIKE '[effort %' ORDER BY rowid",
+      []
+    )
     |> Enum.map(fn [wake_id] -> Wakes.get(db, wake_id) end)
   end
 

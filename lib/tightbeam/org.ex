@@ -12,9 +12,9 @@ defmodule Tightbeam.Org do
 
   @typedoc """
   A session row. Identity-is-data: `origin`/`spawned_by` record WHO created it
-  (provenance is append-only fact, not judgment); `handle` is the vestigial
-  spawn-time name record; `archetype`/`harness`/`provider`/`model` are the current
-  tuning.
+  (provenance is append-only fact, not judgment); `operational_parent` is the
+  mutable supervision edge; `handle` is the vestigial spawn-time name record;
+  `archetype`/`harness`/`provider`/`model` are the current tuning.
   """
   @type session :: %{
           session_key: String.t(),
@@ -26,6 +26,7 @@ defmodule Tightbeam.Org do
           owner_user_id: String.t(),
           origin: String.t(),
           spawned_by: String.t() | nil,
+          operational_parent: String.t(),
           handle: String.t() | nil,
           archetype: String.t(),
           overrides: map() | nil,
@@ -59,7 +60,7 @@ defmodule Tightbeam.Org do
                        else: ""
                      )
 
-  @ddl """
+  @sessions_ddl """
   CREATE TABLE IF NOT EXISTS sessions (
     sessionKey    TEXT PRIMARY KEY,
     displayName   TEXT NOT NULL,
@@ -70,6 +71,7 @@ defmodule Tightbeam.Org do
     ownerUserId   TEXT NOT NULL,
     origin        TEXT NOT NULL,
     spawnedBy     TEXT,
+    operationalParent TEXT NOT NULL,
     handle        TEXT UNIQUE,
     archetype     TEXT NOT NULL,
     overrides     TEXT,
@@ -87,24 +89,28 @@ defmodule Tightbeam.Org do
     createdAt     INTEGER NOT NULL,
     updatedAt     INTEGER NOT NULL
   );
-  CREATE INDEX IF NOT EXISTS sessions_owner ON sessions (ownerUserId, state);
-  CREATE TABLE IF NOT EXISTS harness_pointers (
-    id               INTEGER PRIMARY KEY AUTOINCREMENT,
-    sessionKey       TEXT NOT NULL REFERENCES sessions(sessionKey),
-    harnessSessionId TEXT NOT NULL,
-    sourceSessionRef TEXT NOT NULL,
-    harness          TEXT NOT NULL,
-    machine          TEXT NOT NULL,
-    reason           TEXT NOT NULL CHECK (reason IN ('created','loaded','fallback')),
-    createdAt        INTEGER NOT NULL
-  );
-  CREATE INDEX IF NOT EXISTS pointers_session ON harness_pointers (sessionKey, id);
-  CREATE TABLE IF NOT EXISTS org_settings (
-    key       TEXT PRIMARY KEY,
-    value     TEXT NOT NULL,
-    updatedAt INTEGER NOT NULL
-  );
   """
+
+  @ddl @sessions_ddl <>
+         """
+         CREATE INDEX IF NOT EXISTS sessions_owner ON sessions (ownerUserId, state);
+         CREATE TABLE IF NOT EXISTS harness_pointers (
+           id               INTEGER PRIMARY KEY AUTOINCREMENT,
+           sessionKey       TEXT NOT NULL REFERENCES sessions(sessionKey),
+           harnessSessionId TEXT NOT NULL,
+           sourceSessionRef TEXT NOT NULL,
+           harness          TEXT NOT NULL,
+           machine          TEXT NOT NULL,
+           reason           TEXT NOT NULL CHECK (reason IN ('created','loaded','fallback')),
+           createdAt        INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS pointers_session ON harness_pointers (sessionKey, id);
+         CREATE TABLE IF NOT EXISTS org_settings (
+           key       TEXT PRIMARY KEY,
+           value     TEXT NOT NULL,
+           updatedAt INTEGER NOT NULL
+         );
+         """
 
   @spec ensure_schema(db()) :: :ok | {:error, term()}
   def ensure_schema(db \\ Tightbeam.DB) do
@@ -139,6 +145,136 @@ defmodule Tightbeam.Org do
       )
 
     result
+  end
+
+  @doc false
+  @spec migrate_operational_parent_v1_in_txn(Txn.t(), keyword()) :: :ok
+  def migrate_operational_parent_v1_in_txn(txn, opts \\ [])
+
+  def migrate_operational_parent_v1_in_txn(%Txn{} = txn, opts) when is_list(opts) do
+    case Txn.q(
+           txn,
+           "SELECT type FROM sqlite_master WHERE name='sessions_operational_parent_v1'"
+         ) do
+      [] -> :ok
+      _ -> raise "incompatible_operational_parent_v1: migration object already exists"
+    end
+
+    invalid =
+      Txn.q(
+        txn,
+        """
+        SELECT s.sessionKey,
+               CASE WHEN s.kind='main' THEN s.sessionKey
+                    ELSE COALESCE(s.spawnedBy, 'agent:main:clawline:' || s.ownerUserId || ':main')
+               END AS operationalParent
+        FROM sessions s
+        LEFT JOIN sessions p ON p.sessionKey =
+          CASE WHEN s.kind='main' THEN s.sessionKey
+               ELSE COALESCE(s.spawnedBy, 'agent:main:clawline:' || s.ownerUserId || ':main')
+          END
+        WHERE p.sessionKey IS NULL
+        ORDER BY s.sessionKey
+        """
+      )
+
+    if invalid != [] do
+      raise "incompatible_operational_parent_v1: missing parent #{inspect(invalid)}"
+    end
+
+    migration_graph =
+      txn
+      |> Txn.q("""
+      SELECT sessionKey, kind,
+             CASE WHEN kind='main' THEN sessionKey
+                  ELSE COALESCE(spawnedBy, 'agent:main:clawline:' || ownerUserId || ':main')
+             END
+      FROM sessions
+      """)
+      |> Map.new(fn [key, kind, parent] -> {key, {kind, parent}} end)
+
+    Enum.each(Map.keys(migration_graph), fn key ->
+      validate_migrated_operational_chain!(migration_graph, key, MapSet.new())
+    end)
+
+    harnesses = Enum.map_join(Tightbeam.Harness.all(), ",", &"'#{&1.wire_name()}'")
+
+    replacement_ddl =
+      @sessions_ddl
+      |> String.replace(
+        "CREATE TABLE IF NOT EXISTS sessions",
+        "CREATE TABLE sessions_operational_parent_v1",
+        global: false
+      )
+      |> String.replace("__TIGHTBEAM_HARNESSES__", harnesses)
+      |> String.replace("__TIGHTBEAM_PROVIDERS__", @provider_values)
+
+    :ok = Txn.exec(txn, replacement_ddl)
+
+    Txn.q(
+      txn,
+      """
+      INSERT INTO sessions_operational_parent_v1
+        (sessionKey, displayName, kind, orderIndex, isBuiltIn, adopted,
+         ownerUserId, origin, spawnedBy, operationalParent, handle, archetype,
+         overrides, identityName, identityRevision, cliToken, harness, provider,
+         model, thinkingLevel, modelContext, host, clearedThroughSeq, state,
+         createdAt, updatedAt)
+      SELECT sessionKey, displayName, kind, orderIndex, isBuiltIn, adopted,
+             ownerUserId, origin, spawnedBy,
+             CASE WHEN kind='main' THEN sessionKey
+                  ELSE COALESCE(spawnedBy, 'agent:main:clawline:' || ownerUserId || ':main')
+             END,
+             handle, archetype, overrides, identityName, identityRevision, cliToken,
+             harness, provider, model, thinkingLevel, modelContext, host,
+             clearedThroughSeq, state, createdAt, updatedAt
+      FROM sessions
+      ORDER BY createdAt, sessionKey
+      """
+    )
+
+    maybe_interrupt_operational_parent_migration!(opts, :after_copy)
+    :ok = Txn.exec(txn, "DROP TABLE sessions")
+    maybe_interrupt_operational_parent_migration!(opts, :after_drop)
+
+    :ok =
+      Txn.exec(
+        txn,
+        "ALTER TABLE sessions_operational_parent_v1 RENAME TO sessions"
+      )
+
+    case Txn.q(txn, "PRAGMA foreign_key_check") do
+      [] -> :ok
+      rows -> raise "incompatible_operational_parent_v1: foreign key check #{inspect(rows)}"
+    end
+  end
+
+  def migrate_operational_parent_v1_in_txn(%Txn{}, _opts) do
+    raise ArgumentError, "operational-parent migration options must be a keyword list"
+  end
+
+  defp maybe_interrupt_operational_parent_migration!(opts, point) do
+    if Keyword.get(opts, :fail_at) == point,
+      do: raise("forced operational-parent migration interruption")
+
+    :ok
+  end
+
+  defp validate_migrated_operational_chain!(graph, key, visited) do
+    if MapSet.member?(visited, key) do
+      raise "incompatible_operational_parent_v1: cycle before Main at #{key}"
+    end
+
+    case Map.fetch!(graph, key) do
+      {"main", ^key} ->
+        :ok
+
+      {"main", parent} ->
+        raise "incompatible_operational_parent_v1: Main #{key} points to #{parent}"
+
+      {_kind, parent} ->
+        validate_migrated_operational_chain!(graph, parent, MapSet.put(visited, key))
+    end
   end
 
   @doc "Read an organization setting, or nil when it is unset."
@@ -193,16 +329,25 @@ defmodule Tightbeam.Org do
     now = now()
     cli_token = session_token()
     %Model{} = model = Map.fetch!(input, :model)
+    owner_user_id = Map.fetch!(input, :owner_user_id)
+    spawned_by = Map.get(input, :spawned_by)
+
+    operational_parent =
+      Map.get(input, :operational_parent) ||
+        if(Map.get(input, :kind, "custom") == "main",
+          do: session_key,
+          else: spawned_by || personal_session_key(owner_user_id)
+        )
 
     Txn.q(
       txn,
       """
         INSERT INTO sessions (sessionKey, displayName, kind, orderIndex, isBuiltIn, adopted,
-          ownerUserId, origin, spawnedBy, handle, archetype, overrides, identityName,
+          ownerUserId, origin, spawnedBy, operationalParent, handle, archetype, overrides, identityName,
           identityRevision, cliToken,
           harness, provider, model, thinkingLevel, modelContext, host, state, createdAt, updatedAt)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-          ?15, ?16, ?17, ?18, ?19, ?20, ?21, 'active', ?22, ?22)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+          ?16, ?17, ?18, ?19, ?20, ?21, ?22, 'active', ?23, ?23)
       """,
       [
         session_key,
@@ -211,9 +356,10 @@ defmodule Tightbeam.Org do
         Map.get(input, :order_index, 0),
         if(Map.get(input, :is_built_in, false), do: 1, else: 0),
         if(Map.get(input, :adopted, false), do: 1, else: 0),
-        Map.fetch!(input, :owner_user_id),
+        owner_user_id,
         Map.fetch!(input, :origin),
-        Map.get(input, :spawned_by),
+        spawned_by,
+        operational_parent,
         Map.get(input, :handle),
         Map.fetch!(input, :archetype),
         encode_overrides(Map.get(input, :overrides)),
@@ -460,6 +606,33 @@ defmodule Tightbeam.Org do
     )
 
     must_get(txn, session_key)
+  end
+
+  @doc "Change a session's operational parent without rewriting its spawn provenance."
+  @spec set_operational_parent(db(), String.t(), String.t()) :: session()
+  def set_operational_parent(db \\ Tightbeam.DB, session_key, operational_parent)
+
+  def set_operational_parent(db, session_key, operational_parent)
+      when is_binary(operational_parent) and operational_parent != "" do
+    transaction!(db, fn txn ->
+      session = must_get(txn, session_key)
+      must_get(txn, operational_parent)
+
+      cond do
+        session.kind == "main" and operational_parent != session_key ->
+          raise ArgumentError, "Main's operational parent must remain itself"
+
+        operational_cycle?(txn, operational_parent, session_key, MapSet.new()) ->
+          raise ArgumentError, "operational parent would create a cycle"
+
+        true ->
+          update_in_txn(txn, session_key, "operationalParent = ?2", [operational_parent])
+      end
+    end)
+  end
+
+  def set_operational_parent(_db, _session_key, _operational_parent) do
+    raise ArgumentError, "operational parent must be a non-empty session key"
   end
 
   @doc "Replace the normalized overrides and their derived identity name together."
@@ -1049,19 +1222,49 @@ defmodule Tightbeam.Org do
 
   defp update(db, session_key, sets, values) do
     transaction!(db, fn txn ->
-      must_get(txn, session_key)
-
-      params = [session_key | values] ++ [now()]
-      updated_at_index = length(params)
-
-      Txn.q(
-        txn,
-        "UPDATE sessions SET #{sets}, updatedAt = ?#{updated_at_index} WHERE sessionKey = ?1",
-        params
-      )
-
-      must_get(txn, session_key)
+      update_in_txn(txn, session_key, sets, values)
     end)
+  end
+
+  defp update_in_txn(txn, session_key, sets, values) do
+    must_get(txn, session_key)
+
+    params = [session_key | values] ++ [now()]
+    updated_at_index = length(params)
+
+    Txn.q(
+      txn,
+      "UPDATE sessions SET #{sets}, updatedAt = ?#{updated_at_index} WHERE sessionKey = ?1",
+      params
+    )
+
+    must_get(txn, session_key)
+  end
+
+  defp operational_cycle?(txn, current, target, visited) do
+    cond do
+      current == target ->
+        true
+
+      MapSet.member?(visited, current) ->
+        raise ArgumentError, "existing operational parent cycle at #{current}"
+
+      true ->
+        case Txn.q(
+               txn,
+               "SELECT kind, operationalParent FROM sessions WHERE sessionKey=?1",
+               [current]
+             ) do
+          [["main", ^current]] ->
+            false
+
+          [[_kind, parent]] ->
+            operational_cycle?(txn, parent, target, MapSet.put(visited, current))
+
+          [] ->
+            raise ArgumentError, "unknown operational parent: #{current}"
+        end
+    end
   end
 
   defp must_get(txn, session_key) do
@@ -1074,7 +1277,7 @@ defmodule Tightbeam.Org do
   defp select_session_sql do
     """
     SELECT sessionKey, displayName, kind, orderIndex, isBuiltIn, adopted,
-           ownerUserId, origin, spawnedBy, handle, archetype, overrides, identityName,
+           ownerUserId, origin, spawnedBy, operationalParent, handle, archetype, overrides, identityName,
            identityRevision, cliToken, harness, provider,
            model, thinkingLevel, modelContext, host, clearedThroughSeq, state, createdAt, updatedAt
     FROM sessions
@@ -1091,6 +1294,7 @@ defmodule Tightbeam.Org do
          owner_user_id,
          origin,
          spawned_by,
+         operational_parent,
          handle,
          archetype,
          overrides,
@@ -1118,6 +1322,7 @@ defmodule Tightbeam.Org do
       owner_user_id: owner_user_id,
       origin: origin,
       spawned_by: spawned_by,
+      operational_parent: operational_parent,
       handle: handle,
       archetype: archetype,
       overrides: decode_overrides(overrides),
