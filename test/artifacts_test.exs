@@ -685,6 +685,7 @@ defmodule Tightbeam.ArtifactsTest do
       owner_user_id: "flynn",
       origin: "user:flynn",
       spawned_by: spawned_by,
+      operational_parent: spawned_by || key,
       archetype: "default",
       host: "testhost",
       harness: "claude",

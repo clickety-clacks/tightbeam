@@ -11,13 +11,13 @@ defmodule Tightbeam.EffortCheckin do
   it.
 
   Zero effect on every channel prods the AGENT first — one wake naming the four
-  channels. Only continued silence at the next bracket escalates to the owner's
-  decision request. Owners get decisions, not status.
+  channels. Continued silence climbs the holder's active operational parents
+  and terminates at Main. This production reports agent inactivity to agents;
+  it never manufactures an operator decision.
 
   Filesystem observation is performed before the callback transaction. The
   transaction then CASes the exact generation/wake pair and either re-arms,
-  prods, or opens one parent-routed decision request with its durable deadline
-  wake.
+  prods, or schedules the next parent escalation.
   """
 
   alias Tightbeam.{CausalEvents, DB, Escalation, Org, Placement, Supervision, Wakes}
@@ -488,7 +488,14 @@ defmodule Tightbeam.EffortCheckin do
 
                 nil
               else
-                open_request_in_txn(txn, config, generation, evidence)
+                escalate_parent_in_txn(
+                  txn,
+                  config,
+                  generation,
+                  evidence,
+                  session,
+                  advanced_baseline(generation.baseline, inspection)
+                )
               end
             end
           end
@@ -659,93 +666,6 @@ defmodule Tightbeam.EffortCheckin do
     end
   end
 
-  defp open_request_in_txn(txn, config, generation, evidence) do
-    assignment = assignment_in_txn(txn, generation.assignment_id)
-    expecter = initial_expecter(txn, assignment)
-    menu = menu_in_txn(txn, assignment, expecter)
-    request_id = "dr_" <> Tightbeam.Id.uuid4()
-    deadline_at = now() + deadline_ms(config)
-
-    deadline =
-      Wakes.schedule_in_txn(txn, %{
-        session_key: expecter.session_key || Org.personal_session_key(expecter.user_id),
-        origin: @origin,
-        consumer: "effort_deadline",
-        due_at: deadline_at,
-        assignment_id: generation.assignment_id
-      })
-
-    context = Map.put(evidence, :actions, menu)
-
-    question =
-      "Assignment #{generation.assignment_id} effort check-in outcome: #{evidence.outcome}. " <>
-        "The holder was prodded and stayed silent. Channels checked since arm — " <>
-        "workspace writes: #{evidence.channels.writes} (#{evidence.workspace}); " <>
-        "artifacts recorded: #{evidence.channels.artifacts}; " <>
-        "attests: #{evidence.channels.attests}; " <>
-        "work-item updates: #{evidence.channels.workItems}. " <>
-        "Terminal turns since arm: #{evidence.turnsSinceArmed}; minutes since arm: #{evidence.minutesSinceArmed}. " <>
-        "Choose continue or dismiss, or use an available ordinary power."
-
-    outcome =
-      Escalation.effort_insert_in_txn(txn, %{
-        id: request_id,
-        owner_user_id: expecter.owner_user_id,
-        assignment_id: generation.assignment_id,
-        expecter_session_key: expecter.session_key,
-        expecter_user_id: expecter.user_id,
-        lineage_rung: expecter.rung,
-        generation: generation.generation,
-        deadline_wake_id: deadline.wake_id,
-        raised_at: now(),
-        deadline_at: deadline_at,
-        question: question,
-        options_json: JSON.encode!(menu),
-        context_json: JSON.encode!(context)
-      })
-
-    case outcome do
-      {:inserted, request} ->
-        request
-
-      :conflict ->
-        case Escalation.effort_id_by_generation_in_txn(
-               txn,
-               generation.assignment_id,
-               generation.generation
-             ) do
-          id when is_binary(id) ->
-            winner = request_for_id(txn, id)
-
-            command =
-              if winner.status == "open" do
-                %{
-                  requester: %{kind: "process", id: "tightbeam:effort-checkin"},
-                  reason_kind: "superseded",
-                  causal_source: %{kind: "decision_request", id: winner.id},
-                  outcome: %{
-                    kind: "replacement",
-                    replacement_wake_id: winner.deadline_wake_id
-                  }
-                }
-              else
-                decision_disposition_command(
-                  txn,
-                  winner,
-                  liveness_trigger_in_txn!(txn, winner.assignment_id)
-                )
-              end
-
-            cancel_pending_wake_in_txn!(txn, deadline.wake_id, command)
-
-            winner
-
-          nil ->
-            raise "decision request conflict has no durable winner"
-        end
-    end
-  end
-
   defp insert_generation(
          txn,
          config,
@@ -906,38 +826,6 @@ defmodule Tightbeam.EffortCheckin do
     end
   end
 
-  defp initial_expecter(txn, assignment) do
-    cond do
-      assignment.opened_by_user ->
-        %{
-          session_key: nil,
-          user_id: assignment.opened_by_user,
-          owner_user_id: assignment.opened_by_user,
-          principal_user_id: assignment.opened_by_user,
-          rung: 0
-        }
-
-      assignment.opened_by_session == assignment.holder_key ->
-        holder = session_in_txn(txn, assignment.holder_key)
-
-        if holder.spawned_by do
-          route_session(txn, holder.spawned_by, holder.owner_user_id, 1, assignment.holder_key)
-        else
-          %{
-            session_key: nil,
-            user_id: holder.owner_user_id,
-            owner_user_id: holder.owner_user_id,
-            principal_user_id: holder.owner_user_id,
-            rung: 1
-          }
-        end
-
-      true ->
-        opener = session_in_txn(txn, assignment.opened_by_session)
-        route_session(txn, opener.session_key, opener.owner_user_id, 0, assignment.holder_key)
-    end
-  end
-
   defp advance_expecter(_txn, %{expecter_user_id: user, lineage_rung: rung})
        when is_binary(user) do
     %{
@@ -953,10 +841,10 @@ defmodule Tightbeam.EffortCheckin do
     current = session_in_txn(txn, request.expecter_session_key)
     assignment = assignment_in_txn(txn, request.assignment_id)
 
-    if current.spawned_by do
+    if current.kind != "main" do
       route_session(
         txn,
-        current.spawned_by,
+        current.operational_parent,
         request.owner_user_id,
         request.lineage_rung + 1,
         assignment.holder_key
@@ -976,8 +864,8 @@ defmodule Tightbeam.EffortCheckin do
     session = session_in_txn(txn, key)
 
     cond do
-      key == holder_key and session.spawned_by ->
-        route_session(txn, session.spawned_by, owner_user_id, rung + 1, holder_key)
+      key == holder_key and session.kind != "main" ->
+        route_session(txn, session.operational_parent, owner_user_id, rung + 1, holder_key)
 
       key == holder_key ->
         %{
@@ -997,8 +885,8 @@ defmodule Tightbeam.EffortCheckin do
           rung: rung
         }
 
-      session.spawned_by ->
-        route_session(txn, session.spawned_by, owner_user_id, rung + 1, holder_key)
+      session.kind != "main" ->
+        route_session(txn, session.operational_parent, owner_user_id, rung + 1, holder_key)
 
       true ->
         %{
@@ -1111,7 +999,7 @@ defmodule Tightbeam.EffortCheckin do
         workItems: channels.workItems
       },
       workspace: generation.root,
-      agentProdded: generation.agent_prodded == 1,
+      agentProdded: generation.agent_prodded > 0,
       turnsSinceArmed: channels.turns,
       minutesSinceArmed: div(max(now() - generation.armed_at, 0), 60_000)
     }
@@ -1137,6 +1025,75 @@ defmodule Tightbeam.EffortCheckin do
       due_at: now(),
       assignment_id: generation.assignment_id
     })
+  end
+
+  defp escalate_parent_in_txn(txn, config, generation, evidence, session, baseline) do
+    chain = active_operational_chain!(txn, session)
+    target = Enum.at(chain, generation.agent_prodded - 1) || List.last(chain)
+    target_session = session_in_txn(txn, target)
+
+    Wakes.schedule_in_txn(txn, %{
+      session_key: target,
+      origin: @origin,
+      prompt:
+        "[effort escalation] Child session #{generation.holder_key} remains inactive on " <>
+          "assignment #{generation.assignment_id} after its prod: " <>
+          channel_sentence(evidence) <>
+          " Act through your ordinary session powers. Main is the terminal agent rung; " <>
+          "only Main may ask its operator for a real decision.",
+      due_at: now(),
+      assignment_id: generation.assignment_id
+    })
+
+    if target_session.kind == "main" do
+      nil
+    else
+      insert_generation(
+        txn,
+        config,
+        generation.assignment_id,
+        session,
+        generation.root,
+        baseline,
+        generation.generation + 1,
+        generation.multiplier,
+        generation.agent_prodded + 1
+      )
+    end
+  end
+
+  defp active_operational_chain!(txn, session) do
+    operational_chain!(
+      txn,
+      session.operational_parent,
+      MapSet.new([session.session_key]),
+      []
+    )
+  end
+
+  defp operational_chain!(txn, key, visited, acc) do
+    if MapSet.member?(visited, key) do
+      raise "incompatible_operational_parent_v1: cycle before Main at #{key}"
+    end
+
+    parent = session_in_txn(txn, key)
+    next_acc = if parent.state == "active", do: [key | acc], else: acc
+
+    cond do
+      parent.kind == "main" and parent.operational_parent == key and parent.state == "active" ->
+        Enum.reverse(next_acc)
+
+      parent.kind == "main" ->
+        raise "incompatible_operational_parent_v1: Main #{key} is not an active self-root"
+
+      true ->
+        operational_chain!(
+          txn,
+          parent.operational_parent,
+          MapSet.put(visited, key),
+          next_acc
+        )
+    end
   end
 
   defp channel_sentence(evidence) do
@@ -1242,20 +1199,21 @@ defmodule Tightbeam.EffortCheckin do
   end
 
   defp session_in_txn(txn, key) do
-    [[key, owner, spawned_by, host, state, built_in]] =
+    [[key, owner, operational_parent, host, state, built_in, kind]] =
       Txn.q(
         txn,
-        "SELECT sessionKey, ownerUserId, spawnedBy, host, state, isBuiltIn FROM sessions WHERE sessionKey = ?1",
+        "SELECT sessionKey, ownerUserId, operationalParent, host, state, isBuiltIn, kind FROM sessions WHERE sessionKey = ?1",
         [key]
       )
 
     %{
       session_key: key,
       owner_user_id: owner,
-      spawned_by: spawned_by,
+      operational_parent: operational_parent,
       host: host,
       state: state,
-      is_built_in: built_in == 1
+      is_built_in: built_in == 1,
+      kind: kind
     }
   end
 

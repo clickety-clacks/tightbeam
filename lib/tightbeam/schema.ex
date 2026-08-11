@@ -67,7 +67,10 @@ defmodule Tightbeam.Schema do
   # widen the existing status/arm CHECKs or add those columns through
   # `CREATE TABLE IF NOT EXISTS`, so a v3 database must refuse by name rather
   # than failing on the first return with a raw column/CHECK error.
-  @shape "coordination-fabric-v1-phase1-v4"
+  # The operational-parent port adds a required `sessions.operationalParent`
+  # column. The v4 stamp is the one exact predecessor this build upgrades.
+  @shape "coordination-fabric-v1-phase1-v5"
+  @previous_shape "coordination-fabric-v1-phase1-v4"
 
   @supervision_liveness_objects [
     %{
@@ -763,8 +766,9 @@ defmodule Tightbeam.Schema do
   So the shape is STAMPED at creation and CHECKED here, per the house rule: a
   missing or unknown stamp is a refusal and a bug report, never an inference.
   Note the direction — the one existence question below is asked to REFUSE,
-  never to deduce a shape and accommodate it. Nothing here migrates, ALTERs,
-  or sniffs stored DDL, and nothing should learn to.
+  never to deduce a shape and accommodate it. The sole accepted predecessor is
+  named by `@previous_shape`; its operational-parent upgrade is exact and
+  transactional. No shape is inferred from stored DDL.
   """
   @spec ensure_all(DB.server()) :: :ok
   def ensure_all(db) do
@@ -790,6 +794,46 @@ defmodule Tightbeam.Schema do
         raise ShapeError,
           message:
             "incompatible_supervision_liveness_v1: additive activation failed: #{Exception.message(error)}"
+    end
+  end
+
+  @doc false
+  @spec upgrade_operational_parent_v1(DB.server(), keyword()) :: :ok
+  def upgrade_operational_parent_v1(db, opts \\ []) when is_list(opts) do
+    case DB.foreign_key_rebuild(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@previous_shape]] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message: "incompatible_operational_parent_v1: predecessor stamp #{inspect(rows)}"
+           end
+
+           :ok = Tightbeam.Org.migrate_operational_parent_v1_in_txn(txn, opts)
+
+           Txn.q(
+             txn,
+             "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1",
+             [@previous_shape, @shape, System.system_time(:millisecond)]
+           )
+
+           if Txn.changes(txn) != 1 do
+             raise ShapeError, message: "incompatible_operational_parent_v1: stamp race"
+           end
+
+           :ok
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "incompatible_operational_parent_v1: upgrade failed: #{Exception.message(error)}"
     end
   end
 
@@ -945,6 +989,9 @@ defmodule Tightbeam.Schema do
       {:ok, [[@shape]]} ->
         :ok
 
+      {:ok, [[@previous_shape]]} ->
+        upgrade_operational_parent_v1(db)
+
       {:ok, []} ->
         # No stamp. Either a database this build is about to create, or one
         # written before stamping existed. Those are DIFFERENT, and telling
@@ -959,7 +1006,8 @@ defmodule Tightbeam.Schema do
           stamped: #{found}
           this build: #{@shape}
 
-        There is no migration. Move the database aside and let it be recreated.
+        There is no migration from #{found}. The only supported upgrade source
+        is #{@previous_shape}. Move this database aside and let it be recreated.
         """
 
       # More than one shape stamped. Nothing writes a second row, so this is a
