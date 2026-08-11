@@ -1139,8 +1139,14 @@ defmodule Tightbeam.CoordinationFabricTest do
     # gating `digest-members`'s visibility on resolving THAT column made an
     # orphaned carrier's audit permanently unreachable, even to its own
     # role's owner. A durable row must have a lawful reader.
-    seed_session(db, "agent:filer", "roleowner")
+    seed_session(db, "agent:filer", "filerowner")
     seed_session(db, "agent:stranger2", "outsider2")
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('roleowner', 0, 1)"
+      )
 
     Roles.create!(db, "orphan-role", "roleowner", nil)
 
@@ -3991,6 +3997,8 @@ defmodule Tightbeam.CoordinationFabricTest do
       DB.query(db, "INSERT OR IGNORE INTO users (userId, isAdmin, createdAt) VALUES (?1, 0, 1)", [
         owner
       ])
+
+    ensure_main_session(db, owner)
 
     Tightbeam.Org.create(db, %{
       session_key: session_key,

@@ -21,6 +21,8 @@ defmodule Tightbeam.JobTraceTest do
         "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('owner',0,1),('admin',1,1),('other',0,1)"
       )
 
+    Enum.each(~w(owner admin other), &ensure_main_session(db, &1))
+
     session(db, "holder", "owner")
     session(db, "reviewer", "other")
     session(db, "owner-session", "owner")

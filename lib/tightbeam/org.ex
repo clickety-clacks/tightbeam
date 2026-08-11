@@ -71,7 +71,7 @@ defmodule Tightbeam.Org do
     ownerUserId   TEXT NOT NULL,
     origin        TEXT NOT NULL,
     spawnedBy     TEXT,
-    operationalParent TEXT NOT NULL,
+    operationalParent TEXT NOT NULL REFERENCES sessions(sessionKey),
     handle        TEXT UNIQUE,
     archetype     TEXT NOT NULL,
     overrides     TEXT,
@@ -860,12 +860,14 @@ defmodule Tightbeam.Org do
          assignment_id
        ) do
     outcome =
-      case retirement_replacement_target(
+      case retirement_replacement_target_for_work(
              txn,
              target_role,
              reresolve,
              reresolve_seed,
-             reresolve_rung
+             reresolve_rung,
+             work_item_id,
+             assignment_id
            ) do
         nil ->
           put_liveness_trigger(
@@ -889,6 +891,42 @@ defmodule Tightbeam.Org do
       causal_source: %{kind: "session_transition", id: session_key},
       outcome: outcome
     }
+  end
+
+  defp retirement_replacement_target_for_work(
+         txn,
+         target_role,
+         reresolve,
+         seed,
+         rung,
+         work_item_id,
+         assignment_id
+       ) do
+    if retirement_replacement_permitted?(txn, work_item_id, assignment_id) do
+      retirement_replacement_target(txn, target_role, reresolve, seed, rung)
+    end
+  end
+
+  defp retirement_replacement_permitted?(_txn, nil, nil), do: true
+
+  defp retirement_replacement_permitted?(txn, work_item_id, nil) do
+    Txn.q(txn, "SELECT state FROM work_items WHERE id=?1", [work_item_id]) == [["open"]]
+  end
+
+  defp retirement_replacement_permitted?(txn, direct_work_item_id, assignment_id) do
+    case Txn.q(txn, "SELECT state, workItemId FROM assignments WHERE id=?1", [assignment_id]) do
+      [["open", _assignment_work_item_id]] ->
+        true
+
+      [[_state, assignment_work_item_id]] ->
+        work_item_id = assignment_work_item_id || direct_work_item_id
+
+        is_binary(work_item_id) and
+          Txn.q(txn, "SELECT state FROM work_items WHERE id=?1", [work_item_id]) == [["open"]]
+
+      [] ->
+        false
+    end
   end
 
   defp retirement_replacement_target(txn, target_role, _reresolve, _seed, _rung)

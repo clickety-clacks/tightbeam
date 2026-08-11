@@ -51,6 +51,8 @@ defmodule Tightbeam.ConditionFactsTest do
 
     :ok = Tightbeam.Schema.ensure_all(db)
 
+    ensure_main_session(db, "flynn")
+
     session =
       Org.create(db, %{
         session_key: "agent:condition:app",

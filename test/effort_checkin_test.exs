@@ -415,6 +415,45 @@ defmodule Tightbeam.EffortCheckinTest do
     assert bracket_state(ctx.db, item.id) == "canceled"
   end
 
+  test "Main-held inactivity terminates after the holder prod without climbing its self-parent",
+       ctx do
+    main_root = Placement.workdir_path(ctx.config, ctx.main)
+    init_workspace(main_root)
+
+    item = dispatch(ctx, {:user, "h1"}, ctx.main.session_key, "Main-held assignment")
+    fire_probe(ctx, item.id)
+    fire_probe(ctx, item.id)
+
+    assert escalation_wakes(ctx.db, item.id) == []
+    assert bracket_state(ctx.db, item.id) == "probed"
+    assert no_effort_requests?(ctx.db, item.id)
+  end
+
+  test "reparenting during a silent streak wakes each live effective parent before Main", ctx do
+    new_parent =
+      session(ctx.db, "new-parent", "h1", Placement.local_host_name(), %{
+        operational_parent: ctx.main.session_key
+      })
+
+    item = dispatch(ctx, {:user, "h1"}, "holder", "live reparent")
+    assert %{session_key: "parent"} = escalate(ctx, item.id)
+
+    Org.set_operational_parent(ctx.db, "holder", new_parent.session_key)
+
+    assert %{session_key: "new-parent"} = fire_parent_probe(ctx, item.id)
+    assert %{session_key: main_key} = fire_parent_probe(ctx, item.id)
+    assert main_key == ctx.main.session_key
+
+    assert Enum.map(escalation_wakes(ctx.db, item.id), & &1.session_key) == [
+             "parent",
+             "new-parent",
+             ctx.main.session_key
+           ]
+
+    assert bracket_state(ctx.db, item.id) == "probed"
+    assert no_effort_requests?(ctx.db, item.id)
+  end
+
   test "proofs 6, 11, 12, 13: escalation follows operational parents and terminates at Main",
        ctx do
     mid =
@@ -1040,7 +1079,10 @@ defmodule Tightbeam.EffortCheckinTest do
     assert %{session_key: "parent"} = escalate(%{ctx | config: moved_config}, item.id)
     assert no_effort_requests?(ctx.db, item.id)
 
-    replacement = session(ctx.db, "replacement", "h2", Placement.local_host_name())
+    replacement =
+      session(ctx.db, "replacement", "h2", Placement.local_host_name(), %{
+        operational_parent: "parent"
+      })
 
     prepared =
       EffortCheckin.prepare_transferred_rearms(

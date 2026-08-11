@@ -21,6 +21,8 @@ defmodule Tightbeam.RulesTest do
 
     :ok = Tightbeam.Schema.ensure_all(db)
 
+    Enum.each(~w(flynn mike other reviewer), &ensure_main_session(db, &1))
+
     base_dir =
       Path.join(System.tmp_dir!(), "tightbeam-rules-#{System.unique_integer([:positive])}")
 
@@ -379,7 +381,7 @@ defmodule Tightbeam.RulesTest do
 
     put_rule(
       ctx,
-      rule("live-count", "post", "org.live_sessions_owned_by_caller", "eq", 1)
+      rule("live-count", "post", "org.live_sessions_owned_by_caller", "eq", 2)
     )
 
     Rules.load!(ctx.base_dir, ["post"])
@@ -598,6 +600,7 @@ defmodule Tightbeam.RulesTest do
 
     handler = Gateway.handlers(config)["spawn"]
     process_call = %{call("process:cron") | verb: "spawn"}
+    {:ok, [[session_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM sessions")
 
     Rules.load!(ctx.base_dir, ["spawn"])
 
@@ -610,7 +613,7 @@ defmodule Tightbeam.RulesTest do
     assert {:error, %{code: "rule_denied"}} =
              Dispatch.dispatch(ctx.db, %{"spawn" => handler}, process_call)
 
-    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM sessions")
+    assert {:ok, [[^session_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM sessions")
   end
 
   test "P3 fact registry has exact names and load-time types", ctx do
