@@ -111,7 +111,7 @@ defmodule Tightbeam.Gateway do
           port: non_neg_integer(),
           default_harness: atom(),
           default_model: Model.t(),
-          max_live_sessions_per_user: pos_integer(),
+          max_live_sessions_per_user: pos_integer() | nil,
           wake_tick_ms: pos_integer(),
           prod_limit: non_neg_integer(),
           escalation_decision_deadline_ms: pos_integer(),
@@ -3621,6 +3621,7 @@ defmodule Tightbeam.Gateway do
 
   defp spawn_result(config, db, call) do
     p = call.params
+    max_live_sessions = Map.get(config, :max_live_sessions_per_user)
 
     case spawn_caller(db, call) do
       nil ->
@@ -3636,13 +3637,9 @@ defmodule Tightbeam.Gateway do
           prior ->
             spawn_replay(db, prior.session_key)
 
-          length(Org.list_for_user(db, caller.owner_user_id, false)) >=
-              config.max_live_sessions_per_user ->
-            %{
-              code: "cap_exceeded",
-              message:
-                "live-session cap (#{config.max_live_sessions_per_user}) reached for #{caller.owner_user_id}"
-            }
+          is_integer(max_live_sessions) and max_live_sessions > 0 and
+              length(Org.list_for_user(db, caller.owner_user_id, false)) >= max_live_sessions ->
+            spawn_cap_exceeded(max_live_sessions, caller.owner_user_id)
 
           true ->
             create_spawn(config, db, call, caller)
@@ -3805,6 +3802,7 @@ defmodule Tightbeam.Gateway do
 
   defp create_spawn(config, db, call, caller, archetype, placement, overrides) do
     p = call.params
+    max_live_sessions = Map.get(config, :max_live_sessions_per_user)
     host = placement.host
     defaults = defaults(config, db)
     harness = p[:harness] || archetype.defaults[:harness] || defaults.harness
@@ -3864,25 +3862,33 @@ defmodule Tightbeam.Gateway do
                ) do
             nil ->
               if Archetypes.get(archetype.name) do
-                session = Org.create_in_txn(txn, input)
+                if spawn_cap_reached_in_txn?(
+                     txn,
+                     caller.owner_user_id,
+                     max_live_sessions
+                   ) do
+                  {:cap_exceeded, max_live_sessions}
+                else
+                  session = Org.create_in_txn(txn, input)
 
-                if p[:handle] do
-                  Roles.create_in_txn!(
-                    txn,
-                    p.handle,
-                    caller.owner_user_id,
-                    session.session_key
-                  )
+                  if p[:handle] do
+                    Roles.create_in_txn!(
+                      txn,
+                      p.handle,
+                      caller.owner_user_id,
+                      session.session_key
+                    )
+                  end
+
+                  Idempotency.put_in_txn(txn, %{
+                    owner_user_id: caller.owner_user_id,
+                    operation: "spawn",
+                    idempotency_key: p.idempotency_key,
+                    session_key: session.session_key
+                  })
+
+                  {:created, session}
                 end
-
-                Idempotency.put_in_txn(txn, %{
-                  owner_user_id: caller.owner_user_id,
-                  operation: "spawn",
-                  idempotency_key: p.idempotency_key,
-                  session_key: session.session_key
-                })
-
-                {:created, session}
               else
                 {:error, :unknown_archetype}
               end
@@ -3893,6 +3899,9 @@ defmodule Tightbeam.Gateway do
         end)
 
       case session_result do
+        {:ok, {:cap_exceeded, cap}} ->
+          spawn_cap_exceeded(cap, caller.owner_user_id)
+
         {:ok, {:error, :unknown_archetype}} ->
           %{code: "unknown_archetype", message: "no such archetype: #{archetype.name}"}
 
@@ -3912,6 +3921,28 @@ defmodule Tightbeam.Gateway do
       {:error, denial} ->
         classified_denial("placement_denied", denial)
     end
+  end
+
+  defp spawn_cap_reached_in_txn?(_txn, _owner_user_id, cap)
+       when not is_integer(cap) or cap <= 0,
+       do: false
+
+  defp spawn_cap_reached_in_txn?(txn, owner_user_id, cap) do
+    [[active]] =
+      Txn.q(
+        txn,
+        "SELECT COUNT(*) FROM sessions WHERE ownerUserId = ?1 AND state = 'active'",
+        [owner_user_id]
+      )
+
+    active >= cap
+  end
+
+  defp spawn_cap_exceeded(cap, owner_user_id) do
+    %{
+      code: "cap_exceeded",
+      message: "live-session cap (#{cap}) reached for #{owner_user_id}"
+    }
   end
 
   defp spawn_model_selection(host, harness, params, default_model) do

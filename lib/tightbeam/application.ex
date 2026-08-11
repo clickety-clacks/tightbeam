@@ -254,8 +254,7 @@ defmodule Tightbeam.Application do
           :default_model,
           Tightbeam.Model.new("claude-sonnet-5", effort: "medium")
         ),
-      max_live_sessions_per_user:
-        Application.get_env(:tightbeam, :max_live_sessions_per_user, 50),
+      max_live_sessions_per_user: Application.get_env(:tightbeam, :max_live_sessions_per_user),
       wake_tick_ms: Application.get_env(:tightbeam, :wake_tick_ms, 1_000),
       prod_limit: Application.get_env(:tightbeam, :prod_limit, 3),
       escalation_decision_deadline_ms:

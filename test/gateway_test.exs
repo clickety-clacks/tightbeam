@@ -1912,6 +1912,136 @@ defmodule Tightbeam.GatewayTest do
     assert Idempotency.get(ctx.db, "flynn", "spawn", "spawn-taken") == nil
   end
 
+  test "spawn has no session-count gate when the cap is unset", ctx do
+    base_dir = role_test_base("spawn-unlimited")
+    Archetypes.load!(base_dir)
+
+    start_supervised!(%{
+      id: :spawn_unlimited_conn_registry,
+      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+    })
+
+    for index <- 1..50 do
+      Org.create(ctx.db, %{
+        session_key: "agent:existing-#{index}",
+        display_name: "Existing #{index}",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("claude-fable-5")
+      })
+    end
+
+    spawn =
+      base_dir
+      |> gateway_config(ctx.db, 0)
+      |> Map.delete(:max_live_sessions_per_user)
+      |> Gateway.handlers()
+      |> Map.fetch!("spawn")
+
+    assert %{session_key: session_key} =
+             spawn.(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{
+                 display_name: "Fifty-first worker",
+                 idempotency_key: "spawn-unlimited"
+               }
+             })
+
+    assert Org.get(ctx.db, session_key).state == "active"
+  end
+
+  test "spawn enforces an explicit positive session cap", ctx do
+    base_dir = role_test_base("spawn-capped")
+    Archetypes.load!(base_dir)
+
+    spawn =
+      base_dir
+      |> gateway_config(ctx.db, 0)
+      |> Map.put(:max_live_sessions_per_user, 1)
+      |> Gateway.handlers()
+      |> Map.fetch!("spawn")
+
+    assert %{code: "cap_exceeded", message: message} =
+             spawn.(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{
+                 display_name: "Over cap",
+                 idempotency_key: "spawn-capped"
+               }
+             })
+
+    assert message =~ "live-session cap (1) reached for flynn"
+    assert Idempotency.get(ctx.db, "flynn", "spawn", "spawn-capped") == nil
+  end
+
+  test "concurrent spawns cannot exceed an explicit positive session cap", ctx do
+    parent = self()
+    base_dir = role_test_base("spawn-cap-race")
+    Archetypes.load!(base_dir)
+
+    start_supervised!(%{
+      id: :spawn_cap_race_conn_registry,
+      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+    })
+
+    spawn =
+      base_dir
+      |> gateway_config(ctx.db, 0)
+      |> Map.put(:max_live_sessions_per_user, 2)
+      |> Map.put(:credential_status, fn _provider ->
+        send(parent, {:past_cap_precheck, self()})
+
+        receive do
+          :continue -> :onboarded
+        end
+      end)
+      |> Gateway.handlers()
+      |> Map.fetch!("spawn")
+
+    tasks =
+      for index <- 1..2 do
+        Task.async(fn ->
+          spawn.(%{
+            origin: "user:flynn",
+            session_key: nil,
+            params: %{
+              display_name: "Concurrent worker #{index}",
+              idempotency_key: "spawn-cap-race-#{index}"
+            }
+          })
+        end)
+      end
+
+    callers =
+      for _ <- 1..2 do
+        assert_receive {:past_cap_precheck, caller}, 5_000
+        caller
+      end
+
+    Enum.each(callers, &send(&1, :continue))
+    results = tasks |> Enum.map(&Task.await(&1, 10_000)) |> Enum.with_index(1)
+
+    assert Enum.count(results, fn {result, _index} -> Map.has_key?(result, :session_key) end) == 1
+
+    assert [{%{code: "cap_exceeded"}, rejected_index}] =
+             Enum.reject(results, fn {result, _index} -> Map.has_key?(result, :session_key) end)
+
+    assert Idempotency.get(
+             ctx.db,
+             "flynn",
+             "spawn",
+             "spawn-cap-race-#{rejected_index}"
+           ) == nil
+
+    assert length(Org.list_for_user(ctx.db, "flynn", false)) == 2
+  end
+
   test "spawn serves a populated stale catalog while preserving its health", ctx do
     base_dir = role_test_base("spawn-stale-populated")
     Archetypes.load!(base_dir)
