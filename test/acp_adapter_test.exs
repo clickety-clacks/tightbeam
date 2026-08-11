@@ -92,6 +92,75 @@ defmodule Tightbeam.Acp.AdapterTest do
              |> Enum.map(& &1["value"])
   end
 
+  test "an advertised live option is read, applied by its harness id, and exactly verified" do
+    {adapter, capture_path} = start_adapter(fail_mode: "fast-live")
+    assert {:ok, "sess-1"} = Adapter.new_session(adapter, nil, "/tmp", [], "guidance")
+
+    assert {:ok, %{"currentValue" => "off"}} =
+             Adapter.live_config_option(adapter, "sess-1", "fast")
+
+    assert {:ok, %{"currentValue" => "on"}} =
+             Adapter.apply_live_config_option(adapter, "sess-1", "fast", "on")
+
+    assert ["on"] =
+             capture_path
+             |> captured_requests()
+             |> Enum.filter(
+               &(&1["method"] == "session/set_config_option" and &1["configId"] == "fast")
+             )
+             |> Enum.map(& &1["value"])
+
+    assert {:ok, %{"currentValue" => "on"}} =
+             Adapter.live_config_option(adapter, "sess-1", "fast")
+  end
+
+  test "a missing live option refuses without guessing a config id" do
+    {adapter, capture_path} = start_adapter()
+    assert {:ok, "sess-1"} = Adapter.new_session(adapter, nil, "/tmp", [], "guidance")
+
+    assert {:error, :config_option_unsupported} =
+             Adapter.apply_live_config_option(adapter, "sess-1", "fast", "on")
+
+    refute Enum.any?(captured_requests(capture_path), fn request ->
+             request["method"] == "session/set_config_option" and request["configId"] == "fast"
+           end)
+  end
+
+  test "a mismatched live-option readback is retained as actual state and refused" do
+    {adapter, _capture_path} = start_adapter(fail_mode: "fast-mismatch")
+    assert {:ok, "sess-1"} = Adapter.new_session(adapter, nil, "/tmp", [], "guidance")
+
+    assert {:error, {:config_option_verification_failed, %{"currentValue" => "off"}}} =
+             Adapter.apply_live_config_option(adapter, "sess-1", "fast", "on")
+
+    assert {:ok, %{"currentValue" => "off"}} =
+             Adapter.live_config_option(adapter, "sess-1", "fast")
+  end
+
+  test "Fast is normalized from Claude fast and Codex fast-mode live options" do
+    {claude, _capture_path} = start_adapter(fail_mode: "fast-live")
+    assert {:ok, "sess-1"} = Adapter.new_session(claude, nil, "/tmp", [], "guidance")
+    assert {:ok, %{fast: "off", option_id: "fast"}} = Adapter.fast_status(claude, "sess-1")
+    assert {:ok, %{fast: "on", option_id: "fast"}} = Adapter.apply_fast(claude, "sess-1", "on")
+
+    {codex, capture_path} = start_adapter(harness: :codex, fail_mode: "fast-live-codex")
+    assert {:ok, "sess-1"} = Adapter.new_session(codex, nil, "/tmp", [], "guidance")
+
+    assert {:ok, %{fast: "off", option_id: "fast-mode"}} =
+             Adapter.fast_status(codex, "sess-1")
+
+    assert {:ok, %{fast: "on", option_id: "fast-mode"}} =
+             Adapter.apply_fast(codex, "sess-1", "on")
+
+    assert [true] =
+             capture_path
+             |> captured_requests()
+             |> Enum.filter(
+               &(&1["method"] == "session/set_config_option" and &1["configId"] == "fast-mode")
+             )
+             |> Enum.map(& &1["value"])
+  end
+
   test "residency waits behind slow adapter boot and dead adapters fail promptly" do
     adapter = start_supervised!({SlowBootAdapter, self()})
     assert_receive {:adapter_booting, ^adapter}
@@ -145,6 +214,7 @@ defmodule Tightbeam.Acp.AdapterTest do
   let forkCalls = 0;
   const models = {};
   const efforts = {};
+  const fastValues = {};
   const offeredModels = {};
   const defaultOfferedModels = [
     "default", "opus[1m]", "claude-fable-5[1m]", "sonnet", "haiku",
@@ -168,6 +238,17 @@ defmodule Tightbeam.Acp.AdapterTest do
     }
   };
   const configOptions = (sid) => ({ configOptions: [
+    ...(failMode.startsWith("fast-") ? [{
+      id: failMode === "fast-live-codex" ? "fast-mode" : "fast",
+      name: "Fast mode",
+      type: failMode === "fast-live-codex" ? "boolean" : "select",
+      currentValue: Object.hasOwn(fastValues, sid)
+        ? fastValues[sid]
+        : (failMode === "fast-live-codex" ? false : "off"),
+      options: failMode === "fast-live-codex"
+        ? [{ value: true, name: "On" }, { value: false, name: "Off" }]
+        : [{ value: "on", name: "On" }, { value: "off", name: "Off" }]
+    }] : []),
     {
       id: "model",
       currentValue: models[sid] || "haiku",
@@ -254,6 +335,12 @@ defmodule Tightbeam.Acp.AdapterTest do
           // catalog advertised (`gpt-5.1-codex`) — JSON-RPC -32602 Invalid params.
           return send({ id: m.id, error: { code: -32602, message: "Invalid params" } });
         }
+        if (failMode === "fast-refusal" && m.params.configId === "fast") {
+          return send({ id: m.id, error: { code: -32000, message: "fast refused" } });
+        }
+        if (failMode === "fast-mismatch" && m.params.configId === "fast") {
+          return send({ id: m.id, result: configOptions(m.params.sessionId) });
+        }
         if (failMode === "strict-partial-apply" &&
             m.params.configId === "reasoning_effort" &&
             m.params.value === "high") {
@@ -291,6 +378,7 @@ defmodule Tightbeam.Acp.AdapterTest do
         }
         if (m.params.configId === "model") models[m.params.sessionId] = m.params.value;
         if (m.params.configId === "effort" || m.params.configId === "reasoning_effort") efforts[m.params.sessionId] = m.params.value;
+        if (m.params.configId === "fast" || m.params.configId === "fast-mode") fastValues[m.params.sessionId] = m.params.value;
         return send({ id: m.id, result: configOptions(m.params.sessionId) });
       }
       case "session/set_mode": {
@@ -917,7 +1005,8 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert {:ok, "sess-1"} =
              Adapter.new_session(adapter, Model.new("gpt-old"), "/tmp", [], "guidance")
 
-    assert {:error, :model_verification_failed} =
+    assert {:error,
+            {:runtime_config_mismatch, %Model{family: "haiku", effort: "medium", context: nil}}} =
              Adapter.switch_model_session(
                adapter,
                "sess-1",
@@ -927,7 +1016,9 @@ defmodule Tightbeam.Acp.AdapterTest do
                "guidance"
              )
 
-    assert {:error, :model_readback_unavailable} = Adapter.current_model(adapter, "sess-1")
+    assert {:ok, %Model{family: "haiku", effort: "medium", context: nil}} =
+             Adapter.current_model(adapter, "sess-1")
+
     refute Enum.any?(captured_requests(capture_path), &(&1["method"] == "session/fork"))
   end
 
@@ -1083,23 +1174,28 @@ defmodule Tightbeam.Acp.AdapterTest do
            ] = session_requests(capture_path)
   end
 
-  test "guidance uses the harness-accurate ACP metadata channel on new and load" do
+  test "bounded continuity guidance uses the harness-accurate metadata channel on new and load" do
+    guidance =
+      "served guidance\n\n" <>
+        "Run `tightbeam transcript --session \"same-key\" --limit 50`. " <>
+        "Do not replay or inject earlier messages."
+
     for {harness, expected} <- [
-          {:codex, %{"developerInstructions" => "served guidance"}},
+          {:codex, %{"developerInstructions" => guidance}},
           {:claude,
            %{
              "systemPrompt" => %{
                "type" => "preset",
                "preset" => "claude_code",
-               "append" => "served guidance"
+               "append" => guidance
              }
            }},
-          {:fixture, %{"instructions" => "served guidance"}}
+          {:fixture, %{"instructions" => guidance}}
         ] do
       {adapter, capture_path} = start_adapter(harness: harness)
 
       assert {:ok, "sess-1"} =
-               Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "served guidance")
+               Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], guidance)
 
       assert {:ok, _pushed_model} =
                Adapter.load_session(
@@ -1108,7 +1204,7 @@ defmodule Tightbeam.Acp.AdapterTest do
                  "haiku",
                  "/tmp",
                  [],
-                 "served guidance"
+                 guidance
                )
 
       assert Enum.all?(session_requests(capture_path), &(&1["meta"] == expected))
@@ -1173,6 +1269,26 @@ defmodule Tightbeam.Acp.AdapterTest do
              )
 
     refute Adapter.knows_session?(adapter, "sess-1")
+  end
+
+  test "a rejected candidate reports verified teardown" do
+    {adapter, capture_path} = start_adapter(harness: :codex, fail_mode: "model-invalid-params")
+
+    assert {:error,
+            {:session_prepare_failed, :model_unavailable, "sess-1",
+             %{status: "verified", reason: nil}}} =
+             Adapter.new_candidate_session(
+               adapter,
+               Model.new("gpt-5.1-codex"),
+               "/tmp",
+               [],
+               "guidance"
+             )
+
+    assert Enum.any?(captured_requests(capture_path), fn request ->
+             request["method"] == "session/close" and
+               request["sessionId"] == "sess-1"
+           end)
   end
 
   test "strict apply does not retry an invalid-params model refusal" do
