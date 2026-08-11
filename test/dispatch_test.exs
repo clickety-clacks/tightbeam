@@ -64,7 +64,6 @@ defmodule Tightbeam.DispatchTest do
 
     transition = %{
       kind: "policy_denied",
-      assignment_id: "asg_1",
       evaluation_clock: 5_000
     }
 
@@ -99,6 +98,41 @@ defmodule Tightbeam.DispatchTest do
              )
   end
 
+  test "supervision policy denial cannot name a different transition assignment", %{db: db} do
+    prepare_claimed_liveness!(db)
+    :persistent_term.put(Rules, [denial_rule()])
+
+    call = %{
+      verb: "wake",
+      origin: "process:tightbeam",
+      principal: {:process, "tightbeam"},
+      session_key: "holder",
+      params: %{assignment_id: "asg_other"}
+    }
+
+    assert_raise FunctionClauseError, fn ->
+      Dispatch.dispatch_with_policy_denial_transition(db, %{}, call, %{
+        kind: "policy_denied",
+        assignment_id: "asg_1",
+        evaluation_clock: 5_000
+      })
+    end
+
+    assert [] = EventLog.events_after(db, 0, 10)
+
+    assert {:ok, [[3, "claimed", 5_000]]} =
+             DB.query(
+               db,
+               "SELECT generation, state, claimClock FROM supervision_entitlements"
+             )
+
+    assert {:ok, [["prod", "asg_1"]]} =
+             DB.query(
+               db,
+               "SELECT pendingBranch, pendingAssignment FROM supervision_watermarks"
+             )
+  end
+
   test "supervision policy denial rollback preserves the claimed branch", %{db: db} do
     prepare_claimed_liveness!(db, counters: false)
     :persistent_term.put(Rules, [denial_rule()])
@@ -116,7 +150,6 @@ defmodule Tightbeam.DispatchTest do
                  fn ->
                    Dispatch.dispatch_with_policy_denial_transition(db, %{}, call, %{
                      kind: "policy_denied",
-                     assignment_id: "asg_1",
                      evaluation_clock: 5_000
                    })
                  end

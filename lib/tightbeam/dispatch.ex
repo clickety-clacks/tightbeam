@@ -63,7 +63,6 @@ defmodule Tightbeam.Dispatch do
 
   @type policy_denial_transition :: %{
           required(:kind) => String.t(),
-          required(:assignment_id) => String.t(),
           required(:evaluation_clock) => non_neg_integer()
         }
 
@@ -84,7 +83,9 @@ defmodule Tightbeam.Dispatch do
   Dispatch a supervision call through the same rail as `dispatch/3`.
 
   A policy denial commits its denied event and the supplied liveness transition
-  together. Other outcomes retain the `dispatch/3` behavior and return shapes.
+  together. The assignment is derived from the call, so the event and transition
+  cannot name different assignments. Other outcomes retain the `dispatch/3`
+  behavior and return shapes.
   """
   @spec dispatch_with_policy_denial_transition(
           GenServer.server(),
@@ -95,16 +96,15 @@ defmodule Tightbeam.Dispatch do
   def dispatch_with_policy_denial_transition(
         db,
         handlers,
-        call,
+        %{params: %{assignment_id: assignment_id}} = call,
         %{
           kind: "policy_denied",
-          assignment_id: assignment_id,
           evaluation_clock: evaluation_clock
         } = transition
       )
-      when map_size(transition) == 3 and is_binary(assignment_id) and
+      when map_size(transition) == 2 and is_binary(assignment_id) and
              is_integer(evaluation_clock) and evaluation_clock >= 0 do
-    dispatch_call(db, handlers, call, transition)
+    dispatch_call(db, handlers, call, Map.put(transition, :assignment_id, assignment_id))
   end
 
   defp dispatch_call(db, handlers, call, policy_denial_transition) do
