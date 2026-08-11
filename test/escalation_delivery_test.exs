@@ -112,6 +112,30 @@ defmodule Tightbeam.EscalationDeliveryTest do
     assert wake.prompt =~ "Decision #{id} pending on review."
   end
 
+  test "proof 1b: an operator row and its Main opportunity commit or roll back together", ctx do
+    call = operator_call()
+
+    block_prompt_wakes!(ctx.db)
+    assert_aborts!(fn -> Escalation.operator_ask(ctx.db, call) end)
+
+    assert count(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE kind='operator'") == 0
+    assert notification_wakes(ctx.db) == []
+
+    unblock_prompt_wakes!(ctx.db)
+    request = Escalation.operator_ask(ctx.db, call)
+
+    assert request.kind == "operator"
+    assert request.status == "open"
+    assert request.deadline_wake_id == nil
+
+    assert [%{session_key: main, consumer: "prompt", target_gate: 0, state: "pending"} = wake] =
+             notification_wakes(ctx.db)
+
+    assert main == Org.personal_session_key("flynn")
+    assert wake.prompt =~ request.id
+    assert wake.prompt =~ "ship window?"
+  end
+
   ## Proof 2 — effort-open atomicity (and the assignmentId carrier)
 
   test "proof 2: an effort request, its deadline wake, and its notification are one commit",
@@ -465,6 +489,7 @@ defmodule Tightbeam.EscalationDeliveryTest do
     # in-transaction prompt arm each one owes.
     request_sites = [
       {"lib/tightbeam/escalation.ex", "escalate/4"},
+      {"lib/tightbeam/escalation.ex", "insert_operator_request_in_txn/6"},
       {"lib/tightbeam/effort_checkin.ex", "open_request_in_txn/4"},
       {"lib/tightbeam/effort_checkin.ex", "deadline_in_txn/3"}
     ]
@@ -701,6 +726,16 @@ defmodule Tightbeam.EscalationDeliveryTest do
       principal: {:session, "raiser"},
       session_key: nil,
       params: params
+    }
+  end
+
+  defp operator_call do
+    %{
+      verb: "operator-ask",
+      origin: "agent:raiser",
+      principal: {:session, "raiser"},
+      transport_session_key: "raiser",
+      params: %{question: "ship window?"}
     }
   end
 
