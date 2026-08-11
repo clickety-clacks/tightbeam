@@ -1,7 +1,7 @@
 defmodule Tightbeam.DispatchTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Dispatch, Escalation, EventLog, Rules}
+  alias Tightbeam.{DB, Dispatch, Escalation, EventLog, Model, Org, Rules}
 
   setup do
     :persistent_term.erase(Rules)
@@ -48,6 +48,92 @@ defmodule Tightbeam.DispatchTest do
              {"denied", "nope"},
              {"denied", "spawn"}
            ]
+  end
+
+  test "supervision policy denial commits its event and successor together", %{db: db} do
+    prepare_claimed_liveness!(db)
+    :persistent_term.put(Rules, [denial_rule()])
+
+    call = %{
+      verb: "wake",
+      origin: "process:tightbeam",
+      principal: {:process, "tightbeam"},
+      session_key: "holder",
+      params: %{assignment_id: "asg_1"}
+    }
+
+    transition = %{
+      kind: "policy_denied",
+      assignment_id: "asg_1",
+      evaluation_clock: 5_000
+    }
+
+    assert {:error, %{code: "rule_denied"}} =
+             Dispatch.dispatch_with_policy_denial_transition(
+               db,
+               %{"wake" => fn _ -> flunk("policy denial must not reach the handler") end},
+               call,
+               transition
+             )
+
+    assert [%{id: event_id, kind: "denied", principal: "process:tightbeam"}] =
+             EventLog.events_after(db, 0, 10)
+
+    assert {:ok, [[4, 6_000, "armed", "policy_denied", basis_id, "policy_denied"]]} =
+             DB.query(
+               db,
+               """
+               SELECT generation, dueAt, state, basisKind, basisId, cause
+               FROM supervision_entitlements
+               WHERE assignmentId='asg_1'
+               """
+             )
+
+    assert basis_id == to_string(event_id)
+    assert {:ok, [[1]]} = DB.query(db, "SELECT deniedStreak FROM assignment_prods")
+
+    assert {:ok, [[nil, nil]]} =
+             DB.query(
+               db,
+               "SELECT pendingBranch, pendingAssignment FROM supervision_watermarks"
+             )
+  end
+
+  test "supervision policy denial rollback preserves the claimed branch", %{db: db} do
+    prepare_claimed_liveness!(db, counters: false)
+    :persistent_term.put(Rules, [denial_rule()])
+
+    call = %{
+      verb: "wake",
+      origin: "process:tightbeam",
+      principal: {:process, "tightbeam"},
+      session_key: "holder",
+      params: %{assignment_id: "asg_1"}
+    }
+
+    assert_raise RuntimeError,
+                 "incompatible_supervision_liveness_v1: missing policy denial counters",
+                 fn ->
+                   Dispatch.dispatch_with_policy_denial_transition(db, %{}, call, %{
+                     kind: "policy_denied",
+                     assignment_id: "asg_1",
+                     evaluation_clock: 5_000
+                   })
+                 end
+
+    assert [] = EventLog.events_after(db, 0, 10)
+
+    assert {:ok, [[3, "claimed", 5_000]]} =
+             DB.query(
+               db,
+               "SELECT generation, state, claimClock FROM supervision_entitlements"
+             )
+
+    assert {:ok, [["prod", "asg_1"]]} =
+             DB.query(
+               db,
+               "SELECT pendingBranch, pendingAssignment FROM supervision_watermarks"
+             )
   end
 
   test "raising handler returns server_error and appends a verb event with the error", %{db: db} do
@@ -122,5 +208,90 @@ defmodule Tightbeam.DispatchTest do
              }
            ] =
              EventLog.rail_denials(db, 0, 10)
+  end
+
+  defp prepare_claimed_liveness!(db, opts \\ []) do
+    :ok = Tightbeam.Schema.ensure_all(db)
+
+    :ok =
+      DB.execute(
+        db,
+        """
+        CREATE TABLE supervision_entitlements (
+          assignmentId TEXT PRIMARY KEY REFERENCES assignments(id),
+          generation INTEGER NOT NULL,
+          dueAt INTEGER,
+          state TEXT NOT NULL,
+          lastAttemptGeneration INTEGER,
+          claimClock INTEGER,
+          basisKind TEXT NOT NULL,
+          basisId TEXT NOT NULL,
+          terminusAt INTEGER,
+          cause TEXT NOT NULL,
+          principal TEXT NOT NULL,
+          supervisionIntervalMs INTEGER
+        );
+        """
+      )
+
+    {:ok, _} =
+      DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1)")
+
+    Org.create(db, %{
+      session_key: "holder",
+      display_name: "holder",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("fable"),
+      host: "eezo"
+    })
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO assignments (id, subject, holderKey, openedByUser, openedAt) VALUES ('asg_1', 'ship it', 'holder', 'flynn', 1)"
+      )
+
+    :ok =
+      DB.execute(
+        db,
+        """
+        INSERT INTO supervision_entitlements
+          (assignmentId, generation, dueAt, state, lastAttemptGeneration, claimClock,
+           basisKind, basisId, terminusAt, cause, principal, supervisionIntervalMs)
+        VALUES
+          ('asg_1', 3, 5000, 'claimed', 3, 5000, 'assignment_open', 'asg_1', NULL,
+           'deadline', 'process:tightbeam', 1000);
+        INSERT INTO supervision_watermarks
+          (sessionKey, lastEvaluatedTerminal, pendingBranch, pendingAssignment, pendingK, pendingN)
+        VALUES ('holder', 7, 'prod', 'asg_1', 1, 2);
+        """
+      )
+
+    if Keyword.get(opts, :counters, true) do
+      {:ok, _} =
+        DB.query(
+          db,
+          "INSERT INTO assignment_prods (assignmentId, attemptCount, prodCount, deniedStreak) VALUES ('asg_1', 1, 0, 0)"
+        )
+    end
+
+    :ok
+  end
+
+  defp denial_rule do
+    %{
+      name: "deny-wake",
+      verb: "wake",
+      text: "deny this wake",
+      conditions: [],
+      edges: ["verb"],
+      effect: "deny",
+      check: nil,
+      identity_manifest_sha: "identity-sha"
+    }
   end
 end
