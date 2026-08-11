@@ -166,6 +166,18 @@ A decision that belongs to the user, and any vague point the work depends on (a 
 a concept the work is built on), goes to the user. Do not guess and do not stall: ask. The
 work waits until the user answers; the answer is recorded as a fact and releases the work.
 
+File an owner-scoped decision with `operator-ask`. The command returns a decision request id
+(`dr_id`). Quote that dr_id in each related wake.
+
+Treat a Main wake about an open request as a delivery opportunity. Do not infer that Main
+must present the request, reply, or take another particular action. Apply the session's
+projected instructions to decide whether and how to act.
+
+Label a delivery proxy's recommendation as that proxy's opinion. Main and any other session
+that presented the request never run `operator-rule`. Main also never runs `operator-rule`
+with `--as-user`. A non-presenting relay runs it only after the operator gives an explicit
+instruction that names the dr_id.
+
 ## Report so the user can act
 - Support every claim with its source — a file and line, a log line, a specific commit.
 - Report state the user can act on: what changed, what is ready, what remains, who acts next,

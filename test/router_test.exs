@@ -758,7 +758,7 @@ defmodule Tightbeam.Wire.RouterTest do
     assert disallowed.status == 400
   end
 
-  test "F6: the dispatch boundary strips a wake's substrate-only carrier", ctx do
+  test "the dispatch boundary strips a wake's substrate-only carriers", ctx do
     # Law 0: a client-supplied wake `assignmentId` would forge
     # wake -> turn -> trace attribution. The spec pins that it is STRIPPED at the
     # dispatch boundary, so this drives a REAL authenticated /agent/dispatch
@@ -773,7 +773,11 @@ defmodule Tightbeam.Wire.RouterTest do
       JSON.encode!(%{
         verb: "wake",
         asUser: "flynn",
-        params: %{prompt: "an ordinary conversational wake", assignmentId: "asg_victim"}
+        params: %{
+          prompt: "an ordinary conversational wake",
+          assignmentId: "asg_victim",
+          requestRef: "dr_forged"
+        }
       })
 
     response =
@@ -795,8 +799,22 @@ defmodule Tightbeam.Wire.RouterTest do
     refute Map.has_key?(wake_params, :assignment_id),
            "a client-supplied wake assignmentId must never reach the handler"
 
+    refute Map.has_key?(wake_params, :request_ref),
+           "a client-supplied wake requestRef must never reach the handler"
+
     assert wake_params[:prompt] == "an ordinary conversational wake"
     assert response.status == 200
+  end
+
+  test "operator ruling provenance is substrate-only" do
+    params =
+      Router.atomize_params_for_test("operator-rule", %{
+        "request" => "dr_1",
+        "decision" => "accept",
+        "ruledViaSessionKey" => "forged-session"
+      })
+
+    assert params == %{request: "dr_1", decision: "accept"}
   end
 
   test "Proof 2: agent-supplied createdInTurnSeq and createdContextKnown are stripped from work-item-create",
@@ -1272,13 +1290,25 @@ defmodule Tightbeam.Wire.RouterTest do
     Roles.create!(ctx.db, "beta", "flynn", several.session_key)
 
     assert dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", as: "held"}).status == 200
-    assert_receive {:call, %{origin: "agent:held", principal: {:session, "holder-token"}}}
+
+    assert_receive {:call,
+                    %{
+                      origin: "agent:held",
+                      principal: {:session, "holder-token"},
+                      transport_session_key: "holder-token"
+                    }}
 
     assert dispatch_cli(ctx, holder.cli_token, %{verb: "inspect"}).status == 200
     assert_receive {:call, %{origin: "agent:held", principal: {:session, "holder-token"}}}
 
     assert dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", asUser: "flynn"}).status == 200
-    assert_receive {:call, %{origin: "user:flynn", principal: {:user, "flynn"}}}
+
+    assert_receive {:call,
+                    %{
+                      origin: "user:flynn",
+                      principal: {:user, "flynn"},
+                      transport_session_key: "holder-token"
+                    }}
 
     # Registering a satellite also provisions its operator endpoint over ssh; this
     # test is about the identity ladder, so the reach is stubbed and the gateway
@@ -1355,7 +1385,13 @@ defmodule Tightbeam.Wire.RouterTest do
     assert_receive {:call, %{origin: "agent:main-role", principal: {:session, "main-token"}}}
 
     assert dispatch_cli(ctx, "tbc_test", %{verb: "inspect", asUser: "flynn"}).status == 200
-    assert_receive {:call, %{origin: "user:flynn", principal: {:user, "flynn"}}}
+
+    assert_receive {:call,
+                    %{
+                      origin: "user:flynn",
+                      principal: {:user, "flynn"},
+                      transport_session_key: nil
+                    }}
 
     assert dispatch_cli(ctx, "tbc_test", %{verb: "inspect", asProcess: "cron"}).status == 200
     assert_receive {:call, %{origin: "process:cron", principal: {:process, "cron"}}}
