@@ -111,10 +111,10 @@ both install paths.
 
 The CLI and the gateway ship in one package on purpose, so their version
 handshake holds by construction — you cannot end up with a CLI that its gateway
-refuses. `npm install -g` installs both in npm's global bin directory. If that
-directory is not already on your shell or service `PATH`, add it for easy CLI
-access; Tightbeam does not change your `PATH` for you. Nothing else is added to
-the machine, and neither Elixir nor Rust is needed to run either one.
+refuses. `npm install -g` installs both in npm's global bin directory. If you
+want easy access to the Tightbeam CLI, make sure npm's global bin directory is
+in your `PATH`. Tightbeam does not change your `PATH` for you. Nothing else is
+added to the machine, and neither Elixir nor Rust is needed to run either one.
 
 ### Cutting a release
 
