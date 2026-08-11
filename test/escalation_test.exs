@@ -497,6 +497,331 @@ defmodule Tightbeam.EscalationTest do
            ]
   end
 
+  test "operator ask normalizes, owner-scopes, structurally dedupes, and arms one opportunity",
+       ctx do
+    before_open = System.system_time(:millisecond)
+
+    call =
+      operator_call(ctx.raiser, %{
+        question: "  ship window?  ",
+        note: "  release train  ",
+        options: [%{label: " accept "}, %{"label" => "wait"}],
+        deadline: 12_345
+      })
+
+    request = Escalation.operator_ask(ctx.db, call)
+
+    assert %{
+             kind: "operator",
+             status: "open",
+             owner_user_id: "flynn",
+             raiser_id: "agent:raiser",
+             raiser_session_key: raiser_key,
+             question: "ship window?",
+             options: [%{"label" => "accept"}, %{"label" => "wait"}],
+             context: %{"note" => "release train", "supersedes" => nil},
+             deadline_wake_id: nil,
+             ruled_via_session_key: nil
+           } = request
+
+    assert raiser_key == ctx.raiser.session_key
+    assert request.deadline_at >= before_open + 12_345
+
+    assert [%{session_key: main_key, target_gate: 0, state: "pending"} = wake] =
+             notification_wakes(ctx)
+
+    assert main_key == Org.personal_session_key("flynn")
+    assert wake.prompt =~ request.id
+    assert wake.prompt =~ "ship window?"
+
+    replay =
+      operator_call(ctx.raiser, %{
+        question: "ship window?",
+        note: "release train",
+        options: [%{"label" => "accept"}, %{"label" => "wait"}],
+        deadline: 99_999
+      })
+
+    assert %{id: id, deadline_at: deadline_at} = Escalation.operator_ask(ctx.db, replay)
+    assert id == request.id
+    assert deadline_at == request.deadline_at
+    assert length(notification_wakes(ctx)) == 1
+
+    defaulted =
+      Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "defaults?"}))
+
+    explicit_defaults =
+      Escalation.operator_ask(
+        ctx.db,
+        operator_call(ctx.raiser, %{
+          question: "defaults?",
+          options: [%{label: "accept"}, %{label: "dismiss"}]
+        })
+      )
+
+    assert explicit_defaults.id == defaulted.id
+
+    assert %{code: "invalid"} =
+             Escalation.operator_ask(ctx.db, %{
+               origin: "user:flynn",
+               principal: {:user, "flynn"},
+               params: %{question: "not session-filed"}
+             })
+
+    assert %{code: "invalid"} =
+             Escalation.operator_ask(
+               ctx.db,
+               operator_call(ctx.raiser, %{question: " ", options: []})
+             )
+
+    assert %{code: "invalid"} =
+             Escalation.operator_ask(
+               ctx.db,
+               operator_call(ctx.raiser, %{
+                 question: "no statute effects",
+                 options: [%{label: "accept", effect: "allow"}]
+               })
+             )
+
+    assert Enum.count(EventLog.lifecycle_events(ctx.db), fn event ->
+             event.kind == "decision_request_opened" and event.subject == request.id
+           end) == 1
+  end
+
+  test "operator ask validates linked assignment ownership in the winning transaction", ctx do
+    other = session(ctx.db, "other-holder", "other")
+    insert_assignment!(ctx.db, "a-owned", ctx.raiser.session_key, "open")
+    insert_assignment!(ctx.db, "a-foreign", other.session_key, "open")
+    insert_assignment!(ctx.db, "a-closed", ctx.raiser.session_key, "closed")
+
+    assert %{assignment_id: "a-owned"} =
+             Escalation.operator_ask(
+               ctx.db,
+               operator_call(ctx.raiser, %{question: "owned?", assignment: "a-owned"})
+             )
+
+    assert %{code: "not_owner"} =
+             Escalation.operator_ask(
+               ctx.db,
+               operator_call(ctx.raiser, %{question: "foreign?", assignment: "a-foreign"})
+             )
+
+    assert %{code: "not_open"} =
+             Escalation.operator_ask(
+               ctx.db,
+               operator_call(ctx.raiser, %{question: "closed?", assignment: "a-closed"})
+             )
+
+    assert %{code: "not_found"} =
+             Escalation.operator_ask(
+               ctx.db,
+               operator_call(ctx.raiser, %{question: "missing?", assignment: "a-missing"})
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE kind='operator'")
+  end
+
+  test "operator ruling is Mike-only, transport-stamped, Main-refused, and replay-safe", ctx do
+    {:decision_pending, statute_id} =
+      open(ctx, call(ctx.raiser, %{assignment_id: "operator-wrong-kind"}), statute())
+
+    assert %{code: "invalid"} =
+             Escalation.operator_rule(
+               ctx.db,
+               owner_operator_rule(statute_id, %{decision: "allow"})
+             )
+
+    direct =
+      Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "ship?"}))
+
+    main_rule =
+      owner_operator_rule(direct.id, %{decision: "accept"})
+      |> Map.put(:transport_session_key, Org.personal_session_key("flynn"))
+
+    assert %{code: "proxy_only"} = Escalation.operator_rule(ctx.db, main_rule)
+
+    assert %{code: "not_owner"} =
+             Escalation.operator_rule(ctx.db, %{
+               origin: "user:flynn",
+               principal: {:session, Org.personal_session_key("flynn")},
+               transport_session_key: Org.personal_session_key("flynn"),
+               params: %{request: direct.id, decision: "accept"}
+             })
+
+    assert %{code: "not_owner"} =
+             Escalation.operator_rule(ctx.db, %{
+               origin: "user:other",
+               principal: {:user, "other"},
+               transport_session_key: nil,
+               params: %{request: direct.id, decision: "accept"}
+             })
+
+    assert %{code: "invalid_decision"} =
+             Escalation.operator_rule(
+               ctx.db,
+               owner_operator_rule(direct.id, %{decision: "later"})
+             )
+
+    assert %{code: "invalid"} =
+             Escalation.operator_rule(
+               ctx.db,
+               owner_operator_rule(direct.id, %{decision: "accept", response: "yes"})
+             )
+
+    ruled =
+      Escalation.operator_rule(ctx.db, owner_operator_rule(direct.id, %{decision: "accept"}))
+
+    assert ruled.status == "ruled"
+    assert ruled.decision == "accept"
+    assert ruled.ruled_by == "user:flynn"
+    assert ruled.ruled_via_session_key == nil
+    assert is_integer(ruled.ruling_fact_id)
+    refute Escalation.consume(ctx.db, direct.id)
+
+    refiled =
+      Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "ship?"}))
+
+    refute refiled.id == direct.id
+
+    replay =
+      Escalation.operator_rule(ctx.db, owner_operator_rule(direct.id, %{response: "accept"}))
+
+    assert replay.id == ruled.id
+    assert replay.ruling_fact_id == ruled.ruling_fact_id
+
+    assert %{code: "not_open"} =
+             Escalation.operator_rule(
+               ctx.db,
+               owner_operator_rule(direct.id, %{response: "different"})
+             )
+
+    relayed =
+      Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "relay?"}))
+
+    relay_call =
+      owner_operator_rule(relayed.id, %{response: "  yes, after 013  ", rationale: "  ordered  "})
+      |> Map.put(:transport_session_key, ctx.raiser.session_key)
+
+    assert %{
+             decision: "yes, after 013",
+             rationale: "ordered",
+             ruled_via_session_key: relay_key
+           } = Escalation.operator_rule(ctx.db, relay_call)
+
+    assert relay_key == ctx.raiser.session_key
+
+    assert %{code: "invalid"} =
+             Escalation.rule(ctx.db, owner_operator_rule(relayed.id, %{decision: "accept"}),
+               authorized: true
+             )
+
+    assert %{code: "invalid"} =
+             Escalation.waive(ctx.db, owner_operator_rule(relayed.id, %{decision: "accept"}),
+               authorized: true
+             )
+  end
+
+  test "operator supersede and withdraw are atomic, same-raiser, owner-scoped, and replay-safe",
+       ctx do
+    old = Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "old?"}))
+    successor = session(ctx.db, "successor", "flynn")
+
+    replacement_call =
+      operator_call(successor, %{question: "new?", supersedes: old.id})
+      |> Map.put(:origin, "agent:raiser")
+
+    replacement = Escalation.operator_ask(ctx.db, replacement_call)
+    assert replacement.context["supersedes"] == old.id
+    assert operator_request(ctx, old.id).status == "superseded"
+    assert Escalation.operator_ask(ctx.db, replacement_call).id == replacement.id
+
+    other_origin =
+      operator_call(successor, %{question: "steal?", supersedes: replacement.id})
+      |> Map.put(:origin, "agent:other")
+
+    assert %{code: "not_owner"} = Escalation.operator_ask(ctx.db, other_origin)
+
+    raiser_withdraw = %{
+      origin: "agent:raiser",
+      principal: {:session, successor.session_key},
+      params: %{request: replacement.id, reason: "  replaced elsewhere  "}
+    }
+
+    withdrawn = Escalation.operator_withdraw(ctx.db, raiser_withdraw)
+    assert withdrawn.status == "withdrawn"
+    assert withdrawn.withdrawn_reason == "replaced elsewhere"
+    assert Escalation.operator_withdraw(ctx.db, raiser_withdraw).id == replacement.id
+
+    owner_request =
+      Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "owner withdraw?"}))
+
+    owner_withdraw = %{
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      params: %{request: owner_request.id, reason: "moot"}
+    }
+
+    assert %{code: "invalid"} =
+             Escalation.withdraw(ctx.db, %{
+               origin: "agent:raiser",
+               principal: {:session, ctx.raiser.session_key},
+               params: %{request: owner_request.id, reason: "wrong verb"}
+             })
+
+    assert %{withdrawn_by: "user:flynn"} =
+             Escalation.operator_withdraw(ctx.db, owner_withdraw)
+
+    foreign = session(ctx.db, "foreign", "other")
+
+    assert %{code: "not_owner"} =
+             Escalation.operator_withdraw(ctx.db, %{
+               origin: "agent:raiser",
+               principal: {:session, foreign.session_key},
+               params: %{request: old.id, reason: "cross-owner"}
+             })
+  end
+
+  test "operator rows survive retirement, stay owner-visible, and enforce their CHECK arm", ctx do
+    request =
+      Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "survive?"}))
+
+    same_owner = session(ctx.db, "same-owner", "flynn")
+    foreign = session(ctx.db, "foreign-reader", "other")
+
+    assert [%{id: id, context: %{"note" => nil, "supersedes" => nil}}] =
+             Escalation.list(ctx.db, operator_call(same_owner, %{}), "open")
+
+    assert id == request.id
+
+    rebound = operator_call(foreign, %{}) |> Map.put(:origin, "agent:raiser")
+    assert [] = Escalation.list(ctx.db, rebound, "open")
+    assert nil == Escalation.get(ctx.db, rebound, request.id)
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [
+               ctx.raiser.session_key
+             ])
+
+    :ok = Escalation.withdraw_for_retired(ctx.db, ctx.raiser.session_key)
+    :ok = Escalation.recover_retired(ctx.db)
+    assert operator_request(ctx, request.id).status == "open"
+
+    assert {:error, %DB.Error{}} =
+             DB.query(
+               ctx.db,
+               "UPDATE decision_requests SET status='consumed' WHERE id=?1",
+               [request.id]
+             )
+
+    assert {:error, %DB.Error{}} =
+             DB.query(
+               ctx.db,
+               "UPDATE decision_requests SET status='ruled', decision='accept' WHERE id=?1",
+               [request.id]
+             )
+  end
+
   test "escalation-ruled remains substrate-reserved", ctx do
     assert {:error, %{code: "reserved_kind"}} =
              ConditionFacts.file(ctx.db, ctx.scheduler, %{
@@ -544,6 +869,40 @@ defmodule Tightbeam.EscalationTest do
       principal: {:user, "flynn"},
       params: %{request_id: id, decision: decision}
     }
+  end
+
+  defp operator_call(session, params) do
+    %{
+      verb: "operator-ask",
+      origin: "agent:raiser",
+      principal: {:session, session.session_key},
+      transport_session_key: session.session_key,
+      params: params
+    }
+  end
+
+  defp owner_operator_rule(id, params) do
+    %{
+      verb: "operator-rule",
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      transport_session_key: nil,
+      params: Map.put(params, :request, id)
+    }
+  end
+
+  defp operator_request(ctx, id) do
+    Escalation.get(ctx.db, owner_operator_rule(id, %{}), id)
+  end
+
+  defp insert_assignment!(db, id, holder_key, state) do
+    terminal = if state == "closed", do: ",'revoked',2,'flynn'", else: ",NULL,NULL,NULL"
+
+    :ok =
+      DB.execute(
+        db,
+        "INSERT INTO assignments (id,subject,holderKey,holderFallback,openedBySession,openedAt,state,outcome,closedAt,closedByUser) VALUES ('#{id}','linked','#{holder_key}',0,'#{holder_key}',1,'#{state}'#{terminal})"
+      )
   end
 
   defp request(ctx, id) do
