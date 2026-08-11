@@ -5,6 +5,15 @@ machinery and none is needed — the ledger is durable, so a restart is an
 ordinary event. What follows is what the stop actually does, established by
 running it rather than by reading `application.ex`.
 
+If the gateway is service-managed, installing a new package only swaps the
+executable on disk; it does not restart the running process. After the package
+install, restart the service before performing the checks below. On Linux:
+
+```sh
+sudo systemctl restart tightbeam.service
+systemctl is-active tightbeam.service
+```
+
 Everything below was measured on 2026-07-26 against a real `state.db` with work
 genuinely in flight.
 

@@ -14,6 +14,7 @@ defmodule Tightbeam.Rules do
   for a caller holding no roles, and `assignment.verdicts not_in
   ["reviewed-clean"]` fires for an assignment with no verdicts. List facts are
   `caller.roles`, `assignment.verdicts`,
+  `assignment.independent_verdict_kinds`,
   `assignment.qualifying_review_verdict_kinds`, and
   `assignment.artifact_kinds` (the distinct artifact kinds the assignment's
   holder recorded on its work item, in every artifact state). Assignment
@@ -91,10 +92,14 @@ defmodule Tightbeam.Rules do
   @whole_fields ~w(target_role target_session reviews work_item name harness model effort context archetype host after at)
   @verdict_facts ~w(
     assignment.verdicts
+    assignment.independent_verdict_kinds
     assignment.qualifying_review_verdict_kinds
     work_item.verdict_kinds
   )
-  @linked_review_facts ~w(assignment.qualifying_review_verdict_kinds)
+  @linked_review_facts ~w(
+    assignment.independent_verdict_kinds
+    assignment.qualifying_review_verdict_kinds
+  )
   @name_re ~r/^[a-z0-9][a-z0-9-]*$/
   @facts %{
     "caller.origin_class" => :string,
@@ -114,6 +119,7 @@ defmodule Tightbeam.Rules do
     "assignment.effect_kind" => :string,
     "assignment.state" => :string,
     "assignment.holder_noted_verdict_kinds" => {:list, :string},
+    "assignment.independent_verdict_kinds" => {:list, :string},
     "assignment.qualifying_review_verdict_kinds" => {:list, :string},
     "assignment.artifact_kinds" => {:list, :string},
     "assignment.holder_archetype" => :string,
@@ -1117,6 +1123,13 @@ defmodule Tightbeam.Rules do
     end)
   end
 
+  defp compute_fact("assignment.independent_verdict_kinds", db, call, cache) do
+    with_dependency("$verdict_authors", db, call, cache, fn
+      nil, cache -> {nil, cache}
+      authors, cache -> {distinct_verdict_kinds(authors), cache}
+    end)
+  end
+
   defp compute_fact("assignment.qualifying_review_verdict_kinds", db, call, cache) do
     with_dependency("$assignment", db, call, cache, fn
       nil, cache ->
@@ -1353,6 +1366,16 @@ defmodule Tightbeam.Rules do
     {assignment, cache}
   end
 
+  defp compute_fact("$verdict_authors", db, call, cache) do
+    with_dependency("$assignment", db, call, cache, fn
+      nil, cache ->
+        {nil, cache}
+
+      assignment, cache ->
+        {Assignments.commissioned_review_authors(db, assignment.id, assignment.holder_key), cache}
+    end)
+  end
+
   defp resolve_dispatch_assignment(db, call) do
     case {call.verb, Map.get(call.params, :work_item_id)} do
       {"dispatch", work_item_id} when is_binary(work_item_id) ->
@@ -1379,6 +1402,12 @@ defmodule Tightbeam.Rules do
       {:ok, value, cache} -> fun.(value, cache)
       :error -> throw({:dependency_error, fact})
     end
+  end
+
+  defp distinct_verdict_kinds(authors) do
+    authors
+    |> Enum.map(& &1.verdict_kind)
+    |> Enum.uniq()
   end
 
   defp assignment_context(db, where, params) do

@@ -107,6 +107,19 @@ tightbeam --version
 tightbeam-gateway                  # boots the gateway in the foreground
 ```
 
+For a service-managed installation, `npm install -g` replaces the executable on
+disk but does not restart the running gateway. Restart the service after every
+upgrade, then verify it is active:
+
+```sh
+# Linux
+sudo systemctl restart tightbeam.service
+systemctl is-active tightbeam.service
+```
+
+On macOS, restart the installed Tightbeam launchd service, then verify it with
+`sudo launchctl print system/com.tightbeam.gateway`.
+
 `tightbeam-gateway` is the release equivalent of `mix run --no-halt`: same
 foreground process, same environment contract, same first-boot behaviour. It
 creates the base dir, seeds the identity repository, creates `state.db` and
@@ -130,8 +143,8 @@ the version in `cli/Cargo.toml`, land it on `main`, and wait for the ordinary
 ```sh
 git fetch origin
 git merge --ff-only origin/main
-git tag -a v0.1.6 -m "Tightbeam v0.1.6"
-git push origin v0.1.6
+git tag -a v<version> -m "Tightbeam v<version>"
+git push origin v<version>
 ```
 
 The tag must be exactly `v<major>.<minor>.<patch>`, must match the Cargo package

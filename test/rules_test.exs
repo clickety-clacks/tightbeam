@@ -489,6 +489,7 @@ defmodule Tightbeam.RulesTest do
 
   test "P3 fact registry has exact names and load-time types", ctx do
     list_facts = [
+      "assignment.independent_verdict_kinds",
       "assignment.qualifying_review_verdict_kinds",
       "assignment.artifact_kinds"
     ]
@@ -511,7 +512,6 @@ defmodule Tightbeam.RulesTest do
     end
 
     for removed <- [
-          "assignment.independent_verdict_kinds",
           "assignment.cross_harness_verdict_kinds",
           "assignment.cross_provider_verdict_kinds"
         ] do
@@ -804,7 +804,38 @@ defmodule Tightbeam.RulesTest do
     assert {:deny, %{rule: "needs-review"}} = Rules.evaluate(ctx.db, completion)
   end
 
-  test "qualifying review is the sole public review fact and ignores harness/provider", ctx do
+  test "restored independent verdict fact accepts the prior linked-review shape", ctx do
+    {:ok, _} =
+      DB.query(ctx.db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1)")
+
+    holder = session(ctx.db, "producer", "flynn", archetype: "coder")
+    reviewer = session(ctx.db, "reviewer", "other", harness: "claude", provider: "anthropic")
+    producer = assignment(ctx, holder.session_key, {:user, "flynn"})
+    review = assignment(ctx, reviewer.session_key, {:user, "flynn"}, reviews: producer.id)
+
+    verdict(ctx, reviewer.session_key, review.id, "reviewed-clean")
+
+    put_rule(
+      ctx,
+      rule(
+        "independent",
+        "attest",
+        "assignment.independent_verdict_kinds",
+        "in",
+        ["reviewed-clean"]
+      )
+    )
+
+    Rules.load!(ctx.base_dir, ["attest"])
+
+    assert {:deny, %{rule: "independent"}} =
+             Rules.evaluate(
+               ctx.db,
+               p3_call("attest", nil, %{assignment_id: producer.id, kind: "completion"})
+             )
+  end
+
+  test "qualifying review ignores harness/provider", ctx do
     {:ok, _} =
       DB.query(ctx.db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1)")
 
