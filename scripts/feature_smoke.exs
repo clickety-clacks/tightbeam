@@ -70,11 +70,11 @@ defmodule FeatureSmoke do
     install_smoke_rule!(base_dir)
     gw = base_dir |> Path.join("gateway.json") |> File.read!() |> JSON.decode!()
     Process.put(:salt, Integer.to_string(System.os_time(:second)) <> "-")
+    legs = Tightbeam.FeatureSmokePlan.legs(Tightbeam.Harness.all())
 
     announce_selection!(Tightbeam.FeatureSmokePlan.selection(Tightbeam.Harness.all()))
 
-    Tightbeam.FeatureSmokePlan.legs(Tightbeam.Harness.all())
-    |> Enum.each(fn leg ->
+    Enum.each(legs, fn leg ->
       IO.puts("\nfeature-smoke leg #{leg.wire_name} model=#{leg.model}")
       preflight!(leg, base_dir)
 
@@ -84,10 +84,12 @@ defmodule FeatureSmoke do
         base_dir: base_dir,
         pass: 0,
         leg: leg,
+        legs: legs,
         providers: Tightbeam.FeatureSmokePlan.provider_names(Tightbeam.Harness.all())
       }
       |> sweep_open_work_items()
       |> check_local_deployment()
+      |> check_live_harness_switch()
       |> check_identity_surface()
       |> check_onboard_surface()
       |> check_facts_read()
@@ -136,7 +138,7 @@ defmodule FeatureSmoke do
     cwd = local_workdir_path(state.base_dir, session_key)
 
     try do
-      redeploy!(state, session_key)
+      redeliver_identity!(state, session_key)
 
       assert(state, File.dir?(home), "local deployment HOME missing: #{home}")
 
@@ -210,7 +212,7 @@ defmodule FeatureSmoke do
 
       sentinel_bytes = "durable-local-deployment-#{unique()}\n"
       File.write!(sentinel, sentinel_bytes)
-      redeploy!(state, session_key)
+      redeliver_identity!(state, session_key)
 
       assert(
         state,
@@ -226,6 +228,146 @@ defmodule FeatureSmoke do
       state,
       "local deployment HOME path + exact owned projection + cwd skills + no strays + durable redelivery"
     )
+  end
+
+  # --- runtime harness switch: real ACP reply on destination and restore -----
+  defp check_live_harness_switch(%{legs: [_only]} = state) do
+    IO.puts(
+      "  INCOMPLETE [#{state.leg.wire_name}] live harness switch needs another selected leg; " <>
+        "this filtered run proves only its selected harness"
+    )
+
+    state
+  end
+
+  defp check_live_harness_switch(state) do
+    destination = Enum.find(state.legs, &(&1.wire_name != state.leg.wire_name))
+
+    session =
+      ok!(state, "spawn", %{
+        "archetype" => "reviewer",
+        "displayName" => "smoke-harness-switch-#{unique()}",
+        "idempotencyKey" => "harness-switch-#{unique()}"
+      })
+
+    session_key = get_in(session, ["stream", "sessionKey"]) || session["sessionKey"]
+
+    try do
+      assert_live_engine!(state, session_key, state.leg, "source")
+
+      switched = tune_harness!(state, session_key, destination)
+
+      assert(
+        state,
+        switched["engine_context"] == "reset" and switched["projection_committed"] == true,
+        "harness switch did not report an atomic history reset: #{inspect(switched)}"
+      )
+
+      assert_live_engine!(state, session_key, destination, "destination")
+
+      restored = tune_harness!(state, session_key, state.leg)
+
+      assert(
+        state,
+        restored["engine_context"] == "reset" and restored["projection_committed"] == true,
+        "harness restore did not report an atomic history reset: #{inspect(restored)}"
+      )
+
+      assert_live_engine!(state, session_key, state.leg, "restored")
+    after
+      retire(state, session)
+    end
+
+    pass(
+      state,
+      "live harness switch + destination ACP reply + Fast readback + restore ACP reply"
+    )
+  end
+
+  defp tune_harness!(state, session_key, leg) do
+    result =
+      ok!(state, "tune", %{
+        "sessionKey" => session_key,
+        "setting" => "set_harness",
+        "harness" => leg.wire_name,
+        "model" => leg.model,
+        "effort" => leg.effort
+      })
+
+    assert(
+      state,
+      result["ok"] == true and result["harness"] == leg.wire_name and
+        result["model"] == leg.model and result["effort"] == leg.effort,
+      "harness tune did not read back #{leg.wire_name}/#{leg.model}/#{leg.effort}: " <>
+        inspect(result)
+    )
+
+    result
+  end
+
+  defp assert_live_engine!(state, session_key, leg, phase) do
+    marker = "HARNESS SWITCH #{String.upcase(phase)} #{unique()}"
+
+    wake =
+      ok!(state, "wake", %{
+        "sessionKey" => session_key,
+        "prompt" => "Reply with exactly: #{marker}",
+        "idempotencyKey" => "harness-switch-#{phase}-#{unique()}"
+      })
+
+    assert(
+      state,
+      is_binary(wake["wakeId"]) and wake["wakeId"] != "",
+      "#{phase} harness proof returned no wakeId: #{inspect(wake)}"
+    )
+
+    await_lane_idle!(state, session_key, "while waiting for the #{phase} harness ACP reply")
+
+    transcript = ok!(state, "transcript", %{"sessionKey" => session_key, "limit" => 20})
+
+    reply =
+      Enum.find(transcript["messages"] || [], fn message ->
+        message["role"] == "assistant" and String.contains?(message["content"] || "", marker)
+      end)
+
+    assert(
+      state,
+      is_map(reply) and reply["harness"] == leg.wire_name and reply["model"] == leg.model,
+      "#{phase} ACP reply was not recorded on #{leg.wire_name}/#{leg.model}: " <>
+        inspect(transcript)
+    )
+
+    IO.puts("  ACP [#{phase} #{leg.wire_name}/#{leg.model}] #{inspect(reply["content"])}")
+
+    fast_on =
+      ok!(state, "tune", %{
+        "sessionKey" => session_key,
+        "setting" => "set_fast_mode",
+        "fastMode" => "on"
+      })
+
+    assert(
+      state,
+      fast_on["ok"] == true and fast_on["fast"] == "on" and
+        fast_on["fast_status"] == "known",
+      "#{phase} #{leg.wire_name} Fast enable/readback failed: #{inspect(fast_on)}"
+    )
+
+    fast_off =
+      ok!(state, "tune", %{
+        "sessionKey" => session_key,
+        "setting" => "set_fast_mode",
+        "fastMode" => "off"
+      })
+
+    assert(
+      state,
+      fast_off["ok"] == true and fast_off["fast"] == "off" and
+        fast_off["fast_status"] == "known",
+      "#{phase} #{leg.wire_name} Fast restore/readback failed: #{inspect(fast_off)}"
+    )
+
+    state
   end
 
   # The LOCAL host's workdir, computed without touching the database.
@@ -1214,9 +1356,7 @@ defmodule FeatureSmoke do
   # cross-harness EVIDENCE, not the statute's satisfaction, and the run already reports
   # itself INCOMPLETE(parity) for saying so.
   defp independent_leg(state) do
-    Tightbeam.Harness.all()
-    |> Tightbeam.FeatureSmokePlan.legs()
-    |> Enum.find(state.leg, &(&1.wire_name != state.leg.wire_name))
+    Enum.find(state.legs, state.leg, &(&1.wire_name != state.leg.wire_name))
   end
 
   # A missing credential is a NAMED WAIVER, never an onboarding. Onboarding is its own
@@ -1687,14 +1827,14 @@ defmodule FeatureSmoke do
     ok!(state |> Map.put(:token, token) |> Map.put(:as_session, true), verb, params)
   end
 
-  defp redeploy!(state, session_key) do
-    ok!(state, "tune", %{
-      "sessionKey" => session_key,
-      "setting" => "set_harness",
-      "harness" => state.leg.wire_name,
-      "model" => state.leg.model,
-      "effort" => state.leg.effort
-    })
+  defp redeliver_identity!(state, session_key) do
+    applied = ok!(state, "identity-apply", %{"sessionKey" => session_key, "all" => false})
+
+    assert(
+      state,
+      session_key in (applied["applied"] || []),
+      "identity redelivery missed #{session_key}: #{inspect(applied)}"
+    )
   end
 
   # --- facts-read: file a condition fact, read it back -----------------------
