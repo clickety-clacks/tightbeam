@@ -127,6 +127,10 @@ defmodule Tightbeam.Wire.Router do
         verb: verb,
         origin: origin,
         principal: principal,
+        # Identity resolution can turn a session-authenticated call into a user
+        # principal. Keep the authenticated transport beside that principal so a
+        # handler can stamp the hop without trusting a caller param.
+        transport_session_key: authenticated_session_key(auth),
         session_key: artifact_caller_session(verb, session_key, principal),
         target_role: target_meta.role,
         role_fallback: target_meta.fallback,
@@ -551,6 +555,9 @@ defmodule Tightbeam.Wire.Router do
     end
   end
 
+  defp authenticated_session_key({:session, session}), do: session.session_key
+  defp authenticated_session_key(:org), do: nil
+
   # Strictly typed target seam (spec Addendum A): the reference TYPE is
   # carried by the field name — sessionKey | role | userId, exactly one —
   # never inferred from a string's shape. Nothing here classifies; a
@@ -972,13 +979,19 @@ defmodule Tightbeam.Wire.Router do
   # wake -> turn -> trace attribution, which Law 0 forbids (cross-review F6), so
   # it is stripped before the handler sees it.
   #
+  # An operator ruling's transport provenance follows the same rule: the router
+  # derives it from bearer authentication above, so `ruledViaSessionKey` cannot
+  # enter through params. `wake.requestRef` is also internal because delayed
+  # delivery uses it to bind the wake to its authoritative decision row.
+  #
   # Scoped per verb deliberately: `assignmentId` is an ORDINARY caller param on
   # attest/assign/dispatch/effort-rule, which name the assignment they act on. A
   # blanket strip breaks all of those (the CLI round-trip suite proves it), so the
   # spec's "stripped from any agent/dispatch param map" is read as scoped to the
   # carrier it is written about, not to the parameter name everywhere.
   @substrate_only_params %{
-    "wake" => ~w(assignment_id)a,
+    "wake" => ~w(assignment_id request_ref)a,
+    "operator-rule" => ~w(ruled_via_session_key)a,
     "work-item-create" => ~w(created_in_turn_seq created_context_known)a,
     # The artifact's turn edge and the class of evidence behind it are the
     # substrate's own observation, resolved in `Artifacts.record/2` from the hook
