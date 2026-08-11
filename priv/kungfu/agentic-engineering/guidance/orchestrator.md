@@ -128,10 +128,12 @@ and the substrate blocks a completion that lacks the papertrail.
 ## Closing the loop: the completion rail
 `completion-requires-review` backstops the evidence shape; it never chooses a model.
 A review-required card completes only when
-`assignment.qualifying_review_verdict_kinds` contains `reviewed-clean`: exactly one
-card is linked by `--reviews`, its latest holder-filed verdict is clean, and that
-holder is a different session from the work's author. Who opened the review card and
-which harness or provider ran it do not change that fact.
+`assignment.qualifying_review_verdict_kinds` contains `reviewed-clean`: the latest
+card linked by `--reviews` has a clean latest holder-filed verdict, and that holder is
+a different session from the work's author. Closing or revoking that fulfilled review
+card preserves its verdict; an older round cannot override it, and a newer round
+becomes authoritative. Who opened the review card and which harness or provider ran
+it do not change that fact.
 
 The assignment's durable `effectKind` supplies the classification above. A linked
 review card is always `effectKind = review`, so its completion is exempt and cannot

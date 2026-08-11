@@ -957,7 +957,7 @@ defmodule Tightbeam.AssignmentsTest do
            ]
   end
 
-  test "qualifying review verdict requires exactly one independent card and its latest holder verdict",
+  test "qualifying review verdict follows the latest independent round across terminal state",
        ctx do
     producer = handle(ctx, "assign", assign_call({:user, "flynn"}, "qualifying producer"))
 
@@ -1012,11 +1012,53 @@ defmodule Tightbeam.AssignmentsTest do
       |> put_in([:params, :verdict_kind], "reviewed-clean")
       |> then(&handle(ctx, "attest", &1))
 
-    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == []
+    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == [
+             "reviewed-clean"
+           ]
 
     _ =
       attest_call({:session, "other-session"}, review.id, "verdict")
       |> put_in([:params, :verdict_kind], "reviewed-clean")
+      |> then(&handle(ctx, "attest", &1))
+
+    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == [
+             "reviewed-clean"
+           ]
+
+    _ =
+      attest_call({:session, "other-session"}, second_review.id, "completion")
+      |> then(&handle(ctx, "attest", &1))
+
+    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == [
+             "reviewed-clean"
+           ]
+
+    revoked_review =
+      assign_call({:user, "flynn"}, "revoked qualifying review")
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :reviews_assignment_id], producer.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    _ =
+      attest_call({:session, "other-session"}, revoked_review.id, "verdict")
+      |> put_in([:params, :verdict_kind], "reviewed-clean")
+      |> then(&handle(ctx, "attest", &1))
+
+    _ = handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, revoked_review.id))
+
+    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == [
+             "reviewed-clean"
+           ]
+
+    blocking_review =
+      assign_call({:user, "flynn"}, "blocking latest review")
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :reviews_assignment_id], producer.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    _ =
+      attest_call({:session, "other-session"}, blocking_review.id, "verdict")
+      |> put_in([:params, :verdict_kind], "changes-requested")
       |> then(&handle(ctx, "attest", &1))
 
     assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == []

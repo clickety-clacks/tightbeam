@@ -611,20 +611,18 @@ defmodule Tightbeam.RailRemedyTest do
     assert latest_rewake_target(ctx, assignment.id) == ctx.reviewer.session_key
   end
 
-  test "verdict on an extra linked card keeps the episode re-wake on its review holder", ctx do
+  test "clean verdict on the latest linked card satisfies a stale review episode", ctx do
     assignment = assignment(ctx, "extra linked card")
     load_review_gate(ctx)
 
-    assert {:error, %{producer: review_id}} =
+    assert {:error, %{producer: _review_id}} =
              Dispatch.dispatch(ctx.db, ctx.handlers, completion_call(assignment.id))
 
     extra_review = linked_review(ctx, assignment.id, "extra review")
     verdict(ctx, extra_review.id, "reviewed-clean")
 
-    assert {:error, %{producer: ^review_id}} =
+    assert {:ok, %{assignment: %{state: "closed", outcome: "completed"}}} =
              Dispatch.dispatch(ctx.db, ctx.handlers, completion_call(assignment.id))
-
-    assert latest_rewake_target(ctx, assignment.id) == ctx.reviewer.session_key
   end
 
   test "sole linked card holder verdict redirects the re-wake to the producer holder", ctx do
