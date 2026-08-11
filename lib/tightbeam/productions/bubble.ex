@@ -112,7 +112,7 @@ defmodule Tightbeam.Productions.Bubble do
   # RHS. Find the nearest ACTIVE ancestor of the session the terminal landed
   # in and enqueue the notice there; with none left, the terminal rung fires.
   # TWO UNLIKE ABSENCES, kept apart (review B2 — collapsing them silenced a
-  # whole class of fault): `:parentless` means the session has no spawnedBy
+  # whole class of fault): `:parentless` means the session row is missing
   # at all — its own marker already told the only audience there is, so a
   # fresh cause ends silently (spec §Fault bubbling 2). `:exhausted` means it
   # HAS a lineage and no rung of it is active — a retired rung can never run
@@ -329,11 +329,11 @@ defmodule Tightbeam.Productions.Bubble do
     end
   end
 
-  # First ancestor with an ACTIVE session row, walking spawnedBy. A missing
+  # First ancestor with an ACTIVE session row, walking operationalParent. A missing
   # or retired rung is climbed past — it can never run a turn, which is the
   # same fact a canceled notice proves, learned one enqueue cheaper. The two
   # empty answers are DIFFERENT facts and stay different values: a session
-  # with no spawnedBy is `:parentless`; a session whose lineage exists but
+  # with no row is `:parentless`; a session whose lineage exists but
   # holds no active rung is `:exhausted`.
   defp next_active_ancestor(db, session_key, hops \\ 0)
 
@@ -341,11 +341,17 @@ defmodule Tightbeam.Productions.Bubble do
     do: :exhausted
 
   defp next_active_ancestor(db, session_key, hops) do
-    case DB.query(db, "SELECT spawnedBy FROM sessions WHERE sessionKey = ?1", [session_key]) do
+    case DB.query(db, "SELECT operationalParent FROM sessions WHERE sessionKey = ?1", [
+           session_key
+         ]) do
       {:ok, [[parent]]} when is_binary(parent) ->
-        case DB.query(db, "SELECT state FROM sessions WHERE sessionKey = ?1", [parent]) do
-          {:ok, [["active"]]} -> {:ok, parent}
-          _ -> exhausted_past(db, parent, hops)
+        if parent == session_key do
+          :exhausted
+        else
+          case DB.query(db, "SELECT state FROM sessions WHERE sessionKey = ?1", [parent]) do
+            {:ok, [["active"]]} -> {:ok, parent}
+            _ -> exhausted_past(db, parent, hops)
+          end
         end
 
       _ when hops == 0 ->

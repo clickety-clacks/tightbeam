@@ -189,13 +189,19 @@ defmodule Tightbeam.WakesTest do
         """
         INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1);
         INSERT INTO sessions
-          (sessionKey, displayName, ownerUserId, origin, archetype, harness,
+          (sessionKey, displayName, kind, isBuiltIn, ownerUserId, origin,
+           operationalParent, archetype, harness,
            provider, model, host, state, createdAt, updatedAt)
         VALUES
-          ('retiring', 'retiring', 'flynn', 'user:flynn', 'default', 'claude',
+          ('agent:main:clawline:flynn:main', 'Main', 'main', 1, 'flynn', 'user:flynn',
+           'agent:main:clawline:flynn:main', 'default', 'claude',
            'anthropic', 'fable', 'eezo', 'active', 1, 1),
-          ('replacement', 'replacement', 'flynn', 'user:flynn', 'default',
-           'claude', 'anthropic', 'fable', 'eezo', 'active', 1, 1);
+          ('retiring', 'retiring', 'custom', 0, 'flynn', 'user:flynn',
+           'agent:main:clawline:flynn:main', 'default', 'claude',
+           'anthropic', 'fable', 'eezo', 'active', 1, 1),
+          ('replacement', 'replacement', 'custom', 0, 'flynn', 'user:flynn',
+           'agent:main:clawline:flynn:main', 'default', 'claude', 'anthropic',
+           'fable', 'eezo', 'active', 1, 1);
         INSERT INTO work_items
           (id, title, ownerUserId, state, createdByUser, createdAt)
         VALUES ('wi_retarget', 'Retarget work', 'flynn', 'open', 'flynn', 1);

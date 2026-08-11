@@ -64,6 +64,20 @@ defmodule Tightbeam.DB do
     GenServer.call(server, {:transaction, fun})
   end
 
+  @doc """
+  Run one atomic SQLite table rebuild while foreign-key enforcement is paused.
+
+  The DB owner changes the pragma, transaction, integrity check, and restoration
+  in one serialized call. Callers cannot observe or write through the connection
+  while enforcement is off.
+  """
+  @spec foreign_key_rebuild(server(), (Tightbeam.DB.Txn.t() -> result)) ::
+          {:ok, result} | {:error, Exception.t()}
+        when result: term()
+  def foreign_key_rebuild(server \\ __MODULE__, fun) when is_function(fun, 1) do
+    GenServer.call(server, {:foreign_key_rebuild, fun})
+  end
+
   ## Txn handle passed to transaction callbacks (runs inside the owner process)
 
   defmodule Txn do
@@ -134,6 +148,34 @@ defmodule Tightbeam.DB do
         :ok = Sqlite3.execute(conn, "ROLLBACK")
         {:reply, {:error, e}, state}
     end
+  end
+
+  def handle_call({:foreign_key_rebuild, fun}, _from, %{conn: conn} = state) do
+    reply =
+      try do
+        :ok = Sqlite3.execute(conn, "PRAGMA foreign_keys=OFF")
+        :ok = Sqlite3.execute(conn, "BEGIN IMMEDIATE")
+
+        try do
+          result = fun.(%Txn{conn: conn})
+
+          case run_query(conn, "PRAGMA foreign_key_check", []) do
+            [] -> :ok
+            rows -> raise Error, message: "foreign key check failed: #{inspect(rows)}"
+          end
+
+          :ok = Sqlite3.execute(conn, "COMMIT")
+          {:ok, result}
+        rescue
+          error ->
+            :ok = Sqlite3.execute(conn, "ROLLBACK")
+            {:error, error}
+        end
+      after
+        :ok = Sqlite3.execute(conn, "PRAGMA foreign_keys=ON")
+      end
+
+    {:reply, reply, state}
   end
 
   @doc false

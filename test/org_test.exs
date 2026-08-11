@@ -45,7 +45,8 @@ defmodule Tightbeam.OrgTest do
              provider: "anthropic",
              state: "active",
              is_built_in: true,
-             adopted: true
+             adopted: true,
+             operational_parent: ^key
            } = session
 
     assert Org.get(db, key).display_name == "Main"
@@ -54,6 +55,39 @@ defmodule Tightbeam.OrgTest do
       DB.query(db, "SELECT isBuiltIn, adopted, state FROM sessions WHERE sessionKey = ?1", [key])
 
     assert rows == [[1, 1, "active"]]
+  end
+
+  test "operational parent is total, mutable, and independent of spawn provenance", %{db: db} do
+    main_key = Org.personal_session_key("flynn")
+    main = Org.create(db, base(%{session_key: main_key, kind: "main", is_built_in: true}))
+    first = Org.create(db, base(%{session_key: "first"}))
+
+    child =
+      Org.create(
+        db,
+        base(%{session_key: "child", spawned_by: first.session_key})
+      )
+
+    assert main.operational_parent == main_key
+    assert first.operational_parent == main_key
+    assert child.spawned_by == first.session_key
+    assert child.operational_parent == first.session_key
+
+    assert_raise ArgumentError, ~r/create a cycle/, fn ->
+      Org.set_operational_parent(db, first.session_key, child.session_key)
+    end
+
+    reparented = Org.set_operational_parent(db, child.session_key, main_key)
+    assert reparented.operational_parent == main_key
+    assert reparented.spawned_by == first.session_key
+
+    assert_raise ArgumentError, ~r/non-empty session key/, fn ->
+      Org.set_operational_parent(db, child.session_key, nil)
+    end
+
+    assert_raise ArgumentError, ~r/Main's operational parent/, fn ->
+      Org.set_operational_parent(db, main_key, first.session_key)
+    end
   end
 
   test "overrides and derived identity names round-trip and active reconstruction ignores retired rows",
