@@ -60,10 +60,10 @@ defmodule Tightbeam.EffortCheckinTest do
     main =
       session(db, main_key, "h1", host, %{
         kind: "main",
-        is_built_in: true,
-        operational_parent: main_key
+        is_built_in: true
       })
 
+    ensure_main_session(db, "h2")
     parent = session(db, "parent", "h1", host)
     holder = session(db, "holder", "h2", host, %{spawned_by: "parent"})
     # The extra keys are what `Gateway.children_after_preflight/1` reads: the
@@ -430,10 +430,7 @@ defmodule Tightbeam.EffortCheckinTest do
   end
 
   test "reparenting during a silent streak wakes each live effective parent before Main", ctx do
-    new_parent =
-      session(ctx.db, "new-parent", "h1", Placement.local_host_name(), %{
-        operational_parent: ctx.main.session_key
-      })
+    new_parent = session(ctx.db, "new-parent", "h1", Placement.local_host_name())
 
     item = dispatch(ctx, {:user, "h1"}, "holder", "live reparent")
     assert %{session_key: "parent"} = escalate(ctx, item.id)
@@ -458,9 +455,10 @@ defmodule Tightbeam.EffortCheckinTest do
        ctx do
     mid =
       session(ctx.db, "mid", "h1", Placement.local_host_name(), %{
-        spawned_by: ctx.main.session_key,
-        operational_parent: "parent"
+        spawned_by: ctx.main.session_key
       })
+
+    Org.set_operational_parent(ctx.db, mid.session_key, "parent")
 
     assert %{spawned_by: "parent"} = Org.set_operational_parent(ctx.db, "holder", mid.session_key)
 
@@ -481,9 +479,10 @@ defmodule Tightbeam.EffortCheckinTest do
     # Retired sessions stay in the parent graph but are skipped as escalation targets.
     retired =
       session(ctx.db, "retired-parent", "h1", Placement.local_host_name(), %{
-        spawned_by: ctx.main.session_key,
-        operational_parent: "parent"
+        spawned_by: ctx.main.session_key
       })
+
+    Org.set_operational_parent(ctx.db, retired.session_key, "parent")
 
     {:ok, _} =
       DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [
@@ -1079,10 +1078,8 @@ defmodule Tightbeam.EffortCheckinTest do
     assert %{session_key: "parent"} = escalate(%{ctx | config: moved_config}, item.id)
     assert no_effort_requests?(ctx.db, item.id)
 
-    replacement =
-      session(ctx.db, "replacement", "h2", Placement.local_host_name(), %{
-        operational_parent: "parent"
-      })
+    replacement = session(ctx.db, "replacement", "h2", Placement.local_host_name())
+    Org.set_operational_parent(ctx.db, replacement.session_key, "parent")
 
     prepared =
       EffortCheckin.prepare_transferred_rearms(
