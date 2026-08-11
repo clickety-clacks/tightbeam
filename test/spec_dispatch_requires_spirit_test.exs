@@ -34,6 +34,8 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
     {:ok, _} =
       DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1)")
 
+    ensure_main_session(db, "flynn")
+
     holder = session(db, "impl-holder", "coder", "claude", "anthropic")
     owner = session(db, "po-holder", "product-owner", "codex", "openai")
     Roles.create!(db, "product-owner", "flynn", owner.session_key)

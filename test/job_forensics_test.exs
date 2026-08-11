@@ -61,6 +61,8 @@ defmodule Tightbeam.JobForensicsTest do
         "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn',1,1)"
       )
 
+    ensure_main_session(db, "flynn")
+
     %{db: db, registry: registry, lane: lane}
   end
 

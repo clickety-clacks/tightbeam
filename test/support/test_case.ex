@@ -53,7 +53,8 @@ defmodule Tightbeam.TestCase do
           catalog_reply: 1,
           catalog_reply: 2,
           catalog_probe_harness: 1,
-          ensure_all_schemas: 1
+          ensure_all_schemas: 1,
+          ensure_main_session: 2
         ]
     end
   end
@@ -81,6 +82,35 @@ defmodule Tightbeam.TestCase do
 
   @doc "Create the complete production schema for a unit-test database."
   def ensure_all_schemas(db), do: Tightbeam.Schema.ensure_all(db)
+
+  @doc "Create the canonical self-parented Main fixture for an owner when absent."
+  def ensure_main_session(db, owner) do
+    key = Tightbeam.Org.personal_session_key(owner)
+
+    case Tightbeam.Org.get(db, key) do
+      nil ->
+        Tightbeam.Org.create(db, %{
+          session_key: key,
+          display_name: "Main",
+          kind: "main",
+          is_built_in: true,
+          owner_user_id: owner,
+          origin: "user:#{owner}",
+          operational_parent: key,
+          archetype: "default",
+          harness: "claude",
+          provider: "anthropic",
+          model: Tightbeam.Model.new("fable"),
+          host: "testhost"
+        })
+
+      %{kind: "main", operational_parent: ^key} = session ->
+        session
+
+      session ->
+        raise "invalid Main fixture for #{owner}: #{inspect(session)}"
+    end
+  end
 
   @doc """
   Register satellite hosts the way the product does.

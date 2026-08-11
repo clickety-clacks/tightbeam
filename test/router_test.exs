@@ -34,6 +34,8 @@ defmodule Tightbeam.Wire.RouterTest do
     {:paired, device} =
       Devices.pair(db, %{device_id: "d1", claimed_name: "Flynn", platform: nil, model: nil})
 
+    ensure_main_session(db, device.user_id)
+
     parent = self()
 
     handlers = %{
@@ -1828,18 +1830,24 @@ defmodule Tightbeam.Wire.RouterTest do
   end
 
   defp create_session(db, key, owner, extra \\ []) do
-    Org.create(db, %{
-      session_key: key,
-      display_name: key,
-      owner_user_id: owner,
-      origin: "user:#{owner}",
-      archetype: "default",
-      host: "testhost",
-      harness: "claude",
-      provider: "anthropic",
-      model: Model.new("fable"),
-      is_built_in: Keyword.get(extra, :is_built_in, false),
-      kind: Keyword.get(extra, :kind, "custom")
-    })
+    if key == Org.personal_session_key(owner) do
+      ensure_main_session(db, owner)
+    else
+      ensure_main_session(db, owner)
+
+      Org.create(db, %{
+        session_key: key,
+        display_name: key,
+        owner_user_id: owner,
+        origin: "user:#{owner}",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable"),
+        is_built_in: Keyword.get(extra, :is_built_in, false),
+        kind: Keyword.get(extra, :kind, "custom")
+      })
+    end
   end
 end

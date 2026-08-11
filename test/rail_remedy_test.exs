@@ -31,6 +31,8 @@ defmodule Tightbeam.RailRemedyTest do
         "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1)"
       )
 
+    ensure_main_session(db, "flynn")
+
     holder = session(db, "holder", "flynn", "claude", "coder")
     reviewer = session(db, "reviewer-session", "flynn", "claude", "reviewer")
     Roles.create!(db, "reviewer", "flynn", reviewer.session_key)

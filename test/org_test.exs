@@ -10,7 +10,16 @@ defmodule Tightbeam.OrgTest do
     name = :"db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: name})
     :ok = Tightbeam.Schema.ensure_all(name)
-    %{db: name}
+
+    main_key = Org.personal_session_key("flynn")
+
+    main =
+      Org.create(
+        name,
+        base(%{session_key: main_key, kind: "main", is_built_in: true, adopted: true})
+      )
+
+    %{db: name, main: main}
   end
 
   defp base(overrides \\ %{}) do
@@ -29,11 +38,8 @@ defmodule Tightbeam.OrgTest do
     )
   end
 
-  test "create persists provenance, wire metadata, and boolean flags", %{db: db} do
-    key = Org.personal_session_key("flynn")
-
-    session =
-      Org.create(db, base(%{session_key: key, kind: "main", is_built_in: true, adopted: true}))
+  test "create persists provenance, wire metadata, and boolean flags", %{db: db, main: session} do
+    key = session.session_key
 
     assert session.session_key == "agent:main:clawline:flynn:main"
 
@@ -57,9 +63,11 @@ defmodule Tightbeam.OrgTest do
     assert rows == [[1, 1, "active"]]
   end
 
-  test "operational parent is total, mutable, and independent of spawn provenance", %{db: db} do
-    main_key = Org.personal_session_key("flynn")
-    main = Org.create(db, base(%{session_key: main_key, kind: "main", is_built_in: true}))
+  test "operational parent is total, mutable, and independent of spawn provenance", %{
+    db: db,
+    main: main
+  } do
+    main_key = main.session_key
     first = Org.create(db, base(%{session_key: "first"}))
 
     child =
@@ -88,6 +96,17 @@ defmodule Tightbeam.OrgTest do
     assert_raise ArgumentError, ~r/Main's operational parent/, fn ->
       Org.set_operational_parent(db, main_key, first.session_key)
     end
+
+    assert_raise DB.Error, ~r/FOREIGN KEY constraint failed/, fn ->
+      Org.create(db, base(%{session_key: "orphan", operational_parent: "missing-parent"}))
+    end
+
+    {:ok, foreign_keys} = DB.query(db, "PRAGMA foreign_key_list(sessions)")
+
+    assert Enum.any?(foreign_keys, fn
+             [_id, _seq, "sessions", "operationalParent", "sessionKey" | _rest] -> true
+             _row -> false
+           end)
   end
 
   test "overrides and derived identity names round-trip and active reconstruction ignores retired rows",
@@ -174,16 +193,35 @@ defmodule Tightbeam.OrgTest do
   end
 
   test "list scopes active sessions by owner unless admin and preserves ordering", %{db: db} do
+    main_key = Org.personal_session_key("flynn")
     Org.create(db, base(%{session_key: "k2", order_index: 2}))
     Org.create(db, base(%{session_key: "k1", order_index: 1}))
-    Org.create(db, base(%{session_key: "sam", owner_user_id: "sam", origin: "user:sam"}))
 
-    assert Enum.map(Org.list_for_user(db, "flynn", false), & &1.session_key) == ["k1", "k2"]
-    assert length(Org.list_for_user(db, "flynn", true)) == 3
+    Org.create(
+      db,
+      base(%{
+        session_key: "sam",
+        owner_user_id: "sam",
+        origin: "user:sam",
+        operational_parent: main_key
+      })
+    )
+
+    assert Enum.map(Org.list_for_user(db, "flynn", false), & &1.session_key) == [
+             main_key,
+             "k1",
+             "k2"
+           ]
+
+    assert length(Org.list_for_user(db, "flynn", true)) == 4
 
     retired = Org.retire(db, "k1", "user:flynn", 1_000)
     assert retired.state == "retired"
-    assert Enum.map(Org.list_for_user(db, "flynn", false), & &1.session_key) == ["k2"]
+
+    assert Enum.map(Org.list_for_user(db, "flynn", false), & &1.session_key) == [
+             main_key,
+             "k2"
+           ]
 
     {:ok, [["retired"]]} = DB.query(db, "SELECT state FROM sessions WHERE sessionKey = 'k1'")
   end
@@ -191,7 +229,6 @@ defmodule Tightbeam.OrgTest do
   test "retirement cancels gated direct and role targets, replaces the role, and preserves ungated delivery",
        %{db: db} do
     main_key = Org.personal_session_key("flynn")
-    Org.create(db, base(%{session_key: main_key, kind: "main", is_built_in: true}))
     Org.create(db, base(%{session_key: "retiring"}))
     Roles.create!(db, "reviewer", "flynn", "retiring")
 
