@@ -578,7 +578,6 @@ defmodule Tightbeam.GatewayTest do
       display_name: "Test session",
       owner_user_id: "flynn",
       origin: "user:flynn",
-      operational_parent: main_key,
       archetype: "default",
       host: "testhost",
       harness: "claude",
@@ -8466,13 +8465,14 @@ defmodule Tightbeam.GatewayTest do
   end
 
   defp create_session(db, session_key, owner_user_id, spawned_by \\ nil) do
+    ensure_main_session(db, owner_user_id)
+
     Org.create(db, %{
       session_key: session_key,
       display_name: session_key,
       owner_user_id: owner_user_id,
       origin: "user:#{owner_user_id}",
       spawned_by: spawned_by,
-      operational_parent: spawned_by || "k1",
       archetype: "default",
       host: "testhost",
       harness: "claude",

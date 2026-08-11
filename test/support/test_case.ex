@@ -96,7 +96,6 @@ defmodule Tightbeam.TestCase do
           is_built_in: true,
           owner_user_id: owner,
           origin: "user:#{owner}",
-          operational_parent: key,
           archetype: "default",
           harness: "claude",
           provider: "anthropic",
