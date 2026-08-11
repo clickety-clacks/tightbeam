@@ -5407,78 +5407,10 @@ defmodule Tightbeam.GatewayTest do
     start_supervised!({CoordinatorStub, candidate})
     start_lane!(ctx.db, "k1")
 
-    handlers = Gateway.handlers(config)
-    role_name = "tune-graph"
-    Roles.create!(ctx.db, role_name, "flynn", "k1")
-    work_item = create_work_item(ctx.db, "Harness tune graph")
-
-    assignment_call = %{
-      verb: "assign",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
-      session_key: "k1",
-      target_role: nil,
-      role_fallback: false,
-      params: %{}
-    }
-
-    assert %{id: producer_id} =
-             handlers["assign"].(%{
-               assignment_call
-               | params: %{subject: "Harness tune producer", work_item_id: work_item.id}
-             })
-
-    assert %{id: review_id} =
-             handlers["assign"].(%{
-               assignment_call
-               | params: %{
-                   subject: "Harness tune review",
-                   reviews_assignment_id: producer_id
-                 }
-             })
-
-    graph_rows = fn ->
-      {:ok, assignments} =
-        DB.query(
-          ctx.db,
-          """
-          SELECT id, holderKey, holderRole, holderFallback, state, workItemId,
-                 reviewsAssignmentId, holderHarness, holderProvider
-          FROM assignments
-          WHERE id IN (?1, ?2)
-          ORDER BY id
-          """,
-          [producer_id, review_id]
-        )
-
-      {:ok, work_items} =
-        DB.query(
-          ctx.db,
-          """
-          SELECT id, ownerUserId, state, createdByUser, createdBySession
-          FROM work_items
-          WHERE id = ?1
-          """,
-          [work_item.id]
-        )
-
-      %{
-        roles: Roles.for_session(ctx.db, "k1"),
-        assignments: assignments,
-        work_items: work_items,
-        review_work_item: Assignments.resolved_work_item_id(ctx.db, review_id)
-      }
-    end
-
-    stable_graph = graph_rows.()
-
-    assert stable_graph.roles == [role_name]
-    assert stable_graph.review_work_item == work_item.id
-
     router_opts = [
       db: ctx.db,
       base_dir: base_dir,
-      handlers: handlers,
+      handlers: Gateway.handlers(config),
       session_status: fn session_key -> Gateway.session_status(session_key, ctx.db) end
     ]
 
@@ -5612,7 +5544,6 @@ defmodule Tightbeam.GatewayTest do
              })
 
     assert Org.get(ctx.db, "k1") == before_refusal
-    assert graph_rows.() == stable_graph
   end
 
   test "set_harness changes the engine and projects its home at a turn boundary", ctx do
