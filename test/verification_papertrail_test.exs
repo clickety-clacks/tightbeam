@@ -35,6 +35,8 @@ defmodule Tightbeam.VerificationPapertrailTest do
     {:ok, _} =
       DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1)")
 
+    ensure_main_session(db, "flynn")
+
     holder = session(db, "vp-coder", "coder", "claude", "anthropic")
     reviewer = session(db, "vp-reviewer", "reviewer", "codex", "openai")
     Roles.create!(db, "reviewer", "flynn", reviewer.session_key)

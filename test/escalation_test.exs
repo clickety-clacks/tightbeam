@@ -35,6 +35,8 @@ defmodule Tightbeam.EscalationTest do
 
     :ok = ensure_all_schemas(db)
 
+    ensure_main_session(db, "flynn")
+
     raiser = session(db, "raiser", "flynn")
 
     _admin_device =

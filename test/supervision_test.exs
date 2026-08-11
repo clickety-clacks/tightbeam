@@ -1107,20 +1107,17 @@ defmodule Tightbeam.SupervisionTest do
     assert Supervision.ladder_target(ctx.db, "holder", 1) == ctx.main.session_key
   end
 
-  # The ladder's last rung is the owner's MAIN session, and that key is composed
-  # from a user id rather than read from a row. Every substrate notice addressed
-  # to a user with no main session went to a session that does not exist, was
-  # accepted by delivery, and queued forever — six of them in one soak.
-  test "the ladder answers nobody rather than composing a key for a session that has no row",
+  test "the session graph refuses deleting Main while operational children depend on it",
        ctx do
     assert Supervision.ladder_target(ctx.db, "holder", 2) == ctx.main.session_key
 
-    {:ok, _} =
-      DB.query(ctx.db, "DELETE FROM sessions WHERE sessionKey = ?1", [ctx.main.session_key])
+    assert {:error, %DB.Error{message: message}} =
+             DB.query(ctx.db, "DELETE FROM sessions WHERE sessionKey = ?1", [
+               ctx.main.session_key
+             ])
 
-    assert Supervision.ladder_target(ctx.db, "holder", 2) == nil
-    # Rungs above the chain are the same answer, not a deeper composed key.
-    assert Supervision.ladder_target(ctx.db, "holder", 9) == nil
+    assert message =~ "FOREIGN KEY constraint failed"
+    assert Supervision.ladder_target(ctx.db, "holder", 2) == ctx.main.session_key
   end
 
   test "a retired main session is nobody too — the ladder verifies, it does not compose", ctx do
@@ -1152,9 +1149,7 @@ defmodule Tightbeam.SupervisionTest do
       )
 
     retire!(ctx.db, "supervisor")
-
-    {:ok, _} =
-      DB.query(ctx.db, "DELETE FROM sessions WHERE sessionKey = ?1", [ctx.main.session_key])
+    retire!(ctx.db, ctx.main.session_key)
 
     Supervision.evaluate(ctx.db, ctx.handlers, 0, "holder", seq)
 
@@ -1166,9 +1161,7 @@ defmodule Tightbeam.SupervisionTest do
   # `process:tightbeam` re-resolving a lineage whose owner has no main session.
   test "a lineage notice for an owner with no main session enqueues nothing and is named", ctx do
     retire!(ctx.db, "supervisor")
-
-    {:ok, _} =
-      DB.query(ctx.db, "DELETE FROM sessions WHERE sessionKey = ?1", [ctx.main.session_key])
+    retire!(ctx.db, ctx.main.session_key)
 
     gate = %{reresolve: "lineage", reresolve_seed: "holder", reresolve_rung: 1}
 
