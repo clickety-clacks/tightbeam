@@ -1064,6 +1064,43 @@ defmodule Tightbeam.AssignmentsTest do
     assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == []
   end
 
+  test "qualifying review verdict uses creation order when review rounds share a timestamp",
+       ctx do
+    producer = handle(ctx, "assign", assign_call({:user, "flynn"}, "tied review producer"))
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO assignments
+                 (id, subject, holderKey, holderFallback, openedByUser, openedAt,
+                  reviewsAssignmentId, holderHarness, holderProvider)
+               VALUES
+                 ('zzzz_older_review', 'older review', 'other-session', 0, 'flynn', 42,
+                  ?1, 'claude', 'anthropic'),
+                 ('aaaa_newer_review', 'newer review', 'other-session', 0, 'flynn', 42,
+                  ?1, 'claude', 'anthropic')
+               """,
+               [producer.id]
+             )
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO attests
+                 (id, assignmentId, kind, verdictKind, bySession, byHarness, byProvider, ts)
+               VALUES
+                 ('older_clean', 'zzzz_older_review', 'verdict', 'reviewed-clean',
+                  'other-session', 'claude', 'anthropic', 42),
+                 ('newer_changes', 'aaaa_newer_review', 'verdict', 'changes-requested',
+                  'other-session', 'claude', 'anthropic', 42)
+               """
+             )
+
+    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == []
+  end
+
   test "prefixed idempotency scopes disjoint equal user and session strings", ctx do
     user = handle(ctx, "assign", assign_call({:user, "holder"}, "user", "collision"))
     session = handle(ctx, "assign", assign_call({:session, "holder"}, "session", "collision"))

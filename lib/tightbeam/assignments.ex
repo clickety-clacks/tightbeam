@@ -318,7 +318,7 @@ defmodule Tightbeam.Assignments do
           SELECT id, holderKey
           FROM assignments
           WHERE reviewsAssignmentId = ?1
-          ORDER BY openedAt DESC, id DESC
+          ORDER BY openedAt DESC, rowid DESC
           LIMIT 1
         )
         SELECT 'reviewed-clean'
