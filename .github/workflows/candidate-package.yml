@@ -1,0 +1,552 @@
+name: candidate package
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Full 40-character lowercase commit SHA at a pushed base-repository branch tip
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    name: resolve candidate
+    runs-on: ubuntu-latest
+    outputs:
+      validated_source_sha: ${{ steps.validate.outputs.validated_source_sha }}
+      repository: ${{ steps.resolve.outputs.repository }}
+      requested_sha: ${{ steps.resolve.outputs.requested_sha }}
+      resolved_sha: ${{ steps.resolve.outputs.resolved_sha }}
+      qualifying_pushed_ref: ${{ steps.resolve.outputs.qualifying_pushed_ref }}
+      source_tree_sha256: ${{ steps.resolve.outputs.source_tree_sha256 }}
+      trusted_workflow_sha: ${{ steps.resolve.outputs.trusted_workflow_sha }}
+      trusted_gate_blob: ${{ steps.resolve.outputs.trusted_gate_blob }}
+      trusted_setup_blob: ${{ steps.resolve.outputs.trusted_setup_blob }}
+    steps:
+      - name: Validate dispatch authority and input
+        id: validate
+        shell: bash
+        env:
+          REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
+          REQUIRED_DEFAULT_REF: refs/heads/${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_RUN_ATTEMPT" != "1" ]; then
+            echo "candidate package: GitHub re-runs are refused; create a fresh dispatch with the same full SHA" >&2
+            exit 1
+          fi
+          if [ "$GITHUB_REPOSITORY" != "clickety-clacks/tightbeam" ]; then
+            echo "candidate package: repository must be clickety-clacks/tightbeam; got $GITHUB_REPOSITORY" >&2
+            exit 1
+          fi
+          if [ "$GITHUB_REF" != "$REQUIRED_DEFAULT_REF" ]; then
+            echo "candidate package: dispatch ref $GITHUB_REF is not the required default ref $REQUIRED_DEFAULT_REF" >&2
+            exit 1
+          fi
+          if [[ ! "$REQUESTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "candidate package: source_sha must be exactly 40 lowercase hexadecimal characters" >&2
+            exit 1
+          fi
+          VALIDATED_SOURCE_SHA="$REQUESTED_SOURCE_SHA"
+          printf 'validated_source_sha=%s\n' "$VALIDATED_SOURCE_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Check out the trusted workflow revision
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve the pushed branch tip and trusted action blobs
+        id: resolve
+        shell: bash
+        env:
+          CANDIDATE_SHA: ${{ steps.validate.outputs.validated_source_sha }}
+          TRUSTED_WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+
+          trusted_head=$(git rev-parse HEAD)
+          if [ "$trusted_head" != "$TRUSTED_WORKFLOW_SHA" ]; then
+            echo "candidate package: trusted checkout $trusted_head does not equal workflow SHA $TRUSTED_WORKFLOW_SHA" >&2
+            exit 1
+          fi
+          if git symbolic-ref -q HEAD >/dev/null; then
+            echo "candidate package: trusted workflow checkout is not detached" >&2
+            exit 1
+          fi
+
+          matches=$(mktemp)
+          trap 'rm -f "$matches"' EXIT
+          git for-each-ref --format='%(objectname) %(refname)' refs/remotes/origin | while read -r tip remote_ref; do
+            [ "$remote_ref" = "refs/remotes/origin/HEAD" ] && continue
+            if [ "$tip" = "$CANDIDATE_SHA" ]; then
+              branch_ref="refs/heads/${remote_ref#refs/remotes/origin/}"
+              printf '%s\t%s\n' "$branch_ref" "$remote_ref"
+            fi
+          done > "$matches"
+
+          if [ ! -s "$matches" ]; then
+            printf 'candidate package: no pushed base-repository branch tip equals %s\n' "$CANDIDATE_SHA" >&2
+            exit 1
+          fi
+
+          selected=$(LC_ALL=C sort -t $'\t' -k1,1 "$matches" | head -n 1)
+          qualifying_pushed_ref=${selected%%$'\t'*}
+          selected_remote_ref=${selected#*$'\t'}
+          resolved_sha=$(git rev-parse "$selected_remote_ref^{commit}")
+          if [ "$resolved_sha" != "$CANDIDATE_SHA" ]; then
+            printf 'candidate package: pushed ref %s resolved to %s, not %s\n' \
+              "$qualifying_pushed_ref" "$resolved_sha" "$CANDIDATE_SHA" >&2
+            exit 1
+          fi
+
+          trusted_gate_blob=$(git rev-parse "$TRUSTED_WORKFLOW_SHA:.github/actions/platform-gate/action.yml") || {
+            echo "candidate package: trusted workflow revision lacks the canonical platform gate" >&2
+            exit 1
+          }
+          trusted_setup_blob=$(git rev-parse "$TRUSTED_WORKFLOW_SHA:.github/actions/platform-setup/action.yml") || {
+            echo "candidate package: trusted workflow revision lacks the canonical platform setup" >&2
+            exit 1
+          }
+          source_tree_sha256=$(git ls-tree -r -z --full-tree "$CANDIDATE_SHA" | shasum -a 256 | awk '{print $1}')
+
+          {
+            printf 'repository=%s\n' "$GITHUB_REPOSITORY"
+            printf 'requested_sha=%s\n' "$CANDIDATE_SHA"
+            printf 'resolved_sha=%s\n' "$resolved_sha"
+            printf 'qualifying_pushed_ref=%s\n' "$qualifying_pushed_ref"
+            printf 'source_tree_sha256=%s\n' "$source_tree_sha256"
+            printf 'trusted_workflow_sha=%s\n' "$TRUSTED_WORKFLOW_SHA"
+            printf 'trusted_gate_blob=%s\n' "$trusted_gate_blob"
+            printf 'trusted_setup_blob=%s\n' "$trusted_setup_blob"
+          } >> "$GITHUB_OUTPUT"
+
+  platform-test:
+    name: test ${{ matrix.name }}
+    needs: resolve
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux
+          - os: macos-latest
+            name: macos
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Refuse GitHub re-run attempts
+        shell: bash
+        run: |
+          [ "$GITHUB_RUN_ATTEMPT" = "1" ] || {
+            echo "candidate package: GitHub re-runs are refused; create a fresh dispatch with the same full SHA" >&2
+            exit 1
+          }
+
+      - name: Check out the trusted workflow revision
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+
+      - name: Check out the exact candidate source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ needs.resolve.outputs.validated_source_sha }}
+          path: candidate-source
+          persist-credentials: false
+
+      - name: Verify exact detached candidate source
+        shell: bash
+        env:
+          CANDIDATE_SHA: ${{ needs.resolve.outputs.validated_source_sha }}
+          EXPECTED_SOURCE_TREE_SHA256: ${{ needs.resolve.outputs.source_tree_sha256 }}
+        run: |
+          set -euo pipefail
+          cd candidate-source
+          head_sha=$(git rev-parse HEAD)
+          [ "$head_sha" = "$CANDIDATE_SHA" ] || {
+            printf 'candidate package: checkout HEAD %s does not equal %s\n' \
+              "$head_sha" "$CANDIDATE_SHA" >&2
+            exit 1
+          }
+          if git symbolic-ref -q HEAD >/dev/null; then
+            echo "candidate package: candidate checkout is not detached" >&2
+            exit 1
+          fi
+          [ -z "$(git status --porcelain)" ] || {
+            echo "candidate package: candidate checkout is dirty" >&2
+            exit 1
+          }
+          observed=$(git ls-tree -r -z --full-tree "$CANDIDATE_SHA" | shasum -a 256 | awk '{print $1}')
+          [ "$observed" = "$EXPECTED_SOURCE_TREE_SHA256" ] || {
+            echo "candidate package: source-tree SHA-256 $observed does not equal $EXPECTED_SOURCE_TREE_SHA256" >&2
+            exit 1
+          }
+
+      - name: Authoritative platform gate
+        uses: ./.github/actions/platform-gate
+        with:
+          source_directory: candidate-source
+          platform: ${{ matrix.name }}
+          use_cache: 'false'
+
+  package:
+    name: package ${{ matrix.package_platform }}
+    needs: [resolve, platform-test]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+            package_platform: linux-x86_64
+          - os: macos-latest
+            platform: macos
+            package_platform: darwin-aarch64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Refuse GitHub re-run attempts
+        shell: bash
+        run: |
+          [ "$GITHUB_RUN_ATTEMPT" = "1" ] || {
+            echo "candidate package: GitHub re-runs are refused; create a fresh dispatch with the same full SHA" >&2
+            exit 1
+          }
+
+      - name: Check out the trusted workflow revision
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+
+      - name: Check out the exact candidate source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ needs.resolve.outputs.validated_source_sha }}
+          path: candidate-source
+          persist-credentials: false
+
+      - name: Verify exact detached candidate source
+        shell: bash
+        env:
+          CANDIDATE_SHA: ${{ needs.resolve.outputs.validated_source_sha }}
+          EXPECTED_SOURCE_TREE_SHA256: ${{ needs.resolve.outputs.source_tree_sha256 }}
+        run: |
+          set -euo pipefail
+          cd candidate-source
+          head_sha=$(git rev-parse HEAD)
+          [ "$head_sha" = "$CANDIDATE_SHA" ] || {
+            printf 'candidate package: checkout HEAD %s does not equal %s\n' \
+              "$head_sha" "$CANDIDATE_SHA" >&2
+            exit 1
+          }
+          if git symbolic-ref -q HEAD >/dev/null; then
+            echo "candidate package: candidate checkout is not detached" >&2
+            exit 1
+          fi
+          [ -z "$(git status --porcelain)" ] || {
+            echo "candidate package: candidate checkout is dirty" >&2
+            exit 1
+          }
+          observed=$(git ls-tree -r -z --full-tree "$CANDIDATE_SHA" | shasum -a 256 | awk '{print $1}')
+          [ "$observed" = "$EXPECTED_SOURCE_TREE_SHA256" ] || {
+            echo "candidate package: source-tree SHA-256 $observed does not equal $EXPECTED_SOURCE_TREE_SHA256" >&2
+            exit 1
+          }
+
+      - name: Install package toolchains
+        uses: ./.github/actions/platform-setup
+        with:
+          source_directory: candidate-source
+          platform: ${{ matrix.platform }}
+          phase: toolchains
+          use_cache: 'false'
+
+      - name: Record package-runner observations
+        shell: bash
+        run: |
+          set -euo pipefail
+          elixir_version=$(elixir -e 'IO.write(System.version())')
+          otp_release=$(erl -noshell -eval 'io:format("~s", [erlang:system_info(otp_release)]), halt().')
+          rust_version=$(rustc --version)
+          cargo_version=$(cargo --version)
+          node_version=$(node --version)
+          npm_version=$(npm --version)
+          jq -n \
+            --arg runner_os "$RUNNER_OS" \
+            --arg runner_arch "$RUNNER_ARCH" \
+            --arg image_os "${ImageOS:-}" \
+            --arg image_version "${ImageVersion:-}" \
+            --arg elixir "$elixir_version" \
+            --arg otp "$otp_release" \
+            --arg rust "$rust_version" \
+            --arg cargo "$cargo_version" \
+            --arg node "$node_version" \
+            --arg npm "$npm_version" \
+            '{runner_os: $runner_os, runner_arch: $runner_arch,
+              image_os: (if $image_os == "" then null else $image_os end),
+              image_version: (if $image_version == "" then null else $image_version end),
+              toolchains: {elixir: $elixir, erlang_otp: $otp, rust: $rust, cargo: $cargo, node: $node, npm: $npm}}' \
+            > "$RUNNER_TEMP/package-observations.json"
+
+      - name: Fetch package Mix dependencies
+        uses: ./.github/actions/platform-setup
+        with:
+          source_directory: candidate-source
+          platform: ${{ matrix.platform }}
+          phase: mix-dependencies
+          use_cache: 'false'
+
+      - name: Assemble the candidate package
+        shell: bash
+        working-directory: candidate-source
+        run: sh packaging/assemble.sh
+
+      - name: Stage package and provenance
+        shell: bash
+        env:
+          CANDIDATE_SHA: ${{ needs.resolve.outputs.validated_source_sha }}
+          REQUESTED_SHA: ${{ needs.resolve.outputs.requested_sha }}
+          RESOLVED_SHA: ${{ needs.resolve.outputs.resolved_sha }}
+          QUALIFYING_PUSHED_REF: ${{ needs.resolve.outputs.qualifying_pushed_ref }}
+          SOURCE_TREE_SHA256: ${{ needs.resolve.outputs.source_tree_sha256 }}
+          TRUSTED_WORKFLOW_SHA: ${{ needs.resolve.outputs.trusted_workflow_sha }}
+          TRUSTED_GATE_BLOB: ${{ needs.resolve.outputs.trusted_gate_blob }}
+          TRUSTED_SETUP_BLOB: ${{ needs.resolve.outputs.trusted_setup_blob }}
+          PACKAGE_PLATFORM: ${{ matrix.package_platform }}
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' candidate-source/cli/Cargo.toml)
+          expected="tightbeam-$version-$PACKAGE_PLATFORM.tgz"
+          package_count=$(find candidate-source/_build/npm -maxdepth 1 -type f -name 'tightbeam-*.tgz' | wc -l | tr -d ' ')
+          [ "$package_count" = "1" ] || {
+            echo "candidate package: expected exactly one package for $PACKAGE_PLATFORM; found $package_count" >&2
+            exit 1
+          }
+          package=$(find candidate-source/_build/npm -maxdepth 1 -type f -name 'tightbeam-*.tgz' -print)
+          [ "$(basename "$package")" = "$expected" ] || {
+            echo "candidate package: expected $expected; found $(basename "$package")" >&2
+            exit 1
+          }
+
+          short_sha=$(printf '%.7s' "$CANDIDATE_SHA")
+          stamped="tightbeam-$version-$PACKAGE_PLATFORM-$short_sha.tgz"
+          stage="candidate-staging/$PACKAGE_PLATFORM"
+          mkdir -p "$stage"
+          mv "$package" "$stage/$stamped"
+          package_sha256=$(shasum -a 256 "$stage/$stamped" | awk '{print $1}')
+          package_bytes=$(wc -c < "$stage/$stamped" | tr -d ' ')
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg requested_sha "$REQUESTED_SHA" \
+            --arg resolved_sha "$RESOLVED_SHA" \
+            --arg qualifying_pushed_ref "$QUALIFYING_PUSHED_REF" \
+            --arg source_tree_sha256 "$SOURCE_TREE_SHA256" \
+            --arg trusted_workflow_sha "$TRUSTED_WORKFLOW_SHA" \
+            --arg trusted_gate_blob "$TRUSTED_GATE_BLOB" \
+            --arg trusted_setup_blob "$TRUSTED_SETUP_BLOB" \
+            --arg workflow_name "$GITHUB_WORKFLOW" \
+            --arg workflow_ref "$GITHUB_WORKFLOW_REF" \
+            --arg workflow_sha "$GITHUB_WORKFLOW_SHA" \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg run_number "$GITHUB_RUN_NUMBER" \
+            --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg run_url "$run_url" \
+            --arg actor "$GITHUB_ACTOR" \
+            --arg triggering_actor "$GITHUB_TRIGGERING_ACTOR" \
+            --arg filename "$stamped" \
+            --arg platform "$PACKAGE_PLATFORM" \
+            --arg bytes "$package_bytes" \
+            --arg sha256 "$package_sha256" \
+            --slurpfile observed "$RUNNER_TEMP/package-observations.json" \
+            '{repository: $repository, requested_sha: $requested_sha, resolved_sha: $resolved_sha,
+              qualifying_pushed_ref: $qualifying_pushed_ref, source_tree_sha256: $source_tree_sha256,
+              trusted_workflow_sha: $trusted_workflow_sha, trusted_gate_blob: $trusted_gate_blob,
+              trusted_setup_blob: $trusted_setup_blob,
+              workflow: {name: $workflow_name, ref: $workflow_ref, sha: $workflow_sha},
+              run: {id: $run_id, number: $run_number, attempt: $run_attempt, url: $run_url,
+                    actor: $actor, triggering_actor: $triggering_actor},
+              package: {filename: $filename, platform: $platform, bytes: ($bytes | tonumber), sha256: $sha256},
+              observed_by_package_job: $observed[0]}' \
+            > "$stage/candidate-provenance-$PACKAGE_PLATFORM.json"
+
+      - name: Upload staging artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: candidate-staging-${{ matrix.package_platform }}-${{ needs.resolve.outputs.validated_source_sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: candidate-staging/${{ matrix.package_platform }}
+          retention-days: 1
+          if-no-files-found: error
+          overwrite: false
+
+  aggregate:
+    name: candidate bundle
+    needs: [resolve, package]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Refuse GitHub re-run attempts
+        shell: bash
+        run: |
+          [ "$GITHUB_RUN_ATTEMPT" = "1" ] || {
+            echo "candidate package: GitHub re-runs are refused; create a fresh dispatch with the same full SHA" >&2
+            exit 1
+          }
+
+      - name: Download Linux staging artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: candidate-staging-linux-x86_64-${{ needs.resolve.outputs.validated_source_sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: aggregate-input/linux-x86_64
+
+      - name: Download macOS staging artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: candidate-staging-darwin-aarch64-${{ needs.resolve.outputs.validated_source_sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: aggregate-input/darwin-aarch64
+
+      - name: Validate and assemble the candidate bundle
+        shell: bash
+        env:
+          CANDIDATE_SHA: ${{ needs.resolve.outputs.validated_source_sha }}
+          EXPECTED_REPOSITORY: ${{ needs.resolve.outputs.repository }}
+          REQUESTED_SHA: ${{ needs.resolve.outputs.requested_sha }}
+          RESOLVED_SHA: ${{ needs.resolve.outputs.resolved_sha }}
+          QUALIFYING_PUSHED_REF: ${{ needs.resolve.outputs.qualifying_pushed_ref }}
+          SOURCE_TREE_SHA256: ${{ needs.resolve.outputs.source_tree_sha256 }}
+          TRUSTED_WORKFLOW_SHA: ${{ needs.resolve.outputs.trusted_workflow_sha }}
+          TRUSTED_GATE_BLOB: ${{ needs.resolve.outputs.trusted_gate_blob }}
+          TRUSTED_SETUP_BLOB: ${{ needs.resolve.outputs.trusted_setup_blob }}
+        run: |
+          set -euo pipefail
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          short_sha=$(printf '%.7s' "$CANDIDATE_SHA")
+          input_files=$(find aggregate-input -type f | wc -l | tr -d ' ')
+          tgz_files=$(find aggregate-input -type f -name '*.tgz' | wc -l | tr -d ' ')
+          fragment_files=$(find aggregate-input -type f -name 'candidate-provenance-*.json' | wc -l | tr -d ' ')
+          [ "$input_files" = "4" ] && [ "$tgz_files" = "2" ] && [ "$fragment_files" = "2" ] || {
+            echo "candidate package: expected exactly two packages and two provenance fragments" >&2
+            find aggregate-input -type f -print >&2
+            exit 1
+          }
+
+          mkdir -p candidate-bundle package-records
+          for platform in darwin-aarch64 linux-x86_64; do
+            directory="aggregate-input/$platform"
+            package_count=$(find "$directory" -maxdepth 1 -type f -name '*.tgz' | wc -l | tr -d ' ')
+            fragment_count=$(find "$directory" -maxdepth 1 -type f -name 'candidate-provenance-*.json' | wc -l | tr -d ' ')
+            [ "$package_count" = "1" ] && [ "$fragment_count" = "1" ] || {
+              echo "candidate package: staging set for $platform is not one package plus one fragment" >&2
+              exit 1
+            }
+            package=$(find "$directory" -maxdepth 1 -type f -name '*.tgz' -print)
+            fragment=$(find "$directory" -maxdepth 1 -type f -name 'candidate-provenance-*.json' -print)
+            filename=$(basename "$package")
+            if [[ ! "$filename" =~ ^tightbeam-([0-9]+\.[0-9]+\.[0-9]+)-${platform}-${short_sha}\.tgz$ ]]; then
+              echo "candidate package: unexpected package filename $filename for $platform" >&2
+              exit 1
+            fi
+            package_sha256=$(shasum -a 256 "$package" | awk '{print $1}')
+            package_bytes=$(wc -c < "$package" | tr -d ' ')
+
+            jq -e \
+              --arg repository "$EXPECTED_REPOSITORY" \
+              --arg requested_sha "$REQUESTED_SHA" \
+              --arg resolved_sha "$RESOLVED_SHA" \
+              --arg qualifying_pushed_ref "$QUALIFYING_PUSHED_REF" \
+              --arg source_tree_sha256 "$SOURCE_TREE_SHA256" \
+              --arg trusted_workflow_sha "$TRUSTED_WORKFLOW_SHA" \
+              --arg trusted_gate_blob "$TRUSTED_GATE_BLOB" \
+              --arg trusted_setup_blob "$TRUSTED_SETUP_BLOB" \
+              --arg workflow_name "$GITHUB_WORKFLOW" \
+              --arg workflow_ref "$GITHUB_WORKFLOW_REF" \
+              --arg workflow_sha "$GITHUB_WORKFLOW_SHA" \
+              --arg run_id "$GITHUB_RUN_ID" \
+              --arg run_number "$GITHUB_RUN_NUMBER" \
+              --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+              --arg run_url "$run_url" \
+              --arg actor "$GITHUB_ACTOR" \
+              --arg triggering_actor "$GITHUB_TRIGGERING_ACTOR" \
+              --arg filename "$filename" \
+              --arg platform "$platform" \
+              --arg bytes "$package_bytes" \
+              --arg sha256 "$package_sha256" \
+              '.repository == $repository and .requested_sha == $requested_sha and
+               .resolved_sha == $resolved_sha and .qualifying_pushed_ref == $qualifying_pushed_ref and
+               .source_tree_sha256 == $source_tree_sha256 and .trusted_workflow_sha == $trusted_workflow_sha and
+               .trusted_gate_blob == $trusted_gate_blob and .trusted_setup_blob == $trusted_setup_blob and
+               .workflow.name == $workflow_name and .workflow.ref == $workflow_ref and
+               .workflow.sha == $workflow_sha and .run.id == $run_id and .run.number == $run_number and
+               .run.attempt == $run_attempt and .run.url == $run_url and .run.actor == $actor and
+               .run.triggering_actor == $triggering_actor and .package.filename == $filename and
+               .package.platform == $platform and .package.bytes == ($bytes | tonumber) and
+               .package.sha256 == $sha256 and (.observed_by_package_job | type) == "object"' \
+              "$fragment" >/dev/null || {
+                echo "candidate package: provenance fragment for $platform disagrees with trusted context or package bytes" >&2
+                exit 1
+              }
+
+            jq '{platform: .package.platform, filename: .package.filename, bytes: .package.bytes,
+                 sha256: .package.sha256, observed_by_package_job: .observed_by_package_job}' \
+              "$fragment" > "package-records/$platform.json"
+            cp "$package" "candidate-bundle/$filename"
+          done
+
+          darwin_version=$(jq -r '.filename | capture("^tightbeam-(?<version>[0-9]+\\.[0-9]+\\.[0-9]+)-").version' package-records/darwin-aarch64.json)
+          linux_version=$(jq -r '.filename | capture("^tightbeam-(?<version>[0-9]+\\.[0-9]+\\.[0-9]+)-").version' package-records/linux-x86_64.json)
+          [ "$darwin_version" = "$linux_version" ] || {
+            echo "candidate package: package versions disagree: darwin=$darwin_version linux=$linux_version" >&2
+            exit 1
+          }
+
+          for platform in darwin-aarch64 linux-x86_64; do
+            jq -r '"\(.sha256)  \(.filename)"' "package-records/$platform.json"
+          done > candidate-bundle/SHA256SUMS
+          packages=$(jq -s 'sort_by(.platform)' package-records/*.json)
+          jq -n \
+            --arg repository "$EXPECTED_REPOSITORY" \
+            --arg requested_sha "$REQUESTED_SHA" \
+            --arg resolved_sha "$RESOLVED_SHA" \
+            --arg qualifying_pushed_ref "$QUALIFYING_PUSHED_REF" \
+            --arg source_tree_sha256 "$SOURCE_TREE_SHA256" \
+            --arg trusted_workflow_sha "$TRUSTED_WORKFLOW_SHA" \
+            --arg trusted_gate_blob "$TRUSTED_GATE_BLOB" \
+            --arg trusted_setup_blob "$TRUSTED_SETUP_BLOB" \
+            --arg workflow_name "$GITHUB_WORKFLOW" \
+            --arg workflow_ref "$GITHUB_WORKFLOW_REF" \
+            --arg workflow_sha "$GITHUB_WORKFLOW_SHA" \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg run_number "$GITHUB_RUN_NUMBER" \
+            --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg run_url "$run_url" \
+            --arg actor "$GITHUB_ACTOR" \
+            --arg triggering_actor "$GITHUB_TRIGGERING_ACTOR" \
+            --argjson packages "$packages" \
+            '{repository: $repository, requested_sha: $requested_sha, resolved_sha: $resolved_sha,
+              qualifying_pushed_ref: $qualifying_pushed_ref, source_tree_sha256: $source_tree_sha256,
+              trusted_workflow_sha: $trusted_workflow_sha, trusted_gate_blob: $trusted_gate_blob,
+              trusted_setup_blob: $trusted_setup_blob,
+              workflow: {name: $workflow_name, ref: $workflow_ref, sha: $workflow_sha},
+              run: {id: $run_id, number: $run_number, attempt: $run_attempt, url: $run_url,
+                    actor: $actor, triggering_actor: $triggering_actor},
+              packages: $packages}' > candidate-bundle/candidate-provenance.json
+
+          final_count=$(find candidate-bundle -maxdepth 1 -type f | wc -l | tr -d ' ')
+          [ "$final_count" = "4" ] || {
+            echo "candidate package: final bundle must contain exactly four files; found $final_count" >&2
+            exit 1
+          }
+
+      - name: Upload candidate bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: tightbeam-candidate-${{ needs.resolve.outputs.validated_source_sha }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: candidate-bundle
+          retention-days: 90
+          if-no-files-found: error
+          overwrite: false

@@ -1,0 +1,141 @@
+name: Tightbeam platform gate
+description: Run the authoritative Tightbeam gate against one source tree.
+
+inputs:
+  source_directory:
+    description: Source tree relative to GITHUB_WORKSPACE
+    required: true
+  platform:
+    description: linux or macos
+    required: true
+  use_cache:
+    description: The literal string true or false
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Validate gate inputs
+      shell: bash
+      env:
+        PLATFORM: ${{ inputs.platform }}
+        USE_CACHE: ${{ inputs.use_cache }}
+      run: |
+        set -euo pipefail
+        case "$USE_CACHE" in
+          true|false) ;;
+          *)
+            echo "platform gate: use_cache must be the literal string 'true' or 'false'; got '$USE_CACHE'" >&2
+            exit 1
+            ;;
+        esac
+        case "$PLATFORM" in
+          linux)
+            [ "$RUNNER_OS" = "Linux" ] && [ "$RUNNER_ARCH" = "X64" ] || {
+              echo "platform gate: linux requires RUNNER_OS=Linux and RUNNER_ARCH=X64; got $RUNNER_OS/$RUNNER_ARCH" >&2
+              exit 1
+            }
+            ;;
+          macos)
+            [ "$RUNNER_OS" = "macOS" ] && [ "$RUNNER_ARCH" = "ARM64" ] || {
+              echo "platform gate: macos requires RUNNER_OS=macOS and RUNNER_ARCH=ARM64; got $RUNNER_OS/$RUNNER_ARCH" >&2
+              exit 1
+            }
+            ;;
+          *)
+            echo "platform gate: platform must be linux or macos; got '$PLATFORM'" >&2
+            exit 1
+            ;;
+        esac
+
+    - name: Public rule facts never shrink
+      shell: bash
+      working-directory: ${{ inputs.source_directory }}
+      run: python3 scripts/verify_public_rule_facts.py
+
+    - name: Install toolchains
+      uses: ./.github/actions/platform-setup
+      with:
+        source_directory: ${{ inputs.source_directory }}
+        platform: ${{ inputs.platform }}
+        phase: toolchains
+        use_cache: ${{ inputs.use_cache }}
+
+    - name: Toolchain versions (the parity record)
+      shell: bash
+      working-directory: ${{ inputs.source_directory }}
+      run: |
+        elixir --version
+        rustc --version
+        cargo --version
+        node --version
+        npm --version
+
+    - name: Put the in-repo harness CLI on PATH (suite prerequisite)
+      shell: bash
+      working-directory: ${{ inputs.source_directory }}
+      run: printf '%s/priv/harness_cli\n' "$PWD" >> "$GITHUB_PATH"
+
+    - name: Declare a git identity (suite prerequisite)
+      shell: bash
+      run: |
+        git config --global user.name "tightbeam ci"
+        git config --global user.email "ci@tightbeam.invalid"
+
+    - name: Restore cargo registry cache
+      uses: ./.github/actions/platform-setup
+      with:
+        source_directory: ${{ inputs.source_directory }}
+        platform: ${{ inputs.platform }}
+        phase: cargo-cache
+        use_cache: ${{ inputs.use_cache }}
+
+    - name: cargo build --release (suite prerequisite)
+      shell: bash
+      working-directory: ${{ inputs.source_directory }}/cli
+      run: cargo build --release
+
+    - name: Containment environment (diagnostic)
+      if: ${{ inputs.platform == 'linux' }}
+      shell: bash
+      working-directory: ${{ inputs.source_directory }}
+      run: |
+        uname -a
+        echo "--- /dev/null as the shell sees it ---"
+        ls -la /dev/null
+        stat /dev/null
+        echo "--- containment probe ---"
+        cli/target/release/tightbeam contain-probe
+
+    - name: Restore Mix dependencies and fetch them
+      uses: ./.github/actions/platform-setup
+      with:
+        source_directory: ${{ inputs.source_directory }}
+        platform: ${{ inputs.platform }}
+        phase: mix-dependencies
+        use_cache: ${{ inputs.use_cache }}
+
+    - name: mix compile
+      shell: bash
+      working-directory: ${{ inputs.source_directory }}
+      run: mix compile
+
+    - name: mix format --check-formatted
+      shell: bash
+      working-directory: ${{ inputs.source_directory }}
+      run: mix format --check-formatted
+
+    - name: mix test
+      shell: bash
+      working-directory: ${{ inputs.source_directory }}
+      run: scripts/verify_mix.sh
+
+    - name: cargo fmt --check
+      shell: bash
+      working-directory: ${{ inputs.source_directory }}/cli
+      run: cargo fmt --check
+
+    - name: cargo test
+      shell: bash
+      working-directory: ${{ inputs.source_directory }}/cli
+      run: cargo test

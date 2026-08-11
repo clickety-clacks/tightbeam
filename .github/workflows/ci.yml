@@ -32,119 +32,14 @@ jobs:
         with:
           fetch-depth: 2
 
-      - name: Public rule facts never shrink
-        run: python3 scripts/verify_public_rule_facts.py
-
-      # ONE pinned BEAM for every platform. erlef/setup-beam does support macOS
-      # runners (OTP 25-29 on macOS-14/15/26) — the earlier "linux and windows
-      # only" reading was wrong, and brew cost us the parity the matrix exists
-      # to measure: brew shipped Elixir 1.20.2/OTP 29 against linux's pinned
-      # 1.19.5/OTP 28, and the two jobs then disagreed about what the SUITE IS
-      # (945 tests / 11 skipped on macOS vs 950 / 12 on linux, run 30250495002).
-      # A version difference cannot be told apart from a platform difference, so
-      # both jobs run the versions development and the hosts run.
-      - name: Install BEAM (pinned, every platform)
-        uses: erlef/setup-beam@v1
+      # The canonical action preserves the order and behavior documented above.
+      # Normal CI owns caches; manual candidate runs call the same gate with caches off.
+      - name: Authoritative platform gate
+        uses: ./.github/actions/platform-gate
         with:
-          otp-version: "28"
-          elixir-version: "1.19.5"
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Toolchain versions (the parity record)
-        run: |
-          elixir --version
-          rustc --version
-
-      # Gateway boot refuses unless at least one REGISTERED harness CLI probes on
-      # PATH. CI used to satisfy that by npm-installing pinned claude and codex,
-      # which is a network dependency, ~40s, and — measured — worth nothing: the
-      # suite's failure set is byte-identical with only the in-repo Fixture CLI on
-      # PATH (26 failures either way, shrdlu 2026-07-27). CI holds no credentials,
-      # so it never drove a real harness turn to begin with; a pinned `--version`
-      # cannot catch a harness that changed under us. That is the LIVE
-      # feature_smoke matrix's job, and it stays its job.
-      #
-      # This is not a mock standing in for claude or codex. Fixture is a
-      # registered harness in the test registry (config/test.exs) and this is its
-      # own CLI: nothing here imitates another harness's behaviour.
-      - name: Put the in-repo harness CLI on PATH (suite prerequisite)
-        run: echo "$GITHUB_WORKSPACE/priv/harness_cli" >> "$GITHUB_PATH"
-
-      # The undeclared dependency that lied loudest: the identity suite commits
-      # and MERGES in a real git repo, and git refuses to write a commit without a
-      # committer. `Identity.relearn!/1` runs its merge with no author env, so on
-      # a host with no git identity the merge fails for a reason that is not a
-      # conflict and relearn reports `{:conflict, []}` — a phantom conflict with
-      # nothing to resolve. Every dev mac has a global identity; shrdlu and the
-      # runners have none, which is the whole 2-failure IdentityTest delta.
-      - name: Declare a git identity (suite prerequisite)
-        run: |
-          git config --global user.name "tightbeam ci"
-          git config --global user.email "ci@tightbeam.invalid"
-
-      # Cache the dependency DOWNLOADS only — never cli/target. Two reasons, both
-      # learned the hard way (2026-07-27): (1) this step used to sit AFTER the cargo
-      # build below, so its restore OVERWROTE the freshly built binary with a stale
-      # cached one, and mix test then ran the stale binary while the diagnostic ran
-      # the fresh one — the two disagreed and the failure was un-diagnosable. (2) Even
-      # ordered correctly, caching cli/target makes cargo's mtime fingerprinting skip
-      # the rebuild after a restore, so the gate tests a stale binary. The binary MUST
-      # be built from the commit under test, every run. ~15s of dep recompile is the
-      # price of a gate that tests what was pushed.
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/registry
-          key: cargo-registry-${{ matrix.name }}-${{ hashFiles('cli/Cargo.lock') }}
-
-      - name: cargo build --release (suite prerequisite)
-        working-directory: cli
-        run: cargo build --release
-
-      # Make the runner's containment environment VISIBLE. Three fleet hosts at one
-      # kernel version are not the platform gate; this job is. When a Landlock grant
-      # behaves differently here than on the fleet, this prints the OS release, the
-      # Landlock ABI, and a right-by-right grant trace for a directory and a device
-      # node — so the cause is read from the runner's own output, not guessed from a
-      # kernel number. Never fails the job; it only reports.
-      - name: Containment environment (diagnostic)
-        if: matrix.name == 'linux'
-        run: |
-          uname -a
-          echo "--- /dev/null as the shell sees it ---"
-          ls -la /dev/null
-          stat /dev/null
-          echo "--- containment probe ---"
-          cli/target/release/tightbeam contain-probe
-
-      - name: Cache mix deps
-        uses: actions/cache@v4
-        with:
-          path: |
-            deps
-            _build
-          key: mix-${{ matrix.name }}-${{ hashFiles('mix.lock') }}
-
-      - name: mix deps.get
-        run: mix deps.get
-
-      - name: mix compile
-        run: mix compile
-
-      - name: mix format --check-formatted
-        run: mix format --check-formatted
-
-      - name: mix test
-        run: scripts/verify_mix.sh
-
-      - name: cargo fmt --check
-        working-directory: cli
-        run: cargo fmt --check
-
-      - name: cargo test
-        working-directory: cli
-        run: cargo test
+          source_directory: .
+          platform: ${{ matrix.name }}
+          use_cache: 'true'
 
   # THE DEPLOY ARTIFACT IS BUILT HERE, from the pushed SHA, by a machine nobody
   # develops or smoke-tests on. Building it from a dev tree conflates "what I
