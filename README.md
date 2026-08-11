@@ -1,7 +1,12 @@
 # Tightbeam
 
-A gateway that coordinates agent sessions across machines: durable turns, work
-items, assignments, and gate statutes over a closed verb set.
+Agent orchestration needs a real machine part—not another layer of ad hoc glue.
+Tightbeam coordinates the vendors’ own harnesses rather than repackaging models
+in a generic shell: Claude runs in Claude Code; Codex runs in Codex.
+
+It keeps durable, first-party facts about work in one shared source of truth.
+At the substrate layer, it turns guidance into deterministic rails: rules
+enforced across agents and sessions, not left to each model’s inference.
 
 You RUN tightbeam; you do not depend on it. There is no Hex package.
 
