@@ -32,9 +32,10 @@ end
 defmodule Tightbeam.SchemaShapeTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Schema}
+  alias Tightbeam.{DB, Model, Org, Schema}
 
-  @shape "operator-decision-requests-v1"
+  @shape "operational-parent-v1"
+  @previous_shape "operator-decision-requests-v1"
   @be61_shape "model-identity-message-envelope-v2"
 
   # Captured from Schema.ensure_all/1 at be61cfc98df6b18c0cc280adeca42cba3fbf14b5.
@@ -316,11 +317,80 @@ defmodule Tightbeam.SchemaShapeTest do
     assert error.message =~ @be61_shape
     assert error.message =~ @shape
 
-    assert error.message =~
-             "operator decision requests changed the decision_requests and wakes shape."
+    assert error.message =~ "The only supported upgrade source is #{@previous_shape}"
 
     assert {:ok, [[@be61_shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
     refute "ruledViaSessionKey" in table_columns(db, "decision_requests")
+  end
+
+  test "the exact predecessor upgrades roots to Main and preserves spawn provenance", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    main = session(db, Org.personal_session_key("flynn"), "flynn", kind: "main")
+    root = session(db, "root", "flynn")
+    child = session(db, "child", "flynn", spawned_by: root.session_key)
+    main_key = main.session_key
+    root_key = root.session_key
+    child_key = child.session_key
+
+    :ok =
+      DB.execute(
+        db,
+        "INSERT INTO harness_pointers (sessionKey,harnessSessionId,sourceSessionRef,harness,machine,reason,createdAt) VALUES ('child','hs-child','source-child','claude','testhost','created',1)"
+      )
+
+    downgrade_to_previous_shape(db)
+
+    assert {:ok, [[@previous_shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+    refute "operationalParent" in table_columns(db, "sessions")
+
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok,
+            [
+              [^main_key, nil, ^main_key],
+              [^child_key, ^root_key, ^root_key],
+              [^root_key, nil, ^main_key]
+            ]} =
+             DB.query(
+               db,
+               "SELECT sessionKey,spawnedBy,operationalParent FROM sessions ORDER BY sessionKey"
+             )
+
+    assert {:ok, [[^child_key, "hs-child"]]} =
+             DB.query(db, "SELECT sessionKey,harnessSessionId FROM harness_pointers")
+
+    column =
+      Enum.find(table_info(db, "sessions"), fn [_cid, name | _] ->
+        name == "operationalParent"
+      end)
+
+    assert Enum.at(column, 3) == 1
+  end
+
+  test "an interrupted operational-parent upgrade rolls back and retries exactly", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+    main = session(db, Org.personal_session_key("flynn"), "flynn", kind: "main")
+    main_key = main.session_key
+    _root = session(db, "root", "flynn")
+    downgrade_to_previous_shape(db)
+
+    error =
+      assert_raise Schema.ShapeError, fn ->
+        Schema.upgrade_operational_parent_v1(db, fail_at: :after_drop)
+      end
+
+    assert error.message =~ "forced operational-parent migration interruption"
+    assert {:ok, [[@previous_shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+    refute "operationalParent" in table_columns(db, "sessions")
+    refute table?(db, "sessions_operational_parent_v1")
+
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:ok, [[^main_key]]} =
+             DB.query(db, "SELECT operationalParent FROM sessions WHERE kind='main'")
   end
 
   # The defect this refuses: `CREATE TABLE IF NOT EXISTS` is SILENT about a
@@ -405,6 +475,36 @@ defmodule Tightbeam.SchemaShapeTest do
     assert error.message =~ @shape
   end
 
+  defp session(db, key, owner, opts \\ []) do
+    Org.create(db, %{
+      session_key: key,
+      display_name: key,
+      kind: Keyword.get(opts, :kind, "custom"),
+      is_built_in: Keyword.get(opts, :kind) == "main",
+      owner_user_id: owner,
+      origin: "user:#{owner}",
+      spawned_by: Keyword.get(opts, :spawned_by),
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("fable")
+    })
+  end
+
+  defp downgrade_to_previous_shape(db) do
+    :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN operationalParent")
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "UPDATE schema_stamp SET shape=?1, stampedAt=1",
+        [@previous_shape]
+      )
+
+    :ok
+  end
+
   defp table?(db, name) do
     {:ok, rows} =
       DB.query(db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1", [name])
@@ -413,8 +513,12 @@ defmodule Tightbeam.SchemaShapeTest do
   end
 
   defp table_columns(db, name) do
+    Enum.map(table_info(db, name), fn [_cid, column | _] -> column end)
+  end
+
+  defp table_info(db, name) do
     {:ok, rows} = DB.query(db, "PRAGMA table_info(#{name})")
-    Enum.map(rows, fn [_cid, column | _] -> column end)
+    rows
   end
 
   defp owned_activation_objects(db) do

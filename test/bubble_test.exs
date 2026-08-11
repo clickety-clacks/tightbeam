@@ -190,12 +190,12 @@ defmodule Tightbeam.Productions.BubbleTest do
     assert ref == "bubble:#{cause_seq}"
   end
 
-  test "a parentless session's failure marks its own stream and climbs nowhere", ctx do
+  test "Main is the operational-parent terminus for its own failure", ctx do
     seq = fail_turn!(ctx.db, ctx.main.session_key)
     :ok = Bubble.recognize_terminal(ctx.db, seq)
 
     assert notice_turn(ctx.db, "supervisor") == []
-    refute ConditionFacts.standing?(ctx.db, "user-alerted", "flynn")
+    assert ConditionFacts.standing?(ctx.db, "user-alerted", "flynn")
   end
 
   test "the first delivered turn for an alerted owner clears the alert", ctx do

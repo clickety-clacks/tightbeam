@@ -623,6 +623,7 @@ defmodule Tightbeam.GatewayTest do
       display_name: "Main",
       owner_user_id: "flynn",
       origin: "user:flynn",
+      operational_parent: "k1",
       archetype: "default",
       host: "testhost",
       harness: "claude",
@@ -1852,7 +1853,10 @@ defmodule Tightbeam.GatewayTest do
     create_session(ctx.db, "effort-parent", "flynn")
 
     :ok =
-      DB.execute(ctx.db, "UPDATE sessions SET spawnedBy='effort-parent' WHERE sessionKey='k1'")
+      DB.execute(
+        ctx.db,
+        "UPDATE sessions SET kind='main',isBuiltIn=1,operationalParent='effort-parent' WHERE sessionKey='effort-parent'; UPDATE sessions SET operationalParent='effort-parent' WHERE sessionKey='k1'"
+      )
 
     assignment =
       Gateway.handlers(config)["dispatch"].(%{
@@ -1875,7 +1879,7 @@ defmodule Tightbeam.GatewayTest do
     assert %{consumer: "effort_probe", state: "pending"} = Wakes.get(ctx.db, wake_id)
     {:ok, _} = DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [wake_id])
 
-    # Rung one prods the HOLDER and re-arms; the owner's request is rung two.
+    # Rung one prods the HOLDER and re-arms; the parent escalation is rung two.
     assert :ok = Wakes.fire_due(scheduler)
 
     {:ok, [[rearmed_wake_id]]} =
@@ -1888,22 +1892,27 @@ defmodule Tightbeam.GatewayTest do
     {:ok, _} = DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [rearmed_wake_id])
     assert :ok = Wakes.fire_due(scheduler)
 
-    assert {:ok, [[request_id]]} =
-             DB.query(
-               ctx.db,
-               "SELECT id FROM decision_requests WHERE kind='effort' AND assignmentId=?1",
-               [assignment.id]
-             )
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE kind='effort'")
 
-    assert is_binary(request_id)
     assert Wakes.get(ctx.db, wake_id).state == "fired"
 
-    # The expecter notification is a durable ungated wake armed with the request,
-    # still pending: the same tick that opened the request delivers nothing.
-    assert {:ok, [[notify_id]]} =
+    # The parent escalation is a durable agent-targeted wake. Main is terminal,
+    # so there is no third effort generation and no user/decision rung.
+    assert {:ok, [[notify_id, prompt]]} =
              DB.query(
                ctx.db,
-               "SELECT wakeId FROM wakes WHERE targetGate = 0 AND state = 'pending'"
+               "SELECT wakeId,prompt FROM wakes WHERE sessionKey='effort-parent' AND state='pending' AND consumer='prompt'"
+             )
+
+    assert prompt =~ "[effort escalation]"
+    assert prompt =~ "Child session k1 remains inactive"
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM effort_checkin_generations WHERE assignmentId=?1 AND state='armed'",
+               [assignment.id]
              )
 
     assert %{consumer: "prompt", session_key: expecter} = Wakes.get(ctx.db, notify_id)
@@ -1918,7 +1927,7 @@ defmodule Tightbeam.GatewayTest do
 
     assert_received {:ensure_lane, ^expecter}
 
-    assert {:ok, [[1]]} =
+    assert {:ok, [[0]]} =
              DB.query(
                ctx.db,
                "SELECT COUNT(*) FROM decision_requests WHERE kind='effort' AND assignmentId=?1",
@@ -8985,6 +8994,7 @@ defmodule Tightbeam.GatewayTest do
       owner_user_id: owner_user_id,
       origin: "user:#{owner_user_id}",
       spawned_by: spawned_by,
+      operational_parent: spawned_by || "k1",
       archetype: "default",
       host: "testhost",
       harness: "claude",

@@ -678,7 +678,7 @@ defmodule Tightbeam.Gateway do
           # `work-blocked`/`work-unblocked` assert an authority's judgment
           # over a session (spec production-machine-v1 §Standing facts): the
           # scope must be a session, and the caller must sit ABOVE it in the
-          # spawnedBy lineage, or be its owner (user or admin). ConditionFacts
+          # operational-parent lineage, or be its owner (user or admin). ConditionFacts
           # itself refuses the substrate; this seam refuses the unauthorized.
           p.kind in ~w(work-blocked work-unblocked) and
               not work_block_authority?(db, call, p[:scope]) ->
@@ -1812,6 +1812,7 @@ defmodule Tightbeam.Gateway do
       :harness,
       :origin,
       :spawned_by,
+      :operational_parent,
       :state,
       :created_at
     ])
@@ -3241,7 +3242,7 @@ defmodule Tightbeam.Gateway do
 
   # Authority for asserting `work-blocked`/`work-unblocked` over a session
   # (spec production-machine-v1 §Standing facts): the scope names an existing
-  # session, and the caller is above it in the spawnedBy lineage, or is the
+  # session, and the caller is above it in the operational-parent lineage, or is the
   # scope session's owner (as a user principal), or is an admin. A session
   # asserting over ITSELF is refused — the judgment "stop treating this
   # session as stalled" belongs to whoever supervises it, not to it.
@@ -3267,7 +3268,7 @@ defmodule Tightbeam.Gateway do
   defp caller_in_lineage_above?(_db, _scope, _caller_key, hops) when hops > 32, do: false
 
   defp caller_in_lineage_above?(db, scope, caller_key, hops) do
-    case DB.query(db, "SELECT spawnedBy FROM sessions WHERE sessionKey = ?1", [scope]) do
+    case DB.query(db, "SELECT operationalParent FROM sessions WHERE sessionKey = ?1", [scope]) do
       {:ok, [[parent]]} when is_binary(parent) ->
         parent == caller_key or caller_in_lineage_above?(db, parent, caller_key, hops + 1)
 
@@ -5693,7 +5694,7 @@ defmodule Tightbeam.Gateway do
     rows =
       Txn.q(
         txn,
-        "SELECT sessionKey, spawnedBy FROM sessions WHERE state='active' ORDER BY createdAt, sessionKey"
+        "SELECT sessionKey, operationalParent FROM sessions WHERE state='active' ORDER BY createdAt, sessionKey"
       )
 
     children = Enum.group_by(rows, &Enum.at(&1, 1))
@@ -5702,6 +5703,7 @@ defmodule Tightbeam.Gateway do
       descendants =
         children
         |> Map.get(key, [])
+        |> Enum.reject(fn [child_key, _parent] -> child_key == key end)
         |> Enum.flat_map(fn [child_key, _parent] -> walk.(walk, child_key) end)
 
       descendants ++ [%{session_key: key}]
@@ -5714,7 +5716,7 @@ defmodule Tightbeam.Gateway do
     {:ok, rows} =
       DB.query(
         db,
-        "SELECT sessionKey, spawnedBy, state FROM sessions ORDER BY createdAt, sessionKey"
+        "SELECT sessionKey, operationalParent, state FROM sessions ORDER BY createdAt, sessionKey"
       )
 
     children = Enum.group_by(rows, &Enum.at(&1, 1))
@@ -5723,6 +5725,7 @@ defmodule Tightbeam.Gateway do
       descendants =
         children
         |> Map.get(key, [])
+        |> Enum.reject(fn [child_key, _parent, _state] -> child_key == key end)
         |> Enum.flat_map(fn [child_key, _parent, _state] -> walk.(walk, child_key) end)
 
       state =
@@ -5745,7 +5748,7 @@ defmodule Tightbeam.Gateway do
          supervision_interval_ms,
          drain_reason
        ) do
-    # Invariant: this spawnedBy walk visits each active member of the target's
+    # Invariant: this operational-parent walk visits each active member of the target's
     # transitive subtree exactly once, parent-last. This is the lifecycle
     # seam's canonical subtree ordering; do not duplicate it.
     subtree = retire_subtree_in_txn(txn, root_key)

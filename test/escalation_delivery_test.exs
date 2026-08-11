@@ -136,22 +136,23 @@ defmodule Tightbeam.EscalationDeliveryTest do
     assert wake.prompt =~ "ship window?"
   end
 
-  ## Proof 2 — effort-open atomicity (and the assignmentId carrier)
+  ## Proof 2 — effort-parent atomicity (and the assignmentId carrier)
 
-  test "proof 2: an effort request, its deadline wake, and its notification are one commit",
+  test "proof 2: an effort parent wake and its next monitor are one commit",
        ctx do
     assignment = dispatch!(ctx)
 
-    # Rung one is the agent prod (no request, no owner notification); the OWNER
-    # request is the next bracket, and that is the commit under test here.
+    # Rung one is the holder prod. The next bracket wakes the operational
+    # parent and re-arms the following parent rung in one transaction.
     :ok = EffortCheckin.probe(ctx.db, ctx.config, bracket_wake(ctx.db, assignment.id))
     assert notification_wakes(ctx.db) == []
+    assert [%{session_key: "holder"}] = effort_wakes(ctx.db, assignment.id)
 
     probe_wake = bracket_wake(ctx.db, assignment.id)
     generations_before = count(ctx.db, "SELECT COUNT(*) FROM effort_checkin_generations")
 
-    # FAIL-BEFORE: the probe transaction rolls back whole — no request, no
-    # generation transition, no source-wake fire, no deadline wake, no notification.
+    # FAIL-BEFORE: the probe transaction rolls back whole — no parent wake and
+    # no next generation.
     block_prompt_wakes!(ctx.db)
     assert_aborts!(fn -> EffortCheckin.probe(ctx.db, ctx.config, probe_wake) end)
 
@@ -159,30 +160,22 @@ defmodule Tightbeam.EscalationDeliveryTest do
     assert count(ctx.db, "SELECT COUNT(*) FROM effort_checkin_generations") == generations_before
     assert Wakes.get(ctx.db, probe_wake.wake_id).state == "pending"
     assert generation_state(ctx.db, probe_wake.wake_id) == "armed"
-    assert notification_wakes(ctx.db) == []
+    assert Enum.map(effort_wakes(ctx.db, assignment.id), & &1.session_key) == ["holder"]
     assert count(ctx.db, "SELECT COUNT(*) FROM wakes WHERE consumer='effort_deadline'") == 0
 
     # PASS-AFTER.
     unblock_prompt_wakes!(ctx.db)
     :ok = EffortCheckin.probe(ctx.db, ctx.config, probe_wake)
 
-    assert [[request_id, deadline_wake_id]] =
-             rows(
-               ctx.db,
-               "SELECT id, deadlineWakeId FROM decision_requests WHERE kind='effort' AND status='open'"
-             )
-
-    assert %{consumer: "effort_deadline", state: "pending"} = Wakes.get(ctx.db, deadline_wake_id)
-
-    assert [%{state: "pending", target_gate: 0, consumer: "prompt"} = wake] =
-             notification_wakes(ctx.db)
+    assert [_holder, %{state: "pending", target_gate: 1, consumer: "prompt"} = wake] =
+             effort_wakes(ctx.db, assignment.id)
 
     assert wake.session_key == "mid"
-    assert wake.prompt =~ "Effort check-in #{request_id} for assignment #{assignment.id}"
+    assert wake.prompt =~ "Child session holder remains inactive"
+    assert count(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE kind='effort'") == 0
+    assert count(ctx.db, "SELECT COUNT(*) FROM wakes WHERE consumer='effort_deadline'") == 0
 
-    # The wake's assignmentId is the carrier that replaced the deleted explicit
-    # `assignment_id`/`job_ref` delivery opts; delivery derives the same
-    # attribution from it through `Gateway.wake_attribution/2`.
+    # Delivery derives the same attribution through `Gateway.wake_attribution/2`.
     assert wake.assignment_id == assignment.id
     drain!(ctx)
 
@@ -191,48 +184,34 @@ defmodule Tightbeam.EscalationDeliveryTest do
            ]) == [[assignment.id, job_ref(ctx.db, assignment.id)]]
   end
 
-  ## Proof 3 — effort-retarget atomicity
+  ## Proof 3 — effort-next-parent atomicity
 
-  test "proof 3: a deadline advance and its new-rung notification are one commit", ctx do
+  test "proof 3: a next-parent notification and its replacement monitor are one commit", ctx do
     assignment = dispatch!(ctx)
     :ok = escalate!(ctx, assignment.id)
-    before = effort_request(ctx.db)
-    [notification] = notification_wakes(ctx.db)
+    before = bracket_wake(ctx.db, assignment.id)
+    before_wakes = Enum.map(effort_wakes(ctx.db, assignment.id), & &1.wake_id)
 
-    # FAIL-BEFORE: the CAS, the replacement deadline wake, and the new-rung
-    # notification all roll back together.
+    # FAIL-BEFORE: the next operational-parent wake and monitor both roll back.
     block_prompt_wakes!(ctx.db)
+    assert_aborts!(fn -> EffortCheckin.probe(ctx.db, ctx.config, before) end)
+    assert generation_state(ctx.db, before.wake_id) == "armed"
+    assert Enum.map(effort_wakes(ctx.db, assignment.id), & &1.wake_id) == before_wakes
 
-    assert_aborts!(fn ->
-      EffortCheckin.deadline(ctx.db, ctx.config, Wakes.get(ctx.db, before.deadline_wake_id))
-    end)
-
-    unchanged = effort_request(ctx.db)
-    assert unchanged.expecter_session_key == before.expecter_session_key
-    assert unchanged.lineage_rung == before.lineage_rung
-    assert unchanged.deadline_wake_id == before.deadline_wake_id
-    assert Wakes.get(ctx.db, before.deadline_wake_id).state == "pending"
-    assert Enum.map(notification_wakes(ctx.db), & &1.wake_id) == [notification.wake_id]
-
-    # PASS-AFTER: one advance, one replacement deadline wake, one prompt wake.
+    # PASS-AFTER: one top-parent wake and one replacement monitor.
     unblock_prompt_wakes!(ctx.db)
-    :ok = EffortCheckin.deadline(ctx.db, ctx.config, Wakes.get(ctx.db, before.deadline_wake_id))
-    advanced = effort_request(ctx.db)
+    :ok = EffortCheckin.probe(ctx.db, ctx.config, before)
 
-    assert advanced.lineage_rung == before.lineage_rung + 1
-    assert advanced.deadline_wake_id != before.deadline_wake_id
-    assert Wakes.get(ctx.db, before.deadline_wake_id).state == "fired"
+    assert Enum.map(effort_wakes(ctx.db, assignment.id), & &1.session_key) == [
+             "holder",
+             "mid",
+             "top"
+           ]
 
-    assert %{consumer: "effort_deadline", state: "pending"} =
-             Wakes.get(ctx.db, advanced.deadline_wake_id)
+    assert %{state: "pending", consumer: "effort_probe"} =
+             bracket_wake(ctx.db, assignment.id)
 
-    assert count(
-             ctx.db,
-             "SELECT COUNT(*) FROM wakes WHERE consumer='effort_deadline' AND state='pending'"
-           ) == 1
-
-    assert [_opened, %{state: "pending", target_gate: 0} = rung] = notification_wakes(ctx.db)
-    assert rung.session_key == advanced.expecter_session_key
+    assert count(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE kind='effort'") == 0
   end
 
   ## Proof 4 — crash before delivery, boot recovery
@@ -400,49 +379,39 @@ defmodule Tightbeam.EscalationDeliveryTest do
     assert Enum.map(notification_wakes(ctx.db), & &1.wake_id) == [wake.wake_id]
     assert {message_count(ctx.db), turn_count(ctx.db)} == before
 
-    # And a stale effort-deadline replay is silent too.
+    # A stale effort-probe replay is silent too.
     assignment = dispatch!(ctx)
+    stale = bracket_wake(ctx.db, assignment.id)
     :ok = escalate!(ctx, assignment.id)
-    opened = effort_request(ctx.db)
-    :ok = EffortCheckin.deadline(ctx.db, ctx.config, Wakes.get(ctx.db, opened.deadline_wake_id))
-    after_advance = Enum.map(notification_wakes(ctx.db), & &1.wake_id)
+    after_advance = Enum.map(effort_wakes(ctx.db, assignment.id), & &1.wake_id)
 
-    :ok = EffortCheckin.deadline(ctx.db, ctx.config, Wakes.get(ctx.db, opened.deadline_wake_id))
-    assert Enum.map(notification_wakes(ctx.db), & &1.wake_id) == after_advance
+    :ok = EffortCheckin.probe(ctx.db, ctx.config, stale)
+    assert Enum.map(effort_wakes(ctx.db, assignment.id), & &1.wake_id) == after_advance
   end
 
   ## Proof 8 — effort ladder conservation
 
-  test "proof 8: every rung expiry re-arms one deadline wake and one prompt wake", ctx do
+  test "proof 8: every silent rung wakes one active parent and Main terminates", ctx do
     assignment = dispatch!(ctx)
-    :ok = escalate!(ctx, assignment.id)
+    :ok = EffortCheckin.probe(ctx.db, ctx.config, bracket_wake(ctx.db, assignment.id))
+    assert notified_rungs(ctx.db, assignment.id) == ["holder"]
 
-    opened = effort_request(ctx.db)
-    assert opened.expecter_session_key == "mid"
-    assert opened.lineage_rung == 0
-    assert notified_rungs(ctx.db) == ["mid"]
+    :ok = EffortCheckin.probe(ctx.db, ctx.config, bracket_wake(ctx.db, assignment.id))
+    assert notified_rungs(ctx.db, assignment.id) == ["holder", "mid"]
 
-    # Rung 1 — a LIVE ancestor.
-    live = expire_rung!(ctx, opened)
-    assert live.expecter_session_key == "top"
-    assert live.expecter_user_id == nil
-    assert live.lineage_rung == 1
-    assert notified_rungs(ctx.db) == ["mid", "top"]
-
-    # Rung 2 — the ancestor is retired, so routing SKIPS it to the owner user.
+    # A retired ancestor remains in the graph but is skipped as a wake target.
     :ok = DB.execute(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey='top'")
-    skipped = expire_rung!(ctx, live)
-    assert skipped.expecter_session_key == nil
-    assert skipped.expecter_user_id == "flynn"
-    assert skipped.lineage_rung == 2
+    :ok = EffortCheckin.probe(ctx.db, ctx.config, bracket_wake(ctx.db, assignment.id))
     personal = Org.personal_session_key("flynn")
-    assert notified_rungs(ctx.db) == ["mid", "top", personal]
+    assert notified_rungs(ctx.db, assignment.id) == ["holder", "mid", personal]
 
-    # Terminal user rung — expiry re-arms against the SAME user, same rung.
-    terminal = expire_rung!(ctx, skipped)
-    assert terminal.expecter_user_id == "flynn"
-    assert terminal.lineage_rung == 2
-    assert notified_rungs(ctx.db) == ["mid", "top", personal, personal]
+    assert count(
+             ctx.db,
+             "SELECT COUNT(*) FROM effort_checkin_generations WHERE assignmentId=?1 AND state='armed'",
+             [assignment.id]
+           ) == 0
+
+    assert count(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE kind='effort'") == 0
   end
 
   ## Proof 9 — configured delivery dependencies only
@@ -467,7 +436,9 @@ defmodule Tightbeam.EscalationDeliveryTest do
     assert {:decision_pending, _id} =
              Escalation.escalate(ctx.db, statute_call(), statute(), escalation_ctx())
 
-    assert [effort_wake, statute_wake] = Enum.sort_by(notification_wakes(ctx.db), & &1.created_at)
+    effort_wake = List.last(effort_wakes(ctx.db, assignment.id))
+    assert effort_wake.session_key == "mid"
+    assert [statute_wake] = notification_wakes(ctx.db)
 
     drain!(%{ctx | config: config})
 
@@ -490,7 +461,6 @@ defmodule Tightbeam.EscalationDeliveryTest do
     request_sites = [
       {"lib/tightbeam/escalation.ex", "escalate/4"},
       {"lib/tightbeam/escalation.ex", "insert_operator_request_in_txn/6"},
-      {"lib/tightbeam/effort_checkin.ex", "open_request_in_txn/4"},
       {"lib/tightbeam/effort_checkin.ex", "deadline_in_txn/3"}
     ]
 
@@ -589,16 +559,19 @@ defmodule Tightbeam.EscalationDeliveryTest do
     end
   end
 
-  ## Proof 11 — a retired target is still delivered
+  ## Proof 11 — only decision notices bypass the active target gate
 
-  test "proof 11: targetGate 0 delivers to a retired target; the default gate still gates", ctx do
+  test "proof 11: decisions reach a retired target; effort parent wakes stay gated", ctx do
     assignment = dispatch!(ctx)
     :ok = escalate!(ctx, assignment.id)
 
     assert {:decision_pending, _id} =
              Escalation.escalate(ctx.db, statute_call(), statute(), escalation_ctx())
 
-    assert [effort_wake, statute_wake] = Enum.sort_by(notification_wakes(ctx.db), & &1.created_at)
+    effort_wake = List.last(effort_wakes(ctx.db, assignment.id))
+    assert effort_wake.session_key == "mid"
+    assert effort_wake.target_gate == 1
+    assert [statute_wake] = notification_wakes(ctx.db)
 
     # A CONTROL prompt wake on the same target, carrying the schema default
     # targetGate = 1 — the gate every pre-existing wake producer relies on.
@@ -612,24 +585,33 @@ defmodule Tightbeam.EscalationDeliveryTest do
 
     assert control.target_gate == 1
 
-    # Retire both recorded targets AFTER the requests committed.
+    Assignments.__handle__(ctx.db, "attest", %{
+      verb: "attest",
+      origin: "agent:holder",
+      principal: {:session, "holder"},
+      session_key: nil,
+      params: %{assignment_id: assignment.id, kind: "completion"}
+    })
+
+    # Retire both recorded targets after their wakes committed.
     for key <- [effort_wake.session_key, statute_wake.session_key] do
       :ok = DB.execute(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey='#{key}'")
     end
 
     drain!(ctx)
 
-    for wake <- [effort_wake, statute_wake] do
-      assert Wakes.get(ctx.db, wake.wake_id).state == "fired"
+    assert Wakes.get(ctx.db, statute_wake.wake_id).state == "fired"
 
-      assert rows(ctx.db, "SELECT sessionKey FROM turns WHERE wakeId = ?1", [wake.wake_id]) == [
-               [wake.session_key]
-             ]
+    assert rows(ctx.db, "SELECT sessionKey FROM turns WHERE wakeId = ?1", [
+             statute_wake.wake_id
+           ]) == [[statute_wake.session_key]]
 
-      assert count(ctx.db, "SELECT COUNT(*) FROM messages WHERE sessionKey = ?1", [
-               wake.session_key
-             ]) >= 1
-    end
+    assert count(ctx.db, "SELECT COUNT(*) FROM messages WHERE sessionKey = ?1", [
+             statute_wake.session_key
+           ]) >= 1
+
+    assert count(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId = ?1", [effort_wake.wake_id]) ==
+             0
 
     # The control wake keeps the active-session gate: nothing was committed for it.
     assert count(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId = ?1", [control.wake_id]) == 0
@@ -670,18 +652,22 @@ defmodule Tightbeam.EscalationDeliveryTest do
       )
 
     host = Placement.local_host_name()
+    create_session(db, Org.personal_session_key("flynn"), host)
     create_session(db, "top", host)
     create_session(db, "mid", host, "top")
     create_session(db, "holder", host, "mid")
     create_session(db, "raiser", host)
-    create_session(db, Org.personal_session_key("flynn"), host)
     :ok
   end
 
   defp create_session(db, key, host, spawned_by \\ nil) do
+    main? = key == Org.personal_session_key("flynn")
+
     Org.create(db, %{
       session_key: key,
       display_name: key,
+      kind: if(main?, do: "main", else: "custom"),
+      is_built_in: main?,
       owner_user_id: "flynn",
       origin: "user:flynn",
       archetype: "default",
@@ -794,7 +780,7 @@ defmodule Tightbeam.EscalationDeliveryTest do
     job_ref
   end
 
-  # Zero effect prods the HOLDER first; the owner's request is the next bracket.
+  # Zero effect prods the holder first, then wakes its operational parent.
   defp escalate!(ctx, assignment_id) do
     :ok = EffortCheckin.probe(ctx.db, ctx.config, bracket_wake(ctx.db, assignment_id))
     :ok = EffortCheckin.probe(ctx.db, ctx.config, bracket_wake(ctx.db, assignment_id))
@@ -818,47 +804,8 @@ defmodule Tightbeam.EscalationDeliveryTest do
     state
   end
 
-  defp effort_request(db) do
-    [[id, session, user, rung, deadline_wake]] =
-      rows(
-        db,
-        "SELECT id, expecterSessionKey, expecterUserId, lineageRung, deadlineWakeId FROM decision_requests WHERE kind='effort' AND status='open'"
-      )
-
-    %{
-      id: id,
-      expecter_session_key: session,
-      expecter_user_id: user,
-      lineage_rung: rung,
-      deadline_wake_id: deadline_wake
-    }
-  end
-
-  # One deadline expiry: the fresh interval, the single replacement deadline wake,
-  # and the single new prompt wake are asserted at every rung.
-  defp expire_rung!(ctx, request) do
-    notifications_before = length(notification_wakes(ctx.db))
-    fired_at = System.system_time(:millisecond)
-    :ok = EffortCheckin.deadline(ctx.db, ctx.config, Wakes.get(ctx.db, request.deadline_wake_id))
-    advanced = effort_request(ctx.db)
-
-    assert advanced.deadline_wake_id != request.deadline_wake_id
-    replacement = Wakes.get(ctx.db, advanced.deadline_wake_id)
-    assert replacement.consumer == "effort_deadline"
-    assert replacement.state == "pending"
-    assert replacement.due_at >= fired_at + 86_400_000
-
-    assert count(
-             ctx.db,
-             "SELECT COUNT(*) FROM wakes WHERE consumer='effort_deadline' AND state='pending'"
-           ) == 1
-
-    assert length(notification_wakes(ctx.db)) == notifications_before + 1
-    advanced
-  end
-
-  defp notified_rungs(db) do
-    db |> notification_wakes() |> Enum.map(& &1.session_key)
+  defp notified_rungs(db, assignment_id) do
+    db |> effort_wakes(assignment_id) |> Enum.map(& &1.session_key)
   end
 
   ## Helpers — wakes and delivery
@@ -866,6 +813,15 @@ defmodule Tightbeam.EscalationDeliveryTest do
   defp notification_wakes(db) do
     db
     |> rows("SELECT wakeId FROM wakes WHERE targetGate = 0 ORDER BY rowid")
+    |> Enum.map(fn [wake_id] -> Wakes.get(db, wake_id) end)
+  end
+
+  defp effort_wakes(db, assignment_id) do
+    db
+    |> rows(
+      "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND prompt LIKE '[effort %' ORDER BY rowid",
+      [assignment_id]
+    )
     |> Enum.map(fn [wake_id] -> Wakes.get(db, wake_id) end)
   end
 
