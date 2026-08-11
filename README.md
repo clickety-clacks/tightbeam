@@ -11,9 +11,8 @@ You RUN tightbeam; you do not depend on it. There is no Hex package.
 gateway *and* the CLI, with Erlang bundled. No Elixir, no Rust, no C toolchain
 on the target machine. This is the shorter path and the one to prefer.
 
-**From source** — clone and build. You need this to *produce* a release package
-(there is no registry to install from yet, so somebody builds the tarball), and
-to develop Tightbeam itself.
+**From source** — clone and build. Use this to develop Tightbeam or to produce a
+local package from an unreleased commit.
 
 The prerequisites below are split accordingly; everything else in this document
 applies to both.
@@ -80,20 +79,25 @@ codex --version
 
 ### From a release package
 
-There is no registry to install from, so the tarball is built rather than
-downloaded. **Build it on the platform you will run it on** — the package
-carries a compiled Erlang runtime and a compiled CLI, so it does not
-cross-compile. From a source checkout on a machine of that platform:
+Download the package for your platform from the
+[GitHub Releases](https://github.com/clickety-clacks/tightbeam/releases) page.
+Each release contains packages for `darwin-aarch64` and `linux-x86_64`, a
+`SHA256SUMS` file, and `release-provenance.json` naming the exact tagged commit
+and workflow run that produced them. Verify the downloaded package before
+installing it:
 
 ```sh
-sh packaging/assemble.sh
-# artifact: _build/npm/tightbeam-<version>-<os>-<arch>.tgz
+# Linux
+sha256sum -c SHA256SUMS --ignore-missing
+
+# macOS
+shasum -a 256 -c SHA256SUMS --ignore-missing
 ```
 
-Copy that one file to the target machine and install it:
+Install the verified package:
 
 ```sh
-npm install -g ./tightbeam-<version>-<os>-<arch>.tgz
+npm install -g ./tightbeam-<version>-<os>-<arch>-<commit>.tgz
 tightbeam --version
 tightbeam-gateway                  # boots the gateway in the foreground
 ```
@@ -109,6 +113,26 @@ The CLI and the gateway ship in one package on purpose, so their version
 handshake holds by construction — you cannot end up with a CLI that its gateway
 refuses. `npm install -g` puts both on PATH; nothing else is added to the
 machine, and neither Elixir nor Rust is needed to run either one.
+
+### Cutting a release
+
+Releases are version tags on canonical `main`, not release branches. First set
+the version in `cli/Cargo.toml`, land it on `main`, and wait for the ordinary
+`main` CI run to pass. Then create and push the matching annotated tag:
+
+```sh
+git fetch origin
+git merge --ff-only origin/main
+git tag -a v0.1.6 -m "Tightbeam v0.1.6"
+git push origin v0.1.6
+```
+
+The tag must be exactly `v<major>.<minor>.<patch>`, must match the Cargo package
+version, and must point to the current `origin/main` tip. The tag workflow reruns
+the unchanged macOS and Linux test gates, builds both packages from that tagged
+commit, and creates one GitHub Release containing the packages, checksums, and
+provenance record. If any gate or either platform build fails, no GitHub Release
+is created.
 
 ### From source
 
