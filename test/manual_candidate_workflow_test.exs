@@ -362,6 +362,7 @@ defmodule Tightbeam.ManualCandidateWorkflowTest do
 
     for fixture <- [
           ~S|cmd="git rev-parse "; cmd+="$CANDIDATE_SHA"; $cmd|,
+          ~S|runner=git; $runner rev-parse "$CANDIDATE_SHA"|,
           "runner=git\n$runner rev-parse \"$CANDIDATE_SHA\"",
           "command='git rev-parse'\n$command \"$CANDIDATE_SHA\"",
           "args=(git rev-parse \"$CANDIDATE_SHA\")\n\"${args[@]}\"",
@@ -890,7 +891,7 @@ defmodule Tightbeam.ManualCandidateWorkflowTest do
       ~r/(^|\s)(sh|bash)\s+-c(\s|$)/m,
       ~r/(?im)^\s*(?:(?:local|readonly)\s+|declare(?:\s+-[a-z]+)?\s+)?[a-z_][a-z0-9_]*(?:cmd|command)[a-z0-9_]*\s*\+?=/,
       ~r/\+=/,
-      ~r/(?m)^\s*\$[A-Za-z_][A-Za-z0-9_]*(?:\s|$)/,
+      ~r/(?m)(?:^|[;&|])\s*\$[A-Za-z_][A-Za-z0-9_]*(?:\s|$)/,
       ~r/(?m)^\s*\$\{[A-Za-z_][A-Za-z0-9_]*\}(?:\s|$)/,
       ~r/(?m)^\s*"\$\{[A-Za-z_][A-Za-z0-9_]*\[@\]\}"(?:\s|$)/,
       ~r/\$\{![A-Za-z_][A-Za-z0-9_]*\}/,
