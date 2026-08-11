@@ -160,28 +160,6 @@ defmodule Tightbeam.Acp.Adapter do
   def switchable_models(adapter, session_id),
     do: call(adapter, {:switchable_models, session_id}, @boot_boundary_timeout)
 
-  @doc "One live config option from the latest harness readback for this resident session."
-  @spec live_config_option(adapter(), String.t(), String.t()) ::
-          {:ok, map()}
-          | {:error, :config_option_unsupported | {:adapter_unavailable, term()}}
-  def live_config_option(adapter, session_id, config_id),
-    do: call(adapter, {:live_config_option, session_id, config_id}, @boot_boundary_timeout)
-
-  @doc "Apply one advertised live config option and require exact harness readback."
-  @spec apply_live_config_option(adapter(), String.t(), String.t(), String.t()) ::
-          {:ok, map()}
-          | {:error,
-             :config_option_unsupported
-             | {:config_option_verification_failed, map() | nil}
-             | term()}
-  def apply_live_config_option(adapter, session_id, config_id, value),
-    do:
-      call(
-        adapter,
-        {:apply_live_config_option, session_id, config_id, value},
-        @boot_boundary_timeout
-      )
-
   @doc "Canonical Fast state from the resident harness's latest live config response."
   @spec fast_status(adapter(), String.t()) ::
           {:ok, %{fast: String.t(), option_id: String.t()}}
@@ -614,46 +592,6 @@ defmodule Tightbeam.Acp.Adapter do
     case Map.fetch(state.switchable_models, sid) do
       {:ok, models} -> {:reply, {:ok, models}, state}
       :error -> {:reply, {:error, :model_capability_unavailable}, state}
-    end
-  end
-
-  def handle_call({:live_config_option, sid, config_id}, _from, state) do
-    case cached_config_option(state, sid, config_id) do
-      nil -> {:reply, {:error, :config_option_unsupported}, state}
-      option -> {:reply, {:ok, option}, state}
-    end
-  end
-
-  def handle_call({:apply_live_config_option, sid, config_id, value}, _from, state) do
-    case cached_config_option(state, sid, config_id) do
-      nil ->
-        {:reply, {:error, :config_option_unsupported}, state}
-
-      _advertised ->
-        case Conn.request(
-               state.conn,
-               "session/set_config_option",
-               %{sessionId: sid, configId: config_id, value: value},
-               timeout: 30_000
-             ) do
-          {:ok, result} ->
-            state = remember_config_options(state, sid, result)
-
-            case cached_config_option(state, sid, config_id) do
-              %{} = option ->
-                if (option["currentValue"] || option["value"]) == value do
-                  {:reply, {:ok, option}, state}
-                else
-                  {:reply, {:error, {:config_option_verification_failed, option}}, state}
-                end
-
-              actual ->
-                {:reply, {:error, {:config_option_verification_failed, actual}}, state}
-            end
-
-          {:error, reason} ->
-            {:reply, {:error, reason}, state}
-        end
     end
   end
 
@@ -1453,12 +1391,6 @@ defmodule Tightbeam.Acp.Adapter do
 
   defp remember_config_options(state, sid, _result),
     do: put_in(state.config_options, Map.delete(state.config_options, sid))
-
-  defp cached_config_option(state, sid, config_id) do
-    state.config_options
-    |> Map.get(sid, [])
-    |> Enum.find(&((&1["id"] || &1["configId"]) == config_id))
-  end
 
   defp advertised_fast_option(state, sid) do
     with {:ok, options} <- Map.fetch(state.config_options, sid),

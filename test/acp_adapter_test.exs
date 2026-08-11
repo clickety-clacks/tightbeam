@@ -92,51 +92,6 @@ defmodule Tightbeam.Acp.AdapterTest do
              |> Enum.map(& &1["value"])
   end
 
-  test "an advertised live option is read, applied by its harness id, and exactly verified" do
-    {adapter, capture_path} = start_adapter(fail_mode: "fast-live")
-    assert {:ok, "sess-1"} = Adapter.new_session(adapter, nil, "/tmp", [], "guidance")
-
-    assert {:ok, %{"currentValue" => "off"}} =
-             Adapter.live_config_option(adapter, "sess-1", "fast")
-
-    assert {:ok, %{"currentValue" => "on"}} =
-             Adapter.apply_live_config_option(adapter, "sess-1", "fast", "on")
-
-    assert ["on"] =
-             capture_path
-             |> captured_requests()
-             |> Enum.filter(
-               &(&1["method"] == "session/set_config_option" and &1["configId"] == "fast")
-             )
-             |> Enum.map(& &1["value"])
-
-    assert {:ok, %{"currentValue" => "on"}} =
-             Adapter.live_config_option(adapter, "sess-1", "fast")
-  end
-
-  test "a missing live option refuses without guessing a config id" do
-    {adapter, capture_path} = start_adapter()
-    assert {:ok, "sess-1"} = Adapter.new_session(adapter, nil, "/tmp", [], "guidance")
-
-    assert {:error, :config_option_unsupported} =
-             Adapter.apply_live_config_option(adapter, "sess-1", "fast", "on")
-
-    refute Enum.any?(captured_requests(capture_path), fn request ->
-             request["method"] == "session/set_config_option" and request["configId"] == "fast"
-           end)
-  end
-
-  test "a mismatched live-option readback is retained as actual state and refused" do
-    {adapter, _capture_path} = start_adapter(fail_mode: "fast-mismatch")
-    assert {:ok, "sess-1"} = Adapter.new_session(adapter, nil, "/tmp", [], "guidance")
-
-    assert {:error, {:config_option_verification_failed, %{"currentValue" => "off"}}} =
-             Adapter.apply_live_config_option(adapter, "sess-1", "fast", "on")
-
-    assert {:ok, %{"currentValue" => "off"}} =
-             Adapter.live_config_option(adapter, "sess-1", "fast")
-  end
-
   test "Fast is normalized from Claude fast and Codex fast-mode live options" do
     {claude, _capture_path} = start_adapter(fail_mode: "fast-live")
     assert {:ok, "sess-1"} = Adapter.new_session(claude, nil, "/tmp", [], "guidance")
