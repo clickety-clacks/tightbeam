@@ -364,7 +364,10 @@ defmodule Tightbeam.ManualCandidateWorkflowTest do
           ~S|cmd="git rev-parse "; cmd+="$CANDIDATE_SHA"; $cmd|,
           "runner=git\n$runner rev-parse \"$CANDIDATE_SHA\"",
           "command='git rev-parse'\n$command \"$CANDIDATE_SHA\"",
-          "args=(git rev-parse \"$CANDIDATE_SHA\")\n\"${args[@]}\""
+          "args=(git rev-parse \"$CANDIDATE_SHA\")\n\"${args[@]}\"",
+          "entry=runner\nrunner=git\n${!entry} rev-parse \"$CANDIDATE_SHA\"",
+          "runner=git\ncommand \"$runner\" rev-parse \"$CANDIDATE_SHA\"",
+          "runner=git\n$(\"$runner\" rev-parse \"$CANDIDATE_SHA\")"
         ] do
       refute static_run_body?(fixture), "constructed command fixture passed:\n#{fixture}"
     end
@@ -567,6 +570,18 @@ defmodule Tightbeam.ManualCandidateWorkflowTest do
     assert script =~ "candidate-provenance.json"
 
     upload = Enum.find(aggregate["steps"], &(&1["name"] == "Upload candidate bundle"))
+
+    validation_index =
+      Enum.find_index(
+        aggregate["steps"],
+        &(&1["name"] == "Validate and assemble the candidate bundle")
+      )
+
+    upload_index =
+      Enum.find_index(aggregate["steps"], &(&1["name"] == "Upload candidate bundle"))
+
+    assert validation_index < upload_index
+    refute Map.has_key?(upload, "if")
     assert upload["uses"] == @upload_pin
     assert upload["with"]["retention-days"] == 90
     assert upload["with"]["if-no-files-found"] == "error"
@@ -591,7 +606,26 @@ defmodule Tightbeam.ManualCandidateWorkflowTest do
 
     File.rm_rf!(root)
 
+    inverted_script =
+      String.replace(
+        script,
+        ".package.sha256 == $sha256",
+        ".package.sha256 != $sha256"
+      )
+
+    refute inverted_script == script
+
+    assert_aggregation_refuses(
+      inverted_script,
+      "package SHA comparator mutation from == to !=",
+      fn _fixture -> :ok end
+    )
+
     final_set_fixtures = [
+      {"partial platform staging artifact",
+       fn fixture ->
+         fixture.packages["darwin-aarch64"] |> Path.dirname() |> File.rm_rf!()
+       end},
       {"missing platform output", fn fixture -> File.rm!(fixture.packages["darwin-aarch64"]) end},
       {"wrong package filename",
        fn fixture ->
@@ -604,6 +638,20 @@ defmodule Tightbeam.ManualCandidateWorkflowTest do
            Path.join(Path.dirname(fixture.packages["linux-x86_64"]), "extra.tgz"),
            "extra"
          )
+       end},
+      {"duplicate provenance fragment",
+       fn fixture ->
+         source = fixture.fragments["linux-x86_64"]
+         File.cp!(source, Path.join(Path.dirname(source), "candidate-provenance-duplicate.json"))
+       end},
+      {"package in the wrong staging path",
+       fn fixture ->
+         source = fixture.packages["linux-x86_64"]
+
+         destination =
+           Path.join(Path.dirname(fixture.packages["darwin-aarch64"]), Path.basename(source))
+
+         File.rename!(source, destination)
        end},
       {"package digest mismatch",
        fn fixture ->
@@ -644,6 +692,14 @@ defmodule Tightbeam.ManualCandidateWorkflowTest do
       end)
     end
 
+    for {path, _wrong} <- resolver_mismatches do
+      assert_aggregation_refuses(script, "missing #{Enum.join(path, ".")}", fn fixture ->
+        Enum.each(fixture.fragments, fn {_platform, fragment} ->
+          delete_fragment_field!(fragment, path)
+        end)
+      end)
+    end
+
     context_mismatches = [
       {["workflow", "name"], "wrong workflow"},
       {["workflow", "ref"], "wrong workflow ref"},
@@ -664,6 +720,18 @@ defmodule Tightbeam.ManualCandidateWorkflowTest do
       end)
     end
 
+    for {path, _wrong} <- context_mismatches do
+      assert_aggregation_refuses(script, "missing #{Enum.join(path, ".")}", fn fixture ->
+        Enum.each(fixture.fragments, fn {_platform, fragment} ->
+          delete_fragment_field!(fragment, path)
+        end)
+      end)
+    end
+
+    assert_aggregation_refuses(script, "cross-run provenance input", fn fixture ->
+      mutate_fragment!(fixture.fragments["darwin-aarch64"], ["run", "id"], "other-run")
+    end)
+
     package_mismatches = [
       {["package", "filename"], "wrong.tgz"},
       {["package", "platform"], "wrong-platform"},
@@ -674,6 +742,12 @@ defmodule Tightbeam.ManualCandidateWorkflowTest do
     for {path, wrong} <- package_mismatches do
       assert_aggregation_refuses(script, Enum.join(path, "."), fn fixture ->
         mutate_fragment!(fixture.fragments["linux-x86_64"], path, wrong)
+      end)
+    end
+
+    for {path, _wrong} <- package_mismatches do
+      assert_aggregation_refuses(script, "missing #{Enum.join(path, ".")}", fn fixture ->
+        delete_fragment_field!(fixture.fragments["linux-x86_64"], path)
       end)
     end
   end
@@ -692,14 +766,18 @@ defmodule Tightbeam.ManualCandidateWorkflowTest do
     role_action_additions = [
       {"EEZO build", "EEZO may perform a Tightbeam build."},
       {"EEZO package install", "EEZO may perform a candidate package install."},
+      {"EEZO restart", "EEZO may restart Tightbeam for the candidate."},
       {"EEZO gateway", "EEZO may start a Tightbeam gateway."},
       {"EEZO provider preflight", "EEZO may run a provider preflight."},
       {"EEZO smoke", "EEZO may run candidate smoke proof."},
+      {"EEZO proof", "EEZO may run candidate proof."},
       {"EEZO switch proof", "EEZO may run candidate switch proof."},
       {"TARS install", "TARS may perform a candidate install."},
+      {"TARS restart", "TARS may restart Tightbeam for the candidate."},
       {"TARS gateway", "TARS may start a candidate gateway."},
       {"TARS provider preflight", "TARS may run a provider preflight."},
       {"TARS smoke", "TARS may run candidate smoke proof."},
+      {"TARS proof", "TARS may run candidate proof."},
       {"TARS switch proof", "TARS may run candidate switch proof."},
       {"Gibson checkout", "Gibson may check out the candidate."},
       {"Gibson build", "Gibson may build the candidate."},
@@ -708,7 +786,13 @@ defmodule Tightbeam.ManualCandidateWorkflowTest do
       {"Gibson download", "Gibson may download the candidate."},
       {"Gibson install", "Gibson may install the candidate."},
       {"Gibson restart", "Gibson may restart for the candidate."},
-      {"Gibson proof", "Gibson may run candidate proof."}
+      {"Gibson proof", "Gibson may run candidate proof."},
+      {"Gibson switch", "Gibson may switch to the candidate."},
+      {"Shrdlu workflow install", "Shrdlu may install the candidate from this workflow."},
+      {"Shrdlu workflow restart", "Shrdlu may restart Tightbeam from this workflow."},
+      {"Shrdlu workflow gateway", "Shrdlu may start a gateway from this workflow."},
+      {"Shrdlu workflow proof", "Shrdlu may run installed gateway proof from this workflow."},
+      {"Shrdlu workflow switch", "Shrdlu may switch the candidate from this workflow."}
     ]
 
     for {label, addition} <- role_action_additions do
@@ -808,7 +892,11 @@ defmodule Tightbeam.ManualCandidateWorkflowTest do
       ~r/\+=/,
       ~r/(?m)^\s*\$[A-Za-z_][A-Za-z0-9_]*(?:\s|$)/,
       ~r/(?m)^\s*\$\{[A-Za-z_][A-Za-z0-9_]*\}(?:\s|$)/,
-      ~r/(?m)^\s*"\$\{[A-Za-z_][A-Za-z0-9_]*\[@\]\}"(?:\s|$)/
+      ~r/(?m)^\s*"\$\{[A-Za-z_][A-Za-z0-9_]*\[@\]\}"(?:\s|$)/,
+      ~r/\$\{![A-Za-z_][A-Za-z0-9_]*\}/,
+      ~r/(?m)(^|\s)(?:command|exec|env)\s+["']?\$\{?[A-Za-z_][A-Za-z0-9_]*/,
+      ~r/\$\(\s*["']?\$\{?[A-Za-z_][A-Za-z0-9_]*/,
+      ~r/(?m)^\s*(?:declare|typeset)\s+-n\b/
     ]
 
     Enum.all?(forbidden, &(not Regex.match?(&1, run)))
@@ -1039,6 +1127,12 @@ defmodule Tightbeam.ManualCandidateWorkflowTest do
     File.write!(path, encode_json(updated))
   end
 
+  defp delete_fragment_field!(path, keys) do
+    document = path |> File.read!() |> :json.decode()
+    {_removed, updated} = pop_in(document, Enum.map(keys, &Access.key!(&1)))
+    File.write!(path, encode_json(updated))
+  end
+
   defp encode_json(value), do: value |> :json.encode() |> IO.iodata_to_binary()
 
   defp sha256(bytes),
@@ -1074,14 +1168,18 @@ defmodule Tightbeam.ManualCandidateWorkflowTest do
     forbidden_permissions = [
       {"EEZO", "build"},
       {"EEZO", "install"},
+      {"EEZO", "restart"},
       {"EEZO", "gateway"},
       {"EEZO", "provider preflight"},
       {"EEZO", "smoke"},
+      {"EEZO", "proof"},
       {"EEZO", "switch proof"},
       {"TARS", "install"},
+      {"TARS", "restart"},
       {"TARS", "gateway"},
       {"TARS", "provider preflight"},
       {"TARS", "smoke"},
+      {"TARS", "proof"},
       {"TARS", "switch proof"},
       {"Gibson", "check out"},
       {"Gibson", "build"},
@@ -1090,7 +1188,13 @@ defmodule Tightbeam.ManualCandidateWorkflowTest do
       {"Gibson", "download"},
       {"Gibson", "install"},
       {"Gibson", "restart"},
-      {"Gibson", "proof"}
+      {"Gibson", "proof"},
+      {"Gibson", "switch"},
+      {"Shrdlu", "install"},
+      {"Shrdlu", "restart"},
+      {"Shrdlu", "gateway"},
+      {"Shrdlu", "proof"},
+      {"Shrdlu", "switch"}
     ]
 
     host_rows(guide) == @host_rows and guide =~ @global_refusal and
