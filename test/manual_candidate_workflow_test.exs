@@ -371,6 +371,11 @@ defmodule Tightbeam.ManualCandidateWorkflowTest do
         ] do
       refute static_run_body?(fixture), "constructed command fixture passed:\n#{fixture}"
     end
+
+    inline_command_variable = ~S|runner=git; $runner rev-parse "$CANDIDATE_SHA"|
+
+    refute static_run_body?(inline_command_variable),
+           "inline command-variable fixture passed:\n#{inline_command_variable}"
   end
 
   test "raw dispatch input has one data-only transport and validated SHA use stays quoted" do
@@ -764,40 +769,52 @@ defmodule Tightbeam.ManualCandidateWorkflowTest do
     assert guide =~ "actual installed Shrdlu instance"
 
     role_action_additions = [
-      {"EEZO build", "EEZO may perform a Tightbeam build."},
-      {"EEZO package install", "EEZO may perform a candidate package install."},
-      {"EEZO restart", "EEZO may restart Tightbeam for the candidate."},
-      {"EEZO gateway", "EEZO may start a Tightbeam gateway."},
-      {"EEZO provider preflight", "EEZO may run a provider preflight."},
-      {"EEZO smoke", "EEZO may run candidate smoke proof."},
-      {"EEZO proof", "EEZO may run candidate proof."},
-      {"EEZO switch proof", "EEZO may run candidate switch proof."},
-      {"TARS install", "TARS may perform a candidate install."},
-      {"TARS restart", "TARS may restart Tightbeam for the candidate."},
-      {"TARS gateway", "TARS may start a candidate gateway."},
-      {"TARS provider preflight", "TARS may run a provider preflight."},
-      {"TARS smoke", "TARS may run candidate smoke proof."},
-      {"TARS proof", "TARS may run candidate proof."},
-      {"TARS switch proof", "TARS may run candidate switch proof."},
-      {"Gibson checkout", "Gibson may check out the candidate."},
-      {"Gibson build", "Gibson may build the candidate."},
-      {"Gibson test", "Gibson may test the candidate."},
-      {"Gibson package", "Gibson may package the candidate."},
-      {"Gibson download", "Gibson may download the candidate."},
-      {"Gibson install", "Gibson may install the candidate."},
-      {"Gibson restart", "Gibson may restart for the candidate."},
-      {"Gibson proof", "Gibson may run candidate proof."},
-      {"Gibson switch", "Gibson may switch to the candidate."},
-      {"Shrdlu workflow install", "Shrdlu may install the candidate from this workflow."},
-      {"Shrdlu workflow restart", "Shrdlu may restart Tightbeam from this workflow."},
-      {"Shrdlu workflow gateway", "Shrdlu may start a gateway from this workflow."},
-      {"Shrdlu workflow proof", "Shrdlu may run installed gateway proof from this workflow."},
-      {"Shrdlu workflow switch", "Shrdlu may switch the candidate from this workflow."}
+      {"EEZO",
+       [
+         {"build", "EEZO may perform a Tightbeam build."},
+         {"package install", "EEZO may perform a candidate package install."},
+         {"restart", "EEZO may restart Tightbeam for the candidate."},
+         {"gateway", "EEZO may start a Tightbeam gateway."},
+         {"provider preflight", "EEZO may run a provider preflight."},
+         {"smoke", "EEZO may run candidate smoke proof."},
+         {"proof", "EEZO may run candidate proof."},
+         {"switch proof", "EEZO may run candidate switch proof."}
+       ]},
+      {"TARS",
+       [
+         {"install", "TARS may perform a candidate install."},
+         {"restart", "TARS may restart Tightbeam for the candidate."},
+         {"gateway", "TARS may start a candidate gateway."},
+         {"provider preflight", "TARS may run a provider preflight."},
+         {"smoke", "TARS may run candidate smoke proof."},
+         {"proof", "TARS may run candidate proof."},
+         {"switch proof", "TARS may run candidate switch proof."}
+       ]},
+      {"Shrdlu",
+       [
+         {"workflow install", "Shrdlu may install the candidate from this workflow."},
+         {"workflow restart", "Shrdlu may restart Tightbeam from this workflow."},
+         {"workflow gateway", "Shrdlu may start a gateway from this workflow."},
+         {"workflow proof", "Shrdlu may run installed gateway proof from this workflow."},
+         {"workflow switch", "Shrdlu may switch the candidate from this workflow."}
+       ]},
+      {"Gibson",
+       [
+         {"checkout", "Gibson may check out the candidate."},
+         {"build", "Gibson may build the candidate."},
+         {"test", "Gibson may test the candidate."},
+         {"package", "Gibson may package the candidate."},
+         {"download", "Gibson may download the candidate."},
+         {"install", "Gibson may install the candidate."},
+         {"restart", "Gibson may restart for the candidate."},
+         {"proof", "Gibson may run candidate proof."},
+         {"switch", "Gibson may switch to the candidate."}
+       ]}
     ]
 
-    for {label, addition} <- role_action_additions do
+    for {host, additions} <- role_action_additions, {label, addition} <- additions do
       mutated = guide <> "\n" <> addition
-      refute host_boundary_valid?(mutated), "fixture did not violate #{label}"
+      refute host_boundary_valid?(mutated), "fixture did not violate #{host} #{label}"
     end
 
     mutated = String.replace(guide, "no isolation install or local build", "isolation install")
@@ -890,9 +907,9 @@ defmodule Tightbeam.ManualCandidateWorkflowTest do
       ~r/(^|\s)(sh|bash)\s+-c(\s|$)/m,
       ~r/(?im)^\s*(?:(?:local|readonly)\s+|declare(?:\s+-[a-z]+)?\s+)?[a-z_][a-z0-9_]*(?:cmd|command)[a-z0-9_]*\s*\+?=/,
       ~r/\+=/,
-      ~r/(?m)^\s*\$[A-Za-z_][A-Za-z0-9_]*(?:\s|$)/,
-      ~r/(?m)^\s*\$\{[A-Za-z_][A-Za-z0-9_]*\}(?:\s|$)/,
-      ~r/(?m)^\s*"\$\{[A-Za-z_][A-Za-z0-9_]*\[@\]\}"(?:\s|$)/,
+      ~r/(?m)(?:^|[;&|])\s*\$[A-Za-z_][A-Za-z0-9_]*(?:\s|$)/,
+      ~r/(?m)(?:^|[;&|])\s*\$\{[A-Za-z_][A-Za-z0-9_]*\}(?:\s|$)/,
+      ~r/(?m)(?:^|[;&|])\s*"\$\{[A-Za-z_][A-Za-z0-9_]*\[@\]\}"(?:\s|$)/,
       ~r/\$\{![A-Za-z_][A-Za-z0-9_]*\}/,
       ~r/(?m)(^|\s)(?:command|exec|env)\s+["']?\$\{?[A-Za-z_][A-Za-z0-9_]*/,
       ~r/\$\(\s*["']?\$\{?[A-Za-z_][A-Za-z0-9_]*/,
@@ -1165,43 +1182,23 @@ defmodule Tightbeam.ManualCandidateWorkflowTest do
       "may perform a test-host build"
     ]
 
-    forbidden_permissions = [
-      {"EEZO", "build"},
-      {"EEZO", "install"},
-      {"EEZO", "restart"},
-      {"EEZO", "gateway"},
-      {"EEZO", "provider preflight"},
-      {"EEZO", "smoke"},
-      {"EEZO", "proof"},
-      {"EEZO", "switch proof"},
-      {"TARS", "install"},
-      {"TARS", "restart"},
-      {"TARS", "gateway"},
-      {"TARS", "provider preflight"},
-      {"TARS", "smoke"},
-      {"TARS", "proof"},
-      {"TARS", "switch proof"},
-      {"Gibson", "check out"},
-      {"Gibson", "build"},
-      {"Gibson", "test"},
-      {"Gibson", "package"},
-      {"Gibson", "download"},
-      {"Gibson", "install"},
-      {"Gibson", "restart"},
-      {"Gibson", "proof"},
-      {"Gibson", "switch"},
-      {"Shrdlu", "install"},
-      {"Shrdlu", "restart"},
-      {"Shrdlu", "gateway"},
-      {"Shrdlu", "proof"},
-      {"Shrdlu", "switch"}
-    ]
+    forbidden_permissions = %{
+      "EEZO" =>
+        ~w(build install restart gateway proof) ++
+          ["provider preflight", "smoke", "switch proof"],
+      "TARS" =>
+        ~w(install restart gateway proof) ++ ["provider preflight", "smoke", "switch proof"],
+      "Shrdlu" => ~w(install restart gateway proof switch),
+      "Gibson" => ~w(build test package download install restart proof switch) ++ ["check out"]
+    }
 
     host_rows(guide) == @host_rows and guide =~ @global_refusal and
       Enum.all?(forbidden, &(not String.contains?(guide, &1))) and
-      Enum.all?(forbidden_permissions, fn {host, action} ->
-        pattern = ~r/\b#{Regex.escape(host)}\b[^.\n]*\bmay\b[^.\n]*#{Regex.escape(action)}/i
-        not Regex.match?(pattern, guide)
+      Enum.all?(forbidden_permissions, fn {host, actions} ->
+        Enum.all?(actions, fn action ->
+          pattern = ~r/\b#{Regex.escape(host)}\b[^.\n]*\bmay\b[^.\n]*#{Regex.escape(action)}/i
+          not Regex.match?(pattern, guide)
+        end)
       end)
   end
 end
