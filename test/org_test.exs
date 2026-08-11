@@ -97,9 +97,10 @@ defmodule Tightbeam.OrgTest do
       Org.set_operational_parent(db, main_key, first.session_key)
     end
 
-    assert_raise DB.Error, ~r/FOREIGN KEY constraint failed/, fn ->
-      Org.create(db, base(%{session_key: "orphan", operational_parent: "missing-parent"}))
-    end
+    derived =
+      Org.create(db, base(%{session_key: "derived", operational_parent: "derived"}))
+
+    assert derived.operational_parent == main_key
 
     {:ok, foreign_keys} = DB.query(db, "PRAGMA foreign_key_list(sessions)")
 
@@ -196,14 +197,14 @@ defmodule Tightbeam.OrgTest do
     main_key = Org.personal_session_key("flynn")
     Org.create(db, base(%{session_key: "k2", order_index: 2}))
     Org.create(db, base(%{session_key: "k1", order_index: 1}))
+    ensure_main_session(db, "sam")
 
     Org.create(
       db,
       base(%{
         session_key: "sam",
         owner_user_id: "sam",
-        origin: "user:sam",
-        operational_parent: main_key
+        origin: "user:sam"
       })
     )
 
@@ -213,7 +214,7 @@ defmodule Tightbeam.OrgTest do
              "k2"
            ]
 
-    assert length(Org.list_for_user(db, "flynn", true)) == 4
+    assert length(Org.list_for_user(db, "flynn", true)) == 5
 
     retired = Org.retire(db, "k1", "user:flynn", 1_000)
     assert retired.state == "retired"
