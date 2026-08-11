@@ -145,6 +145,27 @@ pub enum Command {
         request_id: String,
         action: String,
     },
+    OperatorAsk {
+        identity: Identity,
+        question: String,
+        note: Option<String>,
+        options: Option<Vec<String>>,
+        assignment_id: Option<String>,
+        deadline_ms: Option<String>,
+        supersedes: Option<String>,
+    },
+    OperatorRule {
+        identity: Identity,
+        request_id: String,
+        decision: Option<String>,
+        response: Option<String>,
+        rationale: Option<String>,
+    },
+    OperatorWithdraw {
+        identity: Identity,
+        request_id: String,
+        reason: String,
+    },
     DecisionRequests {
         identity: Identity,
         status: Option<String>,
@@ -510,6 +531,14 @@ COMMANDS:
       Atomically open an assignment and wake its holder with the card id.
   effort-rule --request <decisionRequestId> --action continue|dismiss
       Rule an effort-without-effect check-in routed to your principal.
+  operator-ask --question <q> [--note <t>] [--options a,b,c]
+               [--assignment <asgId>] [--deadline <dur>] [--supersedes <dr_id>]
+      File an owner-scoped operator decision request.
+  operator-rule <dr_id> (--decision <label> | --response <text>)
+                [--rationale <text>]
+      Record the operator's resolution. Main and presenting proxies never run this command.
+  operator-withdraw <dr_id> --reason <text>
+      Withdraw an operator decision request as its owner or original asker.
   decision-requests [--status open|ruled|all]
       List decision requests visible to your principal.
   revoke-assignment <assignmentId>
@@ -1195,6 +1224,59 @@ fn parse_with_optional_catalog(
                 action,
             })
         }
+        "operator-ask" => {
+            if parsed.positional.len() != 1 {
+                return Err("usage: tightbeam operator-ask --question <q> [--note <t>] [--options a,b,c] [--assignment <asgId>] [--deadline <dur>] [--supersedes <dr_id>]".to_owned());
+            }
+            let question =
+                nonempty(flags, "question").ok_or_else(|| "--question is required".to_owned())?;
+            let options = flags
+                .get("options")
+                .map(|value| value.split(',').map(str::to_owned).collect::<Vec<_>>());
+            let deadline_ms = flags
+                .get("deadline")
+                .map(|value| parse_duration("deadline", value))
+                .transpose()?;
+            Ok(Command::OperatorAsk {
+                identity: identity(flags)?,
+                question,
+                note: nonempty(flags, "note"),
+                options,
+                assignment_id: nonempty(flags, "assignment"),
+                deadline_ms,
+                supersedes: nonempty(flags, "supersedes"),
+            })
+        }
+        "operator-rule" => {
+            if parsed.positional.len() != 2 {
+                return Err("usage: tightbeam operator-rule <dr_id> (--decision <label> | --response <text>) [--rationale <text>]".to_owned());
+            }
+            let decision = flags.get("decision").cloned();
+            let response = flags.get("response").cloned();
+            if decision.is_some() == response.is_some() {
+                return Err(
+                    "operator-rule requires exactly one of --decision or --response".to_owned(),
+                );
+            }
+            Ok(Command::OperatorRule {
+                identity: identity(flags)?,
+                request_id: parsed.positional[1].clone(),
+                decision,
+                response,
+                rationale: nonempty(flags, "rationale"),
+            })
+        }
+        "operator-withdraw" => {
+            if parsed.positional.len() != 2 {
+                return Err("usage: tightbeam operator-withdraw <dr_id> --reason <text>".to_owned());
+            }
+            Ok(Command::OperatorWithdraw {
+                identity: identity(flags)?,
+                request_id: parsed.positional[1].clone(),
+                reason: nonempty(flags, "reason")
+                    .ok_or_else(|| "--reason is required".to_owned())?,
+            })
+        }
         "decision-requests" => {
             if parsed.positional.len() != 1 {
                 return Err(
@@ -1551,7 +1633,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -2274,6 +2356,9 @@ mod tests {
                 "learn",
                 "list",
                 "onboard",
+                "operator-ask",
+                "operator-rule",
+                "operator-withdraw",
                 "retire",
                 "revoke-assignment",
                 "spawn",
@@ -2828,8 +2913,94 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned())
         );
+    }
+
+    #[test]
+    fn operator_decision_commands_parse_the_exact_surface() {
+        assert_eq!(
+            parse(strings(&[
+                "operator-ask",
+                "--question",
+                "ship window?",
+                "--note",
+                "release train",
+                "--options",
+                "accept,wait",
+                "--assignment",
+                "asg_1",
+                "--deadline",
+                "2h",
+                "--supersedes",
+                "dr_old",
+                "--as",
+                "coder:release",
+            ])),
+            Ok(Command::OperatorAsk {
+                identity: Identity::Role("coder:release".to_owned()),
+                question: "ship window?".to_owned(),
+                note: Some("release train".to_owned()),
+                options: Some(vec!["accept".to_owned(), "wait".to_owned()]),
+                assignment_id: Some("asg_1".to_owned()),
+                deadline_ms: Some("7200000".to_owned()),
+                supersedes: Some("dr_old".to_owned()),
+            })
+        );
+
+        assert_eq!(
+            parse(strings(&[
+                "operator-rule",
+                "dr_1",
+                "--response",
+                "ship after 013",
+                "--rationale",
+                "dependency first",
+                "--as-user",
+                "mike",
+            ])),
+            Ok(Command::OperatorRule {
+                identity: Identity::User("mike".to_owned()),
+                request_id: "dr_1".to_owned(),
+                decision: None,
+                response: Some("ship after 013".to_owned()),
+                rationale: Some("dependency first".to_owned()),
+            })
+        );
+
+        assert_eq!(
+            parse(strings(&[
+                "operator-withdraw",
+                "dr_2",
+                "--reason",
+                "moot after 013",
+            ])),
+            Ok(Command::OperatorWithdraw {
+                identity: Identity::Session,
+                request_id: "dr_2".to_owned(),
+                reason: "moot after 013".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn operator_rule_requires_one_answer_form() {
+        for args in [
+            strings(&["operator-rule", "dr_1"]),
+            strings(&[
+                "operator-rule",
+                "dr_1",
+                "--decision",
+                "accept",
+                "--response",
+                "yes",
+            ]),
+        ] {
+            assert_eq!(
+                parse(args),
+                Err("operator-rule requires exactly one of --decision or --response".to_owned())
+            );
+        }
     }
 
     #[test]
@@ -2844,6 +3015,7 @@ mod tests {
             "revoke-waiver",
             "withdraw",
             "decision-request",
+            "operator-supersede",
             "critical",
             "work-item-update",
             "work-item-list",
