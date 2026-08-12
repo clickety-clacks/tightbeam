@@ -374,6 +374,7 @@ defmodule Tightbeam.ManualCandidateWorkflowTest do
           ~S|! $runner rev-parse "$CANDIDATE_SHA"|,
           ~S|case x in x) $runner rev-parse "$CANDIDATE_SHA";; esac|,
           ~S|time $runner rev-parse "$CANDIDATE_SHA"|,
+          ~S|time -p $runner rev-parse "$CANDIDATE_SHA"|,
           ~S"""
           true && \
           $runner rev-parse "$CANDIDATE_SHA"
@@ -385,6 +386,11 @@ defmodule Tightbeam.ManualCandidateWorkflowTest do
           ~S"""
           printf x | \
           $runner rev-parse "$CANDIDATE_SHA"
+          """,
+          ~S"""
+          true && \
+            \
+            $runner rev-parse "$CANDIDATE_SHA"
           """,
           "runner=git\n$runner rev-parse \"$CANDIDATE_SHA\"",
           "command='git rev-parse'\n$command \"$CANDIDATE_SHA\"",
@@ -412,12 +418,16 @@ defmodule Tightbeam.ManualCandidateWorkflowTest do
     literal_boundary_control = ~S"""
     case x in x) git rev-parse "$CANDIDATE_SHA";; esac
     time git rev-parse "$CANDIDATE_SHA"
+    time -p git rev-parse "$CANDIDATE_SHA"
     true && \
     git rev-parse "$CANDIDATE_SHA"
     false || \
     git rev-parse "$CANDIDATE_SHA"
     printf x | \
     git rev-parse "$CANDIDATE_SHA"
+    true && \
+      \
+      git rev-parse "$CANDIDATE_SHA"
     """
 
     assert static_run_body?(literal_boundary_control)
@@ -942,7 +952,7 @@ defmodule Tightbeam.ManualCandidateWorkflowTest do
       ~r/(^|\s)(sh|bash)\s+-c(\s|$)/m,
       ~r/(?im)^\s*(?:(?:local|readonly)\s+|declare(?:\s+-[a-z]+)?\s+)?[a-z_][a-z0-9_]*(?:cmd|command)[a-z0-9_]*\s*\+?=/,
       ~r/\+=/,
-      ~r/(?m)(?:(?<!\\\n)^|[;&|][ \t]*(?:\\\n[ \t]*)?|\([ \t]+|\)[ \t]+|(?<!\[\[ )![ \t]+)(?:(?:then|do|else|time)[ \t]+)?(?:\{[ \t]*)?(?:"\$(?:\{[A-Za-z_][A-Za-z0-9_]*\}|[A-Za-z_][A-Za-z0-9_]*)"|\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Za-z_][A-Za-z0-9_]*)(?:[ \t]|$)/,
+      ~r/(?m)(?:(?<!\\\n)^|[;&|][ \t]*(?:\\\n[ \t]*)*|\([ \t]+|\)[ \t]+|(?<!\[\[ )![ \t]+)(?:(?:then|do|else)[ \t]+|time[ \t]+(?:-p[ \t]+)?)?(?:\{[ \t]*)?(?:"\$(?:\{[A-Za-z_][A-Za-z0-9_]*\}|[A-Za-z_][A-Za-z0-9_]*)"|\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Za-z_][A-Za-z0-9_]*)(?:[ \t]|$)/,
       ~r/(?m)^\s*\$\{[A-Za-z_][A-Za-z0-9_]*\}(?:\s|$)/,
       ~r/(?m)^\s*"\$\{[A-Za-z_][A-Za-z0-9_]*\[@\]\}"(?:\s|$)/,
       ~r/\$\{![A-Za-z_][A-Za-z0-9_]*\}/,
