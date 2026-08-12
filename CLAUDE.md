@@ -1,5 +1,45 @@
 # tightbeam_ex — agent notes
 
+## THE PHILOSOPHY GATE — run it before you design, again before you ship
+
+Tightbeam is agent-first: agents run the org; the substrate records truth,
+prods, and executes named org-authored law — it NEVER judges and NEVER seizes
+(adjudication deletion ruling, 2026-08-05, shared specs tightbeam-decisions.md).
+Every spec and every change answers these ten. A "no" is a FINDING to report,
+not a style nit — the "hey, that's not what we're about" moment is this list
+doing its job. Layer vocabulary: PHYSICS = substrate mechanism (invariant,
+judgment-free); ANATOMY = neutral seed (shipped shape, org-reshapeable);
+CULTURE = kungfu (domain). See shared specs coordination-fabric-v1.md.
+
+1. **Who judges?** If the substrate is making a judgment call, move it to an
+   agent or delete it. The substrate owes truth, a named failure, and a record
+   — nothing else.
+2. **Can an agent say no?** Every mechanism is a default with a nameable
+   inhibition seam. If you cannot name where an agent overrides it, you built
+   a cage.
+3. **What's the exit?** No state whose exit condition is someone else's
+   decision — every wait ends on time, a turn boundary, or the waiter's own
+   choice. And every state has a lawful AGENT-reachable repair verb: if repair
+   requires an admin at a database console, the design is incomplete
+   (completion-selection wedge, wi_1b0237fe, 2026-08-12).
+4. **Does failure correlate?** A wrong deterministic rule wrongs every case
+   identically and silently — correlated failure is what brittleness IS. Keep
+   rules small and boring, and put a mind above them.
+5. **Interruption or information?** Shape WHEN attention is spent, never WHAT
+   is recorded. An optimization that loses rows is wrong, full stop.
+6. **Which layer?** Mentions the domain → culture. An org could sanely
+   reshape it → not physics. Judgment content → never physics.
+7. **Decimation test.** Kill any one session, or the gateway, mid-flight: does
+   the org degrade to a topology that already works?
+8. **Is the discipline a bone yet?** Anything agents must remember to do every
+   time is a deterministic reflex waiting to be extracted. Inverse holds:
+   anything requiring judgment every time must never be extracted.
+9. **Does a status question reach a mind?** A question answerable from rows is
+   answered by rows.
+10. **Can you say it as a maxim?** If the mechanism's purpose will not
+    compress to one load-bearing sentence consistent with the nine above, be
+    suspicious of the mechanism.
+
 ## ACP / harness facts (for anyone touching the adapter layer)
 
 - **Zed is the ACP reference implementation.** For ANY protocol capability/semantics
