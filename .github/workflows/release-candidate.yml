@@ -1,0 +1,244 @@
+name: release candidate
+
+on:
+  push:
+    branches:
+      - "release-candidate/**"
+  workflow_dispatch:
+    inputs:
+      candidate_branch:
+        description: "Existing release-candidate/* branch"
+        required: true
+        type: string
+      candidate_sha:
+        description: "Exact 40-hex branch head"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  metadata:
+    runs-on: ubuntu-latest
+    outputs:
+      candidate_branch: ${{ steps.candidate.outputs.branch }}
+      candidate_ref: ${{ steps.candidate.outputs.ref }}
+      candidate_sha: ${{ steps.candidate.outputs.sha }}
+    env:
+      CANDIDATE_BRANCH: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_branch || github.ref_name }}
+      CANDIDATE_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_sha || github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CANDIDATE_SHA }}
+          fetch-depth: 0
+
+      - id: candidate
+        name: Verify the exact candidate branch and emit canonical input
+        run: |
+          printf '%s\n' "$CANDIDATE_SHA" | grep -Eq '^[0-9a-f]{40}$' || {
+            echo "release candidate: candidate SHA must be exact lower-case 40-hex" >&2
+            exit 1
+          }
+          printf '%s\n' "$CANDIDATE_BRANCH" | grep -Eq '^release-candidate/[A-Za-z0-9._/-]+$' || {
+            echo "release candidate: invalid candidate branch" >&2
+            exit 1
+          }
+          git check-ref-format "refs/heads/$CANDIDATE_BRANCH"
+          git fetch --no-tags origin \
+            "+refs/heads/main:refs/remotes/origin/main" \
+            "+refs/heads/$CANDIDATE_BRANCH:refs/remotes/origin/$CANDIDATE_BRANCH"
+          [ "$(git rev-parse HEAD)" = "$CANDIDATE_SHA" ]
+          [ "$(git rev-parse "refs/remotes/origin/$CANDIDATE_BRANCH")" = "$CANDIDATE_SHA" ]
+          base=$(git merge-base refs/remotes/origin/main "$CANDIDATE_SHA")
+          features=$(git rev-list --reverse --topo-order "$base..$CANDIDATE_SHA")
+          [ -n "$features" ] || {
+            echo "release candidate: candidate range is empty" >&2
+            exit 1
+          }
+          # Feature values are exact Git-produced SHAs, so word splitting is intentional.
+          scripts/release_candidate.sh --check "$CANDIDATE_BRANCH" "$base" $features \
+            > candidate-input.json
+          printf 'branch=%s\n' "$CANDIDATE_BRANCH" >> "$GITHUB_OUTPUT"
+          printf 'ref=refs/heads/%s\n' "$CANDIDATE_BRANCH" >> "$GITHUB_OUTPUT"
+          printf 'sha=%s\n' "$CANDIDATE_SHA" >> "$GITHUB_OUTPUT"
+
+      # This one-day artifact only carries the checked input between jobs. It is not proof.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: candidate-input-${{ env.CANDIDATE_SHA }}
+          path: candidate-input.json
+          retention-days: 1
+          if-no-files-found: error
+
+  test:
+    needs: metadata
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x86_64
+          - os: macos-latest
+            platform: darwin-aarch64
+    name: test ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.metadata.outputs.candidate_sha }}
+          fetch-depth: 0
+
+      - name: Verify exact checkout
+        env:
+          CANDIDATE_SHA: ${{ needs.metadata.outputs.candidate_sha }}
+        run: test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+
+      - name: Public rule facts never shrink
+        run: python3 scripts/verify_public_rule_facts.py
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "28"
+          elixir-version: "1.19.5"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Put the in-repo harness CLI on PATH
+        run: echo "$GITHUB_WORKSPACE/priv/harness_cli" >> "$GITHUB_PATH"
+
+      - name: Declare the test Git identity
+        run: |
+          git config --global user.name "tightbeam ci"
+          git config --global user.email "ci@tightbeam.invalid"
+
+      - name: Build the release CLI
+        working-directory: cli
+        run: cargo build --release
+
+      - name: Install Mix dependencies
+        run: mix deps.get
+
+      - name: Compile
+        run: mix compile
+
+      - name: Run authoritative gates
+        run: |
+          mix format --check-formatted
+          scripts/verify_mix.sh
+          (cd cli && cargo fmt --check && cargo test)
+
+  package:
+    needs: [metadata, test]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x86_64
+          - os: macos-latest
+            platform: darwin-aarch64
+    name: package ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.metadata.outputs.candidate_sha }}
+          fetch-depth: 0
+
+      - name: Verify exact checkout
+        env:
+          CANDIDATE_SHA: ${{ needs.metadata.outputs.candidate_sha }}
+        run: test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "28"
+          elixir-version: "1.19.5"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Mix dependencies
+        run: mix deps.get
+
+      - name: Assemble and stage the native package
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          sh packaging/assemble.sh
+          package=$(find _build/npm -maxdepth 1 -type f -name 'tightbeam-*.tgz')
+          [ "$(printf '%s\n' "$package" | sed '/^$/d' | wc -l | tr -d ' ')" -eq 1 ]
+          mkdir -p "stage/packages/$PLATFORM" stage/toolchains
+          cp "$package" "stage/packages/$PLATFORM/"
+          {
+            elixir --version
+            rustc --version
+          } > "stage/toolchains/$PLATFORM.txt"
+
+      # Staging is short-lived job transport. Only the proof job publishes candidate proof.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: candidate-staging-${{ needs.metadata.outputs.candidate_sha }}-${{ matrix.platform }}
+          path: stage/
+          retention-days: 1
+          if-no-files-found: error
+
+  proof:
+    needs: [metadata, package]
+    if: ${{ success() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.metadata.outputs.candidate_sha }}
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: candidate-input-${{ needs.metadata.outputs.candidate_sha }}
+          path: evidence
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: candidate-staging-${{ needs.metadata.outputs.candidate_sha }}-*
+          path: evidence
+          merge-multiple: true
+
+      - name: Create and verify the complete proof manifest
+        env:
+          CANDIDATE_REF: ${{ needs.metadata.outputs.candidate_ref }}
+          CANDIDATE_SHA: ${{ needs.metadata.outputs.candidate_sha }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          python3 scripts/verify_release_candidate_manifest.py create \
+            --candidate-input evidence/candidate-input.json \
+            --evidence-root evidence \
+            --workflow-sha "$WORKFLOW_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --output evidence/release-candidate-manifest.json
+          python3 scripts/verify_release_candidate_manifest.py verify \
+            --manifest evidence/release-candidate-manifest.json \
+            --evidence-root evidence \
+            --repository-root . \
+            --expected-repository "$GITHUB_REPOSITORY" \
+            --expected-ref "$CANDIDATE_REF" \
+            --expected-source-sha "$CANDIDATE_SHA" \
+            --expected-workflow-sha "$WORKFLOW_SHA"
+          (
+            cd evidence
+            find packages toolchains -type f -print | sort | xargs sha256sum
+            sha256sum release-candidate-manifest.json
+          ) > evidence/SHA256SUMS
+
+      # No proof artifact exists unless metadata, both test jobs, and both package jobs passed.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-candidate-proof-${{ needs.metadata.outputs.candidate_sha }}
+          path: |
+            evidence/release-candidate-manifest.json
+            evidence/SHA256SUMS
+            evidence/packages/
+            evidence/toolchains/
+          retention-days: 90
+          if-no-files-found: error
