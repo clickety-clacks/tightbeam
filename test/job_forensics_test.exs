@@ -940,7 +940,7 @@ defmodule Tightbeam.JobForensicsTest do
     assert Enum.any?(timeline, &(&1.type == "causal_event" and &1.kind == "prod_fired"))
   end
 
-  test "proof 2: prod_answered emits ONE event per previously-unseen attest, in id order", ctx do
+  test "proof 2: vague attests do not mint legacy prod_answered events", ctx do
     db = ctx.db
     work_item(db, "wi_answer")
     session(db, "supervisor")
@@ -952,21 +952,22 @@ defmodule Tightbeam.JobForensicsTest do
     assert {:prodded, 1} = evaluate(db, handlers, "holder")
     assert answered(db) == []
 
-    # TWO attests land between evaluations; each keeps its own edge.
+    # TWO untyped completion claims land between evaluations. Neither is a
+    # liveness receipt and the retired causal kind stays empty.
     attest(db, "att_b", "asg_answer")
     attest(db, "att_a", "asg_answer")
 
     evaluate(db, handlers, "holder")
-    assert answered(db) == ["att_a", "att_b"], "one event per attest, ordered by attest id"
+    assert answered(db) == []
 
     # Re-evaluating sees nothing new: this table is its own watermark.
     evaluate(db, handlers, "holder")
-    assert answered(db) == ["att_a", "att_b"]
+    assert answered(db) == []
 
-    # A LATER attest gets its own event, and only its own.
+    # A later vague claim also remains inert.
     attest(db, "att_c", "asg_answer")
     evaluate(db, handlers, "holder")
-    assert answered(db) == ["att_a", "att_b", "att_c"]
+    assert answered(db) == []
   end
 
   test "proof 2: an effort rung advance records the rung and expecter it left", ctx do
@@ -1052,7 +1053,7 @@ defmodule Tightbeam.JobForensicsTest do
 
   ## Cross-review regressions (Sol CHANGES-REQUIRED, 2026-07-26)
 
-  test "F5: a post-migration attest does NOT backfill pre-v2 attest history", ctx do
+  test "F5: the retired prod_answered writer does not reinterpret attest history", ctx do
     db = ctx.db
     work_item(db, "wi_pre")
     session(db, "supervisor")
@@ -1076,16 +1077,15 @@ defmodule Tightbeam.JobForensicsTest do
     attest(db, "att_new", "asg_pre", cutoff + 1_000)
     evaluate(db, handlers, "holder")
 
-    assert answered(db) == ["att_new"],
-           "only post-cutoff attests get events; pre-v2 history stays unrecorded"
+    assert answered(db) == [], "attest history is not a liveness receipt"
 
     # A later evaluation still never reaches back across the cutoff.
     attest(db, "att_newer", "asg_pre", cutoff + 2_000)
     evaluate(db, handlers, "holder")
-    assert answered(db) == ["att_new", "att_newer"]
+    assert answered(db) == []
   end
 
-  test "F5: a STALE pre-v2 aggregate cannot make the resolver reach back", ctx do
+  test "F5: a stale pre-v2 aggregate cannot revive the retired writer", ctx do
     db = ctx.db
     work_item(db, "wi_stale")
     session(db, "supervisor")
@@ -1111,8 +1111,8 @@ defmodule Tightbeam.JobForensicsTest do
     attest(db, "att_after", "asg_stale", cutoff + 500)
     evaluate(db, handlers, "holder")
 
-    assert answered(db) == ["att_after"],
-           "the timestamp floor must hold even when the aggregate understates history"
+    assert answered(db) == [],
+           "a mutable aggregate cannot turn attest history into receipts"
   end
 
   test "F6: an agent cannot forge wake or turn attribution", ctx do

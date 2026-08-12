@@ -1508,7 +1508,7 @@ defmodule Tightbeam.ConformanceSupport do
             "no-applicable-escalate-records-none" ->
               assert {:allow, [], []} = Rules.decide(db, turn_call)
 
-              assert {:prodded, 1} =
+              assert :rebased =
                        Supervision.evaluate(
                          db,
                          handlers,
@@ -1718,7 +1718,6 @@ defmodule Tightbeam.ConformanceSupport do
   def run_scheduled_wake_contract(fixture) do
     assert Supervision.turn_end_schedule() == [
              :rail_enforcement,
-             :pending_wake_gate,
              :prod_ladder
            ]
 
@@ -1744,10 +1743,10 @@ defmodule Tightbeam.ConformanceSupport do
               assert {{:remedy, %{name: ^statute}, ^assignment_id, _}, [], []} =
                        Rules.decide(db, turn_call)
 
-              # r21 requires this remedy to act before the pending-wake gate.
-              # The current implementation still bypasses rail_step internally
-              # for a self wake; this assertion is the executable handoff proof.
-              assert :continuation =
+              # The self wake still suppresses the rail remedy, but it does not
+              # suppress the independent prod ladder unless it is an exact
+              # assignment checkpoint.
+              assert {:prodded, 1} =
                        Supervision.evaluate(
                          db,
                          handlers,
@@ -1779,7 +1778,7 @@ defmodule Tightbeam.ConformanceSupport do
             "allow-falls-through-to-pending-wake-gate" ->
               assert {:allow, [], []} = Rules.decide(db, turn_call)
 
-              assert :continuation =
+              assert :rebased =
                        Supervision.evaluate(
                          db,
                          handlers,

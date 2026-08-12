@@ -50,13 +50,13 @@ defmodule Tightbeam.Schema do
         claimClock INTEGER,
         basisKind TEXT NOT NULL CHECK (basisKind IN (
           'assignment_open','prod_scheduled','escalation_scheduled','policy_denied',
-          'progress','no_terminal','parent_retirement','recovery_backfill'
+          'progress','liveness_receipt','no_terminal','parent_retirement','recovery_backfill'
         )),
         basisId TEXT NOT NULL,
         terminusAt INTEGER,
         cause TEXT NOT NULL CHECK (cause IN (
           'assignment_open','progress','deadline','new_terminal','pending_turn','pending_wake',
-          'work_blocked','prod_scheduled','escalation_scheduled','policy_denied','no_terminal',
+          'work_blocked','liveness_receipt','prod_scheduled','escalation_scheduled','policy_denied','no_terminal',
           'terminal_disposition','holder_retired','parent_elevated','terminus',
           'parent_target_retired','recovery_backfill','stale_generation'
         )),
@@ -382,6 +382,53 @@ defmodule Tightbeam.Schema do
   # object and not this trigger. It is still owned and shape-validated, and is
   # installed in the same schema transaction on the next boot.
   @supervision_liveness_enforcement_objects [
+    %{
+      type: "table",
+      name: "supervision_liveness_receipt_state",
+      sql: """
+      CREATE TABLE IF NOT EXISTS supervision_liveness_receipt_state (
+        assignmentId TEXT PRIMARY KEY REFERENCES assignments(id),
+        artifactCursor INTEGER NOT NULL CHECK (artifactCursor >= 0),
+        attestCursor INTEGER NOT NULL CHECK (attestCursor >= 0),
+        workItemEventCursor INTEGER NOT NULL CHECK (workItemEventCursor >= 0),
+        wakeCursor INTEGER NOT NULL CHECK (wakeCursor >= 0),
+        baselineCause TEXT NOT NULL CHECK (baselineCause IN (
+          'assignment_open','first_prod','recovery_backfill'
+        )),
+        baselinePrincipal TEXT NOT NULL
+      )
+      """
+    },
+    %{
+      type: "table",
+      name: "supervision_liveness_receipts",
+      sql: """
+      CREATE TABLE IF NOT EXISTS supervision_liveness_receipts (
+        receiptId INTEGER PRIMARY KEY AUTOINCREMENT,
+        assignmentId TEXT NOT NULL REFERENCES assignments(id),
+        sourceKind TEXT NOT NULL CHECK (sourceKind IN (
+          'artifact','work_item_update','verdict','checkpoint'
+        )),
+        sourceId TEXT NOT NULL,
+        sourceAt INTEGER NOT NULL CHECK (sourceAt >= 0),
+        acceptedAt INTEGER NOT NULL CHECK (acceptedAt >= 0),
+        generation INTEGER NOT NULL CHECK (generation > 0),
+        expiresAt INTEGER CHECK (expiresAt >= 0),
+        UNIQUE (assignmentId, sourceKind, sourceId),
+        CHECK (
+          (sourceKind = 'checkpoint' AND expiresAt > acceptedAt)
+          OR
+          (sourceKind != 'checkpoint' AND expiresAt IS NULL)
+        )
+      )
+      """
+    },
+    %{
+      type: "index",
+      name: "supervision_liveness_receipts_assignment",
+      sql:
+        "CREATE INDEX IF NOT EXISTS supervision_liveness_receipts_assignment ON supervision_liveness_receipts(assignmentId, receiptId)"
+    },
     %{
       type: "table",
       name: "supervision_liveness_migrations",

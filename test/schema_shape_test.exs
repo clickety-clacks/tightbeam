@@ -70,7 +70,13 @@ defmodule Tightbeam.SchemaShapeTest do
     assert table_columns(db, "supervision_liveness_migrations") ==
              ~w(migrationId appliedAt affectedRows cause principal)
 
-    assert length(owned_activation_objects(db)) == 24
+    assert table_columns(db, "supervision_liveness_receipt_state") ==
+             ~w(assignmentId artifactCursor attestCursor workItemEventCursor wakeCursor baselineCause baselinePrincipal)
+
+    assert table_columns(db, "supervision_liveness_receipts") ==
+             ~w(receiptId assignmentId sourceKind sourceId sourceAt acceptedAt generation expiresAt)
+
+    assert length(owned_activation_objects(db)) == 27
 
     assert {:ok, [[0, activated_at, "schema_activation", "process:tightbeam"]]} =
              DB.query(
@@ -338,6 +344,9 @@ defmodule Tightbeam.SchemaShapeTest do
           'supervision_liveness_retirement_immutable_update',
           'supervision_liveness_retirement_immutable_delete',
           'supervision_liveness_migrations',
+          'supervision_liveness_receipt_state',
+          'supervision_liveness_receipts',
+          'supervision_liveness_receipts_assignment',
           'supervision_liveness_sidecar_insert_coherent',
           'supervision_pending_controller_sidecar_update',
           'supervision_pending_controller_sidecar_delete',
@@ -374,6 +383,8 @@ defmodule Tightbeam.SchemaShapeTest do
       DROP TABLE IF EXISTS wake_cancellations;
       DROP TABLE IF EXISTS supervision_liveness_sidecar;
       DROP TABLE IF EXISTS supervision_progress_absorptions;
+      DROP TABLE IF EXISTS supervision_liveness_receipt_state;
+      DROP TABLE IF EXISTS supervision_liveness_receipts;
       DROP TABLE IF EXISTS supervision_entitlements;
       DROP TABLE IF EXISTS supervision_liveness_epoch;
       DROP TABLE IF EXISTS supervision_liveness_migrations;
