@@ -1,5 +1,12 @@
 # tightbeam_ex — agent notes
 
+## THIS LINE: 0.1.x — the maintenance line (split 2026-08-12 at cd72fe0)
+
+Integrate 0.1.x work HERE, not main. main is now the 0.2 fabric program line
+(PR-only, program authorization). Where older guidance, specs, or cards say
+"merge to main", read "merge to 0.1.x" on this line. If a card names a
+branch explicitly, the card wins.
+
 ## ACP / harness facts (for anyone touching the adapter layer)
 
 - **Zed is the ACP reference implementation.** For ANY protocol capability/semantics
