@@ -392,6 +392,11 @@ defmodule Tightbeam.ManualCandidateWorkflowTest do
             \
             $runner rev-parse "$CANDIDATE_SHA"
           """,
+          ~S"""
+          time -p \
+            \
+            $runner rev-parse "$CANDIDATE_SHA"
+          """,
           "runner=git\n$runner rev-parse \"$CANDIDATE_SHA\"",
           "command='git rev-parse'\n$command \"$CANDIDATE_SHA\"",
           "args=(git rev-parse \"$CANDIDATE_SHA\")\n\"${args[@]}\"",
@@ -426,6 +431,9 @@ defmodule Tightbeam.ManualCandidateWorkflowTest do
     printf x | \
     git rev-parse "$CANDIDATE_SHA"
     true && \
+      \
+      git rev-parse "$CANDIDATE_SHA"
+    time -p \
       \
       git rev-parse "$CANDIDATE_SHA"
     """
@@ -952,7 +960,7 @@ defmodule Tightbeam.ManualCandidateWorkflowTest do
       ~r/(^|\s)(sh|bash)\s+-c(\s|$)/m,
       ~r/(?im)^\s*(?:(?:local|readonly)\s+|declare(?:\s+-[a-z]+)?\s+)?[a-z_][a-z0-9_]*(?:cmd|command)[a-z0-9_]*\s*\+?=/,
       ~r/\+=/,
-      ~r/(?m)(?:(?<!\\\n)^|[;&|][ \t]*(?:\\\n[ \t]*)*|\([ \t]+|\)[ \t]+|(?<!\[\[ )![ \t]+)(?:(?:then|do|else)[ \t]+|time[ \t]+(?:-p[ \t]+)?)?(?:\{[ \t]*)?(?:"\$(?:\{[A-Za-z_][A-Za-z0-9_]*\}|[A-Za-z_][A-Za-z0-9_]*)"|\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Za-z_][A-Za-z0-9_]*)(?:[ \t]|$)/,
+      ~r/(?m)(?:(?<!\\\n)^|[;&|][ \t]*(?:\\\n[ \t]*)*|\([ \t]+|\)[ \t]+|(?<!\[\[ )![ \t]+)(?:(?:then|do|else)[ \t]+|time[ \t]+(?:-p[ \t]+)?(?:\\\n[ \t]*)*)?(?:\{[ \t]*)?(?:"\$(?:\{[A-Za-z_][A-Za-z0-9_]*\}|[A-Za-z_][A-Za-z0-9_]*)"|\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Za-z_][A-Za-z0-9_]*)(?:[ \t]|$)/,
       ~r/(?m)^\s*\$\{[A-Za-z_][A-Za-z0-9_]*\}(?:\s|$)/,
       ~r/(?m)^\s*"\$\{[A-Za-z_][A-Za-z0-9_]*\[@\]\}"(?:\s|$)/,
       ~r/\$\{![A-Za-z_][A-Za-z0-9_]*\}/,
