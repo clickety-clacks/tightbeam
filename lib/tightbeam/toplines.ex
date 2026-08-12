@@ -1,925 +1,947 @@
 defmodule Tightbeam.Toplines do
   @moduledoc """
-  The work telemetry the substrate already knows (spec topline-map-v1). A pure
-  READ over durable work, assignment, turn, attest, wake and
-  creation-context rows: no table, no column, no migration, no emission.
+  Durable human-intent Toplines and explicit Work membership.
 
-  Four surfaces, one telemetry builder: the roster, the caller-visible causal
-  forest (`--tree`), a subtree anchored on one item (`--under`), and explicit
-  assignment-set selection (`--assignments`).
+  This module is the only runtime writer for the Topline rows in this tranche.
+  `ensure_schema/1` is intentionally callable by focused tests and integration;
+  production boot registration and the packaged Unicode 15.1 SQLite functions
+  are a later, separately owned seam. Until that seam lands, validation here is
+  authoritative for runtime writes and these tables are not exposed at boot.
 
-  Three things here are deliberately precise, and a plausible-looking
-  implementation gets each one wrong:
-
-  1. MEMBERSHIP HAS EXACTLY ONE DEFINITION —
-     `{a : resolved_work_item_id(a) == item}`. `resolve_all/1` computes that
-     function in bulk (own non-null pin wins, else follow `reviewsAssignmentId`,
-     else NONE), so every consumer — assignment counts, jobs, attests,
-     closing attests, decision requests, the turn union, marker fan-out and
-     parent-edge derivation — reads the SAME map. The recursive
-     `work-item-trace` CTE is NOT reused: it seeds on `workItemId` and unions
-     the reviewed chain, which attributes a legacy conflicted review to two
-     items at once.
-
-  2. THE PARENT BLOCK IS FOUR-VALUED AND NONE OF THE VALUES MAY OVERCLAIM. The
-     creation stamp records CONCURRENCY, not proven causality (core-causality
-     C1), so the response carries a constant `edge_basis` and one of
-     `linked | from_turn | no_turn_observed | unrecorded`. `no_turn_observed`
-     is the substrate saying it LOOKED and nothing was running — a signal, not
-     a `root: true` classification — and `unrecorded` is a pre-C1 row whose
-     parent is unknowable. Both carry `item: nil` so a consumer reading only
-     `item` cannot mistake silence for knowledge. No confidence scores.
-
-  3. AUTHORIZATION IS BY OMISSION, and the bar is twin-world byte identity:
-     the complete response with invisible rows present must be byte-identical
-     to the response against a database where those rows are absent. That is
-     why candidate parent edges are authorization-filtered BEFORE traversal
-     (an invisible parent is indistinguishable from a conversational turn),
-     why the traversal order is over visible nodes only, and why pending
-     wakes are selected by the current holder's SESSION KEY rather than
-     through any item-attributed carrier.
+  The old read-only work telemetry remains byte-compatible through `roster/2`
+  and `topline/2`, which delegate to `Tightbeam.ExecutionMap`.
   """
 
-  alias Tightbeam.{CausalEvents, DB}
+  alias Tightbeam.DB
+  alias Tightbeam.DB.Txn
 
-  @edge_basis "concurrent_turn"
-  @coverage_basis "conservative_shared"
-  @terminal_states ~w(closed failed iceboxed)
+  @white_space [
+    0x0009,
+    0x000A,
+    0x000B,
+    0x000C,
+    0x000D,
+    0x0020,
+    0x0085,
+    0x00A0,
+    0x1680,
+    0x2000,
+    0x2001,
+    0x2002,
+    0x2003,
+    0x2004,
+    0x2005,
+    0x2006,
+    0x2007,
+    0x2008,
+    0x2009,
+    0x200A,
+    0x2028,
+    0x2029,
+    0x202F,
+    0x205F,
+    0x3000
+  ]
 
-  @doc """
-  The `toplines` verb: the roster with full telemetry, or the caller-visible
-  causal forest when `--tree` is set.
+  @ddl """
+  CREATE TABLE IF NOT EXISTS toplines (
+    id               TEXT PRIMARY KEY CHECK (substr(id, 1, 3) = 'tl_'),
+    ownerUserId      TEXT NOT NULL REFERENCES users(userId),
+    title            TEXT NOT NULL CHECK (typeof(title) = 'text' AND length(title) BETWEEN 1 AND 2000),
+    state            TEXT NOT NULL CHECK (state IN ('open','closed')),
+    createdActorKind TEXT NOT NULL CHECK (createdActorKind IN ('user','session')),
+    createdActorRef  TEXT NOT NULL CHECK (length(trim(createdActorRef)) > 0),
+    createdAt        INTEGER NOT NULL CHECK (typeof(createdAt) = 'integer'),
+    updatedAt        INTEGER NOT NULL CHECK (typeof(updatedAt) = 'integer' AND updatedAt >= createdAt),
+    closedAt         INTEGER,
+    CHECK (
+      (state = 'open' AND closedAt IS NULL) OR
+      (state = 'closed' AND typeof(closedAt) = 'integer' AND closedAt >= createdAt)
+    )
+  );
+
+  CREATE UNIQUE INDEX IF NOT EXISTS toplines_id_owner
+    ON toplines (id, ownerUserId);
+  CREATE UNIQUE INDEX IF NOT EXISTS work_items_id_owner
+    ON work_items (id, ownerUserId);
+
+  CREATE TABLE IF NOT EXISTS topline_work_memberships (
+    id                TEXT PRIMARY KEY CHECK (substr(id, 1, 4) = 'tlm_'),
+    toplineId         TEXT NOT NULL,
+    workItemId        TEXT NOT NULL,
+    ownerUserId       TEXT NOT NULL,
+    linkReason        TEXT NOT NULL CHECK (length(trim(linkReason)) BETWEEN 1 AND 4000),
+    linkedActorKind   TEXT NOT NULL CHECK (linkedActorKind IN ('user','session')),
+    linkedActorRef    TEXT NOT NULL CHECK (length(trim(linkedActorRef)) > 0),
+    linkedAt          INTEGER NOT NULL CHECK (typeof(linkedAt) = 'integer'),
+    unlinkReason      TEXT,
+    unlinkedActorKind TEXT,
+    unlinkedActorRef  TEXT,
+    unlinkedAt        INTEGER,
+    FOREIGN KEY (toplineId, ownerUserId) REFERENCES toplines(id, ownerUserId),
+    FOREIGN KEY (workItemId, ownerUserId) REFERENCES work_items(id, ownerUserId),
+    CHECK (
+      (unlinkedAt IS NULL AND unlinkReason IS NULL AND unlinkedActorKind IS NULL AND unlinkedActorRef IS NULL) OR
+      (unlinkedAt IS NOT NULL AND unlinkReason IS NOT NULL AND
+       unlinkedActorKind IS NOT NULL AND unlinkedActorRef IS NOT NULL AND
+       typeof(unlinkedAt) = 'integer' AND unlinkedAt >= linkedAt AND
+       length(trim(unlinkReason)) BETWEEN 1 AND 4000 AND
+       unlinkedActorKind IN ('user','session') AND length(trim(unlinkedActorRef)) > 0)
+    )
+  );
+
+  CREATE UNIQUE INDEX IF NOT EXISTS topline_memberships_active_pair
+    ON topline_work_memberships (toplineId, workItemId)
+    WHERE unlinkedAt IS NULL;
+  CREATE UNIQUE INDEX IF NOT EXISTS topline_memberships_id_topline
+    ON topline_work_memberships (id, toplineId);
+  CREATE INDEX IF NOT EXISTS topline_memberships_work_active
+    ON topline_work_memberships (workItemId)
+    WHERE unlinkedAt IS NULL;
+
+  CREATE TABLE IF NOT EXISTS topline_events (
+    toplineId   TEXT NOT NULL REFERENCES toplines(id),
+    seq         INTEGER NOT NULL CHECK (typeof(seq) = 'integer' AND seq >= 1),
+    kind        TEXT NOT NULL CHECK (kind IN ('topline_created','work_linked','work_unlinked')),
+    membershipId TEXT,
+    actorKind   TEXT NOT NULL CHECK (actorKind IN ('user','session')),
+    actorRef    TEXT NOT NULL CHECK (length(trim(actorRef)) > 0),
+    reason      TEXT,
+    eventAt     INTEGER NOT NULL CHECK (typeof(eventAt) = 'integer'),
+    detail      TEXT NOT NULL CHECK (json_valid(detail) AND json_type(detail) = 'object'),
+    PRIMARY KEY (toplineId, seq),
+    FOREIGN KEY (membershipId, toplineId)
+      REFERENCES topline_work_memberships(id, toplineId),
+    CHECK (
+      (kind = 'topline_created' AND membershipId IS NULL AND reason IS NULL) OR
+      (kind IN ('work_linked','work_unlinked') AND membershipId IS NOT NULL AND
+       length(trim(reason)) BETWEEN 1 AND 4000)
+    )
+  );
+
+  CREATE TABLE IF NOT EXISTS topline_idempotency (
+    callerUserId       TEXT NOT NULL REFERENCES users(userId),
+    operation          TEXT NOT NULL CHECK (operation IN ('topline-create','topline-link-work','topline-unlink-work')),
+    idempotencyKey     TEXT NOT NULL CHECK (length(trim(idempotencyKey)) BETWEEN 1 AND 200),
+    requestFingerprint TEXT NOT NULL CHECK (length(requestFingerprint) = 64),
+    canonicalResponse  TEXT NOT NULL CHECK (json_valid(canonicalResponse)),
+    PRIMARY KEY (callerUserId, operation, idempotencyKey)
+  );
   """
+
+  @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
+  def ensure_schema(db \\ Tightbeam.DB), do: DB.execute(db, @ddl)
+
+  @doc false
+  def __handle__(db, "topline-create", call), do: create(db, call)
+  def __handle__(db, "topline-link-work", call), do: link_work(db, call)
+  def __handle__(db, "topline-unlink-work", call), do: unlink_work(db, call)
+  def __handle__(db, "toplines", call), do: list(db, call)
+  def __handle__(db, "topline", call), do: get(db, call)
+
   @spec roster(DB.server(), map()) :: map()
-  def roster(db, call) do
-    world = world(db, call)
-    appearing = appearing(world, call.params)
+  defdelegate roster(db, call), to: Tightbeam.ExecutionMap
 
-    if truthy?(call.params[:tree]) do
-      forest(world, appearing)
-    else
-      Map.put(envelope(world), :items, Enum.map(appearing, &node(world, &1)))
-    end
-  end
-
-  @doc """
-  The `topline` verb: `--under <id>` (a causal subtree) or `--assignments
-  <id,...>` (explicit assignment-set selection). Exactly one is required.
-  """
   @spec topline(DB.server(), map()) :: map()
-  def topline(db, call) do
-    params = call.params
+  defdelegate topline(db, call), to: Tightbeam.ExecutionMap
 
-    cond do
-      is_binary(params[:under]) and params[:under] != "" and
-          not is_nil(params[:assignments]) ->
-        invalid("--under and --assignments are mutually exclusive")
+  @spec create(DB.server(), map()) :: map()
+  def create(db, call) do
+    params = Map.get(call, :params, %{})
 
-      is_binary(params[:under]) and params[:under] != "" ->
-        under(world(db, call), params, params[:under])
+    with {:ok, caller} <- caller(db, Map.get(call, :principal)),
+         :ok <- valid_shape(params, [:idempotency_key, :title]),
+         {:ok, title} <- canonical_title(param(params, :title)),
+         :ok <- valid_key(param(params, :idempotency_key)) do
+      operation = "topline-create"
+      key = param(params, :idempotency_key)
+      fingerprint = fingerprint(operation, %{title: title})
 
-      not is_nil(params[:assignments]) ->
-        assignment_selection(world(db, call), params[:assignments])
+      transaction!(db, fn txn ->
+        with {:ok, caller} <- reauthorize(txn, caller) do
+          case replay(txn, caller.user, operation, key, fingerprint) do
+            {:ok, response} ->
+              response
 
-      true ->
-        invalid("topline requires --under <workItemId> or --assignments <id,...>")
-    end
-  end
+            :conflict ->
+              error("idempotency_conflict", "idempotency key conflicts with a prior request")
 
-  ## --under — the anchor plus its transitive visible linked descendants
+            :new ->
+              now = mutation_time(call)
+              topline_id = id("tl_")
 
-  defp under(world, params, anchor) do
-    # Unknown and invisible anchors are the same answer: the candidate set is
-    # built from the VISIBLE nodes only, so an anchor absent from it never
-    # reaches a lookup that could distinguish the two.
-    if Map.has_key?(world.items_by_id, anchor) do
-      candidates = descendants(world, anchor)
+              Txn.q(
+                txn,
+                """
+                INSERT INTO toplines
+                  (id, ownerUserId, title, state, createdActorKind, createdActorRef,
+                   createdAt, updatedAt, closedAt)
+                VALUES (?1, ?2, ?3, 'open', ?4, ?5, ?6, ?6, NULL)
+                """,
+                [topline_id, caller.user, title, caller.actor_kind, caller.actor_ref, now]
+              )
 
-      world
-      |> Map.put(:items, Enum.filter(world.items, &MapSet.member?(candidates, &1.id)))
-      |> forest_of(params)
-    else
-      not_found("work item not found")
-    end
-  end
+              append_event(txn, topline_id, "topline_created", nil, caller, nil, now, %{
+                title: title
+              })
 
-  defp forest_of(world, params), do: forest(world, appearing(world, params))
-
-  # Children-of relation over the retained (post-cycle-drop) linked edges. A
-  # cycle among the descendants terminates because the dropped edge is already
-  # absent from `world.linked`.
-  defp descendants(world, anchor) do
-    children = children_index(world)
-    collect([anchor], children, MapSet.new([anchor]))
-  end
-
-  defp collect([], _children, seen), do: seen
-
-  defp collect([id | rest], children, seen) do
-    next = children |> Map.get(id, []) |> Enum.reject(&MapSet.member?(seen, &1))
-    collect(rest ++ next, children, Enum.reduce(next, seen, &MapSet.put(&2, &1)))
-  end
-
-  defp children_index(world) do
-    Enum.group_by(world.linked, fn {_child, parent} -> parent end, fn {child, _parent} ->
-      child
-    end)
-  end
-
-  ## --assignments — explicit selection, all-or-nothing on unknown/invisible
-
-  defp assignment_selection(world, raw) do
-    case selected_ids(raw) do
-      [] ->
-        invalid("--assignments requires at least one assignment id")
-
-      ids ->
-        case classify(world, ids, [], []) do
-          :not_found ->
-            # An unknown id and an id this caller may not see are ONE answer;
-            # a visible NONE id is substrate truth and uses `no_item`.
-            not_found("assignment not found")
-
-          {items, no_item} ->
-            selected =
-              world.items
-              |> Enum.filter(&MapSet.member?(MapSet.new(items), &1.id))
-              |> Enum.map(&node(world, &1))
-
-            envelope(world)
-            |> Map.put(:items, selected)
-            |> Map.put(:no_item, Enum.sort(no_item))
+              response = %{topline: summary_in_txn(txn, topline_id)}
+              remember(txn, caller.user, operation, key, fingerprint, response)
+              response
+          end
         end
+      end)
     end
   end
 
-  defp classify(_world, [], items, no_item), do: {Enum.uniq(items), Enum.uniq(no_item)}
+  @spec link_work(DB.server(), map()) :: map()
+  def link_work(db, call) do
+    params = Map.get(call, :params, %{})
 
-  defp classify(world, [id | rest], items, no_item) do
-    case Map.fetch(world.assignments_by_id, id) do
-      :error ->
-        :not_found
+    with {:ok, caller} <- caller(db, Map.get(call, :principal)),
+         :ok <- valid_shape(params, [:idempotency_key, :reason, :topline_id, :work_item_id]),
+         :ok <- valid_id(param(params, :topline_id), "tl_"),
+         :ok <- valid_id(param(params, :work_item_id), "wi_"),
+         :ok <- valid_reason(param(params, :reason)),
+         :ok <- valid_key(param(params, :idempotency_key)) do
+      operation = "topline-link-work"
+      topline_id = param(params, :topline_id)
+      work_item_id = param(params, :work_item_id)
+      reason = param(params, :reason)
+      key = param(params, :idempotency_key)
 
-      {:ok, assignment} ->
-        case Map.get(world.resolved, id) do
-          nil ->
-            if assignment_detail_visible?(world, assignment),
-              do: classify(world, rest, items, [id | no_item]),
-              else: :not_found
+      fingerprint =
+        fingerprint(operation, %{
+          reason: reason,
+          toplineId: topline_id,
+          workItemId: work_item_id
+        })
 
-          item_id ->
-            if Map.has_key?(world.items_by_id, item_id),
-              do: classify(world, rest, [item_id | items], no_item),
-              else: :not_found
+      transaction!(db, fn txn ->
+        with {:ok, caller} <- reauthorize(txn, caller),
+             {:ok, topline} <- visible_topline(txn, topline_id, caller),
+             {:ok, work_item} <- visible_work_item(txn, work_item_id, caller),
+             :ok <- same_owner(topline, work_item) do
+          case replay(txn, caller.user, operation, key, fingerprint) do
+            {:ok, response} ->
+              response
+
+            :conflict ->
+              error("idempotency_conflict", "idempotency key conflicts with a prior request")
+
+            :new ->
+              cond do
+                topline.state != "open" ->
+                  error("topline_closed", "topline is closed")
+
+                active_membership?(txn, topline_id, work_item_id) ->
+                  error("membership_exists", "active membership already exists")
+
+                true ->
+                  now = mutation_time(call)
+                  membership_id = id("tlm_")
+
+                  Txn.q(
+                    txn,
+                    """
+                    INSERT INTO topline_work_memberships
+                      (id, toplineId, workItemId, ownerUserId, linkReason,
+                       linkedActorKind, linkedActorRef, linkedAt)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                    """,
+                    [
+                      membership_id,
+                      topline_id,
+                      work_item_id,
+                      topline.owner_user_id,
+                      reason,
+                      caller.actor_kind,
+                      caller.actor_ref,
+                      now
+                    ]
+                  )
+
+                  touch_topline(txn, topline_id, now)
+
+                  append_event(
+                    txn,
+                    topline_id,
+                    "work_linked",
+                    membership_id,
+                    caller,
+                    reason,
+                    now,
+                    %{workItemId: work_item_id, linkReason: reason}
+                  )
+
+                  response = %{
+                    membership: membership_in_txn(txn, membership_id),
+                    resolvedPlacementId: nil
+                  }
+
+                  remember(txn, caller.user, operation, key, fingerprint, response)
+                  response
+              end
+          end
         end
+      end)
     end
   end
 
-  # The assignment-detail rule for a NONE assignment: admin, or a caller who
-  # owns the assignment's holder session.
-  defp assignment_detail_visible?(%{caller: nil}, _assignment), do: false
-  defp assignment_detail_visible?(%{caller: %{admin: true}}, _assignment), do: true
+  @spec unlink_work(DB.server(), map()) :: map()
+  def unlink_work(db, call) do
+    params = Map.get(call, :params, %{})
 
-  defp assignment_detail_visible?(world, assignment) do
-    Map.get(world.session_owners, assignment.holder_key) == world.caller.owner
-  end
+    with {:ok, caller} <- caller(db, Map.get(call, :principal)),
+         :ok <- valid_shape(params, [:idempotency_key, :membership_id, :reason]),
+         :ok <- valid_id(param(params, :membership_id), "tlm_"),
+         :ok <- valid_reason(param(params, :reason)),
+         :ok <- valid_key(param(params, :idempotency_key)) do
+      operation = "topline-unlink-work"
+      membership_id = param(params, :membership_id)
+      reason = param(params, :reason)
+      key = param(params, :idempotency_key)
+      fingerprint = fingerprint(operation, %{membershipId: membership_id, reason: reason})
 
-  # Duplicate ids collapse; blank entries are not ids. `--assignments` arrives
-  # from the CLI as a list of strings.
-  defp selected_ids(raw) when is_list(raw) do
-    raw |> Enum.filter(&(is_binary(&1) and &1 != "")) |> Enum.uniq()
-  end
+      transaction!(db, fn txn ->
+        with {:ok, caller} <- reauthorize(txn, caller),
+             {:ok, membership} <- visible_membership(txn, membership_id, caller) do
+          case replay(txn, caller.user, operation, key, fingerprint) do
+            {:ok, response} ->
+              response
 
-  defp selected_ids(raw) when is_binary(raw) do
-    raw |> String.split(",") |> Enum.map(&String.trim/1) |> selected_ids()
-  end
+            :conflict ->
+              error("idempotency_conflict", "idempotency key conflicts with a prior request")
 
-  defp selected_ids(_raw), do: []
+            :new ->
+              if membership.unlinked_at do
+                error("membership_ended", "membership is already ended")
+              else
+                now = mutation_time(call)
 
-  ## Forest assembly — nesting exists only among APPEARING nodes
+                Txn.q(
+                  txn,
+                  """
+                  UPDATE topline_work_memberships
+                  SET unlinkReason = ?2, unlinkedActorKind = ?3,
+                      unlinkedActorRef = ?4, unlinkedAt = ?5
+                  WHERE id = ?1 AND unlinkedAt IS NULL
+                  """,
+                  [membership_id, reason, caller.actor_kind, caller.actor_ref, now]
+                )
 
-  defp forest(world, appearing) do
-    appearing_ids = MapSet.new(appearing, & &1.id)
+                touch_topline(txn, membership.topline_id, now)
 
-    nodes = Map.new(appearing, &{&1.id, node(world, &1)})
+                append_event(
+                  txn,
+                  membership.topline_id,
+                  "work_unlinked",
+                  membership_id,
+                  caller,
+                  reason,
+                  now,
+                  %{workItemId: membership.work_item_id, unlinkReason: reason}
+                )
 
-    # A child whose linked parent is caller-visible but filter-excluded appears
-    # top-level and KEEPS `parent: {status: "linked", item: <parent-id>}`. No
-    # placeholder is emitted and the excluded parent is never pulled in.
-    children =
-      appearing
-      |> Enum.filter(fn item ->
-        parent = Map.get(world.linked, item.id)
-        not is_nil(parent) and MapSet.member?(appearing_ids, parent)
+                response = %{
+                  endedConcernReferenceIds: [],
+                  membership: membership_in_txn(txn, membership_id),
+                  openedPlacement: nil
+                }
+
+                remember(txn, caller.user, operation, key, fingerprint, response)
+                response
+              end
+          end
+        end
       end)
-      |> Enum.group_by(&Map.get(world.linked, &1.id))
-
-    roots =
-      Enum.reject(appearing, fn item ->
-        parent = Map.get(world.linked, item.id)
-        not is_nil(parent) and MapSet.member?(appearing_ids, parent)
-      end)
-
-    Map.put(envelope(world), :roots, Enum.map(roots, &nest(&1, nodes, children)))
+    end
   end
 
-  defp nest(item, nodes, children) do
-    kids = children |> Map.get(item.id, []) |> Enum.map(&nest(&1, nodes, children))
-    Map.put(Map.fetch!(nodes, item.id), :children, kids)
+  @spec list(DB.server(), map()) :: map()
+  def list(db, call) do
+    params = Map.get(call, :params, %{})
+
+    with {:ok, caller} <- caller(db, Map.get(call, :principal)),
+         :ok <- valid_shape(params, [:state], optional: [:state]),
+         {:ok, state} <- list_state(param(params, :state)) do
+      {owner_sql, owner_params} = owner_filter(caller, "t")
+      {state_sql, state_params} = state_filter(state, length(owner_params) + 1)
+
+      {:ok, rows} =
+        DB.query(
+          db,
+          summary_sql("WHERE 1 = 1 #{owner_sql} #{state_sql} ORDER BY t.createdAt ASC, t.id ASC"),
+          owner_params ++ state_params
+        )
+
+      %{toplines: Enum.map(rows, &summary/1)}
+    end
   end
 
-  defp envelope(world) do
+  @spec get(DB.server(), map()) :: map()
+  def get(db, call) do
+    params = Map.get(call, :params, %{})
+
+    with {:ok, caller} <- caller(db, Map.get(call, :principal)),
+         :ok <- valid_shape(params, [:history, :topline_id], optional: [:history]),
+         :ok <- valid_id(param(params, :topline_id), "tl_"),
+         :ok <- valid_history(param(params, :history)) do
+      topline_id = param(params, :topline_id)
+      {owner_sql, owner_params} = owner_filter(caller, "t")
+
+      {:ok, rows} =
+        DB.query(
+          db,
+          summary_sql("WHERE t.id = ?1 #{shifted_owner_filter(owner_sql, 1)}"),
+          [topline_id | owner_params]
+        )
+
+      case rows do
+        [] ->
+          error("not_found", "record not found")
+
+        [row] ->
+          detail =
+            row
+            |> summary()
+            |> Map.put(:workMemberships, active_memberships(db, topline_id))
+            |> Map.put(:concerns, [])
+
+          detail =
+            if param(params, :history) == true,
+              do: Map.put(detail, :history, history(db, topline_id)),
+              else: detail
+
+          %{topline: detail}
+      end
+    end
+  end
+
+  defp summary_sql(where) do
+    """
+    SELECT t.id, t.ownerUserId, t.title, t.state, t.createdActorKind,
+           t.createdActorRef, t.createdAt, t.updatedAt, t.closedAt,
+           (SELECT COUNT(*) FROM topline_work_memberships m
+            WHERE m.toplineId = t.id AND m.unlinkedAt IS NULL)
+    FROM toplines t
+    #{where}
+    """
+  end
+
+  defp summary_in_txn(txn, topline_id) do
+    [row] = Txn.q(txn, summary_sql("WHERE t.id = ?1"), [topline_id])
+    summary(row)
+  end
+
+  defp summary([id, owner, title, state, actor_kind, actor_ref, created, updated, closed, count]) do
     %{
-      edge_basis: @edge_basis,
-      coverage: %{attribution_cutoff: world.cutoff, basis: @coverage_basis}
+      id: id,
+      ownerUserId: owner,
+      title: title,
+      state: state,
+      createdActor: actor(actor_kind, actor_ref),
+      createdAt: created,
+      updatedAt: updated,
+      closedAt: closed,
+      activeWorkCount: count,
+      openConcernCount: 0
     }
   end
 
-  ## Roster filters — they select which authorized nodes APPEAR, nothing else
-
-  defp appearing(world, params) do
-    Enum.filter(world.items, fn item ->
-      origin_match?(item, params[:origin]) and
-        owner_match?(item, params[:owner]) and
-        state_match?(item, params[:state]) and
-        spec_match?(item, params[:spec], params[:spec_sha]) and
-        session_match?(item, params[:session]) and
-        quiet_match?(world, item, params[:quiet_over])
-    end)
-  end
-
-  defp origin_match?(item, "user"), do: principal(item) == "user"
-  defp origin_match?(item, "session"), do: principal(item) == "session"
-  defp origin_match?(_item, _all), do: true
-
-  defp owner_match?(_item, nil), do: true
-  defp owner_match?(item, owner) when is_binary(owner), do: item.owner_user_id == owner
-  defp owner_match?(_item, _owner), do: true
-
-  defp state_match?(_item, nil), do: true
-  defp state_match?(item, state) when is_binary(state), do: item.state == state
-  defp state_match?(_item, _state), do: true
-
-  defp spec_match?(_item, nil, _sha), do: true
-
-  defp spec_match?(item, name, sha) when is_binary(name) do
-    item.spec_ref_name == name and (is_nil(sha) or item.spec_ref_sha256 == sha)
-  end
-
-  defp spec_match?(_item, _name, _sha), do: true
-
-  defp session_match?(_item, nil), do: true
-
-  defp session_match?(item, session) when is_binary(session),
-    do: item.created_by_session == session
-
-  defp session_match?(_item, _session), do: true
-
-  # `--quiet-over` is a compound predicate, not a clock comparison: an item with
-  # a running turn or a pending prompt wake on a current holder is NOT quiet
-  # however old its last progress event is.
-  defp quiet_match?(_world, _item, nil), do: true
-
-  defp quiet_match?(world, item, bound) when is_number(bound) do
-    telemetry = node(world, item)
-
-    telemetry.since_progress_ms > bound and telemetry.active.running_turn == false and
-      telemetry.active.pending_session_wake == false
-  end
-
-  defp quiet_match?(_world, _item, _bound), do: true
-
-  ## Per-node telemetry
-
-  defp node(world, item) do
-    set = Map.get(world.by_item, item.id, [])
-    union = turn_union(world, item.id, set)
-    holders = current_holders(world, set)
-    pre_cutoff? = item.created_at < world.cutoff
-
-    %{
-      id: item.id,
-      title: item.title,
-      spec_ref_name: item.spec_ref_name,
-      spec_ref_sha256: item.spec_ref_sha256,
-      state: item.state,
-      fail_reason: item.fail_reason,
-      bracket1_armed: not is_nil(item.routing_wake_id),
-      origin: %{principal: principal(item), created_by: created_by(item)},
-      creation_context: %{recorded: item.context_known, turn_seq: item.created_in_turn_seq},
-      parent: Map.fetch!(world.parents, item.id),
-      finished_at: finished_at(world, item),
-      assignments: assignment_counts(world, set),
-      jobs: jobs(world, set),
-      attests: attests(world, set),
-      started_at: started_at(world, set),
-      closing_attests: closing_attests(world, set),
-      open_decision_requests: open_decision_requests(world, set),
-      # COVERAGE: turn attribution, mind stamps and marker attribution shipped
-      # as nullable ALTERs with no per-row stamp, so for an item older than the
-      # one conservative shared epoch a zero here would be a claim the rows
-      # cannot support. Absence is UNKNOWN, so it reports null, never 0.
-      turns:
-        if(pre_cutoff?,
-          do: %{total: nil, last_ended_at: nil},
-          else: %{total: length(union), last_ended_at: last_ended_at(union)}
+  defp active_memberships(db, topline_id) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        membership_sql(
+          "WHERE m.toplineId = ?1 AND m.unlinkedAt IS NULL ORDER BY m.linkedAt ASC, m.id ASC"
         ),
-      minds: unless(pre_cutoff?, do: minds(union)),
-      fan_out: unless(pre_cutoff?, do: fan_out(world, set)),
-      # THE ONE RESIDUAL OVERCLAIM in this response, and a considered limit
-      # rather than an oversight: `running_turn` stays BOOLEAN for a pre-cutoff
-      # item, so an old item whose turns were never attributed reports `false` on
-      # absent evidence. The coverage null rule is scoped to COUNTS, and
-      # `--quiet-over` is defined against `running_turn = false` — nulling it here
-      # would silently drop every pre-cutoff item out of `--quiet-over`, which is
-      # the worse failure. `pending_session_wake` carries no such caveat: it is
-      # session-keyed through durable assignment columns.
-      active: %{
-        running_turn: Enum.any?(union, &(&1.status == "running")),
-        pending_session_wake: pending_session_wake?(world, holders)
-      },
-      since_progress_ms: world.now - anchor(world, item, set, union)
-    }
+        [topline_id]
+      )
+
+    Enum.map(rows, &membership/1)
   end
 
-  defp principal(%{created_by_user: user}) when is_binary(user), do: "user"
-  defp principal(_item), do: "session"
-
-  defp created_by(%{created_by_user: user}) when is_binary(user), do: user
-  defp created_by(%{created_by_session: session}), do: session
-
-  # The timestamp of the LATEST disposition_transition whose `toState` equals the
-  # item's CURRENT terminal state. Null for an open item even with prior
-  # transitions, and null for a terminal item with no matching event.
-  defp finished_at(_world, %{state: state}) when state not in @terminal_states, do: nil
-
-  defp finished_at(world, item) do
-    world.dispositions
-    |> Map.get(item.id, [])
-    |> Enum.filter(&(&1.to_state == item.state))
-    |> Enum.max_by(& &1.seq, fn -> nil end)
-    |> then(fn
-      nil -> nil
-      event -> event.at
-    end)
+  defp membership_in_txn(txn, membership_id) do
+    [row] = Txn.q(txn, membership_sql("WHERE m.id = ?1"), [membership_id])
+    membership(row)
   end
 
-  defp assignment_counts(world, set) do
-    rows = rows_for(world.assignments_by_id, set)
-    closed = Enum.filter(rows, &(&1.state == "closed"))
+  defp membership_sql(where) do
+    """
+    SELECT m.id, m.toplineId, m.workItemId, m.ownerUserId, m.linkReason,
+           m.linkedActorKind, m.linkedActorRef, m.linkedAt, m.unlinkReason,
+           m.unlinkedActorKind, m.unlinkedActorRef, m.unlinkedAt,
+           wi.title, wi.state
+    FROM topline_work_memberships m
+    JOIN work_items wi ON wi.id = m.workItemId
+    #{where}
+    """
+  end
 
+  defp membership([
+         id,
+         topline_id,
+         work_item_id,
+         owner,
+         link_reason,
+         linked_kind,
+         linked_ref,
+         linked_at,
+         unlink_reason,
+         unlinked_kind,
+         unlinked_ref,
+         unlinked_at,
+         work_title,
+         work_state
+       ]) do
     %{
-      open: Enum.count(rows, &(&1.state == "open")),
-      closed: length(closed),
-      by_outcome: %{
-        completed: Enum.count(closed, &(&1.outcome == "completed")),
-        surrendered: Enum.count(closed, &(&1.outcome == "surrendered")),
-        revoked: Enum.count(closed, &(&1.outcome == "revoked"))
-      }
+      id: id,
+      toplineId: topline_id,
+      workItemId: work_item_id,
+      ownerUserId: owner,
+      linkReason: link_reason,
+      linkedActor: actor(linked_kind, linked_ref),
+      linkedAt: linked_at,
+      unlinkReason: unlink_reason,
+      unlinkedActor: actor(unlinked_kind, unlinked_ref),
+      unlinkedAt: unlinked_at,
+      workItemTitle: work_title,
+      workItemState: work_state
     }
   end
 
-  # EVER held, closed assignments included — a history count, not a
-  # current-holder count.
-  defp jobs(world, set) do
-    world.assignments_by_id
-    |> rows_for(set)
-    |> Enum.map(& &1.holder_key)
-    |> Enum.uniq()
-    |> length()
-  end
-
-  # Verdict slugs are shape-validated only; there is no durable
-  # approved/rejected taxonomy, so they are reported as stored. Collapsing them
-  # would invent a classification the rows do not carry.
-  defp attests(world, set) do
-    rows = Enum.flat_map(set, &Map.get(world.attests_by_assignment, &1, []))
-
-    %{
-      total: length(rows),
-      by_kind: tally(rows, & &1.kind),
-      by_verdict_kind: rows |> Enum.reject(&is_nil(&1.verdict_kind)) |> tally(& &1.verdict_kind)
-    }
-  end
-
-  defp started_at(world, set) do
-    world.assignments_by_id
-    |> rows_for(set)
-    |> Enum.map(& &1.opened_at)
-    |> Enum.min(fn -> nil end)
-  end
-
-  # Completed and surrendered closes REQUIRE a non-null closingAttestId; revoked
-  # requires it to be null. A revoked close is therefore represented only in
-  # `assignments.by_outcome.revoked`.
-  defp closing_attests(world, set) do
-    world.assignments_by_id
-    |> rows_for(set)
-    |> Enum.filter(&(&1.outcome in ["completed", "surrendered"] and &1.closing_attest_id))
-    |> Enum.sort_by(& &1.id)
-    |> Enum.map(fn assignment ->
-      %{
-        assignmentId: assignment.id,
-        attestId: assignment.closing_attest_id,
-        commitRefs: Map.get(world.commit_refs, assignment.closing_attest_id)
-      }
-    end)
-  end
-
-  defp open_decision_requests(world, set) do
-    Enum.reduce(set, 0, &(&2 + Map.get(world.open_requests, &1, 0)))
-  end
-
-  ## The turn union — either attribution arm alone undercounts
-
-  # A bracket nag may carry only `jobRef`; a review turn may carry only
-  # `assignmentId`. `seq` is the primary key, so uniq_by/2 deduping a turn that
-  # carries BOTH keys is exact.
-  defp turn_union(world, item_id, set) do
-    (Map.get(world.turns_by_job_ref, item_id, []) ++
-       Enum.flat_map(set, &Map.get(world.turns_by_assignment, &1, [])))
-    |> Enum.uniq_by(& &1.seq)
-  end
-
-  defp last_ended_at(union) do
-    union |> Enum.map(& &1.ended_at) |> Enum.reject(&is_nil/1) |> Enum.max(fn -> nil end)
-  end
-
-  # The mind is stamped when a queued turn is CLAIMED, so an unclaimed turn has
-  # no mind: a fully-null pair is the absence of a stamp, not a mind.
-  defp minds(union) do
-    union
-    |> Enum.map(&%{model: &1.model, context: &1.context, effort: &1.effort, harness: &1.harness})
-    |> Enum.reject(&(is_nil(&1.model) and is_nil(&1.harness)))
-    |> Enum.uniq()
-    |> Enum.sort_by(&{&1.model || "", &1.context || "", &1.effort || "", &1.harness || ""})
-  end
-
-  defp fan_out(world, set) do
-    set
-    |> Enum.flat_map(&Map.get(world.markers_by_assignment, &1, []))
-    |> Enum.uniq()
-    |> length()
-  end
-
-  ## Current-holder state — a stale ex-holder marks nothing active
-
-  # A holder is CURRENT only while it owns an OPEN resolved assignment.
-  defp current_holders(world, set) do
-    world.assignments_by_id
-    |> rows_for(set)
-    |> Enum.filter(&(&1.state == "open"))
-    |> Enum.map(& &1.holder_key)
-    |> Enum.uniq()
-  end
-
-  # Supervision gates the CURRENT open holder at turn end, and wake suppression
-  # is session-keyed across all pending prompt wakes — so this is not the set of
-  # item-attributed wakes.
-  defp pending_session_wake?(world, holders) do
-    Enum.any?(holders, &MapSet.member?(world.pending_wake_sessions, &1))
-  end
-
-  ## The progress clock
-
-  # A scheduled wake or a fired prod is NOT progress. The anchor is the maximum
-  # of every known progress timestamp and the coverage baseline, so an older
-  # item's clock can never claim quiet time from before attribution was
-  # knowable. Pre-epoch attests are not discarded — filing one resets the clock,
-  # subject to the same floor.
-  defp anchor(world, item, set, union) do
-    ended = union |> Enum.map(& &1.ended_at) |> Enum.reject(&is_nil/1)
-
-    attested =
-      Enum.flat_map(set, fn id ->
-        Enum.map(Map.get(world.attests_by_assignment, id, []), & &1.ts)
-      end)
-
-    disposed = world.dispositions |> Map.get(item.id, []) |> Enum.map(& &1.at)
-
-    Enum.max([max(item.created_at, world.cutoff) | ended ++ attested ++ disposed])
-  end
-
-  ## Parent derivation — total over missing, legacy and corrupt rows
-
-  # The four statuses are exhaustive and mutually exclusive, and `linked` is the
-  # only one that names an item.
-  defp parents(items, linked) do
-    Map.new(items, fn item ->
-      status =
-        cond do
-          not item.context_known -> %{status: "unrecorded", item: nil}
-          is_nil(item.created_in_turn_seq) -> %{status: "no_turn_observed", item: nil}
-          parent = Map.get(linked, item.id) -> %{status: "linked", item: parent}
-          # `from_turn` absorbs a conversational turn, an assignment resolving to
-          # NONE, a missing turn row, an authorization-hidden parent, and a
-          # cycle-closing edge that had to be dropped. The status is the
-          # load-bearing field; the caller cannot tell these apart, by design.
-          true -> %{status: "from_turn", item: nil}
-        end
-
-      {item.id, status}
-    end)
-  end
-
-  # Candidate edges are AUTHORIZATION-FILTERED before traversal: a visible child
-  # of an invisible parent is indistinguishable from the conversational-turn
-  # case. Appearance filters do not participate — a filter-excluded but visible
-  # parent stays nameable in the child's block.
-  defp candidate_edges(items, items_by_id, turns_by_seq, resolved) do
-    for item <- items,
-        item.context_known,
-        seq = item.created_in_turn_seq,
-        not is_nil(seq),
-        turn = Map.get(turns_by_seq, seq),
-        candidate = candidate_parent(turn, resolved),
-        not is_nil(candidate),
-        Map.has_key?(items_by_id, candidate),
-        into: %{} do
-      {item.id, candidate}
-    end
-  end
-
-  # 1. the turn's `jobRef` when set — bracket nags and item-attributed turns
-  #    carry the work-item id without an assignment;
-  # 2. otherwise the turn assignment's RESOLVED item;
-  # 3. otherwise no edge.
-  defp candidate_parent(nil, _resolved), do: nil
-  defp candidate_parent(%{job_ref: job_ref}, _resolved) when is_binary(job_ref), do: job_ref
-
-  defp candidate_parent(%{assignment_id: assignment_id}, resolved) when is_binary(assignment_id),
-    do: Map.get(resolved, assignment_id)
-
-  defp candidate_parent(_turn, _resolved), do: nil
-
-  # Traversal in canonical node order with a CURRENT-ANCESTRY visited set. An
-  # edge whose target is already on that ancestry is the cycle-closing edge and
-  # is dropped — from the traversal AND from the source node's parent block, so
-  # a corrupt self-parent yields neither an edge nor a `linked`-to-self.
-  #
-  # Each node has at most one candidate parent, so the candidate graph is
-  # functional: every cycle is simple and disjoint, and dropping the one edge
-  # that closes it leaves a forest.
-  defp retain_acyclic(items, candidates) do
-    {dropped, _settled} =
-      Enum.reduce(items, {MapSet.new(), MapSet.new()}, fn item, {dropped, settled} ->
-        if MapSet.member?(settled, item.id) do
-          {dropped, settled}
-        else
-          walk(item.id, candidates, dropped, settled, MapSet.new())
-        end
-      end)
-
-    Map.reject(candidates, fn {child, _parent} -> MapSet.member?(dropped, child) end)
-  end
-
-  defp walk(id, candidates, dropped, settled, ancestry) do
-    settled = MapSet.put(settled, id)
-    ancestry = MapSet.put(ancestry, id)
-
-    case Map.get(candidates, id) do
-      nil ->
-        {dropped, settled}
-
-      parent ->
-        cond do
-          MapSet.member?(ancestry, parent) -> {MapSet.put(dropped, id), settled}
-          # A chain merging into already-explored territory can close no new
-          # cycle: that node's whole upward chain was resolved by an earlier walk.
-          MapSet.member?(settled, parent) -> {dropped, settled}
-          true -> walk(parent, candidates, dropped, settled, ancestry)
-        end
-    end
-  end
-
-  ## The world — every row this read needs, loaded once
-
-  defp world(db, call) do
-    caller = caller(db, Map.get(call, :principal))
-    cutoff = CausalEvents.epoch(db)
-    items = visible_items(db, caller)
-    items_by_id = Map.new(items, &{&1.id, &1})
-
-    assignments = all_assignments(db)
-    assignments_by_id = Map.new(assignments, &{&1.id, &1})
-    resolved = resolve_all(assignments, assignments_by_id)
-    by_item = membership(resolved, items_by_id)
-
-    turns = all_turns(db)
-    turns_by_seq = Map.new(turns, &{&1.seq, &1})
-
-    linked = retain_acyclic(items, candidate_edges(items, items_by_id, turns_by_seq, resolved))
-
-    %{
-      now: Map.get(call, :now) || System.system_time(:millisecond),
-      caller: caller,
-      cutoff: cutoff,
-      items: items,
-      items_by_id: items_by_id,
-      assignments_by_id: assignments_by_id,
-      resolved: resolved,
-      by_item: by_item,
-      turns_by_job_ref: index_turns(turns, & &1.job_ref),
-      turns_by_assignment: index_turns(turns, & &1.assignment_id),
-      linked: linked,
-      parents: parents(items, linked),
-      attests_by_assignment: attests_by_assignment(db),
-      commit_refs: commit_refs(db),
-      markers_by_assignment: markers_by_assignment(db),
-      open_requests: open_requests(db),
-      pending_wake_sessions: pending_wake_sessions(db),
-      dispositions: dispositions(db),
-      session_owners: session_owners(db)
-    }
-  end
-
-  # An item node is visible under the existing `work-item-trace` owner-or-admin
-  # rule. Invisible nodes are omitted ENTIRELY: no value, total, count, order,
-  # marker, id, flag or nesting choice may depend on their existence.
-  defp visible_items(_db, nil), do: []
-
-  defp visible_items(db, caller) do
-    {sql, params} =
-      if caller.admin,
-        do: {"", []},
-        else: {" WHERE ownerUserId = ?1", [caller.owner]}
-
+  defp history(db, topline_id) do
     {:ok, rows} =
       DB.query(
         db,
         """
-        SELECT id, title, ownerUserId, state, failReason, specRefName, specRefSha256,
-               routingWakeId, createdByUser, createdBySession, createdInTurnSeq,
-               createdContextKnown, createdAt
-        FROM work_items#{sql}
-        ORDER BY createdAt ASC, id ASC
+        SELECT toplineId, seq, kind, membershipId, actorKind, actorRef,
+               reason, eventAt, detail
+        FROM topline_events
+        WHERE toplineId = ?1
+        ORDER BY seq ASC
         """,
-        params
+        [topline_id]
       )
 
-    Enum.map(rows, fn [
-                        id,
-                        title,
-                        owner,
-                        state,
-                        fail_reason,
-                        spec_name,
-                        spec_sha,
-                        routing_wake_id,
-                        created_by_user,
-                        created_by_session,
-                        created_in_turn_seq,
-                        context_known,
-                        created_at
-                      ] ->
-      %{
-        id: id,
-        title: title,
-        owner_user_id: owner,
-        state: state,
-        fail_reason: fail_reason,
-        spec_ref_name: spec_name,
-        spec_ref_sha256: spec_sha,
-        routing_wake_id: routing_wake_id,
-        created_by_user: created_by_user,
-        created_by_session: created_by_session,
-        created_in_turn_seq: created_in_turn_seq,
-        context_known: context_known == 1,
-        created_at: created_at
-      }
-    end)
+    Enum.map(rows, &event/1)
   end
 
-  defp all_assignments(db) do
-    {:ok, rows} =
-      DB.query(db, """
-      SELECT id, workItemId, reviewsAssignmentId, holderKey, state, outcome,
-             openedAt, closingAttestId
-      FROM assignments
-      """)
-
-    Enum.map(rows, fn [id, item_id, reviews, holder, state, outcome, opened, closing] ->
-      %{
-        id: id,
-        work_item_id: item_id,
-        reviews_assignment_id: reviews,
-        holder_key: holder,
-        state: state,
-        outcome: outcome,
-        opened_at: opened,
-        closing_attest_id: closing
-      }
-    end)
+  defp event([topline_id, seq, kind, membership_id, actor_kind, actor_ref, reason, at, detail]) do
+    %{
+      actor: actor(actor_kind, actor_ref),
+      at: at,
+      concernId: nil,
+      concernReferenceId: nil,
+      detail: atomize_keys(JSON.decode!(detail)),
+      kind: kind,
+      membershipId: membership_id,
+      reason: reason,
+      seq: seq,
+      toplineId: topline_id
+    }
   end
 
-  # THE normative membership function, computed in bulk:
-  #
-  #   resolved_assignments(item) = {a : resolved_work_item_id(a) == item}
-  #
-  # An assignment's own non-null `workItemId` WINS; otherwise resolution follows
-  # `reviewsAssignmentId`; otherwise NONE. Total and cycle-safe — a memoized nil
-  # is correct because entering a cycle at any point traverses it and returns
-  # nil.
-  defp resolve_all(assignments, by_id) do
-    Enum.reduce(assignments, %{}, fn assignment, memo ->
-      {value, memo} = resolve(by_id, assignment.id, MapSet.new(), memo)
-      Map.put(memo, assignment.id, value)
-    end)
+  defp append_event(txn, topline_id, kind, membership_id, caller, reason, at, detail) do
+    [[seq]] =
+      Txn.q(txn, "SELECT COALESCE(MAX(seq), 0) + 1 FROM topline_events WHERE toplineId = ?1", [
+        topline_id
+      ])
+
+    Txn.q(
+      txn,
+      """
+      INSERT INTO topline_events
+        (toplineId, seq, kind, membershipId, actorKind, actorRef, reason, eventAt, detail)
+      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+      """,
+      [
+        topline_id,
+        seq,
+        kind,
+        membership_id,
+        caller.actor_kind,
+        caller.actor_ref,
+        reason,
+        at,
+        canonical_json(detail)
+      ]
+    )
   end
 
-  defp resolve(by_id, id, visited, memo) do
-    cond do
-      Map.has_key?(memo, id) ->
-        {Map.fetch!(memo, id), memo}
+  defp visible_topline(txn, id, caller) do
+    {owner_sql, owner_params} = owner_filter(caller, "")
 
-      MapSet.member?(visited, id) ->
-        {nil, memo}
+    rows =
+      Txn.q(
+        txn,
+        "SELECT id, ownerUserId, state FROM toplines WHERE id = ?1 #{shifted_owner_filter(owner_sql, 1)}",
+        [id | owner_params]
+      )
 
-      true ->
-        case Map.get(by_id, id) do
-          nil ->
-            {nil, memo}
+    case rows do
+      [[topline_id, owner, state]] ->
+        {:ok, %{id: topline_id, owner_user_id: owner, state: state}}
 
-          %{work_item_id: item_id} when not is_nil(item_id) ->
-            {item_id, Map.put(memo, id, item_id)}
-
-          %{reviews_assignment_id: nil} ->
-            {nil, Map.put(memo, id, nil)}
-
-          %{reviews_assignment_id: reviews} ->
-            {value, memo} = resolve(by_id, reviews, MapSet.put(visited, id), memo)
-            {value, Map.put(memo, id, value)}
-        end
+      [] ->
+        error("not_found", "record not found")
     end
   end
 
-  # An assignment resolving to NONE belongs to no item's ordinary telemetry: it
-  # is not an item orphan and creates no synthetic item.
-  defp membership(resolved, items_by_id) do
-    resolved
-    |> Enum.filter(fn {_id, item_id} -> Map.has_key?(items_by_id, item_id) end)
-    |> Enum.group_by(fn {_id, item_id} -> item_id end, fn {id, _item_id} -> id end)
-    |> Map.new(fn {item_id, ids} -> {item_id, Enum.sort(ids)} end)
-  end
+  defp visible_work_item(txn, id, caller) do
+    {owner_sql, owner_params} = owner_filter(caller, "")
 
-  defp all_turns(db) do
-    {:ok, rows} =
-      DB.query(db, """
-      SELECT seq, assignmentId, jobRef, status, model, thinkingLevel, modelContext,
-             harness, endedAt
-      FROM turns
-      """)
-
-    Enum.map(rows, fn [
-                        seq,
-                        assignment_id,
-                        job_ref,
-                        status,
-                        model,
-                        effort,
-                        model_context,
-                        harness,
-                        ended_at
-                      ] ->
-      %{
-        seq: seq,
-        assignment_id: assignment_id,
-        job_ref: job_ref,
-        status: status,
-        model: model,
-        context: model_context,
-        effort: effort,
-        harness: harness,
-        ended_at: ended_at
-      }
-    end)
-  end
-
-  defp attests_by_assignment(db) do
-    {:ok, rows} =
-      DB.query(db, "SELECT assignmentId, kind, verdictKind, ts FROM attests")
-
-    rows
-    |> Enum.group_by(&hd/1)
-    |> Map.new(fn {assignment_id, grouped} ->
-      {assignment_id,
-       Enum.map(grouped, fn [_id, kind, verdict, ts] ->
-         %{kind: kind, verdict_kind: verdict, ts: ts}
-       end)}
-    end)
-  end
-
-  defp commit_refs(db) do
-    {:ok, rows} = DB.query(db, "SELECT id, commitRefs FROM attests WHERE commitRefs IS NOT NULL")
-    Map.new(rows, fn [id, encoded] -> {id, JSON.decode!(encoded)} end)
-  end
-
-  # `assignmentId` is the durable marker carrier, stamped from the running parent
-  # turn at emission. `subagentRef` is the subagent identity — start and stop are
-  # two markers for one fan-out.
-  defp markers_by_assignment(db) do
-    {:ok, rows} =
-      DB.query(
-        db,
-        "SELECT assignmentId, subagentRef FROM subagent_markers WHERE assignmentId IS NOT NULL"
+    rows =
+      Txn.q(
+        txn,
+        "SELECT id, ownerUserId FROM work_items WHERE id = ?1 #{shifted_owner_filter(owner_sql, 1)}",
+        [id | owner_params]
       )
 
-    rows
-    |> Enum.group_by(&hd/1, &List.last/1)
-    |> Map.new(fn {assignment_id, refs} -> {assignment_id, Enum.uniq(refs)} end)
+    case rows do
+      [[work_item_id, owner]] -> {:ok, %{id: work_item_id, owner_user_id: owner}}
+      [] -> error("not_found", "record not found")
+    end
   end
 
-  defp open_requests(db) do
-    {:ok, rows} =
-      DB.query(db, """
-      SELECT assignmentId, COUNT(*) FROM decision_requests
-      WHERE status = 'open' AND assignmentId IS NOT NULL
-      GROUP BY assignmentId
-      """)
+  defp visible_membership(txn, id, caller) do
+    {owner_sql, owner_params} = owner_filter(caller, "m")
 
-    Map.new(rows, fn [assignment_id, count] -> {assignment_id, count} end)
-  end
-
-  defp pending_wake_sessions(db) do
-    {:ok, rows} =
-      DB.query(
-        db,
-        "SELECT DISTINCT sessionKey FROM wakes WHERE state = 'pending' AND consumer = 'prompt'"
+    rows =
+      Txn.q(
+        txn,
+        """
+        SELECT m.id, m.toplineId, m.workItemId, m.ownerUserId, m.unlinkedAt
+        FROM topline_work_memberships m
+        WHERE m.id = ?1 #{shifted_owner_filter(owner_sql, 1)}
+        """,
+        [id | owner_params]
       )
 
-    MapSet.new(rows, &hd/1)
+    case rows do
+      [[membership_id, topline_id, work_item_id, owner, unlinked_at]] ->
+        {:ok,
+         %{
+           id: membership_id,
+           topline_id: topline_id,
+           work_item_id: work_item_id,
+           owner_user_id: owner,
+           unlinked_at: unlinked_at
+         }}
+
+      [] ->
+        error("not_found", "record not found")
+    end
   end
 
-  # Dispositions append a `disposition_transition` causal event with
-  # `jobRef = item` and exact from/to state. `seq` is commit order, so it — not
-  # `at`, which can tie — decides which transition is the latest.
-  defp dispositions(db) do
-    {:ok, rows} =
-      DB.query(db, """
-      SELECT jobRef, seq, at, json_extract(detail, '$.toState')
-      FROM causal_events
-      WHERE kind = 'disposition_transition' AND jobRef IS NOT NULL
-      """)
-
-    rows
-    |> Enum.group_by(&hd/1)
-    |> Map.new(fn {job_ref, grouped} ->
-      {job_ref,
-       Enum.map(grouped, fn [_ref, seq, at, to_state] ->
-         %{seq: seq, at: at, to_state: to_state}
-       end)}
-    end)
+  defp active_membership?(txn, topline_id, work_item_id) do
+    case Txn.q(
+           txn,
+           "SELECT 1 FROM topline_work_memberships WHERE toplineId = ?1 AND workItemId = ?2 AND unlinkedAt IS NULL",
+           [topline_id, work_item_id]
+         ) do
+      [[1]] -> true
+      [] -> false
+    end
   end
 
-  defp index_turns(turns, key) do
-    turns
-    |> Enum.reject(&is_nil(key.(&1)))
-    |> Enum.group_by(key)
+  defp touch_topline(txn, topline_id, at) do
+    Txn.q(txn, "UPDATE toplines SET updatedAt = ?2 WHERE id = ?1", [topline_id, at])
+    :ok
   end
 
-  defp session_owners(db) do
-    {:ok, rows} = DB.query(db, "SELECT sessionKey, ownerUserId FROM sessions")
-    Map.new(rows, fn [key, owner] -> {key, owner} end)
+  defp same_owner(%{owner_user_id: owner}, %{owner_user_id: owner}), do: :ok
+  defp same_owner(_, _), do: error("owner_mismatch", "topline and work item owners differ")
+
+  defp replay(txn, user, operation, key, fingerprint) do
+    case Txn.q(
+           txn,
+           """
+           SELECT requestFingerprint, canonicalResponse
+           FROM topline_idempotency
+           WHERE callerUserId = ?1 AND operation = ?2 AND idempotencyKey = ?3
+           """,
+           [user, operation, key]
+         ) do
+      [] -> :new
+      [[^fingerprint, response]] -> {:ok, response |> JSON.decode!() |> atomize_keys()}
+      [[_other, _response]] -> :conflict
+    end
   end
 
-  ## Caller resolution — the same owner-or-admin shape work-item-trace uses
+  defp remember(txn, user, operation, key, fingerprint, response) do
+    Txn.q(
+      txn,
+      """
+      INSERT INTO topline_idempotency
+        (callerUserId, operation, idempotencyKey, requestFingerprint, canonicalResponse)
+      VALUES (?1, ?2, ?3, ?4, ?5)
+      """,
+      [user, operation, key, fingerprint, canonical_json(response)]
+    )
 
-  defp caller(db, {:user, user}) do
+    :ok
+  end
+
+  defp fingerprint(operation, parameters) do
+    bytes = fingerprint_json(%{operation: operation, parameters: parameters})
+    :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
+  end
+
+  defp canonical_json(value), do: encode_canonical_json(value, false)
+  defp fingerprint_json(value), do: encode_canonical_json(value, true)
+
+  defp encode_canonical_json(value, normalize?) when is_map(value) do
+    members =
+      value
+      |> Enum.map(fn {key, item} -> {maybe_normalize(to_string(key), normalize?), item} end)
+      |> Enum.sort_by(&elem(&1, 0))
+      |> Enum.map(fn {key, item} ->
+        [json_string(key), ?:, encode_canonical_json(item, normalize?)]
+      end)
+      |> Enum.intersperse(?,)
+
+    IO.iodata_to_binary([?{, members, ?}])
+  end
+
+  defp encode_canonical_json(value, normalize?) when is_list(value) do
+    items = value |> Enum.map(&encode_canonical_json(&1, normalize?)) |> Enum.intersperse(?,)
+    IO.iodata_to_binary([?[, items, ?]])
+  end
+
+  defp encode_canonical_json(value, normalize?) when is_binary(value),
+    do: value |> maybe_normalize(normalize?) |> json_string()
+
+  defp encode_canonical_json(value, _normalize?) when is_integer(value),
+    do: Integer.to_string(value)
+
+  defp encode_canonical_json(true, _normalize?), do: "true"
+  defp encode_canonical_json(false, _normalize?), do: "false"
+  defp encode_canonical_json(nil, _normalize?), do: "null"
+
+  defp maybe_normalize(value, true), do: normalize_string(value)
+  defp maybe_normalize(value, false), do: value
+
+  defp json_string(value) do
+    encoded =
+      value
+      |> String.to_charlist()
+      |> Enum.map(fn
+        ?" -> "\\\""
+        ?\\ -> "\\\\"
+        codepoint when codepoint in 0..31 -> "\\u00" <> hex_byte(codepoint)
+        codepoint -> <<codepoint::utf8>>
+      end)
+
+    IO.iodata_to_binary([?", encoded, ?"])
+  end
+
+  defp hex_byte(value), do: value |> Integer.to_string(16) |> String.pad_leading(2, "0")
+
+  defp atomize_keys(value) when is_map(value) do
+    Map.new(value, fn {key, item} -> {existing_atom(key), atomize_keys(item)} end)
+  end
+
+  defp atomize_keys(value) when is_list(value), do: Enum.map(value, &atomize_keys/1)
+  defp atomize_keys(value), do: value
+
+  defp existing_atom(key) do
+    String.to_existing_atom(key)
+  rescue
+    ArgumentError -> key
+  end
+
+  defp caller(_db, {:process, _}),
+    do: error("process_denied", "process principals cannot access Toplines")
+
+  defp caller(db, {:user, user}) when is_binary(user) do
     case DB.query(db, "SELECT isAdmin FROM users WHERE userId = ?1", [user]) do
-      {:ok, [[admin]]} -> %{owner: user, admin: admin == 1}
-      _ -> nil
+      {:ok, [[admin]]} ->
+        {:ok, %{user: user, admin: admin == 1, actor_kind: "user", actor_ref: user}}
+
+      _ ->
+        error("not_found", "record not found")
     end
   end
 
-  defp caller(db, {:session, session_key}) do
+  defp caller(db, {:session, session}) when is_binary(session) do
     case DB.query(
            db,
            """
-           SELECT u.userId, u.isAdmin
-           FROM sessions AS s
-           JOIN users AS u ON u.userId = s.ownerUserId
+           SELECT s.ownerUserId, u.isAdmin
+           FROM sessions s
+           JOIN users u ON u.userId = s.ownerUserId
            WHERE s.sessionKey = ?1
            """,
-           [session_key]
+           [session]
          ) do
-      {:ok, [[owner, admin]]} -> %{owner: owner, admin: admin == 1}
-      _ -> nil
+      {:ok, [[user, admin]]} ->
+        {:ok, %{user: user, admin: admin == 1, actor_kind: "session", actor_ref: session}}
+
+      _ ->
+        error("not_found", "record not found")
     end
   end
 
-  defp caller(_db, _principal), do: nil
+  defp caller(_db, _principal), do: error("invalid_message", "invalid message")
 
-  ## Small shared helpers
+  defp reauthorize(txn, %{actor_kind: "user", actor_ref: user}) do
+    case Txn.q(txn, "SELECT isAdmin FROM users WHERE userId = ?1", [user]) do
+      [[admin]] ->
+        {:ok, %{user: user, admin: admin == 1, actor_kind: "user", actor_ref: user}}
 
-  defp rows_for(by_id, ids), do: Enum.flat_map(ids, &List.wrap(Map.get(by_id, &1)))
-
-  defp tally(rows, fun) do
-    rows |> Enum.group_by(fun) |> Map.new(fn {key, grouped} -> {key, length(grouped)} end)
+      [] ->
+        error("not_found", "record not found")
+    end
   end
 
-  defp truthy?(true), do: true
-  defp truthy?(_), do: false
+  defp reauthorize(txn, %{actor_kind: "session", actor_ref: session}) do
+    case Txn.q(
+           txn,
+           """
+           SELECT s.ownerUserId, u.isAdmin
+           FROM sessions s
+           JOIN users u ON u.userId = s.ownerUserId
+           WHERE s.sessionKey = ?1
+           """,
+           [session]
+         ) do
+      [[user, admin]] ->
+        {:ok, %{user: user, admin: admin == 1, actor_kind: "session", actor_ref: session}}
 
-  defp invalid(message), do: %{code: "invalid", message: message}
-  defp not_found(message), do: %{code: "not_found", message: message}
+      [] ->
+        error("not_found", "record not found")
+    end
+  end
+
+  defp owner_filter(%{admin: true}, _alias), do: {"", []}
+
+  defp owner_filter(caller, alias_name) do
+    prefix = if alias_name == "", do: "", else: alias_name <> "."
+    {"AND #{prefix}ownerUserId = ?1", [caller.user]}
+  end
+
+  defp shifted_owner_filter("", _offset), do: ""
+
+  defp shifted_owner_filter(sql, offset) do
+    String.replace(sql, "?1", "?#{offset + 1}")
+  end
+
+  defp state_filter("all", _position), do: {"", []}
+  defp state_filter(state, position), do: {"AND t.state = ?#{position}", [state]}
+
+  defp list_state(nil), do: {:ok, "open"}
+  defp list_state(state) when state in ~w(open closed all), do: {:ok, state}
+  defp list_state(_), do: error("invalid_message", "invalid message")
+
+  defp valid_history(nil), do: :ok
+  defp valid_history(value) when is_boolean(value), do: :ok
+  defp valid_history(_), do: error("invalid_message", "invalid message")
+
+  defp valid_shape(params, keys, opts \\ [])
+
+  defp valid_shape(params, keys, opts) when is_map(params) do
+    optional = Keyword.get(opts, :optional, [])
+    actual = params |> Map.keys() |> Enum.map(&param_key/1) |> MapSet.new()
+    allowed = MapSet.new(keys)
+    required = MapSet.difference(allowed, MapSet.new(optional))
+
+    if MapSet.subset?(required, actual) and MapSet.subset?(actual, allowed),
+      do: :ok,
+      else: error("invalid_message", "invalid message")
+  end
+
+  defp valid_shape(_params, _keys, _opts), do: error("invalid_message", "invalid message")
+
+  defp param_key(key) when is_atom(key), do: key
+  defp param_key("idempotencyKey"), do: :idempotency_key
+  defp param_key("membershipId"), do: :membership_id
+  defp param_key("toplineId"), do: :topline_id
+  defp param_key("workItemId"), do: :work_item_id
+  defp param_key("history"), do: :history
+  defp param_key("reason"), do: :reason
+  defp param_key("state"), do: :state
+  defp param_key("title"), do: :title
+  defp param_key(_), do: :unknown
+
+  defp param(params, key) do
+    Map.get(params, key) || Map.get(params, camel_key(key))
+  end
+
+  defp camel_key(:idempotency_key), do: "idempotencyKey"
+  defp camel_key(:membership_id), do: "membershipId"
+  defp camel_key(:topline_id), do: "toplineId"
+  defp camel_key(:work_item_id), do: "workItemId"
+  defp camel_key(key), do: Atom.to_string(key)
+
+  defp canonical_title(value) when is_binary(value) do
+    if String.valid?(value) do
+      title = value |> trim_unicode() |> normalize_string()
+
+      if scalar_length(title) in 1..2000,
+        do: {:ok, title},
+        else: error("invalid_message", "invalid message")
+    else
+      error("invalid_message", "invalid message")
+    end
+  end
+
+  defp canonical_title(_), do: error("invalid_message", "invalid message")
+
+  defp valid_reason(value) when is_binary(value) do
+    if String.valid?(value) and scalar_length(trim_unicode(value)) in 1..4000,
+      do: :ok,
+      else: error("invalid_message", "invalid message")
+  end
+
+  defp valid_reason(_), do: error("invalid_message", "invalid message")
+
+  defp valid_key(value) when is_binary(value) do
+    if String.valid?(value) and scalar_length(trim_unicode(value)) in 1..200,
+      do: :ok,
+      else: error("invalid_message", "invalid message")
+  end
+
+  defp valid_key(_), do: error("invalid_message", "invalid message")
+
+  defp valid_id(value, prefix) when is_binary(value) do
+    if String.valid?(value) and String.starts_with?(value, prefix),
+      do: :ok,
+      else: error("invalid_message", "invalid message")
+  end
+
+  defp valid_id(_value, _prefix), do: error("invalid_message", "invalid message")
+
+  defp trim_unicode(value) do
+    codepoints = String.to_charlist(value)
+
+    codepoints
+    |> trim_leading()
+    |> Enum.reverse()
+    |> trim_leading()
+    |> Enum.reverse()
+    |> to_string()
+  end
+
+  defp trim_leading([codepoint | rest]) when codepoint in @white_space, do: trim_leading(rest)
+  defp trim_leading(codepoints), do: codepoints
+
+  defp normalize_string(value), do: :unicode.characters_to_nfc_binary(value)
+  defp scalar_length(value), do: value |> String.to_charlist() |> length()
+
+  defp actor(nil, nil), do: nil
+  defp actor(kind, ref), do: %{kind: kind, ref: ref}
+
+  defp mutation_time(_call), do: System.system_time(:millisecond)
+  defp id(prefix), do: prefix <> Tightbeam.Id.uuid4()
+
+  defp transaction!(db, fun) do
+    case DB.transaction(db, fun) do
+      {:ok, result} -> result
+      {:error, error} -> raise error
+    end
+  end
+
+  defp error(code, message), do: %{code: code, message: message}
 end
