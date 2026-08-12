@@ -374,13 +374,22 @@ defmodule Tightbeam.ManualCandidateWorkflowTest do
           "runner=git\n$(\"$runner\" rev-parse \"$CANDIDATE_SHA\")"
         ] do
       refute static_run_body?(fixture), "constructed command fixture passed:\n#{fixture}"
+
+      refute candidate_sha_run_body?(fixture),
+             "raw-SHA body predicate accepted a constructed command:\n#{fixture}"
     end
 
-    assert static_run_body?("""
-           if true; then git rev-parse "$CANDIDATE_SHA"; fi
-           while false; do git rev-parse "$CANDIDATE_SHA"; done
-           { git rev-parse "$CANDIDATE_SHA"; }
-           """)
+    literal_control = """
+    if true; then git rev-parse "$CANDIDATE_SHA"; fi
+    while false; do git rev-parse "$CANDIDATE_SHA"; done
+    { git rev-parse "$CANDIDATE_SHA"; }
+    """
+
+    assert static_run_body?(literal_control)
+    assert candidate_sha_run_body?(literal_control)
+    assert candidate_sha_run_body?(~S|git rev-parse "$CANDIDATE_SHA"|)
+
+    refute candidate_sha_run_body?(~S|runner=git; $runner rev-parse "$CANDIDATE_SHA"|)
   end
 
   test "raw dispatch input has one data-only transport and validated SHA use stays quoted" do
@@ -408,9 +417,8 @@ defmodule Tightbeam.ManualCandidateWorkflowTest do
       refute run =~ ~r/(^|\s)eval(\s|$)/m
       refute run =~ ~r/(^|\s)(sh|bash)\s+-c(\s|$)/m
 
-      run
-      |> String.replace("\"$CANDIDATE_SHA\"", "")
-      |> refute_candidate_sha_expansion()
+      assert candidate_sha_run_body?(run),
+             "run body contains a forbidden candidate-SHA expansion or constructed command:\n#{run}"
     end
   end
 
@@ -929,8 +937,11 @@ defmodule Tightbeam.ManualCandidateWorkflowTest do
     text |> String.split(needle) |> length() |> Kernel.-(1)
   end
 
-  defp refute_candidate_sha_expansion(run) do
-    refute run =~ "CANDIDATE_SHA"
+  defp candidate_sha_run_body?(run) do
+    static_run_body?(run) and
+      run
+      |> String.replace("\"$CANDIDATE_SHA\"", "")
+      |> then(&(not String.contains?(&1, "CANDIDATE_SHA")))
   end
 
   defp validation_env(value, output) do
