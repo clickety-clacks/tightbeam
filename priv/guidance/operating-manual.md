@@ -47,7 +47,8 @@ The prompt you send yourself instructs the future you. Cancel a scheduled wake w
 
 ## Work with colleagues without disrupting them
 Ask a colleague when that colleague can answer something you need to do your job. Do not send
-idle status requests or nudges. Send routine progress to your owner.
+idle status requests or nudges. Send your owner only new material results or evidence, exact
+blockers or refusals, and bounded decision requests.
 
 ## Hire help: spawn and retire
 Start a new session:
@@ -132,16 +133,31 @@ your workdir. Your home is substrate-owned identity: the substrate may regenerat
 time, and anything loose in it is forfeit. Keep work out of your home and out of system temp
 directories.
 
-## Never end a turn with open work and nothing on the clock
-While you hold an open assignment, end every turn with a filing — progress, completion, or
-surrender — or a scheduled continuation wake to yourself. A turn that ends with neither is a
-stall: the substrate checks in on you, naming the assignment, and check-ins that go
-unanswered escalate to the session that spawned you. The check-in asks for verbs you already
-have — `attest --kind progress` for what you learned or produced, `attest --kind completion`
-or `--kind surrender` when the obligation ends, a `wake` to your own role with `--after` when
-the next step waits — so the answer is cheaper given before it is asked for. An assignment
-whose holder takes turns while writing, attesting and recording nothing draws exactly this
-check-in; recording the work as you go is the same answer, given first.
+## Keep open work live without generic reports
+While you hold an open assignment, leave a valid durable liveness receipt or schedule a
+continuation wake to yourself before the turn ends. Create a reporting attest or reporting
+wake only for one of these exceptions:
+
+- a new material result or evidence, such as an artifact, test result, frozen commit, or
+  completed bounded investigation;
+- an exact new blocker or refusal, with the failed operation and evidence the owner needs;
+- a bounded decision request that states the choice and why work depends on it;
+- one new, unexpired bounded checkpoint that names the next action or condition and its
+  deadline or scheduled continuation.
+
+A continuation wake is a liveness receipt, not a status report. Schedule concrete continuation
+work or a named dependency recheck, and state when it resumes. Do not file "still working,"
+"unchanged," "waiting," or "no update." Do not repeat a result, blocker, refusal, decision
+request, or checkpoint that adds no new evidence or owner-relevant state.
+
+If no reporting exception applies, record the one valid bounded checkpoint when available or
+schedule a concrete continuation wake. Do not manufacture a generic progress attest.
+Completion and surrender remain truthful terminal receipts.
+
+A turn with neither a receipt nor a scheduled continuation is a stall. The substrate checks in
+on the holder and escalates unanswered check-ins to the session that spawned it. Workdir writes,
+recorded artifacts, assignment attests, and work-item updates remain the mechanical effect
+channels that keep the liveness bracket moving.
 
 ## Work alongside other agents
 Other agents edit at the same time.
