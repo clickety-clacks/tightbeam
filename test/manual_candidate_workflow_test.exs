@@ -410,6 +410,57 @@ defmodule Tightbeam.ManualCandidateWorkflowTest do
              "raw-SHA body predicate accepted a constructed command:\n#{fixture}"
     end
 
+    continuation_position_fixtures = [
+      {"before the time option",
+       ~S"""
+       time \
+         -p $runner rev-parse "$CANDIDATE_SHA"
+       """},
+      {"after the time option",
+       ~S"""
+       time -p \
+         $runner rev-parse "$CANDIDATE_SHA"
+       """},
+      {"around the time option",
+       ~S"""
+       time \
+         -p \
+         $runner rev-parse "$CANDIDATE_SHA"
+       """},
+      {"repeated around the time option",
+       ~S"""
+       time \
+         \
+         -p \
+         \
+         $runner rev-parse "$CANDIDATE_SHA"
+       """}
+    ]
+
+    for {position, fixture} <- continuation_position_fixtures do
+      refute static_run_body?(fixture),
+             "#{position} constructed command fixture passed:\n#{fixture}"
+
+      refute candidate_sha_run_body?(fixture),
+             "#{position} raw-SHA fixture accepted a constructed command:\n#{fixture}"
+
+      literal_control = String.replace(fixture, "$runner", "git")
+      assert static_run_body?(literal_control)
+      assert candidate_sha_run_body?(literal_control)
+    end
+
+    for control <- [
+          ~S|printf '%s\n' "$runner"|,
+          ~S|value=$runner|,
+          ~S|[[ ! $runner ]]|,
+          ~S|case "$runner" in x) printf '%s\n' "$runner";; esac|
+        ] do
+      assert static_run_body?(control),
+             "non-command-position parameter was rejected:\n#{control}"
+
+      assert candidate_sha_run_body?(control)
+    end
+
     literal_control = """
     if true; then git rev-parse "$CANDIDATE_SHA"; fi
     while false; do git rev-parse "$CANDIDATE_SHA"; done
@@ -960,7 +1011,6 @@ defmodule Tightbeam.ManualCandidateWorkflowTest do
       ~r/(^|\s)(sh|bash)\s+-c(\s|$)/m,
       ~r/(?im)^\s*(?:(?:local|readonly)\s+|declare(?:\s+-[a-z]+)?\s+)?[a-z_][a-z0-9_]*(?:cmd|command)[a-z0-9_]*\s*\+?=/,
       ~r/\+=/,
-      ~r/(?m)(?:(?<!\\\n)^|[;&|][ \t]*(?:\\\n[ \t]*)*|\([ \t]+|\)[ \t]+|(?<!\[\[ )![ \t]+)(?:(?:then|do|else)[ \t]+|time[ \t]+(?:-p[ \t]+)?(?:\\\n[ \t]*)*)?(?:\{[ \t]*)?(?:"\$(?:\{[A-Za-z_][A-Za-z0-9_]*\}|[A-Za-z_][A-Za-z0-9_]*)"|\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Za-z_][A-Za-z0-9_]*)(?:[ \t]|$)/,
       ~r/(?m)^\s*\$\{[A-Za-z_][A-Za-z0-9_]*\}(?:\s|$)/,
       ~r/(?m)^\s*"\$\{[A-Za-z_][A-Za-z0-9_]*\[@\]\}"(?:\s|$)/,
       ~r/\$\{![A-Za-z_][A-Za-z0-9_]*\}/,
@@ -970,8 +1020,64 @@ defmodule Tightbeam.ManualCandidateWorkflowTest do
       ~r/(?:[^\s;&|()<>]"\$CANDIDATE_SHA"|"\$CANDIDATE_SHA"[^\s;&|()<>])/
     ]
 
-    Enum.all?(forbidden, &(not Regex.match?(&1, run)))
+    Enum.all?(forbidden, &(not Regex.match?(&1, run))) and not variable_command_word?(run)
   end
+
+  defp variable_command_word?(run) do
+    run
+    |> String.replace(~r/\\\r?\n[ \t]*/, " ")
+    |> shell_tokens()
+    |> variable_command_word?(:command)
+  end
+
+  defp shell_tokens(run) do
+    ~r/"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\$\{[A-Za-z_][A-Za-z0-9_]*\}|&&|\|\||;;|[;&|(){}!]|\n|[^\s;&|(){}!]+/
+    |> Regex.scan(run)
+    |> List.flatten()
+  end
+
+  defp variable_command_word?([], _position), do: false
+
+  defp variable_command_word?([token | rest], position) do
+    cond do
+      token in ["\n", ";", ";;", "&", "&&", "|", "||", ")", "}"] ->
+        variable_command_word?(rest, :command)
+
+      position == :command and token in ["(", "{", "!"] ->
+        variable_command_word?(rest, :command)
+
+      position == :command and token in ["then", "do", "else"] ->
+        variable_command_word?(rest, :command)
+
+      position == :command and token == "time" ->
+        variable_command_word?(rest, :time_option)
+
+      position == :time_option and token == "-p" ->
+        variable_command_word?(rest, :time_command)
+
+      position in [:command, :time_option, :time_command] and shell_assignment_word?(token) ->
+        variable_command_word?(rest, position)
+
+      position in [:command, :time_option, :time_command] and shell_parameter_word?(token) ->
+        true
+
+      position in [:command, :time_option, :time_command] ->
+        variable_command_word?(rest, :argument)
+
+      true ->
+        variable_command_word?(rest, position)
+    end
+  end
+
+  defp shell_assignment_word?(token),
+    do: Regex.match?(~r/^[A-Za-z_][A-Za-z0-9_]*=/, token)
+
+  defp shell_parameter_word?(token),
+    do:
+      Regex.match?(
+        ~r/^(?:"\$(?:\{[A-Za-z_][A-Za-z0-9_]*\}|[A-Za-z_][A-Za-z0-9_]*)"|\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Za-z_][A-Za-z0-9_]*)$/,
+        token
+      )
 
   defp walk(value) when is_map(value),
     do: Enum.flat_map(value, fn {key, item} -> [key | walk(item)] end)
