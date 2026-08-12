@@ -187,9 +187,13 @@ def verify_evidence(value: dict[str, Any], root: Path, kind: str) -> None:
             refuse(f"manifest: missing evidence file {relative}")
         if file_digest(path) != expected_digest:
             refuse(f"manifest: hash mismatch for {relative}")
-        if kind == "packages" and not path.name.endswith(f"-{row['platform']}.tgz"):
-            refuse(f"manifest: package name does not match platform {row['platform']}")
+        platform = row["platform"]
+        if kind == "packages":
+            if not path.name.endswith(f"-{platform}.tgz"):
+                refuse(f"manifest: package name does not match platform {platform}")
         if kind == "toolchains":
+            if relative != Path("toolchains") / f"{platform}.txt":
+                refuse(f"manifest: toolchain path does not match platform {platform}")
             contents = path.read_text()
             for marker in ("Erlang/OTP", "Elixir", "rustc"):
                 if marker not in contents:

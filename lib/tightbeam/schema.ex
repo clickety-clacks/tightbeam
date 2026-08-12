@@ -384,6 +384,94 @@ defmodule Tightbeam.Schema do
   @supervision_liveness_enforcement_objects [
     %{
       type: "table",
+      name: "supervision_liveness_receipt_state",
+      sql: """
+      CREATE TABLE IF NOT EXISTS supervision_liveness_receipt_state (
+        assignmentId TEXT PRIMARY KEY REFERENCES assignments(id),
+        artifactCursor INTEGER NOT NULL CHECK (artifactCursor >= 0),
+        attestCursor INTEGER NOT NULL CHECK (attestCursor >= 0),
+        workItemEventCursor INTEGER NOT NULL CHECK (workItemEventCursor >= 0),
+        wakeCursor INTEGER NOT NULL CHECK (wakeCursor >= 0),
+        baselineCause TEXT NOT NULL CHECK (baselineCause IN (
+          'assignment_open','first_prod','recovery_backfill'
+        )),
+        baselinePrincipal TEXT NOT NULL
+      )
+      """
+    },
+    %{
+      type: "table",
+      name: "supervision_liveness_receipts",
+      sql: """
+      CREATE TABLE IF NOT EXISTS supervision_liveness_receipts (
+        receiptId INTEGER PRIMARY KEY AUTOINCREMENT,
+        assignmentId TEXT NOT NULL REFERENCES assignments(id),
+        sourceKind TEXT NOT NULL CHECK (sourceKind IN (
+          'artifact','work_item_update','verdict','checkpoint'
+        )),
+        sourceId TEXT NOT NULL,
+        sourceAt INTEGER NOT NULL CHECK (sourceAt >= 0),
+        acceptedAt INTEGER NOT NULL CHECK (acceptedAt >= 0),
+        generation INTEGER NOT NULL CHECK (generation > 0),
+        expiresAt INTEGER CHECK (expiresAt >= 0),
+        UNIQUE (assignmentId, sourceKind, sourceId),
+        CHECK (
+          (sourceKind = 'checkpoint' AND expiresAt > acceptedAt)
+          OR
+          (sourceKind != 'checkpoint' AND expiresAt IS NULL)
+        )
+      )
+      """
+    },
+    %{
+      type: "index",
+      name: "supervision_liveness_receipts_assignment",
+      sql:
+        "CREATE INDEX IF NOT EXISTS supervision_liveness_receipts_assignment ON supervision_liveness_receipts(assignmentId, receiptId)"
+    },
+    %{
+      type: "table",
+      name: "supervision_liveness_checkpoint_bindings",
+      sql: """
+      CREATE TABLE IF NOT EXISTS supervision_liveness_checkpoint_bindings (
+        wakeId TEXT PRIMARY KEY REFERENCES wakes(wakeId),
+        assignmentId TEXT NOT NULL REFERENCES assignments(id),
+        holderSessionKey TEXT NOT NULL REFERENCES sessions(sessionKey),
+        sourceTurnSeq INTEGER NOT NULL REFERENCES turns(seq),
+        boundAt INTEGER NOT NULL CHECK (boundAt >= 0),
+        principal TEXT NOT NULL CHECK (principal = 'process:tightbeam')
+      )
+      """
+    },
+    %{
+      type: "trigger",
+      name: "supervision_checkpoint_binding_insert_coherent",
+      sql: """
+      CREATE TRIGGER IF NOT EXISTS supervision_checkpoint_binding_insert_coherent
+      BEFORE INSERT ON supervision_liveness_checkpoint_bindings
+      WHEN NOT EXISTS (
+        SELECT 1
+        FROM wakes w
+        JOIN assignments a ON a.id=NEW.assignmentId
+        JOIN turns t ON t.seq=NEW.sourceTurnSeq
+        JOIN supervision_entitlements e ON e.assignmentId=a.id
+        WHERE w.wakeId=NEW.wakeId
+          AND w.sessionKey=NEW.holderSessionKey
+          AND w.creatorSessionKey=NEW.holderSessionKey
+          AND w.consumer='prompt' AND w.state='pending'
+          AND w.dueAt > w.createdAt
+          AND a.holderKey=NEW.holderSessionKey AND a.state='open'
+          AND t.sessionKey=NEW.holderSessionKey AND t.status='running'
+          AND t.assignmentId=NEW.assignmentId
+          AND e.state IN ('armed','claimed')
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'supervision checkpoint binding requires a running held assignment');
+      END
+      """
+    },
+    %{
+      type: "table",
       name: "supervision_liveness_migrations",
       sql: """
       CREATE TABLE IF NOT EXISTS supervision_liveness_migrations (

@@ -244,7 +244,7 @@ defmodule Tightbeam.SupervisionTest do
     assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
   end
 
-  test "progress resets delivered and attempted counters before the next claim", ctx do
+  test "progress prose does not reset delivered or attempted counters", ctx do
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
     seq1 = terminal!(ctx.db, "holder")
     assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq1)
@@ -257,23 +257,20 @@ defmodule Tightbeam.SupervisionTest do
         "INSERT INTO attests (id, assignmentId, kind, bySession, ts) VALUES ('att_1','asg_1','progress','holder',2)"
       )
 
-    seq2 = terminal!(ctx.db, "holder")
-    assert :rebased = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq2)
-
-    assert %{attemptCount: 0, prodCount: 0, attestCount: 1, stalledAt: nil} =
-             Supervision.prod_state(ctx.db, "asg_1")
-
     {:ok, _} =
       DB.query(
         ctx.db,
         "UPDATE supervision_entitlements SET dueAt=0 WHERE assignmentId='asg_1'"
       )
 
-    seq3 = terminal!(ctx.db, "holder")
-    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq3)
+    seq2 = terminal!(ctx.db, "holder")
+    assert {:prodded, 2} = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq2)
 
-    assert %{attemptCount: 1, prodCount: 1, attestCount: 1, stalledAt: nil} =
+    assert %{attemptCount: 2, prodCount: 2, attestCount: 1, stalledAt: nil} =
              Supervision.prod_state(ctx.db, "asg_1")
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "SELECT receiptId FROM supervision_liveness_receipts")
   end
 
   # Immutable authority: art_201ab36d, SHA-256
@@ -281,85 +278,67 @@ defmodule Tightbeam.SupervisionTest do
   # These cases drive explicit durable rows or synchronous process barriers. They
   # deliberately do not sleep, poll, widen a timeout, or infer a deadline from the
   # wall clock.
-  test "progress without a newer terminal rebases once and remains live for a due sweep", ctx do
+  test "a verdict is a typed fact receipt and resets the ladder once", ctx do
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
-    terminal_seq = terminal!(ctx.db, "holder")
-    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", terminal_seq)
-    [originating] = Wakes.list_pending(ctx.db)
-
-    registry = start_supervised!({ConnRegistry, name: :progress_liveness_registry})
-    lane = start_supervised!({LaneDoorbell, :progress_liveness_lane})
-
-    scheduler =
-      start_supervised!(
-        {Wakes,
-         db: ctx.db,
-         deliver: delivery_fun(ctx.db, registry, lane),
-         tick_ms: 60_000,
-         name: :progress_liveness_wake_scheduler}
-      )
-
-    assert :ok = Wakes.fire_due(scheduler)
-    assert Wakes.get(ctx.db, originating.wake_id).state == "fired"
-    assert Ledger.pending_count(ctx.db, "holder") == 1
-
-    assert {:ok, prod_turn} = Ledger.claim_next(ctx.db, "holder", "progress-liveness")
-    assert prod_turn.wake_id == originating.wake_id
-    assert :ok = Ledger.finish(ctx.db, prod_turn.seq, "delivered")
-    assert Ledger.last_terminal_seq(ctx.db, "holder") == prod_turn.seq
+    seq1 = terminal!(ctx.db, "holder")
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq1)
+    cancel_wake!(ctx.db, hd(Wakes.list_pending(ctx.db)))
 
     {:ok, _} =
       DB.query(
         ctx.db,
-        "UPDATE supervision_watermarks SET lastEvaluatedTerminal=?2 WHERE sessionKey=?1",
-        ["holder", prod_turn.seq]
+        "INSERT INTO attests (id, assignmentId, kind, verdictKind, byUser, ts) VALUES ('att_verdict','asg_1','verdict','verified','flynn',2)"
       )
 
-    name = start_liveness!(ctx, sweep_ms: 60_000)
+    seq2 = terminal!(ctx.db, "holder")
+    assert :rebased = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq2)
 
-    {:ok, _} =
-      DB.query(
-        ctx.db,
-        "INSERT INTO attests (id, assignmentId, kind, bySession, ts) VALUES ('att_liveness','asg_1','progress','holder',2)"
-      )
-
-    sweep_liveness!(name)
-
-    assert %{supervisionState: "armed", supervisionBasisId: "att_liveness"} =
+    assert %{
+             attemptCount: 0,
+             prodCount: 0,
+             supervisionGeneration: 3,
+             supervisionBasisKind: "liveness_receipt"
+           } =
              Supervision.prod_state(ctx.db, "asg_1")
 
-    assert Wakes.list_pending(ctx.db) == [], "a progress-rebase cycle must not act"
+    assert {:ok, [["verdict", "att_verdict", 3]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sourceKind,sourceId,generation FROM supervision_liveness_receipts"
+             )
 
-    sweep_liveness!(name)
+    assert :duplicate = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq2)
 
-    assert [%{assignment_id: "asg_1", origin: "process:tightbeam"}] =
-             Wakes.list_pending(ctx.db)
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE supervision_entitlements SET dueAt=0 WHERE assignmentId='asg_1'")
+
+    seq3 = terminal!(ctx.db, "holder")
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq3)
   end
 
-  test "several newly observed progress attests produce one generation from the greatest basis",
-       ctx do
+  test "several typed effects produce one generation with exact source receipts", ctx do
+    attach_work_item!(ctx.db, "asg_1", "wi_receipts")
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 9_000_000_000_000)
     name = start_liveness!(ctx, sweep_ms: 60_000)
 
     {:ok, _} =
       DB.query(
         ctx.db,
-        """
-        INSERT INTO attests (id, assignmentId, kind, bySession, ts) VALUES
-          ('att_progress_1','asg_1','progress','holder',9000000000000),
-          ('att_progress_2','asg_1','progress','holder',9000000001000)
-        """
+        "INSERT INTO attests (id, assignmentId, kind, verdictKind, byUser, ts) VALUES ('att_fact','asg_1','verdict','verified','flynn',9000000000000)"
+      )
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO work_item_events (ts, workItemId, kind) VALUES (9000000001000, 'wi_receipts', 'metadata')"
       )
 
     sweep_liveness!(name)
 
-    assert {:ok,
-            [
-              ["att_progress_1", "asg_1", 2, 0],
-              ["att_progress_2", "asg_1", 2, 0]
-            ]} =
+    assert {:ok, [["verdict", "att_fact", 2], ["work_item_update", "1", 2]]} =
              DB.query(
                ctx.db,
-               "SELECT attestId, assignmentId, generation, recoveryBaseline FROM supervision_progress_absorptions ORDER BY attestId"
+               "SELECT sourceKind,sourceId,generation FROM supervision_liveness_receipts ORDER BY receiptId"
              )
 
     assert %{
@@ -367,10 +346,9 @@ defmodule Tightbeam.SupervisionTest do
              supervisionGeneration: 2,
              supervisionDueAt: 9_000_000_061_000,
              supervisionIntervalMs: 60_000,
-             supervisionBasisKind: "progress",
-             supervisionBasisId: "att_progress_2",
-             supervisionCause: "progress",
-             supervisionPrincipal: "session:holder"
+             supervisionBasisKind: "liveness_receipt",
+             supervisionCause: "liveness_receipt",
+             supervisionPrincipal: "process:tightbeam"
            } = Supervision.prod_state(ctx.db, "asg_1")
 
     sweep_liveness!(name)
@@ -379,30 +357,112 @@ defmodule Tightbeam.SupervisionTest do
              Supervision.prod_state(ctx.db, "asg_1")
   end
 
-  test "progress committed before a due claim invalidates the older generation", ctx do
+  test "an assignment artifact is an effect receipt; an unrelated artifact is not", ctx do
+    attach_work_item!(ctx.db, "asg_1", "wi_receipts")
     insert_entitlement!(ctx.db, "asg_1", generation: 4, due_at: 0, interval: 60_000)
-
-    {:ok, _} =
-      DB.query(
-        ctx.db,
-        "INSERT INTO attests (id, assignmentId, kind, bySession, ts) VALUES ('att_before_due','asg_1','progress','holder',9000000000000)"
-      )
+    insert_artifact!(ctx.db, "art_other", "holder", "wi_other", 9_000_000_000_000)
+    insert_artifact!(ctx.db, "art_effect", "holder", "wi_receipts", 9_000_000_001_000)
 
     _name = start_liveness!(ctx, sweep_ms: 60_000)
 
     assert %{
              supervisionState: "armed",
              supervisionGeneration: 5,
-             supervisionDueAt: 9_000_000_060_000,
-             supervisionBasisId: "att_before_due"
+             supervisionDueAt: 9_000_000_061_000,
+             supervisionBasisKind: "liveness_receipt"
            } = Supervision.prod_state(ctx.db, "asg_1")
+
+    assert {:ok, [["artifact", "art_effect"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sourceKind,sourceId FROM supervision_liveness_receipts"
+             )
 
     assert Wakes.list_pending(ctx.db) == []
   end
 
-  test "a due claim that commits before progress acts once and the later rebase makes it stale",
-       ctx do
-    terminal_seq = terminal!(ctx.db, "holder")
+  test "one bounded assignment checkpoint resets; repeats need a later effect", ctx do
+    attach_work_item!(ctx.db, "asg_1", "wi_checkpoint")
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0, interval: 60_000)
+    now = System.system_time(:millisecond)
+
+    {first, seq1} =
+      schedule_checkpoint_via_gateway!(ctx, "resume receipt work", 60_000)
+
+    assert :rebased = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq1)
+
+    {second, seq2} =
+      schedule_checkpoint_via_gateway!(ctx, "same checkpoint again", 120_000)
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE supervision_entitlements SET dueAt=0 WHERE assignmentId='asg_1'")
+
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq2)
+    prod = Enum.find(Wakes.list_pending(ctx.db), &(&1.origin == "process:tightbeam"))
+    cancel_wake!(ctx.db, prod)
+
+    insert_artifact!(ctx.db, "art_checkpoint_reset", "holder", "wi_checkpoint", now + 1)
+    seq3 = terminal!(ctx.db, "holder")
+    assert :rebased = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq3)
+
+    {third, seq4} =
+      schedule_checkpoint_via_gateway!(ctx, "checkpoint after durable effect", 180_000)
+
+    assert :rebased = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq4)
+
+    assert {:ok,
+            [
+              ["checkpoint", first_id],
+              ["artifact", "art_checkpoint_reset"],
+              ["checkpoint", third_id]
+            ]} =
+             DB.query(
+               ctx.db,
+               "SELECT sourceKind,sourceId FROM supervision_liveness_receipts ORDER BY receiptId"
+             )
+
+    assert first_id == first.wake_id
+    assert third_id == third.wake_id
+    refute second.wake_id in [first_id, third_id]
+  end
+
+  test "vague progress and unbound, unrelated, or expired wakes are not receipts", ctx do
+    assignment(ctx.db, "asg_other", "holder", "other work", 2)
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
+    now = System.system_time(:millisecond)
+
+    for input <- [
+          %{prompt: "unbound", due_at: now + 60_000},
+          %{prompt: "other assignment", due_at: now + 60_000, assignment_id: "asg_other"},
+          %{prompt: "expired", due_at: 1, assignment_id: "asg_1"}
+        ] do
+      Wakes.schedule(
+        ctx.db,
+        Map.merge(
+          %{
+            session_key: "holder",
+            origin: "session:holder",
+            creator_session_key: "holder"
+          },
+          input
+        )
+      )
+    end
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO attests (id,assignmentId,kind,note,bySession,ts) VALUES ('att_vague','asg_1','progress','blocked, no state change','holder',?1)",
+        [now]
+      )
+
+    seq = terminal!(ctx.db, "holder")
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq)
+    assert {:ok, []} = DB.query(ctx.db, "SELECT receiptId FROM supervision_liveness_receipts")
+  end
+
+  test "a receipt waits for an already-issued controller and resets after it settles", ctx do
+    terminal!(ctx.db, "holder")
     insert_entitlement!(ctx.db, "asg_1", generation: 4, due_at: 0, interval: 60_000)
 
     name = start_liveness!(ctx, sweep_ms: 60_000)
@@ -411,26 +471,30 @@ defmodule Tightbeam.SupervisionTest do
     {:ok, _} =
       DB.query(
         ctx.db,
-        "INSERT INTO attests (id, assignmentId, kind, bySession, ts) VALUES ('att_after_due','asg_1','progress','holder',9000000000000)"
+        "INSERT INTO attests (id, assignmentId, kind, verdictKind, byUser, ts) VALUES ('att_after_due','asg_1','verdict','verified','flynn',9000000000000)"
       )
 
     sweep_liveness!(name)
+    assert Wakes.get(ctx.db, charged.wake_id).state == "pending"
+    assert :appended = admit_supervision_wake!(ctx.db, charged)
+    assert {:ok, turn} = Ledger.claim_next(ctx.db, "holder", "receipt-after-controller")
+    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
 
-    assert Wakes.get(ctx.db, charged.wake_id).state == "canceled"
+    sweep_liveness!(name)
 
     assert %{
              supervisionState: "armed",
              supervisionGeneration: 6,
              supervisionDueAt: 9_000_000_060_000,
-             supervisionBasisId: "att_after_due",
+             supervisionBasisKind: "liveness_receipt",
              attemptCount: 0,
              prodCount: 0
            } = Supervision.prod_state(ctx.db, "asg_1")
 
-    assert Ledger.last_terminal_seq(ctx.db, "holder") == terminal_seq
+    assert Ledger.last_terminal_seq(ctx.db, "holder") == turn.seq
   end
 
-  test "restart preserves an armed deadline and a later rebase captures the replacement interval",
+  test "restart preserves an armed deadline and a later receipt captures the replacement interval",
        ctx do
     insert_entitlement!(ctx.db, "asg_1",
       generation: 7,
@@ -452,16 +516,16 @@ defmodule Tightbeam.SupervisionTest do
     {:ok, _} =
       DB.query(
         ctx.db,
-        "INSERT INTO attests (id, assignmentId, kind, bySession, ts) VALUES ('att_restart','asg_1','progress','holder',32000)"
+        "INSERT INTO attests (id, assignmentId, kind, verdictKind, byUser, ts) VALUES ('att_restart','asg_1','verdict','verified','flynn',9000000032000)"
       )
 
     sweep_liveness!(second)
 
     assert %{
              supervisionGeneration: 8,
-             supervisionDueAt: 34_000,
+             supervisionDueAt: 9_000_000_034_000,
              supervisionIntervalMs: 2_000,
-             supervisionBasisId: "att_restart"
+             supervisionBasisKind: "liveness_receipt"
            } = Supervision.prod_state(ctx.db, "asg_1")
   end
 
@@ -531,7 +595,7 @@ defmodule Tightbeam.SupervisionTest do
              Supervision.prod_state(ctx.db, "asg_1")
   end
 
-  test "a durable continuation defers a due entitlement without consuming it", ctx do
+  test "an unbound continuation does not defer a due entitlement", ctx do
     terminal!(ctx.db, "holder")
     insert_entitlement!(ctx.db, "asg_1", generation: 9, due_at: 0, interval: 60_000)
 
@@ -543,30 +607,12 @@ defmodule Tightbeam.SupervisionTest do
         due_at: 9_000_000_000_000
       })
 
-    name = start_liveness!(ctx, sweep_ms: 60_000)
+    _name = start_liveness!(ctx, sweep_ms: 60_000)
 
-    assert %{supervisionState: "armed", supervisionGeneration: 9, supervisionDueAt: 0} =
+    assert %{supervisionState: "armed", supervisionGeneration: 10, prodCount: 1} =
              Supervision.prod_state(ctx.db, "asg_1")
 
-    assert Enum.map(Wakes.list_pending(ctx.db), & &1.wake_id) == [continuation.wake_id]
-
-    {:ok, _} =
-      DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [continuation.wake_id])
-
-    wake_scheduler =
-      start_supervised!(
-        {Wakes,
-         db: ctx.db,
-         name: :liveness_continuation_scheduler,
-         tick_ms: 60_000,
-         deliver: fn _wake -> :ok end}
-      )
-
-    assert :ok = Wakes.fire_due(wake_scheduler)
-    assert Wakes.get(ctx.db, continuation.wake_id).state == "fired"
-
-    sweep_liveness!(name)
-
+    assert Wakes.get(ctx.db, continuation.wake_id).state == "pending"
     assert Enum.any?(Wakes.list_pending(ctx.db), &(&1.assignment_id == "asg_1"))
   end
 
@@ -1403,7 +1449,7 @@ defmodule Tightbeam.SupervisionTest do
 
     assert Wakes.self_pending_count(ctx.db, "holder") == 1
     seq = terminal!(ctx.db, "holder")
-    assert :continuation = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
+    assert :idle = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
     assert RailRemedy.episode(ctx.db, "completion-needs-review", "asg_1") == nil
     assert Supervision.prod_state(ctx.db, "asg_1") == nil
 
@@ -2116,10 +2162,10 @@ defmodule Tightbeam.SupervisionTest do
              Supervision.watermark(ctx.db, "holder")
 
     seq2 = terminal!(ctx.db, "holder")
-    assert :continuation = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq2)
+    assert :not_due = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq2)
     assert %{attemptCount: 1, prodCount: 1} = Supervision.prod_state(ctx.db, "asg_1")
 
-    assert %{lastEvaluatedTerminal: ^seq1, pendingBranch: nil} =
+    assert %{lastEvaluatedTerminal: ^seq2, pendingBranch: nil} =
              Supervision.watermark(ctx.db, "holder")
 
     assert Enum.count(
@@ -2333,7 +2379,7 @@ defmodule Tightbeam.SupervisionTest do
              1
   end
 
-  test "request sweep reclaims one suppressed terminal and never reclaims it twice", ctx do
+  test "an unrelated pending wake does not suppress or duplicate a prod", ctx do
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
 
     continuation =
@@ -2346,35 +2392,10 @@ defmodule Tightbeam.SupervisionTest do
       })
 
     seq = terminal!(ctx.db, "holder")
-    assert :continuation = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
-    cancel_wake!(ctx.db, continuation)
-
-    name = :"supervision_#{System.unique_integer([:positive])}"
-
-    start_supervised!(
-      {Supervision, db: ctx.db, handlers: ctx.handlers, prod_limit: 3, name: name}
-    )
-
-    Supervision.request_sweep(name)
-
-    # BOTH sweeps are casts, and :sys.get_state is answered in mailbox order, so
-    # each has RUN when its barrier returns. The FIRST barrier is the one that
-    # made this test flaky: polling prod_state instead let first_count be read
-    # before the sweep had written its wake, and the test then compared a
-    # post-sweep count against a pre-sweep one — measured red in 2 of 3 combined
-    # runs on an idle 16-core mac, both as `1 == 0`. The second sleep(20) was a
-    # false pass in the other direction: a still-queued cast read as "did not
-    # reclaim twice", the one thing this test exists to prove.
-    :sys.get_state(name)
-
-    assert Supervision.prod_state(ctx.db, "asg_1") != nil,
-           "the first sweep never reclaimed the suppressed terminal"
-
-    first_count = length(Wakes.list_pending(ctx.db))
-    Supervision.request_sweep(name)
-    :sys.get_state(name)
-    assert length(Wakes.list_pending(ctx.db)) == first_count
-    assert first_count == 1
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
+    assert :duplicate = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
+    assert Wakes.get(ctx.db, continuation.wake_id).state == "pending"
+    assert %{prodCount: 1} = Supervision.prod_state(ctx.db, "asg_1")
   end
 
   test "total catch contains exits and records evaluation failure without losing the claim",
@@ -2820,6 +2841,23 @@ defmodule Tightbeam.SupervisionTest do
         [assignment_id, generation, due_at, basis_kind, basis_id, cause, interval]
       )
 
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT OR IGNORE INTO supervision_liveness_receipt_state
+          (assignmentId, artifactCursor, attestCursor, workItemEventCursor, wakeCursor,
+           baselineCause, baselinePrincipal)
+        VALUES (?1,
+                (SELECT COALESCE(MAX(rowid), 0) FROM artifacts),
+                (SELECT COALESCE(MAX(rowid), 0) FROM attests),
+                (SELECT COALESCE(MAX(id), 0) FROM work_item_events),
+                (SELECT COALESCE(MAX(rowid), 0) FROM wakes),
+                'assignment_open', 'process:tightbeam')
+        """,
+        [assignment_id]
+      )
+
     :ok
   end
 
@@ -2837,6 +2875,48 @@ defmodule Tightbeam.SupervisionTest do
     assert {:ok, %{seq: ^seq}} = Ledger.claim_next(db, session_key, "test")
     assert :ok = Ledger.finish(db, seq, "delivered")
     seq
+  end
+
+  defp schedule_checkpoint_via_gateway!(ctx, prompt, after_ms) do
+    message_id = "checkpoint-turn-#{System.unique_integer([:positive])}"
+
+    assert {:ok, seq} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: "holder",
+               message_id: message_id,
+               origin: "user:flynn",
+               prompt: "checkpoint source turn",
+               assignment_id: "asg_1",
+               job_ref: "wi_checkpoint"
+             })
+
+    assert {:ok, %{seq: ^seq}} = Ledger.claim_next(ctx.db, "holder", "checkpoint-writer")
+
+    assert %{wake_id: wake_id, state: "pending"} =
+             ctx.handlers["wake"].(%{
+               origin: "user:flynn",
+               principal: {:session, "holder"},
+               session_key: "holder",
+               params: %{
+                 prompt: prompt,
+                 after_ms: after_ms,
+                 nudge: false
+               }
+             })
+
+    wake = Wakes.get(ctx.db, wake_id)
+    assert wake.assignment_id == nil
+    assert wake.creator_session_key == "holder"
+
+    assert {:ok, [["asg_1", "holder", ^seq, "process:tightbeam"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT assignmentId,holderSessionKey,sourceTurnSeq,principal FROM supervision_liveness_checkpoint_bindings WHERE wakeId=?1",
+               [wake_id]
+             )
+
+    assert :ok = Ledger.finish(ctx.db, seq, "delivered")
+    {wake, seq}
   end
 
   defp prepare_review_gate(ctx) do
@@ -2950,6 +3030,51 @@ defmodule Tightbeam.SupervisionTest do
         "INSERT INTO assignments (id, subject, holderKey, openedByUser, openedAt) VALUES (?1, ?2, ?3, 'flynn', ?4)",
         [id, subject, holder, opened_at]
       )
+  end
+
+  defp attach_work_item!(db, assignment_id, work_item_id) do
+    ensure_work_item!(db, work_item_id)
+
+    {:ok, _} =
+      DB.query(db, "UPDATE assignments SET workItemId=?2 WHERE id=?1", [
+        assignment_id,
+        work_item_id
+      ])
+
+    :ok
+  end
+
+  defp ensure_work_item!(db, work_item_id) do
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT OR IGNORE INTO work_items
+          (id,title,ownerUserId,state,createdByUser,createdAt)
+        VALUES (?1,?1,'flynn','open','flynn',1)
+        """,
+        [work_item_id]
+      )
+
+    :ok
+  end
+
+  defp insert_artifact!(db, artifact_id, session_key, work_item_id, created_at) do
+    ensure_work_item!(db, work_item_id)
+
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO artifacts
+          (artifactId,kind,title,createdBySession,workItemId,originPath,
+           recordedTurnEvidence,state,createdAt,updatedAt)
+        VALUES (?1,'report',?1,?2,?3,?1,'none','in-workspace',?4,?4)
+        """,
+        [artifact_id, session_key, work_item_id, created_at]
+      )
+
+    :ok
   end
 
   defp retire!(db, session_key) do
@@ -3087,14 +3212,12 @@ defmodule Tightbeam.SupervisionTest do
   # schedule in Supervision.@turn_end_schedule may only change together with
   # (1) this literal, (2) the termination argument in supervision-impl-v1
   # §r21, and (3) a semantic justification for the new position — order is
-  # meaning here (statutes outrank the ladder; a pending wake silences
-  # everything downstream). If this test surprised you
+  # meaning here (statutes outrank the ladder). If this test surprised you
   # red, you changed the shift without signing the lease — go read the
   # schedule comment in supervision.ex.
   test "the turn-end schedule is exactly the r21 shift, in order" do
     assert Tightbeam.Supervision.turn_end_schedule() == [
              :rail_enforcement,
-             :pending_wake_gate,
              :prod_ladder
            ]
   end

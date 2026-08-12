@@ -3549,9 +3549,24 @@ defmodule Tightbeam.Gateway do
         assignment_id: substrate_assignment_id(call)
       })
 
+    bind_liveness_checkpoint_in_txn(txn, call, wake)
     schedule_supervision_controller_in_txn(txn, call, wake)
     wake
   end
+
+  defp bind_liveness_checkpoint_in_txn(
+         txn,
+         %{principal: {:session, creator_session_key}},
+         %{session_key: creator_session_key, wake_id: wake_id}
+       ) do
+    Supervision.transition_in_txn(txn, %{
+      kind: "checkpoint_scheduled",
+      wake_id: wake_id,
+      creator_session_key: creator_session_key
+    })
+  end
+
+  defp bind_liveness_checkpoint_in_txn(_txn, _call, _wake), do: :duplicate
 
   # The controller row is part of the supervision wake, not follow-up
   # bookkeeping. Keeping both writes under the wake handler's transaction means
