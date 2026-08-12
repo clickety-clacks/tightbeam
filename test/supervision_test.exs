@@ -384,36 +384,19 @@ defmodule Tightbeam.SupervisionTest do
   test "one bounded assignment checkpoint resets; repeats need a later effect", ctx do
     attach_work_item!(ctx.db, "asg_1", "wi_checkpoint")
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0, interval: 60_000)
-    terminal!(ctx.db, "holder")
     now = System.system_time(:millisecond)
 
-    first =
-      Wakes.schedule(ctx.db, %{
-        session_key: "holder",
-        origin: "session:holder",
-        prompt: "resume receipt work",
-        due_at: now + 60_000,
-        creator_session_key: "holder",
-        assignment_id: "asg_1"
-      })
+    {first, seq1} =
+      schedule_checkpoint_via_gateway!(ctx, "resume receipt work", 60_000)
 
-    seq1 = terminal!(ctx.db, "holder")
     assert :rebased = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq1)
 
-    second =
-      Wakes.schedule(ctx.db, %{
-        session_key: "holder",
-        origin: "session:holder",
-        prompt: "same checkpoint again",
-        due_at: now + 120_000,
-        creator_session_key: "holder",
-        assignment_id: "asg_1"
-      })
+    {second, seq2} =
+      schedule_checkpoint_via_gateway!(ctx, "same checkpoint again", 120_000)
 
     {:ok, _} =
       DB.query(ctx.db, "UPDATE supervision_entitlements SET dueAt=0 WHERE assignmentId='asg_1'")
 
-    seq2 = terminal!(ctx.db, "holder")
     assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq2)
     prod = Enum.find(Wakes.list_pending(ctx.db), &(&1.origin == "process:tightbeam"))
     cancel_wake!(ctx.db, prod)
@@ -422,17 +405,9 @@ defmodule Tightbeam.SupervisionTest do
     seq3 = terminal!(ctx.db, "holder")
     assert :rebased = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq3)
 
-    third =
-      Wakes.schedule(ctx.db, %{
-        session_key: "holder",
-        origin: "session:holder",
-        prompt: "checkpoint after durable effect",
-        due_at: now + 180_000,
-        creator_session_key: "holder",
-        assignment_id: "asg_1"
-      })
+    {third, seq4} =
+      schedule_checkpoint_via_gateway!(ctx, "checkpoint after durable effect", 180_000)
 
-    seq4 = terminal!(ctx.db, "holder")
     assert :rebased = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq4)
 
     assert {:ok,
@@ -2900,6 +2875,48 @@ defmodule Tightbeam.SupervisionTest do
     assert {:ok, %{seq: ^seq}} = Ledger.claim_next(db, session_key, "test")
     assert :ok = Ledger.finish(db, seq, "delivered")
     seq
+  end
+
+  defp schedule_checkpoint_via_gateway!(ctx, prompt, after_ms) do
+    message_id = "checkpoint-turn-#{System.unique_integer([:positive])}"
+
+    assert {:ok, seq} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: "holder",
+               message_id: message_id,
+               origin: "user:flynn",
+               prompt: "checkpoint source turn",
+               assignment_id: "asg_1",
+               job_ref: "wi_checkpoint"
+             })
+
+    assert {:ok, %{seq: ^seq}} = Ledger.claim_next(ctx.db, "holder", "checkpoint-writer")
+
+    assert %{wake_id: wake_id, state: "pending"} =
+             ctx.handlers["wake"].(%{
+               origin: "user:flynn",
+               principal: {:session, "holder"},
+               session_key: "holder",
+               params: %{
+                 prompt: prompt,
+                 after_ms: after_ms,
+                 nudge: false
+               }
+             })
+
+    wake = Wakes.get(ctx.db, wake_id)
+    assert wake.assignment_id == nil
+    assert wake.creator_session_key == "holder"
+
+    assert {:ok, [["asg_1", "holder", ^seq, "process:tightbeam"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT assignmentId,holderSessionKey,sourceTurnSeq,principal FROM supervision_liveness_checkpoint_bindings WHERE wakeId=?1",
+               [wake_id]
+             )
+
+    assert :ok = Ledger.finish(ctx.db, seq, "delivered")
+    {wake, seq}
   end
 
   defp prepare_review_gate(ctx) do

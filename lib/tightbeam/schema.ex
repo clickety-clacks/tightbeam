@@ -50,13 +50,13 @@ defmodule Tightbeam.Schema do
         claimClock INTEGER,
         basisKind TEXT NOT NULL CHECK (basisKind IN (
           'assignment_open','prod_scheduled','escalation_scheduled','policy_denied',
-          'progress','liveness_receipt','no_terminal','parent_retirement','recovery_backfill'
+          'progress','no_terminal','parent_retirement','recovery_backfill'
         )),
         basisId TEXT NOT NULL,
         terminusAt INTEGER,
         cause TEXT NOT NULL CHECK (cause IN (
           'assignment_open','progress','deadline','new_terminal','pending_turn','pending_wake',
-          'work_blocked','liveness_receipt','prod_scheduled','escalation_scheduled','policy_denied','no_terminal',
+          'work_blocked','prod_scheduled','escalation_scheduled','policy_denied','no_terminal',
           'terminal_disposition','holder_retired','parent_elevated','terminus',
           'parent_target_retired','recovery_backfill','stale_generation'
         )),
@@ -428,6 +428,47 @@ defmodule Tightbeam.Schema do
       name: "supervision_liveness_receipts_assignment",
       sql:
         "CREATE INDEX IF NOT EXISTS supervision_liveness_receipts_assignment ON supervision_liveness_receipts(assignmentId, receiptId)"
+    },
+    %{
+      type: "table",
+      name: "supervision_liveness_checkpoint_bindings",
+      sql: """
+      CREATE TABLE IF NOT EXISTS supervision_liveness_checkpoint_bindings (
+        wakeId TEXT PRIMARY KEY REFERENCES wakes(wakeId),
+        assignmentId TEXT NOT NULL REFERENCES assignments(id),
+        holderSessionKey TEXT NOT NULL REFERENCES sessions(sessionKey),
+        sourceTurnSeq INTEGER NOT NULL REFERENCES turns(seq),
+        boundAt INTEGER NOT NULL CHECK (boundAt >= 0),
+        principal TEXT NOT NULL CHECK (principal = 'process:tightbeam')
+      )
+      """
+    },
+    %{
+      type: "trigger",
+      name: "supervision_checkpoint_binding_insert_coherent",
+      sql: """
+      CREATE TRIGGER IF NOT EXISTS supervision_checkpoint_binding_insert_coherent
+      BEFORE INSERT ON supervision_liveness_checkpoint_bindings
+      WHEN NOT EXISTS (
+        SELECT 1
+        FROM wakes w
+        JOIN assignments a ON a.id=NEW.assignmentId
+        JOIN turns t ON t.seq=NEW.sourceTurnSeq
+        JOIN supervision_entitlements e ON e.assignmentId=a.id
+        WHERE w.wakeId=NEW.wakeId
+          AND w.sessionKey=NEW.holderSessionKey
+          AND w.creatorSessionKey=NEW.holderSessionKey
+          AND w.consumer='prompt' AND w.state='pending'
+          AND w.dueAt > w.createdAt
+          AND a.holderKey=NEW.holderSessionKey AND a.state='open'
+          AND t.sessionKey=NEW.holderSessionKey AND t.status='running'
+          AND t.assignmentId=NEW.assignmentId
+          AND e.state IN ('armed','claimed')
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'supervision checkpoint binding requires a running held assignment');
+      END
+      """
     },
     %{
       type: "table",

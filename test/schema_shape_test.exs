@@ -76,7 +76,10 @@ defmodule Tightbeam.SchemaShapeTest do
     assert table_columns(db, "supervision_liveness_receipts") ==
              ~w(receiptId assignmentId sourceKind sourceId sourceAt acceptedAt generation expiresAt)
 
-    assert length(owned_activation_objects(db)) == 27
+    assert table_columns(db, "supervision_liveness_checkpoint_bindings") ==
+             ~w(wakeId assignmentId holderSessionKey sourceTurnSeq boundAt principal)
+
+    assert length(owned_activation_objects(db)) == 29
 
     assert {:ok, [[0, activated_at, "schema_activation", "process:tightbeam"]]} =
              DB.query(
@@ -347,6 +350,8 @@ defmodule Tightbeam.SchemaShapeTest do
           'supervision_liveness_receipt_state',
           'supervision_liveness_receipts',
           'supervision_liveness_receipts_assignment',
+          'supervision_liveness_checkpoint_bindings',
+          'supervision_checkpoint_binding_insert_coherent',
           'supervision_liveness_sidecar_insert_coherent',
           'supervision_pending_controller_sidecar_update',
           'supervision_pending_controller_sidecar_delete',
@@ -373,6 +378,7 @@ defmodule Tightbeam.SchemaShapeTest do
       DROP TRIGGER IF EXISTS supervision_pending_controller_sidecar_delete;
       DROP TRIGGER IF EXISTS supervision_pending_controller_sidecar_update;
       DROP TRIGGER IF EXISTS supervision_liveness_sidecar_insert_coherent;
+      DROP TRIGGER IF EXISTS supervision_checkpoint_binding_insert_coherent;
       DROP TRIGGER IF EXISTS supervision_fired_lineage_turn_immutable_delete;
       DROP TRIGGER IF EXISTS supervision_fired_lineage_turn_immutable_update;
       DROP TRIGGER IF EXISTS supervision_fired_lineage_sidecar_identity_immutable;
@@ -385,6 +391,7 @@ defmodule Tightbeam.SchemaShapeTest do
       DROP TABLE IF EXISTS supervision_progress_absorptions;
       DROP TABLE IF EXISTS supervision_liveness_receipt_state;
       DROP TABLE IF EXISTS supervision_liveness_receipts;
+      DROP TABLE IF EXISTS supervision_liveness_checkpoint_bindings;
       DROP TABLE IF EXISTS supervision_entitlements;
       DROP TABLE IF EXISTS supervision_liveness_epoch;
       DROP TABLE IF EXISTS supervision_liveness_migrations;

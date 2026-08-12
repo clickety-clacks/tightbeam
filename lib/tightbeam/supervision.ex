@@ -150,9 +150,9 @@ defmodule Tightbeam.Supervision do
             supervisionGeneration: generation,
             supervisionDueAt: due_at,
             supervisionIntervalMs: interval,
-            supervisionBasisKind: basis_kind,
-            supervisionBasisId: basis_id,
-            supervisionCause: cause,
+            supervisionBasisKind: logical_basis_kind(basis_kind, basis_id),
+            supervisionBasisId: logical_basis_id(basis_kind, basis_id),
+            supervisionCause: logical_basis_kind(cause, basis_id),
             supervisionPrincipal: principal,
             supervisionTerminusAt: terminus_at,
             supervisionTransferWakeId: nil,
@@ -174,6 +174,12 @@ defmodule Tightbeam.Supervision do
       {state, projection} -> Map.merge(state, projection)
     end
   end
+
+  defp logical_basis_kind("progress", "receipt:" <> _receipt_id), do: "liveness_receipt"
+  defp logical_basis_kind(kind, _basis_id), do: kind
+
+  defp logical_basis_id("progress", "receipt:" <> receipt_id), do: receipt_id
+  defp logical_basis_id(_kind, basis_id), do: basis_id
 
   @doc """
   Validate an existing accepted parent-transfer reference without creating
@@ -242,6 +248,49 @@ defmodule Tightbeam.Supervision do
     cancel_assignment_controllers_in_txn(txn, assignment_id, requester_id)
     clear_entitlement_in_txn(txn, assignment_id, cause, principal)
     :terminal_disposition
+  end
+
+  def transition_in_txn(%Txn{} = txn, %{
+        kind: "checkpoint_scheduled",
+        wake_id: wake_id,
+        creator_session_key: creator_session_key
+      }) do
+    case Txn.q(
+           txn,
+           """
+           SELECT a.id, t.seq
+           FROM wakes w
+           JOIN turns t ON t.sessionKey=w.sessionKey
+           JOIN assignments a ON a.id=t.assignmentId
+           JOIN supervision_entitlements e ON e.assignmentId=a.id
+           WHERE w.wakeId=?1
+             AND w.sessionKey=?2 AND w.creatorSessionKey=?2
+             AND w.consumer='prompt' AND w.state='pending'
+             AND w.dueAt > w.createdAt
+             AND t.status='running'
+             AND a.holderKey=?2 AND a.state='open'
+             AND e.state IN ('armed','claimed')
+           ORDER BY t.seq DESC
+           LIMIT 1
+           """,
+           [wake_id, creator_session_key]
+         ) do
+      [[assignment_id, turn_seq]] ->
+        Txn.q(
+          txn,
+          """
+          INSERT INTO supervision_liveness_checkpoint_bindings
+            (wakeId, assignmentId, holderSessionKey, sourceTurnSeq, boundAt, principal)
+          VALUES (?1, ?2, ?3, ?4, ?5, 'process:tightbeam')
+          """,
+          [wake_id, assignment_id, creator_session_key, turn_seq, now()]
+        )
+
+        :armed
+
+      [] ->
+        :duplicate
+    end
   end
 
   def transition_in_txn(%Txn{} = txn, %{
@@ -2293,17 +2342,27 @@ defmodule Tightbeam.Supervision do
 
         due_at = receipt_due_at(rows, accepted_at, interval)
 
+        # `supervision_entitlements` is a shape-validated legacy table. Keep its
+        # accepted enum byte-compatible and reserve the existing progress slot;
+        # the additive receipt ledger above is the authoritative provenance.
         Txn.q(
           txn,
           """
           UPDATE supervision_entitlements
           SET generation=?2, dueAt=?3, state='armed', lastAttemptGeneration=NULL,
-              claimClock=NULL, basisKind='liveness_receipt', basisId=?4, terminusAt=NULL,
-              cause='liveness_receipt', principal='process:tightbeam',
+              claimClock=NULL, basisKind='progress', basisId=?4, terminusAt=NULL,
+              cause='progress', principal='process:tightbeam',
               supervisionIntervalMs=?5
           WHERE assignmentId=?1 AND generation=?6 AND state IN ('armed','claimed')
           """,
-          [assignment_id, next_generation, due_at, to_string(basis_id), interval, generation]
+          [
+            assignment_id,
+            next_generation,
+            due_at,
+            "receipt:#{basis_id}",
+            interval,
+            generation
+          ]
         )
 
         source_refs = Enum.map_join(rows, ",", &"#{&1.kind}:#{&1.id}")
@@ -2442,13 +2501,15 @@ defmodule Tightbeam.Supervision do
       case Txn.q(
              txn,
              """
-             SELECT wakeId, createdAt, dueAt
-             FROM wakes
-             WHERE rowid > ?1 AND rowid <= ?2
-               AND assignmentId=?3 AND sessionKey=?4 AND creatorSessionKey=?4
-               AND consumer='prompt' AND state='pending'
-               AND dueAt > ?5 AND dueAt > createdAt
-             ORDER BY dueAt, rowid
+             SELECT w.wakeId, w.createdAt, w.dueAt
+             FROM wakes w
+             JOIN supervision_liveness_checkpoint_bindings b ON b.wakeId=w.wakeId
+             WHERE w.rowid > ?1 AND w.rowid <= ?2
+               AND b.assignmentId=?3 AND b.holderSessionKey=?4
+               AND w.sessionKey=?4 AND w.creatorSessionKey=?4
+               AND w.consumer='prompt' AND w.state='pending'
+               AND w.dueAt > ?5 AND w.dueAt > w.createdAt
+             ORDER BY w.dueAt, w.rowid
              LIMIT 1
              """,
              [cursor, maximum, assignment_id, holder, evaluation_clock]
