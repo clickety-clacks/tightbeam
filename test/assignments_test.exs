@@ -923,13 +923,13 @@ defmodule Tightbeam.AssignmentsTest do
       attest_call({:session, "other-session"}, valid_review.id, "verdict")
       |> put_in([:params, :verdict_kind], "third-party")
 
-    _ = handle(ctx, "attest", third_party)
+    assert %{code: "not_holder"} = handle(ctx, "attest", third_party)
 
     user =
       attest_call({:user, "flynn"}, valid_review.id, "verdict")
       |> put_in([:params, :verdict_kind], "user-verdict")
 
-    _ = handle(ctx, "attest", user)
+    assert %{code: "not_holder"} = handle(ctx, "attest", user)
 
     self_commissioned =
       assign_call({:session, "holder"}, "self commissioned")
@@ -957,6 +957,57 @@ defmodule Tightbeam.AssignmentsTest do
            ]
   end
 
+  test "linked review verdicts require the holder before syntax validation", ctx do
+    producer = handle(ctx, "assign", assign_call({:user, "flynn"}, "guard producer"))
+
+    review =
+      assign_call({:user, "flynn"}, "guard review")
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :reviews_assignment_id], producer.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    for verdict_kind <- ["reviewed-clean", "changes-requested"] do
+      result =
+        attest_call({:session, "other-session"}, review.id, "verdict")
+        |> put_in([:params, :verdict_kind], verdict_kind)
+        |> then(&handle(ctx, "attest", &1))
+
+      assert result.attest.verdictKind == verdict_kind
+      assert result.attest.bySession == "other-session"
+      assert result.attest.byUser == nil
+    end
+
+    for {principal, verdict_kind} <- [
+          {{:session, "holder"}, "reviewed-clean"},
+          {{:session, "holder"}, "changes-requested"},
+          {{:user, "flynn"}, "reviewed-clean"},
+          {{:user, "flynn"}, "Bad"}
+        ] do
+      denied =
+        attest_call(principal, review.id, "verdict")
+        |> put_in([:params, :verdict_kind], verdict_kind)
+
+      assert %{code: "not_holder"} = handle(ctx, "attest", denied)
+    end
+
+    assert review.id
+           |> then(&Assignments.list_attests(ctx.db, &1))
+           |> Enum.map(& &1.verdictKind)
+           |> Enum.sort() == ["changes-requested", "reviewed-clean"]
+
+    malformed =
+      attest_call({:session, "other-session"}, review.id, "verdict")
+      |> put_in([:params, :verdict_kind], "Bad")
+
+    assert %{code: "invalid_verdict_kind"} = handle(ctx, "attest", malformed)
+
+    _ =
+      attest_call({:session, "other-session"}, review.id, "completion")
+      |> then(&handle(ctx, "attest", &1))
+
+    assert %{code: "assignment_closed"} = handle(ctx, "attest", malformed)
+  end
+
   test "qualifying review verdict follows the latest independent round across terminal state",
        ctx do
     producer = handle(ctx, "assign", assign_call({:user, "flynn"}, "qualifying producer"))
@@ -969,10 +1020,10 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == []
 
-    _ =
-      attest_call({:session, "holder"}, review.id, "verdict")
-      |> put_in([:params, :verdict_kind], "third-party")
-      |> then(&handle(ctx, "attest", &1))
+    assert %{code: "not_holder"} =
+             attest_call({:session, "holder"}, review.id, "verdict")
+             |> put_in([:params, :verdict_kind], "third-party")
+             |> then(&handle(ctx, "attest", &1))
 
     assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == []
 

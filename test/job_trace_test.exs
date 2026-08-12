@@ -133,7 +133,7 @@ defmodule Tightbeam.JobTraceTest do
              })
 
     assert %{attest: %{verdictKind: "changes-requested"}} =
-             attest(db, {:user, "admin"}, "asg_review", "verdict", %{
+             attest(db, {:session, "reviewer"}, "asg_review", "verdict", %{
                verdict_kind: "changes-requested"
              })
 

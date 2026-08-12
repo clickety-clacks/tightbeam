@@ -1216,6 +1216,10 @@ defmodule Tightbeam.Assignments do
           assignment.state != "open" ->
             assignment_closed()
 
+          not is_nil(assignment.reviewsAssignmentId) and
+              call.principal != {:session, assignment.holderKey} ->
+            error("not_holder", "assignment is held by session #{assignment.holderKey}")
+
           true ->
             with :ok <- valid_verdict_kind(call.params[:verdict_kind]),
                  :ok <- valid_note(call.params[:note]) do

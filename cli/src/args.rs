@@ -482,8 +482,8 @@ COMMANDS:
   attest <assignmentId> --kind progress|completion|surrender|verdict
       [--commit-refs '[{"repo":"host:/abs/path","commit":"<commit>"}]']
          [--verdict <kind>] [--note "..."]
-      File against an assignment. Verdicts require --verdict and may be filed
-      by any session or user; lifecycle attests remain holder-filed.
+      File against an assignment. Verdicts on review cards require the review
+      holder; producer-card verdicts may be filed by any session or user.
   attests <assignmentId>
       List every attest filed against an assignment.
   assignments [--session <key> | --role <name>] [--state open|closed|all]

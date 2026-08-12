@@ -62,7 +62,8 @@ defmodule Tightbeam.CheckTierTest do
     assert progress.attest.bySession == "holder"
   end
 
-  test "verdict path accepts sessions and users, validates last, and never closes", ctx do
+  test "producer-card verdict path accepts sessions and users, validates last, and never closes",
+       ctx do
     assignment = assign(ctx)
 
     for principal <- [{:session, "reviewer"}, {:session, "holder"}, {:user, "flynn"}] do

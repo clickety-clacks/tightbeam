@@ -62,7 +62,7 @@ defmodule Tightbeam.ConformanceSupport do
     ~w(grammar-root-table-rejected grammar-nested-accepted)
   ]
   @world_keys MapSet.new(
-                ~w(users sessions roles work_items assignments attests retune ledger wakes turn)
+                ~w(users sessions roles work_items assignments attests stored_attests retune ledger wakes turn)
               )
   @world_shapes %{
     "users" => ~w(id admin),
@@ -71,6 +71,7 @@ defmodule Tightbeam.ConformanceSupport do
     "work_items" => ~w(id title),
     "assignments" => ~w(id holder creator reviews work_item files),
     "attests" => ~w(assignment kind by verdict_kind),
+    "stored_attests" => ~w(assignment kind by verdict_kind),
     "retune" => ~w(session harness provider),
     "ledger" => ~w(session pending),
     "wakes" => ~w(target creatorSessionKey at),
@@ -2812,6 +2813,33 @@ defmodule Tightbeam.ConformanceSupport do
         })
 
       refute Map.has_key?(result, :code), "failed to materialize attest: #{inspect(result)}"
+    end)
+
+    Enum.each(Map.get(world, "stored_attests", []), fn attest ->
+      {by_session, by_user} =
+        case principal(attest["by"]) do
+          {:session, session} -> {session, nil}
+          {:user, user} -> {nil, user}
+        end
+
+      assert {:ok, _} =
+               DB.query(
+                 db,
+                 """
+                 INSERT INTO attests
+                   (id, assignmentId, kind, verdictKind, bySession, byUser, ts)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 """,
+                 [
+                   "stored_attest_#{System.unique_integer([:positive])}",
+                   assignments[attest["assignment"]],
+                   attest["kind"],
+                   attest["verdict_kind"],
+                   by_session,
+                   by_user,
+                   System.unique_integer([:positive])
+                 ]
+               )
     end)
 
     Enum.each(Map.get(world, "retune", []), fn retune ->
