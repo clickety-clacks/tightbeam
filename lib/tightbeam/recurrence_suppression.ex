@@ -346,11 +346,17 @@ defmodule Tightbeam.RecurrenceSuppression do
       Txn.q(
         txn,
         """
-        UPDATE recurrence_suppression_episodes SET openedEvidenceSequence=?6
+        UPDATE recurrence_suppression_episodes
+        SET openedEvidenceSequence=?6,recoveryClearedSequence=?7
         WHERE statute=?1 AND targetSession=?2 AND subject=?3 AND fingerprintDigest=?4
           AND generation=?5
         """,
-        key ++ [next, opened_evidence_sequence]
+        key ++
+          [
+            next,
+            opened_evidence_sequence,
+            if(evidence_matches?(recovered_evidence), do: nil, else: opened_evidence_sequence)
+          ]
       )
 
       insert_receipt(txn, key, next, occurrence.receipt_id, "rearmed")

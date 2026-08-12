@@ -336,6 +336,115 @@ defmodule Tightbeam.RecurrenceSuppressionTest do
              )
   end
 
+  test "a false recovery observation at rearm opens the away/back baseline", ctx do
+    config = config(99)
+    first = occurrence(ctx.target.session_key, "asg_open_false", "open-false-first", 1)
+
+    assert :dispatch =
+             RecurrenceSuppression.prepare_first(ctx.db, first, "dispatch-open-false")
+
+    assert :deliver =
+             RecurrenceSuppression.record_first(
+               ctx.db,
+               config,
+               first,
+               "dispatch-open-false",
+               evidence(false, "recovered")
+             )
+
+    assert :suppressed =
+             RecurrenceSuppression.repeat(
+               ctx.db,
+               config,
+               occurrence(ctx.target.session_key, "asg_open_false", "recovered-one", 2),
+               evidence(true, "recovered"),
+               evidence(false, "recurred")
+             )
+
+    open_false = occurrence(ctx.target.session_key, "asg_open_false", "open-two", 3)
+
+    assert {:rearmed, 2} =
+             RecurrenceSuppression.repeat(
+               ctx.db,
+               config,
+               open_false,
+               evidence(false, "recovered"),
+               evidence(true, "recurred")
+             )
+
+    assert {:rearmed, 2} =
+             RecurrenceSuppression.repeat(
+               ctx.db,
+               config,
+               open_false,
+               evidence(true, "recovered"),
+               evidence(false, "recurred")
+             )
+
+    assert {:ok, [[2, clear, nil, 3]]} =
+             DB.query(
+               ctx.db,
+               "SELECT generation,recoveryClearedSequence,recoveredSequence,openedOccurrenceSequence FROM recurrence_suppression_episodes WHERE subject='asg_open_false'"
+             )
+
+    assert is_integer(clear)
+
+    assert :suppressed =
+             RecurrenceSuppression.repeat(
+               ctx.db,
+               config,
+               occurrence(ctx.target.session_key, "asg_open_false", "recovered-two", 4),
+               evidence(true, "recovered"),
+               evidence(true, "recurred")
+             )
+
+    results =
+      1..8
+      |> Enum.map(fn n ->
+        Task.async(fn ->
+          RecurrenceSuppression.repeat(
+            ctx.db,
+            config,
+            occurrence(ctx.target.session_key, "asg_open_false", "open-three-#{n}", 5),
+            evidence(true, "recovered"),
+            evidence(true, "recurred")
+          )
+        end)
+      end)
+      |> Task.await_many()
+
+    assert Enum.all?(results, &match?({:rearmed, 3}, &1))
+
+    assert {:ok, [[3, nil, nil, 5]]} =
+             DB.query(
+               ctx.db,
+               "SELECT generation,recoveryClearedSequence,recoveredSequence,openedOccurrenceSequence FROM recurrence_suppression_episodes WHERE subject='asg_open_false'"
+             )
+
+    assert :suppressed =
+             RecurrenceSuppression.repeat(
+               ctx.db,
+               config,
+               occurrence(ctx.target.session_key, "asg_open_false", "still-true", 6),
+               evidence(true, "recovered"),
+               evidence(true, "recurred")
+             )
+
+    assert {:ok, [[3, nil, nil]]} =
+             DB.query(
+               ctx.db,
+               "SELECT generation,recoveryClearedSequence,recoveredSequence FROM recurrence_suppression_episodes WHERE subject='asg_open_false'"
+             )
+
+    assert {:ok, [[2]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM recurrence_suppression_events WHERE subject='asg_open_false' AND outcome='recurrence_rearmed'"
+             )
+
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM wakes")
+  end
+
   test "Main target and missing fingerprint stay audit-only and fail open", ctx do
     config = config(1)
     main_occurrence = occurrence(ctx.main.session_key, "asg_main", "r1", 1)
