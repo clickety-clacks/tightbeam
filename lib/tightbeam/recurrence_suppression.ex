@@ -49,7 +49,7 @@ defmodule Tightbeam.RecurrenceSuppression do
     generation INTEGER NOT NULL,
     receiptId TEXT NOT NULL,
     outcome TEXT NOT NULL,
-    PRIMARY KEY (statute, targetSession, subject, fingerprintDigest, generation, receiptId)
+    PRIMARY KEY (statute, targetSession, subject, fingerprintDigest, receiptId)
   );
   CREATE TABLE IF NOT EXISTS recurrence_suppression_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -175,7 +175,7 @@ defmodule Tightbeam.RecurrenceSuppression do
         :unavailable
 
       episode ->
-        if receipt?(txn, key, episode.generation, occurrence.receipt_id) do
+        if receipt?(txn, key, occurrence.receipt_id) do
           :suppressed
         else
           recovery_observation =
@@ -196,8 +196,7 @@ defmodule Tightbeam.RecurrenceSuppression do
             )
 
           if evidence_matches?(recurred_evidence) and is_integer(episode.recovered_sequence) and
-               occurrence.sequence > episode.recovered_occurrence_sequence and
-               recurrence_observation > episode.recurrence_baseline_sequence do
+               occurrence.sequence > episode.recovered_occurrence_sequence do
             rearm(txn, key, episode, occurrence, recurrence_observation)
           else
             suppress(txn, config, key, episode, occurrence)
@@ -366,7 +365,7 @@ defmodule Tightbeam.RecurrenceSuppression do
 
           audit(
             txn,
-            "recurrence_escalated_main_fallback",
+            "recurrence_escalated",
             %{occurrence | cause: "operational-parent-unavailable"},
             generation,
             count,
@@ -495,15 +494,15 @@ defmodule Tightbeam.RecurrenceSuppression do
     end
   end
 
-  defp receipt?(txn, key, generation, receipt_id) do
+  defp receipt?(txn, key, receipt_id) do
     Txn.q(
       txn,
       """
       SELECT 1 FROM recurrence_suppression_receipts
       WHERE statute=?1 AND targetSession=?2 AND subject=?3 AND fingerprintDigest=?4
-        AND generation=?5 AND receiptId=?6
+        AND receiptId=?5
       """,
-      key ++ [generation, receipt_id]
+      key ++ [receipt_id]
     ) == [[1]]
   end
 

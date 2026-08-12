@@ -95,6 +95,16 @@ defmodule Tightbeam.RecurrenceSuppressionTest do
                evidence(true, "recurred")
              )
 
+    # A receipt is the same durable occurrence across every generation.
+    assert :suppressed =
+             RecurrenceSuppression.repeat(
+               ctx.db,
+               config,
+               second,
+               evidence(false, "recovered"),
+               evidence(false, "recurred")
+             )
+
     other_subject = occurrence(ctx.target.session_key, "asg_two", "r7", 6)
     assert :dispatch = RecurrenceSuppression.prepare_first(ctx.db, other_subject, "dispatch-two")
 
@@ -178,7 +188,62 @@ defmodule Tightbeam.RecurrenceSuppressionTest do
     assert {:ok, [[1]]} =
              DB.query(
                ctx.db,
-               "SELECT count(*) FROM recurrence_suppression_events WHERE outcome='recurrence_escalated_main_fallback' AND cause='operational-parent-unavailable'"
+               "SELECT count(*) FROM recurrence_suppression_events WHERE outcome='recurrence_escalated' AND cause='operational-parent-unavailable'"
+             )
+  end
+
+  test "concurrent matching recurrences open exactly one next generation", ctx do
+    config = config(99)
+    first = occurrence(ctx.target.session_key, "asg_race", "race-first", 1)
+    assert :dispatch = RecurrenceSuppression.prepare_first(ctx.db, first, "dispatch-race")
+
+    assert :deliver =
+             RecurrenceSuppression.record_first(
+               ctx.db,
+               config,
+               first,
+               "dispatch-race",
+               evidence(false, "recovered")
+             )
+
+    recovery = occurrence(ctx.target.session_key, "asg_race", "race-recovery", 2)
+
+    assert :suppressed =
+             RecurrenceSuppression.repeat(
+               ctx.db,
+               config,
+               recovery,
+               evidence(true, "recovered"),
+               evidence(false, "recurred")
+             )
+
+    results =
+      1..8
+      |> Enum.map(fn n ->
+        Task.async(fn ->
+          RecurrenceSuppression.repeat(
+            ctx.db,
+            config,
+            occurrence(ctx.target.session_key, "asg_race", "race-#{n}", 3),
+            evidence(true, "recovered"),
+            evidence(true, "recurred")
+          )
+        end)
+      end)
+      |> Task.await_many()
+
+    assert Enum.count(results, &match?({:rearmed, 2}, &1)) == 1
+
+    assert {:ok, [[2]]} =
+             DB.query(
+               ctx.db,
+               "SELECT generation FROM recurrence_suppression_episodes WHERE subject='asg_race'"
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM recurrence_suppression_events WHERE subject='asg_race' AND outcome='recurrence_rearmed'"
              )
   end
 
@@ -269,9 +334,31 @@ defmodule Tightbeam.RecurrenceSuppressionTest do
     malformed = [
       {String.replace(valid, "target_session_subject", "global"), "scope"},
       {String.replace(valid, "\n  \"failure_code\",", ""), "fingerprint"},
+      {String.replace(valid, "\"failure_code\",", "\"failure_class\","), "fingerprint"},
+      {String.replace(valid, "fingerprint = [", "unknown = true\nfingerprint = ["),
+       "unknown keys"},
       {String.replace(valid, "escalation_threshold = 3", "escalation_threshold = 0"),
        "escalation_threshold"},
+      {String.replace(valid, "escalation_threshold = 3", "escalation_threshold = \"3\""),
+       "escalation_threshold"},
       {String.replace(valid, "operational_parent_then_main", "drop"), "fallback"},
+      {Regex.replace(
+         ~r/\n\[rule\.recurrence_suppression\.rearm\][\s\S]*\z/,
+         valid,
+         ""
+       ), "rearm"},
+      {String.replace(valid, "recovered_when = [", "unknown = true\nrecovered_when = ["),
+       "unknown keys"},
+      {String.replace(
+         valid,
+         ~s(recovered_when = [{ fact = "caller.origin_class", op = "eq", value = "user" }]),
+         "recovered_when = []"
+       ), "recovered_when"},
+      {String.replace(
+         valid,
+         ~s(recurred_when = [{ fact = "assignment.state", op = "eq", value = "open" }]),
+         "recurred_when = []"
+       ), "recurred_when"},
       {String.replace(valid, "caller.origin_class", "unknown.fact", global: false),
        "unknown fact"}
     ]

@@ -127,8 +127,11 @@ defmodule Tightbeam.RailRemedyTest do
       |> put_in([:params, :failure_class], "review-gate")
       |> put_in([:params, :failure_code], "missing-review")
 
-    # Crash specimen: the boundary is durable before producer dispatch. A retry
-    # resumes through the same dispatch identity and still creates one producer.
+    dispatch_key = "rail-dispatch:completion-needs-review:#{assignment.id}:1"
+
+    # Crash specimen: persist the recurrence boundary, deliver the producer, then
+    # simulate a crash before RailRemedy records the delivered target. The normal
+    # retry must replay the same producer and finish the boundary without a second.
     assert :dispatch =
              Tightbeam.RecurrenceSuppression.prepare_first(
                ctx.db,
@@ -137,11 +140,30 @@ defmodule Tightbeam.RailRemedyTest do
                  subject: assignment.id,
                  receipt_id: "receipt-1"
                },
-               "rail-dispatch:completion-needs-review:#{assignment.id}:1"
+               dispatch_key
              )
+
+    producer_call = %{
+      verb: "assign",
+      origin: "remedy:completion-needs-review",
+      principal:
+        {:remedy, %{statute: "completion-needs-review", action: "assign", owner: "flynn"}},
+      session_key: ctx.reviewer.session_key,
+      target_role: "reviewer",
+      role_fallback: false,
+      params: %{
+        subject: "review #{assignment.id}",
+        reviews_assignment_id: assignment.id,
+        idempotency_key: dispatch_key
+      }
+    }
+
+    assert {:ok, delivered_review} = Dispatch.dispatch(ctx.db, ctx.handlers, producer_call)
 
     assert {:error, %{producer: review_id}} =
              Dispatch.dispatch(ctx.db, ctx.handlers, first)
+
+    assert review_id == delivered_review.id
 
     second =
       first
