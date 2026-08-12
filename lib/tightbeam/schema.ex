@@ -24,6 +24,7 @@ defmodule Tightbeam.Schema do
     Tightbeam.Assignments,
     Tightbeam.EffortCheckin,
     Tightbeam.Placement,
+    Tightbeam.RecurrenceSuppression,
     Tightbeam.RailRemedy,
     Tightbeam.Supervision,
     Tightbeam.WorkState,

@@ -115,6 +115,45 @@ defmodule Tightbeam.RailRemedyTest do
              RailRemedy.episode(ctx.db, "completion-needs-review", assignment.id)
   end
 
+  test "declared recurrence suppression stops a repeat before another producer turn", ctx do
+    assignment = assignment(ctx, "recurring")
+    put_rules(ctx, review_gate() <> recurrence_declaration())
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    first =
+      completion_call(assignment.id)
+      |> put_in([:params, :recurrence_receipt_id], "receipt-1")
+      |> put_in([:params, :recurrence_sequence], 1)
+      |> put_in([:params, :failure_class], "review-gate")
+      |> put_in([:params, :failure_code], "missing-review")
+
+    assert {:error, %{producer: review_id}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, first)
+
+    second =
+      first
+      |> put_in([:params, :recurrence_receipt_id], "receipt-2")
+      |> put_in([:params, :recurrence_sequence], 2)
+
+    assert {:error, %{producer: ^review_id}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, second)
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM assignments WHERE reviewsAssignmentId=?1",
+               [assignment.id]
+             )
+
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM wakes")
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM recurrence_suppression_events WHERE outcome='recurrence_repeat_suppressed'"
+             )
+  end
+
   test "replaying a first occurrence close leaves the second occurrence live", ctx do
     assignment = assignment(ctx, "reentered")
     [rule] = load_review_gate(ctx)
@@ -855,6 +894,21 @@ defmodule Tightbeam.RailRemedyTest do
     [rule.remedy.params]
     subject = "review {assignment_id}"
     reviews = "{assignment_id}"
+    """
+  end
+
+  defp recurrence_declaration do
+    """
+
+    [rule.recurrence_suppression]
+    scope = "target_session_subject"
+    fingerprint = ["statute", "target_session", "subject", "failure_class", "failure_code"]
+    escalation_threshold = 3
+    fallback = "operational_parent_then_main"
+
+    [rule.recurrence_suppression.rearm]
+    recovered_when = [{ fact = "caller.origin_class", op = "eq", value = "user" }]
+    recurred_when = [{ fact = "caller.origin_class", op = "eq", value = "agent" }]
     """
   end
 

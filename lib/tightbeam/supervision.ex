@@ -1118,6 +1118,10 @@ defmodule Tightbeam.Supervision do
         principal: {:session, assignment.holderKey},
         session_key: nil,
         edge: :turn_end,
+        recurrence_receipt_id: "turn-end:#{session_key}:#{terminal_seq}",
+        recurrence_sequence: terminal_seq,
+        recurrence_failure_class: "rail-remedy",
+        recurrence_failure_code: "obligation-unsatisfied",
         params: %{assignment_id: assignment.id, kind: "completion"}
       }
 
