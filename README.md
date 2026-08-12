@@ -351,6 +351,7 @@ The service must **start with no interactive login**, **survive logout**,
 | `TIGHTBEAM_DEFAULT_MODEL` | The default model itself, undecorated (`claude-sonnet-5`). Must be live for the default harness. It is a single global, so on a two-harness host one harness will report its default as unselectable — that is expected, not a fault. |
 | `TIGHTBEAM_DEFAULT_EFFORT` | The default reasoning level (`low`…`max`). Required when the default model offers effort tiers — a model is selected by FIELDS, never one packed string. |
 | `TIGHTBEAM_DEFAULT_CONTEXT` | The vendor's context-window variant, when it offers more than one (`1m`). Omit for the model's default window. |
+| `TIGHTBEAM_MAX_LIVE_SESSIONS_PER_USER` | Optional maximum number of live sessions per user. Omit it for unlimited sessions. When set, it must contain only a positive ASCII base-10 integer (`[1-9][0-9]*`); an invalid value stops the gateway during boot. |
 | `CODEX_PATH` | Pin the codex binary. Harness CLIs auto-update underneath you; an unpinned one changes behaviour without warning. |
 
 Run the service **as an ordinary user, not root** — set the account explicitly

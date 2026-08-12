@@ -61,4 +61,12 @@ if config_env() != :test do
   if value = System.get_env("TIGHTBEAM_LOCAL_HOST_NAME") do
     config :tightbeam, :local_host_name, value
   end
+
+  if value = System.get_env("TIGHTBEAM_MAX_LIVE_SESSIONS_PER_USER") do
+    if Regex.match?(~r/\A[1-9][0-9]*\z/, value) do
+      config :tightbeam, :max_live_sessions_per_user, String.to_integer(value)
+    else
+      raise "TIGHTBEAM_MAX_LIVE_SESSIONS_PER_USER must be a positive base-10 integer"
+    end
+  end
 end

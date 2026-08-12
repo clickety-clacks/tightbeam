@@ -16,7 +16,8 @@ defmodule Tightbeam.RuntimeConfigTest do
     "TIGHTBEAM_WORK_ITEM_TRIAGE_DEADLINE_MS" => "404",
     "TIGHTBEAM_ADVERTISED_URL" => "ws://runtime-poison:9999",
     "TIGHTBEAM_DRAIN_TIMEOUT_MS" => "505",
-    "TIGHTBEAM_LOCAL_HOST_NAME" => "runtime-poison-host"
+    "TIGHTBEAM_LOCAL_HOST_NAME" => "runtime-poison-host",
+    "TIGHTBEAM_MAX_LIVE_SESSIONS_PER_USER" => "606"
   }
 
   setup do
@@ -58,11 +59,58 @@ defmodule Tightbeam.RuntimeConfigTest do
         work_item_triage_deadline_ms: 404,
         advertised_url: "ws://runtime-poison:9999",
         drain_timeout_ms: 505,
-        local_host_name: "runtime-poison-host"
+        local_host_name: "runtime-poison-host",
+        max_live_sessions_per_user: 606
       ]
     ]
 
     assert Config.Reader.read!("config/runtime.exs", env: :dev) == expected
     assert Config.Reader.read!("config/runtime.exs", env: :prod) == expected
+  end
+
+  test "an absent live-session cap leaves the runtime setting unset" do
+    System.delete_env("TIGHTBEAM_MAX_LIVE_SESSIONS_PER_USER")
+
+    runtime_config = Config.Reader.read!("config/runtime.exs", env: :prod)
+
+    refute Keyword.has_key?(runtime_config[:tightbeam], :max_live_sessions_per_user)
+  end
+
+  test "a live-session cap accepts the entire positive ASCII base-10 form" do
+    value = "99999999999999999999999999999999999999999999999999"
+    System.put_env("TIGHTBEAM_MAX_LIVE_SESSIONS_PER_USER", value)
+
+    runtime_config = Config.Reader.read!("config/runtime.exs", env: :prod)
+
+    assert runtime_config[:tightbeam][:max_live_sessions_per_user] == String.to_integer(value)
+  end
+
+  test "an invalid live-session cap fails with a safe variable-specific error" do
+    invalid_values = [
+      "",
+      "0",
+      "+1",
+      "-1",
+      " 1",
+      "1 ",
+      "\t1",
+      "1\n",
+      "1_000",
+      "1,000",
+      "١",
+      "one"
+    ]
+
+    for value <- invalid_values do
+      System.put_env("TIGHTBEAM_MAX_LIVE_SESSIONS_PER_USER", value)
+
+      error =
+        assert_raise RuntimeError, fn ->
+          Config.Reader.read!("config/runtime.exs", env: :prod)
+        end
+
+      assert error.message ==
+               "TIGHTBEAM_MAX_LIVE_SESSIONS_PER_USER must be a positive base-10 integer"
+    end
   end
 end
