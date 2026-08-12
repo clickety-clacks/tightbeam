@@ -378,6 +378,14 @@ defmodule Tightbeam.ManualCandidateWorkflowTest do
           true && \
           $runner rev-parse "$CANDIDATE_SHA"
           """,
+          ~S"""
+          false || \
+          $runner rev-parse "$CANDIDATE_SHA"
+          """,
+          ~S"""
+          printf x | \
+          $runner rev-parse "$CANDIDATE_SHA"
+          """,
           "runner=git\n$runner rev-parse \"$CANDIDATE_SHA\"",
           "command='git rev-parse'\n$command \"$CANDIDATE_SHA\"",
           "args=(git rev-parse \"$CANDIDATE_SHA\")\n\"${args[@]}\"",
@@ -405,6 +413,10 @@ defmodule Tightbeam.ManualCandidateWorkflowTest do
     case x in x) git rev-parse "$CANDIDATE_SHA";; esac
     time git rev-parse "$CANDIDATE_SHA"
     true && \
+    git rev-parse "$CANDIDATE_SHA"
+    false || \
+    git rev-parse "$CANDIDATE_SHA"
+    printf x | \
     git rev-parse "$CANDIDATE_SHA"
     """
 
