@@ -13,6 +13,7 @@ defmodule Tightbeam.RecurrenceSuppression do
     generation INTEGER NOT NULL CHECK (generation > 0),
     suppressedCount INTEGER NOT NULL DEFAULT 0 CHECK (suppressedCount >= 0),
     openedEvidenceSequence INTEGER NOT NULL,
+    openedOccurrenceSequence INTEGER NOT NULL,
     recoveredSequence INTEGER,
     recoveredOccurrenceSequence INTEGER,
     recurrenceBaselineSequence INTEGER,
@@ -132,11 +133,11 @@ defmodule Tightbeam.RecurrenceSuppression do
       """
       INSERT INTO recurrence_suppression_episodes
         (statute,targetSession,subject,fingerprintDigest,generation,suppressedCount,
-         openedEvidenceSequence,recoveredSequence,recoveredOccurrenceSequence,
+         openedEvidenceSequence,openedOccurrenceSequence,recoveredSequence,recoveredOccurrenceSequence,
          recurrenceBaselineSequence,escalated)
-      VALUES (?1,?2,?3,?4,1,0,?5,NULL,NULL,NULL,0) ON CONFLICT DO NOTHING
+      VALUES (?1,?2,?3,?4,1,0,?5,?6,NULL,NULL,NULL,0) ON CONFLICT DO NOTHING
       """,
-      key ++ [opened_sequence]
+      key ++ [opened_sequence, occurrence.sequence]
     )
 
     generation = episode(txn, key).generation
@@ -175,32 +176,48 @@ defmodule Tightbeam.RecurrenceSuppression do
         :unavailable
 
       episode ->
-        if receipt?(txn, key, occurrence.receipt_id) do
-          :suppressed
-        else
-          recovery_observation =
-            observe(txn, key, episode.generation, "recovered", recovered_evidence)
+        case receipt_result(txn, key, occurrence.receipt_id) do
+          nil ->
+            if episode.generation > 1 and
+                 occurrence.sequence == episode.opened_occurrence_sequence and
+                 evidence_matches?(recurred_evidence) do
+              replay_rearm(txn, key, episode.generation, occurrence.receipt_id)
+            else
+              recovery_observation =
+                observe(txn, key, episode.generation, "recovered", recovered_evidence)
 
-          recurrence_observation =
-            observe(txn, key, episode.generation, "recurred", recurred_evidence)
+              recurrence_observation =
+                observe(txn, key, episode.generation, "recurred", recurred_evidence)
 
-          episode =
-            maybe_recover(
-              txn,
-              key,
-              episode,
-              occurrence,
-              recovered_evidence,
-              recovery_observation,
-              recurrence_observation
-            )
+              episode =
+                maybe_recover(
+                  txn,
+                  key,
+                  episode,
+                  occurrence,
+                  recovered_evidence,
+                  recovery_observation,
+                  recurrence_observation
+                )
 
-          if evidence_matches?(recurred_evidence) and is_integer(episode.recovered_sequence) and
-               occurrence.sequence > episode.recovered_occurrence_sequence do
-            rearm(txn, key, episode, occurrence, recurrence_observation)
-          else
-            suppress(txn, config, key, episode, occurrence)
-          end
+              if evidence_matches?(recurred_evidence) and
+                   is_integer(episode.recovered_sequence) and
+                   occurrence.sequence > episode.recovered_occurrence_sequence do
+                rearm(
+                  txn,
+                  key,
+                  episode,
+                  occurrence,
+                  recovered_evidence,
+                  recurrence_observation
+                )
+              else
+                suppress(txn, config, key, episode, occurrence)
+              end
+            end
+
+          result ->
+            result
         end
     end
   end
@@ -260,23 +277,43 @@ defmodule Tightbeam.RecurrenceSuppression do
   defp maybe_recover(_txn, _key, episode, _occurrence, _evidence, _recovery, _recurrence),
     do: episode
 
-  defp rearm(txn, key, episode, occurrence, recurrence_observation) do
+  defp rearm(txn, key, episode, occurrence, recovered_evidence, recurrence_observation) do
     next = episode.generation + 1
 
     Txn.q(
       txn,
       """
       UPDATE recurrence_suppression_episodes
-      SET generation=?7,suppressedCount=0,openedEvidenceSequence=?8,recoveredSequence=NULL,
+      SET generation=?7,suppressedCount=0,openedEvidenceSequence=?8,
+          openedOccurrenceSequence=?9,recoveredSequence=NULL,
           recoveredOccurrenceSequence=NULL,recurrenceBaselineSequence=NULL,escalated=0
       WHERE statute=?1 AND targetSession=?2 AND subject=?3 AND fingerprintDigest=?4
         AND generation=?5 AND recoveredSequence=?6
       """,
-      key ++ [episode.generation, episode.recovered_sequence, next, recurrence_observation]
+      key ++
+        [
+          episode.generation,
+          episode.recovered_sequence,
+          next,
+          recurrence_observation,
+          occurrence.sequence
+        ]
     )
 
     if Txn.changes(txn) == 1 do
-      insert_receipt(txn, key, next, occurrence.receipt_id, "delivered")
+      opened_evidence_sequence = observe(txn, key, next, "recovered", recovered_evidence)
+
+      Txn.q(
+        txn,
+        """
+        UPDATE recurrence_suppression_episodes SET openedEvidenceSequence=?6
+        WHERE statute=?1 AND targetSession=?2 AND subject=?3 AND fingerprintDigest=?4
+          AND generation=?5
+        """,
+        key ++ [next, opened_evidence_sequence]
+      )
+
+      insert_receipt(txn, key, next, occurrence.receipt_id, "rearmed")
 
       audit(
         txn,
@@ -290,8 +327,20 @@ defmodule Tightbeam.RecurrenceSuppression do
 
       {:rearmed, next}
     else
-      :suppressed
+      case episode(txn, key) do
+        %{generation: ^next, opened_occurrence_sequence: sequence}
+        when sequence == occurrence.sequence ->
+          replay_rearm(txn, key, next, occurrence.receipt_id)
+
+        _ ->
+          :suppressed
+      end
     end
+  end
+
+  defp replay_rearm(txn, key, generation, receipt_id) do
+    insert_receipt(txn, key, generation, receipt_id, "rearmed")
+    {:rearmed, generation}
   end
 
   defp suppress(txn, config, key, episode, occurrence) do
@@ -461,8 +510,8 @@ defmodule Tightbeam.RecurrenceSuppression do
     case Txn.q(
            txn,
            """
-           SELECT generation,suppressedCount,openedEvidenceSequence,recoveredSequence,
-                  recoveredOccurrenceSequence,recurrenceBaselineSequence,escalated
+           SELECT generation,suppressedCount,openedEvidenceSequence,openedOccurrenceSequence,
+                  recoveredSequence,recoveredOccurrenceSequence,recurrenceBaselineSequence,escalated
            FROM recurrence_suppression_episodes
            WHERE statute=?1 AND targetSession=?2 AND subject=?3 AND fingerprintDigest=?4
            """,
@@ -473,6 +522,7 @@ defmodule Tightbeam.RecurrenceSuppression do
           generation,
           count,
           opened,
+          opened_occurrence,
           recovered,
           recovered_occurrence,
           recurrence_baseline,
@@ -483,6 +533,7 @@ defmodule Tightbeam.RecurrenceSuppression do
           generation: generation,
           suppressed_count: count,
           opened_evidence_sequence: opened,
+          opened_occurrence_sequence: opened_occurrence,
           recovered_sequence: recovered,
           recovered_occurrence_sequence: recovered_occurrence,
           recurrence_baseline_sequence: recurrence_baseline,
@@ -494,16 +545,21 @@ defmodule Tightbeam.RecurrenceSuppression do
     end
   end
 
-  defp receipt?(txn, key, receipt_id) do
-    Txn.q(
-      txn,
-      """
-      SELECT 1 FROM recurrence_suppression_receipts
-      WHERE statute=?1 AND targetSession=?2 AND subject=?3 AND fingerprintDigest=?4
-        AND receiptId=?5
-      """,
-      key ++ [receipt_id]
-    ) == [[1]]
+  defp receipt_result(txn, key, receipt_id) do
+    case Txn.q(
+           txn,
+           """
+           SELECT generation,outcome FROM recurrence_suppression_receipts
+           WHERE statute=?1 AND targetSession=?2 AND subject=?3 AND fingerprintDigest=?4
+             AND receiptId=?5
+           """,
+           key ++ [receipt_id]
+         ) do
+      [[_generation, "delivered"]] -> :deliver
+      [[_generation, "suppressed"]] -> :suppressed
+      [[generation, "rearmed"]] -> {:rearmed, generation}
+      [] -> nil
+    end
   end
 
   defp insert_receipt(txn, key, generation, receipt_id, outcome) do

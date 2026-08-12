@@ -105,6 +105,15 @@ defmodule Tightbeam.RecurrenceSuppressionTest do
                evidence(false, "recurred")
              )
 
+    assert {:rearmed, 2} =
+             RecurrenceSuppression.repeat(
+               ctx.db,
+               config,
+               recurrence,
+               evidence(false, "recovered"),
+               evidence(false, "recurred")
+             )
+
     other_subject = occurrence(ctx.target.session_key, "asg_two", "r7", 6)
     assert :dispatch = RecurrenceSuppression.prepare_first(ctx.db, other_subject, "dispatch-two")
 
@@ -232,18 +241,80 @@ defmodule Tightbeam.RecurrenceSuppressionTest do
       end)
       |> Task.await_many()
 
-    assert Enum.count(results, &match?({:rearmed, 2}, &1)) == 1
+    assert Enum.all?(results, &match?({:rearmed, 2}, &1))
 
-    assert {:ok, [[2]]} =
+    assert {:ok, [[2, 0, nil, nil, 3]]} =
              DB.query(
                ctx.db,
-               "SELECT generation FROM recurrence_suppression_episodes WHERE subject='asg_race'"
+               "SELECT generation,suppressedCount,recoveredSequence,recoveredOccurrenceSequence,openedOccurrenceSequence FROM recurrence_suppression_episodes WHERE subject='asg_race'"
              )
 
     assert {:ok, [[1]]} =
              DB.query(
                ctx.db,
                "SELECT count(*) FROM recurrence_suppression_events WHERE subject='asg_race' AND outcome='recurrence_rearmed'"
+             )
+
+    assert {:ok, [[8]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM recurrence_suppression_receipts WHERE subject='asg_race' AND generation=2 AND outcome='rearmed'"
+             )
+
+    unchanged_recovery = occurrence(ctx.target.session_key, "asg_race", "race-9", 4)
+
+    assert :suppressed =
+             RecurrenceSuppression.repeat(
+               ctx.db,
+               config,
+               unchanged_recovery,
+               evidence(true, "recovered"),
+               evidence(true, "recurred")
+             )
+
+    assert {:ok, [[2, 1, nil]]} =
+             DB.query(
+               ctx.db,
+               "SELECT generation,suppressedCount,recoveredSequence FROM recurrence_suppression_episodes WHERE subject='asg_race'"
+             )
+
+    changed_away = occurrence(ctx.target.session_key, "asg_race", "race-10", 5)
+
+    assert :suppressed =
+             RecurrenceSuppression.repeat(
+               ctx.db,
+               config,
+               changed_away,
+               evidence(false, "recovered"),
+               evidence(true, "recurred")
+             )
+
+    recovered = occurrence(ctx.target.session_key, "asg_race", "race-11", 6)
+
+    assert :suppressed =
+             RecurrenceSuppression.repeat(
+               ctx.db,
+               config,
+               recovered,
+               evidence(true, "recovered"),
+               evidence(true, "recurred")
+             )
+
+    later_recurrence = occurrence(ctx.target.session_key, "asg_race", "race-12", 7)
+
+    assert {:rearmed, 3} =
+             RecurrenceSuppression.repeat(
+               ctx.db,
+               config,
+               later_recurrence,
+               evidence(true, "recovered"),
+               evidence(true, "recurred")
+             )
+
+    assert {:ok, [[3, 0, nil, 7]]} =
+             DB.query(
+               ctx.db,
+               "SELECT generation,suppressedCount,recoveredSequence,openedOccurrenceSequence FROM recurrence_suppression_episodes WHERE subject='asg_race'"
              )
   end
 
