@@ -366,6 +366,9 @@ defmodule Tightbeam.ManualCandidateWorkflowTest do
           ~S|git rev-parse "$CANDIDATE_SHA"suffix|,
           ~S|runner=git; "$runner" rev-parse "$CANDIDATE_SHA"|,
           ~S|runner=git; ${runner} rev-parse "$CANDIDATE_SHA"|,
+          ~S|runner=git; ${runner:-git} rev-parse "$CANDIDATE_SHA"|,
+          ~S|set -- git; $1 rev-parse "$CANDIDATE_SHA"|,
+          ~S|runner=git; >out $runner rev-parse "$CANDIDATE_SHA"|,
           ~S|if true; then $runner rev-parse "$CANDIDATE_SHA"; fi|,
           ~S|while false; do $runner rev-parse "$CANDIDATE_SHA"; done|,
           ~S|{ $runner rev-parse "$CANDIDATE_SHA"; }|,
@@ -453,7 +456,10 @@ defmodule Tightbeam.ManualCandidateWorkflowTest do
           ~S|printf '%s\n' "$runner"|,
           ~S|value=$runner|,
           ~S|[[ ! $runner ]]|,
-          ~S|case "$runner" in x) printf '%s\n' "$runner";; esac|
+          ~S|case "$runner" in x) printf '%s\n' "$runner";; esac|,
+          ~S|printf x \; "$runner"|,
+          ~S|printf '%s\n' "${runner:-git}" "$1"|,
+          ~S|>out git rev-parse "$CANDIDATE_SHA"|
         ] do
       assert static_run_body?(control),
              "non-command-position parameter was rejected:\n#{control}"
@@ -1031,28 +1037,66 @@ defmodule Tightbeam.ManualCandidateWorkflowTest do
   end
 
   defp shell_tokens(run) do
-    ~r/"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\$\{[A-Za-z_][A-Za-z0-9_]*\}|&&|\|\||;;|[;&|(){}!]|\n|[^\s;&|(){}!]+/
-    |> Regex.scan(run)
-    |> List.flatten()
+    run
+    |> String.graphemes()
+    |> shell_tokens([], false, [], :unquoted)
+    |> Enum.reverse()
   end
 
   defp variable_command_word?([], _position), do: false
 
+  defp variable_command_word?([{:word, "]]", false} | rest], :double_bracket),
+    do: variable_command_word?(rest, :argument)
+
+  defp variable_command_word?([_token | rest], :double_bracket),
+    do: variable_command_word?(rest, :double_bracket)
+
+  defp variable_command_word?([{:redirection, _operator} | rest], position) do
+    rest
+    |> skip_redirection_target()
+    |> variable_command_word?(position)
+  end
+
   defp variable_command_word?([token | rest], position) do
     cond do
-      token in ["\n", ";", ";;", "&", "&&", "|", "||", ")", "}"] ->
+      token in [
+        {:control, "\n"},
+        {:control, ";"},
+        {:control, ";;"},
+        {:control, ";&"},
+        {:control, ";;&"},
+        {:control, "&"},
+        {:control, "&&"},
+        {:control, "|"},
+        {:control, "||"},
+        {:control, ")"},
+        {:control, "}"}
+      ] ->
         variable_command_word?(rest, :command)
 
-      position == :command and token in ["(", "{", "!"] ->
+      position == :command and token in [{:control, "("}, {:control, "{"}, {:control, "!"}] ->
         variable_command_word?(rest, :command)
 
-      position == :command and token in ["then", "do", "else"] ->
+      position == :command and token == {:word, "[[", false} ->
+        variable_command_word?(rest, :double_bracket)
+
+      position == :command and
+          token in [{:word, "then", false}, {:word, "do", false}, {:word, "else", false}] ->
         variable_command_word?(rest, :command)
 
-      position == :command and token == "time" ->
+      position == :command and
+          token in [
+            {:word, "if", false},
+            {:word, "elif", false},
+            {:word, "while", false},
+            {:word, "until", false}
+          ] ->
+        variable_command_word?(rest, :command)
+
+      position == :command and token == {:word, "time", false} ->
         variable_command_word?(rest, :time_option)
 
-      position == :time_option and token == "-p" ->
+      position == :time_option and token == {:word, "-p", false} ->
         variable_command_word?(rest, :time_command)
 
       position in [:command, :time_option, :time_command] and shell_assignment_word?(token) ->
@@ -1069,15 +1113,170 @@ defmodule Tightbeam.ManualCandidateWorkflowTest do
     end
   end
 
-  defp shell_assignment_word?(token),
+  defp skip_redirection_target([{:word, _word, _expanded?} | rest]), do: rest
+  defp skip_redirection_target(tokens), do: tokens
+
+  defp shell_assignment_word?({:word, token, _expanded?}),
     do: Regex.match?(~r/^[A-Za-z_][A-Za-z0-9_]*=/, token)
 
-  defp shell_parameter_word?(token),
+  defp shell_assignment_word?(_token), do: false
+
+  defp shell_parameter_word?({:word, _token, expanded?}), do: expanded?
+  defp shell_parameter_word?(_token), do: false
+
+  defp shell_tokens([], word, expanded?, tokens, _quote) do
+    push_shell_word(tokens, word, expanded?)
+  end
+
+  defp shell_tokens(["'" | rest], word, expanded?, tokens, :single_quoted),
+    do: shell_tokens(rest, ["'" | word], expanded?, tokens, :unquoted)
+
+  defp shell_tokens([character | rest], word, expanded?, tokens, :single_quoted),
+    do: shell_tokens(rest, [character | word], expanded?, tokens, :single_quoted)
+
+  defp shell_tokens(["\\", escaped | rest], word, expanded?, tokens, :double_quoted),
+    do: shell_tokens(rest, [escaped, "\\" | word], expanded?, tokens, :double_quoted)
+
+  defp shell_tokens(["\"" | rest], word, expanded?, tokens, :double_quoted),
+    do: shell_tokens(rest, ["\"" | word], expanded?, tokens, :unquoted)
+
+  defp shell_tokens(["$" | rest], word, expanded?, tokens, :double_quoted),
     do:
-      Regex.match?(
-        ~r/^(?:"\$(?:\{[A-Za-z_][A-Za-z0-9_]*\}|[A-Za-z_][A-Za-z0-9_]*)"|\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Za-z_][A-Za-z0-9_]*)$/,
-        token
+      shell_tokens(
+        rest,
+        ["$" | word],
+        expanded? or parameter_expansion_start?(rest),
+        tokens,
+        :double_quoted
       )
+
+  defp shell_tokens([character | rest], word, expanded?, tokens, :double_quoted),
+    do: shell_tokens(rest, [character | word], expanded?, tokens, :double_quoted)
+
+  defp shell_tokens(["\\", escaped | rest], word, expanded?, tokens, :unquoted),
+    do: shell_tokens(rest, [escaped, "\\" | word], expanded?, tokens, :unquoted)
+
+  defp shell_tokens(["\\"], word, expanded?, tokens, :unquoted),
+    do: push_shell_word(tokens, ["\\" | word], expanded?)
+
+  defp shell_tokens(["'" | rest], word, expanded?, tokens, :unquoted),
+    do: shell_tokens(rest, ["'" | word], expanded?, tokens, :single_quoted)
+
+  defp shell_tokens(["\"" | rest], word, expanded?, tokens, :unquoted),
+    do: shell_tokens(rest, ["\"" | word], expanded?, tokens, :double_quoted)
+
+  defp shell_tokens(["\n" | rest], word, expanded?, tokens, :unquoted) do
+    tokens = push_shell_word(tokens, word, expanded?)
+    shell_tokens(rest, [], false, [{:control, "\n"} | tokens], :unquoted)
+  end
+
+  defp shell_tokens([character | rest], word, expanded?, tokens, :unquoted)
+       when character in [" ", "\t", "\r"] do
+    shell_tokens(rest, [], false, push_shell_word(tokens, word, expanded?), :unquoted)
+  end
+
+  defp shell_tokens([";", ";", "&" | rest], word, expanded?, tokens, :unquoted),
+    do: push_shell_control(rest, word, expanded?, tokens, ";;&")
+
+  defp shell_tokens(["&", ">", ">" | rest], word, expanded?, tokens, :unquoted),
+    do: push_shell_redirection(rest, word, expanded?, tokens, "&>>")
+
+  defp shell_tokens(["&", ">" | rest], word, expanded?, tokens, :unquoted),
+    do: push_shell_redirection(rest, word, expanded?, tokens, "&>")
+
+  defp shell_tokens([first, second | rest], word, expanded?, tokens, :unquoted)
+       when {first, second} in [{"&", "&"}, {"|", "|"}, {";", ";"}, {";", "&"}] do
+    push_shell_control(rest, word, expanded?, tokens, first <> second)
+  end
+
+  defp shell_tokens([character | rest], word, expanded?, tokens, :unquoted)
+       when character in ["<", ">"] do
+    {operator, rest} = take_shell_redirection(character, rest)
+    push_shell_redirection(rest, word, expanded?, tokens, operator)
+  end
+
+  defp shell_tokens([character | rest], word, expanded?, tokens, :unquoted)
+       when character in [";", "&", "|", "(", ")"] do
+    push_shell_control(rest, word, expanded?, tokens, character)
+  end
+
+  defp shell_tokens([character | rest], [], false, tokens, :unquoted)
+       when character in ["{", "}", "!"] do
+    if shell_reserved_boundary?(rest) do
+      shell_tokens(rest, [], false, [{:control, character} | tokens], :unquoted)
+    else
+      shell_tokens(rest, [character], false, tokens, :unquoted)
+    end
+  end
+
+  defp shell_tokens(["$" | rest], word, expanded?, tokens, :unquoted),
+    do:
+      shell_tokens(
+        rest,
+        ["$" | word],
+        expanded? or parameter_expansion_start?(rest),
+        tokens,
+        :unquoted
+      )
+
+  defp shell_tokens([character | rest], word, expanded?, tokens, :unquoted),
+    do: shell_tokens(rest, [character | word], expanded?, tokens, :unquoted)
+
+  defp push_shell_control(rest, word, expanded?, tokens, operator) do
+    tokens = push_shell_word(tokens, word, expanded?)
+    shell_tokens(rest, [], false, [{:control, operator} | tokens], :unquoted)
+  end
+
+  defp push_shell_redirection(rest, word, expanded?, tokens, operator) do
+    {descriptor, tokens} =
+      case shell_word(word) do
+        descriptor when descriptor != "" ->
+          if Regex.match?(~r/^\d+$/, descriptor) do
+            {descriptor, tokens}
+          else
+            {"", push_shell_word(tokens, word, expanded?)}
+          end
+
+        "" ->
+          {"", tokens}
+      end
+
+    shell_tokens(
+      rest,
+      [],
+      false,
+      [{:redirection, descriptor <> operator} | tokens],
+      :unquoted
+    )
+  end
+
+  defp take_shell_redirection("<", ["<", "<" | rest]), do: {"<<<", rest}
+  defp take_shell_redirection("<", ["<" | rest]), do: {"<<", rest}
+  defp take_shell_redirection("<", [">" | rest]), do: {"<>", rest}
+  defp take_shell_redirection("<", ["&" | rest]), do: {"<&", rest}
+  defp take_shell_redirection(">", [">" | rest]), do: {">>", rest}
+  defp take_shell_redirection(">", ["&" | rest]), do: {">&", rest}
+  defp take_shell_redirection(">", ["|" | rest]), do: {">|", rest}
+  defp take_shell_redirection(operator, rest), do: {operator, rest}
+
+  defp shell_reserved_boundary?([]), do: true
+
+  defp shell_reserved_boundary?([character | _rest]),
+    do: character in [" ", "\t", "\r", "\n", ";", "&", "|", "(", ")", "<", ">"]
+
+  defp parameter_expansion_start?([character | _rest]),
+    do:
+      character in ["{", "(", "@", "*", "#", "?", "-", "$", "!", "_"] or
+        Regex.match?(~r/^[A-Za-z0-9_]$/, character)
+
+  defp parameter_expansion_start?([]), do: false
+
+  defp push_shell_word(tokens, [], _expanded?), do: tokens
+
+  defp push_shell_word(tokens, word, expanded?),
+    do: [{:word, shell_word(word), expanded?} | tokens]
+
+  defp shell_word(word), do: word |> Enum.reverse() |> Enum.join()
 
   defp walk(value) when is_map(value),
     do: Enum.flat_map(value, fn {key, item} -> [key | walk(item)] end)
