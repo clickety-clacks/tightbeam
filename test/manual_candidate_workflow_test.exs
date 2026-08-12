@@ -363,6 +363,9 @@ defmodule Tightbeam.ManualCandidateWorkflowTest do
     for fixture <- [
           ~S|cmd="git rev-parse "; cmd+="$CANDIDATE_SHA"; $cmd|,
           ~S|runner=git; $runner rev-parse "$CANDIDATE_SHA"|,
+          ~S|if true; then $runner rev-parse "$CANDIDATE_SHA"; fi|,
+          ~S|while false; do $runner rev-parse "$CANDIDATE_SHA"; done|,
+          ~S|{ $runner rev-parse "$CANDIDATE_SHA"; }|,
           "runner=git\n$runner rev-parse \"$CANDIDATE_SHA\"",
           "command='git rev-parse'\n$command \"$CANDIDATE_SHA\"",
           "args=(git rev-parse \"$CANDIDATE_SHA\")\n\"${args[@]}\"",
@@ -372,6 +375,12 @@ defmodule Tightbeam.ManualCandidateWorkflowTest do
         ] do
       refute static_run_body?(fixture), "constructed command fixture passed:\n#{fixture}"
     end
+
+    assert static_run_body?("""
+           if true; then git rev-parse "$CANDIDATE_SHA"; fi
+           while false; do git rev-parse "$CANDIDATE_SHA"; done
+           { git rev-parse "$CANDIDATE_SHA"; }
+           """)
   end
 
   test "raw dispatch input has one data-only transport and validated SHA use stays quoted" do
@@ -891,7 +900,7 @@ defmodule Tightbeam.ManualCandidateWorkflowTest do
       ~r/(^|\s)(sh|bash)\s+-c(\s|$)/m,
       ~r/(?im)^\s*(?:(?:local|readonly)\s+|declare(?:\s+-[a-z]+)?\s+)?[a-z_][a-z0-9_]*(?:cmd|command)[a-z0-9_]*\s*\+?=/,
       ~r/\+=/,
-      ~r/(?m)(?:^|[;&|])\s*\$[A-Za-z_][A-Za-z0-9_]*(?:\s|$)/,
+      ~r/(?m)(?:^|[;&|])\s*(?:(?:then|do)\s+)?(?:\{\s*)?\$[A-Za-z_][A-Za-z0-9_]*(?:\s|$)/,
       ~r/(?m)^\s*\$\{[A-Za-z_][A-Za-z0-9_]*\}(?:\s|$)/,
       ~r/(?m)^\s*"\$\{[A-Za-z_][A-Za-z0-9_]*\[@\]\}"(?:\s|$)/,
       ~r/\$\{![A-Za-z_][A-Za-z0-9_]*\}/,
