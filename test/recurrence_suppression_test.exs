@@ -278,7 +278,25 @@ defmodule Tightbeam.RecurrenceSuppressionTest do
                "SELECT generation,suppressedCount,recoveredSequence FROM recurrence_suppression_episodes WHERE subject='asg_race'"
              )
 
-    changed_away = occurrence(ctx.target.session_key, "asg_race", "race-10", 5)
+    changed_but_still_true =
+      occurrence(ctx.target.session_key, "asg_race", "race-still-true", 5)
+
+    assert :suppressed =
+             RecurrenceSuppression.repeat(
+               ctx.db,
+               config,
+               changed_but_still_true,
+               evidence(true, "recovered-extra"),
+               evidence(true, "recurred")
+             )
+
+    assert {:ok, [[2, 2, nil, nil]]} =
+             DB.query(
+               ctx.db,
+               "SELECT generation,suppressedCount,recoveryClearedSequence,recoveredSequence FROM recurrence_suppression_episodes WHERE subject='asg_race'"
+             )
+
+    changed_away = occurrence(ctx.target.session_key, "asg_race", "race-10", 6)
 
     assert :suppressed =
              RecurrenceSuppression.repeat(
@@ -289,7 +307,7 @@ defmodule Tightbeam.RecurrenceSuppressionTest do
                evidence(true, "recurred")
              )
 
-    recovered = occurrence(ctx.target.session_key, "asg_race", "race-11", 6)
+    recovered = occurrence(ctx.target.session_key, "asg_race", "race-11", 7)
 
     assert :suppressed =
              RecurrenceSuppression.repeat(
@@ -300,7 +318,7 @@ defmodule Tightbeam.RecurrenceSuppressionTest do
                evidence(true, "recurred")
              )
 
-    later_recurrence = occurrence(ctx.target.session_key, "asg_race", "race-12", 7)
+    later_recurrence = occurrence(ctx.target.session_key, "asg_race", "race-12", 8)
 
     assert {:rearmed, 3} =
              RecurrenceSuppression.repeat(
@@ -311,7 +329,7 @@ defmodule Tightbeam.RecurrenceSuppressionTest do
                evidence(true, "recurred")
              )
 
-    assert {:ok, [[3, 0, nil, 7]]} =
+    assert {:ok, [[3, 0, nil, 8]]} =
              DB.query(
                ctx.db,
                "SELECT generation,suppressedCount,recoveredSequence,openedOccurrenceSequence FROM recurrence_suppression_episodes WHERE subject='asg_race'"

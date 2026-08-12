@@ -165,6 +165,14 @@ defmodule Tightbeam.RailRemedyTest do
 
     assert review_id == delivered_review.id
 
+    assert {:error, %{producer: ^review_id}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, first)
+
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM wakes")
+
+    assert %{rewake_count: 0} =
+             RailRemedy.episode(ctx.db, "completion-needs-review", assignment.id)
+
     second =
       first
       |> put_in([:params, :recurrence_receipt_id], "receipt-2")

@@ -14,6 +14,7 @@ defmodule Tightbeam.RecurrenceSuppression do
     suppressedCount INTEGER NOT NULL DEFAULT 0 CHECK (suppressedCount >= 0),
     openedEvidenceSequence INTEGER NOT NULL,
     openedOccurrenceSequence INTEGER NOT NULL,
+    recoveryClearedSequence INTEGER,
     recoveredSequence INTEGER,
     recoveredOccurrenceSequence INTEGER,
     recurrenceBaselineSequence INTEGER,
@@ -133,11 +134,16 @@ defmodule Tightbeam.RecurrenceSuppression do
       """
       INSERT INTO recurrence_suppression_episodes
         (statute,targetSession,subject,fingerprintDigest,generation,suppressedCount,
-         openedEvidenceSequence,openedOccurrenceSequence,recoveredSequence,recoveredOccurrenceSequence,
-         recurrenceBaselineSequence,escalated)
-      VALUES (?1,?2,?3,?4,1,0,?5,?6,NULL,NULL,NULL,0) ON CONFLICT DO NOTHING
+         openedEvidenceSequence,openedOccurrenceSequence,recoveryClearedSequence,
+         recoveredSequence,recoveredOccurrenceSequence,recurrenceBaselineSequence,escalated)
+      VALUES (?1,?2,?3,?4,1,0,?5,?6,?7,NULL,NULL,NULL,0) ON CONFLICT DO NOTHING
       """,
-      key ++ [opened_sequence, occurrence.sequence]
+      key ++
+        [
+          opened_sequence,
+          occurrence.sequence,
+          if(evidence_matches?(recovered_evidence), do: nil, else: opened_sequence)
+        ]
     )
 
     generation = episode(txn, key).generation
@@ -190,6 +196,15 @@ defmodule Tightbeam.RecurrenceSuppression do
                 observe(txn, key, episode.generation, "recurred", recurred_evidence)
 
               episode =
+                maybe_clear_recovery(
+                  txn,
+                  key,
+                  episode,
+                  recovered_evidence,
+                  recovery_observation
+                )
+
+              episode =
                 maybe_recover(
                   txn,
                   key,
@@ -222,6 +237,30 @@ defmodule Tightbeam.RecurrenceSuppression do
     end
   end
 
+  defp maybe_clear_recovery(txn, key, episode, evidence, recovery_observation) do
+    Txn.q(
+      txn,
+      """
+      UPDATE recurrence_suppression_episodes SET recoveryClearedSequence=?5
+      WHERE statute=?1 AND targetSession=?2 AND subject=?3 AND fingerprintDigest=?4
+        AND generation=?6 AND recoveryClearedSequence IS NULL AND recoveredSequence IS NULL
+        AND ?7=1
+      """,
+      key ++
+        [
+          recovery_observation,
+          episode.generation,
+          if(evidence_matches?(evidence), do: 0, else: 1)
+        ]
+    )
+
+    if Txn.changes(txn) == 1 do
+      %{episode | recovery_cleared_sequence: recovery_observation}
+    else
+      episode(txn, key)
+    end
+  end
+
   defp maybe_recover(
          txn,
          key,
@@ -232,7 +271,8 @@ defmodule Tightbeam.RecurrenceSuppression do
          recurrence_observation
        ) do
     eligible =
-      evidence_matches?(evidence) and recovery_observation > episode.opened_evidence_sequence
+      evidence_matches?(evidence) and is_integer(episode.recovery_cleared_sequence) and
+        recovery_observation > episode.recovery_cleared_sequence
 
     Txn.q(
       txn,
@@ -285,7 +325,7 @@ defmodule Tightbeam.RecurrenceSuppression do
       """
       UPDATE recurrence_suppression_episodes
       SET generation=?7,suppressedCount=0,openedEvidenceSequence=?8,
-          openedOccurrenceSequence=?9,recoveredSequence=NULL,
+          openedOccurrenceSequence=?9,recoveryClearedSequence=NULL,recoveredSequence=NULL,
           recoveredOccurrenceSequence=NULL,recurrenceBaselineSequence=NULL,escalated=0
       WHERE statute=?1 AND targetSession=?2 AND subject=?3 AND fingerprintDigest=?4
         AND generation=?5 AND recoveredSequence=?6
@@ -511,7 +551,8 @@ defmodule Tightbeam.RecurrenceSuppression do
            txn,
            """
            SELECT generation,suppressedCount,openedEvidenceSequence,openedOccurrenceSequence,
-                  recoveredSequence,recoveredOccurrenceSequence,recurrenceBaselineSequence,escalated
+                  recoveryClearedSequence,recoveredSequence,recoveredOccurrenceSequence,
+                  recurrenceBaselineSequence,escalated
            FROM recurrence_suppression_episodes
            WHERE statute=?1 AND targetSession=?2 AND subject=?3 AND fingerprintDigest=?4
            """,
@@ -523,6 +564,7 @@ defmodule Tightbeam.RecurrenceSuppression do
           count,
           opened,
           opened_occurrence,
+          recovery_cleared,
           recovered,
           recovered_occurrence,
           recurrence_baseline,
@@ -534,6 +576,7 @@ defmodule Tightbeam.RecurrenceSuppression do
           suppressed_count: count,
           opened_evidence_sequence: opened,
           opened_occurrence_sequence: opened_occurrence,
+          recovery_cleared_sequence: recovery_cleared,
           recovered_sequence: recovered,
           recovered_occurrence_sequence: recovered_occurrence,
           recurrence_baseline_sequence: recurrence_baseline,

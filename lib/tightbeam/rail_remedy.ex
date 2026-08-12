@@ -285,6 +285,9 @@ defmodule Tightbeam.RailRemedy do
             :suppressed ->
               %{outcome: "recurrence-suppressed", producer_id: row.producer_key}
 
+            :deliver ->
+              %{outcome: "recurrence-suppressed", producer_id: row.producer_key}
+
             {:rearmed, _generation} ->
               if close(db, rule.name, subject, occurrence) do
                 route_episode(db, handlers, rule, subject, call, context, resolved)
