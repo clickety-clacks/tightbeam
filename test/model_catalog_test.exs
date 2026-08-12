@@ -1458,23 +1458,31 @@ defmodule Tightbeam.ModelCatalogTest do
          ctx do
       test_pid = self()
 
-      present? =
+      claude_generation =
         start_supervised!(%{
-          id: unique_name(:present),
-          start: {Agent, :start_link, [fn -> false end]}
+          id: unique_name(:claude_generation),
+          start: {Agent, :start_link, [fn -> 0 end]}
         })
 
-      status = fn _provider ->
-        if Agent.get(present?, & &1), do: :onboarded, else: {:needs_onboarding, :missing}
-      end
+      codex_generation =
+        start_supervised!(%{
+          id: unique_name(:codex_generation),
+          start: {Agent, :start_link, [fn -> 0 end]}
+        })
 
-      probing_fetch = fn path, headers ->
-        send(test_pid, {:claude_probed, path})
-        ctx.claude_fetch.(path, headers)
+      probing_fetch = fn
+        "/v1/models?limit=100" = path, headers ->
+          generation = Agent.get_and_update(claude_generation, fn n -> {n + 1, n + 1} end)
+          send(test_pid, {:catalog_generation, :claude, generation})
+          ctx.claude_fetch.(path, headers)
+
+        path, headers ->
+          ctx.claude_fetch.(path, headers)
       end
 
       probing_codex = fn command ->
-        send(test_pid, {:codex_probed, command})
+        generation = Agent.get_and_update(codex_generation, fn n -> {n + 1, n + 1} end)
+        send(test_pid, {:catalog_generation, :codex, generation})
         ctx.codex_sh.(command)
       end
 
@@ -1482,32 +1490,36 @@ defmodule Tightbeam.ModelCatalogTest do
         start_catalog(ctx,
           ttl_ms: :timer.minutes(15),
           now: fn -> 0 end,
-          credential_status: status,
+          credential_status: fn _provider -> :onboarded end,
           claude_fetch: probing_fetch,
           sh: probing_codex
         )
 
-      # Drain boot: needs_onboarding short-circuits before the probe, so no fetch
-      # runs while the credential is absent.
-      await(fn ->
-        match?(
-          {[], {:unavailable, {:needs_onboarding, :missing}}},
-          ModelCatalog.get(@host, "claude", catalog)
-        )
-      end)
+      # Recovery from needs_onboarding remains covered by the preceding pull-backstop
+      # test. This provider-scope test starts settled, so every later generation is
+      # owned by the credential-present action below.
+      await_fresh(catalog, "claude")
+      await_fresh(catalog, "codex")
 
-      refute_received {:claude_probed, _}
+      claude_before = Agent.get(claude_generation, & &1)
+      codex_before = Agent.get(codex_generation, & &1)
+      assert claude_before == 1
+      assert codex_before == 1
 
-      # The credential lands, then the wired recognition fires. No get/3 follows —
-      # so a probe can only come from the recognition re-deriving.
-      Agent.update(present?, fn _ -> true end)
+      # The wired recognition fires with no get/3 afterward. The sys call is only
+      # a mailbox barrier: once it returns, the preceding cast has been handled.
       ModelCatalog.credential_present(@host, :anthropic, catalog)
+      barrier_state = :sys.get_state(catalog)
 
-      assert_receive {:claude_probed, "/v1/models?limit=100"}, 2_000
+      claude_after = claude_before + 1
+      assert_receive {:catalog_generation, :claude, ^claude_after}, 2_000
+      assert Agent.get(claude_generation, & &1) == claude_after
 
       # Provider-scoped: an anthropic recognition re-derives the harness that
-      # spends anthropic (claude) only — codex (openai) is never probed.
-      refute_receive {:codex_probed, _}, 300
+      # spends anthropic (claude) only. A wrongly launched Codex task is either
+      # still marked refreshing at the barrier or has advanced its generation.
+      refute get_in(barrier_state, [:entries, {@host, "codex"}, :refreshing])
+      assert Agent.get(codex_generation, & &1) == codex_before
     end
 
     # F2 regression: a credential-present arriving WHILE a derive is in flight
@@ -1668,44 +1680,43 @@ defmodule Tightbeam.ModelCatalogTest do
       Tightbeam.Schema.ensure_all(ctx.db)
       test_pid = self()
 
-      present? =
+      claude_generation =
         start_supervised!(%{
-          id: unique_name(:present),
-          start: {Agent, :start_link, [fn -> false end]}
+          id: unique_name(:claude_generation),
+          start: {Agent, :start_link, [fn -> 0 end]}
         })
 
-      status = fn _provider ->
-        if Agent.get(present?, & &1), do: :onboarded, else: {:needs_onboarding, :missing}
-      end
+      probing_fetch = fn
+        "/v1/models?limit=100" = path, headers ->
+          generation = Agent.get_and_update(claude_generation, fn n -> {n + 1, n + 1} end)
+          send(test_pid, {:catalog_generation, :claude, generation})
+          ctx.claude_fetch.(path, headers)
 
-      probing_fetch = fn path, headers ->
-        send(test_pid, {:claude_probed, path})
-        ctx.claude_fetch.(path, headers)
+        path, headers ->
+          ctx.claude_fetch.(path, headers)
       end
 
       catalog =
         start_catalog(ctx,
           ttl_ms: :timer.minutes(15),
           now: fn -> 0 end,
-          credential_status: status,
+          credential_status: fn _provider -> :onboarded end,
           claude_fetch: probing_fetch
         )
 
-      await(fn ->
-        match?(
-          {[], {:unavailable, {:needs_onboarding, :missing}}},
-          ModelCatalog.get(@host, "claude", catalog)
-        )
-      end)
-
-      Agent.update(present?, fn _ -> true end)
+      await_fresh(catalog, "claude")
+      claude_before = Agent.get(claude_generation, & &1)
+      assert claude_before == 1
 
       # No credential-present fact exists: recognizing a fact id that names none
       # reads no row, so the LHS does NOT match and recognition is a no-op — NO
-      # re-derivation, even though the credential is now live. An imperative
-      # refresh would fire here regardless; a fact-driven production does not.
+      # re-derivation. The sys call is a mailbox barrier, so unchanged generation
+      # and refreshing state prove the no-match action did nothing without a
+      # timing-based negative receive.
       assert :ok = Tightbeam.Productions.CatalogRederive.recognize(ctx.db, catalog, 999_999)
-      refute_receive {:claude_probed, _}, 300
+      no_match_state = :sys.get_state(catalog)
+      refute get_in(no_match_state, [:entries, {@host, "claude"}, :refreshing])
+      assert Agent.get(claude_generation, & &1) == claude_before
 
       # File the credential-present fact; recognizing its id re-derives — and the
       # {host, provider} come FROM the fact, not the caller. The FACT is the
@@ -1719,9 +1730,12 @@ defmodule Tightbeam.ModelCatalogTest do
           })
         end)
 
-      Tightbeam.Productions.CatalogRederive.recognize(ctx.db, catalog, fact_id)
+      assert :ok = Tightbeam.Productions.CatalogRederive.recognize(ctx.db, catalog, fact_id)
+      _matching_barrier = :sys.get_state(catalog)
 
-      assert_receive {:claude_probed, "/v1/models?limit=100"}, 2_000
+      claude_after = claude_before + 1
+      assert_receive {:catalog_generation, :claude, ^claude_after}, 2_000
+      assert Agent.get(claude_generation, & &1) == claude_after
     end
   end
 
