@@ -338,7 +338,8 @@ defmodule Tightbeam.EventLog do
           detail,
           audience,
           message,
-          attention
+          attention,
+          false
         )
       end)
 
@@ -356,7 +357,8 @@ defmodule Tightbeam.EventLog do
 
   The returned plan is immutable data captured from the committed marker. The caller
   must publish it only after the surrounding transaction returns successfully. A
-  record-only or inactive audience returns an empty plan.
+  record-only audience returns an empty plan. An existing inactive session keeps
+  its durable marker but also returns an empty plan, because it has no live client.
   """
   @spec notice_in_txn(Txn.t(), String.t(), String.t(), String.t() | nil, keyword()) ::
           publication_plan()
@@ -372,7 +374,8 @@ defmodule Tightbeam.EventLog do
         detail,
         audience,
         message,
-        attention
+        attention,
+        true
       )
 
     plan
@@ -415,7 +418,8 @@ defmodule Tightbeam.EventLog do
          detail,
          audience,
          message,
-         attention
+         attention,
+         store_inactive_marker
        ) do
     lifecycle_in_txn(txn, kind, subject, detail)
 
@@ -423,11 +427,20 @@ defmodule Tightbeam.EventLog do
     # would leave exactly the split this function exists to prevent.
     {plan, undeliverable} =
       Enum.reduce(candidates(audience), {[], []}, fn session_key, {plan, undeliverable} ->
-        case active_owner(txn, session_key) do
-          nil ->
+        case session_recipient(txn, session_key) do
+          :missing ->
             {plan, [session_key | undeliverable]}
 
-          owner ->
+          {:inactive, _owner} when not store_inactive_marker ->
+            {plan, [session_key | undeliverable]}
+
+          {:inactive, _owner} ->
+            {:appended, _marker} =
+              Projection.append_marker_in_txn(txn, session_key, message, attention)
+
+            {plan, undeliverable}
+
+          {:active, owner} ->
             {:appended, marker} =
               Projection.append_marker_in_txn(txn, session_key, message, attention)
 
@@ -449,23 +462,20 @@ defmodule Tightbeam.EventLog do
   # Read through the transaction handle, not Org: a `DB.query` from inside a
   # transaction re-enters the owner process that is running it.
   #
-  # The OWNER comes back with the answer rather than being re-read after the
-  # commit. `ownerUserId` is NOT NULL, so nil here means exactly one thing —
-  # no active session by that key — and the publish below then needs no second
-  # trip through the single-writer DB owner. That trip was the wide half of
-  # the publication race: it can queue behind another session's transaction,
-  # during which the lane that owns this session can commit AND publish a
-  # LATER seq. ConnRegistry no longer drops the earlier one (delivery is
-  # unconditional now); skipping the second trip still narrows the window in
-  # which frames leave in an order the client must settle by seq.
-  defp active_owner(txn, session_key) do
+  # The owner and state come back with the answer rather than being re-read
+  # after commit. The transactional seam must distinguish a missing session
+  # from a retired one: a retired self-wake still gets its durable audit marker,
+  # but it has no live publication plan. The public notice path keeps its
+  # established active-only audience behavior.
+  defp session_recipient(txn, session_key) do
     case Txn.q(
            txn,
-           "SELECT ownerUserId FROM sessions WHERE sessionKey = ?1 AND state = 'active'",
+           "SELECT ownerUserId,state FROM sessions WHERE sessionKey = ?1",
            [session_key]
          ) do
-      [[owner]] -> owner
-      [] -> nil
+      [[owner, "active"]] -> {:active, owner}
+      [[owner, _state]] -> {:inactive, owner}
+      [] -> :missing
     end
   end
 

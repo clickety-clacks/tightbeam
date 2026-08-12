@@ -150,7 +150,7 @@ defmodule Tightbeam.RecordNoticeTest do
     assert Projection.list_after(ctx.db, "work", nil, 10) == []
   end
 
-  test "an inactive transaction audience records without a marker or push", ctx do
+  test "a retired transaction audience stores one marker without a live push plan", ctx do
     Org.retire(ctx.db, "work", "user:flynn", 1_000)
     connect(ctx.registry, "d1")
 
@@ -169,7 +169,10 @@ defmodule Tightbeam.RecordNoticeTest do
 
     refute_received {:push_message, _, _, _}
     assert [%{kind: "wake_failed_delivery"}] = EventLog.lifecycle_events(ctx.db)
-    assert Projection.list_after(ctx.db, "work", nil, 10) == []
+
+    assert [marker] = Projection.list_after(ctx.db, "work", nil, 10)
+    assert marker.sender == "process:tightbeam"
+    assert marker.content == "[wake failed]\n\nThe target retired before delivery."
   end
 
   test "a failed post-commit publish leaves one marker for replay", ctx do
