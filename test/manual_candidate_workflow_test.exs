@@ -363,6 +363,9 @@ defmodule Tightbeam.ManualCandidateWorkflowTest do
     for fixture <- [
           ~S|cmd="git rev-parse "; cmd+="$CANDIDATE_SHA"; $cmd|,
           ~S|runner=git; $runner rev-parse "$CANDIDATE_SHA"|,
+          ~S|git rev-parse "$CANDIDATE_SHA"suffix|,
+          ~S|runner=git; "$runner" rev-parse "$CANDIDATE_SHA"|,
+          ~S|runner=git; ${runner} rev-parse "$CANDIDATE_SHA"|,
           ~S|if true; then $runner rev-parse "$CANDIDATE_SHA"; fi|,
           ~S|while false; do $runner rev-parse "$CANDIDATE_SHA"; done|,
           ~S|{ $runner rev-parse "$CANDIDATE_SHA"; }|,
@@ -908,13 +911,14 @@ defmodule Tightbeam.ManualCandidateWorkflowTest do
       ~r/(^|\s)(sh|bash)\s+-c(\s|$)/m,
       ~r/(?im)^\s*(?:(?:local|readonly)\s+|declare(?:\s+-[a-z]+)?\s+)?[a-z_][a-z0-9_]*(?:cmd|command)[a-z0-9_]*\s*\+?=/,
       ~r/\+=/,
-      ~r/(?m)(?:^|[;&|])\s*(?:(?:then|do)\s+)?(?:\{\s*)?\$[A-Za-z_][A-Za-z0-9_]*(?:\s|$)/,
+      ~r/(?m)(?:(?<!\\\n)^|[;&|])[ \t]*(?:(?:then|do)[ \t]+)?(?:\{[ \t]*)?(?:"\$(?:\{[A-Za-z_][A-Za-z0-9_]*\}|[A-Za-z_][A-Za-z0-9_]*)"|\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Za-z_][A-Za-z0-9_]*)(?:[ \t]|$)/,
       ~r/(?m)^\s*\$\{[A-Za-z_][A-Za-z0-9_]*\}(?:\s|$)/,
       ~r/(?m)^\s*"\$\{[A-Za-z_][A-Za-z0-9_]*\[@\]\}"(?:\s|$)/,
       ~r/\$\{![A-Za-z_][A-Za-z0-9_]*\}/,
       ~r/(?m)(^|\s)(?:command|exec|env)\s+["']?\$\{?[A-Za-z_][A-Za-z0-9_]*/,
       ~r/\$\(\s*["']?\$\{?[A-Za-z_][A-Za-z0-9_]*/,
-      ~r/(?m)^\s*(?:declare|typeset)\s+-n\b/
+      ~r/(?m)^\s*(?:declare|typeset)\s+-n\b/,
+      ~r/(?:[^\s;&|()<>]"\$CANDIDATE_SHA"|"\$CANDIDATE_SHA"[^\s;&|()<>])/
     ]
 
     Enum.all?(forbidden, &(not Regex.match?(&1, run)))
@@ -940,7 +944,7 @@ defmodule Tightbeam.ManualCandidateWorkflowTest do
   defp candidate_sha_run_body?(run) do
     static_run_body?(run) and
       run
-      |> String.replace("\"$CANDIDATE_SHA\"", "")
+      |> String.replace(~r/(?<![^\s;&|()<>])"\$CANDIDATE_SHA"(?![^\s;&|()<>])/, "")
       |> then(&(not String.contains?(&1, "CANDIDATE_SHA")))
   end
 
