@@ -299,6 +299,11 @@ defmodule Tightbeam.EventLog do
           | {:ambient, String.t()}
           | :record_only
 
+  @opaque publication_plan :: [
+            {session_key :: String.t(), owner_user_id :: String.t(), seq :: pos_integer(),
+             payload :: map()}
+          ]
+
   @doc """
   Record an event AND tell whoever it happened to, in one call.
 
@@ -322,6 +327,65 @@ defmodule Tightbeam.EventLog do
   """
   @spec notice(db(), String.t(), String.t(), String.t() | nil, keyword()) :: :ok
   def notice(db \\ Tightbeam.DB, kind, subject, detail, opts) do
+    {audience, message, attention} = notice_options(opts)
+
+    {:ok, {plan, undeliverable}} =
+      DB.transaction(db, fn txn ->
+        notice_in_txn_with_undeliverable(
+          txn,
+          kind,
+          subject,
+          detail,
+          audience,
+          message,
+          attention
+        )
+      end)
+
+    Enum.each(Enum.reverse(undeliverable), fn session_key ->
+      Logger.info(
+        "#{kind} for #{subject} was not delivered to #{session_key}: no active session there"
+      )
+    end)
+
+    publish(plan, opts)
+  end
+
+  @doc """
+  Record a lifecycle event and its process marker inside the caller's transaction.
+
+  The returned plan is immutable data captured from the committed marker. The caller
+  must publish it only after the surrounding transaction returns successfully. A
+  record-only or inactive audience returns an empty plan.
+  """
+  @spec notice_in_txn(Txn.t(), String.t(), String.t(), String.t() | nil, keyword()) ::
+          publication_plan()
+  def notice_in_txn(%Txn{} = txn, kind, subject, detail, opts) do
+    {audience, message, attention} = notice_options(opts)
+    audience = transactional_audience!(audience)
+
+    {plan, _undeliverable} =
+      notice_in_txn_with_undeliverable(
+        txn,
+        kind,
+        subject,
+        detail,
+        audience,
+        message,
+        attention
+      )
+
+    plan
+  end
+
+  @doc "Publish a committed notice plan to connected clients."
+  @spec publish(publication_plan(), keyword()) :: :ok
+  def publish(plan, opts \\ []) when is_list(plan) do
+    registry = Keyword.get(opts, :conn_registry, ConnRegistry)
+    Enum.each(plan, &publish_marker(registry, &1))
+  end
+
+  defp notice_options(opts) do
     audience = Keyword.fetch!(opts, :audience)
 
     {message, attention} =
@@ -333,35 +397,48 @@ defmodule Tightbeam.EventLog do
           {Keyword.fetch!(opts, :message), Keyword.fetch!(opts, :attention)}
       end
 
-    {:ok, {appended, undeliverable}} =
-      DB.transaction(db, fn txn ->
-        lifecycle_in_txn(txn, kind, subject, detail)
+    {audience, message, attention}
+  end
 
-        # The record and the markers commit together: a crash between them
-        # would leave exactly the split this function exists to prevent.
-        Enum.reduce(candidates(audience), {[], []}, fn session_key, {appended, undeliverable} ->
-          case active_owner(txn, session_key) do
-            nil ->
-              {appended, [session_key | undeliverable]}
+  defp transactional_audience!(:record_only), do: :record_only
+  defp transactional_audience!({:session, session_key}), do: {:session, session_key}
 
-            owner ->
-              {:appended, marker} =
-                Projection.append_marker_in_txn(txn, session_key, message, attention)
+  defp transactional_audience!(audience) do
+    raise ArgumentError,
+          "notice_in_txn requires zero or one recipient, got audience: #{inspect(audience)}"
+  end
 
-              {[{session_key, owner, marker} | appended], undeliverable}
-          end
-        end)
+  defp notice_in_txn_with_undeliverable(
+         txn,
+         kind,
+         subject,
+         detail,
+         audience,
+         message,
+         attention
+       ) do
+    lifecycle_in_txn(txn, kind, subject, detail)
+
+    # The record and the markers commit together: a crash between them
+    # would leave exactly the split this function exists to prevent.
+    {plan, undeliverable} =
+      Enum.reduce(candidates(audience), {[], []}, fn session_key, {plan, undeliverable} ->
+        case active_owner(txn, session_key) do
+          nil ->
+            {plan, [session_key | undeliverable]}
+
+          owner ->
+            {:appended, marker} =
+              Projection.append_marker_in_txn(txn, session_key, message, attention)
+
+            publication =
+              {session_key, owner, marker.seq, Payloads.server_message(marker)}
+
+            {[publication | plan], undeliverable}
+        end
       end)
 
-    registry = Keyword.get(opts, :conn_registry, ConnRegistry)
-
-    Enum.each(Enum.reverse(undeliverable), fn session_key ->
-      Logger.info(
-        "#{kind} for #{subject} was not delivered to #{session_key}: no active session there"
-      )
-    end)
-
-    Enum.each(Enum.reverse(appended), &publish_marker(registry, &1))
+    {Enum.reverse(plan), undeliverable}
   end
 
   defp candidates(:record_only), do: []
@@ -397,19 +474,19 @@ defmodule Tightbeam.EventLog do
   # the next socket that drains this session. Letting the exit through would
   # take out the caller — a dying adapter's own coordinator, in the case that
   # found this — over a process whose absence means the wire is down anyway.
-  defp publish_marker(registry, {session_key, owner, marker}) do
+  defp publish_marker(registry, {session_key, owner, seq, payload}) do
     ConnRegistry.publish_message(
       registry,
       session_key,
       owner,
-      marker.seq,
-      Payloads.server_message(marker),
-      fn pid, payload -> send(pid, {:push_message, session_key, marker.seq, payload}) end
+      seq,
+      payload,
+      fn pid, payload -> send(pid, {:push_message, session_key, seq, payload}) end
     )
   catch
     :exit, reason ->
       Logger.warning(
-        "live push of #{session_key} seq #{marker.seq} failed (#{inspect(reason)}); " <>
+        "live push of #{session_key} seq #{seq} failed (#{inspect(reason)}); " <>
           "the message is stored and replays on the next connect"
       )
 
