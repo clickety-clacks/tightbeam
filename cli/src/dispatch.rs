@@ -128,6 +128,9 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             prompt,
             after_ms,
             at,
+            condition_kind,
+            condition_scope,
+            idempotency_key,
         } => {
             let target = match target {
                 Target::Session(value) => string_field("sessionKey", value),
@@ -141,7 +144,30 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             if let Some(value) = at {
                 params.push(format!("\"at\":{value}"));
             }
+            for (name, value) in [
+                ("conditionKind", condition_kind),
+                ("conditionScope", condition_scope),
+                ("idempotencyKey", idempotency_key),
+            ] {
+                if let Some(value) = value {
+                    params.push(string_field(name, value));
+                }
+            }
             Ok(request(identity, "wake", vec![target], params))
+        }
+        Command::Condition {
+            identity,
+            kind,
+            scope,
+            idempotency_key,
+        } => {
+            let mut params = vec![string_field("kind", kind)];
+            for (name, value) in [("scope", scope), ("idempotencyKey", idempotency_key)] {
+                if let Some(value) = value {
+                    params.push(string_field(name, value));
+                }
+            }
+            Ok(request(identity, "condition", vec![], params))
         }
         Command::ArtifactRecord {
             identity,
@@ -1265,6 +1291,7 @@ fn identity_required(cwd: &Path) -> String {
 fn command_identity(command: &Command) -> Option<&Identity> {
     match command {
         Command::Wake { identity, .. }
+        | Command::Condition { identity, .. }
         | Command::ArtifactRecord { identity, .. }
         | Command::Artifacts { identity, .. }
         | Command::Spawn { identity, .. }
@@ -1434,6 +1461,8 @@ mod tests {
                 "go",
                 "--after",
                 "30s",
+                "--key",
+                "historically-ignored",
                 "--as",
                 "coder"
             ]),
@@ -1492,6 +1521,64 @@ mod tests {
                 "flynn"
             ]),
             r#"{"asUser":"flynn","verb":"wake","userId":"mike","params":{"prompt":"go","at":16}}"#
+        );
+    }
+
+    #[test]
+    fn builds_byte_exact_condition_wake_and_fact_bodies() {
+        assert_eq!(
+            body(&[
+                "wake",
+                "--role",
+                "owner",
+                "--when-fact",
+                "build-finished",
+                "--when-scope",
+                "app",
+                "--fallback-after",
+                "2h",
+                "--prompt",
+                "re-read durable state",
+                "--key",
+                "wake-1",
+                "--as-process",
+                "ci",
+            ]),
+            r#"{"asProcess":"ci","verb":"wake","role":"owner","params":{"prompt":"re-read durable state","afterMs":7200000,"conditionKind":"build-finished","conditionScope":"app","idempotencyKey":"wake-1"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "wake",
+                "--session",
+                "agent:owner",
+                "--when-fact",
+                "review-landed",
+                "--at",
+                "123",
+                "--prompt",
+                "decide what follows",
+                "--as",
+                "worker",
+            ]),
+            r#"{"as":"worker","verb":"wake","sessionKey":"agent:owner","params":{"prompt":"decide what follows","at":123,"conditionKind":"review-landed"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "condition",
+                "--kind",
+                "build-finished",
+                "--scope",
+                "app",
+                "--key",
+                "fact-1",
+                "--as-process",
+                "ci",
+            ]),
+            r#"{"asProcess":"ci","verb":"condition","params":{"kind":"build-finished","scope":"app","idempotencyKey":"fact-1"}}"#
+        );
+        assert_eq!(
+            body(&["condition", "--kind", "review-landed", "--as", "reviewer",]),
+            r#"{"as":"reviewer","verb":"condition","params":{"kind":"review-landed"}}"#
         );
     }
 
