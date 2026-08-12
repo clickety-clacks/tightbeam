@@ -9,7 +9,7 @@ defmodule Tightbeam.CredentialsTest do
     %{base: base}
   end
 
-  test "onboarding is serialized gate stop write mark start resume and writes 0600 once", ctx do
+  test "onboarding commits before the credential-present callback and success publication", ctx do
     owner = self()
 
     {:ok, server} =
@@ -19,37 +19,46 @@ defmodule Tightbeam.CredentialsTest do
         machine: "eezo",
         onboarders: %{
           openai: fn _state ->
-            send(owner, :obtain)
+            send(owner, {:step, :obtain})
             {:ok, %{bytes: ~S({"token":"new"}), expires_at: nil}}
           end
         },
         gate: fn _ ->
-          send(owner, :gate)
+          send(owner, {:step, :gate})
           :ok
         end,
         stop: fn _ ->
-          send(owner, :stop)
+          send(owner, {:step, :stop})
           :ok
         end,
         start: fn _, _ ->
           assert File.read!(Path.join([ctx.base, "auth", "codex", "auth.json"])) ==
                    ~S({"token":"new"})
 
-          send(owner, :start)
+          send(owner, {:step, :start})
+          :ok
+        end,
+        on_credential_present: fn :openai ->
+          assert credential_metadata(ctx.base, "codex")["onboarded"] == true
+          send(owner, {:step, :credential_present})
           :ok
         end,
         resume: fn _ ->
-          send(owner, :resume)
+          send(owner, {:step, :resume})
           :ok
         end
       )
 
     assert :ok = Credentials.onboard(:openai, server)
-    assert_receive :gate
-    assert_receive :stop
-    assert_receive :obtain
-    assert_receive :start
-    assert_receive :resume
+
+    steps =
+      for _ <- 1..6 do
+        assert_receive {:step, step}
+        step
+      end
+
+    assert steps == [:gate, :stop, :obtain, :start, :credential_present, :resume]
+    refute_receive {:step, :credential_present}
 
     store = Path.join([ctx.base, "auth", "codex", "auth.json"])
     home = Path.join([ctx.base, "homes", "eezo", "codex", "auth.json"])
@@ -670,6 +679,365 @@ defmodule Tightbeam.CredentialsTest do
     assert fresh != staging
   end
 
+  describe "finish_onboard commit and rollback" do
+    test "success calls the credential-present callback once after durable state", ctx do
+      owner = self()
+
+      {:ok, server} =
+        Credentials.start_link(
+          name: nil,
+          base_dir: ctx.base,
+          machine: "eezo",
+          start: fn :openai, :subscription ->
+            send(owner, {:finish_step, :start})
+            :ok
+          end,
+          on_credential_present: fn :openai ->
+            assert File.read!(Path.join([ctx.base, "auth", "codex", "auth.json"])) ==
+                     ~S({"token":"candidate"})
+
+            assert credential_metadata(ctx.base, "codex")["onboarded"] == true
+            send(owner, {:finish_step, :credential_present})
+            :ok
+          end,
+          capture_sessions: fn :openai ->
+            send(owner, {:finish_step, :capture})
+            [:session]
+          end,
+          resume: fn :openai ->
+            send(owner, {:finish_step, :resume})
+            :ok
+          end,
+          publish_sessions: fn [:session], :onboarded ->
+            send(owner, {:finish_step, :publish})
+            :ok
+          end
+        )
+
+      assert {:ok, staging, lease_id} = Credentials.begin_onboard(:openai, server)
+      File.write!(Path.join(staging, "auth.json"), ~S({"token":"candidate"}))
+
+      assert :ok = Credentials.finish_onboard(:openai, :subscription, lease_id, server)
+
+      steps =
+        for _ <- 1..5 do
+          assert_receive {:finish_step, step}
+          step
+        end
+
+      assert steps == [:start, :credential_present, :capture, :resume, :publish]
+      refute_receive {:finish_step, :credential_present}
+      refute File.exists?(staging)
+    end
+
+    test "a start failure removes a new credential and all success effects", ctx do
+      owner = self()
+
+      {:ok, server} =
+        Credentials.start_link(
+          name: nil,
+          base_dir: ctx.base,
+          machine: "eezo",
+          start: fn :openai, :subscription -> {:error, :runtime_start_failed} end,
+          on_credential_present: fn _ -> send(owner, :forbidden_credential_present) end,
+          resume: fn _ -> send(owner, :forbidden_resume) end,
+          publish_sessions: fn _, _ -> send(owner, :forbidden_publish) end
+        )
+
+      assert {:ok, staging, lease_id} = Credentials.begin_onboard(:openai, server)
+      File.write!(Path.join(staging, "auth.json"), ~S({"token":"candidate"}))
+
+      assert {:error, :runtime_start_failed} =
+               Credentials.finish_onboard(:openai, :subscription, lease_id, server)
+
+      refute File.exists?(Path.join([ctx.base, "auth", "codex", "auth.json"]))
+      refute File.exists?(Path.join([ctx.base, "auth", "codex", ".tightbeam", "credential.json"]))
+      refute File.exists?(staging)
+      assert Credentials.status(:openai, server) == {:needs_onboarding, :missing}
+      refute_receive :forbidden_credential_present
+      refute_receive :forbidden_resume
+      refute_receive :forbidden_publish
+    end
+
+    test "raised and exited start failures roll back and clean the lease without killing the owner",
+         ctx do
+      owner = self()
+
+      failures = [
+        {"raise", fn -> raise "runtime-start-crash" end,
+         {:error, {:credential_start_failed, {:exception, "runtime-start-crash"}}}},
+        {"exit", fn -> exit(:runtime_start_exit) end,
+         {:error, {:credential_start_failed, {:exit, :runtime_start_exit}}}}
+      ]
+
+      Enum.each(failures, fn {label, fail_start, expected} ->
+        base = Path.join(ctx.base, label)
+
+        {:ok, server} =
+          Credentials.start_link(
+            name: nil,
+            base_dir: base,
+            machine: "eezo",
+            start: fn :openai, :subscription -> fail_start.() end,
+            on_credential_present: fn _ -> send(owner, :forbidden_credential_present) end,
+            resume: fn _ -> send(owner, :forbidden_resume) end,
+            publish_sessions: fn _, _ -> send(owner, :forbidden_publish) end
+          )
+
+        assert {:ok, staging, lease_id} = Credentials.begin_onboard(:openai, server)
+        File.write!(Path.join(staging, "auth.json"), ~S({"token":"candidate"}))
+
+        assert ^expected =
+                 Credentials.finish_onboard(:openai, :subscription, lease_id, server)
+
+        assert Process.alive?(server)
+        refute File.exists?(Path.join([base, "auth", "codex", "auth.json"]))
+        refute File.exists?(Path.join([base, "auth", "codex", ".tightbeam", "credential.json"]))
+        refute File.exists?(staging)
+        assert Credentials.status(:openai, server) == {:needs_onboarding, :missing}
+      end)
+
+      refute_receive :forbidden_credential_present
+      refute_receive :forbidden_resume
+      refute_receive :forbidden_publish
+    end
+
+    test "a start failure restores exact prior credential and metadata bytes", ctx do
+      owner = self()
+      credential = Path.join([ctx.base, "auth", "codex", "auth.json"])
+      metadata = Path.join([ctx.base, "auth", "codex", ".tightbeam", "credential.json"])
+      prior_credential = ~S({"token":"prior","spacing":true}) <> "\n"
+      prior_metadata = ~S( { "provider": "openai", "onboarded": true, "kind": "api_key" } )
+      File.mkdir_p!(Path.dirname(metadata))
+      File.write!(credential, prior_credential)
+      File.write!(metadata, prior_metadata)
+
+      {:ok, server} =
+        Credentials.start_link(
+          name: nil,
+          base_dir: ctx.base,
+          machine: "eezo",
+          start: fn :openai, :subscription -> {:error, :runtime_start_failed} end,
+          on_credential_present: fn _ -> send(owner, :forbidden_credential_present) end
+        )
+
+      assert {:ok, staging, lease_id} = Credentials.begin_onboard(:openai, server)
+      File.write!(Path.join(staging, "auth.json"), ~S({"token":"candidate"}))
+
+      assert {:error, :runtime_start_failed} =
+               Credentials.finish_onboard(:openai, :subscription, lease_id, server)
+
+      assert File.read!(credential) == prior_credential
+      assert File.read!(metadata) == prior_metadata
+      refute File.exists?(staging)
+      refute_receive :forbidden_credential_present
+    end
+
+    test "a satellite metadata failure rolls back without transporting credential bytes", ctx do
+      owner = self()
+
+      sh = fn command ->
+        send(owner, {:remote_finish_command, command})
+        text = Enum.join(command, " ")
+
+        if text =~ "last_health" and text =~ "onboarded" do
+          {"metadata refused", 1}
+        else
+          run_remote_command(command)
+        end
+      end
+
+      {:ok, server} =
+        Credentials.start_link(
+          name: nil,
+          base_dir: ctx.base,
+          machine: "worker",
+          ssh: "worker",
+          sh: sh,
+          on_credential_present: fn _ -> send(owner, :forbidden_credential_present) end
+        )
+
+      assert {:ok, staging, lease_id} = Credentials.begin_onboard(:openai, server)
+      File.write!(Path.join(staging, "auth.json"), "satellite-candidate-secret")
+
+      assert {:error, {:credential_metadata_write_failed, message}} =
+               Credentials.finish_onboard(:openai, :subscription, lease_id, server)
+
+      assert message =~ "metadata refused"
+      refute File.exists?(Path.join([ctx.base, "auth", "codex", "auth.json"]))
+      refute File.exists?(Path.join([ctx.base, "auth", "codex", ".tightbeam", "credential.json"]))
+      refute File.exists?(staging)
+      refute_receive :forbidden_credential_present
+
+      commands = collect_remote_finish_commands([])
+      refute Enum.any?(commands, &(Enum.join(&1, " ") =~ "satellite-candidate-secret"))
+    end
+
+    test "a rollback failure persists a present-but-unverified cause and compounds refusal",
+         ctx do
+      owner = self()
+      {:ok, rollback} = Agent.start_link(fn -> :waiting end)
+
+      sh = fn command ->
+        text = Enum.join(command, " ")
+
+        fail_restore? =
+          text =~ "rm -f --" and
+            Agent.get_and_update(rollback, fn
+              :armed -> {true, :failed}
+              state -> {false, state}
+            end)
+
+        if fail_restore? do
+          {"rollback refused", 1}
+        else
+          run_remote_command(command)
+        end
+      end
+
+      {:ok, server} =
+        Credentials.start_link(
+          name: nil,
+          base_dir: ctx.base,
+          machine: "worker",
+          ssh: "worker",
+          sh: sh,
+          start: fn :openai, :subscription ->
+            Agent.update(rollback, fn :waiting -> :armed end)
+            {:error, :runtime_start_failed}
+          end,
+          on_credential_present: fn _ -> send(owner, :forbidden_credential_present) end,
+          resume: fn _ -> send(owner, :forbidden_resume) end,
+          publish_sessions: fn _, _ -> send(owner, :forbidden_publish) end
+        )
+
+      assert {:ok, staging, lease_id} = Credentials.begin_onboard(:openai, server)
+      File.write!(Path.join(staging, "auth.json"), "candidate-remains-present")
+
+      assert {:error,
+              {:onboarding_failed_and_rollback_failed,
+               %{
+                 finish: {:error, :runtime_start_failed},
+                 rollback: {:credential_restore_failed, 1, "rollback refused"},
+                 marker: :ok
+               }}} = Credentials.finish_onboard(:openai, :subscription, lease_id, server)
+
+      assert File.read!(Path.join([ctx.base, "auth", "codex", "auth.json"])) ==
+               "candidate-remains-present"
+
+      metadata = credential_metadata(ctx.base, "codex")
+      assert metadata["onboarded"] == false
+      assert metadata["last_health"] == "present_but_unverified"
+      assert metadata["present_but_unverified"]["finish"] =~ "runtime_start_failed"
+      assert metadata["present_but_unverified"]["rollback"] =~ "rollback refused"
+
+      assert {:needs_onboarding, {:present_but_unverified, cause}} =
+               Credentials.status(:openai, server)
+
+      assert cause == metadata["present_but_unverified"]
+      refute File.exists?(staging)
+      refute_receive :forbidden_credential_present
+      refute_receive :forbidden_resume
+      refute_receive :forbidden_publish
+    end
+
+    test "a rollback marker write failure still makes status fail closed", ctx do
+      owner = self()
+      credential = Path.join([ctx.base, "auth", "codex", "auth.json"])
+      metadata = Path.join([ctx.base, "auth", "codex", ".tightbeam", "credential.json"])
+      File.mkdir_p!(Path.dirname(metadata))
+      File.write!(credential, ~S({"token":"prior"}))
+      File.write!(metadata, ~S({"provider":"openai","onboarded":true,"kind":"api_key"}))
+      {:ok, failures} = Agent.start_link(fn -> :waiting end)
+
+      sh = fn command ->
+        text = Enum.join(command, " ")
+
+        decision =
+          Agent.get_and_update(failures, fn stage ->
+            cond do
+              stage == :armed and text =~ ".tightbeam-rollback/credential" and
+                  text =~ "mv " ->
+                {:restore, :restore_failed}
+
+              text =~ "present_but_unverified" and text =~ "runtime_start_failed" ->
+                {:marker, stage}
+
+              true ->
+                {:run, stage}
+            end
+          end)
+
+        case decision do
+          :restore -> {"rollback refused", 1}
+          :marker -> {"marker refused", 1}
+          :run -> run_remote_command(command)
+        end
+      end
+
+      {:ok, server} =
+        Credentials.start_link(
+          name: nil,
+          base_dir: ctx.base,
+          machine: "worker",
+          ssh: "worker",
+          sh: sh,
+          start: fn :openai, :subscription ->
+            Agent.update(failures, fn :waiting -> :armed end)
+            {:error, :runtime_start_failed}
+          end,
+          on_credential_present: fn _ -> send(owner, :forbidden_credential_present) end,
+          resume: fn _ -> send(owner, :forbidden_resume) end,
+          publish_sessions: fn _, _ -> send(owner, :forbidden_publish) end
+        )
+
+      assert {:ok, staging, lease_id} = Credentials.begin_onboard(:openai, server)
+      File.write!(Path.join(staging, "auth.json"), ~S({"token":"candidate"}))
+
+      assert {:error,
+              {:onboarding_failed_and_rollback_failed,
+               %{
+                 finish: {:error, :runtime_start_failed},
+                 rollback: {:credential_restore_failed, 1, "rollback refused"},
+                 marker: {:error, {:credential_metadata_write_failed, message}}
+               }}} = Credentials.finish_onboard(:openai, :subscription, lease_id, server)
+
+      assert message =~ "marker refused"
+      assert File.read!(credential) == ~S({"token":"candidate"})
+
+      durable_marker = JSON.decode!(File.read!(metadata))
+      assert durable_marker["onboarded"] == false
+      assert durable_marker["present_but_unverified"]["finish"] =~ "has not committed"
+
+      assert {:needs_onboarding, {:present_but_unverified, cause}} =
+               Credentials.status(:openai, server)
+
+      assert cause["finish"] =~ "runtime_start_failed"
+      assert cause["rollback"] =~ "rollback refused"
+      assert Process.alive?(server)
+      refute File.exists?(staging)
+
+      GenServer.stop(server)
+
+      {:ok, restarted} =
+        Credentials.start_link(
+          name: nil,
+          base_dir: ctx.base,
+          machine: "worker",
+          ssh: "worker",
+          sh: sh
+        )
+
+      assert {:needs_onboarding, {:present_but_unverified, restarted_cause}} =
+               Credentials.status(:openai, restarted)
+
+      assert restarted_cause == durable_marker["present_but_unverified"]
+      refute_receive :forbidden_credential_present
+      refute_receive :forbidden_resume
+      refute_receive :forbidden_publish
+    end
+  end
+
   test "machine contexts never share credential bytes", ctx do
     other = ctx.base <> "-other"
     on_exit(fn -> File.rm_rf!(other) end)
@@ -1072,5 +1440,19 @@ defmodule Tightbeam.CredentialsTest do
     after
       0 -> Enum.reverse(acc)
     end
+  end
+
+  defp collect_remote_finish_commands(acc) do
+    receive do
+      {:remote_finish_command, command} ->
+        collect_remote_finish_commands([command | acc])
+    after
+      0 -> Enum.reverse(acc)
+    end
+  end
+
+  defp run_remote_command(command) do
+    remote_command = command |> Enum.drop(6) |> Enum.join(" ")
+    System.cmd("sh", ["-c", remote_command], stderr_to_stdout: true)
   end
 end
