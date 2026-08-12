@@ -11,7 +11,8 @@ defmodule Tightbeam.RulesTest do
     Gateway,
     Org,
     Roles,
-    Rules
+    Rules,
+    Toplines
   }
 
   setup do
@@ -352,6 +353,98 @@ defmodule Tightbeam.RulesTest do
     assert {:deny, %{rule: "live-count"}} = Rules.evaluate(ctx.db, call("user:flynn"))
     assert :ok = Rules.evaluate(ctx.db, call("process:cron"))
     assert :ok = Rules.evaluate(ctx.db, call("broken"))
+  end
+
+  test "work_item.has_topline distinguishes unknown, invisible, inactive, and active membership",
+       ctx do
+    :ok = Toplines.ensure_schema(ctx.db)
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('fact_flynn',0,1),('fact_kay',0,1),('fact_root',1,1)"
+      )
+
+    for {id, owner} <- [
+          {"wi_fact_none", "fact_flynn"},
+          {"wi_fact_linked", "fact_flynn"},
+          {"wi_fact_foreign", "fact_kay"}
+        ] do
+      {:ok, _} =
+        DB.query(
+          ctx.db,
+          """
+          INSERT INTO work_items
+            (id, title, ownerUserId, state, createdByUser, createdContextKnown, createdAt)
+          VALUES (?1, ?1, ?2, 'open', ?2, 1, 1)
+          """,
+          [id, owner]
+        )
+    end
+
+    fact_call = fn origin, work_item_id ->
+      call(origin) |> put_in([:params, :work_item_id], work_item_id)
+    end
+
+    put_rule(ctx, rule("known-none", "post", "work_item.has_topline", "eq", false))
+    Rules.load!(ctx.base_dir, ["post"])
+
+    assert {:deny, %{rule: "known-none"}} =
+             Rules.evaluate(ctx.db, fact_call.("user:fact_flynn", "wi_fact_none"))
+
+    assert {:deny, %{rule: "known-none"}} =
+             Rules.evaluate(ctx.db, fact_call.("user:fact_root", "wi_fact_foreign"))
+
+    assert :ok = Rules.evaluate(ctx.db, fact_call.("user:fact_flynn", "wi_missing"))
+    assert :ok = Rules.evaluate(ctx.db, fact_call.("user:fact_flynn", "wi_fact_foreign"))
+    assert :ok = Rules.evaluate(ctx.db, call("process:tightbeam"))
+    assert :ok = Rules.evaluate(ctx.db, fact_call.("process:tightbeam", "wi_fact_none"))
+
+    topline =
+      Toplines.create(ctx.db, %{
+        principal: {:user, "fact_flynn"},
+        params: %{title: "Fact proof", idempotency_key: "fact-create"},
+        now: 10
+      }).topline
+
+    linked =
+      Toplines.link_work(ctx.db, %{
+        principal: {:user, "fact_flynn"},
+        params: %{
+          topline_id: topline.id,
+          work_item_id: "wi_fact_linked",
+          reason: "explicit membership",
+          idempotency_key: "fact-link"
+        },
+        now: 11
+      }).membership
+
+    put_rule(ctx, rule("known-active", "post", "work_item.has_topline", "eq", true))
+    Rules.load!(ctx.base_dir, ["post"])
+
+    assert {:deny, %{rule: "known-active"}} =
+             Rules.evaluate(ctx.db, fact_call.("user:fact_flynn", "wi_fact_linked"))
+
+    assert {:deny, %{rule: "known-active"}} =
+             Rules.evaluate(ctx.db, fact_call.("user:fact_root", "wi_fact_linked"))
+
+    Toplines.unlink_work(ctx.db, %{
+      principal: {:user, "fact_flynn"},
+      params: %{
+        membership_id: linked.id,
+        reason: "episode ended",
+        idempotency_key: "fact-unlink"
+      },
+      now: 12
+    })
+
+    assert :ok = Rules.evaluate(ctx.db, fact_call.("user:fact_flynn", "wi_fact_linked"))
+
+    put_rule(ctx, rule("known-ended", "post", "work_item.has_topline", "eq", false))
+    Rules.load!(ctx.base_dir, ["post"])
+
+    assert {:deny, %{rule: "known-ended"}} =
+             Rules.evaluate(ctx.db, fact_call.("user:fact_flynn", "wi_fact_linked"))
   end
 
   test "target facts cover active retired missing ghost dm and main sessions", ctx do

@@ -150,9 +150,9 @@ defmodule Tightbeam.Supervision do
             supervisionGeneration: generation,
             supervisionDueAt: due_at,
             supervisionIntervalMs: interval,
-            supervisionBasisKind: basis_kind,
-            supervisionBasisId: basis_id,
-            supervisionCause: cause,
+            supervisionBasisKind: logical_basis_kind(basis_kind, basis_id),
+            supervisionBasisId: logical_basis_id(basis_kind, basis_id),
+            supervisionCause: logical_basis_kind(cause, basis_id),
             supervisionPrincipal: principal,
             supervisionTerminusAt: terminus_at,
             supervisionTransferWakeId: nil,
@@ -174,6 +174,12 @@ defmodule Tightbeam.Supervision do
       {state, projection} -> Map.merge(state, projection)
     end
   end
+
+  defp logical_basis_kind("progress", "receipt:" <> _receipt_id), do: "liveness_receipt"
+  defp logical_basis_kind(kind, _basis_id), do: kind
+
+  defp logical_basis_id("progress", "receipt:" <> receipt_id), do: receipt_id
+  defp logical_basis_id(_kind, basis_id), do: basis_id
 
   @doc """
   Validate an existing accepted parent-transfer reference without creating
@@ -227,7 +233,9 @@ defmodule Tightbeam.Supervision do
       [assignment_id, opened_at + interval, principal, interval]
     )
 
-    if Txn.changes(txn) == 1, do: :armed, else: :duplicate
+    result = if Txn.changes(txn) == 1, do: :armed, else: :duplicate
+    ensure_liveness_receipt_state_in_txn(txn, assignment_id, "assignment_open", principal)
+    result
   end
 
   def transition_in_txn(%Txn{} = txn, %{
@@ -240,6 +248,49 @@ defmodule Tightbeam.Supervision do
     cancel_assignment_controllers_in_txn(txn, assignment_id, requester_id)
     clear_entitlement_in_txn(txn, assignment_id, cause, principal)
     :terminal_disposition
+  end
+
+  def transition_in_txn(%Txn{} = txn, %{
+        kind: "checkpoint_scheduled",
+        wake_id: wake_id,
+        creator_session_key: creator_session_key
+      }) do
+    case Txn.q(
+           txn,
+           """
+           SELECT a.id, t.seq
+           FROM wakes w
+           JOIN turns t ON t.sessionKey=w.sessionKey
+           JOIN assignments a ON a.id=t.assignmentId
+           JOIN supervision_entitlements e ON e.assignmentId=a.id
+           WHERE w.wakeId=?1
+             AND w.sessionKey=?2 AND w.creatorSessionKey=?2
+             AND w.consumer='prompt' AND w.state='pending'
+             AND w.dueAt > w.createdAt
+             AND t.status='running'
+             AND a.holderKey=?2 AND a.state='open'
+             AND e.state IN ('armed','claimed')
+           ORDER BY t.seq DESC
+           LIMIT 1
+           """,
+           [wake_id, creator_session_key]
+         ) do
+      [[assignment_id, turn_seq]] ->
+        Txn.q(
+          txn,
+          """
+          INSERT INTO supervision_liveness_checkpoint_bindings
+            (wakeId, assignmentId, holderSessionKey, sourceTurnSeq, boundAt, principal)
+          VALUES (?1, ?2, ?3, ?4, ?5, 'process:tightbeam')
+          """,
+          [wake_id, assignment_id, creator_session_key, turn_seq, now()]
+        )
+
+        :armed
+
+      [] ->
+        :duplicate
+    end
   end
 
   def transition_in_txn(%Txn{} = txn, %{
@@ -505,7 +556,7 @@ defmodule Tightbeam.Supervision do
          ) do
       [[wake_kind, charged_generation, generation, _basis_kind, _basis_id, interval]]
       when generation == charged_generation ->
-        case absorb_progress_in_txn(txn, assignment_id, interval) do
+        case absorb_liveness_receipts_in_txn(txn, assignment_id, interval) do
           :rebased ->
             :canceled
 
@@ -812,21 +863,17 @@ defmodule Tightbeam.Supervision do
     3. no running or queued turn for the holder: a pending turn means the
        strand is moving;
     4. the holder session is active, not retired;
-    5. no pending wake for the holder, ANY origin — a scheduled wake means
-       the strand is not stalled regardless of who scheduled it
-       (`Wakes.pending_count/2` is the ground truth for "pending" here);
-    6. a terminal exists at all — the sweep also asks about strands that
+    5. a terminal exists at all — the sweep also asks about strands that
        have never ended a turn;
-    7. no standing `work-blocked` fact for the holder: an agent with
+    6. no standing `work-blocked` fact for the holder: an agent with
        authority decided this session is not to be treated as stalled, and
        the production simply does not match — the same absence-of-match as
        a session with no open assignment.
 
-  One conjunct of the spec's LHS is deliberately NOT a match condition,
-  because the ground never gated on it: an attest newer than the prod
-  cycle's watermark (`assignment_prods.attestCount`) does not unmatch the
-  production — `claim_and_act` absorbs it, advancing the watermark and
-  resetting the ladder in the same cycle, and the prod still fires.
+  Liveness receipts are deliberately NOT match conditions. The act consumes
+  only typed durable sources: an assignment artifact, work-item update,
+  verdict fact, or one unexpired assignment-bound checkpoint. Progress prose
+  is never parsed and never resets the ladder by itself.
 
   A no-match verdict names the failing conjunct. Verdicts the turn-end
   schedule must still see — the rail production outranks the prod ladder
@@ -844,7 +891,6 @@ defmodule Tightbeam.Supervision do
         with :new <- dedupe(watermark(db, session_key), terminal_seq),
              :quiet <- turn_gate(db, session_key),
              :live <- holder_state(db, session_key),
-             :none <- wake_gate(db, session_key),
              :evaluable <- terminal_gate(terminal_seq),
              :unblocked <- block_gate(db, session_key) do
           {:match, assignment}
@@ -853,7 +899,6 @@ defmodule Tightbeam.Supervision do
           :coalesced -> {:no_match, :terminal_coalesced}
           :moving -> {:no_match, :strand_moving}
           :retired -> {:no_match, :holder_retired}
-          :pending -> {:no_match, :pending_wake, assignment}
           :no_terminal -> {:no_match, :no_terminal, assignment}
           :blocked -> {:no_match, :work_blocked, assignment}
         end
@@ -880,9 +925,6 @@ defmodule Tightbeam.Supervision do
 
   defp turn_gate(db, session_key),
     do: if(Ledger.pending_count(db, session_key) == 0, do: :quiet, else: :moving)
-
-  defp wake_gate(db, session_key),
-    do: if(Wakes.pending_count(db, session_key) == 0, do: :none, else: :pending)
 
   defp terminal_gate(nil), do: :no_terminal
   defp terminal_gate(_terminal_seq), do: :evaluable
@@ -998,8 +1040,6 @@ defmodule Tightbeam.Supervision do
   #                        escalate / legibility rows; rails-mechanism-v1 owns
   #                        the semantics of this step, this module only hosts
   #                        its slot);
-  #   :pending_wake_gate — an already-pending wake means the strand is not
-  #                        stalled; nothing downstream should fire;
   #   :prod_ladder       — the sweep proper (prods, escalation ladder,
   #                        watermark). Always halts; the schedule never runs
   #                        off the end.
@@ -1026,7 +1066,7 @@ defmodule Tightbeam.Supervision do
   # the turn context, the order carries meaning, and the termination proof is
   # over the closed composition. Orgs extend turn-end behavior through
   # STATUTES (data, hosted by :rail_enforcement) — never by code injection.
-  @turn_end_schedule [:rail_enforcement, :pending_wake_gate, :prod_ladder]
+  @turn_end_schedule [:rail_enforcement, :prod_ladder]
 
   @doc "The end-of-turn shift, in execution order. Pinned by test; amend both."
   def turn_end_schedule, do: @turn_end_schedule
@@ -1068,13 +1108,6 @@ defmodule Tightbeam.Supervision do
       {:acted, _tag} = acted -> {:halt, acted}
       {:retry, _tag} = retry -> {:halt, retry}
       :fallthrough -> :cont
-    end
-  end
-
-  defp turn_end_step(:pending_wake_gate, ctx) do
-    case ctx.verdict do
-      {:no_match, :pending_wake, _assignment} -> {:halt, :continuation}
-      _verdict -> :cont
     end
   end
 
@@ -1306,9 +1339,7 @@ defmodule Tightbeam.Supervision do
                 do: replacement_interval,
                 else: stored_interval
 
-            record_prod_answers_in_txn(txn, assignment.id, session_key)
-
-            case absorb_progress_in_txn(txn, assignment.id, interval) do
+            case absorb_liveness_receipts_in_txn(txn, assignment.id, interval) do
               :rebased ->
                 write_terminal_watermark_in_txn(txn, session_key, terminal_seq)
                 :rebased
@@ -1405,6 +1436,13 @@ defmodule Tightbeam.Supervision do
          terminal_seq,
          cause
        ) do
+    ensure_liveness_receipt_state_in_txn(
+      txn,
+      assignment.id,
+      "first_prod",
+      "process:tightbeam"
+    )
+
     current = counter_state_in_txn(txn, assignment.id)
 
     attempt_count =
@@ -1489,45 +1527,6 @@ defmodule Tightbeam.Supervision do
     else
       :stale
     end
-  end
-
-  # An attestation answers the outstanding prod even when it is not itself a
-  # progress attestation. Keep that causal edge in the typed entitlement path;
-  # progress-specific rebasing remains the separate operation below.
-  defp record_prod_answers_in_txn(txn, assignment_id, session_key) do
-    current = counter_state_in_txn(txn, assignment_id)
-
-    [[attest_count]] =
-      Txn.q(txn, "SELECT count(*) FROM attests WHERE assignmentId=?1", [assignment_id])
-
-    if attest_count > current.attestCount do
-      job_ref = job_ref_in_txn(txn, assignment_id)
-
-      for attest_id <- CausalEvents.unseen_attest_ids_in_txn(txn, assignment_id) do
-        CausalEvents.append_in_txn(txn, %{
-          kind: "prod_answered",
-          assignment_id: assignment_id,
-          job_ref: job_ref,
-          session_key: session_key,
-          detail: %{byAttestId: attest_id}
-        })
-      end
-
-      Txn.q(
-        txn,
-        """
-        INSERT INTO assignment_prods
-          (assignmentId, attemptCount, prodCount, deniedStreak, attestCount, stalledAt)
-        VALUES (?1, 0, 0, 0, ?2, NULL)
-        ON CONFLICT(assignmentId) DO UPDATE SET
-          attemptCount=0, prodCount=0, deniedStreak=0,
-          attestCount=excluded.attestCount, stalledAt=NULL
-        """,
-        [assignment_id, attest_count]
-      )
-    end
-
-    :ok
   end
 
   defp counter_state_in_txn(txn, assignment_id) do
@@ -2016,7 +2015,14 @@ defmodule Tightbeam.Supervision do
         )
 
       Enum.each(existing, fn [assignment_id] ->
-        absorb_progress_in_txn(txn, assignment_id, interval)
+        ensure_liveness_receipt_state_in_txn(
+          txn,
+          assignment_id,
+          "recovery_backfill",
+          "process:tightbeam"
+        )
+
+        absorb_liveness_receipts_in_txn(txn, assignment_id, interval)
       end)
 
       missing =
@@ -2039,6 +2045,13 @@ defmodule Tightbeam.Supervision do
 
           :none ->
             baseline_progress_in_txn(txn, assignment_id)
+
+            ensure_liveness_receipt_state_in_txn(
+              txn,
+              assignment_id,
+              "recovery_backfill",
+              "process:tightbeam"
+            )
 
             Txn.q(
               txn,
@@ -2175,7 +2188,7 @@ defmodule Tightbeam.Supervision do
             if MapSet.member?(acc, assignment_id) do
               acc
             else
-              case absorb_progress_in_txn(txn, assignment_id, interval) do
+              case absorb_liveness_receipts_in_txn(txn, assignment_id, interval) do
                 :rebased -> MapSet.put(acc, assignment_id)
                 :duplicate -> acc
               end
@@ -2199,148 +2212,327 @@ defmodule Tightbeam.Supervision do
 
   defp liveness_cycle(_state, _terminal_rebases), do: :ok
 
-  defp absorb_progress_in_txn(txn, assignment_id, interval) do
-    unseen =
+  defp absorb_liveness_receipts_in_txn(txn, assignment_id, interval) do
+    ensure_liveness_receipt_state_in_txn(
+      txn,
+      assignment_id,
+      "first_prod",
+      "process:tightbeam"
+    )
+
+    [[generation, state]] =
+      Txn.q(
+        txn,
+        "SELECT generation, state FROM supervision_entitlements WHERE assignmentId=?1",
+        [assignment_id]
+      )
+
+    pending_controller? =
       Txn.q(
         txn,
         """
-        SELECT a.id, a.ts, a.bySession
-        FROM attests a
-        LEFT JOIN supervision_progress_absorptions p ON p.attestId=a.id
-        WHERE a.assignmentId=?1 AND a.kind='progress' AND p.attestId IS NULL
-        ORDER BY a.ts, a.id
+        SELECT 1 FROM supervision_liveness_sidecar
+        WHERE assignmentId=?1 AND controllerOrigin='scheduled' AND controllerState='pending'
+        LIMIT 1
+        """,
+        [assignment_id]
+      ) != []
+
+    if state in ["armed", "claimed"] and not pending_controller? do
+      absorb_receipt_candidates_in_txn(txn, assignment_id, generation, interval)
+    else
+      :duplicate
+    end
+  end
+
+  defp absorb_receipt_candidates_in_txn(txn, assignment_id, generation, interval) do
+    evaluation_clock = now()
+
+    [[holder, work_item_id]] =
+      Txn.q(
+        txn,
+        "SELECT holderKey, workItemId FROM assignments WHERE id=?1 AND state='open'",
+        [assignment_id]
+      )
+
+    [[artifact_cursor, attest_cursor, event_cursor, wake_cursor]] =
+      Txn.q(
+        txn,
+        """
+        SELECT artifactCursor, attestCursor, workItemEventCursor, wakeCursor
+        FROM supervision_liveness_receipt_state WHERE assignmentId=?1
         """,
         [assignment_id]
       )
 
-    case unseen do
+    [artifact_max, attest_max, event_max, wake_max] = receipt_source_maxima_in_txn(txn)
+
+    effects =
+      artifact_receipts_in_txn(
+        txn,
+        work_item_id,
+        holder,
+        artifact_cursor,
+        artifact_max
+      ) ++
+        verdict_receipts_in_txn(txn, assignment_id, attest_cursor, attest_max) ++
+        work_item_receipts_in_txn(txn, work_item_id, event_cursor, event_max)
+
+    checkpoint =
+      checkpoint_receipt_in_txn(
+        txn,
+        assignment_id,
+        holder,
+        wake_cursor,
+        wake_max,
+        effects,
+        evaluation_clock
+      )
+
+    Txn.q(
+      txn,
+      """
+      UPDATE supervision_liveness_receipt_state
+      SET artifactCursor=?2, attestCursor=?3, workItemEventCursor=?4, wakeCursor=?5
+      WHERE assignmentId=?1
+      """,
+      [assignment_id, artifact_max, attest_max, event_max, wake_max]
+    )
+
+    receipts = if effects == [], do: List.wrap(checkpoint), else: effects
+
+    case receipts do
       [] ->
         :duplicate
 
       rows ->
-        [[generation, state]] =
+        next_generation = generation + 1
+        accepted_at = evaluation_clock
+
+        Enum.each(rows, fn %{kind: kind, id: id, at: source_at, expires_at: expires_at} ->
           Txn.q(
             txn,
-            "SELECT generation, state FROM supervision_entitlements WHERE assignmentId=?1",
+            """
+            INSERT INTO supervision_liveness_receipts
+              (assignmentId, sourceKind, sourceId, sourceAt, acceptedAt, generation, expiresAt)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            """,
+            [assignment_id, kind, id, source_at, accepted_at, next_generation, expires_at]
+          )
+        end)
+
+        [[basis_id]] =
+          Txn.q(
+            txn,
+            "SELECT MAX(receiptId) FROM supervision_liveness_receipts WHERE assignmentId=?1",
             [assignment_id]
           )
 
-        if state in ["armed", "claimed"] do
-          next_generation = generation + 1
-          [basis_id, basis_ts, by_session] = List.last(rows)
-          principal = "session:#{by_session}"
+        [[attest_count]] =
+          Txn.q(txn, "SELECT count(*) FROM attests WHERE assignmentId=?1", [assignment_id])
 
-          Enum.each(rows, fn [attest_id, attest_ts, attest_session] ->
-            Txn.q(
-              txn,
-              """
-              INSERT INTO supervision_progress_absorptions
-                (attestId, assignmentId, attestTs, generation, recoveryBaseline, cause, principal)
-              VALUES (?1, ?2, ?3, ?4, 0, 'progress', ?5)
-              """,
-              [
-                attest_id,
-                assignment_id,
-                attest_ts,
-                next_generation,
-                "session:#{attest_session}"
-              ]
-            )
-          end)
+        Txn.q(
+          txn,
+          """
+          INSERT INTO assignment_prods
+            (assignmentId, attemptCount, prodCount, deniedStreak, attestCount, stalledAt)
+          VALUES (?1, 0, 0, 0, ?2, NULL)
+          ON CONFLICT(assignmentId) DO UPDATE SET
+            attemptCount=0, prodCount=0, deniedStreak=0,
+            attestCount=excluded.attestCount, stalledAt=NULL
+          """,
+          [assignment_id, attest_count]
+        )
 
-          [[attest_count]] =
-            Txn.q(txn, "SELECT count(*) FROM attests WHERE assignmentId=?1", [assignment_id])
+        due_at = receipt_due_at(rows, accepted_at, interval)
 
-          Txn.q(
-            txn,
-            """
-            INSERT INTO assignment_prods
-              (assignmentId, attemptCount, prodCount, deniedStreak, attestCount, stalledAt)
-            VALUES (?1, 0, 0, 0, ?2, NULL)
-            ON CONFLICT(assignmentId) DO UPDATE SET
-              attemptCount=0, prodCount=0, deniedStreak=0,
-              attestCount=excluded.attestCount, stalledAt=NULL
-            """,
-            [assignment_id, attest_count]
-          )
-
-          Txn.q(
-            txn,
-            """
-            UPDATE supervision_entitlements
-            SET generation=?2, dueAt=?3, state='armed', lastAttemptGeneration=NULL,
-                claimClock=NULL, basisKind='progress', basisId=?4, terminusAt=NULL,
-                cause='progress', principal=?5, supervisionIntervalMs=?6
-            WHERE assignmentId=?1 AND generation=?7 AND state IN ('armed','claimed')
-            """,
-            [
-              assignment_id,
-              next_generation,
-              basis_ts + interval,
-              basis_id,
-              principal,
-              interval,
-              generation
-            ]
-          )
-
-          settle_stale_controller_in_txn(
-            txn,
+        # `supervision_entitlements` is a shape-validated legacy table. Keep its
+        # accepted enum byte-compatible and reserve the existing progress slot;
+        # the additive receipt ledger above is the authoritative provenance.
+        Txn.q(
+          txn,
+          """
+          UPDATE supervision_entitlements
+          SET generation=?2, dueAt=?3, state='armed', lastAttemptGeneration=NULL,
+              claimClock=NULL, basisKind='progress', basisId=?4, terminusAt=NULL,
+              cause='progress', principal='process:tightbeam',
+              supervisionIntervalMs=?5
+          WHERE assignmentId=?1 AND generation=?6 AND state IN ('armed','claimed')
+          """,
+          [
             assignment_id,
             next_generation,
-            basis_id
-          )
+            due_at,
+            "receipt:#{basis_id}",
+            interval,
+            generation
+          ]
+        )
 
-          EventLog.lifecycle_in_txn(
-            txn,
-            "supervision_entitlement_rebased",
-            assignment_id,
-            "generation=#{next_generation} basis=progress:#{basis_id} cause=progress principal=#{principal}"
-          )
+        source_refs = Enum.map_join(rows, ",", &"#{&1.kind}:#{&1.id}")
 
-          :rebased
-        else
-          :duplicate
-        end
+        EventLog.lifecycle_in_txn(
+          txn,
+          "supervision_entitlement_rebased",
+          assignment_id,
+          "generation=#{next_generation} basis=liveness_receipt:#{basis_id} sources=#{source_refs} cause=liveness_receipt principal=process:tightbeam"
+        )
+
+        :rebased
     end
   end
 
-  defp settle_stale_controller_in_txn(txn, assignment_id, generation, basis_id) do
-    rows =
-      Txn.q(
-        txn,
-        """
-        SELECT s.wakeId
-        FROM supervision_liveness_sidecar s
-        JOIN wakes w ON w.wakeId=s.wakeId
-        WHERE s.assignmentId=?1 AND s.controllerOrigin='scheduled'
-          AND s.controllerState='pending' AND s.chargedGeneration < ?2
-          AND w.state='pending'
-        """,
-        [assignment_id, generation]
-      )
+  defp ensure_liveness_receipt_state_in_txn(
+         txn,
+         assignment_id,
+         baseline_cause,
+         principal
+       ) do
+    [artifact_cursor, attest_cursor, event_cursor, wake_cursor] =
+      receipt_source_maxima_in_txn(txn)
 
-    Enum.each(rows, fn [wake_id] ->
-      if Wakes.cancel_in_txn(txn, %{
-           wake_id: wake_id,
-           requester: %{kind: "process", id: "tightbeam:supervision"},
-           reason_kind: "superseded",
-           causal_source: %{kind: "progress_attest", id: basis_id},
-           outcome: %{
-             kind: "no_replacement",
-             liveness_trigger: %{
-               kind: "supervision_entitlement",
-               id: "#{assignment_id}##{generation}"
-             }
-           }
-         }) do
-        Txn.q(
-          txn,
-          "UPDATE supervision_liveness_sidecar SET controllerState='settled' WHERE wakeId=?1",
-          [wake_id]
-        )
-      end
+    Txn.q(
+      txn,
+      """
+      INSERT OR IGNORE INTO supervision_liveness_receipt_state
+        (assignmentId, artifactCursor, attestCursor, workItemEventCursor, wakeCursor,
+         baselineCause, baselinePrincipal)
+      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+      """,
+      [
+        assignment_id,
+        artifact_cursor,
+        attest_cursor,
+        event_cursor,
+        wake_cursor,
+        baseline_cause,
+        principal
+      ]
+    )
+
+    :ok
+  end
+
+  defp receipt_source_maxima_in_txn(txn) do
+    [[artifact_cursor]] = Txn.q(txn, "SELECT COALESCE(MAX(rowid), 0) FROM artifacts")
+    [[attest_cursor]] = Txn.q(txn, "SELECT COALESCE(MAX(rowid), 0) FROM attests")
+    [[event_cursor]] = Txn.q(txn, "SELECT COALESCE(MAX(id), 0) FROM work_item_events")
+    [[wake_cursor]] = Txn.q(txn, "SELECT COALESCE(MAX(rowid), 0) FROM wakes")
+    [artifact_cursor, attest_cursor, event_cursor, wake_cursor]
+  end
+
+  defp artifact_receipts_in_txn(txn, work_item_id, holder, cursor, maximum) do
+    Txn.q(
+      txn,
+      """
+      SELECT artifactId, createdAt
+      FROM artifacts
+      WHERE rowid > ?1 AND rowid <= ?2 AND workItemId=?3 AND createdBySession=?4
+      ORDER BY rowid
+      """,
+      [cursor, maximum, work_item_id, holder]
+    )
+    |> Enum.map(fn [id, at] -> %{kind: "artifact", id: id, at: at, expires_at: nil} end)
+  end
+
+  defp verdict_receipts_in_txn(txn, assignment_id, cursor, maximum) do
+    Txn.q(
+      txn,
+      """
+      SELECT id, ts
+      FROM attests
+      WHERE rowid > ?1 AND rowid <= ?2 AND assignmentId=?3 AND kind='verdict'
+      ORDER BY rowid
+      """,
+      [cursor, maximum, assignment_id]
+    )
+    |> Enum.map(fn [id, at] -> %{kind: "verdict", id: id, at: at, expires_at: nil} end)
+  end
+
+  defp work_item_receipts_in_txn(txn, work_item_id, cursor, maximum) do
+    Txn.q(
+      txn,
+      """
+      SELECT id, ts
+      FROM work_item_events
+      WHERE id > ?1 AND id <= ?2 AND workItemId=?3 AND kind='metadata'
+      ORDER BY id
+      """,
+      [cursor, maximum, work_item_id]
+    )
+    |> Enum.map(fn [id, at] ->
+      %{kind: "work_item_update", id: to_string(id), at: at, expires_at: nil}
     end)
+  end
+
+  defp checkpoint_receipt_in_txn(
+         _txn,
+         _assignment_id,
+         _holder,
+         _cursor,
+         _maximum,
+         effects,
+         _evaluation_clock
+       )
+       when effects != [],
+       do: nil
+
+  defp checkpoint_receipt_in_txn(
+         txn,
+         assignment_id,
+         holder,
+         cursor,
+         maximum,
+         [],
+         evaluation_clock
+       ) do
+    latest_kind =
+      case Txn.q(
+             txn,
+             """
+             SELECT sourceKind FROM supervision_liveness_receipts
+             WHERE assignmentId=?1 ORDER BY receiptId DESC LIMIT 1
+             """,
+             [assignment_id]
+           ) do
+        [[kind]] -> kind
+        [] -> nil
+      end
+
+    if latest_kind == "checkpoint" do
+      nil
+    else
+      case Txn.q(
+             txn,
+             """
+             SELECT w.wakeId, w.createdAt, w.dueAt
+             FROM wakes w
+             JOIN supervision_liveness_checkpoint_bindings b ON b.wakeId=w.wakeId
+             WHERE w.rowid > ?1 AND w.rowid <= ?2
+               AND b.assignmentId=?3 AND b.holderSessionKey=?4
+               AND w.sessionKey=?4 AND w.creatorSessionKey=?4
+               AND w.consumer='prompt' AND w.state='pending'
+               AND w.dueAt > ?5 AND w.dueAt > w.createdAt
+             ORDER BY w.dueAt, w.rowid
+             LIMIT 1
+             """,
+             [cursor, maximum, assignment_id, holder, evaluation_clock]
+           ) do
+        [[id, at, due_at]] ->
+          %{kind: "checkpoint", id: id, at: at, expires_at: due_at}
+
+        [] ->
+          nil
+      end
+    end
+  end
+
+  defp receipt_due_at([%{kind: "checkpoint", expires_at: due_at}], _accepted_at, _interval),
+    do: due_at
+
+  defp receipt_due_at(rows, accepted_at, interval) do
+    latest_source = rows |> Enum.map(& &1.at) |> Enum.max()
+    max(accepted_at, latest_source) + interval
   end
 
   defp claim_due_in_txn(txn, evaluation_clock, rebased, n) do
@@ -2449,13 +2641,6 @@ defmodule Tightbeam.Supervision do
         [holder]
       ) != [] ->
         "pending_turn"
-
-      Txn.q(
-        txn,
-        "SELECT 1 FROM wakes WHERE sessionKey=?1 AND consumer='prompt' AND state='pending' LIMIT 1",
-        [holder]
-      ) != [] ->
-        "pending_wake"
 
       Txn.q(
         txn,

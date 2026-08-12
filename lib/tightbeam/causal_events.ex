@@ -13,13 +13,12 @@ defmodule Tightbeam.CausalEvents do
     replacement deadline wake carries no rung (it is scheduled without
     `reresolve_rung`), so the prior rung has no other home.
   - `prod_fired` — `assignment_prods.prodCount` is a mutable aggregate that
-    RESETS on attest, and the tier that fired lives only in
+    resets on a typed liveness receipt, and the tier that fired lives only in
     `supervision_watermarks.pendingK`, overwritten each evaluation. The
     delivered turn is durable but carries no tier.
-  - `prod_answered` — `assignment_prods.attestCount` is a bare COUNT, so which
-    attest answered the prods is unrecoverable. There is no id watermark
-    anywhere; this table is therefore its own watermark (see
-    `unseen_attest_ids_in_txn/2`).
+  - `prod_answered` — a legacy kind retained for existing rows. New writers do
+    not emit it: `supervision_liveness_receipts` now records the exact typed
+    source that reset a prod, and progress prose is not an answer.
   - `disposition_transition` — `work_items.state` is overwritten and
     `failReason` is nulled on reopen. `work_item_events` is a bare DOORBELL
     (kind is only 'metadata' or 'composition'); it says something changed, never
@@ -121,7 +120,7 @@ defmodule Tightbeam.CausalEvents do
   end
 
   @doc """
-  The attest ids that answered a prod round, ordered by attest id.
+  Legacy resolver for attest ids recorded by the retired `prod_answered` writer.
 
   BOUNDED to attests filed at/after the v2-epoch cutoff — the moment
   causal_events was created. Scanning an assignment's whole attest history would

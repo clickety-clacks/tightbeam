@@ -135,6 +135,7 @@ defmodule Tightbeam.Rules do
     "assignment.holder_archetype" => :string,
     "assignment.caller_is_holder" => :bool,
     "work_item.is_bug" => :bool,
+    "work_item.has_topline" => :bool,
     "work_item.has_spec_ref" => :bool,
     "work_item.verdict_kinds" => {:list, :string},
     "assignment.review_verdict_count" => :int,
@@ -1289,6 +1290,48 @@ defmodule Tightbeam.Rules do
           end
 
         {value, cache}
+    end)
+  end
+
+  # Explicit active membership is the sole Topline truth. Visibility is checked
+  # before the count so an unknown item and another user's item are one nil
+  # answer; ended episodes and Concern references cannot make this fact true.
+  defp compute_fact("work_item.has_topline", db, call, cache) do
+    with_dependency("$work_item_id", db, call, cache, fn
+      nil, cache ->
+        {nil, cache}
+
+      work_item_id, cache ->
+        with_dependency("caller.user", db, call, cache, fn
+          nil, cache ->
+            {nil, cache}
+
+          caller_user, cache ->
+            with_dependency("caller.is_admin", db, call, cache, fn
+              nil, cache ->
+                {nil, cache}
+
+              is_admin, cache ->
+                {:ok, rows} =
+                  DB.query(
+                    db,
+                    """
+                    SELECT EXISTS(
+                      SELECT 1 FROM topline_work_memberships m
+                      WHERE m.workItemId = wi.id AND m.unlinkedAt IS NULL
+                    )
+                    FROM work_items wi
+                    WHERE wi.id = ?1 AND (?2 = 1 OR wi.ownerUserId = ?3)
+                    """,
+                    [work_item_id, if(is_admin, do: 1, else: 0), caller_user]
+                  )
+
+                case rows do
+                  [[flag]] -> {flag == 1, cache}
+                  [] -> {nil, cache}
+                end
+            end)
+        end)
     end)
   end
 

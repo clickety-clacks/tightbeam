@@ -5,7 +5,7 @@ phase = "pending"
 blocking_phase = "P6"
 kind = "sweep"
 source = "supervision-impl-v1 r21 turn-end schedule (Flynn-ratified 2026-07-24)"
-legibility = "rail_enforcement precedes pending_wake_gate; lifecycle:rail_sweep(decision=run-remedy)"
+legibility = "rail_enforcement precedes prod_ladder; lifecycle:rail_sweep(decision=run-remedy)"
 
 [[fixture.rule]]
 name = "scheduled-wake-suppression"
