@@ -20,26 +20,92 @@ defmodule Tightbeam.RecurrenceSuppressionTest do
     config = config(9)
     first = occurrence(ctx.target.session_key, "asg_one", "r1", 1)
 
-    assert :deliver = RecurrenceSuppression.record_first(ctx.db, config, first)
-    assert :deliver = RecurrenceSuppression.record_first(ctx.db, config, first)
+    assert :dispatch = RecurrenceSuppression.prepare_first(ctx.db, first, "dispatch-one")
+
+    assert :deliver =
+             RecurrenceSuppression.record_first(
+               ctx.db,
+               config,
+               first,
+               "dispatch-one",
+               evidence(true, "recovered")
+             )
+
+    assert :delivered = RecurrenceSuppression.prepare_first(ctx.db, first, "dispatch-one")
 
     second = occurrence(ctx.target.session_key, "asg_one", "r2", 2)
-    assert :suppressed = RecurrenceSuppression.repeat(ctx.db, config, second, false, true)
-    assert :suppressed = RecurrenceSuppression.repeat(ctx.db, config, second, false, true)
 
-    recovered = occurrence(ctx.target.session_key, "asg_one", "r3", 3)
-    assert :suppressed = RecurrenceSuppression.repeat(ctx.db, config, recovered, true, false)
+    assert :suppressed =
+             RecurrenceSuppression.repeat(
+               ctx.db,
+               config,
+               second,
+               evidence(true, "recovered"),
+               evidence(false, "recurred")
+             )
 
-    same_sequence = occurrence(ctx.target.session_key, "asg_one", "r4", 3)
-    assert :suppressed = RecurrenceSuppression.repeat(ctx.db, config, same_sequence, false, true)
+    # The recovery fact already matched when generation one opened, so it is stale.
+    assert {:ok, [[nil]]} =
+             DB.query(
+               ctx.db,
+               "SELECT recoveredSequence FROM recurrence_suppression_episodes WHERE subject='asg_one'"
+             )
 
-    recurrence = occurrence(ctx.target.session_key, "asg_one", "r5", 4)
+    changed_away = occurrence(ctx.target.session_key, "asg_one", "r3", 3)
+
+    assert :suppressed =
+             RecurrenceSuppression.repeat(
+               ctx.db,
+               config,
+               changed_away,
+               evidence(false, "recovered"),
+               evidence(false, "recurred")
+             )
+
+    recovered = occurrence(ctx.target.session_key, "asg_one", "r4", 4)
+
+    assert :suppressed =
+             RecurrenceSuppression.repeat(
+               ctx.db,
+               config,
+               recovered,
+               evidence(true, "recovered"),
+               evidence(false, "recurred")
+             )
+
+    same_sequence = occurrence(ctx.target.session_key, "asg_one", "r5", 4)
+
+    assert :suppressed =
+             RecurrenceSuppression.repeat(
+               ctx.db,
+               config,
+               same_sequence,
+               evidence(true, "recovered"),
+               evidence(true, "recurred")
+             )
+
+    recurrence = occurrence(ctx.target.session_key, "asg_one", "r6", 5)
 
     assert {:rearmed, 2} =
-             RecurrenceSuppression.repeat(ctx.db, config, recurrence, false, true)
+             RecurrenceSuppression.repeat(
+               ctx.db,
+               config,
+               recurrence,
+               evidence(true, "recovered"),
+               evidence(true, "recurred")
+             )
 
-    other_subject = occurrence(ctx.target.session_key, "asg_two", "r6", 5)
-    assert :deliver = RecurrenceSuppression.record_first(ctx.db, config, other_subject)
+    other_subject = occurrence(ctx.target.session_key, "asg_two", "r7", 6)
+    assert :dispatch = RecurrenceSuppression.prepare_first(ctx.db, other_subject, "dispatch-two")
+
+    assert :deliver =
+             RecurrenceSuppression.record_first(
+               ctx.db,
+               config,
+               other_subject,
+               "dispatch-two",
+               evidence(false, "recovered")
+             )
 
     assert {:ok, [[2, 0, nil, 0]]} =
              DB.query(
@@ -60,18 +126,27 @@ defmodule Tightbeam.RecurrenceSuppressionTest do
              )
   end
 
-  test "threshold escalates once to the parent without waking the target", ctx do
+  test "threshold audits unavailable operational parent and falls back to Main", ctx do
     config = config(2)
     first = occurrence(ctx.target.session_key, "asg_threshold", "r1", 1)
-    assert :deliver = RecurrenceSuppression.record_first(ctx.db, config, first)
+    assert :dispatch = RecurrenceSuppression.prepare_first(ctx.db, first, "dispatch-threshold")
+
+    assert :deliver =
+             RecurrenceSuppression.record_first(
+               ctx.db,
+               config,
+               first,
+               "dispatch-threshold",
+               evidence(false, "recovered")
+             )
 
     assert :suppressed =
              RecurrenceSuppression.repeat(
                ctx.db,
                config,
                occurrence(ctx.target.session_key, "asg_threshold", "r2", 2),
-               false,
-               false
+               evidence(false, "recovered"),
+               evidence(false, "recurred")
              )
 
     assert :suppressed =
@@ -79,8 +154,8 @@ defmodule Tightbeam.RecurrenceSuppressionTest do
                ctx.db,
                config,
                occurrence(ctx.target.session_key, "asg_threshold", "r3", 3),
-               false,
-               false
+               evidence(false, "recovered"),
+               evidence(false, "recurred")
              )
 
     assert :suppressed =
@@ -88,12 +163,14 @@ defmodule Tightbeam.RecurrenceSuppressionTest do
                ctx.db,
                config,
                occurrence(ctx.target.session_key, "asg_threshold", "r4", 4),
-               false,
-               false
+               evidence(false, "recovered"),
+               evidence(false, "recurred")
              )
 
-    assert {:ok, [["parent", 1]]} =
+    assert {:ok, [[main, 1]]} =
              DB.query(ctx.db, "SELECT sessionKey,count(*) FROM wakes GROUP BY sessionKey")
+
+    assert main == ctx.main.session_key
 
     assert {:ok, [[0]]} =
              DB.query(ctx.db, "SELECT count(*) FROM wakes WHERE sessionKey='target'")
@@ -101,22 +178,33 @@ defmodule Tightbeam.RecurrenceSuppressionTest do
     assert {:ok, [[1]]} =
              DB.query(
                ctx.db,
-               "SELECT count(*) FROM recurrence_suppression_events WHERE outcome='recurrence_escalated'"
+               "SELECT count(*) FROM recurrence_suppression_events WHERE outcome='recurrence_escalated_main_fallback' AND cause='operational-parent-unavailable'"
              )
   end
 
   test "Main target and missing fingerprint stay audit-only and fail open", ctx do
     config = config(1)
     main_occurrence = occurrence(ctx.main.session_key, "asg_main", "r1", 1)
-    assert :deliver = RecurrenceSuppression.record_first(ctx.db, config, main_occurrence)
+
+    assert :dispatch =
+             RecurrenceSuppression.prepare_first(ctx.db, main_occurrence, "dispatch-main")
+
+    assert :deliver =
+             RecurrenceSuppression.record_first(
+               ctx.db,
+               config,
+               main_occurrence,
+               "dispatch-main",
+               evidence(false, "recovered")
+             )
 
     assert :suppressed =
              RecurrenceSuppression.repeat(
                ctx.db,
                config,
                occurrence(ctx.main.session_key, "asg_main", "r2", 2),
-               false,
-               false
+               evidence(false, "recovered"),
+               evidence(false, "recurred")
              )
 
     assert :unavailable =
@@ -127,8 +215,8 @@ defmodule Tightbeam.RecurrenceSuppressionTest do
                  occurrence(ctx.target.session_key, "asg_missing", "r3", 3),
                  :failure_code
                ),
-               false,
-               false
+               evidence(false, "recovered"),
+               evidence(false, "recurred")
              )
 
     assert {:ok, [[1]]} =
@@ -216,6 +304,8 @@ defmodule Tightbeam.RecurrenceSuppressionTest do
       raw_failure_text: "SECRET must never be stored"
     }
   end
+
+  defp evidence(matched, value), do: %{matched: matched, facts: [{"fact", value}]}
 
   defp declaration do
     """

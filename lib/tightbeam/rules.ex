@@ -403,11 +403,18 @@ defmodule Tightbeam.Rules do
   end
 
   @doc false
-  def conditions_match?(db, call, conditions) when is_list(conditions) do
+  def condition_evidence(db, call, conditions) when is_list(conditions) do
     case evaluate_conditions(conditions, %{name: "recurrence-suppression"}, db, call, %{}) do
-      {:match, _cache} -> true
-      _ -> false
+      {:match, cache} -> %{matched: true, facts: evidence_facts(conditions, cache)}
+      {:no_match, cache} -> %{matched: false, facts: evidence_facts(conditions, cache)}
+      {:error, fact} -> %{matched: false, facts: [{fact, :error}]}
     end
+  end
+
+  defp evidence_facts(conditions, cache) do
+    Enum.map(conditions, fn condition ->
+      {condition.fact, Map.get(cache, condition.fact, :not_evaluated)}
+    end)
   end
 
   defp validate_edges!(edges, verb, fail) do

@@ -236,10 +236,12 @@ defmodule Tightbeam.RailRemedy do
 
       with {:ok, producer_call, producer_hint} <-
              producer_call(db, rule, context, resolved, key),
+           :ok <- prepare_first_recurrence(db, rule, subject, call, key),
            {:ok, result} <- Dispatch.dispatch(db, handlers, producer_call),
            producer_id when is_binary(producer_id) <-
              producer_id(rule.remedy.action, result, producer_hint),
-           :ok <- record_first_recurrence(db, rule, subject, call, resolved, producer_id) do
+           :ok <-
+             record_first_recurrence(db, rule, subject, call, resolved, producer_id, key) do
         if cas(
              db,
              """
@@ -779,27 +781,59 @@ defmodule Tightbeam.RailRemedy do
     end
   end
 
+  defp prepare_first_recurrence(
+         _db,
+         %{recurrence_suppression: nil},
+         _subject,
+         _call,
+         _dispatch_key
+       ),
+       do: :ok
+
+  defp prepare_first_recurrence(db, rule, subject, call, dispatch_key) do
+    case RecurrenceSuppression.prepare_first(
+           db,
+           recurrence_occurrence(rule, subject, call, nil),
+           dispatch_key
+         ) do
+      result when result in [:dispatch, :delivered] -> :ok
+      :unavailable -> :ok
+      :conflict -> {:error, :recurrence_dispatch_conflict}
+    end
+  end
+
   defp record_first_recurrence(
          _db,
          %{recurrence_suppression: nil},
          _subject,
          _call,
          _resolved,
-         _producer_id
+         _producer_id,
+         _dispatch_key
        ),
        do: :ok
 
-  defp record_first_recurrence(db, rule, subject, call, resolved, producer_id) do
-    target = resolved[:bound_session] || producer_id
+  defp record_first_recurrence(db, rule, subject, call, resolved, producer_id, dispatch_key) do
+    case delivery_target(db, rule.remedy.action, resolved, producer_id) do
+      target when is_binary(target) ->
+        _ =
+          RecurrenceSuppression.record_first(
+            db,
+            rule.recurrence_suppression,
+            recurrence_occurrence(rule, subject, call, target),
+            dispatch_key,
+            Rules.condition_evidence(
+              db,
+              call,
+              rule.recurrence_suppression.rearm.recovered_when
+            )
+          )
 
-    _ =
-      RecurrenceSuppression.record_first(
-        db,
-        rule.recurrence_suppression,
-        recurrence_occurrence(rule, subject, call, target)
-      )
+        :ok
 
-    :ok
+      _ ->
+        {:error, :unresolved_delivery_target}
+    end
   end
 
   defp repeat_recurrence(_db, %{recurrence_suppression: nil}, _subject, _call, _target),
@@ -812,10 +846,23 @@ defmodule Tightbeam.RailRemedy do
       db,
       config,
       recurrence_occurrence(rule, subject, call, target),
-      Rules.conditions_match?(db, call, config.rearm.recovered_when),
-      Rules.conditions_match?(db, call, config.rearm.recurred_when)
+      Rules.condition_evidence(db, call, config.rearm.recovered_when),
+      Rules.condition_evidence(db, call, config.rearm.recurred_when)
     )
   end
+
+  defp delivery_target(db, "assign", _resolved, assignment_id) do
+    case DB.query(db, "SELECT holderKey FROM assignments WHERE id=?1", [assignment_id]) do
+      {:ok, [[session_key]]} -> session_key
+      _ -> nil
+    end
+  end
+
+  defp delivery_target(_db, "wake", %{bound_session: session_key}, _producer_id),
+    do: session_key
+
+  defp delivery_target(_db, "spawn", _resolved, session_key), do: session_key
+  defp delivery_target(_db, _action, _resolved, _producer_id), do: nil
 
   defp recurrence_occurrence(rule, subject, call, target) do
     params = call.params

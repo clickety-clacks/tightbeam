@@ -127,6 +127,19 @@ defmodule Tightbeam.RailRemedyTest do
       |> put_in([:params, :failure_class], "review-gate")
       |> put_in([:params, :failure_code], "missing-review")
 
+    # Crash specimen: the boundary is durable before producer dispatch. A retry
+    # resumes through the same dispatch identity and still creates one producer.
+    assert :dispatch =
+             Tightbeam.RecurrenceSuppression.prepare_first(
+               ctx.db,
+               %{
+                 statute: "completion-needs-review",
+                 subject: assignment.id,
+                 receipt_id: "receipt-1"
+               },
+               "rail-dispatch:completion-needs-review:#{assignment.id}:1"
+             )
+
     assert {:error, %{producer: review_id}} =
              Dispatch.dispatch(ctx.db, ctx.handlers, first)
 
@@ -151,6 +164,21 @@ defmodule Tightbeam.RailRemedyTest do
              DB.query(
                ctx.db,
                "SELECT count(*) FROM recurrence_suppression_events WHERE outcome='recurrence_repeat_suppressed'"
+             )
+
+    assert {:ok, [[target_session, "delivered", dispatch_key]]} =
+             DB.query(
+               ctx.db,
+               "SELECT targetSession,state,dispatchKey FROM recurrence_suppression_deliveries"
+             )
+
+    assert target_session == ctx.reviewer.session_key
+    assert dispatch_key == "rail-dispatch:completion-needs-review:#{assignment.id}:1"
+
+    assert {:ok, [[^target_session]]} =
+             DB.query(
+               ctx.db,
+               "SELECT targetSession FROM recurrence_suppression_episodes"
              )
   end
 

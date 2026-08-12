@@ -12,9 +12,34 @@ defmodule Tightbeam.RecurrenceSuppression do
     fingerprintDigest TEXT NOT NULL,
     generation INTEGER NOT NULL CHECK (generation > 0),
     suppressedCount INTEGER NOT NULL DEFAULT 0 CHECK (suppressedCount >= 0),
+    openedEvidenceSequence INTEGER NOT NULL,
     recoveredSequence INTEGER,
+    recoveredOccurrenceSequence INTEGER,
+    recurrenceBaselineSequence INTEGER,
     escalated INTEGER NOT NULL DEFAULT 0 CHECK (escalated IN (0, 1)),
     PRIMARY KEY (statute, targetSession, subject, fingerprintDigest)
+  );
+  CREATE TABLE IF NOT EXISTS recurrence_suppression_deliveries (
+    statute TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    receiptId TEXT NOT NULL,
+    dispatchKey TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('pending','delivered')),
+    targetSession TEXT,
+    fingerprintDigest TEXT,
+    PRIMARY KEY (statute, subject, receiptId),
+    UNIQUE (dispatchKey)
+  );
+  CREATE TABLE IF NOT EXISTS recurrence_suppression_fact_observations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    statute TEXT NOT NULL,
+    targetSession TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    fingerprintDigest TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    phase TEXT NOT NULL CHECK (phase IN ('recovered','recurred')),
+    signature TEXT NOT NULL,
+    matched INTEGER NOT NULL CHECK (matched IN (0,1))
   );
   CREATE TABLE IF NOT EXISTS recurrence_suppression_receipts (
     statute TEXT NOT NULL,
@@ -47,37 +72,71 @@ defmodule Tightbeam.RecurrenceSuppression do
   @spec ensure_schema(DB.server()) :: :ok
   def ensure_schema(db \\ DB), do: DB.execute(db, @ddl)
 
-  @doc "Record the one delivery which opens a suppression generation."
-  def record_first(db, config, occurrence) do
-    with {:ok, normalized} <- normalize(occurrence) do
-      transaction!(db, fn txn -> record_first_in_txn(txn, config, normalized) end)
+  @doc "Persist the dispatch identity before the first producer can be delivered."
+  def prepare_first(db, occurrence, dispatch_key) do
+    with {:ok, pending} <- normalize_pending(occurrence), true <- valid_string?(dispatch_key) do
+      transaction!(db, fn txn ->
+        Txn.q(
+          txn,
+          """
+          INSERT INTO recurrence_suppression_deliveries
+            (statute,subject,receiptId,dispatchKey,state)
+          VALUES (?1,?2,?3,?4,'pending') ON CONFLICT DO NOTHING
+          """,
+          [pending.statute, pending.subject, pending.receipt_id, dispatch_key]
+        )
+
+        case Txn.q(
+               txn,
+               "SELECT dispatchKey,state FROM recurrence_suppression_deliveries WHERE statute=?1 AND subject=?2 AND receiptId=?3",
+               [pending.statute, pending.subject, pending.receipt_id]
+             ) do
+          [[^dispatch_key, "pending"]] -> :dispatch
+          [[^dispatch_key, "delivered"]] -> :delivered
+          _ -> :conflict
+        end
+      end)
     else
-      :error -> unavailable(db, occurrence)
+      _ -> :unavailable
     end
   end
 
-  @doc "Classify a later matching occurrence before any wake or turn is created."
-  def repeat(db, config, occurrence, recovered?, recurred?) do
+  @doc "Commit the delivered target and open its suppression generation."
+  def record_first(db, config, occurrence, dispatch_key, recovered_evidence) do
     with {:ok, normalized} <- normalize(occurrence) do
       transaction!(db, fn txn ->
-        repeat_in_txn(txn, config, normalized, recovered?, recurred?)
+        record_first_in_txn(txn, config, normalized, dispatch_key, recovered_evidence)
       end)
     else
       :error -> unavailable(db, occurrence)
     end
   end
 
-  defp record_first_in_txn(txn, _config, occurrence) do
+  @doc "Classify a later matching occurrence before any wake or turn is created."
+  def repeat(db, config, occurrence, recovered_evidence, recurred_evidence) do
+    with {:ok, normalized} <- normalize(occurrence) do
+      transaction!(db, fn txn ->
+        repeat_in_txn(txn, config, normalized, recovered_evidence, recurred_evidence)
+      end)
+    else
+      :error -> unavailable(db, occurrence)
+    end
+  end
+
+  defp record_first_in_txn(txn, _config, occurrence, dispatch_key, recovered_evidence) do
     key = key(occurrence)
+    opened_sequence = observe(txn, key, 1, "recovered", recovered_evidence)
 
     Txn.q(
       txn,
       """
       INSERT INTO recurrence_suppression_episodes
-        (statute,targetSession,subject,fingerprintDigest,generation,suppressedCount,recoveredSequence,escalated)
-      VALUES (?1,?2,?3,?4,1,0,NULL,0) ON CONFLICT DO NOTHING
+        (statute,targetSession,subject,fingerprintDigest,generation,suppressedCount,
+         openedEvidenceSequence,recoveredSequence,recoveredOccurrenceSequence,
+         recurrenceBaselineSequence,escalated)
+      VALUES (?1,?2,?3,?4,1,0,?5,NULL,NULL,NULL,0) ON CONFLICT DO NOTHING
       """,
-      key
+      key ++ [opened_sequence]
     )
 
     generation = episode(txn, key).generation
@@ -86,10 +145,28 @@ defmodule Tightbeam.RecurrenceSuppression do
       audit(txn, "recurrence_first_delivered", occurrence, generation, 0, nil, nil)
     end
 
+    Txn.q(
+      txn,
+      """
+      UPDATE recurrence_suppression_deliveries
+      SET state='delivered',targetSession=?5,fingerprintDigest=?6
+      WHERE statute=?1 AND subject=?2 AND receiptId=?3 AND dispatchKey=?4
+        AND state IN ('pending','delivered')
+      """,
+      [
+        occurrence.statute,
+        occurrence.subject,
+        occurrence.receipt_id,
+        dispatch_key,
+        occurrence.target_session,
+        occurrence.digest
+      ]
+    )
+
     :deliver
   end
 
-  defp repeat_in_txn(txn, config, occurrence, recovered?, recurred?) do
+  defp repeat_in_txn(txn, config, occurrence, recovered_evidence, recurred_evidence) do
     key = key(occurrence)
 
     case episode(txn, key) do
@@ -101,11 +178,27 @@ defmodule Tightbeam.RecurrenceSuppression do
         if receipt?(txn, key, episode.generation, occurrence.receipt_id) do
           :suppressed
         else
-          episode = maybe_recover(txn, key, episode, occurrence, recovered?)
+          recovery_observation =
+            observe(txn, key, episode.generation, "recovered", recovered_evidence)
 
-          if recurred? and is_integer(episode.recovered_sequence) and
-               occurrence.sequence > episode.recovered_sequence do
-            rearm(txn, key, episode, occurrence)
+          recurrence_observation =
+            observe(txn, key, episode.generation, "recurred", recurred_evidence)
+
+          episode =
+            maybe_recover(
+              txn,
+              key,
+              episode,
+              occurrence,
+              recovered_evidence,
+              recovery_observation,
+              recurrence_observation
+            )
+
+          if evidence_matches?(recurred_evidence) and is_integer(episode.recovered_sequence) and
+               occurrence.sequence > episode.recovered_occurrence_sequence and
+               recurrence_observation > episode.recurrence_baseline_sequence do
+            rearm(txn, key, episode, occurrence, recurrence_observation)
           else
             suppress(txn, config, key, episode, occurrence)
           end
@@ -113,15 +206,34 @@ defmodule Tightbeam.RecurrenceSuppression do
     end
   end
 
-  defp maybe_recover(txn, key, %{recovered_sequence: nil} = episode, occurrence, true) do
+  defp maybe_recover(
+         txn,
+         key,
+         %{recovered_sequence: nil} = episode,
+         occurrence,
+         evidence,
+         recovery_observation,
+         recurrence_observation
+       ) do
+    eligible =
+      evidence_matches?(evidence) and recovery_observation > episode.opened_evidence_sequence
+
     Txn.q(
       txn,
       """
-      UPDATE recurrence_suppression_episodes SET recoveredSequence=?5
+      UPDATE recurrence_suppression_episodes
+      SET recoveredSequence=?5,recoveredOccurrenceSequence=?6,recurrenceBaselineSequence=?7
       WHERE statute=?1 AND targetSession=?2 AND subject=?3 AND fingerprintDigest=?4
-        AND generation=?6 AND recoveredSequence IS NULL
+        AND generation=?8 AND recoveredSequence IS NULL AND ?9=1
       """,
-      key ++ [occurrence.sequence, episode.generation]
+      key ++
+        [
+          recovery_observation,
+          occurrence.sequence,
+          recurrence_observation,
+          episode.generation,
+          if(eligible, do: 1, else: 0)
+        ]
     )
 
     if Txn.changes(txn) == 1 do
@@ -131,30 +243,37 @@ defmodule Tightbeam.RecurrenceSuppression do
         occurrence,
         episode.generation,
         episode.suppressed_count,
-        occurrence.sequence,
+        recovery_observation,
         nil
       )
 
-      %{episode | recovered_sequence: occurrence.sequence}
+      %{
+        episode
+        | recovered_sequence: recovery_observation,
+          recovered_occurrence_sequence: occurrence.sequence,
+          recurrence_baseline_sequence: recurrence_observation
+      }
     else
       episode(txn, key)
     end
   end
 
-  defp maybe_recover(_txn, _key, episode, _occurrence, _recovered?), do: episode
+  defp maybe_recover(_txn, _key, episode, _occurrence, _evidence, _recovery, _recurrence),
+    do: episode
 
-  defp rearm(txn, key, episode, occurrence) do
+  defp rearm(txn, key, episode, occurrence, recurrence_observation) do
     next = episode.generation + 1
 
     Txn.q(
       txn,
       """
       UPDATE recurrence_suppression_episodes
-      SET generation=?7,suppressedCount=0,recoveredSequence=NULL,escalated=0
+      SET generation=?7,suppressedCount=0,openedEvidenceSequence=?8,recoveredSequence=NULL,
+          recoveredOccurrenceSequence=NULL,recurrenceBaselineSequence=NULL,escalated=0
       WHERE statute=?1 AND targetSession=?2 AND subject=?3 AND fingerprintDigest=?4
         AND generation=?5 AND recoveredSequence=?6
       """,
-      key ++ [episode.generation, episode.recovered_sequence, next]
+      key ++ [episode.generation, episode.recovered_sequence, next, recurrence_observation]
     )
 
     if Txn.changes(txn) == 1 do
@@ -167,7 +286,7 @@ defmodule Tightbeam.RecurrenceSuppression do
         next,
         0,
         episode.recovered_sequence,
-        occurrence.sequence
+        recurrence_observation
       )
 
       {:rearmed, next}
@@ -220,7 +339,7 @@ defmodule Tightbeam.RecurrenceSuppression do
     )
 
     if Txn.changes(txn) == 1 do
-      case escalation_target(txn, occurrence.target_session) do
+      case main_fallback_target(txn, occurrence.target_session) do
         nil ->
           audit(
             txn,
@@ -247,8 +366,8 @@ defmodule Tightbeam.RecurrenceSuppression do
 
           audit(
             txn,
-            "recurrence_escalated",
-            occurrence,
+            "recurrence_escalated_main_fallback",
+            %{occurrence | cause: "operational-parent-unavailable"},
             generation,
             count,
             nil,
@@ -258,27 +377,23 @@ defmodule Tightbeam.RecurrenceSuppression do
     end
   end
 
-  defp escalation_target(txn, target) do
+  # This base has no durable operational-parent resolver. Creation provenance
+  # (`spawnedBy`) is deliberately not authority; the declared fallback is Main.
+  defp main_fallback_target(txn, target) do
     case Txn.q(
            txn,
-           "SELECT spawnedBy,ownerUserId FROM sessions WHERE sessionKey=?1",
+           "SELECT ownerUserId FROM sessions WHERE sessionKey=?1",
            [target]
          ) do
-      [[parent, owner]] ->
+      [[owner]] ->
         main = Org.personal_session_key(owner)
-
-        cond do
-          active_distinct?(txn, parent, target) -> parent
-          active_distinct?(txn, main, target) -> main
-          true -> nil
-        end
+        if active_distinct?(txn, main, target), do: main
 
       _ ->
         nil
     end
   end
 
-  defp active_distinct?(_txn, nil, _target), do: false
   defp active_distinct?(_txn, candidate, target) when candidate == target, do: false
 
   defp active_distinct?(txn, candidate, _target) do
@@ -324,6 +439,18 @@ defmodule Tightbeam.RecurrenceSuppression do
     end
   end
 
+  defp normalize_pending(occurrence) do
+    with statute when is_binary(statute) and statute != "" <- string(occurrence, :statute),
+         subject when is_binary(subject) and subject != "" <- string(occurrence, :subject),
+         receipt when is_binary(receipt) and receipt != "" <- string(occurrence, :receipt_id) do
+      {:ok, %{statute: statute, subject: subject, receipt_id: receipt}}
+    else
+      _ -> :error
+    end
+  end
+
+  defp valid_string?(value), do: is_binary(value) and value != ""
+
   defp digest(values) do
     bytes = Enum.map_join(values, fn value -> <<byte_size(value)::unsigned-big-64>> <> value end)
     :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
@@ -335,17 +462,31 @@ defmodule Tightbeam.RecurrenceSuppression do
     case Txn.q(
            txn,
            """
-           SELECT generation,suppressedCount,recoveredSequence,escalated
+           SELECT generation,suppressedCount,openedEvidenceSequence,recoveredSequence,
+                  recoveredOccurrenceSequence,recurrenceBaselineSequence,escalated
            FROM recurrence_suppression_episodes
            WHERE statute=?1 AND targetSession=?2 AND subject=?3 AND fingerprintDigest=?4
            """,
            key
          ) do
-      [[generation, count, recovered, escalated]] ->
+      [
+        [
+          generation,
+          count,
+          opened,
+          recovered,
+          recovered_occurrence,
+          recurrence_baseline,
+          escalated
+        ]
+      ] ->
         %{
           generation: generation,
           suppressed_count: count,
+          opened_evidence_sequence: opened,
           recovered_sequence: recovered,
+          recovered_occurrence_sequence: recovered_occurrence,
+          recurrence_baseline_sequence: recurrence_baseline,
           escalated: escalated == 1
         }
 
@@ -379,6 +520,46 @@ defmodule Tightbeam.RecurrenceSuppression do
 
     Txn.changes(txn) == 1
   end
+
+  defp observe(txn, key, generation, phase, evidence) do
+    signature = evidence_signature(evidence)
+    matched = if evidence_matches?(evidence), do: 1, else: 0
+
+    case Txn.q(
+           txn,
+           """
+           SELECT id,signature,matched FROM recurrence_suppression_fact_observations
+           WHERE statute=?1 AND targetSession=?2 AND subject=?3 AND fingerprintDigest=?4
+             AND generation=?5 AND phase=?6 ORDER BY id DESC LIMIT 1
+           """,
+           key ++ [generation, phase]
+         ) do
+      [[id, ^signature, ^matched]] ->
+        id
+
+      _ ->
+        Txn.q(
+          txn,
+          """
+          INSERT INTO recurrence_suppression_fact_observations
+            (statute,targetSession,subject,fingerprintDigest,generation,phase,signature,matched)
+          VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+          """,
+          key ++ [generation, phase, signature, matched]
+        )
+
+        [[id]] = Txn.q(txn, "SELECT last_insert_rowid()")
+        id
+    end
+  end
+
+  defp evidence_signature(evidence) do
+    :crypto.hash(:sha256, :erlang.term_to_binary(evidence, [:deterministic]))
+    |> Base.encode16(case: :lower)
+  end
+
+  defp evidence_matches?(%{matched: true}), do: true
+  defp evidence_matches?(_), do: false
 
   defp audit(txn, outcome, occurrence, generation, count, recovery_sequence, recurrence_sequence) do
     Txn.q(
