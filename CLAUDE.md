@@ -1,5 +1,14 @@
 # tightbeam_ex — agent notes
 
+## THIS LINE: main = the 0.2 fabric program (flipped 2026-08-12)
+
+The pre-flip tip lives on branch 0.1.x — the maintenance line the live org
+patches. Integration into main is PR-only under 0.2 program authorization
+(Mike / the program integrator). If your assignment card names a different
+integration branch, the card wins. If you are a 0.1.x-org agent reading
+this: your line is 0.1.x and this checkout is the wrong one — do not merge
+here. Fixes cross 0.1.x -> main by cherry-pick election only.
+
 ## THE PHILOSOPHY GATE — run it before you design, again before you ship
 
 Tightbeam is agent-first: agents run the org; the substrate records truth,
