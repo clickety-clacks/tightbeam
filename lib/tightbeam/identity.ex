@@ -19,7 +19,15 @@ defmodule Tightbeam.Identity do
   @live "tightbeam/live"
   @required_refs ["main", @upstream, @live]
   @reserved_prefix "tightbeam__"
-  @seed_owned_paths ["archetypes/default.toml", "guidance/operating-model.md"]
+  @seed_owned_paths [
+    "archetypes/default.toml",
+    "archetypes/exec.toml",
+    "guidance/operating-model.md",
+    "guidance/exec.md",
+    "guidance/office-convention.md",
+    "guidance/delegation-card.md",
+    "guidance/directive-vocabulary.md"
+  ]
   @bundle_doc_paths ~w(capabilities.md intake.md preferred-models.md manifest.toml)
 
   @type harness :: atom()

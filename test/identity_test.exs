@@ -38,7 +38,15 @@ defmodule Tightbeam.IdentityTest do
 
     assert git!(dir, ["ls-tree", "-r", "--name-only", "main"])
            |> String.split("\n", trim: true) ==
-             ["archetypes/default.toml", "guidance/operating-model.md"]
+             [
+               "archetypes/default.toml",
+               "archetypes/exec.toml",
+               "guidance/delegation-card.md",
+               "guidance/directive-vocabulary.md",
+               "guidance/exec.md",
+               "guidance/office-convention.md",
+               "guidance/operating-model.md"
+             ]
 
     snapshot = Identity.snapshot!(ctx.base, "default", :codex)
     assert snapshot.skills == %{}

@@ -155,11 +155,28 @@ Work is tracked as durable records, not in chat.
 
     tightbeam assign --subject "fix the resume crash" --role implementer --work-item <workItemId>
 
+Open the card against a role, never a bare session key. The card records the role it
+was opened against; opened against a session key alone it records none, and
+`assignments --role` — and every role-history question after it — cannot see it. A
+role-invisible obligation is work the org cannot account for. The substrate does not
+yet enforce this, so the discipline is yours: `--role`, every time you open one.
+
 - Record what happens against your assignment with attest:
 
     tightbeam attest <assignmentId> --kind progress   --note "root-caused to a nil token"
     tightbeam attest <assignmentId> --kind completion --note "fixed; tests green"
-    tightbeam attest <assignmentId> --kind surrender  --note "blocked on device access"
+    tightbeam attest <assignmentId> --kind surrender  --note "giving the card back unfinished; what remains is written on the work item"
+
+"Blocked" is a state you report and carry; "surrendered" is a state you end in. Never
+use one to say the other. Blocked: file the exact blocker as a progress attest — the
+failed operation, the evidence, who can clear it — wake whoever can clear it with
+`--class blocker`, and keep the card, with a continuation wake naming when you check
+back; the block is yours to carry until it is cleared or escalated. Surrendered: a
+truthful terminal receipt that gives unfinished work back — the card closes, what you
+owed on it ends, and what remains is the opener's to re-dispatch. And there is no
+handoff: custody never transfers between holders. To move work, its holder surrenders
+it and its opener dispatches a fresh card to the next holder — two rows, each naming
+its own accountable session, never one card changing hands.
 
 - Record a judgment — a review, a test outcome, the user's decision — as a verdict:
 
