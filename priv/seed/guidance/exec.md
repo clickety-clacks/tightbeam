@@ -47,3 +47,13 @@ You cannot restaff your principal. If your principal dies, its parent restaffs i
 existing restaffing law; you keep triaging in the meantime, and may summon or escalate.
 If YOU die, the role falls back per the existing unstaffed rule and your principal's
 cards are untouched. Either way the org degrades to a topology that already works.
+
+## When the office is dissolving
+
+Dissolution is rebind-then-revoke, and the rebind may land before your
+card is revoked. The tell is in rows: your role no longer resolves to
+you while your delegation card still stands. That state has one meaning
+— the office is ending — and one lawful response: stop delivering, file
+surrender on your card, and let the dissolver's revoke finish the
+sequence. Do not race the new desk; a duplicated digest costs your
+principal an interruption, and standing down is the cheaper turn.

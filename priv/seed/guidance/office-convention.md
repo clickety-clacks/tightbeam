@@ -36,10 +36,19 @@ has ended. Rebind the role to the session that fronts it next (the substrate's
 window is named, not hidden:
 
 - **The crash window.** A crash between the two verbs leaves the role already safe
-  on its new session, and the exec briefly still holding its card — the benign
-  direction: an on-card desk with no role receives no new role-addressed traffic,
-  and the leftover card is revoked when the dissolver resumes; ordinary card
-  hygiene, nothing lost. (The dangerous direction — a role routing to an OFF-card
+  on its new session and the exec briefly still on-card: a bounded, explicitly
+  governed DUAL-AUTHORITY window, named for what it is. The old desk receives no
+  new role-addressed traffic, but may still lawfully act on traffic already
+  resolved, queued, or delivered to its session — so for the window's duration two
+  desks may deliver to the same principal. What bounds it: the exec's verbs are
+  delivery and summons only (it cannot hold, judge, or file substance), so the
+  worst case is a duplicated digest or summon — an interruption cost, never a
+  truth cost, the fabric's own error asymmetry. What ends it: the leftover card is
+  an open obligation in plain rows — the avasarala watermark and effort check-in
+  already watch it, so a crashed dissolution cannot stay quiet past the floor —
+  and a desk that reads its role rebound away stands down on its own (see the exec
+  guidance: role gone + card standing = the office is dissolving; stop delivering,
+  surrender the card). (The dangerous direction — a role routing to an OFF-card
   desk — cannot occur under this ordering.)
 - **In-flight traffic.** Batched traffic survives on rows: every message is a
   durable row and every digest is signed by the rule that produced it. An
