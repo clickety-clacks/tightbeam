@@ -1513,7 +1513,11 @@ defmodule Tightbeam.AssignmentsTest do
       |> then(&handle(ctx, "attest", &1))
 
     _ =
-      handle(ctx, "attest", attest_call({:session, "other-session"}, independent.id, "completion"))
+      handle(
+        ctx,
+        "attest",
+        attest_call({:session, "other-session"}, independent.id, "completion")
+      )
 
     self_held =
       assign_call({:session, "holder"}, "self-held verdictless review")
