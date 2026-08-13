@@ -1478,6 +1478,45 @@ defmodule Tightbeam.SupervisionTest do
     assert Supervision.prod_state(ctx.db, "asg_1") == nil
   end
 
+  test "an unrelated held classed fyi wake does not suppress the turn-end remedy", ctx do
+    # Sol xhigh review, finding 8: `schedule_in_txn/2` leaves a class-held
+    # member in ordinary `pending` state while moving `dueAt` out to the
+    # ceiling. Undelivered mail sitting in the batcher's queue for up to four
+    # hours is not a queued continuation supervision can rely on — counting
+    # it here let delivery policy silently change WHETHER the fallback fires,
+    # not merely when the fyi consumes attention.
+    prepare_review_gate(ctx)
+
+    held =
+      Wakes.schedule(ctx.db, %{
+        session_key: "holder",
+        target_role: nil,
+        origin: "user:flynn",
+        prompt: "unrelated fyi, held by the batcher",
+        due_at: System.system_time(:millisecond) + 60_000,
+        creator_session_key: "holder",
+        class: "fyi"
+      })
+
+    assert held.delivery_rule == Wakes.digest_rule()
+    refute held.digest, "still a member, not yet a materialized carrier"
+
+    assert Wakes.self_pending_count(ctx.db, "holder") == 0,
+           "a held classed member must not read as an already-pending continuation"
+
+    seq = terminal!(ctx.db, "holder")
+
+    assert {:acted, :rail_remedy} =
+             Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
+
+    assert %{status: "live"} =
+             RailRemedy.episode(ctx.db, "completion-needs-review", "asg_1")
+
+    # The held fyi is untouched by any of this — supervision's own decision
+    # neither judged it nor held it; delivery timing stayed the batcher's.
+    assert Wakes.get(ctx.db, held.wake_id).state == "pending"
+  end
+
   test "turn-end denial without a remedy records re-obligate and uses the normal prod", ctx do
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
     load_turn_end_deny(ctx)

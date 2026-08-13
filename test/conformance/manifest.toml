@@ -69,3 +69,17 @@ kind = "capstone"
 phase = "pending"
 blocking_phase = "P7"
 runners = ["rules_decide", "acting_layer"]
+
+# Coordination fabric (coordination-fabric-v1 §13 Phase 1). GREEN on this line:
+# the mechanism ships here, so its fixtures execute rather than being annotated
+# as pending. The live feature-smoke on both harnesses is deferred by recorded
+# ruling (program §8d — the 0.1.x gateway is deliberately paused); these are the
+# substrate proofs that stand in the meantime.
+[[class]]
+id = "C8"
+dir = "c8_coordination_fabric"
+title = "Coordination fabric — classes and delivery policy"
+kind = "delivery-policy"
+phase = "green"
+blocking_phase = ""
+runners = ["delivery_policy"]

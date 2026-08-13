@@ -51,7 +51,12 @@ defmodule Tightbeam.Wakes do
           target_gate: integer(),
           reresolve: String.t() | nil,
           reresolve_seed: String.t() | nil,
-          reresolve_rung: integer() | nil
+          reresolve_rung: integer() | nil,
+          class: String.t() | nil,
+          class_election: String.t() | nil,
+          delivery_rule: String.t() | nil,
+          digest: boolean(),
+          summon: boolean()
         }
 
   @typedoc "Delivery fun injected by the composition root: fires the prompt into the turn pipeline."
@@ -85,9 +90,42 @@ defmodule Tightbeam.Wakes do
     assignmentId TEXT,
     canceledAt INTEGER,
     targetGate INTEGER NOT NULL DEFAULT 1,
-    CHECK (consumer != 'prompt' OR prompt IS NOT NULL)
+    -- COORDINATION CLASS (fabric §7). Deliberately UNCONSTRAINED: the five seed
+    -- names are ANATOMY, and a kungfu may extend the vocabulary freely, so a
+    -- CHECK here would make an org's own extension a substrate refusal — a cage.
+    -- What the substrate owes is the truth of what the sender said; an extension
+    -- the receiver has no mapping for is delivered as `fyi` with a named skew
+    -- row (§5 policy-skew rule), never dropped and never promoted.
+    class TEXT,
+    -- WHO elected the class. The classifier stamps ONLY unclassified traffic
+    -- (§5); this column is the proof it never overwrote a sender. A digest
+    -- CARRIER is attributed 'batcher' — it was built by the batcher, not
+    -- elected by any sender or the classifier, and claiming 'sender' here
+    -- would be an untrue audit fact (Sol xhigh review, finding 7). Members
+    -- keep their own true election; only the carrier row uses this value.
+    -- `'batcher'` is a SHAPE change (schema.ex's `@shape` bumped to
+    -- `coordination-fabric-classes-v2`, Sol xhigh review round 2, finding 2):
+    -- `CREATE TABLE IF NOT EXISTS` cannot widen this CHECK on a table that
+    -- already exists, so a database from the OLD shape is refused by name
+    -- rather than dying on a raw CHECK violation at the first carrier insert.
+    classElection TEXT CHECK (classElection IN ('sender','classifier','batcher')),
+    -- SIGNED PROVENANCE (§8 legibility): the named rule + revision that decided
+    -- THIS wake's delivery, so any agent knows which reflex to inhibit.
+    deliveryRule TEXT,
+    -- 1 = this wake IS a digest carrier; 0 = an ordinary wake (possibly a
+    -- digest MEMBER, which the wake_cancellations replacement row records).
+    digest INTEGER NOT NULL DEFAULT 0 CHECK (digest IN (0,1)),
+    -- The desk's deliberate spend of its principal's turn (fabric §Terms).
+    -- Sender-elected, NEVER substrate-inferred; the acceptance-№1 query (§11.1)
+    -- subtracts these, and both its windows must run the SAME query, so the
+    -- carrier ships in Phase 1 even though Phase 3 stands up the first desk.
+    summon INTEGER NOT NULL DEFAULT 0 CHECK (summon IN (0,1)),
+    CHECK (consumer != 'prompt' OR prompt IS NOT NULL),
+    CHECK ((class IS NULL) = (classElection IS NULL)),
+    CHECK (digest = 0 OR class IS NOT NULL)
   );
   CREATE INDEX IF NOT EXISTS wakes_due ON wakes (state, dueAt);
+  CREATE INDEX IF NOT EXISTS wakes_delivery ON wakes (state, deliveryRule, sessionKey, class);
   CREATE TABLE IF NOT EXISTS scheduler_state (
     id INTEGER PRIMARY KEY CHECK (id = 0),
     afterFact INTEGER NOT NULL DEFAULT 0
@@ -98,6 +136,121 @@ defmodule Tightbeam.Wakes do
 
   @spec ensure_schema(db()) :: :ok | {:error, term()}
   def ensure_schema(db \\ Tightbeam.DB), do: DB.execute(db, @ddl)
+
+  ## Delivery policy (coordination-fabric-v1 §5 `classifier` + `batcher`, §7 table)
+  #
+  # THE MAXIM: a wake's class decides WHEN a mind's turn is spent, never WHETHER
+  # the message is recorded (Law 2). Every row below lands durably at its own
+  # `schedule_in_txn`; batching only moves the moment the turn materializes, and
+  # every batched delivery exits on TIME or a TURN BOUNDARY — never on anyone's
+  # decision (Invariant 3).
+  #
+  # LAYER. The mechanism — stamp a class, look up an immediacy, enforce a
+  # ceiling, sign the result — is PHYSICS. The names and the numbers are
+  # ANATOMY: seed defaults, verbatim from §7's table, reshapeable by an org
+  # through the identity tree. Phase 6 lifts them into policy rows; until a row
+  # exists these hardcoded defaults are the fallback (§5). Nothing here judges
+  # the CONTENT of a message — the sender elects, the substrate obeys.
+  #
+  # §7's immediacy column reads "desk exists / no desk". No desk exists on this
+  # line (Phase 3 stands up the first one), so the NO-DESK column governs every
+  # row below, and each is annotated with the phrase it implements.
+
+  @doc "The class the classifier stamps on unclassified traffic (fabric §5 seed default)."
+  @spec classifier_default() :: String.t()
+  def classifier_default, do: "fyi"
+
+  @doc "The five seed-shipped base classes (fabric §7). A kungfu may extend past these."
+  @spec seed_classes() :: [String.t()]
+  def seed_classes, do: ~w(fyi status-query input-needed blocker algedonic)
+
+  # Rule revision. Bump when a rule's BEHAVIOUR changes, so a digest signed by
+  # the old revision stays honest about which reflex produced it.
+  @rules_rev "r1"
+
+  @digest_rule "turn-boundary-digest #{@rules_rev}"
+  @immediate_rule "immediate-delivery #{@rules_rev}"
+  @bypass_rule "algedonic-bypass #{@rules_rev}"
+  @inhibited_rule "batcher-inhibited #{@rules_rev}"
+
+  @minute 60_000
+  @hour 3_600_000
+
+  @class_policy %{
+    # "digest at next turn boundary / same" — ceiling 4 h.
+    "fyi" => %{immediacy: :digest, ceiling_ms: 4 * @hour},
+    # "rows answer (Phase 5), else parent" — no responder exists yet, so the
+    # target still receives it; the 30-minute ceiling is what §7 pins.
+    "status-query" => %{immediacy: :digest, ceiling_ms: 30 * @minute},
+    # "principal at next turn boundary" — ceiling is the avasarala floor.
+    "input-needed" => %{immediacy: :digest, ceiling_ms: 30 * @minute},
+    # "principal immediately".
+    "blocker" => %{immediacy: :immediate, ceiling_ms: 0},
+    # "bypasses every bone and every desk. Never batched, never digested."
+    #
+    # PARTIAL AGAINST §7, and named rather than papered over: the seed default
+    # routes an alarm to the principal AND the org's configured human channel.
+    # The bypass half ships here. The dual-routing half does NOT — there is no
+    # human-channel carrier on this line to route to, and inventing one inside
+    # the batching seam would be a routing decision smuggled in under a timing
+    # mechanism. An alarm reaches its target and skips every bone; it does not
+    # yet reach a human by a second path.
+    "algedonic" => %{immediacy: :bypass, ceiling_ms: 0}
+  }
+
+  @doc """
+  Stamp a class on inbound traffic (fabric §5 `classifier`).
+
+  Returns `{class, election}`. A sender's election is returned VERBATIM and is
+  NEVER overwritten — including an extended class this build has never heard of,
+  which the policy below maps down to `fyi` while the row keeps what was said.
+  """
+  @spec classify(String.t() | nil) :: {String.t(), String.t()}
+  def classify(elected) when is_binary(elected) and elected != "", do: {elected, "sender"}
+  def classify(_unclassified), do: {classifier_default(), "classifier"}
+
+  @doc """
+  The delivery policy for a class (fabric §7 seed table).
+
+  An unknown class takes `fyi`'s policy and reports `skew: true` — the §5
+  policy-skew rule: never dropped (Law 2), never promoted to immediate, and the
+  caller files a named skew row so the vocabulary gap is visible and repairable.
+  """
+  @spec delivery_policy(String.t()) :: %{
+          immediacy: :digest | :immediate | :bypass,
+          ceiling_ms: non_neg_integer(),
+          rule: String.t(),
+          skew: boolean()
+        }
+  def delivery_policy(class) when is_binary(class) do
+    case Map.fetch(@class_policy, class) do
+      {:ok, policy} -> Map.merge(policy, %{rule: rule_for(policy.immediacy), skew: false})
+      :error -> known_policy_for_skew()
+    end
+  end
+
+  defp known_policy_for_skew do
+    policy = Map.fetch!(@class_policy, classifier_default())
+    Map.merge(policy, %{rule: rule_for(policy.immediacy), skew: true})
+  end
+
+  defp rule_for(:digest), do: @digest_rule
+  defp rule_for(:immediate), do: @immediate_rule
+  defp rule_for(:bypass), do: @bypass_rule
+
+  @doc "The signature line a digest carries (fabric §8: every bone signs its work)."
+  @spec digest_signature(non_neg_integer()) :: String.t()
+  def digest_signature(count) do
+    "coalesced by #{@digest_rule} (#{count} #{if count == 1, do: "notice", else: "notices"})"
+  end
+
+  @doc false
+  @spec digest_rule() :: String.t()
+  def digest_rule, do: @digest_rule
+
+  @doc false
+  @spec inhibited_rule() :: String.t()
+  def inhibited_rule, do: @inhibited_rule
 
   ## Store (pure DB ops — callable without the scheduler process, e.g. by inspect)
 
@@ -113,7 +266,18 @@ defmodule Tightbeam.Wakes do
     transaction!(db, &schedule_in_txn(&1, input))
   end
 
-  @doc "Persist a pending wake inside an existing DB transaction."
+  @doc """
+  Persist a pending wake inside an existing DB transaction.
+
+  CLASSED TRAFFIC. When the input carries `:class` (or `:classify` to request the
+  classifier's stamp on unclassified traffic), the delivery policy above decides
+  the wake's `dueAt` and signs the row with the rule that decided it. The
+  BATCHER's inhibition seam is named and small: a caller that elected its own
+  delivery time (`:sender_scheduled`), a condition wake, a digest carrier, or a
+  non-prompt consumer is stamped `batcher-inhibited` and keeps the `due_at` it
+  was given. The class is still recorded either way — timing is shaped, truth
+  is not.
+  """
   @spec schedule_in_txn(Txn.t(), map()) :: wake()
   def schedule_in_txn(%Txn{} = txn, input) do
     condition_kind = Map.get(input, :condition_kind)
@@ -124,6 +288,12 @@ defmodule Tightbeam.Wakes do
         cursor
       end
 
+    created_at = now()
+    {class, class_election} = elected_class(input)
+
+    {delivery_rule, due_at} =
+      apply_delivery_policy(txn, input, class, created_at, condition_kind)
+
     wake = %{
       wake_id: Map.get(input, :wake_id, "w_" <> Tightbeam.Id.uuid4()),
       session_key: Map.fetch!(input, :session_key),
@@ -131,9 +301,9 @@ defmodule Tightbeam.Wakes do
       origin: Map.fetch!(input, :origin),
       prompt: Map.get(input, :prompt),
       consumer: Map.get(input, :consumer, "prompt"),
-      due_at: Map.fetch!(input, :due_at),
+      due_at: due_at,
       state: "pending",
-      created_at: now(),
+      created_at: created_at,
       fired_at: nil,
       condition_kind: condition_kind,
       condition_scope: Map.get(input, :condition_scope),
@@ -150,7 +320,12 @@ defmodule Tightbeam.Wakes do
       target_gate: Map.get(input, :target_gate, 1),
       reresolve: Map.get(input, :reresolve),
       reresolve_seed: Map.get(input, :reresolve_seed),
-      reresolve_rung: Map.get(input, :reresolve_rung)
+      reresolve_rung: Map.get(input, :reresolve_rung),
+      class: class,
+      class_election: class_election,
+      delivery_rule: delivery_rule,
+      digest: Map.get(input, :digest, false),
+      summon: Map.get(input, :summon, false)
     }
 
     Txn.q(
@@ -160,9 +335,9 @@ defmodule Tightbeam.Wakes do
           (wakeId, sessionKey, targetRole, origin, prompt, consumer, dueAt, state, createdAt, firedAt,
            reresolve, reresolveSeed, reresolveRung, conditionKind, conditionScope,
            conditionAfterId, firedBy, creatorSessionKey, rumination, work_item_id, assignmentId,
-           targetGate)
+           targetGate, class, classElection, deliveryRule, digest, summon)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, NULL, ?9, ?10, ?11,
-                ?12, ?13, ?14, NULL, ?15, ?16, ?17, ?18, ?19)
+                ?12, ?13, ?14, NULL, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
       """,
       [
         wake.wake_id,
@@ -183,7 +358,12 @@ defmodule Tightbeam.Wakes do
         if(wake.rumination, do: 1, else: 0),
         wake.work_item_id,
         wake.assignment_id,
-        wake.target_gate
+        wake.target_gate,
+        wake.class,
+        wake.class_election,
+        wake.delivery_rule,
+        if(wake.digest, do: 1, else: 0),
+        if(wake.summon, do: 1, else: 0)
       ]
     )
 
@@ -196,8 +376,102 @@ defmodule Tightbeam.Wakes do
       )
     end
 
+    file_policy_skew(txn, wake)
+
     wake
   end
+
+  # The class this wake carries, and who put it there. A caller that names
+  # `:class` elects; a caller that asks to be `:classify`-ed accepts the
+  # classifier's stamp; a caller that does neither gets no class at all, which
+  # is how every wake predating the fabric keeps behaving exactly as it did.
+  #
+  # A DIGEST CARRIER is neither of those: the batcher built the row, so
+  # `classify/1`'s "sender" stamp would be a false audit fact (Sol xhigh
+  # review, finding 7) — checked first because `:digest` always carries
+  # `:class` too and would otherwise be read as a sender election.
+  defp elected_class(input) do
+    cond do
+      Map.get(input, :digest, false) and is_binary(Map.get(input, :class)) ->
+        {Map.fetch!(input, :class), "batcher"}
+
+      is_binary(Map.get(input, :class)) and Map.get(input, :class) != "" ->
+        classify(Map.fetch!(input, :class))
+
+      Map.get(input, :classify, false) ->
+        classify(nil)
+
+      true ->
+        {nil, nil}
+    end
+  end
+
+  # An unclassed wake is not fabric traffic and the policy does not touch it.
+  defp apply_delivery_policy(_txn, input, nil, _created_at, _condition_kind),
+    do: {nil, Map.fetch!(input, :due_at)}
+
+  defp apply_delivery_policy(_txn, input, class, created_at, condition_kind) do
+    policy = delivery_policy(class)
+
+    cond do
+      # The carrier the batcher itself just built. Signed with the rule that
+      # produced it, delivered at the moment that rule chose, and never a
+      # member of anything: `digest = 1` is what keeps it out of its own group.
+      Map.get(input, :digest, false) ->
+        {@digest_rule, Map.fetch!(input, :due_at)}
+
+      # THE CLASS CHECK PRECEDES THE INHIBITION BRANCH (Sol xhigh review,
+      # finding 1). `immediate` and `bypass` classes were never the batcher's
+      # to hold in the first place — §7: algedonic "bypasses every bone...
+      # never batched, never digested, never triaged" — so there is nothing
+      # for `batcher-inhibited` to name here. A sender's own --after/--at on
+      # one of these classes is not the batcher inhibiting anything; it is
+      # the sender's own election, unchanged, and the row must say so: the
+      # rule stays `algedonic-bypass`/`immediate-delivery`, never
+      # `batcher-inhibited`. `due_at` is exactly what the caller supplied
+      # either way — scheduled or not, an alarm is never delayed BY POLICY.
+      policy.immediacy != :digest ->
+        {policy.rule, Map.fetch!(input, :due_at)}
+
+      batcher_inhibited?(input, condition_kind) ->
+        {@inhibited_rule, Map.fetch!(input, :due_at)}
+
+      # THE CEILING IS THE EXIT (Invariant 3). The wake is due at its class
+      # ceiling from the moment it is filed; the batcher may materialize the
+      # digest EARLIER at a turn boundary, but nothing can make it later, and
+      # an idle session's digest materializes its own turn right here.
+      true ->
+        {@digest_rule, created_at + policy.ceiling_ms}
+    end
+  end
+
+  # THE INHIBITION SEAM, named (philosophy gate Q2). The batcher is a default,
+  # not a cage: a sender that elected its own delivery moment keeps it, a
+  # condition wake keeps its own firing mechanics, and an internal consumer is
+  # not an agent's attention to protect. In every case the class is still
+  # RECORDED — inhibiting the reflex never erases what the sender said.
+  defp batcher_inhibited?(input, condition_kind) do
+    Map.get(input, :sender_scheduled, false) or is_binary(condition_kind) or
+      Map.get(input, :consumer, "prompt") != "prompt"
+  end
+
+  # FAIL QUIET AND VISIBLE (§5 policy-skew rule). An extended class this build
+  # has no mapping for is delivered as `fyi` — never dropped, never promoted —
+  # and the gap is a durable row somebody can act on, not a silent downgrade.
+  defp file_policy_skew(txn, %{class: class, wake_id: wake_id}) when is_binary(class) do
+    if delivery_policy(class).skew do
+      EventLog.lifecycle_in_txn(
+        txn,
+        "wake_class_policy_skew",
+        wake_id,
+        "class=#{class} deliveredAs=#{classifier_default()} rule=#{@digest_rule}"
+      )
+    end
+
+    :ok
+  end
+
+  defp file_policy_skew(_txn, _wake), do: :ok
 
   @doc false
   @spec retarget_in_txn(Txn.t(), String.t(), String.t()) :: wake() | :error
@@ -300,7 +574,11 @@ defmodule Tightbeam.Wakes do
     "tightbeam:assignments" => ~w(obligation_disposed),
     "tightbeam:effort-checkin" => ~w(superseded obligation_disposed),
     "tightbeam:supervision" => ~w(superseded),
-    "tightbeam:retirement" => ~w(target_retired obligation_disposed)
+    "tightbeam:retirement" => ~w(target_retired obligation_disposed),
+    # The batcher consumes a digest MEMBER exactly one way: superseded by the
+    # digest that carries it, named as the replacement. It has no other verb —
+    # it cannot withdraw, dispose, or retire anyone's mail.
+    "tightbeam:batcher" => ~w(superseded)
   }
 
   @reason_matrix %{
@@ -1001,7 +1279,18 @@ defmodule Tightbeam.Wakes do
     count
   end
 
-  @doc "Count pending wakes targeting a session that were durably created by that same session."
+  @doc """
+  Count pending wakes targeting a session that were durably created by that
+  same session.
+
+  HELD CLASSED MEMBERS DO NOT COUNT (Sol xhigh review, finding 8). A row still
+  waiting on the batcher (`digest = 0` under `deliveryRule = digest_rule`) is
+  not a queued continuation supervision can rely on — it may not actually
+  reach the session for up to a class ceiling's worth of time. Counting it
+  here let an unrelated `fyi` self-wake suppress the turn-end remedy for as
+  long as four hours. The materialized CARRIER (`digest = 1`) is not held —
+  it is what the batcher already decided to deliver — and counts normally.
+  """
   @spec self_pending_count(db(), String.t()) :: non_neg_integer()
   def self_pending_count(db \\ Tightbeam.DB, session_key) do
     {:ok, [[count]]} =
@@ -1011,11 +1300,372 @@ defmodule Tightbeam.Wakes do
         SELECT count(*) FROM wakes
         WHERE state = 'pending' AND consumer = 'prompt'
           AND sessionKey = ?1 AND creatorSessionKey = ?1
+          -- `IS`, not `=`: an unclassed wake's deliveryRule is NULL, and
+          -- `NULL = ?2` is NULL (neither true nor false) under SQL's
+          -- three-valued logic, which would silently exclude it too. `IS`
+          -- compares NULL correctly and only the true digest-held case matches.
+          AND NOT (digest = 0 AND deliveryRule IS ?2)
         """,
-        [session_key]
+        [session_key, @digest_rule]
       )
 
     count
+  end
+
+  ## The batcher (fabric §5 `batcher`; Invariant 3)
+
+  @doc """
+  Materialize every digest whose delivery moment has arrived.
+
+  ONE TURN FOR N PAYLOADS. Members are grouped by target session AND class —
+  per-class, because the ceiling is per-class and mixing a four-hour `fyi` with
+  a thirty-minute `input-needed` would either delay one or promote the other.
+
+  THE EXIT IS TIME OR A TURN BOUNDARY, never a decision (Invariant 3):
+
+    * the target's next turn boundary — a turn of its own ended at or after
+      THIS member was filed; a turn boundary is a turn ENDING, so queued or
+      running work behind it is not a reason to hold (the wake joins the
+      queue — that IS what "materializing one turn" means); or
+    * the class ceiling — which is the member's own `dueAt`, so an idle session
+      that never takes another turn still has its digest materialize one.
+
+  ELIGIBILITY AND MEMBERSHIP ARE ONE TRANSACTIONALLY COHERENT SNAPSHOT (Sol
+  xhigh review, finding 2). There is no outer "is this group due" query whose
+  answer the transaction later trusts: each member's OWN ceiling and OWN
+  filing time are re-read and re-judged from the SAME snapshot the transaction
+  uses to select members, so a wake filed after another member's boundary or
+  ceiling already passed waits for its own — never absorbed by somebody
+  else's trigger. `due_reason` is computed exactly once, from that snapshot,
+  per member (finding 4): a member with no named reason is left pending, never
+  materialized under an empty `trigger=`.
+
+  SOURCE ROWS ARE PRESERVED (Law 2, wi_1100e078's title). A member is consumed
+  through the typed cancellation seam as `superseded` with the digest named as
+  its REPLACEMENT — the same shape re-resolution already uses. Its prompt, its
+  sender, its class and its election all stay on the row; the digest-member
+  audit is one join over `wake_cancellations`. Nothing is deleted and nothing
+  is summarized away.
+  """
+  @spec materialize_digests(db()) :: [String.t()]
+  def materialize_digests(db \\ Tightbeam.DB), do: materialize_digests(db, now())
+
+  @doc false
+  @spec materialize_digests(db(), integer()) :: [String.t()]
+  def materialize_digests(db, at) do
+    # A candidate LIST only — which (session, class) groups currently hold any
+    # digest-ruled pending wake at all. Nothing about WHETHER a group is due is
+    # decided here; that judgment happens exactly once, per member, inside the
+    # transaction below, against this same `at`.
+    {:ok, groups} =
+      DB.query(
+        db,
+        """
+        SELECT DISTINCT sessionKey, class
+        FROM wakes
+        WHERE state = 'pending' AND consumer = 'prompt' AND digest = 0
+          AND deliveryRule = ?1
+        """,
+        [@digest_rule]
+      )
+
+    Enum.flat_map(groups, fn [session_key, class] ->
+      case materialize_digest(db, session_key, class, at) do
+        nil -> []
+        wake_id -> [wake_id]
+      end
+    end)
+  end
+
+  defp materialize_digest(db, session_key, class, at) do
+    transaction!(db, fn txn ->
+      members =
+        Txn.q(
+          txn,
+          """
+          SELECT wakeId, prompt, origin, creatorSessionKey, createdAt, dueAt
+          FROM wakes
+          WHERE state = 'pending' AND consumer = 'prompt' AND digest = 0
+            AND deliveryRule = ?1 AND sessionKey = ?2 AND class = ?3
+          -- Filing order. `createdAt` ties inside a millisecond, and the tie
+          -- must not be broken by an id, which is random: rowid IS the order
+          -- the org filed them in, and a digest that reordered its members
+          -- would misreport the sequence a reader is trying to reconstruct.
+          ORDER BY createdAt ASC, rowid ASC
+          """,
+          [@digest_rule, session_key, class]
+        )
+
+      materialize_due(txn, session_key, class, at, members)
+    end)
+  end
+
+  # Nothing pending for this group in THIS snapshot — a race with another
+  # materialization, not an error: nothing to carry, nothing to sign.
+  defp materialize_due(_txn, _session_key, _class, _at, []), do: nil
+
+  defp materialize_due(txn, session_key, class, at, members) do
+    boundary = latest_turn_end(txn, session_key)
+
+    due =
+      members
+      |> Enum.map(fn [wake_id, prompt, origin, creator, created_at, due_at] ->
+        {[wake_id, prompt, origin, creator, created_at],
+         member_due_reason(at, due_at, boundary, created_at)}
+      end)
+      |> Enum.filter(fn {_row, reason} -> reason != nil end)
+
+    case due do
+      # Candidate group, but not ONE of its current members has reached its
+      # own ceiling or seen a boundary since it was filed. Nothing is due —
+      # refuse silently rather than materialize under a reason nobody can
+      # name (finding 4): every member simply waits for its own trigger.
+      [] ->
+        nil
+
+      _ ->
+        # Ceiling wins the tie: a digest whose members are due by both
+        # guarantees reports the one that bounds it.
+        reason =
+          if Enum.any?(due, fn {_row, r} -> r == "ceiling" end),
+            do: "ceiling",
+            else: "turn-boundary"
+
+        rows = Enum.map(due, fn {row, _reason} -> row end)
+        materialize_members(txn, session_key, class, reason, at, rows)
+    end
+  end
+
+  # A member's OWN eligibility (Sol xhigh review, finding 2): its own class
+  # ceiling, or a turn of the target's own that ended STRICTLY AFTER THIS
+  # member's own filing time — never another member's ceiling or another
+  # member's boundary.
+  #
+  # STRICT `>`, not `>=` (Sol xhigh review round 2, finding 1): timestamps
+  # here are millisecond-resolution wall-clock reads. A wake filed in the
+  # SAME millisecond a turn ended is not provably filed BEFORE that turn's
+  # end — the ordering is ambiguous, and ambiguous is not "the boundary
+  # happened after this member was filed." An equal timestamp waits for the
+  # member's own NEXT boundary or its ceiling, same as a wake filed a moment
+  # later would.
+  defp member_due_reason(at, due_at, boundary, created_at) do
+    cond do
+      at >= due_at -> "ceiling"
+      is_integer(boundary) and boundary > created_at -> "turn-boundary"
+      true -> nil
+    end
+  end
+
+  # THE LATEST turn end for this session, or nil if none has ever ended. A
+  # turn boundary is the moment an in-flight turn ENDS (finding 3) — nothing
+  # here judges whether the session is otherwise busy; queued or running work
+  # behind the boundary is not a reason to hold what already crossed it.
+  defp latest_turn_end(txn, session_key) do
+    case Txn.q(
+           txn,
+           "SELECT MAX(endedAt) FROM turns WHERE sessionKey = ?1 AND endedAt IS NOT NULL",
+           [session_key]
+         ) do
+      [[nil]] -> nil
+      [[ended]] -> ended
+    end
+  end
+
+  defp materialize_members(txn, session_key, class, reason, at, members) do
+    digest =
+      schedule_in_txn(txn, %{
+        session_key: session_key,
+        origin: "process:tightbeam",
+        prompt: digest_prompt(class, members),
+        due_at: at,
+        class: class,
+        digest: true,
+        # The members already resolved their target; the digest delivers to the
+        # session they resolved to, not to whoever is active now.
+        target_gate: 0
+      })
+
+    carried =
+      Enum.count(members, fn [wake_id | _rest] ->
+        cancel_in_txn(txn, %{
+          wake_id: wake_id,
+          requester: %{kind: "process", id: "tightbeam:batcher"},
+          reason_kind: "superseded",
+          causal_source: %{kind: "wake", id: digest.wake_id},
+          outcome: %{kind: "replacement", replacement_wake_id: digest.wake_id}
+        }) == true
+      end)
+
+    # ALL OR NOTHING. A member the batcher could not consume is a member whose
+    # own wake is still pending WHILE a digest carrying its payload is about to
+    # fire — the one failure worse than not batching at all, because the payload
+    # lands twice and the record says once. There is nothing to accommodate
+    # here: roll the whole materialization back and name what refused.
+    if carried != length(members) do
+      raise "incompatible_delivery_policy_v1: batcher consumed #{carried} of " <>
+              "#{length(members)} digest members for #{session_key}/#{class}"
+    end
+
+    EventLog.lifecycle_in_txn(
+      txn,
+      "wake_digest_materialized",
+      digest.wake_id,
+      "rule=#{@digest_rule} target=#{session_key} class=#{class} members=#{carried} " <>
+        "trigger=#{reason}"
+    )
+
+    digest.wake_id
+  end
+
+  # THE BRIEF. Every payload appears in full and in filing order; the digest
+  # summarizes nothing, because an optimization that loses rows is wrong. The
+  # signature names the rule and its revision so a reader knows which reflex to
+  # inhibit (§8 legibility).
+  defp digest_prompt(class, members) do
+    body =
+      members
+      |> Enum.with_index(1)
+      |> Enum.map(fn {[_wake_id, prompt, origin, creator, _created_at], index} ->
+        "#{index}. [#{class} from #{creator || origin}] #{prompt}"
+      end)
+      |> Enum.join("\n")
+
+    "[digest] #{digest_signature(length(members))}\n\n#{body}"
+  end
+
+  @doc """
+  Every source wake a digest carries, oldest first (fabric §11 acceptance 2).
+
+  The audit that proves zero information loss: a digest that named a member it
+  did not carry, or carried one it did not name, is visible here as a mismatch.
+
+  PROVENANCE-TOTAL (Sol xhigh review, finding 6). Matching only
+  `replacementWakeId`/`reasonKind`/`outcomeKind` proves a row was superseded
+  BY SOMETHING naming this carrier as its replacement — not that the BATCHER
+  carried it. The join also binds `requesterId` to the batcher and
+  `causalSourceKind`/`causalSourceId` to THIS digest wake, so a non-batcher
+  supersession that happens to point at the carrier (or a malformed
+  cancellation whose causal wake differs from its replacement) cannot be
+  reported as a member Law 2 never actually carried.
+  """
+  @spec digest_members(db(), String.t()) :: [map()]
+  def digest_members(db \\ Tightbeam.DB, digest_wake_id) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT w.wakeId, w.prompt, w.class, w.classElection, w.createdAt
+        FROM wake_cancellations c
+        JOIN wakes w ON w.wakeId = c.wakeId
+        WHERE c.replacementWakeId = ?1 AND c.reasonKind = 'superseded'
+          AND c.outcomeKind = 'replacement'
+          AND c.requesterId = 'tightbeam:batcher'
+          AND c.causalSourceKind = 'wake'
+          AND c.causalSourceId = ?1
+        ORDER BY w.createdAt ASC, w.rowid ASC
+        """,
+        [digest_wake_id]
+      )
+
+    Enum.map(rows, fn [wake_id, prompt, class, election, created_at] ->
+      %{
+        wake_id: wake_id,
+        prompt: prompt,
+        class: class,
+        class_election: election,
+        created_at: created_at
+      }
+    end)
+  end
+
+  ## The classed-row read (fabric §12 Q5; §11 acceptance 1)
+
+  @doc """
+  A session's coordination share over a window: turns materialized by
+  non-summon, non-algedonic wakes, against all its turns.
+
+  §11's acceptance 1 measures the pilot with THIS query on both sides of desk
+  stand-up, so it ships in Phase 1 — the before-window opens the moment classed
+  rows exist. Its two exclusions are the two ways spending a mind's turn is the
+  POINT rather than the waste: an `algedonic` alarm, which bypasses every bone
+  by design, and a `summon`, which is a desk deliberately buying its principal's
+  attention.
+
+  A window with no turns reports `share: nil`, not `0.0`. Zero would be a claim
+  about a session that did nothing, and the rows do not support it.
+
+  This is a READ. It counts rows and files none; it makes no judgment about
+  whether a share is good, and it names no threshold — the ruling on §11's
+  acceptance is a mind's (Phase 3 exit), never this function's.
+  """
+  @spec coordination_share(db(), String.t(), integer(), integer()) :: map()
+  def coordination_share(db \\ Tightbeam.DB, session_key, from, to) do
+    {:ok, [[turns, wake_turns, classed, coordination, summons, algedonic]]} =
+      DB.query(
+        db,
+        """
+        SELECT
+          COUNT(*),
+          COALESCE(SUM(CASE WHEN t.wakeId IS NOT NULL THEN 1 ELSE 0 END), 0),
+          COALESCE(SUM(CASE WHEN w.class IS NOT NULL THEN 1 ELSE 0 END), 0),
+          -- §11.1's numerator: ALL non-summon, non-algedonic wake-materialized
+          -- turns, CLASSED OR NOT (Sol xhigh review, finding 5). `w.class IS
+          -- NOT NULL` excluded legacy unclassed wake turns entirely, undercounting
+          -- the share this query exists to measure — a wake-materialized turn
+          -- counts here whether or not the fabric ever stamped it.
+          --
+          -- `w.wakeId IS NOT NULL` — not `t.wakeId IS NOT NULL` (Sol xhigh
+          -- review round 2, finding 3): the LEFT JOIN's `w.*` columns are also
+          -- NULL when `t.wakeId` names a wake that does not exist (a dangling
+          -- reference), and a naive `COALESCE(w.class, '') <> 'algedonic'`
+          -- treats a JOIN MISS exactly like a real unclassed wake — counting
+          -- a dangling reference as coordination traffic that was never
+          -- actually materialized by any wake. Requiring the joined row
+          -- excludes that case while still allowing a real wake's NULL class
+          -- through: `w.class IS NOT 'algedonic'` is NULL-safe (`IS`/`IS NOT`
+          -- never themselves evaluate to NULL), so it is true for a real
+          -- unclassed wake and false only for an actual `algedonic` class —
+          -- and once `w.wakeId IS NOT NULL` holds, `w.summon` is a real,
+          -- NOT NULL column, so a plain `= 0` is safe without COALESCE.
+          COALESCE(SUM(CASE WHEN w.wakeId IS NOT NULL
+                             AND w.summon = 0
+                             AND w.class IS NOT 'algedonic' THEN 1 ELSE 0 END), 0),
+          COALESCE(SUM(CASE WHEN w.summon = 1 THEN 1 ELSE 0 END), 0),
+          COALESCE(SUM(CASE WHEN w.class = 'algedonic' THEN 1 ELSE 0 END), 0)
+        FROM turns AS t
+        LEFT JOIN wakes AS w ON w.wakeId = t.wakeId
+        WHERE t.sessionKey = ?1 AND t.createdAt >= ?2 AND t.createdAt < ?3
+        """,
+        [session_key, from, to]
+      )
+
+    {:ok, by_class} =
+      DB.query(
+        db,
+        """
+        SELECT w.class, COUNT(*)
+        FROM turns AS t
+        JOIN wakes AS w ON w.wakeId = t.wakeId
+        WHERE t.sessionKey = ?1 AND t.createdAt >= ?2 AND t.createdAt < ?3
+          AND w.class IS NOT NULL
+        GROUP BY w.class
+        """,
+        [session_key, from, to]
+      )
+
+    %{
+      session_key: session_key,
+      from: from,
+      to: to,
+      turns: turns,
+      wake_turns: wake_turns,
+      classed_turns: classed,
+      coordination_turns: coordination,
+      summon_turns: summons,
+      algedonic_turns: algedonic,
+      share: if(turns > 0, do: coordination / turns),
+      by_class: Map.new(by_class, fn [class, count] -> {class, count} end)
+    }
   end
 
   @doc "Whether a delivered rumination wake exists for this work-item and caller session."
@@ -1167,6 +1817,11 @@ defmodule Tightbeam.Wakes do
   # leaves its wake pending for the next tick; a crash between deliver and
   # mark redelivers, deduped by turns.wakeId.
   defp deliver_due(%{db: db, deliver: deliver, internal_consumers: consumers} = state) do
+    # THE BATCHER RUNS FIRST, so a digest that just came due is delivered in
+    # this same pass rather than waiting a tick. Held members are consumed here
+    # and never reach the loop below as individual deliveries.
+    materialize_digests(db)
+
     {:ok, rows} =
       DB.query(
         db,
@@ -1629,7 +2284,7 @@ defmodule Tightbeam.Wakes do
   end
 
   defp select_wake_sql do
-    "SELECT wakeId, sessionKey, targetRole, origin, prompt, consumer, dueAt, state, createdAt, firedAt, reresolve, reresolveSeed, reresolveRung, conditionKind, conditionScope, conditionAfterId, firedBy, creatorSessionKey, rumination, work_item_id, assignmentId, canceledAt, targetGate FROM wakes"
+    "SELECT wakeId, sessionKey, targetRole, origin, prompt, consumer, dueAt, state, createdAt, firedAt, reresolve, reresolveSeed, reresolveRung, conditionKind, conditionScope, conditionAfterId, firedBy, creatorSessionKey, rumination, work_item_id, assignmentId, canceledAt, targetGate, class, classElection, deliveryRule, digest, summon FROM wakes"
   end
 
   defp to_wake([
@@ -1655,7 +2310,12 @@ defmodule Tightbeam.Wakes do
          work_item_id,
          assignment_id,
          canceled_at,
-         target_gate
+         target_gate,
+         class,
+         class_election,
+         delivery_rule,
+         digest,
+         summon
        ]) do
     %{
       wake_id: wake_id,
@@ -1680,7 +2340,12 @@ defmodule Tightbeam.Wakes do
       work_item_id: work_item_id,
       assignment_id: assignment_id,
       canceled_at: canceled_at,
-      target_gate: target_gate
+      target_gate: target_gate,
+      class: class,
+      class_election: class_election,
+      delivery_rule: delivery_rule,
+      digest: digest == 1,
+      summon: summon == 1
     }
   end
 

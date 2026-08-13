@@ -131,6 +131,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             condition_kind,
             condition_scope,
             idempotency_key,
+            class,
         } => {
             let target = match target {
                 Target::Session(value) => string_field("sessionKey", value),
@@ -148,6 +149,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 ("conditionKind", condition_kind),
                 ("conditionScope", condition_scope),
                 ("idempotencyKey", idempotency_key),
+                ("class", class),
             ] {
                 if let Some(value) = value {
                     params.push(string_field(name, value));
@@ -576,6 +578,24 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             "attests",
             vec![],
             vec![string_field("assignmentId", assignment_id)],
+        )),
+        Command::CoordinationShare {
+            identity,
+            session,
+            from,
+            to,
+        } => Ok(request(
+            identity,
+            "coordination-share",
+            vec![],
+            // The measured session travels as an ordinary param: the router
+            // declares this verb non-target so the read never doubles as a
+            // session-existence oracle.
+            vec![
+                string_field("session", session),
+                format!("\"from\":{from}"),
+                format!("\"to\":{to}"),
+            ],
         )),
         Command::Assignments {
             identity,
@@ -1323,6 +1343,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::Transcript { identity, .. }
         | Command::Toplines { identity, .. }
         | Command::Topline { identity, .. }
+        | Command::CoordinationShare { identity, .. }
         | Command::WorkItemIcebox { identity, .. }
         | Command::WorkItemReopen { identity, .. }
         | Command::WorkItemClose { identity, .. }
@@ -1536,6 +1557,78 @@ mod tests {
             ]),
             r#"{"asUser":"flynn","verb":"wake","userId":"mike","params":{"prompt":"go","at":16}}"#
         );
+    }
+
+    #[test]
+    fn builds_byte_exact_classed_wake_and_coordination_share_bodies() {
+        // The sender's election rides as an ordinary param, and an EXTENDED
+        // class travels unchanged: the CLI validates that a class is a name,
+        // never that it is one of the five (coordination-fabric-v1 §7).
+        assert_eq!(
+            body(&[
+                "wake",
+                "--role",
+                "owner",
+                "--prompt",
+                "the build finished",
+                "--class",
+                "fyi",
+                "--as",
+                "coder",
+            ]),
+            r#"{"as":"coder","verb":"wake","role":"owner","params":{"prompt":"the build finished","class":"fyi"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "wake",
+                "--role",
+                "owner",
+                "--prompt",
+                "pain",
+                "--class",
+                "kungfu:deploy-window",
+                "--as",
+                "coder",
+            ]),
+            r#"{"as":"coder","verb":"wake","role":"owner","params":{"prompt":"pain","class":"kungfu:deploy-window"}}"#
+        );
+        assert_eq!(
+            args::parse(
+                [
+                    "wake", "--role", "owner", "--prompt", "go", "--class", "", "--as", "coder"
+                ]
+                .iter()
+                .map(|v| (*v).to_owned())
+                .collect()
+            )
+            .unwrap_err(),
+            "--class requires a class name"
+        );
+        // The measured session is a param, never a typed target: the router
+        // declares this verb non-target so the read is not an existence oracle.
+        assert_eq!(
+            body(&[
+                "coordination-share",
+                "--session",
+                "agent:po",
+                "--from",
+                "100",
+                "--to",
+                "200",
+                "--as-user",
+                "flynn",
+            ]),
+            r#"{"asUser":"flynn","verb":"coordination-share","params":{"session":"agent:po","from":100,"to":200}}"#
+        );
+        for missing in [
+            &["coordination-share", "--from", "1", "--to", "2"][..],
+            &["coordination-share", "--session", "agent:po", "--to", "2"][..],
+            &["coordination-share", "--session", "agent:po", "--from", "1"][..],
+        ] {
+            let mut argv = missing.to_vec();
+            argv.extend_from_slice(&["--as-user", "flynn"]);
+            assert!(args::parse(argv.iter().map(|v| (*v).to_owned()).collect()).is_err());
+        }
     }
 
     #[test]

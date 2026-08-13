@@ -27,7 +27,8 @@ defmodule Tightbeam.TranscriptTest do
   alias Tightbeam.Wire.Router
 
   @entry_keys ~w(id at role sender content attachments reply_to_message_id
-                 turn_seq model context effort harness assignment_id job_ref)a
+                 turn_seq model context effort harness assignment_id job_ref
+                 class delivery_rule)a
 
   defmodule LaneDoorbell do
     @moduledoc false

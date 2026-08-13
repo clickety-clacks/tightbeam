@@ -336,7 +336,15 @@ defmodule Tightbeam.ExecutionMap do
       # session-keyed through durable assignment columns.
       active: %{
         running_turn: Enum.any?(union, &(&1.status == "running")),
-        pending_session_wake: pending_session_wake?(world, holders)
+        pending_session_wake: pending_session_wake?(world, holders),
+        # THE FABRIC'S CLASSED MAIL, visible where the org already looks
+        # (fabric §13 Phase 1 exit: classes visible in toplines rows). Counts of
+        # PENDING classed wakes for this item's current open holders, keyed by
+        # the class their senders elected — so a reader can see what is queued
+        # for a mind, and under which class, without reading its transcript.
+        # Empty map, never null: absence of classed mail is knowable from these
+        # rows, unlike the coverage-nulled counts above.
+        pending_wake_classes: pending_wake_classes(world, holders)
       },
       since_progress_ms: world.now - anchor(world, item, set, union)
     }
@@ -478,6 +486,18 @@ defmodule Tightbeam.ExecutionMap do
   # item-attributed wakes.
   defp pending_session_wake?(world, holders) do
     Enum.any?(holders, &MapSet.member?(world.pending_wake_sessions, &1))
+  end
+
+  # Summed across holders, because the row is about the ITEM's exposure, not any
+  # one session's. A digest carrier is counted as the one turn it will spend,
+  # and its members are already `canceled` — so the count never double-reports
+  # a payload that a digest already absorbed.
+  defp pending_wake_classes(world, holders) do
+    holders
+    |> Enum.flat_map(&Map.to_list(Map.get(world.pending_wake_classes, &1, %{})))
+    |> Enum.reduce(%{}, fn {class, count}, acc ->
+      Map.update(acc, class, count, &(&1 + count))
+    end)
   end
 
   ## The progress clock
@@ -628,6 +648,7 @@ defmodule Tightbeam.ExecutionMap do
       markers_by_assignment: markers_by_assignment(db),
       open_requests: open_requests(db),
       pending_wake_sessions: pending_wake_sessions(db),
+      pending_wake_classes: pending_wake_classes(db),
       dispositions: dispositions(db),
       session_owners: session_owners(db)
     }
@@ -848,6 +869,23 @@ defmodule Tightbeam.ExecutionMap do
       )
 
     MapSet.new(rows, &hd/1)
+  end
+
+  defp pending_wake_classes(db) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT sessionKey, class, COUNT(*)
+        FROM wakes
+        WHERE state = 'pending' AND consumer = 'prompt' AND class IS NOT NULL
+        GROUP BY sessionKey, class
+        """
+      )
+
+    Enum.reduce(rows, %{}, fn [session_key, class, count], acc ->
+      Map.update(acc, session_key, %{class => count}, &Map.put(&1, class, count))
+    end)
   end
 
   # Dispositions append a `disposition_transition` causal event with

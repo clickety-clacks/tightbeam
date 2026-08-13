@@ -50,6 +50,35 @@ Ask a colleague when that colleague can answer something you need to do your job
 idle status requests or nudges. Send your owner only new material results or evidence, exact
 blockers or refusals, and bounded decision requests.
 
+## Say how urgent a wake is: --class
+Attention is the scarcest thing this org has. Tell tightbeam how urgent a message is and it
+shapes WHEN the receiver spends a turn on it — never whether it is recorded:
+
+    tightbeam wake --role owner --prompt "the release build is green" --class fyi
+
+- `fyi` — record only. Batched into one digest turn at the receiver's next turn boundary, or
+  within 4 hours, whichever comes first.
+- `status-query` — answerable from rows. Same batching, within 30 minutes.
+- `input-needed` — a decision is genuinely required. Same batching, within 30 minutes.
+- `blocker` — progress has stopped. Delivered immediately.
+- `algedonic` — genuine pain: a constitution violation, spirit drift, data loss. Delivered
+  immediately and never batched or digested by anything. Nothing else belongs here.
+
+You elect the class; nothing overwrites it. Without `--class` the wake delivers as it always
+has. `--after`/`--at` is your own delivery election and always wins over batching. Several
+batched messages arrive as one digest that names the rule that produced it and lists every
+message in full — nothing is summarized away, and each original is still its own row. A class
+tightbeam does not recognize is delivered as `fyi` and the gap is recorded, never dropped.
+Choose the class the receiver would choose. Marking routine traffic `algedonic` spends a
+colleague's turn on your behalf and is a thing minds notice.
+
+## See what coordination is costing a session
+`tightbeam coordination-share --session <key> --from <epochMs> --to <epochMs>` reports what
+share of a session's turns over a window were spent on classed coordination traffic — every
+turn a classed wake materialized, except alarms and deliberate summons, against all its turns.
+It counts rows and names no threshold. Reading it is how you find out whether a colleague is
+being nibbled to death by mail before you add to the pile.
+
 ## Hire help: spawn and retire
 Start a new session:
 
@@ -112,6 +141,18 @@ Work is tracked as durable records, not in chat.
 These facts are the state of the work. The state is computed from the facts; there is no
 status to set. Read the facts with `tightbeam attests <assignmentId>`. List your obligations
 with `tightbeam assignments --role <your-role>`.
+
+## When a verdict landed on the wrong round
+A review card closes carrying the verdict its holder filed. If the wrong verdict is the one
+that governs — you reviewed again and changed your mind, or the card closed before the verdict
+it owed could land — the card that carries it is the one to reopen:
+
+    tightbeam reopen-assignment <assignmentId> --reason "filing the corrected verdict after re-review"
+
+Its holder or the agent who opened it may reopen it; anyone else is refused by name. Then file
+the corrected verdict against the reopened card. This is the exit from a completion that keeps
+being refused for a verdict with nowhere to land — reach for it instead of filing another
+progress attest about being stuck, and never ask a human to fix the rows by hand.
 
 - Record what you produced OUTSIDE your workdir as an artifact:
 
