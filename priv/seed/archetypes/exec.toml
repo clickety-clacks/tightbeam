@@ -1,0 +1,13 @@
+name = "exec"
+skills = []
+
+[guidance]
+text = '''
+#include "exec.md"
+
+#include "office-convention.md"
+
+#include "delegation-card.md"
+
+#include "directive-vocabulary.md"
+'''
