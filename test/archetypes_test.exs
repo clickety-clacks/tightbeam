@@ -24,12 +24,15 @@ defmodule Tightbeam.ArchetypesTest do
     end
 
     assert Path.wildcard(Path.join(identity_dir, "archetypes/*.toml")) ==
-             [Path.join(identity_dir, "archetypes/default.toml")]
+             Enum.map(["default", "exec"], &Path.join(identity_dir, "archetypes/#{&1}.toml"))
 
     assert File.regular?(Path.join([identity_dir, "guidance", "operating-model.md"]))
 
     assert Path.wildcard(Path.join(identity_dir, "guidance/*.md")) ==
-             [Path.join(identity_dir, "guidance/operating-model.md")]
+             Enum.map(
+               ~w(delegation-card directive-vocabulary exec office-convention operating-model),
+               &Path.join(identity_dir, "guidance/#{&1}.md")
+             )
 
     assert %{"default" => default} = Archetypes.load!(ctx.base_dir)
     assert default.skills == ["tightbeam-onboarding"]
@@ -150,7 +153,7 @@ defmodule Tightbeam.ArchetypesTest do
     loaded = Archetypes.load!(ctx.base_dir)
 
     assert Map.keys(loaded) |> Enum.sort() ==
-             ~w(coder default orchestrator product-owner recon reviewer spec-writer)
+             ~w(coder default exec orchestrator product-owner recon reviewer spec-writer)
 
     assert loaded["product-owner"].skills == [
              "tightbeam-dispatching",
