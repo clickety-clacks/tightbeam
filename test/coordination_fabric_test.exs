@@ -1297,6 +1297,53 @@ defmodule Tightbeam.CoordinationFabricTest do
              verb(db, {:user, "outsider5"}, "digest-members", %{wake_id: digest_id})
   end
 
+  test "O5 follow-up (round 3): the pinned owner round-trips exactly — a space-containing id never collides with its own prefix",
+       %{db: db} do
+    # Sol xhigh review round 3: the pin was written as raw text
+    # (`ownerUserId=#{owner}`) and read back with `\S+` — an owner id
+    # containing a space ("alice bob") would be captured back as bare
+    # "alice", transferring the OLD carrier's audit to whatever real user
+    # happens to be named "alice." Both users exist here, deliberately, to
+    # prove the collision cannot happen once the field round-trips through
+    # `URI.encode_www_form/1`/`URI.decode_www_form/1`.
+    {:ok, _} =
+      DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('alice', 0, 1)")
+
+    seed_session(db, "agent:filer6", "alice bob")
+    seed_session(db, "agent:stranger6", "outsider6")
+
+    Roles.create!(db, "collision-role", "alice bob", nil)
+
+    member =
+      Wakes.schedule(db, %{
+        session_key: "agent:filer6",
+        target_role: "collision-role",
+        origin: "agent:sender",
+        creator_session_key: "agent:sender",
+        prompt: "for whoever holds collision-role",
+        due_at: 0,
+        class: "fyi"
+      })
+
+    at = member.created_at + Wakes.delivery_policy("fyi").ceiling_ms
+    assert [digest_id] = Wakes.materialize_digests(db, at)
+
+    # The TRUE owner — the full "alice bob" — reads it.
+    assert {:ok, %{digest_members: members}} =
+             verb(db, {:user, "alice bob"}, "digest-members", %{wake_id: digest_id})
+
+    assert Enum.map(members, & &1.wake_id) == [member.wake_id]
+
+    # The PREFIX user — a real, distinct "alice" — must NOT gain authority
+    # from a truncated read of the pinned fact.
+    assert {:error, %{code: "not_found"}} =
+             verb(db, {:user, "alice"}, "digest-members", %{wake_id: digest_id})
+
+    # An unrelated stranger is refused too.
+    assert {:error, %{code: "not_found"}} =
+             verb(db, {:user, "outsider6"}, "digest-members", %{wake_id: digest_id})
+  end
+
   ## Seam ③ — the `input-needed` carrier (GitHub #11)
 
   test "an agent's question and the notification that carries it are one commit", %{db: db} do

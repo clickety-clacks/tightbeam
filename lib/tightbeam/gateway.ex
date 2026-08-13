@@ -5175,6 +5175,13 @@ defmodule Tightbeam.Gateway do
   # this reads correctly even when no pinned fact exists at all (a `nil`
   # owner never matches a real user id, and the admin path is still
   # reached): the deny-on-nil case never precedes the admin check.
+  #
+  # `URI.decode_www_form/1` reverses `Wakes`'s `pinned_owner_field/1`
+  # (Sol xhigh review round 3): the raw text was LOSSY for a user id
+  # containing a space — "alice bob" pinned and captured back by `\S+` as
+  # bare "alice" would transfer the OLD carrier's audit to a real user named
+  # "alice." Decoding here is what makes the round trip exact regardless of
+  # what the id contains.
   defp pinned_carrier_owner(db, wake_id) do
     case DB.query(
            db,
@@ -5183,7 +5190,7 @@ defmodule Tightbeam.Gateway do
          ) do
       {:ok, [[detail]]} ->
         case Regex.run(~r/ ownerUserId=(\S+)/, detail) do
-          [_, owner] -> owner
+          [_, encoded] -> URI.decode_www_form(encoded)
           nil -> nil
         end
 

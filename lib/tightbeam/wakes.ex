@@ -1742,8 +1742,18 @@ defmodule Tightbeam.Wakes do
   # lookup later. `nil` for a session group (there is no role to pin; the
   # carrier's own `sessionKey` already IS the pinned fact, durably, since
   # sessions are never hard-deleted).
+  #
+  # `URI.encode_www_form/1` (Sol xhigh review round 3 — the same convention
+  # `client_e2e/sim_client.ex` already uses for embedding an opaque value in
+  # a `key=value` text field): a user id is opaque text, not a token — a raw
+  # `ownerUserId=#{owner}` was LOSSY for one containing a space, and lossy in
+  # a way that transfers authority: "alice bob" pinned and read back as
+  # bare "alice" would hand the OLD carrier's audit to a real user named
+  # "alice" while denying the true owner. Encoding makes the field
+  # unambiguous and round-trippable regardless of what the id contains;
+  # `pinned_carrier_owner/2` (gateway.ex) decodes it back.
   defp pinned_owner_field(nil), do: ""
-  defp pinned_owner_field(owner), do: " ownerUserId=#{owner}"
+  defp pinned_owner_field(owner), do: " ownerUserId=#{URI.encode_www_form(owner)}"
 
   # THE CARRIER'S OWN TARGET (O2). A session group's carrier addresses that
   # session directly, exactly as before. A role group's carrier carries
