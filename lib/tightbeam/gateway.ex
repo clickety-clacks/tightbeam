@@ -649,6 +649,15 @@ defmodule Tightbeam.Gateway do
           not (is_binary(p[:prompt]) and p.prompt != "") ->
             %{code: "invalid", message: "a wake must carry a prompt"}
 
+          # A class must be a NAME. Note what is deliberately NOT checked here:
+          # membership in the five seed classes. A kungfu extends the vocabulary
+          # freely (fabric §7), so refusing an unrecognized name would make an
+          # org's own extension a substrate error; an extension this build has
+          # no mapping for is delivered as `fyi` with a named skew row instead
+          # (§5 policy-skew rule) — never dropped, never promoted.
+          Map.has_key?(p, :class) and not (is_binary(p[:class]) and p[:class] != "") ->
+            %{code: "invalid", message: "--class requires a class name"}
+
           not valid_reresolve?(p) ->
             %{code: "invalid", message: "reresolve lineage requires seed and rung"}
 
@@ -904,6 +913,7 @@ defmodule Tightbeam.Gateway do
       "attend" => fn call -> attend_result(db, call) end,
       "toplines" => fn call -> Tightbeam.Toplines.roster(db, call) end,
       "topline" => fn call -> Tightbeam.Toplines.topline(db, call) end,
+      "coordination-share" => fn call -> coordination_share_result(db, call) end,
       "work-item-list" => fn call -> WorkItems.__handle__(db, "work-item-list", call) end,
       "work-item-update" => fn call ->
         WorkItems.__handle__(
@@ -3547,6 +3557,18 @@ defmodule Tightbeam.Gateway do
         condition_kind: condition_kind,
         condition_scope: condition_scope,
         creator_session_key: creator_session_key(call[:principal]),
+        # THE SENDER ELECTS (fabric §7), and election is how traffic ENTERS the
+        # fabric on this line. A wake with no `--class` carries no class and is
+        # delivered exactly as it was before Phase 1 — the substrate does not
+        # decide on the sender's behalf that an existing message "was really an
+        # fyi" and hold it for four hours (gate Q1/Q2). The classifier's default
+        # stamps traffic routed INTO the fabric that declined to elect; Phase 3's
+        # desk is where the receiving boundary starts doing that.
+        #
+        # `sender_scheduled` is the batcher's named inhibition seam: a caller
+        # that said WHEN keeps its own when, class or no class.
+        class: p[:class],
+        sender_scheduled: not is_nil(p[:at]) or not is_nil(p[:after_ms]),
         reresolve: p[:reresolve],
         reresolve_seed: p[:reresolve_seed],
         reresolve_rung: p[:reresolve_rung],
@@ -3627,11 +3649,30 @@ defmodule Tightbeam.Gateway do
   defp creator_session_key(_principal), do: nil
 
   defp select_wake_in_txn_sql do
-    "SELECT wakeId, dueAt, state FROM wakes WHERE wakeId = ?1"
+    "SELECT wakeId, dueAt, state, class, deliveryRule FROM wakes WHERE wakeId = ?1"
   end
 
-  defp wake_from_in_txn_row([wake_id, due_at, state]),
-    do: %{wake_id: wake_id, due_at: due_at, state: state}
+  defp wake_from_in_txn_row([wake_id, due_at, state, class, delivery_rule]),
+    do: %{
+      wake_id: wake_id,
+      due_at: due_at,
+      state: state,
+      class: class,
+      delivery_rule: delivery_rule
+    }
+
+  # The response names the rule that decided delivery (fabric §8: an
+  # unattributable reflex is a bug), so a sender can see it was batched and
+  # knows which reflex to inhibit. Unclassed wakes answer exactly as before.
+  defp wake_response(%{class: class} = wake) when is_binary(class) do
+    %{
+      wake_id: wake.wake_id,
+      due_at: wake.due_at,
+      state: wake.state,
+      class: class,
+      delivery_rule: wake[:delivery_rule]
+    }
+  end
 
   defp wake_response(wake) do
     %{wake_id: wake.wake_id, due_at: wake.due_at, state: wake.state}
@@ -5003,6 +5044,53 @@ defmodule Tightbeam.Gateway do
   #
   # The target turn is never named by the caller: it is the caller session's
   # running turn, which the lane serializes to exactly one.
+  # The acceptance-№1 read (fabric §12 Q5). A pure count over classed rows:
+  # it files nothing, rules nothing, and names no threshold. Visibility follows
+  # `transcript`'s rule — the session's owner or an admin — because the same
+  # rows are readable there, and a coordination share over a session you cannot
+  # read would be a status oracle.
+  defp coordination_share_result(db, call) do
+    p = call.params
+    session_key = p[:session_key] || p[:session]
+
+    cond do
+      not (is_binary(session_key) and session_key != "") ->
+        %{code: "invalid", message: "coordination-share requires --session"}
+
+      not (is_integer(p[:from]) and is_integer(p[:to])) ->
+        %{code: "invalid", message: "coordination-share requires --from and --to in epoch ms"}
+
+      p[:to] <= p[:from] ->
+        %{code: "invalid", message: "--to must be after --from"}
+
+      true ->
+        case Org.get(db, session_key) do
+          nil ->
+            %{code: "not_found", message: "session not found"}
+
+          session ->
+            if coordination_share_readable?(db, call, session),
+              do: Wakes.coordination_share(db, session_key, p.from, p.to),
+              else: %{code: "not_found", message: "session not found"}
+        end
+    end
+  end
+
+  defp coordination_share_readable?(db, call, session) do
+    case call[:principal] do
+      {:user, id} -> session.owner_user_id == id or admin_origin?(db, call.origin)
+      {:session, key} -> key == session.session_key or owner_of?(db, call.origin, session)
+      _ -> false
+    end
+  end
+
+  defp owner_of?(db, origin, session) do
+    case resolve_caller(db, origin) do
+      %{owner_user_id: owner} when is_binary(owner) -> owner == session.owner_user_id
+      _ -> false
+    end
+  end
+
   defp attend_result(db, call) do
     case call[:principal] do
       {:session, session_key} ->

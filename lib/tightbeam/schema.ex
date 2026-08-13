@@ -35,7 +35,14 @@ defmodule Tightbeam.Schema do
   # The shape this build writes. Bump it when a production table changes in a
   # way that makes an older database unreadable, and give the refusal below a
   # sentence saying what changed.
-  @shape "model-identity-v1"
+  # `coordination-fabric-classes-v1` (2026-08-13, fabric §13 Phase 1 seams ①/②):
+  # `wakes` gained `class`, `classElection`, `deliveryRule`, `digest` and
+  # `summon`. `CREATE TABLE IF NOT EXISTS` adds no column to a table that
+  # already exists, so a `model-identity-v1` database would answer every classed
+  # read with `no such column` — and a hand-added column would be worse, because
+  # its rows would carry no class election at all while the shape claimed they
+  # did. Refuse, name it, and let the database be recreated.
+  @shape "coordination-fabric-classes-v1"
 
   @supervision_liveness_objects [
     %{

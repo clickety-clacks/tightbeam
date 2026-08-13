@@ -45,6 +45,11 @@ pub enum Command {
         condition_kind: Option<String>,
         condition_scope: Option<String>,
         idempotency_key: Option<String>,
+        /// The coordination class the SENDER elects (fabric v1 §7). Deliberately
+        /// an unvalidated string: a kungfu may extend the vocabulary, and the
+        /// substrate answers an unknown class with `fyi` delivery plus a named
+        /// skew row, never a refusal.
+        class: Option<String>,
     },
     Condition {
         identity: Identity,
@@ -198,6 +203,12 @@ pub enum Command {
     Attests {
         identity: Identity,
         assignment_id: String,
+    },
+    CoordinationShare {
+        identity: Identity,
+        session: String,
+        from: String,
+        to: String,
     },
     Assignments {
         identity: Identity,
@@ -364,6 +375,7 @@ TARGET (for commands that take one — pass exactly one):
 COMMANDS:
   wake (--session <key> | --role <name> | --user <id>) --prompt "<text>"
        [--after 30s|5m|2h] [--at <epochMs>]
+       [--class fyi|status-query|input-needed|blocker|algedonic]
       Condition wake:
         tightbeam wake (--session <key> | --role <name> | --user <id>)
           --when-fact <kind> [--when-scope <scope>]
@@ -379,6 +391,14 @@ COMMANDS:
       The fallback timer detects silence only; it does not select an action.
       --prompt is the caller's explicit instruction override.
       Tightbeam carries it without rewriting it.
+      --class says how URGENT this is for the receiver, and you elect it: fyi and
+      status-query and input-needed are batched into one digest turn at the
+      receiver's next turn boundary (or their class ceiling — 4h, 30m, 30m —
+      whichever comes first); blocker delivers immediately; algedonic bypasses
+      batching entirely and is for genuine pain only. Without --class the wake
+      delivers exactly as it always has. --after/--at is your own delivery
+      election and always wins over batching. Every batched digest names the
+      rule that produced it, so you can see what held your message.
         tightbeam wake --role reviewer --prompt "review PR 12" --as coder
         tightbeam wake --session agent:coder:app --prompt "check CI" --after 5m --as coder
         tightbeam wake --role owner --when-fact build-finished --when-scope app \
@@ -460,6 +480,12 @@ COMMANDS:
       reports the items they resolve to; an assignment belonging to no item
       comes back in noItem rather than being silently dropped.
         tightbeam topline --under wi_abc123 --as-user flynn
+  coordination-share --session <key> --from <epochMs> --to <epochMs>
+      What share of a session's turns were spent on classed coordination traffic
+      over a window — turns materialized by a classed wake that was neither an
+      algedonic alarm nor a summon, against all its turns. Counts rows and
+      names no threshold; a window with no turns reports a null share, not zero.
+        tightbeam coordination-share --session agent:po --from 1 --to 2 --as-user flynn
   work-item-icebox <workItemId>
       Shelve an unstaffed item (open → iceboxed). Requires zero open
       assignments; work-item-reopen resumes it.
@@ -728,6 +754,9 @@ fn parse_duration(flag: &str, text: &str) -> Result<String, String> {
     Ok(js_number_json(value * multiplier))
 }
 
+const COORDINATION_SHARE_USAGE: &str =
+    "usage: tightbeam coordination-share --session <key> --from <epochMs> --to <epochMs>";
+
 const TOPLINES_USAGE: &str = "usage: tightbeam toplines [--origin user|session|all] [--owner <userId>] [--state <state>] [--quiet-over <duration>] [--spec <name> [--spec-sha <sha>]] [--session <key>] [--tree]";
 
 const TOPLINE_USAGE: &str = "usage: tightbeam topline (--under <workItemId> | --assignments <id,...>) [the same roster filters]";
@@ -987,6 +1016,9 @@ fn parse_with_optional_catalog(
                 return Err("--fallback-after and --at are mutually exclusive".to_owned());
             }
             let idempotency_key = condition_kind.as_ref().and_then(|_| nonempty(flags, "key"));
+            if flags.get("class").is_some_and(String::is_empty) {
+                return Err("--class requires a class name".to_owned());
+            }
             Ok(Command::Wake {
                 identity: identity(flags)?,
                 target: targets.into_iter().next().expect("exactly one target"),
@@ -996,6 +1028,7 @@ fn parse_with_optional_catalog(
                 condition_kind,
                 condition_scope,
                 idempotency_key,
+                class: nonempty(flags, "class"),
             })
         }
         "condition" => {
@@ -1420,6 +1453,24 @@ fn parse_with_optional_catalog(
                 commit_refs,
             })
         }
+        "coordination-share" => {
+            if parsed.positional.len() != 1 {
+                return Err(COORDINATION_SHARE_USAGE.to_owned());
+            }
+            let session =
+                nonempty(flags, "session").ok_or_else(|| COORDINATION_SHARE_USAGE.to_owned())?;
+            let from =
+                nonempty(flags, "from").ok_or_else(|| COORDINATION_SHARE_USAGE.to_owned())?;
+            let to = nonempty(flags, "to").ok_or_else(|| COORDINATION_SHARE_USAGE.to_owned())?;
+            Ok(Command::CoordinationShare {
+                identity: identity(flags)?,
+                session,
+                // The same numeric coercion transcript's --limit uses, rendered
+                // as a JSON number so the handler receives epoch integers.
+                from: js_number_json(number_coercion(&from)),
+                to: js_number_json(number_coercion(&to)),
+            })
+        }
         "attests" => {
             if parsed.positional.len() != 2 {
                 return Err("usage: tightbeam attests <assignmentId>".to_owned());
@@ -1543,7 +1594,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -2034,6 +2085,7 @@ mod tests {
                 "cancel-wake",
                 "condition",
                 "config",
+                "coordination-share",
                 "decision-requests",
                 "dispatch",
                 "doctor",
@@ -2328,6 +2380,7 @@ mod tests {
                 condition_kind: Some("build-finished".to_owned()),
                 condition_scope: Some("app".to_owned()),
                 idempotency_key: Some("wake-1".to_owned()),
+                class: None,
             })
         );
         assert_eq!(
@@ -2353,6 +2406,7 @@ mod tests {
                 condition_kind: Some("review-landed".to_owned()),
                 condition_scope: None,
                 idempotency_key: None,
+                class: None,
             })
         );
         assert_eq!(
@@ -2636,7 +2690,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned())
         );
     }
 
@@ -2800,6 +2854,7 @@ mod tests {
                     condition_kind: None,
                     condition_scope: None,
                     idempotency_key: None,
+                    class: None,
                 },
             ),
             (

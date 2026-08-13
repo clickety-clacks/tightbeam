@@ -131,6 +131,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             condition_kind,
             condition_scope,
             idempotency_key,
+            class,
         } => {
             let target = match target {
                 Target::Session(value) => string_field("sessionKey", value),
@@ -148,6 +149,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 ("conditionKind", condition_kind),
                 ("conditionScope", condition_scope),
                 ("idempotencyKey", idempotency_key),
+                ("class", class),
             ] {
                 if let Some(value) = value {
                     params.push(string_field(name, value));
@@ -576,6 +578,24 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             "attests",
             vec![],
             vec![string_field("assignmentId", assignment_id)],
+        )),
+        Command::CoordinationShare {
+            identity,
+            session,
+            from,
+            to,
+        } => Ok(request(
+            identity,
+            "coordination-share",
+            vec![],
+            // The measured session travels as an ordinary param: the router
+            // declares this verb non-target so the read never doubles as a
+            // session-existence oracle.
+            vec![
+                string_field("session", session),
+                format!("\"from\":{from}"),
+                format!("\"to\":{to}"),
+            ],
         )),
         Command::Assignments {
             identity,
@@ -1323,6 +1343,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::Transcript { identity, .. }
         | Command::Toplines { identity, .. }
         | Command::Topline { identity, .. }
+        | Command::CoordinationShare { identity, .. }
         | Command::WorkItemIcebox { identity, .. }
         | Command::WorkItemReopen { identity, .. }
         | Command::WorkItemClose { identity, .. }
