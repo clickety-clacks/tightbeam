@@ -859,31 +859,125 @@ defmodule Tightbeam.CoordinationFabricTest do
              "entry's kind scope and update this pin"
 
     escalation_slices = function_slices("lib/tightbeam/escalation.ex")
-    {direct, derived} = decision_requests_closure(escalation_slices)
 
-    assert derived == MapSet.new(Map.keys(pinned_kinds)),
+    pinned_arities = %{
+      escalate: 4,
+      open_episodes: 2,
+      statute_park_candidate_in_txn: 2,
+      grant_waiver: 6,
+      current_request: 4,
+      file_agent_request: 2,
+      answer_open: 4,
+      effort_open_by_deadline_wake_in_txn: 2,
+      effort_insert_in_txn: 2,
+      effort_id_by_generation_in_txn: 3,
+      effort_supersede_open_in_txn: 2,
+      effort_update_generation_in_txn: 4,
+      open_counts_by_assignment: 1,
+      consume: 2,
+      withdraw_for_retired: 2,
+      withdraw_episodes: 3,
+      recover_retired: 1,
+      list: 4,
+      get: 4,
+      effort_rule_in_txn: 5,
+      claim_park_wake_in_txn: 3,
+      decision_trace_rows: 2,
+      wake_link_fragment: 1,
+      raw_exists_in_txn?: 2,
+      statute_name_for_ruling: 2,
+      rule_open: 6,
+      withdraw_open: 4,
+      get_raw: 2,
+      request_in_txn: 2,
+      answer: 2,
+      ask: 2,
+      raw_by_id: 2,
+      raw_by_id_in_txn!: 2,
+      resolve: 3,
+      rule: 3,
+      rule_statute: 4,
+      summon: 4,
+      waive: 3,
+      withdraw: 2
+    }
+
+    # (a2), hardened (Sol round 4, findings 2a/2b). A bare atom collapses
+    # arity, so a NEW overload of an already-pinned name (`escalate/5` beside
+    # the real `escalate/4`) is invisible to a name-only inventory — the new
+    # arity silently rides in on the old name's already-accepted entry. The
+    # closure is now computed AT THE AST LEVEL, keyed `{name, arity}`, and its
+    # literal-touch test is stronger than a `Macro.to_string` substring scan
+    # too: it resolves `<>` concatenation chains and this module's OWN
+    # `@attr` references to their literal values (Sol round 4, finding 2b —
+    # an assembled `"decision_" <> "requests"` or an attribute-derived
+    # `@table "decision_requests"` used via `#{@table}` has no contiguous
+    # "decision_requests" text for a `Macro.to_string` scan to find, but is
+    # still a literal to the AST). `ensure_schema/1` is excluded by name: it
+    # emits this table's own DDL (`DB.execute(db, @ddl)`) for ALL THREE kinds
+    # at once, by construction — a schema definition, not a scoped reader, so
+    # it is not part of "every reader lives in escalation.ex" in the sense
+    # this inventory means.
+    {direct_refs, derived_refs} = ast_reader_closure("lib/tightbeam/escalation.ex")
+
+    direct_names = for {name, _arity} <- direct_refs, into: MapSet.new(), do: name
+    derived_names = for {name, _arity} <- derived_refs, into: MapSet.new(), do: name
+
+    assert derived_names == MapSet.new(Map.keys(pinned_kinds)),
            "derived escalation.ex functions touching decision_requests do not match the pin: " <>
-             "new #{inspect(MapSet.difference(derived, MapSet.new(Map.keys(pinned_kinds))))}, " <>
-             "missing #{inspect(MapSet.difference(MapSet.new(Map.keys(pinned_kinds)), derived))}"
+             "new #{inspect(MapSet.difference(derived_names, MapSet.new(Map.keys(pinned_kinds))))}, " <>
+             "missing #{inspect(MapSet.difference(MapSet.new(Map.keys(pinned_kinds)), derived_names))}"
 
-    # (b): every DIRECT entry scoped to a real kind (not "any") must name its
-    # own predicate in its own text. A delegate (in `derived` but not
-    # `direct`) has no text of its own to check — its correctness rides on
-    # the direct entry it calls, which this loop already covers.
-    for {ref, kind} <- pinned_kinds, kind != "any", ref in direct do
+    pinned_refs = for {name, arity} <- pinned_arities, into: MapSet.new(), do: {name, arity}
+
+    assert derived_refs == pinned_refs,
+           "escalation.ex's decision_requests-reading functions changed ARITY, not just name " <>
+             "— a new overload of an already-pinned name is invisible to a name-only pin: new " <>
+             "#{inspect(MapSet.difference(derived_refs, pinned_refs))}, missing " <>
+             "#{inspect(MapSet.difference(pinned_refs, derived_refs))}"
+
+    # (b): every DIRECT entry scoped to a real kind (not "any") must prove an
+    # EXCLUSIVE predicate in its own SQL text, not merely CONTAIN the declared
+    # kind as a substring (Sol round 4, finding 1): a "statute"-scoped helper
+    # widened to `kind IN ('statute','agent')` still contains the literal
+    # 'statute' and passed the old substring check. `kind_predicate_shape/3`
+    # parses the helper's own SQL for its "kind" constraint and accepts only
+    # two shapes — `kind = '<declared>'` for a single declared kind, or an
+    # explicit `kind IN (...)` list EXACTLY equal to a declared pair — and
+    # fails closed, by name, on anything else (an extra IN member, an OR, a
+    # negation, or no recognizable constraint at all). A delegate (in
+    # `derived` but not `direct`) has no text of its own to check — its
+    # correctness rides on the direct entry it calls, which this loop already
+    # covers.
+    for {ref, kind} <- pinned_kinds, kind != "any", ref in direct_names do
       text = text_for_name(escalation_slices, ref)
       assert text != "", "#{ref} is pinned #{inspect(kind)} but no matching function was found"
 
-      required =
-        kind
-        |> String.split(",")
-        |> Enum.map(&"'#{&1}'")
-
-      for literal <- required do
-        assert text =~ literal,
-               "#{ref} is pinned #{inspect(kind)} but its own text does not contain #{literal}"
+      case kind_predicate_shape(ref, text, kind) do
+        :ok -> :ok
+        {:error, message} -> flunk(message)
       end
     end
+
+    # (b2): a query built by interpolating a NON-LITERAL expression into the
+    # query text cannot be proven, by this scan, to be free of an assembled
+    # or hidden table reference — `#{@request_columns}` resolves (it is a
+    # literal attribute), but `#{where}`/`#{status_clause}` in `list/4` and
+    # `get/4`, and `#{clause}` in `decision_trace_rows/2`, do not. Rather than
+    # silently trusting them, each is a REVIEWED, PINNED exception
+    # (visibility-filter and IN-list placeholder text, never a table name);
+    # any function joining this set is new dynamic SQL that has not been
+    # reviewed and fails closed, by name, until it is.
+    pinned_dynamic_queries = MapSet.new([{:list, 4}, {:get, 4}, {:decision_trace_rows, 2}])
+
+    found_dynamic_queries = dynamic_query_refs("lib/tightbeam/escalation.ex")
+
+    assert found_dynamic_queries == pinned_dynamic_queries,
+           "a decision_requests query's text is no longer provably literal (it interpolates " <>
+             "something this scan cannot resolve) in a function not already reviewed for it — a " <>
+             "non-literal fragment could be hiding an assembled table name: new " <>
+             "#{inspect(MapSet.difference(found_dynamic_queries, pinned_dynamic_queries))}, stale " <>
+             "#{inspect(MapSet.difference(pinned_dynamic_queries, found_dynamic_queries))}"
 
     # (c): every "any"-scoped, non-verb helper's external callers are pinned.
     # The verb surface (`ask`/`answer`/`rule`/`waive`/`withdraw`/`resolve`/
@@ -927,12 +1021,55 @@ defmodule Tightbeam.CoordinationFabricTest do
              "new #{inspect(MapSet.difference(any_kind_public, MapSet.new(Map.keys(pinned_callers))))}, " <>
              "stale #{inspect(MapSet.difference(MapSet.new(Map.keys(pinned_callers)), any_kind_public))}"
 
+    # AST-level caller resolution (Sol round 4, finding 3): a textual
+    # `Escalation.<ref>(` scan is blind to a capture (`&Escalation.f/2`), an
+    # `apply/3` target, or a caller that aliased the module under another
+    # name — none of them add the literal substring the old scan looked for.
+    # Computed once, for every lib/ file, rather than per-ref: cheaper, and
+    # the same AST walk answers every ref's question at once.
+    callers_by_ref =
+      escalation_callers_by_file()
+      |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
+      |> Map.new(fn {ref, sites} -> {ref, Enum.uniq(sites)} end)
+
     for {ref, expected} <- pinned_callers do
-      found = external_callers(ref)
+      found = Map.get(callers_by_ref, ref, [])
 
       assert Enum.sort(found) == Enum.sort(expected),
              "#{ref}'s external callers changed: found #{inspect(found)}, pinned #{inspect(expected)}"
     end
+
+    # Imports evade the same scan a different way: `import Escalation` turns
+    # every bare `consume(...)` inside the importing file into a call this
+    # walk never sees, because it never mentions `Escalation` at all. Cheapest
+    # closure (Sol round 4, finding 3's `import` clause): assert the escape
+    # hatch is not in use, so there is nothing to widen the caller walk for —
+    # until the day this fails and it must.
+    importers =
+      Path.wildcard("lib/**/*.ex")
+      |> Enum.reject(&(&1 == "lib/tightbeam/escalation.ex"))
+      |> Enum.filter(&imports_escalation?/1)
+
+    assert importers == [],
+           "lib/ file(s) import Escalation — bare calls there are invisible to the caller walk " <>
+             "above and must be handled explicitly: #{inspect(importers)}"
+
+    # `apply/3` with a non-literal module argument is the one shape this scan
+    # cannot resolve at all: the target could be anything at runtime,
+    # Escalation included. `command_edge.ex`'s `perform_job/2` is a reviewed,
+    # PINNED exception — a generic worker MFA from `validate_worker!/1`,
+    # never Escalation — any other site joining this set is new and
+    # unreviewed.
+    pinned_dynamic_applies =
+      MapSet.new([{"lib/tightbeam/command_edge.ex", "perform_job/2"}])
+
+    found_dynamic_applies = dynamic_apply_sites() |> MapSet.new()
+
+    assert found_dynamic_applies == pinned_dynamic_applies,
+           "a lib/ function calls 3-arity apply/3 with a non-literal module argument outside " <>
+             "the reviewed allowlist — this scan cannot prove it never targets Escalation: new " <>
+             "#{inspect(MapSet.difference(found_dynamic_applies, pinned_dynamic_applies))}, stale " <>
+             "#{inspect(MapSet.difference(pinned_dynamic_applies, found_dynamic_applies))}"
   end
 
   # Every double-quoted or triple-quoted string literal in a file's raw
@@ -1006,33 +1143,230 @@ defmodule Tightbeam.CoordinationFabricTest do
     |> Enum.map_join("\n", fn {_ref, text} -> text end)
   end
 
-  # The DIRECT set (own literal text) and its transitive closure over LOCAL
-  # calls (a delegate with no SQL of its own still counts, because it reaches
-  # one that does). `(?<!\.)` excludes qualified calls (`Escalation.foo(`,
-  # `Txn.q(`) — bare names only, which is exactly what a same-module call is.
-  defp decision_requests_closure(slices) do
-    all_refs = slices |> Map.keys() |> MapSet.new()
+  defp public_escalation_function?(ref) do
+    source = File.read!("lib/tightbeam/escalation.ex")
+    source =~ ~r/^  def #{Regex.escape(Atom.to_string(ref))}[\(,]/m
+  end
 
-    call_graph =
-      for {ref, text} <- slices, into: %{} do
-        called_names =
-          Regex.scan(~r/(?<!\.)\b([a-z_][a-zA-Z0-9_]*[?!]?)\(/, text)
-          |> Enum.map(fn [_, name] -> name end)
-          |> MapSet.new()
+  ## AST-level audit infrastructure (Sol round 4)
+  #
+  # Everything below reads Elixir's own parse tree instead of `Macro.to_string`
+  # text, closing three evasions a text/substring scan cannot see by
+  # construction: a "kind" constraint widened past its declared scope but
+  # still containing the declared literal (hole 1); a table name assembled
+  # from concatenation parts or hidden behind this module's own `@attr`
+  # (hole 2); and a caller reaching `Escalation` through a capture, an
+  # `apply/3` target, or an aliased name rather than a literal `Mod.fun(`
+  # call (hole 3).
 
-        called_refs =
-          all_refs
-          |> Enum.filter(fn other ->
-            [name, _arity] = String.split(other, "/")
-            MapSet.member?(called_names, name)
-          end)
-          |> MapSet.new()
+  # The do-block's top-level forms for a single-`defmodule`-per-file source —
+  # the same assumption `function_slices/1` above already makes.
+  defp module_do_block(ast) do
+    {:defmodule, _, [_, [do: block]]} = ast
 
-        {ref, called_refs}
-      end
+    case block do
+      {:__block__, _, items} -> items
+      single -> [single]
+    end
+  end
+
+  # Every top-level `def`/`defp`'s OWN raw AST node(s), keyed `{name, arity}`
+  # — never collapsed to a bare atom, so a new overload of an already-known
+  # name is its own distinct key rather than silently joining the existing
+  # one's entry. Multiple clauses of the same `{name, arity}` are collected
+  # into a list.
+  defp function_defs_from_ast(ast) do
+    ast
+    |> module_do_block()
+    |> Enum.filter(fn
+      {kind, _, _} -> kind in [:def, :defp]
+      _ -> false
+    end)
+    |> Enum.map(fn {_kind, _meta, args} = node ->
+      head = hd(args)
+
+      ref =
+        case head do
+          {:when, _, [inner | _]} -> inner
+          other -> other
+        end
+
+      name_arity =
+        case ref do
+          {name, _, cargs} when is_list(cargs) -> {name, length(cargs)}
+          {name, _, nil} -> {name, 0}
+        end
+
+      {name_arity, node}
+    end)
+    |> Enum.reduce(%{}, fn {ref, node}, acc -> Map.update(acc, ref, [node], &[node | &1]) end)
+  end
+
+  defp function_defs(file) do
+    {:ok, ast} = file |> File.read!() |> Code.string_to_quoted(columns: true)
+    function_defs_from_ast(ast)
+  end
+
+  # This module's own `@attr "literal"` definitions, resolved to their
+  # literal string value (concatenation- and nested-attribute-aware via
+  # `literal_value/2`) — the map `literal_fragments/2` consults so an
+  # `@table "decision_requests"` used later as `#{@table}` is still found,
+  # even though the reference itself carries no such text.
+  defp module_attrs_from_ast(ast) do
+    ast
+    |> module_do_block()
+    |> Enum.reduce(%{}, fn
+      {:@, _, [{name, _, [value]}]}, acc when is_atom(name) ->
+        case literal_value(value, acc) do
+          {:ok, v} -> Map.put(acc, name, v)
+          :unknown -> acc
+        end
+
+      _, acc ->
+        acc
+    end)
+  end
+
+  defp module_attrs(file) do
+    {:ok, ast} = file |> File.read!() |> Code.string_to_quoted(columns: true)
+    module_attrs_from_ast(ast)
+  end
+
+  # Fully resolves an AST node to a literal string, or `:unknown` the moment
+  # any part of it is not itself a literal (a variable, a function call, an
+  # unresolved attribute). Handles plain literals, `<>` concatenation chains,
+  # this module's own `@attr` reads, the compiler's `Kernel.to_string/1` wrap
+  # around every `#{}` segment, and interpolated (`<<>>`) strings/sigils.
+  defp literal_value(node, attrs) do
+    case node do
+      s when is_binary(s) ->
+        {:ok, s}
+
+      {:<>, _, [a, b]} ->
+        with {:ok, sa} <- literal_value(a, attrs),
+             {:ok, sb} <- literal_value(b, attrs) do
+          {:ok, sa <> sb}
+        else
+          _ -> :unknown
+        end
+
+      {:@, _, [{name, _, nil}]} ->
+        case Map.fetch(attrs, name) do
+          {:ok, v} -> {:ok, v}
+          :error -> :unknown
+        end
+
+      {{:., _, [Kernel, :to_string]}, _, [inner]} ->
+        literal_value(inner, attrs)
+
+      {:<<>>, _, _} = interp ->
+        interpolated_value(interp, attrs)
+
+      {:__block__, _, [single]} ->
+        literal_value(single, attrs)
+
+      _ ->
+        :unknown
+    end
+  end
+
+  defp interpolated_value({:<<>>, _, parts}, attrs) do
+    Enum.reduce_while(parts, {:ok, ""}, fn
+      part, {:ok, acc} when is_binary(part) ->
+        {:cont, {:ok, acc <> part}}
+
+      {:"::", _, [expr, _]}, {:ok, acc} ->
+        case literal_value(expr, attrs) do
+          {:ok, v} -> {:cont, {:ok, acc <> v}}
+          :unknown -> {:halt, :unknown}
+        end
+
+      other, {:ok, acc} ->
+        case literal_value(other, attrs) do
+          {:ok, v} -> {:cont, {:ok, acc <> v}}
+          :unknown -> {:halt, :unknown}
+        end
+    end)
+  end
+
+  # Every literal STRING FRAGMENT reachable anywhere in `node` — plain
+  # literals, `<>` operands, an interpolated string's own static segments,
+  # and resolved `@attr` reads — collected INDIVIDUALLY rather than requiring
+  # the whole surrounding expression to resolve. That is what catches a table
+  # name split across a static prefix/suffix around a dynamic middle, or
+  # hidden entirely behind one resolvable attribute, without needing the rest
+  # of the query (a WHERE fragment built at runtime, say) to be literal too.
+  defp literal_fragments(node, attrs) do
+    {_, frags} =
+      Macro.prewalk(node, [], fn
+        s, acc when is_binary(s) ->
+          {s, [s | acc]}
+
+        {:@, _, [{name, _, nil}]} = n, acc ->
+          case Map.fetch(attrs, name) do
+            {:ok, v} -> {n, [v | acc]}
+            :error -> {n, acc}
+          end
+
+        {:<>, _, _} = n, acc ->
+          case literal_value(n, attrs) do
+            {:ok, v} -> {n, [v | acc]}
+            :unknown -> {n, acc}
+          end
+
+        other, acc ->
+          {other, acc}
+      end)
+
+    frags
+  end
+
+  # Bare (unqualified) local calls AND local captures whose `{name, arity}`
+  # matches a function actually defined in this same set of slices — the
+  # transitive-closure call graph's edge list, at the AST level instead of a
+  # `(?<!\.)\bname\(` text regex.
+  defp local_call_refs(node, known_refs) do
+    {_, calls} =
+      Macro.prewalk(node, [], fn
+        {name, _, args} = n, acc when is_atom(name) and is_list(args) ->
+          ref = {name, length(args)}
+          if MapSet.member?(known_refs, ref), do: {n, [ref | acc]}, else: {n, acc}
+
+        {:&, _, [{:/, _, [{name, _, ctx}, arity]}]} = n, acc
+        when is_atom(name) and not is_list(ctx) ->
+          ref = {name, arity}
+          if MapSet.member?(known_refs, ref), do: {n, [ref | acc]}, else: {n, acc}
+
+        other, acc ->
+          {other, acc}
+      end)
+
+    calls
+  end
+
+  # (a2)'s DIRECT set — every `{name, arity}` whose OWN literal fragments
+  # contain "decision_requests" — and its transitive closure over local
+  # calls, both `{name, arity}`-keyed. `ensure_schema/1` is excluded: it
+  # issues this table's own DDL for all three kinds by construction, which is
+  # not "reading" in the sense this inventory means.
+  defp ast_reader_closure(file) do
+    attrs = module_attrs(file)
+    defs = function_defs(file)
+    known_refs = defs |> Map.keys() |> MapSet.new()
 
     direct =
-      for {ref, text} <- slices, text =~ "decision_requests", into: MapSet.new(), do: ref
+      for {ref, nodes} <- defs,
+          ref != {:ensure_schema, 1},
+          frags = Enum.flat_map(nodes, &literal_fragments(&1, attrs)),
+          Enum.any?(frags, &String.contains?(&1, "decision_requests")),
+          into: MapSet.new(),
+          do: ref
+
+    call_graph =
+      for {ref, nodes} <- defs, into: %{} do
+        calls = nodes |> Enum.flat_map(&local_call_refs(&1, known_refs)) |> MapSet.new()
+        {ref, calls}
+      end
 
     closure =
       Enum.reduce_while(1..100, direct, fn _, acc ->
@@ -1046,35 +1380,463 @@ defmodule Tightbeam.CoordinationFabricTest do
         if MapSet.equal?(next, acc), do: {:halt, acc}, else: {:cont, next}
       end)
 
-    direct_atoms = for ref <- direct, into: MapSet.new(), do: ref_to_atom(ref)
-    closure_atoms = for ref <- closure, into: MapSet.new(), do: ref_to_atom(ref)
-    {direct_atoms, closure_atoms}
+    {direct, closure}
   end
 
-  defp ref_to_atom(ref) do
-    [name, _arity] = String.split(ref, "/")
-    String.to_atom(name)
+  # A `Txn.q`/`DB.query` call's own query-text argument, resolved the same
+  # way `literal_fragments/2` resolves table-name literals — but here the
+  # WHOLE expression must resolve, not just some fragment of it: a query is
+  # either provably literal end to end, or it is dynamic SQL this scan cannot
+  # vouch for at all.
+  defp dynamic_query_refs(file) do
+    attrs = module_attrs(file)
+    defs = function_defs(file)
+
+    for {ref, nodes} <- defs,
+        Enum.any?(nodes, &has_dynamic_query?(&1, attrs)),
+        into: MapSet.new(),
+        do: ref
   end
 
-  defp public_escalation_function?(ref) do
-    source = File.read!("lib/tightbeam/escalation.ex")
-    source =~ ~r/^  def #{Regex.escape(Atom.to_string(ref))}[\(,]/m
+  defp has_dynamic_query?(node, attrs) do
+    {_, hit?} =
+      Macro.prewalk(node, false, fn
+        {{:., _, [_mod, fun]}, _, args} = n, acc
+        when fun in [:q, :query] and length(args) >= 2 ->
+          query_arg = Enum.at(args, 1)
+
+          resolved =
+            case query_arg do
+              bin when is_binary(bin) -> {:ok, bin}
+              other -> literal_value(other, attrs)
+            end
+
+          {n, acc or match?(:unknown, resolved)}
+
+        n, acc ->
+          {n, acc}
+      end)
+
+    hit?
   end
 
-  # For `ref` (an escalation.ex function name), every OTHER lib/ file whose
-  # some function's own text calls `Escalation.<ref>(` — {file, enclosing
-  # function} pairs, using the same true-boundary slicing `function_slices/1`
-  # uses, applied to the caller's file this time.
-  defp external_callers(ref) do
+  # This file's own `alias` declarations (plain, `as:`, and the `Mod.{A, B}`
+  # multi-alias form), mapping the SHORT name a call site can use back to the
+  # module's full path — resolved once per file and threaded through every
+  # call/capture/apply check below.
+  defp module_alias_map(ast) do
+    {_, aliases} =
+      Macro.prewalk(ast, %{}, fn
+        {:alias, _, [{:__aliases__, _, parts}]} = node, acc ->
+          {node, Map.put(acc, List.last(parts), parts)}
+
+        {:alias, _, [{:__aliases__, _, parts}, opts]} = node, acc when is_list(opts) ->
+          case Keyword.get(opts, :as) do
+            {:__aliases__, _, as_parts} -> {node, Map.put(acc, List.last(as_parts), parts)}
+            _ -> {node, acc}
+          end
+
+        {:alias, _, [{{:., _, [{:__aliases__, _, prefix}, :{}]}, _, entries}]} = node, acc ->
+          acc2 =
+            Enum.reduce(entries, acc, fn
+              {:__aliases__, _, suffix}, a -> Map.put(a, List.last(suffix), prefix ++ suffix)
+              _, a -> a
+            end)
+
+          {node, acc2}
+
+        node, acc ->
+          {node, acc}
+      end)
+
+    aliases
+  end
+
+  defp resolves_to_escalation?(parts, aliases) do
+    case parts do
+      [:Tightbeam, :Escalation] -> true
+      [single] -> Map.get(aliases, single) == [:Tightbeam, :Escalation]
+      _ -> false
+    end
+  end
+
+  # Every `Escalation.<fun>` reference reachable in `node` that resolves
+  # (through `aliases`) to `Tightbeam.Escalation` — a remote call, a
+  # `&Mod.fun/arity` capture, or a 3-arity `apply/3` naming the module and
+  # function as literals. None of the latter two add the literal
+  # `Escalation.fun(` substring a text scan looked for.
+  defp escalation_refs_called(node, aliases) do
+    {_, refs} =
+      Macro.prewalk(node, [], fn
+        {{:., _, [{:__aliases__, _, parts}, fun]}, _, _args} = n, acc when is_atom(fun) ->
+          if resolves_to_escalation?(parts, aliases), do: {n, [fun | acc]}, else: {n, acc}
+
+        {:&, _, [{:/, _, [{{:., _, [{:__aliases__, _, parts}, fun]}, _, []}, _arity]}]} = n,
+        acc ->
+          if resolves_to_escalation?(parts, aliases), do: {n, [fun | acc]}, else: {n, acc}
+
+        {:apply, _, [{:__aliases__, _, parts}, fun_atom, _args]} = n, acc
+        when is_atom(fun_atom) ->
+          if resolves_to_escalation?(parts, aliases), do: {n, [fun_atom | acc]}, else: {n, acc}
+
+        node2, acc ->
+          {node2, acc}
+      end)
+
+    refs
+  end
+
+  # `{ref, {file, "name/arity"}}` for every lib/ file (escalation.ex
+  # excluded) and every one of its own functions that reaches Escalation —
+  # computed once for the whole tree rather than once per pinned ref, since
+  # the same walk answers every ref's question at the same time.
+  defp escalation_callers_by_file do
     Path.wildcard("lib/**/*.ex")
     |> Enum.reject(&(&1 == "lib/tightbeam/escalation.ex"))
     |> Enum.flat_map(fn file ->
-      slices = function_slices(file)
+      source = File.read!(file)
+      {:ok, ast} = Code.string_to_quoted(source, columns: true)
+      aliases = module_alias_map(ast)
+      defs = function_defs_from_ast(ast)
 
-      for {caller_ref, text} <- slices, text =~ "Escalation.#{ref}(" do
-        {file, caller_ref}
+      for {{name, arity}, nodes} <- defs,
+          refs = nodes |> Enum.flat_map(&escalation_refs_called(&1, aliases)) |> Enum.uniq(),
+          refs != [],
+          ref <- refs,
+          do: {ref, {file, "#{name}/#{arity}"}}
+    end)
+  end
+
+  defp imports_escalation?(file) do
+    {:ok, ast} = file |> File.read!() |> Code.string_to_quoted(columns: true)
+    aliases = module_alias_map(ast)
+
+    {_, hit?} =
+      Macro.prewalk(ast, false, fn
+        {:import, _, [{:__aliases__, _, parts} | _]} = node, acc ->
+          {node, acc or resolves_to_escalation?(parts, aliases)}
+
+        node, acc ->
+          {node, acc}
+      end)
+
+    hit?
+  end
+
+  # 3-arity `apply/3` sites anywhere in lib/ whose MODULE argument is not
+  # itself a literal (an atom or an `alias`-resolvable name) — the one shape
+  # this scan cannot resolve at all, because the target is decided at
+  # runtime and could be anything, Escalation included.
+  defp dynamic_apply_sites do
+    Path.wildcard("lib/**/*.ex")
+    |> Enum.flat_map(fn file ->
+      defs = function_defs(file)
+
+      for {{name, arity}, nodes} <- defs,
+          Enum.any?(nodes, &has_dynamic_apply?/1),
+          do: {file, "#{name}/#{arity}"}
+    end)
+  end
+
+  defp has_dynamic_apply?(node) do
+    {_, hit?} =
+      Macro.prewalk(node, false, fn
+        {:apply, _, [mod_arg, _fun_arg, _args_arg]} = n, acc ->
+          literal? = is_atom(mod_arg) or match?({:__aliases__, _, _}, mod_arg)
+          {n, acc or not literal?}
+
+        n, acc ->
+          {n, acc}
+      end)
+
+    hit?
+  end
+
+  # Parses each helper's OWN SQL text for its "kind" constraint and accepts
+  # only two EXCLUSIVE shapes: `kind = '<declared>'` for a single declared
+  # kind, or an explicit `kind IN (...)` list equal to a declared pair
+  # (order-insensitive, whitespace/case-normalized). An INSERT's positional
+  # `(..., kind, ...) VALUES (..., '<literal>', ...)` counts as an equality
+  # too (`file_agent_request/2` and `effort_insert_in_txn/2` set `kind` this
+  # way rather than filtering on it). Anything else — an extra IN member, an
+  # OR, a negation, or no recognizable constraint — is rejected with a named
+  # reason; the caller decides how to report it.
+  defp kind_predicate_shape(ref, text, declared_csv) do
+    sql =
+      text
+      |> own_sql_text()
+      |> String.replace("\\n", " ")
+      |> String.replace(~r/\s+/, " ")
+      |> String.trim()
+
+    declared =
+      declared_csv
+      |> String.split(",")
+      |> Enum.map(&(&1 |> String.trim() |> String.downcase()))
+
+    negations =
+      Regex.scan(~r/\bkind\s*(?:!=|<>)\s*'[a-z_]+'|\bkind\s+not\s+in\b|\bkind\s+is\s+not\b/i, sql)
+
+    eq_matches =
+      Regex.scan(~r/\bkind\s*=\s*'([a-z_]+)'/i, sql)
+      |> Enum.map(fn [_, v] -> String.downcase(v) end)
+
+    in_matches =
+      Regex.scan(~r/\bkind\s+in\s*\(\s*((?:'[a-z_]+'\s*,\s*)*'[a-z_]+')\s*\)/i, sql)
+      |> Enum.map(fn [_, list] ->
+        Regex.scan(~r/'([a-z_]+)'/i, list) |> Enum.map(fn [_, v] -> String.downcase(v) end)
+      end)
+
+    insert_matches = insert_kind_literals(sql)
+
+    cond do
+      negations != [] ->
+        {:error, "#{ref}: unrecognized kind-constraint shape (negation) in its own SQL text"}
+
+      length(declared) == 1 ->
+        [only] = declared
+        eqish = Enum.uniq(eq_matches ++ insert_matches)
+
+        if eqish == [only] and in_matches == [] do
+          :ok
+        else
+          {:error,
+           "#{ref}: pinned kind #{inspect(only)} but its own SQL constrains kind to " <>
+             "eq=#{inspect(eqish)} in=#{inspect(in_matches)} — expected exactly `kind = '#{only}'`"}
+        end
+
+      length(declared) == 2 ->
+        sorted_declared = Enum.sort(declared)
+        normalized_in = in_matches |> Enum.map(&Enum.sort/1) |> Enum.uniq()
+
+        if eq_matches ++ insert_matches == [] and normalized_in == [sorted_declared] do
+          :ok
+        else
+          {:error,
+           "#{ref}: pinned pair #{inspect(sorted_declared)} but its own SQL's kind shape is " <>
+             "eq=#{inspect(eq_matches ++ insert_matches)} in=#{inspect(normalized_in)} — " <>
+             "expected exactly one `kind IN (...)` matching the pair"}
+        end
+
+      true ->
+        {:error, "#{ref}: unsupported declared-kind arity #{inspect(declared)}"}
+    end
+  end
+
+  # `insert into decision_requests (..., kind, ...) values (..., 'x', ...)`:
+  # the literal at `kind`'s own column position, if any. Assumes no comma
+  # falls inside a quoted value in these queries (true of every INSERT this
+  # module writes today) — a conservative reading that only ever produces
+  # FEWER matches than are really there, never a false equality.
+  defp insert_kind_literals(sql) do
+    Regex.scan(~r/insert\s+into\s+decision_requests\s*\(([^)]*)\)\s*values\s*\(([^)]*)\)/i, sql)
+    |> Enum.flat_map(fn [_, cols, vals] ->
+      columns = cols |> String.split(",") |> Enum.map(&String.trim/1)
+      values = vals |> String.split(",") |> Enum.map(&String.trim/1)
+
+      case Enum.find_index(columns, &(&1 == "kind")) do
+        nil ->
+          []
+
+        idx ->
+          case Enum.at(values, idx) do
+            "'" <> rest ->
+              case String.split(rest, "'", parts: 2) do
+                [v, _] -> [String.downcase(v)]
+                _ -> []
+              end
+
+            _ ->
+              []
+          end
       end
     end)
+  end
+
+  # Every double-quoted or triple-quoted string literal inside a chunk of
+  # already-reconstructed (`Macro.to_string/1`) source — the same shape
+  # `sql_literals/1` looks for in a whole file, applied here to one
+  # function's own text so `kind_predicate_shape/3` parses only its actual
+  # SQL, not doc text or argument names that happen to contain "kind".
+  defp own_sql_text(text) do
+    Regex.scan(~r/"""(?:(?!""").)*"""|"[^"\n]*"/s, text)
+    |> List.flatten()
+    |> Enum.join(" ")
+  end
+
+  ## Teeth checks (Sol round 4): each one proves the HARDENED tripwire above
+  ## actually rejects the exact evasion it was built to close, on a small
+  ## synthetic fixture — never on the real escalation.ex, so these prove the
+  ## MECHANISM rather than today's snapshot of it.
+
+  test "TEETH (hole 1): a kind predicate widened past its declared scope is rejected, " <>
+         "not merely substring-matched" do
+    widened =
+      "\"SELECT id FROM decision_requests WHERE kind IN ('statute','agent') AND raiserId = ?1\""
+
+    assert {:error, message} = kind_predicate_shape(:fake_widened, widened, "statute")
+    assert message =~ "fake_widened"
+    assert message =~ "statute"
+
+    # Sanity: the exact declared shape (what the widened text used to pass
+    # AS, under the old bare `text =~ "'statute'"` substring check) still
+    # passes under the new one.
+    exact = "\"SELECT id FROM decision_requests WHERE kind = 'statute' AND raiserId = ?1\""
+    assert :ok = kind_predicate_shape(:fake_exact, exact, "statute")
+
+    # A pinned PAIR is equally strict: an extra IN member is rejected too.
+    widened_pair =
+      "\"SELECT COUNT(*) FROM decision_requests WHERE kind IN ('statute','effort','agent')\""
+
+    assert {:error, _} = kind_predicate_shape(:fake_pair, widened_pair, "statute,effort")
+
+    exact_pair =
+      "\"SELECT COUNT(*) FROM decision_requests WHERE kind IN ('statute','effort')\""
+
+    assert :ok = kind_predicate_shape(:fake_pair_ok, exact_pair, "statute,effort")
+  end
+
+  test "TEETH (hole 2): an assembled or attribute-derived table name is caught at the AST " <>
+         "level, where a Macro.to_string substring scan is blind to it" do
+    assembled_src = ~S'''
+    defmodule Fake.Assembled do
+      def evasive_reader(db, id) do
+        DB.query(db, "SELECT id FROM " <> "decision_" <> "requests" <> " WHERE id = ?1", [id])
+      end
+    end
+    '''
+
+    attribute_src = ~S'''
+    defmodule Fake.AttributeDerived do
+      @table "decision_requests"
+
+      def evasive_reader(db, id) do
+        DB.query(db, "SELECT id FROM #{@table} WHERE id = ?1", [id])
+      end
+    end
+    '''
+
+    for src <- [assembled_src, attribute_src] do
+      {:ok, ast} = Code.string_to_quoted(src, columns: true)
+      attrs = module_attrs_from_ast(ast)
+      defs = function_defs_from_ast(ast)
+      [{{:evasive_reader, 2}, nodes}] = Map.to_list(defs)
+
+      # THE HARDENED CHECK: fragment-level, attribute- and concatenation-aware.
+      frags = Enum.flat_map(nodes, &literal_fragments(&1, attrs))
+
+      assert Enum.any?(frags, &String.contains?(&1, "decision_requests")),
+             "the AST-level scan must catch this evasion: #{src}"
+
+      # THE OLD CHECK, for contrast: a plain substring scan over
+      # `Macro.to_string/1`'s reconstructed text — proven blind to it.
+      naive_text = Enum.map_join(nodes, "\n", &Macro.to_string/1)
+
+      refute own_sql_text(naive_text) =~ "decision_requests",
+             "a Macro.to_string substring scan was expected to MISS this evasion (that is " <>
+               "the bug being closed) but it caught it: #{src}"
+    end
+  end
+
+  test "TEETH (hole 2): a new arity overload of an already-pinned reader name is invisible " <>
+         "to a name-only pin but caught by an arity-aware one" do
+    overload_src = ~S'''
+    defmodule Fake.Overload do
+      def reader(db, id) do
+        DB.query(db, "SELECT id FROM decision_requests WHERE id = ?1", [id])
+      end
+
+      def reader(db, id, _extra) do
+        DB.query(db, "SELECT id FROM decision_requests WHERE id = ?1", [id])
+      end
+    end
+    '''
+
+    {:ok, ast} = Code.string_to_quoted(overload_src, columns: true)
+    attrs = module_attrs_from_ast(ast)
+    defs = function_defs_from_ast(ast)
+
+    direct_refs =
+      for {ref, nodes} <- defs,
+          frags = Enum.flat_map(nodes, &literal_fragments(&1, attrs)),
+          Enum.any?(frags, &String.contains?(&1, "decision_requests")),
+          into: MapSet.new(),
+          do: ref
+
+    assert direct_refs == MapSet.new([{:reader, 2}, {:reader, 3}])
+
+    # A NAME-ONLY pin (what round 2's hand-declared map, and round 3's
+    # derived-but-arity-collapsed map, both used) only ever pinned `:reader`
+    # once — it cannot distinguish "the one arity I reviewed" from "a second
+    # one nobody has".
+    name_only_pin = MapSet.new([:reader])
+    derived_names = for {name, _arity} <- direct_refs, into: MapSet.new(), do: name
+    assert derived_names == name_only_pin, "both arities collapse to the same pinned name"
+
+    # An ARITY-AWARE pin that only reviewed `reader/2` catches the new
+    # `reader/3` as a diff.
+    arity_aware_pin = MapSet.new([{:reader, 2}])
+    refute direct_refs == arity_aware_pin
+    assert MapSet.difference(direct_refs, arity_aware_pin) == MapSet.new([{:reader, 3}])
+  end
+
+  test "TEETH (hole 3): a capture-based external caller reaches Escalation invisibly to a " <>
+         "textual `Mod.fun(` scan" do
+    src = ~S'''
+    defmodule Fake.Caller do
+      alias Tightbeam.Escalation
+
+      def captured(db, ids) do
+        fun = &Escalation.consume/2
+        Enum.map(ids, fn id -> fun.(db, id) end)
+      end
+    end
+    '''
+
+    {:ok, ast} = Code.string_to_quoted(src, columns: true)
+    aliases = module_alias_map(ast)
+    defs = function_defs_from_ast(ast)
+    [{{:captured, 2}, nodes}] = Map.to_list(defs)
+
+    # THE HARDENED CHECK: AST-level, alias-resolved, capture-aware.
+    refs = nodes |> Enum.flat_map(&escalation_refs_called(&1, aliases)) |> Enum.uniq()
+    assert refs == [:consume], "the AST-level scan must catch a captured Escalation call"
+
+    # THE OLD CHECK, for contrast: `&Escalation.consume/2` has no trailing
+    # `(` — a literal `Escalation.consume(` scan was expected to MISS it.
+    naive_text = Enum.map_join(nodes, "\n", &Macro.to_string/1)
+
+    refute naive_text =~ "Escalation.consume(",
+           "a textual `Escalation.consume(` scan was expected to MISS this evasion (that is " <>
+             "the bug being closed) but it caught it"
+  end
+
+  test "TEETH (hole 3): apply/3 with a non-literal module argument is flagged, since it " <>
+         "cannot be ruled out as reaching Escalation" do
+    dynamic_src = ~S'''
+    defmodule Fake.DynamicApply do
+      def perform(worker, args) do
+        {mod, fun} = worker
+        apply(mod, fun, args)
+      end
+    end
+    '''
+
+    literal_src = ~S'''
+    defmodule Fake.LiteralApply do
+      def perform(args) do
+        apply(Tightbeam.Escalation, :consume, args)
+      end
+    end
+    '''
+
+    {:ok, dynamic_ast} = Code.string_to_quoted(dynamic_src, columns: true)
+    [{{:perform, 2}, dynamic_nodes}] = dynamic_ast |> function_defs_from_ast() |> Map.to_list()
+    assert Enum.any?(dynamic_nodes, &has_dynamic_apply?/1)
+
+    {:ok, literal_ast} = Code.string_to_quoted(literal_src, columns: true)
+    [{{:perform, 1}, literal_nodes}] = literal_ast |> function_defs_from_ast() |> Map.to_list()
+    refute Enum.any?(literal_nodes, &has_dynamic_apply?/1)
   end
 
   test "the statute gate read cannot be reached by an agent row sharing its raiser",
