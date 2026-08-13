@@ -358,6 +358,19 @@ defmodule Tightbeam.Assignments do
   VERDICT-CARRYING one, the pre-existing independence guard still applies to it
   verbatim — a self-held latest round still disqualifies, so a holder cannot
   launder its own verdict past an earlier independent one.
+
+  SINGLE SOURCE OF TRUTH FOR THE WINNING VERDICT (Sol xhigh review round 2):
+  reopening lets ONE card carry more than one verdict over its life — file
+  reviewed-clean, close, reopen, file changes-requested — so "which round"
+  and "which verdict on that round" cannot be two independently-computed
+  answers; a query that picks the round by its latest verdict and then
+  RE-DERIVES a kind by scanning that round's verdicts again is a second
+  computation that has to agree with the first by construction rather than by
+  identity. Each candidate round is joined to the exact `attests` ROW its
+  ordering was computed from (`latestVerdictRowid`), and `latestVerdictKind`
+  is read off that same row — not recomputed. A round with no holder verdict
+  fails the join (the correlated subquery returns NULL, which no rowid
+  equals) exactly where the old `EXISTS` clause excluded it.
   """
   @spec qualifying_review_verdict_kinds(DB.server(), String.t(), String.t()) :: [String.t()]
   def qualifying_review_verdict_kinds(db, assignment_id, assignment_holder_key) do
@@ -369,16 +382,12 @@ defmodule Tightbeam.Assignments do
           SELECT
             r.id,
             r.holderKey,
-            (
-              SELECT v.ts
-              FROM attests AS v
-              WHERE v.assignmentId = r.id
-                AND v.kind = 'verdict'
-                AND v.bySession = r.holderKey
-              ORDER BY v.ts DESC, v.rowid DESC
-              LIMIT 1
-            ) AS latestVerdictTs,
-            (
+            lv.ts AS latestVerdictTs,
+            lv.rowid AS latestVerdictRowid,
+            lv.verdictKind AS latestVerdictKind
+          FROM assignments AS r
+          JOIN attests AS lv
+            ON lv.rowid = (
               SELECT v.rowid
               FROM attests AS v
               WHERE v.assignmentId = r.id
@@ -386,31 +395,15 @@ defmodule Tightbeam.Assignments do
                 AND v.bySession = r.holderKey
               ORDER BY v.ts DESC, v.rowid DESC
               LIMIT 1
-            ) AS latestVerdictRowid
-          FROM assignments AS r
-          WHERE r.reviewsAssignmentId = ?1
-            AND EXISTS (
-              SELECT 1
-              FROM attests AS held
-              WHERE held.assignmentId = r.id
-                AND held.kind = 'verdict'
-                AND held.bySession = r.holderKey
             )
+          WHERE r.reviewsAssignmentId = ?1
           ORDER BY latestVerdictTs DESC, latestVerdictRowid DESC
           LIMIT 1
         )
-        SELECT 'reviewed-clean'
+        SELECT latestVerdictKind
         FROM latest_review AS r
         WHERE r.holderKey != ?2
-          AND (
-          SELECT v.verdictKind
-          FROM attests AS v
-          WHERE v.assignmentId = r.id
-            AND v.kind = 'verdict'
-            AND v.bySession = r.holderKey
-          ORDER BY v.ts DESC, v.rowid DESC
-          LIMIT 1
-          ) = 'reviewed-clean'
+          AND latestVerdictKind = 'reviewed-clean'
         """,
         [assignment_id, assignment_holder_key]
       )

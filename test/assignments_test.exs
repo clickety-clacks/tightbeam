@@ -1489,6 +1489,57 @@ defmodule Tightbeam.AssignmentsTest do
            ]
   end
 
+  # Sol xhigh review round 2: the reverse direction of finding 1, and on the
+  # SAME card rather than across two. Reopening lets one round carry more than
+  # one verdict over its life, so "which round governs" and "which verdict on
+  # that round governs" must come from the SAME row, not two independently
+  # computed answers that happen to agree today. File reviewed-clean, close,
+  # reopen, then file a NEWER changes-requested on the very same round — the
+  # latest verdict must win WITHIN the card too, not just across cards.
+  test "a newer changes-requested on a reopened card outranks its own earlier reviewed-clean (Sol xhigh review round 2)",
+       ctx do
+    producer = handle(ctx, "assign", assign_call({:session, "holder"}, "same-card producer"))
+
+    review =
+      assign_call({:session, "other-session"}, "same-card review")
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :reviews_assignment_id], producer.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    _ =
+      attest_call({:session, "other-session"}, review.id, "verdict")
+      |> put_in([:params, :verdict_kind], "reviewed-clean")
+      |> then(&handle(ctx, "attest", &1))
+
+    _ = handle(ctx, "attest", attest_call({:session, "other-session"}, review.id, "completion"))
+
+    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == [
+             "reviewed-clean"
+           ]
+
+    reopened =
+      handle(
+        ctx,
+        "reopen-assignment",
+        reopen_call(
+          {:session, "other-session"},
+          review.id,
+          "re-review found problems the first pass missed"
+        )
+      )
+
+    assert reopened.state == "open"
+
+    _ =
+      attest_call({:session, "other-session"}, review.id, "verdict")
+      |> put_in([:params, :verdict_kind], "changes-requested")
+      |> then(&handle(ctx, "attest", &1))
+
+    # The newer changes-requested on THIS SAME card must win — the stale
+    # reviewed-clean must not still qualify completion.
+    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == []
+  end
+
   # Sol xhigh review, Minimality section: an untested boundary the review
   # itself named — an earlier INDEPENDENT reviewed-clean followed by a later
   # SELF-HELD, verdictless round. Completion was denied before the shipped
