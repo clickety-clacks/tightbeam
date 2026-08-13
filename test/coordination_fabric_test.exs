@@ -391,6 +391,11 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert detail =~ "members=1"
     assert detail =~ "trigger=ceiling"
     assert Wakes.get(db, digest_id).prompt =~ "coalesced by #{Wakes.digest_rule()}"
+
+    # O5 follow-up (Sol xhigh review, finding 2): `digest-members` needs a
+    # wake id no other sanctioned surface hands an agent — the delivered
+    # digest signs itself with its OWN id, right after the rule signature.
+    assert Wakes.get(db, digest_id).prompt =~ "wake #{digest_id}"
   end
 
   test "a digest carrier is not itself held, and materializing twice carries nothing twice",
@@ -1079,7 +1084,17 @@ defmodule Tightbeam.CoordinationFabricTest do
     seed_session(db, "agent:stranger", "outsider")
 
     member = schedule(db, session: "agent:po", class: "fyi", prompt: "the build finished")
-    assert [digest_id] = Wakes.materialize_digests(db, member.due_at)
+    assert [materialized_id] = Wakes.materialize_digests(db, member.due_at)
+
+    # THE SANCTIONED DISCOVERY PATH (Sol xhigh review, finding 2): an agent
+    # reading the delivered digest never sees `materialize_digests/2`'s
+    # return value — it reads the message the batcher signed, which now
+    # names its own wake id in the signature line. Parse it out exactly as a
+    # recipient would, and drive `digest-members` from THAT id, not the
+    # internal one, to prove the whole discovery path an agent actually has.
+    delivered_prompt = Wakes.get(db, materialized_id).prompt
+    [digest_id] = Regex.run(~r/wake (w_[0-9a-f-]+)/, delivered_prompt, capture: :all_but_first)
+    assert digest_id == materialized_id
 
     assert {:ok, %{digest_members: members}} =
              verb(db, {:user, "owner"}, "digest-members", %{wake_id: digest_id})

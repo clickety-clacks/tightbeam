@@ -1677,13 +1677,20 @@ defmodule Tightbeam.Wakes do
     {class, target_label, carrier_fields} = carrier_shape(txn, group_key)
     {work_item_id, assignment_id} = shared_work(members)
 
+    # MINTED HERE, not left to `schedule_in_txn`'s default (O5 follow-up: Sol
+    # xhigh review, finding 2 — `digest-members` needs a wake id no agent
+    # could otherwise discover). Minting it before the prompt is built is
+    # what lets the delivered digest sign itself with its OWN id.
+    carrier_wake_id = "w_" <> Tightbeam.Id.uuid4()
+
     digest =
       schedule_in_txn(
         txn,
         Map.merge(
           %{
+            wake_id: carrier_wake_id,
             origin: "process:tightbeam",
-            prompt: digest_prompt(class, members),
+            prompt: digest_prompt(class, members, carrier_wake_id),
             due_at: at,
             class: class,
             digest: true,
@@ -1778,8 +1785,10 @@ defmodule Tightbeam.Wakes do
   # THE BRIEF. Every payload appears in full and in filing order; the digest
   # summarizes nothing, because an optimization that loses rows is wrong. The
   # signature names the rule and its revision so a reader knows which reflex to
-  # inhibit (§8 legibility).
-  defp digest_prompt(class, members) do
+  # inhibit (§8 legibility) — and now names the carrier's OWN wake id (O5
+  # follow-up), so the recipient can ask `digest-members <id>` about the
+  # payload it just received without any surface but the message itself.
+  defp digest_prompt(class, members, wake_id) do
     body =
       members
       |> Enum.with_index(1)
@@ -1796,7 +1805,7 @@ defmodule Tightbeam.Wakes do
       end)
       |> Enum.join("\n")
 
-    "[digest] #{digest_signature(length(members))}\n\n#{body}"
+    "[digest] #{digest_signature(length(members))} wake #{wake_id}\n\n#{body}"
   end
 
   @doc """
