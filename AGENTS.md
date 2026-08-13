@@ -52,6 +52,23 @@ CULTURE = kungfu (domain). See shared specs coordination-fabric-v1.md.
     compress to one load-bearing sentence consistent with the nine above, be
     suspicious of the mechanism.
 
+## WHERE THE SPECS LIVE (read before designing anything)
+
+The spec commons is its own repo: github.com/clickety-clacks/tightbeam-specs
+(gibson clone ~/src/tightbeam-specs; canonical checkout on the NFS at
+eezo:~/shared-workspace/shared/specs/tightbeam). For 0.2 work start with:
+- `v0.2-program-2026-08-12.md` — the program: rulings, staffing, phases,
+  election ledgers, org-pause state. The record of every decision.
+- `coordination-fabric-v1.md` — the design authority for the fabric.
+- `0.2-build-ledger.md` — one entry per landing on main; review evidence
+  goes there BEFORE the push.
+- `0.2-orchestrator-handoff.md` — full context transfer incl. environment
+  map and working norms. Read it before doing ANY 0.2 program work.
+- `tightbeam.md` — the spec hub for the wider corpus; `tightbeam-decisions.md`
+  — the decisions ledger.
+The 0.2 orchestrator runs in tmux session `tb02` on gibson
+(`tmux attach -t tb02`) — coordinate 0.2 work through it, don't duplicate it.
+
 ## ACP / harness facts (for anyone touching the adapter layer)
 
 - **Zed is the ACP reference implementation.** For ANY protocol capability/semantics
