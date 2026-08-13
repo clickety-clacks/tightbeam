@@ -32,7 +32,8 @@ defmodule Tightbeam.Dispatch do
     Placement,
     RailEpisodes,
     RailRemedy,
-    Rules
+    Rules,
+    Supervision
   }
 
   @typedoc """
@@ -62,6 +63,11 @@ defmodule Tightbeam.Dispatch do
 
   @type handlers :: %{optional(String.t()) => handler()}
 
+  @type policy_denial_transition :: %{
+          required(:kind) => String.t(),
+          required(:evaluation_clock) => non_neg_integer()
+        }
+
   @doc """
   Dispatch a call through the handler table. Unknown verb → `{:error,
   %{code: "unknown_verb"}}` + a "denied" event. Handler returning `%{code: _}`
@@ -72,14 +78,47 @@ defmodule Tightbeam.Dispatch do
   @spec dispatch(GenServer.server(), handlers(), call()) ::
           {:ok, map()} | {:error, map()} | {:decision_pending, String.t()}
   def dispatch(db \\ Tightbeam.DB, handlers, call) do
+    dispatch_call(db, handlers, call, nil)
+  end
+
+  @doc """
+  Dispatch a supervision call through the same rail as `dispatch/3`.
+
+  A policy denial commits its denied event and the supplied liveness transition
+  together. The assignment is derived from the call, so the event and transition
+  cannot name different assignments. Other outcomes retain the `dispatch/3`
+  behavior and return shapes.
+  """
+  @spec dispatch_with_policy_denial_transition(
+          GenServer.server(),
+          handlers(),
+          call(),
+          policy_denial_transition()
+        ) :: {:ok, map()} | {:error, map()} | {:decision_pending, String.t()}
+  def dispatch_with_policy_denial_transition(
+        db,
+        handlers,
+        %{params: %{assignment_id: assignment_id}} = call,
+        %{
+          kind: "policy_denied",
+          evaluation_clock: evaluation_clock
+        } = transition
+      )
+      when map_size(transition) == 2 and is_binary(assignment_id) and
+             is_integer(evaluation_clock) and evaluation_clock >= 0 do
+    dispatch_call(db, handlers, call, Map.put(transition, :assignment_id, assignment_id))
+  end
+
+  defp dispatch_call(db, handlers, call, policy_denial_transition) do
     verb = Map.fetch!(call, :verb)
     origin = Map.fetch!(call, :origin)
     principal = Map.get(call, :principal)
     session_key = Map.get(call, :session_key)
+    audit = {verb, origin, principal, session_key, policy_denial_transition}
 
     case bracket_precheck(db, call, verb) do
       :proceed ->
-        dispatch_through_rail(db, handlers, call, verb, origin, principal, session_key)
+        dispatch_through_rail(db, handlers, call, audit)
 
       {:replay, assignment} ->
         # A keyed replay bypasses the rail entirely (statute inertness): the
@@ -104,19 +143,24 @@ defmodule Tightbeam.Dispatch do
 
   defp bracket_precheck(_db, _call, _verb), do: :proceed
 
-  defp dispatch_through_rail(db, handlers, call, verb, origin, principal, session_key) do
+  defp dispatch_through_rail(
+         db,
+         handlers,
+         call,
+         {_verb, _origin, _principal, _session_key, _transition} = audit
+       ) do
     {decision, to_close, to_consume} = Rules.decide(db, call)
     Enum.each(to_close, &close(db, &1))
 
     case decision do
       {:deny, error} ->
-        best_effort_denial(db, verb, origin, principal, session_key, error)
+        record_policy_denial(db, audit, error)
         {:error, error}
 
       {:remedy, statute, ref, error} ->
         outcome = RailRemedy.fire(db, handlers, statute, ref, call)
         error = remedy_error(error, outcome)
-        best_effort_denial(db, verb, origin, principal, session_key, error)
+        record_policy_denial(db, audit, error)
         {:error, error}
 
       {:escalate, statute, ctx, dr_id} ->
@@ -126,7 +170,7 @@ defmodule Tightbeam.Dispatch do
             id -> {:decision_pending, id}
           end
 
-        best_effort_denial(db, verb, origin, principal, session_key, ctx.error)
+        record_policy_denial(db, audit, ctx.error)
         outcome
 
       # A sensor malfunction denies AND summons (§A3). The caller gets the denial it
@@ -137,7 +181,7 @@ defmodule Tightbeam.Dispatch do
       # cannot raise: the summons is subordinate to the deny (§B3), so an unreachable
       # mind is a recorded gap and never a crashed call.
       {:deny_escalate, statute, ctx} ->
-        best_effort_denial(db, verb, origin, principal, session_key, ctx.error)
+        record_policy_denial(db, audit, ctx.error)
         :ok = RailEpisodes.summon(db, call, statute, Map.put(ctx, :dr_id, nil))
         {:error, ctx.error}
 
@@ -146,7 +190,7 @@ defmodule Tightbeam.Dispatch do
 
         case Enum.find(consumed, fn {_id, won?} -> not won? end) do
           nil ->
-            dispatch_to_handler(db, handlers, call, verb, origin, principal, session_key)
+            dispatch_to_handler(db, handlers, call, audit)
 
           {lost_id, false} ->
             error = %{
@@ -161,7 +205,7 @@ defmodule Tightbeam.Dispatch do
               message: "ruling authorization was no longer available"
             }
 
-            best_effort_denial(db, verb, origin, principal, session_key, error)
+            record_policy_denial(db, audit, error)
             {:error, error}
         end
     end
@@ -177,7 +221,12 @@ defmodule Tightbeam.Dispatch do
   defp close(db, {statute, subject, occurrence}),
     do: RailRemedy.close(db, statute, subject, occurrence)
 
-  defp dispatch_to_handler(db, handlers, call, verb, origin, principal, session_key) do
+  defp dispatch_to_handler(
+         db,
+         handlers,
+         call,
+         {verb, origin, principal, session_key, _transition} = audit
+       ) do
     case Map.fetch(handlers, verb) do
       :error ->
         error = %{code: "unknown_verb"}
@@ -192,7 +241,7 @@ defmodule Tightbeam.Dispatch do
 
         case invoke(handler, handler_call) do
           {:returned, %{code: _} = error} ->
-            :ok = EventLog.append_event(db, "denied", verb, origin, session_key, error, principal)
+            record_handler_denial(db, audit, error)
             {:error, error}
 
           {:returned, {:accepted_in_txn, event_id, %{canceled: true} = result}}
@@ -289,6 +338,53 @@ defmodule Tightbeam.Dispatch do
     catch
       _kind, _reason -> :ok
     end
+  end
+
+  defp record_policy_denial(
+         db,
+         {verb, origin, principal, session_key, transition},
+         %{code: code} = error
+       )
+       when code in ["rule_denied", "rule_error"] and not is_nil(transition) do
+    case DB.transaction(db, fn txn ->
+           event_id =
+             EventLog.append_event_in_txn(
+               txn,
+               "denied",
+               verb,
+               origin,
+               session_key,
+               error,
+               principal,
+               System.system_time(:millisecond)
+             )
+
+           Supervision.transition_in_txn(txn, Map.put(transition, :event_id, event_id))
+         end) do
+      {:ok, _transition_result} -> :ok
+      {:error, exception} -> raise exception
+    end
+  end
+
+  defp record_policy_denial(db, {verb, origin, principal, session_key, _transition}, error) do
+    best_effort_denial(db, verb, origin, principal, session_key, error)
+  end
+
+  defp record_handler_denial(
+         db,
+         {_verb, _origin, _principal, _session_key, transition} = audit,
+         %{code: code} = error
+       )
+       when code in ["rule_denied", "rule_error"] and not is_nil(transition) do
+    record_policy_denial(db, audit, error)
+  end
+
+  defp record_handler_denial(
+         db,
+         {verb, origin, principal, session_key, _transition},
+         error
+       ) do
+    :ok = EventLog.append_event(db, "denied", verb, origin, session_key, error, principal)
   end
 
   defp invoke(handler, call) do
