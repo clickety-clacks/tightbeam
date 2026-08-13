@@ -1476,15 +1476,21 @@ defmodule Tightbeam.CoordinationFabricTest do
   # (`alias Tightbeam.Escalation`, one segment) but not a PREFIX alias
   # (`alias Tightbeam, as: TB` then `TB.Escalation.consume(...)`, where the
   # alias covers only the leading segment and `:Escalation` rides along
-  # unresolved as literal text of its own). A leading `:Elixir` segment is
-  # stripped both BEFORE expansion (a call site spelled out
-  # `Elixir.Tightbeam.Escalation.consume(...)` directly, Sol round 6, finding
-  # 2) and AFTER it (an `alias` statement that itself named the target with
-  # an explicit `Elixir.` prefix) — `Elixir.Foo` and `Foo` name the exact
-  # same module; only the AST shape differs.
+  # unresolved as literal text of its own). A reference whose ORIGINAL
+  # leading segment is `:Elixir` is an ABSOLUTE module path (Sol round 7):
+  # `Elixir.Tightbeam.Escalation` names exactly Tightbeam.Escalation
+  # regardless of any local alias, so it must NOT undergo alias expansion —
+  # a local `alias Fake.Other, as: Tightbeam` would otherwise expand the
+  # stripped prefix and hide the real call. Relative references still
+  # expand, and an alias's own target may carry an explicit `Elixir.`
+  # prefix, stripped after expansion — `Elixir.Foo` and `Foo` name the
+  # exact same module; only the AST shape differs.
+  defp resolves_to_escalation?([:"Elixir" | rest], _aliases) do
+    drop_leading_elixir(rest) == [:Tightbeam, :Escalation]
+  end
+
   defp resolves_to_escalation?(parts, aliases) do
     parts
-    |> drop_leading_elixir()
     |> expand_alias_prefix(aliases)
     |> drop_leading_elixir() == [:Tightbeam, :Escalation]
   end
@@ -2373,6 +2379,66 @@ defmodule Tightbeam.CoordinationFabricTest do
     [{{:perform, 2}, dynamic_nodes}] = dynamic_ast |> function_defs_from_ast() |> Map.to_list()
 
     assert Enum.any?(dynamic_nodes, &has_escalation_apply_with_dynamic_function?(&1, aliases_b))
+  end
+
+  test "TEETH (round 7): an ABSOLUTE `Elixir.`-prefixed reference bypasses local alias " <>
+         "expansion — a hostile `alias Fake.Other, as: Tightbeam` cannot hide the real call" do
+    hostile_src = ~S'''
+    defmodule Fake.HostileAliasShadow do
+      alias Fake.Other, as: Tightbeam
+
+      def perform(db, id) do
+        apply(Elixir.Tightbeam.Escalation, :consume, [db, id])
+      end
+
+      def sanity(db, id) do
+        # the shadowing alias DOES apply to relative references — this one
+        # really is Fake.Other.Escalation, not ours
+        Tightbeam.Escalation.consume(db, id)
+      end
+    end
+    '''
+
+    {:ok, ast} = Code.string_to_quoted(hostile_src, columns: true)
+    aliases = module_alias_map(ast)
+    defs = function_defs_from_ast(ast)
+
+    # THE HARDENED CHECK: the absolute reference in perform/2 resolves to the
+    # real Escalation despite the shadowing alias...
+    [{{:perform, 2}, perform_nodes}] = defs |> Enum.filter(&match?({{:perform, 2}, _}, &1))
+    refs = perform_nodes |> Enum.flat_map(&escalation_refs_called(&1, aliases)) |> Enum.uniq()
+    assert refs == [:consume]
+
+    # ...while the RELATIVE reference in sanity/2 expands through the alias to
+    # Fake.Other.Escalation and is correctly NOT attributed to ours.
+    [{{:sanity, 2}, sanity_nodes}] = defs |> Enum.filter(&match?({{:sanity, 2}, _}, &1))
+    assert sanity_nodes |> Enum.flat_map(&escalation_refs_called(&1, aliases)) == []
+
+    # THE OLD CHECK, for contrast (Sol round 7): strip-then-expand let the
+    # shadowing alias capture the stripped prefix and MISS the real call.
+    strip_then_expand = fn parts ->
+      parts
+      |> drop_leading_elixir()
+      |> expand_alias_prefix(aliases)
+      |> drop_leading_elixir() == [:Tightbeam, :Escalation]
+    end
+
+    naive_refs =
+      elem(
+        Macro.prewalk(hd(perform_nodes), [], fn
+          {:apply, _, [{:__aliases__, _, parts}, fun_atom, _args]} = n, acc
+          when is_atom(fun_atom) ->
+            if strip_then_expand.(parts), do: {n, [fun_atom | acc]}, else: {n, acc}
+
+          n, acc ->
+            {n, acc}
+        end),
+        1
+      )
+
+    assert naive_refs == [],
+           "the strip-then-expand resolver was expected to MISS the absolute reference under " <>
+             "a shadowing alias (that is the evasion being closed) but it caught it"
   end
 
   test "TEETH (round 6, finding 3): an edited unscoped-literal function fails its pin's hash, " <>
