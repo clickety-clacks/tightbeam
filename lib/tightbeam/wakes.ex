@@ -1674,7 +1674,7 @@ defmodule Tightbeam.Wakes do
   end
 
   defp materialize_members(txn, group_key, reason, at, members) do
-    {class, target_label, carrier_fields} = carrier_shape(txn, group_key)
+    {class, target_label, carrier_fields, pinned_owner} = carrier_shape(txn, group_key)
     {work_item_id, assignment_id} = shared_work(members)
 
     # MINTED HERE, not left to `schedule_in_txn`'s default (O5 follow-up: Sol
@@ -1730,11 +1730,20 @@ defmodule Tightbeam.Wakes do
       "wake_digest_materialized",
       digest.wake_id,
       "rule=#{@digest_rule} target=#{target_label} class=#{class} members=#{carried} " <>
-        "trigger=#{reason}"
+        "trigger=#{reason}" <> pinned_owner_field(pinned_owner)
     )
 
     digest.wake_id
   end
+
+  # PIN THE PAST (specs roles-registry-v1.md:31 — Sol xhigh review round 2):
+  # a role carrier's authority fact is decided HERE, once, in the SAME
+  # transaction as the carrier itself, and never re-derived from a live role
+  # lookup later. `nil` for a session group (there is no role to pin; the
+  # carrier's own `sessionKey` already IS the pinned fact, durably, since
+  # sessions are never hard-deleted).
+  defp pinned_owner_field(nil), do: ""
+  defp pinned_owner_field(owner), do: " ownerUserId=#{owner}"
 
   # THE CARRIER'S OWN TARGET (O2). A session group's carrier addresses that
   # session directly, exactly as before. A role group's carrier carries
@@ -1745,8 +1754,15 @@ defmodule Tightbeam.Wakes do
   # value (the column is NOT NULL) but delivery never reads it once
   # `targetRole` is set; it names the role's CURRENT resolution, audit-only,
   # never a fallback if that resolution later fails.
+  #
+  # THE FOURTH ELEMENT is the role's owner AT THIS MOMENT — read directly
+  # off the `roles` table, once, here — for `materialize_members/4` to pin
+  # into the SAME transaction's `wake_digest_materialized` lifecycle event.
+  # A session group has no role, so it pins nothing (gateway.ex's read path
+  # never needs it: `Org.get/2` on a real, permanently-resolvable session
+  # already answers the ownership question for that case).
   defp carrier_shape(_txn, {:session, session_key, class}),
-    do: {class, session_key, %{session_key: session_key}}
+    do: {class, session_key, %{session_key: session_key}, nil}
 
   defp carrier_shape(txn, {:role, role, class}) do
     session_key =
@@ -1755,7 +1771,14 @@ defmodule Tightbeam.Wakes do
         nil -> "role:#{role}"
       end
 
-    {class, "role:#{role}", %{session_key: session_key, target_role: role}}
+    {class, "role:#{role}", %{session_key: session_key, target_role: role}, role_owner(txn, role)}
+  end
+
+  defp role_owner(txn, role) do
+    case Txn.q(txn, "SELECT ownerUserId FROM roles WHERE name=?1", [role]) do
+      [[owner]] -> owner
+      [] -> nil
+    end
   end
 
   # O4 ROOT CAUSE: the carrier inherits the group's linked work WHEN EVERY

@@ -5143,27 +5143,52 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  # A ROLE-addressed carrier's `sessionKey` is audit-only (O2) — and for a
-  # role with no active resolution, it is the synthetic `role:<name>` string
-  # `Wakes.carrier_shape/2` stores, which names no real session at all. Sol
-  # xhigh review, finding 4: gating visibility on `Org.get/2` of that column
-  # made an ORPHANED role carrier's audit permanently `not_found`, even to
-  # the role's own owner — a durable row with no lawful reader. The ROLE
-  # record (not the session it may or may not currently resolve to) is the
-  # actual source of truth for who may read it, so a role-addressed carrier
-  # checks the ROLE's owner directly; a session-addressed carrier keeps the
-  # exact rule it always had.
-  defp digest_members_readable?(db, call, %{target_role: role}) when is_binary(role) do
-    case Roles.get(db, role) do
-      %{owner_user_id: owner} -> owner_readable?(db, call, owner)
-      nil -> false
+  # PIN THE PAST, NEVER READ THE PRESENT (specs roles-registry-v1.md:31 —
+  # Sol xhigh review round 2, finding: a LIVE `Roles.get/2` at read time
+  # bound audit authority to a deletable, name-reusable row. After
+  # `role-rm`, `Roles.get/2` returns nil and denied EVERYONE, admin
+  # included; after delete-then-recreate under a different owner, the same
+  # live lookup silently handed the NEW owner read access to the OLD
+  # carrier's members — a fact that was never true).
+  #
+  # A carrier whose `sessionKey` resolves through `Org.get/2` was pinned to
+  # a REAL session at materialization (O2's `carrier_shape/2` puts it there
+  # directly, for a role that resolved at that moment) — sessions are never
+  # hard-deleted, so this resolves for the life of the row, and reading it
+  # needs no role lookup at all: the pinned session's owner already answers
+  # the question. Only a carrier built while its role had NO active
+  # resolution — the synthetic `role:<name>` placeholder, which never
+  # resolves through `Org.get/2` — falls through to the fact
+  # `materialize_members/4` pinned into the SAME transaction's
+  # `wake_digest_materialized` lifecycle event: the role's owner AT THAT
+  # MOMENT, durable regardless of anything that happens to the role
+  # afterward.
+  defp digest_members_readable?(db, call, wake) do
+    case Org.get(db, wake.session_key) do
+      nil -> owner_readable?(db, call, pinned_carrier_owner(db, wake.wake_id))
+      session -> coordination_share_readable?(db, call, session)
     end
   end
 
-  defp digest_members_readable?(db, call, wake) do
-    case Org.get(db, wake.session_key) do
-      nil -> false
-      session -> coordination_share_readable?(db, call, session)
+  # `owner_readable?/3`'s `{:user, id}` clause always falls through to
+  # `admin_origin?/2` regardless of whether `owner_user_id` matched — so
+  # this reads correctly even when no pinned fact exists at all (a `nil`
+  # owner never matches a real user id, and the admin path is still
+  # reached): the deny-on-nil case never precedes the admin check.
+  defp pinned_carrier_owner(db, wake_id) do
+    case DB.query(
+           db,
+           "SELECT detail FROM lifecycle_events WHERE kind = 'wake_digest_materialized' AND subject = ?1",
+           [wake_id]
+         ) do
+      {:ok, [[detail]]} ->
+        case Regex.run(~r/ ownerUserId=(\S+)/, detail) do
+          [_, owner] -> owner
+          nil -> nil
+        end
+
+      _ ->
+        nil
     end
   end
 

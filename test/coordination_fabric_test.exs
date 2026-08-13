@@ -1167,6 +1167,136 @@ defmodule Tightbeam.CoordinationFabricTest do
              verb(db, {:user, "outsider2"}, "digest-members", %{wake_id: digest_id})
   end
 
+  test "O5 follow-up (round 2): a role-rm'd carrier stays readable by its pinned owner and by admin",
+       %{db: db} do
+    # Sol xhigh review round 2: a LIVE `Roles.get/2` at read time bound audit
+    # authority to a deletable row — after `role-rm`, that lookup returns
+    # nil and (in the prior fix) denied EVERYONE, admin included. Authority
+    # must be PINNED at materialization, not re-derived from whatever the
+    # role happens to be right now (specs roles-registry-v1.md:31).
+    seed_session(db, "agent:filer3", "roleowner3")
+    seed_session(db, "agent:stranger3", "outsider3")
+
+    Roles.create!(db, "rm-role", "roleowner3", nil)
+
+    member =
+      Wakes.schedule(db, %{
+        session_key: "agent:filer3",
+        target_role: "rm-role",
+        origin: "agent:sender",
+        creator_session_key: "agent:sender",
+        prompt: "for whoever holds rm-role",
+        due_at: 0,
+        class: "fyi"
+      })
+
+    at = member.created_at + Wakes.delivery_policy("fyi").ceiling_ms
+    assert [digest_id] = Wakes.materialize_digests(db, at)
+
+    # The role is removed AFTER materialization — a live lookup now finds
+    # nothing at all for it.
+    assert :ok = Roles.rm(db, "rm-role")
+    refute Roles.get(db, "rm-role")
+
+    # The pinned owner still reads it.
+    assert {:ok, %{digest_members: members}} =
+             verb(db, {:user, "roleowner3"}, "digest-members", %{wake_id: digest_id})
+
+    assert Enum.map(members, & &1.wake_id) == [member.wake_id]
+
+    # ADMIN ALWAYS HAS A PATH, regardless of role lifecycle — the
+    # deny-on-nil case must never precede the admin check.
+    assert {:ok, %{digest_members: _}} = admin_call(db, "digest-members", %{wake_id: digest_id})
+
+    # A stranger is still refused.
+    assert {:error, %{code: "not_found"}} =
+             verb(db, {:user, "outsider3"}, "digest-members", %{wake_id: digest_id})
+  end
+
+  test "O5 follow-up (round 2): a role deleted then recreated under a different owner does not carry the old carrier's audit",
+       %{db: db} do
+    # THE NAME-REUSE ATTACK Sol proved against the prior fix: a live
+    # `Roles.get(db, role)` by NAME silently handed a NEW owner read access
+    # to an OLD carrier's members, a fact that was never true. The pinned
+    # owner fact — recorded once, at materialization — cannot be reassigned
+    # by deleting and recreating the name.
+    seed_session(db, "agent:filer4", "original-owner")
+    seed_session(db, "agent:filer4b", "new-owner")
+
+    Roles.create!(db, "reused-role", "original-owner", nil)
+
+    member =
+      Wakes.schedule(db, %{
+        session_key: "agent:filer4",
+        target_role: "reused-role",
+        origin: "agent:sender",
+        creator_session_key: "agent:sender",
+        prompt: "for whoever holds reused-role",
+        due_at: 0,
+        class: "fyi"
+      })
+
+    at = member.created_at + Wakes.delivery_policy("fyi").ceiling_ms
+    assert [digest_id] = Wakes.materialize_digests(db, at)
+
+    # The role is deleted and a NEW role, same name, is created for a
+    # different owner — the NAME is reused, the identity is not.
+    assert :ok = Roles.rm(db, "reused-role")
+    Roles.create!(db, "reused-role", "new-owner", nil)
+
+    # The ORIGINAL owner still reads the OLD carrier's audit.
+    assert {:ok, %{digest_members: _}} =
+             verb(db, {:user, "original-owner"}, "digest-members", %{wake_id: digest_id})
+
+    # The NEW owner does NOT gain access to a carrier it never made.
+    assert {:error, %{code: "not_found"}} =
+             verb(db, {:user, "new-owner"}, "digest-members", %{wake_id: digest_id})
+  end
+
+  test "O5 follow-up (round 2): a resolved role carrier reads through its pinned sessionKey, never a live role lookup",
+       %{db: db} do
+    # REGRESSION PIN: before Sol's round-2 finding, a role that RESOLVED at
+    # materialization was readable through the carrier's own pinned
+    # sessionKey (O2) — the fix for the orphaned case must not regress this,
+    # provably: the role is removed entirely before the read, so only the
+    # pinned session (never hard-deleted) can be answering the question.
+    seed_session(db, "agent:holder5", "sessionowner5")
+    seed_session(db, "agent:stranger5", "outsider5")
+
+    Roles.create!(db, "resolved-role", "sessionowner5", "agent:holder5")
+
+    member =
+      Wakes.schedule(db, %{
+        session_key: "agent:holder5",
+        target_role: "resolved-role",
+        origin: "agent:sender",
+        creator_session_key: "agent:sender",
+        prompt: "for whoever holds resolved-role",
+        due_at: 0,
+        class: "fyi"
+      })
+
+    at = member.created_at + Wakes.delivery_policy("fyi").ceiling_ms
+    assert [digest_id] = Wakes.materialize_digests(db, at)
+
+    digest = Wakes.get(db, digest_id)
+    assert digest.target_role == "resolved-role"
+    # THE PINNED FACT: a real, resolved session — never the synthetic
+    # placeholder.
+    assert digest.session_key == "agent:holder5"
+
+    assert :ok = Roles.rm(db, "resolved-role")
+    refute Roles.get(db, "resolved-role")
+
+    assert {:ok, %{digest_members: members}} =
+             verb(db, {:user, "sessionowner5"}, "digest-members", %{wake_id: digest_id})
+
+    assert Enum.map(members, & &1.wake_id) == [member.wake_id]
+
+    assert {:error, %{code: "not_found"}} =
+             verb(db, {:user, "outsider5"}, "digest-members", %{wake_id: digest_id})
+  end
+
   ## Seam ③ — the `input-needed` carrier (GitHub #11)
 
   test "an agent's question and the notification that carries it are one commit", %{db: db} do
