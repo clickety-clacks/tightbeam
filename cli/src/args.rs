@@ -61,6 +61,15 @@ pub enum Command {
         prompt: String,
         after_ms: Option<String>,
         at: Option<String>,
+        condition_kind: Option<String>,
+        condition_scope: Option<String>,
+        idempotency_key: Option<String>,
+    },
+    Condition {
+        identity: Identity,
+        kind: String,
+        scope: Option<String>,
+        idempotency_key: Option<String>,
     },
     ArtifactRecord {
         identity: Identity,
@@ -358,8 +367,9 @@ IDENTITY (optional inside a session workdir; otherwise required):
   --as-user <userId>   act as a human user (e.g. "flynn"). Use this for
                        operator/admin actions or when no agent identity applies.
   --as-process <name>  act as automation (cron, CI, a webhook — e.g.
-                       "cron"). Processes may wake and cancel-wake ONLY —
-                       they cannot spawn, retire, or administer.
+                       "cron"). Processes may wake, cancel-wake, and file
+                       condition facts ONLY — they cannot spawn, retire, or
+                       administer.
   Pass at most ONE explicit identity. It is who the call is attributed to, NOT
   the target of the call. With no flag, the CLI walks up from the current
   directory for .tightbeam-session and the gateway derives the identity from
@@ -373,12 +383,29 @@ TARGET (for commands that take one — pass exactly one):
 COMMANDS:
   wake (--session <key> | --role <name> | --user <id>) --prompt "<text>"
        [--after 30s|5m|2h] [--at <epochMs>]
+      Condition wake:
+        tightbeam wake (--session <key> | --role <name> | --user <id>)
+          --when-fact <kind> [--when-scope <scope>]
+          (--fallback-after 30s|5m|2h | --at <epochMs>)
+          --prompt "<text>" [--key <idempotencyKey>]
       Send a prompt to the selected target. Immediate = a direct message; with --after or
       --at = a scheduled wake that fires later. A wake ALWAYS carries a prompt —
       there is no content-free ping. This is how you DM or nudge another
       session (or yourself).
+      A matching fact or fallback delivers a new notification turn.
+      It never resumes or replays prior work. The fact stamp reports why the prompt arrived.
+      The accountable agent re-reads durable state and decides the next action.
+      The fallback timer detects silence only; it does not select an action.
+      --prompt is the caller's explicit instruction override.
+      Tightbeam carries it without rewriting it.
         tightbeam wake --role reviewer --prompt "review PR 12" --as coder
         tightbeam wake --session agent:coder:app --prompt "check CI" --after 5m --as coder
+        tightbeam wake --role owner --when-fact build-finished --when-scope app \
+          --fallback-after 2h --prompt "re-read the work and decide" --as-process ci
+
+  condition --kind <kind> [--scope <scope>] [--key <idempotencyKey>]
+      File an observable fact. Matching condition wakes receive the fact as a new
+      notification turn; they never resume or replay prior work.
 
   artifact-record --kind <kind> --title <title> --path <originPath>
                   [--description <text>] [--work-item <workItemId>] [--sha256 <hex>]
@@ -490,8 +517,8 @@ COMMANDS:
   attest <assignmentId> --kind progress|completion|surrender|verdict
       [--commit-refs '[{"repo":"host:/abs/path","commit":"<commit>"}]']
          [--verdict <kind>] [--note "..."]
-      File against an assignment. Verdicts require --verdict and may be filed
-      by any session or user; lifecycle attests remain holder-filed.
+      File against an assignment. Verdicts on review cards require the review
+      holder; producer-card verdicts may be filed by any session or user.
   attests <assignmentId>
       List every attest filed against an assignment.
   assignments [--session <key> | --role <name>] [--state open|closed|all]
@@ -573,7 +600,8 @@ DISCOVERY: the CLI walks up from cwd for .tightbeam-session first, then uses
   TIGHTBEAM_URL + TIGHTBEAM_TOKEN, then
   <TIGHTBEAM_BASE_DIR|TIGHTBEAM_HOME|~/.tightbeam>/gateway.json.
 
-DURATIONS (for --after): <n>ms | <n>s | <n>m | <n>h  (e.g. 30s, 5m, 2h).
+DURATIONS (for --after and --fallback-after): <n>ms | <n>s | <n>m | <n>h
+  (e.g. 30s, 5m, 2h).
 
   tightbeam help | --help | -h   show this text.
   tightbeam version | --version  print this CLI's version."#;
@@ -940,16 +968,74 @@ fn parse_with_optional_catalog(
             }
             let prompt = nonempty(flags, "prompt")
                 .ok_or_else(|| "--prompt is required (a wake must carry a prompt)".to_owned())?;
+            for (name, error) in [
+                ("when-fact", "--when-fact requires a non-empty kind"),
+                ("when-scope", "--when-scope requires a non-empty scope"),
+                (
+                    "fallback-after",
+                    "--fallback-after requires a non-empty duration",
+                ),
+            ] {
+                if flags.get(name).is_some_and(String::is_empty) {
+                    return Err(error.to_owned());
+                }
+            }
             let after_ms = nonempty(flags, "after")
                 .map(|value| parse_after(&value))
                 .transpose()?;
+            let fallback_after_ms = nonempty(flags, "fallback-after")
+                .map(|value| parse_duration("fallback-after", &value))
+                .transpose()?;
             let at = nonempty(flags, "at").map(|value| js_number_json(number_coercion(&value)));
+            let condition_kind = nonempty(flags, "when-fact");
+            let condition_scope = nonempty(flags, "when-scope");
+
+            if condition_scope.is_some() && condition_kind.is_none() {
+                return Err("--when-scope requires --when-fact".to_owned());
+            }
+            if fallback_after_ms.is_some() && condition_kind.is_none() {
+                return Err("--fallback-after requires --when-fact".to_owned());
+            }
+            if after_ms.is_some() && fallback_after_ms.is_some() {
+                return Err("--after and --fallback-after are mutually exclusive".to_owned());
+            }
+            if condition_kind.is_some() && after_ms.is_some() {
+                return Err("--after cannot be used with --when-fact".to_owned());
+            }
+            if condition_kind.is_some() && fallback_after_ms.is_none() && at.is_none() {
+                return Err(
+                    "a condition wake requires a fallback (--fallback-after / --at)".to_owned(),
+                );
+            }
+            if fallback_after_ms.is_some() && at.is_some() {
+                return Err("--fallback-after and --at are mutually exclusive".to_owned());
+            }
+            let idempotency_key = condition_kind.as_ref().and_then(|_| nonempty(flags, "key"));
             Ok(Command::Wake {
                 identity: identity(flags)?,
                 target: targets.into_iter().next().expect("exactly one target"),
                 prompt,
-                after_ms,
+                after_ms: fallback_after_ms.or(after_ms),
                 at,
+                condition_kind,
+                condition_scope,
+                idempotency_key,
+            })
+        }
+        "condition" => {
+            if parsed.positional.len() != 1 {
+                return Err(
+                    "usage: tightbeam condition --kind <kind> [--scope <scope>] [--key <idempotencyKey>]"
+                        .to_owned(),
+                );
+            }
+            Ok(Command::Condition {
+                identity: identity(flags)?,
+                kind: nonempty(flags, "kind").ok_or_else(|| {
+                    "--kind is required (a condition fact requires a kind)".to_owned()
+                })?,
+                scope: nonempty(flags, "scope"),
+                idempotency_key: nonempty(flags, "key"),
             })
         }
         "artifact-record" => {
@@ -1465,7 +1551,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -1902,6 +1988,33 @@ mod tests {
     }
 
     #[test]
+    fn wake_help_preserves_agent_agency_at_the_notification_boundary() {
+        let entry = render_command_help(None, "wake").unwrap();
+
+        for required in [
+            "--when-fact <kind>",
+            "new notification turn",
+            "never resumes or replays prior work",
+            "re-reads durable state and decides the next action",
+            "fallback timer detects silence only",
+            "caller's explicit instruction override",
+            "without rewriting it",
+        ] {
+            assert!(
+                entry.contains(required),
+                "missing {required:?} from:\n{entry}"
+            );
+        }
+
+        let manual = render_help(None);
+        assert!(
+            manual.contains("Processes may wake, cancel-wake, and file\n                       condition facts ONLY"),
+            "{manual}"
+        );
+        assert!(!manual.contains("Processes may wake and cancel-wake ONLY"));
+    }
+
+    #[test]
     fn an_unknown_command_has_no_entry_to_print() {
         assert_eq!(
             render_command_help(Some(&crate::harnesses::catalog().unwrap()), "frobnicate"),
@@ -2146,6 +2259,7 @@ mod tests {
                 "attests",
                 "add-user",
                 "cancel-wake",
+                "condition",
                 "config",
                 "decision-requests",
                 "dispatch",
@@ -2413,6 +2527,239 @@ mod tests {
     }
 
     #[test]
+    fn parses_condition_wakes_and_condition_facts_with_optional_fields() {
+        assert_eq!(
+            parse(strings(&[
+                "wake",
+                "--role",
+                "owner",
+                "--when-fact",
+                "build-finished",
+                "--when-scope",
+                "app",
+                "--fallback-after",
+                "2h",
+                "--prompt",
+                "re-read durable state",
+                "--key",
+                "wake-1",
+                "--as-process",
+                "ci",
+            ])),
+            Ok(Command::Wake {
+                identity: Identity::Process("ci".to_owned()),
+                target: Target::Role("owner".to_owned()),
+                prompt: "re-read durable state".to_owned(),
+                after_ms: Some("7200000".to_owned()),
+                at: None,
+                condition_kind: Some("build-finished".to_owned()),
+                condition_scope: Some("app".to_owned()),
+                idempotency_key: Some("wake-1".to_owned()),
+            })
+        );
+        assert_eq!(
+            parse(strings(&[
+                "wake",
+                "--session",
+                "agent:owner",
+                "--when-fact",
+                "review-landed",
+                "--at",
+                "123",
+                "--prompt",
+                "decide what follows",
+                "--as",
+                "worker",
+            ])),
+            Ok(Command::Wake {
+                identity: Identity::Role("worker".to_owned()),
+                target: Target::Session("agent:owner".to_owned()),
+                prompt: "decide what follows".to_owned(),
+                after_ms: None,
+                at: Some("123".to_owned()),
+                condition_kind: Some("review-landed".to_owned()),
+                condition_scope: None,
+                idempotency_key: None,
+            })
+        );
+        assert_eq!(
+            parse(strings(&[
+                "condition",
+                "--kind",
+                "review-landed",
+                "--as-process",
+                "review-hook",
+            ])),
+            Ok(Command::Condition {
+                identity: Identity::Process("review-hook".to_owned()),
+                kind: "review-landed".to_owned(),
+                scope: None,
+                idempotency_key: None,
+            })
+        );
+    }
+
+    #[test]
+    fn refuses_invalid_condition_wake_and_fact_shapes_with_specific_messages() {
+        for (args, expected) in [
+            (
+                strings(&[
+                    "wake",
+                    "--role",
+                    "owner",
+                    "--when-scope",
+                    "app",
+                    "--prompt",
+                    "decide",
+                ]),
+                "--when-scope requires --when-fact",
+            ),
+            (
+                strings(&[
+                    "wake",
+                    "--role",
+                    "owner",
+                    "--when-fact",
+                    "build-finished",
+                    "--prompt",
+                    "decide",
+                ]),
+                "a condition wake requires a fallback (--fallback-after / --at)",
+            ),
+            (
+                strings(&[
+                    "wake",
+                    "--role",
+                    "owner",
+                    "--fallback-after",
+                    "5m",
+                    "--prompt",
+                    "decide",
+                ]),
+                "--fallback-after requires --when-fact",
+            ),
+            (
+                strings(&[
+                    "wake",
+                    "--role",
+                    "owner",
+                    "--when-fact",
+                    "build-finished",
+                    "--after",
+                    "1m",
+                    "--fallback-after",
+                    "5m",
+                    "--prompt",
+                    "decide",
+                ]),
+                "--after and --fallback-after are mutually exclusive",
+            ),
+            (
+                strings(&[
+                    "wake",
+                    "--role",
+                    "owner",
+                    "--when-fact",
+                    "build-finished",
+                    "--fallback-after",
+                    "5m",
+                    "--at",
+                    "123",
+                    "--prompt",
+                    "decide",
+                ]),
+                "--fallback-after and --at are mutually exclusive",
+            ),
+            (
+                strings(&[
+                    "wake",
+                    "--role",
+                    "owner",
+                    "--when-fact",
+                    "build-finished",
+                    "--after",
+                    "1m",
+                    "--prompt",
+                    "decide",
+                ]),
+                "--after cannot be used with --when-fact",
+            ),
+            (
+                strings(&[
+                    "wake",
+                    "--role",
+                    "owner",
+                    "--when-fact",
+                    "build-finished",
+                    "--after",
+                    "1m",
+                    "--at",
+                    "123",
+                    "--prompt",
+                    "decide",
+                ]),
+                "--after cannot be used with --when-fact",
+            ),
+            (
+                strings(&[
+                    "wake",
+                    "--role",
+                    "owner",
+                    "--when-fact",
+                    "build-finished",
+                    "--at",
+                    "123",
+                ]),
+                "--prompt is required (a wake must carry a prompt)",
+            ),
+            (
+                strings(&[
+                    "wake",
+                    "--role",
+                    "owner",
+                    "--when-fact",
+                    "",
+                    "--at",
+                    "123",
+                    "--prompt",
+                    "decide",
+                ]),
+                "--when-fact requires a non-empty kind",
+            ),
+            (
+                strings(&[
+                    "wake",
+                    "--role",
+                    "owner",
+                    "--when-scope",
+                    "",
+                    "--prompt",
+                    "decide",
+                ]),
+                "--when-scope requires a non-empty scope",
+            ),
+            (
+                strings(&[
+                    "wake",
+                    "--role",
+                    "owner",
+                    "--fallback-after",
+                    "",
+                    "--prompt",
+                    "decide",
+                ]),
+                "--fallback-after requires a non-empty duration",
+            ),
+            (
+                strings(&["condition", "--as-process", "ci"]),
+                "--kind is required (a condition fact requires a kind)",
+            ),
+        ] {
+            assert_eq!(parse(args), Err(expected.to_owned()));
+        }
+    }
+
+    #[test]
     fn coerces_and_serializes_numbers_like_javascript() {
         for (input, expected) in [
             ("+1", "1"),
@@ -2481,7 +2828,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned())
         );
     }
 
@@ -2490,7 +2837,6 @@ mod tests {
         for command in [
             "rail-exec",
             "probe",
-            "condition",
             "facts-read",
             "artifact-get",
             "rule",
@@ -2643,6 +2989,28 @@ mod tests {
                     prompt: "go".to_owned(),
                     after_ms: Some("30000".to_owned()),
                     at: Some("123".to_owned()),
+                    condition_kind: None,
+                    condition_scope: None,
+                    idempotency_key: None,
+                },
+            ),
+            (
+                strings(&[
+                    "condition",
+                    "--kind",
+                    "build-finished",
+                    "--scope",
+                    "app",
+                    "--key",
+                    "fact-1",
+                    "--as-process",
+                    "ci",
+                ]),
+                Command::Condition {
+                    identity: Identity::Process("ci".to_owned()),
+                    kind: "build-finished".to_owned(),
+                    scope: Some("app".to_owned()),
+                    idempotency_key: Some("fact-1".to_owned()),
                 },
             ),
             (

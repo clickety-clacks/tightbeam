@@ -1175,8 +1175,13 @@ defmodule Tightbeam.EffortCheckin do
       prompt:
         "[effort check-in] Assignment #{generation.assignment_id}: " <>
           channel_sentence(evidence) <>
-          " Record your work — `artifact-record` for anything produced outside this workdir " <>
-          "(another machine, a service, a conversation), `attest` for progress — or say what is happening.",
+          " Record only a new material result or evidence, an exact new blocker or refusal, " <>
+          "a bounded decision request, or one new, unexpired bounded checkpoint. " <>
+          "A checkpoint must name the next action or condition and its deadline. " <>
+          "Use `artifact-record` for anything produced outside this workdir " <>
+          "(another machine, a service, a conversation). Do not file generic or duplicate status. " <>
+          "If no reporting exception applies, schedule a concrete continuation wake that names " <>
+          "the next action or dependency condition and when to resume.",
       due_at: now(),
       assignment_id: generation.assignment_id
     })

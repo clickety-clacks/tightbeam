@@ -1,7 +1,18 @@
 defmodule Tightbeam.RailRemedy do
   @moduledoc "Active rail remedy execution and durable remedy-episode lifecycle."
 
-  alias Tightbeam.{DB, Dispatch, EventLog, Idempotency, Org, Roles, Wakes}
+  alias Tightbeam.{
+    DB,
+    Dispatch,
+    EventLog,
+    Idempotency,
+    Org,
+    RecurrenceSuppression,
+    Roles,
+    Rules,
+    Wakes
+  }
+
   alias Tightbeam.DB.Txn
 
   @ttl_ms 60_000
@@ -202,7 +213,7 @@ defmodule Tightbeam.RailRemedy do
          handlers,
          rule,
          subject,
-         _call,
+         call,
          context,
          resolved,
          token,
@@ -225,9 +236,12 @@ defmodule Tightbeam.RailRemedy do
 
       with {:ok, producer_call, producer_hint} <-
              producer_call(db, rule, context, resolved, key),
+           :ok <- prepare_first_recurrence(db, rule, subject, call, key),
            {:ok, result} <- Dispatch.dispatch(db, handlers, producer_call),
            producer_id when is_binary(producer_id) <-
-             producer_id(rule.remedy.action, result, producer_hint) do
+             producer_id(rule.remedy.action, result, producer_hint),
+           :ok <-
+             record_first_recurrence(db, rule, subject, call, resolved, producer_id, key) do
         if cas(
              db,
              """
@@ -264,18 +278,37 @@ defmodule Tightbeam.RailRemedy do
     case read_episode(db, rule.name, subject) do
       %{status: "live", claim_token: token, occurrence: occurrence} = row ->
         if producer_live?(db, rule.remedy.action, row.producer_key) do
-          rewake(
-            db,
-            handlers,
-            rule,
-            subject,
-            call,
-            context,
-            resolved,
-            token,
-            occurrence,
-            row.producer_key
-          )
+          target =
+            rewake_target(db, rule.remedy.action, subject, context, resolved, row.producer_key)
+
+          case repeat_recurrence(db, rule, subject, call, target) do
+            :suppressed ->
+              %{outcome: "recurrence-suppressed", producer_id: row.producer_key}
+
+            :deliver ->
+              %{outcome: "recurrence-suppressed", producer_id: row.producer_key}
+
+            {:rearmed, _generation} ->
+              if close(db, rule.name, subject, occurrence) do
+                route_episode(db, handlers, rule, subject, call, context, resolved)
+              else
+                %{outcome: "recurrence-suppressed", producer_id: row.producer_key}
+              end
+
+            _ ->
+              rewake(
+                db,
+                handlers,
+                rule,
+                subject,
+                call,
+                context,
+                resolved,
+                token,
+                occurrence,
+                row.producer_key
+              )
+          end
         else
           %{outcome: "blocked", producer_id: row.producer_key}
         end
@@ -750,6 +783,117 @@ defmodule Tightbeam.RailRemedy do
       _kind, _reason -> :ok
     end
   end
+
+  defp prepare_first_recurrence(
+         _db,
+         %{recurrence_suppression: nil},
+         _subject,
+         _call,
+         _dispatch_key
+       ),
+       do: :ok
+
+  defp prepare_first_recurrence(db, rule, subject, call, dispatch_key) do
+    case RecurrenceSuppression.prepare_first(
+           db,
+           recurrence_occurrence(rule, subject, call, nil),
+           dispatch_key
+         ) do
+      result when result in [:dispatch, :delivered] -> :ok
+      :unavailable -> :ok
+      :conflict -> {:error, :recurrence_dispatch_conflict}
+    end
+  end
+
+  defp record_first_recurrence(
+         _db,
+         %{recurrence_suppression: nil},
+         _subject,
+         _call,
+         _resolved,
+         _producer_id,
+         _dispatch_key
+       ),
+       do: :ok
+
+  defp record_first_recurrence(db, rule, subject, call, resolved, producer_id, dispatch_key) do
+    case delivery_target(db, rule.remedy.action, resolved, producer_id) do
+      target when is_binary(target) ->
+        _ =
+          RecurrenceSuppression.record_first(
+            db,
+            rule.recurrence_suppression,
+            recurrence_occurrence(rule, subject, call, target),
+            dispatch_key,
+            Rules.condition_evidence(
+              db,
+              call,
+              rule.recurrence_suppression.rearm.recovered_when
+            )
+          )
+
+        :ok
+
+      _ ->
+        {:error, :unresolved_delivery_target}
+    end
+  end
+
+  defp repeat_recurrence(_db, %{recurrence_suppression: nil}, _subject, _call, _target),
+    do: :disabled
+
+  defp repeat_recurrence(db, rule, subject, call, target) do
+    config = rule.recurrence_suppression
+
+    RecurrenceSuppression.repeat(
+      db,
+      config,
+      recurrence_occurrence(rule, subject, call, target),
+      Rules.condition_evidence(db, call, config.rearm.recovered_when),
+      Rules.condition_evidence(db, call, config.rearm.recurred_when)
+    )
+  end
+
+  defp delivery_target(db, "assign", _resolved, assignment_id) do
+    case DB.query(db, "SELECT holderKey FROM assignments WHERE id=?1", [assignment_id]) do
+      {:ok, [[session_key]]} -> session_key
+      _ -> nil
+    end
+  end
+
+  defp delivery_target(_db, "wake", %{bound_session: session_key}, _producer_id),
+    do: session_key
+
+  defp delivery_target(_db, "spawn", _resolved, session_key), do: session_key
+  defp delivery_target(_db, _action, _resolved, _producer_id), do: nil
+
+  defp recurrence_occurrence(rule, subject, call, target) do
+    params = call.params
+
+    %{
+      statute: rule.name,
+      target_session: target,
+      subject: subject,
+      failure_class:
+        call[:recurrence_failure_class] || params[:failure_class] || params["failure_class"],
+      failure_code:
+        call[:recurrence_failure_code] || params[:failure_code] || params["failure_code"],
+      receipt_id:
+        call[:recurrence_receipt_id] || params[:recurrence_receipt_id] ||
+          params["recurrence_receipt_id"],
+      sequence:
+        call[:recurrence_sequence] || params[:recurrence_sequence] ||
+          params["recurrence_sequence"],
+      cause: "rail-remedy",
+      principal: principal_label(call.principal)
+    }
+  end
+
+  defp principal_label({:session, key}), do: "session:#{key}"
+  defp principal_label({:user, id}), do: "user:#{id}"
+  defp principal_label({:process, id}), do: "process:#{id}"
+  defp principal_label({:remedy, %{statute: statute}}), do: "remedy:#{statute}"
+  defp principal_label(_principal), do: "unknown"
 
   defp remedy_principal(statute, action, owner),
     do: {:remedy, %{statute: statute, action: action, owner: owner}}

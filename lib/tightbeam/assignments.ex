@@ -307,22 +307,23 @@ defmodule Tightbeam.Assignments do
     end)
   end
 
-  @doc "Return the sole independent linked review card holder's latest verdict kind."
+  @doc "Return the latest linked review round holder's qualifying verdict kind."
   @spec qualifying_review_verdict_kinds(DB.server(), String.t(), String.t()) :: [String.t()]
   def qualifying_review_verdict_kinds(db, assignment_id, assignment_holder_key) do
     {:ok, rows} =
       DB.query(
         db,
         """
+        WITH latest_review AS (
+          SELECT id, holderKey
+          FROM assignments
+          WHERE reviewsAssignmentId = ?1
+          ORDER BY openedAt DESC, rowid DESC
+          LIMIT 1
+        )
         SELECT 'reviewed-clean'
-        FROM assignments AS r
-        WHERE r.reviewsAssignmentId = ?1
-          AND r.holderKey != ?2
-          AND (
-          SELECT COUNT(*)
-          FROM assignments AS linked
-          WHERE linked.reviewsAssignmentId = ?1
-          ) = 1
+        FROM latest_review AS r
+        WHERE r.holderKey != ?2
           AND (
           SELECT v.verdictKind
           FROM attests AS v
@@ -332,7 +333,6 @@ defmodule Tightbeam.Assignments do
           ORDER BY v.ts DESC, v.rowid DESC
           LIMIT 1
           ) = 'reviewed-clean'
-        ORDER BY r.openedAt, r.id
         """,
         [assignment_id, assignment_holder_key]
       )
@@ -1215,6 +1215,10 @@ defmodule Tightbeam.Assignments do
         cond do
           assignment.state != "open" ->
             assignment_closed()
+
+          not is_nil(assignment.reviewsAssignmentId) and
+              call.principal != {:session, assignment.holderKey} ->
+            error("not_holder", "assignment is held by session #{assignment.holderKey}")
 
           true ->
             with :ok <- valid_verdict_kind(call.params[:verdict_kind]),

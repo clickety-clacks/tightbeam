@@ -62,7 +62,7 @@ defmodule Tightbeam.ConformanceSupport do
     ~w(grammar-root-table-rejected grammar-nested-accepted)
   ]
   @world_keys MapSet.new(
-                ~w(users sessions roles work_items assignments attests retune ledger wakes turn)
+                ~w(users sessions roles work_items assignments attests stored_attests retune ledger wakes turn)
               )
   @world_shapes %{
     "users" => ~w(id admin),
@@ -71,6 +71,7 @@ defmodule Tightbeam.ConformanceSupport do
     "work_items" => ~w(id title),
     "assignments" => ~w(id holder creator reviews work_item files),
     "attests" => ~w(assignment kind by verdict_kind),
+    "stored_attests" => ~w(assignment kind by verdict_kind),
     "retune" => ~w(session harness provider),
     "ledger" => ~w(session pending),
     "wakes" => ~w(target creatorSessionKey at),
@@ -1508,7 +1509,7 @@ defmodule Tightbeam.ConformanceSupport do
             "no-applicable-escalate-records-none" ->
               assert {:allow, [], []} = Rules.decide(db, turn_call)
 
-              assert {:prodded, 1} =
+              assert :rebased =
                        Supervision.evaluate(
                          db,
                          handlers,
@@ -1718,7 +1719,6 @@ defmodule Tightbeam.ConformanceSupport do
   def run_scheduled_wake_contract(fixture) do
     assert Supervision.turn_end_schedule() == [
              :rail_enforcement,
-             :pending_wake_gate,
              :prod_ladder
            ]
 
@@ -1744,10 +1744,10 @@ defmodule Tightbeam.ConformanceSupport do
               assert {{:remedy, %{name: ^statute}, ^assignment_id, _}, [], []} =
                        Rules.decide(db, turn_call)
 
-              # r21 requires this remedy to act before the pending-wake gate.
-              # The current implementation still bypasses rail_step internally
-              # for a self wake; this assertion is the executable handoff proof.
-              assert :continuation =
+              # The self wake still suppresses the rail remedy, but it does not
+              # suppress the independent prod ladder unless it is an exact
+              # assignment checkpoint.
+              assert {:prodded, 1} =
                        Supervision.evaluate(
                          db,
                          handlers,
@@ -1779,7 +1779,7 @@ defmodule Tightbeam.ConformanceSupport do
             "allow-falls-through-to-pending-wake-gate" ->
               assert {:allow, [], []} = Rules.decide(db, turn_call)
 
-              assert :continuation =
+              assert :rebased =
                        Supervision.evaluate(
                          db,
                          handlers,
@@ -2813,6 +2813,33 @@ defmodule Tightbeam.ConformanceSupport do
         })
 
       refute Map.has_key?(result, :code), "failed to materialize attest: #{inspect(result)}"
+    end)
+
+    Enum.each(Map.get(world, "stored_attests", []), fn attest ->
+      {by_session, by_user} =
+        case principal(attest["by"]) do
+          {:session, session} -> {session, nil}
+          {:user, user} -> {nil, user}
+        end
+
+      assert {:ok, _} =
+               DB.query(
+                 db,
+                 """
+                 INSERT INTO attests
+                   (id, assignmentId, kind, verdictKind, bySession, byUser, ts)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 """,
+                 [
+                   "stored_attest_#{System.unique_integer([:positive])}",
+                   assignments[attest["assignment"]],
+                   attest["kind"],
+                   attest["verdict_kind"],
+                   by_session,
+                   by_user,
+                   System.unique_integer([:positive])
+                 ]
+               )
     end)
 
     Enum.each(Map.get(world, "retune", []), fn retune ->

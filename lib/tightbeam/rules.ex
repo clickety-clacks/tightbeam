@@ -68,9 +68,19 @@ defmodule Tightbeam.Rules do
                "check",
                "effect",
                "remedy",
-               "external_producer"
+               "external_producer",
+               "recurrence_suppression"
              ])
   @condition_keys MapSet.new(["fact", "op", "value"])
+  @recurrence_keys MapSet.new([
+                     "scope",
+                     "fingerprint",
+                     "escalation_threshold",
+                     "fallback",
+                     "rearm"
+                   ])
+  @rearm_keys MapSet.new(["recovered_when", "recurred_when"])
+  @recurrence_fingerprint ~w(statute target_session subject failure_class failure_code)
   @check_keys MapSet.new(["script", "returns", "timeout_ms", "effects"])
   @remedy_keys MapSet.new([
                  "action",
@@ -125,6 +135,7 @@ defmodule Tightbeam.Rules do
     "assignment.holder_archetype" => :string,
     "assignment.caller_is_holder" => :bool,
     "work_item.is_bug" => :bool,
+    "work_item.has_topline" => :bool,
     "work_item.has_spec_ref" => :bool,
     "work_item.verdict_kinds" => {:list, :string},
     "assignment.review_verdict_count" => :int,
@@ -267,11 +278,17 @@ defmodule Tightbeam.Rules do
     effects = if check, do: Map.values(check.effects), else: [effect]
     remedy = validate_remedy!(Map.get(rule, "remedy"), conditions, check, effects, fail)
 
+    recurrence_suppression =
+      validate_recurrence_suppression!(Map.get(rule, "recurrence_suppression"), fail)
+
     if "remedy" in effects and is_nil(remedy),
       do: fail.("effect remedy requires [rule.remedy]")
 
     if remedy && "remedy" not in effects,
       do: fail.("[rule.remedy] requires a remedy effect")
+
+    if recurrence_suppression && is_nil(remedy),
+      do: fail.("[rule.recurrence_suppression] requires a remedy effect and [rule.remedy]")
 
     external_producer = Map.get(rule, "external_producer", false)
     unless is_boolean(external_producer), do: fail.("external_producer must be a boolean")
@@ -288,6 +305,7 @@ defmodule Tightbeam.Rules do
       effect: effect,
       check: check,
       remedy: remedy,
+      recurrence_suppression: recurrence_suppression,
       external_producer: external_producer,
       source: path,
       base_dir: base_dir,
@@ -309,6 +327,95 @@ defmodule Tightbeam.Rules do
     conditions
     |> Enum.with_index(1)
     |> Enum.map(fn {condition, index} -> validate_condition!(condition, index, fail) end)
+  end
+
+  defp validate_recurrence_suppression!(nil, _fail), do: nil
+
+  defp validate_recurrence_suppression!(declaration, fail) when is_map(declaration) do
+    unknown = unknown_keys(declaration, @recurrence_keys)
+
+    if unknown != [],
+      do: fail.("recurrence_suppression has unknown keys: #{Enum.join(unknown, ", ")}")
+
+    scope = Map.get(declaration, "scope")
+
+    unless scope == "target_session_subject",
+      do: fail.("recurrence_suppression scope must be target_session_subject")
+
+    fingerprint = Map.get(declaration, "fingerprint")
+
+    unless is_list(fingerprint) and fingerprint != [] and
+             Enum.all?(fingerprint, &is_binary/1) and Enum.uniq(fingerprint) == fingerprint,
+           do:
+             fail.(
+               "recurrence_suppression fingerprint must be a non-empty unique list of strings"
+             )
+
+    unless fingerprint == @recurrence_fingerprint,
+      do:
+        fail.(
+          "recurrence_suppression fingerprint must be exactly #{inspect(@recurrence_fingerprint)}"
+        )
+
+    threshold = Map.get(declaration, "escalation_threshold")
+
+    unless is_integer(threshold) and threshold >= 1,
+      do: fail.("recurrence_suppression escalation_threshold must be an integer of at least 1")
+
+    fallback = Map.get(declaration, "fallback")
+
+    unless fallback == "operational_parent_then_main",
+      do: fail.("recurrence_suppression fallback must be operational_parent_then_main")
+
+    rearm = Map.get(declaration, "rearm")
+    unless is_map(rearm), do: fail.("recurrence_suppression rearm must be a table")
+    rearm_unknown = unknown_keys(rearm, @rearm_keys)
+
+    if rearm_unknown != [],
+      do:
+        fail.("recurrence_suppression rearm has unknown keys: #{Enum.join(rearm_unknown, ", ")}")
+
+    recovered_when =
+      validate_rearm_conditions!(Map.get(rearm, "recovered_when"), "recovered_when", fail)
+
+    recurred_when =
+      validate_rearm_conditions!(Map.get(rearm, "recurred_when"), "recurred_when", fail)
+
+    %{
+      scope: scope,
+      fingerprint: fingerprint,
+      escalation_threshold: threshold,
+      fallback: fallback,
+      rearm: %{recovered_when: recovered_when, recurred_when: recurred_when}
+    }
+  end
+
+  defp validate_recurrence_suppression!(_declaration, fail),
+    do: fail.("recurrence_suppression must be a table")
+
+  defp validate_rearm_conditions!(conditions, name, fail) do
+    unless is_list(conditions) and conditions != [] and Enum.all?(conditions, &is_map/1),
+      do:
+        fail.("recurrence_suppression rearm #{name} must be a non-empty list of condition tables")
+
+    conditions
+    |> Enum.with_index(1)
+    |> Enum.map(fn {condition, index} -> validate_condition!(condition, index, fail) end)
+  end
+
+  @doc false
+  def condition_evidence(db, call, conditions) when is_list(conditions) do
+    case evaluate_conditions(conditions, %{name: "recurrence-suppression"}, db, call, %{}) do
+      {:match, cache} -> %{matched: true, facts: evidence_facts(conditions, cache)}
+      {:no_match, cache} -> %{matched: false, facts: evidence_facts(conditions, cache)}
+      {:error, fact} -> %{matched: false, facts: [{fact, :error}]}
+    end
+  end
+
+  defp evidence_facts(conditions, cache) do
+    Enum.map(conditions, fn condition ->
+      {condition.fact, Map.get(cache, condition.fact, :not_evaluated)}
+    end)
   end
 
   defp validate_edges!(edges, verb, fail) do
@@ -1183,6 +1290,48 @@ defmodule Tightbeam.Rules do
           end
 
         {value, cache}
+    end)
+  end
+
+  # Explicit active membership is the sole Topline truth. Visibility is checked
+  # before the count so an unknown item and another user's item are one nil
+  # answer; ended episodes and Concern references cannot make this fact true.
+  defp compute_fact("work_item.has_topline", db, call, cache) do
+    with_dependency("$work_item_id", db, call, cache, fn
+      nil, cache ->
+        {nil, cache}
+
+      work_item_id, cache ->
+        with_dependency("caller.user", db, call, cache, fn
+          nil, cache ->
+            {nil, cache}
+
+          caller_user, cache ->
+            with_dependency("caller.is_admin", db, call, cache, fn
+              nil, cache ->
+                {nil, cache}
+
+              is_admin, cache ->
+                {:ok, rows} =
+                  DB.query(
+                    db,
+                    """
+                    SELECT EXISTS(
+                      SELECT 1 FROM topline_work_memberships m
+                      WHERE m.workItemId = wi.id AND m.unlinkedAt IS NULL
+                    )
+                    FROM work_items wi
+                    WHERE wi.id = ?1 AND (?2 = 1 OR wi.ownerUserId = ?3)
+                    """,
+                    [work_item_id, if(is_admin, do: 1, else: 0), caller_user]
+                  )
+
+                case rows do
+                  [[flag]] -> {flag == 1, cache}
+                  [] -> {nil, cache}
+                end
+            end)
+        end)
     end)
   end
 

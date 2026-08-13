@@ -115,6 +115,103 @@ defmodule Tightbeam.RailRemedyTest do
              RailRemedy.episode(ctx.db, "completion-needs-review", assignment.id)
   end
 
+  test "declared recurrence suppression stops a repeat before another producer turn", ctx do
+    assignment = assignment(ctx, "recurring")
+    put_rules(ctx, review_gate() <> recurrence_declaration())
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    first =
+      completion_call(assignment.id)
+      |> put_in([:params, :recurrence_receipt_id], "receipt-1")
+      |> put_in([:params, :recurrence_sequence], 1)
+      |> put_in([:params, :failure_class], "review-gate")
+      |> put_in([:params, :failure_code], "missing-review")
+
+    dispatch_key = "rail-dispatch:completion-needs-review:#{assignment.id}:1"
+
+    # Crash specimen: persist the recurrence boundary, deliver the producer, then
+    # simulate a crash before RailRemedy records the delivered target. The normal
+    # retry must replay the same producer and finish the boundary without a second.
+    assert :dispatch =
+             Tightbeam.RecurrenceSuppression.prepare_first(
+               ctx.db,
+               %{
+                 statute: "completion-needs-review",
+                 subject: assignment.id,
+                 receipt_id: "receipt-1"
+               },
+               dispatch_key
+             )
+
+    producer_call = %{
+      verb: "assign",
+      origin: "remedy:completion-needs-review",
+      principal:
+        {:remedy, %{statute: "completion-needs-review", action: "assign", owner: "flynn"}},
+      session_key: ctx.reviewer.session_key,
+      target_role: "reviewer",
+      role_fallback: false,
+      params: %{
+        subject: "review #{assignment.id}",
+        reviews_assignment_id: assignment.id,
+        idempotency_key: dispatch_key
+      }
+    }
+
+    assert {:ok, delivered_review} = Dispatch.dispatch(ctx.db, ctx.handlers, producer_call)
+
+    assert {:error, %{producer: review_id}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, first)
+
+    assert review_id == delivered_review.id
+
+    assert {:error, %{producer: ^review_id}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, first)
+
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM wakes")
+
+    assert %{rewake_count: 0} =
+             RailRemedy.episode(ctx.db, "completion-needs-review", assignment.id)
+
+    second =
+      first
+      |> put_in([:params, :recurrence_receipt_id], "receipt-2")
+      |> put_in([:params, :recurrence_sequence], 2)
+
+    assert {:error, %{producer: ^review_id}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, second)
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM assignments WHERE reviewsAssignmentId=?1",
+               [assignment.id]
+             )
+
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM wakes")
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM recurrence_suppression_events WHERE outcome='recurrence_repeat_suppressed'"
+             )
+
+    assert {:ok, [[target_session, "delivered", dispatch_key]]} =
+             DB.query(
+               ctx.db,
+               "SELECT targetSession,state,dispatchKey FROM recurrence_suppression_deliveries"
+             )
+
+    assert target_session == ctx.reviewer.session_key
+    assert dispatch_key == "rail-dispatch:completion-needs-review:#{assignment.id}:1"
+
+    assert {:ok, [[^target_session]]} =
+             DB.query(
+               ctx.db,
+               "SELECT targetSession FROM recurrence_suppression_episodes"
+             )
+  end
+
   test "replaying a first occurrence close leaves the second occurrence live", ctx do
     assignment = assignment(ctx, "reentered")
     [rule] = load_review_gate(ctx)
@@ -611,20 +708,18 @@ defmodule Tightbeam.RailRemedyTest do
     assert latest_rewake_target(ctx, assignment.id) == ctx.reviewer.session_key
   end
 
-  test "verdict on an extra linked card keeps the episode re-wake on its review holder", ctx do
+  test "clean verdict on the latest linked card satisfies a stale review episode", ctx do
     assignment = assignment(ctx, "extra linked card")
     load_review_gate(ctx)
 
-    assert {:error, %{producer: review_id}} =
+    assert {:error, %{producer: _review_id}} =
              Dispatch.dispatch(ctx.db, ctx.handlers, completion_call(assignment.id))
 
     extra_review = linked_review(ctx, assignment.id, "extra review")
     verdict(ctx, extra_review.id, "reviewed-clean")
 
-    assert {:error, %{producer: ^review_id}} =
+    assert {:ok, %{assignment: %{state: "closed", outcome: "completed"}}} =
              Dispatch.dispatch(ctx.db, ctx.handlers, completion_call(assignment.id))
-
-    assert latest_rewake_target(ctx, assignment.id) == ctx.reviewer.session_key
   end
 
   test "sole linked card holder verdict redirects the re-wake to the producer holder", ctx do
@@ -857,6 +952,21 @@ defmodule Tightbeam.RailRemedyTest do
     [rule.remedy.params]
     subject = "review {assignment_id}"
     reviews = "{assignment_id}"
+    """
+  end
+
+  defp recurrence_declaration do
+    """
+
+    [rule.recurrence_suppression]
+    scope = "target_session_subject"
+    fingerprint = ["statute", "target_session", "subject", "failure_class", "failure_code"]
+    escalation_threshold = 3
+    fallback = "operational_parent_then_main"
+
+    [rule.recurrence_suppression.rearm]
+    recovered_when = [{ fact = "caller.origin_class", op = "eq", value = "user" }]
+    recurred_when = [{ fact = "caller.origin_class", op = "eq", value = "agent" }]
     """
   end
 

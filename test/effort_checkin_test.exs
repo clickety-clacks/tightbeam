@@ -776,6 +776,15 @@ defmodule Tightbeam.EffortCheckinTest do
     assert prod.prompt =~ "no writes, artifacts, attests, or work-item updates"
     assert prod.prompt =~ "artifact-record"
     assert prod.prompt =~ "2 turns taken"
+    assert prod.prompt =~ "new material result or evidence"
+    assert prod.prompt =~ "exact new blocker or refusal"
+    assert prod.prompt =~ "bounded decision request"
+    assert prod.prompt =~ "one new, unexpired bounded checkpoint"
+    assert prod.prompt =~ "next action or condition and its deadline"
+    assert prod.prompt =~ "Do not file generic or duplicate status"
+    assert prod.prompt =~ "schedule a concrete continuation wake"
+    assert prod.prompt =~ "next action or dependency condition and when to resume"
+    refute prod.prompt =~ "or say what is happening"
 
     assert rows(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE assignmentId=?1", [
              silent.id
