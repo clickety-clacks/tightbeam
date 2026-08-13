@@ -1070,6 +1070,20 @@ defmodule Tightbeam.CoordinationFabricTest do
              "the reviewed allowlist — this scan cannot prove it never targets Escalation: new " <>
              "#{inspect(MapSet.difference(found_dynamic_applies, pinned_dynamic_applies))}, stale " <>
              "#{inspect(MapSet.difference(pinned_dynamic_applies, found_dynamic_applies))}"
+
+    # The MIRROR shape (Sol round 5, finding 2a): a LITERAL Escalation module
+    # with a non-literal FUNCTION argument. `escalation_refs_called/2` above
+    # requires a literal atom to attribute the call to a `ref`, and the
+    # dynamic-apply check just above only flags a non-literal MODULE — so
+    # this shape is invisible to both. It cannot be scoped to any specific
+    # ref at all, so there is no reviewable pin for it: any occurrence fails
+    # closed outright.
+    escalation_apply_dynamic_function_hits = escalation_apply_dynamic_function_sites()
+
+    assert escalation_apply_dynamic_function_hits == [],
+           "a lib/ function calls apply/3 with a LITERAL Escalation module but a NON-literal " <>
+             "function argument — this cannot be scoped to any specific ref and must be " <>
+             "reviewed: #{inspect(escalation_apply_dynamic_function_hits)}"
   end
 
   # Every double-quoted or triple-quoted string literal in a file's raw
@@ -1452,38 +1466,104 @@ defmodule Tightbeam.CoordinationFabricTest do
     aliases
   end
 
+  # `parts` is a dotted `__aliases__` path as the file's OWN source wrote it
+  # (e.g. `[:Escalation]`, `[:TB, :Escalation]`, `[:Tightbeam, :Escalation]`)
+  # — resolved by expanding only its FIRST segment through the alias map
+  # (Sol round 5, finding 2c): a prior version handled a whole-module alias
+  # (`alias Tightbeam.Escalation`, one segment) but not a PREFIX alias
+  # (`alias Tightbeam, as: TB` then `TB.Escalation.consume(...)`, where the
+  # alias covers only the leading segment and `:Escalation` rides along
+  # unresolved as literal text of its own).
   defp resolves_to_escalation?(parts, aliases) do
-    case parts do
-      [:Tightbeam, :Escalation] -> true
-      [single] -> Map.get(aliases, single) == [:Tightbeam, :Escalation]
-      _ -> false
+    expand_alias_prefix(parts, aliases) == [:Tightbeam, :Escalation]
+  end
+
+  defp expand_alias_prefix([first | rest], aliases) do
+    case Map.fetch(aliases, first) do
+      {:ok, expansion} -> expansion ++ rest
+      :error -> [first | rest]
     end
   end
 
+  # A module reference at the AST level, in EITHER shape a caller can write
+  # it: `Mod.fun` syntax (an `__aliases__` node, resolved through this
+  # file's aliases) or the ATOM form — `apply(:"Elixir.Tightbeam.Escalation",
+  # ...)` or the equivalent `:"Elixir...".fun()` — which is already fully
+  # qualified and evades an `__aliases__`-only match outright (Sol round 5,
+  # finding 2b).
+  defp resolves_module_ref_to_escalation?({:__aliases__, _, parts}, aliases),
+    do: resolves_to_escalation?(parts, aliases)
+
+  defp resolves_module_ref_to_escalation?(atom, _aliases) when is_atom(atom),
+    do: atom == Tightbeam.Escalation
+
+  defp resolves_module_ref_to_escalation?(_other, _aliases), do: false
+
   # Every `Escalation.<fun>` reference reachable in `node` that resolves
-  # (through `aliases`) to `Tightbeam.Escalation` — a remote call, a
-  # `&Mod.fun/arity` capture, or a 3-arity `apply/3` naming the module and
-  # function as literals. None of the latter two add the literal
-  # `Escalation.fun(` substring a text scan looked for.
+  # (through `aliases`, both alias forms and the atom form) to
+  # `Tightbeam.Escalation` — a remote call, a `&Mod.fun/arity` capture, or a
+  # 3-arity `apply/3` naming the module and function as literals. None of the
+  # latter two add the literal `Escalation.fun(` substring a text scan looked
+  # for.
   defp escalation_refs_called(node, aliases) do
     {_, refs} =
       Macro.prewalk(node, [], fn
-        {{:., _, [{:__aliases__, _, parts}, fun]}, _, _args} = n, acc when is_atom(fun) ->
-          if resolves_to_escalation?(parts, aliases), do: {n, [fun | acc]}, else: {n, acc}
+        {{:., _, [mod_ast, fun]}, _, _args} = n, acc when is_atom(fun) ->
+          if resolves_module_ref_to_escalation?(mod_ast, aliases),
+            do: {n, [fun | acc]},
+            else: {n, acc}
 
-        {:&, _, [{:/, _, [{{:., _, [{:__aliases__, _, parts}, fun]}, _, []}, _arity]}]} = n,
-        acc ->
-          if resolves_to_escalation?(parts, aliases), do: {n, [fun | acc]}, else: {n, acc}
+        {:&, _, [{:/, _, [{{:., _, [mod_ast, fun]}, _, []}, _arity]}]} = n, acc ->
+          if resolves_module_ref_to_escalation?(mod_ast, aliases),
+            do: {n, [fun | acc]},
+            else: {n, acc}
 
-        {:apply, _, [{:__aliases__, _, parts}, fun_atom, _args]} = n, acc
-        when is_atom(fun_atom) ->
-          if resolves_to_escalation?(parts, aliases), do: {n, [fun_atom | acc]}, else: {n, acc}
+        {:apply, _, [mod_ast, fun_atom, _args]} = n, acc when is_atom(fun_atom) ->
+          if resolves_module_ref_to_escalation?(mod_ast, aliases),
+            do: {n, [fun_atom | acc]},
+            else: {n, acc}
 
         node2, acc ->
           {node2, acc}
       end)
 
     refs
+  end
+
+  # `apply/3` naming a LITERAL Escalation module but a NON-literal function
+  # (Sol round 5, finding 2a): `escalation_refs_called/2` above requires the
+  # function argument to be a literal atom to attribute the call to a `ref`,
+  # and `has_dynamic_apply?/1` below only flags a non-literal MODULE — so a
+  # literal-module, dynamic-function `apply/3` fell through both, invisible
+  # to either. It cannot be scoped to any specific ref, so it fails closed
+  # outright rather than being silently skipped.
+  defp escalation_apply_dynamic_function_sites do
+    Path.wildcard("lib/**/*.ex")
+    |> Enum.reject(&(&1 == "lib/tightbeam/escalation.ex"))
+    |> Enum.flat_map(fn file ->
+      source = File.read!(file)
+      {:ok, ast} = Code.string_to_quoted(source, columns: true)
+      aliases = module_alias_map(ast)
+      defs = function_defs_from_ast(ast)
+
+      for {{name, arity}, nodes} <- defs,
+          Enum.any?(nodes, &has_escalation_apply_with_dynamic_function?(&1, aliases)),
+          do: {file, "#{name}/#{arity}"}
+    end)
+  end
+
+  defp has_escalation_apply_with_dynamic_function?(node, aliases) do
+    {_, hit?} =
+      Macro.prewalk(node, false, fn
+        {:apply, _, [mod_ast, fun_arg, _args_arg]} = n, acc ->
+          hit = not is_atom(fun_arg) and resolves_module_ref_to_escalation?(mod_ast, aliases)
+          {n, acc or hit}
+
+        n, acc ->
+          {n, acc}
+      end)
+
+    hit?
   end
 
   # `{ref, {file, "name/arity"}}` for every lib/ file (escalation.ex
@@ -1552,74 +1632,168 @@ defmodule Tightbeam.CoordinationFabricTest do
     hit?
   end
 
-  # Parses each helper's OWN SQL text for its "kind" constraint and accepts
-  # only two EXCLUSIVE shapes: `kind = '<declared>'` for a single declared
-  # kind, or an explicit `kind IN (...)` list equal to a declared pair
-  # (order-insensitive, whitespace/case-normalized). An INSERT's positional
-  # `(..., kind, ...) VALUES (..., '<literal>', ...)` counts as an equality
-  # too (`file_agent_request/2` and `effort_insert_in_txn/2` set `kind` this
-  # way rather than filtering on it). Anything else — an extra IN member, an
-  # OR, a negation, or no recognizable constraint — is rejected with a named
-  # reason; the caller decides how to report it.
-  defp kind_predicate_shape(ref, text, declared_csv) do
-    sql =
-      text
-      |> own_sql_text()
-      |> String.replace("\\n", " ")
-      |> String.replace(~r/\s+/, " ")
-      |> String.trim()
+  # A handful of ALREADY-REVIEWED `decision_requests` queries carry no kind
+  # constraint of their own because their safety comes from elsewhere in the
+  # SAME transaction, never from their own WHERE clause:
+  #
+  #   - `escalate/4`'s INSERT never names the `kind` column at all and relies
+  #     on the column's own schema DEFAULT ('statute' — proved by the DDL,
+  #     not by this function).
+  #   - `grant_waiver/6`'s two UPDATEs are scoped by `id`, and that id only
+  #     ever comes from the SAME function's own `kind = 'statute'` SELECT
+  #     immediately above it, never from a caller.
+  #
+  # Keyed by the PINNED ATOM name and the query's own normalized text — an
+  # edit to either the function OR the literal drops out of this allowlist
+  # and fails closed. A NEW unscoped literal anywhere else is not in this
+  # list and fails closed too — that is the gap this list exists to keep
+  # narrow (Sol round 5, finding 1b).
+  @pinned_unscoped_literals %{
+    escalate: [
+      "INSERT INTO decision_requests (id, raiserId, raiserSessionKey, ownerUserId, " <>
+        "assignmentId, raisedAt, deadlineAt, statuteName, actionKey, question, options, " <>
+        "context, status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'open') " <>
+        "ON CONFLICT DO NOTHING"
+    ],
+    grant_waiver: [
+      "UPDATE decision_requests SET status = 'ruled', decision = 'waived', rationale = ?2, " <>
+        "ruledBy = ?3, ruledAt = ?4 WHERE id = ?1 AND status = 'open'",
+      "UPDATE decision_requests SET rulingFactId = ?2 WHERE id = ?1"
+    ]
+  }
 
+  # Every double-quoted or triple-quoted string literal inside a chunk of
+  # already-reconstructed (`Macro.to_string/1`) source, each NORMALIZED (and
+  # quote-stripped) INDIVIDUALLY rather than joined into one blob (Sol round
+  # 5, finding 1b): a single aggregated blob let one properly-scoped query's
+  # `kind = '<declared>'` literal satisfy the whole function's check even
+  # when a SECOND query in the same function carried no kind constraint (or
+  # a wrong one) of its own — the aggregate text still contained the
+  # required substring, so the check never looked past it.
+  defp own_sql_texts(text) do
+    Regex.scan(~r/"""(?:(?!""").)*"""|"[^"\n]*"/s, text)
+    |> List.flatten()
+    |> Enum.map(&normalize_sql_literal/1)
+  end
+
+  defp normalize_sql_literal(lit) do
+    lit
+    |> String.trim_leading("\"")
+    |> String.trim_trailing("\"")
+    |> String.replace("\\n", " ")
+    |> String.replace(~r/\s+/, " ")
+    |> String.trim()
+  end
+
+  # Every OWN query literal that references `decision_requests` must
+  # individually prove one of two EXCLUSIVE shapes: `kind = '<declared>'` for
+  # a single declared kind, or an explicit `kind IN (...)` list equal to a
+  # declared pair (order-insensitive, whitespace/case-normalized). An
+  # INSERT's positional `(..., kind, ...) VALUES (..., '<literal>', ...)`
+  # counts as an equality too (`file_agent_request/2` and
+  # `effort_insert_in_txn/2` set `kind` this way rather than filtering on
+  # it). A literal with NO kind mention at all must be a reviewed, pinned
+  # exception (see `@pinned_unscoped_literals`) or it fails closed — an
+  # unscoped query is exactly the vulnerability this check exists to catch,
+  # not something a substring match anywhere else in the function can excuse
+  # (Sol round 5, finding 1b). `OR` is rejected outright, everywhere, before
+  # any of that: no reviewed helper's SQL uses it today, so ANY occurrence in
+  # a `decision_requests` query is unreviewed disjunction, and `kind =
+  # 'statute' OR 1 = 1` (or an exact IN-list with the same `OR 1 = 1` tacked
+  # on) must not slip past an eq/IN check that never looked for it (Sol round
+  # 5, finding 1a).
+  defp kind_predicate_shape(ref, text, declared_csv) do
     declared =
       declared_csv
       |> String.split(",")
       |> Enum.map(&(&1 |> String.trim() |> String.downcase()))
 
-    negations =
-      Regex.scan(~r/\bkind\s*(?:!=|<>)\s*'[a-z_]+'|\bkind\s+not\s+in\b|\bkind\s+is\s+not\b/i, sql)
+    own_literals =
+      text
+      |> own_sql_texts()
+      |> Enum.filter(&(&1 =~ "decision_requests"))
 
-    eq_matches =
-      Regex.scan(~r/\bkind\s*=\s*'([a-z_]+)'/i, sql)
-      |> Enum.map(fn [_, v] -> String.downcase(v) end)
+    if own_literals == [] do
+      {:error,
+       "#{ref}: its own SQL text has no per-literal decision_requests query to check — it may " <>
+         "be attribute-derived or assembled from parts, which this text-based scan cannot " <>
+         "decompose; review by hand"}
+    else
+      own_literals
+      |> Enum.map(&single_literal_kind_shape(ref, &1, declared))
+      |> Enum.find(:ok, &match?({:error, _}, &1))
+    end
+  end
 
-    in_matches =
-      Regex.scan(~r/\bkind\s+in\s*\(\s*((?:'[a-z_]+'\s*,\s*)*'[a-z_]+')\s*\)/i, sql)
-      |> Enum.map(fn [_, list] ->
-        Regex.scan(~r/'([a-z_]+)'/i, list) |> Enum.map(fn [_, v] -> String.downcase(v) end)
-      end)
-
-    insert_matches = insert_kind_literals(sql)
-
+  defp single_literal_kind_shape(ref, literal, declared) do
     cond do
-      negations != [] ->
-        {:error, "#{ref}: unrecognized kind-constraint shape (negation) in its own SQL text"}
+      literal =~ ~r/\bOR\b/i ->
+        {:error,
+         "#{ref}: its own SQL contains OR in a decision_requests query — no reviewed helper " <>
+           "uses OR today, so any occurrence is unreviewed disjunction and fails closed: " <>
+           inspect(literal)}
 
-      length(declared) == 1 ->
-        [only] = declared
-        eqish = Enum.uniq(eq_matches ++ insert_matches)
-
-        if eqish == [only] and in_matches == [] do
+      not (literal =~ ~r/\bkind\b/i) ->
+        if literal in Map.get(@pinned_unscoped_literals, ref, []) do
           :ok
         else
           {:error,
-           "#{ref}: pinned kind #{inspect(only)} but its own SQL constrains kind to " <>
-             "eq=#{inspect(eqish)} in=#{inspect(in_matches)} — expected exactly `kind = '#{only}'`"}
-        end
-
-      length(declared) == 2 ->
-        sorted_declared = Enum.sort(declared)
-        normalized_in = in_matches |> Enum.map(&Enum.sort/1) |> Enum.uniq()
-
-        if eq_matches ++ insert_matches == [] and normalized_in == [sorted_declared] do
-          :ok
-        else
-          {:error,
-           "#{ref}: pinned pair #{inspect(sorted_declared)} but its own SQL's kind shape is " <>
-             "eq=#{inspect(eq_matches ++ insert_matches)} in=#{inspect(normalized_in)} — " <>
-             "expected exactly one `kind IN (...)` matching the pair"}
+           "#{ref}: a decision_requests query names no kind constraint at all and is not a " <>
+             "reviewed exception in @pinned_unscoped_literals: #{inspect(literal)}"}
         end
 
       true ->
-        {:error, "#{ref}: unsupported declared-kind arity #{inspect(declared)}"}
+        negations =
+          Regex.scan(
+            ~r/\bkind\s*(?:!=|<>)\s*'[a-z_]+'|\bkind\s+not\s+in\b|\bkind\s+is\s+not\b/i,
+            literal
+          )
+
+        eq_matches =
+          Regex.scan(~r/\bkind\s*=\s*'([a-z_]+)'/i, literal)
+          |> Enum.map(fn [_, v] -> String.downcase(v) end)
+
+        in_matches =
+          Regex.scan(~r/\bkind\s+in\s*\(\s*((?:'[a-z_]+'\s*,\s*)*'[a-z_]+')\s*\)/i, literal)
+          |> Enum.map(fn [_, list] ->
+            Regex.scan(~r/'([a-z_]+)'/i, list) |> Enum.map(fn [_, v] -> String.downcase(v) end)
+          end)
+
+        insert_matches = insert_kind_literals(literal)
+
+        cond do
+          negations != [] ->
+            {:error, "#{ref}: unrecognized kind-constraint shape (negation): #{inspect(literal)}"}
+
+          length(declared) == 1 ->
+            [only] = declared
+            eqish = Enum.uniq(eq_matches ++ insert_matches)
+
+            if eqish == [only] and in_matches == [] do
+              :ok
+            else
+              {:error,
+               "#{ref}: pinned kind #{inspect(only)} but a query constrains kind to " <>
+                 "eq=#{inspect(eqish)} in=#{inspect(in_matches)} — expected exactly " <>
+                 "`kind = '#{only}'`: #{inspect(literal)}"}
+            end
+
+          length(declared) == 2 ->
+            sorted_declared = Enum.sort(declared)
+            normalized_in = in_matches |> Enum.map(&Enum.sort/1) |> Enum.uniq()
+
+            if eq_matches ++ insert_matches == [] and normalized_in == [sorted_declared] do
+              :ok
+            else
+              {:error,
+               "#{ref}: pinned pair #{inspect(sorted_declared)} but a query's kind shape is " <>
+                 "eq=#{inspect(eq_matches ++ insert_matches)} in=#{inspect(normalized_in)}: " <>
+                 "#{inspect(literal)}"}
+            end
+
+          true ->
+            {:error, "#{ref}: unsupported declared-kind arity #{inspect(declared)}"}
+        end
     end
   end
 
@@ -1653,17 +1827,6 @@ defmodule Tightbeam.CoordinationFabricTest do
     end)
   end
 
-  # Every double-quoted or triple-quoted string literal inside a chunk of
-  # already-reconstructed (`Macro.to_string/1`) source — the same shape
-  # `sql_literals/1` looks for in a whole file, applied here to one
-  # function's own text so `kind_predicate_shape/3` parses only its actual
-  # SQL, not doc text or argument names that happen to contain "kind".
-  defp own_sql_text(text) do
-    Regex.scan(~r/"""(?:(?!""").)*"""|"[^"\n]*"/s, text)
-    |> List.flatten()
-    |> Enum.join(" ")
-  end
-
   ## Teeth checks (Sol round 4): each one proves the HARDENED tripwire above
   ## actually rejects the exact evasion it was built to close, on a small
   ## synthetic fixture — never on the real escalation.ex, so these prove the
@@ -1694,6 +1857,63 @@ defmodule Tightbeam.CoordinationFabricTest do
       "\"SELECT COUNT(*) FROM decision_requests WHERE kind IN ('statute','effort')\""
 
     assert :ok = kind_predicate_shape(:fake_pair_ok, exact_pair, "statute,effort")
+  end
+
+  test "TEETH (hole 1, round 5): OR in a decision_requests query is rejected outright, since " <>
+         "no reviewed helper uses it" do
+    # eq + OR: an exclusive `kind = '<declared>'` match with a disjunction
+    # tacked on that a bare eq/IN check never looked for.
+    eq_or = "\"SELECT id FROM decision_requests WHERE kind = 'statute' OR 1 = 1\""
+    assert {:error, message} = kind_predicate_shape(:fake_or_eq, eq_or, "statute")
+    assert message =~ "fake_or_eq"
+
+    # IN + OR: same shape, on the pair form.
+    in_or =
+      "\"SELECT id FROM decision_requests WHERE kind IN ('statute','effort') OR 1 = 1\""
+
+    assert {:error, message} = kind_predicate_shape(:fake_or_in, in_or, "statute,effort")
+    assert message =~ "fake_or_in"
+
+    # Sanity: the OR-free forms these are derived from still pass.
+    assert :ok =
+             kind_predicate_shape(
+               :fake_or_eq_clean,
+               "\"SELECT id FROM decision_requests WHERE kind = 'statute'\"",
+               "statute"
+             )
+  end
+
+  test "TEETH (hole 1, round 5): a second, unscoped query in the same helper is not masked " <>
+         "by the first, properly-scoped one" do
+    # THE MASKING BUG: two SEPARATE query literals in one function — the
+    # first properly scoped to the declared kind, the second naming
+    # `decision_requests` with no kind constraint at all. An aggregate,
+    # joined-text check sees the declared literal ANYWHERE in the combined
+    # blob and never notices the second query lacks its own.
+    masked_text =
+      "\"SELECT id FROM decision_requests WHERE kind = 'statute' AND id = ?1\"\n" <>
+        "\"UPDATE decision_requests SET status = 'closed' WHERE id = ?1\""
+
+    assert {:error, message} = kind_predicate_shape(:fake_masked, masked_text, "statute")
+    assert message =~ "fake_masked"
+
+    # THE OLD CHECK, for contrast: joining every literal into one blob before
+    # looking for the declared kind's own predicate — the masking bug being
+    # closed.
+    aggregate = masked_text |> own_sql_texts() |> Enum.join(" ")
+
+    assert aggregate =~ "kind = 'statute'",
+           "the old aggregate check was expected to find the declared predicate ANYWHERE in " <>
+             "the joined text (that is the masking bug being closed) but it did not"
+
+    # A widened SECOND query is caught the same way: the first is exact, the
+    # second smuggles in a foreign kind via a bare eq (not an IN — that is
+    # hole 1's original finding, covered above).
+    widened_second =
+      "\"SELECT id FROM decision_requests WHERE kind = 'statute' AND id = ?1\"\n" <>
+        "\"SELECT id FROM decision_requests WHERE kind = 'effort' AND id = ?1\""
+
+    assert {:error, _} = kind_predicate_shape(:fake_widened_second, widened_second, "statute")
   end
 
   test "TEETH (hole 2): an assembled or attribute-derived table name is caught at the AST " <>
@@ -1732,7 +1952,7 @@ defmodule Tightbeam.CoordinationFabricTest do
       # `Macro.to_string/1`'s reconstructed text — proven blind to it.
       naive_text = Enum.map_join(nodes, "\n", &Macro.to_string/1)
 
-      refute own_sql_text(naive_text) =~ "decision_requests",
+      refute naive_text |> own_sql_texts() |> Enum.any?(&(&1 =~ "decision_requests")),
              "a Macro.to_string substring scan was expected to MISS this evasion (that is " <>
                "the bug being closed) but it caught it: #{src}"
     end
@@ -1837,6 +2057,136 @@ defmodule Tightbeam.CoordinationFabricTest do
     {:ok, literal_ast} = Code.string_to_quoted(literal_src, columns: true)
     [{{:perform, 1}, literal_nodes}] = literal_ast |> function_defs_from_ast() |> Map.to_list()
     refute Enum.any?(literal_nodes, &has_dynamic_apply?/1)
+  end
+
+  test "TEETH (hole 3, round 5): apply/3 naming a LITERAL Escalation module but a " <>
+         "non-literal function is flagged, since it cannot be scoped to any ref" do
+    dynamic_fun_src = ~S'''
+    defmodule Fake.EscalationDynamicFun do
+      def perform(fun, args) do
+        apply(Tightbeam.Escalation, fun, args)
+      end
+    end
+    '''
+
+    literal_fun_src = ~S'''
+    defmodule Fake.EscalationLiteralFun do
+      def perform(args) do
+        apply(Tightbeam.Escalation, :consume, args)
+      end
+    end
+    '''
+
+    {:ok, dynamic_ast} = Code.string_to_quoted(dynamic_fun_src, columns: true)
+    aliases_a = module_alias_map(dynamic_ast)
+    [{{:perform, 2}, dynamic_nodes}] = dynamic_ast |> function_defs_from_ast() |> Map.to_list()
+
+    # THE HARDENED CHECK: a literal Escalation module, dynamic function.
+    assert Enum.any?(dynamic_nodes, &has_escalation_apply_with_dynamic_function?(&1, aliases_a))
+
+    # Neither of the OLD checks caught this shape on its own: the module is
+    # literal, so the dynamic-MODULE apply scan does not flag it; the
+    # function is not a literal atom, so `escalation_refs_called/2` cannot
+    # attribute it to any ref either.
+    refute has_dynamic_apply?(hd(dynamic_nodes))
+    assert Enum.flat_map(dynamic_nodes, &escalation_refs_called(&1, aliases_a)) == []
+
+    {:ok, literal_ast} = Code.string_to_quoted(literal_fun_src, columns: true)
+    aliases_b = module_alias_map(literal_ast)
+    [{{:perform, 1}, literal_nodes}] = literal_ast |> function_defs_from_ast() |> Map.to_list()
+
+    refute Enum.any?(literal_nodes, &has_escalation_apply_with_dynamic_function?(&1, aliases_b))
+  end
+
+  test "TEETH (hole 3, round 5): apply/3's ATOM-form module reference is caught, where an " <>
+         "`__aliases__`-only resolver would miss it" do
+    src = ~S'''
+    defmodule Fake.AtomFormApply do
+      def perform(db, id) do
+        apply(:"Elixir.Tightbeam.Escalation", :consume, [db, id])
+      end
+    end
+    '''
+
+    {:ok, ast} = Code.string_to_quoted(src, columns: true)
+    aliases = module_alias_map(ast)
+    [{{:perform, 2}, nodes}] = ast |> function_defs_from_ast() |> Map.to_list()
+
+    # THE HARDENED CHECK: atom-form and `__aliases__`-form modules resolve
+    # identically.
+    refs = nodes |> Enum.flat_map(&escalation_refs_called(&1, aliases)) |> Enum.uniq()
+    assert refs == [:consume]
+
+    # THE OLD CHECK, for contrast: a resolver that only ever matched
+    # `{:__aliases__, _, parts}` for the module position was expected to
+    # MISS this — the atom form has no such node to match at all.
+    naive_refs =
+      elem(
+        Macro.prewalk(hd(nodes), [], fn
+          {:apply, _, [{:__aliases__, _, parts}, fun_atom, _args]} = n, acc
+          when is_atom(fun_atom) ->
+            if resolves_to_escalation?(parts, aliases), do: {n, [fun_atom | acc]}, else: {n, acc}
+
+          n, acc ->
+            {n, acc}
+        end),
+        1
+      )
+
+    assert naive_refs == [],
+           "an `__aliases__`-only resolver was expected to MISS the atom-form module (that is " <>
+             "the evasion being closed) but it caught it"
+  end
+
+  test "TEETH (hole 3, round 5): a PREFIX alias (`alias Tightbeam, as: TB` then " <>
+         "`TB.Escalation.consume(...)`) is resolved, where a whole-module-only alias map " <>
+         "would miss it" do
+    src = ~S'''
+    defmodule Fake.PrefixAliasCaller do
+      alias Tightbeam, as: TB
+
+      def sneaky(db, id) do
+        TB.Escalation.consume(db, id)
+      end
+    end
+    '''
+
+    {:ok, ast} = Code.string_to_quoted(src, columns: true)
+    aliases = module_alias_map(ast)
+    [{{:sneaky, 2}, nodes}] = ast |> function_defs_from_ast() |> Map.to_list()
+
+    # THE HARDENED CHECK: the alias map's `TB -> [Tightbeam]` prefix is
+    # expanded before the trailing `.Escalation` segment is compared.
+    refs = nodes |> Enum.flat_map(&escalation_refs_called(&1, aliases)) |> Enum.uniq()
+    assert refs == [:consume]
+
+    # THE OLD CHECK, for contrast: a resolver that only expanded a
+    # WHOLE-MODULE alias (`[single] -> Map.get(aliases, single) == [...]`)
+    # never looks at a two-segment `[:TB, :Escalation]` reference at all —
+    # it falls straight to a catch-all `false`.
+    naive_resolves? = fn parts ->
+      case parts do
+        [:Tightbeam, :Escalation] -> true
+        [single] -> Map.get(aliases, single) == [:Tightbeam, :Escalation]
+        _ -> false
+      end
+    end
+
+    naive_refs =
+      elem(
+        Macro.prewalk(hd(nodes), [], fn
+          {{:., _, [{:__aliases__, _, parts}, fun]}, _, _args} = n, acc when is_atom(fun) ->
+            if naive_resolves?.(parts), do: {n, [fun | acc]}, else: {n, acc}
+
+          n, acc ->
+            {n, acc}
+        end),
+        1
+      )
+
+    assert naive_refs == [],
+           "a whole-module-only alias resolver was expected to MISS a prefix alias (that is " <>
+             "the evasion being closed) but it caught it"
   end
 
   test "the statute gate read cannot be reached by an agent row sharing its raiser",
