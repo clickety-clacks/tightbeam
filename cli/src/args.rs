@@ -130,6 +130,20 @@ pub enum Command {
         identity: Identity,
         status: Option<String>,
     },
+    /// File one question at a named principal (coordination-fabric-v1 §7
+    /// `input-needed` carrier). The row is data its asker chooses to honor:
+    /// filing it blocks nothing, here or on the gateway.
+    Ask {
+        identity: Identity,
+        target: Target,
+        question: String,
+        about: Option<String>,
+    },
+    Answer {
+        identity: Identity,
+        request_id: String,
+        answer: String,
+    },
     RevokeAssignment {
         identity: Identity,
         assignment_id: String,
@@ -170,6 +184,9 @@ pub enum Command {
         identity: Identity,
         filters: ToplineFilters,
         tree: bool,
+        /// Keyset cursor: the work item id the previous page ended on.
+        after: Option<String>,
+        limit: Option<String>,
     },
     Topline {
         identity: Identity,
@@ -203,6 +220,11 @@ pub enum Command {
     Attests {
         identity: Identity,
         assignment_id: String,
+        /// Keyset cursor: the attest id the previous page ended on.
+        after: Option<String>,
+        /// Page size, rendered as a JSON number. No default — an audit list that
+        /// silently shortens itself is worse than a long one.
+        limit: Option<String>,
     },
     CoordinationShare {
         identity: Identity,
@@ -463,7 +485,7 @@ COMMANDS:
       ids the previous response handed you. --limit defaults to 50, caps at 500.
   toplines [--origin user|session|all] [--owner <userId>] [--state <state>]
            [--quiet-over <duration>] [--spec <name> [--spec-sha <sha>]]
-           [--session <key>] [--tree]
+           [--session <key>] [--tree] [--after <workItemId>] [--limit <n>]
       The work telemetry the substrate already knows: every work item you can
       see, with its assignment/job/attest/turn counts, who holds it, whether
       anything is running, and how long it has been quiet. --tree renders the
@@ -473,7 +495,13 @@ COMMANDS:
       epistemic status (linked, from_turn, no_turn_observed, unrecorded).
       No percentages and no completion estimates: the rows do not support them.
         tightbeam toplines --origin user --state open --as-user flynn
+      --after/--limit page the FLAT roster on a stable (createdAt, id) cursor;
+      the response carries nextAfter and hasMoreAfter. They bound the RESPONSE,
+      not the gateway's work — the reader still computes telemetry over every
+      item you can see. They are refused with --tree, because a forest has no
+      page boundary that is not also a wrong answer.
         tightbeam toplines --quiet-over 2h --as-user flynn
+        tightbeam toplines --limit 25 --after wi_abc123 --as-user flynn
   topline (--under <workItemId> [roster filters] | --assignments <id,...>)
       --under walks one item's causal subtree (the anchor plus its visible
       linked descendants). --assignments names an explicit assignment set and
@@ -508,6 +536,20 @@ COMMANDS:
       Rule an effort-without-effect check-in routed to your principal.
   decision-requests [--status open|ruled|all]
       List decision requests visible to your principal.
+  ask (--session <key> | --role <name> | --user <id>) --question "<text>"
+      [--about <assignmentId>]
+      Put one question to another principal and get back its id. THE QUESTION
+      HOLDS NOTHING: filing it does not pause your assignment, your turn, or
+      anything else — you still owe what you owed, and you choose whether to
+      wait for the answer, work something else, or surrender the card. Read the
+      answer with decision-requests / decision-request, take the question back
+      with withdraw --request <id> --reason "...". The person you asked gets it
+      at their next turn boundary, or within 30 minutes, whichever is first.
+        tightbeam ask --role owner --question "ship behind a flag or block?" --as coder
+  answer --request <decisionRequestId> --answer "<text>"
+      Answer a question that was put to you. It is an answer, not a ruling: it
+      authorizes nothing and unblocks nothing on its own. Only the principal
+      the question was asked of can answer it.
   revoke-assignment <assignmentId>
       Revoke when the assignment handler already authorizes your principal.
   reopen-assignment <assignmentId> --reason "..."
@@ -521,8 +563,13 @@ COMMANDS:
          [--verdict <kind>] [--note "..."]
       File against an assignment. Verdicts on review cards require the review
       holder; producer-card verdicts may be filed by any session or user.
-  attests <assignmentId>
-      List every attest filed against an assignment.
+  attests <assignmentId> [--after <attestId>] [--limit <n>]
+      List every attest filed against an assignment. Without --limit you get
+      all of them: an audit list that shortens itself silently is worse than a
+      long one. --after <attestId> resumes strictly after the attest you name,
+      so you can walk a long trail without re-reading it; the response carries
+      nextAfter and hasMoreAfter to drive the next call.
+        tightbeam attests as_abc --limit 50 --as-user flynn
   assignments [--session <key> | --role <name>] [--state open|closed|all]
       List assignments (open by default).
 
@@ -753,6 +800,42 @@ fn parse_duration(flag: &str, text: &str) -> Result<String, String> {
         .expect("an ASCII digit sequence parses as a JavaScript number");
     Ok(js_number_json(value * multiplier))
 }
+
+const ATTESTS_USAGE: &str =
+    "usage: tightbeam attests <assignmentId> [--after <attestId>] [--limit <n>]";
+
+// `--after`/`--limit` are shared by `attests` and `toplines` (seam ④), so the
+// two flags are parsed once. An EMPTY value is a refusal rather than "no
+// cursor": a caller that typed the flag meant something by it, and quietly
+// dropping it would return page one while the caller believes it holds page two.
+fn cursor_flag(
+    flags: &HashMap<String, String>,
+    name: &str,
+    expects: &str,
+) -> Result<Option<String>, String> {
+    if flags.get(name).is_some_and(String::is_empty) {
+        return Err(format!("--{name} requires {expects}"));
+    }
+    Ok(nonempty(flags, name))
+}
+
+fn page_limit(flags: &HashMap<String, String>) -> Result<Option<String>, String> {
+    match nonempty(flags, "limit") {
+        None if flags.contains_key("limit") => {
+            Err("--limit requires a positive integer".to_owned())
+        }
+        None => Ok(None),
+        Some(text) => match text.parse::<u32>() {
+            Ok(value) if value > 0 => Ok(Some(value.to_string())),
+            _ => Err("--limit requires a positive integer".to_owned()),
+        },
+    }
+}
+
+const ASK_USAGE: &str = "usage: tightbeam ask (--session <key> | --role <name> | --user <id>) --question \"<text>\" [--about <assignmentId>]";
+
+const ANSWER_USAGE: &str =
+    "usage: tightbeam answer --request <decisionRequestId> --answer \"<text>\"";
 
 const COORDINATION_SHARE_USAGE: &str =
     "usage: tightbeam coordination-share --session <key> --from <epochMs> --to <epochMs>";
@@ -1214,6 +1297,41 @@ fn parse_with_optional_catalog(
                 status: nonempty(flags, "status"),
             })
         }
+        "ask" => {
+            let targets = [
+                nonempty(flags, "session").map(Target::Session),
+                nonempty(flags, "role").map(Target::Role),
+                nonempty(flags, "user").map(Target::User),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+            if parsed.positional.get(1).is_some() || targets.len() != 1 {
+                return Err(ASK_USAGE.to_owned());
+            }
+            let question = nonempty(flags, "question").ok_or_else(|| ASK_USAGE.to_owned())?;
+            if flags.get("about").is_some_and(String::is_empty) {
+                return Err("--about requires an assignment id".to_owned());
+            }
+            Ok(Command::Ask {
+                identity: identity(flags)?,
+                target: targets.into_iter().next().expect("exactly one target"),
+                question,
+                about: nonempty(flags, "about"),
+            })
+        }
+        "answer" => {
+            let request_id = nonempty(flags, "request");
+            let answer = nonempty(flags, "answer");
+            if parsed.positional.get(1).is_some() || request_id.is_none() || answer.is_none() {
+                return Err(ANSWER_USAGE.to_owned());
+            }
+            Ok(Command::Answer {
+                identity: identity(flags)?,
+                request_id: request_id.expect("checked above"),
+                answer: answer.expect("checked above"),
+            })
+        }
         "revoke-assignment" => {
             if parsed.positional.len() != 2 {
                 return Err("usage: tightbeam revoke-assignment <assignmentId>".to_owned());
@@ -1325,10 +1443,23 @@ fn parse_with_optional_catalog(
             if parsed.positional.len() != 1 {
                 return Err(TOPLINES_USAGE.to_owned());
             }
+            let after = cursor_flag(flags, "after", "a work item id")?;
+            let limit = page_limit(flags)?;
+            // Refused HERE as well as at the gateway. A forest has no page
+            // boundary that is not also a wrong answer, and finding that out
+            // after a round trip is worse than finding it out on the command
+            // line (coordination-fabric-v1 §13 seam ④).
+            if flags.contains_key("tree") && (after.is_some() || limit.is_some()) {
+                return Err(
+                    "--after/--limit page the flat roster; --tree returns a forest".to_owned(),
+                );
+            }
             Ok(Command::Toplines {
                 identity: identity(flags)?,
                 filters: topline_filters(flags)?,
                 tree: flags.contains_key("tree"),
+                after,
+                limit,
             })
         }
         "topline" => {
@@ -1473,11 +1604,13 @@ fn parse_with_optional_catalog(
         }
         "attests" => {
             if parsed.positional.len() != 2 {
-                return Err("usage: tightbeam attests <assignmentId>".to_owned());
+                return Err(ATTESTS_USAGE.to_owned());
             }
             Ok(Command::Attests {
                 identity: identity(flags)?,
                 assignment_id: parsed.positional[1].clone(),
+                after: cursor_flag(flags, "after", "an attest id")?,
+                limit: page_limit(flags)?,
             })
         }
         "assignments" => {
@@ -1594,7 +1727,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, ask, answer, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -2074,6 +2207,8 @@ mod tests {
         assert_eq!(
             headings,
             [
+                "answer",
+                "ask",
                 "assimilate",
                 "assign",
                 "assignments",
@@ -2690,7 +2825,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, ask, answer, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned())
         );
     }
 

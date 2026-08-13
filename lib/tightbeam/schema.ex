@@ -35,26 +35,34 @@ defmodule Tightbeam.Schema do
   # The shape this build writes. Bump it when a production table changes in a
   # way that makes an older database unreadable, and give the refusal below a
   # sentence saying what changed.
-  # `coordination-fabric-classes-v1` (2026-08-13, fabric §13 Phase 1 seams ①/②):
-  # `wakes` gained `class`, `classElection`, `deliveryRule`, `digest` and
-  # `summon`. `CREATE TABLE IF NOT EXISTS` adds no column to a table that
-  # already exists, so a `model-identity-v1` database would answer every classed
-  # read with `no such column` — and a hand-added column would be worse, because
-  # its rows would carry no class election at all while the shape claimed they
-  # did. Refuse, name it, and let the database be recreated.
   #
-  # `coordination-fabric-classes-v2` (2026-08-13, Sol xhigh review round 2,
-  # finding 2): `wakes.classElection`'s CHECK constraint gained `'batcher'` —
-  # the digest carrier's honest attribution (round-1 finding 7; the batcher
-  # built the carrier, so stamping it `'sender'` was an untrue audit fact).
-  # `CREATE TABLE IF NOT EXISTS` does not ALTER an existing table's
-  # constraints any more than it adds a column: a `coordination-fabric-classes-v1`
-  # database's `wakes` table still enforces the OLD two-value CHECK, so the
-  # first digest-carrier insert against it would die on a raw, unnamed SQLite
-  # `CHECK constraint failed` — the exact kind of surprise this stamp exists to
-  # turn into a named refusal instead. Bump it so that database is refused BY
-  # NAME, same as any other shape this build cannot read.
-  @shape "coordination-fabric-classes-v2"
+  # TWO LINES CARRIED THIS PHASE TO DIFFERENT NAMES, and this stamp is where
+  # they merge. Wave 1 (wakes classes/delivery, seams ①/②) stamped
+  # `coordination-fabric-classes-v1` then `-v2` (`classElection` gained
+  # `'batcher'`, Sol xhigh review round 2 finding 2). Wave 2 (the agent
+  # question arm, seams ③/④) stamped `coordination-fabric-v1-phase1` then
+  # `-v2` (`decision_requests.deadlineAt` went from `NOT NULL` to nullable,
+  # Sol xhigh review round 2 finding 2 on THAT delta). Neither name ever
+  # described the OTHER line's DDL, so neither could serve the merged tree —
+  # this is a THIRD, brand-new name covering the union of both waves' schema
+  # (`wakes`'s class/delivery columns AND `decision_requests`'s agent arm),
+  # never having named any earlier vintage of either line (verified against
+  # both histories at merge time).
+  #
+  # `decision_requests.deadlineAt` went from `NOT NULL` to nullable at
+  # `coordination-fabric-v1-phase1-v2` (2026-08-13, Sol xhigh review round 2,
+  # finding 2 on that delta) — the agent arm's CHECK grew an explicit
+  # `deadlineAt IS NULL` requirement (finding 1 of round 1 on the same
+  # delta), and the stamp bumped for the same reason wave 1's did.
+  #
+  # `CREATE TABLE IF NOT EXISTS` adds no column to a table that already
+  # exists and does not widen an existing CHECK or relax an existing NOT
+  # NULL — a `classes-v1`, `classes-v2`, `v1-phase1`, or `v1-phase1-v2`
+  # database's tables still enforce their OLD shapes exactly, so the first
+  # read or write this build makes against the NEW columns/constraints would
+  # die on a raw, unnamed SQLite error instead of a refusal that names what
+  # changed. Refuse, name it, and let the database be recreated.
+  @shape "coordination-fabric-v1-phase1-v3"
 
   @supervision_liveness_objects [
     %{

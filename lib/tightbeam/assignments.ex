@@ -440,15 +440,68 @@ defmodule Tightbeam.Assignments do
 
   @doc "List every attest filed against an assignment in deterministic order."
   @spec list_attests(DB.server(), String.t()) :: [map()]
-  def list_attests(db, assignment_id) do
+  def list_attests(db, assignment_id), do: list_attests(db, assignment_id, nil, nil)
+
+  @doc """
+  The same list, paged by a `(ts, id)` KEYSET (fabric §13 Phase 1 seam ④,
+  GitHub #13).
+
+  `after_id` names an attest ON THIS ASSIGNMENT and the page begins strictly
+  after its `(ts, id)` — the same pair `ORDER BY ts ASC, id ASC` already sorts
+  on, and both components are immutable once written, so a page boundary is
+  stable no matter what lands next. `ts` alone would not do: it is a wall-clock
+  millisecond and two attests filed in the same millisecond would either repeat
+  or vanish, which is precisely the bug an OFFSET pager ships with.
+
+  `limit` may be nil, and NIL IS THE DEFAULT everywhere it is reachable: this
+  list is a per-assignment audit trail, and a default page size would silently
+  shorten every existing caller's answer (Law 2 — an optimization that loses
+  rows is wrong). One extra row is read to answer `has_more_after` honestly.
+  """
+  @spec list_attests(
+          DB.server(),
+          String.t(),
+          {integer(), String.t()} | nil,
+          pos_integer() | nil
+        ) :: [map()]
+  def list_attests(db, assignment_id, cursor, limit) do
+    {range_sql, range_params} = attest_keyset(cursor)
+    next = length(range_params) + 2
+
+    {limit_sql, limit_params} =
+      if limit, do: {" LIMIT ?#{next}", [limit]}, else: {"", []}
+
     {:ok, rows} =
       DB.query(
         db,
-        "SELECT id, assignmentId, kind, verdictKind, note, bySession, byUser, producer, producerCommand, byHarness, byProvider, commitRefs, ts FROM attests WHERE assignmentId = ?1 ORDER BY ts ASC, id ASC",
-        [assignment_id]
+        "SELECT id, assignmentId, kind, verdictKind, note, bySession, byUser, producer, producerCommand, byHarness, byProvider, commitRefs, ts FROM attests WHERE assignmentId = ?1#{range_sql} ORDER BY ts ASC, id ASC#{limit_sql}",
+        [assignment_id | range_params] ++ limit_params
       )
 
     Enum.map(rows, &attest/1)
+  end
+
+  # Row-value comparison written out longhand rather than `(ts, id) > (?, ?)`:
+  # the expanded form is what every SQLite build in the fleet supports, and it
+  # is the same predicate.
+  defp attest_keyset(nil), do: {"", []}
+
+  defp attest_keyset({ts, id}),
+    do: {" AND (ts > ?2 OR (ts = ?2 AND id > ?3))", [ts, id]}
+
+  @doc """
+  Resolve an attest cursor to its `(ts, id)` order key, scoped to one assignment.
+
+  `:error` for an id that does not exist AND for an id belonging to a different
+  assignment — one answer, so the cursor cannot be used to probe for attests on
+  assignments the caller did not name.
+  """
+  @spec attest_cursor(DB.server(), String.t(), String.t()) :: {integer(), String.t()} | :error
+  def attest_cursor(db, assignment_id, after_id) do
+    case DB.query(db, "SELECT ts, assignmentId FROM attests WHERE id = ?1", [after_id]) do
+      {:ok, [[ts, ^assignment_id]]} -> {ts, after_id}
+      _ -> :error
+    end
   end
 
   @doc """
@@ -1265,16 +1318,79 @@ defmodule Tightbeam.Assignments do
     end
   end
 
+  # The hard cap on one page. A larger request is CLAMPED, never refused, and the
+  # clamp is observable in the returned count — `transcript`'s rule.
+  @max_attest_page 500
+
   defp attests_result(db, call) do
     assignment_id = call.params[:assignment_id]
 
-    with :ok <- principal_allowed(call.principal, "attests") do
-      case DB.query(db, "SELECT 1 FROM assignments WHERE id = ?1", [assignment_id]) do
-        {:ok, [[1]]} -> %{attests: list_attests(db, assignment_id)}
-        {:ok, []} -> error("unknown_assignment", "unknown assignment: #{assignment_id}")
-      end
+    with :ok <- principal_allowed(call.principal, "attests"),
+         {:ok, limit} <- attest_limit(call.params[:limit]),
+         :known <- known_assignment(db, assignment_id),
+         {:ok, cursor} <- attest_after(db, assignment_id, call.params[:after]) do
+      attest_page(db, assignment_id, cursor, limit, paging?(call.params))
+    else
+      :unknown -> error("unknown_assignment", "unknown assignment: #{assignment_id}")
+      {:error, error} -> error
+      other -> other
     end
   end
+
+  defp known_assignment(db, assignment_id) do
+    case DB.query(db, "SELECT 1 FROM assignments WHERE id = ?1", [assignment_id]) do
+      {:ok, [[1]]} -> :known
+      {:ok, []} -> :unknown
+    end
+  end
+
+  defp paging?(params), do: not is_nil(params[:after]) or not is_nil(params[:limit])
+
+  # No `--after`/`--limit` at all: the response carries ONLY the key it always
+  # carried (Sol xhigh review, finding 8). `next_after`/`has_more_after` are
+  # PAGING vocabulary — a pre-existing caller that never asked to page must see
+  # zero payload change, the same byte-identical promise `toplines`' unpaged
+  # read makes.
+  defp attest_page(db, assignment_id, cursor, _limit, false) do
+    %{attests: list_attests(db, assignment_id, cursor, nil)}
+  end
+
+  # One extra row decides `has_more_after` from the rows themselves rather than a
+  # second COUNT that could disagree with the page it describes.
+  defp attest_page(db, assignment_id, cursor, nil, true) do
+    entries = list_attests(db, assignment_id, cursor, nil)
+    %{attests: entries, next_after: last_attest_id(entries), has_more_after: false}
+  end
+
+  defp attest_page(db, assignment_id, cursor, limit, true) do
+    fetched = list_attests(db, assignment_id, cursor, limit + 1)
+    entries = Enum.take(fetched, limit)
+
+    %{
+      attests: entries,
+      next_after: last_attest_id(entries),
+      has_more_after: length(fetched) > limit
+    }
+  end
+
+  defp last_attest_id([]), do: nil
+  defp last_attest_id(entries), do: List.last(entries).id
+
+  defp attest_limit(nil), do: {:ok, nil}
+  defp attest_limit(n) when is_integer(n) and n > 0, do: {:ok, min(n, @max_attest_page)}
+  defp attest_limit(_), do: {:error, error("invalid", "--limit takes a positive integer")}
+
+  defp attest_after(_db, _assignment_id, nil), do: {:ok, nil}
+
+  defp attest_after(db, assignment_id, after_id) when is_binary(after_id) and after_id != "" do
+    case attest_cursor(db, assignment_id, after_id) do
+      :error -> {:error, error("cursor_not_found", "unknown attest cursor: #{after_id}")}
+      cursor -> {:ok, cursor}
+    end
+  end
+
+  defp attest_after(_db, _assignment_id, _after_id),
+    do: {:error, error("invalid", "--after takes an attest id")}
 
   defp create_assignment(txn, call, owner, key, files, verb) do
     case Txn.q(txn, "SELECT state, harness, provider FROM sessions WHERE sessionKey = ?1", [

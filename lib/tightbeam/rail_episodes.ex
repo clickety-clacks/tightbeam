@@ -27,7 +27,9 @@ defmodule Tightbeam.RailEpisodes do
   forgotten if that were the only prune point.
   deliberately not in `lifecycle_events`: those are observability-only and never decision
   inputs (§E3), and reading them to decide a closure is the authority violation that sank
-  the previous attempt. Episodes themselves stay durable in `decision_requests`.
+  the previous attempt. Episodes themselves stay durable in the escalation store, all of
+  it owned by `Tightbeam.Escalation` (Sol xhigh review round 2, finding 1: nothing outside
+  that module writes SQL naming the table, this doc included).
 
   A restart empties the map, so every surviving episode reads as older than any later
   evaluation and the next healthy verdict closes it. That is the conservative direction
