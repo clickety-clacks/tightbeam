@@ -1152,6 +1152,281 @@ defmodule Tightbeam.AssignmentsTest do
     assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == []
   end
 
+  # The wi_1b0237fe wedge CLASS (fabric §13 Phase 0). A review round that carries
+  # no holder-filed verdict carries no judgment, so it may not displace one — and
+  # a card CLOSED without a verdict never can carry one, which is what left the
+  # producer with no lawful exit.
+  test "a verdictless later review round never displaces the standing holder verdict", ctx do
+    producer = handle(ctx, "assign", assign_call({:user, "flynn"}, "wedge producer"))
+
+    review =
+      assign_call({:user, "flynn"}, "wedge review")
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :reviews_assignment_id], producer.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    _ =
+      attest_call({:session, "other-session"}, review.id, "verdict")
+      |> put_in([:params, :verdict_kind], "reviewed-clean")
+      |> then(&handle(ctx, "attest", &1))
+
+    _ = handle(ctx, "attest", attest_call({:session, "other-session"}, review.id, "completion"))
+
+    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == [
+             "reviewed-clean"
+           ]
+
+    verdictless =
+      assign_call({:user, "flynn"}, "verdictless round")
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :reviews_assignment_id], producer.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == [
+             "reviewed-clean"
+           ]
+
+    # The other half of the wedge, pinned so it cannot be forgotten: the closed
+    # round can never acquire the verdict the old selection demanded of it.
+    assert %{code: "assignment_closed"} =
+             attest_call({:session, "other-session"}, review.id, "verdict")
+             |> put_in([:params, :verdict_kind], "reviewed-clean")
+             |> then(&handle(ctx, "attest", &1))
+
+    # A later round that DOES carry a holder verdict still wins, as before.
+    _ =
+      attest_call({:session, "other-session"}, verdictless.id, "verdict")
+      |> put_in([:params, :verdict_kind], "changes-requested")
+      |> then(&handle(ctx, "attest", &1))
+
+    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == []
+  end
+
+  test "a self-held later review round still disqualifies after the wedge fix", ctx do
+    producer = handle(ctx, "assign", assign_call({:user, "flynn"}, "laundering producer"))
+
+    independent =
+      assign_call({:user, "flynn"}, "independent review")
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :reviews_assignment_id], producer.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    _ =
+      attest_call({:session, "other-session"}, independent.id, "verdict")
+      |> put_in([:params, :verdict_kind], "reviewed-clean")
+      |> then(&handle(ctx, "attest", &1))
+
+    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == [
+             "reviewed-clean"
+           ]
+
+    self_held =
+      assign_call({:user, "flynn"}, "self review")
+      |> put_in([:params, :reviews_assignment_id], producer.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    _ =
+      attest_call({:session, "holder"}, self_held.id, "verdict")
+      |> put_in([:params, :verdict_kind], "reviewed-clean")
+      |> then(&handle(ctx, "attest", &1))
+
+    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == []
+  end
+
+  test "reopen-assignment is the agent-reachable exit from a closed card", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "reopen me"))
+
+    assert %{code: "assignment_open"} =
+             handle(ctx, "reopen-assignment", reopen_call({:user, "flynn"}, assignment.id, "why"))
+
+    closed = handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "completion"))
+    assert closed.assignment.state == "closed"
+
+    assert %{code: "missing_reason"} =
+             handle(
+               ctx,
+               "reopen-assignment",
+               reopen_call({:user, "flynn"}, assignment.id, nil)
+             )
+
+    assert %{code: "invalid_reason"} =
+             handle(ctx, "reopen-assignment", reopen_call({:user, "flynn"}, assignment.id, "   "))
+
+    assert %{code: "process_denied"} =
+             handle(
+               ctx,
+               "reopen-assignment",
+               reopen_call({:process, "cron"}, assignment.id, "why")
+             )
+
+    assert %{code: "unknown_assignment"} =
+             handle(ctx, "reopen-assignment", reopen_call({:user, "flynn"}, "asg_missing", "why"))
+
+    assert %{code: "not_authorized"} =
+             handle(
+               ctx,
+               "reopen-assignment",
+               reopen_call({:session, "other-session"}, assignment.id, "why")
+             )
+
+    reopened =
+      handle(
+        ctx,
+        "reopen-assignment",
+        reopen_call({:user, "flynn"}, assignment.id, "the verdict this card owes was wrong")
+      )
+
+    assert %{state: "open", outcome: nil, closedAt: nil, closingAttestId: nil} = reopened
+
+    # The close was written down, not lost.
+    assert {:ok,
+            [
+              [
+                "completed",
+                closed_at,
+                nil,
+                "holder",
+                attest_id,
+                "flynn",
+                nil,
+                "the verdict this card owes was wrong"
+              ]
+            ]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT priorOutcome, priorClosedAt, priorClosedByUser, priorClosedBySession,
+                      priorClosingAttestId, reopenedByUser, reopenedBySession, reason
+               FROM assignment_reopenings WHERE assignmentId = ?1
+               """,
+               [assignment.id]
+             )
+
+    assert closed_at == closed.assignment.closedAt
+    assert attest_id == closed.assignment.closingAttestId
+
+    # The supervision entitlement an `assign` would arm is armed again.
+    assert {:ok, [["armed", "assignment_open"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state, cause FROM supervision_entitlements WHERE assignmentId = ?1",
+               [assignment.id]
+             )
+
+    assert %{code: "assignment_open"} =
+             handle(ctx, "reopen-assignment", reopen_call({:user, "flynn"}, assignment.id, "why"))
+
+    # And the point of the whole exercise: the holder can file again.
+    assert %{attest: %{kind: "completion"}} =
+             handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "completion"))
+
+    assert marker_contents(ctx.db, "holder")
+           |> Enum.any?(&(&1 == "[assignment reopened: #{assignment.id}]"))
+  end
+
+  test "reopen-assignment refuses a retired holder, a terminal item, and colliding files", ctx do
+    retired = handle(ctx, "assign", assign_call({:session, "holder"}, "retired holder card"))
+    _ = handle(ctx, "attest", attest_call({:session, "holder"}, retired.id, "completion"))
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE sessions SET state = 'retired' WHERE sessionKey = 'holder'")
+
+    assert %{code: "session_retired"} =
+             handle(
+               ctx,
+               "reopen-assignment",
+               reopen_call({:session, "holder"}, retired.id, "why")
+             )
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE sessions SET state = 'active' WHERE sessionKey = 'holder'")
+
+    item = create_work_item(ctx, "terminal item")
+
+    carded =
+      assign_call({:user, "flynn"}, "item card", nil, item.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    _ = handle(ctx, "attest", attest_call({:session, "holder"}, carded.id, "completion"))
+
+    _ =
+      handle(
+        ctx,
+        "work-item-close",
+        work_item_call("work-item-close", {:user, "flynn"}, %{work_item_id: item.id})
+      )
+
+    assert %{code: "work_item_not_open"} =
+             handle(ctx, "reopen-assignment", reopen_call({:user, "flynn"}, carded.id, "why"))
+
+    first =
+      assign_call({:user, "flynn"}, "first file card")
+      |> put_in([:params, :files], ["/tmp/p0-collision"])
+      |> then(&handle(ctx, "assign", &1))
+
+    _ = handle(ctx, "attest", attest_call({:session, "holder"}, first.id, "completion"))
+
+    _ =
+      assign_call({:user, "flynn"}, "second file card")
+      |> put_in([:params, :files], ["/tmp/p0-collision"])
+      |> then(&handle(ctx, "assign", &1))
+
+    assert %{code: "files_overlap"} =
+             handle(ctx, "reopen-assignment", reopen_call({:user, "flynn"}, first.id, "why"))
+  end
+
+  # Fabric §13 Phase 0 exit: the wedge CLASS is exercisable by an AGENT — no
+  # admin, no database console. Every principal below is a session.
+  test "an agent walks the wi_1b0237fe wedge class out through reopen-assignment", ctx do
+    producer = handle(ctx, "assign", assign_call({:session, "holder"}, "wedged producer"))
+
+    review =
+      assign_call({:session, "other-session"}, "wedging review")
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :reviews_assignment_id], producer.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    _ =
+      attest_call({:session, "other-session"}, review.id, "verdict")
+      |> put_in([:params, :verdict_kind], "changes-requested")
+      |> then(&handle(ctx, "attest", &1))
+
+    _ = handle(ctx, "attest", attest_call({:session, "other-session"}, review.id, "completion"))
+
+    # WEDGED: the standing judgment blocks the producer, the round that holds it
+    # is closed, and a verdict cannot be filed on a closed card.
+    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == []
+
+    assert %{code: "assignment_closed"} =
+             attest_call({:session, "other-session"}, review.id, "verdict")
+             |> put_in([:params, :verdict_kind], "reviewed-clean")
+             |> then(&handle(ctx, "attest", &1))
+
+    # THE EXIT: the agent that opened the round reopens it and files the verdict
+    # it now owes.
+    reopened =
+      handle(
+        ctx,
+        "reopen-assignment",
+        reopen_call(
+          {:session, "other-session"},
+          review.id,
+          "the requested changes landed; this round owes a fresh verdict"
+        )
+      )
+
+    assert reopened.state == "open"
+
+    _ =
+      attest_call({:session, "other-session"}, review.id, "verdict")
+      |> put_in([:params, :verdict_kind], "reviewed-clean")
+      |> then(&handle(ctx, "attest", &1))
+
+    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == [
+             "reviewed-clean"
+           ]
+  end
+
   test "prefixed idempotency scopes disjoint equal user and session strings", ctx do
     user = handle(ctx, "assign", assign_call({:user, "holder"}, "user", "collision"))
     session = handle(ctx, "assign", assign_call({:session, "holder"}, "session", "collision"))
@@ -1517,6 +1792,7 @@ defmodule Tightbeam.AssignmentsTest do
               "attest",
               "attests",
               "revoke-assignment",
+              "reopen-assignment",
               "assignments"
             ],
        do:
@@ -1593,6 +1869,11 @@ defmodule Tightbeam.AssignmentsTest do
 
   defp revoke_call(principal, id),
     do: call("revoke-assignment", principal, nil, %{assignment_id: id})
+
+  defp reopen_call(principal, id, reason),
+    do:
+      call("reopen-assignment", principal, nil, %{assignment_id: id, reason: reason})
+      |> Map.put(:supervision_interval_ms, 1_000)
 
   defp query_call(principal, state, holder),
     do: call("assignments", principal, holder, %{state: state})

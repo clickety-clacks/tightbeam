@@ -3445,12 +3445,17 @@ defmodule Tightbeam.ConformanceTest do
     # Deleting adjudication (2026-08-05) removed one more: C7's
     # adjudication-hold-order, whose whole subject was a hold freezing the
     # turn-end shift. The shift itself is unchanged minus that first slot.
-    assert length(@fixtures) == 64
-    assert active_fixtures == 54
+    #
+    # Fabric §13 Phase 0 (2026-08-13) adds one: C4's holder-verdict-wins, which
+    # pins review-round selection against the wi_1b0237fe wedge class. It is a
+    # pending C4 dispatch-rule fixture with its own cases, so it lands in the
+    # active and activated counts, not in the exact-mechanism skips.
+    assert length(@fixtures) == 65
+    assert active_fixtures == 55
     assert exact_skips == 10
-    assert activated_fixture_tests == 41
+    assert activated_fixture_tests == 42
     assert activated_class_tests == 5
-    assert activated_tests == 46
+    assert activated_tests == 47
   end
 
   # The structural guard for the defect this file used to carry: a catch-all clause
@@ -3497,7 +3502,8 @@ defmodule Tightbeam.ConformanceTest do
       )
     end)
 
-    assert Enum.count(entries, &(&1.scope == "fixture")) == 51
+    # 52 since C4/holder-verdict-wins joined the corpus (fabric §13 Phase 0).
+    assert Enum.count(entries, &(&1.scope == "fixture")) == 52
 
     assert %{
              scope: "case",

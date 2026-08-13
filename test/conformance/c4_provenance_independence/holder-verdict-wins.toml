@@ -1,0 +1,24 @@
+[fixture]
+class = "C4"
+name = "holder-verdict-wins"
+phase = "pending"
+blocking_phase = "P3"
+kind = "dispatch-rule"
+source = "coordination-fabric-v1 §13 Phase 0; wi_1b0237fe wedge class"
+legibility = "event:denied(rule=coder-completion-needs-independent-review)"
+
+# The wedge CLASS, pinned. Review-round selection is anchored on the rounds that
+# CARRY a holder-filed verdict, never on assignment-lifecycle recency alone: a
+# round holding no verdict by its own holder carries no judgment and may not
+# displace one. A round closed without a verdict never can acquire one — `attest`
+# refuses a verdict on a closed assignment — so the pre-fix selection left the
+# producer denied with no lawful exit, which is the Law 3 violation Phase 0 repairs.
+[[fixture.rule]]
+name = "coder-completion-needs-independent-review"
+verb = "attest"
+external_producer = true
+text = "completion needs a linked reviewed-clean verdict by the review card's different-session holder"
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "completion" },
+  { fact = "assignment.qualifying_review_verdict_kinds", op = "not_in", value = ["reviewed-clean"] },
+]
