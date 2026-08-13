@@ -1000,6 +1000,13 @@ defmodule Tightbeam.ExecutionMap do
   defp invalid(message), do: %{code: "invalid", message: message}
   defp not_found(message), do: %{code: "not_found", message: message}
 
+  # O3: the roster page's cursor miss names itself `cursor_not_found`, the
+  # same code `attests` and `transcript` use for the identical shape of
+  # refusal — an id that does not resolve, whether because it never existed
+  # or because this caller cannot see it. `not_found/1` above stays the
+  # code for a genuinely different refusal (`--under`'s anchor lookup).
+  defp cursor_not_found(message), do: %{code: "cursor_not_found", message: message}
+
   ## The flat-roster cursor (seam ④)
 
   # The hard cap. A larger request is CLAMPED and the clamp is observable in the
@@ -1039,9 +1046,11 @@ defmodule Tightbeam.ExecutionMap do
     case cursor_key(world, cursor) do
       :error ->
         # An unknown id and an id this caller cannot see are ONE answer — the
-        # same rule `--under` already follows, and the reason the cursor is
-        # resolved against the VISIBLE item map rather than the table.
-        not_found("work item not found")
+        # cursor is resolved against the VISIBLE item map rather than the
+        # table, so a stranger's id and a nonexistent one land here
+        # identically. Named `cursor_not_found` (O3), unified with
+        # `attests`/`transcript`'s cursor refusals.
+        cursor_not_found("work item not found")
 
       key ->
         # `--limit` alone is the first page: there is no cursor to be after.
