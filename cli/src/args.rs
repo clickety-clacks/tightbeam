@@ -25,6 +25,25 @@ pub enum Target {
     User(String),
 }
 
+/// One tune invocation changes one control dimension. Encoding the legal forms
+/// here keeps partial multi-control requests out of the gateway entirely.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TuneControl {
+    Harness {
+        harness: String,
+        model: String,
+        effort: Option<String>,
+        context: Option<String>,
+    },
+    Model {
+        model: String,
+        effort: Option<String>,
+        context: Option<String>,
+    },
+    Effort(String),
+    Fast(String),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     Help,
@@ -95,6 +114,11 @@ pub enum Command {
         identity: Identity,
         session_key: String,
         idempotency_key: Option<String>,
+    },
+    Tune {
+        identity: Identity,
+        session_key: String,
+        control: TuneControl,
     },
     Assign {
         identity: Identity,
@@ -415,6 +439,17 @@ COMMANDS:
 
   retire --session <key> [--key <idempotencyKey>]
       End a session deliberately.
+
+  tune --session <key> (--harness <harness> --model <model> |
+       --model <model> | --effort <level> | --fast on|off)
+       [--effort <level>] [--context <variant>]
+      Change one runtime control on an existing session. Model identity remains
+      separate fields. Same-harness model, effort, and Fast changes preserve the
+      engine conversation; a harness change starts a fresh engine context while
+      keeping the Tightbeam session, role, work, and graph position. Fast is
+      ephemeral and uses only the resident adapter's live advertised option;
+      unsupported sessions refuse it. Naming the resident harness again is a
+      refusal: omit --harness for a same-harness model change.
 
   work-item-create --title "<title>" [--spec-ref <name> --spec-sha256 <hex>]
                    [--key <idempotencyKey>]
@@ -1088,6 +1123,7 @@ fn parse_with_optional_catalog(
                 idempotency_key: nonempty(flags, "key"),
             })
         }
+        "tune" => parse_tune(&parsed, flags),
         "assign" => {
             let targets = [
                 nonempty(flags, "session").map(Target::Session),
@@ -1571,6 +1607,87 @@ fn parse_host_env_unset(
     })
 }
 
+fn parse_tune(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Command, String> {
+    const USAGE: &str = "usage: tightbeam tune --session <key> (--harness <harness> --model <model> [--effort <level>] [--context <variant>] | --model <model> [--effort <level>] [--context <variant>] | --effort <level> | --fast on|off)";
+    const ALLOWED: &[&str] = &[
+        "session",
+        "harness",
+        "model",
+        "effort",
+        "context",
+        "fast",
+        "as",
+        "as-user",
+        "as-process",
+    ];
+
+    if parsed.positional.len() != 1 || flags.keys().any(|name| !ALLOWED.contains(&name.as_str())) {
+        return Err(USAGE.to_owned());
+    }
+
+    let required = |name: &str| {
+        nonempty(flags, name).ok_or_else(|| format!("--{name} requires a non-empty value"))
+    };
+    let session_key = required("session")?;
+
+    for name in ["harness", "model", "effort", "context", "fast"] {
+        if flags.contains_key(name) && nonempty(flags, name).is_none() {
+            return Err(format!("--{name} requires a non-empty value"));
+        }
+    }
+
+    let harness = nonempty(flags, "harness");
+    let model = nonempty(flags, "model");
+    let effort = nonempty(flags, "effort");
+    let context = nonempty(flags, "context");
+    let fast = nonempty(flags, "fast");
+
+    if model.as_deref().is_some_and(has_packed_effort) {
+        return Err("--model must not pack an effort; pass --effort separately".to_owned());
+    }
+
+    let control = match (harness, model, effort, context, fast) {
+        (Some(harness), Some(model), effort, context, None) => TuneControl::Harness {
+            harness,
+            model,
+            effort,
+            context,
+        },
+        (None, Some(model), effort, context, None) => TuneControl::Model {
+            model,
+            effort,
+            context,
+        },
+        (None, None, Some(effort), None, None) => TuneControl::Effort(effort),
+        (None, None, None, None, Some(fast)) if fast == "on" || fast == "off" => {
+            TuneControl::Fast(fast)
+        }
+        (None, None, None, None, Some(_)) => return Err("--fast must be on or off".to_owned()),
+        (Some(_), None, _, _, None) => return Err("--harness requires --model".to_owned()),
+        (None, None, None, Some(_), None) => return Err("--context requires --model".to_owned()),
+        (_, _, _, _, Some(_)) => {
+            return Err(
+                "--fast is mutually exclusive with --harness, --model, --effort, and --context"
+                    .to_owned(),
+            );
+        }
+        _ => return Err(USAGE.to_owned()),
+    };
+
+    Ok(Command::Tune {
+        identity: identity(flags)?,
+        session_key,
+        control,
+    })
+}
+
+fn has_packed_effort(model: &str) -> bool {
+    model
+        .rsplit_once('[')
+        .and_then(|(_, suffix)| suffix.strip_suffix(']'))
+        .is_some_and(|suffix| matches!(suffix, "low" | "medium" | "high" | "xhigh" | "max"))
+}
+
 fn parse_harness_process(
     parsed: &Flags,
     flags: &HashMap<String, String>,
@@ -1906,6 +2023,144 @@ mod tests {
     }
 
     #[test]
+    fn tune_legal_forms_are_typed_as_one_control_and_dispatch_separate_fields() {
+        let cases = [
+            (
+                strings(&[
+                    "tune",
+                    "--session",
+                    "agent:coder:x s_1",
+                    "--harness",
+                    "codex",
+                    "--model",
+                    "gpt-5.6-sol",
+                    "--effort",
+                    "high",
+                    "--context",
+                    "1m",
+                    "--as",
+                    "owner",
+                ]),
+                serde_json::json!({
+                    "as": "owner",
+                    "verb": "tune",
+                    "sessionKey": "agent:coder:x s_1",
+                    "params": {
+                        "setting": "set_harness",
+                        "harness": "codex",
+                        "model": "gpt-5.6-sol",
+                        "effort": "high",
+                        "context": "1m"
+                    }
+                }),
+            ),
+            (
+                strings(&[
+                    "tune",
+                    "--session",
+                    "agent:coder:x s_1",
+                    "--model",
+                    "claude-fable-5[1m]",
+                    "--effort",
+                    "high",
+                    "--as-user",
+                    "mike",
+                ]),
+                serde_json::json!({
+                    "asUser": "mike",
+                    "verb": "tune",
+                    "sessionKey": "agent:coder:x s_1",
+                    "params": {
+                        "setting": "set_model",
+                        "model": "claude-fable-5[1m]",
+                        "effort": "high"
+                    }
+                }),
+            ),
+            (
+                strings(&[
+                    "tune",
+                    "--session",
+                    "agent:coder:x s_1",
+                    "--effort",
+                    "xhigh",
+                ]),
+                serde_json::json!({
+                    "verb": "tune",
+                    "sessionKey": "agent:coder:x s_1",
+                    "params": {"setting": "set_reasoning", "reasoningLevel": "xhigh"}
+                }),
+            ),
+            (
+                strings(&["tune", "--session", "agent:coder:x s_1", "--fast", "on"]),
+                serde_json::json!({
+                    "verb": "tune",
+                    "sessionKey": "agent:coder:x s_1",
+                    "params": {"setting": "set_fast_mode", "fastMode": "on"}
+                }),
+            ),
+        ];
+
+        for (args, expected) in cases {
+            let command = parse(args).expect("legal tune form parses");
+            let request = crate::dispatch::build_request(&command).expect("tune dispatches");
+            assert_eq!(request.path, "/agent/dispatch");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&request.body_json).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn tune_rejects_illegal_combinations_before_dispatch() {
+        for args in [
+            strings(&["tune", "--model", "gpt-5.6-sol"]),
+            strings(&["tune", "--session", "s_1"]),
+            strings(&["tune", "--session", "s_1", "--harness", "codex"]),
+            strings(&["tune", "--session", "s_1", "--context", "1m"]),
+            strings(&[
+                "tune",
+                "--session",
+                "s_1",
+                "--model",
+                "gpt-5.6-sol",
+                "--fast",
+                "on",
+            ]),
+            strings(&["tune", "--session", "s_1", "--fast", "yes"]),
+            strings(&["tune", "--session", "s_1", "--model", "gpt-5.6-sol[high]"]),
+            strings(&["tune", "--session", "s_1", "--model", ""]),
+            strings(&[
+                "tune",
+                "--session",
+                "s_1",
+                "--effort",
+                "high",
+                "--unknown",
+                "value",
+            ]),
+        ] {
+            assert!(parse(args).is_err());
+        }
+    }
+
+    #[test]
+    fn tune_help_names_continuity_and_live_fast_limit() {
+        let entry = render_command_help(None, "tune").expect("tune has help");
+        let prose = entry.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(prose.contains("one runtime control"), "{entry}");
+        assert!(
+            prose.contains("preserve the engine conversation"),
+            "{entry}"
+        );
+        assert!(prose.contains("fresh engine context"), "{entry}");
+        assert!(prose.contains("live advertised option"), "{entry}");
+        assert!(prose.contains("ephemeral"), "{entry}");
+        assert!(prose.contains("omit --harness"), "{entry}");
+    }
+
+    #[test]
     fn fixture_provider_is_additive_inside_the_test_provider_bundle() {
         assert_eq!(
             parse(strings(&[
@@ -2029,6 +2284,7 @@ mod tests {
                 "work-item-get",
                 "attend",
                 "transcript",
+                "tune",
                 "unlearn",
                 "topline",
                 "toplines",
