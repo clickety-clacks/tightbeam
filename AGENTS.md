@@ -3,11 +3,14 @@
 ## THIS LINE: main = the 0.2 fabric program (flipped 2026-08-12)
 
 The pre-flip tip lives on branch 0.1.x — the maintenance line the live org
-patches. Integration into main is PR-only under 0.2 program authorization
-(Mike / the program integrator). If your assignment card names a different
-integration branch, the card wins. If you are a 0.1.x-org agent reading
-this: your line is 0.1.x and this checkout is the wrong one — do not merge
-here. Fixes cross 0.1.x -> main by cherry-pick election only.
+patches. THE GIT PROCESS ON THIS LINE (ruled 2026-08-13, program doc SS8b —
+no door, no PR ceremony): run the verification gates below and record
+baseline+after counts; review evidence lands in the specs repo first; then
+push main DIRECTLY. CI on every main push is the tripwire; git history is
+the audit. If your assignment card names a different integration branch,
+the card wins. If you are a 0.1.x-org agent reading this: your line is
+0.1.x and this checkout is the wrong one — do not push here. Fixes cross
+0.1.x -> main by cherry-pick election only, Mike-authorized.
 
 ## THE PHILOSOPHY GATE — run it before you design, again before you ship
 
