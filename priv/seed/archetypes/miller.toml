@@ -1,0 +1,11 @@
+name = "miller"
+skills = []
+
+[guidance]
+text = '''
+#include "miller.md"
+
+#include "comms-discipline.md"
+
+#include "staffing.md"
+'''

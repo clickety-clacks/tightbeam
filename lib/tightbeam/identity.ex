@@ -20,13 +20,24 @@ defmodule Tightbeam.Identity do
   @required_refs ["main", @upstream, @live]
   @reserved_prefix "tightbeam__"
   @seed_owned_paths [
+    "archetypes/avasarala.toml",
     "archetypes/default.toml",
     "archetypes/exec.toml",
+    "archetypes/miller.toml",
     "guidance/operating-model.md",
     "guidance/exec.md",
     "guidance/office-convention.md",
     "guidance/delegation-card.md",
-    "guidance/directive-vocabulary.md"
+    "guidance/directive-vocabulary.md",
+    "guidance/altitude-statute.md",
+    "guidance/avasarala.md",
+    "guidance/comms-discipline.md",
+    "guidance/desk-playbook.md",
+    "guidance/dispatch-rules.md",
+    "guidance/inception.md",
+    "guidance/miller.md",
+    "guidance/role-charter.md",
+    "guidance/staffing.md"
   ]
   @bundle_doc_paths ~w(capabilities.md intake.md preferred-models.md manifest.toml)
 

@@ -39,13 +39,24 @@ defmodule Tightbeam.IdentityTest do
     assert git!(dir, ["ls-tree", "-r", "--name-only", "main"])
            |> String.split("\n", trim: true) ==
              [
+               "archetypes/avasarala.toml",
                "archetypes/default.toml",
                "archetypes/exec.toml",
+               "archetypes/miller.toml",
+               "guidance/altitude-statute.md",
+               "guidance/avasarala.md",
+               "guidance/comms-discipline.md",
                "guidance/delegation-card.md",
+               "guidance/desk-playbook.md",
                "guidance/directive-vocabulary.md",
+               "guidance/dispatch-rules.md",
                "guidance/exec.md",
+               "guidance/inception.md",
+               "guidance/miller.md",
                "guidance/office-convention.md",
-               "guidance/operating-model.md"
+               "guidance/operating-model.md",
+               "guidance/role-charter.md",
+               "guidance/staffing.md"
              ]
 
     snapshot = Identity.snapshot!(ctx.base, "default", :codex)
@@ -92,7 +103,26 @@ defmodule Tightbeam.IdentityTest do
     assert card =~ "MUST NOT: file verdicts on substance"
     assert card =~ "accept or reject work; make product judgments; alter"
     assert card =~ ~s(Its only "no" is "later")
-    assert card =~ "the avasarala bounds starvation across its watermark population (§5)"
+    assert card =~ "the prodder bounds starvation across its watermark population (§5)"
+
+    # The r5 additions are §6 verb law too: the D2 spawn clause and the D3
+    # containment compilation are load-bearing the same way the lists are.
+    assert card =~ "DIRECTED\n    EXECUTION of its principal's recorded decision"
+    assert card =~ "hold or receive implementation cards"
+    assert card =~ "file completions off\n    this card"
+    assert card =~ "spawn uncited"
+  end
+
+  test "the casebook and probe-list templates require evidence citations and hit counts" do
+    avasarala =
+      File.read!(Application.app_dir(:tightbeam, "priv/seed/guidance/avasarala.md"))
+
+    assert avasarala =~ "evidence: <observed row ids — REQUIRED, every entry, kept current>"
+    assert avasarala =~ "hits: <count>, last-hit: <date, row id> — REQUIRED"
+    assert avasarala =~ "The casebook ships EMPTY."
+
+    miller = File.read!(Application.app_dir(:tightbeam, "priv/seed/guidance/miller.md"))
+    assert miller =~ "It ships EMPTY"
   end
 
   test "the office convention's dissolution sequence names REBIND before revoke" do

@@ -23,7 +23,9 @@ card.
     acknowledge directives there; answer routine queries answerable from rows;
     batch, schedule, and deliver to its principal within §7's ceilings; summon its
     principal with a brief; escalate to rumination; tune its principal's personal
-    reflex policy on instruction (§8).
+    reflex policy on instruction (§8); spawn and wire an office as DIRECTED
+    EXECUTION of its principal's recorded decision — the spawn filing cites the
+    authority row and draws from the seed office templates.
 
     MUST NOT: file verdicts on substance (defined: any verdict-kind attest on a
     card the exec does not hold, or any attest content accepting, rejecting, or
@@ -33,8 +35,13 @@ card.
     are never delayed by the exec; delivery TIMING within §7's bounded ceilings is
     the exec's job, not a hold. Its only "no" is "later"; every "later" has a
     ceiling the BATCHER enforces by creating the delivery wake (Invariant 3), and
-    the avasarala bounds starvation across its watermark population (§5) — two
-    different guarantees, neither claiming the other's.
+    the prodder bounds starvation across its watermark population (§5) — two
+    different guarantees, neither claiming the other's. Further MUST NOT, the
+    containment compilation: hold or receive implementation cards — a card
+    offering the desk substance is refused, not triaged; file completions off
+    this card — the only lifecycle attests it files are its own; spawn uncited —
+    a spawn filing naming no authority row is refused by rule (see the dispatch
+    rules for the armed matrix).
 
 The verb lists are carried verbatim from the coordination fabric design
 (coordination-fabric-v1 §6); its section marks ground as follows. **§7's ceilings**:
@@ -44,9 +51,11 @@ the per-class delivery ceilings the operating manual's `--class` section teaches
 lifecycle transition or another agent's obligation exit — delivery timing inside the
 ceilings is not a hold. **The BATCHER (Invariant 3)**: the substrate bone that
 creates the delivery wake at the turn boundary or the ceiling, whichever comes first
-— no fabric state waits on anyone's decision. **The avasarala (§5)**: the substrate's
-starvation watermark — any obligation or unanswered decision quiet past its floor
-escalates regardless of any gate. **§8**: the inhibition seam — personal reflex
+— no fabric state waits on anyone's decision. **The prodder (§5)**: the substrate's
+deterministic starvation floor — any obligation or unanswered decision quiet past its
+watermark escalates regardless of any gate. (The name AVASARALA belongs to the triage
+mind above this bone, never to the machinery: name the minds, keep the machinery
+boring.) **§8**: the inhibition seam — personal reflex
 changes are the principal's to make instantly by standing directive; shared, skeletal
 ones take the org's law path (see the standing-directives vocabulary).
 
