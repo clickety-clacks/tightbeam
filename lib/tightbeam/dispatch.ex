@@ -26,7 +26,6 @@ defmodule Tightbeam.Dispatch do
 
   alias Tightbeam.{
     Assignments,
-    DB,
     Escalation,
     EventLog,
     Placement,
@@ -319,9 +318,9 @@ defmodule Tightbeam.Dispatch do
     do: %{error | reason: "remedy_fired", producer: outcome.producer_id}
 
   defp ruling_statute(db, ruling_id) do
-    case DB.query(db, "SELECT statuteName FROM decision_requests WHERE id = ?1", [ruling_id]) do
-      {:ok, [[statute]]} -> statute
-      _ -> "ruling-authorization"
+    case Escalation.statute_name_for_ruling(db, ruling_id) do
+      {:ok, statute} -> statute
+      :not_found -> "ruling-authorization"
     end
   end
 end

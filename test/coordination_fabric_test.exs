@@ -772,75 +772,61 @@ defmodule Tightbeam.CoordinationFabricTest do
     # obligation throughout and disposed of it by its own choice.
     assert get_request(db, request.id).status == "open"
 
-    # HALF TWO, structural (Sol xhigh review, finding 2). The old scan required
-    # BOTH `decision_requests` and the literal `'agent'` inside one string node
-    # — it missed a generic `status = 'open'` sweep with no kind predicate, a
-    # kind assembled from a fragment or interpolation (`#{@request_columns}`
-    # defeats an `is_binary` AST match outright), and it permanently
-    # allowlisted the whole of `escalation.ex` for owning the DDL that happens
-    # to say both words. This replaces it with two checks that do not share
-    # that blind spot:
+    # HALF TWO, structural (Sol xhigh review round 2, finding 1). The
+    # enumeration this test used to run — every `status = 'open'` literal
+    # across a fixed file list, checked for a `kind` predicate — had false
+    # negatives no scan can close on its own: a NEW file could gain a reader
+    # invisibly, `status = 'open'` matched only that exact spelling (a
+    # parameterized or assembled predicate evades it), a concatenated literal
+    # is never reconstructed, and the `id = ?`/retirement-sweep exemptions
+    # were bound to string shapes, not to the table. `escalation.ex` now
+    # centralizes EVERY production read and write of `decision_requests`
+    # behind named, kind-classified functions (`@external_reader_kinds`,
+    # documented above `raw_by_id/2`) — so the structural half shrinks to two
+    # checks that are reliable BECAUSE there is nowhere else for a query to
+    # hide, not because this scan is clever:
     #
-    #   (a) FILE enumeration: every `lib/**/*.ex` file whose raw text mentions
-    #       `decision_requests` at all must be a file this test already knows
-    #       about. A brand new reader fails here, in a NEW file, before it
-    #       gets anywhere near a query.
+    #   (a) no `decision_requests` literal exists anywhere in `lib/` outside
+    #       `escalation.ex` — proved with the same text scan as before, now
+    #       with ZERO allowlist besides that one file.
     #
-    #   (b) QUERY enumeration, inside those known files: every literal SQL
-    #       string containing `status = 'open'` that is not scoped to one row
-    #       by `id = ?` must also name a `kind` — a lifecycle sweep that
-    #       forgets to says which kind it means is exactly the "generic
-    #       reader" this tripwire exists to catch. Withdrawal is the one verb
-    #       every arm answers to as its own lawful exit (gate Q3), so the two
-    #       retirement sweeps that mean to reach every kind are named
-    #       exemptions, not silent passes.
-    known_files =
-      [
-        "lib/tightbeam/dispatch.ex",
-        "lib/tightbeam/effort_checkin.ex",
-        "lib/tightbeam/escalation.ex",
-        "lib/tightbeam/execution_map.ex",
-        "lib/tightbeam/gateway.ex",
-        "lib/tightbeam/job_trace.ex",
-        "lib/tightbeam/rail_episodes.ex",
-        "lib/tightbeam/schema.ex",
-        "lib/tightbeam/supervision.ex",
-        "lib/tightbeam/wakes.ex"
-      ]
-      |> Enum.sort()
-
-    discovered =
-      Path.wildcard("lib/**/*.ex")
-      |> Enum.filter(&(File.read!(&1) =~ "decision_requests"))
-      |> Enum.sort()
-
-    assert discovered == known_files,
-           "a file touching decision_requests must be reviewed and added to known_files: " <>
-             "#{inspect(discovered -- known_files)} is new, " <>
-             "#{inspect(known_files -- discovered)} no longer touches it"
-
-    # Deliberately kind-agnostic: retirement withdraws every open row a
-    # retiring session raised, of every kind, as that session's own lawful
-    # exit (see the comments on `withdraw_for_retired/2` and
-    # `recover_retired/1`).
-    kind_agnostic_by_design = [
-      "SELECT id FROM decision_requests WHERE raiserSessionKey = ?1 AND status = 'open'",
-      "EXISTS (SELECT 1 FROM decision_requests dr WHERE dr.raiserSessionKey = s.sessionKey AND dr.status = 'open')"
-    ]
-
+    #   (b) `escalation.ex`'s own helper inventory, name-to-kind-scope, equals
+    #       a pinned copy — so a new helper, or a scope that silently widens
+    #       from (say) `"statute"` to `"any"`, fails here until it is
+    #       reviewed and this pin is updated by hand.
     offenders =
-      for file <- known_files,
-          literal <- sql_literals(file),
-          literal =~ "decision_requests",
-          literal =~ "status = 'open'",
-          not (literal =~ "id = ?"),
-          not (literal =~ ~r/\bkind\b/),
-          not Enum.any?(kind_agnostic_by_design, &(literal =~ &1)) do
-        {file, literal}
-      end
+      Path.wildcard("lib/**/*.ex")
+      |> Enum.reject(&(&1 == "lib/tightbeam/escalation.ex"))
+      |> Enum.flat_map(fn file ->
+        file
+        |> sql_literals()
+        |> Enum.filter(&(&1 =~ "decision_requests"))
+        |> Enum.map(&{file, &1})
+      end)
 
     assert offenders == [],
-           "a status='open' read naming no kind and no single row by id: #{inspect(offenders)}"
+           "a decision_requests literal outside escalation.ex: #{inspect(offenders)}"
+
+    assert Tightbeam.Escalation.external_reader_kinds() == %{
+             raw_by_id: "any",
+             raw_by_id_in_txn: "any",
+             raw_by_id_in_txn!: "any",
+             raw_exists_in_txn?: "any",
+             statute_name_for_ruling: "any",
+             effort_open_by_deadline_wake_in_txn: "effort",
+             effort_insert_in_txn: "effort",
+             effort_id_by_generation_in_txn: "effort",
+             effort_supersede_open_in_txn: "effort",
+             effort_update_generation_in_txn: "effort",
+             effort_rule_in_txn: "effort",
+             statute_park_candidate_in_txn: "statute",
+             claim_park_wake_in_txn: "any",
+             open_counts_by_assignment: "statute,effort",
+             decision_trace_rows: "any",
+             wake_link_fragment: "any"
+           },
+           "escalation.ex's external-reader inventory changed; review the new/changed " <>
+             "entry's kind scope and update this pin"
   end
 
   # Every double-quoted or triple-quoted string literal in a file's raw
@@ -901,6 +887,25 @@ defmodule Tightbeam.CoordinationFabricTest do
     # The agent question is untouched by any of that: still open, still
     # answerless.
     assert get_request(db, question.id).status == "open"
+  end
+
+  # Sol xhigh review round 2: the test above proves current_request/4 lands on
+  # the statute row when an agent row shares its raiser, but it cannot prove
+  # the `kind = 'statute'` predicate is WHY — an agent row's `statuteName` and
+  # `actionKey` are pinned NULL by the schema's own CHECK arm, so no row
+  # sharing those keys can ever be constructed through the ordinary write
+  # path to begin with. That makes the predicate's absence unfalsifiable by
+  # any row this test (or any test) could file. The honest proof is the query
+  # text itself: THE GATE READ still names `kind = 'statute'`, independent of
+  # whatever the schema separately guarantees about NULLs.
+  test "the statute gate read's kind predicate is evidenced in its own query text" do
+    source = File.read!("lib/tightbeam/escalation.ex")
+
+    assert [_, gate_read_body] =
+             Regex.run(~r/defp current_request\(.*?\) do(.*?)\n  end\n/s, source),
+           "current_request/4 (THE GATE READ) was not found where this test expects it"
+
+    assert gate_read_body =~ "kind = 'statute'"
   end
 
   test "--about refuses an assignment the asker cannot legitimately reference, identically to a fake id",

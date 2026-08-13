@@ -1070,6 +1070,393 @@ defmodule Tightbeam.Escalation do
     :crypto.hash(:sha256, canonical_json(canonical)) |> Base.encode16(case: :lower)
   end
 
+  ## EXTERNAL READERS (Sol xhigh review round 2, finding 1).
+  #
+  # Every production module outside this file that touches `decision_requests`
+  # calls ONE of the functions below — never SQL of its own. That is now the
+  # WHOLE of the tripwire's structural half: `coordination_fabric_test.exs`
+  # asserts (a) no `decision_requests` literal exists anywhere else in `lib/`,
+  # which a text scan can prove exhaustively once there is nowhere else for one
+  # to hide, and (b) the function names below, paired with the kind each is
+  # scoped to, equal a pinned inventory — so a new helper, or a scope that
+  # silently widens, fails the test until it is reviewed and the inventory
+  # updated by hand.
+  #
+  # A prior version of this tripwire scanned production source for the raw SQL
+  # instead, and it had three blind spots at once: a literal assembled from
+  # fragments or built with `#{}` interpolation was invisible to it; a helper
+  # that changed what it selected without changing its name or file location
+  # was invisible to it; and "no reader outside escalation.ex" was never
+  # actually the property it checked, because nothing forced a NEW reader to
+  # land inside this file to begin with. Centralizing removes all three at
+  # once: there is no fragment to assemble because there is no SQL to write
+  # outside this module, and the inventory below is the enumeration, not an
+  # approximation of it.
+  @external_reader_kinds %{
+    raw_by_id: "any",
+    raw_by_id_in_txn: "any",
+    raw_by_id_in_txn!: "any",
+    effort_open_by_deadline_wake_in_txn: "effort",
+    effort_insert_in_txn: "effort",
+    effort_id_by_generation_in_txn: "effort",
+    effort_supersede_open_in_txn: "effort",
+    effort_update_generation_in_txn: "effort",
+    effort_rule_in_txn: "effort",
+    statute_park_candidate_in_txn: "statute",
+    claim_park_wake_in_txn: "any",
+    open_counts_by_assignment: "statute,effort",
+    decision_trace_rows: "any",
+    wake_link_fragment: "any",
+    raw_exists_in_txn?: "any",
+    statute_name_for_ruling: "any"
+  }
+
+  @doc false
+  @spec external_reader_kinds() :: %{atom() => String.t()}
+  def external_reader_kinds, do: @external_reader_kinds
+
+  @doc """
+  ANY KIND, by id alone. The caller is responsible for checking `.kind` before
+  treating the row as one arm's data — the same "fetch first, branch on kind"
+  shape `answer/2`, `rule/4` and `withdraw/2` already use internally, exposed
+  here for the one external caller (`EffortCheckin`) that needs a row before it
+  knows which arm it belongs to.
+  """
+  @spec raw_by_id(DB.server(), String.t() | nil) :: map() | nil
+  def raw_by_id(db, id), do: get_raw(db, id)
+
+  @doc "Txn-transactional `raw_by_id/2`, for callers already inside a transaction."
+  @spec raw_by_id_in_txn(Txn.t(), String.t()) :: map() | nil
+  def raw_by_id_in_txn(txn, id) do
+    case Txn.q(txn, "SELECT #{@request_columns} FROM decision_requests WHERE id = ?1", [id]) do
+      [row] -> request_from_row(row)
+      [] -> nil
+    end
+  end
+
+  @doc """
+  ANY KIND, by id alone, inside a transaction — RAISES if the row is not
+  there. Only for a caller that just wrote or just re-read the row and treats
+  its absence as a bug, never a possibility: the same contract this module's
+  own internal `request_in_txn/2` already carries.
+  """
+  @spec raw_by_id_in_txn!(Txn.t(), String.t()) :: map()
+  def raw_by_id_in_txn!(txn, id), do: request_in_txn(txn, id)
+
+  @doc "EFFORT ONLY: the open effort request currently carrying this deadline wake."
+  @spec effort_open_by_deadline_wake_in_txn(Txn.t(), String.t()) :: map() | nil
+  def effort_open_by_deadline_wake_in_txn(txn, wake_id) do
+    case Txn.q(
+           txn,
+           "SELECT #{@request_columns} FROM decision_requests WHERE kind = 'effort' AND status = 'open' AND deadlineWakeId = ?1",
+           [wake_id]
+         ) do
+      [row] -> request_from_row(row)
+      [] -> nil
+    end
+  end
+
+  @doc """
+  EFFORT ONLY: file one generation's request AND arm its check-in prompt, in
+  one commit — the same transactional-outbox shape `escalate/4` and
+  `file_agent_request/2` above already use for their own kinds (escalation-
+  delivery-v1 proof 10: the row and the notification that carries it land
+  together or not at all). `ON CONFLICT DO NOTHING` against
+  `decision_requests_effort_generation` — the caller reads the winner back
+  with `effort_id_by_generation_in_txn/3` on a loss, and arms nothing itself.
+  """
+  @spec effort_insert_in_txn(Txn.t(), map()) :: {:inserted, map()} | :conflict
+  def effort_insert_in_txn(txn, attrs) do
+    Txn.q(
+      txn,
+      """
+      INSERT INTO decision_requests
+        (id, kind, raiserId, ownerUserId, assignmentId, expecterSessionKey,
+         expecterUserId, lineageRung, effortGeneration, deadlineWakeId,
+         raisedAt, deadlineAt, statuteName, actionKey, question, options,
+         context, status)
+      VALUES
+        (?1, 'effort', 'process:tightbeam', ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+         ?9, ?10, NULL, NULL, ?11, ?12, ?13, 'open')
+      ON CONFLICT DO NOTHING
+      """,
+      [
+        attrs.id,
+        attrs.owner_user_id,
+        attrs.assignment_id,
+        attrs.expecter_session_key,
+        attrs.expecter_user_id,
+        attrs.lineage_rung,
+        attrs.generation,
+        attrs.deadline_wake_id,
+        attrs.raised_at,
+        attrs.deadline_at,
+        attrs.question,
+        attrs.options_json,
+        attrs.context_json
+      ]
+    )
+
+    if Txn.changes(txn) == 1 do
+      request = request_in_txn(txn, attrs.id)
+      effort_notification_in_txn(txn, request)
+      {:inserted, request}
+    else
+      :conflict
+    end
+  end
+
+  @doc "EFFORT ONLY: this generation's request id, if one was already filed."
+  @spec effort_id_by_generation_in_txn(Txn.t(), String.t(), integer()) :: String.t() | nil
+  def effort_id_by_generation_in_txn(txn, assignment_id, generation) do
+    case Txn.q(
+           txn,
+           "SELECT id FROM decision_requests WHERE kind = 'effort' AND assignmentId = ?1 AND effortGeneration = ?2",
+           [assignment_id, generation]
+         ) do
+      [[id]] -> id
+      [] -> nil
+    end
+  end
+
+  @doc """
+  EFFORT ONLY: supersede every open request for this assignment. Returns the
+  deadline wake ids it superseded, so the caller can cancel each in turn — the
+  read and the write are one function because every caller does both together
+  and neither ever wants one without the other.
+  """
+  @spec effort_supersede_open_in_txn(Txn.t(), String.t()) :: [String.t()]
+  def effort_supersede_open_in_txn(txn, assignment_id) do
+    wake_ids =
+      Txn.q(
+        txn,
+        "SELECT deadlineWakeId FROM decision_requests WHERE kind = 'effort' AND assignmentId = ?1 AND status = 'open'",
+        [assignment_id]
+      )
+      |> List.flatten()
+
+    Txn.q(
+      txn,
+      "UPDATE decision_requests SET status = 'superseded' WHERE kind = 'effort' AND assignmentId = ?1 AND status = 'open'",
+      [assignment_id]
+    )
+
+    wake_ids
+  end
+
+  @doc """
+  EFFORT ONLY: advance one open request's rung and deadline in place, AND
+  re-arm its check-in prompt on the new expecter — one commit, same shape as
+  `effort_insert_in_txn/2` above (escalation-delivery-v1 proof 10).
+  `deadlineWakeId = ?9` (the last param) is a CAS against the wake this update
+  is racing to replace — a concurrent winner already moved it, and this call
+  loses cleanly rather than double-advancing or arming a stale prompt.
+  """
+  @spec effort_update_generation_in_txn(Txn.t(), String.t(), String.t(), map()) ::
+          {:advanced, map()} | :lost
+  def effort_update_generation_in_txn(txn, id, prior_deadline_wake_id, attrs) do
+    Txn.q(
+      txn,
+      """
+      UPDATE decision_requests
+      SET expecterSessionKey = ?2, expecterUserId = ?3, lineageRung = ?4,
+          deadlineAt = ?5, deadlineWakeId = ?6, options = ?7, context = ?8
+      WHERE id = ?1 AND kind = 'effort' AND status = 'open' AND deadlineWakeId = ?9
+      """,
+      [
+        id,
+        attrs.expecter_session_key,
+        attrs.expecter_user_id,
+        attrs.lineage_rung,
+        attrs.deadline_at,
+        attrs.deadline_wake_id,
+        attrs.options_json,
+        attrs.context_json,
+        prior_deadline_wake_id
+      ]
+    )
+
+    if Txn.changes(txn) == 1 do
+      advanced = request_in_txn(txn, id)
+      effort_notification_in_txn(txn, advanced)
+      {:advanced, advanced}
+    else
+      :lost
+    end
+  end
+
+  # Transactional outbox for the effort arm's own check-in prompt — the same
+  # shared shape `owner_notification/1` (statute) and `ask_notification/2`
+  # (agent) each feed their own `Wakes.schedule_in_txn/2` call with, kept here
+  # rather than in `EffortCheckin` so the row write and its notification are
+  # provably one commit in the same file (Sol xhigh review round 2: proof 10's
+  # same-file call-graph traversal cannot see across a module boundary).
+  defp effort_notification_in_txn(txn, request) do
+    prompt =
+      "Effort check-in #{request.id} for assignment #{request.assignment_id}.\n" <>
+        request.question <>
+        "\nActions: #{Enum.join(request.options || [], ", ")}"
+
+    Wakes.schedule_in_txn(txn, %{
+      session_key:
+        request.expecter_session_key || Org.personal_session_key(request.expecter_user_id),
+      origin: "process:tightbeam",
+      prompt: prompt,
+      due_at: now(),
+      assignment_id: request.assignment_id,
+      target_gate: 0
+    })
+  end
+
+  @doc """
+  EFFORT'S OWN RULING — not the statute `rule/4` above, which refuses an
+  effort-kind id by name. `EffortCheckin.rule/3` fetches the row and checks
+  `.kind == "effort"` itself before ever calling this, so it is id-scoped
+  rather than kind-scoped in its own WHERE clause, same as `rule_open/6`'s
+  statute update just above it in this file.
+  """
+  @spec effort_rule_in_txn(Txn.t(), String.t(), String.t(), String.t(), integer()) :: boolean()
+  def effort_rule_in_txn(txn, id, decision, ruled_by, ruled_at) do
+    Txn.q(
+      txn,
+      "UPDATE decision_requests SET status = 'ruled', decision = ?2, ruledBy = ?3, ruledAt = ?4 WHERE id = ?1 AND status = 'open'",
+      [id, decision, ruled_by, ruled_at]
+    )
+
+    Txn.changes(txn) == 1
+  end
+
+  @doc """
+  STATUTE ONLY: the park sweep's read (`Supervision.park_escalation/3`) — an
+  open statute request by id, the same `kind = 'statute'` scoping
+  `current_request/4` (the gate read) uses, restated here because a park sweep
+  is exactly the kind of reader that must never be able to reach an agent row,
+  even by construction accident.
+  """
+  @spec statute_park_candidate_in_txn(Txn.t(), String.t()) ::
+          {:ok, integer(), String.t() | nil, String.t() | nil} | :not_found
+  def statute_park_candidate_in_txn(txn, request_id) do
+    case Txn.q(
+           txn,
+           "SELECT deadlineAt, parkWakeId, assignmentId FROM decision_requests WHERE id = ?1 AND status = 'open' AND kind = 'statute'",
+           [request_id]
+         ) do
+      [[deadline_at, park_wake_id, assignment_id]] ->
+        {:ok, deadline_at, park_wake_id, assignment_id}
+
+      [] ->
+        :not_found
+    end
+  end
+
+  @doc """
+  Claim the park wake id for one request — id-scoped, so its own WHERE names
+  no kind, but its only caller only ever hands it an id
+  `statute_park_candidate_in_txn/2` just named as an open statute request.
+  """
+  @spec claim_park_wake_in_txn(Txn.t(), String.t(), String.t()) :: :ok
+  def claim_park_wake_in_txn(txn, request_id, wake_id) do
+    Txn.q(
+      txn,
+      "UPDATE decision_requests SET parkWakeId = ?2 WHERE id = ?1 AND parkWakeId IS NULL",
+      [request_id, wake_id]
+    )
+
+    :ok
+  end
+
+  @doc """
+  STATUTE+EFFORT telemetry for the execution map: open request counts per
+  assignment. Agent questions gate nothing (fabric §10) and are not tallied
+  here — counting them would be exactly the kind of silent, generic read the
+  tripwire enumeration exists to catch, and once did (this function predates
+  the agent arm and had no kind predicate at all until this review).
+  """
+  @spec open_counts_by_assignment(DB.server()) :: %{String.t() => non_neg_integer()}
+  def open_counts_by_assignment(db) do
+    {:ok, rows} =
+      DB.query(db, """
+      SELECT assignmentId, COUNT(*) FROM decision_requests
+      WHERE status = 'open' AND assignmentId IS NOT NULL AND kind IN ('statute', 'effort')
+      GROUP BY assignmentId
+      """)
+
+    Map.new(rows, fn [assignment_id, count] -> {assignment_id, count} end)
+  end
+
+  @doc """
+  ANY KIND, forensic dump for `JobTrace`: every request tied to these
+  assignments. Diagnostics, not a gate (`job-trace observability v1`) — every
+  kind belongs in a trace built to answer "what happened here", so this is
+  deliberately unfiltered by kind, the same way `raw_by_id/2` is deliberately
+  unfiltered because its callers decide.
+  """
+  @spec decision_trace_rows(DB.server(), [String.t()]) :: [[term()]]
+  def decision_trace_rows(_db, []), do: []
+
+  def decision_trace_rows(db, assignment_ids) do
+    {clause, params} = trace_in_clause(assignment_ids)
+
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT id, assignmentId, status, decision, raisedAt FROM decision_requests WHERE assignmentId IN (#{clause})",
+        params
+      )
+
+    rows
+  end
+
+  @doc """
+  ANY KIND: SQL TEXT ONLY, no query runs here. `JobTrace.wake_entries/3` joins
+  wake ids from THREE tables (`effort_checkin_generations`, `decision_requests`,
+  `wakes`) in one `UNION` CTE so a wake tied to any of them resolves through a
+  single downstream join; this hands back this table's clause of that union,
+  built against the SAME already-numbered placeholder text the caller built
+  for its other two clauses, so all three share one parameter list.
+  """
+  @spec wake_link_fragment(String.t()) :: String.t()
+  def wake_link_fragment(in_clause) do
+    "SELECT deadlineWakeId, assignmentId FROM decision_requests WHERE assignmentId IN (#{in_clause})"
+  end
+
+  defp trace_in_clause(values) do
+    placeholders =
+      values
+      |> Enum.with_index(1)
+      |> Enum.map_join(", ", fn {_value, index} -> "?#{index}" end)
+
+    {placeholders, values}
+  end
+
+  @doc """
+  ANY KIND: does a request with this id exist at all? `Wakes`' provenance
+  validation uses this for a `decision_request` source/disposition exactly
+  the same way it validates against `assignments`, `work_items` and
+  `sessions` — an existence check, not a decision about what the row means.
+  """
+  @spec raw_exists_in_txn?(Txn.t(), String.t()) :: boolean()
+  def raw_exists_in_txn?(txn, id) do
+    match?([[1]], Txn.q(txn, "SELECT 1 FROM decision_requests WHERE id = ?1", [id]))
+  end
+
+  @doc """
+  ANY KIND, by id: the statute name a ruling denial names in its error
+  context. `Dispatch.ruling_statute/2`'s only caller always holds a ruling
+  id, which only a statute row produces, so this is unfiltered by kind for
+  the same reason `raw_by_id/2` is — the id already came from a statute-only
+  path. `:not_found` is distinct from `{:ok, nil}` (a found row whose
+  `statuteName` is null) so the caller's own fallback applies to exactly the
+  case it always did.
+  """
+  @spec statute_name_for_ruling(DB.server(), String.t()) :: {:ok, String.t() | nil} | :not_found
+  def statute_name_for_ruling(db, ruling_id) do
+    case DB.query(db, "SELECT statuteName FROM decision_requests WHERE id = ?1", [ruling_id]) do
+      {:ok, [[statute]]} -> {:ok, statute}
+      _ -> :not_found
+    end
+  end
+
   defp rule_open(db, request, decision, rationale, origin, opts) do
     ruled_at = now()
 

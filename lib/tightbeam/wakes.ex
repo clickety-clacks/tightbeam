@@ -25,7 +25,7 @@ defmodule Tightbeam.Wakes do
   use GenServer
   require Logger
 
-  alias Tightbeam.{ConditionFacts, DB, EventLog, Gateway}
+  alias Tightbeam.{ConditionFacts, DB, Escalation, EventLog, Gateway}
   alias Tightbeam.DB.Txn
 
   @type db :: GenServer.server()
@@ -915,7 +915,7 @@ defmodule Tightbeam.Wakes do
       )
 
   defp validate_source(txn, "decision_request", source_id, _wake),
-    do: row_exists(txn, "SELECT 1 FROM decision_requests WHERE id=?1", source_id)
+    do: if(Escalation.raw_exists_in_txn?(txn, source_id), do: :ok, else: :error)
 
   defp validate_source(txn, "monitor_generation", source_id, _wake),
     do: generation_exists(txn, source_id)
@@ -1052,7 +1052,7 @@ defmodule Tightbeam.Wakes do
       )
 
   defp validate_disposition(txn, "decision_request_transition", id),
-    do: row_exists(txn, "SELECT 1 FROM decision_requests WHERE id=?1", id)
+    do: if(Escalation.raw_exists_in_txn?(txn, id), do: :ok, else: :error)
 
   defp validate_disposition(txn, "monitor_generation_transition", id),
     do: generation_exists(txn, id)

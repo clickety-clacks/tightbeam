@@ -1227,19 +1227,16 @@ defmodule Tightbeam.Supervision do
 
   # `decision_request_id` here only ever names a statute row: it is the `dr_id`
   # `Escalation.resolve/3` handed back, which comes from `current_request/4`'s
-  # own `kind = 'statute'`-scoped read. Stated here too (Sol xhigh review,
-  # finding 2) rather than left to that upstream invariant alone — a park sweep
-  # is exactly the kind of reader that must not be able to reach an agent row
-  # even by construction accident, and `deadlineAt` is read below on the
-  # assumption it is non-null, which only the statute/effort arms promise.
+  # own `kind = 'statute'`-scoped read. `Escalation.statute_park_candidate_in_txn/2`
+  # (Sol xhigh review, finding 2 / round 2 finding 1) restates that scope at
+  # its own read rather than leaning on the upstream invariant alone — a park
+  # sweep is exactly the kind of reader that must not be able to reach an
+  # agent row even by construction accident — and is now the ONLY place this
+  # module's decision_requests SQL lives (`Escalation` owns the rest).
   defp park_escalation(db, session_key, decision_request_id) do
     transaction!(db, fn txn ->
-      case Txn.q(
-             txn,
-             "SELECT deadlineAt, parkWakeId, assignmentId FROM decision_requests WHERE id = ?1 AND status = 'open' AND kind = 'statute'",
-             [decision_request_id]
-           ) do
-        [[deadline_at, nil, assignment_id]] ->
+      case Escalation.statute_park_candidate_in_txn(txn, decision_request_id) do
+        {:ok, deadline_at, nil, assignment_id} ->
           wake =
             Wakes.schedule_in_txn(txn, %{
               session_key: session_key,
@@ -1256,18 +1253,14 @@ defmodule Tightbeam.Supervision do
               assignment_id: assignment_id
             })
 
-          Txn.q(
-            txn,
-            "UPDATE decision_requests SET parkWakeId = ?2 WHERE id = ?1 AND parkWakeId IS NULL",
-            [decision_request_id, wake.wake_id]
-          )
+          :ok = Escalation.claim_park_wake_in_txn(txn, decision_request_id, wake.wake_id)
 
           :parked
 
-        [[_deadline_at, park_wake_id, _assignment_id]] when is_binary(park_wake_id) ->
+        {:ok, _deadline_at, park_wake_id, _assignment_id} when is_binary(park_wake_id) ->
           :parked
 
-        [] ->
+        :not_found ->
           :skipped
       end
     end)

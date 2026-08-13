@@ -462,7 +462,19 @@ defmodule Tightbeam.EscalationDeliveryTest do
 
   test "proof 10: every request site arms in-transaction and every turn sink is enumerated" do
     # Every production `decision_requests` insert/retarget site, and the
-    # in-transaction prompt arm each one owes.
+    # in-transaction prompt arm each one owes. All four now live in
+    # `escalation.ex` (Sol xhigh review round 2, finding 1: every production
+    # read AND write of `decision_requests` is centralized behind named,
+    # kind-classified functions there) — `EffortCheckin`'s two request sites
+    # moved from `open_request_in_txn/4`/`deadline_in_txn/3` to
+    # `effort_insert_in_txn/2`/`effort_update_generation_in_txn/4`, which now
+    # own their own notification arm too (`effort_notification_in_txn/2`,
+    # private to `escalation.ex`), the same shape `escalate/4` and
+    # `file_agent_request/2` already had. Same-file call-graph traversal
+    # (`arms_prompt_wake_in_txn?/2` below) cannot see across a module
+    # boundary, so the write and the arm must live in the same file to be
+    # provable here — moving the write without the arm would have made this
+    # proof unprovable, not merely relocate it.
     request_sites = [
       {"lib/tightbeam/escalation.ex", "escalate/4"},
       # The agent create-path (fabric §13 Phase 1 seam ③, GitHub #11). It is the
@@ -470,8 +482,8 @@ defmodule Tightbeam.EscalationDeliveryTest do
       # like the three the substrate reaches: the row and the notification that
       # carries it commit together, or neither does.
       {"lib/tightbeam/escalation.ex", "file_agent_request/2"},
-      {"lib/tightbeam/effort_checkin.ex", "open_request_in_txn/4"},
-      {"lib/tightbeam/effort_checkin.ex", "deadline_in_txn/3"}
+      {"lib/tightbeam/escalation.ex", "effort_insert_in_txn/2"},
+      {"lib/tightbeam/escalation.ex", "effort_update_generation_in_txn/4"}
     ]
 
     assert Enum.sort(request_sites) == Enum.sort(decision_request_sites())

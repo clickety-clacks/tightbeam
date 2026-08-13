@@ -49,6 +49,12 @@ defmodule Tightbeam.Schema do
   # never having named any earlier vintage of either line (verified against
   # both histories at merge time).
   #
+  # `decision_requests.deadlineAt` went from `NOT NULL` to nullable at
+  # `coordination-fabric-v1-phase1-v2` (2026-08-13, Sol xhigh review round 2,
+  # finding 2 on that delta) — the agent arm's CHECK grew an explicit
+  # `deadlineAt IS NULL` requirement (finding 1 of round 1 on the same
+  # delta), and the stamp bumped for the same reason wave 1's did.
+  #
   # `CREATE TABLE IF NOT EXISTS` adds no column to a table that already
   # exists and does not widen an existing CHECK or relax an existing NOT
   # NULL — a `classes-v1`, `classes-v2`, `v1-phase1`, or `v1-phase1-v2`

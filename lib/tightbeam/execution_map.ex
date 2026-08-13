@@ -40,7 +40,7 @@ defmodule Tightbeam.ExecutionMap do
      through any item-attributed carrier.
   """
 
-  alias Tightbeam.{CausalEvents, DB}
+  alias Tightbeam.{CausalEvents, DB, Escalation}
 
   @edge_basis "concurrent_turn"
   @coverage_basis "conservative_shared"
@@ -693,7 +693,10 @@ defmodule Tightbeam.ExecutionMap do
       attests_by_assignment: attests_by_assignment(db),
       commit_refs: commit_refs(db),
       markers_by_assignment: markers_by_assignment(db),
-      open_requests: open_requests(db),
+      # STATUTE+EFFORT only (Sol xhigh review round 2, finding 1):
+      # `Escalation.open_counts_by_assignment/1` is now the sole owner of this
+      # query. Agent questions gate nothing (fabric §10) and are not tallied.
+      open_requests: Escalation.open_counts_by_assignment(db),
       pending_wake_sessions: pending_wake_sessions(db),
       pending_wake_classes: pending_wake_classes(db),
       dispositions: dispositions(db),
@@ -895,23 +898,6 @@ defmodule Tightbeam.ExecutionMap do
     rows
     |> Enum.group_by(&hd/1, &List.last/1)
     |> Map.new(fn {assignment_id, refs} -> {assignment_id, Enum.uniq(refs)} end)
-  end
-
-  # `kind IN ('statute', 'effort')` is stated rather than left unfiltered
-  # (Sol xhigh review, finding 2): this tally predates the agent arm, and an
-  # unfiltered `status = 'open'` here silently started counting agent
-  # questions as pending escalations the moment that arm shipped — telemetry
-  # drift, not a gate, but exactly the "generic reader" the tripwire's
-  # enumeration exists to catch.
-  defp open_requests(db) do
-    {:ok, rows} =
-      DB.query(db, """
-      SELECT assignmentId, COUNT(*) FROM decision_requests
-      WHERE status = 'open' AND assignmentId IS NOT NULL AND kind IN ('statute', 'effort')
-      GROUP BY assignmentId
-      """)
-
-    Map.new(rows, fn [assignment_id, count] -> {assignment_id, count} end)
   end
 
   defp pending_wake_sessions(db) do
