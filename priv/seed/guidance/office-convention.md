@@ -25,15 +25,22 @@ doing off-card work is not a reshaped office, it is an unaccountable session.
 
 ## Dissolution and failover
 
-Dissolving an office is a two-verb sequence — revoke, then rebind — executed by the
-same authority, the principal or the org actor dissolving the office: revoke the
-delegation card (`revoke-assignment`), then rebind the role to the session that
-fronts it next (the substrate's `role-bind` verb) — usually the worker itself. The
-sequence is deliberately non-atomic, and its degraded windows are named, not hidden:
+Dissolving an office is a two-verb sequence — REBIND, then revoke — executed by the
+same authority, the principal or the org actor dissolving the office. Order matters,
+and the order is rebind-first: revoking a card never changes role binding — the two
+live on different seams, address and obligation — so a revoke-first sequence would
+leave a window where the role still routes wakes to a desk whose written authority
+has ended. Rebind the role to the session that fronts it next (the substrate's
+`role-bind` verb — usually the worker itself), THEN revoke the delegation card
+(`revoke-assignment`). The sequence is deliberately non-atomic, and its degraded
+window is named, not hidden:
 
-- **The crash window.** A crash between the two verbs leaves the role unstaffed. The
-  existing unstaffed-role rule catches it — wakes to the role fall back to its
-  owner's Main. Nothing new; nothing lost.
+- **The crash window.** A crash between the two verbs leaves the role already safe
+  on its new session, and the exec briefly still holding its card — the benign
+  direction: an on-card desk with no role receives no new role-addressed traffic,
+  and the leftover card is revoked when the dissolver resumes; ordinary card
+  hygiene, nothing lost. (The dangerous direction — a role routing to an OFF-card
+  desk — cannot occur under this ordering.)
 - **In-flight traffic.** Batched traffic survives on rows: every message is a
   durable row and every digest is signed by the rule that produced it. An
   undelivered wake addressed to the ROLE re-resolves at send time per existing law;
@@ -47,7 +54,9 @@ Every failure mode degrades to a topology that already works:
 - Worker dies → normal restaffing by the worker's parent or spawner, per existing
   restaffing law. The exec cannot restaff its principal — not in its verbs — but it
   keeps triaging and may summon or escalate.
-- Card revoked → the role rebinds to the worker, and the office is over.
+- Card revoked → the office is over in authority; the role does NOT rebind itself
+  (revocation never touches routing). The dissolver performs the rebind — which,
+  under the rebind-first order above, has already happened.
 
 Atomic desk rebind is substrate work the org earns with evidence of friction, not a
 gap in this convention: until then, the sequence above is the law and its windows are
