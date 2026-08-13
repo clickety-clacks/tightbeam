@@ -95,21 +95,27 @@ defmodule Tightbeam.IdentityTest do
     # A handful of exact, load-bearing phrases — not the whole text, which
     # would make this test as brittle as the thing it exists to catch.
     assert card =~
-             "MAY: read substrate rows; file its own lifecycle attests on its own card and"
+             "MAY: read substrate rows; file its own lifecycle attests on its own card"
 
     assert card =~
-             "batch, schedule, and deliver to its principal within §7's ceilings; summon its"
+             "batch, schedule, and deliver to its principal within §7's ceilings; summon"
 
     assert card =~ "MUST NOT: file verdicts on substance"
-    assert card =~ "accept or reject work; make product judgments; alter"
+    assert card =~ "accept or reject work; make product judgments;"
     assert card =~ ~s(Its only "no" is "later")
-    assert card =~ "the prodder bounds starvation across its watermark population (§5)"
+    assert card =~ "the prodder bounds starvation across its watermark"
+
+    # Receipt is behavior, never an acknowledgment filing (no-ack law, §6 r5) —
+    # pin the new phrasing and refute the receipt turn it deleted.
+    assert card =~ "directive receipt is proven by BEHAVIOR"
+    assert card =~ "never by an acknowledgment filing"
+    refute card =~ "acknowledge directives there"
 
     # The r5 additions are §6 verb law too: the D2 spawn clause and the D3
     # containment compilation are load-bearing the same way the lists are.
-    assert card =~ "DIRECTED\n    EXECUTION of its principal's recorded decision"
-    assert card =~ "hold or receive implementation cards"
-    assert card =~ "file completions off\n    this card"
+    assert card =~ "DIRECTED EXECUTION of its principal's recorded decision"
+    assert card =~ "hold or RECEIVE\n    implementation cards"
+    assert card =~ "file\n    completions off the delegation card"
     assert card =~ "spawn uncited"
   end
 
