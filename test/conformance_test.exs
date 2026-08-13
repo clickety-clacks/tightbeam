@@ -1135,8 +1135,10 @@ defmodule Tightbeam.ConformanceSupport do
   defp assert_question_outcome("answered", kase, db, handlers, _ids, result) do
     request = filed!(kase, result)
 
-    # A bystander is refused, and the refusal names the reason.
-    assert {:error, %{code: "not_asked"}} =
+    # A bystander is refused `not_found`, not a kind/authority-revealing
+    # `not_asked` (Sol xhigh review, finding 4): an unauthorized caller must
+    # not be able to tell this id apart from a fake one.
+    assert {:error, %{code: "not_found"}} =
              Dispatch.dispatch(db, handlers, answer_call("bystander", request.id, "not mine"))
 
     assert {:ok, %{decision_request: answered}} =
@@ -1285,10 +1287,13 @@ defmodule Tightbeam.ConformanceSupport do
   defp assert_cursor_outcome("unpaged", kase, db, handlers, call) do
     assert {:ok, page} = Dispatch.dispatch(db, handlers, call)
 
-    # NO DEFAULT LIMIT. Every row the assignment carries, and the page says so.
+    # NO DEFAULT LIMIT. Every row the assignment carries. And, since neither
+    # `--after` nor `--limit` was named, the response carries ONLY `attests`
+    # — no `next_after`/`has_more_after` paging vocabulary added (Sol xhigh
+    # review, finding 8: those keys are PAGING vocabulary, and a caller that
+    # never asked to page must see zero payload change).
     assert length(page.attests) == length(Map.get(kase["world"], "attests"))
-    assert page.has_more_after == false
-    assert page.next_after == List.last(page.attests).id
+    assert page == %{attests: page.attests}
   end
 
   defp assert_cursor_outcome("page", kase, db, handlers, call) do

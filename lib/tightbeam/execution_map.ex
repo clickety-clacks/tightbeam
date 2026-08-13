@@ -897,11 +897,17 @@ defmodule Tightbeam.ExecutionMap do
     |> Map.new(fn {assignment_id, refs} -> {assignment_id, Enum.uniq(refs)} end)
   end
 
+  # `kind IN ('statute', 'effort')` is stated rather than left unfiltered
+  # (Sol xhigh review, finding 2): this tally predates the agent arm, and an
+  # unfiltered `status = 'open'` here silently started counting agent
+  # questions as pending escalations the moment that arm shipped — telemetry
+  # drift, not a gate, but exactly the "generic reader" the tripwire's
+  # enumeration exists to catch.
   defp open_requests(db) do
     {:ok, rows} =
       DB.query(db, """
       SELECT assignmentId, COUNT(*) FROM decision_requests
-      WHERE status = 'open' AND assignmentId IS NOT NULL
+      WHERE status = 'open' AND assignmentId IS NOT NULL AND kind IN ('statute', 'effort')
       GROUP BY assignmentId
       """)
 
@@ -1060,10 +1066,17 @@ defmodule Tightbeam.ExecutionMap do
 
         envelope(world)
         |> Map.put(:items, Enum.map(selected, &node(world, &1)))
-        |> Map.put(:next_after, selected != [] && List.last(selected).id)
+        |> Map.put(:next_after, next_after(selected))
         |> Map.put(:has_more_after, rest != [])
     end
   end
+
+  # `false` is not an id: an exhausted page must hand back an explicit `nil`
+  # cursor, the same ID-or-null shape every other page carries, never a
+  # boolean a client could round-trip back in as `--after` (Sol xhigh review,
+  # finding 6).
+  defp next_after([]), do: nil
+  defp next_after(selected), do: List.last(selected).id
 
   defp cursor_key(_world, nil), do: nil
 

@@ -10,7 +10,7 @@ defmodule Tightbeam.CoordinationFabricTest do
   """
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Wakes}
+  alias Tightbeam.{DB, Escalation, Wakes}
 
   setup do
     name = :"db_#{System.unique_integer([:positive])}"
@@ -725,6 +725,11 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert request.park_wake_id == nil
     assert request.consumed_at == nil
 
+    # No deadline either (Sol xhigh review, finding 1): a question is not
+    # swept, so it must not be indistinguishable from a statute/effort row to
+    # a generic `status = 'open' AND deadlineAt <= ?` consumer.
+    assert request.deadline_at == nil
+
     # The transactional outbox: one wake, at the asked session, elected
     # `input-needed` by the asker — so seam ②'s policy batches it to the target's
     # next turn boundary or the 30-minute floor, whichever comes first.
@@ -767,29 +772,169 @@ defmodule Tightbeam.CoordinationFabricTest do
     # obligation throughout and disposed of it by its own choice.
     assert get_request(db, request.id).status == "open"
 
-    # HALF TWO, structural: nothing outside `escalation.ex` selects this kind at
-    # all. A gate has to read the row before it can gate on it, so the readers
-    # are the thing to pin.
-    # Per-LITERAL, not per-file: a comment saying the words is not a reader, and
-    # SQL assembled from fragments is out of reach of any scan (proof 10 states
-    # the same limit). This is a floor against drift, not a sandbox.
-    readers =
-      Path.wildcard("lib/**/*.ex")
+    # HALF TWO, structural (Sol xhigh review, finding 2). The old scan required
+    # BOTH `decision_requests` and the literal `'agent'` inside one string node
+    # — it missed a generic `status = 'open'` sweep with no kind predicate, a
+    # kind assembled from a fragment or interpolation (`#{@request_columns}`
+    # defeats an `is_binary` AST match outright), and it permanently
+    # allowlisted the whole of `escalation.ex` for owning the DDL that happens
+    # to say both words. This replaces it with two checks that do not share
+    # that blind spot:
+    #
+    #   (a) FILE enumeration: every `lib/**/*.ex` file whose raw text mentions
+    #       `decision_requests` at all must be a file this test already knows
+    #       about. A brand new reader fails here, in a NEW file, before it
+    #       gets anywhere near a query.
+    #
+    #   (b) QUERY enumeration, inside those known files: every literal SQL
+    #       string containing `status = 'open'` that is not scoped to one row
+    #       by `id = ?` must also name a `kind` — a lifecycle sweep that
+    #       forgets to says which kind it means is exactly the "generic
+    #       reader" this tripwire exists to catch. Withdrawal is the one verb
+    #       every arm answers to as its own lawful exit (gate Q3), so the two
+    #       retirement sweeps that mean to reach every kind are named
+    #       exemptions, not silent passes.
+    known_files =
+      [
+        "lib/tightbeam/dispatch.ex",
+        "lib/tightbeam/effort_checkin.ex",
+        "lib/tightbeam/escalation.ex",
+        "lib/tightbeam/execution_map.ex",
+        "lib/tightbeam/gateway.ex",
+        "lib/tightbeam/job_trace.ex",
+        "lib/tightbeam/rail_episodes.ex",
+        "lib/tightbeam/schema.ex",
+        "lib/tightbeam/supervision.ex",
+        "lib/tightbeam/wakes.ex"
+      ]
       |> Enum.sort()
-      |> Enum.filter(fn file ->
-        file
-        |> File.read!()
-        |> Code.string_to_quoted!()
-        |> Macro.prewalk([], fn
-          sql, acc when is_binary(sql) -> {sql, [sql | acc]}
-          node, acc -> {node, acc}
-        end)
-        |> elem(1)
-        |> Enum.any?(&(&1 =~ "decision_requests" and &1 =~ ~r/'agent'/))
-      end)
 
-    assert readers == ["lib/tightbeam/escalation.ex"],
-           "an agent question is data its asker honors, never a row another module consults"
+    discovered =
+      Path.wildcard("lib/**/*.ex")
+      |> Enum.filter(&(File.read!(&1) =~ "decision_requests"))
+      |> Enum.sort()
+
+    assert discovered == known_files,
+           "a file touching decision_requests must be reviewed and added to known_files: " <>
+             "#{inspect(discovered -- known_files)} is new, " <>
+             "#{inspect(known_files -- discovered)} no longer touches it"
+
+    # Deliberately kind-agnostic: retirement withdraws every open row a
+    # retiring session raised, of every kind, as that session's own lawful
+    # exit (see the comments on `withdraw_for_retired/2` and
+    # `recover_retired/1`).
+    kind_agnostic_by_design = [
+      "SELECT id FROM decision_requests WHERE raiserSessionKey = ?1 AND status = 'open'",
+      "EXISTS (SELECT 1 FROM decision_requests dr WHERE dr.raiserSessionKey = s.sessionKey AND dr.status = 'open')"
+    ]
+
+    offenders =
+      for file <- known_files,
+          literal <- sql_literals(file),
+          literal =~ "decision_requests",
+          literal =~ "status = 'open'",
+          not (literal =~ "id = ?"),
+          not (literal =~ ~r/\bkind\b/),
+          not Enum.any?(kind_agnostic_by_design, &(literal =~ &1)) do
+        {file, literal}
+      end
+
+    assert offenders == [],
+           "a status='open' read naming no kind and no single row by id: #{inspect(offenders)}"
+  end
+
+  # Every double-quoted or triple-quoted string literal in a file's raw
+  # source, scanned as TEXT rather than parsed AST (Sol xhigh review, finding
+  # 2) — a query built with `#{@request_columns}` interpolation is not a plain
+  # `is_binary` AST node and an AST scan would silently skip it.
+  defp sql_literals(file) do
+    Regex.scan(~r/"""(?:(?!""").)*"""|"[^"\n]*"/s, File.read!(file))
+    |> List.flatten()
+  end
+
+  test "the statute gate read cannot be reached by an agent row sharing its raiser",
+       %{db: db} do
+    seed_session(db, "agent:coder", "flynn")
+    seed_session(db, "agent:po", "flynn")
+
+    # An open AGENT question from `agent:coder`, filed alongside an open
+    # STATUTE escalation from the very same raiser — the closest two rows can
+    # get to colliding on `current_request/4`'s key. If its `kind = 'statute'`
+    # predicate were ever dropped, `statuteName`/`actionKey` being NULL on the
+    # agent row already makes a collision structurally impossible; this proves
+    # the gate read still lands on the statute row, not merely that it could.
+    assert {:ok, %{decision_request: question}} = ask(db, "agent:coder", "agent:po", "which way?")
+
+    call = %{
+      verb: "attest",
+      origin: "agent:agent:coder",
+      principal: {:session, "agent:coder"},
+      session_key: nil,
+      params: %{assignment_id: "a-fake", kind: "completion"}
+    }
+
+    statute = %{name: "review", text: "owner denied review"}
+
+    assert {:needs_request, nil} = Escalation.resolve(db, call, statute)
+
+    {:decision_pending, statute_id} =
+      Escalation.escalate(db, call, statute, %{question: "allow?", options: nil})
+
+    refute statute_id == question.id
+    assert {:needs_request, ^statute_id} = Escalation.resolve(db, call, statute)
+
+    assert Escalation.rule(
+             db,
+             %{
+               origin: "user:flynn",
+               principal: {:user, "flynn"},
+               params: %{
+                 request_id: statute_id,
+                 decision: "allow"
+               }
+             },
+             authorized: true
+           ).decision == "allow"
+
+    assert {:allow, ^statute_id} = Escalation.resolve(db, call, statute)
+
+    # The agent question is untouched by any of that: still open, still
+    # answerless.
+    assert get_request(db, question.id).status == "open"
+  end
+
+  test "--about refuses an assignment the asker cannot legitimately reference, identically to a fake id",
+       %{db: db} do
+    seed_session(db, "agent:coder", "flynn")
+    seed_session(db, "agent:po", "flynn")
+    seed_session(db, "agent:outsider", "someone-else")
+
+    # `agent:outsider` neither holds it, opened it, nor is the party a review
+    # of it would target.
+    private = open_assignment(db, "agent:coder")
+
+    assert {:error, %{code: "not_found", message: invisible}} =
+             ask(db, "agent:outsider", "agent:po", "what is this about?",
+               assignment_id: private.id
+             )
+
+    assert {:error, %{code: "not_found", message: fake}} =
+             ask(db, "agent:outsider", "agent:po", "what is this about?",
+               assignment_id: "as_nonexistent"
+             )
+
+    # An outsider probing ids cannot tell a private assignment from one that
+    # does not exist (Sol xhigh review, finding 5) — same code, same message
+    # SHAPE (each just echoes back the id the caller itself supplied, never
+    # anything the probe didn't already know).
+    assert invisible =~ "unknown assignment: #{private.id}"
+    assert fake =~ "unknown assignment: as_nonexistent"
+
+    # The holder, naturally, can reference its own assignment.
+    assert {:ok, %{decision_request: request}} =
+             ask(db, "agent:coder", "agent:po", "what is this about?", assignment_id: private.id)
+
+    assert request.assignment_id == private.id
   end
 
   test "the asker's exits are its own, and only the asked principal answers", %{db: db} do
@@ -799,11 +944,14 @@ defmodule Tightbeam.CoordinationFabricTest do
 
     assert {:ok, %{decision_request: request}} = ask(db, "agent:coder", "agent:po", "which way?")
 
-    # Not the asker, not a bystander, not an admin: the principal that was asked.
-    assert {:error, %{code: "not_asked"}} =
+    # Not the asker, not a bystander, not an admin: the principal that was
+    # asked. Refused as `not_found` rather than a kind-revealing `not_asked`
+    # (Sol xhigh review, finding 4) — an unauthorized caller learns nothing an
+    # unauthorized caller probing a fake id would not also learn.
+    assert {:error, %{code: "not_found"}} =
              answer(db, {:session, "agent:coder"}, request.id, "myself")
 
-    assert {:error, %{code: "not_asked"}} =
+    assert {:error, %{code: "not_found"}} =
              answer(db, {:session, "agent:stranger"}, request.id, "not mine to answer")
 
     # `rule` and `waive` refuse BY NAME rather than quietly doing something.
@@ -840,6 +988,74 @@ defmodule Tightbeam.CoordinationFabricTest do
              answer(db, {:session, "agent:po"}, request.id, "changed my mind")
   end
 
+  test "answer and rule refuse a fake id, an agent question, and a non-agent request identically to an unauthorized caller",
+       %{db: db} do
+    seed_session(db, "agent:coder", "flynn")
+    seed_session(db, "agent:po", "flynn")
+    seed_session(db, "agent:outsider", "someone-else")
+
+    assert {:ok, %{decision_request: agent_request}} =
+             ask(db, "agent:coder", "agent:po", "which way?")
+
+    statute_id = "dr_statute_probe"
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO decision_requests (id, kind, raiserId, raiserSessionKey, ownerUserId, " <>
+          "raisedAt, deadlineAt, statuteName, actionKey, question, context, status) VALUES " <>
+          "(?1,'statute','session:agent:coder','agent:coder','flynn',1,999999999999," <>
+          "'deploy-gate','k1','q','{}','open')",
+        [statute_id]
+      )
+
+    # `answer`: a caller that was never asked cannot tell a fake id, someone
+    # else's question, and a non-agent request apart — ONE refusal for all
+    # three (Sol xhigh review, finding 4). Authority is checked before
+    # existence or kind is revealed.
+    assert {:error, %{code: "not_found"}} =
+             answer(db, {:session, "agent:outsider"}, "dr_nonexistent", "guess")
+
+    assert {:error, %{code: "not_found"}} =
+             answer(db, {:session, "agent:outsider"}, agent_request.id, "not mine")
+
+    assert {:error, %{code: "not_found"}} =
+             answer(db, {:session, "agent:outsider"}, statute_id, "not agent-kind")
+
+    # `rule`: an unauthorized (non-admin) caller gets the SAME refusal whether
+    # the id is fake, names an agent question, or names a real, rulable
+    # statute request — the agent-kind special case no longer fires ahead of
+    # the authority check.
+    assert {:error, %{code: "not_owner", message: fake}} =
+             verb(db, {:session, "agent:outsider"}, "rule", %{
+               request_id: "dr_nonexistent",
+               decision: "allow"
+             })
+
+    assert {:error, %{code: "not_owner", message: agent_kind}} =
+             verb(db, {:session, "agent:outsider"}, "rule", %{
+               request_id: agent_request.id,
+               decision: "allow"
+             })
+
+    assert {:error, %{code: "not_owner", message: statute_kind}} =
+             verb(db, {:session, "agent:outsider"}, "rule", %{
+               request_id: statute_id,
+               decision: "allow"
+             })
+
+    assert fake == agent_kind
+    assert agent_kind == statute_kind
+
+    # An AUTHORIZED admin still gets the specific, kind-naming refusal for the
+    # agent row — that message is only a leak when the caller has no standing
+    # to be told anything at all.
+    assert {:error, %{code: "invalid", message: authorized_agent}} =
+             admin_call(db, "rule", %{request: agent_request.id, decision: "allow"})
+
+    assert authorized_agent =~ "answered, not ruled"
+  end
+
   test "withdraw is the asker's own lawful exit, and nobody else's", %{db: db} do
     seed_session(db, "agent:coder", "flynn")
     seed_session(db, "agent:po", "flynn")
@@ -865,37 +1081,56 @@ defmodule Tightbeam.CoordinationFabricTest do
     seed_session(db, "agent:coder", "flynn")
     seed_session(db, "agent:po", "flynn")
 
+    # `deadlineAt` is left out of the column list entirely (and so lands NULL,
+    # exactly as the agent arm requires — Sol xhigh review, finding 1) so every
+    # row below is forbidden for exactly the one reason its comment names, not
+    # also for carrying a deadline the arm refuses.
     base =
       "INSERT INTO decision_requests (id, kind, raiserId, raiserSessionKey, ownerUserId, " <>
-        "expecterSessionKey, expecterUserId, raisedAt, deadlineAt, question, context, status"
+        "expecterSessionKey, expecterUserId, raisedAt, question, context, status"
 
     forbidden = [
       # Adjudication vocabulary, one column at a time.
       {", statuteName) VALUES ('d1','agent','session:agent:coder','agent:coder','flynn'," <>
-         "'agent:po','flynn',1,2,'q','{}','open','deploy-gate')"},
+         "'agent:po','flynn',1,'q','{}','open','deploy-gate')"},
       {", decision) VALUES ('d2','agent','session:agent:coder','agent:coder','flynn'," <>
-         "'agent:po','flynn',1,2,'q','{}','open','allow')"},
+         "'agent:po','flynn',1,'q','{}','open','allow')"},
       {", parkWakeId) VALUES ('d3','agent','session:agent:coder','agent:coder','flynn'," <>
-         "'agent:po','flynn',1,2,'q','{}','open','w_1')"},
+         "'agent:po','flynn',1,'q','{}','open','w_1')"},
       {", rulingFactId) VALUES ('d4','agent','session:agent:coder','agent:coder','flynn'," <>
-         "'agent:po','flynn',1,2,'q','{}','open',7)"},
+         "'agent:po','flynn',1,'q','{}','open',7)"},
       # `ruled` is not one of this arm's three words.
       {") VALUES ('d5','agent','session:agent:coder','agent:coder','flynn'," <>
-         "'agent:po','flynn',1,2,'q','{}','ruled')"},
+         "'agent:po','flynn',1,'q','{}','ruled')"},
       # `answered` without an answer, and an answer without an author.
       {") VALUES ('d6','agent','session:agent:coder','agent:coder','flynn'," <>
-         "'agent:po','flynn',1,2,'q','{}','answered')"},
+         "'agent:po','flynn',1,'q','{}','answered')"},
       {", answer) VALUES ('d7','agent','session:agent:coder','agent:coder','flynn'," <>
-         "'agent:po','flynn',1,2,'q','{}','answered','yes')"},
+         "'agent:po','flynn',1,'q','{}','answered','yes')"},
       # `raiserId` must name the asking session, not some other principal.
       {") VALUES ('d8','agent','user:flynn','agent:coder','flynn'," <>
-         "'agent:po','flynn',1,2,'q','{}','open')"}
+         "'agent:po','flynn',1,'q','{}','open')"}
     ]
 
     for {tail} <- forbidden do
       assert {:error, %DB.Error{message: message}} = DB.query(db, base <> tail)
       assert message =~ "CHECK constraint"
     end
+
+    # `deadlineAt` is the statute/effort arms' vocabulary (sweep/deadline
+    # semantics a question does not carry); the agent arm refuses a stamped
+    # one exactly as it refuses a stamped `decision` (Sol xhigh review,
+    # finding 1).
+    assert {:error, %DB.Error{message: deadlined}} =
+             DB.query(
+               db,
+               "INSERT INTO decision_requests (id, kind, raiserId, raiserSessionKey, " <>
+                 "ownerUserId, expecterSessionKey, expecterUserId, raisedAt, deadlineAt, " <>
+                 "question, context, status) VALUES ('d10','agent','session:agent:coder'," <>
+                 "'agent:coder','flynn','agent:po','flynn',1,999,'q','{}','open')"
+             )
+
+    assert deadlined =~ "CHECK constraint"
 
     # And the fence in the other direction: a STATUTE row cannot borrow the
     # agent arm's columns or its terminal word.
@@ -926,6 +1161,42 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert list_requests(db, {:user, "outsider"}) == []
   end
 
+  test "a sibling session sharing the asker's owner is not one of the three visible principals",
+       %{db: db} do
+    seed_session(db, "agent:coder", "flynn")
+    seed_session(db, "agent:po", "flynn")
+    # Owned by flynn too, same as coder — but neither asker, asked, nor the
+    # owner acting AS itself.
+    seed_session(db, "agent:reviewer", "flynn")
+    seed_session(db, "agent:bob-app", "bob")
+
+    assert {:ok, %{decision_request: request}} =
+             ask(db, "agent:coder", "agent:bob-app", "which way?")
+
+    # `owner_user_id: "flynn"` is exactly what the gateway resolves for ANY of
+    # flynn's sessions (`decision-requests`'s `caller.owner_user_id`) — so this
+    # reproduces, at the call site `Escalation.list/get` actually see, what an
+    # unrelated sibling session's call looks like (Sol xhigh review, finding
+    # 3). Before the fix, the `ownerUserId` branch fired for this session
+    # exactly as it does for the owner acting as a user principal.
+    reviewer_call = %{
+      origin: "agent:reviewer",
+      principal: {:session, "agent:reviewer"},
+      params: %{}
+    }
+
+    assert Escalation.list(db, reviewer_call, "open", owner_user_id: "flynn") == []
+    assert Escalation.get(db, reviewer_call, request.id, owner_user_id: "flynn") == nil
+
+    # The owner acting AS itself — a user principal, not merely a session
+    # resolving to the same owner — is the one the `ownerUserId` branch exists
+    # for, and still sees it.
+    owner_call = %{origin: "user:flynn", principal: {:user, "flynn"}, params: %{}}
+
+    assert [%{id: id}] = Escalation.list(db, owner_call, "open", owner_user_id: "flynn")
+    assert id == request.id
+  end
+
   ## Seam ④ — `--after` cursors (GitHub #13)
 
   test "the attests cursor is a (ts, id) keyset that survives a ts collision", %{db: db} do
@@ -937,10 +1208,12 @@ defmodule Tightbeam.CoordinationFabricTest do
     ids = for n <- 1..3, do: attest_row(db, assignment.id, "at_#{n}", 5_000)
     late = attest_row(db, assignment.id, "at_9", 5_001)
 
+    # A bare unpaged read carries no cursor vocabulary at all (seam ④'s
+    # byte-identical promise, Sol xhigh review finding 8) — the collision-
+    # spanning order is proved on `page.attests` alone.
     assert {:ok, page} = attests(db, assignment.id, %{})
     assert Enum.map(page.attests, & &1.id) == ids ++ [late]
-    assert page.has_more_after == false
-    assert page.next_after == late
+    assert page == %{attests: page.attests}
 
     assert {:ok, first} = attests(db, assignment.id, %{limit: 2})
     assert Enum.map(first.attests, & &1.id) == Enum.take(ids, 2)
@@ -969,6 +1242,12 @@ defmodule Tightbeam.CoordinationFabricTest do
     # this seam must not ship (Law 2).
     assert page.attests == Tightbeam.Assignments.list_attests(db, assignment.id)
     assert length(page.attests) == 3
+
+    # BYTE-IDENTICAL means the whole map, not just the list inside it (Sol
+    # xhigh review, finding 8): a pre-existing caller that never passed
+    # `--after`/`--limit` must see the exact response it always did, with no
+    # `next_after`/`has_more_after` keys added.
+    assert page == %{attests: page.attests}
   end
 
   test "an attests cursor from another assignment is not found, exactly like a fake one",
@@ -1010,9 +1289,32 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert second.has_more_after == false
 
     # The cursor is compared against the ORDER KEY, not against membership: an
-    # item filtered out of the page still positions the one after it.
+    # item filtered out of the page still positions the one after it. The
+    # cursor item itself is CLOSED here (Sol xhigh review, finding 7) — every
+    # helper-created item defaults to `open`, so the earlier `state: "open"`
+    # filter never actually excluded anything and this test would have passed
+    # even if cursor resolution regressed from `world.items_by_id` (the full
+    # item map) to the filtered/appearing roster, where a closed cursor item
+    # cannot be found at all.
+    close_work_item_row(db, Enum.at(ids, 0))
+
     assert {:ok, filtered} = toplines(db, %{after: Enum.at(ids, 0), state: "open"})
     assert Enum.map(filtered.items, & &1.id) == Enum.drop(ids, 1)
+  end
+
+  test "an exhausted toplines page hands back a null cursor, never a boolean", %{db: db} do
+    seed_session(db, "agent:coder", "flynn")
+    ids = for n <- 1..2, do: work_item_row(db, "wi_#{n}", 1_000 + n)
+
+    # Paging exactly to the end: the last item is the cursor, and the next
+    # page is empty (Sol xhigh review, finding 6). `selected != [] && ...`
+    # evaluates to `false` for an empty page — not the `nil` an ID-or-null
+    # cursor contract promises, and not something a client could round-trip
+    # back in as `--after`.
+    assert {:ok, exhausted} = toplines(db, %{after: List.last(ids)})
+    assert exhausted.items == []
+    assert exhausted.next_after == nil
+    assert exhausted.has_more_after == false
   end
 
   test "toplines refuses a forest page and an unresolvable cursor by name", %{db: db} do
@@ -1167,6 +1469,11 @@ defmodule Tightbeam.CoordinationFabricTest do
         [id, created_at]
       )
 
+    id
+  end
+
+  defp close_work_item_row(db, id) do
+    {:ok, _} = DB.query(db, "UPDATE work_items SET state = 'closed' WHERE id = ?1", [id])
     id
   end
 

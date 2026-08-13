@@ -1225,11 +1225,18 @@ defmodule Tightbeam.Supervision do
   defp close_episode(db, {statute, subject, occurrence}),
     do: RailRemedy.close(db, statute, subject, occurrence)
 
+  # `decision_request_id` here only ever names a statute row: it is the `dr_id`
+  # `Escalation.resolve/3` handed back, which comes from `current_request/4`'s
+  # own `kind = 'statute'`-scoped read. Stated here too (Sol xhigh review,
+  # finding 2) rather than left to that upstream invariant alone — a park sweep
+  # is exactly the kind of reader that must not be able to reach an agent row
+  # even by construction accident, and `deadlineAt` is read below on the
+  # assumption it is non-null, which only the statute/effort arms promise.
   defp park_escalation(db, session_key, decision_request_id) do
     transaction!(db, fn txn ->
       case Txn.q(
              txn,
-             "SELECT deadlineAt, parkWakeId, assignmentId FROM decision_requests WHERE id = ?1 AND status = 'open'",
+             "SELECT deadlineAt, parkWakeId, assignmentId FROM decision_requests WHERE id = ?1 AND status = 'open' AND kind = 'statute'",
              [decision_request_id]
            ) do
         [[deadline_at, nil, assignment_id]] ->

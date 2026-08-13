@@ -1329,7 +1329,7 @@ defmodule Tightbeam.Assignments do
          {:ok, limit} <- attest_limit(call.params[:limit]),
          :known <- known_assignment(db, assignment_id),
          {:ok, cursor} <- attest_after(db, assignment_id, call.params[:after]) do
-      attest_page(db, assignment_id, cursor, limit)
+      attest_page(db, assignment_id, cursor, limit, paging?(call.params))
     else
       :unknown -> error("unknown_assignment", "unknown assignment: #{assignment_id}")
       {:error, error} -> error
@@ -1344,14 +1344,25 @@ defmodule Tightbeam.Assignments do
     end
   end
 
+  defp paging?(params), do: not is_nil(params[:after]) or not is_nil(params[:limit])
+
+  # No `--after`/`--limit` at all: the response carries ONLY the key it always
+  # carried (Sol xhigh review, finding 8). `next_after`/`has_more_after` are
+  # PAGING vocabulary — a pre-existing caller that never asked to page must see
+  # zero payload change, the same byte-identical promise `toplines`' unpaged
+  # read makes.
+  defp attest_page(db, assignment_id, cursor, _limit, false) do
+    %{attests: list_attests(db, assignment_id, cursor, nil)}
+  end
+
   # One extra row decides `has_more_after` from the rows themselves rather than a
   # second COUNT that could disagree with the page it describes.
-  defp attest_page(db, assignment_id, cursor, nil) do
+  defp attest_page(db, assignment_id, cursor, nil, true) do
     entries = list_attests(db, assignment_id, cursor, nil)
     %{attests: entries, next_after: last_attest_id(entries), has_more_after: false}
   end
 
-  defp attest_page(db, assignment_id, cursor, limit) do
+  defp attest_page(db, assignment_id, cursor, limit, true) do
     fetched = list_attests(db, assignment_id, cursor, limit + 1)
     entries = Enum.take(fetched, limit)
 

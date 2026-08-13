@@ -38,7 +38,14 @@ defmodule Tightbeam.Escalation do
     effortGeneration  INTEGER,
     deadlineWakeId    TEXT,
     raisedAt          INTEGER NOT NULL,
-    deadlineAt        INTEGER NOT NULL,
+    -- Nullable at the column: only the statute/effort arms carry sweep/deadline
+    -- semantics and require it below. The agent arm pins it NULL, right beside
+    -- every other adjudication column it refuses to borrow — a question has no
+    -- deadline for the same reason it has no `decision` (Sol xhigh review,
+    -- finding 1: a non-null `deadlineAt` on every row made an agent question
+    -- indistinguishable from a statute/effort row to any generic
+    -- `status = 'open' AND deadlineAt <= ?` sweep).
+    deadlineAt        INTEGER,
     statuteName       TEXT,
     actionKey         TEXT,
     question          TEXT NOT NULL,
@@ -66,6 +73,7 @@ defmodule Tightbeam.Escalation do
       (kind = 'statute' AND statuteName IS NOT NULL AND actionKey IS NOT NULL
        AND expecterSessionKey IS NULL AND expecterUserId IS NULL
        AND lineageRung IS NULL AND effortGeneration IS NULL AND deadlineWakeId IS NULL
+       AND deadlineAt IS NOT NULL
        AND (decision IS NULL OR decision IN ('allow','deny','waived')))
       OR
       (kind = 'effort' AND raiserId = 'process:tightbeam'
@@ -73,6 +81,7 @@ defmodule Tightbeam.Escalation do
        AND statuteName IS NULL AND actionKey IS NULL AND assignmentId IS NOT NULL
        AND ((expecterSessionKey IS NOT NULL) != (expecterUserId IS NOT NULL))
        AND lineageRung IS NOT NULL AND effortGeneration IS NOT NULL AND deadlineWakeId IS NOT NULL
+       AND deadlineAt IS NOT NULL
        AND (decision IS NULL OR decision IN ('continue','dismiss')))
       OR
       -- THE THIRD ARM: one agent's question, filed at a named principal.
@@ -88,6 +97,12 @@ defmodule Tightbeam.Escalation do
       -- `consumedAt` NULL for the same reason: nothing SPENDS an answer. The
       -- asker reads it and decides for itself (adjudication-deletion amendment:
       -- the row is data its asker chooses to honor).
+      --
+      -- `deadlineAt` NULL too (Sol xhigh review, finding 1): a deadline is
+      -- sweep/statute-arm vocabulary — something the substrate wakes up to act
+      -- on unilaterally. A question has no such semantics; the asker holds its
+      -- own obligation for as long as it likes (gate Q3's three exits are all
+      -- the asker's own choice, never a clock's).
       (kind = 'agent'
        AND raiserSessionKey IS NOT NULL AND raiserId = 'session:' || raiserSessionKey
        -- Both stamped at file time, never inferred later: the asked SESSION and
@@ -99,6 +114,7 @@ defmodule Tightbeam.Escalation do
        AND ruledBy IS NULL AND ruledAt IS NULL AND rulingFactId IS NULL
        AND consumedAt IS NULL AND parkWakeId IS NULL
        AND lineageRung IS NULL AND effortGeneration IS NULL AND deadlineWakeId IS NULL
+       AND deadlineAt IS NULL
        -- `options` stays NULL here: the shared column's shape is a list of
        -- {label, allow|deny} — adjudication vocabulary again. A question's
        -- choices live in its text until they have a shape of their own.
@@ -366,7 +382,7 @@ defmodule Tightbeam.Escalation do
     with {:ok, asker_session_key} <- asking_session(call),
          {:ok, asked} <- asked_principal(db, asked_session_key, asker_session_key),
          {:ok, text} <- asked_question(question),
-         {:ok, about} <- asked_about(db, call) do
+         {:ok, about} <- asked_about(db, call, asker_session_key) do
       file_agent_request(db, %{
         asker_session_key: asker_session_key,
         owner_user_id: owner_user_id!(db, call),
@@ -392,6 +408,13 @@ defmodule Tightbeam.Escalation do
   session resolved to when the question was filed. Nobody else — an admin
   answering a question addressed to someone else would be the substrate letting
   authority stand in for the mind that was actually asked.
+
+  Authority is checked BEFORE anything about the request is revealed: a
+  nonexistent id, an existing non-agent id, and an existing agent question
+  addressed to someone else are ONE identical refusal (Sol xhigh review,
+  finding 4). Distinguishing them would let an unauthorized caller probe
+  request ids for existence and kind — the same existence-oracle risk
+  `page/3`'s cursor resolution refuses (seam ④).
   """
   @spec answer(DB.server(), map()) :: map()
   def answer(db, call) do
@@ -400,24 +423,22 @@ defmodule Tightbeam.Escalation do
 
     case get_raw(db, request_id) do
       %{kind: "agent"} = request ->
-        cond do
-          not answerer?(call, request) ->
-            error("not_asked", "only the principal this question was asked of may answer it")
+        if answerer?(call, request) do
+          cond do
+            not (is_binary(text) and String.trim(text) != "") ->
+              error("invalid", "an answer requires text")
 
-          not (is_binary(text) and String.trim(text) != "") ->
-            error("invalid", "an answer requires text")
+            request.status != "open" ->
+              error("not_open", "decision request is not open")
 
-          request.status != "open" ->
-            error("not_open", "decision request is not open")
-
-          true ->
-            answer_open(db, request, String.trim(text), answered_by(call))
+            true ->
+              answer_open(db, request, String.trim(text), answered_by(call))
+          end
+        else
+          error("not_found", "decision request not found")
         end
 
-      %{} ->
-        error("invalid", "only agent questions are answered; see rule / effort-rule")
-
-      nil ->
+      _ ->
         error("not_found", "decision request not found")
     end
   end
@@ -428,7 +449,6 @@ defmodule Tightbeam.Escalation do
   defp file_agent_request(db, input) do
     now = now()
     request_id = "dr_" <> Tightbeam.Id.uuid4()
-    deadline_at = now + decision_deadline_ms()
 
     context =
       JSON.encode!(%{
@@ -450,7 +470,7 @@ defmodule Tightbeam.Escalation do
             (id, kind, raiserId, raiserSessionKey, ownerUserId, assignmentId,
              expecterSessionKey, expecterUserId, raisedAt, deadlineAt,
              question, context, status, askedOfRole)
-          VALUES (?1, 'agent', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'open', ?12)
+          VALUES (?1, 'agent', ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10, 'open', ?11)
           """,
           [
             request_id,
@@ -461,7 +481,6 @@ defmodule Tightbeam.Escalation do
             input.asked.session_key,
             input.asked.owner_user_id,
             now,
-            deadline_at,
             input.question,
             context,
             input.asked_of_role
@@ -571,19 +590,56 @@ defmodule Tightbeam.Escalation do
   # refusal rather than a silently dropped column (report dirt, never accommodate
   # it). It attributes the question in the execution map's telemetry; it gates
   # nothing there either.
-  defp asked_about(db, call) do
+  #
+  # A bare existence check let an outsider name ANY assignment id, filing a
+  # question that associates it with private work it has no standing to
+  # reference — and an existing-but-invisible id filed successfully while a
+  # nonexistent one refused, which is an existence oracle on top (Sol xhigh
+  # review, finding 5). There is no general assignment-visibility predicate in
+  # this codebase to reuse (`assignment-get` itself is unscoped), so this is
+  # the minimal one: the asker must hold the assignment, have opened it, or be
+  # the one it reviews. Both an invisible id and a nonexistent one refuse
+  # identically.
+  defp asked_about(db, call, asker_session_key) do
     case assignment_id(call) do
       nil ->
         {:ok, nil}
 
       id when is_binary(id) ->
-        case DB.query(db, "SELECT 1 FROM assignments WHERE id = ?1", [id]) do
-          {:ok, [[1]]} -> {:ok, id}
-          {:ok, []} -> {:error, error("not_found", "unknown assignment: #{id}")}
+        if askable_assignment?(db, id, asker_session_key) do
+          {:ok, id}
+        else
+          {:error, error("not_found", "unknown assignment: #{id}")}
         end
 
       _ ->
         {:error, error("invalid", "--about takes an assignment id")}
+    end
+  end
+
+  defp askable_assignment?(db, assignment_id, asker_session_key) do
+    case DB.query(
+           db,
+           "SELECT holderKey, openedBySession, reviewsAssignmentId FROM assignments WHERE id = ?1",
+           [assignment_id]
+         ) do
+      {:ok, [[holder_key, opened_by_session, reviews_id]]} ->
+        holder_key == asker_session_key or
+          opened_by_session == asker_session_key or
+          (is_binary(reviews_id) and reviewed_holder?(db, reviews_id, asker_session_key))
+
+      {:ok, []} ->
+        false
+    end
+  end
+
+  # The assignment named by `--about` reviews another one: the session being
+  # reviewed is legitimately referenced by that review even though it holds
+  # neither the review assignment nor opened it.
+  defp reviewed_holder?(db, reviewed_assignment_id, asker_session_key) do
+    case DB.query(db, "SELECT holderKey FROM assignments WHERE id = ?1", [reviewed_assignment_id]) do
+      {:ok, [[holder_key]]} -> holder_key == asker_session_key
+      {:ok, []} -> false
     end
   end
 
@@ -643,7 +699,14 @@ defmodule Tightbeam.Escalation do
       # THE TRIPWIRE, refused at the verb edge (fabric §10). An agent's question
       # has no allow/deny/waived to hand out, and letting `rule` reach one would
       # turn a question into an authorization the substrate then owns.
-      request && request.kind == "agent" ->
+      #
+      # Gated on `:authorized` too (Sol xhigh review, finding 4): without it, an
+      # unauthorized caller learned a request exists AND is an agent's question
+      # before ever being told it lacks standing to rule anything. Falling
+      # through to `rule_statute/4` for an unauthorized+agent-kind call gives it
+      # the exact same `not_owner` an unauthorized caller gets for a nonexistent
+      # id — only an AUTHORIZED caller ever reaches the kind-specific refusal.
+      request && request.kind == "agent" && Keyword.get(opts, :authorized, false) ->
         error("invalid", "agent questions are answered, not ruled")
 
       true ->
@@ -793,6 +856,14 @@ defmodule Tightbeam.Escalation do
   end
 
   @doc "Withdraw open requests and revoke live waivers for one retired session raiser."
+  # KIND-AGNOSTIC BY DESIGN, not an oversight the tripwire's enumeration should
+  # flag (Sol xhigh review, finding 2): withdrawal is the one verb every arm
+  # answers to as its own lawful, judgment-free exit (gate Q3 for the agent
+  # arm's own doc above). Retirement withdraws ALL of a session's open rows —
+  # statute, effort, agent alike — on that session's behalf, exactly as if the
+  # session had called `withdraw` on each itself. This reads `status = 'open'`
+  # with no `kind` predicate because it means to reach every kind, not because
+  # it forgot one.
   @spec withdraw_for_retired(DB.server(), String.t()) :: :ok
   def withdraw_for_retired(db, session_key) do
     raiser_id = "session:" <> session_key
@@ -861,7 +932,7 @@ defmodule Tightbeam.Escalation do
     {:ok, rows} =
       DB.query(
         db,
-        "SELECT id FROM decision_requests WHERE statuteName = ?1 AND raiserId = 'process:tightbeam' AND actionKey LIKE ?2 AND status = 'open'",
+        "SELECT id FROM decision_requests WHERE kind = 'statute' AND statuteName = ?1 AND raiserId = 'process:tightbeam' AND actionKey LIKE ?2 AND status = 'open'",
         [statute_name, @episode_prefix <> "%"]
       )
 
@@ -917,6 +988,8 @@ defmodule Tightbeam.Escalation do
   end
 
   @doc "Boot backstop for retirement casts lost across a crash."
+  # Same kind-agnostic exemption as `withdraw_for_retired/2` immediately above,
+  # which this only locates candidates for and then calls unchanged.
   @spec recover_retired(DB.server()) :: :ok
   def recover_retired(db \\ DB) do
     {:ok, rows} =
@@ -1069,7 +1142,7 @@ defmodule Tightbeam.Escalation do
             open_ids =
               Txn.q(
                 txn,
-                "SELECT id FROM decision_requests WHERE raiserId = ?1 AND statuteName = ?2 AND status = 'open' ORDER BY rowid",
+                "SELECT id FROM decision_requests WHERE kind = 'statute' AND raiserId = ?1 AND statuteName = ?2 AND status = 'open' ORDER BY rowid",
                 [raiser_id, statute_name]
               )
 
@@ -1361,6 +1434,16 @@ defmodule Tightbeam.Escalation do
   # principal it was asked of, and the owner accountable for the asker. Both
   # asked-side columns are stamped at file time, so this is a column comparison
   # rather than a join that could disagree with the row.
+  #
+  # The `ownerUserId` branch is that THIRD principal — the owner, acting AS
+  # itself — and it must fire only when the caller's own principal IS that
+  # user, never merely because `owner_user_id` (resolved upstream from the
+  # caller's session) happens to equal the row's owner. Every session an owner
+  # runs shares that same resolved owner id, so gating on the value alone let
+  # one of the owner's UNRELATED sessions see a question it was never asker,
+  # asked, nor acting-as-owner for (Sol xhigh review, finding 3: Alice's
+  # `reviewer` session could see `coder`'s question to Bob through Alice's
+  # owner id, despite being a fourth, uninvolved principal).
   defp agent_visibility(call, raiser, owner_user_id) do
     {asked_sql, asked_params} =
       case call.principal do
@@ -1369,11 +1452,13 @@ defmodule Tightbeam.Escalation do
         _ -> {"0", []}
       end
 
-    if is_binary(owner_user_id) do
-      {"(raiserId = ? OR ownerUserId = ? OR #{asked_sql})",
-       [raiser, owner_user_id] ++ asked_params}
-    else
-      {"(raiserId = ? OR #{asked_sql})", [raiser] ++ asked_params}
+    case call.principal do
+      {:user, ^owner_user_id} when is_binary(owner_user_id) ->
+        {"(raiserId = ? OR ownerUserId = ? OR #{asked_sql})",
+         [raiser, owner_user_id] ++ asked_params}
+
+      _ ->
+        {"(raiserId = ? OR #{asked_sql})", [raiser] ++ asked_params}
     end
   end
 
