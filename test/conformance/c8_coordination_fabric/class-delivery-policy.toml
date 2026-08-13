@@ -1,0 +1,19 @@
+[fixture]
+class = "C8"
+name = "class-delivery-policy"
+phase = "green"
+blocking_phase = ""
+kind = "delivery-policy"
+source = "coordination-fabric-v1 §5 batcher, §7 class table, Invariant 3"
+legibility = "lifecycle:wake_digest_materialized"
+
+# THE INVARIANT THIS FIXTURE EXISTS TO HOLD DOWN: a batched delivery exits on
+# TIME or a TURN BOUNDARY and on nothing else (Invariant 3). The two ways to
+# break it are opposite and both silent — a hold that never ends because nobody
+# came back for it, and a "ceiling" that quietly promotes traffic the sender did
+# not mark urgent — so every case below pins the exit it takes BY NAME.
+#
+# `--class` is measured through the `wake` verb, not through `Wakes.schedule`,
+# so the sender's election crosses the dispatch chokepoint the wire router uses.
+# There is no [[fixture.rule]]: the delivery policy is a substrate BEHAVIOUR,
+# not org-authored law, and nothing here evaluates a statute.

@@ -1,0 +1,22 @@
+[fixture]
+class = "C8"
+name = "class-election-and-skew"
+phase = "green"
+blocking_phase = ""
+kind = "delivery-policy"
+source = "coordination-fabric-v1 §5 classifier + policy-skew rule, §7 vocabulary"
+legibility = "handler:invalid"
+
+# THE SENDER'S WORD SURVIVES. Two failures this fixture forbids, and the second
+# is the one a substrate reaches for by reflex:
+#
+#   1. The classifier overwriting an election — §5 says it stamps ONLY
+#      unclassified traffic, so a stamped class is proof the sender said nothing.
+#   2. Refusing a class this build does not recognize. A kungfu extends the
+#      vocabulary freely (§7), so a membership check here would make an org's own
+#      extension a substrate error. The extension is DELIVERED — as `fyi`, never
+#      promoted, never dropped — and the gap is filed as a named skew row that a
+#      mind can act on (§5 policy-skew: fail quiet and visible).
+#
+# What IS refused is a class that is not a name at all, because there is no
+# sender election to preserve in an empty string.

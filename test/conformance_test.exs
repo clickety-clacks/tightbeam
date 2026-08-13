@@ -43,7 +43,7 @@ defmodule Tightbeam.ConformanceSupport do
                ~w(case kind expect reason emits input script_return world call phase2 phase)
              )
   @expects MapSet.new(
-             ~w(deny pass refuse run-remedy re-obligate escalate-park none escalate-halt escalate-open escalate-continue load-raise load-clean)
+             ~w(deny pass refuse run-remedy re-obligate escalate-park none escalate-halt escalate-open escalate-continue load-raise load-clean digest immediate bypass inhibited unclassed)
            )
   @case_expects %{
     "harness-gate" => ~w(deny pass),
@@ -52,7 +52,11 @@ defmodule Tightbeam.ConformanceSupport do
     "handler-refusal" => ~w(refuse pass),
     "remedy" => ~w(run-remedy none escalate-halt escalate-open escalate-continue),
     "sweep" => ~w(run-remedy re-obligate escalate-park none escalate-continue),
-    "capstone" => ~w(deny pass run-remedy re-obligate none)
+    "capstone" => ~w(deny pass run-remedy re-obligate none),
+    # The five outcomes the delivery policy can reach, plus the one refusal it
+    # owes. Named exhaustively so a sixth outcome cannot be smuggled in as a
+    # variant of an existing word (coordination-fabric-v1 §5, §7).
+    "delivery-policy" => ~w(digest immediate bypass inhibited unclassed refuse)
   }
   @load_twins [
     ~w(remedy-target-missing remedy-target-present),
@@ -210,6 +214,9 @@ defmodule Tightbeam.ConformanceSupport do
 
   defp applicable_runners("script-guard", runners),
     do: Enum.filter(runners, &(&1 == "rail_exec"))
+
+  defp applicable_runners("delivery-policy", runners),
+    do: Enum.filter(runners, &(&1 == "delivery_policy"))
 
   defp applicable_runners(_kind, runners), do: runners
 
@@ -856,6 +863,161 @@ defmodule Tightbeam.ConformanceSupport do
   end
 
   defp assert_fixture_world(_fixture, _kase, _db, _ids), do: :ok
+
+  # The delivery-policy contract (coordination-fabric-v1 §5, §7, Invariant 3).
+  #
+  # Every case goes through `Dispatch.dispatch/3` on the `wake` verb — the same
+  # chokepoint the wire router uses — so the sender's election crosses the real
+  # boundary rather than being handed straight to `Wakes.schedule`. The
+  # assertions below are keyed on the case's DECLARED expect and, for a digest,
+  # its declared exit `reason`: there is no shared "and also check whatever
+  # happened" tail, because a batching mechanism that quietly took a different
+  # exit than the one its case names is exactly the failure worth catching.
+  def run_delivery_policy_fixture(fixture) do
+    Enum.each(fixture["cases"], fn kase ->
+      {db, pid} = memory_db!()
+
+      try do
+        ids = materialize_world(db, Map.get(kase, "world", %{}))
+        call = build_call(kase["call"], ids)
+        handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
+
+        assert_delivery_outcome(kase, db, Dispatch.dispatch(db, handlers, call))
+      after
+        GenServer.stop(pid)
+      end
+    end)
+  end
+
+  defp assert_delivery_outcome(%{"expect" => "refuse"} = kase, db, result) do
+    assert {:error, %{code: code}} = result, "#{kase["case"]}: expected a refusal"
+    assert code == kase["reason"]
+
+    # A refused election writes NOTHING. A wake row here would mean the
+    # substrate accepted a message it told the sender it had rejected.
+    assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM wakes")
+
+    if kase["kind"] == "legibility",
+      do: assert(kase["emits"] == "handler:#{code}")
+  end
+
+  defp assert_delivery_outcome(kase, db, result) do
+    assert {:ok, %{wake_id: wake_id}} = result, "#{kase["case"]}: expected the wake to land"
+    wake = Wakes.get(db, wake_id)
+
+    assert_delivery_policy(kase["expect"], kase, db, wake)
+  end
+
+  defp assert_delivery_policy("unclassed", _kase, db, wake) do
+    assert wake.class == nil
+    assert wake.class_election == nil
+    assert wake.delivery_rule == nil
+    assert Wakes.materialize_digests(db, wake.due_at + 1) == []
+  end
+
+  defp assert_delivery_policy("immediate", _kase, db, wake) do
+    assert wake.delivery_rule =~ "immediate-delivery"
+    assert wake.due_at <= wake.created_at
+    assert Wakes.materialize_digests(db, wake.due_at + 1) == []
+  end
+
+  defp assert_delivery_policy("bypass", _kase, db, wake) do
+    assert wake.delivery_rule =~ "algedonic-bypass"
+    assert wake.due_at <= wake.created_at
+
+    assert Wakes.materialize_digests(db, wake.due_at + 1) == [],
+           "an alarm the batcher can absorb is not an alarm"
+  end
+
+  defp assert_delivery_policy("inhibited", _kase, db, wake) do
+    assert wake.delivery_rule == Wakes.inhibited_rule()
+    assert wake.class != nil, "inhibiting the batcher must not erase what was said"
+    assert wake.due_at > wake.created_at
+    assert Wakes.materialize_digests(db, wake.due_at + 1) == []
+  end
+
+  defp assert_delivery_policy("digest", kase, db, wake) do
+    policy = Wakes.delivery_policy(wake.class)
+
+    assert wake.delivery_rule == Wakes.digest_rule()
+    assert wake.class_election == "sender"
+    assert wake.due_at - wake.created_at == policy.ceiling_ms
+
+    if policy.skew do
+      assert lifecycle_detail(db, "wake_class_policy_skew", wake.wake_id) =~
+               "class=#{wake.class}"
+    else
+      assert lifecycle_detail(db, "wake_class_policy_skew", wake.wake_id) == nil
+    end
+
+    case kase["reason"] do
+      "ceiling" -> assert_ceiling_exit(kase, db, wake, policy)
+      "turn-boundary" -> assert_turn_boundary_exit(db, wake)
+      nil -> :ok
+    end
+  end
+
+  # INVARIANT 3, the idle half: nobody comes back for this session, and the
+  # digest still materializes its own turn at the ceiling.
+  defp assert_ceiling_exit(kase, db, wake, policy) do
+    assert Wakes.materialize_digests(db, wake.created_at + policy.ceiling_ms - 1) == []
+    assert [digest_id] = Wakes.materialize_digests(db, wake.created_at + policy.ceiling_ms)
+
+    digest = Wakes.get(db, digest_id)
+    assert digest.digest
+    assert digest.class == wake.class
+    assert digest.prompt =~ Wakes.digest_signature(1)
+
+    # LAW 2: the source row is still here, and it names where its payload went.
+    carried = Wakes.get(db, wake.wake_id)
+    assert carried.state == "canceled"
+    assert carried.prompt == wake.prompt
+    assert [%{wake_id: source}] = Wakes.digest_members(db, digest_id)
+    assert source == wake.wake_id
+
+    if kase["kind"] == "legibility" do
+      detail = lifecycle_detail(db, "wake_digest_materialized", digest_id)
+      assert kase["emits"] == "lifecycle:wake_digest_materialized"
+      assert detail =~ "rule=#{Wakes.digest_rule()}"
+      assert detail =~ "trigger=ceiling"
+    end
+  end
+
+  # INVARIANT 3, the boundary half: a turn of the target's own ends, and the
+  # digest lands there rather than waiting out the ceiling.
+  defp assert_turn_boundary_exit(db, wake) do
+    seq = System.unique_integer([:positive, :monotonic])
+
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO turns
+          (seq, sessionKey, messageId, origin, prompt, status, createdAt, endedAt)
+        VALUES (?1, ?2, ?3, 'user:owner', 'go', 'delivered', ?4, ?5)
+        """,
+        [seq, wake.session_key, "m_#{seq}", wake.created_at + 1, wake.created_at + 2]
+      )
+
+    assert [digest_id] = Wakes.materialize_digests(db, wake.created_at + 3)
+    assert Wakes.get(db, digest_id).due_at < wake.due_at
+    assert [%{wake_id: source}] = Wakes.digest_members(db, digest_id)
+    assert source == wake.wake_id
+  end
+
+  defp lifecycle_detail(db, kind, subject) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT detail FROM lifecycle_events WHERE kind = ?1 AND subject = ?2 ORDER BY id DESC LIMIT 1",
+        [kind, subject]
+      )
+
+    case rows do
+      [[detail]] -> detail
+      [] -> nil
+    end
+  end
 
   def run_handler_refusal_fixture(fixture) do
     Enum.each(fixture["cases"], fn kase ->
@@ -3572,8 +3734,14 @@ defmodule Tightbeam.ConformanceTest do
     # through the dispatch chokepoint (holder-verdict-wins only ever calls
     # `attest`) and exercises the defining displacement shape. It is also a
     # pending C4 fixture with its own named runner clause, not a catch-all.
-    assert length(@fixtures) == 66
-    assert active_fixtures == 56
+    #
+    # Phase 1 of the coordination fabric (2026-08-13) adds the C8 class and two
+    # GREEN fixtures — class-delivery-policy and class-election-and-skew. Green
+    # on both axes, so they raise the total and the active count and leave the
+    # ACTIVATED counts alone: those measure fixtures still waiting on a
+    # mechanism, and this mechanism ships on this branch.
+    assert length(@fixtures) == 68
+    assert active_fixtures == 58
     assert exact_skips == 10
     assert activated_fixture_tests == 43
     assert activated_class_tests == 5
@@ -3971,6 +4139,7 @@ defmodule Tightbeam.ConformanceTest do
             "load_assert" -> Corpus.run_load_assert(fixture)
             "rules_decide" -> Corpus.run_rules_decide(fixture)
             "acting_layer" -> Corpus.run_acting_layer(fixture)
+            "delivery_policy" -> Corpus.run_delivery_policy_fixture(fixture)
           end)
         end
 

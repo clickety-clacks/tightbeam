@@ -178,6 +178,14 @@ defmodule Tightbeam.Wakes do
     # "principal immediately".
     "blocker" => %{immediacy: :immediate, ceiling_ms: 0},
     # "bypasses every bone and every desk. Never batched, never digested."
+    #
+    # PARTIAL AGAINST §7, and named rather than papered over: the seed default
+    # routes an alarm to the principal AND the org's configured human channel.
+    # The bypass half ships here. The dual-routing half does NOT — there is no
+    # human-channel carrier on this line to route to, and inventing one inside
+    # the batching seam would be a routing decision smuggled in under a timing
+    # mechanism. An alarm reaches its target and skips every bone; it does not
+    # yet reach a human by a second path.
     "algedonic" => %{immediacy: :bypass, ceiling_ms: 0}
   }
 
@@ -388,30 +396,36 @@ defmodule Tightbeam.Wakes do
   defp apply_delivery_policy(_txn, input, class, created_at, condition_kind) do
     policy = delivery_policy(class)
 
-    if batcher_inhibited?(input, condition_kind) or policy.immediacy != :digest do
-      {inhibited_or_immediate_rule(input, condition_kind, policy), Map.fetch!(input, :due_at)}
-    else
+    cond do
+      # The carrier the batcher itself just built. Signed with the rule that
+      # produced it, delivered at the moment that rule chose, and never a
+      # member of anything: `digest = 1` is what keeps it out of its own group.
+      Map.get(input, :digest, false) ->
+        {@digest_rule, Map.fetch!(input, :due_at)}
+
+      batcher_inhibited?(input, condition_kind) ->
+        {@inhibited_rule, Map.fetch!(input, :due_at)}
+
       # THE CEILING IS THE EXIT (Invariant 3). The wake is due at its class
       # ceiling from the moment it is filed; the batcher may materialize the
       # digest EARLIER at a turn boundary, but nothing can make it later, and
       # an idle session's digest materializes its own turn right here.
-      {@digest_rule, created_at + policy.ceiling_ms}
+      policy.immediacy == :digest ->
+        {@digest_rule, created_at + policy.ceiling_ms}
+
+      true ->
+        {policy.rule, Map.fetch!(input, :due_at)}
     end
   end
 
   # THE INHIBITION SEAM, named (philosophy gate Q2). The batcher is a default,
   # not a cage: a sender that elected its own delivery moment keeps it, a
-  # condition wake keeps its own firing mechanics, a digest carrier is not
-  # itself digested, and an internal consumer is not an agent's attention.
+  # condition wake keeps its own firing mechanics, and an internal consumer is
+  # not an agent's attention to protect. In every case the class is still
+  # RECORDED — inhibiting the reflex never erases what the sender said.
   defp batcher_inhibited?(input, condition_kind) do
     Map.get(input, :sender_scheduled, false) or is_binary(condition_kind) or
-      Map.get(input, :digest, false) or Map.get(input, :consumer, "prompt") != "prompt"
-  end
-
-  defp inhibited_or_immediate_rule(input, condition_kind, policy) do
-    if batcher_inhibited?(input, condition_kind) and policy.immediacy == :digest,
-      do: @inhibited_rule,
-      else: policy.rule
+      Map.get(input, :consumer, "prompt") != "prompt"
   end
 
   # FAIL QUIET AND VISIBLE (§5 policy-skew rule). An extended class this build
@@ -1352,7 +1366,11 @@ defmodule Tightbeam.Wakes do
           FROM wakes
           WHERE state = 'pending' AND consumer = 'prompt' AND digest = 0
             AND deliveryRule = ?1 AND sessionKey = ?2 AND class = ?3
-          ORDER BY createdAt ASC, wakeId ASC
+          -- Filing order. `createdAt` ties inside a millisecond, and the tie
+          -- must not be broken by an id, which is random: rowid IS the order
+          -- the org filed them in, and a digest that reordered its members
+          -- would misreport the sequence a reader is trying to reconstruct.
+          ORDER BY createdAt ASC, rowid ASC
           """,
           [@digest_rule, session_key, class]
         )
@@ -1390,12 +1408,22 @@ defmodule Tightbeam.Wakes do
         }) == true
       end)
 
+    # ALL OR NOTHING. A member the batcher could not consume is a member whose
+    # own wake is still pending WHILE a digest carrying its payload is about to
+    # fire — the one failure worse than not batching at all, because the payload
+    # lands twice and the record says once. There is nothing to accommodate
+    # here: roll the whole materialization back and name what refused.
+    if carried != length(members) do
+      raise "incompatible_delivery_policy_v1: batcher consumed #{carried} of " <>
+              "#{length(members)} digest members for #{session_key}/#{class}"
+    end
+
     EventLog.lifecycle_in_txn(
       txn,
       "wake_digest_materialized",
       digest.wake_id,
       "rule=#{@digest_rule} target=#{session_key} class=#{class} members=#{carried} " <>
-        "offered=#{length(members)} trigger=#{reason}"
+        "trigger=#{reason}"
     )
 
     digest.wake_id
@@ -1434,7 +1462,7 @@ defmodule Tightbeam.Wakes do
         JOIN wakes w ON w.wakeId = c.wakeId
         WHERE c.replacementWakeId = ?1 AND c.reasonKind = 'superseded'
           AND c.outcomeKind = 'replacement'
-        ORDER BY w.createdAt ASC, w.wakeId ASC
+        ORDER BY w.createdAt ASC, w.rowid ASC
         """,
         [digest_wake_id]
       )

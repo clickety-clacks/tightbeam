@@ -1560,6 +1560,78 @@ mod tests {
     }
 
     #[test]
+    fn builds_byte_exact_classed_wake_and_coordination_share_bodies() {
+        // The sender's election rides as an ordinary param, and an EXTENDED
+        // class travels unchanged: the CLI validates that a class is a name,
+        // never that it is one of the five (coordination-fabric-v1 §7).
+        assert_eq!(
+            body(&[
+                "wake",
+                "--role",
+                "owner",
+                "--prompt",
+                "the build finished",
+                "--class",
+                "fyi",
+                "--as",
+                "coder",
+            ]),
+            r#"{"as":"coder","verb":"wake","role":"owner","params":{"prompt":"the build finished","class":"fyi"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "wake",
+                "--role",
+                "owner",
+                "--prompt",
+                "pain",
+                "--class",
+                "kungfu:deploy-window",
+                "--as",
+                "coder",
+            ]),
+            r#"{"as":"coder","verb":"wake","role":"owner","params":{"prompt":"pain","class":"kungfu:deploy-window"}}"#
+        );
+        assert_eq!(
+            args::parse(
+                [
+                    "wake", "--role", "owner", "--prompt", "go", "--class", "", "--as", "coder"
+                ]
+                .iter()
+                .map(|v| (*v).to_owned())
+                .collect()
+            )
+            .unwrap_err(),
+            "--class requires a class name"
+        );
+        // The measured session is a param, never a typed target: the router
+        // declares this verb non-target so the read is not an existence oracle.
+        assert_eq!(
+            body(&[
+                "coordination-share",
+                "--session",
+                "agent:po",
+                "--from",
+                "100",
+                "--to",
+                "200",
+                "--as-user",
+                "flynn",
+            ]),
+            r#"{"asUser":"flynn","verb":"coordination-share","params":{"session":"agent:po","from":100,"to":200}}"#
+        );
+        for missing in [
+            &["coordination-share", "--from", "1", "--to", "2"][..],
+            &["coordination-share", "--session", "agent:po", "--to", "2"][..],
+            &["coordination-share", "--session", "agent:po", "--from", "1"][..],
+        ] {
+            let mut argv = missing.to_vec();
+            argv.extend_from_slice(&["--as-user", "flynn"]);
+            assert!(args::parse(argv.iter().map(|v| (*v).to_owned()).collect()).is_err());
+        }
+    }
+
+    #[test]
     fn builds_byte_exact_condition_wake_and_fact_bodies() {
         assert_eq!(
             body(&[

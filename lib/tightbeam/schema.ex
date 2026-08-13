@@ -275,6 +275,15 @@ defmodule Tightbeam.Schema do
             (requesterId = 'tightbeam:supervision' AND reasonKind = 'superseded' AND
              causalSourceKind = 'progress_attest' AND outcomeKind = 'no_replacement')
             OR
+            -- The batcher (coordination-fabric-v1 §5). ONE shape and no other:
+            -- a digest member superseded by the wake that carries it, named as
+            -- its replacement. It cannot withdraw, dispose, or retire anyone's
+            -- mail, and it cannot consume a member without naming where the
+            -- payload went — which is what makes the digest-member audit
+            -- (§11 acceptance 2) total rather than best-effort.
+            (requesterId = 'tightbeam:batcher' AND reasonKind = 'superseded' AND
+             causalSourceKind = 'wake' AND outcomeKind = 'replacement')
+            OR
             (requesterId = 'tightbeam:retirement' AND
              ((reasonKind = 'target_retired' AND causalSourceKind = 'session_transition' AND
                outcomeKind IN ('replacement','no_replacement'))
