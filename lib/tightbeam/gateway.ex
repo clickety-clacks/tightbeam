@@ -920,6 +920,7 @@ defmodule Tightbeam.Gateway do
       "toplines" => fn call -> Tightbeam.Toplines.roster(db, call) end,
       "topline" => fn call -> Tightbeam.Toplines.topline(db, call) end,
       "coordination-share" => fn call -> coordination_share_result(db, call) end,
+      "digest-members" => fn call -> digest_members_result(db, call) end,
       "work-item-list" => fn call -> WorkItems.__handle__(db, "work-item-list", call) end,
       "work-item-update" => fn call ->
         WorkItems.__handle__(
@@ -5101,6 +5102,41 @@ defmodule Tightbeam.Gateway do
       _ -> false
     end
   end
+
+  # O5: `digest_members/2` (the C4/acceptance-2 audit — every source wake a
+  # digest carries) had no sanctioned surface, a status question answerable
+  # from rows that no agent could ask (philosophy gate Q9). Visibility
+  # follows `coordination-share`'s exact rule: the carrier's own target
+  # session's owner, or an admin. An id that is not a pending digest CARRIER
+  # — unknown, a member, an ordinary wake, or a carrier this caller cannot
+  # see — answers identically: `not_found`, never an existence oracle.
+  defp digest_members_result(db, call) do
+    wake_id = call.params[:wake_id]
+
+    cond do
+      not (is_binary(wake_id) and wake_id != "") ->
+        %{code: "invalid", message: "digest-members requires a wakeId"}
+
+      true ->
+        case Wakes.get(db, wake_id) do
+          %{digest: true} = wake ->
+            case Org.get(db, wake.session_key) do
+              nil ->
+                digest_members_not_found()
+
+              session ->
+                if coordination_share_readable?(db, call, session),
+                  do: %{digest_members: Wakes.digest_members(db, wake_id)},
+                  else: digest_members_not_found()
+            end
+
+          _ ->
+            digest_members_not_found()
+        end
+    end
+  end
+
+  defp digest_members_not_found, do: %{code: "not_found", message: "wake not found"}
 
   defp attend_result(db, call) do
     case call[:principal] do

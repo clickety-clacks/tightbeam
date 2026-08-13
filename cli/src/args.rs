@@ -232,6 +232,10 @@ pub enum Command {
         from: String,
         to: String,
     },
+    DigestMembers {
+        identity: Identity,
+        wake_id: String,
+    },
     Assignments {
         identity: Identity,
         target: Option<Target>,
@@ -509,11 +513,18 @@ COMMANDS:
       comes back in noItem rather than being silently dropped.
         tightbeam topline --under wi_abc123 --as-user flynn
   coordination-share --session <key> --from <epochMs> --to <epochMs>
-      What share of a session's turns were spent on classed coordination traffic
-      over a window — turns materialized by a classed wake that was neither an
-      algedonic alarm nor a summon, against all its turns. Counts rows and
-      names no threshold; a window with no turns reports a null share, not zero.
+      What share of a session's turns were spent on coordination traffic over a
+      window — every turn a wake materialized, classed or not, except an
+      algedonic alarm or a deliberate summon, against all its turns. Counts
+      rows and names no threshold; a window with no turns reports a null
+      share, not zero.
         tightbeam coordination-share --session agent:po --from 1 --to 2 --as-user flynn
+  digest-members <wakeId>
+      Every source wake a digest carries, oldest first — the C4/acceptance-2
+      audit as a status question, answerable from rows. Refuses by name if
+      the id is unknown, is not a digest carrier, or names a carrier you
+      cannot see — the same not_found either way.
+        tightbeam digest-members w_abc123 --as-user flynn
   work-item-icebox <workItemId>
       Shelve an unstaffed item (open → iceboxed). Requires zero open
       assignments; work-item-reopen resumes it.
@@ -1602,6 +1613,15 @@ fn parse_with_optional_catalog(
                 to: js_number_json(number_coercion(&to)),
             })
         }
+        "digest-members" => {
+            if parsed.positional.len() != 2 {
+                return Err("usage: tightbeam digest-members <wakeId>".to_owned());
+            }
+            Ok(Command::DigestMembers {
+                identity: identity(flags)?,
+                wake_id: parsed.positional[1].clone(),
+            })
+        }
         "attests" => {
             if parsed.positional.len() != 2 {
                 return Err(ATTESTS_USAGE.to_owned());
@@ -2222,6 +2242,7 @@ mod tests {
                 "config",
                 "coordination-share",
                 "decision-requests",
+                "digest-members",
                 "dispatch",
                 "doctor",
                 "effort-rule",
