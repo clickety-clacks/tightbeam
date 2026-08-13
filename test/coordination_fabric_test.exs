@@ -115,6 +115,42 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert Wakes.materialize_digests(db, at) == []
   end
 
+  test "a scheduled or conditional algedonic wake is never batcher-inhibited", %{db: db} do
+    # Sol xhigh review, finding 1: the class check precedes the inhibition
+    # branch. §7: algedonic "bypasses every bone... never batched, never
+    # digested, never triaged." A sender's own --after on an algedonic wake is
+    # the sender's OWN election, not the batcher holding anything — the row
+    # must carry the bypass rule, never `batcher-inhibited`, and the sender's
+    # chosen time, never a ceiling.
+    at = System.system_time(:millisecond) + 4 * 60 * 60 * 1000
+
+    scheduled =
+      schedule(db, session: "agent:po", class: "algedonic", due_at: at, sender_scheduled: true)
+
+    assert scheduled.due_at == at, "the sender's own election, unmoved"
+    assert scheduled.delivery_rule =~ "algedonic-bypass"
+    refute scheduled.delivery_rule == Wakes.inhibited_rule()
+    assert Wakes.materialize_digests(db, at) == []
+
+    # A condition-scoped algedonic wake is likewise never inhibited: its own
+    # firing mechanics govern it, and the delivery-policy row must not claim
+    # the batcher held it either.
+    conditioned =
+      Wakes.schedule(db, %{
+        session_key: "agent:po",
+        origin: "agent:sender",
+        creator_session_key: "agent:sender",
+        prompt: "pain, gated on a fact",
+        due_at: at,
+        class: "algedonic",
+        condition_kind: "work-blocked",
+        condition_scope: "agent:po"
+      })
+
+    assert conditioned.delivery_rule =~ "algedonic-bypass"
+    refute conditioned.delivery_rule == Wakes.inhibited_rule()
+  end
+
   ## Seam ② — the batcher
 
   test "the ceiling is the exit for an idle session: the digest materializes its own turn",
@@ -148,12 +184,12 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert Enum.map(Wakes.digest_members(db, digest_id), & &1.wake_id) == [a.wake_id, b.wake_id]
   end
 
-  test "a turn boundary materializes the digest early, and only when the session is free",
-       %{db: db} do
+  test "a turn boundary materializes the digest early", %{db: db} do
     session = "agent:po"
     held = schedule(db, session: session, class: "fyi", prompt: "one")
 
-    # A turn that is still RUNNING is not a boundary.
+    # A turn that has not yet ENDED is not a boundary — an in-flight turn's
+    # end is the trigger, not its start.
     seq = turn(db, session, status: "running", created_at: held.created_at + 10)
     assert Wakes.materialize_digests(db, held.created_at + 20) == []
 
@@ -164,6 +200,38 @@ defmodule Tightbeam.CoordinationFabricTest do
 
     # Far short of the four-hour ceiling: the boundary, not the clock, released it.
     assert held.created_at + 40 < held.due_at
+  end
+
+  test "a turn boundary releases the digest even with more work queued behind it",
+       %{db: db} do
+    # Sol xhigh review, finding 3: `turn_boundary_passed?` must not require
+    # `busy == 0`. A turn boundary is a turn ENDING — the digest joins the
+    # queue at that boundary rather than waiting for the session to go idle,
+    # which with continuous queued work would mean never.
+    session = "agent:po"
+    held = schedule(db, session: session, class: "fyi", prompt: "one")
+
+    ended = turn(db, session, status: "running", created_at: held.created_at + 10)
+    end_turn(db, ended, held.created_at + 20)
+
+    # Another turn is QUEUED behind the boundary that just released `held`.
+    _queued = turn(db, session, status: "queued", created_at: held.created_at + 25)
+
+    assert [digest_id] = Wakes.materialize_digests(db, held.created_at + 30),
+           "queued work behind an already-passed boundary must not hold the digest"
+
+    assert Wakes.get(db, digest_id).due_at == held.created_at + 30
+  end
+
+  test "the ceiling fires even during an in-flight turn", %{db: db} do
+    # The ceiling is TIME, not a session-state judgment: a turn still running
+    # when the ceiling arrives is not a reason to withhold delivery.
+    session = "agent:po"
+    held = schedule(db, session: session, class: "fyi", prompt: "one")
+    _running = turn(db, session, status: "running", created_at: held.created_at + 10)
+
+    assert [digest_id] = Wakes.materialize_digests(db, held.due_at)
+    assert Wakes.get(db, digest_id).class == "fyi"
   end
 
   test "a turn that ended BEFORE the message arrived is not that message's boundary",
@@ -178,6 +246,45 @@ defmodule Tightbeam.CoordinationFabricTest do
 
     assert Wakes.materialize_digests(db, held.created_at + 1) == [],
            "a boundary in the past never protected attention that was not yet spent"
+  end
+
+  test "a member filed after the trigger waits for its own boundary, not somebody else's",
+       %{db: db} do
+    # Sol xhigh review, finding 2: eligibility and membership must be one
+    # transactionally coherent snapshot. A member the outer group query never
+    # saw at all — filed after a boundary already released an earlier member
+    # of the SAME session/class group — must not be swept into that earlier
+    # member's digest by an unqualified "grab everything pending" query.
+    session = "agent:po"
+
+    early =
+      schedule(db, session: session, class: "fyi", prompt: "early, released by the boundary")
+
+    seq = turn(db, session, status: "running", created_at: early.created_at)
+    Process.sleep(5)
+    ended_at = System.system_time(:millisecond)
+    end_turn(db, seq, ended_at)
+
+    # Filed AFTER the boundary that released `early` — real wall-clock order,
+    # guaranteed by the sleep above (`created_at` is stamped by the row's own
+    # clock and cannot be supplied by the caller). The boundary is not this
+    # member's own; it must wait for its own ceiling or boundary.
+    Process.sleep(5)
+    late = schedule(db, session: session, class: "fyi", prompt: "late, arrived after the trigger")
+    assert late.created_at > ended_at
+
+    assert [digest_id] = Wakes.materialize_digests(db, ended_at + 1)
+
+    assert Enum.map(Wakes.digest_members(db, digest_id), & &1.wake_id) == [early.wake_id]
+
+    assert Wakes.get(db, late.wake_id).state == "pending",
+           "a late arrival is not carried by a boundary that passed before it was filed"
+
+    # `late` still has its own ceiling ahead of it: nothing lost, only delayed —
+    # it gets its OWN digest once its own trigger arrives.
+    assert [late_digest_id] = Wakes.materialize_digests(db, late.due_at)
+    assert late_digest_id != digest_id
+    assert Enum.map(Wakes.digest_members(db, late_digest_id), & &1.wake_id) == [late.wake_id]
   end
 
   test "classes are digested apart, so a 30-minute ceiling is not stretched to four hours",
@@ -264,6 +371,171 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert length(Wakes.digest_members(db, digest_id)) == 1
   end
 
+  test "the carrier is honestly attributed to the batcher; members keep their true elections",
+       %{db: db} do
+    # Sol xhigh review, finding 7: a digest carrier passing `class: class` to
+    # `elected_class/1` used to be read as a sender election. The carrier was
+    # built by the batcher, not elected by anyone — and a group can mix a
+    # sender's own election with the classifier's default stamp, both of
+    # which must survive on their SOURCE rows untouched.
+    session = "agent:po"
+
+    sender_elected = schedule(db, session: session, class: "fyi", prompt: "sender said fyi")
+
+    classifier_elected =
+      Wakes.schedule(db, %{
+        session_key: session,
+        origin: "agent:sender",
+        creator_session_key: "agent:sender",
+        prompt: "unclassed, the classifier stamped it",
+        due_at: sender_elected.due_at,
+        classify: true
+      })
+
+    assert classifier_elected.class == "fyi"
+    assert classifier_elected.class_election == "classifier"
+
+    # Both members' OWN ceilings, not the first one's — `classifier_elected`
+    # was filed after `sender_elected`, so its own ceiling lands later.
+    at = classifier_elected.created_at + Wakes.delivery_policy("fyi").ceiling_ms
+    assert [digest_id] = Wakes.materialize_digests(db, at)
+    carrier = Wakes.get(db, digest_id)
+
+    assert carrier.class_election == "batcher",
+           "the batcher built this row; claiming 'sender' would be an untrue audit fact"
+
+    members = Wakes.digest_members(db, digest_id)
+    elections = Map.new(members, &{&1.wake_id, &1.class_election})
+
+    assert elections[sender_elected.wake_id] == "sender"
+    assert elections[classifier_elected.wake_id] == "classifier"
+  end
+
+  test "digest_members is provenance-total: an adversarial supersession pointing at the carrier is not a member",
+       %{db: db} do
+    # Sol xhigh review, finding 6: matching only replacementWakeId/reasonKind/
+    # outcomeKind proves a row was superseded BY SOMETHING naming this carrier
+    # as its replacement — not that the BATCHER carried it. A legitimate,
+    # differently-caused cancellation that happens to name the same
+    # replacement must not be reported as a digest member.
+    session = "agent:po"
+    member = schedule(db, session: session, class: "fyi", prompt: "the true member")
+
+    assert [digest_id] = Wakes.materialize_digests(db, member.due_at)
+    assert Enum.map(Wakes.digest_members(db, digest_id), & &1.wake_id) == [member.wake_id]
+
+    unrelated =
+      Wakes.schedule(db, %{
+        session_key: session,
+        origin: "agent:other",
+        prompt: "unrelated traffic, not carried by anything",
+        due_at: member.due_at
+      })
+
+    forged_command = %{
+      wake_id: unrelated.wake_id,
+      requester: %{kind: "process", id: "tightbeam:effort-checkin"},
+      reason_kind: "superseded",
+      causal_source: %{kind: "wake", id: digest_id},
+      outcome: %{kind: "replacement", replacement_wake_id: digest_id}
+    }
+
+    assert {:ok, true} =
+             DB.transaction(db, fn txn -> Wakes.cancel_in_txn(txn, forged_command) end)
+
+    # The forged row matches replacementWakeId/reasonKind/outcomeKind exactly,
+    # and even names the carrier as its causal source — but it is not the
+    # batcher's requesterId, so it must not appear as a member.
+    assert Enum.map(Wakes.digest_members(db, digest_id), & &1.wake_id) == [member.wake_id]
+  end
+
+  test "a forced member-cancellation failure rolls back the whole materialization",
+       %{db: db} do
+    session = "agent:po"
+    base = System.system_time(:millisecond)
+
+    {:ok, _} =
+      DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('owner', 0, ?1)", [
+        base
+      ])
+
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO work_items (id, title, ownerUserId, state, createdByUser, createdAt)
+        VALUES ('wi_broken', 'already closed', 'owner', 'closed', 'owner', ?1)
+        """,
+        [base]
+      )
+
+    ok_member = schedule(db, session: session, class: "fyi", prompt: "fine")
+
+    broken_member =
+      Wakes.schedule(db, %{
+        session_key: session,
+        origin: "agent:sender",
+        creator_session_key: "agent:sender",
+        prompt: "linked to closed work",
+        due_at: base,
+        class: "fyi",
+        work_item_id: "wi_broken"
+      })
+
+    # `broken_member`'s own linked work is not open, so the batcher's typed
+    # cancellation for it will be refused by `validate_outcome/4` — the ONE
+    # failure the all-or-nothing rule exists to catch.
+    at = broken_member.created_at + Wakes.delivery_policy("fyi").ceiling_ms
+
+    assert_raise RuntimeError, ~r/incompatible_delivery_policy_v1/, fn ->
+      Wakes.materialize_digests(db, at)
+    end
+
+    # FULL ROLLBACK: neither member was touched, no carrier exists, and
+    # nothing was logged — the transaction layout's guarantee, demonstrated.
+    assert Wakes.get(db, ok_member.wake_id).state == "pending"
+    assert Wakes.get(db, broken_member.wake_id).state == "pending"
+    assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM wake_cancellations")
+    assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM wakes WHERE digest = 1")
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               db,
+               "SELECT count(*) FROM lifecycle_events WHERE kind = 'wake_digest_materialized'"
+             )
+  end
+
+  test "the scheduler materializes AND delivers its own turn for an idle session", %{db: db} do
+    # Sol xhigh review, finding 9: prior coverage only ever called
+    # `materialize_digests/2` directly and asserted a pending carrier — it
+    # never ran the actual scheduler path. This runs `fire_due/1` — the real
+    # tick — and asserts the carrier is DELIVERED, proving Invariant 3's "an
+    # idle session's digest materializes its own turn" end to end.
+    test_pid = self()
+    scheduler = :"coordination_fabric_scheduler_#{System.unique_integer([:positive])}"
+
+    start_supervised!(
+      {Wakes,
+       db: db,
+       name: scheduler,
+       tick_ms: 60_000,
+       deliver: fn wake -> send(test_pid, {:delivered, wake}) end}
+    )
+
+    session = "agent:po"
+    held = schedule(db, session: session, class: "fyi", prompt: "the build finished")
+
+    ended = turn(db, session, status: "running", created_at: held.created_at + 10)
+    end_turn(db, ended, held.created_at + 20)
+
+    assert :ok = Wakes.fire_due(scheduler)
+
+    assert_receive {:delivered, %{digest: true, class: "fyi"} = delivered}, 1_000
+    assert delivered.prompt =~ "the build finished"
+    assert Wakes.get(db, delivered.wake_id).state == "fired"
+    assert Wakes.get(db, held.wake_id).state == "canceled"
+  end
+
   ## Seam ① — the acceptance-№1 read (§12 Q5)
 
   test "coordination share counts classed non-summon non-algedonic turns against all turns",
@@ -285,10 +557,16 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert share.turns == 4
     assert share.wake_turns == 3
     assert share.classed_turns == 2
-    assert share.coordination_turns == 1
+    # §11.1's numerator is ALL non-summon, non-algedonic wake-materialized
+    # turns, classed or not (Sol xhigh review, finding 5): `ordinary` carries
+    # no class at all yet is still wake-materialized traffic, so it counts
+    # alongside `fyi`. The prior pin of `1` here was the bug itself, not a
+    # spec — it silently dropped every legacy unclassed wake turn from the
+    # acceptance-№1 measure.
+    assert share.coordination_turns == 2
     assert share.algedonic_turns == 1
     assert share.summon_turns == 0
-    assert share.share == 0.25
+    assert share.share == 0.5
     assert share.by_class == %{"fyi" => 1, "algedonic" => 1}
   end
 

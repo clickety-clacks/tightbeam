@@ -98,8 +98,12 @@ defmodule Tightbeam.Wakes do
     -- row (§5 policy-skew rule), never dropped and never promoted.
     class TEXT,
     -- WHO elected the class. The classifier stamps ONLY unclassified traffic
-    -- (§5); this column is the proof it never overwrote a sender.
-    classElection TEXT CHECK (classElection IN ('sender','classifier')),
+    -- (§5); this column is the proof it never overwrote a sender. A digest
+    -- CARRIER is attributed 'batcher' — it was built by the batcher, not
+    -- elected by any sender or the classifier, and claiming 'sender' here
+    -- would be an untrue audit fact (Sol xhigh review, finding 7). Members
+    -- keep their own true election; only the carrier row uses this value.
+    classElection TEXT CHECK (classElection IN ('sender','classifier','batcher')),
     -- SIGNED PROVENANCE (§8 legibility): the named rule + revision that decided
     -- THIS wake's delivery, so any agent knows which reflex to inhibit.
     deliveryRule TEXT,
@@ -376,8 +380,16 @@ defmodule Tightbeam.Wakes do
   # `:class` elects; a caller that asks to be `:classify`-ed accepts the
   # classifier's stamp; a caller that does neither gets no class at all, which
   # is how every wake predating the fabric keeps behaving exactly as it did.
+  #
+  # A DIGEST CARRIER is neither of those: the batcher built the row, so
+  # `classify/1`'s "sender" stamp would be a false audit fact (Sol xhigh
+  # review, finding 7) — checked first because `:digest` always carries
+  # `:class` too and would otherwise be read as a sender election.
   defp elected_class(input) do
     cond do
+      Map.get(input, :digest, false) and is_binary(Map.get(input, :class)) ->
+        {Map.fetch!(input, :class), "batcher"}
+
       is_binary(Map.get(input, :class)) and Map.get(input, :class) != "" ->
         classify(Map.fetch!(input, :class))
 
@@ -403,6 +415,19 @@ defmodule Tightbeam.Wakes do
       Map.get(input, :digest, false) ->
         {@digest_rule, Map.fetch!(input, :due_at)}
 
+      # THE CLASS CHECK PRECEDES THE INHIBITION BRANCH (Sol xhigh review,
+      # finding 1). `immediate` and `bypass` classes were never the batcher's
+      # to hold in the first place — §7: algedonic "bypasses every bone...
+      # never batched, never digested, never triaged" — so there is nothing
+      # for `batcher-inhibited` to name here. A sender's own --after/--at on
+      # one of these classes is not the batcher inhibiting anything; it is
+      # the sender's own election, unchanged, and the row must say so: the
+      # rule stays `algedonic-bypass`/`immediate-delivery`, never
+      # `batcher-inhibited`. `due_at` is exactly what the caller supplied
+      # either way — scheduled or not, an alarm is never delayed BY POLICY.
+      policy.immediacy != :digest ->
+        {policy.rule, Map.fetch!(input, :due_at)}
+
       batcher_inhibited?(input, condition_kind) ->
         {@inhibited_rule, Map.fetch!(input, :due_at)}
 
@@ -410,11 +435,8 @@ defmodule Tightbeam.Wakes do
       # ceiling from the moment it is filed; the batcher may materialize the
       # digest EARLIER at a turn boundary, but nothing can make it later, and
       # an idle session's digest materializes its own turn right here.
-      policy.immediacy == :digest ->
-        {@digest_rule, created_at + policy.ceiling_ms}
-
       true ->
-        {policy.rule, Map.fetch!(input, :due_at)}
+        {@digest_rule, created_at + policy.ceiling_ms}
     end
   end
 
@@ -1252,7 +1274,18 @@ defmodule Tightbeam.Wakes do
     count
   end
 
-  @doc "Count pending wakes targeting a session that were durably created by that same session."
+  @doc """
+  Count pending wakes targeting a session that were durably created by that
+  same session.
+
+  HELD CLASSED MEMBERS DO NOT COUNT (Sol xhigh review, finding 8). A row still
+  waiting on the batcher (`digest = 0` under `deliveryRule = digest_rule`) is
+  not a queued continuation supervision can rely on — it may not actually
+  reach the session for up to a class ceiling's worth of time. Counting it
+  here let an unrelated `fyi` self-wake suppress the turn-end remedy for as
+  long as four hours. The materialized CARRIER (`digest = 1`) is not held —
+  it is what the batcher already decided to deliver — and counts normally.
+  """
   @spec self_pending_count(db(), String.t()) :: non_neg_integer()
   def self_pending_count(db \\ Tightbeam.DB, session_key) do
     {:ok, [[count]]} =
@@ -1262,8 +1295,13 @@ defmodule Tightbeam.Wakes do
         SELECT count(*) FROM wakes
         WHERE state = 'pending' AND consumer = 'prompt'
           AND sessionKey = ?1 AND creatorSessionKey = ?1
+          -- `IS`, not `=`: an unclassed wake's deliveryRule is NULL, and
+          -- `NULL = ?2` is NULL (neither true nor false) under SQL's
+          -- three-valued logic, which would silently exclude it too. `IS`
+          -- compares NULL correctly and only the true digest-held case matches.
+          AND NOT (digest = 0 AND deliveryRule IS ?2)
         """,
-        [session_key]
+        [session_key, @digest_rule]
       )
 
     count
@@ -1280,10 +1318,22 @@ defmodule Tightbeam.Wakes do
 
   THE EXIT IS TIME OR A TURN BOUNDARY, never a decision (Invariant 3):
 
-    * the target's next turn boundary — a turn of its own ended after the
-      oldest member was filed and nothing is queued or running behind it; or
+    * the target's next turn boundary — a turn of its own ended at or after
+      THIS member was filed; a turn boundary is a turn ENDING, so queued or
+      running work behind it is not a reason to hold (the wake joins the
+      queue — that IS what "materializing one turn" means); or
     * the class ceiling — which is the member's own `dueAt`, so an idle session
       that never takes another turn still has its digest materialize one.
+
+  ELIGIBILITY AND MEMBERSHIP ARE ONE TRANSACTIONALLY COHERENT SNAPSHOT (Sol
+  xhigh review, finding 2). There is no outer "is this group due" query whose
+  answer the transaction later trusts: each member's OWN ceiling and OWN
+  filing time are re-read and re-judged from the SAME snapshot the transaction
+  uses to select members, so a wake filed after another member's boundary or
+  ceiling already passed waits for its own — never absorbed by somebody
+  else's trigger. `due_reason` is computed exactly once, from that snapshot,
+  per member (finding 4): a member with no named reason is left pending, never
+  materialized under an empty `trigger=`.
 
   SOURCE ROWS ARE PRESERVED (Law 2, wi_1100e078's title). A member is consumed
   through the typed cancellation seam as `superseded` with the digest named as
@@ -1298,71 +1348,37 @@ defmodule Tightbeam.Wakes do
   @doc false
   @spec materialize_digests(db(), integer()) :: [String.t()]
   def materialize_digests(db, at) do
+    # A candidate LIST only — which (session, class) groups currently hold any
+    # digest-ruled pending wake at all. Nothing about WHETHER a group is due is
+    # decided here; that judgment happens exactly once, per member, inside the
+    # transaction below, against this same `at`.
     {:ok, groups} =
       DB.query(
         db,
         """
-        SELECT sessionKey, class, MIN(dueAt), MIN(createdAt)
+        SELECT DISTINCT sessionKey, class
         FROM wakes
         WHERE state = 'pending' AND consumer = 'prompt' AND digest = 0
           AND deliveryRule = ?1
-        GROUP BY sessionKey, class
         """,
         [@digest_rule]
       )
 
-    groups
-    |> Enum.filter(fn [session_key, _class, ceiling_at, held_since] ->
-      due_reason(db, session_key, ceiling_at, held_since, at) != nil
-    end)
-    |> Enum.flat_map(fn [session_key, class, ceiling_at, held_since] ->
-      reason = due_reason(db, session_key, ceiling_at, held_since, at)
-
-      case materialize_digest(db, session_key, class, reason, at) do
+    Enum.flat_map(groups, fn [session_key, class] ->
+      case materialize_digest(db, session_key, class, at) do
         nil -> []
         wake_id -> [wake_id]
       end
     end)
   end
 
-  # Two named reasons, no third. `ceiling` wins the tie so a group that is both
-  # over its ceiling and at a boundary reports the guarantee that bounds it.
-  defp due_reason(db, session_key, ceiling_at, held_since, at) do
-    cond do
-      at >= ceiling_at -> "ceiling"
-      turn_boundary_passed?(db, session_key, held_since) -> "turn-boundary"
-      true -> nil
-    end
-  end
-
-  # A turn boundary is the moment an in-flight turn ENDS. Requiring that
-  # nothing is queued or running keeps the digest from landing behind work the
-  # session is still doing — the next boundary catches it, and the ceiling
-  # bounds the wait regardless.
-  defp turn_boundary_passed?(db, session_key, held_since) do
-    {:ok, [[ended, busy]]} =
-      DB.query(
-        db,
-        """
-        SELECT
-          (SELECT COUNT(*) FROM turns
-            WHERE sessionKey = ?1 AND endedAt IS NOT NULL AND endedAt >= ?2),
-          (SELECT COUNT(*) FROM turns
-            WHERE sessionKey = ?1 AND status IN ('queued','running'))
-        """,
-        [session_key, held_since]
-      )
-
-    ended > 0 and busy == 0
-  end
-
-  defp materialize_digest(db, session_key, class, reason, at) do
+  defp materialize_digest(db, session_key, class, at) do
     transaction!(db, fn txn ->
       members =
         Txn.q(
           txn,
           """
-          SELECT wakeId, prompt, origin, creatorSessionKey, createdAt
+          SELECT wakeId, prompt, origin, creatorSessionKey, createdAt, dueAt
           FROM wakes
           WHERE state = 'pending' AND consumer = 'prompt' AND digest = 0
             AND deliveryRule = ?1 AND sessionKey = ?2 AND class = ?3
@@ -1375,13 +1391,72 @@ defmodule Tightbeam.Wakes do
           [@digest_rule, session_key, class]
         )
 
-      materialize_members(txn, session_key, class, reason, at, members)
+      materialize_due(txn, session_key, class, at, members)
     end)
   end
 
-  # A group the query found and the transaction did not is a race with another
+  # Nothing pending for this group in THIS snapshot — a race with another
   # materialization, not an error: nothing to carry, nothing to sign.
-  defp materialize_members(_txn, _session_key, _class, _reason, _at, []), do: nil
+  defp materialize_due(_txn, _session_key, _class, _at, []), do: nil
+
+  defp materialize_due(txn, session_key, class, at, members) do
+    boundary = latest_turn_end(txn, session_key)
+
+    due =
+      members
+      |> Enum.map(fn [wake_id, prompt, origin, creator, created_at, due_at] ->
+        {[wake_id, prompt, origin, creator, created_at],
+         member_due_reason(at, due_at, boundary, created_at)}
+      end)
+      |> Enum.filter(fn {_row, reason} -> reason != nil end)
+
+    case due do
+      # Candidate group, but not ONE of its current members has reached its
+      # own ceiling or seen a boundary since it was filed. Nothing is due —
+      # refuse silently rather than materialize under a reason nobody can
+      # name (finding 4): every member simply waits for its own trigger.
+      [] ->
+        nil
+
+      _ ->
+        # Ceiling wins the tie: a digest whose members are due by both
+        # guarantees reports the one that bounds it.
+        reason =
+          if Enum.any?(due, fn {_row, r} -> r == "ceiling" end),
+            do: "ceiling",
+            else: "turn-boundary"
+
+        rows = Enum.map(due, fn {row, _reason} -> row end)
+        materialize_members(txn, session_key, class, reason, at, rows)
+    end
+  end
+
+  # A member's OWN eligibility (Sol xhigh review, finding 2): its own class
+  # ceiling, or a turn of the target's own that ended at or after THIS
+  # member's own filing time — never another member's ceiling or another
+  # member's boundary.
+  defp member_due_reason(at, due_at, boundary, created_at) do
+    cond do
+      at >= due_at -> "ceiling"
+      is_integer(boundary) and boundary >= created_at -> "turn-boundary"
+      true -> nil
+    end
+  end
+
+  # THE LATEST turn end for this session, or nil if none has ever ended. A
+  # turn boundary is the moment an in-flight turn ENDS (finding 3) — nothing
+  # here judges whether the session is otherwise busy; queued or running work
+  # behind the boundary is not a reason to hold what already crossed it.
+  defp latest_turn_end(txn, session_key) do
+    case Txn.q(
+           txn,
+           "SELECT MAX(endedAt) FROM turns WHERE sessionKey = ?1 AND endedAt IS NOT NULL",
+           [session_key]
+         ) do
+      [[nil]] -> nil
+      [[ended]] -> ended
+    end
+  end
 
   defp materialize_members(txn, session_key, class, reason, at, members) do
     digest =
@@ -1450,6 +1525,15 @@ defmodule Tightbeam.Wakes do
 
   The audit that proves zero information loss: a digest that named a member it
   did not carry, or carried one it did not name, is visible here as a mismatch.
+
+  PROVENANCE-TOTAL (Sol xhigh review, finding 6). Matching only
+  `replacementWakeId`/`reasonKind`/`outcomeKind` proves a row was superseded
+  BY SOMETHING naming this carrier as its replacement — not that the BATCHER
+  carried it. The join also binds `requesterId` to the batcher and
+  `causalSourceKind`/`causalSourceId` to THIS digest wake, so a non-batcher
+  supersession that happens to point at the carrier (or a malformed
+  cancellation whose causal wake differs from its replacement) cannot be
+  reported as a member Law 2 never actually carried.
   """
   @spec digest_members(db(), String.t()) :: [map()]
   def digest_members(db \\ Tightbeam.DB, digest_wake_id) do
@@ -1462,6 +1546,9 @@ defmodule Tightbeam.Wakes do
         JOIN wakes w ON w.wakeId = c.wakeId
         WHERE c.replacementWakeId = ?1 AND c.reasonKind = 'superseded'
           AND c.outcomeKind = 'replacement'
+          AND c.requesterId = 'tightbeam:batcher'
+          AND c.causalSourceKind = 'wake'
+          AND c.causalSourceId = ?1
         ORDER BY w.createdAt ASC, w.rowid ASC
         """,
         [digest_wake_id]
@@ -1508,8 +1595,17 @@ defmodule Tightbeam.Wakes do
           COUNT(*),
           COALESCE(SUM(CASE WHEN t.wakeId IS NOT NULL THEN 1 ELSE 0 END), 0),
           COALESCE(SUM(CASE WHEN w.class IS NOT NULL THEN 1 ELSE 0 END), 0),
-          COALESCE(SUM(CASE WHEN w.class IS NOT NULL AND w.class <> 'algedonic'
-                             AND w.summon = 0 THEN 1 ELSE 0 END), 0),
+          -- §11.1's numerator: ALL non-summon, non-algedonic wake-materialized
+          -- turns, CLASSED OR NOT (Sol xhigh review, finding 5). `w.class IS
+          -- NOT NULL` excluded legacy unclassed wake turns entirely, undercounting
+          -- the share this query exists to measure — a wake-materialized turn
+          -- counts here whether or not the fabric ever stamped it. Guard the
+          -- class comparison with COALESCE: `NULL <> 'algedonic'` is NULL (not
+          -- true) in SQL, so an unguarded comparison would silently drop the
+          -- very rows this fix restores.
+          COALESCE(SUM(CASE WHEN t.wakeId IS NOT NULL
+                             AND COALESCE(w.class, '') <> 'algedonic'
+                             AND COALESCE(w.summon, 0) = 0 THEN 1 ELSE 0 END), 0),
           COALESCE(SUM(CASE WHEN w.summon = 1 THEN 1 ELSE 0 END), 0),
           COALESCE(SUM(CASE WHEN w.class = 'algedonic' THEN 1 ELSE 0 END), 0)
         FROM turns AS t
