@@ -136,7 +136,7 @@ defmodule FeatureSmoke do
     cwd = local_workdir_path(state.base_dir, session_key)
 
     try do
-      redeploy!(state, session_key)
+      redeploy!(state, session_key, session_harness!(state, session_key))
 
       assert(state, File.dir?(home), "local deployment HOME missing: #{home}")
 
@@ -210,7 +210,7 @@ defmodule FeatureSmoke do
 
       sentinel_bytes = "durable-local-deployment-#{unique()}\n"
       File.write!(sentinel, sentinel_bytes)
-      redeploy!(state, session_key)
+      redeliver!(state, session_key)
 
       assert(
         state,
@@ -1687,14 +1687,60 @@ defmodule FeatureSmoke do
     ok!(state |> Map.put(:token, token) |> Map.put(:as_session, true), verb, params)
   end
 
-  defp redeploy!(state, session_key) do
-    ok!(state, "tune", %{
+  defp session_harness!(state, session_key) do
+    session =
+      state
+      |> ok!("inspect", %{})
+      |> Map.get("sessions", [])
+      |> Enum.find(&(&1["sessionKey"] == session_key))
+
+    case session do
+      %{"harness" => harness} when is_binary(harness) -> harness
+      _ -> fail(state, "local deployment inspect missed #{session_key}: #{inspect(session)}")
+    end
+  end
+
+  # This check targets one selected leg, but read the spawn's actual resident harness
+  # back rather than assuming placement chose it. Only a real boundary mismatch may send
+  # set_harness; an already-resident harness is tuned through its model control.
+  defp redeploy!(state, session_key, resident_harness) do
+    params =
+      if resident_harness == state.leg.wire_name do
+        model_tune_params(state, session_key)
+      else
+        Map.put(model_tune_params(state, session_key), "harness", state.leg.wire_name)
+        |> Map.put("setting", "set_harness")
+      end
+
+    assert_runtime_readback!(state, ok!(state, "tune", params))
+  end
+
+  # The sentinel pass is necessarily resident: the same session just completed a turn
+  # on this leg. Redeliver through model+effort without pretending to cross a harness.
+  defp redeliver!(state, session_key) do
+    assert_runtime_readback!(
+      state,
+      ok!(state, "tune", model_tune_params(state, session_key))
+    )
+  end
+
+  defp model_tune_params(state, session_key) do
+    %{
       "sessionKey" => session_key,
-      "setting" => "set_harness",
-      "harness" => state.leg.wire_name,
+      "setting" => "set_model",
       "model" => state.leg.model,
       "effort" => state.leg.effort
-    })
+    }
+  end
+
+  defp assert_runtime_readback!(state, result) do
+    assert(
+      state,
+      result["ok"] == true and result["harness"] == state.leg.wire_name and
+        result["model"] == state.leg.model and result["effort"] == state.leg.effort,
+      "local deployment runtime readback diverged from " <>
+        "#{state.leg.wire_name}/#{state.leg.model}/#{state.leg.effort}: #{inspect(result)}"
+    )
   end
 
   # --- facts-read: file a condition fact, read it back -----------------------

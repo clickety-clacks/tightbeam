@@ -558,21 +558,12 @@ defmodule Tightbeam.AdapterCoordinator do
         if absorbed? do
           {:noreply, state}
         else
-          case Tightbeam.HarnessProcess.reconcile_key(state.db, key) do
+          case Tightbeam.HarnessProcess.settle_proven_dead(state.db, key) do
             :ok ->
               :ok
 
             :already_resolved ->
               :ok
-
-            {:error, reconcile_reason} ->
-              :ok =
-                Tightbeam.EventLog.lifecycle(
-                  state.db,
-                  "adapter_reconcile_failed",
-                  key_name(key),
-                  inspect(reconcile_reason)
-                )
           end
 
           failures = entry.failures + 1

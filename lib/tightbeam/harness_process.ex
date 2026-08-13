@@ -314,6 +314,22 @@ defmodule Tightbeam.HarnessProcess do
     end
   end
 
+  @doc "Settle cleanup after the coordinator observes its current adapter instance die."
+  @spec settle_proven_dead(DB.server(), tuple()) :: :ok | :already_resolved
+  def settle_proven_dead(db, key) do
+    :ok = ensure_schema(db)
+    :ok = ensure_fence(db, key_name(key))
+
+    result =
+      case latest_unresolved(db, key) do
+        nil -> :already_resolved
+        row -> settle_proven_dead_row(db, row)
+      end
+
+    :ok = complete_park(db, key)
+    result
+  end
+
   @doc "Operator-facing launch ledger, newest first."
   @spec list(DB.server()) :: [row()]
   def list(db \\ DB) do
@@ -344,6 +360,26 @@ defmodule Tightbeam.HarnessProcess do
       end
     else
       {:error, reason} -> unidentified(db, row, reason)
+    end
+  end
+
+  defp settle_proven_dead_row(db, row) do
+    case recover_identity_until(db, row, deadline(identity_wait_ms())) do
+      {:ok, recovered} ->
+        if reboot_orphan?(recovered) do
+          reboot_orphan(db, recovered)
+        else
+          case kill(db, recovered, "exited") do
+            {:error, {:kill_failed, reason}} ->
+              settle_cleanup_failure(db, recovered, "process_group_kill", reason)
+
+            result ->
+              result
+          end
+        end
+
+      {:error, reason} ->
+        settle_cleanup_failure(db, row, "identity_recovery", reason)
     end
   end
 
@@ -916,6 +952,55 @@ defmodule Tightbeam.HarnessProcess do
       end)
 
     if recorded?, do: {:error, {:kill_failed, reason}}, else: :already_resolved
+  end
+
+  defp settle_cleanup_failure(db, row, phase, reason) do
+    {:ok, recorded?} =
+      DB.transaction(db, fn txn ->
+        DB.Txn.q(
+          txn,
+          """
+          UPDATE harness_processes
+             SET state = 'exited', resolvedAt = ?2, lastError = ?3
+           WHERE launchId = ?1 AND resolvedAt IS NULL
+          """,
+          [row.launch_id, now(), inspect(reason)]
+        )
+
+        if DB.Txn.changes(txn) == 1 do
+          :ok =
+            EventLog.lifecycle_in_txn(
+              txn,
+              "harness_cleanup_failed",
+              row.adapter_key,
+              inspect(%{launch_id: row.launch_id, phase: phase, reason: reason})
+            )
+
+          true
+        else
+          false
+        end
+      end)
+
+    if recorded? do
+      case remove_identity(row) do
+        :ok ->
+          :ok
+
+        {:error, remove_reason} ->
+          :ok =
+            EventLog.lifecycle(
+              db,
+              "identity_remove_failed",
+              row.adapter_key,
+              inspect(%{launch_id: row.launch_id, reason: remove_reason})
+            )
+
+          :ok
+      end
+    else
+      :already_resolved
+    end
   end
 
   defp persist_identity(

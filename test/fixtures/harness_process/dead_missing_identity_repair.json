@@ -1,0 +1,32 @@
+[
+  {
+    "launch_sequence": 336,
+    "launch_id": "01KZH9S0PF07YRSD7JZKHBKQTQ",
+    "adapter_key": "claude:shared@gibson",
+    "recorded_pid": 2823430,
+    "kill_attempted_at": 1786232513094,
+    "kill_sent_at": null,
+    "repaired_state": "exited",
+    "resolved_at": 1786239917855
+  },
+  {
+    "launch_sequence": 337,
+    "launch_id": "01KZH9S5411WZCQ1CSD3X990R6",
+    "adapter_key": "codex:shared@eezo",
+    "recorded_pid": 34808,
+    "kill_attempted_at": 1786232515097,
+    "kill_sent_at": null,
+    "repaired_state": "exited",
+    "resolved_at": 1786239917855
+  },
+  {
+    "launch_sequence": 338,
+    "launch_id": "01KZH9XCHTTNGMJ1H487DNJXMM",
+    "adapter_key": "codex:shared@gibson",
+    "recorded_pid": 2824381,
+    "kill_attempted_at": 1786232516674,
+    "kill_sent_at": null,
+    "repaired_state": "exited",
+    "resolved_at": 1786239917855
+  }
+]
