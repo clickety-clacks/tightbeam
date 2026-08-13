@@ -533,15 +533,18 @@ defmodule Tightbeam.AssignmentsTest do
     end
   end
 
-  test "assignment-get returns the full assignment row or not_found", ctx do
+  test "assignment-get returns the full assignment row (plus reopening history) or not_found",
+       ctx do
     assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "fetch me"))
 
+    # `assignment-get` carries every field `assign` returned, plus an empty
+    # `reopenings` list for a card that was never reopened.
     assert handle(
              ctx,
              "assignment-get",
              assignment_get_call({:session, "other-session"}, assignment.id)
            ) ==
-             assignment
+             Map.put(assignment, :reopenings, [])
 
     assert handle(
              ctx,
@@ -1236,38 +1239,33 @@ defmodule Tightbeam.AssignmentsTest do
   test "reopen-assignment is the agent-reachable exit from a closed card", ctx do
     assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "reopen me"))
 
-    assert %{code: "assignment_open"} =
-             handle(ctx, "reopen-assignment", reopen_call({:user, "flynn"}, assignment.id, "why"))
+    assert_reopen_refused!(ctx, {:user, "flynn"}, assignment.id, "why", "assignment_open")
 
     closed = handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "completion"))
     assert closed.assignment.state == "closed"
 
-    assert %{code: "missing_reason"} =
-             handle(
-               ctx,
-               "reopen-assignment",
-               reopen_call({:user, "flynn"}, assignment.id, nil)
-             )
+    assert_reopen_refused!(ctx, {:user, "flynn"}, assignment.id, nil, "missing_reason")
+    assert_reopen_refused!(ctx, {:user, "flynn"}, assignment.id, "   ", "invalid_reason")
 
-    assert %{code: "invalid_reason"} =
-             handle(ctx, "reopen-assignment", reopen_call({:user, "flynn"}, assignment.id, "   "))
-
-    assert %{code: "process_denied"} =
-             handle(
-               ctx,
-               "reopen-assignment",
-               reopen_call({:process, "cron"}, assignment.id, "why")
-             )
-
+    # unknown_assignment has no row to snapshot, so it stays a plain assertion.
     assert %{code: "unknown_assignment"} =
              handle(ctx, "reopen-assignment", reopen_call({:user, "flynn"}, "asg_missing", "why"))
 
-    assert %{code: "not_authorized"} =
-             handle(
-               ctx,
-               "reopen-assignment",
-               reopen_call({:session, "other-session"}, assignment.id, "why")
-             )
+    assert_reopen_refused!(
+      ctx,
+      {:process, "cron"},
+      assignment.id,
+      "why",
+      "process_denied"
+    )
+
+    assert_reopen_refused!(
+      ctx,
+      {:session, "other-session"},
+      assignment.id,
+      "why",
+      "not_authorized"
+    )
 
     reopened =
       handle(
@@ -1313,15 +1311,28 @@ defmodule Tightbeam.AssignmentsTest do
                [assignment.id]
              )
 
-    assert %{code: "assignment_open"} =
-             handle(ctx, "reopen-assignment", reopen_call({:user, "flynn"}, assignment.id, "why"))
+    assert_reopen_refused!(ctx, {:user, "flynn"}, assignment.id, "why", "assignment_open")
 
     # And the point of the whole exercise: the holder can file again.
     assert %{attest: %{kind: "completion"}} =
              handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "completion"))
 
+    # The marker carries actor + reason (finding 6), not just the id.
     assert marker_contents(ctx.db, "holder")
-           |> Enum.any?(&(&1 == "[assignment reopened: #{assignment.id}]"))
+           |> Enum.any?(
+             &(&1 ==
+                 "[assignment reopened: #{assignment.id} by user:flynn — the verdict this card owes was wrong]")
+           )
+
+    # `assignment-get` surfaces the same papertrail through the read path.
+    got = handle(ctx, "assignment-get", assignment_get_call({:user, "flynn"}, assignment.id))
+    assert [reopening] = got.reopenings
+    assert reopening.reopenedByUser == "flynn"
+    assert reopening.reopenedBySession == nil
+    assert reopening.reason == "the verdict this card owes was wrong"
+    assert reopening.priorOutcome == "completed"
+    assert reopening.priorClosedAt == closed_at
+    assert reopening.priorClosingAttestId == attest_id
   end
 
   test "reopen-assignment refuses a retired holder, a terminal item, and colliding files", ctx do
@@ -1331,12 +1342,7 @@ defmodule Tightbeam.AssignmentsTest do
     {:ok, _} =
       DB.query(ctx.db, "UPDATE sessions SET state = 'retired' WHERE sessionKey = 'holder'")
 
-    assert %{code: "session_retired"} =
-             handle(
-               ctx,
-               "reopen-assignment",
-               reopen_call({:session, "holder"}, retired.id, "why")
-             )
+    assert_reopen_refused!(ctx, {:session, "holder"}, retired.id, "why", "session_retired")
 
     {:ok, _} =
       DB.query(ctx.db, "UPDATE sessions SET state = 'active' WHERE sessionKey = 'holder'")
@@ -1356,8 +1362,7 @@ defmodule Tightbeam.AssignmentsTest do
         work_item_call("work-item-close", {:user, "flynn"}, %{work_item_id: item.id})
       )
 
-    assert %{code: "work_item_not_open"} =
-             handle(ctx, "reopen-assignment", reopen_call({:user, "flynn"}, carded.id, "why"))
+    assert_reopen_refused!(ctx, {:user, "flynn"}, carded.id, "why", "work_item_not_open")
 
     first =
       assign_call({:user, "flynn"}, "first file card")
@@ -1371,8 +1376,7 @@ defmodule Tightbeam.AssignmentsTest do
       |> put_in([:params, :files], ["/tmp/p0-collision"])
       |> then(&handle(ctx, "assign", &1))
 
-    assert %{code: "files_overlap"} =
-             handle(ctx, "reopen-assignment", reopen_call({:user, "flynn"}, first.id, "why"))
+    assert_reopen_refused!(ctx, {:user, "flynn"}, first.id, "why", "files_overlap")
   end
 
   # Fabric §13 Phase 0 exit: the wedge CLASS is exercisable by an AGENT — no
@@ -1425,6 +1429,296 @@ defmodule Tightbeam.AssignmentsTest do
     assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == [
              "reviewed-clean"
            ]
+  end
+
+  # Sol xhigh review, finding 1: the CTE must order verdict-carrying rounds by
+  # the RECENCY OF THE LATEST VERDICT, not by when the round was opened. r1
+  # opens and closes first; r2 opens later and files the standing
+  # changes-requested; only then is r1 reopened and files a newer
+  # reviewed-clean. Before the fix, `r.openedAt DESC` kept selecting r2 forever
+  # — the newest verdict could never win against an older round.
+  test "reopen lets an older round's newer verdict outrank a younger round's older one (Sol xhigh review, finding 1)",
+       ctx do
+    producer = handle(ctx, "assign", assign_call({:session, "holder"}, "displacement producer"))
+
+    r1 =
+      assign_call({:session, "other-session"}, "r1")
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :reviews_assignment_id], producer.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    _ = handle(ctx, "attest", attest_call({:session, "other-session"}, r1.id, "completion"))
+
+    r2 =
+      assign_call({:session, "other-session"}, "r2")
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :reviews_assignment_id], producer.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    _ =
+      attest_call({:session, "other-session"}, r2.id, "verdict")
+      |> put_in([:params, :verdict_kind], "changes-requested")
+      |> then(&handle(ctx, "attest", &1))
+
+    # r2 is the latest VERDICT-CARRYING round (r1 carries none yet), so it
+    # correctly governs.
+    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == []
+
+    reopened =
+      handle(
+        ctx,
+        "reopen-assignment",
+        reopen_call(
+          {:session, "other-session"},
+          r1.id,
+          "re-reviewing after r2's changes-requested landed"
+        )
+      )
+
+    assert reopened.state == "open"
+
+    _ =
+      attest_call({:session, "other-session"}, r1.id, "verdict")
+      |> put_in([:params, :verdict_kind], "reviewed-clean")
+      |> then(&handle(ctx, "attest", &1))
+
+    # r1 opened FIRST, but its verdict was filed MOST RECENTLY — selection must
+    # now pick r1, not r2.
+    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == [
+             "reviewed-clean"
+           ]
+  end
+
+  # Sol xhigh review, Minimality section: an untested boundary the review
+  # itself named — an earlier INDEPENDENT reviewed-clean followed by a later
+  # SELF-HELD, verdictless round. Completion was denied before the shipped
+  # diff (the self-held round, being newest by openedAt, won the old selection
+  # and then failed the independence guard) and is allowed after it (the
+  # verdictless self-held round no longer qualifies as a candidate at all, so
+  # it cannot displace — and cannot launder — the earlier independent verdict).
+  # Pinned here as intended behavior, not incidental.
+  test "an independent reviewed-clean survives a later self-held verdictless round (Sol xhigh review, Minimality)",
+       ctx do
+    producer = handle(ctx, "assign", assign_call({:session, "holder"}, "minimality producer"))
+
+    independent =
+      assign_call({:session, "other-session"}, "independent review")
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :reviews_assignment_id], producer.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    _ =
+      attest_call({:session, "other-session"}, independent.id, "verdict")
+      |> put_in([:params, :verdict_kind], "reviewed-clean")
+      |> then(&handle(ctx, "attest", &1))
+
+    _ =
+      handle(ctx, "attest", attest_call({:session, "other-session"}, independent.id, "completion"))
+
+    self_held =
+      assign_call({:session, "holder"}, "self-held verdictless review")
+      |> put_in([:params, :reviews_assignment_id], producer.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    _ = handle(ctx, "attest", attest_call({:session, "holder"}, self_held.id, "completion"))
+
+    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == [
+             "reviewed-clean"
+           ]
+  end
+
+  test "an installed rule can inhibit reopen-assignment (Sol xhigh review, finding 2)", ctx do
+    assignment = dispatch!(ctx, assign_call({:session, "holder"}, "rule-inhibited"))
+
+    dispatch!(
+      ctx,
+      attest_call({:session, "holder"}, assignment.id, "completion")
+    )
+
+    before = reopen_mutation_snapshot(ctx.db, assignment.id)
+
+    base = Path.join(System.tmp_dir!(), "reopen-rules-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(Path.join(base, "identity/rules"))
+
+    File.write!(Path.join(base, "identity/rules/deny.toml"), """
+    [[rule]]
+    name = "deny-reopen"
+    verb = "reopen-assignment"
+    text = "reopen denied"
+    [[rule.deny_when]]
+    fact = "caller.origin_class"
+    op = "eq"
+    value = "agent"
+    """)
+
+    on_exit(fn -> File.rm_rf!(base) end)
+    Rules.load!(base, Map.keys(ctx.handlers))
+
+    assert {:error, %{code: "rule_denied", rule: "deny-reopen"}} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               reopen_call({:session, "holder"}, assignment.id, "trying to reopen")
+             )
+
+    # The rail denies BEFORE the handler ever runs — nothing mutated.
+    assert reopen_mutation_snapshot(ctx.db, assignment.id) == before
+  end
+
+  # Sol xhigh review, finding 3: opener-or-admin left the holder — the mind
+  # that owes the replacement verdict — with no independent exit unless they
+  # also happened to be the opener. `lead` opens the card; `reviewer` holds it.
+  test "the holder has an independent reopen exit distinct from the opener (Sol xhigh review, finding 3)",
+       ctx do
+    review =
+      call("assign", {:user, "flynn"}, "other-session", %{
+        subject: "opener-is-not-holder review",
+        idempotency_key: nil,
+        work_item_id: nil
+      })
+      |> Map.merge(%{target_role: nil, role_fallback: false})
+      |> then(&handle(ctx, "assign", &1))
+
+    _ = handle(ctx, "attest", attest_call({:session, "other-session"}, review.id, "completion"))
+
+    # Merely OWNING the holder session (user "other" owns "other-session") is
+    # not holder identity — only the exact session principal is.
+    assert_reopen_refused!(ctx, {:user, "other"}, review.id, "why", "not_authorized")
+
+    reopened =
+      handle(
+        ctx,
+        "reopen-assignment",
+        reopen_call(
+          {:session, "other-session"},
+          review.id,
+          "the reviewer needs to correct the verdict"
+        )
+      )
+
+    assert reopened.state == "open"
+  end
+
+  test "reason length validation counts Unicode code points, matching the CHECK (Sol xhigh review, finding 5)",
+       ctx do
+    assignment = handle(ctx, "assign", assign_call({:session, "holder"}, "unicode reason"))
+
+    # "e" + combining acute accent (U+0301): ONE grapheme cluster, TWO Unicode
+    # code points. 1001 of them is 1001 graphemes (well inside a grapheme-based
+    # 1..2000 check) but 2002 code points (over the table's code-point CHECK).
+    combining = "e" <> <<0x0301::utf8>>
+    too_long_reason = String.duplicate(combining, 1001)
+    assert String.length(too_long_reason) == 1001
+    assert length(String.to_charlist(too_long_reason)) == 2002
+
+    assert_reopen_refused!(
+      ctx,
+      {:session, "holder"},
+      assignment.id,
+      too_long_reason,
+      "invalid_reason"
+    )
+
+    _ = handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "completion"))
+
+    # Exactly at the 2000-code-point boundary is accepted.
+    boundary_reason = String.duplicate(combining, 1000)
+    assert length(String.to_charlist(boundary_reason)) == 2000
+
+    assert %{state: "open"} =
+             handle(
+               ctx,
+               "reopen-assignment",
+               reopen_call({:session, "holder"}, assignment.id, boundary_reason)
+             )
+  end
+
+  test "reopen-assignment repairs a surrendered card (Sol xhigh review, finding 7)", ctx do
+    assignment = handle(ctx, "assign", assign_call({:session, "holder"}, "surrender then repair"))
+
+    surrendered =
+      handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "surrender"))
+
+    assert surrendered.assignment.outcome == "surrendered"
+
+    reopened =
+      handle(
+        ctx,
+        "reopen-assignment",
+        reopen_call({:session, "holder"}, assignment.id, "the surrender was premature")
+      )
+
+    assert reopened.state == "open"
+
+    assert {:ok, [["surrendered"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT priorOutcome FROM assignment_reopenings WHERE assignmentId = ?1",
+               [assignment.id]
+             )
+  end
+
+  test "reopen-assignment repairs a revoked card (Sol xhigh review, finding 7)", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "revoke then repair"))
+    revoked = handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, assignment.id))
+    assert revoked.outcome == "revoked"
+
+    reopened =
+      handle(
+        ctx,
+        "reopen-assignment",
+        reopen_call({:user, "flynn"}, assignment.id, "the revocation was a mistake")
+      )
+
+    assert reopened.state == "open"
+
+    assert {:ok, [["revoked"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT priorOutcome FROM assignment_reopenings WHERE assignmentId = ?1",
+               [assignment.id]
+             )
+  end
+
+  test "a failure after the history insert rolls back the whole reopen (Sol xhigh review, finding 7)",
+       ctx do
+    assignment =
+      handle(ctx, "assign", assign_call({:session, "holder"}, "post-insert failure"))
+
+    _ = handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "completion"))
+
+    # `terminal_disposition` DELETEs the supervision_entitlements row on close,
+    # so there is normally none left to conflict with by the time a card
+    # reopens. Forcing one back makes `apply_reopen`'s later
+    # `supervision_transition!(:armed, ...)` observe `:duplicate` (the INSERT's
+    # `ON CONFLICT(assignmentId) DO NOTHING` fires) instead of `:armed` — an
+    # uncaught raise landing AFTER the INSERT into `assignment_reopenings` and
+    # the UPDATE to the `assignments` row, proving the whole transaction —
+    # history row included — rolls back together rather than leaving an
+    # orphaned papertrail row behind a card the code never actually reopened.
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO supervision_entitlements
+          (assignmentId, generation, dueAt, state, basisKind, basisId, cause, principal,
+           supervisionIntervalMs)
+        VALUES (?1, 1, 0, 'armed', 'assignment_open', ?1, 'assignment_open', 'process:test', 1000)
+        """,
+        [assignment.id]
+      )
+
+    before = reopen_mutation_snapshot(ctx.db, assignment.id)
+
+    assert_raise RuntimeError, ~r/invalid supervision transition result/, fn ->
+      handle(
+        ctx,
+        "reopen-assignment",
+        reopen_call({:session, "holder"}, assignment.id, "racing supervision state")
+      )
+    end
+
+    assert reopen_mutation_snapshot(ctx.db, assignment.id) == before
   end
 
   test "prefixed idempotency scopes disjoint equal user and session strings", ctx do
@@ -1838,6 +2132,41 @@ defmodule Tightbeam.AssignmentsTest do
   defp assignment_count(db) do
     {:ok, [[count]]} = DB.query(db, "SELECT count(*) FROM assignments")
     count
+  end
+
+  # Sol xhigh review, finding 7: a refusal that returns the right code but still
+  # mutated the row, the reopenings papertrail, or supervision would pass every
+  # assertion that checked only the returned code. This snapshots all three
+  # durable surfaces a reopen touches and pins them unchanged across a refusal.
+  defp reopen_mutation_snapshot(db, assignment_id) do
+    {:ok, [row]} =
+      DB.query(
+        db,
+        "SELECT state, outcome, closedAt, closedByUser, closedBySession, closingAttestId " <>
+          "FROM assignments WHERE id = ?1",
+        [assignment_id]
+      )
+
+    {:ok, [[reopening_count]]} =
+      DB.query(db, "SELECT count(*) FROM assignment_reopenings WHERE assignmentId = ?1", [
+        assignment_id
+      ])
+
+    {:ok, supervision} =
+      DB.query(db, "SELECT state, cause FROM supervision_entitlements WHERE assignmentId = ?1", [
+        assignment_id
+      ])
+
+    %{row: row, reopening_count: reopening_count, supervision: supervision}
+  end
+
+  defp assert_reopen_refused!(ctx, principal, assignment_id, reason, expected_code) do
+    before = reopen_mutation_snapshot(ctx.db, assignment_id)
+
+    assert %{code: ^expected_code} =
+             handle(ctx, "reopen-assignment", reopen_call(principal, assignment_id, reason))
+
+    assert reopen_mutation_snapshot(ctx.db, assignment_id) == before
   end
 
   defp assign_call(principal, subject \\ "work", key \\ nil, work_item_id \\ nil) do

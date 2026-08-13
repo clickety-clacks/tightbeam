@@ -346,6 +346,14 @@ defmodule Tightbeam.Assignments do
   one (`attest` refuses a verdict on a closed assignment), which is exactly the
   state that wedged with no lawful exit. Verdict rows beat lifecycle rows.
 
+  The tiebreak is the RECENCY OF THE LATEST HOLDER-FILED VERDICT itself (verdict
+  row `ts` DESC, then verdict row `rowid` DESC) — never `r.openedAt`. Ordering by
+  when the round was OPENED, rather than when its verdict was FILED, is exactly
+  the lifecycle-recency mistake this function exists to refuse: `reopen-assignment`
+  lets an OLDER round receive a fresh verdict after a chronologically YOUNGER
+  round already closed, and a card that reopens to file the newest judgment must
+  win the selection even though it opened first (Sol xhigh review, finding 1).
+
   What this deliberately does NOT relax: once the selected round is the latest
   VERDICT-CARRYING one, the pre-existing independence guard still applies to it
   verbatim — a self-held latest round still disqualifies, so a holder cannot
@@ -358,7 +366,27 @@ defmodule Tightbeam.Assignments do
         db,
         """
         WITH latest_review AS (
-          SELECT r.id, r.holderKey
+          SELECT
+            r.id,
+            r.holderKey,
+            (
+              SELECT v.ts
+              FROM attests AS v
+              WHERE v.assignmentId = r.id
+                AND v.kind = 'verdict'
+                AND v.bySession = r.holderKey
+              ORDER BY v.ts DESC, v.rowid DESC
+              LIMIT 1
+            ) AS latestVerdictTs,
+            (
+              SELECT v.rowid
+              FROM attests AS v
+              WHERE v.assignmentId = r.id
+                AND v.kind = 'verdict'
+                AND v.bySession = r.holderKey
+              ORDER BY v.ts DESC, v.rowid DESC
+              LIMIT 1
+            ) AS latestVerdictRowid
           FROM assignments AS r
           WHERE r.reviewsAssignmentId = ?1
             AND EXISTS (
@@ -368,7 +396,7 @@ defmodule Tightbeam.Assignments do
                 AND held.kind = 'verdict'
                 AND held.bySession = r.holderKey
             )
-          ORDER BY r.openedAt DESC, r.rowid DESC
+          ORDER BY latestVerdictTs DESC, latestVerdictRowid DESC
           LIMIT 1
         )
         SELECT 'reviewed-clean'
@@ -428,6 +456,32 @@ defmodule Tightbeam.Assignments do
       )
 
     Enum.map(rows, &attest/1)
+  end
+
+  @doc """
+  List every `reopen-assignment` papertrail row for an assignment in
+  deterministic order (Sol xhigh review, finding 6). The reason the assignment
+  is open again — actor, reason, time, and the close it cleared — is durable
+  the moment `reopen-assignment` commits; this is the read that surfaces it
+  rather than leaving it inferable only from a direct query.
+  """
+  @spec list_reopenings(DB.server(), String.t()) :: [map()]
+  def list_reopenings(db, assignment_id) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT id, assignmentId, ts, reopenedByUser, reopenedBySession, reason,
+          priorOutcome, priorClosedAt, priorClosedByUser, priorClosedBySession,
+          priorClosingAttestId
+        FROM assignment_reopenings
+        WHERE assignmentId = ?1
+        ORDER BY ts ASC, id ASC
+        """,
+        [assignment_id]
+      )
+
+    Enum.map(rows, &reopening/1)
   end
 
   @doc false
@@ -1064,7 +1118,14 @@ defmodule Tightbeam.Assignments do
       })
     end
 
-    append_assignment_marker(txn, reopened, :reopened)
+    append_assignment_marker(
+      txn,
+      reopened,
+      :reopened,
+      principal_id(call.principal),
+      call.params[:reason]
+    )
+
     reopened
   end
 
@@ -1148,11 +1209,30 @@ defmodule Tightbeam.Assignments do
     |> Enum.map(&hd/1)
   end
 
+  # Opener-or-admin (revoke's authority) is not enough here: the HOLDER is the
+  # mind that owes the replacement verdict, and gating their only exit behind
+  # someone else's opener/admin decision is exactly the shape Law 3 names
+  # incomplete (Sol xhigh review, finding 3). Holder identity is checked the
+  # same way `attest` checks it for a review verdict — the exact session
+  # principal equals `assignment.holderKey` — never the session's owning user,
+  # so a card cannot be reopened merely by whoever owns the holder session.
+  defp reopen_allowed?(txn, {:session, session} = principal, assignment),
+    do: revoke_allowed?(txn, principal, assignment) or session == assignment.holderKey
+
   defp reopen_allowed?(txn, principal, assignment),
     do: revoke_allowed?(txn, principal, assignment)
 
   defp valid_reopen_reason(reason) when is_binary(reason) do
-    if String.length(reason) in 1..2000 and String.trim(reason) != "",
+    # Unicode CODE POINTS, matching the `assignment_reopenings` CHECK's
+    # `length(trim(reason))` — SQLite's `length()` on TEXT counts code points,
+    # not grapheme clusters. `String.length/1` counts graphemes, so a reason
+    # built of multi-codepoint grapheme clusters (e.g. family-emoji ZWJ
+    # sequences) could pass this guard while still tripping the table's CHECK,
+    # turning a named `invalid_reason` refusal into a raw database error
+    # (Sol xhigh review, finding 5).
+    length_in_code_points = length(String.to_charlist(reason))
+
+    if length_in_code_points in 1..2000 and String.trim(reason) != "",
       do: :ok,
       else:
         error("invalid_reason", "reason must be 1..2000 non-blank characters naming the repair")
@@ -1179,8 +1259,15 @@ defmodule Tightbeam.Assignments do
 
     with :ok <- principal_allowed(call.principal, "assignment-get") do
       case DB.query(db, "SELECT #{columns()} FROM assignments WHERE id = ?1", [assignment_id]) do
-        {:ok, [row]} -> assignment(row)
-        {:ok, []} -> error("not_found", "unknown assignment: #{assignment_id}")
+        {:ok, [row]} ->
+          # `reopenings` (Sol xhigh review, finding 6): the read surface for an
+          # assignment must be able to answer "why is this open again", not just
+          # "database" — this is that answer, in the same list-of-rows shape
+          # `attests` already reads via `list_attests/2`.
+          Map.put(assignment(row), :reopenings, list_reopenings(db, assignment_id))
+
+        {:ok, []} ->
+          error("not_found", "unknown assignment: #{assignment_id}")
       end
     end
   end
@@ -1613,8 +1700,16 @@ defmodule Tightbeam.Assignments do
     append_marker(txn, assignment.holderKey, "[assignment revoked: #{assignment.id}]")
   end
 
-  defp append_assignment_marker(txn, assignment, :reopened) do
-    append_marker(txn, assignment.holderKey, "[assignment reopened: #{assignment.id}]")
+  # Carries actor + reason (Sol xhigh review, finding 6) — the plain
+  # `[assignment reopened: <id>]` marker the other lifecycle markers use leaves
+  # an agent reading its own transcript unable to answer "who reopened this and
+  # why" without a separate read, even though the database has both answers.
+  defp append_assignment_marker(txn, assignment, :reopened, actor, reason) do
+    append_marker(
+      txn,
+      assignment.holderKey,
+      "[assignment reopened: #{assignment.id} by #{actor} — #{reason}]"
+    )
   end
 
   defp append_marker(txn, session_key, text) do
@@ -2225,6 +2320,34 @@ defmodule Tightbeam.Assignments do
       byProvider: by_provider,
       commitRefs: commit_refs && JSON.decode!(commit_refs),
       ts: ts
+    }
+  end
+
+  defp reopening([
+         id,
+         assignment_id,
+         ts,
+         reopened_by_user,
+         reopened_by_session,
+         reason,
+         prior_outcome,
+         prior_closed_at,
+         prior_closed_by_user,
+         prior_closed_by_session,
+         prior_closing_attest_id
+       ]) do
+    %{
+      id: id,
+      assignmentId: assignment_id,
+      ts: ts,
+      reopenedByUser: reopened_by_user,
+      reopenedBySession: reopened_by_session,
+      reason: reason,
+      priorOutcome: prior_outcome,
+      priorClosedAt: prior_closed_at,
+      priorClosedByUser: prior_closed_by_user,
+      priorClosedBySession: prior_closed_by_session,
+      priorClosingAttestId: prior_closing_attest_id
     }
   end
 end
