@@ -805,7 +805,7 @@ defmodule Tightbeam.CoordinationFabricTest do
       |> Enum.flat_map(fn file ->
         file
         |> sql_literals()
-        |> Enum.filter(&(&1 =~ "decision_requests"))
+        |> Enum.filter(&(&1 =~ ~r/\bdecision_requests\b/i))
         |> Enum.map(&{file, &1})
       end)
 
@@ -1359,10 +1359,13 @@ defmodule Tightbeam.CoordinationFabricTest do
   end
 
   # (a2)'s DIRECT set — every `{name, arity}` whose OWN literal fragments
-  # contain "decision_requests" — and its transitive closure over local
-  # calls, both `{name, arity}`-keyed. `ensure_schema/1` is excluded: it
-  # issues this table's own DDL for all three kinds by construction, which is
-  # not "reading" in the sense this inventory means.
+  # contain "decision_requests" (case-INSENSITIVE, Sol round 6, finding 1:
+  # SQL identifiers are case-insensitive, so `DECISION_REQUESTS` names the
+  # exact same table and must not evade a scan that only ever looked for the
+  # lowercase spelling) — and its transitive closure over local calls, both
+  # `{name, arity}`-keyed. `ensure_schema/1` is excluded: it issues this
+  # table's own DDL for all three kinds by construction, which is not
+  # "reading" in the sense this inventory means.
   defp ast_reader_closure(file) do
     attrs = module_attrs(file)
     defs = function_defs(file)
@@ -1372,7 +1375,7 @@ defmodule Tightbeam.CoordinationFabricTest do
       for {ref, nodes} <- defs,
           ref != {:ensure_schema, 1},
           frags = Enum.flat_map(nodes, &literal_fragments(&1, attrs)),
-          Enum.any?(frags, &String.contains?(&1, "decision_requests")),
+          Enum.any?(frags, &(&1 =~ ~r/\bdecision_requests\b/i)),
           into: MapSet.new(),
           do: ref
 
@@ -1473,10 +1476,21 @@ defmodule Tightbeam.CoordinationFabricTest do
   # (`alias Tightbeam.Escalation`, one segment) but not a PREFIX alias
   # (`alias Tightbeam, as: TB` then `TB.Escalation.consume(...)`, where the
   # alias covers only the leading segment and `:Escalation` rides along
-  # unresolved as literal text of its own).
+  # unresolved as literal text of its own). A leading `:Elixir` segment is
+  # stripped both BEFORE expansion (a call site spelled out
+  # `Elixir.Tightbeam.Escalation.consume(...)` directly, Sol round 6, finding
+  # 2) and AFTER it (an `alias` statement that itself named the target with
+  # an explicit `Elixir.` prefix) — `Elixir.Foo` and `Foo` name the exact
+  # same module; only the AST shape differs.
   defp resolves_to_escalation?(parts, aliases) do
-    expand_alias_prefix(parts, aliases) == [:Tightbeam, :Escalation]
+    parts
+    |> drop_leading_elixir()
+    |> expand_alias_prefix(aliases)
+    |> drop_leading_elixir() == [:Tightbeam, :Escalation]
   end
+
+  defp drop_leading_elixir([:"Elixir" | rest]), do: rest
+  defp drop_leading_elixir(parts), do: parts
 
   defp expand_alias_prefix([first | rest], aliases) do
     case Map.fetch(aliases, first) do
@@ -1634,7 +1648,14 @@ defmodule Tightbeam.CoordinationFabricTest do
 
   # A handful of ALREADY-REVIEWED `decision_requests` queries carry no kind
   # constraint of their own because their safety comes from elsewhere in the
-  # SAME transaction, never from their own WHERE clause:
+  # SAME transaction, never from their own WHERE clause — and each exception
+  # is bound to a SHA-256 of the reviewed function's own WHOLE text, not just
+  # to its name (Sol round 6, finding 3): the exception is only as good as
+  # the SAFETY WITNESS a reviewer actually read, and a later edit to the
+  # function can silently invalidate that witness while the ref's NAME stays
+  # the same. `pin_status/2` recomputes the hash at check time; a mismatch
+  # fails closed with a named message pointing at re-review, rather than
+  # quietly keeping on trusting a witness nobody re-read.
   #
   #   - `escalate/4`'s INSERT never names the `kind` column at all and relies
   #     on the column's own schema DEFAULT ('statute' — proved by the DDL,
@@ -1643,24 +1664,56 @@ defmodule Tightbeam.CoordinationFabricTest do
   #     ever comes from the SAME function's own `kind = 'statute'` SELECT
   #     immediately above it, never from a caller.
   #
-  # Keyed by the PINNED ATOM name and the query's own normalized text — an
-  # edit to either the function OR the literal drops out of this allowlist
-  # and fails closed. A NEW unscoped literal anywhere else is not in this
-  # list and fails closed too — that is the gap this list exists to keep
-  # narrow (Sol round 5, finding 1b).
-  @pinned_unscoped_literals %{
-    escalate: [
-      "INSERT INTO decision_requests (id, raiserId, raiserSessionKey, ownerUserId, " <>
-        "assignmentId, raisedAt, deadlineAt, statuteName, actionKey, question, options, " <>
-        "context, status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'open') " <>
-        "ON CONFLICT DO NOTHING"
-    ],
-    grant_waiver: [
-      "UPDATE decision_requests SET status = 'ruled', decision = 'waived', rationale = ?2, " <>
-        "ruledBy = ?3, ruledAt = ?4 WHERE id = ?1 AND status = 'open'",
-      "UPDATE decision_requests SET rulingFactId = ?2 WHERE id = ?1"
-    ]
+  # A NEW unscoped literal anywhere else is not in this list and fails closed
+  # too — that is the gap this list exists to keep narrow (Sol round 5,
+  # finding 1b).
+  @pinned_unscoped_literal_exceptions %{
+    escalate: %{
+      hash: "da3f89f2fe07f759b66a38a8df664480c8dc1a67a1778fca96c95a024397a6d3",
+      witness:
+        "the kind column's own schema DEFAULT 'statute' makes this INSERT statute-scoped " <>
+          "without the column being named",
+      literals: [
+        "INSERT INTO decision_requests (id, raiserId, raiserSessionKey, ownerUserId, " <>
+          "assignmentId, raisedAt, deadlineAt, statuteName, actionKey, question, options, " <>
+          "context, status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'open') " <>
+          "ON CONFLICT DO NOTHING"
+      ]
+    },
+    grant_waiver: %{
+      hash: "279a32de196240f089a7025c38e8dc89f6221f283df7cfd62d8e17f22954c4d8",
+      witness:
+        "both UPDATEs' ids come from this function's own adjacent kind = 'statute' SELECT, " <>
+          "in the same transaction, never from a caller",
+      literals: [
+        "UPDATE decision_requests SET status = 'ruled', decision = 'waived', rationale = ?2, " <>
+          "ruledBy = ?3, ruledAt = ?4 WHERE id = ?1 AND status = 'open'",
+        "UPDATE decision_requests SET rulingFactId = ?2 WHERE id = ?1"
+      ]
+    }
   }
+
+  defp sha256_hex(text), do: :crypto.hash(:sha256, text) |> Base.encode16(case: :lower)
+
+  # `:valid` only if `ref` has a pinned exception AND the current function's
+  # WHOLE text still hashes to the value the reviewer actually read;
+  # `:stale` names both hashes so the error message is actionable; `:no_pin`
+  # for a ref with no exception at all.
+  defp pin_status(ref, text) do
+    case Map.fetch(@pinned_unscoped_literal_exceptions, ref) do
+      :error ->
+        :no_pin
+
+      {:ok, %{hash: expected_hash, witness: witness, literals: literals}} ->
+        actual_hash = sha256_hex(text)
+
+        if actual_hash == expected_hash do
+          {:valid, literals}
+        else
+          {:stale, expected_hash, actual_hash, witness}
+        end
+    end
+  end
 
   # Every double-quoted or triple-quoted string literal inside a chunk of
   # already-reconstructed (`Macro.to_string/1`) source, each NORMALIZED (and
@@ -1685,23 +1738,26 @@ defmodule Tightbeam.CoordinationFabricTest do
     |> String.trim()
   end
 
-  # Every OWN query literal that references `decision_requests` must
+  # Every OWN query literal that references `decision_requests` (case-
+  # INSENSITIVE, Sol round 6, finding 1: SQL identifiers are case-
+  # insensitive, so an unscoped `UPDATE DECISION_REQUESTS ...` following a
+  # scoped lowercase query must not slip past this selector uncounted) must
   # individually prove one of two EXCLUSIVE shapes: `kind = '<declared>'` for
   # a single declared kind, or an explicit `kind IN (...)` list equal to a
   # declared pair (order-insensitive, whitespace/case-normalized). An
   # INSERT's positional `(..., kind, ...) VALUES (..., '<literal>', ...)`
   # counts as an equality too (`file_agent_request/2` and
   # `effort_insert_in_txn/2` set `kind` this way rather than filtering on
-  # it). A literal with NO kind mention at all must be a reviewed, pinned
-  # exception (see `@pinned_unscoped_literals`) or it fails closed — an
-  # unscoped query is exactly the vulnerability this check exists to catch,
-  # not something a substring match anywhere else in the function can excuse
-  # (Sol round 5, finding 1b). `OR` is rejected outright, everywhere, before
-  # any of that: no reviewed helper's SQL uses it today, so ANY occurrence in
-  # a `decision_requests` query is unreviewed disjunction, and `kind =
-  # 'statute' OR 1 = 1` (or an exact IN-list with the same `OR 1 = 1` tacked
-  # on) must not slip past an eq/IN check that never looked for it (Sol round
-  # 5, finding 1a).
+  # it). A literal with NO kind mention at all must be a reviewed, HASH-BOUND
+  # exception (see `@pinned_unscoped_literal_exceptions`) or it fails closed
+  # — an unscoped query is exactly the vulnerability this check exists to
+  # catch, not something a substring match anywhere else in the function can
+  # excuse (Sol round 5, finding 1b). `OR` is rejected outright, everywhere,
+  # before any of that: no reviewed helper's SQL uses it today, so ANY
+  # occurrence in a `decision_requests` query is unreviewed disjunction, and
+  # `kind = 'statute' OR 1 = 1` (or an exact IN-list with the same `OR 1 = 1`
+  # tacked on) must not slip past an eq/IN check that never looked for it
+  # (Sol round 5, finding 1a).
   defp kind_predicate_shape(ref, text, declared_csv) do
     declared =
       declared_csv
@@ -1711,7 +1767,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     own_literals =
       text
       |> own_sql_texts()
-      |> Enum.filter(&(&1 =~ "decision_requests"))
+      |> Enum.filter(&(&1 =~ ~r/\bdecision_requests\b/i))
 
     if own_literals == [] do
       {:error,
@@ -1719,13 +1775,15 @@ defmodule Tightbeam.CoordinationFabricTest do
          "be attribute-derived or assembled from parts, which this text-based scan cannot " <>
          "decompose; review by hand"}
     else
+      pin = pin_status(ref, text)
+
       own_literals
-      |> Enum.map(&single_literal_kind_shape(ref, &1, declared))
+      |> Enum.map(&single_literal_kind_shape(ref, &1, declared, pin))
       |> Enum.find(:ok, &match?({:error, _}, &1))
     end
   end
 
-  defp single_literal_kind_shape(ref, literal, declared) do
+  defp single_literal_kind_shape(ref, literal, declared, pin) do
     cond do
       literal =~ ~r/\bOR\b/i ->
         {:error,
@@ -1734,12 +1792,28 @@ defmodule Tightbeam.CoordinationFabricTest do
            inspect(literal)}
 
       not (literal =~ ~r/\bkind\b/i) ->
-        if literal in Map.get(@pinned_unscoped_literals, ref, []) do
-          :ok
-        else
-          {:error,
-           "#{ref}: a decision_requests query names no kind constraint at all and is not a " <>
-             "reviewed exception in @pinned_unscoped_literals: #{inspect(literal)}"}
+        case pin do
+          {:valid, literals} ->
+            if literal in literals do
+              :ok
+            else
+              {:error,
+               "#{ref}: a decision_requests query names no kind constraint at all and is not " <>
+                 "among #{ref}'s reviewed exceptions: #{inspect(literal)}"}
+            end
+
+          {:stale, expected_hash, actual_hash, witness} ->
+            {:error,
+             "#{ref}: an unscoped decision_requests query relies on a pinned exception whose " <>
+               "SAFETY WITNESS (#{inspect(witness)}) was reviewed against a DIFFERENT version " <>
+               "of this function — pinned hash #{expected_hash}, now #{actual_hash}. The " <>
+               "witness may no longer hold; re-review #{ref} and update " <>
+               "@pinned_unscoped_literal_exceptions: #{inspect(literal)}"}
+
+          :no_pin ->
+            {:error,
+             "#{ref}: a decision_requests query names no kind constraint at all and is not a " <>
+               "reviewed exception in @pinned_unscoped_literal_exceptions: #{inspect(literal)}"}
         end
 
       true ->
@@ -1916,6 +1990,33 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert {:error, _} = kind_predicate_shape(:fake_widened_second, widened_second, "statute")
   end
 
+  test "TEETH (hole 1, round 6): an UPPERCASE decision_requests table name is not invisible " <>
+         "to the per-literal selector" do
+    # SQL identifiers are case-insensitive: `DECISION_REQUESTS` names the
+    # exact same table `decision_requests` does. A scoped first query
+    # followed by an unscoped SECOND query spelled in a different case must
+    # not slip past the selector uncounted — the same masking bug as above,
+    # reached through a case mismatch instead of a second literal.
+    mixed_case_text =
+      "\"SELECT id FROM decision_requests WHERE kind = 'statute' AND id = ?1\"\n" <>
+        "\"UPDATE DECISION_REQUESTS SET status = 'closed' WHERE id = ?1\""
+
+    assert {:error, message} =
+             kind_predicate_shape(:fake_mixed_case, mixed_case_text, "statute")
+
+    assert message =~ "fake_mixed_case"
+
+    # THE OLD CHECK, for contrast: a case-SENSITIVE selector was expected to
+    # MISS the uppercase literal entirely (never even counting it as an "own
+    # literal" to check) — that is the evasion being closed.
+    old_selector_literals =
+      mixed_case_text |> own_sql_texts() |> Enum.filter(&(&1 =~ "decision_requests"))
+
+    assert length(old_selector_literals) == 1,
+           "a case-sensitive selector was expected to see only the lowercase literal (that is " <>
+             "the evasion being closed) but it saw #{length(old_selector_literals)}"
+  end
+
   test "TEETH (hole 2): an assembled or attribute-derived table name is caught at the AST " <>
          "level, where a Macro.to_string substring scan is blind to it" do
     assembled_src = ~S'''
@@ -1956,6 +2057,33 @@ defmodule Tightbeam.CoordinationFabricTest do
              "a Macro.to_string substring scan was expected to MISS this evasion (that is " <>
                "the bug being closed) but it caught it: #{src}"
     end
+  end
+
+  test "TEETH (hole 2, round 6): an UPPERCASE table name is caught by the AST fragment scan " <>
+         "too, not just the per-literal selector" do
+    uppercase_src = ~S'''
+    defmodule Fake.UppercaseTable do
+      def evasive_reader(db, id) do
+        DB.query(db, "SELECT id FROM DECISION_REQUESTS WHERE id = ?1", [id])
+      end
+    end
+    '''
+
+    {:ok, ast} = Code.string_to_quoted(uppercase_src, columns: true)
+    attrs = module_attrs_from_ast(ast)
+    defs = function_defs_from_ast(ast)
+    [{{:evasive_reader, 2}, nodes}] = Map.to_list(defs)
+    frags = Enum.flat_map(nodes, &literal_fragments(&1, attrs))
+
+    # THE HARDENED CHECK: case-insensitive.
+    assert Enum.any?(frags, &(&1 =~ ~r/\bdecision_requests\b/i)),
+           "the case-insensitive AST-level scan must catch this evasion"
+
+    # THE OLD CHECK, for contrast: a case-SENSITIVE `String.contains?/2` scan
+    # was expected to MISS it — that is the evasion being closed.
+    refute Enum.any?(frags, &String.contains?(&1, "decision_requests")),
+           "a case-sensitive substring scan was expected to MISS this evasion (that is the " <>
+             "bug being closed) but it caught it"
   end
 
   test "TEETH (hole 2): a new arity overload of an already-pinned reader name is invisible " <>
@@ -2187,6 +2315,104 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert naive_refs == [],
            "a whole-module-only alias resolver was expected to MISS a prefix alias (that is " <>
              "the evasion being closed) but it caught it"
+  end
+
+  test "TEETH (hole 3, round 6): an explicit `Elixir.` prefix on the module reference is " <>
+         "resolved, for both the literal-function and dynamic-function apply/3 forms" do
+    literal_fun_src = ~S'''
+    defmodule Fake.ElixirPrefixLiteralApply do
+      def perform(db, id) do
+        apply(Elixir.Tightbeam.Escalation, :consume, [db, id])
+      end
+    end
+    '''
+
+    dynamic_fun_src = ~S'''
+    defmodule Fake.ElixirPrefixDynamicApply do
+      def perform(fun, args) do
+        apply(Elixir.Tightbeam.Escalation, fun, args)
+      end
+    end
+    '''
+
+    {:ok, literal_ast} = Code.string_to_quoted(literal_fun_src, columns: true)
+    aliases_a = module_alias_map(literal_ast)
+    [{{:perform, 2}, literal_nodes}] = literal_ast |> function_defs_from_ast() |> Map.to_list()
+
+    # THE HARDENED CHECK: `[:Elixir, :Tightbeam, :Escalation]` resolves the
+    # same as `[:Tightbeam, :Escalation]`.
+    refs = literal_nodes |> Enum.flat_map(&escalation_refs_called(&1, aliases_a)) |> Enum.uniq()
+    assert refs == [:consume]
+
+    # THE OLD CHECK, for contrast: a resolver that compared the raw parts
+    # directly against `[:Tightbeam, :Escalation]`, with no `Elixir.`-prefix
+    # normalization, was expected to MISS the three-segment form.
+    naive_resolves? = fn parts -> parts == [:Tightbeam, :Escalation] end
+
+    naive_refs =
+      elem(
+        Macro.prewalk(hd(literal_nodes), [], fn
+          {:apply, _, [{:__aliases__, _, parts}, fun_atom, _args]} = n, acc
+          when is_atom(fun_atom) ->
+            if naive_resolves?.(parts), do: {n, [fun_atom | acc]}, else: {n, acc}
+
+          n, acc ->
+            {n, acc}
+        end),
+        1
+      )
+
+    assert naive_refs == [],
+           "a resolver with no `Elixir.`-prefix normalization was expected to MISS this (that " <>
+             "is the evasion being closed) but it caught it"
+
+    # The DYNAMIC-function mirror: literal `Elixir.`-prefixed module, but a
+    # non-literal function — must still be flagged as unscopable.
+    {:ok, dynamic_ast} = Code.string_to_quoted(dynamic_fun_src, columns: true)
+    aliases_b = module_alias_map(dynamic_ast)
+    [{{:perform, 2}, dynamic_nodes}] = dynamic_ast |> function_defs_from_ast() |> Map.to_list()
+
+    assert Enum.any?(dynamic_nodes, &has_escalation_apply_with_dynamic_function?(&1, aliases_b))
+  end
+
+  test "TEETH (round 6, finding 3): an edited unscoped-literal function fails its pin's hash, " <>
+         "rather than silently keeping a stale safety witness" do
+    # `escalate/4`'s real pinned text, with one clause of whitespace changed
+    # — a stand-in for ANY real edit. The hash is computed over the WHOLE
+    # function, so even a change nowhere near the unscoped literal itself
+    # invalidates the pin.
+    real_escalate_text = text_for_name(function_slices("lib/tightbeam/escalation.ex"), :escalate)
+    assert {:valid, _} = pin_status(:escalate, real_escalate_text)
+
+    edited_text = real_escalate_text <> " "
+    assert {:stale, expected, actual, witness} = pin_status(:escalate, edited_text)
+    assert expected != actual
+    assert witness =~ "schema DEFAULT"
+
+    # The unscoped INSERT literal that a `:valid` pin would have excused is
+    # now rejected, by name, rather than silently trusting a witness nobody
+    # re-read against the edited function.
+    insert_literal =
+      real_escalate_text
+      |> own_sql_texts()
+      |> Enum.find(&(&1 =~ ~r/\binsert\b/i))
+
+    assert {:error, message} =
+             single_literal_kind_shape(
+               :escalate,
+               insert_literal,
+               ["statute"],
+               {:stale, expected, actual, witness}
+             )
+
+    assert message =~ "escalate"
+    assert message =~ "SAFETY WITNESS"
+    assert message =~ expected
+    assert message =~ actual
+
+    # A ref with no pin at all is unaffected by any of this (`:no_pin`, not
+    # `:stale`) — the two failure reasons stay distinguishable.
+    assert :no_pin = pin_status(:open_episodes, "unrelated text")
   end
 
   test "the statute gate read cannot be reached by an agent row sharing its raiser",
