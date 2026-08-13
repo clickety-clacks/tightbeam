@@ -47,11 +47,11 @@ jobs:
           }
           git check-ref-format "refs/heads/$CANDIDATE_BRANCH"
           git fetch --no-tags origin \
-            "+refs/heads/main:refs/remotes/origin/main" \
+            "+refs/heads/0.1.x:refs/remotes/origin/0.1.x" \
             "+refs/heads/$CANDIDATE_BRANCH:refs/remotes/origin/$CANDIDATE_BRANCH"
           [ "$(git rev-parse HEAD)" = "$CANDIDATE_SHA" ]
           [ "$(git rev-parse "refs/remotes/origin/$CANDIDATE_BRANCH")" = "$CANDIDATE_SHA" ]
-          base=$(git merge-base refs/remotes/origin/main "$CANDIDATE_SHA")
+          base=$(git merge-base refs/remotes/origin/0.1.x "$CANDIDATE_SHA")
           features=$(git rev-list --reverse --topo-order "$base..$CANDIDATE_SHA")
           [ -n "$features" ] || {
             echo "release candidate: candidate range is empty" >&2

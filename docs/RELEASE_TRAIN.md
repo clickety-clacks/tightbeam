@@ -4,14 +4,14 @@ This procedure builds packages from one exact candidate branch commit. It does n
 a release. It does not create a tag.
 
 The candidate branch name must start with `release-candidate/`. The branch contains the
-exact ordered set of reviewed commits after one protected `main` commit.
+exact ordered set of reviewed commits after one protected `0.1.x` commit.
 
 ## Prepare the candidate
 
 Use a clean worktree. Store the preparation manifest outside that worktree.
 
 1. Fetch the protected branch and all reviewed feature commits.
-2. Record the exact `origin/main` SHA as the protected base.
+2. Record the exact `origin/0.1.x` SHA as the protected base.
 3. Order every commit in the exclusive base-to-candidate range.
 4. Run the preparation script with the branch, base, and ordered commits.
 5. Inspect the canonical JSON manifest that the script prints.
@@ -20,8 +20,8 @@ Use a clean worktree. Store the preparation manifest outside that worktree.
 Example:
 
 ```sh
-git fetch --no-tags origin main
-base=$(git rev-parse refs/remotes/origin/main)
+git fetch --no-tags origin 0.1.x
+base=$(git rev-parse refs/remotes/origin/0.1.x)
 scripts/release_candidate.sh \
   release-candidate/0.1.8 \
   "$base" \
@@ -75,39 +75,39 @@ Give the reviewer these exact values:
 The reviewer must review that exact SHA. A review of an earlier branch head does not cover a
 later head.
 
-## Promote to protected main
+## Promote to protected 0.1.x
 
 Promote only the reviewed and proved candidate SHA. Do not rebuild packages during
 promotion.
 
-1. Fetch `main` and the candidate branch again.
+1. Fetch `0.1.x` and the candidate branch again.
 2. Verify that the remote candidate branch still names the proved SHA.
-3. Verify that protected `main` still names the manifest base.
-4. Advance `main` through the repository's protected review path.
-5. Verify that remote `main` names the exact proved candidate SHA.
+3. Verify that protected `0.1.x` still names the manifest base.
+4. Advance `0.1.x` through the repository's protected review path.
+5. Verify that remote `0.1.x` names the exact proved candidate SHA.
 
 Example readback:
 
 ```sh
-git fetch --no-tags origin main release-candidate/0.1.8
+git fetch --no-tags origin 0.1.x release-candidate/0.1.8
 test "$(git rev-parse refs/remotes/origin/release-candidate/0.1.8)" = <candidate-sha>
-test "$(git rev-parse refs/remotes/origin/main)" = <protected-base-sha>
+test "$(git rev-parse refs/remotes/origin/0.1.x)" = <protected-base-sha>
 # Use the protected pull-request or merge path here.
-git fetch --no-tags origin main
-test "$(git rev-parse refs/remotes/origin/main)" = <candidate-sha>
+git fetch --no-tags origin 0.1.x
+test "$(git rev-parse refs/remotes/origin/0.1.x)" = <candidate-sha>
 ```
 
-Stop if `main` moved before promotion. Do not merge extra commits into the proved candidate.
+Stop if `0.1.x` moved before promotion. Do not merge extra commits into the proved candidate.
 Prepare and prove a new candidate instead.
 
 ## Create the immutable tag
 
-Create the version tag only after the exact-main readback succeeds. The tag must target the
+Create the version tag only after the exact-0.1.x readback succeeds. The tag must target the
 proved candidate SHA.
 
-1. Fetch tags and `main`.
+1. Fetch tags and `0.1.x`.
 2. Refuse the operation if the tag already exists locally or remotely.
-3. Verify that `main` names the proved candidate SHA.
+3. Verify that `0.1.x` names the proved candidate SHA.
 4. Create one annotated version tag at that SHA.
 5. Push the tag once.
 6. Read the remote tag target and verify the exact SHA.
@@ -130,6 +130,6 @@ Do not move the branch backward. Do not reuse its name.
 After promotion, select an earlier proved package by its exact digest for an installed test
 host. Do not rebuild that package.
 
-For a source rollback, create and review a revert commit on `main`. Then prepare a new
-candidate from the new protected `main` state. Never move `main`, a candidate branch, or a
+For a source rollback, create and review a revert commit on `0.1.x`. Then prepare a new
+candidate from the new protected `0.1.x` state. Never move `0.1.x`, a candidate branch, or a
 release tag backward.
