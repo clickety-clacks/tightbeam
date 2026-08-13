@@ -887,6 +887,12 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert detail =~ "incompatible_delivery_policy_v1"
     assert detail =~ "#{session}/fyi"
 
+    # SIGNED LIKE THE SUCCESS PATH (Sol xhigh review, finding 3; §8
+    # legibility): the rule name and revision that was attempting this
+    # materialization travels on the failure row too, not just on
+    # `wake_digest_materialized`.
+    assert detail =~ "rule=#{Wakes.digest_rule()}"
+
     # THE POISONED GROUP RETRIES NEXT TICK (still visible, still bounded) —
     # calling materialize_digests again reproduces the exact same failure
     # rather than silently giving up on it.

@@ -1515,10 +1515,17 @@ defmodule Tightbeam.Wakes do
     kind, reason -> file_materialization_failure(db, group_key, inspect({kind, reason}))
   end
 
+  # SIGNED LIKE THE SUCCESS PATH (Sol xhigh review, finding 3 — §8
+  # legibility): `wake_digest_materialized` names `rule=` alongside its
+  # target/class/trigger, and a FAILURE is exactly the row an agent most
+  # needs to know which reflex to inhibit — `@digest_rule` names the batcher
+  # revision that was attempting this materialization when it failed, not
+  # just where and why.
   defp file_materialization_failure(db, group_key, detail) do
     label = group_label(group_key)
+    record = "rule=#{@digest_rule} target=#{label} reason=#{detail}"
     Logger.error("wake digest materialization failed for #{label}: #{detail}")
-    best_effort_lifecycle(db, "wake_digest_materialization_failed", label, detail)
+    best_effort_lifecycle(db, "wake_digest_materialization_failed", label, record)
     nil
   end
 
