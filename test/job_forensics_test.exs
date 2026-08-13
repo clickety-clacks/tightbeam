@@ -663,7 +663,7 @@ defmodule Tightbeam.JobForensicsTest do
     assert is_binary(entry.dispositionId) and entry.dispositionId != ""
   end
 
-  test "linked open work cannot be canceled without liveness and action-needed evidence", %{
+  test "linked open work cancellation stays actionable after progress without a continuation", %{
     db: db
   } do
     work_item(db, "wi_open_cancel")
@@ -726,13 +726,18 @@ defmodule Tightbeam.JobForensicsTest do
     {:ok, true} =
       DB.transaction(db, fn txn -> typed_cancel_in_txn(txn, wake.wake_id, valid_command) end)
 
-    assert_proven_cancellation(canceled_entry(db, "wi_open_cancel", wake.wake_id), %{
+    entry = canceled_entry(db, "wi_open_cancel", wake.wake_id)
+
+    assert_proven_cancellation(entry, %{
       requesterKind: "process",
       requesterId: "tightbeam:wake-scheduler",
       reasonKind: "production_unmatched",
       causalSourceKind: "condition_fact",
       causalSourceId: Integer.to_string(fact_id),
       outcomeKind: "no_replacement",
+      replacementWakeId: nil,
+      dispositionKind: nil,
+      dispositionId: nil,
       primaryWorkKind: "assignment",
       primaryWorkId: "asg_open_cancel",
       workImpactKind: "linked_work_open",
@@ -740,6 +745,36 @@ defmodule Tightbeam.JobForensicsTest do
       livenessTriggerId: "asg_open_cancel#1",
       actionNeeded: true
     })
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO attests (id, assignmentId, kind, bySession, ts)
+      VALUES
+        ('att_after_cancel_1', 'asg_open_cancel', 'progress', 'open-holder', 20),
+        ('att_after_cancel_2', 'asg_open_cancel', 'progress', 'open-holder', 30)
+      """)
+
+    assert {:ok, [["open", nil]]} =
+             DB.query(
+               db,
+               "SELECT state, reviewsAssignmentId FROM assignments WHERE id='asg_open_cancel'"
+             )
+
+    assert {:ok, [[2]]} =
+             DB.query(
+               db,
+               "SELECT COUNT(*) FROM attests WHERE assignmentId='asg_open_cancel' AND kind='progress'"
+             )
+
+    assert {:ok, [["armed", 1, 1000]]} =
+             DB.query(
+               db,
+               "SELECT state, generation, dueAt FROM supervision_entitlements WHERE assignmentId='asg_open_cancel'"
+             )
+
+    after_progress = canceled_entry(db, "wi_open_cancel", wake.wake_id)
+    assert after_progress.livenessTriggerId == "asg_open_cancel#1"
+    assert after_progress.actionNeeded
   end
 
   test "session retirement cancels direct and role-targeted wakes with typed outcomes", %{db: db} do
