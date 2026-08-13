@@ -2,19 +2,19 @@
 
 **Tightbeam runs an organization of AI agents that works for you.**
 
-It is not another agent. Products like OpenClaw and Hermes give you a capable
-individual: one persistent mind that chats, remembers, acts, and improves.
-Tightbeam is the layer such individuals work *inside* — the difference between
-hiring a brilliant freelancer and owning a company. Agents plug in as staff,
-running in their vendors' own harnesses (Claude in Claude Code, Codex in
-Codex), and Tightbeam supplies what turns staff into an institution: durable
-work items, staffing and review across competing model vendors, rules the
-machinery itself enforces, and a paper trail behind every claim.
+Agents like OpenClaw and Hermes give you a capable individual: one
+persistent mind that chats, remembers, acts, and improves. Tightbeam is the
+layer such individuals work *inside*. It is the difference between hiring a
+brilliant freelancer and owning a company. Agents plug in as staff, each
+running in its vendor's own harness: Claude in Claude Code, Codex in Codex.
+Tightbeam adds what turns staff into an institution: durable work, review
+across competing model vendors, enforceable rules, and a paper trail behind
+every claim.
 
-You act as the owner, not the operator. File what you want as tickets;
-decisions only an owner can make reach you pre-triaged, even on your phone.
-The organization handles the rest — including, at times, [improving
-itself unasked](https://tightbeam.clawline.chat/watchdog/).
+You act as the owner, not the operator. File what you want as tickets.
+Decisions that only an owner can make reach you pre-triaged, even on your
+phone. The organization handles the rest. At times it goes further and
+[improves itself unasked](https://tightbeam.clawline.chat/watchdog/).
 
 Three properties make that safe to trust:
 
@@ -30,8 +30,8 @@ Three properties make that safe to trust:
   written. That is why the organization survives failure: any agent, or the
   substrate itself, can go down, and work resumes from the record.
 
-Tightbeam is a standalone service you install and operate, like a database —
-not a library you import into a project.
+Tightbeam is a standalone service you install and operate, like a database.
+It is not a library you import into a project.
 
 ## Two ways to install
 
