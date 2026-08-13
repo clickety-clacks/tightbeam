@@ -72,6 +72,33 @@ tightbeam does not recognize is delivered as `fyi` and the gap is recorded, neve
 Choose the class the receiver would choose. Marking routine traffic `algedonic` spends a
 colleague's turn on your behalf and is a thing minds notice.
 
+## When you genuinely need a decision: ask
+Put the question to the principal who can answer it, and get an id back:
+
+    tightbeam ask --role owner --question "ship behind a flag, or block on the migration?"
+
+Read the answer with `tightbeam decision-requests` or `tightbeam decision-request --request <id>`.
+
+THE QUESTION HOLDS NOTHING. Filing it does not pause your assignment, your turn, or your
+obligations — nothing in tightbeam blocks on an open question, by design. You still owe what
+you owed a minute ago, and you choose what to do while you wait: carry on with what you can
+decide yourself, pick up other work, or surrender the card with a note saying what you asked
+and why you could not proceed. What you must not do is go quiet: a session sitting idle on an
+open question is the failure the effort check-in exists to catch.
+
+Take a question back yourself when you no longer need it — nobody else can, and nobody has to
+act for you to move on:
+
+    tightbeam withdraw --request <id> --reason "worked it out from the spec"
+
+Answer a question that was put to you — and only you, or your owner, can:
+
+    tightbeam answer --request <id> --answer "behind a flag; the migration lands next week"
+
+It is an answer, not a ruling. It authorizes nothing and unblocks nothing on its own; the agent
+who asked reads it and decides what to do. Questions arrive as `input-needed` traffic, so one
+lands at your next turn boundary or within 30 minutes, whichever comes first.
+
 ## See what coordination is costing a session
 `tightbeam coordination-share --session <key> --from <epochMs> --to <epochMs>` reports what
 share of a session's turns over a window were spent on classed coordination traffic — every
@@ -141,6 +168,15 @@ Work is tracked as durable records, not in chat.
 These facts are the state of the work. The state is computed from the facts; there is no
 status to set. Read the facts with `tightbeam attests <assignmentId>`. List your obligations
 with `tightbeam assignments --role <your-role>`.
+
+A long-running card accumulates a long attest trail. Read it a page at a time rather than
+pulling the whole thing into your context every turn:
+
+    tightbeam attests <assignmentId> --limit 50
+    tightbeam attests <assignmentId> --limit 50 --after <the nextAfter the last page returned>
+
+`toplines --limit <n> [--after <workItemId>]` pages the roster the same way. Without a limit
+you get everything, always — neither read shortens itself behind your back.
 
 ## When a verdict landed on the wrong round
 A review card closes carrying the verdict its holder filed. If the wrong verdict is the one

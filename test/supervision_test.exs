@@ -70,8 +70,15 @@ defmodule Tightbeam.SupervisionTest do
     def handle_call(request, _from, state),
       do: {:reply, GenServer.call(state.db, request), state}
 
+    # The gate read, identified by its SHAPE rather than by one adjacency: it is
+    # the only `decision_requests` select that keys on `raiserId` and takes the
+    # newest row. Written this way because the previous spelling required
+    # `WHERE raiserId` to be adjacent, and stopped matching the moment the gate
+    # read stated `kind = 'statute'` in front of it — a proxy that silently
+    # matches nothing turns this whole race proof into a green no-op.
     defp current_request_query?(sql) do
-      String.contains?(sql, "FROM decision_requests WHERE raiserId") and
+      String.contains?(sql, "FROM decision_requests") and
+        String.contains?(sql, "raiserId = ?1") and
         String.contains?(sql, "ORDER BY rowid DESC LIMIT 1")
     end
 

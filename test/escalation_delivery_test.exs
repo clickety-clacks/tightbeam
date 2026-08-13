@@ -465,6 +465,11 @@ defmodule Tightbeam.EscalationDeliveryTest do
     # in-transaction prompt arm each one owes.
     request_sites = [
       {"lib/tightbeam/escalation.ex", "escalate/4"},
+      # The agent create-path (fabric §13 Phase 1 seam ③, GitHub #11). It is the
+      # only request site an AGENT reaches, and it owes the closure law exactly
+      # like the three the substrate reaches: the row and the notification that
+      # carries it commit together, or neither does.
+      {"lib/tightbeam/escalation.ex", "file_agent_request/2"},
       {"lib/tightbeam/effort_checkin.ex", "open_request_in_txn/4"},
       {"lib/tightbeam/effort_checkin.ex", "deadline_in_txn/3"}
     ]

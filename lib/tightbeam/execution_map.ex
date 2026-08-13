@@ -49,16 +49,57 @@ defmodule Tightbeam.ExecutionMap do
   @doc """
   The `toplines` verb: the roster with full telemetry, or the caller-visible
   causal forest when `--tree` is set.
+
+  ## `--after` / `--limit` (fabric §13 Phase 1 seam ④, GitHub #13)
+
+  A keyset cursor over the FLAT roster, and honest about what it is and is not.
+
+  WHAT IT IS: the roster's outermost ordering is `work_items` by
+  `(createdAt, id)` — a stable total order that does not move when a row is
+  updated — and the filters in `appearing/2` are per-item. So "everything
+  ordered after this item" is a well-defined, repeatable page boundary, and a
+  caller can walk the whole roster without skipping or repeating an item that
+  existed for the whole walk. The cursor is compared against the item's ORDER
+  KEY, not its membership, so an item that has since dropped out of the filter
+  still positions the page correctly instead of stranding the caller.
+
+  WHAT IT IS NOT — and this half must not be oversold, because a pager that
+  claims a cost it does not pay is worse than none: this bounds the RESPONSE,
+  not the work. `world/2` still loads every visible work item, assignment, turn,
+  attest and wake to compute per-item telemetry, and `--quiet-over` is a
+  predicate over that telemetry. A SQL `LIMIT` on `work_items` would page a
+  DIFFERENT population — the rows before filtering — and hand back short pages
+  with no way to tell a short page from the last one. That pager is not built
+  here.
+
+  `--tree` REFUSES BY NAME rather than paging. Nesting is derived across the
+  whole appearing set, so a page boundary drawn through a forest either cuts
+  subtrees off from parents that were on the previous page or silently pulls in
+  nodes the limit excluded. Neither is a page; both are a wrong answer that
+  looks like a right one.
   """
   @spec roster(DB.server(), map()) :: map()
   def roster(db, call) do
-    world = world(db, call)
-    appearing = appearing(world, call.params)
+    params = call.params
 
-    if truthy?(call.params[:tree]) do
-      forest(world, appearing)
-    else
-      Map.put(envelope(world), :items, Enum.map(appearing, &node(world, &1)))
+    case page_selection(params) do
+      {:error, error} ->
+        error
+
+      selection ->
+        world = world(db, call)
+        appearing = appearing(world, params)
+
+        cond do
+          truthy?(params[:tree]) and paging?(params) ->
+            invalid("--after/--limit page the flat roster; --tree returns a forest")
+
+          truthy?(params[:tree]) ->
+            forest(world, appearing)
+
+          true ->
+            page(world, appearing, selection)
+        end
     end
   end
 
@@ -71,6 +112,12 @@ defmodule Tightbeam.ExecutionMap do
     params = call.params
 
     cond do
+      # Both of this verb's shapes are already bounded selections — a subtree the
+      # caller anchored, or an assignment list the caller wrote out. Accepting a
+      # cursor and ignoring it would be the worse failure, so it is named.
+      paging?(params) ->
+        invalid("--after/--limit page toplines; topline returns a selection the caller bounded")
+
       is_binary(params[:under]) and params[:under] != "" and
           not is_nil(params[:assignments]) ->
         invalid("--under and --assignments are mutually exclusive")
@@ -960,4 +1007,78 @@ defmodule Tightbeam.ExecutionMap do
 
   defp invalid(message), do: %{code: "invalid", message: message}
   defp not_found(message), do: %{code: "not_found", message: message}
+
+  ## The flat-roster cursor (seam ④)
+
+  # The hard cap. A larger request is CLAMPED and the clamp is observable in the
+  # returned count, exactly as `transcript` behaves.
+  @max_limit 500
+
+  defp paging?(params), do: not is_nil(params[:after]) or not is_nil(params[:limit])
+
+  # NO DEFAULT LIMIT, deliberately, and this is where it differs from
+  # `transcript`. A transcript is an unbounded conversation read tail-first, so a
+  # default page is a kindness. A roster is a work census, and a default limit
+  # would silently shorten every existing caller's answer — an optimization that
+  # loses rows is wrong, full stop (Law 2). Paging happens when a caller asks.
+  defp page_selection(params) do
+    cursor = params[:after]
+    limit = params[:limit]
+
+    cond do
+      not (is_nil(cursor) or (is_binary(cursor) and cursor != "")) ->
+        {:error, invalid("--after takes a work item id")}
+
+      not (is_nil(limit) or (is_integer(limit) and limit > 0)) ->
+        {:error, invalid("--limit takes a positive integer")}
+
+      is_nil(cursor) and is_nil(limit) ->
+        :all
+
+      true ->
+        {:page, cursor, limit && min(limit, @max_limit)}
+    end
+  end
+
+  defp page(world, appearing, :all),
+    do: Map.put(envelope(world), :items, Enum.map(appearing, &node(world, &1)))
+
+  defp page(world, appearing, {:page, cursor, limit}) do
+    case cursor_key(world, cursor) do
+      :error ->
+        # An unknown id and an id this caller cannot see are ONE answer — the
+        # same rule `--under` already follows, and the reason the cursor is
+        # resolved against the VISIBLE item map rather than the table.
+        not_found("work item not found")
+
+      key ->
+        # `--limit` alone is the first page: there is no cursor to be after.
+        after_cursor =
+          if is_nil(key), do: appearing, else: Enum.filter(appearing, &(order_key(&1) > key))
+
+        {selected, rest} = take(after_cursor, limit)
+
+        envelope(world)
+        |> Map.put(:items, Enum.map(selected, &node(world, &1)))
+        |> Map.put(:next_after, selected != [] && List.last(selected).id)
+        |> Map.put(:has_more_after, rest != [])
+    end
+  end
+
+  defp cursor_key(_world, nil), do: nil
+
+  defp cursor_key(world, id) do
+    case Map.fetch(world.items_by_id, id) do
+      {:ok, item} -> order_key(item)
+      :error -> :error
+    end
+  end
+
+  # The roster's outermost ordering, verbatim from `visible_items/2`'s
+  # `ORDER BY createdAt ASC, id ASC`. Both components are immutable for the life
+  # of the row, which is what makes the boundary stable across pages.
+  defp order_key(item), do: {item.created_at, item.id}
+
+  defp take(items, nil), do: {items, []}
+  defp take(items, limit), do: Enum.split(items, limit)
 end

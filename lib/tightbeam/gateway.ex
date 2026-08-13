@@ -735,6 +735,12 @@ defmodule Tightbeam.Gateway do
         Escalation.revoke_waiver(db, call, authorized: admin_origin?(db, call.origin))
       end,
       "withdraw" => fn call -> Escalation.withdraw(db, call) end,
+      # The `input-needed` carrier (fabric §7, GitHub #11). Both verbs are
+      # ordinary routed verbs and nothing more: `Rules.decide` sees them at the
+      # Dispatch chokepoint like every other, the target is resolved by the same
+      # typed-target machinery `wake` uses, and neither one blocks anything.
+      "ask" => fn call -> decision_request_result(Escalation.ask(db, call)) end,
+      "answer" => fn call -> decision_request_result(Escalation.answer(db, call)) end,
       "decision-requests" => fn call ->
         caller = resolve_caller(db, call.origin)
 
@@ -5075,6 +5081,11 @@ defmodule Tightbeam.Gateway do
         end
     end
   end
+
+  # A refusal travels BARE so Dispatch turns it into a denial; a row travels
+  # wrapped, in the same envelope `decision-request` already uses.
+  defp decision_request_result(%{code: _} = error), do: error
+  defp decision_request_result(request), do: %{decision_request: request}
 
   defp coordination_share_readable?(db, call, session) do
     case call[:principal] do

@@ -43,7 +43,7 @@ defmodule Tightbeam.ConformanceSupport do
                ~w(case kind expect reason emits input script_return world call phase2 phase)
              )
   @expects MapSet.new(
-             ~w(deny pass refuse run-remedy re-obligate escalate-park none escalate-halt escalate-open escalate-continue load-raise load-clean digest immediate bypass inhibited unclassed)
+             ~w(deny pass refuse run-remedy re-obligate escalate-park none escalate-halt escalate-open escalate-continue load-raise load-clean digest immediate bypass inhibited unclassed filed gates-nothing answered withdrawn not-rulable page resume unpaged exhausted roster-page)
            )
   @case_expects %{
     "harness-gate" => ~w(deny pass),
@@ -56,7 +56,14 @@ defmodule Tightbeam.ConformanceSupport do
     # The five outcomes the delivery policy can reach, plus the one refusal it
     # owes. Named exhaustively so a sixth outcome cannot be smuggled in as a
     # variant of an existing word (coordination-fabric-v1 §5, §7).
-    "delivery-policy" => ~w(digest immediate bypass inhibited unclassed refuse)
+    "delivery-policy" => ~w(digest immediate bypass inhibited unclassed refuse),
+    # Seam ③. `gates-nothing` is the anti-adjudication outcome and is a WORD OF
+    # ITS OWN rather than a flavour of `filed`, so a change that quietly let a
+    # question hold a completion would have to delete a named outcome to pass.
+    "question-carrier" => ~w(filed gates-nothing answered withdrawn not-rulable refuse),
+    # Seam ④. `unpaged` is likewise its own word: the contract that an unlimited
+    # read still returns everything is the one a default page size would break.
+    "read-cursor" => ~w(page resume unpaged exhausted roster-page refuse)
   }
   @load_twins [
     ~w(remedy-target-missing remedy-target-present),
@@ -217,6 +224,12 @@ defmodule Tightbeam.ConformanceSupport do
 
   defp applicable_runners("delivery-policy", runners),
     do: Enum.filter(runners, &(&1 == "delivery_policy"))
+
+  defp applicable_runners("question-carrier", runners),
+    do: Enum.filter(runners, &(&1 == "question_carrier"))
+
+  defp applicable_runners("read-cursor", runners),
+    do: Enum.filter(runners, &(&1 == "read_cursor"))
 
   defp applicable_runners(_kind, runners), do: runners
 
@@ -1017,6 +1030,329 @@ defmodule Tightbeam.ConformanceSupport do
       [[detail]] -> detail
       [] -> nil
     end
+  end
+
+  # The agent question-carrier contract (fabric §7, §10; GitHub #11).
+  #
+  # Every case FILES the question through `Dispatch.dispatch/3` and then, per its
+  # declared outcome, takes exactly one more step through the same chokepoint.
+  # There is no shared tail: a carrier that reached a different outcome than the
+  # one its case names is the failure worth catching.
+  def run_question_carrier_fixture(fixture) do
+    Enum.each(fixture["cases"], fn kase ->
+      {db, pid} = memory_db!()
+
+      try do
+        ids = materialize_world(db, Map.get(kase, "world", %{}))
+        handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
+        call = build_call(kase["call"], ids)
+
+        assert_question_outcome(
+          kase["expect"],
+          kase,
+          db,
+          handlers,
+          ids,
+          Dispatch.dispatch(db, handlers, call)
+        )
+      after
+        GenServer.stop(pid)
+      end
+    end)
+  end
+
+  defp assert_question_outcome("refuse", kase, db, _handlers, _ids, result) do
+    assert {:error, %{code: code}} = result, "#{kase["case"]}: expected a refusal"
+    assert code == kase["reason"]
+
+    # A refused question writes NOTHING: no row, and no notification promising
+    # a mind something the substrate told the asker it had rejected.
+    assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM decision_requests")
+    assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM wakes WHERE consumer = 'prompt'")
+  end
+
+  defp assert_question_outcome("filed", kase, db, _handlers, _ids, result) do
+    request = filed!(kase, result)
+
+    assert request.kind == "agent"
+    assert request.status == "open"
+    assert request.raiser_id == "session:" <> request.raiser_session_key
+
+    # NO ADJUDICATION VOCABULARY. Each of these is a column a gate would need.
+    for {field, value} <-
+          Map.take(request, [
+            :statute_name,
+            :action_key,
+            :decision,
+            :rationale,
+            :ruled_by,
+            :ruling_fact_id,
+            :consumed_at,
+            :park_wake_id,
+            :answer
+          ]) do
+      assert value == nil, "#{kase["case"]}: agent question carries #{field}"
+    end
+
+    # The carrier: ONE classed notification at the asked session, elected
+    # `input-needed` by the asker, batched by seam ②'s own policy.
+    assert [wake] = prompt_wakes(db, request.expecter_session_key)
+    # The case DECLARES the class the carrier must elect; nothing here infers it.
+    assert wake.class == (kase["reason"] || "input-needed")
+    assert wake.class_election == "sender"
+    assert wake.delivery_rule == Wakes.digest_rule()
+    assert wake.prompt =~ request.id
+
+    if kase["kind"] == "legibility" do
+      assert kase["emits"] == "lifecycle:decision_request_asked"
+      detail = question_lifecycle(db, "decision_request_asked", request.id)
+      assert detail =~ "asker=#{request.raiser_id}"
+      assert detail =~ "askedOf=#{request.expecter_session_key}"
+    end
+  end
+
+  # THE TRIPWIRE (fabric §10). The question names the assignment its asker
+  # holds, and the completion of that assignment goes through untouched.
+  defp assert_question_outcome("gates-nothing", kase, db, handlers, ids, result) do
+    request = filed!(kase, result)
+    assignment_id = Map.fetch!(ids.assignments, "a1")
+    assert request.assignment_id == assignment_id
+
+    assert {:ok, %{attest: %{kind: "completion"}}} =
+             Dispatch.dispatch(db, handlers, %{
+               verb: "attest",
+               origin: "agent:#{request.raiser_session_key}",
+               principal: {:session, request.raiser_session_key},
+               session_key: nil,
+               params: %{assignment_id: assignment_id, kind: "completion"}
+             })
+
+    # Still open. The asker disposed of its obligation by its own choice and the
+    # question held nothing while it did.
+    assert current_status(db, request.id) == "open"
+  end
+
+  defp assert_question_outcome("answered", kase, db, handlers, _ids, result) do
+    request = filed!(kase, result)
+
+    # A bystander is refused, and the refusal names the reason.
+    assert {:error, %{code: "not_asked"}} =
+             Dispatch.dispatch(db, handlers, answer_call("bystander", request.id, "not mine"))
+
+    assert {:ok, %{decision_request: answered}} =
+             Dispatch.dispatch(
+               db,
+               handlers,
+               answer_call(request.expecter_session_key, request.id, "behind a flag")
+             )
+
+    assert answered.status == "answered"
+    assert answered.answer == "behind a flag"
+    assert answered.answered_by == "session:" <> request.expecter_session_key
+
+    # AN ANSWER IS NOT A RULING: nothing is spent and no condition fact is filed,
+    # so no halted call anywhere can be released by it.
+    assert answered.decision == nil
+    assert answered.consumed_at == nil
+    assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM condition_facts")
+
+    # The asker hears about it, unclassed — delivered as every wake was before
+    # Phase 1, because the substrate elects no class on a mind's behalf.
+    assert [reply] = prompt_wakes(db, request.raiser_session_key)
+    assert reply.class == nil
+    assert reply.prompt =~ "behind a flag"
+  end
+
+  defp assert_question_outcome("withdrawn", kase, db, handlers, _ids, result) do
+    request = filed!(kase, result)
+
+    # The principal that was ASKED cannot take the question away from its asker.
+    assert {:error, %{code: "not_raiser"}} =
+             Dispatch.dispatch(db, handlers, %{
+               verb: "withdraw",
+               origin: "agent:#{request.expecter_session_key}",
+               principal: {:session, request.expecter_session_key},
+               session_key: nil,
+               params: %{request: request.id, reason: "not mine"}
+             })
+
+    assert {:ok, %{status: "withdrawn"}} =
+             Dispatch.dispatch(db, handlers, %{
+               verb: "withdraw",
+               origin: "agent:#{request.raiser_session_key}",
+               principal: {:session, request.raiser_session_key},
+               session_key: nil,
+               params: %{request: request.id, reason: "worked it out myself"}
+             })
+
+    assert current_status(db, request.id) == "withdrawn"
+  end
+
+  defp assert_question_outcome("not-rulable", kase, db, handlers, _ids, result) do
+    request = filed!(kase, result)
+
+    for verb <- ~w(rule waive) do
+      assert {:error, %{code: "invalid", message: message}} =
+               Dispatch.dispatch(db, handlers, %{
+                 verb: verb,
+                 origin: "user:root",
+                 principal: {:user, "root"},
+                 session_key: nil,
+                 params: %{request: request.id, decision: "allow"}
+               }),
+             "#{kase["case"]}: #{verb} reached an agent question"
+
+      assert message =~ "answered, not"
+    end
+
+    assert current_status(db, request.id) == "open"
+  end
+
+  defp filed!(kase, result) do
+    assert {:ok, %{decision_request: request}} = result,
+           "#{kase["case"]}: expected the question to be filed"
+
+    request
+  end
+
+  defp answer_call(session_key, request_id, text) do
+    %{
+      verb: "answer",
+      origin: "agent:#{session_key}",
+      principal: {:session, session_key},
+      session_key: nil,
+      params: %{request: request_id, answer: text}
+    }
+  end
+
+  defp current_status(db, id) do
+    {:ok, [[status]]} = DB.query(db, "SELECT status FROM decision_requests WHERE id = ?1", [id])
+    status
+  end
+
+  defp prompt_wakes(db, session_key) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT wakeId FROM wakes WHERE sessionKey = ?1 AND consumer = 'prompt' AND state = 'pending' ORDER BY createdAt, wakeId",
+        [session_key]
+      )
+
+    Enum.map(rows, fn [id] -> Wakes.get(db, id) end)
+  end
+
+  defp question_lifecycle(db, kind, subject) do
+    {:ok, [[detail]]} =
+      DB.query(
+        db,
+        "SELECT detail FROM lifecycle_events WHERE kind = ?1 AND subject = ?2 ORDER BY id DESC LIMIT 1",
+        [kind, subject]
+      )
+
+    detail
+  end
+
+  # The read-cursor contract (fabric §13 Phase 1 seam ④; GitHub #13).
+  #
+  # Cursor VALUES are not written into the cases: the fixture states the law
+  # over pages, and the runner reads the full list to learn the ids. A fixture
+  # that hardcoded them would be pinning today's uuids, not the contract.
+  def run_read_cursor_fixture(fixture) do
+    Enum.each(fixture["cases"], fn kase ->
+      {db, pid} = memory_db!()
+
+      try do
+        ids = materialize_world(db, Map.get(kase, "world", %{}))
+        handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
+        call = build_call(kase["call"], ids)
+
+        assert_cursor_outcome(kase["expect"], kase, db, handlers, call)
+      after
+        GenServer.stop(pid)
+      end
+    end)
+  end
+
+  defp assert_cursor_outcome("refuse", kase, db, handlers, call) do
+    assert {:error, %{code: code}} = Dispatch.dispatch(db, handlers, call),
+           "#{kase["case"]}: expected a refusal"
+
+    assert code == kase["reason"]
+
+    if kase["kind"] == "legibility", do: assert(kase["emits"] == "handler:#{code}")
+  end
+
+  defp assert_cursor_outcome("unpaged", kase, db, handlers, call) do
+    assert {:ok, page} = Dispatch.dispatch(db, handlers, call)
+
+    # NO DEFAULT LIMIT. Every row the assignment carries, and the page says so.
+    assert length(page.attests) == length(Map.get(kase["world"], "attests"))
+    assert page.has_more_after == false
+    assert page.next_after == List.last(page.attests).id
+  end
+
+  defp assert_cursor_outcome("page", kase, db, handlers, call) do
+    limit = call.params.limit
+    assert kase["reason"] == "limit", "#{kase["case"]}: this page is bounded by its limit"
+    assert {:ok, page} = Dispatch.dispatch(db, handlers, call)
+
+    assert length(page.attests) == limit
+    assert page.has_more_after, "#{kase["case"]}: a short page must say more follows"
+    assert page.next_after == List.last(page.attests).id
+  end
+
+  # THE WHOLE LAW, stated over the concatenation rather than any one page: the
+  # walk reproduces the unpaged list exactly — no row lost, none repeated, even
+  # across attests that share a millisecond.
+  defp assert_cursor_outcome("resume", _kase, db, handlers, call) do
+    assert {:ok, whole} =
+             Dispatch.dispatch(db, handlers, %{call | params: %{call.params | limit: nil}})
+
+    expected = Enum.map(whole.attests, & &1.id)
+    assert length(expected) > call.params.limit
+
+    assert walk(db, handlers, call, nil, []) == expected
+  end
+
+  defp assert_cursor_outcome("exhausted", _kase, db, handlers, call) do
+    assert {:ok, whole} = Dispatch.dispatch(db, handlers, call)
+    last = List.last(whole.attests).id
+
+    assert {:ok, past} =
+             Dispatch.dispatch(db, handlers, %{
+               call
+               | params: Map.put(call.params, :after, last)
+             })
+
+    assert past.attests == []
+    assert past.next_after == nil
+    assert past.has_more_after == false
+  end
+
+  defp assert_cursor_outcome("roster-page", _kase, db, handlers, call) do
+    assert {:ok, whole} = Dispatch.dispatch(db, handlers, %{call | params: %{}})
+    expected = Enum.map(whole.items, & &1.id)
+
+    assert {:ok, first} = Dispatch.dispatch(db, handlers, call)
+    assert Enum.map(first.items, & &1.id) == Enum.take(expected, call.params.limit)
+    assert first.has_more_after
+
+    assert {:ok, second} =
+             Dispatch.dispatch(db, handlers, %{
+               call
+               | params: Map.put(call.params, :after, first.next_after)
+             })
+
+    assert Enum.map(first.items, & &1.id) ++ Enum.map(second.items, & &1.id) == expected
+    assert second.has_more_after == false
+  end
+
+  defp walk(db, handlers, call, cursor, seen) do
+    params = if cursor, do: Map.put(call.params, :after, cursor), else: call.params
+    assert {:ok, page} = Dispatch.dispatch(db, handlers, %{call | params: params})
+    seen = seen ++ Enum.map(page.attests, & &1.id)
+
+    if page.has_more_after, do: walk(db, handlers, call, page.next_after, seen), else: seen
   end
 
   def run_handler_refusal_fixture(fixture) do
@@ -3740,8 +4076,11 @@ defmodule Tightbeam.ConformanceTest do
     # on both axes, so they raise the total and the active count and leave the
     # ACTIVATED counts alone: those measure fixtures still waiting on a
     # mechanism, and this mechanism ships on this branch.
-    assert length(@fixtures) == 68
-    assert active_fixtures == 58
+    # Second wave (2026-08-13) adds two more GREEN C8 fixtures —
+    # agent-question-carrier (seam ③) and read-cursors (seam ④) — on the same
+    # both-axes rule as the first two.
+    assert length(@fixtures) == 70
+    assert active_fixtures == 60
     assert exact_skips == 10
     assert activated_fixture_tests == 43
     assert activated_class_tests == 5
@@ -4140,6 +4479,8 @@ defmodule Tightbeam.ConformanceTest do
             "rules_decide" -> Corpus.run_rules_decide(fixture)
             "acting_layer" -> Corpus.run_acting_layer(fixture)
             "delivery_policy" -> Corpus.run_delivery_policy_fixture(fixture)
+            "question_carrier" -> Corpus.run_question_carrier_fixture(fixture)
+            "read_cursor" -> Corpus.run_read_cursor_fixture(fixture)
           end)
         end
 

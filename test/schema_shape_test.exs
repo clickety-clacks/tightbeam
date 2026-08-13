@@ -43,13 +43,13 @@ defmodule Tightbeam.SchemaShapeTest do
   test "a fresh database is created and stamped", %{db: db} do
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["coordination-fabric-classes-v2"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v3"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     # Idempotent: booting twice is the ordinary case, not a shape change.
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["coordination-fabric-classes-v2"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v3"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
   end
 
@@ -232,7 +232,7 @@ defmodule Tightbeam.SchemaShapeTest do
     assert {:ok, ^before_rows} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
     assert {:ok, []} = DB.query(db, "SELECT wakeId FROM wake_cancellations")
 
-    assert {:ok, [["coordination-fabric-classes-v2"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v3"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
   end
 
@@ -314,20 +314,21 @@ defmodule Tightbeam.SchemaShapeTest do
 
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
-    assert error.message =~ "some-later-shape"
-    assert error.message =~ "coordination-fabric-classes-v2"
+    assert error.message =~ "coordination-fabric-v1-phase1-v3"
   end
 
-  # Sol xhigh review round 2, finding 2: `classElection`'s CHECK constraint
-  # gained `'batcher'` (round-1 finding 7), but `CREATE TABLE IF NOT EXISTS`
-  # does not widen an existing table's CHECK any more than it adds a column.
-  # A `coordination-fabric-classes-v1` database's `wakes` table — reconstructed
-  # here byte-for-byte from cafe321's DDL — still enforces the OLD two-value
-  # CHECK. Without the shape bump, this database would boot silently (its
-  # stamp used to match `@shape`) and the first digest-carrier insert would
-  # die on a raw, unnamed `CHECK constraint failed` deep inside the batcher.
-  # This proves the boot gate now refuses it BY NAME first, before any DDL or
-  # insert ever reaches the stale constraint.
+  # Sol xhigh review round 2, finding 2 (wave 1): `classElection`'s CHECK
+  # constraint gained `'batcher'` (round-1 finding 7), but `CREATE TABLE IF
+  # NOT EXISTS` does not widen an existing table's CHECK any more than it
+  # adds a column. A `coordination-fabric-classes-v1` database's `wakes`
+  # table — reconstructed here byte-for-byte from cafe321's DDL — still
+  # enforces the OLD two-value CHECK. Without the shape bump, this database
+  # would boot silently (its stamp used to match `@shape`) and the first
+  # digest-carrier insert would die on a raw, unnamed `CHECK constraint
+  # failed` deep inside the batcher. This proves the boot gate now refuses it
+  # BY NAME first, before any DDL or insert ever reaches the stale
+  # constraint. Kept working across the wave-1/wave-2 merge (Sol xhigh review
+  # round 3, item 2): the oldest vintage on EITHER line must still refuse.
   test "a coordination-fabric-classes-v1 database is refused by name, never a raw CHECK violation",
        %{db: db} do
     :ok =
@@ -375,7 +376,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-classes-v1"
-    assert error.message =~ "coordination-fabric-classes-v2"
+    assert error.message =~ "coordination-fabric-v1-phase1-v3"
     assert error.message =~ "no migration"
 
     # It REFUSED — it did not repair or widen the constraint in place.

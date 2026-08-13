@@ -359,6 +359,40 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             }
             Ok(request(identity, "decision-requests", vec![], params))
         }
+        // `ask` carries a TYPED TARGET, exactly like `wake`: the gateway resolves
+        // a role's binding (and its fallback) once, at the door.
+        Command::Ask {
+            identity,
+            target,
+            question,
+            about,
+        } => {
+            let target = match target {
+                Target::Session(value) => string_field("sessionKey", value),
+                Target::Role(value) => string_field("role", value),
+                Target::User(value) => string_field("userId", value),
+            };
+            let mut params = vec![string_field("question", question)];
+            if let Some(value) = about {
+                params.push(string_field("assignmentId", value));
+            }
+            Ok(request(identity, "ask", vec![target], params))
+        }
+        // `answer` carries NO target: the request id already names who was asked,
+        // and volunteering a session here would make the verb an existence oracle.
+        Command::Answer {
+            identity,
+            request_id,
+            answer,
+        } => Ok(request(
+            identity,
+            "answer",
+            vec![],
+            vec![
+                string_field("request", request_id),
+                string_field("answer", answer),
+            ],
+        )),
         Command::RevokeAssignment {
             identity,
             assignment_id,
@@ -461,10 +495,18 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             identity,
             filters,
             tree,
+            after,
+            limit,
         } => {
             let mut params = filter_params(filters);
             if *tree {
                 params.push("\"tree\":true".to_owned());
+            }
+            if let Some(value) = after {
+                params.push(string_field("after", value));
+            }
+            if let Some(value) = limit {
+                params.push(format!("\"limit\":{value}"));
             }
             Ok(request(identity, "toplines", vec![], params))
         }
@@ -573,12 +615,18 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
         Command::Attests {
             identity,
             assignment_id,
-        } => Ok(request(
-            identity,
-            "attests",
-            vec![],
-            vec![string_field("assignmentId", assignment_id)],
-        )),
+            after,
+            limit,
+        } => {
+            let mut params = vec![string_field("assignmentId", assignment_id)];
+            if let Some(value) = after {
+                params.push(string_field("after", value));
+            }
+            if let Some(value) = limit {
+                params.push(format!("\"limit\":{value}"));
+            }
+            Ok(request(identity, "attests", vec![], params))
+        }
         Command::CoordinationShare {
             identity,
             session,
@@ -1334,6 +1382,8 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::Dispatch { identity, .. }
         | Command::EffortRule { identity, .. }
         | Command::DecisionRequests { identity, .. }
+        | Command::Ask { identity, .. }
+        | Command::Answer { identity, .. }
         | Command::RevokeAssignment { identity, .. }
         | Command::ReopenAssignment { identity, .. }
         | Command::WorkItemCreate { identity, .. }
@@ -1626,6 +1676,124 @@ mod tests {
             &["coordination-share", "--session", "agent:po", "--from", "1"][..],
         ] {
             let mut argv = missing.to_vec();
+            argv.extend_from_slice(&["--as-user", "flynn"]);
+            assert!(args::parse(argv.iter().map(|v| (*v).to_owned()).collect()).is_err());
+        }
+    }
+
+    #[test]
+    fn builds_byte_exact_ask_answer_and_cursor_bodies() {
+        // `ask` carries a typed target; `answer` carries none, because the
+        // request id already names who was asked (seam ③).
+        assert_eq!(
+            body(&[
+                "ask",
+                "--role",
+                "owner",
+                "--question",
+                "ship behind a flag or block?",
+                "--as",
+                "coder",
+            ]),
+            r#"{"as":"coder","verb":"ask","role":"owner","params":{"question":"ship behind a flag or block?"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "ask",
+                "--session",
+                "agent:po",
+                "--question",
+                "which?",
+                "--about",
+                "as_1",
+                "--as",
+                "coder",
+            ]),
+            r#"{"as":"coder","verb":"ask","sessionKey":"agent:po","params":{"question":"which?","assignmentId":"as_1"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "answer",
+                "--request",
+                "dr_1",
+                "--answer",
+                "behind a flag",
+                "--as-user",
+                "flynn",
+            ]),
+            r#"{"asUser":"flynn","verb":"answer","params":{"request":"dr_1","answer":"behind a flag"}}"#
+        );
+        for missing in [
+            &["ask", "--question", "q"][..],
+            &["ask", "--role", "owner"][..],
+            &[
+                "ask",
+                "--role",
+                "owner",
+                "--session",
+                "s",
+                "--question",
+                "q",
+            ][..],
+            &["answer", "--request", "dr_1"][..],
+            &["answer", "--answer", "text"][..],
+        ] {
+            let mut argv = missing.to_vec();
+            argv.extend_from_slice(&["--as", "coder"]);
+            assert!(args::parse(argv.iter().map(|v| (*v).to_owned()).collect()).is_err());
+        }
+
+        // Seam ④. `--limit` is a JSON NUMBER, and neither flag carries a default:
+        // an unpaged call must build exactly the body it built before.
+        assert_eq!(
+            body(&["attests", "as_1", "--as-user", "flynn"]),
+            r#"{"asUser":"flynn","verb":"attests","params":{"assignmentId":"as_1"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "attests",
+                "as_1",
+                "--after",
+                "at_9",
+                "--limit",
+                "50",
+                "--as-user",
+                "flynn",
+            ]),
+            r#"{"asUser":"flynn","verb":"attests","params":{"assignmentId":"as_1","after":"at_9","limit":50}}"#
+        );
+        assert_eq!(
+            body(&[
+                "toplines",
+                "--after",
+                "wi_1",
+                "--limit",
+                "25",
+                "--as-user",
+                "flynn",
+            ]),
+            r#"{"asUser":"flynn","verb":"toplines","params":{"after":"wi_1","limit":25}}"#
+        );
+        // A forest has no lawful page boundary, and the CLI says so before the
+        // round trip rather than after it.
+        assert_eq!(
+            args::parse(
+                ["toplines", "--tree", "--limit", "5", "--as-user", "flynn"]
+                    .iter()
+                    .map(|v| (*v).to_owned())
+                    .collect()
+            )
+            .unwrap_err(),
+            "--after/--limit page the flat roster; --tree returns a forest"
+        );
+        for bad in [
+            &["attests", "as_1", "--limit", "0"][..],
+            &["attests", "as_1", "--limit", "-1"][..],
+            &["attests", "as_1", "--limit", "abc"][..],
+            &["attests", "as_1", "--after", ""][..],
+            &["toplines", "--after", ""][..],
+        ] {
+            let mut argv = bad.to_vec();
             argv.extend_from_slice(&["--as-user", "flynn"]);
             assert!(args::parse(argv.iter().map(|v| (*v).to_owned()).collect()).is_err());
         }

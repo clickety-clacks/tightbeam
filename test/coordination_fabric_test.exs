@@ -696,6 +696,348 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert unreadable == absent
   end
 
+  ## Seam ③ — the `input-needed` carrier (GitHub #11)
+
+  test "an agent's question and the notification that carries it are one commit", %{db: db} do
+    seed_session(db, "agent:coder", "flynn")
+    seed_session(db, "agent:po", "flynn")
+
+    assert {:ok, %{decision_request: request}} =
+             ask(db, "agent:coder", "agent:po", "ship behind a flag or block?")
+
+    assert request.kind == "agent"
+    assert request.status == "open"
+    assert request.raiser_id == "session:agent:coder"
+    assert request.raiser_session_key == "agent:coder"
+    assert request.expecter_session_key == "agent:po"
+    assert request.expecter_user_id == "flynn"
+    assert request.question == "ship behind a flag or block?"
+    assert request.answer == nil
+
+    # NONE of the adjudication vocabulary, and this is the assertion the seam
+    # exists to keep true: an answer is not a verdict, so there is nowhere on
+    # this row for one to be written.
+    assert request.statute_name == nil
+    assert request.action_key == nil
+    assert request.decision == nil
+    assert request.ruled_by == nil
+    assert request.ruling_fact_id == nil
+    assert request.park_wake_id == nil
+    assert request.consumed_at == nil
+
+    # The transactional outbox: one wake, at the asked session, elected
+    # `input-needed` by the asker — so seam ②'s policy batches it to the target's
+    # next turn boundary or the 30-minute floor, whichever comes first.
+    assert [notice] = wakes_for(db, "agent:po")
+    assert notice.class == "input-needed"
+    assert notice.class_election == "sender"
+    assert notice.delivery_rule == Wakes.digest_rule()
+    assert notice.target_gate == 0
+    assert notice.prompt =~ request.id
+    assert notice.prompt =~ "ship behind a flag or block?"
+    assert notice.due_at - notice.created_at == Wakes.delivery_policy("input-needed").ceiling_ms
+  end
+
+  test "THE TRIPWIRE: an open question gates nothing (fabric §10)", %{db: db} do
+    # Two halves, and the second is the one a substrate reaches for by reflex.
+    #
+    # HALF ONE, behavioural: an open question naming an assignment does not stop
+    # its holder completing and closing that assignment. If it ever does,
+    # adjudication has been rebuilt with a friendlier face.
+    seed_session(db, "agent:coder", "flynn")
+    seed_session(db, "agent:po", "flynn")
+    assignment = open_assignment(db, "agent:coder")
+
+    assert {:ok, %{decision_request: request}} =
+             ask(db, "agent:coder", "agent:po", "which way?", assignment_id: assignment.id)
+
+    assert request.assignment_id == assignment.id
+    assert request.status == "open"
+
+    assert %{attest: %{kind: "completion"}} =
+             Tightbeam.Assignments.__handle__(db, "attest", %{
+               verb: "attest",
+               origin: "agent:agent:coder",
+               principal: {:session, "agent:coder"},
+               session_key: nil,
+               params: %{assignment_id: assignment.id, kind: "completion"}
+             })
+
+    # The question is STILL OPEN and the card closed anyway — the asker held its
+    # obligation throughout and disposed of it by its own choice.
+    assert get_request(db, request.id).status == "open"
+
+    # HALF TWO, structural: nothing outside `escalation.ex` selects this kind at
+    # all. A gate has to read the row before it can gate on it, so the readers
+    # are the thing to pin.
+    # Per-LITERAL, not per-file: a comment saying the words is not a reader, and
+    # SQL assembled from fragments is out of reach of any scan (proof 10 states
+    # the same limit). This is a floor against drift, not a sandbox.
+    readers =
+      Path.wildcard("lib/**/*.ex")
+      |> Enum.sort()
+      |> Enum.filter(fn file ->
+        file
+        |> File.read!()
+        |> Code.string_to_quoted!()
+        |> Macro.prewalk([], fn
+          sql, acc when is_binary(sql) -> {sql, [sql | acc]}
+          node, acc -> {node, acc}
+        end)
+        |> elem(1)
+        |> Enum.any?(&(&1 =~ "decision_requests" and &1 =~ ~r/'agent'/))
+      end)
+
+    assert readers == ["lib/tightbeam/escalation.ex"],
+           "an agent question is data its asker honors, never a row another module consults"
+  end
+
+  test "the asker's exits are its own, and only the asked principal answers", %{db: db} do
+    seed_session(db, "agent:coder", "flynn")
+    seed_session(db, "agent:po", "flynn")
+    seed_session(db, "agent:stranger", "outsider")
+
+    assert {:ok, %{decision_request: request}} = ask(db, "agent:coder", "agent:po", "which way?")
+
+    # Not the asker, not a bystander, not an admin: the principal that was asked.
+    assert {:error, %{code: "not_asked"}} =
+             answer(db, {:session, "agent:coder"}, request.id, "myself")
+
+    assert {:error, %{code: "not_asked"}} =
+             answer(db, {:session, "agent:stranger"}, request.id, "not mine to answer")
+
+    # `rule` and `waive` refuse BY NAME rather than quietly doing something.
+    assert {:error, %{code: "invalid", message: ruled}} =
+             admin_call(db, "rule", %{request: request.id, decision: "allow"})
+
+    assert ruled =~ "answered, not ruled"
+
+    assert {:error, %{code: "invalid", message: waived}} =
+             admin_call(db, "waive", %{request: request.id})
+
+    assert waived =~ "answered, not waived"
+
+    # The answer lands, names its author, and wakes the asker — information, not
+    # a verdict: nothing is consumed and no condition fact is filed.
+    before_facts = fact_count(db)
+
+    assert {:ok, %{decision_request: answered}} =
+             answer(db, {:session, "agent:po"}, request.id, "behind a flag")
+
+    assert answered.status == "answered"
+    assert answered.answer == "behind a flag"
+    assert answered.answered_by == "session:agent:po"
+    assert answered.decision == nil
+    assert answered.consumed_at == nil
+    assert fact_count(db) == before_facts
+
+    assert [reply] = wakes_for(db, "agent:coder")
+    assert reply.prompt =~ "behind a flag"
+    assert reply.class == nil, "the substrate does not elect a class on a mind's behalf"
+
+    # Answered once is answered: a second answer is refused, not overwritten.
+    assert {:error, %{code: "not_open"}} =
+             answer(db, {:session, "agent:po"}, request.id, "changed my mind")
+  end
+
+  test "withdraw is the asker's own lawful exit, and nobody else's", %{db: db} do
+    seed_session(db, "agent:coder", "flynn")
+    seed_session(db, "agent:po", "flynn")
+
+    assert {:ok, %{decision_request: request}} = ask(db, "agent:coder", "agent:po", "which way?")
+
+    # The principal that was ASKED cannot take the question away from the asker.
+    assert {:error, %{code: "not_raiser"}} =
+             withdraw(db, {:session, "agent:po"}, request.id, "not mine")
+
+    assert {:ok, withdrawn} =
+             withdraw(db, {:session, "agent:coder"}, request.id, "worked it out myself")
+
+    assert withdrawn.status == "withdrawn"
+    assert withdrawn.withdrawn_reason == "worked it out myself"
+
+    # A withdrawn question can no longer be answered: the exit is real.
+    assert {:error, %{code: "not_open"}} =
+             answer(db, {:session, "agent:po"}, request.id, "too late")
+  end
+
+  test "the schema refuses every shape the agent arm forbids", %{db: db} do
+    seed_session(db, "agent:coder", "flynn")
+    seed_session(db, "agent:po", "flynn")
+
+    base =
+      "INSERT INTO decision_requests (id, kind, raiserId, raiserSessionKey, ownerUserId, " <>
+        "expecterSessionKey, expecterUserId, raisedAt, deadlineAt, question, context, status"
+
+    forbidden = [
+      # Adjudication vocabulary, one column at a time.
+      {", statuteName) VALUES ('d1','agent','session:agent:coder','agent:coder','flynn'," <>
+         "'agent:po','flynn',1,2,'q','{}','open','deploy-gate')"},
+      {", decision) VALUES ('d2','agent','session:agent:coder','agent:coder','flynn'," <>
+         "'agent:po','flynn',1,2,'q','{}','open','allow')"},
+      {", parkWakeId) VALUES ('d3','agent','session:agent:coder','agent:coder','flynn'," <>
+         "'agent:po','flynn',1,2,'q','{}','open','w_1')"},
+      {", rulingFactId) VALUES ('d4','agent','session:agent:coder','agent:coder','flynn'," <>
+         "'agent:po','flynn',1,2,'q','{}','open',7)"},
+      # `ruled` is not one of this arm's three words.
+      {") VALUES ('d5','agent','session:agent:coder','agent:coder','flynn'," <>
+         "'agent:po','flynn',1,2,'q','{}','ruled')"},
+      # `answered` without an answer, and an answer without an author.
+      {") VALUES ('d6','agent','session:agent:coder','agent:coder','flynn'," <>
+         "'agent:po','flynn',1,2,'q','{}','answered')"},
+      {", answer) VALUES ('d7','agent','session:agent:coder','agent:coder','flynn'," <>
+         "'agent:po','flynn',1,2,'q','{}','answered','yes')"},
+      # `raiserId` must name the asking session, not some other principal.
+      {") VALUES ('d8','agent','user:flynn','agent:coder','flynn'," <>
+         "'agent:po','flynn',1,2,'q','{}','open')"}
+    ]
+
+    for {tail} <- forbidden do
+      assert {:error, %DB.Error{message: message}} = DB.query(db, base <> tail)
+      assert message =~ "CHECK constraint"
+    end
+
+    # And the fence in the other direction: a STATUTE row cannot borrow the
+    # agent arm's columns or its terminal word.
+    assert {:error, %DB.Error{message: fenced}} =
+             DB.query(
+               db,
+               "INSERT INTO decision_requests (id, kind, raiserId, ownerUserId, raisedAt, " <>
+                 "deadlineAt, statuteName, actionKey, question, context, status, answer, " <>
+                 "answeredBy, answeredAt) VALUES ('d9','statute','session:agent:coder','flynn'," <>
+                 "1,2,'deploy-gate','k','q','{}','open','yes','session:agent:po',3)"
+             )
+
+    assert fenced =~ "CHECK constraint"
+  end
+
+  test "a question is visible to its asker, the principal asked, and nobody else", %{db: db} do
+    seed_session(db, "agent:coder", "flynn")
+    seed_session(db, "agent:po", "flynn")
+    seed_session(db, "agent:stranger", "outsider")
+
+    assert {:ok, %{decision_request: request}} = ask(db, "agent:coder", "agent:po", "which way?")
+
+    assert [%{id: id}] = list_requests(db, {:session, "agent:coder"})
+    assert id == request.id
+    assert [%{id: ^id}] = list_requests(db, {:session, "agent:po"})
+    assert [%{id: ^id}] = list_requests(db, {:user, "flynn"})
+    assert list_requests(db, {:session, "agent:stranger"}) == []
+    assert list_requests(db, {:user, "outsider"}) == []
+  end
+
+  ## Seam ④ — `--after` cursors (GitHub #13)
+
+  test "the attests cursor is a (ts, id) keyset that survives a ts collision", %{db: db} do
+    seed_session(db, "agent:coder", "flynn")
+    assignment = open_assignment(db, "agent:coder")
+
+    # THREE attests sharing ONE millisecond. A `ts`-only cursor either repeats
+    # them or drops them; the keyset does neither.
+    ids = for n <- 1..3, do: attest_row(db, assignment.id, "at_#{n}", 5_000)
+    late = attest_row(db, assignment.id, "at_9", 5_001)
+
+    assert {:ok, page} = attests(db, assignment.id, %{})
+    assert Enum.map(page.attests, & &1.id) == ids ++ [late]
+    assert page.has_more_after == false
+    assert page.next_after == late
+
+    assert {:ok, first} = attests(db, assignment.id, %{limit: 2})
+    assert Enum.map(first.attests, & &1.id) == Enum.take(ids, 2)
+    assert first.has_more_after
+    assert first.next_after == Enum.at(ids, 1)
+
+    assert {:ok, second} = attests(db, assignment.id, %{limit: 2, after: first.next_after})
+    assert Enum.map(second.attests, & &1.id) == [Enum.at(ids, 2), late]
+    assert second.has_more_after == false
+
+    # Walking to the end returns an empty page, never a repeat.
+    assert {:ok, past} = attests(db, assignment.id, %{after: late})
+    assert past.attests == []
+    assert past.next_after == nil
+    assert past.has_more_after == false
+  end
+
+  test "an unpaged attests read is byte-identical to what it always returned", %{db: db} do
+    seed_session(db, "agent:coder", "flynn")
+    assignment = open_assignment(db, "agent:coder")
+    for n <- 1..3, do: attest_row(db, assignment.id, "at_#{n}", 5_000 + n)
+
+    assert {:ok, page} = attests(db, assignment.id, %{})
+
+    # NO DEFAULT LIMIT: an audit list that shortens itself silently is the bug
+    # this seam must not ship (Law 2).
+    assert page.attests == Tightbeam.Assignments.list_attests(db, assignment.id)
+    assert length(page.attests) == 3
+  end
+
+  test "an attests cursor from another assignment is not found, exactly like a fake one",
+       %{db: db} do
+    seed_session(db, "agent:coder", "flynn")
+    mine = open_assignment(db, "agent:coder")
+    theirs = open_assignment(db, "agent:coder")
+    attest_row(db, theirs.id, "at_elsewhere", 5_000)
+
+    assert {:error, %{code: "cursor_not_found", message: foreign}} =
+             attests(db, mine.id, %{after: "at_elsewhere"})
+
+    assert {:error, %{code: "cursor_not_found", message: absent}} =
+             attests(db, mine.id, %{after: "at_nonexistent"})
+
+    # Different ids, same SHAPE of answer: the cursor is not a probe for attests
+    # on assignments the caller did not name.
+    assert foreign =~ "unknown attest cursor"
+    assert absent =~ "unknown attest cursor"
+
+    assert {:error, %{code: "invalid"}} = attests(db, mine.id, %{limit: 0})
+  end
+
+  test "the toplines cursor pages the flat roster on a stable order key", %{db: db} do
+    seed_session(db, "agent:coder", "flynn")
+    ids = for n <- 1..4, do: work_item_row(db, "wi_#{n}", 1_000 + n)
+
+    assert {:ok, all} = toplines(db, %{})
+    assert Enum.map(all.items, & &1.id) == ids
+    refute Map.has_key?(all, :next_after), "an unpaged roster answers exactly as it did"
+
+    assert {:ok, first} = toplines(db, %{limit: 2})
+    assert Enum.map(first.items, & &1.id) == Enum.take(ids, 2)
+    assert first.next_after == Enum.at(ids, 1)
+    assert first.has_more_after
+
+    assert {:ok, second} = toplines(db, %{limit: 2, after: first.next_after})
+    assert Enum.map(second.items, & &1.id) == Enum.drop(ids, 2)
+    assert second.has_more_after == false
+
+    # The cursor is compared against the ORDER KEY, not against membership: an
+    # item filtered out of the page still positions the one after it.
+    assert {:ok, filtered} = toplines(db, %{after: Enum.at(ids, 0), state: "open"})
+    assert Enum.map(filtered.items, & &1.id) == Enum.drop(ids, 1)
+  end
+
+  test "toplines refuses a forest page and an unresolvable cursor by name", %{db: db} do
+    seed_session(db, "agent:coder", "flynn")
+    work_item_row(db, "wi_1", 1_000)
+
+    assert {:error, %{code: "invalid", message: forest}} = toplines(db, %{tree: true, limit: 2})
+    assert forest =~ "--tree returns a forest"
+
+    # An unknown id and an id this caller cannot see are ONE answer — the same
+    # rule `--under` follows, and what keeps the cursor from being an oracle.
+    assert {:error, %{code: "not_found", message: unknown}} = toplines(db, %{after: "wi_ghost"})
+    assert unknown =~ "work item not found"
+
+    assert {:error, %{code: "invalid"}} = toplines(db, %{limit: -1})
+    assert {:error, %{code: "invalid"}} = toplines(db, %{after: ""})
+
+    # `topline` bounds its own selection, so a cursor there is refused rather
+    # than accepted and ignored.
+    assert {:error, %{code: "invalid", message: bounded}} =
+             topline(db, %{under: "wi_1", limit: 2})
+
+    assert bounded =~ "selection the caller bounded"
+  end
+
   ## Helpers
 
   defp share_call(db, principal, params) do
@@ -712,6 +1054,121 @@ defmodule Tightbeam.CoordinationFabricTest do
 
   defp principal_origin({:user, id}), do: "user:#{id}"
   defp principal_origin({:session, key}), do: "agent:#{key}"
+
+  # Every seam ③/④ call goes through `Dispatch.dispatch/3` — the chokepoint the
+  # wire router uses — so `Rules.decide` sees these verbs exactly as it sees
+  # every other one, and nothing here is proved against a private function the
+  # product never reaches.
+  defp verb(db, principal, verb, params, target \\ nil) do
+    handlers = Tightbeam.Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
+
+    Tightbeam.Dispatch.dispatch(db, handlers, %{
+      verb: verb,
+      origin: principal_origin(principal),
+      principal: principal,
+      session_key: target,
+      params: params
+    })
+  end
+
+  defp ask(db, asker, asked, question, opts \\ []) do
+    params =
+      %{question: question}
+      |> then(fn p ->
+        case Keyword.get(opts, :assignment_id) do
+          nil -> p
+          id -> Map.put(p, :assignment_id, id)
+        end
+      end)
+
+    verb(db, {:session, asker}, "ask", params, asked)
+  end
+
+  defp answer(db, principal, request_id, text),
+    do: verb(db, principal, "answer", %{request: request_id, answer: text})
+
+  defp withdraw(db, principal, request_id, reason),
+    do: verb(db, principal, "withdraw", %{request: request_id, reason: reason})
+
+  defp attests(db, assignment_id, params),
+    do: verb(db, {:user, "flynn"}, "attests", Map.put(params, :assignment_id, assignment_id))
+
+  defp toplines(db, params), do: verb(db, {:user, "flynn"}, "toplines", params)
+  defp topline(db, params), do: verb(db, {:user, "flynn"}, "topline", params)
+
+  defp list_requests(db, principal) do
+    case verb(db, principal, "decision-requests", %{status: "open"}) do
+      {:ok, %{decision_requests: requests}} -> requests
+      other -> flunk("decision-requests refused: #{inspect(other)}")
+    end
+  end
+
+  defp admin_call(db, name, params) do
+    {:ok, _} =
+      DB.query(db, "INSERT OR IGNORE INTO users (userId, isAdmin, createdAt) VALUES ('root',1,1)")
+
+    verb(db, {:user, "root"}, name, params)
+  end
+
+  defp get_request(db, id) do
+    {:ok, [[status]]} = DB.query(db, "SELECT status FROM decision_requests WHERE id = ?1", [id])
+    %{status: status}
+  end
+
+  defp fact_count(db) do
+    {:ok, [[count]]} = DB.query(db, "SELECT count(*) FROM condition_facts")
+    count
+  end
+
+  defp wakes_for(db, session_key) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT wakeId FROM wakes WHERE sessionKey = ?1 AND state = 'pending' ORDER BY createdAt, wakeId",
+        [session_key]
+      )
+
+    Enum.map(rows, fn [id] -> Wakes.get(db, id) end)
+  end
+
+  defp open_assignment(db, holder_key) do
+    Tightbeam.Assignments.__handle__(db, "assign", %{
+      verb: "assign",
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      session_key: holder_key,
+      target_role: nil,
+      role_fallback: false,
+      supervision_interval_ms: 1_000,
+      params: %{subject: "work"}
+    })
+  end
+
+  defp attest_row(db, assignment_id, id, ts) do
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO attests (id, assignmentId, kind, bySession, ts) VALUES (?1, ?2, 'progress', 'agent:coder', ?3)",
+        [id, assignment_id, ts]
+      )
+
+    id
+  end
+
+  defp work_item_row(db, id, created_at) do
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO work_items (id, title, ownerUserId, state, createdByUser, createdAt,
+                                createdContextKnown)
+        VALUES (?1, ?1, 'flynn', 'open', 'flynn', ?2, 0)
+        """,
+        [id, created_at]
+      )
+
+    id
+  end
 
   defp seed_session(db, session_key, owner) do
     {:ok, _} =
