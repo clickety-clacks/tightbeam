@@ -10,4 +10,12 @@ text = '''
 #include "delegation-card.md"
 
 #include "directive-vocabulary.md"
+
+#include "desk-playbook.md"
+
+#include "dispatch-rules.md"
+
+#include "role-charter.md"
+
+#include "comms-discipline.md"
 '''

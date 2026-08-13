@@ -23,6 +23,19 @@ delegation card; an org that wants different desks rewrites this document throug
 identity seam. What it may not do is silently blur the line the card draws: a desk
 doing off-card work is not a reshaped office, it is an unaccountable session.
 
+## The office is the unit of hiring
+
+A hire creates the office whole — mind and desk together, the desk's card naming its
+principal at creation, the new desk wired to the SPAWNER'S desk at birth. Nobody
+builds the org's nervous system; it grows as a side effect of hiring, because every
+hire arrives already connected: directives flow down the desk graph, summons bubble
+up it. The mechanics — who spawns, in what order, citing what — are the desk
+playbook's; the principle is this convention's: minds decide the hire, desks execute
+it, and a session that arrived without an office arrived without a place in the
+graph. Pairing stays priced, not prescribed (a pool desk or bones-only is still an
+office shape), and desks have no desks — the prodder floor below and the principal
+above are a desk's only guardians.
+
 ## Dissolution and failover
 
 Dissolving an office is a two-verb sequence — REBIND, then revoke — executed by the
@@ -44,7 +57,7 @@ window is named, not hidden:
   delivery and summons only (it cannot hold, judge, or file substance), so the
   worst case is a duplicated digest or summon — an interruption cost, never a
   truth cost, the fabric's own error asymmetry. What ends it: the leftover card is
-  an open obligation in plain rows — the avasarala watermark and effort check-in
+  an open obligation in plain rows — the prodder's watermark and effort check-in
   already watch it, so a crashed dissolution cannot stay quiet past the floor —
   and a desk that reads its role rebound away stands down on its own (see the exec
   guidance: role gone + card standing = the office is dissolving; stop delivering,

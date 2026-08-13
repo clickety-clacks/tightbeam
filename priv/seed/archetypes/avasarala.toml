@@ -1,0 +1,11 @@
+name = "avasarala"
+skills = []
+
+[guidance]
+text = '''
+#include "avasarala.md"
+
+#include "comms-discipline.md"
+
+#include "staffing.md"
+'''

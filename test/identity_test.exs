@@ -39,13 +39,24 @@ defmodule Tightbeam.IdentityTest do
     assert git!(dir, ["ls-tree", "-r", "--name-only", "main"])
            |> String.split("\n", trim: true) ==
              [
+               "archetypes/avasarala.toml",
                "archetypes/default.toml",
                "archetypes/exec.toml",
+               "archetypes/miller.toml",
+               "guidance/altitude-statute.md",
+               "guidance/avasarala.md",
+               "guidance/comms-discipline.md",
                "guidance/delegation-card.md",
+               "guidance/desk-playbook.md",
                "guidance/directive-vocabulary.md",
+               "guidance/dispatch-rules.md",
                "guidance/exec.md",
+               "guidance/inception.md",
+               "guidance/miller.md",
                "guidance/office-convention.md",
-               "guidance/operating-model.md"
+               "guidance/operating-model.md",
+               "guidance/role-charter.md",
+               "guidance/staffing.md"
              ]
 
     snapshot = Identity.snapshot!(ctx.base, "default", :codex)
@@ -84,15 +95,40 @@ defmodule Tightbeam.IdentityTest do
     # A handful of exact, load-bearing phrases — not the whole text, which
     # would make this test as brittle as the thing it exists to catch.
     assert card =~
-             "MAY: read substrate rows; file its own lifecycle attests on its own card and"
+             "MAY: read substrate rows; file its own lifecycle attests on its own card"
 
     assert card =~
-             "batch, schedule, and deliver to its principal within §7's ceilings; summon its"
+             "batch, schedule, and deliver to its principal within §7's ceilings; summon"
 
     assert card =~ "MUST NOT: file verdicts on substance"
-    assert card =~ "accept or reject work; make product judgments; alter"
+    assert card =~ "accept or reject work; make product judgments;"
     assert card =~ ~s(Its only "no" is "later")
-    assert card =~ "the avasarala bounds starvation across its watermark population (§5)"
+    assert card =~ "the prodder bounds starvation across its watermark"
+
+    # Receipt is behavior, never an acknowledgment filing (no-ack law, §6 r5) —
+    # pin the new phrasing and refute the receipt turn it deleted.
+    assert card =~ "directive receipt is proven by BEHAVIOR"
+    assert card =~ "never by an acknowledgment filing"
+    refute card =~ "acknowledge directives there"
+
+    # The r5 additions are §6 verb law too: the D2 spawn clause and the D3
+    # containment compilation are load-bearing the same way the lists are.
+    assert card =~ "DIRECTED EXECUTION of its principal's recorded decision"
+    assert card =~ "hold or RECEIVE\n    implementation cards"
+    assert card =~ "file\n    completions off the delegation card"
+    assert card =~ "spawn uncited"
+  end
+
+  test "the casebook and probe-list templates require evidence citations and hit counts" do
+    avasarala =
+      File.read!(Application.app_dir(:tightbeam, "priv/seed/guidance/avasarala.md"))
+
+    assert avasarala =~ "evidence: <observed row ids — REQUIRED, every entry, kept current>"
+    assert avasarala =~ "hits: <count>, last-hit: <date, row id> — REQUIRED"
+    assert avasarala =~ "The casebook ships EMPTY."
+
+    miller = File.read!(Application.app_dir(:tightbeam, "priv/seed/guidance/miller.md"))
+    assert miller =~ "It ships EMPTY"
   end
 
   test "the office convention's dissolution sequence names REBIND before revoke" do

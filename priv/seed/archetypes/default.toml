@@ -56,4 +56,8 @@ archetype; it starts as `default`. Every learned bundle declares its intended ev
 archetype. A user changes the setting when they deliberately want new bare spawns to use that
 learned root instead of Tightbeam's neutral root. Explain this when relevant, but do not
 proactively offer bundle-root adoption; that behavior is separate.
+
+#include "comms-discipline.md"
+
+#include "staffing.md"
 '''
