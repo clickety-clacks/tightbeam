@@ -214,7 +214,9 @@ defmodule Tightbeam.Productions.Bubble do
         # the alert becomes product surface when a main session exists.
         case DB.Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey = ?1", [main_key]) do
           [["active"]] ->
-            {:appended, marker} = Projection.append_marker_in_txn(txn, main_key, message, :high)
+            {:appended, marker} =
+              Projection.append_substrate_in_txn(txn, main_key, message, :high)
+
             {:ok, marker}
 
           _ ->

@@ -42,11 +42,15 @@ defmodule Tightbeam.SchemaShapeTest do
 
   test "a fresh database is created and stamped", %{db: db} do
     assert :ok = Schema.ensure_all(db)
-    assert {:ok, [["model-identity-v1"]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok, [["model-identity-message-envelope-v2"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
 
     # Idempotent: booting twice is the ordinary case, not a shape change.
     assert :ok = Schema.ensure_all(db)
-    assert {:ok, [["model-identity-v1"]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok, [["model-identity-message-envelope-v2"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
   end
 
   test "the shared liveness activation creates one exact additive shape", %{db: db} do
@@ -228,7 +232,8 @@ defmodule Tightbeam.SchemaShapeTest do
     assert {:ok, ^before_rows} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
     assert {:ok, []} = DB.query(db, "SELECT wakeId FROM wake_cancellations")
 
-    assert {:ok, [["model-identity-v1"]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+    assert {:ok, [["model-identity-message-envelope-v2"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
   end
 
   # The defect this refuses: `CREATE TABLE IF NOT EXISTS` is SILENT about a
@@ -303,14 +308,14 @@ defmodule Tightbeam.SchemaShapeTest do
     assert error.message =~ "other-shape"
   end
 
-  test "a database stamped by a different build is refused, naming both shapes", %{db: db} do
+  test "a database stamped with the nullable marker constraint is refused", %{db: db} do
     :ok = Schema.ensure_all(db)
-    {:ok, _} = DB.query(db, "UPDATE schema_stamp SET shape='some-later-shape'")
+    {:ok, _} = DB.query(db, "UPDATE schema_stamp SET shape='model-identity-message-envelope-v1'")
 
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
-    assert error.message =~ "some-later-shape"
-    assert error.message =~ "model-identity-v1"
+    assert error.message =~ "model-identity-message-envelope-v1"
+    assert error.message =~ "model-identity-message-envelope-v2"
   end
 
   defp table?(db, name) do

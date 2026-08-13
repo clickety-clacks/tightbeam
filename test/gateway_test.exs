@@ -2268,6 +2268,13 @@ defmodule Tightbeam.GatewayTest do
 
     assert tombstone.seq > barrier
     assert tombstone.sender == "process:tightbeam"
+    assert tombstone.message_type == "marker"
+
+    assert tombstone.marker == %{
+             kind: "harness-switch",
+             from: "claude (before-model)",
+             to: "fixture (fixture-model)"
+           }
 
     # It names the change, both ends of it, and that nothing was deleted.
     assert tombstone.content =~ "[engine swap]"
@@ -3257,7 +3264,9 @@ defmodule Tightbeam.GatewayTest do
       |> Projection.list_after("k1", nil, 100)
       |> Enum.find(&String.starts_with?(&1.content || "", "[turn failed]"))
 
-    assert marker, "crash recovery must append the turn-failed marker"
+    assert marker, "crash recovery must append the turn-failed notice"
+    assert marker.message_type == "substrate"
+    assert marker.marker == nil
     assert marker.content =~ "side effects are UNKNOWN, not undone"
     assert marker.content =~ "non-idempotent"
   end
@@ -3881,6 +3890,15 @@ defmodule Tightbeam.GatewayTest do
 
     assert %{harness_session_id: "switched-session", reason: "loaded"} =
              Org.current_pointer(ctx.db, "k1")
+
+    assert %{message_type: "marker", marker: marker_facts} =
+             ctx.db
+             |> Projection.list_after("k1", nil, 100)
+             |> Enum.find(&(&1.message_type == "marker"))
+
+    assert marker_facts.kind == "model-retune"
+    assert marker_facts.from == "fable"
+    assert marker_facts.to == "claude-sonnet-4-6"
   end
 
   test "runtime tune hides unknown, foreign, retired, and process targets behind one refusal",
@@ -6702,6 +6720,10 @@ defmodule Tightbeam.GatewayTest do
 
     marker = Enum.find(frames, &(&1["type"] == "message" and &1["sender"] == "process:tightbeam"))
     assert String.starts_with?(marker["content"], "[context reset]\n")
+    assert marker["messageType"] == "marker"
+    assert marker["marker"]["kind"] == "session-restart"
+    assert marker["marker"]["from"] == "stale-harness-sid"
+    assert is_binary(marker["marker"]["to"])
 
     assert Enum.map(Org.pointer_chain(ctx.db, "k1"), & &1.reason) == ["created", "fallback"]
 
