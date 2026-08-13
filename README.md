@@ -1,14 +1,35 @@
 # Tightbeam
 
-Agent orchestration needs a real machine part—not another layer of ad hoc glue.
-Tightbeam coordinates the vendors’ own harnesses rather than repackaging models
-in a generic shell: Claude runs in Claude Code; Codex runs in Codex.
+**Tightbeam runs an organization of AI agents that works for you.**
 
-It keeps durable, first-party facts about work in one shared source of truth.
-At the substrate layer, it turns guidance into deterministic rails: rules
-enforced across agents and sessions, not left to each model’s inference.
+It is not another agent. Products like OpenClaw and Hermes give you a capable
+individual: one persistent mind that chats, remembers, acts, and improves.
+Tightbeam is the layer such individuals work *inside* — the difference between
+hiring a brilliant freelancer and owning a company. Agents plug in as staff,
+running in their vendors' own harnesses (Claude in Claude Code, Codex in
+Codex), and Tightbeam supplies what turns staff into an institution: durable
+work items, staffing and review across competing model vendors, rules the
+machinery itself enforces, and a paper trail behind every claim.
 
-You RUN tightbeam; you do not depend on it. There is no Hex package.
+You act as the owner, not the operator. File what you want as tickets;
+decisions only an owner can make reach you pre-triaged, even on your phone.
+The organization handles the rest — including, at times, [improving
+itself unasked](https://tightbeam.clawline.chat/watchdog/).
+
+Three properties make that safe to trust:
+
+- **A permanent, attributed ledger.** Every job, hire, message, and claim is
+  recorded with who did it. Any afternoon is reconstructible by query, not
+  memory.
+- **Rules that machines enforce.** Organizational law is not prompt text an
+  agent may weigh; a nonconforming filing is refused, deterministically, with
+  the violated rule named.
+- **Agents run the org; the substrate never does.** The machinery records
+  truth, sends reminders, enforces written law — and decides nothing. Kill any
+  agent, or the whole gateway, and work resumes from the record.
+
+Tightbeam is a standalone service you install and operate, like a database —
+not a library you import into a project.
 
 ## Two ways to install
 
