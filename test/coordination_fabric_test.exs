@@ -1123,6 +1123,50 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert {:error, %{code: "invalid"}} = verb(db, {:user, "owner"}, "digest-members", %{})
   end
 
+  test "O5 follow-up: an orphaned role carrier (no active resolution) stays readable by the role's owner",
+       %{db: db} do
+    # Sol xhigh review, finding 4: a role-addressed carrier built while its
+    # role has NO active resolution (no bound session, and the owner's
+    # personal session does not exist either) stores the synthetic
+    # `role:<name>` placeholder in its own (audit-only) sessionKey column —
+    # gating `digest-members`'s visibility on resolving THAT column made an
+    # orphaned carrier's audit permanently unreachable, even to its own
+    # role's owner. A durable row must have a lawful reader.
+    seed_session(db, "agent:filer", "roleowner")
+    seed_session(db, "agent:stranger2", "outsider2")
+
+    Roles.create!(db, "orphan-role", "roleowner", nil)
+
+    member =
+      Wakes.schedule(db, %{
+        session_key: "agent:filer",
+        target_role: "orphan-role",
+        origin: "agent:sender",
+        creator_session_key: "agent:sender",
+        prompt: "for whoever holds orphan-role",
+        due_at: 0,
+        class: "fyi"
+      })
+
+    at = member.created_at + Wakes.delivery_policy("fyi").ceiling_ms
+    assert [digest_id] = Wakes.materialize_digests(db, at)
+
+    digest = Wakes.get(db, digest_id)
+    assert digest.target_role == "orphan-role"
+    # The synthetic placeholder — confirming this test actually exercises
+    # the orphaned case, not a session that happened to resolve.
+    assert digest.session_key == "role:orphan-role"
+
+    assert {:ok, %{digest_members: members}} =
+             verb(db, {:user, "roleowner"}, "digest-members", %{wake_id: digest_id})
+
+    assert Enum.map(members, & &1.wake_id) == [member.wake_id]
+
+    # A stranger is still refused, identically to any other not-found.
+    assert {:error, %{code: "not_found"}} =
+             verb(db, {:user, "outsider2"}, "digest-members", %{wake_id: digest_id})
+  end
+
   ## Seam ③ — the `input-needed` carrier (GitHub #11)
 
   test "an agent's question and the notification that carries it are one commit", %{db: db} do

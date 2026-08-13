@@ -5088,17 +5088,30 @@ defmodule Tightbeam.Gateway do
   defp decision_request_result(%{code: _} = error), do: error
   defp decision_request_result(request), do: %{decision_request: request}
 
-  defp coordination_share_readable?(db, call, session) do
+  defp coordination_share_readable?(_db, %{principal: {:session, key}}, %{session_key: key}),
+    do: true
+
+  defp coordination_share_readable?(db, call, session),
+    do: owner_readable?(db, call, session.owner_user_id)
+
+  # OWNER-OR-ADMIN over a raw owner id, shared by every read whose visibility
+  # is "the thing's owner, or an admin" — `coordination-share` over a
+  # session's owner, `digest-members` over a role-addressed carrier's role's
+  # owner (below). A `{:session, key}` principal is never the target's OWN
+  # session here (that shortcut is `coordination_share_readable?`'s own
+  # first clause, which has no role analogue — a role is not a session
+  # identity); it must resolve to the same owner some other way.
+  defp owner_readable?(db, call, owner_user_id) do
     case call[:principal] do
-      {:user, id} -> session.owner_user_id == id or admin_origin?(db, call.origin)
-      {:session, key} -> key == session.session_key or owner_of?(db, call.origin, session)
+      {:user, id} -> owner_user_id == id or admin_origin?(db, call.origin)
+      {:session, _key} -> owner_of?(db, call.origin, owner_user_id)
       _ -> false
     end
   end
 
-  defp owner_of?(db, origin, session) do
+  defp owner_of?(db, origin, owner_user_id) do
     case resolve_caller(db, origin) do
-      %{owner_user_id: owner} when is_binary(owner) -> owner == session.owner_user_id
+      %{owner_user_id: owner} when is_binary(owner) -> owner == owner_user_id
       _ -> false
     end
   end
@@ -5106,10 +5119,10 @@ defmodule Tightbeam.Gateway do
   # O5: `digest_members/2` (the C4/acceptance-2 audit — every source wake a
   # digest carries) had no sanctioned surface, a status question answerable
   # from rows that no agent could ask (philosophy gate Q9). Visibility
-  # follows `coordination-share`'s exact rule: the carrier's own target
-  # session's owner, or an admin. An id that is not a pending digest CARRIER
-  # — unknown, a member, an ordinary wake, or a carrier this caller cannot
-  # see — answers identically: `not_found`, never an existence oracle.
+  # follows `coordination-share`'s exact rule: the carrier's own target's
+  # owner, or an admin. An id that is not a pending digest CARRIER —
+  # unknown, a member, an ordinary wake, or a carrier this caller cannot see
+  # — answers identically: `not_found`, never an existence oracle.
   defp digest_members_result(db, call) do
     wake_id = call.params[:wake_id]
 
@@ -5120,19 +5133,37 @@ defmodule Tightbeam.Gateway do
       true ->
         case Wakes.get(db, wake_id) do
           %{digest: true} = wake ->
-            case Org.get(db, wake.session_key) do
-              nil ->
-                digest_members_not_found()
-
-              session ->
-                if coordination_share_readable?(db, call, session),
-                  do: %{digest_members: Wakes.digest_members(db, wake_id)},
-                  else: digest_members_not_found()
-            end
+            if digest_members_readable?(db, call, wake),
+              do: %{digest_members: Wakes.digest_members(db, wake_id)},
+              else: digest_members_not_found()
 
           _ ->
             digest_members_not_found()
         end
+    end
+  end
+
+  # A ROLE-addressed carrier's `sessionKey` is audit-only (O2) — and for a
+  # role with no active resolution, it is the synthetic `role:<name>` string
+  # `Wakes.carrier_shape/2` stores, which names no real session at all. Sol
+  # xhigh review, finding 4: gating visibility on `Org.get/2` of that column
+  # made an ORPHANED role carrier's audit permanently `not_found`, even to
+  # the role's own owner — a durable row with no lawful reader. The ROLE
+  # record (not the session it may or may not currently resolve to) is the
+  # actual source of truth for who may read it, so a role-addressed carrier
+  # checks the ROLE's owner directly; a session-addressed carrier keeps the
+  # exact rule it always had.
+  defp digest_members_readable?(db, call, %{target_role: role}) when is_binary(role) do
+    case Roles.get(db, role) do
+      %{owner_user_id: owner} -> owner_readable?(db, call, owner)
+      nil -> false
+    end
+  end
+
+  defp digest_members_readable?(db, call, wake) do
+    case Org.get(db, wake.session_key) do
+      nil -> false
+      session -> coordination_share_readable?(db, call, session)
     end
   end
 
