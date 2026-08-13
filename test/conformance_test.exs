@@ -3624,8 +3624,9 @@ defmodule Tightbeam.ConformanceTest do
       )
     end)
 
-    # 52 since C4/holder-verdict-wins joined the corpus (fabric §13 Phase 0).
-    assert Enum.count(entries, &(&1.scope == "fixture")) == 52
+    # 52 since C4/holder-verdict-wins joined the corpus (fabric §13 Phase 0); 53
+    # since C4/reopen-assignment-repair joined it (Sol xhigh review, finding 4).
+    assert Enum.count(entries, &(&1.scope == "fixture")) == 53
 
     assert %{
              scope: "case",
