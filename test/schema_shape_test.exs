@@ -512,6 +512,193 @@ defmodule Tightbeam.SchemaShapeTest do
     refute ddl =~ "deadlineAt IS NULL"
   end
 
+  # Sol xhigh review round 3, item 2: the rebase merges wave 1 (main,
+  # `coordination-fabric-classes-v2` as of `eeb5be4`) and wave 2 (this branch,
+  # `coordination-fabric-v1-phase1-v2` as of `c555dda`) onto one line under a
+  # brand-new stamp. Both parents' LATEST pre-merge vintage — not just the
+  # oldest — must refuse by name too, or a database someone actually ran
+  # between the two rounds of review boots silently against the merged build.
+  # `wakes` reconstructed byte-for-byte from `git show
+  # eeb5be4:lib/tightbeam/wakes.ex` (already carrying `'batcher'`, so this is
+  # NOT the same shape the classes-v1 test above proves).
+  test "a coordination-fabric-classes-v2 database is refused by name, never a raw error",
+       %{db: db} do
+    :ok =
+      DB.execute(db, """
+      CREATE TABLE schema_stamp (
+        shape     TEXT PRIMARY KEY,
+        stampedAt INTEGER NOT NULL
+      );
+      INSERT INTO schema_stamp (shape, stampedAt) VALUES ('coordination-fabric-classes-v2', 1);
+      CREATE TABLE wakes (
+        wakeId     TEXT PRIMARY KEY,
+        sessionKey TEXT NOT NULL,
+        targetRole TEXT,
+        origin     TEXT NOT NULL,
+        prompt     TEXT,
+        consumer   TEXT NOT NULL DEFAULT 'prompt',
+        dueAt      INTEGER NOT NULL,
+        state      TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','fired','canceled')),
+        createdAt  INTEGER NOT NULL,
+        firedAt    INTEGER,
+        reresolve  TEXT NULL CHECK (reresolve IN ('lineage')),
+        reresolveSeed TEXT NULL,
+        reresolveRung INTEGER NULL,
+        conditionKind TEXT NULL,
+        conditionScope TEXT NULL,
+        conditionAfterId INTEGER NULL,
+        firedBy TEXT NULL CHECK (firedBy IN ('condition','fallback')),
+        creatorSessionKey TEXT NULL,
+        rumination INTEGER NOT NULL DEFAULT 0,
+        work_item_id TEXT,
+        assignmentId TEXT,
+        canceledAt INTEGER,
+        targetGate INTEGER NOT NULL DEFAULT 1,
+        class TEXT,
+        classElection TEXT CHECK (classElection IN ('sender','classifier','batcher')),
+        deliveryRule TEXT,
+        digest INTEGER NOT NULL DEFAULT 0 CHECK (digest IN (0,1)),
+        summon INTEGER NOT NULL DEFAULT 0 CHECK (summon IN (0,1)),
+        CHECK (consumer != 'prompt' OR prompt IS NOT NULL),
+        CHECK ((class IS NULL) = (classElection IS NULL)),
+        CHECK (digest = 0 OR class IS NOT NULL)
+      );
+      """)
+
+    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
+
+    assert error.message =~ "coordination-fabric-classes-v2"
+    assert error.message =~ "coordination-fabric-v1-phase1-v3"
+    assert error.message =~ "no migration"
+
+    # It REFUSED — the merged build's decision_requests columns were never
+    # even attempted against this database.
+    refute table?(db, "decision_requests")
+
+    assert {:ok, [[ddl]]} =
+             DB.query(
+               db,
+               "SELECT sql FROM sqlite_master WHERE type='table' AND name='wakes'"
+             )
+
+    assert ddl =~ "classElection IN ('sender','classifier','batcher')"
+  end
+
+  # The branch's LATEST pre-merge vintage. `decision_requests` reconstructed
+  # byte-for-byte from `git show b2b81df:lib/tightbeam/escalation.ex`
+  # (`c555dda`'s content post-rebase) — nullable `deadlineAt`, with the
+  # explicit per-arm `IS NOT NULL`/`IS NULL` clauses round 2 added.
+  test "a coordination-fabric-v1-phase1-v2 database is refused by name, never a raw error",
+       %{db: db} do
+    :ok =
+      DB.execute(db, """
+      CREATE TABLE schema_stamp (
+        shape     TEXT PRIMARY KEY,
+        stampedAt INTEGER NOT NULL
+      );
+      INSERT INTO schema_stamp (shape, stampedAt) VALUES ('coordination-fabric-v1-phase1-v2', 1);
+      CREATE TABLE IF NOT EXISTS decision_requests (
+        id                TEXT PRIMARY KEY,
+        kind              TEXT NOT NULL DEFAULT 'statute' CHECK (kind IN ('statute','effort','agent')),
+        raiserId          TEXT NOT NULL,
+        raiserSessionKey  TEXT,
+        ownerUserId       TEXT NOT NULL,
+        assignmentId      TEXT,
+        expecterSessionKey TEXT,
+        expecterUserId    TEXT,
+        lineageRung       INTEGER,
+        effortGeneration  INTEGER,
+        deadlineWakeId    TEXT,
+        raisedAt          INTEGER NOT NULL,
+        deadlineAt        INTEGER,
+        statuteName       TEXT,
+        actionKey         TEXT,
+        question          TEXT NOT NULL,
+        options           TEXT,
+        context           TEXT NOT NULL,
+        status            TEXT NOT NULL CHECK (status IN ('open','ruled','consumed','withdrawn','superseded','answered')),
+        decision          TEXT,
+        rationale         TEXT,
+        ruledBy           TEXT,
+        ruledAt           INTEGER,
+        rulingFactId      INTEGER,
+        consumedAt        INTEGER,
+        parkWakeId        TEXT,
+        withdrawnBy       TEXT,
+        withdrawnReason   TEXT,
+        withdrawnAt       INTEGER,
+        askedOfRole       TEXT,
+        answer            TEXT,
+        answeredBy        TEXT,
+        answeredAt        INTEGER,
+        CHECK (
+          (kind = 'statute' AND statuteName IS NOT NULL AND actionKey IS NOT NULL
+           AND expecterSessionKey IS NULL AND expecterUserId IS NULL
+           AND lineageRung IS NULL AND effortGeneration IS NULL AND deadlineWakeId IS NULL
+           AND deadlineAt IS NOT NULL
+           AND (decision IS NULL OR decision IN ('allow','deny','waived')))
+          OR
+          (kind = 'effort' AND raiserId = 'process:tightbeam'
+           AND raiserSessionKey IS NULL
+           AND statuteName IS NULL AND actionKey IS NULL AND assignmentId IS NOT NULL
+           AND ((expecterSessionKey IS NOT NULL) != (expecterUserId IS NOT NULL))
+           AND lineageRung IS NOT NULL AND effortGeneration IS NOT NULL AND deadlineWakeId IS NOT NULL
+           AND deadlineAt IS NOT NULL
+           AND (decision IS NULL OR decision IN ('continue','dismiss')))
+          OR
+          (kind = 'agent'
+           AND raiserSessionKey IS NOT NULL AND raiserId = 'session:' || raiserSessionKey
+           AND expecterSessionKey IS NOT NULL AND expecterUserId IS NOT NULL
+           AND statuteName IS NULL AND actionKey IS NULL
+           AND decision IS NULL AND rationale IS NULL
+           AND ruledBy IS NULL AND ruledAt IS NULL AND rulingFactId IS NULL
+           AND consumedAt IS NULL AND parkWakeId IS NULL
+           AND lineageRung IS NULL AND effortGeneration IS NULL AND deadlineWakeId IS NULL
+           AND deadlineAt IS NULL
+           AND options IS NULL
+           AND status IN ('open','answered','withdrawn')
+           AND (status = 'answered') = (answer IS NOT NULL)
+           AND (answer IS NULL) = (answeredBy IS NULL)
+           AND (answer IS NULL) = (answeredAt IS NULL))
+        ),
+        CHECK (kind = 'agent' OR (askedOfRole IS NULL AND answer IS NULL AND
+                                  answeredBy IS NULL AND answeredAt IS NULL AND
+                                  status <> 'answered'))
+      );
+      CREATE INDEX IF NOT EXISTS decision_requests_owner
+        ON decision_requests (ownerUserId, status);
+      CREATE INDEX IF NOT EXISTS decision_requests_key
+        ON decision_requests (raiserId, statuteName, actionKey);
+      CREATE UNIQUE INDEX IF NOT EXISTS decision_requests_one_open
+        ON decision_requests (raiserId, statuteName, actionKey)
+        WHERE kind = 'statute' AND status = 'open';
+      CREATE UNIQUE INDEX IF NOT EXISTS decision_requests_effort_generation
+        ON decision_requests (assignmentId, effortGeneration) WHERE kind = 'effort';
+      CREATE INDEX IF NOT EXISTS decision_requests_asked
+        ON decision_requests (expecterSessionKey, status) WHERE kind = 'agent';
+      """)
+
+    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
+
+    assert error.message =~ "coordination-fabric-v1-phase1-v2"
+    assert error.message =~ "coordination-fabric-v1-phase1-v3"
+    assert error.message =~ "no migration"
+
+    # It REFUSED — the merged build's wakes class/delivery columns were never
+    # even attempted against this database.
+    refute table?(db, "wakes")
+
+    assert {:ok, [[ddl]]} =
+             DB.query(
+               db,
+               "SELECT sql FROM sqlite_master WHERE type='table' AND name='decision_requests'"
+             )
+
+    assert ddl =~ "deadlineAt        INTEGER,"
+    assert ddl =~ "deadlineAt IS NOT NULL"
+    assert ddl =~ "deadlineAt IS NULL"
+  end
+
   defp table?(db, name) do
     {:ok, rows} =
       DB.query(db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1", [name])
