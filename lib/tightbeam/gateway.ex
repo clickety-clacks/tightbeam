@@ -957,6 +957,17 @@ defmodule Tightbeam.Gateway do
           Map.put(call, :on_assignment_change, assignment_change)
         )
       end,
+      "reopen-assignment" => fn call ->
+        Assignments.__handle__(
+          db,
+          "reopen-assignment",
+          call
+          |> Map.put(:on_assignment_change, assignment_change)
+          # A reopened card is armed exactly like a freshly assigned one, so it
+          # needs the same supervision interval `assign` and `dispatch` get.
+          |> Map.put(:supervision_interval_ms, Map.fetch!(config, :wake_tick_ms))
+        )
+      end,
       "assignments" => fn call -> Assignments.__handle__(db, "assignments", call) end,
       "inspect" => fn call -> inspect_result(config, db, call) end,
       "cancel" => fn call -> cancel_result(db, call) end,

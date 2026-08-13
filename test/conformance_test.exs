@@ -497,6 +497,9 @@ defmodule Tightbeam.ConformanceSupport do
       {"C4", _, "declared-files-overlap"} ->
         run_handler_refusal_fixture(fixture)
 
+      {"C4", _, "reopen-assignment-repair"} ->
+        run_reopen_assignment_fixture(fixture)
+
       {"C4", _, _} ->
         run_rules_fixture(fixture)
 
@@ -922,6 +925,119 @@ defmodule Tightbeam.ConformanceSupport do
   end
 
   defp assert_overlap_observation(_fixture, _db, _call, _overlap?), do: :ok
+
+  # `reopen-assignment`'s own conformance exercise (Sol xhigh review, finding
+  # 4). `holder-verdict-wins` calls only `attest`; this fixture routes
+  # `reopen-assignment` itself through `Dispatch.dispatch/3` — the same
+  # chokepoint the wire router uses, which is also what puts the verb through
+  # `Rules.decide`. The case named `earlier-verdict-round-displaces-…`
+  # additionally proves the repair itself, not just the reopen, by re-filing a
+  # verdict and re-checking the producer's completion against the fixture's
+  # own rule.
+  def run_reopen_assignment_fixture(fixture) do
+    Enum.each(fixture["cases"], fn kase ->
+      {db, pid} = memory_db!()
+
+      try do
+        ids = materialize_world(db, Map.get(kase, "world", %{}))
+        call = build_call(kase["call"], ids)
+        handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
+        assignment_id = call.params[:assignment_id]
+
+        before_row = reopen_fixture_row(db, assignment_id)
+        before_reopenings = reopen_fixture_count(db, assignment_id)
+
+        result = Dispatch.dispatch(db, handlers, call)
+
+        case kase["expect"] do
+          "refuse" ->
+            assert {:error, %{code: code}} = result
+            assert code == kase["reason"]
+            assert reopen_fixture_row(db, assignment_id) == before_row
+            assert reopen_fixture_count(db, assignment_id) == before_reopenings
+
+          "pass" ->
+            assert {:ok, reopened} = result
+            assert reopened.state == "open"
+            assert reopen_fixture_count(db, assignment_id) == before_reopenings + 1
+
+            if kase["case"] ==
+                 "earlier-verdict-round-displaces-later-verdictless-round-when-reopened" do
+              verify_reopen_repairs_displacement!(fixture, db, handlers, ids)
+            end
+        end
+      after
+        GenServer.stop(pid)
+      end
+    end)
+  end
+
+  defp reopen_fixture_row(db, assignment_id) do
+    {:ok, [row]} =
+      DB.query(
+        db,
+        "SELECT state, outcome, closedAt, closedByUser, closedBySession, closingAttestId " <>
+          "FROM assignments WHERE id = ?1",
+        [assignment_id]
+      )
+
+    row
+  end
+
+  defp reopen_fixture_count(db, assignment_id) do
+    {:ok, [[count]]} =
+      DB.query(db, "SELECT count(*) FROM assignment_reopenings WHERE assignmentId = ?1", [
+        assignment_id
+      ])
+
+    count
+  end
+
+  # THE REPAIR, proven end to end: r1 — the round `reopen-assignment` just
+  # reopened — files the corrected verdict, and the producer's completion,
+  # which the fixture's own rule denies without a qualifying `reviewed-clean`,
+  # is checked against BOTH the raw `qualifying_review_verdict_kinds` read and
+  # a real `Dispatch.dispatch/3` attest call gated by that rule. r2 (later,
+  # verdictless, closed) sits in the world throughout and never qualifies.
+  defp verify_reopen_repairs_displacement!(fixture, db, handlers, ids) do
+    producer_id = ids.assignments["a"]
+    r1_id = ids.assignments["r1"]
+
+    verdict_call = %{
+      verb: "attest",
+      origin: "agent:reviewer",
+      principal: {:session, "reviewer"},
+      session_key: nil,
+      params: %{assignment_id: r1_id, kind: "verdict", verdict_kind: "reviewed-clean"}
+    }
+
+    assert {:ok, %{attest: %{verdictKind: "reviewed-clean"}}} =
+             Dispatch.dispatch(db, handlers, verdict_call)
+
+    assert Assignments.qualifying_review_verdict_kinds(db, producer_id, "holder") == [
+             "reviewed-clean"
+           ]
+
+    base = temp_dir!("conformance-reopen-repair")
+    prepare_rule_base!(base, fixture)
+    Rules.load!(base, Map.keys(handlers))
+
+    try do
+      completion_call = %{
+        verb: "attest",
+        origin: "agent:holder",
+        principal: {:session, "holder"},
+        session_key: nil,
+        params: %{assignment_id: producer_id, kind: "completion"}
+      }
+
+      assert {:ok, %{assignment: %{state: "closed"}}} =
+               Dispatch.dispatch(db, handlers, completion_call)
+    after
+      File.rm_rf!(base)
+      :persistent_term.erase(Rules)
+    end
+  end
 
   def run_load_assert(loadset) do
     base = temp_dir!("conformance-load")
@@ -3445,12 +3561,23 @@ defmodule Tightbeam.ConformanceTest do
     # Deleting adjudication (2026-08-05) removed one more: C7's
     # adjudication-hold-order, whose whole subject was a hold freezing the
     # turn-end shift. The shift itself is unchanged minus that first slot.
-    assert length(@fixtures) == 64
-    assert active_fixtures == 54
+    #
+    # Fabric §13 Phase 0 (2026-08-13) adds one: C4's holder-verdict-wins, which
+    # pins review-round selection against the wi_1b0237fe wedge class. It is a
+    # pending C4 dispatch-rule fixture with its own cases, so it lands in the
+    # active and activated counts, not in the exact-mechanism skips.
+    #
+    # Sol xhigh review, finding 4 (2026-08-13) adds a second: C4's
+    # reopen-assignment-repair, which routes `reopen-assignment` itself
+    # through the dispatch chokepoint (holder-verdict-wins only ever calls
+    # `attest`) and exercises the defining displacement shape. It is also a
+    # pending C4 fixture with its own named runner clause, not a catch-all.
+    assert length(@fixtures) == 66
+    assert active_fixtures == 56
     assert exact_skips == 10
-    assert activated_fixture_tests == 41
+    assert activated_fixture_tests == 43
     assert activated_class_tests == 5
-    assert activated_tests == 46
+    assert activated_tests == 48
   end
 
   # The structural guard for the defect this file used to carry: a catch-all clause
@@ -3497,7 +3624,9 @@ defmodule Tightbeam.ConformanceTest do
       )
     end)
 
-    assert Enum.count(entries, &(&1.scope == "fixture")) == 51
+    # 52 since C4/holder-verdict-wins joined the corpus (fabric §13 Phase 0); 53
+    # since C4/reopen-assignment-repair joined it (Sol xhigh review, finding 4).
+    assert Enum.count(entries, &(&1.scope == "fixture")) == 53
 
     assert %{
              scope: "case",

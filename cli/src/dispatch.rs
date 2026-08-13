@@ -366,6 +366,19 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             vec![],
             vec![string_field("assignmentId", assignment_id)],
         )),
+        Command::ReopenAssignment {
+            identity,
+            assignment_id,
+            reason,
+        } => Ok(request(
+            identity,
+            "reopen-assignment",
+            vec![],
+            vec![
+                string_field("assignmentId", assignment_id),
+                string_field("reason", reason),
+            ],
+        )),
         Command::WorkItemCreate {
             identity,
             title,
@@ -1302,6 +1315,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::EffortRule { identity, .. }
         | Command::DecisionRequests { identity, .. }
         | Command::RevokeAssignment { identity, .. }
+        | Command::ReopenAssignment { identity, .. }
         | Command::WorkItemCreate { identity, .. }
         | Command::WorkItemGet { identity, .. }
         | Command::WorkItemTrace { identity, .. }
@@ -1772,6 +1786,17 @@ mod tests {
         assert_eq!(
             body(&["revoke-assignment", "asg_1", "--as", "parent",]),
             r#"{"as":"parent","verb":"revoke-assignment","params":{"assignmentId":"asg_1"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "reopen-assignment",
+                "asg_1",
+                "--reason",
+                "the verdict this card owes was wrong",
+                "--as",
+                "parent",
+            ]),
+            r#"{"as":"parent","verb":"reopen-assignment","params":{"assignmentId":"asg_1","reason":"the verdict this card owes was wrong"}}"#
         );
         assert_eq!(
             body(&[

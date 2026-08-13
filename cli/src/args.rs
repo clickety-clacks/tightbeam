@@ -129,6 +129,11 @@ pub enum Command {
         identity: Identity,
         assignment_id: String,
     },
+    ReopenAssignment {
+        identity: Identity,
+        assignment_id: String,
+        reason: String,
+    },
     WorkItemCreate {
         identity: Identity,
         title: String,
@@ -479,6 +484,12 @@ COMMANDS:
       List decision requests visible to your principal.
   revoke-assignment <assignmentId>
       Revoke when the assignment handler already authorizes your principal.
+  reopen-assignment <assignmentId> --reason "..."
+      Move a CLOSED assignment back to open so its holder can file the verdict
+      or lifecycle row the card still owes — the agent-reachable repair for a
+      card that closed carrying the wrong judgment. The prior close is kept on
+      the record. Refuses by name when the card is already open, its holder is
+      retired, its work item is not open, or its files collide.
   attest <assignmentId> --kind progress|completion|surrender|verdict
       [--commit-refs '[{"repo":"host:/abs/path","commit":"<commit>"}]']
          [--verdict <kind>] [--note "..."]
@@ -1179,6 +1190,23 @@ fn parse_with_optional_catalog(
                 assignment_id: parsed.positional[1].clone(),
             })
         }
+        "reopen-assignment" => {
+            if parsed.positional.len() != 2 {
+                return Err(
+                    "usage: tightbeam reopen-assignment <assignmentId> --reason \"...\"".to_owned(),
+                );
+            }
+            let Some(reason) = nonempty(flags, "reason") else {
+                return Err(
+                    "usage: tightbeam reopen-assignment <assignmentId> --reason \"...\"".to_owned(),
+                );
+            };
+            Ok(Command::ReopenAssignment {
+                identity: identity(flags)?,
+                assignment_id: parsed.positional[1].clone(),
+                reason,
+            })
+        }
         "work-item-create" => {
             if parsed.positional.len() != 1 {
                 return Err("usage: tightbeam work-item-create --title <title> [--spec-ref <name> --spec-sha256 <hex>]".to_owned());
@@ -1515,7 +1543,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -2020,6 +2048,7 @@ mod tests {
                 "list",
                 "onboard",
                 "retire",
+                "reopen-assignment",
                 "revoke-assignment",
                 "spawn",
                 "wake",
@@ -2568,11 +2597,46 @@ mod tests {
         }
     }
 
+    // The repair verb names its reason or it does not run: an unexplained
+    // reopen is exactly the unrecorded repair the papertrail exists to prevent.
+    #[test]
+    fn reopen_assignment_requires_an_id_and_a_reason() {
+        for args in [
+            strings(&["reopen-assignment", "--as-user", "flynn"]),
+            strings(&["reopen-assignment", "asg_1", "asg_2", "--as-user", "flynn"]),
+            strings(&["reopen-assignment", "asg_1", "--as-user", "flynn"]),
+        ] {
+            assert_eq!(
+                parse(args),
+                Err(
+                    "usage: tightbeam reopen-assignment <assignmentId> --reason \"...\"".to_owned()
+                )
+            );
+        }
+
+        assert!(matches!(
+            parse(strings(&[
+                "reopen-assignment",
+                "asg_1",
+                "--reason",
+                "stale verdict",
+                "--as-user",
+                "flynn",
+            ]))
+            .unwrap(),
+            Command::ReopenAssignment {
+                assignment_id,
+                reason,
+                ..
+            } if assignment_id == "asg_1" && reason == "stale verdict"
+        ));
+    }
+
     #[test]
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned())
         );
     }
 
