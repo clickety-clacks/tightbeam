@@ -45,6 +45,10 @@ defmodule Tightbeam.Wire.RouterTest do
         send(parent, {:call, call})
         %{sessions: [], wakes: []}
       end,
+      "tune" => fn call ->
+        send(parent, {:call, call})
+        %{ok: false, code: "not_found", message: "session not found"}
+      end,
       "assign" => fn call ->
         send(parent, {:call, call})
         %{id: "asg_test"}
@@ -166,6 +170,100 @@ defmodule Tightbeam.Wire.RouterTest do
                       verb: "identity-status",
                       origin: "user:flynn",
                       params: %{}
+                    }}
+  end
+
+  test "agent tune defers an unknown session key to the gateway privacy seam", ctx do
+    response =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "tune",
+        asUser: "flynn",
+        sessionKey: "unknown-private-target",
+        params: %{setting: "set_model", model: "claude-fable-5"}
+      })
+
+    assert response.status == 404
+
+    assert_receive {:call,
+                    %{
+                      verb: "tune",
+                      origin: "user:flynn",
+                      session_key: "unknown-private-target",
+                      params: %{setting: "set_model", model: "claude-fable-5"}
+                    }}
+
+    assert JSON.decode!(response.resp_body) == %{
+             "error" => %{"code" => "not_found", "message" => "session not found"}
+           }
+  end
+
+  test "agent tune preserves public control keys and structured failure fields", ctx do
+    parent = self()
+
+    handlers =
+      Map.put(ctx.opts[:handlers], "tune", fn call ->
+        send(parent, {:call, call})
+
+        %{
+          ok: false,
+          code: "runtime_config_mismatch",
+          message: "readback differed",
+          model: "gpt-5.6-sol",
+          effort: "high",
+          projection_committed: false,
+          cleanup_status: "unverified",
+          lifecycle_event_id: "le_123",
+          warnings: ["candidate close unverified"]
+        }
+      end)
+
+    ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, handlers)}
+
+    response =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "tune",
+        asUser: "flynn",
+        sessionKey: "live-session",
+        params: %{setting: "set_fast_mode", fastMode: "on"}
+      })
+
+    assert response.status == 400
+
+    assert_receive {:call,
+                    %{
+                      verb: "tune",
+                      session_key: "live-session",
+                      params: %{setting: "set_fast_mode", fastMode: "on"}
+                    }}
+
+    assert JSON.decode!(response.resp_body) == %{
+             "error" => %{
+               "code" => "runtime_config_mismatch",
+               "message" => "readback differed",
+               "model" => "gpt-5.6-sol",
+               "effort" => "high",
+               "projectionCommitted" => false,
+               "cleanupStatus" => "unverified",
+               "lifecycleEventId" => "le_123",
+               "warnings" => ["candidate close unverified"]
+             }
+           }
+
+    effort =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "tune",
+        asUser: "flynn",
+        sessionKey: "live-session",
+        params: %{setting: "set_reasoning", reasoningLevel: "high"}
+      })
+
+    assert effort.status == 400
+
+    assert_receive {:call,
+                    %{
+                      verb: "tune",
+                      session_key: "live-session",
+                      params: %{setting: "set_reasoning", reasoningLevel: "high"}
                     }}
   end
 

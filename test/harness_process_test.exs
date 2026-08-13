@@ -445,6 +445,79 @@ defmodule Tightbeam.HarnessProcessTest do
     assert row.process_group_id > 0
   end
 
+  test "proven-dead settlement resolves the captured missing-identity rows and is inert when repeated",
+       ctx do
+    fixture_path =
+      Path.expand("fixtures/harness_process/dead_missing_identity_repair.json", __DIR__)
+
+    rows = fixture_path |> File.read!() |> JSON.decode!()
+    prior_identity_wait = Application.get_env(:tightbeam, :harness_process_identity_wait_ms)
+    Application.put_env(:tightbeam, :harness_process_identity_wait_ms, 0)
+
+    on_exit(fn ->
+      if prior_identity_wait,
+        do:
+          Application.put_env(
+            :tightbeam,
+            :harness_process_identity_wait_ms,
+            prior_identity_wait
+          ),
+        else: Application.delete_env(:tightbeam, :harness_process_identity_wait_ms)
+    end)
+
+    for fixture <- rows do
+      [harness, preset, host] = String.split(fixture["adapter_key"], ~r/[:@]/)
+      key = {String.to_existing_atom(harness), preset, host}
+      identity_path = Path.join(ctx.test_dir, fixture["launch_id"] <> ".identity")
+
+      {:ok, _} =
+        DB.query(
+          ctx.db,
+          """
+          INSERT INTO harness_processes
+            (launchId, adapterKey, harness, preset, host, helperPath, identityPath,
+             launchSequence, osPid, state, createdAt, killAttemptedAt, lastError)
+          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'kill_failed', 1, ?10,
+                  'identity material unavailable')
+          """,
+          [
+            fixture["launch_id"],
+            fixture["adapter_key"],
+            harness,
+            preset,
+            host,
+            @helper,
+            identity_path,
+            fixture["launch_sequence"],
+            fixture["recorded_pid"],
+            fixture["kill_attempted_at"]
+          ]
+        )
+
+      assert :ok = HarnessProcess.settle_proven_dead(ctx.db, key)
+      assert :already_resolved = HarnessProcess.settle_proven_dead(ctx.db, key)
+      refute HarnessProcess.fenced?(ctx.db, key)
+
+      resolved = Enum.find(HarnessProcess.list(ctx.db), &(&1.launch_id == fixture["launch_id"]))
+      assert resolved.state == fixture["repaired_state"]
+      assert resolved.os_pid == fixture["recorded_pid"]
+      assert resolved.kill_attempted_at == fixture["kill_attempted_at"]
+      assert resolved.kill_sent_at == fixture["kill_sent_at"]
+      assert is_integer(resolved.resolved_at)
+      assert resolved.last_error =~ "identity_unavailable"
+
+      assert [event] =
+               Enum.filter(EventLog.lifecycle_events(ctx.db), fn event ->
+                 event.kind == "harness_cleanup_failed" and
+                   event.subject == fixture["adapter_key"]
+               end)
+
+      assert event.detail =~ fixture["launch_id"]
+      assert event.detail =~ "identity_recovery"
+      assert event.detail =~ "identity_unavailable"
+    end
+  end
+
   test "a helper refusal cannot resolve a launch without attempting the group kill", ctx do
     key = {:claude, "shared", "testhost"}
     {_port, row} = launch_stubborn(ctx, key)
@@ -586,12 +659,14 @@ defmodule Tightbeam.HarnessProcessTest do
     assert HarnessProcess.fenced?(ctx.db, key)
   end
 
-  test "a propagated reconciliation failure does not kill coordinator accounting", ctx do
+  test "a proven-dead cleanup refusal records the failure and starts one successor", ctx do
     # The whole schema: a death is now told to the sessions it halted.
     :ok = ensure_all_schemas(ctx.db)
     path = Path.join(ctx.test_dir, "failed-reconcile-adapter.js")
     File.write!(path, @fake_adapter)
     key = {:claude, "shared", "testhost"}
+    owner = self()
+    starts = :atomics.new(1, signed: false)
 
     coordinator =
       start_supervised!(
@@ -599,6 +674,9 @@ defmodule Tightbeam.HarnessProcessTest do
          adapter_sup: ctx.sup,
          adapter_context: fn _ -> [] end,
          adapter_opts: fn _, _ ->
+           attempt = :atomics.add_get(starts, 1, 1)
+           send(owner, {:adapter_started, attempt})
+
            [
              harness: :claude,
              cmd: [System.find_executable("node"), path],
@@ -609,12 +687,13 @@ defmodule Tightbeam.HarnessProcessTest do
              process_helper: @helper
            ]
          end,
-         backoff_base_ms: 60_000,
+         backoff_base_ms: 500,
          db: ctx.db,
          name: :surviving_failed_reconcile_coordinator}
       )
 
     assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+    assert_receive {:adapter_started, 1}
 
     assert eventually(fn ->
              match?([%{state: "running"}], AdapterCoordinator.harness_processes(coordinator))
@@ -635,19 +714,62 @@ defmodule Tightbeam.HarnessProcessTest do
     Process.exit(adapter, :kill)
 
     assert eventually(fn ->
-             Process.alive?(coordinator) and
-               match?(
-                 %{generation: 2, failures: 1, timer: timer} when is_reference(timer),
-                 :sys.get_state(coordinator).adapters[key]
-               )
+             match?(
+               %{generation: 2, pid: nil, timer: timer} when is_reference(timer),
+               :sys.get_state(coordinator).adapters[key]
+             )
            end)
 
-    assert [%{state: "kill_failed", resolved_at: nil}] = HarnessProcess.list(ctx.db)
+    send(coordinator, {:restart_adapter, key, 2})
+    send(coordinator, {:restart_adapter, key, 2})
+
+    checkouts =
+      for _ <- 1..4 do
+        Task.async(fn -> AdapterCoordinator.adapter_for(coordinator, key) end)
+      end
+
+    assert_receive {:adapter_started, 2}, 2_000
+
+    assert [{:ok, successor_pid, 2}] =
+             checkouts
+             |> Enum.map(&Task.await(&1, 2_000))
+             |> Enum.uniq()
+
+    assert Process.alive?(successor_pid)
+    refute_receive {:adapter_started, 3}, 700
+
+    assert eventually(fn ->
+             case :sys.get_state(coordinator).adapters[key] do
+               %{generation: 2, pid: pid} when is_pid(pid) -> Process.alive?(pid)
+               _ -> false
+             end
+           end)
+
+    assert [successor, failed] = HarnessProcess.list(ctx.db)
+    assert successor.state == "running"
+    assert failed.launch_id == launch_id
+    assert failed.state == "exited"
+    assert is_integer(failed.resolved_at)
+    assert failed.last_error =~ "signal_refused"
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM harness_park_fences WHERE adapterKey = ?1",
+               ["claude:shared@testhost"]
+             )
 
     assert Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
-             event.kind == "adapter_reconcile_failed" and
+             event.kind == "harness_cleanup_failed" and
                event.subject == "claude:shared@testhost" and
-               event.detail =~ "kill_failed"
+               event.detail =~ launch_id and
+               event.detail =~ "process_group_kill" and
+               event.detail =~ "signal_refused"
+           end)
+
+    refute Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
+             event.kind == "adapter_reconcile_failed" and
+               event.subject == "claude:shared@testhost"
            end)
   end
 
