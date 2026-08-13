@@ -161,6 +161,9 @@ channels that keep the liveness bracket moving.
 
 ## Work alongside other agents
 Other agents edit at the same time.
+An installed engineering bundle can require a pre-edit base gate. Its always-on
+guidance detects that event, and its elected skill owns the procedure.
+
 - A dirty worktree or a mid-flight branch that is not yours is not yours to stash, reset, or
   clean away, and it is not a blocker to stall on. Reconcile it: identify who or what created
   it, and either ask that owner to clean it up, or, once you have established it is safe to

@@ -1,11 +1,13 @@
 name = "product-owner"
-skills = ["tightbeam-dispatching", "product-discovery", "human-communication"]
+skills = ["tightbeam-dispatching", "base-synchronization", "product-discovery", "human-communication"]
 
 [guidance]
 text = """
 #include "wisdom-core.md"
 
 #include "engineering-tenets.md"
+
+#include "base-synchronization.md"
 
 #include "subtraction.md"
 

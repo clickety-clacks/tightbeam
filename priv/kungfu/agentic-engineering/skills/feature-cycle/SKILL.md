@@ -69,9 +69,11 @@ per-feature, but your attention across features is the scarce resource.
    The `--reviews` link and the verdict by that card's different-session holder are
    what let the substrate compute independence. Harness and provider differences stay
    observable selection evidence; they do not gate completion. A verdict filed
-   without the link is a claim the rows cannot confirm. On `changes-requested`, wake
-   the producer to iterate and have the same reviewer re-file on the same review card
-   until `reviewed-clean`; do not multiply review cards for review rounds.
+   without the link is a claim the rows cannot confirm. A reviewer files one verdict
+   and completes that review assignment. On `changes-requested`, wake the producer to
+   iterate, then open one fresh linked review assignment for the next round under the
+   same selection and independence rules. Keep every closed prior-round card as
+   immutable history; repeat fresh rounds until `reviewed-clean`.
 6. **Spirit review (substantial changes).** A goal is substantial when it produces
    product behavior with no product-owner-gated spec authority behind it —
    behavior an agent or user experiences, an authority moved between homes, or a

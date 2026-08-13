@@ -145,5 +145,6 @@ record contradicts.
 
 Work in a worktree that is yours to write (`worktree-session`) — by default one you
 create in your own workdir, or one the assigning agent hands you for the job (an
-orchestrator passing a worktree down to you) — reconcile with main before building on
-it, and leave no worktree of your own behind when the assignment closes.
+orchestrator passing a worktree down to you). Before each new or review-rework pass,
+follow the always-on `Base synchronization trigger`; leave no worktree of your own
+behind when the assignment closes.

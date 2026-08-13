@@ -24,6 +24,8 @@ description: Commit and push discipline — build before committing, one concern
 
 ## Merging your branch into main
 Merging is a semantic integration problem, not a text-selection problem.
+This final integration event is distinct from the always-on pre-pass base gate; proof
+from one does not satisfy the other.
 1. Merge main into your branch first. Every conflict is resolved on your branch.
 2. Resolve conflicts semantically. Never resolve by wholesale accepting ours, theirs,
    or the newer block. For each conflict, determine what each side contributes — read

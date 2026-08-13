@@ -1,11 +1,13 @@
 name = "coder"
-skills = ["worktree-session", "committing-and-pushing", "human-communication"]
+skills = ["worktree-session", "base-synchronization", "committing-and-pushing", "human-communication"]
 
 [guidance]
 text = """
 #include "wisdom-core.md"
 
 #include "engineering-tenets.md"
+
+#include "base-synchronization.md"
 
 #include "preferred-models.md"
 

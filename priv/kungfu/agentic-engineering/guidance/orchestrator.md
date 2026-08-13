@@ -29,9 +29,11 @@ do not fill it with your own guess.
 `tightbeam dispatch --to <holder> --subject "<what>" --brief "<context + authority +
 definition of done>" --work-item <id>` opens the assignment and wakes the holder in one
 atomic step — the holder comes up with `[assignment: <id>]` and your brief in hand. That
-is the path for a plain card. When the card must declare the files it touches (`--files`)
-or link the review it performs (`--reviews`), those flags live on `assign`, so open it
-with `assign` and then `wake` the holder — the two-step remains for exactly those cards.
+is the path for a plain card. When the card must declare files (`--files`) or link a
+review (`--reviews`), those flags live on `assign`. A source-changing card also needs
+an authorized base declaration after assignment creation and before wake. Use
+`assign`, record the required facts, then `wake` for these three cases; the
+`base-synchronization` skill owns declaration procedure.
 Either way the law is the operating manual's, and you follow it exactly. Beyond the
 mechanics, a card that hands over the task but withholds the context, the authority, and
 a concrete definition of done is dumping, not delegating — the holder stalls or guesses,
