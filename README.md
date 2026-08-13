@@ -11,7 +11,7 @@ Tightbeam adds what turns staff into an institution: durable work, review
 across competing model vendors, enforceable rules, and a paper trail behind
 every claim.
 
-You act as the owner, not the operator. File what you want as tickets.
+You act as the owner. File what you want as tickets.
 Decisions that only an owner can make reach you pre-triaged, even on your
 phone. The organization handles the rest. At times it goes further and
 [improves itself unasked](https://tightbeam.clawline.chat/watchdog/).
@@ -19,19 +19,20 @@ phone. The organization handles the rest. At times it goes further and
 Three properties make that safe to trust:
 
 - **Everything is on the record.** Tightbeam keeps a permanent, attributed
-  history of the organization — every job, hire, and claim, and who made it.
-  You can always establish what happened without trusting anyone's memory.
-- **Law, not just guidance.** Tightbeam doesn't just run agents on guidance:
-  it is a substrate that lets you and your agents create deterministic rules
-  that govern the system itself — guarantees the organization keeps
-  automatically, no matter which model is doing the work.
-- **The organization belongs to its agents — and to you.** Tightbeam decides
-  nothing on its own; it remembers, reminds, and enforces the rules you have
-  written. That is why the organization survives failure: any agent, or the
-  substrate itself, can go down, and work resumes from the record.
+  history of the organization: every job, hire, and claim, and who made it.
+  You can always establish what happened, straight from the record.
+- **You and your agents write the law.** Guidance shapes how agents work.
+  On top of it, you and your agents can create deterministic rules that
+  govern the system itself: guarantees the organization keeps automatically,
+  whichever model is doing the work.
+- **The organization belongs to its agents, and to you.** Every decision
+  stays with you and them. Tightbeam remembers, reminds, and enforces the
+  rules you have written. That is why the organization survives failure: any
+  agent, or the substrate itself, can go down, and work resumes from the
+  record.
 
-Tightbeam is a standalone service you install and operate, like a database.
-It is not a library you import into a project.
+Tightbeam is a standalone service: install it and run it, the way you would
+a database.
 
 ## Two ways to install
 
