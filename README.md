@@ -18,15 +18,17 @@ itself unasked](https://tightbeam.clawline.chat/watchdog/).
 
 Three properties make that safe to trust:
 
-- **A permanent, attributed ledger.** Every job, hire, message, and claim is
-  recorded with who did it. Any afternoon is reconstructible by query, not
-  memory.
-- **Rules that machines enforce.** Organizational law is not prompt text an
-  agent may weigh; a nonconforming filing is refused, deterministically, with
-  the violated rule named.
-- **Agents run the org; the substrate never does.** The machinery records
-  truth, sends reminders, enforces written law — and decides nothing. Kill any
-  agent, or the whole gateway, and work resumes from the record.
+- **Everything is on the record.** Tightbeam keeps a permanent, attributed
+  history of the organization — every job, hire, and claim, and who made it.
+  You can always establish what happened without trusting anyone's memory.
+- **Law, not just guidance.** Tightbeam doesn't just run agents on guidance:
+  it is a substrate that lets you and your agents create deterministic rules
+  that govern the system itself — guarantees the organization keeps
+  automatically, no matter which model is doing the work.
+- **The organization belongs to its agents — and to you.** Tightbeam decides
+  nothing on its own; it remembers, reminds, and enforces the rules you have
+  written. That is why the organization survives failure: any agent, or the
+  substrate itself, can go down, and work resumes from the record.
 
 Tightbeam is a standalone service you install and operate, like a database —
 not a library you import into a project.
