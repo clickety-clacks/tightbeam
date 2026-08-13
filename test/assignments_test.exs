@@ -852,6 +852,42 @@ defmodule Tightbeam.AssignmentsTest do
     assert is_binary(after_close.id)
   end
 
+  test "assignment readback and work-item trace project the same ordered declared files", ctx do
+    paths = [
+      "test/job_trace_test.exs",
+      "lib/tightbeam/assignments.ex",
+      "test/assignments_test.exs"
+    ]
+
+    expected = Enum.sort(paths)
+    item = create_work_item(ctx, "Assignment file projection")
+
+    assignment =
+      assign_call({:user, "flynn"}, "project files", nil, item.id)
+      |> put_in([:params, :files], paths)
+      |> then(&handle(ctx, "assign", &1))
+
+    %{assignments: assignments} =
+      handle(ctx, "assignments", query_call({:user, "flynn"}, "open", "holder"))
+
+    readback = Enum.find(assignments, &(&1.id == assignment.id))
+
+    trace =
+      Tightbeam.WorkItems.__handle__(ctx.db, "work-item-trace", %{
+        verb: "work-item-trace",
+        principal: {:user, "flynn"},
+        origin: "user:flynn",
+        session_key: nil,
+        params: %{work_item_id: item.id}
+      })
+
+    traced = Enum.find(trace.assignments, &(&1.id == assignment.id))
+
+    assert readback.files == expected
+    assert Assignments.declared_files(ctx.db, assignment.id) == expected
+    assert traced.files == expected
+  end
+
   test "verdict attests freeze provenance and project inert producer history columns", ctx do
     assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "verdict stamps"))
 

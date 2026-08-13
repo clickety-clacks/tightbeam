@@ -267,7 +267,10 @@ defmodule Tightbeam.Assignments do
         params
       )
 
-    Enum.map(rows, &assignment/1)
+    Enum.map(rows, fn row ->
+      assignment = assignment(row)
+      Map.put(assignment, :files, declared_files(db, assignment.id))
+    end)
   end
 
   @doc "Return distinct verdict kinds filed against an assignment."
