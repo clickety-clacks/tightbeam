@@ -772,28 +772,33 @@ defmodule Tightbeam.CoordinationFabricTest do
     # obligation throughout and disposed of it by its own choice.
     assert get_request(db, request.id).status == "open"
 
-    # HALF TWO, structural (Sol xhigh review round 2, finding 1). The
-    # enumeration this test used to run — every `status = 'open'` literal
-    # across a fixed file list, checked for a `kind` predicate — had false
-    # negatives no scan can close on its own: a NEW file could gain a reader
-    # invisibly, `status = 'open'` matched only that exact spelling (a
-    # parameterized or assembled predicate evades it), a concatenated literal
-    # is never reconstructed, and the `id = ?`/retirement-sweep exemptions
-    # were bound to string shapes, not to the table. `escalation.ex` now
-    # centralizes EVERY production read and write of `decision_requests`
-    # behind named, kind-classified functions (`@external_reader_kinds`,
-    # documented above `raw_by_id/2`) — so the structural half shrinks to two
-    # checks that are reliable BECAUSE there is nowhere else for a query to
-    # hide, not because this scan is clever:
+    # HALF TWO, structural (Sol xhigh review round 3). Round 2 centralized
+    # every decision_requests reader into escalation.ex behind a hand-DECLARED
+    # name-to-kind map. Sol found four bypasses a declared (not derived) map
+    # cannot close: a new reader added INSIDE escalation.ex with no map entry;
+    # a helper removed with its entry left stale; a helper's SQL widened past
+    # its declared scope with no textual signal; and a new external caller of
+    # an "any"-scoped helper, which has zero literal for any scan to catch.
+    # This closes all four by making the map a CHECKED CLAIM:
     #
     #   (a) no `decision_requests` literal exists anywhere in `lib/` outside
-    #       `escalation.ex` — proved with the same text scan as before, now
-    #       with ZERO allowlist besides that one file.
+    #       `escalation.ex` (unchanged from round 2: ZERO allowlist).
     #
-    #   (b) `escalation.ex`'s own helper inventory, name-to-kind-scope, equals
-    #       a pinned copy — so a new helper, or a scope that silently widens
-    #       from (say) `"statute"` to `"any"`, fails here until it is
-    #       reviewed and this pin is updated by hand.
+    #   (a2) `escalation.ex`'s own inventory is DERIVED from its source — every
+    #        function's true `end`-bounded body (comments stripped, so a
+    #        neighbor's trailing `@doc` cannot bleed in and a mention inside a
+    #        comment cannot fake one in) is checked for the literal, closed
+    #        TRANSITIVELY over local calls so a delegate with no SQL of its
+    #        own (`answer/2` calling `get_raw/2`) still counts — and asserted
+    #        equal to the pinned map's keys.
+    #
+    #   (b) every entry scoped to one kind (or a named pair) must contain ITS
+    #       OWN predicate in its own text — catches widening even when the
+    #       reader itself never moved.
+    #
+    #   (c) every "any"-scoped, non-verb helper's external call sites are
+    #       pinned by {file, enclosing function} — the one thing no literal
+    #       scan can see, because a new caller adds no new SQL text anywhere.
     offenders =
       Path.wildcard("lib/**/*.ex")
       |> Enum.reject(&(&1 == "lib/tightbeam/escalation.ex"))
@@ -807,26 +812,127 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert offenders == [],
            "a decision_requests literal outside escalation.ex: #{inspect(offenders)}"
 
-    assert Tightbeam.Escalation.external_reader_kinds() == %{
-             raw_by_id: "any",
-             raw_by_id_in_txn: "any",
-             raw_by_id_in_txn!: "any",
-             raw_exists_in_txn?: "any",
-             statute_name_for_ruling: "any",
-             effort_open_by_deadline_wake_in_txn: "effort",
-             effort_insert_in_txn: "effort",
-             effort_id_by_generation_in_txn: "effort",
-             effort_supersede_open_in_txn: "effort",
-             effort_update_generation_in_txn: "effort",
-             effort_rule_in_txn: "effort",
-             statute_park_candidate_in_txn: "statute",
-             claim_park_wake_in_txn: "any",
-             open_counts_by_assignment: "statute,effort",
-             decision_trace_rows: "any",
-             wake_link_fragment: "any"
-           },
-           "escalation.ex's external-reader inventory changed; review the new/changed " <>
+    pinned_kinds = %{
+      escalate: "statute",
+      open_episodes: "statute",
+      statute_park_candidate_in_txn: "statute",
+      grant_waiver: "statute",
+      current_request: "statute",
+      file_agent_request: "agent",
+      answer_open: "agent",
+      effort_open_by_deadline_wake_in_txn: "effort",
+      effort_insert_in_txn: "effort",
+      effort_id_by_generation_in_txn: "effort",
+      effort_supersede_open_in_txn: "effort",
+      effort_update_generation_in_txn: "effort",
+      open_counts_by_assignment: "statute,effort",
+      consume: "any",
+      withdraw_for_retired: "any",
+      withdraw_episodes: "any",
+      recover_retired: "any",
+      list: "any",
+      get: "any",
+      effort_rule_in_txn: "any",
+      claim_park_wake_in_txn: "any",
+      decision_trace_rows: "any",
+      wake_link_fragment: "any",
+      raw_exists_in_txn?: "any",
+      statute_name_for_ruling: "any",
+      rule_open: "any",
+      withdraw_open: "any",
+      get_raw: "any",
+      request_in_txn: "any",
+      answer: "agent",
+      ask: "agent",
+      raw_by_id: "any",
+      raw_by_id_in_txn!: "any",
+      resolve: "statute",
+      rule: "any",
+      rule_statute: "any",
+      summon: "statute",
+      waive: "any",
+      withdraw: "any"
+    }
+
+    assert Escalation.helper_kind_inventory() == pinned_kinds,
+           "escalation.ex's decision_requests inventory changed; review the new/changed " <>
              "entry's kind scope and update this pin"
+
+    escalation_slices = function_slices("lib/tightbeam/escalation.ex")
+    {direct, derived} = decision_requests_closure(escalation_slices)
+
+    assert derived == MapSet.new(Map.keys(pinned_kinds)),
+           "derived escalation.ex functions touching decision_requests do not match the pin: " <>
+             "new #{inspect(MapSet.difference(derived, MapSet.new(Map.keys(pinned_kinds))))}, " <>
+             "missing #{inspect(MapSet.difference(MapSet.new(Map.keys(pinned_kinds)), derived))}"
+
+    # (b): every DIRECT entry scoped to a real kind (not "any") must name its
+    # own predicate in its own text. A delegate (in `derived` but not
+    # `direct`) has no text of its own to check — its correctness rides on
+    # the direct entry it calls, which this loop already covers.
+    for {ref, kind} <- pinned_kinds, kind != "any", ref in direct do
+      text = text_for_name(escalation_slices, ref)
+      assert text != "", "#{ref} is pinned #{inspect(kind)} but no matching function was found"
+
+      required =
+        kind
+        |> String.split(",")
+        |> Enum.map(&"'#{&1}'")
+
+      for literal <- required do
+        assert text =~ literal,
+               "#{ref} is pinned #{inspect(kind)} but its own text does not contain #{literal}"
+      end
+    end
+
+    # (c): every "any"-scoped, non-verb helper's external callers are pinned.
+    # The verb surface (`ask`/`answer`/`rule`/`waive`/`withdraw`/`resolve`/
+    # `escalate`/`summon`/`revoke_waiver`) is reached exclusively through
+    # Dispatch/Gateway's own routing tables, proved elsewhere (router
+    # allowlist, dispatch conformance) — not a "helper" another module reaches
+    # on its own initiative, so it is deliberately excluded here.
+    pinned_callers = %{
+      consume: [{"lib/tightbeam/dispatch.ex", "dispatch_through_rail/7"}],
+      withdraw_for_retired: [{"lib/tightbeam/supervision.ex", "handle_cast/2"}],
+      withdraw_episodes: [{"lib/tightbeam/rail_episodes.ex", "handle_call/3"}],
+      recover_retired: [{"lib/tightbeam/boot.ex", "start_link/1"}],
+      list: [{"lib/tightbeam/gateway.ex", "handlers/1"}],
+      get: [{"lib/tightbeam/gateway.ex", "handlers/1"}],
+      effort_rule_in_txn: [{"lib/tightbeam/effort_checkin.ex", "rule_in_txn/7"}],
+      claim_park_wake_in_txn: [{"lib/tightbeam/supervision.ex", "park_escalation/3"}],
+      decision_trace_rows: [{"lib/tightbeam/job_trace.ex", "decision_entries/2"}],
+      wake_link_fragment: [{"lib/tightbeam/job_trace.ex", "wake_entries/3"}],
+      raw_exists_in_txn?: [
+        {"lib/tightbeam/wakes.ex", "validate_source/4"},
+        {"lib/tightbeam/wakes.ex", "validate_disposition/3"}
+      ],
+      statute_name_for_ruling: [{"lib/tightbeam/dispatch.ex", "ruling_statute/2"}],
+      raw_by_id: [{"lib/tightbeam/effort_checkin.ex", "request_row/2"}],
+      raw_by_id_in_txn!: [{"lib/tightbeam/effort_checkin.ex", "request_for_id/2"}]
+    }
+
+    verb_surface =
+      ~w(ask answer rule waive withdraw resolve escalate summon revoke_waiver)a
+
+    any_kind_public =
+      for {ref, "any"} <- pinned_kinds,
+          ref not in verb_surface,
+          public_escalation_function?(ref),
+          into: MapSet.new(),
+          do: ref
+
+    assert any_kind_public == MapSet.new(Map.keys(pinned_callers)),
+           "a public \"any\"-scoped, non-verb helper has no pinned-caller entry (or a pinned " <>
+             "entry names a helper that no longer exists/is no longer \"any\"/public): " <>
+             "new #{inspect(MapSet.difference(any_kind_public, MapSet.new(Map.keys(pinned_callers))))}, " <>
+             "stale #{inspect(MapSet.difference(MapSet.new(Map.keys(pinned_callers)), any_kind_public))}"
+
+    for {ref, expected} <- pinned_callers do
+      found = external_callers(ref)
+
+      assert Enum.sort(found) == Enum.sort(expected),
+             "#{ref}'s external callers changed: found #{inspect(found)}, pinned #{inspect(expected)}"
+    end
   end
 
   # Every double-quoted or triple-quoted string literal in a file's raw
@@ -836,6 +942,139 @@ defmodule Tightbeam.CoordinationFabricTest do
   defp sql_literals(file) do
     Regex.scan(~r/"""(?:(?!""").)*"""|"[^"\n]*"/s, File.read!(file))
     |> List.flatten()
+  end
+
+  # Every top-level `def`/`defp` in `file`, keyed `"name/arity"`, reconstructed
+  # via `Macro.to_string/1` on its OWN AST node — never text sliced "from this
+  # line to the next `def`", which bled a neighbor's `@doc`/comment in (Sol
+  # xhigh review round 3 caught this exact bug in an earlier draft: a
+  # multi-line function head with the body's `do:` on a later line defeated a
+  # same-line one-liner check, and the resulting "search for the next `end`
+  # at this indentation" fell through to end-of-file, silently swallowing
+  # every function after it). The AST already excludes comments by
+  # construction — nothing to strip, nothing left to bleed — and
+  # `Macro.to_string/1` faithfully reconstructs `#{}` interpolation as text
+  # (verified: a heredoc built with `#{@request_columns}` round-trips with
+  # `decision_requests` still readable in the output), so this is accurate
+  # for BOTH concerns the old text-slicing approach traded against each
+  # other. Multiple clauses of the same name/arity are concatenated.
+  defp function_slices(file) do
+    source = File.read!(file)
+    {:ok, ast} = Code.string_to_quoted(source, columns: true)
+    {:defmodule, _, [_, [do: block]]} = ast
+
+    top_level =
+      case block do
+        {:__block__, _, items} -> items
+        single -> [single]
+      end
+
+    top_level
+    |> Enum.filter(fn
+      {kind, _, _} -> kind in [:def, :defp]
+      _ -> false
+    end)
+    |> Enum.map(fn {_kind, _meta, args} = node ->
+      head = hd(args)
+
+      ref =
+        case head do
+          {:when, _, [inner | _]} -> inner
+          other -> other
+        end
+
+      name_arity =
+        case ref do
+          {name, _, cargs} when is_list(cargs) -> "#{name}/#{length(cargs)}"
+          {name, _, nil} -> "#{name}/0"
+        end
+
+      {name_arity, Macro.to_string(node)}
+    end)
+    |> Enum.reduce(%{}, fn {ref, text}, acc ->
+      Map.update(acc, ref, text, &(&1 <> "\n" <> text))
+    end)
+  end
+
+  # `slices` is keyed `"name/arity"`; the pinned map keys are bare atom names
+  # (arity-agnostic, since no name in this inventory is overloaded across
+  # arities). Concatenates every matching arity's text, so an overload would
+  # fail safe (checked against the union) rather than silently picking one.
+  defp text_for_name(slices, name) do
+    slices
+    |> Enum.filter(fn {ref, _text} -> String.starts_with?(ref, "#{name}/") end)
+    |> Enum.map_join("\n", fn {_ref, text} -> text end)
+  end
+
+  # The DIRECT set (own literal text) and its transitive closure over LOCAL
+  # calls (a delegate with no SQL of its own still counts, because it reaches
+  # one that does). `(?<!\.)` excludes qualified calls (`Escalation.foo(`,
+  # `Txn.q(`) — bare names only, which is exactly what a same-module call is.
+  defp decision_requests_closure(slices) do
+    all_refs = slices |> Map.keys() |> MapSet.new()
+
+    call_graph =
+      for {ref, text} <- slices, into: %{} do
+        called_names =
+          Regex.scan(~r/(?<!\.)\b([a-z_][a-zA-Z0-9_]*[?!]?)\(/, text)
+          |> Enum.map(fn [_, name] -> name end)
+          |> MapSet.new()
+
+        called_refs =
+          all_refs
+          |> Enum.filter(fn other ->
+            [name, _arity] = String.split(other, "/")
+            MapSet.member?(called_names, name)
+          end)
+          |> MapSet.new()
+
+        {ref, called_refs}
+      end
+
+    direct =
+      for {ref, text} <- slices, text =~ "decision_requests", into: MapSet.new(), do: ref
+
+    closure =
+      Enum.reduce_while(1..100, direct, fn _, acc ->
+        next =
+          Enum.reduce(call_graph, acc, fn {ref, calls}, acc2 ->
+            if Enum.any?(calls, &MapSet.member?(acc2, &1)),
+              do: MapSet.put(acc2, ref),
+              else: acc2
+          end)
+
+        if MapSet.equal?(next, acc), do: {:halt, acc}, else: {:cont, next}
+      end)
+
+    direct_atoms = for ref <- direct, into: MapSet.new(), do: ref_to_atom(ref)
+    closure_atoms = for ref <- closure, into: MapSet.new(), do: ref_to_atom(ref)
+    {direct_atoms, closure_atoms}
+  end
+
+  defp ref_to_atom(ref) do
+    [name, _arity] = String.split(ref, "/")
+    String.to_atom(name)
+  end
+
+  defp public_escalation_function?(ref) do
+    source = File.read!("lib/tightbeam/escalation.ex")
+    source =~ ~r/^  def #{Regex.escape(Atom.to_string(ref))}[\(,]/m
+  end
+
+  # For `ref` (an escalation.ex function name), every OTHER lib/ file whose
+  # some function's own text calls `Escalation.<ref>(` — {file, enclosing
+  # function} pairs, using the same true-boundary slicing `function_slices/1`
+  # uses, applied to the caller's file this time.
+  defp external_callers(ref) do
+    Path.wildcard("lib/**/*.ex")
+    |> Enum.reject(&(&1 == "lib/tightbeam/escalation.ex"))
+    |> Enum.flat_map(fn file ->
+      slices = function_slices(file)
+
+      for {caller_ref, text} <- slices, text =~ "Escalation.#{ref}(" do
+        {file, caller_ref}
+      end
+    end)
   end
 
   test "the statute gate read cannot be reached by an agent row sharing its raiser",
@@ -898,11 +1137,18 @@ defmodule Tightbeam.CoordinationFabricTest do
   # any row this test (or any test) could file. The honest proof is the query
   # text itself: THE GATE READ still names `kind = 'statute'`, independent of
   # whatever the schema separately guarantees about NULLs.
+  #
+  # Comment-insensitive (Sol xhigh review round 3): a comment MENTIONING the
+  # predicate must never satisfy this on the real SQL's behalf. `function_slices/1`
+  # reconstructs the body from its AST (`Macro.to_string/1`), which excludes
+  # comments by construction — there is no `# kind = 'statute'` comment for
+  # this to accidentally match, because comments are never part of the AST
+  # this reads from at all.
   test "the statute gate read's kind predicate is evidenced in its own query text" do
-    source = File.read!("lib/tightbeam/escalation.ex")
+    slices = function_slices("lib/tightbeam/escalation.ex")
+    gate_read_body = text_for_name(slices, :current_request)
 
-    assert [_, gate_read_body] =
-             Regex.run(~r/defp current_request\(.*?\) do(.*?)\n  end\n/s, source),
+    assert gate_read_body != "",
            "current_request/4 (THE GATE READ) was not found where this test expects it"
 
     assert gate_read_body =~ "kind = 'statute'"

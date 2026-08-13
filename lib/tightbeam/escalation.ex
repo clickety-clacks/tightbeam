@@ -1082,38 +1082,88 @@ defmodule Tightbeam.Escalation do
   # silently widens, fails the test until it is reviewed and the inventory
   # updated by hand.
   #
-  # A prior version of this tripwire scanned production source for the raw SQL
-  # instead, and it had three blind spots at once: a literal assembled from
-  # fragments or built with `#{}` interpolation was invisible to it; a helper
-  # that changed what it selected without changing its name or file location
-  # was invisible to it; and "no reader outside escalation.ex" was never
-  # actually the property it checked, because nothing forced a NEW reader to
-  # land inside this file to begin with. Centralizing removes all three at
-  # once: there is no fragment to assemble because there is no SQL to write
-  # outside this module, and the inventory below is the enumeration, not an
-  # approximation of it.
-  @external_reader_kinds %{
-    raw_by_id: "any",
-    raw_by_id_in_txn: "any",
-    raw_by_id_in_txn!: "any",
+  # A prior version of this tripwire DECLARED this inventory by hand and
+  # scanned production source for the raw SQL outside it. Sol xhigh review
+  # round 3 named four bypasses that survives: a new reader added INSIDE this
+  # file with no map entry; a helper removed with its entry left stale; a
+  # helper's SQL widened past its declared scope with no textual signal; and
+  # a new external caller of an "any"-scoped helper, which has no literal for
+  # any scan to catch. `coordination_fabric_test.exs`'s tripwire now closes
+  # all four by DERIVING this map from source rather than trusting it:
+  #
+  #   (a) every function in this file is enumerated, its OWN text extracted
+  #       by true `end`-boundary (not "until the next `def`", which bleeds a
+  #       neighbor's `@doc` in) with comments stripped, and the set of ones
+  #       whose text names `decision_requests` — closed transitively over
+  #       LOCAL calls, so a delegate with no SQL of its own (`answer/2`
+  #       calling `get_raw/2`) still counts — is asserted equal to this map's
+  #       keys.
+  #   (b) every entry scoped to one kind (or a named pair) must contain ITS
+  #       OWN predicate in its own text.
+  #   (c) every "any"-scoped, non-verb helper's external call sites are
+  #       pinned by {file, enclosing function}.
+  #
+  # So this map is now a CHECKED CLAIM, not a fact anyone has to remember to
+  # keep current — the derivation is the enumeration, not an approximation of
+  # it. It include this module's PRIVATE plumbing too (`get_raw/2`,
+  # `current_request/4`, `rule_open/6`, ...): they can never be called from
+  # outside (Elixir enforces that), but they are still part of what "every
+  # reader lives in escalation.ex" has to mean.
+  @helper_kind_inventory %{
+    # DIRECT: own SQL literal, single-kind or named-pair scope (round-2 (b)
+    # verifies each contains its own predicate).
+    escalate: "statute",
+    open_episodes: "statute",
+    statute_park_candidate_in_txn: "statute",
+    grant_waiver: "statute",
+    current_request: "statute",
+    file_agent_request: "agent",
+    answer_open: "agent",
     effort_open_by_deadline_wake_in_txn: "effort",
     effort_insert_in_txn: "effort",
     effort_id_by_generation_in_txn: "effort",
     effort_supersede_open_in_txn: "effort",
     effort_update_generation_in_txn: "effort",
-    effort_rule_in_txn: "effort",
-    statute_park_candidate_in_txn: "statute",
-    claim_park_wake_in_txn: "any",
     open_counts_by_assignment: "statute,effort",
+    # DIRECT: own SQL literal, unscoped by kind (id-scoped internal plumbing,
+    # a genuinely cross-kind read, or a documented kind-agnostic exit).
+    consume: "any",
+    withdraw_for_retired: "any",
+    withdraw_episodes: "any",
+    recover_retired: "any",
+    list: "any",
+    get: "any",
+    effort_rule_in_txn: "any",
+    claim_park_wake_in_txn: "any",
     decision_trace_rows: "any",
     wake_link_fragment: "any",
     raw_exists_in_txn?: "any",
-    statute_name_for_ruling: "any"
+    statute_name_for_ruling: "any",
+    rule_open: "any",
+    withdraw_open: "any",
+    get_raw: "any",
+    request_in_txn: "any",
+    # DELEGATE: no SQL literal of its own — reaches one of the entries above
+    # by a local call. `answer/2`/`ask/2`/`rule/3`/`waive/3`/`withdraw/2`/
+    # `resolve/3`/`summon/4` are this module's PUBLIC VERB SURFACE, reached
+    # exclusively through Dispatch/Gateway's own routing tables and proved
+    # there by other tests — not "helpers" another module reaches on its own
+    # initiative, so (c)'s pinned-caller treatment does not apply to them.
+    answer: "agent",
+    ask: "agent",
+    raw_by_id: "any",
+    raw_by_id_in_txn!: "any",
+    resolve: "statute",
+    rule: "any",
+    rule_statute: "any",
+    summon: "statute",
+    waive: "any",
+    withdraw: "any"
   }
 
   @doc false
-  @spec external_reader_kinds() :: %{atom() => String.t()}
-  def external_reader_kinds, do: @external_reader_kinds
+  @spec helper_kind_inventory() :: %{atom() => String.t()}
+  def helper_kind_inventory, do: @helper_kind_inventory
 
   @doc """
   ANY KIND, by id alone. The caller is responsible for checking `.kind` before
@@ -1124,15 +1174,6 @@ defmodule Tightbeam.Escalation do
   """
   @spec raw_by_id(DB.server(), String.t() | nil) :: map() | nil
   def raw_by_id(db, id), do: get_raw(db, id)
-
-  @doc "Txn-transactional `raw_by_id/2`, for callers already inside a transaction."
-  @spec raw_by_id_in_txn(Txn.t(), String.t()) :: map() | nil
-  def raw_by_id_in_txn(txn, id) do
-    case Txn.q(txn, "SELECT #{@request_columns} FROM decision_requests WHERE id = ?1", [id]) do
-      [row] -> request_from_row(row)
-      [] -> nil
-    end
-  end
 
   @doc """
   ANY KIND, by id alone, inside a transaction — RAISES if the row is not
