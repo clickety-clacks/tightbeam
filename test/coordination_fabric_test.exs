@@ -10,7 +10,7 @@ defmodule Tightbeam.CoordinationFabricTest do
   """
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Escalation, Wakes}
+  alias Tightbeam.{DB, Escalation, Roles, Wakes}
 
   setup do
     name = :"db_#{System.unique_integer([:positive])}"
@@ -41,6 +41,13 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert %{immediacy: :digest, ceiling_ms: 1_800_000} = Wakes.delivery_policy("input-needed")
     assert %{immediacy: :immediate} = Wakes.delivery_policy("blocker")
     assert %{immediacy: :bypass} = Wakes.delivery_policy("algedonic")
+
+    # O7: neither class is governed by a ceiling at all (§7's "immediate"/
+    # "bypass" rows name no ceiling), so the datum must say so honestly
+    # rather than publish an inert `0` a future policy-extraction pass could
+    # mistake for a real fact.
+    assert Wakes.delivery_policy("blocker").ceiling_ms == nil
+    assert Wakes.delivery_policy("algedonic").ceiling_ms == nil
 
     for class <- Wakes.seed_classes() do
       policy = Wakes.delivery_policy(class)
@@ -480,9 +487,335 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert Enum.map(Wakes.digest_members(db, digest_id), & &1.wake_id) == [member.wake_id]
   end
 
-  test "a forced member-cancellation failure rolls back the whole materialization",
+  test "O2: role-addressed classed wakes digest into a role-carrier that carries targetRole forward",
+       %{db: db} do
+    seed_session(db, "s1", "flynn")
+    Roles.create!(db, "role-x", "flynn", "s1")
+
+    a =
+      Wakes.schedule(db, %{
+        session_key: "s1",
+        target_role: "role-x",
+        origin: "agent:sender",
+        creator_session_key: "agent:sender",
+        prompt: "first for role-x",
+        due_at: 0,
+        class: "fyi"
+      })
+
+    b =
+      Wakes.schedule(db, %{
+        session_key: "s1",
+        target_role: "role-x",
+        origin: "agent:sender",
+        creator_session_key: "agent:sender",
+        prompt: "second for role-x",
+        due_at: 0,
+        class: "fyi"
+      })
+
+    at = b.created_at + Wakes.delivery_policy("fyi").ceiling_ms
+
+    assert [digest_id] = Wakes.materialize_digests(db, at)
+    digest = Wakes.get(db, digest_id)
+
+    assert digest.digest
+    assert digest.target_role == "role-x"
+    assert Enum.map(Wakes.digest_members(db, digest_id), & &1.wake_id) == [a.wake_id, b.wake_id]
+  end
+
+  test "O2: a role rebound inside the ceiling window reaches the new holder, not whoever held it when the members were filed",
+       %{db: db} do
+    seed_session(db, "s1", "flynn")
+    seed_session(db, "s2", "flynn")
+    Roles.create!(db, "role-x", "flynn", "s1")
+
+    test_pid = self()
+    scheduler = :"coordination_fabric_role_scheduler_#{System.unique_integer([:positive])}"
+
+    start_supervised!({
+      Wakes,
+      # A minimal stand-in for the composition root's real `deliver` fn
+      # (org.ex): resolve `target_role` fresh, at delivery time, exactly the
+      # contract the real one honors. This test's job is to prove the
+      # CARRIER exposes `target_role` so that contract even applies to it —
+      # not to re-prove the contract itself.
+      db: db,
+      name: scheduler,
+      tick_ms: 60_000,
+      deliver: fn wake ->
+        case wake.target_role do
+          role when is_binary(role) ->
+            {:ok, session_key, _fallback} = Roles.resolve(db, role)
+            send(test_pid, {:delivered, session_key, wake})
+
+          nil ->
+            send(test_pid, {:delivered, wake.session_key, wake})
+        end
+      end
+    })
+
+    held =
+      Wakes.schedule(db, %{
+        session_key: "s1",
+        target_role: "role-x",
+        origin: "agent:sender",
+        creator_session_key: "agent:sender",
+        prompt: "for whoever holds role-x",
+        due_at: 0,
+        class: "fyi"
+      })
+
+    # Backdate past its own ceiling so the scheduler's real-clock sweep finds
+    # it due the instant it looks — the point under test is WHO receives it,
+    # not when.
+    {:ok, _} =
+      DB.query(db, "UPDATE wakes SET createdAt=1, dueAt=1 WHERE wakeId=?1", [held.wake_id])
+
+    # The role rebinds to a DIFFERENT session BEFORE materialization ever
+    # runs (the scheduler materializes with its own real clock, inside
+    # `fire_due` below, never on a timestamp this test hands it).
+    :ok = Roles.bind(db, "role-x", "s2")
+
+    assert :ok = Wakes.fire_due(scheduler)
+
+    assert_receive {:delivered, "s2", %{target_role: "role-x", digest: true}}, 1_000
+  end
+
+  test "O2: mixed role- and session-addressed traffic for the same principal stays in separate groups",
+       %{db: db} do
+    seed_session(db, "s1", "flynn")
+    Roles.create!(db, "role-y", "flynn", "s1")
+
+    role_member =
+      Wakes.schedule(db, %{
+        session_key: "s1",
+        target_role: "role-y",
+        origin: "agent:sender",
+        creator_session_key: "agent:sender",
+        prompt: "role traffic",
+        due_at: 0,
+        class: "fyi"
+      })
+
+    session_member =
+      Wakes.schedule(db, %{
+        session_key: "s1",
+        origin: "agent:sender",
+        creator_session_key: "agent:sender",
+        prompt: "session traffic",
+        due_at: 0,
+        class: "fyi"
+      })
+
+    at =
+      max(role_member.created_at, session_member.created_at) +
+        Wakes.delivery_policy("fyi").ceiling_ms
+
+    # A role and the session it happens to be bound to right now are
+    # DIFFERENT ADDRESSES — one re-resolves at delivery, the other does not
+    # — so they never share a carrier even though both name "s1" today.
+    assert digest_ids = Wakes.materialize_digests(db, at)
+    assert length(digest_ids) == 2
+
+    digests = Enum.map(digest_ids, &Wakes.get(db, &1))
+    role_digest = Enum.find(digests, &(&1.target_role == "role-y"))
+    session_digest = Enum.find(digests, &is_nil(&1.target_role))
+
+    assert role_digest
+    assert session_digest
+    assert session_digest.session_key == "s1"
+
+    assert Enum.map(Wakes.digest_members(db, role_digest.wake_id), & &1.wake_id) == [
+             role_member.wake_id
+           ]
+
+    assert Enum.map(Wakes.digest_members(db, session_digest.wake_id), & &1.wake_id) == [
+             session_member.wake_id
+           ]
+  end
+
+  test "O4: the carrier inherits the group's linked work when every member agrees on one",
        %{db: db} do
     session = "agent:po"
+    base = System.system_time(:millisecond)
+
+    {:ok, _} =
+      DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('owner', 0, ?1)", [
+        base
+      ])
+
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO work_items (id, title, ownerUserId, state, createdByUser, createdAt)
+        VALUES ('wi_shared', 'shared work', 'owner', 'open', 'owner', ?1)
+        """,
+        [base]
+      )
+
+    a =
+      Wakes.schedule(db, %{
+        session_key: session,
+        origin: "agent:sender",
+        creator_session_key: "agent:sender",
+        prompt: "first",
+        due_at: base,
+        class: "fyi",
+        work_item_id: "wi_shared"
+      })
+
+    b =
+      Wakes.schedule(db, %{
+        session_key: session,
+        origin: "agent:sender",
+        creator_session_key: "agent:sender",
+        prompt: "second",
+        due_at: base,
+        class: "fyi",
+        work_item_id: "wi_shared"
+      })
+
+    at = b.created_at + Wakes.delivery_policy("fyi").ceiling_ms
+    assert [digest_id] = Wakes.materialize_digests(db, at)
+
+    digest = Wakes.get(db, digest_id)
+    assert digest.work_item_id == "wi_shared"
+    assert Enum.map(Wakes.digest_members(db, digest_id), & &1.wake_id) == [a.wake_id, b.wake_id]
+  end
+
+  test "O4: a genuinely mixed-work group's carrier takes the named digest-carrier exemption and claims no work item",
+       %{db: db} do
+    session = "agent:po"
+    base = System.system_time(:millisecond)
+
+    {:ok, _} =
+      DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('owner', 0, ?1)", [
+        base
+      ])
+
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO work_items (id, title, ownerUserId, state, createdByUser, createdAt)
+        VALUES ('wi_x', 'x', 'owner', 'open', 'owner', ?1),
+               ('wi_y', 'y', 'owner', 'open', 'owner', ?1)
+        """,
+        [base]
+      )
+
+    a =
+      Wakes.schedule(db, %{
+        session_key: session,
+        origin: "agent:sender",
+        creator_session_key: "agent:sender",
+        prompt: "first",
+        due_at: base,
+        class: "fyi",
+        work_item_id: "wi_x"
+      })
+
+    b =
+      Wakes.schedule(db, %{
+        session_key: session,
+        origin: "agent:sender",
+        creator_session_key: "agent:sender",
+        prompt: "second",
+        due_at: base,
+        class: "fyi",
+        work_item_id: "wi_y"
+      })
+
+    at = b.created_at + Wakes.delivery_policy("fyi").ceiling_ms
+
+    # No raise, despite neither member's own linked work matching the
+    # other's — the named exemption is what lets an honest, genuinely mixed
+    # group batch at all.
+    assert [digest_id] = Wakes.materialize_digests(db, at)
+    digest = Wakes.get(db, digest_id)
+    refute digest.work_item_id
+    assert Enum.map(Wakes.digest_members(db, digest_id), & &1.wake_id) == [a.wake_id, b.wake_id]
+  end
+
+  test "O4: the digest-carrier exemption is scoped to the batcher's own reserved requester id, nobody else's",
+       %{db: db} do
+    session = "agent:po"
+    base = System.system_time(:millisecond)
+
+    {:ok, _} =
+      DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('owner', 0, ?1)", [
+        base
+      ])
+
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO work_items (id, title, ownerUserId, state, createdByUser, createdAt)
+        VALUES ('wi_a', 'a', 'owner', 'open', 'owner', ?1),
+               ('wi_b', 'b', 'owner', 'open', 'owner', ?1)
+        """,
+        [base]
+      )
+
+    member =
+      Wakes.schedule(db, %{
+        session_key: session,
+        origin: "agent:sender",
+        creator_session_key: "agent:sender",
+        prompt: "m",
+        due_at: base,
+        class: "fyi",
+        work_item_id: "wi_a"
+      })
+
+    carrier =
+      Wakes.schedule(db, %{
+        session_key: session,
+        origin: "process:tightbeam",
+        prompt: "digest carrier",
+        due_at: base,
+        class: "fyi",
+        digest: true,
+        work_item_id: "wi_b"
+      })
+
+    replacement_command = fn requester_id ->
+      %{
+        wake_id: member.wake_id,
+        requester: %{kind: "process", id: requester_id},
+        reason_kind: "superseded",
+        causal_source: %{kind: "wake", id: carrier.wake_id},
+        outcome: %{kind: "replacement", replacement_wake_id: carrier.wake_id}
+      }
+    end
+
+    # A non-batcher requester otherwise authorized for superseded/wake/
+    # replacement (effort-checkin) does NOT get the batcher's exemption — the
+    # work mismatch is refused exactly as it would be for any ordinary
+    # replacement.
+    assert {:ok, false} =
+             DB.transaction(db, fn txn ->
+               Wakes.cancel_in_txn(txn, replacement_command.("tightbeam:effort-checkin"))
+             end)
+
+    assert Wakes.get(db, member.wake_id).state == "pending"
+
+    # The SAME shape, from the batcher's own reserved id, IS exempt.
+    assert {:ok, true} =
+             DB.transaction(db, fn txn ->
+               Wakes.cancel_in_txn(txn, replacement_command.("tightbeam:batcher"))
+             end)
+
+    assert Wakes.get(db, member.wake_id).state == "canceled"
+  end
+
+  test "O4: a forced member-cancellation failure rolls back its own group and does not crash the sweep",
+       %{db: db} do
+    session = "agent:po"
+    healthy_session = "agent:po2"
     base = System.system_time(:millisecond)
 
     {:ok, _} =
@@ -513,23 +846,61 @@ defmodule Tightbeam.CoordinationFabricTest do
         work_item_id: "wi_broken"
       })
 
+    # A second, entirely healthy group — a DIFFERENT session, so a different
+    # (session, class) group under the same materialization sweep.
+    healthy_member = schedule(db, session: healthy_session, class: "fyi", prompt: "unrelated")
+
     # `broken_member`'s own linked work is not open, so the batcher's typed
     # cancellation for it will be refused by `validate_outcome/4` — the ONE
     # failure the all-or-nothing rule exists to catch.
     at = broken_member.created_at + Wakes.delivery_policy("fyi").ceiling_ms
 
-    assert_raise RuntimeError, ~r/incompatible_delivery_policy_v1/, fn ->
-      Wakes.materialize_digests(db, at)
-    end
+    # PER-GROUP ISOLATION (O4): the poisoned group's raise is caught before
+    # it reaches the caller — decimating one group must not decimate the
+    # sweep. The healthy group still materializes in the SAME call.
+    assert [digest_id] = Wakes.materialize_digests(db, at)
+    assert Wakes.get(db, digest_id).session_key == healthy_session
+    assert Enum.map(Wakes.digest_members(db, digest_id), & &1.wake_id) == [healthy_member.wake_id]
 
-    # FULL ROLLBACK: neither member was touched, no carrier exists, and
-    # nothing was logged — the transaction layout's guarantee, demonstrated.
+    # THE POISONED GROUP'S OWN TRANSACTION STILL ROLLS BACK IN FULL: neither
+    # of its members was touched and no carrier exists for it.
     assert Wakes.get(db, ok_member.wake_id).state == "pending"
     assert Wakes.get(db, broken_member.wake_id).state == "pending"
-    assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM wake_cancellations")
-    assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM wakes WHERE digest = 1")
 
-    assert {:ok, [[0]]} =
+    assert {:ok, [[1]]} = DB.query(db, "SELECT count(*) FROM wake_cancellations")
+    assert {:ok, [[1]]} = DB.query(db, "SELECT count(*) FROM wakes WHERE digest = 1")
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               db,
+               "SELECT count(*) FROM lifecycle_events WHERE kind = 'wake_digest_materialized'"
+             )
+
+    # THE NAMED ROW IS THE AGENT-REACHABLE REPAIR SURFACE (philosophy gate
+    # Q3): the poisoned group is visible and identifiable, not merely absent.
+    assert {:ok, [[detail]]} =
+             DB.query(
+               db,
+               "SELECT detail FROM lifecycle_events WHERE kind = 'wake_digest_materialization_failed'"
+             )
+
+    assert detail =~ "incompatible_delivery_policy_v1"
+    assert detail =~ "#{session}/fyi"
+
+    # THE POISONED GROUP RETRIES NEXT TICK (still visible, still bounded) —
+    # calling materialize_digests again reproduces the exact same failure
+    # rather than silently giving up on it.
+    assert Wakes.materialize_digests(db, at) == []
+
+    assert {:ok, [[2]]} =
+             DB.query(
+               db,
+               "SELECT count(*) FROM lifecycle_events WHERE kind = 'wake_digest_materialization_failed'"
+             )
+
+    # The healthy group's own carrier is untouched by the retry — still
+    # exactly the one materialization from before.
+    assert {:ok, [[1]]} =
              DB.query(
                db,
                "SELECT count(*) FROM lifecycle_events WHERE kind = 'wake_digest_materialized'"
@@ -694,6 +1065,41 @@ defmodule Tightbeam.CoordinationFabricTest do
              })
 
     assert unreadable == absent
+  end
+
+  test "O5: the digest-members verb reads for the carrier's owner, refuses a non-carrier, and is not an oracle",
+       %{db: db} do
+    seed_session(db, "agent:po", "owner")
+    seed_session(db, "agent:stranger", "outsider")
+
+    member = schedule(db, session: "agent:po", class: "fyi", prompt: "the build finished")
+    assert [digest_id] = Wakes.materialize_digests(db, member.due_at)
+
+    assert {:ok, %{digest_members: members}} =
+             verb(db, {:user, "owner"}, "digest-members", %{wake_id: digest_id})
+
+    assert Enum.map(members, & &1.wake_id) == [member.wake_id]
+
+    # A caller who cannot see the carrier's session and a wake id naming
+    # nothing at all give the SAME answer — otherwise the read is an
+    # existence oracle over ordinary wakes.
+    assert {:error, %{code: "not_found", message: unreadable}} =
+             verb(db, {:user, "outsider"}, "digest-members", %{wake_id: digest_id})
+
+    assert {:error, %{code: "not_found", message: absent}} =
+             verb(db, {:user, "outsider"}, "digest-members", %{wake_id: "w_does_not_exist"})
+
+    assert unreadable == absent
+
+    # A wake id that resolves but is not itself a digest CARRIER (an
+    # ordinary, non-batched wake) refuses identically — this is a status
+    # question about the C4 audit, not a generic wake lookup.
+    ordinary = schedule(db, session: "agent:po", prompt: "not a digest")
+
+    assert {:error, %{code: "not_found"}} =
+             verb(db, {:user, "owner"}, "digest-members", %{wake_id: ordinary.wake_id})
+
+    assert {:error, %{code: "invalid"}} = verb(db, {:user, "owner"}, "digest-members", %{})
   end
 
   ## Seam ③ — the `input-needed` carrier (GitHub #11)
@@ -2979,9 +3385,14 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert {:error, %{code: "invalid", message: forest}} = toplines(db, %{tree: true, limit: 2})
     assert forest =~ "--tree returns a forest"
 
-    # An unknown id and an id this caller cannot see are ONE answer — the same
-    # rule `--under` follows, and what keeps the cursor from being an oracle.
-    assert {:error, %{code: "not_found", message: unknown}} = toplines(db, %{after: "wi_ghost"})
+    # An unknown id and an id this caller cannot see are ONE answer — the
+    # cursor is resolved against the visible item map, so a stranger's id and
+    # a nonexistent one land here identically. O3: `cursor_not_found`, unified
+    # with `attests`/`transcript`'s cursor refusals, what keeps the cursor
+    # from being an oracle.
+    assert {:error, %{code: "cursor_not_found", message: unknown}} =
+             toplines(db, %{after: "wi_ghost"})
+
     assert unknown =~ "work item not found"
 
     assert {:error, %{code: "invalid"}} = toplines(db, %{limit: -1})

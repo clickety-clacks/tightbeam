@@ -320,6 +320,144 @@ defmodule Tightbeam.WakesTest do
     assert states[replacement.wake_id] == {"pending", 2}
   end
 
+  test "O1: retarget carries the sender's class election verbatim but re-derives delivery policy for the new target",
+       %{db: db} do
+    active_sessions!(db, ["a", "b"])
+
+    original =
+      Wakes.schedule(db, %{
+        session_key: "a",
+        origin: "agent:sender",
+        creator_session_key: "agent:sender",
+        prompt: "fyi note",
+        due_at: 0,
+        class: "fyi"
+      })
+
+    assert original.class == "fyi"
+    assert original.class_election == "sender"
+    assert original.delivery_rule == Wakes.digest_rule()
+    refute original.digest
+    refute original.summon
+
+    # Backdate the original's filing/ceiling so the ceiling recompute below is
+    # provably NOT a coincidental copy — the real clock alone could otherwise
+    # land both wakes in the same millisecond and pass this test by luck.
+    ceiling = Wakes.delivery_policy("fyi").ceiling_ms
+
+    {:ok, _} =
+      DB.query(db, "UPDATE wakes SET createdAt=1000, dueAt=?2 WHERE wakeId=?1", [
+        original.wake_id,
+        1000 + ceiling
+      ])
+
+    original = Wakes.get(db, original.wake_id)
+
+    assert {:ok, replacement} =
+             DB.transaction(db, fn txn ->
+               Wakes.retarget_in_txn(txn, original.wake_id, "b")
+             end)
+
+    # THE SENDER'S ELECTION SURVIVES RETARGET (O1, Law 2) — never destroyed,
+    # never re-elected.
+    assert replacement.class == "fyi"
+    assert replacement.class_election == "sender"
+    refute replacement.digest
+    refute replacement.summon
+    assert replacement.session_key == "b"
+
+    # POLICY RE-APPLIED FOR THE NEW TARGET: a digest-held member's ceiling
+    # window re-opens from THIS retarget moment — it joins B's own group and
+    # B's own boundary, not a copy of A's already-elapsing timing.
+    assert replacement.delivery_rule == Wakes.digest_rule()
+    assert replacement.due_at == replacement.created_at + ceiling
+    refute replacement.due_at == original.due_at
+  end
+
+  test "O1: a retargeted summon keeps summon, and a sender-scheduled moment stays unmoved",
+       %{db: db} do
+    active_sessions!(db, ["a", "b"])
+
+    original =
+      Wakes.schedule(db, %{
+        session_key: "a",
+        origin: "agent:sender",
+        creator_session_key: "agent:sender",
+        prompt: "come look at this",
+        due_at: System.system_time(:millisecond) + 60_000,
+        class: "input-needed",
+        sender_scheduled: true,
+        summon: true
+      })
+
+    assert original.summon
+    assert original.delivery_rule == Wakes.inhibited_rule()
+
+    assert {:ok, replacement} =
+             DB.transaction(db, fn txn ->
+               Wakes.retarget_in_txn(txn, original.wake_id, "b")
+             end)
+
+    assert replacement.summon
+    assert replacement.class == "input-needed"
+    assert replacement.class_election == "sender"
+    assert replacement.session_key == "b"
+
+    # The sender already named this moment (batcher-inhibited); retarget
+    # must not start batching it now.
+    assert replacement.delivery_rule == Wakes.inhibited_rule()
+    assert replacement.due_at == original.due_at
+  end
+
+  test "O1: an immediate class's own election is unmoved by retarget", %{db: db} do
+    active_sessions!(db, ["a", "b"])
+    at = System.system_time(:millisecond)
+
+    original =
+      Wakes.schedule(db, %{
+        session_key: "a",
+        origin: "agent:sender",
+        creator_session_key: "agent:sender",
+        prompt: "stopped",
+        due_at: at,
+        class: "blocker"
+      })
+
+    assert {:ok, replacement} =
+             DB.transaction(db, fn txn ->
+               Wakes.retarget_in_txn(txn, original.wake_id, "b")
+             end)
+
+    assert replacement.class == "blocker"
+    assert replacement.class_election == "sender"
+    assert replacement.due_at == at
+    assert replacement.delivery_rule == original.delivery_rule
+  end
+
+  defp active_sessions!(db, keys) do
+    values =
+      keys
+      |> Enum.map(fn key ->
+        "('#{key}', '#{key}', 'flynn', 'user:flynn', 'default', 'claude', 'anthropic', 'fable', 'eezo', 'active', 1, 1)"
+      end)
+      |> Enum.join(",\n")
+
+    :ok =
+      DB.execute(
+        db,
+        """
+        INSERT OR IGNORE INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1);
+        INSERT INTO sessions
+          (sessionKey, displayName, ownerUserId, origin, archetype, harness,
+           provider, model, host, state, createdAt, updatedAt)
+        VALUES
+          #{values};
+        """
+      )
+
+    :ok
+  end
+
   test "fire_due claims each due wake once across synchronous passes", %{
     db: db,
     scheduler: scheduler
