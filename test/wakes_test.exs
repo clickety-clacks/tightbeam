@@ -320,6 +320,155 @@ defmodule Tightbeam.WakesTest do
     assert states[replacement.wake_id] == {"pending", 2}
   end
 
+  test "O1: retarget carries the sender's class election AND the original ceiling verbatim — never restarts it",
+       %{db: db} do
+    active_sessions!(db, ["a", "b"])
+
+    original =
+      Wakes.schedule(db, %{
+        session_key: "a",
+        origin: "agent:sender",
+        creator_session_key: "agent:sender",
+        prompt: "fyi note",
+        due_at: 0,
+        class: "fyi"
+      })
+
+    assert original.class == "fyi"
+    assert original.class_election == "sender"
+    assert original.delivery_rule == Wakes.digest_rule()
+    refute original.digest
+    refute original.summon
+
+    # Backdate the original's filing time deep into its own ceiling window —
+    # 3h59m into a 4h `fyi` ceiling — so a restarted ceiling (retarget-moment
+    # + ceiling_ms) is provably DIFFERENT from the preserved one, not a
+    # coincidental match (Sol xhigh review round 2, finding 1: Invariant 3 —
+    # the ceiling anchors on the wake's own creation, never on when it
+    # happened to get retargeted; recomputing it here would let this `fyi`
+    # land at 7h59m, a straight §7 violation).
+    ceiling = Wakes.delivery_policy("fyi").ceiling_ms
+    original_created_at = 1000
+    original_due_at = original_created_at + ceiling - 60_000
+
+    {:ok, _} =
+      DB.query(db, "UPDATE wakes SET createdAt=?2, dueAt=?3 WHERE wakeId=?1", [
+        original.wake_id,
+        original_created_at,
+        original_due_at
+      ])
+
+    original = Wakes.get(db, original.wake_id)
+
+    assert {:ok, replacement} =
+             DB.transaction(db, fn txn ->
+               Wakes.retarget_in_txn(txn, original.wake_id, "b")
+             end)
+
+    # THE SENDER'S ELECTION SURVIVES RETARGET (O1, Law 2) — never destroyed,
+    # never re-elected.
+    assert replacement.class == "fyi"
+    assert replacement.class_election == "sender"
+    refute replacement.digest
+    refute replacement.summon
+    assert replacement.session_key == "b"
+
+    # THE CEILING IS PRESERVED, NOT RESTARTED: the replacement's `dueAt` is
+    # the ORIGINAL's, byte-identical — never `replacement.created_at +
+    # ceiling`, which would extend it. B's own turn-boundary eligibility is
+    # handled dynamically, by grouping on the row's new `sessionKey` at the
+    # next materialization pass — nothing here needs to move `dueAt` for
+    # that to be true.
+    assert replacement.delivery_rule == Wakes.digest_rule()
+    assert replacement.due_at == original_due_at
+    assert replacement.due_at == original.due_at
+    refute replacement.due_at == replacement.created_at + ceiling
+  end
+
+  test "O1: a retargeted summon keeps summon, and a sender-scheduled moment stays unmoved",
+       %{db: db} do
+    active_sessions!(db, ["a", "b"])
+
+    original =
+      Wakes.schedule(db, %{
+        session_key: "a",
+        origin: "agent:sender",
+        creator_session_key: "agent:sender",
+        prompt: "come look at this",
+        due_at: System.system_time(:millisecond) + 60_000,
+        class: "input-needed",
+        sender_scheduled: true,
+        summon: true
+      })
+
+    assert original.summon
+    assert original.delivery_rule == Wakes.inhibited_rule()
+
+    assert {:ok, replacement} =
+             DB.transaction(db, fn txn ->
+               Wakes.retarget_in_txn(txn, original.wake_id, "b")
+             end)
+
+    assert replacement.summon
+    assert replacement.class == "input-needed"
+    assert replacement.class_election == "sender"
+    assert replacement.session_key == "b"
+
+    # The sender already named this moment (batcher-inhibited); retarget
+    # must not start batching it now.
+    assert replacement.delivery_rule == Wakes.inhibited_rule()
+    assert replacement.due_at == original.due_at
+  end
+
+  test "O1: an immediate class's own election is unmoved by retarget", %{db: db} do
+    active_sessions!(db, ["a", "b"])
+    at = System.system_time(:millisecond)
+
+    original =
+      Wakes.schedule(db, %{
+        session_key: "a",
+        origin: "agent:sender",
+        creator_session_key: "agent:sender",
+        prompt: "stopped",
+        due_at: at,
+        class: "blocker"
+      })
+
+    assert {:ok, replacement} =
+             DB.transaction(db, fn txn ->
+               Wakes.retarget_in_txn(txn, original.wake_id, "b")
+             end)
+
+    assert replacement.class == "blocker"
+    assert replacement.class_election == "sender"
+    assert replacement.due_at == at
+    assert replacement.delivery_rule == original.delivery_rule
+  end
+
+  defp active_sessions!(db, keys) do
+    values =
+      keys
+      |> Enum.map(fn key ->
+        "('#{key}', '#{key}', 'flynn', 'user:flynn', 'default', 'claude', 'anthropic', 'fable', 'eezo', 'active', 1, 1)"
+      end)
+      |> Enum.join(",\n")
+
+    :ok =
+      DB.execute(
+        db,
+        """
+        INSERT OR IGNORE INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1);
+        INSERT INTO sessions
+          (sessionKey, displayName, ownerUserId, origin, archetype, harness,
+           provider, model, host, state, createdAt, updatedAt)
+        VALUES
+          #{values};
+        """
+      )
+
+    :ok
+  end
+
   test "fire_due claims each due wake once across synchronous passes", %{
     db: db,
     scheduler: scheduler

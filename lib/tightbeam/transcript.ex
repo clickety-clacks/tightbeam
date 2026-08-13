@@ -391,7 +391,12 @@ defmodule Tightbeam.Transcript do
   ## Errors — the two not_found bodies are each byte-identical across their cases
 
   defp not_found, do: %{code: "not_found", message: "session not found"}
-  defp cursor_not_found, do: %{code: "not_found", message: "cursor message not found"}
+
+  # O3: `cursor_not_found` — the same code `attests` names, not a bare
+  # `not_found` — so a caller distinguishes "the session doesn't exist or
+  # isn't yours" from "the cursor you passed doesn't resolve." Every read
+  # verb's cursor miss uses this code (execution_map's roster page, attests).
+  defp cursor_not_found, do: %{code: "cursor_not_found", message: "cursor message not found"}
   defp invalid(message), do: %{code: "invalid", message: message}
 
   defp string_param(params, key) do

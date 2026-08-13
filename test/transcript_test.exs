@@ -21,7 +21,8 @@ defmodule Tightbeam.TranscriptTest do
     Dispatch,
     Gateway,
     Org,
-    Transcript
+    Transcript,
+    Wakes
   }
 
   alias Tightbeam.Wire.Router
@@ -141,7 +142,7 @@ defmodule Tightbeam.TranscriptTest do
 
   ## Proof 4 — cursor refusal
 
-  test "proof 4: a foreign or nonexistent cursor is one byte-identical not_found", ctx do
+  test "proof 4: a foreign or nonexistent cursor is one byte-identical cursor_not_found", ctx do
     seed(ctx.db, "owned", 2)
     [foreign_id] = seed(ctx.db, "foreign", 1)
 
@@ -149,7 +150,10 @@ defmodule Tightbeam.TranscriptTest do
     missing = read(ctx, %{session_key: "owned", before: "s_does_not_exist"})
 
     assert foreign == missing
-    assert foreign.code == "not_found"
+    # O3: the same code every read verb's cursor miss uses (unify cursor
+    # errors) — `cursor_not_found`, not the bare `not_found` a session-level
+    # refusal returns.
+    assert foreign.code == "cursor_not_found"
 
     # Neither body names the id, and neither degenerates into the tail.
     encoded = JSON.encode!(foreign)
@@ -444,6 +448,46 @@ defmodule Tightbeam.TranscriptTest do
     assert legacy.turn_seq == legacy_seq
     assert legacy.assignment_id == nil
     assert legacy.job_ref == nil
+  end
+
+  # S5 coverage pin: `@entry_keys` above (and proof 8's key-set assertion)
+  # proves `class`/`delivery_rule` are PRESENT keys — it would not fail if
+  # the projection always joined them to nil. This drives one REAL classed
+  # wake through production delivery (`Wakes.schedule/2` then
+  # `Gateway.deliver_prompt/4` with the same `wake_id:` option the scheduler
+  # itself passes) and asserts the projected values are non-null and
+  # correct, end to end through the `wakes` LEFT JOIN.
+  test "proof 8b: a classed wake's delivery projects non-null class and deliveryRule end to end",
+       ctx do
+    start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
+    start_supervised!({LaneDoorbell, self()})
+
+    wake =
+      Wakes.schedule(ctx.db, %{
+        session_key: "owned",
+        origin: "agent:sender",
+        creator_session_key: "agent:sender",
+        prompt: "class test",
+        due_at: System.system_time(:millisecond),
+        class: "fyi",
+        sender_scheduled: true
+      })
+
+    assert wake.class == "fyi"
+    assert wake.delivery_rule == Wakes.inhibited_rule()
+
+    assert :appended =
+             Gateway.deliver_prompt("owned", wake.origin, wake.prompt,
+               db: ctx.db,
+               wake_id: wake.wake_id,
+               sender: wake.origin,
+               client_message_id: "c_classed"
+             )
+
+    [entry] = read(ctx, %{session_key: "owned", limit: 1}).messages
+
+    assert entry.class == "fyi"
+    assert entry.delivery_rule == Wakes.inhibited_rule()
   end
 
   test "proof 8 (source): exactly one qualified enqueue_in_txn call and no enqueue/2 call" do

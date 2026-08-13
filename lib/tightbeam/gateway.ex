@@ -920,6 +920,7 @@ defmodule Tightbeam.Gateway do
       "toplines" => fn call -> Tightbeam.Toplines.roster(db, call) end,
       "topline" => fn call -> Tightbeam.Toplines.topline(db, call) end,
       "coordination-share" => fn call -> coordination_share_result(db, call) end,
+      "digest-members" => fn call -> digest_members_result(db, call) end,
       "work-item-list" => fn call -> WorkItems.__handle__(db, "work-item-list", call) end,
       "work-item-update" => fn call ->
         WorkItems.__handle__(
@@ -5087,20 +5088,118 @@ defmodule Tightbeam.Gateway do
   defp decision_request_result(%{code: _} = error), do: error
   defp decision_request_result(request), do: %{decision_request: request}
 
-  defp coordination_share_readable?(db, call, session) do
+  defp coordination_share_readable?(_db, %{principal: {:session, key}}, %{session_key: key}),
+    do: true
+
+  defp coordination_share_readable?(db, call, session),
+    do: owner_readable?(db, call, session.owner_user_id)
+
+  # OWNER-OR-ADMIN over a raw owner id, shared by every read whose visibility
+  # is "the thing's owner, or an admin" — `coordination-share` over a
+  # session's owner, `digest-members` over a role-addressed carrier's role's
+  # owner (below). A `{:session, key}` principal is never the target's OWN
+  # session here (that shortcut is `coordination_share_readable?`'s own
+  # first clause, which has no role analogue — a role is not a session
+  # identity); it must resolve to the same owner some other way.
+  defp owner_readable?(db, call, owner_user_id) do
     case call[:principal] do
-      {:user, id} -> session.owner_user_id == id or admin_origin?(db, call.origin)
-      {:session, key} -> key == session.session_key or owner_of?(db, call.origin, session)
+      {:user, id} -> owner_user_id == id or admin_origin?(db, call.origin)
+      {:session, _key} -> owner_of?(db, call.origin, owner_user_id)
       _ -> false
     end
   end
 
-  defp owner_of?(db, origin, session) do
+  defp owner_of?(db, origin, owner_user_id) do
     case resolve_caller(db, origin) do
-      %{owner_user_id: owner} when is_binary(owner) -> owner == session.owner_user_id
+      %{owner_user_id: owner} when is_binary(owner) -> owner == owner_user_id
       _ -> false
     end
   end
+
+  # O5: `digest_members/2` (the C4/acceptance-2 audit — every source wake a
+  # digest carries) had no sanctioned surface, a status question answerable
+  # from rows that no agent could ask (philosophy gate Q9). Visibility
+  # follows `coordination-share`'s exact rule: the carrier's own target's
+  # owner, or an admin. An id that is not a pending digest CARRIER —
+  # unknown, a member, an ordinary wake, or a carrier this caller cannot see
+  # — answers identically: `not_found`, never an existence oracle.
+  defp digest_members_result(db, call) do
+    wake_id = call.params[:wake_id]
+
+    cond do
+      not (is_binary(wake_id) and wake_id != "") ->
+        %{code: "invalid", message: "digest-members requires a wakeId"}
+
+      true ->
+        case Wakes.get(db, wake_id) do
+          %{digest: true} = wake ->
+            if digest_members_readable?(db, call, wake),
+              do: %{digest_members: Wakes.digest_members(db, wake_id)},
+              else: digest_members_not_found()
+
+          _ ->
+            digest_members_not_found()
+        end
+    end
+  end
+
+  # PIN THE PAST, NEVER READ THE PRESENT (specs roles-registry-v1.md:31 —
+  # Sol xhigh review round 2, finding: a LIVE `Roles.get/2` at read time
+  # bound audit authority to a deletable, name-reusable row. After
+  # `role-rm`, `Roles.get/2` returns nil and denied EVERYONE, admin
+  # included; after delete-then-recreate under a different owner, the same
+  # live lookup silently handed the NEW owner read access to the OLD
+  # carrier's members — a fact that was never true).
+  #
+  # A carrier whose `sessionKey` resolves through `Org.get/2` was pinned to
+  # a REAL session at materialization (O2's `carrier_shape/2` puts it there
+  # directly, for a role that resolved at that moment) — sessions are never
+  # hard-deleted, so this resolves for the life of the row, and reading it
+  # needs no role lookup at all: the pinned session's owner already answers
+  # the question. Only a carrier built while its role had NO active
+  # resolution — the synthetic `role:<name>` placeholder, which never
+  # resolves through `Org.get/2` — falls through to the fact
+  # `materialize_members/4` pinned into the SAME transaction's
+  # `wake_digest_materialized` lifecycle event: the role's owner AT THAT
+  # MOMENT, durable regardless of anything that happens to the role
+  # afterward.
+  defp digest_members_readable?(db, call, wake) do
+    case Org.get(db, wake.session_key) do
+      nil -> owner_readable?(db, call, pinned_carrier_owner(db, wake.wake_id))
+      session -> coordination_share_readable?(db, call, session)
+    end
+  end
+
+  # `owner_readable?/3`'s `{:user, id}` clause always falls through to
+  # `admin_origin?/2` regardless of whether `owner_user_id` matched — so
+  # this reads correctly even when no pinned fact exists at all (a `nil`
+  # owner never matches a real user id, and the admin path is still
+  # reached): the deny-on-nil case never precedes the admin check.
+  #
+  # `URI.decode_www_form/1` reverses `Wakes`'s `pinned_owner_field/1`
+  # (Sol xhigh review round 3): the raw text was LOSSY for a user id
+  # containing a space — "alice bob" pinned and captured back by `\S+` as
+  # bare "alice" would transfer the OLD carrier's audit to a real user named
+  # "alice." Decoding here is what makes the round trip exact regardless of
+  # what the id contains.
+  defp pinned_carrier_owner(db, wake_id) do
+    case DB.query(
+           db,
+           "SELECT detail FROM lifecycle_events WHERE kind = 'wake_digest_materialized' AND subject = ?1",
+           [wake_id]
+         ) do
+      {:ok, [[detail]]} ->
+        case Regex.run(~r/ ownerUserId=(\S+)/, detail) do
+          [_, encoded] -> URI.decode_www_form(encoded)
+          nil -> nil
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  defp digest_members_not_found, do: %{code: "not_found", message: "wake not found"}
 
   defp attend_result(db, call) do
     case call[:principal] do

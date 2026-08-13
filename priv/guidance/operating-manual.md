@@ -101,8 +101,8 @@ lands at your next turn boundary or within 30 minutes, whichever comes first.
 
 ## See what coordination is costing a session
 `tightbeam coordination-share --session <key> --from <epochMs> --to <epochMs>` reports what
-share of a session's turns over a window were spent on classed coordination traffic — every
-turn a classed wake materialized, except alarms and deliberate summons, against all its turns.
+share of a session's turns over a window were spent on coordination traffic — every turn a wake
+materialized, classed or not, except alarms and deliberate summons, against all its turns.
 It counts rows and names no threshold. Reading it is how you find out whether a colleague is
 being nibbled to death by mail before you add to the pile.
 

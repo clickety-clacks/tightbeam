@@ -645,6 +645,12 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 format!("\"to\":{to}"),
             ],
         )),
+        Command::DigestMembers { identity, wake_id } => Ok(request(
+            identity,
+            "digest-members",
+            vec![],
+            vec![string_field("wakeId", wake_id)],
+        )),
         Command::Assignments {
             identity,
             target,
@@ -1394,6 +1400,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::Toplines { identity, .. }
         | Command::Topline { identity, .. }
         | Command::CoordinationShare { identity, .. }
+        | Command::DigestMembers { identity, .. }
         | Command::WorkItemIcebox { identity, .. }
         | Command::WorkItemReopen { identity, .. }
         | Command::WorkItemClose { identity, .. }
@@ -1679,6 +1686,25 @@ mod tests {
             argv.extend_from_slice(&["--as-user", "flynn"]);
             assert!(args::parse(argv.iter().map(|v| (*v).to_owned()).collect()).is_err());
         }
+    }
+
+    #[test]
+    fn builds_byte_exact_digest_members_body() {
+        // O5: the same positional-id shape `work-item-get` uses — the wake id
+        // travels as an ordinary `wakeId` param, never a typed target.
+        assert_eq!(
+            body(&["digest-members", "w_abc123", "--as-user", "flynn"]),
+            r#"{"asUser":"flynn","verb":"digest-members","params":{"wakeId":"w_abc123"}}"#
+        );
+        assert!(
+            args::parse(
+                ["digest-members", "--as-user", "flynn"]
+                    .iter()
+                    .map(|v| (*v).to_owned())
+                    .collect()
+            )
+            .is_err()
+        );
     }
 
     #[test]

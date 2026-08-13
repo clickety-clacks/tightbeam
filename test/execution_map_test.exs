@@ -30,6 +30,7 @@ defmodule Tightbeam.ExecutionMapTest do
     Dispatch,
     Org,
     ExecutionMap,
+    Wakes,
     WorkItems,
     WorkState
   }
@@ -575,6 +576,50 @@ defmodule Tightbeam.ExecutionMapTest do
     assert stale.active.pending_session_wake == false, "a stale ex-holder is not a current holder"
     assert stale.jobs == 1, "the ever-held history still counts it"
     assert "wi_stale" in ids(roster(ctx, %{quiet_over: bound}))
+  end
+
+  # S5 coverage pin: `pending_wake_classes` (fabric §13 Phase 1 exit — classes
+  # visible in toplines rows) had zero tests before this. Real classed wakes
+  # (`Wakes.schedule/2`, not staged rows) on an item's current holders,
+  # summed across holders and grouped by class, with an unclassed wake on the
+  # same session proving it never joins the count.
+  test "a work item's pending_wake_classes sums classed pending wakes across its current holders",
+       ctx do
+    item!(ctx.db, "wi_classed", created_at: 2_000_000)
+    session!(ctx.db, "s_classed_a", "flynn")
+    session!(ctx.db, "s_classed_b", "flynn")
+    assignment!(ctx.db, "asg_classed_a", work_item_id: "wi_classed", holder: "s_classed_a")
+    assignment!(ctx.db, "asg_classed_b", work_item_id: "wi_classed", holder: "s_classed_b")
+
+    Wakes.schedule(ctx.db, %{
+      session_key: "s_classed_a",
+      origin: "agent:sender",
+      prompt: "one",
+      due_at: @default_created,
+      class: "fyi"
+    })
+
+    Wakes.schedule(ctx.db, %{
+      session_key: "s_classed_a",
+      origin: "agent:sender",
+      prompt: "two",
+      due_at: @default_created,
+      class: "fyi"
+    })
+
+    Wakes.schedule(ctx.db, %{
+      session_key: "s_classed_b",
+      origin: "agent:sender",
+      prompt: "three",
+      due_at: @default_created,
+      class: "blocker"
+    })
+
+    # An unclassed pending wake on the same holder must not appear at all.
+    wake!(ctx.db, "wk_unclassed", "s_classed_a", state: "pending", work_item_id: "wi_classed")
+
+    classed = node(roster(ctx), "wi_classed")
+    assert classed.active.pending_wake_classes == %{"fyi" => 2, "blocker" => 1}
   end
 
   ## Proof 10 — coverage: absence before the cutoff is unknown, never zero

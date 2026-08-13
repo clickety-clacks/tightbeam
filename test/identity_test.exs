@@ -71,6 +71,54 @@ defmodule Tightbeam.IdentityTest do
            ]
   end
 
+  # S4 coverage pin: the file-list assertion above proves the seed ships
+  # `guidance/delegation-card.md`, `guidance/office-convention.md`, and
+  # `guidance/directive-vocabulary.md` by NAME — it would not fail if any of
+  # the three were emptied. These three pin the load-bearing CONTENT
+  # (coordination-fabric-v1 §6) so an edit that keeps the filename but guts
+  # the substance is caught here, not discovered by an exec acting off-card.
+  test "the delegation card's verb lists carry §6's MAY and MUST NOT content, not just a filename" do
+    card =
+      File.read!(Application.app_dir(:tightbeam, "priv/seed/guidance/delegation-card.md"))
+
+    # A handful of exact, load-bearing phrases — not the whole text, which
+    # would make this test as brittle as the thing it exists to catch.
+    assert card =~
+             "MAY: read substrate rows; file its own lifecycle attests on its own card and"
+
+    assert card =~
+             "batch, schedule, and deliver to its principal within §7's ceilings; summon its"
+
+    assert card =~ "MUST NOT: file verdicts on substance"
+    assert card =~ "accept or reject work; make product judgments; alter"
+    assert card =~ ~s(Its only "no" is "later")
+    assert card =~ "the avasarala bounds starvation across its watermark population (§5)"
+  end
+
+  test "the office convention's dissolution sequence names REBIND before revoke" do
+    convention =
+      File.read!(Application.app_dir(:tightbeam, "priv/seed/guidance/office-convention.md"))
+
+    assert convention =~ "REBIND, then revoke"
+    assert convention =~ "the order is rebind-first"
+
+    # ORDERING, not just presence: REBIND must textually precede revoke, the
+    # same discipline the sequence itself enforces (a revoke-first sequence
+    # leaves a dual-authority window the doc names as the failure to avoid).
+    rebind_at = :binary.match(convention, "REBIND") |> elem(0)
+    revoke_at = :binary.match(convention, "revoke") |> elem(0)
+    assert rebind_at < revoke_at
+  end
+
+  test "the directive vocabulary seed doc names all five base keys" do
+    vocabulary =
+      File.read!(Application.app_dir(:tightbeam, "priv/seed/guidance/directive-vocabulary.md"))
+
+    for key <- ~w(focus interrupt-only-for digest dnd-until escalate-to) do
+      assert vocabulary =~ "`#{key}:`", "directive vocabulary is missing key #{key}"
+    end
+  end
+
   test "a shipped bundle manifest without purpose is refused when bundles are read", ctx do
     File.write!(Path.join(ctx.source, "manifest.toml"), ~s(root_archetype = "product-owner"\n))
 
