@@ -13,22 +13,34 @@ is not assembled after the fact; it is built by hiring. Directives flow down the
 desk graph; summons bubble up it.
 
 The spawning desk executes a hire as directed execution of its principal's recorded
-decision, in this order, filing each step on its own card:
+decision, in this order:
 
-1. **Cite the authority.** The principal's decision to hire is a row — an attest or
-   ruling. File the citation on your own delegation card before anything spawns.
-   An uncited spawn is refused by rule (see the dispatch rules): initiative stays
-   with minds.
-2. **Spawn the mind** — `spawn --name <role> ...` registers the role bound to the
-   new session. Its charter comes from the role-charter template, filled from the
-   principal's decision, cited to the authority row.
-3. **Spawn its desk** — one exec-archetype session, from the same seed templates.
+1. **The authority rides ON the spawn filing.** The principal's decision to hire is
+   a row — an attest or ruling — and each spawn carries its citation itself: today,
+   name the authority row in the spawn's own free-text surface (its `--display`
+   and the card subjects it opens); the typed authority-reference field on the
+   spawn verb arrives with its build card. Never file the citation as a separate,
+   later attest — a citation the spawn does not carry is a spawn that went out
+   uncited, and an uncited spawn is refused by rule (see the dispatch rules).
+   Initiative stays with minds.
+2. **Spawn the mind** — `spawn --name <role> ...` registers the role, bound at
+   birth to the mind's session. Its charter comes from the role-charter template,
+   filled from the principal's decision, citing the same authority row.
+3. **Spawn its desk** — one exec-archetype session, from the same seed templates,
+   citation on that filing too.
 4. **Open the delegation card** against the desk's role, subject from the
    delegation-card template, naming the new mind as its principal.
-5. **Wire it in.** File the new desk's initial standing directives — `escalate-to:`
-   names YOUR office, so what the new desk cannot answer climbs the graph — and
-   record the new office on your own card. Role traffic now lands on the new desk;
-   the graph grew by one office and nobody assembled anything.
+5. **Rebind the role to the desk.** Role traffic lands on the new desk only after
+   the worker's role is rebound to the desk's session — the substrate's
+   `role-bind` verb (a gateway wire verb today; its CLI surface arrives with its
+   build card). Until the rebind, role-addressed wakes still land on the mind;
+   an office claimed wired without this step is a claim the rows refute.
+6. **The principal wires itself up.** Standing directives are the card's named
+   principal's to file, and nobody else's — so the NEW MIND files its own desk's
+   initial policy, starting with `escalate-to:` naming YOUR office so what its
+   desk cannot answer climbs the graph. Hand it the recommended wiring in its
+   charter; record the new office on your own card as working state. The graph
+   grew by one office and nobody assembled anything.
 
 Not every principal gets a dedicated desk — pairing is priced, not prescribed:
 frontier-class minds warrant one, mid-tier squads share a pool desk, and the

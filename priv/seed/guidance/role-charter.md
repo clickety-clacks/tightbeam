@@ -16,8 +16,10 @@ outlives every card.
 
     purpose: <one load-bearing sentence: what this mind exists to judge>
     authority: <the decisions that are this role's to make, named>
-    boundaries: <what this role must not decide or touch, named — the MUST-NOT
-      list here compiles into the office's dispatch rules>
+    boundaries: <what this role must not decide or touch, named — law as
+      written text, kept by the mind and audited by Miller; only the DESK
+      delegation card's STRUCTURAL must-nots compile into dispatch rules,
+      never these>
     principal: <the role this one answers to; its spirit rulings bound yours>
     desk: <the desk fronting this role, or "bones only" — see the office
       convention; the prodder floor guards either way>

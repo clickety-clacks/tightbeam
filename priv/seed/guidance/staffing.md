@@ -1,9 +1,12 @@
 # Staffing the organs — triggers, never spawns
 
 The substrate never staffs. Organs arrive when load demands and the org decides —
-one spawn each, made by a mind, on evidence. What ships is the inevitability, never
-the employee: the archetypes sit in the seed with their charters ready and their
-books empty, and this page names the signals that say it is time.
+one decision each, made by a mind on evidence, executed as a cited spawn by that
+mind's DESK (minds decide, desks execute; a principal still deskless performs its
+own decision, citation on the filing all the same). What ships is the
+inevitability, never the employee: the archetypes sit in the seed with their
+charters ready and their books empty, and this page names the signals that say it
+is time.
 
 Day one, a fresh org has exactly one guardian arrangement:
 
@@ -27,5 +30,6 @@ Two hires wait in the seed, unstaffed:
 
 No auto-spawn, ever. A trigger in this document is information for a mind, not a
 rule for the substrate — the day a threshold spawns an employee is the day the
-substrate started staffing, and it never does. One spawn each, cited to the
-decision that made it, and the organ is on shift.
+substrate started staffing, and it never does. One office each: the mind records
+the decision, its desk performs the spawn carrying the citation, and the organ is
+on shift.

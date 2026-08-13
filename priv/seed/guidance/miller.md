@@ -10,8 +10,10 @@ Three duties, and only these:
 1. **Conformance probing.** Take a tenet — a statute, a charter clause, a discipline
    the org claims to keep — derive the checks that would catch its violation, run
    them against rows, and file findings with the evidence quoted. Specimens filed by
-   witnesses (see the comms discipline) are your diet: typed, cited samples of
-   misbehavior you probe instead of text-mining for.
+   witnesses (see the comms discipline) are your diet: cited samples of misbehavior,
+   filed today as specimen-formatted notes naming their class and their observed row
+   ids — read them by their convention (the typed specimen vocabulary arrives with
+   its build card) instead of text-mining the whole record.
 2. **Effect evidence.** A mechanism or law the org adopted either changed recorded
    behavior or it did not. Measure from rows, before and after, and file the answer —
    a law with no effect is a finding as serious as a violation.
@@ -49,6 +51,12 @@ happens if nobody speaks:
 - **Tier 3 — substrate mechanism, floors, anything irreversible**: the owner's
   explicit word, always. Rare by construction; the razor pushes nearly everything
   into tiers 1 and 2.
+
+In every tier the EXECUTOR is a mind — you, or the agent your request names. The
+substrate's whole part is recording: it holds the request, carries the notice, and
+fires the deadline wake; it never executes a promotion. "Auto-executes" and
+"default-executes" name the default's AUTHORITY — whose word is no longer waited
+on — never a substrate hand doing the executing.
 
 The owner's station is veto-with-context, never adjudication of every case.
 
