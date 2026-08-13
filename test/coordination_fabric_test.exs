@@ -123,12 +123,15 @@ defmodule Tightbeam.CoordinationFabricTest do
     # must carry the bypass rule, never `batcher-inhibited`, and the sender's
     # chosen time, never a ceiling.
     at = System.system_time(:millisecond) + 4 * 60 * 60 * 1000
+    # Sol xhigh review round 2, finding 4: exact equality, not `=~` — a
+    # prefixed or revised rule string must not slip past this assertion.
+    bypass_rule = Wakes.delivery_policy("algedonic").rule
 
     scheduled =
       schedule(db, session: "agent:po", class: "algedonic", due_at: at, sender_scheduled: true)
 
     assert scheduled.due_at == at, "the sender's own election, unmoved"
-    assert scheduled.delivery_rule =~ "algedonic-bypass"
+    assert scheduled.delivery_rule == bypass_rule
     refute scheduled.delivery_rule == Wakes.inhibited_rule()
     assert Wakes.materialize_digests(db, at) == []
 
@@ -147,8 +150,9 @@ defmodule Tightbeam.CoordinationFabricTest do
         condition_scope: "agent:po"
       })
 
-    assert conditioned.delivery_rule =~ "algedonic-bypass"
+    assert conditioned.delivery_rule == bypass_rule
     refute conditioned.delivery_rule == Wakes.inhibited_rule()
+    assert conditioned.due_at == at, "the sender's elected time, unchanged"
   end
 
   ## Seam ② — the batcher
@@ -261,19 +265,20 @@ defmodule Tightbeam.CoordinationFabricTest do
       schedule(db, session: session, class: "fyi", prompt: "early, released by the boundary")
 
     seq = turn(db, session, status: "running", created_at: early.created_at)
-    Process.sleep(5)
-    ended_at = System.system_time(:millisecond)
+    ended_at = early.created_at + 10
     end_turn(db, seq, ended_at)
 
-    # Filed AFTER the boundary that released `early` — real wall-clock order,
-    # guaranteed by the sleep above (`created_at` is stamped by the row's own
-    # clock and cannot be supplied by the caller). The boundary is not this
-    # member's own; it must wait for its own ceiling or boundary.
-    Process.sleep(5)
     late = schedule(db, session: session, class: "fyi", prompt: "late, arrived after the trigger")
-    assert late.created_at > ended_at
 
-    assert [digest_id] = Wakes.materialize_digests(db, ended_at + 1)
+    # Deterministically AFTER the boundary that released `early` — pinned by
+    # direct injection, never raced against the real clock (Sol xhigh review
+    # round 2, finding 1): `Wakes.schedule` always stamps `createdAt` from its
+    # own clock, so there is no public way to make this ordering exact except
+    # to set it directly, the same way `turn`/`end_turn` already inject their
+    # own timestamps below.
+    stamp_created_at!(db, late, ended_at + 10)
+
+    assert [digest_id] = Wakes.materialize_digests(db, ended_at + 20)
 
     assert Enum.map(Wakes.digest_members(db, digest_id), & &1.wake_id) == [early.wake_id]
 
@@ -285,6 +290,32 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert [late_digest_id] = Wakes.materialize_digests(db, late.due_at)
     assert late_digest_id != digest_id
     assert Enum.map(Wakes.digest_members(db, late_digest_id), & &1.wake_id) == [late.wake_id]
+  end
+
+  test "a member filed in the same millisecond as a turn's end waits for the next boundary",
+       %{db: db} do
+    # Sol xhigh review round 2, finding 1: `boundary >= created_at` treated a
+    # wake filed in the SAME millisecond a turn ended as already past that
+    # boundary. Same-millisecond is ambiguous ordering — not proof the turn
+    # ended AFTER the wake was filed — so it must NOT release the digest.
+    # Pinned with exact injected timestamps, never raced against the clock.
+    session = "agent:po"
+
+    edge =
+      schedule(db, session: session, class: "fyi", prompt: "same millisecond as the boundary")
+
+    seq = turn(db, session, status: "running", created_at: edge.created_at)
+    end_turn(db, seq, edge.created_at)
+
+    assert Wakes.materialize_digests(db, edge.created_at + 1) == [],
+           "an equal createdAt/endedAt is not proof the boundary happened after filing"
+
+    # A turn ending STRICTLY after the member's filing time resolves it.
+    next_seq = turn(db, session, status: "running", created_at: edge.created_at + 1)
+    end_turn(db, next_seq, edge.created_at + 1)
+
+    assert [digest_id] = Wakes.materialize_digests(db, edge.created_at + 2)
+    assert Enum.map(Wakes.digest_members(db, digest_id), & &1.wake_id) == [edge.wake_id]
   end
 
   test "classes are digested apart, so a 30-minute ceiling is not stretched to four hours",
@@ -570,6 +601,33 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert share.by_class == %{"fyi" => 1, "algedonic" => 1}
   end
 
+  test "a dangling wakeId with no matching wake row is not counted as coordination traffic",
+       %{db: db} do
+    # Sol xhigh review round 2, finding 3: the numerator's COALESCE guards
+    # passed even when the LEFT JOIN found NO wake row at all — a turn whose
+    # `wakeId` names a wake that does not exist got `w.class` and `w.summon`
+    # both read as NULL, which `COALESCE(w.class, '') <> 'algedonic'` and
+    # `COALESCE(w.summon, 0) = 0` both waved through as "an unclassed,
+    # non-summon wake." It is not a wake at all. Requiring the JOIN actually
+    # match (`w.wakeId IS NOT NULL`) excludes it.
+    session = "agent:po"
+    base = System.system_time(:millisecond)
+
+    turn(db, session, created_at: base, wake_id: "w_never_existed")
+    turn(db, session, created_at: base + 1)
+
+    share = Wakes.coordination_share(db, session, base, base + 10)
+
+    assert share.turns == 2
+    assert share.wake_turns == 1, "the turn still names a wakeId, dangling or not"
+    assert share.classed_turns == 0
+
+    assert share.coordination_turns == 0,
+           "a dangling wakeId is not a wake-materialized turn — nothing was ever carried"
+
+    assert share.share == 0.0
+  end
+
   test "a summon is a deliberate spend, subtracted from the share", %{db: db} do
     session = "agent:po"
     base = System.system_time(:millisecond)
@@ -687,6 +745,20 @@ defmodule Tightbeam.CoordinationFabricTest do
       sender_scheduled: Keyword.get(opts, :sender_scheduled, false),
       summon: Keyword.get(opts, :summon, false)
     })
+  end
+
+  # Injects an exact `createdAt`, deterministically — `Wakes.schedule` always
+  # stamps it from its own clock, so this is the only way to pin a wake's
+  # filing time relative to another event without racing the real clock
+  # (Sol xhigh review round 2, finding 1).
+  defp stamp_created_at!(db, wake, created_at) do
+    {:ok, _} =
+      DB.query(db, "UPDATE wakes SET createdAt = ?1 WHERE wakeId = ?2", [
+        created_at,
+        wake.wake_id
+      ])
+
+    :ok
   end
 
   defp turn(db, session_key, opts) do

@@ -103,6 +103,11 @@ defmodule Tightbeam.Wakes do
     -- elected by any sender or the classifier, and claiming 'sender' here
     -- would be an untrue audit fact (Sol xhigh review, finding 7). Members
     -- keep their own true election; only the carrier row uses this value.
+    -- `'batcher'` is a SHAPE change (schema.ex's `@shape` bumped to
+    -- `coordination-fabric-classes-v2`, Sol xhigh review round 2, finding 2):
+    -- `CREATE TABLE IF NOT EXISTS` cannot widen this CHECK on a table that
+    -- already exists, so a database from the OLD shape is refused by name
+    -- rather than dying on a raw CHECK violation at the first carrier insert.
     classElection TEXT CHECK (classElection IN ('sender','classifier','batcher')),
     -- SIGNED PROVENANCE (§8 legibility): the named rule + revision that decided
     -- THIS wake's delivery, so any agent knows which reflex to inhibit.
@@ -1432,13 +1437,21 @@ defmodule Tightbeam.Wakes do
   end
 
   # A member's OWN eligibility (Sol xhigh review, finding 2): its own class
-  # ceiling, or a turn of the target's own that ended at or after THIS
+  # ceiling, or a turn of the target's own that ended STRICTLY AFTER THIS
   # member's own filing time — never another member's ceiling or another
   # member's boundary.
+  #
+  # STRICT `>`, not `>=` (Sol xhigh review round 2, finding 1): timestamps
+  # here are millisecond-resolution wall-clock reads. A wake filed in the
+  # SAME millisecond a turn ended is not provably filed BEFORE that turn's
+  # end — the ordering is ambiguous, and ambiguous is not "the boundary
+  # happened after this member was filed." An equal timestamp waits for the
+  # member's own NEXT boundary or its ceiling, same as a wake filed a moment
+  # later would.
   defp member_due_reason(at, due_at, boundary, created_at) do
     cond do
       at >= due_at -> "ceiling"
-      is_integer(boundary) and boundary >= created_at -> "turn-boundary"
+      is_integer(boundary) and boundary > created_at -> "turn-boundary"
       true -> nil
     end
   end
@@ -1599,13 +1612,24 @@ defmodule Tightbeam.Wakes do
           -- turns, CLASSED OR NOT (Sol xhigh review, finding 5). `w.class IS
           -- NOT NULL` excluded legacy unclassed wake turns entirely, undercounting
           -- the share this query exists to measure — a wake-materialized turn
-          -- counts here whether or not the fabric ever stamped it. Guard the
-          -- class comparison with COALESCE: `NULL <> 'algedonic'` is NULL (not
-          -- true) in SQL, so an unguarded comparison would silently drop the
-          -- very rows this fix restores.
-          COALESCE(SUM(CASE WHEN t.wakeId IS NOT NULL
-                             AND COALESCE(w.class, '') <> 'algedonic'
-                             AND COALESCE(w.summon, 0) = 0 THEN 1 ELSE 0 END), 0),
+          -- counts here whether or not the fabric ever stamped it.
+          --
+          -- `w.wakeId IS NOT NULL` — not `t.wakeId IS NOT NULL` (Sol xhigh
+          -- review round 2, finding 3): the LEFT JOIN's `w.*` columns are also
+          -- NULL when `t.wakeId` names a wake that does not exist (a dangling
+          -- reference), and a naive `COALESCE(w.class, '') <> 'algedonic'`
+          -- treats a JOIN MISS exactly like a real unclassed wake — counting
+          -- a dangling reference as coordination traffic that was never
+          -- actually materialized by any wake. Requiring the joined row
+          -- excludes that case while still allowing a real wake's NULL class
+          -- through: `w.class IS NOT 'algedonic'` is NULL-safe (`IS`/`IS NOT`
+          -- never themselves evaluate to NULL), so it is true for a real
+          -- unclassed wake and false only for an actual `algedonic` class —
+          -- and once `w.wakeId IS NOT NULL` holds, `w.summon` is a real,
+          -- NOT NULL column, so a plain `= 0` is safe without COALESCE.
+          COALESCE(SUM(CASE WHEN w.wakeId IS NOT NULL
+                             AND w.summon = 0
+                             AND w.class IS NOT 'algedonic' THEN 1 ELSE 0 END), 0),
           COALESCE(SUM(CASE WHEN w.summon = 1 THEN 1 ELSE 0 END), 0),
           COALESCE(SUM(CASE WHEN w.class = 'algedonic' THEN 1 ELSE 0 END), 0)
         FROM turns AS t

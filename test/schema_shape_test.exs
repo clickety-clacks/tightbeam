@@ -43,13 +43,13 @@ defmodule Tightbeam.SchemaShapeTest do
   test "a fresh database is created and stamped", %{db: db} do
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["coordination-fabric-classes-v1"]]} =
+    assert {:ok, [["coordination-fabric-classes-v2"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     # Idempotent: booting twice is the ordinary case, not a shape change.
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["coordination-fabric-classes-v1"]]} =
+    assert {:ok, [["coordination-fabric-classes-v2"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
   end
 
@@ -232,7 +232,7 @@ defmodule Tightbeam.SchemaShapeTest do
     assert {:ok, ^before_rows} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
     assert {:ok, []} = DB.query(db, "SELECT wakeId FROM wake_cancellations")
 
-    assert {:ok, [["coordination-fabric-classes-v1"]]} =
+    assert {:ok, [["coordination-fabric-classes-v2"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
   end
 
@@ -315,7 +315,78 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "some-later-shape"
+    assert error.message =~ "coordination-fabric-classes-v2"
+  end
+
+  # Sol xhigh review round 2, finding 2: `classElection`'s CHECK constraint
+  # gained `'batcher'` (round-1 finding 7), but `CREATE TABLE IF NOT EXISTS`
+  # does not widen an existing table's CHECK any more than it adds a column.
+  # A `coordination-fabric-classes-v1` database's `wakes` table — reconstructed
+  # here byte-for-byte from cafe321's DDL — still enforces the OLD two-value
+  # CHECK. Without the shape bump, this database would boot silently (its
+  # stamp used to match `@shape`) and the first digest-carrier insert would
+  # die on a raw, unnamed `CHECK constraint failed` deep inside the batcher.
+  # This proves the boot gate now refuses it BY NAME first, before any DDL or
+  # insert ever reaches the stale constraint.
+  test "a coordination-fabric-classes-v1 database is refused by name, never a raw CHECK violation",
+       %{db: db} do
+    :ok =
+      DB.execute(db, """
+      CREATE TABLE schema_stamp (
+        shape     TEXT PRIMARY KEY,
+        stampedAt INTEGER NOT NULL
+      );
+      INSERT INTO schema_stamp (shape, stampedAt) VALUES ('coordination-fabric-classes-v1', 1);
+      CREATE TABLE wakes (
+        wakeId     TEXT PRIMARY KEY,
+        sessionKey TEXT NOT NULL,
+        targetRole TEXT,
+        origin     TEXT NOT NULL,
+        prompt     TEXT,
+        consumer   TEXT NOT NULL DEFAULT 'prompt',
+        dueAt      INTEGER NOT NULL,
+        state      TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','fired','canceled')),
+        createdAt  INTEGER NOT NULL,
+        firedAt    INTEGER,
+        reresolve  TEXT NULL CHECK (reresolve IN ('lineage')),
+        reresolveSeed TEXT NULL,
+        reresolveRung INTEGER NULL,
+        conditionKind TEXT NULL,
+        conditionScope TEXT NULL,
+        conditionAfterId INTEGER NULL,
+        firedBy TEXT NULL CHECK (firedBy IN ('condition','fallback')),
+        creatorSessionKey TEXT NULL,
+        rumination INTEGER NOT NULL DEFAULT 0,
+        work_item_id TEXT,
+        assignmentId TEXT,
+        canceledAt INTEGER,
+        targetGate INTEGER NOT NULL DEFAULT 1,
+        class TEXT,
+        classElection TEXT CHECK (classElection IN ('sender','classifier')),
+        deliveryRule TEXT,
+        digest INTEGER NOT NULL DEFAULT 0 CHECK (digest IN (0,1)),
+        summon INTEGER NOT NULL DEFAULT 0 CHECK (summon IN (0,1)),
+        CHECK (consumer != 'prompt' OR prompt IS NOT NULL),
+        CHECK ((class IS NULL) = (classElection IS NULL)),
+        CHECK (digest = 0 OR class IS NOT NULL)
+      );
+      """)
+
+    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
+
     assert error.message =~ "coordination-fabric-classes-v1"
+    assert error.message =~ "coordination-fabric-classes-v2"
+    assert error.message =~ "no migration"
+
+    # It REFUSED — it did not repair or widen the constraint in place.
+    assert {:ok, [[ddl]]} =
+             DB.query(
+               db,
+               "SELECT sql FROM sqlite_master WHERE type='table' AND name='wakes'"
+             )
+
+    assert ddl =~ "classElection IN ('sender','classifier')"
+    refute ddl =~ "batcher"
   end
 
   defp table?(db, name) do

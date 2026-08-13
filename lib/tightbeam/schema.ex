@@ -42,7 +42,19 @@ defmodule Tightbeam.Schema do
   # read with `no such column` — and a hand-added column would be worse, because
   # its rows would carry no class election at all while the shape claimed they
   # did. Refuse, name it, and let the database be recreated.
-  @shape "coordination-fabric-classes-v1"
+  #
+  # `coordination-fabric-classes-v2` (2026-08-13, Sol xhigh review round 2,
+  # finding 2): `wakes.classElection`'s CHECK constraint gained `'batcher'` —
+  # the digest carrier's honest attribution (round-1 finding 7; the batcher
+  # built the carrier, so stamping it `'sender'` was an untrue audit fact).
+  # `CREATE TABLE IF NOT EXISTS` does not ALTER an existing table's
+  # constraints any more than it adds a column: a `coordination-fabric-classes-v1`
+  # database's `wakes` table still enforces the OLD two-value CHECK, so the
+  # first digest-carrier insert against it would die on a raw, unnamed SQLite
+  # `CHECK constraint failed` — the exact kind of surprise this stamp exists to
+  # turn into a named refusal instead. Bump it so that database is refused BY
+  # NAME, same as any other shape this build cannot read.
+  @shape "coordination-fabric-classes-v2"
 
   @supervision_liveness_objects [
     %{
