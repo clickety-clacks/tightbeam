@@ -119,21 +119,23 @@ defmodule Tightbeam.CoordinationFabricTest do
 
   test "the ceiling is the exit for an idle session: the digest materializes its own turn",
        %{db: db} do
-    filed = System.system_time(:millisecond)
     a = schedule(db, session: "agent:po", class: "fyi", prompt: "the build finished")
     b = schedule(db, session: "agent:po", class: "fyi", prompt: "docs merged")
 
+    # The clock the batcher reads is the ROW's, not the test's: a wall clock
+    # sampled a millisecond earlier makes this proof pass by luck.
     ceiling = Wakes.delivery_policy("fyi").ceiling_ms
+    due = b.created_at + ceiling
     assert a.due_at - a.created_at == ceiling
     assert a.delivery_rule == Wakes.digest_rule()
 
     # No turn ever runs for this session. Before the ceiling: nothing fires —
     # and nothing is lost either.
-    assert Wakes.materialize_digests(db, filed + ceiling - 1) == []
+    assert Wakes.materialize_digests(db, a.created_at + ceiling - 1) == []
     assert Wakes.get(db, a.wake_id).state == "pending"
 
     # At the ceiling the digest exists WITHOUT anyone deciding anything.
-    assert [digest_id] = Wakes.materialize_digests(db, filed + ceiling)
+    assert [digest_id] = Wakes.materialize_digests(db, due)
     digest = Wakes.get(db, digest_id)
 
     assert digest.digest
@@ -180,13 +182,12 @@ defmodule Tightbeam.CoordinationFabricTest do
 
   test "classes are digested apart, so a 30-minute ceiling is not stretched to four hours",
        %{db: db} do
-    filed = System.system_time(:millisecond)
     schedule(db, session: "agent:po", class: "fyi", prompt: "fyi one")
     decision = schedule(db, session: "agent:po", class: "input-needed", prompt: "pick a or b")
 
     assert decision.due_at - decision.created_at == 1_800_000
 
-    assert [digest_id] = Wakes.materialize_digests(db, filed + 1_800_000)
+    assert [digest_id] = Wakes.materialize_digests(db, decision.due_at)
     digest = Wakes.get(db, digest_id)
 
     assert digest.class == "input-needed"
@@ -196,13 +197,10 @@ defmodule Tightbeam.CoordinationFabricTest do
 
   test "LAW 2: a carried member keeps its row and points at the digest that carries it",
        %{db: db} do
-    filed = System.system_time(:millisecond)
-
     member =
       schedule(db, session: "agent:po", class: "fyi", prompt: "the whole payload, verbatim")
 
-    assert [digest_id] =
-             Wakes.materialize_digests(db, filed + Wakes.delivery_policy("fyi").ceiling_ms)
+    assert [digest_id] = Wakes.materialize_digests(db, member.due_at)
 
     carried = Wakes.get(db, member.wake_id)
 
@@ -233,11 +231,9 @@ defmodule Tightbeam.CoordinationFabricTest do
 
   test "the digest names the rule that produced it and the trigger that released it",
        %{db: db} do
-    filed = System.system_time(:millisecond)
-    schedule(db, session: "agent:po", class: "fyi", prompt: "one")
+    held = schedule(db, session: "agent:po", class: "fyi", prompt: "one")
 
-    assert [digest_id] =
-             Wakes.materialize_digests(db, filed + Wakes.delivery_policy("fyi").ceiling_ms)
+    assert [digest_id] = Wakes.materialize_digests(db, held.due_at)
 
     assert {:ok, [[detail]]} =
              DB.query(
@@ -254,9 +250,8 @@ defmodule Tightbeam.CoordinationFabricTest do
 
   test "a digest carrier is not itself held, and materializing twice carries nothing twice",
        %{db: db} do
-    filed = System.system_time(:millisecond)
-    schedule(db, session: "agent:po", class: "fyi", prompt: "one")
-    at = filed + Wakes.delivery_policy("fyi").ceiling_ms
+    held = schedule(db, session: "agent:po", class: "fyi", prompt: "one")
+    at = held.due_at
 
     assert [digest_id] = Wakes.materialize_digests(db, at)
 
