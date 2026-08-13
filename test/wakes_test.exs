@@ -320,7 +320,7 @@ defmodule Tightbeam.WakesTest do
     assert states[replacement.wake_id] == {"pending", 2}
   end
 
-  test "O1: retarget carries the sender's class election verbatim but re-derives delivery policy for the new target",
+  test "O1: retarget carries the sender's class election AND the original ceiling verbatim — never restarts it",
        %{db: db} do
     active_sessions!(db, ["a", "b"])
 
@@ -340,15 +340,22 @@ defmodule Tightbeam.WakesTest do
     refute original.digest
     refute original.summon
 
-    # Backdate the original's filing/ceiling so the ceiling recompute below is
-    # provably NOT a coincidental copy — the real clock alone could otherwise
-    # land both wakes in the same millisecond and pass this test by luck.
+    # Backdate the original's filing time deep into its own ceiling window —
+    # 3h59m into a 4h `fyi` ceiling — so a restarted ceiling (retarget-moment
+    # + ceiling_ms) is provably DIFFERENT from the preserved one, not a
+    # coincidental match (Sol xhigh review round 2, finding 1: Invariant 3 —
+    # the ceiling anchors on the wake's own creation, never on when it
+    # happened to get retargeted; recomputing it here would let this `fyi`
+    # land at 7h59m, a straight §7 violation).
     ceiling = Wakes.delivery_policy("fyi").ceiling_ms
+    original_created_at = 1000
+    original_due_at = original_created_at + ceiling - 60_000
 
     {:ok, _} =
-      DB.query(db, "UPDATE wakes SET createdAt=1000, dueAt=?2 WHERE wakeId=?1", [
+      DB.query(db, "UPDATE wakes SET createdAt=?2, dueAt=?3 WHERE wakeId=?1", [
         original.wake_id,
-        1000 + ceiling
+        original_created_at,
+        original_due_at
       ])
 
     original = Wakes.get(db, original.wake_id)
@@ -366,12 +373,16 @@ defmodule Tightbeam.WakesTest do
     refute replacement.summon
     assert replacement.session_key == "b"
 
-    # POLICY RE-APPLIED FOR THE NEW TARGET: a digest-held member's ceiling
-    # window re-opens from THIS retarget moment — it joins B's own group and
-    # B's own boundary, not a copy of A's already-elapsing timing.
+    # THE CEILING IS PRESERVED, NOT RESTARTED: the replacement's `dueAt` is
+    # the ORIGINAL's, byte-identical — never `replacement.created_at +
+    # ceiling`, which would extend it. B's own turn-boundary eligibility is
+    # handled dynamically, by grouping on the row's new `sessionKey` at the
+    # next materialization pass — nothing here needs to move `dueAt` for
+    # that to be true.
     assert replacement.delivery_rule == Wakes.digest_rule()
-    assert replacement.due_at == replacement.created_at + ceiling
-    refute replacement.due_at == original.due_at
+    assert replacement.due_at == original_due_at
+    assert replacement.due_at == original.due_at
+    refute replacement.due_at == replacement.created_at + ceiling
   end
 
   test "O1: a retargeted summon keeps summon, and a sender-scheduled moment stays unmoved",

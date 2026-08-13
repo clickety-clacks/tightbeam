@@ -605,45 +605,27 @@ defmodule Tightbeam.Wakes do
   # SENDER's facts, not the batcher's — retarget is org.ex:688's unroutable
   # remedy (a target session retired), and moving WHO receives a wake must
   # never destroy WHAT the sender elected or what the row IS. The INSERT
-  # above now carries all five columns verbatim; this function decides only
-  # the two that were NEVER the sender's facts in the first place.
+  # above now carries all five columns verbatim.
   #
-  # `deliveryRule`/`dueAt` are the BATCHER's timing decision, made against
-  # the OLD target — retargeting must not silently keep counting against a
-  # boundary the NEW target never crosses, but it must also never move a
-  # moment the original scheduling already fixed on purpose. Rather than
-  # guessing which original input flags produced that moment, this replays
-  # the SAME distinction `apply_delivery_policy/5` already draws, honestly,
-  # from the row's own already-stored `deliveryRule` fact:
+  # `deliveryRule`/`dueAt` are carried VERBATIM too, and deliberately (Sol
+  # xhigh review round 2, finding 1 — Invariant 3): the CEILING anchors on
+  # the wake's own CREATION, never on when it happened to get retargeted.
+  # `created_at + ceiling_ms`, computed against the RETARGET moment, was
+  # this function's first draft and it was wrong — it RESTARTS the ceiling,
+  # so an `fyi` retargeted at 3h59m could land at 7h59m, a straight §7
+  # violation (a wake held longer because its target retired is a worse
+  # answer than the one Law 2 already gives: the row's original `dueAt` is
+  # already the correct ceiling, computed once, honestly, at filing time).
+  # There is nothing to recompute here, and nothing to tighten either —
+  # `source.due_at` already IS the anchor.
   #
-  #   * unclassed (`class: nil`) — not fabric traffic; `dueAt` untouched,
-  #     exactly as before this fix.
-  #   * the carrier itself (`digest: true`) — already the batcher's own
-  #     decided moment; retargeting rebinds WHO receives it, never WHEN.
-  #   * an immediate/bypass class (blocker/algedonic) — the sender's own
-  #     election (§7: "never batched, never digested"); untouched.
-  #   * `deliveryRule == @inhibited_rule` — the sender (or a condition, or an
-  #     internal consumer) already named its own moment; the batcher never
-  #     held this one and retargeting must not start holding it now.
-  #   * anything else — a genuine digest-HELD member. This is the case O1's
-  #     record names explicitly: "a digest-held wake for session A retargeted
-  #     to B must join B's group/boundary, not keep A's timing." Its ceiling
-  #     window re-opens from THIS retarget moment, so the next materialization
-  #     pass groups and releases it against the NEW target, not the old one.
-  defp retarget_delivery(%{class: nil} = source, _created_at), do: {nil, source.due_at}
-
-  defp retarget_delivery(%{digest: true} = source, _created_at),
-    do: {source.delivery_rule, source.due_at}
-
-  defp retarget_delivery(%{class: class} = source, created_at) do
-    policy = delivery_policy(class)
-
-    cond do
-      policy.immediacy != :digest -> {source.delivery_rule, source.due_at}
-      source.delivery_rule == @inhibited_rule -> {@inhibited_rule, source.due_at}
-      true -> {@digest_rule, created_at + policy.ceiling_ms}
-    end
-  end
+  # The new target's own turn-boundary eligibility needs no help from this
+  # function: `materialize_due/4` re-reads `group_boundary/2` FRESH every
+  # materialization pass, against whatever session or role the row names
+  # NOW — retargeting a digest-held member into the new target's group is
+  # the whole mechanism. Nothing about WHEN it is due needs to move for that
+  # to be true.
+  defp retarget_delivery(source, _created_at), do: {source.delivery_rule, source.due_at}
 
   @requester_kinds ~w(user session process)
   @reason_kinds ~w(requester_withdrew superseded obligation_disposed routing_bracket_satisfied target_retired production_unmatched consumer_unavailable target_unresolvable)
