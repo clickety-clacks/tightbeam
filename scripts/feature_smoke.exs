@@ -22,6 +22,14 @@
 # wants both legs green (artifact-carrier-proposal-v1 §7.3); the filter is for
 # answering one leg's question quickly, not for satisfying the gate.
 #
+# TIGHTBEAM_SMOKE_DEADLINE_S (default 30) is the one knob for every plain HTTP/DB
+# round-trip budget in this file: the curl `--max-time` ceiling and the short await
+# loops (episode settle, effort check-in, skill materialization, turn boundary). Raise
+# it on a loaded box — live e2e evidence has the dispatch verb's own pre-turn work
+# running past 30s on a fully functional host. It does NOT cover the two budgets that
+# wait on real model turns (`@turn_observer_wait_ms`, `@lane_slack_ms`); those stay
+# fixed so a genuine turn-side hang cannot hide behind a knob meant for a slow box.
+#
 # The last two groups cover artifact-carrier-proposal-v1 §7.3 as a pair, and the
 # split between them is deliberate. `check_gate_chain_enforced/1` proves the LAW —
 # each statute denies while its fact is unsatisfied, and the artifact releases the
@@ -55,9 +63,22 @@ defmodule FeatureSmoke do
 
   @owner System.get_env("TIGHTBEAM_SMOKE_OWNER") || "mike"
 
+  # ONE knob for every plain 30s budget in this file: the curl round-trip ceiling and
+  # the short await loops (episode settle, effort check-in, skill materialization, turn
+  # boundary). 30s assumed a box that hands the HTTP response back quickly; live e2e
+  # evidence on a loaded mac says otherwise — the dispatch verb's own pre-turn work can
+  # run past 30s while the box is otherwise fully functional (turns deliver in ~3.5s once
+  # created), so a fixed 30s reads a working box as a hang. `TIGHTBEAM_SMOKE_DEADLINE_S`
+  # widens (or narrows) that ceiling without touching the file. Deliberately NOT applied
+  # to `@turn_observer_wait_ms` or `@lane_slack_ms` below — those budget real model turns,
+  # not HTTP/DB round trips, and conflating the two would hide a genuine turn-side hang
+  # behind a knob meant for a loaded box's dispatch path.
+  @smoke_deadline_s (System.get_env("TIGHTBEAM_SMOKE_DEADLINE_S") || "30") |> String.to_integer()
+  @smoke_deadline_ms @smoke_deadline_s * 1000
+
   # How long a remedy episode gets to reach a status. The transition rides the attest
   # that provoked it, so this covers scheduling, not model time.
-  @episode_settle_ms 30_000
+  @episode_settle_ms @smoke_deadline_ms
 
   # This smoke-owned wait stops only the observer. It never reaches runtime execution.
   @turn_observer_wait_ms :timer.minutes(10)
@@ -530,6 +551,15 @@ defmodule FeatureSmoke do
   # triggers the remedy, which assigns a reviewer and blocks completion; the gate
   # self-releases once the linked review-holder verdict lands.
   # Requires the `completion-requires-review` rail loaded (identity/rules/engineering.toml).
+  #
+  # THIS GROUP IS ABOUT THE REVIEW GATE, not the newer `code-review-requires-passing-tests`
+  # one — that gate's own proof, including its denial, lives in
+  # `check_gate_chain_enforced/1`. But that rule is chained onto the `assign` verb, and the
+  # review remedy's own producer call IS an `assign` — so a coder with no filed
+  # `tests-passed` receipt would have THAT assign blocked before the reviewer is ever
+  # named, and step 1 below would read `code-review-requires-passing-tests`, not
+  # `completion-requires-review`, failing this group on the wrong statute. Filing the
+  # receipt first keeps this group asserting the one thing its name says it does.
   defp check_flagship_review_loop(state) do
     u = unique()
     # A reviewer role bound to a live reviewer session (the remedy's assign target).
@@ -573,6 +603,23 @@ defmodule FeatureSmoke do
       })
 
     asg_id = asg["id"] || asg["assignmentId"]
+
+    # 0. Clear code-review-requires-passing-tests up front — precondition for THIS group,
+    # not its subject. The fixture has no real code to test, so the note says so plainly
+    # rather than claiming a suite that never ran; the gate checks kind + a non-blank note
+    # on the holder's own session, nothing structural. `ok_as!` raises on any error, which
+    # is exactly right here: this filing is not itself under test.
+    ok_as!(state, coder_tok, "attest", %{
+      "assignmentId" => asg_id,
+      "kind" => "verdict",
+      "verdictKind" => "tests-passed",
+      "note" =>
+        tests_passed_note(
+          "command n/a (fixture assignment #{asg_id} carries no code to test), " <>
+            "result: passing — filed only to clear code-review-requires-passing-tests so " <>
+            "this group can drive the review gate, which is what it actually asserts"
+        )
+    })
 
     # 1. Coder attests completion with NO review on record → BLOCKED by the rule.
     # (The wire exposes only code+message; a remedy and a plain deny both carry
@@ -735,8 +782,62 @@ defmodule FeatureSmoke do
     end
 
     try do
-      # 1. Review gate. Its remedy assigns the bound reviewer, synchronously inside the
-      # attest, so the review exists by the time the denial response returns.
+      # 0. The tests-passed gate — the newest link in the chain
+      # (code-review-requires-passing-tests, priv/kungfu/agentic-engineering/rules/
+      # engineering.toml). It is chained onto the `assign` verb, not `attest`, so it never
+      # denies the completion directly: it denies the REVIEW REMEDY's own producer call,
+      # before the review ever exists. With no `tests-passed` receipt on file yet, this
+      # attest still reads `rule_denied` — the remedy fired, tried to assign the bound
+      # reviewer, and that assign was itself denied — so the reviewer is NOT assigned here
+      # (confirmed below) and completion-requires-review has not had a chance to deny on
+      # its own account yet.
+      #
+      # TWO rows land against this one call, not one, and both name the same statute. The
+      # inner `assign` dispatch (the remedy's producer call) hits its own `:deny` decision
+      # and writes its own best-effort row; `RailRemedy.lease_and_dispatch/9` then reports
+      # the remedy "blocked" with that denial attached, and the OUTER `attest` dispatch's
+      # `:remedy` branch always writes its own row too — `Dispatch.remedy_error/2` merges
+      # the inner denial's `rule`/`ref`/`message` onto the outer error first, so the outer
+      # row carries the SAME statute name rather than `completion-requires-review`. Two
+      # verbs (`assign`, `attest`), two independent `Dispatch.dispatch/3` calls, two true
+      # audit rows for one HTTP round trip — not a retry (`denied!/4` calls `attempt` once)
+      # and not a stray extra append (the shape is deterministic: any remedy whose own
+      # producer call is denied by a rule chained onto that producer's verb double-writes
+      # exactly this way). Asserting the pair is what proves it is this shape and not one.
+      denied!(
+        state,
+        ["code-review-requires-passing-tests", "code-review-requires-passing-tests"],
+        asg_id,
+        complete
+      )
+
+      no_reviews_yet = ok!(state, "assignments", %{"sessionKey" => reviewer_key})
+
+      assert(
+        state,
+        (no_reviews_yet["assignments"] || no_reviews_yet)
+        |> List.wrap()
+        |> Enum.all?(fn a -> (a["reviewsAssignmentId"] || a["reviews"]) != asg_id end),
+        "gate chain: the reviewer already holds a review of #{asg_id} before any tests-passed " <>
+          "receipt was filed — the tests-passed gate should have blocked the remedy's assign " <>
+          "before it got that far. Got: #{inspect(no_reviews_yet)}"
+      )
+
+      # The receipt. Filed by the HOLDER's own session with a non-blank note — that is the
+      # whole of what `assignment.holder_noted_verdict_kinds` checks
+      # (`Rules.compute_fact/4`); nothing here reads the note's content, but this smoke
+      # only ever writes true ones, so it names the actual command this group's own
+      # `seed_verifiable_work!/3` already ran and verified.
+      ok_as!(state, holder.token, "attest", %{
+        "assignmentId" => asg_id,
+        "kind" => "verdict",
+        "verdictKind" => "tests-passed",
+        "note" => tests_passed_note("command `sh #{holder.check.name}`, result: passing")
+      })
+
+      # 1. Review gate, reachable now that the tests-passed receipt is on file. Its remedy
+      # assigns the bound reviewer, synchronously inside the attest, so the review exists
+      # by the time the denial response returns.
       denied!(state, "completion-requires-review", asg_id, complete)
 
       reviews = ok!(state, "assignments", %{"sessionKey" => reviewer_key})
@@ -939,10 +1040,11 @@ defmodule FeatureSmoke do
 
       pass(
         state,
-        "gate chain enforced: review(#{reviewer_leg.wire_name}) → verification → artifact " <>
-          "denied in order, released by a #{recorded["recordedTurnEvidence"]} row (gate is " <>
-          "evidence-blind, classes not spoofable), completes, episode closed — holder: " <>
-          "#{materialized} turn(s) materialized, #{started} started"
+        "gate chain enforced: tests-passed → review(#{reviewer_leg.wire_name}) → " <>
+          "verification → artifact denied in order, released by a " <>
+          "#{recorded["recordedTurnEvidence"]} row (gate is evidence-blind, classes not " <>
+          "spoofable), completes, episode closed — holder: #{materialized} turn(s) " <>
+          "materialized, #{started} started"
       )
     after
       # EVERY assertion about an assignment outcome stays above this line: `retire` REVOKES
@@ -1199,6 +1301,19 @@ defmodule FeatureSmoke do
     }
   end
 
+  # The receipt `code-review-requires-passing-tests` demands: repository, commit, command
+  # (or suite), and passing result, as the rule's own message names them
+  # (priv/kungfu/agentic-engineering/rules/engineering.toml). The gate itself checks only
+  # that the HOLDER's own session filed a non-empty-noted `tests-passed` verdict
+  # (`Rules.compute_fact/4` on `assignment.holder_noted_verdict_kinds` — kind and a
+  # non-blank note, nothing structural) — but this smoke does not fabricate a passing run
+  # it never observed, so the note carries the repository and commit this checkout is
+  # actually AT, not a placeholder.
+  defp tests_passed_note(rest) do
+    {sha, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: File.cwd!())
+    "repository #{File.cwd!()}, commit #{String.trim(sha)}, #{rest}"
+  end
+
   # The reviewer runs on a different SELECTED leg wherever this run has one, and on the
   # holder's own harness when it does not.
   #
@@ -1304,11 +1419,25 @@ defmodule FeatureSmoke do
   # redundant here: it waited for the remedy turn, which is how a capable holder came to
   # satisfy the whole chain before the next denial could be asserted.
   #
-  # The window must hold EXACTLY ONE row for this assignment. Requiring one rather than
-  # taking the newest is what keeps the correlation exact without the drain: anything else
-  # writing a denial against this assignment inside the round trip fails the group loudly
-  # instead of being silently picked over.
+  # The window must hold EXACTLY the expected rows for this assignment, in order.
+  # Requiring an exact list rather than taking the newest — or merely checking membership
+  # — is what keeps the correlation exact without the drain: anything else writing a
+  # denial against this assignment inside the round trip fails the group loudly instead of
+  # being silently picked over.
+  #
+  # `statute` is usually one name, but it is a LIST for a call whose one HTTP round trip
+  # legitimately writes more than one row. `code-review-requires-passing-tests` is the
+  # case in point: it is chained onto the `assign` verb, so when a remedy's own producer
+  # call (e.g. completion-requires-review's reviewer assignment) is itself denied by it,
+  # TWO independent `Dispatch.dispatch/3` calls each hit their own deny branch and each
+  # write their own best-effort row — the inner `assign` and the outer `attest` that fired
+  # the remedy (`dispatch.ex` `remedy_error/2` carries the inner denial's `rule` onto the
+  # outer one once the remedy comes back blocked). That is two TRUE rows, not one row
+  # counted twice: passing a list here is how this group tells that apart from an
+  # accidental double append, rather than loosening the assertion to `in` and losing the
+  # ability to tell them apart at all.
   defp denied!(state, statute, assignment_id, attempt) when is_function(attempt, 0) do
+    expected = List.wrap(statute)
     watermark = events_watermark(state)
     res = attempt.()
     ceiling = events_watermark(state)
@@ -1316,20 +1445,20 @@ defmodule FeatureSmoke do
     assert(
       state,
       get_in(res, ["error", "code"]) == "rule_denied",
-      "artifact closure: completion should be denied by #{statute}, got #{inspect(res)}"
+      "artifact closure: completion should be denied by #{inspect(expected)}, got #{inspect(res)}"
     )
 
     recorded = recorded_denials(state, watermark, ceiling, assignment_id)
 
     assert(
       state,
-      recorded == [statute],
+      recorded == expected,
       "artifact closure: the denials recorded against #{assignment_id} by this call are " <>
-        "#{inspect(recorded)}, not exactly [#{inspect(statute)}]. The wire said #{inspect(res)}, " <>
+        "#{inspect(recorded)}, not exactly #{inspect(expected)}. The wire said #{inspect(res)}, " <>
         "but the wire cannot name a statute — an empty list means the denial row is missing " <>
-        "(best-effort append, or a non-statute refusal), another name means the chain is not " <>
-        "where this group thinks it is, and more than one means something else filed against " <>
-        "this assignment while the call was in flight."
+        "(best-effort append, or a non-statute refusal), a different list means the chain is " <>
+        "not where this group thinks it is, and an extra row means something else filed " <>
+        "against this assignment while the call was in flight."
     )
   end
 
@@ -1821,8 +1950,14 @@ defmodule FeatureSmoke do
 
     holder_key = get_in(holder, ["stream", "sessionKey"]) || holder["sessionKey"]
 
+    # `t0` is WALL clock, not monotonic: the timing report below diffs it directly
+    # against `openedAt`/`createdAt` columns, which are `System.system_time(:millisecond)`
+    # (`rail_remedy.ex`/`org.ex` `now/0`), so both sides of the subtraction need to be the
+    # same clock.
+    t0 = System.system_time(:millisecond)
+
     res =
-      ok!(state, "dispatch", %{
+      dispatch_with_timing!(state, t0, wi_id, holder_key, %{
         "sessionKey" => holder_key,
         "subject" => "smoke fanout #{unique()}",
         "brief" => "ship the smoke feature",
@@ -1850,6 +1985,91 @@ defmodule FeatureSmoke do
 
     retire(state, holder)
     pass(state, "dispatch opens an assignment linked to its work item (brackets F7)")
+  end
+
+  # `dispatch` is one HTTP call, but a deadline miss on it is not one fact — it is
+  # "somewhere between curl handing off the request and the row this verb is supposed to
+  # produce." Live e2e evidence on a loaded mac hit exactly that: the box was fully
+  # functional (turns delivered in ~3.5s once created) but this call's own pre-turn work
+  # — session lookup, workdir placement, the synchronous half of dispatch — ran past the
+  # deadline, and the failure read as an opaque hang. `ok!/3` alone cannot say which of
+  # those a timeout means, because a curl timeout throws the round trip away with no
+  # information about how far the SERVER got.
+  #
+  # So this call is the one place in the file that does not just assert — it retries
+  # nothing and changes nothing about `ok!/3`'s contract on success, but on failure it
+  # goes back to the database and asks, directly, how far dispatch got: a session row
+  # existed before this call ever ran (checked here as the first, cheapest fact), an
+  # assignment row is what the verb is opening, and a turn row is the wake dispatch fires
+  # once the assignment exists. Reporting which of those landed — and each one's own
+  # elapsed time from `t0` — turns "it hung" into "it reached the assignment row at 9.4s
+  # and never got a turn," which is the difference between chasing a hang and reading a
+  # trace.
+  defp dispatch_with_timing!(state, t0, wi_id, holder_key, params) do
+    ok!(state, "dispatch", params)
+  rescue
+    e in Failure ->
+      fail(state, e.message <> "\n" <> dispatch_timing_report(state, t0, wi_id, holder_key))
+  end
+
+  # Plain and explicit on purpose — three rows, three shapes, and a clever combinator
+  # over them would cost more to read than it saves to write.
+  defp dispatch_timing_report(state, t0, wi_id, holder_key) do
+    elapsed = System.system_time(:millisecond) - t0
+
+    session_line =
+      case sqlite(
+             state,
+             "SELECT createdAt FROM sessions WHERE sessionKey = #{sql_quote(holder_key)}"
+           ) do
+        "" ->
+          "session row: never reached (the spawn that should have created it ran earlier " <>
+            "in this check, so \"never\" here means the row went missing, not that it is " <>
+            "still pending)."
+
+        at ->
+          "session row: reached #{String.to_integer(at) - t0}ms after t0 (createdAt=#{at})."
+      end
+
+    assignment_line =
+      case sqlite(
+             state,
+             "SELECT id, openedAt FROM assignments WHERE workItemId = #{sql_quote(wi_id)} " <>
+               "AND holderKey = #{sql_quote(holder_key)} ORDER BY openedAt DESC LIMIT 1"
+           ) do
+        "" ->
+          "assignment row: never reached."
+
+        row ->
+          [id, opened_at] = String.split(row, "|")
+          "assignment row: reached #{String.to_integer(opened_at) - t0}ms after t0 (id=#{id})."
+      end
+
+    turn_line =
+      case sqlite(
+             state,
+             "SELECT status, createdAt FROM turns WHERE sessionKey = #{sql_quote(holder_key)} " <>
+               "ORDER BY createdAt DESC LIMIT 1"
+           ) do
+        "" ->
+          "turn row: never reached."
+
+        row ->
+          [status, created_at] = String.split(row, "|")
+          "turn row: reached #{String.to_integer(created_at) - t0}ms after t0 (status=#{status})."
+      end
+
+    Enum.join(
+      [
+        "dispatch timing breakdown against a #{@smoke_deadline_s}s deadline " <>
+          "(TIGHTBEAM_SMOKE_DEADLINE_S) — HTTP round trip: #{elapsed}ms since dispatch was " <>
+          "issued.",
+        session_line,
+        assignment_line,
+        turn_line
+      ],
+      "\n"
+    )
   end
 
   # --- effort-without-effect: durable parent check-in and reassignment ----------
@@ -1963,7 +2183,7 @@ defmodule FeatureSmoke do
   end
 
   defp await_effort_request!(state, assignment_id, prior_id) do
-    deadline = System.monotonic_time(:millisecond) + 30_000
+    deadline = System.monotonic_time(:millisecond) + @smoke_deadline_ms
     await_effort_request!(state, assignment_id, prior_id, deadline)
   end
 
@@ -2289,7 +2509,7 @@ defmodule FeatureSmoke do
     args = [
       "-sS",
       "--max-time",
-      "30",
+      Integer.to_string(@smoke_deadline_s),
       "-o",
       "-",
       "-w",
@@ -2352,7 +2572,7 @@ defmodule FeatureSmoke do
   end
 
   defp await_materialized_skills!(state, cwd, skills) do
-    deadline = System.monotonic_time(:millisecond) + 30_000
+    deadline = System.monotonic_time(:millisecond) + @smoke_deadline_ms
     await_materialized_skills!(state, cwd, skills, deadline)
   end
 
@@ -2399,7 +2619,7 @@ defmodule FeatureSmoke do
   end
 
   defp await_turn_boundary!(state, session_key) do
-    deadline = System.monotonic_time(:millisecond) + 30_000
+    deadline = System.monotonic_time(:millisecond) + @smoke_deadline_ms
     await_turn_boundary!(state, session_key, deadline)
   end
 
