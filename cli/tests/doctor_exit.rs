@@ -9,13 +9,51 @@ fn executable(path: &std::path::Path, body: &str) {
     fs::set_permissions(path, permissions).unwrap();
 }
 
-#[test]
-fn doctor_exits_nonzero_when_no_registered_harness_cli_is_runnable() {
+fn test_root(subject: &str) -> std::path::PathBuf {
     let unique = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let root = std::env::temp_dir().join(format!("tightbeam-doctor-exit-{unique}"));
+    std::env::temp_dir().join(format!("tightbeam-doctor-{subject}-{unique}"))
+}
+
+fn bank_captured_hollow_anthropic(base_dir: &std::path::Path) {
+    let store = base_dir.join("auth").join("claude");
+    fs::create_dir_all(store.join(".tightbeam")).unwrap();
+    fs::write(
+        store.join(".tightbeam").join("credential.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "provider": "anthropic",
+            "kind": "subscription",
+            "onboarded": true
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    // Captured from the real hollow Claude credential that caused the incident. Keep the
+    // surrounding vendor fields so this exercises the banked response shape, not a toy object.
+    let captured = serde_json::json!({
+        "claudeAiOauth": {
+            "accessToken": "",
+            "refreshToken": "",
+            "expiresAt": 0,
+            "refreshTokenExpiresAt": 0,
+            "scopes": [],
+            "subscriptionType": "",
+            "rateLimitTier": "",
+            "auditSecret": "MUST-NOT-LEAK"
+        }
+    });
+    fs::write(
+        store.join(".credentials.json"),
+        serde_json::to_vec(&captured).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn doctor_exits_nonzero_when_no_registered_harness_cli_is_runnable() {
+    let root = test_root("exit");
     let path = root.join("path");
     let base_dir = root.join("org");
     fs::create_dir_all(&path).unwrap();
@@ -38,6 +76,94 @@ fn doctor_exits_nonzero_when_no_registered_harness_cli_is_runnable() {
         !String::from_utf8_lossy(&output.stdout).contains("run tightbeam doctor"),
         "doctor's own note pointed back to doctor"
     );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn doctor_reports_banked_oauth_corruption_after_ps_failure() {
+    let root = test_root("corrupt");
+    let path = root.join("path");
+    let base_dir = root.join("org");
+    fs::create_dir_all(&path).unwrap();
+
+    executable(&path.join("codex"), "#!/bin/sh\nexit 0\n");
+    executable(&path.join("uname"), "#!/bin/sh\nprintf 'test-host\\n'\n");
+    executable(&path.join("ps"), "#!/bin/sh\nexit 1\n");
+    bank_captured_hollow_anthropic(&base_dir);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_tightbeam"))
+        .args(["doctor", "--json", "--base-dir", base_dir.to_str().unwrap()])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "a corrupt credential passed doctor"
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["credential_health"]["anthropic"]["status"],
+        "corrupt"
+    );
+    assert_eq!(
+        report["credential_health"]["anthropic"]["corrupt_fields"],
+        serde_json::json!([
+            "claudeAiOauth.accessToken",
+            "claudeAiOauth.refreshToken",
+            "claudeAiOauth.expiresAt"
+        ])
+    );
+    if cfg!(target_os = "macos") {
+        assert!(
+            report["epistemics"]["notes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|note| note == "probe: ps enumeration failed")
+        );
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("banked OAuth credential for anthropic is CORRUPT"));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("MUST-NOT-LEAK"));
+    assert!(!stderr.contains("MUST-NOT-LEAK"));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn doctor_reports_ordinary_ps_failure_as_structured_data_and_fails() {
+    let root = test_root("ps-failure");
+    let path = root.join("path");
+    let base_dir = root.join("org");
+    fs::create_dir_all(&path).unwrap();
+
+    executable(&path.join("codex"), "#!/bin/sh\nexit 0\n");
+    executable(&path.join("uname"), "#!/bin/sh\nprintf 'test-host\\n'\n");
+    executable(&path.join("ps"), "#!/bin/sh\nexit 1\n");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_tightbeam"))
+        .args(["doctor", "--json", "--base-dir", base_dir.to_str().unwrap()])
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "ps failure passed doctor");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["credential_health"]["anthropic"]["status"],
+        "not_banked"
+    );
+    assert!(
+        report["epistemics"]["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|note| note == "probe: ps enumeration failed")
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("probe: ps enumeration failed"));
 
     fs::remove_dir_all(root).unwrap();
 }
