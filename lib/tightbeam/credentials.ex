@@ -867,25 +867,33 @@ defmodule Tightbeam.Credentials do
   #
   # ACCEPTED COST, explicitly: a bad login can now displace a working
   # credential. That is recoverable by signing in again, and it is honest.
+  # ORDER IS THE INVARIANT: the durable not-onboarded marker commits BEFORE the
+  # credential is installed (Sol xhigh review, blocking 1 and 2). Installing
+  # first leaves two windows in which the PRIOR credential's `onboarded: true`
+  # metadata outlives it and comes to describe the new, never-activated
+  # candidate — so a restarted gateway reads the org healthy on a credential
+  # nothing ever verified. That is the same lie the rollback told, reached from
+  # the other side.
+  #
+  # Marking first means a metadata failure refuses while the store is still
+  # untouched: prior credential, prior metadata, consistent with each other and
+  # with what the operator was told. And a crash at any point after the mark
+  # leaves the org readably failed, which is the honest reading of an
+  # onboarding that did not finish.
   defp finish_staged_onboard(state, provider, kind, path) do
-    with {:ok, credential} <- install_staged!(state, provider, kind, path) do
-      case prepare_staged_activation(state, provider, kind) do
+    with :ok <- prepare_staged_activation(state, provider, kind),
+         {:ok, credential} <- install_staged!(state, provider, kind, path) do
+      case activate_staged_credential(state, provider, kind, credential) do
         :ok ->
-          case activate_staged_credential(state, provider, kind, credential) do
-            :ok ->
-              result =
-                with :ok <- state.on_credential_present.(provider),
-                     captured <- capture_sessions(state, provider),
-                     :ok <- state.resume.(provider) do
-                  publish_sessions(state, captured, :onboarded)
-                  :ok
-                end
+          result =
+            with :ok <- state.on_credential_present.(provider),
+                 captured <- capture_sessions(state, provider),
+                 :ok <- state.resume.(provider) do
+              publish_sessions(state, captured, :onboarded)
+              :ok
+            end
 
-              {result, update_in(state.present_but_unverified, &Map.delete(&1, provider))}
-
-            failure ->
-              failed_finish(state, provider, kind, failure)
-          end
+          {result, update_in(state.present_but_unverified, &Map.delete(&1, provider))}
 
         failure ->
           failed_finish(state, provider, kind, failure)
@@ -935,6 +943,14 @@ defmodule Tightbeam.Credentials do
   # serves `present_but_unverified` from both the in-memory map and the durable
   # marker, so the refusal survives a gateway restart — a failed login must not
   # look healthy again just because the process bounced.
+  #
+  # If THIS marker write fails too, the durable cause falls back to the
+  # pre-activation marker's "credential activation has not committed", which
+  # `finish_staged_onboard/4` committed before anything was installed. That is
+  # less specific than the vendor's own words — a known, accepted degradation
+  # (Sol xhigh review, important 1) — but it still fails closed, which is the
+  # property that matters. The verbatim reason reaches the caller in the
+  # returned compound error either way.
   defp failed_finish(state, provider, kind, failure) do
     cause = %{"finish" => inspect(failure)}
 
