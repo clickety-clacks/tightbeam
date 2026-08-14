@@ -171,6 +171,8 @@ defmodule Tightbeam.AdapterCoordinator do
     db = Keyword.get(opts, :db, Tightbeam.DB)
     :ok = Tightbeam.HarnessProcess.ensure_schema(db)
     :ok = Tightbeam.HarnessProcess.reconcile(db)
+    :ok = Tightbeam.CommandExecutions.ensure_schema(db)
+    :ok = Tightbeam.CommandExecutions.reconcile(db)
 
     {:ok,
      %{
