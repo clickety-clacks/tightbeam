@@ -1007,8 +1007,17 @@ defmodule Tightbeam.Wire.Router do
   # §Review-of relation pins both names ("wire `reviews`, atomized
   # `:reviews_assignment_id`"). Underscoring alone yields `:reviews`, which no
   # handler reads, so the link silently never landed.
+  #
+  # `tune.reasoningLevel` is the second: `Macro.underscore` turns the wire word
+  # into `:reasoning_level`, but the handler reads `:reasoningLevel` — the raw
+  # COLUMN spelling, which the device path builds by hand and so never went
+  # through atomization. Without this alias an agent's `--effort` crossed
+  # `/agent/dispatch`, matched no branch, and came back "tune does not support
+  # set_reasoning yet": a caller's explicit election answered as an unbuilt
+  # feature.
   @param_aliases %{
-    "assign" => %{reviews: :reviews_assignment_id}
+    "assign" => %{reviews: :reviews_assignment_id},
+    "tune" => %{reasoning_level: :reasoningLevel}
   }
 
   @doc false

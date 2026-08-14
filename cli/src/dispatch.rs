@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use crate::args::{Command, Identity, Target, ToplineSelection};
+use crate::args::{Command, Identity, Target, ToplineSelection, TuneControl};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestSpec {
@@ -252,6 +252,66 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 }
             }
             Ok(request(identity, "spawn", vec![], params))
+        }
+        Command::Tune {
+            identity,
+            session_key,
+            control,
+        } => {
+            // The `setting` word is chosen HERE from the variant the parser
+            // built, never taken from the caller. There is no spelling of this
+            // command that lets a caller name an arbitrary setting and have it
+            // forwarded: the typed path is the only path, and the generic
+            // live-config passthrough it replaced is not coming back. A
+            // control Tightbeam has no vocabulary for is a control it cannot
+            // verify, cannot report in sessionStatus, and must not pretend to
+            // have applied.
+            let mut params = Vec::new();
+            let mut model_fields = Vec::new();
+            match control {
+                TuneControl::Harness {
+                    harness,
+                    model,
+                    effort,
+                    context,
+                } => {
+                    params.push(string_field("setting", "set_harness"));
+                    params.push(string_field("harness", harness));
+                    model_fields.push(("model", model.clone().map(Some)));
+                    model_fields.push(("effort", effort.clone()));
+                    model_fields.push(("context", context.clone()));
+                }
+                TuneControl::Model {
+                    model,
+                    effort,
+                    context,
+                } => {
+                    params.push(string_field("setting", "set_model"));
+                    model_fields.push(("model", Some(Some(model.clone()))));
+                    model_fields.push(("effort", effort.clone()));
+                    model_fields.push(("context", context.clone()));
+                }
+                TuneControl::Effort(effort) => {
+                    params.push(string_field("setting", "set_reasoning"));
+                    params.push(string_field("reasoningLevel", effort));
+                }
+            }
+            // Same rule as `spawn`: a model field NAMED but empty crosses as
+            // JSON null, an omitted one stays omitted. Inheritance on the far
+            // side depends on telling those apart.
+            for (name, value) in model_fields {
+                match value {
+                    Some(Some(value)) => params.push(string_field(name, &value)),
+                    Some(None) => params.push(format!("\"{name}\":null")),
+                    None => {}
+                }
+            }
+            Ok(request(
+                identity,
+                "tune",
+                vec![string_field("sessionKey", session_key)],
+                params,
+            ))
         }
         Command::List { identity } => Ok(request(identity, "inspect", vec![], vec![])),
         Command::Retire {
@@ -1383,6 +1443,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::Artifacts { identity, .. }
         | Command::Spawn { identity, .. }
         | Command::List { identity }
+        | Command::Tune { identity, .. }
         | Command::Retire { identity, .. }
         | Command::Assign { identity, .. }
         | Command::Dispatch { identity, .. }
@@ -1447,6 +1508,95 @@ mod tests {
 
     fn body(values: &[&str]) -> String {
         build_request(&parse(values)).unwrap().body_json
+    }
+
+    #[test]
+    fn builds_byte_exact_tune_bodies_for_each_typed_control() {
+        // The `setting` word comes from the VARIANT, not from the caller.
+        // `sessionKey` is a body-root target field (the router resolves it),
+        // and the model identity crosses as separate fields.
+        assert_eq!(
+            body(&[
+                "tune",
+                "--session",
+                "agent:coder:x s_1",
+                "--harness",
+                "codex",
+                "--model",
+                "gpt-5.6-sol",
+                "--effort",
+                "high",
+                "--as-user",
+                "flynn",
+            ]),
+            r#"{"asUser":"flynn","verb":"tune","sessionKey":"agent:coder:x s_1","params":{"setting":"set_harness","harness":"codex","model":"gpt-5.6-sol","effort":"high"}}"#
+        );
+
+        // No model named: the key is OMITTED, so the gateway completes it
+        // from the destination harness's catalog. A CLI-invented default here
+        // would silence the one seam that knows what the host offers.
+        assert_eq!(
+            body(&[
+                "tune",
+                "--session",
+                "s_1",
+                "--harness",
+                "codex",
+                "--as-user",
+                "flynn"
+            ]),
+            r#"{"asUser":"flynn","verb":"tune","sessionKey":"s_1","params":{"setting":"set_harness","harness":"codex"}}"#
+        );
+
+        assert_eq!(
+            body(&[
+                "tune",
+                "--session",
+                "s_1",
+                "--model",
+                "claude-fable-5",
+                "--context",
+                "1m",
+                "--as-user",
+                "flynn",
+            ]),
+            r#"{"asUser":"flynn","verb":"tune","sessionKey":"s_1","params":{"setting":"set_model","model":"claude-fable-5","context":"1m"}}"#
+        );
+
+        // NAMED EMPTY crosses as JSON null, exactly as it does on spawn: the
+        // vendor's default window is a selection, not a silence.
+        assert_eq!(
+            body(&[
+                "tune",
+                "--session",
+                "s_1",
+                "--model",
+                "claude-fable-5",
+                "--context",
+                "",
+                "--as-user",
+                "flynn",
+            ]),
+            r#"{"asUser":"flynn","verb":"tune","sessionKey":"s_1","params":{"setting":"set_model","model":"claude-fable-5","context":null}}"#
+        );
+
+        // The effort form spells the gateway's column word. Without the
+        // router's `tune` param alias this arrives as `reasoning_level`,
+        // matches no branch, and comes back "tune does not support
+        // set_reasoning yet" — a caller's election answered as an unbuilt
+        // feature.
+        assert_eq!(
+            body(&[
+                "tune",
+                "--session",
+                "s_1",
+                "--effort",
+                "xhigh",
+                "--as-user",
+                "flynn"
+            ]),
+            r#"{"asUser":"flynn","verb":"tune","sessionKey":"s_1","params":{"setting":"set_reasoning","reasoningLevel":"xhigh"}}"#
+        );
     }
 
     #[test]

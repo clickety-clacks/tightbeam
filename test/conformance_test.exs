@@ -63,7 +63,14 @@ defmodule Tightbeam.ConformanceSupport do
     "question-carrier" => ~w(filed gates-nothing answered withdrawn not-rulable refuse),
     # Seam ④. `unpaged` is likewise its own word: the contract that an unlimited
     # read still returns everything is the one a default page size would break.
-    "read-cursor" => ~w(page resume unpaged exhausted roster-page refuse)
+    "read-cursor" => ~w(page resume unpaged exhausted roster-page refuse),
+    # A live engine switch has exactly two outcomes the substrate may reach: it
+    # applies, or it says no by name. There is no third word — no "queued", no
+    # "applied at the next boundary", no "switched to the nearest available" —
+    # because each of those would be the substrate deciding something on the
+    # caller's behalf (v0.2 program §4). Enumerated so adding one would have to
+    # be written down here first.
+    "live-switch" => ~w(refuse pass)
   }
   @load_twins [
     ~w(remedy-target-missing remedy-target-present),
@@ -230,6 +237,9 @@ defmodule Tightbeam.ConformanceSupport do
 
   defp applicable_runners("read-cursor", runners),
     do: Enum.filter(runners, &(&1 == "read_cursor"))
+
+  defp applicable_runners("live-switch", runners),
+    do: Enum.filter(runners, &(&1 == "live_switch"))
 
   defp applicable_runners(_kind, runners), do: runners
 
@@ -1358,6 +1368,83 @@ defmodule Tightbeam.ConformanceSupport do
     seen = seen ++ Enum.map(page.attests, & &1.id)
 
     if page.has_more_after, do: walk(db, handlers, call, page.next_after, seen), else: seen
+  end
+
+  @doc """
+  A live engine switch, driven through the DISPATCH CHOKEPOINT so the election
+  crosses the same seam an org would rail, and answered with a NAMED refusal.
+
+  Every case asserts three things, not one: the refusal is named, the session's
+  engine identity is byte-identical afterwards, and no transcript row was
+  appended. The second and third are what make a refusal free — a "no" that
+  still moved the history barrier would satisfy the first assertion alone.
+  """
+  def run_live_switch_fixture(fixture) do
+    Enum.each(fixture["cases"], fn kase ->
+      {db, pid} = memory_db!()
+
+      try do
+        ids = materialize_world(db, Map.get(kase, "world", %{}))
+        call = build_call(kase["call"], ids)
+        handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
+        before = live_switch_identity(db, call.session_key)
+
+        result = Dispatch.dispatch(db, handlers, call)
+
+        case kase["expect"] do
+          "refuse" ->
+            assert {:error, %{code: code}} = result,
+                   "#{kase["case"]}: expected a named refusal, got #{inspect(result)}"
+
+            assert code == kase["reason"],
+                   "#{kase["case"]}: the refusal must be named #{kase["reason"]}, got #{code}"
+
+          "pass" ->
+            assert {:ok, _} = result, "#{kase["case"]}: expected the switch to apply"
+        end
+
+        if kase["expect"] == "refuse" do
+          assert live_switch_identity(db, call.session_key) == before,
+                 "#{kase["case"]}: a refused switch must leave the session's engine untouched"
+
+          {:ok, [[appended]]} =
+            DB.query(db, "SELECT count(*) FROM messages WHERE sessionKey = ?1", [
+              call.session_key
+            ])
+
+          assert appended == 0,
+                 "#{kase["case"]}: a refused switch must append no marker and bury no row"
+        end
+
+        # A refusal an operator cannot find afterwards is a refusal that will be
+        # argued about. The denial rides the ordinary verb event log, so "who
+        # tried to re-engine this session, and what did the substrate say" is a
+        # question rows answer.
+        if kase["kind"] == "legibility" do
+          assert kase["emits"] == "eventlog:denied verb=tune"
+
+          assert Enum.any?(
+                   EventLog.events_after(db, 0, 50),
+                   &(&1.kind == "denied" and &1.verb == "tune")
+                 ),
+                 "#{kase["case"]}: the refused switch left no denied verb event"
+        end
+      after
+        GenServer.stop(pid)
+      end
+    end)
+  end
+
+  defp live_switch_identity(db, session_key) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT harness, provider, model, thinkingLevel, modelContext, clearedThroughSeq " <>
+          "FROM sessions WHERE sessionKey = ?1",
+        [session_key]
+      )
+
+    rows
   end
 
   def run_handler_refusal_fixture(fixture) do
@@ -4093,8 +4180,12 @@ defmodule Tightbeam.ConformanceTest do
     # Second wave (2026-08-13) adds two more GREEN C8 fixtures —
     # agent-question-carrier (seam ③) and read-cursors (seam ④) — on the same
     # both-axes rule as the first two.
-    assert length(@fixtures) == 70
-    assert active_fixtures == 60
+    # The live engine switch (2026-08-14) adds the C9 class and one GREEN
+    # fixture, live-engine-switch. Green on both axes, so it raises the total
+    # and the active count and leaves the ACTIVATED counts alone. The class is
+    # green too, so it adds no class registration either.
+    assert length(@fixtures) == 71
+    assert active_fixtures == 61
     assert exact_skips == 10
     assert activated_fixture_tests == 43
     assert activated_class_tests == 5
@@ -4495,6 +4586,7 @@ defmodule Tightbeam.ConformanceTest do
             "delivery_policy" -> Corpus.run_delivery_policy_fixture(fixture)
             "question_carrier" -> Corpus.run_question_carrier_fixture(fixture)
             "read_cursor" -> Corpus.run_read_cursor_fixture(fixture)
+            "live_switch" -> Corpus.run_live_switch_fixture(fixture)
           end)
         end
 

@@ -46,6 +46,13 @@ defmodule Tightbeam.Wire.Payloads do
   - `[adapter down]` — the harness engine this session runs on died and took
     the running turn with it; `[adapter recovered]` follows when the
     replacement is ready.
+  - `[engine swap]` — a caller elected a different HARNESS for this session.
+    The visible transcript restarts from the marker (rows below it are
+    RETAINED, never deleted, and stop being served) because a new engine
+    cannot load the previous engine's session.
+  - `[model retune]` — a caller elected a different MODEL on the SAME
+    harness. The engine and its conversation are unchanged and nothing is
+    hidden; only the mind answering moved.
 
   Markers carry `attentionTier` like any other message. The substrate elects
   it the way an agent elects its reply's, over the SAME vocabulary, and -1

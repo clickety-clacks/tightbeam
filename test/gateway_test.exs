@@ -2208,6 +2208,246 @@ defmodule Tightbeam.GatewayTest do
     assert total == 3, "the two earlier rows must still exist beneath the barrier"
   end
 
+  # THE ADJUDICATION BOUNDARY (v0.2 program §4), proved at the seam: a live
+  # switch happens because a CALLER named one, and every way it can fail is a
+  # NAMED refusal that leaves the session exactly as it was. Nothing here
+  # initiates a switch, holds one pending, or picks an engine on the caller's
+  # behalf.
+  describe "live engine switch: who may ask, and how it says no" do
+    setup ctx do
+      base_dir = role_test_base("live-switch")
+      Archetypes.load!(base_dir)
+
+      Org.create(ctx.db, %{
+        session_key: "live",
+        display_name: "Live",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("before-model")
+      })
+
+      for body <- ["first", "second"] do
+        Projection.append(ctx.db, %{
+          session_key: "live",
+          role: "user",
+          sender: "user:flynn",
+          content: body
+        })
+      end
+
+      %{
+        handlers: Gateway.handlers(gateway_config(base_dir, ctx.db, 0)),
+        before: Org.get(ctx.db, "live"),
+        base_dir: base_dir
+      }
+    end
+
+    test "an invented harness is refused BY NAME, never raised as a server fault", ctx do
+      # `Harness.parse!/1` raises, and a raise inside a handler is reported as
+      # `server_error` — the substrate blaming itself for a caller naming an
+      # engine that does not exist. Inventing a harness is refused exactly as
+      # inventing a model is.
+      assert %{ok: false, code: "unknown_harness", message: message} =
+               ctx.handlers["tune"].(%{
+                 origin: "user:flynn",
+                 session_key: "live",
+                 params: %{setting: "set_harness", harness: "gemini", model: "m"}
+               })
+
+      assert message =~ "unknown harness: gemini"
+      assert message =~ "claude", "the refusal must name what this build DOES offer"
+      assert Org.get(ctx.db, "live") == ctx.before
+    end
+
+    test "naming the resident harness is refused, and buries nothing", ctx do
+      # The destructive no-op: `apply_harness_change` moves the barrier to
+      # MAX(seq) unconditionally, so "switch claude to claude" would hide the
+      # whole visible transcript to swap an engine for itself. No recorded fact
+      # may be hidden to satisfy a request that changes nothing.
+      assert %{ok: false, code: "same_harness", message: message} =
+               ctx.handlers["tune"].(%{
+                 origin: "user:flynn",
+                 session_key: "live",
+                 params: %{setting: "set_harness", harness: "claude", model: "before-model"}
+               })
+
+      assert message =~ "already this session's harness"
+      assert Org.get(ctx.db, "live") == ctx.before
+
+      assert length(Projection.list_after(ctx.db, "live", nil, 50, 0)) == 2,
+             "a refused switch appends no marker and hides no row"
+    end
+
+    test "only the session's owner (or an admin) may re-engine it", ctx do
+      # ONE refusal for foreign and for process callers alike: which of them it
+      # was is not the caller's business to learn by probing.
+      for origin <- ["user:mallory", "process:cron"] do
+        assert %{ok: false, code: "not_found", message: "session not found"} =
+                 ctx.handlers["tune"].(%{
+                   origin: origin,
+                   session_key: "live",
+                   params: %{setting: "set_harness", harness: "fixture", model: "fixture-model"}
+                 }),
+               "#{origin} must not be able to re-engine flynn's session"
+      end
+
+      # The same gate covers the model and effort controls, which move the mind
+      # answering just as surely.
+      for setting <- [
+            %{setting: "set_model", model: "claude-sonnet-4-6"},
+            %{setting: "set_reasoning", reasoningLevel: "high"}
+          ] do
+        assert %{ok: false, code: "not_found"} =
+                 ctx.handlers["tune"].(%{
+                   origin: "user:mallory",
+                   session_key: "live",
+                   params: setting
+                 })
+      end
+
+      assert Org.get(ctx.db, "live") == ctx.before
+    end
+  end
+
+  test "durable queued work refuses the switch before any engine moves", ctx do
+    # THE SECOND GUARD. An idle lane proves no turn is RUNNING, but durable
+    # work can still sit QUEUED in the ledger — and switching there re-engines
+    # the session out from under a turn already accepted and recorded. The row
+    # survives either way (nothing is lost); what would be wrong is running it
+    # on an engine its author never chose.
+    base_dir = role_test_base("live-switch-queued")
+    auth_dir = Path.join([base_dir, "auth", "fixture"])
+    adapter = Path.join([base_dir, "adapters", "node_modules", ".bin", "fixture-acp"])
+    File.mkdir_p!(auth_dir)
+    File.write!(Path.join(auth_dir, "fixture.json"), "fixture-token")
+    File.mkdir_p!(Path.dirname(adapter))
+    File.write!(adapter, "#!/bin/sh\n")
+    File.chmod!(adapter, 0o755)
+    Archetypes.load!(base_dir)
+
+    start_supervised!(%{
+      id: :live_switch_queued_conn_registry,
+      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+    })
+
+    Org.create(ctx.db, %{
+      session_key: "queued",
+      display_name: "Queued",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("before-model")
+    })
+
+    {:appended, message} =
+      Projection.append(ctx.db, %{
+        session_key: "queued",
+        role: "user",
+        sender: "user:flynn",
+        content: "do the thing"
+      })
+
+    start_lane!(ctx.db, "queued")
+    before = Org.get(ctx.db, "queued")
+
+    # Enqueued from INSIDE the held boundary, so the lane cannot claim it and
+    # the race the second guard closes is the one actually under test.
+    config =
+      base_dir
+      |> gateway_config(ctx.db, 0)
+      |> Map.put(:on_tune_fence, fn ->
+        {:ok, _seq} =
+          Ledger.enqueue(ctx.db, %{
+            session_key: "queued",
+            message_id: message.id,
+            origin: "user:flynn",
+            prompt: "do the thing"
+          })
+
+        :ok
+      end)
+
+    assert %{ok: false, code: "turn_in_progress", message: refusal} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: "user:flynn",
+               session_key: "queued",
+               params: %{setting: "set_harness", harness: "fixture", model: "fixture-model"}
+             })
+
+    assert refusal =~ "queued or running turn"
+
+    # The exit is the CALLER's: retry at the boundary. Nothing was applied,
+    # nothing was queued on the caller's behalf, nothing was buried.
+    assert Org.get(ctx.db, "queued") == before
+    assert Org.get(ctx.db, "queued").cleared_through_seq == 0
+
+    assert length(Projection.list_after(ctx.db, "queued", nil, 50, 0)) == 1,
+           "a refused switch appends no tombstone"
+  end
+
+  test "a model retune leaves a marker naming both ends, and a no-op leaves none", ctx do
+    # A model change is a recorded fact ABOUT the session: an agent reading its
+    # own history must be able to see that the mind answering moved, and where.
+    # Unlike `[engine swap]` this hides nothing, so the marker promises nothing
+    # about the transcript.
+    base_dir = role_test_base("retune-marker")
+    Archetypes.load!(base_dir)
+
+    start_supervised!(%{
+      id: :retune_marker_conn_registry,
+      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+    })
+
+    Org.create(ctx.db, %{
+      session_key: "retune",
+      display_name: "Retune",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("claude-fable-5", effort: "low")
+    })
+
+    start_lane!(ctx.db, "retune")
+    handlers = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))
+
+    assert %{ok: true} =
+             handlers["tune"].(%{
+               origin: "user:flynn",
+               session_key: "retune",
+               params: %{setting: "set_model", model: "claude-sonnet-4-6"}
+             })
+
+    assert [marker] = Projection.list_after(ctx.db, "retune", nil, 50, 0)
+    assert marker.sender == "process:tightbeam", "the anti-forgery: no session can type one"
+    assert marker.content =~ "[model retune]"
+    assert marker.content =~ "claude-fable-5"
+    assert marker.content =~ "claude-sonnet-4-6"
+
+    refute marker.content =~ "RETAINED",
+           "a retune hides nothing, so it must not borrow the engine swap's promise"
+
+    # Re-electing the model the session already runs changed nothing, so there
+    # is nothing to mark: a "changed from X to X" row would be a false record.
+    assert %{ok: true} =
+             handlers["tune"].(%{
+               origin: "user:flynn",
+               session_key: "retune",
+               params: %{setting: "set_model", model: "claude-sonnet-4-6"}
+             })
+
+    assert length(Projection.list_after(ctx.db, "retune", nil, 50, 0)) == 1
+  end
+
   test "a failure between the barrier and its tombstone rolls BOTH back", ctx do
     base_dir = role_test_base("swap-atomic")
     auth_dir = Path.join([base_dir, "auth", "fixture"])

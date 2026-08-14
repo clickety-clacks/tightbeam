@@ -1,0 +1,48 @@
+[fixture]
+class = "C9"
+name = "live-engine-switch"
+phase = "green"
+blocking_phase = ""
+kind = "live-switch"
+source = "v0.2 program §4 adjudication boundary; 0.1.x supported live session tuning (835ebb3)"
+legibility = "eventlog:denied verb=tune"
+
+# THE INVARIANT THIS FIXTURE EXISTS TO HOLD DOWN: a live engine switch is an
+# ELECTION by an agent or a user, and every way the substrate can decline one is
+# a NAMED refusal that leaves the session exactly as it was.
+#
+# Two failure shapes are what this pins, and both are silent:
+#
+#   1. A REFUSAL THAT ISN'T ONE. Naming a harness this build does not carry used
+#      to raise, and a raise inside a handler is reported as `server_error` —
+#      the substrate blaming itself for a caller's typo, and telling the caller
+#      nothing about what it could have named instead. Each case below pins the
+#      refusal BY NAME, so a code that degrades back into a server fault, or
+#      into a neighbouring code, fails here.
+#
+#   2. A NO-OP THAT COSTS SOMETHING. The harness swap moves the history barrier
+#      unconditionally, so a switch that changes nothing still hides everything
+#      the session has said. Every case asserts the session row is byte-identical
+#      afterwards and that no transcript row was appended: a refused election
+#      must cost the caller nothing but the answer.
+#
+# `unknown-setting-is-refused-not-interpreted` is the one that guards the SHAPE
+# of the surface rather than one refusal in it. The typed path is the only path
+# — the generic live-config passthrough this capability replaced is deliberately
+# gone — so a setting Tightbeam has no vocabulary for is answered "unsupported"
+# and never routed to a nearest match. A control the substrate cannot verify or
+# report is one it must not pretend to have applied.
+#
+# WHAT IS NOT HERE, and why. Two properties of this capability cannot be reached
+# from a bare in-memory database and are proved at their own seams instead:
+#   - `turn_in_progress` (the durable-queue fence) fires INSIDE the held turn
+#     boundary, after credential, catalog, and spinup validation. Reaching it
+#     needs a real lane and a real host, so it is proved in `gateway_test.exs`
+#     ("durable queued work refuses the switch before any engine moves"), which
+#     enqueues from inside the boundary — the race the fence exists to close.
+#   - A SUCCESSFUL switch needs an adapter, a credential, and a catalog. Its
+#     barrier/tombstone atomicity is proved in `gateway_test.exs` too.
+# There is no [[fixture.rule]]: refusing to invent a harness is substrate
+# BEHAVIOUR, not org-authored law, and nothing here evaluates a statute. An org
+# that wants to gate switching further rails the `tune` verb, which reaches
+# `Rules.decide` at the Dispatch chokepoint like any other verb.

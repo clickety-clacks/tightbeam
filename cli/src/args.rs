@@ -25,6 +25,43 @@ pub enum Target {
     User(String),
 }
 
+/// The ONE runtime control a `tune` call changes.
+///
+/// A model is named by FIELDS — harness, model, effort, context — never by one
+/// packed string, and these variants are how the CLI makes a partial naming
+/// unrepresentable rather than merely discouraged. There is no state here
+/// holding a `--context` with no model for it to qualify, or an effort tier
+/// with nothing to apply it to: each variant is a complete election the
+/// gateway can answer against the destination host's catalog.
+///
+/// Every field the caller does not name is left for the CATALOG to complete,
+/// never for the CLI to invent — which is why the model fields are
+/// `Option<Option<String>>` (see `Command::Spawn`): a flag not passed and a
+/// flag passed empty are different requests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TuneControl {
+    /// A different HARNESS. The engine changes, so the engine's conversation
+    /// cannot come with it — Tightbeam's session, role, work, and graph
+    /// position do. Naming no model lets the destination catalog compose its
+    /// own default; the SOURCE model and its effort tier are never inherited
+    /// across the boundary, because a tier is vocabulary the destination may
+    /// not have.
+    Harness {
+        harness: String,
+        model: Option<String>,
+        effort: Option<Option<String>>,
+        context: Option<Option<String>>,
+    },
+    /// A different MODEL on the resident harness. The conversation survives.
+    Model {
+        model: String,
+        effort: Option<Option<String>>,
+        context: Option<Option<String>>,
+    },
+    /// A different reasoning tier for the resident model.
+    Effort(String),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     Help,
@@ -92,6 +129,14 @@ pub enum Command {
         context: Option<Option<String>>,
         handle: Option<String>,
         host: Option<String>,
+    },
+    /// Change one runtime control on a LIVE session. This is an ELECTION by
+    /// the caller: nothing in Tightbeam re-engines a session on its own, so
+    /// there is no form of this command that asks the substrate to choose.
+    Tune {
+        identity: Identity,
+        session_key: String,
+        control: TuneControl,
     },
     List {
         identity: Identity,
@@ -458,6 +503,30 @@ COMMANDS:
       context-window variant when it offers more than one. All must come from
       list's model catalog — never invent one.
 
+  tune --session <key> (--harness {{HARNESSES_PIPE}} [--model <model>] |
+       --model <model> | --effort <level>)
+       [--effort <level>] [--context <variant>]
+      Change ONE runtime control on a session that is already running. Model
+      identity remains separate fields, exactly as in spawn, and every field is
+      answered against that host's catalog — an invented harness or model is
+      refused by name, never substituted.
+        tightbeam tune --session "agent:coder:x s_1" \
+          --harness {{EXAMPLE_HARNESS}} --model <catalog-model> --as orchestrator:news
+      --model on its own retunes the model on the RESIDENT harness and the
+      engine's conversation survives. --harness changes the engine, so its
+      conversation cannot come along: the visible transcript restarts from an
+      [engine swap] marker (earlier rows are retained, not deleted) while the
+      Tightbeam session, its role, its work, and its graph position stay put.
+      Naming the resident harness again is refused — omit --harness for a
+      same-harness model change. Omitting --model with --harness lets the
+      destination catalog compose its own default; the source model and its
+      effort tier are never carried across the boundary.
+      A switch is YOUR election and lands only at a turn boundary: while the
+      session has a running or queued turn the call is refused with
+      turn_in_progress and nothing changes. Retry once the turn finishes —
+      Tightbeam will not queue the switch behind it, and never re-engines a
+      session on its own initiative.
+
   list
       Show the sessions you can address (with handles + provenance), the
       org's shape — archetypes (with allowed hosts), known hosts, and the
@@ -750,6 +819,26 @@ fn split_args(args: Vec<String>) -> Flags {
 
 fn nonempty(flags: &HashMap<String, String>, name: &str) -> Option<String> {
     flags.get(name).filter(|value| !value.is_empty()).cloned()
+}
+
+const TUNE_USAGE: &str = "usage: tightbeam tune --session <key> (--harness <harness> [--model <model>] | --model <model> | --effort <level>) [--effort <level>] [--context <variant>]";
+
+/// TIGHTBEAM'S EFFORT LEVELS ARE NOT PART OF A MODEL'S NAME.
+///
+/// The vendors spell a context variant `claude-fable-5[1m]` and Tightbeam once
+/// spelled a reasoning tier `gpt-5.6-sol[high]`. The syntaxes matched, so a
+/// catalog read the vendor's suffix as ours and the 1M-context model silently
+/// ceased to exist. The fields are separate everywhere below this line, so a
+/// bracket carrying one of OUR words is refused here rather than parsed:
+/// `--effort` is where an effort is named.
+///
+/// A bracket carrying anything else is the VENDOR's context variant and is
+/// none of this function's business — `claude-fable-5[1m]` passes.
+fn has_packed_effort(model: &str) -> bool {
+    model
+        .strip_suffix(']')
+        .and_then(|rest| rest.rsplit_once('['))
+        .is_some_and(|(_, packed)| matches!(packed, "low" | "medium" | "high" | "xhigh" | "max"))
 }
 
 /// PRESENCE, for the fields where an empty value means something. `nonempty`
@@ -1206,6 +1295,88 @@ fn parse_with_optional_catalog(
                 context: named(flags, "context"),
                 handle: nonempty(flags, "name"),
                 host: nonempty(flags, "host"),
+            })
+        }
+        "tune" => {
+            // A CLOSED flag set, unlike most commands. On every other verb an
+            // unrecognised flag is inert; here it is dangerous — `--modle
+            // claude-opus-5` would drop the model the caller named and switch
+            // the session to the destination harness's default instead, and
+            // the caller would read "ok: true" and believe otherwise.
+            const ALLOWED: &[&str] = &[
+                "session",
+                "harness",
+                "model",
+                "effort",
+                "context",
+                "as",
+                "as-user",
+                "as-process",
+            ];
+
+            // A live switch names ONE session. `--role`/`--user` are refused
+            // rather than resolved: re-engining "whoever currently holds
+            // reviewer" is a different act from re-engining a session, and
+            // which session that is must be the caller's own answer.
+            if parsed.positional.get(1).is_some()
+                || flags.keys().any(|flag| !ALLOWED.contains(&flag.as_str()))
+            {
+                return Err(TUNE_USAGE.to_owned());
+            }
+            // PRESENT-BUT-EMPTY is a real answer for `--effort` and
+            // `--context` — "no tier", "the vendor's default window" — and is
+            // carried through as one. It is not an answer for the other three:
+            // there is no session named "", no engine named "", no model
+            // named "".
+            for name in ["session", "harness", "model"] {
+                if flags.get(name).is_some_and(String::is_empty) {
+                    return Err(format!("--{name} requires a non-empty value"));
+                }
+            }
+            let session_key = nonempty(flags, "session").ok_or_else(|| TUNE_USAGE.to_owned())?;
+            let harness = nonempty(flags, "harness");
+            let model = nonempty(flags, "model");
+            let effort = named(flags, "effort");
+            let context = named(flags, "context");
+
+            if model.as_deref().is_some_and(has_packed_effort) {
+                return Err("--model must not pack an effort; pass --effort separately".to_owned());
+            }
+            if let Some(name) = harness.as_deref() {
+                let catalog = match supplied_catalog {
+                    Some(catalog) => catalog.clone(),
+                    None => crate::harnesses::catalog()?,
+                };
+                if !catalog.contains(name) {
+                    return Err(format!("unsupported harness: {name}"));
+                }
+            }
+
+            let control = match (harness, model, effort, context) {
+                (Some(harness), model, effort, context) => TuneControl::Harness {
+                    harness,
+                    model,
+                    effort,
+                    context,
+                },
+                (None, Some(model), effort, context) => TuneControl::Model {
+                    model,
+                    effort,
+                    context,
+                },
+                // An effort alone retunes the resident model's tier. A context
+                // alone qualifies nothing — there is no model in the request
+                // for it to be a variant OF — and an empty effort alone elects
+                // "no tier" on a model nobody named. Both are usage errors
+                // rather than a guess.
+                (None, None, Some(Some(effort)), None) => TuneControl::Effort(effort),
+                (None, None, _, _) => return Err(TUNE_USAGE.to_owned()),
+            };
+
+            Ok(Command::Tune {
+                identity: identity(flags)?,
+                session_key,
+                control,
             })
         }
         "list" => Ok(Command::List {
@@ -1747,7 +1918,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, ask, answer, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, ask, answer, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -2194,6 +2365,281 @@ mod tests {
         );
     }
 
+    /// The catalog every tune test validates `--harness` against.
+    fn tune_catalog() -> crate::harnesses::HarnessCatalog {
+        crate::harnesses::HarnessCatalog {
+            harnesses: vec![
+                crate::harnesses::HarnessProjection {
+                    wire_name: "fixture".to_owned(),
+                    install_package: "fixture-package".to_owned(),
+                    cli_binary: "fixture".to_owned(),
+                    process_markers: vec!["fixture-acp".to_owned()],
+                },
+                crate::harnesses::HarnessProjection {
+                    wire_name: "codex".to_owned(),
+                    install_package: "codex-package".to_owned(),
+                    cli_binary: "codex".to_owned(),
+                    process_markers: vec!["codex-acp".to_owned()],
+                },
+            ],
+        }
+    }
+
+    fn tune(args: &[&str]) -> Result<Command, String> {
+        parse_with_catalog(strings(args), &tune_catalog())
+    }
+
+    #[test]
+    fn tune_names_one_control_and_a_model_by_fields() {
+        // A HARNESS switch. The model fields ride along as fields; none of
+        // them is packed into the harness or into each other.
+        assert_eq!(
+            tune(&[
+                "tune",
+                "--session",
+                "s_1",
+                "--harness",
+                "codex",
+                "--model",
+                "gpt-5.6-sol",
+                "--effort",
+                "high",
+                "--as-user",
+                "flynn",
+            ]),
+            Ok(Command::Tune {
+                identity: Identity::User("flynn".to_owned()),
+                session_key: "s_1".to_owned(),
+                control: TuneControl::Harness {
+                    harness: "codex".to_owned(),
+                    model: Some("gpt-5.6-sol".to_owned()),
+                    effort: Some(Some("high".to_owned())),
+                    context: None,
+                },
+            })
+        );
+
+        // A harness switch with NO model: the destination catalog composes its
+        // own default. The CLI must not fill this in — it does not know what
+        // the destination host offers, and inventing one is the whole failure
+        // this design exists to prevent.
+        assert_eq!(
+            tune(&[
+                "tune",
+                "--session",
+                "s_1",
+                "--harness",
+                "codex",
+                "--as-user",
+                "flynn"
+            ]),
+            Ok(Command::Tune {
+                identity: Identity::User("flynn".to_owned()),
+                session_key: "s_1".to_owned(),
+                control: TuneControl::Harness {
+                    harness: "codex".to_owned(),
+                    model: None,
+                    effort: None,
+                    context: None,
+                },
+            })
+        );
+
+        // A same-harness MODEL retune.
+        assert_eq!(
+            tune(&[
+                "tune",
+                "--session",
+                "s_1",
+                "--model",
+                "claude-fable-5",
+                "--context",
+                "1m",
+                "--as-user",
+                "flynn",
+            ]),
+            Ok(Command::Tune {
+                identity: Identity::User("flynn".to_owned()),
+                session_key: "s_1".to_owned(),
+                control: TuneControl::Model {
+                    model: "claude-fable-5".to_owned(),
+                    effort: None,
+                    context: Some(Some("1m".to_owned())),
+                },
+            })
+        );
+
+        // An EFFORT alone retunes the resident model's tier.
+        assert_eq!(
+            tune(&[
+                "tune",
+                "--session",
+                "s_1",
+                "--effort",
+                "xhigh",
+                "--as-user",
+                "flynn"
+            ]),
+            Ok(Command::Tune {
+                identity: Identity::User("flynn".to_owned()),
+                session_key: "s_1".to_owned(),
+                control: TuneControl::Effort("xhigh".to_owned()),
+            })
+        );
+
+        // NAMED EMPTY survives as a named empty: `--context ""` is the
+        // vendor's default window, a real selection, and it must reach the
+        // gateway as one rather than as silence to be inherited over.
+        assert_eq!(
+            tune(&[
+                "tune",
+                "--session",
+                "s_1",
+                "--model",
+                "claude-fable-5",
+                "--context",
+                "",
+                "--as-user",
+                "flynn",
+            ]),
+            Ok(Command::Tune {
+                identity: Identity::User("flynn".to_owned()),
+                session_key: "s_1".to_owned(),
+                control: TuneControl::Model {
+                    model: "claude-fable-5".to_owned(),
+                    effort: None,
+                    context: Some(None),
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn tune_refuses_a_packed_model_an_invented_harness_and_a_partial_naming() {
+        // OUR effort word packed into the model string. Refused, and told
+        // where the field actually lives.
+        assert_eq!(
+            tune(&[
+                "tune",
+                "--session",
+                "s_1",
+                "--model",
+                "gpt-5.6-sol[high]",
+                "--as-user",
+                "flynn",
+            ]),
+            Err("--model must not pack an effort; pass --effort separately".to_owned())
+        );
+
+        // The VENDOR's context variant in the same syntax is not ours to
+        // refuse — `[1m]` is a window, not a tier, and reading it as one is
+        // how the 1M model once ceased to exist.
+        assert!(matches!(
+            tune(&[
+                "tune",
+                "--session",
+                "s_1",
+                "--model",
+                "claude-fable-5[1m]",
+                "--as-user",
+                "flynn",
+            ]),
+            Ok(Command::Tune { .. })
+        ));
+
+        // An engine this build does not carry is refused by name at the CLI,
+        // before a session is ever addressed.
+        assert_eq!(
+            tune(&[
+                "tune",
+                "--session",
+                "s_1",
+                "--harness",
+                "gemini",
+                "--as-user",
+                "flynn"
+            ]),
+            Err("unsupported harness: gemini".to_owned())
+        );
+
+        // A context qualifies a MODEL. Alone it qualifies nothing, and the
+        // CLI does not guess which model the caller meant.
+        assert_eq!(
+            tune(&[
+                "tune",
+                "--session",
+                "s_1",
+                "--context",
+                "1m",
+                "--as-user",
+                "flynn"
+            ]),
+            Err(TUNE_USAGE.to_owned())
+        );
+
+        // No control named at all.
+        assert_eq!(
+            tune(&["tune", "--session", "s_1", "--as-user", "flynn"]),
+            Err(TUNE_USAGE.to_owned())
+        );
+
+        // No session named.
+        assert_eq!(
+            tune(&["tune", "--model", "claude-fable-5", "--as-user", "flynn"]),
+            Err(TUNE_USAGE.to_owned())
+        );
+
+        // A live switch names ONE session. Re-engining "whoever holds
+        // reviewer" is a different act and is not spelled here.
+        assert_eq!(
+            tune(&[
+                "tune",
+                "--role",
+                "reviewer",
+                "--model",
+                "m",
+                "--as-user",
+                "flynn"
+            ]),
+            Err(TUNE_USAGE.to_owned())
+        );
+
+        // A MISTYPED flag is the dangerous case: silently ignored, `--modle`
+        // would switch the session to the destination default and report
+        // success. The flag set is closed so it cannot.
+        assert_eq!(
+            tune(&[
+                "tune",
+                "--session",
+                "s_1",
+                "--harness",
+                "codex",
+                "--modle",
+                "gpt-5.6-sol",
+                "--as-user",
+                "flynn",
+            ]),
+            Err(TUNE_USAGE.to_owned())
+        );
+
+        // Empty values for the three fields that have no meaningful empty.
+        for name in ["session", "harness", "model"] {
+            let flag = format!("--{name}");
+            assert_eq!(
+                tune(&[
+                    "tune",
+                    "--session",
+                    "s_1",
+                    flag.as_str(),
+                    "",
+                    "--as-user",
+                    "flynn",
+                ]),
+                Err(format!("--{name} requires a non-empty value"))
+            );
+        }
+    }
+
     #[test]
     fn help_enumerates_exactly_cli_surface_v1() {
         let help = render_help(Some(&crate::harnesses::catalog().unwrap()));
@@ -2259,6 +2705,7 @@ mod tests {
                 "reopen-assignment",
                 "revoke-assignment",
                 "spawn",
+                "tune",
                 "wake",
                 "work-item-close",
                 "work-item-create",
@@ -2846,7 +3293,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, ask, answer, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, ask, answer, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned())
         );
     }
 

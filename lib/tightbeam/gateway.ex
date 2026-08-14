@@ -4074,73 +4074,7 @@ defmodule Tightbeam.Gateway do
         %{ok: true}
 
       p[:setting] == "set_harness" and is_binary(p[:harness]) ->
-        case Org.get(db, call.session_key) do
-          nil ->
-            %{ok: false, code: "not_found"}
-
-          session ->
-            harness = p.harness
-            module = Harness.parse!(harness)
-            harness_atom = module.id()
-
-            # Composed against the NEW harness, exactly as `set_model` composes
-            # against the current one: the wire names a vendor model, and the
-            # effort tier — owned by the reasoning picker — is carried over or
-            # chosen from what the new harness offers (#69).
-            model =
-              compose_model_selection(
-                session.host,
-                harness,
-                session.model,
-                resolve_selection(session.host, harness, p, config.default_model)
-              )
-
-            with :ok <- validate_credential(config, harness, session.host),
-                 {:ok, routed} <-
-                   validate_catalog_model(
-                     session.host,
-                     harness,
-                     model,
-                     from_default?(p)
-                   ),
-                 :ok <-
-                   Spinup.ensure_ready(
-                     config,
-                     harness_atom,
-                     session.host,
-                     spinup_opts(config, db)
-                   ) do
-              case at_session_turn_boundary(config, session.session_key, fn ->
-                     run_session_mutation(session.session_key, fn ->
-                       apply_harness_change(
-                         config,
-                         db,
-                         call,
-                         session,
-                         harness,
-                         harness_atom,
-                         model,
-                         routed.provider
-                       )
-                     end)
-                   end) do
-                {:ok, result} ->
-                  result
-
-                {:error, :turn_in_progress} ->
-                  %{
-                    ok: false,
-                    code: "turn_in_progress",
-                    message:
-                      "this session is running a turn, so switching its harness to #{harness} " <>
-                        "was not applied; it needs a turn boundary. Try again once the current turn finishes."
-                  }
-              end
-            else
-              {:error, denial} ->
-                denial
-            end
-        end
+        set_harness_result(config, db, call, p)
 
       p[:setting] == "set_host" and is_binary(p[:host]) ->
         case Org.get(db, call.session_key) do
@@ -4180,11 +4114,13 @@ defmodule Tightbeam.Gateway do
         remove_override_result(config, db, call)
 
       p[:setting] == "set_model" and is_binary(p[:model]) ->
-        case Org.get(db, call.session_key) do
-          nil ->
-            %{ok: false, code: "not_found"}
+        # SAME harness, new model: the engine stays, and so does its
+        # conversation. Same election, same owner gate, same catalog answer.
+        case tunable_session(db, call) do
+          {:error, denial} ->
+            denial
 
-          session ->
+          {:ok, session} ->
             new_ref =
               compose_model_selection(
                 session.host,
@@ -4197,18 +4133,18 @@ defmodule Tightbeam.Gateway do
         end
 
       p[:setting] == "set_reasoning" and is_binary(p[:reasoningLevel]) ->
-        case Org.get(db, call.session_key) do
-          nil ->
-            %{ok: false, code: "not_found"}
+        case tunable_session(db, call) do
+          {:error, denial} ->
+            denial
 
-          %{model: nil} ->
+          {:ok, %{model: nil}} ->
             %{
               ok: false,
               code: "model_unknown",
               message: "reasoning cannot be changed while the current model is unknown"
             }
 
-          session ->
+          {:ok, session} ->
             new_ref = %{session.model | effort: p.reasoningLevel}
             apply_model_change(config, db, call, session, new_ref)
         end
@@ -4216,6 +4152,190 @@ defmodule Tightbeam.Gateway do
       true ->
         %{ok: false, code: "unsupported", message: "tune does not support #{p[:setting]} yet"}
     end
+  end
+
+  # THE LIVE ENGINE SWITCH.
+  #
+  # ADJUDICATION BOUNDARY (v0.2 program §4): this runs because a CALLER named a
+  # harness on this request, and for no other reason. The substrate never
+  # initiates a switch, never walks a preference list looking for a better
+  # engine, and never holds a session pending someone's model decision. A
+  # switch is an ELECTION by the agent or user who asked for it; everything
+  # below is validation of that election, and every way it can fail is NAMED.
+  #
+  # The model is named by FIELDS — `--harness`, `--model`, `--effort`,
+  # `--context` — never one packed string, and every field is answered by the
+  # destination host's catalog. Inventing a harness or a model is refused by
+  # name (`unknown_harness`, `model_unavailable`), never guessed at and never
+  # silently substituted.
+  defp set_harness_result(config, db, call, p) do
+    harness = p.harness
+
+    with {:ok, session} <- tunable_session(db, call),
+         {:ok, module} <- known_harness(harness),
+         :ok <- distinct_harness(session, harness),
+         model = destination_model(session, module, harness, p),
+         :ok <- validate_credential(config, harness, session.host),
+         {:ok, routed} <-
+           validate_catalog_model(session.host, harness, model, from_default?(p)),
+         :ok <-
+           Spinup.ensure_ready(config, module.id(), session.host, spinup_opts(config, db)) do
+      case at_tune_boundary(config, db, session.session_key, fn ->
+             run_session_mutation(session.session_key, fn ->
+               apply_harness_change(
+                 config,
+                 db,
+                 call,
+                 session,
+                 harness,
+                 module.id(),
+                 model,
+                 routed.provider
+               )
+             end)
+           end) do
+        {:ok, result} -> result
+        {:error, :turn_in_progress} -> turn_in_progress_error()
+      end
+    else
+      {:error, denial} -> denial
+    end
+  end
+
+  # WHO MAY RE-ENGINE A SESSION: its owner, or an admin. Nobody else, and a
+  # `process:` caller never (it resolves with no owner and falls through).
+  #
+  # This gate exists because a live switch is the one tune setting that
+  # replaces the mind answering for a session. It is keyed on `call.origin`,
+  # not `call.principal`, because the device path (`/api/session-control`)
+  # builds its call without a principal — a principal-keyed gate would deny
+  # the chat client its own picker.
+  #
+  # ONE refusal for unknown, retired, and foreign: which of the three it was
+  # is not this caller's business to learn by probing.
+  defp tunable_session(db, call) do
+    session = Org.get(db, call.session_key)
+    caller = resolve_caller(db, call.origin)
+
+    case {session, caller} do
+      {%{state: "active"} = active, %{owner_user_id: owner}} when is_binary(owner) ->
+        if owner == active.owner_user_id or admin_origin?(db, call.origin),
+          do: {:ok, active},
+          else: {:error, tune_not_found()}
+
+      _ ->
+        {:error, tune_not_found()}
+    end
+  end
+
+  defp tune_not_found, do: %{ok: false, code: "not_found", message: "session not found"}
+
+  # `Harness.parse!/1` RAISES on a name this build does not carry, and a raise
+  # inside a handler is translated to `server_error` — the substrate reporting
+  # its own bug for what is only a caller naming an engine that does not
+  # exist. An invented harness is a REFUSAL, named, listing what this build
+  # actually offers, exactly as an invented model is refused against the
+  # catalog.
+  defp known_harness(harness) do
+    case Enum.find(Harness.all(), &(&1.wire_name() == harness)) do
+      nil ->
+        {:error,
+         %{
+           ok: false,
+           code: "unknown_harness",
+           message:
+             "unknown harness: #{harness}; this build offers " <>
+               Enum.map_join(Harness.all(), ", ", & &1.wire_name())
+         }}
+
+      module ->
+        {:ok, module}
+    end
+  end
+
+  # Naming the RESIDENT harness is not a switch, and running it as one is
+  # destructive: `apply_harness_change` moves the history barrier to MAX(seq)
+  # unconditionally, so "switch claude to claude" buries every message in the
+  # visible transcript in order to swap an engine for itself. No recorded fact
+  # may be hidden to satisfy a request that changes nothing, so this is
+  # refused by name. A same-harness model change is `--model` with no
+  # `--harness`.
+  defp distinct_harness(%{harness: resident}, resident) do
+    {:error,
+     %{
+       ok: false,
+       code: "same_harness",
+       message:
+         "#{resident} is already this session's harness; " <>
+           "omit --harness for a same-harness model change"
+     }}
+  end
+
+  defp distinct_harness(_session, _harness), do: :ok
+
+  # A HARNESS BOUNDARY NEVER INHERITS THE SOURCE'S EFFORT, and never inherits
+  # the ORG's default model either. Effort is a tier in the DESTINATION
+  # catalog's vocabulary and the source's tier may simply not exist there;
+  # carrying it across produced a bogus `effort_not_offered` for a model the
+  # destination offers perfectly well. So when the caller names no model, the
+  # base is the DESTINATION harness's own default with its hardcoded tier
+  # stripped, and `compose_model_selection/4` is given no current effort — it
+  # picks from what that host's catalog actually offers for that harness.
+  defp destination_model(session, module, harness, p) do
+    base =
+      if Map.has_key?(Model.named_fields(p), :family),
+        do: nil,
+        else: %{module.default_model() | effort: nil}
+
+    compose_model_selection(
+      session.host,
+      harness,
+      nil,
+      resolve_selection(session.host, harness, p, base)
+    )
+  end
+
+  # THE IN-FLIGHT ANSWER: a live switch never interrupts a turn and is never
+  # queued behind one. It is REFUSED, by name, and the caller re-elects when
+  # the turn ends. The wait therefore ends on the caller's own choice, never
+  # on the substrate's.
+  #
+  # Two guards, because the lane alone is not enough. `at_session_turn_boundary`
+  # proves no turn is RUNNING — the check and the act are atomic in the lane's
+  # mailbox. But an idle lane can sit above durable work still QUEUED in the
+  # ledger, and switching there would re-engine the session out from under a
+  # turn that was already accepted and recorded: the row survives (nothing is
+  # lost) but it would run on an engine its author never chose. `pending_count`
+  # closes that window from INSIDE the held boundary, so no turn can be
+  # enqueued between the count and the swap.
+  defp at_tune_boundary(config, db, session_key, fun) do
+    at_session_turn_boundary(config, session_key, fn ->
+      # Probe seam (same idiom as `on_swap_interlock`): lets a test enqueue
+      # durable work inside the boundary and prove the count still refuses.
+      # Absent in production.
+      case config[:on_tune_fence] do
+        callback when is_function(callback, 0) -> callback.()
+        _ -> :ok
+      end
+
+      if Ledger.pending_count(db, session_key) > 0,
+        do: {:tune_refused, :turn_in_progress},
+        else: fun.()
+    end)
+    |> case do
+      {:ok, {:tune_refused, :turn_in_progress}} -> {:error, :turn_in_progress}
+      result -> result
+    end
+  end
+
+  defp turn_in_progress_error do
+    %{
+      ok: false,
+      code: "turn_in_progress",
+      message:
+        "this session has a queued or running turn, so the change was not applied. " <>
+          "Try again once the current turn finishes."
+    }
   end
 
   # A selection that names a model but no effort (the ordinary case from
@@ -4420,7 +4540,7 @@ defmodule Tightbeam.Gateway do
   defp apply_model_change(config, db, _call, session, new_ref) do
     with {:ok, routed} <- validate_catalog_model(session.host, session.harness, new_ref, false) do
       boundary =
-        at_session_turn_boundary(config, session.session_key, fn ->
+        at_tune_boundary(config, db, session.session_key, fn ->
           run_session_mutation(session.session_key, fn ->
             apply_tuned_model(config, db, session, new_ref, routed.provider)
           end)
@@ -4443,18 +4563,14 @@ defmodule Tightbeam.Gateway do
                 "for its next turn)"
           }
 
-        # Busy = a turn is in flight; the switch cannot land mid-turn, so the change
-        # was NOT applied. The honest remedy after this fix is to retry at the
-        # boundary -- never "start a new session" (the live switch replaces that old escape),
-        # and never a false intake/validation claim (the intake gate is a different axis).
+        # Busy = a turn is in flight (running on the lane, or durably queued in
+        # the ledger); the switch cannot land mid-turn, so the change was NOT
+        # applied. The honest remedy is to retry at the boundary -- never
+        # "start a new session" (the live switch replaces that old escape),
+        # and never a false intake/validation claim (the intake gate is a
+        # different axis).
         {:error, :turn_in_progress} ->
-          %{
-            ok: false,
-            code: "turn_in_progress",
-            message:
-              "this session is running a turn, so switching to #{Model.describe(new_ref)} " <>
-                "was not applied; it needs a turn boundary. Try again once the current turn finishes."
-          }
+          turn_in_progress_error()
       end
     else
       {:error, denial} -> denial
@@ -4463,8 +4579,17 @@ defmodule Tightbeam.Gateway do
 
   defp apply_tuned_model(config, db, session, new_ref, provider) do
     case Org.current_pointer(db, session.session_key) do
+      # No pointer: nothing is resident, so there is no runtime to move — only
+      # the record to correct. It still earns its marker, on the same rule as
+      # the resident path: the session's model changed, and the transcript is
+      # where an agent reads that it did.
       nil ->
         Org.set_model(db, session.session_key, new_ref, provider)
+
+        if session.model != new_ref do
+          append_marker(db, session.session_key, retune_marker(session.model, new_ref))
+        end
+
         :ok
 
       pointer ->
@@ -4588,33 +4713,88 @@ defmodule Tightbeam.Gateway do
       DB.transaction(db, fn txn ->
         {record_model, record_harness} = read_recorded_model(txn, session.session_key)
 
-        case Org.swap_model_in_txn(
-               txn,
-               session.session_key,
-               {record_model, record_harness},
-               {new_ref, record_harness, provider}
-             ) do
-          {:ok, _} -> :ok
-          {:duplicate, _} -> :ok
-          :stale -> raise("model mutation race inside serialized tune")
-        end
+        outcome =
+          case Org.swap_model_in_txn(
+                 txn,
+                 session.session_key,
+                 {record_model, record_harness},
+                 {new_ref, record_harness, provider}
+               ) do
+            # A model change is a recorded fact ABOUT this session, so it earns
+            # a transcript row: an agent reading its own history must be able
+            # to see that the mind answering changed, and where. The marker
+            # rides the SAME transaction as the swap it describes — a swap
+            # committed without its marker is the silent substitution the
+            # marker exists to prevent, just rarer.
+            {:ok, _} ->
+              {:appended, marker} =
+                Projection.append_marker_in_txn(
+                  txn,
+                  session.session_key,
+                  retune_marker(record_model, new_ref)
+                )
+
+              {:changed, marker}
+
+            # The recorded row ALREADY names this model. The caller's election
+            # is satisfied, so this is not a failure — and it must not mint a
+            # "changed from X to X" row for a change that did not happen.
+            {:duplicate, _} ->
+              :duplicate
+
+            :stale ->
+              raise("model mutation race inside serialized tune")
+          end
 
         if switched_sid != prior_sid do
           Org.append_pointer_in_txn(txn, session.session_key, switched_sid, "loaded")
         end
 
-        :ok
+        outcome
       end)
 
     case result do
-      {:ok, :ok} ->
+      {:ok, outcome} ->
         close_superseded_model_session(adapter, session.session_key, prior_sid, switched_sid)
+
+        # AFTER COMMIT, never before: the row is durable by the time it is
+        # pushed, so a fan-out that cannot run is a DELIVERY delay that replay
+        # settles, never a lost fact.
+        case outcome do
+          {:changed, marker} -> publish_stored_message(db, session.session_key, marker)
+          :duplicate -> :ok
+        end
+
         :ok
 
       {:error, error} ->
         reject_tuned_session(adapter, prior_sid, switched_sid)
         raise error
     end
+  end
+
+  # `[model retune]` — the model changed; the ENGINE and its conversation did
+  # not. Deliberately a different marker from `[engine swap]`, which also moves
+  # the history barrier: a retune hides nothing, so its marker must promise
+  # nothing about the transcript.
+  defp retune_marker(from, to) do
+    "[model retune]\n\nThis session's model changed from #{Model.describe(from)} " <>
+      "to #{Model.describe(to)}. The engine and its conversation are unchanged."
+  end
+
+  # The record is already committed by the time this runs. A registry that
+  # cannot be reached delays delivery until the next replay; it must never
+  # undo, or fail, the change that produced the row.
+  defp publish_stored_message(db, session_key, message) do
+    publish_message(db, session_key, message)
+  catch
+    :exit, reason ->
+      Logger.warning(
+        "live push of #{session_key} seq #{message.seq} failed (#{inspect(reason)}); " <>
+          "the message is stored and replays on the next connect"
+      )
+
+      :ok
   end
 
   defp close_superseded_model_session(_adapter, _session_key, sid, sid), do: :ok
@@ -5765,7 +5945,10 @@ defmodule Tightbeam.Gateway do
            content: content,
            sender: "process:tightbeam"
          }) do
-      {:appended, marker} -> publish_message(db, session_key, marker)
+      # The row is committed. Pushing it is delivery, and delivery that cannot
+      # run is a delay replay settles — so it never fails the change that
+      # produced the marker.
+      {:appended, marker} -> publish_stored_message(db, session_key, marker)
       _ -> :ok
     end
   end

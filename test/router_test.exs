@@ -433,6 +433,47 @@ defmodule Tightbeam.Wire.RouterTest do
            }
   end
 
+  test "an agent's typed tune fields reach the handler under the names it reads", ctx do
+    # `atomize_params` underscores every wire word, so `reasoningLevel` arrives
+    # as `:reasoning_level` — a spelling no tune branch reads. The device path
+    # builds that param by hand and so never noticed; an AGENT's `--effort`
+    # crossed /agent/dispatch, matched nothing, and came back "tune does not
+    # support set_reasoning yet": a caller's explicit election answered as an
+    # unbuilt feature. The alias is what makes the CLI's effort form real.
+    key = "agent-tune-fields"
+    create_session(ctx.db, key, ctx.device.user_id)
+    opts = with_handler(ctx.opts, "tune", &send_call/1)
+
+    for {params, assertion} <- [
+          {%{setting: "set_reasoning", reasoningLevel: "xhigh"},
+           fn p -> assert p[:reasoningLevel] == "xhigh" end},
+          {%{setting: "set_harness", harness: "codex", model: "gpt-5.6-sol", effort: "high"},
+           fn p ->
+             assert p[:setting] == "set_harness"
+             assert p[:harness] == "codex"
+             assert p[:model] == "gpt-5.6-sol"
+             assert p[:effort] == "high"
+           end}
+        ] do
+      response =
+        conn(
+          :post,
+          "/agent/dispatch",
+          JSON.encode!(%{verb: "tune", asUser: "flynn", sessionKey: key, params: params})
+        )
+        |> put_req_header("authorization", "Bearer tbc_test")
+        |> put_req_header(
+          "x-tightbeam-cli-version",
+          Tightbeam.CliCompatibility.required_version()
+        )
+        |> Router.call(Router.init(opts))
+
+      assert response.status == 200
+      assert_received {:call, %{verb: "tune", session_key: ^key, params: delivered}}
+      assertion.(delivered)
+    end
+  end
+
   test "PATCH /api/streams/:key decodes a clawline '+' path key as a space", ctx do
     key = "agent:main:clawline:mike:main s_test1234"
     create_session(ctx.db, key, ctx.device.user_id)

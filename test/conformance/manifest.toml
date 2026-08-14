@@ -87,3 +87,16 @@ blocking_phase = ""
 # (seam ④). No catch-all — a fixture whose kind names no runner runs nothing,
 # and the manifest is where that would be visible.
 runners = ["delivery_policy", "question_carrier", "read_cursor"]
+
+# The live engine switch (v0.2 program §4). GREEN: the mechanism ships on this
+# line, so its fixtures execute. ONE kind, ONE runner, its own named clause —
+# no catch-all, so a fixture whose kind names no runner runs nothing and the
+# manifest is where that absence is visible.
+[[class]]
+id = "C9"
+dir = "c9_live_engine_switch"
+title = "Live engine switch — named refusals, unchanged sessions"
+kind = "live-switch"
+phase = "green"
+blocking_phase = ""
+runners = ["live_switch"]
