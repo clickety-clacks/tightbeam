@@ -34,6 +34,59 @@ defmodule Tightbeam.SchemaShapeTest do
 
   alias Tightbeam.{DB, Schema}
 
+  @shape "operator-decision-requests-v1"
+  @be61_shape "model-identity-message-envelope-v2"
+
+  # Captured from Schema.ensure_all/1 at be61cfc98df6b18c0cc280adeca42cba3fbf14b5.
+  # Keep the old table exact: its missing ruledViaSessionKey column is why this
+  # build must refuse the old stamp before it serves a decision-request read.
+  @be61_decision_requests_ddl """
+  CREATE TABLE decision_requests (
+    id                TEXT PRIMARY KEY,
+    kind              TEXT NOT NULL DEFAULT 'statute' CHECK (kind IN ('statute','effort')),
+    raiserId          TEXT NOT NULL,
+    raiserSessionKey  TEXT,
+    ownerUserId       TEXT NOT NULL,
+    assignmentId      TEXT,
+    expecterSessionKey TEXT,
+    expecterUserId    TEXT,
+    lineageRung       INTEGER,
+    effortGeneration  INTEGER,
+    deadlineWakeId    TEXT,
+    raisedAt          INTEGER NOT NULL,
+    deadlineAt        INTEGER NOT NULL,
+    statuteName       TEXT,
+    actionKey         TEXT,
+    question          TEXT NOT NULL,
+    options           TEXT,
+    context           TEXT NOT NULL,
+    status            TEXT NOT NULL CHECK (status IN ('open','ruled','consumed','withdrawn','superseded')),
+    decision          TEXT,
+    rationale         TEXT,
+    ruledBy           TEXT,
+    ruledAt           INTEGER,
+    rulingFactId      INTEGER,
+    consumedAt        INTEGER,
+    parkWakeId        TEXT,
+    withdrawnBy       TEXT,
+    withdrawnReason   TEXT,
+    withdrawnAt       INTEGER,
+    CHECK (
+      (kind = 'statute' AND statuteName IS NOT NULL AND actionKey IS NOT NULL
+       AND expecterSessionKey IS NULL AND expecterUserId IS NULL
+       AND lineageRung IS NULL AND effortGeneration IS NULL AND deadlineWakeId IS NULL
+       AND (decision IS NULL OR decision IN ('allow','deny','waived')))
+      OR
+      (kind = 'effort' AND raiserId = 'process:tightbeam'
+       AND raiserSessionKey IS NULL
+       AND statuteName IS NULL AND actionKey IS NULL AND assignmentId IS NOT NULL
+       AND ((expecterSessionKey IS NOT NULL) != (expecterUserId IS NOT NULL))
+       AND lineageRung IS NOT NULL AND effortGeneration IS NOT NULL AND deadlineWakeId IS NOT NULL
+       AND (decision IS NULL OR decision IN ('continue','dismiss')))
+    )
+  )
+  """
+
   setup do
     name = :"schema_shape_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: name})
@@ -43,14 +96,23 @@ defmodule Tightbeam.SchemaShapeTest do
   test "a fresh database is created and stamped", %{db: db} do
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["model-identity-message-envelope-v2"]]} =
+    assert {:ok, [[@shape]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     # Idempotent: booting twice is the ordinary case, not a shape change.
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["model-identity-message-envelope-v2"]]} =
+    assert {:ok, [[@shape]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok, [[1, operator_index]]} =
+             DB.query(
+               db,
+               "SELECT COUNT(*), MIN(sql) FROM sqlite_master WHERE type='index' AND name='decision_requests_operator_open'"
+             )
+
+    assert operator_index =~ "(ownerUserId, raiserId, actionKey)"
+    assert operator_index =~ ~r/WHERE\s+kind\s*=\s*'operator'\s+AND\s+status\s*=\s*'open'/
   end
 
   test "the shared liveness activation creates one exact additive shape", %{db: db} do
@@ -232,8 +294,33 @@ defmodule Tightbeam.SchemaShapeTest do
     assert {:ok, ^before_rows} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
     assert {:ok, []} = DB.query(db, "SELECT wakeId FROM wake_cancellations")
 
-    assert {:ok, [["model-identity-message-envelope-v2"]]} =
+    assert {:ok, [[@shape]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
+  end
+
+  test "the real be61 decision-request shape is refused before it can be read", %{db: db} do
+    :ok =
+      DB.execute(db, """
+      CREATE TABLE schema_stamp (
+        shape     TEXT PRIMARY KEY,
+        stampedAt INTEGER NOT NULL
+      );
+      INSERT INTO schema_stamp (shape, stampedAt) VALUES ('#{@be61_shape}', 1);
+      #{@be61_decision_requests_ddl};
+      """)
+
+    refute "ruledViaSessionKey" in table_columns(db, "decision_requests")
+
+    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
+
+    assert error.message =~ @be61_shape
+    assert error.message =~ @shape
+
+    assert error.message =~
+             "operator decision requests changed the decision_requests and wakes shape."
+
+    assert {:ok, [[@be61_shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+    refute "ruledViaSessionKey" in table_columns(db, "decision_requests")
   end
 
   # The defect this refuses: `CREATE TABLE IF NOT EXISTS` is SILENT about a
@@ -315,7 +402,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "model-identity-message-envelope-v1"
-    assert error.message =~ "model-identity-message-envelope-v2"
+    assert error.message =~ @shape
   end
 
   defp table?(db, name) do
