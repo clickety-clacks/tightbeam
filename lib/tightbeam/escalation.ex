@@ -372,7 +372,7 @@ defmodule Tightbeam.Escalation do
   at all (the transactional outbox every other request site owes). The
   notification is elected `input-needed` — the asker said so by asking — so the
   Phase 1 delivery policy batches it to the target's next turn boundary or the
-  avasarala floor, whichever comes first (§7).
+  prodder floor, whichever comes first (§7).
   """
   @spec ask(DB.server(), map()) :: map()
   def ask(db, call) do

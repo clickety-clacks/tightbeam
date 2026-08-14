@@ -182,7 +182,7 @@ defmodule Tightbeam.Wakes do
     # "rows answer (Phase 5), else parent" — no responder exists yet, so the
     # target still receives it; the 30-minute ceiling is what §7 pins.
     "status-query" => %{immediacy: :digest, ceiling_ms: 30 * @minute},
-    # "principal at next turn boundary" — ceiling is the avasarala floor.
+    # "principal at next turn boundary" — ceiling is the prodder floor.
     "input-needed" => %{immediacy: :digest, ceiling_ms: 30 * @minute},
     # "principal immediately". NO CEILING (O7): `immediate`/`bypass` classes
     # never pass through the ceiling arithmetic (`apply_delivery_policy`'s
@@ -1506,7 +1506,7 @@ defmodule Tightbeam.Wakes do
   # repair agent-reachable: the named row below is the visible, actionable
   # failure; the group's own members stay genuinely pending, not silently
   # dropped, and the SAME group is retried next tick — bounded by the
-  # avasarala floor on whichever member's obligation is oldest.
+  # prodder floor on whichever member's obligation is oldest.
   defp safe_materialize_digest(db, group_key, at) do
     materialize_digest(db, group_key, at)
   rescue
