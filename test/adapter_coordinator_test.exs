@@ -26,7 +26,13 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     %{db: db, sup: sup, test_dir: test_dir}
   end
 
-  test "five consecutive boot failures open the circuit (async boot)", ctx do
+  # THE CAGE IS GONE (ruling, 2026-08-14): "we have no business adding security ON
+  # TOP of codex or claude logins." A latch that refuses after N failures is the
+  # substrate declaring a vendor dead on its own count, and then reporting its own
+  # verdict in place of the vendor's. Failures are still COUNTED, because the count
+  # paces the backoff and is a fact worth reporting -- but no count is ever a refusal.
+  test "repeated boot failures never refuse a checkout -- the count is a fact, not a verdict",
+       ctx do
     coordinator =
       start_supervised!(
         {AdapterCoordinator,
@@ -40,37 +46,37 @@ defmodule Tightbeam.AdapterCoordinatorTest do
          name: :"coord_#{System.unique_integer([:positive])}"}
       )
 
-    # Async boot: the first checkout hands out a pid whose boot then fails;
-    # crashes count via :DOWN on the (fast) backoff clock until the circuit
-    # opens and checkout fails fast.
     assert {:ok, _pid, _gen} =
              AdapterCoordinator.adapter_for(coordinator, {:claude, "default", "testhost"})
 
-    # MEASURED 2026-07-29, this cascade timed directly on an idle 16-core mac with
-    # only four test files running: 90, 99, 127, 2211, 2532 ms. Bimodal, and the
-    # slow mode is not the nominal work — five `sh -c false` spawns plus a
-    # 1,2,4,8,16ms backoff is the ~100ms cluster. The ~2.2s cluster is fork/exec
-    # contention with the `node` spawns of sibling suites, so what this budget
-    # actually races is process-spawn pressure from the rest of the run, which no
-    # barrier here can remove. The old 200-try (2s) budget lost to it in 2 of 3
-    # combined runs on an IDLE machine; CI is 4-core and busier.
+    # Let failures pile up well past the old threshold of five.
     assert wait_until(
              fn ->
                match?(
-                 %{"claude:default@testhost" => %{circuit: :open}},
+                 %{"claude:default@testhost" => %{consecutive_failures: n}} when n >= 6,
                  AdapterCoordinator.health(coordinator)
                )
              end,
              1_500
            )
 
-    assert {:error, :degraded} =
+    # The checkout STILL attempts. Under the old latch this returned
+    # {:error, :degraded} forever, and no new credential could be activated through
+    # the key -- which is what made a credential swap unrecoverable.
+    assert {:ok, _pid, _gen} =
              AdapterCoordinator.adapter_for(coordinator, {:claude, "default", "testhost"})
 
+    # The count is still reported: truth about what happened, deciding nothing.
     assert %{"claude:default@testhost" => %{consecutive_failures: failures}} =
              AdapterCoordinator.health(coordinator)
 
-    assert failures >= 5
+    assert failures >= 6
+
+    # And the health projection carries no verdict field at all.
+    refute Map.has_key?(
+             AdapterCoordinator.health(coordinator)["claude:default@testhost"],
+             :circuit
+           )
   end
 
   test "adapter boot context is captured in the coordinator before lazy adapter opts", ctx do
@@ -179,22 +185,18 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     assert_receive {:boot_context, ^second, [credential_kind: :api_key]}
   end
 
-  test "failure circuit threshold uses application config", ctx do
-    old_value = Application.get_env(:tightbeam, :adapter_failure_circuit)
-
-    on_exit(fn ->
-      if old_value,
-        do: Application.put_env(:tightbeam, :adapter_failure_circuit, old_value),
-        else: Application.delete_env(:tightbeam, :adapter_failure_circuit)
-    end)
-
+  test "no failure count latches the coordinator into refusing", ctx do
+    # There is no configurable threshold any more: :adapter_failure_circuit was
+    # deleted with the latch. Setting it must change nothing -- the knob is gone,
+    # not merely defaulted, so a stale config cannot resurrect the cage.
     Application.put_env(:tightbeam, :adapter_failure_circuit, 1)
+    on_exit(fn -> Application.delete_env(:tightbeam, :adapter_failure_circuit) end)
 
     coordinator =
       start_supervised!(
         {AdapterCoordinator,
          adapter_sup: ctx.sup,
-         backoff_base_ms: 1_000,
+         backoff_base_ms: 1,
          adapter_context: fn _ -> [] end,
          adapter_opts: fn _, _ ->
            [harness: :claude, cmd: [System.find_executable("false")], home: "/tmp", cwd: "/tmp"]
@@ -208,10 +210,13 @@ defmodule Tightbeam.AdapterCoordinatorTest do
 
     assert wait_until(fn ->
              match?(
-               %{"claude:default@testhost" => %{circuit: :open, consecutive_failures: 1}},
+               %{"claude:default@testhost" => %{consecutive_failures: n}} when n >= 2,
                AdapterCoordinator.health(coordinator)
              )
            end)
+
+    assert {:ok, _pid, _generation} =
+             AdapterCoordinator.adapter_for(coordinator, {:claude, "default", "testhost"})
   end
 
   # What the coordinator itself says it is doing: {holding a slot, waiting for one}.

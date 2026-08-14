@@ -17,11 +17,23 @@ defmodule Tightbeam.AdapterCoordinator do
     Lanes stamp the generation they ran a turn against; a lane
     seeing a stale generation at next turn start performs session/load LAZILY
     (parent-spec rule: no eager mass re-adoption).
-  - Backoff: restart with exponential backoff 1s → 60s cap. After the configured
-    consecutive failures the circuit OPENS: the key is marked degraded,
-    `adapter_for/2` returns {:error, :degraded} so affected turns fail fast
-    with a clear reason, /version|/health reflects it, the gateway stays up.
-    A successful restart closes the circuit and resets the count.
+  - Backoff: restart with exponential backoff 1s → 60s cap. Backoff is PACING,
+    not a verdict: it shapes WHEN the next attempt happens and never whether one
+    is allowed. It clears itself on the next success and needs nobody's decision.
+    The consecutive-failure count is kept because it drives that curve, and is
+    reported on /version as a FACT about what has happened.
+
+    There is deliberately NO circuit breaker. One used to latch open after five
+    consecutive failures and refuse `adapter_for/2` with `{:error, :degraded}`
+    forever after, and it was deleted 2026-08-14 by ruling: "we have no business
+    adding security ON TOP of codex or claude logins." A latch is the substrate
+    judging a harness — declaring a vendor dead on its own count, refusing the
+    attempt, and then reporting its OWN verdict (`:degraded`) in place of what
+    the vendor actually said. It also made recovery impossible: a new credential
+    could not be activated through a latched key, and the latch was guaranteed
+    exactly when a credential had stopped working, which is the only reason
+    anyone replaces one. An unreachable provider now simply keeps failing at the
+    backoff cadence, and every turn carries the vendor's own reason.
   - Re-adoption semaphore: at most the configured number of concurrent session/load
     calls per machine (no thundering herd after an adapter bounce, and no machine
     queues behind another machine's recovery). session/load failure → that session
@@ -31,7 +43,7 @@ defmodule Tightbeam.AdapterCoordinator do
   - The coordinator MONITORS adapters (never links); adapter death emits a
     lifecycle event with the exit reason and bumps the generation.
   - Readiness is tracked explicitly — a fresh entry
-    has zero failures and a closed circuit without ever having booted, so only
+    has zero failures without ever having booted, so only
     `{:adapter_ready, key, pid}` may mark a key ready, and only for the
     INSTANCE it names.
   - FAILURE MEMORY is ATTEMPT-SCOPED: `last_failure` records {generation, reason}
@@ -64,8 +76,11 @@ defmodule Tightbeam.AdapterCoordinator do
 
   @doc """
   The adapter for a key, starting it lazily on first use. Returns the pid AND
-  the current generation (the lane stamps it against the turn). Degraded key →
-  {:error, :degraded} — fail the turn fast, never queue behind a dead adapter.
+  the current generation (the lane stamps it against the turn).
+
+  An attempt is always made. A key that has been failing is retried on the
+  backoff curve and the turn carries whatever the harness said — the coordinator
+  never substitutes a verdict of its own for the vendor's answer.
   """
   @spec adapter_for(GenServer.server(), adapter_key()) :: checkout()
   def adapter_for(server \\ __MODULE__, key) do
@@ -105,7 +120,7 @@ defmodule Tightbeam.AdapterCoordinator do
     end
   end
 
-  @doc "Health projection for /version: per-key %{generation, circuit, consecutive_failures}."
+  @doc "Health projection for /version: per-key %{generation, consecutive_failures}."
   @spec health(GenServer.server()) :: %{optional(String.t()) => map()}
   def health(server \\ __MODULE__) do
     GenServer.call(server, :health)
@@ -181,7 +196,6 @@ defmodule Tightbeam.AdapterCoordinator do
        park_grace_ms: Keyword.get(opts, :park_grace_ms, 10_000),
        backoff_base_ms: Keyword.get(opts, :backoff_base_ms, 1_000),
        load_soft_cap: Application.get_env(:tightbeam, :adapter_load_soft_cap, 3),
-       failure_circuit: Application.get_env(:tightbeam, :adapter_failure_circuit, 5),
        adapters: %{},
        monitors: %{},
        # Monitor refs of adapter INSTANCES that completed boot. Readiness on the
@@ -206,9 +220,6 @@ defmodule Tightbeam.AdapterCoordinator do
 
       Tightbeam.HarnessProcess.fenced?(state.db, key) ->
         {:reply, {:error, {:park_fenced, key_name(key)}}, state}
-
-      entry.circuit == :open ->
-        {:reply, {:error, :degraded}, state}
 
       true ->
         {:noreply, capture_adapter_context(key, {:checkout, from}, state)}
@@ -253,7 +264,6 @@ defmodule Tightbeam.AdapterCoordinator do
         {key_name(key),
          %{
            generation: entry.generation,
-           circuit: entry.circuit,
            consecutive_failures: entry.failures
          }}
       end)
@@ -307,9 +317,6 @@ defmodule Tightbeam.AdapterCoordinator do
 
       Tightbeam.HarnessProcess.fenced?(state.db, key) ->
         {:reply, {:error, {:park_fenced, key_name(key)}}, state}
-
-      entry.circuit == :open ->
-        {:reply, {:error, :degraded}, state}
 
       true ->
         {reply, state} = start_adapter(key, entry, state, context)
@@ -469,7 +476,7 @@ defmodule Tightbeam.AdapterCoordinator do
   # probe those same readers already get.
   #
   # ONE gate, on `ready`: a key whose adapter never finished booting was serving
-  # nobody, and a boot-failure cascade (five deaths into an open circuit) would
+  # nobody, and a boot-failure cascade would
   # otherwise post five lines to every session on the host. A death during boot
   # still gets its row; the turn that asked for it gets its own spawn error.
   defp told_sessions(_db, _key, false = _was_ready?), do: []
@@ -568,7 +575,6 @@ defmodule Tightbeam.AdapterCoordinator do
 
           failures = entry.failures + 1
 
-          circuit = if failures >= state.failure_circuit, do: :open, else: :closed
 
           # The death belongs to the generation that DIED, not to the bumped one
           # the replacement will carry — that is the generation a turn holding
@@ -585,7 +591,6 @@ defmodule Tightbeam.AdapterCoordinator do
               monitor: nil,
               generation: generation,
               failures: failures,
-              circuit: circuit,
               timer: timer,
               ready: false,
               context: nil,
@@ -607,7 +612,7 @@ defmodule Tightbeam.AdapterCoordinator do
   def handle_info({:adapter_ready, key, pid}, state) do
     case state.adapters[key] do
       %{pid: ^pid} = entry when is_pid(pid) ->
-        entry = %{entry | failures: 0, circuit: :closed, ready: true, last_failure: nil}
+        entry = %{entry | failures: 0, ready: true, last_failure: nil}
         state = %{state | ready_refs: put_ready_ref(state.ready_refs, entry.monitor)}
         {:noreply, %{state | adapters: Map.put(state.adapters, key, entry)}}
 
@@ -699,7 +704,7 @@ defmodule Tightbeam.AdapterCoordinator do
         ref = Process.monitor(pid)
         generation = max(entry.generation, 1)
 
-        # Boot is LAZY: a spawned pid proves nothing. failures/circuit are
+        # Boot is LAZY: a spawned pid proves nothing. failures are
         # reset only by {:adapter_ready, key, pid} — the completed-boot signal.
         entry = %{
           entry
@@ -721,7 +726,6 @@ defmodule Tightbeam.AdapterCoordinator do
 
       {:error, start_reason} ->
         failures = entry.failures + 1
-        circuit = if failures >= state.failure_circuit, do: :open, else: :closed
         generation = max(entry.generation, 1)
 
         timer =
@@ -735,7 +739,6 @@ defmodule Tightbeam.AdapterCoordinator do
           entry
           | generation: generation,
             failures: failures,
-            circuit: circuit,
             timer: timer,
             ready: false,
             last_failure: {generation, {:adapter_start_failed, start_reason}}
@@ -751,7 +754,6 @@ defmodule Tightbeam.AdapterCoordinator do
       monitor: nil,
       generation: 0,
       failures: 0,
-      circuit: :closed,
       timer: nil,
       ready: false,
       last_failure: nil,
