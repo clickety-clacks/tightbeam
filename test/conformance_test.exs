@@ -1369,11 +1369,15 @@ defmodule Tightbeam.ConformanceSupport do
         call = build_call(kase["call"], ids)
         handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
         {:ok, [[before_count]]} = DB.query(db, "SELECT count(*) FROM assignments")
-        overlap? = Assignments.open_assignments_touching(db, call.params[:files] || []) != []
+        files = call.params[:files]
 
-        if kase["reason"] in [nil, "files_overlap"] do
-          assert_overlap_observation(fixture, db, call, overlap?)
-        end
+        overlap? =
+          is_list(files) and files != [] and
+            Enum.all?(files, fn path ->
+              is_binary(path) and String.length(String.trim(path)) in 1..2_000
+            end) and Assignments.open_assignments_touching(db, Enum.uniq(files)) != []
+
+        assert_overlap_observation(fixture, db, call, overlap?)
 
         if String.contains?(kase["case"], "concurrent") do
           results =
@@ -1382,9 +1386,14 @@ defmodule Tightbeam.ConformanceSupport do
             |> Task.await_many()
 
           {:ok, [[after_count]]} = DB.query(db, "SELECT count(*) FROM assignments")
-          assert Enum.count(results, &match?({:ok, _}, &1)) == 1
-          assert Enum.count(results, &match?({:error, %{code: "files_overlap"}}, &1)) == 1
-          assert after_count == before_count + 1
+          assert Enum.all?(results, &match?({:ok, _}, &1))
+
+          assert results
+                 |> Enum.map(fn {:ok, assignment} -> assignment.id end)
+                 |> Enum.uniq()
+                 |> length() == 2
+
+          assert after_count == before_count + 2
         else
           result = Dispatch.dispatch(db, handlers, call)
           {:ok, [[after_count]]} = DB.query(db, "SELECT count(*) FROM assignments")
@@ -4264,7 +4273,7 @@ defmodule Tightbeam.ConformanceTest do
     )
   end
 
-  test "handler refusal covers all canonical codes and leaves no assignment survivor" do
+  test "declared-file fixture preserves advisory overlap and malformed-input refusal" do
     Corpus.run_handler_refusal_fixture(fixture!("C4", "declared-files-overlap"))
   end
 

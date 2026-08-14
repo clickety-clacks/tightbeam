@@ -785,7 +785,7 @@ defmodule Tightbeam.AssignmentsTest do
     assert ctx.db |> WorkState.item_detail(item.id) |> JSON.encode!() == before_snapshot
   end
 
-  test "declared files dedupe silently and overlap is transactionally serialized", ctx do
+  test "declared files are advisory, round-trip, and never reserve a path", ctx do
     paths = ["lib/a.ex", "lib/b.ex", "lib/a.ex", "../kept", "/absolute/kept"]
 
     first =
@@ -804,12 +804,13 @@ defmodule Tightbeam.AssignmentsTest do
     overlapping =
       assign_call({:user, "flynn"}, "overlap")
       |> put_in([:params, :files], ["lib/a.ex"])
+      |> then(&handle(ctx, "assign", &1))
 
-    assert %{code: "files_overlap", message: message} = handle(ctx, "assign", overlapping)
-    assert message =~ first.id
+    assert is_binary(overlapping.id)
+    assert Assignments.declared_files(ctx.db, overlapping.id) == ["lib/a.ex"]
 
-    assert {:ok, [[0]]} =
-             DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE subject = 'overlap'")
+    assert Assignments.open_assignments_touching(ctx.db, ["lib/a.ex"]) ==
+             Enum.sort([first.id, overlapping.id])
 
     malformed =
       assign_call({:user, "flynn"}, "malformed")
@@ -822,6 +823,22 @@ defmodule Tightbeam.AssignmentsTest do
 
     no_files = handle(ctx, "assign", assign_call({:user, "flynn"}, "no files"))
     assert Assignments.declared_files(ctx.db, no_files.id) == []
+
+    empty_files =
+      assign_call({:user, "flynn"}, "empty files")
+      |> put_in([:params, :files], [])
+      |> then(&handle(ctx, "assign", &1))
+
+    assert Assignments.declared_files(ctx.db, empty_files.id) == []
+
+    # The substrate cannot know whether bootstrap context is stale or incomplete.
+    # Persisting either shape must not turn the suggestion into a work barrier.
+    incomplete =
+      assign_call({:user, "flynn"}, "incomplete files")
+      |> put_in([:params, :files], ["likely-but-not-complete.ex"])
+      |> then(&handle(ctx, "assign", &1))
+
+    assert is_binary(incomplete.id)
 
     disjoint =
       for {subject, path} <- [{"disjoint one", "one"}, {"disjoint two", "two"}] do
@@ -842,8 +859,13 @@ defmodule Tightbeam.AssignmentsTest do
       end
       |> Task.await_many()
 
-    assert Enum.count(concurrent, &(&1[:code] == "files_overlap")) == 1
-    assert Enum.count(concurrent, &is_binary(&1[:id])) == 1
+    assert Enum.all?(concurrent, &is_binary(&1.id))
+    assert concurrent |> Enum.map(& &1.id) |> Enum.uniq() |> length() == 2
+
+    assert Enum.all?(
+             concurrent,
+             &(Assignments.declared_files(ctx.db, &1.id) == ["same-race-path"])
+           )
 
     _closed = handle(ctx, "attest", attest_call({:session, "holder"}, first.id, "completion"))
 
@@ -1371,7 +1393,8 @@ defmodule Tightbeam.AssignmentsTest do
     assert reopening.priorClosingAttestId == attest_id
   end
 
-  test "reopen-assignment refuses a retired holder, a terminal item, and colliding files", ctx do
+  test "reopen-assignment refuses a retired holder and terminal item but ignores advisory overlap",
+       ctx do
     retired = handle(ctx, "assign", assign_call({:session, "holder"}, "retired holder card"))
     _ = handle(ctx, "attest", attest_call({:session, "holder"}, retired.id, "completion"))
 
@@ -1407,12 +1430,18 @@ defmodule Tightbeam.AssignmentsTest do
 
     _ = handle(ctx, "attest", attest_call({:session, "holder"}, first.id, "completion"))
 
-    _ =
+    second =
       assign_call({:user, "flynn"}, "second file card")
       |> put_in([:params, :files], ["/tmp/p0-collision"])
       |> then(&handle(ctx, "assign", &1))
 
-    assert_reopen_refused!(ctx, {:user, "flynn"}, first.id, "why", "files_overlap")
+    reopened =
+      handle(ctx, "reopen-assignment", reopen_call({:user, "flynn"}, first.id, "why"))
+
+    assert reopened.state == "open"
+
+    assert Assignments.open_assignments_touching(ctx.db, ["/tmp/p0-collision"]) ==
+             Enum.sort([first.id, second.id])
   end
 
   # Fabric §13 Phase 0 exit: the wedge CLASS is exercisable by an AGENT — no

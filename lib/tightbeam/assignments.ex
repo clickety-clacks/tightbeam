@@ -1089,8 +1089,7 @@ defmodule Tightbeam.Assignments do
           true ->
             with :ok <- lawful_closed_shape(assignment),
                  :ok <- reopen_holder_active(txn, assignment),
-                 :ok <- reopen_work_item_open(txn, assignment),
-                 :ok <- reopen_files_free(txn, assignment) do
+                 :ok <- reopen_work_item_open(txn, assignment) do
               apply_reopen(txn, call, assignment)
             end
         end
@@ -1235,27 +1234,6 @@ defmodule Tightbeam.Assignments do
           "work item #{assignment.workItemId} is #{state}; reopen the item before its assignment"
         )
     end
-  end
-
-  defp reopen_files_free(txn, assignment) do
-    case open_assignments_touching_in_txn(txn, declared_files_in_txn(txn, assignment.id), nil) do
-      [] ->
-        :ok
-
-      [colliding_id | _] ->
-        error(
-          "files_overlap",
-          "open assignment #{colliding_id} already declares a file this assignment declares"
-        )
-    end
-  end
-
-  defp declared_files_in_txn(txn, assignment_id) do
-    txn
-    |> Txn.q("SELECT path FROM assignment_files WHERE assignmentId = ?1 ORDER BY path", [
-      assignment_id
-    ])
-    |> Enum.map(&hd/1)
   end
 
   # Opener-or-admin (revoke's authority) is not enough here: the HOLDER is the
@@ -1444,11 +1422,6 @@ defmodule Tightbeam.Assignments do
           end
         end
 
-        case open_assignments_touching_in_txn(txn, files, nil) do
-          [] -> :ok
-          [colliding_id | _] -> throw({:files_overlap, colliding_id})
-        end
-
         # In-txn state='open' INTERLOCK (r4-F1): the pre-statute guard and this
         # insert are different transactions; a disposition committing between
         # them must not let a terminal item acquire an open assignment. The
@@ -1540,12 +1513,6 @@ defmodule Tightbeam.Assignments do
         error("not_found", "unknown sessionKey: #{call.session_key}")
     end
   catch
-    {:files_overlap, colliding_id} ->
-      error(
-        "files_overlap",
-        "declared files overlap open assignment #{colliding_id}"
-      )
-
     {:work_item_not_open, work_item_id} ->
       error("work_item_not_open", "work item #{work_item_id} is not open")
 
@@ -2231,13 +2198,6 @@ defmodule Tightbeam.Assignments do
 
   defp assignment_files("assign", params), do: valid_files(params[:files])
   defp assignment_files(_verb, _params), do: {:ok, []}
-
-  defp open_assignments_touching_in_txn(_txn, [], _exclude_id), do: []
-
-  defp open_assignments_touching_in_txn(txn, paths, exclude_id) do
-    {sql, params} = open_assignments_touching_query(paths, exclude_id)
-    Txn.q(txn, sql, params) |> Enum.map(&hd/1)
-  end
 
   defp open_assignments_touching_query(paths, exclude_id) do
     placeholders =

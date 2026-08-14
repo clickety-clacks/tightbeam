@@ -172,8 +172,11 @@ defmodule Tightbeam.JobTraceTest do
     end)
 
     direct = Enum.find(trace.assignments, &(&1.id == "asg_direct"))
+    legacy = Enum.find(trace.assignments, &(&1.id == "asg_bad"))
     review = Enum.find(trace.assignments, &(&1.id == "asg_review"))
     assert direct.files == ["a.ex", "z.ex"]
+    assert legacy.files == []
+    assert review.files == []
     assert direct.openerRef == "user:owner"
     assert review.openerRef == "session:reviewer"
     assert review.reviewsAssignmentId == "asg_direct"

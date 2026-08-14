@@ -41,9 +41,10 @@ per-feature, but your attention across features is the scarce resource.
    one objective per dispatch, together covering every clause. Cut along the seams that
    minimize what crosses between goals: defects cluster at the interfaces between
    different agents' work. Run independent goals in parallel; order goals that touch
-   the same code. Declare each goal's files on its assignment
-   (`--files '["path", ...]'`) — the substrate refuses a second open assignment that
-   overlaps those paths, so two coders cannot be aimed at the same file.
+   the same code. Use `--files '["path", ...]'` only when likely starting paths help
+   the holder begin. The list is optional bootstrap context, not custody, authorization,
+   or a complete source boundary. When current source inspection exposes a real
+   collision, require truthful reporting and coordinate the order or reconciliation.
 4. **Implement.** For each goal, assign a coder one goal with the spec path and the
    work-item id. The coder attests progress as it works — including when the goal
    builds clean and is ready for review. Completion is attested only after the review

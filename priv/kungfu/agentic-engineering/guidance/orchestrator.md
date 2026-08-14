@@ -58,11 +58,13 @@ Decompose by the seam, not just for parallelism: defects cluster where two agent
 work meets, so cut along interfaces that minimize what crosses between goals — one
 objective per dispatch, independently verifiable, and together the goals cover the
 whole spec: a clause no goal owns is work nobody owes. Run independent goals in
-parallel; order goals that touch the same code, and declare each goal's files
-(`--files`) so the substrate refuses an accidental collision at dispatch time instead
-of you discovering it at merge time. Pour your attention into the goal on the critical
-path — the longest chain of dependent work sets the finish, and speeding up anything
-with slack buys nothing.
+parallel; order goals that touch the same code. Use `--files` as optional bootstrap
+context: name the likely starting paths when that helps the holder begin, but never
+treat the list as custody, authorization, or a complete source boundary. When current
+source inspection exposes a real collision, require both holders to report it truthfully
+and coordinate the order or reconciliation. Pour your attention into the goal on the
+critical path — the longest chain of dependent work sets the finish, and speeding up
+anything with slack buys nothing.
 
 ## How much you carry at once
 Complex, novel, interdependent work collapses a coordinator's attention fast: hold a
