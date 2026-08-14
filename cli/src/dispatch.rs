@@ -277,7 +277,10 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 } => {
                     params.push(string_field("setting", "set_harness"));
                     params.push(string_field("harness", harness));
-                    model_fields.push(("model", model.clone().map(Some)));
+                    // `model` is REQUIRED on this variant (v0.2 program §4):
+                    // parsing cannot build a `TuneControl::Harness` without
+                    // one, so it always crosses as a named, non-empty value.
+                    model_fields.push(("model", Some(Some(model.clone()))));
                     model_fields.push(("effort", effort.clone()));
                     model_fields.push(("context", context.clone()));
                 }
@@ -1532,20 +1535,31 @@ mod tests {
             r#"{"asUser":"flynn","verb":"tune","sessionKey":"agent:coder:x s_1","params":{"setting":"set_harness","harness":"codex","model":"gpt-5.6-sol","effort":"high"}}"#
         );
 
-        // No model named: the key is OMITTED, so the gateway completes it
-        // from the destination harness's catalog. A CLI-invented default here
-        // would silence the one seam that knows what the host offers.
+        // No model named: REFUSED at parse time (v0.2 program §4 — the
+        // substrate never elects a destination model). This body can no
+        // longer be built at all, so there is nothing byte-exact to assert
+        // here; `args::tune_refuses_a_packed_model_an_invented_harness_and_a_partial_naming`
+        // covers the refusal itself.
         assert_eq!(
-            body(&[
-                "tune",
-                "--session",
-                "s_1",
-                "--harness",
-                "codex",
-                "--as-user",
-                "flynn"
-            ]),
-            r#"{"asUser":"flynn","verb":"tune","sessionKey":"s_1","params":{"setting":"set_harness","harness":"codex"}}"#
+            args::parse(
+                [
+                    "tune",
+                    "--session",
+                    "s_1",
+                    "--harness",
+                    "codex",
+                    "--as-user",
+                    "flynn"
+                ]
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect()
+            ),
+            Err(
+                "--harness requires --model: the substrate does not choose one \
+                 (model_required)"
+                    .to_owned()
+            )
         );
 
         assert_eq!(

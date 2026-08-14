@@ -1849,6 +1849,76 @@ defmodule Tightbeam.Wire.RouterTest do
     assert blank.context == nil
   end
 
+  test "F6: a malformed model field on the DEVICE path reaches the gateway named, not silently dropped",
+       ctx do
+    # Sol xhigh review, live-switch finding 6. `model_params/1` used to drop
+    # a non-string field entirely, so the gateway saw a params map
+    # indistinguishable from "no model named" — which, before F2 closed it,
+    # activated the destination's default and reported `ok: true` on a
+    # switch the caller never elected. This exercises the REAL gateway
+    # handler (not a stub) through the full device path.
+    key = "control-malformed-model"
+    create_session(ctx.db, key, ctx.device.user_id)
+
+    opts =
+      with_handler(ctx.opts, "tune", fn call ->
+        Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})["tune"].(call)
+      end)
+
+    response =
+      conn(
+        :post,
+        "/api/session-control",
+        JSON.encode!(%{
+          "sessionKey" => key,
+          "action" => "set_harness",
+          "harness" => "codex",
+          "model" => 123
+        })
+      )
+      |> put_req_header("authorization", "Bearer #{ctx.device.token}")
+      |> Router.call(Router.init(opts))
+
+    assert response.status == 200
+    body = JSON.decode!(response.resp_body)
+    assert body["code"] == "invalid_model_field"
+    assert Org.get(ctx.db, key).harness == "claude"
+  end
+
+  test "F6: an unknown tune param key on RAW DISPATCH is refused by name, never silently forwarded",
+       ctx do
+    # Sol xhigh review, live-switch finding 6. Raw `/agent/dispatch` has no
+    # closed flag set the way the CLI does — `atomize_params/2` forwards
+    # whatever the caller sent. A mistyped `modle` used to be inert: no
+    # branch read it, `model` stayed absent, and (before F2 closed it) the
+    # switch silently completed on the destination's default while the
+    # caller believed it named `gpt-5.6-sol`.
+    key = "dispatch-unknown-param"
+    create_session(ctx.db, key, ctx.device.user_id)
+
+    opts =
+      with_handler(ctx.opts, "tune", fn call ->
+        Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})["tune"].(call)
+      end)
+
+    request =
+      dispatch_cli(%{ctx | opts: opts}, "tbc_test", %{
+        verb: "tune",
+        asUser: ctx.device.user_id,
+        sessionKey: key,
+        params: %{setting: "set_harness", harness: "codex", modle: "gpt-5.6-sol"}
+      })
+
+    # A handler result carrying `code` (no `ok: true`) is a REFUSAL as far as
+    # `Dispatch.dispatch/3` is concerned, not a success payload to unwrap —
+    # it renders as the wire's ordinary error envelope.
+    assert request.status == 400
+    body = JSON.decode!(request.resp_body)["error"]
+    assert body["code"] == "unknown_param"
+    assert body["message"] =~ "modle"
+    assert Org.get(ctx.db, key).harness == "claude"
+  end
+
   defp post_control(opts, token, session_key, action) do
     conn(
       :post,

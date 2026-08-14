@@ -2311,6 +2311,82 @@ defmodule Tightbeam.GatewayTest do
 
       assert Org.get(ctx.db, "live") == ctx.before
     end
+
+    test "the SAME gate covers every legacy tune mutation: rename, adopt, set_host", ctx do
+      # F3 (Sol xhigh review): `set_harness`/`set_model`/`set_reasoning` were
+      # the only settings gated by `tunable_session/2`. The legacy actions
+      # performed NO owner-or-admin check at all — a non-owner's session
+      # token could rename, adopt, or relocate a victim session it merely
+      # named by key. Pre-existing (before this card), but this card is what
+      # made `tune` agent-reachable end to end, so it closes here.
+      for params <- [
+            %{setting: "rename", display_name: "owned by mallory"},
+            %{setting: "adopt", adopted: true},
+            %{setting: "set_host", host: "worker"}
+          ] do
+        assert %{ok: false, code: "not_found"} =
+                 ctx.handlers["tune"].(%{
+                   origin: "user:mallory",
+                   session_key: "live",
+                   params: params
+                 }),
+               "user:mallory must not be able to #{params.setting} flynn's session"
+      end
+
+      assert Org.get(ctx.db, "live") == ctx.before
+    end
+
+    test "authorization uses the router's immutable principal, not a live re-resolution of the role's holder",
+         ctx do
+      # F8 (Sol xhigh review): the router captures `{:session, key}` — the
+      # session that PROVED it held the role AT AUTHENTICATION TIME — as an
+      # immutable principal. `tunable_session/2` used to re-derive "who
+      # holds this role" itself from `call.origin`, which answers a
+      # DIFFERENT, LATER question. If a role is rebound between
+      # authentication and this check, the re-derivation would authorize
+      # TODAY's holder for a request the router authenticated for
+      # YESTERDAY's. This simulates exactly that ordering: "worker" is bound
+      # to mallory's OWN session (an outsider to flynn's "live") when the
+      # call is built (the router's moment), and to flynn's "live" itself
+      # by the time the gateway processes it — the OLD code re-resolved
+      # "worker" at THAT later moment, found it now bound to "live", and
+      # authorized "live"'s owner against itself: trivially true, and wrong.
+      Org.create(ctx.db, %{
+        session_key: "agent-a",
+        display_name: "Agent A",
+        owner_user_id: "mallory",
+        origin: "user:mallory",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("before-model")
+      })
+
+      Roles.create!(ctx.db, "worker", "mallory", "agent-a")
+      # The admin rebind, AFTER the router already authenticated "agent-a"
+      # as "worker" and stamped `principal: {:session, "agent-a"}`.
+      :ok = Roles.bind(ctx.db, "worker", "live")
+
+      call = %{
+        origin: "agent:worker",
+        principal: {:session, "agent-a"},
+        session_key: "live",
+        params: %{setting: "rename", display_name: "renamed by a stale role"}
+      }
+
+      assert %{ok: false, code: "not_found"} = ctx.handlers["tune"].(call)
+      assert Org.get(ctx.db, "live") == ctx.before
+
+      # The DEVICE path carries no principal at all (never role-mediated)
+      # and is sound as `call.origin` already reads it — unaffected.
+      assert %{ok: false, code: "not_found"} =
+               ctx.handlers["tune"].(%{
+                 origin: "user:mallory",
+                 session_key: "live",
+                 params: %{setting: "rename", display_name: "still not mallory's"}
+               })
+    end
   end
 
   test "durable queued work refuses the switch before any engine moves", ctx do
@@ -2390,6 +2466,441 @@ defmodule Tightbeam.GatewayTest do
 
     assert length(Projection.list_after(ctx.db, "queued", nil, 50, 0)) == 1,
            "a refused switch appends no tombstone"
+  end
+
+  test "a prompt racing the merged swap transaction lands after it, never buried, on the new engine",
+       ctx do
+    # F1 (Sol xhigh review): the pending-count check, the harness swap, and
+    # the barrier now share ONE transaction with prompt acceptance
+    # (`deliver_prompt`'s echo+enqueue). `DB` is single-writer and serializes
+    # one `transaction/2` at a time in its owner process, so a concurrent
+    # `deliver_prompt` racing the swap can only land strictly BEFORE this
+    # transaction opens (the sibling test above — durable queued work
+    # refuses the switch — covers that, via `on_tune_fence` firing before
+    # the count) or strictly AFTER it commits. This proves the second half,
+    # using `on_swap_interlock` (already inside the merged transaction) to
+    # hold it open while a genuinely concurrent process tries to commit a
+    # prompt: that attempt must queue behind the DB owner and can never land
+    # inside the window, so the prompt is neither buried by the barrier nor
+    # claimed under the harness the swap left behind.
+    base_dir = role_test_base("swap-enqueue-race")
+    auth_dir = Path.join([base_dir, "auth", "fixture"])
+    adapter = Path.join([base_dir, "adapters", "node_modules", ".bin", "fixture-acp"])
+    File.mkdir_p!(auth_dir)
+    File.write!(Path.join(auth_dir, "fixture.json"), "fixture-token")
+    File.mkdir_p!(Path.dirname(adapter))
+    File.write!(adapter, "#!/bin/sh\n")
+    File.chmod!(adapter, 0o755)
+    Archetypes.load!(base_dir)
+
+    start_supervised!(%{
+      id: :swap_enqueue_race_conn_registry,
+      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+    })
+
+    handlers = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))
+
+    Org.create(ctx.db, %{
+      session_key: "race",
+      display_name: "Race",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("before-model")
+    })
+
+    start_lane!(ctx.db, "race")
+    parent = self()
+
+    tune_task =
+      Task.async(fn ->
+        handlers["tune"].(%{
+          origin: "user:flynn",
+          session_key: "race",
+          on_swap_interlock: fn _txn ->
+            send(parent, {:inside_txn, self()})
+
+            receive do
+              :proceed -> :ok
+            end
+          end,
+          params: %{setting: "set_harness", harness: "fixture", model: "fixture-model"}
+        })
+      end)
+
+    assert_receive {:inside_txn, db_owner_pid}, 2_000
+
+    race_task =
+      Task.async(fn ->
+        DB.transaction(ctx.db, fn txn ->
+          Gateway.deliver_prompt_in_txn(txn, "race", "user:flynn", "racing prompt", [])
+        end)
+      end)
+
+    # `race_task` is a `GenServer.call` to the SAME single-writer `DB` owner
+    # the interlock above is blocking — it can only be sitting in that
+    # process's mailbox right now, not running. This sleep gives the
+    # scheduler room to actually deliver that call before the interlock
+    # releases; it does not gate correctness (the DB owner enforces the
+    # ordering regardless of timing), only this test's confidence that it
+    # exercised the genuinely-concurrent case rather than a sequential one.
+    Process.sleep(50)
+    send(db_owner_pid, :proceed)
+
+    assert %{ok: true} = Task.await(tune_task, 5_000)
+    assert {:ok, {:appended, _message_id, _message, _opts}} = Task.await(race_task, 5_000)
+
+    # NOT BURIED: the racing prompt's row is visible above the barrier the
+    # swap just moved.
+    barrier = Org.get(ctx.db, "race").cleared_through_seq
+    visible = Projection.list_after(ctx.db, "race", nil, 50, barrier)
+
+    assert Enum.any?(visible, &(&1.content == "racing prompt")),
+           "the racing prompt must not be buried by the barrier it raced, got #{inspect(visible)}"
+
+    # ON THE NEW ENGINE: the turn it enqueued claims under the harness the
+    # transaction left resident, never the one it left behind — because it
+    # committed strictly after the swap's transaction ended.
+    assert {:ok, turn} = Ledger.claim_next(ctx.db, "race", "test-claim")
+    assert turn.prompt == "racing prompt"
+    assert Org.get(ctx.db, "race").harness == "fixture"
+
+    assert {:ok, [[stamped_harness]]} =
+             DB.query(ctx.db, "SELECT harness FROM turns WHERE seq = ?1", [turn.seq])
+
+    assert stamped_harness == "fixture"
+  end
+
+  test "two racing identical swaps: one succeeds, one refuses same_harness, exactly one tombstone",
+       ctx do
+    # F5 (Sol xhigh review): the distinct-harness snapshot used to be taken
+    # BEFORE the lane and the mutation lock, from `tunable_session`'s
+    # pre-lane read. Two concurrent identical swap requests both saw the
+    # session on "claude" and both passed that check; the second then
+    # entered the (old, separate) swap transaction and performed a
+    # same-harness no-op that still moved the barrier a second time and
+    # appended a FALSE tombstone. The fresh, in-transaction read
+    # (`Org.get_in_txn/2`) closes it: the second request's own transaction
+    # now sees the FIRST swap's result and refuses `same_harness`.
+    base_dir = role_test_base("swap-duplicate-race")
+    auth_dir = Path.join([base_dir, "auth", "fixture"])
+    adapter = Path.join([base_dir, "adapters", "node_modules", ".bin", "fixture-acp"])
+    File.mkdir_p!(auth_dir)
+    File.write!(Path.join(auth_dir, "fixture.json"), "fixture-token")
+    File.mkdir_p!(Path.dirname(adapter))
+    File.write!(adapter, "#!/bin/sh\n")
+    File.chmod!(adapter, 0o755)
+    Archetypes.load!(base_dir)
+
+    start_supervised!(%{
+      id: :swap_duplicate_race_conn_registry,
+      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+    })
+
+    handlers = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))
+
+    Org.create(ctx.db, %{
+      session_key: "dup",
+      display_name: "Dup",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("before-model")
+    })
+
+    start_lane!(ctx.db, "dup")
+    parent = self()
+
+    call = fn tag ->
+      %{
+        origin: "user:flynn",
+        session_key: "dup",
+        on_swap_interlock: fn _txn ->
+          send(parent, {:inside_txn, tag, self()})
+
+          receive do
+            :proceed -> :ok
+          end
+        end,
+        params: %{setting: "set_harness", harness: "fixture", model: "fixture-model"}
+      }
+    end
+
+    first_task = Task.async(fn -> handlers["tune"].(call.(:first)) end)
+    assert_receive {:inside_txn, :first, first_db_owner_pid}, 2_000
+
+    # The lane + mutation lock (`with_session_mutation_lock/2`) serialize the
+    # SECOND request behind the first's whole `fun`, so it cannot even begin
+    # its own transaction until the first is released. Starting it now and
+    # releasing the first proves that ordering rather than assuming it.
+    #
+    # The second request never reaches ITS OWN `on_swap_interlock` at all:
+    # its fresh, in-transaction read (`Org.get_in_txn/2`) sees the first
+    # swap's result and refuses `same_harness` in the `cond`'s first
+    # matching clause, before the swap write (and so before the interlock
+    # point past it) ever runs — which is a STRONGER proof than reaching the
+    # interlock would be: the duplicate is turned away before it does
+    # anything, not caught mid-write.
+    second_task = Task.async(fn -> handlers["tune"].(call.(:second)) end)
+    Process.sleep(50)
+    send(first_db_owner_pid, :proceed)
+
+    results = [Task.await(first_task, 5_000), Task.await(second_task, 5_000)]
+
+    assert Enum.count(results, &match?(%{ok: true}, &1)) == 1
+    assert Enum.count(results, &match?(%{ok: false, code: "same_harness"}, &1)) == 1
+
+    assert Org.get(ctx.db, "dup").harness == "fixture"
+
+    tombstones =
+      ctx.db
+      |> Projection.list_after("dup", nil, 50, 0)
+      |> Enum.filter(&(&1.content =~ "[engine swap]"))
+
+    assert length(tombstones) == 1,
+           "exactly one tombstone for exactly one swap, got #{inspect(tombstones)}"
+  end
+
+  describe "the substrate never elects a model (F2, Sol xhigh review)" do
+    setup ctx do
+      base_dir = role_test_base("tune-model-election")
+      codex_auth = Path.join([base_dir, "auth", "codex"])
+      File.mkdir_p!(codex_auth)
+      File.write!(Path.join(codex_auth, "auth.json"), "test-token")
+      Archetypes.load!(base_dir)
+
+      start_supervised!(%{
+        id: :tune_model_election_conn_registry,
+        start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+      })
+
+      Org.create(ctx.db, %{
+        session_key: "elect",
+        display_name: "Elect",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("before-model")
+      })
+
+      start_lane!(ctx.db, "elect")
+
+      %{handlers: Gateway.handlers(gateway_config(base_dir, ctx.db, 0))}
+    end
+
+    test "set_harness with no --model refuses model_required, never a destination default", ctx do
+      assert %{ok: false, code: "model_required", message: message} =
+               ctx.handlers["tune"].(%{
+                 origin: "user:flynn",
+                 session_key: "elect",
+                 params: %{setting: "set_harness", harness: "codex"}
+               })
+
+      assert message =~ "explicit --model"
+      assert Org.get(ctx.db, "elect").harness == "claude"
+    end
+
+    test "set_harness with --context and no --model refuses the more specific context_requires_model",
+         ctx do
+      assert %{ok: false, code: "context_requires_model", message: message} =
+               ctx.handlers["tune"].(%{
+                 origin: "user:flynn",
+                 session_key: "elect",
+                 params: %{setting: "set_harness", harness: "codex", context: "1m"}
+               })
+
+      assert message =~ "--context"
+      assert Org.get(ctx.db, "elect").harness == "claude"
+    end
+
+    test "set_harness onto a tiered model with no --effort refuses effort_required, naming the tiers",
+         ctx do
+      assert %{ok: false, code: "effort_required", message: message} =
+               ctx.handlers["tune"].(%{
+                 origin: "user:flynn",
+                 session_key: "elect",
+                 params: %{setting: "set_harness", harness: "codex", model: "gpt-5.6-sol"}
+               })
+
+      assert message =~ "gpt-5.6-sol"
+      assert message =~ "medium"
+      assert Org.get(ctx.db, "elect").harness == "claude"
+    end
+
+    test "set_harness with an explicit --model and --effort still applies cleanly", ctx do
+      assert %{ok: true, harness: "codex", model: "gpt-5.6-sol", effort: "medium"} =
+               ctx.handlers["tune"].(%{
+                 origin: "user:flynn",
+                 session_key: "elect",
+                 params: %{
+                   setting: "set_harness",
+                   harness: "codex",
+                   model: "gpt-5.6-sol",
+                   effort: "medium"
+                 }
+               })
+    end
+
+    test "set_model with no --model refuses model_required rather than the unbuilt-setting catch-all",
+         ctx do
+      assert %{ok: false, code: "model_required"} =
+               ctx.handlers["tune"].(%{
+                 origin: "user:flynn",
+                 session_key: "elect",
+                 params: %{setting: "set_model"}
+               })
+    end
+
+    test "F6: the closed tune param set refuses an unknown key by name, never silently forwarded",
+         ctx do
+      assert %{ok: false, code: "unknown_param", message: message} =
+               ctx.handlers["tune"].(%{
+                 origin: "user:flynn",
+                 session_key: "elect",
+                 params: %{setting: "set_harness", harness: "codex", modle: "gpt-5.6-sol"}
+               })
+
+      assert message =~ "modle"
+      assert Org.get(ctx.db, "elect").harness == "claude"
+    end
+
+    test "F6: a malformed (non-string) model field refuses invalid_model_field, never a silent default",
+         ctx do
+      assert %{ok: false, code: "invalid_model_field"} =
+               ctx.handlers["tune"].(%{
+                 origin: "user:flynn",
+                 session_key: "elect",
+                 params: %{setting: "set_harness", harness: "codex", model: 123}
+               })
+
+      assert Org.get(ctx.db, "elect").harness == "claude"
+    end
+  end
+
+  test "F9: a digest carrier's own wake id survives a cross-harness barrier, discoverable via inspect",
+       ctx do
+    # Sol xhigh review, live-switch finding 9. The carrier's own wake id is
+    # ordinarily discoverable from the DELIVERED DIGEST MESSAGE, which names
+    # it in its own text (`digest_prompt/3`). After a cross-harness barrier
+    # that message is no longer served — the transcript is exactly what
+    # stopped being read — and `inspect`'s wake list is scoped to PENDING
+    # work, which a delivered carrier is not.
+    # `Wakes.list_digest_carriers/3` (wired into `inspect_result`) is the
+    # sanctioned path back to it.
+    start_supervised!(%{
+      id: :digest_carrier_deliver_conn_registry,
+      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+    })
+
+    Org.create(ctx.db, %{
+      session_key: "digester",
+      display_name: "Digester",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("before-model")
+    })
+
+    a =
+      Wakes.schedule(ctx.db, %{
+        session_key: "digester",
+        origin: "agent:sender",
+        creator_session_key: "agent:sender",
+        prompt: "the build finished",
+        due_at: System.system_time(:millisecond),
+        class: "fyi"
+      })
+
+    b =
+      Wakes.schedule(ctx.db, %{
+        session_key: "digester",
+        origin: "agent:sender",
+        creator_session_key: "agent:sender",
+        prompt: "docs merged",
+        due_at: System.system_time(:millisecond),
+        class: "fyi"
+      })
+
+    ceiling = Wakes.delivery_policy("fyi").ceiling_ms
+    due = max(a.created_at, b.created_at) + ceiling
+
+    assert [digest_id] = Wakes.materialize_digests(ctx.db, due)
+    digest = Wakes.get(ctx.db, digest_id)
+    assert digest.digest
+
+    assert Enum.map(Wakes.digest_members(ctx.db, digest_id), & &1.wake_id) == [
+             a.wake_id,
+             b.wake_id
+           ]
+
+    # DELIVER: the carrier fires and becomes a resident message, exactly as
+    # the real wake pipeline does.
+    assert :appended =
+             Gateway.deliver_prompt("digester", digest.origin, digest.prompt,
+               db: ctx.db,
+               wake_id: digest.wake_id,
+               fire_wake_in_txn: true
+             )
+
+    assert Wakes.get(ctx.db, digest.wake_id).state == "fired"
+
+    # CROSS-HARNESS SWITCH: the barrier hides the delivered digest message.
+    base_dir = role_test_base("digest-carrier-discovery")
+    auth_dir = Path.join([base_dir, "auth", "fixture"])
+    adapter = Path.join([base_dir, "adapters", "node_modules", ".bin", "fixture-acp"])
+    File.mkdir_p!(auth_dir)
+    File.write!(Path.join(auth_dir, "fixture.json"), "fixture-token")
+    File.mkdir_p!(Path.dirname(adapter))
+    File.write!(adapter, "#!/bin/sh\n")
+    File.chmod!(adapter, 0o755)
+    Archetypes.load!(base_dir)
+
+    handlers = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))
+    start_lane!(ctx.db, "digester")
+
+    assert %{ok: true} =
+             handlers["tune"].(%{
+               origin: "user:flynn",
+               session_key: "digester",
+               params: %{setting: "set_harness", harness: "fixture", model: "fixture-model"}
+             })
+
+    barrier = Org.get(ctx.db, "digester").cleared_through_seq
+    visible = Projection.list_after(ctx.db, "digester", nil, 50, barrier)
+
+    refute Enum.any?(visible, &(&1.content =~ digest.wake_id)),
+           "the delivered digest message must be hidden by the barrier for this test to prove anything"
+
+    # DISCOVERY: the new engine calls `inspect` and finds the carrier's own
+    # wake id, regardless of the barrier and regardless of pending state.
+    assert %{digest_carriers: carriers} =
+             handlers["inspect"].(%{origin: "user:flynn", session_key: nil, params: %{}})
+
+    assert Enum.any?(carriers, &(&1.wake_id == digest.wake_id and &1.session_key == "digester")),
+           "the digest carrier must be discoverable after the barrier, got #{inspect(carriers)}"
+
+    # AND CAN STILL READ digest-members with the id it just discovered.
+    assert %{digest_members: members} =
+             handlers["digest-members"].(%{
+               origin: "user:flynn",
+               principal: {:user, "flynn"},
+               session_key: nil,
+               params: %{wake_id: digest.wake_id}
+             })
+
+    assert Enum.map(members, & &1.wake_id) == [a.wake_id, b.wake_id]
   end
 
   test "a model retune leaves a marker naming both ends, and a no-op leaves none", ctx do
@@ -4792,16 +5303,27 @@ defmodule Tightbeam.GatewayTest do
     emitted = Gateway.session_status("k-round-trip", ctx.db).modelCatalog.models
     terra_ref = Enum.find(emitted, &(&1.name == "GPT-5.6 Terra")).ref
 
-    assert %{ok: true} =
+    # F2 (Sol xhigh review): terra offers tiers, so the ref alone is refused
+    # (the substrate no longer picks one) — an explicit --effort completes
+    # the same round trip the ref proves: the FAMILY comes back from the
+    # catalog's own identity, and the tier is the caller's own election.
+    assert %{ok: false, code: "effort_required"} =
              Gateway.handlers(config)["tune"].(%{
                origin: "user:flynn",
                session_key: "k-round-trip",
                params: %{setting: "set_model", model: terra_ref}
              })
 
+    assert %{ok: true} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: "user:flynn",
+               session_key: "k-round-trip",
+               params: %{setting: "set_model", model: terra_ref, effort: "low"}
+             })
+
     stored = Org.get(ctx.db, "k-round-trip").model
     assert {stored.family, stored.context} == {"gpt-5.6-terra", nil}
-    assert stored.effort in ["low", "high"]
+    assert stored.effort == "low"
     assert Org.get(ctx.db, "k-round-trip").provider == "openai"
   end
 
@@ -4836,8 +5358,14 @@ defmodule Tightbeam.GatewayTest do
     assert Org.get(ctx.db, "k-codex").model == Model.new("gpt-5.6-sol", effort: "xhigh")
   end
 
-  test "set_model with a bare model id falls back to the new model's first tier when the current effort doesn't apply",
+  test "set_model with a bare model id to a different tiered family refuses effort_required, naming the tiers",
        ctx do
+    # F2 (Sol xhigh review, v0.2 program §4): the substrate never elects an
+    # effort tier on TUNE's behalf. This used to fall back to the new
+    # model's first listed tier when the outgoing effort didn't apply
+    # (`pick_effort`, deleted) — that was the substrate choosing, not
+    # validating a caller's choice, so a bare model id onto a DIFFERENT
+    # tiered family is refused instead, naming what's on offer.
     base_dir = role_test_base("set-model-bare-falls-back")
     Archetypes.load!(base_dir)
     config = gateway_config(base_dir, ctx.db, 0)
@@ -4858,22 +5386,23 @@ defmodule Tightbeam.GatewayTest do
     start_supervised!({CoordinatorStub, {adapter, self()}})
     start_lane!(ctx.db, "k-codex-fallback")
 
-    assert %{ok: true} =
+    assert %{ok: false, code: "effort_required", message: message} =
              Gateway.handlers(config)["tune"].(%{
                origin: "user:flynn",
                session_key: "k-codex-fallback",
                params: %{setting: "set_model", model: "gpt-5.6-terra"}
              })
 
-    # gpt-5.6-terra only offers low/high (in that catalog order); xhigh
-    # doesn't carry over and terra has no "medium" either, so this lands on
-    # its first listed tier.
-    assert Org.get(ctx.db, "k-codex-fallback").model == Model.new("gpt-5.6-terra", effort: "low")
+    assert message =~ "gpt-5.6-terra"
+    assert message =~ "low"
+    assert message =~ "high"
+
+    # Nothing applied: the session is still on its prior model.
+    assert Org.get(ctx.db, "k-codex-fallback").model == Model.new("gpt-5.6-sol", effort: "xhigh")
   end
 
-  test "set_model with a bare model id prefers 'medium' when the current effort doesn't apply but medium does",
-       ctx do
-    base_dir = role_test_base("set-model-bare-prefers-medium")
+  test "set_model with a bare model id and an explicit --effort still applies cleanly", ctx do
+    base_dir = role_test_base("set-model-bare-explicit-effort")
     Archetypes.load!(base_dir)
     config = gateway_config(base_dir, ctx.db, 0)
 
@@ -4893,15 +5422,15 @@ defmodule Tightbeam.GatewayTest do
     start_supervised!({CoordinatorStub, {adapter, self()}})
     start_lane!(ctx.db, "k-codex-medium")
 
+    # Naming no effort for a DIFFERENT tiered family is refused (the case
+    # above); naming one is honoured exactly as given, never composed.
     assert %{ok: true} =
              Gateway.handlers(config)["tune"].(%{
                origin: "user:flynn",
                session_key: "k-codex-medium",
-               params: %{setting: "set_model", model: "gpt-5.6-sol"}
+               params: %{setting: "set_model", model: "gpt-5.6-sol", effort: "medium"}
              })
 
-    # "turbo" doesn't exist on sol, but sol does offer "medium", so that's
-    # preferred over just taking the first listed tier.
     assert Org.get(ctx.db, "k-codex-medium").model == Model.new("gpt-5.6-sol", effort: "medium")
   end
 
@@ -5521,15 +6050,26 @@ defmodule Tightbeam.GatewayTest do
 
     start_lane!(ctx.db, "k1")
 
+    # F2 (Sol xhigh review): sol offers reasoning tiers, so a bare id with NO
+    # `--effort` is refused (`effort_required`) rather than composed onto
+    # "medium" — the substrate no longer picks a tier on the caller's
+    # behalf. This test's actual subject is the BARE ID acceptance (#69: the
+    # picker advertises `gpt-5.6-sol`, not the packed `gpt-5.6-sol[medium]`
+    # ref), so the effort travels as its own explicit field alongside it.
     assert %{ok: true, harness: "codex"} =
              Gateway.handlers(config)["tune"].(%{
                origin: "user:flynn",
                session_key: "k1",
-               params: %{setting: "set_harness", harness: "codex", model: "gpt-5.6-sol"}
+               params: %{
+                 setting: "set_harness",
+                 harness: "codex",
+                 model: "gpt-5.6-sol",
+                 effort: "medium"
+               }
              })
 
-    # Composed, not passed through: the tier is real information and the session must
-    # end up on a ref the catalog actually offers.
+    # Passed through cleanly: the session ends up on a ref the catalog
+    # actually offers, from the bare id + separate effort field.
     assert Org.get(ctx.db, "k1").model == Model.new("gpt-5.6-sol", effort: "medium")
 
     # And the value under test is one the picker really does advertise for this

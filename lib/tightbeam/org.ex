@@ -257,6 +257,22 @@ defmodule Tightbeam.Org do
   end
 
   @doc """
+  `get/2`, inside the caller's own transaction — a fresh, in-txn snapshot for a
+  caller that already read this session OUTSIDE any transaction and is about to
+  act on a fact about it (which harness it currently runs) that a concurrent
+  writer could have moved since. Reading it again here, as the first statement
+  of the transaction that will act on the answer, closes that gap the same way
+  `Ledger.pending_count_in_txn/2` does.
+  """
+  @spec get_in_txn(Txn.t(), String.t()) :: session() | nil
+  def get_in_txn(%Txn{} = txn, session_key) do
+    case Txn.q(txn, select_session_sql() <> " WHERE sessionKey = ?1", [session_key]) do
+      [row] -> to_session(row)
+      [] -> nil
+    end
+  end
+
+  @doc """
   Sessions for a user. `is_admin: true` returns ALL active sessions — a
   management capability. WIRE CALLERS MUST PASS `false`: chat catalogs,
   replay, and broadcast are owner-only for everyone, admin included (spec

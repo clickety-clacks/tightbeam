@@ -3336,6 +3336,17 @@ defmodule Tightbeam.Gateway do
         keys = MapSet.new(sessions, & &1.session_key)
         wakes = Wakes.list_pending(db) |> Enum.filter(&MapSet.member?(keys, &1.session_key))
 
+        # F9 (Sol xhigh review): the sanctioned discovery path for a digest
+        # carrier's OWN wake id, surviving a cross-harness barrier that hides
+        # the delivered digest message which would ordinarily carry it.
+        # `wakes` above is scoped to PENDING work and a delivered carrier is
+        # not that, so it needs its own read here rather than a filter over
+        # the same list.
+        digest_carriers =
+          sessions
+          |> Enum.flat_map(&Wakes.list_digest_carriers(db, &1.session_key))
+          |> Enum.map(&Map.take(&1, [:wake_id, :session_key, :class, :created_at, :fired_at]))
+
         # Discovery beats documentation: the org's SHAPE — what archetypes
         # exist (and their WHERE), what hosts are known, what model refs are
         # valid — is not a secret from its members. Without this, agents
@@ -3360,6 +3371,7 @@ defmodule Tightbeam.Gateway do
         result = %{
           sessions: Enum.map(sessions, &inspect_session/1),
           wakes: wakes,
+          digest_carriers: digest_carriers,
           roles: role_list_result(db).roles,
           archetypes: org_shape.archetypes,
           hosts: org_shape.hosts,
@@ -4057,31 +4069,99 @@ defmodule Tightbeam.Gateway do
     %{stream: db |> Org.get(session_key) |> Payloads.stream_session(), session_key: session_key}
   end
 
+  # THE CLOSED PARAMETER SURFACE FOR TUNE (F6, Sol xhigh review). The CLI's own
+  # `tune` flag set is closed (cli/src/args.rs `ALLOWED`) so a caller who
+  # mistypes `--modle` learns immediately rather than switching a session to a
+  # destination default it never asked for. Raw `/agent/dispatch` has no such
+  # gate — `Router.atomize_params/2` forwards whatever the caller sent — and
+  # neither does the device mapper's `model_params/1`, which used to DROP a
+  # malformed field rather than carry it here to be named. "The server is the
+  # contract, the CLI is convenience": the same closed set has to live here,
+  # once, for every setting, keyed on the setting the caller named.
+  @tune_params_by_setting %{
+    "rename" => ~w(setting display_name)a,
+    "adopt" => ~w(setting adopted)a,
+    "set_harness" => ~w(setting harness model effort context)a,
+    "set_host" => ~w(setting host)a,
+    "remove_override" => ~w(setting skill guidance)a,
+    "set_model" => ~w(setting model effort context)a,
+    "set_reasoning" => ~w(setting reasoningLevel)a
+  }
+
   defp tune_result(config, db, call) do
     p = call.params
 
+    case validate_tune_params(p) do
+      {:error, denial} -> denial
+      :ok -> tune_dispatch(config, db, call, p)
+    end
+  end
+
+  defp validate_tune_params(p) do
+    case Map.get(@tune_params_by_setting, p[:setting]) do
+      # An unrecognised setting falls through to `tune_dispatch/4`'s own
+      # catch-all ("unsupported"), which already names the actual cause; this
+      # gate only judges params against a setting it recognises.
+      nil ->
+        :ok
+
+      allowed ->
+        case Map.keys(p) -- allowed do
+          [] -> :ok
+          unknown -> {:error, unknown_param_error(unknown)}
+        end
+    end
+  end
+
+  defp unknown_param_error(keys) do
+    %{
+      ok: false,
+      code: "unknown_param",
+      message: "tune does not accept #{Enum.map_join(keys, ", ", &to_string/1)} for this setting"
+    }
+  end
+
+  defp tune_dispatch(config, db, call, p) do
     cond do
       p[:setting] == "rename" and is_binary(p[:display_name]) ->
-        session = Org.rename(db, call.session_key, p.display_name)
-        stream = Payloads.stream_session(session)
-        broadcast(db, session.owner_user_id, Payloads.stream_updated(stream))
-        %{stream: stream}
+        # F3 (Sol xhigh review): every tune mutation passes the same
+        # owner-or-admin gate `set_harness`/`set_model` already do. This was
+        # the pre-existing hole a role-token caller could drive with its own
+        # `sessionKey` swapped for a victim's — legacy since before this
+        # card, but this card is what made `tune` agent-reachable, so it
+        # closes here.
+        case tunable_session(db, call) do
+          {:error, denial} ->
+            denial
+
+          {:ok, session} ->
+            updated = Org.rename(db, session.session_key, p.display_name)
+            stream = Payloads.stream_session(updated)
+            broadcast(db, updated.owner_user_id, Payloads.stream_updated(stream))
+            %{stream: stream}
+        end
 
       p[:setting] == "adopt" and is_boolean(p[:adopted]) ->
-        session = Org.set_adopted(db, call.session_key, p.adopted)
-        stream = Payloads.stream_session(session)
-        broadcast(db, session.owner_user_id, Payloads.stream_updated(stream))
-        %{ok: true}
+        case tunable_session(db, call) do
+          {:error, denial} ->
+            denial
+
+          {:ok, session} ->
+            updated = Org.set_adopted(db, session.session_key, p.adopted)
+            stream = Payloads.stream_session(updated)
+            broadcast(db, updated.owner_user_id, Payloads.stream_updated(stream))
+            %{ok: true}
+        end
 
       p[:setting] == "set_harness" and is_binary(p[:harness]) ->
         set_harness_result(config, db, call, p)
 
       p[:setting] == "set_host" and is_binary(p[:host]) ->
-        case Org.get(db, call.session_key) do
-          nil ->
-            %{ok: false, code: "not_found"}
+        case tunable_session(db, call) do
+          {:error, denial} ->
+            denial
 
-          session ->
+          {:ok, session} ->
             archetype = Archetypes.get(session.archetype) || Archetypes.builtin_default()
 
             case Placement.resolve(archetype, p.host, Placement.hosts(config.base_dir, db)) do
@@ -4096,7 +4176,7 @@ defmodule Tightbeam.Gateway do
                     denial
 
                   :ok ->
-                    case Placement.move_workdir(config, call.session_key, session.host, host) do
+                    case Placement.move_workdir(config, session.session_key, session.host, host) do
                       :ok ->
                         case commit_host_rearm(config, db, session, host, 8) do
                           :ok -> %{ok: true, host: host}
@@ -4111,9 +4191,11 @@ defmodule Tightbeam.Gateway do
         end
 
       p[:setting] == "remove_override" ->
+        # Already gated (`session_mutation_allowed/3`, inside
+        # `remove_override_result/3`) — not one of F3's holes, left as-is.
         remove_override_result(config, db, call)
 
-      p[:setting] == "set_model" and is_binary(p[:model]) ->
+      p[:setting] == "set_model" ->
         # SAME harness, new model: the engine stays, and so does its
         # conversation. Same election, same owner gate, same catalog answer.
         case tunable_session(db, call) do
@@ -4121,15 +4203,17 @@ defmodule Tightbeam.Gateway do
             denial
 
           {:ok, session} ->
-            new_ref =
-              compose_model_selection(
-                session.host,
-                session.harness,
-                session.model,
-                resolve_selection(session.host, session.harness, p, session.model)
-              )
-
-            apply_model_change(config, db, call, session, new_ref)
+            with :ok <- validate_model_election(p),
+                 {:ok, new_ref} <-
+                   compose_tune_model_selection(
+                     session.host,
+                     session.harness,
+                     resolve_selection(session.host, session.harness, p, session.model)
+                   ) do
+              apply_model_change(config, db, call, session, new_ref)
+            else
+              {:error, denial} -> denial
+            end
         end
 
       p[:setting] == "set_reasoning" and is_binary(p[:reasoningLevel]) ->
@@ -4174,7 +4258,13 @@ defmodule Tightbeam.Gateway do
     with {:ok, session} <- tunable_session(db, call),
          {:ok, module} <- known_harness(harness),
          :ok <- distinct_harness(session, harness),
-         model = destination_model(session, module, harness, p),
+         :ok <- validate_model_election(p),
+         {:ok, model} <-
+           compose_tune_model_selection(
+             session.host,
+             harness,
+             destination_model(session, harness, p)
+           ),
          :ok <- validate_credential(config, harness, session.host),
          {:ok, routed} <-
            validate_catalog_model(session.host, harness, model, from_default?(p)),
@@ -4215,11 +4305,11 @@ defmodule Tightbeam.Gateway do
   # is not this caller's business to learn by probing.
   defp tunable_session(db, call) do
     session = Org.get(db, call.session_key)
-    caller = resolve_caller(db, call.origin)
+    caller = principal_caller(db, call)
 
     case {session, caller} do
       {%{state: "active"} = active, %{owner_user_id: owner}} when is_binary(owner) ->
-        if owner == active.owner_user_id or admin_origin?(db, call.origin),
+        if owner == active.owner_user_id or admin_caller?(db, call),
           do: {:ok, active},
           else: {:error, tune_not_found()}
 
@@ -4227,6 +4317,43 @@ defmodule Tightbeam.Gateway do
         {:error, tune_not_found()}
     end
   end
+
+  # THE CALLER'S IDENTITY IS WHAT THE ROUTER ALREADY PROVED, not a fresh
+  # re-resolution of `call.origin`'s role name (F8, Sol xhigh review). A role
+  # can be REBOUND to a different session between the router's authentication
+  # and this check; `resolve_caller/2` re-reading `"agent:<role>"` at THIS
+  # moment would authorize whoever holds the role NOW for a request the
+  # router authenticated for whoever held it THEN — a TOCTOU an admin
+  # rebinding a role mid-flight could open. The router already resolved that
+  # question once, immutably, into `call.principal` (`{:session, key}`) at
+  # authentication time; using it here instead closes the gap.
+  #
+  # Device calls and `--as-user` CLI calls carry NO session principal (they
+  # were never role-mediated) and are sound as `call.origin` already reads
+  # them — those fall back to the existing resolution, unchanged.
+  defp principal_caller(db, %{principal: {:session, session_key}}) do
+    case Org.get(db, session_key) do
+      %{state: "active"} = caller ->
+        %{owner_user_id: caller.owner_user_id, caller_session: caller}
+
+      _ ->
+        nil
+    end
+  end
+
+  defp principal_caller(db, call), do: resolve_caller(db, call.origin)
+
+  # `admin_origin?/2`'s TOCTOU counterpart: the admin bypass must ask the same
+  # immutable-principal question `principal_caller/2` does, not re-derive "who
+  # holds this role right now" a second time by a different route.
+  defp admin_caller?(db, %{principal: {:session, session_key}}) do
+    case Org.get(db, session_key) do
+      %{owner_user_id: user_id} -> match?(%{is_admin: true}, Devices.user(db, user_id))
+      _ -> false
+    end
+  end
+
+  defp admin_caller?(db, call), do: admin_origin?(db, call.origin)
 
   defp tune_not_found, do: %{ok: false, code: "not_found", message: "session not found"}
 
@@ -4260,39 +4387,33 @@ defmodule Tightbeam.Gateway do
   # may be hidden to satisfy a request that changes nothing, so this is
   # refused by name. A same-harness model change is `--model` with no
   # `--harness`.
-  defp distinct_harness(%{harness: resident}, resident) do
-    {:error,
-     %{
-       ok: false,
-       code: "same_harness",
-       message:
-         "#{resident} is already this session's harness; " <>
-           "omit --harness for a same-harness model change"
-     }}
-  end
+  defp distinct_harness(%{harness: resident}, resident),
+    do: {:error, distinct_harness_error(resident)}
 
   defp distinct_harness(_session, _harness), do: :ok
 
-  # A HARNESS BOUNDARY NEVER INHERITS THE SOURCE'S EFFORT, and never inherits
-  # the ORG's default model either. Effort is a tier in the DESTINATION
-  # catalog's vocabulary and the source's tier may simply not exist there;
-  # carrying it across produced a bogus `effort_not_offered` for a model the
-  # destination offers perfectly well. So when the caller names no model, the
-  # base is the DESTINATION harness's own default with its hardcoded tier
-  # stripped, and `compose_model_selection/4` is given no current effort — it
-  # picks from what that host's catalog actually offers for that harness.
-  defp destination_model(session, module, harness, p) do
-    base =
-      if Map.has_key?(Model.named_fields(p), :family),
-        do: nil,
-        else: %{module.default_model() | effort: nil}
+  defp distinct_harness_error(resident) do
+    %{
+      ok: false,
+      code: "same_harness",
+      message:
+        "#{resident} is already this session's harness; " <>
+          "omit --harness for a same-harness model change"
+    }
+  end
 
-    compose_model_selection(
-      session.host,
-      harness,
-      nil,
-      resolve_selection(session.host, harness, p, base)
-    )
+  # A HARNESS BOUNDARY NEVER INHERITS THE SOURCE'S EFFORT, and never invents a
+  # model the caller did not name (v0.2 program §4 — Sol xhigh review,
+  # live-switch finding 2: `set_harness_result/4` refuses `model_required`
+  # before this is ever called, so `p` always names one here). Effort is a
+  # tier in the DESTINATION catalog's vocabulary and the source's tier may
+  # simply not exist there; carrying it across produced a bogus
+  # `effort_not_offered` for a model the destination offers perfectly well.
+  # There is no fallback base: a family is always present in `p`, so
+  # `resolve_selection/4` always takes its "caller named a family" branch,
+  # which never inherits from a base anyway.
+  defp destination_model(session, harness, p) do
+    resolve_selection(session.host, harness, p, nil)
   end
 
   # THE IN-FLIGHT ANSWER: a live switch never interrupts a turn and is never
@@ -4338,11 +4459,14 @@ defmodule Tightbeam.Gateway do
     }
   end
 
-  # A selection that names a model but no effort (the ordinary case from
-  # `setModel.options`, which offers models rather than tiers) takes the
-  # session's current effort, falling back to "medium" or the first available
-  # tier when the current one doesn't apply to the newly selected model. An
-  # explicit effort is honoured as given.
+  # SPAWN's composition: a selection that names a model but no effort takes
+  # the session's current (or configured-default) effort, falling back to
+  # "medium" or the first available tier when the current one doesn't apply
+  # to the newly selected model. A brand-new session carries no risk of
+  # silently discarding a caller's OWN prior election, which is the harm
+  # `compose_tune_model_selection/3` below exists to prevent — that function,
+  # not this one, is TUNE's (Sol xhigh review, live-switch finding 2; scoped
+  # here to the verb the finding's scenarios and diff actually cover).
   defp compose_model_selection(host, harness, current, %Model{effort: nil} = selected) do
     case efforts_for(host, harness, selected) do
       [] -> selected
@@ -4358,6 +4482,87 @@ defmodule Tightbeam.Gateway do
       "medium" in efforts -> "medium"
       true -> List.first(efforts)
     end
+  end
+
+  # TUNE's composition (v0.2 program §4 — the substrate never elects; Sol
+  # xhigh review, live-switch finding 2). A model that offers reasoning tiers
+  # and gets no `--effort` is REFUSED, naming the tiers on offer — never the
+  # session's outgoing effort, never "medium", never the catalog's first
+  # entry. Those were three different elections `compose_model_selection/4`
+  # (spawn's, above) wore as one function; a live switch gets none of them,
+  # mid-session, on the substrate's own initiative. A model with no tiers
+  # needs no effort at all — `nil` stands.
+  defp compose_tune_model_selection(host, harness, %Model{effort: nil} = selected) do
+    case efforts_for(host, harness, selected) do
+      [] -> {:ok, selected}
+      efforts -> {:error, effort_required_error(selected, efforts)}
+    end
+  end
+
+  defp compose_tune_model_selection(_host, _harness, %Model{} = selected), do: {:ok, selected}
+
+  defp effort_required_error(selected, efforts) do
+    %{
+      ok: false,
+      code: "effort_required",
+      message:
+        "#{selected.family} offers reasoning tiers (#{Enum.join(efforts, ", ")}); " <>
+          "pass --effort to choose one"
+    }
+  end
+
+  # THE SUBSTRATE NEVER ELECTS A MODEL (v0.2 program §4 — Sol xhigh review,
+  # live-switch finding 2). A harness swap or a same-harness model change
+  # that names no model used to complete itself from the destination's
+  # configured default; that is the substrate choosing, not validating a
+  # caller's choice, and it is refused here BY NAME instead of silently
+  # substituted. `--context` qualifies a model, so a context with no model to
+  # qualify gets the more specific refusal — it names the actual mistake
+  # (a stray `--context`) rather than the generic "you must name a model".
+  defp validate_model_election(p) do
+    case Map.fetch(p, :model) do
+      {:ok, model} when is_binary(model) and model != "" ->
+        :ok
+
+      {:ok, model} when is_nil(model) or model == "" ->
+        model_election_error(p)
+
+      :error ->
+        model_election_error(p)
+
+      {:ok, _malformed} ->
+        {:error, invalid_model_field_error()}
+    end
+  end
+
+  defp model_election_error(p) do
+    if Map.has_key?(p, :context) do
+      {:error,
+       %{
+         ok: false,
+         code: "context_requires_model",
+         message: "--context qualifies a --model; name one, or drop --context"
+       }}
+    else
+      {:error,
+       %{
+         ok: false,
+         code: "model_required",
+         message: "this switch requires an explicit --model; the substrate does not choose one"
+       }}
+    end
+  end
+
+  # F6 (Sol xhigh review): a malformed field is a DIFFERENT fact than an
+  # absent one, and must be named as what it is rather than falling through
+  # to `model_required`/`context_requires_model` and reading as a caller who
+  # simply named nothing.
+  defp invalid_model_field_error do
+    %{
+      ok: false,
+      code: "invalid_model_field",
+      message: "model must be a string naming a catalog entry"
+    }
   end
 
   defp efforts_for(host, harness, %Model{} = selected) do
@@ -4427,8 +4632,13 @@ defmodule Tightbeam.Gateway do
     deliver_opts = if config[:sh], do: [sh: config.sh], else: []
 
     # Pin the shared home to the model this session will run on the new
-    # harness, not the org default, so the next turn's session/new
-    # offers and accepts it (wi_263814d3).
+    # harness, not the org default, so the next turn's session/new offers
+    # and accepts it (wi_263814d3). Best-effort AHEAD of the transaction
+    # below: if that transaction goes on to refuse the swap (a duplicate
+    # concurrent request that lost the race, or a turn that landed first),
+    # this pin was wasted work, never a wrong RESULT — nothing DB-visible
+    # changed, and the swap that does land re-pins to what it actually
+    # needs.
     with_home_pin_lock(harness_atom, session.host, fn ->
       Placement.deliver_home(
         config,
@@ -4437,72 +4647,129 @@ defmodule Tightbeam.Gateway do
       )
     end)
 
-    Org.set_harness(
-      db,
-      call.session_key,
-      harness,
-      provider,
-      model
-    )
-
-    # History barrier (product ruling): a new engine gets a fresh
-    # visible slate. Rows are RETAINED (never deleted) but replay
-    # stops at the barrier, and live clients are told to drop their
-    # local view. No pointer surgery: the old harness session can't
-    # load on the new engine → fallback pointer, fresh context.
+    # THE SERIALIZATION DOMAIN (Sol xhigh review, live-switch findings 1/4/5).
+    # The fresh same-harness check, the pending-turn count, the engine swap,
+    # the history barrier, and its tombstone are ONE transaction — not five
+    # separate calls to the single-writer `DB` owner. `DB` processes one
+    # `transaction/2` at a time in the owner process, so no other write
+    # (`deliver_prompt`'s echo+enqueue included) can land between any two of
+    # these: a prompt either committed before this transaction opens (the
+    # count below sees it and refuses) or it cannot commit until after this
+    # one ends, landing on whichever engine this decision leaves resident.
+    # `Org.get_in_txn/2` — read HERE, not trusted from the snapshot
+    # `tunable_session` returned before the lane was ever taken — is what
+    # lets a second, concurrent, identical swap see the FIRST swap's result
+    # and refuse `same_harness` instead of performing a same-harness no-op
+    # that still moves the barrier and appends a false tombstone (finding 5).
     #
-    # ONE TRANSACTION, both writes. The barrier and its tombstone are a
-    # single fact: history stopped being shown, and here is why. Split
-    # across two transactions, a crash between them left the barrier
-    # moved with no marker — which is precisely the silent burial the
-    # tombstone exists to prevent, just rarer. The MAX(seq) read moved
-    # inside too, so a message landing between the read and the barrier
-    # cannot be buried without being counted.
-    # DB.transaction CATCHES a raise and RETURNS {:error, exception}. A
-    # hard {:ok, _} match here is a MatchError that crashes the wire
-    # call instead of denying it — the trap already documented at
-    # `ruling_transaction/2`, and one this very test caught.
+    # History barrier (product ruling): a new engine gets a fresh visible
+    # slate. Rows are RETAINED (never deleted) but replay stops at the
+    # barrier, and live clients are told to drop their local view. No
+    # pointer surgery: the old harness session can't load on the new engine
+    # -> fallback pointer, fresh context. The MAX(seq) read lives inside
+    # this same transaction too, so a message landing between the read and
+    # the barrier cannot be buried without being counted.
+    #
+    # DB.transaction CATCHES a raise and RETURNS {:error, exception}. A hard
+    # {:ok, _} match here is a MatchError that crashes the wire call instead
+    # of denying it — the trap already documented at `ruling_transaction/2`,
+    # and one this very test caught.
     barrier =
       DB.transaction(db, fn txn ->
-        [[max_seq]] =
-          Txn.q(
-            txn,
-            "SELECT COALESCE(MAX(seq), 0) FROM messages WHERE sessionKey = ?1",
-            [call.session_key]
-          )
+        fresh = Org.get_in_txn(txn, call.session_key)
 
-        Org.set_cleared_through_in_txn(txn, call.session_key, max_seq)
+        cond do
+          is_nil(fresh) or fresh.state != "active" ->
+            {:refused, :not_found}
 
-        # Probe seam (same idiom as `on_work_item_interlock`): lets a
-        # test fail the transaction BETWEEN the two writes and prove the
-        # barrier rolls back with them. Absent in production.
-        case Map.get(call, :on_swap_interlock) do
-          fun when is_function(fun, 1) -> fun.(txn)
-          _ -> :ok
+          fresh.harness == harness ->
+            {:refused, :same_harness}
+
+          Ledger.pending_count_in_txn(txn, call.session_key) > 0 ->
+            {:refused, :turn_in_progress}
+
+          true ->
+            case Org.swap_model_in_txn(
+                   txn,
+                   call.session_key,
+                   {fresh.model, fresh.harness},
+                   {model, harness, provider}
+                 ) do
+              {:ok, _updated} ->
+                :ok
+
+              other ->
+                # UNREACHABLE BY CONSTRUCTION: `fresh` was read as the FIRST
+                # statement of this very transaction, and nothing else can
+                # write to this row before the UPDATE below runs (single
+                # writer, one transaction at a time). `:duplicate` requires
+                # `fresh.harness == harness`, already refused above;
+                # `:stale` requires a write this transaction did not make.
+                raise "swap_model_in_txn saw #{inspect(other)} inside its " <>
+                        "own serializing transaction — the fresh read above " <>
+                        "did not describe the row this UPDATE just saw"
+            end
+
+            [[max_seq]] =
+              Txn.q(
+                txn,
+                "SELECT COALESCE(MAX(seq), 0) FROM messages WHERE sessionKey = ?1",
+                [call.session_key]
+              )
+
+            Org.set_cleared_through_in_txn(txn, call.session_key, max_seq)
+
+            # Probe seam (same idiom as `on_work_item_interlock`): lets a
+            # test fail the transaction BETWEEN the two writes and prove the
+            # barrier rolls back with them, or race a concurrent write into
+            # this window and prove it cannot land inside it. Absent in
+            # production.
+            case Map.get(call, :on_swap_interlock) do
+              fun when is_function(fun, 1) -> fun.(txn)
+              _ -> :ok
+            end
+
+            Projection.append_marker_in_txn(
+              txn,
+              call.session_key,
+              swap_tombstone(session, harness, model)
+            )
+
+            :swapped
         end
-
-        Projection.append_marker_in_txn(
-          txn,
-          call.session_key,
-          swap_tombstone(session, harness, model)
-        )
       end)
 
     case barrier do
       {:error, error} ->
-        # Rolled back: the barrier did NOT move and the history is
-        # still shown. The session is already on the new engine, which
-        # is the safe direction to fail in — an operator sees their
-        # conversation and a refused swap, never an empty chat with no
-        # account of why. No broadcast either: there is nothing to tell
-        # clients to drop.
+        # Rolled back: the barrier did NOT move and the history is still
+        # shown, and the session is STILL on its prior engine (the swap
+        # write rolled back with everything else in this transaction) — the
+        # safe direction to fail in. An operator sees their conversation
+        # and a refused swap, never an empty chat with no account of why,
+        # and never a session silently re-engined with no marker. No
+        # broadcast either: there is nothing to tell clients to drop.
         %{
           ok: false,
           code: "swap_barrier_failed",
           message: describe_error(error)
         }
 
-      {:ok, _} ->
+      {:ok, {:refused, :turn_in_progress}} ->
+        turn_in_progress_error()
+
+      {:ok, {:refused, :same_harness}} ->
+        # The FIRST of two racing identical requests already won this swap
+        # inside ITS transaction; this one's fresh read (not the stale
+        # pre-lane snapshot) sees that and refuses by the same name a
+        # sequential same-harness request gets, rather than performing a
+        # same-harness no-op that still moves the barrier and appends a
+        # false tombstone (finding 5).
+        distinct_harness_error(harness)
+
+      {:ok, {:refused, :not_found}} ->
+        tune_not_found()
+
+      {:ok, :swapped} ->
         broadcast(
           db,
           session.owner_user_id,

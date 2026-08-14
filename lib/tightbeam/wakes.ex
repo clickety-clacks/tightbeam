@@ -1349,6 +1349,31 @@ defmodule Tightbeam.Wakes do
     end
   end
 
+  @doc """
+  Recent digest carriers targeting a session, regardless of pending state (O5
+  follow-up; F9, Sol xhigh review). `list_pending/1` is scoped to PENDING
+  work, and a delivered carrier is not that — it already fired. But its own
+  wake id is the only sanctioned key into `digest_members/2`, and the
+  delivered digest MESSAGE that ordinarily names it (`digest_prompt/3`) stops
+  being served across a cross-harness history barrier: the transcript is
+  exactly what stopped being read. Without this, a session that switched
+  engines mid-batch has no lawful way back to its own digest's payload — a
+  status question rows already answer (philosophy gate Q9). Bounded and
+  newest-first: a discovery aid for `inspect`, not an audit log.
+  """
+  @spec list_digest_carriers(db(), String.t(), pos_integer()) :: [wake()]
+  def list_digest_carriers(db \\ Tightbeam.DB, session_key, limit \\ 20) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        select_wake_sql() <>
+          " WHERE sessionKey = ?1 AND digest = 1 ORDER BY createdAt DESC LIMIT ?2",
+        [session_key, limit]
+      )
+
+    Enum.map(rows, &to_wake/1)
+  end
+
   @doc "All pending wakes, soonest first (inspect filters to owned sessions)."
   @spec list_pending(db()) :: [wake()]
   def list_pending(db \\ Tightbeam.DB) do

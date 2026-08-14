@@ -471,6 +471,30 @@ defmodule Tightbeam.Ledger do
   end
 
   @doc """
+  `pending_count/2`, inside the caller's own transaction.
+
+  The in-txn form matters, not just the query: `DB` is single-writer and
+  serializes one `DB.transaction/2` call at a time, so a count taken as its
+  OWN transaction (as `pending_count/2` does) can never rule out a prompt
+  committing in the gap before the caller's next transaction opens. A count
+  read inside the SAME transaction that goes on to perform the swap+barrier
+  closes that gap: no other write (`deliver_prompt`'s echo+enqueue included)
+  can land between this read and the writes that follow it, because none can
+  run until this transaction commits (Sol xhigh review, live-switch finding 1).
+  """
+  @spec pending_count_in_txn(Txn.t(), String.t()) :: non_neg_integer()
+  def pending_count_in_txn(%Txn{} = txn, session_key) do
+    [[count]] =
+      Txn.q(
+        txn,
+        "SELECT count(*) FROM turns WHERE sessionKey = ?1 AND status IN ('queued','running')",
+        [session_key]
+      )
+
+    count
+  end
+
+  @doc """
   Is a turn RUNNING for this session — started and not yet terminal?
 
   `claim_next/3` sets `status = 'running'` and `startedAt` in one UPDATE, so this

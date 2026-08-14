@@ -241,7 +241,15 @@ defmodule Tightbeam.ConformanceSupport do
   defp applicable_runners("live-switch", runners),
     do: Enum.filter(runners, &(&1 == "live_switch"))
 
-  defp applicable_runners(_kind, runners), do: runners
+  defp applicable_runners("harness-gate", runners),
+    do: Enum.filter(runners, &(&1 == "compiled_hook_grep"))
+
+  # F10 (Sol xhigh review): NO CATCH-ALL. Every fixture `kind` this manifest
+  # actually uses has its own clause above; a kind that matches none of them
+  # — a typo, or a future kind nobody wired a runner for — must run NOTHING
+  # and fail loudly (`runners != []` at the call site), not fall back to
+  # every runner the class happens to declare. A silent `runners` pass-through
+  # here is exactly the kind/runner mismatch this function exists to catch.
 
   defp load_loadset!(path, class) do
     loadset = path |> decode_toml!() |> Map.fetch!("loadset")

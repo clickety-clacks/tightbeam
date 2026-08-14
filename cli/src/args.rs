@@ -42,13 +42,14 @@ pub enum Target {
 pub enum TuneControl {
     /// A different HARNESS. The engine changes, so the engine's conversation
     /// cannot come with it — Tightbeam's session, role, work, and graph
-    /// position do. Naming no model lets the destination catalog compose its
-    /// own default; the SOURCE model and its effort tier are never inherited
-    /// across the boundary, because a tier is vocabulary the destination may
-    /// not have.
+    /// position do. `model` is REQUIRED (v0.2 program §4: the substrate
+    /// never elects) — the SOURCE model and its effort tier are never
+    /// inherited across the boundary either, because a tier is vocabulary
+    /// the destination may not have, so an omitted `--effort` on a model
+    /// that offers tiers is refused rather than guessed.
     Harness {
         harness: String,
-        model: Option<String>,
+        model: String,
         effort: Option<Option<String>>,
         context: Option<Option<String>>,
     },
@@ -821,24 +822,28 @@ fn nonempty(flags: &HashMap<String, String>, name: &str) -> Option<String> {
     flags.get(name).filter(|value| !value.is_empty()).cloned()
 }
 
-const TUNE_USAGE: &str = "usage: tightbeam tune --session <key> (--harness <harness> [--model <model>] | --model <model> | --effort <level>) [--effort <level>] [--context <variant>]";
+const TUNE_USAGE: &str = "usage: tightbeam tune --session <key> (--harness <harness> --model <model> | --model <model> | --effort <level>) [--effort <level>] [--context <variant>]";
 
-/// TIGHTBEAM'S EFFORT LEVELS ARE NOT PART OF A MODEL'S NAME.
+/// TIGHTBEAM'S FIELDS ARE NEVER PACKED INTO ONE STRING.
 ///
-/// The vendors spell a context variant `claude-fable-5[1m]` and Tightbeam once
-/// spelled a reasoning tier `gpt-5.6-sol[high]`. The syntaxes matched, so a
-/// catalog read the vendor's suffix as ours and the 1M-context model silently
-/// ceased to exist. The fields are separate everywhere below this line, so a
-/// bracket carrying one of OUR words is refused here rather than parsed:
-/// `--effort` is where an effort is named.
+/// `--model`, `--effort`, and `--context` are separate flags for a reason:
+/// Tightbeam once spelled a reasoning tier `gpt-5.6-sol[high]`, colliding with
+/// the vendor's own context-variant syntax (`claude-fable-5[1m]`), and a
+/// catalog read the vendor's bracket as ours — the 1M-context model silently
+/// ceased to exist.
 ///
-/// A bracket carrying anything else is the VENDOR's context variant and is
-/// none of this function's business — `claude-fable-5[1m]` passes.
+/// This function used to allow the vendor's syntax through by checking the
+/// bracket's CONTENTS against a hardcoded list of Tightbeam's own tier words
+/// (`low`/`medium`/`high`/`xhigh`/`max`). That list already went stale once —
+/// the reviewed catalog offers `ultra` too (`test/model_catalog_test.exs`) —
+/// and a fixed vocabulary can never keep up with a PER-MODEL catalog this
+/// binary does not always carry at parse time (F7, Sol xhigh review). So the
+/// check no longer inspects what is inside the brackets at all: ANY bracketed
+/// suffix on `--model` is packed form and is refused, naming where the field
+/// actually belongs. A caller who wants a vendor context variant passes it as
+/// `--context`, the field that exists for exactly that.
 fn has_packed_effort(model: &str) -> bool {
-    model
-        .strip_suffix(']')
-        .and_then(|rest| rest.rsplit_once('['))
-        .is_some_and(|(_, packed)| matches!(packed, "low" | "medium" | "high" | "xhigh" | "max"))
+    model.ends_with(']') && model.contains('[')
 }
 
 /// PRESENCE, for the fields where an empty value means something. `nonempty`
@@ -1340,7 +1345,11 @@ fn parse_with_optional_catalog(
             let context = named(flags, "context");
 
             if model.as_deref().is_some_and(has_packed_effort) {
-                return Err("--model must not pack an effort; pass --effort separately".to_owned());
+                return Err(
+                    "--model must not carry a bracketed suffix; pass --effort or --context \
+                     separately"
+                        .to_owned(),
+                );
             }
             if let Some(name) = harness.as_deref() {
                 let catalog = match supplied_catalog {
@@ -1352,13 +1361,35 @@ fn parse_with_optional_catalog(
                 }
             }
 
+            // THE SUBSTRATE NEVER ELECTS (v0.2 program §4). A harness swap
+            // re-engines the mind answering a session; the CLI does not let
+            // that request leave with no model named and trust the far side
+            // to pick one, the same way it does not let `--context` (a
+            // QUALIFIER of a model) leave with no model for it to qualify.
+            // Both are refused BY NAME here, and the gateway enforces the
+            // same two rules independently — the server is the contract,
+            // this is only its earliest, friendliest echo.
             let control = match (harness, model, effort, context) {
-                (Some(harness), model, effort, context) => TuneControl::Harness {
+                (Some(harness), Some(model), effort, context) => TuneControl::Harness {
                     harness,
                     model,
                     effort,
                     context,
                 },
+                (Some(_), None, _, Some(_)) => {
+                    return Err(
+                        "--context qualifies a --model; name one, or drop --context \
+                         (context_requires_model)"
+                            .to_owned(),
+                    );
+                }
+                (Some(_), None, _, None) => {
+                    return Err(
+                        "--harness requires --model: the substrate does not choose one \
+                         (model_required)"
+                            .to_owned(),
+                    );
+                }
                 (None, Some(model), effort, context) => TuneControl::Model {
                     model,
                     effort,
@@ -1370,6 +1401,13 @@ fn parse_with_optional_catalog(
                 // "no tier" on a model nobody named. Both are usage errors
                 // rather than a guess.
                 (None, None, Some(Some(effort)), None) => TuneControl::Effort(effort),
+                (None, None, _, Some(_)) => {
+                    return Err(
+                        "--context qualifies a --model; name one, or drop --context \
+                         (context_requires_model)"
+                            .to_owned(),
+                    );
+                }
                 (None, None, _, _) => return Err(TUNE_USAGE.to_owned()),
             };
 
@@ -2412,16 +2450,17 @@ mod tests {
                 session_key: "s_1".to_owned(),
                 control: TuneControl::Harness {
                     harness: "codex".to_owned(),
-                    model: Some("gpt-5.6-sol".to_owned()),
+                    model: "gpt-5.6-sol".to_owned(),
                     effort: Some(Some("high".to_owned())),
                     context: None,
                 },
             })
         );
 
-        // A harness switch with NO model: the destination catalog composes its
-        // own default. The CLI must not fill this in — it does not know what
-        // the destination host offers, and inventing one is the whole failure
+        // A harness switch with NO model is REFUSED (v0.2 program §4): the
+        // substrate does not compose the destination's own default, and the
+        // CLI does not invent one either — it does not know what the
+        // destination host offers, and inventing one is the whole failure
         // this design exists to prevent.
         assert_eq!(
             tune(&[
@@ -2433,16 +2472,33 @@ mod tests {
                 "--as-user",
                 "flynn"
             ]),
-            Ok(Command::Tune {
-                identity: Identity::User("flynn".to_owned()),
-                session_key: "s_1".to_owned(),
-                control: TuneControl::Harness {
-                    harness: "codex".to_owned(),
-                    model: None,
-                    effort: None,
-                    context: None,
-                },
-            })
+            Err(
+                "--harness requires --model: the substrate does not choose one \
+                 (model_required)"
+                    .to_owned()
+            )
+        );
+
+        // `--context` with no `--model` for it to qualify — even alongside
+        // `--harness` — is refused by the more specific name: the caller's
+        // actual mistake is the stray `--context`, not a bare missing model.
+        assert_eq!(
+            tune(&[
+                "tune",
+                "--session",
+                "s_1",
+                "--harness",
+                "codex",
+                "--context",
+                "1m",
+                "--as-user",
+                "flynn"
+            ]),
+            Err(
+                "--context qualifies a --model; name one, or drop --context \
+                 (context_requires_model)"
+                    .to_owned()
+            )
         );
 
         // A same-harness MODEL retune.
@@ -2528,13 +2584,21 @@ mod tests {
                 "--as-user",
                 "flynn",
             ]),
-            Err("--model must not pack an effort; pass --effort separately".to_owned())
+            Err(
+                "--model must not carry a bracketed suffix; pass --effort or --context \
+                 separately"
+                    .to_owned()
+            )
         );
 
-        // The VENDOR's context variant in the same syntax is not ours to
-        // refuse — `[1m]` is a window, not a tier, and reading it as one is
-        // how the 1M model once ceased to exist.
-        assert!(matches!(
+        // F7 (Sol xhigh review): the VENDOR's context variant in the same
+        // syntax is ALSO refused now — a hardcoded list of Tightbeam's own
+        // tier words already went stale once (the catalog offers `ultra`
+        // too), and a per-model catalog is not always available to check
+        // against at CLI parse time. Any bracket is packed form; a context
+        // variant is named through `--context`, the field that exists for
+        // it.
+        assert_eq!(
             tune(&[
                 "tune",
                 "--session",
@@ -2544,8 +2608,12 @@ mod tests {
                 "--as-user",
                 "flynn",
             ]),
-            Ok(Command::Tune { .. })
-        ));
+            Err(
+                "--model must not carry a bracketed suffix; pass --effort or --context \
+                 separately"
+                    .to_owned()
+            )
+        );
 
         // An engine this build does not carry is refused by name at the CLI,
         // before a session is ever addressed.
@@ -2563,7 +2631,8 @@ mod tests {
         );
 
         // A context qualifies a MODEL. Alone it qualifies nothing, and the
-        // CLI does not guess which model the caller meant.
+        // CLI does not guess which model the caller meant — named by the
+        // more specific cause rather than the generic usage line.
         assert_eq!(
             tune(&[
                 "tune",
@@ -2574,7 +2643,11 @@ mod tests {
                 "--as-user",
                 "flynn"
             ]),
-            Err(TUNE_USAGE.to_owned())
+            Err(
+                "--context qualifies a --model; name one, or drop --context \
+                 (context_requires_model)"
+                    .to_owned()
+            )
         );
 
         // No control named at all.
