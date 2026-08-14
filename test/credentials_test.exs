@@ -899,6 +899,15 @@ defmodule Tightbeam.CredentialsTest do
     test "a satellite metadata failure refuses without transporting credential bytes", ctx do
       owner = self()
 
+      # Seed a PRIOR onboarded credential, so the stale-health scenario Sol
+      # named has something stale to leave behind if the ordering regresses.
+      prior_credential = "prior-satellite-secret"
+      credential_path = Path.join([ctx.base, "auth", "codex", "auth.json"])
+      metadata_path = Path.join([ctx.base, "auth", "codex", ".tightbeam", "credential.json"])
+      File.mkdir_p!(Path.dirname(metadata_path))
+      File.write!(credential_path, prior_credential)
+      File.write!(metadata_path, ~S({"provider":"openai","onboarded":true,"kind":"subscription"}))
+
       sh = fn command ->
         send(owner, {:remote_finish_command, command})
         text = Enum.join(command, " ")
@@ -923,15 +932,40 @@ defmodule Tightbeam.CredentialsTest do
       assert {:ok, staging, lease_id} = Credentials.begin_onboard(:openai, server)
       File.write!(Path.join(staging, "auth.json"), "satellite-candidate-secret")
 
-      # Both the pre-activation marker and the failure marker are metadata
-      # writes, so this mock refuses both: the refusal compounds rather than
-      # being swallowed.
-      assert {:error, {:onboarding_failed_and_marker_failed, detail}} =
+      # The marker commits BEFORE the credential is installed, so an unwritable
+      # metadata path refuses with the store still untouched.
+      assert {:error, {:credential_metadata_write_failed, message}} =
                Credentials.finish_onboard(:openai, :subscription, lease_id, server)
 
-      assert inspect(detail) =~ "metadata refused"
+      assert inspect(message) =~ "metadata refused"
       refute File.exists?(staging)
       refute_receive :forbidden_credential_present
+
+      # Nothing was installed, so the prior state stays coherent: the prior
+      # credential and its prior metadata still describe each other. The stale
+      # `onboarded: true` can never come to describe a candidate that was never
+      # activated (Sol xhigh blocking 1).
+      assert File.read!(Path.join([ctx.base, "auth", "codex", "auth.json"])) == prior_credential
+
+      # And a restarted gateway reads the same thing from disk, not from memory.
+      {:ok, restarted} =
+        Credentials.start_link(
+          name: nil,
+          base_dir: ctx.base,
+          machine: "worker",
+          ssh: "worker",
+          sh: &run_remote_command/1
+        )
+
+      assert File.read!(Path.join([ctx.base, "auth", "codex", "auth.json"])) == prior_credential
+
+      # `:onboarded` is the CORRECT reading here, and the point of the ordering:
+      # the refusal happened before anything was installed, so the prior
+      # credential and its prior metadata still describe each other. A failed
+      # onboarding is a clean no-op — nothing was silently restored, because
+      # nothing was ever removed. The stale-health defect would show up as this
+      # metadata describing a DIFFERENT credential; assert it does not.
+      assert Credentials.status(:openai, restarted) == :onboarded
 
       # The property this test exists for, unchanged: credential bytes never
       # cross the ssh edge as command text.
@@ -1021,7 +1055,7 @@ defmodule Tightbeam.CredentialsTest do
               {:onboarding_failed_and_marker_failed,
                %{
                  finish: {:error, :runtime_start_failed},
-                 marker: {:error, {:credential_metadata_write_failed, message}}
+                 marker: {:credential_metadata_write_failed, message}
                }}} = Credentials.finish_onboard(:openai, :subscription, lease_id, server)
 
       assert message =~ "marker refused"
