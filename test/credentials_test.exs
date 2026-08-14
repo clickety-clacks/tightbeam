@@ -1083,10 +1083,15 @@ defmodule Tightbeam.CredentialsTest do
           sh: sh
         )
 
+      # DURABILITY, read from disk by a process that never saw the failure: the
+      # detailed cause was refused, so what survives is the pre-activation
+      # marker's generic text. Less specific than the vendor's own words, and
+      # still fails closed — which is the property that matters.
       assert {:needs_onboarding, {:present_but_unverified, restarted_cause}} =
                Credentials.status(:openai, restarted)
 
       assert restarted_cause == durable_marker["present_but_unverified"]
+      assert restarted_cause["finish"] =~ "credential activation has not committed"
       refute_receive :forbidden_credential_present
       refute_receive :forbidden_resume
       refute_receive :forbidden_publish
