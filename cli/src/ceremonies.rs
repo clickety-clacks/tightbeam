@@ -2689,6 +2689,200 @@ fn target_from_probe(output: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn durable_view(
+        provider: &str,
+        credential_kind: &str,
+        state: &str,
+        next_action: &str,
+        authorization_url: Option<&str>,
+        display_code: Option<&str>,
+        cleanup_state: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "ceremonyId": "oc_test",
+            "provider": provider,
+            "host": "gibson",
+            "credentialKind": credential_kind,
+            "principalUserId": "flynn",
+            "state": state,
+            "authorizationUrl": authorization_url,
+            "displayCode": display_code,
+            "startedAt": 1_000,
+            "expiresAt": 2_000,
+            "nextAction": next_action,
+            "cleanupState": cleanup_state,
+        })
+    }
+
+    #[test]
+    fn durable_public_view_accepts_only_the_closed_state_action_shapes() {
+        for (state, action) in [
+            ("preparing", "waitForChallenge"),
+            ("validating", "waitForValidation"),
+            ("readyToCommit", "waitForTurnBoundary"),
+            ("committing", "waitForCommit"),
+            ("recoveryRequired", "restartOrCancel"),
+        ] {
+            parse_durable_view(Some(durable_view(
+                "anthropic",
+                "subscription",
+                state,
+                action,
+                None,
+                None,
+                "complete",
+            )))
+            .unwrap();
+        }
+
+        parse_durable_view(Some(durable_view(
+            "anthropic",
+            "subscription",
+            "awaitingUser",
+            "openUrlThenSubmitCode",
+            Some("https://example.invalid/anthropic"),
+            None,
+            "complete",
+        )))
+        .unwrap();
+        parse_durable_view(Some(durable_view(
+            "openai",
+            "subscription",
+            "awaitingUser",
+            "openUrlThenConfirmApproval",
+            Some("https://example.invalid/openai"),
+            Some("ABCD-EFGH"),
+            "complete",
+        )))
+        .unwrap();
+        parse_durable_view(Some(durable_view(
+            "openai",
+            "apiKey",
+            "awaitingUser",
+            "supplyApiKeyThroughStdin",
+            None,
+            None,
+            "complete",
+        )))
+        .unwrap();
+
+        for state in ["succeeded", "canceled", "expired", "superseded", "failed"] {
+            parse_durable_view(Some(durable_view(
+                "anthropic",
+                "subscription",
+                state,
+                "none",
+                None,
+                None,
+                "pending",
+            )))
+            .unwrap();
+        }
+        parse_durable_view(Some(durable_view(
+            "anthropic",
+            "subscription",
+            "failed",
+            "operatorRepair",
+            None,
+            None,
+            "pending",
+        )))
+        .unwrap();
+
+        for invalid in [
+            durable_view(
+                "anthropic",
+                "subscription",
+                "awaiting_user",
+                "openUrlThenSubmitCode",
+                Some("https://example.invalid"),
+                None,
+                "complete",
+            ),
+            durable_view(
+                "anthropic",
+                "subscription",
+                "awaitingUser",
+                "openUrlThenConfirmApproval",
+                Some("https://example.invalid"),
+                Some("CODE"),
+                "complete",
+            ),
+            durable_view(
+                "anthropic",
+                "subscription",
+                "preparing",
+                "unknownAction",
+                None,
+                None,
+                "complete",
+            ),
+            durable_view(
+                "anthropic",
+                "subscription",
+                "succeeded",
+                "operatorRepair",
+                None,
+                None,
+                "complete",
+            ),
+        ] {
+            assert!(parse_durable_view(Some(invalid)).is_err());
+        }
+
+        let mut missing_null = durable_view(
+            "anthropic",
+            "subscription",
+            "preparing",
+            "waitForChallenge",
+            None,
+            None,
+            "complete",
+        );
+        missing_null
+            .as_object_mut()
+            .unwrap()
+            .remove("authorizationUrl");
+        assert!(parse_durable_view(Some(missing_null)).is_err());
+    }
+
+    #[test]
+    fn durable_public_view_debug_redacts_challenge_material() {
+        let view = parse_durable_view(Some(durable_view(
+            "openai",
+            "subscription",
+            "awaitingUser",
+            "openUrlThenConfirmApproval",
+            Some("https://challenge-secret-sentinel.invalid"),
+            Some("display-secret-sentinel"),
+            "complete",
+        )))
+        .unwrap();
+        let rendered = format!("{view:?}");
+
+        assert!(
+            !rendered.contains("challenge-secret-sentinel"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("display-secret-sentinel"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+    }
+
+    #[test]
+    fn approval_requires_an_observed_input_event_not_stdin_eof() {
+        assert_eq!(
+            approval_confirmation(0),
+            Err("no approval confirmation was provided".to_owned())
+        );
+        assert_eq!(approval_confirmation(1), Ok(()));
+    }
+
+    #[test]
+    fn durable_gateway_calls_are_bounded_by_the_ceremony_deadline() {
+        assert!(active_durable_deadline(0).is_none());
+        assert!(active_durable_deadline(i64::MAX).is_some());
+    }
+
     /// The refusal is the whole value of not reading a key from a terminal, so
     /// the sentence is pinned rather than the `isatty` branch that produces it
     /// (which a unit test cannot stub). It must name the pipe form, because that
