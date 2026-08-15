@@ -13,6 +13,8 @@ Reference implementation: the TypeScript gateway at `~/src/tightbeam`
 (read-only; its tests and scripts/blackbox drivers are the behavioral
 oracle). Exemplar Elixir module for style/specs/docs: `lib/tightbeam/ledger.ex`.
 
-Rules: `mix test` green before every commit; commit to main, never branch or
-push; append to JOURNAL.md before ending a session; new deps need a journal
-justification; cross-provider review per the SOP.
+Rules: `mix test` green before every commit; integrate to 0.1.x, never main
+(main is the 0.2 line: fixes cross to it only by Mike-authorized cherry-pick,
+and a card that names a branch explicitly wins); append to JOURNAL.md before
+ending a session; new deps need a journal justification; cross-provider review
+per the SOP.

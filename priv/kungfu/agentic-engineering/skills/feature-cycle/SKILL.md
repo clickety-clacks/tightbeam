@@ -98,8 +98,10 @@ per-feature, but your attention across features is the scarce resource.
    exactly as a code review is. When you cannot tell which side a goal falls on,
    that question goes to the product owner too — the ask costs one wake; a wrong
    guess merges a change the spirit never accepted.
-7. **Integrate.** The coder reconciles the change with main
-   (committing-and-pushing skill); the review that clears the work covers the
+7. **Integrate.** The coder reconciles the change with 0.1.x
+   (committing-and-pushing skill; main is the 0.2 line: fixes cross to it only by
+   Mike-authorized cherry-pick, and a card that names a branch explicitly wins);
+   the review that clears the work covers the
    post-reconciliation result — a review from before integration is stale where
    integration changed semantics.
 8. **Verification papertrail.** Before a goal completes, the coder verifies the work

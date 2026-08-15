@@ -32,9 +32,11 @@ boundary.
    what created it (`git log`, the branch name, `tightbeam list` for the sessions
    around you), then either wake the owner to clean it up, or remove it yourself once
    you have established it is safe (abandoned, yours, or the owner agrees).
-6. Reconcile main into your branch before building on it: merge main in, resolve
+6. Reconcile 0.1.x into your branch before building on it: merge 0.1.x in, resolve
    conflicts on your branch, and prove the combined result builds and passes tests
-   there. Do not build new work on a branch that has diverged from main.
+   there. Do not build new work on a branch that has diverged from 0.1.x (main is
+   the 0.2 line: fixes cross to it only by Mike-authorized cherry-pick, and a card
+   that names a branch explicitly wins).
 7. After your branch merges, prune your worktree and delete the merged branch. A
    finished assignment leaves no worktree behind; attest the cleanup as part of
    completion.

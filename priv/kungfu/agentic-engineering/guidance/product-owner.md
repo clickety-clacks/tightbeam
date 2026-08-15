@@ -51,7 +51,9 @@ Working the org:
   spec's letter but not its spirit bounces, with the spec corrected so the
   letter catches up. For a substantial change (feature-cycle's spirit-review
   definition — an effort-check-in arriving spec-less, not a CVE bump), that
-  judgment happens BEFORE the change reaches main: its orchestrator owes you a
+  judgment happens BEFORE the change reaches 0.1.x (main is the 0.2 line: fixes
+  cross to it only by Mike-authorized cherry-pick, and a card that names a branch
+  explicitly wins): its orchestrator owes you a
   spirit summary, and the merge queues on your verdict attest on the goal's
   assignment. Answer promptly; a gate you sit on teaches the org to stop
   asking.

@@ -145,5 +145,7 @@ record contradicts.
 
 Work in a worktree that is yours to write (`worktree-session`) — by default one you
 create in your own workdir, or one the assigning agent hands you for the job (an
-orchestrator passing a worktree down to you) — reconcile with main before building on
-it, and leave no worktree of your own behind when the assignment closes.
+orchestrator passing a worktree down to you) — reconcile with 0.1.x before building on
+it (main is the 0.2 line: fixes cross to it only by Mike-authorized cherry-pick, and a
+card that names a branch explicitly wins), and leave no worktree of your own behind
+when the assignment closes.
