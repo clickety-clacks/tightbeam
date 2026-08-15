@@ -108,10 +108,10 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
     assert output =~ "is not descended from protected base"
   end
 
-  test "preparation refuses a protected base after origin/main advances" do
+  test "preparation refuses a protected base after origin/0.1.x advances" do
     fixture = git_fixture!()
-    git!(fixture.repo, ["push", "origin", "#{fixture.f1}:refs/heads/main"])
-    git!(fixture.repo, ["fetch", "origin", "main"])
+    git!(fixture.repo, ["push", "origin", "#{fixture.f1}:refs/heads/0.1.x"])
+    git!(fixture.repo, ["fetch", "origin", "0.1.x"])
 
     {stale_output, stale_status} =
       command(
@@ -123,7 +123,7 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
     assert stale_status != 0
 
     assert stale_output ==
-             "release candidate: protected base #{fixture.base} is not the fetched origin/main #{fixture.f1}.\n"
+             "release candidate: protected base #{fixture.base} is not the fetched origin/0.1.x #{fixture.f1}.\n"
 
     refute git_ref?(fixture.repo, "refs/heads/release-candidate/stale-base")
     refute git_ref?(fixture.remote, "refs/heads/release-candidate/stale-base")
@@ -336,7 +336,7 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
     remote = Path.join(root, "origin.git")
     File.mkdir_p!(repo)
     on_exit(fn -> File.rm_rf!(root) end)
-    git!(repo, ["init", "-b", "main"])
+    git!(repo, ["init", "-b", "0.1.x"])
     git!(repo, ["config", "user.name", "Release Test"])
     git!(repo, ["config", "user.email", "release@test.invalid"])
     File.write!(Path.join(repo, "content"), "base\n")
@@ -346,7 +346,7 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
     File.mkdir_p!(remote)
     git!(remote, ["init", "--bare"])
     git!(repo, ["remote", "add", "origin", remote])
-    git!(repo, ["push", "-u", "origin", "main"])
+    git!(repo, ["push", "-u", "origin", "0.1.x"])
     File.write!(Path.join(repo, "content"), "feature one\n", [:append])
     git!(repo, ["commit", "-am", "feature one"])
     f1 = git!(repo, ["rev-parse", "HEAD"])
