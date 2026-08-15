@@ -2348,6 +2348,104 @@ mod tests {
     }
 
     #[test]
+    fn worker_response_frames_are_closed_and_debug_redacts_code() {
+        let code = decode_worker_response(1, b"response-secret-sentinel#state".to_vec()).unwrap();
+        let rendered = format!("{code:?}");
+        assert!(!rendered.contains("response-secret-sentinel"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert_eq!(
+            decode_worker_response(2, vec![]),
+            Ok(WorkerResponse::Approved)
+        );
+
+        for (tag, value) in [
+            (1, vec![]),
+            (2, b"unexpected".to_vec()),
+            (3, vec![]),
+            (1, vec![0xff]),
+        ] {
+            assert_eq!(
+                decode_worker_response(tag, value),
+                Err("worker_response_invalid".to_owned())
+            );
+        }
+    }
+
+    #[test]
+    fn staged_candidate_digest_is_bound_to_the_private_bytes() {
+        let root = std::env::temp_dir().join(format!(
+            "tightbeam-worker-candidate-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let candidate = root.join(".credentials.json");
+        let bytes = b"candidate-secret-sentinel";
+
+        let digest = stage_candidate_and_digest(&candidate, bytes).unwrap();
+        assert_eq!(digest, format!("{:x}", Sha256::digest(bytes)));
+        assert_eq!(fs::read(&candidate).unwrap(), bytes);
+        assert_eq!(
+            fs::symlink_metadata(&candidate)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o077,
+            0
+        );
+
+        assert!(stage_candidate_and_digest(&candidate, b"replacement").is_err());
+        assert_eq!(fs::read(&candidate).unwrap(), bytes);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn challenge_restart_material_is_private_exact_and_not_followed() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "tightbeam-worker-challenge-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let secret = root.join("challenge.json");
+
+        let first = load_or_create_anthropic_challenge(&secret).unwrap();
+        let second = load_or_create_anthropic_challenge(&secret).unwrap();
+        assert_eq!(first.url, second.url);
+        assert_eq!(
+            fs::symlink_metadata(&secret).unwrap().permissions().mode() & 0o077,
+            0
+        );
+
+        let linked = root.join("linked.json");
+        symlink(&secret, &linked).unwrap();
+        assert!(load_or_create_anthropic_challenge(&linked).is_err());
+
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(write_private_file(&root.join("not-private"), b"secret").is_err());
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn live_worker_process_identity_is_observable_without_a_timeout_proxy() {
+        let identity = os_process_start_identity(std::process::id()).unwrap();
+        assert!(!identity.is_empty());
+        if cfg!(target_os = "linux") {
+            assert!(identity.starts_with("linux:"), "{identity}");
+        }
+        if cfg!(target_os = "macos") {
+            assert!(identity.starts_with("macos:"), "{identity}");
+        }
+    }
+
+    #[test]
     fn a_ceremony_outliving_its_lease_is_killed_with_its_whole_group() {
         // The stub forks a GRANDCHILD and records its pid, so this asserts the whole group
         // died rather than just the process we spawned. A wrapper that killed only its
