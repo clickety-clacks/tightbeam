@@ -449,6 +449,66 @@ defmodule Tightbeam.ConditionFactsTest do
     assert List.last(fired_order) == b_wake
   end
 
+  test "shared harness health keeps auth and rate-limit standing states distinct", ctx do
+    scope = ConditionFacts.harness_scope("claude", "gibson")
+    assert scope == JSON.encode!(["claude", "gibson"])
+
+    assert {:ok, %{kind: "harness-auth-dead", scope: ^scope}} =
+             DB.transaction(ctx.db, fn txn ->
+               ConditionFacts.file_harness_health_in_txn(
+                 txn,
+                 "claude",
+                 "gibson",
+                 "auth-dead",
+                 :assert
+               )
+             end)
+
+    assert ConditionFacts.harness_unavailable?(ctx.db, "claude", "gibson")
+    assert ConditionFacts.harness_failure_standing?(ctx.db, "claude", "gibson", "auth-dead")
+
+    refute ConditionFacts.harness_failure_standing?(
+             ctx.db,
+             "claude",
+             "gibson",
+             "rate-limit-dead"
+           )
+
+    assert {:ok, %{kind: "harness-rate-limit-dead"}} =
+             DB.transaction(ctx.db, fn txn ->
+               ConditionFacts.file_harness_health_in_txn(
+                 txn,
+                 "claude",
+                 "gibson",
+                 "rate-limit-dead",
+                 :assert
+               )
+             end)
+
+    assert {:ok, %{kind: "harness-auth-restored"}} =
+             DB.transaction(ctx.db, fn txn ->
+               ConditionFacts.file_harness_health_in_txn(
+                 txn,
+                 "claude",
+                 "gibson",
+                 "auth-dead",
+                 :retract
+               )
+             end)
+
+    refute ConditionFacts.harness_failure_standing?(ctx.db, "claude", "gibson", "auth-dead")
+    assert ConditionFacts.harness_unavailable?(ctx.db, "claude", "gibson")
+  end
+
+  test "only the substrate may file reserved harness health facts", ctx do
+    assert {:error, %{code: "reserved_kind"}} =
+             ConditionFacts.file(ctx.db, ctx.scheduler, %{
+               kind: "harness-auth-dead",
+               scope: ConditionFacts.harness_scope("claude", "gibson"),
+               origin: "agent:observer"
+             })
+  end
+
   defp condition_wake(ctx, kind, scope, due_at \\ nil) do
     Wakes.schedule(ctx.db, %{
       session_key: ctx.session.session_key,

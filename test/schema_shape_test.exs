@@ -49,6 +49,25 @@ defmodule Tightbeam.SchemaShapeTest do
     assert {:ok, [["model-identity-v1"]]} = DB.query(db, "SELECT shape FROM schema_stamp")
   end
 
+  test "the harness health foundation is additive and exact", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    assert table_columns(db, "harness_health_observations") ==
+             ~w(id correlationId harness host failureClass evidenceKind sessionKey assignmentId observedAt cause principal incidentId)
+
+    assert table_columns(db, "harness_health_incidents") ==
+             ~w(id harness host failureClass state openedAt openObservationId openedFactId resolvedAt resolutionObservationId resolvedFactId)
+
+    assert table_columns(db, "harness_health_members") == ~w(incidentId sessionKey)
+
+    assert table_columns(db, "harness_health_assignments") ==
+             ~w(incidentId assignmentId sessionKey)
+
+    assert {:ok, [["model-identity-v1"]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+    assert :ok = Schema.ensure_all(db)
+    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM harness_health_incidents")
+  end
+
   test "the shared liveness activation creates one exact additive shape", %{db: db} do
     assert :ok = Schema.ensure_all(db)
 
