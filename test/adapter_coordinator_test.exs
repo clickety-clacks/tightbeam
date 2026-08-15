@@ -79,11 +79,14 @@ defmodule Tightbeam.AdapterCoordinatorTest do
   # onboarding ceremony read that refusal as "this credential is bad". Recovery
   # required restarting the gateway to wipe the in-memory latch.
   #
-  # The adapter command is SWITCHABLE so the replacement can be viable rather than
-  # another instant death (Sol xhigh, important 4): failing until the circuit
-  # opens, then a process that stays alive, so the post-activation assertions do
-  # not race a :DOWN.
+  # The adapter command is SWITCHABLE so the replacement is genuinely VIABLE, not
+  # another instant death (Sol xhigh, important 4 and round 3): it fails until the
+  # circuit latches, then becomes the protocol-capable @fake harness that answers
+  # `initialize` and COMPLETES BOOT. `sleep` would stay alive without ever
+  # becoming ready, which proves only that a process exists.
   test "activate_provider_runtime bypasses an open circuit and replaces the adapter", ctx do
+    viable = Path.join(ctx.test_dir, "viable_harness.js")
+    File.write!(viable, @fake)
     {:ok, phase} = Agent.start_link(fn -> :failing end)
 
     coordinator =
@@ -96,10 +99,10 @@ defmodule Tightbeam.AdapterCoordinatorTest do
            cmd =
              case Agent.get(phase, & &1) do
                :failing -> [System.find_executable("false")]
-               :viable -> [System.find_executable("sleep"), "60"]
+               :viable -> [System.find_executable("node"), viable]
              end
 
-           [harness: :claude, cmd: cmd, home: "/tmp", cwd: "/tmp"]
+           [harness: :claude, cmd: cmd, home: ctx.test_dir, cwd: ctx.test_dir]
          end,
          db: ctx.db,
          name: :"coord_#{System.unique_integer([:positive])}"}
@@ -137,14 +140,16 @@ defmodule Tightbeam.AdapterCoordinatorTest do
                credential_kind: :subscription
              )
 
-    # A NEW adapter, still alive after the old backoff window -- not the latched
-    # key's survivor handed back, and not a corpse.
-    assert Process.alive?(pid)
+    # A NEW adapter -- not the latched key's survivor handed back -- and one that
+    # actually BOOTS. Readiness is the honest proof the replacement credential
+    # produced a working runtime; a live pid alone is not.
     assert generation > latched_generation(latched)
-    Process.sleep(50)
+    assert wait_until(fn -> AdapterCoordinator.ready?(coordinator, key) end, 2_000)
     assert Process.alive?(pid)
 
-    # ...and the history of the credential that no longer exists is cleared.
+    # ...and the history of the credential that no longer exists is cleared, and
+    # STAYS cleared past the old backoff window rather than transiently.
+    Process.sleep(50)
     assert %{"claude:default@testhost" => health} = AdapterCoordinator.health(coordinator)
     assert health.circuit == :closed
     assert health.consecutive_failures == 0
@@ -155,6 +160,9 @@ defmodule Tightbeam.AdapterCoordinatorTest do
   # the authority-first ordering, `live_entry?` won the cond and onboarding
   # reported success on the credential the operator had just replaced.
   test "activate_provider_runtime replaces a live adapter even when context matches", ctx do
+    viable = Path.join(ctx.test_dir, "same_kind_harness.js")
+    File.write!(viable, @fake)
+
     coordinator =
       start_supervised!(
         {AdapterCoordinator,
@@ -164,9 +172,9 @@ defmodule Tightbeam.AdapterCoordinatorTest do
          adapter_opts: fn _, _ ->
            [
              harness: :claude,
-             cmd: [System.find_executable("sleep"), "60"],
-             home: "/tmp",
-             cwd: "/tmp"
+             cmd: [System.find_executable("node"), viable],
+             home: ctx.test_dir,
+             cwd: ctx.test_dir
            ]
          end,
          db: ctx.db,
@@ -180,6 +188,9 @@ defmodule Tightbeam.AdapterCoordinatorTest do
                credential_kind: :subscription
              )
 
+    # Wait for READY, so the first adapter is unambiguously healthy: a
+    # replacement afterwards cannot be explained by the first having died.
+    assert wait_until(fn -> AdapterCoordinator.ready?(coordinator, key) end, 2_000)
     assert Process.alive?(first)
 
     # Same key, same credential KIND -- a subscription refresh. The running
@@ -190,7 +201,57 @@ defmodule Tightbeam.AdapterCoordinatorTest do
              )
 
     refute second == first
+    refute Process.alive?(first)
     assert Process.alive?(second)
+  end
+
+  # A FENCED key must still have the replaced credential's health cleared
+  # (Sol xhigh round 3). Returning :park_fenced with the entry untouched left the
+  # old credential's open circuit intact, so the first ordinary checkout after an
+  # unpark was refused :degraded -- the recovery deadlock, rebuilt on the other
+  # side of the fence. The fence blocks STARTING; it does not make the old
+  # credential's failures true again.
+  test "a fenced key still has the replaced credential's health cleared", ctx do
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         backoff_base_ms: 1,
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn _, _ ->
+           [harness: :claude, cmd: [System.find_executable("false")], home: "/tmp", cwd: "/tmp"]
+         end,
+         db: ctx.db,
+         name: :"coord_#{System.unique_integer([:positive])}"}
+      )
+
+    key = {:claude, "default", "testhost"}
+
+    assert {:ok, _pid, _gen} = AdapterCoordinator.adapter_for(coordinator, key)
+
+    assert wait_until(
+             fn ->
+               match?(
+                 %{"claude:default@testhost" => %{circuit: :open}},
+                 AdapterCoordinator.health(coordinator)
+               )
+             end,
+             1_500
+           )
+
+    {:ok, _} = Tightbeam.HarnessProcess.begin_park(ctx.db, key)
+
+    # Authority does NOT unpark -- the fence is a lifecycle constraint.
+    assert {:error, {:park_fenced, _}} =
+             AdapterCoordinator.activate_provider_runtime(coordinator, key,
+               credential_kind: :subscription
+             )
+
+    # ...but the replaced credential's verdict is gone, so an unpark does not
+    # walk straight back into the deadlock.
+    assert %{"claude:default@testhost" => health} = AdapterCoordinator.health(coordinator)
+    assert health.circuit == :closed
+    assert health.consecutive_failures == 0
   end
 
   defp latched_generation(%{generation: generation}), do: generation

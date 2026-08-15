@@ -26,7 +26,7 @@ defmodule Tightbeam.AdapterCoordinator do
     The circuit protects AGENT CONNECTIONS from a dead harness. It has no
     authority over CREDENTIAL INSTALLATION, and the two must not be mixed
     (ruled 2026-08-14, after the credential-swap incident). Onboarding reaches
-    the coordinator through the authoritative `adapter_for/3`, which bypasses
+    the coordinator through `activate_provider_runtime/3`, which bypasses
     the circuit and clears the failure history before attempting — see
     `adapter_for_reply/4`. Otherwise a latched key vetoes the only call that
     can unlatch it: the circuit is guaranteed open exactly when a credential
@@ -95,7 +95,8 @@ defmodule Tightbeam.AdapterCoordinator do
 
   THE ONLY CALL THAT OUTRANKS ADAPTER HEALTH, and it is named rather than
   spelled as an extra argument on purpose (Sol xhigh, important 3). Authority
-  used to ride on `adapter_for/3` — pass a context, get a circuit bypass — so
+  used to ride on the old `adapter_for/3` — pass a context, get a circuit
+  bypass — so
   any future caller that happened to supply context would silently acquire the
   right to override health policy. The credential lifecycle is the only thing
   entitled to it, and now the only thing that can say it.
@@ -341,16 +342,30 @@ defmodule Tightbeam.AdapterCoordinator do
             {state, false}
           end
 
-        entry = Map.get(state.adapters, key, fresh_entry())
+        # The reset happens BEFORE the fence check and is PERSISTED either way
+        # (Sol xhigh round 3). A fence blocks STARTING; it does not make the old
+        # credential's failures true again. Returning :park_fenced with the entry
+        # untouched left the replaced credential's open circuit intact, so the
+        # first ordinary checkout after an unpark was refused :degraded — the
+        # recovery deadlock, rebuilt on the other side of the fence.
+        #
+        # Clearing here is honest regardless of the fence: those failures are
+        # facts about a credential that no longer exists. This also keeps the
+        # generation advancing exactly once on EVERY authoritative branch,
+        # fenced included.
+        entry =
+          state.adapters
+          |> Map.get(key, fresh_entry())
+          |> reset_failure_history(closed?)
+
+        state = put_in(state.adapters[key], entry)
 
         if Tightbeam.HarnessProcess.fenced?(state.db, key) do
           # A park fence is an explicit lifecycle constraint, not a health
           # verdict, so credential authority does not implicitly unpark.
           {:reply, {:error, {:park_fenced, key_name(key)}}, state}
         else
-          {reply, state} =
-            start_adapter(key, reset_failure_history(entry, closed?), state, context)
-
+          {reply, state} = start_adapter(key, entry, state, context)
           {:reply, reply, state}
         end
 
