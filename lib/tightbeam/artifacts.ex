@@ -208,7 +208,20 @@ defmodule Tightbeam.Artifacts do
   end
 
   @doc """
-  Archive in-workspace rows after a session workspace has been reaped.
+  Take a retired session's workspace into custody, then archive its rows.
+
+  THE WORKSPACE IS ALWAYS PRESERVED. Artifact rows say what a row is; they have
+  never said whether the bytes may be deleted. Work exists before anyone files a
+  row for it, so "this session recorded no artifact" is a statement about
+  paperwork, not about an empty workspace. Reading it as a deletion oracle is
+  what let an ordinary revoke-and-retire remove a session workspace that held
+  uncommitted work, and report success (wi_38df6905, specimen 2026-08-07).
+
+  Nothing here consults Git. A workspace goes into the archive whole — tracked,
+  staged, untracked, ignored, nested repositories, and files no repository ever
+  knew about — because every narrower rule is a rule about what someone
+  remembered to commit, and the bytes worth keeping are usually the ones nobody
+  did.
 
   An origin that does not resolve inside the session workspace is an EXTERNAL
   artifact — work that legitimately happened somewhere else (another machine, a
@@ -229,27 +242,25 @@ defmodule Tightbeam.Artifacts do
     rows = list(db, %{session_key: session_key})
     live = Enum.filter(rows, &(&1.state == "in-workspace"))
 
-    if live == [] do
-      remove_workspace(workspace_path)
-    else
-      {relative_paths, external, errors} = archive_candidates(live, workspace_path)
+    {relative_paths, external, errors} = archive_candidates(live, workspace_path)
 
-      # An origin that is inside the workspace and unreadable is not external —
-      # nothing was released, the bytes are simply gone. That still refuses to
-      # invent custody.
-      if map_size(relative_paths) == 0 and errors != [] do
-        raise hd(errors)
-      end
+    # An origin that is inside the workspace and unreadable is not external —
+    # nothing was released, the bytes are simply gone. That still refuses to
+    # invent custody.
+    if map_size(relative_paths) == 0 and errors != [] do
+      raise hd(errors)
+    end
 
-      archived_path =
-        if map_size(relative_paths) == 0 do
-          remove_workspace(workspace_path)
-          nil
-        else
-          ensure_workspace_available!(workspace_path)
-          archive_workspace!(workspace_path, archive_root, session_key)
-        end
+    archived_path = preserve_workspace!(workspace_path, archive_root, session_key)
 
+    # A row claimed custody, so the workspace was there when we classified it.
+    # If it is not there now, say that instead of recording a home under an
+    # archive directory nothing ever wrote.
+    if map_size(relative_paths) > 0 and is_nil(archived_path) do
+      raise ArgumentError, "workspace is unavailable for artifact archival"
+    end
+
+    if relative_paths != %{} or external != [] do
       updated_at = now()
 
       {:ok, :ok} =
@@ -340,45 +351,141 @@ defmodule Tightbeam.Artifacts do
     get(db, artifact_id)
   end
 
-  defp remove_workspace(nil), do: :ok
+  # Nothing on this machine to preserve: a remote holder's workspace, which this
+  # host can neither read nor remove, or a session whose workspace was never
+  # created here. Either way there are no bytes to lose and nothing to delete.
+  defp preserve_workspace!(nil, _archive_root, _session_key), do: nil
 
-  defp remove_workspace(workspace_path) do
-    if File.exists?(workspace_path), do: File.rm_rf!(workspace_path)
-    :ok
+  defp preserve_workspace!(workspace_path, archive_root, session_key) do
+    case File.lstat(workspace_path) do
+      {:ok, %File.Stat{type: :directory}} ->
+        archive_workspace!(workspace_path, archive_root, session_key)
+
+      _absent ->
+        nil
+    end
   end
 
+  # The recovery location is STABLE: one session always archives to one
+  # directory, so an operator finds a retired workspace by session key and a
+  # retry lands on its own earlier attempt instead of scattering copies. The
+  # digest keeps that name faithful — `sanitize/1` maps ':' and ' ' to the same
+  # character, so two different session keys can otherwise produce one directory
+  # name, and merging two workspaces into one archive is its own kind of loss.
   defp archive_workspace!(workspace_path, archive_root, session_key) do
-    ensure_workspace_available!(workspace_path)
-
-    archive_dir =
-      Path.join(
-        archive_root,
-        "#{sanitize(session_key)}-#{System.system_time(:millisecond)}"
-      )
+    archive_dir = Path.join(archive_root, archive_name(session_key))
+    inventory = inventory!(workspace_path)
 
     File.mkdir_p!(archive_root)
 
-    case File.rename(workspace_path, archive_dir) do
-      :ok ->
-        archive_dir
+    # A rename into a free location is the whole preservation in one atomic
+    # step: there is no instant when the bytes are in neither place. Every other
+    # case — a workspace on another filesystem, a retry landing on what an
+    # earlier attempt left — copies, PROVES the copy, and only then removes the
+    # source.
+    moved? =
+      match?({:error, :enoent}, File.lstat(archive_dir)) and
+        File.rename(workspace_path, archive_dir) == :ok
 
-      {:error, _reason} ->
-        case File.cp_r(workspace_path, archive_dir) do
-          {:ok, _paths} ->
-            File.rm_rf!(workspace_path)
-            archive_dir
+    unless moved?, do: copy_into!(workspace_path, archive_dir)
 
-          {:error, reason, file} ->
-            _ = File.rm_rf(archive_dir)
+    verify_archived!(inventory, archive_dir, workspace_path, moved?)
 
-            raise File.CopyError,
-              reason: reason,
-              action: "copy",
-              source: file,
-              destination: archive_dir
-        end
+    unless moved?, do: File.rm_rf!(workspace_path)
+
+    archive_dir
+  end
+
+  defp archive_name(session_key) do
+    digest =
+      :crypto.hash(:sha256, session_key)
+      |> Base.encode16(case: :lower)
+      |> binary_part(0, 8)
+
+    "#{sanitize(session_key)}-#{digest}"
+  end
+
+  # `File.cp_r/2` merges into a destination that already exists, which is what a
+  # retry landing on an earlier attempt's archive needs, and it preserves a
+  # symlink as the symlink it was.
+  #
+  # A failed copy leaves the archive standing, unlike the version this replaced:
+  # what is already in there may be the only copy of something, and the source is
+  # still in place to try again from.
+  defp copy_into!(workspace_path, archive_dir) do
+    case File.cp_r(workspace_path, archive_dir) do
+      {:ok, _paths} ->
+        :ok
+
+      {:error, reason, file} ->
+        raise File.CopyError,
+          reason: reason,
+          action: "copy",
+          source: file,
+          destination: archive_dir
     end
   end
+
+  # What we set out to preserve, read BEFORE anything moves: every path under the
+  # workspace with the type and size that must still be there afterwards.
+  defp inventory!(workspace_path), do: entries!(workspace_path, [], %{})
+
+  defp entries!(path, segments, acc) do
+    stat = File.lstat!(path)
+
+    acc =
+      case segments do
+        [] -> acc
+        _named -> Map.put(acc, Path.join(Enum.reverse(segments)), signature(stat))
+      end
+
+    case stat.type do
+      :directory ->
+        Enum.reduce(File.ls!(path), acc, fn entry, inner ->
+          entries!(Path.join(path, entry), [entry | segments], inner)
+        end)
+
+      _leaf ->
+        acc
+    end
+  end
+
+  # A directory's own size says nothing about what is in it; its children carry
+  # that, and each of them is inventoried in its own right.
+  defp signature(%File.Stat{type: :directory}), do: :directory
+  defp signature(%File.Stat{type: type, size: size}), do: {type, size}
+
+  # A copy that reported success is not a copy that happened. The source is
+  # removed only after the archive answers for every path the workspace had, and
+  # a refusal names where the bytes are so the operator does not have to guess.
+  defp verify_archived!(inventory, archive_dir, workspace_path, moved?) do
+    unproven =
+      Enum.reject(inventory, fn {relative, signature} ->
+        archived?(File.lstat(Path.join(archive_dir, relative)), signature)
+      end)
+
+    if unproven != [] do
+      {first, _signature} = Enum.min(unproven)
+
+      raise "workspace archive is incomplete: #{length(unproven)} of #{map_size(inventory)} " <>
+              "entries are missing or altered under #{archive_dir} (first: #{first}). " <>
+              recovery(workspace_path, moved?)
+    end
+
+    :ok
+  end
+
+  defp archived?({:ok, %File.Stat{type: :directory}}, :directory), do: true
+  defp archived?({:ok, %File.Stat{type: type, size: size}}, {type, size}), do: true
+  defp archived?(_stat, _signature), do: false
+
+  defp recovery(workspace_path, false),
+    do: "The workspace was NOT removed and is still at #{workspace_path}."
+
+  defp recovery(workspace_path, true),
+    do:
+      "The workspace was moved out of #{workspace_path} in one step, so its bytes are " <>
+        "in that archive directory and nothing was deleted."
 
   defp ensure_workspace_available!(workspace_path) do
     case is_binary(workspace_path) && File.lstat(workspace_path) do

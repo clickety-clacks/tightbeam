@@ -355,7 +355,11 @@ defmodule Tightbeam.ArtifactsTest do
     assert external.origin_path == outside
     assert File.read!(outside) == "not in workspace"
     refute File.exists?(workspace)
-    refute File.exists?(archive_root)
+
+    # The ROW is released because the bytes it points at are elsewhere. The
+    # WORKSPACE is still taken into custody: what a row says has never been a
+    # licence to delete the directory the session worked in.
+    assert [_archived] = File.ls!(archive_root)
   end
 
   test "canonical custody accepts an internal symlink and records the archived target", ctx do
@@ -434,7 +438,10 @@ defmodule Tightbeam.ArtifactsTest do
     assert external.home == nil
     assert File.read!(outside) == "outside"
     refute File.exists?(workspace)
-    refute File.exists?(archive_root)
+
+    # Preserved as the link it was, still pointing where it pointed — the
+    # archive is the workspace, not an interpretation of it.
+    assert File.read_link!(Path.join(archived_dir(archive_root), "outside-link.md")) == outside
   end
 
   test "valid artifacts archive beside each external and unreadable mixed-row class", ctx do
@@ -525,7 +532,11 @@ defmodule Tightbeam.ArtifactsTest do
       Path.join(System.tmp_dir!(), "artifact-archive-#{System.unique_integer([:positive])}")
 
     File.mkdir_p!(workspace)
-    on_exit(fn -> File.rm_rf(workspace) end)
+
+    on_exit(fn ->
+      File.rm_rf(workspace)
+      File.rm_rf(archive_root)
+    end)
 
     # The exact form the operating manual teaches for remote work. Resolving it
     # against the workspace would make "shrdlu:" a missing directory and raise.
@@ -541,7 +552,11 @@ defmodule Tightbeam.ArtifactsTest do
     external = Artifacts.get(ctx.db, row.artifact_id)
     assert external.state == "released"
     assert external.home == nil
-    refute File.exists?(archive_root)
+
+    # The origin was never resolved against the workspace, and the workspace was
+    # still preserved rather than removed on the strength of that classification.
+    refute File.exists?(workspace)
+    assert [_archived] = File.ls!(archive_root)
   end
 
   test "a remote session with only declared work archives with no reachable workspace", ctx do
@@ -558,20 +573,282 @@ defmodule Tightbeam.ArtifactsTest do
     assert Artifacts.get(ctx.db, row.artifact_id).state == "released"
   end
 
-  test "removes an artifact-free workspace", ctx do
-    workspace =
-      Path.join(
-        System.tmp_dir!(),
-        "empty-artifact-workspace-#{System.unique_integer([:positive])}"
-      )
+  # wi_38df6905, specimen 2026-08-07: a revoke and an ordinary retire removed a
+  # session workspace that held uncommitted work, and reported success. The
+  # workspace had no artifact row, and row presence was the deletion oracle.
+  test "an artifact-free workspace is preserved, not deleted: a row is not a licence", ctx do
+    {workspace, archive_root} = workspace_fixture("artifact-free")
 
     File.mkdir_p!(workspace)
-    File.write!(Path.join(workspace, "scratch.txt"), "discard me")
+    File.write!(Path.join(workspace, "uncommitted.ex"), "the work nobody filed")
+
+    assert Artifacts.list(ctx.db, %{session_key: ctx.parent.session_key}) == []
 
     assert :ok =
-             Artifacts.archive_session(ctx.db, ctx.parent.session_key, workspace, "/unused")
+             Artifacts.archive_session(ctx.db, ctx.parent.session_key, workspace, archive_root)
+
+    assert File.read!(Path.join(archived_dir(archive_root), "uncommitted.ex")) ==
+             "the work nobody filed"
 
     refute File.exists?(workspace)
+  end
+
+  test "a clean checkout is preserved: retirement is not a judgement about tidiness", ctx do
+    {workspace, archive_root} = workspace_fixture("clean")
+    git_repo!(workspace)
+    File.write!(Path.join(workspace, "tracked.txt"), "committed\n")
+    git!(workspace, ["add", "tracked.txt"])
+    git!(workspace, ["commit", "--quiet", "-m", "tracked"])
+
+    # Git has nothing to report, which is exactly when a Git-shaped guard says
+    # "safe to delete". It is not the guard.
+    assert git_status!(workspace) == ""
+
+    assert :ok =
+             Artifacts.archive_session(ctx.db, ctx.parent.session_key, workspace, archive_root)
+
+    assert File.read!(Path.join(archived_dir(archive_root), "tracked.txt")) == "committed\n"
+    refute File.exists?(workspace)
+  end
+
+  test "a dirty tracked file is preserved as it stands, not as it was committed", ctx do
+    {workspace, archive_root} = workspace_fixture("dirty")
+    git_repo!(workspace)
+    File.write!(Path.join(workspace, "tracked.txt"), "committed\n")
+    git!(workspace, ["add", "tracked.txt"])
+    git!(workspace, ["commit", "--quiet", "-m", "tracked"])
+    File.write!(Path.join(workspace, "tracked.txt"), "the edit that was never committed\n")
+
+    assert :ok =
+             Artifacts.archive_session(ctx.db, ctx.parent.session_key, workspace, archive_root)
+
+    assert File.read!(Path.join(archived_dir(archive_root), "tracked.txt")) ==
+             "the edit that was never committed\n"
+
+    refute File.exists?(workspace)
+  end
+
+  test "a staged file is preserved", ctx do
+    {workspace, archive_root} = workspace_fixture("staged")
+    git_repo!(workspace)
+    File.write!(Path.join(workspace, "base.txt"), "base\n")
+    git!(workspace, ["add", "base.txt"])
+    git!(workspace, ["commit", "--quiet", "-m", "base"])
+    File.write!(Path.join(workspace, "staged.txt"), "staged, never committed\n")
+    git!(workspace, ["add", "staged.txt"])
+
+    assert :ok =
+             Artifacts.archive_session(ctx.db, ctx.parent.session_key, workspace, archive_root)
+
+    archived = archived_dir(archive_root)
+    assert File.read!(Path.join(archived, "staged.txt")) == "staged, never committed\n"
+
+    # The index itself, so the staging survives with the bytes.
+    assert File.exists?(Path.join(archived, ".git/index"))
+    refute File.exists?(workspace)
+  end
+
+  test "an untracked file is preserved", ctx do
+    {workspace, archive_root} = workspace_fixture("untracked")
+    git_repo!(workspace)
+    File.write!(Path.join(workspace, "base.txt"), "base\n")
+    git!(workspace, ["add", "base.txt"])
+    git!(workspace, ["commit", "--quiet", "-m", "base"])
+    File.write!(Path.join(workspace, "scratch.md"), "untracked notes\n")
+
+    assert :ok =
+             Artifacts.archive_session(ctx.db, ctx.parent.session_key, workspace, archive_root)
+
+    assert File.read!(Path.join(archived_dir(archive_root), "scratch.md")) == "untracked notes\n"
+    refute File.exists?(workspace)
+  end
+
+  test "an ignored file is preserved — Git status cannot see it at all", ctx do
+    {workspace, archive_root} = workspace_fixture("ignored")
+    git_repo!(workspace)
+    File.write!(Path.join(workspace, ".gitignore"), "secrets/\n")
+    File.mkdir_p!(Path.join(workspace, "secrets"))
+    File.write!(Path.join(workspace, "secrets/key.env"), "TOKEN=keep-me\n")
+    git!(workspace, ["add", ".gitignore"])
+    git!(workspace, ["commit", "--quiet", "-m", "ignore secrets"])
+
+    # The whole reason Git status is not the guard: this file is invisible to it,
+    # and a status-clean workspace here still holds bytes nobody can regenerate.
+    assert git_status!(workspace) == ""
+
+    assert :ok =
+             Artifacts.archive_session(ctx.db, ctx.parent.session_key, workspace, archive_root)
+
+    assert File.read!(Path.join(archived_dir(archive_root), "secrets/key.env")) ==
+             "TOKEN=keep-me\n"
+
+    refute File.exists?(workspace)
+  end
+
+  test "a nested repository is preserved whole, including its own uncommitted work", ctx do
+    {workspace, archive_root} = workspace_fixture("nested")
+    git_repo!(workspace)
+    File.write!(Path.join(workspace, "outer.txt"), "outer\n")
+    git!(workspace, ["add", "outer.txt"])
+    git!(workspace, ["commit", "--quiet", "-m", "outer"])
+
+    nested = Path.join(workspace, "nested")
+    git_repo!(nested)
+    File.write!(Path.join(nested, "inner.txt"), "inner uncommitted\n")
+
+    # The outer repository reports the nested checkout as one opaque entry and
+    # never names the file inside it. A guard reading this output cannot know
+    # what it is about to destroy.
+    refute git_status!(workspace) =~ "inner.txt"
+
+    assert :ok =
+             Artifacts.archive_session(ctx.db, ctx.parent.session_key, workspace, archive_root)
+
+    archived = archived_dir(archive_root)
+    assert File.read!(Path.join(archived, "nested/inner.txt")) == "inner uncommitted\n"
+    assert File.exists?(Path.join(archived, "nested/.git/HEAD"))
+    refute File.exists?(workspace)
+  end
+
+  test "a workspace no repository ever knew about is preserved", ctx do
+    {workspace, archive_root} = workspace_fixture("non-git")
+    File.mkdir_p!(Path.join(workspace, "notes"))
+    File.write!(Path.join(workspace, "notes/plan.md"), "no repository here\n")
+
+    refute File.exists?(Path.join(workspace, ".git"))
+
+    assert :ok =
+             Artifacts.archive_session(ctx.db, ctx.parent.session_key, workspace, archive_root)
+
+    assert File.read!(Path.join(archived_dir(archive_root), "notes/plan.md")) ==
+             "no repository here\n"
+
+    refute File.exists?(workspace)
+  end
+
+  test "an archive that cannot be written refuses and leaves the workspace where it is", ctx do
+    {workspace, archive_root} = workspace_fixture("archive-failure")
+    File.mkdir_p!(workspace)
+    File.write!(Path.join(workspace, "work.txt"), "still here\n")
+
+    # The archive root is occupied by a file, so no archive directory can be
+    # created under it. Refusing is the only answer that keeps the bytes.
+    File.write!(archive_root, "not a directory")
+
+    assert_raise File.Error, fn ->
+      Artifacts.archive_session(ctx.db, ctx.parent.session_key, workspace, archive_root)
+    end
+
+    assert File.read!(Path.join(workspace, "work.txt")) == "still here\n"
+  end
+
+  test "an archive that does not match the workspace refuses before removing the source", ctx do
+    {workspace, archive_root} = workspace_fixture("verification-failure")
+    decoy = Path.join(System.tmp_dir!(), "decoy-#{System.unique_integer([:positive])}.md")
+    on_exit(fn -> File.rm_rf(decoy) end)
+
+    File.mkdir_p!(Path.join(workspace, "reports"))
+    File.write!(Path.join(workspace, "reports/result.md"), "first\n")
+
+    assert :ok =
+             Artifacts.archive_session(ctx.db, ctx.parent.session_key, workspace, archive_root)
+
+    archived = archived_dir(archive_root)
+
+    # The session works again, and something has since replaced the archived
+    # file with a link pointing out of the archive. The copy will "succeed" —
+    # straight through the link — and the archive will not hold the bytes.
+    File.mkdir_p!(Path.join(workspace, "reports"))
+    File.write!(Path.join(workspace, "reports/result.md"), "second, longer than the first\n")
+    File.write!(decoy, "")
+    File.rm!(Path.join(archived, "reports/result.md"))
+    File.ln_s!(decoy, Path.join(archived, "reports/result.md"))
+
+    error =
+      assert_raise RuntimeError, fn ->
+        Artifacts.archive_session(ctx.db, ctx.parent.session_key, workspace, archive_root)
+      end
+
+    assert error.message =~ "workspace archive is incomplete"
+    assert error.message =~ "reports/result.md"
+    assert error.message =~ "was NOT removed and is still at #{workspace}"
+
+    # The refusal is worth nothing if the source went anyway.
+    assert File.read!(Path.join(workspace, "reports/result.md")) ==
+             "second, longer than the first\n"
+  end
+
+  test "retrying lands on the same recovery location and loses nothing", ctx do
+    {workspace, archive_root} = workspace_fixture("retry")
+    File.mkdir_p!(workspace)
+    File.write!(Path.join(workspace, "first.txt"), "first\n")
+
+    assert :ok =
+             Artifacts.archive_session(ctx.db, ctx.parent.session_key, workspace, archive_root)
+
+    [archive_name] = File.ls!(archive_root)
+    refute File.exists?(workspace)
+
+    # Retiring the same session again finds nothing left to take and says so
+    # without disturbing what is already preserved.
+    assert :ok =
+             Artifacts.archive_session(ctx.db, ctx.parent.session_key, workspace, archive_root)
+
+    assert File.ls!(archive_root) == [archive_name]
+    assert File.read!(Path.join([archive_root, archive_name, "first.txt"])) == "first\n"
+
+    # A retry that DOES find a workspace merges into the same directory rather
+    # than scattering a second copy beside it: one session, one place to look.
+    File.mkdir_p!(workspace)
+    File.write!(Path.join(workspace, "second.txt"), "second\n")
+
+    assert :ok =
+             Artifacts.archive_session(ctx.db, ctx.parent.session_key, workspace, archive_root)
+
+    assert File.ls!(archive_root) == [archive_name]
+    assert File.read!(Path.join([archive_root, archive_name, "first.txt"])) == "first\n"
+    assert File.read!(Path.join([archive_root, archive_name, "second.txt"])) == "second\n"
+    refute File.exists?(workspace)
+  end
+
+  defp workspace_fixture(name) do
+    suffix = "#{name}-#{System.unique_integer([:positive])}"
+    workspace = Path.join(System.tmp_dir!(), "artifact-workspace-#{suffix}")
+    archive_root = Path.join(System.tmp_dir!(), "artifact-archive-#{suffix}")
+
+    on_exit(fn ->
+      File.rm_rf(workspace)
+      File.rm_rf(archive_root)
+    end)
+
+    {workspace, archive_root}
+  end
+
+  # One session archives to one directory, so there is exactly one here to find.
+  defp archived_dir(archive_root) do
+    [name] = File.ls!(archive_root)
+    Path.join(archive_root, name)
+  end
+
+  # A real repository, not a fabricated `.git` directory: these tests assert what
+  # Git itself reports about a workspace, and a stand-in would let them agree
+  # with a `git status` nobody ran.
+  defp git_repo!(path) do
+    File.mkdir_p!(path)
+    git!(path, ["init", "--quiet"])
+    git!(path, ["config", "user.email", "test@example.invalid"])
+    git!(path, ["config", "user.name", "Test"])
+    path
+  end
+
+  defp git!(path, args) do
+    {_output, 0} = System.cmd("git", ["-C", path | args], stderr_to_stdout: true)
+    :ok
+  end
+
+  defp git_status!(path) do
+    {output, 0} = System.cmd("git", ["-C", path, "status", "--porcelain"], stderr_to_stdout: true)
+    output
   end
 
   # No `recorded_message_id`: the caller cannot supply one, so the fixture cannot
