@@ -1,12 +1,13 @@
 # tightbeam_ex — agent notes
 
-## THIS LINE: 0.1.x — the maintenance line (split 2026-08-12 at cd72fe0)
+## THIS LINE: highest 0.1.* branch (currently 0.1.9) — the maintenance line
 
-Integrate 0.1.x work HERE, not main. main is now the 0.2 fabric program
-line — never target it from this line; fixes cross to it only by
-Mike-authorized cherry-pick election. Where older guidance, specs, or cards
-say "merge to main", read "merge to 0.1.x" on this line. If a card names
-a branch explicitly, the card wins.
+Integrate maintenance work into the highest `0.1.*` branch (currently `0.1.9`),
+not main. main is now the 0.2 fabric program line — never target it from this
+line; fixes cross to it only by Mike-authorized cherry-pick election. Where
+older guidance, specs, or cards name another default integration branch, read
+"highest `0.1.*` branch" on this line. If a card names a branch explicitly, the
+card wins.
 
 ## ACP / harness facts (for anyone touching the adapter layer)
 
