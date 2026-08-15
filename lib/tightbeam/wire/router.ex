@@ -644,6 +644,22 @@ defmodule Tightbeam.Wire.Router do
 
       given == ["role"] ->
         case Roles.resolve(db(conn), body["role"]) do
+          # `Roles.resolve/2` answers "who stands in for this role", falling back to
+          # the owner's personal session when the role is unbound or its binding is
+          # not active. That is a fair answer for a wake and a PHANTOM for an
+          # assignment: assign/dispatch BIND an obligation, and the owner's session
+          # is not the requested role's holder — commonly not even its provider — so
+          # the card lands on a session that cannot do the work while the requester
+          # believes it dispatched (wi_756153b7, specimens asg_6f380b79 and
+          # asg_388a5a54, the latter against a role whose bound session was retired).
+          # Refuse HERE, the one place the fallback is still distinguishable: past
+          # this seam only a boolean survives, and the handler sees an active session
+          # it has no reason to doubt. Every other consumer keeps the fallback.
+          {:ok, _session_key, true} when verb in ["assign", "dispatch"] ->
+            {:error, 400, "no_live_role_holder",
+             "role #{body["role"]} has no live bound session; spawn one and bind the role, " <>
+               "or target an active sessionKey"}
+
           {:ok, session_key, fallback} ->
             {:ok, session_key, %{role: body["role"], fallback: fallback}}
 
