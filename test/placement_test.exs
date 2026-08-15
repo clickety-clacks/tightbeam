@@ -768,6 +768,162 @@ defmodule Tightbeam.PlacementTest do
              baseline ++ [{"EXAMPLE_OVERLAY_VAR", "example-local"}]
   end
 
+  test "host toolchain rows construct local PATH in order and clearing them restores bytes", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    first = Path.join(base_dir, "toolchain-one")
+    second = Path.join(base_dir, "toolchain-two")
+    File.mkdir_p!(first)
+    File.mkdir_p!(second)
+
+    config = %{
+      base_dir: base_dir,
+      db: db,
+      cwd: "/work",
+      cli_bin: "/local/bin",
+      default_model: Model.new("fable")
+    }
+
+    assert {:ok, []} = DB.query(db, "SELECT host FROM host_toolchain_dirs")
+    refute Map.has_key?(Placement.hosts(base_dir, db)["testhost"], :toolchain_dirs)
+
+    baseline = Placement.adapter_opts(config, {:claude, "default", "testhost"})[:env]
+
+    assert {:ok, %{dirs: [^first, ^second]}} =
+             Placement.set_toolchain_dirs(
+               db,
+               "testhost",
+               [first, second],
+               "user:operator"
+             )
+
+    assert Placement.hosts(base_dir, db)["testhost"].toolchain_dirs == [first, second]
+
+    configured = Placement.adapter_opts(config, {:claude, "default", "testhost"})[:env]
+
+    assert {"PATH", "/local/bin:#{first}:#{second}:/usr/local/bin:/usr/bin:/bin"} in configured
+
+    refute {"PATH", "/local/bin:" <> (System.get_env("PATH") || "")} in configured
+
+    assert {:ok, %{dirs: []}} =
+             Placement.set_toolchain_dirs(db, "testhost", [], "user:operator")
+
+    refute Map.has_key?(Placement.hosts(base_dir, db)["testhost"], :toolchain_dirs)
+    assert Placement.adapter_opts(config, {:claude, "default", "testhost"})[:env] == baseline
+  end
+
+  test "host toolchain rows use the same constructed PATH for ssh adapters", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    Application.put_env(:tightbeam, :advertised_url, "http://gateway.example:4000")
+
+    assert {:ok, _} =
+             Placement.register_host(db, "worker", %{
+               ssh: "codex@worker",
+               base_dir: "/srv/tb",
+               cli_bin: "/srv/tb/bin"
+             })
+
+    assert {:ok, _} =
+             Placement.set_toolchain_dirs(
+               db,
+               "worker",
+               ["/tools/one", "/tools/two"],
+               "user:operator"
+             )
+
+    parent = self()
+
+    sh = fn command ->
+      send(parent, {:toolchain_sh, command})
+
+      if Enum.any?(command, &String.contains?(&1, "credential-harvest")) and
+           Enum.any?(command, &String.contains?(&1, "cat")),
+         do: {"", 42},
+         else: {"", 0}
+    end
+
+    config = %{
+      base_dir: base_dir,
+      db: db,
+      cwd: "/work",
+      cli_bin: "/local/bin",
+      default_model: Model.new("fable"),
+      sh: sh
+    }
+
+    command = Placement.adapter_opts(config, {:codex, "default", "worker"})[:cmd]
+
+    assert "PATH=/srv/tb/bin:/tools/one:/tools/two:/usr/local/bin:/usr/bin:/bin" in command
+    refute "PATH=/srv/tb/bin:$PATH" in command
+
+    assert_receive {:toolchain_sh,
+                    [
+                      "ssh",
+                      "-o",
+                      "BatchMode=yes",
+                      "-o",
+                      "ConnectTimeout=5",
+                      "codex@worker",
+                      "test",
+                      "-d",
+                      "/tools/one"
+                    ]}
+
+    assert_receive {:toolchain_sh,
+                    [
+                      "ssh",
+                      "-o",
+                      "BatchMode=yes",
+                      "-o",
+                      "ConnectTimeout=5",
+                      "codex@worker",
+                      "test",
+                      "-d",
+                      "/tools/two"
+                    ]}
+  end
+
+  test "a configured but unavailable toolchain directory refuses adapter start loudly", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    config = %{
+      base_dir: base_dir,
+      db: db,
+      cwd: "/work",
+      cli_bin: "/local/bin",
+      default_model: Model.new("fable")
+    }
+
+    missing = Path.join(base_dir, "missing-toolchain")
+
+    assert {:ok, _} =
+             Placement.set_toolchain_dirs(db, "testhost", [missing], "user:operator")
+
+    assert_raise RuntimeError,
+                 "host testhost toolchain directory is unavailable at adapter start: #{missing}",
+                 fn -> Placement.adapter_opts(config, {:claude, "default", "testhost"}) end
+
+    assert {:ok, _} =
+             Placement.register_host(db, "worker", %{
+               ssh: "codex@worker",
+               base_dir: "/srv/tb",
+               cli_bin: "/srv/tb/bin"
+             })
+
+    assert {:ok, _} =
+             Placement.set_toolchain_dirs(db, "worker", ["/missing-remote"], "user:operator")
+
+    remote = Map.put(config, :sh, fn _command -> {"", 1} end)
+
+    assert_raise RuntimeError,
+                 "host worker toolchain directory is unavailable at adapter start (exit 1): /missing-remote",
+                 fn -> Placement.adapter_opts(remote, {:codex, "default", "worker"}) end
+  end
+
   test "adapter_opts appends an ssh overlay to remote_env", %{base_dir: base_dir, db: db} do
     Application.put_env(:tightbeam, :advertised_url, "http://gateway.example:4000")
 

@@ -322,6 +322,11 @@ pub enum Command {
         harness: String,
         name: String,
     },
+    HostToolchainSet {
+        identity: Identity,
+        host: String,
+        dirs: Vec<String>,
+    },
     HarnessProcesses {
         identity: Identity,
     },
@@ -601,6 +606,9 @@ COMMANDS:
       List environment overlays, optionally filtered by exact host and harness.
   host-env-unset --host <host> --harness <harness> NAME
       Remove one exact environment overlay.
+  host-toolchain-set --host <host> --dirs '<json-array>'
+      Replace the host's ordered toolchain directories. An empty array restores
+      the inherited PATH. The result previews the PATH shape adapters will use.
   harness-process list
       List the durable harness launch ledger, newest launch first.
 
@@ -1591,6 +1599,7 @@ fn parse_with_optional_catalog(
         "host-env-set" => parse_host_env_set(&parsed, flags),
         "host-env-list" => parse_host_env_list(&parsed, flags),
         "host-env-unset" => parse_host_env_unset(&parsed, flags),
+        "host-toolchain-set" => parse_host_toolchain_set(&parsed, flags),
         "update-clients" => {
             if parsed.positional.len() != 1 {
                 return Err("usage: tightbeam update-clients --as-user <adminUserId>".to_owned());
@@ -1633,7 +1642,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, host-toolchain-set, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -1686,6 +1695,26 @@ fn parse_host_env_unset(
         host: nonempty(flags, "host").ok_or_else(|| usage.to_owned())?,
         harness: nonempty(flags, "harness").ok_or_else(|| usage.to_owned())?,
         name: name.clone(),
+    })
+}
+
+fn parse_host_toolchain_set(
+    parsed: &Flags,
+    flags: &HashMap<String, String>,
+) -> Result<Command, String> {
+    let usage = "usage: tightbeam host-toolchain-set --host <host> --dirs '<json-array>'";
+    if parsed.positional.len() != 1 {
+        return Err(usage.to_owned());
+    }
+
+    let encoded = nonempty(flags, "dirs").ok_or_else(|| usage.to_owned())?;
+    let dirs = serde_json::from_str::<Vec<String>>(&encoded)
+        .map_err(|_| "--dirs must be a JSON array of strings".to_owned())?;
+
+    Ok(Command::HostToolchainSet {
+        identity: identity(flags)?,
+        host: nonempty(flags, "host").ok_or_else(|| usage.to_owned())?,
+        dirs,
     })
 }
 
@@ -2034,6 +2063,66 @@ mod tests {
         }
     }
 
+    #[test]
+    fn host_toolchain_set_parses_an_ordered_json_array_and_allows_the_empty_exit() {
+        assert_eq!(
+            parse(strings(&[
+                "host-toolchain-set",
+                "--host",
+                "gibson",
+                "--dirs",
+                r#"["/tools/one","/tools/two"]"#,
+                "--as-user",
+                "flynn",
+            ])),
+            Ok(Command::HostToolchainSet {
+                identity: Identity::User("flynn".to_owned()),
+                host: "gibson".to_owned(),
+                dirs: vec!["/tools/one".to_owned(), "/tools/two".to_owned()],
+            })
+        );
+
+        assert_eq!(
+            parse(strings(&[
+                "host-toolchain-set",
+                "--host",
+                "gibson",
+                "--dirs",
+                "[]",
+            ])),
+            Ok(Command::HostToolchainSet {
+                identity: Identity::Session,
+                host: "gibson".to_owned(),
+                dirs: vec![],
+            })
+        );
+    }
+
+    #[test]
+    fn host_toolchain_set_refuses_missing_or_non_string_directory_lists() {
+        let usage =
+            "usage: tightbeam host-toolchain-set --host <host> --dirs '<json-array>'".to_owned();
+
+        assert_eq!(
+            parse(strings(&["host-toolchain-set", "--host", "gibson"])),
+            Err(usage.clone())
+        );
+        assert_eq!(
+            parse(strings(&["host-toolchain-set", "--dirs", r#"["/tools"]"#,])),
+            Err(usage)
+        );
+        assert_eq!(
+            parse(strings(&[
+                "host-toolchain-set",
+                "--host",
+                "gibson",
+                "--dirs",
+                r#"[1]"#,
+            ])),
+            Err("--dirs must be a JSON array of strings".to_owned())
+        );
+    }
+
     /// `--help` was consumed before the command was ever looked at, so every
     /// subcommand answered with the whole manual — the operator asking about one
     /// command got 150 lines and had to find the answer themselves.
@@ -2351,6 +2440,7 @@ mod tests {
                 "host-env-list",
                 "host-env-set",
                 "host-env-unset",
+                "host-toolchain-set",
                 "identity",
                 "kungfu",
                 "learn",
@@ -2393,6 +2483,7 @@ mod tests {
             "host-env-set --host <host> --harness <harness> NAME=VALUE",
             "host-env-list [--host <host>] [--harness <harness>]",
             "host-env-unset --host <host> --harness <harness> NAME",
+            "host-toolchain-set --host <host> --dirs '<json-array>'",
             "harness-process list",
             "kungfu list",
         ] {
@@ -2913,7 +3004,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, host-toolchain-set, doctor, assimilate, harness-process".to_owned())
         );
     }
 

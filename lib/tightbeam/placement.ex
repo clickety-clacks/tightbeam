@@ -6,7 +6,8 @@ defmodule Tightbeam.Placement do
 
   Hosts are DB ROWS behind the org's DB owner — the serialization seam — written
   by `assimilate` through `register_host/3` and read back as name =>
-  %{ssh: destination-or-nil, base_dir: path, cli_bin: path-or-nil}
+  %{ssh: destination-or-nil, base_dir: path, cli_bin: path-or-nil,
+  toolchain_dirs: ordered-paths-when-configured}
   (host-registry-v1). `gateway.json` stays a FILE — the CLI reads it
   before any DB exists. The gateway's own machine is under its
   REAL hostname (`local_host_name/0`; ssh: nil) — never under an indexical
@@ -91,7 +92,8 @@ defmodule Tightbeam.Placement do
   @type host_config :: %{
           required(:ssh) => String.t() | nil,
           required(:base_dir) => String.t(),
-          optional(:cli_bin) => String.t() | nil
+          optional(:cli_bin) => String.t() | nil,
+          optional(:toolchain_dirs) => [String.t()]
         }
 
   @typedoc "Adapter key. The reserved identity `shared` is the one runtime per harness+host."
@@ -119,13 +121,27 @@ defmodule Tightbeam.Placement do
   )
   """
 
+  @host_toolchain_dirs_ddl """
+  CREATE TABLE IF NOT EXISTS host_toolchain_dirs (
+    host     TEXT NOT NULL,
+    position INTEGER NOT NULL CHECK (position >= 0),
+    dir      TEXT NOT NULL,
+    setBy    TEXT NOT NULL,
+    setAt    INTEGER NOT NULL,
+    PRIMARY KEY (host, position)
+  )
+  """
+
+  @posix_path ["/usr/local/bin", "/usr/bin", "/bin"]
+
   @env_name ~r/^[A-Z_][A-Z0-9_]*$/
 
   @doc "Create the placement schema."
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
   def ensure_schema(db \\ DB) do
     with :ok <- DB.execute(db, @hosts_ddl),
-         do: DB.execute(db, @harness_env_overlays_ddl)
+         :ok <- DB.execute(db, @harness_env_overlays_ddl),
+         do: DB.execute(db, @host_toolchain_dirs_ddl)
   end
 
   @doc """
@@ -145,9 +161,20 @@ defmodule Tightbeam.Placement do
   """
   @spec hosts(String.t(), DB.server()) :: %{optional(String.t()) => host_config()}
   def hosts(base_dir, db \\ DB) do
-    db
-    |> registered_hosts()
-    |> Map.put(local_host_name(), %{ssh: nil, base_dir: base_dir, cli_bin: nil})
+    configured =
+      db
+      |> registered_hosts()
+      |> Map.put(local_host_name(), %{ssh: nil, base_dir: base_dir, cli_bin: nil})
+
+    Enum.reduce(registered_toolchain_dirs(db), configured, fn {host, dirs}, acc ->
+      case Map.fetch(acc, host) do
+        {:ok, host_config} ->
+          Map.put(acc, host, Map.put(host_config, :toolchain_dirs, dirs))
+
+        :error ->
+          raise "host toolchain registry contains rows for unknown host: #{host}"
+      end
+    end)
   end
 
   # Placement's own callers hand it the gateway config, which carries both the
@@ -267,6 +294,40 @@ defmodule Tightbeam.Placement do
       end)
 
     %{host: host, harness: harness, name: name, removed: removed}
+  end
+
+  @doc "Replace one host's ordered toolchain directories in the host registry."
+  @spec set_toolchain_dirs(DB.server(), String.t(), [String.t()], String.t()) ::
+          {:ok, map()} | {:error, map()}
+  def set_toolchain_dirs(db, host, dirs, set_by) when is_list(dirs) do
+    set_at = System.system_time(:millisecond)
+
+    case DB.transaction(db, fn txn ->
+           if known_host_in_txn?(txn, host) do
+             DB.Txn.q(txn, "DELETE FROM host_toolchain_dirs WHERE host = ?1", [host])
+
+             dirs
+             |> Enum.with_index()
+             |> Enum.each(fn {dir, position} ->
+               DB.Txn.q(
+                 txn,
+                 """
+                 INSERT INTO host_toolchain_dirs (host, position, dir, setBy, setAt)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 """,
+                 [host, position, dir, set_by, set_at]
+               )
+             end)
+
+             {:ok, %{host: host, dirs: dirs, set_by: set_by, set_at: set_at}}
+           else
+             denial = unknown_host_denial(host)
+             {:error, %{denial | message: "unknown_host rule: " <> denial.message}}
+           end
+         end) do
+      {:ok, result} -> result
+      {:error, error} -> raise error
+    end
   end
 
   @doc """
@@ -794,6 +855,16 @@ defmodule Tightbeam.Placement do
     end)
   end
 
+  defp registered_toolchain_dirs(db) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT host, dir FROM host_toolchain_dirs ORDER BY host, position"
+      )
+
+    Enum.group_by(rows, fn [host, _dir] -> host end, fn [_host, dir] -> dir end)
+  end
+
   @doc "Ensure a session workdir and its converged credential file."
   @spec ensure_workdir(host_config(), String.t(), String.t(), keyword()) :: :ok
   def ensure_workdir(%{ssh: nil}, path, content, _opts) do
@@ -1074,6 +1145,7 @@ defmodule Tightbeam.Placement do
 
     host_config = Map.fetch!(hosts_for(config), host)
     sh = Map.get(config, :sh, &system_cmd/1)
+    ensure_toolchain_dirs!(host, host_config, sh)
 
     target = %{
       base_dir: config.base_dir,
@@ -1099,11 +1171,13 @@ defmodule Tightbeam.Placement do
       |> env_overlays(host, module.wire_name())
       |> Enum.map(&{&1.name, &1.value})
 
+    path = adapter_path(config, host_config)
+
     common_env =
       [
         {"TIGHTBEAM_HOME", config.base_dir},
         {"TIGHTBEAM_MACHINE", host},
-        {"PATH", config.cli_bin <> ":" <> (System.get_env("PATH") || "")},
+        {"PATH", path},
         {"TIGHTBEAM_LINEAGE", lineage}
       ] ++ overlay_env
 
@@ -1113,7 +1187,7 @@ defmodule Tightbeam.Placement do
           "TIGHTBEAM_HOME=#{host_config.base_dir}",
           "TIGHTBEAM_MACHINE=#{host}",
           "TIGHTBEAM_URL=#{Application.fetch_env!(:tightbeam, :advertised_url)}",
-          "PATH=#{host_config[:cli_bin] || ""}:$PATH",
+          "PATH=#{path}",
           "TIGHTBEAM_LINEAGE=#{lineage}"
         ] ++
           Enum.map(overlay_env, fn {name, value} ->
@@ -1149,6 +1223,55 @@ defmodule Tightbeam.Placement do
       env: []
     ]
     |> Keyword.merge(plan)
+  end
+
+  @doc "Preview the exact PATH an adapter on a configured host will receive."
+  @spec toolchain_path_preview(map(), String.t()) :: String.t()
+  def toolchain_path_preview(config, host) do
+    config
+    |> hosts_for()
+    |> Map.fetch!(host)
+    |> then(&adapter_path(config, &1))
+  end
+
+  defp adapter_path(config, %{ssh: ssh} = host_config) do
+    case Map.fetch(host_config, :toolchain_dirs) do
+      {:ok, dirs} ->
+        cli_bin = if ssh, do: host_config[:cli_bin], else: config.cli_bin
+
+        [cli_bin | dirs ++ @posix_path]
+        |> Enum.reject(&(&1 in [nil, ""]))
+        |> Enum.join(":")
+
+      :error when is_nil(ssh) ->
+        config.cli_bin <> ":" <> (System.get_env("PATH") || "")
+
+      :error ->
+        "#{host_config[:cli_bin] || ""}:$PATH"
+    end
+  end
+
+  defp ensure_toolchain_dirs!(_host, host_config, _sh)
+       when not is_map_key(host_config, :toolchain_dirs), do: :ok
+
+  defp ensure_toolchain_dirs!(host, %{ssh: nil, toolchain_dirs: dirs}, _sh) do
+    Enum.each(dirs, fn dir ->
+      unless File.dir?(dir) do
+        raise "host #{host} toolchain directory is unavailable at adapter start: #{dir}"
+      end
+    end)
+  end
+
+  defp ensure_toolchain_dirs!(host, %{ssh: destination, toolchain_dirs: dirs}, sh) do
+    Enum.each(dirs, fn dir ->
+      case sh.(["ssh" | @ssh_opts] ++ [destination, "test", "-d", dir]) do
+        {_output, 0} ->
+          :ok
+
+        {_output, exit} ->
+          raise "host #{host} toolchain directory is unavailable at adapter start (exit #{exit}): #{dir}"
+      end
+    end)
   end
 
   @doc """

@@ -855,6 +855,22 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 string_field("name", name),
             ],
         )),
+        Command::HostToolchainSet {
+            identity,
+            host,
+            dirs,
+        } => Ok(request(
+            identity,
+            "host-toolchain-set",
+            vec![],
+            vec![
+                string_field("host", host),
+                format!(
+                    "\"dirs\":{}",
+                    serde_json::to_string(dirs).expect("toolchain directories serialize")
+                ),
+            ],
+        )),
         Command::HarnessProcesses { identity } => {
             Ok(request(identity, "harness-processes", vec![], vec![]))
         }
@@ -1460,6 +1476,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::HostEnvSet { identity, .. }
         | Command::HostEnvList { identity, .. }
         | Command::HostEnvUnset { identity, .. }
+        | Command::HostToolchainSet { identity, .. }
         | Command::HarnessProcesses { identity } => Some(identity),
         Command::Help
         | Command::CommandHelp(_)
@@ -2181,6 +2198,22 @@ mod tests {
                 "flynn",
             ]),
             r#"{"asUser":"flynn","verb":"host-env-unset","params":{"host":"gibson","harness":"claude","name":"EXAMPLE_OVERLAY_VAR"}}"#
+        );
+    }
+
+    #[test]
+    fn builds_byte_exact_host_toolchain_body() {
+        assert_eq!(
+            body(&[
+                "host-toolchain-set",
+                "--host",
+                "gibson",
+                "--dirs",
+                r#"["/tools/one","/tools/two"]"#,
+                "--as-user",
+                "flynn",
+            ]),
+            r#"{"asUser":"flynn","verb":"host-toolchain-set","params":{"host":"gibson","dirs":["/tools/one","/tools/two"]}}"#
         );
     }
 

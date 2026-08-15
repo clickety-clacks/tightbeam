@@ -797,6 +797,31 @@ defmodule Tightbeam.Gateway do
           p = call.params
           Placement.unset_env_overlay(db, p.host, p.harness, p.name)
         end),
+      "host-toolchain-set" =>
+        admin_call_handler(db, fn call ->
+          p = call.params
+
+          case Placement.set_toolchain_dirs(db, p.host, p.dirs, call.origin) do
+            {:ok, row} when p.dirs == [] ->
+              Map.put(
+                row,
+                :effect,
+                "this host's adapter PATH now keeps the inherited value unchanged"
+              )
+
+            {:ok, row} ->
+              preview = Placement.toolchain_path_preview(config, p.host)
+
+              Map.put(
+                row,
+                :effect,
+                "this host's adapter PATH is now fully constructed: #{preview}"
+              )
+
+            {:error, denial} ->
+              denial
+          end
+        end),
       "register-host" =>
         admin_handler(db, fn p ->
           # The dumb half of assimilation (spec §Placement): the CLI ceremony
