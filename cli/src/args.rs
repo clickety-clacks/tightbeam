@@ -504,7 +504,7 @@ COMMANDS:
       context-window variant when it offers more than one. All must come from
       list's model catalog — never invent one.
 
-  tune --session <key> (--harness {{HARNESSES_PIPE}} [--model <model>] |
+  tune --session <key> (--harness {{HARNESSES_PIPE}} --model <model> |
        --model <model> | --effort <level>)
        [--effort <level>] [--context <variant>]
       Change ONE runtime control on a session that is already running. Model
@@ -519,9 +519,10 @@ COMMANDS:
       [engine swap] marker (earlier rows are retained, not deleted) while the
       Tightbeam session, its role, its work, and its graph position stay put.
       Naming the resident harness again is refused — omit --harness for a
-      same-harness model change. Omitting --model with --harness lets the
-      destination catalog compose its own default; the source model and its
-      effort tier are never carried across the boundary.
+      same-harness model change. --harness REQUIRES --model: crossing an
+      engine boundary is a model election, and Tightbeam never elects on
+      your behalf (omitting it is refused as model_required). The source
+      model and its effort tier are never carried across the boundary.
       A switch is YOUR election and lands only at a turn boundary: while the
       session has a running or queued turn the call is refused with
       turn_in_progress and nothing changes. Retry once the turn finishes —

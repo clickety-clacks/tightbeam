@@ -2132,6 +2132,205 @@ defmodule Tightbeam.GatewayTest do
              Path.join(auth_dir, "fixture.json")
   end
 
+  # THE STALE-ELECTION SEAM (Sol round 2, blocking 1-3). Each test pauses a
+  # tune at `on_tune_elected` — election done, commit not begun — commits a
+  # competing write, releases, and asserts the transaction refuses BY NAME
+  # rather than committing a decision that no longer describes the session.
+
+  defp stale_election_arena!(ctx, name) do
+    base_dir = role_test_base(name)
+    auth_dir = Path.join([base_dir, "auth", "fixture"])
+    adapter = Path.join([base_dir, "adapters", "node_modules", ".bin", "fixture-acp"])
+    File.mkdir_p!(auth_dir)
+    File.write!(Path.join(auth_dir, "fixture.json"), "fixture-token")
+    File.mkdir_p!(Path.dirname(adapter))
+    File.write!(adapter, "#!/bin/sh\n")
+    File.chmod!(adapter, 0o755)
+    Archetypes.load!(base_dir)
+
+    start_supervised!(%{
+      id: :"stale_election_conn_#{name}",
+      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+    })
+
+    Gateway.handlers(gateway_config(base_dir, ctx.db, 0))
+  end
+
+  test "a set_host landing after the election refuses the harness switch as stale_election",
+       ctx do
+    handlers = stale_election_arena!(ctx, "stale-host-switch")
+
+    Org.create(ctx.db, %{
+      session_key: "stale-host",
+      display_name: "Stale host",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("before-model")
+    })
+
+    start_lane!(ctx.db, "stale-host")
+
+    result =
+      handlers["tune"].(%{
+        origin: "user:flynn",
+        session_key: "stale-host",
+        on_tune_elected: fn ->
+          # The election validated credential, catalog and readiness against
+          # `testhost`. This lands a host move before the commit opens.
+          {:ok, _} =
+            DB.transaction(ctx.db, fn txn ->
+              DB.Txn.q(txn, "UPDATE sessions SET host='otherhost' WHERE sessionKey=?1", [
+                "stale-host"
+              ])
+            end)
+        end,
+        params: %{setting: "set_harness", harness: "fixture", model: "fixture-model"}
+      })
+
+    assert %{ok: false, code: "stale_election"} = result
+
+    # Nothing committed: still the original harness and model, no barrier
+    # move, no tombstone.
+    fresh = Org.get(ctx.db, "stale-host")
+    assert fresh.harness == "claude"
+    assert fresh.model.family == "before-model"
+    assert fresh.cleared_through_seq in [nil, 0]
+  end
+
+  test "a harness switch landing after a retune's election refuses the retune as stale_election",
+       ctx do
+    handlers = stale_election_arena!(ctx, "stale-retune")
+
+    Org.create(ctx.db, %{
+      session_key: "stale-retune",
+      display_name: "Stale retune",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "fixture",
+      provider: "fixture_provider",
+      model: Model.new("fixture-model")
+    })
+
+    start_lane!(ctx.db, "stale-retune")
+
+    result =
+      handlers["tune"].(%{
+        origin: "user:flynn",
+        session_key: "stale-retune",
+        on_tune_elected: fn ->
+          # The retune was validated against the fixture catalog. This commits
+          # an engine change underneath it; committing the retune's model and
+          # provider now would marry a fixture model to a claude session. The
+          # stale-election precondition deliberately precedes the duplicate
+          # check, so re-electing the same model still proves it.
+          {:ok, _} =
+            DB.transaction(ctx.db, fn txn ->
+              DB.Txn.q(
+                txn,
+                "UPDATE sessions SET harness='claude', provider='anthropic' WHERE sessionKey=?1",
+                ["stale-retune"]
+              )
+            end)
+        end,
+        params: %{setting: "set_model", model: "fixture-model"}
+      })
+
+    assert %{ok: false, code: "stale_election"} = result
+
+    # The record still shows what the concurrent switch left: claude, with the
+    # original model untouched and NO retune marker minted for a change that
+    # did not happen.
+    fresh = Org.get(ctx.db, "stale-retune")
+    assert fresh.harness == "claude"
+    assert fresh.model.family == "fixture-model"
+
+    markers =
+      Projection.list_after(ctx.db, "stale-retune", nil, 50, 0)
+      |> Enum.filter(&String.contains?(&1.content || "", "[model retune]"))
+
+    assert markers == []
+  end
+
+  test "the loser of two racing swap elections is refused IN the transaction",
+       ctx do
+    handlers = stale_election_arena!(ctx, "swap-loser")
+
+    Org.create(ctx.db, %{
+      session_key: "swap-loser",
+      display_name: "Swap loser",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("before-model")
+    })
+
+    start_lane!(ctx.db, "swap-loser")
+    parent = self()
+
+    # The LOSER elects first and pauses with its election in hand — its
+    # preflight read `claude`, so the outer same-harness check has already
+    # passed. Only the in-transaction fresh read can refuse it now: this is
+    # the interleaving the old racing-identical-swaps test could not build
+    # (Sol round 2, important 4). The home pin moving BEHIND the commit
+    # (blocking 2) is what makes the loser's refusal side-effect-free.
+    loser =
+      Task.async(fn ->
+        handlers["tune"].(%{
+          origin: "user:flynn",
+          session_key: "swap-loser",
+          on_tune_elected: fn ->
+            send(parent, {:elected, self()})
+
+            receive do
+              :proceed -> :ok
+            end
+          end,
+          params: %{setting: "set_harness", harness: "fixture", model: "fixture-model"}
+        })
+      end)
+
+    assert_receive {:elected, loser_pid}, 2_000
+
+    # The WINNER runs to completion while the loser holds its stale election.
+    assert %{ok: true} =
+             handlers["tune"].(%{
+               origin: "user:flynn",
+               session_key: "swap-loser",
+               params: %{setting: "set_harness", harness: "fixture", model: "fixture-model"}
+             })
+
+    send(loser_pid, :proceed)
+    loser_result = Task.await(loser, 5_000)
+
+    # Refused by the in-transaction re-check — same_harness, by the same name
+    # a sequential request gets — and the WINNER's outcome stands untouched:
+    # its model, one barrier move, one tombstone.
+    assert %{ok: false, code: code} = loser_result
+    assert code in ["distinct_harness", "same_harness"]
+
+    fresh = Org.get(ctx.db, "swap-loser")
+    assert fresh.harness == "fixture"
+    assert fresh.model.family == "fixture-model"
+
+    # Exactly one tombstone, visible above the barrier the winner moved — the
+    # same property the sequential swap test pins, held under the race.
+    barrier = fresh.cleared_through_seq
+
+    visible = Projection.list_after(ctx.db, "swap-loser", nil, 50, barrier)
+
+    tombstones = Enum.filter(visible, &String.contains?(&1.content || "", "[engine swap]"))
+    assert length(tombstones) == 1
+  end
+
   test "a harness swap leaves a tombstone ABOVE its own barrier", ctx do
     base_dir = role_test_base("swap-tombstone")
     auth_dir = Path.join([base_dir, "auth", "fixture"])

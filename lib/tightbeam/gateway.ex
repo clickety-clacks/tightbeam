@@ -4259,6 +4259,7 @@ defmodule Tightbeam.Gateway do
          {:ok, module} <- known_harness(harness),
          :ok <- distinct_harness(session, harness),
          :ok <- validate_model_election(p),
+         :ok <- refuse_packed_model(p),
          {:ok, model} <-
            compose_tune_model_selection(
              session.host,
@@ -4270,6 +4271,20 @@ defmodule Tightbeam.Gateway do
            validate_catalog_model(session.host, harness, model, from_default?(p)),
          :ok <-
            Spinup.ensure_ready(config, module.id(), session.host, spinup_opts(config, db)) do
+      # Probe seam (same idiom as `on_swap_interlock`, one window earlier):
+      # lets a test PAUSE this request with its ELECTION fully decided —
+      # preflight, catalog, credential, readiness — before the boundary below
+      # is taken, and commit a competing write in the pause. That is the exact
+      # window the stale-election preconditions exist for; without the seam
+      # the interleaving cannot be built deterministically from outside (Sol
+      # round 2, important 4). BEFORE the boundary, necessarily: inside it the
+      # pause would hold the per-session lock the competing request needs.
+      # Absent in production.
+      case Map.get(call, :on_tune_elected) do
+        fun when is_function(fun, 0) -> fun.()
+        _ -> :ok
+      end
+
       case at_tune_boundary(config, db, session.session_key, fn ->
              run_session_mutation(session.session_key, fn ->
                apply_harness_change(
@@ -4459,6 +4474,22 @@ defmodule Tightbeam.Gateway do
     }
   end
 
+  # The session changed under the election — its harness or host moved between
+  # this request's validation and its commit (a concurrent tune or set_host won
+  # the race). Nothing was applied and nothing was re-derived on the caller's
+  # behalf: re-run the command so the election happens against the session as
+  # it now is (Sol round 2, blocking 1/3).
+  defp stale_election_error do
+    %{
+      ok: false,
+      code: "stale_election",
+      message:
+        "the session's harness or host changed while this change was being " <>
+          "prepared, so it was not applied. Re-run the command to elect " <>
+          "against the session as it now is."
+    }
+  end
+
   # SPAWN's composition: a selection that names a model but no effort takes
   # the session's current (or configured-default) effort, falling back to
   # "medium" or the first available tier when the current one doesn't apply
@@ -4519,6 +4550,26 @@ defmodule Tightbeam.Gateway do
   # substituted. `--context` qualifies a model, so a context with no model to
   # qualify gets the more specific refusal — it names the actual mistake
   # (a stray `--context`) rather than the generic "you must name a model".
+  # FIELDS ARE NEVER PACKED ACROSS THE ENGINE BOUNDARY, and the server owns
+  # that contract — not the CLI (Sol round 2, important 5). Raw-dispatch and
+  # device callers reach the gateway directly, and a packed ref like
+  # "model[effort]" or the vendor "[1m]" would smuggle an effort or context
+  # election past the typed fields on a cross-harness switch. Scoped to
+  # `set_harness` DELIBERATELY: same-harness `set_model` accepts the row's own
+  # PUBLISHED identity echoed back (the issued-row contract pinned by test
+  # "an issued row identity echoed back resolves to that row's fields") —
+  # resolving your own issued name against the resident harness elects
+  # nothing, while carrying one across a boundary would.
+  defp refuse_packed_model(%{model: model}) when is_binary(model) do
+    if String.contains?(model, "[") or String.contains?(model, "]") do
+      {:error, invalid_model_field_error()}
+    else
+      :ok
+    end
+  end
+
+  defp refuse_packed_model(_p), do: :ok
+
   defp validate_model_election(p) do
     case Map.fetch(p, :model) do
       {:ok, model} when is_binary(model) and model != "" ->
@@ -4631,22 +4682,6 @@ defmodule Tightbeam.Gateway do
        ) do
     deliver_opts = if config[:sh], do: [sh: config.sh], else: []
 
-    # Pin the shared home to the model this session will run on the new
-    # harness, not the org default, so the next turn's session/new offers
-    # and accepts it (wi_263814d3). Best-effort AHEAD of the transaction
-    # below: if that transaction goes on to refuse the swap (a duplicate
-    # concurrent request that lost the race, or a turn that landed first),
-    # this pin was wasted work, never a wrong RESULT — nothing DB-visible
-    # changed, and the swap that does land re-pins to what it actually
-    # needs.
-    with_home_pin_lock(harness_atom, session.host, fn ->
-      Placement.deliver_home(
-        config,
-        {harness_atom, "shared", session.host},
-        Keyword.put(deliver_opts, :model, model)
-      )
-    end)
-
     # THE SERIALIZATION DOMAIN (Sol xhigh review, live-switch findings 1/4/5).
     # The fresh same-harness check, the pending-turn count, the engine swap,
     # the history barrier, and its tombstone are ONE transaction — not five
@@ -4684,6 +4719,20 @@ defmodule Tightbeam.Gateway do
 
           fresh.harness == harness ->
             {:refused, :same_harness}
+
+          # THE ELECTION'S SNAPSHOT MUST STILL HOLD (Sol round 2, blocking 3).
+          # Everything decided before this transaction — credential preflight,
+          # catalog resolution, Spinup.ensure_ready, the home pin — was decided
+          # against `session.host`. The transaction serializes WRITES, but it
+          # cannot retroactively serialize that election: a concurrent
+          # `set_host` landing between preflight and here would otherwise
+          # commit a harness/model/provider validated and activated on host A
+          # into a session now living on host B. A stale election is refused
+          # BY NAME, never silently committed and never silently re-derived —
+          # the caller re-runs `tune` and the election happens against the
+          # session as it now is.
+          fresh.host != session.host ->
+            {:refused, :stale_election}
 
           Ledger.pending_count_in_txn(txn, call.session_key) > 0 ->
             {:refused, :turn_in_progress}
@@ -4769,7 +4818,30 @@ defmodule Tightbeam.Gateway do
       {:ok, {:refused, :not_found}} ->
         tune_not_found()
 
+      {:ok, {:refused, :stale_election}} ->
+        stale_election_error()
+
       {:ok, :swapped} ->
+        # Pin the shared home to the model this session now runs on the new
+        # harness, not the org default, so the next turn's session/new offers
+        # and accepts it (wi_263814d3). AFTER the commit, deliberately (Sol
+        # round 2, blocking 2): the pin used to run ahead of the transaction
+        # on the theory that a refused swap made it "wasted work, never a
+        # wrong result" — false for two RACING swaps electing DIFFERENT
+        # models. The loser re-pinned the shared home to its model and was
+        # then refused, leaving the resident engine and the home disagreeing.
+        # Pinning only on the committed branch means the home always reflects
+        # a swap that actually happened; the pending-turn refusal inside the
+        # transaction guarantees no turn can consume the home between this
+        # commit and this pin.
+        with_home_pin_lock(harness_atom, session.host, fn ->
+          Placement.deliver_home(
+            config,
+            {harness_atom, "shared", session.host},
+            Keyword.put(deliver_opts, :model, model)
+          )
+        end)
+
         broadcast(
           db,
           session.owner_user_id,
@@ -4804,18 +4876,28 @@ defmodule Tightbeam.Gateway do
   # wedge a reload that waits on the lane while the lane's bounce waits on the mutation
   # lock (see repoint_main_session, the same shape). `ensure_lane_quiet` first so
   # :no_lane can only mean the lane died in the gap, which we treat as busy: retry.
-  defp apply_model_change(config, db, _call, session, new_ref) do
+  defp apply_model_change(config, db, call, session, new_ref) do
     with {:ok, routed} <- validate_catalog_model(session.host, session.harness, new_ref, false) do
+      # Probe seam, same contract and same placement rule as the harness
+      # path's `on_tune_elected`: election decided, boundary not yet taken.
+      case Map.get(call, :on_tune_elected) do
+        fun when is_function(fun, 0) -> fun.()
+        _ -> :ok
+      end
+
       boundary =
         at_tune_boundary(config, db, session.session_key, fn ->
           run_session_mutation(session.session_key, fn ->
-            apply_tuned_model(config, db, session, new_ref, routed.provider)
+            apply_tuned_model(config, db, call, session, new_ref, routed.provider)
           end)
         end)
 
       case boundary do
         {:ok, :ok} ->
           %{ok: true}
+
+        {:ok, {:error, :stale_election}} ->
+          stale_election_error()
 
         # A real fault from the switch (adapter down, context move could not complete) -- NOT
         # the old frozen-offered-set refusal, which no longer exists. `apply_failure`
@@ -4844,20 +4926,63 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp apply_tuned_model(config, db, session, new_ref, provider) do
+  defp apply_tuned_model(config, db, _call, session, new_ref, provider) do
     case Org.current_pointer(db, session.session_key) do
       # No pointer: nothing is resident, so there is no runtime to move — only
       # the record to correct. It still earns its marker, on the same rule as
       # the resident path: the session's model changed, and the transcript is
-      # where an agent reads that it did.
+      # where an agent reads that it did. ONE transaction for both, same as
+      # the resident branch (Sol round 2, important 6): a set_model that
+      # commits without its marker is the silent substitution the marker
+      # exists to prevent, and a crash between two separate writes produced
+      # exactly that. The same transaction also holds the stale-election
+      # precondition — this election was validated against `session.harness`.
       nil ->
-        Org.set_model(db, session.session_key, new_ref, provider)
+        result =
+          DB.transaction(db, fn txn ->
+            {record_model, record_harness} = read_recorded_model(txn, session.session_key)
 
-        if session.model != new_ref do
-          append_marker(db, session.session_key, retune_marker(session.model, new_ref))
+            cond do
+              record_harness != session.harness ->
+                :stale_election
+
+              record_model == new_ref ->
+                :duplicate
+
+              true ->
+                {:ok, _} =
+                  Org.swap_model_in_txn(
+                    txn,
+                    session.session_key,
+                    {record_model, record_harness},
+                    {new_ref, record_harness, provider}
+                  )
+
+                {:appended, marker} =
+                  Projection.append_marker_in_txn(
+                    txn,
+                    session.session_key,
+                    retune_marker(record_model, new_ref)
+                  )
+
+                {:changed, marker}
+            end
+          end)
+
+        case result do
+          {:ok, :stale_election} ->
+            {:error, :stale_election}
+
+          {:ok, {:changed, marker}} ->
+            publish_stored_message(db, session.session_key, marker)
+            :ok
+
+          {:ok, :duplicate} ->
+            :ok
+
+          {:error, error} ->
+            raise error
         end
-
-        :ok
 
       pointer ->
         coordinator = Process.whereis(Tightbeam.AdapterCoordinator)
@@ -4980,40 +5105,23 @@ defmodule Tightbeam.Gateway do
       DB.transaction(db, fn txn ->
         {record_model, record_harness} = read_recorded_model(txn, session.session_key)
 
+        # THE ELECTION'S SNAPSHOT MUST STILL HOLD (Sol round 2, blocking 1).
+        # This model was validated against `session.harness`'s catalog and
+        # provider BEFORE the turn boundary was taken. A harness switch that
+        # committed in between leaves this row on a different engine — and the
+        # old code would have committed a claude model and provider onto a
+        # codex session, both calls reporting success. The fresh in-txn read
+        # is a PRECONDITION here, never a substitute target: a stale election
+        # is refused by name, and the caller re-elects against the session as
+        # it now is.
         outcome =
-          case Org.swap_model_in_txn(
-                 txn,
-                 session.session_key,
-                 {record_model, record_harness},
-                 {new_ref, record_harness, provider}
-               ) do
-            # A model change is a recorded fact ABOUT this session, so it earns
-            # a transcript row: an agent reading its own history must be able
-            # to see that the mind answering changed, and where. The marker
-            # rides the SAME transaction as the swap it describes — a swap
-            # committed without its marker is the silent substitution the
-            # marker exists to prevent, just rarer.
-            {:ok, _} ->
-              {:appended, marker} =
-                Projection.append_marker_in_txn(
-                  txn,
-                  session.session_key,
-                  retune_marker(record_model, new_ref)
-                )
-
-              {:changed, marker}
-
-            # The recorded row ALREADY names this model. The caller's election
-            # is satisfied, so this is not a failure — and it must not mint a
-            # "changed from X to X" row for a change that did not happen.
-            {:duplicate, _} ->
-              :duplicate
-
-            :stale ->
-              raise("model mutation race inside serialized tune")
+          if record_harness != session.harness do
+            :stale_election
+          else
+            project_tuned_swap(txn, session, record_model, record_harness, new_ref, provider)
           end
 
-        if switched_sid != prior_sid do
+        if outcome != :stale_election and switched_sid != prior_sid do
           Org.append_pointer_in_txn(txn, session.session_key, switched_sid, "loaded")
         end
 
@@ -5021,6 +5129,13 @@ defmodule Tightbeam.Gateway do
       end)
 
     case result do
+      {:ok, :stale_election} ->
+        # The fork the adapter prepared was for an election that no longer
+        # describes this session; hand it back rather than leaving it
+        # resident beside the pointer that never moved.
+        reject_tuned_session(adapter, prior_sid, switched_sid)
+        {:error, :stale_election}
+
       {:ok, outcome} ->
         close_superseded_model_session(adapter, session.session_key, prior_sid, switched_sid)
 
@@ -5037,6 +5152,40 @@ defmodule Tightbeam.Gateway do
       {:error, error} ->
         reject_tuned_session(adapter, prior_sid, switched_sid)
         raise error
+    end
+  end
+
+  defp project_tuned_swap(txn, session, record_model, record_harness, new_ref, provider) do
+    case Org.swap_model_in_txn(
+           txn,
+           session.session_key,
+           {record_model, record_harness},
+           {new_ref, record_harness, provider}
+         ) do
+      # A model change is a recorded fact ABOUT this session, so it earns
+      # a transcript row: an agent reading its own history must be able
+      # to see that the mind answering changed, and where. The marker
+      # rides the SAME transaction as the swap it describes — a swap
+      # committed without its marker is the silent substitution the
+      # marker exists to prevent, just rarer.
+      {:ok, _} ->
+        {:appended, marker} =
+          Projection.append_marker_in_txn(
+            txn,
+            session.session_key,
+            retune_marker(record_model, new_ref)
+          )
+
+        {:changed, marker}
+
+      # The recorded row ALREADY names this model. The caller's election
+      # is satisfied, so this is not a failure — and it must not mint a
+      # "changed from X to X" row for a change that did not happen.
+      {:duplicate, _} ->
+        :duplicate
+
+      :stale ->
+        raise("model mutation race inside serialized tune")
     end
   end
 
