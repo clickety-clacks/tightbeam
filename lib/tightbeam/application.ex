@@ -159,6 +159,11 @@ defmodule Tightbeam.Application do
       {Tightbeam.DB, path: db_path, name: Tightbeam.DB},
       # Schema + boot epoch as a transient one-shot after the DB is up.
       {Tightbeam.Boot, base_dir},
+      # Ceremony workers outlive requests and credential-owner restarts. Their
+      # registry and temporary-child supervisor therefore start before the
+      # gateway composes any credential owner.
+      Tightbeam.OnboardingRegistry,
+      Tightbeam.OnboardingSupervisor,
       # Lane naming registry and the task supervisor for turn work.
       {Registry, keys: :unique, name: Tightbeam.LaneRegistry},
       {Task.Supervisor, name: Tightbeam.TurnTaskSupervisor},

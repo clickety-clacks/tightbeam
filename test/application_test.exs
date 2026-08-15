@@ -18,6 +18,8 @@ defmodule Tightbeam.ApplicationTest do
 
   test "boot on a fresh database creates every schema before recovery" do
     assert Process.whereis(DB) |> is_pid()
+    assert Process.whereis(Tightbeam.OnboardingRegistry) |> is_pid()
+    assert Process.whereis(Tightbeam.OnboardingSupervisor) |> is_pid()
     assert Process.whereis(Tightbeam.LaneRegistry) |> is_pid()
     assert Process.whereis(Tightbeam.LaneSupervisor) |> is_pid()
 
