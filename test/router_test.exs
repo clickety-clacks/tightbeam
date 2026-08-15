@@ -1158,8 +1158,8 @@ defmodule Tightbeam.Wire.RouterTest do
              DB.query(ctx.db, "SELECT origin, state FROM wakes")
   end
 
-  test "assign resolves bound and fallback roles and refuses unusable references", ctx do
-    main = create_session(ctx.db, Org.personal_session_key("flynn"), "flynn")
+  test "assign resolves a live-bound role and refuses unusable references", ctx do
+    create_session(ctx.db, Org.personal_session_key("flynn"), "flynn")
     holder = create_session(ctx.db, "assign-holder", "flynn")
     retired = create_session(ctx.db, "assign-retired", "flynn")
     Roles.create!(ctx.db, "bound-assignment", "flynn", holder.session_key)
@@ -1181,22 +1181,19 @@ defmodule Tightbeam.Wire.RouterTest do
                       role_fallback: false
                     }}
 
-    assert dispatch_cli(ctx, "tbc_test", %{
-             verb: "assign",
-             asUser: "flynn",
-             role: "fallback-assignment",
-             params: %{subject: "x"}
-           }).status == 200
+    # Previously 200 on the owner's personal session with role_fallback: true —
+    # the phantom binding of wi_756153b7. The seam refuses it now.
+    unbound =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "assign",
+        asUser: "flynn",
+        role: "fallback-assignment",
+        params: %{subject: "x"}
+      })
 
-    assert_receive {:call,
-                    %{
-                      verb: "assign",
-                      session_key: key,
-                      target_role: "fallback-assignment",
-                      role_fallback: true
-                    }}
-
-    assert key == main.session_key
+    assert unbound.status == 400
+    assert JSON.decode!(unbound.resp_body)["error"]["code"] == "no_live_role_holder"
+    refute_receive {:call, %{verb: "assign", target_role: "fallback-assignment"}}
 
     for body <- [
           %{verb: "assign", asUser: "flynn", role: "missing-assignment", params: %{subject: "x"}},
@@ -1217,6 +1214,66 @@ defmodule Tightbeam.Wire.RouterTest do
 
     assert response.status == 400
     assert JSON.decode!(response.resp_body)["error"]["code"] == "session_retired"
+  end
+
+  # wi_756153b7. Assigning to a role with no live holder used to bind the owner's
+  # personal session with holderFallback=1: an obligation on a session that is not
+  # the role's holder and commonly not even the requested provider, while the
+  # requester believed it dispatched. Specimens asg_6f380b79 (unbound role) and
+  # asg_388a5a54 (role whose bound session had been retired) — both shapes below.
+  #
+  # Run against the REAL assign/dispatch handlers over a session-authenticated
+  # request, because the claim is "no row", and a mocked handler writes none either
+  # way. The positive control proves this same wiring DOES write a row for a live
+  # holder, so the zero rows above it is the refusal and not dead plumbing.
+  test "assign and dispatch refuse a role with no live holder and open no assignment", ctx do
+    create_session(ctx.db, Org.personal_session_key("flynn"), "flynn")
+    live = create_session(ctx.db, "live-holder", "flynn")
+    dead = create_session(ctx.db, "dead-holder", "flynn")
+    caller = create_session(ctx.db, "phantom-caller", "flynn")
+
+    Roles.create!(ctx.db, "live-role", "flynn", live.session_key)
+    Roles.create!(ctx.db, "unbound-role", "flynn", nil)
+    Roles.create!(ctx.db, "retired-role", "flynn", dead.session_key)
+    Roles.create!(ctx.db, "caller-role", "flynn", caller.session_key)
+    Org.retire(ctx.db, dead.session_key, "user:flynn", 1_000)
+
+    ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, observed_real_handlers(ctx))}
+
+    for verb <- ["assign", "dispatch"], role <- ["unbound-role", "retired-role"] do
+      response =
+        dispatch_session(ctx, caller, %{
+          verb: verb,
+          role: role,
+          params: %{subject: "phantom #{verb} on #{role}", brief: "Bind no ghost."}
+        })
+
+      assert response.status == 400
+
+      assert JSON.decode!(response.resp_body)["error"] == %{
+               "code" => "no_live_role_holder",
+               "message" =>
+                 "role #{role} has no live bound session; spawn one and bind the role, " <>
+                   "or target an active sessionKey"
+             }
+
+      refute_receive {:call, %{verb: ^verb}}
+    end
+
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM assignments")
+
+    accepted =
+      dispatch_session(ctx, caller, %{
+        verb: "assign",
+        role: "live-role",
+        params: %{subject: "work a live holder can actually do"}
+      })
+
+    assert accepted.status == 200
+    assert_receive {:call, %{verb: "assign", session_key: "live-holder", role_fallback: false}}
+
+    assert {:ok, [["live-holder", "live-role", 0]]} =
+             DB.query(ctx.db, "SELECT holderKey, holderRole, holderFallback FROM assignments")
   end
 
   test "acting as a role requires its active binding", ctx do
@@ -1677,6 +1734,28 @@ defmodule Tightbeam.Wire.RouterTest do
     |> put_req_header("authorization", "Bearer tbc_test")
     |> put_req_header("x-tightbeam-cli-version", Tightbeam.CliCompatibility.required_version())
     |> Router.call(Router.init(ctx.opts))
+  end
+
+  # Authenticate as the session itself — the path a working agent actually takes
+  # when it assigns to a role, and the one the phantom specimens came in on.
+  defp dispatch_session(ctx, session, body) do
+    dispatch_cli(ctx, session.cli_token, body)
+  end
+
+  # The real handler table, each verb announcing its call before it runs. A mock
+  # cannot answer "was a row written"; this can, and it still proves "no handler
+  # ran" the same way the mocked table does.
+  defp observed_real_handlers(ctx) do
+    parent = self()
+
+    Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir, wake_tick_ms: 1_000})
+    |> Map.new(fn {verb, handler} ->
+      {verb,
+       fn call ->
+         send(parent, {:call, call})
+         handler.(call)
+       end}
+    end)
   end
 
   defp dispatch_cli(ctx, bearer, body) do
