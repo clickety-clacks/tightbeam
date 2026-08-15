@@ -80,11 +80,27 @@ pub(crate) struct Challenge {
     pub(crate) url: String,
 }
 
+impl std::fmt::Debug for Challenge {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Challenge")
+            .field("verifier", &"<redacted>")
+            .field("state", &"<redacted>")
+            .field("url", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Build the sign-in URL and the secret that proves we are the one who asked for it.
 pub(crate) fn begin() -> Challenge {
     let verifier = random_urlsafe(32);
-    let challenge = base64url(&Sha256::digest(verifier.as_bytes()));
     let state = random_urlsafe(32);
+
+    build_challenge(verifier, state)
+}
+
+fn build_challenge(verifier: String, state: String) -> Challenge {
+    let challenge = base64url(&Sha256::digest(verifier.as_bytes()));
 
     let query = [
         ("code", "true"),
@@ -108,6 +124,53 @@ pub(crate) fn begin() -> Challenge {
     }
 }
 
+/// The credential owner's private restart material for one browser challenge.
+pub(crate) fn challenge_secret_json(challenge: &Challenge) -> String {
+    serde_json::json!({
+        "version": 1,
+        "verifier": challenge.verifier,
+        "state": challenge.state,
+    })
+    .to_string()
+}
+
+/// Rebuild the exact public URL from the credential-owned verifier and state.
+pub(crate) fn resume(encoded: &str) -> Result<Challenge, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(encoded).map_err(|_| "challenge secret is malformed".to_owned())?;
+    let object = value
+        .as_object()
+        .filter(|object| object.len() == 3)
+        .ok_or_else(|| "challenge secret is malformed".to_owned())?;
+    if object.get("version").and_then(serde_json::Value::as_u64) != Some(1) {
+        return Err("challenge secret is malformed".to_owned());
+    }
+    let required = |name: &str| {
+        object
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| "challenge secret is malformed".to_owned())
+    };
+    let verifier = required("verifier")?;
+    let state = required("state")?;
+    if ![&verifier, &state]
+        .into_iter()
+        .all(|value| valid_challenge_component(value))
+    {
+        return Err("challenge secret is malformed".to_owned());
+    }
+    Ok(build_challenge(verifier, state))
+}
+
+fn valid_challenge_component(value: &str) -> bool {
+    value.len() == 43
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
 /// Exchange what the operator pasted for a credential.
 ///
 /// The paste is `code#state`, which is what the callback page shows. The state is CHECKED
@@ -115,6 +178,14 @@ pub(crate) fn begin() -> Challenge {
 /// the challenge this process generated, and accepting a mismatched one would let a code
 /// from some other sign-in be banked as this host's credential.
 pub(crate) fn complete(challenge: &Challenge, pasted: &str) -> Result<Credential, String> {
+    complete_with_timeout(challenge, pasted, Duration::from_secs(30))
+}
+
+pub(crate) fn complete_with_timeout(
+    challenge: &Challenge,
+    pasted: &str,
+    timeout: Duration,
+) -> Result<Credential, String> {
     let pasted = pasted.trim();
     let (code, state) = pasted.split_once('#').ok_or_else(|| {
         "expected the code as `code#state`, exactly as the page shows it".to_owned()
@@ -138,8 +209,8 @@ pub(crate) fn complete(challenge: &Challenge, pasted: &str) -> Result<Credential
 
     let payload = serde_json::to_string(&body).map_err(|error| error.to_string())?;
     let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(30))
-        .timeout_connect(Duration::from_secs(30))
+        .timeout(timeout)
+        .timeout_connect(timeout)
         .build();
 
     let response = agent
@@ -526,6 +597,69 @@ mod tests {
         let (first, second) = (begin(), begin());
         assert_ne!(first.state, second.state);
         assert_ne!(first.verifier, second.verifier);
+    }
+
+    #[test]
+    fn persisted_challenge_rebuilds_the_exact_public_url() {
+        let original = begin();
+        let encoded = challenge_secret_json(&original);
+        let resumed = resume(&encoded).unwrap();
+
+        assert_eq!(resumed.verifier, original.verifier);
+        assert_eq!(resumed.state, original.state);
+        assert_eq!(resumed.url, original.url);
+    }
+
+    #[test]
+    fn challenge_debug_redacts_every_restart_value() {
+        let challenge = build_challenge(
+            "verifier-secret-sentinel".to_owned(),
+            "state-secret-sentinel".to_owned(),
+        );
+        let rendered = format!("{challenge:?}");
+
+        assert!(!rendered.contains("verifier-secret-sentinel"), "{rendered}");
+        assert!(!rendered.contains("state-secret-sentinel"), "{rendered}");
+        assert!(!rendered.contains(AUTHORIZE_URL), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+    }
+
+    #[test]
+    fn malformed_or_extended_challenge_secrets_are_refused() {
+        let component = "A".repeat(43);
+        for encoded in [
+            "not-json".to_owned(),
+            serde_json::json!({
+                "version": 2,
+                "verifier": component,
+                "state": component,
+            })
+            .to_string(),
+            serde_json::json!({
+                "version": 1,
+                "verifier": component,
+                "state": component,
+                "unexpected": true,
+            })
+            .to_string(),
+            serde_json::json!({
+                "version": 1,
+                "verifier": "short",
+                "state": component,
+            })
+            .to_string(),
+            serde_json::json!({
+                "version": 1,
+                "verifier": "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!",
+                "state": component,
+            })
+            .to_string(),
+        ] {
+            assert_eq!(
+                resume(&encoded).unwrap_err(),
+                "challenge secret is malformed"
+            );
+        }
     }
 
     /// A credential missing its refresh token or expiry is refused, not defaulted: banked
