@@ -1,5 +1,20 @@
 # Release candidate procedure
 
+Status: **SUPERSEDED — MUST NOT IMPLEMENT.**
+
+The authority for branch and release process on both product lines is
+[CONTRIBUTING.md on main](https://github.com/clickety-clacks/tightbeam/blob/main/CONTRIBUTING.md).
+The 0.1 line uses per-version scratchpad branches. The highest `0.1.*` branch (currently
+`0.1.9`) is active until Mike calls quits. Its last build is the release: tag the branch
+tip, run proof at that tag SHA, spin the successor branch from the same tip, and never move
+the released version branch again.
+
+The old `release-candidate/*` mechanism and `0.1.x` series branch are retired. Do not create,
+advance, or retain candidate branches. The contract below remains only to explain historical
+artifacts. It must not be implemented.
+
+## Historical contract
+
 This procedure builds packages from one exact candidate branch commit. It does not publish
 a release. It does not create a tag.
 
