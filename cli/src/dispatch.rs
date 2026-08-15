@@ -6,10 +6,30 @@ use serde_json::Value;
 
 use crate::args::{Command, Identity, Target, ToplineSelection, TuneControl};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+pub const ONBOARDING_PROTOCOL_VERSION: u64 = 2;
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct RequestSpec {
     pub path: &'static str,
     pub body_json: String,
+    sensitive_body: bool,
+}
+
+impl std::fmt::Debug for RequestSpec {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RequestSpec")
+            .field("path", &self.path)
+            .field(
+                "body_json",
+                if self.sensitive_body {
+                    &"<redacted onboarding response>" as &dyn std::fmt::Debug
+                } else {
+                    &self.body_json as &dyn std::fmt::Debug
+                },
+            )
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,6 +37,62 @@ pub struct Endpoint {
     pub base: String,
     pub token: String,
     pub origin: Origin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnboardingCredentialKind {
+    Subscription,
+    ApiKey,
+}
+
+impl OnboardingCredentialKind {
+    fn wire(self) -> &'static str {
+        match self {
+            Self::Subscription => "subscription",
+            Self::ApiKey => "apiKey",
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub enum OnboardingResponse {
+    Code(String),
+    Approved,
+}
+
+impl std::fmt::Debug for OnboardingResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Code(_) => formatter.debug_tuple("Code").field(&"<redacted>").finish(),
+            Self::Approved => formatter.write_str("Approved"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OnboardingRequest {
+    Begin {
+        provider: String,
+        machine: Option<String>,
+        kind: OnboardingCredentialKind,
+        idempotency_key: String,
+    },
+    Status {
+        ceremony_id: String,
+    },
+    Respond {
+        ceremony_id: String,
+        response: OnboardingResponse,
+        idempotency_key: String,
+    },
+    Restart {
+        ceremony_id: String,
+        idempotency_key: String,
+    },
+    Cancel {
+        ceremony_id: String,
+        idempotency_key: String,
+    },
 }
 
 /// WHERE the endpoint came from, kept because it answers a question its VALUES cannot.
@@ -109,6 +185,7 @@ fn request(
     RequestSpec {
         path: "/agent/dispatch",
         body_json: object(body),
+        sensitive_body: false,
     }
 }
 
@@ -214,6 +291,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
         Command::ToolCallObserved => Ok(RequestSpec {
             path: "/agent/tool-call-observed",
             body_json: "{}".to_owned(),
+            sensitive_body: false,
         }),
         Command::Spawn {
             identity,
@@ -888,6 +966,86 @@ pub fn build_onboard_phase_request(
         params.push(string_field("reason", reason));
     }
     request(identity, "onboard", vec![], params)
+}
+
+pub fn build_onboarding_capability_request(identity: &Identity) -> RequestSpec {
+    request(identity, "inspect", vec![], vec![])
+}
+
+pub fn build_onboarding_v2_request(
+    identity: &Identity,
+    onboarding: &OnboardingRequest,
+) -> RequestSpec {
+    let sensitive_body = matches!(
+        onboarding,
+        OnboardingRequest::Respond {
+            response: OnboardingResponse::Code(_),
+            ..
+        }
+    );
+    let params = match onboarding {
+        OnboardingRequest::Begin {
+            provider,
+            machine,
+            kind,
+            idempotency_key,
+        } => {
+            let mut params = vec![
+                string_field("phase", "begin"),
+                format!("\"protocolVersion\":{ONBOARDING_PROTOCOL_VERSION}"),
+                string_field("provider", provider),
+            ];
+            if let Some(machine) = machine {
+                params.push(string_field("machine", machine));
+            }
+            params.push(string_field("kind", kind.wire()));
+            params.push(string_field("idempotencyKey", idempotency_key));
+            params
+        }
+        OnboardingRequest::Status { ceremony_id } => vec![
+            string_field("phase", "status"),
+            string_field("ceremonyId", ceremony_id),
+        ],
+        OnboardingRequest::Respond {
+            ceremony_id,
+            response,
+            idempotency_key,
+        } => {
+            let response = match response {
+                OnboardingResponse::Code(value) => object(vec![
+                    string_field("kind", "code"),
+                    string_field("value", value),
+                ]),
+                OnboardingResponse::Approved => object(vec![string_field("kind", "approved")]),
+            };
+            vec![
+                string_field("phase", "respond"),
+                string_field("ceremonyId", ceremony_id),
+                format!("\"response\":{response}"),
+                string_field("idempotencyKey", idempotency_key),
+            ]
+        }
+        OnboardingRequest::Restart {
+            ceremony_id,
+            idempotency_key,
+        } => vec![
+            string_field("phase", "restart"),
+            string_field("ceremonyId", ceremony_id),
+            string_field("idempotencyKey", idempotency_key),
+        ],
+        OnboardingRequest::Cancel {
+            ceremony_id,
+            idempotency_key,
+        } => vec![
+            string_field("phase", "cancel"),
+            string_field("ceremonyId", ceremony_id),
+            string_field("idempotencyKey", idempotency_key),
+        ],
+    };
+
+    let mut request = request(identity, "onboard", vec![], params);
+    request.sensitive_body = sensitive_body;
+    request
 }
 
 pub fn build_register_host_request(
@@ -2224,6 +2382,101 @@ mod tests {
             r#"{"asUser":"flynn","verb":"onboard","params":{"provider":"anthropic","phase":"finish","kind":"apiKey","machine":"work-1","leaseId":"lease-7"}}"#
         );
         assert!(!keyed.body_json.contains("sk-"));
+    }
+
+    #[test]
+    fn durable_onboarding_requests_are_closed_and_byte_exact() {
+        let identity = Identity::User("flynn".to_owned());
+        assert_eq!(
+            build_onboarding_capability_request(&identity).body_json,
+            r#"{"asUser":"flynn","verb":"inspect","params":{}}"#
+        );
+
+        for (request, expected) in [
+            (
+                OnboardingRequest::Begin {
+                    provider: "anthropic".to_owned(),
+                    machine: Some("gibson".to_owned()),
+                    kind: OnboardingCredentialKind::Subscription,
+                    idempotency_key: "begin-1".to_owned(),
+                },
+                r#"{"asUser":"flynn","verb":"onboard","params":{"phase":"begin","protocolVersion":2,"provider":"anthropic","machine":"gibson","kind":"subscription","idempotencyKey":"begin-1"}}"#,
+            ),
+            (
+                OnboardingRequest::Status {
+                    ceremony_id: "oc_123".to_owned(),
+                },
+                r#"{"asUser":"flynn","verb":"onboard","params":{"phase":"status","ceremonyId":"oc_123"}}"#,
+            ),
+            (
+                OnboardingRequest::Respond {
+                    ceremony_id: "oc_123".to_owned(),
+                    response: OnboardingResponse::Code("code#state".to_owned()),
+                    idempotency_key: "response-1".to_owned(),
+                },
+                r#"{"asUser":"flynn","verb":"onboard","params":{"phase":"respond","ceremonyId":"oc_123","response":{"kind":"code","value":"code#state"},"idempotencyKey":"response-1"}}"#,
+            ),
+            (
+                OnboardingRequest::Respond {
+                    ceremony_id: "oc_123".to_owned(),
+                    response: OnboardingResponse::Approved,
+                    idempotency_key: "response-2".to_owned(),
+                },
+                r#"{"asUser":"flynn","verb":"onboard","params":{"phase":"respond","ceremonyId":"oc_123","response":{"kind":"approved"},"idempotencyKey":"response-2"}}"#,
+            ),
+            (
+                OnboardingRequest::Restart {
+                    ceremony_id: "oc_123".to_owned(),
+                    idempotency_key: "restart-1".to_owned(),
+                },
+                r#"{"asUser":"flynn","verb":"onboard","params":{"phase":"restart","ceremonyId":"oc_123","idempotencyKey":"restart-1"}}"#,
+            ),
+            (
+                OnboardingRequest::Cancel {
+                    ceremony_id: "oc_123".to_owned(),
+                    idempotency_key: "cancel-1".to_owned(),
+                },
+                r#"{"asUser":"flynn","verb":"onboard","params":{"phase":"cancel","ceremonyId":"oc_123","idempotencyKey":"cancel-1"}}"#,
+            ),
+        ] {
+            assert_eq!(
+                build_onboarding_v2_request(&identity, &request).body_json,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn onboarding_code_debug_is_redacted_and_api_key_v2_is_byte_free() {
+        let sentinel = "response-secret-sentinel#state";
+        let response = OnboardingResponse::Code(sentinel.to_owned());
+        let request = build_onboarding_v2_request(
+            &Identity::User("flynn".to_owned()),
+            &OnboardingRequest::Respond {
+                ceremony_id: "oc_123".to_owned(),
+                response: response.clone(),
+                idempotency_key: "response-1".to_owned(),
+            },
+        );
+        assert!(!format!("{response:?}").contains(sentinel));
+        assert!(!format!("{request:?}").contains(sentinel));
+        assert!(request.body_json.contains(sentinel));
+
+        let api_key = build_onboarding_v2_request(
+            &Identity::User("flynn".to_owned()),
+            &OnboardingRequest::Begin {
+                provider: "openai".to_owned(),
+                machine: None,
+                kind: OnboardingCredentialKind::ApiKey,
+                idempotency_key: "begin-api-key".to_owned(),
+            },
+        );
+        assert_eq!(
+            api_key.body_json,
+            r#"{"asUser":"flynn","verb":"onboard","params":{"phase":"begin","protocolVersion":2,"provider":"openai","kind":"apiKey","idempotencyKey":"begin-api-key"}}"#
+        );
+        assert!(!api_key.body_json.contains("response"));
+        assert!(!api_key.body_json.contains("value"));
     }
 
     #[test]
