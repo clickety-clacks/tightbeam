@@ -119,7 +119,8 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
         | Command::CommandHelp(_)
         | Command::Doctor { .. }
         | Command::UpdateClients { .. }
-        | Command::Assimilate(_) => {
+        | Command::Assimilate(_)
+        | Command::OnboardingWorker(_) => {
             Err("command does not dispatch through /agent/dispatch".to_owned())
         }
         Command::Wake {
@@ -1337,6 +1338,7 @@ where
         }
         Command::UpdateClients { as_user } => crate::ceremonies::update_clients(&as_user),
         Command::Assimilate(args) => crate::ceremonies::assimilate(args),
+        Command::OnboardingWorker(args) => crate::ceremonies::run_onboarding_worker(args),
         Command::Onboard {
             identity,
             provider,
@@ -1466,7 +1468,8 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::Doctor { .. }
         | Command::ToolCallObserved
         | Command::UpdateClients { .. }
-        | Command::Assimilate(_) => None,
+        | Command::Assimilate(_)
+        | Command::OnboardingWorker(_) => None,
     }
 }
 

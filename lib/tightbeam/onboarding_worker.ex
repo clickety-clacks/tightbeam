@@ -412,7 +412,7 @@ defmodule Tightbeam.OnboardingWorker do
   end
 
   defp worker_args(opts) do
-    args = [
+    [
       "onboarding-worker",
       "--ceremony-id",
       Keyword.fetch!(opts, :ceremony_id),
@@ -423,17 +423,12 @@ defmodule Tightbeam.OnboardingWorker do
       "--worker-ref",
       Keyword.fetch!(opts, :worker_ref),
       "--deadline-ms",
-      opts |> Keyword.fetch!(:deadline_ms) |> Integer.to_string()
+      opts |> Keyword.fetch!(:deadline_ms) |> Integer.to_string(),
+      "--secret-ref",
+      required_string!(opts, :secret_ref),
+      "--staging-ref",
+      required_string!(opts, :staging_ref)
     ]
-
-    Enum.reduce([{:secret_ref, "--secret-ref"}, {:staging_ref, "--staging-ref"}], args, fn
-      {key, flag}, acc ->
-        case Keyword.get(opts, key) do
-          nil -> acc
-          value when is_binary(value) and byte_size(value) > 0 -> acc ++ [flag, value]
-          _other -> raise ArgumentError, "#{key} must be a non-empty string"
-        end
-    end)
   end
 
   defp required_string!(opts, key) do

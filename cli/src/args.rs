@@ -290,6 +290,9 @@ pub enum Command {
         provider: String,
         api_key: bool,
     },
+    /// Host-local provider worker. Hidden from the public command manual and
+    /// launched only by the gateway's onboarding supervisor.
+    OnboardingWorker(OnboardingWorkerArgs),
     AddUser {
         identity: Identity,
         user_id: String,
@@ -370,6 +373,17 @@ pub struct AssimilateArgs {
     pub harnesses: Vec<String>,
     pub catalog: HarnessCatalog,
     pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnboardingWorkerArgs {
+    pub ceremony_id: String,
+    pub provider: String,
+    pub credential_kind: String,
+    pub worker_ref: String,
+    pub deadline_ms: u64,
+    pub secret_ref: String,
+    pub staging_ref: String,
 }
 
 const HELP_TEMPLATE: &str = r#"tightbeam — coordinate with other agent sessions in this org.
@@ -1572,6 +1586,7 @@ fn parse_with_optional_catalog(
             }
         }
         "onboard" => parse_onboard(&parsed, flags),
+        "onboarding-worker" => parse_onboarding_worker(&parsed, flags),
         "add-user" => {
             let user_id = parsed
                 .positional
@@ -1914,6 +1929,55 @@ fn parse_onboard(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Comm
         // process table. The key arrives on stdin instead.
         api_key: flags.contains_key("api-key"),
     })
+}
+
+fn parse_onboarding_worker(
+    parsed: &Flags,
+    flags: &HashMap<String, String>,
+) -> Result<Command, String> {
+    const USAGE: &str = "invalid private onboarding worker invocation";
+    const ALLOWED: &[&str] = &[
+        "ceremony-id",
+        "provider",
+        "credential-kind",
+        "worker-ref",
+        "deadline-ms",
+        "secret-ref",
+        "staging-ref",
+    ];
+
+    if parsed.positional.as_slice() != ["onboarding-worker"]
+        || flags.keys().any(|flag| !ALLOWED.contains(&flag.as_str()))
+    {
+        return Err(USAGE.to_owned());
+    }
+
+    let required = |name: &str| nonempty(flags, name).ok_or_else(|| USAGE.to_owned());
+    let ceremony_id = required("ceremony-id")?;
+    let provider = required("provider")?;
+    let credential_kind = required("credential-kind")?;
+    let worker_ref = required("worker-ref")?;
+    let secret_ref = required("secret-ref")?;
+    let staging_ref = required("staging-ref")?;
+    let deadline_ms = required("deadline-ms")?
+        .parse::<u64>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| USAGE.to_owned())?;
+
+    if !matches!(provider.as_str(), "anthropic" | "openai") || credential_kind != "subscription" {
+        return Err(USAGE.to_owned());
+    }
+
+    Ok(Command::OnboardingWorker(OnboardingWorkerArgs {
+        ceremony_id,
+        provider,
+        credential_kind,
+        worker_ref,
+        deadline_ms,
+        secret_ref,
+        staging_ref,
+    }))
 }
 
 #[cfg(test)]
@@ -2260,6 +2324,88 @@ mod tests {
     }
 
     #[test]
+    fn public_onboarding_spelling_and_api_key_flag_are_unchanged() {
+        for (provider, api_key) in [("openai", false), ("anthropic", true)] {
+            let mut args = strings(&["onboard", provider, "--as-user", "flynn"]);
+            if api_key {
+                args.push("--api-key".to_owned());
+            }
+            assert_eq!(
+                parse(args),
+                Ok(Command::Onboard {
+                    identity: Identity::User("flynn".to_owned()),
+                    provider: provider.to_owned(),
+                    api_key,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn private_onboarding_worker_accepts_only_secret_free_closed_argv() {
+        let valid = strings(&[
+            "onboarding-worker",
+            "--ceremony-id",
+            "oc_1",
+            "--provider",
+            "anthropic",
+            "--credential-kind",
+            "subscription",
+            "--worker-ref",
+            "ow_1",
+            "--deadline-ms",
+            "60000",
+            "--secret-ref",
+            "/private/challenge.json",
+            "--staging-ref",
+            "/private/staging",
+        ]);
+        assert_eq!(
+            parse(valid.clone()),
+            Ok(Command::OnboardingWorker(OnboardingWorkerArgs {
+                ceremony_id: "oc_1".to_owned(),
+                provider: "anthropic".to_owned(),
+                credential_kind: "subscription".to_owned(),
+                worker_ref: "ow_1".to_owned(),
+                deadline_ms: 60_000,
+                secret_ref: "/private/challenge.json".to_owned(),
+                staging_ref: "/private/staging".to_owned(),
+            }))
+        );
+
+        for invalid in [
+            {
+                let mut args = valid.clone();
+                args.extend(strings(&["--response", "secret-sentinel"]));
+                args
+            },
+            {
+                let mut args = valid.clone();
+                let index = args.iter().position(|arg| arg == "subscription").unwrap();
+                args[index] = "apiKey".to_owned();
+                args
+            },
+            {
+                let mut args = valid.clone();
+                let index = args.iter().position(|arg| arg == "--secret-ref").unwrap();
+                args.drain(index..=index + 1);
+                args
+            },
+            {
+                let mut args = valid.clone();
+                let index = args.iter().position(|arg| arg == "60000").unwrap();
+                args[index] = "0".to_owned();
+                args
+            },
+        ] {
+            assert_eq!(
+                parse(invalid),
+                Err("invalid private onboarding worker invocation".to_owned())
+            );
+        }
+    }
+
+    #[test]
     fn update_clients_is_an_admin_fleet_ceremony() {
         assert_eq!(
             parse(strings(&["update-clients", "--as-user", "flynn"])),
@@ -2302,6 +2448,10 @@ mod tests {
     #[test]
     fn help_enumerates_exactly_cli_surface_v1() {
         let help = render_help(Some(&crate::harnesses::catalog().unwrap()));
+        assert!(
+            !help.contains("onboarding-worker"),
+            "the host-local worker mode is not a public command"
+        );
         assert!(
             help.find("  kungfu list").unwrap() < help.find("  ADMIN (").unwrap(),
             "kungfu list is ungated discovery and must not appear under ADMIN"

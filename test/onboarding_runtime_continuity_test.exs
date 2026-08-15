@@ -175,6 +175,8 @@ defmodule Tightbeam.OnboardingRuntimeContinuityTest do
       provider: :anthropic,
       credential_kind: :subscription,
       deadline_ms: 60_000,
+      secret_ref: Path.join(Path.dirname(ctx.fixture_path), "#{worker_ref}.challenge.json"),
+      staging_ref: Path.dirname(ctx.fixture_path),
       registry: ctx.registry,
       cmd: [System.find_executable("elixir"), ctx.fixture_path]
     ]

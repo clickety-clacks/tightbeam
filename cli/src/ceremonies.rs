@@ -3,17 +3,19 @@
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::args::{AssimilateArgs, Identity};
+use sha2::{Digest, Sha256};
+
+use crate::args::{AssimilateArgs, Identity, OnboardingWorkerArgs};
 use crate::child_process::{
-    RunError, Supervised, exited_without_reaping, nonblocking, reset_sigchld_before_spawn,
-    supervise,
+    NonblockingFd, RunError, Supervised, exited_without_reaping, nonblocking,
+    reset_sigchld_before_spawn, supervise,
 };
 use crate::dispatch::{self, Endpoint, RequestSpec};
 use crate::harnesses::HarnessCatalog;
@@ -91,6 +93,321 @@ impl From<RunError> for StageFailure {
             reason: error.to_string(),
         }
     }
+}
+
+#[derive(PartialEq, Eq)]
+enum WorkerResponse {
+    Code(String),
+    Approved,
+}
+
+impl std::fmt::Debug for WorkerResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Code(_) => formatter.debug_tuple("Code").field(&"<redacted>").finish(),
+            Self::Approved => formatter.write_str("Approved"),
+        }
+    }
+}
+
+/// Run the hidden host-local worker protocol. Ordinary output is a closed NDJSON
+/// observation stream; browser responses arrive only through inherited stdin.
+pub fn run_onboarding_worker(args: OnboardingWorkerArgs) -> Result<(), String> {
+    let process_id = std::process::id();
+    let start_identity = os_process_start_identity(process_id)
+        .map_err(|_| "worker_process_identity_unavailable".to_owned())?;
+
+    worker_emit(&serde_json::json!({
+        "type": "workerStarted",
+        "workerRef": args.worker_ref,
+        "ceremonyId": args.ceremony_id,
+        "processId": process_id,
+        "osProcessStartIdentity": start_identity,
+    }))?;
+
+    // No pinned real OpenAI device-login capture exists in current custody.
+    // Parsing an imagined transcript would turn a green unit test into a false
+    // provider contract, so this worker does not spawn or read codex yet.
+    if args.provider == "openai" {
+        return worker_validation_failure("provider_output_fixture_unavailable");
+    }
+
+    run_anthropic_worker(args)
+}
+
+fn run_anthropic_worker(args: OnboardingWorkerArgs) -> Result<(), String> {
+    let deadline = Instant::now()
+        .checked_add(Duration::from_millis(args.deadline_ms))
+        .ok_or_else(|| "worker_deadline_invalid".to_owned())?;
+    let challenge = load_or_create_anthropic_challenge(Path::new(&args.secret_ref))
+        .map_err(|_| "challenge_secret_unavailable".to_owned())?;
+
+    worker_emit(&serde_json::json!({
+        "type": "publicChallengeReady",
+        "authorizationUrl": challenge.url,
+    }))?;
+
+    let response = read_worker_response(deadline)?;
+    let WorkerResponse::Code(code) = response else {
+        return worker_validation_failure("invalid_response_kind");
+    };
+
+    worker_emit(&serde_json::json!({
+        "type": "responseDelivered",
+        "responseKind": "code",
+    }))?;
+
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .filter(|duration| !duration.is_zero())
+        .ok_or_else(|| "worker_deadline_expired".to_owned())?;
+
+    let credential =
+        match crate::anthropic_oauth::complete_with_timeout(&challenge, &code, remaining) {
+            Ok(credential) => credential,
+            Err(_) => return worker_validation_failure("provider_validation_failed"),
+        };
+
+    if validate_setup_token(&credential.access_token, None, deadline).is_err() {
+        return worker_validation_failure("provider_validation_failed");
+    }
+
+    let candidate = crate::anthropic_oauth::credentials_json(&credential);
+    let candidate_path = Path::new(&args.staging_ref).join(".credentials.json");
+    let candidate_digest = match stage_candidate_and_digest(&candidate_path, candidate.as_bytes()) {
+        Ok(digest) => digest,
+        Err(_) => return worker_validation_failure("candidate_staging_failed"),
+    };
+
+    worker_emit(&serde_json::json!({
+        "type": "validationResult",
+        "accepted": true,
+    }))?;
+    worker_emit(&serde_json::json!({
+        "type": "candidateReady",
+        "stagingRef": args.staging_ref,
+        "candidateDigest": candidate_digest,
+    }))
+}
+
+fn worker_validation_failure(code: &str) -> Result<(), String> {
+    worker_emit(&serde_json::json!({
+        "type": "validationResult",
+        "accepted": false,
+        "failureCode": code,
+    }))?;
+    Err(code.to_owned())
+}
+
+fn worker_emit(observation: &serde_json::Value) -> Result<(), String> {
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    serde_json::to_writer(&mut output, observation)
+        .map_err(|_| "worker_output_failed".to_owned())?;
+    output
+        .write_all(b"\n")
+        .and_then(|()| output.flush())
+        .map_err(|_| "worker_output_failed".to_owned())
+}
+
+fn read_worker_response(deadline: Instant) -> Result<WorkerResponse, String> {
+    const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+    let _nonblocking =
+        NonblockingFd::new(libc::STDIN_FILENO).map_err(|_| "worker_stdin_failed".to_owned())?;
+    let mut header = [0u8; 5];
+    read_fd_before_deadline(libc::STDIN_FILENO, &mut header, deadline)?;
+    let length = u32::from_be_bytes(header[1..].try_into().expect("four-byte length")) as usize;
+    if length > MAX_RESPONSE_BYTES {
+        return Err("worker_response_too_large".to_owned());
+    }
+    let mut value = vec![0u8; length];
+    read_fd_before_deadline(libc::STDIN_FILENO, &mut value, deadline)?;
+
+    decode_worker_response(header[0], value)
+}
+
+fn decode_worker_response(tag: u8, value: Vec<u8>) -> Result<WorkerResponse, String> {
+    match (tag, value.len()) {
+        (1, 1..) => String::from_utf8(value)
+            .map(WorkerResponse::Code)
+            .map_err(|_| "worker_response_invalid".to_owned()),
+        (2, 0) => Ok(WorkerResponse::Approved),
+        _ => Err("worker_response_invalid".to_owned()),
+    }
+}
+
+fn read_fd_before_deadline(
+    fd: libc::c_int,
+    buffer: &mut [u8],
+    deadline: Instant,
+) -> Result<(), String> {
+    let mut offset = 0;
+    while offset < buffer.len() {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|duration| !duration.is_zero())
+            .ok_or_else(|| "worker_deadline_expired".to_owned())?;
+        let timeout = remaining.as_millis().min(libc::c_int::MAX as u128) as libc::c_int;
+        let mut poll = libc::pollfd {
+            fd,
+            events: libc::POLLIN | libc::POLLHUP,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut poll, 1, timeout) };
+        if ready == 0 {
+            return Err("worker_deadline_expired".to_owned());
+        }
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err("worker_stdin_failed".to_owned());
+        }
+
+        let read = unsafe {
+            libc::read(
+                fd,
+                buffer[offset..].as_mut_ptr().cast(),
+                buffer.len() - offset,
+            )
+        };
+        if read > 0 {
+            offset += read as usize;
+        } else if read == 0 {
+            return Err("worker_stdin_closed".to_owned());
+        } else {
+            let error = io::Error::last_os_error();
+            if !matches!(
+                error.kind(),
+                io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+            ) {
+                return Err("worker_stdin_failed".to_owned());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn load_or_create_anthropic_challenge(
+    secret_ref: &Path,
+) -> Result<crate::anthropic_oauth::Challenge, String> {
+    match fs::symlink_metadata(secret_ref) {
+        Ok(metadata)
+            if metadata.is_file()
+                && !metadata.file_type().is_symlink()
+                && metadata.permissions().mode() & 0o077 == 0 =>
+        {
+            let encoded = fs::read_to_string(secret_ref).map_err(|error| error.to_string())?;
+            crate::anthropic_oauth::resume(&encoded)
+        }
+        Ok(_) => Err("challenge secret is malformed".to_owned()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let challenge = crate::anthropic_oauth::begin();
+            write_private_file(
+                secret_ref,
+                crate::anthropic_oauth::challenge_secret_json(&challenge).as_bytes(),
+            )?;
+            Ok(challenge)
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn write_private_candidate(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    write_private_file(path, bytes)
+}
+
+fn stage_candidate_and_digest(path: &Path, bytes: &[u8]) -> Result<String, String> {
+    write_private_candidate(path, bytes)?;
+    let staged = fs::read(path).map_err(|error| error.to_string())?;
+    Ok(format!("{:x}", Sha256::digest(&staged)))
+}
+
+fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = private_parent(path)?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| error.to_string())?;
+    let staged = (|| -> Result<(), String> {
+        file.write_all(bytes).map_err(|error| error.to_string())?;
+        file.sync_all().map_err(|error| error.to_string())
+    })();
+    if let Err(reason) = staged {
+        let _ = fs::remove_file(path);
+        return Err(reason);
+    }
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn private_parent(path: &Path) -> Result<&Path, String> {
+    let parent = path.parent().ok_or_else(|| "missing parent".to_owned())?;
+    let metadata = fs::symlink_metadata(parent).map_err(|error| error.to_string())?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err("private parent is not owner-only".to_owned());
+    }
+    Ok(parent)
+}
+
+#[cfg(target_os = "linux")]
+fn os_process_start_identity(pid: u32) -> Result<String, String> {
+    let stat = fs::read(format!("/proc/{pid}/stat")).map_err(|error| error.to_string())?;
+    let close = stat
+        .iter()
+        .rposition(|byte| *byte == b')')
+        .ok_or_else(|| "process stat is malformed".to_owned())?;
+    let fields = stat
+        .get(close + 2..)
+        .ok_or_else(|| "process stat is malformed".to_owned())?
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|field| !field.is_empty())
+        .collect::<Vec<_>>();
+    let start = fields
+        .get(19)
+        .and_then(|field| std::str::from_utf8(field).ok())
+        .and_then(|field| field.parse::<u64>().ok())
+        .ok_or_else(|| "process stat is malformed".to_owned())?;
+    Ok(format!("linux:{start}"))
+}
+
+#[cfg(target_os = "macos")]
+fn os_process_start_identity(pid: u32) -> Result<String, String> {
+    let pid = libc::c_int::try_from(pid).map_err(|_| "process id is too large".to_owned())?;
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>())
+        .map_err(|_| "process identity buffer is too large".to_owned())?;
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if written != size {
+        return Err("process start identity is unavailable".to_owned());
+    }
+    let info = unsafe { info.assume_init() };
+    Ok(format!(
+        "macos:{}:{}",
+        info.pbi_start_tvsec, info.pbi_start_tvusec
+    ))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn os_process_start_identity(_pid: u32) -> Result<String, String> {
+    Err("process start identity is unsupported".to_owned())
 }
 
 pub fn onboard<S, H>(
