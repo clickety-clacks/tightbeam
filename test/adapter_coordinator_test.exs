@@ -74,13 +74,18 @@ defmodule Tightbeam.AdapterCoordinatorTest do
   end
 
   # THE INCIDENT TEST (2026-08-14). A latched circuit used to veto the credential
-  # lifecycle's own start call, so an operator installing a WORKING credential
-  # was refused by a verdict about the credential they were replacing -- and the
+  # lifecycle's own start call, so an operator installing a WORKING credential was
+  # refused by a verdict about the credential they were replacing -- and the
   # onboarding ceremony read that refusal as "this credential is bad". Recovery
   # required restarting the gateway to wipe the in-memory latch.
   #
-  # The circuit protects agent connections. It has no say over installation.
-  test "an authoritative credential start bypasses an open circuit and clears it", ctx do
+  # The adapter command is SWITCHABLE so the replacement can be viable rather than
+  # another instant death (Sol xhigh, important 4): failing until the circuit
+  # opens, then a process that stays alive, so the post-activation assertions do
+  # not race a :DOWN.
+  test "activate_provider_runtime bypasses an open circuit and replaces the adapter", ctx do
+    {:ok, phase} = Agent.start_link(fn -> :failing end)
+
     coordinator =
       start_supervised!(
         {AdapterCoordinator,
@@ -88,7 +93,13 @@ defmodule Tightbeam.AdapterCoordinatorTest do
          backoff_base_ms: 1,
          adapter_context: fn _ -> [] end,
          adapter_opts: fn _, _ ->
-           [harness: :claude, cmd: [System.find_executable("false")], home: "/tmp", cwd: "/tmp"]
+           cmd =
+             case Agent.get(phase, & &1) do
+               :failing -> [System.find_executable("false")]
+               :viable -> [System.find_executable("sleep"), "60"]
+             end
+
+           [harness: :claude, cmd: cmd, home: "/tmp", cwd: "/tmp"]
          end,
          db: ctx.db,
          name: :"coord_#{System.unique_integer([:positive])}"}
@@ -109,19 +120,80 @@ defmodule Tightbeam.AdapterCoordinatorTest do
              1_500
            )
 
-    # An ordinary checkout is still refused -- the circuit is doing its job.
+    # An ordinary checkout is still refused -- the circuit is doing its real job,
+    # which this change does not touch.
     assert {:error, :degraded} = AdapterCoordinator.adapter_for(coordinator, key)
 
-    # The credential lifecycle's call is NOT refused. Before the fix this
-    # returned {:error, :degraded}, which is the entire deadlock.
-    assert {:ok, _pid, _generation} =
-             AdapterCoordinator.adapter_for(coordinator, key, credential_kind: :subscription)
+    %{"claude:default@testhost" => latched} = AdapterCoordinator.health(coordinator)
+    assert latched.consecutive_failures >= 5
 
-    # ...and it cleared the history of the credential that no longer exists.
+    # The credential is replaced with one that works.
+    Agent.update(phase, fn :failing -> :viable end)
+
+    # The credential lifecycle's call is NOT refused. Before the fix this returned
+    # {:error, :degraded}, which is the entire deadlock.
+    assert {:ok, pid, generation} =
+             AdapterCoordinator.activate_provider_runtime(coordinator, key,
+               credential_kind: :subscription
+             )
+
+    # A NEW adapter, still alive after the old backoff window -- not the latched
+    # key's survivor handed back, and not a corpse.
+    assert Process.alive?(pid)
+    assert generation > latched_generation(latched)
+    Process.sleep(50)
+    assert Process.alive?(pid)
+
+    # ...and the history of the credential that no longer exists is cleared.
     assert %{"claude:default@testhost" => health} = AdapterCoordinator.health(coordinator)
     assert health.circuit == :closed
     assert health.consecutive_failures == 0
   end
+
+  # A live adapter started for the PREVIOUS credential must not be handed back as
+  # the authoritative result: identical context does not make it current. Without
+  # the authority-first ordering, `live_entry?` won the cond and onboarding
+  # reported success on the credential the operator had just replaced.
+  test "activate_provider_runtime replaces a live adapter even when context matches", ctx do
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         backoff_base_ms: 1,
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn _, _ ->
+           [
+             harness: :claude,
+             cmd: [System.find_executable("sleep"), "60"],
+             home: "/tmp",
+             cwd: "/tmp"
+           ]
+         end,
+         db: ctx.db,
+         name: :"coord_#{System.unique_integer([:positive])}"}
+      )
+
+    key = {:claude, "default", "testhost"}
+
+    assert {:ok, first, _gen} =
+             AdapterCoordinator.activate_provider_runtime(coordinator, key,
+               credential_kind: :subscription
+             )
+
+    assert Process.alive?(first)
+
+    # Same key, same credential KIND -- a subscription refresh. The running
+    # adapter holds the OLD credential and must be replaced regardless.
+    assert {:ok, second, _gen} =
+             AdapterCoordinator.activate_provider_runtime(coordinator, key,
+               credential_kind: :subscription
+             )
+
+    refute second == first
+    assert Process.alive?(second)
+  end
+
+  defp latched_generation(%{generation: generation}), do: generation
 
   test "adapter boot context is captured in the coordinator before lazy adapter opts", ctx do
     owner = self()
@@ -222,7 +294,9 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     first_ref = Process.monitor(first)
 
     assert {:ok, second, 2} =
-             AdapterCoordinator.adapter_for(coordinator, key, credential_kind: :api_key)
+             AdapterCoordinator.activate_provider_runtime(coordinator, key,
+               credential_kind: :api_key
+             )
 
     refute second == first
     assert_receive {:DOWN, ^first_ref, :process, ^first, _reason}

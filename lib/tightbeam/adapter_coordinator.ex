@@ -90,15 +90,26 @@ defmodule Tightbeam.AdapterCoordinator do
   end
 
   @doc """
-  Start or return an adapter using context already captured by the caller.
+  Install a credential's runtime: replace the adapter for `key` and clear the
+  failure history of the credential being replaced.
 
-  Credential lifecycle transitions use this form because the lifecycle owner
-  already knows the kind being installed and cannot synchronously answer a
-  coordinator callback while it is waiting for the start result.
+  THE ONLY CALL THAT OUTRANKS ADAPTER HEALTH, and it is named rather than
+  spelled as an extra argument on purpose (Sol xhigh, important 3). Authority
+  used to ride on `adapter_for/3` — pass a context, get a circuit bypass — so
+  any future caller that happened to supply context would silently acquire the
+  right to override health policy. The credential lifecycle is the only thing
+  entitled to it, and now the only thing that can say it.
+
+  The circuit protects agent connections from a dead harness. It has no
+  authority over credential installation: an operator installing a credential is
+  not asking the coordinator's permission, and a latched key would otherwise
+  veto the only call that can unlatch it (the credential-swap incident,
+  2026-08-14). A park fence is NOT bypassed — that is an explicit lifecycle
+  constraint, not a health verdict.
   """
-  @spec adapter_for(GenServer.server(), adapter_key(), keyword()) :: checkout()
-  def adapter_for(server, key, context) do
-    GenServer.call(server, {:adapter_for, key, context}, 30_000)
+  @spec activate_provider_runtime(GenServer.server(), adapter_key(), keyword()) :: checkout()
+  def activate_provider_runtime(server, key, context) do
+    GenServer.call(server, {:activate_provider_runtime, key, context}, 30_000)
   end
 
   @doc """
@@ -226,7 +237,7 @@ defmodule Tightbeam.AdapterCoordinator do
     end
   end
 
-  def handle_call({:adapter_for, key, context}, _from, state) do
+  def handle_call({:activate_provider_runtime, key, context}, _from, state) do
     adapter_for_reply(key, context, state, true)
   end
 
@@ -303,14 +314,44 @@ defmodule Tightbeam.AdapterCoordinator do
     entry = Map.get(state.adapters, key, fresh_entry())
 
     cond do
-      live_entry?(entry) and authoritative? and entry.context != normalize_context(context) ->
-        case do_close_adapter(key, state) do
-          {:ok, state} ->
-            {reply, state} = start_adapter(key, state.adapters[key], state, context)
-            {:reply, reply, state}
+      # AUTHORITY COMES FIRST — ahead of the live-entry shortcut, deliberately
+      # (Sol xhigh, blocking). This used to replace a live adapter only when the
+      # context DIFFERED, so re-onboarding the same credential KIND — the common
+      # case, and exactly what a subscription refresh is — matched the running
+      # adapter and handed it straight back. A backoff retry that happened to
+      # start an adapter moments before onboarding would then be returned as the
+      # authoritative result, and the ceremony reported success while the runtime
+      # was still on the credential the operator had just replaced. Same lie as
+      # the incident, one layer down.
+      #
+      # A credential installation always gets a NEW adapter. The running one was
+      # started for a credential that no longer exists; identical context does
+      # not make it current.
+      authoritative? ->
+        # `do_close_adapter/2` already advances the generation, so track whether
+        # it ran: an activation must advance it EXACTLY ONCE, and double-bumping
+        # desynchronises every lane's stamped generation.
+        {state, closed?} =
+          if live_entry?(entry) do
+            case do_close_adapter(key, state) do
+              {:ok, state} -> {state, true}
+              {{:error, _reason}, state} -> {state, false}
+            end
+          else
+            {state, false}
+          end
 
-          {{:error, _reason} = error, state} ->
-            {:reply, error, state}
+        entry = Map.get(state.adapters, key, fresh_entry())
+
+        if Tightbeam.HarnessProcess.fenced?(state.db, key) do
+          # A park fence is an explicit lifecycle constraint, not a health
+          # verdict, so credential authority does not implicitly unpark.
+          {:reply, {:error, {:park_fenced, key_name(key)}}, state}
+        else
+          {reply, state} =
+            start_adapter(key, reset_failure_history(entry, closed?), state, context)
+
+          {:reply, reply, state}
         end
 
       live_entry?(entry) ->
@@ -334,10 +375,6 @@ defmodule Tightbeam.AdapterCoordinator do
       # gateway restart. Onboarding fails -> the failure counts normally,
       # because a freshly installed credential that cannot start an adapter is
       # real evidence about THIS credential.
-      authoritative? ->
-        {reply, state} = start_adapter(key, reset_failure_history(entry), state, context)
-        {:reply, reply, state}
-
       entry.circuit == :open ->
         {:reply, {:error, :degraded}, state}
 
@@ -347,11 +384,25 @@ defmodule Tightbeam.AdapterCoordinator do
     end
   end
 
-  # Cancels any pending retry as well: the authoritative attempt happens NOW and
-  # must not race a restart scheduled against the old credential's failures.
-  defp reset_failure_history(entry) do
+  # ADVANCES THE GENERATION, which is what actually invalidates an in-flight
+  # restart (Sol xhigh, important 2). `Process.cancel_timer/1` returning false
+  # means the {:restart_adapter, key, generation} message may already be in the
+  # mailbox, and setting `timer: nil` does not remove it. The restart handler
+  # matches on `%{generation: ^generation, pid: nil}`, so bumping here makes any
+  # queued message for the old generation fall through its catch-all — including
+  # the case where the authoritative start then fails synchronously and would
+  # otherwise leave a second retry lane racing the scheduled backoff.
+  #
+  # Bumping is also semantically right: a credential change IS a new generation,
+  # and lanes holding a stale one perform session/load lazily, exactly as after
+  # any other adapter replacement.
+  defp reset_failure_history(entry, generation_already_advanced?) do
     if is_reference(entry.timer), do: Process.cancel_timer(entry.timer)
-    %{entry | failures: 0, circuit: :closed, timer: nil}
+
+    generation =
+      if generation_already_advanced?, do: entry.generation, else: entry.generation + 1
+
+    %{entry | failures: 0, circuit: :closed, timer: nil, generation: generation}
   end
 
   @impl true

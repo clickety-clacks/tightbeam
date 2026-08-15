@@ -112,7 +112,7 @@ defmodule Tightbeam.GatewayTest do
       {:reply, reply, state}
     end
 
-    def handle_call({:adapter_for, key, _context}, from, state),
+    def handle_call({:activate_provider_runtime, key, _context}, from, state),
       do: handle_call({:adapter_for, key}, from, state)
 
     def handle_call({:acquire_load_slot, _machine, _borrower}, _from, state),

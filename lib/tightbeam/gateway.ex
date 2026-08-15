@@ -4916,7 +4916,7 @@ defmodule Tightbeam.Gateway do
       Enum.reduce(harnesses_for_provider(provider), {[], []}, fn module, {started, failed} ->
         key = {module.id(), "shared", machine}
 
-        case AdapterCoordinator.adapter_for(
+        case AdapterCoordinator.activate_provider_runtime(
                Tightbeam.AdapterCoordinator,
                key,
                credential_kind: kind
