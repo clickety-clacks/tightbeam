@@ -18,6 +18,14 @@ defmodule Tightbeam.Idempotency do
           session_key: String.t()
         }
 
+  @type onboarding_identity :: %{
+          principal: String.t(),
+          ceremony_id: String.t() | nil,
+          phase: String.t(),
+          response_kind: String.t() | nil,
+          idempotency_key: String.t()
+        }
+
   @ddl """
   CREATE TABLE IF NOT EXISTS wire_idempotency (
     ownerUserId    TEXT NOT NULL,
@@ -30,6 +38,56 @@ defmodule Tightbeam.Idempotency do
 
   @spec ensure_schema(db()) :: :ok | {:error, term()}
   def ensure_schema(db \\ Tightbeam.DB), do: DB.execute(db, @ddl)
+
+  @doc """
+  Build the stable identity for one onboarding mutation.
+
+  The function deliberately has no response-value argument. A caller can
+  deduplicate a typed response, but cannot store or hash its secret through
+  this seam.
+  """
+  @spec onboarding_identity(
+          String.t(),
+          String.t() | nil,
+          String.t(),
+          String.t() | nil,
+          String.t()
+        ) ::
+          onboarding_identity()
+  def onboarding_identity(principal, ceremony_id, phase, response_kind, idempotency_key)
+      when is_binary(principal) and byte_size(principal) > 0 and
+             is_binary(idempotency_key) and byte_size(idempotency_key) > 0 do
+    valid? =
+      case {phase, ceremony_id, response_kind} do
+        {"begin", nil, nil} ->
+          true
+
+        {"respond", id, kind} when is_binary(id) and byte_size(id) > 0 ->
+          kind in ["code", "approved"]
+
+        {mutation, id, nil} when mutation in ["restart", "cancel"] ->
+          is_binary(id) and byte_size(id) > 0
+
+        _other ->
+          false
+      end
+
+    if valid? do
+      %{
+        principal: principal,
+        ceremony_id: ceremony_id,
+        phase: phase,
+        response_kind: response_kind,
+        idempotency_key: idempotency_key
+      }
+    else
+      raise ArgumentError, "invalid onboarding idempotency identity"
+    end
+  end
+
+  def onboarding_identity(_principal, _ceremony_id, _phase, _response_kind, _idempotency_key) do
+    raise ArgumentError, "invalid onboarding idempotency identity"
+  end
 
   @doc "Prior result for this (owner, operation, key), or nil."
   @spec get(db(), String.t(), String.t(), String.t()) :: row() | nil

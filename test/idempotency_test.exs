@@ -51,4 +51,57 @@ defmodule Tightbeam.IdempotencyTest do
                session_key: "1"
              })
   end
+
+  test "onboarding mutation identity is stable and structurally excludes response bytes" do
+    identity =
+      Idempotency.onboarding_identity(
+        "user:mike",
+        "oc_1",
+        "respond",
+        "code",
+        "phone-response-1"
+      )
+
+    assert identity ==
+             Idempotency.onboarding_identity(
+               "user:mike",
+               "oc_1",
+               "respond",
+               "code",
+               "phone-response-1"
+             )
+
+    refute identity ==
+             Idempotency.onboarding_identity(
+               "user:mike",
+               "oc_1",
+               "respond",
+               "approved",
+               "phone-response-1"
+             )
+
+    refute inspect(identity) =~ "response-secret-sentinel"
+    refute Map.has_key?(identity, :response)
+    refute Map.has_key?(identity, :response_value)
+
+    assert %{ceremony_id: nil, phase: "begin", response_kind: nil} =
+             Idempotency.onboarding_identity("user:mike", nil, "begin", nil, "begin-1")
+  end
+
+  test "onboarding mutation identity rejects open or contradictory shapes" do
+    invalid = [
+      {"user:mike", nil, "respond", "code", "response-1"},
+      {"user:mike", "oc_1", "respond", "apiKey", "response-1"},
+      {"user:mike", "oc_1", "approved", nil, "response-1"},
+      {"user:mike", "oc_1", "cancel", "code", "cancel-1"},
+      {"", "oc_1", "cancel", nil, "cancel-1"},
+      {"user:mike", "oc_1", "cancel", nil, ""}
+    ]
+
+    Enum.each(invalid, fn args ->
+      assert_raise ArgumentError, ~r/invalid onboarding idempotency identity/, fn ->
+        apply(Idempotency, :onboarding_identity, Tuple.to_list(args))
+      end
+    end)
+  end
 end
