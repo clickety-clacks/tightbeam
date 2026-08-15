@@ -8,6 +8,11 @@ Harness CLIs are the operator's to install; Tight Beam installs its own
 plumbing (adapters, CLI, base dir) and never the vendors' software. Install the
 binary first (`docs/SATELLITE.md`), then onboard it here.
 
+GitHub is a separate host capability, not a model-provider credential. Its
+project-auth contract is specified in `docs/GITHUB-AUTH.md`; the important rule
+is the same operational shape: prove the host can authenticate, or refuse with a
+repair. Do not paste a PAT into an agent.
+
 ## The two kinds
 
 A host holds ONE credential per provider, of either kind, and it is host-local

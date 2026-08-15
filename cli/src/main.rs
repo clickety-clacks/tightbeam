@@ -6,6 +6,7 @@ mod ceremonies;
 mod child_process;
 mod contain;
 mod dispatch;
+mod github_auth;
 mod harness_process;
 mod harnesses;
 mod lease;

@@ -289,6 +289,50 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
     assert check.fix == "Register a host."
   end
 
+  test "github auth is not checked when the project has no github remote", ctx do
+    {0, report} = Doctor.evaluate(ctx.catalog, ctx.inputs)
+
+    refute find(report, "github_auth:github.com")
+  end
+
+  test "github auth passes only when the host probe reports live cli and git auth", ctx do
+    inputs =
+      ctx.inputs
+      |> put(:github_remote_url, "https://github.com/example/project.git")
+      |> put(:github_probe, fn "github.com", "https://github.com/example/project.git" ->
+        {:ok, %{account: "octo", git_protocol: "https"}}
+      end)
+
+    {0, report} = Doctor.evaluate(ctx.catalog, inputs)
+    check = find(report, "github_auth:github.com")
+
+    assert check.ok
+    assert check.detail =~ "GitHub github.com is live for octo via https"
+    refute Doctor.format(report, :human) =~ "PAT"
+  end
+
+  test "github auth failure names onboarding repair and never asks for a PAT", ctx do
+    inputs =
+      ctx.inputs
+      |> put(:github_remote_url, "git@github.com:example/project.git")
+      |> put(:github_probe, fn "github.com", "git@github.com:example/project.git" ->
+        {:error, :needs_onboarding,
+         "not logged in github_pat_secret https://user:ghp_secret@github.com/example/project.git"}
+      end)
+
+    {1, report} = Doctor.evaluate(ctx.catalog, inputs)
+    check = find(report, "github_auth:github.com")
+
+    refute report.ready
+    refute check.ok
+    assert check.detail =~ "needs_onboarding: not logged in"
+    refute check.detail =~ "github_pat_secret"
+    refute check.detail =~ "ghp_secret"
+    assert check.detail =~ "https://[redacted]@github.com/example/project.git"
+    assert check.fix =~ "tightbeam onboard github --hostname github.com"
+    assert check.fix =~ "Do not paste a PAT into an agent."
+  end
+
   # RULED: doctor never creates org state. An org that has not booted has no DB,
   # so the registry is unreadable — a fact for the table, not a failed check and
   # never a reason to conjure the DB into existence.
