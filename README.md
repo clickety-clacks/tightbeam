@@ -136,23 +136,9 @@ added to the machine, and neither Elixir nor Rust is needed to run either one.
 
 ### Cutting a release
 
-Releases are version tags on canonical `main`, not release branches. First set
-the version in `cli/Cargo.toml`, land it on `main`, and wait for the ordinary
-`main` CI run to pass. Then create and push the matching annotated tag:
-
-```sh
-git fetch origin
-git merge --ff-only origin/main
-git tag -a v<version> -m "Tightbeam v<version>"
-git push origin v<version>
-```
-
-The tag must be exactly `v<major>.<minor>.<patch>`, must match the Cargo package
-version, and must point to the current `origin/main` tip. The tag workflow reruns
-the unchanged macOS and Linux test gates, builds both packages from that tagged
-commit, and creates one GitHub Release containing the packages, checksums, and
-provenance record. If any gate or either platform build fails, no GitHub Release
-is created.
+Releases are cut from the `0.1.x` maintenance line through the release-candidate
+procedure in `docs/RELEASE_TRAIN.md` — the sole canonical release procedure. The
+exact commands live only there, so this page cannot drift from them.
 
 ### From source
 

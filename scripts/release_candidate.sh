@@ -58,19 +58,19 @@ git cat-file -e "$base^{commit}" 2>/dev/null || {
   exit 1
 }
 
-remote_main=$(git rev-parse --verify refs/remotes/origin/main 2>/dev/null) || {
-  echo "release candidate: refs/remotes/origin/main is missing; fetch origin/main first." >&2
+remote_maintenance=$(git rev-parse --verify refs/remotes/origin/0.1.x 2>/dev/null) || {
+  echo "release candidate: refs/remotes/origin/0.1.x is missing; fetch origin/0.1.x first." >&2
   exit 1
 }
 
 if [ "$check_only" -eq 0 ]; then
-  [ "$remote_main" = "$base" ] || {
-    echo "release candidate: protected base $base is not the fetched origin/main $remote_main." >&2
+  [ "$remote_maintenance" = "$base" ] || {
+    echo "release candidate: protected base $base is not the fetched origin/0.1.x $remote_maintenance." >&2
     exit 1
   }
 else
-  git merge-base --is-ancestor "$base" "$remote_main" || {
-    echo "release candidate: protected base $base is not an ancestor of origin/main $remote_main." >&2
+  git merge-base --is-ancestor "$base" "$remote_maintenance" || {
+    echo "release candidate: protected base $base is not an ancestor of origin/0.1.x $remote_maintenance." >&2
     exit 1
   }
 fi
