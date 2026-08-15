@@ -12,6 +12,22 @@ defmodule Tightbeam.AdapterCoordinatorTest do
   });
   """
 
+  @gated_fake ~S"""
+  const fs = require("node:fs");
+  const gate = process.argv[2];
+  const rl = require("node:readline").createInterface({ input: process.stdin });
+  const send = (o) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...o }) + "\n");
+  rl.on("line", (line) => {
+    const m = JSON.parse(line);
+    if (m.method !== "initialize") return;
+    const answer = () =>
+      fs.existsSync(gate)
+        ? send({ id: m.id, result: { protocolVersion: 1 } })
+        : setTimeout(answer, 5);
+    answer();
+  });
+  """
+
   setup do
     db = :"coordinator_db_#{System.unique_integer([:positive])}"
     sup = :"adapter_sup_#{System.unique_integer([:positive])}"
@@ -86,7 +102,8 @@ defmodule Tightbeam.AdapterCoordinatorTest do
   # becoming ready, which proves only that a process exists.
   test "activate_provider_runtime bypasses an open circuit and replaces the adapter", ctx do
     viable = Path.join(ctx.test_dir, "viable_harness.js")
-    File.write!(viable, @fake)
+    File.write!(viable, @gated_fake)
+    release = Path.join(ctx.test_dir, "release_boot")
     {:ok, phase} = Agent.start_link(fn -> :failing end)
 
     coordinator =
@@ -99,7 +116,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
            cmd =
              case Agent.get(phase, & &1) do
                :failing -> [System.find_executable("false")]
-               :viable -> [System.find_executable("node"), viable]
+               :viable -> [System.find_executable("node"), viable, release]
              end
 
            [harness: :claude, cmd: cmd, home: ctx.test_dir, cwd: ctx.test_dir]
@@ -140,19 +157,23 @@ defmodule Tightbeam.AdapterCoordinatorTest do
                credential_kind: :subscription
              )
 
-    # THE RESET MUST BE OBSERVABLE BEFORE READINESS (Sol xhigh round 4).
+    # THE RESET MUST BE OBSERVABLE BEFORE READINESS (Sol xhigh rounds 4-5).
     # {:adapter_ready, ...} clears failures and closes the circuit by itself, so
     # asserting only after boot cannot tell "authority reset it before starting"
-    # from "boot completed and cleared it anyway". This reads the projection
-    # while the replacement is still booting.
+    # from "boot completed and cleared it anyway". The replacement is a GATED
+    # fake that will not answer `initialize` until the release file exists, so
+    # this is a barrier rather than a race.
+    refute AdapterCoordinator.ready?(coordinator, key)
     assert %{"claude:default@testhost" => pre_ready} = AdapterCoordinator.health(coordinator)
     assert pre_ready.circuit == :closed
     assert pre_ready.consecutive_failures == 0
     assert pre_ready.generation == latched_generation(latched) + 1
-    refute AdapterCoordinator.ready?(coordinator, key)
 
     # Exactly ONE generation advance for the activation.
     assert generation == latched_generation(latched) + 1
+
+    # Now let boot complete.
+    File.write!(release, "go")
 
     # A NEW adapter -- not the latched key's survivor handed back -- and one that
     # actually BOOTS. Readiness is the honest proof the replacement credential
@@ -278,8 +299,10 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     assert health.circuit == :closed
     assert health.consecutive_failures == 0
 
-    # And once the park genuinely resolves, ordinary traffic is served again
-    # rather than meeting the replaced credential's stale refusal.
+    # And once the park genuinely resolves, an ordinary checkout is ADMITTED
+    # rather than meeting the replaced credential's stale :degraded. (Admitted,
+    # not healthy: this coordinator's command is `false`, so the adapter dies
+    # right after -- the claim here is precisely that the refusal is gone.)
     :ok = Tightbeam.HarnessProcess.complete_park(ctx.db, key)
     refute Tightbeam.HarnessProcess.fenced?(ctx.db, key)
     assert {:ok, _pid, _gen} = AdapterCoordinator.adapter_for(coordinator, key)

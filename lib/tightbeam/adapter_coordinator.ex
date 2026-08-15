@@ -329,11 +329,11 @@ defmodule Tightbeam.AdapterCoordinator do
       # started for a credential that no longer exists; identical context does
       # not make it current.
       authoritative? ->
-        # THE FENCE IS CHECKED BEFORE ANY CLOSE (Sol xhigh round 4, blocking).
-        # `do_close_adapter/2` calls `complete_park/2`, which DELETES the fence
-        # row -- so closing first and checking afterwards silently unparked a key
-        # that another lifecycle operation had fenced, the precise opposite of
-        # the contract this path claims to keep. A fenced key is not touched.
+        # A FENCED KEY IS NEITHER CLOSED NOR STARTED, and its fence is never
+        # removed (Sol xhigh rounds 4-5). Activation uses its own close, which
+        # does not run the park ceremony, so it cannot delete a fence that
+        # arrives concurrently either. Its health IS still updated below —
+        # "not touched" was inaccurate.
         if Tightbeam.HarnessProcess.fenced?(state.db, key) do
           # The replaced credential's health is still cleared: a fence blocks
           # STARTING, it does not make the old credential's failures true again,
@@ -393,10 +393,12 @@ defmodule Tightbeam.AdapterCoordinator do
   # path -- and "exactly one advance per activation" is the invariant every
   # lane's stamped generation depends on.
   defp authoritative_start(key, entry, state, context) do
+    # `advanced?` means the replacement RAN, not that it succeeded:
+    # `cancel_pending_starts/2` advances the generation before anything can
+    # fail, so keying off a result double-advanced (Sol xhigh round 4).
     {state, advanced?} =
       if live_entry?(entry) do
-        {_result, state} = do_close_adapter(key, state)
-        {state, true}
+        {replace_adapter_for_activation(key, state), true}
       else
         {state, false}
       end
@@ -428,6 +430,33 @@ defmodule Tightbeam.AdapterCoordinator do
 
   def handle_cast({:release_load_slot, machine, slot}, state) do
     {:noreply, release_slot(machine, slot, state)}
+  end
+
+  # THE ACTIVATION'S OWN CLOSE — deliberately NOT `do_close_adapter/2`
+  # (Sol xhigh round 5, blocking). That function brackets its work in
+  # `begin_park/2` .. `complete_park/2`, and `complete_park/2` DELETES the
+  # fence row. `begin_park/2` is INSERT OR IGNORE, so it cannot tell a fence it
+  # created from one another lifecycle operation established microseconds
+  # earlier — meaning any close could destroy someone else's park. Checking the
+  # fence first narrows that window but cannot close it, because the fence can
+  # arrive DURING the close.
+  #
+  # A credential installation is not parking a harness; it is replacing an
+  # adapter. So it takes the parts it actually needs — cancel pending starts
+  # (which advances the generation), ask the adapter to close, resolve the
+  # durable launch row — and never touches park state at all. Skipping the
+  # reconcile is not an option: an unresolved launch row is ITSELF a fence, so
+  # a retire without it would leave the key fenced forever.
+  defp replace_adapter_for_activation(key, state) do
+    state = cancel_pending_starts(key, state)
+
+    case state.adapters[key] do
+      %{pid: pid} when is_pid(pid) -> Tightbeam.Acp.Adapter.request_close(pid)
+      _ -> :ok
+    end
+
+    _ = Tightbeam.HarnessProcess.reconcile_key(state.db, key)
+    retire_adapter(key, state)
   end
 
   defp do_close_adapter(key, state) do
