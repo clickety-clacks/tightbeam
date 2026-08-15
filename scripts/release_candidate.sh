@@ -58,19 +58,21 @@ git cat-file -e "$base^{commit}" 2>/dev/null || {
   exit 1
 }
 
-remote_protected=$(git rev-parse --verify refs/remotes/origin/0.1.x 2>/dev/null) || {
-  echo "release candidate: refs/remotes/origin/0.1.x is missing; fetch origin/0.1.x first." >&2
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+protected_ref=$(sh "$script_dir/highest_0_1_branch.sh") || exit 1
+remote_protected=$(git rev-parse --verify "$protected_ref" 2>/dev/null) || {
+  echo "release candidate: $protected_ref is missing." >&2
   exit 1
 }
 
 if [ "$check_only" -eq 0 ]; then
   [ "$remote_protected" = "$base" ] || {
-    echo "release candidate: protected base $base is not the fetched origin/0.1.x $remote_protected." >&2
+    echo "release candidate: protected base $base is not the fetched $protected_ref $remote_protected." >&2
     exit 1
   }
 else
   git merge-base --is-ancestor "$base" "$remote_protected" || {
-    echo "release candidate: protected base $base is not an ancestor of origin/0.1.x $remote_protected." >&2
+    echo "release candidate: protected base $base is not an ancestor of $protected_ref $remote_protected." >&2
     exit 1
   }
 fi
