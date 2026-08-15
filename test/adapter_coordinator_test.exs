@@ -140,19 +140,32 @@ defmodule Tightbeam.AdapterCoordinatorTest do
                credential_kind: :subscription
              )
 
+    # THE RESET MUST BE OBSERVABLE BEFORE READINESS (Sol xhigh round 4).
+    # {:adapter_ready, ...} clears failures and closes the circuit by itself, so
+    # asserting only after boot cannot tell "authority reset it before starting"
+    # from "boot completed and cleared it anyway". This reads the projection
+    # while the replacement is still booting.
+    assert %{"claude:default@testhost" => pre_ready} = AdapterCoordinator.health(coordinator)
+    assert pre_ready.circuit == :closed
+    assert pre_ready.consecutive_failures == 0
+    assert pre_ready.generation == latched_generation(latched) + 1
+    refute AdapterCoordinator.ready?(coordinator, key)
+
+    # Exactly ONE generation advance for the activation.
+    assert generation == latched_generation(latched) + 1
+
     # A NEW adapter -- not the latched key's survivor handed back -- and one that
     # actually BOOTS. Readiness is the honest proof the replacement credential
     # produced a working runtime; a live pid alone is not.
-    assert generation > latched_generation(latched)
     assert wait_until(fn -> AdapterCoordinator.ready?(coordinator, key) end, 2_000)
     assert Process.alive?(pid)
 
-    # ...and the history of the credential that no longer exists is cleared, and
-    # STAYS cleared past the old backoff window rather than transiently.
+    # ...and it STAYS cleared past the old backoff window rather than transiently.
     Process.sleep(50)
     assert %{"claude:default@testhost" => health} = AdapterCoordinator.health(coordinator)
     assert health.circuit == :closed
     assert health.consecutive_failures == 0
+    assert Process.alive?(pid)
   end
 
   # A live adapter started for the PREVIOUS credential must not be handed back as
@@ -202,6 +215,11 @@ defmodule Tightbeam.AdapterCoordinatorTest do
 
     refute second == first
     refute Process.alive?(first)
+
+    # The replacement must reach READY as well (Sol xhigh round 4): a faulty one
+    # could spawn, kill the first, and then fail lazy boot just after an
+    # alive? check.
+    assert wait_until(fn -> AdapterCoordinator.ready?(coordinator, key) end, 2_000)
     assert Process.alive?(second)
   end
 
@@ -240,6 +258,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
            )
 
     {:ok, _} = Tightbeam.HarnessProcess.begin_park(ctx.db, key)
+    assert Tightbeam.HarnessProcess.fenced?(ctx.db, key)
 
     # Authority does NOT unpark -- the fence is a lifecycle constraint.
     assert {:error, {:park_fenced, _}} =
@@ -247,11 +266,23 @@ defmodule Tightbeam.AdapterCoordinatorTest do
                credential_kind: :subscription
              )
 
+    # THE FENCE SURVIVES the activation (Sol xhigh round 4, blocking). Closing
+    # the adapter before checking called complete_park/2, which DELETES the fence
+    # row, so an activation silently unparked a key another lifecycle operation
+    # had fenced.
+    assert Tightbeam.HarnessProcess.fenced?(ctx.db, key)
+
     # ...but the replaced credential's verdict is gone, so an unpark does not
     # walk straight back into the deadlock.
     assert %{"claude:default@testhost" => health} = AdapterCoordinator.health(coordinator)
     assert health.circuit == :closed
     assert health.consecutive_failures == 0
+
+    # And once the park genuinely resolves, ordinary traffic is served again
+    # rather than meeting the replaced credential's stale refusal.
+    :ok = Tightbeam.HarnessProcess.complete_park(ctx.db, key)
+    refute Tightbeam.HarnessProcess.fenced?(ctx.db, key)
+    assert {:ok, _pid, _gen} = AdapterCoordinator.adapter_for(coordinator, key)
   end
 
   defp latched_generation(%{generation: generation}), do: generation

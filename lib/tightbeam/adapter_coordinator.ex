@@ -329,44 +329,19 @@ defmodule Tightbeam.AdapterCoordinator do
       # started for a credential that no longer exists; identical context does
       # not make it current.
       authoritative? ->
-        # `do_close_adapter/2` already advances the generation, so track whether
-        # it ran: an activation must advance it EXACTLY ONCE, and double-bumping
-        # desynchronises every lane's stamped generation.
-        {state, closed?} =
-          if live_entry?(entry) do
-            case do_close_adapter(key, state) do
-              {:ok, state} -> {state, true}
-              {{:error, _reason}, state} -> {state, false}
-            end
-          else
-            {state, false}
-          end
-
-        # The reset happens BEFORE the fence check and is PERSISTED either way
-        # (Sol xhigh round 3). A fence blocks STARTING; it does not make the old
-        # credential's failures true again. Returning :park_fenced with the entry
-        # untouched left the replaced credential's open circuit intact, so the
-        # first ordinary checkout after an unpark was refused :degraded — the
-        # recovery deadlock, rebuilt on the other side of the fence.
-        #
-        # Clearing here is honest regardless of the fence: those failures are
-        # facts about a credential that no longer exists. This also keeps the
-        # generation advancing exactly once on EVERY authoritative branch,
-        # fenced included.
-        entry =
-          state.adapters
-          |> Map.get(key, fresh_entry())
-          |> reset_failure_history(closed?)
-
-        state = put_in(state.adapters[key], entry)
-
+        # THE FENCE IS CHECKED BEFORE ANY CLOSE (Sol xhigh round 4, blocking).
+        # `do_close_adapter/2` calls `complete_park/2`, which DELETES the fence
+        # row -- so closing first and checking afterwards silently unparked a key
+        # that another lifecycle operation had fenced, the precise opposite of
+        # the contract this path claims to keep. A fenced key is not touched.
         if Tightbeam.HarnessProcess.fenced?(state.db, key) do
-          # A park fence is an explicit lifecycle constraint, not a health
-          # verdict, so credential authority does not implicitly unpark.
-          {:reply, {:error, {:park_fenced, key_name(key)}}, state}
+          # The replaced credential's health is still cleared: a fence blocks
+          # STARTING, it does not make the old credential's failures true again,
+          # and leaving them rebuilds the deadlock past the unpark (round 3).
+          entry = reset_failure_history(entry, false)
+          {:reply, {:error, {:park_fenced, key_name(key)}}, put_in(state.adapters[key], entry)}
         else
-          {reply, state} = start_adapter(key, entry, state, context)
-          {:reply, reply, state}
+          authoritative_start(key, entry, state, context)
         end
 
       live_entry?(entry) ->
@@ -411,6 +386,31 @@ defmodule Tightbeam.AdapterCoordinator do
   # Bumping is also semantically right: a credential change IS a new generation,
   # and lanes holding a stale one perform session/load lazily, exactly as after
   # any other adapter replacement.
+  # `advanced?` means "do_close_adapter/2 RAN", not "it succeeded" (Sol xhigh
+  # round 4). That function calls `cancel_pending_starts/2`, which advances the
+  # generation BEFORE reconciliation, so it advances even when the durable kill
+  # then fails. Keying the reset off the RESULT therefore advanced twice on that
+  # path -- and "exactly one advance per activation" is the invariant every
+  # lane's stamped generation depends on.
+  defp authoritative_start(key, entry, state, context) do
+    {state, advanced?} =
+      if live_entry?(entry) do
+        {_result, state} = do_close_adapter(key, state)
+        {state, true}
+      else
+        {state, false}
+      end
+
+    entry =
+      state.adapters
+      |> Map.get(key, fresh_entry())
+      |> reset_failure_history(advanced?)
+
+    state = put_in(state.adapters[key], entry)
+    {reply, state} = start_adapter(key, entry, state, context)
+    {:reply, reply, state}
+  end
+
   defp reset_failure_history(entry, generation_already_advanced?) do
     if is_reference(entry.timer), do: Process.cancel_timer(entry.timer)
 
