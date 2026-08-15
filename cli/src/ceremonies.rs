@@ -105,6 +105,28 @@ where
     S: Fn(&Endpoint, &RequestSpec, Option<Instant>) -> Result<Option<serde_json::Value>, String>,
     H: Fn(&Endpoint, Instant) -> Result<Option<HarnessCatalog>, String>,
 {
+    legacy_onboard(
+        identity,
+        provider,
+        api_key,
+        endpoint,
+        send_request,
+        load_harnesses,
+    )
+}
+
+fn legacy_onboard<S, H>(
+    identity: &Identity,
+    provider: &str,
+    api_key: bool,
+    endpoint: &Endpoint,
+    send_request: S,
+    load_harnesses: H,
+) -> Result<(), String>
+where
+    S: Fn(&Endpoint, &RequestSpec, Option<Instant>) -> Result<Option<serde_json::Value>, String>,
+    H: Fn(&Endpoint, Instant) -> Result<Option<HarnessCatalog>, String>,
+{
     let kind = if api_key { "apiKey" } else { "subscription" };
     let machine = onboard_machine(
         std::env::var("TIGHTBEAM_MACHINE")
