@@ -119,6 +119,18 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
              command("sh", [@branch_resolver], cd: fixture.repo)
   end
 
+  test "highest maintenance branch refuses when no numeric 0.1 branch exists" do
+    fixture = git_fixture!()
+    git!(fixture.repo, ["update-ref", "-d", "refs/remotes/origin/0.1.9"])
+
+    {output, status} = command("sh", [@branch_resolver], cd: fixture.repo)
+
+    assert status != 0
+
+    assert output ==
+             "maintenance branch: no remote-tracking branch matches origin/0.1.<number>.\n"
+  end
+
   test "preparation refuses a protected base after origin/0.1.9 advances" do
     fixture = git_fixture!()
     git!(fixture.repo, ["push", "origin", "#{fixture.f1}:refs/heads/0.1.9"])
