@@ -181,6 +181,20 @@ defmodule Tightbeam.Harness.Fixture do
              max_input_tokens: 1_024,
              capabilities: %{},
              provider: credential_provider()
+           },
+           # A SECOND, TIERED entry, additive on purpose: fixture-model's
+           # empty effort list is pinned behavior (the must-not-name-a-tier
+           # refusal), and the effort-relative tune paths need a model that
+           # CAN take one. Tests that race set_reasoning use this family.
+           %{
+             family: "fixture-tiered",
+             context: nil,
+             display_name: "Fixture Tiered",
+             name: "Fixture Tiered",
+             efforts: ["low", "medium", "high"],
+             max_input_tokens: 1_024,
+             capabilities: %{},
+             provider: credential_provider()
            }
          ]}
 
@@ -202,6 +216,17 @@ defmodule Tightbeam.Harness.Fixture do
       display_name: "Fixture Model",
       name: "Fixture Model",
       efforts: [],
+      max_input_tokens: 1_024,
+      capabilities: %{},
+      provider: credential_provider()
+    }
+
+    tiered_entry = %{
+      family: "fixture-tiered",
+      context: nil,
+      display_name: "Fixture Tiered",
+      name: "Fixture Tiered",
+      efforts: ["low", "medium", "high"],
       max_input_tokens: 1_024,
       capabilities: %{},
       provider: credential_provider()
@@ -261,9 +286,9 @@ defmodule Tightbeam.Harness.Fixture do
         %{case: "negative", envelope: %{"unrelated" => true}, expected: :skip}
       ],
       catalog_expected: %{
-        "valid" => {:ok, [valid_entry]},
+        "valid" => {:ok, [valid_entry, tiered_entry]},
         # No vendor, so no per-kind route: the fixture answers identically.
-        "valid_api_key" => {:ok, [valid_entry]},
+        "valid_api_key" => {:ok, [valid_entry, tiered_entry]},
         "malformed" => {:error, :malformed_catalog},
         "unavailable" => {:error, :fixture_unavailable}
       },

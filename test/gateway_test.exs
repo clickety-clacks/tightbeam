@@ -2307,6 +2307,56 @@ defmodule Tightbeam.GatewayTest do
     assert markers == []
   end
 
+  test "a model change landing after an effort-only election refuses it as stale_election",
+       ctx do
+    handlers = stale_election_arena!(ctx, "stale-effort")
+
+    Org.create(ctx.db, %{
+      session_key: "stale-effort",
+      display_name: "Stale effort",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "fixture",
+      provider: "fixture_provider",
+      model: Model.new("fixture-tiered", effort: "medium")
+    })
+
+    start_lane!(ctx.db, "stale-effort")
+
+    result =
+      handlers["tune"].(%{
+        origin: "user:flynn",
+        session_key: "stale-effort",
+        on_tune_elected: fn ->
+          # set_reasoning DERIVED its target from the snapshot's model — a
+          # RELATIVE election. A concurrent model change makes that derivation
+          # stale: committing it would silently revert the model family the
+          # other request just elected (Sol round 4, blocking).
+          {:ok, _} =
+            DB.transaction(ctx.db, fn txn ->
+              DB.Txn.q(txn, "UPDATE sessions SET model='other-family' WHERE sessionKey=?1", [
+                "stale-effort"
+              ])
+            end)
+        end,
+        params: %{setting: "set_reasoning", reasoningLevel: "high"}
+      })
+
+    assert %{ok: false, code: "stale_election"} = result
+
+    # The concurrent election stands; the stale derivation minted nothing.
+    fresh = Org.get(ctx.db, "stale-effort")
+    assert fresh.model.family == "other-family"
+
+    markers =
+      Projection.list_after(ctx.db, "stale-effort", nil, 50, 0)
+      |> Enum.filter(&String.contains?(&1.content || "", "[model retune]"))
+
+    assert markers == []
+  end
+
   test "the loser of two racing swap elections is refused IN the transaction",
        ctx do
     handlers = stale_election_arena!(ctx, "swap-loser")

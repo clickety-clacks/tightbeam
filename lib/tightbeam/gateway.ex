@@ -4229,8 +4229,13 @@ defmodule Tightbeam.Gateway do
             }
 
           {:ok, session} ->
+            # A RELATIVE election: new_ref is DERIVED from the snapshot's
+            # model, so the snapshot model is part of the election and must
+            # still hold at commit (Sol round 4, blocking). set_model is
+            # absolute -- the caller named their target -- so it passes no
+            # basis and tolerates concurrent effort tweaks.
             new_ref = %{session.model | effort: p.reasoningLevel}
-            apply_model_change(config, db, call, session, new_ref)
+            apply_model_change(config, db, call, session, new_ref, session.model)
         end
 
       true ->
@@ -4876,7 +4881,7 @@ defmodule Tightbeam.Gateway do
   # wedge a reload that waits on the lane while the lane's bounce waits on the mutation
   # lock (see repoint_main_session, the same shape). `ensure_lane_quiet` first so
   # :no_lane can only mean the lane died in the gap, which we treat as busy: retry.
-  defp apply_model_change(config, db, call, session, new_ref) do
+  defp apply_model_change(config, db, call, session, new_ref, basis \\ nil) do
     with {:ok, routed} <- validate_catalog_model(session.host, session.harness, new_ref, false) do
       # Probe seam, same contract and same placement rule as the harness
       # path's `on_tune_elected`: election decided, boundary not yet taken.
@@ -4888,7 +4893,7 @@ defmodule Tightbeam.Gateway do
       boundary =
         at_tune_boundary(config, db, session.session_key, fn ->
           run_session_mutation(session.session_key, fn ->
-            apply_tuned_model(config, db, call, session, new_ref, routed.provider)
+            apply_tuned_model(config, db, call, session, new_ref, routed.provider, basis)
           end)
         end)
 
@@ -4926,7 +4931,7 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp apply_tuned_model(config, db, _call, session, new_ref, provider) do
+  defp apply_tuned_model(config, db, _call, session, new_ref, provider, basis) do
     case Org.current_pointer(db, session.session_key) do
       # No pointer: nothing is resident, so there is no runtime to move — only
       # the record to correct. It still earns its marker, on the same rule as
@@ -4944,7 +4949,8 @@ defmodule Tightbeam.Gateway do
               read_recorded_model(txn, session.session_key)
 
             cond do
-              record_harness != session.harness or record_host != session.host ->
+              record_harness != session.harness or record_host != session.host or
+                  stale_basis?(basis, record_model) ->
                 :stale_election
 
               record_model == new_ref ->
@@ -5030,7 +5036,8 @@ defmodule Tightbeam.Gateway do
                     pointer.harness_session_id,
                     switched_sid,
                     new_ref,
-                    provider
+                    provider,
+                    basis
                   )
                 end
               end)
@@ -5061,7 +5068,8 @@ defmodule Tightbeam.Gateway do
                     pointer.harness_session_id,
                     pointer.harness_session_id,
                     new_ref,
-                    provider
+                    provider,
+                    basis
                   )
                 end
               end)
@@ -5079,6 +5087,18 @@ defmodule Tightbeam.Gateway do
   # The recorded selection, read back inside the serialized mutation. The row
   # holds FIELDS, so this is where they become an identity again — never a
   # packed column read straight into a comparison.
+  # A RELATIVE election (set_reasoning derives its target from the snapshot's
+  # model) carries that model as its BASIS: if the recorded family or context
+  # no longer matches it at commit, the derivation is stale and committing it
+  # would silently revert a concurrent set_model (Sol round 4, blocking).
+  # Effort is excluded on purpose -- concurrent effort-only changes are
+  # last-writer-wins, and comparing it would refuse legitimate races.
+  defp stale_basis?(nil, _record_model), do: false
+  defp stale_basis?(_basis, nil), do: true
+
+  defp stale_basis?(%Model{} = basis, %Model{} = record),
+    do: basis.family != record.family or basis.context != record.context
+
   defp read_recorded_model(txn, session_key) do
     [[family, effort, context, harness, host]] =
       Txn.q(
@@ -5100,7 +5120,8 @@ defmodule Tightbeam.Gateway do
          prior_sid,
          switched_sid,
          new_ref,
-         provider
+         provider,
+         basis
        ) do
     result =
       DB.transaction(db, fn txn ->
@@ -5118,7 +5139,8 @@ defmodule Tightbeam.Gateway do
         # never a substitute target: a stale election is refused by name, and
         # the caller re-elects against the session as it now is.
         outcome =
-          if record_harness != session.harness or record_host != session.host do
+          if record_harness != session.harness or record_host != session.host or
+               stale_basis?(basis, record_model) do
             :stale_election
           else
             project_tuned_swap(txn, session, record_model, record_harness, new_ref, provider)
