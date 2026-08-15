@@ -1892,7 +1892,29 @@ defmodule Tightbeam.Supervision do
         do: current.attemptCount,
         else: current.attemptCount + 1
 
-    {branch, k} = branch_for_claim(txn, assignment.holderKey, current.prodCount, n)
+    # THE LADDER ADVANCES ON HEARD PRODS, NOT SENT ONES (Mike's design,
+    # 2026-08-15, after the correlated-outage postmortem). `current.prodCount`
+    # counts every prod CLAIMED — including prods whose wake-turn failed
+    # because the harness was down. During the 2026-08-10 outage that meant
+    # ladders exhausted into a dead tree: every rung's wake became a failed
+    # turn, the count climbed anyway, 127 strands stalled in one day, and
+    # nothing re-armed them when the harness recovered.
+    #
+    # A failed prod turn is evidence about the TRANSPORT, not the holder. The
+    # ladder measures unaccountability, so only prods that were actually
+    # DELIVERED — heard, and then ignored — may advance it. The stored
+    # counters keep counting every attempt (they pace the backoff and are
+    # facts worth reporting); the RUNG decision reads delivery. An outage now
+    # freezes the ladder instead of burning it: the sweep keeps retrying at
+    # backoff pace, and the first delivered prod after recovery resumes the
+    # climb exactly where the evidence left it.
+    {branch, k} =
+      branch_for_claim(
+        txn,
+        assignment.holderKey,
+        heard_prod_count(txn, assignment.id),
+        n
+      )
 
     stalled_at =
       if branch in ["escalation", "terminus"],
@@ -1996,6 +2018,55 @@ defmodule Tightbeam.Supervision do
       [] ->
         zero_state(assignment_id)
     end
+  end
+
+  # Prods and escalations this assignment's holder actually RECEIVED — within
+  # the CURRENT ladder epoch. Two boundaries compose here:
+  #
+  # TRANSPORT: a wake was heard unless its turn failed or was canceled — a
+  # failed turn is evidence about the harness, not the holder. A delivered
+  # prod was heard and ignored; an admitted escalation's turn (queued to the
+  # parent) is the durable transfer itself, parked rather than lost; the
+  # legacy retirement path marks its evidence on the sidecar directly. A wake
+  # with NO turn at all was never attempted and proves nothing.
+  #
+  # EPOCH: a typed liveness receipt is the holder's NAMED REPAIR VERB — it
+  # resets the ladder, and evidence from before it must never resurrect a
+  # rung (Sol review, blocking: a lifetime count re-escalated an accountable
+  # holder immediately after their receipt, overriding the repair seam the
+  # philosophy gates require). The receipt records the generation it re-armed;
+  # prods charged at or after it are this epoch's, everything earlier is
+  # history. Before any receipt exists, ALL evidence counts — including legacy
+  # retirement rows whose chargedGeneration is NULL (a NULL would silently
+  # fail a >= comparison, un-hearing a durable parent transfer; Sol
+  # confirmation round). Once a receipt boundary exists, NULL-generation rows
+  # fall out of the epoch — conservative, and honest: a repaired ladder
+  # restarts at prod 1.
+  defp heard_prod_count(txn, assignment_id) do
+    [[count]] =
+      Txn.q(
+        txn,
+        """
+        SELECT COUNT(*)
+        FROM supervision_liveness_sidecar s
+        LEFT JOIN turns t ON t.wakeId = s.wakeId
+        WHERE s.assignmentId = ?1
+          AND s.wakeKind IN ('prod', 'escalation')
+          AND (s.chargedGeneration >=
+                 (SELECT MAX(generation)
+                  FROM supervision_liveness_receipts
+                  WHERE assignmentId = ?1)
+                 OR NOT EXISTS (SELECT 1
+                                FROM supervision_liveness_receipts
+                                WHERE assignmentId = ?1))
+          AND ((t.wakeId IS NOT NULL AND
+                t.status NOT IN ('failed', 'failed_unknown', 'canceled'))
+               OR s.transferEvidenceId IS NOT NULL)
+        """,
+        [assignment_id]
+      )
+
+    count
   end
 
   defp branch_for_claim(txn, holder, prod_count, n) do
