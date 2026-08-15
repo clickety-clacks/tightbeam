@@ -4,4 +4,5 @@ cli/src/ceremonies.rs
 cli/src/dispatch.rs
 lib/tightbeam/credentials.ex
 lib/tightbeam/gateway.ex
+lib/tightbeam/onboarding_worker.ex
 lib/tightbeam/org.ex
