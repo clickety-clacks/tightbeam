@@ -54,6 +54,25 @@ defmodule Tightbeam.ModelCatalogTest do
     }
   end
 
+  test "catalog caller census pins the effective-health Credentials.status/2 seam" do
+    source = File.read!(Path.expand("../lib/tightbeam/model_catalog.ex", __DIR__))
+    {:ok, ast} = Code.string_to_quoted(source)
+
+    {_ast, calls} =
+      Macro.prewalk(ast, [], fn
+        {{:., _, [{:__aliases__, _, [:Tightbeam, :Credentials]}, function]}, _, args} = node,
+        calls
+        when is_list(args) ->
+          {node, [{function, length(args)} | calls]}
+
+        node, calls ->
+          {node, calls}
+      end)
+
+    assert Enum.count(calls, &(&1 == {:status, 2})) == 1
+    refute Enum.any?(calls, fn {function, _arity} -> function == :status_with_ceremony end)
+  end
+
   test "derives consumed Claude and Codex fields from provider captures", ctx do
     catalog = start_catalog(ctx)
     await_fresh(catalog, "claude")

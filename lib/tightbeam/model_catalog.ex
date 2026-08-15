@@ -541,6 +541,9 @@ defmodule Tightbeam.ModelCatalog do
 
     case GenServer.whereis(server) do
       nil -> {:needs_onboarding, :credential_server_unavailable}
+      # Compatibility boundary: catalog executability consumes effective grant
+      # health only. Ceremony state has a separate additive API and must not
+      # change this return shape.
       _pid -> Tightbeam.Credentials.status(provider, server)
     end
   end
