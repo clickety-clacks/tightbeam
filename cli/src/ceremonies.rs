@@ -422,14 +422,22 @@ where
     S: Fn(&Endpoint, &RequestSpec, Option<Instant>) -> Result<Option<serde_json::Value>, String>,
     H: Fn(&Endpoint, Instant) -> Result<Option<HarnessCatalog>, String>,
 {
-    legacy_onboard(
-        identity,
-        provider,
-        api_key,
-        endpoint,
-        send_request,
-        load_harnesses,
-    )
+    if api_key {
+        // Owner ruling att_ab29bd8b: the API-key ceremony stays on its
+        // existing stdin-to-local-client path until a successor defines the
+        // credential-owner IPC seam. No v2 request ever carries key bytes.
+        legacy_onboard(
+            identity,
+            provider,
+            true,
+            endpoint,
+            send_request,
+            load_harnesses,
+        )
+    } else {
+        drop(load_harnesses);
+        durable_subscription_onboard(identity, provider, endpoint, &send_request)
+    }
 }
 
 fn legacy_onboard<S, H>(
@@ -587,6 +595,514 @@ where
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DurableCeremonyState {
+    Preparing,
+    AwaitingUser,
+    Validating,
+    ReadyToCommit,
+    Committing,
+    RecoveryRequired,
+    Succeeded,
+    Canceled,
+    Expired,
+    Superseded,
+    Failed,
+}
+
+impl DurableCeremonyState {
+    fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "preparing" => Self::Preparing,
+            "awaitingUser" => Self::AwaitingUser,
+            "validating" => Self::Validating,
+            "readyToCommit" => Self::ReadyToCommit,
+            "committing" => Self::Committing,
+            "recoveryRequired" => Self::RecoveryRequired,
+            "succeeded" => Self::Succeeded,
+            "canceled" => Self::Canceled,
+            "expired" => Self::Expired,
+            "superseded" => Self::Superseded,
+            "failed" => Self::Failed,
+            _ => return None,
+        })
+    }
+
+    fn terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Succeeded | Self::Canceled | Self::Expired | Self::Superseded | Self::Failed
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DurableCredentialKind {
+    Subscription,
+    ApiKey,
+}
+
+impl DurableCredentialKind {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "subscription" => Some(Self::Subscription),
+            "apiKey" => Some(Self::ApiKey),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DurableNextAction {
+    WaitForChallenge,
+    OpenUrlThenSubmitCode,
+    OpenUrlThenConfirmApproval,
+    SupplyApiKeyThroughStdin,
+    WaitForValidation,
+    WaitForTurnBoundary,
+    WaitForCommit,
+    RestartOrCancel,
+    OperatorRepair,
+    None,
+}
+
+impl DurableNextAction {
+    fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "waitForChallenge" => Self::WaitForChallenge,
+            "openUrlThenSubmitCode" => Self::OpenUrlThenSubmitCode,
+            "openUrlThenConfirmApproval" => Self::OpenUrlThenConfirmApproval,
+            "supplyApiKeyThroughStdin" => Self::SupplyApiKeyThroughStdin,
+            "waitForValidation" => Self::WaitForValidation,
+            "waitForTurnBoundary" => Self::WaitForTurnBoundary,
+            "waitForCommit" => Self::WaitForCommit,
+            "restartOrCancel" => Self::RestartOrCancel,
+            "operatorRepair" => Self::OperatorRepair,
+            "none" => Self::None,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Clone, PartialEq)]
+struct DurableCeremonyView {
+    raw: serde_json::Value,
+    ceremony_id: String,
+    provider: String,
+    credential_kind: DurableCredentialKind,
+    state: DurableCeremonyState,
+    next_action: DurableNextAction,
+    expires_at: i64,
+    authorization_url: Option<String>,
+    display_code: Option<String>,
+}
+
+impl std::fmt::Debug for DurableCeremonyView {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DurableCeremonyView")
+            .field("ceremony_id", &self.ceremony_id)
+            .field("provider", &self.provider)
+            .field("credential_kind", &self.credential_kind)
+            .field("state", &self.state)
+            .field("next_action", &self.next_action)
+            .field("expires_at", &self.expires_at)
+            .field(
+                "authorization_url",
+                &self.authorization_url.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "display_code",
+                &self.display_code.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+fn durable_subscription_onboard<S>(
+    identity: &Identity,
+    provider: &str,
+    endpoint: &Endpoint,
+    send_request: &S,
+) -> Result<(), String>
+where
+    S: Fn(&Endpoint, &RequestSpec, Option<Instant>) -> Result<Option<serde_json::Value>, String>,
+{
+    let capability = dispatch::build_onboarding_capability_request(identity);
+    require_onboarding_protocol(send_request(endpoint, &capability, None)?)?;
+
+    let machine = onboard_machine(
+        std::env::var("TIGHTBEAM_MACHINE")
+            .ok()
+            .filter(|name| !name.is_empty()),
+        dispatch::provisioned(),
+    )?;
+    let begin = dispatch::build_onboarding_v2_request(
+        identity,
+        &dispatch::OnboardingRequest::Begin {
+            provider: provider.to_owned(),
+            machine,
+            kind: dispatch::OnboardingCredentialKind::Subscription,
+            idempotency_key: durable_onboarding_key("begin"),
+        },
+    );
+    let mut view = parse_durable_view(send_request(endpoint, &begin, None)?)?;
+    if view.provider != provider || view.credential_kind != DurableCredentialKind::Subscription {
+        return Err("gateway returned an onboarding view for a different scope".to_owned());
+    }
+    let ceremony_id = view.ceremony_id.clone();
+    let mut checked_after_expiry = false;
+
+    loop {
+        if view.state == DurableCeremonyState::RecoveryRequired
+            || view.next_action == DurableNextAction::RestartOrCancel
+            || view.next_action == DurableNextAction::OperatorRepair
+        {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&view.raw).expect("JSON value serializes")
+            );
+            return Err("onboarding ceremony requires an explicit product action".to_owned());
+        }
+
+        if view.state.terminal() {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&view.raw).expect("JSON value serializes")
+            );
+            return if view.state == DurableCeremonyState::Succeeded {
+                Ok(())
+            } else {
+                Err("onboarding ceremony ended without installing a credential".to_owned())
+            };
+        }
+
+        if epoch_ms() >= view.expires_at {
+            if checked_after_expiry {
+                return Err(
+                    "gateway did not publish a terminal state after ceremony expiry".to_owned(),
+                );
+            }
+            checked_after_expiry = true;
+            view = read_durable_status(
+                identity,
+                &view,
+                endpoint,
+                send_request,
+                Instant::now() + DURABLE_FINAL_STATUS_TIMEOUT,
+            )?;
+            require_same_durable_ceremony(&view, &ceremony_id, provider)?;
+            continue;
+        }
+
+        let request = match view.next_action {
+            DurableNextAction::OpenUrlThenSubmitCode => {
+                let code = read_browser_code(&view)?;
+                Some(dispatch::OnboardingRequest::Respond {
+                    ceremony_id: view.ceremony_id.clone(),
+                    response: dispatch::OnboardingResponse::Code(code),
+                    idempotency_key: durable_onboarding_key("respond"),
+                })
+            }
+            DurableNextAction::OpenUrlThenConfirmApproval => {
+                confirm_browser_approval(&view)?;
+                Some(dispatch::OnboardingRequest::Respond {
+                    ceremony_id: view.ceremony_id.clone(),
+                    response: dispatch::OnboardingResponse::Approved,
+                    idempotency_key: durable_onboarding_key("respond"),
+                })
+            }
+            DurableNextAction::SupplyApiKeyThroughStdin => {
+                return Err(
+                    "the v2 API-key transport is not available; use the unchanged --api-key path"
+                        .to_owned(),
+                );
+            }
+            DurableNextAction::WaitForChallenge
+            | DurableNextAction::WaitForValidation
+            | DurableNextAction::WaitForTurnBoundary
+            | DurableNextAction::WaitForCommit => None,
+            DurableNextAction::RestartOrCancel
+            | DurableNextAction::OperatorRepair
+            | DurableNextAction::None => {
+                return Err("gateway returned an inconsistent onboarding view".to_owned());
+            }
+        };
+
+        if let Some(request) = request {
+            let Some(deadline) = active_durable_deadline(view.expires_at) else {
+                continue;
+            };
+            let request = dispatch::build_onboarding_v2_request(identity, &request);
+            view = parse_durable_view(send_request(endpoint, &request, Some(deadline))?)?;
+            require_same_durable_ceremony(&view, &ceremony_id, provider)?;
+            continue;
+        }
+
+        thread::sleep(onboarding_poll_interval());
+        let Some(deadline) = active_durable_deadline(view.expires_at) else {
+            continue;
+        };
+        view = read_durable_status(identity, &view, endpoint, send_request, deadline)?;
+        require_same_durable_ceremony(&view, &ceremony_id, provider)?;
+    }
+}
+
+const DURABLE_FINAL_STATUS_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn active_durable_deadline(expires_at: i64) -> Option<Instant> {
+    let remaining_ms = expires_at.checked_sub(epoch_ms())?;
+    let remaining_ms = u64::try_from(remaining_ms)
+        .ok()
+        .filter(|value| *value > 0)?;
+    Instant::now().checked_add(Duration::from_millis(remaining_ms))
+}
+
+fn read_durable_status<S>(
+    identity: &Identity,
+    view: &DurableCeremonyView,
+    endpoint: &Endpoint,
+    send_request: &S,
+    deadline: Instant,
+) -> Result<DurableCeremonyView, String>
+where
+    S: Fn(&Endpoint, &RequestSpec, Option<Instant>) -> Result<Option<serde_json::Value>, String>,
+{
+    let status = dispatch::build_onboarding_v2_request(
+        identity,
+        &dispatch::OnboardingRequest::Status {
+            ceremony_id: view.ceremony_id.clone(),
+        },
+    );
+    parse_durable_view(send_request(endpoint, &status, Some(deadline))?)
+}
+
+fn require_same_durable_ceremony(
+    view: &DurableCeremonyView,
+    ceremony_id: &str,
+    provider: &str,
+) -> Result<(), String> {
+    if view.ceremony_id == ceremony_id
+        && view.provider == provider
+        && view.credential_kind == DurableCredentialKind::Subscription
+    {
+        Ok(())
+    } else {
+        Err("gateway returned an onboarding view for a different scope".to_owned())
+    }
+}
+
+fn require_onboarding_protocol(reply: Option<serde_json::Value>) -> Result<(), String> {
+    let compatible = reply
+        .as_ref()
+        .and_then(|result| result.get("onboardingProtocolVersion"))
+        .and_then(serde_json::Value::as_u64)
+        == Some(dispatch::ONBOARDING_PROTOCOL_VERSION);
+    if compatible {
+        Ok(())
+    } else {
+        Err(
+            "client_upgrade_required: gateway does not advertise onboarding protocol version 2"
+                .to_owned(),
+        )
+    }
+}
+
+fn parse_durable_view(reply: Option<serde_json::Value>) -> Result<DurableCeremonyView, String> {
+    let raw = reply.ok_or_else(|| "gateway returned no onboarding view".to_owned())?;
+    let string = |name: &str| {
+        raw.get(name)
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| "gateway returned an invalid onboarding view".to_owned())
+    };
+    let nullable_string = |name: &str| match raw.get(name) {
+        Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(value)) if !value.is_empty() => Ok(Some(value.to_owned())),
+        _ => Err("gateway returned an invalid onboarding view".to_owned()),
+    };
+    let ceremony_id = string("ceremonyId")?;
+    let provider = string("provider")?;
+    if !matches!(provider.as_str(), "anthropic" | "openai") {
+        return Err("gateway returned an invalid onboarding view".to_owned());
+    }
+    let _host = string("host")?;
+    let credential_kind = DurableCredentialKind::parse(&string("credentialKind")?)
+        .ok_or_else(|| "gateway returned an invalid onboarding view".to_owned())?;
+    let _principal_user_id = string("principalUserId")?;
+    let state = DurableCeremonyState::parse(&string("state")?)
+        .ok_or_else(|| "gateway returned an invalid onboarding view".to_owned())?;
+    let next_action = DurableNextAction::parse(&string("nextAction")?)
+        .ok_or_else(|| "gateway returned an invalid onboarding view".to_owned())?;
+    let started_at = raw
+        .get("startedAt")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| "gateway returned an invalid onboarding view".to_owned())?;
+    let expires_at = raw
+        .get("expiresAt")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| "gateway returned an invalid onboarding view".to_owned())?;
+    if expires_at <= started_at {
+        return Err("gateway returned an invalid onboarding view".to_owned());
+    }
+    let cleanup_state = string("cleanupState")?;
+    if !matches!(cleanup_state.as_str(), "pending" | "complete") {
+        return Err("gateway returned an invalid onboarding view".to_owned());
+    }
+    let authorization_url = nullable_string("authorizationUrl")?;
+    let display_code = nullable_string("displayCode")?;
+
+    if !valid_durable_view_shape(
+        &provider,
+        credential_kind,
+        state,
+        next_action,
+        &cleanup_state,
+        authorization_url.as_deref(),
+        display_code.as_deref(),
+    ) {
+        return Err("gateway returned an invalid onboarding view".to_owned());
+    }
+
+    Ok(DurableCeremonyView {
+        raw,
+        ceremony_id,
+        provider,
+        credential_kind,
+        state,
+        next_action,
+        expires_at,
+        authorization_url,
+        display_code,
+    })
+}
+
+fn valid_durable_view_shape(
+    provider: &str,
+    credential_kind: DurableCredentialKind,
+    state: DurableCeremonyState,
+    next_action: DurableNextAction,
+    cleanup_state: &str,
+    authorization_url: Option<&str>,
+    display_code: Option<&str>,
+) -> bool {
+    let fields_absent = authorization_url.is_none() && display_code.is_none();
+    let action_matches = match state {
+        DurableCeremonyState::Preparing => {
+            next_action == DurableNextAction::WaitForChallenge && fields_absent
+        }
+        DurableCeremonyState::AwaitingUser => match (provider, credential_kind, next_action) {
+            (
+                "anthropic",
+                DurableCredentialKind::Subscription,
+                DurableNextAction::OpenUrlThenSubmitCode,
+            ) => authorization_url.is_some() && display_code.is_none(),
+            (
+                "openai",
+                DurableCredentialKind::Subscription,
+                DurableNextAction::OpenUrlThenConfirmApproval,
+            ) => authorization_url.is_some() && display_code.is_some(),
+            (_, DurableCredentialKind::ApiKey, DurableNextAction::SupplyApiKeyThroughStdin) => {
+                fields_absent
+            }
+            _ => false,
+        },
+        DurableCeremonyState::Validating => {
+            next_action == DurableNextAction::WaitForValidation && fields_absent
+        }
+        DurableCeremonyState::ReadyToCommit => {
+            next_action == DurableNextAction::WaitForTurnBoundary && fields_absent
+        }
+        DurableCeremonyState::Committing => {
+            next_action == DurableNextAction::WaitForCommit && fields_absent
+        }
+        DurableCeremonyState::RecoveryRequired => {
+            next_action == DurableNextAction::RestartOrCancel && fields_absent
+        }
+        state if state.terminal() => {
+            fields_absent
+                && (next_action == DurableNextAction::None
+                    || (next_action == DurableNextAction::OperatorRepair
+                        && cleanup_state == "pending"))
+        }
+        _ => false,
+    };
+
+    action_matches && (state.terminal() || cleanup_state == "complete")
+}
+
+fn read_browser_code(view: &DurableCeremonyView) -> Result<String, String> {
+    let url = view
+        .authorization_url
+        .as_deref()
+        .ok_or_else(|| "gateway returned an invalid onboarding view".to_owned())?;
+    println!("\nOpen this and sign in:\n\n    {url}\n");
+    println!("Then paste the code it shows you (code#state) and press enter:");
+    let mut code = String::new();
+    io::stdin()
+        .read_line(&mut code)
+        .map_err(|_| "could not read the browser response".to_owned())?;
+    let code = code.trim().to_owned();
+    if code.is_empty() {
+        Err("no browser response was provided".to_owned())
+    } else {
+        Ok(code)
+    }
+}
+
+fn confirm_browser_approval(view: &DurableCeremonyView) -> Result<(), String> {
+    let url = view
+        .authorization_url
+        .as_deref()
+        .ok_or_else(|| "gateway returned an invalid onboarding view".to_owned())?;
+    let display_code = view
+        .display_code
+        .as_deref()
+        .ok_or_else(|| "gateway returned an invalid onboarding view".to_owned())?;
+    println!("\nOpen this and approve the device:\n\n    {url}\n");
+    println!("Enter this code if prompted: {display_code}");
+    println!("Press enter after the provider confirms approval:");
+    let mut acknowledged = String::new();
+    let bytes_read = io::stdin()
+        .read_line(&mut acknowledged)
+        .map_err(|_| "could not read the approval confirmation".to_owned())?;
+    approval_confirmation(bytes_read)
+}
+
+fn approval_confirmation(bytes_read: usize) -> Result<(), String> {
+    if bytes_read == 0 {
+        Err("no approval confirmation was provided".to_owned())
+    } else {
+        Ok(())
+    }
+}
+
+fn durable_onboarding_key(phase: &str) -> String {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("cli-{phase}-{}-{unique}", std::process::id())
+}
+
+fn epoch_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+#[cfg(not(test))]
+fn onboarding_poll_interval() -> Duration {
+    Duration::from_millis(250)
+}
+
+#[cfg(test)]
+fn onboarding_poll_interval() -> Duration {
+    Duration::ZERO
 }
 
 /// The gateway has to SAY it onboarded. A 2xx only says the request arrived.
@@ -2526,7 +3042,7 @@ mod tests {
                 token: "signal-fixture-token".to_owned(),
                 origin: crate::dispatch::Origin::Provisioned,
             };
-            let result = onboard(
+            let result = legacy_onboard(
                 &Identity::User("signal-fixture".to_owned()),
                 "openai",
                 false,

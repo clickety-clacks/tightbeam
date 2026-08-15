@@ -2943,19 +2943,6 @@ mod tests {
     fn onboarding_discovers_once_and_keeps_every_phase_on_that_endpoint() {
         use std::cell::{Cell, RefCell};
 
-        let staging = std::env::temp_dir().join(format!(
-            "tightbeam-onboard-endpoint-{}-{}",
-            std::process::id(),
-            line!()
-        ));
-        let _ = fs::remove_dir_all(&staging);
-        fs::create_dir_all(&staging).unwrap();
-        // The stub codex below is `true`: it exits zero and writes nothing, which is the
-        // shape of a CANCELLED device-code login, and the openai leg now refuses it. This
-        // test is about endpoints rather than credentials, so it stages the credential the
-        // real ceremony would have produced and lets the phases run. Do not delete this as
-        // setup noise -- without it the run cancels and never reaches `finish`.
-        fs::write(staging.join("auth.json"), br#"{"tokens":{}}"#).unwrap();
         let _env = MACHINE_ENV
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2967,7 +2954,6 @@ mod tests {
         let gateway = "https://one-gateway.test".to_owned();
         let discoveries = Cell::new(0);
         let calls = RefCell::new(Vec::new());
-        let catalog_calls = RefCell::new(Vec::new());
         let result = run_with(
             Command::Onboard {
                 identity: Identity::User("flynn".to_owned()),
@@ -2983,89 +2969,99 @@ mod tests {
                 })
             },
             |endpoint, request, deadline| {
-                let phase = if request.body_json.contains(r#""phase":"begin""#) {
+                let phase = if request.body_json.contains(r#""verb":"inspect""#) {
+                    "inspect"
+                } else if request.body_json.contains(r#""phase":"begin""#) {
                     "begin"
-                } else if request.body_json.contains(r#""phase":"finish""#) {
-                    "finish"
                 } else {
                     panic!("unexpected onboarding request: {}", request.body_json);
                 };
                 calls
                     .borrow_mut()
                     .push((endpoint.base.clone(), phase, deadline.is_some()));
-                if phase == "begin" {
+                if phase == "inspect" {
                     Ok(Some(serde_json::json!({
-                        "stagingPath": staging,
-                        "leaseId": "lease-7",
-                        "leaseTtlMs": 60_000
+                        "onboardingProtocolVersion": 2
                     })))
                 } else {
-                    // What the gateway actually answers a finish with
-                    // (gateway.ex:2495). This used to be `Ok(None)`, which the CLI read as
-                    // success -- so this test asserted, and protected, the defect that a
-                    // transport 2xx counts as the gateway confirming an install.
                     Ok(Some(serde_json::json!({
+                        "ceremonyId": "oc_endpoint",
                         "provider": "openai",
+                        "host": "fixture-machine",
                         "credentialKind": "subscription",
-                        "status": "onboarded"
+                        "principalUserId": "flynn",
+                        "state": "succeeded",
+                        "authorizationUrl": null,
+                        "displayCode": null,
+                        "startedAt": 1,
+                        "expiresAt": 2,
+                        "nextAction": "none",
+                        "cleanupState": "complete"
                     })))
                 }
             },
-            |endpoint, deadline| {
-                catalog_calls
-                    .borrow_mut()
-                    .push((endpoint.base.clone(), deadline));
-                Ok(Some(crate::harnesses::HarnessCatalog {
-                    harnesses: vec![crate::harnesses::HarnessProjection {
-                        wire_name: "codex".to_owned(),
-                        install_package: "codex-acp".to_owned(),
-                        cli_binary: "true".to_owned(),
-                        process_markers: vec!["codex".to_owned()],
-                    }],
-                }))
-            },
+            |_, _| panic!("durable onboarding does not load the local harness catalog"),
         );
 
         match prior_machine {
             Some(value) => unsafe { std::env::set_var("TIGHTBEAM_MACHINE", value) },
             None => unsafe { std::env::remove_var("TIGHTBEAM_MACHINE") },
         }
-        let _ = fs::remove_dir_all(&staging);
 
         result.unwrap();
         assert_eq!(discoveries.get(), 1);
-        let catalog_calls = catalog_calls.into_inner();
-        assert_eq!(catalog_calls.len(), 1);
-        assert_eq!(catalog_calls[0].0, gateway);
         assert_eq!(
             calls.into_inner(),
-            vec![(gateway.clone(), "begin", false), (gateway, "finish", true),]
+            vec![
+                (gateway.clone(), "inspect", false),
+                (gateway, "begin", false)
+            ]
         );
     }
 
-    /// A 2xx is the transport saying it arrived, not the gateway saying it installed.
-    ///
-    /// The same mistake as reading a codex exit code as "a credential was produced", one
-    /// layer out. `parse_response` answers `Ok(None)` for a success with no `result`, so
-    /// before this every 2xx reached `Ok(())` and the CLI reported a completed onboarding
-    /// the gateway had never confirmed. The stub here returns exactly that: a finish that
-    /// succeeds at the transport and says nothing.
-    ///
-    /// Today's gateway cannot send it. It is checked because the CLI and the gateway are
-    /// versioned and shipped separately, and the CLI is the half that has to survive
-    /// meeting a version of the other that answers differently.
     #[test]
-    fn a_finish_the_gateway_never_confirmed_is_refused_and_cancelled() {
+    fn an_old_gateway_is_refused_before_a_mutating_begin() {
         use std::cell::RefCell;
 
-        let staging = std::env::temp_dir().join(format!(
-            "tightbeam-onboard-unconfirmed-{}-{}",
-            std::process::id(),
-            line!()
-        ));
-        let _ = fs::remove_dir_all(&staging);
-        fs::create_dir_all(&staging).unwrap();
-        fs::write(staging.join("auth.json"), br#"{"tokens":{}}"#).unwrap();
+        let requests = RefCell::new(Vec::new());
+        let result = run_with(
+            Command::Onboard {
+                identity: Identity::User("flynn".to_owned()),
+                provider: "openai".to_owned(),
+                api_key: false,
+            },
+            || {
+                Ok(Endpoint {
+                    base: "https://gateway.test".to_owned(),
+                    token: "tbc_one".to_owned(),
+                    origin: Origin::Provisioned,
+                })
+            },
+            |_, request, _| {
+                requests.borrow_mut().push(request.body_json.clone());
+                Ok(Some(serde_json::json!({})))
+            },
+            |_, _| panic!("old-gateway refusal must not load the harness catalog"),
+        );
+
+        let error = result.unwrap_err();
+        assert!(error.contains("client_upgrade_required"), "{error}");
+        let requests = requests.into_inner();
+        assert_eq!(
+            requests,
+            vec![r#"{"asUser":"flynn","verb":"inspect","params":{}}"#]
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request.contains(r#""phase":"begin""#))
+        );
+    }
+
+    #[test]
+    fn disconnect_after_durable_begin_does_not_cancel_the_ceremony() {
+        use std::cell::RefCell;
+
         let _env = MACHINE_ENV
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3088,51 +3084,61 @@ mod tests {
                     origin: Origin::Provisioned,
                 })
             },
-            |_, request, _| {
-                let phase = if request.body_json.contains(r#""phase":"begin""#) {
+            |_, request, deadline| {
+                let phase = if request.body_json.contains(r#""verb":"inspect""#) {
+                    "inspect"
+                } else if request.body_json.contains(r#""phase":"begin""#) {
                     "begin"
-                } else if request.body_json.contains(r#""phase":"finish""#) {
-                    "finish"
-                } else {
+                } else if request.body_json.contains(r#""phase":"status""#) {
+                    "status"
+                } else if request.body_json.contains(r#""phase":"cancel""#) {
                     "cancel"
+                } else {
+                    panic!("unexpected onboarding request: {}", request.body_json)
                 };
                 phases.borrow_mut().push(phase);
                 match phase {
-                    "begin" => Ok(Some(serde_json::json!({
-                        "stagingPath": staging,
-                        "leaseId": "lease-7",
-                        "leaseTtlMs": 60_000
-                    }))),
-                    // 2xx, no result. The transport succeeded and the gateway said nothing.
-                    _ => Ok(None),
+                    "inspect" => {
+                        assert!(deadline.is_none());
+                        Ok(Some(serde_json::json!({
+                            "onboardingProtocolVersion": 2
+                        })))
+                    }
+                    "begin" => {
+                        assert!(deadline.is_none());
+                        Ok(Some(serde_json::json!({
+                            "ceremonyId": "oc_disconnect",
+                            "provider": "openai",
+                            "host": "fixture-machine",
+                            "credentialKind": "subscription",
+                            "principalUserId": "flynn",
+                            "state": "preparing",
+                            "authorizationUrl": null,
+                            "displayCode": null,
+                            "startedAt": 1,
+                            "expiresAt": i64::MAX,
+                            "nextAction": "waitForChallenge",
+                            "cleanupState": "complete"
+                        })))
+                    }
+                    "status" => {
+                        assert!(deadline.is_some());
+                        Err("transport disconnected".to_owned())
+                    }
+                    "cancel" => panic!("disconnect must leave the durable ceremony alive"),
+                    _ => unreachable!(),
                 }
             },
-            |_, _| {
-                Ok(Some(crate::harnesses::HarnessCatalog {
-                    harnesses: vec![crate::harnesses::HarnessProjection {
-                        wire_name: "codex".to_owned(),
-                        install_package: "codex-acp".to_owned(),
-                        cli_binary: "true".to_owned(),
-                        process_markers: vec!["codex".to_owned()],
-                    }],
-                }))
-            },
+            |_, _| panic!("durable onboarding does not load the local harness catalog"),
         );
 
         match prior_machine {
             Some(value) => unsafe { std::env::set_var("TIGHTBEAM_MACHINE", value) },
             None => unsafe { std::env::remove_var("TIGHTBEAM_MACHINE") },
         }
-        let _ = fs::remove_dir_all(&staging);
 
-        let error = result.unwrap_err();
-        assert!(error.contains("did not confirm"), "{error}");
-        assert!(error.contains("doctor"), "no way forward offered: {error}");
-        assert_eq!(
-            phases.into_inner(),
-            vec!["begin", "finish", "cancel"],
-            "an unconfirmed finish must release the lease rather than leave it open"
-        );
+        assert_eq!(result.unwrap_err(), "transport disconnected");
+        assert_eq!(phases.into_inner(), vec!["inspect", "begin", "status"]);
     }
 
     /// The one condition, at the seam, without the ceremony around it.
