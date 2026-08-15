@@ -163,6 +163,9 @@ defmodule Tightbeam.OnboardingRuntimeContinuityTest do
 
     assert {:error, :invalid_response} =
              OnboardingWorker.deliver_response(worker_ref, :unknown, @secret, ctx.registry)
+
+    assert {:error, :invalid_response} =
+             OnboardingWorker.deliver_response(worker_ref, :api_key, @secret, ctx.registry)
   end
 
   defp worker_opts(ctx, worker_ref, ceremony_id) do

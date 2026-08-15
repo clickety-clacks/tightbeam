@@ -13,7 +13,7 @@ defmodule Tightbeam.OnboardingWorker do
 
   alias Tightbeam.OnboardingRegistry
 
-  @response_tags %{code: 1, approved: 2, api_key: 3}
+  @response_tags %{code: 1, approved: 2}
 
   defstruct port: nil,
             buffer: <<>>,
@@ -35,18 +35,16 @@ defmodule Tightbeam.OnboardingWorker do
             authorization_url: String.t(),
             display_code: String.t() | nil
           }
-          | %{kind: :response_delivered, response_kind: :code | :approved | :api_key}
+          | %{kind: :response_delivered, response_kind: :code | :approved}
           | %{
               kind: :validation_result,
               accepted: boolean(),
-              validation_receipt_ref: String.t() | nil,
               failure_code: String.t() | nil
             }
           | %{
               kind: :candidate_ready,
               staging_ref: String.t(),
-              candidate_digest: String.t(),
-              validation_receipt_ref: String.t()
+              candidate_digest: String.t()
             }
 
   @doc false
@@ -98,7 +96,7 @@ defmodule Tightbeam.OnboardingWorker do
   end
 
   @doc "Deliver one response through the worker's inherited stdin pipe."
-  @spec deliver_response(String.t(), :code | :approved | :api_key, binary() | nil, atom()) ::
+  @spec deliver_response(String.t(), :code | :approved, binary() | nil, atom()) ::
           :ok | {:error, :invalid_response | :not_found | :worker_closed}
   def deliver_response(worker_ref, kind, value, registry \\ OnboardingRegistry) do
     with {:ok, pid} <- find_worker(worker_ref, registry) do
@@ -113,7 +111,7 @@ defmodule Tightbeam.OnboardingWorker do
     worker_ref = required_string!(opts, :worker_ref)
     ceremony_id = required_string!(opts, :ceremony_id)
     provider = required_member!(opts, :provider, ["anthropic", "openai"])
-    credential_kind = required_member!(opts, :credential_kind, ["subscription", "api_key"])
+    credential_kind = required_member!(opts, :credential_kind, ["subscription"])
     registry = Keyword.get(opts, :registry, OnboardingRegistry)
     command = Keyword.get_lazy(opts, :cmd, fn -> default_command(opts) end) ++ worker_args(opts)
     port = open_command(command)
@@ -289,14 +287,13 @@ defmodule Tightbeam.OnboardingWorker do
 
   defp decode_observation(%{"type" => "validationResult", "accepted" => accepted} = decoded)
        when is_boolean(accepted) do
-    receipt = Map.get(decoded, "validationReceiptRef")
     failure = Map.get(decoded, "failureCode")
 
     valid_shape =
-      exact_keys?(decoded, ["type", "accepted"], ["validationReceiptRef", "failureCode"]) and
+      exact_keys?(decoded, ["type", "accepted"], ["failureCode"]) and
         case accepted do
-          true -> nonempty?(receipt) and is_nil(failure)
-          false -> optional_nonempty?(receipt) and nonempty?(failure)
+          true -> is_nil(failure)
+          false -> nonempty?(failure)
         end
 
     if valid_shape do
@@ -304,7 +301,6 @@ defmodule Tightbeam.OnboardingWorker do
        %{
          kind: :validation_result,
          accepted: accepted,
-         validation_receipt_ref: receipt,
          failure_code: failure
        }}
     else
@@ -316,25 +312,17 @@ defmodule Tightbeam.OnboardingWorker do
          %{
            "type" => "candidateReady",
            "stagingRef" => staging_ref,
-           "candidateDigest" => candidate_digest,
-           "validationReceiptRef" => receipt_ref
+           "candidateDigest" => candidate_digest
          } = decoded
        )
        when is_binary(staging_ref) and byte_size(staging_ref) > 0 and
-              is_binary(candidate_digest) and byte_size(candidate_digest) > 0 and
-              is_binary(receipt_ref) and byte_size(receipt_ref) > 0 do
-    if exact_keys?(decoded, [
-         "type",
-         "stagingRef",
-         "candidateDigest",
-         "validationReceiptRef"
-       ]) do
+              is_binary(candidate_digest) and byte_size(candidate_digest) > 0 do
+    if exact_keys?(decoded, ["type", "stagingRef", "candidateDigest"]) do
       {:ok,
        %{
          kind: :candidate_ready,
          staging_ref: staging_ref,
-         candidate_digest: candidate_digest,
-         validation_receipt_ref: receipt_ref
+         candidate_digest: candidate_digest
        }}
     else
       :error
@@ -363,9 +351,8 @@ defmodule Tightbeam.OnboardingWorker do
 
   defp response_frame(:approved, nil), do: tagged_frame(:approved, <<>>)
 
-  defp response_frame(kind, value)
-       when kind in [:code, :api_key] and is_binary(value) and byte_size(value) > 0 do
-    tagged_frame(kind, value)
+  defp response_frame(:code, value) when is_binary(value) and byte_size(value) > 0 do
+    tagged_frame(:code, value)
   end
 
   defp response_frame(_kind, _value), do: :error
@@ -394,11 +381,7 @@ defmodule Tightbeam.OnboardingWorker do
 
   defp response_kind("code"), do: :code
   defp response_kind("approved"), do: :approved
-  defp response_kind("apiKey"), do: :api_key
   defp response_kind(_kind), do: nil
-
-  defp optional_nonempty?(nil), do: true
-  defp optional_nonempty?(value), do: nonempty?(value)
 
   defp nonempty?(value), do: is_binary(value) and byte_size(value) > 0
 
