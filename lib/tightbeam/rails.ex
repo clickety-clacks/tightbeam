@@ -83,6 +83,7 @@ defmodule Tightbeam.Rails do
   # the same turn it would have bound anyway, while a miss silently downgrades a
   # correct agent's evidence.
   @observation_pattern "tightbeam[^\"]*artifact-record"
+  @github_auth_pattern "(github\\.com|gh repo |gh pr |gh issue )"
 
   @typedoc "A validated gate statute."
   @type statute :: %{
@@ -146,7 +147,8 @@ defmodule Tightbeam.Rails do
 
     %{
       "hooks" => %{
-        "PreToolUse" => Enum.map(statutes, &pre_tool_use_entry/1) ++ [observation_entry()]
+        "PreToolUse" =>
+          Enum.map(statutes, &pre_tool_use_entry/1) ++ [github_auth_entry(), observation_entry()]
       }
     }
   end
@@ -188,6 +190,27 @@ defmodule Tightbeam.Rails do
     payload =
       "grep -qE \"#{escape_double_quoted(@observation_pattern)}\" - || exit 0; " <>
         "tightbeam tool-call-observed >/dev/null 2>&1; exit 0"
+
+    %{
+      "matcher" => "Bash",
+      "hooks" => [
+        %{"type" => "command", "command" => "sh -c '" <> escape_single_quotes(payload) <> "'"}
+      ]
+    }
+  end
+
+  @doc """
+  The reserved GitHub auth gate. It is not operator law; it is platform
+  hygiene for a known credential seam. Non-GitHub commands exit immediately,
+  while GitHub-dependent shell calls ask the local CLI to prove host auth before
+  git can fall through to an interactive username/PAT prompt.
+  """
+  @spec github_auth_entry() :: map()
+  def github_auth_entry do
+    payload =
+      "input=$(cat); printf '%s' \"$input\" | " <>
+        "grep -qE \"#{escape_double_quoted(@github_auth_pattern)}\" - || exit 0; " <>
+        "printf '%s' \"$input\" | tightbeam github-auth-check || exit 2; exit 0"
 
     %{
       "matcher" => "Bash",

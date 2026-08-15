@@ -878,3 +878,13 @@ turn boots a replacement and re-adopts. Regression test kills via the
 message; driver A3 is the standing OS-level guard. Also in the soak lane
 review: argv "--" handling and httpc→curl (this Erlang build's inets
 cannot load :http_util).
+
+GITHUB AUTH SPEC (operator-authored). Confirmed no existing tracker item
+specifically covered fresh Tightbeam projects losing GitHub auth and pushing
+agents toward PAT prompts. Local shell has `gh` keyring auth, but the launch
+path only explicitly projects harness homes plus Tightbeam env; satellite and
+service-user projects therefore need a first-class host capability. Added
+`docs/GITHUB-AUTH.md`: `tightbeam onboard github` defaults to GitHub CLI
+browser/device OAuth, readiness proves both `gh` API auth and `git ls-remote`,
+PAT is never an agent fallback, and gateway/satellite hosts prove independently.
+Linked it from onboarding docs.

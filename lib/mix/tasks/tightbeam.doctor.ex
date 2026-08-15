@@ -34,6 +34,7 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
         System.get_env("TIGHTBEAM_ADVERTISED_URL") ||
           Application.get_env(:tightbeam, :advertised_url),
       hosts: org_hosts(base_dir),
+      github_remote_url: github_remote_url(),
       local_host_name: Placement.local_host_name(),
       credential_state: &local_credential_state(base_dir, &1),
       cli_bin: Path.join(base_dir, "bin")
@@ -62,6 +63,8 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
     cli_bin = Keyword.get(inputs, :cli_bin, Path.join(base_dir, "bin"))
     binary_probe = Keyword.get(inputs, :harness_binary_probe, &Placement.harness_binary_probe/2)
     credential_probe = Keyword.get(inputs, :credential_state, fn _provider -> :unknown end)
+    github_probe = Keyword.get(inputs, :github_probe, &github_probe/2)
+    github_remote_url = Keyword.get(inputs, :github_remote_url)
     harnesses = Enum.map(Tightbeam.Harness.all(), & &1.wire_name())
 
     credential_states =
@@ -106,19 +109,22 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
         end)
       end)
 
-    non_harness_checks = [
-      default_model_check(
-        catalog,
-        default_harness,
-        default_model,
-        Map.fetch!(credential_states, default_harness),
-        base_dir,
-        local_host_name
-      ),
-      identity_check(base_dir),
-      advertised_url_check(advertised_url),
-      hosts_check(hosts, local_host_name)
-    ]
+    non_harness_checks =
+      [
+        default_model_check(
+          catalog,
+          default_harness,
+          default_model,
+          Map.fetch!(credential_states, default_harness),
+          base_dir,
+          local_host_name
+        ),
+        identity_check(base_dir),
+        advertised_url_check(advertised_url),
+        hosts_check(hosts, local_host_name),
+        github_check(github_remote_url, github_probe)
+      ]
+      |> Enum.reject(&is_nil/1)
 
     checks = [hd(non_harness_checks)] ++ harness_checks ++ tl(non_harness_checks)
 
@@ -361,6 +367,154 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
 
   defp onboard_command(provider, _host),
     do: "tightbeam onboard #{provider} --as-user <userId>"
+
+  defp github_check(nil, _github_probe), do: nil
+
+  defp github_check(remote_url, github_probe) do
+    case github_hostname(remote_url) do
+      nil ->
+        nil
+
+      hostname ->
+        case github_probe.(hostname, remote_url) do
+          {:ok, %{account: account, git_protocol: protocol}} ->
+            detail =
+              "GitHub #{hostname} is live for #{account || "active account"}" <>
+                if(protocol, do: " via #{protocol}", else: "")
+
+            check("github_auth:#{hostname}", true, detail, "")
+
+          {:error, state, detail} ->
+            check(
+              "github_auth:#{hostname}",
+              false,
+              "#{state}: #{scrub_github_detail(detail)}",
+              "Run on this host: tightbeam onboard github --hostname #{hostname}. " <>
+                "Do not paste a PAT into an agent."
+            )
+        end
+    end
+  end
+
+  defp github_hostname(remote_url) when is_binary(remote_url) do
+    cond do
+      String.starts_with?(remote_url, "https://") or String.starts_with?(remote_url, "http://") ->
+        remote_url
+        |> URI.parse()
+        |> Map.get(:host)
+        |> github_host()
+
+      String.starts_with?(remote_url, "ssh://") ->
+        remote_url
+        |> URI.parse()
+        |> Map.get(:host)
+        |> github_host()
+
+      String.starts_with?(remote_url, "git@") ->
+        case String.split(remote_url, ["@", ":"], parts: 3) do
+          ["git", host, _path] -> github_host(host)
+          _ -> nil
+        end
+
+      true ->
+        nil
+    end
+  end
+
+  defp github_hostname(_remote_url), do: nil
+
+  defp github_host(nil), do: nil
+
+  defp github_host(host) do
+    cond do
+      host == "github.com" -> host
+      String.ends_with?(host, ".github.com") -> host
+      true -> nil
+    end
+  end
+
+  defp github_remote_url do
+    case System.cmd("git", ["config", "--get", "remote.origin.url"], stderr_to_stdout: true) do
+      {url, 0} ->
+        url = String.trim(url)
+        if url == "", do: nil, else: url
+
+      _ ->
+        nil
+    end
+  rescue
+    ErlangError -> nil
+  end
+
+  defp github_probe(hostname, remote_url) do
+    with {:gh, path} when is_binary(path) <- {:gh, System.find_executable("gh")},
+         {:auth, {_out, 0}} <-
+           {:auth,
+            System.cmd("gh", ["auth", "status", "--active", "--hostname", hostname],
+              stderr_to_stdout: true
+            )},
+         {:api, {account, 0}} <-
+           {:api, System.cmd("gh", ["api", "--hostname", hostname, "user", "--jq", ".login"])},
+         {:git, {_out, 0}} <-
+           {:git, System.cmd("git", ["ls-remote", remote_url, "HEAD"], stderr_to_stdout: true)} do
+      {:ok, %{account: String.trim(account), git_protocol: github_git_protocol(hostname)}}
+    else
+      {:gh, nil} ->
+        {:error, :missing_cli, "gh is missing from PATH"}
+
+      {:auth, {detail, _status}} ->
+        {:error, :needs_onboarding, scrub_github_detail(detail)}
+
+      {:api, {detail, _status}} ->
+        {:error, classify_github_api_failure(detail), scrub_github_detail(detail)}
+
+      {:git, {detail, _status}} ->
+        {:error, :git_unready, scrub_github_detail(detail)}
+    end
+  rescue
+    ErlangError ->
+      {:error, :unknown, "GitHub readiness probe could not run"}
+  end
+
+  defp github_git_protocol(hostname) do
+    _ = hostname
+
+    case System.cmd("gh", ["config", "get", "git_protocol"]) do
+      {protocol, 0} ->
+        protocol = String.trim(protocol)
+        if protocol == "", do: nil, else: protocol
+
+      _ ->
+        nil
+    end
+  rescue
+    ErlangError -> nil
+  end
+
+  defp classify_github_api_failure(detail) do
+    down = String.downcase(to_string(detail))
+
+    cond do
+      String.contains?(down, "scope") or String.contains?(down, "forbidden") or
+          String.contains?(down, "403") ->
+        :insufficient_scope
+
+      String.contains?(down, "auth") or String.contains?(down, "401") ->
+        :needs_onboarding
+
+      true ->
+        :unknown
+    end
+  end
+
+  defp scrub_github_detail(detail) do
+    detail
+    |> to_string()
+    |> String.replace(~r/github_pat_[A-Za-z0-9_]+/, "[redacted]")
+    |> String.replace(~r/gh[opusr]_[A-Za-z0-9_]+/, "[redacted]")
+    |> String.replace(~r{https://[^/\s:]+:[^@\s]+@}, "https://[redacted]@")
+    |> String.trim()
+  end
 
   defp local_credential_state(base_dir, provider) do
     host = Placement.local_host_name()
