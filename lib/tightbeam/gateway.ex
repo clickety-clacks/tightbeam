@@ -72,6 +72,7 @@ defmodule Tightbeam.Gateway do
     Escalation,
     EventLog,
     Harness,
+    HarnessHealth,
     Homes,
     Identity,
     Idempotency,
@@ -1942,7 +1943,11 @@ defmodule Tightbeam.Gateway do
                ) do
           append_assistant_messages(db, turn, echo, result)
 
-          {:ok, %{terminal_publish: terminal_publish}}
+          record_in_txn = fn txn ->
+            HarnessHealth.resolve_normal_turn_in_txn(txn, session, turn)
+          end
+
+          {:ok, %{terminal_publish: terminal_publish, record_in_txn: record_in_txn}}
         else
           {:error, {failed_stage, reason}} ->
             # A FAILED TURN FAILS. It does not freeze the session behind a
@@ -2018,6 +2023,14 @@ defmodule Tightbeam.Gateway do
                 end
 
               EventLog.lifecycle_in_txn(txn, "harness_turn_error", turn.session_key, detail)
+
+              HarnessHealth.observe_turn_failure_in_txn(
+                txn,
+                session,
+                turn,
+                failed_stage,
+                raw_reason
+              )
             end
 
             {:error,

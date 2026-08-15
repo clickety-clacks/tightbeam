@@ -322,6 +322,27 @@ defmodule Tightbeam.EventLog do
   """
   @spec notice(db(), String.t(), String.t(), String.t() | nil, keyword()) :: :ok
   def notice(db \\ Tightbeam.DB, kind, subject, detail, opts) do
+    validate_notice_opts!(opts)
+
+    {:ok, publication} =
+      DB.transaction(db, fn txn ->
+        notice_in_txn(txn, kind, subject, detail, opts)
+      end)
+
+    publish_notice(publication, opts)
+  end
+
+  @doc """
+  Record a notice and its durable markers inside a caller-owned transaction.
+
+  The returned publication plan contains only already-stored markers. The
+  caller must pass it to `publish_notice/2` after its outer transaction commits.
+  This keeps an incident and its one human blocker indivisible without trying
+  to push uncommitted rows onto the wire.
+  """
+  @spec notice_in_txn(Txn.t(), String.t(), String.t(), String.t() | nil, keyword()) :: map()
+  def notice_in_txn(%Txn{} = txn, kind, subject, detail, opts) do
+    validate_notice_opts!(opts)
     audience = Keyword.fetch!(opts, :audience)
 
     {message, attention} =
@@ -333,41 +354,64 @@ defmodule Tightbeam.EventLog do
           {Keyword.fetch!(opts, :message), Keyword.fetch!(opts, :attention)}
       end
 
-    {:ok, {appended, undeliverable}} =
-      DB.transaction(db, fn txn ->
-        lifecycle_in_txn(txn, kind, subject, detail)
+    lifecycle_in_txn(txn, kind, subject, detail)
 
-        # The record and the markers commit together: a crash between them
-        # would leave exactly the split this function exists to prevent.
-        Enum.reduce(candidates(audience), {[], []}, fn session_key, {appended, undeliverable} ->
-          case active_owner(txn, session_key) do
-            nil ->
-              {appended, [session_key | undeliverable]}
+    # The record and the markers commit together: a crash between them would
+    # leave exactly the split this API exists to prevent.
+    {appended, undeliverable} =
+      Enum.reduce(candidates(audience), {[], []}, fn session_key, {appended, undeliverable} ->
+        case active_owner(txn, session_key) do
+          nil ->
+            {appended, [session_key | undeliverable]}
 
-            owner ->
-              {:appended, marker} =
-                Projection.append_marker_in_txn(txn, session_key, message, attention)
+          owner ->
+            {:appended, marker} =
+              Projection.append_marker_in_txn(txn, session_key, message, attention)
 
-              {[{session_key, owner, marker} | appended], undeliverable}
-          end
-        end)
+            {[{session_key, owner, marker} | appended], undeliverable}
+        end
       end)
 
+    %{
+      kind: kind,
+      subject: subject,
+      appended: Enum.reverse(appended),
+      undeliverable: Enum.reverse(undeliverable)
+    }
+  end
+
+  @doc "Publish a committed notice plan; stored markers remain replayable if live push fails."
+  @spec publish_notice(map(), keyword()) :: :ok
+  def publish_notice(publication, opts \\ []) do
     registry = Keyword.get(opts, :conn_registry, ConnRegistry)
 
-    Enum.each(Enum.reverse(undeliverable), fn session_key ->
+    Enum.each(publication.undeliverable, fn session_key ->
       Logger.info(
-        "#{kind} for #{subject} was not delivered to #{session_key}: no active session there"
+        "#{publication.kind} for #{publication.subject} was not delivered to #{session_key}: " <>
+          "no active session there"
       )
     end)
 
-    Enum.each(Enum.reverse(appended), &publish_marker(registry, &1))
+    Enum.each(publication.appended, &publish_marker(registry, &1))
+    :ok
   end
 
   defp candidates(:record_only), do: []
   defp candidates({:session, session_key}), do: [session_key]
   defp candidates({:sessions, session_keys}), do: session_keys
   defp candidates({:ambient, user_id}), do: [Org.personal_session_key(user_id)]
+
+  defp validate_notice_opts!(opts) do
+    case Keyword.fetch!(opts, :audience) do
+      :record_only ->
+        :ok
+
+      _ ->
+        Keyword.fetch!(opts, :message)
+        Keyword.fetch!(opts, :attention)
+        :ok
+    end
+  end
 
   # Read through the transaction handle, not Org: a `DB.query` from inside a
   # transaction re-enters the owner process that is running it.

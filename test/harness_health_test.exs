@@ -1,7 +1,7 @@
 defmodule Tightbeam.HarnessHealthTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{ConditionFacts, DB, EventLog, HarnessHealth, Model, Org}
+  alias Tightbeam.{ConditionFacts, DB, EventLog, HarnessHealth, Ledger, Model, Org, Projection}
 
   setup do
     db = :"harness_health_#{System.unique_integer([:positive])}"
@@ -141,6 +141,146 @@ defmodule Tightbeam.HarnessHealthTest do
              "gibson",
              "rate-limit-dead"
            )
+  end
+
+  test "terminal error classification preserves auth, rate-limit, and unrelated classes" do
+    assert HarnessHealth.classify_turn_failure(%{
+             "message" => "Internal error",
+             "data" => %{"details" => "auth expired"}
+           }) == "auth-dead"
+
+    assert HarnessHealth.classify_turn_failure(%{
+             "status" => 429,
+             "message" => "too many requests"
+           }) ==
+             "rate-limit-dead"
+
+    assert HarnessHealth.classify_turn_failure({:acp_exit, 137}) == nil
+    assert HarnessHealth.classify_turn_failure(%{"message" => "model not found"}) == nil
+  end
+
+  test "provider invalidation emits one auth blocker while rate limiting emits none", ctx do
+    main_key = Org.personal_session_key("flynn")
+
+    Org.create(ctx.db, %{
+      session_key: main_key,
+      display_name: "Main",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "gibson",
+      harness: "codex",
+      provider: "openai",
+      model: Model.new("gpt-5")
+    })
+
+    assert {:opened, auth} =
+             HarnessHealth.observe_provider_invalidation(
+               ctx.db,
+               "claude",
+               "gibson",
+               %{"authMode" => nil, "planType" => nil},
+               conn_registry: :missing_harness_health_registry
+             )
+
+    assert {:attached, attached} =
+             HarnessHealth.observe_provider_invalidation(
+               ctx.db,
+               "claude",
+               "gibson",
+               %{"authMode" => nil, "planType" => nil},
+               conn_registry: :missing_harness_health_registry
+             )
+
+    assert attached.id == auth.id
+    assert [marker] = Projection.list_after(ctx.db, main_key, nil, 10)
+    assert marker.attention_tier == 1
+    assert marker.content =~ auth.id
+    assert marker.content =~ "A human must restore this credential"
+
+    assert Enum.count(
+             EventLog.lifecycle_events(ctx.db),
+             &(&1.kind == "harness_health_auth_blocker")
+           ) ==
+             1
+
+    assert {:opened, _rate} =
+             HarnessHealth.observe(
+               ctx.db,
+               authoritative(hd(ctx.sessions), "rate-limit-dead", 20, "provider-rate-only")
+             )
+
+    assert [_marker] = Projection.list_after(ctx.db, main_key, nil, 10)
+
+    assert Enum.count(
+             EventLog.lifecycle_events(ctx.db),
+             &(&1.kind == "harness_health_auth_blocker")
+           ) ==
+             1
+  end
+
+  test "failed-turn evidence and normal-turn recovery share their terminal CAS", ctx do
+    [first, second, third] = ctx.sessions
+
+    for {ref, message_id} <- [{first, "failed-1"}, {second, "failed-2"}] do
+      {:ok, _seq} =
+        Ledger.enqueue(ctx.db, %{
+          session_key: ref.session,
+          message_id: message_id,
+          origin: "agent:test",
+          prompt: "run",
+          assignment_id: ref.assignment
+        })
+
+      {:ok, turn} = Ledger.claim_next(ctx.db, ref.session, "test-lane")
+      turn = Map.put(turn, :session_key, ref.session)
+      session = Org.get(ctx.db, ref.session)
+
+      assert {:ok, post_commit} =
+               DB.transaction(ctx.db, fn txn ->
+                 assert Ledger.finish_in_txn(txn, turn.seq, "failed", "auth expired")
+
+                 HarnessHealth.observe_turn_failure_in_txn(
+                   txn,
+                   session,
+                   turn,
+                   :prompt,
+                   %{"data" => %{"details" => "auth expired"}}
+                 )
+               end)
+
+      if is_function(post_commit, 0), do: post_commit.()
+    end
+
+    assert [incident] = HarnessHealth.active(ctx.db)
+    assert incident.failureClass == "auth-dead"
+    evidence = HarnessHealth.get(ctx.db, incident.id).observations
+
+    assert evidence |> Enum.map(& &1.assignment_id) |> MapSet.new() ==
+             MapSet.new([first.assignment, second.assignment])
+
+    {:ok, _seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: third.session,
+        message_id: "healthy-turn",
+        origin: "agent:test",
+        prompt: "run",
+        assignment_id: third.assignment
+      })
+
+    {:ok, turn} = Ledger.claim_next(ctx.db, third.session, "test-lane")
+    turn = Map.put(turn, :session_key, third.session)
+    session = Org.get(ctx.db, third.session)
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               assert Ledger.finish_in_txn(txn, turn.seq, "delivered", nil)
+               HarnessHealth.resolve_normal_turn_in_txn(txn, session, turn)
+             end)
+
+    assert HarnessHealth.active(ctx.db) == []
+    assert HarnessHealth.get(ctx.db, incident.id).state == "resolved"
+    refute HarnessHealth.unavailable?(ctx.db, "claude", "gibson")
   end
 
   test "one open incident absorbs later evidence and preserves its first evidence", ctx do

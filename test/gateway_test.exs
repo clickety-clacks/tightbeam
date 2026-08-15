@@ -57,6 +57,7 @@ defmodule Tightbeam.GatewayTest do
     EventLog,
     EffortCheckin,
     Gateway,
+    HarnessHealth,
     Identity,
     Idempotency,
     LaneManager,
@@ -6814,6 +6815,22 @@ defmodule Tightbeam.GatewayTest do
 
     assert lifecycle, "the :prompt turn failure must record a harness_turn_error"
     assert lifecycle.detail =~ "prompt"
+
+    assert HarnessHealth.active(ctx.db) == []
+
+    assert {:ok, [["auth-dead", "terminal-failure", "k1", cause]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT failureClass,evidenceKind,sessionKey,cause
+               FROM harness_health_observations
+               WHERE correlationId=?1
+               """,
+               ["harness-turn:#{turn.seq}:auth-dead"]
+             )
+
+    assert cause =~ "stage=prompt"
+    assert cause =~ "auth expired"
 
     # G3: the operator reads the human message/details as PROSE, never a raw inspected ACP
     # error map. The auth detail survives as text; the map's inspect markers (`=>`, `%{`) do

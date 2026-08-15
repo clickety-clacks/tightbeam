@@ -1,7 +1,7 @@
 defmodule Tightbeam.Productions.BubbleTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{ConditionFacts, ConnRegistry, DB, Ledger, Model, Org}
+  alias Tightbeam.{ConditionFacts, ConnRegistry, DB, HarnessHealth, Ledger, Model, Org}
   alias Tightbeam.Productions.Bubble
 
   defmodule LaneDoorbell do
@@ -103,6 +103,47 @@ defmodule Tightbeam.Productions.BubbleTest do
     # deterministic wakeId absorbs it. One notice, not two.
     :ok = Bubble.recognize_terminal(ctx.db, seq)
     assert [_] = notice_turn(ctx.db, "supervisor")
+  end
+
+  test "an open incident suppresses only its affected harness", ctx do
+    assert {:opened, _incident} =
+             HarnessHealth.observe(ctx.db, %{
+               correlation_id: "bubble-rate-limit",
+               harness: "claude",
+               host: "testhost",
+               failure_class: "rate-limit-dead",
+               evidence_kind: "authoritative-provider",
+               session_key: ctx.holder.session_key,
+               assignment_id: nil,
+               observed_at: 1,
+               cause: "provider rate limit",
+               principal: "process:tightbeam"
+             })
+
+    affected_seq = fail_turn!(ctx.db, ctx.holder.session_key)
+    :ok = Bubble.recognize_terminal(ctx.db, affected_seq)
+    assert notice_turn(ctx.db, ctx.supervisor.session_key) == []
+
+    healthy =
+      Org.create(ctx.db, %{
+        session_key: "healthy-holder",
+        display_name: "Healthy holder",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        harness: "claude",
+        provider: "anthropic",
+        host: "healthy-host",
+        model: Model.new("fable"),
+        spawned_by: ctx.supervisor.session_key
+      })
+
+    healthy_seq = fail_turn!(ctx.db, healthy.session_key)
+    :ok = Bubble.recognize_terminal(ctx.db, healthy_seq)
+    healthy_ref = "bubble:#{healthy_seq}"
+
+    assert [[_, ^healthy_ref, _, _, _]] =
+             notice_turn(ctx.db, ctx.supervisor.session_key)
   end
 
   test "a canceled cause turn never bubbles — cancellation is a decision", ctx do

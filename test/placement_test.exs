@@ -2,7 +2,16 @@ defmodule Tightbeam.PlacementTest do
   use Tightbeam.TestCase, async: false
   alias Tightbeam.Model
 
-  alias Tightbeam.{Archetypes, Credentials, DB, EventLog, Homes, Identity, Org, Placement, Rails}
+  alias Tightbeam.{
+    Archetypes,
+    Credentials,
+    DB,
+    HarnessHealth,
+    Homes,
+    Identity,
+    Placement,
+    Rails
+  }
 
   setup do
     base_dir = Path.join(System.tmp_dir!(), "tb-placement-#{System.unique_integer([:positive])}")
@@ -10,9 +19,7 @@ defmodule Tightbeam.PlacementTest do
     File.write!(Path.join(base_dir, "gateway.json"), JSON.encode!(%{cliToken: "tbc_test"}))
     db = :"placement_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
-    :ok = Org.ensure_schema(db)
-    :ok = EventLog.ensure_schema(db)
-    :ok = Placement.ensure_schema(db)
+    :ok = Tightbeam.Schema.ensure_all(db)
     Archetypes.load!(base_dir)
     Rails.load!(base_dir)
 
@@ -739,6 +746,36 @@ defmodule Tightbeam.PlacementTest do
     refute_receive {:unexpected_sh, _}
   end
 
+  test "a terminal provider callback opens one authoritative auth incident", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    unless Process.whereis(Tightbeam.TurnTaskSupervisor) do
+      start_supervised!({Task.Supervisor, name: Tightbeam.TurnTaskSupervisor})
+    end
+
+    config = %{
+      base_dir: base_dir,
+      db: db,
+      cwd: "/work",
+      cli_bin: "/local/bin",
+      sh: fn _command -> {"", 0} end
+    }
+
+    handler = Placement.adapter_opts(config, {:codex, "default", "testhost"})[:on_auth_event]
+    handler.(:transient, %{"authMode" => "chatgpt"})
+    refute eventually(fn -> HarnessHealth.active(db) != [] end, 4)
+
+    handler.(:terminal, %{"authMode" => nil, "planType" => nil})
+
+    assert eventually(fn ->
+             match?(
+               [%{failureClass: "auth-dead", harness: "codex", host: "testhost"}],
+               HarnessHealth.active(db)
+             )
+           end)
+  end
+
   test "adapter_opts appends a local overlay and absent rows leave env unchanged", %{
     base_dir: base_dir,
     db: db
@@ -1272,6 +1309,22 @@ defmodule Tightbeam.PlacementTest do
     assert {:ok, "testhost"} = Placement.resolve(anywhere, nil, hosts)
     assert {:ok, "work-1"} = Placement.resolve(anywhere, "work-1", hosts)
     assert {:error, %{code: "unknown_host"}} = Placement.resolve(anywhere, "nope", hosts)
+  end
+
+  defp eventually(fun, tries \\ 60)
+
+  defp eventually(fun, tries) do
+    cond do
+      fun.() ->
+        true
+
+      tries == 0 ->
+        false
+
+      true ->
+        Process.sleep(25)
+        eventually(fun, tries - 1)
+    end
   end
 
   defp install_statute(base_dir, text \\ "History-rewriting git commands are forbidden here.") do

@@ -8,12 +8,13 @@ defmodule Tightbeam.HarnessHealth do
   window. Resolution appends normal-turn evidence and retracts the class fact;
   neither observations nor incidents are deleted.
 
-  This module records and reads facts. Runtime classification, patrol
-  suppression, blockers, probes, and normal-turn wiring remain at their locked
-  producer and consumer seams.
+  Runtime producers call the transaction-owned helpers here so a failed turn
+  cannot commit without its evidence and a delivered turn cannot commit
+  without clearing the affected shared harness. Recovery probing and process
+  recycling remain outside this module.
   """
 
-  alias Tightbeam.{ConditionFacts, DB, EventLog, Id}
+  alias Tightbeam.{ConditionFacts, DB, EventLog, Id, Org}
   alias Tightbeam.DB.Txn
 
   @failure_classes ~w(auth-dead rate-limit-dead)
@@ -209,11 +210,155 @@ defmodule Tightbeam.HarnessHealth do
   @spec evidence_window_ms() :: pos_integer()
   def evidence_window_ms, do: @evidence_window_ms
 
+  @doc "Whether either incident class currently stands for one shared harness."
+  @spec unavailable?(DB.server(), String.t(), String.t()) :: boolean()
+  def unavailable?(db \\ DB, harness, host),
+    do: ConditionFacts.harness_unavailable?(db, harness, host)
+
+  @doc "Classify a terminal turn reason without collapsing auth and rate limiting."
+  @spec classify_turn_failure(term()) :: String.t() | nil
+  def classify_turn_failure(reason) do
+    evidence = reason |> evidence_text() |> String.downcase()
+
+    cond do
+      contains_any?(evidence, [
+        "rate limit",
+        "rate_limit",
+        "ratelimit",
+        "too many requests",
+        "quota exceeded",
+        "http 429",
+        "status 429",
+        "\"status\":429",
+        "\"status_code\":429",
+        "\"statuscode\":429",
+        "status_code\" => 429",
+        "statuscode\" => 429"
+      ]) ->
+        "rate-limit-dead"
+
+      contains_any?(evidence, [
+        "auth expired",
+        "authentication expired",
+        "authentication failed",
+        "authentication required",
+        "invalid token",
+        "expired token",
+        "token expired",
+        "token revoked",
+        "unauthorized",
+        "unauthenticated",
+        "http 401",
+        "status 401",
+        "\"status\":401",
+        "\"status_code\":401",
+        "\"statuscode\":401",
+        "status_code\" => 401",
+        "statuscode\" => 401"
+      ]) ->
+        "auth-dead"
+
+      true ->
+        nil
+    end
+  end
+
+  @doc "Record classified turn-failure evidence inside the turn's terminal transaction."
+  @spec observe_turn_failure_in_txn(Txn.t(), map(), map(), term(), term()) ::
+          nil | (-> :ok)
+  def observe_turn_failure_in_txn(%Txn{} = txn, session, turn, failed_stage, reason) do
+    case classify_turn_failure(reason) do
+      nil ->
+        nil
+
+      failure_class ->
+        assignment_id =
+          case Txn.q(txn, "SELECT assignmentId FROM turns WHERE seq=?1", [turn.seq]) do
+            [[assignment_id]] -> assignment_id
+            [] -> nil
+          end
+
+        result =
+          observe_in_txn(txn, %{
+            correlation_id: "harness-turn:#{turn.seq}:#{failure_class}",
+            harness: to_string(session.harness),
+            host: session.host,
+            failure_class: failure_class,
+            evidence_kind: "terminal-failure",
+            session_key: turn.session_key,
+            assignment_id: assignment_id,
+            observed_at: System.system_time(:millisecond),
+            cause: "stage=#{failed_stage} reason=#{evidence_text(reason)}",
+            principal: turn.origin || "process:tightbeam"
+          })
+
+        post_commit(result)
+    end
+  end
+
+  @doc "Resolve every open class for this shared harness inside a delivered-turn transaction."
+  @spec resolve_normal_turn_in_txn(Txn.t(), map(), map()) :: :ok
+  def resolve_normal_turn_in_txn(%Txn{} = txn, session, turn) do
+    harness = to_string(session.harness)
+
+    Txn.q(
+      txn,
+      """
+      SELECT failureClass FROM harness_health_incidents
+      WHERE harness=?1 AND host=?2 AND state='open'
+      ORDER BY failureClass
+      """,
+      [harness, session.host]
+    )
+    |> List.flatten()
+    |> Enum.each(fn failure_class ->
+      resolve_in_txn(txn, %{
+        correlation_id: "harness-turn:#{turn.seq}:normal-success:#{failure_class}",
+        harness: harness,
+        host: session.host,
+        failure_class: failure_class,
+        session_key: turn.session_key,
+        assignment_id: nil,
+        observed_at: System.system_time(:millisecond),
+        cause: "normal turn #{turn.seq} delivered",
+        principal: turn.origin || "process:tightbeam"
+      })
+    end)
+
+    :ok
+  end
+
+  @doc "Open an auth incident immediately from a provider-authoritative invalidation."
+  @spec observe_provider_invalidation(DB.server(), String.t(), String.t(), term(), keyword()) ::
+          {:opened | :attached | :duplicate, map()}
+  def observe_provider_invalidation(db \\ DB, harness, host, event, opts \\ []) do
+    observe(db, %{
+      correlation_id: "provider-auth:" <> Id.uuid4(),
+      harness: to_string(harness),
+      host: host,
+      failure_class: "auth-dead",
+      evidence_kind: "authoritative-provider",
+      session_key: nil,
+      assignment_id: nil,
+      observed_at: System.system_time(:millisecond),
+      cause: evidence_text(event),
+      principal: Keyword.get(opts, :principal, "process:tightbeam/provider"),
+      conn_registry: Keyword.get(opts, :conn_registry, Tightbeam.ConnRegistry)
+    })
+  end
+
   @doc "Record failure evidence and open or attach to its incident atomically."
   @spec observe(DB.server(), map()) :: {:pending | :opened | :attached | :duplicate, map()}
   def observe(db \\ DB, input) do
     input = normalize_failure!(input)
-    transaction!(db, &observe_in_txn(&1, input))
+    result = transaction!(db, &observe_in_txn(&1, input))
+
+    case post_commit(result, Map.get(input, :conn_registry, Tightbeam.ConnRegistry)) do
+      nil -> :ok
+      publish -> publish.()
+    end
+
+    strip_publication(result)
   end
 
   @doc "The observation mutation inside a caller-owned transaction."
@@ -362,6 +507,8 @@ defmodule Tightbeam.HarnessHealth do
       lifecycle_detail(input, opening_observation_id)
     )
 
+    notice_publication = auth_blocker_in_txn(txn, incident_id, input)
+
     {:opened,
      %{
        id: incident_id,
@@ -371,7 +518,8 @@ defmodule Tightbeam.HarnessHealth do
        state: "open",
        openedAt: input.observed_at,
        openedFactId: fact_id,
-       observationId: opening_observation_id
+       observationId: opening_observation_id,
+       notice_publication: notice_publication
      }}
   end
 
@@ -721,6 +869,75 @@ defmodule Tightbeam.HarnessHealth do
       cause: input.cause,
       principal: input.principal
     })
+  end
+
+  defp auth_blocker_in_txn(_txn, _incident_id, %{failure_class: "rate-limit-dead"}),
+    do: nil
+
+  defp auth_blocker_in_txn(txn, incident_id, input) do
+    main_sessions =
+      Txn.q(
+        txn,
+        """
+        SELECT DISTINCT s.ownerUserId
+        FROM harness_health_members m
+        JOIN sessions s ON s.sessionKey=m.sessionKey
+        WHERE m.incidentId=?1
+        ORDER BY s.ownerUserId
+        """,
+        [incident_id]
+      )
+      |> List.flatten()
+      |> Enum.map(&Org.personal_session_key/1)
+
+    [[assignment_count]] =
+      Txn.q(
+        txn,
+        "SELECT COUNT(*) FROM harness_health_assignments WHERE incidentId=?1",
+        [incident_id]
+      )
+
+    message =
+      "[shared harness authentication unavailable]\n\n" <>
+        "The #{input.harness} harness on #{input.host} rejected its credential. " <>
+        "Incident #{incident_id} records #{assignment_count} affected open assignment(s). " <>
+        "A human must restore this credential. Ordinary agent retries and alerts for this " <>
+        "harness are suppressed until a normal turn succeeds."
+
+    EventLog.notice_in_txn(
+      txn,
+      "harness_health_auth_blocker",
+      incident_id,
+      lifecycle_detail(input, input.correlation_id),
+      audience: {:sessions, main_sessions},
+      message: message,
+      attention: :high
+    )
+  end
+
+  defp post_commit(result, registry \\ Tightbeam.ConnRegistry)
+
+  defp post_commit({_status, %{notice_publication: nil}}, _registry), do: nil
+
+  defp post_commit({_status, %{notice_publication: publication}}, registry) do
+    fn -> EventLog.publish_notice(publication, conn_registry: registry) end
+  end
+
+  defp post_commit(_result, _registry), do: nil
+
+  defp strip_publication({status, detail}),
+    do: {status, Map.delete(detail, :notice_publication)}
+
+  defp contains_any?(text, patterns), do: Enum.any?(patterns, &String.contains?(text, &1))
+
+  defp evidence_text(evidence) when is_binary(evidence), do: evidence
+
+  defp evidence_text(evidence) do
+    try do
+      JSON.encode!(evidence)
+    rescue
+      _ -> inspect(evidence, limit: 50, printable_limit: 4_000)
+    end
   end
 
   defp transaction!(db, fun) do
