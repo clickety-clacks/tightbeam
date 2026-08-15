@@ -140,19 +140,70 @@ defmodule Tightbeam.Wire.PayloadsTest do
 
     assert running["payload"]["terminalState"] == false
     refute Map.has_key?(running["payload"], "error")
+    refute Map.has_key?(running["payload"], "failure")
+
+    failure = %{
+      "code" => "onboarding_in_progress",
+      "message" => "Onboarding is waiting for a browser step.",
+      "onboarding" => %{
+        "ceremonyId" => "oc_1",
+        "provider" => "anthropic",
+        "host" => "gibson",
+        "state" => "awaitingUser",
+        "nextAction" => "openUrlThenSubmitCode"
+      }
+    }
 
     failed =
       Payloads.prompt_turn_state_event(%{
         client_message_id: "client-1",
         session_key: "s1",
         state: "failed",
-        error: "boom"
+        error: "Onboarding is waiting for a browser step.",
+        failure: failure
       })
 
     assert failed["payload"]["messageId"] == "client-1"
     assert failed["payload"]["correlationId"] == "client-1"
     assert failed["payload"]["terminalState"] == true
-    assert failed["payload"]["error"] == "boom"
+    assert failed["payload"]["error"] == "Onboarding is waiting for a browser step."
+    assert failed["payload"]["failure"] == failure
+  end
+
+  test "onboarding updates use the complete closed state mapping" do
+    expected = %{
+      "preparing" => "preparing",
+      "awaiting_user" => "awaitingUser",
+      "validating" => "validating",
+      "ready_to_commit" => "readyToCommit",
+      "committing" => "committing",
+      "recovery_required" => "recoveryRequired",
+      "succeeded" => "succeeded",
+      "canceled" => "canceled",
+      "expired" => "expired",
+      "superseded" => "superseded",
+      "failed" => "failed"
+    }
+
+    assert Map.new(expected, fn {stored, _wire} ->
+             {stored, Payloads.onboarding_wire_state(stored)}
+           end) == expected
+
+    view = %{
+      "ceremonyId" => "oc_1",
+      "state" => "awaiting_user",
+      "authorizationUrl" => "https://example.invalid/authorize",
+      "nextAction" => "openUrlThenSubmitCode"
+    }
+
+    assert Payloads.onboarding_update(view) == %{
+             "type" => "onboarding_update",
+             "onboarding" => %{view | "state" => "awaitingUser"}
+           }
+
+    assert_raise ArgumentError, ~r/unknown onboarding stored state/, fn ->
+      Payloads.onboarding_wire_state("awaiting-user")
+    end
   end
 
   test "stream builders preserve exact wrapper shapes" do

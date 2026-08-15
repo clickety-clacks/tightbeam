@@ -64,6 +64,9 @@ defmodule Tightbeam.Wire.Payloads do
   @typedoc "prompt_turn_state names: accepted | queued | running | delivered | canceled | failed."
   @type turn_state :: String.t()
 
+  @typedoc "Closed durable onboarding states before their wire spelling is applied."
+  @type onboarding_state :: String.t()
+
   @doc "pair_result: `{success: true, token, userId}` or `{success: false, reason}`."
   @spec pair_result({:ok, String.t(), String.t()} | {:error, String.t()}) :: payload()
   def pair_result({:ok, token, user_id}) do
@@ -215,10 +218,11 @@ defmodule Tightbeam.Wire.Payloads do
   end
 
   @spec prompt_turn_state_event(%{
-          client_message_id: String.t(),
-          session_key: String.t(),
-          state: turn_state(),
-          error: String.t() | nil
+          required(:client_message_id) => String.t(),
+          required(:session_key) => String.t(),
+          required(:state) => turn_state(),
+          required(:error) => String.t() | nil,
+          optional(:failure) => map() | nil
         }) :: payload()
   def prompt_turn_state_event(input) do
     client_message_id = Map.fetch!(input, :client_message_id)
@@ -235,7 +239,37 @@ defmodule Tightbeam.Wire.Payloads do
     %{
       "type" => "event",
       "event" => "prompt_turn_state",
-      "payload" => put_if_present(payload, "error", Map.fetch!(input, :error))
+      "payload" =>
+        payload
+        |> put_if_present("error", Map.fetch!(input, :error))
+        |> put_if_present("failure", Map.get(input, :failure))
+    }
+  end
+
+  @doc "Encode the complete closed durable-to-wire onboarding state table."
+  @spec onboarding_wire_state(onboarding_state()) :: String.t()
+  def onboarding_wire_state("preparing"), do: "preparing"
+  def onboarding_wire_state("awaiting_user"), do: "awaitingUser"
+  def onboarding_wire_state("validating"), do: "validating"
+  def onboarding_wire_state("ready_to_commit"), do: "readyToCommit"
+  def onboarding_wire_state("committing"), do: "committing"
+  def onboarding_wire_state("recovery_required"), do: "recoveryRequired"
+  def onboarding_wire_state("succeeded"), do: "succeeded"
+  def onboarding_wire_state("canceled"), do: "canceled"
+  def onboarding_wire_state("expired"), do: "expired"
+  def onboarding_wire_state("superseded"), do: "superseded"
+  def onboarding_wire_state("failed"), do: "failed"
+
+  def onboarding_wire_state(_unknown) do
+    raise ArgumentError, "unknown onboarding stored state"
+  end
+
+  @doc "Wrap one authorized public ceremony view for device delivery."
+  @spec onboarding_update(%{required(String.t()) => term()}) :: payload()
+  def onboarding_update(%{"state" => stored_state} = public_view) do
+    %{
+      "type" => "onboarding_update",
+      "onboarding" => Map.put(public_view, "state", onboarding_wire_state(stored_state))
     }
   end
 

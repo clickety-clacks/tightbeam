@@ -84,6 +84,20 @@ defmodule Tightbeam.Wire.Socket do
             replayed_seqs: MapSet.new(),
             deps: %{}
 
+  @doc "Publish an authorized ceremony view to the principal's authenticated devices only."
+  @spec publish_onboarding_update(String.t(), map(), GenServer.server()) :: :ok
+  def publish_onboarding_update(
+        principal_user_id,
+        public_view,
+        registry \\ Tightbeam.ConnRegistry
+      ) do
+    payload = Payloads.onboarding_update(public_view)
+
+    ConnRegistry.broadcast(registry, principal_user_id, payload, fn pid, update ->
+      send(pid, {:push, update})
+    end)
+  end
+
   @impl true
   def init(deps) do
     {:ok, %__MODULE__{deps: deps}}

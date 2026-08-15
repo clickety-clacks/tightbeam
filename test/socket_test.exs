@@ -80,6 +80,44 @@ defmodule Tightbeam.Wire.SocketTest do
     %{db: db, registry: registry, deps: deps}
   end
 
+  test "onboarding updates use the existing authenticated principal-scoped connection", ctx do
+    assert {:ok, _owner_ref, nil} =
+             ConnRegistry.register(ctx.registry, %{
+               pid: self(),
+               user_id: "owner",
+               device_id: "owner-phone",
+               is_admin: true,
+               subscriptions: MapSet.new(["chat"])
+             })
+
+    assert {:ok, _other_ref, nil} =
+             ConnRegistry.register(ctx.registry, %{
+               pid: self(),
+               user_id: "other-admin",
+               device_id: "other-phone",
+               is_admin: true,
+               subscriptions: MapSet.new(["chat"])
+             })
+
+    view = %{
+      "ceremonyId" => "oc_phone",
+      "state" => "awaiting_user",
+      "authorizationUrl" => "https://example.invalid/authorize",
+      "nextAction" => "openUrlThenSubmitCode"
+    }
+
+    assert :ok = Socket.publish_onboarding_update("owner", view, ctx.registry)
+    assert_receive {:push, %{"type" => "onboarding_update"} = payload}
+    refute_received {:push, _second_payload}
+
+    assert payload["onboarding"]["state"] == "awaitingUser"
+
+    assert {:push, {:text, encoded}, %Socket{phase: :live}} =
+             Socket.handle_info({:push, payload}, %Socket{phase: :live})
+
+    assert JSON.decode!(encoded) == payload
+  end
+
   test "chat ingress uses real Gateway handlers for ack, dedupe, conflict, and validation", ctx do
     start_supervised!(%{
       id: :socket_e2e_conn_registry,
