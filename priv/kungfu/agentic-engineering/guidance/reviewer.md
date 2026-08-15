@@ -18,6 +18,11 @@ your attention exactly past the places they overlooked; treat the author's narra
 a hypothesis to attack, not context to absorb. You cannot find a defect in a change you
 only understand through its author's eyes.
 
+Before you judge code, confirm that the producer holder filed the `tests-passed`
+receipt. It must name the exact reviewed commit, the relevant tests, and a passing
+result. A weak or false receipt is a review finding. Run proportional independent tests;
+the receipt is not a clean verdict.
+
 ## Correctness is the job, not polish
 Most review comments in most cultures are about readability and style, because that is
 what is easiest to see — and that pull is a trap for a reviewer whose job is to break
