@@ -22,6 +22,17 @@ defmodule Tightbeam.AdapterCoordinator do
     `adapter_for/2` returns {:error, :degraded} so affected turns fail fast
     with a clear reason, /version|/health reflects it, the gateway stays up.
     A successful restart closes the circuit and resets the count.
+
+    The circuit protects AGENT CONNECTIONS from a dead harness. It has no
+    authority over CREDENTIAL INSTALLATION, and the two must not be mixed
+    (ruled 2026-08-14, after the credential-swap incident). Onboarding reaches
+    the coordinator through the authoritative `adapter_for/3`, which bypasses
+    the circuit and clears the failure history before attempting — see
+    `adapter_for_reply/4`. Otherwise a latched key vetoes the only call that
+    can unlatch it: the circuit is guaranteed open exactly when a credential
+    has stopped working, which is the only reason anyone replaces one, and the
+    replacement could never be activated. Onboarding writes this state; it does
+    not ask it for permission.
   - Re-adoption semaphore: at most the configured number of concurrent session/load
     calls per machine (no thundering herd after an adapter bounce, and no machine
     queues behind another machine's recovery). session/load failure → that session
@@ -308,6 +319,25 @@ defmodule Tightbeam.AdapterCoordinator do
       Tightbeam.HarnessProcess.fenced?(state.db, key) ->
         {:reply, {:error, {:park_fenced, key_name(key)}}, state}
 
+      # THE AUTHORITATIVE PATH — credential lifecycle only (the sole caller is
+      # `start_provider_runtime`). Onboarding is a WRITER of adapter health, not
+      # a reader gated by it, and conflating the two is what deadlocked
+      # credential recovery: the circuit exists to protect agent connections
+      # from a dead harness, and it was allowed to veto the one call that could
+      # make that harness live again. The operator installing a credential is
+      # not asking the coordinator's permission.
+      #
+      # It also RESETS the failure history first. Every failure counted on this
+      # key was caused by a credential that no longer exists; carrying that
+      # count onto its replacement is carrying a verdict about something gone.
+      # Onboarding succeeds -> unlatched, count cleared, turns flow with no
+      # gateway restart. Onboarding fails -> the failure counts normally,
+      # because a freshly installed credential that cannot start an adapter is
+      # real evidence about THIS credential.
+      authoritative? ->
+        {reply, state} = start_adapter(key, reset_failure_history(entry), state, context)
+        {:reply, reply, state}
+
       entry.circuit == :open ->
         {:reply, {:error, :degraded}, state}
 
@@ -315,6 +345,13 @@ defmodule Tightbeam.AdapterCoordinator do
         {reply, state} = start_adapter(key, entry, state, context)
         {:reply, reply, state}
     end
+  end
+
+  # Cancels any pending retry as well: the authoritative attempt happens NOW and
+  # must not race a restart scheduled against the old credential's failures.
+  defp reset_failure_history(entry) do
+    if is_reference(entry.timer), do: Process.cancel_timer(entry.timer)
+    %{entry | failures: 0, circuit: :closed, timer: nil}
   end
 
   @impl true
