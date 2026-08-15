@@ -1,7 +1,9 @@
 # tightbeam_ex — agent notes
 
-## THIS LINE: highest 0.1.* branch (currently 0.1.9) — the maintenance line
+## THIS LINE: highest 0.1.* branch (currently 0.1.9) — see CONTRIBUTING.md on main
 
+The branch and release ruling for both product lines is in
+[CONTRIBUTING.md on main](https://github.com/clickety-clacks/tightbeam/blob/main/CONTRIBUTING.md).
 Integrate maintenance work into the highest `0.1.*` branch (currently `0.1.9`),
 not main. main is now the 0.2 fabric program line — never target it from this
 line; fixes cross to it only by Mike-authorized cherry-pick election. Where
