@@ -2257,6 +2257,56 @@ defmodule Tightbeam.GatewayTest do
     assert markers == []
   end
 
+  test "a set_host landing after a retune's election refuses the retune as stale_election",
+       ctx do
+    handlers = stale_election_arena!(ctx, "stale-retune-host")
+
+    Org.create(ctx.db, %{
+      session_key: "stale-retune-host",
+      display_name: "Stale retune host",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "fixture",
+      provider: "fixture_provider",
+      model: Model.new("fixture-model")
+    })
+
+    start_lane!(ctx.db, "stale-retune-host")
+
+    result =
+      handlers["tune"].(%{
+        origin: "user:flynn",
+        session_key: "stale-retune-host",
+        on_tune_elected: fn ->
+          # The retune's model was validated against TESTHOST's catalog, and
+          # its fork would be built with testhost placement. Moving the host
+          # under the election makes both stale; the harness alone matching
+          # must NOT be enough (Sol round 3, blocking).
+          {:ok, _} =
+            DB.transaction(ctx.db, fn txn ->
+              DB.Txn.q(txn, "UPDATE sessions SET host='otherhost' WHERE sessionKey=?1", [
+                "stale-retune-host"
+              ])
+            end)
+        end,
+        params: %{setting: "set_model", model: "fixture-model"}
+      })
+
+    assert %{ok: false, code: "stale_election"} = result
+
+    fresh = Org.get(ctx.db, "stale-retune-host")
+    assert fresh.host == "otherhost"
+    assert fresh.harness == "fixture"
+
+    markers =
+      Projection.list_after(ctx.db, "stale-retune-host", nil, 50, 0)
+      |> Enum.filter(&String.contains?(&1.content || "", "[model retune]"))
+
+    assert markers == []
+  end
+
   test "the loser of two racing swap elections is refused IN the transaction",
        ctx do
     handlers = stale_election_arena!(ctx, "swap-loser")
@@ -2314,8 +2364,7 @@ defmodule Tightbeam.GatewayTest do
     # Refused by the in-transaction re-check — same_harness, by the same name
     # a sequential request gets — and the WINNER's outcome stands untouched:
     # its model, one barrier move, one tombstone.
-    assert %{ok: false, code: code} = loser_result
-    assert code in ["distinct_harness", "same_harness"]
+    assert %{ok: false, code: "same_harness"} = loser_result
 
     fresh = Org.get(ctx.db, "swap-loser")
     assert fresh.harness == "fixture"

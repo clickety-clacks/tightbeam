@@ -4940,10 +4940,11 @@ defmodule Tightbeam.Gateway do
       nil ->
         result =
           DB.transaction(db, fn txn ->
-            {record_model, record_harness} = read_recorded_model(txn, session.session_key)
+            {record_model, record_harness, record_host} =
+              read_recorded_model(txn, session.session_key)
 
             cond do
-              record_harness != session.harness ->
+              record_harness != session.harness or record_host != session.host ->
                 :stale_election
 
               record_model == new_ref ->
@@ -5079,17 +5080,17 @@ defmodule Tightbeam.Gateway do
   # holds FIELDS, so this is where they become an identity again — never a
   # packed column read straight into a comparison.
   defp read_recorded_model(txn, session_key) do
-    [[family, effort, context, harness]] =
+    [[family, effort, context, harness, host]] =
       Txn.q(
         txn,
         """
-        SELECT model, thinkingLevel, modelContext, harness
+        SELECT model, thinkingLevel, modelContext, harness, host
         FROM sessions WHERE sessionKey=?1
         """,
         [session_key]
       )
 
-    {family && %Model{family: family, effort: effort, context: context}, harness}
+    {family && %Model{family: family, effort: effort, context: context}, harness, host}
   end
 
   defp project_tuned_model(
@@ -5103,19 +5104,21 @@ defmodule Tightbeam.Gateway do
        ) do
     result =
       DB.transaction(db, fn txn ->
-        {record_model, record_harness} = read_recorded_model(txn, session.session_key)
+        {record_model, record_harness, record_host} =
+          read_recorded_model(txn, session.session_key)
 
-        # THE ELECTION'S SNAPSHOT MUST STILL HOLD (Sol round 2, blocking 1).
-        # This model was validated against `session.harness`'s catalog and
-        # provider BEFORE the turn boundary was taken. A harness switch that
-        # committed in between leaves this row on a different engine — and the
-        # old code would have committed a claude model and provider onto a
-        # codex session, both calls reporting success. The fresh in-txn read
-        # is a PRECONDITION here, never a substitute target: a stale election
-        # is refused by name, and the caller re-elects against the session as
-        # it now is.
+        # THE ELECTION'S SNAPSHOT MUST STILL HOLD (Sol rounds 2-3). BOTH axes:
+        # this model was validated against `session.harness`'s catalog ON
+        # `session.host`, and the fork was built with that host's placement,
+        # guidance and cwd. A harness switch OR a set_host committing in
+        # between leaves this row somewhere the election never saw — the old
+        # code would have committed a claude model onto a codex session, or a
+        # host-A-validated model onto a session now living on host B, all
+        # calls reporting success. The fresh in-txn read is a PRECONDITION,
+        # never a substitute target: a stale election is refused by name, and
+        # the caller re-elects against the session as it now is.
         outcome =
-          if record_harness != session.harness do
+          if record_harness != session.harness or record_host != session.host do
             :stale_election
           else
             project_tuned_swap(txn, session, record_model, record_harness, new_ref, provider)
