@@ -164,7 +164,13 @@ defmodule Tightbeam.GithubAuth do
     end
   end
 
-  defp classify_api_failure(detail) do
+  # Keyword sets are part of the cross-language contract: the Rust classifier
+  # (cli/src/github_auth/probe.rs) must classify identically — "invalid oauth
+  # token" and "not logged into any accounts" both mean needs_onboarding on
+  # both sides. "auth" deliberately catches oauth, authentication, and
+  # unauthorized. Public only for the parity test.
+  @doc false
+  def classify_api_failure(detail) do
     down = String.downcase(to_string(detail))
 
     cond do
@@ -172,7 +178,8 @@ defmodule Tightbeam.GithubAuth do
           String.contains?(down, "403") ->
         :insufficient_scope
 
-      String.contains?(down, "auth") or String.contains?(down, "401") ->
+      String.contains?(down, "auth") or String.contains?(down, "not logged") or
+          String.contains?(down, "401") ->
         :needs_onboarding
 
       true ->
