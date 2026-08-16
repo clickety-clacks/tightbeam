@@ -450,4 +450,139 @@ defmodule Tightbeam.OrgTest do
         }
     end
   end
+
+  ## Durable process custody (spec art_6817803a rev6 §B5, additive per att_4e52a5be)
+  ##
+  ## These live here rather than beside the fence module because the SUBJECT is
+  ## retirement's observable behaviour. A reader asking "what does retiring a
+  ## session do now" must find the answer in Org's own tests.
+
+  alias Tightbeam.ManagedProcesses
+
+  defp custody_session(db, key) do
+    Org.create(db, base(%{session_key: key, display_name: key}))
+  end
+
+  defp retire_in_txn!(db, key) do
+    {:ok, session} =
+      DB.transaction(db, fn txn -> Org.retire_in_txn(txn, key, "user:flynn", 1_000) end)
+
+    session
+  end
+
+  defp preparing_process(db, session_key) do
+    attrs = %{
+      process_id: "mp_#{System.unique_integer([:positive])}",
+      owner_user_id: "flynn",
+      owner_session_key: session_key,
+      session_generation: 1,
+      launch_turn_seq: nil,
+      host: "testhost",
+      purpose: "onboarding_ceremony",
+      command_descriptor: "codex login (digest sha256:abcd)",
+      launch_token: "tok_#{System.unique_integer([:positive])}",
+      launch_deadline: 10_000,
+      lease_expires_at: 60_000,
+      now: 1_000
+    }
+
+    {:ok, {:ok, row}} = DB.transaction(db, &ManagedProcesses.insert_preparing(&1, attrs))
+    row
+  end
+
+  # The ordinary case, and the one that must not change: a session owning no
+  # managed process retires exactly as it did before durable custody existed.
+  test "a session with no managed process still retires outright", %{db: db} do
+    custody_session(db, "agent:plain")
+
+    assert %{state: "retired"} = retire_in_txn!(db, "agent:plain")
+    assert ManagedProcesses.fence(db, "agent:plain").state == "retired"
+  end
+
+  # §B5, acceptance 8 and 19. Reporting this session retired is the exact lie the
+  # fence exists to prevent: a process nobody has proved anything about is still
+  # out there, and `process-reconcile` is the repair.
+  test "an unresolved process defers retirement and the session stays active", %{db: db} do
+    custody_session(db, "agent:busy")
+    row = preparing_process(db, "agent:busy")
+
+    {:ok, _} =
+      DB.transaction(db, fn txn ->
+        ManagedProcesses.transition(
+          txn,
+          row.processId,
+          [state: "preparing", revision: 1],
+          %{state: "identity_unknown", uncertainty_cause: "launch_handoff_unknown", now: 2_000}
+        )
+      end)
+
+    assert %{state: "active"} = retire_in_txn!(db, "agent:busy")
+
+    fence = ManagedProcesses.fence(db, "agent:busy")
+    assert fence.state == "retiring"
+    assert fence.finalizedAt == nil
+
+    # The census installed retirement as the reason of record WITHOUT claiming
+    # the process is gone: the uncertainty survives beside the stop cause.
+    settled = ManagedProcesses.get(db, row.processId)
+    assert settled.state == "identity_unknown"
+    assert settled.stopCause == "session_retired"
+    assert settled.uncertaintyCause == "launch_handoff_unknown"
+  end
+
+  # §B5, acceptance 23 and 24: once the last row terminalizes, an EXACT retry
+  # finalizes, and a further retry is idempotent rather than a second retirement.
+  test "an exact retry retires once the blocking row resolves", %{db: db} do
+    custody_session(db, "agent:later")
+    row = preparing_process(db, "agent:later")
+
+    assert %{state: "active"} = retire_in_txn!(db, "agent:later")
+
+    blocked = ManagedProcesses.get(db, row.processId)
+    assert blocked.state == "launch_cancel_requested"
+    assert blocked.stopCause == "session_retired"
+
+    {:ok, _} =
+      DB.transaction(db, fn txn ->
+        ManagedProcesses.transition(
+          txn,
+          row.processId,
+          [state: "launch_cancel_requested", revision: blocked.revision],
+          %{state: "launch_canceled", resolved_at: 7_000, now: 7_000}
+        )
+      end)
+
+    assert %{state: "retired"} = retire_in_txn!(db, "agent:later")
+
+    fence = ManagedProcesses.fence(db, "agent:later")
+    assert fence.state == "retired"
+    assert fence.generation == 1, "an exact retry must not open a second retirement"
+
+    assert %{state: "retired"} = retire_in_txn!(db, "agent:later")
+    assert ManagedProcesses.fence(db, "agent:later").generation == 1
+  end
+
+  # A deferred retirement leaves wakes ALONE. They still belong to a session that
+  # is still running, and cancelling them would strand work the owner can still
+  # reach after `process-reconcile` clears the block.
+  test "a deferred retirement does not cancel the session's wakes", %{db: db} do
+    custody_session(db, "agent:wakes")
+    preparing_process(db, "agent:wakes")
+
+    {:ok, _} =
+      DB.transaction(db, fn txn ->
+        Wakes.schedule_in_txn(txn, %{
+          wake_id: "w_custody_defer",
+          session_key: "agent:wakes",
+          origin: "user:flynn",
+          prompt: "still yours",
+          due_at: 9_000_000
+        })
+      end)
+
+    assert %{state: "active"} = retire_in_txn!(db, "agent:wakes")
+
+    assert {:ok, [["pending"]]} =
+             DB.query(db, "SELECT state FROM wakes WHERE wakeId = ?1", ["w_custody_defer"])
+  end
 end
