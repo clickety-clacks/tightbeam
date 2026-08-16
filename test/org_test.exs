@@ -810,4 +810,74 @@ defmodule Tightbeam.OrgTest do
     assert %{state: "retired"} = Org.get(db, child.session_key)
     assert %{state: "retired"} = Org.get(db, parent.session_key)
   end
+
+  # REVIEW att_8017ebe7 F2, boot half. Boot recovery had no production entry
+  # point at all; this is the callable one. The remaining gap is its call site
+  # in lib/tightbeam/boot.ex, which is outside this assignment's declared
+  # custody and requested.
+  test "boot recovery settles expired leases and finalizes what became finishable", %{db: db} do
+    custody_session(db, "agent:boot-finishable")
+    custody_session(db, "agent:boot-stuck")
+
+    finishable = preparing_process(db, "agent:boot-finishable")
+    stuck = preparing_process(db, "agent:boot-stuck")
+
+    # Both sessions retire and defer; then one process terminalizes and the
+    # other becomes genuinely unknown — the shape a crash leaves behind.
+    assert %{state: "active"} = retire_in_txn!(db, "agent:boot-finishable")
+    assert %{state: "active"} = retire_in_txn!(db, "agent:boot-stuck")
+
+    blocked = ManagedProcesses.get(db, finishable.processId)
+
+    {:ok, _} =
+      DB.transaction(db, fn txn ->
+        ManagedProcesses.transition(
+          txn,
+          blocked.processId,
+          [state: "launch_cancel_requested", revision: blocked.revision],
+          %{state: "launch_canceled", resolved_at: 7_000, now: 7_000}
+        )
+
+        stuck_row = ManagedProcesses.get_in_txn(txn, stuck.processId)
+
+        ManagedProcesses.transition(
+          txn,
+          stuck.processId,
+          [state: stuck_row.state, revision: stuck_row.revision],
+          %{state: "identity_unknown", uncertainty_cause: "launch_handoff_unknown", now: 7_000}
+        )
+      end)
+
+    summary = Tightbeam.Gateway.recover_process_custody(db)
+
+    assert "agent:boot-finishable" in summary.retired
+    assert "agent:boot-stuck" in summary.blocked_sessions
+
+    assert %{state: "retired"} = Org.get(db, "agent:boot-finishable")
+
+    # The unknown one is NOT cleaned up by a restart. Evidence is :not_probed on
+    # this line, so recovery settles and reports but never fabricates absence.
+    assert %{state: "active"} = Org.get(db, "agent:boot-stuck")
+    still = ManagedProcesses.get(db, stuck.processId)
+    assert still.state == "identity_unknown"
+    assert still.stopCause == "session_retired"
+    refute still.state in ManagedProcesses.terminal_states()
+  end
+
+  test "boot recovery is idempotent and terminalizes nothing on a repeat", %{db: db} do
+    custody_session(db, "agent:boot-repeat")
+    row = preparing_process(db, "agent:boot-repeat")
+    assert %{state: "active"} = retire_in_txn!(db, "agent:boot-repeat")
+
+    first = Tightbeam.Gateway.recover_process_custody(db)
+    assert first.blocked_sessions == ["agent:boot-repeat"]
+
+    before = ManagedProcesses.get(db, row.processId)
+    second = Tightbeam.Gateway.recover_process_custody(db)
+    assert second.blocked_sessions == ["agent:boot-repeat"]
+
+    after_row = ManagedProcesses.get(db, row.processId)
+    assert after_row.state == before.state
+    refute after_row.state in ManagedProcesses.terminal_states()
+  end
 end

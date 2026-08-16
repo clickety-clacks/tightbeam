@@ -6030,6 +6030,64 @@ defmodule Tightbeam.Gateway do
     walk.(walk, root_key)
   end
 
+  @doc """
+  Boot recovery for durable process custody (spec art_6817803a rev6 §B5, review
+  att_8017ebe7 F2).
+
+  Two passes, in this order and for a reason:
+
+    1. Every row a restart must look at — the four nonterminal states plus the
+       two unresolved, across all sessions — goes through the SAME
+       `reconcile_in_txn/3` the `process-reconcile` verb uses, so restart repair
+       and the manual repair cannot drift into two decision tables that
+       disagree about what proof means.
+    2. Every session still behind an open retirement fence is then offered to
+       the finalizer, because a row that terminalizes in pass 1 is exactly what
+       makes its session finishable — and because an older build could have
+       terminalized the last process and died before finalizing, leaving a
+       session `retiring` for ever with nothing left to trigger it.
+
+  EVIDENCE IS `:not_probed`, and that is the honest value on this line: there is
+  no OS probe here yet. So this settles expired leases, installs the causes those
+  imply, and reports — but it will not fabricate an absence proof, and no row is
+  terminalized on the strength of a restart alone. A process whose fate is
+  genuinely unknown stays unresolved and keeps blocking its session's
+  retirement, which is the fail-closed behaviour §B3 requires.
+
+  Returns a summary rather than logging inside the transaction, so the caller
+  decides what to say about it.
+  """
+  @spec recover_process_custody(DB.server()) :: %{
+          reconciled: non_neg_integer(),
+          still_blocked: non_neg_integer(),
+          retired: [String.t()],
+          blocked_sessions: [String.t()]
+        }
+  def recover_process_custody(db \\ DB) do
+    now = System.system_time(:millisecond)
+
+    {:ok, result} =
+      DB.transaction(db, fn txn ->
+        outcomes =
+          txn
+          |> ManagedProcesses.recovery_rows_in_txn()
+          |> Enum.map(fn row ->
+            ManagedProcesses.reconcile_in_txn(txn, row.processId, now: now, evidence: :not_probed)
+          end)
+
+        finalized = Org.finalize_open_retirements_in_txn(txn, now)
+
+        %{
+          reconciled: length(outcomes),
+          still_blocked: Enum.count(outcomes, &match?({:blocked, _}, &1)),
+          retired: finalized.retired,
+          blocked_sessions: finalized.blocked
+        }
+      end)
+
+    result
+  end
+
   @doc false
   # Test seam for the retirement cascade's durable-truth contract (review
   # att_8017ebe7 F3). The cascade is private and reached in production only
