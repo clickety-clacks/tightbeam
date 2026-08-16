@@ -41,7 +41,8 @@ pub struct GithubStatus {
 
 pub fn onboard(hostname: &str, remote: Option<&str>) -> Result<(), String> {
     let base_dir = crate::base_dir::resolve();
-    onboard_with(hostname, remote, &base_dir, RealGh)
+    let gh = RealGh::banking_into(&base_dir)?;
+    onboard_with(hostname, remote, &base_dir, gh)
 }
 
 pub fn check_tool_call_stdin() -> Result<(), String> {
@@ -49,7 +50,16 @@ pub fn check_tool_call_stdin() -> Result<(), String> {
     std::io::stdin()
         .read_to_string(&mut raw)
         .map_err(|error| format!("could not read tool-call JSON from stdin: {error}"))?;
-    check_tool_call_with(&raw, &RealGh)
+    let base_dir = crate::base_dir::resolve();
+    check_tool_call_with(&raw, &RealGh::using_banked(&base_dir))
+}
+
+/// The Tightbeam-owned gh config dir. One shared dir, not per-hostname:
+/// GH_CONFIG_DIR is single-valued while gh's hosts.yml natively holds every
+/// hostname, so per-host dirs would make a project that spans github.com and a
+/// GHE host impossible to configure.
+pub fn gh_config_dir(base_dir: &Path) -> PathBuf {
+    base_dir.join("auth").join("github").join("gh")
 }
 
 trait Gh {
@@ -59,7 +69,53 @@ trait Gh {
     fn git_ls_remote(&self, remote: &str) -> Result<Output, String>;
 }
 
-struct RealGh;
+/// Runs gh (and git, whose credential helper is gh) against the banked
+/// Tightbeam config dir when one exists. The OS keyring is deliberately out of
+/// the read path: agent processes descend from the gateway daemon, and a
+/// daemon-descended context cannot read the login keychain
+/// (errSecInteractionNotAllowed) — a keyring credential probes live from an
+/// operator terminal while being unreadable everywhere project work runs.
+struct RealGh {
+    config_dir: Option<PathBuf>,
+}
+
+impl RealGh {
+    /// Probe-side construction: use the banked dir if it exists, otherwise
+    /// inherit the ambient environment unchanged (bootstrap, dev checkouts).
+    fn using_banked(base_dir: &Path) -> Self {
+        let dir = gh_config_dir(base_dir);
+        RealGh {
+            config_dir: dir.is_dir().then_some(dir),
+        }
+    }
+
+    /// Onboarding-side construction: the banked dir is the destination, so it
+    /// is created (0700) before gh runs.
+    fn banking_into(base_dir: &Path) -> Result<Self, String> {
+        let dir = gh_config_dir(base_dir);
+        fs::create_dir_all(&dir)
+            .map_err(|error| format!("could not create {}: {error}", dir.display()))?;
+        let mut restrict = dir.clone();
+        loop {
+            fs::set_permissions(&restrict, fs::Permissions::from_mode(0o700))
+                .map_err(|error| format!("could not set 0700 on {}: {error}", restrict.display()))?;
+            if restrict.ends_with("auth") || !restrict.pop() {
+                break;
+            }
+        }
+        Ok(RealGh {
+            config_dir: Some(dir),
+        })
+    }
+
+    fn command(&self, program: &str) -> Command {
+        let mut command = Command::new(program);
+        if let Some(dir) = &self.config_dir {
+            command.env("GH_CONFIG_DIR", dir);
+        }
+        command
+    }
+}
 
 impl Gh for RealGh {
     fn which_gh(&self) -> Option<PathBuf> {
@@ -67,21 +123,21 @@ impl Gh for RealGh {
     }
 
     fn output(&self, args: &[&str]) -> Result<Output, String> {
-        Command::new("gh")
+        self.command("gh")
             .args(args)
             .output()
             .map_err(|error| format!("failed to run gh {}: {error}", args.join(" ")))
     }
 
     fn status(&self, args: &[&str]) -> Result<std::process::ExitStatus, String> {
-        Command::new("gh")
+        self.command("gh")
             .args(args)
             .status()
             .map_err(|error| format!("failed to run gh {}: {error}", args.join(" ")))
     }
 
     fn git_ls_remote(&self, remote: &str) -> Result<Output, String> {
-        Command::new("git")
+        self.command("git")
             .args(["ls-remote", remote, "HEAD"])
             .output()
             .map_err(|error| format!("failed to run git ls-remote: {error}"))
@@ -106,6 +162,11 @@ fn onboard_with(
                 "GitHub auth for {hostname} is not live ({state}); starting GitHub CLI login.",
                 state = status.state.as_str()
             );
+            // --insecure-storage is deliberate, not a fallback: the credential
+            // must land in the banked GH_CONFIG_DIR as a 0600 file, because the
+            // OS keyring is unreadable from the daemon-descended environments
+            // that do project work. The storage mode is surfaced in the result
+            // and in capability metadata rather than passing as implicit success.
             let login = gh.status(&[
                 "auth",
                 "login",
@@ -114,6 +175,7 @@ fn onboard_with(
                 "--web",
                 "--git-protocol",
                 "https",
+                "--insecure-storage",
             ])?;
             if !login.success() {
                 return Err(format!(
@@ -156,6 +218,8 @@ fn onboard_with(
             "gitProtocol": status.git_protocol,
             "gitRemote": status.git_remote,
             "gitReady": status.git_ready,
+            "storage": "file",
+            "configDir": gh_config_dir(base_dir),
             "metadata": metadata_path(base_dir, &hostname),
         }))
         .expect("JSON value serializes")
@@ -301,6 +365,7 @@ fn check_tool_call_with(raw: &str, gh: &impl Gh) -> Result<(), String> {
     let texts = tool_call_strings(raw);
     let mut remotes = texts
         .iter()
+        .filter(|text| has_git_operation(text) || looks_like_gh_repo_call(text))
         .flat_map(|text| github_remotes(text))
         .collect::<Vec<_>>();
     remotes.sort();
@@ -378,13 +443,52 @@ fn collect_json_strings(value: &serde_json::Value, strings: &mut Vec<String>) {
     }
 }
 
+// The guard judges operations, not mentions. A `tightbeam assign` whose brief
+// says "read the gh issue thread at https://github.com/org/repo" performs no
+// GitHub operation and must not be refused — that false positive blocked real
+// org traffic on day one. Command-position matching under-matches by design
+// (e.g. a gh call nested inside `sh -c "..."` slips through): for a hygiene
+// gate the acceptable direction to be wrong in is letting gh fail at runtime
+// with its own auth error, never blocking commands that merely talk about
+// GitHub.
 fn looks_like_gh_repo_call(text: &str) -> bool {
+    has_operation(text, "gh ", &["repo", "pr", "issue", "api"])
+}
+
+fn has_git_operation(text: &str) -> bool {
+    has_operation(
+        text,
+        "git ",
+        &[
+            "clone",
+            "fetch",
+            "pull",
+            "push",
+            "ls-remote",
+            "remote",
+            "submodule",
+        ],
+    )
+}
+
+fn has_operation(text: &str, program: &str, areas: &[&str]) -> bool {
     let down = text.to_ascii_lowercase();
-    down.contains("gh repo clone")
-        || down.contains("gh repo fork")
-        || down.contains("gh repo view")
-        || down.contains("gh pr ")
-        || down.contains("gh issue ")
+    down.match_indices(program).any(|(idx, _)| {
+        at_command_position(&down, idx)
+            && areas.iter().any(|area| {
+                let rest = down[idx + program.len()..].trim_start();
+                rest.strip_prefix(area)
+                    .is_some_and(|after| after.is_empty() || !after.starts_with(char::is_alphanumeric))
+            })
+    })
+}
+
+fn at_command_position(text: &str, idx: usize) -> bool {
+    let head = text[..idx].trim_end_matches([' ', '\t']);
+    match head.chars().last() {
+        None => true,
+        Some(ch) => matches!(ch, ';' | '&' | '|' | '(' | '{' | '\n' | '`'),
+    }
 }
 
 fn github_remotes(text: &str) -> Vec<String> {
@@ -542,6 +646,7 @@ fn write_metadata(base_dir: &Path, status: &GithubStatus) -> Result<(), String> 
         "checked_at_unix": checked_at,
         "status": status.state.as_str(),
         "source": "gh",
+        "storage": "file",
     });
     fs::write(
         &path,
@@ -693,6 +798,7 @@ mod tests {
                     "--web",
                     "--git-protocol",
                     "https",
+                    "--insecure-storage",
                 ],
                 std::process::ExitStatus::from_raw(0),
             )
@@ -710,6 +816,7 @@ mod tests {
         let metadata = fs::read_to_string(metadata_path(&root, "github.com")).unwrap();
         assert!(metadata.contains("\"status\": \"live\""));
         assert!(metadata.contains("\"account\": \"octo\""));
+        assert!(metadata.contains("\"storage\": \"file\""));
         assert!(!metadata.contains("token"));
         assert!(!metadata.contains("PAT"));
         assert_eq!(
@@ -829,5 +936,96 @@ mod tests {
         assert!(error.contains("tightbeam onboard github --hostname github.com"));
         assert!(error.contains("--remote https://github.com/org/repo.git"));
         assert!(error.contains("Do not paste a PAT into an agent"));
+    }
+
+    #[test]
+    fn tool_call_guard_ignores_github_mentions_that_are_not_operations() {
+        // A refusal here would block org traffic whose *prose* names GitHub —
+        // the exact false positive that hit `tightbeam assign --brief` on the
+        // first live project. FakeGh::new(false) has no gh at all, so any probe
+        // attempt would refuse: Ok proves no probe ran.
+        for command in [
+            "tightbeam assign --subject work --brief 'read the gh issue thread \
+             at https://github.com/org/repo and summarize'",
+            "echo see https://github.com/org/repo.git for details",
+            "tightbeam wake --role coder --prompt 'fork https://github.com/org/repo, \
+             then gh pr create'",
+        ] {
+            let raw = serde_json::json!({
+                "tool_name": "Bash",
+                "tool_input": {"command": command}
+            })
+            .to_string();
+            assert_eq!(
+                check_tool_call_with(&raw, &FakeGh::new(false)),
+                Ok(()),
+                "mention-only command must not be probed: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_call_guard_still_refuses_operations_after_shell_connectors() {
+        for command in [
+            "cd /work && git clone https://github.com/org/repo.git",
+            "true; gh issue list --repo org/repo",
+            "git fetch https://github.com/org/repo.git | cat",
+        ] {
+            let raw = serde_json::json!({
+                "tool_name": "Bash",
+                "tool_input": {"command": command}
+            })
+            .to_string();
+            let error = check_tool_call_with(&raw, &FakeGh::new(false)).unwrap_err();
+            assert!(
+                error.contains("Tightbeam cannot use GitHub"),
+                "operation must still be gated: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn banked_config_dir_is_shared_across_hostnames() {
+        let base = Path::new("/base");
+        assert_eq!(
+            gh_config_dir(base),
+            Path::new("/base/auth/github/gh"),
+            "one dir for all hostnames: GH_CONFIG_DIR is single-valued while hosts.yml is not"
+        );
+    }
+
+    #[test]
+    fn banking_into_creates_restricted_config_dir() {
+        let root = std::env::temp_dir().join(format!(
+            "tb-gh-bank-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let gh = RealGh::banking_into(&root).unwrap();
+        let dir = gh_config_dir(&root);
+        assert_eq!(gh.config_dir.as_deref(), Some(dir.as_path()));
+        for restricted in [&dir, &root.join("auth/github"), &root.join("auth")] {
+            assert_eq!(
+                fs::metadata(restricted).unwrap().permissions().mode() & 0o777,
+                0o700,
+                "{} must not be group/world readable",
+                restricted.display()
+            );
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn using_banked_ignores_a_missing_config_dir() {
+        let root = std::env::temp_dir().join(format!(
+            "tb-gh-missing-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        assert_eq!(RealGh::using_banked(&root).config_dir, None);
     }
 }

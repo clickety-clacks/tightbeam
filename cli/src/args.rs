@@ -600,8 +600,11 @@ COMMANDS:
       never leaves this machine.
   onboard github [--hostname github.com] [--remote URL]
       Prove or create this host's GitHub CLI browser/device login, then stamp
-      non-secret capability metadata. With --remote, also prove git can read
-      that repository. This never asks an agent for a PAT.
+      non-secret capability metadata. The credential is banked file-backed
+      (0600) in Tightbeam's own gh config dir and agents reach it via
+      GH_CONFIG_DIR, because daemon-descended agent environments cannot read
+      the OS login keychain. With --remote, also prove git can read that
+      repository. This never asks an agent for a PAT.
 
   add-user <userId> [--admin]
       Add a user, optionally as an admin. An existing admin may run this over

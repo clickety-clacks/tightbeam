@@ -1179,7 +1179,7 @@ defmodule Tightbeam.Placement do
         {"TIGHTBEAM_MACHINE", host},
         {"PATH", path},
         {"TIGHTBEAM_LINEAGE", lineage}
-      ] ++ overlay_env
+      ] ++ github_env(config.base_dir) ++ overlay_env
 
     remote_env =
       if host_config.ssh do
@@ -1188,7 +1188,13 @@ defmodule Tightbeam.Placement do
           "TIGHTBEAM_MACHINE=#{host}",
           "TIGHTBEAM_URL=#{Application.fetch_env!(:tightbeam, :advertised_url)}",
           "PATH=#{path}",
-          "TIGHTBEAM_LINEAGE=#{lineage}"
+          "TIGHTBEAM_LINEAGE=#{lineage}",
+          # Unconditional on satellites: existence of the banked dir cannot be
+          # checked cheaply over ssh, and pointing gh at an absent dir yields
+          # the correct answer anyway (needs_onboarding on the satellite's own
+          # store), where inheriting the remote user's keyring would repeat the
+          # local trap: live from a terminal, unreadable from project work.
+          "GH_CONFIG_DIR=#{Path.join([host_config.base_dir, "auth", "github", "gh"])}"
         ] ++
           Enum.map(overlay_env, fn {name, value} ->
             "#{name}=#{Tightbeam.Harness.Support.shell_quote(value)}"
@@ -1272,6 +1278,20 @@ defmodule Tightbeam.Placement do
           raise "host #{host} toolchain directory is unavailable at adapter start (exit #{exit}): #{dir}"
       end
     end)
+  end
+
+  # The GitHub host capability reaches agents as a path, never as token bytes:
+  # `tightbeam onboard github` banks a file-backed gh credential under the base
+  # dir, and GH_CONFIG_DIR points gh (and git, through gh's credential helper)
+  # at it. The OS login keychain is not an alternative here — agent processes
+  # descend from the gateway daemon, and that context cannot read it
+  # (errSecInteractionNotAllowed), so a keyring credential probes live from an
+  # operator terminal while failing everywhere project work actually runs.
+  # Absent dir = not onboarded; gh then reports needs_onboarding instead of
+  # silently consulting a store agents cannot reach.
+  defp github_env(base_dir) do
+    dir = Path.join([base_dir, "auth", "github", "gh"])
+    if File.dir?(dir), do: [{"GH_CONFIG_DIR", dir}], else: []
   end
 
   @doc """
