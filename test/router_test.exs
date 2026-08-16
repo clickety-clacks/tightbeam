@@ -258,6 +258,86 @@ defmodule Tightbeam.Wire.RouterTest do
     assert JSON.decode!(not_owner.resp_body)["error"]["code"] == "not_owner"
   end
 
+  # The --status filter had the same shape of defect the operator verbs did: a working
+  # unit but an unproven wire path. Escalation.list appended `AND status = ?` for ANY
+  # binary status, so `decision-requests --status all` filtered on the literal 'all' and
+  # returned nothing. The unit tests in escalation_test.exs call Escalation.list/list_status
+  # DIRECTLY; this drives the filter THROUGH /agent/dispatch against the REAL Gateway
+  # handler, so status=all listing rows and status=bogus reaching the client as a named
+  # refusal are both proven on the wire, not just at the seam.
+  test "decision-requests status filter crosses the wire router: all lists, illegal refuses",
+       ctx do
+    owner = ctx.device.user_id
+    raiser = create_session(ctx.db, "dr-filter-raiser", owner, is_built_in: true)
+    handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})
+    ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, handlers)}
+
+    # Two requests spanning two statuses: one left open, one ruled.
+    open_ask =
+      dispatch_cli(ctx, raiser.cli_token, %{
+        verb: "operator-ask",
+        params: %{question: "q-open?", options: [%{label: "a"}, %{label: "b"}]}
+      })
+
+    assert is_binary(open_id = JSON.decode!(open_ask.resp_body)["result"]["id"])
+
+    ruled_ask =
+      dispatch_cli(ctx, raiser.cli_token, %{
+        verb: "operator-ask",
+        params: %{question: "q-ruled?", options: [%{label: "a"}, %{label: "b"}]}
+      })
+
+    assert is_binary(ruled_id = JSON.decode!(ruled_ask.resp_body)["result"]["id"])
+
+    ruled =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "operator-rule",
+        asUser: owner,
+        params: %{request: ruled_id, decision: "a"}
+      })
+
+    assert ruled.status == 200
+
+    list_ids = fn params ->
+      resp =
+        dispatch_cli(ctx, "tbc_test", %{verb: "decision-requests", asUser: owner, params: params})
+
+      assert resp.status == 200
+      JSON.decode!(resp.resp_body)["result"]["decisionRequests"] |> Enum.map(& &1["id"])
+    end
+
+    # status=all returns rows in BOTH statuses over the wire — the regression: before the
+    # fix this filtered on literal 'all' and returned [].
+    all_ids = list_ids.(%{status: "all"})
+    assert open_id in all_ids
+    assert ruled_id in all_ids
+
+    # Absent status defaults to "open" through the router: the open row shows, the ruled
+    # one is filtered out.
+    default_ids = list_ids.(%{})
+    assert open_id in default_ids
+    refute ruled_id in default_ids
+
+    # An explicit legal status filters over the wire to exactly that status.
+    open_only = list_ids.(%{status: "open"})
+    assert open_id in open_only
+    refute ruled_id in open_only
+
+    # An illegal status reaches the client as a NAMED refusal (HTTP 400), not a silent
+    # empty 200 — the refusal names the legal set.
+    bogus =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "decision-requests",
+        asUser: owner,
+        params: %{status: "bogus"}
+      })
+
+    assert bogus.status == 400
+    error = JSON.decode!(bogus.resp_body)["error"]
+    assert error["code"] == "invalid"
+    assert error["message"] =~ "open, ruled, consumed, withdrawn, superseded, all"
+  end
+
   test "identity status crosses the closed CLI verb router", ctx do
     response =
       dispatch_cli(ctx, "tbc_test", %{
