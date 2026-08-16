@@ -2315,4 +2315,107 @@ defmodule Tightbeam.Wire.RouterTest do
       assert verb in agent_verbs, "#{verb} must be allowlisted"
     end
   end
+
+  # REVIEW att_8017ebe7 F4. These verbs shipped ungated: any authenticated
+  # caller could read another user's process row and STOP it. The reviewer
+  # reproduced it — foreign user `mike` reading and stopping a row owned by
+  # `flynn`. This is that reproduction, kept as the regression.
+  #
+  # The refusal is `not_found`, the same answer an absent row gets, ON PURPOSE.
+  # A distinct "forbidden" would confirm the row exists to a caller with no
+  # business knowing it, turning these verbs into an existence oracle over other
+  # users' processes.
+  test "a foreign caller can neither read nor stop another user's process", ctx do
+    {:ok, _} =
+      DB.query(ctx.db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('mike', 0, 1)")
+
+    owner = create_session(ctx.db, "custody-owner", "flynn")
+    stranger = create_session(ctx.db, "custody-stranger", "mike")
+    Roles.create!(ctx.db, "custody-stranger", "mike", stranger.session_key)
+
+    :ok = Tightbeam.ManagedProcesses.ensure_schema(ctx.db)
+
+    {:ok, {:ok, row}} =
+      DB.transaction(ctx.db, fn txn ->
+        Tightbeam.ManagedProcesses.insert_preparing(txn, %{
+          process_id: "mp_owned_by_flynn",
+          owner_user_id: "flynn",
+          owner_session_key: owner.session_key,
+          session_generation: 0,
+          launch_turn_seq: nil,
+          host: "testhost",
+          purpose: "onboarding_ceremony",
+          command_descriptor: "codex login",
+          launch_token: "tok_secret",
+          launch_deadline: 10_000,
+          lease_expires_at: 60_000,
+          now: 1_000
+        })
+      end)
+
+    handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir, wake_tick_ms: 1_000})
+    ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, handlers)}
+
+    for verb <- ~w(process-get process-stop process-reconcile process-extend) do
+      params =
+        if verb == "process-extend",
+          do: %{processId: row.processId, forMs: 60_000},
+          else: %{processId: row.processId}
+
+      response = dispatch_cli(ctx, stranger.cli_token, %{verb: verb, params: params})
+
+      assert JSON.decode!(response.resp_body)["error"]["code"] == "not_found",
+             "#{verb} leaked another user's process: #{response.resp_body}"
+
+      refute response.resp_body =~ "tok_secret"
+      refute response.resp_body =~ "forbidden"
+    end
+
+    # The destructive one is the point: the row is untouched.
+    after_row = Tightbeam.ManagedProcesses.get(ctx.db, row.processId)
+    assert after_row.state == "preparing"
+    assert after_row.stopCause == nil
+    assert after_row.revision == row.revision
+  end
+
+  test "the owning session and an admin both reach their own process", ctx do
+    {:ok, _} =
+      DB.query(ctx.db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('boss', 1, 1)")
+
+    owner = create_session(ctx.db, "custody-mine", "flynn")
+    Roles.create!(ctx.db, "custody-mine", "flynn", owner.session_key)
+    admin = create_session(ctx.db, "custody-admin", "boss")
+    Roles.create!(ctx.db, "custody-admin", "boss", admin.session_key)
+
+    :ok = Tightbeam.ManagedProcesses.ensure_schema(ctx.db)
+
+    {:ok, {:ok, row}} =
+      DB.transaction(ctx.db, fn txn ->
+        Tightbeam.ManagedProcesses.insert_preparing(txn, %{
+          process_id: "mp_mine",
+          owner_user_id: "flynn",
+          owner_session_key: owner.session_key,
+          session_generation: 0,
+          launch_turn_seq: nil,
+          host: "testhost",
+          purpose: "onboarding_ceremony",
+          command_descriptor: "codex login",
+          launch_token: "tok_mine",
+          launch_deadline: 10_000,
+          lease_expires_at: 60_000,
+          now: 1_000
+        })
+      end)
+
+    handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir, wake_tick_ms: 1_000})
+    ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, handlers)}
+
+    for token <- [owner.cli_token, admin.cli_token] do
+      response =
+        dispatch_cli(ctx, token, %{verb: "process-get", params: %{processId: row.processId}})
+
+      assert response.status == 200
+      assert JSON.decode!(response.resp_body)["result"]["process"]["processId"] == "mp_mine"
+    end
+  end
 end

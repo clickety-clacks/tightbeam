@@ -749,7 +749,7 @@ defmodule Tightbeam.ManagedProcesses do
   durable claim that a workload was authorized when it was not.
   """
   @spec bind_identity_in_txn(Txn.t(), String.t(), map(), keyword()) ::
-          {:running, map()} | {:stop, map()} | {:lost, map() | nil}
+          {:running, map()} | {:stop, map()} | {:unproven, map()} | {:lost, map() | nil}
   def bind_identity_in_txn(txn, process_id, identity, opts) do
     now = Keyword.fetch!(opts, :now)
 
@@ -758,15 +758,27 @@ defmodule Tightbeam.ManagedProcesses do
         {:lost, nil}
 
       %{state: state} = row when state in ["preparing", "launch_cancel_requested"] ->
-        bound = %{
-          os_pid: Map.fetch!(identity, :os_pid),
-          process_group_id: Map.fetch!(identity, :process_group_id),
-          boot_identity: Map.fetch!(identity, :boot_identity),
-          broker_identity: Map.get(identity, :broker_identity),
-          now: now
-        }
+        # LAUNCH AUTHORITY (review att_8017ebe7 F5). The identity tuple is
+        # osPid + processGroupId + bootIdentity + launchToken, and the token is
+        # the half that proves this child is OURS rather than merely a real
+        # process that exists. Binding pid/group/boot without it accepts any
+        # broker that can name a live process — the reboot-reuse hole one level
+        # up: the other three prove "this process exists", only the token proves
+        # "we launched it". It is compared against the value stored at insert,
+        # which the broker never sees until it is handed one.
+        if Map.get(identity, :launch_token) != row.launchToken do
+          {:unproven, row}
+        else
+          bound = %{
+            os_pid: Map.fetch!(identity, :os_pid),
+            process_group_id: Map.fetch!(identity, :process_group_id),
+            boot_identity: Map.fetch!(identity, :boot_identity),
+            broker_identity: Map.get(identity, :broker_identity),
+            now: now
+          }
 
-        decide_bind(txn, row, bound, now)
+          decide_bind(txn, row, bound, now)
+        end
 
       row ->
         # Terminal, unresolved, or already running: this bind lost.
@@ -921,6 +933,9 @@ defmodule Tightbeam.ManagedProcesses do
     case bind_identity_in_txn(txn, row.processId, identity, now: now) do
       {:running, updated} -> {:ok, updated}
       {:stop, updated} -> {:blocked, updated}
+      # An identity that cannot prove it is ours is not evidence of anything.
+      # It becomes uncertainty, not a bind and not an absence proof.
+      {:unproven, _} -> reconcile_settled(row, txn, :unknown, now)
       {:lost, current} -> {:blocked, current}
     end
   end

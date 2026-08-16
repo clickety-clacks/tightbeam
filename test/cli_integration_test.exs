@@ -1279,4 +1279,67 @@ defmodule Tightbeam.CliIntegrationTest do
 
     request_id
   end
+
+  # Durable process custody through the REAL built binary (spec art_6817803a
+  # rev6 §B4). The router-seam test proves the allowlist and handler table; the
+  # Rust parser tests prove argv parsing. Neither observes the path BETWEEN
+  # them — session-file discovery, the binary's own argument handling, response
+  # rendering — and that is exactly where the equivalent defect hid on
+  # wi_756153b7, where the shipped `dispatch` verb rejected --role at its own
+  # parser while the wire path it targeted was provably correct.
+  test "the real CLI reaches every custody verb end to end", ctx do
+    {listed, code} =
+      System.cmd(ctx.binary, ["processes"], cd: ctx.workdir, stderr_to_stdout: true)
+
+    assert code == 0, "processes exited #{code}: #{listed}"
+    assert_receive {:cli_call, %{verb: "processes"}}
+
+    for verb <- ["process-get", "process-stop", "process-reconcile"] do
+      {out, code} =
+        System.cmd(ctx.binary, [verb, "mp_absent"], cd: ctx.workdir, stderr_to_stdout: true)
+
+      # An unknown process is a clean refusal, not a crash and not an invention.
+      assert code == 1, "#{verb} exited #{code}: #{out}"
+      assert out =~ "not_found", "#{verb} did not report not_found: #{out}"
+      assert_receive {:cli_call, %{verb: ^verb}}
+    end
+
+    {extended, code} =
+      System.cmd(ctx.binary, ["process-extend", "mp_absent", "--for", "30m"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert code == 1, "process-extend exited #{code}: #{extended}"
+    assert extended =~ "not_found"
+    assert_receive {:cli_call, %{verb: "process-extend", params: %{process_id: "mp_absent"}}}
+  end
+
+  # §B4 / acceptance case 18, asserted against the SHIPPED BINARY rather than a
+  # parser unit: the maintenance line exposes no generic raw-command start.
+  test "the real CLI has no generic process-start", ctx do
+    {out, code} =
+      System.cmd(ctx.binary, ["process-start", "--", "sleep", "60"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    refute code == 0, "process-start must not be a usable verb: #{out}"
+    refute_receive {:cli_call, %{verb: "process-start"}}
+  end
+
+  # `--for` without a value, and `process-extend` without `--for` at all, must
+  # refuse rather than default. A silently invented lease is the unearned
+  # promise this design exists to avoid.
+  test "the real CLI refuses process-extend without a duration", ctx do
+    {out, code} =
+      System.cmd(ctx.binary, ["process-extend", "mp_absent"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    refute code == 0
+    assert out =~ "--for", "the refusal must name the missing flag: #{out}"
+    refute_receive {:cli_call, %{verb: "process-extend"}}
+  end
 end

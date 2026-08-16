@@ -530,11 +530,21 @@ defmodule Tightbeam.ManagedProcessesTest do
 
   ## Identity bind (§B5 steps 3-7) — the one decision the barrier protects
 
-  defp identity, do: %{os_pid: 4242, process_group_id: 4242, boot_identity: "boot-abc"}
+  defp identity(token \\ nil),
+    do: %{
+      os_pid: 4242,
+      process_group_id: 4242,
+      boot_identity: "boot-abc",
+      launch_token: token
+    }
 
+  # A real broker is HANDED the launch token; the tests read it off the row for
+  # the same reason (review att_8017ebe7 F5).
   defp bind(db, process_id, now \\ 3_000) do
+    token = ManagedProcesses.get(db, process_id).launchToken
+
     tx!(db, fn txn ->
-      ManagedProcesses.bind_identity_in_txn(txn, process_id, identity(), now: now)
+      ManagedProcesses.bind_identity_in_txn(txn, process_id, identity(token), now: now)
     end)
   end
 
@@ -730,14 +740,20 @@ defmodule Tightbeam.ManagedProcessesTest do
   # generation checks cannot be bypassed by arriving via reconcile.
   test "verified identity reconciles through the same atomic bind", ctx do
     live = preparing(ctx.db)
-    assert {:ok, running} = reconcile(ctx.db, live.processId, {:identity, identity()}, 3_000)
+    live_token = ManagedProcesses.get(ctx.db, live.processId).launchToken
+
+    assert {:ok, running} =
+             reconcile(ctx.db, live.processId, {:identity, identity(live_token)}, 3_000)
+
     assert running.state == "running"
     assert running.releaseGrantedAt == 3_000
 
     expired = preparing(ctx.db, %{lease_expires_at: 2_000})
 
+    expired_token = ManagedProcesses.get(ctx.db, expired.processId).launchToken
+
     assert {:blocked, stopped} =
-             reconcile(ctx.db, expired.processId, {:identity, identity()}, 5_000)
+             reconcile(ctx.db, expired.processId, {:identity, identity(expired_token)}, 5_000)
 
     assert stopped.state == "stop_requested"
     assert stopped.stopCause == "lease_expired"
@@ -1037,5 +1053,52 @@ defmodule Tightbeam.ManagedProcessesTest do
 
     refute Map.has_key?(ManagedProcesses.writable_fields(), :one_time_code)
     refute Map.has_key?(ManagedProcesses.writable_fields(), :command)
+  end
+
+  # REVIEW att_8017ebe7 F5. Binding pid/group/boot without the stored launch
+  # token accepts any broker that can name a live process. Those three prove
+  # "this process exists"; only the token proves "we launched it".
+  test "a bind without the stored launch token proves nothing and is refused", ctx do
+    row = preparing(ctx.db)
+
+    assert {:unproven, unchanged} =
+             tx!(ctx.db, fn txn ->
+               ManagedProcesses.bind_identity_in_txn(
+                 txn,
+                 row.processId,
+                 identity("tok_not_the_stored_one"),
+                 now: 3_000
+               )
+             end)
+
+    assert unchanged.state == "preparing"
+    assert unchanged.osPid == nil, "an unproven identity must not be written"
+    assert unchanged.releaseGrantedAt == nil
+    assert ManagedProcesses.get(ctx.db, row.processId).revision == row.revision
+  end
+
+  test "a bind with a missing launch token is refused too", ctx do
+    row = preparing(ctx.db)
+
+    assert {:unproven, _} =
+             tx!(ctx.db, fn txn ->
+               ManagedProcesses.bind_identity_in_txn(txn, row.processId, identity(), now: 3_000)
+             end)
+
+    assert ManagedProcesses.get(ctx.db, row.processId).osPid == nil
+  end
+
+  # An identity that cannot prove it is ours is not evidence of anything: it
+  # becomes uncertainty, never a bind and never an absence proof.
+  test "reconcile treats an unproven identity as uncertainty, not proof", ctx do
+    row = preparing(ctx.db)
+
+    assert {:blocked, unresolved} =
+             reconcile(ctx.db, row.processId, {:identity, identity("tok_wrong")}, 5_000)
+
+    assert unresolved.state == "identity_unknown"
+    assert unresolved.uncertaintyCause == "launch_handoff_unknown"
+    assert unresolved.osPid == nil
+    refute unresolved.state in ManagedProcesses.terminal_states()
   end
 end
