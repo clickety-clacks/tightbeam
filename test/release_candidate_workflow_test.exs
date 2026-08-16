@@ -27,7 +27,28 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
     assert {_, 0} = command("tar", ["xf", archive, "-C", capture_root])
     File.rm!(archive)
     File.ln_s!(Path.join(@root, "deps"), Path.join(capture_root, "deps"))
-    File.ln_s!(Path.join(@root, "cli/target"), Path.join(capture_root, "cli/target"))
+
+    # The archive gets its OWN cargo target, NOT a symlink to the worktree's.
+    #
+    # This used to be `File.ln_s!(Path.join(@root, "cli/target"), ...)`, to reuse
+    # the build cache. The cost was invisible and severe: `packaging/assemble.sh`
+    # runs `cargo build --release` inside this archive, and through that symlink
+    # the build landed on the AUTHORITATIVE `cli/target/release/tightbeam` —
+    # replacing the real CLI, with a fresh inode, once per full suite run.
+    #
+    # Four other test files exec that binary by absolute path (test_helper,
+    # containment, conformance, cli_integration), so they could observe a binary
+    # this checkout never built. Measured across four quiescent gates: inodes
+    # 1192769024 -> 1192776109 -> 1192842397 -> 1192900781 -> 1192984930, every
+    # gate green, the artifact different each time. Green runs never revealed it;
+    # only hashing the artifact did.
+    #
+    # A private target costs a cold build here and buys an authoritative CLI that
+    # nothing mutates mid-suite. `packaging/assemble.sh` is unchanged and still
+    # performs a real build from a clean archive, which is this test's actual
+    # contract — it proves the repository's real assembler works, and it now
+    # proves it without reaching back into the tree under test.
+    File.mkdir_p!(Path.join(capture_root, "cli/target"))
 
     {assemble_output, 0} = command("sh", ["packaging/assemble.sh"], cd: capture_root)
     [artifact] = Regex.run(~r/^artifact: (.+)$/m, assemble_output, capture: :all_but_first)
