@@ -51,4 +51,17 @@ defmodule Tightbeam.GithubAuthTest do
     assert GithubAuth.scrub_detail("https://gho_secret123@github.com/org/repo.git") ==
              "https://[redacted]@github.com/org/repo.git"
   end
+
+  test "classify_api_failure matches the Rust classifier's contract" do
+    # The sentinel phrases that previously classified differently per side.
+    assert GithubAuth.classify_api_failure("invalid oauth token") == :needs_onboarding
+
+    assert GithubAuth.classify_api_failure("You are not logged into any accounts") ==
+             :needs_onboarding
+
+    assert GithubAuth.classify_api_failure("HTTP 401 unauthorized") == :needs_onboarding
+    assert GithubAuth.classify_api_failure("missing required scope") == :insufficient_scope
+    assert GithubAuth.classify_api_failure("HTTP 403 Forbidden") == :insufficient_scope
+    assert GithubAuth.classify_api_failure("connection reset by peer") == :unknown
+  end
 end

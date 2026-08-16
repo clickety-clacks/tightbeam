@@ -262,12 +262,16 @@ fn github_refusal(hostname: &str, remote: Option<&str>, status: &GithubStatus) -
     )
 }
 
+// Keyword sets are part of the cross-language contract: the Elixir brain
+// (Tightbeam.GithubAuth.classify_api_failure/1) must classify identically —
+// "invalid oauth token" and "not logged into any accounts" both mean
+// needs_onboarding on both sides. "auth" deliberately catches oauth,
+// authentication, and unauthorized.
 fn classify_api_failure(detail: &str) -> GithubState {
     let down = detail.to_ascii_lowercase();
     if down.contains("scope") || down.contains("forbidden") || down.contains("403") {
         GithubState::InsufficientScope
-    } else if down.contains("not logged") || down.contains("authentication") || down.contains("401")
-    {
+    } else if down.contains("auth") || down.contains("not logged") || down.contains("401") {
         GithubState::NeedsOnboarding
     } else {
         GithubState::Unknown
@@ -340,6 +344,36 @@ mod tests {
     use super::super::test_support::{FakeGh, out};
     use super::*;
     use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn classify_api_failure_matches_the_elixir_classifier_contract() {
+        // The sentinel phrases that previously classified differently per side
+        // (Tightbeam.GithubAuth has the mirror of this test).
+        assert_eq!(
+            classify_api_failure("invalid oauth token"),
+            GithubState::NeedsOnboarding
+        );
+        assert_eq!(
+            classify_api_failure("You are not logged into any accounts"),
+            GithubState::NeedsOnboarding
+        );
+        assert_eq!(
+            classify_api_failure("HTTP 401 unauthorized"),
+            GithubState::NeedsOnboarding
+        );
+        assert_eq!(
+            classify_api_failure("missing required scope"),
+            GithubState::InsufficientScope
+        );
+        assert_eq!(
+            classify_api_failure("HTTP 403 Forbidden"),
+            GithubState::InsufficientScope
+        );
+        assert_eq!(
+            classify_api_failure("connection reset by peer"),
+            GithubState::Unknown
+        );
+    }
 
     #[test]
     fn missing_gh_is_a_named_state_with_no_login_attempt() {
