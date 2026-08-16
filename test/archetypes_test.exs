@@ -155,6 +155,7 @@ defmodule Tightbeam.ArchetypesTest do
     assert loaded["product-owner"].skills == [
              "tightbeam-dispatching",
              "product-discovery",
+             "committing-and-pushing",
              "human-communication"
            ]
 
@@ -176,7 +177,8 @@ defmodule Tightbeam.ArchetypesTest do
         :codex
       )
 
-    assert Map.keys(product_owner.skills) == ["human-communication", "product-discovery"]
+    assert Map.keys(product_owner.skills) ==
+             ["committing-and-pushing", "human-communication", "product-discovery"]
 
     refute File.regular?(
              Path.join([
