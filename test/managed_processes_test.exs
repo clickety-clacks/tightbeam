@@ -629,4 +629,139 @@ defmodule Tightbeam.ManagedProcessesTest do
 
     assert tx!(ctx.db, &ManagedProcesses.current_generation_in_txn(&1, "agent:fresh")) == 1
   end
+
+  ## process-reconcile (§B4) — the repair every blocked answer must name
+
+  defp reconcile(db, process_id, evidence, now) do
+    tx!(db, fn txn ->
+      ManagedProcesses.reconcile_in_txn(txn, process_id, evidence: evidence, now: now)
+    end)
+  end
+
+  # §B4: reconcile settles the lease itself and "never waits for a separate
+  # sweeper to make this decision".
+  test "reconcile settles an expired lease in its own transaction", ctx do
+    row = preparing(ctx.db, %{lease_expires_at: 2_000})
+
+    assert {:blocked, settled} = reconcile(ctx.db, row.processId, :not_probed, 5_000)
+    assert settled.state == "launch_cancel_requested"
+    assert settled.stopCause == "lease_expired"
+  end
+
+  test "reconcile leaves a live lease alone and reports the deadline to look again", ctx do
+    row = preparing(ctx.db, %{lease_expires_at: 60_000})
+
+    assert {:blocked, still} = reconcile(ctx.db, row.processId, :not_probed, 5_000)
+    assert still.state == "preparing"
+    assert still.stopCause == nil
+    assert still.launchDeadline == 10_000
+  end
+
+  # §B4/§B5: only PROVEN absence terminalizes a launch. A deadline alone never
+  # fabricates it — that is the difference between detecting the event and
+  # guessing from a timeout.
+  test "proven absence terminalizes a launch, and a deadline alone does not", ctx do
+    timed_out = preparing(ctx.db)
+    assert {:blocked, _} = reconcile(ctx.db, timed_out.processId, :not_probed, 50_000)
+    assert ManagedProcesses.get(ctx.db, timed_out.processId).state == "preparing"
+
+    assert {:ok, failed} = reconcile(ctx.db, timed_out.processId, :absent, 50_000)
+    assert failed.state == "launch_failed"
+    # launch_timeout is a typed LAST ERROR, not a stop cause: a launch that
+    # never started has nothing to stop. The table's CHECK refuses the confusion.
+    assert failed.lastError == "launch_timeout"
+    assert failed.stopCause == nil
+    assert failed.resolvedAt == 50_000
+  end
+
+  test "proven absence on a cancelled launch records launch_canceled with its cause", ctx do
+    row = preparing(ctx.db)
+
+    tx!(ctx.db, fn txn ->
+      ManagedProcesses.transition(
+        txn,
+        row.processId,
+        [state: "preparing", revision: 1],
+        %{state: "launch_cancel_requested", stop_cause: "owner_stop", now: 2_000}
+      )
+    end)
+
+    assert {:ok, canceled} = reconcile(ctx.db, row.processId, :absent, 6_000)
+    assert canceled.state == "launch_canceled"
+    assert canceled.stopCause == "owner_stop"
+  end
+
+  # §B3: identity_unknown may remain unresolved indefinitely. It is a
+  # fail-closed RESULT, not a failure, and repeating the repair must not
+  # invent progress.
+  test "unknown evidence stays unresolved however often it is reconciled", ctx do
+    row = preparing(ctx.db)
+
+    for _ <- 1..3 do
+      assert {:blocked, unresolved} = reconcile(ctx.db, row.processId, :unknown, 50_000)
+      assert unresolved.state == "identity_unknown"
+      assert unresolved.uncertaintyCause == "launch_handoff_unknown"
+    end
+
+    final = ManagedProcesses.get(ctx.db, row.processId)
+    assert final.state == "identity_unknown"
+    refute final.state in ManagedProcesses.terminal_states()
+    assert ManagedProcesses.blocks_retirement?(final)
+  end
+
+  test "unknown evidence preserves a stop cause it already carried", ctx do
+    row = preparing(ctx.db)
+
+    tx!(ctx.db, fn txn ->
+      ManagedProcesses.transition(
+        txn,
+        row.processId,
+        [state: "preparing", revision: 1],
+        %{state: "launch_cancel_requested", stop_cause: "session_retired", now: 2_000}
+      )
+    end)
+
+    assert {:blocked, unresolved} = reconcile(ctx.db, row.processId, :unknown, 6_000)
+    assert unresolved.state == "identity_unknown"
+    assert unresolved.stopCause == "session_retired"
+  end
+
+  # Verified identity routes back through the atomic bind, so the lease and
+  # generation checks cannot be bypassed by arriving via reconcile.
+  test "verified identity reconciles through the same atomic bind", ctx do
+    live = preparing(ctx.db)
+    assert {:ok, running} = reconcile(ctx.db, live.processId, {:identity, identity()}, 3_000)
+    assert running.state == "running"
+    assert running.releaseGrantedAt == 3_000
+
+    expired = preparing(ctx.db, %{lease_expires_at: 2_000})
+
+    assert {:blocked, stopped} =
+             reconcile(ctx.db, expired.processId, {:identity, identity()}, 5_000)
+
+    assert stopped.state == "stop_requested"
+    assert stopped.stopCause == "lease_expired"
+    assert stopped.releaseGrantedAt == nil
+  end
+
+  test "reconciling a terminal row is a no-op that reports it", ctx do
+    row = preparing(ctx.db)
+
+    tx!(ctx.db, fn txn ->
+      ManagedProcesses.transition(
+        txn,
+        row.processId,
+        [state: "preparing", revision: 1],
+        %{state: "exited", resolved_at: 2_000, now: 2_000}
+      )
+    end)
+
+    assert {:ok, terminal} = reconcile(ctx.db, row.processId, :absent, 9_000)
+    assert terminal.state == "exited"
+    assert terminal.resolvedAt == 2_000
+  end
+
+  test "reconciling an unknown process id is refused, not invented", ctx do
+    assert {:error, :unknown_process} = reconcile(ctx.db, "mp_nope", :absent, 1_000)
+  end
 end
