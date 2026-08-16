@@ -627,6 +627,42 @@ defmodule Tightbeam.ModelCatalogTest do
     assert File.read!(store) == "sk-ant-api03-STALE"
   end
 
+  # The harvest reads the LOCAL filesystem, so the `ssh: nil` guard scopes it to
+  # a local probe: a remote host's credential lives on that host, and a 401 from
+  # its probe must fall through untouched rather than sweep this box's homes.
+  # Same rotation, same 401 body -- but the owning host is remote, so the store
+  # is left exactly as stale as it was.
+  test "a subscription 401 on a remote host is never harvested against the local store", ctx do
+    remote_base = Path.join(ctx.base_dir, "remote-root")
+    store = Path.join([remote_base, "auth", "claude", ".credentials.json"])
+    File.mkdir_p!(Path.dirname(store))
+    stale_store = ~s({"claudeAiOauth":{"accessToken":"fixture-token-STALE"}})
+    File.write!(store, stale_store)
+
+    home = Path.join([remote_base, "homes", "sat", "claude"])
+    File.mkdir_p!(home)
+    File.write!(Path.join(home, ".credentials.json"), ~s({"claudeAiOauth":{"accessToken":"fixture-token-ROTATED"}}))
+
+    {:ok, _entry} =
+      Placement.register_host(ctx.db, "sat", %{ssh: "sat.example", base_dir: remote_base, cli_bin: nil})
+
+    revoked = ~s({"type":"error","error":{"type":"authentication_error","message":"OAuth access token has been revoked."}})
+
+    sh = fn command ->
+      if claude_probe?(command),
+        do: catalog_reply(revoked, 401),
+        else: catalog_reply(JSON.encode!(%{models: []}))
+    end
+
+    catalog = start_catalog(ctx, sh: sh)
+
+    await(fn ->
+      ModelCatalog.get("sat", "claude", catalog) == {[], {:unavailable, {:http_status, 401, revoked}}}
+    end)
+
+    assert File.read!(store) == stale_store
+  end
+
   defp bearer(headers) do
     {~c"authorization", raw} = List.keyfind(headers, ~c"authorization", 0)
     to_string(raw) |> String.replace_prefix("Bearer ", "")

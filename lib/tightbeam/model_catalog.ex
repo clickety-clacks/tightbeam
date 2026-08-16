@@ -508,7 +508,7 @@ defmodule Tightbeam.ModelCatalog do
 
         probe
         |> module.fetch_catalog()
-        |> retry_after_rotation_harvest(module.id(), kind, probe, module)
+        |> retry_after_rotation_harvest(kind, probe, module)
       else
         {:needs_onboarding, reason} ->
           {:error, {:needs_onboarding, reason}}
@@ -548,18 +548,17 @@ defmodule Tightbeam.ModelCatalog do
   # credential lives on that host and this cannot reach it.
   defp retry_after_rotation_harvest(
          {:error, {:http_status, 401, _}} = error,
-         harness,
          :subscription,
          %{host_config: %{ssh: nil}} = probe,
          module
        ) do
-    Tightbeam.Homes.sweep_auth(probe.base_dir, harness)
+    Tightbeam.Homes.sweep_auth(probe.base_dir, module.id())
     module.fetch_catalog(probe)
   rescue
     _ -> error
   end
 
-  defp retry_after_rotation_harvest(result, _harness, _kind, _probe, _module), do: result
+  defp retry_after_rotation_harvest(result, _kind, _probe, _module), do: result
 
   defp credential_status(%{credential_status: status}, provider, _host)
        when is_function(status, 1),
