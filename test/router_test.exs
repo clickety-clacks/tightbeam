@@ -152,6 +152,77 @@ defmodule Tightbeam.Wire.RouterTest do
     assert agent_verbs -- handler_keys == []
   end
 
+  # The seam gh#11 named: operator-ask/-rule/-withdraw had a working Escalation
+  # implementation, a CLI that sent them, and unit tests that called Escalation
+  # DIRECTLY — but the wire router omitted them from @agent_verbs (rejected as
+  # "verb not allowed") and the Gateway handler table had no entry (unknown_verb).
+  # The unit tests never crossed the router, so the dead seam shipped. This test
+  # drives the whole operator lifecycle THROUGH /agent/dispatch against the REAL
+  # Gateway handlers, so the allowlist and the handler table must both carry the
+  # verbs for it to pass.
+  test "operator decision lifecycle crosses the wire router: ask -> list -> rule -> withdraw",
+       ctx do
+    owner = ctx.device.user_id
+    raiser = create_session(ctx.db, "operator-raiser", owner, is_built_in: true)
+    handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})
+    ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, handlers)}
+
+    # ask — as the raiser session (a session principal, which operator-ask requires)
+    ask =
+      dispatch_cli(ctx, raiser.cli_token, %{
+        verb: "operator-ask",
+        params: %{question: "ship 0.1.8?", options: [%{label: "ship"}, %{label: "hold"}]}
+      })
+
+    assert ask.status == 200
+    asked = JSON.decode!(ask.resp_body)["result"]
+    assert asked["status"] == "open"
+    assert is_binary(dr_id = asked["id"])
+
+    # list — as the owner over the org transport; the open request appears
+    listed =
+      dispatch_cli(ctx, "tbc_test", %{verb: "decision-requests", asUser: owner, params: %{}})
+
+    assert listed.status == 200
+
+    ids =
+      JSON.decode!(listed.resp_body)["result"]["decisionRequests"] |> Enum.map(& &1["id"])
+
+    assert dr_id in ids
+
+    # rule — as the owner; org transport (not the owner's personal session) so it
+    # is a genuine ruling, not the proxy_only refusal
+    ruled =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "operator-rule",
+        asUser: owner,
+        params: %{request: dr_id, decision: "ship"}
+      })
+
+    assert ruled.status == 200
+    assert JSON.decode!(ruled.resp_body)["result"]["status"] == "ruled"
+
+    # withdraw — needs an open request, so open a second and withdraw it, closing
+    # the fourth verb through the same seam
+    ask2 =
+      dispatch_cli(ctx, raiser.cli_token, %{
+        verb: "operator-ask",
+        params: %{question: "cut 0.1.9?", options: [%{label: "cut"}, %{label: "wait"}]}
+      })
+
+    assert is_binary(dr2 = JSON.decode!(ask2.resp_body)["result"]["id"])
+
+    withdrawn =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "operator-withdraw",
+        asUser: owner,
+        params: %{request: dr2, reason: "moot after ship"}
+      })
+
+    assert withdrawn.status == 200
+    assert JSON.decode!(withdrawn.resp_body)["result"]["status"] == "withdrawn"
+  end
+
   test "identity status crosses the closed CLI verb router", ctx do
     response =
       dispatch_cli(ctx, "tbc_test", %{

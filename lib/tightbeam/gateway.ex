@@ -726,6 +726,9 @@ defmodule Tightbeam.Gateway do
         Escalation.revoke_waiver(db, call, authorized: admin_origin?(db, call.origin))
       end,
       "withdraw" => fn call -> Escalation.withdraw(db, call) end,
+      "operator-ask" => fn call -> Escalation.operator_ask(db, call) end,
+      "operator-rule" => fn call -> Escalation.operator_rule(db, call) end,
+      "operator-withdraw" => fn call -> Escalation.operator_withdraw(db, call) end,
       "decision-requests" => fn call ->
         caller = resolve_caller(db, call.origin)
 
