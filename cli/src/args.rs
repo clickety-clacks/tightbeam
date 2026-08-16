@@ -751,6 +751,32 @@ COMMANDS:
       After: add the host to an archetype's `where`.
         tightbeam assimilate work-1.local --as-user flynn
 
+  processes
+      Long-running ceremonies your session owns, with the state and lease of
+      each. A ceremony appears here from before it is spawned until it reaches
+      a terminal state, so a row with no live process is a report, not a bug.
+        tightbeam processes --as-user flynn
+  process-get <processId>
+      One ceremony in full: state, owner, host, os pid, process group, launch
+      deadline, lease expiry, and the reason it stopped or is unresolved.
+  process-extend <processId> --for <duration>
+      Push the lease out for a ceremony that is still working. The lease is
+      what stops an abandoned ceremony living for ever, so extend it
+      deliberately rather than as a habit.
+        tightbeam process-get mp_01j... --as-user flynn
+        tightbeam process-extend mp_01j... --for 30m --as-user flynn
+  process-stop <processId>
+      Ask a ceremony to stop. It records the request against the durable row;
+      it does not report the process gone, because a stop that has been asked
+      for and a process that has ended are different facts and this seam will
+      not conflate them.
+  process-reconcile <processId>
+      Settle a ceremony whose fate is uncertain — after a restart, or once its
+      lease has expired. It reports what the record can prove and marks what it
+      cannot as unresolved rather than guessing an outcome.
+        tightbeam process-stop mp_01j... --as-user flynn
+        tightbeam process-reconcile mp_01j... --as-user flynn
+
 DISCOVERY: the CLI walks up from cwd for .tightbeam-session first, then uses
   TIGHTBEAM_URL + TIGHTBEAM_TOKEN, then
   <TIGHTBEAM_BASE_DIR|TIGHTBEAM_HOME|~/.tightbeam>/gateway.json.
@@ -2942,6 +2968,17 @@ mod tests {
                 "learn",
                 "list",
                 "onboard",
+                // Durable process custody's owner verbs (spec art_6817803a rev6
+                // §B4). They are in this list because the list IS the surface
+                // contract: 3fd9c97's lesson was that a verb needs the router
+                // allowlist, the handler table AND the CLI to be real, and this
+                // assertion is where a verb that exists but is undocumented
+                // gets caught.
+                "process-extend",
+                "process-get",
+                "process-reconcile",
+                "process-stop",
+                "processes",
                 "retire",
                 "reopen-assignment",
                 "revoke-assignment",
