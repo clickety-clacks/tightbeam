@@ -641,12 +641,21 @@ defmodule Tightbeam.ModelCatalogTest do
 
     home = Path.join([remote_base, "homes", "sat", "claude"])
     File.mkdir_p!(home)
-    File.write!(Path.join(home, ".credentials.json"), ~s({"claudeAiOauth":{"accessToken":"fixture-token-ROTATED"}}))
+
+    File.write!(
+      Path.join(home, ".credentials.json"),
+      ~s({"claudeAiOauth":{"accessToken":"fixture-token-ROTATED"}})
+    )
 
     {:ok, _entry} =
-      Placement.register_host(ctx.db, "sat", %{ssh: "sat.example", base_dir: remote_base, cli_bin: nil})
+      Placement.register_host(ctx.db, "sat", %{
+        ssh: "sat.example",
+        base_dir: remote_base,
+        cli_bin: nil
+      })
 
-    revoked = ~s({"type":"error","error":{"type":"authentication_error","message":"OAuth access token has been revoked."}})
+    revoked =
+      ~s({"type":"error","error":{"type":"authentication_error","message":"OAuth access token has been revoked."}})
 
     sh = fn command ->
       if claude_probe?(command),
@@ -657,7 +666,8 @@ defmodule Tightbeam.ModelCatalogTest do
     catalog = start_catalog(ctx, sh: sh)
 
     await(fn ->
-      ModelCatalog.get("sat", "claude", catalog) == {[], {:unavailable, {:http_status, 401, revoked}}}
+      ModelCatalog.get("sat", "claude", catalog) ==
+        {[], {:unavailable, {:http_status, 401, revoked}}}
     end)
 
     assert File.read!(store) == stale_store
