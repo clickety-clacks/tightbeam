@@ -43,9 +43,14 @@ impl RealGh {
         let dir = gh_config_dir(base_dir);
         fs::create_dir_all(&dir)
             .map_err(|error| format!("could not create {}: {error}", dir.display()))?;
-        for restrict in [base_dir.join("auth"), base_dir.join("auth").join("github"), dir.clone()] {
-            fs::set_permissions(&restrict, fs::Permissions::from_mode(0o700))
-                .map_err(|error| format!("could not set 0700 on {}: {error}", restrict.display()))?;
+        for restrict in [
+            base_dir.join("auth"),
+            base_dir.join("auth").join("github"),
+            dir.clone(),
+        ] {
+            fs::set_permissions(&restrict, fs::Permissions::from_mode(0o700)).map_err(|error| {
+                format!("could not set 0700 on {}: {error}", restrict.display())
+            })?;
         }
         Ok(RealGh {
             config_dir: Some(dir),

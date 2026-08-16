@@ -107,8 +107,9 @@ fn has_operation(text: &str, program: &str, areas: &[&str]) -> bool {
         at_command_position(&down, idx)
             && areas.iter().any(|area| {
                 let rest = down[idx + program.len()..].trim_start();
-                rest.strip_prefix(area)
-                    .is_some_and(|after| after.is_empty() || !after.starts_with(char::is_alphanumeric))
+                rest.strip_prefix(area).is_some_and(|after| {
+                    after.is_empty() || !after.starts_with(char::is_alphanumeric)
+                })
             })
     })
 }
@@ -154,7 +155,11 @@ fn at_command_position(text: &str, idx: usize) -> bool {
         .rfind([';', '&', '|', '(', '{', '\n', '`'])
         .map_or(0, |connector| connector + 1);
     text[span_start..idx].split_whitespace().all(|token| {
-        is_env_assignment(token) || matches!(token, "env" | "command" | "exec" | "time" | "nohup" | "xargs")
+        is_env_assignment(token)
+            || matches!(
+                token,
+                "env" | "command" | "exec" | "time" | "nohup" | "xargs"
+            )
     })
 }
 
@@ -196,7 +201,10 @@ fn repo_shaped(path: &str) -> bool {
     if path.ends_with(".git") {
         return true;
     }
-    path.split('/').filter(|segment| !segment.is_empty()).count() == 2
+    path.split('/')
+        .filter(|segment| !segment.is_empty())
+        .count()
+        == 2
 }
 
 fn prefixed_values(text: &str, prefix: &str) -> Vec<String> {
@@ -241,7 +249,7 @@ fn github_hostname_from_remote(remote: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::{out, FakeGh};
+    use super::super::test_support::{FakeGh, out};
     use super::*;
 
     #[test]

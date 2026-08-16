@@ -30,6 +30,7 @@ defmodule Tightbeam.GithubAuthTest do
 
   test "scrub_detail redacts every github token shape and credentialed URL" do
     assert GithubAuth.scrub_detail("token ghp_abc123 leaked") == "token [redacted] leaked"
+
     assert GithubAuth.scrub_detail("gho_abc ghu_abc ghs_abc ghr_abc") ==
              "[redacted] [redacted] [redacted] [redacted]"
 
@@ -37,6 +38,17 @@ defmodule Tightbeam.GithubAuthTest do
              "fine [redacted] failed"
 
     assert GithubAuth.scrub_detail("https://user:secret@github.com/org/repo.git") ==
+             "https://[redacted]@github.com/org/repo.git"
+
+    # Any scheme, not just https — parity with the Rust scrubber.
+    assert GithubAuth.scrub_detail("http://user:secret@github.com/org/repo.git") ==
+             "http://[redacted]@github.com/org/repo.git"
+
+    assert GithubAuth.scrub_detail("ssh://user:secret@github.com/org/repo.git") ==
+             "ssh://[redacted]@github.com/org/repo.git"
+
+    # Token-as-username: the token substring itself is redacted.
+    assert GithubAuth.scrub_detail("https://gho_secret123@github.com/org/repo.git") ==
              "https://[redacted]@github.com/org/repo.git"
   end
 end

@@ -72,18 +72,18 @@ defmodule Tightbeam.GithubAuth do
     env = env(base_dir)
 
     with {:gh, path} when is_binary(path) <- {:gh, System.find_executable("gh")},
-         {:auth, {_out, 0}} <-
+         {:auth, {:ok, {_out, 0}}} <-
            {:auth,
-            System.cmd("gh", ["auth", "status", "--active", "--hostname", hostname],
+            bounded_cmd("gh", ["auth", "status", "--active", "--hostname", hostname],
               stderr_to_stdout: true,
               env: env
             )},
-         {:api, {account, 0}} <-
+         {:api, {:ok, {account, 0}}} <-
            {:api,
-            System.cmd("gh", ["api", "--hostname", hostname, "user", "--jq", ".login"], env: env)},
-         {:git, {_out, 0}} <-
+            bounded_cmd("gh", ["api", "--hostname", hostname, "user", "--jq", ".login"], env: env)},
+         {:git, {:ok, {_out, 0}}} <-
            {:git,
-            System.cmd("git", ["ls-remote", remote_url, "HEAD"],
+            bounded_cmd("git", ["ls-remote", remote_url, "HEAD"],
               stderr_to_stdout: true,
               env: env
             )} do
@@ -92,29 +92,55 @@ defmodule Tightbeam.GithubAuth do
       {:gh, nil} ->
         {:error, :missing_cli, "gh is missing from PATH"}
 
-      {:auth, {detail, _status}} ->
+      {_step, :timeout} ->
+        {:error, :unknown, "GitHub readiness probe timed out"}
+
+      {_step, :error} ->
+        {:error, :unknown, "GitHub readiness probe could not run"}
+
+      {:auth, {:ok, {detail, _status}}} ->
         {:error, :needs_onboarding, scrub_detail(detail)}
 
-      {:api, {detail, _status}} ->
+      {:api, {:ok, {detail, _status}}} ->
         {:error, classify_api_failure(detail), scrub_detail(detail)}
 
-      {:git, {detail, _status}} ->
+      {:git, {:ok, {detail, _status}}} ->
         {:error, :git_unready, scrub_detail(detail)}
     end
-  rescue
-    ErlangError ->
-      {:error, :unknown, "GitHub readiness probe could not run"}
   end
 
-  @doc "Redact token material from probe output before it is surfaced anywhere."
+  @doc """
+  Redact token material from probe output before it is surfaced anywhere.
+  Held to the same width as the Rust scrubber (cli/src/github_auth/redact.rs):
+  every gh token prefix — which also covers token-as-username URLs, since the
+  token substring itself is redacted wherever it appears — plus user:password
+  userinfo under any URL scheme, not just https.
+  """
   @spec scrub_detail(term()) :: String.t()
   def scrub_detail(detail) do
     detail
     |> to_string()
     |> String.replace(~r/github_pat_[A-Za-z0-9_]+/, "[redacted]")
     |> String.replace(~r/gh[opusr]_[A-Za-z0-9_]+/, "[redacted]")
-    |> String.replace(~r{https://[^/\s:]+:[^@\s]+@}, "https://[redacted]@")
+    |> String.replace(~r{([a-zA-Z][a-zA-Z0-9+.-]*://)[^/\s:@]+:[^@\s]+@}, "\\1[redacted]@")
     |> String.trim()
+  end
+
+  # Bounded like the Rust probes (bank.rs PROBE_TIMEOUT): an unbounded
+  # `git ls-remote` against an unreachable host would hang doctor, and the
+  # spec says a timeout is `unknown`, never live. `:brutal_kill` may leave
+  # the OS child to die on its closed port — acceptable for an operator
+  # diagnostic.
+  @probe_timeout_ms 15_000
+
+  defp bounded_cmd(cmd, args, opts) do
+    task = Task.async(fn -> System.cmd(cmd, args, opts) end)
+
+    case Task.yield(task, @probe_timeout_ms) || Task.shutdown(task, :brutal_kill) do
+      {:ok, result} -> {:ok, result}
+      {:exit, _reason} -> :error
+      nil -> :timeout
+    end
   end
 
   defp known_host(nil), do: nil
@@ -128,16 +154,14 @@ defmodule Tightbeam.GithubAuth do
   end
 
   defp git_protocol(env) do
-    case System.cmd("gh", ["config", "get", "git_protocol"], env: env) do
-      {protocol, 0} ->
+    case bounded_cmd("gh", ["config", "get", "git_protocol"], env: env) do
+      {:ok, {protocol, 0}} ->
         protocol = String.trim(protocol)
         if protocol == "", do: nil, else: protocol
 
       _ ->
         nil
     end
-  rescue
-    ErlangError -> nil
   end
 
   defp classify_api_failure(detail) do
