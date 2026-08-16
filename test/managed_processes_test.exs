@@ -22,7 +22,7 @@ defmodule Tightbeam.ManagedProcessesTest do
           process_id: "mp_#{System.unique_integer([:positive])}",
           owner_user_id: "flynn",
           owner_session_key: "agent:owner",
-          session_generation: 1,
+          session_generation: 0,
           launch_turn_seq: 42,
           host: "testhost",
           purpose: "onboarding_ceremony",
@@ -70,7 +70,7 @@ defmodule Tightbeam.ManagedProcessesTest do
     assert row.uncertaintyCause == nil
     assert row.stopAttemptCount == 0
     assert row.releaseGrantedAt == nil
-    assert row.sessionGeneration == 1
+    assert row.sessionGeneration == 0, "a session that never retired is at generation 0"
   end
 
   test "a winning transition changes one row and bumps the revision", ctx do
@@ -526,5 +526,107 @@ defmodule Tightbeam.ManagedProcessesTest do
     assert ManagedProcesses.get(ctx.db, mine.processId).stopCause == nil
     assert ManagedProcesses.get(ctx.db, theirs.processId).state == "preparing"
     assert ManagedProcesses.get(ctx.db, theirs.processId).stopCause == nil
+  end
+
+  ## Identity bind (§B5 steps 3-7) — the one decision the barrier protects
+
+  defp identity, do: %{os_pid: 4242, process_group_id: 4242, boot_identity: "boot-abc"}
+
+  defp bind(db, process_id, now \\ 3_000) do
+    tx!(db, fn txn ->
+      ManagedProcesses.bind_identity_in_txn(txn, process_id, identity(), now: now)
+    end)
+  end
+
+  test "a clean bind reaches running and records the release grant", ctx do
+    row = preparing(ctx.db)
+
+    assert {:running, bound} = bind(ctx.db, row.processId)
+    assert bound.state == "running"
+    assert bound.releaseGrantedAt == 3_000
+    assert bound.osPid == 4242
+    assert bound.stopCause == nil
+  end
+
+  # §B5: if a stop won first, the bind goes only to stop_requested. It binds the
+  # identity — the stop worker needs it to signal the right group — but it must
+  # never release, and never claim a grant that did not happen.
+  test "a bind that loses to an earlier stop reaches stop_requested and never grants release",
+       ctx do
+    row = preparing(ctx.db)
+
+    tx!(ctx.db, fn txn ->
+      ManagedProcesses.transition(
+        txn,
+        row.processId,
+        [state: "preparing", revision: 1],
+        %{state: "launch_cancel_requested", stop_cause: "owner_stop", now: 2_000}
+      )
+    end)
+
+    assert {:stop, bound} = bind(ctx.db, row.processId)
+    assert bound.state == "stop_requested"
+    assert bound.stopCause == "owner_stop", "the first cause must survive the bind"
+    assert bound.releaseGrantedAt == nil
+    assert bound.osPid == 4242, "identity is still bound so the stop can find the group"
+  end
+
+  # §B5, acceptance 22: identity discovered AFTER lease expiry installs
+  # lease_expired, reaches stop_requested, and never records a release grant.
+  test "a bind after lease expiry stops instead of running", ctx do
+    row = preparing(ctx.db, %{lease_expires_at: 2_500})
+
+    assert {:stop, bound} = bind(ctx.db, row.processId, 3_000)
+    assert bound.state == "stop_requested"
+    assert bound.stopCause == "lease_expired"
+    assert bound.releaseGrantedAt == nil
+  end
+
+  # A bind belonging to a previous life of the session must not expose running.
+  # The generation captured at insert is what makes that detectable.
+  test "a bind whose session generation moved on stops instead of running", ctx do
+    row = preparing(ctx.db, %{owner_session_key: "agent:moved", session_generation: 0})
+
+    tx!(ctx.db, fn txn ->
+      ManagedProcesses.open_fence_in_txn(txn, "agent:moved",
+        retirement_epoch: 2_000,
+        principal: "user:flynn"
+      )
+    end)
+
+    assert {:stop, bound} = bind(ctx.db, row.processId)
+    assert bound.state == "stop_requested"
+    assert bound.stopCause == "session_retired"
+    assert bound.releaseGrantedAt == nil
+  end
+
+  test "a bind against an already-terminal row loses and reports the durable state", ctx do
+    row = preparing(ctx.db)
+
+    tx!(ctx.db, fn txn ->
+      ManagedProcesses.transition(
+        txn,
+        row.processId,
+        [state: "preparing", revision: 1],
+        %{state: "launch_failed", last_error: "spawn refused", resolved_at: 2_000, now: 2_000}
+      )
+    end)
+
+    assert {:lost, current} = bind(ctx.db, row.processId)
+    assert current.state == "launch_failed"
+    assert current.osPid == nil
+  end
+
+  test "the captured generation is the fence generation at insert", ctx do
+    assert tx!(ctx.db, &ManagedProcesses.current_generation_in_txn(&1, "agent:fresh")) == 0
+
+    tx!(ctx.db, fn txn ->
+      ManagedProcesses.open_fence_in_txn(txn, "agent:fresh",
+        retirement_epoch: 1_000,
+        principal: "user:flynn"
+      )
+    end)
+
+    assert tx!(ctx.db, &ManagedProcesses.current_generation_in_txn(&1, "agent:fresh")) == 1
   end
 end
