@@ -909,6 +909,47 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
         Command::HarnessProcesses { identity } => {
             Ok(request(identity, "harness-processes", vec![], vec![]))
         }
+        Command::Processes { identity } => Ok(request(identity, "processes", vec![], vec![])),
+        Command::ProcessGet {
+            identity,
+            process_id,
+        } => Ok(request(
+            identity,
+            "process-get",
+            vec![],
+            vec![string_field("processId", process_id)],
+        )),
+        Command::ProcessExtend {
+            identity,
+            process_id,
+            for_ms,
+        } => Ok(request(
+            identity,
+            "process-extend",
+            vec![],
+            vec![
+                string_field("processId", process_id),
+                format!("\"forMs\":{for_ms}"),
+            ],
+        )),
+        Command::ProcessStop {
+            identity,
+            process_id,
+        } => Ok(request(
+            identity,
+            "process-stop",
+            vec![],
+            vec![string_field("processId", process_id)],
+        )),
+        Command::ProcessReconcile {
+            identity,
+            process_id,
+        } => Ok(request(
+            identity,
+            "process-reconcile",
+            vec![],
+            vec![string_field("processId", process_id)],
+        )),
     }
 }
 
@@ -1488,7 +1529,12 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::HostEnvSet { identity, .. }
         | Command::HostEnvList { identity, .. }
         | Command::HostEnvUnset { identity, .. }
-        | Command::HarnessProcesses { identity } => Some(identity),
+        | Command::HarnessProcesses { identity }
+        | Command::Processes { identity }
+        | Command::ProcessGet { identity, .. }
+        | Command::ProcessExtend { identity, .. }
+        | Command::ProcessStop { identity, .. }
+        | Command::ProcessReconcile { identity, .. } => Some(identity),
         Command::Help
         | Command::CommandHelp(_)
         | Command::Doctor { .. }

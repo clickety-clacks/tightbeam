@@ -368,6 +368,30 @@ pub enum Command {
     HarnessProcesses {
         identity: Identity,
     },
+    /// Durable process custody, owner-reachable (spec art_6817803a rev6 §B4).
+    /// Deliberately NO `ProcessStart`: the maintenance line routes the existing
+    /// typed onboarding ceremony through this record and keeps arbitrary
+    /// commands off the surface entirely (acceptance case 18).
+    Processes {
+        identity: Identity,
+    },
+    ProcessGet {
+        identity: Identity,
+        process_id: String,
+    },
+    ProcessExtend {
+        identity: Identity,
+        process_id: String,
+        for_ms: String,
+    },
+    ProcessStop {
+        identity: Identity,
+        process_id: String,
+    },
+    ProcessReconcile {
+        identity: Identity,
+        process_id: String,
+    },
     UpdateClients {
         as_user: String,
     },
@@ -1148,6 +1172,12 @@ fn parse_with_optional_catalog(
             })
         }
         "harness-process" => parse_harness_process(&parsed, flags),
+        "processes" => Ok(Command::Processes {
+            identity: identity(flags)?,
+        }),
+        "process-get" | "process-stop" | "process-reconcile" | "process-extend" => {
+            parse_process_verb(&parsed, flags)
+        }
         "wake" => {
             let targets = [
                 nonempty(flags, "session").map(Target::Session),
@@ -2029,6 +2059,52 @@ fn parse_harness_process(
     }
 }
 
+/// The owner's per-process verbs (spec art_6817803a rev6 §B4).
+///
+/// There is deliberately no `process-start` here. §B4 keeps arbitrary commands
+/// off the maintenance line: it routes the existing typed onboarding ceremony
+/// through the same custody record instead, so a raw-command wrapper has no
+/// entry point to grow from.
+fn parse_process_verb(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Command, String> {
+    let verb = parsed.positional[0].as_str();
+
+    let process_id = parsed
+        .positional
+        .get(1)
+        .cloned()
+        .ok_or_else(|| format!("usage: tightbeam {verb} <processId>"))?;
+
+    let identity = identity(flags)?;
+
+    match verb {
+        "process-get" => Ok(Command::ProcessGet {
+            identity,
+            process_id,
+        }),
+        "process-stop" => Ok(Command::ProcessStop {
+            identity,
+            process_id,
+        }),
+        "process-reconcile" => Ok(Command::ProcessReconcile {
+            identity,
+            process_id,
+        }),
+        "process-extend" => {
+            let for_ms = flags
+                .get("for")
+                .ok_or_else(|| "usage: tightbeam process-extend <processId> --for 30m".to_owned())
+                .and_then(|value| parse_duration("for", value))?;
+
+            Ok(Command::ProcessExtend {
+                identity,
+                process_id,
+                for_ms,
+            })
+        }
+        other => Err(format!("unknown process verb: {other}")),
+    }
+}
+
 fn parse_config(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Command, String> {
     match (
         parsed.positional.get(1).map(String::as_str),
@@ -2177,6 +2253,97 @@ mod tests {
         ] {
             assert_eq!(parse(args), Ok(Command::Help));
         }
+    }
+
+    /// Durable process custody, owner-reachable (spec art_6817803a rev6 §B4).
+    ///
+    /// Parsing is the third place a verb has to exist. The router allowlist and
+    /// the Gateway handler table are the other two, and 3fd9c97 landed because
+    /// two of the three were present and the seam shipped dead. Here the
+    /// compiler caught the same shape in miniature: the Command variants
+    /// existed and built a request, and nothing constructed them, so `cargo
+    /// build` reported them "never constructed" until this parser arrived.
+    #[test]
+    fn process_custody_verbs_parse() {
+        assert_eq!(
+            parse(strings(&["processes", "--as-user", "flynn"])),
+            Ok(Command::Processes {
+                identity: Identity::User("flynn".to_owned()),
+            })
+        );
+
+        assert_eq!(
+            parse(strings(&["process-get", "mp_1", "--as-user", "flynn"])),
+            Ok(Command::ProcessGet {
+                identity: Identity::User("flynn".to_owned()),
+                process_id: "mp_1".to_owned(),
+            })
+        );
+
+        assert_eq!(
+            parse(strings(&["process-stop", "mp_1", "--as-user", "flynn"])),
+            Ok(Command::ProcessStop {
+                identity: Identity::User("flynn".to_owned()),
+                process_id: "mp_1".to_owned(),
+            })
+        );
+
+        assert_eq!(
+            parse(strings(&[
+                "process-reconcile",
+                "mp_1",
+                "--as-user",
+                "flynn"
+            ])),
+            Ok(Command::ProcessReconcile {
+                identity: Identity::User("flynn".to_owned()),
+                process_id: "mp_1".to_owned(),
+            })
+        );
+
+        assert_eq!(
+            parse(strings(&[
+                "process-extend",
+                "mp_1",
+                "--for",
+                "30m",
+                "--as-user",
+                "flynn"
+            ])),
+            Ok(Command::ProcessExtend {
+                identity: Identity::User("flynn".to_owned()),
+                process_id: "mp_1".to_owned(),
+                for_ms: "1800000".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn process_verbs_refuse_a_missing_process_id() {
+        for verb in ["process-get", "process-stop", "process-reconcile"] {
+            let error = parse(strings(&[verb, "--as-user", "flynn"])).unwrap_err();
+            assert!(
+                error.contains(verb),
+                "{verb} must name itself in its usage: {error}"
+            );
+        }
+    }
+
+    /// `process-extend` without `--for` is a request with no duration. Refusing
+    /// beats inventing one: a silently defaulted lease is exactly the kind of
+    /// invented promise this design exists to avoid.
+    #[test]
+    fn process_extend_requires_a_duration() {
+        let error = parse(strings(&["process-extend", "mp_1", "--as-user", "flynn"])).unwrap_err();
+        assert!(error.contains("--for"), "{error}");
+    }
+
+    /// §B4 / acceptance case 18: the maintenance line ships no generic
+    /// raw-command process start. Asserted at the parser, because that is where
+    /// such a thing would have to be added.
+    #[test]
+    fn there_is_no_generic_process_start_verb() {
+        assert!(parse(strings(&["process-start", "--", "sleep", "60"])).is_err());
     }
 
     #[test]
