@@ -74,6 +74,13 @@ One shared dir, not per-hostname: `GH_CONFIG_DIR` is single-valued while gh's
 `hosts.yml` natively holds every hostname. The dir is 0700, the files inside
 0600, and gh owns their format — Tightbeam never parses them.
 
+GHE and other non-github.com hostnames onboard and operate through gh's
+native multi-host support in that same store, but the shell guard's remote
+extraction and doctor's hostname recognition currently know only github.com —
+GHE operations run unguarded (failing at runtime with gh's own errors when
+unauthenticated, the guard's documented under-match direction) and undoctored
+until a canonical host parser is added.
+
 The OS login keychain is deliberately not the store. Agent processes descend
 from the gateway daemon, and a daemon-descended context cannot read the login
 keychain (`security` fails with `errSecInteractionNotAllowed`, exit 36 —
