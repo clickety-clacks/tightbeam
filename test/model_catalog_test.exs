@@ -536,7 +536,14 @@ defmodule Tightbeam.ModelCatalogTest do
                catalog_reply(~s({"detail":"Could not parse your authentication token."}), 401)
              end
            ], "codex",
-           {:http_status, 401, ~s({"detail":"Could not parse your authentication token."})}}
+           {:rotation_retry_failed,
+            %{
+              initial_401:
+                {:http_status, 401, ~s({"detail":"Could not parse your authentication token."})},
+              initial_guidance: "sign in again to repair the original 401",
+              retry_failure:
+                {:http_status, 401, ~s({"detail":"Could not parse your authentication token."})}
+            }}}
         ] do
       name = unique_name(label)
       catalog = start_catalog(ctx, Keyword.put(opts, :name, name))
@@ -601,7 +608,7 @@ defmodule Tightbeam.ModelCatalogTest do
              rotated_home
   end
 
-  test "a failed rotation retry preserves the original 401 and stops after one retry", ctx do
+  test "a failed rotation retry reports the original 401 and distinct retry failure", ctx do
     stale_store = ~s({"claudeAiOauth":{"accessToken":"fixture-token-STALE"}})
     File.write!(Path.join([ctx.base_dir, "auth", "claude", ".credentials.json"]), stale_store)
 
@@ -630,12 +637,29 @@ defmodule Tightbeam.ModelCatalogTest do
 
     catalog = start_catalog(ctx, claude_fetch: claude_fetch)
 
+    combined_failure =
+      {:rotation_retry_failed,
+       %{
+         initial_401: {:http_status, 401, revoked},
+         initial_guidance: "sign in again to repair the original 401",
+         retry_failure: {:network, :etimedout}
+       }}
+
     await(fn ->
       ModelCatalog.get(@host, "claude", catalog) ==
-        {[], {:unavailable, {:http_status, 401, revoked}}}
+        {[], {:unavailable, combined_failure}}
     end)
 
     assert :counters.get(fetches, 1) == 2
+
+    assert {:error, %Unroutable{} = unroutable} =
+             ModelCatalog.route(@host, "claude", Model.new("anything"), catalog)
+
+    message = Unroutable.message(unroutable)
+    assert message =~ "initial_401"
+    assert message =~ "sign in again to repair the original 401"
+    assert message =~ "retry_failure"
+    assert message =~ "etimedout"
   end
 
   test "an api-key 401 is never treated as a rotation and never harvested", ctx do
