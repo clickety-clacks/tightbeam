@@ -942,8 +942,10 @@ defmodule Tightbeam.PlacementTest do
     gh_dir = Path.join([base_dir, "auth", "github", "gh"])
     refute File.dir?(gh_dir)
 
-    assert {"GH_CONFIG_DIR", gh_dir} in
-             Placement.adapter_opts(config, {:claude, "default", "testhost"})[:env]
+    assert {"GH_CONFIG_DIR", gh_dir} in Placement.adapter_opts(
+             config,
+             {:claude, "default", "testhost"}
+           )[:env]
   end
 
 

@@ -63,10 +63,12 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
     cli_bin = Keyword.get(inputs, :cli_bin, Path.join(base_dir, "bin"))
     binary_probe = Keyword.get(inputs, :harness_binary_probe, &Placement.harness_binary_probe/2)
     credential_probe = Keyword.get(inputs, :credential_state, fn _provider -> :unknown end)
+
     github_probe =
       Keyword.get(inputs, :github_probe, fn hostname, remote_url ->
         Tightbeam.GithubAuth.probe(base_dir, hostname, remote_url)
       end)
+
     github_remote_url = Keyword.get(inputs, :github_remote_url)
     harnesses = Enum.map(Tightbeam.Harness.all(), & &1.wire_name())
 

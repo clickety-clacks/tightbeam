@@ -134,7 +134,7 @@ defmodule Tightbeam.RailsTest do
 
     assert command ==
              "sh -c 'input=$(cat); printf '\\''%s'\\'' \"$input\" | " <>
-               "grep -qE \"(github\\\\.com|gh repo |gh pr |gh issue |gh api )\" - || exit 0; " <>
+               "grep -qE \"(github\\\\.com|gh[[:space:]]+(repo|pr|issue|api))\" - || exit 0; " <>
                "printf '\\''%s'\\'' \"$input\" | tightbeam github-auth-check || exit 2; exit 0'"
   end
 

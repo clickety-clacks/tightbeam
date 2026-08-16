@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::bank::Gh;
 use super::redact::scrub_detail;
-use super::{gh_config_dir, GithubState, GithubStatus};
+use super::{GithubState, GithubStatus, gh_config_dir};
 
 pub(super) fn onboard_with(
     hostname: &str,
@@ -337,7 +337,7 @@ fn write_metadata(base_dir: &Path, status: &GithubStatus) -> Result<(), String> 
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::{out, FakeGh};
+    use super::super::test_support::{FakeGh, out};
     use super::*;
     use std::os::unix::process::ExitStatusExt;
 
