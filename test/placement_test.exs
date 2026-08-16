@@ -924,7 +924,7 @@ defmodule Tightbeam.PlacementTest do
                  fn -> Placement.adapter_opts(remote, {:codex, "default", "worker"}) end
   end
 
-  test "adapter_opts projects GH_CONFIG_DIR only once a github credential is banked", %{
+  test "adapter_opts always pins GH_CONFIG_DIR at the banked github dir", %{
     base_dir: base_dir,
     db: db
   } do
@@ -936,11 +936,11 @@ defmodule Tightbeam.PlacementTest do
       default_model: Model.new("fable")
     }
 
-    unbanked = Placement.adapter_opts(config, {:claude, "default", "testhost"})[:env]
-    refute Enum.any?(unbanked, fn {key, _value} -> key == "GH_CONFIG_DIR" end)
-
+    # Unconditional even before onboarding: an absent banked dir makes gh
+    # answer needs_onboarding, where ambient fallback would let a keyring
+    # credential agents cannot read answer "live".
     gh_dir = Path.join([base_dir, "auth", "github", "gh"])
-    File.mkdir_p!(gh_dir)
+    refute File.dir?(gh_dir)
 
     assert {"GH_CONFIG_DIR", gh_dir} in
              Placement.adapter_opts(config, {:claude, "default", "testhost"})[:env]

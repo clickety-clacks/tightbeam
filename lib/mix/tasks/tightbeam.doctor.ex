@@ -491,9 +491,10 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
       {:error, :unknown, "GitHub readiness probe could not run"}
   end
 
+  # Unconditional: an absent banked dir must probe as needs_onboarding, never
+  # as whatever the operator shell's ambient gh config can reach.
   defp github_probe_env(base_dir) do
-    dir = Path.join([base_dir, "auth", "github", "gh"])
-    if File.dir?(dir), do: [{"GH_CONFIG_DIR", dir}], else: []
+    [{"GH_CONFIG_DIR", Path.join([base_dir, "auth", "github", "gh"])}]
   end
 
   defp github_git_protocol(hostname, env) do

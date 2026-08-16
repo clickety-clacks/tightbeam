@@ -226,13 +226,15 @@ operational rule is that GitHub work runs in sessions spawned after
 onboarding.
 
 Every agent environment (local adapter launch and satellite ssh launch) gets
-`GH_CONFIG_DIR` pointing at the host's banked dir — a path, never token bytes.
-Locally it is projected once the banked dir exists; on satellites it is set
-unconditionally, because pointing gh at an absent dir yields the correct
-answer (`needs_onboarding` against the satellite's own store) while inheriting
-the remote user's keyring would repeat the local trap: live from a terminal,
-unreadable from project work. Git rides the same rail through gh's credential
-helper (`gh auth git-credential`), which consults `GH_CONFIG_DIR`.
+`GH_CONFIG_DIR` pointing at the host's banked dir — a path, never token bytes,
+set unconditionally whether or not the dir exists yet. Pointing gh at an
+absent dir yields the honest answer (`needs_onboarding` against the host's
+own store), while any ambient fallback would repeat the trap this capability
+exists to eliminate: a keyring credential that is live from a terminal and
+unreadable from project work. The probes in `tightbeam onboard github`,
+`tightbeam github-auth-check`, and doctor pin the same dir for the same
+reason. Git rides the same rail through gh's credential helper
+(`gh auth git-credential`), which consults `GH_CONFIG_DIR`.
 
 If a containment mode forbids even the banked file store, the project must
 report GitHub as unavailable instead of falling back to PAT prompts.
