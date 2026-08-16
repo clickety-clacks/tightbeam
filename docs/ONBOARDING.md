@@ -129,6 +129,14 @@ Login status and file presence are not liveness.
 Run these checks when model-catalog or credential-home code changes. They use
 fixture credentials and never contact a provider.
 
+0. Build the CLI suite prerequisite:
+
+   ~~~sh
+   cargo build --release --manifest-path cli/Cargo.toml
+   ~~~
+
+   PASS: the command exits zero.
+
 1. Run the public-route end-to-end check:
 
    ~~~sh
