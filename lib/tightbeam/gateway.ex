@@ -911,10 +911,10 @@ defmodule Tightbeam.Gateway do
       # The router-seam test in router_test.exs drives these through
       # /agent/dispatch against this real table so both halves must exist.
       "processes" => fn call -> processes_result(db, call) end,
-      "process-get" => fn call -> process_get_result(db, call) end,
-      "process-extend" => fn call -> process_extend_result(db, call) end,
-      "process-stop" => fn call -> process_stop_result(db, call) end,
-      "process-reconcile" => fn call -> process_reconcile_result(db, call) end,
+      "process-get" => custody_handler(db, &process_get_result/2),
+      "process-extend" => custody_handler(db, &process_extend_result/2),
+      "process-stop" => custody_handler(db, &process_stop_result/2),
+      "process-reconcile" => custody_handler(db, &process_reconcile_result/2),
       "role-create" => fn call -> role_create_result(db, call) end,
       "role-bind" => fn call -> role_bind_result(db, call) end,
       "role-rm" => fn call -> role_rm_result(db, call) end,
@@ -6574,6 +6574,59 @@ defmodule Tightbeam.Gateway do
   ## deliberately NO generic `process-start -- <command>` on this line: §B4 says
   ## the maintenance line routes the existing typed onboarding ceremony through
   ## this record and keeps arbitrary commands off the surface entirely.
+
+  # AUTHORIZATION FOR PER-PROCESS VERBS (review att_8017ebe7 F4).
+  #
+  # These shipped ungated. Any authenticated caller could read another user's
+  # process row and — worse — STOP it: a cross-user read plus a destructive
+  # action. The reviewer reproduced it, foreign user `mike` stopping a process
+  # owned by `flynn`.
+  #
+  # The gate runs BEFORE the verb sees the id, and its refusal is the same
+  # `not_found` an absent row gets. That is deliberate: a distinct "forbidden"
+  # would confirm the row exists to a caller with no business knowing it, and
+  # turn these verbs into an existence oracle over other users' processes.
+  #
+  # Who may act: the owning user, a session owned by that user, or an admin.
+  # `processes` needs no gate here because it lists only the caller's own
+  # session and cannot name someone else's.
+  defp custody_handler(db, fun) do
+    fn call ->
+      with {:ok, id} <- required_process_id(call) do
+        case ManagedProcesses.get(db, id) do
+          nil ->
+            %{code: "not_found", message: "unknown processId: #{id}"}
+
+          row ->
+            if custody_authorized?(db, call, row),
+              do: fun.(db, call),
+              else: %{code: "not_found", message: "unknown processId: #{id}"}
+        end
+      end
+    end
+  end
+
+  defp caller_session_owner(db, session_key) do
+    case Org.get(db, session_key) do
+      %{owner_user_id: owner} -> owner
+      _ -> nil
+    end
+  end
+
+  defp custody_authorized?(db, call, row) do
+    case call[:principal] do
+      {:user, user_id} ->
+        user_id == row.ownerUserId or match?(%{is_admin: true}, Devices.user(db, user_id))
+
+      {:session, caller_key} ->
+        caller_key == row.ownerSessionKey or
+          caller_session_owner(db, caller_key) == row.ownerUserId or
+          admin_origin?(db, call.origin)
+
+      _ ->
+        false
+    end
+  end
 
   defp processes_result(db, call) do
     session_key = call.session_key || caller_session(call)
