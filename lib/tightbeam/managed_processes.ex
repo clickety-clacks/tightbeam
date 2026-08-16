@@ -1050,6 +1050,47 @@ defmodule Tightbeam.ManagedProcesses do
     end
   end
 
+  @doc """
+  Every row a restart must look at, across all sessions (§B5).
+
+  The scan covers the same set that blocks retirement — the four nonterminal
+  states plus the two unresolved ones — because a crash can leave a row in any
+  of them and each still owes either work or evidence. Terminal rows are
+  finished and are deliberately absent.
+
+  The caller probes each row and feeds the result back through
+  `reconcile_in_txn/3`, so restart repair and the `process-reconcile` verb share
+  one decision table rather than drifting into two.
+  """
+  @spec recovery_rows_in_txn(Txn.t()) :: [map()]
+  def recovery_rows_in_txn(txn) do
+    placeholders =
+      retirement_blocking_states()
+      |> Enum.with_index(1)
+      |> Enum.map_join(", ", fn {_s, i} -> "?#{i}" end)
+
+    txn
+    |> Txn.q(
+      @select <> " WHERE state IN (#{placeholders}) ORDER BY createdAt",
+      retirement_blocking_states()
+    )
+    |> Enum.map(&to_row/1)
+  end
+
+  @doc """
+  Every session still behind an open retirement fence (§B5).
+
+  A restart must revisit these even when no process row changed: an older build
+  could have terminalized the last process and died before finalizing the
+  session, leaving it `retiring` forever with nothing left to trigger it.
+  """
+  @spec open_fences_in_txn(Txn.t()) :: [map()]
+  def open_fences_in_txn(txn) do
+    txn
+    |> Txn.q(@fence_select <> " WHERE state = 'retiring' ORDER BY openedAt", [])
+    |> Enum.map(&to_fence/1)
+  end
+
   @doc "Whether this row still owes work or evidence before its session may retire."
   @spec blocks_retirement?(map()) :: boolean()
   def blocks_retirement?(%{state: state}), do: state in (@nonterminal ++ @unresolved)
