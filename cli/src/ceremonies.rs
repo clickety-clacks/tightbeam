@@ -414,6 +414,10 @@ fn unnamed_machine(because: &str) -> String {
 /// the first time either side is tuned.
 const CEREMONY_FALLBACK_TIMEOUT: Duration = Duration::from_secs(1_800);
 
+/// The one purpose this line supports, spelled exactly as the gateway's closed set spells
+/// it. A value the gateway does not know is refused, and the ceremony does not start.
+const CUSTODY_PURPOSE: &str = "onboarding_ceremony";
+
 /// How long a launch may take to get from `process-open` to a committed identity.
 ///
 /// This is not the ceremony's lease -- it bounds only fork, setpgid and one round trip,
@@ -1010,7 +1014,9 @@ fn run_openai_onboarding(staging: &str, ceremony: &Ceremony<'_>) -> Result<(), S
     // that exists before any record of it does is exactly the orphan this ceremony has
     // already produced in the field -- one found alive after two days against a deleted
     // binary. Row first, then pid, then release.
-    let custody = open_custody(ceremony, "openai device-code onboarding")?;
+    // The purpose is a value from the gateway's closed set, not prose: the descriptor is
+    // derived there so this seam has no command argument to grow into a generic launcher.
+    let custody = open_custody(ceremony, CUSTODY_PURPOSE)?;
 
     let status = match custody {
         Some((process_id, launch_token)) => {
@@ -2321,6 +2327,96 @@ mod tests {
             .map(|out| !out.stdout.trim_ascii().is_empty())
             .expect("could not determine whether the grandchild is alive: `ps` did not run");
         assert!(!alive, "grandchild {grandchild} outlived the group kill");
+    }
+
+    /// A refused `process-open` starts nothing at all (owner ruling att_538f0b6f).
+    ///
+    /// The sibling test below proves the barrier holds a child that HAS been forked.
+    /// This one covers the earlier boundary: custody that never opened must not reach
+    /// the spawn in the first place. The two assertions are the ruling's "no row, no
+    /// spawn" pair seen from the launcher's side -- refusing after forking would still
+    /// be a process the gateway has no record of, which is Bug B itself.
+    #[test]
+    fn a_refused_process_open_never_reaches_the_spawn() {
+        let root = std::env::temp_dir().join(format!(
+            "tightbeam-custody-unopened-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let staging = root.join("staging");
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let ran = root.join("codex-ran");
+        let codex = bin.join("codex");
+        fs::write(
+            &codex,
+            format!("#!/bin/sh\nprintf ran > '{}'\n", ran.display()),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&codex, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let prior_machine = std::env::var("TIGHTBEAM_MACHINE").ok();
+        unsafe {
+            std::env::set_var("TIGHTBEAM_MACHINE", "custody-fixture-host");
+        }
+
+        let endpoint = Endpoint {
+            base: "http://custody-fixture.invalid".to_owned(),
+            token: "custody-fixture-token".to_owned(),
+            origin: crate::dispatch::Origin::Provisioned,
+        };
+        let staged = staging.display().to_string();
+        let binary = codex.display().to_string();
+        let result = onboard(
+            &Identity::User("flynn".to_owned()),
+            "openai",
+            false,
+            &endpoint,
+            |_, request, _| {
+                if request.body_json.contains(r#""verb":"process-open""#) {
+                    return Err("process_owner_session_unavailable".to_owned());
+                }
+                let value: serde_json::Value = serde_json::from_str(&request.body_json).unwrap();
+                match value
+                    .pointer("/params/phase")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    Some("begin") => Ok(Some(serde_json::json!({
+                        "stagingPath": staged,
+                        "leaseId": "custody-fixture-lease",
+                        "leaseTtlMs": 300_000
+                    }))),
+                    _ => Ok(None),
+                }
+            },
+            |_, _| {
+                Ok(Some(crate::harnesses::HarnessCatalog {
+                    harnesses: vec![crate::harnesses::HarnessProjection {
+                        wire_name: "codex".to_owned(),
+                        cli_binary: binary.clone(),
+                        install_package: "codex-acp".to_owned(),
+                        process_markers: vec!["codex".to_owned()],
+                    }],
+                }))
+            },
+        );
+
+        match prior_machine {
+            Some(value) => unsafe { std::env::set_var("TIGHTBEAM_MACHINE", value) },
+            None => unsafe { std::env::remove_var("TIGHTBEAM_MACHINE") },
+        }
+
+        let error = result.expect_err("a refused process-open must fail the ceremony");
+        assert!(
+            error.contains("process_owner_session_unavailable"),
+            "{error}"
+        );
+        assert!(
+            !ran.exists(),
+            "the ceremony spawned without durable custody"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// The barrier's whole reason to exist, proven against a real child.

@@ -2535,6 +2535,83 @@ defmodule Tightbeam.Wire.RouterTest do
     assert JSON.decode!(response.resp_body)["error"]["code"] == "session_retiring"
   end
 
+  # OWNER RULING att_538f0b6f: a user principal is custodied too, bound to that
+  # user's own personal session, and the binding is VERIFIED rather than composed.
+  #
+  # `tightbeam onboard --as-user` is the PRIMARY onboarding path. Leaving it
+  # uncustodied would recreate Bug B exactly where it was reported, so the answer
+  # is never "run without a row" -- it is either a verified owning session or a
+  # refusal before anything is spawned.
+  defp open_custody_as_user(ctx, user) do
+    dispatch_cli(ctx, "tbc_test", %{
+      verb: "process-open",
+      asUser: user,
+      params: %{purpose: "onboarding_ceremony", leaseMs: 60_000, deadlineMs: 30_000}
+    })
+  end
+
+  defp custody_rows(ctx) do
+    {:ok, rows} = Tightbeam.DB.query(ctx.db, "SELECT processId FROM managed_processes", [])
+    rows
+  end
+
+  test "a user-principal ceremony is custodied against that user's own session", ctx do
+    session = create_session(ctx.db, Org.personal_session_key("flynn"), "flynn")
+    ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, custody_handlers(ctx))}
+
+    response = open_custody_as_user(ctx, "flynn")
+    assert response.status == 200
+    result = JSON.decode!(response.resp_body)["result"]
+
+    # The row exists, and it is owned by the durable session that was verified --
+    # not by a key composed from the user id and trusted unread.
+    assert result["process"]["ownerSessionKey"] == session.session_key
+    assert result["process"]["state"] == "preparing"
+    assert is_binary(result["launchToken"])
+  end
+
+  # The three ways the composed key can be wrong, and every one of them refuses
+  # BEFORE a row exists. `no rows` is the load-bearing half of each assertion: a
+  # refusal that has already written a row has already made an orphan possible.
+  test "a user with no personal session is refused before any row is written", ctx do
+    ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, custody_handlers(ctx))}
+
+    response = open_custody_as_user(ctx, "flynn")
+
+    assert JSON.decode!(response.resp_body)["error"]["code"] ==
+             "process_owner_session_unavailable"
+
+    assert custody_rows(ctx) == []
+  end
+
+  test "a user whose personal session is retired is refused before any row", ctx do
+    create_session(ctx.db, Org.personal_session_key("flynn"), "flynn")
+    Org.retire(ctx.db, Org.personal_session_key("flynn"), "user:flynn", 1_000)
+    ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, custody_handlers(ctx))}
+
+    response = open_custody_as_user(ctx, "flynn")
+
+    assert JSON.decode!(response.resp_body)["error"]["code"] ==
+             "process_owner_session_unavailable"
+
+    assert custody_rows(ctx) == []
+  end
+
+  # The key matches the naming rule but the row belongs to somebody else. This is
+  # the case a composed key cannot detect on its own, and the reason the ruling
+  # asks for ownerUserId to be compared rather than assumed.
+  test "a personal session owned by another user cannot hold this user's custody", ctx do
+    create_session(ctx.db, Org.personal_session_key("flynn"), "clu")
+    ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, custody_handlers(ctx))}
+
+    response = open_custody_as_user(ctx, "flynn")
+
+    assert JSON.decode!(response.resp_body)["error"]["code"] ==
+             "process_owner_session_unavailable"
+
+    assert custody_rows(ctx) == []
+  end
+
   # §B4 acceptance 18, asserted at the handshake itself: there is no command
   # parameter to supply. The descriptor is derived from a closed purpose set, so
   # a generic raw-command launcher has no argument to grow from.
