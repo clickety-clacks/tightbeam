@@ -601,6 +601,43 @@ defmodule Tightbeam.ModelCatalogTest do
              rotated_home
   end
 
+  test "a failed rotation retry preserves the original 401 and stops after one retry", ctx do
+    stale_store = ~s({"claudeAiOauth":{"accessToken":"fixture-token-STALE"}})
+    File.write!(Path.join([ctx.base_dir, "auth", "claude", ".credentials.json"]), stale_store)
+
+    home = Path.join([ctx.base_dir, "homes", @host, "claude"])
+    File.mkdir_p!(home)
+
+    File.write!(
+      Path.join(home, ".credentials.json"),
+      ~s({"claudeAiOauth":{"accessToken":"fixture-token-ROTATED"}})
+    )
+
+    revoked =
+      ~s({"type":"error","error":{"type":"authentication_error","message":"OAuth access token has been revoked."}})
+
+    fetches = :counters.new(1, [])
+
+    claude_fetch = fn "/v1/models?limit=100", _headers ->
+      :counters.add(fetches, 1, 1)
+
+      case :counters.get(fetches, 1) do
+        1 -> {:error, {:http_status, 401, revoked}}
+        2 -> {:error, {:network, :etimedout}}
+        count -> flunk("catalog fetched #{count} times")
+      end
+    end
+
+    catalog = start_catalog(ctx, claude_fetch: claude_fetch)
+
+    await(fn ->
+      ModelCatalog.get(@host, "claude", catalog) ==
+        {[], {:unavailable, {:http_status, 401, revoked}}}
+    end)
+
+    assert :counters.get(fetches, 1) == 2
+  end
+
   test "an api-key 401 is never treated as a rotation and never harvested", ctx do
     store = Path.join([ctx.base_dir, "auth", "claude", ".credentials.json"])
     File.write!(store, "sk-ant-api03-STALE")
