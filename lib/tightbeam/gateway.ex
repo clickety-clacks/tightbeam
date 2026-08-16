@@ -78,6 +78,7 @@ defmodule Tightbeam.Gateway do
     LaneManager,
     Ledger,
     ManagedProcesses,
+    HarnessProcess,
     Model,
     ModelCatalog,
     Org,
@@ -94,6 +95,11 @@ defmodule Tightbeam.Gateway do
     WorkItems,
     WorkState
   }
+
+  # How long a custody probe may take. It runs one local exec that does a file read and a
+  # kill-0, so a second is generous; the point of the bound is that a hung helper must not
+  # hold the reconcile transaction open.
+  @custody_probe_timeout_ms 1_000
 
   alias Tightbeam.Acp.Adapter
   alias Tightbeam.DB.Txn
@@ -940,8 +946,10 @@ defmodule Tightbeam.Gateway do
       "processes" => fn call -> processes_result(db, call) end,
       "process-get" => custody_handler(db, &process_get_result/2),
       "process-extend" => custody_handler(db, &process_extend_result/2),
-      "process-stop" => custody_handler(db, &process_stop_result/2),
-      "process-reconcile" => custody_handler(db, &process_reconcile_result/2),
+      "process-stop" =>
+        custody_handler(db, fn db, call -> process_stop_result(db, call, config) end),
+      "process-reconcile" =>
+        custody_handler(db, fn db, call -> process_reconcile_result(db, call, config) end),
       "role-create" => fn call -> role_create_result(db, call) end,
       "role-bind" => fn call -> role_bind_result(db, call) end,
       "role-rm" => fn call -> role_rm_result(db, call) end,
@@ -6614,6 +6622,79 @@ defmodule Tightbeam.Gateway do
 
   defp opener_session(_db, _principal), do: :no_principal
 
+  # PHYSICAL EVIDENCE for a managed row, or an honest refusal (owner ruling att_9b99f366).
+  #
+  # The gateway can only look at processes on the machine it is running on. For a row
+  # recorded on any other host this returns `:not_probed` -- unchanged, honest, and NEVER
+  # `:absent`, because "I cannot see it" and "it is gone" are different facts and treating
+  # them alike is the false terminal liveness this design exists to refuse.
+  #
+  # Locality is read from the host table's `ssh: nil` marker rather than by comparing host
+  # NAMES: the org's local host carries its real hostname, so a name comparison would be a
+  # second, drifting source of truth for something `Placement` already knows.
+  # Can this gateway look at this row's process, and should it?
+  #
+  # `:unbound` is not a host question -- a row that never bound has no identity to prove,
+  # so there is nothing to look for and nothing to refuse. Locality is read from the host
+  # table's `ssh: nil` marker rather than by comparing host NAMES: the local host carries
+  # its real hostname, so a name comparison would be a second, drifting source of truth
+  # for something Placement already knows.
+  defp custody_locality(_config, _db, nil), do: :unbound
+
+  defp custody_locality(config, db, row) do
+    cond do
+      is_nil(row.brokerIdentity) or is_nil(row.osPid) or is_nil(row.processGroupId) ->
+        :unbound
+
+      match?(%{ssh: nil}, Map.get(Placement.hosts(config.base_dir, db), row.host)) ->
+        :local
+
+      true ->
+        :remote
+    end
+  end
+
+  defp custody_evidence(config, db, row, action) do
+    probe_locally(Map.get(Placement.hosts(config.base_dir, db), row.host), row, action)
+  end
+
+  # Everything the helper needs to PROVE the process is this row's, passed positionally in
+  # the order the helper declares. The launch token is included because it is the only
+  # field that proves we launched this process rather than merely that a process exists.
+  defp probe_locally(host, row, action) do
+    helper = host[:cli_bin] || Path.join(host.base_dir, "bin/tightbeam")
+
+    args = [
+      "process-custody",
+      action,
+      row.brokerIdentity,
+      row.processId,
+      Integer.to_string(row.osPid),
+      Integer.to_string(row.processGroupId),
+      row.bootIdentity,
+      row.launchToken
+    ]
+
+    case HarnessProcess.bounded_command_for_custody(helper, args, @custody_probe_timeout_ms) do
+      {output, 0} ->
+        case String.trim(output) do
+          "gone" -> :absent
+          "present" -> {:identity, %{state: :present}}
+          "exited" -> {:identity, %{stop: :exited}}
+          "killed" -> {:identity, %{stop: :killed}}
+          "failed" -> {:identity, %{stop: :stop_failed}}
+          # The helper could not prove the process is ours. That is NOT an absence proof:
+          # it is the one answer that must never be laundered into one.
+          _ -> :unknown
+        end
+
+      # A helper that could not run tells us nothing about the process. Unknown, never
+      # absent -- an unreadable probe must not retire a row.
+      _ ->
+        :unknown
+    end
+  end
+
   defp positive_ms(value, default) when is_integer(value) and value > 0, do: value
   defp positive_ms(_value, default), do: default
 
@@ -6740,56 +6821,133 @@ defmodule Tightbeam.Gateway do
   defp extend_refusal_message(:lost),
     do: "another transition won; the durable row is returned"
 
-  defp process_stop_result(db, call) do
+  defp process_stop_result(db, call, config) do
     with {:ok, id} <- required_process_id(call) do
       now = System.system_time(:millisecond)
 
-      case DB.transaction(db, &ManagedProcesses.request_stop_in_txn(&1, id, now: now)) do
-        {:ok, {:ok, row}} ->
-          %{process: Payloads.managed_process(row)}
+      # Refuse a row we cannot reach BEFORE recording a stop request against it. Asking a
+      # process to stop when nothing here can ask it leaves a row saying a stop is in
+      # flight that nobody will ever deliver -- which reads, later, as a stop that failed
+      # rather than one that was never possible (owner ruling att_9b99f366).
+      case custody_locality(config, db, ManagedProcesses.get(db, id)) do
+        :remote ->
+          %{
+            code: "remote_process_probe_unsupported",
+            message:
+              "this ceremony is recorded on a host this gateway cannot signal; " <>
+                "run process-stop against the gateway on that host"
+          }
 
-        {:ok, {:blocked, row}} ->
-          Payloads.process_blocked("process_retirement_blocked", [row])
-
-        {:ok, {:error, :unknown_process}} ->
-          %{code: "not_found", message: "unknown processId: #{id}"}
-
-        {:ok, {:lost, row}} ->
-          %{process: Payloads.managed_process(row)}
-
-        {:error, error} ->
-          %{code: "server_error", message: error_map_text(error)}
+        locality ->
+          stop_settled(db, id, now, locality, config)
       end
     end
   end
 
-  defp process_reconcile_result(db, call) do
+  # Request the stop durably, then -- for a row on this host -- deliver it and record what
+  # was OBSERVED. The request is written first so a crash between the two leaves a row boot
+  # recovery can finish, rather than a signal nobody recorded.
+  defp stop_settled(db, id, now, locality, config) do
+    case DB.transaction(db, &ManagedProcesses.request_stop_in_txn(&1, id, now: now)) do
+      {:ok, {:ok, row}} ->
+        deliver_stop(db, row, now, locality, config)
+
+      {:ok, {:blocked, row}} ->
+        Payloads.process_blocked("process_retirement_blocked", [row])
+
+      {:ok, {:error, :unknown_process}} ->
+        %{code: "not_found", message: "unknown processId: #{id}"}
+
+      {:ok, {:lost, row}} ->
+        %{process: Payloads.managed_process(row)}
+
+      {:error, error} ->
+        %{code: "server_error", message: error_map_text(error)}
+    end
+  end
+
+  # A row that never bound has nothing to signal, so it keeps its requested state and waits
+  # for reconcile rather than being recorded as stopped. Every other answer goes through the
+  # recorder's own compare-and-set, so a concurrent transition wins rather than being
+  # overwritten by a verdict computed before it.
+  defp deliver_stop(db, row, now, :local, config) do
+    outcome =
+      case custody_evidence(config, db, row, "stop") do
+        {:identity, %{stop: verdict}} -> verdict
+        _ -> :identity_unknown
+      end
+
+    case DB.transaction(
+           db,
+           &ManagedProcesses.record_stop_outcome_in_txn(&1, row.processId, outcome, now: now)
+         ) do
+      {:ok, {:ok, settled}} -> %{process: Payloads.managed_process(settled)}
+      {:ok, {:blocked, settled}} -> Payloads.process_blocked("process_unresolved", [settled])
+      {:ok, {:lost, settled}} -> %{process: Payloads.managed_process(settled)}
+      {:ok, {:error, :unknown_process}} -> %{code: "not_found", message: "unknown processId"}
+      {:error, error} -> %{code: "server_error", message: error_map_text(error)}
+    end
+  end
+
+  defp deliver_stop(_db, row, _now, _locality, _config),
+    do: %{process: Payloads.managed_process(row)}
+
+  defp process_reconcile_result(db, call, config) do
     with {:ok, id} <- required_process_id(call) do
       now = System.system_time(:millisecond)
 
-      # Evidence is supplied, never inferred. This line ships no OS probe, so
-      # the honest evidence for a row is `:not_probed`: reconcile still settles
-      # the lease and reports the durable state and deadline, but it will not
-      # fabricate an absence proof it does not have. Anything stronger would be
-      # a guess wearing a proof's clothes (§B4).
-      result =
-        DB.transaction(db, fn txn ->
-          ManagedProcesses.reconcile_in_txn(txn, id, now: now, evidence: :not_probed)
-        end)
+      # Evidence is gathered, never inferred, and gathered OUTSIDE the transaction: the
+      # probe is an exec on another process and must not hold a write transaction open
+      # while it runs (owner ruling att_9b99f366).
+      #
+      # For a row on this gateway's own host the helper proves the identity and looks;
+      # for anything else the evidence stays `:not_probed`, which settles the lease and
+      # reports the durable state without ever claiming an absence this gateway cannot
+      # see. A guess wearing a proof's clothes is the one output forbidden here (§B4).
+      row = ManagedProcesses.get(db, id)
 
-      case result do
-        {:ok, {:ok, row}} ->
-          %{process: Payloads.managed_process(row)}
+      # Locality is decided BEFORE anything is written. A row this gateway cannot see is
+      # refused outright, with its stop cause and unresolved state left exactly as they
+      # were: reconciling it here would settle a lease on a machine nobody looked at, and
+      # an operator would read that as a resolution.
+      case custody_locality(config, db, row) do
+        :remote ->
+          %{
+            code: "remote_process_probe_unsupported",
+            message:
+              "this ceremony is recorded on host #{row.host}, which this gateway cannot " <>
+                "probe; run process-reconcile against the gateway on that host"
+          }
 
-        {:ok, {:blocked, row}} ->
-          Payloads.process_blocked("process_unresolved", [row])
+        locality ->
+          evidence =
+            if locality == :local,
+              do: custody_evidence(config, db, row, "probe"),
+              else: :not_probed
 
-        {:ok, {:error, :unknown_process}} ->
-          %{code: "not_found", message: "unknown processId: #{id}"}
-
-        {:error, error} ->
-          %{code: "server_error", message: error_map_text(error)}
+          reconcile_settled(db, id, now, evidence)
       end
+    end
+  end
+
+  defp reconcile_settled(db, id, now, evidence) do
+    result =
+      DB.transaction(db, fn txn ->
+        ManagedProcesses.reconcile_in_txn(txn, id, now: now, evidence: evidence)
+      end)
+
+    case result do
+      {:ok, {:ok, row}} ->
+        %{process: Payloads.managed_process(row)}
+
+      {:ok, {:blocked, row}} ->
+        Payloads.process_blocked("process_unresolved", [row])
+
+      {:ok, {:error, :unknown_process}} ->
+        %{code: "not_found", message: "unknown processId: #{id}"}
+
+      {:error, error} ->
+        %{code: "server_error", message: error_map_text(error)}
     end
   end
 

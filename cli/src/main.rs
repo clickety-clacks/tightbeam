@@ -11,6 +11,7 @@ mod harnesses;
 mod lease;
 mod preflight;
 mod probe;
+mod process_custody;
 mod users;
 
 fn main() {
@@ -55,6 +56,20 @@ fn main() {
     if args.first().is_some_and(|arg| arg == "boot-identity") {
         match harness_process::print_boot_identity() {
             Ok(()) => std::process::exit(0),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // Durable process custody's physical half (owner ruling att_9b99f366). Internal and
+    // closed-purpose: the gateway's stop and reconcile workers invoke it, it is absent from
+    // the help and from the surface contract, and it proves the row's identity from the
+    // broker's artifact before it probes or signals anything.
+    if args.first().is_some_and(|arg| arg == "process-custody") {
+        match process_custody::run(&args[1..]) {
+            Ok(status) => std::process::exit(status),
             Err(error) => {
                 eprintln!("{error}");
                 std::process::exit(1);
