@@ -899,12 +899,16 @@ fn bank_openai_api_key(staging: &str, key: &str, ceremony: &Ceremony<'_>) -> Res
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
 
-    let status = run_bounded(
+    // Custodied like the device-code flow. It is shorter-lived, but "shorter-lived" is
+    // not a guarantee -- it is a vendor CLI spawned by us, and the ruling covers every
+    // Tightbeam-owned onboarding ceremony rather than the ones that happen to hang.
+    let status = run_custodied(
+        ceremony,
         command,
         "codex login --with-api-key",
-        ceremony.deadline,
         Some(key.as_bytes()),
-    )?;
+    )
+    .map_err(|failure| failure.reason)?;
 
     codex_staged_a_credential(status, staging, "`codex login --with-api-key`")
 }
@@ -1070,40 +1074,7 @@ fn run_openai_onboarding(staging: &str, ceremony: &Ceremony<'_>) -> Result<(), S
     // binary. Row first, then pid, then release.
     // The purpose is a value from the gateway's closed set, not prose: the descriptor is
     // derived there so this seam has no command argument to grow into a generic launcher.
-    let custody = open_custody(ceremony, CUSTODY_PURPOSE)?;
-
-    let status = match custody {
-        Some((process_id, launch_token)) => {
-            let mut barrier = LaunchBarrier::new().map_err(|error| {
-                StageFailure::from(format!("launch barrier unavailable: {error}"))
-            })?;
-            let bind = |pid, pgid| bind_custody(ceremony, &process_id, &launch_token, pid, pgid);
-            let outcome = run_bounded_inner(
-                command,
-                "codex device-code login",
-                ceremony.deadline,
-                None,
-                Some(Custody {
-                    barrier: &mut barrier,
-                    bind: &bind,
-                }),
-            );
-            // Dropping the barrier here closes the write end. For a launch that never
-            // reached release -- a bind refusal, a gateway that could not be reached, a
-            // panic between the two -- that closure IS the child's exit: it reads EOF in
-            // its pre-exec and dies without ever exec-ing codex.
-            drop(barrier);
-            outcome
-        }
-        None => run_bounded_inner(
-            command,
-            "codex device-code login",
-            ceremony.deadline,
-            None,
-            None,
-        ),
-    }
-    .map_err(StageFailure::from)?;
+    let status = run_custodied(ceremony, command, "codex device-code login", None)?;
 
     codex_staged_a_credential(status, staging, "OpenAI device-code onboarding")
         .map_err(StageFailure::from)
@@ -1111,14 +1082,46 @@ fn run_openai_onboarding(staging: &str, ceremony: &Ceremony<'_>) -> Result<(), S
 
 /// Open the durable custody row, returning its id and launch token.
 ///
-/// `None` means this CLI is running with no gateway to be accountable to -- the offline
-/// and test paths -- and the ceremony runs uncustodied exactly as it did before. That is
-/// deliberate and narrow: it is not a fallback for a gateway that refused. A refusal is
-/// an error, and it stops the ceremony before anything is spawned.
-fn open_custody(
+/// Run a vendor ceremony child under durable custody: row first, child held at the
+/// barrier, identity committed, release only when the gateway grants it.
+///
+/// Shared by both openai ceremonies because both spawn a vendor CLI, and the ruling is
+/// about ceremonies rather than about one flow. Dropping the barrier on the way out is
+/// what makes every failure between here and the release safe: the child reads EOF in its
+/// pre-exec and exits without ever running the workload.
+fn run_custodied(
     ceremony: &Ceremony<'_>,
-    purpose: &str,
-) -> Result<Option<(String, String)>, StageFailure> {
+    command: ProcessCommand,
+    what: &str,
+    stdin: Option<&[u8]>,
+) -> Result<ExitStatus, StageFailure> {
+    let (process_id, launch_token) = open_custody(ceremony, CUSTODY_PURPOSE)?;
+
+    let mut barrier = LaunchBarrier::new()
+        .map_err(|error| StageFailure::from(format!("launch barrier unavailable: {error}")))?;
+    let bind = |pid, pgid| bind_custody(ceremony, &process_id, &launch_token, pid, pgid);
+
+    let outcome = run_bounded_inner(
+        command,
+        what,
+        ceremony.deadline,
+        stdin,
+        Some(Custody {
+            barrier: &mut barrier,
+            bind: &bind,
+        }),
+    );
+    drop(barrier);
+    outcome.map_err(StageFailure::from)
+}
+
+/// There is NO uncustodied path out of here (owner ruling att_538f0b6f). An earlier
+/// version let a 2xx-with-no-body mean "no gateway to be accountable to, carry on"; that
+/// was wrong for the same reason the ruling is. A ceremony running with no durable row is
+/// exactly the orphan this work exists to prevent, and it would arrive silently, on the
+/// path taken when the gateway said the least. Every answer that is not a row plus a token
+/// stops the ceremony before anything is spawned.
+fn open_custody(ceremony: &Ceremony<'_>, purpose: &str) -> Result<(String, String), StageFailure> {
     let remaining = ceremony
         .deadline
         .saturating_duration_since(Instant::now())
@@ -1129,11 +1132,13 @@ fn open_custody(
         remaining,
         LAUNCH_DEADLINE.as_millis() as u64,
     );
-    let Some(opened) =
-        (ceremony.send_request)(ceremony.endpoint, &request, None).map_err(StageFailure::from)?
-    else {
-        return Ok(None);
-    };
+    let opened = (ceremony.send_request)(ceremony.endpoint, &request, None)
+        .map_err(StageFailure::from)?
+        .ok_or_else(|| {
+            StageFailure::from(
+                "process-open returned no custody row; the ceremony was not started".to_owned(),
+            )
+        })?;
 
     // Both halves or neither. A row without its token cannot be bound, and continuing with
     // half an answer would spawn a child this CLI could never commit -- which the barrier
@@ -1145,7 +1150,7 @@ fn open_custody(
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned);
     match (process_id, launch_token) {
-        (Some(process_id), Some(launch_token)) => Ok(Some((process_id, launch_token))),
+        (Some(process_id), Some(launch_token)) => Ok((process_id, launch_token)),
         _ => Err(StageFailure::from(
             "process-open did not return a processId and launchToken; the ceremony was not started"
                 .to_owned(),
@@ -2397,6 +2402,92 @@ mod tests {
             .map(|out| !out.stdout.trim_ascii().is_empty())
             .expect("could not determine whether the grandchild is alive: `ps` did not run");
         assert!(!alive, "grandchild {grandchild} outlived the group kill");
+    }
+
+    /// A gateway that answers process-open with 2xx and NO body starts nothing either.
+    ///
+    /// This is the quiet version of the same rule, and it is the one that nearly shipped:
+    /// an earlier version read "no body" as "no gateway to be accountable to" and ran the
+    /// ceremony uncustodied. It would never have failed a test, because the fixtures all
+    /// answer with a body -- it would simply have produced, on the least eventful path
+    /// available, exactly the orphan this work exists to prevent.
+    #[test]
+    fn a_custody_answer_with_no_row_starts_nothing() {
+        let root = std::env::temp_dir().join(format!(
+            "tightbeam-custody-norow-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let staging = root.join("staging");
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let ran = root.join("codex-ran");
+        let codex = bin.join("codex");
+        fs::write(
+            &codex,
+            format!("#!/bin/sh\nprintf ran > '{}'\n", ran.display()),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&codex, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let prior_machine = std::env::var("TIGHTBEAM_MACHINE").ok();
+        unsafe {
+            std::env::set_var("TIGHTBEAM_MACHINE", "custody-fixture-host");
+        }
+
+        let endpoint = Endpoint {
+            base: "http://custody-fixture.invalid".to_owned(),
+            token: "custody-fixture-token".to_owned(),
+            origin: crate::dispatch::Origin::Provisioned,
+        };
+        let staged = staging.display().to_string();
+        let binary = codex.display().to_string();
+        let result = onboard(
+            &Identity::User("flynn".to_owned()),
+            "openai",
+            false,
+            &endpoint,
+            |_, request, _| {
+                // 2xx, and the gateway said nothing at all.
+                if request.body_json.contains(r#""verb":"process-open""#) {
+                    return Ok(None);
+                }
+                let value: serde_json::Value = serde_json::from_str(&request.body_json).unwrap();
+                match value
+                    .pointer("/params/phase")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    Some("begin") => Ok(Some(serde_json::json!({
+                        "stagingPath": staged,
+                        "leaseId": "custody-fixture-lease",
+                        "leaseTtlMs": 300_000
+                    }))),
+                    _ => Ok(None),
+                }
+            },
+            |_, _| {
+                Ok(Some(crate::harnesses::HarnessCatalog {
+                    harnesses: vec![crate::harnesses::HarnessProjection {
+                        wire_name: "codex".to_owned(),
+                        cli_binary: binary.clone(),
+                        install_package: "codex-acp".to_owned(),
+                        process_markers: vec!["codex".to_owned()],
+                    }],
+                }))
+            },
+            &root.join("custody"),
+        );
+
+        match prior_machine {
+            Some(value) => unsafe { std::env::set_var("TIGHTBEAM_MACHINE", value) },
+            None => unsafe { std::env::remove_var("TIGHTBEAM_MACHINE") },
+        }
+
+        let error = result.expect_err("an empty custody answer must fail the ceremony");
+        assert!(error.contains("no custody row"), "{error}");
+        assert!(!ran.exists(), "the ceremony spawned without a durable row");
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// A refused `process-open` starts nothing at all (owner ruling att_538f0b6f).
