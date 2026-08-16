@@ -690,6 +690,101 @@ defmodule Tightbeam.ManagedProcesses do
     }
   end
 
+  @doc """
+  The session's current retirement generation: 0 if it has never retired.
+
+  A launch captures this at insert. A later identity bind compares it against
+  the live value, which is how a bind belonging to a previous life of the
+  session is detected as stale (§B5).
+  """
+  @spec current_generation_in_txn(Txn.t(), String.t()) :: non_neg_integer()
+  def current_generation_in_txn(txn, session_key) do
+    case fence_in_txn(txn, session_key) do
+      nil -> 0
+      fence -> fence.generation
+    end
+  end
+
+  @doc """
+  Bind the proven identity tuple and decide, atomically, whether the workload
+  may run (§B5 steps 3-7).
+
+  This is the single decision point the whole barrier exists to protect, so it
+  is ONE transaction: bind the identity, re-check the session generation, the
+  stop cause and the lease, and only then choose. Splitting the bind from the
+  check is precisely the window that lets a workload be released into a session
+  that has already started retiring.
+
+  Answers:
+
+    * `{:running, row}` — the row is `running` and `releaseGrantedAt` is set.
+      This is the ONLY answer that authorizes opening the pre-exec barrier.
+    * `{:stop, row}` — identity is bound and the row is `stop_requested`,
+      carrying whatever cause won. The broker must NOT release; it hands the
+      proven identity to the stop worker. The workload never executes.
+    * `{:lost, row}` — another transition won; report that durable row.
+
+  Note what is deliberately absent from the stop answers: no `releaseGrantedAt`
+  is ever recorded on them. §B5 is explicit that a late bind "never records a
+  release grant, or opens the pre-exec barrier", and recording one would leave a
+  durable claim that a workload was authorized when it was not.
+  """
+  @spec bind_identity_in_txn(Txn.t(), String.t(), map(), keyword()) ::
+          {:running, map()} | {:stop, map()} | {:lost, map() | nil}
+  def bind_identity_in_txn(txn, process_id, identity, opts) do
+    now = Keyword.fetch!(opts, :now)
+
+    case get_in_txn(txn, process_id) do
+      nil ->
+        {:lost, nil}
+
+      %{state: state} = row when state in ["preparing", "launch_cancel_requested"] ->
+        bound = %{
+          os_pid: Map.fetch!(identity, :os_pid),
+          process_group_id: Map.fetch!(identity, :process_group_id),
+          boot_identity: Map.fetch!(identity, :boot_identity),
+          broker_identity: Map.get(identity, :broker_identity),
+          now: now
+        }
+
+        decide_bind(txn, row, bound, now)
+
+      row ->
+        # Terminal, unresolved, or already running: this bind lost.
+        {:lost, row}
+    end
+  end
+
+  defp decide_bind(txn, row, bound, now) do
+    generation = current_generation_in_txn(txn, row.ownerSessionKey)
+    retiring? = match?(%{state: "retiring"}, fence_in_txn(txn, row.ownerSessionKey))
+
+    stop_cause =
+      cond do
+        # A cause already present always wins. Whoever asked first owns the
+        # reason; a later condition never rewrites it.
+        row.stopCause != nil -> row.stopCause
+        retiring? or generation != row.sessionGeneration -> "session_retired"
+        row.leaseExpiresAt <= now -> "lease_expired"
+        true -> nil
+      end
+
+    changes =
+      case stop_cause do
+        nil ->
+          Map.merge(bound, %{state: "running", release_granted_at: now})
+
+        cause ->
+          Map.merge(bound, %{state: "stop_requested", stop_cause: cause})
+      end
+
+    case transition(txn, row.processId, [state: row.state, revision: row.revision], changes) do
+      {:ok, updated} when stop_cause == nil -> {:running, updated}
+      {:ok, updated} -> {:stop, updated}
+      {:lost, current} -> {:lost, current}
+    end
+  end
+
   @doc "Whether this row still owes work or evidence before its session may retire."
   @spec blocks_retirement?(map()) :: boolean()
   def blocks_retirement?(%{state: state}), do: state in (@nonterminal ++ @unresolved)
