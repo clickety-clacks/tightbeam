@@ -742,15 +742,21 @@ defmodule Tightbeam.Gateway do
       "ask" => fn call -> decision_request_result(Escalation.ask(db, call)) end,
       "answer" => fn call -> decision_request_result(Escalation.answer(db, call)) end,
       "decision-requests" => fn call ->
-        caller = resolve_caller(db, call.origin)
+        case Escalation.list_status(call.params[:status]) do
+          {:ok, status} ->
+            caller = resolve_caller(db, call.origin)
 
-        %{
-          decision_requests:
-            Escalation.list(db, call, call.params[:status] || "open",
-              owner_user_id: caller && caller.owner_user_id,
-              admin: admin_origin?(db, call.origin)
-            )
-        }
+            %{
+              decision_requests:
+                Escalation.list(db, call, status,
+                  owner_user_id: caller && caller.owner_user_id,
+                  admin: admin_origin?(db, call.origin)
+                )
+            }
+
+          %{code: _} = err ->
+            err
+        end
       end,
       "decision-request" => fn call ->
         caller = resolve_caller(db, call.origin)

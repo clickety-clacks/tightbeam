@@ -12,6 +12,13 @@ defmodule Tightbeam.Escalation do
 
   @default_decision_deadline_ms 86_400_000
 
+  # The `status` values a decision request row can hold — the schema CHECK's own set
+  # (see @ddl). `list/4` accepts these plus the sentinel "all" (no status filter); any
+  # other value is refused by `list_status/1` so a typo names the legal set instead of
+  # silently filtering on a status that can never exist.
+  @request_statuses ~w(open ruled consumed withdrawn superseded)
+  @list_status_filters @request_statuses ++ ["all"]
+
   # Marks an `actionKey` as naming a CONDITION rather than one caller's action. Reserved
   # here because `digest/1` is a hex SHA-256 and can never collide with it.
   @episode_prefix "episode:"
@@ -1004,14 +1011,37 @@ defmodule Tightbeam.Escalation do
   end
 
   @doc """
+  Validate a `--status` filter for `list/4` at the verb edge. `nil` (absent) defaults
+  to "open"; a legal status or the "all" sentinel passes through; anything else refuses
+  and names the legal set, so a typo cannot silently return an empty list.
+  """
+  @spec list_status(String.t() | nil) :: {:ok, String.t()} | map()
+  def list_status(nil), do: {:ok, "open"}
+  def list_status(status) when status in @list_status_filters, do: {:ok, status}
+
+  def list_status(status),
+    do:
+      error(
+        "invalid",
+        "unknown status #{inspect(status)}; legal: #{Enum.join(@list_status_filters, ", ")}"
+      )
+
+  @doc """
   List visible decision requests. Owner/admin and raiser visibility are disjoint
   filters.
   """
   @spec list(DB.server(), map(), String.t() | nil, keyword()) :: [map()]
   def list(db, call, status \\ "open", opts \\ []) do
     {where, params} = visibility(call, Keyword.get(opts, :owner_user_id))
-    status_clause = if is_binary(status), do: " AND status = ?#{length(params) + 1}", else: ""
-    params = if is_binary(status), do: params ++ [status], else: params
+
+    # nil and the "all" sentinel both mean "no status filter". A concrete status filters
+    # to that one value; "all" as a literal never matches a row, so it must not reach SQL.
+    {status_clause, params} =
+      if is_binary(status) and status != "all" do
+        {" AND status = ?#{length(params) + 1}", params ++ [status]}
+      else
+        {"", params}
+      end
 
     {:ok, rows} =
       DB.query(

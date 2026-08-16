@@ -616,7 +616,7 @@ COMMANDS:
       Atomically open an assignment and wake its holder with the card id.
   effort-rule --request <decisionRequestId> --action continue|dismiss
       Rule an effort-without-effect check-in routed to your principal.
-  decision-requests [--status open|ruled|all]
+  decision-requests [--status open|ruled|consumed|withdrawn|superseded|all]
       List decision requests visible to your principal.
   ask (--session <key> | --role <name> | --user <id>) --question "<text>"
       [--about <assignmentId>]
@@ -1510,7 +1510,7 @@ fn parse_with_optional_catalog(
         "decision-requests" => {
             if parsed.positional.len() != 1 {
                 return Err(
-                    "usage: tightbeam decision-requests [--status open|ruled|all]".to_owned(),
+                    "usage: tightbeam decision-requests [--status open|ruled|consumed|withdrawn|superseded|all]".to_owned(),
                 );
             }
             Ok(Command::DecisionRequests {
