@@ -544,7 +544,7 @@ COMMANDS:
       Record the operator's resolution. Main and presenting proxies never run this command.
   operator-withdraw <dr_id> --reason <text>
       Withdraw an operator decision request as its owner or original asker.
-  decision-requests [--status open|ruled|all]
+  decision-requests [--status open|ruled|consumed|withdrawn|superseded|all]
       List decision requests visible to your principal.
   revoke-assignment <assignmentId>
       Revoke when the assignment handler already authorizes your principal.
@@ -1288,7 +1288,7 @@ fn parse_with_optional_catalog(
         "decision-requests" => {
             if parsed.positional.len() != 1 {
                 return Err(
-                    "usage: tightbeam decision-requests [--status open|ruled|all]".to_owned(),
+                    "usage: tightbeam decision-requests [--status open|ruled|consumed|withdrawn|superseded|all]".to_owned(),
                 );
             }
             Ok(Command::DecisionRequests {

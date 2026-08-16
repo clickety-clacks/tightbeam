@@ -388,6 +388,56 @@ defmodule Tightbeam.EscalationTest do
     assert request(ctx, id).status == "withdrawn"
   end
 
+  test "list status filter: 'all' returns every status, each legal status filters to its own",
+       ctx do
+    {:decision_pending, open_id} =
+      open(ctx, call(ctx.raiser, %{assignment_id: "s-open", kind: "completion"}), statute())
+
+    {:decision_pending, ruled_id} =
+      open(ctx, call(ctx.raiser, %{assignment_id: "s-ruled", kind: "completion"}), statute())
+
+    Escalation.rule(ctx.db, rule_call(ruled_id, "allow"), authorized: true)
+
+    {:decision_pending, consumed_id} =
+      open(ctx, call(ctx.raiser, %{assignment_id: "s-consumed", kind: "completion"}), statute())
+
+    Escalation.rule(ctx.db, rule_call(consumed_id, "allow"), authorized: true)
+    assert Escalation.consume(ctx.db, consumed_id)
+
+    all_call = call(ctx.raiser, %{})
+
+    # "all" and nil both mean no status filter — every one of the three rows is visible.
+    ids = fn status ->
+      ctx.db |> Escalation.list(all_call, status) |> Enum.map(& &1.id) |> Enum.sort()
+    end
+
+    assert ids.("all") == Enum.sort([open_id, ruled_id, consumed_id])
+    assert ids.(nil) == Enum.sort([open_id, ruled_id, consumed_id])
+
+    # Each concrete status filters to exactly the rows in that status — the regression:
+    # before the fix, "all" filtered on the literal 'all' and returned nothing.
+    assert ids.("open") == [open_id]
+    assert ids.("ruled") == [ruled_id]
+    assert ids.("consumed") == [consumed_id]
+
+    # Legal statuses with no matching rows return empty, not an error.
+    assert ids.("withdrawn") == []
+    assert ids.("superseded") == []
+  end
+
+  test "list_status validates the filter: defaults, passthrough, and a named refusal", _ctx do
+    assert {:ok, "open"} = Escalation.list_status(nil)
+    assert {:ok, "all"} = Escalation.list_status("all")
+
+    for status <- ~w(open ruled consumed withdrawn superseded) do
+      assert {:ok, ^status} = Escalation.list_status(status)
+    end
+
+    assert %{code: "invalid", message: message} = Escalation.list_status("bogus")
+    assert message =~ "bogus"
+    assert message =~ "open, ruled, consumed, withdrawn, superseded, all"
+  end
+
   test "non-session raisers use the origin domain and option labels resolve to effects", ctx do
     call = %{
       verb: "attest",

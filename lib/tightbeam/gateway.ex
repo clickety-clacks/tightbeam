@@ -730,15 +730,21 @@ defmodule Tightbeam.Gateway do
       "operator-rule" => fn call -> Escalation.operator_rule(db, call) end,
       "operator-withdraw" => fn call -> Escalation.operator_withdraw(db, call) end,
       "decision-requests" => fn call ->
-        caller = resolve_caller(db, call.origin)
+        case Escalation.list_status(call.params[:status]) do
+          {:ok, status} ->
+            caller = resolve_caller(db, call.origin)
 
-        %{
-          decision_requests:
-            Escalation.list(db, call, call.params[:status] || "open",
-              owner_user_id: caller && caller.owner_user_id,
-              admin: admin_origin?(db, call.origin)
-            )
-        }
+            %{
+              decision_requests:
+                Escalation.list(db, call, status,
+                  owner_user_id: caller && caller.owner_user_id,
+                  admin: admin_origin?(db, call.origin)
+                )
+            }
+
+          %{code: _} = err ->
+            err
+        end
       end,
       "decision-request" => fn call ->
         caller = resolve_caller(db, call.origin)
