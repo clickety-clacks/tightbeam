@@ -1156,7 +1156,7 @@ defmodule Tightbeam.PlacementTest do
              "TIGHTBEAM_URL=http://gateway.example:4000",
              "PATH=/srv/tb/bin:$PATH",
              "TIGHTBEAM_LINEAGE=tb1-Y29kZXhAd29ya2Vy",
-             "GH_CONFIG_DIR=/srv/tb/auth/github/gh",
+             "GH_CONFIG_DIR='/srv/tb/auth/github/gh'",
              ~s(CODEX_CONFIG='{"bypass_hook_trust":true}'),
              "/srv/tb/adapters/node_modules/.bin/codex-acp"
            ]
