@@ -929,6 +929,14 @@ defmodule Tightbeam.Gateway do
       # entry and no handler row, so the seam shipped dead and nothing noticed.
       # The router-seam test in router_test.exs drives these through
       # /agent/dispatch against this real table so both halves must exist.
+      # The launch handshake (rev6 §B2/§B5, owner ruling att_c990c4fe). The
+      # typed ceremony opens custody BEFORE it spawns, then binds the proven
+      # identity and is told the exact revision on which it may release. These
+      # are the broker's two calls; they are NOT a generic process-start,
+      # because the caller names a typed PURPOSE from a closed set and can
+      # never supply a command (§B4, acceptance 18).
+      "process-open" => fn call -> process_open_result(db, call) end,
+      "process-bind" => custody_handler(db, &process_bind_result/2),
       "processes" => fn call -> processes_result(db, call) end,
       "process-get" => custody_handler(db, &process_get_result/2),
       "process-extend" => custody_handler(db, &process_extend_result/2),
@@ -6490,6 +6498,138 @@ defmodule Tightbeam.Gateway do
 
       _ ->
         false
+    end
+  end
+
+  # A caller may open custody only for a purpose this line supports. There is no
+  # `command` parameter anywhere in this seam: the descriptor is DERIVED from the
+  # purpose, so a generic raw-command launcher has no argument to grow from
+  # (§B4, acceptance 18).
+  @custody_purposes %{
+    "onboarding_ceremony" => "typed onboarding ceremony"
+  }
+
+  defp process_open_result(db, call) do
+    purpose = call.params[:purpose]
+
+    with {:session, session_key} <- call[:principal],
+         {:ok, descriptor} <- Map.fetch(@custody_purposes, purpose),
+         %{owner_user_id: owner, host: host} <- Org.get(db, session_key) do
+      now = System.system_time(:millisecond)
+      lease_ms = positive_ms(call.params[:lease_ms], 15 * 60 * 1_000)
+      deadline_ms = positive_ms(call.params[:deadline_ms], 60 * 1_000)
+
+      attrs = %{
+        process_id: "mp_" <> Tightbeam.Id.ulid(),
+        owner_user_id: owner,
+        owner_session_key: session_key,
+        launch_turn_seq: call.params[:launch_turn_seq],
+        host: host,
+        purpose: purpose,
+        command_descriptor: descriptor,
+        launch_token: "tok_" <> Tightbeam.Id.ulid(),
+        launch_deadline: now + deadline_ms,
+        lease_expires_at: now + lease_ms,
+        now: now
+      }
+
+      case DB.transaction(db, fn txn ->
+             # The generation is captured HERE, inside the same transaction that
+             # inserts, so a retirement committing afterwards is detectably
+             # newer at bind time rather than invisibly concurrent.
+             generation = ManagedProcesses.current_generation_in_txn(txn, session_key)
+
+             if match?(%{state: "retiring"}, ManagedProcesses.fence_in_txn(txn, session_key)) do
+               {:error, :session_retiring}
+             else
+               ManagedProcesses.insert_preparing(
+                 txn,
+                 Map.put(attrs, :session_generation, generation)
+               )
+             end
+           end) do
+        {:ok, {:ok, row}} ->
+          # The token goes to the broker and NOWHERE else: it is the half of the
+          # identity tuple that proves we launched this child, so the projection
+          # deliberately omits it and it is returned only to the opener.
+          %{process: Payloads.managed_process(row), launchToken: row.launchToken}
+
+        {:ok, {:error, :session_retiring}} ->
+          %{
+            code: "session_retiring",
+            message: "this session is retiring; it may not open custody"
+          }
+
+        {:error, error} ->
+          %{code: "server_error", message: error_map_text(error)}
+      end
+    else
+      {:user, _} ->
+        %{code: "invalid_message", message: "process-open requires a session principal"}
+
+      :error ->
+        %{
+          code: "invalid_message",
+          message:
+            "unsupported purpose; this line supports #{Map.keys(@custody_purposes) |> Enum.join(", ")}"
+        }
+
+      _ ->
+        %{code: "not_found", message: "unknown opener session"}
+    end
+  end
+
+  defp positive_ms(value, default) when is_integer(value) and value > 0, do: value
+  defp positive_ms(_value, default), do: default
+
+  # The broker calls this after spawning behind the closed barrier. It answers
+  # the EXACT revision the workload may be released on, and only when the row
+  # reached `running` — every other answer means do not release (§B5 steps 4-7).
+  defp process_bind_result(db, call) do
+    p = call.params
+
+    with {:ok, id} <- required_process_id(call),
+         true <- is_integer(p[:os_pid]) and is_integer(p[:process_group_id]),
+         true <- is_binary(p[:boot_identity]) and is_binary(p[:launch_token]) do
+      identity = %{
+        os_pid: p.os_pid,
+        process_group_id: p.process_group_id,
+        boot_identity: p.boot_identity,
+        launch_token: p.launch_token,
+        broker_identity: p[:broker_identity]
+      }
+
+      now = System.system_time(:millisecond)
+
+      case DB.transaction(db, &ManagedProcesses.bind_identity_in_txn(&1, id, identity, now: now)) do
+        {:ok, {:running, row}} ->
+          %{process: Payloads.managed_process(row), release: true, releaseRevision: row.revision}
+
+        {:ok, {:stop, row}} ->
+          # Identity is bound so the stop worker can signal the right group, but
+          # the barrier stays shut and no release revision is issued.
+          %{process: Payloads.managed_process(row), release: false, stopCause: row.stopCause}
+
+        {:ok, {:unproven, row}} ->
+          %{
+            code: "launch_unproven",
+            message: "the launch token does not match this row; nothing was bound",
+            process: Payloads.managed_process(row)
+          }
+
+        {:ok, {:lost, row}} ->
+          %{process: Payloads.managed_process(row), release: false}
+
+        {:error, error} ->
+          %{code: "server_error", message: error_map_text(error)}
+      end
+    else
+      _ ->
+        %{
+          code: "invalid_message",
+          message:
+            "process-bind requires processId, launchToken, osPid, processGroupId, bootIdentity"
+        }
     end
   end
 
