@@ -2130,4 +2130,142 @@ defmodule Tightbeam.Wire.RouterTest do
       assert JSON.decode!(response.resp_body)["result"]["process"]["processId"] == "mp_mine"
     end
   end
+
+  # THE LAUNCH HANDSHAKE at the wire (rev6 §B2/§B5, owner ruling att_c990c4fe,
+  # review att_8017ebe7 F1). Row before spawn, token to the broker, atomic
+  # validate, release only on the exact returned revision.
+  defp custody_handlers(ctx) do
+    Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir, wake_tick_ms: 1_000})
+  end
+
+  defp open_custody(ctx, token) do
+    dispatch_cli(ctx, token, %{
+      verb: "process-open",
+      params: %{purpose: "onboarding_ceremony", leaseMs: 60_000, deadlineMs: 30_000}
+    })
+  end
+
+  test "the ceremony opens custody before spawning and is handed the launch token", ctx do
+    caller = create_session(ctx.db, "broker-session", "flynn")
+    Roles.create!(ctx.db, "broker-session", "flynn", caller.session_key)
+    ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, custody_handlers(ctx))}
+
+    response = open_custody(ctx, caller.cli_token)
+    assert response.status == 200
+
+    result = JSON.decode!(response.resp_body)["result"]
+    process = result["process"]
+
+    assert process["state"] == "preparing"
+    assert process["ownerSessionKey"] == caller.session_key
+    assert process["osPid"] == nil, "no identity exists before the spawn"
+    assert is_binary(result["launchToken"])
+
+    # The token is handed to the OPENER only. It is the half of the identity
+    # tuple that proves we launched the child, so the projection must not carry it.
+    refute Map.has_key?(process, "launchToken")
+  end
+
+  test "a bind with the token reaches running and returns the release revision", ctx do
+    caller = create_session(ctx.db, "broker-bind", "flynn")
+    Roles.create!(ctx.db, "broker-bind", "flynn", caller.session_key)
+    ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, custody_handlers(ctx))}
+
+    opened = JSON.decode!(open_custody(ctx, caller.cli_token).resp_body)["result"]
+    id = opened["process"]["processId"]
+
+    bound =
+      dispatch_cli(ctx, caller.cli_token, %{
+        verb: "process-bind",
+        params: %{
+          processId: id,
+          launchToken: opened["launchToken"],
+          osPid: 4242,
+          processGroupId: 4242,
+          bootIdentity: "boot-abc"
+        }
+      })
+
+    assert bound.status == 200
+    result = JSON.decode!(bound.resp_body)["result"]
+
+    assert result["release"] == true
+    assert result["process"]["state"] == "running"
+    assert result["releaseRevision"] == result["process"]["revision"]
+    assert result["process"]["osPid"] == 4242
+  end
+
+  # §B5 / F5: the token is what proves the child is ours. A bind without it
+  # binds nothing and issues no release revision, so the barrier stays shut.
+  test "a bind with the wrong token is refused and releases nothing", ctx do
+    caller = create_session(ctx.db, "broker-wrong", "flynn")
+    Roles.create!(ctx.db, "broker-wrong", "flynn", caller.session_key)
+    ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, custody_handlers(ctx))}
+
+    opened = JSON.decode!(open_custody(ctx, caller.cli_token).resp_body)["result"]
+    id = opened["process"]["processId"]
+
+    bound =
+      dispatch_cli(ctx, caller.cli_token, %{
+        verb: "process-bind",
+        params: %{
+          processId: id,
+          launchToken: "tok_forged",
+          osPid: 4242,
+          processGroupId: 4242,
+          bootIdentity: "boot-abc"
+        }
+      })
+
+    body = JSON.decode!(bound.resp_body)
+    assert body["error"]["code"] == "launch_unproven"
+
+    row = Tightbeam.ManagedProcesses.get(ctx.db, id)
+    assert row.state == "preparing"
+    assert row.osPid == nil
+    assert row.releaseGrantedAt == nil
+  end
+
+  # §B5: a session already retiring must not open new custody — otherwise the
+  # retirement census it just ran would be incomplete the moment it committed.
+  test "a retiring session cannot open custody", ctx do
+    caller = create_session(ctx.db, "broker-retiring", "flynn")
+    Roles.create!(ctx.db, "broker-retiring", "flynn", caller.session_key)
+    ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, custody_handlers(ctx))}
+
+    :ok = Tightbeam.ManagedProcesses.ensure_schema(ctx.db)
+
+    {:ok, _} =
+      DB.transaction(ctx.db, fn txn ->
+        Tightbeam.ManagedProcesses.open_fence_in_txn(txn, caller.session_key,
+          retirement_epoch: 5_000,
+          principal: "user:flynn"
+        )
+      end)
+
+    response = open_custody(ctx, caller.cli_token)
+    assert JSON.decode!(response.resp_body)["error"]["code"] == "session_retiring"
+  end
+
+  # §B4 acceptance 18, asserted at the handshake itself: there is no command
+  # parameter to supply. The descriptor is derived from a closed purpose set, so
+  # a generic raw-command launcher has no argument to grow from.
+  test "custody cannot be opened for an arbitrary purpose or carry a command", ctx do
+    caller = create_session(ctx.db, "broker-generic", "flynn")
+    Roles.create!(ctx.db, "broker-generic", "flynn", caller.session_key)
+    ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, custody_handlers(ctx))}
+
+    refused =
+      dispatch_cli(ctx, caller.cli_token, %{
+        verb: "process-open",
+        params: %{purpose: "run_anything", command: "/bin/sh -c 'curl evil'"}
+      })
+
+    assert JSON.decode!(refused.resp_body)["error"]["code"] == "invalid_message"
+
+    allowed = JSON.decode!(open_custody(ctx, caller.cli_token).resp_body)["result"]
+
+    # Even on the supported purpose, the descriptor is ours, not the caller's.
+    assert allowed["process"]["commandDescriptor"] == "typed onboarding ceremony"
+  end
 end
