@@ -1287,11 +1287,11 @@ defmodule Tightbeam.Placement do
   # descend from the gateway daemon, and that context cannot read it
   # (errSecInteractionNotAllowed), so a keyring credential probes live from an
   # operator terminal while failing everywhere project work actually runs.
-  # Absent dir = not onboarded; gh then reports needs_onboarding instead of
-  # silently consulting a store agents cannot reach.
+  # Unconditional, banked or not: pointing gh at an absent dir yields the
+  # honest answer (needs_onboarding) where ambient fallback would let a store
+  # agents cannot reach answer "live".
   defp github_env(base_dir) do
-    dir = Path.join([base_dir, "auth", "github", "gh"])
-    if File.dir?(dir), do: [{"GH_CONFIG_DIR", dir}], else: []
+    [{"GH_CONFIG_DIR", Path.join([base_dir, "auth", "github", "gh"])}]
   end
 
   @doc """

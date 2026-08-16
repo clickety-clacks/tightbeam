@@ -80,12 +80,15 @@ struct RealGh {
 }
 
 impl RealGh {
-    /// Probe-side construction: use the banked dir if it exists, otherwise
-    /// inherit the ambient environment unchanged (bootstrap, dev checkouts).
+    /// Probe-side construction: the banked dir is pinned whether or not it
+    /// exists yet. Falling back to the ambient environment would let a
+    /// keyring or operator-shell credential answer "live" for environments
+    /// that cannot read it — the exact inconsistency this capability exists
+    /// to eliminate. An absent dir makes gh answer needs_onboarding, which
+    /// is the honest state.
     fn using_banked(base_dir: &Path) -> Self {
-        let dir = gh_config_dir(base_dir);
         RealGh {
-            config_dir: dir.is_dir().then_some(dir),
+            config_dir: Some(gh_config_dir(base_dir)),
         }
     }
 
@@ -117,16 +120,29 @@ impl RealGh {
     }
 }
 
+/// Probes are bounded: the guard runs inside a PreToolUse hook, and an
+/// unbounded `git ls-remote` against an unreachable host would hang the
+/// agent's whole tool path. A timed-out probe maps to an error, which the
+/// callers treat as `unknown` — per spec, never live. The login ceremony
+/// (`status`) stays unbounded on purpose: a human is completing a browser
+/// flow that legitimately takes minutes.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 impl Gh for RealGh {
     fn which_gh(&self) -> Option<PathBuf> {
         crate::preflight::on_path("gh", &std::env::var("PATH").unwrap_or_default())
     }
 
     fn output(&self, args: &[&str]) -> Result<Output, String> {
-        self.command("gh")
+        let child = self
+            .command("gh")
             .args(args)
-            .output()
-            .map_err(|error| format!("failed to run gh {}: {error}", args.join(" ")))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("failed to run gh {}: {error}", args.join(" ")))?;
+        wait_bounded(child, &format!("gh {}", args.join(" ")))
     }
 
     fn status(&self, args: &[&str]) -> Result<std::process::ExitStatus, String> {
@@ -137,10 +153,42 @@ impl Gh for RealGh {
     }
 
     fn git_ls_remote(&self, remote: &str) -> Result<Output, String> {
-        self.command("git")
+        let child = self
+            .command("git")
             .args(["ls-remote", remote, "HEAD"])
-            .output()
-            .map_err(|error| format!("failed to run git ls-remote: {error}"))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("failed to run git ls-remote: {error}"))?;
+        wait_bounded(child, "git ls-remote")
+    }
+}
+
+// Probe output is small (auth status lines, one ls-remote ref), so waiting for
+// exit before draining the pipes cannot deadlock on a full pipe buffer in
+// practice; a pathological child that fills the buffer just gets killed at the
+// deadline like any other hang.
+fn wait_bounded(mut child: std::process::Child, what: &str) -> Result<Output, String> {
+    let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return child
+                    .wait_with_output()
+                    .map_err(|error| format!("failed reading {what} output: {error}"));
+            }
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "{what} timed out after {}s",
+                    PROBE_TIMEOUT.as_secs()
+                ));
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Err(error) => return Err(format!("failed waiting for {what}: {error}")),
+        }
     }
 }
 
@@ -339,8 +387,11 @@ fn probe_with(hostname: &str, gh: &impl Gh) -> GithubStatus {
 fn probe_git_remote(status: &GithubStatus, remote: &str, gh: &impl Gh) -> GithubStatus {
     let output = gh.git_ls_remote(remote);
     match output {
+        // The success path scrubs too: git_remote lands in stdout JSON and
+        // capability.json, and a working credentialed URL is exactly the one
+        // whose secret must not be persisted.
         Ok(output) if output.status.success() => GithubStatus {
-            git_remote: Some(remote.to_owned()),
+            git_remote: Some(scrub_detail(remote)),
             git_ready: Some(true),
             ..status.clone()
         },
@@ -590,7 +641,15 @@ fn scrub_detail(detail: &str) -> String {
             "[redacted]".to_owned()
         } else if let Some((scheme, rest)) = word.split_once("://") {
             if let Some((userinfo, host_path)) = rest.split_once('@') {
-                if userinfo.contains(':') {
+                // user:password AND token-as-username forms — gh accepts
+                // https://ghp_xxx@host clones, so a bare token can be the
+                // entire userinfo with no colon in sight.
+                let userinfo_is_secret = userinfo.contains(':')
+                    || userinfo.contains("github_pat_")
+                    || ["ghp_", "gho_", "ghu_", "ghs_", "ghr_"]
+                        .iter()
+                        .any(|prefix| userinfo.contains(prefix));
+                if userinfo_is_secret {
                     format!("{scheme}://[redacted]@{host_path}")
                 } else {
                     word.to_owned()
@@ -1018,7 +1077,7 @@ mod tests {
     }
 
     #[test]
-    fn using_banked_ignores_a_missing_config_dir() {
+    fn using_banked_pins_the_config_dir_even_when_absent() {
         let root = std::env::temp_dir().join(format!(
             "tb-gh-missing-{}",
             SystemTime::now()
@@ -1026,6 +1085,11 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        assert_eq!(RealGh::using_banked(&root).config_dir, None);
+        // No ambient fallback: an absent banked dir must probe as
+        // needs_onboarding, never as whatever the operator shell can reach.
+        assert_eq!(
+            RealGh::using_banked(&root).config_dir.as_deref(),
+            Some(gh_config_dir(&root).as_path())
+        );
     }
 }

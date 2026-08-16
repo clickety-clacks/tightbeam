@@ -83,7 +83,10 @@ defmodule Tightbeam.Rails do
   # the same turn it would have bound anyway, while a miss silently downgrades a
   # correct agent's evidence.
   @observation_pattern "tightbeam[^\"]*artifact-record"
-  @github_auth_pattern "(github\\.com|gh repo |gh pr |gh issue )"
+  # A cheap prefilter only — it may over-match freely (the CLI judges
+  # operations vs mentions), but it must never exclude an operation the CLI
+  # would gate, so every gh area the checker knows appears here.
+  @github_auth_pattern "(github\\.com|gh repo |gh pr |gh issue |gh api )"
 
   @typedoc "A validated gate statute."
   @type statute :: %{
