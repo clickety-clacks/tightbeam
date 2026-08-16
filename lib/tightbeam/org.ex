@@ -629,6 +629,87 @@ defmodule Tightbeam.Org do
     end
   end
 
+  @doc """
+  Finish a retirement that was deferred, in the SAME transaction that
+  terminalized the last process row (spec art_6817803a rev6 §B5).
+
+  Two callers reach this: an exact `retire` retry after `process-reconcile`
+  clears the block, and boot recovery, which must revisit every open fence
+  because an older build could have terminalized the last process and died
+  before finalizing the session — leaving it `retiring` forever with nothing
+  left to trigger it.
+
+  Answers `{:retired, session}` when the fence closed and the row flipped,
+  `{:blocked, rows}` while anything is still unresolved, and
+  `{:already_retired, session}` when there is nothing left to do. An exact retry
+  is idempotent success, never a second retirement.
+
+  Sharing this with `retire_in_txn/4` is deliberate: two code paths that each
+  decided when a session has "finished retiring" would eventually disagree, and
+  the disagreement would show up as a session that is durably retired while a
+  process it owns is still running.
+  """
+  @spec finalize_retiring_session_in_txn(Txn.t(), String.t(), integer()) ::
+          {:retired, session()} | {:already_retired, session()} | {:blocked, [map()]} | :no_fence
+  def finalize_retiring_session_in_txn(%Txn{} = txn, session_key, now) do
+    case ManagedProcesses.fence_in_txn(txn, session_key) do
+      nil ->
+        :no_fence
+
+      %{state: "retired"} ->
+        {:already_retired, must_get(txn, session_key)}
+
+      %{state: "retiring", generation: generation} ->
+        case ManagedProcesses.finalize_fence_in_txn(txn, session_key,
+               generation: generation,
+               now: now
+             ) do
+          {:blocked, blockers} ->
+            {:blocked, blockers}
+
+          final when elem(final, 0) in [:ok, :already_final] ->
+            Txn.q(
+              txn,
+              "UPDATE sessions SET state = 'retired', updatedAt = ?2 WHERE sessionKey = ?1 AND state = 'active'",
+              [session_key, now]
+            )
+
+            # Zero changed rows is not a fault here: a session already flipped by
+            # a concurrent finalizer is the idempotent case, and raising would
+            # turn a duplicate boot scan into an outage.
+            cancel_retirement_wakes_in_txn(txn, session_key)
+
+            {:retired, must_get(txn, session_key)}
+        end
+    end
+  end
+
+  @doc """
+  Boot recovery's second pass (§B5): revisit every session still behind an open
+  fence and finalize the ones that have become finishable.
+
+  Runs AFTER process rows are reconciled, because a row that terminalizes during
+  that pass is exactly what makes its session finishable. Returns the sessions
+  it retired and the ones still blocked, so the caller can report rather than
+  guess.
+  """
+  @spec finalize_open_retirements_in_txn(Txn.t(), integer()) :: %{
+          retired: [String.t()],
+          blocked: [String.t()]
+        }
+  def finalize_open_retirements_in_txn(%Txn{} = txn, now) do
+    txn
+    |> ManagedProcesses.open_fences_in_txn()
+    |> Enum.reduce(%{retired: [], blocked: []}, fn fence, acc ->
+      case finalize_retiring_session_in_txn(txn, fence.sessionKey, now) do
+        {:retired, _} -> %{acc | retired: acc.retired ++ [fence.sessionKey]}
+        {:already_retired, _} -> %{acc | retired: acc.retired ++ [fence.sessionKey]}
+        {:blocked, _} -> %{acc | blocked: acc.blocked ++ [fence.sessionKey]}
+        :no_fence -> acc
+      end
+    end)
+  end
+
   defp cancel_retirement_wakes_in_txn(txn, session_key) do
     Txn.q(
       txn,

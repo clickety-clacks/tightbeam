@@ -585,4 +585,134 @@ defmodule Tightbeam.OrgTest do
     assert {:ok, [["pending"]]} =
              DB.query(db, "SELECT state FROM wakes WHERE wakeId = ?1", ["w_custody_defer"])
   end
+
+  ## Boot recovery (§B5) — the restart pass that finishes what a crash left open
+
+  # §B5, acceptance 24: an interrupted or legacy fixture whose session is
+  # retiring and whose process rows are ALREADY terminal. Nothing further will
+  # ever happen to those rows, so without this pass the session stays `retiring`
+  # forever with no trigger left to finish it.
+  test "boot recovery finalizes a session whose last process already terminalized", %{db: db} do
+    custody_session(db, "agent:stranded")
+    row = preparing_process(db, "agent:stranded")
+
+    assert %{state: "active"} = retire_in_txn!(db, "agent:stranded")
+
+    blocked = ManagedProcesses.get(db, row.processId)
+
+    {:ok, _} =
+      DB.transaction(db, fn txn ->
+        ManagedProcesses.transition(
+          txn,
+          row.processId,
+          [state: "launch_cancel_requested", revision: blocked.revision],
+          %{state: "launch_canceled", resolved_at: 7_000, now: 7_000}
+        )
+      end)
+
+    # The crash: the process settled but nothing finalized the session.
+    assert ManagedProcesses.fence(db, "agent:stranded").state == "retiring"
+    assert %{state: "active"} = Org.get(db, "agent:stranded")
+
+    {:ok, result} =
+      DB.transaction(db, &Org.finalize_open_retirements_in_txn(&1, 9_000))
+
+    assert result.retired == ["agent:stranded"]
+    assert result.blocked == []
+    assert %{state: "retired"} = Org.get(db, "agent:stranded")
+    assert ManagedProcesses.fence(db, "agent:stranded").state == "retired"
+  end
+
+  # Running it twice must not retire anything twice, and must not raise. A
+  # duplicate boot scan is ordinary, not an incident.
+  test "boot recovery is idempotent across repeated scans", %{db: db} do
+    custody_session(db, "agent:twice")
+    row = preparing_process(db, "agent:twice")
+    assert %{state: "active"} = retire_in_txn!(db, "agent:twice")
+
+    blocked = ManagedProcesses.get(db, row.processId)
+
+    {:ok, _} =
+      DB.transaction(db, fn txn ->
+        ManagedProcesses.transition(
+          txn,
+          row.processId,
+          [state: "launch_cancel_requested", revision: blocked.revision],
+          %{state: "launch_canceled", resolved_at: 7_000, now: 7_000}
+        )
+      end)
+
+    {:ok, first} = DB.transaction(db, &Org.finalize_open_retirements_in_txn(&1, 9_000))
+    assert first.retired == ["agent:twice"]
+
+    # Second scan: the fence is closed, so there is nothing left to visit.
+    {:ok, second} = DB.transaction(db, &Org.finalize_open_retirements_in_txn(&1, 9_500))
+    assert second.retired == []
+    assert second.blocked == []
+    assert %{state: "retired"} = Org.get(db, "agent:twice")
+  end
+
+  # §B3/§B5: an unresolved row keeps blocking across restarts. Boot recovery
+  # must not "clean up" what it cannot prove.
+  test "boot recovery leaves a session blocked while a row stays unresolved", %{db: db} do
+    custody_session(db, "agent:unproven")
+    row = preparing_process(db, "agent:unproven")
+
+    {:ok, _} =
+      DB.transaction(db, fn txn ->
+        ManagedProcesses.transition(
+          txn,
+          row.processId,
+          [state: "preparing", revision: 1],
+          %{state: "identity_unknown", uncertainty_cause: "launch_handoff_unknown", now: 2_000}
+        )
+      end)
+
+    assert %{state: "active"} = retire_in_txn!(db, "agent:unproven")
+
+    for now <- [9_000, 10_000, 11_000] do
+      {:ok, result} = DB.transaction(db, &Org.finalize_open_retirements_in_txn(&1, now))
+      assert result.blocked == ["agent:unproven"]
+      assert result.retired == []
+    end
+
+    assert %{state: "active"} = Org.get(db, "agent:unproven")
+    assert ManagedProcesses.fence(db, "agent:unproven").state == "retiring"
+
+    still = ManagedProcesses.get(db, row.processId)
+    assert still.state == "identity_unknown"
+    assert still.stopCause == "session_retired"
+  end
+
+  test "the recovery scan returns every blocking row and no terminal one", %{db: db} do
+    custody_session(db, "agent:scan-a")
+    custody_session(db, "agent:scan-b")
+    blocking_a = preparing_process(db, "agent:scan-a")
+    blocking_b = preparing_process(db, "agent:scan-b")
+    finished = preparing_process(db, "agent:scan-a")
+
+    {:ok, _} =
+      DB.transaction(db, fn txn ->
+        ManagedProcesses.transition(
+          txn,
+          finished.processId,
+          [state: "preparing", revision: 1],
+          %{state: "exited", resolved_at: 2_000, now: 2_000}
+        )
+      end)
+
+    {:ok, rows} = DB.transaction(db, &ManagedProcesses.recovery_rows_in_txn/1)
+    ids = Enum.map(rows, & &1.processId)
+
+    assert blocking_a.processId in ids
+    assert blocking_b.processId in ids, "the scan must cross session boundaries"
+    refute finished.processId in ids
+  end
+
+  test "finalizing a session that never retired reports no fence", %{db: db} do
+    custody_session(db, "agent:never")
+
+    assert {:ok, :no_fence} =
+             DB.transaction(db, &Org.finalize_retiring_session_in_txn(&1, "agent:never", 1_000))
+  end
 end
