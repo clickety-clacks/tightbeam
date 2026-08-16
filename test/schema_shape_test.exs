@@ -84,6 +84,7 @@ defmodule Tightbeam.SchemaShapeTest do
                 purpose commandDescriptor osPid processGroupId bootIdentity launchToken
                 brokerIdentity launchDeadline leaseExpiresAt cancelRequestedAt releaseGrantedAt
                 stopCause uncertaintyCause stopAttemptCount state lastError deliveryEvidenceId
+                deliveryResult deliveryProviderKind deliveryEventKind
                 createdAt updatedAt resolvedAt revision)
   end
 

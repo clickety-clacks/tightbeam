@@ -902,4 +902,140 @@ defmodule Tightbeam.ManagedProcessesTest do
     assert terminal.state == "killed"
     assert terminal.resolvedAt == 5_000
   end
+
+  ## Delivery evidence and the canary scan (§B6, acceptance 14/15/16/17)
+
+  @canary_code "CANARY-ONE-TIME-CODE-8Q4Z"
+  @canary_url "https://canary.example/device/CANARY-URL-7X2"
+
+  defp consume(db, process_id, receipt, now \\ 4_000) do
+    tx!(db, fn txn ->
+      ManagedProcesses.consume_delivery_receipt_in_txn(txn, process_id, receipt, now: now)
+    end)
+  end
+
+  test "a success receipt is recorded as a pointer and custody continues", ctx do
+    bound = running_row(ctx.db)
+
+    assert {:ok, row} =
+             consume(ctx.db, bound.processId, %{
+               result: :succeeded,
+               delivery_evidence_id: "dlv_12345",
+               provider_kind: "anthropic",
+               event_kind: "device_code_emitted"
+             })
+
+    assert row.deliveryEvidenceId == "dlv_12345"
+    assert row.deliveryResult == "succeeded"
+    assert row.deliveryProviderKind == "anthropic"
+    assert row.deliveryEventKind == "device_code_emitted"
+
+    # A successful handoff is not a reason to stop a ceremony that is running.
+    assert row.state == "running"
+    assert row.stopCause == nil
+  end
+
+  # §B6: on failure custody KEEPS the process managed. "The delivery failed" and
+  # "the process has stopped" are different facts, and only the second ends
+  # custody — terminalizing here would end it on the strength of the wrong one.
+  test "a failed or timed-out receipt does not terminalize the process", ctx do
+    for result <- [:failed, :timed_out] do
+      bound = running_row(ctx.db)
+
+      assert {:ok, row} =
+               consume(ctx.db, bound.processId, %{
+                 result: result,
+                 delivery_evidence_id: "dlv_#{result}",
+                 provider_kind: "openai",
+                 event_kind: "device_code_emitted"
+               })
+
+      assert row.deliveryResult == to_string(result)
+      assert row.state == "running", "custody must survive a failed delivery"
+      assert row.resolvedAt == nil
+      assert ManagedProcesses.blocks_retirement?(row)
+    end
+  end
+
+  test "the record refuses a delivery result outside the closed set", ctx do
+    bound = running_row(ctx.db)
+
+    # DB.transaction catches the raise and returns it, so assert on the value.
+    assert {:error, %CaseClauseError{term: :probably_fine}} =
+             DB.transaction(ctx.db, fn txn ->
+               ManagedProcesses.consume_delivery_receipt_in_txn(
+                 txn,
+                 bound.processId,
+                 %{result: :probably_fine, delivery_evidence_id: "dlv_x"},
+                 now: 4_000
+               )
+             end)
+  end
+
+  # ACCEPTANCE 14 AND 17. Push canary values at every field a caller can reach,
+  # then scan EVERY text column of the record for them. The columns are
+  # enumerated from the table rather than hand-listed, so a column added later
+  # is scanned automatically instead of quietly escaping this check.
+  test "no canary value can reach any text column of the record", ctx do
+    bound = running_row(ctx.db)
+
+    # Everything a caller controls, carrying canaries.
+    assert {:ok, _} =
+             consume(ctx.db, bound.processId, %{
+               result: :succeeded,
+               delivery_evidence_id: "dlv_pointer_only",
+               provider_kind: "anthropic",
+               event_kind: "device_code_emitted"
+             })
+
+    # Read the revision BEFORE opening the transaction: calling `get/2` inside
+    # one makes the DB GenServer call itself.
+    current = ManagedProcesses.get(ctx.db, bound.processId)
+
+    tx!(ctx.db, fn txn ->
+      ManagedProcesses.transition(
+        txn,
+        bound.processId,
+        [state: "running", revision: current.revision],
+        %{last_error: "provider refused the request", now: 5_000}
+      )
+    end)
+
+    columns = ManagedProcesses.text_columns(ctx.db)
+    assert "commandDescriptor" in columns, "the scan must cover the descriptor"
+    assert "lastError" in columns, "the scan must cover errors"
+
+    for column <- columns do
+      {:ok, rows} =
+        DB.query(
+          ctx.db,
+          "SELECT COUNT(*) FROM managed_processes WHERE #{column} LIKE ?1 OR #{column} LIKE ?2",
+          ["%" <> @canary_code <> "%", "%" <> @canary_url <> "%"]
+        )
+
+      assert rows == [[0]], "canary value reached managed_processes.#{column}"
+    end
+  end
+
+  # The stronger half of the same rule: there is nowhere to PUT a secret, so it
+  # cannot arrive by a route nobody thought to scan. A caller that tries is
+  # refused by the writable set rather than silently accepted.
+  test "the record has no field a secret could be written to", ctx do
+    bound = running_row(ctx.db)
+
+    for field <- [:one_time_code, :device_code, :url, :command, :env, :credential] do
+      assert {:error, %ArgumentError{}} =
+               DB.transaction(ctx.db, fn txn ->
+                 ManagedProcesses.transition(
+                   txn,
+                   bound.processId,
+                   [state: "running", revision: bound.revision],
+                   %{field => @canary_code, now: 6_000}
+                 )
+               end)
+    end
+
+    refute Map.has_key?(ManagedProcesses.writable_fields(), :one_time_code)
+    refute Map.has_key?(ManagedProcesses.writable_fields(), :command)
+  end
 end
