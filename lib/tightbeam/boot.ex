@@ -9,7 +9,7 @@ defmodule Tightbeam.Boot do
   startup and does not linger as a process.
   """
 
-  alias Tightbeam.{Escalation, EventLog, Ledger, Schema}
+  alias Tightbeam.{Escalation, EventLog, Gateway, Ledger, Schema}
 
   @spec child_spec(term()) :: Supervisor.child_spec()
   def child_spec(base_dir) do
@@ -30,6 +30,17 @@ defmodule Tightbeam.Boot do
     # Boot recovery: any 'running' turn from a prior life is UNKNOWN-terminal.
     _ = Ledger.recover_running()
     :ok = Escalation.recover_retired()
+
+    # Durable process custody (spec art_6817803a rev6 §B5): reconcile every
+    # process row a crash left nonterminal or unresolved, then finalize any
+    # session still behind an open retirement fence. Without this pass a session
+    # blocked on a process that has since settled stays `retiring` for ever,
+    # because the thing that would have finished it died with the last boot.
+    #
+    # Evidence is `:not_probed` inside — this line has no OS probe — so expired
+    # leases settle and causes install, but nothing is terminalized on the
+    # strength of a restart alone.
+    _ = Gateway.recover_process_custody()
 
     projections =
       "[" <> Enum.map_join(Tightbeam.Harness.all(), ",", & &1.wire_projection()) <> "]"

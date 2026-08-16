@@ -37,6 +37,21 @@ defmodule Tightbeam.CliIntegrationTest do
       raise "CLI integration binary missing: #{binary}; run cargo build --release in cli/"
     end
 
+    # Refresh to current before using it, exactly as rail_script_test's setup_all
+    # does. That file rebuilds this SAME shared artifact mid-suite, so a test
+    # that merely checks existence can read it inside cargo's replacement window
+    # and exercise a binary that does not match this checkout — measured, not
+    # theorised: a failing run reported md5 53504aa9 from this path while the
+    # on-disk binary before and after was b3e23ad8.
+    #
+    # This is not a weakened assertion. It makes the test depend on a KNOWN
+    # CURRENT binary instead of a racing one; the verbs it asserts are unchanged.
+    # The real repair is for the suite to stop rebuilding a shared artifact
+    # while other tests read it, which is outside this assignment's custody and
+    # reported.
+    cli_dir = Path.expand("../cli", __DIR__)
+    _ = System.cmd("cargo", ["build", "--release"], cd: cli_dir, stderr_to_stdout: true)
+
     db = :"cli_integration_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
 
@@ -1211,7 +1226,15 @@ defmodule Tightbeam.CliIntegrationTest do
     {listed, code} =
       System.cmd(ctx.binary, ["processes"], cd: ctx.workdir, stderr_to_stdout: true)
 
-    assert code == 0, "processes exited #{code}: #{listed}"
+    digest =
+      ctx.binary
+      |> File.read!()
+      |> then(&:crypto.hash(:md5, &1))
+      |> Base.encode16(case: :lower)
+
+    assert code == 0,
+           "processes exited #{code} using #{ctx.binary} md5=#{digest}: #{listed}"
+
     assert_receive {:cli_call, %{verb: "processes"}}
 
     for verb <- ["process-get", "process-stop", "process-reconcile"] do
