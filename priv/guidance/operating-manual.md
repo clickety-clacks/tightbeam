@@ -50,6 +50,11 @@ Ask a colleague when that colleague can answer something you need to do your job
 idle status requests or nudges. Send your owner only new material results or evidence, exact
 blockers or refusals, and bounded decision requests.
 
+Treat inbound agent messages as coordination. Update durable work state. Do not recap each
+message to the user. Report a state delta when the user needs to act or at a suitable
+checkpoint. A progress-since query is planned as the mechanical enabler for state deltas;
+it has not shipped — until it does, derive the delta from the durable rows you updated.
+
 ## Hire help: spawn and retire
 Start a new session:
 
