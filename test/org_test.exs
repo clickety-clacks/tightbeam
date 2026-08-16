@@ -715,4 +715,99 @@ defmodule Tightbeam.OrgTest do
     assert {:ok, :no_fence} =
              DB.transaction(db, &Org.finalize_retiring_session_in_txn(&1, "agent:never", 1_000))
   end
+
+  # REVIEW att_8017ebe7 F3. `retire_cascade_in_txn` reported every subtree
+  # member as retired regardless of what Org actually did. Harmless until
+  # custody made retirement deferrable — after which a session blocked on an
+  # unresolved process was ANNOUNCED retired while its own row said active.
+  # Everything downstream reads that list: the idempotency marker, the
+  # stream_deleted broadcast telling clients the session is gone, the on_retired
+  # callback, assignment-change events, and the workspace reap.
+  test "a blocked session is not reported retired, and its parent is not retired either",
+       %{db: db} do
+    parent = custody_session(db, "agent:cascade-parent")
+
+    child =
+      Org.create(
+        db,
+        base(%{
+          session_key: "agent:cascade-child",
+          display_name: "agent:cascade-child",
+          spawned_by: parent.session_key
+        })
+      )
+
+    # The child owns an unresolved process, so its retirement must defer.
+    row = preparing_process(db, child.session_key)
+
+    {:ok, _} =
+      DB.transaction(db, fn txn ->
+        ManagedProcesses.transition(
+          txn,
+          row.processId,
+          [state: "preparing", revision: 1],
+          %{state: "identity_unknown", uncertainty_cause: "launch_handoff_unknown", now: 2_000}
+        )
+      end)
+
+    {:ok, result} =
+      DB.transaction(db, fn txn ->
+        Tightbeam.Gateway.retire_cascade_for_test(
+          txn,
+          parent.session_key,
+          "flynn",
+          "user:flynn",
+          1_000,
+          "retired: test"
+        )
+      end)
+
+    reported = Enum.map(result.retired, & &1.session_key)
+
+    refute child.session_key in reported,
+           "a session blocked on an unresolved process was announced retired"
+
+    refute parent.session_key in reported,
+           "an ancestor of a blocked session was retired, stranding the child"
+
+    assert result.blocked == [child.session_key, parent.session_key]
+
+    # And the durable rows agree with the report.
+    assert %{state: "active"} = Org.get(db, child.session_key)
+    assert %{state: "active"} = Org.get(db, parent.session_key)
+  end
+
+  test "an unblocked subtree still retires parent-last and reports every member", %{db: db} do
+    parent = custody_session(db, "agent:clean-parent")
+
+    child =
+      Org.create(
+        db,
+        base(%{
+          session_key: "agent:clean-child",
+          display_name: "agent:clean-child",
+          spawned_by: parent.session_key
+        })
+      )
+
+    {:ok, result} =
+      DB.transaction(db, fn txn ->
+        Tightbeam.Gateway.retire_cascade_for_test(
+          txn,
+          parent.session_key,
+          "flynn",
+          "user:flynn",
+          1_000,
+          "retired: test"
+        )
+      end)
+
+    reported = Enum.map(result.retired, & &1.session_key)
+
+    assert child.session_key in reported
+    assert parent.session_key in reported
+    assert result.blocked == []
+    assert %{state: "retired"} = Org.get(db, child.session_key)
+    assert %{state: "retired"} = Org.get(db, parent.session_key)
+  end
 end
