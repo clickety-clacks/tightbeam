@@ -98,7 +98,17 @@ defmodule Tightbeam.Wire.Router do
         do: Tightbeam.AdapterCoordinator.health(coordinator),
         else: %{}
 
-    json(conn, 200, %{"protocolVersion" => 1, "server" => "tightbeam", "adapters" => health})
+    # builds-identify-bytes: a running gateway states which bytes it is. version is
+    # the release version (single home: the CLI-compat policy); build/sha are the
+    # compile-time stamp (Tightbeam.BuildStamp), not runtime git.
+    json(conn, 200, %{
+      "protocolVersion" => 1,
+      "server" => "tightbeam",
+      "version" => Tightbeam.CliCompatibility.required_version(),
+      "build" => Tightbeam.BuildStamp.build(),
+      "sha" => Tightbeam.BuildStamp.sha(),
+      "adapters" => health
+    })
   end
 
   get "/harnesses" do

@@ -217,6 +217,23 @@ defmodule Tightbeam.Wire.RouterTest do
     assert response.resp_body == expected
   end
 
+  test "/version states which bytes the gateway is: version + build stamp", ctx do
+    response = Router.call(conn(:get, "/version"), Router.init(ctx.opts))
+
+    assert response.status == 200
+    body = JSON.decode!(response.resp_body)
+
+    # The release version comes from its single home; the seam only asserts the
+    # body carries it, not a hardcoded string that every bump would break.
+    assert body["version"] == Tightbeam.CliCompatibility.required_version()
+
+    # build is the compile-time rev-list count: a positive integer, and the exact
+    # value the stamp captured — never runtime git.
+    assert is_integer(body["build"]) and body["build"] > 0
+    assert body["build"] == Tightbeam.BuildStamp.build()
+    assert body["sha"] == Tightbeam.BuildStamp.sha()
+  end
+
   test "CLI exact-version refusal is loud and precedes bearer authentication", ctx do
     body = JSON.encode!(%{verb: "inspect", asUser: "flynn", params: %{}})
 
