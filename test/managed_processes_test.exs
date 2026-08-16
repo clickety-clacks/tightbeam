@@ -343,4 +343,183 @@ defmodule Tightbeam.ManagedProcessesTest do
       refute unresolved in ManagedProcesses.terminal_states()
     end
   end
+
+  ## The retirement fence (§B5, additive per att_54f4348d)
+
+  defp open_fence(db, session_key, epoch \\ 5_000) do
+    tx!(db, fn txn ->
+      ManagedProcesses.open_fence_in_txn(txn, session_key,
+        retirement_epoch: epoch,
+        principal: "user:flynn"
+      )
+    end)
+  end
+
+  test "opening the fence marks the session retiring at generation 1", ctx do
+    assert {:ok, fence} = open_fence(ctx.db, "agent:owner")
+
+    assert fence.state == "retiring"
+    assert fence.generation == 1
+    assert fence.finalizedAt == nil
+    assert fence.retirementEpoch == 5_000
+  end
+
+  # An exact retirement retry must reach the same durable answer. Opening a
+  # second fence, or bumping the generation on a retry, would make a late
+  # identity bind from the SAME retirement look stale.
+  test "reopening an open fence is idempotent and does not move the generation", ctx do
+    assert {:ok, first} = open_fence(ctx.db, "agent:owner")
+    assert {:already_open, again} = open_fence(ctx.db, "agent:owner", 9_999)
+
+    assert again.generation == first.generation
+    assert again.retirementEpoch == 5_000
+  end
+
+  test "a session that finalized and retires again opens at the next generation", ctx do
+    assert {:ok, _} = open_fence(ctx.db, "agent:owner")
+
+    assert {:ok, final} =
+             tx!(ctx.db, fn txn ->
+               ManagedProcesses.finalize_fence_in_txn(txn, "agent:owner",
+                 generation: 1,
+                 now: 6_000
+               )
+             end)
+
+    assert final.state == "retired"
+    assert final.finalizedAt == 6_000
+
+    assert {:ok, second} = open_fence(ctx.db, "agent:owner", 7_000)
+    assert second.generation == 2
+    assert second.state == "retiring"
+    assert second.finalizedAt == nil
+  end
+
+  test "finalizing is refused while any row still blocks, and names the blockers", ctx do
+    row = preparing(ctx.db, %{owner_session_key: "agent:blocked"})
+    assert {:ok, _} = open_fence(ctx.db, "agent:blocked")
+
+    assert {:blocked, blockers} =
+             tx!(ctx.db, fn txn ->
+               ManagedProcesses.finalize_fence_in_txn(txn, "agent:blocked",
+                 generation: 1,
+                 now: 6_000
+               )
+             end)
+
+    assert Enum.map(blockers, & &1.processId) == [row.processId]
+    assert ManagedProcesses.fence(ctx.db, "agent:blocked").state == "retiring"
+  end
+
+  test "finalizing twice at the same generation is idempotent success", ctx do
+    assert {:ok, _} = open_fence(ctx.db, "agent:owner")
+
+    finalize = fn ->
+      tx!(ctx.db, fn txn ->
+        ManagedProcesses.finalize_fence_in_txn(txn, "agent:owner", generation: 1, now: 6_000)
+      end)
+    end
+
+    assert {:ok, _} = finalize.()
+    assert {:already_final, fence} = finalize.()
+    assert fence.state == "retired"
+    assert fence.finalizedAt == 6_000
+  end
+
+  test "the fence table refuses a retired row with no finalization timestamp", ctx do
+    assert {:error, _} =
+             DB.transaction(ctx.db, fn txn ->
+               Tightbeam.DB.Txn.q(
+                 txn,
+                 """
+                 INSERT INTO session_retirement_fence
+                   (sessionKey, generation, state, retirementEpoch, principal, openedAt, revision)
+                 VALUES ('agent:liar', 1, 'retired', 1, 'user:flynn', 1, 1)
+                 """
+               )
+             end)
+  end
+
+  # SPEC B5: the census is asymmetric on purpose. preparing and running are
+  # DRIVEN to a new state; identity_unknown is not, because retirement orders a
+  # stop, it does not prove the process is gone.
+  test "the census drives preparing and running but leaves identity_unknown unresolved", ctx do
+    prep = preparing(ctx.db, %{owner_session_key: "agent:census"})
+    run = preparing(ctx.db, %{owner_session_key: "agent:census"})
+    unknown = preparing(ctx.db, %{owner_session_key: "agent:census"})
+
+    tx!(ctx.db, fn txn ->
+      ManagedProcesses.transition(
+        txn,
+        run.processId,
+        [state: "preparing", revision: 1],
+        identity_bind()
+      )
+
+      ManagedProcesses.transition(
+        txn,
+        unknown.processId,
+        [state: "preparing", revision: 1],
+        %{state: "identity_unknown", uncertainty_cause: "launch_handoff_unknown", now: 2_000}
+      )
+    end)
+
+    tx!(ctx.db, fn txn ->
+      ManagedProcesses.retirement_census_in_txn(txn, "agent:census", now: 5_000)
+    end)
+
+    assert %{state: "launch_cancel_requested", stopCause: "session_retired"} =
+             ManagedProcesses.get(ctx.db, prep.processId)
+
+    assert %{state: "stop_requested", stopCause: "session_retired"} =
+             ManagedProcesses.get(ctx.db, run.processId)
+
+    still_unknown = ManagedProcesses.get(ctx.db, unknown.processId)
+    assert still_unknown.state == "identity_unknown"
+    assert still_unknown.stopCause == "session_retired"
+    assert still_unknown.uncertaintyCause == "launch_handoff_unknown"
+  end
+
+  # Whoever asked first owns the reason. Overwriting it would erase why the
+  # process is stopping in favour of the most recent bystander.
+  test "the census never overwrites a stop cause that was already there", ctx do
+    row = preparing(ctx.db, %{owner_session_key: "agent:first"})
+
+    tx!(ctx.db, fn txn ->
+      ManagedProcesses.transition(
+        txn,
+        row.processId,
+        [state: "preparing", revision: 1],
+        %{state: "launch_cancel_requested", stop_cause: "owner_stop", now: 2_000}
+      )
+    end)
+
+    tx!(ctx.db, fn txn ->
+      ManagedProcesses.retirement_census_in_txn(txn, "agent:first", now: 5_000)
+    end)
+
+    assert ManagedProcesses.get(ctx.db, row.processId).stopCause == "owner_stop"
+  end
+
+  test "the census skips terminal rows and other sessions", ctx do
+    mine = preparing(ctx.db, %{owner_session_key: "agent:mine"})
+    theirs = preparing(ctx.db, %{owner_session_key: "agent:theirs"})
+
+    tx!(ctx.db, fn txn ->
+      ManagedProcesses.transition(
+        txn,
+        mine.processId,
+        [state: "preparing", revision: 1],
+        %{state: "launch_failed", last_error: "spawn refused", resolved_at: 2_000, now: 2_000}
+      )
+    end)
+
+    tx!(ctx.db, fn txn ->
+      ManagedProcesses.retirement_census_in_txn(txn, "agent:mine", now: 5_000)
+    end)
+
+    assert ManagedProcesses.get(ctx.db, mine.processId).stopCause == nil
+    assert ManagedProcesses.get(ctx.db, theirs.processId).state == "preparing"
+    assert ManagedProcesses.get(ctx.db, theirs.processId).stopCause == nil
+  end
 end

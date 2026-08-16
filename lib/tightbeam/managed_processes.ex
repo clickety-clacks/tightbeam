@@ -155,6 +155,41 @@ defmodule Tightbeam.ManagedProcesses do
   );
   """
 
+  # THE RETIREMENT FENCE (§B5, built additively per owner authority att_54f4348d).
+  #
+  # rev6 §B5 asks for `sessions.state` to gain a `retiring` value between
+  # `active` and `retired`. It cannot: `org.ex` declares
+  # `CHECK (state IN ('active','retired'))`, its DDL is
+  # `CREATE TABLE IF NOT EXISTS`, and `schema.ex` forbids in-place repair, so a
+  # conformant third value would force the schema stamp to move and REFUSE every
+  # database already in the field, live installs included. The owner approved
+  # this additive shape instead: a separate row carries "this session is
+  # retiring", and `sessions.state` flips straight to `retired` only when the
+  # finalizer proves nothing is left to resolve.
+  #
+  # The row is the generation holder too. §B5 wants retirement to increment a
+  # session generation so a late identity bind can tell that retirement moved on
+  # underneath it; each retirement opens a fence at the next generation, and a
+  # managed row captures that number at insert.
+  #
+  # Co-located with the process record on purpose: the fence exists ONLY to gate
+  # process custody, and a new module would also have been a new file outside
+  # this assignment's declared paths.
+  @fence_ddl """
+  CREATE TABLE IF NOT EXISTS session_retirement_fence (
+    sessionKey      TEXT PRIMARY KEY,
+    generation      INTEGER NOT NULL CHECK (generation > 0),
+    state           TEXT NOT NULL CHECK (state IN ('retiring','retired')),
+    retirementEpoch INTEGER NOT NULL CHECK (retirementEpoch >= 0),
+    principal       TEXT NOT NULL,
+    openedAt        INTEGER NOT NULL,
+    finalizedAt     INTEGER,
+    revision        INTEGER NOT NULL CHECK (revision > 0),
+    CHECK ((state = 'retiring' AND finalizedAt IS NULL) OR
+           (state = 'retired'  AND finalizedAt IS NOT NULL))
+  );
+  """
+
   @doc """
   Create the table and the indexes the later owners scan on.
 
@@ -165,6 +200,7 @@ defmodule Tightbeam.ManagedProcesses do
   def ensure_schema(db \\ DB) do
     case DB.transaction(db, fn txn ->
            Txn.exec(txn, @ddl)
+           Txn.exec(txn, @fence_ddl)
 
            Txn.exec(
              txn,
@@ -446,6 +482,210 @@ defmodule Tightbeam.ManagedProcesses do
       createdAt: created_at,
       updatedAt: updated_at,
       resolvedAt: resolved_at,
+      revision: revision
+    }
+  end
+
+  @fence_select "SELECT sessionKey, generation, state, retirementEpoch, principal, openedAt, finalizedAt, revision FROM session_retirement_fence"
+
+  @doc "The retirement fence for a session, or nil if it has never retired."
+  @spec fence_in_txn(Txn.t(), String.t()) :: map() | nil
+  def fence_in_txn(txn, session_key) do
+    case Txn.q(txn, @fence_select <> " WHERE sessionKey = ?1", [session_key]) do
+      [row] -> to_fence(row)
+      [] -> nil
+    end
+  end
+
+  @doc "The retirement fence for a session, or nil."
+  @spec fence(DB.server(), String.t()) :: map() | nil
+  def fence(db \\ DB, session_key) do
+    {:ok, rows} = DB.query(db, @fence_select <> " WHERE sessionKey = ?1", [session_key])
+
+    case rows do
+      [row] -> to_fence(row)
+      [] -> nil
+    end
+  end
+
+  @doc """
+  Open the fence: this session is retiring, at a new generation (§B5).
+
+  Idempotent on an already-open fence — an exact retirement retry must reach the
+  same durable answer without opening a second fence or inventing a generation
+  (§B5, "an exact retire-session retry against `retiring` reruns the durable
+  process census and calls the finalizer"). A session that already finalized
+  retires again at the NEXT generation, which is what makes a late identity bind
+  from the previous life detectably stale.
+  """
+  @spec open_fence_in_txn(Txn.t(), String.t(), keyword()) :: {:ok, map()} | {:already_open, map()}
+  def open_fence_in_txn(txn, session_key, opts) do
+    epoch = Keyword.fetch!(opts, :retirement_epoch)
+    principal = Keyword.fetch!(opts, :principal)
+
+    case fence_in_txn(txn, session_key) do
+      %{state: "retiring"} = open ->
+        {:already_open, open}
+
+      previous ->
+        generation = if previous, do: previous.generation + 1, else: 1
+
+        Txn.q(
+          txn,
+          """
+          INSERT INTO session_retirement_fence
+            (sessionKey, generation, state, retirementEpoch, principal, openedAt, revision)
+          VALUES (?1, ?2, 'retiring', ?3, ?4, ?3, 1)
+          ON CONFLICT(sessionKey) DO UPDATE SET
+            generation = ?2, state = 'retiring', retirementEpoch = ?3, principal = ?4,
+            openedAt = ?3, finalizedAt = NULL, revision = revision + 1
+          """,
+          [session_key, generation, epoch, principal]
+        )
+
+        {:ok, fence_in_txn(txn, session_key)}
+    end
+  end
+
+  @doc """
+  Close the fence, but only when nothing is left to resolve (§B5).
+
+  Answers `{:blocked, rows}` when any nonterminal or unresolved row remains, so
+  the caller can report `process_retirement_blocked` naming the process IDs, the
+  launch deadlines, and `process-reconcile`. Answers `{:ok, fence}` when the
+  fence moved to `retired`, and `{:already_final, fence}` when it was already
+  there — an exact retry is idempotent success, not a second retirement.
+
+  This does NOT touch `sessions.state`. Flipping that row is the caller's act,
+  in this same transaction, and it lives in a file this assignment does not yet
+  hold; keeping the decision here and the write there means the two cannot
+  disagree about whether finalization was earned.
+  """
+  @spec finalize_fence_in_txn(Txn.t(), String.t(), keyword()) ::
+          {:ok, map()} | {:already_final, map()} | {:blocked, [map()]} | {:error, :no_fence}
+  def finalize_fence_in_txn(txn, session_key, opts) do
+    generation = Keyword.fetch!(opts, :generation)
+    now = Keyword.fetch!(opts, :now)
+
+    case fence_in_txn(txn, session_key) do
+      nil ->
+        {:error, :no_fence}
+
+      %{state: "retired", generation: ^generation} = fence ->
+        {:already_final, fence}
+
+      %{generation: other} = fence when other != generation ->
+        # A fence at a different generation is a different retirement. Report
+        # what is durable rather than finalizing someone else's.
+        {:already_final, fence}
+
+      %{state: "retiring", revision: revision} ->
+        case retirement_blockers_in_txn(txn, session_key) do
+          [] ->
+            Txn.q(
+              txn,
+              """
+              UPDATE session_retirement_fence
+              SET state = 'retired', finalizedAt = ?2, revision = revision + 1
+              WHERE sessionKey = ?1 AND state = 'retiring' AND revision = ?3
+              """,
+              [session_key, now, revision]
+            )
+
+            if Txn.changes(txn) == 1 do
+              {:ok, fence_in_txn(txn, session_key)}
+            else
+              {:blocked, retirement_blockers_in_txn(txn, session_key)}
+            end
+
+          blockers ->
+            {:blocked, blockers}
+        end
+    end
+  end
+
+  @doc """
+  The census fence (§B5): settle every one of this session's process rows in the
+  SAME transaction that opens the retirement fence.
+
+  A concurrent start or reconcile either commits before this and appears in the
+  census, or loses its revision compare-and-set afterwards, reloads the stop
+  cause, and cannot expose `running`. That is what makes the census complete
+  rather than a snapshot with a gap behind it.
+
+  The four rules, straight from §B5, and the asymmetry is the point:
+
+  - `preparing` -> `launch_cancel_requested`, cause `session_retired`;
+  - `running` -> `stop_requested`, cause `session_retired`;
+  - `identity_unknown` STAYS unresolved and only gains the cause when it has
+    none — retirement orders the stop, it does not prove the process is gone;
+  - `launch_cancel_requested`, `stop_requested`, `stop_failed` keep whatever
+    cause they already had; only a legacy null gets filled.
+
+  A first cause is never overwritten: whoever asked first owns the reason, and
+  rewriting it would erase why the process is being stopped in favour of the
+  most recent bystander.
+  """
+  @spec retirement_census_in_txn(Txn.t(), String.t(), keyword()) :: [map()]
+  def retirement_census_in_txn(txn, session_key, opts) do
+    now = Keyword.fetch!(opts, :now)
+
+    txn
+    |> retirement_blockers_in_txn(session_key)
+    |> Enum.map(fn row -> census_one(txn, row, now) end)
+  end
+
+  defp census_one(txn, %{state: "preparing"} = row, now) do
+    settle(txn, row, %{
+      state: "launch_cancel_requested",
+      cancel_requested_at: now,
+      stop_cause: row.stopCause || "session_retired",
+      now: now
+    })
+  end
+
+  defp census_one(txn, %{state: "running"} = row, now) do
+    settle(txn, row, %{
+      state: "stop_requested",
+      stop_cause: row.stopCause || "session_retired",
+      now: now
+    })
+  end
+
+  # Unresolved and already-requested rows keep their state. They gain a cause
+  # only if they have none, so retirement can be the reason of record for a row
+  # nobody had yet asked to stop.
+  defp census_one(txn, %{stopCause: nil} = row, now) do
+    settle(txn, row, %{state: row.state, stop_cause: "session_retired", now: now})
+  end
+
+  defp census_one(_txn, row, _now), do: row
+
+  defp settle(txn, row, changes) do
+    case transition(txn, row.processId, [state: row.state, revision: row.revision], changes) do
+      {:ok, updated} -> updated
+      {:lost, current} -> current
+    end
+  end
+
+  defp to_fence([
+         session_key,
+         generation,
+         state,
+         epoch,
+         principal,
+         opened_at,
+         finalized_at,
+         revision
+       ]) do
+    %{
+      sessionKey: session_key,
+      generation: generation,
+      state: state,
+      retirementEpoch: epoch,
+      principal: principal,
+      openedAt: opened_at,
+      finalizedAt: finalized_at,
       revision: revision
     }
   end
