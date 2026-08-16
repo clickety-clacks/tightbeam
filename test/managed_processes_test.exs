@@ -764,4 +764,142 @@ defmodule Tightbeam.ManagedProcessesTest do
   test "reconciling an unknown process id is refused, not invented", ctx do
     assert {:error, :unknown_process} = reconcile(ctx.db, "mp_nope", :absent, 1_000)
   end
+
+  ## process-stop and the stop worker's outcome (§B4, §B5)
+
+  defp request_stop(db, process_id, now, opts \\ []) do
+    tx!(db, fn txn ->
+      ManagedProcesses.request_stop_in_txn(txn, process_id, [now: now] ++ opts)
+    end)
+  end
+
+  defp record_outcome(db, process_id, outcome, now, opts \\ []) do
+    tx!(db, fn txn ->
+      ManagedProcesses.record_stop_outcome_in_txn(txn, process_id, outcome, [now: now] ++ opts)
+    end)
+  end
+
+  defp running_row(db) do
+    row = preparing(db)
+    assert {:running, bound} = bind(db, row.processId)
+    bound
+  end
+
+  test "stopping a preparing row cancels the launch rather than pretending to signal", ctx do
+    row = preparing(ctx.db)
+
+    assert {:ok, stopped} = request_stop(ctx.db, row.processId, 4_000)
+    assert stopped.state == "launch_cancel_requested"
+    assert stopped.stopCause == "owner_stop"
+    assert stopped.cancelRequestedAt == 4_000
+  end
+
+  test "stopping a running row requests a stop against its proven identity", ctx do
+    bound = running_row(ctx.db)
+
+    assert {:ok, stopping} = request_stop(ctx.db, bound.processId, 4_000)
+    assert stopping.state == "stop_requested"
+    assert stopping.stopCause == "owner_stop"
+    assert stopping.osPid == 4242
+  end
+
+  # §B4: without a proven identity there is nothing safe to signal, so the
+  # request becomes a durable cause on a row that STAYS unresolved.
+  test "stopping an identity_unknown row records the cause and stays blocked", ctx do
+    row = preparing(ctx.db)
+
+    tx!(ctx.db, fn txn ->
+      ManagedProcesses.transition(
+        txn,
+        row.processId,
+        [state: "preparing", revision: 1],
+        %{state: "identity_unknown", uncertainty_cause: "launch_handoff_unknown", now: 2_000}
+      )
+    end)
+
+    assert {:blocked, blocked} = request_stop(ctx.db, row.processId, 4_000)
+    assert blocked.state == "identity_unknown"
+    assert blocked.stopCause == "owner_stop"
+    assert blocked.uncertaintyCause == "launch_handoff_unknown"
+    assert ManagedProcesses.blocks_retirement?(blocked)
+  end
+
+  # §B4: a second stop must not create a second logical request.
+  test "stopping twice returns the existing request and issues no second one", ctx do
+    bound = running_row(ctx.db)
+
+    assert {:ok, first} = request_stop(ctx.db, bound.processId, 4_000)
+    assert {:ok, again} = request_stop(ctx.db, bound.processId, 5_000)
+
+    assert again.state == "stop_requested"
+    assert again.revision == first.revision, "a second stop must not mutate the row again"
+    assert again.stopAttemptCount == 0
+  end
+
+  # §B4: a retry from stop_failed increments a durable attempt count — how "we
+  # tried again" is recorded WITHOUT duplicating the obligation.
+  test "a retry from stop_failed increments the attempt count", ctx do
+    bound = running_row(ctx.db)
+    assert {:ok, _} = request_stop(ctx.db, bound.processId, 4_000)
+
+    assert {:ok, failed} = record_outcome(ctx.db, bound.processId, :stop_failed, 5_000)
+    assert failed.state == "stop_failed"
+    assert failed.lastError == "signal_failed"
+    assert failed.stopCause == "owner_stop"
+
+    assert {:ok, retried} = request_stop(ctx.db, bound.processId, 6_000)
+    assert retried.state == "stop_requested"
+    assert retried.stopAttemptCount == 1
+    assert retried.stopCause == "owner_stop", "the original cause survives the retry"
+  end
+
+  test "the worker's kill and exit outcomes are terminal and stop blocking retirement", ctx do
+    for {outcome, expected} <- [killed: "killed", exited: "exited"] do
+      bound = running_row(ctx.db)
+      assert {:ok, _} = request_stop(ctx.db, bound.processId, 4_000)
+
+      assert {:ok, done} = record_outcome(ctx.db, bound.processId, outcome, 5_000)
+      assert done.state == expected
+      assert done.resolvedAt == 5_000
+      assert done.stopCause == "owner_stop"
+      refute ManagedProcesses.blocks_retirement?(done)
+    end
+  end
+
+  # §B5: identity_unknown from the worker preserves the request's stopCause and
+  # records the identity problem SEPARATELY. Both facts are true at once.
+  test "an unproven signal keeps the stop cause and records uncertainty apart", ctx do
+    bound = running_row(ctx.db)
+    assert {:ok, _} = request_stop(ctx.db, bound.processId, 4_000)
+
+    assert {:ok, unknown} = record_outcome(ctx.db, bound.processId, :identity_unknown, 5_000)
+    assert unknown.state == "identity_unknown"
+    assert unknown.stopCause == "owner_stop"
+    assert unknown.uncertaintyCause == "stop_signal_unproven"
+    assert ManagedProcesses.blocks_retirement?(unknown)
+  end
+
+  # §B5's natural-exit-versus-stop row: the monitor may terminalize first, and a
+  # later worker result must not reopen or overwrite that.
+  test "a worker result against an already-terminal row loses", ctx do
+    bound = running_row(ctx.db)
+    assert {:ok, _} = request_stop(ctx.db, bound.processId, 4_000)
+
+    assert {:ok, exited} = record_outcome(ctx.db, bound.processId, :exited, 5_000)
+    assert exited.state == "exited"
+
+    assert {:lost, current} = record_outcome(ctx.db, bound.processId, :killed, 6_000)
+    assert current.state == "exited"
+    assert current.resolvedAt == 5_000
+  end
+
+  test "stopping a terminal row reports it rather than reopening the obligation", ctx do
+    bound = running_row(ctx.db)
+    assert {:ok, _} = request_stop(ctx.db, bound.processId, 4_000)
+    assert {:ok, _} = record_outcome(ctx.db, bound.processId, :killed, 5_000)
+
+    assert {:ok, terminal} = request_stop(ctx.db, bound.processId, 7_000)
+    assert terminal.state == "killed"
+    assert terminal.resolvedAt == 5_000
+  end
 end

@@ -917,6 +917,139 @@ defmodule Tightbeam.ManagedProcesses do
     end
   end
 
+  @doc """
+  `process-stop` (§B4), and the same split lease expiry and retirement use.
+
+  The rule underneath all three is one thing: a stop request is only lawful
+  against a PROVEN identity. Without one there is nothing safe to signal, so the
+  request becomes a durable cause on an unresolved row instead of a pretend
+  stop.
+
+    * `preparing` -> `launch_cancel_requested`, cause installed;
+    * `running` or `stop_failed` -> `stop_requested`, which the table will only
+      accept with the full identity tuple present;
+    * `identity_unknown` -> STAYS unresolved, gaining the cause only if it had
+      none, and answers `{:blocked, row}` so the caller returns
+      `process_retirement_blocked` naming `process-reconcile`.
+
+  A retry from `stop_failed` increments `stopAttemptCount` and never creates a
+  second logical stop request (§B4): the attempt count is how "we tried again"
+  is recorded without duplicating the obligation.
+  """
+  @spec request_stop_in_txn(Txn.t(), String.t(), keyword()) ::
+          {:ok, map()} | {:blocked, map()} | {:lost, map() | nil} | {:error, :unknown_process}
+  def request_stop_in_txn(txn, process_id, opts) do
+    now = Keyword.fetch!(opts, :now)
+    cause = Keyword.get(opts, :cause, "owner_stop")
+
+    case get_in_txn(txn, process_id) do
+      nil ->
+        {:error, :unknown_process}
+
+      %{state: state} = row when state in @terminal ->
+        # Already settled. Report it; do not reopen a closed obligation.
+        {:ok, row}
+
+      %{state: "preparing"} = row ->
+        apply_stop(txn, row, %{
+          state: "launch_cancel_requested",
+          cancel_requested_at: now,
+          stop_cause: row.stopCause || cause,
+          now: now
+        })
+
+      %{state: "identity_unknown"} = row ->
+        # No proven identity means nothing safe to signal. Record WHY it must
+        # stop and leave the row unresolved — the honest answer, and the one
+        # that keeps retirement blocked until evidence arrives.
+        case apply_stop(txn, row, %{
+               state: "identity_unknown",
+               stop_cause: row.stopCause || cause,
+               now: now
+             }) do
+          {:ok, updated} -> {:blocked, updated}
+          other -> other
+        end
+
+      %{state: "stop_failed"} = row ->
+        apply_stop(txn, row, %{
+          state: "stop_requested",
+          stop_cause: row.stopCause || cause,
+          stop_attempt_count: row.stopAttemptCount + 1,
+          now: now
+        })
+
+      %{state: "running"} = row ->
+        apply_stop(txn, row, %{
+          state: "stop_requested",
+          stop_cause: row.stopCause || cause,
+          now: now
+        })
+
+      %{state: state} = row when state in ["launch_cancel_requested", "stop_requested"] ->
+        # One logical request already exists. Returning it, rather than issuing
+        # a second, is what stops two signals chasing one process (§B4).
+        {:ok, row}
+    end
+  end
+
+  defp apply_stop(txn, row, changes) do
+    case transition(txn, row.processId, [state: row.state, revision: row.revision], changes) do
+      {:ok, updated} -> {:ok, updated}
+      {:lost, current} -> {:lost, current}
+    end
+  end
+
+  @doc """
+  Record what the stop worker actually observed (§B5).
+
+  The worker signals OUTSIDE the transaction and comes back here with a result.
+  The two unresolved outcomes preserve the request's `stopCause` and record the
+  identity problem SEPARATELY in `uncertaintyCause`, because "we were told to
+  stop it" and "we could not prove which process it is" are different facts and
+  a row is routinely both.
+
+  `:killed` and `:exited` are terminal. `:stop_failed` and `:identity_unknown`
+  are not: they keep blocking retirement until new evidence arrives, which is
+  the fail-closed behaviour §B3 requires rather than a bug to smooth over.
+  """
+  @spec record_stop_outcome_in_txn(Txn.t(), String.t(), atom(), keyword()) ::
+          {:ok, map()} | {:lost, map() | nil} | {:error, :unknown_process}
+  def record_stop_outcome_in_txn(txn, process_id, outcome, opts) do
+    now = Keyword.fetch!(opts, :now)
+
+    case get_in_txn(txn, process_id) do
+      nil ->
+        {:error, :unknown_process}
+
+      %{state: "stop_requested"} = row ->
+        changes =
+          case outcome do
+            :killed ->
+              %{state: "killed", resolved_at: now}
+
+            :exited ->
+              %{state: "exited", resolved_at: now}
+
+            :stop_failed ->
+              %{state: "stop_failed", last_error: Keyword.get(opts, :error, "signal_failed")}
+
+            :identity_unknown ->
+              %{
+                state: "identity_unknown",
+                uncertainty_cause: Keyword.get(opts, :uncertainty_cause, "stop_signal_unproven")
+              }
+          end
+
+        apply_stop(txn, row, Map.put(changes, :now, now))
+
+      row ->
+        # The monitor may have seen a natural exit first. A later worker result
+        # must not reopen or overwrite that (§B5's natural-exit-versus-stop row).
+        {:lost, row}
+    end
+  end
+
   @doc "Whether this row still owes work or evidence before its session may retire."
   @spec blocks_retirement?(map()) :: boolean()
   def blocks_retirement?(%{state: state}), do: state in (@nonterminal ++ @unresolved)
