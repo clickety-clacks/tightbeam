@@ -22,7 +22,17 @@ merge list. It is *moving code* until Mike calls quits.
 checkout, no counter service (semver form: `0.1.9+N`). "Which 0.1.9 are you
 running?" is answered by the build number, never by the branch name.
 
-**Calling quits.** The last build *is* the release:
+**A release branch evolves until it passes (ruled 2026-08-16).** Release
+testing runs against the branch's builds, and every defect it finds lands its
+fix ON THE SAME BRANCH as a new build — then testing re-runs against the
+evolving branch. The loop continues until the branch tests clean. Passing is
+what earns quits; quits is never declared over a failing branch. While a
+version is still testing, its successor stays empty — and if something lands
+on the successor prematurely, merge it back into the testing branch and keep
+evolving. ("We evolve a release branch until it passes.")
+
+**Calling quits.** Quits happens when the branch tests clean; the last
+(passing) build *is* the release:
 
 1. Tag `v0.1.9` at the branch tip — the immutable, byte-exact name that
    installs and support use. The CI proof (gates on both platforms, packages
@@ -31,9 +41,12 @@ running?" is answered by the build number, never by the branch name.
    immediately.
 3. `0.1.9` never moves again. Freeze is by abandonment, identity is the tag.
 
-**Never push to a version branch after its tag exists.** If a released version
-needs a fix, that fix lands on the current scratchpad; shipping it is a new
-version. (History: a frozen candidate branch was pushed to on 2026-08-15 and
+**Never push to a version branch after quits.** The tag is minted at quits —
+after the branch passes — so a tag and further pushes cannot coexist. (A tag
+minted before its branch passed, as `v0.1.8` was, does not freeze the branch:
+the branch keeps evolving until it tests clean, and the passing build carries
+the authoritative identity.) If a *released* version needs a fix, that fix
+lands on the current scratchpad; shipping it is a new version. (History: a frozen candidate branch was pushed to on 2026-08-15 and
 had to be discarded — receipts you can write to are traps, which is why the
 old `release-candidate/*` mechanism was retired along with the `0.1.x` series
 branch.)
