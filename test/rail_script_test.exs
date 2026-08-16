@@ -5,14 +5,51 @@ defmodule Tightbeam.RailScriptTest do
   @release_binary Path.expand("../cli/target/release/tightbeam", __DIR__)
   @cli_dir Path.expand("../cli", __DIR__)
 
-  # The real-binary integration test invokes @release_binary. `File.exists?` is not
-  # enough — a STALE binary (built before rail-exec existed) passes existence yet fails
-  # the subcommand. Refresh it to current before the suite so the test always exercises
-  # code matching this checkout. Cached cargo makes this ~seconds after the first build;
-  # a cargo-less environment leaves whatever exists and the compile-time guard skips.
+  # The real-binary integration test invokes @release_binary, and `File.exists?`
+  # is not enough: a STALE binary (built before rail-exec existed) passes
+  # existence yet fails the subcommand. That is a real hazard and this guard
+  # still covers it.
+  #
+  # It USED to cover it by running `cargo build --release` here. That rebuilt a
+  # SHARED artifact in the middle of the suite — cli/target/release/tightbeam is
+  # read by absolute path from test_helper, containment, conformance and
+  # cli_integration too — so a test could read the file inside cargo's
+  # replacement window and exercise a binary that was not this checkout's.
+  # Measured, not theorised (att_9e4e06df): a failing run read md5 53504aa9 from
+  # that path while the on-disk artifact immediately before and after was
+  # b3e23ad8. Intermittent, and invisible to a before/after comparison because
+  # the file is restored.
+  #
+  # So the protection is now a REFUSAL rather than a mutation: assert the binary
+  # is at least as new as the sources that produce it, and if it is not, say so
+  # and name the exact command. A test suite may depend on a shared artifact; it
+  # must not rewrite one while its neighbours are reading it.
   setup_all do
     if File.exists?(@release_binary) do
-      _ = System.cmd("cargo", ["build", "--release"], cd: @cli_dir, stderr_to_stdout: true)
+      built_at = File.stat!(@release_binary).mtime
+
+      newest_source =
+        [Path.join(@cli_dir, "Cargo.toml") | Path.wildcard(Path.join(@cli_dir, "src/**/*.rs"))]
+        |> Enum.filter(&File.exists?/1)
+        |> Enum.map(&File.stat!(&1).mtime)
+        |> Enum.max(fn -> built_at end)
+
+      if newest_source > built_at do
+        flunk("""
+        the release CLI is older than cli/ sources, so real-binary tests would
+        exercise code that is not this checkout:
+
+            #{@release_binary}
+
+        Build it before the gate, which is what AGENTS.md already requires:
+
+            cargo build --release --manifest-path cli/Cargo.toml
+
+        This check deliberately does NOT rebuild: the binary is shared with
+        other test files that read it by absolute path, and rebuilding it here
+        replaces it underneath them mid-run (att_9e4e06df).
+        """)
+      end
     end
 
     :ok
