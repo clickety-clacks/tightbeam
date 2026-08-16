@@ -40,6 +40,9 @@ pub struct GithubStatus {
 }
 
 pub fn onboard(hostname: &str, remote: Option<&str>) -> Result<(), String> {
+    // Validate before banking_into touches the filesystem, so a bad
+    // --hostname leaves nothing behind.
+    normalize_hostname(hostname)?;
     let base_dir = crate::base_dir::resolve();
     let gh = RealGh::banking_into(&base_dir)?;
     onboard_with(hostname, remote, &base_dir, gh)
@@ -93,18 +96,16 @@ impl RealGh {
     }
 
     /// Onboarding-side construction: the banked dir is the destination, so it
-    /// is created (0700) before gh runs.
+    /// is created (0700) before gh runs. The restricted paths are named
+    /// explicitly — never walked upward — so nothing above base_dir can ever
+    /// be chmodded regardless of how the path shape evolves.
     fn banking_into(base_dir: &Path) -> Result<Self, String> {
         let dir = gh_config_dir(base_dir);
         fs::create_dir_all(&dir)
             .map_err(|error| format!("could not create {}: {error}", dir.display()))?;
-        let mut restrict = dir.clone();
-        loop {
+        for restrict in [base_dir.join("auth"), base_dir.join("auth").join("github"), dir.clone()] {
             fs::set_permissions(&restrict, fs::Permissions::from_mode(0o700))
                 .map_err(|error| format!("could not set 0700 on {}: {error}", restrict.display()))?;
-            if restrict.ends_with("auth") || !restrict.pop() {
-                break;
-            }
         }
         Ok(RealGh {
             config_dir: Some(dir),
@@ -468,13 +469,28 @@ fn github_refusal(hostname: &str, remote: Option<&str>, status: &GithubStatus) -
     )
 }
 
+// Only the command field of a Bash tool call IS an operation. Scanning every
+// JSON string treated prompts, briefs, and descriptions as if they could run —
+// and any such field beginning "Git clone the repo first..." sat at "command
+// position" by construction. When the payload has no command field (a non-Bash
+// hook shape, or non-JSON stdin), fall back to scanning everything: over-broad
+// gating of an unknown shape beats silently ignoring it.
 fn tool_call_strings(raw: &str) -> Vec<String> {
-    let mut strings = Vec::new();
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) {
-        collect_json_strings(&value, &mut strings);
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(value) => {
+            if let Some(command) = value
+                .pointer("/tool_input/command")
+                .and_then(serde_json::Value::as_str)
+            {
+                return vec![command.to_owned()];
+            }
+            let mut strings = Vec::new();
+            collect_json_strings(&value, &mut strings);
+            strings.push(raw.to_owned());
+            strings
+        }
+        Err(_) => vec![raw.to_owned()],
     }
-    strings.push(raw.to_owned());
-    strings
 }
 
 fn collect_json_strings(value: &serde_json::Value, strings: &mut Vec<String>) {
@@ -523,7 +539,12 @@ fn has_git_operation(text: &str) -> bool {
 }
 
 fn has_operation(text: &str, program: &str, areas: &[&str]) -> bool {
-    let down = text.to_ascii_lowercase();
+    // Quoted spans are blanked before matching: a shell only executes what
+    // sits outside quotes, so `--brief 'Fix it.\ngh pr view 123'` carries no
+    // gh operation no matter how its prose is line-broken. The original text
+    // still feeds remote extraction, where quoted URLs are legitimate
+    // operands (`git clone 'https://…'`).
+    let down = blank_quoted(text).to_ascii_lowercase();
     down.match_indices(program).any(|(idx, _)| {
         at_command_position(&down, idx)
             && areas.iter().any(|area| {
@@ -534,12 +555,59 @@ fn has_operation(text: &str, program: &str, areas: &[&str]) -> bool {
     })
 }
 
-fn at_command_position(text: &str, idx: usize) -> bool {
-    let head = text[..idx].trim_end_matches([' ', '\t']);
-    match head.chars().last() {
-        None => true,
-        Some(ch) => matches!(ch, ';' | '&' | '|' | '(' | '{' | '\n' | '`'),
+fn blank_quoted(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for ch in text.chars() {
+        match quote {
+            Some(open) => {
+                out.push(' ');
+                if escaped {
+                    escaped = false;
+                } else if open == '"' && ch == '\\' {
+                    escaped = true;
+                } else if ch == open {
+                    quote = None;
+                }
+            }
+            None => {
+                if ch == '\'' || ch == '"' {
+                    quote = Some(ch);
+                    out.push(' ');
+                } else {
+                    out.push(ch);
+                }
+            }
+        }
     }
+    // An unterminated quote blanks to the end — under-matching, the
+    // acceptable direction.
+    out
+}
+
+// Command position: everything between the last shell connector and the
+// candidate program must be an env assignment (`GIT_TERMINAL_PROMPT=0 git
+// clone …` is the single most common agent invocation shape) or a plain
+// command wrapper. An empty span — string start or right after a connector —
+// qualifies trivially.
+fn at_command_position(text: &str, idx: usize) -> bool {
+    let span_start = text[..idx]
+        .rfind([';', '&', '|', '(', '{', '\n', '`'])
+        .map_or(0, |connector| connector + 1);
+    text[span_start..idx].split_whitespace().all(|token| {
+        is_env_assignment(token) || matches!(token, "env" | "command" | "exec" | "time" | "nohup" | "xargs")
+    })
+}
+
+fn is_env_assignment(token: &str) -> bool {
+    token.split_once('=').is_some_and(|(name, _value)| {
+        !name.is_empty()
+            && !name.starts_with(|ch: char| ch.is_ascii_digit())
+            && name
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    })
 }
 
 fn github_remotes(text: &str) -> Vec<String> {
@@ -550,17 +618,27 @@ fn github_remotes(text: &str) -> Vec<String> {
         "ssh://git@github.com/",
         "git@github.com:",
     ] {
-        remotes.extend(prefixed_values(text, prefix));
+        for value in prefixed_values(text, prefix) {
+            let value = value
+                .trim_matches(|ch: char| matches!(ch, '.' | ',' | ')' | ']' | '}'))
+                .to_owned();
+            if repo_shaped(value.strip_prefix(prefix).unwrap_or(&value)) {
+                remotes.push(value);
+            }
+        }
     }
     remotes
-        .into_iter()
-        .map(|value| {
-            value
-                .trim_matches(|ch: char| matches!(ch, '.' | ',' | ')' | ']' | '}'))
-                .to_owned()
-        })
-        .filter(|value| value.contains('/'))
-        .collect()
+}
+
+// Only owner/repo-shaped paths are candidate git remotes. A command whose
+// comment links https://github.com/org/repo/pull/123 must not have that page
+// URL ls-remote'd — the probe would fail and refuse a valid command on a
+// fully live host.
+fn repo_shaped(path: &str) -> bool {
+    if path.ends_with(".git") {
+        return true;
+    }
+    path.split('/').filter(|segment| !segment.is_empty()).count() == 2
 }
 
 fn prefixed_values(text: &str, prefix: &str) -> Vec<String> {
@@ -1009,6 +1087,14 @@ mod tests {
             "echo see https://github.com/org/repo.git for details",
             "tightbeam wake --role coder --prompt 'fork https://github.com/org/repo, \
              then gh pr create'",
+            // Multi-line brief: the newline must not promote quoted prose to
+            // command position.
+            "tightbeam assign --brief 'Fix the flaky test.\ngh pr view 123 has context'",
+            // Sentence-initial imperatives inside quoted prose.
+            "tightbeam assign --brief 'Git clone the repo first, then review'",
+            "tightbeam dispatch --subject fix --brief 'GH issue 5; gh pr list shows the rest'",
+            // A comment linking a non-repo GitHub page URL is not a remote.
+            "gh_wrapper --note 'context: https://github.com/org/repo/pull/123'",
         ] {
             let raw = serde_json::json!({
                 "tool_name": "Bash",
@@ -1019,6 +1105,43 @@ mod tests {
                 check_tool_call_with(&raw, &FakeGh::new(false)),
                 Ok(()),
                 "mention-only command must not be probed: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_call_guard_judges_only_the_command_field() {
+        // Prompts, briefs, and descriptions ride alongside the command in the
+        // tool-call JSON; only tool_input.command can run.
+        let raw = serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": {
+                "command": "ls -la",
+                "description": "List files before we git clone https://github.com/org/repo.git"
+            }
+        })
+        .to_string();
+        assert_eq!(check_tool_call_with(&raw, &FakeGh::new(false)), Ok(()));
+    }
+
+    #[test]
+    fn tool_call_guard_gates_env_prefixed_operations() {
+        // `NAME=value git …` is the most common agent invocation shape; it
+        // must not slip past the gate.
+        for command in [
+            "GIT_TERMINAL_PROMPT=0 git clone https://github.com/org/repo.git",
+            "GH_PAGER=cat gh pr view 1 --repo org/repo",
+            "env GIT_SSH_COMMAND='ssh -i key' git fetch https://github.com/org/repo.git",
+        ] {
+            let raw = serde_json::json!({
+                "tool_name": "Bash",
+                "tool_input": {"command": command}
+            })
+            .to_string();
+            let error = check_tool_call_with(&raw, &FakeGh::new(false)).unwrap_err();
+            assert!(
+                error.contains("Tightbeam cannot use GitHub"),
+                "env-prefixed operation must be gated: {command}"
             );
         }
     }

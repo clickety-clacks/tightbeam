@@ -210,12 +210,27 @@ call. Non-GitHub calls pass through. GitHub-dependent calls must prove host
 Failure exits as a tool refusal with the repair command and the instruction not
 to paste a PAT into an agent.
 
-The guard judges operations, not mentions: `git`/`gh` must appear in command
-position, and a command whose argument text merely *names* a GitHub URL or a
-gh subcommand (an assignment brief, a wake prompt, an echo) is not probed.
+The guard judges operations, not mentions, on three levels. It reads only the
+`tool_input.command` field of the tool call — prompts, briefs, and
+descriptions ride alongside and cannot run. Within the command, quoted spans
+are blanked before matching, because a shell only executes what sits outside
+quotes — so a multi-line `--brief '…\ngh pr view 123…'` carries no operation
+regardless of how its prose is line-broken. And `git`/`gh` must appear in
+command position (start of string, after a shell connector, or behind
+`NAME=value` env assignments and plain wrappers like `env`/`exec`/`xargs`).
+Only owner/repo-shaped URLs are treated as candidate remotes, so a command
+whose comment links an issue or PR page is not `ls-remote`d into a refusal.
 The matcher under-matches by design — a gh call nested inside `sh -c "..."`
 slips through and fails at runtime with gh's own auth error, which is the
 acceptable direction for a hygiene gate to be wrong in.
+
+Git's side of the rail depends on `gh auth git-credential` being configured
+as a credential helper in a git config the agent's git reads; `gh auth login`
+writes that into the operator's `~/.gitconfig` as a side effect, which agents
+share on a local host. The hook's `git ls-remote` probe runs in the agent
+environment, so a missing helper is caught at tool-call time as
+`git_unready` — but note the repair for that state is fixing the helper
+config, not re-running onboarding.
 
 `tightbeam github-auth-check` resolves the banked config dir itself, so the
 hook's probe never depends on the session's projected environment. The

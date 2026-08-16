@@ -494,7 +494,7 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
   # Unconditional: an absent banked dir must probe as needs_onboarding, never
   # as whatever the operator shell's ambient gh config can reach.
   defp github_probe_env(base_dir) do
-    [{"GH_CONFIG_DIR", Path.join([base_dir, "auth", "github", "gh"])}]
+    [{"GH_CONFIG_DIR", Placement.github_config_dir(base_dir)}]
   end
 
   defp github_git_protocol(hostname, env) do
