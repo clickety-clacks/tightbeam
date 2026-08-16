@@ -77,6 +77,7 @@ defmodule Tightbeam.Gateway do
     Idempotency,
     LaneManager,
     Ledger,
+    ManagedProcesses,
     Model,
     ModelCatalog,
     Org,
@@ -902,6 +903,18 @@ defmodule Tightbeam.Gateway do
           coordinator = Map.get(config, :adapter_coordinator, Tightbeam.AdapterCoordinator)
           %{harness_processes: AdapterCoordinator.harness_processes(coordinator)}
         end),
+      # Durable process custody, owner-reachable (spec art_6817803a rev6 §B4).
+      # Every one of these must ALSO appear in the router's @agent_verbs
+      # allowlist: 3fd9c97 landed because three verbs had a working
+      # implementation, a CLI that sent them, and unit tests — but no allowlist
+      # entry and no handler row, so the seam shipped dead and nothing noticed.
+      # The router-seam test in router_test.exs drives these through
+      # /agent/dispatch against this real table so both halves must exist.
+      "processes" => fn call -> processes_result(db, call) end,
+      "process-get" => fn call -> process_get_result(db, call) end,
+      "process-extend" => fn call -> process_extend_result(db, call) end,
+      "process-stop" => fn call -> process_stop_result(db, call) end,
+      "process-reconcile" => fn call -> process_reconcile_result(db, call) end,
       "role-create" => fn call -> role_create_result(db, call) end,
       "role-bind" => fn call -> role_bind_result(db, call) end,
       "role-rm" => fn call -> role_rm_result(db, call) end,
@@ -6555,4 +6568,148 @@ defmodule Tightbeam.Gateway do
   end
 
   defp deliver(pid, payload), do: send(pid, {:push, payload})
+  ## Durable process custody (spec art_6817803a rev6 §B4)
+  ##
+  ## The owner can read, extend, stop and reconcile its own processes. There is
+  ## deliberately NO generic `process-start -- <command>` on this line: §B4 says
+  ## the maintenance line routes the existing typed onboarding ceremony through
+  ## this record and keeps arbitrary commands off the surface entirely.
+
+  defp processes_result(db, call) do
+    session_key = call.session_key || caller_session(call)
+
+    if is_binary(session_key) do
+      %{
+        processes:
+          Enum.map(
+            ManagedProcesses.list_for_session(db, session_key),
+            &Payloads.managed_process/1
+          )
+      }
+    else
+      %{code: "missing_target", message: "processes needs a session to list"}
+    end
+  end
+
+  defp process_get_result(db, call) do
+    with {:ok, id} <- required_process_id(call) do
+      case ManagedProcesses.get(db, id) do
+        nil -> %{code: "not_found", message: "unknown processId: #{id}"}
+        row -> %{process: Payloads.managed_process(row)}
+      end
+    end
+  end
+
+  defp process_extend_result(db, call) do
+    with {:ok, id} <- required_process_id(call) do
+      now = System.system_time(:millisecond)
+      for_ms = call.params[:for_ms] || 0
+
+      result =
+        DB.transaction(db, fn txn ->
+          ManagedProcesses.extend_lease_in_txn(txn, id, now: now, lease_expires_at: now + for_ms)
+        end)
+
+      case result do
+        {:ok, {:ok, row}} ->
+          %{process: Payloads.managed_process(row)}
+
+        {:ok, {:error, :unknown_process}} ->
+          %{code: "not_found", message: "unknown processId: #{id}"}
+
+        {:ok, {reason, row}} ->
+          # `expired`, `session_retiring` and `not_running` are refusals with a
+          # durable row behind them, so the caller is told WHICH row refused and
+          # what would move it, rather than a bare code.
+          %{
+            code: to_string(reason),
+            message: extend_refusal_message(reason),
+            process: Payloads.managed_process(row)
+          }
+
+        {:error, error} ->
+          %{code: "server_error", message: error_map_text(error)}
+      end
+    end
+  end
+
+  defp extend_refusal_message(:expired),
+    do:
+      "the lease already expired; the stop is the winning outcome and reviving it is not extension"
+
+  defp extend_refusal_message(:session_retiring),
+    do:
+      "the owner session is retiring; extend requires an active session at the captured generation"
+
+  defp extend_refusal_message(:not_running),
+    do: "only a running process holds a lease that can be extended"
+
+  defp extend_refusal_message(:lost),
+    do: "another transition won; the durable row is returned"
+
+  defp process_stop_result(db, call) do
+    with {:ok, id} <- required_process_id(call) do
+      now = System.system_time(:millisecond)
+
+      case DB.transaction(db, &ManagedProcesses.request_stop_in_txn(&1, id, now: now)) do
+        {:ok, {:ok, row}} ->
+          %{process: Payloads.managed_process(row)}
+
+        {:ok, {:blocked, row}} ->
+          Payloads.process_blocked("process_retirement_blocked", [row])
+
+        {:ok, {:error, :unknown_process}} ->
+          %{code: "not_found", message: "unknown processId: #{id}"}
+
+        {:ok, {:lost, row}} ->
+          %{process: Payloads.managed_process(row)}
+
+        {:error, error} ->
+          %{code: "server_error", message: error_map_text(error)}
+      end
+    end
+  end
+
+  defp process_reconcile_result(db, call) do
+    with {:ok, id} <- required_process_id(call) do
+      now = System.system_time(:millisecond)
+
+      # Evidence is supplied, never inferred. This line ships no OS probe, so
+      # the honest evidence for a row is `:not_probed`: reconcile still settles
+      # the lease and reports the durable state and deadline, but it will not
+      # fabricate an absence proof it does not have. Anything stronger would be
+      # a guess wearing a proof's clothes (§B4).
+      result =
+        DB.transaction(db, fn txn ->
+          ManagedProcesses.reconcile_in_txn(txn, id, now: now, evidence: :not_probed)
+        end)
+
+      case result do
+        {:ok, {:ok, row}} ->
+          %{process: Payloads.managed_process(row)}
+
+        {:ok, {:blocked, row}} ->
+          Payloads.process_blocked("process_unresolved", [row])
+
+        {:ok, {:error, :unknown_process}} ->
+          %{code: "not_found", message: "unknown processId: #{id}"}
+
+        {:error, error} ->
+          %{code: "server_error", message: error_map_text(error)}
+      end
+    end
+  end
+
+  defp required_process_id(call) do
+    case call.params[:process_id] do
+      id when is_binary(id) and id != "" ->
+        {:ok, id}
+
+      _ ->
+        %{code: "invalid_message", message: "processId required"}
+    end
+  end
+
+  defp caller_session(%{principal: {:session, key}}), do: key
+  defp caller_session(_call), do: nil
 end

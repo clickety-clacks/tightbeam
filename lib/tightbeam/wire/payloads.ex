@@ -293,6 +293,63 @@ defmodule Tightbeam.Wire.Payloads do
     |> put_if_present("state", state)
   end
 
+  @doc """
+  The wire projection of a managed process (spec art_6817803a rev6 §B2/§B6).
+
+  Every field an owner needs to decide what to do next, and nothing that could
+  carry a secret. That is cheap to guarantee here because the record has no
+  column for a raw command line, environment, credential or one-time code —
+  there is nothing to accidentally include. `commandDescriptor` is the safe
+  operator label and digest; `deliveryEvidenceId` POINTS at the authorized
+  delivery sink rather than repeating what it holds.
+
+  `blocksRetirement` is projected rather than left for the client to derive,
+  because "may this session finish retiring" is the question every unresolved
+  answer is really about, and each client re-deriving it from the state string
+  is how two clients end up disagreeing.
+  """
+  @spec managed_process(map()) :: payload()
+  def managed_process(row) do
+    %{
+      "processId" => row.processId,
+      "ownerSessionKey" => row.ownerSessionKey,
+      "host" => row.host,
+      "purpose" => row.purpose,
+      "commandDescriptor" => row.commandDescriptor,
+      "state" => row.state,
+      "blocksRetirement" => Tightbeam.ManagedProcesses.blocks_retirement?(row),
+      "osPid" => row.osPid,
+      "processGroupId" => row.processGroupId,
+      "launchDeadline" => row.launchDeadline,
+      "leaseExpiresAt" => row.leaseExpiresAt,
+      "stopCause" => row.stopCause,
+      "uncertaintyCause" => row.uncertaintyCause,
+      "stopAttemptCount" => row.stopAttemptCount,
+      "lastError" => row.lastError,
+      "deliveryEvidenceId" => row.deliveryEvidenceId,
+      "createdAt" => row.createdAt,
+      "updatedAt" => row.updatedAt,
+      "resolvedAt" => row.resolvedAt,
+      "revision" => row.revision
+    }
+  end
+
+  @doc """
+  The repair pointer an unresolved answer must carry (§B3, §B4).
+
+  Every blocked result names the verb that can move it. A refusal that does not
+  say what to do next is how an unresolved process becomes someone's permanent
+  mystery.
+  """
+  @spec process_blocked(String.t(), [map()]) :: payload()
+  def process_blocked(code, rows) do
+    %{
+      "code" => code,
+      "repairVerb" => "process-reconcile",
+      "processes" => Enum.map(rows, &managed_process/1)
+    }
+  end
+
   defp put_if_present(map, _key, nil), do: map
   defp put_if_present(map, key, value), do: Map.put(map, key, value)
 end

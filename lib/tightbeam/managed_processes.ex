@@ -1091,6 +1091,69 @@ defmodule Tightbeam.ManagedProcesses do
     |> Enum.map(&to_fence/1)
   end
 
+  @doc "Every process this session owns, newest last."
+  @spec list_for_session(DB.server(), String.t()) :: [map()]
+  def list_for_session(db \\ DB, session_key) do
+    {:ok, rows} =
+      DB.query(db, @select <> " WHERE ownerSessionKey = ?1 ORDER BY createdAt", [session_key])
+
+    Enum.map(rows, &to_row/1)
+  end
+
+  @doc """
+  `process-extend` (§B4): push the lease out, and only from a position that
+  makes that meaningful.
+
+  §B5's race table pins both edges. Extend wins ONLY from `running` at the
+  current revision with a lease that is still in the future — an expired lease
+  is not extendable, because by then the stop is already the winning outcome and
+  reviving it would resurrect a process the record has stopped promising to
+  keep. And extend requires the session's generation to be unchanged: retirement
+  moves the generation, so an extend that loses to retirement answers
+  `{:session_retiring, row}` rather than silently granting a lease on a session
+  that is going away.
+  """
+  @spec extend_lease_in_txn(Txn.t(), String.t(), keyword()) ::
+          {:ok, map()}
+          | {:expired, map()}
+          | {:session_retiring, map()}
+          | {:not_running, map()}
+          | {:lost, map() | nil}
+          | {:error, :unknown_process}
+  def extend_lease_in_txn(txn, process_id, opts) do
+    now = Keyword.fetch!(opts, :now)
+    lease_expires_at = Keyword.fetch!(opts, :lease_expires_at)
+
+    case get_in_txn(txn, process_id) do
+      nil ->
+        {:error, :unknown_process}
+
+      %{state: "running"} = row ->
+        cond do
+          row.leaseExpiresAt <= now ->
+            {:expired, row}
+
+          current_generation_in_txn(txn, row.ownerSessionKey) != row.sessionGeneration ->
+            {:session_retiring, row}
+
+          match?(%{state: "retiring"}, fence_in_txn(txn, row.ownerSessionKey)) ->
+            {:session_retiring, row}
+
+          true ->
+            case transition(txn, process_id, [state: "running", revision: row.revision], %{
+                   lease_expires_at: lease_expires_at,
+                   now: now
+                 }) do
+              {:ok, updated} -> {:ok, updated}
+              {:lost, current} -> {:lost, current}
+            end
+        end
+
+      row ->
+        {:not_running, row}
+    end
+  end
+
   @doc "Whether this row still owes work or evidence before its session may retire."
   @spec blocks_retirement?(map()) :: boolean()
   def blocks_retirement?(%{state: state}), do: state in (@nonterminal ++ @unresolved)
