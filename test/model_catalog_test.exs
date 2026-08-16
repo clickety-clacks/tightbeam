@@ -554,6 +554,84 @@ defmodule Tightbeam.ModelCatalogTest do
     assert is_map(Gateway.org_options())
   end
 
+  # Issue #9: Claude Code rotates `.credentials.json` inside the harness home
+  # (write-temp-then-rename), which severs the symlink to the store copy. The
+  # store copy freezes on the pre-rotation token and the provider revokes it,
+  # so every refresh 401s "revoked" against a token that is fine everywhere
+  # else. The store credential here is deliberately stale/wrong; the home
+  # copy under `homes/<host>/claude` is the rotated one the vendor actually
+  # wrote, and only it authenticates -- proving the recovered catalog came
+  # from a real harvest-and-retry, not a lucky second read of the same file.
+  test "a subscription 401 harvests the rotated home credential and retries", ctx do
+    stale_store = ~s({"claudeAiOauth":{"accessToken":"fixture-token-STALE"}})
+    File.write!(Path.join([ctx.base_dir, "auth", "claude", ".credentials.json"]), stale_store)
+
+    rotated_home = ~s({"claudeAiOauth":{"accessToken":"fixture-token-ROTATED"}})
+    home = Path.join([ctx.base_dir, "homes", @host, "claude"])
+    File.mkdir_p!(home)
+    File.write!(Path.join(home, ".credentials.json"), rotated_home)
+
+    claude_json = fixture_body("claude_models.jsonc")
+
+    claude_fetch = fn
+      "/v1/models?limit=100", headers ->
+        if bearer(headers) == "fixture-token-ROTATED" do
+          {:ok, claude_json}
+        else
+          {:error,
+           {:http_status, 401,
+            ~s({"type":"error","error":{"type":"authentication_error","message":"OAuth access token has been revoked."}})}}
+        end
+
+      "/v1/models/claude-haiku-4-5-20251001", _headers ->
+        ctx.claude_fetch.("/v1/models/claude-haiku-4-5-20251001", [])
+    end
+
+    log =
+      capture_log(fn ->
+        catalog = start_catalog(ctx, claude_fetch: claude_fetch)
+        await_fresh(catalog, "claude")
+
+        assert {[_ | _], :fresh} = ModelCatalog.get(@host, "claude", catalog)
+      end)
+
+    refute log =~ "revoked"
+
+    assert File.read!(Path.join([ctx.base_dir, "auth", "claude", ".credentials.json"])) ==
+             rotated_home
+  end
+
+  test "an api-key 401 is never treated as a rotation and never harvested", ctx do
+    store = Path.join([ctx.base_dir, "auth", "claude", ".credentials.json"])
+    File.write!(store, "sk-ant-api03-STALE")
+
+    home = Path.join([ctx.base_dir, "homes", @host, "claude"])
+    File.mkdir_p!(home)
+    File.write!(Path.join(home, ".credentials.json"), "sk-ant-api03-ROTATED")
+
+    claude_fetch = fn "/v1/models?limit=100", _headers ->
+      {:error, {:http_status, 401, ~s({"detail":"API key is invalid."})}}
+    end
+
+    catalog =
+      start_catalog(ctx,
+        claude_fetch: claude_fetch,
+        credential_kind: fn _provider -> :api_key end
+      )
+
+    await(fn ->
+      ModelCatalog.get(@host, "claude", catalog) ==
+        {[], {:unavailable, {:http_status, 401, ~s({"detail":"API key is invalid."})}}}
+    end)
+
+    assert File.read!(store) == "sk-ant-api03-STALE"
+  end
+
+  defp bearer(headers) do
+    {~c"authorization", raw} = List.keyfind(headers, ~c"authorization", 0)
+    to_string(raw) |> String.replace_prefix("Bearer ", "")
+  end
+
   test "missing Credentials server fails catalog refresh closed", ctx do
     parent = self()
     name = unique_name(:missing_credentials)
