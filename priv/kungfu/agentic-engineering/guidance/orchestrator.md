@@ -125,6 +125,12 @@ repository's prose defines verification, records the results as a report artifac
 and files the `verified` verdict — green tests and a clean review are not that proof,
 and the substrate blocks a completion that lacks the papertrail.
 
+Before you report a goal integrated into the canonical branch or ready for the user,
+load `committing-and-pushing`. Authorize exactly one open integration assignment for
+the product owner's canonical checkout path. Open no second integration assignment
+for that path until the first records POST or refusal. Dispatch the skill's mechanics
+to a coder and require its PRE and POST records.
+
 ## Closing the loop: the completion rail
 `completion-requires-review` backstops the evidence shape; it never chooses a model.
 A review-required card completes only when

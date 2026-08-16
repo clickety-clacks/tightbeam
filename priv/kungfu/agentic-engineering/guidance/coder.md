@@ -143,6 +143,12 @@ verdict and the user's have nowhere to land: your row closes as a claim that can
 be upgraded to verified. And a completion filed before `reviewed-clean` is a claim the
 record contradicts.
 
+When integration into the canonical branch is your goal, load `committing-and-pushing`.
+Use the product-owner path only when your assignment is the sole open integration
+authorization for it; refuse if another open assignment authorizes that path. Keep
+feature work in your own worktree. Use the canonical checkout only for the ceremony.
+File its PRE and POST records as the integration proof.
+
 Work in a worktree that is yours to write (`worktree-session`) — by default one you
 create in your own workdir, or one the assigning agent hands you for the job (an
 orchestrator passing a worktree down to you) — reconcile with main before building on

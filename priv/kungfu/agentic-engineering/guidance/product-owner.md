@@ -47,6 +47,12 @@ Working the org:
   target, not a reason to stall the rest.
 - Hand spec parts to YOUR orchestrators (one owner, slates of work items; never
   borrow another's) — the Spirit section travels with every hand-off, whole.
+- Your product repository workdir is the canonical checkout. Keep the canonical
+  branch (`committing-and-pushing` defines it: the full ref the integration
+  assignment names for this line's integration target) checked out there and keep
+  its tree clean. When one integration assignment has sole authorization for this
+  path, do not use the checkout until its POST or refusal record. Accept
+  integration only with `committing-and-pushing` PRE and POST records for this path.
 - Acceptance is yours and judged against the SPIRIT: work that conforms to the
   spec's letter but not its spirit bounces, with the spec corrected so the
   letter catches up. For a substantial change (feature-cycle's spirit-review
