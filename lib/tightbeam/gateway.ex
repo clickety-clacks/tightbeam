@@ -6765,7 +6765,7 @@ defmodule Tightbeam.Gateway do
   defp process_open_result(db, call) do
     purpose = call.params[:purpose]
 
-    with {:session, session_key} <- call[:principal],
+    with {:ok, session_key} <- opener_session(db, call[:principal]),
          {:ok, descriptor} <- Map.fetch(@custody_purposes, purpose),
          %{owner_user_id: owner, host: host} <- Org.get(db, session_key) do
       now = System.system_time(:millisecond)
@@ -6817,8 +6817,19 @@ defmodule Tightbeam.Gateway do
           %{code: "server_error", message: error_map_text(error)}
       end
     else
-      {:user, _} ->
-        %{code: "invalid_message", message: "process-open requires a session principal"}
+      :no_owner_session ->
+        %{
+          code: "process_owner_session_unavailable",
+          message:
+            "no active personal session for this user to hold custody of the ceremony; " <>
+              "the launch was refused before any process was started"
+        }
+
+      :no_principal ->
+        %{
+          code: "invalid_message",
+          message: "process-open requires a session or user principal"
+        }
 
       :error ->
         %{
@@ -6831,6 +6842,30 @@ defmodule Tightbeam.Gateway do
         %{code: "not_found", message: "unknown opener session"}
     end
   end
+
+  # Which durable session is accountable for this launch (owner ruling att_538f0b6f).
+  #
+  # A user principal is bound to that user's OWN personal session, and the binding is
+  # VERIFIED rather than composed. `personal_session_key/1` builds a key from a string
+  # rule, so it answers for users who have never had a session and for keys whose row
+  # belongs to somebody else; trusting it alone would open a custody row that no live
+  # session owns, which is the orphan this whole ceremony exists to prevent. The row must
+  # exist, be active, and carry this very user.
+  #
+  # Refusing here refuses BEFORE the row and before the spawn -- the only ordering in
+  # which "no accountable owner" cannot already have started something.
+  defp opener_session(_db, {:session, session_key}), do: {:ok, session_key}
+
+  defp opener_session(db, {:user, user_id}) do
+    session_key = Org.personal_session_key(user_id)
+
+    case Org.get(db, session_key) do
+      %{owner_user_id: ^user_id, state: "active"} -> {:ok, session_key}
+      _ -> :no_owner_session
+    end
+  end
+
+  defp opener_session(_db, _principal), do: :no_principal
 
   defp positive_ms(value, default) when is_integer(value) and value > 0, do: value
   defp positive_ms(_value, default), do: default
