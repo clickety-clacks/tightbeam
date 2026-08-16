@@ -4,7 +4,7 @@ defmodule Tightbeam.Org do
   and append-only harness-session pointer chains.
   """
 
-  alias Tightbeam.{DB, Supervision, Wakes}
+  alias Tightbeam.{DB, ManagedProcesses, Supervision, Wakes}
   alias Tightbeam.DB.Txn
   alias Tightbeam.Model
 
@@ -552,17 +552,65 @@ defmodule Tightbeam.Org do
       other -> raise "invalid parent-target retirement result: #{inspect(other)}"
     end
 
-    Txn.q(
-      txn,
-      "UPDATE sessions SET state = 'retired', updatedAt = ?2 WHERE sessionKey = ?1 AND state = 'active'",
-      [session_key, retirement_epoch]
-    )
+    # DURABLE PROCESS CUSTODY (spec art_6817803a rev6 §B5, additive shape per
+    # owner adjudication att_4e52a5be / att_54f4348d).
+    #
+    # rev6 asks `sessions.state` to gain `retiring` between `active` and
+    # `retired`. It cannot: line 86 declares CHECK (state IN
+    # ('active','retired')), the DDL is CREATE TABLE IF NOT EXISTS, and
+    # `Schema` forbids in-place repair — so a third value would force the schema
+    # stamp to move and refuse every database already in the field. The approved
+    # shape carries "retiring" in a separate `session_retirement_fence` row and
+    # keeps this column's two values exactly as they are.
+    #
+    # The fence opens, the census settles every one of this session's process
+    # rows, and the finalizer decides — all inside THIS transaction, which is
+    # what makes the census complete: a concurrent start or reconcile either
+    # commits before the fence and is seen here, or loses its compare-and-set
+    # afterwards and cannot expose `running`.
+    #
+    # WHEN NOTHING BLOCKS, and that is the ordinary case because most sessions
+    # own no managed process at all, every observable below is exactly what it
+    # was before this change: the same UPDATE, the same refusal to proceed if it
+    # did not change one row, the same wake cancellation, the same return.
+    {:ok, fence} =
+      ManagedProcesses.open_fence_in_txn(txn, session_key,
+        retirement_epoch: retirement_epoch,
+        principal: principal
+      )
+      |> case do
+        {:ok, opened} -> {:ok, opened}
+        {:already_open, opened} -> {:ok, opened}
+      end
 
-    if Txn.changes(txn) != 1, do: raise("retirement state changed before commit")
+    ManagedProcesses.retirement_census_in_txn(txn, session_key, now: retirement_epoch)
 
-    cancel_retirement_wakes_in_txn(txn, session_key)
+    case ManagedProcesses.finalize_fence_in_txn(txn, session_key,
+           generation: fence.generation,
+           now: retirement_epoch
+         ) do
+      {:blocked, _blockers} ->
+        # A process this session owns is not resolved, so retirement is NOT
+        # finished. The session stays `active` with an open fence rather than
+        # claiming a retirement it has not earned: reporting it retired is the
+        # exact lie §B5 exists to prevent, and the wakes are not cancelled
+        # because they still belong to a session that is still running.
+        # `process-reconcile` plus an exact `retire` retry is the repair.
+        must_get(txn, session_key)
 
-    must_get(txn, session_key)
+      final when elem(final, 0) in [:ok, :already_final] ->
+        Txn.q(
+          txn,
+          "UPDATE sessions SET state = 'retired', updatedAt = ?2 WHERE sessionKey = ?1 AND state = 'active'",
+          [session_key, retirement_epoch]
+        )
+
+        if Txn.changes(txn) != 1, do: raise("retirement state changed before commit")
+
+        cancel_retirement_wakes_in_txn(txn, session_key)
+
+        must_get(txn, session_key)
+    end
   end
 
   defp cancel_retirement_wakes_in_txn(txn, session_key) do
