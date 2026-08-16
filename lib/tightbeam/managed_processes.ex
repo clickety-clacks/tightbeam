@@ -785,6 +785,138 @@ defmodule Tightbeam.ManagedProcesses do
     end
   end
 
+  @doc """
+  `process-reconcile` (§B4): the repeatable repair for every unresolved launch
+  and stop state, and the verb every blocked answer is required to name.
+
+  The caller supplies the physical evidence; this decides what it means. That
+  split is deliberate. Probing the OS is the one part that cannot be done inside
+  a transaction, and embedding it here would make the decision untestable
+  against the cases that matter most — the ones where no evidence exists.
+
+  `evidence`:
+
+    * `:not_probed` — the deadline has not passed, so nothing was asked of the
+      OS. Lease and cause are still settled; the launch itself is left alone.
+    * `:absent` — the broker PROVED no such child exists. Only this terminalizes
+      a launch, and only a proof, never a timeout on its own.
+    * `{:identity, %{...}}` — a verified pre-exec identity. Continues the
+      winning start or stop through `bind_identity_in_txn/4`, which re-applies
+      the same atomic lease and generation checks.
+    * `:unknown` — neither identity nor absence could be proved. The row becomes
+      or stays `identity_unknown`, keeping any stop cause. This is a fail-closed
+      RESULT, not a failure: §B3 is explicit that it may remain unresolved
+      indefinitely, that retirement stays blocked while it does, and that
+      Tightbeam must not delete the row, call it stopped, or promise eventual
+      terminalization without new evidence.
+
+  Lease expiry is settled FIRST and in the same transaction, because §B4 says
+  reconcile "never waits for a separate sweeper to make this decision".
+  """
+  @spec reconcile_in_txn(Txn.t(), String.t(), keyword()) ::
+          {:ok, map()} | {:blocked, map()} | {:error, :unknown_process}
+  def reconcile_in_txn(txn, process_id, opts) do
+    now = Keyword.fetch!(opts, :now)
+    evidence = Keyword.get(opts, :evidence, :not_probed)
+
+    case get_in_txn(txn, process_id) do
+      nil -> {:error, :unknown_process}
+      row -> row |> settle_lease(txn, now) |> reconcile_settled(txn, evidence, now)
+    end
+  end
+
+  # Step one, always: an expired lease installs its cause when none exists, and
+  # moves a launch that has not yet bound identity out of `preparing`. A row
+  # with proven identity becomes a stop request; an unresolved row keeps its
+  # state and merely gains the cause.
+  defp settle_lease(row, txn, now) do
+    cond do
+      row.state in @terminal ->
+        row
+
+      row.leaseExpiresAt > now ->
+        row
+
+      true ->
+        cause = row.stopCause || "lease_expired"
+
+        target =
+          case row.state do
+            "preparing" -> "launch_cancel_requested"
+            "running" -> "stop_requested"
+            other -> other
+          end
+
+        case transition(txn, row.processId, [state: row.state, revision: row.revision], %{
+               state: target,
+               stop_cause: cause,
+               now: now
+             }) do
+          {:ok, updated} -> updated
+          {:lost, current} -> current
+        end
+    end
+  end
+
+  defp reconcile_settled(%{state: state} = row, _txn, _evidence, _now) when state in @terminal do
+    {:ok, row}
+  end
+
+  defp reconcile_settled(row, _txn, :not_probed, now)
+       when is_integer(now) do
+    # Before the launch deadline there is nothing to prove and nothing to wait
+    # on; report the state and the deadline so the caller can say when to look
+    # again rather than guessing.
+    {:blocked, row}
+  end
+
+  defp reconcile_settled(row, txn, :absent, now) do
+    # Proven absence is the ONLY thing that terminalizes a launch. A deadline
+    # alone never fabricates it (§B4, §B5).
+    # `launch_timeout` is a typed LAST ERROR, not a stop cause. §B2's stop-cause
+    # vocabulary is closed to owner_stop / lease_expired / session_retired —
+    # reasons to stop something that is running. A launch that never started has
+    # nothing to stop, and the table's CHECK refused the confusion when this
+    # first tried to write it there.
+    changes =
+      case row.state do
+        "preparing" ->
+          %{state: "launch_failed", last_error: "launch_timeout"}
+
+        "launch_cancel_requested" ->
+          %{state: "launch_canceled", stop_cause: row.stopCause}
+
+        _ ->
+          %{state: "exited", stop_cause: row.stopCause}
+      end
+
+    changes = changes |> Map.put(:resolved_at, now) |> Map.put(:now, now)
+
+    case transition(txn, row.processId, [state: row.state, revision: row.revision], changes) do
+      {:ok, updated} -> {:ok, updated}
+      {:lost, current} -> {:ok, current}
+    end
+  end
+
+  defp reconcile_settled(row, txn, {:identity, identity}, now) do
+    case bind_identity_in_txn(txn, row.processId, identity, now: now) do
+      {:running, updated} -> {:ok, updated}
+      {:stop, updated} -> {:blocked, updated}
+      {:lost, current} -> {:blocked, current}
+    end
+  end
+
+  defp reconcile_settled(row, txn, :unknown, now) do
+    case transition(txn, row.processId, [state: row.state, revision: row.revision], %{
+           state: "identity_unknown",
+           uncertainty_cause: row.uncertaintyCause || "launch_handoff_unknown",
+           now: now
+         }) do
+      {:ok, updated} -> {:blocked, updated}
+      {:lost, current} -> {:blocked, current}
+    end
+  end
+
   @doc "Whether this row still owes work or evidence before its session may retire."
   @spec blocks_retirement?(map()) :: boolean()
   def blocks_retirement?(%{state: state}), do: state in (@nonterminal ++ @unresolved)
