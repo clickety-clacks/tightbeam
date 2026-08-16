@@ -200,14 +200,14 @@ mod group_kill_tests {
 }
 
 #[cfg(target_os = "linux")]
-fn boot_identity() -> Result<String, String> {
+pub(crate) fn boot_identity() -> Result<String, String> {
     fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .map(|value| value.trim().to_owned())
         .map_err(|error| format!("kernel boot identity unavailable: {error}"))
 }
 
 #[cfg(target_os = "macos")]
-fn boot_identity() -> Result<String, String> {
+pub(crate) fn boot_identity() -> Result<String, String> {
     let metadata = fs::metadata("/var/run/com.apple.logind.didRunThisBoot")
         .map_err(|error| format!("boot marker unavailable: {error}"))?;
     Ok(format!(

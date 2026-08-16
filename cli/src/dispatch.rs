@@ -918,6 +918,60 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
     }
 }
 
+/// Open durable custody BEFORE the ceremony spawns (spec art_6817803a rev6 §B2,
+/// owner ruling att_c990c4fe).
+///
+/// There is no `command` parameter and there never will be: the caller names a
+/// typed PURPOSE from the gateway's closed set and the descriptor is derived
+/// there. A generic raw-command launcher has no argument to grow from (§B4,
+/// acceptance 18).
+pub fn build_process_open_request(
+    identity: &Identity,
+    purpose: &str,
+    lease_ms: u64,
+    deadline_ms: u64,
+) -> RequestSpec {
+    request(
+        identity,
+        "process-open",
+        vec![],
+        vec![
+            string_field("purpose", purpose),
+            format!("\"leaseMs\":{lease_ms}"),
+            format!("\"deadlineMs\":{deadline_ms}"),
+        ],
+    )
+}
+
+/// Bind the proven identity and ask whether the workload may be released
+/// (§B5 steps 3-7).
+///
+/// The launch token is the half of the identity tuple that proves WE launched
+/// this child; pid, process group and boot identity only prove that a process
+/// exists. The gateway answers `release` and, when true, the exact revision the
+/// barrier may be opened on — every other answer means keep it shut.
+pub fn build_process_bind_request(
+    identity: &Identity,
+    process_id: &str,
+    launch_token: &str,
+    os_pid: i64,
+    process_group_id: i64,
+    boot_identity: &str,
+) -> RequestSpec {
+    request(
+        identity,
+        "process-bind",
+        vec![],
+        vec![
+            string_field("processId", process_id),
+            string_field("launchToken", launch_token),
+            format!("\"osPid\":{os_pid}"),
+            format!("\"processGroupId\":{process_group_id}"),
+            string_field("bootIdentity", boot_identity),
+        ],
+    )
+}
+
 pub fn build_onboard_phase_request(
     identity: &Identity,
     provider: &str,
@@ -2806,6 +2860,11 @@ mod tests {
                 })
             },
             |endpoint, request, deadline| {
+                if let Some(answer) =
+                    crate::ceremonies::fixture_custody_answer(&request.body_json, true)
+                {
+                    return answer;
+                }
                 let phase = if request.body_json.contains(r#""phase":"begin""#) {
                     "begin"
                 } else if request.body_json.contains(r#""phase":"finish""#) {
@@ -2912,6 +2971,11 @@ mod tests {
                 })
             },
             |_, request, _| {
+                if let Some(answer) =
+                    crate::ceremonies::fixture_custody_answer(&request.body_json, true)
+                {
+                    return answer;
+                }
                 let phase = if request.body_json.contains(r#""phase":"begin""#) {
                     "begin"
                 } else if request.body_json.contains(r#""phase":"finish""#) {
