@@ -143,7 +143,16 @@ defmodule Tightbeam.ManagedProcesses do
                        'launch_failed','launch_canceled','exited','killed',
                        'stop_failed','identity_unknown')),
     lastError         TEXT,
-    deliveryEvidenceId TEXT,
+    -- The FOUR fields §B6 permits from a delivery receipt, and no more. The
+    -- URL and one-time code are not among them: the authorized delivery row or
+    -- the stopgap attest is the ONLY durable sink allowed to hold the code, and
+    -- this row merely POINTS at it. `deliveryEventKind` is a safe label such as
+    -- `device_code_emitted`, never the value that was emitted.
+    deliveryEvidenceId  TEXT,
+    deliveryResult      TEXT CHECK (deliveryResult IS NULL OR deliveryResult IN
+                        ('succeeded','failed','timed_out')),
+    deliveryProviderKind TEXT,
+    deliveryEventKind   TEXT,
     createdAt         INTEGER NOT NULL,
     updatedAt         INTEGER NOT NULL,
     resolvedAt        INTEGER,
@@ -228,6 +237,7 @@ defmodule Tightbeam.ManagedProcesses do
               purpose commandDescriptor osPid processGroupId bootIdentity launchToken
               brokerIdentity launchDeadline leaseExpiresAt cancelRequestedAt releaseGrantedAt
               stopCause uncertaintyCause stopAttemptCount state lastError deliveryEvidenceId
+              deliveryResult deliveryProviderKind deliveryEventKind
               createdAt updatedAt resolvedAt revision)
 
   @select "SELECT #{Enum.join(@columns, ", ")} FROM managed_processes"
@@ -401,6 +411,9 @@ defmodule Tightbeam.ManagedProcesses do
     stop_attempt_count: "stopAttemptCount",
     last_error: "lastError",
     delivery_evidence_id: "deliveryEvidenceId",
+    delivery_result: "deliveryResult",
+    delivery_provider_kind: "deliveryProviderKind",
+    delivery_event_kind: "deliveryEventKind",
     resolved_at: "resolvedAt"
   }
 
@@ -450,6 +463,9 @@ defmodule Tightbeam.ManagedProcesses do
          state,
          last_error,
          delivery_evidence_id,
+         delivery_result,
+         delivery_provider_kind,
+         delivery_event_kind,
          created_at,
          updated_at,
          resolved_at,
@@ -479,6 +495,9 @@ defmodule Tightbeam.ManagedProcesses do
       state: state,
       lastError: last_error,
       deliveryEvidenceId: delivery_evidence_id,
+      deliveryResult: delivery_result,
+      deliveryProviderKind: delivery_provider_kind,
+      deliveryEventKind: delivery_event_kind,
       createdAt: created_at,
       updatedAt: updated_at,
       resolvedAt: resolved_at,
@@ -1152,6 +1171,69 @@ defmodule Tightbeam.ManagedProcesses do
       row ->
         {:not_running, row}
     end
+  end
+
+  @doc """
+  Consume the delivery owner's structured receipt (§B6).
+
+  The URL and the one-time code belong to `wi_0535922b`'s delivery contract and
+  to the authorized sink it writes. This CONSUMES that boundary's receipt and
+  does nothing the boundary owns: it does not send the code, open the browser,
+  write the attest, or schedule the re-arm.
+
+  Four fields are permitted from the receipt and there is nowhere to put a
+  fifth: the evidence id, the terminal result, the provider kind, and a safe
+  event kind such as `device_code_emitted` — a LABEL for what happened, never
+  the value that was emitted. The row points at the sink; it does not copy it.
+
+  On `:succeeded`, custody continues and the process stays exactly as it was —
+  a successful handoff is not a reason to stop a ceremony that is still running.
+  On `:failed` or `:timed_out`, the process stays MANAGED rather than being
+  terminalized here: §B6 says custody waits until it observes the delivery
+  owner's abort receipt, because "the delivery failed" and "the process has
+  stopped" are different facts and only the second one ends custody.
+  """
+  @spec consume_delivery_receipt_in_txn(Txn.t(), String.t(), map(), keyword()) ::
+          {:ok, map()} | {:lost, map() | nil} | {:error, :unknown_process}
+  def consume_delivery_receipt_in_txn(txn, process_id, receipt, opts) do
+    now = Keyword.fetch!(opts, :now)
+
+    result =
+      case Map.fetch!(receipt, :result) do
+        r when r in [:succeeded, :failed, :timed_out] -> to_string(r)
+      end
+
+    case get_in_txn(txn, process_id) do
+      nil ->
+        {:error, :unknown_process}
+
+      row ->
+        transition(txn, process_id, [state: row.state, revision: row.revision], %{
+          delivery_evidence_id: Map.fetch!(receipt, :delivery_evidence_id),
+          delivery_result: result,
+          delivery_provider_kind: Map.get(receipt, :provider_kind),
+          delivery_event_kind: Map.get(receipt, :event_kind),
+          now: now
+        })
+        |> case do
+          {:ok, updated} -> {:ok, updated}
+          {:lost, current} -> {:lost, current}
+        end
+    end
+  end
+
+  @doc """
+  Every column of this record that holds free text, for the canary scan (§B6,
+  acceptance cases 14 and 17).
+
+  Enumerated from the table rather than hand-listed, so a column added later is
+  scanned automatically instead of quietly escaping the check.
+  """
+  @spec text_columns(DB.server()) :: [String.t()]
+  def text_columns(db \\ DB) do
+    {:ok, rows} = DB.query(db, "PRAGMA table_info(managed_processes)")
+
+    for [_cid, name, type | _] <- rows, String.upcase(to_string(type)) == "TEXT", do: name
   end
 
   @doc "Whether this row still owes work or evidence before its session may retire."
