@@ -83,32 +83,29 @@ pub fn run(args: &[String]) -> Result<i32, String> {
         launch_token: args[6].clone(),
     };
 
+    println!("{}", decide(action, Path::new(&args[1]), &expected)?);
+    Ok(0)
+}
+
+/// The whole decision, separated from printing it.
+///
+/// Split out so a test can assert BOTH the verdict and what happened to a real process --
+/// the pair is the actual contract. "Answered identity_unknown" is worth little on its own;
+/// "answered identity_unknown AND the process is still running" is the guarantee.
+fn decide(action: Action, path: &Path, expected: &Expected) -> Result<&'static str, String> {
     // The proof comes first, unconditionally, for both actions. There is no path through
-    // this function that touches the process before this call has succeeded.
-    if !identity_proven(Path::new(&args[1]), &expected)? {
-        println!("{IDENTITY_UNKNOWN}");
-        return Ok(0);
+    // this function that touches the process before this check has passed.
+    if !identity_proven(path, expected)? {
+        return Ok(IDENTITY_UNKNOWN);
     }
 
     match action {
-        Action::Probe => {
-            println!(
-                "{}",
-                if alive(expected.os_pid) {
-                    PRESENT
-                } else {
-                    GONE
-                }
-            );
-            Ok(0)
-        }
-        Action::Stop => {
-            println!(
-                "{}",
-                stop_group(expected.process_group_id, expected.os_pid)?
-            );
-            Ok(0)
-        }
+        Action::Probe => Ok(if alive(expected.os_pid) {
+            PRESENT
+        } else {
+            GONE
+        }),
+        Action::Stop => stop_group(expected.process_group_id, expected.os_pid),
     }
 }
 
@@ -155,6 +152,14 @@ fn identity_proven(path: &Path, expected: &Expected) -> Result<bool, String> {
 /// Only ever asked AFTER the identity is proven. On its own this question is worthless —
 /// it answers yes for a recycled pid belonging to somebody else entirely — which is why
 /// the ruling names it as the last step and not the test.
+///
+/// A ZOMBIE answers yes. A child that has died but whose parent has not yet reaped it is
+/// still a pid the kernel will accept a signal for, so a stop that lands in that window
+/// reports `failed` for a process that is in every practical sense gone. That is the safe
+/// direction and is left as it is: the wrong answer here is unresolved, which a later
+/// reconcile repairs once the entry is reaped, whereas the opposite error would be a
+/// terminal `gone` for something still running. Never trade a false unresolved for a
+/// false terminal.
 fn alive(pid: libc::pid_t) -> bool {
     // SAFETY: signal 0 performs the permission and existence check without delivering.
     unsafe { libc::kill(pid, 0) == 0 }
@@ -249,6 +254,133 @@ mod tests {
 
     fn this_boot() -> String {
         harness_process::boot_identity().unwrap()
+    }
+
+    /// Real children, because the guarantee is about processes and not about strings.
+    ///
+    /// A group leader of its own, exactly as a custodied ceremony child is: `stop_group`
+    /// signals the GROUP, so a test whose child shared the runner's group would either
+    /// prove nothing or kill the test binary.
+    fn spawn_leader() -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+        let mut command = std::process::Command::new("sleep");
+        command.arg("30");
+        // SAFETY: setpgid in the child between fork and exec; touches nothing else.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        command.spawn().expect("sleep spawns")
+    }
+
+    fn expected_for(child: &std::process::Child, boot: &str) -> Expected {
+        Expected {
+            process_id: "mp_live".to_owned(),
+            os_pid: child.id() as libc::pid_t,
+            process_group_id: child.id() as libc::pid_t,
+            boot_identity: boot.to_owned(),
+            launch_token: "tok_live".to_owned(),
+        }
+    }
+
+    fn identity_for(dir: &Path, e: &Expected) -> std::path::PathBuf {
+        artifact(
+            dir,
+            &format!(
+                "{}\t{}\t{}\t{}\t{}",
+                e.process_id, e.os_pid, e.process_group_id, e.boot_identity, e.launch_token
+            ),
+        )
+    }
+
+    #[test]
+    fn a_proven_live_process_probes_present_and_stops_killed() {
+        let boot = this_boot();
+        let dir = temp("live");
+        let mut child = spawn_leader();
+        let e = expected_for(&child, &boot);
+        let path = identity_for(&dir, &e);
+
+        assert_eq!(decide(Action::Probe, &path, &e).unwrap(), PRESENT);
+
+        // Reap from another thread while the stop runs, because in production SOMETHING
+        // reaps: the broker if it is alive, init if it is not. Without a reaper the child
+        // lingers as a zombie that `kill -0` still answers for, and the helper correctly
+        // reports `failed` -- see `alive`. This test is about the ordinary case.
+        let pid = e.os_pid;
+        let reaper = std::thread::spawn(move || {
+            let mut status = 0;
+            // SAFETY: waiting on this test's own child.
+            unsafe { libc::waitpid(pid, &mut status, 0) };
+        });
+
+        assert_eq!(decide(Action::Stop, &path, &e).unwrap(), KILLED);
+        reaper.join().expect("reaper joins");
+
+        // The verdict is only half of it: the process must actually be gone.
+        assert_eq!(decide(Action::Probe, &path, &e).unwrap(), GONE);
+        let _ = child.try_wait();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// THE assertion this helper exists for. The artifact does not corroborate the row, so
+    /// the answer is identity_unknown -- AND the live process is untouched. A version that
+    /// signalled first and checked afterwards would pass every string-only test and would
+    /// kill somebody else's process the first time a pid was reused.
+    #[test]
+    fn an_unproven_identity_is_never_signalled() {
+        let boot = this_boot();
+        let dir = temp("unproven");
+        let mut child = spawn_leader();
+        let e = expected_for(&child, &boot);
+
+        // Everything matches except the launch token, which never leaves the broker.
+        let path = artifact(
+            &dir,
+            &format!(
+                "mp_live\t{}\t{}\t{boot}\ttok_SOMEONE_ELSE",
+                e.os_pid, e.process_group_id
+            ),
+        );
+
+        assert_eq!(decide(Action::Stop, &path, &e).unwrap(), IDENTITY_UNKNOWN);
+        assert!(
+            alive(e.os_pid),
+            "an unproven identity must not be signalled"
+        );
+
+        assert_eq!(decide(Action::Probe, &path, &e).unwrap(), IDENTITY_UNKNOWN);
+        assert!(
+            alive(e.os_pid),
+            "an unproven identity must not even be probed"
+        );
+
+        // SAFETY: cleaning up the test's own child.
+        unsafe { libc::kill(e.os_pid, libc::SIGKILL) };
+        let _ = child.wait();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A ceremony that ended on its own before anyone asked. `exited`, not `killed`: the
+    /// record must not credit this stop with a death it did not cause.
+    #[test]
+    fn a_process_that_already_ended_stops_exited() {
+        let boot = this_boot();
+        let dir = temp("already");
+        let mut child = spawn_leader();
+        let e = expected_for(&child, &boot);
+        let path = identity_for(&dir, &e);
+
+        // SAFETY: ending the test's own child before the helper looks.
+        unsafe { libc::kill(e.os_pid, libc::SIGKILL) };
+        let _ = child.wait();
+
+        assert_eq!(decide(Action::Stop, &path, &e).unwrap(), EXITED);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
