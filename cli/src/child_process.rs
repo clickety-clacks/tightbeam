@@ -1355,6 +1355,36 @@ impl LaunchBarrier {
         if unsafe { libc::pipe(fds.as_mut_ptr()) } == -1 {
             return Err(io::Error::last_os_error());
         }
+
+        // Close-on-exec, and it is load-bearing in two directions.
+        //
+        // Inwards: the barrier is read in `pre_exec`, which runs AFTER fork and BEFORE
+        // exec, so close-on-exec still leaves it readable exactly where it is needed -- and
+        // then guarantees the ceremony child does not carry a live pipe end on into codex.
+        //
+        // Outwards, which is the one that bites: without it, every OTHER child this process
+        // spawns for any reason inherits both ends and holds them for its whole life. A
+        // write end held open by an unrelated process means the launcher's death can never
+        // reach the waiting child as EOF -- which is precisely the guarantee the barrier
+        // exists to provide.
+        //
+        // `pipe2(O_CLOEXEC)` would set this atomically, but it does not exist on macOS,
+        // which this CLI runs on. The window between `pipe` and these two `fcntl` calls is
+        // therefore real: a spawn on another thread landing inside it inherits the fds
+        // anyway. `wait_for_launch_release` closes stray inherited descriptors on its own
+        // side for exactly that reason -- the two measures overlap on purpose, because
+        // neither one alone closes the hole on both platforms.
+        for fd in fds {
+            // SAFETY: setting FD_CLOEXEC on a descriptor this function just created.
+            if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+                let error = io::Error::last_os_error();
+                for fd in fds {
+                    // SAFETY: closing descriptors this function created and still owns.
+                    unsafe { libc::close(fd) };
+                }
+                return Err(error);
+            }
+        }
         Ok(Self {
             read_fd: fds[0],
             write_fd: fds[1],
@@ -1436,6 +1466,25 @@ pub(crate) unsafe fn wait_for_launch_release(
     read_fd: libc::c_int,
     write_fd: libc::c_int,
 ) -> io::Result<()> {
+    // Disarm the launcher's signal handlers FIRST, before anything here can block.
+    //
+    // This code runs in a child that has forked and not yet exec'd, so it is still a copy
+    // of the launcher: same handlers, and -- critically -- same table of every OTHER
+    // supervised process group. `forward_to_active_group` is installed for these three
+    // signals, so a TERM aimed at THIS child would run that handler in this copy and
+    // forward the signal on to unrelated ceremonies' groups. It is the barrier that makes
+    // this reachable at all: every other child in this codebase execs immediately, which
+    // resets dispositions to default, and only a child parked here can be signalled while
+    // still wearing its parent's handlers. Restoring the default disposition makes a TERM
+    // to this child do the one thing it should -- end this child.
+    //
+    // `signal` is async-signal-safe, which `sigaction` on a struct built here would not
+    // reliably be; SIG_DFL needs no flags, so the simple call is also the correct one.
+    for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+        // SAFETY: restoring the default disposition in a freshly forked child.
+        unsafe { libc::signal(signal, libc::SIG_DFL) };
+    }
+
     // Without this the pipe can never report EOF: the child would hold open the very end
     // whose closure it is waiting on, so a dead broker would hang it rather than end it.
     unsafe { libc::close(write_fd) };

@@ -12,8 +12,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::args::{AssimilateArgs, Identity};
 use crate::child_process::{
-    RunError, Supervised, exited_without_reaping, nonblocking, reset_sigchld_before_spawn,
-    supervise,
+    LaunchBarrier, RunError, Supervised, exited_without_reaping, nonblocking,
+    reset_sigchld_before_spawn, supervise, wait_for_launch_release,
 };
 use crate::dispatch::{self, Endpoint, RequestSpec};
 use crate::harnesses::HarnessCatalog;
@@ -63,10 +63,23 @@ fn lease_deadline(ready: &serde_json::Value, now: Instant) -> Instant {
 
 type HarnessLoader<'a> = dyn Fn(&Endpoint, Instant) -> Result<Option<HarnessCatalog>, String> + 'a;
 
+/// The gateway call the ceremony already owns, in the same `dyn Fn` shape as
+/// `HarnessLoader` so it can live in `Ceremony` without making the struct
+/// generic over a closure type.
+type RequestSender<'a> = dyn Fn(&Endpoint, &RequestSpec, Option<Instant>) -> Result<Option<serde_json::Value>, String>
+    + 'a;
+
 struct Ceremony<'a> {
     endpoint: &'a Endpoint,
     deadline: Instant,
     load_harnesses: &'a HarnessLoader<'a>,
+    // Durable process custody needs to reach the gateway from the SPAWN SITE
+    // (spec art_6817803a rev6 §B2/§B5): open custody before the child exists,
+    // then bind its proven identity and learn the exact revision the pre-exec
+    // barrier may be opened on. `onboard/2` already holds both of these and
+    // previously threaded neither down, which is why the barrier had no caller.
+    identity: &'a Identity,
+    send_request: &'a RequestSender<'a>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -90,6 +103,34 @@ impl From<RunError> for StageFailure {
             interrupted: error.is_interrupted(),
             reason: error.to_string(),
         }
+    }
+}
+
+/// Answer the two custody verbs on behalf of a fake gateway.
+///
+/// `None` means the request was not a custody call and the fixture should classify it as
+/// it always did -- so a test that has never heard of custody keeps asserting exactly the
+/// onboarding phases it was written to assert.
+///
+/// `release` is the interesting knob: `false` reproduces a gateway that bound the identity
+/// and then refused to let the workload run, which must leave the barrier shut.
+#[cfg(test)]
+pub(crate) fn fixture_custody_answer(
+    body: &str,
+    release: bool,
+) -> Option<Result<Option<serde_json::Value>, String>> {
+    let request: serde_json::Value = serde_json::from_str(body).ok()?;
+    match request.get("verb").and_then(serde_json::Value::as_str)? {
+        "process-open" => Some(Ok(Some(serde_json::json!({
+            "process": {"processId": "mp_fixture", "state": "preparing"},
+            "launchToken": "lt_fixture"
+        })))),
+        "process-bind" => Some(Ok(Some(serde_json::json!({
+            "process": {"processId": "mp_fixture", "state": "running"},
+            "release": release,
+            "releaseRevision": 2
+        })))),
+        _ => None,
     }
 }
 
@@ -130,6 +171,8 @@ where
         endpoint,
         deadline,
         load_harnesses: &load_harnesses,
+        identity,
+        send_request: &send_request,
     };
     let ready = match ready {
         Some(ready) => ready,
@@ -371,6 +414,14 @@ fn unnamed_machine(because: &str) -> String {
 /// the first time either side is tuned.
 const CEREMONY_FALLBACK_TIMEOUT: Duration = Duration::from_secs(1_800);
 
+/// How long a launch may take to get from `process-open` to a committed identity.
+///
+/// This is not the ceremony's lease -- it bounds only fork, setpgid and one round trip,
+/// which is milliseconds of work. It is generous against a slow or contended gateway and
+/// still short enough that a row abandoned mid-launch is reconcilable in the same minute
+/// rather than sitting in `preparing` until somebody notices it.
+const LAUNCH_DEADLINE: Duration = Duration::from_secs(60);
+
 /// Hands the controlling terminal to a child's process group, and takes it back on drop.
 ///
 /// A ceremony child must lead its OWN process group so the watchdog can signal the whole
@@ -436,31 +487,113 @@ fn set_terminal_group(fd: libc::c_int, pgid: libc::pid_t) -> bool {
 /// that reads to EOF deadlocks against a pipe left open. `None` leaves stdin
 /// exactly as the caller configured it -- the interactive ceremonies inherit the
 /// terminal and must keep doing so.
+/// The launch handshake, held open across the one instant when the child exists, is
+/// identified, and has not yet been let go.
+///
+/// It exists because those three facts are true in exactly one place -- inside
+/// `supervise`'s driver, after spawn and before the workload runs -- and the durable
+/// record must be written THERE. Binding after the child is already executing would
+/// record an identity for a process that may have already forked, exec'd, or exited;
+/// binding before spawn would record a pid that does not exist yet. Neither is custody.
+struct Custody<'a> {
+    barrier: &'a mut LaunchBarrier,
+    /// Commit the proven identity. `Ok(true)` is the gateway's grant to release the
+    /// workload; `Ok(false)` is its refusal. A refusal is NOT an error to paper over --
+    /// it is the substrate saying this launch must not run, and the only correct
+    /// response is to leave the barrier shut.
+    bind: &'a dyn Fn(libc::pid_t, libc::pid_t) -> Result<bool, String>,
+}
+
+impl Custody<'_> {
+    /// Bind, then release -- in that order, with no path that reverses it.
+    ///
+    /// Every early return here leaves the barrier unreleased, which is the safe
+    /// direction: the child is blocked in its pre-exec read, `supervise` terminates the
+    /// group on the returned error, and the workload never executes. The dangerous
+    /// failure is the opposite one, so the release call is the last statement and is
+    /// reachable only through a granted bind.
+    fn commit(self, supervised: &mut Supervised) -> Result<(), RunError> {
+        // The child has inherited the read end by now, so the broker drops its own copy.
+        // While the broker holds one, a write into a pipe nobody reads cannot fail -- so a
+        // broker that lost its child would never learn it had.
+        self.barrier.close_parent_read_end();
+
+        let pgid = supervised.pgid();
+        let pid = supervised.child().id() as libc::pid_t;
+
+        // The parent's half of the race `attend` handles one function down, and here it is
+        // load-bearing rather than merely tidy. We are about to write this group id into a
+        // durable row and hand it to a stop path, and the child -- held at the barrier --
+        // may not have run its own setpgid yet. Setting it from this side makes the group
+        // exist BEFORE it is committed as fact, rather than recording a group id that
+        // nothing has joined yet and handing it to a stop path. Both sides racing to set
+        // the same value is the standard job-control fix and the redundant call is
+        // harmless. Safe against exec, because a custodied child cannot have exec'd -- that
+        // is exactly what the barrier is holding it away from.
+        // SAFETY: setting a child's group to itself while it is alive and pre-exec.
+        unsafe {
+            libc::setpgid(pgid, pgid);
+        }
+
+        let released = (self.bind)(pid, pgid).map_err(RunError::Failed)?;
+        if !released {
+            return Err(RunError::Failed(format!(
+                "custody refused to release pid {pid}: the durable record did not accept \
+                 this identity, so the workload was not started"
+            )));
+        }
+
+        self.barrier
+            .release()
+            .map_err(|error| RunError::Failed(format!("could not release pid {pid}: {error}")))
+    }
+}
+
 fn run_bounded(
     command: ProcessCommand,
     what: &str,
     deadline: Instant,
     stdin: Option<&[u8]>,
 ) -> Result<ExitStatus, String> {
-    run_bounded_inner(command, what, deadline, stdin).map_err(|error| error.to_string())
+    run_bounded_inner(command, what, deadline, stdin, None).map_err(|error| error.to_string())
 }
 
+/// `custody` present means this launch is under durable custody: the child is held at a
+/// barrier inside its own `pre_exec` and does not exec the workload until the identity is
+/// committed. Absent means the historical behavior, unchanged -- spawn and run.
 fn run_bounded_inner(
     mut command: ProcessCommand,
     what: &str,
     deadline: Instant,
     stdin: Option<&[u8]>,
+    custody: Option<Custody<'_>>,
 ) -> Result<ExitStatus, RunError> {
+    // Raw fds, copied into the closure before the spawn. `pre_exec` runs after `fork` in a
+    // process that may hold only this one thread, so the closure must touch nothing that
+    // allocates, locks, or borrows -- two `c_int`s are the whole of what crosses.
+    let gate = custody
+        .as_ref()
+        .map(|custody| (custody.barrier.read_fd(), custody.barrier.write_fd()));
+
     unsafe {
-        command.pre_exec(|| {
+        command.pre_exec(move || {
             if libc::setpgid(0, 0) == -1 {
                 return Err(io::Error::last_os_error());
+            }
+            // AFTER setpgid, so that a child released here is already the leader of the
+            // group the stop path will signal. Blocking first would leave a window in
+            // which the committed identity names a group the child has not joined.
+            if let Some((read_fd, write_fd)) = gate {
+                unsafe { wait_for_launch_release(read_fd, write_fd) }?;
             }
             Ok(())
         });
     }
 
     let (_, status) = supervise(command, what, deadline, |supervised| {
+        if let Some(custody) = custody {
+            custody.commit(supervised)?;
+        }
         attend(supervised, stdin)
     })?;
     Ok(status)
@@ -871,11 +1004,127 @@ fn run_openai_onboarding(staging: &str, ceremony: &Ceremony<'_>) -> Result<(), S
     // String, which discards the INTERRUPTED classification. An interrupt must stay
     // distinguishable from an ordinary failure all the way up, because `onboard` skips the
     // gateway cancel on one and not the other.
-    let status = run_bounded_inner(command, "codex device-code login", ceremony.deadline, None)
-        .map_err(StageFailure::from)?;
+    // The durable row is opened BEFORE the spawn, and the child is held at a barrier until
+    // its identity is committed into that row. The order is the whole point: a ceremony
+    // that could outlive this CLI must be recoverable by whoever finds it, and a process
+    // that exists before any record of it does is exactly the orphan this ceremony has
+    // already produced in the field -- one found alive after two days against a deleted
+    // binary. Row first, then pid, then release.
+    let custody = open_custody(ceremony, "openai device-code onboarding")?;
+
+    let status = match custody {
+        Some((process_id, launch_token)) => {
+            let mut barrier = LaunchBarrier::new().map_err(|error| {
+                StageFailure::from(format!("launch barrier unavailable: {error}"))
+            })?;
+            let bind = |pid, pgid| bind_custody(ceremony, &process_id, &launch_token, pid, pgid);
+            let outcome = run_bounded_inner(
+                command,
+                "codex device-code login",
+                ceremony.deadline,
+                None,
+                Some(Custody {
+                    barrier: &mut barrier,
+                    bind: &bind,
+                }),
+            );
+            // Dropping the barrier here closes the write end. For a launch that never
+            // reached release -- a bind refusal, a gateway that could not be reached, a
+            // panic between the two -- that closure IS the child's exit: it reads EOF in
+            // its pre-exec and dies without ever exec-ing codex.
+            drop(barrier);
+            outcome
+        }
+        None => run_bounded_inner(
+            command,
+            "codex device-code login",
+            ceremony.deadline,
+            None,
+            None,
+        ),
+    }
+    .map_err(StageFailure::from)?;
 
     codex_staged_a_credential(status, staging, "OpenAI device-code onboarding")
         .map_err(StageFailure::from)
+}
+
+/// Open the durable custody row, returning its id and launch token.
+///
+/// `None` means this CLI is running with no gateway to be accountable to -- the offline
+/// and test paths -- and the ceremony runs uncustodied exactly as it did before. That is
+/// deliberate and narrow: it is not a fallback for a gateway that refused. A refusal is
+/// an error, and it stops the ceremony before anything is spawned.
+fn open_custody(
+    ceremony: &Ceremony<'_>,
+    purpose: &str,
+) -> Result<Option<(String, String)>, StageFailure> {
+    let remaining = ceremony
+        .deadline
+        .saturating_duration_since(Instant::now())
+        .as_millis() as u64;
+    let request = dispatch::build_process_open_request(
+        ceremony.identity,
+        purpose,
+        remaining,
+        LAUNCH_DEADLINE.as_millis() as u64,
+    );
+    let Some(opened) =
+        (ceremony.send_request)(ceremony.endpoint, &request, None).map_err(StageFailure::from)?
+    else {
+        return Ok(None);
+    };
+
+    // Both halves or neither. A row without its token cannot be bound, and continuing with
+    // half an answer would spawn a child this CLI could never commit -- which the barrier
+    // would then hold shut forever. Refusing here is the same refusal, six seconds earlier
+    // and with a reason attached.
+    let process_id = json_string(&opened, "process", "processId");
+    let launch_token = opened
+        .get("launchToken")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    match (process_id, launch_token) {
+        (Some(process_id), Some(launch_token)) => Ok(Some((process_id, launch_token))),
+        _ => Err(StageFailure::from(
+            "process-open did not return a processId and launchToken; the ceremony was not started"
+                .to_owned(),
+        )),
+    }
+}
+
+/// Commit the proven identity and report whether the gateway granted release.
+///
+/// A `release: false` answer is a legitimate outcome, not a failure to retry: the row may
+/// already have been asked to stop, or the launch deadline may have passed while the child
+/// was starting. Either way the correct action is identical -- do not release -- so it is
+/// reported as `Ok(false)` and the barrier stays shut.
+fn bind_custody(
+    ceremony: &Ceremony<'_>,
+    process_id: &str,
+    launch_token: &str,
+    pid: libc::pid_t,
+    pgid: libc::pid_t,
+) -> Result<bool, String> {
+    let boot_identity = crate::harness_process::boot_identity()?;
+    let request = dispatch::build_process_bind_request(
+        ceremony.identity,
+        process_id,
+        launch_token,
+        pid as i64,
+        pgid as i64,
+        &boot_identity,
+    );
+    let bound = (ceremony.send_request)(ceremony.endpoint, &request, None)?
+        .ok_or_else(|| "process-bind returned no answer".to_owned())?;
+    Ok(bound
+        .get("release")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false))
+}
+
+fn json_string(value: &serde_json::Value, object: &str, field: &str) -> Option<String> {
+    value.get(object)?.get(field)?.as_str().map(str::to_owned)
 }
 
 /// The subscription ceremony: `claude setup-token` under a pty, the token read off the
@@ -1989,6 +2238,10 @@ mod tests {
             endpoint: &endpoint,
             deadline: Instant::now() + Duration::from_secs(1_800),
             load_harnesses: &|_, _| Ok(None),
+            identity: &Identity::User("flynn".to_owned()),
+            // These cases do not reach the custody seam; a sender that refuses
+            // is louder than one that silently succeeds if one ever does.
+            send_request: &|_, _, _| Err("no gateway in this test".to_owned()),
         };
 
         assert_eq!(
@@ -2070,6 +2323,99 @@ mod tests {
         assert!(!alive, "grandchild {grandchild} outlived the group kill");
     }
 
+    /// The barrier's whole reason to exist, proven against a real child.
+    ///
+    /// Every other test in this file would still pass if the barrier were inert -- they
+    /// grant release, and a launch that is never held looks identical to one that is held
+    /// and then let go. Only a REFUSED release can tell those two apart, and it tells them
+    /// apart by a file that does not exist: the fixture writes its marker as its first
+    /// statement, so the marker's absence means the shell never ran, which means `exec`
+    /// never happened, which means the workload was still behind the barrier when the
+    /// gateway said no. If this assertion ever fails, the child ran before its identity
+    /// was durable and the ceremony can orphan again.
+    #[test]
+    fn a_refused_release_never_lets_the_workload_exec() {
+        let root = std::env::temp_dir().join(format!(
+            "tightbeam-custody-refused-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let staging = root.join("staging");
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let ran = root.join("codex-ran");
+        let codex = bin.join("codex");
+        fs::write(
+            &codex,
+            format!("#!/bin/sh\nprintf ran > '{}'\n", ran.display()),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&codex, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let prior_machine = std::env::var("TIGHTBEAM_MACHINE").ok();
+        unsafe {
+            std::env::set_var("TIGHTBEAM_MACHINE", "custody-fixture-host");
+        }
+
+        let endpoint = Endpoint {
+            base: "http://custody-fixture.invalid".to_owned(),
+            token: "custody-fixture-token".to_owned(),
+            origin: crate::dispatch::Origin::Provisioned,
+        };
+        let staged = staging.display().to_string();
+        let binary = codex.display().to_string();
+        let result = onboard(
+            &Identity::User("flynn".to_owned()),
+            "openai",
+            false,
+            &endpoint,
+            |_, request, _| {
+                // `false`: the identity binds, and the gateway declines to release it.
+                if let Some(answer) = fixture_custody_answer(&request.body_json, false) {
+                    return answer;
+                }
+                let value: serde_json::Value = serde_json::from_str(&request.body_json).unwrap();
+                match value
+                    .pointer("/params/phase")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    Some("begin") => Ok(Some(serde_json::json!({
+                        "stagingPath": staged,
+                        "leaseId": "custody-fixture-lease",
+                        "leaseTtlMs": 300_000
+                    }))),
+                    _ => Ok(None),
+                }
+            },
+            |_, _| {
+                Ok(Some(crate::harnesses::HarnessCatalog {
+                    harnesses: vec![crate::harnesses::HarnessProjection {
+                        wire_name: "codex".to_owned(),
+                        // Absolute, so the fixture resolves without this test mutating the
+                        // PATH every other test in the binary is reading concurrently.
+                        cli_binary: binary.clone(),
+                        install_package: "codex-acp".to_owned(),
+                        process_markers: vec!["codex".to_owned()],
+                    }],
+                }))
+            },
+        );
+
+        match prior_machine {
+            Some(value) => unsafe { std::env::set_var("TIGHTBEAM_MACHINE", value) },
+            None => unsafe { std::env::remove_var("TIGHTBEAM_MACHINE") },
+        }
+
+        let error = result.expect_err("a refused release must fail the ceremony");
+        assert!(error.contains("did not accept"), "{error}");
+        assert!(
+            !ran.exists(),
+            "the workload exec'd behind a refused release: the barrier is not holding"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// Codex uses the pipe-backed bounded runner rather than the Anthropic pty runner.
     /// Its signal has to retain the same interrupted classification all the way through
     /// onboarding, or `onboard` mistakes TERM for a staging failure and waits on cancel.
@@ -2095,6 +2441,9 @@ mod tests {
                 false,
                 &endpoint,
                 |_, request, _| {
+                    if let Some(answer) = fixture_custody_answer(&request.body_json, true) {
+                        return answer;
+                    }
                     let request: serde_json::Value =
                         serde_json::from_str(&request.body_json).unwrap();
                     match request
@@ -2380,6 +2729,8 @@ mod tests {
             endpoint: &endpoint,
             deadline,
             load_harnesses: &|_, _| Ok(None),
+            identity: &Identity::User("flynn".to_owned()),
+            send_request: &|_, _, _| Err("no gateway in this test".to_owned()),
         };
         let sent = std::cell::RefCell::new(Vec::new());
 
@@ -3483,6 +3834,10 @@ mod tests {
             endpoint: &endpoint,
             deadline: Instant::now() + Duration::from_secs(1_800),
             load_harnesses: &|_, _| Ok(None),
+            identity: &Identity::User("flynn".to_owned()),
+            // These cases do not reach the custody seam; a sender that refuses
+            // is louder than one that silently succeeds if one ever does.
+            send_request: &|_, _, _| Err("no gateway in this test".to_owned()),
         };
         assert_eq!(
             harness_cli("nonesuch", &ceremony),
