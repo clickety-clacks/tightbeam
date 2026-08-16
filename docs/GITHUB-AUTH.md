@@ -63,6 +63,26 @@ hostname it is asked to use:
 - `unknown`: the host could not be asked or the probe timed out. This is never
   treated as live.
 
+The credential itself is banked **file-backed** in a Tightbeam-owned GitHub CLI
+config dir under the base dir:
+
+```text
+auth/github/gh/
+```
+
+One shared dir, not per-hostname: `GH_CONFIG_DIR` is single-valued while gh's
+`hosts.yml` natively holds every hostname. The dir is 0700, the files inside
+0600, and gh owns their format — Tightbeam never parses them.
+
+The OS login keychain is deliberately not the store. Agent processes descend
+from the gateway daemon, and a daemon-descended context cannot read the login
+keychain (`security` fails with `errSecInteractionNotAllowed`, exit 36 —
+observed on gd-mbp, 2026-08-16). A keyring credential therefore probes live
+from an operator terminal while being unreadable from every environment that
+does project work. File-backed storage under the base dir is the same shape as
+the banked model-provider credentials and is readable by exactly the processes
+that need it.
+
 The capability is stamped as metadata under Tightbeam's base dir, but the
 metadata is evidence only. The authority remains the live probe.
 
@@ -81,7 +101,8 @@ Suggested metadata fields:
   "git_protocol": "https",
   "checked_at": "2026-08-15T00:00:00Z",
   "status": "live",
-  "source": "gh"
+  "source": "gh",
+  "storage": "file"
 }
 ```
 
@@ -101,18 +122,24 @@ The command runs on the host whose GitHub capability is being banked.
 Required behavior:
 
 1. Verify `gh` is executable on the relevant `PATH`.
-2. Run `gh auth status --active --hostname <host>`.
-3. If status is already live, write capability metadata and finish.
-4. If status is not live, drive `gh auth login --hostname <host> --web
-   --git-protocol https` as the default ceremony.
-5. When `--remote URL` is present, run `git ls-remote URL HEAD` from the same
+2. Create the banked config dir (`auth/github/gh`, 0700) and run every gh and
+   git invocation below with `GH_CONFIG_DIR` pointing at it.
+3. Run `gh auth status --active --hostname <host>`.
+4. If status is already live in the banked dir, write capability metadata and
+   finish.
+5. If status is not live, drive `gh auth login --hostname <host> --web
+   --git-protocol https --insecure-storage` as the default ceremony.
+   `--insecure-storage` is a deliberate choice, not a fallback: it lands the
+   credential in the banked dir as a 0600 file instead of the login keychain,
+   which agent environments cannot read (see Model). The `storage: "file"`
+   fact is surfaced in the command result, capability metadata, and doctor
+   output rather than passing as implicit success.
+6. When `--remote URL` is present, run `git ls-remote URL HEAD` from the same
    environment before writing capability metadata.
-6. After login, re-run the probes before writing capability metadata.
+7. After login, re-run the probes before writing capability metadata.
 
 The ceremony must not run `gh auth login --with-token` unless a future explicit
-operator flag is added. If `gh` falls back to insecure plaintext storage, the
-command must surface that fact in the result and doctor output; whether that is
-allowed should be a policy setting, not an implicit success.
+operator flag is added.
 
 For satellites, the same command runs on the satellite after host registration.
 Gateway-mediated onboarding may orchestrate the command, but the credential must
@@ -183,10 +210,32 @@ call. Non-GitHub calls pass through. GitHub-dependent calls must prove host
 Failure exits as a tool refusal with the repair command and the instruction not
 to paste a PAT into an agent.
 
-For local sessions, preserve the host environment needed for `gh` and Git's
-credential helper unless a containment mode explicitly forbids it. If
-containment forbids the OS credential store, the project must report GitHub as
-unavailable instead of falling back to PAT prompts.
+The guard judges operations, not mentions: `git`/`gh` must appear in command
+position, and a command whose argument text merely *names* a GitHub URL or a
+gh subcommand (an assignment brief, a wake prompt, an echo) is not probed.
+The matcher under-matches by design — a gh call nested inside `sh -c "..."`
+slips through and fails at runtime with gh's own auth error, which is the
+acceptable direction for a hygiene gate to be wrong in.
+
+`tightbeam github-auth-check` resolves the banked config dir itself, so the
+hook's probe never depends on the session's projected environment. The
+agent's own `gh`/`git` invocations do: a session spawned before the
+capability was banked has no `GH_CONFIG_DIR` and its direct gh calls read the
+unreachable default store. Until per-turn env re-projection exists, the
+operational rule is that GitHub work runs in sessions spawned after
+onboarding.
+
+Every agent environment (local adapter launch and satellite ssh launch) gets
+`GH_CONFIG_DIR` pointing at the host's banked dir — a path, never token bytes.
+Locally it is projected once the banked dir exists; on satellites it is set
+unconditionally, because pointing gh at an absent dir yields the correct
+answer (`needs_onboarding` against the satellite's own store) while inheriting
+the remote user's keyring would repeat the local trap: live from a terminal,
+unreadable from project work. Git rides the same rail through gh's credential
+helper (`gh auth git-credential`), which consults `GH_CONFIG_DIR`.
+
+If a containment mode forbids even the banked file store, the project must
+report GitHub as unavailable instead of falling back to PAT prompts.
 
 For remote sessions, do not assume the gateway's `HOME`, keychain, or
 `~/.config/gh` applies. The remote host must pass its own readiness probe.
@@ -240,6 +289,12 @@ Session/project status should expose only non-secret fields. Suggested display:
 - A proposed agent shell call such as `git clone https://github.com/org/repo.git`
   is refused before execution when host GitHub auth is missing, and the refusal
   names `tightbeam onboard github --hostname github.com --remote ...`.
+- A command that merely mentions a GitHub URL or a gh subcommand in argument
+  prose — `tightbeam assign --brief "read the gh issue thread at
+  https://github.com/org/repo"` — is not probed and not refused.
+- With a banked file credential present, `gh auth status` run by the probe
+  reports the account sourced from the banked `hosts.yml`, not from an OS
+  keyring, and the probe passes from a daemon-descended process.
 - No prompt, status payload, log event, or agent message asks the operator to
   paste a PAT.
 - No token bytes appear in events, doctor output, status JSON, stderr logs, or

@@ -63,7 +63,10 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
     cli_bin = Keyword.get(inputs, :cli_bin, Path.join(base_dir, "bin"))
     binary_probe = Keyword.get(inputs, :harness_binary_probe, &Placement.harness_binary_probe/2)
     credential_probe = Keyword.get(inputs, :credential_state, fn _provider -> :unknown end)
-    github_probe = Keyword.get(inputs, :github_probe, &github_probe/2)
+    github_probe =
+      Keyword.get(inputs, :github_probe, fn hostname, remote_url ->
+        github_probe(base_dir, hostname, remote_url)
+      end)
     github_remote_url = Keyword.get(inputs, :github_remote_url)
     harnesses = Enum.map(Tightbeam.Harness.all(), & &1.wire_name())
 
@@ -446,18 +449,30 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
     ErlangError -> nil
   end
 
-  defp github_probe(hostname, remote_url) do
+  # The probe must judge the store agents actually read: with a banked
+  # file-backed credential present, gh and git run with GH_CONFIG_DIR pointing
+  # at it, so doctor's "live" cannot be satisfied by a login-keychain entry
+  # that daemon-descended project environments cannot read.
+  defp github_probe(base_dir, hostname, remote_url) do
+    env = github_probe_env(base_dir)
+
     with {:gh, path} when is_binary(path) <- {:gh, System.find_executable("gh")},
          {:auth, {_out, 0}} <-
            {:auth,
             System.cmd("gh", ["auth", "status", "--active", "--hostname", hostname],
-              stderr_to_stdout: true
+              stderr_to_stdout: true,
+              env: env
             )},
          {:api, {account, 0}} <-
-           {:api, System.cmd("gh", ["api", "--hostname", hostname, "user", "--jq", ".login"])},
+           {:api,
+            System.cmd("gh", ["api", "--hostname", hostname, "user", "--jq", ".login"], env: env)},
          {:git, {_out, 0}} <-
-           {:git, System.cmd("git", ["ls-remote", remote_url, "HEAD"], stderr_to_stdout: true)} do
-      {:ok, %{account: String.trim(account), git_protocol: github_git_protocol(hostname)}}
+           {:git,
+            System.cmd("git", ["ls-remote", remote_url, "HEAD"],
+              stderr_to_stdout: true,
+              env: env
+            )} do
+      {:ok, %{account: String.trim(account), git_protocol: github_git_protocol(hostname, env)}}
     else
       {:gh, nil} ->
         {:error, :missing_cli, "gh is missing from PATH"}
@@ -476,10 +491,15 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
       {:error, :unknown, "GitHub readiness probe could not run"}
   end
 
-  defp github_git_protocol(hostname) do
+  defp github_probe_env(base_dir) do
+    dir = Path.join([base_dir, "auth", "github", "gh"])
+    if File.dir?(dir), do: [{"GH_CONFIG_DIR", dir}], else: []
+  end
+
+  defp github_git_protocol(hostname, env) do
     _ = hostname
 
-    case System.cmd("gh", ["config", "get", "git_protocol"]) do
+    case System.cmd("gh", ["config", "get", "git_protocol"], env: env) do
       {protocol, 0} ->
         protocol = String.trim(protocol)
         if protocol == "", do: nil, else: protocol

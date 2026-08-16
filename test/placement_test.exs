@@ -924,6 +924,29 @@ defmodule Tightbeam.PlacementTest do
                  fn -> Placement.adapter_opts(remote, {:codex, "default", "worker"}) end
   end
 
+  test "adapter_opts projects GH_CONFIG_DIR only once a github credential is banked", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    config = %{
+      base_dir: base_dir,
+      db: db,
+      cwd: "/work",
+      cli_bin: "/local/bin",
+      default_model: Model.new("fable")
+    }
+
+    unbanked = Placement.adapter_opts(config, {:claude, "default", "testhost"})[:env]
+    refute Enum.any?(unbanked, fn {key, _value} -> key == "GH_CONFIG_DIR" end)
+
+    gh_dir = Path.join([base_dir, "auth", "github", "gh"])
+    File.mkdir_p!(gh_dir)
+
+    assert {"GH_CONFIG_DIR", gh_dir} in
+             Placement.adapter_opts(config, {:claude, "default", "testhost"})[:env]
+  end
+
+
   test "adapter_opts appends an ssh overlay to remote_env", %{base_dir: base_dir, db: db} do
     Application.put_env(:tightbeam, :advertised_url, "http://gateway.example:4000")
 
@@ -1133,6 +1156,7 @@ defmodule Tightbeam.PlacementTest do
              "TIGHTBEAM_URL=http://gateway.example:4000",
              "PATH=/srv/tb/bin:$PATH",
              "TIGHTBEAM_LINEAGE=tb1-Y29kZXhAd29ya2Vy",
+             "GH_CONFIG_DIR=/srv/tb/auth/github/gh",
              ~s(CODEX_CONFIG='{"bypass_hook_trust":true}'),
              "/srv/tb/adapters/node_modules/.bin/codex-acp"
            ]

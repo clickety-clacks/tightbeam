@@ -888,3 +888,32 @@ service-user projects therefore need a first-class host capability. Added
 browser/device OAuth, readiness proves both `gh` API auth and `git ls-remote`,
 PAT is never an agent fallback, and gateway/satellite hosts prove independently.
 Linked it from onboarding docs.
+
+GITHUB AUTH FILE-BACKED STORAGE — the first live project-creation test caught
+the credential-reachability gap the spec's "environment class" rule warned
+about. The gdiab keyring login probed live from the operator terminal while
+every agent operation was refused: agent processes descend from the gateway
+LaunchDaemon, and that context cannot read the login keychain (`security` →
+errSecInteractionNotAllowed, exit 36). Same disease as the model-provider
+staleness in issue #9 — daemon context vs user-session credential stores.
+Fix: `tightbeam onboard github` now banks the credential file-backed (0600)
+in a Tightbeam-owned gh config dir (`auth/github/gh`, shared across
+hostnames since GH_CONFIG_DIR is single-valued and hosts.yml is not), the
+ceremony passes --insecure-storage deliberately and surfaces `storage:
+"file"` as a fact, every probe (onboard, doctor, github-auth-check) judges
+liveness against that dir, and placement projects GH_CONFIG_DIR into agent
+env — locally when the dir exists, unconditionally over ssh. Git rides the
+same rail via gh's credential helper. Design validated live on gd-mbp by
+manual banking + host-env overlay before being encoded here.
+
+Two findings from the same live test, both fixed or fenced in the same
+change: the guard's substring matching refused a `tightbeam assign` whose
+BRIEF merely mentioned "gh issue" and a GitHub URL — the guard now requires
+git/gh in command position and judges operations, not mentions,
+deliberately under-matching (nested `sh -c` calls fail at runtime with gh's
+own error instead of prose being blocked). And sessions spawned before
+onboarding never see GH_CONFIG_DIR: github-auth-check now resolves the
+banked dir itself so the HOOK probe is env-independent, but the agent's own
+gh calls still need the projected var — documented as an operational rule
+(GitHub work runs in post-onboarding sessions) until per-turn env
+re-projection exists.
