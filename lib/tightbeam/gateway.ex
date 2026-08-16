@@ -5649,7 +5649,8 @@ defmodule Tightbeam.Gateway do
         %{
           deleted_session_key: call.session_key,
           retired_session_keys: retired_subtree_keys(db, call.session_key),
-          deferred: []
+          deferred: [],
+          blocked: []
         }
 
       true ->
@@ -5784,6 +5785,16 @@ defmodule Tightbeam.Gateway do
     walk.(walk, root_key)
   end
 
+  @doc false
+  # Test seam for the retirement cascade's durable-truth contract (review
+  # att_8017ebe7 F3). The cascade is private and reached in production only
+  # through the retire verb, which needs a device principal; the property under
+  # test is which members the cascade REPORTS versus which it durably retired,
+  # and that is worth asserting directly rather than through the whole verb.
+  def retire_cascade_for_test(txn, root_key, owner, principal, interval_ms, drain_reason) do
+    retire_cascade_in_txn(txn, root_key, owner, principal, interval_ms, drain_reason)
+  end
+
   defp retire_cascade_in_txn(
          txn,
          root_key,
@@ -5807,22 +5818,50 @@ defmodule Tightbeam.Gateway do
       end)
 
     if leased == [] do
-      retired =
-        Enum.map(subtree, fn member ->
-          assignments =
-            retire_session_in_txn(
-              txn,
-              member.session_key,
-              owner,
-              principal,
-              supervision_interval_ms,
-              drain_reason
-            )
+      # DURABLE TRUTH, PARENT-LAST (review att_8017ebe7 F3).
+      #
+      # This used to report every member as retired regardless of what
+      # `Org.retire_in_txn/4` actually did. That was harmless until durable
+      # process custody made retirement DEFERRABLE — after which a session
+      # blocked on an unresolved process was announced retired while its own
+      # row still said `active` behind an open fence. Everything downstream
+      # reads this list: the idempotency marker, the `stream_deleted` broadcast
+      # that tells clients the session is gone, the on_retired callback, the
+      # assignment-change events, and the workspace reap. Every one of them was
+      # firing on a session that had not retired.
+      #
+      # Two rules now, and the walk is already parent-last so both are cheap:
+      #   * a member appears in `retired` only if its durable state says so;
+      #   * an ancestor of a blocked member is NOT retired either. Retiring a
+      #     parent whose child is still running is the same lie one level up,
+      #     and it would strand the child with no live parent to repair it.
+      {retired, blocked} =
+        Enum.reduce(subtree, {[], []}, fn member, {retired, blocked} ->
+          if blocked_descendant?(txn, member.session_key, blocked) do
+            {retired, [member.session_key | blocked]}
+          else
+            assignments =
+              retire_session_in_txn(
+                txn,
+                member.session_key,
+                owner,
+                principal,
+                supervision_interval_ms,
+                drain_reason
+              )
 
-          %{session_key: member.session_key, assignments: assignments}
+            case Org.get_in_txn(txn, member.session_key) do
+              %{state: "retired"} ->
+                {retired ++ [%{session_key: member.session_key, assignments: assignments}],
+                 blocked}
+
+              _ ->
+                {retired, [member.session_key | blocked]}
+            end
+          end
         end)
 
-      %{retired: retired, deferred: []}
+      %{retired: retired, deferred: [], blocked: Enum.reverse(blocked)}
     else
       deadline = Enum.max_by(leased, & &1.hard_deadline).hard_deadline
 
@@ -5841,7 +5880,7 @@ defmodule Tightbeam.Gateway do
           }
         end)
 
-      %{retired: [], deferred: deferred}
+      %{retired: [], deferred: deferred, blocked: []}
     end
   end
 
@@ -5867,6 +5906,27 @@ defmodule Tightbeam.Gateway do
   defp retire_intent_wake_id(root_key, session_key) do
     digest = :crypto.hash(:sha256, root_key <> "\0" <> session_key) |> Base.encode16(case: :lower)
     "w_retire_" <> digest
+  end
+
+  # Is any already-blocked member a descendant of this one? The subtree walk is
+  # parent-last, so every descendant has been decided by the time we get here.
+  defp blocked_descendant?(_txn, _key, []), do: false
+
+  defp blocked_descendant?(txn, key, blocked) do
+    Enum.any?(blocked, fn blocked_key -> ancestor_of?(txn, key, blocked_key) end)
+  end
+
+  defp ancestor_of?(txn, key, candidate, hops \\ 0)
+  defp ancestor_of?(_txn, _key, _candidate, hops) when hops > 32, do: false
+
+  defp ancestor_of?(txn, key, candidate, hops) do
+    case Txn.q(txn, "SELECT spawnedBy FROM sessions WHERE sessionKey = ?1", [candidate]) do
+      [[parent]] when is_binary(parent) ->
+        parent == key or ancestor_of?(txn, key, parent, hops + 1)
+
+      _ ->
+        false
+    end
   end
 
   defp retire_session_in_txn(
