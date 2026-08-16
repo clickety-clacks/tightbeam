@@ -221,6 +221,41 @@ defmodule Tightbeam.Wire.RouterTest do
 
     assert withdrawn.status == 200
     assert JSON.decode!(withdrawn.resp_body)["result"]["status"] == "withdrawn"
+
+    # The negative side of the SAME seam. The defect was the allowlist gate: a
+    # verb it omits is refused here, before any handler, with this exact shape —
+    # the refusal the three operator verbs used to draw. Assert it directly so a
+    # future drop from @agent_verbs is caught as a refusal, not a silent 200.
+    denied = dispatch_cli(ctx, raiser.cli_token, %{verb: "operator-nonsense", params: %{}})
+
+    assert denied.status == 400
+
+    assert JSON.decode!(denied.resp_body) == %{
+             "error" => %{
+               "code" => "invalid_message",
+               "message" => "verb not allowed: operator-nonsense"
+             }
+           }
+
+    # And an allowed operator verb still enforces its owner authorization THROUGH
+    # the router: a session principal (not the human owner) is refused not_owner,
+    # proving the verb is genuinely routed to its handler's auth, not merely let
+    # past the allowlist.
+    ask3 =
+      dispatch_cli(ctx, raiser.cli_token, %{
+        verb: "operator-ask",
+        params: %{question: "who rules?", options: [%{label: "a"}, %{label: "b"}]}
+      })
+
+    assert is_binary(dr3 = JSON.decode!(ask3.resp_body)["result"]["id"])
+
+    not_owner =
+      dispatch_cli(ctx, raiser.cli_token, %{
+        verb: "operator-rule",
+        params: %{request: dr3, decision: "a"}
+      })
+
+    assert JSON.decode!(not_owner.resp_body)["error"]["code"] == "not_owner"
   end
 
   test "identity status crosses the closed CLI verb router", ctx do
