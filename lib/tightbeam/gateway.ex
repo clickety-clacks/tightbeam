@@ -6125,6 +6125,18 @@ defmodule Tightbeam.Gateway do
   defp reap_retired_sessions(config, db, session_keys) do
     coordinator = Map.get(config, :adapter_coordinator, Tightbeam.AdapterCoordinator)
 
+    # Reap only what actually retired. Before durable process custody this was
+    # a tautology — everything on this list had just flipped to `retired` in the
+    # committed transaction — but a session whose managed process is unresolved
+    # now stays `active` behind an open retirement fence (spec rev6 §B5). Its
+    # workspace is exactly where `process-reconcile` looks for the evidence that
+    # would resolve it, so archiving here would destroy the repair path for the
+    # blocked row and leave the process unresolvable by construction.
+    #
+    # Read the durable state rather than trusting the caller's list: the list is
+    # assembled before commit and the block is decided during it.
+    session_keys = Enum.filter(session_keys, &retired?(db, &1))
+
     Enum.each(session_keys, &archive_retired_workspace(config, db, &1))
 
     session_keys
@@ -6150,6 +6162,10 @@ defmodule Tightbeam.Gateway do
     _ -> :ok
   catch
     :exit, _ -> :ok
+  end
+
+  defp retired?(db, session_key) do
+    match?(%{state: "retired"}, Org.get(db, session_key))
   end
 
   defp archive_retired_workspace(config, db, session_key) do
