@@ -553,7 +553,11 @@ defmodule Tightbeam.ModelCatalog do
          module
        ) do
     Tightbeam.Homes.sweep_auth(probe.base_dir, module.id())
-    module.fetch_catalog(probe)
+
+    case module.fetch_catalog(probe) do
+      {:ok, _entries} = success -> success
+      _retry_error -> error
+    end
   rescue
     _ -> error
   end
