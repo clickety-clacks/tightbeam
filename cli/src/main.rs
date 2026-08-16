@@ -9,6 +9,7 @@ mod dispatch;
 mod harness_process;
 mod harnesses;
 mod lease;
+mod onboard_emit;
 mod preflight;
 mod probe;
 mod users;
