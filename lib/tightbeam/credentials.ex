@@ -918,7 +918,8 @@ defmodule Tightbeam.Credentials do
   end
 
   defp activate_staged_credential(state, provider, kind, credential) do
-    with :ok <- start_for_finish(state, provider, kind),
+    with :ok <- state.stop.(provider),
+         :ok <- start_for_finish(state, provider, kind),
          :ok <- mark_onboarded_for_finish(state, provider, kind, credential) do
       :ok
     end

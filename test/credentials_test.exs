@@ -468,10 +468,10 @@ defmodule Tightbeam.CredentialsTest do
              {:needs_onboarding, {:unsupported, :no_subscription}}
   end
 
-  test "interactive CLI phase keeps credential bytes off control messages and runtime serving",
+  test "interactive phase keeps the old same-kind runtime serving until installed replacement",
        ctx do
     owner = self()
-    {:ok, prior_runtime} = Agent.start_link(fn -> :serving end)
+    {:ok, runtime} = Agent.start_link(fn -> {:serving, :subscription} end)
 
     {:ok, server} =
       Credentials.start_link(
@@ -482,38 +482,59 @@ defmodule Tightbeam.CredentialsTest do
           send(owner, :gate)
           :ok
         end,
-        stop: fn _ ->
-          Agent.update(prior_runtime, fn _ -> :parked end)
-          send(owner, :forbidden_stop)
-          :ok
-        end,
-        start: fn _, _ ->
-          assert Agent.get(prior_runtime, & &1) == :serving
+        stop: fn :openai ->
+          assert Agent.get(runtime, & &1) == {:serving, :subscription}
 
           assert File.read!(Path.join([ctx.base, "auth", "codex", "auth.json"])) ==
                    "device-code-result"
 
-          send(owner, :start)
+          assert credential_metadata(ctx.base, "codex")["last_health"] ==
+                   "present_but_unverified"
+
+          Agent.update(runtime, fn _ -> {:stopped, :subscription} end)
+          send(owner, {:finish_step, :stop})
+          :ok
+        end,
+        start: fn :openai, :subscription ->
+          assert Agent.get(runtime, & &1) == {:stopped, :subscription}
+
+          assert File.read!(Path.join([ctx.base, "auth", "codex", "auth.json"])) ==
+                   "device-code-result"
+
+          Agent.update(runtime, fn _ -> {:serving, :subscription, :replacement} end)
+          send(owner, {:finish_step, :start})
+          :ok
+        end,
+        on_credential_present: fn :openai ->
+          assert Agent.get(runtime, & &1) == {:serving, :subscription, :replacement}
+          assert credential_metadata(ctx.base, "codex")["onboarded"]
+          send(owner, {:finish_step, :commit})
           :ok
         end,
         resume: fn _ ->
-          send(owner, :resume)
+          send(owner, {:finish_step, :resume})
           :ok
         end
       )
 
     assert {:ok, staging, lease_id} = Credentials.begin_onboard(:openai, server)
     assert_receive :gate
-    refute_receive :forbidden_stop
-    assert Agent.get(prior_runtime, & &1) == :serving
+    refute_receive {:finish_step, :stop}
+    assert Agent.get(runtime, & &1) == {:serving, :subscription}
     assert {:messages, []} = Process.info(server, :messages)
     File.write!(Path.join(staging, "auth.json"), "device-code-result")
-    refute_receive :forbidden_stop
+    refute_receive {:finish_step, :stop}
 
     assert :ok = Credentials.finish_onboard(:openai, :subscription, lease_id, server)
-    assert_receive :start
-    assert_receive :resume
-    refute_receive :forbidden_stop
+
+    steps =
+      for _ <- 1..4 do
+        assert_receive {:finish_step, step}
+        step
+      end
+
+    assert steps == [:stop, :start, :commit, :resume]
+    assert Agent.get(runtime, & &1) == {:serving, :subscription, :replacement}
     refute File.exists?(staging)
 
     assert File.read!(Path.join([ctx.base, "auth", "codex", "auth.json"])) ==
@@ -743,6 +764,56 @@ defmodule Tightbeam.CredentialsTest do
   end
 
   describe "finish_onboard commit and rollback" do
+    test "a stop refusal keeps the installed candidate unverified and never starts", ctx do
+      owner = self()
+
+      {:ok, server} =
+        Credentials.start_link(
+          name: nil,
+          base_dir: ctx.base,
+          machine: "eezo",
+          stop: fn :openai ->
+            assert File.read!(Path.join([ctx.base, "auth", "codex", "auth.json"])) ==
+                     ~S({"token":"candidate"})
+
+            refute credential_metadata(ctx.base, "codex")["onboarded"]
+
+            assert credential_metadata(ctx.base, "codex")["last_health"] ==
+                     "present_but_unverified"
+
+            send(owner, :stop_refused)
+            {:error, :runtime_stop_refused}
+          end,
+          start: fn _, _ -> send(owner, :forbidden_start) end,
+          on_credential_present: fn _ -> send(owner, :forbidden_credential_present) end,
+          resume: fn _ -> send(owner, :forbidden_resume) end,
+          publish_sessions: fn _, _ -> send(owner, :forbidden_publish) end
+        )
+
+      assert {:ok, staging, lease_id} = Credentials.begin_onboard(:openai, server)
+      refute_receive :stop_refused
+      File.write!(Path.join(staging, "auth.json"), ~S({"token":"candidate"}))
+
+      assert {:error, :runtime_stop_refused} =
+               Credentials.finish_onboard(:openai, :subscription, lease_id, server)
+
+      assert_receive :stop_refused
+
+      assert File.read!(Path.join([ctx.base, "auth", "codex", "auth.json"])) ==
+               ~S({"token":"candidate"})
+
+      assert {:needs_onboarding, {:present_but_unverified, cause}} =
+               Credentials.status(:openai, server)
+
+      assert cause["finish"] =~ "runtime_stop_refused"
+      refute credential_metadata(ctx.base, "codex")["onboarded"]
+      refute File.exists?(staging)
+      refute_receive :forbidden_start
+      refute_receive :forbidden_credential_present
+      refute_receive :forbidden_resume
+      refute_receive :forbidden_publish
+    end
+
     test "success calls the credential-present callback once after durable state", ctx do
       owner = self()
 
