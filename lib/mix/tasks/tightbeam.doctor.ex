@@ -65,7 +65,7 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
     credential_probe = Keyword.get(inputs, :credential_state, fn _provider -> :unknown end)
     github_probe =
       Keyword.get(inputs, :github_probe, fn hostname, remote_url ->
-        github_probe(base_dir, hostname, remote_url)
+        Tightbeam.GithubAuth.probe(base_dir, hostname, remote_url)
       end)
     github_remote_url = Keyword.get(inputs, :github_remote_url)
     harnesses = Enum.map(Tightbeam.Harness.all(), & &1.wire_name())
@@ -371,10 +371,13 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
   defp onboard_command(provider, _host),
     do: "tightbeam onboard #{provider} --as-user <userId>"
 
+  # Doctor formats and reports; Tightbeam.GithubAuth judges. This check owns
+  # only the presentation of the probe result — the readiness model lives in
+  # one place, like local_credential_state asking Tightbeam.Credentials.
   defp github_check(nil, _github_probe), do: nil
 
   defp github_check(remote_url, github_probe) do
-    case github_hostname(remote_url) do
+    case Tightbeam.GithubAuth.hostname(remote_url) do
       nil ->
         nil
 
@@ -391,48 +394,11 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
             check(
               "github_auth:#{hostname}",
               false,
-              "#{state}: #{scrub_github_detail(detail)}",
+              "#{state}: #{Tightbeam.GithubAuth.scrub_detail(detail)}",
               "Run on this host: tightbeam onboard github --hostname #{hostname}. " <>
                 "Do not paste a PAT into an agent."
             )
         end
-    end
-  end
-
-  defp github_hostname(remote_url) when is_binary(remote_url) do
-    cond do
-      String.starts_with?(remote_url, "https://") or String.starts_with?(remote_url, "http://") ->
-        remote_url
-        |> URI.parse()
-        |> Map.get(:host)
-        |> github_host()
-
-      String.starts_with?(remote_url, "ssh://") ->
-        remote_url
-        |> URI.parse()
-        |> Map.get(:host)
-        |> github_host()
-
-      String.starts_with?(remote_url, "git@") ->
-        case String.split(remote_url, ["@", ":"], parts: 3) do
-          ["git", host, _path] -> github_host(host)
-          _ -> nil
-        end
-
-      true ->
-        nil
-    end
-  end
-
-  defp github_hostname(_remote_url), do: nil
-
-  defp github_host(nil), do: nil
-
-  defp github_host(host) do
-    cond do
-      host == "github.com" -> host
-      String.ends_with?(host, ".github.com") -> host
-      true -> nil
     end
   end
 
@@ -447,94 +413,6 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
     end
   rescue
     ErlangError -> nil
-  end
-
-  # The probe must judge the store agents actually read: with a banked
-  # file-backed credential present, gh and git run with GH_CONFIG_DIR pointing
-  # at it, so doctor's "live" cannot be satisfied by a login-keychain entry
-  # that daemon-descended project environments cannot read.
-  defp github_probe(base_dir, hostname, remote_url) do
-    env = github_probe_env(base_dir)
-
-    with {:gh, path} when is_binary(path) <- {:gh, System.find_executable("gh")},
-         {:auth, {_out, 0}} <-
-           {:auth,
-            System.cmd("gh", ["auth", "status", "--active", "--hostname", hostname],
-              stderr_to_stdout: true,
-              env: env
-            )},
-         {:api, {account, 0}} <-
-           {:api,
-            System.cmd("gh", ["api", "--hostname", hostname, "user", "--jq", ".login"], env: env)},
-         {:git, {_out, 0}} <-
-           {:git,
-            System.cmd("git", ["ls-remote", remote_url, "HEAD"],
-              stderr_to_stdout: true,
-              env: env
-            )} do
-      {:ok, %{account: String.trim(account), git_protocol: github_git_protocol(hostname, env)}}
-    else
-      {:gh, nil} ->
-        {:error, :missing_cli, "gh is missing from PATH"}
-
-      {:auth, {detail, _status}} ->
-        {:error, :needs_onboarding, scrub_github_detail(detail)}
-
-      {:api, {detail, _status}} ->
-        {:error, classify_github_api_failure(detail), scrub_github_detail(detail)}
-
-      {:git, {detail, _status}} ->
-        {:error, :git_unready, scrub_github_detail(detail)}
-    end
-  rescue
-    ErlangError ->
-      {:error, :unknown, "GitHub readiness probe could not run"}
-  end
-
-  # Unconditional: an absent banked dir must probe as needs_onboarding, never
-  # as whatever the operator shell's ambient gh config can reach.
-  defp github_probe_env(base_dir) do
-    [{"GH_CONFIG_DIR", Placement.github_config_dir(base_dir)}]
-  end
-
-  defp github_git_protocol(hostname, env) do
-    _ = hostname
-
-    case System.cmd("gh", ["config", "get", "git_protocol"], env: env) do
-      {protocol, 0} ->
-        protocol = String.trim(protocol)
-        if protocol == "", do: nil, else: protocol
-
-      _ ->
-        nil
-    end
-  rescue
-    ErlangError -> nil
-  end
-
-  defp classify_github_api_failure(detail) do
-    down = String.downcase(to_string(detail))
-
-    cond do
-      String.contains?(down, "scope") or String.contains?(down, "forbidden") or
-          String.contains?(down, "403") ->
-        :insufficient_scope
-
-      String.contains?(down, "auth") or String.contains?(down, "401") ->
-        :needs_onboarding
-
-      true ->
-        :unknown
-    end
-  end
-
-  defp scrub_github_detail(detail) do
-    detail
-    |> to_string()
-    |> String.replace(~r/github_pat_[A-Za-z0-9_]+/, "[redacted]")
-    |> String.replace(~r/gh[opusr]_[A-Za-z0-9_]+/, "[redacted]")
-    |> String.replace(~r{https://[^/\s:]+:[^@\s]+@}, "https://[redacted]@")
-    |> String.trim()
   end
 
   defp local_credential_state(base_dir, provider) do

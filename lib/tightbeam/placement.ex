@@ -1194,7 +1194,7 @@ defmodule Tightbeam.Placement do
           # the correct answer anyway (needs_onboarding on the satellite's own
           # store), where inheriting the remote user's keyring would repeat the
           # local trap: live from a terminal, unreadable from project work.
-          "GH_CONFIG_DIR=#{Tightbeam.Harness.Support.shell_quote(github_config_dir(host_config.base_dir))}"
+          "GH_CONFIG_DIR=#{Tightbeam.Harness.Support.shell_quote(Tightbeam.GithubAuth.config_dir(host_config.base_dir))}"
         ] ++
           Enum.map(overlay_env, fn {name, value} ->
             "#{name}=#{Tightbeam.Harness.Support.shell_quote(value)}"
@@ -1290,13 +1290,7 @@ defmodule Tightbeam.Placement do
   # Unconditional, banked or not: pointing gh at an absent dir yields the
   # honest answer (needs_onboarding) where ambient fallback would let a store
   # agents cannot reach answer "live".
-  defp github_env(base_dir) do
-    [{"GH_CONFIG_DIR", github_config_dir(base_dir)}]
-  end
-
-  @doc "The banked GitHub CLI config dir for a base dir. See docs/GITHUB-AUTH.md."
-  @spec github_config_dir(String.t()) :: String.t()
-  def github_config_dir(base_dir), do: Path.join([base_dir, "auth", "github", "gh"])
+  defp github_env(base_dir), do: Tightbeam.GithubAuth.env(base_dir)
 
   @doc """
   Capture same-tier adapter boot inputs in the higher-tier coordinator.
