@@ -1307,3 +1307,336 @@ mod tests {
         );
     }
 }
+
+/// The pre-exec launch barrier, and portable parent-death, from one pipe.
+///
+/// Spec `art_6817803a` rev6 §B2: "A managed launch broker starts the child behind a
+/// closed pre-exec barrier and configures parent-death termination. The workload cannot
+/// execute until proven identity commits and the broker observes an explicit release
+/// grant. This rule prevents a launcher crash between spawn and identity binding from
+/// creating an executing orphan."
+///
+/// Two requirements, one primitive. The child holds the read end of a pipe whose write
+/// end only the broker holds, and blocks on it inside `pre_exec` — after `fork`, before
+/// `exec`:
+///
+///   * it reads the release byte -> identity committed, proceed to `exec`;
+///   * it reads EOF -> every write end is closed, which happens exactly when the broker
+///     dies, so it `_exit`s WITHOUT ever exec-ing the workload.
+///
+/// "Parent-death termination" reads as Linux `prctl(PR_SET_PDEATHSIG)`, which does not
+/// exist on macOS — and both hosts that run this suite are macOS, which would make the
+/// launcher-crash acceptance case untestable on every machine that runs it. Pipe EOF is
+/// POSIX and behaves identically on both.
+///
+/// It also satisfies the rule more strongly than the wording asks. There is no orphan to
+/// terminate on a launcher crash, because the workload never started: the process sitting
+/// in the barrier is still the forked launcher, not the ceremony. Unrepresentable rather
+/// than cleaned up afterwards.
+///
+/// The child MUST close its inherited copy of the write end before reading, or the pipe
+/// can never report EOF — the child would be holding open the very end whose closure it
+/// is waiting for, and a broker crash would hang it forever instead of killing it.
+pub(crate) struct LaunchBarrier {
+    read_fd: libc::c_int,
+    write_fd: libc::c_int,
+    released: bool,
+}
+
+/// One byte, and its value is checked. A pipe that somehow carried anything else is not a
+/// release grant, and treating "some bytes arrived" as authorization would let stray
+/// output past the barrier.
+const BARRIER_RELEASE: u8 = b'R';
+
+impl LaunchBarrier {
+    pub(crate) fn new() -> io::Result<Self> {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `fds` is a valid two-element array for the duration of the call.
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self {
+            read_fd: fds[0],
+            write_fd: fds[1],
+            released: false,
+        })
+    }
+
+    pub(crate) fn read_fd(&self) -> libc::c_int {
+        self.read_fd
+    }
+
+    pub(crate) fn write_fd(&self) -> libc::c_int {
+        self.write_fd
+    }
+
+    /// Close the parent's copy of the READ end, once the child has inherited it.
+    ///
+    /// Not merely tidy: while the broker still holds a read end, a `write` that nobody is
+    /// reading cannot fail, so a broker that lost its child would never learn it.
+    pub(crate) fn close_parent_read_end(&mut self) {
+        if self.read_fd >= 0 {
+            // SAFETY: closing a fd this struct owns, exactly once.
+            unsafe { libc::close(self.read_fd) };
+            self.read_fd = -1;
+        }
+    }
+
+    /// Grant release: the identity is committed and the workload may run.
+    pub(crate) fn release(&mut self) -> io::Result<()> {
+        if self.released {
+            return Ok(());
+        }
+        let byte = [BARRIER_RELEASE];
+        loop {
+            // SAFETY: writing one byte from a live local buffer to an fd we own.
+            let n = unsafe { libc::write(self.write_fd, byte.as_ptr().cast(), 1) };
+            if n == 1 {
+                self.released = true;
+                return Ok(());
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+
+    pub(crate) fn released(&self) -> bool {
+        self.released
+    }
+}
+
+impl Drop for LaunchBarrier {
+    /// Dropping WITHOUT releasing is the launcher-crash path, and it is the point of the
+    /// design: closing the last write end sends the waiting child EOF, and it exits
+    /// without exec-ing. A broker that dies anywhere between spawn and identity commit
+    /// therefore leaves no running workload, whether it died by panic, by `?`, or by
+    /// signal.
+    fn drop(&mut self) {
+        self.close_parent_read_end();
+        if self.write_fd >= 0 {
+            // SAFETY: closing a fd this struct owns, exactly once.
+            unsafe { libc::close(self.write_fd) };
+            self.write_fd = -1;
+        }
+    }
+}
+
+/// The child half of the barrier. Call ONLY inside `Command::pre_exec`.
+///
+/// Everything here must be async-signal-safe: this runs after `fork` in a process that
+/// may hold locks belonging to threads that no longer exist, so it allocates nothing and
+/// calls nothing but raw syscalls.
+///
+/// # Safety
+///
+/// Must be called between `fork` and `exec`, with both fds inherited from the broker.
+pub(crate) unsafe fn wait_for_launch_release(
+    read_fd: libc::c_int,
+    write_fd: libc::c_int,
+) -> io::Result<()> {
+    // Without this the pipe can never report EOF: the child would hold open the very end
+    // whose closure it is waiting on, so a dead broker would hang it rather than end it.
+    unsafe { libc::close(write_fd) };
+
+    // ...and neither can it report EOF while some OTHER child holds a copy.
+    //
+    // `fork` copies the whole descriptor table, so a second launch started while this one
+    // sits in the barrier inherits THIS barrier's write end and holds it open. The broker
+    // could then die with its own write end closed and this child would still wait
+    // forever, because a sibling — not the broker — is keeping the pipe alive. Parent-death
+    // would be silently defeated exactly when two ceremonies overlap, which is precisely
+    // when it matters.
+    //
+    // Found by the barrier's own tests deadlocking when the four of them ran concurrently
+    // in one process. That is the production shape, not a test artifact: one broker
+    // launching two ceremonies is the same fork pattern.
+    //
+    // So close every inherited descriptor above stdio except this barrier's read end,
+    // before blocking. That is ordinary launcher hygiene — a workload should not inherit
+    // descriptors nobody meant to give it — and it makes "the only write end left belongs
+    // to the broker" true by construction rather than by luck. `close` on a descriptor
+    // that was never open simply fails, which is why the return value is ignored, and a
+    // bare close loop is async-signal-safe where `closefrom`/`close_range` are not
+    // portable across both hosts.
+    let max_fd = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+    let max_fd = if (3..=4096).contains(&max_fd) {
+        max_fd as libc::c_int
+    } else {
+        4096
+    };
+
+    let mut fd = 3;
+    while fd < max_fd {
+        if fd != read_fd {
+            unsafe { libc::close(fd) };
+        }
+        fd += 1;
+    }
+
+    let mut byte = [0u8; 1];
+    loop {
+        let n = unsafe { libc::read(read_fd, byte.as_mut_ptr().cast(), 1) };
+
+        match n {
+            1 if byte[0] == BARRIER_RELEASE => {
+                unsafe { libc::close(read_fd) };
+                return Ok(());
+            }
+            // EOF: every write end is closed, so the broker is gone. Leave WITHOUT
+            // exec-ing. `_exit` rather than `exit` because atexit handlers inherited
+            // across the fork are not ours to run.
+            0 => unsafe { libc::_exit(0) },
+            // A byte that is not the grant is not authorization.
+            1 => unsafe { libc::_exit(0) },
+            _ => {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    // Cannot prove release was granted, so do not run the workload.
+                    unsafe { libc::_exit(0) }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod launch_barrier_tests {
+    use super::*;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    /// A workload that leaves a durable mark IF it ever runs. The mark is the whole
+    /// assertion: "did the workload execute" is not a thing you can ask a process that
+    /// correctly never started, so it has to be asked of the filesystem.
+    fn marking_child(marker: &std::path::Path) -> Command {
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", &format!("printf ran > {}", marker.display())])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command
+    }
+
+    fn temp_marker(name: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "tb-barrier-{}-{}-{}",
+            name,
+            std::process::id(),
+            LAUNCH_TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    static LAUNCH_TEST_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    fn spawn_behind(barrier: &LaunchBarrier, mut command: Command) -> Child {
+        let read_fd = barrier.read_fd();
+        let write_fd = barrier.write_fd();
+        unsafe {
+            command.pre_exec(move || {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                wait_for_launch_release(read_fd, write_fd)
+            });
+        }
+        reset_sigchld_before_spawn();
+        command.spawn().expect("spawn behind barrier")
+    }
+
+    /// SPEC §B2: the workload cannot execute until the broker grants release.
+    #[test]
+    fn the_workload_does_not_run_until_release_is_granted() {
+        let marker = temp_marker("released");
+        let mut barrier = LaunchBarrier::new().unwrap();
+        let mut child = spawn_behind(&barrier, marking_child(&marker));
+        barrier.close_parent_read_end();
+
+        // Held: give it real time to misbehave rather than trusting a tight window.
+        thread::sleep(Duration::from_millis(250));
+        assert!(
+            !marker.exists(),
+            "workload ran before the barrier was released"
+        );
+
+        barrier.release().unwrap();
+        let status = child.wait().unwrap();
+        assert!(status.success());
+
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "ran");
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    /// SPEC §B2 / acceptance case 12: crash the launcher before identity commit. The
+    /// pre-exec workload must never run. Dropping the barrier without releasing IS the
+    /// crash: it closes the last write end exactly as a dying process would.
+    #[test]
+    fn a_broker_that_dies_before_release_never_lets_the_workload_run() {
+        let marker = temp_marker("crashed");
+        let mut barrier = LaunchBarrier::new().unwrap();
+        let mut child = spawn_behind(&barrier, marking_child(&marker));
+        barrier.close_parent_read_end();
+
+        assert!(!barrier.released());
+        drop(barrier);
+
+        let status = child.wait().unwrap();
+        assert!(
+            status.success(),
+            "the barred child should exit cleanly, not be killed"
+        );
+
+        thread::sleep(Duration::from_millis(100));
+        assert!(
+            !marker.exists(),
+            "a launcher crash before identity commit produced an EXECUTING ORPHAN"
+        );
+    }
+
+    /// A byte that is not the grant is not authorization. Guards against treating any
+    /// stray write into the pipe as release.
+    #[test]
+    fn a_byte_that_is_not_the_grant_does_not_release_the_workload() {
+        let marker = temp_marker("wrongbyte");
+        let mut barrier = LaunchBarrier::new().unwrap();
+        let mut child = spawn_behind(&barrier, marking_child(&marker));
+        barrier.close_parent_read_end();
+
+        let junk = [b'X'];
+        // SAFETY: writing one byte to the barrier's own live write end.
+        let written = unsafe { libc::write(barrier.write_fd(), junk.as_ptr().cast(), 1) };
+        assert_eq!(written, 1);
+
+        let status = child.wait().unwrap();
+        assert!(status.success());
+
+        thread::sleep(Duration::from_millis(100));
+        assert!(
+            !marker.exists(),
+            "a non-grant byte was accepted as a release grant"
+        );
+    }
+
+    /// Releasing twice is one grant, not two writes into a pipe nobody is reading.
+    #[test]
+    fn release_is_idempotent() {
+        let marker = temp_marker("twice");
+        let mut barrier = LaunchBarrier::new().unwrap();
+        let mut child = spawn_behind(&barrier, marking_child(&marker));
+        barrier.close_parent_read_end();
+
+        barrier.release().unwrap();
+        barrier.release().unwrap();
+        assert!(barrier.released());
+
+        let status = child.wait().unwrap();
+        assert!(status.success());
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "ran");
+        let _ = std::fs::remove_file(&marker);
+    }
+}
