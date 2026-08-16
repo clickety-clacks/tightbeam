@@ -100,7 +100,7 @@ defmodule Tightbeam.Credentials do
   def onboard(provider, server \\ __MODULE__),
     do: GenServer.call(server, {:onboard, provider}, :infinity)
 
-  @doc "Begin an interactive CLI onboarding lease after gate + runtime stop."
+  @doc "Begin an interactive CLI onboarding lease after gating new work, without stopping the serving runtime."
   @spec begin_onboard(provider(), GenServer.server()) ::
           {:ok, String.t(), String.t()} | {:error, term()}
   def begin_onboard(provider, server \\ __MODULE__),
@@ -421,8 +421,7 @@ defmodule Tightbeam.Credentials do
 
     if previous, do: cleanup_staging!(state, previous.path)
 
-    with :ok <- state.gate.(provider),
-         :ok <- state.stop.(provider) do
+    with :ok <- state.gate.(provider) do
       path = onboarding_staging_path(state, provider)
       lease_id = Tightbeam.Id.uuid4()
       :ok = prepare_staging!(state, path)

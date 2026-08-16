@@ -468,8 +468,10 @@ defmodule Tightbeam.CredentialsTest do
              {:needs_onboarding, {:unsupported, :no_subscription}}
   end
 
-  test "interactive CLI phase keeps credential bytes off control messages", ctx do
+  test "interactive CLI phase keeps credential bytes off control messages and runtime serving",
+       ctx do
     owner = self()
+    {:ok, prior_runtime} = Agent.start_link(fn -> :serving end)
 
     {:ok, server} =
       Credentials.start_link(
@@ -481,10 +483,16 @@ defmodule Tightbeam.CredentialsTest do
           :ok
         end,
         stop: fn _ ->
-          send(owner, :stop)
+          Agent.update(prior_runtime, fn _ -> :parked end)
+          send(owner, :forbidden_stop)
           :ok
         end,
         start: fn _, _ ->
+          assert Agent.get(prior_runtime, & &1) == :serving
+
+          assert File.read!(Path.join([ctx.base, "auth", "codex", "auth.json"])) ==
+                   "device-code-result"
+
           send(owner, :start)
           :ok
         end,
@@ -496,17 +504,72 @@ defmodule Tightbeam.CredentialsTest do
 
     assert {:ok, staging, lease_id} = Credentials.begin_onboard(:openai, server)
     assert_receive :gate
-    assert_receive :stop
+    refute_receive :forbidden_stop
+    assert Agent.get(prior_runtime, & &1) == :serving
     assert {:messages, []} = Process.info(server, :messages)
     File.write!(Path.join(staging, "auth.json"), "device-code-result")
+    refute_receive :forbidden_stop
 
     assert :ok = Credentials.finish_onboard(:openai, :subscription, lease_id, server)
     assert_receive :start
     assert_receive :resume
+    refute_receive :forbidden_stop
     refute File.exists?(staging)
 
     assert File.read!(Path.join([ctx.base, "auth", "codex", "auth.json"])) ==
              "device-code-result"
+  end
+
+  test "failed and canceled interactive phases keep the prior runtime serving", ctx do
+    owner = self()
+    {:ok, prior_runtime} = Agent.start_link(fn -> :serving end)
+
+    {:ok, server} =
+      Credentials.start_link(
+        name: nil,
+        base_dir: ctx.base,
+        machine: "eezo",
+        stop: fn provider ->
+          Agent.update(prior_runtime, fn _ -> :parked end)
+          send(owner, {:forbidden_stop, provider})
+          :ok
+        end,
+        start: fn provider, _kind ->
+          send(owner, {:forbidden_start, provider})
+          :ok
+        end
+      )
+
+    assert {:ok, failed_staging, failed_lease_id} =
+             Credentials.begin_onboard(:openai, server)
+
+    assert Agent.get(prior_runtime, & &1) == :serving
+    refute_receive {:forbidden_stop, :openai}
+
+    assert {:error, {:device_auth_failed, :enoent}} =
+             Credentials.finish_onboard(
+               :openai,
+               :subscription,
+               failed_lease_id,
+               server
+             )
+
+    refute File.exists?(failed_staging)
+    assert Agent.get(prior_runtime, & &1) == :serving
+    refute_receive {:forbidden_stop, :openai}
+    refute_receive {:forbidden_start, :openai}
+
+    assert {:ok, canceled_staging, canceled_lease_id} =
+             Credentials.begin_onboard(:anthropic, server)
+
+    assert Agent.get(prior_runtime, & &1) == :serving
+    refute_receive {:forbidden_stop, :anthropic}
+
+    assert :ok = Credentials.cancel_onboard(:anthropic, canceled_lease_id, server)
+    refute File.exists?(canceled_staging)
+    assert Agent.get(prior_runtime, & &1) == :serving
+    refute_receive {:forbidden_stop, :anthropic}
+    refute_receive {:forbidden_start, :anthropic}
   end
 
   test "satellite onboarding installs entirely on that machine without credential transport",
@@ -597,12 +660,12 @@ defmodule Tightbeam.CredentialsTest do
 
     assert {:ok, staging, stale_lease_id} = Credentials.begin_onboard(:openai, server)
     File.write!(Path.join(staging, "auth.json"), ~S({"token":"stale"}))
-    assert_receive {:stop, :openai}
+    refute_receive {:stop, :openai}
 
     assert {:ok, fresh, current_lease_id} = Credentials.begin_onboard(:openai, server)
     assert fresh != staging
     assert current_lease_id != stale_lease_id
-    assert_receive {:stop, :openai}
+    refute_receive {:stop, :openai}
     refute File.exists?(staging)
     File.write!(Path.join(fresh, "auth.json"), ~S({"token":"successor"}))
 
