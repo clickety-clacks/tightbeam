@@ -2241,4 +2241,78 @@ defmodule Tightbeam.Wire.RouterTest do
       kind: Keyword.get(extra, :kind, "custom")
     })
   end
+
+  # Durable process custody's owner verbs, driven through /agent/dispatch
+  # against the REAL Gateway handler table (spec art_6817803a rev6 §B4).
+  #
+  # This is the shape 3fd9c97 exists to enforce. Those three operator verbs had
+  # a working implementation, a CLI that sent them, and unit tests that called
+  # the implementation directly — and no @agent_verbs entry and no handler row,
+  # so the seam shipped DEAD and the green suite said nothing. A verb needs both
+  # halves, and only a test that crosses the router proves it has them.
+  test "the process custody verbs cross the router into the real handler table", ctx do
+    caller = create_session(ctx.db, "custody-caller", "flynn")
+    Roles.create!(ctx.db, "custody-caller", "flynn", caller.session_key)
+
+    handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir, wake_tick_ms: 1_000})
+    ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, handlers)}
+
+    # Every verb must be BOTH allowlisted and handled. A missing allowlist entry
+    # answers "verb not allowed"; a missing handler row answers "unknown_verb".
+    # Asserting neither string appears is what makes this catch both halves.
+    for verb <- ~w(processes process-get process-extend process-stop process-reconcile) do
+      params = if verb == "processes", do: %{}, else: %{processId: "mp_absent"}
+
+      response =
+        dispatch_cli(ctx, caller.cli_token, %{verb: verb, params: params})
+
+      body = JSON.decode!(response.resp_body)
+      rendered = response.resp_body
+
+      refute rendered =~ "verb not allowed",
+             "#{verb} is missing from the router @agent_verbs allowlist"
+
+      refute rendered =~ "unknown_verb",
+             "#{verb} is missing from the Gateway handler table"
+
+      assert response.status in [200, 404],
+             "#{verb} answered #{response.status}: #{rendered}"
+
+      refute is_nil(body), "#{verb} returned no body"
+    end
+  end
+
+  test "process-get reports an unknown process id rather than inventing one", ctx do
+    caller = create_session(ctx.db, "custody-reader", "flynn")
+    Roles.create!(ctx.db, "custody-reader", "flynn", caller.session_key)
+
+    handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir, wake_tick_ms: 1_000})
+    ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, handlers)}
+
+    response =
+      dispatch_cli(ctx, caller.cli_token, %{
+        verb: "process-get",
+        params: %{processId: "mp_nope"}
+      })
+
+    assert response.status == 404
+    assert JSON.decode!(response.resp_body)["error"]["code"] == "not_found"
+  end
+
+  # §B4: the maintenance line ships NO generic raw-command process start.
+  # Acceptance case 18. Asserted at the allowlist, because that is the gate a
+  # future contributor would have to open deliberately.
+  test "no generic process-start verb exists on this line", _ctx do
+    agent_verbs =
+      Router.__info__(:attributes)
+      |> Keyword.fetch!(:agent_verbs)
+      |> List.flatten()
+
+    refute "process-start" in agent_verbs,
+           "the maintenance line must not expose a generic raw-command process start"
+
+    for verb <- ~w(processes process-get process-extend process-stop process-reconcile) do
+      assert verb in agent_verbs, "#{verb} must be allowlisted"
+    end
+  end
 end
