@@ -100,6 +100,33 @@ one.
 
 Login status and file presence are not liveness.
 
+### Check subscription rotation recovery before a release
+
+Run these checks when model-catalog or credential-home code changes. They use
+fixture credentials and never contact a provider.
+
+1. Run the public-route end-to-end check:
+
+   ~~~sh
+   MIX_ENV=test mix test test/model_catalog_rotation_e2e_test.exs
+   ~~~
+
+   PASS: the first catalog request uses the stale store token and gets a 401.
+   Tightbeam harvests the rotated local-home token, retries once, returns a
+   routable model, and writes the rotated bytes back to the store.
+
+2. Run the feature matrix:
+
+   ~~~sh
+   MIX_ENV=test mix test test/model_catalog_test.exs
+   ~~~
+
+   PASS: a local subscription 401 repairs and retries. An API-key 401 does not
+   harvest. A remote-host subscription 401 does not harvest the gateway store.
+
+3. Record both command exits and test counts. A skipped negative row is not a
+   pass. Do not use a real credential to satisfy either check.
+
 ## What a credential looks like on disk
 
 Credentials are store rows, not loose files. Each provider needs all three:
