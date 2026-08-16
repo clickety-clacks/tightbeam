@@ -115,6 +115,40 @@ defmodule Tightbeam.SchemaShapeTest do
     assert operator_index =~ ~r/WHERE\s+kind\s*=\s*'operator'\s+AND\s+status\s*=\s*'open'/
   end
 
+  # Managed-process custody adds a table and changes NO existing one, so it must
+  # NOT move the stamp. Bumping the stamp for an additive table would refuse
+  # every database already in the field — including a live install — to gain a
+  # table that `CREATE TABLE IF NOT EXISTS` would have created on the next boot
+  # anyway. The stamp exists for shapes this build cannot READ, per its own
+  # comment; a table that did not exist yesterday is not one of those.
+  #
+  # This test is the guard, because the obvious mistake is self-concealing: bump
+  # `@shape` in `schema.ex`, bump the literal in this file to match, and every
+  # assertion stays green while the build has quietly become unreadable to the
+  # field. Asserting the stamp is UNMOVED against a database stamped before the
+  # table existed is what catches it.
+  test "managed-process custody is additive and does not move the schema stamp", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+    assert {:ok, [[stamped]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+
+    # Simulate a database written before this table existed: same stamp, no table.
+    :ok = DB.execute(db, "DROP TABLE managed_processes")
+    refute table?(db, "managed_processes")
+
+    # It boots without refusal and gains the table.
+    assert :ok = Schema.ensure_all(db)
+    assert table?(db, "managed_processes")
+
+    assert {:ok, [[^stamped]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert table_columns(db, "managed_processes") ==
+             ~w(processId ownerUserId ownerSessionKey sessionGeneration launchTurnSeq host
+                purpose commandDescriptor osPid processGroupId bootIdentity launchToken
+                brokerIdentity launchDeadline leaseExpiresAt cancelRequestedAt releaseGrantedAt
+                stopCause uncertaintyCause stopAttemptCount state lastError deliveryEvidenceId
+                createdAt updatedAt resolvedAt revision)
+  end
+
   test "the shared liveness activation creates one exact additive shape", %{db: db} do
     assert :ok = Schema.ensure_all(db)
 
