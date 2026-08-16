@@ -105,13 +105,11 @@ Login status and file presence are not liveness.
 Run these checks when model-catalog or credential-home code changes. They use
 fixture credentials and never contact a provider.
 
-0. Build the CLI suite prerequisite:
+0. Complete the README's [From source](../README.md#from-source) setup through
+   the release CLI build.
 
-   ~~~sh
-   cargo build --release --manifest-path cli/Cargo.toml
-   ~~~
-
-   PASS: the command exits zero.
+   PASS: every prerequisite command exits zero, including `mix deps.get` and
+   `cargo build --release --manifest-path cli/Cargo.toml`.
 
 1. Run the public-route end-to-end check:
 
@@ -132,8 +130,9 @@ fixture credentials and never contact a provider.
    PASS: a local subscription 401 repairs and retries. An API-key 401 does not
    harvest. A remote-host subscription 401 does not harvest the gateway store.
 
-3. Record both command exits and test counts. A skipped negative row is not a
-   pass. Do not use a real credential to satisfy either check.
+3. Record every prerequisite and test command exit, plus both test counts. A
+   skipped negative row is not a pass. Do not use a real credential to satisfy
+   either check.
 
 ## What a credential looks like on disk
 

@@ -309,8 +309,11 @@ defmodule Tightbeam.Homes do
   @doc """
   Harvest a runtime-rotated regular credential into the backing store.
 
-  This is a stopped-runtime lifecycle operation. It never discovers or
-  imports credentials from a user's personal harness installation.
+  This runs during stopped-runtime lifecycle reconciliation and during a live
+  local model-catalog recovery after a subscription 401. The live call is
+  bounded to managed homes under `base_dir`, and harvested store writes are
+  atomic. It never discovers or imports credentials from a user's personal
+  harness installation.
   """
   @spec sweep_auth(String.t(), harness()) :: :ok
   def sweep_auth(base_dir, harness) do
