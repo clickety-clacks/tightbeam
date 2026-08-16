@@ -992,6 +992,7 @@ pub fn build_process_bind_request(
     os_pid: i64,
     process_group_id: i64,
     boot_identity: &str,
+    broker_identity: &str,
 ) -> RequestSpec {
     request(
         identity,
@@ -1003,6 +1004,10 @@ pub fn build_process_bind_request(
             format!("\"osPid\":{os_pid}"),
             format!("\"processGroupId\":{process_group_id}"),
             string_field("bootIdentity", boot_identity),
+            // The locator of the artifact this broker just wrote. The row stores where the
+            // proof lives, never the proof itself: a launch token in the database would be
+            // readable by anything that can read a row (owner ruling att_9b99f366).
+            string_field("brokerIdentity", broker_identity),
         ],
     )
 }
@@ -1385,14 +1390,21 @@ pub fn run(command: Command) -> Result<(), String> {
         },
         send_to_with_deadline,
         crate::harnesses::load_optional_from,
+        &crate::base_dir::resolve().join("process-custody"),
     )
 }
 
+/// `custody_dir` is passed rather than resolved in here, and that is deliberate. It is
+/// where the broker writes the identity artifact that later authorises a stop, so a test
+/// that could reach the operator's real base dir would write into a live install -- which
+/// is exactly what happened the first time this landed. Requiring the caller to name the
+/// directory makes that unrepresentable rather than merely discouraged.
 fn run_with<D, S, H>(
     command: Command,
     discover_endpoint: D,
     send_request: S,
     load_harnesses: H,
+    custody_dir: &Path,
 ) -> Result<(), String>
 where
     D: FnOnce() -> Result<Endpoint, String>,
@@ -1472,6 +1484,7 @@ where
                 &endpoint,
                 send_request,
                 load_harnesses,
+                custody_dir,
             )
         }
         command => {
@@ -3001,6 +3014,7 @@ mod tests {
                 Ok(None)
             },
             |_, _| panic!("harness loader must not be called"),
+            Path::new("/nonexistent/this-test-never-binds"),
         )
         .unwrap();
 
@@ -3017,6 +3031,7 @@ mod tests {
             || Ok(endpoint),
             |_, _, _| panic!("network sender must not be called"),
             |_, _| panic!("harness loader must not be called"),
+            Path::new("/nonexistent/this-test-never-binds"),
         )
         .unwrap_err();
 
@@ -3124,6 +3139,11 @@ mod tests {
                     }],
                 }))
             },
+            &std::env::temp_dir().join(format!(
+                "tightbeam-custody-dispatch-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            )),
         );
 
         match prior_machine {
@@ -3222,6 +3242,11 @@ mod tests {
                     }],
                 }))
             },
+            &std::env::temp_dir().join(format!(
+                "tightbeam-custody-dispatch-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            )),
         );
 
         match prior_machine {

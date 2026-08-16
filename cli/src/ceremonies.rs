@@ -5,7 +5,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -80,6 +80,9 @@ struct Ceremony<'a> {
     // previously threaded neither down, which is why the barrier had no caller.
     identity: &'a Identity,
     send_request: &'a RequestSender<'a>,
+    /// Where the broker writes its identity artifact. Passed in, never resolved here --
+    /// see `run_with`.
+    custody_dir: &'a Path,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -120,13 +123,19 @@ pub(crate) fn fixture_custody_answer(
     release: bool,
 ) -> Option<Result<Option<serde_json::Value>, String>> {
     let request: serde_json::Value = serde_json::from_str(body).ok()?;
+    // Unique per test thread. The broker writes its identity artifact with `create_new`,
+    // so a shared id would make the SECOND test to run fail on a collision -- and would
+    // hide that collision behind a fixture, which is how the purpose defect survived.
+    let process_id = format!("mp_fixture_{:?}", std::thread::current().id())
+        .replace(|c: char| !c.is_ascii_alphanumeric() && c != '_', "");
+
     match request.get("verb").and_then(serde_json::Value::as_str)? {
         "process-open" => Some(Ok(Some(serde_json::json!({
-            "process": {"processId": "mp_fixture", "state": "preparing"},
+            "process": {"processId": process_id, "state": "preparing"},
             "launchToken": "lt_fixture"
         })))),
         "process-bind" => Some(Ok(Some(serde_json::json!({
-            "process": {"processId": "mp_fixture", "state": "running"},
+            "process": {"processId": process_id, "state": "running"},
             "release": release,
             "releaseRevision": 2
         })))),
@@ -141,6 +150,7 @@ pub fn onboard<S, H>(
     endpoint: &Endpoint,
     send_request: S,
     load_harnesses: H,
+    custody_dir: &Path,
 ) -> Result<(), String>
 where
     S: Fn(&Endpoint, &RequestSpec, Option<Instant>) -> Result<Option<serde_json::Value>, String>,
@@ -171,6 +181,7 @@ where
         endpoint,
         deadline,
         load_harnesses: &load_harnesses,
+        custody_dir,
         identity,
         send_request: &send_request,
     };
@@ -506,6 +517,49 @@ struct Custody<'a> {
     /// it is the substrate saying this launch must not run, and the only correct
     /// response is to leave the barrier shut.
     bind: &'a dyn Fn(libc::pid_t, libc::pid_t) -> Result<bool, String>,
+}
+
+/// Write the broker's identity artifact and return its locator (owner ruling att_9b99f366).
+///
+/// This file is what later lets a stop or reconcile helper PROVE the process it is about
+/// to signal is the one this row describes. pid, process group and argv can all be true of
+/// a process that merely inherited a recycled number after this one died; only an artifact
+/// this broker wrote, carrying the launch token that never leaves the broker, ties the
+/// number to the launch. The helper matches every field, so a partial match is a refusal
+/// rather than a near-enough.
+///
+/// Mode 0600 and `create_new`: it carries the launch token, so it is readable only by the
+/// owner, and a path that already exists is a collision to refuse rather than overwrite --
+/// overwriting would let a stale or planted artifact vouch for a live process.
+fn write_broker_identity(
+    directory: &Path,
+    process_id: &str,
+    launch_token: &str,
+    pid: libc::pid_t,
+    pgid: libc::pid_t,
+    boot_identity: &str,
+) -> Result<String, String> {
+    fs::create_dir_all(directory)
+        .map_err(|error| format!("custody identity directory unavailable: {error}"))?;
+
+    let path = directory.join(format!("{process_id}.identity"));
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|error| format!("custody identity could not be written: {error}"))?;
+
+    // Same tab-separated shape harness_process uses for the identity it writes, so the two
+    // artifacts read alike; the process id and launch token are the fields this one adds.
+    write!(
+        file,
+        "{process_id}\t{pid}\t{pgid}\t{boot_identity}\t{launch_token}"
+    )
+    .and_then(|()| file.sync_all())
+    .map_err(|error| format!("custody identity could not be written: {error}"))?;
+
+    Ok(path.to_string_lossy().into_owned())
 }
 
 impl Custody<'_> {
@@ -1113,6 +1167,20 @@ fn bind_custody(
     pgid: libc::pid_t,
 ) -> Result<bool, String> {
     let boot_identity = crate::harness_process::boot_identity()?;
+
+    // Written BEFORE the bind, so the locator the row stores always names an artifact that
+    // already exists. Binding first would leave a window in which the row points at a file
+    // nothing has created, and a stop arriving in that window could find no proof and be
+    // unable to tell "not ours" from "not written yet".
+    let broker_identity = write_broker_identity(
+        ceremony.custody_dir,
+        process_id,
+        launch_token,
+        pid,
+        pgid,
+        &boot_identity,
+    )?;
+
     let request = dispatch::build_process_bind_request(
         ceremony.identity,
         process_id,
@@ -1120,6 +1188,7 @@ fn bind_custody(
         pid as i64,
         pgid as i64,
         &boot_identity,
+        &broker_identity,
     );
     let bound = (ceremony.send_request)(ceremony.endpoint, &request, None)?
         .ok_or_else(|| "process-bind returned no answer".to_owned())?;
@@ -2248,6 +2317,7 @@ mod tests {
             // These cases do not reach the custody seam; a sender that refuses
             // is louder than one that silently succeeds if one ever does.
             send_request: &|_, _, _| Err("no gateway in this test".to_owned()),
+            custody_dir: Path::new("/nonexistent/this-test-never-binds"),
         };
 
         assert_eq!(
@@ -2400,6 +2470,7 @@ mod tests {
                     }],
                 }))
             },
+            &root.join("custody"),
         );
 
         match prior_machine {
@@ -2496,6 +2567,7 @@ mod tests {
                     }],
                 }))
             },
+            &root.join("custody"),
         );
 
         match prior_machine {
@@ -2560,6 +2632,7 @@ mod tests {
                     }
                 },
                 |_, _| Ok(None),
+                &PathBuf::from(&staging).join("custody"),
             );
             let error = result.expect_err("TERM must abort codex onboarding");
             assert!(error.contains("interrupted by signal"), "{error}");
@@ -2602,6 +2675,7 @@ mod tests {
             .env(STAGING, &staging)
             .env(CANCEL, &cancel)
             .env("TIGHTBEAM_MACHINE", "signal-fixture-host")
+            .env("TIGHTBEAM_BASE_DIR", root.join("base"))
             .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -2827,6 +2901,7 @@ mod tests {
             load_harnesses: &|_, _| Ok(None),
             identity: &Identity::User("flynn".to_owned()),
             send_request: &|_, _, _| Err("no gateway in this test".to_owned()),
+            custody_dir: Path::new("/nonexistent/this-test-never-binds"),
         };
         let sent = std::cell::RefCell::new(Vec::new());
 
@@ -3934,6 +4009,7 @@ mod tests {
             // These cases do not reach the custody seam; a sender that refuses
             // is louder than one that silently succeeds if one ever does.
             send_request: &|_, _, _| Err("no gateway in this test".to_owned()),
+            custody_dir: Path::new("/nonexistent/this-test-never-binds"),
         };
         assert_eq!(
             harness_cli("nonesuch", &ceremony),

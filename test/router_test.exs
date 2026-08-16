@@ -2324,6 +2324,99 @@ defmodule Tightbeam.Wire.RouterTest do
     assert custody_rows(ctx) == []
   end
 
+  # OWNER RULING att_9b99f366: physical work is bounded to the gateway's own host, and a
+  # row anywhere else is REFUSED rather than settled.
+  #
+  # The refusal is the whole point. This gateway cannot see a process on another machine,
+  # so any answer it gives about one is invented -- and the two inventions available,
+  # "stopped" and "absent", are both terminal. Reporting either would resolve a lease and
+  # release a retirement fence for a ceremony that is, for all anyone here knows, still
+  # running. So the verb refuses, names the repair, and leaves the row exactly as it was.
+  defp bound_remote_row(ctx, owner, process_id) do
+    {:ok, {:ok, row}} =
+      DB.transaction(ctx.db, fn txn ->
+        Tightbeam.ManagedProcesses.insert_preparing(txn, %{
+          process_id: process_id,
+          owner_user_id: "flynn",
+          owner_session_key: owner.session_key,
+          session_generation: 0,
+          launch_turn_seq: nil,
+          # A host that is not in this gateway's host table at all, which is the strongest
+          # form of "not mine to signal".
+          host: "a-machine-far-away",
+          purpose: "onboarding_ceremony",
+          command_descriptor: "codex login",
+          launch_token: "tok_remote",
+          launch_deadline: 10_000,
+          lease_expires_at: 60_000,
+          now: 1_000
+        })
+      end)
+
+    {:ok, _} =
+      DB.transaction(ctx.db, fn txn ->
+        Tightbeam.ManagedProcesses.bind_identity_in_txn(
+          txn,
+          process_id,
+          %{
+            os_pid: 4242,
+            process_group_id: 4242,
+            boot_identity: "boot-elsewhere",
+            launch_token: "tok_remote",
+            broker_identity: "/tmp/nowhere.identity"
+          },
+          now: 2_000
+        )
+      end)
+
+    row
+  end
+
+  test "a bound process on another host is refused, not stopped", ctx do
+    owner = create_session(ctx.db, "custody-remote-stop", "flynn")
+    Roles.create!(ctx.db, "custody-remote-stop", "flynn", owner.session_key)
+    :ok = Tightbeam.ManagedProcesses.ensure_schema(ctx.db)
+    bound_remote_row(ctx, owner, "mp_remote_stop")
+    ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, custody_handlers(ctx))}
+
+    before = Tightbeam.ManagedProcesses.get(ctx.db, "mp_remote_stop")
+
+    response =
+      dispatch_cli(ctx, owner.cli_token, %{
+        verb: "process-stop",
+        params: %{processId: "mp_remote_stop"}
+      })
+
+    error = JSON.decode!(response.resp_body)["error"]
+    assert error["code"] == "remote_process_probe_unsupported"
+    assert error["message"] =~ "process-stop"
+
+    # Untouched: no stop recorded, no state moved. A refusal that had already written
+    # stop_requested would leave a stop in flight that nothing will ever deliver.
+    assert Tightbeam.ManagedProcesses.get(ctx.db, "mp_remote_stop") == before
+  end
+
+  test "a bound process on another host is refused, never reported absent", ctx do
+    owner = create_session(ctx.db, "custody-remote-rec", "flynn")
+    Roles.create!(ctx.db, "custody-remote-rec", "flynn", owner.session_key)
+    :ok = Tightbeam.ManagedProcesses.ensure_schema(ctx.db)
+    bound_remote_row(ctx, owner, "mp_remote_rec")
+    ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, custody_handlers(ctx))}
+
+    before = Tightbeam.ManagedProcesses.get(ctx.db, "mp_remote_rec")
+
+    response =
+      dispatch_cli(ctx, owner.cli_token, %{
+        verb: "process-reconcile",
+        params: %{processId: "mp_remote_rec"}
+      })
+
+    error = JSON.decode!(response.resp_body)["error"]
+    assert error["code"] == "remote_process_probe_unsupported"
+    assert error["message"] =~ "a-machine-far-away"
+    assert Tightbeam.ManagedProcesses.get(ctx.db, "mp_remote_rec") == before
+  end
+
   # §B4 acceptance 18, asserted at the handshake itself: there is no command
   # parameter to supply. The descriptor is derived from a closed purpose set, so
   # a generic raw-command launcher has no argument to grow from.

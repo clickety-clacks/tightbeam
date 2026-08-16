@@ -687,6 +687,15 @@ defmodule Tightbeam.HarnessProcess do
     end
   end
 
+  @doc false
+  # Public for durable process custody's physical helper (owner ruling att_9b99f366),
+  # which needs exactly this: a bounded, PATH-resolving, stderr-merging spawn that cannot
+  # outlive its deadline. Reused rather than reimplemented -- a second copy would drift on
+  # the resolve rule this one already had to learn, and a custody probe that silently never
+  # ran is worse than one that fails.
+  def bounded_command_for_custody(executable, args, timeout_ms),
+    do: bounded_command(executable, args, timeout_ms)
+
   defp bounded_command(executable, args, timeout_ms) do
     # `:spawn_executable` NEVER searches PATH -- it wants a real path and raises
     # `:enoent` for a bare name. Callers pass "ssh", so every remote identity read and
