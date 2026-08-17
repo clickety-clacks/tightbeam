@@ -730,7 +730,7 @@ defmodule Tightbeam.CredentialsTest do
       refute File.exists?(staging)
     end
 
-    test "a start failure removes a new credential and all success effects", ctx do
+    test "a start failure KEEPS the new credential and refuses visibly", ctx do
       owner = self()
 
       {:ok, server} =
@@ -750,16 +750,51 @@ defmodule Tightbeam.CredentialsTest do
       assert {:error, :runtime_start_failed} =
                Credentials.finish_onboard(:openai, :subscription, lease_id, server)
 
-      refute File.exists?(Path.join([ctx.base, "auth", "codex", "auth.json"]))
-      refute File.exists?(Path.join([ctx.base, "auth", "codex", ".tightbeam", "credential.json"]))
+      # The operator's credential stays where they put it: the substrate holds no
+      # opinion about a vendor login, and reverting one silently resumes spend on
+      # an account the operator believes is disconnected (Mike, 2026-08-14).
+      assert File.read!(Path.join([ctx.base, "auth", "codex", "auth.json"])) ==
+               ~S({"token":"candidate"})
+
+      # ...and the org reads FAILED, matching what the operator just watched fail.
+      assert {:needs_onboarding, {:present_but_unverified, cause}} =
+               Credentials.status(:openai, server)
+
+      assert cause["finish"] =~ "runtime_start_failed"
+
       refute File.exists?(staging)
-      assert Credentials.status(:openai, server) == {:needs_onboarding, :missing}
       refute_receive :forbidden_credential_present
       refute_receive :forbidden_resume
       refute_receive :forbidden_publish
     end
 
-    test "raised and exited start failures roll back and clean the lease without killing the owner",
+    test "the refusal survives a restart — a failed login never looks healthy again",
+         ctx do
+      {:ok, server} =
+        Credentials.start_link(
+          name: nil,
+          base_dir: ctx.base,
+          machine: "eezo",
+          start: fn :openai, :subscription -> {:error, :runtime_start_failed} end
+        )
+
+      assert {:ok, staging, lease_id} = Credentials.begin_onboard(:openai, server)
+      File.write!(Path.join(staging, "auth.json"), ~S({"token":"candidate"}))
+
+      assert {:error, :runtime_start_failed} =
+               Credentials.finish_onboard(:openai, :subscription, lease_id, server)
+
+      # A fresh server reads only durable state: the marker, not the memory.
+      {:ok, restarted} =
+        Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
+
+      assert {:needs_onboarding, {:present_but_unverified, cause}} =
+               Credentials.status(:openai, restarted)
+
+      assert cause["finish"] =~ "runtime_start_failed"
+    end
+
+    test "raised and exited start failures refuse and clean the lease without killing the owner",
          ctx do
       owner = self()
 
@@ -791,10 +826,18 @@ defmodule Tightbeam.CredentialsTest do
                  Credentials.finish_onboard(:openai, :subscription, lease_id, server)
 
         assert Process.alive?(server)
-        refute File.exists?(Path.join([base, "auth", "codex", "auth.json"]))
-        refute File.exists?(Path.join([base, "auth", "codex", ".tightbeam", "credential.json"]))
+
+        # Crashing and exiting starts refuse like any other start failure: the
+        # operator's credential stays, the org reads failed.
+        assert File.read!(Path.join([base, "auth", "codex", "auth.json"])) ==
+                 ~S({"token":"candidate"})
+
         refute File.exists?(staging)
-        assert Credentials.status(:openai, server) == {:needs_onboarding, :missing}
+
+        assert {:needs_onboarding, {:present_but_unverified, cause}} =
+                 Credentials.status(:openai, server)
+
+        assert cause["finish"] =~ "credential_start_failed"
       end)
 
       refute_receive :forbidden_credential_present
@@ -802,7 +845,15 @@ defmodule Tightbeam.CredentialsTest do
       refute_receive :forbidden_publish
     end
 
-    test "a start failure restores exact prior credential and metadata bytes", ctx do
+    # THE INCIDENT TEST (2026-08-14). The prior contract restored the previous
+    # credential when activation failed, which meant an operator who watched a
+    # login fail — and may have chosen to stay logged out, "I was running out of
+    # tokens anyway" — silently kept spending on the account they believed was
+    # disconnected. It also deadlocked recovery: activation cannot succeed while
+    # the adapter circuit is latched, and the latch is guaranteed exactly when
+    # the old credential has stopped working. A swap fails when you need it.
+    test "a start failure DISPLACES the prior credential — no silent revival of old spend",
+         ctx do
       owner = self()
       credential = Path.join([ctx.base, "auth", "codex", "auth.json"])
       metadata = Path.join([ctx.base, "auth", "codex", ".tightbeam", "credential.json"])
@@ -827,14 +878,35 @@ defmodule Tightbeam.CredentialsTest do
       assert {:error, :runtime_start_failed} =
                Credentials.finish_onboard(:openai, :subscription, lease_id, server)
 
-      assert File.read!(credential) == prior_credential
-      assert File.read!(metadata) == prior_metadata
+      # The prior credential is GONE — it cannot be revived to spend behind the
+      # operator's back.
+      assert File.read!(credential) == ~S({"token":"candidate"})
+      refute File.read!(credential) == prior_credential
+
+      # The prior metadata claimed `onboarded: true`. Leaving that would report a
+      # healthy org describing a credential the operator thinks they replaced.
+      refute File.read!(metadata) == prior_metadata
+
+      assert {:needs_onboarding, {:present_but_unverified, cause}} =
+               Credentials.status(:openai, server)
+
+      assert cause["finish"] =~ "runtime_start_failed"
+
       refute File.exists?(staging)
       refute_receive :forbidden_credential_present
     end
 
-    test "a satellite metadata failure rolls back without transporting credential bytes", ctx do
+    test "a satellite metadata failure refuses without transporting credential bytes", ctx do
       owner = self()
+
+      # Seed a PRIOR onboarded credential, so the stale-health scenario Sol
+      # named has something stale to leave behind if the ordering regresses.
+      prior_credential = "prior-satellite-secret"
+      credential_path = Path.join([ctx.base, "auth", "codex", "auth.json"])
+      metadata_path = Path.join([ctx.base, "auth", "codex", ".tightbeam", "credential.json"])
+      File.mkdir_p!(Path.dirname(metadata_path))
+      File.write!(credential_path, prior_credential)
+      File.write!(metadata_path, ~S({"provider":"openai","onboarded":true,"kind":"subscription"}))
 
       sh = fn command ->
         send(owner, {:remote_finish_command, command})
@@ -860,36 +932,104 @@ defmodule Tightbeam.CredentialsTest do
       assert {:ok, staging, lease_id} = Credentials.begin_onboard(:openai, server)
       File.write!(Path.join(staging, "auth.json"), "satellite-candidate-secret")
 
+      # The marker commits BEFORE the credential is installed, so an unwritable
+      # metadata path refuses with the store still untouched.
       assert {:error, {:credential_metadata_write_failed, message}} =
                Credentials.finish_onboard(:openai, :subscription, lease_id, server)
 
-      assert message =~ "metadata refused"
-      refute File.exists?(Path.join([ctx.base, "auth", "codex", "auth.json"]))
-      refute File.exists?(Path.join([ctx.base, "auth", "codex", ".tightbeam", "credential.json"]))
+      assert inspect(message) =~ "metadata refused"
       refute File.exists?(staging)
       refute_receive :forbidden_credential_present
 
+      # Nothing was installed, so the prior state stays coherent: the prior
+      # credential and its prior metadata still describe each other. The stale
+      # `onboarded: true` can never come to describe a candidate that was never
+      # activated (Sol xhigh blocking 1).
+      assert File.read!(Path.join([ctx.base, "auth", "codex", "auth.json"])) == prior_credential
+
+      # And a restarted gateway reads the same thing from disk, not from memory.
+      {:ok, restarted} =
+        Credentials.start_link(
+          name: nil,
+          base_dir: ctx.base,
+          machine: "worker",
+          ssh: "worker",
+          sh: &run_remote_command/1
+        )
+
+      assert File.read!(Path.join([ctx.base, "auth", "codex", "auth.json"])) == prior_credential
+
+      # `:onboarded` is the CORRECT reading here, and the point of the ordering:
+      # the refusal happened before anything was installed, so the prior
+      # credential and its prior metadata still describe each other. A failed
+      # onboarding is a clean no-op — nothing was silently restored, because
+      # nothing was ever removed. The stale-health defect would show up as this
+      # metadata describing a DIFFERENT credential; assert it does not.
+      assert Credentials.status(:openai, restarted) == :onboarded
+
+      # The property this test exists for, unchanged: credential bytes never
+      # cross the ssh edge as command text.
       commands = collect_remote_finish_commands([])
       refute Enum.any?(commands, &(Enum.join(&1, " ") =~ "satellite-candidate-secret"))
     end
 
-    test "a rollback failure persists a present-but-unverified cause and compounds refusal",
+    test "a satellite start failure persists a present-but-unverified cause and keeps the candidate",
          ctx do
       owner = self()
-      {:ok, rollback} = Agent.start_link(fn -> :waiting end)
+
+      {:ok, server} =
+        Credentials.start_link(
+          name: nil,
+          base_dir: ctx.base,
+          machine: "worker",
+          ssh: "worker",
+          sh: &run_remote_command/1,
+          start: fn :openai, :subscription -> {:error, :runtime_start_failed} end,
+          on_credential_present: fn _ -> send(owner, :forbidden_credential_present) end,
+          resume: fn _ -> send(owner, :forbidden_resume) end,
+          publish_sessions: fn _, _ -> send(owner, :forbidden_publish) end
+        )
+
+      assert {:ok, staging, lease_id} = Credentials.begin_onboard(:openai, server)
+      File.write!(Path.join(staging, "auth.json"), "candidate-remains-present")
+
+      assert {:error, :runtime_start_failed} =
+               Credentials.finish_onboard(:openai, :subscription, lease_id, server)
+
+      assert File.read!(Path.join([ctx.base, "auth", "codex", "auth.json"])) ==
+               "candidate-remains-present"
+
+      metadata = credential_metadata(ctx.base, "codex")
+      assert metadata["onboarded"] == false
+      assert metadata["last_health"] == "present_but_unverified"
+      assert metadata["present_but_unverified"]["finish"] =~ "runtime_start_failed"
+
+      assert {:needs_onboarding, {:present_but_unverified, cause}} =
+               Credentials.status(:openai, server)
+
+      assert cause == metadata["present_but_unverified"]
+      refute File.exists?(staging)
+      refute_receive :forbidden_credential_present
+      refute_receive :forbidden_resume
+      refute_receive :forbidden_publish
+    end
+
+    # The FAILURE marker write can itself fail. Status must still fail closed —
+    # falling back to the durable pre-activation marker ("has not committed")
+    # that `prepare_staged_activation` wrote before the start was attempted.
+    test "a failure-marker write failure still makes status fail closed", ctx do
+      owner = self()
+      credential = Path.join([ctx.base, "auth", "codex", "auth.json"])
+      metadata = Path.join([ctx.base, "auth", "codex", ".tightbeam", "credential.json"])
+      File.mkdir_p!(Path.dirname(metadata))
+      File.write!(credential, ~S({"token":"prior"}))
+      File.write!(metadata, ~S({"provider":"openai","onboarded":true,"kind":"api_key"}))
 
       sh = fn command ->
         text = Enum.join(command, " ")
 
-        fail_restore? =
-          text =~ "rm -f --" and
-            Agent.get_and_update(rollback, fn
-              :armed -> {true, :failed}
-              state -> {false, state}
-            end)
-
-        if fail_restore? do
-          {"rollback refused", 1}
+        if text =~ "present_but_unverified" and text =~ "runtime_start_failed" do
+          {"marker refused", 1}
         else
           run_remote_command(command)
         end
@@ -902,90 +1042,7 @@ defmodule Tightbeam.CredentialsTest do
           machine: "worker",
           ssh: "worker",
           sh: sh,
-          start: fn :openai, :subscription ->
-            Agent.update(rollback, fn :waiting -> :armed end)
-            {:error, :runtime_start_failed}
-          end,
-          on_credential_present: fn _ -> send(owner, :forbidden_credential_present) end,
-          resume: fn _ -> send(owner, :forbidden_resume) end,
-          publish_sessions: fn _, _ -> send(owner, :forbidden_publish) end
-        )
-
-      assert {:ok, staging, lease_id} = Credentials.begin_onboard(:openai, server)
-      File.write!(Path.join(staging, "auth.json"), "candidate-remains-present")
-
-      assert {:error,
-              {:onboarding_failed_and_rollback_failed,
-               %{
-                 finish: {:error, :runtime_start_failed},
-                 rollback: {:credential_restore_failed, 1, "rollback refused"},
-                 marker: :ok
-               }}} = Credentials.finish_onboard(:openai, :subscription, lease_id, server)
-
-      assert File.read!(Path.join([ctx.base, "auth", "codex", "auth.json"])) ==
-               "candidate-remains-present"
-
-      metadata = credential_metadata(ctx.base, "codex")
-      assert metadata["onboarded"] == false
-      assert metadata["last_health"] == "present_but_unverified"
-      assert metadata["present_but_unverified"]["finish"] =~ "runtime_start_failed"
-      assert metadata["present_but_unverified"]["rollback"] =~ "rollback refused"
-
-      assert {:needs_onboarding, {:present_but_unverified, cause}} =
-               Credentials.status(:openai, server)
-
-      assert cause == metadata["present_but_unverified"]
-      refute File.exists?(staging)
-      refute_receive :forbidden_credential_present
-      refute_receive :forbidden_resume
-      refute_receive :forbidden_publish
-    end
-
-    test "a rollback marker write failure still makes status fail closed", ctx do
-      owner = self()
-      credential = Path.join([ctx.base, "auth", "codex", "auth.json"])
-      metadata = Path.join([ctx.base, "auth", "codex", ".tightbeam", "credential.json"])
-      File.mkdir_p!(Path.dirname(metadata))
-      File.write!(credential, ~S({"token":"prior"}))
-      File.write!(metadata, ~S({"provider":"openai","onboarded":true,"kind":"api_key"}))
-      {:ok, failures} = Agent.start_link(fn -> :waiting end)
-
-      sh = fn command ->
-        text = Enum.join(command, " ")
-
-        decision =
-          Agent.get_and_update(failures, fn stage ->
-            cond do
-              stage == :armed and text =~ ".tightbeam-rollback/credential" and
-                  text =~ "mv " ->
-                {:restore, :restore_failed}
-
-              text =~ "present_but_unverified" and text =~ "runtime_start_failed" ->
-                {:marker, stage}
-
-              true ->
-                {:run, stage}
-            end
-          end)
-
-        case decision do
-          :restore -> {"rollback refused", 1}
-          :marker -> {"marker refused", 1}
-          :run -> run_remote_command(command)
-        end
-      end
-
-      {:ok, server} =
-        Credentials.start_link(
-          name: nil,
-          base_dir: ctx.base,
-          machine: "worker",
-          ssh: "worker",
-          sh: sh,
-          start: fn :openai, :subscription ->
-            Agent.update(failures, fn :waiting -> :armed end)
-            {:error, :runtime_start_failed}
-          end,
+          start: fn :openai, :subscription -> {:error, :runtime_start_failed} end,
           on_credential_present: fn _ -> send(owner, :forbidden_credential_present) end,
           resume: fn _ -> send(owner, :forbidden_resume) end,
           publish_sessions: fn _, _ -> send(owner, :forbidden_publish) end
@@ -995,11 +1052,10 @@ defmodule Tightbeam.CredentialsTest do
       File.write!(Path.join(staging, "auth.json"), ~S({"token":"candidate"}))
 
       assert {:error,
-              {:onboarding_failed_and_rollback_failed,
+              {:onboarding_failed_and_marker_failed,
                %{
                  finish: {:error, :runtime_start_failed},
-                 rollback: {:credential_restore_failed, 1, "rollback refused"},
-                 marker: {:error, {:credential_metadata_write_failed, message}}
+                 marker: {:credential_metadata_write_failed, message}
                }}} = Credentials.finish_onboard(:openai, :subscription, lease_id, server)
 
       assert message =~ "marker refused"
@@ -1013,7 +1069,6 @@ defmodule Tightbeam.CredentialsTest do
                Credentials.status(:openai, server)
 
       assert cause["finish"] =~ "runtime_start_failed"
-      assert cause["rollback"] =~ "rollback refused"
       assert Process.alive?(server)
       refute File.exists?(staging)
 
@@ -1028,10 +1083,15 @@ defmodule Tightbeam.CredentialsTest do
           sh: sh
         )
 
+      # DURABILITY, read from disk by a process that never saw the failure: the
+      # detailed cause was refused, so what survives is the pre-activation
+      # marker's generic text. Less specific than the vendor's own words, and
+      # still fails closed — which is the property that matters.
       assert {:needs_onboarding, {:present_but_unverified, restarted_cause}} =
                Credentials.status(:openai, restarted)
 
       assert restarted_cause == durable_marker["present_but_unverified"]
+      assert restarted_cause["finish"] =~ "credential activation has not committed"
       refute_receive :forbidden_credential_present
       refute_receive :forbidden_resume
       refute_receive :forbidden_publish

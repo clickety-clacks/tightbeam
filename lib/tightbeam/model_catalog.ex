@@ -504,7 +504,11 @@ defmodule Tightbeam.ModelCatalog do
       with :onboarded <- credential_status(state, provider, host),
            kind when kind in [:api_key, :subscription] <-
              credential_kind(state, provider, host) do
-        module.fetch_catalog(Map.put(probe, :credential_kind, kind))
+        probe = Map.put(probe, :credential_kind, kind)
+
+        probe
+        |> module.fetch_catalog()
+        |> retry_after_rotation_harvest(kind, probe, module)
       else
         {:needs_onboarding, reason} ->
           {:error, {:needs_onboarding, reason}}
@@ -527,6 +531,34 @@ defmodule Tightbeam.ModelCatalog do
       kind, reason -> {:error, {kind, reason}}
     end
   end
+
+  # A subscription bearer 401 on the STORE copy can mean the credential is
+  # genuinely revoked, or it can mean Claude Code rotated it inside the
+  # harness home: the vendor's write-temp-then-rename severs the store's
+  # symlink, the store copy freezes on the pre-rotation token, and the
+  # provider revokes the superseded one (issue #9). `Homes.sweep_auth/2`
+  # already knows how to harvest a severed home's regular file back into the
+  # store and is a no-op when nothing is severed, so trying it here costs
+  # nothing against a truly revoked credential and turns the staleness
+  # window into its own repair trigger — instead of waiting on the next boot
+  # sweep or a session spawn's home reconciliation to close it.
+  #
+  # `sweep_auth/2` reads the LOCAL filesystem only (gateway.ex's boot call
+  # does the same), so this is scoped to a local probe; a remote host's
+  # credential lives on that host and this cannot reach it.
+  defp retry_after_rotation_harvest(
+         {:error, {:http_status, 401, _}} = error,
+         :subscription,
+         %{host_config: %{ssh: nil}} = probe,
+         module
+       ) do
+    Tightbeam.Homes.sweep_auth(probe.base_dir, module.id())
+    module.fetch_catalog(probe)
+  rescue
+    _ -> error
+  end
+
+  defp retry_after_rotation_harvest(result, _kind, _probe, _module), do: result
 
   defp credential_status(%{credential_status: status}, provider, _host)
        when is_function(status, 1),

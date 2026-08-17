@@ -2,9 +2,11 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
   use Tightbeam.TestCase, async: false
 
   @root Path.expand("..", __DIR__)
+  @branch_resolver Path.join(@root, "scripts/highest_0_1_branch.sh")
   @script Path.join(@root, "scripts/release_candidate.sh")
   @verifier Path.join(@root, "scripts/verify_release_candidate_manifest.py")
   @workflow Path.join(@root, ".github/workflows/release-candidate.yml")
+  @ci_workflow Path.join(@root, ".github/workflows/ci.yml")
 
   # Evidence fixture provenance: capture opaque package bytes from the repository's real
   # assembler and toolchain bytes from the same commands used by the workflow. The proof
@@ -108,10 +110,31 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
     assert output =~ "is not descended from protected base"
   end
 
-  test "preparation refuses a protected base after origin/main advances" do
+  test "highest maintenance branch sorts 0.1.10 above 0.1.9 numerically" do
     fixture = git_fixture!()
-    git!(fixture.repo, ["push", "origin", "#{fixture.f1}:refs/heads/main"])
-    git!(fixture.repo, ["fetch", "origin", "main"])
+    git!(fixture.repo, ["push", "origin", "#{fixture.f1}:refs/heads/0.1.10"])
+    git!(fixture.repo, ["fetch", "origin", "+refs/heads/0.1.*:refs/remotes/origin/0.1.*"])
+
+    assert {"refs/remotes/origin/0.1.10\n", 0} =
+             command("sh", [@branch_resolver], cd: fixture.repo)
+  end
+
+  test "highest maintenance branch refuses when no numeric 0.1 branch exists" do
+    fixture = git_fixture!()
+    git!(fixture.repo, ["update-ref", "-d", "refs/remotes/origin/0.1.9"])
+
+    {output, status} = command("sh", [@branch_resolver], cd: fixture.repo)
+
+    assert status != 0
+
+    assert output ==
+             "maintenance branch: no remote-tracking branch matches origin/0.1.<number>.\n"
+  end
+
+  test "preparation refuses a protected base after origin/0.1.9 advances" do
+    fixture = git_fixture!()
+    git!(fixture.repo, ["push", "origin", "#{fixture.f1}:refs/heads/0.1.9"])
+    git!(fixture.repo, ["fetch", "origin", "0.1.9"])
 
     {stale_output, stale_status} =
       command(
@@ -123,7 +146,7 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
     assert stale_status != 0
 
     assert stale_output ==
-             "release candidate: protected base #{fixture.base} is not the fetched origin/main #{fixture.f1}.\n"
+             "release candidate: protected base #{fixture.base} is not the fetched refs/remotes/origin/0.1.9 #{fixture.f1}.\n"
 
     refute git_ref?(fixture.repo, "refs/heads/release-candidate/stale-base")
     refute git_ref?(fixture.remote, "refs/heads/release-candidate/stale-base")
@@ -169,9 +192,19 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
     assert workflow =~ "permissions:\n  contents: read"
     assert workflow =~ ~s(ref: ${{ needs.metadata.outputs.candidate_sha }})
     assert workflow =~ "test \"$(git rev-parse HEAD)\" = \"$CANDIDATE_SHA\""
+    assert workflow =~ ~s(+refs/heads/0.1.*:refs/remotes/origin/0.1.*)
+    assert workflow =~ "protected_ref=$(sh scripts/highest_0_1_branch.sh)"
     assert workflow =~ "platform: linux-x86_64"
     assert workflow =~ "platform: darwin-aarch64"
     assert workflow =~ "sh packaging/assemble.sh"
+
+    ci_workflow = File.read!(@ci_workflow)
+    assert ci_workflow =~ ~s(branches: ["0.1.*"])
+
+    assert ci_workflow =~
+             "if: startsWith(github.ref, 'refs/heads/0.1.') || startsWith(github.ref, 'refs/tags/v')"
+
+    assert ci_workflow =~ "maintenance_ref=$(sh scripts/highest_0_1_branch.sh)"
   end
 
   test "workflow publishes final proof only behind all test and package jobs" do
@@ -336,7 +369,7 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
     remote = Path.join(root, "origin.git")
     File.mkdir_p!(repo)
     on_exit(fn -> File.rm_rf!(root) end)
-    git!(repo, ["init", "-b", "main"])
+    git!(repo, ["init", "-b", "0.1.9"])
     git!(repo, ["config", "user.name", "Release Test"])
     git!(repo, ["config", "user.email", "release@test.invalid"])
     File.write!(Path.join(repo, "content"), "base\n")
@@ -346,7 +379,7 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
     File.mkdir_p!(remote)
     git!(remote, ["init", "--bare"])
     git!(repo, ["remote", "add", "origin", remote])
-    git!(repo, ["push", "-u", "origin", "main"])
+    git!(repo, ["push", "-u", "origin", "0.1.9"])
     File.write!(Path.join(repo, "content"), "feature one\n", [:append])
     git!(repo, ["commit", "-am", "feature one"])
     f1 = git!(repo, ["rev-parse", "HEAD"])

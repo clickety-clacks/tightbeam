@@ -47,19 +47,22 @@ jobs:
           }
           git check-ref-format "refs/heads/$CANDIDATE_BRANCH"
           git fetch --no-tags origin \
-            "+refs/heads/0.1.x:refs/remotes/origin/0.1.x" \
+            "+refs/heads/0.1.*:refs/remotes/origin/0.1.*" \
             "+refs/heads/$CANDIDATE_BRANCH:refs/remotes/origin/$CANDIDATE_BRANCH"
           [ "$(git rev-parse HEAD)" = "$CANDIDATE_SHA" ]
           [ "$(git rev-parse "refs/remotes/origin/$CANDIDATE_BRANCH")" = "$CANDIDATE_SHA" ]
-          base=$(git merge-base refs/remotes/origin/0.1.x "$CANDIDATE_SHA")
+          protected_ref=$(sh scripts/highest_0_1_branch.sh)
+          base=$(git merge-base "$protected_ref" "$CANDIDATE_SHA")
           features=$(git rev-list --reverse --topo-order "$base..$CANDIDATE_SHA")
           [ -n "$features" ] || {
             echo "release candidate: candidate range is empty" >&2
             exit 1
           }
           # Feature values are exact Git-produced SHAs, so word splitting is intentional.
+          # Redirect OUTSIDE the worktree: the shell creates the output file before
+          # the script checks for a dirty worktree (RELEASE_TRAIN.md warns exactly this).
           scripts/release_candidate.sh --check "$CANDIDATE_BRANCH" "$base" $features \
-            > candidate-input.json
+            > "$RUNNER_TEMP/candidate-input.json"
           printf 'branch=%s\n' "$CANDIDATE_BRANCH" >> "$GITHUB_OUTPUT"
           printf 'ref=refs/heads/%s\n' "$CANDIDATE_BRANCH" >> "$GITHUB_OUTPUT"
           printf 'sha=%s\n' "$CANDIDATE_SHA" >> "$GITHUB_OUTPUT"
@@ -68,7 +71,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: candidate-input-${{ env.CANDIDATE_SHA }}
-          path: candidate-input.json
+          path: ${{ runner.temp }}/candidate-input.json
           retention-days: 1
           if-no-files-found: error
 

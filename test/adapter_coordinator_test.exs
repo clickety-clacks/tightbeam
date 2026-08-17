@@ -73,6 +73,58 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     assert failures >= 5
   end
 
+  # THE INCIDENT TEST (2026-08-14). A latched circuit vetoed the credential
+  # lifecycle's own start call, so an operator installing a WORKING credential
+  # was refused by a verdict about the credential they were replacing -- and the
+  # onboarding ceremony read that refusal as "this credential is bad". Recovery
+  # required restarting the gateway to wipe the in-memory latch.
+  #
+  # SCOPE, stated so it is not read for more than it proves (Sol xhigh): this is
+  # a coordinator-level ADMISSION regression. It proves the latched circuit no
+  # longer refuses the authoritative caller, and that ordinary checkouts are
+  # still refused. It does not exercise start_provider_runtime, credential
+  # persistence, or eventual circuit closure -- the adapter command here is
+  # `false` and never boots. The end-to-end proof is a live credential swap on a
+  # real gateway, recorded in the e2e ledger.
+  test "an open circuit does not refuse the credential lifecycle", ctx do
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         backoff_base_ms: 1,
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn _, _ ->
+           [harness: :claude, cmd: [System.find_executable("false")], home: "/tmp", cwd: "/tmp"]
+         end,
+         db: ctx.db,
+         name: :"coord_#{System.unique_integer([:positive])}"}
+      )
+
+    key = {:claude, "default", "testhost"}
+
+    # Drive the key into a latched circuit, exactly as an expired credential does.
+    assert {:ok, _pid, _gen} = AdapterCoordinator.adapter_for(coordinator, key)
+
+    assert wait_until(
+             fn ->
+               match?(
+                 %{"claude:default@testhost" => %{circuit: :open}},
+                 AdapterCoordinator.health(coordinator)
+               )
+             end,
+             1_500
+           )
+
+    # An ordinary checkout is still refused -- the circuit keeps doing its real
+    # job, which this change does not touch.
+    assert {:error, :degraded} = AdapterCoordinator.adapter_for(coordinator, key)
+
+    # The credential lifecycle's call is NOT refused. Before the fix this
+    # returned {:error, :degraded}, which is the entire deadlock.
+    assert {:ok, _pid, _generation} =
+             AdapterCoordinator.adapter_for(coordinator, key, credential_kind: :subscription)
+  end
+
   test "adapter boot context is captured in the coordinator before lazy adapter opts", ctx do
     owner = self()
 

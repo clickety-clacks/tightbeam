@@ -846,29 +846,57 @@ defmodule Tightbeam.Credentials do
     |> Enum.group_by(& &1.credential_provider(), &{&1.id(), "shared", machine})
   end
 
+  # A FAILED ONBOARDING LEAVES THE ORG FAILED — it never restores the previous
+  # credential. Ruled by Mike 2026-08-14 after the credential-swap incident:
+  # "we have no business adding security ON TOP of codex or claude logins."
+  #
+  # The substrate stores what the operator gave it and reports what the vendor
+  # said when it was used. It holds no opinion about whether a vendor login is
+  # valid — the vendor owns that, and the only honest test is a real turn.
+  #
+  # The restore this replaced was worse than a wedge. An operator whose login
+  # fails believes the system is stopped, and may have CHOSEN that ("I was
+  # running out of tokens anyway, I'll leave it logged out"). Silently reviving
+  # the previous credential resumed real spend against an account they believed
+  # was disconnected — a state contradicting the operator's model, which the
+  # substrate must never construct. It also deadlocked recovery: activation
+  # fails while the adapter's circuit is latched open, so every attempt to
+  # install a WORKING credential was reverted, and the latch is guaranteed
+  # precisely when the old credential has stopped working — the only reason
+  # anyone swaps one. Failure correlated with need.
+  #
+  # ACCEPTED COST, explicitly: a bad login can now displace a working
+  # credential. That is recoverable by signing in again, and it is honest.
+  # ORDER IS THE INVARIANT: the durable not-onboarded marker commits BEFORE the
+  # credential is installed (Sol xhigh review, blocking 1 and 2). Installing
+  # first leaves two windows in which the PRIOR credential's `onboarded: true`
+  # metadata outlives it and comes to describe the new, never-activated
+  # candidate — so a restarted gateway reads the org healthy on a credential
+  # nothing ever verified. That is the same lie the rollback told, reached from
+  # the other side.
+  #
+  # Marking first means a metadata failure refuses while the store is still
+  # untouched: prior credential, prior metadata, consistent with each other and
+  # with what the operator was told. And a crash at any point after the mark
+  # leaves the org readably failed, which is the honest reading of an
+  # onboarding that did not finish.
   defp finish_staged_onboard(state, provider, kind, path) do
-    with {:ok, prior} <- snapshot_prior_state(state, provider, path),
+    with :ok <- prepare_staged_activation(state, provider, kind),
          {:ok, credential} <- install_staged!(state, provider, kind, path) do
-      case prepare_staged_activation(state, provider, kind) do
+      case activate_staged_credential(state, provider, kind, credential) do
         :ok ->
-          case activate_staged_credential(state, provider, kind, credential) do
-            :ok ->
-              result =
-                with :ok <- state.on_credential_present.(provider),
-                     captured <- capture_sessions(state, provider),
-                     :ok <- state.resume.(provider) do
-                  publish_sessions(state, captured, :onboarded)
-                  :ok
-                end
+          result =
+            with :ok <- state.on_credential_present.(provider),
+                 captured <- capture_sessions(state, provider),
+                 :ok <- state.resume.(provider) do
+              publish_sessions(state, captured, :onboarded)
+              :ok
+            end
 
-              {result, update_in(state.present_but_unverified, &Map.delete(&1, provider))}
-
-            failure ->
-              rollback_failed_finish(state, provider, kind, prior, failure)
-          end
+          {result, update_in(state.present_but_unverified, &Map.delete(&1, provider))}
 
         failure ->
-          rollback_failed_finish(state, provider, kind, prior, failure)
+          failed_finish(state, provider, kind, failure)
       end
     else
       failure -> {failure, state}
@@ -884,8 +912,7 @@ defmodule Tightbeam.Credentials do
         "terminal" => false,
         "last_health" => "present_but_unverified",
         "present_but_unverified" => %{
-          "finish" => "credential activation has not committed",
-          "rollback" => "prior credential restoration has not completed"
+          "finish" => "credential activation has not committed"
         }
       })
     end)
@@ -910,34 +937,44 @@ defmodule Tightbeam.Credentials do
     metadata_write_for_finish(fn -> mark_onboarded!(state, provider, kind, credential) end)
   end
 
-  defp rollback_failed_finish(state, provider, kind, prior, failure) do
-    case restore_prior_state(state, provider, prior) do
-      :ok ->
-        {failure, state}
+  # Fail CLOSED and VISIBLE: the staged credential stays installed, the org
+  # reads as not-onboarded, and the cause carries the failure verbatim so a
+  # reader learns what the vendor or the runtime actually said. `status/1`
+  # serves `present_but_unverified` from both the in-memory map and the durable
+  # marker, so the refusal survives a gateway restart — a failed login must not
+  # look healthy again just because the process bounced.
+  #
+  # If THIS marker write fails too, the durable cause falls back to the
+  # pre-activation marker's "credential activation has not committed", which
+  # `finish_staged_onboard/4` committed before anything was installed. That is
+  # less specific than the vendor's own words — a known, accepted degradation
+  # (Sol xhigh review, important 1) — but it still fails closed, which is the
+  # property that matters. The verbatim reason reaches the caller in the
+  # returned compound error either way.
+  defp failed_finish(state, provider, kind, failure) do
+    cause = %{"finish" => inspect(failure)}
 
-      {:error, rollback_failure} ->
-        cause = %{
-          "finish" => inspect(failure),
-          "rollback" => inspect(rollback_failure)
-        }
+    marker_result =
+      write_metadata_result(state, provider, %{
+        "provider" => Atom.to_string(provider),
+        "kind" => Atom.to_string(kind),
+        "onboarded" => false,
+        "terminal" => false,
+        "last_health" => "present_but_unverified",
+        "present_but_unverified" => cause
+      })
 
-        marker_result =
-          write_metadata_result(state, provider, %{
-            "provider" => Atom.to_string(provider),
-            "kind" => Atom.to_string(kind),
-            "onboarded" => false,
-            "terminal" => false,
-            "last_health" => "present_but_unverified",
-            "present_but_unverified" => cause
-          })
+    result =
+      case marker_result do
+        :ok ->
+          failure
 
-        result =
+        {:error, marker_failure} ->
           {:error,
-           {:onboarding_failed_and_rollback_failed,
-            %{finish: failure, rollback: rollback_failure, marker: marker_result}}}
+           {:onboarding_failed_and_marker_failed, %{finish: failure, marker: marker_failure}}}
+      end
 
-        {result, put_in(state.present_but_unverified[provider], cause)}
-    end
+    {result, put_in(state.present_but_unverified[provider], cause)}
   end
 
   defp write_metadata_result(state, provider, metadata) do
@@ -952,168 +989,6 @@ defmodule Tightbeam.Credentials do
   catch
     caught_kind, reason ->
       {:error, {:credential_metadata_write_failed, {caught_kind, reason}}}
-  end
-
-  # The snapshot belongs to the active lease and is gone when that lease is cleaned up.
-  # Satellite bytes stay in satellite staging: only presence markers cross the ssh edge.
-  defp snapshot_prior_state(%{ssh: nil} = state, provider, _staging_path) do
-    with {:ok, credential} <- snapshot_local_file(credential_store_path(state, provider)),
-         {:ok, metadata} <- snapshot_local_file(metadata_path(state, provider)),
-         {:ok, store} <- snapshot_local_directory(store_dir(state.base_dir, provider)) do
-      {:ok, %{credential: credential, metadata: metadata, store: store}}
-    end
-  end
-
-  defp snapshot_prior_state(state, provider, staging_path) do
-    backup_dir = Path.join(staging_path, ".tightbeam-rollback")
-
-    with {:ok, credential} <-
-           snapshot_remote_file(
-             state,
-             credential_store_path(state, provider),
-             Path.join(backup_dir, "credential")
-           ),
-         {:ok, metadata} <-
-           snapshot_remote_file(
-             state,
-             metadata_path(state, provider),
-             Path.join(backup_dir, "metadata")
-           ),
-         {:ok, store} <- snapshot_remote_directory(state, store_dir(state.base_dir, provider)) do
-      {:ok, %{credential: credential, metadata: metadata, store: store}}
-    end
-  end
-
-  defp snapshot_local_file(path) do
-    case File.read(path) do
-      {:ok, bytes} -> {:ok, {:present, bytes}}
-      {:error, :enoent} -> {:ok, :absent}
-      {:error, reason} -> {:error, {:credential_snapshot_failed, path, reason}}
-    end
-  end
-
-  defp snapshot_remote_file(state, source, backup) do
-    script =
-      "if test -f #{shell_quote(source)}; then " <>
-        "mkdir -p #{shell_quote(Path.dirname(backup))} && " <>
-        "cp #{shell_quote(source)} #{shell_quote(backup)} && " <>
-        "chmod 600 #{shell_quote(backup)} && printf present; " <>
-        "else printf absent; fi"
-
-    case remote_command(state, ["sh", "-c", shell_quote(script)]) do
-      {"present", 0} -> {:ok, {:present, backup}}
-      {"absent", 0} -> {:ok, :absent}
-      {output, status} -> {:error, {:credential_snapshot_failed, status, String.trim(output)}}
-    end
-  end
-
-  defp snapshot_local_directory(path) do
-    case File.lstat(path) do
-      {:ok, %{type: :directory}} -> {:ok, :present}
-      {:ok, %{type: type}} -> {:error, {:credential_snapshot_failed, path, type}}
-      {:error, :enoent} -> {:ok, :absent}
-      {:error, reason} -> {:error, {:credential_snapshot_failed, path, reason}}
-    end
-  end
-
-  defp snapshot_remote_directory(state, path) do
-    script =
-      "if test -L #{shell_quote(path)}; then exit 2; " <>
-        "elif test -d #{shell_quote(path)}; then printf present; " <>
-        "elif test -e #{shell_quote(path)}; then exit 2; else printf absent; fi"
-
-    case remote_command(state, ["sh", "-c", shell_quote(script)]) do
-      {"present", 0} -> {:ok, :present}
-      {"absent", 0} -> {:ok, :absent}
-      {output, status} -> {:error, {:credential_snapshot_failed, status, String.trim(output)}}
-    end
-  end
-
-  defp restore_prior_state(%{ssh: nil} = state, provider, prior) do
-    with :ok <- restore_local_file(credential_store_path(state, provider), prior.credential),
-         :ok <- restore_local_file(metadata_path(state, provider), prior.metadata),
-         :ok <- restore_local_store(state, provider, prior.store) do
-      :ok
-    end
-  end
-
-  defp restore_prior_state(state, provider, prior) do
-    with :ok <-
-           restore_remote_file(state, credential_store_path(state, provider), prior.credential),
-         :ok <- restore_remote_file(state, metadata_path(state, provider), prior.metadata),
-         :ok <- restore_remote_store(state, provider, prior.store) do
-      :ok
-    end
-  end
-
-  defp restore_local_file(path, {:present, bytes}) do
-    atomic_write!(path, bytes)
-    :ok
-  rescue
-    error -> {:error, {:credential_restore_failed, path, Exception.message(error)}}
-  end
-
-  defp restore_local_file(path, :absent) do
-    case File.rm(path) do
-      :ok -> :ok
-      {:error, :enoent} -> :ok
-      {:error, reason} -> {:error, {:credential_restore_failed, path, reason}}
-    end
-  end
-
-  defp restore_local_store(_state, _provider, :present), do: :ok
-
-  defp restore_local_store(state, provider, :absent) do
-    with :ok <- remove_local_directory_if_empty(Path.dirname(metadata_path(state, provider))),
-         :ok <- remove_local_directory_if_empty(store_dir(state.base_dir, provider)) do
-      :ok
-    end
-  end
-
-  defp remove_local_directory_if_empty(path) do
-    case File.rmdir(path) do
-      :ok -> :ok
-      {:error, :enoent} -> :ok
-      {:error, reason} -> {:error, {:credential_restore_failed, path, reason}}
-    end
-  end
-
-  defp restore_remote_file(state, destination, {:present, backup}) do
-    temporary = destination <> ".rollback-#{System.unique_integer([:positive])}"
-
-    script =
-      "test -f #{shell_quote(backup)} && " <>
-        "mkdir -p #{shell_quote(Path.dirname(destination))} && " <>
-        "cp #{shell_quote(backup)} #{shell_quote(temporary)} && " <>
-        "chmod 600 #{shell_quote(temporary)} && " <>
-        "mv #{shell_quote(temporary)} #{shell_quote(destination)} && " <>
-        "chmod 600 #{shell_quote(destination)}"
-
-    restore_remote_command(state, script)
-  end
-
-  defp restore_remote_file(state, destination, :absent) do
-    restore_remote_command(state, "rm -f -- #{shell_quote(destination)}")
-  end
-
-  defp restore_remote_store(_state, _provider, :present), do: :ok
-
-  defp restore_remote_store(state, provider, :absent) do
-    metadata_dir = Path.dirname(metadata_path(state, provider))
-    store = store_dir(state.base_dir, provider)
-
-    script =
-      "if test -d #{shell_quote(metadata_dir)}; then rmdir #{shell_quote(metadata_dir)}; fi && " <>
-        "if test -d #{shell_quote(store)}; then rmdir #{shell_quote(store)}; fi"
-
-    restore_remote_command(state, script)
-  end
-
-  defp restore_remote_command(state, script) do
-    case remote_command(state, ["sh", "-c", shell_quote(script)]) do
-      {_output, 0} -> :ok
-      {output, status} -> {:error, {:credential_restore_failed, status, String.trim(output)}}
-    end
   end
 
   defp mark_onboarded!(state, provider, kind, credential) do

@@ -145,6 +145,27 @@ pub enum Command {
         request_id: String,
         action: String,
     },
+    OperatorAsk {
+        identity: Identity,
+        question: String,
+        note: Option<String>,
+        options: Option<Vec<String>>,
+        assignment_id: Option<String>,
+        deadline_ms: Option<String>,
+        supersedes: Option<String>,
+    },
+    OperatorRule {
+        identity: Identity,
+        request_id: String,
+        decision: Option<String>,
+        response: Option<String>,
+        rationale: Option<String>,
+    },
+    OperatorWithdraw {
+        identity: Identity,
+        request_id: String,
+        reason: String,
+    },
     DecisionRequests {
         identity: Identity,
         status: Option<String>,
@@ -300,6 +321,11 @@ pub enum Command {
         host: String,
         harness: String,
         name: String,
+    },
+    HostToolchainSet {
+        identity: Identity,
+        host: String,
+        dirs: Vec<String>,
     },
     HarnessProcesses {
         identity: Identity,
@@ -510,6 +536,14 @@ COMMANDS:
       Atomically open an assignment and wake its holder with the card id.
   effort-rule --request <decisionRequestId> --action continue|dismiss
       Rule an effort-without-effect check-in routed to your principal.
+  operator-ask --question <q> [--note <t>] [--options a,b,c]
+               [--assignment <asgId>] [--deadline <dur>] [--supersedes <dr_id>]
+      File an owner-scoped operator decision request.
+  operator-rule <dr_id> (--decision <label> | --response <text>)
+                [--rationale <text>]
+      Record the operator's resolution. Main and presenting proxies never run this command.
+  operator-withdraw <dr_id> --reason <text>
+      Withdraw an operator decision request as its owner or original asker.
   decision-requests [--status open|ruled|all]
       List decision requests visible to your principal.
   revoke-assignment <assignmentId>
@@ -572,6 +606,9 @@ COMMANDS:
       List environment overlays, optionally filtered by exact host and harness.
   host-env-unset --host <host> --harness <harness> NAME
       Remove one exact environment overlay.
+  host-toolchain-set --host <host> --dirs '<json-array>'
+      Replace the host's ordered toolchain directories. An empty array restores
+      the inherited PATH. The result previews the PATH shape adapters will use.
   harness-process list
       List the durable harness launch ledger, newest launch first.
 
@@ -1195,6 +1232,59 @@ fn parse_with_optional_catalog(
                 action,
             })
         }
+        "operator-ask" => {
+            if parsed.positional.len() != 1 {
+                return Err("usage: tightbeam operator-ask --question <q> [--note <t>] [--options a,b,c] [--assignment <asgId>] [--deadline <dur>] [--supersedes <dr_id>]".to_owned());
+            }
+            let question =
+                nonempty(flags, "question").ok_or_else(|| "--question is required".to_owned())?;
+            let options = flags
+                .get("options")
+                .map(|value| value.split(',').map(str::to_owned).collect::<Vec<_>>());
+            let deadline_ms = flags
+                .get("deadline")
+                .map(|value| parse_duration("deadline", value))
+                .transpose()?;
+            Ok(Command::OperatorAsk {
+                identity: identity(flags)?,
+                question,
+                note: nonempty(flags, "note"),
+                options,
+                assignment_id: nonempty(flags, "assignment"),
+                deadline_ms,
+                supersedes: nonempty(flags, "supersedes"),
+            })
+        }
+        "operator-rule" => {
+            if parsed.positional.len() != 2 {
+                return Err("usage: tightbeam operator-rule <dr_id> (--decision <label> | --response <text>) [--rationale <text>]".to_owned());
+            }
+            let decision = flags.get("decision").cloned();
+            let response = flags.get("response").cloned();
+            if decision.is_some() == response.is_some() {
+                return Err(
+                    "operator-rule requires exactly one of --decision or --response".to_owned(),
+                );
+            }
+            Ok(Command::OperatorRule {
+                identity: identity(flags)?,
+                request_id: parsed.positional[1].clone(),
+                decision,
+                response,
+                rationale: nonempty(flags, "rationale"),
+            })
+        }
+        "operator-withdraw" => {
+            if parsed.positional.len() != 2 {
+                return Err("usage: tightbeam operator-withdraw <dr_id> --reason <text>".to_owned());
+            }
+            Ok(Command::OperatorWithdraw {
+                identity: identity(flags)?,
+                request_id: parsed.positional[1].clone(),
+                reason: nonempty(flags, "reason")
+                    .ok_or_else(|| "--reason is required".to_owned())?,
+            })
+        }
         "decision-requests" => {
             if parsed.positional.len() != 1 {
                 return Err(
@@ -1509,6 +1599,7 @@ fn parse_with_optional_catalog(
         "host-env-set" => parse_host_env_set(&parsed, flags),
         "host-env-list" => parse_host_env_list(&parsed, flags),
         "host-env-unset" => parse_host_env_unset(&parsed, flags),
+        "host-toolchain-set" => parse_host_toolchain_set(&parsed, flags),
         "update-clients" => {
             if parsed.positional.len() != 1 {
                 return Err("usage: tightbeam update-clients --as-user <adminUserId>".to_owned());
@@ -1551,7 +1642,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, host-toolchain-set, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -1604,6 +1695,26 @@ fn parse_host_env_unset(
         host: nonempty(flags, "host").ok_or_else(|| usage.to_owned())?,
         harness: nonempty(flags, "harness").ok_or_else(|| usage.to_owned())?,
         name: name.clone(),
+    })
+}
+
+fn parse_host_toolchain_set(
+    parsed: &Flags,
+    flags: &HashMap<String, String>,
+) -> Result<Command, String> {
+    let usage = "usage: tightbeam host-toolchain-set --host <host> --dirs '<json-array>'";
+    if parsed.positional.len() != 1 {
+        return Err(usage.to_owned());
+    }
+
+    let encoded = nonempty(flags, "dirs").ok_or_else(|| usage.to_owned())?;
+    let dirs = serde_json::from_str::<Vec<String>>(&encoded)
+        .map_err(|_| "--dirs must be a JSON array of strings".to_owned())?;
+
+    Ok(Command::HostToolchainSet {
+        identity: identity(flags)?,
+        host: nonempty(flags, "host").ok_or_else(|| usage.to_owned())?,
+        dirs,
     })
 }
 
@@ -1952,6 +2063,66 @@ mod tests {
         }
     }
 
+    #[test]
+    fn host_toolchain_set_parses_an_ordered_json_array_and_allows_the_empty_exit() {
+        assert_eq!(
+            parse(strings(&[
+                "host-toolchain-set",
+                "--host",
+                "gibson",
+                "--dirs",
+                r#"["/tools/one","/tools/two"]"#,
+                "--as-user",
+                "flynn",
+            ])),
+            Ok(Command::HostToolchainSet {
+                identity: Identity::User("flynn".to_owned()),
+                host: "gibson".to_owned(),
+                dirs: vec!["/tools/one".to_owned(), "/tools/two".to_owned()],
+            })
+        );
+
+        assert_eq!(
+            parse(strings(&[
+                "host-toolchain-set",
+                "--host",
+                "gibson",
+                "--dirs",
+                "[]",
+            ])),
+            Ok(Command::HostToolchainSet {
+                identity: Identity::Session,
+                host: "gibson".to_owned(),
+                dirs: vec![],
+            })
+        );
+    }
+
+    #[test]
+    fn host_toolchain_set_refuses_missing_or_non_string_directory_lists() {
+        let usage =
+            "usage: tightbeam host-toolchain-set --host <host> --dirs '<json-array>'".to_owned();
+
+        assert_eq!(
+            parse(strings(&["host-toolchain-set", "--host", "gibson"])),
+            Err(usage.clone())
+        );
+        assert_eq!(
+            parse(strings(&["host-toolchain-set", "--dirs", r#"["/tools"]"#,])),
+            Err(usage)
+        );
+        assert_eq!(
+            parse(strings(&[
+                "host-toolchain-set",
+                "--host",
+                "gibson",
+                "--dirs",
+                r#"[1]"#,
+            ])),
+            Err("--dirs must be a JSON array of strings".to_owned())
+        );
+    }
+
     /// `--help` was consumed before the command was ever looked at, so every
     /// subcommand answered with the whole manual — the operator asking about one
     /// command got 150 lines and had to find the answer themselves.
@@ -2269,11 +2440,15 @@ mod tests {
                 "host-env-list",
                 "host-env-set",
                 "host-env-unset",
+                "host-toolchain-set",
                 "identity",
                 "kungfu",
                 "learn",
                 "list",
                 "onboard",
+                "operator-ask",
+                "operator-rule",
+                "operator-withdraw",
                 "retire",
                 "revoke-assignment",
                 "spawn",
@@ -2308,6 +2483,7 @@ mod tests {
             "host-env-set --host <host> --harness <harness> NAME=VALUE",
             "host-env-list [--host <host>] [--harness <harness>]",
             "host-env-unset --host <host> --harness <harness> NAME",
+            "host-toolchain-set --host <host> --dirs '<json-array>'",
             "harness-process list",
             "kungfu list",
         ] {
@@ -2828,8 +3004,94 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, host-toolchain-set, doctor, assimilate, harness-process".to_owned())
         );
+    }
+
+    #[test]
+    fn operator_decision_commands_parse_the_exact_surface() {
+        assert_eq!(
+            parse(strings(&[
+                "operator-ask",
+                "--question",
+                "ship window?",
+                "--note",
+                "release train",
+                "--options",
+                "accept,wait",
+                "--assignment",
+                "asg_1",
+                "--deadline",
+                "2h",
+                "--supersedes",
+                "dr_old",
+                "--as",
+                "coder:release",
+            ])),
+            Ok(Command::OperatorAsk {
+                identity: Identity::Role("coder:release".to_owned()),
+                question: "ship window?".to_owned(),
+                note: Some("release train".to_owned()),
+                options: Some(vec!["accept".to_owned(), "wait".to_owned()]),
+                assignment_id: Some("asg_1".to_owned()),
+                deadline_ms: Some("7200000".to_owned()),
+                supersedes: Some("dr_old".to_owned()),
+            })
+        );
+
+        assert_eq!(
+            parse(strings(&[
+                "operator-rule",
+                "dr_1",
+                "--response",
+                "ship after 013",
+                "--rationale",
+                "dependency first",
+                "--as-user",
+                "mike",
+            ])),
+            Ok(Command::OperatorRule {
+                identity: Identity::User("mike".to_owned()),
+                request_id: "dr_1".to_owned(),
+                decision: None,
+                response: Some("ship after 013".to_owned()),
+                rationale: Some("dependency first".to_owned()),
+            })
+        );
+
+        assert_eq!(
+            parse(strings(&[
+                "operator-withdraw",
+                "dr_2",
+                "--reason",
+                "moot after 013",
+            ])),
+            Ok(Command::OperatorWithdraw {
+                identity: Identity::Session,
+                request_id: "dr_2".to_owned(),
+                reason: "moot after 013".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn operator_rule_requires_one_answer_form() {
+        for args in [
+            strings(&["operator-rule", "dr_1"]),
+            strings(&[
+                "operator-rule",
+                "dr_1",
+                "--decision",
+                "accept",
+                "--response",
+                "yes",
+            ]),
+        ] {
+            assert_eq!(
+                parse(args),
+                Err("operator-rule requires exactly one of --decision or --response".to_owned())
+            );
+        }
     }
 
     #[test]
@@ -2844,6 +3106,7 @@ mod tests {
             "revoke-waiver",
             "withdraw",
             "decision-request",
+            "operator-supersede",
             "critical",
             "work-item-update",
             "work-item-list",

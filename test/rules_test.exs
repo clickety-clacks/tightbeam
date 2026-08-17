@@ -1171,6 +1171,67 @@ defmodule Tightbeam.RulesTest do
     assert review_count(ctx.db, producer.id) == 1
   end
 
+  test "shipped completion remedy waits for the holder receipt and creates one review", ctx do
+    holder = session(ctx.db, "receipt-remedy-holder", "flynn", archetype: "coder")
+    reviewer = session(ctx.db, "receipt-remedy-reviewer", "flynn", archetype: "reviewer")
+
+    {:ok, _} =
+      DB.query(ctx.db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1)")
+
+    Roles.create!(ctx.db, "reviewer", "flynn", reviewer.session_key)
+    producer = assignment(ctx, holder.session_key, {:user, "flynn"})
+
+    put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    completion =
+      p3_call("attest", {:session, holder.session_key}, %{
+        assignment_id: producer.id,
+        kind: "completion"
+      })
+
+    assert {:error,
+            %{
+              reason: "remedy_blocked",
+              producer: nil,
+              rule: "code-review-requires-passing-tests",
+              ref: producer_id
+            }} = Dispatch.dispatch(ctx.db, ctx.handlers, completion)
+
+    assert producer_id == producer.id
+    assert review_count(ctx.db, producer.id) == 0
+
+    verdict(
+      ctx,
+      holder.session_key,
+      producer.id,
+      "tests-passed",
+      "gibson:/repo 378807eabb39cecc25ea801494053f8aa20feafa; " <>
+        "mix test test/rules_test.exs; passed: 1 test"
+    )
+
+    assert {:error,
+            %{
+              reason: "remedy_fired",
+              producer: review_id,
+              rule: "completion-requires-review"
+            }} = Dispatch.dispatch(ctx.db, ctx.handlers, completion)
+
+    assert review_count(ctx.db, producer.id) == 1
+
+    assert {:error, %{reason: "remedy_fired", producer: ^review_id}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, completion)
+
+    assert review_count(ctx.db, producer.id) == 1
+    verdict(ctx, reviewer.session_key, review_id, "reviewed-clean", "reviewed exact receipt tip")
+
+    assert {:ok, %{assignment: %{id: completed_id, state: "closed"}}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, completion)
+
+    assert completed_id == producer.id
+    assert review_count(ctx.db, producer.id) == 1
+  end
+
   test "typed completion keeps code reviewed while receipt exemptions stay narrow", ctx do
     coder = session(ctx.db, "receipt-closed", "flynn", archetype: "coder")
     noncoder = session(ctx.db, "receipt-orchestrator", "flynn", archetype: "orchestrator")

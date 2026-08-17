@@ -35,7 +35,7 @@ defmodule Tightbeam.Schema do
   # The shape this build writes. Bump it when a production table changes in a
   # way that makes an older database unreadable, and give the refusal below a
   # sentence saying what changed.
-  @shape "model-identity-message-envelope-v2"
+  @shape "operator-decision-requests-v1"
 
   @supervision_liveness_objects [
     %{
@@ -918,10 +918,7 @@ defmodule Tightbeam.Schema do
           stamped: #{found}
           this build: #{@shape}
 
-        This build stores the optional messageType discriminator and structured
-        marker kind/from/to fields. It also enforces that marker facts cannot be
-        stored without the marker discriminator. An older stamped database lacks
-        those columns or the total marker constraint.
+        operator decision requests changed the decision_requests and wakes shape.
 
         There is no migration. Move the database aside and let it be recreated.
         """

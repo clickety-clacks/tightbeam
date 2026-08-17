@@ -310,7 +310,21 @@ defmodule Tightbeam.AdapterCoordinator do
       Tightbeam.HarnessProcess.fenced?(state.db, key) ->
         {:reply, {:error, {:park_fenced, key_name(key)}}, state}
 
-      entry.circuit == :open ->
+      # THE CIRCUIT DOES NOT GATE CREDENTIAL INSTALLATION (the credential-swap
+      # incident, 2026-08-14). It protects agent connections from a dead
+      # harness; it has no authority over an operator installing a credential.
+      # `authoritative?` is set only by the credential lifecycle, whose one
+      # caller is `start_provider_runtime`.
+      #
+      # Conflating them deadlocked recovery by construction. The circuit is
+      # guaranteed open exactly when a credential has stopped working — which is
+      # the only reason anyone replaces one — so the latch vetoed the single
+      # call that could unlatch it. Onboarding reported "Successfully logged in"
+      # and then :degraded, the ceremony read that as a bad credential, and the
+      # replacement was rolled back. Measured live: three onboardings left the
+      # store still holding the original credential, and recovery needed an
+      # operator restarting the gateway.
+      entry.circuit == :open and not authoritative? ->
         {:reply, {:error, :degraded}, state}
 
       true ->

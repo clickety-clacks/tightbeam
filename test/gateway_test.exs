@@ -3145,6 +3145,81 @@ defmodule Tightbeam.GatewayTest do
              })
   end
 
+  test "host-toolchain-set replaces one ordered registry row set and previews the PATH switch",
+       ctx do
+    config =
+      ctx.catalog_base
+      |> gateway_config(ctx.db, 0)
+      |> Map.put(:cli_bin, "/local/bin")
+
+    set = Gateway.handlers(config)["host-toolchain-set"]
+    host = Placement.local_host_name()
+
+    assert %{
+             host: ^host,
+             dirs: ["/tools/one", "/tools/two"],
+             set_by: "user:flynn",
+             set_at: set_at,
+             effect:
+               "this host's adapter PATH is now fully constructed: /local/bin:/tools/one:/tools/two:/usr/local/bin:/usr/bin:/bin"
+           } =
+             set.(%{
+               origin: "user:flynn",
+               params: %{host: host, dirs: ["/tools/one", "/tools/two"]}
+             })
+
+    assert is_integer(set_at)
+
+    assert {:ok,
+            [
+              [^host, 0, "/tools/one", "user:flynn", ^set_at],
+              [^host, 1, "/tools/two", "user:flynn", ^set_at]
+            ]} =
+             DB.query(
+               ctx.db,
+               "SELECT host, position, dir, setBy, setAt FROM host_toolchain_dirs ORDER BY position"
+             )
+
+    assert %{code: "unknown_host", message: message} =
+             set.(%{
+               origin: "user:flynn",
+               params: %{host: "missing-host", dirs: ["/tools"]}
+             })
+
+    assert message =~ "unknown_host rule"
+
+    assert %{
+             host: ^host,
+             dirs: [],
+             effect: "this host's adapter PATH now keeps the inherited value unchanged"
+           } =
+             set.(%{origin: "user:flynn", params: %{host: host, dirs: []}})
+
+    assert {:ok, []} = DB.query(ctx.db, "SELECT host FROM host_toolchain_dirs")
+  end
+
+  test "host-toolchain-set refuses a resolved non-admin agent", ctx do
+    handlers = Gateway.handlers(%{db: ctx.db})
+    host = Placement.local_host_name()
+
+    {:pending, _operator_device} =
+      Devices.pair(ctx.db, %{
+        device_id: "toolchain-operator-device",
+        claimed_name: "Toolchain operator",
+        platform: nil,
+        model: nil
+      })
+
+    operator = create_session(ctx.db, "toolchain-operator-session", "operator")
+    Roles.create!(ctx.db, "operator", "operator", operator.session_key)
+
+    assert %{code: "forbidden", message: "admin required"} =
+             handlers["host-toolchain-set"].(%{
+               origin: "agent:operator",
+               params: %{host: host, dirs: ["/tools"]}
+             })
+  end
+
   test "update-clients refuses non-admin callers and enumerates satellites for admins", ctx do
     register_hosts(ctx.db, %{
       "alpha" => %{
