@@ -326,6 +326,53 @@ Session/project status should expose only non-secret fields. Suggested display:
 - A timeout or unreachable host reports `unknown` and does not authorize GitHub
   work.
 
+## Fixture-backed 0.1.8 runbook
+
+Run this gate from the repository root. First remove every inherited
+`TIGHTBEAM_*` and `RELEASE_*` variable, as required by `AGENTS.md`. Do not use a
+real GitHub login, token, remote, or network endpoint.
+
+Build the real candidate CLI that the test will execute:
+
+```sh
+CARGO_TARGET_DIR=cli/target/github-auth-e2e \
+  cargo build --release --manifest-path cli/Cargo.toml
+```
+
+Expected result: exit 0 and an executable at
+`cli/target/github-auth-e2e/release/tightbeam`. The E2E repeats this cached build
+in `setup_all` so no other suite can replace the tested binary through the shared
+Cargo target. Existing compiler warnings do not change the result.
+
+Run the fixture E2E:
+
+```sh
+MIX_ENV=test mix test test/github_auth_e2e_test.exs
+```
+
+Expected result: exit 0, `5 tests, 0 failures`. The test puts fixture `gh` and
+`git` programs first on `PATH`. Those programs write only under the test's
+temporary directory. They do not contact GitHub. The timeout row takes about 32
+seconds because both the Rust and Elixir probes exercise the real 15-second
+deadline.
+
+The 0.1.8 GitHub E2E inventory is:
+
+| Row | Required evidence |
+| --- | --- |
+| Bank and private storage | The real CLI uses browser/device login with `--web --git-protocol https --insecure-storage`; it never uses `--with-token`; directories are 0700 and files are 0600. |
+| Host isolation | A satellite cannot borrow the local bank or ambient `GH_CONFIG_DIR`. Every fixture call sees only that host's bank. |
+| Environment projection | Local adapter options and satellite SSH commands receive the correct host-local `GH_CONFIG_DIR` and `TIGHTBEAM_MACHINE`. No token bytes are projected. |
+| Refusal and repair | A GitHub operation is refused before `git` runs. The refusal names host, hostname, failed phase, state, exact onboarding command, and the no-PAT rule. Quoted brief text and description prose do not trigger the guard. |
+| Probe states | Fixture probes prove `live`, `needs_onboarding`, `insufficient_scope`, `git_unready`, and timeout or provider failure as `unknown`. Unknown never authorizes work. |
+| Redaction and agreement | Rust and Elixir classify the same API failures. Refusals, doctor output, JSON, and capability metadata omit fixture secrets and bank paths. |
+
+The later installed-build live E2E should use **tars**, the sanctioned
+non-production macOS gateway test host. It must run only after separate authority
+permits packaging, installation, and a human device login. This fixture gate does
+not perform that row, and this producer does not install a build or touch a live
+credential.
+
 ## Implementation notes
 
 The existing adapter launch path already adds common environment variables in
