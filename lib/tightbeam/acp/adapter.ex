@@ -394,13 +394,26 @@ defmodule Tightbeam.Acp.Adapter do
 
     case Keyword.fetch(opts, :harness_process_launch_id) do
       {:ok, launch_id} ->
-        case Tightbeam.HarnessProcess.capture_identity(
-               Keyword.get(opts, :db, Tightbeam.DB),
-               launch_id,
-               :infinity
-             ) do
+        db = Keyword.get(opts, :db, Tightbeam.DB)
+
+        case Tightbeam.HarnessProcess.capture_identity(db, launch_id, :infinity) do
           :ok -> :ok
           {:error, reason} -> raise "harness process identity unavailable: #{inspect(reason)}"
+        end
+
+        # Rails-critical launch invariant 3: a harness that can bind a network listener under a
+        # bypass flag (OpenCode's `--port`/`serve` expose an ungated shell route) must have ZERO
+        # LISTEN sockets in its launched process group. Fail-closed — refuse the launch rather
+        # than proceed degraded. Opt-in, so stdio-only harnesses' launch path is unchanged.
+        if Harness.requires_zero_listeners?(module) do
+          case Tightbeam.HarnessProcess.assert_zero_listeners(db, launch_id) do
+            :ok ->
+              :ok
+
+            {:error, reason} ->
+              raise "rails-critical: launched #{harness} process group holds a network listener; " <>
+                      "refusing launch (invariant: 0 LISTEN sockets): #{inspect(reason)}"
+          end
         end
 
       :error ->

@@ -70,6 +70,82 @@ defmodule Tightbeam.Spinup do
     end
   end
 
+  @doc """
+  Provision a binary-native harness's adapter as a shell shim over an operator-installed CLI.
+
+  The `adapter_provisioning/0 == :shim` counterpart to `ensure_adapter/3`: instead of
+  npm-installing a package, it writes `#!/bin/sh\\nexec "<cli>" <exec_args…> "$@"\\n` at
+  `shim_path` (under the shared `adapters/node_modules/.bin`, where readiness already looks),
+  makes it executable, and creates the `.bin` dir if absent. `cli_binary` is resolved on the
+  target — a missing CLI is a host-unready REFUSAL naming the binary the operator must install,
+  never a silent stub. The subcommand is BAKED INTO the shim, so the launch argv cannot carry a
+  plugin-disabling or listener-opening flag; Tightbeam launches `cmd: [shim]` with no extra argv.
+
+  Reusable by any binary-native harness (e.g. a future cursor harness) via its own
+  `ensure_adapter/1` supplying its binary name and subcommand.
+  """
+  @spec ensure_shim_adapter(map(), String.t(), String.t(), [String.t()]) ::
+          {:ok, String.t()} | {:error, denial()}
+  def ensure_shim_adapter(target, shim_path, cli_binary, exec_args) do
+    if Support.local?(target) do
+      find = Map.get(target, :find_executable, &System.find_executable/1)
+
+      case find.(cli_binary) do
+        cli_path when is_binary(cli_path) ->
+          File.mkdir_p!(Path.dirname(shim_path))
+          File.write!(shim_path, shim_contents(cli_path, exec_args))
+          File.chmod!(shim_path, 0o755)
+          {:ok, "shim adapter present"}
+
+        _ ->
+          {:error, shim_cli_missing(target, cli_binary)}
+      end
+    else
+      ssh = target.host_config.ssh
+      resolve = remote_command(ssh, "command -v #{shell_quote(cli_binary)}")
+
+      case target.sh.(resolve) do
+        {output, 0} ->
+          cli_path = output |> String.trim() |> String.split("\n") |> List.last()
+
+          script =
+            "mkdir -p #{shell_quote(Path.dirname(shim_path))} && " <>
+              "printf %s #{shell_quote(shim_contents(cli_path, exec_args))} > #{shell_quote(shim_path)} && " <>
+              "chmod 755 #{shell_quote(shim_path)}"
+
+          case target.sh.(remote_command(ssh, script)) do
+            {_out, 0} ->
+              {:ok, "shim adapter present"}
+
+            {out, _exit} ->
+              {:error,
+               host_unready(
+                 "host #{target.host_name} is not ready: writing the #{cli_binary} adapter shim " <>
+                   "at #{shim_path} failed: #{String.trim(out)}"
+               )}
+          end
+
+        {_output, _exit} ->
+          {:error, shim_cli_missing(target, cli_binary)}
+      end
+    end
+  end
+
+  # The subcommand is a FIXED literal baked in here (never from launch opts), so no
+  # plugin-disabling (`--pure`) or listener-opening (`--port`/`serve`) flag can reach the CLI:
+  # `"$@"` forwards only what Tightbeam's launch passes, which is nothing.
+  defp shim_contents(cli_path, exec_args) do
+    "#!/bin/sh\nexec \"#{cli_path}\" #{Enum.join(exec_args, " ")} \"$@\"\n"
+  end
+
+  defp shim_cli_missing(target, cli_binary) do
+    host_unready(
+      "host #{target.host_name} is not ready: the #{cli_binary} binary is not on PATH. It is an " <>
+        "operator prerequisite Tightbeam does not install; install #{cli_binary} on " <>
+        "#{target.host_name}, then retry placement."
+    )
+  end
+
   # One provisioning mechanism for both localities. The gateway host used to be the only
   # machine that could not supply its own adapters — it refused and told the operator to
   # go install them by hand, on the host tightbeam is standing on. The asymmetry made
@@ -129,8 +205,15 @@ defmodule Tightbeam.Spinup do
   # unpinned tree makes the patcher raise. Versions stay in the harness modules; this
   # seam only asks each of them for its own.
   defp install_command(target, install_dir, locality) do
+    # npm_provisioned/0, not all/0: a binary-native (:shim) harness has no npm package, and
+    # joining a non-existent spec here would fail `npm install` for every npm harness sharing
+    # this one line. A shim harness provisions its adapter through `ensure_shim_adapter/4`.
     packages =
-      Enum.map_join(Harness.all(), " ", &"#{&1.install_package()}@#{&1.adapter_version()}")
+      Enum.map_join(
+        Harness.npm_provisioned(),
+        " ",
+        &"#{&1.install_package()}@#{&1.adapter_version()}"
+      )
 
     # `--no-save`, because npm records a CARET RANGE for a version it installed
     # exactly: `npm install pkg@1.1.4` writes `"^1.1.4"` into package.json, so the

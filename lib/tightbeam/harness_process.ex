@@ -628,6 +628,63 @@ defmodule Tightbeam.HarnessProcess do
     end
   end
 
+  @doc """
+  Assert the launched process group holds ZERO TCP LISTEN sockets (rails-critical launch
+  invariant 3), for a harness that opts in via `Harness.requires_zero_listeners?/1`.
+
+  Fail-closed: any LISTEN socket in the group, or a probe that cannot conclude, is `{:error, _}`
+  and the caller refuses the launch. `opencode acp` binds nothing, so this verifies the structural
+  never-`--pure`/never-`serve` invariants held — a listener means a listener-opening flag reached
+  the CLI. This is the highest AFFORDABLE rung: a running process's sockets are observable only at
+  runtime, so a runtime assert is as structural as invariant 3 can be. Local host only for now;
+  the remote probe is tracked follow-on (OpenCode is provisioned locally on the gateway).
+  """
+  @spec assert_zero_listeners(DB.server(), String.t()) :: :ok | {:error, term()}
+  def assert_zero_listeners(db, launch_id) do
+    case fetch!(db, launch_id) do
+      %{ssh: nil, process_group_id: pgid} when is_integer(pgid) ->
+        case listener_probe(pgid) do
+          {:ok, []} -> :ok
+          {:ok, listeners} -> {:error, {:listeners_present, listeners}}
+          {:error, reason} -> {:error, {:listener_probe_failed, reason}}
+        end
+
+      %{ssh: ssh} when not is_nil(ssh) ->
+        {:error, :remote_listener_probe_unimplemented}
+
+      _ ->
+        {:error, :no_process_group_id}
+    end
+  end
+
+  # `lsof -nP -a -g <pgid> -iTCP -sTCP:LISTEN -Fn`: the LISTEN TCP sockets held by ANY process in
+  # the launched process group. `-a` ANDs the pgid and socket-state filters; `-Fn` prints one
+  # field per line, so a socket name is an `n`-prefixed line. An empty selection is lsof exit 1
+  # with no output — the zero-listener case. A status outside {0,1}, or an `lsof:` diagnostic, is
+  # an inconclusive probe and fails closed.
+  defp listener_probe(pgid) do
+    args = ["-nP", "-a", "-g", Integer.to_string(pgid), "-iTCP", "-sTCP:LISTEN", "-Fn"]
+
+    case bounded_command("lsof", args, 5_000) do
+      {:error, :timeout} ->
+        {:error, :timeout}
+
+      {output, status} when status in [0, 1] ->
+        lines = String.split(output, "\n", trim: true)
+
+        cond do
+          Enum.any?(lines, &String.starts_with?(&1, "lsof:")) ->
+            {:error, {:lsof_diagnostic, one_line(output)}}
+
+          true ->
+            {:ok, Enum.filter(lines, &String.starts_with?(&1, "n"))}
+        end
+
+      {output, status} ->
+        {:error, {:lsof_failed, status, one_line(output)}}
+    end
+  end
+
   defp run_group_command(%{ssh: nil} = row, timeout_ms) do
     bounded_command(
       row.helper_path,

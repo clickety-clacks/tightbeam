@@ -152,6 +152,9 @@ defmodule Tightbeam.Harness.Claude do
   def install_package, do: "@agentclientprotocol/claude-agent-acp"
 
   @impl true
+  def adapter_provisioning, do: :npm
+
+  @impl true
   def cli_binary, do: "claude"
 
   @impl true
