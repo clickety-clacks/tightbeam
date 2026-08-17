@@ -592,6 +592,115 @@ defmodule FeatureSmoke do
       "flagship: tests-passed receipt failed: #{inspect(receipt)}"
     )
 
+    # First prove the ordinary production path: the remedy creates one new exact-revision
+    # review, a retry reuses it, and the clean verdict releases completion.
+    fresh_asg =
+      ok!(state, "assign", %{
+        "sessionKey" => coder_key,
+        "subject" => "fresh review commission #{u}",
+        "workItemId" => wi_id,
+        "effectKind" => "code",
+        "idempotencyKey" => "fresh-fa-#{u}"
+      })
+
+    fresh_asg_id = fresh_asg["id"] || fresh_asg["assignmentId"]
+
+    fresh_receipt =
+      post_as(state, coder_tok, "attest", %{
+        "assignmentId" => fresh_asg_id,
+        "kind" => "verdict",
+        "verdictKind" => "tests-passed",
+        "note" =>
+          "#{revision["repo"]} #{revision["commit"]}; scripts/feature_smoke.exs; passed: fresh review prerequisite"
+      })
+
+    assert(
+      state,
+      not (is_map(fresh_receipt) and Map.has_key?(fresh_receipt, "error")),
+      "flagship: fresh tests-passed receipt failed: #{inspect(fresh_receipt)}"
+    )
+
+    fresh_blocked =
+      post_as(state, coder_tok, "attest", %{
+        "assignmentId" => fresh_asg_id,
+        "kind" => "completion",
+        "commitRefs" => [revision]
+      })
+
+    assert(
+      state,
+      get_in(fresh_blocked, ["error", "rule"]) == "completion-requires-review" or
+        (get_in(fresh_blocked, ["error", "message"]) || "") =~
+          "completion-requires-review",
+      "flagship: fresh completion should commission a review: #{inspect(fresh_blocked)}"
+    )
+
+    fresh_reviews = ok!(state, "assignments", %{"sessionKey" => reviewer_key})
+
+    fresh_review_asgs =
+      (fresh_reviews["assignments"] || fresh_reviews)
+      |> List.wrap()
+      |> Enum.filter(fn a -> (a["reviewsAssignmentId"] || a["reviews"]) == fresh_asg_id end)
+
+    assert(
+      state,
+      length(fresh_review_asgs) == 1,
+      "flagship: remedy must create exactly one fresh review: #{inspect(fresh_reviews)}"
+    )
+
+    fresh_review_id = hd(fresh_review_asgs)["id"] || hd(fresh_review_asgs)["assignmentId"]
+
+    fresh_retry =
+      post_as(state, coder_tok, "attest", %{
+        "assignmentId" => fresh_asg_id,
+        "kind" => "completion",
+        "commitRefs" => [revision]
+      })
+
+    assert(
+      state,
+      get_in(fresh_retry, ["error", "rule"]) == "completion-requires-review" or
+        (get_in(fresh_retry, ["error", "message"]) || "") =~ "completion-requires-review",
+      "flagship: fresh retry before verdict should remain blocked: #{inspect(fresh_retry)}"
+    )
+
+    retried_reviews = ok!(state, "assignments", %{"sessionKey" => reviewer_key})
+
+    assert(
+      state,
+      (retried_reviews["assignments"] || retried_reviews)
+      |> List.wrap()
+      |> Enum.count(fn a -> (a["reviewsAssignmentId"] || a["reviews"]) == fresh_asg_id end) ==
+        1,
+      "flagship: fresh review retry created a duplicate: #{inspect(retried_reviews)}"
+    )
+
+    fresh_verdict =
+      post_as(state, reviewer_tok, "attest", %{
+        "assignmentId" => fresh_review_id,
+        "kind" => "verdict",
+        "verdictKind" => "reviewed-clean"
+      })
+
+    assert(
+      state,
+      not (is_map(fresh_verdict) and Map.has_key?(fresh_verdict, "error")),
+      "flagship: fresh review verdict failed: #{inspect(fresh_verdict)}"
+    )
+
+    fresh_done =
+      post_as(state, coder_tok, "attest", %{
+        "assignmentId" => fresh_asg_id,
+        "kind" => "completion",
+        "commitRefs" => [revision]
+      })
+
+    assert(
+      state,
+      not (is_map(fresh_done) and Map.has_key?(fresh_done, "error")),
+      "flagship: fresh completion did not release: #{inspect(fresh_done)}"
+    )
+
     # Stage the shape this public migration surface exists to repair: an owner-identified
     # pre-binding review card. The row predates this feature, so no current creator verb can
     # honestly produce it. All behavior under test after this setup runs through the live
@@ -690,7 +799,7 @@ defmodule FeatureSmoke do
 
     pass(
       state,
-      "flagship reviewer-loop: legacy bind → exact deny/retry → one reused review → verdict → exact completion"
+      "flagship reviewer-loop: fresh commission/reuse + legacy bind/reuse → verdicts → exact completions"
     )
   end
 

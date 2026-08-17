@@ -305,8 +305,24 @@ defmodule Tightbeam.JobTraceTest do
 
     assert_received {:commit_ref_command, "ssh", args, [stderr_to_stdout: true]}
     assert "git@remote-test" in args
-    assert "/srv/repo" in args
-    assert List.last(args) == "0123456789abcdef^{commit}"
+    assert "sh" in args
+    assert "-c" in args
+    refute "/srv/repo" in args
+    refute "0123456789abcdef^{commit}" in args
+
+    command =
+      [
+        "git",
+        "-C",
+        "/srv/repo",
+        "rev-parse",
+        "--verify",
+        "--end-of-options",
+        "0123456789abcdef^{commit}"
+      ]
+      |> Enum.map_join(" ", &Tightbeam.Harness.Support.shell_quote/1)
+
+    assert List.last(args) == Tightbeam.Harness.Support.shell_quote(command)
   end
 
   test "equal-time numeric turn ids sort numerically", %{db: db} do

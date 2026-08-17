@@ -127,6 +127,9 @@ defmodule Tightbeam.JobTrace do
 
       {:ok, []} ->
         nil
+
+      {:error, reason} ->
+        raise "review revision binding read failed: #{inspect(reason)}"
     end
   end
 

@@ -845,19 +845,46 @@ defmodule Tightbeam.AssignmentsTest do
             }} = Assignments.normalize_dispatch_call(ctx.db, completion)
 
     assert_receive {:commit_ref_command, "ssh", args, [stderr_to_stdout: true]}
-    refute "sh" in args
-    refute "-c" in args
+    path = "/srv/repos/project with spaces"
+    commit = "feature;touch /tmp/nope"
 
-    assert Enum.take(args, -8) == [
+    command =
+      ["git", "-C", path, "rev-parse", "--verify", "--end-of-options", "#{commit}^{commit}"]
+      |> Enum.map_join(" ", &Tightbeam.Harness.Support.shell_quote/1)
+
+    assert Enum.take(args, -4) == [
              "git@remote.example",
-             "git",
-             "-C",
-             "/srv/repos/project with spaces",
-             "rev-parse",
-             "--verify",
-             "--end-of-options",
-             "feature;touch /tmp/nope^{commit}"
+             "sh",
+             "-c",
+             Tightbeam.Harness.Support.shell_quote(command)
            ]
+
+    refute path in args
+    refute "#{commit}^{commit}" in args
+  end
+
+  test "dispatch denies a verdict whose refs conflict with its bound review revision", ctx do
+    producer = handle(ctx, "assign", assign_call({:user, "flynn"}, "verdict producer"))
+
+    review =
+      assign_call({:user, "flynn"}, "bound review")
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :reviews_assignment_id], producer.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    conflict =
+      attest_call({:session, "other-session"}, review.id, "verdict")
+      |> put_in([:params, :verdict_kind], "reviewed-clean")
+      |> put_in([:params, :commit_refs], test_commit_refs("HEAD^"))
+
+    assert {:error, %{code: "review_revision_conflict"}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, conflict)
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT count(*) FROM attests WHERE assignmentId = ?1", [review.id])
+
+    assert {:ok, [["denied", "attest"]]} =
+             DB.query(ctx.db, "SELECT kind, verb FROM events ORDER BY id DESC LIMIT 1")
   end
 
   test "Proof 1: a conflicting review-assignment create is refused with review_item_conflict",

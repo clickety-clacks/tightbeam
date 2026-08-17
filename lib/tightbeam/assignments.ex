@@ -294,11 +294,11 @@ defmodule Tightbeam.Assignments do
   end
 
   @doc "Return distinct verdict kinds filed against an assignment."
-  @spec verdict_kinds(DB.server(), String.t()) :: [String.t()]
-  def verdict_kinds(db, assignment_id) do
-    {:ok, rows} =
-      DB.query(
-        db,
+  @spec verdict_kinds(DB.server() | Txn.t(), String.t()) :: [String.t()]
+  def verdict_kinds(queryable, assignment_id) do
+    rows =
+      query_rows(
+        queryable,
         "SELECT DISTINCT verdictKind FROM attests WHERE assignmentId = ?1 AND kind = 'verdict' ORDER BY verdictKind",
         [assignment_id]
       )
@@ -358,13 +358,24 @@ defmodule Tightbeam.Assignments do
     applicable_review_verdict_kinds(queryable, assignment_id, holder_key, "policy", nil)
   end
 
-  @doc "Return the newest reusable open independent review for a code result revision."
-  @spec newest_applicable_open_review(DB.server() | Txn.t(), String.t(), String.t(), map()) ::
-          String.t() | nil
-  def newest_applicable_open_review(queryable, assignment_id, holder_key, result_revision) do
+  @doc "Return the newest reusable open independent review applicable to a producer result."
+  @spec newest_applicable_open_review(
+          DB.server() | Txn.t(),
+          String.t(),
+          String.t(),
+          String.t(),
+          map() | nil
+        ) :: String.t() | nil
+  def newest_applicable_open_review(
+        queryable,
+        assignment_id,
+        holder_key,
+        effect_kind,
+        result_revision
+      ) do
     queryable
     |> review_candidates(assignment_id, holder_key, true)
-    |> Enum.find(&review_applicable?(queryable, &1, "code", result_revision))
+    |> Enum.find(&open_review_applicable?(queryable, &1, effect_kind, result_revision))
     |> case do
       nil -> nil
       review -> review.id
@@ -769,6 +780,9 @@ defmodule Tightbeam.Assignments do
         _ ->
           result
       end
+    else
+      {:error, error} -> error
+      result -> result
     end
   rescue
     TransitionRace -> assignment_closed()
@@ -1959,19 +1973,13 @@ defmodule Tightbeam.Assignments do
   end
 
   defp run_git_rev_parse(%{ssh: destination}, path, commit) when is_binary(destination) do
+    command =
+      ["git", "-C", path, "rev-parse", "--verify", "--end-of-options", "#{commit}^{commit}"]
+      |> Enum.map_join(" ", &Support.shell_quote/1)
+
     run_commit_ref_command(
       "ssh",
-      Support.ssh_opts() ++
-        [
-          destination,
-          "git",
-          "-C",
-          path,
-          "rev-parse",
-          "--verify",
-          "--end-of-options",
-          "#{commit}^{commit}"
-        ],
+      Support.ssh_opts() ++ [destination, "sh", "-c", Support.shell_quote(command)],
       stderr_to_stdout: true
     )
   end
@@ -2033,6 +2041,13 @@ defmodule Tightbeam.Assignments do
   end
 
   defp review_applicable?(_queryable, _review, _effect_kind, _result_revision), do: false
+
+  defp open_review_applicable?(_queryable, _review, effect_kind, _result_revision)
+       when effect_kind in ["policy", "release", "live_mutation"],
+       do: true
+
+  defp open_review_applicable?(queryable, review, effect_kind, result_revision),
+    do: review_applicable?(queryable, review, effect_kind, result_revision)
 
   defp fallback_revision(_queryable, nil), do: :unbound
 

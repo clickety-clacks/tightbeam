@@ -1213,6 +1213,87 @@ defmodule Tightbeam.RulesTest do
     assert review_count(ctx.db, producer.id) == 1
   end
 
+  test "shipped completion remedy commissions and reuses unversioned reviews", ctx do
+    holder = session(ctx.db, "unversioned-holder", "flynn", archetype: "coder")
+    reviewer = session(ctx.db, "unversioned-reviewer", "flynn", archetype: "reviewer")
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT OR REPLACE INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1)"
+      )
+
+    Roles.create!(ctx.db, "reviewer", "flynn", reviewer.session_key)
+    put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    for effect_kind <- ["policy", "release", "live_mutation"] do
+      producer =
+        assignment(ctx, holder.session_key, {:user, "flynn"}, effect_kind: effect_kind)
+
+      verdict(
+        ctx,
+        holder.session_key,
+        producer.id,
+        "tests-passed",
+        "gibson:/repo unversioned; mix test test/rules_test.exs; passed: unversioned fixture"
+      )
+
+      completion =
+        p3_call("attest", {:session, holder.session_key}, %{
+          assignment_id: producer.id,
+          kind: "completion"
+        })
+        |> update_in([:params], &Map.delete(&1, :commit_refs))
+        |> Map.delete(:result_revision)
+
+      preexisting_review_id =
+        if effect_kind == "policy" do
+          review_call =
+            p3_call("assign", {:user, "flynn"}, %{
+              subject: "preexisting unversioned review",
+              reviews_assignment_id: producer.id,
+              effect_kind: "review",
+              idempotency_key: nil
+            })
+            |> update_in([:params], &Map.delete(&1, :review_commit_refs))
+            |> Map.put(:session_key, reviewer.session_key)
+
+          assert {:ok, review} = Dispatch.dispatch(ctx.db, ctx.handlers, review_call)
+          review.id
+        end
+
+      assert {:error,
+              %{
+                reason: "remedy_fired",
+                producer: review_id,
+                rule: "completion-requires-review"
+              }} = Dispatch.dispatch(ctx.db, ctx.handlers, completion)
+
+      if preexisting_review_id, do: assert(review_id == preexisting_review_id)
+
+      assert review_count(ctx.db, producer.id) == 1
+
+      assert {:ok, [[0]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT count(*) FROM assignment_review_revisions WHERE reviewAssignmentId = ?1",
+                 [review_id]
+               )
+
+      assert {:error, %{reason: "remedy_fired", producer: ^review_id}} =
+               Dispatch.dispatch(ctx.db, ctx.handlers, completion)
+
+      assert review_count(ctx.db, producer.id) == 1
+      verdict(ctx, reviewer.session_key, review_id, "reviewed-clean", "clean unversioned review")
+
+      assert {:ok, %{assignment: %{id: completed_id, state: "closed"}}} =
+               Dispatch.dispatch(ctx.db, ctx.handlers, completion)
+
+      assert completed_id == producer.id
+    end
+  end
+
   test "typed completion keeps code reviewed while receipt exemptions stay narrow", ctx do
     coder = session(ctx.db, "receipt-closed", "flynn", archetype: "coder")
     noncoder = session(ctx.db, "receipt-orchestrator", "flynn", archetype: "orchestrator")

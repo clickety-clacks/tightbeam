@@ -43,6 +43,7 @@ defmodule Tightbeam.Rules do
 
   alias Tightbeam.{
     Assignments,
+    Artifacts,
     DB,
     Devices,
     Escalation,
@@ -1038,13 +1039,9 @@ defmodule Tightbeam.Rules do
     subject = gated_ref(call)
 
     if not is_nil(rule.remedy) and is_binary(subject) do
-      case query_rows(
-             db,
-             "SELECT occurrence FROM rail_remedy_episodes WHERE statute = ?1 AND subject = ?2 AND status = 'live'",
-             [rule.name, subject]
-           ) do
-        [] -> to_close
-        [[occurrence]] -> [{rule.name, subject, occurrence} | to_close]
+      case Tightbeam.RailRemedy.live?(db, rule.name, subject) do
+        nil -> to_close
+        occurrence -> [{rule.name, subject, occurrence} | to_close]
       end
     else
       to_close
@@ -1189,14 +1186,7 @@ defmodule Tightbeam.Rules do
         {nil, cache}
 
       assignment, cache ->
-        rows =
-          query_rows(
-            db,
-            "SELECT DISTINCT verdictKind FROM attests WHERE assignmentId = ?1 AND kind = 'verdict' ORDER BY verdictKind",
-            [assignment.id]
-          )
-
-        {Enum.map(rows, &hd/1), cache}
+        {Assignments.verdict_kinds(db, assignment.id), cache}
     end)
   end
 
@@ -1285,18 +1275,7 @@ defmodule Tightbeam.Rules do
         {nil, cache}
 
       assignment, cache ->
-        rows =
-          query_rows(
-            db,
-            """
-            SELECT DISTINCT kind FROM artifacts
-            WHERE workItemId = ?1 AND createdBySession = ?2
-            ORDER BY kind
-            """,
-            [assignment.work_item_id, assignment.holder_key]
-          )
-
-        {Enum.map(rows, &hd/1), cache}
+        {Artifacts.recorded_kinds(db, assignment.work_item_id, assignment.holder_key), cache}
     end)
   end
 
@@ -1627,11 +1606,6 @@ defmodule Tightbeam.Rules do
 
   defp query(%DB.Txn{} = txn, sql, params), do: {:ok, DB.Txn.q(txn, sql, params)}
   defp query(db, sql, params), do: DB.query(db, sql, params)
-
-  defp query_rows(queryable, sql, params) do
-    {:ok, rows} = query(queryable, sql, params)
-    rows
-  end
 
   defp caller_user(db, call, cache) do
     case parse_origin(call.origin) do
