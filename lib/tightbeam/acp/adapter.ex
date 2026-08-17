@@ -469,6 +469,12 @@ defmodule Tightbeam.Acp.Adapter do
     end
   end
 
+  @doc false
+  # Test seam for the invariant-3 refuse-wiring: a full adapter boot needs a registered :shim
+  # harness (Phase-2), so exercise the guard directly here.
+  def listener_guard_for_test(opts, module, harness, state, stderr_path, offset),
+    do: listener_guard(opts, module, harness, state, stderr_path, offset)
+
   defp gate(opts, state) do
     case Keyword.fetch(opts, :probe_cwd) do
       {:ok, probe_cwd} ->
