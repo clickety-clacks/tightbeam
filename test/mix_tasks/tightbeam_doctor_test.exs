@@ -23,6 +23,7 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
       hosts: %{"local-test" => %{ssh: nil, base_dir: base_dir, cli_bin: nil}},
       local_host_name: "local-test",
       cli_bin: Path.join(base_dir, "bin"),
+      github_gh_path: "/fixture/bin/gh",
       harness_binary_probe: fn harness, _cli_bin ->
         {:ok, %{bin: "/fake/#{harness}", version: "#{harness} 1.0"}}
       end
@@ -293,6 +294,7 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
     {0, report} = Doctor.evaluate(ctx.catalog, ctx.inputs)
 
     refute find(report, "github_auth:github.com")
+    assert report.github == nil
   end
 
   test "github auth passes only when the host probe reports live cli and git auth", ctx do
@@ -308,6 +310,22 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
 
     assert check.ok
     assert check.detail =~ "GitHub github.com is live for octo via https"
+    assert check.detail =~ "host local-test"
+    assert check.detail =~ "gh /fixture/bin/gh"
+    assert check.detail =~ "state live"
+    assert check.detail =~ "storage file"
+
+    assert report.github == %{
+             account: "octo",
+             gh_path: "/fixture/bin/gh",
+             git_protocol: "https",
+             host: "local-test",
+             hostname: "github.com",
+             repair: nil,
+             state: "live",
+             storage: "file"
+           }
+
     refute Doctor.format(report, :human) =~ "PAT"
   end
 
@@ -329,8 +347,17 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
     refute check.detail =~ "github_pat_secret"
     refute check.detail =~ "ghp_secret"
     assert check.detail =~ "https://[redacted]@github.com/example/project.git"
+    assert check.detail =~ "host local-test"
+    assert check.detail =~ "gh /fixture/bin/gh"
+    assert check.detail =~ "storage file"
     assert check.fix =~ "tightbeam onboard github --hostname github.com"
+    assert check.fix =~ "--remote git@github.com:example/project.git"
     assert check.fix =~ "Do not paste a PAT into an agent."
+    assert report.github.state == "needs_onboarding"
+    assert report.github.host == "local-test"
+    assert report.github.gh_path == "/fixture/bin/gh"
+    assert report.github.storage == "file"
+    assert report.github.repair =~ "--remote git@github.com:example/project.git"
   end
 
   # RULED: doctor never creates org state. An org that has not booted has no DB,

@@ -84,6 +84,7 @@ mod test_support {
         outputs: Mutex<VecDeque<(&'static [&'static str], Output)>>,
         statuses: Mutex<VecDeque<(&'static [&'static str], std::process::ExitStatus)>>,
         git_outputs: Mutex<VecDeque<(&'static str, Output)>>,
+        remote_urls: Mutex<VecDeque<(&'static str, Option<&'static str>)>>,
     }
 
     impl FakeGh {
@@ -93,6 +94,7 @@ mod test_support {
                 outputs: Mutex::new(VecDeque::new()),
                 statuses: Mutex::new(VecDeque::new()),
                 git_outputs: Mutex::new(VecDeque::new()),
+                remote_urls: Mutex::new(VecDeque::new()),
             }
         }
 
@@ -112,6 +114,11 @@ mod test_support {
 
         pub(super) fn git_output(self, remote: &'static str, output: Output) -> Self {
             self.git_outputs.lock().unwrap().push_back((remote, output));
+            self
+        }
+
+        pub(super) fn remote_url(self, name: &'static str, url: Option<&'static str>) -> Self {
+            self.remote_urls.lock().unwrap().push_back((name, url));
             self
         }
     }
@@ -152,6 +159,17 @@ mod test_support {
                 .expect("unexpected git ls-remote call");
             assert_eq!(remote, expected);
             Ok(output)
+        }
+
+        fn git_remote_url(&self, name: &str) -> Result<Option<String>, String> {
+            let (expected, url) = self
+                .remote_urls
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected git remote lookup");
+            assert_eq!(name, expected);
+            Ok(url.map(str::to_owned))
         }
     }
 

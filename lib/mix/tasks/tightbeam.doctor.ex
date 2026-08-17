@@ -70,6 +70,10 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
       end)
 
     github_remote_url = Keyword.get(inputs, :github_remote_url)
+
+    github_gh_path =
+      Keyword.get_lazy(inputs, :github_gh_path, fn -> System.find_executable("gh") end)
+
     harnesses = Enum.map(Tightbeam.Harness.all(), & &1.wire_name())
 
     credential_states =
@@ -114,6 +118,9 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
         end)
       end)
 
+    {github_check, github_status} =
+      github_check(github_remote_url, github_probe, local_host_name, github_gh_path)
+
     non_harness_checks =
       [
         default_model_check(
@@ -127,7 +134,7 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
         identity_check(base_dir),
         advertised_url_check(advertised_url),
         hosts_check(hosts, local_host_name),
-        github_check(github_remote_url, github_probe)
+        github_check
       ]
       |> Enum.reject(&is_nil/1)
 
@@ -137,7 +144,7 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
       ready_harnesses != [] and
         Enum.all?(non_harness_checks, &(&1.ok or &1.unverifiable))
 
-    {if(ready, do: 0, else: 1), %{checks: checks, ready: ready}}
+    {if(ready, do: 0, else: 1), %{checks: checks, github: github_status, ready: ready}}
   end
 
   @doc false
@@ -376,30 +383,70 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
   # Doctor formats and reports; Tightbeam.GithubAuth judges. This check owns
   # only the presentation of the probe result — the readiness model lives in
   # one place, like local_credential_state asking Tightbeam.Credentials.
-  defp github_check(nil, _github_probe), do: nil
+  defp github_check(nil, _github_probe, _host, _gh_path), do: {nil, nil}
 
-  defp github_check(remote_url, github_probe) do
+  defp github_check(remote_url, github_probe, host, configured_gh_path) do
     case Tightbeam.GithubAuth.hostname(remote_url) do
       nil ->
-        nil
+        {nil, nil}
 
       hostname ->
+        scrubbed_remote = Tightbeam.GithubAuth.scrub_detail(remote_url)
+
+        repair =
+          "tightbeam onboard github --hostname #{hostname} --remote #{scrubbed_remote}"
+
         case github_probe.(hostname, remote_url) do
-          {:ok, %{account: account, git_protocol: protocol}} ->
+          {:ok, status} ->
+            account = Map.get(status, :account)
+            protocol = Map.get(status, :git_protocol)
+            gh_path = Map.get(status, :gh_path) || configured_gh_path
+            storage = Map.get(status, :storage, "file")
+
             detail =
               "GitHub #{hostname} is live for #{account || "active account"}" <>
-                if(protocol, do: " via #{protocol}", else: "")
+                if(protocol, do: " via #{protocol}", else: "") <>
+                "; host #{host}; gh #{gh_path || "missing"}; state live; " <>
+                "account #{account || "unknown"}; protocol #{protocol || "unknown"}; " <>
+                "storage #{storage}"
 
-            check("github_auth:#{hostname}", true, detail, "")
+            readiness = %{
+              account: account,
+              gh_path: gh_path,
+              git_protocol: protocol,
+              host: host,
+              hostname: hostname,
+              repair: nil,
+              state: "live",
+              storage: storage
+            }
+
+            {check("github_auth:#{hostname}", true, detail, ""), readiness}
 
           {:error, state, detail} ->
-            check(
-              "github_auth:#{hostname}",
-              false,
-              "#{state}: #{Tightbeam.GithubAuth.scrub_detail(detail)}",
-              "Run on this host: tightbeam onboard github --hostname #{hostname}. " <>
-                "Do not paste a PAT into an agent."
-            )
+            state = to_string(state)
+            gh_path = configured_gh_path
+            detail = Tightbeam.GithubAuth.scrub_detail(detail)
+
+            readiness = %{
+              account: nil,
+              gh_path: gh_path,
+              git_protocol: nil,
+              host: host,
+              hostname: hostname,
+              repair: repair,
+              state: state,
+              storage: "file"
+            }
+
+            {check(
+               "github_auth:#{hostname}",
+               false,
+               "#{state}: #{detail}; host #{host}; hostname #{hostname}; " <>
+                 "gh #{gh_path || "missing"}; state #{state}; account unknown; " <>
+                 "protocol unknown; storage file",
+               "Run on this host: #{repair}. Do not paste a PAT into an agent."
+             ), readiness}
         end
     end
   end

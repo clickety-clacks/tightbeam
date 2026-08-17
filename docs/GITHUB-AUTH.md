@@ -217,19 +217,25 @@ call. Non-GitHub calls pass through. GitHub-dependent calls must prove host
 Failure exits as a tool refusal with the repair command and the instruction not
 to paste a PAT into an agent.
 
-The guard judges operations, not mentions, on three levels. It reads only the
-`tool_input.command` field of the tool call — prompts, briefs, and
-descriptions ride alongside and cannot run. Within the command, quoted spans
-are blanked before matching, because a shell only executes what sits outside
-quotes — so a multi-line `--brief '…\ngh pr view 123…'` carries no operation
-regardless of how its prose is line-broken. And `git`/`gh` must appear in
-command position (start of string, after a shell connector, or behind
-`NAME=value` env assignments and plain wrappers like `env`/`exec`/`xargs`).
-Only owner/repo-shaped URLs are treated as candidate remotes, so a command
-whose comment links an issue or PR page is not `ls-remote`d into a refusal.
-The matcher under-matches by design — a gh call nested inside `sh -c "..."`
-slips through and fails at runtime with gh's own auth error, which is the
-acceptable direction for a hygiene gate to be wrong in.
+The guard judges operations, not mentions, from an executable-command
+representation. It reads only `tool_input.command`; prompts, briefs, and
+descriptions ride alongside and cannot run. Its shell tokenizer keeps quoted
+arguments as arguments, splits executable commands at shell connectors,
+recurses into `sh -c`/`bash -c` scripts, and removes here-document bodies
+before classifying commands. A multi-line brief or here-document can therefore
+contain `gh pr view` or `git clone` as data without becoming an operation,
+while the same words in a nested shell script are gated. Environment
+assignments and plain wrappers such as `env`, `exec`, and `xargs` are unwrapped
+before the program is classified. Only owner/repo-shaped URLs are candidate
+remotes, so a command whose argument links an issue or PR page is not
+`ls-remote`d into a refusal.
+
+For `git fetch`, `pull`, `push`, or `ls-remote` with a named remote rather than
+a URL, the guard runs `git config --get remote.<name>.url` locally. It gates the
+operation only when that configured URL is a recognized GitHub remote. An
+omitted fetch/pull/push remote defaults to `origin` for this resolution. This
+is local configuration inspection; no network or credential probe runs for a
+configured non-GitHub remote.
 
 Git's side of the rail depends on `gh auth git-credential` being configured
 as a credential helper in a git config the agent's git reads; `gh auth login`
@@ -240,12 +246,12 @@ environment, so a missing helper is caught at tool-call time as
 config, not re-running onboarding.
 
 `tightbeam github-auth-check` resolves the banked config dir itself, so the
-hook's probe never depends on the session's projected environment. The
-agent's own `gh`/`git` invocations do: a session spawned before the
-capability was banked has no `GH_CONFIG_DIR` and its direct gh calls read the
-unreachable default store. Until per-turn env re-projection exists, the
-operational rule is that GitHub work runs in sessions spawned after
-onboarding.
+hook's probe never depends on the session's projected environment. Agent
+`gh`/`git` invocations use the same path because `GH_CONFIG_DIR` is projected
+unconditionally at every adapter launch, whether or not the bank exists yet.
+When onboarding later creates files at that path, an already-running session
+sees them on its next invocation; no respawn or per-turn environment
+re-projection is required.
 
 Every agent environment (local adapter launch and satellite ssh launch) gets
 `GH_CONFIG_DIR` pointing at the host's banked dir — a path, never token bytes,
@@ -290,10 +296,14 @@ Session/project status should expose only non-secret fields. Suggested display:
 ```json
 {
   "github": {
+    "host": "eezo",
     "hostname": "github.com",
+    "gh_path": "/opt/homebrew/bin/gh",
     "state": "live",
     "account": "gdiab",
-    "gitProtocol": "https"
+    "git_protocol": "https",
+    "storage": "file",
+    "repair": null
   }
 }
 ```
@@ -313,6 +323,10 @@ Session/project status should expose only non-secret fields. Suggested display:
 - A proposed agent shell call such as `git clone https://github.com/org/repo.git`
   is refused before execution when host GitHub auth is missing, and the refusal
   names `tightbeam onboard github --hostname github.com --remote ...`.
+- `git fetch origin` resolves `remote.origin.url` and is refused before
+  execution when that URL is on GitHub. A configured non-GitHub origin passes.
+- A GitHub operation inside `sh -c` is gated; the same text inside a
+  here-document body is data and passes without a probe.
 - A command that merely mentions a GitHub URL or a gh subcommand in argument
   prose — `tightbeam assign --brief "read the gh issue thread at
   https://github.com/org/repo"` — is not probed and not refused.
@@ -322,7 +336,11 @@ Session/project status should expose only non-secret fields. Suggested display:
 - No prompt, status payload, log event, or agent message asks the operator to
   paste a PAT.
 - No token bytes appear in events, doctor output, status JSON, stderr logs, or
-  project metadata.
+  project metadata, including a token-shaped substring embedded after text
+  such as `provider_error=ghp_...`.
+- Before onboarding reports success, every banked directory is 0700 and every
+  banked file is 0600, including a provider-created `hosts.yml` that began
+  with a permissive mode.
 - A timeout or unreachable host reports `unknown` and does not authorize GitHub
   work.
 

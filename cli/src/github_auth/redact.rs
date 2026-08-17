@@ -1,19 +1,10 @@
 pub(super) fn scrub_detail(detail: &str) -> String {
+    let detail = redact_token_sequences(detail);
     let mut redacted = String::new();
     for word in detail.split_whitespace() {
-        let cleaned = if word.contains("github_pat_") && !word.contains("://") {
-            "[redacted]".to_owned()
-        } else if let Some((scheme, rest)) = word.split_once("://") {
+        let cleaned = if let Some((scheme, rest)) = word.split_once("://") {
             if let Some((userinfo, host_path)) = rest.split_once('@') {
-                // user:password AND token-as-username forms — gh accepts
-                // https://ghp_xxx@host clones, so a bare token can be the
-                // entire userinfo with no colon in sight.
-                let userinfo_is_secret = userinfo.contains(':')
-                    || userinfo.contains("github_pat_")
-                    || ["ghp_", "gho_", "ghu_", "ghs_", "ghr_"]
-                        .iter()
-                        .any(|prefix| userinfo.contains(prefix));
-                if userinfo_is_secret {
+                if userinfo.contains(':') || userinfo.contains("[redacted]") {
                     format!("{scheme}://[redacted]@{host_path}")
                 } else {
                     word.to_owned()
@@ -21,13 +12,6 @@ pub(super) fn scrub_detail(detail: &str) -> String {
             } else {
                 word.to_owned()
             }
-        } else if word.starts_with("ghp_")
-            || word.starts_with("gho_")
-            || word.starts_with("ghu_")
-            || word.starts_with("ghs_")
-            || word.starts_with("ghr_")
-        {
-            "[redacted]".to_owned()
         } else {
             word.to_owned()
         };
@@ -35,6 +19,48 @@ pub(super) fn scrub_detail(detail: &str) -> String {
             redacted.push(' ');
         }
         redacted.push_str(&cleaned);
+    }
+    redacted
+}
+
+fn redact_token_sequences(detail: &str) -> String {
+    const PREFIXES: [&str; 6] = ["github_pat_", "ghp_", "gho_", "ghu_", "ghs_", "ghr_"];
+
+    let mut redacted = String::with_capacity(detail.len());
+    let mut cursor = 0;
+    while cursor < detail.len() {
+        let next = PREFIXES
+            .iter()
+            .filter_map(|prefix| {
+                detail[cursor..]
+                    .find(prefix)
+                    .map(|offset| (cursor + offset, prefix))
+            })
+            .min_by_key(|(offset, _prefix)| *offset);
+
+        let Some((start, prefix)) = next else {
+            redacted.push_str(&detail[cursor..]);
+            break;
+        };
+        redacted.push_str(&detail[cursor..start]);
+
+        let value_start = start + prefix.len();
+        let mut end = value_start;
+        for ch in detail[value_start..].chars() {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                end += ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+
+        if end == value_start {
+            redacted.push_str(prefix);
+            cursor = value_start;
+        } else {
+            redacted.push_str("[redacted]");
+            cursor = end;
+        }
     }
     redacted
 }
@@ -52,5 +78,9 @@ mod tests {
         assert!(!scrubbed.contains("ghp_secret"));
         assert!(!scrubbed.contains("gho_secret"));
         assert!(scrubbed.contains("https://[redacted]@github.com/org/repo.git"));
+
+        let embedded =
+            scrub_detail("provider_error=ghp_fixture_EMBEDDED, token=github_pat_11ABC_def");
+        assert_eq!(embedded, "provider_error=[redacted], token=[redacted]");
     }
 }

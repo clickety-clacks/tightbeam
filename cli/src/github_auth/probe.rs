@@ -47,6 +47,7 @@ pub(super) fn onboard_with(
                      Do not paste a PAT into an agent; rerun tightbeam onboard github --hostname {hostname}."
                 ));
             }
+            gh.secure_banked_files()?;
             status = probe_with(&hostname, &gh);
         }
     }
@@ -71,6 +72,10 @@ pub(super) fn onboard_with(
         }
     }
 
+    // gh may have created or reused files with an operator umask. Onboarding
+    // cannot report success until every banked directory and file has the
+    // capability's 0700/0600 modes.
+    gh.secure_banked_files()?;
     write_metadata(base_dir, &status)?;
     println!(
         "{}",
@@ -347,6 +352,15 @@ fn write_metadata(base_dir: &Path, status: &GithubStatus) -> Result<(), String> 
         .ok_or_else(|| format!("metadata path has no parent: {}", path.display()))?;
     fs::create_dir_all(parent)
         .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    for dir in [
+        base_dir.join("auth"),
+        base_dir.join("auth").join("github"),
+        base_dir.join("auth").join("github").join(&status.hostname),
+        parent.to_path_buf(),
+    ] {
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("could not set 0700 on {}: {error}", dir.display()))?;
+    }
 
     let checked_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -491,6 +505,19 @@ mod tests {
                 & 0o777,
             0o600
         );
+        for dir in [
+            root.join("auth"),
+            root.join("auth/github"),
+            root.join("auth/github/github.com"),
+            root.join("auth/github/github.com/.tightbeam"),
+        ] {
+            assert_eq!(
+                fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+                0o700,
+                "{} must be private",
+                dir.display()
+            );
+        }
         fs::remove_dir_all(root).unwrap();
     }
 

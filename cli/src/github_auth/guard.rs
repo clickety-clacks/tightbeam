@@ -2,16 +2,44 @@ use super::bank::Gh;
 use super::probe::check_github_ready;
 
 pub(super) fn check_tool_call_with(raw: &str, gh: &impl Gh) -> Result<(), String> {
-    let texts = tool_call_strings(raw);
-    let mut remotes = texts
-        .iter()
-        .filter(|text| has_git_operation(text) || looks_like_gh_repo_call(text))
-        .flat_map(|text| github_remotes(text))
-        .collect::<Vec<_>>();
+    let mut remotes = Vec::new();
+    let mut gh_repo = false;
+
+    for text in tool_call_strings(raw) {
+        for command in executable_commands(&text) {
+            gh_repo |= looks_like_gh_repo_call(&command);
+
+            let Some((verb, args)) = git_operation(&command) else {
+                continue;
+            };
+
+            let direct = args
+                .iter()
+                .flat_map(|arg| github_remotes(arg))
+                .collect::<Vec<_>>();
+            if !direct.is_empty() {
+                remotes.extend(direct);
+                continue;
+            }
+
+            let operand = git_remote_operand(verb, args);
+            let remote_name = match operand {
+                Some(value) if is_named_remote(value) => Some(value),
+                None if matches!(verb, "fetch" | "pull" | "push") => Some("origin"),
+                _ => None,
+            };
+
+            if let Some(name) = remote_name {
+                if let Some(url) = gh.git_remote_url(name)? {
+                    remotes.extend(github_remotes(&url));
+                }
+            }
+        }
+    }
+
     remotes.sort();
     remotes.dedup();
 
-    let gh_repo = texts.iter().any(|text| looks_like_gh_repo_call(text));
     if remotes.is_empty() && !gh_repo {
         return Ok(());
     }
@@ -68,101 +96,6 @@ fn collect_json_strings(value: &serde_json::Value, strings: &mut Vec<String>) {
     }
 }
 
-// The guard judges operations, not mentions. A `tightbeam assign` whose brief
-// says "read the gh issue thread at https://github.com/org/repo" performs no
-// GitHub operation and must not be refused — that false positive blocked real
-// org traffic on day one. Command-position matching under-matches by design
-// (e.g. a gh call nested inside `sh -c "..."` slips through): for a hygiene
-// gate the acceptable direction to be wrong in is letting gh fail at runtime
-// with its own auth error, never blocking commands that merely talk about
-// GitHub.
-fn looks_like_gh_repo_call(text: &str) -> bool {
-    has_operation(text, "gh ", &["repo", "pr", "issue", "api"])
-}
-
-fn has_git_operation(text: &str) -> bool {
-    has_operation(
-        text,
-        "git ",
-        &[
-            "clone",
-            "fetch",
-            "pull",
-            "push",
-            "ls-remote",
-            "remote",
-            "submodule",
-        ],
-    )
-}
-
-fn has_operation(text: &str, program: &str, areas: &[&str]) -> bool {
-    // Quoted spans are blanked before matching: a shell only executes what
-    // sits outside quotes, so `--brief 'Fix it.\ngh pr view 123'` carries no
-    // gh operation no matter how its prose is line-broken. The original text
-    // still feeds remote extraction, where quoted URLs are legitimate
-    // operands (`git clone 'https://…'`).
-    let down = blank_quoted(text).to_ascii_lowercase();
-    down.match_indices(program).any(|(idx, _)| {
-        at_command_position(&down, idx)
-            && areas.iter().any(|area| {
-                let rest = down[idx + program.len()..].trim_start();
-                rest.strip_prefix(area).is_some_and(|after| {
-                    after.is_empty() || !after.starts_with(char::is_alphanumeric)
-                })
-            })
-    })
-}
-
-fn blank_quoted(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut quote: Option<char> = None;
-    let mut escaped = false;
-    for ch in text.chars() {
-        match quote {
-            Some(open) => {
-                out.push(' ');
-                if escaped {
-                    escaped = false;
-                } else if open == '"' && ch == '\\' {
-                    escaped = true;
-                } else if ch == open {
-                    quote = None;
-                }
-            }
-            None => {
-                if ch == '\'' || ch == '"' {
-                    quote = Some(ch);
-                    out.push(' ');
-                } else {
-                    out.push(ch);
-                }
-            }
-        }
-    }
-    // An unterminated quote blanks to the end — under-matching, the
-    // acceptable direction.
-    out
-}
-
-// Command position: everything between the last shell connector and the
-// candidate program must be an env assignment (`GIT_TERMINAL_PROMPT=0 git
-// clone …` is the single most common agent invocation shape) or a plain
-// command wrapper. An empty span — string start or right after a connector —
-// qualifies trivially.
-fn at_command_position(text: &str, idx: usize) -> bool {
-    let span_start = text[..idx]
-        .rfind([';', '&', '|', '(', '{', '\n', '`'])
-        .map_or(0, |connector| connector + 1);
-    text[span_start..idx].split_whitespace().all(|token| {
-        is_env_assignment(token)
-            || matches!(
-                token,
-                "env" | "command" | "exec" | "time" | "nohup" | "xargs"
-            )
-    })
-}
-
 fn is_env_assignment(token: &str) -> bool {
     token.split_once('=').is_some_and(|(name, _value)| {
         !name.is_empty()
@@ -171,6 +104,322 @@ fn is_env_assignment(token: &str) -> bool {
                 .chars()
                 .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
     })
+}
+
+// The guard represents executable shell commands as words. Quoted arguments
+// remain arguments, nested `sh -c` scripts are parsed recursively, and here-doc
+// bodies are removed before tokenization. That is the distinction the rail
+// needs: operations can be gated while briefs, prompts, and data stay data.
+fn executable_commands(text: &str) -> Vec<Vec<String>> {
+    let text = strip_heredoc_bodies(text);
+    let mut expanded = Vec::new();
+    for command in tokenize_commands(&text) {
+        if let Some(script) = nested_shell_script(&command) {
+            expanded.extend(executable_commands(script));
+        } else {
+            expanded.push(command);
+        }
+    }
+    expanded
+}
+
+fn nested_shell_script(command: &[String]) -> Option<&str> {
+    let command = normalized_command(command);
+    let program = command.first()?.rsplit('/').next()?;
+    if !matches!(program, "sh" | "bash" | "dash" | "zsh" | "ksh") {
+        return None;
+    }
+
+    command.windows(2).find_map(|pair| {
+        let flag = pair[0].as_str();
+        (flag == "-c" || (flag.starts_with('-') && flag[1..].contains('c')))
+            .then_some(pair[1].as_str())
+    })
+}
+
+fn looks_like_gh_repo_call(command: &[String]) -> bool {
+    let command = normalized_command(command);
+    command
+        .first()
+        .and_then(|program| program.rsplit('/').next())
+        .is_some_and(|program| program == "gh")
+        && command[1..]
+            .iter()
+            .any(|word| matches!(word.as_str(), "repo" | "pr" | "issue" | "api"))
+}
+
+fn git_operation(command: &[String]) -> Option<(&str, &[String])> {
+    let command = normalized_command(command);
+    if command.first()?.rsplit('/').next()? != "git" {
+        return None;
+    }
+
+    let mut index = 1;
+    while index < command.len() {
+        let word = command[index].as_str();
+        if matches!(
+            word,
+            "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace"
+        ) {
+            index += 2;
+        } else if word.starts_with('-') {
+            index += 1;
+        } else {
+            break;
+        }
+    }
+
+    let verb = command.get(index)?.as_str();
+    matches!(
+        verb,
+        "clone" | "fetch" | "pull" | "push" | "ls-remote" | "remote" | "submodule"
+    )
+    .then_some((verb, &command[index + 1..]))
+}
+
+fn git_remote_operand<'a>(verb: &str, args: &'a [String]) -> Option<&'a str> {
+    if !matches!(verb, "clone" | "fetch" | "pull" | "push" | "ls-remote") {
+        return None;
+    }
+
+    let value_options = [
+        "-b",
+        "--branch",
+        "--depth",
+        "--deepen",
+        "--filter",
+        "--jobs",
+        "--origin",
+        "--refmap",
+        "--server-option",
+        "--shallow-exclude",
+        "--shallow-since",
+        "--upload-pack",
+    ];
+    let mut skip_value = false;
+    for word in args {
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
+        if word == "--" {
+            continue;
+        }
+        if word.starts_with('-') {
+            skip_value = value_options.contains(&word.as_str()) && !word.contains('=');
+            continue;
+        }
+        return Some(word);
+    }
+    None
+}
+
+fn is_named_remote(value: &str) -> bool {
+    !value.is_empty()
+        && !value.contains("://")
+        && !value.starts_with("git@")
+        && !value.starts_with('.')
+        && !value.starts_with('/')
+        && !value.contains('/')
+}
+
+fn normalized_command(command: &[String]) -> &[String] {
+    let mut index = 0;
+    loop {
+        while command
+            .get(index)
+            .is_some_and(|word| is_env_assignment(word))
+        {
+            index += 1;
+        }
+
+        let Some(program) = command.get(index).and_then(|word| word.rsplit('/').next()) else {
+            return &command[command.len()..];
+        };
+        match program {
+            "env" => {
+                index += 1;
+                while command
+                    .get(index)
+                    .is_some_and(|word| word.starts_with('-') || is_env_assignment(word))
+                {
+                    index += 1;
+                }
+            }
+            "command" | "exec" | "time" | "nohup" | "xargs" => {
+                index += 1;
+                while command.get(index).is_some_and(|word| word.starts_with('-')) {
+                    index += 1;
+                }
+            }
+            _ => return &command[index..],
+        }
+    }
+}
+
+fn strip_heredoc_bodies(text: &str) -> String {
+    let mut pending = std::collections::VecDeque::<(String, bool)>::new();
+    let mut stripped = String::with_capacity(text.len());
+
+    for line in text.split_inclusive('\n') {
+        if let Some((delimiter, strip_tabs)) = pending.front() {
+            let candidate = line.trim_end_matches('\n').trim_end_matches('\r');
+            let candidate = if *strip_tabs {
+                candidate.trim_start_matches('\t')
+            } else {
+                candidate
+            };
+            if candidate == delimiter {
+                pending.pop_front();
+            }
+            if line.ends_with('\n') {
+                stripped.push('\n');
+            }
+            continue;
+        }
+
+        stripped.push_str(line);
+        pending.extend(heredoc_delimiters(line));
+    }
+    stripped
+}
+
+fn heredoc_delimiters(line: &str) -> Vec<(String, bool)> {
+    let chars = line.chars().collect::<Vec<_>>();
+    let mut delimiters = Vec::new();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut index = 0;
+
+    while index < chars.len() {
+        let ch = chars[index];
+        if let Some(open) = quote {
+            if escaped {
+                escaped = false;
+            } else if open == '"' && ch == '\\' {
+                escaped = true;
+            } else if ch == open {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        if matches!(ch, '\'' | '"') {
+            quote = Some(ch);
+            index += 1;
+            continue;
+        }
+        if ch != '<' || chars.get(index + 1) != Some(&'<') || chars.get(index + 2) == Some(&'<') {
+            index += 1;
+            continue;
+        }
+
+        index += 2;
+        let strip_tabs = chars.get(index) == Some(&'-');
+        if strip_tabs {
+            index += 1;
+        }
+        while chars.get(index).is_some_and(|ch| ch.is_whitespace()) {
+            index += 1;
+        }
+
+        let mut delimiter = String::new();
+        let mut delimiter_quote = None;
+        while let Some(&ch) = chars.get(index) {
+            if let Some(open) = delimiter_quote {
+                if ch == open {
+                    delimiter_quote = None;
+                } else {
+                    delimiter.push(ch);
+                }
+            } else if matches!(ch, '\'' | '"') {
+                delimiter_quote = Some(ch);
+            } else if ch.is_whitespace() || matches!(ch, ';' | '&' | '|') {
+                break;
+            } else {
+                delimiter.push(ch);
+            }
+            index += 1;
+        }
+        if !delimiter.is_empty() {
+            delimiters.push((delimiter, strip_tabs));
+        }
+    }
+    delimiters
+}
+
+fn tokenize_commands(text: &str) -> Vec<Vec<String>> {
+    let mut commands = Vec::new();
+    let mut command = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut comment = false;
+
+    for ch in text.chars() {
+        if comment {
+            if ch == '\n' {
+                push_word(&mut command, &mut word);
+                push_command(&mut commands, &mut command);
+                comment = false;
+            }
+            continue;
+        }
+
+        if let Some(open) = quote {
+            if escaped {
+                word.push(ch);
+                escaped = false;
+            } else if open == '"' && ch == '\\' {
+                escaped = true;
+            } else if ch == open {
+                quote = None;
+            } else {
+                word.push(ch);
+            }
+            continue;
+        }
+
+        if escaped {
+            word.push(ch);
+            escaped = false;
+            continue;
+        }
+
+        match ch {
+            '\\' => escaped = true,
+            '\'' | '"' => quote = Some(ch),
+            '#' if word.is_empty() => comment = true,
+            '\n' => {
+                push_word(&mut command, &mut word);
+                push_command(&mut commands, &mut command);
+            }
+            ch if ch.is_whitespace() => push_word(&mut command, &mut word),
+            ';' | '&' | '|' | '(' | ')' | '{' | '}' | '`' => {
+                push_word(&mut command, &mut word);
+                push_command(&mut commands, &mut command);
+            }
+            _ => word.push(ch),
+        }
+    }
+    if escaped {
+        word.push('\\');
+    }
+    push_word(&mut command, &mut word);
+    push_command(&mut commands, &mut command);
+    commands
+}
+
+fn push_word(command: &mut Vec<String>, word: &mut String) {
+    if !word.is_empty() {
+        command.push(std::mem::take(word));
+    }
+}
+
+fn push_command(commands: &mut Vec<Vec<String>>, command: &mut Vec<String>) {
+    if !command.is_empty() {
+        commands.push(std::mem::take(command));
+    }
 }
 
 fn github_remotes(text: &str) -> Vec<String> {
@@ -393,5 +642,59 @@ mod tests {
                 "operation must still be gated: {command}"
             );
         }
+    }
+
+    #[test]
+    fn tool_call_guard_resolves_named_github_remotes_before_fetch() {
+        let raw = serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": "git fetch origin"}
+        })
+        .to_string();
+        let gh = FakeGh::new(false).remote_url("origin", Some("https://github.com/org/repo.git"));
+
+        let error = check_tool_call_with(&raw, &gh).unwrap_err();
+        assert!(error.contains("Tightbeam cannot use GitHub"));
+        assert!(error.contains("--remote https://github.com/org/repo.git"));
+    }
+
+    #[test]
+    fn tool_call_guard_does_not_gate_named_non_github_remotes() {
+        let raw = serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": "git fetch origin"}
+        })
+        .to_string();
+        let gh =
+            FakeGh::new(false).remote_url("origin", Some("https://gitlab.example/org/repo.git"));
+
+        assert_eq!(check_tool_call_with(&raw, &gh), Ok(()));
+    }
+
+    #[test]
+    fn tool_call_guard_recurses_into_nested_shell_scripts() {
+        let raw = serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": {
+                "command": "sh -c \"git clone https://github.com/org/repo.git\""
+            }
+        })
+        .to_string();
+
+        let error = check_tool_call_with(&raw, &FakeGh::new(false)).unwrap_err();
+        assert!(error.contains("Tightbeam cannot use GitHub"));
+    }
+
+    #[test]
+    fn tool_call_guard_ignores_github_operations_inside_heredoc_data() {
+        let raw = serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": {
+                "command": "cat <<'EOF' > /tmp/note\ngit clone https://github.com/org/repo.git\nEOF\n"
+            }
+        })
+        .to_string();
+
+        assert_eq!(check_tool_call_with(&raw, &FakeGh::new(false)), Ok(()));
     }
 }

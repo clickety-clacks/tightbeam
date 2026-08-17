@@ -62,11 +62,17 @@ defmodule Tightbeam.GithubAuth do
   @doc """
   The live readiness probe: gh auth, gh api identity, and git ls-remote for
   the given remote, all run with the banked GH_CONFIG_DIR. Returns
-  `{:ok, %{account: name, git_protocol: protocol}}` or
+  `{:ok, %{account: name, git_protocol: protocol, gh_path: path, storage: "file"}}` or
   `{:error, state, scrubbed_detail}` with the spec's state names.
   """
   @spec probe(String.t(), String.t(), String.t()) ::
-          {:ok, %{account: String.t(), git_protocol: String.t() | nil}}
+          {:ok,
+           %{
+             account: String.t(),
+             git_protocol: String.t() | nil,
+             gh_path: String.t(),
+             storage: String.t()
+           }}
           | {:error, atom(), String.t()}
   def probe(base_dir, hostname, remote_url) do
     env = env(base_dir)
@@ -90,10 +96,17 @@ defmodule Tightbeam.GithubAuth do
               stderr_to_stdout: true,
               env: env
             )} do
-      {:ok, %{account: String.trim(account), git_protocol: git_protocol(env)}}
+      {:ok,
+       %{
+         account: String.trim(account),
+         git_protocol: git_protocol(env),
+         gh_path: path,
+         storage: "file"
+       }}
     else
       {:gh, nil} ->
-        {:error, :missing_cli, "gh is missing from PATH"}
+        {:error, :missing_cli,
+         "gh is missing from PATH; PATH searched: #{System.get_env("PATH") || ""}"}
 
       {_step, :timeout} ->
         {:error, :unknown, "GitHub readiness probe timed out"}

@@ -145,6 +145,16 @@ defmodule Tightbeam.GithubAuthE2ETest do
     refute login_args =~ "--with-token"
     refute String.downcase(login_args) =~ "pat"
 
+    assert {:ok, github_status} =
+             with_fixture_env(ctx, ctx.local, "live", "local-fixture", fn ->
+               GithubAuth.probe(ctx.local, "github.com", @remote)
+             end)
+
+    assert github_status.gh_path == Path.join(ctx.bin, "gh")
+    assert github_status.storage == "file"
+    assert github_status.account == "fixture-user"
+    assert github_status.git_protocol == "https"
+
     {guard_output, 0} =
       run_cli(ctx, ctx.local, "live", "local-fixture", ["github-auth-check"],
         input: tool_call("git clone #{@remote}")
@@ -207,6 +217,48 @@ defmodule Tightbeam.GithubAuthE2ETest do
                  "github-auth-check"
                ],
                input: prose
+             )
+
+    assert File.read!(ctx.log) == ""
+
+    File.write!(ctx.log, "")
+
+    {named_refusal, 1} =
+      run_cli(ctx, ctx.satellite, "live", "satellite-fixture", ["github-auth-check"],
+        input: tool_call("git fetch origin")
+      )
+
+    assert named_refusal =~ "from host satellite-fixture for github.com"
+    assert named_refusal =~ "--remote #{@remote}"
+
+    assert Enum.any?(fixture_calls(ctx), fn {program, dir, args} ->
+             program == "git" and dir == satellite_dir and
+               args == "config --get remote.origin.url"
+           end)
+
+    File.write!(ctx.log, "")
+
+    {nested_refusal, 1} =
+      run_cli(ctx, ctx.satellite, "live", "satellite-fixture", ["github-auth-check"],
+        input: tool_call("sh -c \"git clone #{@remote}\"")
+      )
+
+    assert nested_refusal =~ "from host satellite-fixture for github.com"
+
+    File.write!(ctx.log, "")
+
+    heredoc = "cat <<'EOF' > /tmp/github-note\ngit clone #{@remote}\nEOF\n"
+
+    assert {"", 0} =
+             run_cli(
+               ctx,
+               ctx.satellite,
+               "explode",
+               "satellite-fixture",
+               [
+                 "github-auth-check"
+               ],
+               input: tool_call(heredoc)
              )
 
     assert File.read!(ctx.log) == ""
@@ -275,6 +327,13 @@ defmodule Tightbeam.GithubAuthE2ETest do
     github_check = Enum.find(report.checks, &(&1.name == "github_auth:github.com"))
     refute github_check.ok
     assert github_check.detail =~ "git_unready"
+    assert github_check.detail =~ "host local-fixture"
+    assert github_check.detail =~ "gh #{Path.join(ctx.bin, "gh")}"
+    assert github_check.detail =~ "storage file"
+    assert report.github.host == "local-fixture"
+    assert report.github.gh_path == Path.join(ctx.bin, "gh")
+    assert report.github.state == "git_unready"
+    assert report.github.storage == "file"
 
     for rendered <- [Doctor.format(report, :human), Doctor.format(report, :json)] do
       refute rendered =~ @secret
@@ -512,9 +571,11 @@ defmodule Tightbeam.GithubAuthE2ETest do
             ;;
         esac
         mkdir -p "$GH_CONFIG_DIR"
-        umask 077
+        # Deliberately simulate a permissive provider-created file. Tightbeam,
+        # not this fixture, must repair it before reporting success.
+        umask 022
         printf 'github.com:\n  oauth_token: %s\n  user: fixture-user\n' "$secret" > "$GH_CONFIG_DIR/hosts.yml"
-        chmod 600 "$GH_CONFIG_DIR/hosts.yml"
+        chmod 644 "$GH_CONFIG_DIR/hosts.yml"
         exit 0
         ;;
       api:--hostname)
@@ -557,8 +618,13 @@ defmodule Tightbeam.GithubAuthE2ETest do
     secret="${GH_FIXTURE_SECRET:-ghp_fixture_secret}"
     printf 'git|%s|%s\n' "$GH_CONFIG_DIR" "$*" >> "$GH_FIXTURE_LOG"
 
+    if [ "$*" = "config --get remote.origin.url" ]; then
+      printf 'https://github.com/example/project.git\n'
+      exit 0
+    fi
+
     if [ "$mode" = "git_fail" ]; then
-      printf 'credential %s refused for %s\n' "$secret" "$2" >&2
+      printf 'provider_error=%s refused for %s\n' "$secret" "$2" >&2
       exit 128
     fi
 

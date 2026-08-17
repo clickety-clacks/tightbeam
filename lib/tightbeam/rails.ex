@@ -85,10 +85,11 @@ defmodule Tightbeam.Rails do
   @observation_pattern "tightbeam[^\"]*artifact-record"
   # A cheap prefilter only — it may over-match freely (the CLI judges
   # operations vs mentions), but it must never exclude an operation the CLI
-  # would gate. The checker accepts any whitespace run between `gh ` and the
-  # area word and no trailing character after it, so this pattern must be at
-  # least that generous per area.
-  @github_auth_pattern "(github\\.com|gh[[:space:]]+(repo|pr|issue|api))"
+  # would gate. Every raw `git` mention reaches the checker because named
+  # remotes have no github.com literal; the checker then reads only the
+  # executable command representation, so this deliberate over-match cannot
+  # turn descriptions or heredoc data into operations.
+  @github_auth_pattern "(github\\.com|gh[[:space:]]+(repo|pr|issue|api)|git)"
 
   @typedoc "A validated gate statute."
   @type statute :: %{

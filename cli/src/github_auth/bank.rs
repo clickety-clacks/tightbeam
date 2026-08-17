@@ -10,6 +10,12 @@ pub(super) trait Gh {
     fn output(&self, args: &[&str]) -> Result<Output, String>;
     fn status(&self, args: &[&str]) -> Result<std::process::ExitStatus, String>;
     fn git_ls_remote(&self, remote: &str) -> Result<Output, String>;
+    fn git_remote_url(&self, _name: &str) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+    fn secure_banked_files(&self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Runs gh (and git, whose credential helper is gh) against the banked
@@ -109,6 +115,66 @@ impl Gh for RealGh {
             .map_err(|error| format!("failed to run git ls-remote: {error}"))?;
         wait_bounded(child, "git ls-remote")
     }
+
+    fn git_remote_url(&self, name: &str) -> Result<Option<String>, String> {
+        let key = format!("remote.{name}.url");
+        let output = self
+            .command("git")
+            .args(["config", "--get", &key])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|error| format!("failed to resolve git remote {name}: {error}"))?;
+
+        if !output.status.success() {
+            return Ok(None);
+        }
+
+        let url = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        Ok((!url.is_empty()).then_some(url))
+    }
+
+    fn secure_banked_files(&self) -> Result<(), String> {
+        if let Some(dir) = &self.config_dir {
+            restrict_banked_tree(dir)?;
+        }
+        Ok(())
+    }
+}
+
+fn restrict_banked_tree(path: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("could not inspect {}: {error}", path.display()))?;
+
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "refusing symlink in banked GitHub config: {}",
+            path.display()
+        ));
+    }
+
+    if metadata.is_dir() {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("could not set 0700 on {}: {error}", path.display()))?;
+        for entry in fs::read_dir(path)
+            .map_err(|error| format!("could not read {}: {error}", path.display()))?
+        {
+            let entry = entry.map_err(|error| {
+                format!("could not inspect entry in {}: {error}", path.display())
+            })?;
+            restrict_banked_tree(&entry.path())?;
+        }
+        return Ok(());
+    }
+
+    if metadata.is_file() {
+        return fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("could not set 0600 on {}: {error}", path.display()));
+    }
+
+    Err(format!(
+        "unsupported entry in banked GitHub config: {}",
+        path.display()
+    ))
 }
 
 // Probe output is small (auth status lines, one ls-remote ref), so waiting for
@@ -181,5 +247,36 @@ mod tests {
             RealGh::using_banked(&root).config_dir.as_deref(),
             Some(gh_config_dir(&root).as_path())
         );
+    }
+
+    #[test]
+    fn secure_banked_files_repairs_existing_file_and_directory_modes() {
+        let root = std::env::temp_dir().join(format!(
+            "tb-gh-private-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let gh = RealGh::banking_into(&root).unwrap();
+        let dir = gh_config_dir(&root);
+        let nested = dir.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o755)).unwrap();
+        let hosts = dir.join("hosts.yml");
+        fs::write(&hosts, "github.com:\n").unwrap();
+        fs::set_permissions(&hosts, fs::Permissions::from_mode(0o644)).unwrap();
+
+        gh.secure_banked_files().unwrap();
+
+        assert_eq!(
+            fs::metadata(&nested).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&hosts).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::remove_dir_all(&root).unwrap();
     }
 }
