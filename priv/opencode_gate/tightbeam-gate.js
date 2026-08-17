@@ -34,8 +34,11 @@ export const TightbeamGate = async () => {
         let re;
         try {
           re = new RegExp(statute.pattern);
-        } catch {
-          continue;
+        } catch (e) {
+          // FAIL-CLOSED: a malformed statute pattern is a broken gate, not an absent one. Deny
+          // the call rather than skip the statute — a skipped rule is a silent hole, exactly the
+          // failure a rails gate must never have.
+          throw new Error(`[gate: ${statute.name}] malformed statute pattern; denied fail-closed`);
         }
         if (re.test(callJson)) {
           // Same refusal contract as the codex/claude gate: abort the call before it runs and
