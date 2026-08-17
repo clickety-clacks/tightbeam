@@ -249,6 +249,10 @@ defmodule Tightbeam.SessionLane do
   defp finalize(state, seq, outcome) do
     {terminal, error, publish, in_txn} =
       case outcome do
+        {:ok, %{terminal_publish: fun, record_in_txn: action}}
+        when is_function(fun, 1) and is_function(action, 1) ->
+          {"delivered", nil, fun, action}
+
         {:ok, %{terminal_publish: fun}} when is_function(fun, 1) ->
           {"delivered", nil, fun, nil}
 
@@ -266,25 +270,26 @@ defmodule Tightbeam.SessionLane do
           {"failed", error_text(reason), nil, nil}
       end
 
-    finish_result =
+    {finish_result, post_commit} =
       if in_txn do
-        {:ok, won} =
+        {:ok, {won, post_commit}} =
           DB.transaction(state.db, fn txn ->
             if Ledger.finish_in_txn(txn, seq, terminal, error) do
-              in_txn.(txn)
-              true
+              {true, in_txn.(txn)}
             else
-              false
+              {false, nil}
             end
           end)
 
-        if won, do: :ok, else: :already_terminal
+        {if(won, do: :ok, else: :already_terminal), post_commit}
       else
-        Ledger.finish(state.db, seq, terminal, error)
+        {Ledger.finish(state.db, seq, terminal, error), nil}
       end
 
     case finish_result do
       :ok ->
+        if is_function(post_commit, 0), do: post_commit.()
+
         if publish do
           publish.(terminal)
         else
