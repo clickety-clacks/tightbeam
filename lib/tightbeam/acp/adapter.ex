@@ -401,21 +401,6 @@ defmodule Tightbeam.Acp.Adapter do
           {:error, reason} -> raise "harness process identity unavailable: #{inspect(reason)}"
         end
 
-        # Rails-critical launch invariant 3: a harness that can bind a network listener under a
-        # bypass flag (OpenCode's `--port`/`serve` expose an ungated shell route) must have ZERO
-        # LISTEN sockets in its launched process group. Fail-closed — refuse the launch rather
-        # than proceed degraded. Opt-in, so stdio-only harnesses' launch path is unchanged.
-        if Harness.requires_zero_listeners?(module) do
-          case Tightbeam.HarnessProcess.assert_zero_listeners(db, launch_id) do
-            :ok ->
-              :ok
-
-            {:error, reason} ->
-              raise "rails-critical: launched #{harness} process group holds a network listener; " <>
-                      "refusing launch (invariant: 0 LISTEN sockets): #{inspect(reason)}"
-          end
-        end
-
       :error ->
         :ok
     end
@@ -444,10 +429,43 @@ defmodule Tightbeam.Acp.Adapter do
            timeout: :infinity
          ) do
       {:ok, %{"protocolVersion" => 1}} ->
-        gate(opts, state)
+        case listener_guard(opts, module, harness, state, stderr_path, offset) do
+          :ok -> gate(opts, state)
+          stop -> stop
+        end
 
       other ->
         {:stop, adapter_failure_reason({:initialize_failed, other}, stderr_path, offset), state}
+    end
+  end
+
+  # Rails-critical launch invariant 3 (ZERO LISTEN sockets in the launched process group), asserted
+  # AFTER `initialize` returns — the harness is fully booted by the time it answers, so a listener
+  # it binds DURING boot is now observable. A pre-initialize probe raced the bind: OpenCode's
+  # :4096 HTTP server comes up ~0.3–1.1s after spawn, AFTER `capture_identity`. Fail-closed: a
+  # listener (or an inconclusive probe) refuses the launch. Applies automatically to the :shim
+  # harness class (`Harness.requires_zero_listeners?/1`); a launch with no recorded process group
+  # cannot be probed and is skipped here.
+  #
+  # RESIDUAL (honest, unclosable by this mechanism): even a settle-window probe cannot catch a
+  # listener bound strictly AFTER the last sample. That gap is input for the go-live threat-model
+  # adjudication, not something the assert can eliminate.
+  defp listener_guard(opts, module, harness, state, stderr_path, offset) do
+    with true <- Harness.requires_zero_listeners?(module),
+         {:ok, launch_id} <- Keyword.fetch(opts, :harness_process_launch_id) do
+      db = Keyword.get(opts, :db, Tightbeam.DB)
+
+      case Tightbeam.HarnessProcess.assert_zero_listeners(db, launch_id) do
+        :ok ->
+          :ok
+
+        {:error, reason} ->
+          {:stop,
+           adapter_failure_reason({:listener_present, harness, reason}, stderr_path, offset),
+           state}
+      end
+    else
+      _ -> :ok
     end
   end
 
