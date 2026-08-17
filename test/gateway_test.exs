@@ -1954,6 +1954,114 @@ defmodule Tightbeam.GatewayTest do
     assert Org.get(ctx.db, coder.session_key).display_name == "Product Owner — Outpost"
   end
 
+  test "Gateway.migrate_po_display_names broadcasts the ordinary stream_updated event for every session it renames, and only for those",
+       ctx do
+    ensure_global_registry()
+
+    {:ok, _ref, nil} =
+      ConnRegistry.register(Tightbeam.ConnRegistry, %{
+        pid: self(),
+        user_id: "flynn",
+        device_id: "migrate-po-display-device",
+        is_admin: false,
+        subscriptions: MapSet.new(["chat"])
+      })
+
+    migrating =
+      Org.create(ctx.db, %{
+        session_key: "po-migrate-1",
+        display_name: "Product Owner — Outpost",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "product-owner",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+
+    already_normalized =
+      Org.create(ctx.db, %{
+        session_key: "po-migrate-2",
+        display_name: "PO — Weather",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "product-owner",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+
+    migrated = Gateway.migrate_po_display_names(ctx.db)
+    assert Enum.map(migrated, & &1.session_key) == [migrating.session_key]
+
+    migrating_key = migrating.session_key
+    already_normalized_key = already_normalized.session_key
+
+    assert_receive {:push,
+                    %{
+                      "type" => "stream_updated",
+                      "stream" => %{
+                        "sessionKey" => ^migrating_key,
+                        "displayName" => "PO — Outpost"
+                      }
+                    }}
+
+    refute_receive {:push,
+                    %{
+                      "type" => "stream_updated",
+                      "stream" => %{"sessionKey" => ^already_normalized_key}
+                    }}
+  end
+
+  test "a product-owner spawn concurrent with migration never acquires the old prefix", ctx do
+    base_dir = role_test_base("spawn-po-migration-race")
+    manifests = Path.join([base_dir, "identity", "archetypes"])
+    File.mkdir_p!(manifests)
+    File.write!(Path.join(manifests, "product-owner.toml"), ~s(name = "product-owner"\n))
+    Archetypes.load!(base_dir)
+    ensure_global_registry()
+
+    Org.create(ctx.db, %{
+      session_key: "po-race-existing",
+      display_name: "Product Owner — Outpost",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "product-owner",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("fable")
+    })
+
+    spawn = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["spawn"]
+
+    [spawn_result, _migrated] =
+      [
+        Task.async(fn ->
+          spawn.(%{
+            origin: "user:flynn",
+            session_key: nil,
+            params: %{
+              display_name: "Product Owner — Weather",
+              archetype: "product-owner",
+              idempotency_key: "spawn-po-migration-race"
+            }
+          })
+        end),
+        Task.async(fn -> Gateway.migrate_po_display_names(ctx.db) end)
+      ]
+      |> Task.await_many(10_000)
+
+    # normalize_spawn_display_name runs before the write ever reaches the DB,
+    # so the new session's stored name is never the raw old-prefixed input —
+    # true for either interleaving `Tightbeam.DB`'s single serialized
+    # connection could pick between the two concurrent transactions.
+    assert Org.get(ctx.db, spawn_result.session_key).display_name == "PO — Weather"
+    assert Org.get(ctx.db, "po-race-existing").display_name == "PO — Outpost"
+  end
+
   test "spawn has no session-count gate when the cap is unset", ctx do
     base_dir = role_test_base("spawn-unlimited")
     Archetypes.load!(base_dir)

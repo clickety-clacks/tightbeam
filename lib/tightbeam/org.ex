@@ -401,30 +401,49 @@ defmodule Tightbeam.Org do
   transaction against the exact old prefix, so this is idempotent — a
   session already renamed no longer matches and a second run selects
   nothing. Touches only `displayName`; retired sessions and every other
-  column are untouched. Returns the before/after mapping actually applied.
+  column are untouched.
+
+  The UPDATE rechecks `state = 'active' AND archetype = ?` itself rather
+  than trusting the SELECT above it, so a session that retires (or is
+  reassigned off `product-owner`) between discovery and write within this
+  same transaction is skipped, not renamed — `Txn.changes(txn) == 1` is the
+  same expected-match guard `swap_model_in_txn/4` uses for the same reason.
+  `Tightbeam.DB` fully serializes every transaction through one connection
+  (see its moduledoc), so no other write can actually land inside this
+  window today; the recheck is the correctness argument that stays true if
+  that ever changes, not a race this suite can force open.
+
+  Returns every session actually renamed, in its POST-migration state, so a
+  caller can broadcast `stream_updated` for each (see
+  `Tightbeam.Gateway.migrate_po_display_names/1`) without a second read.
   """
-  @spec migrate_po_display_names(db()) :: [
-          %{session_key: String.t(), from: String.t(), to: String.t()}
-        ]
+  @spec migrate_po_display_names(db()) :: [session()]
   def migrate_po_display_names(db \\ Tightbeam.DB) do
-    transaction!(db, fn txn ->
-      targets =
-        txn
-        |> Txn.q(po_display_candidates_sql(), [@po_archetype_name])
-        |> po_display_migration_targets()
+    transaction!(db, fn txn -> migrate_po_display_names_in_txn(txn) end)
+  end
 
-      now = now()
+  defp migrate_po_display_names_in_txn(%Txn{} = txn) do
+    targets =
+      txn
+      |> Txn.q(po_display_candidates_sql(), [@po_archetype_name])
+      |> po_display_migration_targets()
 
-      Enum.each(targets, fn %{session_key: session_key, to: to} ->
-        Txn.q(
-          txn,
-          "UPDATE sessions SET displayName = ?2, updatedAt = ?3 WHERE sessionKey = ?1",
-          [session_key, to, now]
-        )
-      end)
+    now = now()
 
-      targets
+    targets
+    |> Enum.reduce([], fn %{session_key: session_key, to: to}, renamed ->
+      Txn.q(
+        txn,
+        """
+        UPDATE sessions SET displayName = ?2, updatedAt = ?3
+        WHERE sessionKey = ?1 AND state = 'active' AND archetype = ?4
+        """,
+        [session_key, to, now, @po_archetype_name]
+      )
+
+      if Txn.changes(txn) == 1, do: [must_get(txn, session_key) | renamed], else: renamed
     end)
+    |> Enum.reverse()
   end
 
   defp po_display_candidates_sql,

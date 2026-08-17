@@ -421,8 +421,11 @@ defmodule Tightbeam.OrgTest do
     plan = Org.po_display_migration_plan(db)
     assert plan == [%{session_key: "po-1", from: "Product Owner — Outpost", to: "PO — Outpost"}]
 
+    history_counts_before = history_table_counts(db)
+
     applied = Org.migrate_po_display_names(db)
-    assert applied == plan
+    assert Enum.map(applied, & &1.session_key) == ["po-1"]
+    assert Enum.map(applied, & &1.display_name) == ["PO — Outpost"]
 
     assert Org.get(db, "po-1").display_name == "PO — Outpost"
     assert Org.get(db, "po-2").display_name == already_normalized.display_name
@@ -435,6 +438,10 @@ defmodule Tightbeam.OrgTest do
     assert migrated.archetype == target.archetype
     assert migrated.state == target.state
     assert migrated.owner_user_id == target.owner_user_id
+
+    # No historical row anywhere moved — the migration's only statement is an
+    # UPDATE against `sessions`, so it cannot reach these tables at all.
+    assert history_table_counts(db) == history_counts_before
 
     # Idempotent: the prefix no longer matches, so a second run selects nothing.
     assert Org.po_display_migration_plan(db) == []
@@ -488,6 +495,13 @@ defmodule Tightbeam.OrgTest do
 
     assert_raise ArgumentError, "unknown session: missing", fn ->
       Org.rename(db, "missing", "Nope")
+    end
+  end
+
+  defp history_table_counts(db) do
+    for table <- ~w(events lifecycle_events messages) do
+      {:ok, [[count]]} = DB.query(db, "SELECT COUNT(*) FROM #{table}")
+      {table, count}
     end
   end
 

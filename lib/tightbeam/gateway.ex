@@ -4035,6 +4035,28 @@ defmodule Tightbeam.Gateway do
     end
   end
 
+  @doc """
+  Apply `Org.migrate_po_display_names/1` and broadcast the ordinary
+  `stream_updated` event for every session it renamed — the same
+  composition `tune`'s own rename setting uses (`Org.rename/3` +
+  `Payloads.stream_session/1` + `broadcast/3`), so a connected client never
+  retains a stale product-owner label. Returns the migrated sessions.
+  """
+  @spec migrate_po_display_names(Org.db()) :: [Org.session()]
+  def migrate_po_display_names(db \\ Tightbeam.DB) do
+    migrated = Org.migrate_po_display_names(db)
+
+    Enum.each(migrated, fn session ->
+      broadcast(
+        db,
+        session.owner_user_id,
+        Payloads.stream_updated(Payloads.stream_session(session))
+      )
+    end)
+
+    migrated
+  end
+
   defp spawn_cap_reached_in_txn?(_txn, _owner_user_id, cap)
        when not is_integer(cap) or cap <= 0,
        do: false
