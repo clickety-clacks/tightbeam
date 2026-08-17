@@ -263,6 +263,11 @@ defmodule Tightbeam.Org do
   writer could have moved since. Reading it again here, as the first statement
   of the transaction that will act on the answer, closes that gap the same way
   `Ledger.pending_count_in_txn/2` does.
+
+  The retirement cascade reads through here for the same reason: it needs the
+  DURABLE state of a member it just tried to retire, in the same transaction,
+  because retirement is now deferrable and the attempt no longer implies the
+  outcome (review att_8017ebe7 F3).
   """
   @spec get_in_txn(Txn.t(), String.t()) :: session() | nil
   def get_in_txn(%Txn{} = txn, session_key) do
@@ -1207,21 +1212,6 @@ defmodule Tightbeam.Org do
 
       must_get(txn, session_key)
     end)
-  end
-
-  @doc """
-  Read a session inside an open transaction, or nil.
-
-  The retirement cascade needs the DURABLE state of a member it just tried to
-  retire, in the same transaction, because retirement is now deferrable and the
-  attempt no longer implies the outcome (review att_8017ebe7 F3).
-  """
-  @spec get_in_txn(Txn.t(), String.t()) :: session() | nil
-  def get_in_txn(%Txn{} = txn, session_key) do
-    case Txn.q(txn, select_session_sql() <> " WHERE sessionKey = ?1", [session_key]) do
-      [row] -> to_session(row)
-      [] -> nil
-    end
   end
 
   defp must_get(txn, session_key) do
