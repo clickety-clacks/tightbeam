@@ -17,20 +17,25 @@ defmodule Tightbeam.Harness.Opencode do
        bakes in the `acp` subcommand; the only argv added downstream is the rails-exec wrapper +
        a stderr redirect. There is no code path by which `--pure` reaches the CLI.
     2. NEVER `serve`/`--port`/`--hostname`/`--mdns`. Those open an HTTP listener whose
-       `POST /session/{id}/shell` route runs commands with NO model and BYPASSES the plugin gate.
-       Production launch is `opencode acp`; the argv is held by the same construction as (1) — the
-       shim is `exec opencode acp "$@"` and Tightbeam passes no argv.
+       `POST /session/{id}/shell` (and `/command`, `/pty`, `/tui`) routes run commands with NO
+       model. TRUE BEHAVIOR (captured, EVIDENCE/RAILS-INVESTIGATION-Qb-floor.md): those routes
+       escape BOTH the plugin gate (no `tool.execute.before` fires) AND the harness-exec
+       process-group floor (the spawned command runs in its OWN process group, so
+       `harness-group killpg(recorded_pgid)` cannot reach it). Production launch is `opencode acp`;
+       the argv is held by the same construction as (1) — the shim is `exec opencode acp "$@"` and
+       Tightbeam passes no argv.
     3. 0 LISTEN sockets asserted at spawn, fail-closed — enforced AUTOMATICALLY for the whole
        `:shim` class (`Harness.requires_zero_listeners?/1` gates on `adapter_provisioning`), in the
        shared launch seam (`Tightbeam.Acp.Adapter`), asserted AFTER `initialize` returns + over a
        settle window — because `opencode acp` v1.18.18 binds its 127.0.0.1:4096 HTTP server (the
-       `/session/{id}/shell` bypass surface) ~0.3–1.1s AFTER spawn (captured live,
-       EVIDENCE/RAILS-FINDING-acp-http-listener.md), which a pre-initialize probe would race. What
-       is CAPTURED: the listener finding, and the probe/refusal logic (unit-tested). NOT yet
-       captured end-to-end: the assert firing through the real adapter-boot path for a registered
-       OpenCode — that is a go-live validation, not something claimed here. HONEST RESIDUAL: a
-       listener bound strictly after the last sample is not caught; that gap is for the go-live
-       threat-model adjudication.
+       route surface in (2)) ~0.3–1.1s AFTER spawn (captured live,
+       EVIDENCE/RAILS-FINDING-acp-http-listener.md), which a pre-initialize probe would race.
+       This assert is a RACY BEST-EFFORT detector, NOT A GUARANTEE: it samples a settle window and
+       cannot catch a listener bound strictly after the last sample. What is CAPTURED: the listener
+       finding, and the probe/refusal logic (unit-tested). NOT captured end-to-end: the assert
+       firing through the real adapter-boot path for a registered OpenCode — a go-live validation,
+       not claimed here. The residual + the (2) gate/floor escape are inputs for the go-live
+       threat-model adjudication, which a per-launch probe cannot close.
 
   GATE: `prepare_launch/3` points OpenCode at a Tightbeam-owned config (via `OPENCODE_CONFIG`)
   whose `plugin` array references the out-of-tree gate plugin (`priv/opencode_gate/`). The
