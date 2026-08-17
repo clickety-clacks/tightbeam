@@ -948,7 +948,6 @@ defmodule Tightbeam.PlacementTest do
            )[:env]
   end
 
-
   test "adapter_opts appends an ssh overlay to remote_env", %{base_dir: base_dir, db: db} do
     Application.put_env(:tightbeam, :advertised_url, "http://gateway.example:4000")
 
