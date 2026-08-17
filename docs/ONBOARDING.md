@@ -32,6 +32,30 @@ An `onboarded` result from the CLI is therefore a claim about the ceremony, not
 proof the credential works; prove liveness separately (below) before trusting
 it.
 
+## The definition of interactive onboarding
+
+Interactive onboarding is not complete until the operator holds the sign-in URL
+and the one-time code. The loop runs through the operator: the operator opens the
+URL, approves in a browser, and the ceremony banks the credential. No code in the
+operator's hands means the operator cannot finish. So the onboarding is not done.
+Every `tightbeam onboard <provider>` means this full loop, not just the command
+returning.
+
+The ceremony delivers the URL and code so an operator who cannot see its terminal
+still receives them — a session-run install over a private pty is the case this
+protects. It emits the deliverable three ways:
+
+- a **wake** to the owner user, carrying the URL and code. This is the durable
+  record and the notification in one.
+- a **0600 delivery file** in the working directory
+  (`onboard-delivery-<provider>-<ms>.json`). This is a local copy a courier can read.
+- a **structured line** on stdout (`{"onboardingDelivery": …}`) for a relay to parse.
+
+The one-time code is not a credential. It is a short-lived pairing code that expires
+in minutes. If the gateway does not name the owner (an older gateway, or a caller
+with no owner), the ceremony still writes the file and the structured line, and it
+records that no wake was sent. It degrades loudly, never silently.
+
 ## Running an interactive ceremony
 
 Run it ON the host whose credential it banks. Credentials never transit between

@@ -905,6 +905,25 @@ pub fn build_onboard_phase_request(
     request(identity, "onboard", vec![], params)
 }
 
+/// Build a `wake --user <owner>` request carrying the onboarding sign-in prompt, so the
+/// operator who cannot see the ceremony's terminal still receives the URL+code. The wake
+/// row IS the durable record of the delivery (wi_0535922b) -- it persists in the substrate
+/// with the code text, the target, and timestamps.
+///
+/// `userId` is a target field and `prompt` a param, exactly as `Command::Wake` builds them.
+pub fn build_operator_wake_request(
+    identity: &Identity,
+    owner_user_id: &str,
+    prompt: &str,
+) -> RequestSpec {
+    request(
+        identity,
+        "wake",
+        vec![string_field("userId", owner_user_id)],
+        vec![string_field("prompt", prompt)],
+    )
+}
+
 pub fn build_register_host_request(
     as_user: &str,
     name: &str,
