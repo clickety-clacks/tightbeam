@@ -183,6 +183,52 @@ defmodule Tightbeam.RetireOwnershipTest do
     assert %{code: "not_found"} = retire(ctx, "user:flynn", {:user, "flynn"}, "kays-holder")
   end
 
+  # A retire that is BLOCKED by an unresolved process has to say so. The cascade
+  # already knew — it returns `blocked` — but the reply dropped that list and
+  # still announced `deletedSessionKey`, so a caller whose session sat behind an
+  # open process fence was told the session had been deleted (review
+  # att_c36308f5 F4). MAIN `a18d8b30` had no blocking at all, so this was a
+  # false success the custody series introduced, not one it inherited.
+  test "a blocked retire reports the blocker and its repair verb, not a deletion", ctx do
+    session!(ctx.db, "flynns-blocked", "flynn")
+
+    {:ok, {:ok, row}} =
+      DB.transaction(ctx.db, fn txn ->
+        Tightbeam.ManagedProcesses.insert_preparing(txn, %{
+          process_id: "mp_blocks_retire",
+          owner_user_id: "flynn",
+          owner_session_key: "flynns-blocked",
+          session_generation: 0,
+          launch_turn_seq: nil,
+          host: "testhost",
+          purpose: "onboarding_ceremony",
+          command_descriptor: "codex login",
+          launch_token: "tok_blocks",
+          launch_deadline: 10_000,
+          lease_expires_at: 60_000,
+          now: 1_000
+        })
+      end)
+
+    result = retire(ctx, "user:flynn", {:user, "flynn"}, "flynns-blocked")
+
+    assert result.blocked == ["flynns-blocked"]
+    assert result.retired_session_keys == []
+
+    assert result.deleted_session_key == nil,
+           "retire announced a deletion for a session still behind a process fence"
+
+    # §B5 wants the blocker reported WITH the verb that repairs it. `processes`
+    # on a blocked key lists the rows and their launch deadlines from there, so
+    # the repair path is reachable by an agent without a database console.
+    assert result.repair_verb == "process-reconcile"
+
+    # The durable rows agree with the reply, which is the whole point of the
+    # finding: the announcement and the truth had come apart.
+    refute Org.get(ctx.db, "flynns-blocked").state == "retired"
+    assert Tightbeam.ManagedProcesses.get(ctx.db, row.processId)
+  end
+
   ## Helpers
 
   defp retire(ctx, origin, principal, session_key, idempotency_key \\ nil) do

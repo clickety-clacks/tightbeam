@@ -406,10 +406,15 @@ defmodule Tightbeam.WorkStateTest do
         params: %{}
       })
 
+    # `blocked` and `repairVerb` ride along on every retire reply now, so an
+    # unblocked one has to say so explicitly rather than by omission (review
+    # att_c36308f5 F4). Nothing here is behind a fence, so both are empty.
     assert result == %{
              deleted_session_key: "retiring",
              retired_session_keys: ["retiring"],
-             deferred: []
+             deferred: [],
+             blocked: [],
+             repair_verb: nil
            }
 
     assert_receive {:retired, "retiring"}

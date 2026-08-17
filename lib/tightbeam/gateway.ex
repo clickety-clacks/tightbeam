@@ -5963,13 +5963,30 @@ defmodule Tightbeam.Gateway do
 
               reap_retired_sessions(config, db, Enum.map(result.retired, & &1.session_key))
 
+              # The cascade already knows which members stayed behind an open
+              # process fence; this reply used to drop that list and still
+              # announce `deletedSessionKey`, so a caller whose session was
+              # blocked was told it had been deleted (review att_c36308f5 F4).
+              # `deletedSessionKey` now names the target only when the target
+              # durably retired, and the blockers come back with the verb that
+              # repairs them (§B5) — `processes` on a blocked key lists the rows
+              # and their launch deadlines.
+              blocked_target? = session.session_key in result.blocked
+
               %{
-                deleted_session_key: session.session_key,
+                deleted_session_key: if(blocked_target?, do: nil, else: session.session_key),
                 retired_session_keys: Enum.map(result.retired, & &1.session_key),
-                deferred: result.deferred
+                deferred: result.deferred,
+                blocked: result.blocked,
+                repair_verb: if(result.blocked == [], do: nil, else: "process-reconcile")
               }
             else
-              %{deleted_session_key: session.session_key, retired_session_keys: [], deferred: []}
+              %{
+                deleted_session_key: session.session_key,
+                retired_session_keys: [],
+                deferred: [],
+                blocked: []
+              }
             end
 
           _ ->
