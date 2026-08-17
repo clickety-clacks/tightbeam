@@ -9,6 +9,7 @@ defmodule Tightbeam.PlacementTest do
     HarnessHealth,
     Homes,
     Identity,
+    Org,
     Placement,
     Rails
   }
@@ -753,6 +754,19 @@ defmodule Tightbeam.PlacementTest do
     unless Process.whereis(Tightbeam.TurnTaskSupervisor) do
       start_supervised!({Task.Supervisor, name: Tightbeam.TurnTaskSupervisor})
     end
+
+    Org.create(db, %{
+      session_key: Org.personal_session_key("flynn"),
+      display_name: "Main",
+      kind: "main",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "operator-host",
+      harness: "codex",
+      provider: "openai",
+      model: Model.new("gpt-5")
+    })
 
     config = %{
       base_dir: base_dir,

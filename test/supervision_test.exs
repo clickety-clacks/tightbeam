@@ -2813,13 +2813,17 @@ defmodule Tightbeam.SupervisionTest do
              Supervision.evaluate(ctx.db, transient, 3, ctx.holder.session_key, terminal)
 
     assert %{pendingBranch: "prod"} = Supervision.watermark(ctx.db, ctx.holder.session_key)
+    assert %{supervisionCause: prior_cause} = Supervision.prod_state(ctx.db, "asg_1")
     open_rate_limit_incident!(ctx)
 
     assert :harness_unavailable =
              Supervision.evaluate(ctx.db, ctx.handlers, 3, ctx.holder.session_key, terminal)
 
     assert %{pendingBranch: nil} = Supervision.watermark(ctx.db, ctx.holder.session_key)
-    assert %{prodCount: 0} = Supervision.prod_state(ctx.db, "asg_1")
+
+    assert %{prodCount: 0, supervisionCause: ^prior_cause} =
+             Supervision.prod_state(ctx.db, "asg_1")
+
     assert Wakes.list_pending(ctx.db) == []
   end
 

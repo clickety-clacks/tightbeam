@@ -1655,18 +1655,31 @@ defmodule Tightbeam.Supervision do
               :ready
 
             cause ->
-              Txn.q(
-                txn,
-                """
-                UPDATE supervision_entitlements
-                SET state='armed', claimClock=NULL,
-                    cause=CASE WHEN ?3='harness_unavailable' THEN cause ELSE ?3 END,
-                    principal='process:tightbeam'
-                WHERE assignmentId=?1 AND generation=?2 AND state='claimed'
-                  AND lastAttemptGeneration=?2
-                """,
-                [pending.pendingAssignment, generation, cause]
-              )
+              if cause == "harness_unavailable" do
+                # The entitlement cause CHECK predates harness health. Keep the durable
+                # entitlement cause unchanged; the lifecycle event below records the gate.
+                Txn.q(
+                  txn,
+                  """
+                  UPDATE supervision_entitlements
+                  SET state='armed', claimClock=NULL, principal='process:tightbeam'
+                  WHERE assignmentId=?1 AND generation=?2 AND state='claimed'
+                    AND lastAttemptGeneration=?2
+                  """,
+                  [pending.pendingAssignment, generation]
+                )
+              else
+                Txn.q(
+                  txn,
+                  """
+                  UPDATE supervision_entitlements
+                  SET state='armed', claimClock=NULL, cause=?3, principal='process:tightbeam'
+                  WHERE assignmentId=?1 AND generation=?2 AND state='claimed'
+                    AND lastAttemptGeneration=?2
+                  """,
+                  [pending.pendingAssignment, generation, cause]
+                )
+              end
 
               if Txn.changes(txn) == 1 do
                 clear_pending_in_txn(txn, pending)

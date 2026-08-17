@@ -14,7 +14,7 @@ defmodule Tightbeam.HarnessHealth do
   recycling remain outside this module.
   """
 
-  alias Tightbeam.{ConditionFacts, DB, EventLog, Id, Org}
+  alias Tightbeam.{ConditionFacts, DB, EventLog, Id}
   alias Tightbeam.DB.Txn
 
   @failure_classes ~w(auth-dead rate-limit-dead)
@@ -885,22 +885,7 @@ defmodule Tightbeam.HarnessHealth do
     do: nil
 
   defp auth_blocker_in_txn(txn, incident_id, input) do
-    audience =
-      case Txn.q(
-             txn,
-             """
-             SELECT DISTINCT s.ownerUserId
-             FROM harness_health_members m
-             JOIN sessions s ON s.sessionKey=m.sessionKey
-             WHERE m.incidentId=?1
-             ORDER BY s.ownerUserId
-             LIMIT 1
-             """,
-             [incident_id]
-           ) do
-        [[owner_user_id]] -> {:session, Org.personal_session_key(owner_user_id)}
-        [] -> :record_only
-      end
+    audience = {:session, auth_blocker_recipient!(txn, incident_id)}
 
     [[assignment_count]] =
       Txn.q(
@@ -925,6 +910,47 @@ defmodule Tightbeam.HarnessHealth do
       message: message,
       attention: :high
     )
+  end
+
+  defp auth_blocker_recipient!(txn, incident_id) do
+    affected_main =
+      Txn.q(
+        txn,
+        """
+        SELECT DISTINCT main.sessionKey
+        FROM harness_health_members m
+        JOIN sessions affected ON affected.sessionKey=m.sessionKey
+        JOIN sessions main ON main.ownerUserId=affected.ownerUserId
+        WHERE m.incidentId=?1
+          AND main.kind='main' AND main.state='active'
+        ORDER BY affected.ownerUserId, main.sessionKey
+        LIMIT 1
+        """,
+        [incident_id]
+      )
+
+    case affected_main do
+      [[session_key]] ->
+        session_key
+
+      [] ->
+        case Txn.q(
+               txn,
+               """
+               SELECT sessionKey FROM sessions
+               WHERE kind='main' AND state='active'
+               ORDER BY ownerUserId, sessionKey
+               LIMIT 1
+               """
+             ) do
+          [[session_key]] ->
+            session_key
+
+          [] ->
+            raise "cannot open auth-dead incident #{incident_id}: " <>
+                    "no active personal session exists for an affected or ambient owner"
+        end
+    end
   end
 
   defp post_commit(result, registry \\ Tightbeam.ConnRegistry)

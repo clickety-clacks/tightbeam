@@ -26,6 +26,21 @@ defmodule Tightbeam.HarnessHealthTest do
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Tightbeam.Schema.ensure_all(db)
 
+    main_session = Org.personal_session_key("flynn")
+
+    Org.create(db, %{
+      session_key: main_session,
+      display_name: "Main",
+      kind: "main",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "gibson",
+      harness: "codex",
+      provider: "openai",
+      model: Model.new("gpt-5")
+    })
+
     sessions =
       for index <- 1..3 do
         session_key = "agent:harness-health:#{index}"
@@ -83,7 +98,7 @@ defmodule Tightbeam.HarnessHealthTest do
                [outside_session]
              )
 
-    %{db: db, sessions: sessions, outside_session: outside_session}
+    %{db: db, main_session: main_session, sessions: sessions, outside_session: outside_session}
   end
 
   test "inference needs two distinct sessions in the bounded window", ctx do
@@ -182,25 +197,14 @@ defmodule Tightbeam.HarnessHealthTest do
 
   test "provider invalidation emits one consolidated auth blocker while rate limiting emits none",
        ctx do
-    main_key = Org.personal_session_key("flynn")
+    main_key = ctx.main_session
     second_main_key = Org.personal_session_key("zoe")
     second_worker_key = "agent:harness-health:zoe"
 
     Org.create(ctx.db, %{
-      session_key: main_key,
-      display_name: "Main",
-      owner_user_id: "flynn",
-      origin: "user:flynn",
-      archetype: "default",
-      host: "gibson",
-      harness: "codex",
-      provider: "openai",
-      model: Model.new("gpt-5")
-    })
-
-    Org.create(ctx.db, %{
       session_key: second_main_key,
       display_name: "Second main",
+      kind: "main",
       owner_user_id: "zoe",
       origin: "user:zoe",
       archetype: "default",
@@ -281,6 +285,74 @@ defmodule Tightbeam.HarnessHealthTest do
              &(&1.kind == "harness_health_auth_blocker")
            ) ==
              1
+  end
+
+  test "memberless provider invalidation alerts an ambient owner before late work attaches",
+       ctx do
+    quiet_host = "quiet-host"
+
+    assert {:opened, opened} =
+             HarnessHealth.observe_provider_invalidation(
+               ctx.db,
+               "claude",
+               quiet_host,
+               %{"authMode" => nil, "planType" => nil},
+               conn_registry: :missing_harness_health_registry
+             )
+
+    assert [marker] = Projection.list_after(ctx.db, ctx.main_session, nil, 10)
+    assert marker.content =~ opened.id
+    assert HarnessHealth.get(ctx.db, opened.id).affectedSessions == []
+
+    late_session = "agent:harness-health:late"
+    late_assignment = "asg_health_late"
+
+    Org.create(ctx.db, %{
+      session_key: late_session,
+      display_name: "Late affected worker",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "coder",
+      host: quiet_host,
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("claude-fable-5")
+    })
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO assignments
+                 (id,subject,holderKey,openedBySession,openedAt,state,holderHarness,holderProvider)
+               VALUES (?1,'late affected work',?2,?2,12,'open','claude','anthropic')
+               """,
+               [late_assignment, late_session]
+             )
+
+    assert {:attached, attached} =
+             HarnessHealth.observe(ctx.db, %{
+               harness: "claude",
+               host: quiet_host,
+               failure_class: "auth-dead",
+               evidence_kind: "authoritative-provider",
+               session_key: late_session,
+               assignment_id: late_assignment,
+               observed_at: 13,
+               correlation_id: "late-member-auth",
+               cause: "terminal recovery-chain failure",
+               principal: "process:tightbeam"
+             })
+
+    assert attached.id == opened.id
+    assert [^late_session] = HarnessHealth.get(ctx.db, opened.id).affectedSessions
+    assert [^late_assignment] = HarnessHealth.get(ctx.db, opened.id).affectedAssignments
+    assert [_marker] = Projection.list_after(ctx.db, ctx.main_session, nil, 10)
+
+    assert Enum.count(
+             EventLog.lifecycle_events(ctx.db),
+             &(&1.kind == "harness_health_auth_blocker")
+           ) == 1
   end
 
   test "failed-turn evidence and normal-turn recovery share their terminal CAS", ctx do
