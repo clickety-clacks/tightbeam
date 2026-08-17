@@ -32,7 +32,7 @@ end
 defmodule Tightbeam.SchemaShapeTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Schema}
+  alias Tightbeam.{Assignments, DB, Schema}
 
   @shape "operator-decision-requests-v1"
   @be61_shape "model-identity-message-envelope-v2"
@@ -266,6 +266,52 @@ defmodule Tightbeam.SchemaShapeTest do
 
       assert activated_at == 40_000 + statement
     end
+  end
+
+  test "predecessor assignment file rows stay exact across ensure_all", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO users (userId, isAdmin, createdAt)
+      VALUES ('flynn', 0, 1);
+      INSERT INTO sessions
+        (sessionKey,displayName,ownerUserId,origin,archetype,harness,provider,
+         model,createdAt,updatedAt)
+      VALUES
+        ('holder','holder','flynn','user:flynn','coder','claude','anthropic',
+         'fixture-model',1,1);
+      """)
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO assignments
+        (id,subject,holderKey,holderRole,holderFallback,openedByUser,
+         openedBySession,openedAt,state,outcome,closedAt,closedByUser,
+         closedBySession,closingAttestId)
+      VALUES
+        ('asg_predecessor','advisory files','holder',NULL,0,'flynn',
+         NULL,1,'open',NULL,NULL,NULL,NULL,NULL)
+      """)
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO assignment_files (assignmentId, path)
+      VALUES ('asg_predecessor','lib/a.ex'), ('asg_predecessor','test/a_test.exs')
+      """)
+
+    assert {:ok, before_rows} =
+             DB.query(db, "SELECT * FROM assignment_files ORDER BY assignmentId, path")
+
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:ok, ^before_rows} =
+             DB.query(db, "SELECT * FROM assignment_files ORDER BY assignmentId, path")
+
+    assert Assignments.declared_files(db, "asg_predecessor") ==
+             ["lib/a.ex", "test/a_test.exs"]
+
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
   end
 
   test "an incomplete activation and an empty epoch refuse without repair", %{db: db} do

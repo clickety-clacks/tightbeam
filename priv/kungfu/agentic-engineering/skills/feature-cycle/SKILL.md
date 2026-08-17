@@ -12,9 +12,9 @@ canonical path, bind it to the work-item by content, not by memory:
 serves, so every coder and reviewer reads the same one. Every assignment below threads
 to the work-item (`--work-item <id>`). `tightbeam dispatch --to <holder> --subject "…"
 --brief "…" --work-item <id>` opens a plain card and wakes its holder in one atomic step;
-a card that declares files (`--files`) or links a review (`--reviews`) opens with `assign`
-and is then woken, because those flags live on `assign` — so the steps below that need
-them keep that two-step form.
+a card that includes an advisory file suggestion (`--files`) or links a review
+(`--reviews`) opens with `assign` and is then woken, because those flags live on
+`assign` — so the steps below that use them keep that two-step form.
 
 Keep only a handful of goals truly in-flight at once (see the kernel); this loop is
 per-feature, but your attention across features is the scarce resource.
@@ -41,9 +41,9 @@ per-feature, but your attention across features is the scarce resource.
    one objective per dispatch, together covering every clause. Cut along the seams that
    minimize what crosses between goals: defects cluster at the interfaces between
    different agents' work. Run independent goals in parallel; order goals that touch
-   the same code. Declare each goal's files on its assignment
-   (`--files '["path", ...]'`) — the substrate refuses a second open assignment that
-   overlaps those paths, so two coders cannot be aimed at the same file.
+   the same code. Add `--files '["path", ...]'` when an advisory suggestion will help
+   others discover the expected work area. It grants no path and forbids no work.
+   Reconcile real overlaps normally.
 4. **Implement.** For each goal, assign a coder one goal with the spec path and the
    work-item id. The coder attests progress as it works — including when the goal
    builds clean and is ready for review. Completion is attested only after the review

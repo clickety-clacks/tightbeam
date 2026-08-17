@@ -529,7 +529,8 @@ COMMANDS:
          [--reviews <assignmentId>] [--effect-kind <kind>]
          [--files '["lib/a.ex","test/a_test.exs"]']
       Open an obligation held by a session; a work item is the durable thread
-      across assignments.
+      across assignments. --files is an advisory suggestion that others can see;
+      it reserves no path and does not limit the assignment's work.
   dispatch (--to <sessionKey> | --holder <sessionKey>) --subject "<work>"
            --brief "<one sentence>" [--work-item <workItemId>]
            [--effect-kind <kind>] [--workdir-root <relativePath>] [--key <key>]
@@ -2156,6 +2157,24 @@ mod tests {
             !entry.contains("DISCOVERY:") && !entry.contains("  doctor "),
             "the entry must stop at its own last line: {entry}"
         );
+    }
+
+    #[test]
+    fn assign_help_calls_files_advisory_not_a_reservation_or_limit() {
+        let entry = render_command_help(None, "assign").unwrap();
+
+        for required in [
+            "--files",
+            "advisory suggestion",
+            "others can see",
+            "reserves no path",
+            "does not limit",
+        ] {
+            assert!(
+                entry.contains(required),
+                "missing {required:?} from:\n{entry}"
+            );
+        }
     }
 
     #[test]

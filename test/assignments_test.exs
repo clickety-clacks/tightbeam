@@ -782,7 +782,7 @@ defmodule Tightbeam.AssignmentsTest do
     assert ctx.db |> WorkState.item_detail(item.id) |> JSON.encode!() == before_snapshot
   end
 
-  test "declared files dedupe silently and overlap is transactionally serialized", ctx do
+  test "declared files stay visible and overlapping assignments all open", ctx do
     paths = ["lib/a.ex", "lib/b.ex", "lib/a.ex", "../kept", "/absolute/kept"]
 
     first =
@@ -799,14 +799,28 @@ defmodule Tightbeam.AssignmentsTest do
     assert Assignments.open_assignments_touching(ctx.db, []) == []
 
     overlapping =
-      assign_call({:user, "flynn"}, "overlap")
-      |> put_in([:params, :files], ["lib/a.ex"])
+      for {subject, declared} <- [
+            {"overlap a", ["lib/a.ex"]},
+            {"overlap b", ["lib/b.ex"]},
+            {"overlap both", ["lib/a.ex", "lib/b.ex"]}
+          ] do
+        assign_call({:user, "flynn"}, subject)
+        |> put_in([:params, :files], declared)
+        |> then(&handle(ctx, "assign", &1))
+      end
 
-    assert %{code: "files_overlap", message: message} = handle(ctx, "assign", overlapping)
-    assert message =~ first.id
+    assert Enum.all?(overlapping, &is_binary(&1.id))
 
-    assert {:ok, [[0]]} =
-             DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE subject = 'overlap'")
+    assert Enum.map(overlapping, &Assignments.declared_files(ctx.db, &1.id)) == [
+             ["lib/a.ex"],
+             ["lib/b.ex"],
+             ["lib/a.ex", "lib/b.ex"]
+           ]
+
+    touching_a = Assignments.open_assignments_touching(ctx.db, ["lib/a.ex"])
+
+    assert Enum.sort([first.id, Enum.at(overlapping, 0).id, Enum.at(overlapping, 2).id]) ==
+             touching_a
 
     malformed =
       assign_call({:user, "flynn"}, "malformed")
@@ -817,17 +831,14 @@ defmodule Tightbeam.AssignmentsTest do
     assert {:ok, [[0]]} =
              DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE subject = 'malformed'")
 
+    empty_files =
+      assign_call({:user, "flynn"}, "empty files")
+      |> put_in([:params, :files], [])
+      |> then(&handle(ctx, "assign", &1))
+
     no_files = handle(ctx, "assign", assign_call({:user, "flynn"}, "no files"))
+    assert Assignments.declared_files(ctx.db, empty_files.id) == []
     assert Assignments.declared_files(ctx.db, no_files.id) == []
-
-    disjoint =
-      for {subject, path} <- [{"disjoint one", "one"}, {"disjoint two", "two"}] do
-        assign_call({:user, "flynn"}, subject)
-        |> put_in([:params, :files], [path])
-        |> then(&handle(ctx, "assign", &1))
-      end
-
-    assert Enum.all?(disjoint, &is_binary(&1.id))
 
     concurrent =
       for subject <- ["race one", "race two"] do
@@ -839,17 +850,42 @@ defmodule Tightbeam.AssignmentsTest do
       end
       |> Task.await_many()
 
-    assert Enum.count(concurrent, &(&1[:code] == "files_overlap")) == 1
-    assert Enum.count(concurrent, &is_binary(&1[:id])) == 1
+    assert Enum.all?(concurrent, &is_binary(&1.id))
 
-    _closed = handle(ctx, "attest", attest_call({:session, "holder"}, first.id, "completion"))
+    assert Enum.map(concurrent, &Assignments.declared_files(ctx.db, &1.id)) == [
+             ["same-race-path"],
+             ["same-race-path"]
+           ]
 
-    after_close =
-      assign_call({:user, "flynn"}, "after close")
+    assert Enum.sort(Enum.map(concurrent, & &1.id)) ==
+             Assignments.open_assignments_touching(ctx.db, ["same-race-path"])
+
+    opened = marker_contents(ctx.db, "holder")
+
+    for assignment <- [first | overlapping] ++ [empty_files, no_files | concurrent] do
+      assert "[assignment opened: #{assignment.id}]" in opened
+    end
+
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM events WHERE kind = 'denied'")
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM rail_remedy_episodes")
+
+    completion_target =
+      assign_call({:user, "flynn"}, "outside-list completion")
       |> put_in([:params, :files], ["lib/a.ex"])
       |> then(&handle(ctx, "assign", &1))
 
-    assert is_binary(after_close.id)
+    completion_call =
+      attest_call({:session, "holder"}, completion_target.id, "completion")
+      |> put_in([:params, :files], ["lib/b.ex"])
+
+    completion = handle(ctx, "attest", completion_call)
+    assert completion.assignment.state == "closed"
+    assert completion.assignment.outcome == "completed"
+
+    markers = marker_contents(ctx.db, "holder")
+    assert "[completion filed on #{completion_target.id}]" in markers
+    assert "[assignment closed: #{completion_target.id} — completed]" in markers
+    refute Enum.any?(markers, &String.contains?(&1, "path denied"))
   end
 
   test "assignment readback and work-item trace project the same ordered declared files", ctx do

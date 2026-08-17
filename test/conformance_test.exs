@@ -863,11 +863,6 @@ defmodule Tightbeam.ConformanceSupport do
         call = build_call(kase["call"], ids)
         handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
         {:ok, [[before_count]]} = DB.query(db, "SELECT count(*) FROM assignments")
-        overlap? = Assignments.open_assignments_touching(db, call.params[:files] || []) != []
-
-        if kase["reason"] in [nil, "files_overlap"] do
-          assert_overlap_observation(fixture, db, call, overlap?)
-        end
 
         if String.contains?(kase["case"], "concurrent") do
           results =
@@ -875,10 +870,11 @@ defmodule Tightbeam.ConformanceSupport do
             |> Enum.map(fn _ -> Task.async(fn -> Dispatch.dispatch(db, handlers, call) end) end)
             |> Task.await_many()
 
+          assignments = Enum.map(results, fn {:ok, assignment} -> assignment end)
           {:ok, [[after_count]]} = DB.query(db, "SELECT count(*) FROM assignments")
-          assert Enum.count(results, &match?({:ok, _}, &1)) == 1
-          assert Enum.count(results, &match?({:error, %{code: "files_overlap"}}, &1)) == 1
-          assert after_count == before_count + 1
+          assert length(assignments) == 2
+          assert after_count == before_count + 2
+          Enum.each(assignments, &assert_advisory_assignment(db, call, &1))
         else
           result = Dispatch.dispatch(db, handlers, call)
           {:ok, [[after_count]]} = DB.query(db, "SELECT count(*) FROM assignments")
@@ -890,8 +886,13 @@ defmodule Tightbeam.ConformanceSupport do
               assert after_count == before_count
 
             "pass" ->
-              assert {:ok, _} = result
+              assert {:ok, assignment} = result
               assert after_count == before_count + 1
+              assert_advisory_assignment(db, call, assignment)
+
+              if kase["kind"] == "legibility" do
+                assert kase["emits"] == fixture["legibility"]
+              end
           end
         end
       after
@@ -900,28 +901,24 @@ defmodule Tightbeam.ConformanceSupport do
     end)
   end
 
-  defp assert_overlap_observation(%{"rule" => [_ | _]} = fixture, db, call, overlap?) do
-    base = temp_dir!("conformance-overlap-observation")
-    prepare_rule_base!(base, fixture)
-    Rules.load!(base, Map.keys(Gateway.handlers(%{})))
+  defp assert_advisory_assignment(db, call, assignment) do
+    expected_files = call.params |> Map.get(:files, []) |> Enum.uniq() |> Enum.sort()
+    assert Assignments.declared_files(db, assignment.id) == expected_files
 
-    try do
-      if overlap?,
-        do:
-          assert(
-            match?(
-              {:deny, %{rule: "declared-files-overlap-observation"}},
-              Rules.evaluate(db, call)
-            )
-          ),
-        else: assert(Rules.evaluate(db, call) == :ok)
-    after
-      File.rm_rf!(base)
-      :persistent_term.erase(Rules)
+    if expected_files != [] do
+      assert assignment.id in Assignments.open_assignments_touching(db, expected_files)
     end
-  end
 
-  defp assert_overlap_observation(_fixture, _db, _call, _overlap?), do: :ok
+    assert {:ok, [[1]]} =
+             DB.query(
+               db,
+               "SELECT count(*) FROM messages WHERE content = ?1",
+               ["[assignment opened: #{assignment.id}]"]
+             )
+
+    assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM events WHERE kind = 'denied'")
+    assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM rail_remedy_episodes")
+  end
 
   def run_load_assert(loadset) do
     base = temp_dir!("conformance-load")
@@ -3623,7 +3620,7 @@ defmodule Tightbeam.ConformanceTest do
     )
   end
 
-  test "handler refusal covers all canonical codes and leaves no assignment survivor" do
+  test "declared-file cases preserve validation and expose advisory assignments" do
     Corpus.run_handler_refusal_fixture(fixture!("C4", "declared-files-overlap"))
   end
 

@@ -1,6 +1,6 @@
 ---
 name: worktree-session
-description: The worktree is the isolation boundary when many agents edit one repo — your own branch, declared files, reconcile before building, never destroy work that is not yours, cleanup. Use at the start of and throughout any assignment that touches a repository.
+description: The worktree is the isolation boundary when many agents edit one repo — your own branch, advisory file suggestions, reconcile before building, never destroy work that is not yours, cleanup. Use at the start of and throughout any assignment that touches a repository.
 ---
 
 # Worktree session
@@ -15,12 +15,9 @@ boundary.
    way it lives in a durable assignment workdir — never system temp or your home.
 2. A repo below your session root does not announce its conventions: its `AGENTS.md`
    and committed skills do not load into your session. Read them when you enter it.
-3. Declare the files your goal touches on the assignment (`--files '["path", ...]'`).
-   The substrate refuses to open a second assignment that overlaps an open assignment's
-   declared paths, so two coders cannot be aimed at the same file — the declaration is
-   how the substrate keeps you from colliding, not just etiquette. If your goal grows
-   to need a path another open assignment already holds, that overlap is a real block:
-   surface it, do not reach into their file.
+3. Add `--files '["path", ...]'` when an advisory suggestion will help others
+   discover where you expect the work to land. It grants no path and forbids no work.
+   Reconcile real overlaps normally, and preserve work that another agent already made.
 4. Destructive git that hides or discards another agent's uncommitted work is refused
    at the gate before it runs — `git stash` (mutating forms), `git reset --hard`,
    forced `git clean`, `git checkout -- <path>`, and `git restore` all hit a refusal

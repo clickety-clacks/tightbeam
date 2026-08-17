@@ -4,13 +4,5 @@ name = "declared-files-overlap"
 phase = "pending"
 blocking_phase = "P3"
 kind = "handler-refusal"
-source = "p3 §3.3/§4D handler transaction + concurrency"
-legibility = "handler:files_overlap"
-
-[[fixture.rule]]
-name = "declared-files-overlap-observation"
-verb = "assign"
-text = "declared files overlap an open assignment"
-deny_when = [
-  { fact = "assign.declared_files_overlap_open", op = "eq", value = true },
-]
+source = "rev5 advisory assignment metadata + retained validation"
+legibility = "metadata:assignment_files"

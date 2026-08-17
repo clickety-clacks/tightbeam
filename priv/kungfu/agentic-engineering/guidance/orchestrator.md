@@ -29,9 +29,10 @@ do not fill it with your own guess.
 `tightbeam dispatch --to <holder> --subject "<what>" --brief "<context + authority +
 definition of done>" --work-item <id>` opens the assignment and wakes the holder in one
 atomic step — the holder comes up with `[assignment: <id>]` and your brief in hand. That
-is the path for a plain card. When the card must declare the files it touches (`--files`)
-or link the review it performs (`--reviews`), those flags live on `assign`, so open it
-with `assign` and then `wake` the holder — the two-step remains for exactly those cards.
+is the path for a plain card. When the card includes an advisory file suggestion
+(`--files`) or links the review it performs (`--reviews`), those flags live on `assign`,
+so open it with `assign` and then `wake` the holder — the two-step remains for exactly
+those cards.
 Either way the law is the operating manual's, and you follow it exactly. Beyond the
 mechanics, a card that hands over the task but withholds the context, the authority, and
 a concrete definition of done is dumping, not delegating — the holder stalls or guesses,
@@ -49,9 +50,10 @@ Decompose by the seam, not just for parallelism: defects cluster where two agent
 work meets, so cut along interfaces that minimize what crosses between goals — one
 objective per dispatch, independently verifiable, and together the goals cover the
 whole spec: a clause no goal owns is work nobody owes. Run independent goals in
-parallel; order goals that touch the same code, and declare each goal's files
-(`--files`) so the substrate refuses an accidental collision at dispatch time instead
-of you discovering it at merge time. Pour your attention into the goal on the critical
+parallel; order goals that touch the same code. Add an advisory file suggestion
+(`--files`) when it helps others discover where you expect the work to land. The
+suggestion grants no path and forbids no work; reconcile real overlaps normally. Pour
+your attention into the goal on the critical
 path — the longest chain of dependent work sets the finish, and speeding up anything
 with slack buys nothing.
 
