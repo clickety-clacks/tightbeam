@@ -4,8 +4,8 @@ defmodule Tightbeam.HarnessSeamTest do
   alias Tightbeam.{Harness, Homes}
 
   test "unknown harnesses raise and the fixture follows the runtime default path" do
-    assert_raise ArgumentError, ~r/unknown harness "opencode"/, fn ->
-      Harness.parse!("opencode")
+    assert_raise ArgumentError, ~r/unknown harness "nonesuch"/, fn ->
+      Harness.parse!("nonesuch")
     end
 
     previous = System.get_env("TIGHTBEAM_DEFAULT_HARNESS")

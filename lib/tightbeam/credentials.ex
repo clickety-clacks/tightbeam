@@ -32,7 +32,7 @@ defmodule Tightbeam.Credentials do
   @ssh_opts ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
   @fixture_provider? Application.compile_env(:tightbeam, :fixture_harness, false)
 
-  @type provider :: :openai | :anthropic | :fixture_provider
+  @type provider :: :openai | :anthropic | :opencode | :fixture_provider
   @type kind :: :api_key | :subscription
   @type status :: :onboarded | {:needs_onboarding, term()}
 
@@ -1158,6 +1158,7 @@ defmodule Tightbeam.Credentials do
 
   defp harness_name(:openai), do: "codex"
   defp harness_name(:anthropic), do: "claude"
+  defp harness_name(:opencode), do: "opencode"
   defp harness_name(:fixture_provider), do: "fixture"
 
   defp atomic_write!(path, bytes) do

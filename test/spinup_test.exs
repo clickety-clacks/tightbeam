@@ -81,9 +81,11 @@ defmodule Tightbeam.SpinupTest do
     assert script =~ "npm install --prefix"
     assert script =~ Path.join(ctx.base_dir, "adapters")
 
-    # Every harness at its pin, asserted per harness rather than by naming packages —
-    # a partial pin has to fail for the harness that lost it (#47).
-    for module <- Tightbeam.Harness.all() do
+    # Every npm-provisioned harness at its pin, asserted per harness rather than by naming
+    # packages — a partial pin has to fail for the harness that lost it (#47). Binary-native
+    # (:shim) harnesses contribute no npm package, so the install line is keyed on
+    # npm_provisioned/0, matching Spinup.install_command.
+    for module <- Tightbeam.Harness.npm_provisioned() do
       assert script =~ "#{module.install_package()}@#{module.adapter_version()}",
              "#{module.wire_name()} is not installed at its pinned version"
     end
@@ -270,8 +272,9 @@ defmodule Tightbeam.SpinupTest do
     # PINNED, not bare (#47): a bare name resolves to npm's latest, so every
     # provision installed whatever was published that day while @adapter_version
     # documented a pin nothing enforced. Measured on main: claude-agent-acp 0.62.0
-    # and codex-acp 1.1.7 against pins of 0.59.0 and 1.1.4.
-    for module <- Tightbeam.Harness.all() do
+    # and codex-acp 1.1.7 against pins of 0.59.0 and 1.1.4. Keyed on npm_provisioned/0:
+    # a binary-native (:shim) harness contributes no package to this line.
+    for module <- Tightbeam.Harness.npm_provisioned() do
       assert List.last(install) =~ "#{module.install_package()}@#{module.adapter_version()}",
              "#{module.wire_name()} is not installed at its pinned version"
     end
