@@ -185,12 +185,27 @@ defmodule Tightbeam.CommandExecutionsTest do
     assert CommandExecutions.get!(ctx.db, healthy.execution_id).state == "prepared"
   end
 
-  test "boot reconciliation excludes terminal history from receipt reads", ctx do
+  test "boot reconciliation bounds decoding to unresolved rows", ctx do
     finished = execute(ctx, "terminal-history", ["/bin/true"])
-    File.write!(finished.terminal_path, "")
+    refused = CommandExecutions.prepare(ctx.db, attrs(ctx, "refused-history", ["/bin/true"]))
+
+    assert CommandExecutions.mark_not_started(ctx.db, refused.execution_id, "test refusal").state ==
+             "not_started"
+
+    {:ok, []} =
+      DB.query(
+        ctx.db,
+        "UPDATE command_executions SET commandJson = 'not-json' WHERE state IN ('finished','not_started')"
+      )
 
     assert :ok = CommandExecutions.reconcile(ctx.db)
-    assert CommandExecutions.get!(ctx.db, finished.execution_id).state == "finished"
+
+    assert {:ok, [["finished"], ["not_started"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state FROM command_executions WHERE executionId IN (?1, ?2) ORDER BY state",
+               [finished.execution_id, refused.execution_id]
+             )
   end
 
   test "exec failure is durably not_started and duplicate consumption is refused", ctx do

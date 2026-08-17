@@ -500,7 +500,10 @@ fn now_ms() -> u128 {
 
 #[cfg(test)]
 mod tests {
-    use super::{acknowledge_best_effort, decode_status, hex_sha256, pipe};
+    use super::{Manifest, decode_status, hex_sha256, pipe, supervise, wait_child};
+    use serde_json::Value;
+    use std::fs;
+    use std::path::PathBuf;
 
     #[test]
     fn hashes_exact_bytes() {
@@ -517,9 +520,55 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_acknowledgement_reader_cannot_abort_supervision() {
-        let (reader, mut writer) = pipe(false).unwrap();
+    fn a_missing_acknowledgement_reader_cannot_destroy_terminal_evidence() {
+        let root = std::env::temp_dir().join(format!(
+            "tightbeam-command-exec-ack-window-{}-{}",
+            std::process::id(),
+            super::now_ms()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = |name: &str| root.join(name);
+        let manifest = Manifest {
+            execution_id: "ack-window".to_string(),
+            command: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "printf done".to_string(),
+            ],
+            cwd: PathBuf::from(&root),
+            claim_path: path("claim"),
+            launcher_path: path("launcher.json"),
+            started_path: path("started.json"),
+            stdout_path: path("stdout"),
+            stderr_path: path("stderr"),
+            not_started_path: path("not_started.json"),
+            terminal_path: path("terminal.json"),
+        };
+        let (reader, writer) = pipe(false).unwrap();
         drop(reader);
-        acknowledge_best_effort(&mut writer, "started");
+
+        match unsafe { libc::fork() } {
+            -1 => panic!("test supervisor could not fork"),
+            0 => {
+                let code = if supervise(&manifest, writer).is_ok() {
+                    0
+                } else {
+                    1
+                };
+                unsafe { libc::_exit(code) };
+            }
+            child => {
+                drop(writer);
+                assert_eq!(decode_status(wait_child(child).unwrap()), (Some(0), None));
+            }
+        }
+
+        let terminal: Value =
+            serde_json::from_slice(&fs::read(&manifest.terminal_path).unwrap()).unwrap();
+        assert_eq!(terminal["executionId"], "ack-window");
+        assert_eq!(terminal["exitCode"], 0);
+        assert_eq!(terminal["signal"], Value::Null);
+        assert_eq!(fs::read(&manifest.stdout_path).unwrap(), b"done");
+        fs::remove_dir_all(root).unwrap();
     }
 }
