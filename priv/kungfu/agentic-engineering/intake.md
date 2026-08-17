@@ -13,6 +13,5 @@ operational until every answer is recorded or the operator explicitly defers tha
    verification mean in each source repository?
    Destinations: the org's chosen kinds in `identity/rules/verification.toml`; per-project
    verification prose in each repository's AGENTS.md (or equivalent).
-4. What is the shared spec workspace root?
-5. What review-independence stance governs model family, thinking level, and fresh-session
+4. What review-independence stance governs model family, thinking level, and fresh-session
    separation?
