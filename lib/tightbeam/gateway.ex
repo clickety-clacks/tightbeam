@@ -2965,14 +2965,14 @@ defmodule Tightbeam.Gateway do
                             else: []
                           )
 
-  defp onboard_result(config, %{params: %{provider: provider, phase: phase} = params})
+  defp onboard_result(config, %{params: %{provider: provider, phase: phase} = params} = call)
        when provider in @onboarding_providers and phase in ["begin", "finish", "cancel"] do
     machine = params[:machine] || Placement.local_host_name()
 
     with true <- Map.has_key?(Placement.hosts(config.base_dir, gateway_db(config)), machine),
          {:ok, kind} <- onboarding_kind(params[:kind]) do
-      onboard_phase(
-        config,
+      config
+      |> onboard_phase(
         provider_atom(provider),
         phase,
         machine,
@@ -2980,6 +2980,7 @@ defmodule Tightbeam.Gateway do
         params[:lease_id],
         params[:reason]
       )
+      |> with_owner_user_id(phase, gateway_db(config), call.origin)
     else
       false ->
         %{code: "unknown_host", message: "unknown onboarding machine #{machine}"}
@@ -3066,6 +3067,25 @@ defmodule Tightbeam.Gateway do
         %{code: "needs_onboarding", message: inspect(reason)}
     end
   end
+
+  # The begin reply carries the OWNER user id so the CLI can wake THAT user with the
+  # sign-in URL+code the ceremony is about to surface (wi_0535922b). An onboarding run
+  # in a session no operator watches must deliver its URL+code out of band, and the
+  # gateway is the only party that knows whose org this is. Added ONLY to the begin
+  # "ready" reply; finish/cancel and every error map pass through untouched. An origin
+  # with no owner (a process principal) leaves the field absent, and the CLI degrades
+  # loudly rather than waking no one.
+  defp with_owner_user_id(%{status: "ready"} = reply, "begin", db, origin) do
+    case resolve_caller(db, origin) do
+      %{owner_user_id: owner} when is_binary(owner) ->
+        Map.put(reply, :owner_user_id, owner)
+
+      _ ->
+        reply
+    end
+  end
+
+  defp with_owner_user_id(reply, _phase, _db, _origin), do: reply
 
   defp onboarding_failure("unsupported_no_subscription"), do: :unsupported_no_subscription
   defp onboarding_failure(_reason), do: nil

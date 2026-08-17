@@ -6,7 +6,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::{Command as ProcessCommand, ExitStatus, Stdio};
+use std::process::{ChildStdout, Command as ProcessCommand, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -17,6 +17,7 @@ use crate::child_process::{
 };
 use crate::dispatch::{self, Endpoint, RequestSpec};
 use crate::harnesses::HarnessCatalog;
+use crate::onboard_emit::{self, Deliverable, Notified};
 use crate::preflight;
 
 /// Read the staging path out of a `begin` phase response.
@@ -61,12 +62,38 @@ fn lease_deadline(ready: &serde_json::Value, now: Instant) -> Instant {
     now + lease_timeout(ready)
 }
 
+/// The owner user id the gateway names on the `begin` reply (wi_0535922b), so the CLI can
+/// wake THAT user with the sign-in URL+code. Absent on a gateway too old to send it or a
+/// caller with no owner (a process principal) -- the emission then degrades loudly rather
+/// than waking no one. Pure so the wire shape can be pinned by a test.
+fn owner_user_id(ready: &serde_json::Value) -> Option<String> {
+    ready
+        .get("ownerUserId")
+        .and_then(serde_json::Value::as_str)
+        .filter(|owner| !owner.is_empty())
+        .map(str::to_owned)
+}
+
 type HarnessLoader<'a> = dyn Fn(&Endpoint, Instant) -> Result<Option<HarnessCatalog>, String> + 'a;
+
+/// The gateway sender the ceremony uses to emit the sign-in delivery (operator wake) --
+/// type-erased like `HarnessLoader` so `Ceremony` stays a plain struct rather than growing a
+/// generic parameter for it.
+type SendRequest<'a> = dyn Fn(&Endpoint, &RequestSpec, Option<Instant>) -> Result<Option<serde_json::Value>, String>
+    + 'a;
 
 struct Ceremony<'a> {
     endpoint: &'a Endpoint,
     deadline: Instant,
     load_harnesses: &'a HarnessLoader<'a>,
+    // Emission context (wi_0535922b): who to attribute the wake to, how to send it, which
+    // provider/machine the delivery names, and the owner user to wake (absent on an older
+    // gateway or a non-owned caller -> the CLI degrades loudly).
+    identity: &'a Identity,
+    send: &'a SendRequest<'a>,
+    provider: &'a str,
+    machine: Option<&'a str>,
+    owner_user_id: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -130,6 +157,11 @@ where
         endpoint,
         deadline,
         load_harnesses: &load_harnesses,
+        identity,
+        send: &send_request,
+        provider,
+        machine: machine.as_deref(),
+        owner_user_id: ready.as_ref().and_then(owner_user_id),
     };
     let ready = match ready {
         Some(ready) => ready,
@@ -853,6 +885,138 @@ fn this_host() -> String {
         .unwrap_or_else(|| "this machine".to_owned())
 }
 
+/// Milliseconds since the epoch, for stamping when a deliverable was minted.
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn wake_id_of(reply: &serde_json::Value) -> Option<String> {
+    reply
+        .get("wakeId")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
+/// Surface a sign-in deliverable the operator cannot see on the ceremony's terminal, through
+/// the three channels of Mike's triad (wi_0535922b): the operator WAKE (the durable substrate
+/// row AND the notification, in one), a 0600 local delivery FILE, and a machine-readable
+/// STRUCTURED line on stdout. Every channel is best-effort and LOUD on failure -- a delivery
+/// that cannot be waked or filed says so rather than vanishing.
+fn emit_delivery(ceremony: &Ceremony<'_>, deliverable: &Deliverable, ttl: Option<Duration>) {
+    let machine = ceremony
+        .machine
+        .map(str::to_owned)
+        .unwrap_or_else(this_host);
+    let minted = now_ms();
+    let expires = ttl.map(|ttl| minted + ttl.as_millis() as i64);
+
+    // 1. Operator wake: the durable row carrying the code text, target, and timestamps.
+    let notified = notify_operator(ceremony, deliverable, &machine);
+
+    // 2. Local durable copy (0600): a file a courier can read even if the wake never sent.
+    let file_json = onboard_emit::delivery_file_json(
+        ceremony.provider,
+        &machine,
+        deliverable,
+        minted,
+        expires,
+        &notified,
+    );
+    let file_path = write_delivery_file(ceremony.provider, minted, &file_json);
+
+    // 3. Structured stdout: the machine-readable line, pointing at the wake and the file.
+    let wake_id = match &notified {
+        Notified::Waked { wake_id, .. } => wake_id.as_deref(),
+        Notified::NotNotified { .. } => None,
+    };
+    let line = onboard_emit::structured_line(
+        ceremony.provider,
+        &machine,
+        deliverable,
+        wake_id,
+        file_path.as_deref(),
+    );
+    println!("{line}");
+}
+
+/// Wake the owner user with the sign-in prompt -- the durable substrate row AND the
+/// notification in one. Split from `emit_delivery` so the branch logic (owner present ->
+/// wake; owner absent or send failed -> a LOUD `NotNotified` with the reason) is testable
+/// with a fake sender, without the file and stdout side effects.
+fn notify_operator(ceremony: &Ceremony<'_>, deliverable: &Deliverable, machine: &str) -> Notified {
+    let Some(owner) = ceremony.owner_user_id.as_deref() else {
+        eprintln!(
+            "onboarding delivery: no owner to notify -- the gateway did not name an ownerUserId \
+             (an older gateway, or a caller with no owner). The URL+code are in the delivery file \
+             and structured output below."
+        );
+        return Notified::NotNotified {
+            reason: "gateway did not supply ownerUserId".to_owned(),
+        };
+    };
+
+    let prompt = onboard_emit::operator_prompt(ceremony.provider, machine, deliverable);
+    let request = dispatch::build_operator_wake_request(ceremony.identity, owner, &prompt);
+    match (ceremony.send)(ceremony.endpoint, &request, None) {
+        Ok(reply) => Notified::Waked {
+            user_id: owner.to_owned(),
+            wake_id: reply.as_ref().and_then(wake_id_of),
+        },
+        Err(error) => {
+            eprintln!(
+                "onboarding delivery: could NOT wake the operator ({owner}): {error}. The \
+                 URL+code are in the delivery file and structured output below."
+            );
+            Notified::NotNotified {
+                reason: format!("wake failed: {error}"),
+            }
+        }
+    }
+}
+
+/// Write the 0600 delivery file into the CURRENT DIRECTORY -- the session workdir for an
+/// agent-run ceremony (durable artifact space), the invoker's directory for a user run.
+/// Never /tmp, never home by construction: it lands where the operator invoked onboard.
+/// Best-effort: a write failure is loud but does not fail the ceremony, since the wake and
+/// stdout still carry the deliverable. Returns the path written, for the structured line.
+fn write_delivery_file(provider: &str, minted_ms: i64, contents: &str) -> Option<String> {
+    let name = format!("onboard-delivery-{provider}-{minted_ms}.json");
+    let path = std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(&name);
+    let open = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(&path);
+    match open.and_then(|mut file| file.write_all(contents.as_bytes())) {
+        Ok(()) => Some(path.to_string_lossy().into_owned()),
+        Err(error) => {
+            eprintln!(
+                "onboarding delivery: could not write the delivery file {}: {error}",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+/// codex's device code appears on stdout the instant it is minted, then codex POLLS for up to
+/// fifteen minutes for the operator to approve in a browser. The operator therefore needs the
+/// code BEFORE codex exits -- so this TEES stdout: the supervise drive forwards every byte to
+/// the real terminal (passthrough preserved for an operator who IS watching) while buffering
+/// it, and the moment the URL+code parse out it emits the delivery mid-run. This is not the
+/// old scrape it superseded: that echoed to an operator who could already see the screen;
+/// this delivers to one who cannot.
+///
+/// The tee is done SINGLE-THREADED inside a custom drive (`attend_teed`) that mirrors
+/// `attend`'s exit/interrupt/expire loop exactly and reads the same `Supervised` predicates,
+/// so the INTERRUPTED classification and lease watchdog are preserved. `attend` itself is
+/// untouched for every other ceremony.
 fn run_openai_onboarding(staging: &str, ceremony: &Ceremony<'_>) -> Result<(), StageFailure> {
     let codex = harness_cli("openai", ceremony).map_err(StageFailure::from)?;
     let mut command = ProcessCommand::new(&codex);
@@ -860,22 +1024,147 @@ fn run_openai_onboarding(staging: &str, ceremony: &Ceremony<'_>) -> Result<(), S
         .args(["login", "--device-auth"])
         .env("CODEX_HOME", staging)
         .stdin(Stdio::inherit())
-        .stderr(Stdio::inherit());
+        .stderr(Stdio::inherit())
+        .stdout(Stdio::piped());
 
-    // stdout is INHERITED, not captured. codex prints the sign-in link and the one-time
-    // code itself, more usefully than we did: we used to pipe its output, replay it through
-    // a terminal emulator to strip ANSI, scan for a URL, and echo back a line the operator
-    // could already see four lines above. Reading a stream we have no reason to read is the
-    // same mistake the anthropic leg was deleted for.
-    // `run_bounded_inner` rather than `run_bounded`: the latter flattens its error to a
-    // String, which discards the INTERRUPTED classification. An interrupt must stay
-    // distinguishable from an ordinary failure all the way up, because `onboard` skips the
-    // gateway cancel on one and not the other.
-    let status = run_bounded_inner(command, "codex device-code login", ceremony.deadline, None)
-        .map_err(StageFailure::from)?;
+    // Same process-group setup `run_bounded_inner` does, so the lease watchdog can terminate
+    // the whole ceremony group. Replicated here because the tee needs a custom `supervise`
+    // drive rather than the shared `attend`-only one.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
 
+    let mut emitted = false;
+    let mut buffer = Vec::<u8>::new();
+
+    let outcome = supervise(
+        command,
+        "codex device-code login",
+        ceremony.deadline,
+        |supervised| attend_teed(supervised, ceremony, &mut emitted, &mut buffer),
+    );
+
+    // Miss path: codex produced a sign-in block we could not parse (a format drift), and it
+    // was not an operator cancel. Record the raw teed tail so the deliverable is never
+    // invisible -- loud degradation, exactly as ruled.
+    let interrupted = matches!(&outcome, Err(error) if error.is_interrupted());
+    if !emitted && !interrupted {
+        let text = String::from_utf8_lossy(&buffer);
+        if text.contains("device") || text.contains("one-time code") {
+            let tail = onboard_emit::raw_tail(&text, 4096);
+            if !tail.is_empty() {
+                emit_delivery(ceremony, &Deliverable::RawTail { tail }, None);
+            }
+        }
+    }
+
+    let (_, status) = outcome.map_err(StageFailure::from)?;
     codex_staged_a_credential(status, staging, "OpenAI device-code onboarding")
         .map_err(StageFailure::from)
+}
+
+/// `attend` with a teed stdout. Identical job-control and loop to `attend` -- setpgid, the
+/// terminal handoff, the SIGCONT, then the exact `exited?`/`interrupted?`/`leader_exited`/
+/// `expired?`/`wait` ordering -- with one addition: the piped stdout is drained each pass
+/// (and once more at exit) so the URL+code reach the operator while codex still polls. No
+/// stdin secret is delivered; codex reads none for device-auth.
+fn attend_teed(
+    supervised: &mut Supervised,
+    ceremony: &Ceremony<'_>,
+    emitted: &mut bool,
+    buffer: &mut Vec<u8>,
+) -> Result<(), RunError> {
+    let pgid = supervised.pgid();
+    unsafe {
+        libc::setpgid(pgid, pgid);
+    }
+
+    let _terminal = TerminalHandoff::to(pgid);
+
+    unsafe {
+        libc::killpg(pgid, libc::SIGCONT);
+    }
+
+    // Take the piped stdout and make it non-blocking, so draining it never wedges the loop
+    // that also has to notice the lease expiring. A child whose stdout cannot be made
+    // non-blocking is left to the loop (it just gets no passthrough), not failed.
+    let mut piped = supervised.child().stdout.take();
+    if let Some(out) = piped.as_ref() {
+        let _ = nonblocking(out.as_raw_fd());
+    }
+
+    loop {
+        if let Some(out) = piped.as_mut() {
+            tee_pump(out, ceremony, emitted, buffer);
+        }
+
+        let leader_exited = supervised.exited()?;
+
+        if let Some(error) = supervised.interrupted() {
+            return Err(error);
+        }
+
+        if leader_exited {
+            // A last drain: the bytes that carried the code may have landed between the final
+            // pump and the exit.
+            if let Some(out) = piped.as_mut() {
+                tee_pump(out, ceremony, emitted, buffer);
+            }
+            return Ok(());
+        }
+
+        if let Some(error) = supervised.expired() {
+            return Err(error);
+        }
+
+        supervised.wait(None);
+    }
+}
+
+/// Drain whatever is readable from the teed stdout right now (non-blocking): forward it to the
+/// real stdout for passthrough, buffer it, and on the FIRST pass where the URL+code parse out,
+/// emit the delivery. Returns when the pipe would block, is exhausted, or ends.
+fn tee_pump(
+    out: &mut ChildStdout,
+    ceremony: &Ceremony<'_>,
+    emitted: &mut bool,
+    buffer: &mut Vec<u8>,
+) {
+    let mut chunk = [0u8; 4096];
+    let mut stdout = io::stdout();
+    loop {
+        match out.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                let _ = stdout.write_all(&chunk[..n]);
+                let _ = stdout.flush();
+                buffer.extend_from_slice(&chunk[..n]);
+                // The code sits in the first few hundred bytes; a generous cap bounds memory
+                // without ever dropping it.
+                if buffer.len() > 64 * 1024 {
+                    let overflow = buffer.len() - 64 * 1024;
+                    buffer.drain(..overflow);
+                }
+                if !*emitted {
+                    if let Some(deliverable) =
+                        onboard_emit::extract_codex_device(&String::from_utf8_lossy(buffer))
+                    {
+                        // codex's own message says the code expires in fifteen minutes.
+                        emit_delivery(ceremony, &deliverable, Some(Duration::from_secs(15 * 60)));
+                        *emitted = true;
+                    }
+                }
+            }
+            Err(ref error) if error.kind() == io::ErrorKind::WouldBlock => break,
+            Err(ref error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
 }
 
 /// The subscription ceremony: `claude setup-token` under a pty, the token read off the
@@ -894,6 +1183,16 @@ fn run_anthropic_onboarding(
     ceremony: &Ceremony<'_>,
 ) -> Result<(), StageFailure> {
     let challenge = crate::anthropic_oauth::begin();
+    // Deliver the sign-in URL out of band BEFORE blocking on the pasted code: an operator who
+    // cannot see this terminal must still receive the link to open. There is no code on our
+    // side here -- the anthropic flow returns `code#state` FROM the operator (pasted below).
+    emit_delivery(
+        ceremony,
+        &Deliverable::SignInUrl {
+            url: challenge.url.clone(),
+        },
+        None,
+    );
     let pasted = ask_for_code(&challenge.url)?;
     let credential =
         crate::anthropic_oauth::complete(&challenge, &pasted).map_err(StageFailure::from)?;
@@ -1989,6 +2288,11 @@ mod tests {
             endpoint: &endpoint,
             deadline: Instant::now() + Duration::from_secs(1_800),
             load_harnesses: &|_, _| Ok(None),
+            identity: &Identity::Session,
+            send: &|_, _, _| Ok(None),
+            provider: "fixture-provider",
+            machine: None,
+            owner_user_id: None,
         };
 
         assert_eq!(
@@ -2380,6 +2684,11 @@ mod tests {
             endpoint: &endpoint,
             deadline,
             load_harnesses: &|_, _| Ok(None),
+            identity: &Identity::Session,
+            send: &|_, _, _| Ok(None),
+            provider: "fixture-provider",
+            machine: None,
+            owner_user_id: None,
         };
         let sent = std::cell::RefCell::new(Vec::new());
 
@@ -2409,6 +2718,99 @@ mod tests {
             sent[0].0
         );
         assert_eq!(sent[0].1, Some(deadline));
+    }
+
+    #[test]
+    fn owner_user_id_reads_the_begin_reply_field() {
+        let present = serde_json::json!({ "stagingPath": "/s", "ownerUserId": "mike" });
+        assert_eq!(owner_user_id(&present), Some("mike".to_owned()));
+        // Absent (an older gateway) or empty -> None, so the CLI degrades loudly.
+        assert_eq!(
+            owner_user_id(&serde_json::json!({ "stagingPath": "/s" })),
+            None
+        );
+        assert_eq!(
+            owner_user_id(&serde_json::json!({ "ownerUserId": "" })),
+            None
+        );
+    }
+
+    #[test]
+    fn notify_operator_wakes_the_owner_with_the_code() {
+        let endpoint = Endpoint {
+            base: "http://gateway.test".to_owned(),
+            token: "tbc_test".to_owned(),
+            origin: crate::dispatch::Origin::Provisioned,
+        };
+        let sent = std::cell::RefCell::new(Vec::<String>::new());
+        let send = |_: &Endpoint, request: &RequestSpec, _: Option<Instant>| {
+            sent.borrow_mut().push(request.body_json.clone());
+            Ok(Some(serde_json::json!({ "wakeId": "w_test" })))
+        };
+        let ceremony = Ceremony {
+            endpoint: &endpoint,
+            deadline: Instant::now() + Duration::from_secs(60),
+            load_harnesses: &|_, _| Ok(None),
+            identity: &Identity::User("mike".to_owned()),
+            send: &send,
+            provider: "openai",
+            machine: Some("shrdlu"),
+            owner_user_id: Some("mike".to_owned()),
+        };
+        let deliverable = Deliverable::DeviceCode {
+            url: "https://auth.openai.com/codex/device".to_owned(),
+            code: "VG6S-L35ON".to_owned(),
+        };
+
+        let notified = notify_operator(&ceremony, &deliverable, "shrdlu");
+
+        assert_eq!(
+            notified,
+            Notified::Waked {
+                user_id: "mike".to_owned(),
+                wake_id: Some("w_test".to_owned()),
+            }
+        );
+        let body = &sent.borrow()[0];
+        assert!(body.contains(r#""verb":"wake""#), "{body}");
+        assert!(body.contains(r#""userId":"mike""#), "{body}");
+        // The wake row carries the code text itself -- it IS the durable delivery record.
+        assert!(body.contains("VG6S-L35ON"), "{body}");
+    }
+
+    #[test]
+    fn notify_operator_degrades_loudly_without_an_owner() {
+        let endpoint = Endpoint {
+            base: "http://gateway.test".to_owned(),
+            token: "tbc_test".to_owned(),
+            origin: crate::dispatch::Origin::Provisioned,
+        };
+        let send = |_: &Endpoint,
+                    _: &RequestSpec,
+                    _: Option<Instant>|
+         -> Result<Option<serde_json::Value>, String> {
+            panic!("no wake must be sent when there is no owner to notify")
+        };
+        let ceremony = Ceremony {
+            endpoint: &endpoint,
+            deadline: Instant::now() + Duration::from_secs(60),
+            load_harnesses: &|_, _| Ok(None),
+            identity: &Identity::Session,
+            send: &send,
+            provider: "openai",
+            machine: Some("shrdlu"),
+            owner_user_id: None,
+        };
+        let deliverable = Deliverable::SignInUrl {
+            url: "https://claude.ai/oauth/authorize".to_owned(),
+        };
+
+        let notified = notify_operator(&ceremony, &deliverable, "shrdlu");
+
+        match notified {
+            Notified::NotNotified { reason } => assert!(reason.contains("ownerUserId"), "{reason}"),
+            other => panic!("expected NotNotified, got {other:?}"),
+        }
     }
 
     #[test]
@@ -3483,6 +3885,11 @@ mod tests {
             endpoint: &endpoint,
             deadline: Instant::now() + Duration::from_secs(1_800),
             load_harnesses: &|_, _| Ok(None),
+            identity: &Identity::Session,
+            send: &|_, _, _| Ok(None),
+            provider: "fixture-provider",
+            machine: None,
+            owner_user_id: None,
         };
         assert_eq!(
             harness_cli("nonesuch", &ceremony),

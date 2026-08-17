@@ -460,6 +460,35 @@ defmodule Tightbeam.CredentialKindsTest do
       assert Credentials.kind(:anthropic, Credentials) == :api_key
     end
 
+    # wi_0535922b: the begin reply names the OWNER user so the CLI can wake that
+    # user with the sign-in URL+code a session-run ceremony would otherwise trap
+    # on a pty nobody watches. Only the begin "ready" reply carries it; a caller
+    # with an owner (a user or agent origin) resolves, a process origin does not.
+    test "the begin reply carries ownerUserId for the operator wake (wi_0535922b)", ctx do
+      :ok = Tightbeam.Devices.ensure_schema(ctx.db)
+
+      {:ok, _rows} =
+        Tightbeam.DB.query(
+          ctx.db,
+          "INSERT INTO users (userId, isAdmin, createdAt) VALUES (?1, 1, ?2)",
+          ["owner-admin", System.system_time(:second)]
+        )
+
+      start_supervised!({Credentials, name: Credentials, base_dir: ctx.base, machine: "testhost"})
+
+      onboard =
+        Tightbeam.Gateway.handlers(%{
+          base_dir: ctx.base,
+          db: ctx.db,
+          onboarding_lease_ms: 1_800_000
+        })["onboard"]
+
+      call = %{origin: "user:owner-admin", params: %{provider: "anthropic"}}
+
+      assert %{status: "ready", owner_user_id: "owner-admin"} =
+               onboard.(put_in(call.params[:phase], "begin"))
+    end
+
     # FAIL-BEFORE (#106): the begin reply echoed the STORE spelling
     # (`kind: :api_key`), so the ceremony's opening line said "api_key" on a
     # wire whose contract — and every other surface, via
