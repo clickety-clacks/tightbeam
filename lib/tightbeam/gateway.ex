@@ -6722,8 +6722,12 @@ defmodule Tightbeam.Gateway do
   # turn these verbs into an existence oracle over other users' processes.
   #
   # Who may act: the owning user, a session owned by that user, or an admin.
-  # `processes` needs no gate here because it lists only the caller's own
-  # session and cannot name someone else's.
+  #
+  # `processes` is gated by the same predicate, in `processes_result/2`. An
+  # earlier comment here claimed it needed no gate because it lists only the
+  # caller's own session; that was false — it falls back to the caller only when
+  # the request names no target, and a hand-built request that named one was
+  # served (review att_c36308f5 F1).
   defp custody_handler(db, fun) do
     fn call ->
       with {:ok, id} <- required_process_id(call) do
@@ -7005,16 +7009,30 @@ defmodule Tightbeam.Gateway do
   defp processes_result(db, call) do
     session_key = call.session_key || caller_session(call)
 
-    if is_binary(session_key) do
-      %{
-        processes:
-          Enum.map(
-            ManagedProcesses.list_for_session(db, session_key),
-            &Payloads.managed_process/1
-          )
-      }
-    else
-      %{code: "missing_target", message: "processes needs a session to list"}
+    cond do
+      not is_binary(session_key) ->
+        %{code: "missing_target", message: "processes needs a session to list"}
+
+      # `call.session_key` is whatever the CALLER put on the wire, not who the
+      # caller is: the CLI never sends it for this verb (`dispatch.rs` builds
+      # `processes` with no params), so a request that names a target is a
+      # hand-built one, and ungated it read another user's rows. Same predicate
+      # and same `not_found` refusal as the per-process verbs above — the target
+      # session stands in for the row's owner columns.
+      not custody_authorized?(db, call, %{
+        ownerSessionKey: session_key,
+        ownerUserId: caller_session_owner(db, session_key)
+      }) ->
+        %{code: "not_found", message: "unknown session: #{session_key}"}
+
+      true ->
+        %{
+          processes:
+            Enum.map(
+              ManagedProcesses.list_for_session(db, session_key),
+              &Payloads.managed_process/1
+            )
+        }
     end
   end
 

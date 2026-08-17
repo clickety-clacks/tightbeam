@@ -2083,6 +2083,40 @@ defmodule Tightbeam.Wire.RouterTest do
       refute response.resp_body =~ "forbidden"
     end
 
+    # `processes` takes its target on the ENVELOPE rather than in params, which
+    # is how it stayed outside the loop above AND outside the gate: it fell back
+    # to the caller only when the request named nobody, so a stranger who named
+    # the owner was served the owner's rows (review att_c36308f5 F1). The CLI
+    # never sends a target for this verb, so nothing legitimate is being refused
+    # here — only the hand-built request that reproduced the leak.
+    listed =
+      dispatch_cli(ctx, stranger.cli_token, %{
+        verb: "processes",
+        sessionKey: owner.session_key,
+        params: %{}
+      })
+
+    assert JSON.decode!(listed.resp_body)["error"]["code"] == "not_found",
+           "processes leaked another user's rows: #{listed.resp_body}"
+
+    refute listed.resp_body =~ "tok_secret"
+    refute listed.resp_body =~ row.processId
+    refute listed.resp_body =~ "forbidden"
+
+    # ...and the owner still reaches its own, named explicitly. The gate has to
+    # refuse the stranger without costing the owner the verb.
+    Roles.create!(ctx.db, "custody-owner", "flynn", owner.session_key)
+
+    mine =
+      dispatch_cli(ctx, owner.cli_token, %{
+        verb: "processes",
+        sessionKey: owner.session_key,
+        params: %{}
+      })
+
+    assert mine.resp_body =~ row.processId,
+           "the gate cost the owner its own listing: #{mine.resp_body}"
+
     # The destructive one is the point: the row is untouched.
     after_row = Tightbeam.ManagedProcesses.get(ctx.db, row.processId)
     assert after_row.state == "preparing"
