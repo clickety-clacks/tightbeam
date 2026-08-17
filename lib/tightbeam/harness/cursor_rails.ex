@@ -71,13 +71,19 @@ defmodule Tightbeam.Harness.CursorRails do
 
   # Tightbeam PreToolUse `matcher` -> Cursor before-execution hook event.
   #
-  # ONLY matchers with a genuine BEFORE-execution gate belong here. The reserved
-  # Tightbeam entries (probe, observation, github-auth) and the current statute
-  # set all use "Bash" -> beforeShellExecution. "mcp__<server>__<tool>" is the
-  # standard Claude MCP tool-name convention Tightbeam mirrors, so it maps to
-  # Cursor's beforeMCPExecution. Anything else raises (see UnmappableRailError).
+  # ONLY matchers with a genuine, MATCHER-FAITHFUL BEFORE-execution gate belong
+  # here. Today that is exactly "Bash" -> beforeShellExecution: the reserved
+  # Tightbeam entries (probe, observation, github-auth) and every shipped statute
+  # use "Bash".
+  #
+  # MCP is deliberately NOT mapped. A Tightbeam "mcp__<server>__<tool>" matcher
+  # gates ONE specific tool, but Cursor's beforeMCPExecution fires for EVERY MCP
+  # call and this compiler cannot re-derive a per-tool guard from the opaque
+  # wrapped command — routing an mcp__ rail there would gate unrelated MCP tools
+  # (matcher parity violation / false positives, wisdom 4). No shipped statute
+  # targets MCP, so refusing it costs nothing today; it raises (see
+  # UnmappableRailError) until a tool-faithful Cursor contract exists.
   @shell_event "beforeShellExecution"
-  @mcp_event "beforeMCPExecution"
 
   @doc """
   Compile a Tightbeam PreToolUse hook map into a Cursor hooks config.
@@ -108,7 +114,6 @@ defmodule Tightbeam.Harness.CursorRails do
   """
   @spec event_for(String.t()) :: String.t()
   def event_for("Bash"), do: @shell_event
-  def event_for("mcp__" <> _tool), do: @mcp_event
   def event_for(matcher), do: raise(UnmappableRailError, matcher: matcher)
 
   # Wrap one Tightbeam command entry into a Cursor command entry that speaks
@@ -117,9 +122,15 @@ defmodule Tightbeam.Harness.CursorRails do
     %{"command" => wrap(tb_command)}
   end
 
-  # JSON-string escaping of the captured stderr, in sed: backslash first, then
-  # quote. Kept as a raw sigil so the shell sees exactly `s/\\/\\\\/g; s/"/\\"/g`.
-  @sed_json_escape ~S(s/\\/\\\\/g; s/"/\\"/g)
+  # JSON-string encoding of the captured stderr reason, pure POSIX (no jq/python
+  # dependency for the rare deny path). `tr '\000-\037' ' '` first maps EVERY JSON
+  # control byte (0x00-0x1F: newline, CR, tab, and the rest) to a space, so a
+  # multi-line or control-byte reason cannot break out of the JSON string; sed
+  # then escapes backslash and quote. Result: always well-formed JSON — a deny is
+  # never downgraded to a hook-failure (which Cursor would treat as a non-deny,
+  # i.e. a bypass). The reason is flattened to one line, not dropped. Kept as a
+  # raw sigil so the shell sees the escapes verbatim.
+  @json_encode_reason ~S(tr '\000-\037' ' ' | sed 's/\\/\\\\/g; s/"/\\"/g')
 
   # Adapt a Tightbeam gate command (block = exit 2 + stderr reason; allow = exit 0)
   # to Cursor's protocol (stdout JSON verdict, exit 0). Cursor runs this string in
@@ -134,7 +145,7 @@ defmodule Tightbeam.Harness.CursorRails do
       "msg=$(printf '%s' \"$in\" | sh -c \"$(printf '%s' '#{b64}' | base64 -d)\" 2>&1 1>/dev/null); " <>
       "rc=$?; " <>
       "if [ \"$rc\" = 2 ]; then " <>
-      "esc=$(printf '%s' \"$msg\" | sed '#{@sed_json_escape}'); " <>
+      "esc=$(printf '%s' \"$msg\" | #{@json_encode_reason}); " <>
       "printf '{\"permission\":\"deny\",\"user_message\":\"%s\"}' \"$esc\"; " <>
       "else printf '{\"permission\":\"allow\"}'; fi"
   end
