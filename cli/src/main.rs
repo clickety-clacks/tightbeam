@@ -4,6 +4,7 @@ mod base_dir;
 mod catalog_probe;
 mod ceremonies;
 mod child_process;
+mod command_execution;
 mod contain;
 mod dispatch;
 mod harness_process;
@@ -28,6 +29,16 @@ fn main() {
 
     if args.first().is_some_and(|arg| arg == "harness-exec") {
         match harness_process::session_exec(&args[1..]) {
+            Ok(status) => std::process::exit(status),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if args.first().is_some_and(|arg| arg == "command-exec") {
+        match command_execution::run(&args[1..]) {
             Ok(status) => std::process::exit(status),
             Err(error) => {
                 eprintln!("{error}");

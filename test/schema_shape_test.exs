@@ -95,6 +95,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
   test "a fresh database is created and stamped", %{db: db} do
     assert :ok = Schema.ensure_all(db)
+    assert "executionId" in table_columns(db, "command_executions")
 
     assert {:ok, [[@shape]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")

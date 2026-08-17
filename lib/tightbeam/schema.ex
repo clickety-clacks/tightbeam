@@ -22,6 +22,7 @@ defmodule Tightbeam.Schema do
     Tightbeam.Roles,
     Tightbeam.WorkItems,
     Tightbeam.Assignments,
+    Tightbeam.CommandExecutions,
     Tightbeam.EffortCheckin,
     Tightbeam.Placement,
     Tightbeam.RecurrenceSuppression,
