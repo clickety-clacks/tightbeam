@@ -762,7 +762,8 @@ defmodule Tightbeam.Credentials do
     with :ok <- refuse_hollow(:cursor, credential.bytes, "the onboarding ceremony") do
       atomic_write!(
         credential_store_path(state, :cursor),
-        String.trim(credential.bytes) <> "\n"
+        String.trim(credential.bytes) <> "\n",
+        bank_dir_mode(:cursor)
       )
 
       reconcile_provider_homes(state, :cursor)
@@ -1183,8 +1184,29 @@ defmodule Tightbeam.Credentials do
   defp harness_name(:cursor), do: "cursor"
   defp harness_name(:fixture_provider), do: "fixture"
 
-  defp atomic_write!(path, bytes) do
-    File.mkdir_p!(Path.dirname(path))
+  # The mode a provider's bank directory must carry, or nil to leave whatever
+  # `mkdir` created. Cursor is the one owner-only (0700) provider: its key is a
+  # bare secret with no harness home to fall back on, so a world-traversable
+  # directory around a 0600 file is exposure the credential-park store exists to
+  # close. The others keep the default here; tightening every provider to 0700
+  # is a separate cross-provider change, not a rider on the cursor add. This is
+  # the single source of truth for both the local and remote bank writes.
+  defp bank_dir_mode(:cursor), do: 0o700
+  defp bank_dir_mode(_provider), do: nil
+
+  # `dir_mode` is opt-in and defaults to leaving the directory as `mkdir_p`
+  # created it, so every existing caller is byte-for-byte unchanged. Cursor
+  # passes 0o700 because its bank directory holds a bare secret with no harness
+  # home to fall back on: the file is 0600, but a 0755 directory still lets any
+  # same-box process TRAVERSE to it, and the credential-park contract is
+  # owner-only at rest. This is scoped to the cursor write on purpose — widening
+  # 0700 to every provider's bank directory changes openai/anthropic/fixture
+  # behavior and is an adjudication for the dispatcher, not a change to smuggle
+  # in under a cursor provider-add.
+  defp atomic_write!(path, bytes, dir_mode \\ nil) do
+    dir = Path.dirname(path)
+    File.mkdir_p!(dir)
+    if dir_mode, do: File.chmod!(dir, dir_mode)
     temporary = path <> ".tmp-#{System.unique_integer([:positive])}"
     File.write!(temporary, bytes)
     File.chmod!(temporary, 0o600)
@@ -1266,10 +1288,23 @@ defmodule Tightbeam.Credentials do
   defp install_staged!(state, provider, kind, path) do
     source = staged_path(provider, path)
     store = credential_store_path(state, provider)
+    dir = Path.dirname(store)
+
+    # Cursor's bank directory is owner-only, remotely as it is locally: the key
+    # is a bare secret with no harness home, so a 0755 directory that any
+    # same-box account can traverse to a 0600 file is exactly the exposure the
+    # credential-park store exists to close. Scoped to cursor on purpose — the
+    # other providers' remote directories keep the perms they have always had.
+    dir_chmod =
+      case bank_dir_mode(provider) do
+        nil -> ""
+        mode -> "chmod #{Integer.to_string(mode, 8)} #{shell_quote(dir)} && "
+      end
 
     script =
       "test -f #{shell_quote(source)} && " <>
-        "mkdir -p #{shell_quote(Path.dirname(store))} && " <>
+        "mkdir -p #{shell_quote(dir)} && " <>
+        dir_chmod <>
         "chmod 600 #{shell_quote(source)} && " <>
         "mv #{shell_quote(source)} #{shell_quote(store)} && " <>
         "chmod 600 #{shell_quote(store)}"
