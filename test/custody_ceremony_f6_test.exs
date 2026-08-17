@@ -174,13 +174,23 @@ defmodule Tightbeam.CustodyCeremonyF6Test do
       })
     )
 
+    # A HOME and a TMPDIR of its own, so closing the environment leaves the CLI
+    # somewhere to be rather than pointing it at the real user's dotfiles.
+    home = Path.join(root, "home")
+    tmpdir = Path.join(root, "tmp")
+    File.mkdir_p!(home)
+    File.mkdir_p!(tmpdir)
+
     %{
       binary: binary,
       db: db,
       deny_flag: deny_flag,
+      env_log: Path.join(root, "workload-env.log"),
+      home: home,
       machine: machine,
       release_stamp: release_stamp,
       root: root,
+      tmpdir: tmpdir,
       workdir: workdir
     }
   end
@@ -242,6 +252,20 @@ defmodule Tightbeam.CustodyCeremonyF6Test do
     assert exec =~ "argv=login --device-auth", "the fixture ran with unexpected argv: #{exec}"
     assert exec =~ "stamp=present", "the workload exec'd before its release: #{exec}"
 
+    # Checked HERE and not in the denied case because only a workload that
+    # actually exec'd can report what it was handed; the denied case proves the
+    # opposite thing, that nothing exec'd at all.
+    assert_environment_closed(ctx, [
+      "TIGHTBEAM_BASE_DIR",
+      "TIGHTBEAM_MACHINE",
+      "PATH",
+      "HOME",
+      "TMPDIR",
+      "TB_F6_EXEC_LOG",
+      "TB_F6_ENV_LOG",
+      "TB_F6_RELEASE_STAMP"
+    ])
+
     [_, child_pid] = Regex.run(~r/pid=(\d+)/, exec)
     [_, child_pgid] = Regex.run(~r/pgid=(\d+)/, exec)
 
@@ -291,13 +315,17 @@ defmodule Tightbeam.CustodyCeremonyF6Test do
     System.cmd(ctx.binary, ["onboard", "openai"],
       cd: ctx.workdir,
       stderr_to_stdout: true,
-      env: [
-        {"TIGHTBEAM_BASE_DIR", ctx.root},
-        {"TIGHTBEAM_MACHINE", ctx.machine},
-        {"PATH", Path.join(ctx.root, "harness-bin") <> ":" <> System.get_env("PATH")},
-        {"TB_F6_EXEC_LOG", exec_log},
-        {"TB_F6_RELEASE_STAMP", ctx.release_stamp}
-      ]
+      env:
+        closed_env([
+          {"TIGHTBEAM_BASE_DIR", ctx.root},
+          {"TIGHTBEAM_MACHINE", ctx.machine},
+          {"PATH", Path.join(ctx.root, "harness-bin") <> ":/usr/bin:/bin"},
+          {"HOME", ctx.home},
+          {"TMPDIR", ctx.tmpdir},
+          {"TB_F6_EXEC_LOG", exec_log},
+          {"TB_F6_ENV_LOG", ctx.env_log},
+          {"TB_F6_RELEASE_STAMP", ctx.release_stamp}
+        ])
     )
   end
 
@@ -305,8 +333,65 @@ defmodule Tightbeam.CustodyCeremonyF6Test do
     System.cmd(ctx.binary, ["process-reconcile", process_id],
       cd: ctx.workdir,
       stderr_to_stdout: true,
-      env: [{"TIGHTBEAM_BASE_DIR", ctx.root}]
+      env:
+        closed_env([
+          {"TIGHTBEAM_BASE_DIR", ctx.root},
+          {"PATH", "/usr/bin:/bin"},
+          {"HOME", ctx.home},
+          {"TMPDIR", ctx.tmpdir}
+        ])
     )
+  end
+
+  # `System.cmd/3` MERGES `env:` into the parent environment — it does not
+  # replace it. An allowlist alone therefore proves NOTHING about isolation:
+  # every variable the test runner happened to hold, credentials included,
+  # still reached the workload, which is exactly what made this test's
+  # "no credential in reach" claim unearned (review att_c36308f5 F6).
+  #
+  # Passing `{name, nil}` is how `System.cmd/3` REMOVES a variable, so closing
+  # the environment means naming every inherited variable outside the allowlist
+  # and removing it. Built from `System.get_env/0` at call time rather than from
+  # a fixed deny list, because the leak to worry about is the variable nobody
+  # thought to name.
+  defp closed_env(allowed) do
+    kept = MapSet.new(allowed, fn {name, _value} -> name end)
+
+    allowed ++
+      for {name, _value} <- System.get_env(), not MapSet.member?(kept, name), do: {name, nil}
+  end
+
+  # The claim, OBSERVED rather than argued: the fixture dumps the environment it
+  # was actually handed, and no name the test runner holds outside the allowlist
+  # may appear in it. Anything the CLI itself adds on the way down is ours and
+  # is not inheritance, so it is not what this checks; the second assertion
+  # covers those by shape instead.
+  defp assert_environment_closed(ctx, allowed_names) do
+    received =
+      ctx.env_log
+      |> File.read!()
+      |> String.split("\n", trim: true)
+      |> Enum.map(&(&1 |> String.split("=", parts: 2) |> hd()))
+      |> MapSet.new()
+
+    inherited =
+      System.get_env()
+      |> Map.keys()
+      |> Enum.filter(&(&1 not in allowed_names and MapSet.member?(received, &1)))
+      |> Enum.sort()
+
+    assert inherited == [],
+           "the workload inherited #{inspect(inherited)} from the test runner; " <>
+             "the isolation this proof claims does not hold"
+
+    secretish =
+      received
+      |> Enum.filter(&Regex.match?(~r/KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL/i, &1))
+      |> Enum.reject(&String.starts_with?(&1, "TB_F6_"))
+      |> Enum.sort()
+
+    assert secretish == [],
+           "the workload was handed credential-shaped variables #{inspect(secretish)}"
   end
 
   # The two custody verbs are wrapped, not replaced: the real handler decides,
@@ -353,10 +438,13 @@ defmodule Tightbeam.CustodyCeremonyF6Test do
 
   # The fixture harness CLI. It contacts nothing, writes only where it is told,
   # and records the one fact the success case turns on: whether the release had
-  # already been granted at the instant it became this program.
+  # already been granted at the instant it became this program. It also dumps
+  # the environment it was handed, which is the only place the isolation claim
+  # can be checked from — the test cannot see what the CLI passed down.
   defp fixture_script do
     """
     #!/bin/sh
+    env > "$TB_F6_ENV_LOG"
     if [ -e "$TB_F6_RELEASE_STAMP" ]; then stamp=present; else stamp=absent; fi
     pgid=`ps -o pgid= -p $$ | tr -d ' '`
     printf 'argv=%s stamp=%s pid=%s pgid=%s\\n' "$*" "$stamp" "$$" "$pgid" >> "$TB_F6_EXEC_LOG"
