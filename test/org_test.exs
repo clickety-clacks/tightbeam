@@ -421,7 +421,8 @@ defmodule Tightbeam.OrgTest do
     plan = Org.po_display_migration_plan(db)
     assert plan == [%{session_key: "po-1", from: "Product Owner — Outpost", to: "PO — Outpost"}]
 
-    history_counts_before = history_table_counts(db)
+    seed_history_rows(db, "po-1")
+    history_before = history_snapshot(db)
 
     applied = Org.migrate_po_display_names(db)
     assert Enum.map(applied, & &1.session_key) == ["po-1"]
@@ -439,9 +440,12 @@ defmodule Tightbeam.OrgTest do
     assert migrated.state == target.state
     assert migrated.owner_user_id == target.owner_user_id
 
-    # No historical row anywhere moved — the migration's only statement is an
-    # UPDATE against `sessions`, so it cannot reach these tables at all.
-    assert history_table_counts(db) == history_counts_before
+    # No historical row anywhere moved OR was rewritten — full row content
+    # (not just a count) is byte-identical, including the seeded rows
+    # attached to the very session that got renamed. A migration that
+    # somehow UPDATEd rather than left these tables alone (same row count,
+    # different content) would fail this where a count-only check could not.
+    assert history_snapshot(db) == history_before
 
     # Idempotent: the prefix no longer matches, so a second run selects nothing.
     assert Org.po_display_migration_plan(db) == []
@@ -498,10 +502,38 @@ defmodule Tightbeam.OrgTest do
     end
   end
 
-  defp history_table_counts(db) do
+  defp seed_history_rows(db, session_key) do
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO events (ts, kind, verb, origin, principal, sessionKey, payload) VALUES (1, 'verb', 'seed', 'user:flynn', NULL, ?1, 'null')",
+        [session_key]
+      )
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO lifecycle_events (ts, kind, subject, detail) VALUES (1, 'seed', ?1, 'untouched')",
+        [session_key]
+      )
+
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO messages (id, sessionKey, role, content, timestamp, llmVisibleMessageId)
+        VALUES ('seed-msg-1', ?1, 'user', 'seed content', 1, 'seed-msg-1')
+        """,
+        [session_key]
+      )
+
+    :ok
+  end
+
+  defp history_snapshot(db) do
     for table <- ~w(events lifecycle_events messages) do
-      {:ok, [[count]]} = DB.query(db, "SELECT COUNT(*) FROM #{table}")
-      {table, count}
+      {:ok, rows} = DB.query(db, "SELECT * FROM #{table} ORDER BY 1")
+      {table, rows}
     end
   end
 

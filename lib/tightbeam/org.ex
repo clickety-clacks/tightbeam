@@ -403,15 +403,18 @@ defmodule Tightbeam.Org do
   nothing. Touches only `displayName`; retired sessions and every other
   column are untouched.
 
-  The UPDATE rechecks `state = 'active' AND archetype = ?` itself rather
-  than trusting the SELECT above it, so a session that retires (or is
-  reassigned off `product-owner`) between discovery and write within this
-  same transaction is skipped, not renamed — `Txn.changes(txn) == 1` is the
-  same expected-match guard `swap_model_in_txn/4` uses for the same reason.
-  `Tightbeam.DB` fully serializes every transaction through one connection
-  (see its moduledoc), so no other write can actually land inside this
-  window today; the recheck is the correctness argument that stays true if
-  that ever changes, not a race this suite can force open.
+  The UPDATE rechecks all three of the SELECT's own predicates —
+  `state = 'active'`, `archetype = ?`, AND the exact `displayName` this
+  transaction just read — rather than trusting the SELECT above it, so a
+  session that retires, is reassigned off `product-owner`, or is renamed to
+  anything else (by a user, or by having already been migrated) between
+  discovery and write within this same transaction is skipped, not
+  clobbered — `Txn.changes(txn) == 1` is the same expected-match guard
+  `swap_model_in_txn/4` uses for the same reason. `Tightbeam.DB` fully
+  serializes every transaction through one connection (see its moduledoc),
+  so no other write can actually land inside this window today; the
+  recheck is the correctness argument that stays true if that ever
+  changes, not a race this suite can force open.
 
   Returns every session actually renamed, in its POST-migration state, so a
   caller can broadcast `stream_updated` for each (see
@@ -431,14 +434,14 @@ defmodule Tightbeam.Org do
     now = now()
 
     targets
-    |> Enum.reduce([], fn %{session_key: session_key, to: to}, renamed ->
+    |> Enum.reduce([], fn %{session_key: session_key, from: from, to: to}, renamed ->
       Txn.q(
         txn,
         """
         UPDATE sessions SET displayName = ?2, updatedAt = ?3
-        WHERE sessionKey = ?1 AND state = 'active' AND archetype = ?4
+        WHERE sessionKey = ?1 AND state = 'active' AND archetype = ?4 AND displayName = ?5
         """,
-        [session_key, to, now, @po_archetype_name]
+        [session_key, to, now, @po_archetype_name, from]
       )
 
       if Txn.changes(txn) == 1, do: [must_get(txn, session_key) | renamed], else: renamed
