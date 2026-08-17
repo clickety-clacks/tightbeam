@@ -1024,30 +1024,12 @@ fn run_openai_onboarding(staging: &str, ceremony: &Ceremony<'_>) -> Result<(), S
         .args(["login", "--device-auth"])
         .env("CODEX_HOME", staging)
         .stdin(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .stdout(Stdio::piped());
-
-    // Same process-group setup `run_bounded_inner` does, so the lease watchdog can terminate
-    // the whole ceremony group. Replicated here because the tee needs a custom `supervise`
-    // drive rather than the shared `attend`-only one.
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setpgid(0, 0) == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+        .stderr(Stdio::inherit());
 
     let mut emitted = false;
     let mut buffer = Vec::<u8>::new();
 
-    let outcome = supervise(
-        command,
-        "codex device-code login",
-        ceremony.deadline,
-        |supervised| attend_teed(supervised, ceremony, &mut emitted, &mut buffer),
-    );
+    let outcome = supervise_teed(command, ceremony, &mut emitted, &mut buffer);
 
     // Miss path: codex produced a sign-in block we could not parse (a format drift), and it
     // was not an operator cancel. Record the raw teed tail so the deliverable is never
@@ -1063,9 +1045,45 @@ fn run_openai_onboarding(staging: &str, ceremony: &Ceremony<'_>) -> Result<(), S
         }
     }
 
-    let (_, status) = outcome.map_err(StageFailure::from)?;
+    let status = outcome.map_err(StageFailure::from)?;
     codex_staged_a_credential(status, staging, "OpenAI device-code onboarding")
         .map_err(StageFailure::from)
+}
+
+/// Spawn a device-auth child with its stdout TEED, and drive it under the lease with
+/// `attend_teed`. Forces the two things the tee needs and nothing provider-specific: a piped
+/// stdout, and the child's own process group (setpgid, so the lease watchdog can terminate the
+/// whole ceremony group -- the same setup `run_bounded_inner` does, replicated because the tee
+/// needs a custom `supervise` drive rather than the shared `attend`-only one). The caller
+/// configures everything else (program, args, env, stdin, stderr).
+///
+/// Extracted from `run_openai_onboarding` for one reason: so the teed drive -- the piped
+/// stdout flowing through `attend_teed`/`tee_pump` into `emit_delivery` mid-run -- is
+/// exercisable against a stub child. Production points it at codex; the tests point it at a
+/// `/bin/sh` stub that replays a real device-auth capture.
+fn supervise_teed(
+    mut command: ProcessCommand,
+    ceremony: &Ceremony<'_>,
+    emitted: &mut bool,
+    buffer: &mut Vec<u8>,
+) -> Result<ExitStatus, RunError> {
+    command.stdout(Stdio::piped());
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    supervise(
+        command,
+        "codex device-code login",
+        ceremony.deadline,
+        |supervised| attend_teed(supervised, ceremony, emitted, buffer),
+    )
+    .map(|(_, status)| status)
 }
 
 /// `attend` with a teed stdout. Identical job-control and loop to `attend` -- setpgid, the
@@ -2133,6 +2151,14 @@ fn target_from_probe(output: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// Serializes the tests that drive `emit_delivery`, because `write_delivery_file` writes into
+    /// the process-wide current directory (the shared crate root under `cargo test`) and each such
+    /// test globs + deletes `onboard-delivery-openai-*.json` to clean up. Without this lock two of
+    /// them running in parallel delete each other's file mid-run. Poison is ignored: a panicking
+    /// assertion in one test must surface as that test's failure, not as a poison error masking it
+    /// in the next.
+    static DELIVERY_CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// The refusal is the whole value of not reading a key from a terminal, so
     /// the sentence is pinned rather than the `isatty` branch that produces it
     /// (which a unit test cannot stub). It must name the pipe form, because that
@@ -2654,6 +2680,288 @@ mod tests {
         assert_eq!(
             handled, "term",
             "SIGKILL arrived before the contained process handled SIGTERM"
+        );
+    }
+
+    /// The `onboard-delivery-openai-*.json` files present in `dir` right now.
+    ///
+    /// `emit_delivery` writes a 0600 delivery file into the current directory (the crate root
+    /// under `cargo test`). The teed-drive test below snapshots this set before and after so it
+    /// removes only what it created, never a neighbour test's artifact.
+    fn openai_delivery_files(dir: &std::path::Path) -> std::collections::HashSet<PathBuf> {
+        fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with("onboard-delivery-openai-") && name.ends_with(".json")
+                    })
+            })
+            .collect()
+    }
+
+    /// The teed OpenAI drive delivers MID-RUN, end to end through the real loop.
+    ///
+    /// This is the seam an independent review flagged as unproven: real device-auth bytes had
+    /// never been driven through the LIVE tee -- `supervise_teed` -> `attend_teed` ->
+    /// `tee_pump` -> `extract_codex_device` -> `emit_delivery` -> operator wake. The pure
+    /// extraction is unit-tested against this same fixture in `onboard_emit`; this proves the
+    /// drive reaches it while the child still runs. A `/bin/sh` stub replays the real codex
+    /// 0.146.0 device-auth capture to its (piped, teed) stdout, then sleeps briefly and exits
+    /// 0 -- so the delivery must fire BEFORE the child exits, and the drive must still return
+    /// the child's status.
+    #[test]
+    fn the_teed_openai_drive_emits_the_code_mid_run() {
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/codex-device-auth-0.146.0.txt"
+        );
+
+        let _cwd_guard = DELIVERY_CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        let before = openai_delivery_files(&cwd);
+
+        let mut command = ProcessCommand::new("/bin/sh");
+        command
+            .args(["-c", &format!("cat {fixture}; sleep 0.2; exit 0")])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null());
+
+        let endpoint = Endpoint {
+            base: "http://gateway.test".to_owned(),
+            token: "tbc_test".to_owned(),
+            origin: crate::dispatch::Origin::Provisioned,
+        };
+        let sent = std::cell::RefCell::new(Vec::<String>::new());
+        let send = |_: &Endpoint, request: &RequestSpec, _: Option<Instant>| {
+            sent.borrow_mut().push(request.body_json.clone());
+            Ok(Some(serde_json::json!({ "wakeId": "w_test" })))
+        };
+        let ceremony = Ceremony {
+            endpoint: &endpoint,
+            deadline: Instant::now() + Duration::from_secs(30),
+            load_harnesses: &|_, _| Ok(None),
+            identity: &Identity::User("mike".to_owned()),
+            send: &send,
+            provider: "openai",
+            machine: Some("shrdlu"),
+            owner_user_id: Some("mike".to_owned()),
+        };
+
+        let mut emitted = false;
+        let mut buffer = Vec::<u8>::new();
+        let status = supervise_teed(command, &ceremony, &mut emitted, &mut buffer).unwrap();
+
+        // Clean up before any assertion can unwind and leak the crate-dir artifact.
+        for path in openai_delivery_files(&cwd).difference(&before) {
+            let _ = fs::remove_file(path);
+        }
+
+        assert!(
+            status.success(),
+            "the stub child exited non-zero: {status:?}"
+        );
+        assert!(emitted, "the teed drive never emitted the delivery mid-run");
+
+        let sent = sent.into_inner();
+        assert_eq!(sent.len(), 1, "expected exactly one wake, got {sent:?}");
+        let body = &sent[0];
+        assert!(body.contains(r#""verb":"wake""#), "{body}");
+        assert!(body.contains(r#""userId":"mike""#), "{body}");
+        // The real capture's code and URL, carried on the durable wake row.
+        assert!(
+            body.contains("VG6S-L35ON"),
+            "code missing from wake: {body}"
+        );
+        assert!(
+            body.contains("auth.openai.com/codex/device"),
+            "url missing from wake: {body}"
+        );
+    }
+
+    /// The full OpenAI onboarding leg delivers the device code and banks the credential.
+    ///
+    /// This drives the LITERAL `run_openai_onboarding` -- the entry an independent review named
+    /// as unproven -- against a codex stub, so every hop runs as one behavior path: `harness_cli`
+    /// (resolving the stub through the ceremony's harness catalog) -> `supervise_teed` ->
+    /// `attend_teed` -> `tee_pump` -> `extract_codex_device` -> `emit_delivery` -> operator wake
+    /// + `write_delivery_file` (0600) -> the structured line -> `codex_staged_a_credential`. The
+    /// stub replays the real codex 0.146.0 device-auth capture to its teed stdout, then banks a
+    /// non-empty `auth.json` into `$CODEX_HOME` and exits 0, so the delivery must fire mid-run AND
+    /// the leg must return Ok. Asserting the delivery FILE's mode and contents -- not just the
+    /// wake -- is what makes `write_delivery_file` a proven step of this path, not an inferred one.
+    #[test]
+    fn run_openai_onboarding_delivers_the_device_code_and_banks_the_credential() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/codex-device-auth-0.146.0.txt"
+        );
+
+        // A private scratch root for this run: the staging CODEX_HOME the stub banks into, and the
+        // stub script itself. Named from the clock + pid so parallel tests never collide.
+        let unique = format!(
+            "{}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            std::process::id()
+        );
+        let root = std::env::temp_dir().join(format!("tightbeam-onboard-e2e-{unique}"));
+        let staging = root.join("staging");
+        fs::create_dir_all(&staging).unwrap();
+
+        // The codex stub: replay the real capture to (teed) stdout, then bank a credential into
+        // $CODEX_HOME and exit 0 -- exactly the success shape codex_staged_a_credential accepts.
+        let stub = root.join("codex-stub.sh");
+        fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\ncat {fixture}\nsleep 0.2\nprintf '{{\"token\":\"banked\"}}' > \"$CODEX_HOME/auth.json\"\nexit 0\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let endpoint = Endpoint {
+            base: "http://gateway.test".to_owned(),
+            token: "tbc_test".to_owned(),
+            origin: crate::dispatch::Origin::Provisioned,
+        };
+        let sent = std::cell::RefCell::new(Vec::<String>::new());
+        let send = |_: &Endpoint, request: &RequestSpec, _: Option<Instant>| {
+            sent.borrow_mut().push(request.body_json.clone());
+            Ok(Some(serde_json::json!({ "wakeId": "w_test" })))
+        };
+        // The harness catalog points `codex` at the stub's absolute path; harness_cli resolves it
+        // without touching the process PATH -- on_path joins each search dir with an absolute
+        // binary and gets the absolute path back.
+        let catalog = crate::harnesses::HarnessCatalog {
+            harnesses: vec![crate::harnesses::HarnessProjection {
+                wire_name: "codex".to_owned(),
+                install_package: "codex".to_owned(),
+                cli_binary: stub.to_string_lossy().into_owned(),
+                process_markers: vec![],
+            }],
+        };
+        let load = |_: &Endpoint, _: Instant| Ok(Some(catalog.clone()));
+        let ceremony = Ceremony {
+            endpoint: &endpoint,
+            deadline: Instant::now() + Duration::from_secs(30),
+            load_harnesses: &load,
+            identity: &Identity::User("mike".to_owned()),
+            send: &send,
+            provider: "openai",
+            machine: Some("shrdlu"),
+            owner_user_id: Some("mike".to_owned()),
+        };
+
+        let _cwd_guard = DELIVERY_CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        let before = openai_delivery_files(&cwd);
+
+        let result = run_openai_onboarding(staging.to_str().unwrap(), &ceremony);
+
+        // Capture the delivery file's mode and contents, then clean it and the scratch root before
+        // any assertion can unwind and leak an artifact into the crate dir.
+        let fresh: Vec<PathBuf> = openai_delivery_files(&cwd)
+            .difference(&before)
+            .cloned()
+            .collect();
+        let file_evidence = fresh.first().map(|path| {
+            let mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            let body = fs::read_to_string(path).unwrap();
+            (mode, body)
+        });
+        for path in &fresh {
+            let _ = fs::remove_file(path);
+        }
+        let _ = fs::remove_dir_all(&root);
+
+        result.expect("the full onboarding leg should bank the credential and return Ok");
+
+        // The operator wake carried the real code and URL.
+        let sent = sent.into_inner();
+        assert_eq!(sent.len(), 1, "expected exactly one wake, got {sent:?}");
+        let body = &sent[0];
+        assert!(body.contains(r#""verb":"wake""#), "{body}");
+        assert!(
+            body.contains("VG6S-L35ON"),
+            "code missing from wake: {body}"
+        );
+        assert!(
+            body.contains("auth.openai.com/codex/device"),
+            "url missing from wake: {body}"
+        );
+
+        // write_delivery_file wrote exactly one 0600 file carrying the same code and URL.
+        assert_eq!(
+            fresh.len(),
+            1,
+            "expected exactly one delivery file, got {fresh:?}"
+        );
+        let (mode, contents) = file_evidence.expect("the delivery file should exist");
+        assert_eq!(mode, 0o600, "the delivery file must be private (0600)");
+        assert!(
+            contents.contains("VG6S-L35ON"),
+            "code missing from delivery file: {contents}"
+        );
+        assert!(
+            contents.contains("auth.openai.com/codex/device"),
+            "url missing from delivery file: {contents}"
+        );
+    }
+
+    /// The teed drive honors the lease exactly as `attend` does.
+    ///
+    /// A child that never exits is terminated when the lease expires -- promptly, and with
+    /// nothing emitted -- so the tee cannot let a wedged codex outlive its lease. Pairs with
+    /// `term_during_codex_onboarding_kills_the_tree_without_entering_cancel`, which already
+    /// proves the interrupt path through this same drive against a real child.
+    #[test]
+    fn the_teed_openai_drive_expires_on_the_lease() {
+        let mut command = ProcessCommand::new("/bin/sh");
+        command
+            .args(["-c", "sleep 5"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null());
+
+        let endpoint = Endpoint {
+            base: "http://gateway.test".to_owned(),
+            token: "tbc_test".to_owned(),
+            origin: crate::dispatch::Origin::Provisioned,
+        };
+        let ceremony = Ceremony {
+            endpoint: &endpoint,
+            deadline: Instant::now() + Duration::from_millis(200),
+            load_harnesses: &|_, _| Ok(None),
+            identity: &Identity::User("mike".to_owned()),
+            send: &|_, _, _| panic!("a ceremony that emitted nothing must send no wake"),
+            provider: "openai",
+            machine: Some("shrdlu"),
+            owner_user_id: Some("mike".to_owned()),
+        };
+
+        let mut emitted = false;
+        let mut buffer = Vec::<u8>::new();
+        let started = Instant::now();
+        let error = supervise_teed(command, &ceremony, &mut emitted, &mut buffer).unwrap_err();
+
+        assert!(
+            error.to_string().contains("onboarding lease expired"),
+            "{error}"
+        );
+        assert!(!emitted, "an expired ceremony should have emitted nothing");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the lease did not end the teed drive promptly: {:?}",
+            started.elapsed()
         );
     }
 
