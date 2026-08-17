@@ -419,6 +419,105 @@ defmodule Tightbeam.HarnessHealthTest do
     refute HarnessHealth.unavailable?(ctx.db, "claude", "gibson")
   end
 
+  test "no active main preserves failed turns while incident promotion refuses", ctx do
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "UPDATE sessions SET state='retired' WHERE sessionKey=?1",
+               [ctx.main_session]
+             )
+
+    [first, second | _] = ctx.sessions
+
+    for {ref, message_id} <- [{first, "refused-1"}, {second, "refused-2"}] do
+      {:ok, _seq} =
+        Ledger.enqueue(ctx.db, %{
+          session_key: ref.session,
+          message_id: message_id,
+          origin: "agent:test",
+          prompt: "run",
+          assignment_id: ref.assignment
+        })
+
+      {:ok, turn} = Ledger.claim_next(ctx.db, ref.session, "test-lane")
+      turn = Map.put(turn, :session_key, ref.session)
+      session = Org.get(ctx.db, ref.session)
+
+      assert {:ok, nil} =
+               DB.transaction(ctx.db, fn txn ->
+                 assert Ledger.finish_in_txn(txn, turn.seq, "failed", "auth expired")
+
+                 HarnessHealth.observe_turn_failure_in_txn(
+                   txn,
+                   session,
+                   turn,
+                   :prompt,
+                   %{"data" => %{"details" => "auth expired"}}
+                 )
+               end)
+    end
+
+    assert {:ok, [["failed"], ["failed"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns ORDER BY seq")
+
+    assert HarnessHealth.active(ctx.db) == []
+
+    assert {:ok, [[2]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM harness_health_observations")
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM condition_facts")
+
+    assert Enum.count(
+             EventLog.lifecycle_events(ctx.db),
+             &(&1.kind == "harness_health_incident_refused")
+           ) == 1
+
+    assert {:ok, _seq} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: second.session,
+               message_id: "after-refusal",
+               origin: "agent:test",
+               prompt: "continue",
+               assignment_id: second.assignment
+             })
+
+    assert {:ok, turn} = Ledger.claim_next(ctx.db, second.session, "test-lane")
+    turn = Map.put(turn, :session_key, second.session)
+    session = Org.get(ctx.db, second.session)
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "UPDATE sessions SET state='active' WHERE sessionKey=?1",
+               [ctx.main_session]
+             )
+
+    assert {:ok, post_commit} =
+             DB.transaction(ctx.db, fn txn ->
+               assert Ledger.finish_in_txn(txn, turn.seq, "failed", "auth expired")
+
+               HarnessHealth.observe_turn_failure_in_txn(
+                 txn,
+                 session,
+                 turn,
+                 :prompt,
+                 %{"data" => %{"details" => "auth expired"}}
+               )
+             end)
+
+    assert is_function(post_commit, 0)
+    post_commit.()
+
+    assert [incident] = HarnessHealth.active(ctx.db)
+    assert length(HarnessHealth.get(ctx.db, incident.id).observations) == 3
+
+    assert Enum.count(
+             EventLog.lifecycle_events(ctx.db),
+             &(&1.kind == "harness_health_auth_blocker")
+           ) == 1
+  end
+
   test "one open incident absorbs later evidence and preserves its first evidence", ctx do
     [first, second, third] = ctx.sessions
 

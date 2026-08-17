@@ -338,9 +338,9 @@ defmodule Tightbeam.HarnessHealth do
     :ok
   end
 
-  @doc "Open an auth incident immediately from a provider-authoritative invalidation."
+  @doc "Record provider-authoritative invalidation and open unless human delivery must refuse."
   @spec observe_provider_invalidation(DB.server(), String.t(), String.t(), term(), keyword()) ::
-          {:opened | :attached | :duplicate, map()}
+          {:pending | :opened | :attached | :duplicate, map()}
   def observe_provider_invalidation(db \\ DB, harness, host, event, opts \\ []) do
     observe(db, %{
       correlation_id: "provider-auth:" <> Id.uuid4(),
@@ -476,6 +476,16 @@ defmodule Tightbeam.HarnessHealth do
   end
 
   defp open_new_incident(txn, opening_observation_id, input) do
+    case auth_blocker_recipient(txn, input) do
+      :no_recipient ->
+        refuse_incident_promotion(txn, opening_observation_id, input)
+
+      {:ok, recipient} ->
+        do_open_new_incident(txn, opening_observation_id, input, recipient)
+    end
+  end
+
+  defp do_open_new_incident(txn, opening_observation_id, input, recipient) do
     incident_id = "hhi_" <> Id.uuid4()
 
     %{fact_id: fact_id} =
@@ -517,7 +527,7 @@ defmodule Tightbeam.HarnessHealth do
       lifecycle_detail(input, opening_observation_id)
     )
 
-    notice_publication = auth_blocker_in_txn(txn, incident_id, input)
+    notice_publication = auth_blocker_in_txn(txn, incident_id, input, recipient)
 
     {:opened,
      %{
@@ -531,6 +541,30 @@ defmodule Tightbeam.HarnessHealth do
        observationId: opening_observation_id,
        notice_publication: notice_publication
      }}
+  end
+
+  defp refuse_incident_promotion(txn, observation_id, input) do
+    EventLog.lifecycle_in_txn(
+      txn,
+      "harness_health_incident_refused",
+      observation_id,
+      JSON.encode!(%{
+        observationId: observation_id,
+        harness: input.harness,
+        host: input.host,
+        failureClass: input.failure_class,
+        evidenceKind: input.evidence_kind,
+        correlationId: input.correlation_id,
+        cause: input.cause,
+        principal: input.principal,
+        reason: "no-active-main"
+      })
+    )
+
+    {:pending,
+     txn
+     |> pending(input, observation_id)
+     |> Map.put(:refusal, "no-active-main")}
   end
 
   defp resolve_open(txn, input) do
@@ -881,12 +915,15 @@ defmodule Tightbeam.HarnessHealth do
     })
   end
 
-  defp auth_blocker_in_txn(_txn, _incident_id, %{failure_class: "rate-limit-dead"}),
-    do: nil
+  defp auth_blocker_in_txn(
+         _txn,
+         _incident_id,
+         %{failure_class: "rate-limit-dead"},
+         nil
+       ),
+       do: nil
 
-  defp auth_blocker_in_txn(txn, incident_id, input) do
-    audience = {:session, auth_blocker_recipient!(txn, incident_id)}
-
+  defp auth_blocker_in_txn(txn, incident_id, input, recipient) when is_binary(recipient) do
     [[assignment_count]] =
       Txn.q(
         txn,
@@ -906,32 +943,33 @@ defmodule Tightbeam.HarnessHealth do
       "harness_health_auth_blocker",
       incident_id,
       lifecycle_detail(input, input.correlation_id),
-      audience: audience,
+      audience: {:session, recipient},
       message: message,
       attention: :high
     )
   end
 
-  defp auth_blocker_recipient!(txn, incident_id) do
+  defp auth_blocker_recipient(_txn, %{failure_class: "rate-limit-dead"}), do: {:ok, nil}
+
+  defp auth_blocker_recipient(txn, input) do
     affected_main =
       Txn.q(
         txn,
         """
         SELECT DISTINCT main.sessionKey
-        FROM harness_health_members m
-        JOIN sessions affected ON affected.sessionKey=m.sessionKey
+        FROM sessions affected
         JOIN sessions main ON main.ownerUserId=affected.ownerUserId
-        WHERE m.incidentId=?1
+        WHERE affected.harness=?1 AND affected.host=?2 AND affected.state='active'
           AND main.kind='main' AND main.state='active'
         ORDER BY affected.ownerUserId, main.sessionKey
         LIMIT 1
         """,
-        [incident_id]
+        [input.harness, input.host]
       )
 
     case affected_main do
       [[session_key]] ->
-        session_key
+        {:ok, session_key}
 
       [] ->
         case Txn.q(
@@ -944,11 +982,10 @@ defmodule Tightbeam.HarnessHealth do
                """
              ) do
           [[session_key]] ->
-            session_key
+            {:ok, session_key}
 
           [] ->
-            raise "cannot open auth-dead incident #{incident_id}: " <>
-                    "no active personal session exists for an affected or ambient owner"
+            :no_recipient
         end
     end
   end
