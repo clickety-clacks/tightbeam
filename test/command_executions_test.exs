@@ -6,6 +6,9 @@ defmodule Tightbeam.CommandExecutionsTest do
   @helper Path.expand("../cli/target/release/tightbeam", __DIR__)
 
   setup do
+    previous_host = System.get_env("TIGHTBEAM_LOCAL_HOST_NAME")
+    System.put_env("TIGHTBEAM_LOCAL_HOST_NAME", "testhost")
+
     root =
       Path.join(
         System.tmp_dir!(),
@@ -18,6 +21,15 @@ defmodule Tightbeam.CommandExecutionsTest do
     :ok = CommandExecutions.ensure_schema(db)
     assert File.exists?(@helper)
     on_exit(fn -> File.rm_rf!(root) end)
+
+    on_exit(fn ->
+      if previous_host do
+        System.put_env("TIGHTBEAM_LOCAL_HOST_NAME", previous_host)
+      else
+        System.delete_env("TIGHTBEAM_LOCAL_HOST_NAME")
+      end
+    end)
+
     %{db: db, root: root}
   end
 
@@ -48,8 +60,15 @@ defmodule Tightbeam.CommandExecutionsTest do
     assert command_json == first.command_json
     assert command_sha256 == first.command_sha256
 
+    assert CommandExecutions.helper_command(first, @helper) ==
+             [@helper, "command-exec", first.prepared_path]
+
     assert_raise ArgumentError, ~r/already bound to another execution intent/, fn ->
       CommandExecutions.prepare(ctx.db, %{attrs | command: ["/bin/echo", "different"]})
+    end
+
+    assert_raise ArgumentError, ~r/receipt_root must be a non-empty string/, fn ->
+      CommandExecutions.prepare(ctx.db, %{attrs | receipt_root: ""})
     end
   end
 
@@ -110,13 +129,68 @@ defmodule Tightbeam.CommandExecutionsTest do
     assert signaled.signal == 15
   end
 
+  test "the exec child restores SIGPIPE before recording command evidence", ctx do
+    signaled = execute(ctx, "sigpipe", ["/bin/sh", "-c", "kill -13 $$; exit 0"])
+
+    assert signaled.state == "finished"
+    assert signaled.exit_code == nil
+    assert signaled.signal == 13
+  end
+
+  test "the detached command reads EOF rather than the invoker stdin", ctx do
+    row =
+      CommandExecutions.prepare(
+        ctx.db,
+        attrs(ctx, "detached-stdin", [
+          "/bin/sh",
+          "-c",
+          "if IFS= read -r line; then printf 'input:%s' \"$line\"; else printf eof; fi"
+        ])
+      )
+
+    {_output, 0} =
+      System.cmd(
+        "/bin/sh",
+        ["-c", ~S(printf secret | "$0" command-exec "$1"), @helper, row.prepared_path]
+      )
+
+    assert eventually(fn -> File.exists?(row.terminal_path) end)
+    finished = CommandExecutions.refresh(ctx.db, row.execution_id)
+    assert finished.state == "finished"
+    assert File.read!(finished.stdout_path) == "eof"
+  end
+
   test "terminal output evidence refuses captured-byte drift", ctx do
     row = execute(ctx, "output-drift", ["/bin/sh", "-c", "printf sealed"])
     File.write!(row.stdout_path, "changed")
 
-    assert_raise RuntimeError, ~r/output evidence does not match/, fn ->
+    assert_raise CommandExecutions.ReceiptError, ~r/output evidence does not match/, fn ->
       CommandExecutions.refresh(ctx.db, row.execution_id)
     end
+  end
+
+  test "boot reconciliation records malformed receipt evidence and continues", ctx do
+    malformed = CommandExecutions.prepare(ctx.db, attrs(ctx, "malformed", ["/bin/true"]))
+    File.write!(malformed.started_path, "")
+
+    healthy = CommandExecutions.prepare(ctx.db, attrs(ctx, "healthy", ["/bin/true"]))
+
+    assert :ok = CommandExecutions.reconcile(ctx.db)
+
+    assert %{state: "started_unknown", last_error: error} =
+             CommandExecutions.get!(ctx.db, malformed.execution_id)
+
+    assert error =~ "reconciliation refused"
+    assert error =~ "invalid JSON"
+    assert CommandExecutions.get!(ctx.db, healthy.execution_id).state == "prepared"
+  end
+
+  test "boot reconciliation excludes terminal history from receipt reads", ctx do
+    finished = execute(ctx, "terminal-history", ["/bin/true"])
+    File.write!(finished.terminal_path, "")
+
+    assert :ok = CommandExecutions.reconcile(ctx.db)
+    assert CommandExecutions.get!(ctx.db, finished.execution_id).state == "finished"
   end
 
   test "exec failure is durably not_started and duplicate consumption is refused", ctx do
@@ -135,6 +209,48 @@ defmodule Tightbeam.CommandExecutionsTest do
       System.cmd(@helper, ["command-exec", row.prepared_path], stderr_to_stdout: true)
 
     assert duplicate =~ "execution already consumed"
+  end
+
+  test "a receipt pinned to another host is refused before consumption", ctx do
+    row =
+      CommandExecutions.prepare(
+        ctx.db,
+        %{attrs(ctx, "wrong-host", ["/bin/true"]) | host: "another-host"}
+      )
+
+    {output, 1} =
+      System.cmd(@helper, ["command-exec", row.prepared_path], stderr_to_stdout: true)
+
+    assert output =~ "prepared execution is pinned to host another-host, not testhost"
+    refute File.exists?(row.claim_path)
+    assert CommandExecutions.get!(ctx.db, row.execution_id).state == "prepared"
+  end
+
+  test "a terminal bound turn settles prepared intent without inferring a start", ctx do
+    :ok =
+      DB.execute(
+        ctx.db,
+        "CREATE TABLE turns (seq INTEGER, sessionKey TEXT, status TEXT)"
+      )
+
+    {:ok, []} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO turns (seq, sessionKey, status) VALUES (?1, ?2, ?3)",
+        [42, "agent:test", "delivered"]
+      )
+
+    row =
+      CommandExecutions.prepare(
+        ctx.db,
+        Map.put(attrs(ctx, "terminal-turn", ["/bin/true"]), :turn_seq, 42)
+      )
+
+    assert :ok = CommandExecutions.reconcile(ctx.db)
+    settled = CommandExecutions.get!(ctx.db, row.execution_id)
+    assert settled.state == "not_started"
+    assert settled.last_error == "bound turn became terminal without a launcher identity"
+    refute File.exists?(row.started_path)
   end
 
   test "detached supervisor finishes after the invoking adapter is killed post-start", ctx do

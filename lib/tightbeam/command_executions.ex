@@ -6,9 +6,18 @@ defmodule Tightbeam.CommandExecutions do
   supervisor records what the kernel observed. A command is `started` only
   when the close-on-exec pipe closes without an error payload; turn or ACP
   progress is never used as a proxy for that event.
+
+  Terminal history is retained indefinitely. Boot reconciliation selects only
+  unresolved rows. A `started_unknown` row is re-examined for later durable
+  receipts, but remains unknown indefinitely when no stronger evidence appears.
   """
 
   alias Tightbeam.{DB, Id}
+
+  defmodule ReceiptError do
+    @moduledoc false
+    defexception [:message]
+  end
 
   @ddl """
   CREATE TABLE IF NOT EXISTS command_executions (
@@ -216,14 +225,33 @@ defmodule Tightbeam.CommandExecutions do
   def reconcile(db \\ DB) do
     :ok = ensure_schema(db)
 
-    list(db)
-    |> Enum.reject(&(&1.state in ~w(not_started finished)))
+    unresolved(db)
     |> Enum.each(fn row ->
-      maybe_settle_terminal_turn(row, db)
-      reconcile_row(db, get!(db, row.execution_id))
+      try do
+        maybe_settle_terminal_turn(row, db)
+        reconcile_row(db, get!(db, row.execution_id))
+      rescue
+        error in [ReceiptError, File.Error] ->
+          persist_reconciliation_error(db, row, error)
+      end
     end)
 
     :ok
+  end
+
+  defp unresolved(db) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT #{@columns}
+          FROM command_executions
+         WHERE state IN ('prepared','started','started_unknown')
+         ORDER BY preparedAt DESC
+        """
+      )
+
+    Enum.map(rows, &decode_row/1)
   end
 
   defp maybe_settle_terminal_turn(%{state: "prepared", turn_seq: seq} = row, db)
@@ -273,13 +301,16 @@ defmodule Tightbeam.CommandExecutions do
 
     cond do
       terminal && not_started ->
-        raise "command execution #{row.execution_id} has conflicting terminal and not_started receipts"
+        raise ReceiptError,
+              "command execution #{row.execution_id} has conflicting terminal and not_started receipts"
 
       terminal && is_nil(started) ->
-        raise "command execution #{row.execution_id} has a terminal receipt without a started receipt"
+        raise ReceiptError,
+              "command execution #{row.execution_id} has a terminal receipt without a started receipt"
 
       not_started && started ->
-        raise "command execution #{row.execution_id} has conflicting started and not_started receipts"
+        raise ReceiptError,
+              "command execution #{row.execution_id} has conflicting started and not_started receipts"
 
       terminal ->
         validate_terminal_evidence!(row, terminal)
@@ -289,7 +320,8 @@ defmodule Tightbeam.CommandExecutions do
         {:not_started, not_started}
 
       started && is_nil(launcher) ->
-        raise "command execution #{row.execution_id} has a started receipt without launcher identity"
+        raise ReceiptError,
+              "command execution #{row.execution_id} has a started receipt without launcher identity"
 
       started ->
         {:started, started}
@@ -310,7 +342,7 @@ defmodule Tightbeam.CommandExecutions do
         db,
         """
         UPDATE command_executions
-           SET state = ?2, osPid = ?3, processGroupId = ?4
+           SET state = ?2, osPid = ?3, processGroupId = ?4, lastError = NULL
          WHERE executionId = ?1
         """,
         [row.execution_id, Atom.to_string(state), launcher["osPid"], launcher["processGroupId"]]
@@ -394,10 +426,25 @@ defmodule Tightbeam.CommandExecutions do
         """
         UPDATE command_executions
            SET state = 'started_unknown', osPid = ?2, processGroupId = ?3,
-               startedAt = ?4
+               startedAt = ?4, lastError = NULL
          WHERE executionId = ?1
         """,
         [row.execution_id, receipt["osPid"], launcher["processGroupId"], receipt["startedAt"]]
+      )
+
+    :ok
+  end
+
+  defp persist_reconciliation_error(db, row, error) do
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        UPDATE command_executions
+           SET state = 'started_unknown', lastError = ?2
+         WHERE executionId = ?1
+        """,
+        [row.execution_id, "reconciliation refused: #{Exception.message(error)}"]
       )
 
     :ok
@@ -413,7 +460,8 @@ defmodule Tightbeam.CommandExecutions do
 
     execution_id = Map.get(attrs, :execution_id, Id.ulid())
     command_json = JSON.encode!(command)
-    root = Path.join([Map.fetch!(attrs, :receipt_root), "command-executions", execution_id])
+    receipt_root = required_string!(attrs, :receipt_root)
+    root = Path.join([receipt_root, "command-executions", execution_id])
 
     %{
       execution_id: execution_id,
@@ -531,12 +579,21 @@ defmodule Tightbeam.CommandExecutions do
   defp read_receipt(row, path) do
     case File.read(path) do
       {:ok, bytes} ->
-        receipt = JSON.decode!(bytes)
+        case JSON.decode(bytes) do
+          {:ok, receipt} when is_map(receipt) ->
+            if receipt["executionId"] == row.execution_id do
+              receipt
+            else
+              raise ReceiptError,
+                    "command execution receipt at #{path} names another execution"
+            end
 
-        if receipt["executionId"] == row.execution_id do
-          receipt
-        else
-          raise "command execution receipt at #{path} names another execution"
+          {:ok, _receipt} ->
+            raise ReceiptError, "command execution receipt at #{path} is not a JSON object"
+
+          {:error, reason} ->
+            raise ReceiptError,
+                  "command execution receipt at #{path} is invalid JSON: #{inspect(reason)}"
         end
 
       {:error, :enoent} ->
@@ -555,7 +612,8 @@ defmodule Tightbeam.CommandExecutions do
              receipt["stdoutSha256"] == sha256(stdout) and
              receipt["stderrBytes"] == byte_size(stderr) and
              receipt["stderrSha256"] == sha256(stderr) do
-      raise "command execution #{row.execution_id} terminal output evidence does not match the captured bytes"
+      raise ReceiptError,
+            "command execution #{row.execution_id} terminal output evidence does not match the captured bytes"
     end
   end
 

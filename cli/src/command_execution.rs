@@ -153,7 +153,7 @@ fn supervise(manifest: &Manifest, mut acknowledgement: OwnedFd) -> Result<(), St
 
             if !exec_error.is_empty() {
                 write_not_started(manifest, exec_error.trim())?;
-                acknowledge(&mut acknowledgement, "not_started")?;
+                acknowledge_best_effort(&mut acknowledgement, "not_started");
                 wait_child(child)?;
                 return Ok(());
             }
@@ -166,7 +166,7 @@ fn supervise(manifest: &Manifest, mut acknowledgement: OwnedFd) -> Result<(), St
                     "startedAt": now_ms()
                 }),
             )?;
-            acknowledge(&mut acknowledgement, "started")?;
+            acknowledge_best_effort(&mut acknowledgement, "started");
             drop(acknowledgement);
 
             let status = wait_child(child)?;
@@ -197,21 +197,31 @@ fn prelaunch_refusal(
     error: &str,
 ) -> Result<(), String> {
     write_not_started(manifest, error)?;
-    acknowledge(acknowledgement, "not_started")
+    acknowledge_best_effort(acknowledgement, "not_started");
+    Ok(())
 }
 
 fn exec_child(manifest: &Manifest, stdout: File, stderr: File, exec_write: OwnedFd) -> ! {
-    drop_fd_cloexec(exec_write.as_raw_fd());
-
     let failure = (|| -> Result<(), String> {
         std::env::set_current_dir(&manifest.cwd)
             .map_err(|error| format!("cwd could not be entered: {error}"))?;
 
-        if unsafe { libc::dup2(stdout.as_raw_fd(), libc::STDOUT_FILENO) } == -1
+        let stdin = File::open("/dev/null")
+            .map_err(|error| format!("detached stdin could not be opened: {error}"))?;
+
+        if unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) } == libc::SIG_ERR {
+            return Err(format!(
+                "SIGPIPE disposition could not be restored: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        if unsafe { libc::dup2(stdin.as_raw_fd(), libc::STDIN_FILENO) } == -1
+            || unsafe { libc::dup2(stdout.as_raw_fd(), libc::STDOUT_FILENO) } == -1
             || unsafe { libc::dup2(stderr.as_raw_fd(), libc::STDERR_FILENO) } == -1
         {
             return Err(format!(
-                "output could not be attached: {}",
+                "detached command streams could not be attached: {}",
                 std::io::Error::last_os_error()
             ));
         }
@@ -272,6 +282,14 @@ fn read_manifest(path: &Path) -> Result<Manifest, String> {
         return Err("prepared command differs from its exact command bytes".into());
     }
 
+    let pinned_host = field("host")?;
+    let actual_host = current_host()?;
+    if pinned_host != actual_host {
+        return Err(format!(
+            "prepared execution is pinned to host {pinned_host}, not {actual_host}"
+        ));
+    }
+
     Ok(Manifest {
         execution_id: field("executionId")?,
         command,
@@ -312,10 +330,6 @@ fn set_fd_cloexec(fd: libc::c_int) -> Result<(), String> {
     } else {
         Ok(())
     }
-}
-
-fn drop_fd_cloexec(fd: libc::c_int) {
-    let _ = unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
 }
 
 fn output_file(path: &Path) -> Result<File, String> {
@@ -379,6 +393,34 @@ fn acknowledge(fd: &mut OwnedFd, value: &str) -> Result<(), String> {
     File::from(fd.try_clone().map_err(|error| error.to_string())?)
         .write_all(format!("{value}\n").as_bytes())
         .map_err(|error| format!("command verdict could not be acknowledged: {error}"))
+}
+
+fn acknowledge_best_effort(fd: &mut OwnedFd, value: &str) {
+    if let Err(error) = acknowledge(fd, value) {
+        let _ = writeln!(std::io::stderr(), "{error}");
+    }
+}
+
+fn current_host() -> Result<String, String> {
+    if let Ok(host) = std::env::var("TIGHTBEAM_LOCAL_HOST_NAME")
+        && !host.is_empty()
+    {
+        return Ok(host);
+    }
+
+    let mut bytes = [0_u8; 256];
+    if unsafe { libc::gethostname(bytes.as_mut_ptr().cast(), bytes.len()) } == -1 {
+        return Err(format!(
+            "local hostname could not be read: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let length = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    String::from_utf8(bytes[..length].to_vec())
+        .map_err(|_| "local hostname is not valid UTF-8".to_string())
 }
 
 fn wait_child(child: libc::pid_t) -> Result<libc::c_int, String> {
@@ -458,7 +500,7 @@ fn now_ms() -> u128 {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_status, hex_sha256};
+    use super::{acknowledge_best_effort, decode_status, hex_sha256, pipe};
 
     #[test]
     fn hashes_exact_bytes() {
@@ -472,5 +514,12 @@ mod tests {
     fn decodes_exit_and_signal_statuses() {
         assert_eq!(decode_status(7 << 8), (Some(7), None));
         assert_eq!(decode_status(libc::SIGTERM), (None, Some(libc::SIGTERM)));
+    }
+
+    #[test]
+    fn a_missing_acknowledgement_reader_cannot_abort_supervision() {
+        let (reader, mut writer) = pipe(false).unwrap();
+        drop(reader);
+        acknowledge_best_effort(&mut writer, "started");
     }
 }
