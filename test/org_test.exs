@@ -363,6 +363,85 @@ defmodule Tightbeam.OrgTest do
     assert rows == [["Renamed", "claude-fable-5", "high", "1m", "anthropic"]]
   end
 
+  test "normalize_spawn_display_name prefixes product-owner spawn inputs and preserves an already-normalized one" do
+    assert Org.normalize_spawn_display_name("product-owner", "Outpost") == "PO — Outpost"
+
+    assert Org.normalize_spawn_display_name("product-owner", "Product Owner — Outpost") ==
+             "PO — Outpost"
+
+    assert Org.normalize_spawn_display_name("product-owner", "PO — Outpost") == "PO — Outpost"
+  end
+
+  test "normalize_spawn_display_name leaves another archetype's display name untouched" do
+    assert Org.normalize_spawn_display_name("coder", "Product Owner — Outpost") ==
+             "Product Owner — Outpost"
+
+    assert Org.normalize_spawn_display_name("coder", "Coder — auth fix") == "Coder — auth fix"
+  end
+
+  test "po display migration renames only active product-owner sessions with the exact old prefix, preserves the suffix, and is idempotent",
+       %{db: db} do
+    target =
+      Org.create(
+        db,
+        base(%{
+          session_key: "po-1",
+          archetype: "product-owner",
+          display_name: "Product Owner — Outpost"
+        })
+      )
+
+    already_normalized =
+      Org.create(
+        db,
+        base(%{session_key: "po-2", archetype: "product-owner", display_name: "PO — Weather"})
+      )
+
+    other_archetype =
+      Org.create(
+        db,
+        base(%{
+          session_key: "coder-1",
+          archetype: "coder",
+          display_name: "Product Owner — Impostor"
+        })
+      )
+
+    retired_target =
+      db
+      |> Org.create(
+        base(%{
+          session_key: "po-retired",
+          archetype: "product-owner",
+          display_name: "Product Owner — Retired"
+        })
+      )
+      |> then(&Org.retire(db, &1.session_key, "test:org", 1_000))
+
+    plan = Org.po_display_migration_plan(db)
+    assert plan == [%{session_key: "po-1", from: "Product Owner — Outpost", to: "PO — Outpost"}]
+
+    applied = Org.migrate_po_display_names(db)
+    assert applied == plan
+
+    assert Org.get(db, "po-1").display_name == "PO — Outpost"
+    assert Org.get(db, "po-2").display_name == already_normalized.display_name
+    assert Org.get(db, "coder-1").display_name == other_archetype.display_name
+    assert Org.get(db, "po-retired").display_name == retired_target.display_name
+
+    # Only displayName moved on the migrated row — every other column, including
+    # updatedAt's neighbors, is untouched by the migration.
+    migrated = Org.get(db, "po-1")
+    assert migrated.archetype == target.archetype
+    assert migrated.state == target.state
+    assert migrated.owner_user_id == target.owner_user_id
+
+    # Idempotent: the prefix no longer matches, so a second run selects nothing.
+    assert Org.po_display_migration_plan(db) == []
+    assert Org.migrate_po_display_names(db) == []
+    assert Org.get(db, "po-1").display_name == "PO — Outpost"
+  end
+
   test "pointer chain is append-only and current is latest", %{db: db} do
     Org.create(db, base(%{session_key: "k1"}))
     Org.append_pointer(db, "k1", "uuid-1", "created")

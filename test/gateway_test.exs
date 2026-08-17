@@ -1912,6 +1912,48 @@ defmodule Tightbeam.GatewayTest do
     assert Idempotency.get(ctx.db, "flynn", "spawn", "spawn-taken") == nil
   end
 
+  test "spawn normalizes a product-owner display name and leaves another archetype's alone",
+       ctx do
+    base_dir = role_test_base("spawn-po-display")
+    manifests = Path.join([base_dir, "identity", "archetypes"])
+    File.mkdir_p!(manifests)
+    File.write!(Path.join(manifests, "product-owner.toml"), ~s(name = "product-owner"\n))
+    Archetypes.load!(base_dir)
+
+    start_supervised!(%{
+      id: :spawn_po_display_conn_registry,
+      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+    })
+
+    spawn = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["spawn"]
+
+    po =
+      spawn.(%{
+        origin: "user:flynn",
+        session_key: nil,
+        params: %{
+          display_name: "Outpost",
+          archetype: "product-owner",
+          idempotency_key: "spawn-po-display"
+        }
+      })
+
+    assert Org.get(ctx.db, po.session_key).display_name == "PO — Outpost"
+
+    coder =
+      spawn.(%{
+        origin: "user:flynn",
+        session_key: nil,
+        params: %{
+          display_name: "Product Owner — Outpost",
+          archetype: "default",
+          idempotency_key: "spawn-po-display-other"
+        }
+      })
+
+    assert Org.get(ctx.db, coder.session_key).display_name == "Product Owner — Outpost"
+  end
+
   test "spawn has no session-count gate when the cap is unset", ctx do
     base_dir = role_test_base("spawn-unlimited")
     Archetypes.load!(base_dir)

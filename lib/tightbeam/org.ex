@@ -351,6 +351,99 @@ defmodule Tightbeam.Org do
     update(db, session_key, "displayName = ?2", [display_name])
   end
 
+  @po_archetype_name "product-owner"
+  @po_display_prefix_old "Product Owner — "
+  @po_display_prefix_new "PO — "
+
+  @doc """
+  Normalize a caller-supplied spawn display name for the `product-owner`
+  archetype only: an input already carrying the `PO — ` prefix is preserved,
+  an input carrying the old `Product Owner — ` prefix is converted to it, and
+  any other input is prefixed with it. Every other archetype's display name
+  passes through unchanged — this must never infer product-owner identity
+  from the display name itself, only from the archetype the caller selected.
+  """
+  @spec normalize_spawn_display_name(String.t(), String.t()) :: String.t()
+  def normalize_spawn_display_name(@po_archetype_name, display_name) do
+    cond do
+      String.starts_with?(display_name, @po_display_prefix_new) ->
+        display_name
+
+      String.starts_with?(display_name, @po_display_prefix_old) ->
+        String.replace_prefix(display_name, @po_display_prefix_old, @po_display_prefix_new)
+
+      true ->
+        @po_display_prefix_new <> display_name
+    end
+  end
+
+  def normalize_spawn_display_name(_archetype_name, display_name), do: display_name
+
+  @doc """
+  Active `product-owner` sessions still carrying the old `Product Owner — `
+  display prefix, paired with the label `migrate_po_display_names/1` would
+  give each. Read-only — call this to record the target count and
+  before/after mapping before invoking the mutation.
+  """
+  @spec po_display_migration_plan(db()) :: [
+          %{session_key: String.t(), from: String.t(), to: String.t()}
+        ]
+  def po_display_migration_plan(db \\ Tightbeam.DB) do
+    {:ok, rows} = DB.query(db, po_display_candidates_sql(), [@po_archetype_name])
+    po_display_migration_targets(rows)
+  end
+
+  @doc """
+  Apply `po_display_migration_plan/1`: rename every active `product-owner`
+  session still carrying the old `Product Owner — ` prefix to `PO — `,
+  preserving the suffix exactly, through the same `sessions.displayName`
+  update primitive `rename/3` owns. Selects and writes inside one
+  transaction against the exact old prefix, so this is idempotent — a
+  session already renamed no longer matches and a second run selects
+  nothing. Touches only `displayName`; retired sessions and every other
+  column are untouched. Returns the before/after mapping actually applied.
+  """
+  @spec migrate_po_display_names(db()) :: [
+          %{session_key: String.t(), from: String.t(), to: String.t()}
+        ]
+  def migrate_po_display_names(db \\ Tightbeam.DB) do
+    transaction!(db, fn txn ->
+      targets =
+        txn
+        |> Txn.q(po_display_candidates_sql(), [@po_archetype_name])
+        |> po_display_migration_targets()
+
+      now = now()
+
+      Enum.each(targets, fn %{session_key: session_key, to: to} ->
+        Txn.q(
+          txn,
+          "UPDATE sessions SET displayName = ?2, updatedAt = ?3 WHERE sessionKey = ?1",
+          [session_key, to, now]
+        )
+      end)
+
+      targets
+    end)
+  end
+
+  defp po_display_candidates_sql,
+    do: "SELECT sessionKey, displayName FROM sessions WHERE state = 'active' AND archetype = ?1"
+
+  defp po_display_migration_targets(rows) do
+    rows
+    |> Enum.filter(fn [_session_key, display_name] ->
+      String.starts_with?(display_name, @po_display_prefix_old)
+    end)
+    |> Enum.map(fn [session_key, display_name] ->
+      %{
+        session_key: session_key,
+        from: display_name,
+        to: String.replace_prefix(display_name, @po_display_prefix_old, @po_display_prefix_new)
+      }
+    end)
+  end
+
   @doc """
   Set a session's adoption — the client-side view-membership flag (the `tune`
   adopt write). Agent- and substrate-started sessions exist and are addressable

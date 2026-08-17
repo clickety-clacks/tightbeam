@@ -3948,7 +3948,7 @@ defmodule Tightbeam.Gateway do
     # that will actually run the turn (#88) — not the gateway's.
     with {:ok, {model, routed}} <- prepared do
       input = %{
-        display_name: p.display_name,
+        display_name: Org.normalize_spawn_display_name(archetype.name, p.display_name),
         kind: "custom",
         owner_user_id: caller.owner_user_id,
         origin: call.origin,
