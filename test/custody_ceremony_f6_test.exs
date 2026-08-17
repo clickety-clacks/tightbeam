@@ -362,22 +362,40 @@ defmodule Tightbeam.CustodyCeremonyF6Test do
   end
 
   # The claim, OBSERVED rather than argued: the fixture dumps the environment it
-  # was actually handed, and no name the test runner holds outside the allowlist
-  # may appear in it. Anything the CLI itself adds on the way down is ours and
+  # was actually handed, and nothing the test runner holds outside the allowlist
+  # may have REACHED it. Anything the CLI itself adds on the way down is ours and
   # is not inheritance, so it is not what this checks; the second assertion
   # covers those by shape instead.
+  #
+  # A leak is judged by VALUE, not by name: a variable leaked only if the
+  # RUNNER'S value for it arrived downstream. The fixture is a shell, and a shell
+  # defines a few names of its own no matter what it is handed — `PWD` from
+  # `getcwd`, `SHLVL` and `_` at startup. Those collide with names the runner
+  # also holds while carrying none of the runner's data, so they are named here
+  # rather than left to a value comparison that `SHLVL=1` could pass by
+  # coincidence. None of them can carry a credential.
+  @shell_defined ~w(PWD OLDPWD SHLVL _)
+
   defp assert_environment_closed(ctx, allowed_names) do
     received =
       ctx.env_log
       |> File.read!()
       |> String.split("\n", trim: true)
-      |> Enum.map(&(&1 |> String.split("=", parts: 2) |> hd()))
-      |> MapSet.new()
+      |> Enum.flat_map(fn line ->
+        case String.split(line, "=", parts: 2) do
+          [name, value] -> [{name, value}]
+          _ -> []
+        end
+      end)
+      |> Map.new()
 
     inherited =
       System.get_env()
-      |> Map.keys()
-      |> Enum.filter(&(&1 not in allowed_names and MapSet.member?(received, &1)))
+      |> Enum.filter(fn {name, value} ->
+        name not in allowed_names and name not in @shell_defined and
+          Map.get(received, name) == value
+      end)
+      |> Enum.map(&elem(&1, 0))
       |> Enum.sort()
 
     assert inherited == [],
@@ -386,6 +404,7 @@ defmodule Tightbeam.CustodyCeremonyF6Test do
 
     secretish =
       received
+      |> Map.keys()
       |> Enum.filter(&Regex.match?(~r/KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL/i, &1))
       |> Enum.reject(&String.starts_with?(&1, "TB_F6_"))
       |> Enum.sort()
