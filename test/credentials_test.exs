@@ -1321,6 +1321,56 @@ defmodule Tightbeam.CredentialsTest do
     end
   end
 
+  # Cursor is api-key-only and env-injected: its key never lands in a harness
+  # home, so the credential-park store IS the whole at-rest surface, and the
+  # min-safe-store rec requires it owner-only (0700 dir, 0600 file).
+  describe "cursor provider" do
+    test "banks the api key owner-only, kind recorded, no key in metadata", ctx do
+      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
+
+      {:ok, staging, lease_id} = Credentials.begin_onboard(:cursor, server)
+      # The ceremony stages the bare key under this exact name; a drift here is a
+      # silent onboarding failure, which the Rust-side contract test also guards.
+      File.write!(Path.join(staging, "api-key"), "cur-secret-key\n")
+      assert :ok = Credentials.finish_onboard(:cursor, :api_key, lease_id, server)
+
+      dir = Path.join([ctx.base, "auth", "cursor"])
+      store = Path.join(dir, "api-key")
+
+      assert String.trim(File.read!(store)) == "cur-secret-key"
+      assert File.stat!(store).mode |> Bitwise.band(0o777) == 0o600
+      # The bank DIRECTORY is 0700, not mkdir's 0755 — the finding this closes.
+      assert File.stat!(dir).mode |> Bitwise.band(0o777) == 0o700
+
+      metadata = credential_metadata(ctx.base, "cursor")
+      assert metadata["kind"] == "api_key"
+      assert metadata["onboarded"] == true
+      # An API key is static: no synthetic expiry that would demand re-onboard.
+      assert metadata["expires_at"] == nil
+      # The secret is banked in the store, never copied into the metadata record.
+      refute metadata |> JSON.encode!() |> String.contains?("cur-secret-key")
+
+      # kind_at reads the recorded metadata, so it reports the banked kind now.
+      assert Credentials.kind_at(ctx.base, :cursor) == :api_key
+      # kind/2 ADDITIONALLY cross-checks that a harness declares this provider's
+      # credential ready. The cursor harness module is a separate card, so until
+      # it lands there is nothing to consume the key and kind/2 reports :none.
+      # This is the two-card seam, asserted rather than hidden; it flips to
+      # :api_key the moment the cursor harness ships alongside this.
+      assert Credentials.kind(:cursor, server) == :none
+    end
+
+    test "refuses a blank cursor key and banks nothing", ctx do
+      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
+
+      {:ok, staging, lease_id} = Credentials.begin_onboard(:cursor, server)
+      File.write!(Path.join(staging, "api-key"), "   \n")
+
+      assert {:error, _reason} = Credentials.finish_onboard(:cursor, :api_key, lease_id, server)
+      refute File.exists?(Path.join([ctx.base, "auth", "cursor", "api-key"]))
+    end
+  end
+
   # A HOLLOW CREDENTIAL IS DIRT, AND DIRT IS REPORTED, NOT BANKED.
   #
   # The incident these pin: a re-onboard left `accessToken: ""`, `refreshToken: ""`,

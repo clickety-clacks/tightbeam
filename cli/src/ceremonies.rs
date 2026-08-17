@@ -605,6 +605,7 @@ fn run_api_key_onboarding(
     match provider {
         "openai" => bank_openai_api_key(staging, &key, ceremony),
         "anthropic" => bank_anthropic_api_key(staging, &key),
+        "cursor" => bank_cursor_api_key(staging, &key),
         #[cfg(test)]
         "fixture-provider" => fs::write(std::path::Path::new(staging).join("fixture.json"), &key)
             .map_err(|error| error.to_string()),
@@ -691,6 +692,13 @@ fn validate_api_key_with_timeout(
             .set("anthropic-version", "2023-06-01"),
         "openai" => agent
             .get("https://api.openai.com/v1/models")
+            .set("authorization", &format!("Bearer {key}")),
+        // /v1/me is Cursor's API-key-info endpoint: the lightest authenticated
+        // read that exists, so it proves the key without creating an agent or a
+        // run. A rejected key comes back HTTP 401, handled by the shared
+        // Status(..) arm below exactly as anthropic/openai are.
+        "cursor" => agent
+            .get("https://api.cursor.com/v1/me")
             .set("authorization", &format!("Bearer {key}")),
         #[cfg(test)]
         "fixture-provider" => return Ok(()),
@@ -806,6 +814,25 @@ fn codex_staged_a_credential(status: ExitStatus, staging: &str, what: &str) -> R
 /// kinds; only the recorded kind differs.
 fn bank_anthropic_api_key(staging: &str, key: &str) -> Result<(), String> {
     let path = std::path::Path::new(staging).join(".credentials.json");
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|error| format!("could not stage the API key at {}: {error}", path.display()))?;
+    file.write_all(key.as_bytes())
+        .map_err(|error| format!("could not stage the API key at {}: {error}", path.display()))
+}
+
+/// Cursor, like anthropic, has no CLI login affordance a headless host can drive
+/// -- cursor-agent takes its key ONLY from the CURSOR_API_KEY environment
+/// variable -- so the validated key is staged directly, at 0600, under the
+/// `api-key` name the gateway's cursor install reads (credentials.ex
+/// `staged_path(:cursor, _)`). The bytes are the bare key; the harness injects
+/// them as CURSOR_API_KEY at spawn, so nothing downstream links this into a home.
+fn bank_cursor_api_key(staging: &str, key: &str) -> Result<(), String> {
+    let path = std::path::Path::new(staging).join("api-key");
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -2293,6 +2320,49 @@ mod tests {
 
         let staged = staging.join(filename);
         assert_eq!(fs::read_to_string(&staged).unwrap(), "sk-ant-api03-test");
+        let mode = fs::metadata(&staged).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        let _ = fs::remove_dir_all(&staging);
+    }
+
+    /// The same cross-language contract for cursor: the bare key is staged at
+    /// 0600 under a filename the Elixir gateway's `staged_credential(:cursor, _)`
+    /// reads. Cursor has no CLI login, so this direct stage IS the ceremony's
+    /// whole banking leg — if the filename drifts from the gateway's, the key is
+    /// staged where nothing installs it and onboarding fails silently.
+    #[test]
+    fn a_cursor_api_key_stages_a_filename_the_gateway_accepts() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let staging = std::env::temp_dir().join(format!(
+            "tightbeam-api-key-stage-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = fs::remove_dir_all(&staging);
+        fs::create_dir_all(&staging).unwrap();
+
+        bank_cursor_api_key(staging.to_str().unwrap(), "cur-test-key").unwrap();
+
+        let entries = fs::read_dir(&staging)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            entries.len(),
+            1,
+            "the ceremony must stage exactly one credential"
+        );
+        let filename = &entries[0];
+        let gateway = include_str!("../../lib/tightbeam/credentials.ex");
+        assert!(
+            gateway.contains(&format!("File.read(Path.join(path, \"{filename}\"))")),
+            "Rust staged {filename}, but the Elixir gateway does not read that filename"
+        );
+
+        let staged = staging.join(filename);
+        assert_eq!(fs::read_to_string(&staged).unwrap(), "cur-test-key");
         let mode = fs::metadata(&staged).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
 
