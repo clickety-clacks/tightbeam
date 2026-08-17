@@ -116,6 +116,75 @@ defmodule Tightbeam.SchemaShapeTest do
     assert operator_index =~ ~r/WHERE\s+kind\s*=\s*'operator'\s+AND\s+status\s*=\s*'open'/
   end
 
+  test "review revision bindings have the exact additive constrained shape", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    assert table_columns(db, "assignment_review_revisions") ==
+             ~w(reviewAssignmentId repo commitOid bySession byUser cause ts)
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1);
+      INSERT INTO sessions
+        (sessionKey,displayName,ownerUserId,origin,archetype,harness,provider,
+         model,createdAt,updatedAt)
+      VALUES
+        ('holder','holder','flynn','user:flynn','reviewer','claude','anthropic',
+         'fixture-model',1,1);
+      INSERT INTO assignments (id,subject,holderKey,openedByUser,openedAt)
+      VALUES ('asg_review','review','holder','flynn',1);
+      """)
+
+    oid = String.duplicate("a", 40)
+
+    invalid = [
+      [nil, oid, "holder", nil, "review-commission"],
+      ["testhost:/repo", nil, "holder", nil, "review-commission"],
+      ["testhost:/repo", String.upcase(oid), "holder", nil, "review-commission"],
+      ["testhost:/repo", String.duplicate("g", 40), "holder", nil, "review-commission"],
+      ["testhost:/repo", String.duplicate("a", 39), "holder", nil, "review-commission"],
+      ["testhost:/repo", oid, nil, nil, "review-commission"],
+      ["testhost:/repo", oid, "holder", "flynn", "review-commission"],
+      ["testhost:/repo", oid, "holder", nil, "invented-cause"]
+    ]
+
+    Enum.each(invalid, fn [repo, commit, by_session, by_user, cause] ->
+      assert {:error, _} =
+               DB.query(
+                 db,
+                 """
+                 INSERT INTO assignment_review_revisions
+                   (reviewAssignmentId,repo,commitOid,bySession,byUser,cause,ts)
+                 VALUES ('asg_review',?1,?2,?3,?4,?5,1)
+                 """,
+                 [repo, commit, by_session, by_user, cause]
+               )
+    end)
+
+    assert {:ok, []} =
+             DB.query(
+               db,
+               """
+               INSERT INTO assignment_review_revisions
+                 (reviewAssignmentId,repo,commitOid,bySession,cause,ts)
+               VALUES ('asg_review','testhost:/repo',?1,'holder','review-commission',1)
+               """,
+               [oid]
+             )
+
+    assert {:error, _} =
+             DB.query(
+               db,
+               """
+               INSERT INTO assignment_review_revisions
+                 (reviewAssignmentId,repo,commitOid,byUser,cause,ts)
+               VALUES ('asg_review','testhost:/other',?1,'flynn',
+                       'legacy-review-revision-binding',2)
+               """,
+               [oid]
+             )
+  end
+
   test "the harness health foundation is additive and exact", %{db: db} do
     assert :ok = Schema.ensure_all(db)
 

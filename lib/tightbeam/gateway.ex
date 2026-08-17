@@ -984,6 +984,9 @@ defmodule Tightbeam.Gateway do
         )
       end,
       "assignments" => fn call -> Assignments.__handle__(db, "assignments", call) end,
+      "bind-review-revision" => fn call ->
+        Assignments.__handle__(db, "bind-review-revision", call)
+      end,
       "inspect" => fn call -> inspect_result(config, db, call) end,
       "cancel" => fn call -> cancel_result(db, call) end,
       "critical" => fn call -> critical_result(config, db, call) end,

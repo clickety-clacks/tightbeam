@@ -124,7 +124,7 @@ defmodule Tightbeam.RetireOwnershipTest do
         target_role: nil,
         role_fallback: false,
         supervision_interval_ms: 1_000,
-        params: %{subject: "menu check", brief: "menu check"},
+        params: %{subject: "menu check", brief: "menu check", effect_kind: "coordination"},
         effort_config: %{db: ctx.db, base_dir: System.tmp_dir!()}
       })
 
@@ -171,7 +171,7 @@ defmodule Tightbeam.RetireOwnershipTest do
         target_role: nil,
         role_fallback: false,
         supervision_interval_ms: 1_000,
-        params: %{subject: "foreign"}
+        params: %{subject: "foreign", effect_kind: "coordination"}
       })
 
     {:ok, foreign_menu} =

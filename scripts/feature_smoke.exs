@@ -477,6 +477,7 @@ defmodule FeatureSmoke do
         "sessionKey" => coder_key,
         "subject" => "esc impl #{u}",
         "workItemId" => wi_id,
+        "effectKind" => "code",
         "idempotencyKey" => "ea-#{u}"
       })
 
@@ -569,17 +570,57 @@ defmodule FeatureSmoke do
         "sessionKey" => coder_key,
         "subject" => "impl #{u}",
         "workItemId" => wi_id,
+        "effectKind" => "code",
         "idempotencyKey" => "fa-#{u}"
       })
 
     asg_id = asg["id"] || asg["assignmentId"]
+    revision = smoke_revision!()
 
-    # 1. Coder attests completion with NO review on record → BLOCKED by the rule.
+    receipt =
+      post_as(state, coder_tok, "attest", %{
+        "assignmentId" => asg_id,
+        "kind" => "verdict",
+        "verdictKind" => "tests-passed",
+        "note" =>
+          "#{revision["repo"]} #{revision["commit"]}; scripts/feature_smoke.exs; passed: live smoke prerequisite"
+      })
+
+    assert(
+      state,
+      not (is_map(receipt) and Map.has_key?(receipt, "error")),
+      "flagship: tests-passed receipt failed: #{inspect(receipt)}"
+    )
+
+    # Stage the shape this public migration surface exists to repair: an owner-identified
+    # pre-binding review card. The row predates this feature, so no current creator verb can
+    # honestly produce it. All behavior under test after this setup runs through the live
+    # gateway, including the holder-only bind.
+    legacy_review_id = "asg_smoke_legacy_#{u}"
+    stage_legacy_review!(state, legacy_review_id, asg_id, reviewer_key)
+
+    bound =
+      post_as(state, reviewer_tok, "bind-review-revision", %{
+        "assignmentId" => legacy_review_id,
+        "commitRefs" => [revision]
+      })
+
+    assert(
+      state,
+      get_in(bound, ["result", "binding", "reviewAssignmentId"]) == legacy_review_id,
+      "flagship: legacy bind failed: #{inspect(bound)}"
+    )
+
+    # 1. Coder attests completion with no clean review on record → BLOCKED by the rule.
     # (The wire exposes only code+message; a remedy and a plain deny both carry
     # code=rule_denied — the remedy's `reason=remedy_fired` is stripped. Proof that
     # it was a REMEDY, not a bare deny, is step 2: the reviewer gets assigned.)
     blocked =
-      post_as(state, coder_tok, "attest", %{"assignmentId" => asg_id, "kind" => "completion"})
+      post_as(state, coder_tok, "attest", %{
+        "assignmentId" => asg_id,
+        "kind" => "completion",
+        "commitRefs" => [revision]
+      })
 
     assert(
       state,
@@ -588,26 +629,38 @@ defmodule FeatureSmoke do
       "flagship: completion without review should be blocked by the rule, got #{inspect(blocked)}"
     )
 
-    # 2. The remedy assigned the reviewer a review of the coder's assignment.
-    reviews = ok!(state, "assignments", %{"sessionKey" => reviewer_key})
-
-    review_asg =
-      (reviews["assignments"] || reviews)
-      |> List.wrap()
-      |> Enum.find(fn a -> (a["reviewsAssignmentId"] || a["reviews"]) == asg_id end)
+    # 2. The remedy reused the exact open legacy card. A retry still creates no duplicate.
+    retry =
+      post_as(state, coder_tok, "attest", %{
+        "assignmentId" => asg_id,
+        "kind" => "completion",
+        "commitRefs" => [revision]
+      })
 
     assert(
       state,
-      is_map(review_asg),
-      "flagship: remedy did not assign the reviewer a review of #{asg_id}; got #{inspect(reviews)}"
+      get_in(retry, ["error", "rule"]) == "completion-requires-review" or
+        (get_in(retry, ["error", "message"]) || "") =~ "completion-requires-review",
+      "flagship: retry before verdict should remain blocked, got #{inspect(retry)}"
     )
 
-    review_id = review_asg["id"] || review_asg["assignmentId"]
+    reviews = ok!(state, "assignments", %{"sessionKey" => reviewer_key})
+
+    review_asgs =
+      (reviews["assignments"] || reviews)
+      |> List.wrap()
+      |> Enum.filter(fn a -> (a["reviewsAssignmentId"] || a["reviews"]) == asg_id end)
+
+    assert(
+      state,
+      Enum.map(review_asgs, &(&1["id"] || &1["assignmentId"])) == [legacy_review_id],
+      "flagship: exact-revision retries must reuse one legacy review; got #{inspect(reviews)}"
+    )
 
     # 3. Reviewer files the reviewed-clean verdict on the review assignment.
     v =
       post_as(state, reviewer_tok, "attest", %{
-        "assignmentId" => review_id,
+        "assignmentId" => legacy_review_id,
         "kind" => "verdict",
         "verdictKind" => "reviewed-clean"
       })
@@ -620,7 +673,11 @@ defmodule FeatureSmoke do
 
     # 4. Coder re-attests completion → the verdict is present → the gate passes.
     done =
-      post_as(state, coder_tok, "attest", %{"assignmentId" => asg_id, "kind" => "completion"})
+      post_as(state, coder_tok, "attest", %{
+        "assignmentId" => asg_id,
+        "kind" => "completion",
+        "commitRefs" => [revision]
+      })
 
     assert(
       state,
@@ -633,7 +690,7 @@ defmodule FeatureSmoke do
 
     pass(
       state,
-      "flagship reviewer-loop enforced end-to-end on same harness with different sessions: blocked → reviewer assigned → verdict → completes"
+      "flagship reviewer-loop: legacy bind → exact deny/retry → one reused review → verdict → exact completion"
     )
   end
 
@@ -1123,6 +1180,7 @@ defmodule FeatureSmoke do
         "subject" => "run #{check.name} and record its output — #{subject}",
         "workItemId" => wi_id,
         "files" => [check.name],
+        "effectKind" => "code",
         "idempotencyKey" => "#{tag}as-#{u}"
       })
 
@@ -1667,6 +1725,39 @@ defmodule FeatureSmoke do
     if token == "", do: fail(state, "no cliToken for session #{session_key}"), else: token
   end
 
+  defp smoke_revision! do
+    {root, 0} = System.cmd("git", ["rev-parse", "--show-toplevel"], stderr_to_stdout: true)
+    root = String.trim(root)
+    {commit, 0} = System.cmd("git", ["rev-parse", "--verify", "HEAD^{commit}"], cd: root)
+
+    %{
+      "repo" => "#{Tightbeam.Placement.local_host_name()}:#{root}",
+      "commit" => String.trim(commit)
+    }
+  end
+
+  defp stage_legacy_review!(state, review_id, producer_id, reviewer_key) do
+    db = Path.join(state.base_dir, "state.db")
+    opened_at = System.system_time(:millisecond)
+
+    sql = """
+    BEGIN IMMEDIATE;
+    INSERT INTO assignments
+      (id,subject,holderKey,openedByUser,openedAt,workItemId,reviewsAssignmentId)
+    SELECT #{sql_quote(review_id)},'legacy review',#{sql_quote(reviewer_key)},
+           #{sql_quote(@owner)},#{opened_at},workItemId,id
+    FROM assignments WHERE id = #{sql_quote(producer_id)};
+    INSERT INTO assignment_effects (assignmentId,effectKind)
+    VALUES (#{sql_quote(review_id)},'review');
+    COMMIT;
+    """
+
+    case System.cmd("sqlite3", [db, sql], stderr_to_stdout: true) do
+      {_, 0} -> :ok
+      {out, rc} -> fail(state, "could not stage legacy review rc=#{rc}: #{out}")
+    end
+  end
+
   defp sql_quote(s), do: "'" <> String.replace(s, "'", "''") <> "'"
 
   defp post_as(state, token, verb, params) do
@@ -1818,6 +1909,7 @@ defmodule FeatureSmoke do
         "sessionKey" => holder_key,
         "subject" => "smoke assignment #{unique()}",
         "workItemId" => wi_id,
+        "effectKind" => "evidence",
         "idempotencyKey" => "a-#{unique()}"
       })
 
@@ -1873,6 +1965,7 @@ defmodule FeatureSmoke do
         "subject" => "smoke fanout #{unique()}",
         "brief" => "ship the smoke feature",
         "workItemId" => wi_id,
+        "effectKind" => "coordination",
         "idempotencyKey" => "d-#{unique()}"
       })
 

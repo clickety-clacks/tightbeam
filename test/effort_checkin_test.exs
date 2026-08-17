@@ -808,7 +808,12 @@ defmodule Tightbeam.EffortCheckinTest do
     item = work_item!(ctx.db, "production path")
     handlers = Gateway.handlers(ctx.config)
 
-    params = %{subject: "turns only", brief: "turns only", work_item_id: item.id}
+    params = %{
+      subject: "turns only",
+      brief: "turns only",
+      work_item_id: item.id,
+      effect_kind: "coordination"
+    }
 
     call = %{
       verb: "dispatch",
@@ -1331,6 +1336,8 @@ defmodule Tightbeam.EffortCheckinTest do
   end
 
   defp assignment(ctx, verb, principal, holder, params) do
+    params = Map.put_new(params, :effect_kind, "coordination")
+
     call = %{
       verb: verb,
       origin: origin(principal),

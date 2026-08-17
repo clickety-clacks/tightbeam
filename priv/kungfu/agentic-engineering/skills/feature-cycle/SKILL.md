@@ -11,7 +11,7 @@ canonical path, bind it to the work-item by content, not by memory:
 `--spec-ref <name> --spec-sha256 <hex>` records the exact spec version the work
 serves, so every coder and reviewer reads the same one. Every assignment below threads
 to the work-item (`--work-item <id>`). `tightbeam dispatch --to <holder> --subject "…"
---brief "…" --work-item <id>` opens a plain card and wakes its holder in one atomic step;
+--brief "…" --work-item <id> --effect-kind <kind>` opens a plain card and wakes its holder in one atomic step;
 a card that includes an advisory file suggestion (`--files`) or links a review
 (`--reviews`) opens with `assign` and is then woken, because those flags live on
 `assign` — so the steps below that use them keep that two-step form.
@@ -20,7 +20,7 @@ Keep only a handful of goals truly in-flight at once (see the kernel); this loop
 per-feature, but your attention across features is the scarce resource.
 
 1. **Spec.** Spawn a spec-writer and assign it the spec:
-   `tightbeam assign --subject "spec: <feature>" --role spec-writer --work-item <id>`.
+   `tightbeam assign --subject "spec: <feature>" --role spec-writer --work-item <id> --effect-kind policy`.
    The spec states invariants first, a testable acceptance contract, open questions,
    and non-goals. An open question that decides the nature of the product goes to the
    user (`tightbeam wake --user <id> --prompt "<the question>"`) before spec review;
@@ -65,7 +65,7 @@ per-feature, but your attention across features is the scarce resource.
    the selected reviewer as a fresh session with the capability the effect requires.
    Same model, provider, or harness remains eligible. Link the single review card to
    the reviewed work:
-   `tightbeam assign --subject "review of <goal>" --role reviewer:<slug> --work-item <id> --reviews <coderAssignmentId>`.
+   `tightbeam assign --subject "review of <goal>" --role reviewer:<slug> --work-item <id> --reviews <coderAssignmentId> --review-commit-refs '[{"repo":"<host>:<absolute-path>","commit":"<result-revision>"}]'`.
    The `--reviews` link and the verdict by that card's different-session holder are
    what let the substrate compute independence. Harness and provider differences stay
    observable selection evidence; they do not gate completion. A verdict filed

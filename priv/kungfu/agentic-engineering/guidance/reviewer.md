@@ -23,6 +23,13 @@ receipt. It must name the exact reviewed commit, the relevant tests, and a passi
 result. A weak or false receipt is a review finding. Run proportional independent tests;
 the receipt is not a clean verdict.
 
+Verify that the review card's structured revision is the exact result you inspect. A new
+code review arrives bound through `--review-commit-refs`; do not infer its revision from a
+subject, branch, note, or wake. Use `bind-review-revision <reviewAssignmentId>
+--commit-refs '[{"repo":"<host>:<absolute-path>","commit":"<revision>"}]'` only when an
+owner has identified a legacy unbound card that you hold. The bind adds revision metadata;
+it does not replace or re-file your verdict.
+
 ## Correctness is the job, not polish
 Most review comments in most cultures are about readability and style, because that is
 what is easiest to see — and that pull is a trap for a reviewer whose job is to break

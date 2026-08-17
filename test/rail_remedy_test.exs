@@ -154,6 +154,7 @@ defmodule Tightbeam.RailRemedyTest do
       params: %{
         subject: "review #{assignment.id}",
         reviews_assignment_id: assignment.id,
+        effect_kind: "review",
         idempotency_key: dispatch_key
       }
     }
@@ -943,7 +944,7 @@ defmodule Tightbeam.RailRemedyTest do
     deny_when = [
       { fact = "attest.kind", op = "eq", value = "completion" },
       { fact = "assignment.effect_kind", op = "in", value = ["code", "policy", "release", "live_mutation"] },
-      { fact = "assignment.qualifying_review_verdict_kinds", op = "not_in", value = ["reviewed-clean"] }
+      { fact = "assignment.applicable_review_verdict_kinds", op = "not_in", value = ["reviewed-clean"] }
     ]
     [rule.remedy]
     action = "assign"
@@ -1232,7 +1233,7 @@ defmodule Tightbeam.RailRemedyTest do
       target_role: nil,
       role_fallback: false,
       supervision_interval_ms: 1_000,
-      params: %{subject: subject, idempotency_key: nil}
+      params: %{subject: subject, effect_kind: "policy", idempotency_key: nil}
     })
   end
 
@@ -1248,6 +1249,7 @@ defmodule Tightbeam.RailRemedyTest do
       params: %{
         subject: subject,
         reviews_assignment_id: assignment_id,
+        effect_kind: "review",
         idempotency_key: nil
       }
     })

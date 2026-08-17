@@ -78,7 +78,7 @@ defmodule Tightbeam.Wire.SeamTest do
         verb: "assign",
         asUser: "flynn",
         sessionKey: producer.session_key,
-        params: %{subject: "fix the seam"}
+        params: %{subject: "fix the seam", effectKind: "coordination"}
       })
     )
 
@@ -89,7 +89,7 @@ defmodule Tightbeam.Wire.SeamTest do
         verb: "assign",
         asUser: "flynn",
         sessionKey: reviewer.session_key,
-        params: %{subject: "review the fix", reviews: produced}
+        params: %{subject: "review the fix", reviews: produced, effectKind: "review"}
       })
     )
 
@@ -114,7 +114,7 @@ defmodule Tightbeam.Wire.SeamTest do
         verb: "assign",
         asUser: "flynn",
         sessionKey: reviewer.session_key,
-        params: %{subject: "review a ghost", reviews: "asg_never_existed"}
+        params: %{subject: "review a ghost", reviews: "asg_never_existed", effectKind: "review"}
       })
 
     assert JSON.decode!(response.resp_body)["error"]["code"] == "unknown_review_target"

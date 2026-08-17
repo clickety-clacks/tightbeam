@@ -834,7 +834,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
 
   defp assign_call(principal, holder, subject, work_item_id, opts \\ []) do
     params =
-      %{subject: subject, work_item_id: work_item_id}
+      %{subject: subject, work_item_id: work_item_id, effect_kind: "coordination"}
       |> maybe_put(:idempotency_key, opts[:key])
 
     %{
@@ -851,7 +851,12 @@ defmodule Tightbeam.WorkItemBracketsTest do
 
   defp disp_dispatch(ctx, principal, holder, subject, work_item_id, opts \\ []) do
     params =
-      %{subject: subject, brief: "Implement #{subject}.", work_item_id: work_item_id}
+      %{
+        subject: subject,
+        brief: "Implement #{subject}.",
+        work_item_id: work_item_id,
+        effect_kind: "coordination"
+      }
       |> maybe_put(:idempotency_key, opts[:key])
 
     call = %{

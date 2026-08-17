@@ -2,6 +2,7 @@ defmodule Tightbeam.RailRemedy do
   @moduledoc "Active rail remedy execution and durable remedy-episode lifecycle."
 
   alias Tightbeam.{
+    Assignments,
     DB,
     Dispatch,
     EventLog,
@@ -47,11 +48,24 @@ defmodule Tightbeam.RailRemedy do
   def fire(db, handlers, rule, subject, call) do
     result =
       with {:ok, context} <- binding_context(db, subject, call),
-           {:ok, resolved} <- resolve_remedy(rule.remedy, context),
-           {:ok, resolved} <- bind_target(db, rule.remedy.action, resolved) do
-        route_episode(db, handlers, rule, subject, call, context, resolved)
+           {:ok, resolved} <- resolve_remedy(rule.remedy, context) do
+        case reusable_review(db, rule, context) do
+          nil ->
+            with {:ok, resolved} <- bind_target(db, rule.remedy.action, resolved) do
+              route_episode(db, handlers, rule, subject, call, context, resolved)
+            end
+
+          review_id ->
+            wake_reusable_review(db, rule, context, review_id)
+        end
       else
         {:error, _unbound} -> %{outcome: "unbound", producer_id: nil}
+      end
+
+    result =
+      case result do
+        {:error, _unbound} -> %{outcome: "unbound", producer_id: nil}
+        outcome -> outcome
       end
 
     lifecycle(db, rule, subject, call, result)
@@ -616,6 +630,9 @@ defmodule Tightbeam.RailRemedy do
            holder_role: holder_role,
            holder_archetype: archetype,
            caller_origin: call.origin,
+           result_revision:
+             if(Map.get(call, :result_revision), do: [call.result_revision], else: nil),
+           review_revision: Map.get(call, :result_revision),
            owner: owner
          }}
 
@@ -660,12 +677,47 @@ defmodule Tightbeam.RailRemedy do
     bindings =
       Map.take(
         context,
-        ~w(assignment_id work_item_id holder_key holder_role holder_archetype caller_origin)a
+        ~w(assignment_id work_item_id holder_key holder_role holder_archetype caller_origin result_revision)a
       )
 
     with {:ok, target} <- resolve_map(remedy.target, bindings),
          {:ok, params} <- resolve_map(remedy.params, bindings) do
       {:ok, %{target: target, params: params}}
+    end
+  end
+
+  defp reusable_review(_db, %{name: name}, %{review_revision: nil})
+       when name == "completion-requires-review",
+       do: nil
+
+  defp reusable_review(db, %{name: "completion-requires-review"}, context) do
+    Assignments.newest_applicable_open_review(
+      db,
+      context.assignment_id,
+      context.holder_key,
+      context.review_revision
+    )
+  end
+
+  defp reusable_review(_db, _rule, _context), do: nil
+
+  defp wake_reusable_review(db, rule, context, review_id) do
+    case DB.query(db, "SELECT holderKey FROM assignments WHERE id = ?1", [review_id]) do
+      {:ok, [[holder_key]]} ->
+        _wake =
+          Wakes.schedule(db, %{
+            session_key: holder_key,
+            target_role: nil,
+            origin: "remedy:#{rule.name}",
+            prompt: "review assignment #{review_id} is needed for #{context.assignment_id}",
+            due_at: now(),
+            assignment_id: review_id
+          })
+
+        %{outcome: "woke-existing", producer_id: review_id}
+
+      _ ->
+        %{outcome: "blocked", producer_id: nil}
     end
   end
 

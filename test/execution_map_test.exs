@@ -48,7 +48,7 @@ defmodule Tightbeam.ExecutionMapTest do
   @node_keys Enum.sort(
                ~w(active assignments attests bracket1_armed closing_attests creation_context
                   fail_reason fan_out finished_at id jobs minds open_decision_requests
-                  origin parent since_progress_ms spec_ref_name spec_ref_sha256 started_at
+                  origin parent review_revision_bindings since_progress_ms spec_ref_name spec_ref_sha256 started_at
                   state title turns)a
              )
 
@@ -485,6 +485,7 @@ defmodule Tightbeam.ExecutionMapTest do
     # only in by_outcome.revoked.
     item!(ctx.db, "wi_closes")
     assignment!(ctx.db, "asg_done", work_item_id: "wi_closes", holder: "s_holder")
+    assignment!(ctx.db, "asg_review", reviews: "asg_done", holder: "s_holder")
     assignment!(ctx.db, "asg_gave_up", work_item_id: "wi_closes", holder: "s_holder")
     assignment!(ctx.db, "asg_revoked", work_item_id: "wi_closes", holder: "s_holder")
 
@@ -495,6 +496,17 @@ defmodule Tightbeam.ExecutionMapTest do
     close!(ctx.db, "asg_gave_up", "surrendered", "att_gave_up")
     close!(ctx.db, "asg_revoked", "revoked", nil)
 
+    :ok =
+      DB.execute(
+        ctx.db,
+        """
+        INSERT INTO assignment_review_revisions
+          (reviewAssignmentId, repo, commitOid, bySession, cause, ts)
+        VALUES ('asg_review', 'testhost:/repo', '#{String.duplicate("a", 40)}',
+                's_holder', 'review-commission', #{@default_created})
+        """
+      )
+
     telemetry = node(roster(ctx), "wi_closes")
 
     assert telemetry.closing_attests == [
@@ -502,8 +514,20 @@ defmodule Tightbeam.ExecutionMapTest do
              %{assignmentId: "asg_gave_up", attestId: "att_gave_up", commitRefs: nil}
            ]
 
+    assert telemetry.review_revision_bindings == [
+             %{
+               reviewAssignmentId: "asg_review",
+               commitRefs: [
+                 %{repo: "testhost:/repo", commit: String.duplicate("a", 40)}
+               ],
+               principal: "session:s_holder",
+               cause: "review-commission",
+               ts: @default_created
+             }
+           ]
+
     assert telemetry.assignments == %{
-             open: 0,
+             open: 1,
              closed: 3,
              by_outcome: %{completed: 1, surrendered: 1, revoked: 1}
            }

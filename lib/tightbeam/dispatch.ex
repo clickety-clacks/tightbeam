@@ -72,24 +72,38 @@ defmodule Tightbeam.Dispatch do
   @spec dispatch(GenServer.server(), handlers(), call()) ::
           {:ok, map()} | {:error, map()} | {:decision_pending, String.t()}
   def dispatch(db \\ Tightbeam.DB, handlers, call) do
-    verb = Map.fetch!(call, :verb)
-    origin = Map.fetch!(call, :origin)
-    principal = Map.get(call, :principal)
-    session_key = Map.get(call, :session_key)
+    case Assignments.normalize_dispatch_call(db, call) do
+      {:ok, call} ->
+        call = Map.put(call, :atomic_completion_review_rules, Rules.completion_review_rules())
+        verb = Map.fetch!(call, :verb)
+        origin = Map.fetch!(call, :origin)
+        principal = Map.get(call, :principal)
+        session_key = Map.get(call, :session_key)
 
-    case bracket_precheck(db, call, verb) do
-      :proceed ->
-        dispatch_through_rail(db, handlers, call, verb, origin, principal, session_key)
+        case bracket_precheck(db, call, verb) do
+          :proceed ->
+            dispatch_through_rail(db, handlers, call, verb, origin, principal, session_key)
 
-      {:replay, assignment} ->
-        # A keyed replay bypasses the rail entirely (statute inertness): the
-        # original assignment is returned, no rumination, no terminal guard.
-        :ok = EventLog.append_event(db, "verb", verb, origin, session_key, assignment, principal)
-        {:ok, assignment}
+          {:replay, assignment} ->
+            # A keyed replay bypasses the rail entirely (statute inertness): the
+            # original assignment is returned, no rumination, no terminal guard.
+            :ok =
+              EventLog.append_event(db, "verb", verb, origin, session_key, assignment, principal)
 
-      {:refuse, error} ->
-        # Terminal guard fires BEFORE Rules.decide: no statute or remedy episode
-        # touches a non-open item (work-item-brackets §Mechanism, Proof 12).
+            {:ok, assignment}
+
+          {:refuse, error} ->
+            # Terminal guard fires BEFORE Rules.decide: no statute or remedy episode
+            # touches a non-open item (work-item-brackets §Mechanism, Proof 12).
+            best_effort_denial(db, verb, origin, principal, session_key, error)
+            {:error, error}
+        end
+
+      {:error, error} ->
+        verb = Map.fetch!(call, :verb)
+        origin = Map.fetch!(call, :origin)
+        principal = Map.get(call, :principal)
+        session_key = Map.get(call, :session_key)
         best_effort_denial(db, verb, origin, principal, session_key, error)
         {:error, error}
     end
@@ -186,11 +200,33 @@ defmodule Tightbeam.Dispatch do
 
       {:ok, handler} ->
         handler_call =
-          if verb in ["assign", "dispatch"],
-            do: Map.put(call, :accepted_event_in_txn, true),
-            else: call
+          cond do
+            verb in ["assign", "dispatch"] ->
+              Map.put(call, :accepted_event_in_txn, true)
+
+            verb == "attest" and call.params[:kind] == "completion" ->
+              Map.put(call, :atomic_rail_decision, true)
+
+            true ->
+              call
+          end
 
         case invoke(handler, handler_call) do
+          {:returned, %{code: _, __rail_decision__: rail} = error} ->
+            error = Map.delete(error, :__rail_decision__)
+
+            handle_late_rail(
+              db,
+              handlers,
+              call,
+              rail,
+              error,
+              verb,
+              origin,
+              principal,
+              session_key
+            )
+
           {:returned, %{code: _} = error} ->
             :ok = EventLog.append_event(db, "denied", verb, origin, session_key, error, principal)
             {:error, error}
@@ -216,6 +252,32 @@ defmodule Tightbeam.Dispatch do
             {:error, error}
         end
     end
+  end
+
+  defp handle_late_rail(
+         db,
+         handlers,
+         call,
+         {decision, to_close, _to_consume},
+         error,
+         verb,
+         origin,
+         principal,
+         session_key
+       ) do
+    Enum.each(to_close, &close(db, &1))
+
+    error =
+      case decision do
+        {:remedy, statute, ref, _} ->
+          remedy_error(error, RailRemedy.fire(db, handlers, statute, ref, call))
+
+        _ ->
+          error
+      end
+
+    best_effort_denial(db, verb, origin, principal, session_key, error)
+    {:error, error}
   end
 
   # Verbs whose RESULT must not be duplicated into observability. A closed set,

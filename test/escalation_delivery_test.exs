@@ -780,7 +780,8 @@ defmodule Tightbeam.EscalationDeliveryTest do
         params: %{
           subject: "delivery",
           brief: "exercise the durable notification",
-          work_item_id: item.id
+          work_item_id: item.id,
+          effect_kind: "coordination"
         },
         effort_config: ctx.config
       })

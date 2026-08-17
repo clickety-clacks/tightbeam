@@ -3184,6 +3184,13 @@ defmodule Tightbeam.SupervisionTest do
         "INSERT INTO assignments (id, subject, holderKey, openedByUser, openedAt) VALUES (?1, ?2, ?3, 'flynn', ?4)",
         [id, subject, holder, opened_at]
       )
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO assignment_effects (assignmentId, effectKind) VALUES (?1, 'policy')",
+        [id]
+      )
   end
 
   defp attach_work_item!(db, assignment_id, work_item_id) do

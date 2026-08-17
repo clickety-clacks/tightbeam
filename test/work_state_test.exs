@@ -447,7 +447,7 @@ defmodule Tightbeam.WorkStateTest do
       target_role: nil,
       role_fallback: false,
       supervision_interval_ms: 1_000,
-      params: %{subject: subject, work_item_id: work_item_id},
+      params: %{subject: subject, work_item_id: work_item_id, effect_kind: "coordination"},
       on_assignment_change: ctx.assignment_change,
       on_work_item_change: ctx.item_change
     })
@@ -461,7 +461,7 @@ defmodule Tightbeam.WorkStateTest do
       target_role: nil,
       role_fallback: false,
       supervision_interval_ms: 1_000,
-      params: %{subject: subject, work_item_id: work_item_id}
+      params: %{subject: subject, work_item_id: work_item_id, effect_kind: "coordination"}
     }
   end
 

@@ -69,8 +69,9 @@ defmodule Tightbeam.ConformanceSupport do
     "sessions" => ~w(key owner archetype harness provider host model),
     "roles" => ~w(name session),
     "work_items" => ~w(id title),
-    "assignments" => ~w(id holder creator reviews work_item files),
-    "attests" => ~w(assignment kind by verdict_kind),
+    "assignments" =>
+      ~w(id holder creator reviews work_item files effect_kind review_revision state),
+    "attests" => ~w(assignment kind by verdict_kind commit_refs note),
     "stored_attests" => ~w(assignment kind by verdict_kind),
     "retune" => ~w(session harness provider),
     "ledger" => ~w(session pending),
@@ -109,7 +110,7 @@ defmodule Tightbeam.ConformanceSupport do
     {"C7", "sweep-never-consumes"} =>
       ~w(sweep-allow-leaves-ruling-ruled verb-edge-consumes-exactly-once no-consume-legible),
     {"Cap", "capstone-reviewer-loop"} =>
-      ~w(missing-review-dispatch-remedy changes-requested-iterates-author commissioned-clean-review-releases idle-pre-review-sweep-runs-remedy unbound-reviewer-refuses-loudly loop-legible-no-teardown-claim),
+      ~w(missing-review-dispatch-remedy changes-requested-iterates-author commissioned-clean-review-releases exact-revision-denial-runs-remedy unbound-reviewer-refuses-loudly loop-legible-no-teardown-claim multiplicity-two-clean-passes stale-clean-denies revoked-clean-denies unbound-clean-denies evidence-intake-passes exact-revision-clean-passes),
     {"Cap", "capstone-tests-before-success"} =>
       ~w(behind-main-script-denies reconciled-missing-tests-denies produced-tests-release idle-sweep-reobligates tests-loop-legible),
     {"Cap", "capstone-real-run-before-ship"} =>
@@ -2059,25 +2060,6 @@ defmodule Tightbeam.ConformanceSupport do
         {db, pid} = memory_db!()
 
         try do
-          ids = materialize_world(db, missing["world"])
-
-          assert {:acted, :rail_remedy} =
-                   Supervision.evaluate(
-                     db,
-                     Gateway.handlers(%{db: db, wake_tick_ms: 1_000}),
-                     3,
-                     "holder",
-                     ids.turns["holder"]
-                   )
-
-          assert review_effect_count(db, ids.assignments["work"]) == 1
-        after
-          GenServer.stop(pid)
-        end
-
-        {db, pid} = memory_db!()
-
-        try do
           unbound_world =
             missing["world"]
             |> Map.put("roles", [])
@@ -2782,13 +2764,39 @@ defmodule Tightbeam.ConformanceSupport do
               subject: assignment["id"],
               idempotency_key: nil,
               reviews_assignment_id: assignment_ids[assignment["reviews"]],
+              review_commit_refs:
+                if(assignment["reviews"],
+                  do: [fixture_revision(assignment["review_revision"] || "current")],
+                  else: nil
+                ),
               work_item_id: work_items[assignment["work_item"]],
-              files: assignment["files"]
+              files: assignment["files"],
+              effect_kind:
+                assignment["effect_kind"] ||
+                  if(assignment["reviews"], do: "review", else: "policy")
             }
           })
 
         assert is_binary(result.id),
                "failed to materialize assignment #{assignment["id"]}: #{inspect(result)}"
+
+        if assignment["reviews"] && is_nil(assignment["review_revision"]) do
+          assert {:ok, _} =
+                   DB.query(
+                     db,
+                     "DELETE FROM assignment_review_revisions WHERE reviewAssignmentId = ?1",
+                     [result.id]
+                   )
+        end
+
+        if assignment["state"] == "revoked" do
+          assert {:ok, _} =
+                   DB.query(
+                     db,
+                     "UPDATE assignments SET state='closed',outcome='revoked',closedAt=2,closedByUser=?1 WHERE id=?2",
+                     [first_user(world), result.id]
+                   )
+        end
 
         Map.put(assignment_ids, assignment["id"], result.id)
       end)
@@ -2805,7 +2813,13 @@ defmodule Tightbeam.ConformanceSupport do
           params: %{
             assignment_id: assignments[attest["assignment"]],
             kind: attest["kind"],
-            verdict_kind: attest["verdict_kind"]
+            verdict_kind: attest["verdict_kind"],
+            note: attest["note"],
+            commit_refs:
+              if(attest["commit_refs"],
+                do: [fixture_revision(attest["commit_refs"])],
+                else: nil
+              )
           }
         })
 
@@ -3105,7 +3119,7 @@ defmodule Tightbeam.ConformanceSupport do
         target_role: nil,
         role_fallback: false,
         supervision_interval_ms: 1_000,
-        params: %{subject: subject, idempotency_key: nil}
+        params: %{subject: subject, effect_kind: "coordination", idempotency_key: nil}
       })
 
     assert is_binary(result.id)
@@ -3239,6 +3253,24 @@ defmodule Tightbeam.ConformanceSupport do
     params = atomize(raw["params"])
 
     params =
+      if params[:commit_refs] do
+        Map.put(params, :commit_refs, [fixture_revision(params[:commit_refs])])
+      else
+        params
+      end
+
+    params =
+      if raw["verb"] == "assign" do
+        Map.put_new(
+          params,
+          :effect_kind,
+          if(params[:reviews_assignment_id], do: "review", else: "coordination")
+        )
+      else
+        params
+      end
+
+    params =
       if params[:assignment_id],
         do: %{params | assignment_id: ids.assignments[params.assignment_id]},
         else: params
@@ -3264,9 +3296,26 @@ defmodule Tightbeam.ConformanceSupport do
       params: params
     }
 
+    call =
+      case params[:commit_refs] do
+        [revision] -> Map.put(call, :result_revision, revision)
+        _ -> call
+      end
+
     if raw["verb"] == "assign",
       do: Map.merge(call, %{target_role: nil, role_fallback: false}),
       else: call
+  end
+
+  defp fixture_revision(which) do
+    root = File.cwd!()
+    ref = if which == "stale", do: "HEAD^", else: "HEAD"
+    {commit, 0} = System.cmd("git", ["rev-parse", "--verify", "#{ref}^{commit}"], cd: root)
+
+    %{
+      repo: "#{Placement.local_host_name()}:#{root}",
+      commit: String.trim(commit)
+    }
   end
 
   defp principal(nil), do: nil

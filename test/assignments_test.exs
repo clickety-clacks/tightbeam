@@ -632,7 +632,7 @@ defmodule Tightbeam.AssignmentsTest do
 
   test "assign and dispatch stamp valid effects while legacy rows resolve conservatively", ctx do
     effects =
-      for kind <- ~w(code policy release live_mutation evidence review coordination), into: %{} do
+      for kind <- ~w(code policy release live_mutation evidence coordination), into: %{} do
         assignment =
           assign_call({:user, "flynn"}, "#{kind} effect")
           |> put_in([:params, :effect_kind], kind)
@@ -641,6 +641,11 @@ defmodule Tightbeam.AssignmentsTest do
         assert assignment.effectKind == kind
         {kind, assignment}
       end
+
+    assert %{code: "review_effect_requires_link"} =
+             assign_call({:user, "flynn"}, "unlinked review effect")
+             |> put_in([:params, :effect_kind], "review")
+             |> then(&handle(ctx, "assign", &1))
 
     evidence = effects["evidence"]
 
@@ -675,6 +680,184 @@ defmodule Tightbeam.AssignmentsTest do
     legacy = Assignments.list(ctx.db, %{state: "all"})
     assert Enum.find(legacy, &(&1.id == evidence.id)).effectKind == "code"
     assert Enum.find(legacy, &(&1.id == review.id)).effectKind == "review"
+  end
+
+  test "unlinked intake requires an explicit non-review effect and linked intake forces review",
+       ctx do
+    before_count = assignment_count(ctx.db)
+
+    omitted =
+      assign_call({:user, "flynn"}, "unclassified")
+      |> put_in([:params, :effect_kind], nil)
+
+    assert %{code: "effect_kind_required"} = handle(ctx, "assign", omitted)
+    assert assignment_count(ctx.db) == before_count
+
+    producer = handle(ctx, "assign", assign_call({:user, "flynn"}, "classified code"))
+
+    review =
+      assign_call({:user, "flynn"}, "forced review")
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :reviews_assignment_id], producer.id)
+      |> put_in([:params, :effect_kind], "evidence")
+      |> then(&handle(ctx, "assign", &1))
+
+    assert review.effectKind == "review"
+  end
+
+  test "code revisions normalize before selection and legacy bindings replay or conflict", ctx do
+    producer = handle(ctx, "assign", assign_call({:user, "flynn"}, "revision producer"))
+    [full_ref] = test_commit_refs()
+    abbreviated = %{full_ref | commit: String.slice(full_ref.commit, 0, 12)}
+
+    completion =
+      attest_call({:session, "holder"}, producer.id, "completion")
+      |> put_in([:params, :commit_refs], [abbreviated])
+
+    assert {:ok, normalized} = Assignments.normalize_dispatch_call(ctx.db, completion)
+    assert normalized.result_revision == full_ref
+    assert normalized.params.commit_refs == [full_ref]
+
+    uppercase =
+      put_in(completion, [:params, :commit_refs], [
+        %{full_ref | commit: String.upcase(full_ref.commit)}
+      ])
+
+    assert {:ok, %{result_revision: ^full_ref}} =
+             Assignments.normalize_dispatch_call(ctx.db, uppercase)
+
+    assert {:error, %{code: "completion_revision_ambiguous"}} =
+             completion
+             |> put_in([:params, :commit_refs], [])
+             |> then(&Assignments.normalize_dispatch_call(ctx.db, &1))
+
+    assert {:error, %{code: "unverifiable_commit_ref"}} =
+             completion
+             |> put_in([:params, :commit_refs], [Map.put(full_ref, :base, full_ref.commit)])
+             |> then(&Assignments.normalize_dispatch_call(ctx.db, &1))
+
+    review =
+      assign_call({:user, "flynn"}, "legacy review")
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :reviews_assignment_id], producer.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    repo = full_ref.repo
+    commit_oid = full_ref.commit
+
+    assert {:ok, [[^repo, ^commit_oid, "review-commission"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT repo,commitOid,cause FROM assignment_review_revisions WHERE reviewAssignmentId=?1",
+               [review.id]
+             )
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "DELETE FROM assignment_review_revisions WHERE reviewAssignmentId=?1",
+               [review.id]
+             )
+
+    _clean =
+      attest_call({:session, "other-session"}, review.id, "verdict")
+      |> put_in([:params, :verdict_kind], "reviewed-clean")
+      |> then(&handle(ctx, "attest", &1))
+
+    bind =
+      call("bind-review-revision", {:session, "other-session"}, nil, %{
+        review_assignment_id: review.id,
+        commit_refs: [abbreviated]
+      })
+
+    assert %{code: "bind_forbidden_non_holder"} =
+             bind
+             |> Map.put(:principal, {:session, "holder"})
+             |> Map.put(:origin, "agent:holder")
+             |> then(&handle(ctx, "bind-review-revision", &1))
+
+    binding = handle(ctx, "bind-review-revision", bind)
+    assert binding.reviewAssignmentId == review.id
+    assert binding.commitRefs == [full_ref]
+    assert binding.principal == "session:other-session"
+    assert binding.cause == "legacy-review-revision-binding"
+    assert handle(ctx, "bind-review-revision", bind) == binding
+
+    stale = test_commit_refs("HEAD^")
+
+    assert %{code: "review_revision_conflict"} =
+             bind
+             |> put_in([:params, :commit_refs], stale)
+             |> then(&handle(ctx, "bind-review-revision", &1))
+
+    assert Assignments.applicable_review_verdict_kinds(
+             ctx.db,
+             producer.id,
+             "holder",
+             "code",
+             full_ref
+           ) == ["reviewed-clean"]
+
+    assert Assignments.applicable_review_verdict_kinds(
+             ctx.db,
+             producer.id,
+             "holder",
+             "code",
+             hd(stale)
+           ) == []
+  end
+
+  test "remote revision normalization passes the commit as one ssh argument", ctx do
+    register_hosts(ctx.db, %{
+      "remote" => %{ssh: "git@remote.example", base_dir: "/srv/tightbeam", cli_bin: nil}
+    })
+
+    previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
+
+    on_exit(fn ->
+      if previous_runner,
+        do: Application.put_env(:tightbeam, :commit_ref_command, previous_runner),
+        else: Application.delete_env(:tightbeam, :commit_ref_command)
+    end)
+
+    parent = self()
+    oid = String.duplicate("a", 40)
+
+    Application.put_env(:tightbeam, :commit_ref_command, fn executable, args, opts ->
+      send(parent, {:commit_ref_command, executable, args, opts})
+      {oid <> "\n", 0}
+    end)
+
+    producer = handle(ctx, "assign", assign_call({:user, "flynn"}, "remote revision"))
+
+    completion =
+      attest_call({:session, "holder"}, producer.id, "completion")
+      |> put_in([:params, :commit_refs], [
+        %{repo: "remote:/srv/repos/project with spaces", commit: "feature;touch /tmp/nope"}
+      ])
+
+    assert {:ok,
+            %{
+              result_revision: %{
+                repo: "remote:/srv/repos/project with spaces",
+                commit: ^oid
+              }
+            }} = Assignments.normalize_dispatch_call(ctx.db, completion)
+
+    assert_receive {:commit_ref_command, "ssh", args, [stderr_to_stdout: true]}
+    refute "sh" in args
+    refute "-c" in args
+
+    assert Enum.take(args, -8) == [
+             "git@remote.example",
+             "git",
+             "-C",
+             "/srv/repos/project with spaces",
+             "rev-parse",
+             "--verify",
+             "--end-of-options",
+             "feature;touch /tmp/nope^{commit}"
+           ]
   end
 
   test "Proof 1: a conflicting review-assignment create is refused with review_item_conflict",
@@ -1117,12 +1300,21 @@ defmodule Tightbeam.AssignmentsTest do
              "reviewed-clean"
            ]
 
-    _ =
+    changes =
       attest_call({:session, "other-session"}, review.id, "verdict")
       |> put_in([:params, :verdict_kind], "changes-requested")
       |> then(&handle(ctx, "attest", &1))
 
-    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == []
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE attests SET ts = (SELECT max(ts) + 1 FROM attests) WHERE id = ?1",
+               [changes.attest.id]
+             )
+
+    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == [
+             "changes-requested"
+           ]
 
     second_review =
       assign_call({:user, "flynn"}, "second qualifying review")
@@ -1135,9 +1327,8 @@ defmodule Tightbeam.AssignmentsTest do
       |> put_in([:params, :verdict_kind], "reviewed-clean")
       |> then(&handle(ctx, "attest", &1))
 
-    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == [
-             "reviewed-clean"
-           ]
+    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder")
+           |> Enum.sort() == ["changes-requested", "reviewed-clean"]
 
     _ =
       attest_call({:session, "other-session"}, review.id, "verdict")
@@ -1184,7 +1375,8 @@ defmodule Tightbeam.AssignmentsTest do
       |> put_in([:params, :verdict_kind], "changes-requested")
       |> then(&handle(ctx, "attest", &1))
 
-    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == []
+    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder")
+           |> Enum.sort() == ["changes-requested", "reviewed-clean"]
   end
 
   test "qualifying review verdict uses creation order when review rounds share a timestamp",
@@ -1221,7 +1413,8 @@ defmodule Tightbeam.AssignmentsTest do
                """
              )
 
-    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == []
+    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder")
+           |> Enum.sort() == ["changes-requested", "reviewed-clean"]
   end
 
   test "prefixed idempotency scopes disjoint equal user and session strings", ctx do
@@ -1501,6 +1694,7 @@ defmodule Tightbeam.AssignmentsTest do
                ctx.db,
                ctx.handlers,
                attest_call({:session, "holder"}, completion_assignment.id, "completion")
+               |> put_in([:params, :commit_refs], test_commit_refs())
              )
 
     assert closed.state == "closed"
@@ -1588,6 +1782,7 @@ defmodule Tightbeam.AssignmentsTest do
               "assignment-get",
               "attest",
               "attests",
+              "bind-review-revision",
               "revoke-assignment",
               "assignments"
             ],
@@ -1596,6 +1791,7 @@ defmodule Tightbeam.AssignmentsTest do
            ctx.db,
            verb,
            call
+           |> maybe_add_review_revision(verb)
            |> Map.put(:verb, verb)
            |> then(fn routed ->
              if verb in ["assign", "dispatch"],
@@ -1615,6 +1811,8 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   defp dispatch!(ctx, call) do
+    call = maybe_add_completion_revision(call)
+
     assert {:ok, result} =
              Dispatch.dispatch(
                ctx.db,
@@ -1640,7 +1838,8 @@ defmodule Tightbeam.AssignmentsTest do
     call("assign", principal, "holder", %{
       subject: subject,
       idempotency_key: key,
-      work_item_id: work_item_id
+      work_item_id: work_item_id,
+      effect_kind: "code"
     })
     |> Map.merge(%{target_role: nil, role_fallback: false})
   end
@@ -1650,7 +1849,8 @@ defmodule Tightbeam.AssignmentsTest do
       subject: subject,
       brief: brief,
       idempotency_key: key,
-      work_item_id: work_item_id
+      work_item_id: work_item_id,
+      effect_kind: "code"
     })
     |> Map.merge(%{target_role: nil, role_fallback: false, supervision_interval_ms: 1_000})
   end
@@ -1677,6 +1877,33 @@ defmodule Tightbeam.AssignmentsTest do
       session_key: target,
       params: params
     }
+  end
+
+  defp maybe_add_review_revision(call, "assign") do
+    if call.params[:reviews_assignment_id] && is_nil(call.params[:review_commit_refs]),
+      do: put_in(call, [:params, :review_commit_refs], test_commit_refs()),
+      else: call
+  end
+
+  defp maybe_add_review_revision(call, _verb), do: call
+
+  defp maybe_add_completion_revision(%{verb: "attest", params: %{kind: "completion"}} = call) do
+    if is_nil(call.params[:commit_refs]),
+      do: put_in(call, [:params, :commit_refs], test_commit_refs()),
+      else: call
+  end
+
+  defp maybe_add_completion_revision(call), do: call
+
+  defp test_commit_refs(ref \\ "HEAD") do
+    {oid, 0} = System.cmd("git", ["rev-parse", ref], cd: File.cwd!())
+
+    [
+      %{
+        repo: "#{Tightbeam.Placement.local_host_name()}:#{File.cwd!()}",
+        commit: String.trim(oid)
+      }
+    ]
   end
 
   defp origin({:session, key}), do: "agent:#{key}"

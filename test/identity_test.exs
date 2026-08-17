@@ -145,13 +145,38 @@ defmodule Tightbeam.IdentityTest do
     engineering_rule = File.read!(Path.join(base, "identity/rules/engineering.toml"))
     assert engineering_rule =~ ~s(name = "code-review-requires-passing-tests")
     assert engineering_rule =~ ~s(on_rule_denied = "surface")
+    assert engineering_rule =~ ~s(fact = "assignment.completion_review_required")
+    assert engineering_rule =~ ~s(fact = "assignment.applicable_review_verdict_kinds")
 
     reviewer = Identity.snapshot!(base, "reviewer", :codex)
     assert reviewer.guidance =~ "producer holder filed the `tests-passed`"
+    assert reviewer.guidance =~ "structured revision"
+    assert reviewer.guidance =~ "bind-review-revision"
 
     coder = Identity.snapshot!(base, "coder", :codex)
     assert coder.guidance =~ "Before the ready-for-review progress attest"
     assert coder.guidance =~ "--verdict tests-passed"
+
+    orchestrator = Identity.snapshot!(base, "orchestrator", :codex)
+    assert orchestrator.guidance =~ "effectKind"
+    assert orchestrator.guidance =~ "review-commit-refs"
+    assert orchestrator.guidance =~ "bind-review-revision"
+
+    feature_cycle =
+      File.read!(Path.join(shipped, "skills/feature-cycle/SKILL.md"))
+
+    assert feature_cycle =~ "--effect-kind <kind>"
+    assert feature_cycle =~ "--review-commit-refs"
+
+    dispatching =
+      File.read!(Path.expand("priv/skills/tightbeam-dispatching/SKILL.md"))
+
+    assert dispatching =~ "--effect-kind <kind>"
+
+    operating_manual =
+      File.read!(Path.expand("priv/guidance/operating-manual.md"))
+
+    assert operating_manual =~ "--effect-kind <kind>"
   end
 
   test "init refuses an identity repository missing the live ref with repair guidance", ctx do

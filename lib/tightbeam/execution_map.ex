@@ -314,6 +314,7 @@ defmodule Tightbeam.ExecutionMap do
       attests: attests(world, set),
       started_at: started_at(world, set),
       closing_attests: closing_attests(world, set),
+      review_revision_bindings: review_revision_bindings(world, set),
       open_decision_requests: open_decision_requests(world, set),
       # COVERAGE: turn attribution, mind stamps and marker attribution shipped
       # as nullable ALTERs with no per-row stamp, so for an item older than the
@@ -424,6 +425,12 @@ defmodule Tightbeam.ExecutionMap do
         commitRefs: Map.get(world.commit_refs, assignment.closing_attest_id)
       }
     end)
+  end
+
+  defp review_revision_bindings(world, set) do
+    set
+    |> Enum.flat_map(&Map.get(world.review_bindings_by_producer, &1, []))
+    |> Enum.sort_by(& &1.reviewAssignmentId)
   end
 
   defp open_decision_requests(world, set) do
@@ -625,6 +632,7 @@ defmodule Tightbeam.ExecutionMap do
       parents: parents(items, linked),
       attests_by_assignment: attests_by_assignment(db),
       commit_refs: commit_refs(db),
+      review_bindings_by_producer: review_bindings_by_producer(db),
       markers_by_assignment: markers_by_assignment(db),
       open_requests: open_requests(db),
       pending_wake_sessions: pending_wake_sessions(db),
@@ -812,6 +820,36 @@ defmodule Tightbeam.ExecutionMap do
   defp commit_refs(db) do
     {:ok, rows} = DB.query(db, "SELECT id, commitRefs FROM attests WHERE commitRefs IS NOT NULL")
     Map.new(rows, fn [id, encoded] -> {id, JSON.decode!(encoded)} end)
+  end
+
+  defp review_bindings_by_producer(db) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT review.reviewsAssignmentId, revisions.reviewAssignmentId,
+               revisions.repo, revisions.commitOid, revisions.bySession,
+               revisions.byUser, revisions.cause, revisions.ts
+        FROM assignment_review_revisions AS revisions
+        JOIN assignments AS review ON review.id = revisions.reviewAssignmentId
+        ORDER BY review.reviewsAssignmentId, revisions.reviewAssignmentId
+        """
+      )
+
+    rows
+    |> Enum.group_by(&hd/1)
+    |> Map.new(fn {producer_id, grouped} ->
+      {producer_id,
+       Enum.map(grouped, fn [_, review_id, repo, oid, by_session, by_user, cause, ts] ->
+         %{
+           reviewAssignmentId: review_id,
+           commitRefs: [%{repo: repo, commit: oid}],
+           principal: if(by_session, do: "session:" <> by_session, else: "user:" <> by_user),
+           cause: cause,
+           ts: ts
+         }
+       end)}
+    end)
   end
 
   # `assignmentId` is the durable marker carrier, stamped from the running parent
