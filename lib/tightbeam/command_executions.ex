@@ -606,6 +606,17 @@ defmodule Tightbeam.CommandExecutions do
   defp validate_terminal_evidence!(row, receipt) do
     stdout = File.read!(row.stdout_path)
     stderr = File.read!(row.stderr_path)
+    exit_code = receipt["exitCode"]
+    signal = receipt["signal"]
+    finished_at = receipt["finishedAt"]
+
+    unless (is_nil(exit_code) or is_integer(exit_code)) and
+             (is_nil(signal) or is_integer(signal)) and
+             is_nil(exit_code) != is_nil(signal) and
+             is_integer(finished_at) do
+      raise ReceiptError,
+            "command execution #{row.execution_id} terminal status evidence is invalid"
+    end
 
     unless receipt["stdoutBytes"] == byte_size(stdout) and
              receipt["stdoutSha256"] == sha256(stdout) and

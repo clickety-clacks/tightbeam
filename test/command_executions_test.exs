@@ -185,47 +185,76 @@ defmodule Tightbeam.CommandExecutionsTest do
     assert CommandExecutions.get!(ctx.db, healthy.execution_id).state == "prepared"
   end
 
-  test "boot reconciliation isolates a terminal receipt with a non-scalar exit code", ctx do
-    poisoned = CommandExecutions.prepare(ctx.db, attrs(ctx, "poisoned-terminal", ["/bin/true"]))
+  test "boot reconciliation isolates malformed terminal status evidence per row", ctx do
+    invalid_statuses = [
+      %{exitCode: %{"not" => "a scalar"}, signal: nil, finishedAt: 30},
+      %{exitCode: nil, signal: ["x"], finishedAt: 30},
+      %{exitCode: "seven", signal: nil, finishedAt: 30},
+      %{exitCode: "7", signal: nil, finishedAt: 30},
+      %{exitCode: 7.9, signal: nil, finishedAt: 30},
+      %{exitCode: true, signal: nil, finishedAt: 30},
+      %{exitCode: 0, signal: nil, finishedAt: "yesterday"},
+      %{exitCode: 3, signal: 9, finishedAt: 30}
+    ]
+
+    poisoned =
+      invalid_statuses
+      |> Enum.with_index()
+      |> Enum.map(fn {status, index} ->
+        row =
+          CommandExecutions.prepare(
+            ctx.db,
+            attrs(ctx, "poisoned-terminal-#{index}", ["/bin/true"])
+          )
+
+        File.write!(row.stdout_path, "")
+        File.write!(row.stderr_path, "")
+
+        write_receipt(
+          row.launcher_identity_path,
+          JSON.encode!(%{executionId: row.execution_id, osPid: 11, processGroupId: 11})
+        )
+
+        write_receipt(
+          row.started_path,
+          JSON.encode!(%{executionId: row.execution_id, osPid: 12, startedAt: 20})
+        )
+
+        terminal =
+          Map.merge(
+            %{
+              executionId: row.execution_id,
+              stdoutBytes: 0,
+              stdoutSha256: sha256(""),
+              stderrBytes: 0,
+              stderrSha256: sha256("")
+            },
+            status
+          )
+
+        write_receipt(row.terminal_path, JSON.encode!(terminal))
+        row
+      end)
 
     healthy =
       CommandExecutions.prepare(ctx.db, attrs(ctx, "healthy-terminal-peer", ["/bin/true"]))
 
-    File.write!(poisoned.stdout_path, "")
-    File.write!(poisoned.stderr_path, "")
-
-    write_receipt(
-      poisoned.launcher_identity_path,
-      JSON.encode!(%{executionId: poisoned.execution_id, osPid: 11, processGroupId: 11})
-    )
-
-    write_receipt(
-      poisoned.started_path,
-      JSON.encode!(%{executionId: poisoned.execution_id, osPid: 12, startedAt: 20})
-    )
-
-    write_receipt(
-      poisoned.terminal_path,
-      JSON.encode!(%{
-        executionId: poisoned.execution_id,
-        finishedAt: 30,
-        exitCode: %{"not" => "a scalar"},
-        signal: nil,
-        stdoutBytes: 0,
-        stdoutSha256: sha256(""),
-        stderrBytes: 0,
-        stderrSha256: sha256("")
-      })
-    )
-
     assert :ok = CommandExecutions.reconcile(ctx.db)
 
-    assert %{state: "started_unknown", last_error: error} =
-             CommandExecutions.get!(ctx.db, poisoned.execution_id)
+    Enum.each(poisoned, fn row ->
+      assert %{state: "started_unknown", last_error: error} =
+               CommandExecutions.get!(ctx.db, row.execution_id)
 
-    assert error =~ "reconciliation refused"
-    assert error =~ "unsupported type"
+      assert error =~ "reconciliation refused"
+      assert error =~ "terminal status evidence is invalid"
+    end)
+
     assert CommandExecutions.get!(ctx.db, healthy.execution_id).state == "prepared"
+    assert :ok = CommandExecutions.reconcile(ctx.db)
+
+    assert Enum.all?(poisoned, fn row ->
+             CommandExecutions.get!(ctx.db, row.execution_id).state == "started_unknown"
+           end)
   end
 
   test "boot reconciliation bounds decoding to unresolved rows", ctx do
