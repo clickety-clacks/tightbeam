@@ -19,8 +19,20 @@ defmodule Tightbeam.Harness.CursorRailsTest do
     JSON.decode!(out)
   end
 
-  # A real cursor beforeShellExecution stdin payload (shape captured from the
-  # cursor-agent binary v2026.08.11-e8db854): the shell command sits in "command".
+  # A cursor beforeShellExecution stdin payload.
+  #
+  # PROVENANCE (not hand-invented): the field set and the deny/allow protocol are
+  # transcribed from the real cursor-agent binary v2026.08.11-e8db854
+  # (~/.local/share/cursor-agent/versions/2026.08.11-e8db854/index.js). The
+  # beforeShellExecution input object is built as {command, cwd, sandbox} with the
+  # common hook fields (hook_event_name, tool_name, tool_input, ...); the hook's
+  # verdict is read from STDOUT as {"permission":"allow"|"ask"|"deny","user_message"}
+  # with "deny" throwing/blocking (a nonzero exit is a hook-FAILURE, not a deny).
+  #
+  # KNOWN GAP (auth-blocked, orchestrator-confirmed no CURSOR_API_KEY): this proves
+  # the generated wrapper emits cursor's real verdict shape for a real input shape,
+  # but NOT that a live cursor-agent turn accepts it end-to-end. That authenticated
+  # rails RE-CAPTURE is the coordinator-owned follow-on, gated on George's key.
   defp shell_stdin(command) do
     JSON.encode!(%{
       "hook_event_name" => "beforeShellExecution",
@@ -39,24 +51,19 @@ defmodule Tightbeam.Harness.CursorRailsTest do
       assert CursorRails.compile(%{"hooks" => %{"PreToolUse" => []}}) == %{"hooks" => %{}}
     end
 
-    test "Bash routes to beforeShellExecution, mcp__ to beforeMCPExecution" do
+    test "Bash routes to beforeShellExecution and the wrap is applied" do
       pre = %{
         "hooks" => %{
           "PreToolUse" => [
-            %{"matcher" => "Bash", "hooks" => [%{"type" => "command", "command" => "true"}]},
-            %{
-              "matcher" => "mcp__fs__write",
-              "hooks" => [%{"type" => "command", "command" => "true"}]
-            }
+            %{"matcher" => "Bash", "hooks" => [%{"type" => "command", "command" => "true"}]}
           ]
         }
       }
 
       %{"hooks" => hooks} = CursorRails.compile(pre)
 
-      assert Map.keys(hooks) |> Enum.sort() == ["beforeMCPExecution", "beforeShellExecution"]
+      assert Map.keys(hooks) == ["beforeShellExecution"]
       assert [%{"command" => shell_cmd}] = hooks["beforeShellExecution"]
-      assert [%{"command" => _mcp_cmd}] = hooks["beforeMCPExecution"]
       # The wrap is applied, not a passthrough of the raw command.
       assert shell_cmd =~ "permission"
       refute shell_cmd == "true"
@@ -80,7 +87,17 @@ defmodule Tightbeam.Harness.CursorRailsTest do
   end
 
   describe "rails floor — no silent drops" do
-    for matcher <- ["Edit", "Write", "Read", "WebFetch", "Glob", "unknown-tool"] do
+    # MCP is refused, not routed: Cursor's beforeMCPExecution fires for every MCP
+    # tool, so an mcp__server__tool_a rail cannot be enforced tool-faithfully.
+    for matcher <- [
+          "Edit",
+          "Write",
+          "Read",
+          "WebFetch",
+          "Glob",
+          "mcp__server__tool",
+          "unknown-tool"
+        ] do
       test "matcher #{matcher} with no before-execution analog raises fail-closed" do
         pre = %{
           "hooks" => %{
@@ -175,6 +192,31 @@ defmodule Tightbeam.Harness.CursorRailsTest do
       verdict = run_hook(hook, shell_stdin("trip wire"))
       assert verdict["permission"] == "deny"
       assert verdict["user_message"] =~ "hi"
+    end
+
+    test "a MULTILINE gate reason still yields valid deny JSON (no bypass)" do
+      # A Tightbeam-shaped command whose block message spans two lines. Without
+      # control-byte flattening this emits a literal newline inside the JSON string
+      # -> invalid JSON -> Cursor reads a hook FAILURE, not a deny (a bypass).
+      tb = ~S[sh -c 'grep -qE "trip" - || exit 0; printf "line one\nline two\n" >&2; exit 2']
+
+      pre = %{
+        "hooks" => %{
+          "PreToolUse" => [
+            %{"matcher" => "Bash", "hooks" => [%{"type" => "command", "command" => tb}]}
+          ]
+        }
+      }
+
+      %{"hooks" => %{"beforeShellExecution" => [hook]}} = CursorRails.compile(pre)
+
+      # If the verdict were invalid JSON, JSON.decode! in run_hook would raise.
+      verdict = run_hook(hook, shell_stdin("trip wire"))
+      assert verdict["permission"] == "deny"
+      # The reason is preserved (flattened to one line), not dropped.
+      assert verdict["user_message"] =~ "line one"
+      assert verdict["user_message"] =~ "line two"
+      refute verdict["user_message"] =~ "\n"
     end
   end
 end
