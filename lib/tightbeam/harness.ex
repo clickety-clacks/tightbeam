@@ -50,6 +50,22 @@ defmodule Tightbeam.Harness do
   @callback default_model() :: Tightbeam.Model.t()
   @callback install_package() :: binary()
   @doc """
+  How this harness's ACP adapter is provisioned onto a host.
+
+  `:npm` — the adapter is an npm package. Its pinned `install_package()@adapter_version()`
+  joins the ONE shared `npm install` line (`Spinup.install_command/3`) into the shared
+  `adapters/node_modules` tree, and the readiness/patch machinery expects that layout.
+
+  `:shim` — the adapter is a shell shim over a binary the operator already installed
+  (`cli_binary()`). `ensure_adapter/1` writes `#!/bin/sh\\nexec "<cli>" <sub> "$@"\\n` at the
+  adapter path via `Spinup.ensure_shim_adapter/4` and NEVER npm-installs; such a harness is
+  excluded from the shared npm line (`Harness.npm_provisioned/0`). For a shim harness
+  `install_package()` names the shim binary (its basename is the adapter filename), not an npm
+  package. Binary-native by construction — the same seam a future non-npm harness (e.g. cursor)
+  reuses by returning `:shim` and supplying its own binary + subcommand.
+  """
+  @callback adapter_provisioning() :: :npm | :shim
+  @doc """
   The vendor CLI this harness invokes directly.
 
   An operator prerequisite, never something Tight Beam installs: assimilation puts
@@ -87,6 +103,18 @@ defmodule Tightbeam.Harness do
   """
   @callback warm_home(target(), String.t()) :: :ok | {:error, term()}
 
+  @doc """
+  Optional OVERRIDE of the default zero-LISTEN-socket launch assertion (rails-critical invariant).
+
+  The default is SAFE-BY-DEFAULT per provisioning class — every `:shim` harness is asserted
+  automatically (see `requires_zero_listeners?/1`) — so this callback exists only to override that
+  default DELIBERATELY: a `:shim` harness that legitimately needs a network listener opts OUT by
+  returning `false` (a rails-reviewed choice, never a silent default), and it also allows a future
+  `:npm` harness to opt IN by returning `true`. A harness that does not implement it takes the
+  class default.
+  """
+  @callback requires_zero_listeners?() :: boolean()
+
   @callback install_cli_projection(String.t()) :: :ok
   @callback probe_cli(target()) ::
               {:ok, %{bin: String.t(), version: String.t()}}
@@ -95,7 +123,31 @@ defmodule Tightbeam.Harness do
   @callback classify_subagent_event(map()) ::
               {:subagent_start | :subagent_stop, map()} | :skip
   @callback fetch_catalog(map()) :: {:ok, [map()]} | {:error, term()}
-  @optional_callbacks warm_home: 2
+  @optional_callbacks warm_home: 2, requires_zero_listeners?: 0
+
+  @doc """
+  Whether the shared launch seam asserts the launched process group has ZERO LISTEN sockets,
+  aborting fail-closed otherwise (rails-critical launch invariant 3).
+
+  SAFE-BY-DEFAULT for the binary-native (`:shim`) harness class: every `:shim` harness is enforced
+  automatically, because a shimmed CLI (e.g. `opencode acp`) can expose an ungated network route
+  under a bypass flag, and a new shim harness must NOT be able to ship without this protection by
+  merely forgetting an opt-in — wrong default direction. The `:npm` path (claude/codex) is not
+  enforced here (a universal-including-npm assertion is a separate, later hardening that would need
+  its own zero-listener verification of those harnesses).
+
+  A harness OVERRIDES the class default only by implementing `requires_zero_listeners?/0`
+  explicitly: a `:shim` harness that needs a listener opts OUT with `false`; a `:npm` harness could
+  opt IN with `true`. Never a silent default off.
+  """
+  @spec requires_zero_listeners?(module()) :: boolean()
+  def requires_zero_listeners?(module) do
+    if function_exported?(module, :requires_zero_listeners?, 0) do
+      module.requires_zero_listeners?()
+    else
+      module.adapter_provisioning() == :shim
+    end
+  end
 
   @callback conformance_vectors() :: %{
               required(String.t()) => [
@@ -117,6 +169,16 @@ defmodule Tightbeam.Harness do
   @doc "The ordered harness registry. Its order is the product fallback order."
   @spec all() :: [module()]
   def all, do: @registry
+
+  @doc """
+  The harnesses whose ACP adapter is an npm package (`adapter_provisioning/0 == :npm`).
+
+  The one shared `npm install` line and the node_modules/.bin patch machinery iterate THIS
+  list, not `all/0`: a binary-native (`:shim`) harness has no npm package, and joining a
+  non-existent spec into the shared install would fail provisioning for every npm harness too.
+  """
+  @spec npm_provisioned() :: [module()]
+  def npm_provisioned, do: Enum.filter(all(), &(&1.adapter_provisioning() == :npm))
 
   @doc "The configured default harness module, or the first registry entry."
   @spec default() :: module()
