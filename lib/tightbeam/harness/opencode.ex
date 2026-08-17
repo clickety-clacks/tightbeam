@@ -22,12 +22,15 @@ defmodule Tightbeam.Harness.Opencode do
        shim is `exec opencode acp "$@"` and Tightbeam passes no argv.
     3. 0 LISTEN sockets asserted at spawn, fail-closed — enforced AUTOMATICALLY for the whole
        `:shim` class (`Harness.requires_zero_listeners?/1` gates on `adapter_provisioning`), in the
-       shared launch seam (`Tightbeam.Acp.Adapter`, post-identity, pgid in hand). This is not
-       merely defense-in-depth: `opencode acp` v1.18.18 was found to bind an ungated HTTP server on
-       127.0.0.1:4096 (the `/session/{id}/shell` bypass surface), captured live — so the assertion
-       currently REFUSES the launch, which is correct and gates go-live until the finding is
-       adjudicated (EVIDENCE/RAILS-FINDING-acp-http-listener.md). Any LISTEN socket in the launched
-       process group aborts the launch.
+       shared launch seam (`Tightbeam.Acp.Adapter`), asserted AFTER `initialize` returns + over a
+       settle window — because `opencode acp` v1.18.18 binds its 127.0.0.1:4096 HTTP server (the
+       `/session/{id}/shell` bypass surface) ~0.3–1.1s AFTER spawn (captured live,
+       EVIDENCE/RAILS-FINDING-acp-http-listener.md), which a pre-initialize probe would race. What
+       is CAPTURED: the listener finding, and the probe/refusal logic (unit-tested). NOT yet
+       captured end-to-end: the assert firing through the real adapter-boot path for a registered
+       OpenCode — that is a go-live validation, not something claimed here. HONEST RESIDUAL: a
+       listener bound strictly after the last sample is not caught; that gap is for the go-live
+       threat-model adjudication.
 
   GATE: `prepare_launch/3` points OpenCode at a Tightbeam-owned config (via `OPENCODE_CONFIG`)
   whose `plugin` array references the out-of-tree gate plugin (`priv/opencode_gate/`). The
@@ -71,8 +74,8 @@ defmodule Tightbeam.Harness.Opencode do
 
   # TODO(HB-04, model-catalog): the OpenCode model vocabulary is `provider/model`
   # (e.g. OpenCode Zen / Kimi K3). The concrete default + selectable set is the catalog decision
-  # tracked with `fetch_catalog/1`; this names a documented placeholder until that lands and is
-  # not exercised while the harness is unregistered.
+  # tracked with `fetch_catalog/1`; this names a documented placeholder until that lands (a fresh
+  # org only reaches it once a model has been chosen, which the catalog wiring precedes).
   @impl true
   def default_model, do: Model.new("opencode/zen", effort: "medium")
 
@@ -220,9 +223,8 @@ defmodule Tightbeam.Harness.Opencode do
   end
 
   # TODO(session-semantics): the exact OpenCode ACP `_meta` guidance key, permission mode, and
-  # model-switch semantics are not yet ground-truth-verified; these mirror the generic shape and
-  # are not exercised while the harness is unregistered. Verify against a live `opencode acp`
-  # session before driving real turns.
+  # model-switch semantics are not yet ground-truth-verified; these mirror the generic shape.
+  # Verify against a live `opencode acp` session before driving real turns.
   @impl true
   def session_config(session, guidance) do
     prefix =
@@ -328,12 +330,24 @@ defmodule Tightbeam.Harness.Opencode do
   # TODO(HB-04, catalog-source): the production catalog source is `opencode models` (provider-
   # stamped `provider/model` slugs); wiring + provider stamping is the catalog decision. The
   # injected-reader shape (fixture precedent) keeps derivation testable without coupling to a
-  # live source; the real reader is tracked follow-on and not exercised while unregistered.
+  # live source; the real reader is a tracked follow-on (the production path fails loud until it
+  # is wired — see `fetch_catalog/1`).
   @impl true
   def fetch_catalog(state) do
-    fetch = get_in(state, [:options, :opencode_fetch]) || fn -> {:ok, :valid} end
+    case get_in(state, [:options, :opencode_fetch]) do
+      nil ->
+        # No production catalog source is wired yet (HB-04, deferred). FAIL LOUD — fabricating a
+        # `{:ok, …}` here would advertise a model that may not exist and silently ship a wrong
+        # catalog. The injected fetcher below exists ONLY for conformance derivation tests.
+        {:error, :opencode_catalog_source_unwired}
 
-    case fetch.() do
+      fetch ->
+        derive_catalog(fetch.())
+    end
+  end
+
+  defp derive_catalog(fetched) do
+    case fetched do
       {:ok, :valid} ->
         {:ok,
          [

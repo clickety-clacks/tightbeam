@@ -630,20 +630,24 @@ defmodule Tightbeam.HarnessProcess do
 
   @doc """
   Assert the launched process group holds ZERO TCP LISTEN sockets (rails-critical launch
-  invariant 3), for a harness that opts in via `Harness.requires_zero_listeners?/1`.
+  invariant 3), for a harness in the `:shim` class (`Harness.requires_zero_listeners?/1`).
 
   Fail-closed: any LISTEN socket in the group, or a probe that cannot conclude, is `{:error, _}`
-  and the caller refuses the launch. `opencode acp` binds nothing, so this verifies the structural
-  never-`--pure`/never-`serve` invariants held — a listener means a listener-opening flag reached
-  the CLI. This is the highest AFFORDABLE rung: a running process's sockets are observable only at
-  runtime, so a runtime assert is as structural as invariant 3 can be. Local host only for now;
-  the remote probe is tracked follow-on (OpenCode is provisioned locally on the gateway).
+  and the caller refuses the launch. It samples a SETTLE WINDOW rather than once — captured live,
+  `opencode acp` v1.18.18 binds an HTTP server on 127.0.0.1:4096 roughly 0.3–1.1s after spawn (see
+  EVIDENCE/RAILS-FINDING-acp-http-listener.md), so a single point-in-time probe races the bind;
+  the caller (`Acp.Adapter`) runs this only AFTER `initialize` returns, by which point the harness
+  has booted. A running process's sockets are observable only at runtime, so a runtime assert is
+  as structural as invariant 3 can be. HONEST RESIDUAL: neither a settle window nor a
+  post-initialize probe can catch a listener bound strictly later — that gap is for the go-live
+  adjudication. Local host only for now; the remote probe is a tracked follow-on.
   """
-  @spec assert_zero_listeners(DB.server(), String.t()) :: :ok | {:error, term()}
-  def assert_zero_listeners(db, launch_id) do
+  @spec assert_zero_listeners(DB.server(), String.t(), (integer() -> tuple())) ::
+          :ok | {:error, term()}
+  def assert_zero_listeners(db, launch_id, run \\ &lsof_listen_probe/1) do
     case fetch!(db, launch_id) do
       %{ssh: nil, process_group_id: pgid} when is_integer(pgid) ->
-        case listener_probe(pgid) do
+        case listener_probe(pgid, run) do
           {:ok, []} -> :ok
           {:ok, listeners} -> {:error, {:listeners_present, listeners}}
           {:error, reason} -> {:error, {:listener_probe_failed, reason}}
@@ -657,15 +661,44 @@ defmodule Tightbeam.HarnessProcess do
     end
   end
 
-  # `lsof -nP -a -g <pgid> -iTCP -sTCP:LISTEN -Fn`: the LISTEN TCP sockets held by ANY process in
-  # the launched process group. `-a` ANDs the pgid and socket-state filters; `-Fn` prints one
-  # field per line, so a socket name is an `n`-prefixed line. An empty selection is lsof exit 1
-  # with no output — the zero-listener case. A status outside {0,1}, or an `lsof:` diagnostic, is
-  # an inconclusive probe and fails closed.
-  defp listener_probe(pgid) do
-    args = ["-nP", "-a", "-g", Integer.to_string(pgid), "-iTCP", "-sTCP:LISTEN", "-Fn"]
+  # Sample the process group's LISTEN sockets across a short SETTLE WINDOW, not once — a listener
+  # can still be landing when the first sample runs (OpenCode's :4096 binds ~0.3–1.1s post-spawn).
+  # ANY sample showing a listener fails immediately; an inconclusive sample (lsof error) fails
+  # closed. All-empty across the window is the zero-listener pass. The window shrinks — never
+  # eliminates — the late-bind race (see `assert_zero_listeners/2`).
+  @listener_settle_samples 4
+  @listener_settle_interval_ms 150
 
-    case bounded_command("lsof", args, 5_000) do
+  defp listener_probe(pgid, run) do
+    Enum.reduce_while(1..@listener_settle_samples, {:ok, []}, fn i, _acc ->
+      case listener_sample(pgid, run) do
+        {:ok, []} ->
+          if i < @listener_settle_samples, do: Process.sleep(@listener_settle_interval_ms)
+          {:cont, {:ok, []}}
+
+        {:ok, _listeners} = present ->
+          {:halt, present}
+
+        {:error, _} = err ->
+          {:halt, err}
+      end
+    end)
+  end
+
+  # The real probe (injectable for tests): `lsof -nP -a -g <pgid> -iTCP -sTCP:LISTEN -Fn` — the
+  # LISTEN TCP sockets held by ANY process in the launched process group. Returns the runner's
+  # `{output, status}` (or `{:error, :timeout}`) for `listener_sample/2` to classify.
+  defp lsof_listen_probe(pgid) do
+    args = ["-nP", "-a", "-g", Integer.to_string(pgid), "-iTCP", "-sTCP:LISTEN", "-Fn"]
+    bounded_command("lsof", args, 5_000)
+  end
+
+  # `-a` ANDs the pgid and socket-state filters; `-Fn` prints one field per line, so a socket name
+  # is an `n`-prefixed line. An empty selection is lsof exit 1 with no output — the zero-listener
+  # case. A status outside {0,1}, or an `lsof:` diagnostic, is an inconclusive probe and fails
+  # closed.
+  defp listener_sample(pgid, run) do
+    case run.(pgid) do
       {:error, :timeout} ->
         {:error, :timeout}
 

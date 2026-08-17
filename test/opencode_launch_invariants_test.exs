@@ -22,7 +22,7 @@ defmodule Tightbeam.OpencodeLaunchInvariantsTest do
   # The rails-critical launch invariants for the OpenCode harness, tested structurally where the
   # conformance suite cannot: the shim can carry no plugin-disabling/listener-opening flag, the
   # launch argv is exactly the shim, the gate env is wired and OPENCODE_PURE never is, and the
-  # 0-LISTEN assertion is opt-in per harness.
+  # 0-LISTEN assertion is automatic for the :shim class (safe-by-default).
   use Tightbeam.TestCase, async: false
 
   import Bitwise, only: [band: 2]
@@ -129,6 +129,23 @@ defmodule Tightbeam.OpencodeLaunchInvariantsTest do
       refute Opencode in Harness.npm_provisioned()
       assert Tightbeam.Harness.Claude in Harness.npm_provisioned()
       assert Tightbeam.Harness.Codex in Harness.npm_provisioned()
+    end
+  end
+
+  describe "fetch_catalog (no fabricated catalog in production)" do
+    test "with no wired source it FAILS LOUD rather than inventing a catalog" do
+      assert {:error, :opencode_catalog_source_unwired} = Opencode.fetch_catalog(%{})
+      assert {:error, :opencode_catalog_source_unwired} = Opencode.fetch_catalog(%{options: %{}})
+    end
+
+    test "the injected fetcher (conformance only) derives a provider-stamped entry" do
+      state = %{options: %{opencode_fetch: fn -> {:ok, :valid} end}}
+
+      assert {:ok, [%{provider: :opencode, family: "opencode/zen"}]} =
+               Opencode.fetch_catalog(state)
+
+      assert {:error, :malformed_catalog} =
+               Opencode.fetch_catalog(%{options: %{opencode_fetch: fn -> {:ok, :other} end}})
     end
   end
 

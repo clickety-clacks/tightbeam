@@ -89,6 +89,74 @@ defmodule Tightbeam.HarnessProcessTest do
     %{db: db, sup: sup, test_dir: test_dir}
   end
 
+  # Insert a minimal launch row so `assert_zero_listeners/3` can fetch its ssh + process group.
+  defp insert_launch!(db, launch_id, ssh, pgid) do
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO harness_processes
+          (launchId, adapterKey, harness, preset, host, ssh, helperPath, identityPath,
+           launchSequence, osPid, processGroupId, bootIdentity, identityToken, state, createdAt)
+        VALUES (?1, 'opencode:default@testhost', 'opencode', 'default', 'testhost', ?2, '/h',
+                '/i/#{launch_id}', 1, ?3, ?3, 'boot', 'tok', 'running', 0)
+        """,
+        [launch_id, ssh, pgid]
+      )
+
+    :ok
+  end
+
+  describe "assert_zero_listeners/3 (rails invariant 3)" do
+    test "a LISTEN socket in the group is caught and refused", ctx do
+      :ok = insert_launch!(ctx.db, "l-present", nil, 4242)
+      # lsof -Fn output: a socket name is an `n`-prefixed line.
+      run = fn 4242 -> {"p4242\nf10\nn127.0.0.1:4096\n", 0} end
+
+      assert {:error, {:listeners_present, ["n127.0.0.1:4096"]}} =
+               HarnessProcess.assert_zero_listeners(ctx.db, "l-present", run)
+    end
+
+    test "zero listeners across the settle window passes", ctx do
+      :ok = insert_launch!(ctx.db, "l-zero", nil, 4243)
+      # lsof exit 1 with no output = empty selection.
+      run = fn 4243 -> {"", 1} end
+      assert :ok = HarnessProcess.assert_zero_listeners(ctx.db, "l-zero", run)
+    end
+
+    test "an lsof that is not on PATH fails CLOSED (never silently passes)", ctx do
+      :ok = insert_launch!(ctx.db, "l-absent", nil, 4244)
+      run = fn 4244 -> {"lsof is not on this gateway's PATH", 127} end
+
+      assert {:error, {:listener_probe_failed, {:lsof_failed, 127, _}}} =
+               HarnessProcess.assert_zero_listeners(ctx.db, "l-absent", run)
+    end
+
+    test "an lsof: diagnostic is inconclusive and fails CLOSED", ctx do
+      :ok = insert_launch!(ctx.db, "l-diag", nil, 4245)
+      run = fn 4245 -> {"lsof: WARNING: can't stat() ...", 1} end
+
+      assert {:error, {:listener_probe_failed, {:lsof_diagnostic, _}}} =
+               HarnessProcess.assert_zero_listeners(ctx.db, "l-diag", run)
+    end
+
+    test "a remote (ssh) launch is refused — probe unimplemented, not silently passed", ctx do
+      :ok = insert_launch!(ctx.db, "l-remote", "vector@remote", 4246)
+      run = fn _ -> flunk("remote must not run the local probe") end
+
+      assert {:error, :remote_listener_probe_unimplemented} =
+               HarnessProcess.assert_zero_listeners(ctx.db, "l-remote", run)
+    end
+
+    test "a launch with no recorded process group cannot be probed and is refused", ctx do
+      :ok = insert_launch!(ctx.db, "l-nopgid", nil, nil)
+      run = fn _ -> flunk("must not probe without a pgid") end
+
+      assert {:error, :no_process_group_id} =
+               HarnessProcess.assert_zero_listeners(ctx.db, "l-nopgid", run)
+    end
+  end
+
   test "an old harness process schema is refused without partial DDL" do
     old_db = :"old_harness_process_db_#{System.unique_integer([:positive])}"
 
