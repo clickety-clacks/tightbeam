@@ -32,7 +32,7 @@ defmodule Tightbeam.Credentials do
   @ssh_opts ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
   @fixture_provider? Application.compile_env(:tightbeam, :fixture_harness, false)
 
-  @type provider :: :openai | :anthropic | :opencode | :fixture_provider
+  @type provider :: :openai | :anthropic | :opencode | :cursor | :fixture_provider
   @type kind :: :api_key | :subscription
   @type status :: :onboarded | {:needs_onboarding, term()}
 
@@ -752,6 +752,24 @@ defmodule Tightbeam.Credentials do
     end
   end
 
+  # Cursor holds ONE kind, an API key, and it never lands in a harness home: the
+  # cursor CLI reads no credential file, only the CURSOR_API_KEY env var, so the
+  # banked key is injected at spawn by the cursor harness rather than linked in.
+  # It is banked as a bare string, trimmed, exactly as an anthropic API key is —
+  # the blank check is all refuse_hollow can say about a bare secret, and the deep
+  # anthropic check does not apply.
+  defp write_credential!(state, :cursor, credential) do
+    with :ok <- refuse_hollow(:cursor, credential.bytes, "the onboarding ceremony") do
+      atomic_write!(
+        credential_store_path(state, :cursor),
+        String.trim(credential.bytes) <> "\n"
+      )
+
+      reconcile_provider_homes(state, :cursor)
+      :ok
+    end
+  end
+
   defp write_credential!(state, :fixture_provider, credential) do
     with :ok <- refuse_hollow(:fixture_provider, credential.bytes, "the onboarding ceremony") do
       atomic_write!(credential_store_path(state, :fixture_provider), credential.bytes)
@@ -1153,12 +1171,16 @@ defmodule Tightbeam.Credentials do
   defp credential_store_path(state, :anthropic),
     do: Path.join([state.base_dir, "auth", "claude", ".credentials.json"])
 
+  defp credential_store_path(state, :cursor),
+    do: Path.join([state.base_dir, "auth", "cursor", "api-key"])
+
   defp credential_store_path(state, :fixture_provider),
     do: Path.join([state.base_dir, "auth", "fixture", "fixture.json"])
 
   defp harness_name(:openai), do: "codex"
   defp harness_name(:anthropic), do: "claude"
   defp harness_name(:opencode), do: "opencode"
+  defp harness_name(:cursor), do: "cursor"
   defp harness_name(:fixture_provider), do: "fixture"
 
   defp atomic_write!(path, bytes) do
@@ -1217,6 +1239,16 @@ defmodule Tightbeam.Credentials do
     end
   end
 
+  # A bare API key staged under the provider's one name. Same basename the store
+  # uses, matching the openai/anthropic staged-then-installed shape; the cursor
+  # harness reads the banked file only to inject CURSOR_API_KEY at spawn.
+  defp staged_credential(:cursor, kind, path) do
+    case File.read(Path.join(path, "api-key")) do
+      {:ok, bytes} -> {:ok, Map.put(installed_metadata(:cursor, kind), :bytes, bytes)}
+      {:error, reason} -> {:error, {:cursor_api_key_failed, reason}}
+    end
+  end
+
   defp staged_credential(:fixture_provider, kind, path) do
     case File.read(Path.join(path, "fixture.json")) do
       {:ok, bytes} -> {:ok, Map.put(installed_metadata(:fixture_provider, kind), :bytes, bytes)}
@@ -1268,6 +1300,7 @@ defmodule Tightbeam.Credentials do
 
   defp staged_path(:openai, path), do: Path.join(path, "auth.json")
   defp staged_path(:anthropic, path), do: Path.join(path, ".credentials.json")
+  defp staged_path(:cursor, path), do: Path.join(path, "api-key")
   defp staged_path(:fixture_provider, path), do: Path.join(path, "fixture.json")
 
   defp onboarding_staging_path(%{ssh: nil}, provider) do
