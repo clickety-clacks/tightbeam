@@ -360,6 +360,26 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
     assert report.github.repair =~ "--remote git@github.com:example/project.git"
   end
 
+  test "github missing CLI reports storage as unknown", ctx do
+    inputs =
+      ctx.inputs
+      |> put(:github_remote_url, "https://github.com/example/project.git")
+      |> put(:github_gh_path, nil)
+      |> put(:github_probe, fn "github.com", "https://github.com/example/project.git" ->
+        {:error, :missing_cli, "gh is missing from PATH"}
+      end)
+
+    {1, report} = Doctor.evaluate(ctx.catalog, inputs)
+    check = find(report, "github_auth:github.com")
+
+    refute check.ok
+    assert check.detail =~ "gh missing"
+    assert check.detail =~ "storage unknown"
+    assert report.github.state == "missing_cli"
+    assert report.github.gh_path == nil
+    assert report.github.storage == nil
+  end
+
   # RULED: doctor never creates org state. An org that has not booted has no DB,
   # so the registry is unreadable — a fact for the table, not a failed check and
   # never a reason to conjure the DB into existence.

@@ -13,27 +13,36 @@ pub(super) fn check_tool_call_with(raw: &str, gh: &impl Gh) -> Result<(), String
                 continue;
             };
 
-            let direct = args
+            let mut operation_remotes = args
                 .iter()
                 .flat_map(|arg| github_remotes(arg))
                 .collect::<Vec<_>>();
-            if !direct.is_empty() {
-                remotes.extend(direct);
-                continue;
-            }
 
-            let operand = git_remote_operand(verb, args);
-            let remote_name = match operand {
-                Some(value) if is_named_remote(value) => Some(value),
-                None if matches!(verb, "fetch" | "pull" | "push") => Some("origin"),
-                _ => None,
-            };
-
-            if let Some(name) = remote_name {
-                if let Some(url) = gh.git_remote_url(name)? {
-                    remotes.extend(github_remotes(&url));
+            let submodule_network = verb == "submodule" && submodule_network_operation(args);
+            if operation_remotes.is_empty() && submodule_network {
+                for url in gh.git_submodule_urls()? {
+                    operation_remotes.extend(github_remotes(&url));
                 }
             }
+
+            if operation_remotes.is_empty() {
+                let operand = git_remote_operand(verb, args);
+                let remote_name = match operand {
+                    Some(value) if is_named_remote(value) => Some(value),
+                    None if matches!(verb, "fetch" | "pull" | "push") || submodule_network => {
+                        Some("origin")
+                    }
+                    _ => None,
+                };
+
+                if let Some(name) = remote_name {
+                    if let Some(url) = gh.git_remote_url(name)? {
+                        operation_remotes.extend(github_remotes(&url));
+                    }
+                }
+            }
+
+            remotes.extend(operation_remotes);
         }
     }
 
@@ -185,11 +194,15 @@ fn git_remote_operand<'a>(verb: &str, args: &'a [String]) -> Option<&'a str> {
     let value_options = [
         "-b",
         "--branch",
+        "-c",
+        "--config",
         "--depth",
         "--deepen",
         "--filter",
         "--jobs",
         "--origin",
+        "-o",
+        "--push-option",
         "--refmap",
         "--server-option",
         "--shallow-exclude",
@@ -214,6 +227,12 @@ fn git_remote_operand<'a>(verb: &str, args: &'a [String]) -> Option<&'a str> {
     None
 }
 
+fn submodule_network_operation(args: &[String]) -> bool {
+    args.iter()
+        .find(|word| !word.starts_with('-'))
+        .is_some_and(|word| matches!(word.as_str(), "add" | "update"))
+}
+
 fn is_named_remote(value: &str) -> bool {
     !value.is_empty()
         && !value.contains("://")
@@ -226,11 +245,20 @@ fn is_named_remote(value: &str) -> bool {
 fn normalized_command(command: &[String]) -> &[String] {
     let mut index = 0;
     loop {
-        while command
-            .get(index)
-            .is_some_and(|word| is_env_assignment(word))
-        {
-            index += 1;
+        loop {
+            if command
+                .get(index)
+                .is_some_and(|word| is_env_assignment(word))
+            {
+                index += 1;
+                continue;
+            }
+            let width = leading_redirection_width(command, index);
+            if width > 0 {
+                index += width;
+                continue;
+            }
+            break;
         }
 
         let Some(program) = command.get(index).and_then(|word| word.rsplit('/').next()) else {
@@ -255,6 +283,29 @@ fn normalized_command(command: &[String]) -> &[String] {
             _ => return &command[index..],
         }
     }
+}
+
+fn leading_redirection_width(command: &[String], index: usize) -> usize {
+    let Some(word) = command.get(index) else {
+        return 0;
+    };
+    let redirect = word.trim_start_matches(|ch: char| ch.is_ascii_digit());
+    for operator in ["<<<", "<<-", "<<", ">>", "<>", ">|", ">", "<"] {
+        if redirect == operator {
+            return if command.get(index + 1).is_some() {
+                2
+            } else {
+                1
+            };
+        }
+        if redirect
+            .strip_prefix(operator)
+            .is_some_and(|target| !target.is_empty())
+        {
+            return 1;
+        }
+    }
+    0
 }
 
 fn strip_heredoc_bodies(text: &str) -> String {
@@ -423,77 +474,48 @@ fn push_command(commands: &mut Vec<Vec<String>>, command: &mut Vec<String>) {
 }
 
 fn github_remotes(text: &str) -> Vec<String> {
-    let mut remotes = Vec::new();
-    for prefix in [
-        "https://github.com/",
-        "http://github.com/",
-        "ssh://git@github.com/",
-        "git@github.com:",
-    ] {
-        for value in prefixed_values(text, prefix) {
-            let value = value
-                .trim_matches(|ch: char| matches!(ch, '.' | ',' | ')' | ']' | '}'))
-                .to_owned();
-            if repo_shaped(value.strip_prefix(prefix).unwrap_or(&value)) {
-                remotes.push(value);
-            }
-        }
-    }
-    remotes
+    parse_github_remote(text)
+        .map(|remote| vec![remote.original])
+        .unwrap_or_default()
 }
 
-// Only owner/repo-shaped paths are candidate git remotes. A command whose
-// comment links https://github.com/org/repo/pull/123 must not have that page
-// URL ls-remote'd — the probe would fail and refuse a valid command on a
-// fully live host.
-fn repo_shaped(path: &str) -> bool {
-    if path.ends_with(".git") {
-        return true;
-    }
-    path.split('/')
-        .filter(|segment| !segment.is_empty())
-        .count()
-        == 2
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedGithubRemote {
+    original: String,
+    hostname: String,
 }
 
-fn prefixed_values(text: &str, prefix: &str) -> Vec<String> {
-    let mut values = Vec::new();
-    let mut search_from = 0;
-    while let Some(offset) = text[search_from..].find(prefix) {
-        let start = search_from + offset;
-        let tail = &text[start..];
-        let end = tail
-            .char_indices()
-            .find_map(|(index, ch)| remote_boundary(ch).then_some(index))
-            .unwrap_or(tail.len());
-        values.push(tail[..end].to_owned());
-        search_from = start + end.max(prefix.len());
-        if search_from >= text.len() {
-            break;
-        }
+fn parse_github_remote(text: &str) -> Option<ParsedGithubRemote> {
+    let original = text
+        .trim()
+        .trim_matches(|ch: char| matches!(ch, '(' | ')' | '[' | ']' | '{' | '}' | ',' | '.'));
+    let scp_url;
+    let parseable = if original.contains("://") {
+        original
+    } else {
+        let (authority, path) = original.split_once(':')?;
+        scp_url = format!("ssh://{authority}/{path}");
+        &scp_url
+    };
+
+    let parsed = ureq::get(parseable).request_url().ok()?;
+    if !matches!(parsed.scheme(), "git" | "http" | "https" | "ssh") {
+        return None;
     }
-    values
+    let hostname = github_hostname(parsed.host())?;
+    Some(ParsedGithubRemote {
+        original: original.to_owned(),
+        hostname,
+    })
 }
 
-fn remote_boundary(ch: char) -> bool {
-    ch.is_whitespace()
-        || matches!(
-            ch,
-            '"' | '\'' | '\\' | '`' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}' | ';'
-        )
+fn github_hostname(host: &str) -> Option<String> {
+    let hostname = host.trim_end_matches('.').to_ascii_lowercase();
+    (hostname == "github.com" || hostname.ends_with(".github.com")).then_some(hostname)
 }
 
 fn github_hostname_from_remote(remote: &str) -> Option<String> {
-    if remote.starts_with("git@github.com:") {
-        return Some("github.com".to_owned());
-    }
-    let after_scheme = remote.split_once("://").map(|(_, rest)| rest)?;
-    let host_and_path = after_scheme
-        .split_once('@')
-        .map(|(_, rest)| rest)
-        .unwrap_or(after_scheme);
-    let host = host_and_path.split('/').next()?.split(':').next()?;
-    (host == "github.com" || host.ends_with(".github.com")).then(|| host.to_owned())
+    parse_github_remote(remote).map(|remote| remote.hostname)
 }
 
 #[cfg(test)]
@@ -691,6 +713,116 @@ mod tests {
             "tool_name": "Bash",
             "tool_input": {
                 "command": "cat <<'EOF' > /tmp/note\ngit clone https://github.com/org/repo.git\nEOF\n"
+            }
+        })
+        .to_string();
+
+        assert_eq!(check_tool_call_with(&raw, &FakeGh::new(false)), Ok(()));
+    }
+
+    #[test]
+    fn parsed_github_remotes_accept_userinfo_case_and_any_git_operand_path() {
+        for remote in [
+            "https://alice@github.com/org/repo.git",
+            "https://x-access-token:ghp_secret@GitHub.com/org/repo.git",
+            "ssh://git@GITHUB.COM/org/repo.git",
+            "git@GitHub.com:org/repo.git",
+            "https://github.com/org/repo/pull/123",
+            "https://github.com/org",
+        ] {
+            let parsed = parse_github_remote(remote).expect("GitHub repository remote");
+            assert_eq!(parsed.original, remote);
+            assert_eq!(parsed.hostname, "github.com");
+        }
+
+        for non_remote in [
+            "https://evil.example/github.com/org/repo.git",
+            "https://github.com.evil.example/org/repo.git",
+            "ftp://github.com/org/repo.git",
+        ] {
+            assert_eq!(parse_github_remote(non_remote), None, "{non_remote}");
+        }
+    }
+
+    #[test]
+    fn tool_call_guard_gates_userinfo_and_case_insensitive_github_urls() {
+        let secret = "ghp_USERINFO_SECRET";
+        for command in [
+            "git fetch https://alice@github.com/org/repo.git".to_owned(),
+            format!("git fetch https://x-access-token:{secret}@github.com/org/repo.git"),
+            "git clone https://GitHub.com/org/repo.git".to_owned(),
+        ] {
+            let raw = serde_json::json!({
+                "tool_name": "Bash",
+                "tool_input": {"command": command}
+            })
+            .to_string();
+            let error = check_tool_call_with(&raw, &FakeGh::new(false)).unwrap_err();
+            assert!(error.contains("Tightbeam cannot use GitHub"), "{command}");
+            assert!(!error.contains(secret), "{command}");
+        }
+    }
+
+    #[test]
+    fn tool_call_guard_handles_leading_redirects_and_push_value_options() {
+        let redirected = serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": {
+                "command": "> /tmp/clone.log git clone https://github.com/org/repo.git"
+            }
+        })
+        .to_string();
+        assert!(
+            check_tool_call_with(&redirected, &FakeGh::new(false))
+                .unwrap_err()
+                .contains("Tightbeam cannot use GitHub")
+        );
+
+        let push = serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": "git push -o foo origin"}
+        })
+        .to_string();
+        let gh = FakeGh::new(false).remote_url("origin", Some("https://github.com/org/repo.git"));
+        assert!(
+            check_tool_call_with(&push, &gh)
+                .unwrap_err()
+                .contains("Tightbeam cannot use GitHub")
+        );
+    }
+
+    #[test]
+    fn tool_call_guard_resolves_configured_submodules_and_relative_origins() {
+        let raw = serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": "git submodule update --init"}
+        })
+        .to_string();
+
+        let configured =
+            FakeGh::new(false).submodule_urls(vec!["https://github.com/org/submodule.git"]);
+        assert!(
+            check_tool_call_with(&raw, &configured)
+                .unwrap_err()
+                .contains("Tightbeam cannot use GitHub")
+        );
+
+        let relative = FakeGh::new(false)
+            .submodule_urls(vec!["../submodule.git"])
+            .remote_url("origin", Some("https://github.com/org/repo.git"));
+        assert!(
+            check_tool_call_with(&raw, &relative)
+                .unwrap_err()
+                .contains("Tightbeam cannot use GitHub")
+        );
+    }
+
+    #[test]
+    fn tool_call_guard_does_not_gate_userinfo_on_non_github_urls() {
+        let raw = serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": {
+                "command": "git fetch https://alice@gitlab.example/org/repo.git"
             }
         })
         .to_string();

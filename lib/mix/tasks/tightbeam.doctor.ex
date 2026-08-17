@@ -426,6 +426,7 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
           {:error, state, detail} ->
             state = to_string(state)
             gh_path = configured_gh_path
+            storage = if state == "missing_cli", do: nil, else: "file"
             detail = Tightbeam.GithubAuth.scrub_detail(detail)
 
             readiness = %{
@@ -436,7 +437,7 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
               hostname: hostname,
               repair: repair,
               state: state,
-              storage: "file"
+              storage: storage
             }
 
             {check(
@@ -444,7 +445,7 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
                false,
                "#{state}: #{detail}; host #{host}; hostname #{hostname}; " <>
                  "gh #{gh_path || "missing"}; state #{state}; account unknown; " <>
-                 "protocol unknown; storage file",
+                 "protocol unknown; storage #{storage || "unknown"}",
                "Run on this host: #{repair}. Do not paste a PAT into an agent."
              ), readiness}
         end

@@ -1,3 +1,34 @@
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Scrubbed(String);
+
+impl Scrubbed {
+    pub(super) fn new(value: impl AsRef<str>) -> Self {
+        Self(scrub_detail(value.as_ref()))
+    }
+
+    pub(super) fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub(super) fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl std::fmt::Display for Scrubbed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::ops::Deref for Scrubbed {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
+    }
+}
+
 pub(super) fn scrub_detail(detail: &str) -> String {
     let detail = redact_token_sequences(detail);
     let mut redacted = String::new();
@@ -82,5 +113,19 @@ mod tests {
         let embedded =
             scrub_detail("provider_error=ghp_fixture_EMBEDDED, token=github_pat_11ABC_def");
         assert_eq!(embedded, "provider_error=[redacted], token=[redacted]");
+    }
+
+    #[test]
+    fn scrubbed_values_cannot_expose_raw_provider_text_when_formatted() {
+        let detail = Scrubbed::new(
+            "provider_error=ghp_fixture_EMBEDDED at \
+             https://x-access-token:ghp_REMOTE_SECRET@github.com/org/repo.git",
+        );
+
+        let rendered = format!("{detail}");
+        assert_eq!(
+            rendered,
+            "provider_error=[redacted] at https://[redacted]@github.com/org/repo.git"
+        );
     }
 }

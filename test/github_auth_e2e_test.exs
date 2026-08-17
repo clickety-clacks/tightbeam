@@ -245,6 +245,39 @@ defmodule Tightbeam.GithubAuthE2ETest do
 
     assert nested_refusal =~ "from host satellite-fixture for github.com"
 
+    bypasses = [
+      {"git fetch https://alice@github.com/example/project.git",
+       "https://alice@github.com/example/project.git"},
+      {"git fetch https://x-access-token:#{@secret}@github.com/example/project.git",
+       "https://[redacted]@github.com/example/project.git"},
+      {"git clone https://GitHub.com/example/project.git",
+       "https://GitHub.com/example/project.git"},
+      {"git push -o foo origin", @remote},
+      {"> /tmp/clone.log git clone #{@remote}", @remote},
+      {"git submodule update --init", @remote}
+    ]
+
+    for {command, repaired_remote} <- bypasses do
+      File.write!(ctx.log, "")
+
+      {bypass_refusal, 1} =
+        run_cli(ctx, ctx.satellite, "live", "satellite-fixture", ["github-auth-check"],
+          input: tool_call(command)
+        )
+
+      assert bypass_refusal =~ "from host satellite-fixture for github.com"
+      assert bypass_refusal =~ "--remote #{repaired_remote}"
+      refute bypass_refusal =~ @secret
+
+      calls = fixture_calls(ctx)
+
+      refute Enum.any?(calls, fn {program, _dir, args} ->
+               program == "git" and String.starts_with?(args, "ls-remote ")
+             end)
+
+      refute File.read!(ctx.log) =~ @secret
+    end
+
     File.write!(ctx.log, "")
 
     heredoc = "cat <<'EOF' > /tmp/github-note\ngit clone #{@remote}\nEOF\n"
@@ -280,6 +313,31 @@ defmodule Tightbeam.GithubAuthE2ETest do
     assert git_refusal =~ "git_unready"
     refute git_refusal =~ @secret
 
+    {provider_failure, 1} =
+      run_cli(ctx, ctx.local, "api_auth", "local-fixture", ["onboard", "github"], [])
+
+    assert provider_failure =~ "provider_error=[redacted]" or
+             provider_failure =~ "invalid oauth token [redacted]"
+
+    refute provider_failure =~ @secret
+
+    credentialed_remote =
+      "https://user:#{@secret}@github.com/example/project.git"
+
+    {remote_failure, 1} =
+      run_cli(
+        ctx,
+        ctx.local,
+        "git_fail",
+        "local-fixture",
+        ["onboard", "github", "--remote", credentialed_remote],
+        []
+      )
+
+    assert remote_failure =~ "https://[redacted]@github.com/example/project.git"
+    assert remote_failure =~ "provider_error=[redacted]"
+    refute remote_failure =~ @secret
+
     for {mode, detail, expected} <- [
           {"api_auth", "invalid oauth token", :needs_onboarding},
           {"api_scope", "missing required scope", :insufficient_scope},
@@ -302,9 +360,6 @@ defmodule Tightbeam.GithubAuthE2ETest do
 
       refute elixir_detail =~ @secret
     end
-
-    credentialed_remote =
-      "https://user:#{@secret}@github.com/example/project.git"
 
     {1, report} =
       with_fixture_env(ctx, ctx.local, "git_fail", "local-fixture", fn ->
@@ -622,6 +677,12 @@ defmodule Tightbeam.GithubAuthE2ETest do
       printf 'https://github.com/example/project.git\n'
       exit 0
     fi
+
+    case "$*" in
+      "config --get-regexp "*|"config --file .gitmodules --get-regexp "*)
+        exit 1
+        ;;
+    esac
 
     if [ "$mode" = "git_fail" ]; then
       printf 'provider_error=%s refused for %s\n' "$secret" "$2" >&2

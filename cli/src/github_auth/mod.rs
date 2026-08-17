@@ -7,6 +7,7 @@ mod probe;
 mod redact;
 
 use bank::RealGh;
+use redact::Scrubbed;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GithubState {
@@ -32,15 +33,15 @@ impl GithubState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GithubStatus {
-    pub hostname: String,
-    pub state: GithubState,
-    pub failed_phase: &'static str,
-    pub account: Option<String>,
-    pub git_protocol: Option<String>,
-    pub git_remote: Option<String>,
-    pub git_ready: Option<bool>,
-    pub detail: String,
+struct GithubStatus {
+    hostname: String,
+    state: GithubState,
+    failed_phase: &'static str,
+    account: Option<String>,
+    git_protocol: Option<String>,
+    git_remote: Option<Scrubbed>,
+    git_ready: Option<bool>,
+    detail: Scrubbed,
 }
 
 pub fn onboard(hostname: &str, remote: Option<&str>) -> Result<(), String> {
@@ -85,6 +86,7 @@ mod test_support {
         statuses: Mutex<VecDeque<(&'static [&'static str], std::process::ExitStatus)>>,
         git_outputs: Mutex<VecDeque<(&'static str, Output)>>,
         remote_urls: Mutex<VecDeque<(&'static str, Option<&'static str>)>>,
+        submodule_urls: Mutex<VecDeque<Vec<&'static str>>>,
     }
 
     impl FakeGh {
@@ -95,6 +97,7 @@ mod test_support {
                 statuses: Mutex::new(VecDeque::new()),
                 git_outputs: Mutex::new(VecDeque::new()),
                 remote_urls: Mutex::new(VecDeque::new()),
+                submodule_urls: Mutex::new(VecDeque::new()),
             }
         }
 
@@ -119,6 +122,11 @@ mod test_support {
 
         pub(super) fn remote_url(self, name: &'static str, url: Option<&'static str>) -> Self {
             self.remote_urls.lock().unwrap().push_back((name, url));
+            self
+        }
+
+        pub(super) fn submodule_urls(self, urls: Vec<&'static str>) -> Self {
+            self.submodule_urls.lock().unwrap().push_back(urls);
             self
         }
     }
@@ -170,6 +178,18 @@ mod test_support {
                 .expect("unexpected git remote lookup");
             assert_eq!(name, expected);
             Ok(url.map(str::to_owned))
+        }
+
+        fn git_submodule_urls(&self) -> Result<Vec<String>, String> {
+            Ok(self
+                .submodule_urls
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_default()
+                .into_iter()
+                .map(str::to_owned)
+                .collect())
         }
     }
 

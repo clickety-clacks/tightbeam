@@ -5,7 +5,7 @@ use std::process::Output;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::bank::Gh;
-use super::redact::scrub_detail;
+use super::redact::Scrubbed;
 use super::{GithubState, GithubStatus, gh_config_dir};
 
 pub(super) fn onboard_with(
@@ -19,7 +19,7 @@ pub(super) fn onboard_with(
     let mut status = probe_with(&hostname, &gh);
 
     match status.state {
-        GithubState::MissingCli => return Err(status.detail),
+        GithubState::MissingCli => return Err(status.detail.into_string()),
         GithubState::Live => {}
         _ => {
             eprintln!(
@@ -63,6 +63,7 @@ pub(super) fn onboard_with(
     if let Some(remote) = remote {
         status = probe_git_remote(&status, remote, &gh);
         if status.state != GithubState::Live {
+            let remote = Scrubbed::new(remote);
             return Err(format!(
                 "GitHub repository auth for {remote} is not live: {}. \
                  Run tightbeam onboard github --hostname {hostname} and repair git auth; \
@@ -85,7 +86,7 @@ pub(super) fn onboard_with(
             "hostname": status.hostname,
             "account": status.account,
             "gitProtocol": status.git_protocol,
-            "gitRemote": status.git_remote,
+            "gitRemote": status.git_remote.as_deref(),
             "gitReady": status.git_ready,
             "storage": "file",
             "configDir": gh_config_dir(base_dir),
@@ -136,10 +137,10 @@ pub(super) fn probe_with(hostname: &str, gh: &impl Gh) -> GithubStatus {
             git_protocol: None,
             git_remote: None,
             git_ready: None,
-            detail: format!(
+            detail: Scrubbed::new(format!(
                 "gh is missing from PATH; install GitHub CLI on this host and run \
                  tightbeam onboard github --hostname {hostname}. PATH searched: {search_path}"
-            ),
+            )),
         };
     }
 
@@ -154,7 +155,7 @@ pub(super) fn probe_with(hostname: &str, gh: &impl Gh) -> GithubStatus {
                 git_protocol: None,
                 git_remote: None,
                 git_ready: None,
-                detail: stderr_or_stdout(&output),
+                detail: Scrubbed::new(stderr_or_stdout(&output)),
             };
         }
     } else if let Err(error) = status {
@@ -166,7 +167,7 @@ pub(super) fn probe_with(hostname: &str, gh: &impl Gh) -> GithubStatus {
             git_protocol: None,
             git_remote: None,
             git_ready: None,
-            detail: error,
+            detail: Scrubbed::new(error),
         };
     }
 
@@ -182,7 +183,7 @@ pub(super) fn probe_with(hostname: &str, gh: &impl Gh) -> GithubStatus {
                 git_protocol: git_protocol(gh, hostname),
                 git_remote: None,
                 git_ready: None,
-                detail: "gh api authenticated successfully".to_owned(),
+                detail: Scrubbed::new("gh api authenticated successfully"),
             }
         }
         Ok(output) => {
@@ -195,7 +196,7 @@ pub(super) fn probe_with(hostname: &str, gh: &impl Gh) -> GithubStatus {
                 git_protocol: git_protocol(gh, hostname),
                 git_remote: None,
                 git_ready: None,
-                detail,
+                detail: Scrubbed::new(detail),
             }
         }
         Err(error) => GithubStatus {
@@ -206,7 +207,7 @@ pub(super) fn probe_with(hostname: &str, gh: &impl Gh) -> GithubStatus {
             git_protocol: git_protocol(gh, hostname),
             git_remote: None,
             git_ready: None,
-            detail: error,
+            detail: Scrubbed::new(error),
         },
     }
 }
@@ -219,24 +220,24 @@ pub(super) fn probe_git_remote(status: &GithubStatus, remote: &str, gh: &impl Gh
         // whose secret must not be persisted.
         Ok(output) if output.status.success() => GithubStatus {
             failed_phase: "git ls-remote",
-            git_remote: Some(scrub_detail(remote)),
+            git_remote: Some(Scrubbed::new(remote)),
             git_ready: Some(true),
             ..status.clone()
         },
         Ok(output) => GithubStatus {
             state: GithubState::GitUnready,
             failed_phase: "git ls-remote",
-            git_remote: Some(scrub_detail(remote)),
+            git_remote: Some(Scrubbed::new(remote)),
             git_ready: Some(false),
-            detail: scrub_detail(&stderr_or_stdout(&output)),
+            detail: Scrubbed::new(stderr_or_stdout(&output)),
             ..status.clone()
         },
         Err(error) => GithubStatus {
             state: GithubState::Unknown,
             failed_phase: "git ls-remote",
-            git_remote: Some(scrub_detail(remote)),
+            git_remote: Some(Scrubbed::new(remote)),
             git_ready: Some(false),
-            detail: scrub_detail(&error),
+            detail: Scrubbed::new(error),
             ..status.clone()
         },
     }
@@ -275,7 +276,7 @@ fn github_refusal_for(
     let mut repair = format!("tightbeam onboard github --hostname {hostname}");
     if let Some(remote) = remote {
         repair.push_str(" --remote ");
-        repair.push_str(&scrub_detail(remote));
+        repair.push_str(Scrubbed::new(remote).as_str());
     }
 
     format!(
@@ -284,7 +285,7 @@ fn github_refusal_for(
          Run: {repair}. Do not paste a PAT into an agent.",
         phase = status.failed_phase,
         state = status.state.as_str(),
-        detail = scrub_detail(&status.detail)
+        detail = status.detail
     )
 }
 
@@ -370,7 +371,7 @@ fn write_metadata(base_dir: &Path, status: &GithubStatus) -> Result<(), String> 
         "hostname": status.hostname,
         "account": status.account,
         "git_protocol": status.git_protocol,
-        "git_remote": status.git_remote,
+        "git_remote": status.git_remote.as_deref(),
         "git_ready": status.git_ready,
         "checked_at_unix": checked_at,
         "status": status.state.as_str(),
@@ -564,5 +565,80 @@ mod tests {
         assert!(normalize_hostname("-github.com").is_err());
         assert!(normalize_hostname("github-.com").is_err());
         assert!(normalize_hostname("github_com").is_err());
+    }
+
+    #[test]
+    fn onboarding_failure_scrubs_raw_provider_detail_at_the_status_boundary() {
+        let gh = FakeGh::new(true)
+            .output(
+                &["auth", "status", "--active", "--hostname", "github.com"],
+                out(1, "", "not logged in"),
+            )
+            .status(
+                &[
+                    "auth",
+                    "login",
+                    "--hostname",
+                    "github.com",
+                    "--web",
+                    "--git-protocol",
+                    "https",
+                    "--insecure-storage",
+                ],
+                std::process::ExitStatus::from_raw(0),
+            )
+            .output(
+                &["auth", "status", "--active", "--hostname", "github.com"],
+                out(0, "", ""),
+            )
+            .output(
+                &["api", "--hostname", "github.com", "user", "--jq", ".login"],
+                out(
+                    1,
+                    "",
+                    "invalid oauth token provider_error=ghp_fixture_EMBEDDED",
+                ),
+            )
+            .output(&["config", "get", "git_protocol"], out(0, "https\n", ""));
+
+        let error =
+            onboard_with("github.com", None, Path::new("/unused-github-auth"), gh).unwrap_err();
+        assert!(error.contains("provider_error=[redacted]"));
+        assert!(!error.contains("ghp_fixture_EMBEDDED"));
+    }
+
+    #[test]
+    fn onboarding_failure_scrubs_the_remote_and_provider_detail() {
+        let remote = "https://x-access-token:ghp_REMOTE_SECRET_ABC@github.com/org/repo.git";
+        let gh = FakeGh::new(true)
+            .output(
+                &["auth", "status", "--active", "--hostname", "github.com"],
+                out(0, "", ""),
+            )
+            .output(
+                &["api", "--hostname", "github.com", "user", "--jq", ".login"],
+                out(0, "octo\n", ""),
+            )
+            .output(&["config", "get", "git_protocol"], out(0, "https\n", ""))
+            .git_output(
+                remote,
+                out(
+                    128,
+                    "",
+                    "provider_error=ghp_PROVIDER_SECRET authentication failed",
+                ),
+            );
+
+        let error = onboard_with(
+            "github.com",
+            Some(remote),
+            Path::new("/unused-github-auth"),
+            gh,
+        )
+        .unwrap_err();
+        assert!(error.contains("https://[redacted]@github.com/org/repo.git"));
+        assert!(error.contains("provider_error=[redacted]"));
+        assert!(!error.contains("ghp_REMOTE_SECRET_ABC"));
+        assert!(!error.contains("ghp_PROVIDER_SECRET"));
     }
 }

@@ -13,6 +13,9 @@ pub(super) trait Gh {
     fn git_remote_url(&self, _name: &str) -> Result<Option<String>, String> {
         Ok(None)
     }
+    fn git_submodule_urls(&self) -> Result<Vec<String>, String> {
+        Ok(Vec::new())
+    }
     fn secure_banked_files(&self) -> Result<(), String> {
         Ok(())
     }
@@ -131,6 +134,38 @@ impl Gh for RealGh {
 
         let url = String::from_utf8_lossy(&output.stdout).trim().to_owned();
         Ok((!url.is_empty()).then_some(url))
+    }
+
+    fn git_submodule_urls(&self) -> Result<Vec<String>, String> {
+        let mut urls = Vec::new();
+        for args in [
+            vec!["config", "--get-regexp", r"^submodule\..*\.url$"],
+            vec![
+                "config",
+                "--file",
+                ".gitmodules",
+                "--get-regexp",
+                r"^submodule\..*\.url$",
+            ],
+        ] {
+            let output = self
+                .command("git")
+                .args(&args)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .map_err(|error| format!("failed to resolve git submodule URLs: {error}"))?;
+            if !output.status.success() {
+                continue;
+            }
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                if let Some(url) = line.split_whitespace().nth(1) {
+                    urls.push(url.to_owned());
+                }
+            }
+        }
+        urls.sort();
+        urls.dedup();
+        Ok(urls)
     }
 
     fn secure_banked_files(&self) -> Result<(), String> {
