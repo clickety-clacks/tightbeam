@@ -126,6 +126,7 @@ pub(super) fn probe_with(hostname: &str, gh: &impl Gh) -> GithubStatus {
         return GithubStatus {
             hostname: hostname.to_owned(),
             state: GithubState::MissingCli,
+            failed_phase: "gh discovery",
             account: None,
             git_protocol: None,
             git_remote: None,
@@ -143,6 +144,7 @@ pub(super) fn probe_with(hostname: &str, gh: &impl Gh) -> GithubStatus {
             return GithubStatus {
                 hostname: hostname.to_owned(),
                 state: GithubState::NeedsOnboarding,
+                failed_phase: "gh auth status",
                 account: None,
                 git_protocol: None,
                 git_remote: None,
@@ -154,6 +156,7 @@ pub(super) fn probe_with(hostname: &str, gh: &impl Gh) -> GithubStatus {
         return GithubStatus {
             hostname: hostname.to_owned(),
             state: GithubState::Unknown,
+            failed_phase: "gh auth status",
             account: None,
             git_protocol: None,
             git_remote: None,
@@ -169,6 +172,7 @@ pub(super) fn probe_with(hostname: &str, gh: &impl Gh) -> GithubStatus {
             GithubStatus {
                 hostname: hostname.to_owned(),
                 state: GithubState::Live,
+                failed_phase: "gh api",
                 account: (!account.is_empty()).then_some(account),
                 git_protocol: git_protocol(gh, hostname),
                 git_remote: None,
@@ -181,6 +185,7 @@ pub(super) fn probe_with(hostname: &str, gh: &impl Gh) -> GithubStatus {
             GithubStatus {
                 hostname: hostname.to_owned(),
                 state: classify_api_failure(&detail),
+                failed_phase: "gh api",
                 account: None,
                 git_protocol: git_protocol(gh, hostname),
                 git_remote: None,
@@ -191,6 +196,7 @@ pub(super) fn probe_with(hostname: &str, gh: &impl Gh) -> GithubStatus {
         Err(error) => GithubStatus {
             hostname: hostname.to_owned(),
             state: GithubState::Unknown,
+            failed_phase: "gh api",
             account: None,
             git_protocol: git_protocol(gh, hostname),
             git_remote: None,
@@ -207,12 +213,14 @@ pub(super) fn probe_git_remote(status: &GithubStatus, remote: &str, gh: &impl Gh
         // capability.json, and a working credentialed URL is exactly the one
         // whose secret must not be persisted.
         Ok(output) if output.status.success() => GithubStatus {
+            failed_phase: "git ls-remote",
             git_remote: Some(scrub_detail(remote)),
             git_ready: Some(true),
             ..status.clone()
         },
         Ok(output) => GithubStatus {
             state: GithubState::GitUnready,
+            failed_phase: "git ls-remote",
             git_remote: Some(scrub_detail(remote)),
             git_ready: Some(false),
             detail: scrub_detail(&stderr_or_stdout(&output)),
@@ -220,6 +228,7 @@ pub(super) fn probe_git_remote(status: &GithubStatus, remote: &str, gh: &impl Gh
         },
         Err(error) => GithubStatus {
             state: GithubState::Unknown,
+            failed_phase: "git ls-remote",
             git_remote: Some(scrub_detail(remote)),
             git_ready: Some(false),
             detail: scrub_detail(&error),
@@ -248,6 +257,16 @@ pub(super) fn check_github_ready(
 }
 
 fn github_refusal(hostname: &str, remote: Option<&str>, status: &GithubStatus) -> String {
+    let host = projected_host_label();
+    github_refusal_for(&host, hostname, remote, status)
+}
+
+fn github_refusal_for(
+    host: &str,
+    hostname: &str,
+    remote: Option<&str>,
+    status: &GithubStatus,
+) -> String {
     let mut repair = format!("tightbeam onboard github --hostname {hostname}");
     if let Some(remote) = remote {
         repair.push_str(" --remote ");
@@ -255,11 +274,26 @@ fn github_refusal(hostname: &str, remote: Option<&str>, status: &GithubStatus) -
     }
 
     format!(
-        "Tightbeam cannot use GitHub from this host for {hostname}: {state}: {detail}. \
+        "Tightbeam cannot use GitHub from {host} for {hostname}: failed phase {phase}; \
+         {state}: {detail}. \
          Run: {repair}. Do not paste a PAT into an agent.",
+        phase = status.failed_phase,
         state = status.state.as_str(),
         detail = scrub_detail(&status.detail)
     )
+}
+
+fn projected_host_label() -> String {
+    ["TIGHTBEAM_MACHINE", "TIGHTBEAM_LOCAL_HOST_NAME"]
+        .iter()
+        .find_map(|name| {
+            std::env::var(name)
+                .ok()
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        })
+        .map(|host| format!("host {host}"))
+        .unwrap_or_else(|| "this host".to_owned())
 }
 
 // Keyword sets are part of the cross-language contract: the Elixir brain

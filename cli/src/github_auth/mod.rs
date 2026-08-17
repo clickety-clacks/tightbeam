@@ -35,6 +35,7 @@ impl GithubState {
 pub struct GithubStatus {
     pub hostname: String,
     pub state: GithubState,
+    pub failed_phase: &'static str,
     pub account: Option<String>,
     pub git_protocol: Option<String>,
     pub git_remote: Option<String>,

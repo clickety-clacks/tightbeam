@@ -80,7 +80,10 @@ defmodule Tightbeam.GithubAuth do
             )},
          {:api, {:ok, {account, 0}}} <-
            {:api,
-            bounded_cmd("gh", ["api", "--hostname", hostname, "user", "--jq", ".login"], env: env)},
+            bounded_cmd("gh", ["api", "--hostname", hostname, "user", "--jq", ".login"],
+              stderr_to_stdout: true,
+              env: env
+            )},
          {:git, {:ok, {_out, 0}}} <-
            {:git,
             bounded_cmd("git", ["ls-remote", remote_url, "HEAD"],
