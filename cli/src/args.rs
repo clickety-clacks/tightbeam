@@ -1952,8 +1952,12 @@ fn parse_onboard(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Comm
     }
     let provider = parsed.positional[1].clone();
     let fixture_provider = cfg!(test) && provider == "fixture-provider";
-    if !matches!(provider.as_str(), "openai" | "anthropic" | "github") && !fixture_provider {
-        return Err("provider must be openai, anthropic, or github".to_owned());
+    if !matches!(
+        provider.as_str(),
+        "openai" | "anthropic" | "cursor" | "github"
+    ) && !fixture_provider
+    {
+        return Err("provider must be openai, anthropic, cursor, or github".to_owned());
     }
     let allowed = [
         "api-key",
@@ -1988,6 +1992,18 @@ fn parse_onboard(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Comm
     }
     if provider != "github" && remote.is_some() {
         return Err("--remote is only valid for tightbeam onboard github".to_owned());
+    }
+    // Cursor authenticates ONLY with an API key -- its `login` writes the OS
+    // login keychain, which a headless worker cannot reach, so there is no
+    // subscription ceremony to fall back to. Requiring --api-key here fails
+    // loudly at parse time rather than routing an empty request into the
+    // subscription path, which has no cursor branch and would die deeper with a
+    // worse message.
+    if provider == "cursor" && !flags.contains_key("api-key") {
+        return Err(
+            "tightbeam onboard cursor requires --api-key; Cursor has no subscription login"
+                .to_owned(),
+        );
     }
     Ok(Command::Onboard {
         identity: identity(flags)?,
@@ -2473,6 +2489,31 @@ mod tests {
         assert_eq!(
             parse(strings(&["onboard", "openai", "--hostname", "github.com"])),
             Err("--hostname is only valid for tightbeam onboard github".to_owned())
+        );
+    }
+
+    #[test]
+    fn cursor_onboard_requires_an_api_key_and_carries_it_on_stdin() {
+        // Cursor is api-key-only: with --api-key it parses, and the flag is a
+        // boolean so the secret never lands in argv.
+        assert_eq!(
+            parse(strings(&["onboard", "cursor", "--api-key"])),
+            Ok(Command::Onboard {
+                identity: Identity::Session,
+                provider: "cursor".to_owned(),
+                api_key: true,
+                hostname: None,
+                remote: None,
+            })
+        );
+        // Without --api-key there is no subscription path to fall back to, so it
+        // refuses at parse time rather than routing an empty subscription begin.
+        assert_eq!(
+            parse(strings(&["onboard", "cursor"])),
+            Err(
+                "tightbeam onboard cursor requires --api-key; Cursor has no subscription login"
+                    .to_owned()
+            )
         );
     }
 
