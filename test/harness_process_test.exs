@@ -1,3 +1,11 @@
+defmodule Tightbeam.HarnessProcessTest.ShimStub do
+  @moduledoc false
+  # A :shim harness stub: `Harness.requires_zero_listeners?/1` returns true for it via the class
+  # default (no per-harness property), so `listener_guard` runs the assert. Plain module — only the
+  # provisioning surface is needed.
+  def adapter_provisioning, do: :shim
+end
+
 defmodule Tightbeam.HarnessProcessTest do
   use Tightbeam.TestCase, async: false
 
@@ -154,6 +162,37 @@ defmodule Tightbeam.HarnessProcessTest do
 
       assert {:error, :no_process_group_id} =
                HarnessProcess.assert_zero_listeners(ctx.db, "l-nopgid", run)
+    end
+
+    test "the adapter REFUSES (stops) when the assert fails, for a :shim harness", ctx do
+      # A remote row makes assert_zero_listeners return {:error, :remote_...} deterministically.
+      :ok = insert_launch!(ctx.db, "l-guard", "vector@remote", 4247)
+      state = %Tightbeam.Acp.Adapter{harness: :shimstub, cwd: "/tmp"}
+      opts = [harness_process_launch_id: "l-guard", db: ctx.db]
+
+      assert {:stop, {:listener_present, :shimstub, :remote_listener_probe_unimplemented}, ^state} =
+               Tightbeam.Acp.Adapter.listener_guard_for_test(
+                 opts,
+                 __MODULE__.ShimStub,
+                 :shimstub,
+                 state,
+                 "/no/such/stderr",
+                 0
+               )
+    end
+
+    test "the adapter PROCEEDS (:ok) for an :npm harness — invariant 3 does not apply", ctx do
+      state = %Tightbeam.Acp.Adapter{harness: :claude}
+
+      assert :ok =
+               Tightbeam.Acp.Adapter.listener_guard_for_test(
+                 [db: ctx.db],
+                 Tightbeam.Harness.Claude,
+                 :claude,
+                 state,
+                 "/no/such/stderr",
+                 0
+               )
     end
   end
 
