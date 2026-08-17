@@ -231,8 +231,7 @@ defmodule Tightbeam.CommandExecutions do
         maybe_settle_terminal_turn(row, db)
         reconcile_row(db, get!(db, row.execution_id))
       rescue
-        error in [ReceiptError, File.Error] ->
-          persist_reconciliation_error(db, row, error)
+        error -> persist_reconciliation_error(db, row, error)
       end
     end)
 
