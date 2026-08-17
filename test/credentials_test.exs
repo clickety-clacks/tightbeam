@@ -1352,12 +1352,9 @@ defmodule Tightbeam.CredentialsTest do
 
       # kind_at reads the recorded metadata, so it reports the banked kind now.
       assert Credentials.kind_at(ctx.base, :cursor) == :api_key
-      # kind/2 ADDITIONALLY cross-checks that a harness declares this provider's
-      # credential ready. The cursor harness module is a separate card, so until
-      # it lands there is nothing to consume the key and kind/2 reports :none.
-      # This is the two-card seam, asserted rather than hidden; it flips to
-      # :api_key the moment the cursor harness ships alongside this.
-      assert Credentials.kind(:cursor, server) == :none
+      # kind/2 additionally cross-checks that the registered Cursor harness can
+      # consume the banked key. The registry row now lands alongside this provider.
+      assert Credentials.kind(:cursor, server) == :api_key
     end
 
     test "refuses a blank cursor key and banks nothing", ctx do
