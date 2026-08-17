@@ -236,11 +236,17 @@ defmodule Tightbeam.Wire.RouterTest do
 
   test "CLI exact-version refusal is loud and precedes bearer authentication", ctx do
     body = JSON.encode!(%{verb: "inspect", asUser: "flynn", params: %{}})
+    required_version = Tightbeam.CliCompatibility.required_version()
+    %Version{major: required_major} = Version.parse!(required_version)
+    offered_version = "#{required_major + 1}.0.0"
+
+    refute offered_version == required_version
+    assert {:error, _message} = Tightbeam.CliCompatibility.check(offered_version)
 
     incompatible =
       conn(:post, "/agent/dispatch", body)
       |> put_req_header("authorization", "Bearer tbc_test")
-      |> put_req_header("x-tightbeam-cli-version", "0.2.0")
+      |> put_req_header("x-tightbeam-cli-version", offered_version)
       |> Router.call(Router.init(ctx.opts))
 
     assert incompatible.status == 426
@@ -249,14 +255,14 @@ defmodule Tightbeam.Wire.RouterTest do
              "error" => %{
                "code" => "incompatible_cli",
                "message" =>
-                 "your CLI offered 0.2.0; this gateway requires #{Tightbeam.CliCompatibility.required_version()}"
+                 "your CLI offered #{offered_version}; this gateway requires #{required_version}"
              }
            }
 
     auth_failure =
       conn(:post, "/agent/dispatch", body)
       |> put_req_header("authorization", "Bearer wrong")
-      |> put_req_header("x-tightbeam-cli-version", Tightbeam.CliCompatibility.required_version())
+      |> put_req_header("x-tightbeam-cli-version", required_version)
       |> Router.call(Router.init(ctx.opts))
 
     assert auth_failure.status == 401
