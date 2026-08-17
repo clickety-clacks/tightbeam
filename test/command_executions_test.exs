@@ -257,6 +257,132 @@ defmodule Tightbeam.CommandExecutionsTest do
            end)
   end
 
+  test "boot reconciliation isolates all nine reviewed poison classes", ctx do
+    prepare = fn key, extra ->
+      CommandExecutions.prepare(
+        ctx.db,
+        Map.merge(attrs(ctx, key, ["/bin/true"]), extra)
+      )
+    end
+
+    write_outputs = fn row ->
+      File.write!(row.stdout_path, "")
+      File.write!(row.stderr_path, "")
+    end
+
+    write_launcher = fn row ->
+      write_receipt(
+        row.launcher_identity_path,
+        JSON.encode!(%{executionId: row.execution_id, osPid: 11, processGroupId: 11})
+      )
+    end
+
+    write_started = fn row ->
+      write_receipt(
+        row.started_path,
+        JSON.encode!(%{executionId: row.execution_id, osPid: 11, startedAt: 20})
+      )
+    end
+
+    write_terminal = fn row, overrides ->
+      terminal =
+        Map.merge(
+          %{
+            executionId: row.execution_id,
+            finishedAt: 30,
+            exitCode: 0,
+            signal: nil,
+            stdoutBytes: 0,
+            stdoutSha256: sha256(""),
+            stderrBytes: 0,
+            stderrSha256: sha256("")
+          },
+          overrides
+        )
+
+      write_receipt(row.terminal_path, JSON.encode!(terminal))
+    end
+
+    non_scalar_exit = prepare.("poison-non-scalar-exit", %{})
+    write_outputs.(non_scalar_exit)
+    write_launcher.(non_scalar_exit)
+    write_started.(non_scalar_exit)
+    write_terminal.(non_scalar_exit, %{exitCode: %{"not" => "scalar"}})
+
+    non_scalar_signal = prepare.("poison-non-scalar-signal", %{})
+    write_outputs.(non_scalar_signal)
+    write_launcher.(non_scalar_signal)
+    write_started.(non_scalar_signal)
+    write_terminal.(non_scalar_signal, %{exitCode: nil, signal: ["x"]})
+
+    non_scalar_finished_at = prepare.("poison-non-scalar-finished-at", %{})
+    write_outputs.(non_scalar_finished_at)
+    write_launcher.(non_scalar_finished_at)
+    write_started.(non_scalar_finished_at)
+    write_terminal.(non_scalar_finished_at, %{finishedAt: %{"not" => "scalar"}})
+
+    array_terminal = prepare.("poison-array-terminal", %{})
+    write_outputs.(array_terminal)
+    write_launcher.(array_terminal)
+    write_started.(array_terminal)
+    write_receipt(array_terminal.terminal_path, JSON.encode!([1, 2, 3]))
+
+    invalid_started = prepare.("poison-invalid-started", %{})
+    write_receipt(invalid_started.started_path, "")
+
+    terminal_without_started = prepare.("poison-terminal-without-started", %{})
+    write_outputs.(terminal_without_started)
+    write_launcher.(terminal_without_started)
+    write_terminal.(terminal_without_started, %{})
+
+    conflicting_terminal = prepare.("poison-conflicting-terminal", %{})
+    write_outputs.(conflicting_terminal)
+    write_launcher.(conflicting_terminal)
+    write_started.(conflicting_terminal)
+    write_terminal.(conflicting_terminal, %{})
+
+    write_receipt(
+      conflicting_terminal.not_started_path,
+      JSON.encode!(%{
+        executionId: conflicting_terminal.execution_id,
+        recordedAt: 1,
+        error: "refused"
+      })
+    )
+
+    missing_output = prepare.("poison-missing-output", %{})
+    write_launcher.(missing_output)
+    write_started.(missing_output)
+    write_terminal.(missing_output, %{})
+
+    missing_turns_table = prepare.("poison-missing-turns-table", %{turn_seq: 42})
+    healthy = prepare.("healthy-nine-class-peer", %{})
+
+    poisoned = [
+      {non_scalar_exit, "terminal status evidence is invalid"},
+      {non_scalar_signal, "terminal status evidence is invalid"},
+      {non_scalar_finished_at, "terminal status evidence is invalid"},
+      {array_terminal, "is not a JSON object"},
+      {invalid_started, "is invalid JSON"},
+      {terminal_without_started, "terminal receipt without a started receipt"},
+      {conflicting_terminal, "conflicting terminal and not_started receipts"},
+      {missing_output, missing_output.stdout_path},
+      {missing_turns_table, "no match of right hand side value"}
+    ]
+
+    assert :ok = CommandExecutions.reconcile(ctx.db)
+
+    Enum.each(poisoned, fn {row, expected_error} ->
+      assert %{state: "started_unknown", last_error: error} =
+               CommandExecutions.get!(ctx.db, row.execution_id)
+
+      assert error =~ "reconciliation refused"
+      assert error =~ expected_error
+    end)
+
+    assert CommandExecutions.get!(ctx.db, healthy.execution_id).state == "prepared"
+  end
+
   test "boot reconciliation bounds decoding to unresolved rows", ctx do
     finished = execute(ctx, "terminal-history", ["/bin/true"])
     refused = CommandExecutions.prepare(ctx.db, attrs(ctx, "refused-history", ["/bin/true"]))
