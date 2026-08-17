@@ -28,6 +28,9 @@ defmodule Tightbeam.Harness.Fixture do
   def install_package, do: "@tightbeam/fixture-acp"
 
   @impl true
+  def adapter_provisioning, do: :npm
+
+  @impl true
   def cli_binary, do: "fixture"
 
   @doc false
