@@ -845,16 +845,37 @@ defmodule Tightbeam.ManagedProcesses do
   reconcile "never waits for a separate sweeper to make this decision".
   """
   @spec reconcile_in_txn(Txn.t(), String.t(), keyword()) ::
-          {:ok, map()} | {:blocked, map()} | {:error, :unknown_process}
+          {:ok, map()} | {:blocked, map()} | {:lost, map()} | {:error, :unknown_process}
   def reconcile_in_txn(txn, process_id, opts) do
     now = Keyword.fetch!(opts, :now)
     evidence = Keyword.get(opts, :evidence, :not_probed)
+    observed = Keyword.get(opts, :evidence_revision)
 
     case get_in_txn(txn, process_id) do
-      nil -> {:error, :unknown_process}
-      row -> row |> settle_lease(txn, now) |> reconcile_settled(txn, evidence, now)
+      nil ->
+        {:error, :unknown_process}
+
+      row ->
+        if stale_evidence?(row, observed) do
+          {:lost, row}
+        else
+          row |> settle_lease(txn, now) |> reconcile_settled(txn, evidence, now)
+        end
     end
   end
+
+  # Physical evidence is gathered OUTSIDE the transaction, because probing execs another
+  # process and must not hold a write open. That gap is the whole hazard: the row can
+  # move between the look and the write, and every verdict written here is TERMINAL. A
+  # stale `absent` landing on a row that has since bound and started running would
+  # resolve its lease and release the retirement fence for a live process -- the exact
+  # false terminal liveness this design exists to refuse.
+  #
+  # So the evidence carries the revision it was gathered against, and a row that has
+  # moved since loses the write rather than the truth. The caller passes no revision
+  # when no probe happened (`:not_probed`), which is not a staleness question at all.
+  defp stale_evidence?(row, observed) when is_integer(observed), do: row.revision != observed
+  defp stale_evidence?(_row, _observed), do: false
 
   # Step one, always: an expired lease installs its cause when none exists, and
   # moves a launch that has not yet bound identity out of `preparing`. A row
@@ -1051,10 +1072,19 @@ defmodule Tightbeam.ManagedProcesses do
           {:ok, map()} | {:lost, map() | nil} | {:error, :unknown_process}
   def record_stop_outcome_in_txn(txn, process_id, outcome, opts) do
     now = Keyword.fetch!(opts, :now)
+    observed = Keyword.get(opts, :evidence_revision)
 
     case get_in_txn(txn, process_id) do
       nil ->
         {:error, :unknown_process}
+
+      # The state check below is not enough on its own. A row can leave
+      # `stop_requested` and come BACK to it -- that is exactly what the
+      # `stop_failed` retry path does -- so a verdict computed during attempt one
+      # can land on attempt two and terminalize a process the second signal never
+      # resolved. The revision is what tells those two apart.
+      row when is_integer(observed) and row.revision != observed ->
+        {:lost, row}
 
       %{state: "stop_requested"} = row ->
         changes =

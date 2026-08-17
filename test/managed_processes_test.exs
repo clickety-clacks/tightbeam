@@ -642,9 +642,13 @@ defmodule Tightbeam.ManagedProcessesTest do
 
   ## process-reconcile (§B4) — the repair every blocked answer must name
 
-  defp reconcile(db, process_id, evidence, now) do
+  defp reconcile(db, process_id, evidence, now, opts \\ []) do
     tx!(db, fn txn ->
-      ManagedProcesses.reconcile_in_txn(txn, process_id, evidence: evidence, now: now)
+      ManagedProcesses.reconcile_in_txn(
+        txn,
+        process_id,
+        [evidence: evidence, now: now] ++ opts
+      )
     end)
   end
 
@@ -781,6 +785,57 @@ defmodule Tightbeam.ManagedProcessesTest do
     assert {:error, :unknown_process} = reconcile(ctx.db, "mp_nope", :absent, 1_000)
   end
 
+  # The probe runs OUTSIDE the transaction, because it execs another process. So the
+  # row can move between the look and the write, and everything written here is
+  # TERMINAL: a stale `absent` landing on a row that has since bound and started
+  # running would resolve its lease and release the retirement fence for a process
+  # that is alive. The evidence carries the revision it was gathered against, and a
+  # row that moved loses the WRITE rather than the truth.
+  test "evidence bound to a stale revision loses and writes no outcome", ctx do
+    row = preparing(ctx.db)
+    probed_revision = row.revision
+
+    # The row moves after the probe and before the write — here, the bind the stale
+    # `absent` would otherwise overwrite.
+    assert {:running, bound} = bind(ctx.db, row.processId)
+    assert bound.revision != probed_revision
+
+    assert {:lost, current} =
+             reconcile(ctx.db, row.processId, :absent, 50_000, evidence_revision: probed_revision)
+
+    # The winning row is returned untouched: same state, same revision, and no
+    # resolution written against it.
+    assert current.revision == bound.revision
+    assert current.state == "running"
+    assert current.resolvedAt == nil
+
+    durable = ManagedProcesses.get(ctx.db, row.processId)
+    assert durable.state == "running"
+    assert durable.revision == bound.revision
+  end
+
+  # The same evidence against the revision it was actually gathered at must still
+  # land — a compare-and-set that refuses everything would pass the test above and
+  # break the verb.
+  test "evidence bound to the current revision still settles the row", ctx do
+    row = preparing(ctx.db)
+
+    assert {:ok, failed} =
+             reconcile(ctx.db, row.processId, :absent, 50_000, evidence_revision: row.revision)
+
+    assert failed.state == "launch_failed"
+    assert failed.resolvedAt == 50_000
+  end
+
+  # No probe happened, so there is no revision to be stale against. Callers that
+  # never looked must not be forced to invent one.
+  test "unprobed evidence needs no revision and is not a staleness question", ctx do
+    row = preparing(ctx.db, %{lease_expires_at: 2_000})
+
+    assert {:blocked, settled} = reconcile(ctx.db, row.processId, :not_probed, 5_000)
+    assert settled.state == "launch_cancel_requested"
+  end
+
   ## process-stop and the stop worker's outcome (§B4, §B5)
 
   defp request_stop(db, process_id, now, opts \\ []) do
@@ -867,6 +922,43 @@ defmodule Tightbeam.ManagedProcessesTest do
     assert retried.state == "stop_requested"
     assert retried.stopAttemptCount == 1
     assert retried.stopCause == "owner_stop", "the original cause survives the retry"
+  end
+
+  # The state is not enough to tell two stop attempts apart: `stop_requested` is
+  # reachable AGAIN from `stop_failed`, so attempt one's verdict would otherwise land
+  # on attempt two's row and record a death the second signal never caused. The
+  # revision the signal was aimed at is what separates them.
+  test "a stop verdict from an earlier attempt loses against the retry's row", ctx do
+    bound = running_row(ctx.db)
+    assert {:ok, first} = request_stop(ctx.db, bound.processId, 4_000)
+
+    assert {:ok, _} = record_outcome(ctx.db, bound.processId, :stop_failed, 5_000)
+    assert {:ok, retried} = request_stop(ctx.db, bound.processId, 6_000)
+    assert retried.state == "stop_requested"
+
+    # Attempt one's worker finally reports. It is aimed at a row that no longer exists.
+    assert {:lost, current} =
+             record_outcome(ctx.db, bound.processId, :killed, 7_000,
+               evidence_revision: first.revision
+             )
+
+    assert current.state == "stop_requested", "the retry's obligation survives"
+    assert current.resolvedAt == nil
+    assert current.revision == retried.revision
+    assert ManagedProcesses.blocks_retirement?(current)
+  end
+
+  test "a stop verdict bound to the revision it was aimed at still lands", ctx do
+    bound = running_row(ctx.db)
+    assert {:ok, stopping} = request_stop(ctx.db, bound.processId, 4_000)
+
+    assert {:ok, done} =
+             record_outcome(ctx.db, bound.processId, :killed, 5_000,
+               evidence_revision: stopping.revision
+             )
+
+    assert done.state == "killed"
+    assert done.resolvedAt == 5_000
   end
 
   test "the worker's kill and exit outcomes are terminal and stop blocking retirement", ctx do

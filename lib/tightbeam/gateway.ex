@@ -7130,10 +7130,19 @@ defmodule Tightbeam.Gateway do
         _ -> :identity_unknown
       end
 
-    case DB.transaction(
-           db,
-           &ManagedProcesses.record_stop_outcome_in_txn(&1, row.processId, outcome, now: now)
-         ) do
+    # `row` is the row as the stop request left it, which is also the row the signal above
+    # was aimed at. Binding its revision is what stops this verdict landing on a LATER
+    # stop_requested -- the retry path returns a row to that same state, so the state
+    # alone cannot tell attempt one's result from attempt two's row.
+    case DB.transaction(db, fn txn ->
+           case ManagedProcesses.record_stop_outcome_in_txn(txn, row.processId, outcome,
+                  now: now,
+                  evidence_revision: row.revision
+                ) do
+             {:ok, settled} -> {:ok, finalize_owner_retirement(txn, settled, now)}
+             other -> other
+           end
+         end) do
       {:ok, {:ok, settled}} -> %{process: Payloads.managed_process(settled)}
       {:ok, {:blocked, settled}} -> Payloads.process_blocked("process_unresolved", [settled])
       {:ok, {:lost, settled}} -> %{process: Payloads.managed_process(settled)}
@@ -7173,20 +7182,41 @@ defmodule Tightbeam.Gateway do
           }
 
         locality ->
-          evidence =
+          # The evidence carries the revision it was read against, so the write below can
+          # refuse a verdict computed before another transition. Only a real probe is
+          # bound: `:not_probed` asks no question about the row, so it has no staleness.
+          {evidence, observed} =
             if locality == :local,
-              do: custody_evidence(config, db, row, "probe"),
-              else: :not_probed
+              do: {custody_evidence(config, db, row, "probe"), row.revision},
+              else: {:not_probed, nil}
 
-          reconcile_settled(db, id, now, evidence)
+          reconcile_settled(db, id, now, evidence, observed)
       end
     end
   end
 
-  defp reconcile_settled(db, id, now, evidence) do
+  @doc false
+  # Test seam for the compare-and-set the probe gap needs. The property under test is a
+  # RACE: evidence gathered against one revision, written after another transition won.
+  # In production the gather and the write are one uninterrupted call, so there is no
+  # honest way to interleave a competing transition from outside -- the revision
+  # parameter IS the seam, and passing a stale one directly is the only way to assert
+  # that a losing write leaves both the row and the retirement fence untouched.
+  def reconcile_settled_for_test(db, id, now, evidence, observed) do
+    reconcile_settled(db, id, now, evidence, observed)
+  end
+
+  defp reconcile_settled(db, id, now, evidence, observed) do
     result =
       DB.transaction(db, fn txn ->
-        ManagedProcesses.reconcile_in_txn(txn, id, now: now, evidence: evidence)
+        case ManagedProcesses.reconcile_in_txn(txn, id,
+               now: now,
+               evidence: evidence,
+               evidence_revision: observed
+             ) do
+          {:ok, row} -> {:ok, finalize_owner_retirement(txn, row, now)}
+          other -> other
+        end
       end)
 
     case result do
@@ -7196,12 +7226,34 @@ defmodule Tightbeam.Gateway do
       {:ok, {:blocked, row}} ->
         Payloads.process_blocked("process_unresolved", [row])
 
+      # The evidence was gathered against a row that has since moved, so the write lost
+      # and the CURRENT durable row is what gets reported. Nothing was written and the
+      # finalizer never ran -- which is the whole point: a stale `absent` must not
+      # resolve a lease, and must not release a retirement fence, for a live process.
+      {:ok, {:lost, row}} ->
+        %{process: Payloads.managed_process(row)}
+
       {:ok, {:error, :unknown_process}} ->
         %{code: "not_found", message: "unknown processId: #{id}"}
 
       {:error, error} ->
         %{code: "server_error", message: error_map_text(error)}
     end
+  end
+
+  # The resolved process and the retirement it unblocks commit together or not at all.
+  # In two transactions there is a window where the last blocker is terminal while the
+  # fence is still open, and nothing routine reopens that window -- a crash inside it
+  # strands the session in `retiring` with no process left to trigger the finalizer
+  # (spec art_6817803a rev6 §B5).
+  #
+  # Called on every successful write rather than only on the ones that look terminal:
+  # the fence already decides what is finishable, and a second copy of that test living
+  # here is a second thing to keep in agreement. `:no_fence` and `{:blocked, _}` are the
+  # ordinary answers for a session that is not retiring or is still blocked.
+  defp finalize_owner_retirement(txn, row, now) do
+    Org.finalize_retiring_session_in_txn(txn, row.ownerSessionKey, now)
+    row
   end
 
   defp required_process_id(call) do

@@ -586,6 +586,73 @@ defmodule Tightbeam.OrgTest do
              DB.query(db, "SELECT state FROM wakes WHERE wakeId = ?1", ["w_custody_defer"])
   end
 
+  ## The reconcile that unblocks a retirement (§B5) — one transaction, not two
+  ##
+  ## Boot recovery below repairs a session whose last process settled while nothing
+  ## finalized it. These prove the ordinary path never opens that window in the first
+  ## place: the resolution and the retirement it releases commit together.
+
+  test "resolving the last blocker retires its session in the same transaction", %{db: db} do
+    custody_session(db, "agent:unblocks")
+    row = preparing_process(db, "agent:unblocks")
+
+    assert %{state: "active"} = retire_in_txn!(db, "agent:unblocks")
+    assert ManagedProcesses.fence(db, "agent:unblocks").state == "retiring"
+
+    blocked = ManagedProcesses.get(db, row.processId)
+
+    Tightbeam.Gateway.reconcile_settled_for_test(
+      db,
+      row.processId,
+      9_000,
+      :absent,
+      blocked.revision
+    )
+
+    assert ManagedProcesses.get(db, row.processId).state == "launch_canceled"
+
+    # No second pass, no later boot: the fence closed with the row.
+    assert ManagedProcesses.fence(db, "agent:unblocks").state == "retired"
+    assert %{state: "retired"} = Org.get(db, "agent:unblocks")
+  end
+
+  # The other half of the compare-and-set, and the reason it is worth having: a
+  # verdict computed before another transition must not release a retirement fence.
+  # The row here MOVED after the probe — the session started retiring — so the stale
+  # `absent` loses, and a session whose process nobody has proved anything about
+  # stays exactly where it was.
+  test "a reconcile that loses the compare-and-set releases no retirement fence", %{db: db} do
+    custody_session(db, "agent:stale")
+    row = preparing_process(db, "agent:stale")
+
+    # Probe time: the evidence is gathered against this revision.
+    probed_revision = ManagedProcesses.get(db, row.processId).revision
+
+    # ...and then the row moves, because the session began retiring.
+    assert %{state: "active"} = retire_in_txn!(db, "agent:stale")
+    moved = ManagedProcesses.get(db, row.processId)
+    assert moved.revision != probed_revision
+
+    Tightbeam.Gateway.reconcile_settled_for_test(
+      db,
+      row.processId,
+      9_000,
+      :absent,
+      probed_revision
+    )
+
+    # No outcome written...
+    current = ManagedProcesses.get(db, row.processId)
+    assert current.state == moved.state
+    assert current.revision == moved.revision
+    assert current.resolvedAt == nil
+
+    # ...and no finalizer run.
+    assert ManagedProcesses.fence(db, "agent:stale").state == "retiring"
+    assert ManagedProcesses.fence(db, "agent:stale").finalizedAt == nil
+    assert %{state: "active"} = Org.get(db, "agent:stale")
+  end
+
   ## Boot recovery (§B5) — the restart pass that finishes what a crash left open
 
   # §B5, acceptance 24: an interrupted or legacy fixture whose session is
