@@ -229,6 +229,31 @@ defmodule Tightbeam.RetireOwnershipTest do
     assert Tightbeam.ManagedProcesses.get(ctx.db, row.processId)
   end
 
+  # One verb, one reply shape. The blocking fix above gave the cascade branch two
+  # new keys, and the already-retired branch has to carry them too — a caller
+  # that pattern-matches on `blocked` must not have it appear and disappear
+  # depending on which path answered.
+  test "an already-retired session answers in the same shape as a live retire", ctx do
+    session!(ctx.db, "twice", "flynn")
+
+    first = retire(ctx, "user:flynn", {:user, "flynn"}, "twice")
+    assert first.deleted_session_key == "twice"
+    assert Org.get(ctx.db, "twice").state == "retired"
+
+    second = retire(ctx, "user:flynn", {:user, "flynn"}, "twice")
+
+    assert Map.keys(second) |> Enum.sort() == Map.keys(first) |> Enum.sort()
+
+    # Idempotent success, and nothing terminal can still be blocking.
+    assert second == %{
+             deleted_session_key: "twice",
+             retired_session_keys: [],
+             deferred: [],
+             blocked: [],
+             repair_verb: nil
+           }
+  end
+
   ## Helpers
 
   defp retire(ctx, origin, principal, session_key, idempotency_key \\ nil) do

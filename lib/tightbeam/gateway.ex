@@ -5981,11 +5981,15 @@ defmodule Tightbeam.Gateway do
                 repair_verb: if(result.blocked == [], do: nil, else: "process-reconcile")
               }
             else
+              # Already retired: idempotent success, and nothing can be blocking
+              # a session that is already terminal. Same key set as the branch
+              # above — one verb must not answer in two shapes.
               %{
                 deleted_session_key: session.session_key,
                 retired_session_keys: [],
                 deferred: [],
-                blocked: []
+                blocked: [],
+                repair_verb: nil
               }
             end
 
