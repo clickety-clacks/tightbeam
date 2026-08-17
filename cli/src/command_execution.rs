@@ -43,6 +43,7 @@ pub fn run(args: &[String]) -> Result<i32, String> {
             return Ok(10);
         }
     };
+    crate::child_process::reset_sigchld_before_spawn();
     match unsafe { libc::fork() } {
         -1 => {
             let error = format!(
@@ -500,10 +501,14 @@ fn now_ms() -> u128 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Manifest, decode_status, hex_sha256, pipe, supervise, wait_child};
+    use super::{
+        Manifest, current_host, decode_status, hex_sha256, pipe, run, supervise, wait_child,
+    };
     use serde_json::Value;
     use std::fs;
     use std::path::PathBuf;
+    use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn hashes_exact_bytes() {
@@ -569,6 +574,70 @@ mod tests {
         assert_eq!(terminal["exitCode"], 0);
         assert_eq!(terminal["signal"], Value::Null);
         assert_eq!(fs::read(&manifest.stdout_path).unwrap(), b"done");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn inherited_sigchld_ignore_cannot_destroy_terminal_evidence() {
+        let root = std::env::temp_dir().join(format!(
+            "tightbeam-command-exec-sigchld-{}-{}",
+            std::process::id(),
+            super::now_ms()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = |name: &str| root.join(name);
+        let prepared_path = path("prepared.json");
+        let terminal_path = path("terminal.json");
+        let stdout_path = path("stdout");
+        let command = vec!["/bin/sh", "-c", "printf inherited"];
+        let command_json = serde_json::to_string(&command).unwrap();
+        fs::write(
+            &prepared_path,
+            serde_json::to_vec(&serde_json::json!({
+                "executionId": "inherited-sigchld",
+                "host": current_host().unwrap(),
+                "cwd": root,
+                "command": command,
+                "commandJson": command_json,
+                "commandSha256": hex_sha256(command_json.as_bytes()),
+                "claimPath": path("claim"),
+                "launcherIdentityPath": path("launcher.json"),
+                "startedPath": path("started.json"),
+                "stdoutPath": stdout_path,
+                "stderrPath": path("stderr"),
+                "notStartedPath": path("not_started.json"),
+                "terminalPath": terminal_path
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        match unsafe { libc::fork() } {
+            -1 => panic!("test invoker could not fork"),
+            0 => {
+                unsafe {
+                    libc::signal(libc::SIGCHLD, libc::SIG_IGN);
+                }
+                let code = run(&[prepared_path.to_string_lossy().into_owned()]).unwrap();
+                unsafe { libc::_exit(code) };
+            }
+            child => {
+                assert_eq!(decode_status(wait_child(child).unwrap()), (Some(0), None));
+            }
+        }
+
+        for _ in 0..200 {
+            if terminal_path.exists() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let terminal: Value = serde_json::from_slice(&fs::read(&terminal_path).unwrap()).unwrap();
+        assert_eq!(terminal["executionId"], "inherited-sigchld");
+        assert_eq!(terminal["exitCode"], 0);
+        assert_eq!(terminal["signal"], Value::Null);
+        assert_eq!(fs::read(&stdout_path).unwrap(), b"inherited");
         fs::remove_dir_all(root).unwrap();
     }
 }
