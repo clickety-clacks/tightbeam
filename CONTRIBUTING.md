@@ -13,13 +13,22 @@ assignment card names an integration branch, the card wins.
 
 ## The 0.1 release model (ruled 2026-08-15)
 
-**One living branch per version.** `0.1.9` is the active scratchpad: work meant
+**One living branch per version.** `0.1.8` is the active scratchpad: work meant
 for the 0.1 line lands there as it comes — scope is organic, no predetermined
-merge list. It is *moving code* until Mike calls quits.
+merge list. It is *moving code* until Mike calls quits. `v0.1.8` was tagged
+before the branch passed, which does not freeze it (see "Never push to a
+version branch after quits" below).
+
+**`0.1.9` is not a supported line (ruled 2026-08-18).** It is not the
+successor scratchpad and must not be based on or added to. Work that already
+landed there is being reconciled back into `0.1.8` under the same-branch rule
+above. Any guidance, card, or convention still directing work to `0.1.9` —
+including the 2026-08-15 branch-convention migration slate — is superseded by
+this paragraph.
 
 **Build numbers identify bytes.** Every build is `<version> build <N>`, with
 `N = git rev-list --count HEAD` — deterministic, reproducible from any
-checkout, no counter service (semver form: `0.1.9+N`). "Which 0.1.9 are you
+checkout, no counter service (semver form: `0.1.8+N`). "Which 0.1.8 are you
 running?" is answered by the build number, never by the branch name.
 
 **A release branch evolves until it passes (ruled 2026-08-16).** Release
@@ -34,12 +43,16 @@ evolving. ("We evolve a release branch until it passes.")
 **Calling quits.** Quits happens when the branch tests clean; the last
 (passing) build *is* the release:
 
-1. Tag `v0.1.9` at the branch tip — the immutable, byte-exact name that
+1. Tag `v<current>` at the branch tip — the immutable, byte-exact name that
    installs and support use. The CI proof (gates on both platforms, packages
    built and hashed, manifest verified) runs at that SHA.
-2. Spin `0.1.10` from the tip. It is the new scratchpad, effective
-   immediately.
-3. `0.1.9` never moves again. Freeze is by abandonment, identity is the tag.
+2. Spin the next version from the tip. It is the new scratchpad, effective
+   immediately, and it stays empty until then.
+3. `<current>` never moves again. Freeze is by abandonment, identity is the
+   tag.
+
+   Written with placeholders deliberately: naming a specific successor here
+   is what let `0.1.9` be treated as live while `0.1.8` was still testing.
 
 **Never push to a version branch after quits.** The tag is minted at quits —
 after the branch passes — so a tag and further pushes cannot coexist. (A tag
