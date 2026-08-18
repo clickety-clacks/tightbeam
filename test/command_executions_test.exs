@@ -384,7 +384,8 @@ defmodule Tightbeam.CommandExecutionsTest do
   end
 
   test "boot reconciliation bounds decoding to unresolved rows", ctx do
-    finished = execute(ctx, "terminal-history", ["/bin/true"])
+    true_path = System.find_executable("true") || raise "true executable is unavailable"
+    finished = execute(ctx, "terminal-history", [true_path])
     refused = CommandExecutions.prepare(ctx.db, attrs(ctx, "refused-history", ["/bin/true"]))
 
     assert CommandExecutions.mark_not_started(ctx.db, refused.execution_id, "test refusal").state ==
