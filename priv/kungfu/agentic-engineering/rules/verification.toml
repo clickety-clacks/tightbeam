@@ -17,6 +17,35 @@ target_session = "{holder_key}"
 [rule.remedy.params]
 prompt = "Your completion of {assignment_id} is blocked: no verification verdict is filed. Verify the work the way this repository defines verification (its AGENTS.md or equivalent prose), then file `tightbeam attest {assignment_id} --kind verdict --verdict verified` with a note saying what you ran and what you observed."
 
+# Widened 2026-08-18 from coder-only to the other archetypes whose deliverable is
+# a FILE. The shape was right and already proven; only its reach was short, and
+# the loss concentrated exactly where it did not reach. Measured on gibson that
+# day, closed assignments carrying NO artifact on their work item: reviewer
+# 456/682, spec-writer 35/71, recon 34/148 — against coder's 118/397, the one
+# archetype this rule already covered.
+#
+# REVIEWER BELONGS HERE, and the tempting argument against it is wrong. "A
+# review's deliverable is its verdict, and a verdict is already a durable row"
+# holds only if the verdict can carry the review. It cannot: the note field caps
+# at 2000 characters, and reviewers already route around it in the open — "FULL
+# CLAUSE TABLE + EVIDENCE: art_xxxxxxx, the 2000-char note cap forced the card's
+# clause table". So a reviewer that files a verdict and records nothing has kept
+# the DECISION and dropped the REASONING behind it. The review document is the
+# verdict's substance, not an optional companion to it.
+#
+# Mike ruled the real fix on 2026-08-18: a verdict should POINT AT an artifact
+# rather than carry a capped note, which makes review context durable by
+# construction and retires this clause for reviewers. Until that lands (0.2
+# design), this rail is the interim that keeps the reasoning attached to the
+# decision. A workspace with no artifact rows is
+# REMOVED when it closes (artifacts-and-reconciliation.md, ratified floor), so an
+# unrecorded report is not a filing lapse but a deletion: 7 of 10 workdir paths
+# cited as evidence by attests in a single day no longer existed.
+#
+# The kind list widened with it. `report` alone would have blocked a spec-writer
+# holding a perfectly good spec, because the fact carries the kinds the holder
+# ACTUALLY recorded; this asks whether the work left a record at all, never which
+# sort of record the archetype should have chosen.
 [[rule]]
 name = "completion-requires-results-artifact"
 verb = "attest"
@@ -25,11 +54,11 @@ effect = "remedy"
 text = "completion requires a recorded results artifact from the holder"
 deny_when = [
   { fact = "attest.kind", op = "eq", value = "completion" },
-  { fact = "assignment.holder_archetype", op = "in", value = ["coder"] },
-  { fact = "assignment.artifact_kinds", op = "not_in", value = ["report"] },
+  { fact = "assignment.holder_archetype", op = "in", value = ["coder", "reviewer", "spec-writer", "recon"] },
+  { fact = "assignment.artifact_kinds", op = "not_in", value = ["report", "spec", "doc", "data", "other"] },
 ]
 [rule.remedy]
 action = "wake"
 target_session = "{holder_key}"
 [rule.remedy.params]
-prompt = "Your completion of {assignment_id} is blocked: no results artifact is recorded. Record the verification results (output, logs, evidence) with `tightbeam artifact-record` as a report artifact on this work item, then complete."
+prompt = "Your completion of {assignment_id} is blocked: no artifact is recorded on its work item. Your session workspace is REMOVED when it closes, so a document you did not record is destroyed with it — the row survives and the bytes do not. Record what you produced (report, spec, evidence, logs) with `tightbeam artifact-record --kind <kind> --title <title> --path <path> --work-item <workItemId>`, then complete."
