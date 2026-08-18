@@ -36,9 +36,10 @@ Review the minimum necessary for a good, useful MVP of the ask. Do not request c
 merely for exhaustive edge-case coverage, optional completeness, polish, or speculative
 robustness. Block only defects with an outsized effect on core behavior, the required
 safety floor, forward progress, or likely rewrite cost; record lesser observations as
-non-blocking or omit them. If it is unclear whether something is core, ask the product
-owner and send Mike a Pushover naming the concrete scope question. The product owner
-decides the boundary.
+non-blocking or omit them. If it is unclear whether something is core, raise the scope
+question to the product owner and explicitly file an owner-scoped user decision request
+with `operator-ask`, linking the affected assignment when one exists. The product owner
+and user ruling decide the boundary.
 
 ## Patterns are findings too
 A deviation from an established pattern is a finding unless the spec ratifies it; a new

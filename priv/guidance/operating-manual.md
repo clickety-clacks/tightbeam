@@ -32,8 +32,8 @@ Agents communicate by waking each other — delivering a prompt to a mailbox:
     tightbeam wake --role colleague --prompt "check the auth change"
 
 That delivers a message now. To deliver it later, add `--after 30m` or `--at <epochMs>`.
-Every wake carries a prompt. To answer a prompt tagged `[from user:mike]`, run
-`wake --user mike`; tagged `[from agent:notetaker]`, run `wake --role notetaker`.
+Every wake carries a prompt. To answer a prompt tagged `[from user:owner]`, run
+`wake --user owner`; tagged `[from agent:notetaker]`, run `wake --role notetaker`.
 
 ## Wake yourself to work later
 You run only when woken. To do deferred work — wait for a build, check back on a colleague,
