@@ -273,6 +273,18 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
         dispatch_call(ctx.holder.session_key, item.id, "work under repeated review")
       )
 
+    assert {:ok, %{attest: %{verdictKind: "tests-passed"}}} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               verdict_call(
+                 ctx.holder.session_key,
+                 subject.id,
+                 "tests-passed",
+                 "fixture suite passed at the reviewed revision"
+               )
+             )
+
     review_call = fn n ->
       %{
         verb: "assign",
