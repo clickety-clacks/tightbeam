@@ -400,7 +400,12 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
              Dispatch.dispatch(
                ctx.db,
                ctx.handlers,
-               verdict_call(ctx.holder.session_key, subject.id, "tests-passed")
+               verdict_call(
+                 ctx.holder.session_key,
+                 subject.id,
+                 "tests-passed",
+                 "fixture suite passed at the reviewed revision"
+               )
              )
 
     review_call = fn n ->
