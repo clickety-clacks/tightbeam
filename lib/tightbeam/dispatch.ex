@@ -105,7 +105,7 @@ defmodule Tightbeam.Dispatch do
 
   defp dispatch_through_rail(db, handlers, call, verb, origin, principal, session_key) do
     {decision, to_close, to_consume} = Rules.decide(db, call)
-    Enum.each(to_close, &close(db, &1))
+    Enum.each(to_close, &close(db, handlers, &1))
 
     case decision do
       {:deny, error} ->
@@ -170,11 +170,14 @@ defmodule Tightbeam.Dispatch do
   # whose statute passed; a malfunction episode closes because the statute's check
   # answered at all, whatever it answered. The atom tag is unambiguous — a statute name
   # is a lowercase string, never an atom.
-  defp close(db, {:episodes, statute, position}),
+  defp close(db, _handlers, {:episodes, statute, position}),
     do: RailEpisodes.recovered(db, statute, position)
 
-  defp close(db, {statute, subject, occurrence}),
+  defp close(db, _handlers, {statute, subject, occurrence}),
     do: RailRemedy.close(db, statute, subject, occurrence)
+
+  defp close(db, handlers, {:notice, statute, subject, call}),
+    do: RailRemedy.notice(db, handlers, statute, subject, call)
 
   defp dispatch_to_handler(db, handlers, call, verb, origin, principal, session_key) do
     case Map.fetch(handlers, verb) do

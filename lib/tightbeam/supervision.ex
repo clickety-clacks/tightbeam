@@ -1159,7 +1159,7 @@ defmodule Tightbeam.Supervision do
       }
 
       {decision, to_close, _to_consume} = Rules.decide(db, call)
-      Enum.each(to_close, &close_episode(db, &1))
+      Enum.each(to_close, &close_episode(db, handlers, &1))
 
       case decision do
         {:remedy, statute, ref, _error} ->
@@ -1219,11 +1219,14 @@ defmodule Tightbeam.Supervision do
   end
 
   # The sweep closes both kinds of episode the verb edge does (§C3.5, §A3).
-  defp close_episode(db, {:episodes, statute, position}),
+  defp close_episode(db, _handlers, {:episodes, statute, position}),
     do: RailEpisodes.recovered(db, statute, position)
 
-  defp close_episode(db, {statute, subject, occurrence}),
+  defp close_episode(db, _handlers, {statute, subject, occurrence}),
     do: RailRemedy.close(db, statute, subject, occurrence)
+
+  defp close_episode(db, handlers, {:notice, statute, subject, call}),
+    do: RailRemedy.notice(db, handlers, statute, subject, call)
 
   # `decision_request_id` here only ever names a statute row: it is the `dr_id`
   # `Escalation.resolve/3` handed back, which comes from `current_request/4`'s

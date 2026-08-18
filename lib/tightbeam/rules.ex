@@ -97,7 +97,7 @@ defmodule Tightbeam.Rules do
                  "on_rule_denied",
                  "params"
                ])
-  @binding_tokens ~w(assignment_id work_item_id holder_key holder_role holder_archetype caller_origin)
+  @binding_tokens ~w(assignment_id work_item_id holder_key holder_role holder_archetype caller_origin owner_main)
   @embedded_fields ~w(subject prompt display)
   @whole_fields ~w(target_role target_session reviews work_item name harness model effort context archetype host after at)
   @verdict_facts ~w(
@@ -281,11 +281,11 @@ defmodule Tightbeam.Rules do
     recurrence_suppression =
       validate_recurrence_suppression!(Map.get(rule, "recurrence_suppression"), fail)
 
-    if "remedy" in effects and is_nil(remedy),
-      do: fail.("effect remedy requires [rule.remedy]")
+    if Enum.any?(effects, &(&1 in ~w(remedy notice))) and is_nil(remedy),
+      do: fail.("effect remedy or notice requires [rule.remedy]")
 
-    if remedy && "remedy" not in effects,
-      do: fail.("[rule.remedy] requires a remedy effect")
+    if remedy && not Enum.any?(effects, &(&1 in ~w(remedy notice))),
+      do: fail.("[rule.remedy] requires a remedy or notice effect")
 
     if recurrence_suppression && is_nil(remedy),
       do: fail.("[rule.recurrence_suppression] requires a remedy effect and [rule.remedy]")
@@ -431,8 +431,8 @@ defmodule Tightbeam.Rules do
   end
 
   defp validate_effect!(effect, check, explicit?, fail) do
-    unless effect in ~w(deny remedy escalate),
-      do: fail.("effect must be one of deny, remedy, escalate")
+    unless effect in ~w(deny remedy escalate notice),
+      do: fail.("effect must be one of deny, remedy, escalate, notice")
 
     if check && explicit?,
       do: fail.("effect is valid only on predicate-only statutes")
@@ -557,8 +557,18 @@ defmodule Tightbeam.Rules do
 
     requirements = verdict_requirements(conditions)
     produces = Map.get(remedy, "produces")
+    notice? = effects == ["notice"]
 
     cond do
+      notice? and action != "wake" ->
+        fail.("notice effect requires remedy action wake")
+
+      notice? and not is_nil(produces) ->
+        fail.("notice effect must omit produces")
+
+      notice? ->
+        :ok
+
       check && not is_nil(produces) ->
         fail.("script-effect remedy must omit produces")
 
@@ -586,7 +596,8 @@ defmodule Tightbeam.Rules do
       fail.("linked-review-fact remedy requires reviews = \"{assignment_id}\"")
     end
 
-    if "remedy" not in effects, do: fail.("[rule.remedy] requires a remedy effect")
+    if not Enum.any?(effects, &(&1 in ~w(remedy notice))),
+      do: fail.("[rule.remedy] requires a remedy or notice effect")
 
     %{
       action: action,
@@ -955,6 +966,21 @@ defmodule Tightbeam.Rules do
     {{:remedy, rule, gated_ref(call), error}, Enum.reverse(to_close), Enum.reverse(to_consume)}
   end
 
+  # A notice is a rail side effect, never a gate. The actor owns the durable
+  # record and wake through the same hand-off list that already owns episode
+  # closure. The rule fold continues, so later statutes and the handler retain
+  # their ordinary behavior.
+  defp fold_effect("notice", rule, rest, db, call, cache, to_close, to_consume, _exit_class) do
+    subject = notice_ref(db, call)
+
+    to_close =
+      if is_binary(subject),
+        do: [{:notice, rule, subject, call} | to_close],
+        else: to_close
+
+    decide_rules(rest, db, call, cache, to_close, to_consume)
+  end
+
   defp fold_effect("escalate", rule, rest, db, call, cache, to_close, to_consume, exit_class) do
     ctx = %{
       question: rule.text,
@@ -1033,7 +1059,7 @@ defmodule Tightbeam.Rules do
   defp recovery(rule, position, to_close), do: [{:episodes, rule.name, position} | to_close]
 
   defp maybe_close(rule, db, call, to_close) do
-    subject = gated_ref(call)
+    subject = if rule.effect == "notice", do: notice_ref(db, call), else: gated_ref(call)
 
     if not is_nil(rule.remedy) and is_binary(subject) do
       case RailRemedy.live?(db, rule.name, subject) do
@@ -1042,6 +1068,27 @@ defmodule Tightbeam.Rules do
       end
     else
       to_close
+    end
+  end
+
+  # Review verdicts arrive on one review card per round, but their crossing is
+  # about the reviewed assignment. Keying the episode to that stable subject
+  # prevents one notice per review card while preserving the ordinary gated
+  # reference for every other notice-bearing verb.
+  defp notice_ref(db, call) do
+    case gated_ref(call) do
+      ref when is_binary(ref) ->
+        case DB.query(
+               db,
+               "SELECT COALESCE(reviewsAssignmentId, id) FROM assignments WHERE id = ?1",
+               [ref]
+             ) do
+          {:ok, [[subject]]} when is_binary(subject) -> subject
+          _ -> ref
+        end
+
+      ref ->
+        ref
     end
   end
 

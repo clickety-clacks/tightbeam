@@ -172,6 +172,37 @@ defmodule Tightbeam.RulesTest do
     assert error.message =~ "same-table"
   end
 
+  test "notice is a predicate-only wake effect with a named target", ctx do
+    valid =
+      """
+      [[rule]]
+      name = "doorbell"
+      verb = "post"
+      text = "look at this"
+      effect = "notice"
+      deny_when = [{ fact = "caller.origin_class", op = "eq", value = "user" }]
+
+      [rule.remedy]
+      action = "wake"
+      target_session = "work"
+
+      [rule.remedy.params]
+      prompt = "look"
+      """
+
+    put_raw(ctx, valid)
+    assert [%{effect: "notice", remedy: %{action: "wake"}}] = Rules.load!(ctx.base_dir, ["post"])
+
+    for {contents, reason} <- [
+          {String.replace(valid, "\n[rule.remedy]\n", "\n[rule.remedy-disabled]\n"),
+           "unknown keys"}
+        ] do
+      put_raw(ctx, contents)
+      error = assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, ["post"]) end
+      assert error.message =~ reason
+    end
+  end
+
   test "scalar and ordered operators cover positive negative and boundaries", ctx do
     scalar_cases = [
       {"eq", "user", true},
