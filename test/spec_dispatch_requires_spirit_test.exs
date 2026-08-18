@@ -6,6 +6,7 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
     Archetypes,
     DB,
     Dispatch,
+    EventLog,
     Gateway,
     Identity,
     Roles,
@@ -175,8 +176,7 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
 
   # The round counter, proven through the ENGINE rather than by reading the
   # function: a synthetic org statute denies past 2 rounds; two verdicts pass,
-  # the third is refused. This is the fact the (staged) review-rounds doorbell
-  # will read the day the grammar grows a non-blocking effect.
+  # the third is refused.
   test "assignment.review_verdict_count counts rounds through the rules engine", ctx do
     rules_dir = Path.join(ctx.base_dir, "identity/rules")
     File.mkdir_p!(rules_dir)
@@ -261,5 +261,95 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
       )
 
     assert {:error, %{rule: "round-cap-probe"}} = r3_result
+  end
+
+  test "review-rounds doorbell records and summons once without blocking attests", ctx do
+    item = work_item(ctx, nil)
+
+    {:ok, subject} =
+      Dispatch.dispatch(
+        ctx.db,
+        ctx.handlers,
+        dispatch_call(ctx.holder.session_key, item.id, "work under repeated review")
+      )
+
+    review_call = fn n ->
+      %{
+        verb: "assign",
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        session_key: ctx.owner.session_key,
+        target_role: nil,
+        role_fallback: false,
+        params: %{
+          subject: "doorbell round #{n}",
+          reviews_assignment_id: subject.id
+        }
+      }
+    end
+
+    for n <- 1..4 do
+      {:ok, review} = Dispatch.dispatch(ctx.db, ctx.handlers, review_call.(n))
+
+      assert {:ok, %{attest: %{verdictKind: "changes-requested"}}} =
+               Dispatch.dispatch(
+                 ctx.db,
+                 ctx.handlers,
+                 verdict_call(ctx.owner.session_key, review.id, "changes-requested")
+               )
+    end
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE origin = 'remedy:review-rounds-doorbell'"
+             )
+
+    {:ok, crossing} = Dispatch.dispatch(ctx.db, ctx.handlers, review_call.(5))
+
+    assert {:ok, %{attest: %{verdictKind: "changes-requested"}}} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               verdict_call(ctx.owner.session_key, crossing.id, "changes-requested")
+             )
+
+    assert {:ok, [[1, ^ctx.owner.session_key]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT COUNT(*), sessionKey
+               FROM wakes
+               WHERE origin = 'remedy:review-rounds-doorbell'
+               """
+             )
+
+    assert [%{kind: "rail_notice", subject: "review-rounds-doorbell", detail: detail}] =
+             ctx.db
+             |> EventLog.lifecycle_events()
+             |> Enum.filter(&(&1.kind == "rail_notice"))
+
+    assert %{"ref" => ref, "outcome" => "claimed-dispatched"} = JSON.decode!(detail)
+    assert ref == subject.id
+
+    {:ok, repeated} = Dispatch.dispatch(ctx.db, ctx.handlers, review_call.(6))
+
+    assert {:ok, %{attest: %{verdictKind: "changes-requested"}}} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               verdict_call(ctx.owner.session_key, repeated.id, "changes-requested")
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE origin = 'remedy:review-rounds-doorbell'"
+             )
+
+    assert 1 ==
+             ctx.db
+             |> EventLog.lifecycle_events()
+             |> Enum.count(&(&1.kind == "rail_notice"))
   end
 end

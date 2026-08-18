@@ -77,6 +77,7 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
              "refix-requires-diagnosis",
              "code-review-requires-passing-tests",
              "spec-dispatch-requires-spirit",
+             "review-rounds-doorbell",
              "completion-requires-verification",
              "completion-requires-results-artifact"
            ]

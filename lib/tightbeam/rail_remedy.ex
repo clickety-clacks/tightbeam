@@ -58,6 +58,26 @@ defmodule Tightbeam.RailRemedy do
     result
   end
 
+  @doc "Record and dispatch one non-blocking notice per live statute/subject crossing."
+  @spec notice(DB.server(), Dispatch.handlers(), map(), String.t(), map()) :: outcome()
+  def notice(db, handlers, rule, subject, call) do
+    call = put_in(call, [:params, :assignment_id], subject)
+
+    result =
+      with {:ok, context} <- binding_context(db, subject, call),
+           {:ok, resolved} <- resolve_remedy(rule.remedy, context),
+           {:ok, resolved} <- bind_target(db, "wake", resolved) do
+        route_notice_episode(db, handlers, rule, subject, call, context, resolved)
+      else
+        {:error, _unbound} -> %{outcome: "unbound", producer_id: nil}
+      end
+
+    if result.outcome != "notice-suppressed",
+      do: lifecycle(db, rule, subject, call, result, "rail_notice")
+
+    result
+  end
+
   @doc "Return the occurrence when one statute/subject episode is live."
   @spec live?(DB.server(), String.t(), String.t()) :: pos_integer() | nil
   def live?(db, statute, subject) do
@@ -109,6 +129,36 @@ defmodule Tightbeam.RailRemedy do
 
       :occupied ->
         occupied_episode(db, handlers, rule, subject, call, context, resolved)
+    end
+  end
+
+  # A notice stays live until the predicate stops matching. Rules.maybe_close/4
+  # then closes the episode, which rearms the next false-to-true crossing. A
+  # repeated matching attest observes the live row and does not send again.
+  defp route_notice_episode(db, handlers, rule, subject, call, context, resolved) do
+    case read_episode(db, rule.name, subject) do
+      %{status: "live", producer_key: producer_key} ->
+        %{outcome: "notice-suppressed", producer_id: producer_key}
+
+      row ->
+        case claim(db, rule, subject, context, row) do
+          {:claimed, token, occurrence, reopened?} ->
+            lease_and_dispatch(
+              db,
+              handlers,
+              rule,
+              subject,
+              call,
+              context,
+              resolved,
+              token,
+              occurrence,
+              reopened?
+            )
+
+          :occupied ->
+            %{outcome: "notice-suppressed", producer_id: Map.get(row || %{}, :producer_key)}
+        end
     end
   end
 
@@ -616,7 +666,8 @@ defmodule Tightbeam.RailRemedy do
            holder_role: holder_role,
            holder_archetype: archetype,
            caller_origin: call.origin,
-           owner: owner
+           owner: owner,
+           owner_main: Org.personal_session_key(owner)
          }}
 
       _ ->
@@ -660,7 +711,7 @@ defmodule Tightbeam.RailRemedy do
     bindings =
       Map.take(
         context,
-        ~w(assignment_id work_item_id holder_key holder_role holder_archetype caller_origin)a
+        ~w(assignment_id work_item_id holder_key holder_role holder_archetype caller_origin owner_main)a
       )
 
     with {:ok, target} <- resolve_map(remedy.target, bindings),
@@ -764,7 +815,7 @@ defmodule Tightbeam.RailRemedy do
     end
   end
 
-  defp lifecycle(db, rule, subject, call, result) do
+  defp lifecycle(db, rule, subject, call, result, kind \\ "rail_remedy") do
     detail =
       JSON.encode!(%{
         edge: if(Map.get(call, :edge, :verb) == :turn_end, do: "turn-end", else: "verb"),
@@ -776,7 +827,7 @@ defmodule Tightbeam.RailRemedy do
       })
 
     try do
-      EventLog.lifecycle(db, "rail_remedy", rule.name, detail)
+      EventLog.lifecycle(db, kind, rule.name, detail)
     rescue
       _reason -> :ok
     catch
