@@ -362,12 +362,18 @@ defmodule Tightbeam.CustodyCeremonyF6Test do
 
   test "restart before and after the deadline keeps an artifact-free broker exit honest", ctx do
     exec_log = Path.join(ctx.root, "prebind-no-artifact-exec.log")
-    File.write!(ctx.prebind_mode, "before-artifact")
+    File.write!(ctx.prebind_mode, "crash-before-artifact")
+    {broker, broker_pid} = start_onboard(ctx, exec_log)
 
-    {output, status} = onboard(ctx, exec_log)
-    assert status != 0, "the broker unexpectedly survived the pre-artifact refusal: #{output}"
+    assert_receive {:custody_open_waiting, process_id, open_handler}, 30_000
+    assert ManagedProcesses.get(ctx.db, process_id).state == "preparing"
+    refute File.exists?(identity_path(ctx, process_id))
 
-    assert_receive {:custody, "process-open", process_id}, 30_000
+    kill_broker(broker_pid)
+    send(open_handler, :broker_killed)
+    {output, status} = await_broker(broker)
+
+    assert status != 0, "the broker survived SIGKILL before artifact creation: #{output}"
     refute File.exists?(exec_log), "the workload ran before identity binding"
     refute File.exists?(identity_path(ctx, process_id))
 
@@ -422,16 +428,21 @@ defmodule Tightbeam.CustodyCeremonyF6Test do
   test "restart proves absence after the real broker exits between artifact and identity commit",
        ctx do
     exec_log = Path.join(ctx.root, "prebind-artifact-exit-exec.log")
-    File.write!(ctx.prebind_mode, "after-artifact")
-
-    {output, status} = onboard(ctx, exec_log)
-    assert status != 0, "the broker unexpectedly committed identity: #{output}"
+    File.write!(ctx.prebind_mode, "crash-after-artifact")
+    {broker, broker_pid} = start_onboard(ctx, exec_log)
 
     assert_receive {:custody, "process-open", process_id}, 30_000
-    assert_receive {:custody, "process-bind", ^process_id}, 30_000
+    assert_receive {:custody_bind_waiting, ^process_id, bind_handler}, 30_000
     refute File.exists?(exec_log), "the workload ran after the bind request failed"
     assert File.exists?(identity_path(ctx, process_id))
     assert ManagedProcesses.get(ctx.db, process_id).state == "preparing"
+
+    kill_broker(broker_pid)
+    send(bind_handler, :broker_killed)
+    {output, status} = await_broker(broker)
+
+    assert status != 0, "the broker survived SIGKILL after artifact creation: #{output}"
+    refute File.exists?(exec_log), "the pre-exec workload ran after its broker was killed"
 
     assert %{reconciled: 1} = Gateway.recover_process_custody(ctx.gateway_config)
     settled = ManagedProcesses.get(ctx.db, process_id)
@@ -464,6 +475,68 @@ defmodule Tightbeam.CustodyCeremonyF6Test do
           {"TB_F6_RELEASE_STAMP", ctx.release_stamp}
         ])
     )
+  end
+
+  defp start_onboard(ctx, exec_log) do
+    env =
+      closed_env([
+        {"TIGHTBEAM_BASE_DIR", ctx.root},
+        {"TIGHTBEAM_MACHINE", ctx.machine},
+        {"PATH", Path.join(ctx.root, "harness-bin") <> ":/usr/bin:/bin"},
+        {"HOME", ctx.home},
+        {"TMPDIR", ctx.tmpdir},
+        {"TB_F6_EXEC_LOG", exec_log},
+        {"TB_F6_HOLD_FILE", ctx.hold_flag},
+        {"TB_F6_ENV_LOG", ctx.env_log},
+        {"TB_F6_RELEASE_STAMP", ctx.release_stamp}
+      ])
+      |> Enum.map(fn
+        {name, nil} -> {String.to_charlist(name), false}
+        {name, value} -> {String.to_charlist(name), String.to_charlist(value)}
+      end)
+
+    broker =
+      Port.open(
+        {:spawn_executable, String.to_charlist(ctx.binary)},
+        [
+          :binary,
+          :exit_status,
+          :stderr_to_stdout,
+          {:args, ["onboard", "openai"]},
+          {:cd, ctx.workdir},
+          {:env, env}
+        ]
+      )
+
+    {:os_pid, broker_pid} = Port.info(broker, :os_pid)
+
+    on_exit(fn ->
+      if Port.info(broker) != nil do
+        _ = System.cmd("/bin/kill", ["-KILL", Integer.to_string(broker_pid)])
+      end
+    end)
+
+    {broker, broker_pid}
+  end
+
+  defp await_broker(broker, output \\ []) do
+    receive do
+      {^broker, {:data, data}} ->
+        await_broker(broker, [data | output])
+
+      {^broker, {:exit_status, status}} ->
+        {output |> Enum.reverse() |> IO.iodata_to_binary(), status}
+    after
+      30_000 ->
+        raise "timed out waiting for the killed broker to exit"
+    end
+  end
+
+  defp kill_broker(broker_pid) do
+    case System.cmd("/bin/kill", ["-KILL", Integer.to_string(broker_pid)]) do
+      {_output, 0} -> :ok
+      {output, status} -> raise "could not kill broker #{broker_pid}: #{status}: #{output}"
+    end
   end
 
   defp process_reconcile(ctx, process_id) do
@@ -550,10 +623,10 @@ defmodule Tightbeam.CustodyCeremonyF6Test do
            "the workload was handed credential-shaped variables #{inspect(secretish)}"
   end
 
-  # The two custody verbs are wrapped, not replaced: the real handler decides,
-  # and the wrapper only observes it and — for the denied case — commits a
-  # legitimate stop through the ordinary verb at the one moment that makes the
-  # denial deterministic.
+  # The two custody verbs are wrapped, not replaced. Most cases only observe
+  # the real handler. The crash fixtures hold an HTTP request open at a
+  # deterministic broker boundary so the test can kill the exact release-CLI
+  # PID before allowing the abandoned request process to finish.
   defp instrument(handlers, db, test_pid, deny_flag, prebind_mode, release_stamp) do
     Map.new(handlers, fn
       {"process-open" = verb, handler} ->
@@ -562,12 +635,20 @@ defmodule Tightbeam.CustodyCeremonyF6Test do
            result = handler.(call)
            id = process_id(result)
            if id && File.exists?(deny_flag), do: stop_row(db, id)
-           send(test_pid, {:custody, verb, id})
 
-           if prebind_mode(prebind_mode) == "before-artifact" do
-             %{code: "server_error", message: "fixture stopped the broker before spawn"}
-           else
-             result
+           case prebind_mode(prebind_mode) do
+             "crash-before-artifact" ->
+               send(test_pid, {:custody_open_waiting, id, self()})
+
+               receive do
+                 :broker_killed -> result
+               after
+                 30_000 -> raise "fixture timed out waiting for the pre-artifact broker kill"
+               end
+
+             _ ->
+               send(test_pid, {:custody, verb, id})
+               result
            end
          end}
 
@@ -577,13 +658,18 @@ defmodule Tightbeam.CustodyCeremonyF6Test do
            id = call.params[:process_id]
 
            case prebind_mode(prebind_mode) do
-             "after-artifact" ->
-               send(test_pid, {:custody, verb, id})
+             "crash-after-artifact" ->
+               send(test_pid, {:custody_bind_waiting, id, self()})
 
-               %{
-                 code: "server_error",
-                 message: "fixture stopped the broker before identity commit"
-               }
+               receive do
+                 :broker_killed ->
+                   %{
+                     code: "server_error",
+                     message: "fixture cleaned up the abandoned process-bind request"
+                   }
+               after
+                 30_000 -> raise "fixture timed out waiting for the post-artifact broker kill"
+               end
 
              "pause-before-commit" ->
                send(test_pid, {:custody_bind_waiting, id, self()})
