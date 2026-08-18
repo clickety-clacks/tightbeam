@@ -4,7 +4,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, ExitStatus, Stdio};
 use std::thread;
@@ -139,6 +139,24 @@ pub(crate) fn fixture_custody_answer(
             "release": release,
             "releaseRevision": 2
         })))),
+        "process-outcome" => {
+            let state = match request
+                .pointer("/params/outcome")
+                .and_then(serde_json::Value::as_str)
+            {
+                Some("launch_failed") => "launch_failed",
+                Some("exited") => "exited",
+                _ => {
+                    return Some(Err(
+                        "fixture received an unsupported custody outcome".to_owned()
+                    ));
+                }
+            };
+            Some(Ok(Some(serde_json::json!({
+                "process": {"processId": process_id, "state": state},
+                "accepted": true
+            }))))
+        }
         _ => None,
     }
 }
@@ -595,7 +613,7 @@ impl Custody<'_> {
 
         let released = (self.bind)(pid, pgid).map_err(RunError::Failed)?;
         if !released {
-            return Err(RunError::Failed(format!(
+            return Err(RunError::CustodyDenied(format!(
                 "custody refused to release pid {pid}: the durable record did not accept \
                  this identity, so the workload was not started"
             )));
@@ -1097,8 +1115,24 @@ fn run_custodied(
 ) -> Result<ExitStatus, StageFailure> {
     let (process_id, launch_token) = open_custody(ceremony, CUSTODY_PURPOSE)?;
 
-    let mut barrier = LaunchBarrier::new()
-        .map_err(|error| StageFailure::from(format!("launch barrier unavailable: {error}")))?;
+    let mut barrier = match LaunchBarrier::new() {
+        Ok(barrier) => barrier,
+        Err(error) => {
+            let reason = format!("launch barrier unavailable: {error}");
+            record_launch_failed(
+                ceremony,
+                &process_id,
+                &launch_token,
+                "launch_barrier_unavailable",
+            )
+            .map_err(|outcome_error| {
+                StageFailure::from(format!(
+                    "{reason}; durable launch outcome was not recorded: {outcome_error}"
+                ))
+            })?;
+            return Err(StageFailure::from(reason));
+        }
+    };
     let bind = |pid, pgid| bind_custody(ceremony, &process_id, &launch_token, pid, pgid);
 
     let outcome = run_bounded_inner(
@@ -1112,7 +1146,107 @@ fn run_custodied(
         }),
     );
     drop(barrier);
-    outcome.map_err(StageFailure::from)
+    match outcome {
+        Ok(status) => {
+            record_natural_exit(ceremony, &process_id, &launch_token, status)?;
+            Ok(status)
+        }
+        Err(error) if error.is_spawn_failed() => {
+            let reason = error.to_string();
+            record_launch_failed(ceremony, &process_id, &launch_token, "spawn_failed").map_err(
+                |outcome_error| {
+                    StageFailure::from(format!(
+                        "{reason}; durable launch outcome was not recorded: {outcome_error}"
+                    ))
+                },
+            )?;
+            Err(StageFailure::from(error))
+        }
+        Err(error) if error.is_custody_denied() => {
+            let reason = error.to_string();
+            record_denied_bind_stopped(ceremony, &process_id, &launch_token).map_err(
+                |outcome_error| {
+                    StageFailure::from(format!(
+                        "{reason}; durable denied-bind outcome was not recorded: {outcome_error}"
+                    ))
+                },
+            )?;
+            Err(StageFailure::from(error))
+        }
+        Err(error) => Err(StageFailure::from(error)),
+    }
+}
+
+fn record_launch_failed(
+    ceremony: &Ceremony<'_>,
+    process_id: &str,
+    launch_token: &str,
+    error_kind: &str,
+) -> Result<(), String> {
+    let request = dispatch::build_process_launch_failed_request(
+        ceremony.identity,
+        process_id,
+        launch_token,
+        error_kind,
+    );
+    require_custody_outcome(ceremony, &request, &["launch_failed", "launch_canceled"])
+}
+
+fn record_natural_exit(
+    ceremony: &Ceremony<'_>,
+    process_id: &str,
+    launch_token: &str,
+    status: ExitStatus,
+) -> Result<(), StageFailure> {
+    let (exit_code, exit_signal) = match (status.code(), status.signal()) {
+        (Some(code), None) => (Some(code), None),
+        (None, Some(signal)) => (None, Some(signal)),
+        _ => {
+            return Err(StageFailure::from(
+                "the ceremony exited without a reportable exit code or signal".to_owned(),
+            ));
+        }
+    };
+    let request = dispatch::build_process_exited_request(
+        ceremony.identity,
+        process_id,
+        launch_token,
+        exit_code,
+        exit_signal,
+    );
+    require_custody_outcome(ceremony, &request, &["exited"]).map_err(StageFailure::from)
+}
+
+fn record_denied_bind_stopped(
+    ceremony: &Ceremony<'_>,
+    process_id: &str,
+    launch_token: &str,
+) -> Result<(), String> {
+    let request = dispatch::build_process_denied_bind_stopped_request(
+        ceremony.identity,
+        process_id,
+        launch_token,
+    );
+    require_custody_outcome(ceremony, &request, &["exited"])
+}
+
+fn require_custody_outcome(
+    ceremony: &Ceremony<'_>,
+    request: &RequestSpec,
+    accepted_states: &[&str],
+) -> Result<(), String> {
+    let answer = (ceremony.send_request)(ceremony.endpoint, request, None)?
+        .ok_or_else(|| "process-outcome returned no durable row".to_owned())?;
+    let state = json_string(&answer, "process", "state");
+    if answer.get("accepted").and_then(serde_json::Value::as_bool) == Some(true)
+        && state
+            .as_deref()
+            .is_some_and(|state| accepted_states.contains(&state))
+    {
+        Ok(())
+    } else {
+        Err("process-outcome did not confirm the expected durable terminal state".to_owned())
+    }
 }
 
 /// There is NO uncustodied path out of here (owner ruling att_538f0b6f). An earlier

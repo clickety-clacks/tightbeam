@@ -1012,6 +1012,75 @@ pub fn build_process_bind_request(
     )
 }
 
+/// Record a launch that failed before any child identity could be bound.
+///
+/// The launch token authenticates the broker that opened the row. `error_kind`
+/// is a closed, sanitized label; the operating-system error remains in the
+/// caller's immediate error and never enters the durable row as free-form text.
+pub fn build_process_launch_failed_request(
+    identity: &Identity,
+    process_id: &str,
+    launch_token: &str,
+    error_kind: &str,
+) -> RequestSpec {
+    request(
+        identity,
+        "process-outcome",
+        vec![],
+        vec![
+            string_field("processId", process_id),
+            string_field("launchToken", launch_token),
+            string_field("outcome", "launch_failed"),
+            string_field("errorKind", error_kind),
+        ],
+    )
+}
+
+/// Record the wait result of a child whose workload was released.
+///
+/// Exactly one of exit code or signal is sent. Both are sanitized kernel facts;
+/// no stdout, stderr, argument, environment, or credential bytes cross here.
+pub fn build_process_exited_request(
+    identity: &Identity,
+    process_id: &str,
+    launch_token: &str,
+    exit_code: Option<i32>,
+    exit_signal: Option<i32>,
+) -> RequestSpec {
+    let mut params = vec![
+        string_field("processId", process_id),
+        string_field("launchToken", launch_token),
+        string_field("outcome", "exited"),
+    ];
+    if let Some(code) = exit_code {
+        params.push(format!("\"exitCode\":{code}"));
+    }
+    if let Some(signal) = exit_signal {
+        params.push(format!("\"exitSignal\":{signal}"));
+    }
+    request(identity, "process-outcome", vec![], params)
+}
+
+/// Record that a denied bind was handed to the broker's supervised stop
+/// funnel and the child was reaped without releasing the workload.
+pub fn build_process_denied_bind_stopped_request(
+    identity: &Identity,
+    process_id: &str,
+    launch_token: &str,
+) -> RequestSpec {
+    request(
+        identity,
+        "process-outcome",
+        vec![],
+        vec![
+            string_field("processId", process_id),
+            string_field("launchToken", launch_token),
+            string_field("outcome", "exited"),
+            string_field("stopResult", "denied_bind_reaped"),
+        ],
+    )
+}
+
 pub fn build_onboard_phase_request(
     identity: &Identity,
     provider: &str,
@@ -2585,6 +2654,25 @@ mod tests {
             r#"{"asUser":"flynn","verb":"onboard","params":{"provider":"anthropic","phase":"finish","kind":"apiKey","machine":"work-1","leaseId":"lease-7"}}"#
         );
         assert!(!keyed.body_json.contains("sk-"));
+    }
+
+    #[test]
+    fn custody_outcomes_carry_only_token_authenticated_sanitized_facts() {
+        let identity = Identity::User("flynn".to_owned());
+
+        assert_eq!(
+            build_process_launch_failed_request(&identity, "mp_1", "tok_1", "spawn_failed")
+                .body_json,
+            r#"{"asUser":"flynn","verb":"process-outcome","params":{"processId":"mp_1","launchToken":"tok_1","outcome":"launch_failed","errorKind":"spawn_failed"}}"#
+        );
+        assert_eq!(
+            build_process_exited_request(&identity, "mp_1", "tok_1", Some(17), None).body_json,
+            r#"{"asUser":"flynn","verb":"process-outcome","params":{"processId":"mp_1","launchToken":"tok_1","outcome":"exited","exitCode":17}}"#
+        );
+        assert_eq!(
+            build_process_denied_bind_stopped_request(&identity, "mp_1", "tok_1").body_json,
+            r#"{"asUser":"flynn","verb":"process-outcome","params":{"processId":"mp_1","launchToken":"tok_1","outcome":"exited","stopResult":"denied_bind_reaped"}}"#
+        );
     }
 
     #[test]

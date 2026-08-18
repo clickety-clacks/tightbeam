@@ -488,6 +488,8 @@ impl Drop for NonblockingFd {
 #[derive(Debug)]
 pub(crate) enum RunError {
     Failed(String),
+    SpawnFailed(String),
+    CustodyDenied(String),
     Interrupted {
         signal: libc::c_int,
         message: String,
@@ -507,6 +509,12 @@ impl RunError {
             Self::Failed(message) => {
                 Self::Failed(format!("{message}; cleanup also failed: {cleanup}"))
             }
+            Self::SpawnFailed(message) => {
+                Self::SpawnFailed(format!("{message}; cleanup also failed: {cleanup}"))
+            }
+            Self::CustodyDenied(message) => {
+                Self::Failed(format!("{message}; cleanup also failed: {cleanup}"))
+            }
             Self::Interrupted { signal, message } => Self::Interrupted {
                 signal,
                 message: format!("{message}; cleanup also failed: {cleanup}"),
@@ -516,6 +524,14 @@ impl RunError {
 
     pub(crate) fn is_interrupted(&self) -> bool {
         matches!(self, Self::Interrupted { .. })
+    }
+
+    pub(crate) fn is_spawn_failed(&self) -> bool {
+        matches!(self, Self::SpawnFailed(_))
+    }
+
+    pub(crate) fn is_custody_denied(&self) -> bool {
+        matches!(self, Self::CustodyDenied(_))
     }
 }
 
@@ -528,9 +544,10 @@ impl From<String> for RunError {
 impl std::fmt::Display for RunError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Failed(message) | Self::Interrupted { message, .. } => {
-                formatter.write_str(message)
-            }
+            Self::Failed(message)
+            | Self::SpawnFailed(message)
+            | Self::CustodyDenied(message)
+            | Self::Interrupted { message, .. } => formatter.write_str(message),
         }
     }
 }
@@ -569,7 +586,9 @@ pub(crate) fn supervise<T>(
 
     let forwarding = SignalForwarding::install().map_err(|error| error.to_string())?;
     reset_sigchld_before_spawn();
-    let child = command.spawn().map_err(|error| error.to_string())?;
+    let child = command
+        .spawn()
+        .map_err(|error| RunError::SpawnFailed(error.to_string()))?;
     // The parent's copies of whatever stdio the caller configured close here, before the
     // driver waits for the child's end of them to report EOF.
     drop(command);

@@ -627,6 +627,85 @@ defmodule Tightbeam.ManagedProcessesTest do
     assert current.osPid == nil
   end
 
+  ## Launch-broker outcomes (§B5, acceptance 2/3)
+
+  defp broker_outcome(db, process_id, outcome, detail, now \\ 4_000) do
+    tx!(db, fn txn ->
+      ManagedProcesses.record_broker_outcome_in_txn(txn, process_id, outcome,
+        now: now,
+        detail: detail
+      )
+    end)
+  end
+
+  test "a spawn failure terminalizes preparing once with a typed error", ctx do
+    row = preparing(ctx.db)
+
+    assert {:ok, failed} =
+             broker_outcome(ctx.db, row.processId, :launch_failed, "spawn_failed")
+
+    assert failed.state == "launch_failed"
+    assert failed.lastError == "spawn_failed"
+    assert failed.resolvedAt == 4_000
+    refute ManagedProcesses.blocks_retirement?(failed)
+
+    assert {:ok, replayed} =
+             broker_outcome(ctx.db, row.processId, :launch_failed, "spawn_failed", 9_000)
+
+    assert replayed.revision == failed.revision
+    assert replayed.resolvedAt == failed.resolvedAt
+  end
+
+  test "a spawn failure that loses to cancellation preserves the cause", ctx do
+    row = preparing(ctx.db)
+
+    assert {:ok, requested} = request_stop(ctx.db, row.processId, 2_000)
+    assert requested.state == "launch_cancel_requested"
+
+    assert {:ok, canceled} =
+             broker_outcome(ctx.db, row.processId, :launch_failed, "spawn_failed")
+
+    assert canceled.state == "launch_canceled"
+    assert canceled.stopCause == "owner_stop"
+    assert canceled.lastError == "spawn_failed"
+    assert canceled.resolvedAt == 4_000
+  end
+
+  test "a natural exit wins from running or stop_requested and is idempotent", ctx do
+    for stop_first? <- [false, true] do
+      row = preparing(ctx.db)
+      assert {:running, bound} = bind(ctx.db, row.processId)
+
+      if stop_first? do
+        assert {:ok, stopping} = request_stop(ctx.db, row.processId, 3_500)
+        assert stopping.state == "stop_requested"
+      end
+
+      assert {:ok, exited} =
+               broker_outcome(ctx.db, bound.processId, :exited, "exit_code:0")
+
+      assert exited.state == "exited"
+      assert exited.lastError == "exit_code:0"
+      assert exited.resolvedAt == 4_000
+
+      assert {:ok, replayed} =
+               broker_outcome(ctx.db, bound.processId, :exited, "exit_code:0", 9_000)
+
+      assert replayed.revision == exited.revision
+      assert replayed.resolvedAt == exited.resolvedAt
+    end
+  end
+
+  test "a natural-exit report cannot skip identity binding", ctx do
+    row = preparing(ctx.db)
+
+    assert {:lost, current} =
+             broker_outcome(ctx.db, row.processId, :exited, "exit_code:0")
+
+    assert current.state == "preparing"
+    assert current.revision == row.revision
+  end
+
   test "the captured generation is the fence generation at insert", ctx do
     assert tx!(ctx.db, &ManagedProcesses.current_generation_in_txn(&1, "agent:fresh")) == 0
 

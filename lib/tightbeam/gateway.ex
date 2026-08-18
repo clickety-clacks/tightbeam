@@ -924,6 +924,7 @@ defmodule Tightbeam.Gateway do
       # never supply a command (§B4, acceptance 18).
       "process-open" => fn call -> process_open_result(db, call) end,
       "process-bind" => custody_handler(db, &process_bind_result/2),
+      "process-outcome" => custody_handler(db, &process_outcome_result/2),
       "processes" => fn call -> processes_result(db, call) end,
       "process-get" => custody_handler(db, &process_get_result/2),
       "process-extend" => custody_handler(db, &process_extend_result/2),
@@ -7001,7 +7002,9 @@ defmodule Tightbeam.Gateway do
 
         {:ok, {:stop, row}} ->
           # Identity is bound so the stop worker can signal the right group, but
-          # the barrier stays shut and no release revision is issued.
+          # the barrier stays shut and no release revision is issued. That false
+          # grant hands the child to the launch broker's supervised stop funnel;
+          # after it reaps the child, the broker records the terminal outcome.
           %{process: Payloads.managed_process(row), release: false, stopCause: row.stopCause}
 
         {:ok, {:unproven, row}} ->
@@ -7026,6 +7029,78 @@ defmodule Tightbeam.Gateway do
         }
     end
   end
+
+  # The launch broker owns two terminal facts that no sweeper should have to
+  # infer: spawn itself failed before identity binding, or the released child
+  # exited and was reaped. The launch token authenticates that broker, while the
+  # closed detail shapes keep command, output, environment, and credential bytes
+  # out of the row (§B2, §B5).
+  defp process_outcome_result(db, call) do
+    p = call.params
+
+    with {:ok, id} <- required_process_id(call),
+         %{launchToken: token} <- ManagedProcesses.get(db, id),
+         true <- is_binary(p[:launch_token]) and p.launch_token == token,
+         {:ok, outcome, detail} <- broker_outcome(p) do
+      now = System.system_time(:millisecond)
+
+      case DB.transaction(db, fn txn ->
+             case ManagedProcesses.record_broker_outcome_in_txn(txn, id, outcome,
+                    now: now,
+                    detail: detail
+                  ) do
+               {:ok, row} -> {:ok, finalize_owner_retirement(txn, row, now)}
+               other -> other
+             end
+           end) do
+        {:ok, {:ok, row}} ->
+          %{process: Payloads.managed_process(row), accepted: true}
+
+        {:ok, {:lost, row}} ->
+          %{process: Payloads.managed_process(row), accepted: false}
+
+        {:ok, {:error, :unknown_process}} ->
+          %{code: "not_found", message: "unknown processId: #{id}"}
+
+        {:error, error} ->
+          %{code: "server_error", message: error_map_text(error)}
+      end
+    else
+      nil ->
+        %{code: "not_found", message: "unknown processId"}
+
+      false ->
+        %{code: "launch_unproven", message: "the launch token does not match this row"}
+
+      :error ->
+        %{
+          code: "invalid_message",
+          message:
+            "process-outcome requires a supported outcome and one sanitized error or exit fact"
+        }
+
+      error ->
+        error
+    end
+  end
+
+  defp broker_outcome(%{outcome: "launch_failed", error_kind: kind})
+       when kind in ["spawn_failed", "launch_barrier_unavailable"],
+       do: {:ok, :launch_failed, kind}
+
+  defp broker_outcome(%{outcome: "exited", exit_code: code} = params)
+       when is_integer(code) and code >= 0 and not is_map_key(params, :exit_signal),
+       do: {:ok, :exited, "exit_code:#{code}"}
+
+  defp broker_outcome(%{outcome: "exited", exit_signal: signal} = params)
+       when is_integer(signal) and signal > 0 and not is_map_key(params, :exit_code),
+       do: {:ok, :exited, "exit_signal:#{signal}"}
+
+  defp broker_outcome(%{outcome: "exited", stop_result: "denied_bind_reaped"} = params)
+       when not is_map_key(params, :exit_code) and not is_map_key(params, :exit_signal),
+       do: {:ok, :exited, "denied_bind_reaped"}
+
+  defp broker_outcome(_params), do: :error
 
   defp processes_result(db, call) do
     session_key = call.session_key || caller_session(call)

@@ -817,6 +817,60 @@ defmodule Tightbeam.ManagedProcesses do
   end
 
   @doc """
+  Record the launch broker's own terminal observation (§B5, §B7.2-3).
+
+  A failed spawn resolves the exact pre-bind revision: `preparing` becomes
+  `launch_failed`, while a stop that won first keeps its cause and becomes
+  `launch_canceled`. A natural child exit resolves either `running` or
+  `stop_requested` as `exited`; that is the natural-exit-versus-stop race in
+  the closed table, and a later stop worker therefore loses without signalling
+  again.
+
+  Replaying the same terminal outcome is idempotent. Any different winner is
+  returned as `{:lost, row}` and is never overwritten.
+  """
+  @spec record_broker_outcome_in_txn(Txn.t(), String.t(), atom(), keyword()) ::
+          {:ok, map()} | {:lost, map() | nil} | {:error, :unknown_process}
+  def record_broker_outcome_in_txn(txn, process_id, outcome, opts) do
+    now = Keyword.fetch!(opts, :now)
+    detail = Keyword.fetch!(opts, :detail)
+
+    case get_in_txn(txn, process_id) do
+      nil ->
+        {:error, :unknown_process}
+
+      %{state: state} = row
+      when outcome == :launch_failed and state in ["launch_failed", "launch_canceled"] ->
+        {:ok, row}
+
+      %{state: "exited"} = row when outcome == :exited ->
+        {:ok, row}
+
+      %{state: state} = row
+      when outcome == :launch_failed and state in ["preparing", "launch_cancel_requested"] ->
+        target = if state == "preparing", do: "launch_failed", else: "launch_canceled"
+
+        transition(txn, process_id, [state: state, revision: row.revision], %{
+          state: target,
+          last_error: detail,
+          resolved_at: now,
+          now: now
+        })
+
+      %{state: state} = row when outcome == :exited and state in ["running", "stop_requested"] ->
+        transition(txn, process_id, [state: state, revision: row.revision], %{
+          state: "exited",
+          last_error: detail,
+          resolved_at: now,
+          now: now
+        })
+
+      row ->
+        {:lost, row}
+    end
+  end
+
+  @doc """
   `process-reconcile` (§B4): the repeatable repair for every unresolved launch
   and stop state, and the verb every blocked answer is required to name.
 

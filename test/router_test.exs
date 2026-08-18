@@ -2229,6 +2229,92 @@ defmodule Tightbeam.Wire.RouterTest do
     assert result["process"]["osPid"] == 4242
   end
 
+  test "the broker records spawn failure durably and a gateway restart replay is idempotent",
+       ctx do
+    caller = create_session(ctx.db, "broker-spawn-failure", "flynn")
+    Roles.create!(ctx.db, "broker-spawn-failure", "flynn", caller.session_key)
+    ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, custody_handlers(ctx))}
+
+    opened = JSON.decode!(open_custody(ctx, caller.cli_token).resp_body)["result"]
+    id = opened["process"]["processId"]
+
+    request = %{
+      verb: "process-outcome",
+      params: %{
+        processId: id,
+        launchToken: opened["launchToken"],
+        outcome: "launch_failed",
+        errorKind: "spawn_failed"
+      }
+    }
+
+    first = JSON.decode!(dispatch_cli(ctx, caller.cli_token, request).resp_body)["result"]
+    assert first["accepted"] == true
+    assert first["process"]["state"] == "launch_failed"
+    assert first["process"]["lastError"] == "spawn_failed"
+    revision = first["process"]["revision"]
+
+    # Rebuild the real handler table to model the gateway process restarting
+    # after the commit but before the broker received its reply.
+    restarted = %{ctx | opts: Keyword.put(ctx.opts, :handlers, custody_handlers(ctx))}
+    replay = JSON.decode!(dispatch_cli(restarted, caller.cli_token, request).resp_body)["result"]
+    assert replay["accepted"] == true
+    assert replay["process"]["revision"] == revision
+  end
+
+  test "the broker records a sanitized natural exit and a forged token cannot do so", ctx do
+    caller = create_session(ctx.db, "broker-natural-exit", "flynn")
+    Roles.create!(ctx.db, "broker-natural-exit", "flynn", caller.session_key)
+    ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, custody_handlers(ctx))}
+
+    opened = JSON.decode!(open_custody(ctx, caller.cli_token).resp_body)["result"]
+    id = opened["process"]["processId"]
+
+    bind =
+      dispatch_cli(ctx, caller.cli_token, %{
+        verb: "process-bind",
+        params: %{
+          processId: id,
+          launchToken: opened["launchToken"],
+          osPid: 4242,
+          processGroupId: 4242,
+          bootIdentity: "boot-abc"
+        }
+      })
+
+    assert JSON.decode!(bind.resp_body)["result"]["release"] == true
+
+    forged =
+      dispatch_cli(ctx, caller.cli_token, %{
+        verb: "process-outcome",
+        params: %{
+          processId: id,
+          launchToken: "tok_forged",
+          outcome: "exited",
+          exitCode: 0
+        }
+      })
+
+    assert JSON.decode!(forged.resp_body)["error"]["code"] == "launch_unproven"
+    assert Tightbeam.ManagedProcesses.get(ctx.db, id).state == "running"
+
+    exited =
+      dispatch_cli(ctx, caller.cli_token, %{
+        verb: "process-outcome",
+        params: %{
+          processId: id,
+          launchToken: opened["launchToken"],
+          outcome: "exited",
+          exitCode: 0
+        }
+      })
+
+    result = JSON.decode!(exited.resp_body)["result"]
+    assert result["accepted"] == true
+    assert result["process"]["state"] == "exited"
+    assert result["process"]["lastError"] == "exit_code:0"
+  end
+
   # §B5 / F5: the token is what proves the child is ours. A bind without it
   # binds nothing and issues no release revision, so the barrier stays shut.
   test "a bind with the wrong token is refused and releases nothing", ctx do

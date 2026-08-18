@@ -11,8 +11,7 @@ defmodule Tightbeam.CustodyCeremonyF6Test do
   `ManagedProcesses` prove the decisions; only this proves that the pieces are
   wired to each other.
 
-  Two cases, because the handshake has exactly two outcomes and each is only
-  interesting for what it FORBIDS:
+  Two real-boundary cases cover natural exit and the denied-bind handoff:
 
     * a denied bind must leave the workload unexecuted — the child dies at the
       barrier having never become the vendor CLI;
@@ -153,7 +152,14 @@ defmodule Tightbeam.CustodyCeremonyF6Test do
       Router.init(
         db: db,
         base_dir: root,
-        handlers: instrument(real_handlers, db, test_pid, deny_flag, release_stamp),
+        handlers:
+          instrument(
+            real_handlers,
+            db,
+            test_pid,
+            deny_flag,
+            release_stamp
+          ),
         cli_token: "tbc_custody_f6",
         session_status: fn _ -> nil end
       )
@@ -208,6 +214,7 @@ defmodule Tightbeam.CustodyCeremonyF6Test do
 
     assert_receive {:custody, "process-open", process_id}, 30_000
     assert_receive {:custody, "process-bind", ^process_id}, 30_000
+    assert_receive {:custody, "process-outcome", ^process_id}, 30_000
 
     # `flunk` rather than `refute ..., message`: ExUnit evaluates the message
     # eagerly, so reading the log to describe the failure would itself raise on the
@@ -222,13 +229,9 @@ defmodule Tightbeam.CustodyCeremonyF6Test do
     assert row.osPid, "the denied row never recorded the identity it refused to release"
     assert row.brokerIdentity
     assert row.stopCause == "owner_stop"
-
-    # The child is gone — it read EOF at the barrier — so the physical probe can
-    # prove absence, and only a proof terminalizes the row.
-    assert {_, 0} = process_reconcile(ctx, process_id)
-    resolved = ManagedProcesses.get(ctx.db, process_id)
-    assert resolved.state in ManagedProcesses.terminal_states()
-    assert resolved.resolvedAt
+    assert row.state == "exited"
+    assert row.lastError == "denied_bind_reaped"
+    assert row.resolvedAt
 
     # Nothing was staged, because nothing ran.
     assert Credentials.kind_at(ctx.root, :openai) == :none
@@ -241,6 +244,7 @@ defmodule Tightbeam.CustodyCeremonyF6Test do
 
     assert_receive {:custody, "process-open", process_id}, 30_000
     assert_receive {:custody, "process-bind", ^process_id}, 30_000
+    assert_receive {:custody, "process-outcome", ^process_id}, 30_000
 
     assert status == 0, "the ceremony failed: #{output}"
 
@@ -286,12 +290,9 @@ defmodule Tightbeam.CustodyCeremonyF6Test do
     assert String.to_integer(child_pgid) == row.processGroupId,
            "the workload ran outside the recorded process group"
 
-    # The ceremony leaves the row live on purpose; `process-reconcile` is the verb
-    # that resolves it, and it does so from a physical probe run by the same built
-    # binary — not from a timeout.
-    assert {_, 0} = process_reconcile(ctx, process_id)
     resolved = ManagedProcesses.get(ctx.db, process_id)
-    assert resolved.state in ManagedProcesses.terminal_states()
+    assert resolved.state == "exited"
+    assert resolved.lastError == "exit_code:0"
     assert resolved.resolvedAt
     refute ManagedProcesses.blocks_retirement?(resolved)
 
@@ -325,20 +326,6 @@ defmodule Tightbeam.CustodyCeremonyF6Test do
           {"TB_F6_EXEC_LOG", exec_log},
           {"TB_F6_ENV_LOG", ctx.env_log},
           {"TB_F6_RELEASE_STAMP", ctx.release_stamp}
-        ])
-    )
-  end
-
-  defp process_reconcile(ctx, process_id) do
-    System.cmd(ctx.binary, ["process-reconcile", process_id],
-      cd: ctx.workdir,
-      stderr_to_stdout: true,
-      env:
-        closed_env([
-          {"TIGHTBEAM_BASE_DIR", ctx.root},
-          {"PATH", "/usr/bin:/bin"},
-          {"HOME", ctx.home},
-          {"TMPDIR", ctx.tmpdir}
         ])
     )
   end
@@ -417,7 +404,13 @@ defmodule Tightbeam.CustodyCeremonyF6Test do
   # and the wrapper only observes it and — for the denied case — commits a
   # legitimate stop through the ordinary verb at the one moment that makes the
   # denial deterministic.
-  defp instrument(handlers, db, test_pid, deny_flag, release_stamp) do
+  defp instrument(
+         handlers,
+         db,
+         test_pid,
+         deny_flag,
+         release_stamp
+       ) do
     Map.new(handlers, fn
       {"process-open" = verb, handler} ->
         {verb,
@@ -434,6 +427,14 @@ defmodule Tightbeam.CustodyCeremonyF6Test do
          fn call ->
            result = handler.(call)
            File.write!(release_stamp, "bind answered")
+           send(test_pid, {:custody, verb, process_id(result)})
+           result
+         end}
+
+      {"process-outcome" = verb, handler} ->
+        {verb,
+         fn call ->
+           result = handler.(call)
            send(test_pid, {:custody, verb, process_id(result)})
            result
          end}
