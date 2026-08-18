@@ -314,7 +314,9 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
                verdict_call(ctx.owner.session_key, crossing.id, "changes-requested")
              )
 
-    assert {:ok, [[1, ^ctx.owner.session_key]]} =
+    owner_session_key = ctx.owner.session_key
+
+    assert {:ok, [[1, ^owner_session_key]]} =
              DB.query(
                ctx.db,
                """
