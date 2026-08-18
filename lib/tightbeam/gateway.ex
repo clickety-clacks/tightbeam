@@ -6115,8 +6115,12 @@ defmodule Tightbeam.Gateway do
         {ManagedProcesses.recovery_rows_in_txn(txn), ManagedProcesses.open_fences_in_txn(txn)}
       end)
 
-    for row <- rows do
-      locality = custody_locality(config, db, row)
+    local_rows =
+      rows
+      |> Enum.map(&{&1, custody_locality(config, db, &1)})
+      |> Enum.reject(fn {_row, locality} -> locality == :remote end)
+
+    for {row, locality} <- local_rows do
       {evidence, observed} = sweep_evidence(config, db, row, locality, mode, now)
 
       case reconcile_custody_in_db(db, row.processId, now, evidence, observed) do
@@ -6141,10 +6145,11 @@ defmodule Tightbeam.Gateway do
           match?(%{state: "retiring"}, ManagedProcesses.fence(db, fence.sessionKey)),
           do: fence.sessionKey
 
-    current_rows = Enum.map(rows, &ManagedProcesses.get(db, &1.processId))
+    current_rows =
+      Enum.map(local_rows, fn {row, _locality} -> ManagedProcesses.get(db, row.processId) end)
 
     %{
-      reconciled: length(rows),
+      reconciled: length(local_rows),
       still_blocked:
         Enum.count(current_rows, fn
           nil -> false
@@ -6155,14 +6160,30 @@ defmodule Tightbeam.Gateway do
     }
   end
 
-  # An unbound row has no physical identity to probe. Before its deadline the
-  # broker may still complete the ordinary bind, including the winning late
-  # stop handoff. Only a passed launch/lease deadline earns the durable
-  # uncertainty result; boot by itself is not evidence that the broker died.
-  defp sweep_evidence(_config, _db, row, :unbound, _mode, now) do
-    if min(row.launchDeadline, row.leaseExpiresAt) <= now,
-      do: {:unknown, row.revision},
-      else: {:not_probed, nil}
+  # The broker writes a deterministic identity artifact before process-bind.
+  # That existing artifact is the only lawful way to recover an identity from
+  # an unbound row: its values are merely candidates until the Rust helper
+  # re-reads the artifact, checks the launch token and current boot, and proves
+  # the child present or gone. A missing artifact before the deadline leaves the
+  # ordinary bind race open. After the deadline it is honest uncertainty, never
+  # fabricated absence.
+  defp sweep_evidence(config, db, row, :unbound, mode, now) do
+    deadline_due? = min(row.launchDeadline, row.leaseExpiresAt) <= now
+
+    if mode == :boot or deadline_due? do
+      case unbound_custody_candidate(config, row) do
+        {:ok, candidate} ->
+          {custody_evidence(config, db, candidate, "probe"), row.revision}
+
+        :missing when not deadline_due? ->
+          {:not_probed, nil}
+
+        _ ->
+          {:unknown, row.revision}
+      end
+    else
+      {:not_probed, nil}
+    end
   end
 
   defp sweep_evidence(config, db, row, locality, mode, now) do
@@ -6986,18 +7007,40 @@ defmodule Tightbeam.Gateway do
   # table's `ssh: nil` marker rather than by comparing host NAMES: the local host carries
   # its real hostname, so a name comparison would be a second, drifting source of truth
   # for something Placement already knows.
-  defp custody_locality(_config, _db, nil), do: :unbound
-
   defp custody_locality(config, db, row) do
-    cond do
-      is_nil(row.brokerIdentity) or is_nil(row.osPid) or is_nil(row.processGroupId) ->
-        :unbound
+    case Map.get(Placement.hosts(config.base_dir, db), row.host) do
+      %{ssh: nil} ->
+        if is_nil(row.brokerIdentity) or is_nil(row.osPid) or is_nil(row.processGroupId),
+          do: :unbound,
+          else: :local
 
-      match?(%{ssh: nil}, Map.get(Placement.hosts(config.base_dir, db), row.host)) ->
-        :local
-
-      true ->
+      _ ->
         :remote
+    end
+  end
+
+  defp unbound_custody_candidate(config, row) do
+    path = Path.join([config.base_dir, "process-custody", "#{row.processId}.identity"])
+
+    with {:ok, contents} <- File.read(path),
+         [process_id, pid_text, pgid_text, boot_identity, launch_token] <-
+           contents |> String.trim_trailing() |> String.split("\t"),
+         true <- process_id == row.processId,
+         true <- launch_token == row.launchToken,
+         true <- boot_identity != "",
+         {os_pid, ""} <- Integer.parse(pid_text),
+         {process_group_id, ""} <- Integer.parse(pgid_text),
+         true <- os_pid > 0 and process_group_id > 0 do
+      {:ok,
+       Map.merge(row, %{
+         osPid: os_pid,
+         processGroupId: process_group_id,
+         bootIdentity: boot_identity,
+         brokerIdentity: path
+       })}
+    else
+      {:error, :enoent} -> :missing
+      _ -> :invalid
     end
   end
 

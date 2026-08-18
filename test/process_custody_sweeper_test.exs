@@ -64,6 +64,49 @@ defmodule Tightbeam.ProcessCustodySweeperTest do
     assert ManagedProcesses.get(ctx.db, waiting.processId).revision == waiting.revision
   end
 
+  test "an expired remote row is excluded before reconciliation", ctx do
+    now = System.system_time(:millisecond)
+
+    row =
+      preparing(ctx.db, %{
+        host: "remote-custody-host",
+        launch_deadline: now + 60_000,
+        lease_expires_at: now + 120_000
+      })
+
+    identity = %{
+      os_pid: 4242,
+      process_group_id: 4242,
+      boot_identity: "remote-boot",
+      launch_token: row.launchToken,
+      broker_identity: "/remote/process-custody/#{row.processId}.identity"
+    }
+
+    {:ok, {:running, running}} =
+      DB.transaction(
+        ctx.db,
+        &ManagedProcesses.bind_identity_in_txn(&1, row.processId, identity, now: now)
+      )
+
+    expired_at = now - 1
+
+    {:ok, {:ok, _expired}} =
+      DB.transaction(ctx.db, fn txn ->
+        ManagedProcesses.transition(
+          txn,
+          row.processId,
+          [state: "running", revision: running.revision],
+          %{state: "running", lease_expires_at: expired_at, now: now}
+        )
+      end)
+
+    before = ManagedProcesses.get(ctx.db, row.processId)
+    assert before.leaseExpiresAt == expired_at
+
+    assert %{reconciled: 0} = Gateway.sweep_process_custody(ctx.config)
+    assert ManagedProcesses.get(ctx.db, row.processId) == before
+  end
+
   test "boot records helper absence as unknown and repeating it is idempotent", ctx do
     row = preparing(ctx.db, %{})
 

@@ -147,13 +147,14 @@ defmodule Tightbeam.CustodyCeremonyF6Test do
 
     test_pid = self()
     deny_flag = Path.join(root, "deny-bind")
+    prebind_mode = Path.join(root, "prebind-mode")
     release_stamp = Path.join(root, "release.stamp")
 
     router_opts =
       Router.init(
         db: db,
         base_dir: root,
-        handlers: instrument(real_handlers, db, test_pid, deny_flag, release_stamp),
+        handlers: instrument(real_handlers, db, test_pid, deny_flag, prebind_mode, release_stamp),
         cli_token: "tbc_custody_f6",
         session_status: fn _ -> nil end
       )
@@ -192,6 +193,7 @@ defmodule Tightbeam.CustodyCeremonyF6Test do
       home: home,
       hold_flag: hold_flag,
       machine: machine,
+      prebind_mode: prebind_mode,
       release_stamp: release_stamp,
       root: root,
       tmpdir: tmpdir,
@@ -358,6 +360,89 @@ defmodule Tightbeam.CustodyCeremonyF6Test do
     assert repeated.state == settled.state
   end
 
+  test "restart before and after the deadline keeps an artifact-free broker exit honest", ctx do
+    exec_log = Path.join(ctx.root, "prebind-no-artifact-exec.log")
+    File.write!(ctx.prebind_mode, "before-artifact")
+
+    {output, status} = onboard(ctx, exec_log)
+    assert status != 0, "the broker unexpectedly survived the pre-artifact refusal: #{output}"
+
+    assert_receive {:custody, "process-open", process_id}, 30_000
+    refute File.exists?(exec_log), "the workload ran before identity binding"
+    refute File.exists?(identity_path(ctx, process_id))
+
+    force_launch_deadline(ctx.db, process_id, System.system_time(:millisecond) + 60_000)
+    before = ManagedProcesses.get(ctx.db, process_id)
+
+    Gateway.recover_process_custody(ctx.gateway_config)
+    waiting = ManagedProcesses.get(ctx.db, process_id)
+    assert waiting.state == "preparing"
+    assert waiting.revision == before.revision
+
+    force_launch_deadline(ctx.db, process_id, System.system_time(:millisecond) - 1)
+    Gateway.recover_process_custody(ctx.gateway_config)
+
+    unknown = ManagedProcesses.get(ctx.db, process_id)
+    assert unknown.state == "identity_unknown"
+    assert unknown.uncertaintyCause == "launch_handoff_unknown"
+    assert unknown.stopCause == nil
+
+    Gateway.recover_process_custody(ctx.gateway_config)
+    assert ManagedProcesses.get(ctx.db, process_id).revision == unknown.revision
+  end
+
+  test "restart binds a real live pre-exec identity and the broker releases that revision", ctx do
+    exec_log = Path.join(ctx.root, "prebind-recovered-live-exec.log")
+    File.write!(ctx.prebind_mode, "pause-before-commit")
+
+    ceremony = Task.async(fn -> onboard(ctx, exec_log) end)
+
+    assert_receive {:custody, "process-open", process_id}, 30_000
+    assert_receive {:custody_bind_waiting, ^process_id, bind_handler}, 30_000
+    assert File.exists?(identity_path(ctx, process_id))
+    refute File.exists?(exec_log), "the workload crossed the pre-exec barrier before recovery"
+
+    assert %{reconciled: 1} = Gateway.recover_process_custody(ctx.gateway_config)
+    recovered = ManagedProcesses.get(ctx.db, process_id)
+    assert recovered.state == "running"
+    assert recovered.releaseGrantedAt
+    assert recovered.brokerIdentity == identity_path(ctx, process_id)
+
+    send(bind_handler, :continue_bind)
+    assert_receive {:custody, "process-bind", ^process_id}, 30_000
+
+    {output, status} = Task.await(ceremony, 30_000)
+    assert status == 0, "the recovered broker did not release the proven revision: #{output}"
+    assert File.read!(exec_log) =~ "stamp=present"
+
+    assert {_, 0} = process_reconcile(ctx, process_id)
+    assert ManagedProcesses.get(ctx.db, process_id).state in ManagedProcesses.terminal_states()
+  end
+
+  test "restart proves absence after the real broker exits between artifact and identity commit",
+       ctx do
+    exec_log = Path.join(ctx.root, "prebind-artifact-exit-exec.log")
+    File.write!(ctx.prebind_mode, "after-artifact")
+
+    {output, status} = onboard(ctx, exec_log)
+    assert status != 0, "the broker unexpectedly committed identity: #{output}"
+
+    assert_receive {:custody, "process-open", process_id}, 30_000
+    assert_receive {:custody, "process-bind", ^process_id}, 30_000
+    refute File.exists?(exec_log), "the workload ran after the bind request failed"
+    assert File.exists?(identity_path(ctx, process_id))
+    assert ManagedProcesses.get(ctx.db, process_id).state == "preparing"
+
+    assert %{reconciled: 1} = Gateway.recover_process_custody(ctx.gateway_config)
+    settled = ManagedProcesses.get(ctx.db, process_id)
+    assert settled.state == "launch_failed"
+    assert settled.lastError == "launch_timeout"
+    assert settled.resolvedAt
+
+    assert %{reconciled: 0} = Gateway.recover_process_custody(ctx.gateway_config)
+    assert ManagedProcesses.get(ctx.db, process_id).revision == settled.revision
+  end
+
   # A ceremony run of the REAL built CLI. `TIGHTBEAM_MACHINE` is required rather
   # than convenient: without a `gateway.json` the CLI refuses to guess which
   # machine it is onboarding, which is the correct refusal and not one this test
@@ -469,7 +554,7 @@ defmodule Tightbeam.CustodyCeremonyF6Test do
   # and the wrapper only observes it and — for the denied case — commits a
   # legitimate stop through the ordinary verb at the one moment that makes the
   # denial deterministic.
-  defp instrument(handlers, db, test_pid, deny_flag, release_stamp) do
+  defp instrument(handlers, db, test_pid, deny_flag, prebind_mode, release_stamp) do
     Map.new(handlers, fn
       {"process-open" = verb, handler} ->
         {verb,
@@ -478,16 +563,48 @@ defmodule Tightbeam.CustodyCeremonyF6Test do
            id = process_id(result)
            if id && File.exists?(deny_flag), do: stop_row(db, id)
            send(test_pid, {:custody, verb, id})
-           result
+
+           if prebind_mode(prebind_mode) == "before-artifact" do
+             %{code: "server_error", message: "fixture stopped the broker before spawn"}
+           else
+             result
+           end
          end}
 
       {"process-bind" = verb, handler} ->
         {verb,
          fn call ->
-           result = handler.(call)
-           File.write!(release_stamp, "bind answered")
-           send(test_pid, {:custody, verb, process_id(result)})
-           result
+           id = call.params[:process_id]
+
+           case prebind_mode(prebind_mode) do
+             "after-artifact" ->
+               send(test_pid, {:custody, verb, id})
+
+               %{
+                 code: "server_error",
+                 message: "fixture stopped the broker before identity commit"
+               }
+
+             "pause-before-commit" ->
+               send(test_pid, {:custody_bind_waiting, id, self()})
+
+               receive do
+                 :continue_bind -> :ok
+               after
+                 30_000 -> raise "fixture timed out waiting to continue process-bind"
+               end
+
+               result = handler.(call)
+               File.write!(release_stamp, "bind answered")
+               send(test_pid, {:custody, verb, process_id(result)})
+               result
+
+             _ ->
+               result = handler.(call)
+               File.write!(release_stamp, "bind answered")
+               send(test_pid, {:custody, verb, process_id(result)})
+               result
+           end
          end}
 
       {verb, handler} ->
@@ -497,6 +614,26 @@ defmodule Tightbeam.CustodyCeremonyF6Test do
 
   defp process_id(%{process: %{"processId" => id}}), do: id
   defp process_id(_other), do: nil
+
+  defp prebind_mode(path) do
+    case File.read(path) do
+      {:ok, mode} -> String.trim(mode)
+      {:error, :enoent} -> nil
+    end
+  end
+
+  defp identity_path(ctx, process_id) do
+    Path.join([ctx.root, "process-custody", "#{process_id}.identity"])
+  end
+
+  defp force_launch_deadline(db, process_id, deadline) do
+    {:ok, _} =
+      DB.query(
+        db,
+        "UPDATE managed_processes SET launchDeadline = ?1 WHERE processId = ?2",
+        [deadline, process_id]
+      )
+  end
 
   defp stop_row(db, process_id) do
     {:ok, _} =

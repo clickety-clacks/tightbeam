@@ -780,6 +780,13 @@ defmodule Tightbeam.ManagedProcesses do
           decide_bind(txn, row, bound, now)
         end
 
+      %{state: "running"} = row ->
+        if same_identity?(row, identity), do: {:running, row}, else: {:lost, row}
+
+      %{state: state} = row
+      when state in ["stop_requested", "stop_failed", "identity_unknown"] ->
+        if same_identity?(row, identity), do: {:stop, row}, else: {:lost, row}
+
       row ->
         # Terminal, unresolved, or already running: this bind lost.
         {:lost, row}
