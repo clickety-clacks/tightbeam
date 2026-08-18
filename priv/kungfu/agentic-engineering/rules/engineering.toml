@@ -87,8 +87,7 @@ deny_when = [
 # at round four (recent norm is 1-2; the old process ran 4-10; grace built
 # in), SHINE LIGHT on a review that may be spinning by summoning the product
 # owner — while limiting nothing. The notice effect records and wakes once
-# while this predicate stays true, then always allows the attest. If a future
-# predicate becomes false, the existing episode close rearms its next crossing.
+# for this rule and reviewed assignment, then always allows later attests.
 [[rule]]
 name = "review-rounds-doorbell"
 verb = "attest"

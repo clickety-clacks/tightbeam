@@ -132,9 +132,10 @@ defmodule Tightbeam.RailRemedy do
     end
   end
 
-  # A notice stays live until the predicate stops matching. Rules.maybe_close/4
-  # then closes the episode, which rearms the next false-to-true crossing. A
-  # repeated matching attest observes the live row and does not send again.
+  # A notice is a durable one-shot for one statute/subject. Unlike a gating
+  # remedy, it does not close when a later call misses the predicate: an
+  # unrelated attest must not rearm a round-count doorbell. A repeated match
+  # observes the live row and does not send again.
   defp route_notice_episode(db, handlers, rule, subject, call, context, resolved) do
     case read_episode(db, rule.name, subject) do
       %{status: "live", producer_key: producer_key} ->
