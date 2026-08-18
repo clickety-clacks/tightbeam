@@ -951,14 +951,49 @@ defmodule Tightbeam.ManagedProcesses do
   end
 
   defp reconcile_settled(row, txn, {:identity, identity}, now) do
-    case bind_identity_in_txn(txn, row.processId, identity, now: now) do
-      {:running, updated} -> {:ok, updated}
-      {:stop, updated} -> {:blocked, updated}
-      # An identity that cannot prove it is ours is not evidence of anything.
-      # It becomes uncertainty, not a bind and not an absence proof.
-      {:unproven, _} -> reconcile_settled(row, txn, :unknown, now)
-      {:lost, current} -> {:blocked, current}
+    cond do
+      row.state in ["preparing", "launch_cancel_requested"] ->
+        case bind_identity_in_txn(txn, row.processId, identity, now: now) do
+          {:running, updated} -> {:ok, updated}
+          {:stop, updated} -> {:blocked, updated}
+          # An identity that cannot prove it is ours is not evidence of anything.
+          # It becomes uncertainty, not a bind and not an absence proof.
+          {:unproven, _} -> reconcile_settled(row, txn, :unknown, now)
+          {:lost, current} -> {:blocked, current}
+        end
+
+      not same_identity?(row, identity) ->
+        reconcile_settled(row, txn, :unknown, now)
+
+      row.state == "running" ->
+        {:ok, row}
+
+      row.state == "stop_requested" ->
+        {:blocked, row}
+
+      row.state == "stop_failed" ->
+        case transition(txn, row.processId, [state: row.state, revision: row.revision], %{
+               state: "stop_requested",
+               stop_attempt_count: row.stopAttemptCount + 1,
+               now: now
+             }) do
+          {:ok, updated} -> {:blocked, updated}
+          {:lost, current} -> {:blocked, current}
+        end
+
+      row.state == "identity_unknown" ->
+        resume_proven_identity(txn, row, now)
     end
+  end
+
+  defp reconcile_settled(
+         %{state: "identity_unknown", uncertaintyCause: cause} = row,
+         _txn,
+         :unknown,
+         _now
+       )
+       when not is_nil(cause) do
+    {:blocked, row}
   end
 
   defp reconcile_settled(row, txn, :unknown, now) do
@@ -970,6 +1005,49 @@ defmodule Tightbeam.ManagedProcesses do
       {:ok, updated} -> {:blocked, updated}
       {:lost, current} -> {:blocked, current}
     end
+  end
+
+  # A successful helper probe is proof about the identity ALREADY stored on a
+  # post-bind row. Re-running `bind_identity_in_txn/4` cannot handle that row —
+  # binding is deliberately single-shot — so restart recovery resumes the
+  # durable winner here instead. A row that was released and still has no stop
+  # cause returns to `running`; a row that owes a stop returns to
+  # `stop_requested`. The lease and retirement generation are re-checked in
+  # this transaction, and a stop cause is never erased or replaced.
+  defp resume_proven_identity(txn, row, now) do
+    generation = current_generation_in_txn(txn, row.ownerSessionKey)
+    retiring? = match?(%{state: "retiring"}, fence_in_txn(txn, row.ownerSessionKey))
+
+    cause =
+      cond do
+        row.stopCause != nil -> row.stopCause
+        retiring? or generation != row.sessionGeneration -> "session_retired"
+        row.leaseExpiresAt <= now -> "lease_expired"
+        true -> nil
+      end
+
+    target =
+      if is_nil(cause) and row.releaseGrantedAt != nil, do: "running", else: "stop_requested"
+
+    changes = %{
+      state: target,
+      stop_cause: cause,
+      uncertainty_cause: nil,
+      now: now
+    }
+
+    case transition(txn, row.processId, [state: row.state, revision: row.revision], changes) do
+      {:ok, updated} when target == "running" -> {:ok, updated}
+      {:ok, updated} -> {:blocked, updated}
+      {:lost, current} -> {:blocked, current}
+    end
+  end
+
+  defp same_identity?(row, identity) do
+    row.osPid == Map.get(identity, :os_pid) and
+      row.processGroupId == Map.get(identity, :process_group_id) and
+      row.bootIdentity == Map.get(identity, :boot_identity) and
+      row.launchToken == Map.get(identity, :launch_token)
   end
 
   @doc """

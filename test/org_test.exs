@@ -922,8 +922,8 @@ defmodule Tightbeam.OrgTest do
 
     assert %{state: "retired"} = Org.get(db, "agent:boot-finishable")
 
-    # The unknown one is NOT cleaned up by a restart. Evidence is :not_probed on
-    # this line, so recovery settles and reports but never fabricates absence.
+    # The unknown one is NOT cleaned up by a restart. No broker proof exists, so
+    # recovery reports the uncertainty and never fabricates absence.
     assert %{state: "active"} = Org.get(db, "agent:boot-stuck")
     still = ManagedProcesses.get(db, stuck.processId)
     assert still.state == "identity_unknown"

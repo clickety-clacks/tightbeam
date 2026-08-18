@@ -1051,6 +1051,15 @@ defmodule Tightbeam.GatewayTest do
       Enum.find(children, &match?({Tightbeam.Supervision, _}, &1))
 
     assert Keyword.fetch!(supervision_opts, :recover) == false
+
+    {Tightbeam.ProcessCustodySweeper, custody_opts} =
+      Enum.find(children, &match?({Tightbeam.ProcessCustodySweeper, _}, &1))
+
+    assert Keyword.fetch!(custody_opts, :interval) == 1_234
+
+    assert %{db: db, base_dir: base_dir} = Keyword.fetch!(custody_opts, :config)
+    assert db == ctx.db
+    assert is_binary(base_dir)
   end
 
   # Hosts assimilated before the endpoint file existed, and hosts whose org token

@@ -305,6 +305,10 @@ defmodule Tightbeam.Gateway do
          },
          tick_ms: config.wake_tick_ms,
          name: Tightbeam.WakeScheduler},
+        {Tightbeam.ProcessCustodySweeper,
+         config: Map.put(config, :db, db),
+         interval: config.wake_tick_ms,
+         name: Tightbeam.ProcessCustodySweeper},
         {Tightbeam.Supervision,
          db: db,
          handlers: handler_table,
@@ -6068,61 +6072,126 @@ defmodule Tightbeam.Gateway do
   end
 
   @doc """
-  Boot recovery for durable process custody (spec art_6817803a rev6 §B5, review
-  att_8017ebe7 F2).
+  Boot recovery for durable process custody (spec art_6817803a rev6 §B5).
 
-  Two passes, in this order and for a reason:
-
-    1. Every row a restart must look at — the four nonterminal states plus the
-       two unresolved, across all sessions — goes through the SAME
-       `reconcile_in_txn/3` the `process-reconcile` verb uses, so restart repair
-       and the manual repair cannot drift into two decision tables that
-       disagree about what proof means.
-    2. Every session still behind an open retirement fence is then offered to
-       the finalizer, because a row that terminalizes in pass 1 is exactly what
-       makes its session finishable — and because an older build could have
-       terminalized the last process and died before finalizing, leaving a
-       session `retiring` for ever with nothing left to trigger it.
-
-  EVIDENCE IS `:not_probed`, and that is the honest value on this line: there is
-  no OS probe here yet. So this settles expired leases, installs the causes those
-  imply, and reports — but it will not fabricate an absence proof, and no row is
-  terminalized on the strength of a restart alone. A process whose fate is
-  genuinely unknown stays unresolved and keeps blocking its session's
-  retirement, which is the fail-closed behaviour §B3 requires.
-
-  Returns a summary rather than logging inside the transaction, so the caller
-  decides what to say about it.
+  The restart pass snapshots every nonterminal or unresolved row, gathers
+  physical broker evidence outside the write transaction, and feeds that proof
+  through the same revision-bound reconciliation used by `process-reconcile`.
+  A proven live stop is resumed; a proven absence terminalizes; an unavailable
+  or contradictory proof becomes `identity_unknown`. Remote rows remain
+  untouched because this gateway cannot prove facts about their processes.
   """
-  @spec recover_process_custody(DB.server()) :: %{
+  @spec recover_process_custody(config() | DB.server()) :: %{
           reconciled: non_neg_integer(),
           still_blocked: non_neg_integer(),
           retired: [String.t()],
           blocked_sessions: [String.t()]
         }
-  def recover_process_custody(db \\ DB) do
+  def recover_process_custody(config) when is_map(config) do
+    custody_sweep(config, Map.get(config, :db, DB), :boot)
+  end
+
+  def recover_process_custody(db) do
+    base_dir = Application.get_env(:tightbeam, :base_dir, System.tmp_dir!())
+    custody_sweep(%{base_dir: base_dir, db: db}, db, :boot)
+  end
+
+  @doc "Run one lease/launch-deadline custody sweep now."
+  @spec sweep_process_custody(config()) :: %{
+          reconciled: non_neg_integer(),
+          still_blocked: non_neg_integer(),
+          retired: [String.t()],
+          blocked_sessions: [String.t()]
+        }
+  def sweep_process_custody(config) do
+    custody_sweep(config, Map.get(config, :db, DB), :periodic)
+  end
+
+  defp custody_sweep(config, db, mode) do
     now = System.system_time(:millisecond)
 
-    {:ok, result} =
+    {:ok, {rows, open_fences}} =
       DB.transaction(db, fn txn ->
-        outcomes =
-          txn
-          |> ManagedProcesses.recovery_rows_in_txn()
-          |> Enum.map(fn row ->
-            ManagedProcesses.reconcile_in_txn(txn, row.processId, now: now, evidence: :not_probed)
-          end)
-
-        finalized = Org.finalize_open_retirements_in_txn(txn, now)
-
-        %{
-          reconciled: length(outcomes),
-          still_blocked: Enum.count(outcomes, &match?({:blocked, _}, &1)),
-          retired: finalized.retired,
-          blocked_sessions: finalized.blocked
-        }
+        {ManagedProcesses.recovery_rows_in_txn(txn), ManagedProcesses.open_fences_in_txn(txn)}
       end)
 
-    result
+    for row <- rows do
+      locality = custody_locality(config, db, row)
+      {evidence, observed} = sweep_evidence(config, db, row, locality, mode, now)
+
+      case reconcile_custody_in_db(db, row.processId, now, evidence, observed) do
+        {:ok, {:blocked, %{state: "stop_requested"} = stopped}} when locality == :local ->
+          _ = deliver_stop(db, stopped, now, locality, config)
+
+        _ ->
+          :ok
+      end
+    end
+
+    # Also closes a fence whose last row was terminal before this process began.
+    {:ok, finalized} = DB.transaction(db, &Org.finalize_open_retirements_in_txn(&1, now))
+
+    retired_during_rows =
+      for fence <- open_fences,
+          match?(%{state: "retired"}, ManagedProcesses.fence(db, fence.sessionKey)),
+          do: fence.sessionKey
+
+    blocked_sessions =
+      for fence <- open_fences,
+          match?(%{state: "retiring"}, ManagedProcesses.fence(db, fence.sessionKey)),
+          do: fence.sessionKey
+
+    current_rows = Enum.map(rows, &ManagedProcesses.get(db, &1.processId))
+
+    %{
+      reconciled: length(rows),
+      still_blocked:
+        Enum.count(current_rows, fn
+          nil -> false
+          row -> ManagedProcesses.blocks_retirement?(row)
+        end),
+      retired: Enum.uniq(retired_during_rows ++ finalized.retired),
+      blocked_sessions: Enum.uniq(blocked_sessions ++ finalized.blocked)
+    }
+  end
+
+  # An unbound row has no physical identity to probe. Before its deadline the
+  # broker may still complete the ordinary bind, including the winning late
+  # stop handoff. Only a passed launch/lease deadline earns the durable
+  # uncertainty result; boot by itself is not evidence that the broker died.
+  defp sweep_evidence(_config, _db, row, :unbound, _mode, now) do
+    if min(row.launchDeadline, row.leaseExpiresAt) <= now,
+      do: {:unknown, row.revision},
+      else: {:not_probed, nil}
+  end
+
+  defp sweep_evidence(config, db, row, locality, mode, now) do
+    if custody_due?(row, mode, now) do
+      case locality do
+        :local -> {custody_evidence(config, db, row, "probe"), row.revision}
+        :remote -> {:not_probed, nil}
+      end
+    else
+      {:not_probed, nil}
+    end
+  end
+
+  defp custody_due?(_row, :boot, _now), do: true
+
+  defp custody_due?(row, :periodic, now) do
+    case row.state do
+      "preparing" ->
+        min(row.launchDeadline, row.leaseExpiresAt) <= now
+
+      "running" ->
+        row.leaseExpiresAt <= now
+
+      "launch_cancel_requested" ->
+        min(row.launchDeadline, row.leaseExpiresAt) <= now
+
+      state ->
+        state in ["stop_requested", "stop_failed", "identity_unknown"]
+    end
   end
 
   @doc false
@@ -6956,14 +7025,32 @@ defmodule Tightbeam.Gateway do
     case HarnessProcess.bounded_command_for_custody(helper, args, @custody_probe_timeout_ms) do
       {output, 0} ->
         case String.trim(output) do
-          "gone" -> :absent
-          "present" -> {:identity, %{state: :present}}
-          "exited" -> {:identity, %{stop: :exited}}
-          "killed" -> {:identity, %{stop: :killed}}
-          "failed" -> {:identity, %{stop: :stop_failed}}
+          "gone" ->
+            :absent
+
+          "present" ->
+            {:identity,
+             %{
+               os_pid: row.osPid,
+               process_group_id: row.processGroupId,
+               boot_identity: row.bootIdentity,
+               launch_token: row.launchToken,
+               broker_identity: row.brokerIdentity
+             }}
+
+          "exited" ->
+            {:identity, %{stop: :exited}}
+
+          "killed" ->
+            {:identity, %{stop: :killed}}
+
+          "failed" ->
+            {:identity, %{stop: :stop_failed}}
+
           # The helper could not prove the process is ours. That is NOT an absence proof:
           # it is the one answer that must never be laundered into one.
-          _ -> :unknown
+          _ ->
+            :unknown
         end
 
       # A helper that could not run tells us nothing about the process. Unknown, never
@@ -7246,18 +7333,25 @@ defmodule Tightbeam.Gateway do
   end
 
   defp reconcile_settled(db, id, now, evidence, observed) do
-    result =
-      DB.transaction(db, fn txn ->
-        case ManagedProcesses.reconcile_in_txn(txn, id,
-               now: now,
-               evidence: evidence,
-               evidence_revision: observed
-             ) do
-          {:ok, row} -> {:ok, finalize_owner_retirement(txn, row, now)}
-          other -> other
-        end
-      end)
+    db
+    |> reconcile_custody_in_db(id, now, evidence, observed)
+    |> reconcile_payload(id)
+  end
 
+  defp reconcile_custody_in_db(db, id, now, evidence, observed) do
+    DB.transaction(db, fn txn ->
+      case ManagedProcesses.reconcile_in_txn(txn, id,
+             now: now,
+             evidence: evidence,
+             evidence_revision: observed
+           ) do
+        {:ok, row} -> {:ok, finalize_owner_retirement(txn, row, now)}
+        other -> other
+      end
+    end)
+  end
+
+  defp reconcile_payload(result, id) do
     case result do
       {:ok, {:ok, row}} ->
         %{process: Payloads.managed_process(row)}

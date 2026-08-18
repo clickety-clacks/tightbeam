@@ -178,15 +178,19 @@ defmodule Tightbeam.CustodyCeremonyF6Test do
     # somewhere to be rather than pointing it at the real user's dotfiles.
     home = Path.join(root, "home")
     tmpdir = Path.join(root, "tmp")
+    hold_flag = Path.join(root, "hold-workload")
     File.mkdir_p!(home)
     File.mkdir_p!(tmpdir)
+    on_exit(fn -> File.rm(hold_flag) end)
 
     %{
       binary: binary,
       db: db,
       deny_flag: deny_flag,
       env_log: Path.join(root, "workload-env.log"),
+      gateway_config: gateway_config,
       home: home,
+      hold_flag: hold_flag,
       machine: machine,
       release_stamp: release_stamp,
       root: root,
@@ -307,6 +311,53 @@ defmodule Tightbeam.CustodyCeremonyF6Test do
     end
   end
 
+  test "the sweeper physically stops an expired live lease and is idempotent", ctx do
+    exec_log = Path.join(ctx.root, "expired-live-exec.log")
+    File.write!(ctx.hold_flag, "keep the fixture alive until custody stops it")
+
+    ceremony = Task.async(fn -> onboard(ctx, exec_log) end)
+
+    assert_receive {:custody, "process-open", process_id}, 30_000
+    assert_receive {:custody, "process-bind", ^process_id}, 30_000
+    assert eventually(fn -> File.exists?(exec_log) end)
+
+    running = ManagedProcesses.get(ctx.db, process_id)
+    assert running.state == "running"
+    assert running.brokerIdentity
+
+    expired_at = System.system_time(:millisecond) - 1
+
+    {:ok, {:ok, expired}} =
+      DB.transaction(ctx.db, fn txn ->
+        ManagedProcesses.transition(
+          txn,
+          process_id,
+          [state: "running", revision: running.revision],
+          %{state: "running", lease_expires_at: expired_at, now: expired_at}
+        )
+      end)
+
+    assert expired.leaseExpiresAt == expired_at
+
+    first = Gateway.sweep_process_custody(ctx.gateway_config)
+    assert first.reconciled == 1
+
+    {_, status} = Task.await(ceremony, 30_000)
+    assert status != 0, "the live workload reported success after its lease-expiry stop"
+
+    settled = ManagedProcesses.get(ctx.db, process_id)
+    assert settled.state in ["killed", "exited"]
+    assert settled.stopCause == "lease_expired"
+    assert settled.resolvedAt
+
+    second = Gateway.sweep_process_custody(ctx.gateway_config)
+    repeated = ManagedProcesses.get(ctx.db, process_id)
+
+    assert second.reconciled == 0
+    assert repeated.revision == settled.revision
+    assert repeated.state == settled.state
+  end
+
   # A ceremony run of the REAL built CLI. `TIGHTBEAM_MACHINE` is required rather
   # than convenient: without a `gateway.json` the CLI refuses to guess which
   # machine it is onboarding, which is the correct refusal and not one this test
@@ -323,6 +374,7 @@ defmodule Tightbeam.CustodyCeremonyF6Test do
           {"HOME", ctx.home},
           {"TMPDIR", ctx.tmpdir},
           {"TB_F6_EXEC_LOG", exec_log},
+          {"TB_F6_HOLD_FILE", ctx.hold_flag},
           {"TB_F6_ENV_LOG", ctx.env_log},
           {"TB_F6_RELEASE_STAMP", ctx.release_stamp}
         ])
@@ -467,8 +519,19 @@ defmodule Tightbeam.CustodyCeremonyF6Test do
     if [ -e "$TB_F6_RELEASE_STAMP" ]; then stamp=present; else stamp=absent; fi
     pgid=`ps -o pgid= -p $$ | tr -d ' '`
     printf 'argv=%s stamp=%s pid=%s pgid=%s\\n' "$*" "$stamp" "$$" "$pgid" >> "$TB_F6_EXEC_LOG"
+    while [ -n "${TB_F6_HOLD_FILE:-}" ] && [ -e "$TB_F6_HOLD_FILE" ]; do sleep 0.05; done
     printf '%s' '{"tokens":{"access_token":"tb-f6-synthetic-not-a-credential"}}' > "$CODEX_HOME/auth.json"
     exit 0
     """
+  end
+
+  defp eventually(check, attempts \\ 200)
+
+  defp eventually(check, attempts) do
+    cond do
+      check.() -> true
+      attempts == 0 -> false
+      true -> Process.sleep(20) && eventually(check, attempts - 1)
+    end
   end
 end

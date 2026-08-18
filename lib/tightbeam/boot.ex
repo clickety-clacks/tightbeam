@@ -36,11 +36,9 @@ defmodule Tightbeam.Boot do
     # session still behind an open retirement fence. Without this pass a session
     # blocked on a process that has since settled stays `retiring` for ever,
     # because the thing that would have finished it died with the last boot.
-    #
-    # Evidence is `:not_probed` inside — this line has no OS probe — so expired
-    # leases settle and causes install, but nothing is terminalized on the
-    # strength of a restart alone.
-    _ = Gateway.recover_process_custody()
+    # The base directory locates the installed custody helper and host registry;
+    # the gateway gathers physical broker proof before it writes any outcome.
+    _ = Gateway.recover_process_custody(%{base_dir: base_dir, db: Tightbeam.DB})
 
     projections =
       "[" <> Enum.map_join(Tightbeam.Harness.all(), ",", & &1.wire_projection()) <> "]"

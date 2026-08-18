@@ -105,9 +105,9 @@ defmodule Tightbeam.BootTest do
   end
 
   # The other half of the same rule: boot must NOT tidy away what it cannot
-  # prove. Evidence is `:not_probed` on this line, so an unresolved row keeps
-  # blocking its session across restarts rather than being terminalized by the
-  # act of rebooting.
+  # prove. This row has no bound broker identity, so recovery records honest
+  # uncertainty and keeps blocking its session rather than terminalizing it by
+  # the act of rebooting.
   test "boot leaves an unresolved process unresolved and its session blocked", ctx do
     session("agent:boot-unproven")
     row = preparing("agent:boot-unproven")

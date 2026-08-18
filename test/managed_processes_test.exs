@@ -711,14 +711,16 @@ defmodule Tightbeam.ManagedProcessesTest do
   test "unknown evidence stays unresolved however often it is reconciled", ctx do
     row = preparing(ctx.db)
 
-    for _ <- 1..3 do
-      assert {:blocked, unresolved} = reconcile(ctx.db, row.processId, :unknown, 50_000)
-      assert unresolved.state == "identity_unknown"
-      assert unresolved.uncertaintyCause == "launch_handoff_unknown"
-    end
+    assert {:blocked, first} = reconcile(ctx.db, row.processId, :unknown, 50_000)
+    assert first.state == "identity_unknown"
+    assert first.uncertaintyCause == "launch_handoff_unknown"
+
+    assert {:blocked, repeated} = reconcile(ctx.db, row.processId, :unknown, 50_000)
+    assert repeated.revision == first.revision, "an identical sweep must not churn the row"
 
     final = ManagedProcesses.get(ctx.db, row.processId)
     assert final.state == "identity_unknown"
+    assert final.revision == first.revision
     refute final.state in ManagedProcesses.terminal_states()
     assert ManagedProcesses.blocks_retirement?(final)
   end
@@ -762,6 +764,94 @@ defmodule Tightbeam.ManagedProcessesTest do
     assert stopped.state == "stop_requested"
     assert stopped.stopCause == "lease_expired"
     assert stopped.releaseGrantedAt == nil
+  end
+
+  test "proof for an already-running identity keeps the winning release", ctx do
+    row = preparing(ctx.db)
+    assert {:running, bound} = bind(ctx.db, row.processId)
+
+    assert {:ok, running} =
+             reconcile(
+               ctx.db,
+               row.processId,
+               {:identity, identity(row.launchToken)},
+               4_000,
+               evidence_revision: bound.revision
+             )
+
+    assert running.state == "running"
+    assert running.releaseGrantedAt == bound.releaseGrantedAt
+    assert running.revision == bound.revision
+  end
+
+  test "proof for an expired running identity resumes the winning stop", ctx do
+    row = preparing(ctx.db, %{lease_expires_at: 4_000})
+    assert {:running, bound} = bind(ctx.db, row.processId)
+
+    assert {:blocked, stopping} =
+             reconcile(
+               ctx.db,
+               row.processId,
+               {:identity, identity(row.launchToken)},
+               5_000,
+               evidence_revision: bound.revision
+             )
+
+    assert stopping.state == "stop_requested"
+    assert stopping.stopCause == "lease_expired"
+    assert stopping.releaseGrantedAt == bound.releaseGrantedAt
+  end
+
+  test "proof restores a previously released identity after an uncertain probe", ctx do
+    row = preparing(ctx.db)
+    assert {:running, bound} = bind(ctx.db, row.processId)
+
+    assert {:ok, unknown} =
+             tx!(ctx.db, fn txn ->
+               ManagedProcesses.transition(
+                 txn,
+                 row.processId,
+                 [state: "running", revision: bound.revision],
+                 %{
+                   state: "identity_unknown",
+                   uncertainty_cause: "stop_signal_unproven",
+                   now: 4_000
+                 }
+               )
+             end)
+
+    assert {:ok, resumed} =
+             reconcile(
+               ctx.db,
+               row.processId,
+               {:identity, identity(row.launchToken)},
+               5_000,
+               evidence_revision: unknown.revision
+             )
+
+    assert resumed.state == "running"
+    assert resumed.releaseGrantedAt == bound.releaseGrantedAt
+    assert resumed.uncertaintyCause == nil
+  end
+
+  test "proof resumes a stop cause that survived an uncertain signal", ctx do
+    bound = running_row(ctx.db)
+    assert {:ok, stopping} = request_stop(ctx.db, bound.processId, 4_000)
+    assert {:ok, unknown} = record_outcome(ctx.db, bound.processId, :identity_unknown, 5_000)
+
+    assert {:blocked, resumed} =
+             reconcile(
+               ctx.db,
+               bound.processId,
+               {:identity, identity(bound.launchToken)},
+               6_000,
+               evidence_revision: unknown.revision
+             )
+
+    assert resumed.state == "stop_requested"
+    assert resumed.stopCause == stopping.stopCause
+    assert resumed.uncertaintyCause == nil
+    refute resumed.state == "running"
   end
 
   test "reconciling a terminal row is a no-op that reports it", ctx do
