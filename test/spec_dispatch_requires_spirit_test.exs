@@ -385,4 +385,96 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
              |> EventLog.lifecycle_events()
              |> Enum.count(&(&1.kind == "rail_notice"))
   end
+
+  test "review-rounds doorbell stays latched when its wake is refused", ctx do
+    item = work_item(ctx, nil)
+
+    {:ok, subject} =
+      Dispatch.dispatch(
+        ctx.db,
+        ctx.handlers,
+        dispatch_call(ctx.holder.session_key, item.id, "work under refused doorbell wake")
+      )
+
+    assert {:ok, %{attest: %{verdictKind: "tests-passed"}}} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               verdict_call(ctx.holder.session_key, subject.id, "tests-passed")
+             )
+
+    review_call = fn n ->
+      %{
+        verb: "assign",
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        session_key: ctx.owner.session_key,
+        target_role: nil,
+        role_fallback: false,
+        params: %{
+          subject: "refused doorbell round #{n}",
+          reviews_assignment_id: subject.id
+        }
+      }
+    end
+
+    for n <- 1..4 do
+      {:ok, review} = Dispatch.dispatch(ctx.db, ctx.handlers, review_call.(n))
+
+      assert {:ok, %{attest: %{verdictKind: "changes-requested"}}} =
+               Dispatch.dispatch(
+                 ctx.db,
+                 ctx.handlers,
+                 verdict_call(ctx.owner.session_key, review.id, "changes-requested")
+               )
+    end
+
+    refusing_handlers =
+      Map.put(ctx.handlers, "wake", fn _call ->
+        %{code: "forced_notice_refusal", message: "the notice target refused the wake"}
+      end)
+
+    {:ok, crossing} = Dispatch.dispatch(ctx.db, ctx.handlers, review_call.(5))
+
+    assert {:ok, %{attest: %{verdictKind: "changes-requested"}}} =
+             Dispatch.dispatch(
+               ctx.db,
+               refusing_handlers,
+               verdict_call(ctx.owner.session_key, crossing.id, "changes-requested")
+             )
+
+    {:ok, repeated} = Dispatch.dispatch(ctx.db, ctx.handlers, review_call.(6))
+
+    assert {:ok, %{attest: %{verdictKind: "changes-requested"}}} =
+             Dispatch.dispatch(
+               ctx.db,
+               refusing_handlers,
+               verdict_call(ctx.owner.session_key, repeated.id, "changes-requested")
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE origin = 'remedy:review-rounds-doorbell'"
+             )
+
+    assert {:ok, [["live", nil]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT status, producerKey
+               FROM rail_remedy_episodes
+               WHERE statute = 'review-rounds-doorbell' AND subject = ?1
+               """,
+               [subject.id]
+             )
+
+    assert [%{kind: "rail_notice", subject: "review-rounds-doorbell", detail: detail}] =
+             ctx.db
+             |> EventLog.lifecycle_events()
+             |> Enum.filter(&(&1.kind == "rail_notice"))
+
+    assert %{"outcome" => "blocked", "ref" => ref} = JSON.decode!(detail)
+    assert ref == subject.id
+  end
 end

@@ -124,7 +124,8 @@ defmodule Tightbeam.RailRemedy do
           resolved,
           token,
           occurrence,
-          reopened?
+          reopened?,
+          :release
         )
 
       :occupied ->
@@ -154,7 +155,8 @@ defmodule Tightbeam.RailRemedy do
               resolved,
               token,
               occurrence,
-              reopened?
+              reopened?,
+              :latch
             )
 
           :occupied ->
@@ -269,7 +271,8 @@ defmodule Tightbeam.RailRemedy do
          resolved,
          token,
          occurrence,
-         reopened?
+         reopened?,
+         failure_mode
        ) do
     won? =
       cas(
@@ -313,11 +316,11 @@ defmodule Tightbeam.RailRemedy do
       else
         {:error, %{code: "rule_denied"} = denial}
         when rule.remedy.on_rule_denied == "surface" ->
-          release_dispatch(db, rule.name, subject, token)
+          settle_dispatch_failure(db, rule.name, subject, token, failure_mode)
           %{outcome: "blocked", producer_id: nil, denial: denial}
 
         _ ->
-          release_dispatch(db, rule.name, subject, token)
+          settle_dispatch_failure(db, rule.name, subject, token, failure_mode)
           %{outcome: "blocked", producer_id: nil}
       end
     else
@@ -639,6 +642,21 @@ defmodule Tightbeam.RailRemedy do
       db,
       """
       DELETE FROM rail_remedy_episodes
+      WHERE statute = ?1 AND subject = ?2 AND status = 'dispatched' AND claimToken = ?3
+      """,
+      [statute, subject, token]
+    )
+  end
+
+  defp settle_dispatch_failure(db, statute, subject, token, :release),
+    do: release_dispatch(db, statute, subject, token)
+
+  defp settle_dispatch_failure(db, statute, subject, token, :latch) do
+    cas(
+      db,
+      """
+      UPDATE rail_remedy_episodes
+      SET status = 'live', producerKey = NULL
       WHERE statute = ?1 AND subject = ?2 AND status = 'dispatched' AND claimToken = ?3
       """,
       [statute, subject, token]
