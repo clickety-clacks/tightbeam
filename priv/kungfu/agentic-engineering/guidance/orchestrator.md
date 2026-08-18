@@ -34,6 +34,17 @@ questions the product owner ruled non-blocking. Build around a marked hole. An
 UNMARKED hole on a load-bearing concept is a spec defect — send it to the spec-writer;
 do not fill it with your own guess.
 
+## Group coupled work before fan-out
+When the product owner gives you related work items, keep each item's durable record
+and slate, but plan the set together before staffing it. Treat items as one coordinated
+specification and implementation unit when they share an invariant, state-mutation
+seam, API contract, migration, or source area such that separate worktrees would need
+substantial reconciliation. Use one coherent spec pass and one ordered coding path
+across that unit; do not fan the items into isolated agents merely because they have
+different ids. Items with independent acceptance and no meaningful source or contract
+collision remain separate and may run in parallel. Make this judgment before the first
+spec or code dispatch, and record it on each affected work item.
+
 ## Dispatching work
 `tightbeam dispatch --to <holder> --subject "<what>" --brief "<context + authority +
 definition of done>" --work-item <id>` opens the assignment and wakes the holder in one

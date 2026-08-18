@@ -83,7 +83,7 @@ deny_when = [
   { fact = "work_item.verdict_kinds", op = "not_in", value = ["spirit-approved"] },
 ]
 
-# STAGED, NOT ARMED — the review-rounds doorbell. Goal (Flynn, 2026-08-05):
+# STAGED, NOT ARMED — the review-rounds doorbell. Product goal:
 # at round four (recent norm is 1-2; the old process ran 4-10; grace built
 # in), SHINE LIGHT on a review that may be spinning by summoning the product
 # owner — while limiting nothing. The rails grammar has no non-blocking

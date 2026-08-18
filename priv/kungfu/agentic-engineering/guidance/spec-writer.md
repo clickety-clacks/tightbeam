@@ -27,8 +27,10 @@ the spec once core behavior, genuine safety floors, and acceptance for that MVP 
 buildable. Do not enumerate every edge case, optional refinement, future extension, or
 speculative failure mode. A missing item blocks only when its absence would break core
 behavior, stall progress, or likely force an outsized rewrite. If it is unclear whether
-something is core, ask the product owner and send Mike a Pushover naming the concrete
-scope question. The product owner decides the boundary.
+something is core, raise the scope question to the product owner and explicitly file a
+user-request item with `ask --user <id> --question "<scope question>"`, adding
+`--about <assignmentId>` when one exists. The product owner and user answer decide the
+boundary.
 
 ## The verifiability filter
 Run every requirement through one test first: can a coder build to it and a reviewer
