@@ -97,7 +97,7 @@ defmodule Tightbeam.Rules do
                  "on_rule_denied",
                  "params"
                ])
-  @binding_tokens ~w(assignment_id work_item_id holder_key holder_role holder_archetype caller_origin owner_main)
+  @binding_tokens ~w(assignment_id work_item_id holder_key holder_role holder_archetype caller_origin)
   @embedded_fields ~w(subject prompt display)
   @whole_fields ~w(target_role target_session reviews work_item name harness model effort context archetype host after at)
   @verdict_facts ~w(

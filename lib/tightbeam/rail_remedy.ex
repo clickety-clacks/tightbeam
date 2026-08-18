@@ -666,8 +666,7 @@ defmodule Tightbeam.RailRemedy do
            holder_role: holder_role,
            holder_archetype: archetype,
            caller_origin: call.origin,
-           owner: owner,
-           owner_main: Org.personal_session_key(owner)
+           owner: owner
          }}
 
       _ ->
@@ -711,7 +710,7 @@ defmodule Tightbeam.RailRemedy do
     bindings =
       Map.take(
         context,
-        ~w(assignment_id work_item_id holder_key holder_role holder_archetype caller_origin owner_main)a
+        ~w(assignment_id work_item_id holder_key holder_role holder_archetype caller_origin)a
       )
 
     with {:ok, target} <- resolve_map(remedy.target, bindings),

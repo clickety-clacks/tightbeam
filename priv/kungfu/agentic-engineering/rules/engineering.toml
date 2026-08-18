@@ -101,7 +101,7 @@ deny_when = [
 
 [rule.remedy]
 action = "wake"
-target_session = "{owner_main}"
+target_role = "product-owner"
 
 [rule.remedy.params]
 prompt = "Review-rounds doorbell for {assignment_id}: four or more review rounds have landed. Inspect the durable review history and decide whether scope or process needs correction."
