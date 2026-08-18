@@ -8,6 +8,7 @@ defmodule Tightbeam.VerificationPapertrailTest do
   alias Tightbeam.Model
 
   alias Tightbeam.{
+    Artifacts,
     Archetypes,
     Assignments,
     DB,
@@ -109,6 +110,24 @@ defmodule Tightbeam.VerificationPapertrailTest do
                attest_call(ctx.reviewer.session_key, review.id, "verdict", "reviewed-clean")
              )
 
+    # The review's own document. A verdict row carries the DECISION; the note
+    # field caps at 2000 characters, so the clause table and evidence — the
+    # reasoning that makes the decision reviewable — live in an artifact. The
+    # school requires it of reviewers exactly as it does of coders, so the
+    # papertrail fixture records one rather than modelling a reviewer that
+    # drops its own analysis.
+    Artifacts.record(ctx.db, %{
+      principal: {:session, ctx.reviewer.session_key},
+      session_key: ctx.reviewer.session_key,
+      recorded_message_id: "msg_papertrail_review",
+      params: %{
+        kind: "report",
+        title: "review clause table",
+        origin_path: Path.join(System.tmp_dir!(), "papertrail-review.md"),
+        work_item_id: item.id
+      }
+    })
+
     %{item: item, work: work, review: review}
   end
 
@@ -143,7 +162,7 @@ defmodule Tightbeam.VerificationPapertrailTest do
 
     assert_receive {:wake_delivered, artifact_wake}
     assert artifact_wake.session_key == ctx.holder.session_key
-    assert artifact_wake.prompt =~ "no results artifact is recorded"
+    assert artifact_wake.prompt =~ "no artifact is recorded on its work item"
     assert %{status: "live"} = RailRemedy.episode(ctx.db, @artifact_rule, work.id)
     # The satisfied verification statute's episode closed through maybe_close.
     assert %{status: "closed"} = RailRemedy.episode(ctx.db, @verification_rule, work.id)

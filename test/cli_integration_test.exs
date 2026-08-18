@@ -682,7 +682,7 @@ defmodule Tightbeam.CliIntegrationTest do
     assert denied_again_status != 0
     assert denied_again =~ "completion-requires-results-artifact"
     assert_receive {:wake_delivered, artifact_wake}, 5_000
-    assert artifact_wake.prompt =~ "no results artifact is recorded"
+    assert artifact_wake.prompt =~ "no artifact is recorded on its work item"
 
     # The report artifact, through the REAL CLI. This hop used to call the
     # handler directly with a `recorded_message_id` no wire client can send,

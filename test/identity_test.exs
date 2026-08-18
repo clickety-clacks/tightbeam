@@ -119,6 +119,27 @@ defmodule Tightbeam.IdentityTest do
     assert card =~ "spawn uncited"
   end
 
+  # Work-custody pin: operating-model.md is composed into EVERY archetype, so
+  # the custody rail reaches every session including learned-kungfu archetypes.
+  # The forensic reason it exists (2026-08-18): retirement deletes a workdir
+  # unless it holds registered in-workspace artifacts, so undeclared work is
+  # destroyed silently and attests that cite raw workdir paths point at bytes
+  # nobody owns — 7 of 10 paths cited over one day were already gone. Pin the
+  # load-bearing phrases so an edit that keeps the file cannot gut the rail.
+  test "the operating model carries the work-custody rail, not just the identity seam" do
+    model =
+      File.read!(Application.app_dir(:tightbeam, "priv/seed/guidance/operating-model.md"))
+
+    assert model =~ "Work custody: the last step of finishing"
+    assert model =~ "DELETED unless it holds\nregistered artifacts"
+    assert model =~ "A path\nwritten into an attest is a pointer, not custody"
+    assert model =~ "finishing has a fixed last step, not a judgment call"
+    assert model =~ "tightbeam artifact-record --kind <kind> --title"
+    assert model =~ "an unneeded artifact costs one row, an unrecorded one costs the work"
+    assert model =~ "that\nfile must be an artifact FIRST"
+    assert model =~ "the handoff is the artifact, never the\npath"
+  end
+
   test "the casebook and probe-list templates require evidence citations and hit counts" do
     avasarala =
       File.read!(Application.app_dir(:tightbeam, "priv/seed/guidance/avasarala.md"))
