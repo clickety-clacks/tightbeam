@@ -11,6 +11,7 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
     Identity,
     Roles,
     Rules,
+    Wakes,
     WorkItems
   }
 
@@ -38,6 +39,14 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
     holder = session(db, "impl-holder", "coder", "claude", "anthropic")
     owner = session(db, "po-holder", "product-owner", "codex", "openai")
     Roles.create!(db, "product-owner", "flynn", owner.session_key)
+
+    start_supervised!(
+      {Wakes,
+       db: db,
+       deliver: fn _wake -> true end,
+       tick_ms: 60_000,
+       name: Tightbeam.WakeScheduler}
+    )
 
     base_dir =
       Path.join(System.tmp_dir!(), "tightbeam-spirit-gate-#{System.unique_integer([:positive])}")
