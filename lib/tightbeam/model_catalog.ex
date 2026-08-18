@@ -565,7 +565,7 @@ defmodule Tightbeam.ModelCatalog do
             initial_401: initial_401,
             initial_guidance: "sign in again to repair the original 401",
             retry_failure: retry_failure
-           }}}
+          }}}
     end
   rescue
     _ -> error
