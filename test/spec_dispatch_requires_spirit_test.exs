@@ -354,6 +354,19 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
 
     {:ok, repeated} = Dispatch.dispatch(ctx.db, ctx.handlers, review_call.(6))
 
+    assert {:ok, %{attest: %{kind: "progress"}}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, %{
+               verb: "attest",
+               origin: "session:#{ctx.owner.session_key}",
+               principal: {:session, ctx.owner.session_key},
+               session_key: ctx.owner.session_key,
+               params: %{
+                 assignment_id: repeated.id,
+                 kind: "progress",
+                 note: "sixth review is still in progress"
+               }
+             })
+
     assert {:ok, %{attest: %{verdictKind: "changes-requested"}}} =
              Dispatch.dispatch(
                ctx.db,

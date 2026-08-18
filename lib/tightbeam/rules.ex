@@ -1059,9 +1059,9 @@ defmodule Tightbeam.Rules do
   defp recovery(rule, position, to_close), do: [{:episodes, rule.name, position} | to_close]
 
   defp maybe_close(rule, db, call, to_close) do
-    subject = if rule.effect == "notice", do: notice_ref(db, call), else: gated_ref(call)
+    subject = gated_ref(call)
 
-    if not is_nil(rule.remedy) and is_binary(subject) do
+    if rule.effect != "notice" and not is_nil(rule.remedy) and is_binary(subject) do
       case RailRemedy.live?(db, rule.name, subject) do
         nil -> to_close
         occurrence -> [{rule.name, subject, occurrence} | to_close]
