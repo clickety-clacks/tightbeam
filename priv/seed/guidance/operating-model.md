@@ -32,3 +32,25 @@ These edits are commits on `identity/` main layered over `tightbeam/upstream` an
 through `tightbeam/live`. Do not write directly into the identity tree except while resolving
 a reported re-learn conflict, followed by `tightbeam identity relearn --resolve`; use
 `--abort` to abandon that conflicted merge.
+
+# Work custody: the last step of finishing
+
+Your session workdir is scratch. When your session retires it is DELETED unless it holds
+registered artifacts — preservation is a consequence of custody, never of effort. A path
+written into an attest is a pointer, not custody: the row survives, the bytes do not.
+
+So finishing has a fixed last step, not a judgment call. Before you file completion or
+surrender — and before you go quiet on a card you may not hold again — record every
+document you produced that anyone might need again:
+
+`tightbeam artifact-record --kind <kind> --title "<title>" --path <originPath>
+[--work-item <workItemId>]`
+
+Record specs, plans, reports, reviews, analyses, and any evidence file another row cites.
+Skip build outputs, scratch probes, and anything a single command reproduces. When you are
+unsure, record it: an unneeded artifact costs one row, an unrecorded one costs the work.
+
+Two rules follow from the same fact. If you cite a workdir path anywhere as evidence, that
+file must be an artifact FIRST — citing an unrecorded path files a reference to bytes
+nobody owns. And if you hand work to a successor, the handoff is the artifact, never the
+path: the successor's session cannot read a workdir that retirement has already removed.
