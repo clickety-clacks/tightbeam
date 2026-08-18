@@ -65,6 +65,105 @@ already compiled into it:
   them explicitly with the first two commands below rather than answering that
   prompt; `--if-missing` makes both a no-op when you already have them.
 
+## Linux: unprivileged user namespaces, and the Codex sandbox
+
+**macOS is unaffected.** This section is Linux only.
+
+Codex runs every shell command inside a [bubblewrap](https://github.com/containers/bubblewrap)
+sandbox, and bubblewrap needs an **unprivileged user namespace** to build it.
+Several distributions restrict exactly that, as hardening. Where they do, no
+Codex agent on that host can run any command at all.
+
+The failure is severe and nearly silent, so know the shape of it:
+
+```
+bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted
+```
+
+It reads like a networking fault. It is not. bubblewrap creates the network
+namespace, then tries to bring up `lo` inside it, which needs a capability it
+should have inherited from the user namespace it was denied. The loopback line
+is simply the first place the missing namespace surfaces.
+
+**Why it is worse than an ordinary broken dependency:** an agent that cannot
+start a command cannot run `tightbeam` either. It cannot file an attest, record
+a blocker, or schedule a continuation. It fails, stays silent, and its card
+looks like ordinary open work. Expect to find it by noticing turns that produce
+no attests, not by seeing an error.
+
+### Check before you onboard a Linux host
+
+```sh
+bwrap --unshare-net --ro-bind / / /bin/true   # exit 0 = sandbox works
+unshare --user --map-root-user true           # exit 0 = userns available
+```
+
+If the first command prints the error above, agents on that host will not run.
+
+### Fix: Ubuntu 23.10 and later (including 24.04 LTS)
+
+Ubuntu ships `kernel.apparmor_restrict_unprivileged_userns=1` by default. It
+does not forbid the namespace outright — it transitions the process into the
+`unprivileged_userns` AppArmor profile, whose first rule is `audit deny
+capability`. You get a user namespace with every capability stripped, which is
+useless for building a sandbox. Nothing is written to the kernel log, so the
+only symptom is the `EPERM` above.
+
+Grant the capability to `bwrap` alone, using the same pattern Ubuntu ships for
+Chrome and VS Code. Create `/etc/apparmor.d/bwrap`:
+
+```
+abi <abi/4.0>,
+include <tunables/global>
+
+profile bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+  include if exists <local/bwrap>
+}
+```
+
+```sh
+sudo apparmor_parser -Q /etc/apparmor.d/bwrap   # parse-check first
+sudo apparmor_parser -r /etc/apparmor.d/bwrap   # load
+bwrap --unshare-net --ro-bind / / /bin/true     # verify
+```
+
+Existing sessions recover on their next turn; no gateway or adapter restart is
+needed. The profile reloads at boot via the `apparmor` service.
+
+Prefer this to `sysctl kernel.apparmor_restrict_unprivileged_userns=0`. That
+one line also works, and it disables the restriction for **every** binary on
+the host — unprivileged user namespaces are a well-worn local privilege
+escalation route, which is why the restriction exists. The per-binary profile
+keeps it in force everywhere else. After the profile is installed,
+`unshare --user` still fails for other programs; that is correct, not a partial
+fix.
+
+Rollback: `sudo rm /etc/apparmor.d/bwrap && sudo systemctl reload apparmor`.
+
+### What might need doing on other distributions
+
+Not verified here — treat as leads, and use the two check commands above to
+confirm before and after.
+
+- **Debian** — some configurations ship `kernel.unprivileged_userns_clone=0`.
+  Set it to `1`, persisted in `/etc/sysctl.d/`. Debian has no AppArmor
+  userns-transition profile to add, so the sysctl is the lever.
+- **RHEL, CentOS Stream, Rocky, Alma** — older releases capped
+  `user.max_user_namespaces` at `0`. Raise it in `/etc/sysctl.d/`. Current
+  releases generally ship a usable default.
+- **Arch and derivatives** — stock kernels are fine; `linux-hardened` restricts
+  userns and needs `kernel.unprivileged_userns_clone=1`.
+- **SELinux hosts** — a denial appears in the audit log rather than as silent
+  capability stripping, so `ausearch -m avc` is the place to look.
+- **Containers and unprivileged LXC** — nested user namespaces may be
+  unavailable regardless of sysctl, and the runtime may need
+  `--security-opt seccomp=unconfined` or an equivalent. A host that cannot
+  provide the namespace at all cannot run Codex agents.
+
+If a host cannot be fixed, it can still run `claude` harness sessions, which do
+not use bubblewrap.
+
 ## Install
 
 Install at least one harness first. These are the vendors' install commands;
