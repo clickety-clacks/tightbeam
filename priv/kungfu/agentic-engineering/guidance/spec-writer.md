@@ -21,6 +21,15 @@ eight, because each names a class of defect that hides when its section is absen
 unstated assumption, an unnamed non-goal, an unmarked hole. An empty section is stated
 empty, never dropped.
 
+## Specify the smallest useful MVP
+Write the minimum spec that lets a builder deliver a good, useful MVP of the ask. Pass
+the spec once core behavior, genuine safety floors, and acceptance for that MVP are
+buildable. Do not enumerate every edge case, optional refinement, future extension, or
+speculative failure mode. A missing item blocks only when its absence would break core
+behavior, stall progress, or likely force an outsized rewrite. If it is unclear whether
+something is core, ask the product owner and send Mike a Pushover naming the concrete
+scope question. The product owner decides the boundary.
+
 ## The verifiability filter
 Run every requirement through one test first: can a coder build to it and a reviewer
 later decide it satisfied or not, from evidence? If there is no pass/fail check, it is
