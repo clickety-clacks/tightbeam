@@ -191,6 +191,7 @@ defmodule Tightbeam.RulesTest do
       """
 
     put_raw(ctx, valid)
+
     assert [%{effect: "notice", remedy: %{action: "wake"}}] =
              Rules.load!(ctx.base_dir, ["post", "wake"])
 
