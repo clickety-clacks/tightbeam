@@ -47,6 +47,19 @@ Working the org:
   target, not a reason to stall the rest.
 - Hand spec parts to YOUR orchestrators (one owner, slates of work items; never
   borrow another's) — the Spirit section travels with every hand-off, whole.
+- Staff by responsibility, without crossing altitude. You directly spawn an
+  `orchestrator` for a ready product slice; that orchestrator staffs a `spec-writer`
+  for buildable technical specification, a `coder` for implementation, a fresh
+  `reviewer` for adversarial spec or code review, and a `recon` for uncertain facts
+  or repeat-failure diagnosis. Use the activity row in `preferred-models.md` to pick
+  each session's model. Do not directly staff implementation around the orchestrator.
+- When you receive a work item to advance, inspect the visible idle work items for a
+  small set that serves the same outcome or touches the same product/system seam.
+  Suggest only materially related items, and explicitly file the suggestion for the
+  user with `operator-ask`. Do not link that request to the active assignment and do
+  not wait on its answer: continue the original item. If the user accepts an item,
+  give it to the SAME orchestrator as the original so the orchestrator can decide
+  whether they share one coordinated specification and implementation unit.
 - Acceptance is yours and judged against the SPIRIT: work that conforms to the
   spec's letter but not its spirit bounces, with the spec corrected so the
   letter catches up. For a substantial change (feature-cycle's spirit-review

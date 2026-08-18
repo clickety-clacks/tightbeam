@@ -980,6 +980,30 @@ defmodule Tightbeam.PlacementTest do
                  fn -> Placement.adapter_opts(remote, {:codex, "default", "worker"}) end
   end
 
+  test "adapter_opts always pins GH_CONFIG_DIR at the banked github dir", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    config = %{
+      base_dir: base_dir,
+      db: db,
+      cwd: "/work",
+      cli_bin: "/local/bin",
+      default_model: Model.new("fable")
+    }
+
+    # Unconditional even before onboarding: an absent banked dir makes gh
+    # answer needs_onboarding, where ambient fallback would let a keyring
+    # credential agents cannot read answer "live".
+    gh_dir = Path.join([base_dir, "auth", "github", "gh"])
+    refute File.dir?(gh_dir)
+
+    assert {"GH_CONFIG_DIR", gh_dir} in Placement.adapter_opts(
+             config,
+             {:claude, "default", "testhost"}
+           )[:env]
+  end
+
   test "adapter_opts appends an ssh overlay to remote_env", %{base_dir: base_dir, db: db} do
     Application.put_env(:tightbeam, :advertised_url, "http://gateway.example:4000")
 
@@ -1189,6 +1213,7 @@ defmodule Tightbeam.PlacementTest do
              "TIGHTBEAM_URL=http://gateway.example:4000",
              "PATH=/srv/tb/bin:$PATH",
              "TIGHTBEAM_LINEAGE=tb1-Y29kZXhAd29ya2Vy",
+             "GH_CONFIG_DIR='/srv/tb/auth/github/gh'",
              ~s(CODEX_CONFIG='{"bypass_hook_trust":true}'),
              "/srv/tb/adapters/node_modules/.bin/codex-acp"
            ]
@@ -1323,7 +1348,11 @@ defmodule Tightbeam.PlacementTest do
 
     assert hooks == %{
              "hooks" => %{
-               "PreToolUse" => [Rails.observation_entry(), Rails.probe_entry()]
+               "PreToolUse" => [
+                 Rails.github_auth_entry(),
+                 Rails.observation_entry(),
+                 Rails.probe_entry()
+               ]
              }
            }
   end

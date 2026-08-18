@@ -536,7 +536,14 @@ defmodule Tightbeam.ModelCatalogTest do
                catalog_reply(~s({"detail":"Could not parse your authentication token."}), 401)
              end
            ], "codex",
-           {:http_status, 401, ~s({"detail":"Could not parse your authentication token."})}}
+           {:rotation_retry_failed,
+            %{
+              initial_401:
+                {:http_status, 401, ~s({"detail":"Could not parse your authentication token."})},
+              initial_guidance: "sign in again to repair the original 401",
+              retry_failure:
+                {:http_status, 401, ~s({"detail":"Could not parse your authentication token."})}
+            }}}
         ] do
       name = unique_name(label)
       catalog = start_catalog(ctx, Keyword.put(opts, :name, name))
@@ -599,6 +606,60 @@ defmodule Tightbeam.ModelCatalogTest do
 
     assert File.read!(Path.join([ctx.base_dir, "auth", "claude", ".credentials.json"])) ==
              rotated_home
+  end
+
+  test "a failed rotation retry reports the original 401 and distinct retry failure", ctx do
+    stale_store = ~s({"claudeAiOauth":{"accessToken":"fixture-token-STALE"}})
+    File.write!(Path.join([ctx.base_dir, "auth", "claude", ".credentials.json"]), stale_store)
+
+    home = Path.join([ctx.base_dir, "homes", @host, "claude"])
+    File.mkdir_p!(home)
+
+    File.write!(
+      Path.join(home, ".credentials.json"),
+      ~s({"claudeAiOauth":{"accessToken":"fixture-token-ROTATED"}})
+    )
+
+    revoked =
+      ~s({"type":"error","error":{"type":"authentication_error","message":"OAuth access token has been revoked."}})
+
+    fetches = :counters.new(1, [])
+
+    claude_fetch = fn "/v1/models?limit=100", _headers ->
+      :counters.add(fetches, 1, 1)
+
+      case :counters.get(fetches, 1) do
+        1 -> {:error, {:http_status, 401, revoked}}
+        2 -> {:error, {:network, :etimedout}}
+        count -> flunk("catalog fetched #{count} times")
+      end
+    end
+
+    catalog = start_catalog(ctx, claude_fetch: claude_fetch)
+
+    combined_failure =
+      {:rotation_retry_failed,
+       %{
+         initial_401: {:http_status, 401, revoked},
+         initial_guidance: "sign in again to repair the original 401",
+         retry_failure: {:network, :etimedout}
+       }}
+
+    await(fn ->
+      ModelCatalog.get(@host, "claude", catalog) ==
+        {[], {:unavailable, combined_failure}}
+    end)
+
+    assert :counters.get(fetches, 1) == 2
+
+    assert {:error, %Unroutable{} = unroutable} =
+             ModelCatalog.route(@host, "claude", Model.new("anything"), catalog)
+
+    message = Unroutable.message(unroutable)
+    assert message =~ "initial_401"
+    assert message =~ "sign in again to repair the original 401"
+    assert message =~ "retry_failure"
+    assert message =~ "etimedout"
   end
 
   test "an api-key 401 is never treated as a rotation and never harvested", ctx do

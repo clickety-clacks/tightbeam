@@ -4,7 +4,7 @@
     "method": "GET",
     "url": "https://api.anthropic.com/v1/models?limit=1",
     "header": "x-api-key",
-    "source": "curl from eezo, deliberately invalid key",
+    "source": "curl fixture, deliberately invalid key",
     "sanitized": true
   },
   "response": {

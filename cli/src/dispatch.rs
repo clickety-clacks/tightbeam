@@ -118,6 +118,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
         Command::Help
         | Command::CommandHelp(_)
         | Command::Doctor { .. }
+        | Command::GithubAuthCheck
         | Command::UpdateClients { .. }
         | Command::Assimilate(_) => {
             Err("command does not dispatch through /agent/dispatch".to_owned())
@@ -905,6 +906,25 @@ pub fn build_onboard_phase_request(
     request(identity, "onboard", vec![], params)
 }
 
+/// Build a `wake --user <owner>` request carrying the onboarding sign-in prompt, so the
+/// operator who cannot see the ceremony's terminal still receives the URL+code. The wake
+/// row IS the durable record of the delivery (wi_0535922b) -- it persists in the substrate
+/// with the code text, the target, and timestamps.
+///
+/// `userId` is a target field and `prompt` a param, exactly as `Command::Wake` builds them.
+pub fn build_operator_wake_request(
+    identity: &Identity,
+    owner_user_id: &str,
+    prompt: &str,
+) -> RequestSpec {
+    request(
+        identity,
+        "wake",
+        vec![string_field("userId", owner_user_id)],
+        vec![string_field("prompt", prompt)],
+    )
+}
+
 pub fn build_register_host_request(
     as_user: &str,
     name: &str,
@@ -1353,11 +1373,20 @@ where
         }
         Command::UpdateClients { as_user } => crate::ceremonies::update_clients(&as_user),
         Command::Assimilate(args) => crate::ceremonies::assimilate(args),
+        Command::GithubAuthCheck => crate::github_auth::check_tool_call_stdin(),
         Command::Onboard {
             identity,
             provider,
             api_key,
+            hostname,
+            remote,
         } => {
+            if provider == "github" {
+                return crate::github_auth::onboard(
+                    hostname.as_deref().unwrap_or("github.com"),
+                    remote.as_deref(),
+                );
+            }
             let endpoint = discover_endpoint()?;
             require_session_endpoint(&identity, &endpoint)?;
             crate::ceremonies::onboard(
@@ -1482,6 +1511,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::CommandHelp(_)
         | Command::Doctor { .. }
         | Command::ToolCallObserved
+        | Command::GithubAuthCheck
         | Command::UpdateClients { .. }
         | Command::Assimilate(_) => None,
     }
@@ -2750,6 +2780,8 @@ mod tests {
                 identity: Identity::User("flynn".to_owned()),
                 provider: "openai".to_owned(),
                 api_key: false,
+                hostname: None,
+                remote: None,
             },
             || {
                 discoveries.set(discoveries.get() + 1);
@@ -2857,6 +2889,8 @@ mod tests {
                 identity: Identity::User("flynn".to_owned()),
                 provider: "openai".to_owned(),
                 api_key: false,
+                hostname: None,
+                remote: None,
             },
             || {
                 Ok(Endpoint {

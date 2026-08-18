@@ -152,6 +152,192 @@ defmodule Tightbeam.Wire.RouterTest do
     assert agent_verbs -- handler_keys == []
   end
 
+  # The seam gh#11 named: operator-ask/-rule/-withdraw had a working Escalation
+  # implementation, a CLI that sent them, and unit tests that called Escalation
+  # DIRECTLY — but the wire router omitted them from @agent_verbs (rejected as
+  # "verb not allowed") and the Gateway handler table had no entry (unknown_verb).
+  # The unit tests never crossed the router, so the dead seam shipped. This test
+  # drives the whole operator lifecycle THROUGH /agent/dispatch against the REAL
+  # Gateway handlers, so the allowlist and the handler table must both carry the
+  # verbs for it to pass.
+  test "operator decision lifecycle crosses the wire router: ask -> list -> rule -> withdraw",
+       ctx do
+    owner = ctx.device.user_id
+    raiser = create_session(ctx.db, "operator-raiser", owner, is_built_in: true)
+    handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})
+    ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, handlers)}
+
+    # ask — as the raiser session (a session principal, which operator-ask requires)
+    ask =
+      dispatch_cli(ctx, raiser.cli_token, %{
+        verb: "operator-ask",
+        params: %{question: "ship 0.1.8?", options: [%{label: "ship"}, %{label: "hold"}]}
+      })
+
+    assert ask.status == 200
+    asked = JSON.decode!(ask.resp_body)["result"]
+    assert asked["status"] == "open"
+    assert is_binary(dr_id = asked["id"])
+
+    # list — as the owner over the org transport; the open request appears
+    listed =
+      dispatch_cli(ctx, "tbc_test", %{verb: "decision-requests", asUser: owner, params: %{}})
+
+    assert listed.status == 200
+
+    ids =
+      JSON.decode!(listed.resp_body)["result"]["decisionRequests"] |> Enum.map(& &1["id"])
+
+    assert dr_id in ids
+
+    # rule — as the owner; org transport (not the owner's personal session) so it
+    # is a genuine ruling, not the proxy_only refusal
+    ruled =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "operator-rule",
+        asUser: owner,
+        params: %{request: dr_id, decision: "ship"}
+      })
+
+    assert ruled.status == 200
+    assert JSON.decode!(ruled.resp_body)["result"]["status"] == "ruled"
+
+    # withdraw — needs an open request, so open a second and withdraw it, closing
+    # the fourth verb through the same seam
+    ask2 =
+      dispatch_cli(ctx, raiser.cli_token, %{
+        verb: "operator-ask",
+        params: %{question: "cut 0.1.9?", options: [%{label: "cut"}, %{label: "wait"}]}
+      })
+
+    assert is_binary(dr2 = JSON.decode!(ask2.resp_body)["result"]["id"])
+
+    withdrawn =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "operator-withdraw",
+        asUser: owner,
+        params: %{request: dr2, reason: "moot after ship"}
+      })
+
+    assert withdrawn.status == 200
+    assert JSON.decode!(withdrawn.resp_body)["result"]["status"] == "withdrawn"
+
+    # The negative side of the SAME seam. The defect was the allowlist gate: a
+    # verb it omits is refused here, before any handler, with this exact shape —
+    # the refusal the three operator verbs used to draw. Assert it directly so a
+    # future drop from @agent_verbs is caught as a refusal, not a silent 200.
+    denied = dispatch_cli(ctx, raiser.cli_token, %{verb: "operator-nonsense", params: %{}})
+
+    assert denied.status == 400
+
+    assert JSON.decode!(denied.resp_body) == %{
+             "error" => %{
+               "code" => "invalid_message",
+               "message" => "verb not allowed: operator-nonsense"
+             }
+           }
+
+    # And an allowed operator verb still enforces its owner authorization THROUGH
+    # the router: a session principal (not the human owner) is refused not_owner,
+    # proving the verb is genuinely routed to its handler's auth, not merely let
+    # past the allowlist.
+    ask3 =
+      dispatch_cli(ctx, raiser.cli_token, %{
+        verb: "operator-ask",
+        params: %{question: "who rules?", options: [%{label: "a"}, %{label: "b"}]}
+      })
+
+    assert is_binary(dr3 = JSON.decode!(ask3.resp_body)["result"]["id"])
+
+    not_owner =
+      dispatch_cli(ctx, raiser.cli_token, %{
+        verb: "operator-rule",
+        params: %{request: dr3, decision: "a"}
+      })
+
+    assert JSON.decode!(not_owner.resp_body)["error"]["code"] == "not_owner"
+  end
+
+  # The --status filter had the same shape of defect the operator verbs did: a working
+  # unit but an unproven wire path. Escalation.list appended `AND status = ?` for ANY
+  # binary status, so `decision-requests --status all` filtered on the literal 'all' and
+  # returned nothing. The unit tests in escalation_test.exs call Escalation.list/list_status
+  # DIRECTLY; this drives the filter THROUGH /agent/dispatch against the REAL Gateway
+  # handler, so status=all listing rows and status=bogus reaching the client as a named
+  # refusal are both proven on the wire, not just at the seam.
+  test "decision-requests status filter crosses the wire router: all lists, illegal refuses",
+       ctx do
+    owner = ctx.device.user_id
+    raiser = create_session(ctx.db, "dr-filter-raiser", owner, is_built_in: true)
+    handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})
+    ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, handlers)}
+
+    # Two requests spanning two statuses: one left open, one ruled.
+    open_ask =
+      dispatch_cli(ctx, raiser.cli_token, %{
+        verb: "operator-ask",
+        params: %{question: "q-open?", options: [%{label: "a"}, %{label: "b"}]}
+      })
+
+    assert is_binary(open_id = JSON.decode!(open_ask.resp_body)["result"]["id"])
+
+    ruled_ask =
+      dispatch_cli(ctx, raiser.cli_token, %{
+        verb: "operator-ask",
+        params: %{question: "q-ruled?", options: [%{label: "a"}, %{label: "b"}]}
+      })
+
+    assert is_binary(ruled_id = JSON.decode!(ruled_ask.resp_body)["result"]["id"])
+
+    ruled =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "operator-rule",
+        asUser: owner,
+        params: %{request: ruled_id, decision: "a"}
+      })
+
+    assert ruled.status == 200
+
+    list_ids = fn params ->
+      resp =
+        dispatch_cli(ctx, "tbc_test", %{verb: "decision-requests", asUser: owner, params: params})
+
+      assert resp.status == 200
+      JSON.decode!(resp.resp_body)["result"]["decisionRequests"] |> Enum.map(& &1["id"])
+    end
+
+    # status=all returns rows in BOTH statuses over the wire — the regression: before the
+    # fix this filtered on literal 'all' and returned [].
+    all_ids = list_ids.(%{status: "all"})
+    assert open_id in all_ids
+    assert ruled_id in all_ids
+
+    # Absent status defaults to "open" through the router: the open row shows, the ruled
+    # one is filtered out.
+    default_ids = list_ids.(%{})
+    assert open_id in default_ids
+    refute ruled_id in default_ids
+
+    # An explicit legal status filters over the wire to exactly that status.
+    open_only = list_ids.(%{status: "open"})
+    assert open_id in open_only
+    refute ruled_id in open_only
+
+    # An illegal status reaches the client as a NAMED refusal (HTTP 400), not a silent
+    # empty 200 — the refusal names the legal set.
+    bogus =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "decision-requests",
+        asUser: owner,
+        params: %{status: "bogus"}
+      })
+
+    assert bogus.status == 400
+    error = JSON.decode!(bogus.resp_body)["error"]
+    assert error["code"] == "invalid"
+    assert error["message"] =~ "open, ruled, consumed, withdrawn, superseded, all"
+  end
+
   test "identity status crosses the closed CLI verb router", ctx do
     response =
       dispatch_cli(ctx, "tbc_test", %{
@@ -313,6 +499,23 @@ defmodule Tightbeam.Wire.RouterTest do
 
     assert response.status == 200
     assert response.resp_body == expected
+  end
+
+  test "/version states which bytes the gateway is: version + build stamp", ctx do
+    response = Router.call(conn(:get, "/version"), Router.init(ctx.opts))
+
+    assert response.status == 200
+    body = JSON.decode!(response.resp_body)
+
+    # The release version comes from its single home; the seam only asserts the
+    # body carries it, not a hardcoded string that every bump would break.
+    assert body["version"] == Tightbeam.CliCompatibility.required_version()
+
+    # build is the compile-time rev-list count: a positive integer, and the exact
+    # value the stamp captured — never runtime git.
+    assert is_integer(body["build"]) and body["build"] > 0
+    assert body["build"] == Tightbeam.BuildStamp.build()
+    assert body["sha"] == Tightbeam.BuildStamp.sha()
   end
 
   test "CLI exact-version refusal is loud and precedes bearer authentication", ctx do

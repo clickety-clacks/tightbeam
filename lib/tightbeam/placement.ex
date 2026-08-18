@@ -1179,7 +1179,7 @@ defmodule Tightbeam.Placement do
         {"TIGHTBEAM_MACHINE", host},
         {"PATH", path},
         {"TIGHTBEAM_LINEAGE", lineage}
-      ] ++ overlay_env
+      ] ++ github_env(config.base_dir) ++ overlay_env
 
     remote_env =
       if host_config.ssh do
@@ -1188,7 +1188,13 @@ defmodule Tightbeam.Placement do
           "TIGHTBEAM_MACHINE=#{host}",
           "TIGHTBEAM_URL=#{Application.fetch_env!(:tightbeam, :advertised_url)}",
           "PATH=#{path}",
-          "TIGHTBEAM_LINEAGE=#{lineage}"
+          "TIGHTBEAM_LINEAGE=#{lineage}",
+          # Unconditional on satellites: existence of the banked dir cannot be
+          # checked cheaply over ssh, and pointing gh at an absent dir yields
+          # the correct answer anyway (needs_onboarding on the satellite's own
+          # store), where inheriting the remote user's keyring would repeat the
+          # local trap: live from a terminal, unreadable from project work.
+          "GH_CONFIG_DIR=#{Tightbeam.Harness.Support.shell_quote(Tightbeam.GithubAuth.config_dir(host_config.base_dir))}"
         ] ++
           Enum.map(overlay_env, fn {name, value} ->
             "#{name}=#{Tightbeam.Harness.Support.shell_quote(value)}"
@@ -1273,6 +1279,18 @@ defmodule Tightbeam.Placement do
       end
     end)
   end
+
+  # The GitHub host capability reaches agents as a path, never as token bytes:
+  # `tightbeam onboard github` banks a file-backed gh credential under the base
+  # dir, and GH_CONFIG_DIR points gh (and git, through gh's credential helper)
+  # at it. The OS login keychain is not an alternative here — agent processes
+  # descend from the gateway daemon, and that context cannot read it
+  # (errSecInteractionNotAllowed), so a keyring credential probes live from an
+  # operator terminal while failing everywhere project work actually runs.
+  # Unconditional, banked or not: pointing gh at an absent dir yields the
+  # honest answer (needs_onboarding) where ambient fallback would let a store
+  # agents cannot reach answer "live".
+  defp github_env(base_dir), do: Tightbeam.GithubAuth.env(base_dir)
 
   @doc """
   Capture same-tier adapter boot inputs in the higher-tier coordinator.

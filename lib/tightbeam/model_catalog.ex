@@ -547,13 +547,26 @@ defmodule Tightbeam.ModelCatalog do
   # does the same), so this is scoped to a local probe; a remote host's
   # credential lives on that host and this cannot reach it.
   defp retry_after_rotation_harvest(
-         {:error, {:http_status, 401, _}} = error,
+         {:error, {:http_status, 401, _} = initial_401} = error,
          :subscription,
          %{host_config: %{ssh: nil}} = probe,
          module
        ) do
     Tightbeam.Homes.sweep_auth(probe.base_dir, module.id())
-    module.fetch_catalog(probe)
+
+    case module.fetch_catalog(probe) do
+      {:ok, _entries} = success ->
+        success
+
+      {:error, retry_failure} ->
+        {:error,
+         {:rotation_retry_failed,
+          %{
+            initial_401: initial_401,
+            initial_guidance: "sign in again to repair the original 401",
+            retry_failure: retry_failure
+           }}}
+    end
   rescue
     _ -> error
   end

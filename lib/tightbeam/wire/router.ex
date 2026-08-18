@@ -54,7 +54,7 @@ defmodule Tightbeam.Wire.Router do
 
   Module.register_attribute(__MODULE__, :agent_verbs, persist: true)
 
-  @agent_verbs ~w(wake condition facts-read artifact-record artifact-get artifacts spawn retire critical inspect cancel tune approve-device deny-device revoke-device promote-user add-user config register-host host-env-set host-env-list host-env-unset host-toolchain-set update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests revoke-assignment assignments work-item-create work-item-get work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail rule effort-rule waive revoke-waiver withdraw decision-requests decision-request transcript attend toplines topline harness-processes)
+  @agent_verbs ~w(wake condition facts-read artifact-record artifact-get artifacts spawn retire critical inspect cancel tune approve-device deny-device revoke-device promote-user add-user config register-host host-env-set host-env-list host-env-unset host-toolchain-set update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests revoke-assignment assignments work-item-create work-item-get work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail rule effort-rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request transcript attend toplines topline harness-processes)
   @max_upload_bytes 32 * 1024 * 1024
   @multipart_opts Plug.Parsers.init(
                     parsers: [{:multipart, length: @max_upload_bytes + 1_000_000}],
@@ -98,7 +98,17 @@ defmodule Tightbeam.Wire.Router do
         do: Tightbeam.AdapterCoordinator.health(coordinator),
         else: %{}
 
-    json(conn, 200, %{"protocolVersion" => 1, "server" => "tightbeam", "adapters" => health})
+    # builds-identify-bytes: a running gateway states which bytes it is. version is
+    # the release version (single home: the CLI-compat policy); build/sha are the
+    # compile-time stamp (Tightbeam.BuildStamp), not runtime git.
+    json(conn, 200, %{
+      "protocolVersion" => 1,
+      "server" => "tightbeam",
+      "version" => Tightbeam.CliCompatibility.required_version(),
+      "build" => Tightbeam.BuildStamp.build(),
+      "sha" => Tightbeam.BuildStamp.sha(),
+      "adapters" => health
+    })
   end
 
   get "/harnesses" do

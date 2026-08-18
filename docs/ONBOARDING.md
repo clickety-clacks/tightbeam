@@ -8,6 +8,11 @@ Harness CLIs are the operator's to install; Tight Beam installs its own
 plumbing (adapters, CLI, base dir) and never the vendors' software. Install the
 binary first (`docs/SATELLITE.md`), then onboard it here.
 
+GitHub is a separate host capability, not a model-provider credential. Its
+project-auth contract is specified in `docs/GITHUB-AUTH.md`; the important rule
+is the same operational shape: prove the host can authenticate, or refuse with a
+repair. Do not paste a PAT into an agent.
+
 ## The two kinds
 
 A host holds ONE credential per provider, of either kind, and it is host-local
@@ -31,6 +36,30 @@ provider, the host and the kind, and leaves the existing credential untouched.
 An `onboarded` result from the CLI is therefore a claim about the ceremony, not
 proof the credential works; prove liveness separately (below) before trusting
 it.
+
+## The definition of interactive onboarding
+
+Interactive onboarding is not complete until the operator holds the sign-in URL
+and the one-time code. The loop runs through the operator: the operator opens the
+URL, approves in a browser, and the ceremony banks the credential. No code in the
+operator's hands means the operator cannot finish. So the onboarding is not done.
+Every `tightbeam onboard <provider>` means this full loop, not just the command
+returning.
+
+The ceremony delivers the URL and code so an operator who cannot see its terminal
+still receives them — a session-run install over a private pty is the case this
+protects. It emits the deliverable three ways:
+
+- a **wake** to the owner user, carrying the URL and code. This is the durable
+  record and the notification in one.
+- a **0600 delivery file** in the working directory
+  (`onboard-delivery-<provider>-<ms>.json`). This is a local copy a courier can read.
+- a **structured line** on stdout (`{"onboardingDelivery": …}`) for a relay to parse.
+
+The one-time code is not a credential. It is a short-lived pairing code that expires
+in minutes. If the gateway does not name the owner (an older gateway, or a caller
+with no owner), the ceremony still writes the file and the structured line, and it
+records that no wake was sent. It degrades loudly, never silently.
 
 ## Running an interactive ceremony
 
@@ -105,6 +134,12 @@ Login status and file presence are not liveness.
 Run these checks when model-catalog or credential-home code changes. They use
 fixture credentials and never contact a provider.
 
+0. Complete the README's [From source](../README.md#from-source) setup through
+   the release CLI build.
+
+   PASS: every prerequisite command exits zero, including `mix deps.get` and
+   `cargo build --release --manifest-path cli/Cargo.toml`.
+
 1. Run the public-route end-to-end check:
 
    ~~~sh
@@ -124,8 +159,9 @@ fixture credentials and never contact a provider.
    PASS: a local subscription 401 repairs and retries. An API-key 401 does not
    harvest. A remote-host subscription 401 does not harvest the gateway store.
 
-3. Record both command exits and test counts. A skipped negative row is not a
-   pass. Do not use a real credential to satisfy either check.
+3. Record every prerequisite and test command exit, plus both test counts. A
+   skipped negative row is not a pass. Do not use a real credential to satisfy
+   either check.
 
 ## What a credential looks like on disk
 

@@ -31,6 +31,16 @@ invariants, error paths, and over-engineering. An unrequested addition is a find
 Demo, prototype, or placeholder framing on a product-trusted path is a finding. A
 hand-written ideal fixture is a finding — it passes review and ships broken.
 
+## Apply an MVP review threshold
+Review the minimum necessary for a good, useful MVP of the ask. Do not request changes
+merely for exhaustive edge-case coverage, optional completeness, polish, or speculative
+robustness. Block only defects with an outsized effect on core behavior, the required
+safety floor, forward progress, or likely rewrite cost; record lesser observations as
+non-blocking or omit them. If it is unclear whether something is core, raise the scope
+question to the product owner and explicitly file an owner-scoped user decision request
+with `operator-ask`, linking the affected assignment when one exists. The product owner
+and user ruling decide the boundary.
+
 ## Patterns are findings too
 A deviation from an established pattern is a finding unless the spec ratifies it; a new
 pattern duplicating an existing one under a new name is a finding even when the parallel

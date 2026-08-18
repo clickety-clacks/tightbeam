@@ -6,7 +6,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::{Command as ProcessCommand, ExitStatus, Stdio};
+use std::process::{ChildStdout, Command as ProcessCommand, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -17,6 +17,7 @@ use crate::child_process::{
 };
 use crate::dispatch::{self, Endpoint, RequestSpec};
 use crate::harnesses::HarnessCatalog;
+use crate::onboard_emit::{self, Deliverable, Notified};
 use crate::preflight;
 
 /// Read the staging path out of a `begin` phase response.
@@ -61,12 +62,38 @@ fn lease_deadline(ready: &serde_json::Value, now: Instant) -> Instant {
     now + lease_timeout(ready)
 }
 
+/// The owner user id the gateway names on the `begin` reply (wi_0535922b), so the CLI can
+/// wake THAT user with the sign-in URL+code. Absent on a gateway too old to send it or a
+/// caller with no owner (a process principal) -- the emission then degrades loudly rather
+/// than waking no one. Pure so the wire shape can be pinned by a test.
+fn owner_user_id(ready: &serde_json::Value) -> Option<String> {
+    ready
+        .get("ownerUserId")
+        .and_then(serde_json::Value::as_str)
+        .filter(|owner| !owner.is_empty())
+        .map(str::to_owned)
+}
+
 type HarnessLoader<'a> = dyn Fn(&Endpoint, Instant) -> Result<Option<HarnessCatalog>, String> + 'a;
+
+/// The gateway sender the ceremony uses to emit the sign-in delivery (operator wake) --
+/// type-erased like `HarnessLoader` so `Ceremony` stays a plain struct rather than growing a
+/// generic parameter for it.
+type SendRequest<'a> = dyn Fn(&Endpoint, &RequestSpec, Option<Instant>) -> Result<Option<serde_json::Value>, String>
+    + 'a;
 
 struct Ceremony<'a> {
     endpoint: &'a Endpoint,
     deadline: Instant,
     load_harnesses: &'a HarnessLoader<'a>,
+    // Emission context (wi_0535922b): who to attribute the wake to, how to send it, which
+    // provider/machine the delivery names, and the owner user to wake (absent on an older
+    // gateway or a non-owned caller -> the CLI degrades loudly).
+    identity: &'a Identity,
+    send: &'a SendRequest<'a>,
+    provider: &'a str,
+    machine: Option<&'a str>,
+    owner_user_id: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -130,6 +157,11 @@ where
         endpoint,
         deadline,
         load_harnesses: &load_harnesses,
+        identity,
+        send: &send_request,
+        provider,
+        machine: machine.as_deref(),
+        owner_user_id: ready.as_ref().and_then(owner_user_id),
     };
     let ready = match ready {
         Some(ready) => ready,
@@ -853,6 +885,147 @@ fn this_host() -> String {
         .unwrap_or_else(|| "this machine".to_owned())
 }
 
+/// Milliseconds since the epoch, for stamping when a deliverable was minted.
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn wake_id_of(reply: &serde_json::Value) -> Option<String> {
+    reply
+        .get("wakeId")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
+/// Surface a sign-in deliverable the operator cannot see on the ceremony's terminal, through
+/// the three channels of Mike's triad (wi_0535922b): the operator WAKE (the durable substrate
+/// row AND the notification, in one), a 0600 local delivery FILE, and a machine-readable
+/// STRUCTURED line on stdout. Every channel is best-effort and LOUD on failure -- a delivery
+/// that cannot be waked or filed says so rather than vanishing.
+fn emit_delivery(ceremony: &Ceremony<'_>, deliverable: &Deliverable, ttl: Option<Duration>) {
+    let machine = ceremony
+        .machine
+        .map(str::to_owned)
+        .unwrap_or_else(this_host);
+    let minted = now_ms();
+    let expires = ttl.map(|ttl| minted + ttl.as_millis() as i64);
+
+    // 1. Operator wake: the durable row carrying the code text, target, and timestamps.
+    let notified = notify_operator(ceremony, deliverable, &machine);
+
+    // 2. Local durable copy (0600): a file a courier can read even if the wake never sent.
+    let file_json = onboard_emit::delivery_file_json(
+        ceremony.provider,
+        &machine,
+        deliverable,
+        minted,
+        expires,
+        &notified,
+    );
+    let file_path = write_delivery_file(ceremony.provider, minted, &file_json);
+
+    // 3. Structured stdout: the machine-readable line, pointing at the wake and the file.
+    let wake_id = match &notified {
+        Notified::Waked { wake_id, .. } => wake_id.as_deref(),
+        Notified::NotNotified { .. } => None,
+    };
+    let line = onboard_emit::structured_line(
+        ceremony.provider,
+        &machine,
+        deliverable,
+        wake_id,
+        file_path.as_deref(),
+    );
+    println!("{line}");
+}
+
+/// Wake the owner user with the sign-in prompt -- the durable substrate row AND the
+/// notification in one. Split from `emit_delivery` so the branch logic (owner present ->
+/// wake; owner absent or send failed -> a LOUD `NotNotified` with the reason) is testable
+/// with a fake sender, without the file and stdout side effects.
+fn notify_operator(ceremony: &Ceremony<'_>, deliverable: &Deliverable, machine: &str) -> Notified {
+    let Some(owner) = ceremony.owner_user_id.as_deref() else {
+        eprintln!(
+            "onboarding delivery: no owner to notify -- the gateway did not name an ownerUserId \
+             (an older gateway, or a caller with no owner). The URL+code are in the delivery file \
+             and structured output below."
+        );
+        return Notified::NotNotified {
+            reason: "gateway did not supply ownerUserId".to_owned(),
+        };
+    };
+
+    let prompt = onboard_emit::operator_prompt(ceremony.provider, machine, deliverable);
+    let request = dispatch::build_operator_wake_request(ceremony.identity, owner, &prompt);
+    // Bound the wake to the SAME lease the child runs under. This send is synchronous inside
+    // emit_delivery, reached from tee_pump mid-poll: an unbounded send to a hung gateway would
+    // outlive the ceremony deadline -- the notification defeating the very lease the watchdog
+    // enforces. Some(deadline) routes through send_to_with_deadline's lease::until, so a hang
+    // expires loudly here and falls through to the still-written file + stdout channels below.
+    match (ceremony.send)(ceremony.endpoint, &request, Some(ceremony.deadline)) {
+        Ok(reply) => Notified::Waked {
+            user_id: owner.to_owned(),
+            wake_id: reply.as_ref().and_then(wake_id_of),
+        },
+        Err(error) => {
+            eprintln!(
+                "onboarding delivery: could NOT wake the operator ({owner}): {error}. The \
+                 URL+code are in the delivery file and structured output below."
+            );
+            Notified::NotNotified {
+                reason: format!("wake failed: {error}"),
+            }
+        }
+    }
+}
+
+/// Write the 0600 delivery file into the CURRENT DIRECTORY -- the session workdir for an
+/// agent-run ceremony (durable artifact space), the invoker's directory for a user run.
+/// Never /tmp, never home by construction: it lands where the operator invoked onboard.
+/// Best-effort: a write failure is loud but does not fail the ceremony, since the wake and
+/// stdout still carry the deliverable. Returns the path written, for the structured line.
+fn write_delivery_file(provider: &str, minted_ms: i64, contents: &str) -> Option<String> {
+    let name = format!("onboard-delivery-{provider}-{minted_ms}.json");
+    let path = std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(&name);
+    // create_new (O_CREAT|O_EXCL): on Unix the mode argument is honored ONLY when the file is
+    // created, so a create+truncate of an existing name would keep that file's old, possibly
+    // world-readable mode. Refusing to reuse a name makes a non-0600 delivery file
+    // unrepresentable -- a name collision (two deliveries in the same millisecond into one cwd)
+    // becomes the loud named failure below, never a silent 0644.
+    let open = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&path);
+    match open.and_then(|mut file| file.write_all(contents.as_bytes())) {
+        Ok(()) => Some(path.to_string_lossy().into_owned()),
+        Err(error) => {
+            eprintln!(
+                "onboarding delivery: could not write the delivery file {}: {error}",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+/// codex's device code appears on stdout the instant it is minted, then codex POLLS for up to
+/// fifteen minutes for the operator to approve in a browser. The operator therefore needs the
+/// code BEFORE codex exits -- so this TEES stdout: the supervise drive forwards every byte to
+/// the real terminal (passthrough preserved for an operator who IS watching) while buffering
+/// it, and the moment the URL+code parse out it emits the delivery mid-run. This is not the
+/// old scrape it superseded: that echoed to an operator who could already see the screen;
+/// this delivers to one who cannot.
+///
+/// The tee is done SINGLE-THREADED inside a custom drive (`attend_teed`) that mirrors
+/// `attend`'s exit/interrupt/expire loop exactly and reads the same `Supervised` predicates,
+/// so the INTERRUPTED classification and lease watchdog are preserved. `attend` itself is
+/// untouched for every other ceremony.
 fn run_openai_onboarding(staging: &str, ceremony: &Ceremony<'_>) -> Result<(), StageFailure> {
     let codex = harness_cli("openai", ceremony).map_err(StageFailure::from)?;
     let mut command = ProcessCommand::new(&codex);
@@ -862,20 +1035,166 @@ fn run_openai_onboarding(staging: &str, ceremony: &Ceremony<'_>) -> Result<(), S
         .stdin(Stdio::inherit())
         .stderr(Stdio::inherit());
 
-    // stdout is INHERITED, not captured. codex prints the sign-in link and the one-time
-    // code itself, more usefully than we did: we used to pipe its output, replay it through
-    // a terminal emulator to strip ANSI, scan for a URL, and echo back a line the operator
-    // could already see four lines above. Reading a stream we have no reason to read is the
-    // same mistake the anthropic leg was deleted for.
-    // `run_bounded_inner` rather than `run_bounded`: the latter flattens its error to a
-    // String, which discards the INTERRUPTED classification. An interrupt must stay
-    // distinguishable from an ordinary failure all the way up, because `onboard` skips the
-    // gateway cancel on one and not the other.
-    let status = run_bounded_inner(command, "codex device-code login", ceremony.deadline, None)
-        .map_err(StageFailure::from)?;
+    let mut emitted = false;
+    let mut buffer = Vec::<u8>::new();
 
+    let outcome = supervise_teed(command, ceremony, &mut emitted, &mut buffer);
+
+    // Miss path: codex produced a sign-in block we could not parse (a format drift), and it
+    // was not an operator cancel. Record the raw teed tail so the deliverable is never
+    // invisible -- loud degradation, exactly as ruled.
+    // The fallback must NOT gate on codex's vendor wording ("device", "one-time code"): the
+    // drift it exists to survive is precisely a change to that wording, so gating on it
+    // reintroduces the silent-loss class this work item removes. Any non-empty output we
+    // failed to parse into a code, that was not an operator cancel, earns the raw tail;
+    // raw_tail's own trim guards the whitespace-only case.
+    let interrupted = matches!(&outcome, Err(error) if error.is_interrupted());
+    if !emitted && !interrupted {
+        let text = String::from_utf8_lossy(&buffer);
+        let tail = onboard_emit::raw_tail(&text, 4096);
+        if !tail.is_empty() {
+            emit_delivery(ceremony, &Deliverable::RawTail { tail }, None);
+        }
+    }
+
+    let status = outcome.map_err(StageFailure::from)?;
     codex_staged_a_credential(status, staging, "OpenAI device-code onboarding")
         .map_err(StageFailure::from)
+}
+
+/// Spawn a device-auth child with its stdout TEED, and drive it under the lease with
+/// `attend_teed`. Forces the two things the tee needs and nothing provider-specific: a piped
+/// stdout, and the child's own process group (setpgid, so the lease watchdog can terminate the
+/// whole ceremony group -- the same setup `run_bounded_inner` does, replicated because the tee
+/// needs a custom `supervise` drive rather than the shared `attend`-only one). The caller
+/// configures everything else (program, args, env, stdin, stderr).
+///
+/// Extracted from `run_openai_onboarding` for one reason: so the teed drive -- the piped
+/// stdout flowing through `attend_teed`/`tee_pump` into `emit_delivery` mid-run -- is
+/// exercisable against a stub child. Production points it at codex; the tests point it at a
+/// `/bin/sh` stub that replays a real device-auth capture.
+fn supervise_teed(
+    mut command: ProcessCommand,
+    ceremony: &Ceremony<'_>,
+    emitted: &mut bool,
+    buffer: &mut Vec<u8>,
+) -> Result<ExitStatus, RunError> {
+    command.stdout(Stdio::piped());
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    supervise(
+        command,
+        "codex device-code login",
+        ceremony.deadline,
+        |supervised| attend_teed(supervised, ceremony, emitted, buffer),
+    )
+    .map(|(_, status)| status)
+}
+
+/// `attend` with a teed stdout. Identical job-control and loop to `attend` -- setpgid, the
+/// terminal handoff, the SIGCONT, then the exact `exited?`/`interrupted?`/`leader_exited`/
+/// `expired?`/`wait` ordering -- with one addition: the piped stdout is drained each pass
+/// (and once more at exit) so the URL+code reach the operator while codex still polls. No
+/// stdin secret is delivered; codex reads none for device-auth.
+fn attend_teed(
+    supervised: &mut Supervised,
+    ceremony: &Ceremony<'_>,
+    emitted: &mut bool,
+    buffer: &mut Vec<u8>,
+) -> Result<(), RunError> {
+    let pgid = supervised.pgid();
+    unsafe {
+        libc::setpgid(pgid, pgid);
+    }
+
+    let _terminal = TerminalHandoff::to(pgid);
+
+    unsafe {
+        libc::killpg(pgid, libc::SIGCONT);
+    }
+
+    // Take the piped stdout and make it non-blocking, so draining it never wedges the loop
+    // that also has to notice the lease expiring. A child whose stdout cannot be made
+    // non-blocking is left to the loop (it just gets no passthrough), not failed.
+    let mut piped = supervised.child().stdout.take();
+    if let Some(out) = piped.as_ref() {
+        let _ = nonblocking(out.as_raw_fd());
+    }
+
+    loop {
+        if let Some(out) = piped.as_mut() {
+            tee_pump(out, ceremony, emitted, buffer);
+        }
+
+        let leader_exited = supervised.exited()?;
+
+        if let Some(error) = supervised.interrupted() {
+            return Err(error);
+        }
+
+        if leader_exited {
+            // A last drain: the bytes that carried the code may have landed between the final
+            // pump and the exit.
+            if let Some(out) = piped.as_mut() {
+                tee_pump(out, ceremony, emitted, buffer);
+            }
+            return Ok(());
+        }
+
+        if let Some(error) = supervised.expired() {
+            return Err(error);
+        }
+
+        supervised.wait(None);
+    }
+}
+
+/// Drain whatever is readable from the teed stdout right now (non-blocking): forward it to the
+/// real stdout for passthrough, buffer it, and on the FIRST pass where the URL+code parse out,
+/// emit the delivery. Returns when the pipe would block, is exhausted, or ends.
+fn tee_pump(
+    out: &mut ChildStdout,
+    ceremony: &Ceremony<'_>,
+    emitted: &mut bool,
+    buffer: &mut Vec<u8>,
+) {
+    let mut chunk = [0u8; 4096];
+    let mut stdout = io::stdout();
+    loop {
+        match out.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                let _ = stdout.write_all(&chunk[..n]);
+                let _ = stdout.flush();
+                buffer.extend_from_slice(&chunk[..n]);
+                // The code sits in the first few hundred bytes; a generous cap bounds memory
+                // without ever dropping it.
+                if buffer.len() > 64 * 1024 {
+                    let overflow = buffer.len() - 64 * 1024;
+                    buffer.drain(..overflow);
+                }
+                if !*emitted {
+                    if let Some(deliverable) =
+                        onboard_emit::extract_codex_device(&String::from_utf8_lossy(buffer))
+                    {
+                        // codex's own message says the code expires in fifteen minutes.
+                        emit_delivery(ceremony, &deliverable, Some(Duration::from_secs(15 * 60)));
+                        *emitted = true;
+                    }
+                }
+            }
+            Err(ref error) if error.kind() == io::ErrorKind::WouldBlock => break,
+            Err(ref error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
 }
 
 /// The subscription ceremony: `claude setup-token` under a pty, the token read off the
@@ -894,6 +1213,16 @@ fn run_anthropic_onboarding(
     ceremony: &Ceremony<'_>,
 ) -> Result<(), StageFailure> {
     let challenge = crate::anthropic_oauth::begin();
+    // Deliver the sign-in URL out of band BEFORE blocking on the pasted code: an operator who
+    // cannot see this terminal must still receive the link to open. There is no code on our
+    // side here -- the anthropic flow returns `code#state` FROM the operator (pasted below).
+    emit_delivery(
+        ceremony,
+        &Deliverable::SignInUrl {
+            url: challenge.url.clone(),
+        },
+        None,
+    );
     let pasted = ask_for_code(&challenge.url)?;
     let credential =
         crate::anthropic_oauth::complete(&challenge, &pasted).map_err(StageFailure::from)?;
@@ -1834,6 +2163,14 @@ fn target_from_probe(output: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// Serializes the tests that drive `emit_delivery`, because `write_delivery_file` writes into
+    /// the process-wide current directory (the shared crate root under `cargo test`) and each such
+    /// test globs + deletes `onboard-delivery-openai-*.json` to clean up. Without this lock two of
+    /// them running in parallel delete each other's file mid-run. Poison is ignored: a panicking
+    /// assertion in one test must surface as that test's failure, not as a poison error masking it
+    /// in the next.
+    static DELIVERY_CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// The refusal is the whole value of not reading a key from a terminal, so
     /// the sentence is pinned rather than the `isatty` branch that produces it
     /// (which a unit test cannot stub). It must name the pipe form, because that
@@ -1989,6 +2326,11 @@ mod tests {
             endpoint: &endpoint,
             deadline: Instant::now() + Duration::from_secs(1_800),
             load_harnesses: &|_, _| Ok(None),
+            identity: &Identity::Session,
+            send: &|_, _, _| Ok(None),
+            provider: "fixture-provider",
+            machine: None,
+            owner_user_id: None,
         };
 
         assert_eq!(
@@ -2353,6 +2695,568 @@ mod tests {
         );
     }
 
+    /// The `onboard-delivery-openai-*.json` files present in `dir` right now.
+    ///
+    /// `emit_delivery` writes a 0600 delivery file into the current directory (the crate root
+    /// under `cargo test`). The teed-drive test below snapshots this set before and after so it
+    /// removes only what it created, never a neighbour test's artifact.
+    fn openai_delivery_files(dir: &std::path::Path) -> std::collections::HashSet<PathBuf> {
+        fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with("onboard-delivery-openai-") && name.ends_with(".json")
+                    })
+            })
+            .collect()
+    }
+
+    /// The teed OpenAI drive delivers MID-RUN, end to end through the real loop.
+    ///
+    /// This is the seam an independent review flagged as unproven: real device-auth bytes had
+    /// never been driven through the LIVE tee -- `supervise_teed` -> `attend_teed` ->
+    /// `tee_pump` -> `extract_codex_device` -> `emit_delivery` -> operator wake. The pure
+    /// extraction is unit-tested against this same fixture in `onboard_emit`; this proves the
+    /// drive reaches it while the child still runs. A `/bin/sh` stub replays the real codex
+    /// 0.146.0 device-auth capture to its (piped, teed) stdout, then sleeps briefly and exits
+    /// 0 -- so the delivery must fire BEFORE the child exits, and the drive must still return
+    /// the child's status.
+    #[test]
+    fn the_teed_openai_drive_emits_the_code_mid_run() {
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/codex-device-auth-0.146.0.txt"
+        );
+
+        let _cwd_guard = DELIVERY_CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        let before = openai_delivery_files(&cwd);
+
+        let mut command = ProcessCommand::new("/bin/sh");
+        command
+            .args(["-c", &format!("cat {fixture}; sleep 0.2; exit 0")])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null());
+
+        let endpoint = Endpoint {
+            base: "http://gateway.test".to_owned(),
+            token: "tbc_test".to_owned(),
+            origin: crate::dispatch::Origin::Provisioned,
+        };
+        let sent = std::cell::RefCell::new(Vec::<String>::new());
+        let send = |_: &Endpoint, request: &RequestSpec, _: Option<Instant>| {
+            sent.borrow_mut().push(request.body_json.clone());
+            Ok(Some(serde_json::json!({ "wakeId": "w_test" })))
+        };
+        let ceremony = Ceremony {
+            endpoint: &endpoint,
+            deadline: Instant::now() + Duration::from_secs(30),
+            load_harnesses: &|_, _| Ok(None),
+            identity: &Identity::User("mike".to_owned()),
+            send: &send,
+            provider: "openai",
+            machine: Some("shrdlu"),
+            owner_user_id: Some("mike".to_owned()),
+        };
+
+        let mut emitted = false;
+        let mut buffer = Vec::<u8>::new();
+        let status = supervise_teed(command, &ceremony, &mut emitted, &mut buffer).unwrap();
+
+        // Clean up before any assertion can unwind and leak the crate-dir artifact.
+        for path in openai_delivery_files(&cwd).difference(&before) {
+            let _ = fs::remove_file(path);
+        }
+
+        assert!(
+            status.success(),
+            "the stub child exited non-zero: {status:?}"
+        );
+        assert!(emitted, "the teed drive never emitted the delivery mid-run");
+
+        let sent = sent.into_inner();
+        assert_eq!(sent.len(), 1, "expected exactly one wake, got {sent:?}");
+        let body = &sent[0];
+        assert!(body.contains(r#""verb":"wake""#), "{body}");
+        assert!(body.contains(r#""userId":"mike""#), "{body}");
+        // The real capture's code and URL, carried on the durable wake row.
+        assert!(
+            body.contains("VG6S-L35ON"),
+            "code missing from wake: {body}"
+        );
+        assert!(
+            body.contains("auth.openai.com/codex/device"),
+            "url missing from wake: {body}"
+        );
+    }
+
+    /// The full OpenAI onboarding leg delivers the device code and banks the credential.
+    ///
+    /// This drives the LITERAL `run_openai_onboarding` -- the entry an independent review named
+    /// as unproven -- against a codex stub, so every hop runs as one behavior path: `harness_cli`
+    /// (resolving the stub through the ceremony's harness catalog) -> `supervise_teed` ->
+    /// `attend_teed` -> `tee_pump` -> `extract_codex_device` -> `emit_delivery` -> operator wake
+    /// + `write_delivery_file` (0600) -> the structured line -> `codex_staged_a_credential`. The
+    /// stub replays the real codex 0.146.0 device-auth capture to its teed stdout, then banks a
+    /// non-empty `auth.json` into `$CODEX_HOME` and exits 0, so the delivery must fire mid-run AND
+    /// the leg must return Ok. Asserting the delivery FILE's mode and contents -- not just the
+    /// wake -- is what makes `write_delivery_file` a proven step of this path, not an inferred one.
+    #[test]
+    fn run_openai_onboarding_delivers_the_device_code_and_banks_the_credential() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/codex-device-auth-0.146.0.txt"
+        );
+
+        // A private scratch root for this run: the staging CODEX_HOME the stub banks into, and the
+        // stub script itself. Named from the clock + pid so parallel tests never collide.
+        let unique = format!(
+            "{}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            std::process::id()
+        );
+        let root = std::env::temp_dir().join(format!("tightbeam-onboard-e2e-{unique}"));
+        let staging = root.join("staging");
+        fs::create_dir_all(&staging).unwrap();
+
+        // The codex stub: replay the real capture to (teed) stdout, then bank a credential into
+        // $CODEX_HOME and exit 0 -- exactly the success shape codex_staged_a_credential accepts.
+        let stub = root.join("codex-stub.sh");
+        fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\ncat {fixture}\nsleep 0.2\nprintf '{{\"token\":\"banked\"}}' > \"$CODEX_HOME/auth.json\"\nexit 0\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let endpoint = Endpoint {
+            base: "http://gateway.test".to_owned(),
+            token: "tbc_test".to_owned(),
+            origin: crate::dispatch::Origin::Provisioned,
+        };
+        let sent = std::cell::RefCell::new(Vec::<String>::new());
+        let send = |_: &Endpoint, request: &RequestSpec, _: Option<Instant>| {
+            sent.borrow_mut().push(request.body_json.clone());
+            Ok(Some(serde_json::json!({ "wakeId": "w_test" })))
+        };
+        // The harness catalog points `codex` at the stub's absolute path; harness_cli resolves it
+        // without touching the process PATH -- on_path joins each search dir with an absolute
+        // binary and gets the absolute path back.
+        let catalog = crate::harnesses::HarnessCatalog {
+            harnesses: vec![crate::harnesses::HarnessProjection {
+                wire_name: "codex".to_owned(),
+                install_package: "codex".to_owned(),
+                cli_binary: stub.to_string_lossy().into_owned(),
+                process_markers: vec![],
+            }],
+        };
+        let load = |_: &Endpoint, _: Instant| Ok(Some(catalog.clone()));
+        let ceremony = Ceremony {
+            endpoint: &endpoint,
+            deadline: Instant::now() + Duration::from_secs(30),
+            load_harnesses: &load,
+            identity: &Identity::User("mike".to_owned()),
+            send: &send,
+            provider: "openai",
+            machine: Some("shrdlu"),
+            owner_user_id: Some("mike".to_owned()),
+        };
+
+        let _cwd_guard = DELIVERY_CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        let before = openai_delivery_files(&cwd);
+
+        let result = run_openai_onboarding(staging.to_str().unwrap(), &ceremony);
+
+        // Capture the delivery file's mode and contents, then clean it and the scratch root before
+        // any assertion can unwind and leak an artifact into the crate dir.
+        let fresh: Vec<PathBuf> = openai_delivery_files(&cwd)
+            .difference(&before)
+            .cloned()
+            .collect();
+        let file_evidence = fresh.first().map(|path| {
+            let mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            let body = fs::read_to_string(path).unwrap();
+            (mode, body)
+        });
+        for path in &fresh {
+            let _ = fs::remove_file(path);
+        }
+        let _ = fs::remove_dir_all(&root);
+
+        result.expect("the full onboarding leg should bank the credential and return Ok");
+
+        // The operator wake carried the real code and URL.
+        let sent = sent.into_inner();
+        assert_eq!(sent.len(), 1, "expected exactly one wake, got {sent:?}");
+        let body = &sent[0];
+        assert!(body.contains(r#""verb":"wake""#), "{body}");
+        assert!(
+            body.contains("VG6S-L35ON"),
+            "code missing from wake: {body}"
+        );
+        assert!(
+            body.contains("auth.openai.com/codex/device"),
+            "url missing from wake: {body}"
+        );
+
+        // write_delivery_file wrote exactly one 0600 file carrying the same code and URL.
+        assert_eq!(
+            fresh.len(),
+            1,
+            "expected exactly one delivery file, got {fresh:?}"
+        );
+        let (mode, contents) = file_evidence.expect("the delivery file should exist");
+        assert_eq!(mode, 0o600, "the delivery file must be private (0600)");
+        assert!(
+            contents.contains("VG6S-L35ON"),
+            "code missing from delivery file: {contents}"
+        );
+        assert!(
+            contents.contains("auth.openai.com/codex/device"),
+            "url missing from delivery file: {contents}"
+        );
+    }
+
+    /// The operator wake is bounded by the ceremony lease, and losing it does not lose the file.
+    ///
+    /// F1 (independent review of e75b8ce): `notify_operator` sent the wake with deadline `None`,
+    /// so a hung gateway could make the notification outlive the very lease the watchdog
+    /// enforces. This drives the real tee so `emit_delivery` -> `notify_operator` runs, records
+    /// the deadline the send is handed, and fails that send the way a lease-expired hang would --
+    /// proving both halves: the send carries `Some(ceremony.deadline)`, and the lost wake still
+    /// leaves the 0600 file behind (loud degradation, not a sunk deliverable).
+    #[test]
+    fn the_operator_wake_is_bounded_by_the_ceremony_lease() {
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/codex-device-auth-0.146.0.txt"
+        );
+
+        let _cwd_guard = DELIVERY_CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        let before = openai_delivery_files(&cwd);
+
+        let mut command = ProcessCommand::new("/bin/sh");
+        command
+            .args(["-c", &format!("cat {fixture}; sleep 0.2; exit 0")])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null());
+
+        let endpoint = Endpoint {
+            base: "http://gateway.test".to_owned(),
+            token: "tbc_test".to_owned(),
+            origin: crate::dispatch::Origin::Provisioned,
+        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        // Record the deadline each send is handed, and fail the send as a hung gateway would once
+        // its lease elapsed, so the fallback (file + stdout) is exercised at the same time.
+        let seen: std::cell::RefCell<Vec<Option<Instant>>> = std::cell::RefCell::new(Vec::new());
+        let send = |_: &Endpoint,
+                    _request: &RequestSpec,
+                    d: Option<Instant>|
+         -> Result<Option<serde_json::Value>, String> {
+            seen.borrow_mut().push(d);
+            Err("gateway request refused because the onboarding lease expired".to_owned())
+        };
+        let ceremony = Ceremony {
+            endpoint: &endpoint,
+            deadline,
+            load_harnesses: &|_, _| Ok(None),
+            identity: &Identity::User("mike".to_owned()),
+            send: &send,
+            provider: "openai",
+            machine: Some("shrdlu"),
+            owner_user_id: Some("mike".to_owned()),
+        };
+
+        let mut emitted = false;
+        let mut buffer = Vec::<u8>::new();
+        let status = supervise_teed(command, &ceremony, &mut emitted, &mut buffer).unwrap();
+
+        // Capture whether the file survived, then clean up before any assertion can unwind.
+        let fresh: Vec<PathBuf> = openai_delivery_files(&cwd)
+            .difference(&before)
+            .cloned()
+            .collect();
+        let file_written = !fresh.is_empty();
+        for path in &fresh {
+            let _ = fs::remove_file(path);
+        }
+
+        assert!(
+            status.success(),
+            "the stub child exited non-zero: {status:?}"
+        );
+        assert!(
+            emitted,
+            "the drive should have emitted the delivery mid-run"
+        );
+        let seen = seen.into_inner();
+        assert_eq!(
+            seen.len(),
+            1,
+            "expected exactly one wake send, got {seen:?}"
+        );
+        // F1: the wake carries the ceremony lease, never an unbounded None.
+        assert_eq!(
+            seen[0],
+            Some(deadline),
+            "the operator wake must be bounded by the ceremony deadline"
+        );
+        // The lost wake did not sink the local copy: loud degradation, file still written.
+        assert!(
+            file_written,
+            "the delivery file must survive a failed/hung wake"
+        );
+    }
+
+    /// F2: a fresh delivery file is created private (0600).
+    #[test]
+    fn a_fresh_delivery_file_is_created_private_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let _cwd_guard = DELIVERY_CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        // A distinctive minted timestamp so the name cannot clash with a real delivery file.
+        let minted = 1_700_000_000_000 + std::process::id() as i64;
+        let path = cwd.join(format!("onboard-delivery-openai-{minted}.json"));
+        let _ = fs::remove_file(&path);
+
+        let written = write_delivery_file("openai", minted, "{\"x\":1}");
+
+        let mode = fs::metadata(&path)
+            .ok()
+            .map(|meta| meta.permissions().mode() & 0o777);
+        let _ = fs::remove_file(&path);
+
+        assert!(written.is_some(), "a fresh name must be written");
+        assert_eq!(
+            mode,
+            Some(0o600),
+            "a fresh delivery file must be created 0600"
+        );
+    }
+
+    /// F2 (independent review of e75b8ce): the claimed 0600 file could be 0644.
+    ///
+    /// `create(true).truncate(true).mode(0o600)` honored the mode only on creation, so writing
+    /// over an existing name kept that file's old, possibly world-readable mode -- the reviewer's
+    /// repro pre-seeded a 0644 file and the pairing code landed at 0644. `create_new` refuses the
+    /// collision loudly instead, so the secret is never written into a non-private file.
+    #[test]
+    fn an_existing_delivery_name_is_refused_not_silently_reused() {
+        use std::os::unix::fs::PermissionsExt;
+        let _cwd_guard = DELIVERY_CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        let minted = 1_700_000_000_001 + std::process::id() as i64;
+        let path = cwd.join(format!("onboard-delivery-openai-{minted}.json"));
+
+        // Pre-seed the exact target name as a world-readable file with prior contents.
+        fs::write(&path, "PRIOR").unwrap();
+        fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let written = write_delivery_file("openai", minted, "{\"secret\":\"VG6S-L35ON\"}");
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        let contents = fs::read_to_string(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(
+            written, None,
+            "an existing name must be refused, not reused"
+        );
+        assert_eq!(mode, 0o644, "the pre-existing file must be left untouched");
+        assert_eq!(
+            contents, "PRIOR",
+            "the secret must NOT be written into the world-readable file"
+        );
+    }
+
+    /// F3 (independent review of e75b8ce): the raw-tail miss must survive vendor-wording drift.
+    ///
+    /// The integrated fallback used to fire only when the failed stream contained lowercase
+    /// `device` or `one-time code` -- so a sign-in block whose wording drifted past both phrases
+    /// (the exact case the fallback exists to survive) took no path and vanished. This drives a
+    /// synthetic drifted block -- a parse miss carrying NEITHER phrase -- through the LITERAL
+    /// `run_openai_onboarding`, and proves the raw tail still reaches the operator wake and the
+    /// local file.
+    #[test]
+    fn a_drifted_sign_in_block_records_the_raw_tail_without_vendor_wording() {
+        use std::os::unix::fs::PermissionsExt;
+        // A plausible future codex format our extractor cannot parse (no "one-time code" marker)
+        // and which contains neither phrase the old gate keyed on. Synthetic by necessity: it is
+        // a format that does not exist yet -- the drift the fallback is built to survive.
+        let drift = "To finish signing in, open https://auth.openai.com/activate and type the pairing key: WXYZ-1234";
+        assert!(
+            onboard_emit::extract_codex_device(drift).is_none(),
+            "the drifted block must be a genuine parse miss"
+        );
+        assert!(
+            !drift.contains("device") && !drift.contains("one-time code"),
+            "the drifted block must lack the old gate's vendor phrases"
+        );
+
+        let unique = format!(
+            "{}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            std::process::id()
+        );
+        let root = std::env::temp_dir().join(format!("tightbeam-onboard-drift-{unique}"));
+        let staging = root.join("staging");
+        fs::create_dir_all(&staging).unwrap();
+
+        // Emit the drifted block, then exit 0 banking NO credential -- a real miss.
+        let stub = root.join("codex-stub.sh");
+        fs::write(
+            &stub,
+            format!("#!/bin/sh\nprintf %s '{drift}'\nsleep 0.2\nexit 0\n"),
+        )
+        .unwrap();
+        fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let endpoint = Endpoint {
+            base: "http://gateway.test".to_owned(),
+            token: "tbc_test".to_owned(),
+            origin: crate::dispatch::Origin::Provisioned,
+        };
+        let sent = std::cell::RefCell::new(Vec::<String>::new());
+        let send = |_: &Endpoint, request: &RequestSpec, _: Option<Instant>| {
+            sent.borrow_mut().push(request.body_json.clone());
+            Ok(Some(serde_json::json!({ "wakeId": "w_test" })))
+        };
+        let catalog = crate::harnesses::HarnessCatalog {
+            harnesses: vec![crate::harnesses::HarnessProjection {
+                wire_name: "codex".to_owned(),
+                install_package: "codex".to_owned(),
+                cli_binary: stub.to_string_lossy().into_owned(),
+                process_markers: vec![],
+            }],
+        };
+        let load = |_: &Endpoint, _: Instant| Ok(Some(catalog.clone()));
+        let ceremony = Ceremony {
+            endpoint: &endpoint,
+            deadline: Instant::now() + Duration::from_secs(30),
+            load_harnesses: &load,
+            identity: &Identity::User("mike".to_owned()),
+            send: &send,
+            provider: "openai",
+            machine: Some("shrdlu"),
+            owner_user_id: Some("mike".to_owned()),
+        };
+
+        let _cwd_guard = DELIVERY_CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        let before = openai_delivery_files(&cwd);
+
+        let result = run_openai_onboarding(staging.to_str().unwrap(), &ceremony);
+
+        let fresh: Vec<PathBuf> = openai_delivery_files(&cwd)
+            .difference(&before)
+            .cloned()
+            .collect();
+        let file_body = fresh.first().map(|path| fs::read_to_string(path).unwrap());
+        for path in &fresh {
+            let _ = fs::remove_file(path);
+        }
+        let _ = fs::remove_dir_all(&root);
+
+        // Sign-in did not complete (no credential banked) -- the leg fails loudly...
+        assert!(
+            result.is_err(),
+            "a miss that banked no credential must not report success"
+        );
+        // ...but the deliverable was NOT lost: exactly one raw-tail wake carried the drifted block.
+        let sent = sent.into_inner();
+        assert_eq!(
+            sent.len(),
+            1,
+            "expected exactly one raw-tail wake, got {sent:?}"
+        );
+        assert!(
+            sent[0].contains("WXYZ-1234"),
+            "raw tail missing the drifted code: {}",
+            sent[0]
+        );
+        assert!(
+            sent[0].contains("activate"),
+            "raw tail missing the drifted url: {}",
+            sent[0]
+        );
+        // The 0600 local copy carries it too.
+        assert_eq!(
+            fresh.len(),
+            1,
+            "expected exactly one delivery file, got {fresh:?}"
+        );
+        let file_body = file_body.expect("a delivery file must be written for the raw tail");
+        assert!(
+            file_body.contains("WXYZ-1234"),
+            "raw tail missing from delivery file: {file_body}"
+        );
+    }
+
+    /// The teed drive honors the lease exactly as `attend` does.
+    ///
+    /// A child that never exits is terminated when the lease expires -- promptly, and with
+    /// nothing emitted -- so the tee cannot let a wedged codex outlive its lease. Pairs with
+    /// `term_during_codex_onboarding_kills_the_tree_without_entering_cancel`, which already
+    /// proves the interrupt path through this same drive against a real child.
+    #[test]
+    fn the_teed_openai_drive_expires_on_the_lease() {
+        let mut command = ProcessCommand::new("/bin/sh");
+        command
+            .args(["-c", "sleep 5"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null());
+
+        let endpoint = Endpoint {
+            base: "http://gateway.test".to_owned(),
+            token: "tbc_test".to_owned(),
+            origin: crate::dispatch::Origin::Provisioned,
+        };
+        let ceremony = Ceremony {
+            endpoint: &endpoint,
+            deadline: Instant::now() + Duration::from_millis(200),
+            load_harnesses: &|_, _| Ok(None),
+            identity: &Identity::User("mike".to_owned()),
+            send: &|_, _, _| panic!("a ceremony that emitted nothing must send no wake"),
+            provider: "openai",
+            machine: Some("shrdlu"),
+            owner_user_id: Some("mike".to_owned()),
+        };
+
+        let mut emitted = false;
+        let mut buffer = Vec::<u8>::new();
+        let started = Instant::now();
+        let error = supervise_teed(command, &ceremony, &mut emitted, &mut buffer).unwrap_err();
+
+        assert!(
+            error.to_string().contains("onboarding lease expired"),
+            "{error}"
+        );
+        assert!(!emitted, "an expired ceremony should have emitted nothing");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the lease did not end the teed drive promptly: {:?}",
+            started.elapsed()
+        );
+    }
+
     #[test]
     fn lease_deadline_starts_from_the_begin_reply() {
         let ready = serde_json::json!({"leaseTtlMs": 12_345});
@@ -2380,6 +3284,11 @@ mod tests {
             endpoint: &endpoint,
             deadline,
             load_harnesses: &|_, _| Ok(None),
+            identity: &Identity::Session,
+            send: &|_, _, _| Ok(None),
+            provider: "fixture-provider",
+            machine: None,
+            owner_user_id: None,
         };
         let sent = std::cell::RefCell::new(Vec::new());
 
@@ -2409,6 +3318,99 @@ mod tests {
             sent[0].0
         );
         assert_eq!(sent[0].1, Some(deadline));
+    }
+
+    #[test]
+    fn owner_user_id_reads_the_begin_reply_field() {
+        let present = serde_json::json!({ "stagingPath": "/s", "ownerUserId": "mike" });
+        assert_eq!(owner_user_id(&present), Some("mike".to_owned()));
+        // Absent (an older gateway) or empty -> None, so the CLI degrades loudly.
+        assert_eq!(
+            owner_user_id(&serde_json::json!({ "stagingPath": "/s" })),
+            None
+        );
+        assert_eq!(
+            owner_user_id(&serde_json::json!({ "ownerUserId": "" })),
+            None
+        );
+    }
+
+    #[test]
+    fn notify_operator_wakes_the_owner_with_the_code() {
+        let endpoint = Endpoint {
+            base: "http://gateway.test".to_owned(),
+            token: "tbc_test".to_owned(),
+            origin: crate::dispatch::Origin::Provisioned,
+        };
+        let sent = std::cell::RefCell::new(Vec::<String>::new());
+        let send = |_: &Endpoint, request: &RequestSpec, _: Option<Instant>| {
+            sent.borrow_mut().push(request.body_json.clone());
+            Ok(Some(serde_json::json!({ "wakeId": "w_test" })))
+        };
+        let ceremony = Ceremony {
+            endpoint: &endpoint,
+            deadline: Instant::now() + Duration::from_secs(60),
+            load_harnesses: &|_, _| Ok(None),
+            identity: &Identity::User("mike".to_owned()),
+            send: &send,
+            provider: "openai",
+            machine: Some("shrdlu"),
+            owner_user_id: Some("mike".to_owned()),
+        };
+        let deliverable = Deliverable::DeviceCode {
+            url: "https://auth.openai.com/codex/device".to_owned(),
+            code: "VG6S-L35ON".to_owned(),
+        };
+
+        let notified = notify_operator(&ceremony, &deliverable, "shrdlu");
+
+        assert_eq!(
+            notified,
+            Notified::Waked {
+                user_id: "mike".to_owned(),
+                wake_id: Some("w_test".to_owned()),
+            }
+        );
+        let body = &sent.borrow()[0];
+        assert!(body.contains(r#""verb":"wake""#), "{body}");
+        assert!(body.contains(r#""userId":"mike""#), "{body}");
+        // The wake row carries the code text itself -- it IS the durable delivery record.
+        assert!(body.contains("VG6S-L35ON"), "{body}");
+    }
+
+    #[test]
+    fn notify_operator_degrades_loudly_without_an_owner() {
+        let endpoint = Endpoint {
+            base: "http://gateway.test".to_owned(),
+            token: "tbc_test".to_owned(),
+            origin: crate::dispatch::Origin::Provisioned,
+        };
+        let send = |_: &Endpoint,
+                    _: &RequestSpec,
+                    _: Option<Instant>|
+         -> Result<Option<serde_json::Value>, String> {
+            panic!("no wake must be sent when there is no owner to notify")
+        };
+        let ceremony = Ceremony {
+            endpoint: &endpoint,
+            deadline: Instant::now() + Duration::from_secs(60),
+            load_harnesses: &|_, _| Ok(None),
+            identity: &Identity::Session,
+            send: &send,
+            provider: "openai",
+            machine: Some("shrdlu"),
+            owner_user_id: None,
+        };
+        let deliverable = Deliverable::SignInUrl {
+            url: "https://claude.ai/oauth/authorize".to_owned(),
+        };
+
+        let notified = notify_operator(&ceremony, &deliverable, "shrdlu");
+
+        match notified {
+            Notified::NotNotified { reason } => assert!(reason.contains("ownerUserId"), "{reason}"),
+            other => panic!("expected NotNotified, got {other:?}"),
+        }
     }
 
     #[test]
@@ -3483,6 +4485,11 @@ mod tests {
             endpoint: &endpoint,
             deadline: Instant::now() + Duration::from_secs(1_800),
             load_harnesses: &|_, _| Ok(None),
+            identity: &Identity::Session,
+            send: &|_, _, _| Ok(None),
+            provider: "fixture-provider",
+            machine: None,
+            owner_user_id: None,
         };
         assert_eq!(
             harness_cli("nonesuch", &ceremony),
