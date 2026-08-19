@@ -35,6 +35,7 @@ defmodule Tightbeam.SchemaShapeTest do
   alias Tightbeam.{Assignments, DB, Schema}
 
   @shape "operator-decision-requests-v1"
+  @model_identity_shape "model-identity-v1"
   @be61_shape "model-identity-message-envelope-v2"
 
   # Captured from Schema.ensure_all/1 at be61cfc98df6b18c0cc280adeca42cba3fbf14b5.
@@ -114,6 +115,108 @@ defmodule Tightbeam.SchemaShapeTest do
 
     assert operator_index =~ "(ownerUserId, raiserId, actionKey)"
     assert operator_index =~ ~r/WHERE\s+kind\s*=\s*'operator'\s+AND\s+status\s*=\s*'open'/
+  end
+
+  test "model-identity-v1 migrates exactly and preserves decision requests and wakes", %{db: db} do
+    :ok = Schema.ensure_all(db)
+    downgrade_decision_requests_to_model_identity(db)
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO decision_requests
+        (id, kind, raiserId, ownerUserId, raisedAt, deadlineAt, statuteName,
+         actionKey, question, context, status)
+      VALUES
+        ('dr_statute', 'statute', 'session:holder', 'mike', 1, 2, 'law-a',
+         'action-a', 'allow?', '{}', 'open');
+
+      INSERT INTO decision_requests
+        (id, kind, raiserId, ownerUserId, assignmentId, expecterSessionKey,
+         lineageRung, effortGeneration, deadlineWakeId, raisedAt, deadlineAt,
+         question, context, status, decision, ruledBy, ruledAt)
+      VALUES
+        ('dr_effort', 'effort', 'process:tightbeam', 'mike', 'asg_a', 'holder',
+         2, 3, 'w_deadline', 3, 4, 'continue?', '{}', 'ruled', 'continue',
+         'user:mike', 5);
+
+      INSERT INTO wakes
+        (wakeId, sessionKey, origin, prompt, dueAt, state, createdAt, firedAt)
+      VALUES
+        ('w_pending', 'holder', 'process:test', 'resume', 10, 'pending', 6, NULL),
+        ('w_fired', 'holder', 'process:test', 'done', 11, 'fired', 7, 12);
+      """)
+
+    {:ok, decision_requests_before} =
+      DB.query(
+        db,
+        "SELECT #{model_identity_request_columns()} FROM decision_requests ORDER BY id"
+      )
+
+    {:ok, wakes_before} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
+
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok, ^decision_requests_before} =
+             DB.query(
+               db,
+               "SELECT #{model_identity_request_columns()} FROM decision_requests ORDER BY id"
+             )
+
+    assert {:ok, [[nil], [nil]]} =
+             DB.query(db, "SELECT ruledViaSessionKey FROM decision_requests ORDER BY id")
+
+    assert {:ok, ^wakes_before} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
+    assert {:ok, []} = table_names(db, "decision_requests_model_identity_v1")
+    assert {:ok, [[1]]} = index_count(db, "decision_requests_operator_open")
+
+    # The rebuilt table is the same target shape a fresh 0.1.8 database gets.
+    fresh = :"schema_shape_fresh_#{System.unique_integer([:positive])}"
+    start_supervised!({DB, path: ":memory:", name: fresh}, id: fresh)
+    assert :ok = Schema.ensure_all(fresh)
+
+    assert object_sql(db, "table", "decision_requests") ==
+             object_sql(fresh, "table", "decision_requests")
+
+    for name <-
+          ~w(decision_requests_owner decision_requests_key decision_requests_one_open decision_requests_effort_generation decision_requests_operator_open) do
+      assert object_sql(db, "index", name) == object_sql(fresh, "index", name)
+    end
+
+    # A second boot is ordinary and leaves both commissioned populations exact.
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:ok, ^decision_requests_before} =
+             DB.query(
+               db,
+               "SELECT #{model_identity_request_columns()} FROM decision_requests ORDER BY id"
+             )
+
+    assert {:ok, ^wakes_before} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
+  end
+
+  test "a failed exact migration rolls back the rename and stamp", %{db: db} do
+    :ok = Schema.ensure_all(db)
+    downgrade_decision_requests_to_model_identity(db)
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO decision_requests
+        (id, kind, raiserId, ownerUserId, raisedAt, deadlineAt, statuteName,
+         actionKey, question, context, status)
+      VALUES
+        ('dr_kept', 'statute', 'session:holder', 'mike', 1, 2, 'law-a',
+         'action-a', 'allow?', '{}', 'open');
+      DROP INDEX decision_requests_key;
+      """)
+
+    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
+    assert error.message =~ "failed and was rolled back"
+    assert {:ok, [[@model_identity_shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+    assert {:ok, [["dr_kept"]]} = DB.query(db, "SELECT id FROM decision_requests")
+    assert {:ok, []} = table_names(db, "decision_requests_model_identity_v1")
+    refute "ruledViaSessionKey" in table_columns(db, "decision_requests")
   end
 
   test "the harness health foundation is additive and exact", %{db: db} do
@@ -382,8 +485,7 @@ defmodule Tightbeam.SchemaShapeTest do
     assert error.message =~ @be61_shape
     assert error.message =~ @shape
 
-    assert error.message =~
-             "operator decision requests changed the decision_requests and wakes shape."
+    assert error.message =~ "can migrate only #{@model_identity_shape} to #{@shape}"
 
     assert {:ok, [[@be61_shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
     refute "ruledViaSessionKey" in table_columns(db, "decision_requests")
@@ -476,6 +578,58 @@ defmodule Tightbeam.SchemaShapeTest do
       DB.query(db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1", [name])
 
     rows == [[1]]
+  end
+
+  defp downgrade_decision_requests_to_model_identity(db) do
+    :ok =
+      DB.execute(db, """
+      DROP INDEX decision_requests_owner;
+      DROP INDEX decision_requests_key;
+      DROP INDEX decision_requests_one_open;
+      DROP INDEX decision_requests_effort_generation;
+      DROP INDEX decision_requests_operator_open;
+      DROP TABLE decision_requests;
+      #{@be61_decision_requests_ddl};
+      CREATE INDEX decision_requests_owner
+        ON decision_requests (ownerUserId, status);
+      CREATE INDEX decision_requests_key
+        ON decision_requests (raiserId, statuteName, actionKey);
+      CREATE UNIQUE INDEX decision_requests_one_open
+        ON decision_requests (raiserId, statuteName, actionKey)
+        WHERE kind = 'statute' AND status = 'open';
+      CREATE UNIQUE INDEX decision_requests_effort_generation
+        ON decision_requests (assignmentId, effortGeneration) WHERE kind = 'effort';
+      UPDATE schema_stamp SET shape = '#{@model_identity_shape}', stampedAt = 1;
+      """)
+
+    :ok
+  end
+
+  defp model_identity_request_columns do
+    """
+    id, kind, raiserId, raiserSessionKey, ownerUserId, assignmentId,
+    expecterSessionKey, expecterUserId, lineageRung, effortGeneration,
+    deadlineWakeId, raisedAt, deadlineAt, statuteName, actionKey, question,
+    options, context, status, decision, rationale, ruledBy, ruledAt,
+    rulingFactId, consumedAt, parkWakeId, withdrawnBy, withdrawnReason, withdrawnAt
+    """
+  end
+
+  defp table_names(db, name) do
+    DB.query(db, "SELECT name FROM sqlite_master WHERE type='table' AND name=?1", [name])
+  end
+
+  defp index_count(db, name) do
+    DB.query(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?1", [name])
+  end
+
+  defp object_sql(db, type, name) do
+    {:ok, [[sql]]} =
+      DB.query(db, "SELECT sql FROM sqlite_master WHERE type=?1 AND name=?2", [type, name])
+
+    sql
+    |> String.downcase()
+    |> String.replace(~r/\s+/u, "")
   end
 
   defp table_columns(db, name) do
