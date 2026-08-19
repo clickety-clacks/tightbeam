@@ -257,7 +257,8 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
       params: %{
         subject: subject,
         work_item_id: work_item_id,
-        reviews_assignment_id: opts[:reviews_assignment_id]
+        reviews_assignment_id: opts[:reviews_assignment_id],
+        effect_kind: if(opts[:reviews_assignment_id], do: "review", else: "live_mutation")
       }
     })
   end
@@ -283,7 +284,8 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
       params: %{
         subject: subject,
         brief: "Implement #{subject}.",
-        work_item_id: work_item_id
+        work_item_id: work_item_id,
+        effect_kind: "live_mutation"
       }
     }
   end

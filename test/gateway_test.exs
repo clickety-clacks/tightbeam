@@ -607,7 +607,7 @@ defmodule Tightbeam.GatewayTest do
              handlers["assign"].(
                Map.merge(common, %{
                  verb: "assign",
-                 params: %{subject: "gateway interval assign"}
+                 params: %{subject: "gateway interval assign", effect_kind: "coordination"}
                })
              )
 
@@ -617,7 +617,8 @@ defmodule Tightbeam.GatewayTest do
                  verb: "dispatch",
                  params: %{
                    subject: "gateway interval dispatch",
-                   brief: "prove the configured interval"
+                   brief: "prove the configured interval",
+                   effect_kind: "coordination"
                  }
                })
              )
@@ -1801,7 +1802,11 @@ defmodule Tightbeam.GatewayTest do
         session_key: "k1",
         target_role: nil,
         role_fallback: false,
-        params: %{subject: "scheduler seam", brief: "exercise the real effort wake route"}
+        params: %{
+          subject: "scheduler seam",
+          brief: "exercise the real effort wake route",
+          effect_kind: "coordination"
+        }
       })
 
     {:ok, [[wake_id]]} =

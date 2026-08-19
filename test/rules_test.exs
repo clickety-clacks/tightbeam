@@ -616,7 +616,7 @@ defmodule Tightbeam.RulesTest do
   test "P3 fact registry has exact names and load-time types", ctx do
     list_facts = [
       "assignment.independent_verdict_kinds",
-      "assignment.qualifying_review_verdict_kinds",
+      "assignment.applicable_review_verdict_kinds",
       "assignment.artifact_kinds"
     ]
 
@@ -714,7 +714,7 @@ defmodule Tightbeam.RulesTest do
       rule(
         "bad-list-member",
         "attest",
-        "assignment.qualifying_review_verdict_kinds",
+        "assignment.applicable_review_verdict_kinds",
         "in",
         [1]
       )
@@ -731,7 +731,7 @@ defmodule Tightbeam.RulesTest do
     review = assignment(ctx, holder.session_key, {:user, "flynn"}, reviews: assignment.id)
 
     list_facts = [
-      "assignment.qualifying_review_verdict_kinds",
+      "assignment.applicable_review_verdict_kinds",
       "assignment.artifact_kinds"
     ]
 
@@ -846,6 +846,33 @@ defmodule Tightbeam.RulesTest do
              )
   end
 
+  test "retired assign-remedy files input fails at the canonical param gate", ctx do
+    put_rule(ctx, """
+    [[rule]]
+    name = "retired-remedy-files"
+    verb = "attest"
+    text = "completion requires review"
+    effect = "remedy"
+    deny_when = [
+      { fact = "attest.kind", op = "eq", value = "completion" },
+      { fact = "assignment.applicable_review_verdict_kinds", op = "not_in", value = ["reviewed-clean"] }
+    ]
+    [rule.remedy]
+    action = "assign"
+    produces = "reviewed-clean"
+    target_role = "reviewer"
+    [rule.remedy.params]
+    subject = "review {assignment_id}"
+    reviews = "{assignment_id}"
+    files = ["lib/a.ex"]
+    """)
+
+    error = assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, ["attest"]) end
+    assert error.message =~ "remedy assign has invalid params: files"
+    assert error.message =~ "retired-remedy-files"
+    assert error.message =~ "rule.toml"
+  end
+
   test "check-tier assignment facts are nil for every unresolved assignment shape", ctx do
     holder = session(ctx.db, "check-tier-holder", "flynn", archetype: "coder")
     assignment = assignment(ctx, holder.session_key, {:user, "flynn"})
@@ -932,7 +959,10 @@ defmodule Tightbeam.RulesTest do
 
   test "restored independent verdict fact accepts the prior linked-review shape", ctx do
     {:ok, _} =
-      DB.query(ctx.db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1)")
+      DB.query(
+        ctx.db,
+        "INSERT OR REPLACE INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1)"
+      )
 
     holder = session(ctx.db, "producer", "flynn", archetype: "coder")
     reviewer = session(ctx.db, "reviewer", "other", harness: "claude", provider: "anthropic")
@@ -963,7 +993,10 @@ defmodule Tightbeam.RulesTest do
 
   test "qualifying review ignores harness/provider", ctx do
     {:ok, _} =
-      DB.query(ctx.db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1)")
+      DB.query(
+        ctx.db,
+        "INSERT OR REPLACE INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1)"
+      )
 
     holder = session(ctx.db, "producer", "flynn", archetype: "coder")
     reviewer = session(ctx.db, "reviewer", "other", harness: "claude", provider: "anthropic")
@@ -983,7 +1016,7 @@ defmodule Tightbeam.RulesTest do
       rule(
         "qualified",
         "attest",
-        "assignment.qualifying_review_verdict_kinds",
+        "assignment.applicable_review_verdict_kinds",
         "in",
         ["reviewed-clean"]
       )
@@ -1108,6 +1141,8 @@ defmodule Tightbeam.RulesTest do
         assignment_id: review.id,
         kind: "completion"
       })
+      |> Map.delete(:result_revision)
+      |> update_in([:params], &Map.delete(&1, :commit_refs))
 
     assert {:ok, %{assignment: %{state: "closed", effectKind: "review"}}} =
              Dispatch.dispatch(ctx.db, handlers, review_completion)
@@ -1157,13 +1192,16 @@ defmodule Tightbeam.RulesTest do
     producer = assignment(ctx, holder.session_key, {:user, "flynn"})
 
     {:ok, _} =
-      DB.query(ctx.db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1)")
+      DB.query(
+        ctx.db,
+        "INSERT OR REPLACE INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1)"
+      )
 
     put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
 
     review_call =
-      p3_call("assign", {:user, "reviewer"}, %{
+      p3_call("assign", {:user, "flynn"}, %{
         subject: "review receipt producer",
         reviews_assignment_id: producer.id,
         idempotency_key: nil,
@@ -1202,6 +1240,150 @@ defmodule Tightbeam.RulesTest do
              Dispatch.dispatch(ctx.db, ctx.handlers, review_call)
 
     assert review_count(ctx.db, producer.id) == 1
+  end
+
+  test "shipped completion remedy waits for the holder receipt and creates one review", ctx do
+    holder = session(ctx.db, "receipt-remedy-holder", "flynn", archetype: "coder")
+    reviewer = session(ctx.db, "receipt-remedy-reviewer", "flynn", archetype: "reviewer")
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT OR REPLACE INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1)"
+      )
+
+    Roles.create!(ctx.db, "reviewer", "flynn", reviewer.session_key)
+    producer = assignment(ctx, holder.session_key, {:user, "flynn"})
+
+    put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    completion =
+      p3_call("attest", {:session, holder.session_key}, %{
+        assignment_id: producer.id,
+        kind: "completion"
+      })
+
+    assert {:error,
+            %{
+              reason: "remedy_blocked",
+              producer: nil,
+              rule: "code-review-requires-passing-tests",
+              ref: producer_id
+            }} = Dispatch.dispatch(ctx.db, ctx.handlers, completion)
+
+    assert producer_id == producer.id
+    assert review_count(ctx.db, producer.id) == 0
+
+    verdict(
+      ctx,
+      holder.session_key,
+      producer.id,
+      "tests-passed",
+      "gibson:/repo 378807eabb39cecc25ea801494053f8aa20feafa; " <>
+        "mix test test/rules_test.exs; passed: 1 test"
+    )
+
+    assert {:error,
+            %{
+              reason: "remedy_fired",
+              producer: review_id,
+              rule: "completion-requires-review"
+            }} = Dispatch.dispatch(ctx.db, ctx.handlers, completion)
+
+    assert review_count(ctx.db, producer.id) == 1
+
+    assert {:error, %{reason: "remedy_fired", producer: ^review_id}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, completion)
+
+    assert review_count(ctx.db, producer.id) == 1
+    verdict(ctx, reviewer.session_key, review_id, "reviewed-clean", "reviewed exact receipt tip")
+
+    assert {:ok, %{assignment: %{id: completed_id, state: "closed"}}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, completion)
+
+    assert completed_id == producer.id
+    assert review_count(ctx.db, producer.id) == 1
+  end
+
+  test "shipped completion remedy commissions and reuses unversioned reviews", ctx do
+    holder = session(ctx.db, "unversioned-holder", "flynn", archetype: "coder")
+    reviewer = session(ctx.db, "unversioned-reviewer", "flynn", archetype: "reviewer")
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT OR REPLACE INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1)"
+      )
+
+    Roles.create!(ctx.db, "reviewer", "flynn", reviewer.session_key)
+    put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    for effect_kind <- ["policy", "release", "live_mutation"] do
+      producer =
+        assignment(ctx, holder.session_key, {:user, "flynn"}, effect_kind: effect_kind)
+
+      verdict(
+        ctx,
+        holder.session_key,
+        producer.id,
+        "tests-passed",
+        "gibson:/repo unversioned; mix test test/rules_test.exs; passed: unversioned fixture"
+      )
+
+      completion =
+        p3_call("attest", {:session, holder.session_key}, %{
+          assignment_id: producer.id,
+          kind: "completion"
+        })
+        |> update_in([:params], &Map.delete(&1, :commit_refs))
+        |> Map.delete(:result_revision)
+
+      preexisting_review_id =
+        if effect_kind == "policy" do
+          review_call =
+            p3_call("assign", {:user, "flynn"}, %{
+              subject: "preexisting unversioned review",
+              reviews_assignment_id: producer.id,
+              effect_kind: "review",
+              idempotency_key: nil
+            })
+            |> update_in([:params], &Map.delete(&1, :review_commit_refs))
+            |> Map.put(:session_key, reviewer.session_key)
+
+          assert {:ok, review} = Dispatch.dispatch(ctx.db, ctx.handlers, review_call)
+          review.id
+        end
+
+      assert {:error,
+              %{
+                reason: "remedy_fired",
+                producer: review_id,
+                rule: "completion-requires-review"
+              }} = Dispatch.dispatch(ctx.db, ctx.handlers, completion)
+
+      if preexisting_review_id, do: assert(review_id == preexisting_review_id)
+      assert review_count(ctx.db, producer.id) == 1
+
+      assert {:ok, [[0]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT count(*) FROM assignment_review_revisions WHERE reviewAssignmentId = ?1",
+                 [review_id]
+               )
+
+      assert {:error, %{reason: "remedy_fired", producer: ^review_id}} =
+               Dispatch.dispatch(ctx.db, ctx.handlers, completion)
+
+      assert review_count(ctx.db, producer.id) == 1
+      verdict(ctx, reviewer.session_key, review_id, "reviewed-clean", "clean unversioned review")
+
+      assert {:ok, %{assignment: %{id: completed_id, state: "closed"}}} =
+               Dispatch.dispatch(ctx.db, ctx.handlers, completion)
+
+      assert completed_id == producer.id
+    end
   end
 
   test "typed completion keeps code reviewed while receipt exemptions stay narrow", ctx do
@@ -1252,7 +1434,7 @@ defmodule Tightbeam.RulesTest do
     assert orchestration_id == orchestration.id
 
     ordinary =
-      p3_call("assign", {:user, "reviewer"}, %{
+      p3_call("assign", {:user, "flynn"}, %{
         subject: "ordinary assignment",
         idempotency_key: nil,
         files: nil
@@ -1264,7 +1446,7 @@ defmodule Tightbeam.RulesTest do
 
     for producer <- [noncode, closed] do
       call =
-        p3_call("assign", {:user, "reviewer"}, %{
+        p3_call("assign", {:user, "flynn"}, %{
           subject: "exempt review",
           reviews_assignment_id: producer.id,
           idempotency_key: nil,
@@ -1284,6 +1466,23 @@ defmodule Tightbeam.RulesTest do
   end
 
   defp p3_call(verb, principal, params) do
+    params =
+      cond do
+        verb == "attest" and params[:kind] == "completion" and is_nil(params[:commit_refs]) ->
+          Map.put(params, :commit_refs, test_commit_refs())
+
+        (verb == "assign" and params[:reviews_assignment_id]) &&
+            is_nil(params[:review_commit_refs]) ->
+          Map.put(params, :review_commit_refs, test_commit_refs())
+
+        verb == "assign" and is_nil(params[:reviews_assignment_id]) and
+            is_nil(params[:effect_kind]) ->
+          Map.put(params, :effect_kind, "coordination")
+
+        true ->
+          params
+      end
+
     origin =
       case principal do
         {:session, key} -> "agent:#{key}"
@@ -1291,7 +1490,7 @@ defmodule Tightbeam.RulesTest do
         nil -> "process:test"
       end
 
-    %{
+    call = %{
       verb: verb,
       origin: origin,
       principal: principal,
@@ -1301,19 +1500,50 @@ defmodule Tightbeam.RulesTest do
       role_fallback: false,
       supervision_interval_ms: 1_000
     }
+
+    if verb == "attest" and params[:kind] == "completion" do
+      Map.put(call, :result_revision, hd(params.commit_refs))
+    else
+      call
+    end
   end
 
   defp assignment(ctx, holder_key, opener, opts \\ []) do
+    case opener do
+      {:user, user} ->
+        {:ok, _} =
+          DB.query(
+            ctx.db,
+            "INSERT OR IGNORE INTO users (userId, isAdmin, createdAt) VALUES (?1, 0, 1)",
+            [user]
+          )
+
+      _ ->
+        :ok
+    end
+
     call =
       p3_call("assign", opener, %{
         subject: "P3 assignment #{System.unique_integer([:positive])}",
         idempotency_key: nil,
         reviews_assignment_id: opts[:reviews],
-        effect_kind: opts[:effect_kind],
+        effect_kind: opts[:effect_kind] || "code",
+        review_commit_refs: if(opts[:reviews], do: test_commit_refs(), else: nil),
         files: opts[:files]
       })
 
     Assignments.__handle__(ctx.db, "assign", %{call | session_key: holder_key})
+  end
+
+  defp test_commit_refs do
+    {oid, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: File.cwd!())
+
+    [
+      %{
+        repo: "#{Tightbeam.Placement.local_host_name()}:#{File.cwd!()}",
+        commit: String.trim(oid)
+      }
+    ]
   end
 
   defp verdict(ctx, session_key, assignment_id, verdict_kind, note \\ nil) do
@@ -1408,7 +1638,7 @@ defmodule Tightbeam.RulesTest do
     deny_when = [
       { fact = "attest.kind", op = "eq", value = "completion" },
       { fact = "assignment.effect_kind", op = "in", value = ["code", "policy", "release", "live_mutation"] },
-      { fact = "assignment.qualifying_review_verdict_kinds", op = "not_in", value = ["reviewed-clean"] }
+      { fact = "assignment.applicable_review_verdict_kinds", op = "not_in", value = ["reviewed-clean"] }
     ]
     """
   end
@@ -1447,7 +1677,7 @@ defmodule Tightbeam.RulesTest do
       if op == "not_in" and
            fact in [
              "assignment.verdicts",
-             "assignment.qualifying_review_verdict_kinds"
+             "assignment.applicable_review_verdict_kinds"
            ] do
         "external_producer = true"
       else

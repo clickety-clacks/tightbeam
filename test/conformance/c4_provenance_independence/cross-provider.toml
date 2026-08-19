@@ -4,7 +4,7 @@ name = "cross-provider"
 phase = "pending"
 blocking_phase = "P3"
 kind = "dispatch-rule"
-source = "assignment.qualifying_review_verdict_kinds; review selection is provider-neutral"
+source = "assignment.applicable_review_verdict_kinds; review selection is provider-neutral"
 legibility = "event:denied(rule=cross-provider-review)"
 
 [[fixture.rule]]
@@ -14,5 +14,5 @@ external_producer = true
 text = "completion needs one qualifying reviewed-clean verdict regardless of provider"
 deny_when = [
   { fact = "attest.kind", op = "eq", value = "completion" },
-  { fact = "assignment.qualifying_review_verdict_kinds", op = "not_in", value = ["reviewed-clean"] },
+  { fact = "assignment.applicable_review_verdict_kinds", op = "not_in", value = ["reviewed-clean"] },
 ]

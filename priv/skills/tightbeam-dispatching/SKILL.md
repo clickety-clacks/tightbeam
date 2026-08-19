@@ -5,7 +5,7 @@ description: Assignment and attest hygiene when dispatching work to another sess
 
 Dispatching work: spawn (or pick) the worker, then open the
 obligation as a row — `tightbeam assign --subject "..."
-(--session K | --role R) [--work-item <id>]` — and wake the worker
+(--session K | --role R) [--work-item <id>] --effect-kind <kind>` — and wake the worker
 with a brief of AT MOST ONE SENTENCE plus the references:
 
     tightbeam wake --role coder:x --prompt \

@@ -134,7 +134,7 @@ it is FOR.
 
 
 When you give work to anyone — a hire or a colleague — the assignment row IS the
-dispatch: open it first (`tightbeam assign --subject "..." --work-item <id>`), then wake
+dispatch: open it first (`tightbeam assign --subject "..." --work-item <id> --effect-kind <kind>`), then wake
 the holder with at most one sentence plus the assignment id. The rows are the brief; a
 wake without a card you opened is an expectation you chose not to record. Thread every
 assignment to the work item it serves. What you hire, you clean up: when a hire's last
@@ -161,7 +161,8 @@ Work is tracked as durable records, not in chat.
 
 - An assignment is an obligation on that work, held by a session:
 
-    tightbeam assign --subject "fix the resume crash" --role implementer --work-item <workItemId>
+    tightbeam assign --subject "fix the resume crash" --role implementer \
+      --work-item <workItemId> --effect-kind code
 
 Open the card against a role, never a bare session key. The card records the role it
 was opened against; opened against a session key alone it records none, and

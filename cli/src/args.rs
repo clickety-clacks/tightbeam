@@ -155,6 +155,7 @@ pub enum Command {
         work_item_id: Option<String>,
         reviews: Option<String>,
         effect_kind: Option<String>,
+        review_commit_refs: Option<Vec<serde_json::Value>>,
         files: Option<Vec<String>>,
     },
     Dispatch {
@@ -281,6 +282,11 @@ pub enum Command {
     DigestMembers {
         identity: Identity,
         wake_id: String,
+    },
+    BindReviewRevision {
+        identity: Identity,
+        review_assignment_id: String,
+        commit_refs: Vec<serde_json::Value>,
     },
     Assignments {
         identity: Identity,
@@ -607,6 +613,7 @@ COMMANDS:
   assign --subject "<work>" (--session <key> | --role <name>)
          [--key <key>] [--work-item <workItemId>]
          [--reviews <assignmentId>] [--effect-kind <kind>]
+         [--review-commit-refs '[{"repo":"host:/abs/path","commit":"<commit>"}]']
          [--files '["lib/a.ex","test/a_test.exs"]']
       Open an obligation held by a session; a work item is the durable thread
       across assignments.
@@ -652,6 +659,8 @@ COMMANDS:
       so you can walk a long trail without re-reading it; the response carries
       nextAfter and hasMoreAfter to drive the next call.
         tightbeam attests as_abc --limit 50 --as-user flynn
+  bind-review-revision <reviewAssignmentId> --commit-refs <json>
+      Bind an owner-identified legacy code-review card to its result revision.
   assignments [--session <key> | --role <name>] [--state open|closed|all]
       List assignments (open by default).
 
@@ -1455,14 +1464,26 @@ fn parse_with_optional_catalog(
                         .map_err(|_| "--files must be a JSON array of strings".to_owned())
                 })
                 .transpose()?;
+            let reviews = nonempty(flags, "reviews");
+            let effect_kind = nonempty(flags, "effect-kind");
+            if reviews.is_none() && effect_kind.is_none() {
+                return Err("--effect-kind is required for an unlinked assignment".to_owned());
+            }
+            let review_commit_refs = nonempty(flags, "review-commit-refs")
+                .map(|encoded| {
+                    serde_json::from_str::<Vec<serde_json::Value>>(&encoded)
+                        .map_err(|_| "--review-commit-refs must be a JSON array".to_owned())
+                })
+                .transpose()?;
             Ok(Command::Assign {
                 identity: identity(flags)?,
                 subject,
                 target: targets.into_iter().next().expect("exactly one target"),
                 idempotency_key: nonempty(flags, "key"),
                 work_item_id: nonempty(flags, "work-item"),
-                reviews: nonempty(flags, "reviews"),
-                effect_kind: nonempty(flags, "effect-kind"),
+                reviews,
+                effect_kind,
+                review_commit_refs,
                 files,
             })
         }
@@ -1477,12 +1498,14 @@ fn parse_with_optional_catalog(
             let subject =
                 nonempty(flags, "subject").ok_or_else(|| "--subject is required".to_owned())?;
             let brief = nonempty(flags, "brief").ok_or_else(|| "--brief is required".to_owned())?;
+            let effect_kind = nonempty(flags, "effect-kind")
+                .ok_or_else(|| "--effect-kind is required".to_owned())?;
             Ok(Command::Dispatch {
                 identity: identity(flags)?,
                 subject,
                 holder: holders.into_iter().next().expect("exactly one holder"),
                 work_item_id: nonempty(flags, "work-item"),
-                effect_kind: nonempty(flags, "effect-kind"),
+                effect_kind: Some(effect_kind),
                 workdir_root: nonempty(flags, "workdir-root"),
                 brief,
                 idempotency_key: nonempty(flags, "key"),
@@ -1841,6 +1864,20 @@ fn parse_with_optional_catalog(
                 assignment_id: parsed.positional[1].clone(),
                 after: cursor_flag(flags, "after", "an attest id")?,
                 limit: page_limit(flags)?,
+            })
+        }
+        "bind-review-revision" => {
+            if parsed.positional.len() != 2 {
+                return Err("usage: tightbeam bind-review-revision <reviewAssignmentId> --commit-refs <json>".to_owned());
+            }
+            let encoded = nonempty(flags, "commit-refs")
+                .ok_or_else(|| "--commit-refs is required".to_owned())?;
+            let commit_refs = serde_json::from_str::<Vec<serde_json::Value>>(&encoded)
+                .map_err(|_| "--commit-refs must be a JSON array".to_owned())?;
+            Ok(Command::BindReviewRevision {
+                identity: identity(flags)?,
+                review_assignment_id: parsed.positional[1].clone(),
+                commit_refs,
             })
         }
         "assignments" => {
@@ -2757,6 +2794,7 @@ mod tests {
                 "attest",
                 "attests",
                 "add-user",
+                "bind-review-revision",
                 "cancel-wake",
                 "condition",
                 "config",

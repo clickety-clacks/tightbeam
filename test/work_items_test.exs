@@ -398,7 +398,11 @@ defmodule Tightbeam.WorkItemsTest do
 
   defp assign(ctx, holder, subject, work_item_id) do
     assignment_call =
-      call("assign", {:user, "flynn"}, %{subject: subject, work_item_id: work_item_id})
+      call("assign", {:user, "flynn"}, %{
+        subject: subject,
+        work_item_id: work_item_id,
+        effect_kind: "coordination"
+      })
       |> Map.merge(%{session_key: holder, target_role: nil, role_fallback: false})
 
     Assignments.__handle__(ctx.db, "assign", assignment_call)

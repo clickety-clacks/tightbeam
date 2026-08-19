@@ -25,6 +25,7 @@ defmodule Tightbeam.Artifacts do
   """
 
   alias Tightbeam.{DB, TurnObservations}
+  alias Tightbeam.DB.Txn
 
   @outside_workspace "artifact origin is outside its session workspace"
 
@@ -168,16 +169,23 @@ defmodule Tightbeam.Artifacts do
   State-blind by design: in-workspace, archived, and released rows all count —
   a record counts in every state.
   """
-  @spec recorded_kinds(DB.server(), String.t(), String.t()) :: [String.t()]
-  def recorded_kinds(db \\ Tightbeam.DB, work_item_id, created_by_session) do
-    {:ok, rows} =
-      DB.query(
-        db,
+  @spec recorded_kinds(DB.server() | Txn.t(), String.t(), String.t()) :: [String.t()]
+  def recorded_kinds(queryable \\ Tightbeam.DB, work_item_id, created_by_session) do
+    rows =
+      query_rows(
+        queryable,
         "SELECT DISTINCT kind FROM artifacts WHERE workItemId = ?1 AND createdBySession = ?2 ORDER BY kind",
         [work_item_id, created_by_session]
       )
 
     Enum.map(rows, &hd/1)
+  end
+
+  defp query_rows(%Txn{} = txn, sql, params), do: Txn.q(txn, sql, params)
+
+  defp query_rows(db, sql, params) do
+    {:ok, rows} = DB.query(db, sql, params)
+    rows
   end
 
   @doc "List artifacts matching exact optional provenance filters, newest first."

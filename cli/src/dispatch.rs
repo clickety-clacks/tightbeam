@@ -341,6 +341,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             work_item_id,
             reviews,
             effect_kind,
+            review_commit_refs,
             files,
         } => {
             let target = match target {
@@ -360,6 +361,12 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             }
             if let Some(value) = effect_kind {
                 params.push(string_field("effectKind", value));
+            }
+            if let Some(value) = review_commit_refs {
+                params.push(format!(
+                    "\"reviewCommitRefs\":{}",
+                    serde_json::to_string(value).expect("commit refs are JSON serializable")
+                ));
             }
             if let Some(value) = files {
                 params.push(format!(
@@ -713,6 +720,22 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             "digest-members",
             vec![],
             vec![string_field("wakeId", wake_id)],
+        )),
+        Command::BindReviewRevision {
+            identity,
+            review_assignment_id,
+            commit_refs,
+        } => Ok(request(
+            identity,
+            "bind-review-revision",
+            vec![],
+            vec![
+                string_field("reviewAssignmentId", review_assignment_id),
+                format!(
+                    "\"commitRefs\":{}",
+                    serde_json::to_string(commit_refs).expect("commit refs are JSON serializable")
+                ),
+            ],
         )),
         Command::Assignments {
             identity,
@@ -1490,6 +1513,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::WorkItemFail { identity, .. }
         | Command::Attest { identity, .. }
         | Command::Attests { identity, .. }
+        | Command::BindReviewRevision { identity, .. }
         | Command::Assignments { identity, .. }
         | Command::CancelWake { identity, .. }
         | Command::IdentityEdit { identity, .. }

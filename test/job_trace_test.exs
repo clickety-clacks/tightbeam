@@ -121,6 +121,17 @@ defmodule Tightbeam.JobTraceTest do
                commit_refs: commit_refs
              })
 
+    :ok =
+      DB.execute(
+        db,
+        """
+        INSERT INTO assignment_review_revisions
+          (reviewAssignmentId, repo, commitOid, bySession, cause, ts)
+        VALUES ('asg_review', '#{Tightbeam.Placement.local_host_name()}:#{repo}',
+                '#{commit}', 'reviewer', 'legacy-review-revision-binding', 99)
+        """
+      )
+
     assert %{code: "invalid_commit_refs"} =
              attest(db, {:session, "holder"}, "asg_bad", "verdict", %{
                verdict_kind: "reviewed-clean",
@@ -167,7 +178,7 @@ defmodule Tightbeam.JobTraceTest do
     Enum.each(trace.assignments, fn assignment ->
       assert_keys(
         assignment,
-        ~w(files holderKey id openerRef reviewsAssignmentId state)a
+        ~w(files holderKey id openerRef reviewRevisionBinding reviewsAssignmentId state)a
       )
     end)
 
@@ -180,6 +191,15 @@ defmodule Tightbeam.JobTraceTest do
     assert direct.openerRef == "user:owner"
     assert review.openerRef == "session:reviewer"
     assert review.reviewsAssignmentId == "asg_direct"
+
+    assert review.reviewRevisionBinding == %{
+             commitRefs: [
+               %{repo: "#{Tightbeam.Placement.local_host_name()}:#{repo}", commit: commit}
+             ],
+             principal: "session:reviewer",
+             cause: "legacy-review-revision-binding",
+             ts: 99
+           }
 
     Enum.each(trace.timeline, &assert_entry_schema/1)
 
@@ -267,7 +287,7 @@ defmodule Tightbeam.JobTraceTest do
 
     Application.put_env(:tightbeam, :commit_ref_command, fn executable, args, opts ->
       send(parent, {:commit_ref_command, executable, args, opts})
-      {"", 0}
+      {"0123456789abcdef0123456789abcdef01234567\n", 0}
     end)
 
     remote_refs = [
@@ -288,8 +308,24 @@ defmodule Tightbeam.JobTraceTest do
 
     assert_received {:commit_ref_command, "ssh", args, [stderr_to_stdout: true]}
     assert "git@remote-test" in args
-    assert List.last(args) =~ "/srv/repo"
-    assert List.last(args) =~ "0123456789abcdef^{commit}"
+    assert "sh" in args
+    assert "-c" in args
+    refute "/srv/repo" in args
+    refute "0123456789abcdef^{commit}" in args
+
+    command =
+      [
+        "git",
+        "-C",
+        "/srv/repo",
+        "rev-parse",
+        "--verify",
+        "--end-of-options",
+        "0123456789abcdef^{commit}"
+      ]
+      |> Enum.map_join(" ", &Tightbeam.Harness.Support.shell_quote/1)
+
+    assert List.last(args) == Tightbeam.Harness.Support.shell_quote(command)
   end
 
   test "equal-time numeric turn ids sort numerically", %{db: db} do

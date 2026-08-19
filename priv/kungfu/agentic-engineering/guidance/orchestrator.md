@@ -120,13 +120,14 @@ the same proven outcome is fine; a different outcome is not. A holder's "done" i
 claim (the substrate itself scores a completion as `claims-done` until a verifying
 verdict lands), so verify from rows, never from a worker's self-report.
 
-Classify the EFFECT before you commission review; never infer it from the holder's
-role. Exactly one linked independent `reviewed-clean` is required when a card changes
-code or source behavior; authoritative specs, policy, Kung Fu, or rails; a release
-artifact or promotion; or live runtime, configuration, or identity state. One card
-that carries several of those effects still gets one review, not one per effect.
-Review verdicts and review-card lifecycle, read-only recon or advice,
-status/accountability work, and coordination are evidence-only and get no review.
+Classify the authorized output when you open every unlinked assignment; never infer it
+from the holder's role or final diff. Use `evidence` for read-only work, `coordination`
+for dispatch-only work, `code` for source or executable behavior, `policy` for owner-gated
+policy or specs, `release` for publishing, and `live_mutation` for runtime,
+infrastructure, or credential changes. Do not select `review`; the substrate forces that
+kind on a card linked by `--reviews`. Code needs an exact result revision and one or more
+applicable independent `reviewed-clean` verdicts. Policy, release, and live mutation use
+the unversioned independent clean set. Evidence and coordination are review-exempt.
 Never stage a review of a review.
 
 For a review-required effect, choose the first qualified permitted candidate in the
@@ -139,7 +140,9 @@ session with the capability the effect requires. Same-model, same-provider, and
 same-harness sessions remain eligible; those differences are preferences and
 observability, not constitutional gates.
 
-Link the single review card to the work it reviews (`--reviews`, see feature-cycle).
+Link the review card to the work it reviews (`--reviews`, see feature-cycle). When you
+commission code review, also supply the exact result revision with
+`--review-commit-refs '[{"repo":"<host>:<absolute-path>","commit":"<revision>"}]'`.
 The review-card holder files the verdict. That exact link plus the different-session
 holder makes independence a fact on the record, not a claim. Real proof of working
 behavior is the verification statute's papertrail: the holder verifies the way the
@@ -150,12 +153,18 @@ and the substrate blocks a completion that lacks the papertrail.
 ## Closing the loop: the completion rail
 `completion-requires-review` backstops the evidence shape; it never chooses a model.
 A review-required card completes only when
-`assignment.qualifying_review_verdict_kinds` contains `reviewed-clean`: the latest
+`assignment.applicable_review_verdict_kinds` contains `reviewed-clean`: one or more
 card linked by `--reviews` has a clean latest holder-filed verdict, and that holder is
 a different session from the work's author. Closing or revoking that fulfilled review
 card preserves its verdict; an older round cannot override it, and a newer round
 becomes authoritative. Who opened the review card and which harness or provider ran
 it do not change that fact.
+
+For an owner-identified legacy code-review card with no structured revision, wake the
+existing review card holder with the card ID and exact result revision. Do not wake the
+producer with the bind request, and do not commission a duplicate review before the holder
+reports the bind result. The holder uses `bind-review-revision`; prose commit names never
+bind a card.
 
 The assignment's durable `effectKind` supplies the classification above. A linked
 review card is always `effectKind = review`, so its completion is exempt and cannot

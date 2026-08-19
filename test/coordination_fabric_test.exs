@@ -3750,7 +3750,7 @@ defmodule Tightbeam.CoordinationFabricTest do
       target_role: nil,
       role_fallback: false,
       supervision_interval_ms: 1_000,
-      params: %{subject: "work"}
+      params: %{subject: "work", effect_kind: "coordination"}
     })
   end
 

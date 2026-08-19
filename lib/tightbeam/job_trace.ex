@@ -102,9 +102,35 @@ defmodule Tightbeam.JobTrace do
         openerRef: opener_ref(opened_user, opened_session),
         state: state,
         files: assignment_files(db, id),
-        reviewsAssignmentId: reviews
+        reviewsAssignmentId: reviews,
+        reviewRevisionBinding: review_revision_binding(db, id)
       }
     end)
+  end
+
+  defp review_revision_binding(db, assignment_id) do
+    case DB.query(
+           db,
+           """
+           SELECT repo, commitOid, bySession, byUser, cause, ts
+           FROM assignment_review_revisions WHERE reviewAssignmentId = ?1
+           """,
+           [assignment_id]
+         ) do
+      {:ok, [[repo, oid, by_session, by_user, cause, ts]]} ->
+        %{
+          commitRefs: [%{repo: repo, commit: oid}],
+          principal: if(by_session, do: "session:" <> by_session, else: "user:" <> by_user),
+          cause: cause,
+          ts: ts
+        }
+
+      {:ok, []} ->
+        nil
+
+      {:error, reason} ->
+        raise "review revision binding read failed: #{inspect(reason)}"
+    end
   end
 
   defp assignment_files(db, assignment_id) do

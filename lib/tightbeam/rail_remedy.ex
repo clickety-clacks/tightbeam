@@ -2,6 +2,7 @@ defmodule Tightbeam.RailRemedy do
   @moduledoc "Active rail remedy execution and durable remedy-episode lifecycle."
 
   alias Tightbeam.{
+    Assignments,
     DB,
     Dispatch,
     EventLog,
@@ -47,11 +48,24 @@ defmodule Tightbeam.RailRemedy do
   def fire(db, handlers, rule, subject, call) do
     result =
       with {:ok, context} <- binding_context(db, subject, call),
-           {:ok, resolved} <- resolve_remedy(rule.remedy, context),
-           {:ok, resolved} <- bind_target(db, rule.remedy.action, resolved) do
-        route_episode(db, handlers, rule, subject, call, context, resolved)
+           {:ok, resolved} <- resolve_remedy(rule.remedy, context) do
+        case reusable_review(db, rule, context) do
+          nil ->
+            with {:ok, resolved} <- bind_target(db, rule.remedy.action, resolved) do
+              route_episode(db, handlers, rule, subject, call, context, resolved)
+            end
+
+          review_id ->
+            wake_reusable_review(db, rule, context, review_id)
+        end
       else
         {:error, _unbound} -> %{outcome: "unbound", producer_id: nil}
+      end
+
+    result =
+      case result do
+        {:error, _unbound} -> %{outcome: "unbound", producer_id: nil}
+        outcome -> outcome
       end
 
     lifecycle(db, rule, subject, call, result)
@@ -79,14 +93,14 @@ defmodule Tightbeam.RailRemedy do
   end
 
   @doc "Return the occurrence when one statute/subject episode is live."
-  @spec live?(DB.server(), String.t(), String.t()) :: pos_integer() | nil
-  def live?(db, statute, subject) do
-    case DB.query(
-           db,
+  @spec live?(DB.server() | Txn.t(), String.t(), String.t()) :: pos_integer() | nil
+  def live?(queryable, statute, subject) do
+    case query_rows(
+           queryable,
            "SELECT occurrence FROM rail_remedy_episodes WHERE statute = ?1 AND subject = ?2 AND status = 'live'",
            [statute, subject]
          ) do
-      {:ok, [[occurrence]]} -> occurrence
+      [[occurrence]] -> occurrence
       _ -> nil
     end
   end
@@ -669,14 +683,18 @@ defmodule Tightbeam.RailRemedy do
     case DB.query(
            db,
            """
-           SELECT a.id, a.workItemId, a.holderKey, a.holderRole, s.archetype, s.ownerUserId
+           SELECT a.id, a.workItemId, a.holderKey, a.holderRole, s.archetype, s.ownerUserId,
+                  COALESCE(e.effectKind,
+                    CASE WHEN a.reviewsAssignmentId IS NULL THEN 'code' ELSE 'review' END)
            FROM assignments a
            JOIN sessions s ON s.sessionKey = a.holderKey
+           LEFT JOIN assignment_effects e ON e.assignmentId = a.id
            WHERE a.id = ?1
            """,
            [assignment_id]
          ) do
-      {:ok, [[assignment_id, work_item_id, holder_key, holder_role, archetype, owner]]} ->
+      {:ok,
+       [[assignment_id, work_item_id, holder_key, holder_role, archetype, owner, effect_kind]]} ->
         {:ok,
          %{
            assignment_id: assignment_id,
@@ -685,6 +703,10 @@ defmodule Tightbeam.RailRemedy do
            holder_role: holder_role,
            holder_archetype: archetype,
            caller_origin: call.origin,
+           result_revision:
+             if(Map.get(call, :result_revision), do: [call.result_revision], else: nil),
+           review_revision: Map.get(call, :result_revision),
+           effect_kind: effect_kind,
            owner: owner
          }}
 
@@ -729,12 +751,44 @@ defmodule Tightbeam.RailRemedy do
     bindings =
       Map.take(
         context,
-        ~w(assignment_id work_item_id holder_key holder_role holder_archetype caller_origin)a
+        ~w(assignment_id work_item_id holder_key holder_role holder_archetype caller_origin result_revision)a
       )
 
     with {:ok, target} <- resolve_map(remedy.target, bindings),
          {:ok, params} <- resolve_map(remedy.params, bindings) do
       {:ok, %{target: target, params: params}}
+    end
+  end
+
+  defp reusable_review(db, %{name: "completion-requires-review"}, context) do
+    Assignments.newest_applicable_open_review(
+      db,
+      context.assignment_id,
+      context.holder_key,
+      context.effect_kind,
+      context.review_revision
+    )
+  end
+
+  defp reusable_review(_db, _rule, _context), do: nil
+
+  defp wake_reusable_review(db, rule, context, review_id) do
+    case DB.query(db, "SELECT holderKey FROM assignments WHERE id = ?1", [review_id]) do
+      {:ok, [[holder_key]]} ->
+        _wake =
+          Wakes.schedule(db, %{
+            session_key: holder_key,
+            target_role: nil,
+            origin: "remedy:#{rule.name}",
+            prompt: "review assignment #{review_id} is needed for #{context.assignment_id}",
+            due_at: now(),
+            assignment_id: review_id
+          })
+
+        %{outcome: "woke-existing", producer_id: review_id}
+
+      _ ->
+        %{outcome: "blocked", producer_id: nil}
     end
   end
 
@@ -749,12 +803,24 @@ defmodule Tightbeam.RailRemedy do
       {key, value}, {:ok, acc} ->
         embedded? = key in [:subject, :prompt, :display]
 
-        case resolve_value(value, bindings, embedded?) do
+        case resolve_param(key, value, bindings, embedded?) do
           {:ok, resolved} -> {:cont, {:ok, Map.put(acc, key, resolved)}}
           error -> {:halt, error}
         end
     end)
   end
+
+  # Unversioned producer kinds still commission reviews; only code has a result revision
+  # to bind. Every other missing whole-field token remains an unbound remedy.
+  defp resolve_param(:review_commit_refs, "{result_revision}", bindings, false) do
+    case Map.get(bindings, :result_revision) do
+      nil -> {:ok, nil}
+      value -> {:ok, value}
+    end
+  end
+
+  defp resolve_param(_key, value, bindings, embedded?),
+    do: resolve_value(value, bindings, embedded?)
 
   defp resolve_list(values, bindings) do
     Enum.reduce_while(values, {:ok, []}, fn value, {:ok, acc} ->
@@ -791,6 +857,15 @@ defmodule Tightbeam.RailRemedy do
           {:halt, {:error, token}}
       end
     end)
+  end
+
+  defp query_rows(%Txn{} = txn, sql, params), do: Txn.q(txn, sql, params)
+
+  defp query_rows(db, sql, params) do
+    case DB.query(db, sql, params) do
+      {:ok, rows} -> rows
+      _ -> []
+    end
   end
 
   defp fetch_binding(bindings, token) do

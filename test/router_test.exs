@@ -344,7 +344,7 @@ defmodule Tightbeam.Wire.RouterTest do
         target_role: nil,
         role_fallback: false,
         supervision_interval_ms: 1_000,
-        params: %{subject: "Build it", work_item_id: item.id}
+        params: %{subject: "Build it", work_item_id: item.id, effect_kind: "coordination"}
       })
 
     WorkState.emit(ctx.db, assignment.id, nil)
@@ -1118,7 +1118,7 @@ defmodule Tightbeam.Wire.RouterTest do
              verb: "assign",
              asUser: "flynn",
              role: "bound-assignment",
-             params: %{subject: "x"}
+             params: %{subject: "x", effectKind: "coordination"}
            }).status == 200
 
     assert_receive {:call,
@@ -1133,7 +1133,7 @@ defmodule Tightbeam.Wire.RouterTest do
              verb: "assign",
              asUser: "flynn",
              role: "fallback-assignment",
-             params: %{subject: "x"}
+             params: %{subject: "x", effectKind: "coordination"}
            }).status == 200
 
     assert_receive {:call,
@@ -1147,8 +1147,18 @@ defmodule Tightbeam.Wire.RouterTest do
     assert key == main.session_key
 
     for body <- [
-          %{verb: "assign", asUser: "flynn", role: "missing-assignment", params: %{subject: "x"}},
-          %{verb: "assign", asUser: "flynn", sessionKey: "missing", params: %{subject: "x"}}
+          %{
+            verb: "assign",
+            asUser: "flynn",
+            role: "missing-assignment",
+            params: %{subject: "x", effectKind: "coordination"}
+          },
+          %{
+            verb: "assign",
+            asUser: "flynn",
+            sessionKey: "missing",
+            params: %{subject: "x", effectKind: "coordination"}
+          }
         ] do
       response = dispatch_cli(ctx, "tbc_test", body)
       assert response.status == 404
@@ -1160,7 +1170,7 @@ defmodule Tightbeam.Wire.RouterTest do
         verb: "assign",
         asUser: "flynn",
         sessionKey: retired.session_key,
-        params: %{subject: "x"}
+        params: %{subject: "x", effectKind: "coordination"}
       })
 
     assert response.status == 400

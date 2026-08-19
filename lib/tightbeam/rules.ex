@@ -15,7 +15,7 @@ defmodule Tightbeam.Rules do
   ["reviewed-clean"]` fires for an assignment with no verdicts. List facts are
   `caller.roles`, `assignment.verdicts`,
   `assignment.independent_verdict_kinds`,
-  `assignment.qualifying_review_verdict_kinds`, and
+  `assignment.applicable_review_verdict_kinds`, and
   `assignment.artifact_kinds` (the distinct artifact kinds the assignment's
   holder recorded on its work item, in every artifact state). Assignment
   caller identity comes from the optional dispatch principal rather than the
@@ -42,8 +42,8 @@ defmodule Tightbeam.Rules do
   """
 
   alias Tightbeam.{
-    Artifacts,
     Assignments,
+    Artifacts,
     DB,
     Devices,
     Escalation,
@@ -97,18 +97,18 @@ defmodule Tightbeam.Rules do
                  "on_rule_denied",
                  "params"
                ])
-  @binding_tokens ~w(assignment_id work_item_id holder_key holder_role holder_archetype caller_origin)
+  @binding_tokens ~w(assignment_id work_item_id holder_key holder_role holder_archetype caller_origin result_revision)
   @embedded_fields ~w(subject prompt display)
-  @whole_fields ~w(target_role target_session reviews work_item name harness model effort context archetype host after at)
+  @whole_fields ~w(target_role target_session reviews review_commit_refs work_item name harness model effort context archetype host after at)
   @verdict_facts ~w(
     assignment.verdicts
     assignment.independent_verdict_kinds
-    assignment.qualifying_review_verdict_kinds
+    assignment.applicable_review_verdict_kinds
     work_item.verdict_kinds
   )
   @linked_review_facts ~w(
     assignment.independent_verdict_kinds
-    assignment.qualifying_review_verdict_kinds
+    assignment.applicable_review_verdict_kinds
   )
   @name_re ~r/^[a-z0-9][a-z0-9-]*$/
   @facts %{
@@ -130,7 +130,8 @@ defmodule Tightbeam.Rules do
     "assignment.state" => :string,
     "assignment.holder_noted_verdict_kinds" => {:list, :string},
     "assignment.independent_verdict_kinds" => {:list, :string},
-    "assignment.qualifying_review_verdict_kinds" => {:list, :string},
+    "assignment.completion_review_required" => :bool,
+    "assignment.applicable_review_verdict_kinds" => {:list, :string},
     "assignment.artifact_kinds" => {:list, :string},
     "assignment.holder_archetype" => :string,
     "assignment.caller_is_holder" => :bool,
@@ -205,6 +206,21 @@ defmodule Tightbeam.Rules do
 
     rules
     |> Enum.filter(&(&1.verb == verb and edge in &1.edges))
+    |> decide_rules(db, call, %{}, [], [])
+  end
+
+  @doc false
+  def completion_review_rules do
+    :persistent_term.get(@persist_key, [])
+    |> Enum.filter(fn rule ->
+      rule.verb == "attest" and "verb" in rule.edges and
+        Enum.any?(rule.conditions, &(&1.fact == "assignment.applicable_review_verdict_kinds"))
+    end)
+  end
+
+  @doc false
+  def completion_review_decide(db, call, rules) do
+    rules
     |> decide_rules(db, call, %{}, [], [])
   end
 
@@ -504,7 +520,8 @@ defmodule Tightbeam.Rules do
     {required_top, allowed_top, required_params, allowed_params} =
       case action do
         "assign" ->
-          {~w(target_role), ~w(target_role), ~w(subject), ~w(subject reviews files work_item)}
+          {~w(target_role), ~w(target_role), ~w(subject),
+           ~w(subject reviews review_commit_refs work_item)}
 
         "wake" ->
           {[], ~w(target_role target_session), ~w(prompt), ~w(prompt after at)}
@@ -1226,8 +1243,11 @@ defmodule Tightbeam.Rules do
 
   defp compute_fact("assignment.verdicts", db, call, cache) do
     with_dependency("$assignment", db, call, cache, fn
-      nil, cache -> {nil, cache}
-      assignment, cache -> {Assignments.verdict_kinds(db, assignment.id), cache}
+      nil, cache ->
+        {nil, cache}
+
+      assignment, cache ->
+        {Assignments.verdict_kinds(db, assignment.id), cache}
     end)
   end
 
@@ -1259,7 +1279,7 @@ defmodule Tightbeam.Rules do
 
       assignment, cache ->
         {:ok, rows} =
-          DB.query(
+          query(
             db,
             """
             SELECT DISTINCT verdictKind FROM attests
@@ -1284,16 +1304,28 @@ defmodule Tightbeam.Rules do
     end)
   end
 
-  defp compute_fact("assignment.qualifying_review_verdict_kinds", db, call, cache) do
+  defp compute_fact("assignment.completion_review_required", db, call, cache) do
     with_dependency("$assignment", db, call, cache, fn
       nil, cache ->
         {nil, cache}
 
       assignment, cache ->
-        {Assignments.qualifying_review_verdict_kinds(
+        {assignment.effect_kind in ["code", "policy", "release", "live_mutation"], cache}
+    end)
+  end
+
+  defp compute_fact("assignment.applicable_review_verdict_kinds", db, call, cache) do
+    with_dependency("$assignment", db, call, cache, fn
+      nil, cache ->
+        {nil, cache}
+
+      assignment, cache ->
+        {Assignments.applicable_review_verdict_kinds(
            db,
            assignment.id,
-           assignment.holder_key
+           assignment.holder_key,
+           assignment.effect_kind,
+           Map.get(call, :result_revision)
          ), cache}
     end)
   end
@@ -1607,7 +1639,7 @@ defmodule Tightbeam.Rules do
   end
 
   defp assignment_context(db, where, params) do
-    case DB.query(
+    case query(
            db,
            """
            SELECT a.id, a.workItemId, a.reviewsAssignmentId, a.holderKey, a.state, s.archetype,
@@ -1651,6 +1683,9 @@ defmodule Tightbeam.Rules do
         nil
     end
   end
+
+  defp query(%DB.Txn{} = txn, sql, params), do: {:ok, DB.Txn.q(txn, sql, params)}
+  defp query(db, sql, params), do: DB.query(db, sql, params)
 
   defp caller_user(db, call, cache) do
     case parse_origin(call.origin) do

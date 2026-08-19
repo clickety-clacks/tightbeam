@@ -24,6 +24,8 @@ defmodule Tightbeam.Wire.SeamTest do
     DB,
     Gateway,
     Org,
+    Placement,
+    Roles,
     Rules
   }
 
@@ -78,7 +80,7 @@ defmodule Tightbeam.Wire.SeamTest do
         verb: "assign",
         asUser: "flynn",
         sessionKey: producer.session_key,
-        params: %{subject: "fix the seam"}
+        params: %{subject: "fix the seam", effectKind: "coordination"}
       })
     )
 
@@ -89,7 +91,7 @@ defmodule Tightbeam.Wire.SeamTest do
         verb: "assign",
         asUser: "flynn",
         sessionKey: reviewer.session_key,
-        params: %{subject: "review the fix", reviews: produced}
+        params: %{subject: "review the fix", reviews: produced, effectKind: "review"}
       })
     )
 
@@ -114,11 +116,77 @@ defmodule Tightbeam.Wire.SeamTest do
         verb: "assign",
         asUser: "flynn",
         sessionKey: reviewer.session_key,
-        params: %{subject: "review a ghost", reviews: "asg_never_existed"}
+        params: %{subject: "review a ghost", reviews: "asg_never_existed", effectKind: "review"}
       })
 
     assert JSON.decode!(response.resp_body)["error"]["code"] == "unknown_review_target"
     assert assignment_id(ctx.db, "review a ghost") == nil
+  end
+
+  test "a conflicting bound-review verdict returns a JSON refusal and writes no attest", ctx do
+    producer = create_session(ctx.db, "revision-producer", "flynn")
+    reviewer = create_session(ctx.db, "revision-reviewer", "flynn")
+    Roles.create!(ctx.db, "revision-reviewer", "flynn", reviewer.session_key)
+
+    register_hosts(ctx.db, %{
+      Placement.local_host_name() => %{ssh: nil, base_dir: File.cwd!(), cli_bin: nil}
+    })
+
+    {head, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: File.cwd!())
+    {parent, 0} = System.cmd("git", ["rev-parse", "HEAD^"], cd: File.cwd!())
+    repo = "#{Placement.local_host_name()}:#{File.cwd!()}"
+    head_ref = %{repo: repo, commit: String.trim(head)}
+    parent_ref = %{repo: repo, commit: String.trim(parent)}
+
+    ok!(
+      dispatch_cli(ctx, "tbc_wire_seam", %{
+        verb: "assign",
+        asUser: "flynn",
+        sessionKey: producer.session_key,
+        params: %{subject: "revision-producing work", effectKind: "code"}
+      })
+    )
+
+    producer_id = assignment_id(ctx.db, "revision-producing work")
+
+    ok!(
+      dispatch_cli(ctx, "tbc_wire_seam", %{
+        verb: "assign",
+        asUser: "flynn",
+        sessionKey: reviewer.session_key,
+        params: %{
+          subject: "bound revision review",
+          reviews: producer_id,
+          effectKind: "review",
+          reviewCommitRefs: [head_ref]
+        }
+      })
+    )
+
+    review_id = assignment_id(ctx.db, "bound revision review")
+
+    response =
+      dispatch_cli(ctx, reviewer.cli_token, %{
+        verb: "attest",
+        params: %{
+          assignmentId: review_id,
+          kind: "verdict",
+          verdictKind: "reviewed-clean",
+          commitRefs: [parent_ref]
+        }
+      })
+
+    assert response.status == 400
+
+    assert JSON.decode!(response.resp_body) == %{
+             "error" => %{
+               "code" => "review_revision_conflict",
+               "message" => "review revision conflicts with existing evidence"
+             }
+           }
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT count(*) FROM attests WHERE assignmentId = ?1", [review_id])
   end
 
   # A refusal here is the interesting failure, and the raw Plug.Conn dump buries

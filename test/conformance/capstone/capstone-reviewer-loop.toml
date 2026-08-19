@@ -10,9 +10,9 @@ legibility = "event:denied(rule=capstone-reviewer-loop);lifecycle:rail_remedy; l
 name = "capstone-reviewer-loop"
 verb = "attest"
 text = "linked reviewed-clean from the review card's different-session holder releases completion"
-edges = ["verb", "turn-end"]
+edges = ["verb"]
 effect = "remedy"
-deny_when = [{ fact = "assignment.qualifying_review_verdict_kinds", op = "not_in", value = ["reviewed-clean"] }]
+deny_when = [{ fact = "assignment.applicable_review_verdict_kinds", op = "not_in", value = ["reviewed-clean"] }]
 [fixture.rule.remedy]
 action = "assign"
 produces = "reviewed-clean"
@@ -20,3 +20,4 @@ target_role = "reviewer"
 [fixture.rule.remedy.params]
 subject = "review {assignment_id}"
 reviews = "{assignment_id}"
+review_commit_refs = "{result_revision}"

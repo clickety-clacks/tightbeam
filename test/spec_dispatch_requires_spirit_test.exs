@@ -109,7 +109,8 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
       params: %{
         subject: subject,
         brief: "Implement #{subject}.",
-        work_item_id: item_id
+        work_item_id: item_id,
+        effect_kind: "coordination"
       }
     }
   end
@@ -165,7 +166,8 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
         role_fallback: false,
         params: %{
           subject: "spirit review of work item #{item.id}",
-          work_item_id: item.id
+          work_item_id: item.id,
+          effect_kind: "policy"
         }
       })
 
@@ -222,7 +224,8 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
         role_fallback: false,
         params: %{
           subject: "round #{n}",
-          reviews_assignment_id: subject.id
+          reviews_assignment_id: subject.id,
+          effect_kind: "review"
         }
       }
     end

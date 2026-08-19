@@ -275,7 +275,15 @@ defmodule Tightbeam.CliIntegrationTest do
     {assigned, 0} =
       System.cmd(
         ctx.binary,
-        ["assign", "--subject", "admin revocation", "--session", "cli-worker"],
+        [
+          "assign",
+          "--subject",
+          "admin revocation",
+          "--session",
+          "cli-worker",
+          "--effect-kind",
+          "coordination"
+        ],
         cd: other_dir,
         stderr_to_stdout: true
       )
@@ -355,6 +363,8 @@ defmodule Tightbeam.CliIntegrationTest do
           "ship",
           "--session",
           "cli-holder",
+          "--effect-kind",
+          "coordination",
           "--key",
           "assign-cli"
         ],
@@ -386,6 +396,8 @@ defmodule Tightbeam.CliIntegrationTest do
           "investigate",
           "--brief",
           "Investigate the restored CLI path.",
+          "--effect-kind",
+          "coordination",
           "--key",
           "dispatch-cli"
         ],
@@ -576,6 +588,8 @@ defmodule Tightbeam.CliIntegrationTest do
           "cli-coder",
           "--work-item",
           item_id,
+          "--effect-kind",
+          "code",
           "--as-user",
           "flynn"
         ],
@@ -587,6 +601,14 @@ defmodule Tightbeam.CliIntegrationTest do
 
     repo = Path.expand("..", __DIR__)
     {commit, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: repo)
+
+    review_refs =
+      JSON.encode!([
+        %{
+          "repo" => "#{Tightbeam.Placement.local_host_name()}:#{repo}",
+          "commit" => String.trim(commit)
+        }
+      ])
 
     {_receipt, 0} =
       System.cmd(
@@ -624,6 +646,8 @@ defmodule Tightbeam.CliIntegrationTest do
           item_id,
           "--reviews",
           work_id,
+          "--review-commit-refs",
+          review_refs,
           "--as-user",
           "flynn"
         ],
@@ -648,7 +672,16 @@ defmodule Tightbeam.CliIntegrationTest do
     # A1 first denial: the completion is refused and the wake names the
     # missing verification verdict.
     {denied, denied_status} =
-      System.cmd(ctx.binary, ["attest", work_id, "--kind", "completion"],
+      System.cmd(
+        ctx.binary,
+        [
+          "attest",
+          work_id,
+          "--kind",
+          "completion",
+          "--commit-refs",
+          review_refs
+        ],
         cd: coder_dir,
         stderr_to_stdout: true
       )
@@ -674,7 +707,16 @@ defmodule Tightbeam.CliIntegrationTest do
 
     # A1 second denial: the artifact statute prods next, naming its own record.
     {denied_again, denied_again_status} =
-      System.cmd(ctx.binary, ["attest", work_id, "--kind", "completion"],
+      System.cmd(
+        ctx.binary,
+        [
+          "attest",
+          work_id,
+          "--kind",
+          "completion",
+          "--commit-refs",
+          review_refs
+        ],
         cd: coder_dir,
         stderr_to_stdout: true
       )
@@ -739,7 +781,16 @@ defmodule Tightbeam.CliIntegrationTest do
 
     # A2: the papertrail stands — the completion passes and the episodes close.
     {completed, 0} =
-      System.cmd(ctx.binary, ["attest", work_id, "--kind", "completion"],
+      System.cmd(
+        ctx.binary,
+        [
+          "attest",
+          work_id,
+          "--kind",
+          "completion",
+          "--commit-refs",
+          review_refs
+        ],
         cd: coder_dir,
         stderr_to_stdout: true
       )
@@ -799,6 +850,8 @@ defmodule Tightbeam.CliIntegrationTest do
           coder.session_key,
           "--work-item",
           item_id,
+          "--effect-kind",
+          "coordination",
           "--as-user",
           "flynn"
         ],
@@ -1145,6 +1198,8 @@ defmodule Tightbeam.CliIntegrationTest do
           "effort #{action}",
           "--brief",
           "Exercise the #{action} ruling path.",
+          "--effect-kind",
+          "coordination",
           "--key",
           key
         ],

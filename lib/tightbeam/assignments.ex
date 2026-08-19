@@ -6,7 +6,7 @@ defmodule Tightbeam.Assignments do
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
   alias Tightbeam.Harness.Support
-  alias Tightbeam.{EffortCheckin, EventLog, Org, Placement, Projection, Supervision, Wakes}
+  alias Tightbeam.{EffortCheckin, EventLog, Org, Placement, Projection, Rules, Supervision, Wakes}
 
   @effect_kinds ~w(code policy release live_mutation evidence review coordination)
   @effect_kind_sql Enum.map_join(@effect_kinds, ", ", &"'#{&1}'")
@@ -111,6 +111,25 @@ defmodule Tightbeam.Assignments do
   )
   """
 
+  @assignment_review_revisions_ddl """
+  CREATE TABLE IF NOT EXISTS assignment_review_revisions (
+    reviewAssignmentId TEXT PRIMARY KEY REFERENCES assignments(id),
+    repo TEXT NOT NULL CHECK(length(repo) > 0),
+    commitOid TEXT NOT NULL CHECK(
+      length(commitOid) IN (40, 64)
+      AND commitOid = lower(commitOid)
+      AND commitOid NOT GLOB '*[^0-9a-f]*'
+    ),
+    bySession TEXT NULL REFERENCES sessions(sessionKey),
+    byUser TEXT NULL REFERENCES users(userId),
+    cause TEXT NOT NULL CHECK(
+      cause IN ('review-commission', 'legacy-review-revision-binding')
+    ),
+    ts INTEGER NOT NULL,
+    CHECK((bySession IS NOT NULL) != (byUser IS NOT NULL))
+  )
+  """
+
   @interruptions_ddl """
   CREATE TABLE IF NOT EXISTS assignment_interruptions (
     assignmentId TEXT PRIMARY KEY REFERENCES assignments(id),
@@ -156,6 +175,7 @@ defmodule Tightbeam.Assignments do
     :ok = DB.execute(db, @attests_ddl)
     :ok = DB.execute(db, @assignment_files_ddl)
     :ok = DB.execute(db, @assignment_effects_ddl)
+    :ok = DB.execute(db, @assignment_review_revisions_ddl)
     :ok = DB.execute(db, @interruptions_ddl)
     :ok = DB.execute(db, @reopenings_ddl)
     Tightbeam.EffortCheckin.ensure_schema(db)
@@ -302,11 +322,11 @@ defmodule Tightbeam.Assignments do
   end
 
   @doc "Return distinct verdict kinds filed against an assignment."
-  @spec verdict_kinds(DB.server(), String.t()) :: [String.t()]
-  def verdict_kinds(db, assignment_id) do
-    {:ok, rows} =
-      DB.query(
-        db,
+  @spec verdict_kinds(DB.server() | Txn.t(), String.t()) :: [String.t()]
+  def verdict_kinds(queryable, assignment_id) do
+    rows =
+      query_rows(
+        queryable,
         "SELECT DISTINCT verdictKind FROM attests WHERE assignmentId = ?1 AND kind = 'verdict' ORDER BY verdictKind",
         [assignment_id]
       )
@@ -339,7 +359,7 @@ defmodule Tightbeam.Assignments do
   end
 
   @doc """
-  Return the latest linked review round holder's qualifying verdict kind.
+  Return the latest applicable linked review round holder's qualifying verdict kind.
 
   HOLDER-VERDICT-WINS (fabric §13 Phase 0, wi_1b0237fe wedge class): the round
   is selected among the linked review cards THAT CARRY A HOLDER-FILED VERDICT,
@@ -362,6 +382,10 @@ defmodule Tightbeam.Assignments do
   verbatim — a self-held latest round still disqualifies, so a holder cannot
   launder its own verdict past an earlier independent one.
 
+  Revision applicability is evaluated before the winner is selected. Code review
+  rounds must bind to the producer's current result revision. Unversioned policy,
+  release, and live-mutation reviews remain applicable without a revision binding.
+
   SINGLE SOURCE OF TRUTH FOR THE WINNING VERDICT (Sol xhigh review round 2):
   reopening lets ONE card carry more than one verdict over its life — file
   reviewed-clean, close, reopen, file changes-requested — so "which round"
@@ -375,46 +399,84 @@ defmodule Tightbeam.Assignments do
   fails the join (the correlated subquery returns NULL, which no rowid
   equals) exactly where the old `EXISTS` clause excluded it.
   """
-  @spec qualifying_review_verdict_kinds(DB.server(), String.t(), String.t()) :: [String.t()]
-  def qualifying_review_verdict_kinds(db, assignment_id, assignment_holder_key) do
-    {:ok, rows} =
-      DB.query(
-        db,
-        """
-        WITH latest_review AS (
-          SELECT
-            r.id,
-            r.holderKey,
-            lv.ts AS latestVerdictTs,
-            lv.rowid AS latestVerdictRowid,
-            lv.verdictKind AS latestVerdictKind
-          FROM assignments AS r
-          JOIN attests AS lv
-            ON lv.rowid = (
-              SELECT v.rowid
-              FROM attests AS v
-              WHERE v.assignmentId = r.id
-                AND v.kind = 'verdict'
-                AND v.bySession = r.holderKey
-              ORDER BY v.ts DESC, v.rowid DESC
-              LIMIT 1
-            )
-          WHERE r.reviewsAssignmentId = ?1
-          ORDER BY latestVerdictTs DESC, latestVerdictRowid DESC
-          LIMIT 1
-        )
-        SELECT latestVerdictKind
-        FROM latest_review AS r
-        WHERE r.holderKey != ?2
-          AND latestVerdictKind = 'reviewed-clean'
-        """,
-        [assignment_id, assignment_holder_key]
-      )
+  @spec applicable_review_verdict_kinds(
+          DB.server() | Txn.t(),
+          String.t(),
+          String.t(),
+          String.t(),
+          map() | nil
+        ) :: [String.t()]
+  def applicable_review_verdict_kinds(
+        queryable,
+        assignment_id,
+        assignment_holder_key,
+        effect_kind,
+        result_revision
+      ) do
+    winner =
+      queryable
+      |> review_candidates(assignment_id, assignment_holder_key, false)
+      |> Enum.filter(&review_applicable?(queryable, &1, effect_kind, result_revision))
+      |> Enum.reject(&is_nil(&1.verdict_kind))
+      |> Enum.max_by(&{&1.verdict_ts, &1.verdict_rowid}, fn -> nil end)
 
-    case rows do
-      [[verdict_kind]] when is_binary(verdict_kind) -> [verdict_kind]
-      _ -> []
+    case winner do
+      %{holder_key: holder, verdict_kind: "reviewed-clean"}
+      when holder != assignment_holder_key ->
+        ["reviewed-clean"]
+
+      _ ->
+        []
     end
+  end
+
+  @doc false
+  def qualifying_review_verdict_kinds(queryable, assignment_id, holder_key) do
+    applicable_review_verdict_kinds(queryable, assignment_id, holder_key, "policy", nil)
+  end
+
+  @doc "Return the newest reusable open independent review applicable to a producer result."
+  @spec newest_applicable_open_review(
+          DB.server() | Txn.t(),
+          String.t(),
+          String.t(),
+          String.t(),
+          map() | nil
+        ) :: String.t() | nil
+  def newest_applicable_open_review(
+        queryable,
+        assignment_id,
+        holder_key,
+        effect_kind,
+        result_revision
+      ) do
+    queryable
+    |> review_candidates(assignment_id, holder_key, true)
+    |> Enum.find(
+      &(independent_review?(&1, holder_key) and
+          open_review_applicable?(queryable, &1, effect_kind, result_revision))
+    )
+    |> case do
+      nil -> nil
+      review -> review.id
+    end
+  end
+
+  @doc "Return normalized review-revision bindings linked to a producer."
+  def review_revision_bindings(queryable, assignment_id) do
+    query_rows(
+      queryable,
+      """
+      SELECT rr.reviewAssignmentId, rr.repo, rr.commitOid, rr.bySession, rr.byUser,
+             rr.cause, rr.ts
+      FROM assignment_review_revisions rr
+      JOIN assignments r ON r.id = rr.reviewAssignmentId
+      WHERE r.reviewsAssignmentId = ?1
+      ORDER BY r.openedAt, r.id
+      """,
+      [assignment_id]
+    )
+    |> Enum.map(&review_binding/1)
   end
 
   @doc "Return the declared file paths for an assignment."
@@ -602,6 +664,7 @@ defmodule Tightbeam.Assignments do
   def __handle__(db, "revoke-assignment", call), do: revoke_result(db, call)
   def __handle__(db, "reopen-assignment", call), do: reopen_result(db, call)
   def __handle__(db, "assignments", call), do: assignments_result(db, call)
+  def __handle__(db, "bind-review-revision", call), do: bind_review_revision_result(db, call)
 
   defp assign_result(db, call) do
     open_assignment_result(
@@ -630,7 +693,7 @@ defmodule Tightbeam.Assignments do
     with :ok <- principal_allowed(call.principal, verb),
          :ok <- valid_subject(call.params[:subject]),
          :ok <- valid_idempotency_key(call.params[:idempotency_key]),
-         :ok <- valid_effect_kind(call.params[:effect_kind]),
+         :ok <- valid_effect_kind(call.params[:reviews_assignment_id], call.params[:effect_kind]),
          {:ok, _files} <- assignment_files(verb, call.params) do
       key = call.params[:idempotency_key]
       replay = if is_binary(key), do: replayed_assignment(db, call), else: nil
@@ -758,8 +821,9 @@ defmodule Tightbeam.Assignments do
          :ok <- valid_subject(call.params[:subject]),
          :ok <- valid_supervision_interval(call[:supervision_interval_ms]),
          :ok <- valid_idempotency_key(call.params[:idempotency_key]),
-         :ok <- valid_effect_kind(call.params[:effect_kind]),
+         :ok <- valid_effect_kind(call.params[:reviews_assignment_id], call.params[:effect_kind]),
          {:ok, files} <- assignment_files(verb, call.params),
+         {:ok, call} <- normalize_review_commission(db, call, verb),
          :ok <- extra_validation.() do
       owner = principal_id(call.principal)
       key = call.params[:idempotency_key]
@@ -790,6 +854,9 @@ defmodule Tightbeam.Assignments do
         error ->
           error
       end
+    else
+      {:error, error} -> error
+      error -> error
     end
   rescue
     error in UnknownWorkItem -> error("unknown_work_item", Exception.message(error))
@@ -845,6 +912,7 @@ defmodule Tightbeam.Assignments do
   defp attest_result(db, call) do
     with :ok <- principal_allowed(call.principal, "attest"),
          :ok <- commit_ref_filing_allowed(db, call),
+         {:ok, call} <- normalize_verdict_refs(db, call),
          :ok <- valid_commit_refs(db, call.params[:kind], call.params[:commit_refs]) do
       assignment_id = call.params[:assignment_id]
       from = best_effort_value(fn -> Tightbeam.WorkState.status(db, assignment_id) end)
@@ -872,10 +940,43 @@ defmodule Tightbeam.Assignments do
         _ ->
           result
       end
+    else
+      {:error, error} -> error
+      result -> result
     end
   rescue
     TransitionRace -> assignment_closed()
   end
+
+  @doc "Normalize a code completion before the dispatch rail reads revision facts."
+  def normalize_dispatch_call(db, %{verb: "attest", params: %{kind: "completion"}} = call) do
+    assignment_id = call.params[:assignment_id]
+
+    case DB.query(
+           db,
+           """
+           SELECT COALESCE(e.effectKind,
+                    CASE WHEN a.reviewsAssignmentId IS NULL THEN 'code' ELSE 'review' END)
+           FROM assignments a
+           LEFT JOIN assignment_effects e ON e.assignmentId = a.id
+           WHERE a.id = ?1
+           """,
+           [assignment_id]
+         ) do
+      {:ok, [["code"]]} ->
+        with {:ok, revision} <- normalize_revision(db, call.params[:commit_refs], :completion) do
+          {:ok,
+           call
+           |> put_in([:params, :commit_refs], [revision])
+           |> Map.put(:result_revision, revision)}
+        end
+
+      _ ->
+        {:ok, call}
+    end
+  end
+
+  def normalize_dispatch_call(_db, call), do: {:ok, call}
 
   # Per effort-checkin-v2 §Design 5 and the provenance it cites verbatim —
   # "Artifacts are the referents" — an attest's referents are the artifacts the
@@ -1373,6 +1474,136 @@ defmodule Tightbeam.Assignments do
   defp attest_after(_db, _assignment_id, _after_id),
     do: {:error, error("invalid", "--after takes an attest id")}
 
+  defp bind_review_revision_result(db, call) do
+    with :ok <- principal_allowed(call.principal, "bind-review-revision"),
+         {:ok, context} <- legacy_bind_context(db, call),
+         {:ok, revision} <- normalize_revision(db, call.params[:commit_refs], :review),
+         :ok <- fallback_matches(db, context.commit_refs, revision) do
+      transaction(db, fn txn -> bind_review_revision_in_txn(txn, call, revision) end)
+    end
+  end
+
+  defp legacy_bind_context(queryable, call) do
+    review_id = call.params[:review_assignment_id]
+
+    case query_rows(
+           queryable,
+           """
+           SELECT r.holderKey,
+                  COALESCE(pe.effectKind,
+                    CASE WHEN p.reviewsAssignmentId IS NULL THEN 'code' ELSE 'review' END),
+                  (SELECT v.verdictKind FROM attests v
+                   WHERE v.assignmentId = r.id AND v.kind = 'verdict'
+                     AND v.bySession = r.holderKey
+                   ORDER BY v.ts DESC, v.id DESC LIMIT 1),
+                  (SELECT v.commitRefs FROM attests v
+                   WHERE v.assignmentId = r.id AND v.kind = 'verdict'
+                     AND v.bySession = r.holderKey
+                   ORDER BY v.ts DESC, v.id DESC LIMIT 1)
+           FROM assignments r
+           LEFT JOIN assignments p ON p.id = r.reviewsAssignmentId
+           LEFT JOIN assignment_effects pe ON pe.assignmentId = p.id
+           WHERE r.id = ?1 AND r.reviewsAssignmentId IS NOT NULL
+           """,
+           [review_id]
+         ) do
+      [] ->
+        error("bind_target_not_code_review", "target is not a review of a code assignment")
+
+      [[_holder, effect, _verdict, _refs]] when effect != "code" ->
+        error("bind_target_not_code_review", "target is not a review of a code assignment")
+
+      [[holder, _effect, _verdict, _refs]] when call.principal != {:session, holder} ->
+        error("bind_forbidden_non_holder", "only the review holder may bind its revision")
+
+      [[_holder, _effect, verdict, _refs]] when verdict != "reviewed-clean" ->
+        error("bind_requires_clean_verdict", "binding requires a final reviewed-clean verdict")
+
+      [[holder, "code", "reviewed-clean", refs]] ->
+        {:ok, %{holder: holder, commit_refs: decode_refs(refs)}}
+    end
+  end
+
+  defp bind_review_revision_in_txn(txn, call, revision) do
+    with {:ok, context} <- legacy_bind_context(txn, call),
+         :ok <- fallback_matches(txn, context.commit_refs, revision) do
+      review_id = call.params[:review_assignment_id]
+
+      case query_rows(
+             txn,
+             "SELECT reviewAssignmentId, repo, commitOid, bySession, byUser, cause, ts FROM assignment_review_revisions WHERE reviewAssignmentId = ?1",
+             [review_id]
+           ) do
+        [] ->
+          insert_review_revision(
+            txn,
+            review_id,
+            revision,
+            call.principal,
+            "legacy-review-revision-binding"
+          )
+
+        [row] ->
+          existing = review_binding(row)
+
+          if existing.commitRefs == [revision],
+            do: existing,
+            else: review_revision_conflict()
+      end
+    end
+  end
+
+  defp insert_review_revision(txn, review_id, revision, principal, cause) do
+    {by_user, by_session} = opener(principal)
+    ts = now()
+
+    Txn.q(
+      txn,
+      """
+      INSERT INTO assignment_review_revisions
+        (reviewAssignmentId, repo, commitOid, bySession, byUser, cause, ts)
+      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+      """,
+      [review_id, revision.repo, revision.commit, by_session, by_user, cause, ts]
+    )
+
+    review_binding([review_id, revision.repo, revision.commit, by_session, by_user, cause, ts])
+  end
+
+  defp review_binding([review_id, repo, oid, by_session, by_user, cause, ts]) do
+    %{
+      reviewAssignmentId: review_id,
+      commitRefs: [%{repo: repo, commit: oid}],
+      principal: if(by_session, do: "session:" <> by_session, else: "user:" <> by_user),
+      cause: cause,
+      ts: ts
+    }
+  end
+
+  defp atomic_completion_rule(_txn, %{params: %{kind: kind}}) when kind != "completion",
+    do: :ok
+
+  defp atomic_completion_rule(_txn, %{atomic_rail_decision: false}), do: :ok
+
+  defp atomic_completion_rule(_txn, call) when not is_map_key(call, :atomic_rail_decision),
+    do: :ok
+
+  defp atomic_completion_rule(txn, call) do
+    case Rules.completion_review_decide(txn, call, call.atomic_completion_review_rules) do
+      {:allow, _to_close, _to_consume} ->
+        :ok
+
+      {decision, to_close, to_consume} ->
+        error = decision_error(decision)
+        Map.put(error, :__rail_decision__, {decision, to_close, to_consume})
+    end
+  end
+
+  defp decision_error({:deny, error}), do: error
+  defp decision_error({:remedy, _rule, _ref, error}), do: error
+  defp decision_error({:escalate, _rule, ctx, _id}), do: ctx.error
+  defp decision_error({:deny_escalate, _rule, ctx}), do: ctx.error
+
   defp create_assignment(txn, call, owner, key, files, verb) do
     case Txn.q(txn, "SELECT state, harness, provider FROM sessions WHERE sessionKey = ?1", [
            call.session_key
@@ -1462,6 +1693,16 @@ defmodule Tightbeam.Assignments do
           "INSERT INTO assignment_effects (assignmentId, effectKind) VALUES (?1, ?2)",
           [id, effective_effect_kind(reviews_assignment_id, call.params[:effect_kind])]
         )
+
+        if reviews_assignment_id && call[:review_revision] do
+          insert_review_revision(
+            txn,
+            id,
+            call.review_revision,
+            call.principal,
+            "review-commission"
+          )
+        end
 
         Enum.each(files, fn path ->
           Txn.q(
@@ -1592,7 +1833,8 @@ defmodule Tightbeam.Assignments do
           true ->
             with :ok <- valid_kind(call.params[:kind]),
                  :ok <- valid_note(call.params[:note]),
-                 :ok <- absent_verdict_kind(call.params[:verdict_kind]) do
+                 :ok <- absent_verdict_kind(call.params[:verdict_kind]),
+                 :ok <- atomic_completion_rule(txn, call) do
               if Txn.q(txn, "SELECT 1 FROM assignments WHERE id = ?1 AND state = 'open'", [
                    assignment_id
                  ]) != [[1]],
@@ -1669,7 +1911,8 @@ defmodule Tightbeam.Assignments do
 
           true ->
             with :ok <- valid_verdict_kind(call.params[:verdict_kind]),
-                 :ok <- valid_note(call.params[:note]) do
+                 :ok <- valid_note(call.params[:note]),
+                 :ok <- bound_verdict_matches(txn, assignment, call.params[:commit_refs]) do
               if Txn.q(txn, "SELECT 1 FROM assignments WHERE id = ?1 AND state = 'open'", [
                    assignment_id
                  ]) != [[1]],
@@ -1948,10 +2191,16 @@ defmodule Tightbeam.Assignments do
   defp valid_subject(_),
     do: error("invalid_subject", "subject must be 1..2000 non-blank characters")
 
-  defp valid_effect_kind(nil), do: :ok
-  defp valid_effect_kind(kind) when kind in @effect_kinds, do: :ok
+  defp valid_effect_kind(nil, nil),
+    do: error("effect_kind_required", "effectKind is required for an unlinked assignment")
 
-  defp valid_effect_kind(_),
+  defp valid_effect_kind(nil, "review"),
+    do: error("review_effect_requires_link", "effectKind review requires --reviews")
+
+  defp valid_effect_kind(nil, kind) when kind in @effect_kinds, do: :ok
+  defp valid_effect_kind(review, _kind) when is_binary(review), do: :ok
+
+  defp valid_effect_kind(_review, _kind),
     do:
       error("invalid_effect_kind", "effectKind must be one of #{Enum.join(@effect_kinds, ", ")}")
 
@@ -1959,7 +2208,6 @@ defmodule Tightbeam.Assignments do
        when not is_nil(reviews_assignment_id),
        do: "review"
 
-  defp effective_effect_kind(nil, nil), do: "code"
   defp effective_effect_kind(nil, requested), do: requested
 
   defp valid_supervision_interval(interval) when is_integer(interval) and interval > 0,
@@ -2076,7 +2324,79 @@ defmodule Tightbeam.Assignments do
     end
   end
 
-  defp validate_commit_ref(db, ref) when is_map(ref) do
+  defp validate_commit_ref(db, ref) do
+    case normalize_revision(db, [ref], :review) do
+      {:ok, _revision} -> :ok
+      {:error, error} -> error
+    end
+  end
+
+  defp normalize_review_commission(db, call, verb) do
+    case {verb, call.params[:reviews_assignment_id]} do
+      {verb, _review_id} when verb != "assign" ->
+        {:ok, call}
+
+      {"assign", nil} ->
+        {:ok, call}
+
+      {"assign", review_id} ->
+        normalize_review_commission_for(db, call, review_id)
+    end
+  end
+
+  defp normalize_review_commission_for(db, call, review_id) do
+    case query_rows(
+           db,
+           """
+           SELECT COALESCE(e.effectKind,
+                    CASE WHEN a.reviewsAssignmentId IS NULL THEN 'code' ELSE 'review' END)
+           FROM assignments a
+           LEFT JOIN assignment_effects e ON e.assignmentId = a.id
+           WHERE a.id = ?1
+           """,
+           [review_id]
+         ) do
+      [["code"]] ->
+        with {:ok, revision} <- normalize_revision(db, call.params[:review_commit_refs], :review) do
+          {:ok, Map.put(call, :review_revision, revision)}
+        end
+
+      _ ->
+        {:ok, call}
+    end
+  end
+
+  defp normalize_verdict_refs(db, %{params: %{kind: "verdict"}} = call) do
+    assignment_id = call.params[:assignment_id]
+    refs = call.params[:commit_refs]
+
+    case query_rows(
+           db,
+           "SELECT repo, commitOid FROM assignment_review_revisions WHERE reviewAssignmentId = ?1",
+           [assignment_id]
+         ) do
+      [[repo, oid]] when not is_nil(refs) ->
+        binding = %{repo: repo, commit: oid}
+
+        case normalize_revision(db, refs, :review) do
+          {:ok, ^binding} -> {:ok, put_in(call, [:params, :commit_refs], [binding])}
+          _ -> {:error, review_revision_conflict()}
+        end
+
+      _ ->
+        {:ok, call}
+    end
+  end
+
+  defp normalize_verdict_refs(_db, call), do: {:ok, call}
+
+  defp normalize_revision(_queryable, refs, mode) when not is_list(refs),
+    do: {:error, revision_count_error(mode)}
+
+  defp normalize_revision(_queryable, refs, mode) when length(refs) != 1,
+    do: {:error, revision_count_error(mode)}
+
+  defp normalize_revision(queryable, [ref], _mode) when is_map(ref) do
     normalized = Map.new(ref, fn {key, value} -> {to_string(key), value} end)
 
     with ["commit", "repo"] <- normalized |> Map.keys() |> Enum.sort(),
@@ -2084,50 +2404,60 @@ defmodule Tightbeam.Assignments do
          commit when is_binary(commit) <- normalized["commit"],
          [host, path] <- String.split(repo, ":", parts: 2),
          true <- host != "" and Path.type(path) == :absolute,
-         {_output, 0} <- run_git_cat_file(db, host, path, commit) do
-      :ok
+         {:ok, host_config} <- commit_ref_host(queryable, host),
+         {output, 0} <- run_git_rev_parse(host_config, path, commit),
+         [oid] <- String.split(output, "\n", trim: true),
+         true <- Regex.match?(~r/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/, oid) do
+      {:ok, %{repo: repo, commit: oid}}
     else
-      _ -> error("unverifiable_commit_ref", "commitRefs contains an unverifiable commit")
+      _ ->
+        {:error, error("unverifiable_commit_ref", "commitRefs contains an unverifiable commit")}
+    end
+  rescue
+    _ -> {:error, error("unverifiable_commit_ref", "commitRefs contains an unverifiable commit")}
+  catch
+    :exit, _ ->
+      {:error, error("unverifiable_commit_ref", "commitRefs contains an unverifiable commit")}
+  end
+
+  defp normalize_revision(_queryable, [_ref], _mode),
+    do: {:error, error("unverifiable_commit_ref", "commitRefs contains an unverifiable commit")}
+
+  defp revision_count_error(:completion),
+    do: error("completion_revision_ambiguous", "code completion requires exactly one commitRef")
+
+  defp revision_count_error(:review),
+    do: error("review_revision_required", "code review requires exactly one commitRef")
+
+  defp commit_ref_host(queryable, host) do
+    if host == Placement.local_host_name() do
+      {:ok, %{ssh: nil}}
+    else
+      case query_rows(queryable, "SELECT ssh FROM hosts WHERE name = ?1", [host]) do
+        [[ssh]] -> {:ok, %{ssh: ssh}}
+        [] -> {:error, :unknown_host}
+      end
     end
   end
 
-  defp validate_commit_ref(_db, _ref),
-    do: error("unverifiable_commit_ref", "commitRefs contains an unverifiable commit")
+  defp run_git_rev_parse(%{ssh: nil}, path, commit) do
+    run_commit_ref_command(
+      "git",
+      ["-C", path, "rev-parse", "--verify", "--end-of-options", "#{commit}^{commit}"],
+      stderr_to_stdout: true
+    )
+  end
 
-  defp run_git_cat_file(db, host, path, commit) do
-    base_dir =
-      Application.get_env(
-        :tightbeam,
-        :base_dir,
-        Path.join(System.user_home!(), ".tightbeam")
-      )
+  defp run_git_rev_parse(%{ssh: destination}, path, commit) when is_binary(destination) do
+    command =
+      ["git", "-C", path, "rev-parse", "--verify", "--end-of-options", "#{commit}^{commit}"]
+      |> Enum.map_join(" ", &Support.shell_quote/1)
 
-    case Placement.hosts(base_dir, db)[host] do
-      %{ssh: nil} ->
-        run_commit_ref_command(
-          "git",
-          ["-C", path, "cat-file", "-e", "#{commit}^{commit}"],
-          stderr_to_stdout: true
-        )
-
-      %{ssh: destination} when is_binary(destination) ->
-        command =
-          ["git", "-C", path, "cat-file", "-e", "#{commit}^{commit}"]
-          |> Enum.map_join(" ", &shell_quote/1)
-
-        run_commit_ref_command(
-          "ssh",
-          Support.ssh_opts() ++ [destination, "sh", "-c", shell_quote(command)],
-          stderr_to_stdout: true
-        )
-
-      nil ->
-        {:error, :unknown_host}
-    end
-  rescue
-    _ -> {:error, :verification_failed}
-  catch
-    :exit, _ -> {:error, :verification_failed}
+    run_commit_ref_command(
+      "ssh",
+      Support.ssh_opts() ++ [destination, "sh", "-c", Support.shell_quote(command)],
+      stderr_to_stdout: true
+    )
   end
 
   defp run_commit_ref_command(executable, args, opts) do
@@ -2135,7 +2465,132 @@ defmodule Tightbeam.Assignments do
     runner.(executable, args, opts)
   end
 
-  defp shell_quote(value), do: "'" <> String.replace(value, "'", "'\\''") <> "'"
+  defp review_candidates(queryable, assignment_id, _holder_key, open_only?) do
+    open_clause = if open_only?, do: "AND r.state = 'open'", else: ""
+
+    query_rows(
+      queryable,
+      """
+      SELECT r.id, r.openedAt, r.holderKey, r.outcome,
+             rr.repo, rr.commitOid, lv.verdictKind, lv.commitRefs, lv.ts, lv.rowid
+      FROM assignments r
+      LEFT JOIN assignment_review_revisions rr ON rr.reviewAssignmentId = r.id
+      LEFT JOIN attests lv ON lv.rowid = (
+        SELECT v.rowid FROM attests v
+        WHERE v.assignmentId = r.id AND v.kind = 'verdict'
+          AND v.bySession = r.holderKey
+        ORDER BY v.ts DESC, v.rowid DESC LIMIT 1
+      )
+      WHERE r.reviewsAssignmentId = ?1
+        AND COALESCE(r.outcome, '') != 'revoked'
+        #{open_clause}
+      ORDER BY r.openedAt DESC, r.id DESC
+      """,
+      [assignment_id]
+    )
+    |> Enum.map(fn [
+                     id,
+                     opened_at,
+                     holder,
+                     outcome,
+                     repo,
+                     oid,
+                     verdict,
+                     refs,
+                     verdict_ts,
+                     verdict_rowid
+                   ] ->
+      %{
+        id: id,
+        opened_at: opened_at,
+        holder_key: holder,
+        outcome: outcome,
+        binding: if(repo, do: %{repo: repo, commit: oid}, else: nil),
+        verdict_kind: verdict,
+        verdict_refs: decode_refs(refs),
+        verdict_ts: verdict_ts,
+        verdict_rowid: verdict_rowid
+      }
+    end)
+  end
+
+  defp independent_review?(review, assignment_holder_key),
+    do: review.holder_key != assignment_holder_key
+
+  defp review_applicable?(_queryable, review, effect_kind, _result_revision)
+       when effect_kind in ["policy", "release", "live_mutation"],
+       do: not is_nil(review.verdict_kind)
+
+  defp review_applicable?(queryable, review, "code", result_revision)
+       when is_map(result_revision) do
+    case review.binding do
+      binding when is_map(binding) -> binding == result_revision
+      nil -> fallback_revision(queryable, review.verdict_refs) == {:ok, result_revision}
+    end
+  end
+
+  defp review_applicable?(_queryable, _review, _effect_kind, _result_revision), do: false
+
+  defp open_review_applicable?(_queryable, _review, effect_kind, _result_revision)
+       when effect_kind in ["policy", "release", "live_mutation"],
+       do: true
+
+  defp open_review_applicable?(queryable, review, effect_kind, result_revision),
+    do: review_applicable?(queryable, review, effect_kind, result_revision)
+
+  defp fallback_revision(_queryable, nil), do: :unbound
+
+  defp fallback_revision(queryable, refs) do
+    case normalize_revision(queryable, refs, :review) do
+      {:ok, revision} -> {:ok, revision}
+      _ -> :unbound
+    end
+  end
+
+  defp fallback_matches(_queryable, nil, _revision), do: :ok
+
+  defp fallback_matches(queryable, refs, revision) do
+    case normalize_revision(queryable, refs, :review) do
+      {:ok, ^revision} -> :ok
+      _ -> review_revision_conflict()
+    end
+  end
+
+  defp bound_verdict_matches(_txn, %{reviewsAssignmentId: nil}, _refs), do: :ok
+  defp bound_verdict_matches(_txn, _assignment, nil), do: :ok
+
+  defp bound_verdict_matches(txn, assignment, refs) do
+    case query_rows(
+           txn,
+           "SELECT repo, commitOid FROM assignment_review_revisions WHERE reviewAssignmentId = ?1",
+           [assignment.id]
+         ) do
+      [] ->
+        :ok
+
+      [[repo, oid]] ->
+        if refs == [%{repo: repo, commit: oid}], do: :ok, else: review_revision_conflict()
+    end
+  end
+
+  defp review_revision_conflict,
+    do: error("review_revision_conflict", "review revision conflicts with existing evidence")
+
+  defp decode_refs(nil), do: nil
+
+  defp decode_refs(encoded) when is_binary(encoded) do
+    case JSON.decode(encoded) do
+      {:ok, refs} -> refs
+      _ -> :invalid
+    end
+  end
+
+  defp query_rows(%Txn{} = txn, sql, params), do: Txn.q(txn, sql, params)
+
+  defp query_rows(db, sql, params) do
+    {:ok, rows} = DB.query(db, sql, params)
+    rows
+  end
 
   defp valid_kind(kind) when kind in ["progress", "completion", "surrender"], do: :ok
   defp valid_kind(_), do: error("invalid_kind", "kind must be progress, completion, or surrender")
