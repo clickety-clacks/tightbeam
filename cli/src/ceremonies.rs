@@ -2566,6 +2566,12 @@ mod tests {
             "TERM did not promptly exit codex onboarding; canceled_lease={canceled_lease:?}, \
              staging={staging_survived}, descendant_alive={alive}"
         );
+        assert!(
+            status
+                .expect("promptly exited inner test must have a status")
+                .success(),
+            "the inner interrupted-reason assertion failed"
+        );
         assert_eq!(
             canceled_lease.as_deref(),
             Some("signal-fixture-lease"),
