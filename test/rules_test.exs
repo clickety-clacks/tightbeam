@@ -615,14 +615,28 @@ defmodule Tightbeam.RulesTest do
       end
     end
 
-    retired_fact = "assign.declared_" <> "files" <> "_overlap_open"
-    put_rule(ctx, rule("retired-overlap-fact", "assign", retired_fact, "eq", true))
+    put_rule(
+      ctx,
+      rule("overlap", "assign", "assign.declared_files_overlap_open", "eq", true)
+    )
 
-    error = assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, ["assign"]) end
-    assert error.message =~ "unknown fact"
-    assert error.message =~ retired_fact
-    assert error.message =~ "retired-overlap-fact"
-    assert error.message =~ "rule.toml"
+    assert [_] = Rules.load!(ctx.base_dir, ["assign"])
+
+    put_rule(
+      ctx,
+      rule("overlap-ne", "assign", "assign.declared_files_overlap_open", "ne", false)
+    )
+
+    assert [_] = Rules.load!(ctx.base_dir, ["assign"])
+
+    put_rule(
+      ctx,
+      rule("bad-overlap", "assign", "assign.declared_files_overlap_open", "eq", "true")
+    )
+
+    assert_raise ArgumentError, ~r/does not match bool/, fn ->
+      Rules.load!(ctx.base_dir, ["assign"])
+    end
 
     put_rule(
       ctx,
@@ -678,7 +692,7 @@ defmodule Tightbeam.RulesTest do
     end
   end
 
-  test "P3 fact nil and empty-list matrix excludes retired path facts", ctx do
+  test "P3 fact nil, empty-list, and overlap presence matrix", ctx do
     holder = session(ctx.db, "p3-holder", "flynn", archetype: "coder")
     assignment = assignment(ctx, holder.session_key, {:user, "flynn"})
     review = assignment(ctx, holder.session_key, {:user, "flynn"}, reviews: assignment.id)
@@ -751,33 +765,52 @@ defmodule Tightbeam.RulesTest do
                :missing_db,
                p3_call("attest", nil, %{assignment_id: assignment.id, kind: "completion"})
              )
-  end
 
-  test "retired assign-remedy files input fails at the canonical param gate", ctx do
-    put_rule(ctx, """
-    [[rule]]
-    name = "retired-remedy-files"
-    verb = "attest"
-    text = "completion requires review"
-    effect = "remedy"
-    deny_when = [
-      { fact = "attest.kind", op = "eq", value = "completion" },
-      { fact = "assignment.qualifying_review_verdict_kinds", op = "not_in", value = ["reviewed-clean"] }
+    _existing = assignment(ctx, holder.session_key, {:user, "flynn"}, files: ["lib/a.ex"])
+
+    overlap_cases = [
+      {%{}, true, false},
+      {%{files: []}, true, false},
+      {%{files: "lib/a.ex"}, true, false},
+      {%{files: ["ok", " "]}, true, false},
+      {%{files: [String.duplicate("x", 2_001)]}, true, false},
+      {%{files: [String.duplicate("é", 2_000)]}, false, true},
+      {%{files: [" " <> String.duplicate("x", 2_000) <> " "]}, false, true},
+      {%{files: ["lib/other.ex"]}, false, true},
+      {%{files: ["lib/a.ex", "lib/a.ex"]}, true, true}
     ]
-    [rule.remedy]
-    action = "assign"
-    produces = "reviewed-clean"
-    target_role = "reviewer"
-    [rule.remedy.params]
-    subject = "review {assignment_id}"
-    reviews = "{assignment_id}"
-    files = ["lib/a.ex"]
-    """)
 
-    error = assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, ["attest"]) end
-    assert error.message =~ "remedy assign has invalid params: files"
-    assert error.message =~ "retired-remedy-files"
-    assert error.message =~ "rule.toml"
+    for {params, expected, fires?} <- overlap_cases do
+      put_rule(
+        ctx,
+        rule("overlap", "assign", "assign.declared_files_overlap_open", "eq", expected)
+      )
+
+      Rules.load!(ctx.base_dir, ["assign"])
+      result = Rules.evaluate(ctx.db, p3_call("assign", {:user, "flynn"}, params))
+      assert match_result(result) == fires?
+    end
+
+    put_rule(
+      ctx,
+      rule("wrong-verb", "attest", "assign.declared_files_overlap_open", "eq", true)
+    )
+
+    Rules.load!(ctx.base_dir, ["attest"])
+    assert :ok = Rules.evaluate(ctx.db, p3_call("attest", nil, %{files: ["lib/a.ex"]}))
+
+    put_rule(
+      ctx,
+      rule("overlap-error", "assign", "assign.declared_files_overlap_open", "eq", true)
+    )
+
+    Rules.load!(ctx.base_dir, ["assign"])
+
+    assert {:deny, %{code: "rule_error", fact: "assign.declared_files_overlap_open"}} =
+             Rules.evaluate(
+               :missing_db,
+               p3_call("assign", {:user, "flynn"}, %{files: ["lib/a.ex"]})
+             )
   end
 
   test "check-tier assignment facts are nil for every unresolved assignment shape", ctx do

@@ -115,6 +115,27 @@ defmodule Tightbeam.RailRemedyTest do
              RailRemedy.episode(ctx.db, "completion-needs-review", assignment.id)
   end
 
+  test "assign remedy preserves declared file metadata", ctx do
+    assignment = assignment(ctx, "declared files")
+
+    put_rules(
+      ctx,
+      String.replace(
+        review_gate(),
+        ~s(reviews = "{assignment_id}"),
+        ~s(reviews = "{assignment_id}"\nfiles = ["lib/a.ex", "{assignment_id}"])
+      )
+    )
+
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    assert {:error, %{reason: "remedy_fired", producer: review_id}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, completion_call(assignment.id))
+
+    assert Enum.sort(Assignments.declared_files(ctx.db, review_id)) ==
+             Enum.sort(["lib/a.ex", assignment.id])
+  end
+
   test "declared recurrence suppression stops a repeat before another producer turn", ctx do
     assignment = assignment(ctx, "recurring")
     put_rules(ctx, review_gate() <> recurrence_declaration())

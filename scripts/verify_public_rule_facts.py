@@ -19,18 +19,37 @@ def fact_names(source: str) -> set[str]:
     return set(FACT_NAME.findall(match.group(1)))
 
 
-def parent_source() -> str:
+def parent_refs() -> list[str]:
+    line = subprocess.check_output(
+        ["git", "rev-list", "--parents", "-n", "1", "HEAD"],
+        text=True,
+        stderr=subprocess.PIPE,
+    )
+    return line.split()[1:]
+
+
+def source_at(ref: str) -> str:
     return subprocess.check_output(
-        ["git", "show", f"HEAD^:{SOURCE}"], text=True, stderr=subprocess.PIPE
+        ["git", "show", f"{ref}:{SOURCE}"], text=True, stderr=subprocess.PIPE
     )
 
 
 def main() -> int:
     try:
-        previous = fact_names(parent_source())
-    except subprocess.CalledProcessError:
+        parents = parent_refs()
+    except subprocess.CalledProcessError as error:
+        print(f"public rule-fact compatibility: cannot inspect HEAD: {error}", file=sys.stderr)
+        return 1
+
+    if not parents:
         print("public rule-fact compatibility: no parent commit to compare")
         return 0
+
+    try:
+        previous = set().union(*(fact_names(source_at(parent)) for parent in parents))
+    except (subprocess.CalledProcessError, ValueError) as error:
+        print(f"public rule-fact compatibility: cannot inspect every parent: {error}", file=sys.stderr)
+        return 1
 
     current = fact_names(SOURCE.read_text())
     removed = sorted(previous - current)

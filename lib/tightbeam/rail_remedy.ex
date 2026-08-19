@@ -670,14 +670,34 @@ defmodule Tightbeam.RailRemedy do
   end
 
   defp resolve_map(map, bindings) do
-    Enum.reduce_while(map, {:ok, %{}}, fn {key, value}, {:ok, acc} ->
-      embedded? = key in [:subject, :prompt, :display]
+    Enum.reduce_while(map, {:ok, %{}}, fn
+      {key, values}, {:ok, acc} when key == :files and is_list(values) ->
+        case resolve_list(values, bindings) do
+          {:ok, resolved} -> {:cont, {:ok, Map.put(acc, key, resolved)}}
+          error -> {:halt, error}
+        end
 
-      case resolve_value(value, bindings, embedded?) do
-        {:ok, resolved} -> {:cont, {:ok, Map.put(acc, key, resolved)}}
+      {key, value}, {:ok, acc} ->
+        embedded? = key in [:subject, :prompt, :display]
+
+        case resolve_value(value, bindings, embedded?) do
+          {:ok, resolved} -> {:cont, {:ok, Map.put(acc, key, resolved)}}
+          error -> {:halt, error}
+        end
+    end)
+  end
+
+  defp resolve_list(values, bindings) do
+    Enum.reduce_while(values, {:ok, []}, fn value, {:ok, acc} ->
+      case resolve_value(value, bindings, false) do
+        {:ok, resolved} -> {:cont, {:ok, [resolved | acc]}}
         error -> {:halt, error}
       end
     end)
+    |> case do
+      {:ok, values} -> {:ok, Enum.reverse(values)}
+      error -> error
+    end
   end
 
   defp resolve_value(value, _bindings, _embedded?) when not is_binary(value), do: {:ok, value}

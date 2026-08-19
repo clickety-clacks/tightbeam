@@ -139,7 +139,8 @@ defmodule Tightbeam.Rules do
     "work_item.has_spec_ref" => :bool,
     "work_item.verdict_kinds" => {:list, :string},
     "assignment.review_verdict_count" => :int,
-    "assignment.prior_completed_fix_count" => :int
+    "assignment.prior_completed_fix_count" => :int,
+    "assign.declared_files_overlap_open" => :bool
   }
   @operators ~w(eq ne gt gte lt lte in not_in)
 
@@ -503,7 +504,7 @@ defmodule Tightbeam.Rules do
     {required_top, allowed_top, required_params, allowed_params} =
       case action do
         "assign" ->
-          {~w(target_role), ~w(target_role), ~w(subject), ~w(subject reviews work_item)}
+          {~w(target_role), ~w(target_role), ~w(subject), ~w(subject reviews files work_item)}
 
         "wake" ->
           {[], ~w(target_role target_session), ~w(prompt), ~w(prompt after at)}
@@ -543,8 +544,15 @@ defmodule Tightbeam.Rules do
       validate_interpolation!(field, value, fail)
     end)
 
-    Enum.each(params, fn {field, value} ->
-      validate_interpolation!(field, value, fail)
+    Enum.each(params, fn
+      {"files", files} when is_list(files) ->
+        Enum.each(files, &validate_interpolation!("files", &1, fail))
+
+      {"files", _} ->
+        fail.("remedy files must be a non-empty list")
+
+      {field, value} ->
+        validate_interpolation!(field, value, fail)
     end)
 
     requirements = verdict_requirements(conditions)
@@ -598,6 +606,11 @@ defmodule Tightbeam.Rules do
   defp validate_interpolation!(field, value, fail) when field in @embedded_fields do
     unless is_binary(value), do: fail.("remedy #{field} must be a string")
     validate_tokens!(value, fail)
+  end
+
+  defp validate_interpolation!("files", value, fail) do
+    unless is_binary(value), do: fail.("remedy files entries must be strings")
+    validate_whole_interpolation("files", value, fail)
   end
 
   defp validate_interpolation!(field, value, fail) when field in @whole_fields do
@@ -1434,6 +1447,25 @@ defmodule Tightbeam.Rules do
 
         {count, cache}
     end)
+  end
+
+  defp compute_fact("assign.declared_files_overlap_open", db, call, cache) do
+    value =
+      case {call.verb, Map.get(call.params, :files)} do
+        {"assign", files} when is_list(files) and files != [] ->
+          if Enum.all?(files, fn path ->
+               is_binary(path) and String.length(String.trim(path)) in 1..2_000
+             end) do
+            Assignments.open_assignments_touching(db, Enum.uniq(files)) != []
+          else
+            nil
+          end
+
+        _ ->
+          nil
+      end
+
+    {value, cache}
   end
 
   defp compute_fact("$target", db, call, cache) do
