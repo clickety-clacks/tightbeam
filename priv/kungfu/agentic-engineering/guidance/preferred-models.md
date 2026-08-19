@@ -6,6 +6,8 @@ bundle's `kungfu/<name>/preferred-models.md`. The working set is deliberately sm
 a model not listed here is NOT IN USE, and adding one is an intake/release-ceremony act.
 
 ## Working set (capsules)
+<!-- machine-read: mix tightbeam.catalog.diff parses each capsule id from the
+     leading "- **<id>**" of these bullets; keep that shape when editing. -->
 
 - **claude-fable-5**: deepest judgment and breadth; load-bearing rulings, adversarial
   whole-system review, wisdom-level authoring. Expensive; reserve for what needs it.

@@ -17,6 +17,7 @@ defmodule Tightbeam.ReleaseTagWorkflowTest do
     end
 
     advance_canonical!(fixture)
+
     {_output, status} =
       command("sh", [@script, "v0.1.8+#{fixture.build}", fixture.head], cd: fixture.repo)
 
@@ -31,6 +32,7 @@ defmodule Tightbeam.ReleaseTagWorkflowTest do
              command("sh", [@script, "v0.2.0+#{fixture.build}", fixture.head], cd: fixture.repo)
 
     advance_canonical!(fixture)
+
     {_output, status} =
       command("sh", [@script, "v0.2.0+#{fixture.build}", fixture.head], cd: fixture.repo)
 
