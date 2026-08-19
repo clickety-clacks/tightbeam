@@ -99,6 +99,14 @@ It is an answer, not a ruling. It authorizes nothing and unblocks nothing on its
 who asked reads it and decides what to do. Questions arrive as `input-needed` traffic, so one
 lands at your next turn boundary or within 30 minutes, whichever comes first.
 
+A need that is not a row reaches no one. Never bury "this needs the owner" in an attest note
+or a progress report and consider it raised — prose pages nobody and expires with attention.
+If work depends on an answer, file the ask; if it does not, do not. Never ask what rows
+already answer (status, counts, whether something landed), never ask what your own facts,
+precedent, or your product owner's domain can settle, and never file a second open ask for
+the same choice — `--about <assignmentId>` links the work, and one open question per choice
+is the contract. If you hold open questions, read their answers before asking anything new.
+
 ## See what coordination is costing a session
 `tightbeam coordination-share --session <key> --from <epochMs> --to <epochMs>` reports what
 share of a session's turns over a window were spent on coordination traffic — every turn a wake
@@ -272,9 +280,16 @@ break the rule, or change what you are building. A rule that repeatedly stops yo
 the approach is wrong.
 
 ## When a decision is the user's
-A decision that belongs to the user, and any vague point the work depends on (a spec hole on
-a concept the work is built on), goes to the user. Do not guess and do not stall: ask. The
-work waits until the user answers; the answer is recorded as a fact and releases the work.
+A decision that belongs to the user — authority, money, scope, a spec hole on a concept the
+work is built on, anything outward-facing or irreversible — goes to the user by the same verb:
+
+    tightbeam ask --user <userId> --question "<the choice, its options, and what depends on it>" --about <assignmentId>
+
+Do not guess, and do not dress the question as a status update. The question still holds
+nothing: park only the dependent step, carry on with everything else, and say in the card
+what you asked and what waits on it. The user's answer arrives as a row and releases exactly
+the step that waited. The user's open questions are the one inbox they trust to be complete —
+keep it honest: withdraw an ask the moment events moot it, and never duplicate one.
 
 ## Report so the user can act
 - Support every claim with its source — a file and line, a log line, a specific commit.
