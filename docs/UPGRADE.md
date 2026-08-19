@@ -50,6 +50,10 @@ copies every 0.1.7 row, sets the new fields to `NULL`, and creates the exact
 the migration does not rewrite wakes; it checks that their row count is
 unchanged in the same transaction. The stamp changes last. Any failure rolls
 back both table rebuilds, copied rows, indexes, and the stamp together.
+The serialized database owner suspends foreign-key enforcement only around the
+transaction because SQLite otherwise checks child rows during `DROP TABLE`.
+The transaction runs `foreign_key_check` before it stamps or commits, and the
+owner restores enforcement after success or rollback.
 
 An unstamped database, an unknown stamp, an intermediate development stamp, or
 more than one stamp is a refusal. Keep that database in place and use a build
@@ -145,7 +149,7 @@ upgrade_port=12384
    sqlite3 -readonly "$upgrade_db" \
      "SELECT count(*) FROM sqlite_master
       WHERE type='table' AND name IN
-        ('decision_requests_model_identity_v1','messages_model_identity_v1');"
+        ('decision_requests_model_identity_v1','messages_new');"
    ```
 
    PASS means the stamp is `operator-decision-requests-v1`, `quick_check` is

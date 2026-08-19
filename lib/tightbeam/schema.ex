@@ -1075,17 +1075,27 @@ defmodule Tightbeam.Schema do
   end
 
   defp migrate_model_identity_v1(db) do
-    case DB.transaction(db, &migrate_model_identity_v1_in_txn/1) do
-      {:ok, :ok} ->
-        :ok
+    # SQLite checks child rows during DROP TABLE even when constraints are
+    # deferred. The DB owner is the only connection and serializes this whole
+    # call, so suspend enforcement around the transaction, verify every FK
+    # before commit, and restore enforcement even when the transaction raises.
+    :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
 
-      {:error, %ShapeError{} = error} ->
-        raise error
+    try do
+      case DB.transaction(db, &migrate_model_identity_v1_in_txn/1) do
+        {:ok, :ok} ->
+          :ok
 
-      {:error, error} ->
-        raise ShapeError,
-          message:
-            "migration #{@model_identity_shape} -> #{@shape} failed and was rolled back: #{Exception.message(error)}"
+        {:error, %ShapeError{} = error} ->
+          raise error
+
+        {:error, error} ->
+          raise ShapeError,
+            message:
+              "migration #{@model_identity_shape} -> #{@shape} failed and was rolled back: #{Exception.message(error)}"
+      end
+    after
+      :ok = DB.execute(db, "PRAGMA foreign_keys = ON")
     end
   end
 
@@ -1143,17 +1153,7 @@ defmodule Tightbeam.Schema do
     [[^decision_request_count]] = Txn.q(txn, "SELECT COUNT(*) FROM decision_requests_new")
     [[^wake_count]] = Txn.q(txn, "SELECT COUNT(*) FROM wakes")
 
-    :ok = Txn.exec(txn, "ALTER TABLE messages RENAME TO messages_model_identity_v1")
-
-    :ok =
-      Txn.exec(
-        txn,
-        """
-        DROP INDEX messages_session;
-        DROP INDEX messages_client_dedupe;
-        #{@operator_messages_ddl}
-        """
-      )
+    :ok = Txn.exec(txn, @operator_messages_ddl)
 
     Txn.q(
       txn,
@@ -1169,7 +1169,7 @@ defmodule Tightbeam.Schema do
         clientMessageId, replyToMessageId, replyToClientMessageId,
         llmVisibleMessageId, attachments, attentionTier,
         NULL, NULL, NULL, NULL
-      FROM messages_model_identity_v1
+      FROM messages
       """
     )
 
@@ -1188,11 +1188,23 @@ defmodule Tightbeam.Schema do
         DROP TABLE decision_requests_model_identity_v1;
         ALTER TABLE decision_requests_new RENAME TO decision_requests;
         #{@operator_decision_requests_indexes_ddl}
-        DROP TABLE messages_model_identity_v1;
+        DROP INDEX messages_session;
+        DROP INDEX messages_client_dedupe;
+        DROP TABLE messages;
         ALTER TABLE messages_new RENAME TO messages;
         #{@operator_messages_indexes_ddl}
         """
       )
+
+    case Txn.q(txn, "PRAGMA foreign_key_check") do
+      [] ->
+        :ok
+
+      rows ->
+        raise ShapeError,
+          message:
+            "migration #{@model_identity_shape} -> #{@shape} left invalid foreign keys: #{inspect(rows)}"
+    end
 
     Txn.q(
       txn,

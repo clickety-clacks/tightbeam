@@ -173,6 +173,24 @@ defmodule Tightbeam.SchemaShapeTest do
          'client-a', NULL, NULL, 'm_one', '[{"kind":"text"}]', 1),
         (11, 'm_two', 'holder', 'assistant', 'world', 14, 'session:holder', NULL,
          NULL, 'm_one', NULL, 'm_two', '[]', 0);
+
+      INSERT INTO users (userId, isAdmin, createdAt)
+      VALUES ('mike', 1, 1);
+      INSERT INTO sessions
+        (sessionKey, displayName, ownerUserId, origin, archetype, harness,
+         provider, model, createdAt, updatedAt)
+      VALUES
+        ('holder', 'holder', 'mike', 'user:mike', 'coder', 'codex', 'openai',
+         'fixture-model', 1, 1);
+      INSERT INTO work_items
+        (id, title, ownerUserId, createdByUser, createdAt)
+      VALUES ('wi_one', 'one', 'mike', 'mike', 1);
+      INSERT INTO artifacts
+        (artifactId, kind, title, createdBySession, workItemId, originPath,
+         recordedMessageId, createdAt, updatedAt)
+      VALUES
+        ('art_one', 'report', 'one', 'holder', 'wi_one', '/tmp/one',
+         'm_one', 1, 1);
       """)
 
     {:ok, decision_requests_before} =
@@ -211,8 +229,10 @@ defmodule Tightbeam.SchemaShapeTest do
              )
 
     assert {:ok, []} = table_names(db, "decision_requests_model_identity_v1")
-    assert {:ok, []} = table_names(db, "messages_model_identity_v1")
+    assert {:ok, []} = table_names(db, "messages_new")
     assert {:ok, [[1]]} = index_count(db, "decision_requests_operator_open")
+    assert {:ok, [["m_one"]]} = DB.query(db, "SELECT recordedMessageId FROM artifacts")
+    assert {:ok, [[1]]} = DB.query(db, "PRAGMA foreign_keys")
 
     # The rebuilt table is the same target shape a fresh 0.1.8 database gets.
     fresh = :"schema_shape_fresh_#{System.unique_integer([:positive])}"
@@ -295,9 +315,10 @@ defmodule Tightbeam.SchemaShapeTest do
     assert {:ok, [["dr_kept"]]} = DB.query(db, "SELECT id FROM decision_requests")
     assert {:ok, [[9, "m_kept"]]} = DB.query(db, "SELECT seq, id FROM messages")
     assert {:ok, []} = table_names(db, "decision_requests_model_identity_v1")
-    assert {:ok, []} = table_names(db, "messages_model_identity_v1")
+    assert {:ok, []} = table_names(db, "messages_new")
     refute "ruledViaSessionKey" in table_columns(db, "decision_requests")
     refute "messageType" in table_columns(db, "messages")
+    assert {:ok, [[1]]} = DB.query(db, "PRAGMA foreign_keys")
   end
 
   test "the harness health foundation is additive and exact", %{db: db} do
