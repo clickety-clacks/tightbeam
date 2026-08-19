@@ -223,7 +223,19 @@ where
     if let Err(failure) = staged {
         let _ = fs::remove_dir_all(staging);
         if failure.interrupted {
-            return Err(failure.reason);
+            let reason = failure.reason;
+            let _ = cancel_after_begin(
+                identity,
+                provider,
+                kind,
+                machine.as_deref(),
+                Some(lease_id),
+                None,
+                &reason,
+                &ceremony,
+                &send_request,
+            );
+            return Err(reason);
         }
         let reason = failure.reason;
         let classified = if reason.contains("unsupported (no subscription)") {
@@ -2414,9 +2426,9 @@ mod tests {
 
     /// Codex uses the pipe-backed bounded runner rather than the Anthropic pty runner.
     /// Its signal has to retain the same interrupted classification all the way through
-    /// onboarding, or `onboard` mistakes TERM for a staging failure and waits on cancel.
+    /// onboarding while still releasing the exact lease created by `begin`.
     #[test]
-    fn term_during_codex_onboarding_kills_the_tree_without_entering_cancel() {
+    fn term_during_codex_onboarding_cancels_its_exact_lease_and_keeps_the_interrupt() {
         const INNER: &str = "TIGHTBEAM_CODEX_SIGNAL_INNER";
         const MARKER: &str = "TIGHTBEAM_CODEX_SIGNAL_MARKER";
         const STAGING: &str = "TIGHTBEAM_CODEX_SIGNAL_STAGING";
@@ -2449,9 +2461,12 @@ mod tests {
                             "leaseTtlMs": 300_000
                         }))),
                         Some("cancel") => {
-                            fs::write(&cancel, "entered").unwrap();
-                            thread::sleep(Duration::from_secs(300));
-                            Ok(None)
+                            let lease = request
+                                .pointer("/params/leaseId")
+                                .and_then(serde_json::Value::as_str)
+                                .expect("cancel must identify the lease from begin");
+                            fs::write(&cancel, lease).unwrap();
+                            Err("cancel transport failed".to_owned())
                         }
                         phase => panic!("unexpected onboarding phase: {phase:?}"),
                     }
@@ -2459,7 +2474,10 @@ mod tests {
                 |_, _| Ok(None),
             );
             let error = result.expect_err("TERM must abort codex onboarding");
-            assert!(error.contains("interrupted by signal"), "{error}");
+            assert_eq!(
+                error,
+                "codex device-code login was interrupted by signal 15"
+            );
             assert!(!std::path::Path::new(&staging).exists());
             assert!(std::path::Path::new(&marker).exists());
             return;
@@ -2491,7 +2509,7 @@ mod tests {
         inner
             .args([
                 "--exact",
-                "ceremonies::tests::term_during_codex_onboarding_kills_the_tree_without_entering_cancel",
+                "ceremonies::tests::term_during_codex_onboarding_cancels_its_exact_lease_and_keeps_the_interrupt",
                 "--nocapture",
             ])
             .env(INNER, "1")
@@ -2539,16 +2557,20 @@ mod tests {
         let grandchild_pid: libc::pid_t = grandchild.trim().parse().unwrap();
         let alive = unsafe { libc::kill(grandchild_pid, 0) } == 0
             || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH);
-        let cancel_entered = cancel.exists();
+        let canceled_lease = fs::read_to_string(&cancel).ok();
         let staging_survived = staging.exists();
         let _ = fs::remove_dir_all(&root);
 
         assert!(
             !required_kill,
-            "TERM did not promptly exit codex onboarding; cancel={cancel_entered}, \
+            "TERM did not promptly exit codex onboarding; canceled_lease={canceled_lease:?}, \
              staging={staging_survived}, descendant_alive={alive}"
         );
-        assert!(!cancel_entered, "TERM entered the lease-cancellation wait");
+        assert_eq!(
+            canceled_lease.as_deref(),
+            Some("signal-fixture-lease"),
+            "TERM did not cancel the lease returned by begin"
+        );
         assert!(!alive, "codex descendant {grandchild} survived TERM");
         assert!(!staging_survived, "TERM left codex staging behind");
     }
