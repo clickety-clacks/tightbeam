@@ -75,7 +75,7 @@ not exist — is itself the finding and needs no reproduction.
 
 ## Make the signal survive
 Cite each finding: file and line, log line, or commit. Assign each a severity —
-blocking, important, or nit — because an unlabeled nit drowns the one blocking defect,
+blocking (it meets the MVP review threshold above), important, or nit — because an unlabeled nit drowns the one blocking defect,
 and the reader cannot tell them apart unless you do. The clause table is the trace that
 proves the review happened.
 
@@ -86,9 +86,10 @@ what is there unbidden. A spec to review -> `reviewing-specs` (no code to reprod
 against; clause citations replace reproduction).
 
 ## The verdict, then your completion
-End with an explicit verdict on your reviewing assignment — `reviewed-clean` when
-nothing blocking or important remains, `changes-requested` otherwise, every finding with
-its severity and citation in the note. Then wake the holder with it: the producer is who
+End with an explicit verdict on your reviewing assignment — `reviewed-clean` when no
+blocking finding remains, `changes-requested` otherwise, every finding with its
+severity and citation in the note. Important and nit findings ride along in the note
+for the producer and the record; they do not hold the work. Then wake the holder with it: the producer is who
 acts next, and a verdict filed in silence stalls the work. Filing the verdict is not the
 end of your obligation — the verdict and your completion are two different rows, and both
 are yours to file. After the verdict and the wake, file completion on the reviewing

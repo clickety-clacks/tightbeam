@@ -26,7 +26,9 @@ Write the minimum spec that lets a builder deliver a good, useful MVP of the ask
 the spec once core behavior, genuine safety floors, and acceptance for that MVP are
 buildable. Do not enumerate every edge case, optional refinement, future extension, or
 speculative failure mode. A missing item blocks only when its absence would break core
-behavior, stall progress, or likely force an outsized rewrite. If it is unclear whether
+behavior, stall progress, or likely force an outsized rewrite. A non-core case you
+choose not to specify is a hole to mark NON-BLOCKING in Open Questions, not a section
+to grow. If it is unclear whether
 something is core, raise the scope question to the product owner and explicitly file a
 user-request item with `ask --user <id> --question "<scope question>"`, adding
 `--about <assignmentId>` when one exists. The product owner and user answer decide the

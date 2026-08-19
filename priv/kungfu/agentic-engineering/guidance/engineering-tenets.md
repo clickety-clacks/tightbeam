@@ -6,10 +6,19 @@
   cites its LIVE authority — a current spec clause, a directive, or a demonstrated bug.
   Conformance, fidelity, and tidiness are never that authority; when a clause demands a
   behavior change, surface the adjudication instead of making the edit.
+- Drive to an MVP. Use the minimum necessary to produce a good, useful MVP of the ask;
+  bias toward forward progress and the smallest coherent work product. Required
+  correctness and genuine safety floors stay mandatory. Optional completeness, polish,
+  and speculative robustness never block. Whether a disputed point is core is a scope
+  question for the product owner and the user, never yours to settle alone — pause that
+  one point and raise it; do not stall the rest.
 - Passing is not working. Compiling, green tests, and a clean review are not proof it works.
   Run it against real inputs before you call it done.
 - Capture test fixtures from real responses. A hand-written ideal fixture passes review and
-  ships broken.
+  ships broken. A capture proves today's reading of the contract, nothing more; when
+  capturing needs a human or a live credential, let the fixture test skip honestly and
+  make the code refuse loudly on a contract mismatch — never fabricate the fixture, and
+  never hold an MVP for the capture.
 - Read code and its provenance before you change it. Do not modify or delete code you do not
   understand.
 - Build exactly the spec. Unrequested additions are defects. If the spec has a hole on a
