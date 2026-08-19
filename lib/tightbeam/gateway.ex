@@ -558,9 +558,9 @@ defmodule Tightbeam.Gateway do
 
         {:error,
          {:no_harness_cli,
-          "Tight Beam cannot start because no registered harness CLI is installed. " <>
+          "Tightbeam cannot start because no registered harness CLI is installed. " <>
             "That is expected on a fresh machine. Install #{binaries}, ensure it is on PATH, " <>
-            "then start Tight Beam again. Run `tightbeam doctor` to check this machine."}}
+            "then start Tightbeam again. Run `tightbeam doctor` to check this machine."}}
 
       true ->
         detail =

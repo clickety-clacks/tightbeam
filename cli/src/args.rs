@@ -716,7 +716,7 @@ COMMANDS:
       being enabled, creates the base dir, installs the ACP adapters and
       this CLI, and records the host. --dry-run runs that probe for real
       and writes nothing else.
-      HARNESS CLIs ARE YOURS TO INSTALL. Tight Beam installs its own
+      HARNESS CLIs ARE YOURS TO INSTALL. Tightbeam installs its own
       plumbing on a satellite — adapters, CLI, base dir — never the
       vendors' software, and --harness <h> means "enable h here", which
       presupposes h's CLI is already there. The probe sees only what a

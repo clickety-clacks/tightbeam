@@ -4,7 +4,7 @@ Getting a harness logged in on a host. This is a SEPARATE activity from the
 smoke run: `docs/SMOKE.md` assumes every harness it exercises is already
 installed and logged in, and fails fast pointing here when one is not.
 
-Harness CLIs are the operator's to install; Tight Beam installs its own
+Harness CLIs are the operator's to install; Tightbeam installs its own
 plumbing (adapters, CLI, base dir) and never the vendors' software. Install the
 binary first (`docs/SATELLITE.md`), then onboard it here.
 

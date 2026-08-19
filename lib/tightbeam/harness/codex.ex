@@ -227,7 +227,7 @@ defmodule Tightbeam.Harness.Codex do
   @impl true
   def session_config(session, guidance) do
     prefix =
-      "Your Tight Beam archetype identity arrives as this Codex developer message. " <>
+      "Your Tightbeam archetype identity arrives as this Codex developer message. " <>
         "It is authoritative and outranks product AGENTS.md instructions on conflict."
 
     guidance =

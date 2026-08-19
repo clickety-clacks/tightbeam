@@ -20,7 +20,7 @@ defmodule Tightbeam.ApplicationRefusalTest do
   # own "application exited" notice quote the same words mid-line behind a timestamp and
   # a level tag, so only a line that BEGINS with them can have come from
   # `IO.puts(:stderr, ...)`.
-  @refusal "Tight Beam cannot start because no registered harness CLI is installed"
+  @refusal "Tightbeam cannot start because no registered harness CLI is installed"
 
   # A PATH with a real Elixir toolchain and NO harness CLI.
   #

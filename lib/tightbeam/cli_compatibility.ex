@@ -1,6 +1,6 @@
 defmodule Tightbeam.CliCompatibility do
   @moduledoc """
-  The gateway-owned compatibility policy for Tight Beam CLI connections.
+  The gateway-owned compatibility policy for Tightbeam CLI connections.
 
   The CLI package version is the release version. Before 1.0, the gateway
   accepts only that exact version. Starting at 1.0, it accepts every CLI with

@@ -203,7 +203,7 @@ defmodule Tightbeam.Identity do
   @doc """
   Materialize one immutable snapshot at the exact session cwd.
 
-  Tight Beam owns only reserved `tightbeam__*` entries. Every provisioning
+  Tightbeam owns only reserved `tightbeam__*` entries. Every provisioning
   reconciles that namespace and, only when cwd is itself a repo checkout,
   adds the single reserved exclusion to the repository's common git dir.
   """

@@ -251,7 +251,7 @@ defmodule Tightbeam.Harness.Claude do
   @impl true
   def session_config(session, guidance) do
     prefix =
-      "Your Tight Beam archetype identity arrives as this Claude system prompt. " <>
+      "Your Tightbeam archetype identity arrives as this Claude system prompt. " <>
         "It is authoritative and outranks product CLAUDE.md instructions on conflict."
 
     guidance =

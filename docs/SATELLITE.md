@@ -20,7 +20,7 @@ it and demands nothing.
 
 1. **Base dir** — `mkdir -p ~/.tightbeam/auth/<harness>` for each harness
    that will run here (`claude`, `codex`). `homes/` is created by delivery.
-2. **Credentials** — run Tight Beam onboarding independently on this
+2. **Credentials** — run Tightbeam onboarding independently on this
    machine: `tightbeam onboard openai` for Codex device-code, and
    `tightbeam onboard anthropic` for Claude setup-token. Never copy,
    harvest, scp, or rsync credentials between machines. No operator env is
@@ -39,7 +39,7 @@ it and demands nothing.
    choosing. Also install `rsync` (standard on macOS/Linux).
 4. **The harness CLIs themselves** — `claude` and/or `codex`, on a PATH a
    **non-login ssh shell** can see. These are a prerequisite, like node and
-   rsync: Tight Beam installs Tight Beam's plumbing on a satellite, not the
+   rsync: Tightbeam installs Tightbeam's plumbing on a satellite, not the
    vendors' software. Onboarding and turns invoke these binaries **directly**
    (`claude setup-token`, `codex login --device-auth`) — the ACP adapters wrap
    them and cannot stand in for them. A host without them assimilates fine and
@@ -75,7 +75,7 @@ registering a remote host without it fails at registration rather than at first
 turn.
 
 Hosts are **not** declared by hand. `tightbeam assimilate <ssh-dest> --name <name>`
-probes the machine, installs Tight Beam's plumbing, and records the host in
+probes the machine, installs Tightbeam's plumbing, and records the host in
 `<base_dir>/hosts.json` — the one registry. The name is yours; `local` is
 reserved, and the gateway's own machine is always present under its real hostname.
 Run `docs/ASSIMILATION-E2E.md` for the full procedure.

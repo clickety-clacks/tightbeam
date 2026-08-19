@@ -52,8 +52,8 @@ defmodule Tightbeam.Harness do
   @doc """
   The vendor CLI this harness invokes directly.
 
-  An operator prerequisite, never something Tight Beam installs: assimilation puts
-  Tight Beam's own plumbing on a satellite -- adapters, CLI, base dir -- and enabling
+  An operator prerequisite, never something Tightbeam installs: assimilation puts
+  Tightbeam's own plumbing on a satellite -- adapters, CLI, base dir -- and enabling
   a harness there presupposes this binary is already on that machine's PATH. It is
   projected on the wire so the satellite probe can check for it by name.
   """

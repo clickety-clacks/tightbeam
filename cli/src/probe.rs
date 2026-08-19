@@ -1435,7 +1435,7 @@ fn offline_harness_notes(
                 path.display()
             ),
             None => format!(
-                "harness {}: {} is missing from PATH; install it and run Tight Beam again",
+                "harness {}: {} is missing from PATH; install it and run Tightbeam again",
                 harness.wire_name, harness.cli_binary
             ),
         }
@@ -1490,7 +1490,7 @@ mod tests {
             "gateway is not running; local registered harness checks still ran"
         );
         assert!(notes.iter().any(|note| note
-            == "harness claude: claude is missing from PATH; install it and run Tight Beam again"));
+            == "harness claude: claude is missing from PATH; install it and run Tightbeam again"));
         assert!(
             notes
                 .iter()

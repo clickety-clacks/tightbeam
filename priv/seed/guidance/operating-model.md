@@ -9,11 +9,11 @@ Keep the two AGENTS scopes separate:
 - Product build, test, and repository conventions belong in that product repository's own
   `AGENTS.md` or `CLAUDE.md` and may be committed there.
 - Archetype-personal behavior that should follow you to every repository belongs in the
-  Tight Beam identity tree. Never put archetype-personal customization in a product
+  Tightbeam identity tree. Never put archetype-personal customization in a product
   repository's guidance file.
 
 The materialized `.codex/skills/tightbeam__*` and `.claude/skills/tightbeam__*` entries are
-Tight Beam projections. They are excluded when the session cwd is a repository checkout and
+Tightbeam projections. They are excluded when the session cwd is a repository checkout and
 must never be committed as product files.
 
 Use the identity seam for every customization:
