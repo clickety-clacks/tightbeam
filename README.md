@@ -187,7 +187,9 @@ Download the package for your platform from the
 [GitHub Releases](https://github.com/clickety-clacks/tightbeam/releases) page.
 Each release contains packages for `darwin-aarch64` and `linux-x86_64`, a
 `SHA256SUMS` file, and `release-provenance.json` naming the exact tagged commit
-and workflow run that produced them. Verify the downloaded package before
+and workflow run that produced them. (Exception: `v0.1.8+1325` was published
+manually from the e2e-proven packages; its SHA-256 hashes are in the release
+notes instead of a `SHA256SUMS` asset.) Verify the downloaded package before
 installing it:
 
 ```sh
@@ -201,7 +203,7 @@ shasum -a 256 -c SHA256SUMS --ignore-missing
 Install the verified package:
 
 ```sh
-npm install -g ./tightbeam-<version>-<os>-<arch>-<commit>.tgz
+npm install -g ./tightbeam-<version>-<os>-<arch>-build<N>.tgz
 tightbeam --version
 tightbeam-gateway                  # boots the gateway in the foreground
 ```
