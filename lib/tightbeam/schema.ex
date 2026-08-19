@@ -131,6 +131,43 @@ defmodule Tightbeam.Schema do
     WHERE kind = 'operator' AND status = 'open';
   """
 
+  @operator_messages_ddl """
+  CREATE TABLE messages_new (
+    seq                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    id                     TEXT NOT NULL UNIQUE,
+    sessionKey             TEXT NOT NULL,
+    role                   TEXT NOT NULL CHECK (role IN ('user','assistant')),
+    content                TEXT NOT NULL,
+    timestamp              INTEGER NOT NULL,
+    sender                 TEXT,
+    deviceId               TEXT,
+    clientMessageId        TEXT,
+    replyToMessageId       TEXT,
+    replyToClientMessageId TEXT,
+    llmVisibleMessageId    TEXT NOT NULL,
+    attachments            TEXT NOT NULL DEFAULT '[]',
+    attentionTier          INTEGER NOT NULL DEFAULT 0,
+    messageType            TEXT,
+    markerKind             TEXT CHECK (
+      markerKind IS NULL OR markerKind IN ('harness-switch','model-retune','session-restart')
+    ),
+    markerFrom             TEXT,
+    markerTo               TEXT,
+    CHECK (
+      (messageType IS 'marker' AND markerKind IS NOT NULL AND markerFrom IS NOT NULL AND markerTo IS NOT NULL)
+      OR
+      (messageType IS NOT 'marker' AND markerKind IS NULL AND markerFrom IS NULL AND markerTo IS NULL)
+    )
+  );
+  """
+
+  @operator_messages_indexes_ddl """
+  CREATE INDEX messages_session ON messages (sessionKey, seq);
+  CREATE UNIQUE INDEX messages_client_dedupe
+    ON messages (sessionKey, deviceId, clientMessageId)
+    WHERE clientMessageId IS NOT NULL AND deviceId IS NOT NULL;
+  """
+
   @supervision_liveness_objects [
     %{
       type: "table",
@@ -1053,11 +1090,12 @@ defmodule Tightbeam.Schema do
   end
 
   defp migrate_model_identity_v1_in_txn(%Txn{} = txn) do
-    # Read both commissioned populations before any DDL. A missing table is an
+    # Read every commissioned population before any DDL. A missing table is an
     # incompatible instance of the stamped predecessor and fails the transaction;
     # the values are preservation checks, never inputs used to infer a shape.
     [[decision_request_count]] = Txn.q(txn, "SELECT COUNT(*) FROM decision_requests")
     [[wake_count]] = Txn.q(txn, "SELECT COUNT(*) FROM wakes")
+    [[message_count]] = Txn.q(txn, "SELECT COUNT(*) FROM messages")
 
     :ok =
       Txn.exec(txn, "ALTER TABLE decision_requests RENAME TO decision_requests_model_identity_v1")
@@ -1105,6 +1143,44 @@ defmodule Tightbeam.Schema do
     [[^decision_request_count]] = Txn.q(txn, "SELECT COUNT(*) FROM decision_requests_new")
     [[^wake_count]] = Txn.q(txn, "SELECT COUNT(*) FROM wakes")
 
+    :ok = Txn.exec(txn, "ALTER TABLE messages RENAME TO messages_model_identity_v1")
+
+    :ok =
+      Txn.exec(
+        txn,
+        """
+        DROP INDEX messages_session;
+        DROP INDEX messages_client_dedupe;
+        #{@operator_messages_ddl}
+        """
+      )
+
+    Txn.q(
+      txn,
+      """
+      INSERT INTO messages_new (
+        seq, id, sessionKey, role, content, timestamp, sender, deviceId,
+        clientMessageId, replyToMessageId, replyToClientMessageId,
+        llmVisibleMessageId, attachments, attentionTier,
+        messageType, markerKind, markerFrom, markerTo
+      )
+      SELECT
+        seq, id, sessionKey, role, content, timestamp, sender, deviceId,
+        clientMessageId, replyToMessageId, replyToClientMessageId,
+        llmVisibleMessageId, attachments, attentionTier,
+        NULL, NULL, NULL, NULL
+      FROM messages_model_identity_v1
+      """
+    )
+
+    if Txn.changes(txn) != message_count do
+      raise ShapeError,
+        message:
+          "migration #{@model_identity_shape} -> #{@shape} copied #{Txn.changes(txn)} of #{message_count} messages"
+    end
+
+    [[^message_count]] = Txn.q(txn, "SELECT COUNT(*) FROM messages_new")
+
     :ok =
       Txn.exec(
         txn,
@@ -1112,6 +1188,9 @@ defmodule Tightbeam.Schema do
         DROP TABLE decision_requests_model_identity_v1;
         ALTER TABLE decision_requests_new RENAME TO decision_requests;
         #{@operator_decision_requests_indexes_ddl}
+        DROP TABLE messages_model_identity_v1;
+        ALTER TABLE messages_new RENAME TO messages;
+        #{@operator_messages_indexes_ddl}
         """
       )
 

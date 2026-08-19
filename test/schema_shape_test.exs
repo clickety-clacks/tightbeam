@@ -88,6 +88,25 @@ defmodule Tightbeam.SchemaShapeTest do
   )
   """
 
+  @model_identity_messages_ddl """
+  CREATE TABLE messages (
+    seq                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    id                     TEXT NOT NULL UNIQUE,
+    sessionKey             TEXT NOT NULL,
+    role                   TEXT NOT NULL CHECK (role IN ('user','assistant')),
+    content                TEXT NOT NULL,
+    timestamp              INTEGER NOT NULL,
+    sender                 TEXT,
+    deviceId               TEXT,
+    clientMessageId        TEXT,
+    replyToMessageId       TEXT,
+    replyToClientMessageId TEXT,
+    llmVisibleMessageId    TEXT NOT NULL,
+    attachments            TEXT NOT NULL DEFAULT '[]',
+    attentionTier          INTEGER NOT NULL DEFAULT 0
+  )
+  """
+
   setup do
     name = :"schema_shape_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: name})
@@ -117,7 +136,7 @@ defmodule Tightbeam.SchemaShapeTest do
     assert operator_index =~ ~r/WHERE\s+kind\s*=\s*'operator'\s+AND\s+status\s*=\s*'open'/
   end
 
-  test "model-identity-v1 migrates exactly and preserves decision requests and wakes", %{db: db} do
+  test "model-identity-v1 migrates exact requests, messages, and wakes", %{db: db} do
     :ok = Schema.ensure_all(db)
     downgrade_decision_requests_to_model_identity(db)
 
@@ -144,6 +163,16 @@ defmodule Tightbeam.SchemaShapeTest do
       VALUES
         ('w_pending', 'holder', 'process:test', 'resume', 10, 'pending', 6, NULL),
         ('w_fired', 'holder', 'process:test', 'done', 11, 'fired', 7, 12);
+
+      INSERT INTO messages
+        (seq, id, sessionKey, role, content, timestamp, sender, deviceId,
+         clientMessageId, replyToMessageId, replyToClientMessageId,
+         llmVisibleMessageId, attachments, attentionTier)
+      VALUES
+        (7, 'm_one', 'holder', 'user', 'hello', 13, 'user:mike', 'device-a',
+         'client-a', NULL, NULL, 'm_one', '[{"kind":"text"}]', 1),
+        (11, 'm_two', 'holder', 'assistant', 'world', 14, 'session:holder', NULL,
+         NULL, 'm_one', NULL, 'm_two', '[]', 0);
       """)
 
     {:ok, decision_requests_before} =
@@ -153,6 +182,9 @@ defmodule Tightbeam.SchemaShapeTest do
       )
 
     {:ok, wakes_before} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
+
+    {:ok, messages_before} =
+      DB.query(db, "SELECT #{model_identity_message_columns()} FROM messages ORDER BY seq")
 
     assert :ok = Schema.ensure_all(db)
 
@@ -168,7 +200,18 @@ defmodule Tightbeam.SchemaShapeTest do
              DB.query(db, "SELECT ruledViaSessionKey FROM decision_requests ORDER BY id")
 
     assert {:ok, ^wakes_before} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
+
+    assert {:ok, ^messages_before} =
+             DB.query(db, "SELECT #{model_identity_message_columns()} FROM messages ORDER BY seq")
+
+    assert {:ok, [[nil, nil, nil, nil], [nil, nil, nil, nil]]} =
+             DB.query(
+               db,
+               "SELECT messageType, markerKind, markerFrom, markerTo FROM messages ORDER BY seq"
+             )
+
     assert {:ok, []} = table_names(db, "decision_requests_model_identity_v1")
+    assert {:ok, []} = table_names(db, "messages_model_identity_v1")
     assert {:ok, [[1]]} = index_count(db, "decision_requests_operator_open")
 
     # The rebuilt table is the same target shape a fresh 0.1.8 database gets.
@@ -184,6 +227,12 @@ defmodule Tightbeam.SchemaShapeTest do
       assert object_sql(db, "index", name) == object_sql(fresh, "index", name)
     end
 
+    assert object_sql(db, "table", "messages") == object_sql(fresh, "table", "messages")
+
+    for name <- ~w(messages_session messages_client_dedupe) do
+      assert object_sql(db, "index", name) == object_sql(fresh, "index", name)
+    end
+
     # A second boot is ordinary and leaves both commissioned populations exact.
     assert :ok = Schema.ensure_all(db)
 
@@ -194,6 +243,9 @@ defmodule Tightbeam.SchemaShapeTest do
              )
 
     assert {:ok, ^wakes_before} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
+
+    assert {:ok, ^messages_before} =
+             DB.query(db, "SELECT #{model_identity_message_columns()} FROM messages ORDER BY seq")
   end
 
   test "a failed exact migration rolls back the rename and stamp", %{db: db} do
@@ -217,6 +269,35 @@ defmodule Tightbeam.SchemaShapeTest do
     assert {:ok, [["dr_kept"]]} = DB.query(db, "SELECT id FROM decision_requests")
     assert {:ok, []} = table_names(db, "decision_requests_model_identity_v1")
     refute "ruledViaSessionKey" in table_columns(db, "decision_requests")
+  end
+
+  test "a message rebuild failure rolls back requests, messages, and stamp", %{db: db} do
+    :ok = Schema.ensure_all(db)
+    downgrade_decision_requests_to_model_identity(db)
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO decision_requests
+        (id, kind, raiserId, ownerUserId, raisedAt, deadlineAt, statuteName,
+         actionKey, question, context, status)
+      VALUES
+        ('dr_kept', 'statute', 'session:holder', 'mike', 1, 2, 'law-a',
+         'action-a', 'allow?', '{}', 'open');
+      INSERT INTO messages
+        (seq, id, sessionKey, role, content, timestamp, llmVisibleMessageId)
+      VALUES (9, 'm_kept', 'holder', 'user', 'hello', 3, 'm_kept');
+      DROP INDEX messages_client_dedupe;
+      """)
+
+    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
+    assert error.message =~ "failed and was rolled back"
+    assert {:ok, [[@model_identity_shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+    assert {:ok, [["dr_kept"]]} = DB.query(db, "SELECT id FROM decision_requests")
+    assert {:ok, [[9, "m_kept"]]} = DB.query(db, "SELECT seq, id FROM messages")
+    assert {:ok, []} = table_names(db, "decision_requests_model_identity_v1")
+    assert {:ok, []} = table_names(db, "messages_model_identity_v1")
+    refute "ruledViaSessionKey" in table_columns(db, "decision_requests")
+    refute "messageType" in table_columns(db, "messages")
   end
 
   test "the harness health foundation is additive and exact", %{db: db} do
@@ -599,6 +680,14 @@ defmodule Tightbeam.SchemaShapeTest do
         WHERE kind = 'statute' AND status = 'open';
       CREATE UNIQUE INDEX decision_requests_effort_generation
         ON decision_requests (assignmentId, effortGeneration) WHERE kind = 'effort';
+      DROP INDEX messages_session;
+      DROP INDEX messages_client_dedupe;
+      DROP TABLE messages;
+      #{@model_identity_messages_ddl};
+      CREATE INDEX messages_session ON messages (sessionKey, seq);
+      CREATE UNIQUE INDEX messages_client_dedupe
+        ON messages (sessionKey, deviceId, clientMessageId)
+        WHERE clientMessageId IS NOT NULL AND deviceId IS NOT NULL;
       UPDATE schema_stamp SET shape = '#{@model_identity_shape}', stampedAt = 1;
       """)
 
@@ -612,6 +701,14 @@ defmodule Tightbeam.SchemaShapeTest do
     deadlineWakeId, raisedAt, deadlineAt, statuteName, actionKey, question,
     options, context, status, decision, rationale, ruledBy, ruledAt,
     rulingFactId, consumedAt, parkWakeId, withdrawnBy, withdrawnReason, withdrawnAt
+    """
+  end
+
+  defp model_identity_message_columns do
+    """
+    seq, id, sessionKey, role, content, timestamp, sender, deviceId,
+    clientMessageId, replyToMessageId, replyToClientMessageId,
+    llmVisibleMessageId, attachments, attentionTier
     """
   end
 

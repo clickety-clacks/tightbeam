@@ -20,10 +20,11 @@ genuinely in flight.
 
 ## Take a backup first
 
-`sqlite3 "$TIGHTBEAM_BASE_DIR/state.db" ".backup '$DEST/pre-upgrade.db'"` — safe
-while running, and the restore is already proven. See **[BACKUP.md](BACKUP.md)**
-for the procedure and, more importantly, for what `state.db` does *not* cover
-(`gateway.json` especially — losing it rotates the org token).
+Use `VACUUM INTO` from a read-only SQLite handle when the source is a live WAL
+database. It takes one consistent read snapshot. Do not use `.backup` for this
+release check: a continuously written WAL source can make that API restart its
+copy indefinitely. See **[BACKUP.md](BACKUP.md)** for what `state.db` does *not*
+cover (`gateway.json` especially — losing it rotates the org token).
 
 Back up **every registered base directory**. Each host owns its own `state.db`.
 The primary database does not migrate a satellite database for it. A macOS host
@@ -42,12 +43,13 @@ model-identity-v1 -> operator-decision-requests-v1
 ```
 
 It runs in one SQLite transaction. It rebuilds `decision_requests` with the
-0.1.8 operator-request constraint and `ruledViaSessionKey` column, copies every
-0.1.7 request, sets the new field to `NULL`, creates the exact 0.1.8 indexes,
-and updates the stamp last. The 0.1.7 and 0.1.8 `wakes` table definitions are
-identical, so the migration does not rewrite wakes; it checks that their row
-count is unchanged in the same transaction. Any failure rolls back the table
-rename, copied rows, indexes, and stamp together.
+0.1.8 operator-request constraint and `ruledViaSessionKey` column. It also
+rebuilds `messages` with the 0.1.8 marker-envelope columns and constraint. It
+copies every 0.1.7 row, sets the new fields to `NULL`, and creates the exact
+0.1.8 indexes. The 0.1.7 and 0.1.8 `wakes` table definitions are identical, so
+the migration does not rewrite wakes; it checks that their row count is
+unchanged in the same transaction. The stamp changes last. Any failure rolls
+back both table rebuilds, copied rows, indexes, and the stamp together.
 
 An unstamped database, an unknown stamp, an intermediate development stamp, or
 more than one stamp is a refusal. Keep that database in place and use a build
@@ -87,19 +89,28 @@ upgrade_port=12384
 2. Install the verified 0.1.7 package into an isolated npm prefix. Start it on
    an unused port against the fixture. Require `/version` to report 0.1.7, then
    stop it cleanly.
-3. Before installing 0.1.8, require this exact stamp and record the populations:
+3. Install an unmodified 0.1.8 package in a second isolated prefix and start it
+   against a fresh copy of the fixture. Require a named `ShapeError` that shows
+   `model-identity-v1` as the stored stamp and
+   `operator-decision-requests-v1` as the build stamp. It must not serve. Keep
+   the migrated-run copy separate from this refusal control.
+4. Before installing the migration candidate, require this exact stamp and
+   record the populations:
 
    ```sh
    sqlite3 -readonly "$upgrade_db" "SELECT shape FROM schema_stamp;"
    sqlite3 -readonly "$upgrade_db" \
-     "SELECT 'work_items',count(*) FROM work_items UNION ALL
+      "SELECT 'work_items',count(*) FROM work_items UNION ALL
       SELECT 'assignments',count(*) FROM assignments UNION ALL
+      SELECT 'sessions',count(*) FROM sessions UNION ALL
+      SELECT 'attests',count(*) FROM attests UNION ALL
       SELECT 'decision_requests',count(*) FROM decision_requests UNION ALL
-      SELECT 'wakes',count(*) FROM wakes;"
+      SELECT 'wakes',count(*) FROM wakes UNION ALL
+      SELECT 'messages',count(*) FROM messages;"
    ```
 
-4. Hash the complete commissioned rows in deterministic order. Select only the
-   0.1.7 request columns so the new nullable column does not change the digest:
+5. Hash the complete rebuilt rows in deterministic order. Select only the
+   0.1.7 columns so the new nullable columns do not change the digest:
 
    ```sh
    request_columns='id,kind,raiserId,raiserSessionKey,ownerUserId,assignmentId,expecterSessionKey,expecterUserId,lineageRung,effortGeneration,deadlineWakeId,raisedAt,deadlineAt,statuteName,actionKey,question,options,context,status,decision,rationale,ruledBy,ruledAt,rulingFactId,consumedAt,parkWakeId,withdrawnBy,withdrawnReason,withdrawnAt'
@@ -107,12 +118,15 @@ upgrade_port=12384
      "SELECT $request_columns FROM decision_requests ORDER BY id;" | shasum -a 256
    sqlite3 -readonly "$upgrade_db" ".mode quote" \
      "SELECT * FROM wakes ORDER BY wakeId;" | shasum -a 256
+   message_columns='seq,id,sessionKey,role,content,timestamp,sender,deviceId,clientMessageId,replyToMessageId,replyToClientMessageId,llmVisibleMessageId,attachments,attentionTier'
+   sqlite3 -readonly "$upgrade_db" ".mode quote" \
+     "SELECT $message_columns FROM messages ORDER BY seq;" | shasum -a 256
    ```
 
-5. Install the verified 0.1.8 package into the same isolated prefix. Start the
-   gateway once against the same base and port. This boot performs the
-   migration. Do not run a separate SQL migration command.
-6. Require `/version` to report the expected 0.1.8 build and source SHA. Then
+6. Install the verified migration-candidate package into the same isolated
+   prefix. Start the gateway once against the same base and port. This boot
+   performs the migration. Do not run a separate SQL migration command.
+7. Require `/version` to report the expected 0.1.8 build and source SHA. Then
    require all of these database checks:
 
    ```sh
@@ -123,20 +137,27 @@ upgrade_port=12384
      "SELECT count(*) FROM pragma_table_info('decision_requests')
       WHERE name='ruledViaSessionKey';"
    sqlite3 -readonly "$upgrade_db" \
+     "SELECT count(*) FROM pragma_table_info('messages')
+      WHERE name IN ('messageType','markerKind','markerFrom','markerTo');"
+   sqlite3 -readonly "$upgrade_db" \
      "SELECT count(*) FROM sqlite_master
       WHERE type='index' AND name='decision_requests_operator_open';"
    sqlite3 -readonly "$upgrade_db" \
      "SELECT count(*) FROM sqlite_master
-      WHERE type='table' AND name='decision_requests_model_identity_v1';"
+      WHERE type='table' AND name IN
+        ('decision_requests_model_identity_v1','messages_model_identity_v1');"
    ```
 
    PASS means the stamp is `operator-decision-requests-v1`, `quick_check` is
-   `ok`, `foreign_key_check` prints nothing, the new column and index counts are
-   `1`, and the temporary-table count is `0`.
-7. Repeat the four population counts and both deterministic hashes. Require
-   exact equality with step 3 and step 4. Start the 0.1.8 gateway a second time
-   and require the same counts and hashes again; this proves an ordinary restart
-   does not replay the migration.
+   `ok`, `foreign_key_check` prints nothing, the new request-column and index
+   counts are `1`, the new message-column count is `4`, and the temporary-table
+   count is `0`.
+8. Repeat all population counts and deterministic hashes. Require exact
+   equality with steps 4 and 5. Start the 0.1.8 gateway a second time and
+   require the same stamp timestamp, counts, and hashes again; this proves an
+   ordinary restart does not replay the migration.
+9. On a disposable copy, replace the stamp with an unknown value and require a
+   named refusal with no table or stamp mutation.
 
 ### macOS: package and base-directory smoke
 
@@ -149,10 +170,10 @@ isolated test gateway.
 2. Install the 0.1.8 Darwin package into the same isolated prefix and restart
    against the same base directory.
 3. Require `/version` to report the expected 0.1.8 build and source SHA.
-4. Require the new stamp, unchanged `work_items`, `assignments`,
-   `decision_requests`, and `wakes` counts, `PRAGMA quick_check = ok`, no foreign
-   key failures, the new column and operator index, and no migration temporary
-   table.
+4. Require the new stamp; unchanged `work_items`, `assignments`, `sessions`,
+   `attests`, `decision_requests`, `wakes`, and `messages` counts;
+   `PRAGMA quick_check = ok`; no foreign key failures; all new columns and
+   indexes; and no migration temporary table.
 
 Do not run the TARS or Shrdlu cold-install custody matrix again. This is the
 upgrade-preservation check that matrix did not cover.
