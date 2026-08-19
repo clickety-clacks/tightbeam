@@ -2519,8 +2519,8 @@ mod tests {
             .env("TIGHTBEAM_MACHINE", "signal-fixture-host")
             .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
         let mut inner = inner.spawn().unwrap();
 
         let ready_by = Instant::now() + Duration::from_secs(5);
@@ -2533,10 +2533,11 @@ mod tests {
             0
         );
 
-        let mut stdout = inner.stdout.take().unwrap();
+        let mut stderr = inner.stderr.take().unwrap();
         let drain = thread::spawn(move || {
             let mut discarded = Vec::new();
-            let _ = stdout.read_to_end(&mut discarded);
+            let _ = stderr.read_to_end(&mut discarded);
+            discarded
         });
         let exit_by = Instant::now() + Duration::from_secs(5);
         let mut status = None;
@@ -2552,7 +2553,7 @@ mod tests {
             );
             let _ = inner.wait();
         }
-        drain.join().unwrap();
+        let stderr = String::from_utf8_lossy(&drain.join().unwrap()).into_owned();
 
         let grandchild_pid: libc::pid_t = grandchild.trim().parse().unwrap();
         let alive = unsafe { libc::kill(grandchild_pid, 0) } == 0
@@ -2570,7 +2571,7 @@ mod tests {
             status
                 .expect("promptly exited inner test must have a status")
                 .success(),
-            "the inner interrupted-reason assertion failed"
+            "the inner interrupted-reason assertion failed; stderr={stderr:?}"
         );
         assert_eq!(
             canceled_lease.as_deref(),
