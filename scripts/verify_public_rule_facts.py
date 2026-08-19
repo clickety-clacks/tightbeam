@@ -38,6 +38,7 @@ def history_refs() -> list[str]:
         [
             "git",
             "rev-list",
+            "--full-history",
             f"{COMPATIBILITY_BASELINE}^..HEAD",
             "--",
             str(SOURCE),
