@@ -43,8 +43,10 @@ defmodule Tightbeam.Schema do
   # The one predecessor shape this build can migrate. This is deliberately a
   # complete target table, not an ALTER inferred from sqlite_master: the stamp
   # identifies the exact source contract, and this DDL names the exact target.
+  # The temporary name also keeps the live request-site audit honest: this is a
+  # bulk schema copy, not a new decision request that owes a prompt wake.
   @operator_decision_requests_ddl """
-  CREATE TABLE decision_requests (
+  CREATE TABLE decision_requests_new (
     id                TEXT PRIMARY KEY,
     kind              TEXT NOT NULL DEFAULT 'statute' CHECK (kind IN ('statute','effort','operator')),
     raiserId          TEXT NOT NULL,
@@ -112,6 +114,9 @@ defmodule Tightbeam.Schema do
        ))
     )
   );
+  """
+
+  @operator_decision_requests_indexes_ddl """
   CREATE INDEX decision_requests_owner
     ON decision_requests (ownerUserId, status);
   CREATE INDEX decision_requests_key
@@ -1072,7 +1077,7 @@ defmodule Tightbeam.Schema do
     Txn.q(
       txn,
       """
-      INSERT INTO decision_requests (
+      INSERT INTO decision_requests_new (
         id, kind, raiserId, raiserSessionKey, ownerUserId, assignmentId,
         expecterSessionKey, expecterUserId, lineageRung, effortGeneration,
         deadlineWakeId, raisedAt, deadlineAt, statuteName, actionKey, question,
@@ -1097,10 +1102,18 @@ defmodule Tightbeam.Schema do
           "migration #{@model_identity_shape} -> #{@shape} copied #{Txn.changes(txn)} of #{decision_request_count} decision requests"
     end
 
-    [[^decision_request_count]] = Txn.q(txn, "SELECT COUNT(*) FROM decision_requests")
+    [[^decision_request_count]] = Txn.q(txn, "SELECT COUNT(*) FROM decision_requests_new")
     [[^wake_count]] = Txn.q(txn, "SELECT COUNT(*) FROM wakes")
 
-    :ok = Txn.exec(txn, "DROP TABLE decision_requests_model_identity_v1")
+    :ok =
+      Txn.exec(
+        txn,
+        """
+        DROP TABLE decision_requests_model_identity_v1;
+        ALTER TABLE decision_requests_new RENAME TO decision_requests;
+        #{@operator_decision_requests_indexes_ddl}
+        """
+      )
 
     Txn.q(
       txn,

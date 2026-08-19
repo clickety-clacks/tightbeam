@@ -629,6 +629,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
     sql
     |> String.downcase()
+    |> String.replace("\"", "")
     |> String.replace(~r/\s+/u, "")
   end
 
