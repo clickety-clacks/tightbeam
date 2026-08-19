@@ -102,17 +102,22 @@ Prepare and prove a new candidate instead.
 
 ## Create the immutable tag
 
-Create the version tag only after the exact-main readback succeeds. The tag must target the
-proved candidate SHA.
+Create the build-qualified version tag only after the exact canonical-branch readback
+succeeds. The tag must be `v<version>+<build>`, where `<build>` is
+`git rev-list --count <proved-candidate-sha>`, and it must target the proved candidate SHA.
 
 1. Fetch tags and `main`.
 2. Refuse the operation if the tag already exists locally or remotely.
-3. Verify that `main` names the proved candidate SHA.
+3. Verify that the version branch for a 0.1 release, or `main` for later lines, names the
+   proved candidate SHA.
 4. Create one annotated version tag at that SHA.
 5. Push the tag once.
 6. Read the remote tag target and verify the exact SHA.
 
-Never update or delete a release tag. The release-candidate workflow has no tag trigger.
+Never update or delete a release tag. Never publish an immutable GitHub Release before
+quits: deleting it does not make its tag name reusable. The premature immutable `v0.1.8`
+release burned that bare name permanently. The release-candidate workflow has no tag
+trigger.
 
 ## Prevent duplicate work
 

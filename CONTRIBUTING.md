@@ -43,9 +43,11 @@ evolving. ("We evolve a release branch until it passes.")
 **Calling quits.** Quits happens when the branch tests clean; the last
 (passing) build *is* the release:
 
-1. Tag `v<current>` at the branch tip — the immutable, byte-exact name that
-   installs and support use. The CI proof (gates on both platforms, packages
-   built and hashed, manifest verified) runs at that SHA.
+1. Tag `v<current>+<build>` at the branch tip — for example,
+   `v0.1.8+1325`. The version and deterministic build number together are the
+   immutable, byte-exact name that installs and support use. The CI proof
+   (gates on both platforms, packages built and hashed, manifest verified)
+   runs at that SHA.
 2. Spin the next version from the tip. It is the new scratchpad, effective
    immediately, and it stays empty until then.
 3. `<current>` never moves again. Freeze is by abandonment, identity is the
@@ -58,7 +60,10 @@ evolving. ("We evolve a release branch until it passes.")
 after the branch passes — so a tag and further pushes cannot coexist. (A tag
 minted before its branch passed, as `v0.1.8` was, does not freeze the branch:
 the branch keeps evolving until it tests clean, and the passing build carries
-the authoritative identity.) If a *released* version needs a fix, that fix
+the authoritative identity.) A tag name used by an immutable GitHub Release
+remains unavailable even if that release and tag are deleted. Never publish
+the release before quits; the premature immutable `v0.1.8` release burned
+that bare name permanently. If a *released* version needs a fix, that fix
 lands on the current scratchpad; shipping it is a new version. (History: a frozen candidate branch was pushed to on 2026-08-15 and
 had to be discarded — receipts you can write to are traps, which is why the
 old `release-candidate/*` mechanism was retired along with the `0.1.x` series
