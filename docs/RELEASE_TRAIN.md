@@ -106,7 +106,8 @@ Create the build-qualified version tag only after the exact canonical-branch rea
 succeeds. The tag must be `v<version>+<build>`, where `<build>` is
 `git rev-list --count <proved-candidate-sha>`, and it must target the proved candidate SHA.
 
-1. Fetch tags and `main`.
+1. Fetch tags and the selected canonical branch: the version branch for a 0.1 release,
+   or `main` for a later line.
 2. Refuse the operation if the tag already exists locally or remotely.
 3. Verify that the version branch for a 0.1 release, or `main` for later lines, names the
    proved candidate SHA.
