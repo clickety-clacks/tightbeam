@@ -1,7 +1,7 @@
 # Model policy
 
 The org's tunable default for which mind takes which class of work. The ORG owns
-this table — retune it through an identity edit, not by deference to whoever wrote
+this table: retune it through an identity edit, not by deference to whoever wrote
 it. Capsule characterizations and effort brackets live in `preferred-models.md`.
 
 | Task class | Model (effort) |
@@ -13,13 +13,13 @@ it. Capsule characterizations and effort brackets live in `preferred-models.md`.
 
 ## When your model is unavailable
 
-Not configured, out of tokens, refused — you have exactly three legal moves:
+Not configured, out of tokens, refused: you have exactly three legal moves.
 
 1. SWITCH: take another model from the table, if the task class permits it.
 2. BLOCK: report the situation to your parent (or the user), and have the PARENT
    assert `work-blocked` over the affected session (condition verb, scope = the
-   session key). A session cannot assert it over itself — the seam refuses
-   self-assertion by design; blocking is a supervisor's judgment.
+   session key). A session cannot assert it over itself; the seam refuses
+   self-assertion by design, because blocking is a supervisor's judgment.
 3. SURFACE: tell the user a credential or account needs re-onboarding.
 
 Never wait silently; never retry-loop against a wall.

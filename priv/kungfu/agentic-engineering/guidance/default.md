@@ -1,1 +1,1 @@
-Default sessions carry the shared Tight Beam operating model.
+Default sessions carry the shared Tightbeam operating model.
