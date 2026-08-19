@@ -18,8 +18,10 @@ from `<base_dir>/gateway.json`).
 ## Harness parity (normative for every run)
 
 This runbook is a MATRIX, not a list: one full pass PER HARNESS the org
-supports (today: claude on `claude-sonnet-5` at effort `medium`, codex on
-`gpt-5.6-sol` at effort `medium`), using a
+supports. Recorded live examples exist for claude on `claude-sonnet-5` at
+effort `medium` and codex on `gpt-5.6-sol` at effort `medium`. Cursor is
+registered but has no recorded live model or live leg; supply a model returned
+by that org's Cursor catalog rather than inventing a default. Use a
 session of that harness for every step. A smoke run's verdict is
 INCOMPLETE — not passed — until every harness leg has run or been WAIVED by
 name with the blocker stated (e.g. "codex leg waived: no codex grant in the
@@ -151,6 +153,7 @@ on 2026-07-25:
   TIGHTBEAM_BASE_DIR=~/.tightbeam-beam \
   TIGHTBEAM_SMOKE_MODEL_CLAUDE='claude-sonnet-5' TIGHTBEAM_SMOKE_EFFORT_CLAUDE='medium' \
   TIGHTBEAM_SMOKE_MODEL_CODEX='gpt-5.6-sol' TIGHTBEAM_SMOKE_EFFORT_CODEX='medium' \
+  TIGHTBEAM_SMOKE_MODEL_CURSOR='<catalog-listed-cursor-model>' \
   mix run --no-start scripts/feature_smoke.exs
   ```
 
@@ -161,6 +164,12 @@ on 2026-07-25:
   instead, which is why the stale value was never caught. The accepted list and how to
   re-probe it live in the note above `@adapter_selectable_models` in
   `lib/tightbeam/harness/claude.ex`.
+
+  Replace `<catalog-listed-cursor-model>` with a model returned by the target
+  org's Cursor catalog. It is an input placeholder, not a default or a claim of
+  live support. Until Cursor credential liveness and a model are available, set
+  `TIGHTBEAM_SMOKE_LEGS=claude,codex` and record Cursor as
+  `INCOMPLETE(parity)` with the credential/model blocker.
 
   Each registered harness must have its credential preflight and catalog
   bootstrap complete first. The gateway
