@@ -7,7 +7,7 @@ defmodule Tightbeam.Escalation do
   batch must fail closed if any CAS loses; earlier winners stay consumed.
   """
 
-  alias Tightbeam.{ConditionFacts, DB, EventLog, Org, Roles, Wakes}
+  alias Tightbeam.{ConditionFacts, DB, EventLog, Org, PatrolResponse, Roles, Wakes}
   alias Tightbeam.DB.Txn
 
   @default_decision_deadline_ms 86_400_000
@@ -1149,6 +1149,7 @@ defmodule Tightbeam.Escalation do
     current_request: "statute",
     file_agent_request: "agent",
     answer_open: "agent",
+    effort_open_by_id_in_txn: "effort",
     effort_open_by_deadline_wake_in_txn: "effort",
     effort_insert_in_txn: "effort",
     effort_id_by_generation_in_txn: "effort",
@@ -1227,6 +1228,19 @@ defmodule Tightbeam.Escalation do
     end
   end
 
+  @doc "EFFORT ONLY: the open effort request with this id."
+  @spec effort_open_by_id_in_txn(Txn.t(), String.t()) :: map() | nil
+  def effort_open_by_id_in_txn(txn, id) do
+    case Txn.q(
+           txn,
+           "SELECT #{@request_columns} FROM decision_requests WHERE kind = 'effort' AND status = 'open' AND id = ?1",
+           [id]
+         ) do
+      [row] -> request_from_row(row)
+      [] -> nil
+    end
+  end
+
   @doc """
   EFFORT ONLY: file one generation's request AND arm its check-in prompt, in
   one commit — the same transactional-outbox shape `escalate/4` and
@@ -1270,7 +1284,7 @@ defmodule Tightbeam.Escalation do
 
     if Txn.changes(txn) == 1 do
       request = request_in_txn(txn, attrs.id)
-      effort_notification_in_txn(txn, request)
+      effort_notification_in_txn(txn, request, nil)
       {:inserted, request}
     else
       :conflict
@@ -1349,7 +1363,7 @@ defmodule Tightbeam.Escalation do
 
     if Txn.changes(txn) == 1 do
       advanced = request_in_txn(txn, id)
-      effort_notification_in_txn(txn, advanced)
+      effort_notification_in_txn(txn, advanced, prior_deadline_wake_id)
       {:advanced, advanced}
     else
       :lost
@@ -1362,21 +1376,56 @@ defmodule Tightbeam.Escalation do
   # rather than in `EffortCheckin` so the row write and its notification are
   # provably one commit in the same file (Sol xhigh review round 2: proof 10's
   # same-file call-graph traversal cannot see across a module boundary).
-  defp effort_notification_in_txn(txn, request) do
-    prompt =
-      "Effort check-in #{request.id} for assignment #{request.assignment_id}.\n" <>
-        request.question <>
-        "\nActions: #{Enum.join(request.options || [], ", ")}"
+  defp effort_notification_in_txn(txn, request, delivery_wake_id) do
+    existing =
+      PatrolResponse.existing_effort_source_in_txn(
+        txn,
+        "effort_decision_notification",
+        request.id,
+        request.lineage_rung
+      )
 
-    Wakes.schedule_in_txn(txn, %{
-      session_key:
-        request.expecter_session_key || Org.personal_session_key(request.expecter_user_id),
-      origin: "process:tightbeam",
-      prompt: prompt,
-      due_at: now(),
-      assignment_id: request.assignment_id,
-      target_gate: 0
-    })
+    if existing && (is_nil(delivery_wake_id) or existing.state == "fired") do
+      existing
+    else
+      prompt =
+        "Effort check-in #{request.id} for assignment #{request.assignment_id}.\n" <>
+          request.question <>
+          "\nActions: #{Enum.join(request.options || [], ", ")}"
+
+      wake =
+        Wakes.schedule_in_txn(txn, %{
+          session_key:
+            request.expecter_session_key || Org.personal_session_key(request.expecter_user_id),
+          origin: "process:tightbeam",
+          prompt: prompt,
+          due_at: now(),
+          assignment_id: request.assignment_id,
+          target_gate: 0
+        })
+
+      {:ok, _source} =
+        if existing do
+          PatrolResponse.create_effort_delivery_retry_in_txn(
+            txn,
+            wake.wake_id,
+            "effort_decision_notification",
+            request.id,
+            request.lineage_rung,
+            delivery_wake_id
+          )
+        else
+          PatrolResponse.create_effort_source_in_txn(
+            txn,
+            wake.wake_id,
+            "effort_decision_notification",
+            request.id,
+            request.lineage_rung
+          )
+        end
+
+      wake
+    end
   end
 
   @doc """

@@ -589,8 +589,22 @@ defmodule Tightbeam.Wakes do
             :ok
         end
 
-        [row] = Txn.q(txn, select_wake_sql() <> " WHERE wakeId=?1", [replacement_id])
-        to_wake(row)
+        case Tightbeam.PatrolResponse.attach_destination_retry_in_txn(
+               txn,
+               wake_id,
+               replacement_id
+             ) do
+          :ordinary ->
+            [row] = Txn.q(txn, select_wake_sql() <> " WHERE wakeId=?1", [replacement_id])
+            to_wake(row)
+
+          {:ok, _source} ->
+            [row] = Txn.q(txn, select_wake_sql() <> " WHERE wakeId=?1", [replacement_id])
+            to_wake(row)
+
+          {:error, :patrol_output_source_conflict} ->
+            raise "patrol_output_source_conflict"
+        end
       else
         :error
       end
@@ -628,14 +642,14 @@ defmodule Tightbeam.Wakes do
   defp retarget_delivery(source, _created_at), do: {source.delivery_rule, source.due_at}
 
   @requester_kinds ~w(user session process)
-  @reason_kinds ~w(requester_withdrew superseded obligation_disposed routing_bracket_satisfied target_retired production_unmatched consumer_unavailable target_unresolvable)
+  @reason_kinds ~w(requester_withdrew superseded obligation_disposed routing_bracket_satisfied target_retired production_unmatched consumer_unavailable target_unresolvable patrol_source_mismatch)
   @source_kinds ~w(verb_call wake progress_attest condition_fact assignment_transition work_item_transition decision_request monitor_generation routing_bracket session_transition scheduler_delivery)
   @disposition_kinds ~w(assignment_transition work_item_transition decision_request_transition monitor_generation_transition)
   @liveness_kinds ~w(supervision_entitlement supervision_transfer pending_wake routing_bracket)
 
   @process_reasons %{
     "tightbeam:wake-scheduler" =>
-      ~w(production_unmatched consumer_unavailable target_unresolvable),
+      ~w(production_unmatched consumer_unavailable target_unresolvable patrol_source_mismatch),
     "tightbeam:work-items" => ~w(routing_bracket_satisfied),
     "tightbeam:assignments" => ~w(obligation_disposed),
     "tightbeam:effort-checkin" => ~w(superseded obligation_disposed),
@@ -661,7 +675,8 @@ defmodule Tightbeam.Wakes do
     "target_retired" => {~w(session_transition), ~w(replacement no_replacement)},
     "production_unmatched" => {~w(condition_fact), ~w(no_replacement)},
     "consumer_unavailable" => {~w(scheduler_delivery), ~w(no_replacement)},
-    "target_unresolvable" => {~w(scheduler_delivery), ~w(no_replacement)}
+    "target_unresolvable" => {~w(scheduler_delivery), ~w(no_replacement)},
+    "patrol_source_mismatch" => {~w(scheduler_delivery), ~w(no_replacement)}
   }
 
   @doc """
@@ -2249,14 +2264,6 @@ defmodule Tightbeam.Wakes do
                      }
                    }
                  }) do
-            # REFUND THE RUNG. The prodder's bookkeeping increments prodCount
-            # when the wake is scheduled, but suppression voids that act.
-            Txn.q(
-              txn,
-              "UPDATE assignment_prods SET prodCount = MAX(prodCount - 1, 0) WHERE assignmentId = ?1",
-              [wake.assignment_id]
-            )
-
             true
           else
             _ -> false

@@ -1347,39 +1347,51 @@ defmodule Tightbeam.Supervision do
                 write_terminal_watermark_in_txn(txn, session_key, terminal_seq)
                 :rebased
 
-              :duplicate when state == "claimed" ->
-                write_terminal_watermark_in_txn(txn, session_key, terminal_seq)
-                :claimed
-
-              :duplicate when state == "armed" and due_at > evaluation_clock ->
-                write_terminal_watermark_in_txn(txn, session_key, terminal_seq)
-                :not_due
-
-              :duplicate when state == "armed" ->
-                if due_gate?(txn, assignment.id, session_key) do
-                  :controlled
+              :duplicate ->
+                if Tightbeam.PatrolResponse.acknowledged_terminal_in_txn?(
+                     txn,
+                     assignment.id,
+                     terminal_seq
+                   ) do
+                  write_terminal_watermark_in_txn(txn, session_key, terminal_seq)
+                  :patrol_response_acknowledged
                 else
-                  case claim_entitlement_in_txn(
-                         txn,
-                         assignment,
-                         generation,
-                         due_at,
-                         last_attempt,
-                         basis_kind,
-                         basis_id,
-                         evaluation_clock,
-                         n,
-                         terminal_seq,
-                         "new_terminal"
-                       ) do
-                    :ok -> :claimed
-                    :stale -> :duplicate
+                  case state do
+                    "claimed" ->
+                      write_terminal_watermark_in_txn(txn, session_key, terminal_seq)
+                      :claimed
+
+                    "armed" when due_at > evaluation_clock ->
+                      write_terminal_watermark_in_txn(txn, session_key, terminal_seq)
+                      :not_due
+
+                    "armed" ->
+                      if due_gate?(txn, assignment.id, session_key) do
+                        :controlled
+                      else
+                        case claim_entitlement_in_txn(
+                               txn,
+                               assignment,
+                               generation,
+                               due_at,
+                               last_attempt,
+                               basis_kind,
+                               basis_id,
+                               evaluation_clock,
+                               n,
+                               terminal_seq,
+                               "new_terminal"
+                             ) do
+                          :ok -> :claimed
+                          :stale -> :duplicate
+                        end
+                      end
+
+                    _ ->
+                      write_terminal_watermark_in_txn(txn, session_key, terminal_seq)
+                      :duplicate
                   end
                 end
-
-              :duplicate ->
-                write_terminal_watermark_in_txn(txn, session_key, terminal_seq)
-                :duplicate
             end
         end
       end)
@@ -1402,6 +1414,9 @@ defmodule Tightbeam.Supervision do
 
       :controlled ->
         :continuation
+
+      :patrol_response_acknowledged ->
+        :patrol_response_acknowledged
 
       :duplicate ->
         :duplicate

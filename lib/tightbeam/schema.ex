@@ -62,7 +62,10 @@ defmodule Tightbeam.Schema do
   # read or write this build makes against the NEW columns/constraints would
   # die on a raw, unnamed SQLite error instead of a refusal that names what
   # changed. Refuse, name it, and let the database be recreated.
-  @shape "coordination-fabric-v1-phase1-v3"
+  # `-v4` adds the closed `patrol_source_mismatch` cancellation reason. SQLite
+  # cannot widen the existing CHECK in place, so an older stamped database is
+  # refused instead of being inferred or repaired.
+  @shape "coordination-fabric-v1-phase1-v4"
 
   @supervision_liveness_objects [
     %{
@@ -204,7 +207,7 @@ defmodule Tightbeam.Schema do
         reasonKind TEXT NOT NULL CHECK (reasonKind IN (
           'requester_withdrew','superseded','obligation_disposed',
           'routing_bracket_satisfied','target_retired','production_unmatched',
-          'consumer_unavailable','target_unresolvable'
+          'consumer_unavailable','target_unresolvable','patrol_source_mismatch'
         )),
         causalSourceKind TEXT NOT NULL CHECK (causalSourceKind IN (
           'verb_call','wake','progress_attest','condition_fact','assignment_transition',
@@ -271,7 +274,8 @@ defmodule Tightbeam.Schema do
              ((reasonKind = 'production_unmatched' AND causalSourceKind = 'condition_fact' AND
                outcomeKind = 'no_replacement')
               OR
-              (reasonKind IN ('consumer_unavailable','target_unresolvable') AND
+              (reasonKind IN ('consumer_unavailable','target_unresolvable',
+                              'patrol_source_mismatch') AND
                causalSourceKind = 'scheduler_delivery' AND outcomeKind = 'no_replacement')))
             OR
             (requesterId = 'tightbeam:work-items' AND
@@ -774,6 +778,7 @@ defmodule Tightbeam.Schema do
 
     case DB.transaction(db, fn txn ->
            ensure_supervision_liveness_v1_in_txn(txn, activated_at)
+           Tightbeam.PatrolResponse.ensure_schema_in_txn(txn)
          end) do
       {:ok, :ok} ->
         :ok

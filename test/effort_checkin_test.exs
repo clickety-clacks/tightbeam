@@ -6,6 +6,7 @@ defmodule Tightbeam.EffortCheckinTest do
     Archetypes,
     Artifacts,
     Assignments,
+    ConditionFacts,
     ConnRegistry,
     DB,
     EffortCheckin,
@@ -337,8 +338,8 @@ defmodule Tightbeam.EffortCheckinTest do
     drain_notifications!(ctx)
 
     # Delivery derives the SAME attribution through `wake_attribution/2` — for
-    # the agent prod that opened the bracket's first rung as well as for the two
-    # owner notifications.
+    # the agent prod that opened the bracket's first rung and the current owner
+    # notification. The superseded predecessor notification creates no turn.
     assert rows(
              ctx.db,
              """
@@ -349,7 +350,6 @@ defmodule Tightbeam.EffortCheckinTest do
              """,
              []
            ) == [
-             [assignment.id, item.id],
              [assignment.id, item.id],
              [assignment.id, item.id]
            ]
@@ -570,7 +570,8 @@ defmodule Tightbeam.EffortCheckinTest do
     advanced = request(ctx.db, user_request.id)
     assert advanced.expecter_user_id == "h1"
     assert advanced.lineage_rung == user_request.lineage_rung
-    assert advanced.deadline_wake_id != old_deadline
+    assert advanced.deadline_wake_id == old_deadline
+    assert Wakes.get(ctx.db, old_deadline).state == "canceled"
     EffortCheckin.deadline(ctx.db, ctx.config, Wakes.get(ctx.db, old_deadline))
     assert request(ctx.db, user_request.id).deadline_wake_id == advanced.deadline_wake_id
 
@@ -1304,6 +1305,99 @@ defmodule Tightbeam.EffortCheckinTest do
     assert rows(ctx.db, "SELECT COUNT(*) FROM effort_checkin_generations WHERE assignmentId=?1", [
              bare.id
            ]) == [[0]]
+  end
+
+  test "a current work-blocked fact re-arms only the typed internal effort probe", ctx do
+    assignment = dispatch(ctx, {:session, "parent"}, "holder", "blocked work")
+    first_probe = current_wake(ctx.db, assignment.id)
+
+    {:ok, fact} =
+      DB.transaction(ctx.db, fn txn ->
+        ConditionFacts.file_in_txn(txn, %{
+          kind: "work-blocked",
+          scope: "holder",
+          origin: "session:holder"
+        })
+      end)
+
+    assert :ok = EffortCheckin.probe(ctx.db, ctx.config, first_probe)
+
+    assert [[1, "probed", evidence], [2, "armed", nil]] =
+             rows(
+               ctx.db,
+               "SELECT generation,state,evidence FROM effort_checkin_generations WHERE assignmentId=?1 ORDER BY generation",
+               [assignment.id]
+             )
+
+    fact_id = fact.fact_id
+
+    assert %{"outcome" => "work_blocked", "conditionFactId" => ^fact_id} =
+             JSON.decode!(evidence)
+
+    assert [[2]] =
+             rows(
+               ctx.db,
+               "SELECT COUNT(*) FROM patrol_output_sources WHERE assignmentId=?1 AND sourceKind='effort_generation_probe'",
+               [assignment.id]
+             )
+
+    assert [[0]] =
+             rows(
+               ctx.db,
+               "SELECT COUNT(*) FROM decision_requests WHERE assignmentId=?1 AND status='open'",
+               [assignment.id]
+             )
+
+    assert [] ==
+             Wakes.list_pending(ctx.db)
+             |> Enum.filter(&(&1.consumer == "prompt" and &1.assignment_id == assignment.id))
+  end
+
+  test "filing work-blocked supersedes a request and cancels its pending outward wakes", ctx do
+    assignment = dispatch(ctx, {:session, "parent"}, "holder", "blocked request")
+    request = escalate(ctx, assignment.id)
+
+    outward =
+      Wakes.list_pending(ctx.db)
+      |> Enum.filter(&(&1.consumer == "prompt" and &1.assignment_id == assignment.id))
+
+    assert length(outward) == 2
+    assert Enum.any?(outward, &(&1.target_gate == 0))
+
+    deadline = Wakes.get(ctx.db, request.deadline_wake_id)
+    assert deadline.state == "pending"
+
+    {:ok, fact} =
+      DB.transaction(ctx.db, fn txn ->
+        ConditionFacts.file_in_txn(txn, %{
+          kind: "work-blocked",
+          scope: "holder",
+          origin: "session:holder"
+        })
+      end)
+
+    assert request(ctx.db, request.id).status == "superseded"
+    assert Enum.all?(outward, &(Wakes.get(ctx.db, &1.wake_id).state == "canceled"))
+    assert Wakes.get(ctx.db, deadline.wake_id).state == "canceled"
+
+    fact_id = to_string(fact.fact_id)
+    [first_outward, second_outward] = outward
+
+    assert [[3]] =
+             rows(
+               ctx.db,
+               """
+               SELECT COUNT(*) FROM wake_cancellations
+               WHERE wakeId IN (?1,?2,?3) AND reasonKind='production_unmatched'
+                 AND causalSourceKind='condition_fact' AND causalSourceId=?4
+                 AND outcomeKind='no_replacement'
+               """,
+               [first_outward.wake_id, second_outward.wake_id, deadline.wake_id, fact_id]
+             )
+
+    assert [] ==
+             Wakes.list_pending(ctx.db)
+             |> Enum.filter(&(&1.assignment_id == assignment.id and &1.consumer == "prompt"))
   end
 
   defp dispatch(ctx, principal, holder, subject) do

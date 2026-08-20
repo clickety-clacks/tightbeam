@@ -13,7 +13,7 @@ defmodule Tightbeam.ConditionFacts do
   substrate is forbidden to assert an agent's judgment.
   """
 
-  alias Tightbeam.{DB, EventLog, Idempotency, Wakes}
+  alias Tightbeam.{DB, EventLog, Idempotency, PatrolResponse, Wakes}
   alias Tightbeam.DB.Txn
 
   @reserved_kinds ~w(quota-recovered escalation-ruled user-alerted user-alert-cleared credential-present)
@@ -81,7 +81,9 @@ defmodule Tightbeam.ConditionFacts do
       "kind=#{kind} scope=#{scope || "nil"} by=#{origin}"
     )
 
-    %{fact_id: fact_id, ts: ts, kind: kind, scope: scope, origin: origin}
+    fact = %{fact_id: fact_id, ts: ts, kind: kind, scope: scope, origin: origin}
+    :ok = PatrolResponse.recognize_block_in_txn(txn, fact)
+    fact
   end
 
   @spec file_idempotent(DB.server(), GenServer.server(), map()) :: map() | {:error, map()}

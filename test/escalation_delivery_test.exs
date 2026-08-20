@@ -405,8 +405,7 @@ defmodule Tightbeam.EscalationDeliveryTest do
     assert live.lineage_rung == 1
     assert notified_rungs(ctx.db) == ["mid", "top"]
 
-    # Rung 2 — the ancestor is retired, so routing SKIPS it to the owner user.
-    :ok = DB.execute(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey='top'")
+    # Rung 2 — the live ancestor has no further parent, so routing reaches the owner user.
     skipped = expire_rung!(ctx, live)
     assert skipped.expecter_session_key == nil
     assert skipped.expecter_user_id == "flynn"
@@ -581,9 +580,9 @@ defmodule Tightbeam.EscalationDeliveryTest do
     end
   end
 
-  ## Proof 11 — a retired target is still delivered
+  ## Proof 11 — typed patrol output rejects a retired target
 
-  test "proof 11: targetGate 0 delivers to a retired target; the default gate still gates", ctx do
+  test "proof 11: targetGate 0 remains permissive except for typed patrol output", ctx do
     assignment = dispatch!(ctx)
     :ok = escalate!(ctx, assignment.id)
 
@@ -611,17 +610,27 @@ defmodule Tightbeam.EscalationDeliveryTest do
 
     drain!(ctx)
 
-    for wake <- [effort_wake, statute_wake] do
-      assert Wakes.get(ctx.db, wake.wake_id).state == "fired"
+    assert Wakes.get(ctx.db, effort_wake.wake_id).state == "canceled"
 
-      assert rows(ctx.db, "SELECT sessionKey FROM turns WHERE wakeId = ?1", [wake.wake_id]) == [
-               [wake.session_key]
+    assert rows(
+             ctx.db,
+             "SELECT reasonKind,outcomeKind FROM wake_cancellations WHERE wakeId=?1",
+             [effort_wake.wake_id]
+           ) == [["patrol_source_mismatch", "no_replacement"]]
+
+    assert rows(ctx.db, "SELECT sessionKey FROM turns WHERE wakeId=?1", [effort_wake.wake_id]) ==
+             []
+
+    assert Wakes.get(ctx.db, statute_wake.wake_id).state == "fired"
+
+    assert rows(ctx.db, "SELECT sessionKey FROM turns WHERE wakeId=?1", [statute_wake.wake_id]) ==
+             [
+               [statute_wake.session_key]
              ]
 
-      assert count(ctx.db, "SELECT COUNT(*) FROM messages WHERE sessionKey = ?1", [
-               wake.session_key
-             ]) >= 1
-    end
+    assert count(ctx.db, "SELECT COUNT(*) FROM messages WHERE sessionKey=?1", [
+             statute_wake.session_key
+           ]) >= 1
 
     # The control wake keeps the active-session gate: nothing was committed for it.
     assert count(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId = ?1", [control.wake_id]) == 0

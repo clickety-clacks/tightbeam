@@ -80,6 +80,7 @@ defmodule Tightbeam.Gateway do
     Model,
     ModelCatalog,
     Org,
+    PatrolResponse,
     Projection,
     Rails,
     Rules,
@@ -1053,39 +1054,52 @@ defmodule Tightbeam.Gateway do
 
     case delivery_target(txn, session_key, opts[:target_gate]) do
       nil ->
-        cancel_unavailable_supervision_controller_in_txn(txn, opts, session_key)
+        case PatrolResponse.admit_delivery_in_txn(txn, opts[:wake_id], session_key) do
+          :ordinary ->
+            cancel_unavailable_supervision_controller_in_txn(txn, opts, session_key)
+
+          _patrol_stop ->
+            :ok
+        end
+
         :skipped
 
       {target, role_ref, role_fallback} when not is_nil(target) ->
-        if Ledger.enqueueable_in_txn?(txn, target) do
-          case admit_supervision_controller_in_txn(txn, opts, target) do
-            :canceled ->
-              :skipped
+        case PatrolResponse.admit_delivery_in_txn(txn, opts[:wake_id], target) do
+          result when result in [:ordinary, :admit] ->
+            if Ledger.enqueueable_in_txn?(txn, target) do
+              case admit_supervision_controller_in_txn(txn, opts, target) do
+                :canceled ->
+                  :skipped
 
-            controller ->
-              append_and_enqueue_in_txn(
-                txn,
-                target,
-                role_ref,
-                role_fallback,
-                origin,
-                stamped,
-                Keyword.put(opts, :supervision_controller, controller)
-              )
-          end
-        else
-          case cancel_unavailable_supervision_controller_in_txn(txn, opts, target) do
-            :canceled ->
-              :skipped
+                controller ->
+                  append_and_enqueue_in_txn(
+                    txn,
+                    target,
+                    role_ref,
+                    role_fallback,
+                    origin,
+                    stamped,
+                    Keyword.put(opts, :supervision_controller, controller)
+                  )
+              end
+            else
+              case cancel_unavailable_supervision_controller_in_txn(txn, opts, target) do
+                :canceled ->
+                  :skipped
 
-            :ordinary ->
-              # Asked BEFORE the echo, because the echo commits in this same
-              # transaction and a raise is not available to take it back (it would
-              # roll the caller's wake `fired` mark back with it). The ledger still
-              # refuses independently — it is the single writer — but a message with
-              # no turn is history nobody can answer, so nothing is written at all.
-              refuse_undeliverable_turn(txn, target, origin, opts)
-          end
+                :ordinary ->
+                  # Asked BEFORE the echo, because the echo commits in this same
+                  # transaction and a raise is not available to take it back (it would
+                  # roll the caller's wake `fired` mark back with it). The ledger still
+                  # refuses independently — it is the single writer — but a message with
+                  # no turn is history nobody can answer, so nothing is written at all.
+                  refuse_undeliverable_turn(txn, target, origin, opts)
+              end
+            end
+
+          _stopped ->
+            :skipped
         end
     end
   end
@@ -3664,7 +3678,10 @@ defmodule Tightbeam.Gateway do
            wake_kind: wake_kind
          }) do
       {:armed, _generation} ->
-        :ok
+        case PatrolResponse.create_supervision_episode_in_txn(txn, wake.wake_id) do
+          {:ok, _episode} -> :ok
+          {:error, reason} -> raise Atom.to_string(reason)
+        end
 
       :duplicate ->
         # An internal supervision marker is a claim that this wake is a typed

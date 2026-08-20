@@ -1890,6 +1890,21 @@ defmodule Tightbeam.SupervisionTest do
     assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq)
     [originating] = Wakes.list_pending(ctx.db)
 
+    assert {:ok, [["asg_1", wake_id, "prod", 1, ^seq, nil]]} =
+             DB.query(
+               ctx.db,
+               "SELECT assignmentId,originatingWakeId,recoveryBranch,recoveryRung,sourceTerminalId,answerTerminalId FROM supervision_patrol_response_episodes"
+             )
+
+    assert wake_id == originating.wake_id
+
+    assert {:ok,
+            [[^wake_id, "asg_1", "holder", "supervision_episode", ^wake_id, 0, ^wake_id, nil, 0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId,assignmentId,holderKey,sourceKind,sourceRef,sourceVersion,rootWakeId,predecessorWakeId,retryOrdinal FROM patrol_output_sources"
+             )
+
     parent = self()
     registry = start_supervised!({ConnRegistry, name: :atomic_fire_registry})
 
@@ -1924,10 +1939,20 @@ defmodule Tightbeam.SupervisionTest do
       )
 
     assert :ok = Wakes.fire_due(scheduler)
-    assert_receive {:race_result, "fired", {:prodded, 2}}
+    assert_receive {:race_result, "fired", :patrol_response_acknowledged}
     assert Wakes.get(ctx.db, originating.wake_id).state == "fired"
-    assert [%{prompt: next_prompt}] = Wakes.list_pending(ctx.db)
-    assert next_prompt =~ "prod 2 of 2"
+    assert Wakes.list_pending(ctx.db) == []
+
+    assert {:ok,
+            [[answer_terminal, acknowledged_at, "patrol_answer_terminal", "process:tightbeam"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT answerTerminalId,acknowledgedAt,acknowledgmentCause,acknowledgmentPrincipal FROM supervision_patrol_response_episodes WHERE originatingWakeId=?1",
+               [originating.wake_id]
+             )
+
+    assert is_integer(answer_terminal)
+    assert is_integer(acknowledged_at)
   end
 
   test "external direct wake keeps deliver-then-mark ordering", ctx do
@@ -1966,7 +1991,7 @@ defmodule Tightbeam.SupervisionTest do
     assert Wakes.get(ctx.db, external.wake_id).state == "fired"
   end
 
-  test "repeated synchronous delivery racer advances every prod and quiesces only at Main terminus",
+  test "synchronous patrol answer quiesces at its exact delivered terminal",
        ctx do
     n = 12
     assignment(ctx.db, "asg_main", ctx.main.session_key, "main work", 2)
@@ -2008,24 +2033,16 @@ defmodule Tightbeam.SupervisionTest do
          name: :repeated_race_scheduler}
       )
 
-    for iteration <- 1..n do
-      assert :ok = Wakes.fire_due(scheduler)
-      assert_receive {:iteration_result, wake_id, "fired", result}
-      assert Wakes.get(ctx.db, wake_id).state == "fired"
-
-      if iteration < n do
-        assert result == {:prodded, iteration + 1}
-      else
-        assert result == :terminus
-      end
-    end
+    assert :ok = Wakes.fire_due(scheduler)
+    assert_receive {:iteration_result, wake_id, "fired", :patrol_response_acknowledged}
+    assert Wakes.get(ctx.db, wake_id).state == "fired"
 
     assert Wakes.pending_count(ctx.db, ctx.main.session_key) == 0
     assert Ledger.pending_count(ctx.db, ctx.main.session_key) == 0
     assert %{pendingBranch: nil} = Supervision.watermark(ctx.db, ctx.main.session_key)
 
     assert Enum.count(EventLog.lifecycle_events(ctx.db), &(&1.kind == "supervision_terminus")) ==
-             1
+             0
   end
 
   test "delivered prod and escalation prompts match the stamped templates byte for byte", ctx do
@@ -2373,6 +2390,7 @@ defmodule Tightbeam.SupervisionTest do
     assert :ok = Wakes.fire_due(scheduler)
 
     assert %{state: "canceled", fired_at: nil} = Wakes.get(ctx.db, wake.wake_id)
+    wake_id = wake.wake_id
 
     assert {:ok, [["settled"]]} =
              DB.query(
@@ -2381,20 +2399,211 @@ defmodule Tightbeam.SupervisionTest do
                [wake.wake_id]
              )
 
-    assert {:ok, [["target_unresolvable", "scheduler_delivery", "no_replacement"]]} =
+    assert {:ok,
+            [
+              [
+                "patrol_source_mismatch",
+                "tightbeam:wake-scheduler",
+                "scheduler_delivery",
+                ^wake_id,
+                "no_replacement"
+              ]
+            ]} =
              DB.query(
                ctx.db,
-               "SELECT reasonKind,causalSourceKind,outcomeKind FROM wake_cancellations WHERE wakeId=?1",
+               "SELECT reasonKind,requesterId,causalSourceKind,causalSourceId,outcomeKind FROM wake_cancellations WHERE wakeId=?1",
                [wake.wake_id]
              )
 
     assert {:ok, []} = DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [wake.wake_id])
     assert Wakes.list_pending(ctx.db) == []
 
-    assert Enum.any?(
+    assert {:ok, [[^wake_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId FROM patrol_output_sources WHERE wakeId=?1",
+               [wake.wake_id]
+             )
+  end
+
+  test "holder retirement tombstones a pending typed patrol wake and preserves its source", ctx do
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
+    terminal_seq = terminal!(ctx.db, "holder")
+
+    assert {:prodded, 1} =
+             Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", terminal_seq)
+
+    assert [wake] = Wakes.list_pending(ctx.db)
+    wake_id = wake.wake_id
+
+    retire!(ctx.db, "holder")
+
+    assert %{state: "canceled", fired_at: nil} = Wakes.get(ctx.db, wake_id)
+
+    assert {:ok, [[^wake_id, "supervision_episode"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId,sourceKind FROM patrol_output_sources WHERE wakeId=?1",
+               [wake_id]
+             )
+
+    assert {:ok, [["obligation_disposed", "disposition"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT reasonKind,outcomeKind FROM wake_cancellations WHERE wakeId=?1",
+               [wake_id]
+             )
+  end
+
+  test "a schema-valid but incoherent typed source fails closed at delivery", ctx do
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 60_000)
+
+    wake =
+      Wakes.schedule(ctx.db, %{
+        session_key: "holder",
+        origin: "process:tightbeam",
+        prompt: "malformed patrol carrier",
+        due_at: 0,
+        assignment_id: "asg_1"
+      })
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO patrol_output_sources
+                 (wakeId,assignmentId,holderKey,sourceKind,sourceRef,sourceVersion,
+                  rootWakeId,predecessorWakeId,retryOrdinal,createdAt,
+                  sourceCause,sourcePrincipal)
+               VALUES (?1,'asg_1','supervisor','supervision_episode',?1,0,
+                       ?1,NULL,0,?2,'patrol_output_scheduled','process:tightbeam')
+               """,
+               [wake.wake_id, wake.created_at]
+             )
+
+    assert :skipped =
+             Gateway.deliver_prompt(
+               "holder",
+               "process:tightbeam",
+               wake.prompt,
+               db: ctx.db,
+               wake_id: wake.wake_id,
+               sender: wake.origin,
+               target_gate: wake,
+               fire_wake_in_txn: true,
+               assignment_id: "asg_1"
+             )
+
+    assert %{state: "canceled", fired_at: nil} = Wakes.get(ctx.db, wake.wake_id)
+
+    assert {:ok, [["patrol_source_mismatch", "no_replacement"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT reasonKind,outcomeKind FROM wake_cancellations WHERE wakeId=?1",
+               [wake.wake_id]
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM patrol_output_sources WHERE wakeId=?1",
+               [wake.wake_id]
+             )
+
+    assert {:ok, []} = DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [wake.wake_id])
+
+    assert :skipped =
+             Gateway.deliver_prompt(
+               "holder",
+               "process:tightbeam",
+               wake.prompt,
+               db: ctx.db,
+               wake_id: wake.wake_id,
+               sender: wake.origin,
+               target_gate: wake,
+               fire_wake_in_txn: true,
+               assignment_id: "asg_1"
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wake_cancellations WHERE wakeId=?1",
+               [wake.wake_id]
+             )
+  end
+
+  test "destination retirement creates one coherent typed supervision retry", ctx do
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
+    terminal_seq = terminal!(ctx.db, "holder")
+
+    assert {:escalated, 1, "supervisor"} =
+             Supervision.evaluate(ctx.db, ctx.handlers, 0, "holder", terminal_seq)
+
+    assert [root] =
+             Wakes.list_pending(ctx.db)
+             |> Enum.filter(&(&1.assignment_id == "asg_1"))
+
+    retire!(ctx.db, "supervisor")
+
+    assert {:ok,
+            [
+              [root_wake_id, nil, 0, root_wake_id, "canceled"],
+              [retry_wake_id, root_wake_id, 1, root_wake_id, "pending"]
+            ]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT p.wakeId,p.predecessorWakeId,p.retryOrdinal,p.rootWakeId,w.state
+               FROM patrol_output_sources p JOIN wakes w ON w.wakeId=p.wakeId
+               WHERE p.rootWakeId=?1 ORDER BY p.retryOrdinal
+               """,
+               [root.wake_id]
+             )
+
+    assert retry_wake_id != root_wake_id
+
+    assert {:ok, [["target_retired", "replacement", ^retry_wake_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT reasonKind,outcomeKind,replacementWakeId FROM wake_cancellations WHERE wakeId=?1",
+               [root_wake_id]
+             )
+  end
+
+  test "holder retirement terminalizes an already queued typed patrol turn once", ctx do
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
+    terminal_seq = terminal!(ctx.db, "holder")
+
+    assert {:prodded, 1} =
+             Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", terminal_seq)
+
+    assert [wake] = Wakes.list_pending(ctx.db)
+    assert :appended = admit_supervision_wake!(ctx.db, wake)
+
+    assert {:ok, [[turn_seq, "queued"]]} =
+             DB.query(ctx.db, "SELECT seq,status FROM turns WHERE wakeId=?1", [wake.wake_id])
+
+    retire!(ctx.db, "holder")
+
+    assert {:ok, [[^turn_seq, "canceled", ended_at]]} =
+             DB.query(ctx.db, "SELECT seq,status,endedAt FROM turns WHERE wakeId=?1", [
+               wake.wake_id
+             ])
+
+    assert is_integer(ended_at)
+
+    assert Enum.count(
              EventLog.lifecycle_events(ctx.db),
-             &(&1.kind == "supervision_controller_unavailable" and &1.subject == "asg_1")
-           )
+             &(&1.kind == "patrol_turn_stopped" and &1.subject == to_string(turn_seq))
+           ) == 1
+
+    retire!(ctx.db, "holder")
+
+    assert Enum.count(
+             EventLog.lifecycle_events(ctx.db),
+             &(&1.kind == "patrol_turn_stopped" and &1.subject == to_string(turn_seq))
+           ) == 1
   end
 
   test "transient refusal preserves the outbox and a later edge drains without recounting", ctx do
@@ -2938,10 +3147,9 @@ defmodule Tightbeam.SupervisionTest do
              &(&1.kind == "supervision_wake_suppressed" and &1.subject == wake_id)
            )
 
-    # The rung is REFUNDED: schedule claimed prodCount 1, the suppressed fire
-    # voided it. Without this, suppressed prods consume the ladder and a
-    # blocked holder gets escalated over — the SMOKE 42 shrdlu finding.
-    assert %{prodCount: 0} = Supervision.prod_state(ctx.db, "asg_1")
+    # Block recognition does not mutate counters or rungs. The charged prod
+    # remains durable while the exact wake is canceled without replacement.
+    assert %{prodCount: 1} = Supervision.prod_state(ctx.db, "asg_1")
 
     # An agent's own wake to the SAME blocked session still delivers — the
     # fact suppresses supervision's mail, never anyone else's.

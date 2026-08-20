@@ -20,7 +20,17 @@ defmodule Tightbeam.EffortCheckin do
   wake.
   """
 
-  alias Tightbeam.{CausalEvents, DB, Escalation, Org, Placement, Supervision, Wakes}
+  alias Tightbeam.{
+    CausalEvents,
+    DB,
+    Escalation,
+    Org,
+    PatrolResponse,
+    Placement,
+    Supervision,
+    Wakes
+  }
+
   alias Tightbeam.DB.Txn
 
   @origin "process:tightbeam"
@@ -421,77 +431,90 @@ defmodule Tightbeam.EffortCheckin do
   defp probe_in_txn(txn, config, wake, inspection) do
     case generation_for_wake_in_txn(txn, wake.wake_id) do
       %{state: "armed"} = generation ->
-        open? =
-          Txn.q(
+        admission =
+          PatrolResponse.admit_internal_in_txn(
             txn,
-            "SELECT 1 FROM assignments WHERE id = ?1 AND state = 'open'",
-            [generation.assignment_id]
-          ) == [[1]]
-
-        if open? do
-          Txn.q(
-            txn,
-            "UPDATE effort_checkin_generations SET state = 'probed' WHERE assignmentId = ?1 AND generation = ?2 AND wakeId = ?3 AND state = 'armed'",
-            [generation.assignment_id, generation.generation, wake.wake_id]
+            wake.wake_id,
+            "effort_generation_probe"
           )
 
-          if Txn.changes(txn) == 1 do
-            mark_wake_fired(txn, wake.wake_id)
-            channels = channels(txn, generation, inspection)
-            session = session_in_txn(txn, generation.holder_key)
+        cond do
+          match?({:blocked, _}, admission) ->
+            {:blocked, stop} = admission
+            blocked_probe_in_txn(txn, config, wake, generation, stop)
 
-            if effect?(channels) do
-              insert_generation(
-                txn,
-                config,
-                generation.assignment_id,
-                session,
-                generation.root,
-                inspection,
-                generation.generation + 1,
-                1,
-                0
-              )
-
-              nil
-            else
-              evidence = evidence(generation, channels)
-
-              # The observation consumed this generation's stamp and laid the
-              # next one, so the row advances to it even when nothing moved:
-              # a later `continue` re-arms against a stamp that still exists.
+          admission in [:admit, :ordinary] and
               Txn.q(
                 txn,
-                "UPDATE effort_checkin_generations SET evidence = ?3, baseline = ?4 WHERE assignmentId = ?1 AND generation = ?2",
-                [
-                  generation.assignment_id,
-                  generation.generation,
-                  JSON.encode!(evidence),
-                  encode_observation(advanced_baseline(generation.baseline, inspection))
-                ]
-              )
+                "SELECT 1 FROM assignments WHERE id = ?1 AND state = 'open'",
+                [generation.assignment_id]
+              ) == [[1]] ->
+            Txn.q(
+              txn,
+              "UPDATE effort_checkin_generations SET state = 'probed' WHERE assignmentId = ?1 AND generation = ?2 AND wakeId = ?3 AND state = 'armed'",
+              [generation.assignment_id, generation.generation, wake.wake_id]
+            )
 
-              if generation.agent_prodded == 0 do
-                prod_holder_in_txn(txn, generation, evidence)
+            if Txn.changes(txn) == 1 do
+              mark_wake_fired(txn, wake.wake_id)
+              channels = channels(txn, generation, inspection)
+              session = session_in_txn(txn, generation.holder_key)
 
+              if effect?(channels) do
                 insert_generation(
                   txn,
                   config,
                   generation.assignment_id,
                   session,
                   generation.root,
-                  advanced_baseline(generation.baseline, inspection),
+                  inspection,
                   generation.generation + 1,
-                  generation.multiplier,
-                  1
+                  1,
+                  0
                 )
 
                 nil
               else
-                open_request_in_txn(txn, config, generation, evidence)
+                evidence = evidence(generation, channels)
+
+                # The observation consumed this generation's stamp and laid the
+                # next one, so the row advances to it even when nothing moved:
+                # a later `continue` re-arms against a stamp that still exists.
+                Txn.q(
+                  txn,
+                  "UPDATE effort_checkin_generations SET evidence = ?3, baseline = ?4 WHERE assignmentId = ?1 AND generation = ?2",
+                  [
+                    generation.assignment_id,
+                    generation.generation,
+                    JSON.encode!(evidence),
+                    encode_observation(advanced_baseline(generation.baseline, inspection))
+                  ]
+                )
+
+                if generation.agent_prodded == 0 do
+                  prod_holder_in_txn(txn, generation, evidence)
+
+                  insert_generation(
+                    txn,
+                    config,
+                    generation.assignment_id,
+                    session,
+                    generation.root,
+                    advanced_baseline(generation.baseline, inspection),
+                    generation.generation + 1,
+                    generation.multiplier,
+                    1
+                  )
+
+                  nil
+                else
+                  open_request_in_txn(txn, config, generation, evidence)
+                end
               end
             end
-          end
+
+          true ->
+            nil
         end
 
       _ ->
@@ -499,12 +522,53 @@ defmodule Tightbeam.EffortCheckin do
     end
   end
 
-  defp deadline_in_txn(txn, config, wake) do
-    case request_for_deadline(txn, wake.wake_id) do
-      nil ->
-        nil
+  defp blocked_probe_in_txn(txn, config, wake, generation, stop) do
+    Txn.q(
+      txn,
+      "UPDATE effort_checkin_generations SET state='probed',evidence=?4 WHERE assignmentId=?1 AND generation=?2 AND wakeId=?3 AND state='armed'",
+      [
+        generation.assignment_id,
+        generation.generation,
+        wake.wake_id,
+        JSON.encode!(%{
+          assignmentId: generation.assignment_id,
+          effortGeneration: generation.generation,
+          outcome: "work_blocked",
+          conditionFactId: stop.fact_id
+        })
+      ]
+    )
 
-      request ->
+    if Txn.changes(txn) == 1 do
+      mark_wake_fired(txn, wake.wake_id)
+      session = session_in_txn(txn, generation.holder_key)
+
+      insert_generation(
+        txn,
+        config,
+        generation.assignment_id,
+        session,
+        generation.root,
+        generation.baseline,
+        generation.generation + 1,
+        generation.multiplier,
+        generation.agent_prodded
+      )
+    end
+
+    nil
+  end
+
+  defp deadline_in_txn(txn, config, wake) do
+    admission =
+      PatrolResponse.admit_internal_in_txn(
+        txn,
+        wake.wake_id,
+        "effort_decision_deadline"
+      )
+
+    case {admission, request_for_deadline(txn, wake.wake_id)} do
+      {result, request} when result in [:admit, :ordinary] and not is_nil(request) ->
         next = advance_expecter(txn, request)
         deadline = now() + deadline_ms(config)
         assignment = assignment_in_txn(txn, request.assignment_id)
@@ -533,6 +597,34 @@ defmodule Tightbeam.EffortCheckin do
 
         case outcome do
           {:advanced, advanced} ->
+            existing_deadline_source =
+              PatrolResponse.existing_effort_source_in_txn(
+                txn,
+                "effort_decision_deadline",
+                advanced.id,
+                advanced.lineage_rung
+              )
+
+            {:ok, _source} =
+              if existing_deadline_source do
+                PatrolResponse.create_effort_delivery_retry_in_txn(
+                  txn,
+                  replacement.wake_id,
+                  "effort_decision_deadline",
+                  advanced.id,
+                  advanced.lineage_rung,
+                  wake.wake_id
+                )
+              else
+                PatrolResponse.create_effort_source_in_txn(
+                  txn,
+                  replacement.wake_id,
+                  "effort_decision_deadline",
+                  advanced.id,
+                  advanced.lineage_rung
+                )
+              end
+
             mark_wake_fired(txn, wake.wake_id)
 
             # The request row is overwritten in place and the replacement deadline
@@ -579,6 +671,9 @@ defmodule Tightbeam.EffortCheckin do
             cancel_pending_wake_in_txn!(txn, replacement.wake_id, command)
             nil
         end
+
+      _ ->
+        nil
     end
   end
 
@@ -706,6 +801,15 @@ defmodule Tightbeam.EffortCheckin do
 
     case outcome do
       {:inserted, request} ->
+        {:ok, _source} =
+          PatrolResponse.create_effort_source_in_txn(
+            txn,
+            deadline.wake_id,
+            "effort_decision_deadline",
+            request.id,
+            request.lineage_rung
+          )
+
         request
 
       :conflict ->
@@ -807,6 +911,15 @@ defmodule Tightbeam.EffortCheckin do
         work_items
       ]
     )
+
+    {:ok, _source} =
+      PatrolResponse.create_effort_source_in_txn(
+        txn,
+        wake.wake_id,
+        "effort_generation_probe",
+        assignment_id,
+        generation
+      )
 
     generation_for_assignment_in_txn(txn, assignment_id, generation)
   end
@@ -1121,22 +1234,34 @@ defmodule Tightbeam.EffortCheckin do
   # It rides the ordinary active-session gate — a holder that is not there to
   # answer is the owner's decision at the next bracket, not a second prod.
   defp prod_holder_in_txn(txn, generation, evidence) do
-    Wakes.schedule_in_txn(txn, %{
-      session_key: generation.holder_key,
-      origin: @origin,
-      prompt:
-        "[effort check-in] Assignment #{generation.assignment_id}: " <>
-          channel_sentence(evidence) <>
-          " Record only a new material result or evidence, an exact new blocker or refusal, " <>
-          "a bounded decision request, or one new, unexpired bounded checkpoint. " <>
-          "A checkpoint must name the next action or condition and its deadline. " <>
-          "Use `artifact-record` for anything produced outside this workdir " <>
-          "(another machine, a service, a conversation). Do not file generic or duplicate status. " <>
-          "If no reporting exception applies, schedule a concrete continuation wake that names " <>
-          "the next action or dependency condition and when to resume.",
-      due_at: now(),
-      assignment_id: generation.assignment_id
-    })
+    wake =
+      Wakes.schedule_in_txn(txn, %{
+        session_key: generation.holder_key,
+        origin: @origin,
+        prompt:
+          "[effort check-in] Assignment #{generation.assignment_id}: " <>
+            channel_sentence(evidence) <>
+            " Record only a new material result or evidence, an exact new blocker or refusal, " <>
+            "a bounded decision request, or one new, unexpired bounded checkpoint. " <>
+            "A checkpoint must name the next action or condition and its deadline. " <>
+            "Use `artifact-record` for anything produced outside this workdir " <>
+            "(another machine, a service, a conversation). Do not file generic or duplicate status. " <>
+            "If no reporting exception applies, schedule a concrete continuation wake that names " <>
+            "the next action or dependency condition and when to resume.",
+        due_at: now(),
+        assignment_id: generation.assignment_id
+      })
+
+    {:ok, _source} =
+      PatrolResponse.create_effort_source_in_txn(
+        txn,
+        wake.wake_id,
+        "effort_generation_prod",
+        generation.assignment_id,
+        generation.generation
+      )
+
+    wake
   end
 
   defp channel_sentence(evidence) do

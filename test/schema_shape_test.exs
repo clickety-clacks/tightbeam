@@ -43,14 +43,82 @@ defmodule Tightbeam.SchemaShapeTest do
   test "a fresh database is created and stamped", %{db: db} do
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v3"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v4"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     # Idempotent: booting twice is the ordinary case, not a shape change.
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v3"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v4"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
+  end
+
+  test "patrol acknowledgment schema is an exact replay-stable closed set", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:ok, [[8]]} =
+             DB.query(
+               db,
+               """
+               SELECT COUNT(*) FROM sqlite_schema
+               WHERE name IN (
+                 'patrol_output_sources',
+                 'patrol_output_source_immutable',
+                 'patrol_output_source_immutable_delete',
+                 'supervision_patrol_response_episodes',
+                 'supervision_patrol_episode_insert_coherent',
+                 'supervision_patrol_episode_source_immutable',
+                 'supervision_patrol_acknowledgment_one_way',
+                 'supervision_patrol_episode_immutable_delete'
+               )
+               """
+             )
+
+    assert :ok = Schema.ensure_all(db)
+  end
+
+  test "an incomplete patrol acknowledgment shape refuses startup without repair", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+    assert :ok = DB.execute(db, "DROP TRIGGER supervision_patrol_episode_immutable_delete")
+
+    error =
+      assert_raise Schema.ShapeError, fn ->
+        Schema.ensure_all(db)
+      end
+
+    assert error.message =~ "incompatible_patrol_response_acknowledgment_v1"
+    assert error.message =~ "incomplete additive shape"
+
+    assert {:ok, []} =
+             DB.query(
+               db,
+               "SELECT 1 FROM sqlite_schema WHERE name='supervision_patrol_episode_immutable_delete'"
+             )
+  end
+
+  test "an unequal patrol output-source image refuses startup", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+    assert :ok = DB.execute(db, "DROP TRIGGER patrol_output_source_immutable")
+
+    assert :ok =
+             DB.execute(
+               db,
+               """
+               CREATE TRIGGER patrol_output_source_immutable
+               BEFORE UPDATE ON patrol_output_sources
+               BEGIN
+                 SELECT RAISE(ABORT, 'different immutable source rule');
+               END
+               """
+             )
+
+    error =
+      assert_raise Schema.ShapeError, fn ->
+        Schema.ensure_all(db)
+      end
+
+    assert error.message =~ "incompatible_patrol_output_sources_v1"
+    assert error.message =~ "unequal schema image for patrol_output_source_immutable"
   end
 
   test "the shared liveness activation creates one exact additive shape", %{db: db} do
@@ -232,7 +300,7 @@ defmodule Tightbeam.SchemaShapeTest do
     assert {:ok, ^before_rows} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
     assert {:ok, []} = DB.query(db, "SELECT wakeId FROM wake_cancellations")
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v3"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v4"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
   end
 
@@ -315,7 +383,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "some-later-shape"
-    assert error.message =~ "coordination-fabric-v1-phase1-v3"
+    assert error.message =~ "coordination-fabric-v1-phase1-v4"
   end
 
   # Sol xhigh review round 2, finding 2 (wave 1): `classElection`'s CHECK
@@ -377,7 +445,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-classes-v1"
-    assert error.message =~ "coordination-fabric-v1-phase1-v3"
+    assert error.message =~ "coordination-fabric-v1-phase1-v4"
     assert error.message =~ "no migration"
 
     # It REFUSED — it did not repair or widen the constraint in place.
@@ -497,7 +565,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-v1-phase1"
-    assert error.message =~ "coordination-fabric-v1-phase1-v3"
+    assert error.message =~ "coordination-fabric-v1-phase1-v4"
     assert error.message =~ "no migration"
 
     # It REFUSED — it did not repair or relax the constraint in place.
@@ -568,7 +636,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-classes-v2"
-    assert error.message =~ "coordination-fabric-v1-phase1-v3"
+    assert error.message =~ "coordination-fabric-v1-phase1-v4"
     assert error.message =~ "no migration"
 
     # It REFUSED — the merged build's decision_requests columns were never
@@ -681,7 +749,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-v1-phase1-v2"
-    assert error.message =~ "coordination-fabric-v1-phase1-v3"
+    assert error.message =~ "coordination-fabric-v1-phase1-v4"
     assert error.message =~ "no migration"
 
     # It REFUSED — the merged build's wakes class/delivery columns were never

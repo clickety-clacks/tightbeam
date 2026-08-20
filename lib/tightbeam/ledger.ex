@@ -17,7 +17,7 @@ defmodule Tightbeam.Ledger do
   - No automatic retries: `failed_unknown` is terminal; nothing here re-sends.
   """
 
-  alias Tightbeam.DB
+  alias Tightbeam.{DB, PatrolResponse}
   alias Tightbeam.DB.Txn
 
   require Logger
@@ -204,71 +204,74 @@ defmodule Tightbeam.Ledger do
             :busy
 
           [] ->
-            selected_mind =
-              case Txn.q(
-                     txn,
-                     """
-                     SELECT model, thinkingLevel, modelContext, harness
-                     FROM sessions WHERE sessionKey = ?1
-                     """,
-                     [session_key]
-                   ) do
-                [[model, effort, context, harness]] -> {model, effort, context, harness}
-                [] -> {nil, nil, nil, nil}
-              end
-
-            Txn.q(
-              txn,
-              """
-                UPDATE turns
-                SET status = 'running', owner = ?2, startedAt = ?3,
-                    model = ?4, harness = ?5, thinkingLevel = ?6, modelContext = ?7
-                WHERE seq = (SELECT t.seq FROM turns AS t
-                             WHERE t.sessionKey = ?1 AND t.status = 'queued'
-                               AND EXISTS (
-                                 SELECT 1 FROM sessions AS s
-                                 WHERE s.sessionKey = t.sessionKey AND s.state = 'active'
-                               )
-                             ORDER BY seq LIMIT 1)
-                  AND status = 'queued'
-              """,
-              [
-                session_key,
-                owner,
-                now,
-                elem(selected_mind, 0),
-                elem(selected_mind, 3),
-                elem(selected_mind, 1),
-                elem(selected_mind, 2)
-              ]
-            )
-
-            if Txn.changes(txn) == 1 do
-              [[seq, message_id, origin, prompt, wake_id]] =
-                Txn.q(
-                  txn,
-                  """
-                    SELECT seq, messageId, origin, prompt, wakeId FROM turns
-                    WHERE sessionKey = ?1 AND status = 'running'
-                  """,
-                  [session_key]
-                )
-
-              {:ok,
-               %{
-                 seq: seq,
-                 message_id: message_id,
-                 origin: origin,
-                 prompt: prompt,
-                 wake_id: wake_id
-               }}
-            else
-              no_claim(txn, session_key)
-            end
+            claim_candidate_in_txn(txn, session_key, owner, now)
         end
       end)
 
     result
+  end
+
+  defp claim_candidate_in_txn(txn, session_key, owner, now) do
+    case Txn.q(
+           txn,
+           "SELECT seq FROM turns WHERE sessionKey=?1 AND status='queued' ORDER BY seq LIMIT 1",
+           [session_key]
+         ) do
+      [] ->
+        no_claim(txn, session_key)
+
+      [[seq]] ->
+        case PatrolResponse.admit_turn_in_txn(txn, seq, now) do
+          :canceled -> claim_candidate_in_txn(txn, session_key, owner, now)
+          _ -> claim_selected_in_txn(txn, session_key, owner, now, seq)
+        end
+    end
+  end
+
+  defp claim_selected_in_txn(txn, session_key, owner, now, seq) do
+    selected_mind =
+      case Txn.q(
+             txn,
+             "SELECT model,thinkingLevel,modelContext,harness FROM sessions WHERE sessionKey=?1",
+             [session_key]
+           ) do
+        [[model, effort, context, harness]] -> {model, effort, context, harness}
+        [] -> {nil, nil, nil, nil}
+      end
+
+    Txn.q(
+      txn,
+      """
+      UPDATE turns
+      SET status='running',owner=?2,startedAt=?3,model=?4,harness=?5,
+          thinkingLevel=?6,modelContext=?7
+      WHERE seq=?1 AND status='queued'
+        AND EXISTS (SELECT 1 FROM sessions s WHERE s.sessionKey=?8 AND s.state='active')
+      """,
+      [
+        seq,
+        owner,
+        now,
+        elem(selected_mind, 0),
+        elem(selected_mind, 3),
+        elem(selected_mind, 1),
+        elem(selected_mind, 2),
+        session_key
+      ]
+    )
+
+    if Txn.changes(txn) == 1 do
+      [[^seq, message_id, origin, prompt, wake_id]] =
+        Txn.q(
+          txn,
+          "SELECT seq,messageId,origin,prompt,wakeId FROM turns WHERE seq=?1 AND status='running'",
+          [seq]
+        )
+
+      {:ok, %{seq: seq, message_id: message_id, origin: origin, prompt: prompt, wake_id: wake_id}}
+    else
+      no_claim(txn, session_key)
+    end
   end
 
   # Nothing moved. Either the queue is empty, or it holds work whose session
@@ -387,7 +390,13 @@ defmodule Tightbeam.Ledger do
       [seq, terminal, now, error]
     )
 
-    Txn.changes(txn) == 1
+    won = Txn.changes(txn) == 1
+
+    if won and terminal == "delivered" do
+      PatrolResponse.acknowledge_in_txn(txn, seq)
+    end
+
+    won
   end
 
   @doc """
