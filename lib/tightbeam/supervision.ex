@@ -1348,49 +1348,54 @@ defmodule Tightbeam.Supervision do
                 :rebased
 
               :duplicate ->
-                if Tightbeam.PatrolResponse.acknowledged_terminal_in_txn?(
-                     txn,
-                     assignment.id,
-                     terminal_seq
-                   ) do
-                  write_terminal_watermark_in_txn(txn, session_key, terminal_seq)
-                  :patrol_response_acknowledged
-                else
-                  case state do
-                    "claimed" ->
-                      write_terminal_watermark_in_txn(txn, session_key, terminal_seq)
-                      :claimed
+                cond do
+                  terminal_watermarked_in_txn?(txn, session_key, terminal_seq) ->
+                    :duplicate
 
-                    "armed" when due_at > evaluation_clock ->
-                      write_terminal_watermark_in_txn(txn, session_key, terminal_seq)
-                      :not_due
+                  Tightbeam.PatrolResponse.acknowledged_terminal_in_txn?(
+                    txn,
+                    assignment.id,
+                    terminal_seq
+                  ) ->
+                    write_terminal_watermark_in_txn(txn, session_key, terminal_seq)
+                    :patrol_response_acknowledged
 
-                    "armed" ->
-                      if due_gate?(txn, assignment.id, session_key) do
-                        :controlled
-                      else
-                        case claim_entitlement_in_txn(
-                               txn,
-                               assignment,
-                               generation,
-                               due_at,
-                               last_attempt,
-                               basis_kind,
-                               basis_id,
-                               evaluation_clock,
-                               n,
-                               terminal_seq,
-                               "new_terminal"
-                             ) do
-                          :ok -> :claimed
-                          :stale -> :duplicate
+                  true ->
+                    case state do
+                      "claimed" ->
+                        write_terminal_watermark_in_txn(txn, session_key, terminal_seq)
+                        :claimed
+
+                      "armed" when due_at > evaluation_clock ->
+                        write_terminal_watermark_in_txn(txn, session_key, terminal_seq)
+                        :not_due
+
+                      "armed" ->
+                        if due_gate?(txn, assignment.id, session_key) do
+                          :controlled
+                        else
+                          case claim_entitlement_in_txn(
+                                 txn,
+                                 assignment,
+                                 generation,
+                                 due_at,
+                                 last_attempt,
+                                 basis_kind,
+                                 basis_id,
+                                 evaluation_clock,
+                                 n,
+                                 terminal_seq,
+                                 "new_terminal"
+                               ) do
+                            :ok -> :claimed
+                            :stale -> :duplicate
+                          end
                         end
-                      end
 
-                    _ ->
-                      write_terminal_watermark_in_txn(txn, session_key, terminal_seq)
-                      :duplicate
-                  end
+                      _ ->
+                        write_terminal_watermark_in_txn(txn, session_key, terminal_seq)
+                        :duplicate
+                    end
                 end
             end
         end
@@ -1421,6 +1426,14 @@ defmodule Tightbeam.Supervision do
       :duplicate ->
         :duplicate
     end
+  end
+
+  defp terminal_watermarked_in_txn?(txn, session_key, terminal_seq) do
+    Txn.q(
+      txn,
+      "SELECT 1 FROM supervision_watermarks WHERE sessionKey=?1 AND lastEvaluatedTerminal=?2",
+      [session_key, terminal_seq]
+    ) == [[1]]
   end
 
   defp write_terminal_watermark_in_txn(_txn, _session_key, nil), do: :ok

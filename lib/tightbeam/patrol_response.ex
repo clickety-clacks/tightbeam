@@ -244,6 +244,21 @@ defmodule Tightbeam.PatrolResponse do
 
   @doc false
   def create_supervision_episode_in_txn(%Txn{} = txn, wake_id) when is_binary(wake_id) do
+    case episode_by_wake(txn, wake_id) do
+      nil ->
+        create_new_supervision_episode_in_txn(txn, wake_id)
+
+      stored ->
+        if stored_episode_source_equal?(txn, stored),
+          do: {:ok, stored},
+          else: {:error, :patrol_response_episode_conflict}
+    end
+  end
+
+  def create_supervision_episode_in_txn(%Txn{}, _wake_id),
+    do: {:error, :invalid_patrol_response_episode}
+
+  defp create_new_supervision_episode_in_txn(txn, wake_id) do
     case supervision_episode_input(txn, wake_id) do
       {:ok, episode} ->
         with {:ok, stored} <- insert_or_equal_episode(txn, episode),
@@ -267,9 +282,6 @@ defmodule Tightbeam.PatrolResponse do
         {:error, :invalid_patrol_response_episode}
     end
   end
-
-  def create_supervision_episode_in_txn(%Txn{}, _wake_id),
-    do: {:error, :invalid_patrol_response_episode}
 
   @doc false
   def create_effort_source_in_txn(%Txn{} = txn, wake_id, source_kind, source_ref, source_version)
@@ -804,6 +816,33 @@ defmodule Tightbeam.PatrolResponse do
 
   defp episode_equal?(_, _), do: false
 
+  defp stored_episode_source_equal?(txn, episode) do
+    case source_for_wake(txn, episode.originating_wake_id) do
+      %{
+        wake_id: wake_id,
+        assignment_id: assignment_id,
+        holder_key: holder_key,
+        destination: destination,
+        source_kind: "supervision_episode",
+        source_ref: source_ref,
+        source_version: 0,
+        root_wake_id: root_wake_id,
+        predecessor_wake_id: nil,
+        retry_ordinal: 0,
+        created_at: created_at
+      } ->
+        wake_id == episode.originating_wake_id and
+          assignment_id == episode.assignment_id and
+          holder_key == destination and
+          source_ref == episode.originating_wake_id and
+          root_wake_id == episode.originating_wake_id and
+          created_at == episode.scheduled_at
+
+      _ ->
+        false
+    end
+  end
+
   defp effort_source_input(
          txn,
          wake_id,
@@ -1050,55 +1089,56 @@ defmodule Tightbeam.PatrolResponse do
 
   defp coherent_retry_chain?(txn, wake_id) do
     case source_for_wake(txn, wake_id) do
-      %{retry_ordinal: 0, predecessor_wake_id: nil, root_wake_id: ^wake_id} ->
-        true
+      %{root_wake_id: root, retry_ordinal: ordinal} = tail ->
+        chain = sources_for_root(txn, root)
 
-      %{retry_ordinal: ordinal, root_wake_id: root} when ordinal > 0 ->
-        [[count, min_ordinal, max_ordinal]] =
-          Txn.q(
-            txn,
-            """
-            WITH RECURSIVE chain(wakeId,predecessorWakeId,retryOrdinal) AS (
-              SELECT wakeId,predecessorWakeId,retryOrdinal FROM patrol_output_sources WHERE wakeId=?1
-              UNION ALL
-              SELECT p.wakeId,p.predecessorWakeId,p.retryOrdinal
-              FROM patrol_output_sources p JOIN chain c ON p.wakeId=c.predecessorWakeId
-            )
-            SELECT COUNT(*),MIN(retryOrdinal),MAX(retryOrdinal) FROM chain
-            """,
-            [wake_id]
-          )
+        identity_coherent =
+          chain
+          |> Enum.with_index()
+          |> Enum.all?(fn {member, index} ->
+            member.retry_ordinal == index and
+              retry_member_identity_equal?(member, tail) and
+              retry_predecessor_equal?(chain, member, index, root)
+          end)
 
-        count == ordinal + 1 and min_ordinal == 0 and max_ordinal == ordinal and
-          Txn.q(
-            txn,
-            "SELECT 1 FROM patrol_output_sources WHERE wakeId=?1 AND rootWakeId=?1 AND retryOrdinal=0",
-            [root]
-          ) == [[1]] and retry_cancellations_coherent?(txn, wake_id)
+        length(chain) == ordinal + 1 and
+          List.last(chain).wake_id == wake_id and
+          identity_coherent and
+          retry_cancellations_coherent?(txn, chain)
 
       _ ->
         false
     end
   end
 
-  defp retry_cancellations_coherent?(txn, wake_id) do
-    Txn.q(
-      txn,
-      """
-      WITH RECURSIVE chain(wakeId,predecessorWakeId,retryOrdinal) AS (
-        SELECT wakeId,predecessorWakeId,retryOrdinal FROM patrol_output_sources WHERE wakeId=?1
-        UNION ALL
-        SELECT p.wakeId,p.predecessorWakeId,p.retryOrdinal
-        FROM patrol_output_sources p JOIN chain c ON p.wakeId=c.predecessorWakeId
-      )
-      SELECT COUNT(*)
-      FROM chain child
-      JOIN wake_cancellations c ON c.wakeId=child.predecessorWakeId
-        AND c.outcomeKind='replacement' AND c.replacementWakeId=child.wakeId
-      WHERE child.retryOrdinal>0
-      """,
-      [wake_id]
-    ) == [[source_for_wake(txn, wake_id).retry_ordinal]]
+  defp retry_member_identity_equal?(member, tail) do
+    Enum.all?(
+      ~w(assignment_id holder_key source_kind source_ref source_version root_wake_id)a,
+      &(Map.fetch!(member, &1) == Map.fetch!(tail, &1))
+    )
+  end
+
+  defp retry_predecessor_equal?(_chain, member, 0, root) do
+    member.wake_id == root and is_nil(member.predecessor_wake_id)
+  end
+
+  defp retry_predecessor_equal?(chain, member, index, _root) do
+    member.predecessor_wake_id == Enum.at(chain, index - 1).wake_id
+  end
+
+  defp retry_cancellations_coherent?(txn, chain) do
+    chain
+    |> Enum.chunk_every(2, 1, :discard)
+    |> Enum.all?(fn [predecessor, successor] ->
+      Txn.q(
+        txn,
+        """
+        SELECT 1 FROM wake_cancellations
+        WHERE wakeId=?1 AND outcomeKind='replacement' AND replacementWakeId=?2
+        """,
+        [predecessor.wake_id, successor.wake_id]
+      ) == [[1]]
+    end)
   end
 
   defp admission_stop(txn, source, destination, expected_wake_state, admission_clock) do
@@ -1437,6 +1477,21 @@ defmodule Tightbeam.PatrolResponse do
       WHERE p.assignmentId=?1 AND w.state=?2 ORDER BY p.createdAt,p.wakeId
       """,
       [assignment_id, state]
+    )
+    |> Enum.map(&source_from_row/1)
+  end
+
+  defp sources_for_root(txn, root_wake_id) do
+    Txn.q(
+      txn,
+      """
+      SELECT p.wakeId,p.assignmentId,p.holderKey,p.sourceKind,p.sourceRef,
+             p.sourceVersion,p.rootWakeId,p.predecessorWakeId,p.retryOrdinal,
+             p.createdAt,w.sessionKey
+      FROM patrol_output_sources p JOIN wakes w ON w.wakeId=p.wakeId
+      WHERE p.rootWakeId=?1 ORDER BY p.retryOrdinal
+      """,
+      [root_wake_id]
     )
     |> Enum.map(&source_from_row/1)
   end

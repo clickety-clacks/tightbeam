@@ -11,6 +11,7 @@ defmodule Tightbeam.SupervisionTest do
     Gateway,
     Ledger,
     Org,
+    PatrolResponse,
     Projection,
     RailRemedy,
     Roles,
@@ -356,7 +357,7 @@ defmodule Tightbeam.SupervisionTest do
   # sidecar rows carry transfer evidence but a NULL chargedGeneration. Before
   # any receipt exists they are real heard evidence (NULL fails >= silently);
   # after a receipt they belong to history like everything else pre-repair.
-  test "a NULL-generation transfer counts before the first receipt and not after", ctx do
+  test "F2 retirement elevation remains ordinary transfer evidence outside patrol sources", ctx do
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
 
     # The sidecar's coherence trigger demands a matching escalation wake row
@@ -406,6 +407,12 @@ defmodule Tightbeam.SupervisionTest do
     {:ok, _} =
       DB.query(ctx.db, "UPDATE wakes SET state='fired', firedAt=1 WHERE wakeId='w_legacy'")
 
+    assert {:ok, [[0, 0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT (SELECT COUNT(*) FROM supervision_patrol_response_episodes WHERE originatingWakeId='w_legacy'),(SELECT COUNT(*) FROM patrol_output_sources WHERE wakeId='w_legacy')"
+             )
+
     seq1 = terminal!(ctx.db, "holder")
 
     # One heard escalation at n=1: the ladder honors the durable transfer.
@@ -434,7 +441,7 @@ defmodule Tightbeam.SupervisionTest do
     assert %{stalledAt: nil} = Supervision.prod_state(ctx.db, "asg_1")
   end
 
-  test "an internal effort wake does not suppress the no-filing prod", ctx do
+  test "F2 an internal effort wake remains ordinary and does not suppress the prod", ctx do
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
 
     Wakes.schedule(ctx.db, %{
@@ -449,7 +456,7 @@ defmodule Tightbeam.SupervisionTest do
     assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
   end
 
-  test "progress prose does not reset delivered or attempted counters", ctx do
+  test "F3 progress prose stays durable without becoming a receipt or acknowledgment", ctx do
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
     seq1 = terminal!(ctx.db, "holder")
     assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq1)
@@ -488,7 +495,7 @@ defmodule Tightbeam.SupervisionTest do
   # These cases drive explicit durable rows or synchronous process barriers. They
   # deliberately do not sleep, poll, widen a timeout, or infer a deadline from the
   # wall clock.
-  test "a verdict is a typed fact receipt and resets the ladder once", ctx do
+  test "F3 a verdict receipt wins before acknowledgment suppression and rebases once", ctx do
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
     seq1 = terminal!(ctx.db, "holder")
     assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq1)
@@ -567,7 +574,8 @@ defmodule Tightbeam.SupervisionTest do
              Supervision.prod_state(ctx.db, "asg_1")
   end
 
-  test "an assignment artifact is an effect receipt; an unrelated artifact is not", ctx do
+  test "F3 an artifact receipt wins before acknowledgment while unrelated artifacts do not",
+       ctx do
     attach_work_item!(ctx.db, "asg_1", "wi_receipts")
     insert_entitlement!(ctx.db, "asg_1", generation: 4, due_at: 0, interval: 60_000)
     insert_artifact!(ctx.db, "art_other", "holder", "wi_other", 9_000_000_000_000)
@@ -589,6 +597,56 @@ defmodule Tightbeam.SupervisionTest do
              )
 
     assert Wakes.list_pending(ctx.db) == []
+  end
+
+  test "F3 tool call result and durable messages remain byte-equal after acknowledgment", ctx do
+    assignment(ctx.db, "asg_f3_tool", "holder", "tool effect", 3)
+
+    %{turn_seq: answer_terminal, wake_id: wake_id} =
+      prepare_patrol_answer!(ctx, "asg_f3_tool", "holder")
+
+    assert {:ok, {tool_call, tool_result}} =
+             DB.transaction(ctx.db, fn txn ->
+               {:appended, tool_call} =
+                 Projection.append_in_txn(txn, %{
+                   session_key: "holder",
+                   role: "assistant",
+                   content: ~s({"type":"tool_call","id":"call_f3","name":"read"}),
+                   sender: "agent:holder"
+                 })
+
+               {:appended, tool_result} =
+                 Projection.append_in_txn(txn, %{
+                   session_key: "holder",
+                   role: "assistant",
+                   content: ~s({"type":"tool_result","tool_call_id":"call_f3","value":"ok"}),
+                   sender: "process:tool"
+                 })
+
+               {tool_call, tool_result}
+             end)
+
+    before =
+      [Projection.get(ctx.db, tool_call.id), Projection.get(ctx.db, tool_result.id)]
+      |> :erlang.term_to_binary()
+
+    assert :ok = Ledger.finish(ctx.db, answer_terminal, "delivered")
+
+    assert :patrol_response_acknowledged =
+             Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", answer_terminal)
+
+    after_bytes =
+      [Projection.get(ctx.db, tool_call.id), Projection.get(ctx.db, tool_result.id)]
+      |> :erlang.term_to_binary()
+
+    assert after_bytes == before
+
+    assert {:ok, [[^answer_terminal]]} =
+             DB.query(
+               ctx.db,
+               "SELECT answerTerminalId FROM supervision_patrol_response_episodes WHERE originatingWakeId=?1",
+               [wake_id]
+             )
   end
 
   test "one bounded assignment checkpoint resets; repeats need a later effect", ctx do
@@ -1884,7 +1942,7 @@ defmodule Tightbeam.SupervisionTest do
     assert Ledger.pending_count(ctx.db, "holder") == 0
   end
 
-  test "supervision wake is fired in the enqueue transaction before its provoked terminal", ctx do
+  test "F1 and F8.3 supervision delivery commits before its exact acknowledged terminal", ctx do
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
     seq = terminal!(ctx.db, "holder")
     assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq)
@@ -1991,7 +2049,7 @@ defmodule Tightbeam.SupervisionTest do
     assert Wakes.get(ctx.db, external.wake_id).state == "fired"
   end
 
-  test "synchronous patrol answer quiesces at its exact delivered terminal",
+  test "F1 synchronous patrol answer quiesces at its exact delivered terminal",
        ctx do
     n = 12
     assignment(ctx.db, "asg_main", ctx.main.session_key, "main work", 2)
@@ -2255,7 +2313,7 @@ defmodule Tightbeam.SupervisionTest do
     assert [%{reresolve: "lineage"}] = Wakes.list_pending(ctx.db)
   end
 
-  test "supervision wake creation and controller sidecar commit atomically", ctx do
+  test "F8 boundary 2 supervision wake sidecar episode and source commit atomically", ctx do
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0, interval: 60_000)
     seq = terminal!(ctx.db, "holder")
 
@@ -2276,7 +2334,7 @@ defmodule Tightbeam.SupervisionTest do
     assert is_binary(wake_id)
   end
 
-  test "a rejected supervision controller schedule rolls back its wake row", ctx do
+  test "F8 boundary 1 a rejected supervision controller schedule rolls back every row", ctx do
     insert_entitlement!(ctx.db, "asg_1",
       generation: 1,
       due_at: 9_000_000_000_000,
@@ -2307,7 +2365,8 @@ defmodule Tightbeam.SupervisionTest do
              DB.query(ctx.db, "SELECT COUNT(*) FROM supervision_liveness_sidecar")
   end
 
-  test "a supervision controller without an entitlement rolls back its wake row", ctx do
+  test "F5 a supervision controller without truthful episode inputs rolls back its wake row",
+       ctx do
     {:ok, _} = DB.query(ctx.db, "DELETE FROM supervision_entitlements WHERE assignmentId='asg_1'")
     wake = ctx.handlers["wake"]
 
@@ -2333,7 +2392,7 @@ defmodule Tightbeam.SupervisionTest do
              DB.query(ctx.db, "SELECT COUNT(*) FROM supervision_liveness_sidecar")
   end
 
-  test "an unknown internal supervision controller kind rolls back its wake row", ctx do
+  test "F5 an unknown episode branch rolls back its wake row", ctx do
     wake = ctx.handlers["wake"]
 
     assert_raise RuntimeError, ~r/unknown controller kind "mystery"/, fn ->
@@ -2353,6 +2412,25 @@ defmodule Tightbeam.SupervisionTest do
 
     assert {:ok, [[0]]} =
              DB.query(ctx.db, "SELECT COUNT(*) FROM wakes WHERE assignmentId='asg_1'")
+  end
+
+  test "F5 every schema-valid invalid episode dimension rolls back with one typed refusal",
+       ctx do
+    for dimension <- [
+          :source_terminal_missing,
+          :source_terminal_zero,
+          :source_terminal_negative,
+          :source_terminal_unknown,
+          :source_terminal_other_holder,
+          :rung_zero,
+          :rung_negative,
+          :rung_unequal,
+          :wake_other_assignment,
+          :escalation_lineage_rung,
+          :prod_lineage_fields
+        ] do
+      assert_invalid_episode_schedule!(ctx, dimension)
+    end
   end
 
   test "production scheduler cancels an unavailable supervision target without stranding its controller",
@@ -2455,7 +2533,7 @@ defmodule Tightbeam.SupervisionTest do
              )
   end
 
-  test "a schema-valid but incoherent typed source fails closed at delivery", ctx do
+  test "F5 a schema-valid acknowledgment source mismatch fails closed at delivery", ctx do
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 60_000)
 
     wake =
@@ -2531,6 +2609,945 @@ defmodule Tightbeam.SupervisionTest do
                "SELECT COUNT(*) FROM wake_cancellations WHERE wakeId=?1",
                [wake.wake_id]
              )
+  end
+
+  test "F18 rejects each frozen retry-chain mismatch one dimension at a time", ctx do
+    for dimension <- [
+          :assignment,
+          :holder,
+          :source_kind,
+          :source_ref,
+          :source_version,
+          :root_wake,
+          :predecessor_wake,
+          :retry_ordinal
+        ] do
+      assert_retry_dimension_rejected!(ctx, dimension)
+    end
+  end
+
+  test "F18 later destination generation and current-holder mismatches stop once", ctx do
+    for dimension <- [:destination, :generation, :current_holder] do
+      assert_later_source_dimension_rejected!(ctx, dimension)
+    end
+  end
+
+  test "F4 terminal failures and assignment lifecycle outcomes never acknowledge patrol answers",
+       ctx do
+    for {suffix, terminal_status} <- [
+          {"canceled", "canceled"},
+          {"failed", "failed"},
+          {"failed_unknown", "failed_unknown"}
+        ] do
+      assignment_id = "asg_f4_#{suffix}"
+      holder = "holder_f4_#{suffix}"
+      session(ctx.db, holder, "supervisor")
+      assignment(ctx.db, assignment_id, holder, suffix, 10)
+
+      %{turn_seq: turn_seq, wake_id: wake_id} =
+        prepare_patrol_answer!(ctx, assignment_id, holder)
+
+      case terminal_status do
+        "failed_unknown" -> assert [^turn_seq] = Ledger.recover_running(ctx.db)
+        status -> assert :ok = Ledger.finish(ctx.db, turn_seq, status)
+      end
+
+      assert_no_patrol_acknowledgment!(ctx.db, wake_id, turn_seq)
+
+      refute Supervision.evaluate(ctx.db, ctx.handlers, 3, holder, turn_seq) ==
+               :patrol_response_acknowledged
+
+      assert_no_patrol_acknowledgment!(ctx.db, wake_id, turn_seq)
+    end
+
+    for {suffix, transition} <- [
+          {"completed", :completion},
+          {"surrendered", :surrender},
+          {"revoked", :revoke}
+        ] do
+      assignment_id = "asg_f4_#{suffix}"
+      holder = "holder_f4_#{suffix}"
+      session(ctx.db, holder, "supervisor")
+      assignment(ctx.db, assignment_id, holder, suffix, 20)
+
+      %{turn_seq: turn_seq, wake_id: wake_id} =
+        prepare_patrol_answer!(ctx, assignment_id, holder)
+
+      result = transition_assignment!(ctx.db, assignment_id, holder, transition)
+      assert result.state == "closed"
+      assert result.outcome == suffix
+      assert :ok = Ledger.finish(ctx.db, turn_seq, "delivered")
+
+      assert_no_patrol_acknowledgment!(ctx.db, wake_id, turn_seq)
+
+      refute Supervision.evaluate(ctx.db, ctx.handlers, 3, holder, turn_seq) ==
+               :patrol_response_acknowledged
+
+      assert_no_patrol_acknowledgment!(ctx.db, wake_id, turn_seq)
+
+      assert {:ok, []} =
+               DB.query(
+                 ctx.db,
+                 "SELECT state FROM supervision_entitlements WHERE assignmentId=?1",
+                 [
+                   assignment_id
+                 ]
+               )
+
+      assert Enum.any?(
+               EventLog.lifecycle_events(ctx.db),
+               &(&1.kind == "supervision_entitlement_cleared" and &1.subject == assignment_id)
+             )
+    end
+
+    assignment(ctx.db, "asg_f4_rail", "holder", "rail wins", 30)
+
+    %{turn_seq: rail_terminal, wake_id: rail_wake_id} =
+      prepare_patrol_answer!(ctx, "asg_f4_rail", "holder")
+
+    prepare_review_gate(ctx)
+    assert :ok = Ledger.finish(ctx.db, rail_terminal, "delivered")
+
+    assert {:acted, :rail_remedy} =
+             Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", rail_terminal)
+
+    assert {:ok, [[^rail_terminal]]} =
+             DB.query(
+               ctx.db,
+               "SELECT answerTerminalId FROM supervision_patrol_response_episodes WHERE originatingWakeId=?1",
+               [rail_wake_id]
+             )
+
+    assert Supervision.prod_state(ctx.db, "asg_f4_rail").prodCount == 1
+  end
+
+  test "F6 branch and rung episodes acknowledge only their own composite identities", ctx do
+    rows = [
+      %{name: "prod_1", branch: "prod", rung: 1, n: 3, prior_prods: 0},
+      %{name: "prod_2", branch: "prod", rung: 2, n: 3, prior_prods: 1},
+      %{name: "escalation_1", branch: "escalation", rung: 1, n: 0, prior_prods: 0},
+      %{name: "escalation_2", branch: "escalation", rung: 2, n: 0, prior_prods: 1}
+    ]
+
+    prepared =
+      Enum.map(rows, fn row ->
+        assignment_id = "asg_f6_#{row.name}"
+        holder = "holder_f6_#{row.name}"
+        session(ctx.db, holder, "supervisor")
+        assignment(ctx.db, assignment_id, holder, row.name, 25 + row.rung)
+        insert_entitlement!(ctx.db, assignment_id, generation: 1, due_at: 0)
+
+        if row.prior_prods > 0 do
+          seed_heard_prod!(ctx, assignment_id, holder)
+        end
+
+        source_terminal = terminal!(ctx.db, holder)
+
+        case {row.branch, row.rung} do
+          {"prod", rung} ->
+            assert {:prodded, ^rung} =
+                     Supervision.evaluate(ctx.db, ctx.handlers, row.n, holder, source_terminal)
+
+          {"escalation", rung} ->
+            assert {:escalated, ^rung, _target} =
+                     Supervision.evaluate(ctx.db, ctx.handlers, row.n, holder, source_terminal)
+        end
+
+        wake =
+          ctx.db
+          |> Wakes.list_pending()
+          |> Enum.find(&(&1.assignment_id == assignment_id))
+
+        assert wake
+        assert :appended = admit_supervision_wake!(ctx.db, wake)
+
+        assert {:ok, %{seq: answer_terminal, wake_id: wake_id}} =
+                 Ledger.claim_next(ctx.db, wake.session_key, "f6-#{row.name}")
+
+        assert wake_id == wake.wake_id
+
+        Map.merge(row, %{
+          assignment_id: assignment_id,
+          holder: holder,
+          source_terminal: source_terminal,
+          answer_terminal: answer_terminal,
+          wake_id: wake_id
+        })
+      end)
+
+    prepared
+    |> Enum.reverse()
+    |> Enum.each(fn row ->
+      assert :ok = Ledger.finish(ctx.db, row.answer_terminal, "delivered")
+    end)
+
+    for row <- prepared do
+      assert {:ok,
+              [
+                [
+                  assignment_id,
+                  branch,
+                  rung,
+                  source_terminal,
+                  answer_terminal
+                ]
+              ]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT assignmentId,recoveryBranch,recoveryRung,sourceTerminalId,answerTerminalId FROM supervision_patrol_response_episodes WHERE originatingWakeId=?1",
+                 [row.wake_id]
+               )
+
+      assert assignment_id == row.assignment_id
+      assert branch == row.branch
+      assert rung == row.rung
+      assert source_terminal == row.source_terminal
+      assert answer_terminal == row.answer_terminal
+
+      assert {:ok, [[1]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM supervision_patrol_response_episodes WHERE answerTerminalId=?1",
+                 [row.answer_terminal]
+               )
+    end
+
+    assert {:ok, [[4]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(DISTINCT assignmentId || ':' || originatingWakeId || ':' || recoveryBranch || ':' || recoveryRung || ':' || sourceTerminalId) FROM supervision_patrol_response_episodes WHERE assignmentId LIKE 'asg_f6_%'"
+             )
+  end
+
+  test "F7 concurrent finalization and notification consume one answer without crossing lanes",
+       ctx do
+    %{turn_seq: answer_terminal, wake_id: wake_id} =
+      prepare_patrol_answer!(ctx, "asg_1", "holder")
+
+    session(ctx.db, "holder_f7_other", "supervisor")
+    assignment(ctx.db, "asg_f7_other", "holder_f7_other", "unrelated", 30)
+    insert_entitlement!(ctx.db, "asg_f7_other", generation: 1, due_at: 0)
+    unrelated_terminal = terminal!(ctx.db, "holder_f7_other")
+
+    finalizers =
+      for owner <- ["finalizer-a", "finalizer-b"] do
+        Task.async(fn -> {owner, Ledger.finish(ctx.db, answer_terminal, "delivered")} end)
+      end
+
+    assert Enum.sort(Task.await_many(finalizers)) ==
+             Enum.sort([{"finalizer-a", :ok}, {"finalizer-b", :already_terminal}])
+
+    evaluations = [
+      Task.async(fn ->
+        {:answer, Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", answer_terminal)}
+      end),
+      Task.async(fn ->
+        {:answer, Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", answer_terminal)}
+      end),
+      Task.async(fn ->
+        {:unrelated,
+         Supervision.evaluate(
+           ctx.db,
+           ctx.handlers,
+           3,
+           "holder_f7_other",
+           unrelated_terminal
+         )}
+      end)
+    ]
+
+    results = Task.await_many(evaluations)
+    assert Enum.count(results, &(&1 == {:answer, :patrol_response_acknowledged})) == 1
+    assert Enum.count(results, &(&1 == {:answer, :duplicate})) == 1
+    assert [{:unrelated, {:prodded, 1}}] = Enum.filter(results, &(elem(&1, 0) == :unrelated))
+
+    assert {:ok, [[^answer_terminal]]} =
+             DB.query(
+               ctx.db,
+               "SELECT answerTerminalId FROM supervision_patrol_response_episodes WHERE originatingWakeId=?1",
+               [wake_id]
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM patrol_output_sources WHERE rootWakeId=?1",
+               [wake_id]
+             )
+
+    assert %{lastEvaluatedTerminal: ^answer_terminal} = Supervision.watermark(ctx.db, "holder")
+
+    assert length(Enum.filter(Wakes.list_pending(ctx.db), &(&1.assignment_id == "asg_f7_other"))) ==
+             1
+
+    assert Enum.empty?(Enum.filter(Wakes.list_pending(ctx.db), &(&1.assignment_id == "asg_1")))
+  end
+
+  test "F8 boundaries 4 through 6 publish only the committed terminal and acknowledgment", ctx do
+    %{turn_seq: answer_terminal, wake_id: wake_id} =
+      prepare_patrol_answer!(ctx, "asg_1", "holder")
+
+    assert {:error, %RuntimeError{message: "f8 terminal crash"}} =
+             DB.transaction(ctx.db, fn txn ->
+               assert true = Ledger.finish_in_txn(txn, answer_terminal, "delivered")
+               raise "f8 terminal crash"
+             end)
+
+    assert {:ok, [["running"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [answer_terminal])
+
+    assert {:ok, [[nil]]} =
+             DB.query(
+               ctx.db,
+               "SELECT answerTerminalId FROM supervision_patrol_response_episodes WHERE originatingWakeId=?1",
+               [wake_id]
+             )
+
+    assert :ok = Ledger.finish(ctx.db, answer_terminal, "delivered")
+
+    assert [%{seq: ^answer_terminal, status: "delivered"}] =
+             Enum.filter(Ledger.unpublished_terminals(ctx.db), &(&1.seq == answer_terminal))
+
+    assert :already_terminal = Ledger.finish(ctx.db, answer_terminal, "delivered")
+
+    assert :patrol_response_acknowledged =
+             Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", answer_terminal)
+
+    assert :duplicate =
+             Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", answer_terminal)
+
+    assert {:ok, [[^answer_terminal, 1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT answerTerminalId,(SELECT COUNT(*) FROM patrol_output_sources WHERE rootWakeId=?1) FROM supervision_patrol_response_episodes WHERE originatingWakeId=?1",
+               [wake_id]
+             )
+  end
+
+  test "F9 final patrol state replays idempotently and leaves a later terminal ordinary", ctx do
+    %{turn_seq: answer_terminal, wake_id: wake_id} =
+      prepare_patrol_answer!(ctx, "asg_1", "holder")
+
+    assert :ok = Ledger.finish(ctx.db, answer_terminal, "delivered")
+
+    assert :patrol_response_acknowledged =
+             Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", answer_terminal)
+
+    assert {:ok, [baseline]} =
+             DB.query(
+               ctx.db,
+               "SELECT assignmentId,originatingWakeId,recoveryBranch,recoveryRung,sourceTerminalId,answerTerminalId,scheduledAt,acknowledgedAt,scheduledCause,scheduledPrincipal,acknowledgmentCause,acknowledgmentPrincipal FROM supervision_patrol_response_episodes WHERE originatingWakeId=?1",
+               [wake_id]
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM patrol_output_sources WHERE wakeId=?1", [
+               wake_id
+             ])
+
+    assert {:ok, {:ok, %{answer_terminal_id: ^answer_terminal}}} =
+             DB.transaction(ctx.db, fn txn ->
+               PatrolResponse.create_supervision_episode_in_txn(txn, wake_id)
+             end)
+
+    assert {:ok, {:acknowledged, %{answer_terminal_id: ^answer_terminal}}} =
+             DB.transaction(ctx.db, fn txn ->
+               PatrolResponse.acknowledge_in_txn(txn, answer_terminal)
+             end)
+
+    assert :already_terminal = Ledger.finish(ctx.db, answer_terminal, "delivered")
+
+    assert :duplicate =
+             Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", answer_terminal)
+
+    assert {:ok, [^baseline]} =
+             DB.query(
+               ctx.db,
+               "SELECT assignmentId,originatingWakeId,recoveryBranch,recoveryRung,sourceTerminalId,answerTerminalId,scheduledAt,acknowledgedAt,scheduledCause,scheduledPrincipal,acknowledgmentCause,acknowledgmentPrincipal FROM supervision_patrol_response_episodes WHERE originatingWakeId=?1",
+               [wake_id]
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM patrol_output_sources WHERE wakeId=?1", [
+               wake_id
+             ])
+
+    later = terminal!(ctx.db, "holder")
+
+    refute Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", later) ==
+             :patrol_response_acknowledged
+
+    assert {:ok, [^baseline]} =
+             DB.query(
+               ctx.db,
+               "SELECT assignmentId,originatingWakeId,recoveryBranch,recoveryRung,sourceTerminalId,answerTerminalId,scheduledAt,acknowledgedAt,scheduledCause,scheduledPrincipal,acknowledgmentCause,acknowledgmentPrincipal FROM supervision_patrol_response_episodes WHERE originatingWakeId=?1",
+               [wake_id]
+             )
+  end
+
+  test "F10 historical delivery-before-revoke rows stay byte-equal beside admitted-first control",
+       ctx do
+    assignment(ctx.db, "asg_f10_history", "holder", "historical evidence", 1)
+
+    for {seq, ended_at} <- [
+          {19_082, 1_786_525_417_781},
+          {19_084, 1_786_525_418_890},
+          {19_086, 1_786_525_419_917}
+        ] do
+      assert {:ok, []} =
+               DB.query(
+                 ctx.db,
+                 "INSERT INTO turns (seq,sessionKey,messageId,origin,prompt,assignmentId,status,createdAt,startedAt,endedAt) VALUES (?1,'holder',?2,'process:tightbeam','historical','asg_f10_history','delivered',?3,?3,?3)",
+                 [seq, "m_f10_#{seq}", ended_at]
+               )
+    end
+
+    revoke_at = 1_786_525_633_131
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "UPDATE assignments SET state='closed',outcome='revoked',closedAt=?2,closedByUser='flynn' WHERE id=?1",
+               ["asg_f10_history", revoke_at]
+             )
+
+    assert {:ok, historical_before} =
+             DB.query(
+               ctx.db,
+               "SELECT seq,sessionKey,messageId,wakeId,origin,prompt,assignmentId,status,createdAt,startedAt,endedAt,publishedAt FROM turns WHERE seq IN (19082,19084,19086) ORDER BY seq"
+             )
+
+    assert Enum.map(historical_before, &Enum.at(&1, 10)) == [
+             1_786_525_417_781,
+             1_786_525_418_890,
+             1_786_525_419_917
+           ]
+
+    assert Enum.all?(historical_before, &(Enum.at(&1, 10) < revoke_at))
+
+    session(ctx.db, "holder_f10_control", "supervisor")
+    assignment(ctx.db, "asg_f10_control", "holder_f10_control", "admitted control", 140)
+    control_wake = prepare_effort_root!(ctx.db, "asg_f10_control", "holder_f10_control")
+
+    assert {:ok, {:appended, "holder_f10_control", _message, _opts}} =
+             DB.transaction(ctx.db, fn txn ->
+               Gateway.deliver_prompt_in_txn(
+                 txn,
+                 "holder_f10_control",
+                 control_wake.origin,
+                 control_wake.prompt,
+                 wake_id: control_wake.wake_id,
+                 sender: control_wake.origin,
+                 target_gate: control_wake,
+                 fire_wake_in_txn: true,
+                 assignment_id: "asg_f10_control"
+               )
+             end)
+
+    assert {:ok, %{seq: admitted_turn}} =
+             Ledger.claim_next(ctx.db, "holder_f10_control", "f10-control")
+
+    revoked = transition_assignment!(ctx.db, "asg_f10_control", "holder_f10_control", :revoke)
+    assert revoked.outcome == "revoked"
+    assert :ok = Ledger.finish(ctx.db, admitted_turn, "delivered")
+
+    assert {:ok, [["delivered"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [admitted_turn])
+
+    assert {:ok, ^historical_before} =
+             DB.query(
+               ctx.db,
+               "SELECT seq,sessionKey,messageId,wakeId,origin,prompt,assignmentId,status,createdAt,startedAt,endedAt,publishedAt FROM turns WHERE seq IN (19082,19084,19086) ORDER BY seq"
+             )
+  end
+
+  test "F12 lifecycle-before-admission tombstones only the pending wake and queued turn",
+       ctx do
+    for transition <- [:completion, :surrender, :revoke, :retirement] do
+      suffix = Atom.to_string(transition)
+      assignment_id = "asg_f12_#{suffix}"
+      holder = "holder_f12_#{suffix}"
+      session(ctx.db, holder, "supervisor")
+      assignment(ctx.db, assignment_id, holder, suffix, 40)
+
+      %{pending_wake: pending_wake, queued_turn: queued_turn} =
+        prepare_lifecycle_candidates!(ctx, assignment_id, holder)
+
+      case transition do
+        :retirement ->
+          retire!(ctx.db, holder)
+
+        other ->
+          result = transition_assignment!(ctx.db, assignment_id, holder, other)
+          assert result.state == "closed"
+      end
+
+      assert %{state: "canceled", fired_at: nil} = Wakes.get(ctx.db, pending_wake.wake_id)
+
+      assert {:ok, [["canceled", ended_at]]} =
+               DB.query(ctx.db, "SELECT status,endedAt FROM turns WHERE seq=?1", [queued_turn])
+
+      assert is_integer(ended_at)
+
+      assert {:ok, [[1, "obligation_disposed", "disposition"]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT COUNT(*),reasonKind,outcomeKind FROM wake_cancellations WHERE wakeId=?1",
+                 [pending_wake.wake_id]
+               )
+
+      assert Enum.count(
+               EventLog.lifecycle_events(ctx.db),
+               &(&1.kind == "patrol_turn_stopped" and &1.subject == to_string(queued_turn))
+             ) == 1
+
+      assert {:ok, :replay} =
+               DB.transaction(ctx.db, fn txn ->
+                 PatrolResponse.admit_delivery_in_txn(txn, pending_wake.wake_id, holder)
+               end)
+
+      assert :already_terminal = Ledger.finish(ctx.db, queued_turn, "delivered")
+
+      assert {:ok, [[1]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM wake_cancellations WHERE wakeId=?1",
+                 [pending_wake.wake_id]
+               )
+
+      assert Enum.count(
+               EventLog.lifecycle_events(ctx.db),
+               &(&1.kind == "patrol_turn_stopped" and &1.subject == to_string(queued_turn))
+             ) == 1
+
+      assert {:ok, [["canceled"]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT state FROM effort_checkin_generations WHERE assignmentId=?1",
+                 [assignment_id]
+               )
+    end
+  end
+
+  test "F13 closed predecessor retry chains cannot affect a successor on the same work item",
+       ctx do
+    for placement <- [:shared_holder, :distinct_holders] do
+      suffix = Atom.to_string(placement)
+      work_item_id = "wi_f13_#{suffix}"
+      predecessor_id = "asg_f13_a_#{suffix}"
+      successor_id = "asg_f13_b_#{suffix}"
+      predecessor_holder = "holder_f13_a_#{suffix}"
+
+      successor_holder =
+        if placement == :shared_holder,
+          do: predecessor_holder,
+          else: "holder_f13_b_#{suffix}"
+
+      session(ctx.db, predecessor_holder, "supervisor")
+
+      if successor_holder != predecessor_holder do
+        session(ctx.db, successor_holder, "supervisor")
+      end
+
+      assignment(ctx.db, predecessor_id, predecessor_holder, "predecessor", 50)
+      assignment(ctx.db, successor_id, successor_holder, "successor", 51)
+
+      %{chain: [root, retry_one, retry_two], queued_turn: queued_turn} =
+        prepare_predecessor_chain!(ctx, predecessor_id, predecessor_holder)
+
+      result = transition_assignment!(ctx.db, predecessor_id, predecessor_holder, :completion)
+      assert result.state == "closed"
+      assert result.outcome == "completed"
+
+      attach_work_item!(ctx.db, predecessor_id, work_item_id)
+      attach_work_item!(ctx.db, successor_id, work_item_id)
+
+      insert_entitlement!(ctx.db, successor_id, generation: 1, due_at: 0)
+      successor_terminal = terminal!(ctx.db, successor_holder)
+
+      replay_tasks =
+        Enum.map([root, retry_one, retry_two], fn wake ->
+          Task.async(fn ->
+            DB.transaction(ctx.db, fn txn ->
+              PatrolResponse.admit_delivery_in_txn(txn, wake.wake_id, predecessor_holder)
+            end)
+          end)
+        end)
+
+      successor_task =
+        Task.async(fn ->
+          Supervision.evaluate(
+            ctx.db,
+            ctx.handlers,
+            3,
+            successor_holder,
+            successor_terminal
+          )
+        end)
+
+      assert Enum.all?(Task.await_many(replay_tasks), &(&1 == {:ok, :replay}))
+      assert {:prodded, 1} = Task.await(successor_task)
+      assert :already_terminal = Ledger.finish(ctx.db, queued_turn, "delivered")
+
+      assert {:ok, [["canceled"]]} =
+               DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [queued_turn])
+
+      assert %{prodCount: 1} = Supervision.prod_state(ctx.db, successor_id)
+
+      assert {:ok, [[2, "armed"]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT generation,state FROM supervision_entitlements WHERE assignmentId=?1",
+                 [successor_id]
+               )
+
+      assert [successor_wake] =
+               Wakes.list_pending(ctx.db)
+               |> Enum.filter(&(&1.assignment_id == successor_id))
+
+      assert {:ok, [[1]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM patrol_output_sources WHERE wakeId=?1 AND assignmentId=?2",
+                 [successor_wake.wake_id, successor_id]
+               )
+
+      assert {:ok, [[0]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM wake_cancellations WHERE wakeId=?1",
+                 [successor_wake.wake_id]
+               )
+
+      assert {:ok, [[0]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM patrol_output_sources WHERE wakeId=?1 AND assignmentId=?2",
+                 [successor_wake.wake_id, predecessor_id]
+               )
+    end
+  end
+
+  test "F14 typed lifecycle races expose only admission-before or lifecycle-before", ctx do
+    transitions = [:completion, :surrender, :revoke, :retirement]
+
+    for transition <- transitions do
+      suffix = Atom.to_string(transition)
+      assignment_id = "asg_f14_delivery_#{suffix}"
+      holder = "holder_f14_delivery_#{suffix}"
+      session(ctx.db, holder, "supervisor")
+      assignment(ctx.db, assignment_id, holder, "delivery race", 60)
+      wake = prepare_pending_patrol_wake!(ctx, assignment_id, holder)
+
+      delivery =
+        Task.async(fn ->
+          DB.transaction(ctx.db, fn txn ->
+            Gateway.deliver_prompt_in_txn(
+              txn,
+              holder,
+              wake.origin,
+              wake.prompt,
+              wake_id: wake.wake_id,
+              sender: wake.origin,
+              target_gate: wake,
+              fire_wake_in_txn: true,
+              assignment_id: assignment_id
+            )
+          end)
+        end)
+
+      lifecycle =
+        Task.async(fn -> run_lifecycle!(ctx.db, assignment_id, holder, transition) end)
+
+      Task.await(delivery)
+      Task.await(lifecycle)
+
+      assert %{state: wake_state} = Wakes.get(ctx.db, wake.wake_id)
+      assert wake_state in ["fired", "canceled"]
+
+      assert {:ok, turns} =
+               DB.query(ctx.db, "SELECT status FROM turns WHERE wakeId=?1", [wake.wake_id])
+
+      assert turns in [[], [["canceled"]]]
+
+      assert {:ok, [[1]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM patrol_output_sources WHERE wakeId=?1",
+                 [wake.wake_id]
+               )
+    end
+
+    for transition <- transitions do
+      suffix = Atom.to_string(transition)
+      assignment_id = "asg_f14_turn_#{suffix}"
+      holder = "holder_f14_turn_#{suffix}"
+      session(ctx.db, holder, "supervisor")
+      assignment(ctx.db, assignment_id, holder, "turn race", 70)
+
+      %{turn_seq: turn_seq, wake_id: wake_id} =
+        prepare_queued_patrol_turn!(ctx, assignment_id, holder)
+
+      claim = Task.async(fn -> Ledger.claim_next(ctx.db, holder, "f14-race") end)
+
+      lifecycle =
+        Task.async(fn -> run_lifecycle!(ctx.db, assignment_id, holder, transition) end)
+
+      claim_result = Task.await(claim)
+      Task.await(lifecycle)
+
+      case claim_result do
+        {:ok, %{seq: ^turn_seq}} -> assert :ok = Ledger.finish(ctx.db, turn_seq, "delivered")
+        :none -> :ok
+      end
+
+      assert {:ok, [[status]]} =
+               DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [turn_seq])
+
+      assert status in ["canceled", "delivered"]
+      assert_no_patrol_acknowledgment!(ctx.db, wake_id, turn_seq)
+    end
+
+    for transition <- transitions do
+      suffix = Atom.to_string(transition)
+      assignment_id = "asg_f14_retry_#{suffix}"
+      holder = "holder_f14_retry_#{suffix}"
+      session(ctx.db, holder, "supervisor")
+      assignment(ctx.db, assignment_id, holder, "retry race", 80)
+      root = prepare_effort_root!(ctx.db, assignment_id, holder)
+
+      retry =
+        Task.async(fn ->
+          create_racing_retry(ctx.db, root, assignment_id, holder, "retry #{suffix}")
+        end)
+
+      lifecycle =
+        Task.async(fn -> run_lifecycle!(ctx.db, assignment_id, holder, transition) end)
+
+      retry_result = Task.await(retry)
+      Task.await(lifecycle)
+
+      assert retry_result in [:created, :lifecycle_won]
+
+      assert {:ok, sources} =
+               DB.query(
+                 ctx.db,
+                 "SELECT retryOrdinal,w.state FROM patrol_output_sources p JOIN wakes w ON w.wakeId=p.wakeId WHERE p.rootWakeId=?1 ORDER BY retryOrdinal",
+                 [root.wake_id]
+               )
+
+      assert sources in [[[0, "canceled"]], [[0, "canceled"], [1, "canceled"]]]
+    end
+
+    assignment_id = "asg_f14_retry_duel"
+    holder = "holder_f14_retry_duel"
+    session(ctx.db, holder, "supervisor")
+    assignment(ctx.db, assignment_id, holder, "retry duel", 90)
+    root = prepare_effort_root!(ctx.db, assignment_id, holder)
+
+    retry_tasks =
+      for label <- ["a", "b"] do
+        Task.async(fn -> create_racing_retry(ctx.db, root, assignment_id, holder, label) end)
+      end
+
+    assert Enum.sort(Task.await_many(retry_tasks)) == [:created, :lifecycle_won]
+
+    assert {:ok, [[0, nil], [1, root_wake_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT retryOrdinal,predecessorWakeId FROM patrol_output_sources WHERE rootWakeId=?1 ORDER BY retryOrdinal",
+               [root.wake_id]
+             )
+
+    assert root_wake_id == root.wake_id
+  end
+
+  test "F15 lifecycle crash boundaries roll back fully and replay one stopped result", ctx do
+    assignment_id = "asg_f15"
+    holder = "holder_f15"
+    session(ctx.db, holder, "supervisor")
+    assignment(ctx.db, assignment_id, holder, "crash boundaries", 100)
+
+    assert {:error, %RuntimeError{message: "f15 schedule crash"}} =
+             DB.transaction(ctx.db, fn txn ->
+               wake =
+                 Wakes.schedule_in_txn(txn, %{
+                   session_key: holder,
+                   origin: "process:tightbeam",
+                   prompt: "f15 root",
+                   due_at: 0,
+                   assignment_id: assignment_id
+                 })
+
+               insert_effort_generation_in_txn!(txn, assignment_id, holder, 1, wake.wake_id)
+
+               assert {:ok, _source} =
+                        PatrolResponse.create_effort_source_in_txn(
+                          txn,
+                          wake.wake_id,
+                          "effort_generation_prod",
+                          assignment_id,
+                          1
+                        )
+
+               raise "f15 schedule crash"
+             end)
+
+    assert {:ok, [[0, 0, 0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT (SELECT COUNT(*) FROM wakes WHERE assignmentId=?1),(SELECT COUNT(*) FROM effort_checkin_generations WHERE assignmentId=?1),(SELECT COUNT(*) FROM patrol_output_sources WHERE assignmentId=?1)",
+               [assignment_id]
+             )
+
+    assert {:ok, %{wake: root}} =
+             DB.transaction(ctx.db, fn txn ->
+               wake =
+                 Wakes.schedule_in_txn(txn, %{
+                   session_key: holder,
+                   origin: "process:tightbeam",
+                   prompt: "f15 root",
+                   due_at: 0,
+                   assignment_id: assignment_id
+                 })
+
+               insert_effort_generation_in_txn!(txn, assignment_id, holder, 1, wake.wake_id)
+
+               assert {:ok, _source} =
+                        PatrolResponse.create_effort_source_in_txn(
+                          txn,
+                          wake.wake_id,
+                          "effort_generation_prod",
+                          assignment_id,
+                          1
+                        )
+
+               %{wake: wake}
+             end)
+
+    assert {:error, %RuntimeError{message: "f15 delivery crash"}} =
+             DB.transaction(ctx.db, fn txn ->
+               assert {:appended, ^holder, _message, _opts} =
+                        Gateway.deliver_prompt_in_txn(
+                          txn,
+                          holder,
+                          root.origin,
+                          root.prompt,
+                          wake_id: root.wake_id,
+                          sender: root.origin,
+                          target_gate: root,
+                          fire_wake_in_txn: true,
+                          assignment_id: assignment_id
+                        )
+
+               raise "f15 delivery crash"
+             end)
+
+    assert %{state: "pending"} = Wakes.get(ctx.db, root.wake_id)
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [root.wake_id])
+
+    assert {:ok, {:appended, ^holder, _message, _opts}} =
+             DB.transaction(ctx.db, fn txn ->
+               Gateway.deliver_prompt_in_txn(
+                 txn,
+                 holder,
+                 root.origin,
+                 root.prompt,
+                 wake_id: root.wake_id,
+                 sender: root.origin,
+                 target_gate: root,
+                 fire_wake_in_txn: true,
+                 assignment_id: assignment_id
+               )
+             end)
+
+    assert {:ok, [[queued_turn]]} =
+             DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1 AND status='queued'", [
+               root.wake_id
+             ])
+
+    pending =
+      Wakes.schedule(ctx.db, %{
+        session_key: holder,
+        origin: "process:tightbeam",
+        prompt: "f15 pending",
+        due_at: 0,
+        assignment_id: assignment_id
+      })
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               insert_effort_generation_in_txn!(txn, assignment_id, holder, 2, pending.wake_id)
+
+               assert {:ok, _source} =
+                        PatrolResponse.create_effort_source_in_txn(
+                          txn,
+                          pending.wake_id,
+                          "effort_generation_prod",
+                          assignment_id,
+                          2
+                        )
+
+               :ok
+             end)
+
+    assert {:error, %RuntimeError{message: "f15 tombstone crash"}} =
+             DB.transaction(ctx.db, fn txn ->
+               [] =
+                 DB.Txn.q(
+                   txn,
+                   "UPDATE assignments SET state='closed',outcome='revoked',closedAt=101,closedByUser='flynn' WHERE id=?1 AND state='open'",
+                   [assignment_id]
+                 )
+
+               assert :ok =
+                        PatrolResponse.tombstone_assignment_in_txn(
+                          txn,
+                          assignment_id,
+                          "tightbeam:assignments",
+                          101
+                        )
+
+               raise "f15 tombstone crash"
+             end)
+
+    assert %{state: "pending"} = Wakes.get(ctx.db, pending.wake_id)
+
+    assert {:ok, [["queued"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [queued_turn])
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM wake_cancellations WHERE wakeId=?1", [
+               pending.wake_id
+             ])
+
+    result = transition_assignment!(ctx.db, assignment_id, holder, :completion)
+    assert result.state == "closed"
+    assert %{state: "canceled"} = Wakes.get(ctx.db, pending.wake_id)
+
+    assert {:ok, [["canceled"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [queued_turn])
+
+    assert queued_turn in (Ledger.unpublished_terminals(ctx.db) |> Enum.map(& &1.seq))
+
+    assert {:ok, :replay} =
+             DB.transaction(ctx.db, fn txn ->
+               PatrolResponse.admit_delivery_in_txn(txn, pending.wake_id, holder)
+             end)
+
+    assert :already_terminal = Ledger.finish(ctx.db, queued_turn, "delivered")
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM wake_cancellations WHERE wakeId=?1", [
+               pending.wake_id
+             ])
+
+    assert Enum.count(
+             EventLog.lifecycle_events(ctx.db),
+             &(&1.kind == "patrol_turn_stopped" and &1.subject == to_string(queued_turn))
+           ) == 1
   end
 
   test "destination retirement creates one coherent typed supervision retry", ctx do
@@ -2795,7 +3812,7 @@ defmodule Tightbeam.SupervisionTest do
              )
   end
 
-  test "drain precedes idle and dedupe for a stale closed-assignment promise", ctx do
+  test "F11 terminal assignment state precedes stale branch drain and dedupe", ctx do
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
     transient = Map.put(ctx.handlers, "wake", fn _ -> %{code: "server_error"} end)
     seq = terminal!(ctx.db, "holder")
@@ -3059,7 +4076,7 @@ defmodule Tightbeam.SupervisionTest do
   # spec production-machine-v1 §The prod production: work-blocked is not
   # suppression bolted onto the prodder — the production does not match, the
   # same absence-of-match as a session with no open assignment.
-  test "a standing work-blocked fact unmatches the prod production until it is retracted", ctx do
+  test "F16.1 and F17 a standing block unmatches until authorized unblock", ctx do
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
     file_fact(ctx.db, "work-blocked", "holder")
 
@@ -3088,7 +4105,7 @@ defmodule Tightbeam.SupervisionTest do
   # Recognition happens at act time or it is not recognition: the claim and
   # the dispatch are two phases, and a fact filed between them must still be
   # seen by the drain.
-  test "a pending branch claimed before work-blocked is discarded at drain, not dispatched",
+  test "F16.2 a branch claimed before block is discarded at drain without dispatch",
        ctx do
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
     transient = Map.put(ctx.handlers, "wake", fn _ -> %{code: "server_error"} end)
@@ -3115,7 +4132,7 @@ defmodule Tightbeam.SupervisionTest do
   # the e2e that forced this fix watched a prod land after the block): a wake
   # scheduled by a pre-block drain is suppressed at delivery, consumed as
   # canceled with the reason named, never delivered.
-  test "a prod wake scheduled before work-blocked is suppressed at fire, not delivered", ctx do
+  test "F16.3 a supervision wake scheduled before block is suppressed at fire", ctx do
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
     seq = terminal!(ctx.db, "holder")
     assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
@@ -3167,7 +4184,119 @@ defmodule Tightbeam.SupervisionTest do
     assert delivered_id == agent_wake.wake_id
   end
 
-  test "work-blocked standing on another session leaves this holder's prods matching", ctx do
+  test "F16 queued supervision answers and effort prods stop once across five block replays",
+       ctx do
+    assignment(ctx.db, "asg_f16_supervision", "holder", "queued supervision", 110)
+
+    %{turn_seq: supervision_turn} =
+      prepare_queued_patrol_turn!(ctx, "asg_f16_supervision", "holder")
+
+    session(ctx.db, "holder_f16_effort", "supervisor")
+    assignment(ctx.db, "asg_f16_effort", "holder_f16_effort", "queued effort", 111)
+    effort_wake = prepare_effort_root!(ctx.db, "asg_f16_effort", "holder_f16_effort")
+
+    assert {:ok, {:appended, "holder_f16_effort", _message, _opts}} =
+             DB.transaction(ctx.db, fn txn ->
+               Gateway.deliver_prompt_in_txn(
+                 txn,
+                 "holder_f16_effort",
+                 effort_wake.origin,
+                 effort_wake.prompt,
+                 wake_id: effort_wake.wake_id,
+                 sender: effort_wake.origin,
+                 target_gate: effort_wake,
+                 fire_wake_in_txn: true,
+                 assignment_id: "asg_f16_effort"
+               )
+             end)
+
+    assert {:ok, [[effort_turn]]} =
+             DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1 AND status='queued'", [
+               effort_wake.wake_id
+             ])
+
+    assert %{prodCount: 1} = Supervision.prod_state(ctx.db, "asg_f16_supervision")
+    file_fact(ctx.db, "work-blocked", "holder")
+    file_fact(ctx.db, "work-blocked", "holder_f16_effort")
+
+    for _replay <- 1..5 do
+      assert :none = Ledger.claim_next(ctx.db, "holder", "f16-supervision")
+      assert :none = Ledger.claim_next(ctx.db, "holder_f16_effort", "f16-effort")
+    end
+
+    assert {:ok, [["canceled"], ["canceled"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT status FROM turns WHERE seq IN (?1,?2) ORDER BY seq",
+               [supervision_turn, effort_turn]
+             )
+
+    assert Enum.count(
+             EventLog.lifecycle_events(ctx.db),
+             &(&1.kind == "patrol_turn_stopped" and
+                 &1.subject in [to_string(supervision_turn), to_string(effort_turn)])
+           ) == 2
+
+    assert %{prodCount: 1} = Supervision.prod_state(ctx.db, "asg_f16_supervision")
+
+    assert {:ok, [[1], [1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM condition_facts WHERE kind='work-blocked' AND scope IN ('holder','holder_f16_effort') GROUP BY scope ORDER BY scope"
+             )
+
+    refute Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
+             event.kind in ["supervision_prod_denied", "supervision_blocked"] and
+               event.subject in ["asg_f16_supervision", "asg_f16_effort"]
+           end)
+  end
+
+  test "F17 unblock starts from current state and ordinary user traffic is never suppressed",
+       ctx do
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
+    file_fact(ctx.db, "work-blocked", "holder")
+
+    user_wake =
+      Wakes.schedule(ctx.db, %{
+        session_key: "holder",
+        origin: "user:flynn",
+        prompt: "ordinary user traffic",
+        due_at: 0
+      })
+
+    assert {:ok, {:appended, "holder", _message, _opts}} =
+             DB.transaction(ctx.db, fn txn ->
+               Gateway.deliver_prompt_in_txn(
+                 txn,
+                 "holder",
+                 user_wake.origin,
+                 user_wake.prompt,
+                 wake_id: user_wake.wake_id,
+                 sender: user_wake.origin,
+                 target_gate: user_wake,
+                 fire_wake_in_txn: true
+               )
+             end)
+
+    assert {:ok, [[user_turn, "queued"]]} =
+             DB.query(ctx.db, "SELECT seq,status FROM turns WHERE wakeId=?1", [user_wake.wake_id])
+
+    assert {:ok, %{seq: ^user_turn}} = Ledger.claim_next(ctx.db, "holder", "f17-user")
+    assert :ok = Ledger.finish(ctx.db, user_turn, "delivered")
+
+    assert :blocked = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", user_turn)
+    assert Wakes.list_pending(ctx.db) == []
+
+    file_fact(ctx.db, "work-unblocked", "holder")
+    next_terminal = terminal!(ctx.db, "holder")
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", next_terminal)
+
+    assert [fresh] = Wakes.list_pending(ctx.db)
+    refute fresh.wake_id == user_wake.wake_id
+    assert %{prodCount: 1} = Supervision.prod_state(ctx.db, "asg_1")
+  end
+
+  test "F17 a block on another holder leaves this assignment ordinary", ctx do
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
     file_fact(ctx.db, "work-blocked", "supervisor")
     seq = terminal!(ctx.db, "holder")
@@ -3333,6 +4462,725 @@ defmodule Tightbeam.SupervisionTest do
 
     :ok
   end
+
+  defp prepare_patrol_answer!(ctx, assignment_id, holder) do
+    insert_entitlement!(ctx.db, assignment_id, generation: 1, due_at: 0)
+    source_terminal = terminal!(ctx.db, holder)
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, holder, source_terminal)
+
+    wake =
+      ctx.db
+      |> Wakes.list_pending()
+      |> Enum.find(&(&1.assignment_id == assignment_id))
+
+    assert wake
+    assert :appended = admit_supervision_wake!(ctx.db, wake)
+    assert {:ok, %{seq: turn_seq, wake_id: wake_id}} = Ledger.claim_next(ctx.db, holder, "f4")
+    assert wake_id == wake.wake_id
+
+    %{source_terminal: source_terminal, turn_seq: turn_seq, wake_id: wake_id}
+  end
+
+  defp prepare_pending_patrol_wake!(ctx, assignment_id, holder) do
+    insert_entitlement!(ctx.db, assignment_id, generation: 1, due_at: 0)
+    source_terminal = terminal!(ctx.db, holder)
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, holder, source_terminal)
+
+    wake =
+      ctx.db
+      |> Wakes.list_pending()
+      |> Enum.find(&(&1.assignment_id == assignment_id))
+
+    assert wake
+    wake
+  end
+
+  defp seed_heard_prod!(ctx, assignment_id, holder) do
+    wake =
+      Wakes.schedule(ctx.db, %{
+        session_key: holder,
+        origin: "process:tightbeam",
+        prompt: "heard prod given",
+        due_at: 0,
+        assignment_id: assignment_id
+      })
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO supervision_liveness_sidecar (wakeId,assignmentId,controllerOrigin,wakeKind,controllerState,chargedGeneration) VALUES (?1,?2,'scheduled','prod','pending',1)",
+               [wake.wake_id, assignment_id]
+             )
+
+    assert {:ok, {:appended, ^holder, _message, _opts}} =
+             DB.transaction(ctx.db, fn txn ->
+               Gateway.deliver_prompt_in_txn(
+                 txn,
+                 holder,
+                 wake.origin,
+                 wake.prompt,
+                 wake_id: wake.wake_id,
+                 sender: wake.origin,
+                 target_gate: wake,
+                 fire_wake_in_txn: true,
+                 assignment_id: assignment_id
+               )
+             end)
+
+    assert {:ok, %{seq: turn_seq}} = Ledger.claim_next(ctx.db, holder, "f6-heard")
+    assert :ok = Ledger.finish(ctx.db, turn_seq, "delivered")
+    :ok
+  end
+
+  defp prepare_queued_patrol_turn!(ctx, assignment_id, holder) do
+    wake = prepare_pending_patrol_wake!(ctx, assignment_id, holder)
+    assert :appended = admit_supervision_wake!(ctx.db, wake)
+
+    assert {:ok, [[turn_seq]]} =
+             DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1 AND status='queued'", [
+               wake.wake_id
+             ])
+
+    %{turn_seq: turn_seq, wake_id: wake.wake_id}
+  end
+
+  defp prepare_lifecycle_candidates!(ctx, assignment_id, holder) do
+    insert_entitlement!(ctx.db, assignment_id, generation: 1, due_at: 0)
+    source_terminal = terminal!(ctx.db, holder)
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, holder, source_terminal)
+
+    supervision_wake =
+      ctx.db
+      |> Wakes.list_pending()
+      |> Enum.find(&(&1.assignment_id == assignment_id))
+
+    assert supervision_wake
+    assert :appended = admit_supervision_wake!(ctx.db, supervision_wake)
+
+    assert {:ok, [[queued_turn]]} =
+             DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1 AND status='queued'", [
+               supervision_wake.wake_id
+             ])
+
+    pending_wake =
+      Wakes.schedule(ctx.db, %{
+        session_key: holder,
+        origin: "process:tightbeam",
+        prompt: "pending effort output",
+        due_at: 0,
+        assignment_id: assignment_id
+      })
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO effort_checkin_generations
+                 (assignmentId,generation,state,baseHorizonMs,multiplier,armedAt,
+                  terminalSeqWatermark,holderKey,host,root,baseline,wakeId,evidence,
+                  agentProdded,artifactWatermark,attestWatermark,workItemWatermark)
+               VALUES (?1,1,'probed',1000,1,1,0,?2,'eezo','.',
+                       '{"status":"unavailable","reason":"fixture"}',?3,NULL,0,0,0,0)
+               """,
+               [assignment_id, holder, supervision_wake.wake_id]
+             )
+
+    assert {:ok, {:ok, %{wake_id: pending_wake_id}}} =
+             DB.transaction(ctx.db, fn txn ->
+               PatrolResponse.create_effort_source_in_txn(
+                 txn,
+                 pending_wake.wake_id,
+                 "effort_generation_prod",
+                 assignment_id,
+                 1
+               )
+             end)
+
+    assert pending_wake_id == pending_wake.wake_id
+    %{pending_wake: pending_wake, queued_turn: queued_turn}
+  end
+
+  defp prepare_predecessor_chain!(ctx, assignment_id, holder) do
+    root =
+      Wakes.schedule(ctx.db, %{
+        session_key: holder,
+        origin: "process:tightbeam",
+        prompt: "predecessor root",
+        due_at: 0,
+        assignment_id: assignment_id
+      })
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO effort_checkin_generations
+                 (assignmentId,generation,state,baseHorizonMs,multiplier,armedAt,
+                  terminalSeqWatermark,holderKey,host,root,baseline,wakeId,evidence,
+                  agentProdded,artifactWatermark,attestWatermark,workItemWatermark)
+               VALUES (?1,1,'probed',1000,1,1,0,?2,'eezo','.',
+                       '{"status":"unavailable","reason":"fixture"}',?3,NULL,0,0,0,0)
+               """,
+               [assignment_id, holder, root.wake_id]
+             )
+
+    assert {:ok, {:ok, %{wake_id: root_wake_id}}} =
+             DB.transaction(ctx.db, fn txn ->
+               PatrolResponse.create_effort_source_in_txn(
+                 txn,
+                 root.wake_id,
+                 "effort_generation_prod",
+                 assignment_id,
+                 1
+               )
+             end)
+
+    assert root_wake_id == root.wake_id
+    retry_one = attach_predecessor_retry!(ctx.db, root, assignment_id, holder, 1)
+    retry_two = attach_predecessor_retry!(ctx.db, retry_one, assignment_id, holder, 2)
+
+    assert {:ok, {:appended, ^holder, _message, _opts}} =
+             DB.transaction(ctx.db, fn txn ->
+               Gateway.deliver_prompt_in_txn(
+                 txn,
+                 holder,
+                 retry_two.origin,
+                 retry_two.prompt,
+                 wake_id: retry_two.wake_id,
+                 sender: retry_two.origin,
+                 target_gate: retry_two,
+                 fire_wake_in_txn: true,
+                 assignment_id: assignment_id
+               )
+             end)
+
+    assert {:ok, [[queued_turn]]} =
+             DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1 AND status='queued'", [
+               retry_two.wake_id
+             ])
+
+    %{chain: [root, retry_one, retry_two], queued_turn: queued_turn}
+  end
+
+  defp attach_predecessor_retry!(db, predecessor, assignment_id, holder, ordinal) do
+    replacement =
+      Wakes.schedule(db, %{
+        session_key: holder,
+        origin: "process:tightbeam",
+        prompt: "predecessor retry #{ordinal}",
+        due_at: 0,
+        assignment_id: assignment_id
+      })
+
+    assert {:ok, {:ok, %{retry_ordinal: ^ordinal}}} =
+             DB.transaction(db, fn txn ->
+               with {:ok, source} <-
+                      PatrolResponse.attach_destination_retry_in_txn(
+                        txn,
+                        predecessor.wake_id,
+                        replacement.wake_id
+                      ),
+                    true <-
+                      Wakes.cancel_in_txn(txn, %{
+                        wake_id: predecessor.wake_id,
+                        requester: %{kind: "process", id: "tightbeam:effort-checkin"},
+                        reason_kind: "superseded",
+                        causal_source: %{kind: "wake", id: replacement.wake_id},
+                        outcome: %{
+                          kind: "replacement",
+                          replacement_wake_id: replacement.wake_id
+                        }
+                      }) do
+                 {:ok, source}
+               end
+             end)
+
+    replacement
+  end
+
+  defp prepare_effort_root!(db, assignment_id, holder) do
+    root =
+      Wakes.schedule(db, %{
+        session_key: holder,
+        origin: "process:tightbeam",
+        prompt: "effort root",
+        due_at: 0,
+        assignment_id: assignment_id
+      })
+
+    assert {:ok, []} =
+             DB.query(
+               db,
+               """
+               INSERT INTO effort_checkin_generations
+                 (assignmentId,generation,state,baseHorizonMs,multiplier,armedAt,
+                  terminalSeqWatermark,holderKey,host,root,baseline,wakeId,evidence,
+                  agentProdded,artifactWatermark,attestWatermark,workItemWatermark)
+               VALUES (?1,1,'probed',1000,1,1,0,?2,'eezo','.',
+                       '{"status":"unavailable","reason":"fixture"}',?3,NULL,0,0,0,0)
+               """,
+               [assignment_id, holder, root.wake_id]
+             )
+
+    assert {:ok, {:ok, %{wake_id: root_wake_id}}} =
+             DB.transaction(db, fn txn ->
+               PatrolResponse.create_effort_source_in_txn(
+                 txn,
+                 root.wake_id,
+                 "effort_generation_prod",
+                 assignment_id,
+                 1
+               )
+             end)
+
+    assert root_wake_id == root.wake_id
+    root
+  end
+
+  defp assert_retry_dimension_rejected!(ctx, dimension) do
+    suffix = Atom.to_string(dimension)
+    assignment_id = "asg_f18_#{suffix}"
+    other_assignment_id = "asg_f18_other_#{suffix}"
+    assignment(ctx.db, assignment_id, "holder", suffix, 120)
+    assignment(ctx.db, other_assignment_id, "holder", "other #{suffix}", 121)
+    insert_entitlement!(ctx.db, assignment_id, generation: 1, due_at: 60_000)
+
+    root =
+      Wakes.schedule(ctx.db, %{
+        session_key: "holder",
+        origin: "process:tightbeam",
+        prompt: "f18 root #{suffix}",
+        due_at: 0,
+        assignment_id: assignment_id
+      })
+
+    tail =
+      Wakes.schedule(ctx.db, %{
+        session_key: "holder",
+        origin: "process:tightbeam",
+        prompt: "f18 tail #{suffix}",
+        due_at: 0,
+        assignment_id: assignment_id
+      })
+
+    extra =
+      Wakes.schedule(ctx.db, %{
+        session_key: "holder",
+        origin: "process:tightbeam",
+        prompt: "f18 extra #{suffix}",
+        due_at: 0,
+        assignment_id: assignment_id
+      })
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO effort_checkin_generations
+                 (assignmentId,generation,state,baseHorizonMs,multiplier,armedAt,
+                  terminalSeqWatermark,holderKey,host,root,baseline,wakeId,evidence,
+                  agentProdded,artifactWatermark,attestWatermark,workItemWatermark)
+               VALUES (?1,1,'probed',1000,1,1,0,'holder','eezo','.',
+                       '{"status":"unavailable","reason":"fixture"}',?2,NULL,0,0,0,0)
+               """,
+               [assignment_id, tail.wake_id]
+             )
+
+    root_source = %{
+      assignment: assignment_id,
+      holder: "holder",
+      kind: "effort_generation_prod",
+      ref: assignment_id,
+      version: 1,
+      root: root.wake_id,
+      predecessor: nil,
+      ordinal: 0
+    }
+
+    tail_source = %{
+      assignment: assignment_id,
+      holder: "holder",
+      kind: "effort_generation_prod",
+      ref: assignment_id,
+      version: 1,
+      root: root.wake_id,
+      predecessor: root.wake_id,
+      ordinal: 1
+    }
+
+    {root_source, tail_source} =
+      case dimension do
+        :assignment -> {Map.put(root_source, :assignment, other_assignment_id), tail_source}
+        :holder -> {Map.put(root_source, :holder, "supervisor"), tail_source}
+        :source_kind -> {Map.put(root_source, :kind, "effort_generation_probe"), tail_source}
+        :source_ref -> {Map.put(root_source, :ref, other_assignment_id), tail_source}
+        :source_version -> {Map.put(root_source, :version, 9), tail_source}
+        :root_wake -> {root_source, Map.put(tail_source, :root, extra.wake_id)}
+        :predecessor_wake -> {root_source, Map.put(tail_source, :predecessor, extra.wake_id)}
+        :retry_ordinal -> {root_source, Map.put(tail_source, :ordinal, 2)}
+      end
+
+    # F18 alone may bypass the constructor for one schema-valid semantic
+    # mismatch. Every row above changes exactly the named dimension.
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO patrol_output_sources
+                 (wakeId,assignmentId,holderKey,sourceKind,sourceRef,sourceVersion,
+                  rootWakeId,predecessorWakeId,retryOrdinal,createdAt,
+                  sourceCause,sourcePrincipal)
+               VALUES
+                 (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,
+                  'patrol_output_scheduled','process:tightbeam'),
+                 (?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,
+                  'patrol_output_scheduled','process:tightbeam')
+               """,
+               [
+                 root.wake_id,
+                 root_source.assignment,
+                 root_source.holder,
+                 root_source.kind,
+                 root_source.ref,
+                 root_source.version,
+                 root_source.root,
+                 root_source.predecessor,
+                 root_source.ordinal,
+                 root.created_at,
+                 tail.wake_id,
+                 tail_source.assignment,
+                 tail_source.holder,
+                 tail_source.kind,
+                 tail_source.ref,
+                 tail_source.version,
+                 tail_source.root,
+                 tail_source.predecessor,
+                 tail_source.ordinal,
+                 tail.created_at
+               ]
+             )
+
+    assert {:ok, true} =
+             DB.transaction(ctx.db, fn txn ->
+               Wakes.cancel_in_txn(txn, %{
+                 wake_id: root.wake_id,
+                 requester: %{kind: "process", id: "tightbeam:effort-checkin"},
+                 reason_kind: "superseded",
+                 causal_source: %{kind: "wake", id: tail.wake_id},
+                 outcome: %{kind: "replacement", replacement_wake_id: tail.wake_id}
+               })
+             end)
+
+    admission =
+      DB.transaction(ctx.db, fn txn ->
+        PatrolResponse.admit_delivery_in_txn(txn, tail.wake_id, "holder")
+      end)
+
+    assert admission == {:ok, {:stopped, :mismatch}},
+           "#{dimension} mismatch admission returned #{inspect(admission)}"
+
+    assert %{state: "canceled", fired_at: nil} = Wakes.get(ctx.db, tail.wake_id)
+
+    assert {:ok, [["patrol_source_mismatch", "no_replacement"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT reasonKind,outcomeKind FROM wake_cancellations WHERE wakeId=?1",
+               [tail.wake_id]
+             )
+
+    for _replay <- 1..5 do
+      assert {:ok, :replay} =
+               DB.transaction(ctx.db, fn txn ->
+                 PatrolResponse.admit_delivery_in_txn(txn, tail.wake_id, "holder")
+               end)
+    end
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM wake_cancellations WHERE wakeId=?1", [
+               tail.wake_id
+             ])
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM assignment_prods WHERE assignmentId=?1", [
+               assignment_id
+             ])
+  end
+
+  defp assert_invalid_episode_schedule!(ctx, dimension) do
+    suffix = Atom.to_string(dimension)
+    holder = "holder_f5_#{suffix}"
+    other_holder = "holder_f5_other_#{suffix}"
+    assignment_id = "asg_f5_#{suffix}"
+    other_assignment_id = "asg_f5_other_#{suffix}"
+    session(ctx.db, holder, "supervisor")
+    session(ctx.db, other_holder, "supervisor")
+    assignment(ctx.db, assignment_id, holder, suffix, 140)
+    assignment(ctx.db, other_assignment_id, holder, "other #{suffix}", 141)
+    source_terminal = terminal!(ctx.db, holder)
+    other_terminal = terminal!(ctx.db, other_holder)
+
+    assert {:error, %RuntimeError{message: "invalid_patrol_response_episode"}} =
+             DB.transaction(ctx.db, fn txn ->
+               branch =
+                 if dimension in [:rung_unequal, :escalation_lineage_rung],
+                   do: "escalation",
+                   else: "prod"
+
+               pending_rung =
+                 case dimension do
+                   :rung_zero -> 0
+                   :rung_negative -> -1
+                   _ -> 1
+                 end
+
+               {reresolve, seed, wake_rung} =
+                 case dimension do
+                   :rung_unequal -> {"lineage", holder, 2}
+                   :escalation_lineage_rung -> {"lineage", other_holder, 3}
+                   :prod_lineage_fields -> {"lineage", holder, 1}
+                   _ when branch == "escalation" -> {"lineage", holder, pending_rung}
+                   _ -> {nil, nil, nil}
+                 end
+
+               wake_assignment =
+                 if dimension == :wake_other_assignment,
+                   do: other_assignment_id,
+                   else: assignment_id
+
+               wake =
+                 Wakes.schedule_in_txn(txn, %{
+                   session_key: holder,
+                   origin: "process:tightbeam",
+                   prompt: "invalid episode #{suffix}",
+                   due_at: 0,
+                   consumer: "prompt",
+                   assignment_id: wake_assignment,
+                   reresolve: reresolve,
+                   reresolve_seed: seed,
+                   reresolve_rung: wake_rung
+                 })
+
+               unless dimension in [:rung_unequal, :escalation_lineage_rung, :prod_lineage_fields] do
+                 DB.Txn.q(
+                   txn,
+                   "INSERT INTO supervision_liveness_sidecar (wakeId,assignmentId,controllerOrigin,wakeKind,controllerState,chargedGeneration) VALUES (?1,?2,'scheduled',?3,'pending',1)",
+                   [wake.wake_id, wake_assignment, branch]
+                 )
+               end
+
+               unless dimension == :source_terminal_missing do
+                 terminal_id =
+                   case dimension do
+                     :source_terminal_zero -> 0
+                     :source_terminal_negative -> -1
+                     :source_terminal_unknown -> 9_999_999
+                     :source_terminal_other_holder -> other_terminal
+                     _ -> source_terminal
+                   end
+
+                 DB.Txn.q(
+                   txn,
+                   "INSERT INTO supervision_watermarks (sessionKey,lastEvaluatedTerminal,pendingBranch,pendingAssignment,pendingK,pendingN) VALUES (?1,?2,?3,?4,?5,3)",
+                   [holder, terminal_id, branch, assignment_id, pending_rung]
+                 )
+               end
+
+               assert {:error, :invalid_patrol_response_episode} =
+                        PatrolResponse.create_supervision_episode_in_txn(txn, wake.wake_id)
+
+               raise "invalid_patrol_response_episode"
+             end)
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM wakes WHERE assignmentId IN (?1,?2)", [
+               assignment_id,
+               other_assignment_id
+             ])
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM supervision_patrol_response_episodes WHERE assignmentId IN (?1,?2)",
+               [assignment_id, other_assignment_id]
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM patrol_output_sources WHERE assignmentId IN (?1,?2)",
+               [assignment_id, other_assignment_id]
+             )
+  end
+
+  defp assert_later_source_dimension_rejected!(ctx, dimension) do
+    suffix = Atom.to_string(dimension)
+    assignment_id = "asg_f18_later_#{suffix}"
+    holder = "holder_f18_later_#{suffix}"
+    session(ctx.db, holder, "supervisor")
+    assignment(ctx.db, assignment_id, holder, suffix, 130)
+    insert_entitlement!(ctx.db, assignment_id, generation: 1, due_at: 60_000)
+    wake = prepare_effort_root!(ctx.db, assignment_id, holder)
+
+    destination =
+      case dimension do
+        :destination ->
+          "supervisor"
+
+        :generation ->
+          assert {:ok, []} =
+                   DB.query(
+                     ctx.db,
+                     "UPDATE effort_checkin_generations SET state='canceled' WHERE assignmentId=?1 AND generation=1",
+                     [assignment_id]
+                   )
+
+          holder
+
+        :current_holder ->
+          assert {:ok, []} =
+                   DB.query(ctx.db, "UPDATE assignments SET holderKey='supervisor' WHERE id=?1", [
+                     assignment_id
+                   ])
+
+          holder
+      end
+
+    assert {:ok, {:stopped, :mismatch}} =
+             DB.transaction(ctx.db, fn txn ->
+               PatrolResponse.admit_delivery_in_txn(txn, wake.wake_id, destination)
+             end)
+
+    assert %{state: "canceled", fired_at: nil} = Wakes.get(ctx.db, wake.wake_id)
+
+    assert {:ok, [["patrol_source_mismatch", "no_replacement"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT reasonKind,outcomeKind FROM wake_cancellations WHERE wakeId=?1",
+               [wake.wake_id]
+             )
+
+    for _replay <- 1..5 do
+      assert {:ok, :replay} =
+               DB.transaction(ctx.db, fn txn ->
+                 PatrolResponse.admit_delivery_in_txn(txn, wake.wake_id, destination)
+               end)
+    end
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM wake_cancellations WHERE wakeId=?1", [
+               wake.wake_id
+             ])
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM assignment_prods WHERE assignmentId=?1", [
+               assignment_id
+             ])
+  end
+
+  defp insert_effort_generation_in_txn!(txn, assignment_id, holder, generation, wake_id) do
+    [] =
+      DB.Txn.q(
+        txn,
+        """
+        INSERT INTO effort_checkin_generations
+          (assignmentId,generation,state,baseHorizonMs,multiplier,armedAt,
+           terminalSeqWatermark,holderKey,host,root,baseline,wakeId,evidence,
+           agentProdded,artifactWatermark,attestWatermark,workItemWatermark)
+        VALUES (?1,?2,'probed',1000,1,1,0,?3,'eezo','.',
+                '{"status":"unavailable","reason":"fixture"}',?4,NULL,0,0,0,0)
+        """,
+        [assignment_id, generation, holder, wake_id]
+      )
+
+    :ok
+  end
+
+  defp create_racing_retry(db, root, assignment_id, holder, label) do
+    case DB.transaction(db, fn txn ->
+           replacement =
+             Wakes.schedule_in_txn(txn, %{
+               session_key: holder,
+               origin: "process:tightbeam",
+               prompt: label,
+               due_at: 0,
+               assignment_id: assignment_id
+             })
+
+           with {:ok, _source} <-
+                  PatrolResponse.attach_destination_retry_in_txn(
+                    txn,
+                    root.wake_id,
+                    replacement.wake_id
+                  ),
+                true <-
+                  Wakes.cancel_in_txn(txn, %{
+                    wake_id: root.wake_id,
+                    requester: %{kind: "process", id: "tightbeam:effort-checkin"},
+                    reason_kind: "superseded",
+                    causal_source: %{kind: "wake", id: replacement.wake_id},
+                    outcome: %{
+                      kind: "replacement",
+                      replacement_wake_id: replacement.wake_id
+                    }
+                  }) do
+             :created
+           else
+             _ -> raise "expected retry race loss"
+           end
+         end) do
+      {:ok, :created} -> :created
+      {:error, %RuntimeError{message: "expected retry race loss"}} -> :lifecycle_won
+      {:error, error} -> raise error
+    end
+  end
+
+  defp run_lifecycle!(db, _assignment_id, holder, :retirement), do: retire!(db, holder)
+
+  defp run_lifecycle!(db, assignment_id, holder, transition) do
+    result = transition_assignment!(db, assignment_id, holder, transition)
+    assert result.state == "closed"
+    result
+  end
+
+  defp assert_no_patrol_acknowledgment!(db, wake_id, turn_seq) do
+    assert {:ok, [[nil]]} =
+             DB.query(
+               db,
+               "SELECT answerTerminalId FROM supervision_patrol_response_episodes WHERE originatingWakeId=?1",
+               [wake_id]
+             )
+
+    assert {:ok, [[status]]} = DB.query(db, "SELECT status FROM turns WHERE seq=?1", [turn_seq])
+    assert status in ["canceled", "failed", "failed_unknown", "delivered"]
+  end
+
+  defp transition_assignment!(db, assignment_id, holder, transition) do
+    {verb, principal, params} =
+      case transition do
+        :completion ->
+          {"attest", {:session, holder}, %{assignment_id: assignment_id, kind: "completion"}}
+
+        :surrender ->
+          {"attest", {:session, holder}, %{assignment_id: assignment_id, kind: "surrender"}}
+
+        :revoke ->
+          {"revoke-assignment", {:user, "flynn"}, %{assignment_id: assignment_id}}
+      end
+
+    result =
+      Assignments.__handle__(db, verb, %{
+        verb: verb,
+        origin: principal_origin(principal),
+        principal: principal,
+        session_key: nil,
+        params: params
+      })
+
+    Map.get(result, :assignment, result)
+  end
+
+  defp principal_origin({:session, key}), do: "agent:#{key}"
+  defp principal_origin({:user, id}), do: "user:#{id}"
 
   defp terminal!(db, session_key) do
     message_id = "m_#{System.unique_integer([:positive])}"
