@@ -40,7 +40,7 @@ defmodule Tightbeam.ModelPolicy.CanonicalJSON do
   end
 
   defp encode_value(value) when is_binary(value), do: encode_string(value)
-  defp encode_value(value) when is_integer(value), do: Integer.to_string(value)
+  defp encode_value(value) when is_integer(value), do: encode_integer(value)
   defp encode_value(value) when is_float(value), do: encode_float(value)
   defp encode_value(true), do: "true"
   defp encode_value(false), do: "false"
@@ -90,6 +90,21 @@ defmodule Tightbeam.ModelPolicy.CanonicalJSON do
       end)
 
     [?", escaped, ?"]
+  end
+
+  defp encode_integer(value) do
+    float =
+      try do
+        :erlang.float(value)
+      rescue
+        ArgumentError -> raise ArgumentError, "integer is outside the finite IEEE-754 domain"
+      end
+
+    if trunc(float) == value do
+      encode_float(float)
+    else
+      raise ArgumentError, "integer is not exactly representable as an IEEE-754 double"
+    end
   end
 
   # :short gives the shortest round-tripping decimal. RFC 8785 then requires

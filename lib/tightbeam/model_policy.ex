@@ -9,7 +9,7 @@ defmodule Tightbeam.ModelPolicy do
   alias Tightbeam.ModelPolicy.CanonicalJSON
 
   @floors ~w(closed working-set any)
-  @segment ~r/^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/
+  @segment ~r/^[a-z0-9]+(?:-[a-z0-9]+)*$/
   @selection_keys ~w(harness model context effort guidance_suffix)
 
   @type source_input :: %{

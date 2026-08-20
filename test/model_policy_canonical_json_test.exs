@@ -32,6 +32,19 @@ defmodule Tightbeam.ModelPolicy.CanonicalJSONTest do
            ]) == "[333333333.3333333,1e+30,4.5,0.002,1e-27,0]"
   end
 
+  test "admits only integers exactly representable in the IEEE-754 domain" do
+    assert CanonicalJSON.encode!(9_007_199_254_740_992) == "9007199254740992"
+    assert CanonicalJSON.encode!(1_000_000_000_000_000_000_000) == "1e+21"
+
+    assert_raise ArgumentError, ~r/not exactly representable/, fn ->
+      CanonicalJSON.encode!(9_007_199_254_740_993)
+    end
+
+    assert_raise ArgumentError, ~r/outside the finite IEEE-754 domain/, fn ->
+      CanonicalJSON.encode!(Integer.pow(2, 1024))
+    end
+  end
+
   test "hashes the exact canonical bytes" do
     value = %{"b" => 2, "a" => [true, nil, "x"]}
     bytes = "{\"a\":[true,null,\"x\"],\"b\":2}"

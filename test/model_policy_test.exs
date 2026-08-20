@@ -108,6 +108,46 @@ defmodule Tightbeam.ModelPolicyTest do
     refute ModelPolicy.source_sha256(first) == ModelPolicy.source_sha256(second)
   end
 
+  test "policy ids admit numeric-leading canonical segments" do
+    substrate = """
+    schema_version = 1
+    [[capsules]]
+    model = "model-a"
+    description = "A."
+    [[capsules.forms]]
+    harness = "codex"
+    context = "default"
+    efforts = ["high"]
+    [[uses]]
+    id = "1st-use"
+    title = "First use"
+    wants = "precision"
+    floor = "closed"
+    [[uses.models]]
+    harness = "codex"
+    model = "model-a"
+    effort = "high"
+    """
+
+    assert {:ok, snapshot} =
+             ModelPolicy.compile([
+               %{
+                 kind: :substrate,
+                 name: "substrate",
+                 path: "guidance/preferred-models.toml",
+                 bytes: substrate
+               },
+               %{
+                 kind: :kungfu,
+                 name: "1st-bundle",
+                 path: "kungfu/1st-bundle/preferred-models.toml",
+                 bytes: "schema_version = 1\n"
+               }
+             ])
+
+    assert Map.has_key?(snapshot.uses, "substrate:1st-use")
+  end
+
   test "matches listed tuples and each floor exactly" do
     snapshot = compile_f21!(Base.decode64!(@f21_k_lf_b64))
     {:ok, closed} = ModelPolicy.resolve(snapshot, "fixture", "substrate:fixture-substrate-closed")
