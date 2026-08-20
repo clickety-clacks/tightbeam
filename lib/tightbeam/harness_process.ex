@@ -13,6 +13,7 @@ defmodule Tightbeam.HarnessProcess do
 
   @ssh_opts ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
   @command_timeout_ms 5_000
+  @boot_mismatch_refusal "harness boot identity does not match the current boot"
   @old_schema_refusal "The database carries a pre-release harness_processes shape; it is not upgraded by design. Reset the database and restart Tightbeam."
 
   @process_ddl """
@@ -119,7 +120,7 @@ defmodule Tightbeam.HarnessProcess do
                   """
                   SELECT 1 FROM harness_processes
                    WHERE adapterKey = ?1
-                     AND state IN ('launching','running','park_requested','kill_failed')
+                     AND state IN ('launching','running','park_requested')
                      AND resolvedAt IS NULL
                   UNION ALL
                   SELECT 1 FROM harness_park_fences WHERE adapterKey = ?1
@@ -213,6 +214,13 @@ defmodule Tightbeam.HarnessProcess do
           [key_name(key), at]
         )
 
+        [[requested_at]] =
+          DB.Txn.q(
+            txn,
+            "SELECT requestedAt FROM harness_park_fences WHERE adapterKey = ?1",
+            [key_name(key)]
+          )
+
         case latest_unresolved_in_txn(txn, key_name(key)) do
           nil ->
             :no_launch
@@ -225,10 +233,14 @@ defmodule Tightbeam.HarnessProcess do
                  SET state = 'park_requested', parkRequestedAt = COALESCE(parkRequestedAt, ?2)
                WHERE launchId = ?1 AND resolvedAt IS NULL
               """,
-              [row.launch_id, at]
+              [row.launch_id, requested_at]
             )
 
-            %{row | state: "park_requested", park_requested_at: row.park_requested_at || at}
+            %{
+              row
+              | state: "park_requested",
+                park_requested_at: row.park_requested_at || requested_at
+            }
         end
       end)
 
@@ -247,7 +259,7 @@ defmodule Tightbeam.HarnessProcess do
         SELECT
           (SELECT COUNT(*) FROM harness_processes
             WHERE adapterKey = ?1
-              AND state IN ('launching','running','park_requested','kill_failed')
+              AND state IN ('launching','running','park_requested')
               AND resolvedAt IS NULL) +
           (SELECT COUNT(*) FROM harness_park_fences WHERE adapterKey = ?1)
         """,
@@ -258,10 +270,33 @@ defmodule Tightbeam.HarnessProcess do
   end
 
   @doc "Release the per-key fence after the park has reached a terminal state."
-  @spec complete_park(DB.server(), tuple()) :: :ok
+  @spec complete_park(DB.server(), tuple() | row()) :: :ok
+  def complete_park(db, %{adapter_key: adapter_key, park_requested_at: requested_at})
+      when is_integer(requested_at) do
+    {:ok, _} =
+      DB.query(
+        db,
+        "DELETE FROM harness_park_fences WHERE adapterKey = ?1 AND requestedAt = ?2",
+        [adapter_key, requested_at]
+      )
+
+    :ok
+  end
+
   def complete_park(db, key) do
     {:ok, _} =
-      DB.query(db, "DELETE FROM harness_park_fences WHERE adapterKey = ?1", [key_name(key)])
+      DB.query(
+        db,
+        """
+        DELETE FROM harness_park_fences
+         WHERE adapterKey = ?1
+           AND NOT EXISTS (
+             SELECT 1 FROM harness_processes
+              WHERE adapterKey = ?1 AND resolvedAt IS NULL
+           )
+        """,
+        [key_name(key)]
+      )
 
     :ok
   end
@@ -282,10 +317,10 @@ defmodule Tightbeam.HarnessProcess do
     :ok = ensure_schema(db)
 
     Enum.each(unresolved(db), fn row ->
-      :ok = ensure_fence(db, row.adapter_key)
+      row = ensure_fenced_row(db, row)
 
       if reconcile_row(db, row) == :ok do
-        :ok = complete_park_name(db, row.adapter_key)
+        :ok = complete_park(db, row)
       end
     end)
 
@@ -302,12 +337,12 @@ defmodule Tightbeam.HarnessProcess do
         :ok
 
       row ->
-        :ok = ensure_fence(db, row.adapter_key)
+        row = ensure_fenced_row(db, row)
 
         terminal_state = if row.state == "park_requested", do: "closed_gracefully", else: "exited"
 
         case reconcile_row(db, row, terminal_state) do
-          :ok -> complete_park(db, key)
+          :ok -> complete_park(db, row)
           :already_resolved -> :already_resolved
           {:error, _reason} = error -> error
         end
@@ -318,16 +353,79 @@ defmodule Tightbeam.HarnessProcess do
   @spec settle_proven_dead(DB.server(), tuple()) :: :ok | :already_resolved
   def settle_proven_dead(db, key) do
     :ok = ensure_schema(db)
-    :ok = ensure_fence(db, key_name(key))
+
+    row = latest_unresolved(db, key)
+    row = if row, do: ensure_fenced_row(db, row), else: nil
 
     result =
-      case latest_unresolved(db, key) do
+      case row do
         nil -> :already_resolved
         row -> settle_proven_dead_row(db, row)
       end
 
-    :ok = complete_park(db, key)
+    :ok = complete_park(db, row || key)
     result
+  end
+
+  @doc "Apply an authenticated ruling to one exact unresolved historical park."
+  @spec settle_historical(DB.server(), String.t(), String.t(), String.t(), String.t(), tuple()) ::
+          :ok | {:error, atom()}
+  def settle_historical(db, adapter_key, launch_id, evidence, reason, principal)
+      when is_binary(adapter_key) and is_binary(launch_id) and is_binary(evidence) and
+             is_binary(reason) and
+             (elem(principal, 0) == :session or elem(principal, 0) == :user) do
+    :ok = ensure_schema(db)
+
+    result =
+      DB.transaction(db, fn txn ->
+        with {:ok, row} <- historical_target(txn, launch_id),
+             :ok <- historical_target_open(row),
+             :ok <- historical_target_adapter(row, adapter_key),
+             :ok <- historical_target_current(txn, row),
+             :ok <- historical_target_unambiguous(txn, row),
+             :ok <- historical_target_fenced(txn, row) do
+          settled_at = now()
+
+          DB.Txn.q(
+            txn,
+            "UPDATE harness_processes SET state = 'exited', resolvedAt = ?2, lastError = NULL WHERE launchId = ?1 AND resolvedAt IS NULL",
+            [row.launch_id, settled_at]
+          )
+
+          :ok =
+            EventLog.lifecycle_in_txn(
+              txn,
+              "harness_park_ruled_settled",
+              row.adapter_key,
+              inspect(%{
+                launch_id: row.launch_id,
+                principal: principal,
+                evidence: evidence,
+                reason: reason
+              })
+            )
+
+          DB.Txn.q(
+            txn,
+            "DELETE FROM harness_park_fences WHERE adapterKey = ?1 AND requestedAt = ?2",
+            [row.adapter_key, row.park_requested_at]
+          )
+
+          {:settled, row}
+        end
+      end)
+
+    case result do
+      {:ok, {:settled, row}} ->
+        record_identity_removal(db, row)
+        :ok
+
+      {:ok, {:error, reason}} ->
+        {:error, reason}
+
+      {:error, error} ->
+        raise error
+    end
   end
 
   @doc "Operator-facing launch ledger, newest first."
@@ -492,6 +590,9 @@ defmodule Tightbeam.HarnessProcess do
           )
 
         resolve(db, row, terminal_state)
+
+      {:refused, @boot_mismatch_refusal = reason} ->
+        settle_boot_mismatch(db, row, reason)
 
       {:refused, reason} ->
         kill_failed(db, row, {:signal_refused, reason})
@@ -841,22 +942,87 @@ defmodule Tightbeam.HarnessProcess do
     decode_row(row)
   end
 
-  defp ensure_fence(db, adapter_key) do
-    {:ok, _} =
-      DB.query(
-        db,
-        "INSERT OR IGNORE INTO harness_park_fences (adapterKey, requestedAt) VALUES (?1, ?2)",
-        [adapter_key, now()]
-      )
-
-    :ok
+  defp historical_target(txn, launch_id) do
+    case DB.Txn.q(
+           txn,
+           """
+           SELECT launchId, adapterKey, harness, preset, host, ssh, helperPath, identityPath,
+                  launchSequence, osPid, processGroupId, bootIdentity, identityToken,
+                  state, createdAt, parkRequestedAt, killAttemptedAt, killSentAt, resolvedAt,
+                  lastError
+             FROM harness_processes WHERE launchId = ?1
+           """,
+           [launch_id]
+         ) do
+      [row] -> {:ok, decode_row(row)}
+      [] -> {:error, :missing}
+    end
   end
 
-  defp complete_park_name(db, adapter_key) do
-    {:ok, _} =
-      DB.query(db, "DELETE FROM harness_park_fences WHERE adapterKey = ?1", [adapter_key])
+  defp historical_target_open(%{resolved_at: nil, state: state})
+       when state in ["launching", "running", "park_requested", "kill_failed"],
+       do: :ok
 
-    :ok
+  defp historical_target_open(_row), do: {:error, :terminal}
+
+  defp historical_target_adapter(%{adapter_key: adapter_key}, adapter_key), do: :ok
+  defp historical_target_adapter(_row, _adapter_key), do: {:error, :adapter_mismatch}
+
+  defp historical_target_current(txn, row) do
+    case DB.Txn.q(
+           txn,
+           "SELECT 1 FROM harness_processes WHERE adapterKey = ?1 AND launchSequence > ?2 LIMIT 1",
+           [row.adapter_key, row.launch_sequence]
+         ) do
+      [] -> :ok
+      _ -> {:error, :superseded}
+    end
+  end
+
+  defp historical_target_unambiguous(txn, row) do
+    case DB.Txn.q(
+           txn,
+           "SELECT COUNT(*) FROM harness_processes WHERE adapterKey = ?1 AND resolvedAt IS NULL",
+           [row.adapter_key]
+         ) do
+      [[1]] -> :ok
+      _ -> {:error, :ambiguous}
+    end
+  end
+
+  defp historical_target_fenced(_txn, %{park_requested_at: nil}), do: {:error, :stale_fence}
+
+  defp historical_target_fenced(txn, row) do
+    case DB.Txn.q(
+           txn,
+           "SELECT 1 FROM harness_park_fences WHERE adapterKey = ?1 AND requestedAt = ?2",
+           [row.adapter_key, row.park_requested_at]
+         ) do
+      [[1]] -> :ok
+      [] -> {:error, :stale_fence}
+    end
+  end
+
+  defp ensure_fenced_row(db, row) do
+    {:ok, requested_at} =
+      DB.transaction(db, fn txn ->
+        DB.Txn.q(
+          txn,
+          "INSERT OR IGNORE INTO harness_park_fences (adapterKey, requestedAt) VALUES (?1, ?2)",
+          [row.adapter_key, now()]
+        )
+
+        [[requested_at]] =
+          DB.Txn.q(
+            txn,
+            "SELECT requestedAt FROM harness_park_fences WHERE adapterKey = ?1",
+            [row.adapter_key]
+          )
+
+        requested_at
+      end)
+
+    %{row | park_requested_at: requested_at}
   end
 
   defp clear_orphan_fences(db) do
@@ -948,10 +1114,72 @@ defmodule Tightbeam.HarnessProcess do
           [row.launch_id, inspect(reason)]
         )
 
-        DB.Txn.changes(txn) == 1
+        recorded? = DB.Txn.changes(txn) == 1
+        clear_matching_fence_in_txn(txn, row)
+        recorded?
       end)
 
     if recorded?, do: {:error, {:kill_failed, reason}}, else: :already_resolved
+  end
+
+  defp settle_boot_mismatch(db, row, reason) do
+    {:ok, settled?} =
+      DB.transaction(db, fn txn ->
+        DB.Txn.q(
+          txn,
+          "UPDATE harness_processes SET state = 'exited', resolvedAt = ?2, lastError = NULL WHERE launchId = ?1 AND resolvedAt IS NULL",
+          [row.launch_id, now()]
+        )
+
+        settled? = DB.Txn.changes(txn) == 1
+
+        if settled? do
+          :ok =
+            EventLog.lifecycle_in_txn(
+              txn,
+              "harness_launch_boot_mismatch",
+              row.adapter_key,
+              inspect(%{launch_id: row.launch_id, evidence: reason})
+            )
+        end
+
+        clear_matching_fence_in_txn(txn, row)
+        settled?
+      end)
+
+    if settled? do
+      record_identity_removal(db, row)
+      :ok
+    else
+      :already_resolved
+    end
+  end
+
+  defp clear_matching_fence_in_txn(_txn, %{park_requested_at: nil}), do: :ok
+
+  defp clear_matching_fence_in_txn(txn, row) do
+    DB.Txn.q(
+      txn,
+      "DELETE FROM harness_park_fences WHERE adapterKey = ?1 AND requestedAt = ?2",
+      [row.adapter_key, row.park_requested_at]
+    )
+
+    :ok
+  end
+
+  defp record_identity_removal(db, row) do
+    case remove_identity(row) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        EventLog.lifecycle(
+          db,
+          "identity_remove_failed",
+          row.adapter_key,
+          inspect(%{launch_id: row.launch_id, reason: reason})
+        )
+    end
   end
 
   defp settle_cleanup_failure(db, row, phase, reason) do

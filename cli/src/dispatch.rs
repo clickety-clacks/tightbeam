@@ -909,6 +909,23 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
         Command::HarnessProcesses { identity } => {
             Ok(request(identity, "harness-processes", vec![], vec![]))
         }
+        Command::HarnessProcessSettle {
+            identity,
+            adapter_key,
+            launch_id,
+            evidence,
+            reason,
+        } => Ok(request(
+            identity,
+            "harness-process-settle",
+            vec![],
+            vec![
+                string_field("adapterKey", adapter_key),
+                string_field("launchId", launch_id),
+                string_field("evidence", evidence),
+                string_field("reason", reason),
+            ],
+        )),
     }
 }
 
@@ -1507,7 +1524,8 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::HostEnvSet { identity, .. }
         | Command::HostEnvList { identity, .. }
         | Command::HostEnvUnset { identity, .. }
-        | Command::HarnessProcesses { identity } => Some(identity),
+        | Command::HarnessProcesses { identity }
+        | Command::HarnessProcessSettle { identity, .. } => Some(identity),
         Command::Help
         | Command::CommandHelp(_)
         | Command::Doctor { .. }
@@ -1637,6 +1655,27 @@ mod tests {
         assert_eq!(
             body(&["harness-process", "list", "--as-user", "flynn"]),
             r#"{"asUser":"flynn","verb":"harness-processes","params":{}}"#
+        );
+    }
+
+    #[test]
+    fn builds_harness_process_settlement_request() {
+        assert_eq!(
+            body(&[
+                "harness-process",
+                "settle",
+                "--adapter-key",
+                "claude:shared@testhost",
+                "--launch",
+                "launch-1",
+                "--evidence",
+                "boot record",
+                "--reason",
+                "operator ruling",
+                "--as-user",
+                "flynn",
+            ]),
+            r#"{"asUser":"flynn","verb":"harness-process-settle","params":{"adapterKey":"claude:shared@testhost","launchId":"launch-1","evidence":"boot record","reason":"operator ruling"}}"#
         );
     }
 

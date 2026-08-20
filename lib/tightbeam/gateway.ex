@@ -908,6 +908,7 @@ defmodule Tightbeam.Gateway do
           coordinator = Map.get(config, :adapter_coordinator, Tightbeam.AdapterCoordinator)
           %{harness_processes: AdapterCoordinator.harness_processes(coordinator)}
         end),
+      "harness-process-settle" => fn call -> harness_process_settle_result(db, call) end,
       "role-create" => fn call -> role_create_result(db, call) end,
       "role-bind" => fn call -> role_bind_result(db, call) end,
       "role-rm" => fn call -> role_rm_result(db, call) end,
@@ -4388,6 +4389,58 @@ defmodule Tightbeam.Gateway do
   end
 
   defp principal_caller(db, call), do: resolve_caller(db, call.origin)
+
+  defp harness_process_settle_result(db, call) do
+    with {:ok, principal} <- settlement_principal(Map.get(call, :principal)),
+         {:ok, adapter_key} <- settlement_text(call.params, :adapter_key),
+         {:ok, launch_id} <- settlement_text(call.params, :launch_id),
+         {:ok, evidence} <- settlement_text(call.params, :evidence),
+         {:ok, reason} <- settlement_text(call.params, :reason),
+         :ok <-
+           Tightbeam.HarnessProcess.settle_historical(
+             db,
+             adapter_key,
+             launch_id,
+             evidence,
+             reason,
+             principal
+           ) do
+      %{ok: true, launch_id: launch_id, adapter_key: adapter_key}
+    else
+      {:error, :principal_required} ->
+        %{ok: false, code: "principal_required", message: "session or user principal required"}
+
+      {:error, :missing_parameter} ->
+        %{
+          ok: false,
+          code: "invalid",
+          message: "adapter key, launch id, evidence, and reason are required"
+        }
+
+      {:error, refusal} ->
+        %{ok: false, code: to_string(refusal), message: settlement_refusal_message(refusal)}
+    end
+  end
+
+  defp settlement_principal({kind, value})
+       when kind in [:session, :user] and is_binary(value) and value != "",
+       do: {:ok, {kind, value}}
+
+  defp settlement_principal(_principal), do: {:error, :principal_required}
+
+  defp settlement_text(params, key) do
+    case Map.get(params, key) do
+      value when is_binary(value) and value != "" -> {:ok, value}
+      _ -> {:error, :missing_parameter}
+    end
+  end
+
+  defp settlement_refusal_message(:missing), do: "harness launch not found"
+  defp settlement_refusal_message(:terminal), do: "harness launch is already terminal"
+  defp settlement_refusal_message(:adapter_mismatch), do: "launch does not belong to adapter"
+  defp settlement_refusal_message(:superseded), do: "harness launch has been superseded"
+  defp settlement_refusal_message(:ambiguous), do: "adapter has multiple unresolved launches"
+  defp settlement_refusal_message(:stale_fence), do: "launch has no matching park fence"
 
   # `admin_origin?/2`'s TOCTOU counterpart: the admin bypass must ask the same
   # immutable-principal question `principal_caller/2` does, not re-derive "who

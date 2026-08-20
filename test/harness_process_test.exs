@@ -273,7 +273,7 @@ defmodule Tightbeam.HarnessProcessTest do
     assert :ok = HarnessProcess.capture_identity(ctx.db, launch_id, :infinity)
   end
 
-  test "kill delivery failure remains fenced and the reconcile sweep retries it", ctx do
+  test "kill delivery failure remains evidence and the reconcile sweep retries it", ctx do
     {_port, row} = launch_stubborn(ctx, {:claude, "shared", "testhost"})
     assert {:ok, fenced} = HarnessProcess.begin_park(ctx.db, {:claude, "shared", "testhost"})
     failing_helper = System.find_executable("false")
@@ -290,7 +290,7 @@ defmodule Tightbeam.HarnessProcessTest do
     assert {:error, {:kill_failed, {:sigkill_not_delivered, 1, ""}}} =
              HarnessProcess.park(ctx.db, fenced)
 
-    assert HarnessProcess.fenced?(ctx.db, {:claude, "shared", "testhost"})
+    refute HarnessProcess.fenced?(ctx.db, {:claude, "shared", "testhost"})
     assert [%{state: "kill_failed"}] = HarnessProcess.list(ctx.db)
 
     {:ok, _} =
@@ -322,7 +322,7 @@ defmodule Tightbeam.HarnessProcessTest do
     assert {:error, {:kill_failed, :sigkill_delivery_unconfirmed}} =
              HarnessProcess.park(ctx.db, fenced)
 
-    assert HarnessProcess.fenced?(ctx.db, {:claude, "shared", "testhost"})
+    refute HarnessProcess.fenced?(ctx.db, {:claude, "shared", "testhost"})
     assert [%{state: "kill_failed", resolved_at: nil}] = HarnessProcess.list(ctx.db)
   end
 
@@ -605,7 +605,7 @@ defmodule Tightbeam.HarnessProcessTest do
     refute HarnessProcess.fenced?(ctx.db, key)
   end
 
-  test "planned close returns reconciliation failure and keeps the launch fenced", ctx do
+  test "planned close returns reconciliation failure without blocking a successor", ctx do
     path = Path.join(ctx.test_dir, "planned-close-adapter.js")
     File.write!(path, @fake_adapter)
     key = {:claude, "shared", "testhost"}
@@ -656,7 +656,7 @@ defmodule Tightbeam.HarnessProcessTest do
     assert [%{state: "kill_failed", resolved_at: nil}] =
              AdapterCoordinator.harness_processes(coordinator)
 
-    assert HarnessProcess.fenced?(ctx.db, key)
+    refute HarnessProcess.fenced?(ctx.db, key)
   end
 
   test "a proven-dead cleanup refusal records the failure and starts one successor", ctx do
@@ -908,7 +908,7 @@ defmodule Tightbeam.HarnessProcessTest do
   # opposite fact (see the unlaunched tests below) and made this test a receipt
   # for the defect that fenced claude:shared@eezo forever after a mid-launch
   # crash.
-  test "a kill_failed durable park fences checkout after coordinator recreation", ctx do
+  test "a kill_failed durable park does not fence checkout after coordinator recreation", ctx do
     key = {:claude, "shared", "testhost"}
 
     _opts =
@@ -942,11 +942,158 @@ defmodule Tightbeam.HarnessProcessTest do
          name: :durable_fence_coordinator}
       )
 
-    assert {:error, {:park_fenced, "claude:shared@testhost"}} =
-             AdapterCoordinator.adapter_for(coordinator, key)
+    assert {:ok, _adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
 
-    refute_receive :adapter_started
+    assert_receive :adapter_started
     assert [%{state: "kill_failed"}] = AdapterCoordinator.harness_processes(coordinator)
+  end
+
+  test "the exact remote helper boot mismatch settles only its launch with provenance", ctx do
+    key = {:claude, "shared", "testhost"}
+    {_port, row} = launch_stubborn(ctx, key)
+    helper = refusing_group_helper(ctx, "harness boot identity does not match the current boot")
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE harness_processes SET helperPath = ?2 WHERE launchId = ?1", [
+        row.launch_id,
+        helper
+      ])
+
+    assert {:ok, parked} = HarnessProcess.begin_park(ctx.db, key)
+    assert :ok = HarnessProcess.park(ctx.db, %{parked | helper_path: helper})
+
+    assert [%{state: "exited", resolved_at: resolved_at, last_error: nil}] =
+             HarnessProcess.list(ctx.db)
+
+    assert is_integer(resolved_at)
+    refute HarnessProcess.fenced?(ctx.db, key)
+
+    assert [event] =
+             Enum.filter(
+               EventLog.lifecycle_events(ctx.db),
+               &(&1.kind == "harness_launch_boot_mismatch")
+             )
+
+    assert event.detail =~ row.launch_id
+    assert event.detail =~ "boot identity does not match"
+  end
+
+  test "historical settlement records the authenticated ruling and refuses repeats", ctx do
+    key = "claude:shared@testhost"
+    insert_historical_park(ctx.db, "historical-1", key, 1, 100)
+
+    assert :ok =
+             HarnessProcess.settle_historical(
+               ctx.db,
+               key,
+               "historical-1",
+               "incident art_a6002609",
+               "operator confirms old launch is dead",
+               {:session, "agent:coder:repair s_1"}
+             )
+
+    assert [%{state: "exited", resolved_at: resolved_at, last_error: nil}] =
+             HarnessProcess.list(ctx.db)
+
+    assert is_integer(resolved_at)
+
+    assert [event] =
+             Enum.filter(
+               EventLog.lifecycle_events(ctx.db),
+               &(&1.kind == "harness_park_ruled_settled")
+             )
+
+    assert event.detail =~ "agent:coder:repair s_1"
+    assert event.detail =~ "incident art_a6002609"
+    assert event.detail =~ "operator confirms old launch is dead"
+
+    assert {:error, :terminal} =
+             HarnessProcess.settle_historical(
+               ctx.db,
+               key,
+               "historical-1",
+               "same evidence",
+               "same reason",
+               {:user, "flynn"}
+             )
+  end
+
+  test "historical settlement refuses wrong and superseded targets without touching a successor",
+       ctx do
+    key = "claude:shared@testhost"
+
+    assert {:error, :missing} =
+             HarnessProcess.settle_historical(
+               ctx.db,
+               key,
+               "missing-launch",
+               "evidence",
+               "reason",
+               {:user, "flynn"}
+             )
+
+    insert_historical_park(ctx.db, "old-launch", key, 1, 100)
+
+    assert {:error, :adapter_mismatch} =
+             HarnessProcess.settle_historical(
+               ctx.db,
+               "codex:shared@testhost",
+               "old-launch",
+               "evidence",
+               "reason",
+               {:user, "flynn"}
+             )
+
+    {:ok, _} =
+      DB.query(ctx.db, "DELETE FROM harness_park_fences WHERE adapterKey = ?1", [key])
+
+    insert_historical_park(ctx.db, "successor", key, 2, 200)
+
+    assert {:error, :superseded} =
+             HarnessProcess.settle_historical(
+               ctx.db,
+               key,
+               "old-launch",
+               "evidence",
+               "reason",
+               {:user, "flynn"}
+             )
+
+    assert {:error, :ambiguous} =
+             HarnessProcess.settle_historical(
+               ctx.db,
+               key,
+               "successor",
+               "evidence",
+               "reason",
+               {:user, "flynn"}
+             )
+
+    assert %{state: "kill_failed", resolved_at: nil} =
+             Enum.find(HarnessProcess.list(ctx.db), &(&1.launch_id == "successor"))
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM harness_park_fences WHERE adapterKey = ?1 AND requestedAt = 200",
+               [key]
+             )
+
+    stale_key = "codex:shared@testhost"
+    insert_historical_park(ctx.db, "stale-launch", stale_key, 3, 300)
+
+    {:ok, _} =
+      DB.query(ctx.db, "DELETE FROM harness_park_fences WHERE adapterKey = ?1", [stale_key])
+
+    assert {:error, :stale_fence} =
+             HarnessProcess.settle_historical(
+               ctx.db,
+               stale_key,
+               "stale-launch",
+               "evidence",
+               "reason",
+               {:user, "flynn"}
+             )
   end
 
   # SMOKE §11 step 43: the gateway was SIGKILLed between `prepare_launch`'s
@@ -1071,6 +1218,42 @@ defmodule Tightbeam.HarnessProcessTest do
 
   defp launch_stubborn(ctx, key) do
     launch(ctx, key, ["sh", "-c", "trap '' HUP TERM; while :; do sleep 1; done"])
+  end
+
+  defp insert_historical_park(db, launch_id, adapter_key, sequence, requested_at) do
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO harness_processes
+          (launchId, adapterKey, harness, preset, host, helperPath, identityPath,
+           launchSequence, state, createdAt, parkRequestedAt, lastError)
+        VALUES (?1, ?2, 'claude', 'shared', 'testhost', '/bin/false', ?3,
+                ?4, 'kill_failed', 1, ?5, 'historical refusal')
+        """,
+        [launch_id, adapter_key, "/tmp/#{launch_id}.identity", sequence, requested_at]
+      )
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO harness_park_fences (adapterKey, requestedAt) VALUES (?1, ?2)",
+        [adapter_key, requested_at]
+      )
+
+    :ok
+  end
+
+  defp refusing_group_helper(ctx, refusal) do
+    helper = Path.join(ctx.test_dir, "refusing-group-helper")
+
+    File.write!(
+      helper,
+      "#!/bin/sh\n[ \"$1\" = \"boot-identity\" ] && exec \"#{@helper}\" \"$@\"\necho '#{refusal}' >&2\nexit 1\n"
+    )
+
+    File.chmod!(helper, 0o755)
+    helper
   end
 
   defp launch(ctx, key, cmd) do

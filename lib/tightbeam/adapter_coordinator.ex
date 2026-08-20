@@ -395,7 +395,11 @@ defmodule Tightbeam.AdapterCoordinator do
 
     result = if reconcile_result == :already_resolved, do: :ok, else: reconcile_result
     state = retire_adapter(key, state)
-    if result == :ok, do: Tightbeam.HarnessProcess.complete_park(state.db, key)
+
+    if result == :ok do
+      park = if process_row == :no_launch, do: key, else: process_row
+      Tightbeam.HarnessProcess.complete_park(state.db, park)
+    end
 
     {result, state}
   end

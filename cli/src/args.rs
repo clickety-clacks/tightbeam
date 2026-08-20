@@ -368,6 +368,13 @@ pub enum Command {
     HarnessProcesses {
         identity: Identity,
     },
+    HarnessProcessSettle {
+        identity: Identity,
+        adapter_key: String,
+        launch_id: String,
+        evidence: String,
+        reason: String,
+    },
     UpdateClients {
         as_user: String,
     },
@@ -705,6 +712,8 @@ COMMANDS:
       Remove one exact environment overlay.
   harness-process list
       List the durable harness launch ledger, newest launch first.
+  harness-process settle --adapter-key <key> --launch <id> --evidence <text> --reason <text>
+      Apply the caller's explicit ruling to one exact unresolved historical park.
 
   doctor [--json] [--base-dir p]
       Check the local Tightbeam installation and report its health.
@@ -2025,8 +2034,19 @@ fn parse_harness_process(
         (Some("list"), None, None) => Ok(Command::HarnessProcesses {
             identity: identity(flags)?,
         }),
+        (Some("settle"), None, None) => Ok(Command::HarnessProcessSettle {
+            identity: identity(flags)?,
+            adapter_key: nonempty(flags, "adapter-key").ok_or_else(|| harness_settle_usage())?,
+            launch_id: nonempty(flags, "launch").ok_or_else(|| harness_settle_usage())?,
+            evidence: nonempty(flags, "evidence").ok_or_else(|| harness_settle_usage())?,
+            reason: nonempty(flags, "reason").ok_or_else(|| harness_settle_usage())?,
+        }),
         _ => Err("usage: tightbeam harness-process list".to_owned()),
     }
+}
+
+fn harness_settle_usage() -> String {
+    "usage: tightbeam harness-process settle --adapter-key <key> --launch <id> --evidence <text> --reason <text>".to_owned()
 }
 
 fn parse_config(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Command, String> {
@@ -2186,6 +2206,36 @@ mod tests {
             Ok(Command::HarnessProcesses {
                 identity: Identity::User("flynn".to_owned()),
             })
+        );
+    }
+
+    #[test]
+    fn harness_process_settle_requires_exact_target_evidence_and_reason() {
+        assert_eq!(
+            parse(strings(&[
+                "harness-process",
+                "settle",
+                "--adapter-key",
+                "claude:shared@testhost",
+                "--launch",
+                "launch-1",
+                "--evidence",
+                "operator inspected incident evidence",
+                "--reason",
+                "old helper launch is dead",
+            ])),
+            Ok(Command::HarnessProcessSettle {
+                identity: Identity::Session,
+                adapter_key: "claude:shared@testhost".to_owned(),
+                launch_id: "launch-1".to_owned(),
+                evidence: "operator inspected incident evidence".to_owned(),
+                reason: "old helper launch is dead".to_owned(),
+            })
+        );
+
+        assert_eq!(
+            parse(strings(&["harness-process", "settle"])),
+            Err(harness_settle_usage())
         );
     }
 

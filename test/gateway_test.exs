@@ -57,6 +57,7 @@ defmodule Tightbeam.GatewayTest do
     EventLog,
     EffortCheckin,
     Gateway,
+    HarnessProcess,
     Identity,
     Idempotency,
     LaneManager,
@@ -682,6 +683,65 @@ defmodule Tightbeam.GatewayTest do
              handlers["harness-processes"].(call)
 
     assert_receive :harness_processes
+  end
+
+  test "agent settlement handler binds the authenticated principal and refuses process callers",
+       ctx do
+    :ok = HarnessProcess.ensure_schema(ctx.db)
+    key = "claude:shared@testhost"
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO harness_processes
+          (launchId, adapterKey, harness, preset, host, helperPath, identityPath,
+           launchSequence, state, createdAt, parkRequestedAt, lastError)
+        VALUES ('launch-1', ?1, 'claude', 'shared', 'testhost', '/bin/false',
+                '/tmp/launch-1.identity', 1, 'kill_failed', 1, 100, 'refusal')
+        """,
+        [key]
+      )
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO harness_park_fences (adapterKey, requestedAt) VALUES (?1, 100)",
+        [key]
+      )
+
+    handlers = Gateway.handlers(%{db: ctx.db})
+
+    params = %{
+      adapter_key: key,
+      launch_id: "launch-1",
+      evidence: "incident row",
+      reason: "human ruling"
+    }
+
+    assert %{ok: false, code: "principal_required"} =
+             handlers["harness-process-settle"].(%{
+               origin: "process:tightbeam",
+               principal: {:process, "tightbeam"},
+               params: params
+             })
+
+    assert %{ok: true, launch_id: "launch-1", adapter_key: ^key} =
+             handlers["harness-process-settle"].(%{
+               origin: "agent:coder",
+               principal: {:session, "agent:coder:repair s_1"},
+               params: params
+             })
+
+    assert [event] =
+             Enum.filter(
+               EventLog.lifecycle_events(ctx.db),
+               &(&1.kind == "harness_park_ruled_settled")
+             )
+
+    assert event.detail =~ "agent:coder:repair s_1"
+    assert event.detail =~ "incident row"
+    assert event.detail =~ "human ruling"
   end
 
   test "retire atomically cascades parent-last, interrupts assignments, and removes every wire",
