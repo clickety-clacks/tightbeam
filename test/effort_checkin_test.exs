@@ -14,6 +14,7 @@ defmodule Tightbeam.EffortCheckinTest do
     Gateway,
     Ledger,
     Org,
+    PatrolResponse,
     Placement,
     Wakes,
     WorkItems
@@ -1351,6 +1352,76 @@ defmodule Tightbeam.EffortCheckinTest do
     assert [] ==
              Wakes.list_pending(ctx.db)
              |> Enum.filter(&(&1.consumer == "prompt" and &1.assignment_id == assignment.id))
+
+    blocked_replacement = current_wake(ctx.db, assignment.id)
+
+    for _replay <- 1..5 do
+      assert :ok = EffortCheckin.probe(ctx.db, ctx.config, first_probe)
+    end
+
+    assert current_wake(ctx.db, assignment.id).wake_id == blocked_replacement.wake_id
+
+    {:ok, _fact} =
+      DB.transaction(ctx.db, fn txn ->
+        ConditionFacts.file_in_txn(txn, %{
+          kind: "work-unblocked",
+          scope: "holder",
+          origin: "session:holder"
+        })
+      end)
+
+    assert :ok = EffortCheckin.probe(ctx.db, ctx.config, blocked_replacement)
+
+    assert [[2, "probed", 0], [3, "armed", 1]] =
+             rows(
+               ctx.db,
+               "SELECT generation,state,agentProdded FROM effort_checkin_generations WHERE assignmentId=?1 AND generation >= 2 ORDER BY generation",
+               [assignment.id]
+             )
+  end
+
+  test "an armed agent-prodded bracket preserves its rung across block and five replays", ctx do
+    assignment = dispatch(ctx, {:session, "parent"}, "holder", "blocked after prod")
+    first_probe = current_wake(ctx.db, assignment.id)
+    assert :ok = EffortCheckin.probe(ctx.db, ctx.config, first_probe)
+
+    assert [[2, "armed", 1]] =
+             rows(
+               ctx.db,
+               "SELECT generation,state,agentProdded FROM effort_checkin_generations WHERE assignmentId=?1 AND state='armed'",
+               [assignment.id]
+             )
+
+    second_probe = current_wake(ctx.db, assignment.id)
+
+    {:ok, _fact} =
+      DB.transaction(ctx.db, fn txn ->
+        ConditionFacts.file_in_txn(txn, %{
+          kind: "work-blocked",
+          scope: "holder",
+          origin: "session:holder"
+        })
+      end)
+
+    assert :ok = EffortCheckin.probe(ctx.db, ctx.config, second_probe)
+
+    for _replay <- 1..5 do
+      assert :ok = EffortCheckin.probe(ctx.db, ctx.config, second_probe)
+    end
+
+    assert [[2, "probed", 1], [3, "armed", 1]] =
+             rows(
+               ctx.db,
+               "SELECT generation,state,agentProdded FROM effort_checkin_generations WHERE assignmentId=?1 AND generation >= 2 ORDER BY generation",
+               [assignment.id]
+             )
+
+    assert [[3]] =
+             rows(
+               ctx.db,
+               "SELECT COUNT(*) FROM patrol_output_sources WHERE assignmentId=?1 AND sourceKind='effort_generation_probe'",
+               [assignment.id]
+             )
   end
 
   test "filing work-blocked supersedes a request and cancels its pending outward wakes", ctx do
@@ -1398,6 +1469,349 @@ defmodule Tightbeam.EffortCheckinTest do
     assert [] ==
              Wakes.list_pending(ctx.db)
              |> Enum.filter(&(&1.assignment_id == assignment.id and &1.consumer == "prompt"))
+
+    turns_before =
+      rows(ctx.db, "SELECT COUNT(*) FROM turns WHERE assignmentId=?1", [assignment.id])
+
+    for wake <- outward, _replay <- 1..5 do
+      assert :skipped =
+               Gateway.deliver_prompt(wake.session_key, wake.origin, wake.prompt,
+                 db: ctx.db,
+                 wake_id: wake.wake_id,
+                 sender: wake.origin,
+                 target_gate: wake,
+                 fire_wake_in_txn: true,
+                 assignment_id: assignment.id
+               )
+    end
+
+    for _replay <- 1..5 do
+      assert :ok = EffortCheckin.deadline(ctx.db, ctx.config, deadline)
+    end
+
+    assert turns_before ==
+             rows(ctx.db, "SELECT COUNT(*) FROM turns WHERE assignmentId=?1", [assignment.id])
+
+    assert [[3]] =
+             rows(
+               ctx.db,
+               "SELECT COUNT(*) FROM wake_cancellations WHERE wakeId IN (?1,?2,?3)",
+               [first_outward.wake_id, second_outward.wake_id, deadline.wake_id]
+             )
+
+    assert request(ctx.db, request.id).status == "superseded"
+  end
+
+  test "F11 revoked assignments and a retired holder stop every stale effort edge once", ctx do
+    probe_assignment = dispatch(ctx, {:session, "parent"}, "holder", "stale probe")
+    request_assignment = dispatch(ctx, {:session, "parent"}, "holder", "stale request")
+    queued_assignment = dispatch(ctx, {:session, "parent"}, "holder", "stale queued prod")
+    request = escalate(ctx, request_assignment.id)
+
+    assert :ok =
+             EffortCheckin.probe(ctx.db, ctx.config, current_wake(ctx.db, queued_assignment.id))
+
+    [[queued_wake_id]] =
+      rows(
+        ctx.db,
+        "SELECT wakeId FROM patrol_output_sources WHERE assignmentId=?1 AND sourceKind='effort_generation_prod'",
+        [queued_assignment.id]
+      )
+
+    queued_wake = Wakes.get(ctx.db, queued_wake_id)
+
+    assert :appended =
+             Gateway.deliver_prompt(
+               queued_wake.session_key,
+               queued_wake.origin,
+               queued_wake.prompt,
+               db: ctx.db,
+               wake_id: queued_wake.wake_id,
+               sender: queued_wake.origin,
+               target_gate: queued_wake,
+               fire_wake_in_txn: true,
+               assignment_id: queued_assignment.id
+             )
+
+    assert [[queued_turn, "queued"]] =
+             rows(ctx.db, "SELECT seq,status FROM turns WHERE wakeId=?1", [queued_wake_id])
+
+    candidates =
+      rows(
+        ctx.db,
+        """
+        SELECT p.sourceKind,p.wakeId
+        FROM patrol_output_sources p JOIN wakes w ON w.wakeId=p.wakeId
+        WHERE p.assignmentId IN (?1,?2) AND w.state='pending'
+        ORDER BY p.sourceKind,p.wakeId
+        """,
+        [probe_assignment.id, request_assignment.id]
+      )
+
+    assert Enum.map(candidates, &hd/1) ==
+             ~w(effort_decision_deadline effort_decision_notification effort_generation_probe effort_generation_prod)
+
+    source_count =
+      rows(
+        ctx.db,
+        "SELECT COUNT(*) FROM patrol_output_sources WHERE assignmentId IN (?1,?2,?3)",
+        [probe_assignment.id, request_assignment.id, queued_assignment.id]
+      )
+
+    for assignment <- [probe_assignment, request_assignment, queued_assignment] do
+      assert %{state: "closed", outcome: "revoked"} =
+               assignment(ctx, "revoke-assignment", {:session, "parent"}, nil, %{
+                 assignment_id: assignment.id
+               })
+    end
+
+    assert %{state: "retired"} = Org.retire(ctx.db, "holder", "user:h2", 60_000)
+
+    assert rows(
+             ctx.db,
+             "SELECT COUNT(*) FROM assignments WHERE holderKey='holder' AND state='open'",
+             []
+           ) == [[0]]
+
+    assert request(ctx.db, request.id).status == "superseded"
+
+    wakes = Map.new(candidates, fn [kind, wake_id] -> {kind, Wakes.get(ctx.db, wake_id)} end)
+
+    turn_count =
+      rows(
+        ctx.db,
+        "SELECT COUNT(*) FROM turns WHERE assignmentId IN (?1,?2,?3)",
+        [probe_assignment.id, request_assignment.id, queued_assignment.id]
+      )
+
+    for _replay <- 1..5 do
+      assert :ok =
+               EffortCheckin.probe(ctx.db, ctx.config, wakes["effort_generation_probe"])
+
+      assert :ok =
+               EffortCheckin.deadline(ctx.db, ctx.config, wakes["effort_decision_deadline"])
+
+      for kind <- ["effort_generation_prod", "effort_decision_notification"] do
+        wake = wakes[kind]
+
+        assert :skipped =
+                 Gateway.deliver_prompt(wake.session_key, wake.origin, wake.prompt,
+                   db: ctx.db,
+                   wake_id: wake.wake_id,
+                   sender: wake.origin,
+                   target_gate: wake,
+                   fire_wake_in_txn: true,
+                   assignment_id: wake.assignment_id
+                 )
+      end
+
+      assert {:unclaimable, :session_retired} =
+               Ledger.claim_next(ctx.db, "holder", "f11-stale-turn")
+    end
+
+    wake_ids = Enum.map(candidates, fn [_kind, wake_id] -> wake_id end)
+
+    assert Enum.all?(wake_ids, &(Wakes.get(ctx.db, &1).state == "canceled"))
+
+    assert [[4]] =
+             rows(
+               ctx.db,
+               "SELECT COUNT(*) FROM wake_cancellations WHERE wakeId IN (?1,?2,?3,?4)",
+               wake_ids
+             )
+
+    assert [["canceled"]] =
+             rows(ctx.db, "SELECT status FROM turns WHERE seq=?1", [queued_turn])
+
+    assert source_count ==
+             rows(
+               ctx.db,
+               "SELECT COUNT(*) FROM patrol_output_sources WHERE assignmentId IN (?1,?2,?3)",
+               [probe_assignment.id, request_assignment.id, queued_assignment.id]
+             )
+
+    assert turn_count ==
+             rows(
+               ctx.db,
+               "SELECT COUNT(*) FROM turns WHERE assignmentId IN (?1,?2,?3)",
+               [probe_assignment.id, request_assignment.id, queued_assignment.id]
+             )
+  end
+
+  test "F18 real effort constructors cross internal delivery and queued-turn seams", ctx do
+    assignment = dispatch(ctx, {:session, "parent"}, "holder", "real effort sources")
+
+    assert {:ok, %{seq: dispatch_turn}} =
+             Ledger.claim_next(ctx.db, "holder", "f18-dispatch-given")
+
+    assert :ok = Ledger.finish(ctx.db, dispatch_turn, "delivered")
+
+    first_probe = current_wake(ctx.db, assignment.id)
+    assert :ok = EffortCheckin.probe(ctx.db, ctx.config, first_probe)
+    second_probe = current_wake(ctx.db, assignment.id)
+    request = fire_probe(ctx, assignment.id)
+    assert request
+
+    assert [
+             ["effort_decision_deadline", request_id, lineage_rung],
+             ["effort_decision_notification", request_id, lineage_rung],
+             ["effort_generation_probe", assignment_id, 1],
+             ["effort_generation_probe", assignment_id, 2],
+             ["effort_generation_prod", assignment_id, 1]
+           ] =
+             rows(
+               ctx.db,
+               "SELECT sourceKind,sourceRef,sourceVersion FROM patrol_output_sources WHERE assignmentId=?1 ORDER BY sourceKind,sourceVersion",
+               [assignment.id]
+             )
+
+    assert request_id == request.id
+    assert lineage_rung == request.lineage_rung
+    assert assignment_id == assignment.id
+
+    assert {:ok, :replay} =
+             DB.transaction(ctx.db, fn txn ->
+               PatrolResponse.admit_internal_in_txn(
+                 txn,
+                 first_probe.wake_id,
+                 "effort_generation_probe"
+               )
+             end)
+
+    assert {:ok, :replay} =
+             DB.transaction(ctx.db, fn txn ->
+               PatrolResponse.admit_internal_in_txn(
+                 txn,
+                 second_probe.wake_id,
+                 "effort_generation_probe"
+               )
+             end)
+
+    pending_delivery_wakes =
+      rows(
+        ctx.db,
+        "SELECT p.sourceKind,p.wakeId FROM patrol_output_sources p JOIN wakes w ON w.wakeId=p.wakeId WHERE p.assignmentId=?1 AND p.sourceKind IN ('effort_generation_prod','effort_decision_notification') AND w.state='pending' ORDER BY p.sourceKind",
+        [assignment.id]
+      )
+
+    for [_kind, wake_id] <- pending_delivery_wakes do
+      wake = Wakes.get(ctx.db, wake_id)
+
+      assert :appended =
+               Gateway.deliver_prompt(wake.session_key, wake.origin, wake.prompt,
+                 db: ctx.db,
+                 wake_id: wake.wake_id,
+                 sender: wake.origin,
+                 target_gate: wake,
+                 fire_wake_in_txn: true,
+                 assignment_id: assignment.id
+               )
+
+      assert {:ok, %{seq: seq, wake_id: ^wake_id}} =
+               Ledger.claim_next(ctx.db, wake.session_key, "f18-real-effort")
+
+      assert :ok = Ledger.finish(ctx.db, seq, "delivered")
+    end
+
+    assert :ok =
+             EffortCheckin.deadline(
+               ctx.db,
+               ctx.config,
+               Wakes.get(ctx.db, request.deadline_wake_id)
+             )
+  end
+
+  test "F18 decision request lineage rung and deadline wake mismatches stop once", ctx do
+    for dimension <- [:decision_request, :lineage_rung, :wake_id] do
+      assignment =
+        dispatch(ctx, {:session, "parent"}, "holder", "decision mismatch #{dimension}")
+
+      request = escalate(ctx, assignment.id)
+
+      source_kind =
+        if dimension == :wake_id,
+          do: "effort_decision_deadline",
+          else: "effort_decision_notification"
+
+      [[wake_id]] =
+        rows(
+          ctx.db,
+          "SELECT wakeId FROM patrol_output_sources WHERE assignmentId=?1 AND sourceKind=?2",
+          [assignment.id, source_kind]
+        )
+
+      wake = Wakes.get(ctx.db, wake_id)
+      source_count = rows(ctx.db, "SELECT COUNT(*) FROM patrol_output_sources", [])
+
+      case dimension do
+        :decision_request ->
+          assert {:ok, []} =
+                   DB.query(
+                     ctx.db,
+                     "UPDATE decision_requests SET status='superseded' WHERE id=?1",
+                     [request.id]
+                   )
+
+        :lineage_rung ->
+          assert {:ok, []} =
+                   DB.query(
+                     ctx.db,
+                     "UPDATE decision_requests SET lineageRung=lineageRung+1 WHERE id=?1",
+                     [
+                       request.id
+                     ]
+                   )
+
+        :wake_id ->
+          replacement =
+            Wakes.schedule(ctx.db, %{
+              session_key: wake.session_key,
+              origin: wake.origin,
+              consumer: "effort_deadline",
+              due_at: wake.due_at,
+              assignment_id: assignment.id
+            })
+
+          assert {:ok, []} =
+                   DB.query(
+                     ctx.db,
+                     "UPDATE decision_requests SET deadlineWakeId=?2 WHERE id=?1",
+                     [
+                       request.id,
+                       replacement.wake_id
+                     ]
+                   )
+      end
+
+      for _replay <- 1..5 do
+        case dimension do
+          :wake_id ->
+            assert :ok = EffortCheckin.deadline(ctx.db, ctx.config, wake)
+
+          _ ->
+            assert :skipped =
+                     Gateway.deliver_prompt(wake.session_key, wake.origin, wake.prompt,
+                       db: ctx.db,
+                       wake_id: wake.wake_id,
+                       sender: wake.origin,
+                       target_gate: wake,
+                       fire_wake_in_txn: true,
+                       assignment_id: assignment.id
+                     )
+        end
+      end
+
+      assert Wakes.get(ctx.db, wake.wake_id).state == "canceled"
+
+      assert [["patrol_source_mismatch", "no_replacement"]] =
+               rows(
+                 ctx.db,
+                 "SELECT reasonKind,outcomeKind FROM wake_cancellations WHERE wakeId=?1",
+                 [wake.wake_id]
+               )
+
+      assert source_count == rows(ctx.db, "SELECT COUNT(*) FROM patrol_output_sources", [])
+    end
   end
 
   defp dispatch(ctx, principal, holder, subject) do

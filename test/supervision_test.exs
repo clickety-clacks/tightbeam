@@ -2626,9 +2626,102 @@ defmodule Tightbeam.SupervisionTest do
     end
   end
 
-  test "F18 later destination generation and current-holder mismatches stop once", ctx do
-    for dimension <- [:destination, :generation, :current_holder] do
+  test "F18 later destination generation holder session and assignment changes stop once", ctx do
+    for dimension <- [
+          :destination,
+          :generation,
+          :current_holder
+        ] do
       assert_later_source_dimension_rejected!(ctx, dimension)
+    end
+  end
+
+  test "F18 starts from a real supervision episode through delivery and turn admission", ctx do
+    holder = "holder_f18_supervision"
+    assignment_id = "asg_f18_supervision"
+    session(ctx.db, holder, "supervisor")
+    assignment(ctx.db, assignment_id, holder, "real supervision source", 131)
+    wake = prepare_pending_patrol_wake!(ctx, assignment_id, holder)
+
+    assert {:ok,
+            [
+              [
+                ^assignment_id,
+                ^holder,
+                "supervision_episode",
+                source_ref,
+                0,
+                root_wake_id,
+                nil,
+                0
+              ]
+            ]} =
+             DB.query(
+               ctx.db,
+               "SELECT assignmentId,holderKey,sourceKind,sourceRef,sourceVersion,rootWakeId,predecessorWakeId,retryOrdinal FROM patrol_output_sources WHERE wakeId=?1",
+               [wake.wake_id]
+             )
+
+    assert source_ref == wake.wake_id
+    assert root_wake_id == wake.wake_id
+    assert :appended = admit_supervision_wake!(ctx.db, wake)
+    assert {:ok, %{wake_id: wake_id, seq: seq}} = Ledger.claim_next(ctx.db, holder, "f18-real")
+    assert wake_id == wake.wake_id
+    assert :ok = Ledger.finish(ctx.db, seq, "delivered")
+  end
+
+  test "F18 constructor rejects retired-session and closed-assignment sources", ctx do
+    for dimension <- [:session_state, :assignment_state] do
+      holder = "holder_f18_#{dimension}"
+      assignment_id = "asg_f18_#{dimension}"
+      session(ctx.db, holder, "supervisor")
+      assignment(ctx.db, assignment_id, holder, Atom.to_string(dimension), 132)
+
+      wake =
+        Wakes.schedule(ctx.db, %{
+          session_key: holder,
+          origin: "process:tightbeam",
+          prompt: "invalid lifecycle source",
+          due_at: 0,
+          assignment_id: assignment_id
+        })
+
+      assert {:ok, :ok} =
+               DB.transaction(ctx.db, fn txn ->
+                 insert_effort_generation_in_txn!(txn, assignment_id, holder, 1, wake.wake_id)
+               end)
+
+      case dimension do
+        :session_state ->
+          assert {:ok, []} =
+                   DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [
+                     holder
+                   ])
+
+        :assignment_state ->
+          assert {:ok, []} =
+                   DB.query(
+                     ctx.db,
+                     "UPDATE assignments SET state='closed',outcome='revoked',closedAt=1,closedBySession=?2 WHERE id=?1",
+                     [assignment_id, holder]
+                   )
+      end
+
+      assert {:ok, {:error, :invalid_patrol_output_source}} =
+               DB.transaction(ctx.db, fn txn ->
+                 PatrolResponse.create_effort_source_in_txn(
+                   txn,
+                   wake.wake_id,
+                   "effort_generation_prod",
+                   assignment_id,
+                   1
+                 )
+               end)
+
+      assert {:ok, [[0]]} =
+               DB.query(ctx.db, "SELECT COUNT(*) FROM patrol_output_sources WHERE wakeId=?1", [
+                 wake.wake_id
+               ])
     end
   end
 
@@ -3833,6 +3926,50 @@ defmodule Tightbeam.SupervisionTest do
     assert Wakes.list_pending(ctx.db) == []
   end
 
+  test "F11 a revoked assignment and retired holder stop a stale supervision escalation", ctx do
+    holder = "holder_f11_escalation"
+    assignment_id = "asg_f11_escalation"
+    session(ctx.db, holder, "supervisor")
+    assignment(ctx.db, assignment_id, holder, "stale escalation", 133)
+    insert_entitlement!(ctx.db, assignment_id, generation: 1, due_at: 0)
+    source_terminal = terminal!(ctx.db, holder)
+
+    assert {:escalated, 1, "supervisor"} =
+             Supervision.evaluate(ctx.db, ctx.handlers, 0, holder, source_terminal)
+
+    assert [wake] = Enum.filter(Wakes.list_pending(ctx.db), &(&1.assignment_id == assignment_id))
+
+    assert %{state: "closed", outcome: "revoked"} =
+             transition_assignment!(ctx.db, assignment_id, holder, :revoke)
+
+    assert %{state: "retired"} = Org.retire(ctx.db, holder, "user:flynn", 60_000)
+
+    for _replay <- 1..5 do
+      assert :skipped =
+               Gateway.deliver_prompt(wake.session_key, wake.origin, wake.prompt,
+                 db: ctx.db,
+                 wake_id: wake.wake_id,
+                 sender: wake.origin,
+                 target_gate: wake,
+                 fire_wake_in_txn: true,
+                 assignment_id: assignment_id
+               )
+
+      assert :none = Ledger.claim_next(ctx.db, wake.session_key, "f11-stale-escalation")
+    end
+
+    assert %{state: "canceled", fired_at: nil} = Wakes.get(ctx.db, wake.wake_id)
+
+    assert {:ok, [["obligation_disposed", "disposition"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT reasonKind,outcomeKind FROM wake_cancellations WHERE wakeId=?1",
+               [wake.wake_id]
+             )
+
+    assert {:ok, []} = DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [wake.wake_id])
+  end
+
   test "Main self-target takes the no-wake terminus exactly once", ctx do
     assignment(ctx.db, "asg_main", ctx.main.session_key, "main work", 2)
     insert_entitlement!(ctx.db, "asg_main", generation: 1, due_at: 0)
@@ -4088,7 +4225,10 @@ defmodule Tightbeam.SupervisionTest do
     assert {:no_match, :work_blocked, %{id: "asg_1"}} =
              Supervision.prod_production_matches?(ctx.db, "holder", seq)
 
-    assert :blocked = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
+    for _replay <- 1..5 do
+      assert :blocked = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
+    end
+
     assert Wakes.list_pending(ctx.db) == []
     # Nothing was claimed and nothing watermarked: retraction re-matches this
     # very terminal from current state.
@@ -4118,7 +4258,10 @@ defmodule Tightbeam.SupervisionTest do
     # The drain re-reads the standing fact and clears the branch without
     # dispatching. The claim already advanced the dedupe watermark, so this
     # terminal reads duplicate afterwards.
-    assert :duplicate = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
+    for _replay <- 1..5 do
+      assert :duplicate = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
+    end
+
     assert %{pendingBranch: nil} = Supervision.watermark(ctx.db, "holder")
     assert Wakes.list_pending(ctx.db) == []
     assert %{prodCount: 0} = Supervision.prod_state(ctx.db, "asg_1")
@@ -4154,7 +4297,10 @@ defmodule Tightbeam.SupervisionTest do
          name: :suppression_scheduler}
       )
 
-    assert :ok = Wakes.fire_due(scheduler)
+    for _replay <- 1..5 do
+      assert :ok = Wakes.fire_due(scheduler)
+    end
+
     refute_receive {:delivered, ^wake_id}, 200
 
     assert Wakes.get(ctx.db, wake_id).state == "canceled"
@@ -4287,6 +4433,32 @@ defmodule Tightbeam.SupervisionTest do
     assert :blocked = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", user_turn)
     assert Wakes.list_pending(ctx.db) == []
 
+    assert {:ok, tool_messages} =
+             DB.transaction(ctx.db, fn txn ->
+               {:appended, tool_call} =
+                 Projection.append_in_txn(txn, %{
+                   session_key: "holder",
+                   role: "assistant",
+                   content: ~s({"type":"tool_call","id":"call_f17","name":"ordinary"}),
+                   sender: "agent:holder"
+                 })
+
+               {:appended, tool_result} =
+                 Projection.append_in_txn(txn, %{
+                   session_key: "holder",
+                   role: "assistant",
+                   content: ~s({"type":"tool_result","tool_call_id":"call_f17","value":"ok"}),
+                   sender: "process:tool"
+                 })
+
+               [tool_call.id, tool_result.id]
+             end)
+
+    tool_bytes =
+      tool_messages
+      |> Enum.map(&Projection.get(ctx.db, &1))
+      |> :erlang.term_to_binary()
+
     file_fact(ctx.db, "work-unblocked", "holder")
     next_terminal = terminal!(ctx.db, "holder")
     assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", next_terminal)
@@ -4294,6 +4466,11 @@ defmodule Tightbeam.SupervisionTest do
     assert [fresh] = Wakes.list_pending(ctx.db)
     refute fresh.wake_id == user_wake.wake_id
     assert %{prodCount: 1} = Supervision.prod_state(ctx.db, "asg_1")
+
+    assert tool_bytes ==
+             tool_messages
+             |> Enum.map(&Projection.get(ctx.db, &1))
+             |> :erlang.term_to_binary()
   end
 
   test "F17 a block on another holder leaves this assignment ordinary", ctx do

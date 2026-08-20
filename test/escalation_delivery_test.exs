@@ -16,6 +16,7 @@ defmodule Tightbeam.EscalationDeliveryTest do
 
   alias Tightbeam.{
     Assignments,
+    ConditionFacts,
     DB,
     EffortCheckin,
     Escalation,
@@ -76,6 +77,38 @@ defmodule Tightbeam.EscalationDeliveryTest do
   end
 
   ## Proof 1 — statute atomicity
+
+  test "F17 an unrelated statute decision notification crosses a standing work block", ctx do
+    owner_session = Org.personal_session_key("flynn")
+
+    assert {:ok, _fact} =
+             DB.transaction(ctx.db, fn txn ->
+               ConditionFacts.file_in_txn(txn, %{
+                 kind: "work-blocked",
+                 scope: owner_session,
+                 origin: "session:#{owner_session}"
+               })
+             end)
+
+    assert {:decision_pending, request_id} =
+             Escalation.escalate(ctx.db, statute_call(), statute(), escalation_ctx())
+
+    assert [%{session_key: ^owner_session, state: "pending", target_gate: 0} = wake] =
+             notification_wakes(ctx.db)
+
+    drain!(ctx)
+
+    assert Wakes.get(ctx.db, wake.wake_id).state == "fired"
+
+    assert [["queued", ^owner_session]] =
+             rows(ctx.db, "SELECT status,sessionKey FROM turns WHERE wakeId=?1", [wake.wake_id])
+
+    assert count(
+             ctx.db,
+             "SELECT COUNT(*) FROM decision_requests WHERE id=?1 AND status='open'",
+             [request_id]
+           ) == 1
+  end
 
   test "proof 1: a statute request and its owner notification commit or roll back together",
        ctx do
