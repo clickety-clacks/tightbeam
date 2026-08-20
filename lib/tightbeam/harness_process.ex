@@ -230,7 +230,7 @@ defmodule Tightbeam.HarnessProcess do
               txn,
               """
               UPDATE harness_processes
-                 SET state = 'park_requested', parkRequestedAt = COALESCE(parkRequestedAt, ?2)
+                 SET state = 'park_requested', parkRequestedAt = ?2
                WHERE launchId = ?1 AND resolvedAt IS NULL
               """,
               [row.launch_id, requested_at]
@@ -239,7 +239,7 @@ defmodule Tightbeam.HarnessProcess do
             %{
               row
               | state: "park_requested",
-                park_requested_at: row.park_requested_at || requested_at
+                park_requested_at: requested_at
             }
         end
       end)

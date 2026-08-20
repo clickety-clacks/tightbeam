@@ -304,6 +304,42 @@ defmodule Tightbeam.HarnessProcessTest do
     refute HarnessProcess.fenced?(ctx.db, {:claude, "shared", "testhost"})
   end
 
+  test "a repeated refused park releases the newly opened operation fence", ctx do
+    key = {:claude, "shared", "testhost"}
+    {_port, row} = launch_stubborn(ctx, key)
+    failing_helper = System.find_executable("false")
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE harness_processes SET helperPath = ?2 WHERE launchId = ?1",
+        [row.launch_id, failing_helper]
+      )
+
+    assert {:ok, first} = HarnessProcess.begin_park(ctx.db, key)
+
+    assert {:error, {:kill_failed, {:sigkill_not_delivered, 1, ""}}} =
+             HarnessProcess.park(ctx.db, %{first | helper_path: failing_helper})
+
+    refute HarnessProcess.fenced?(ctx.db, key)
+    Process.sleep(5)
+
+    assert {:ok, second} = HarnessProcess.begin_park(ctx.db, key)
+    assert second.park_requested_at > first.park_requested_at
+
+    assert {:error, {:kill_failed, {:sigkill_not_delivered, 1, ""}}} =
+             HarnessProcess.park(ctx.db, %{second | helper_path: failing_helper})
+
+    refute HarnessProcess.fenced?(ctx.db, key)
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM harness_park_fences WHERE adapterKey = ?1",
+               ["claude:shared@testhost"]
+             )
+  end
+
   test "a kill command that never returns is bounded and remains kill_failed", ctx do
     {_port, row} = launch_stubborn(ctx, {:claude, "shared", "testhost"})
     hanging = grouped_helper(ctx, "hanging-helper", "exec sleep 30")
