@@ -16,6 +16,7 @@ defmodule Tightbeam.EffortCheckinTest do
     Org,
     PatrolResponse,
     Placement,
+    Supervision,
     Wakes,
     WorkItems
   }
@@ -1635,6 +1636,281 @@ defmodule Tightbeam.EffortCheckinTest do
                ctx.db,
                "SELECT COUNT(*) FROM turns WHERE assignmentId IN (?1,?2,?3)",
                [probe_assignment.id, request_assignment.id, queued_assignment.id]
+             )
+  end
+
+  test "F11 one tombstoned assignment rejects every new patrol source on replay", ctx do
+    assignment = dispatch(ctx, {:session, "parent"}, "holder", "post-terminal creation")
+
+    assert {:ok, %{seq: dispatch_turn}} =
+             Ledger.claim_next(ctx.db, "holder", "f11-dispatch-given")
+
+    assert :ok = Ledger.finish(ctx.db, dispatch_turn, "delivered")
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "UPDATE supervision_entitlements SET dueAt=0 WHERE assignmentId=?1",
+               [assignment.id]
+             )
+
+    handlers = Gateway.handlers(%{db: ctx.db, wake_tick_ms: ctx.config.wake_tick_ms})
+
+    assert {:escalated, 1, "parent"} =
+             Supervision.evaluate(ctx.db, handlers, 0, "holder", dispatch_turn)
+
+    first_probe = current_wake(ctx.db, assignment.id)
+    assert :ok = EffortCheckin.probe(ctx.db, ctx.config, first_probe)
+    second_probe = current_wake(ctx.db, assignment.id)
+    request = fire_probe(ctx, assignment.id)
+    assert request
+
+    assert [
+             ["effort_decision_deadline"],
+             ["effort_decision_notification"],
+             ["effort_generation_probe"],
+             ["effort_generation_prod"],
+             ["supervision_episode"]
+           ] =
+             rows(
+               ctx.db,
+               "SELECT DISTINCT sourceKind FROM patrol_output_sources WHERE assignmentId=?1 ORDER BY sourceKind",
+               [assignment.id]
+             )
+
+    [[prod_wake_id]] =
+      rows(
+        ctx.db,
+        "SELECT wakeId FROM patrol_output_sources WHERE assignmentId=?1 AND sourceKind='effort_generation_prod'",
+        [assignment.id]
+      )
+
+    prod_wake = Wakes.get(ctx.db, prod_wake_id)
+
+    assert :appended =
+             Gateway.deliver_prompt(
+               prod_wake.session_key,
+               prod_wake.origin,
+               prod_wake.prompt,
+               db: ctx.db,
+               wake_id: prod_wake.wake_id,
+               sender: prod_wake.origin,
+               target_gate: prod_wake,
+               fire_wake_in_txn: true,
+               assignment_id: assignment.id
+             )
+
+    assert [[queued_turn, "queued"]] =
+             rows(ctx.db, "SELECT seq,status FROM turns WHERE wakeId=?1", [prod_wake_id])
+
+    assert %{state: "closed", outcome: "revoked"} =
+             assignment(ctx, "revoke-assignment", {:session, "parent"}, nil, %{
+               assignment_id: assignment.id
+             })
+
+    assert %{state: "retired"} = Org.retire(ctx.db, "holder", "user:h2", 60_000)
+    assert request(ctx.db, request.id).status == "superseded"
+
+    assert [["canceled", nil, nil, nil]] =
+             rows(
+               ctx.db,
+               "SELECT status,startedAt,owner,harness FROM turns WHERE seq=?1",
+               [queued_turn]
+             )
+
+    before =
+      rows(
+        ctx.db,
+        """
+        SELECT
+          (SELECT COUNT(*) FROM wakes WHERE assignmentId=?1),
+          (SELECT COUNT(*) FROM turns WHERE assignmentId=?1),
+          (SELECT COUNT(*) FROM patrol_output_sources WHERE assignmentId=?1),
+          (SELECT COUNT(*) FROM supervision_patrol_response_episodes WHERE assignmentId=?1),
+          (SELECT COUNT(*) FROM effort_checkin_generations WHERE assignmentId=?1),
+          (SELECT COUNT(*) FROM decision_requests WHERE assignmentId=?1),
+          (SELECT COUNT(*) FROM assignment_prods WHERE assignmentId=?1),
+          (SELECT COUNT(*) FROM wake_cancellations w JOIN wakes k ON k.wakeId=w.wakeId WHERE k.assignmentId=?1),
+          (SELECT COUNT(*) FROM lifecycle_events WHERE kind='patrol_turn_stopped' AND subject=?2)
+        """,
+        [assignment.id, to_string(queued_turn)]
+      )
+
+    for replay <- 1..5,
+        source_kind <- [
+          "supervision_episode",
+          "effort_generation_probe",
+          "effort_generation_prod",
+          "effort_decision_notification",
+          "effort_decision_deadline"
+        ] do
+      marker = "f11 post-terminal #{source_kind} replay #{replay}"
+      wake_id = "w_f11_post_terminal_#{source_kind}"
+
+      assert {:error, %RuntimeError{message: ^marker}} =
+               DB.transaction(ctx.db, fn txn ->
+                 {wake, result} =
+                   case source_kind do
+                     "supervision_episode" ->
+                       wake =
+                         Wakes.schedule_in_txn(txn, %{
+                           wake_id: wake_id,
+                           session_key: "parent",
+                           origin: "process:tightbeam",
+                           prompt: "stale supervision creation",
+                           consumer: "prompt",
+                           due_at: 0,
+                           assignment_id: assignment.id,
+                           reresolve: "lineage",
+                           reresolve_seed: "holder",
+                           reresolve_rung: 1
+                         })
+
+                       DB.Txn.q(
+                         txn,
+                         "INSERT INTO supervision_liveness_sidecar (wakeId,assignmentId,controllerOrigin,wakeKind,controllerState,chargedGeneration) VALUES (?1,?2,'scheduled','escalation','pending',1)",
+                         [wake.wake_id, assignment.id]
+                       )
+
+                       DB.Txn.q(
+                         txn,
+                         "UPDATE supervision_watermarks SET pendingBranch='escalation',pendingAssignment=?2,pendingK=1,pendingN=0,lastEvaluatedTerminal=?3 WHERE sessionKey=?1",
+                         ["holder", assignment.id, dispatch_turn]
+                       )
+
+                       {wake, PatrolResponse.create_supervision_episode_in_txn(txn, wake.wake_id)}
+
+                     kind when kind in ["effort_generation_probe", "effort_generation_prod"] ->
+                       generation = if kind == "effort_generation_probe", do: 90, else: 91
+                       state = if kind == "effort_generation_probe", do: "armed", else: "probed"
+
+                       wake =
+                         Wakes.schedule_in_txn(txn, %{
+                           wake_id: wake_id,
+                           session_key: "holder",
+                           origin: "process:tightbeam",
+                           prompt:
+                             if(kind == "effort_generation_prod", do: "stale prod", else: nil),
+                           consumer:
+                             if(kind == "effort_generation_probe",
+                               do: "effort_probe",
+                               else: "prompt"
+                             ),
+                           due_at: 0,
+                           assignment_id: assignment.id
+                         })
+
+                       DB.Txn.q(
+                         txn,
+                         """
+                         INSERT INTO effort_checkin_generations
+                           (assignmentId,generation,state,baseHorizonMs,multiplier,armedAt,
+                            terminalSeqWatermark,holderKey,host,root,baseline,wakeId,evidence,
+                            agentProdded,artifactWatermark,attestWatermark,workItemWatermark)
+                         VALUES (?1,?2,?3,10,1,1,0,'holder',?4,'.',
+                                 '{"status":"unavailable","reason":"fixture"}',?5,NULL,0,0,0,0)
+                         """,
+                         [assignment.id, generation, state, ctx.holder.host, wake.wake_id]
+                       )
+
+                       {wake,
+                        PatrolResponse.create_effort_source_in_txn(
+                          txn,
+                          wake.wake_id,
+                          kind,
+                          assignment.id,
+                          generation
+                        )}
+
+                     kind ->
+                       consumer =
+                         if kind == "effort_decision_deadline",
+                           do: "effort_deadline",
+                           else: "prompt"
+
+                       wake =
+                         Wakes.schedule_in_txn(txn, %{
+                           wake_id: wake_id,
+                           session_key: "parent",
+                           origin: "process:tightbeam",
+                           prompt:
+                             if(consumer == "prompt", do: "stale decision notice", else: nil),
+                           consumer: consumer,
+                           due_at: 0,
+                           assignment_id: assignment.id,
+                           target_gate: if(consumer == "prompt", do: 0, else: 1)
+                         })
+
+                       {wake,
+                        PatrolResponse.create_effort_source_in_txn(
+                          txn,
+                          wake.wake_id,
+                          kind,
+                          request.id,
+                          request.lineage_rung
+                        )}
+                   end
+
+                 assert wake.wake_id == wake_id
+
+                 expected_error =
+                   if source_kind == "supervision_episode",
+                     do: {:error, :invalid_patrol_response_episode},
+                     else: {:error, :invalid_patrol_output_source}
+
+                 assert result == expected_error
+                 raise marker
+               end)
+
+      assert before ==
+               rows(
+                 ctx.db,
+                 """
+                 SELECT
+                   (SELECT COUNT(*) FROM wakes WHERE assignmentId=?1),
+                   (SELECT COUNT(*) FROM turns WHERE assignmentId=?1),
+                   (SELECT COUNT(*) FROM patrol_output_sources WHERE assignmentId=?1),
+                   (SELECT COUNT(*) FROM supervision_patrol_response_episodes WHERE assignmentId=?1),
+                   (SELECT COUNT(*) FROM effort_checkin_generations WHERE assignmentId=?1),
+                   (SELECT COUNT(*) FROM decision_requests WHERE assignmentId=?1),
+                   (SELECT COUNT(*) FROM assignment_prods WHERE assignmentId=?1),
+                   (SELECT COUNT(*) FROM wake_cancellations w JOIN wakes k ON k.wakeId=w.wakeId WHERE k.assignmentId=?1),
+                   (SELECT COUNT(*) FROM lifecycle_events WHERE kind='patrol_turn_stopped' AND subject=?2)
+                 """,
+                 [assignment.id, to_string(queued_turn)]
+               )
+    end
+
+    for _replay <- 1..5 do
+      assert :ok = EffortCheckin.probe(ctx.db, ctx.config, first_probe)
+      assert :ok = EffortCheckin.probe(ctx.db, ctx.config, second_probe)
+
+      assert :ok =
+               EffortCheckin.deadline(
+                 ctx.db,
+                 ctx.config,
+                 Wakes.get(ctx.db, request.deadline_wake_id)
+               )
+
+      assert :none = Ledger.claim_next(ctx.db, "holder", "f11-post-terminal")
+    end
+
+    assert before ==
+             rows(
+               ctx.db,
+               """
+               SELECT
+                 (SELECT COUNT(*) FROM wakes WHERE assignmentId=?1),
+                 (SELECT COUNT(*) FROM turns WHERE assignmentId=?1),
+                 (SELECT COUNT(*) FROM patrol_output_sources WHERE assignmentId=?1),
+                 (SELECT COUNT(*) FROM supervision_patrol_response_episodes WHERE assignmentId=?1),
+                 (SELECT COUNT(*) FROM effort_checkin_generations WHERE assignmentId=?1),
+                 (SELECT COUNT(*) FROM decision_requests WHERE assignmentId=?1),
+                 (SELECT COUNT(*) FROM assignment_prods WHERE assignmentId=?1),
+                 (SELECT COUNT(*) FROM wake_cancellations w JOIN wakes k ON k.wakeId=w.wakeId WHERE k.assignmentId=?1),
+                 (SELECT COUNT(*) FROM lifecycle_events WHERE kind='patrol_turn_stopped' AND subject=?2)
+               """,
+               [assignment.id, to_string(queued_turn)]
              )
   end
 

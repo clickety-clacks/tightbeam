@@ -2670,6 +2670,143 @@ defmodule Tightbeam.SupervisionTest do
     assert :ok = Ledger.finish(ctx.db, seq, "delivered")
   end
 
+  test "F18 queued typed turn stops one later holder mismatch through ledger admission", ctx do
+    holder = "holder_f18_queued_mismatch"
+    assignment_id = "asg_f18_queued_mismatch"
+    session(ctx.db, holder, "supervisor")
+    assignment(ctx.db, assignment_id, holder, "queued holder mismatch", 132)
+    wake = prepare_effort_root!(ctx.db, assignment_id, holder)
+
+    assert {:ok, {:appended, ^holder, _message, _opts}} =
+             DB.transaction(ctx.db, fn txn ->
+               Gateway.deliver_prompt_in_txn(
+                 txn,
+                 holder,
+                 wake.origin,
+                 wake.prompt,
+                 wake_id: wake.wake_id,
+                 sender: wake.origin,
+                 target_gate: wake,
+                 fire_wake_in_txn: true,
+                 assignment_id: assignment_id
+               )
+             end)
+
+    assert {:ok, [[queued_turn, "queued", nil, nil, nil]]} =
+             DB.query(
+               ctx.db,
+               "SELECT seq,status,startedAt,owner,harness FROM turns WHERE wakeId=?1",
+               [wake.wake_id]
+             )
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "UPDATE assignments SET holderKey='supervisor' WHERE id=?1", [
+               assignment_id
+             ])
+
+    assert {:ok, before_stop} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT
+               (SELECT COUNT(*) FROM wakes),
+               (SELECT COUNT(*) FROM turns),
+               (SELECT COUNT(*) FROM patrol_output_sources),
+               (SELECT COUNT(*) FROM wake_cancellations),
+               (SELECT COUNT(*) FROM supervision_patrol_response_episodes),
+               (SELECT COUNT(*) FROM supervision_patrol_response_episodes WHERE answerTerminalId IS NOT NULL),
+               (SELECT COUNT(*) FROM assignment_prods),
+               (SELECT COUNT(*) FROM lifecycle_events WHERE kind='patrol_turn_stopped')
+               """
+             )
+
+    assert :none = Ledger.claim_next(ctx.db, holder, "f18-queued-mismatch")
+
+    assert {:ok, [["canceled", nil, nil, nil, "patrol stop: assignment.holderKey"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT status,startedAt,owner,harness,error FROM turns WHERE seq=?1",
+               [queued_turn]
+             )
+
+    assert [stop] =
+             EventLog.lifecycle_events(ctx.db)
+             |> Enum.filter(
+               &(&1.kind == "patrol_turn_stopped" and &1.subject == to_string(queued_turn))
+             )
+
+    assert stop.detail ==
+             "wakeId=#{wake.wake_id} assignmentId=#{assignment_id} sourceKind=effort_generation_prod sourceRef=#{assignment_id} sourceVersion=1 cause=assignment.holderKey principal=process:tightbeam outcome=no_replacement"
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM wake_cancellations WHERE wakeId=?1", [
+               wake.wake_id
+             ])
+
+    assert {:ok, after_stop} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT
+               (SELECT COUNT(*) FROM wakes),
+               (SELECT COUNT(*) FROM turns),
+               (SELECT COUNT(*) FROM patrol_output_sources),
+               (SELECT COUNT(*) FROM wake_cancellations),
+               (SELECT COUNT(*) FROM supervision_patrol_response_episodes),
+               (SELECT COUNT(*) FROM supervision_patrol_response_episodes WHERE answerTerminalId IS NOT NULL),
+               (SELECT COUNT(*) FROM assignment_prods),
+               (SELECT COUNT(*) FROM lifecycle_events WHERE kind='patrol_turn_stopped')
+               """
+             )
+
+    assert [
+             [
+               wakes,
+               turns,
+               sources,
+               cancellations,
+               episodes,
+               acknowledgments,
+               prods,
+               stops_before
+             ]
+           ] =
+             before_stop
+
+    assert after_stop == [
+             [
+               wakes,
+               turns,
+               sources,
+               cancellations,
+               episodes,
+               acknowledgments,
+               prods,
+               stops_before + 1
+             ]
+           ]
+
+    for _replay <- 1..5 do
+      assert :none = Ledger.claim_next(ctx.db, holder, "f18-queued-mismatch-replay")
+    end
+
+    assert {:ok, ^after_stop} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT
+                 (SELECT COUNT(*) FROM wakes),
+                 (SELECT COUNT(*) FROM turns),
+                 (SELECT COUNT(*) FROM patrol_output_sources),
+                 (SELECT COUNT(*) FROM wake_cancellations),
+                 (SELECT COUNT(*) FROM supervision_patrol_response_episodes),
+                 (SELECT COUNT(*) FROM supervision_patrol_response_episodes WHERE answerTerminalId IS NOT NULL),
+                 (SELECT COUNT(*) FROM assignment_prods),
+                 (SELECT COUNT(*) FROM lifecycle_events WHERE kind='patrol_turn_stopped')
+               """
+             )
+  end
+
   test "F18 constructor rejects retired-session and closed-assignment sources", ctx do
     for dimension <- [:session_state, :assignment_state] do
       holder = "holder_f18_#{dimension}"
