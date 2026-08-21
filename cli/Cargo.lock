@@ -553,6 +553,7 @@ dependencies = [
 name = "tightbeam"
 version = "0.1.8"
 dependencies = [
+ "base64",
  "libc",
  "rusqlite",
  "serde_json",

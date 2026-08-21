@@ -10,6 +10,8 @@ use std::process::{ChildStdout, Command as ProcessCommand, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use base64::Engine;
+
 use crate::args::{AssimilateArgs, Identity};
 use crate::child_process::{
     RunError, Supervised, exited_without_reaping, nonblocking, reset_sigchld_before_spawn,
@@ -705,13 +707,14 @@ fn validate_api_key_with_timeout(
         "openai" => agent
             .get("https://api.openai.com/v1/models")
             .set("authorization", &format!("Bearer {key}")),
-        // /v1/me is Cursor's API-key-info endpoint: the lightest authenticated
-        // read that exists, so it proves the key without creating an agent or a
-        // run. A rejected key comes back HTTP 401, handled by the shared
-        // Status(..) arm below exactly as anthropic/openai are.
-        "cursor" => agent
-            .get("https://api.cursor.com/v1/me")
-            .set("authorization", &format!("Bearer {key}")),
+        // Cursor documents /v0/me with HTTP Basic authentication: the API key
+        // is the username and the password is empty. A rejected key still comes
+        // back HTTP 401, handled by the shared Status(..) arm below exactly as
+        // anthropic/openai are.
+        "cursor" => {
+            let (url, (name, value)) = cursor_api_key_probe(key);
+            agent.get(url).set(name, &value)
+        }
         #[cfg(test)]
         "fixture-provider" => return Ok(()),
         _ => return Err(format!("unsupported provider: {provider}")),
@@ -737,6 +740,14 @@ fn validate_api_key_with_timeout(
             Err(unvalidated_api_key(provider, &error.to_string(), host))
         }
     }
+}
+
+fn cursor_api_key_probe(key: &str) -> (&'static str, (&'static str, String)) {
+    let credentials = base64::engine::general_purpose::STANDARD.encode(format!("{key}:"));
+    (
+        "https://api.cursor.com/v0/me",
+        ("authorization", format!("Basic {credentials}")),
+    )
 }
 
 /// Let codex write its own `auth.json`.
@@ -2242,6 +2253,20 @@ mod tests {
             !names.contains(&"x-api-key"),
             "x-api-key is the OTHER kind's header"
         );
+    }
+
+    /// Cursor's documented user-key probe is GET /v0/me with the key as the
+    /// Basic-auth username and an empty password. The old /v1/me Bearer probe
+    /// returned the same 401 body for several invalid shapes, so a generic 401
+    /// fixture could not detect this request-shape regression.
+    #[test]
+    fn a_cursor_api_key_uses_the_documented_basic_auth_probe() {
+        let (url, (name, value)) = cursor_api_key_probe("cur-test-key");
+
+        assert_eq!(url, "https://api.cursor.com/v0/me");
+        assert_eq!(name, "authorization");
+        assert_eq!(value, "Basic Y3VyLXRlc3Qta2V5Og==");
+        assert!(!value.contains("Bearer"));
     }
 
     /// The refusal a truncated capture earns. Recorded signature: a bearer route answers
