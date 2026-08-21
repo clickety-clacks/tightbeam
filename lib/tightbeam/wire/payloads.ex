@@ -18,9 +18,11 @@ defmodule Tightbeam.Wire.Payloads do
     `Tightbeam.Origin`. `origin` stays beside it as the detailed provenance;
     clients render from `startedBy` and never parse the origin string.
   - A message's class is derivable from wire fields alone:
-    role=user + deviceId/clientMessageId, no sender → typed on a device;
-    role=user + sender=<origin> → delivered by wake (colleague DM,
-    operator CLI action, or automation, per the sender's class prefix);
+    role=user + deviceId/clientMessageId → typed on a device; sender, when
+    present, is its authenticated user attribution;
+    role=user + sender=<origin>, no deviceId/clientMessageId → delivered
+    by wake (colleague DM, operator CLI action, or automation, per the
+    sender's class prefix);
     role=assistant (+ sender "tightbeam") → the session's own output.
   - Wake-delivered messages carry a first-line `[from <origin>]` stamp in
     BOTH stored content and the model prompt — one string, three
@@ -28,7 +30,8 @@ defmodule Tightbeam.Wire.Payloads do
     (strip the first line and show a chip ONLY when it matches the
     `sender` field — the cross-check is the anti-forgery), and the model's
     return address. Only the first line is provenance; any `[from ...]`
-    deeper in a body is quoted text.
+    deeper in a body is quoted text. Device-typed messages never carry this
+    wake stamp in stored content or the model prompt, even when attributed.
 
   MARKER MESSAGES (normative): substrate-authored notices that mark a POINT
   in the stream, not speech — role=assistant + sender="process:tightbeam" +

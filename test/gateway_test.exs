@@ -6497,6 +6497,16 @@ defmodule Tightbeam.GatewayTest do
     assert Gateway.deliver_prompt("k1", "agent:caller", "wake", opts) == :duplicate
     assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM messages")
     assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId = 'w_1'")
+
+    assert {:ok, [["[from agent:caller]\n\nwake", "[from agent:caller]\n\nwake"]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT m.content, t.prompt
+               FROM messages m JOIN turns t ON t.messageId=m.id
+               WHERE t.wakeId='w_1'
+               """
+             )
   end
 
   # @cold_runner_prompt_timeout is 60_000 and ExUnit's default per-test timeout is
