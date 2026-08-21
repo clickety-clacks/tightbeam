@@ -2209,6 +2209,60 @@ defmodule Tightbeam.SupervisionTest do
              )
   end
 
+  test "invalid reply resolution leaves a pending supervision controller untouched", ctx do
+    registry = start_supervised!({ConnRegistry, name: :invalid_reply_controller_registry})
+    lane = start_supervised!({LaneDoorbell, :invalid_reply_controller_lane})
+
+    session(ctx.db, "reply-holder", ctx.supervisor.session_key)
+    assignment(ctx.db, "asg_reply_controller", "reply-holder", "investigate", 3)
+    insert_entitlement!(ctx.db, "asg_reply_controller", generation: 1, due_at: 0)
+    terminal_seq = terminal!(ctx.db, "reply-holder")
+
+    assert {:escalated, 1, "supervisor"} =
+             Supervision.evaluate(ctx.db, ctx.handlers, 0, "reply-holder", terminal_seq)
+
+    [wake] = Wakes.list_pending(ctx.db)
+
+    assert {:ok, [["pending", 2]]} =
+             DB.query(
+               ctx.db,
+               "SELECT controllerState,chargedGeneration FROM supervision_liveness_sidecar WHERE wakeId=?1",
+               [wake.wake_id]
+             )
+
+    assert {:ok, [[message_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM messages")
+    assert {:ok, [[turn_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
+    assert {:ok, [[event_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM causal_events")
+
+    assert :invalid_reply_reference =
+             Gateway.deliver_prompt(wake.session_key, wake.origin, wake.prompt,
+               db: ctx.db,
+               wake_id: wake.wake_id,
+               sender: wake.origin,
+               target_gate: wake,
+               fire_wake_in_txn: true,
+               conn_registry: registry,
+               lane_manager: lane,
+               reply_to_llm_visible_message_id: "missing-visible-id"
+             )
+
+    assert {:ok, [[^message_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM messages")
+    assert {:ok, [[^turn_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
+    assert {:ok, [[^event_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM causal_events")
+    assert Wakes.get(ctx.db, wake.wake_id).state == "pending"
+
+    assert {:ok, [["pending", 2]]} =
+             DB.query(
+               ctx.db,
+               "SELECT controllerState,chargedGeneration FROM supervision_liveness_sidecar WHERE wakeId=?1",
+               [wake.wake_id]
+             )
+
+    refute_receive {:push_message, _, _, _}, 0
+    refute_receive {:push, %{"event" => "prompt_turn_state"}}, 0
+    refute_receive {:ensure_lane, _}, 0
+  end
+
   test "wake validation requires the complete re-resolution triple and nudge false leaves due work pending",
        ctx do
     wake = ctx.handlers["wake"]

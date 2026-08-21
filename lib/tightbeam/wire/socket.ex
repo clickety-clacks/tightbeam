@@ -425,23 +425,26 @@ defmodule Tightbeam.Wire.Socket do
       is_nil(session) or (session.owner_user_id != state.user_id and not state.is_admin) ->
         push(Payloads.wire_error("not_found", nil, id), state)
 
-      reply_reference == :error ->
-        push(Payloads.wire_error("invalid_message", "invalid reply reference", id), state)
-
       true ->
-        {:ok, reply_to_llm_visible_message_id} = reply_reference
+        params = %{
+          content: content,
+          device_id: state.device_id,
+          client_message_id: id,
+          attachments: msg["attachments"] || []
+        }
+
+        params =
+          case reply_reference do
+            {:ok, nil} -> params
+            {:ok, reply_id} -> Map.put(params, :reply_to_llm_visible_message_id, reply_id)
+            :error -> Map.put(params, :invalid_reply_reference, true)
+          end
 
         call = %{
           verb: "post",
           origin: "user:#{state.user_id}",
           session_key: session_key,
-          params: %{
-            content: content,
-            device_id: state.device_id,
-            client_message_id: id,
-            attachments: msg["attachments"] || [],
-            reply_to_llm_visible_message_id: reply_to_llm_visible_message_id
-          }
+          params: params
         }
 
         case Dispatch.dispatch(db(state), state.deps.handlers, call) do

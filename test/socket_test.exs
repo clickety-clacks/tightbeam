@@ -353,6 +353,12 @@ defmodule Tightbeam.Wire.SocketTest do
              "messageId" => "c_reply"
            }
 
+    assert_receive {:push_message, ^main, _seq,
+                    %{"type" => "message", "clientMessageId" => "c_reply"}}
+
+    assert_receive {:push, %{"event" => "prompt_turn_state"}}
+    assert_receive {:ensure_lane, ^main}
+
     invalid_references = [
       {"c_malformed", %{}},
       {"c_missing_id", [%{"kind" => "reply"}]},
@@ -369,14 +375,30 @@ defmodule Tightbeam.Wire.SocketTest do
     ]
 
     for {id, references} <- invalid_references do
+      assert {:ok, [[message_count_before]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM messages")
+      assert {:ok, [[turn_count_before]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
+
+      assert {:ok, [[denied_count_before]]} =
+               DB.query(ctx.db, "SELECT COUNT(*) FROM events WHERE kind='denied'")
+
       frame = send_message(%{reply | "id" => id, "references" => references}, live)
 
       assert frame == %{
                "type" => "error",
                "code" => "invalid_message",
-               "message" => "invalid reply reference",
                "messageId" => id
              }
+
+      assert {:ok, [[^message_count_before]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM messages")
+      assert {:ok, [[^turn_count_before]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
+
+      assert {:ok, [[denied_count_after]]} =
+               DB.query(ctx.db, "SELECT COUNT(*) FROM events WHERE kind='denied'")
+
+      assert denied_count_after == denied_count_before + 1
+      refute_receive {:push_message, _, _, _}, 0
+      refute_receive {:push, %{"event" => "prompt_turn_state"}}, 0
+      refute_receive {:ensure_lane, _}, 0
     end
 
     assert {:ok, event_payloads} = DB.query(ctx.db, "SELECT payload FROM events")
@@ -421,6 +443,70 @@ defmodule Tightbeam.Wire.SocketTest do
              target.id,
              second_target.id
            ]
+  end
+
+  test "chat ingress preserves post params for zero reply references", ctx do
+    {:paired, device} =
+      Devices.pair(ctx.db, %{
+        device_id: "zero-reply-reference",
+        claimed_name: "Flynn",
+        platform: nil,
+        model: nil
+      })
+
+    parent = self()
+
+    handlers = %{
+      "post" => fn call ->
+        send(parent, {:post_params, call.params})
+        %{ack: call.params.client_message_id}
+      end
+    }
+
+    Rules.load!(Path.join(System.tmp_dir!(), "missing-zero-reply-rules"), Map.keys(handlers))
+
+    on_exit(fn ->
+      Rules.load!(Path.join(System.tmp_dir!(), "missing-zero-reply-reset"), [])
+    end)
+
+    deps = %{ctx.deps | handlers: handlers}
+    {:ok, socket} = Socket.init(deps)
+    auth = %{"type" => "auth", "token" => device.token, "deviceId" => device.device_id}
+
+    {:push, _auth_frames, replaying} =
+      Socket.handle_in({JSON.encode!(auth), opcode: :text}, socket)
+
+    {:push, _sync_frame, live} = Socket.handle_info(:finish_replay, replaying)
+    main = Org.personal_session_key(device.user_id)
+
+    zero_reply_frames = [
+      {"c_absent_references", %{}},
+      {"c_empty_references", %{"references" => []}},
+      {"c_unrelated_references",
+       %{"references" => [%{"kind" => "citation", "opaque" => %{"future" => true}}]}}
+    ]
+
+    for {id, extra} <- zero_reply_frames do
+      message =
+        Map.merge(
+          %{"type" => "message", "id" => id, "content" => "unchanged", "sessionKey" => main},
+          extra
+        )
+
+      assert send_message(message, live) == %{"type" => "ack", "id" => id}
+
+      assert_receive {:post_params,
+                      %{
+                        content: "unchanged",
+                        device_id: device_id,
+                        client_message_id: ^id,
+                        attachments: []
+                      } = params}
+
+      assert device_id == device.device_id
+      refute Map.has_key?(params, :reply_to_llm_visible_message_id)
+      refute Map.has_key?(params, :invalid_reply_reference)
+    end
   end
 
   test "pair and auth failures use the contract reasons", ctx do
