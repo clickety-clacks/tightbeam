@@ -632,12 +632,20 @@ defmodule Tightbeam.Gateway do
             db: db,
             device_id: p.device_id,
             client_message_id: p.client_message_id,
-            attachments: Map.get(p, :attachments, [])
+            attachments: Map.get(p, :attachments, []),
+            reply_to_llm_visible_message_id: Map.get(p, :reply_to_llm_visible_message_id)
           )
 
-        if outcome == :appended,
-          do: %{ack: p.client_message_id},
-          else: %{dedupe: to_string(outcome)}
+        case outcome do
+          :appended ->
+            %{ack: p.client_message_id}
+
+          :invalid_reply_reference ->
+            %{code: "invalid_message", message: "invalid reply reference"}
+
+          dedupe ->
+            %{dedupe: to_string(dedupe)}
+        end
       end,
       "wake" => fn call ->
         p = call.params
@@ -1009,7 +1017,7 @@ defmodule Tightbeam.Gateway do
   then broadcasts the echo and nudges the lane. Returns the dedupe outcome.
   """
   @spec deliver_prompt(String.t(), String.t(), String.t(), keyword()) ::
-          :appended | :duplicate | :conflict | :skipped
+          :appended | :duplicate | :conflict | :invalid_reply_reference | :skipped
   def deliver_prompt(session_key, origin, prompt, opts \\ []) do
     db = Keyword.get(opts, :db, Tightbeam.DB)
 
@@ -1037,6 +1045,7 @@ defmodule Tightbeam.Gateway do
           {:appended, String.t(), map(), keyword()}
           | {:duplicate, map()}
           | {:conflict, map()}
+          | :invalid_reply_reference
           | :skipped
   def deliver_prompt_in_txn(%DB.Txn{} = txn, session_key, origin, prompt, opts \\ []) do
     stamped =
@@ -1085,57 +1094,80 @@ defmodule Tightbeam.Gateway do
   end
 
   defp append_and_enqueue_in_txn(txn, target, role_ref, role_fallback, origin, stamped, opts) do
-    input = %{
-      session_key: target,
-      role: "user",
-      content: stamped,
-      device_id: opts[:device_id],
-      client_message_id: opts[:client_message_id],
-      attachments: opts[:attachments] || [],
-      sender: opts[:sender]
-    }
+    with {:ok, reply_target} <- resolve_reply_target(txn, target, opts),
+         input <- %{
+           session_key: target,
+           role: "user",
+           content: stamped,
+           device_id: opts[:device_id],
+           client_message_id: opts[:client_message_id],
+           attachments: opts[:attachments] || [],
+           sender: opts[:sender],
+           reply_to_message_id: reply_target && reply_target.id,
+           reply_to_client_message_id: reply_target && reply_target.client_message_id
+         },
+         outcome <- Projection.append_in_txn(txn, input) do
+      case outcome do
+        {:appended, message} ->
+          {assignment_id, job_ref} = turn_attribution(txn, opts)
 
-    case Projection.append_in_txn(txn, input) do
-      {:appended, message} ->
-        {assignment_id, job_ref} = turn_attribution(txn, opts)
+          enqueued =
+            Ledger.enqueue_in_txn(txn, %{
+              session_key: target,
+              message_id: message.id,
+              wake_id: opts[:wake_id],
+              origin: origin,
+              prompt: stamped,
+              role_ref: role_ref || opts[:role_ref],
+              role_fallback: role_fallback || opts[:role_fallback] || false,
+              assignment_id: assignment_id,
+              job_ref: job_ref,
+              request_ref: opts[:request_ref]
+            })
 
-        enqueued =
-          Ledger.enqueue_in_txn(txn, %{
-            session_key: target,
-            message_id: message.id,
-            wake_id: opts[:wake_id],
-            origin: origin,
-            prompt: stamped,
-            role_ref: role_ref || opts[:role_ref],
-            role_fallback: role_fallback || opts[:role_fallback] || false,
-            assignment_id: assignment_id,
-            job_ref: job_ref,
-            request_ref: opts[:request_ref]
-          })
+          case enqueued do
+            {:ok, seq} ->
+              settle_supervision_controller_in_txn(txn, opts, target, seq)
+              fire_wake_in_txn(txn, opts)
 
-        case enqueued do
-          {:ok, seq} ->
-            settle_supervision_controller_in_txn(txn, opts, target, seq)
-            fire_wake_in_txn(txn, opts)
+              # Nag-by-re-arm: a bracket wake that just fired re-arms its
+              # replacement IN this transaction if the item is still holderless
+              # and non-terminal (the lattice does not watch holderless work).
+              # No-ops for every non-bracket wake (the discriminator is the item's
+              # routing/slate wake-id matching this wake).
+              WorkItems.rearm_on_fire_in_txn(txn, opts[:wake_id], opts[:target_gate])
 
-            # Nag-by-re-arm: a bracket wake that just fired re-arms its
-            # replacement IN this transaction if the item is still holderless
-            # and non-terminal (the lattice does not watch holderless work).
-            # No-ops for every non-bracket wake (the discriminator is the item's
-            # routing/slate wake-id matching this wake).
-            WorkItems.rearm_on_fire_in_txn(txn, opts[:wake_id], opts[:target_gate])
+              {:appended, target, message, opts}
 
-            {:appended, target, message, opts}
+            # The ledger is the single writer and refuses on its own authority, so
+            # this stays reachable for any future caller even though the check
+            # above already declined this one in the same transaction.
+            {:error, :no_session} ->
+              refuse_undeliverable_turn(txn, target, origin, opts)
+          end
 
-          # The ledger is the single writer and refuses on its own authority, so
-          # this stays reachable for any future caller even though the check
-          # above already declined this one in the same transaction.
-          {:error, :no_session} ->
-            refuse_undeliverable_turn(txn, target, origin, opts)
+        other ->
+          other
+      end
+    else
+      :error -> :invalid_reply_reference
+    end
+  end
+
+  defp resolve_reply_target(txn, session_key, opts) do
+    case opts[:reply_to_llm_visible_message_id] do
+      nil ->
+        {:ok, nil}
+
+      llm_visible_message_id when is_binary(llm_visible_message_id) ->
+        case DB.Txn.q(
+               txn,
+               "SELECT id, clientMessageId FROM messages WHERE sessionKey = ?1 AND llmVisibleMessageId = ?2 LIMIT 2",
+               [session_key, llm_visible_message_id]
+             ) do
+          [[id, client_message_id]] -> {:ok, %{id: id, client_message_id: client_message_id}}
+          _ -> :error
         end
-
-      other ->
-        other
     end
   end
 
@@ -1296,7 +1328,8 @@ defmodule Tightbeam.Gateway do
   end
 
   @doc "Publish and lane-nudge a delivery after its transaction commits."
-  @spec complete_delivery(DB.server(), term()) :: :appended | :duplicate | :conflict | :skipped
+  @spec complete_delivery(DB.server(), term()) ::
+          :appended | :duplicate | :conflict | :invalid_reply_reference | :skipped
   def complete_delivery(db, {:appended, actual_session_key, message, opts}) do
     registry = Keyword.get(opts, :conn_registry, Tightbeam.ConnRegistry)
     publish_message(db, actual_session_key, message, registry)
@@ -1319,6 +1352,7 @@ defmodule Tightbeam.Gateway do
   end
 
   def complete_delivery(_db, :skipped), do: :skipped
+  def complete_delivery(_db, :invalid_reply_reference), do: :invalid_reply_reference
   def complete_delivery(_db, {:duplicate, _message}), do: :duplicate
   def complete_delivery(_db, {:conflict, _message}), do: :conflict
 
