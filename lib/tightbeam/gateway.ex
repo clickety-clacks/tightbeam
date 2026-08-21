@@ -1059,9 +1059,12 @@ defmodule Tightbeam.Gateway do
           | :invalid_reply_reference
           | :skipped
   def deliver_prompt_in_txn(%DB.Txn{} = txn, session_key, origin, prompt, opts \\ []) do
+    typed_device_message? =
+      is_binary(opts[:device_id]) and is_binary(opts[:client_message_id])
+
     stamped =
-      case opts[:sender] do
-        sender when is_binary(sender) -> "[from #{sender}]\n\n" <> prompt
+      case {opts[:sender], typed_device_message?} do
+        {sender, false} when is_binary(sender) -> "[from #{sender}]\n\n" <> prompt
         _ -> prompt
       end
 

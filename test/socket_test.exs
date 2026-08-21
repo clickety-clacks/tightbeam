@@ -144,14 +144,19 @@ defmodule Tightbeam.Wire.SocketTest do
                       "type" => "message",
                       "role" => "user",
                       "sender" => ^authenticated_sender,
+                      "content" => "hello",
                       "deviceId" => "chat-e2e",
                       "clientMessageId" => "c_once"
                     }}
 
-    assert {:ok, [[^authenticated_sender, "chat-e2e"]]} =
+    assert {:ok, [[^authenticated_sender, "chat-e2e", "hello", "hello"]]} =
              DB.query(
                ctx.db,
-               "SELECT sender, deviceId FROM messages WHERE clientMessageId='c_once'"
+               """
+               SELECT m.sender, m.deviceId, m.content, t.prompt
+               FROM messages m JOIN turns t ON t.messageId=m.id
+               WHERE m.clientMessageId='c_once'
+               """
              )
 
     {:push, {:text, duplicate_ack}, live} =
@@ -283,14 +288,19 @@ defmodule Tightbeam.Wire.SocketTest do
                       "type" => "message",
                       "role" => "user",
                       "sender" => ^admin_sender,
+                      "content" => "admin hello",
                       "deviceId" => "chat-admin",
                       "clientMessageId" => "c_admin_once"
                     }}
 
-    assert {:ok, [[^admin_sender, "chat-admin"]]} =
+    assert {:ok, [[^admin_sender, "chat-admin", "admin hello", "admin hello"]]} =
              DB.query(
                ctx.db,
-               "SELECT sender, deviceId FROM messages WHERE clientMessageId='c_admin_once'"
+               """
+               SELECT m.sender, m.deviceId, m.content, t.prompt
+               FROM messages m JOIN turns t ON t.messageId=m.id
+               WHERE m.clientMessageId='c_admin_once'
+               """
              )
 
     {:push, {:text, admin_duplicate_ack}, _admin_live} =
