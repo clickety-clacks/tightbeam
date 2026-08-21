@@ -17,12 +17,13 @@ defmodule Tightbeam.Wire.Payloads do
     class already collapsed for rendering, TOTAL, classified in
     `Tightbeam.Origin`. `origin` stays beside it as the detailed provenance;
     clients render from `startedBy` and never parse the origin string.
-  - A message's class is derivable from wire fields alone:
-    role=user + deviceId/clientMessageId → typed on a device; sender, when
-    present, is its authenticated user attribution;
-    role=user + sender=<origin>, no deviceId/clientMessageId → delivered
-    by wake (colleague DM, operator CLI action, or automation, per the
-    sender's class prefix);
+  - A message's class is derivable from wire fields and the checked stamp:
+    role=user + sender=<origin> + an exact matching first-line stamp →
+    delivered by wake (colleague DM, operator CLI action, or automation, per
+    the sender's class prefix); deviceId/clientMessageId may also be present
+    as the server delivery's idempotency key;
+    role=user + deviceId/clientMessageId + no matching stamp → typed on a
+    device; sender, when present, is its authenticated user attribution;
     role=assistant (+ sender "tightbeam") → the session's own output.
   - Wake-delivered messages carry a first-line `[from <origin>]` stamp in
     BOTH stored content and the model prompt — one string, three

@@ -96,6 +96,7 @@ defmodule Tightbeam.Productions.BubbleTest do
     assert request_ref == "bubble:#{seq}"
     assert wake_id == "bubble:#{seq}:supervisor"
     assert origin == "process:tightbeam"
+    assert String.starts_with?(prompt, "[from process:tightbeam]\n\nTurn #{seq}")
     assert prompt =~ "holder"
     assert prompt =~ "quota exhausted"
 

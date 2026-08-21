@@ -631,6 +631,7 @@ defmodule Tightbeam.Gateway do
           deliver_prompt(call.session_key, call.origin, p.content,
             db: db,
             sender: call.origin,
+            authenticated_device_message: true,
             device_id: p.device_id,
             client_message_id: p.client_message_id,
             attachments: Map.get(p, :attachments, [])
@@ -1046,11 +1047,14 @@ defmodule Tightbeam.Gateway do
           | {:conflict, map()}
           | :skipped
   def deliver_prompt_in_txn(%DB.Txn{} = txn, session_key, origin, prompt, opts \\ []) do
-    typed_device_message? =
-      is_binary(opts[:device_id]) and is_binary(opts[:client_message_id])
+    # The authenticated post handler is the provenance boundary. Device/client
+    # identifiers alone are not evidence: process deliveries also use them for dedupe.
+    authenticated_device_message? =
+      opts[:authenticated_device_message] == true and is_binary(opts[:device_id]) and
+        is_binary(opts[:client_message_id])
 
     stamped =
-      case {opts[:sender], typed_device_message?} do
+      case {opts[:sender], authenticated_device_message?} do
         {sender, false} when is_binary(sender) -> "[from #{sender}]\n\n" <> prompt
         _ -> prompt
       end
