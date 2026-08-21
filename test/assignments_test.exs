@@ -877,7 +877,8 @@ defmodule Tightbeam.AssignmentsTest do
     assert is_binary(after_close.id)
   end
 
-  test "assignment readback and work-item trace project the same ordered declared files", ctx do
+  test "assignment reads, work-item get, and trace project the same ordered declared files",
+       ctx do
     paths = [
       "test/job_trace_test.exs",
       "lib/tightbeam/assignments.ex",
@@ -892,10 +893,21 @@ defmodule Tightbeam.AssignmentsTest do
       |> put_in([:params, :files], paths)
       |> then(&handle(ctx, "assign", &1))
 
+    empty =
+      assign_call({:user, "flynn"}, "project no files", nil, item.id)
+      |> then(&handle(ctx, "assign", &1))
+
     %{assignments: assignments} =
       handle(ctx, "assignments", query_call({:user, "flynn"}, "open", "holder"))
 
-    readback = Enum.find(assignments, &(&1.id == assignment.id))
+    get =
+      Tightbeam.WorkItems.__handle__(ctx.db, "work-item-get", %{
+        verb: "work-item-get",
+        principal: {:user, "flynn"},
+        origin: "user:flynn",
+        session_key: nil,
+        params: %{work_item_id: item.id}
+      })
 
     trace =
       Tightbeam.WorkItems.__handle__(ctx.db, "work-item-trace", %{
@@ -906,11 +918,13 @@ defmodule Tightbeam.AssignmentsTest do
         params: %{work_item_id: item.id}
       })
 
-    traced = Enum.find(trace.assignments, &(&1.id == assignment.id))
+    expected_files = %{assignment.id => expected, empty.id => []}
 
-    assert readback.files == expected
     assert Assignments.declared_files(ctx.db, assignment.id) == expected
-    assert traced.files == expected
+
+    for projection <- [assignments, get.assignments, trace.assignments] do
+      assert Map.new(projection, &{&1.id, &1.files}) == expected_files
+    end
   end
 
   test "verdict attests freeze provenance and project inert producer history columns", ctx do
