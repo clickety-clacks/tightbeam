@@ -176,6 +176,48 @@ defmodule Tightbeam.LaneTest do
     assert stored_error == expected
   end
 
+  test "a transaction record is delivered to its after-commit callback only after commit", ctx do
+    parent = self()
+    seq = enqueue!(ctx.db, "k1", "known failure")
+
+    runner = fn _turn ->
+      {:error,
+       %{
+         reason: "failed",
+         record_in_txn: fn txn ->
+           EventLog.lifecycle_in_txn(txn, "recorded_failure", "k1", nil)
+           :durable_record
+         end,
+         after_commit: fn :durable_record ->
+           {:ok, [[count]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM lifecycle_events WHERE kind='recorded_failure'"
+             )
+
+           send(parent, {:after_commit, count})
+         end,
+         terminal_publish: fn terminal -> send(parent, {:published, terminal}) end
+       }}
+    end
+
+    {:ok, _mgr} =
+      LaneManager.start_link(
+        db: ctx.db,
+        lane_sup: ctx.lane_sup,
+        task_sup: ctx.task_sup,
+        runner: runner,
+        interval: 60_000,
+        name: :after_commit_lane_manager
+      )
+
+    :ok = LaneManager.ensure_lane(:after_commit_lane_manager, "k1")
+
+    assert_receive {:after_commit, 1}
+    assert_receive {:published, "failed"}
+    {:ok, [["failed"]]} = DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [seq])
+  end
+
   defp eventually(fun, tries \\ 60) do
     cond do
       fun.() ->

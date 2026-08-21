@@ -180,6 +180,34 @@ defmodule Tightbeam.GatewayTest do
          {:error, %{"message" => "Internal error", "data" => %{"details" => "auth expired"}}},
          parent}
 
+    # The typed fields are the concrete ACP response specimens frozen in the
+    # reviewed provenance recon. The surrounding prose is deliberately hostile
+    # so the public projection proves that it copies none of it.
+    def handle_call({:prompt, _sid, "known codex failure", _opts}, _from, parent),
+      do:
+        {:reply,
+         {:error,
+          %{
+            "code" => -32603,
+            "message" => "Internal error",
+            "data" => %{
+              "codexErrorInfo" => "usageLimitExceeded",
+              "details" => "token=provider-secret /private/provider/payload.json"
+            }
+          }}, parent}
+
+    def handle_call({:prompt, _sid, "known claude failure", _opts}, _from, parent),
+      do:
+        {:reply,
+         {:error,
+          %{
+            "message" => "provider payload",
+            "data" => %{
+              "errorKind" => "rate_limit",
+              "details" => "credential=provider-secret https://provider.invalid/account"
+            }
+          }}, parent}
+
     def handle_call({:prompt, _sid, prompt, _opts}, from, parent) do
       send(parent, {:prompt_started, self()})
 
@@ -7527,6 +7555,311 @@ defmodule Tightbeam.GatewayTest do
            )
   end
 
+  test "known process causes persist safely on the assignment and route to its owner", ctx do
+    exact_registry =
+      start_supervised!(%{
+        id: :process_cause_conn_registry,
+        start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+      })
+
+    adapter = start_supervised!({AdapterStub, self()})
+    start_supervised!({CoordinatorStub, adapter})
+    owner_session = Org.personal_session_key("flynn")
+    create_session(ctx.db, owner_session, "flynn")
+
+    {:ok, _ref, nil} =
+      ConnRegistry.register(exact_registry, %{
+        pid: self(),
+        user_id: "flynn",
+        device_id: "process-cause",
+        is_admin: false,
+        subscriptions: MapSet.new(["chat"])
+      })
+
+    :ok =
+      DB.execute(ctx.db, """
+      INSERT INTO work_items (id, title, ownerUserId, createdByUser, createdAt)
+      VALUES ('wi_process_cause', 'Process cause', 'flynn', 'flynn', 1)
+      """)
+
+    for assignment_id <- ["asg_codex", "asg_claude", "asg_unknown", "asg_credential_known"] do
+      {:ok, _} =
+        DB.query(
+          ctx.db,
+          """
+          INSERT INTO assignments
+            (id, subject, holderKey, openedByUser, openedAt, workItemId)
+          VALUES (?1, 'Process cause test', 'k1', 'flynn', 1, 'wi_process_cause')
+          """,
+          [assignment_id]
+        )
+    end
+
+    base = gateway_children_base!()
+
+    config = %{
+      base_dir: base,
+      cwd: "/tmp",
+      port: 0,
+      default_harness: :claude,
+      default_model: Model.new("claude-fable-5"),
+      max_live_sessions_per_user: 50,
+      wake_tick_ms: 1_000,
+      onboarding_lease_ms: 1_800_000,
+      conn_registry: exact_registry,
+      db: ctx.db
+    }
+
+    {Tightbeam.LaneManager, lane_opts} =
+      config
+      |> Gateway.children()
+      |> Enum.find(&match?({Tightbeam.LaneManager, _}, &1))
+
+    runner = Keyword.fetch!(lane_opts, :runner)
+
+    run_failure = fn prompt, assignment_id ->
+      assert :appended =
+               Gateway.deliver_prompt("k1", "user:flynn", prompt,
+                 db: ctx.db,
+                 conn_registry: exact_registry,
+                 lane_manager: ctx.lane,
+                 assignment_id: assignment_id,
+                 job_ref: "wi_process_cause",
+                 client_message_id: "c_#{assignment_id}"
+               )
+
+      assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
+
+      assert {:error,
+              %{
+                reason: reason,
+                terminal_publish: publish,
+                record_in_txn: record,
+                after_commit: after_commit
+              }} = runner.(Map.put(turn, :session_key, "k1"))
+
+      assert {:ok, notice} =
+               DB.transaction(ctx.db, fn txn ->
+                 stored_error = if is_binary(reason), do: reason, else: inspect(reason)
+                 assert Ledger.finish_in_txn(txn, turn.seq, "failed", stored_error)
+                 record.(txn)
+               end)
+
+      after_commit.(notice)
+      publish.("failed")
+      {turn, collect_pushes_until_failed("c_#{assignment_id}", [])}
+    end
+
+    {codex_turn, codex_frames} = run_failure.("known codex failure", "asg_codex")
+    {claude_turn, claude_frames} = run_failure.("known claude failure", "asg_claude")
+    run_failure.("fail this turn", "asg_unknown")
+
+    typed_events =
+      ctx.db
+      |> EventLog.lifecycle_events()
+      |> Enum.filter(&(&1.kind == "assignment_process_failure"))
+
+    assert Enum.map(typed_events, & &1.subject) == ["asg_codex", "asg_claude"]
+
+    details = Enum.map(typed_events, &JSON.decode!(&1.detail))
+
+    assert details == [
+             %{
+               "actionNeeded" => true,
+               "causeSpecificity" => "concrete",
+               "reportedAtLayer" => "acp",
+               "safeCause" => %{
+                 "code" => "codex_usage_limit",
+                 "message" => "Codex usage limit reached"
+               },
+               "schemaVersion" => 1,
+               "turnSeq" => codex_turn.seq
+             },
+             %{
+               "actionNeeded" => true,
+               "causeSpecificity" => "concrete",
+               "reportedAtLayer" => "acp",
+               "safeCause" => %{
+                 "code" => "claude_rate_limit",
+                 "message" => "Claude rate limit reached"
+               },
+               "schemaVersion" => 1,
+               "turnSeq" => claude_turn.seq
+             }
+           ]
+
+    owner_markers = Projection.list_after(ctx.db, owner_session, nil, 100)
+
+    assert Enum.map(owner_markers, &{&1.content, &1.attention_tier}) == [
+             {"[assignment action needed]\n\nReview assignment asg_codex: Codex usage limit reached.",
+              1},
+             {"[assignment action needed]\n\nReview assignment asg_claude: Claude rate limit reached.",
+              1}
+           ]
+
+    safe_output =
+      Enum.map_join(typed_events, & &1.detail) <> Enum.map_join(owner_markers, & &1.content)
+
+    refute safe_output =~ "provider-secret"
+    refute safe_output =~ "/private/"
+    refute safe_output =~ "provider.invalid"
+    refute safe_output =~ "payload"
+
+    target_markers =
+      ctx.db
+      |> Projection.list_after("k1", nil, 100)
+      |> Enum.filter(&String.starts_with?(&1.content || "", "[turn failed]"))
+
+    assert Enum.at(target_markers, 0).content =~ "Codex usage limit reached"
+    assert Enum.at(target_markers, 1).content =~ "Claude rate limit reached"
+
+    failed_state_error = fn frames, assignment_id ->
+      frames
+      |> Enum.find(fn frame ->
+        frame["event"] == "prompt_turn_state" and
+          get_in(frame, ["payload", "messageId"]) == "c_#{assignment_id}" and
+          get_in(frame, ["payload", "state"]) == "failed"
+      end)
+      |> get_in(["payload", "error"])
+    end
+
+    assert failed_state_error.(codex_frames, "asg_codex") == "Codex usage limit reached"
+    assert failed_state_error.(claude_frames, "asg_claude") == "Claude rate limit reached"
+
+    {:ok, stored_errors} =
+      DB.query(
+        ctx.db,
+        "SELECT error FROM turns WHERE seq IN (?1, ?2) ORDER BY seq",
+        [codex_turn.seq, claude_turn.seq]
+      )
+
+    assert stored_errors == [["Codex usage limit reached"], ["Claude rate limit reached"]]
+
+    public_known_output =
+      Enum.map_join(Enum.take(target_markers, 2), & &1.content) <>
+        failed_state_error.(codex_frames, "asg_codex") <>
+        failed_state_error.(claude_frames, "asg_claude") <>
+        Enum.map_join(stored_errors, fn [error] -> error end)
+
+    refute public_known_output =~ "provider-secret"
+    refute public_known_output =~ "/private/"
+    refute public_known_output =~ "provider.invalid"
+    refute public_known_output =~ "payload"
+
+    refute Enum.any?(typed_events, &(&1.subject == "asg_unknown"))
+    refute Enum.any?(owner_markers, &String.contains?(&1.content, "asg_unknown"))
+
+    assert Enum.count(
+             EventLog.lifecycle_events(ctx.db),
+             &(&1.kind == "harness_turn_error" and &1.subject == "k1")
+           ) == 3
+
+    degrade_host_catalog("testhost", "claude", {:needs_onboarding, :missing})
+
+    {credential_turn, credential_frames} =
+      run_failure.("known codex failure", "asg_credential_known")
+
+    credential_marker =
+      ctx.db
+      |> Projection.list_after("k1", nil, 100)
+      |> Enum.filter(&String.starts_with?(&1.content || "", "[turn failed]"))
+      |> List.last()
+
+    assert credential_marker.content =~ "tightbeam onboard anthropic --as-user <userId>"
+    refute credential_marker.content =~ "Codex usage limit reached"
+
+    credential_state_error = failed_state_error.(credential_frames, "asg_credential_known")
+    assert credential_state_error =~ "tightbeam onboard anthropic --as-user <userId>"
+    refute credential_state_error =~ "Codex usage limit reached"
+
+    {:ok, [[credential_stored_error]]} =
+      DB.query(ctx.db, "SELECT error FROM turns WHERE seq=?1", [credential_turn.seq])
+
+    assert credential_stored_error =~ "tightbeam onboard anthropic --as-user <userId>"
+    refute credential_stored_error =~ "Codex usage limit reached"
+
+    assert Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
+             event.kind == "assignment_process_failure" and
+               event.subject == "asg_credential_known" and
+               JSON.decode!(event.detail)["safeCause"]["code"] == "codex_usage_limit"
+           end)
+  end
+
+  test "process cause recording rolls back with the failed turn finalization", ctx do
+    exact_registry =
+      start_supervised!(%{
+        id: :process_cause_rollback_registry,
+        start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+      })
+
+    adapter = start_supervised!({AdapterStub, self()})
+    start_supervised!({CoordinatorStub, adapter})
+    owner_session = Org.personal_session_key("flynn")
+    create_session(ctx.db, owner_session, "flynn")
+
+    :ok =
+      DB.execute(ctx.db, """
+      INSERT INTO work_items (id, title, ownerUserId, createdByUser, createdAt)
+      VALUES ('wi_process_rollback', 'Process rollback', 'flynn', 'flynn', 1);
+      INSERT INTO assignments
+        (id, subject, holderKey, openedByUser, openedAt, workItemId)
+      VALUES
+        ('asg_process_rollback', 'Process rollback', 'k1', 'flynn', 1,
+         'wi_process_rollback');
+      """)
+
+    config = %{
+      base_dir: gateway_children_base!(),
+      cwd: "/tmp",
+      port: 0,
+      default_harness: :claude,
+      default_model: Model.new("claude-fable-5"),
+      max_live_sessions_per_user: 50,
+      wake_tick_ms: 1_000,
+      onboarding_lease_ms: 1_800_000,
+      conn_registry: exact_registry,
+      db: ctx.db
+    }
+
+    {Tightbeam.LaneManager, lane_opts} =
+      config
+      |> Gateway.children()
+      |> Enum.find(&match?({Tightbeam.LaneManager, _}, &1))
+
+    runner = Keyword.fetch!(lane_opts, :runner)
+
+    assert :appended =
+             Gateway.deliver_prompt("k1", "user:flynn", "known codex failure",
+               db: ctx.db,
+               conn_registry: exact_registry,
+               lane_manager: ctx.lane,
+               assignment_id: "asg_process_rollback",
+               job_ref: "wi_process_rollback",
+               client_message_id: "c_process_rollback"
+             )
+
+    assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
+
+    assert {:error, %{record_in_txn: record}} =
+             runner.(Map.put(turn, :session_key, "k1"))
+
+    assert {:error, %RuntimeError{message: "forced process-cause rollback"}} =
+             DB.transaction(ctx.db, fn txn ->
+               assert Ledger.finish_in_txn(txn, turn.seq, "failed", "known failure")
+               record.(txn)
+               raise "forced process-cause rollback"
+             end)
+
+    assert {:ok, [["running"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [turn.seq])
+
+    refute Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
+             event.kind in ["harness_turn_error", "assignment_process_failure"]
+           end)
+
+    assert Projection.list_after(ctx.db, owner_session, nil, 100) == []
+  end
+
   # AC6 (spec 1ae8fa52 §O6/I7+I9). O6 RATIFIES the existing turn-path refuse-by-name
   # (`unonboarded_refusal`): a turn onto a {host, harness} whose catalog health is
   # `unavailable({:needs_onboarding, :missing})` is refused with the EXACT
@@ -9695,6 +10028,33 @@ defmodule Tightbeam.GatewayTest do
       {:ensure_lane, _key} -> collect_pushes(n, acc)
     after
       1_000 -> flunk("timed out collecting golden frames")
+    end
+  end
+
+  defp collect_pushes_until_failed(message_id, acc) do
+    receive do
+      {:push, payload} ->
+        collect_push_until_failed(payload, message_id, acc)
+
+      {:push_message, _key, _seq, payload} ->
+        collect_push_until_failed(payload, message_id, acc)
+
+      {:ensure_lane, _key} ->
+        collect_pushes_until_failed(message_id, acc)
+    after
+      1_000 -> flunk("timed out collecting failed turn frames")
+    end
+  end
+
+  defp collect_push_until_failed(payload, message_id, acc) do
+    frames = [payload | acc]
+
+    if payload["event"] == "prompt_turn_state" and
+         get_in(payload, ["payload", "messageId"]) == message_id and
+         get_in(payload, ["payload", "state"]) == "failed" do
+      Enum.reverse(frames)
+    else
+      collect_pushes_until_failed(message_id, frames)
     end
   end
 
