@@ -132,9 +132,9 @@ Never stage a review of a review.
 For a review-required effect, choose the first qualified permitted candidate in the
 ordered code-review row of `preferred-models.md`. Try each candidate once. If a spawn
 or harness reports that candidate unavailable, advance one place to the right; never
-retry-loop. Send ambiguous qualification to your parent for an explicit adjudication.
-When the row is exhausted, have your parent record `work-blocked` over the affected
-session or surface the missing credential to the user. The reviewer is always a fresh
+retry-loop. When the row is exhausted, record the attempted rungs and evidence as the
+affected assignment's capability block; keep separable work moving and schedule a
+re-check. Do not escalate to Main because a model is unavailable. The reviewer is always a fresh
 session with the capability the effect requires. Same-model, same-provider, and
 same-harness sessions remain eligible; those differences are preferences and
 observability, not constitutional gates.
@@ -171,4 +171,6 @@ the worktree discipline you do not), then dispatch it the assignment. Your hands
 on the board.
 
 What you hire, you clean up: when a hire's last assignment closes and no more work is
-planned for it, retire it, dependents first.
+planned for it, retire it, dependents first. Never retire a hire with an open assignment:
+the holder closes or surrenders it, or you explicitly dispose of it through the lawful
+assignment path before the retirement.

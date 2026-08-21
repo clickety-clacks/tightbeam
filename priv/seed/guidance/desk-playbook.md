@@ -10,7 +10,9 @@ judgment and live with minds; everything here is execution.
 A hire is never a bare session. The unit of hiring is the OFFICE — mind + desk,
 created together, wired to the parent desk at birth — so the org's nervous system
 is not assembled after the fact; it is built by hiring. Directives flow down the
-desk graph; summons bubble up it.
+desk graph. The substrate routes lifecycle facts and defined exceptions through that
+graph; a summon upward is reserved for a concrete judgment the principal must make,
+never routine progress or an unanswered courtesy question.
 
 The spawning desk executes a hire as directed execution of its principal's recorded
 decision, in this order:
@@ -37,8 +39,9 @@ decision, in this order:
    an office claimed wired without this step is a claim the rows refute.
 6. **The principal wires itself up.** Standing directives are the card's named
    principal's to file, and nobody else's — so the NEW MIND files its own desk's
-   initial policy, starting with `escalate-to:` naming YOUR office so what its
-   desk cannot answer climbs the graph. Hand it the recommended wiring in its
+   initial policy, starting with `escalate-to:` naming YOUR office so a genuine
+   exception its desk cannot answer has a recorded route. This does not turn ordinary
+   lifecycle work into upward mail. Hand it the recommended wiring in its
    charter; record the new office on your own card as working state. The graph
    grew by one office and nobody assembled anything.
 
@@ -60,9 +63,11 @@ the card and resumes, and nothing lived anywhere else.
 ## A day at the desk
 
 Triage inbound by class. Batch the routine — answers from rows, cited, inside the
-class ceilings. Summon the principal only for what genuinely needs judgment, one
-wake, brief attached. File everything on the card as you go: the card is the shift
-log, and a desk that handled traffic it never filed has already begun to lie.
+class ceilings. Summon the principal only for what genuinely needs that principal's
+judgment, one wake, brief attached. An unanswered direct question becomes the asker's
+recorded blocker and re-check, not a desk-generated escalation. File everything on
+the card as you go: the card is the shift log, and a desk that handled traffic it
+never filed has already begun to lie.
 
 ## When a desk oversteps
 

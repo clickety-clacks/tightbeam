@@ -26,8 +26,10 @@ seam, never silent):
 - `dnd-until:` — no summons before the stated time. A time, always — do-not-disturb
   with no end is a state whose exit is someone else's decision, and no such state
   exists here.
-- `escalate-to:` — the named role or session that takes what the desk cannot answer
-  and must not sit on. Unset, escalation follows the principal's own chain.
+- `escalate-to:` — the named role or session for a genuine exception the desk cannot
+  answer and must not sit on. It is not a route for ordinary lifecycle updates,
+  unanswered peer questions, or a routine appeal to Main. Unset, a genuine exception
+  follows the principal's recorded chain.
 
 **Personal never overrides skeletal.** A directive shapes only its own principal's
 attention — that is why the principal may file one instantly, no permission asked:

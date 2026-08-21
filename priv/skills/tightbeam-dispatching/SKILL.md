@@ -35,6 +35,12 @@ Do not file "still working," "unchanged," "waiting," or "no update."
 Do not repeat a result, blocker, refusal, decision request, or checkpoint
 without new evidence or owner-relevant state.
 
+Ask another agent only when answering is that agent's normal work. If its
+answer is necessary and does not arrive, keep the question and evidence as
+your assignment's exact blocker, continue separable work, and schedule a
+re-check. Do not chase a parent or Main merely because the answer is late;
+normal lifecycle routing is the substrate's job.
+
 If no reporting exception applies, record the one valid bounded checkpoint
 when available or schedule a concrete continuation wake. Never manufacture
 a generic progress attest. Completion and surrender remain truthful terminal

@@ -10,10 +10,12 @@ is time.
 
 Day one, a fresh org has exactly one guardian arrangement:
 
-- **The prodder is always on**, escalating to Main. It is the deterministic
-  starvation floor — any obligation or unanswered decision quiet past its watermark
-  escalates, judged by nobody. Its rings land on Main because **Main is the day-one
-  nurse**: until the org hires better, the root session adjudicates its own rings.
+- **The prodder is always on**, routing root-terminal starvation cases to Main. It is
+  the deterministic floor — any obligation or unanswered decision quiet past its
+  watermark is surfaced as a fact, judged by nobody. Its rings land on Main because
+  **Main is the day-one nurse**: until the org hires better, the root session
+  adjudicates its own rings. This is substrate routing for terminal/root conditions,
+  never a normal agent-to-Main escalation path.
 
 Two hires wait in the seed, unstaffed:
 

@@ -66,8 +66,13 @@ one with `tightbeam cancel-wake <wakeId>`. A checkpoint names the exact boundary
 
 ## Work with colleagues without disrupting them
 Ask a colleague when that colleague can answer something you need to do your job. Do not send
-idle status requests or nudges. Send your owner only new material results or evidence, exact
-blockers or refusals, and bounded decision requests.
+idle status requests or nudges. Ordinary progress belongs in assignment rows, not in
+upward chat with your parent or Main. Send your owner only new material results or evidence,
+an exact blocker or refusal, or a bounded decision request that is actually theirs to decide.
+If a necessary direct question goes unanswered, record the question and evidence as a blocker
+on your own assignment, keep separable work moving, and schedule a re-check; do not keep
+escalating the silence. The substrate routes lifecycle exceptions through the recorded work
+graph. Main is for root-terminal cases, not a routine fallback.
 
 ## Say how urgent a wake is: --class
 Attention is the scarcest thing this org has. Tell tightbeam how urgent a message is and it
@@ -100,10 +105,11 @@ Read the answer with `tightbeam decision-requests` or `tightbeam decision-reques
 
 THE QUESTION HOLDS NOTHING. Filing it does not pause your assignment, your turn, or your
 obligations — nothing in tightbeam blocks on an open question, by design. You still owe what
-you owed a minute ago, and you choose what to do while you wait: carry on with what you can
-decide yourself, pick up other work, or surrender the card with a note saying what you asked
-and why you could not proceed. What you must not do is go quiet: a session sitting idle on an
-open question is the failure the effort check-in exists to catch.
+you owed a minute ago: carry on with what you can decide yourself or pick up separable work.
+When the answer is necessary and has not arrived, file the exact blocker on your own assignment
+and schedule a re-check. Do not make silence into a parent/Main conversation. What you must not
+do is go quiet: a session sitting idle on an open question is the failure the effort check-in
+exists to catch.
 
 Take a question back yourself when you no longer need it — nobody else can, and nobody has to
 act for you to move on:
@@ -157,7 +163,10 @@ dispatch: open it first (`tightbeam assign --subject "..." --work-item <id>`), t
 the holder with at most one sentence plus the assignment id. The rows are the brief; a
 wake without a card you opened is an expectation you chose not to record. Thread every
 assignment to the work item it serves. What you hire, you clean up: when a hire's last
-assignment closes and no more work is planned for it, retire it — dependents first.
+assignment closes and no more work is planned for it, retire it — dependents first. Never retire
+a session with an open assignment: its holder must first file completion or surrender, or its
+opener must explicitly dispose of the work through the lawful assignment path. Retirement does
+not silently solve unfinished work.
 
 ## Before you build what tightbeam already is
 When work — yours or the user's ask — starts to look like one of these, tightbeam (or
@@ -196,9 +205,10 @@ yet enforce this, so the discipline is yours: `--role`, every time you open one.
 
 "Blocked" is a state you report and carry; "surrendered" is a state you end in. Never
 use one to say the other. Blocked: file the exact blocker as a progress attest — the
-failed operation, the evidence, who can clear it — wake whoever can clear it with
-`--class blocker`, and keep the card, with a continuation wake naming when you check
-back; the block is yours to carry until it is cleared or escalated. Surrendered: a
+failed operation, the evidence, and what decision, access, or external fact would clear it —
+and keep the card with a continuation wake naming when you check back. Ask a specific agent only
+when answering is that agent's normal work; an unanswered question remains your recorded block,
+not a reason to page your parent or Main. Surrendered: a
 truthful terminal receipt that gives unfinished work back — the card closes, what you
 owed on it ends, and what remains is the opener's to re-dispatch. And there is no
 handoff: custody never transfers between holders. To move work, its holder surrenders

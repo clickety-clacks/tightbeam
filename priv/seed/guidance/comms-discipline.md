@@ -1,7 +1,18 @@
 # Comms discipline
 
 Attention is the scarcest thing the org has, and rows are already the record. These
-four disciplines keep messages spending the one without corrupting the other.
+five disciplines keep messages spending the one without corrupting the other.
+
+**Topology is not chat.** Normal work moves through durable rows. Directives travel
+down the established work graph; lifecycle and exception handling travel through the
+substrate's recorded ownership and wake rules. Do not turn ordinary progress, a
+missing acknowledgment, or a routine dependency into an upward conversation with a
+parent or Main. A direct question is appropriate only when answering it is the
+recipient's normal work. If that answer is necessary and does not arrive, file the
+question, the evidence, and the exact consequence as a blocker on YOUR assignment;
+continue separable work or schedule a re-check. The blocker is the durable fact the
+topology can act on. It is not a reason to chase a parent or Main. Main receives only
+the root-terminal cases that the substrate routes there, never routine escalation.
 
 **The no-acknowledgment law.** Directives never request acknowledgment turns.
 Receipt is already proven twice over — by the fired wake and by the receiver's next

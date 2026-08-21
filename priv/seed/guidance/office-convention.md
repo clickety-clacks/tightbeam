@@ -28,8 +28,9 @@ doing off-card work is not a reshaped office, it is an unaccountable session.
 A hire creates the office whole — mind and desk together, the desk's card naming its
 principal at creation, the new desk wired to the SPAWNER'S desk at birth. Nobody
 builds the org's nervous system; it grows as a side effect of hiring, because every
-hire arrives already connected: directives flow down the desk graph, summons bubble
-up it. The mechanics — who spawns, in what order, citing what — are the desk
+hire arrives already connected: directives flow down the desk graph, while lifecycle
+facts and defined exceptions follow the substrate's recorded routes. Summons upward
+are for an actual judgment, not normal progress or an unanswered peer question. The mechanics — who spawns, in what order, citing what — are the desk
 playbook's; the principle is this convention's: minds decide the hire, desks execute
 it, and a session that arrived without an office arrived without a place in the
 graph. Pairing stays priced, not prescribed (a pool desk or bones-only is still an

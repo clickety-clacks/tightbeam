@@ -13,16 +13,17 @@ it. Capsule characterizations and effort brackets live in `preferred-models.md`.
 
 ## When your model is unavailable
 
-Not configured, out of tokens, refused: you have exactly three legal moves.
+Not configured, out of tokens, refused — follow the ordered candidates in the
+applicable activity table or manifest. Try each candidate once, in order; a refusal
+or harness failure advances one rung, never back to the same rung. The end of that
+ordered list is a named capability block, not permission to improvise a model.
 
-1. SWITCH: take another model from the table, if the task class permits it.
-2. BLOCK: report the situation to your parent (or the user), and have the PARENT
-   assert `work-blocked` over the affected session (condition verb, scope = the
-   session key). A session cannot assert it over itself; the seam refuses
-   self-assertion by design, because blocking is a supervisor's judgment.
-3. SURFACE: tell the user a credential or account needs re-onboarding.
-
-Never wait silently; never retry-loop against a wall.
+Record the failed candidates, evidence, and consequence as a blocker on your own
+assignment; continue separable work or schedule a re-check. Do not make model
+unavailability a routine conversation with your parent or Main, and never retry-loop
+against a wall. Only after the prescribed ring-down is exhausted may the responsible
+owner surface a real credential/account need to the user through the normal exception
+path.
 
 The substrate does not read this document. Model choice is judgment, and judgment
 is inference's (spec production-machine-v1).
