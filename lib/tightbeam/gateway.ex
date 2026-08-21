@@ -627,24 +627,28 @@ defmodule Tightbeam.Gateway do
       "post" => fn call ->
         p = call.params
 
-        outcome =
-          deliver_prompt(call.session_key, call.origin, p.content,
-            db: db,
-            device_id: p.device_id,
-            client_message_id: p.client_message_id,
-            attachments: Map.get(p, :attachments, []),
-            reply_to_llm_visible_message_id: Map.get(p, :reply_to_llm_visible_message_id)
-          )
+        if p[:invalid_reply_reference] == true do
+          %{code: "invalid_message", message: nil}
+        else
+          outcome =
+            deliver_prompt(call.session_key, call.origin, p.content,
+              db: db,
+              device_id: p.device_id,
+              client_message_id: p.client_message_id,
+              attachments: Map.get(p, :attachments, []),
+              reply_to_llm_visible_message_id: Map.get(p, :reply_to_llm_visible_message_id)
+            )
 
-        case outcome do
-          :appended ->
-            %{ack: p.client_message_id}
+          case outcome do
+            :appended ->
+              %{ack: p.client_message_id}
 
-          :invalid_reply_reference ->
-            %{code: "invalid_message", message: "invalid reply reference"}
+            :invalid_reply_reference ->
+              %{code: "invalid_message", message: nil}
 
-          dedupe ->
-            %{dedupe: to_string(dedupe)}
+            dedupe ->
+              %{dedupe: to_string(dedupe)}
+          end
         end
       end,
       "wake" => fn call ->
@@ -1060,42 +1064,59 @@ defmodule Tightbeam.Gateway do
         :skipped
 
       {target, role_ref, role_fallback} when not is_nil(target) ->
-        if Ledger.enqueueable_in_txn?(txn, target) do
-          case admit_supervision_controller_in_txn(txn, opts, target) do
-            :canceled ->
-              :skipped
+        case resolve_reply_target(txn, target, opts) do
+          {:ok, reply_target} ->
+            if Ledger.enqueueable_in_txn?(txn, target) do
+              case admit_supervision_controller_in_txn(txn, opts, target) do
+                :canceled ->
+                  :skipped
 
-            controller ->
-              append_and_enqueue_in_txn(
-                txn,
-                target,
-                role_ref,
-                role_fallback,
-                origin,
-                stamped,
-                Keyword.put(opts, :supervision_controller, controller)
-              )
-          end
-        else
-          case cancel_unavailable_supervision_controller_in_txn(txn, opts, target) do
-            :canceled ->
-              :skipped
+                controller ->
+                  append_and_enqueue_in_txn(
+                    txn,
+                    target,
+                    role_ref,
+                    role_fallback,
+                    origin,
+                    stamped,
+                    opts
+                    |> Keyword.put(:reply_target, reply_target)
+                    |> Keyword.put(:supervision_controller, controller)
+                  )
+              end
+            else
+              case cancel_unavailable_supervision_controller_in_txn(txn, opts, target) do
+                :canceled ->
+                  :skipped
 
-            :ordinary ->
-              # Asked BEFORE the echo, because the echo commits in this same
-              # transaction and a raise is not available to take it back (it would
-              # roll the caller's wake `fired` mark back with it). The ledger still
-              # refuses independently — it is the single writer — but a message with
-              # no turn is history nobody can answer, so nothing is written at all.
-              refuse_undeliverable_turn(txn, target, origin, opts)
-          end
+                :ordinary ->
+                  # Asked BEFORE the echo, because the echo commits in this same
+                  # transaction and a raise is not available to take it back (it would
+                  # roll the caller's wake `fired` mark back with it). The ledger still
+                  # refuses independently — it is the single writer — but a message with
+                  # no turn is history nobody can answer, so nothing is written at all.
+                  refuse_undeliverable_turn(txn, target, origin, opts)
+              end
+            end
+
+          :error ->
+            :invalid_reply_reference
         end
     end
   end
 
-  defp append_and_enqueue_in_txn(txn, target, role_ref, role_fallback, origin, stamped, opts) do
-    with {:ok, reply_target} <- resolve_reply_target(txn, target, opts),
-         input <- %{
+  defp append_and_enqueue_in_txn(
+         txn,
+         target,
+         role_ref,
+         role_fallback,
+         origin,
+         stamped,
+         opts
+       ) do
+    reply_target = opts[:reply_target]
+
+    with input <- %{
            session_key: target,
            role: "user",
            content: stamped,
@@ -1149,8 +1170,6 @@ defmodule Tightbeam.Gateway do
         other ->
           other
       end
-    else
-      :error -> :invalid_reply_reference
     end
   end
 
