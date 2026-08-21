@@ -685,7 +685,17 @@ defmodule Tightbeam.PlacementTest do
   # path passed the whole suite — the exact regression the ticket is about.
   test "every harness resolves its local adapter under base_dir, never a sibling checkout",
        %{base_dir: base_dir, db: db} do
-    config = %{base_dir: base_dir, db: db, cwd: "/work", cli_bin: Path.join(base_dir, "bin")}
+    config = %{
+      base_dir: base_dir,
+      db: db,
+      cwd: "/work",
+      cli_bin: Path.join(base_dir, "bin"),
+      credential_kind: :api_key
+    }
+
+    cursor_auth = Path.join([base_dir, "auth", "cursor"])
+    File.mkdir_p!(cursor_auth)
+    File.write!(Path.join(cursor_auth, "api-key"), "fixture-cursor-key\n")
 
     for module <- Tightbeam.Harness.all() do
       opts = Placement.adapter_opts(config, {module.id(), "shared", "testhost"})
