@@ -74,6 +74,7 @@ defmodule Tightbeam.Gateway do
     Harness,
     Homes,
     Identity,
+    IdPrefix,
     Idempotency,
     LaneManager,
     Ledger,
@@ -731,7 +732,7 @@ defmodule Tightbeam.Gateway do
       "artifact-get" => fn call ->
         Artifacts.get(db, call.params[:artifact_id]) || %{code: "not_found"}
       end,
-      "artifacts" => fn call -> %{artifacts: Artifacts.list(db, call.params)} end,
+      "artifacts" => fn call -> Artifacts.list_result(db, call.params) end,
       "rule" => fn call ->
         Escalation.rule(db, call,
           authorized: admin_origin?(db, call.origin),
@@ -3501,29 +3502,53 @@ defmodule Tightbeam.Gateway do
 
   defp cancel_wake_result(db, call, wake_id) do
     with {:ok, requester} <- cancellation_requester(call[:principal]) do
-      command = %{
-        wake_id: wake_id,
-        expected_origin: call.origin,
-        requester: requester,
-        reason_kind: "requester_withdrew",
-        causal_source: %{
-          kind: "verb_call",
-          accepted_event: %{
-            origin: call.origin,
-            session_key: call.session_key,
-            principal: call.principal
-          }
-        },
-        outcome: %{kind: "no_replacement"}
-      }
+      result =
+        DB.transaction(db, fn txn ->
+          visible? = fn candidate ->
+            Txn.q(txn, "SELECT 1 FROM wakes WHERE wakeId = ?1 AND origin = ?2", [
+              candidate,
+              call.origin
+            ]) == [[1]]
+          end
 
-      case DB.transaction(db, fn txn -> Wakes.cancel_in_txn(txn, command) end) do
+          case IdPrefix.resolve_in_txn(txn, :wake, wake_id, visible?) do
+            {:ok, resolved} ->
+              id_resolved(call, txn, :wake, resolved)
+
+              Wakes.cancel_in_txn(txn, %{
+                wake_id: resolved,
+                expected_origin: call.origin,
+                requester: requester,
+                reason_kind: "requester_withdrew",
+                causal_source: %{
+                  kind: "verb_call",
+                  accepted_event: %{
+                    origin: call.origin,
+                    session_key: call.session_key,
+                    principal: call.principal
+                  }
+                },
+                outcome: %{kind: "no_replacement"}
+              })
+
+            :unknown ->
+              false
+
+            {:ambiguous, error} ->
+              error
+          end
+        end)
+
+      case result do
         {:ok, {:accepted_in_txn, event_id, %{canceled: true}}}
         when is_integer(event_id) and event_id > 0 ->
           {:accepted_in_txn, event_id, %{canceled: true}}
 
         {:ok, false} ->
           %{canceled: false}
+
+        {:ok, %{code: _} = error} ->
+          error
 
         {:ok, other} ->
           raise "invalid public wake cancellation result: #{inspect(other)}"
@@ -3546,6 +3571,13 @@ defmodule Tightbeam.Gateway do
     do: {:ok, %{kind: "process", id: id}}
 
   defp cancellation_requester(_principal), do: :error
+
+  defp id_resolved(call, txn, type, id) do
+    case Map.get(call, :on_id_resolved_in_txn) do
+      fun when is_function(fun, 3) -> fun.(txn, type, id)
+      _ -> :ok
+    end
+  end
 
   defp wake_result(config, db, call) do
     p = call.params
@@ -5832,21 +5864,37 @@ defmodule Tightbeam.Gateway do
   # unknown, a member, an ordinary wake, or a carrier this caller cannot see
   # — answers identically: `not_found`, never an existence oracle.
   defp digest_members_result(db, call) do
-    wake_id = call.params[:wake_id]
+    supplied = call.params[:wake_id]
 
     cond do
-      not (is_binary(wake_id) and wake_id != "") ->
+      not (is_binary(supplied) and supplied != "") ->
         %{code: "invalid", message: "digest-members requires a wakeId"}
 
       true ->
-        case Wakes.get(db, wake_id) do
-          %{digest: true} = wake ->
-            if digest_members_readable?(db, call, wake),
-              do: %{digest_members: Wakes.digest_members(db, wake_id)},
-              else: digest_members_not_found()
+        visible? = fn id ->
+          case Wakes.get(db, id) do
+            %{digest: true} = wake -> digest_members_readable?(db, call, wake)
+            _ -> false
+          end
+        end
 
-          _ ->
+        case IdPrefix.resolve(db, :wake, supplied, visible?) do
+          {:ok, wake_id} ->
+            case Wakes.get(db, wake_id) do
+              %{digest: true} = wake ->
+                if digest_members_readable?(db, call, wake),
+                  do: %{digest_members: Wakes.digest_members(db, wake_id)},
+                  else: digest_members_not_found()
+
+              _ ->
+                digest_members_not_found()
+            end
+
+          :unknown ->
             digest_members_not_found()
+
+          {:ambiguous, error} ->
+            error
         end
     end
   end

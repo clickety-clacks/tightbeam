@@ -452,7 +452,7 @@ defmodule Tightbeam.AssignmentsTest do
           "user dispatch",
           "Dispatch immediately.",
           nil,
-          work_item.id
+          String.slice(work_item.id, 0, 12)
         )
       )
 
@@ -478,7 +478,12 @@ defmodule Tightbeam.AssignmentsTest do
       handle(
         ctx,
         "assign",
-        assign_call({:session, "other-session"}, "bookkeeping", nil, work_item.id)
+        assign_call(
+          {:session, "other-session"},
+          "bookkeeping",
+          nil,
+          String.slice(work_item.id, 0, 12)
+        )
       )
 
     assert assigned.workItemId == work_item.id
@@ -569,10 +574,25 @@ defmodule Tightbeam.AssignmentsTest do
         work_item_call("work-item-create", {:user, "flynn"}, %{title: "Second"})
       )
 
+    prefix = String.slice(first.id, 0, 12)
+
     linked =
-      handle(ctx, "assign", assign_call({:user, "flynn"}, "linked", "work-key", first.id))
+      handle(ctx, "assign", assign_call({:user, "flynn"}, "linked", "work-key", prefix))
 
     assert linked.workItemId == first.id
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO work_items (id, title, ownerUserId, createdByUser, createdAt) VALUES (?1, 'competitor', 'flynn', 'flynn', 3)",
+        [prefix <> "competitor"]
+      )
+
+    replay_after_ambiguity =
+      handle(ctx, "assign", assign_call({:user, "flynn"}, "ignored", "work-key", prefix))
+
+    assert replay_after_ambiguity.id == linked.id
+    assert replay_after_ambiguity.workItemId == first.id
 
     for work_item_id <- [second.id, nil, "wi_missing"] do
       replay =
@@ -613,7 +633,7 @@ defmodule Tightbeam.AssignmentsTest do
 
     review_call =
       assign_call({:user, "flynn"}, "review")
-      |> put_in([:params, :reviews_assignment_id], reviewed.id)
+      |> put_in([:params, :reviews_assignment_id], String.slice(reviewed.id, 0, 12))
       |> put_in([:params, :effect_kind], "policy")
       |> Map.put(:session_key, "other-session")
 
@@ -631,6 +651,64 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert {:ok, [[0]]} =
              DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE subject = 'unknown review'")
+  end
+
+  test "public assignment references resolve canonically and refusals have no effects", ctx do
+    lifecycle = handle(ctx, "assign", assign_call({:user, "flynn"}, "prefix lifecycle"))
+    lifecycle_prefix = String.slice(lifecycle.id, 0, 12)
+
+    revoked = handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, lifecycle_prefix))
+    assert revoked.id == lifecycle.id
+    assert revoked.state == "closed"
+
+    reopened =
+      handle(
+        ctx,
+        "reopen-assignment",
+        reopen_call({:user, "flynn"}, lifecycle_prefix, "prefix proof")
+      )
+
+    assert reopened.id == lifecycle.id
+    assert reopened.state == "open"
+
+    attested = handle(ctx, "assign", assign_call({:user, "flynn"}, "prefix attest"))
+    attest_prefix = String.slice(attested.id, 0, 12)
+
+    assert %{attest: %{assignmentId: assignment_id}} =
+             handle(ctx, "attest", attest_call({:session, "holder"}, attest_prefix, "progress"))
+
+    assert assignment_id == attested.id
+
+    assert %{attests: [%{assignmentId: ^assignment_id}]} =
+             handle(
+               ctx,
+               "attests",
+               call("attests", {:session, "holder"}, nil, %{assignment_id: attest_prefix})
+             )
+
+    snapshot = fn ->
+      {:ok, assignments} =
+        DB.query(ctx.db, "SELECT id, state, outcome FROM assignments ORDER BY id")
+
+      {:ok, [[attests]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM attests")
+      {:ok, [[wakes]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
+      {:ok, [[events]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM lifecycle_events")
+      {assignments, attests, wakes, events}
+    end
+
+    before = snapshot.()
+
+    ambiguous_call =
+      revoke_call({:user, "flynn"}, "asg_")
+      |> Map.put(:on_assignment_change, fn _, _ -> send(self(), :unexpected_callback) end)
+
+    assert %{code: "ambiguous_id"} = handle(ctx, "revoke-assignment", ambiguous_call)
+
+    assert %{code: "unknown_assignment"} =
+             handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, "asg_missing"))
+
+    assert snapshot.() == before
+    refute_received :unexpected_callback
   end
 
   test "assign and dispatch stamp valid effects while legacy rows resolve conservatively", ctx do

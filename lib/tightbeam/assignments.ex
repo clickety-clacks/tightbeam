@@ -6,7 +6,17 @@ defmodule Tightbeam.Assignments do
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
   alias Tightbeam.Harness.Support
-  alias Tightbeam.{EffortCheckin, EventLog, Org, Placement, Projection, Supervision, Wakes}
+
+  alias Tightbeam.{
+    EffortCheckin,
+    EventLog,
+    IdPrefix,
+    Org,
+    Placement,
+    Projection,
+    Supervision,
+    Wakes
+  }
 
   @effect_kinds ~w(code policy release live_mutation evidence review coordination)
   @effect_kind_sql Enum.map_join(@effect_kinds, ", ", &"'#{&1}'")
@@ -644,10 +654,19 @@ defmodule Tightbeam.Assignments do
             nil ->
               :proceed
 
-            work_item_id ->
-              case Tightbeam.WorkItems.state_for(db, work_item_id) do
-                state when state in [nil, "open"] -> :proceed
-                _terminal -> {:refuse, work_item_not_open(work_item_id)}
+            supplied ->
+              case IdPrefix.resolve(db, :work_item, supplied) do
+                {:ok, work_item_id} ->
+                  case Tightbeam.WorkItems.state_for(db, work_item_id) do
+                    state when state in [nil, "open"] -> :proceed
+                    _terminal -> {:refuse, work_item_not_open(work_item_id)}
+                  end
+
+                :unknown ->
+                  :proceed
+
+                {:ambiguous, error} ->
+                  {:refuse, error}
               end
           end
       end
@@ -660,34 +679,54 @@ defmodule Tightbeam.Assignments do
     do: error("work_item_not_open", "work item #{work_item_id} is not open")
 
   defp dispatch_result(db, call) do
-    case {call.params[:work_item_id], call.principal} do
-      {work_item_id, {:session, caller_session}} when not is_nil(work_item_id) ->
-        if Wakes.rumination_exists?(db, work_item_id, caller_session) do
-          open_dispatch_result(db, call)
-        else
-          transaction(db, fn txn ->
-            Wakes.schedule_in_txn(txn, %{
-              session_key: caller_session,
-              origin: call.origin,
-              creator_session_key: caller_session,
-              prompt:
-                "digest: Ruminate on work-item #{work_item_id} against the whole spec and its spirit before you fan out. Intent you were about to dispatch: subject=#{call.params[:subject]} brief=#{call.params[:brief]}. When you've thought it through, re-issue the dispatch.",
-              due_at: now(),
-              rumination: true,
-              work_item_id: work_item_id
-            })
+    outcome =
+      transaction(db, fn txn ->
+        supplied = call.params[:work_item_id]
 
-            %{
-              rumination_required: true,
-              work_item_id: work_item_id,
-              message:
-                "Sent you to ruminate on #{work_item_id} first — re-dispatch when you're done thinking."
-            }
-          end)
+        case resolve_optional_in_txn(txn, :work_item, supplied) do
+          {:ok, work_item_id} ->
+            if work_item_id, do: id_resolved(call, txn, :work_item, work_item_id)
+            resolved_call = put_in(call, [:params, :work_item_id], work_item_id)
+
+            case {work_item_id, call.principal} do
+              {id, {:session, caller_session}} when not is_nil(id) ->
+                if Wakes.rumination_exists_in_txn?(txn, id, caller_session) do
+                  {:open, resolved_call}
+                else
+                  Wakes.schedule_in_txn(txn, %{
+                    session_key: caller_session,
+                    origin: call.origin,
+                    creator_session_key: caller_session,
+                    prompt:
+                      "digest: Ruminate on work-item #{id} against the whole spec and its spirit before you fan out. Intent you were about to dispatch: subject=#{call.params[:subject]} brief=#{call.params[:brief]}. When you've thought it through, re-issue the dispatch.",
+                    due_at: now(),
+                    rumination: true,
+                    work_item_id: id
+                  })
+
+                  %{
+                    rumination_required: true,
+                    work_item_id: id,
+                    message:
+                      "Sent you to ruminate on #{id} first — re-dispatch when you're done thinking."
+                  }
+                end
+
+              _ ->
+                {:open, resolved_call}
+            end
+
+          :unknown ->
+            error("unknown_work_item", "unknown work item: #{supplied}")
+
+          {:ambiguous, error} ->
+            error
         end
+      end)
 
-      _ ->
-        open_dispatch_result(db, call)
+    case outcome do
+      {:open, resolved_call} -> open_dispatch_result(db, resolved_call)
+      other -> other
     end
   end
 
@@ -846,8 +885,13 @@ defmodule Tightbeam.Assignments do
     with :ok <- principal_allowed(call.principal, "attest"),
          :ok <- commit_ref_filing_allowed(db, call),
          :ok <- valid_commit_refs(db, call.params[:kind], call.params[:commit_refs]) do
-      assignment_id = call.params[:assignment_id]
-      from = best_effort_value(fn -> Tightbeam.WorkState.status(db, assignment_id) end)
+      supplied = call.params[:assignment_id]
+
+      from =
+        case IdPrefix.resolve(db, :assignment, supplied) do
+          {:ok, id} -> {id, best_effort_value(fn -> Tightbeam.WorkState.status(db, id) end)}
+          _ -> {supplied, :error}
+        end
 
       # The referent cursor is read BEFORE the claim is filed: what a claim points
       # at is what had been recorded when it was made, never an artifact that
@@ -855,11 +899,29 @@ defmodule Tightbeam.Assignments do
       # transaction is deliberate — a registry this cannot read is reported as
       # such, and a failed CHECK never rejects the claim (§Design 5).
       artifact_cursor = artifact_cursor(db)
-      result = transaction(db, fn txn -> attest_in_txn(txn, call) end)
 
-      if not Map.has_key?(result, :code) and match?({:ok, _}, from) do
-        {:ok, from} = from
-        best_effort(fn -> notify(call, :on_assignment_change, assignment_id, from) end)
+      result =
+        transaction(db, fn txn ->
+          case IdPrefix.resolve_in_txn(txn, :assignment, supplied) do
+            {:ok, id} ->
+              id_resolved(call, txn, :assignment, id)
+              resolved_call = put_in(call, [:params, :assignment_id], id)
+
+              with :ok <- commit_ref_filing_allowed_in_txn(txn, resolved_call) do
+                attest_in_txn(txn, resolved_call)
+              end
+
+            :unknown ->
+              error("unknown_assignment", "unknown assignment: #{supplied}")
+
+            {:ambiguous, error} ->
+              error
+          end
+        end)
+
+      if not Map.has_key?(result, :code) and match?({_id, {:ok, _}}, from) do
+        {assignment_id, {:ok, prior_state}} = from
+        best_effort(fn -> notify(call, :on_assignment_change, assignment_id, prior_state) end)
       end
 
       # The claim is filed; now check what it pointed at. Verification runs
@@ -1022,13 +1084,39 @@ defmodule Tightbeam.Assignments do
 
   defp revoke_result(db, call) do
     with :ok <- principal_allowed(call.principal, "revoke-assignment") do
-      assignment_id = call.params[:assignment_id]
-      from = best_effort_value(fn -> Tightbeam.WorkState.status(db, assignment_id) end)
-      result = transaction(db, fn txn -> revoke_in_txn(txn, call) end)
+      supplied = call.params[:assignment_id]
 
-      if not Map.has_key?(result, :code) and match?({:ok, _}, from) do
-        {:ok, from} = from
-        best_effort(fn -> notify(call, :on_assignment_change, assignment_id, from) end)
+      from =
+        case IdPrefix.resolve(db, :assignment, supplied) do
+          {:ok, id} -> {id, best_effort_value(fn -> Tightbeam.WorkState.status(db, id) end)}
+          _ -> {supplied, :error}
+        end
+
+      result =
+        transaction(db, fn txn ->
+          visible? = fn id ->
+            case fetch_assignment(txn, id) do
+              nil -> false
+              assignment -> revoke_allowed?(txn, call.principal, assignment)
+            end
+          end
+
+          case IdPrefix.resolve_in_txn(txn, :assignment, supplied, visible?) do
+            {:ok, id} ->
+              id_resolved(call, txn, :assignment, id)
+              revoke_in_txn(txn, put_in(call, [:params, :assignment_id], id))
+
+            :unknown ->
+              error("unknown_assignment", "unknown assignment: #{supplied}")
+
+            {:ambiguous, error} ->
+              error
+          end
+        end)
+
+      if not Map.has_key?(result, :code) and match?({_id, {:ok, _}}, from) do
+        {assignment_id, {:ok, prior_state}} = from
+        best_effort(fn -> notify(call, :on_assignment_change, assignment_id, prior_state) end)
       end
 
       result
@@ -1055,13 +1143,39 @@ defmodule Tightbeam.Assignments do
   defp reopen_result(db, call) do
     with :ok <- principal_allowed(call.principal, "reopen-assignment"),
          :ok <- valid_reopen_reason(call.params[:reason]) do
-      assignment_id = call.params[:assignment_id]
-      from = best_effort_value(fn -> Tightbeam.WorkState.status(db, assignment_id) end)
-      result = transaction(db, fn txn -> reopen_in_txn(txn, call) end)
+      supplied = call.params[:assignment_id]
 
-      if not Map.has_key?(result, :code) and match?({:ok, _}, from) do
-        {:ok, from} = from
-        best_effort(fn -> notify(call, :on_assignment_change, assignment_id, from) end)
+      from =
+        case IdPrefix.resolve(db, :assignment, supplied) do
+          {:ok, id} -> {id, best_effort_value(fn -> Tightbeam.WorkState.status(db, id) end)}
+          _ -> {supplied, :error}
+        end
+
+      result =
+        transaction(db, fn txn ->
+          visible? = fn id ->
+            case fetch_assignment(txn, id) do
+              nil -> false
+              assignment -> reopen_allowed?(txn, call.principal, assignment)
+            end
+          end
+
+          case IdPrefix.resolve_in_txn(txn, :assignment, supplied, visible?) do
+            {:ok, id} ->
+              id_resolved(call, txn, :assignment, id)
+              reopen_in_txn(txn, put_in(call, [:params, :assignment_id], id))
+
+            :unknown ->
+              error("unknown_assignment", "unknown assignment: #{supplied}")
+
+            {:ambiguous, error} ->
+              error
+          end
+        end)
+
+      if not Map.has_key?(result, :code) and match?({_id, {:ok, _}}, from) do
+        {assignment_id, {:ok, prior_state}} = from
+        best_effort(fn -> notify(call, :on_assignment_change, assignment_id, prior_state) end)
       end
 
       result
@@ -1304,24 +1418,27 @@ defmodule Tightbeam.Assignments do
   @max_attest_page 500
 
   defp attests_result(db, call) do
-    assignment_id = call.params[:assignment_id]
+    supplied = call.params[:assignment_id]
 
     with :ok <- principal_allowed(call.principal, "attests"),
-         {:ok, limit} <- attest_limit(call.params[:limit]),
-         :known <- known_assignment(db, assignment_id),
-         {:ok, cursor} <- attest_after(db, assignment_id, call.params[:after]) do
-      attest_page(db, assignment_id, cursor, limit, paging?(call.params))
+         {:ok, limit} <- attest_limit(call.params[:limit]) do
+      case IdPrefix.resolve(db, :assignment, supplied) do
+        {:ok, assignment_id} ->
+          with {:ok, cursor} <- attest_after(db, assignment_id, call.params[:after]) do
+            attest_page(db, assignment_id, cursor, limit, paging?(call.params))
+          else
+            {:error, error} -> error
+          end
+
+        :unknown ->
+          error("unknown_assignment", "unknown assignment: #{supplied}")
+
+        {:ambiguous, error} ->
+          error
+      end
     else
-      :unknown -> error("unknown_assignment", "unknown assignment: #{assignment_id}")
       {:error, error} -> error
       other -> other
-    end
-  end
-
-  defp known_assignment(db, assignment_id) do
-    case DB.query(db, "SELECT 1 FROM assignments WHERE id = ?1", [assignment_id]) do
-      {:ok, [[1]]} -> :known
-      {:ok, []} -> :unknown
     end
   end
 
@@ -1382,7 +1499,20 @@ defmodule Tightbeam.Assignments do
 
       [["active", harness, provider]] ->
         # F7 amendment: dispatch persists workItemId exactly as assign does.
-        work_item_id = call.params[:work_item_id]
+        supplied_work_item_id = call.params[:work_item_id]
+
+        work_item_id =
+          case resolve_optional_in_txn(txn, :work_item, supplied_work_item_id) do
+            {:ok, id} ->
+              id_resolved(call, txn, :work_item, id)
+              id
+
+            :unknown ->
+              raise UnknownWorkItem, work_item_id: supplied_work_item_id
+
+            {:ambiguous, error} ->
+              throw({:id_resolution, error})
+          end
 
         case work_item_id do
           nil ->
@@ -1393,8 +1523,21 @@ defmodule Tightbeam.Assignments do
               do: raise(UnknownWorkItem, work_item_id: work_item_id)
         end
 
-        reviews_assignment_id =
+        supplied_review_id =
           if verb == "assign", do: call.params[:reviews_assignment_id], else: nil
+
+        reviews_assignment_id =
+          case resolve_optional_in_txn(txn, :assignment, supplied_review_id) do
+            {:ok, id} ->
+              id_resolved(call, txn, :assignment, id)
+              id
+
+            :unknown ->
+              raise UnknownReviewTarget, assignment_id: supplied_review_id
+
+            {:ambiguous, error} ->
+              throw({:id_resolution, error})
+          end
 
         if reviews_assignment_id do
           case Txn.q(
@@ -1513,6 +1656,9 @@ defmodule Tightbeam.Assignments do
         error("not_found", "unknown sessionKey: #{call.session_key}")
     end
   catch
+    {:id_resolution, error} ->
+      error
+
     {:work_item_not_open, work_item_id} ->
       error("work_item_not_open", "work item #{work_item_id} is not open")
 
@@ -1525,6 +1671,11 @@ defmodule Tightbeam.Assignments do
     :review_of_review ->
       error("review_of_review", "a review assignment cannot itself be reviewed")
   end
+
+  defp resolve_optional_in_txn(_txn, _type, nil), do: {:ok, nil}
+
+  defp resolve_optional_in_txn(txn, type, supplied),
+    do: IdPrefix.resolve_in_txn(txn, type, supplied)
 
   defp resolve_work_item_id_in_txn(txn, assignment_id, visited) do
     if MapSet.member?(visited, assignment_id) do
@@ -2032,7 +2183,22 @@ defmodule Tightbeam.Assignments do
         :ok
 
       {kind, _refs} when kind in ["completion", "verdict"] ->
-        commit_ref_filing_allowed_for_assignment(db, call, kind)
+        supplied = call.params[:assignment_id]
+
+        case IdPrefix.resolve(db, :assignment, supplied) do
+          {:ok, id} ->
+            commit_ref_filing_allowed_for_assignment(
+              db,
+              put_in(call, [:params, :assignment_id], id),
+              kind
+            )
+
+          :unknown ->
+            error("unknown_assignment", "unknown assignment: #{supplied}")
+
+          {:ambiguous, error} ->
+            error
+        end
 
       {_kind, _refs} ->
         :ok
@@ -2042,36 +2208,69 @@ defmodule Tightbeam.Assignments do
   defp commit_ref_filing_allowed_for_assignment(db, call, kind) do
     assignment_id = call.params[:assignment_id]
 
-    case DB.query(
-           db,
-           "SELECT holderKey, state, reviewsAssignmentId FROM assignments WHERE id = ?1",
-           [assignment_id]
-         ) do
-      {:ok, []} ->
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT holderKey, state, reviewsAssignmentId FROM assignments WHERE id = ?1",
+        [assignment_id]
+      )
+
+    commit_ref_filing_allowed_for_rows(rows, call, kind, assignment_id)
+  end
+
+  defp commit_ref_filing_allowed_in_txn(txn, call) do
+    case {call.params[:kind], call.params[:commit_refs]} do
+      {_kind, nil} ->
+        :ok
+
+      {kind, _refs} when kind in ["completion", "verdict"] ->
+        commit_ref_filing_allowed_for_assignment_in_txn(txn, call, kind)
+
+      {_kind, _refs} ->
+        :ok
+    end
+  end
+
+  defp commit_ref_filing_allowed_for_assignment_in_txn(txn, call, kind) do
+    assignment_id = call.params[:assignment_id]
+
+    rows =
+      Txn.q(
+        txn,
+        "SELECT holderKey, state, reviewsAssignmentId FROM assignments WHERE id = ?1",
+        [assignment_id]
+      )
+
+    commit_ref_filing_allowed_for_rows(rows, call, kind, assignment_id)
+  end
+
+  defp commit_ref_filing_allowed_for_rows(rows, call, kind, assignment_id) do
+    case rows do
+      [] ->
         error("unknown_assignment", "unknown assignment: #{assignment_id}")
 
-      {:ok, [[holder, _state, _reviews_assignment_id]]}
+      [[holder, _state, _reviews_assignment_id]]
       when kind == "completion" and call.principal != {:session, holder} ->
         error("not_holder", "assignment is held by session #{holder}")
 
-      {:ok, [[_holder, state, _reviews_assignment_id]]}
+      [[_holder, state, _reviews_assignment_id]]
       when kind == "completion" and state != "open" ->
         assignment_closed()
 
-      {:ok, [[_holder, "open", reviews_assignment_id]]}
+      [[_holder, "open", reviews_assignment_id]]
       when kind == "completion" and not is_nil(reviews_assignment_id) ->
         error(
           "invalid_commit_refs",
           "commitRefs are not allowed on non-producing completion attests"
         )
 
-      {:ok, [[_holder, _state, nil]]} when kind == "verdict" ->
+      [[_holder, _state, nil]] when kind == "verdict" ->
         error(
           "invalid_commit_refs",
           "commitRefs on verdict attests require a review-linked assignment"
         )
 
-      {:ok, [[_holder, _state, _reviews_assignment_id]]} ->
+      [[_holder, _state, _reviews_assignment_id]] ->
         :ok
     end
   end
@@ -2297,6 +2496,13 @@ defmodule Tightbeam.Assignments do
       _ -> :error
     catch
       _, _ -> :error
+    end
+  end
+
+  defp id_resolved(call, txn, type, id) do
+    case Map.get(call, :on_id_resolved_in_txn) do
+      fun when is_function(fun, 3) -> fun.(txn, type, id)
+      _ -> :ok
     end
   end
 

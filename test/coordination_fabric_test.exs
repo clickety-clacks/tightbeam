@@ -1101,6 +1101,13 @@ defmodule Tightbeam.CoordinationFabricTest do
 
     assert Enum.map(members, & &1.wake_id) == [member.wake_id]
 
+    assert {:ok, %{digest_members: prefix_members}} =
+             verb(db, {:user, "owner"}, "digest-members", %{
+               wake_id: String.slice(digest_id, 0, 12)
+             })
+
+    assert Enum.map(prefix_members, & &1.wake_id) == [member.wake_id]
+
     # A caller who cannot see the carrier's session and a wake id naming
     # nothing at all give the SAME answer — otherwise the read is an
     # existence oracle over ordinary wakes.
@@ -3238,6 +3245,49 @@ defmodule Tightbeam.CoordinationFabricTest do
              ask(db, "agent:coder", "agent:po", "what is this about?", assignment_id: private.id)
 
     assert request.assignment_id == private.id
+  end
+
+  test "--about stores a canonical prefix target and refusals emit no request, event, or wake",
+       %{db: db} do
+    seed_session(db, "agent:coder", "flynn")
+    seed_session(db, "agent:po", "flynn")
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO assignments (id, subject, holderKey, openedBySession, openedAt) VALUES ('asg_about_alpha', 'alpha', 'agent:coder', 'agent:coder', 1)"
+      )
+
+    assert {:ok, %{decision_request: request}} =
+             ask(db, "agent:coder", "agent:po", "prefix?", assignment_id: "asg_about_a")
+
+    assert request.assignment_id == "asg_about_alpha"
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO assignments (id, subject, holderKey, openedBySession, openedAt) VALUES ('asg_about_atom', 'atom', 'agent:coder', 'agent:coder', 2)"
+      )
+
+    snapshot = fn ->
+      {:ok, [[requests]]} = DB.query(db, "SELECT COUNT(*) FROM decision_requests")
+      {:ok, [[events]]} = DB.query(db, "SELECT COUNT(*) FROM lifecycle_events")
+      {:ok, [[wakes]]} = DB.query(db, "SELECT COUNT(*) FROM wakes")
+      {requests, events, wakes}
+    end
+
+    before = snapshot.()
+
+    assert {:error,
+            %{
+              code: "ambiguous_id",
+              candidates: ["asg_about_alpha", "asg_about_atom"]
+            }} = ask(db, "agent:coder", "agent:po", "ambiguous?", assignment_id: "asg_about_a")
+
+    assert {:error, %{code: "not_found"}} =
+             ask(db, "agent:coder", "agent:po", "missing?", assignment_id: "asg_missing")
+
+    assert snapshot.() == before
   end
 
   test "the asker's exits are its own, and only the asked principal answers", %{db: db} do

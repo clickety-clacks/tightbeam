@@ -24,7 +24,8 @@ defmodule Tightbeam.Artifacts do
   through `recorded_kinds/3`, which reads neither column.
   """
 
-  alias Tightbeam.{DB, TurnObservations}
+  alias Tightbeam.{DB, IdPrefix, TurnObservations}
+  alias Tightbeam.DB.Txn
 
   @outside_workspace "artifact origin is outside its session workspace"
 
@@ -88,34 +89,52 @@ defmodule Tightbeam.Artifacts do
         {recorded_message_id, evidence} = turn_evidence(db, session_key)
         now = now()
 
-        {:ok, _} =
-          DB.query(
-            db,
-            """
-            INSERT INTO artifacts
-              (artifactId, kind, title, description, createdBySession, workItemId,
-               parentSession, originPath, contentSha256, recordedMessageId,
-               recordedTurnEvidence, state, home, createdAt, updatedAt)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-                    'in-workspace', NULL, ?12, ?12)
-            """,
-            [
-              artifact_id,
-              call.params.kind,
-              call.params.title,
-              call.params[:description],
-              session_key,
-              work_item_id,
-              parent_session,
-              call.params.origin_path,
-              call.params[:content_sha256],
-              recorded_message_id,
-              evidence,
-              now
-            ]
-          )
+        case DB.transaction(db, fn txn ->
+               case IdPrefix.resolve_in_txn(txn, :work_item, work_item_id) do
+                 {:ok, canonical_id} ->
+                   Txn.q(
+                     txn,
+                     """
+                     INSERT INTO artifacts
+                       (artifactId, kind, title, description, createdBySession, workItemId,
+                        parentSession, originPath, contentSha256, recordedMessageId,
+                        recordedTurnEvidence, state, home, createdAt, updatedAt)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                             'in-workspace', NULL, ?12, ?12)
+                     """,
+                     [
+                       artifact_id,
+                       call.params.kind,
+                       call.params.title,
+                       call.params[:description],
+                       session_key,
+                       canonical_id,
+                       parent_session,
+                       call.params.origin_path,
+                       call.params[:content_sha256],
+                       recorded_message_id,
+                       evidence,
+                       now
+                     ]
+                   )
 
-        get(db, artifact_id)
+                   [row] =
+                     Txn.q(txn, "SELECT #{columns()} FROM artifacts WHERE artifactId = ?1", [
+                       artifact_id
+                     ])
+
+                   artifact(row)
+
+                 :unknown ->
+                   %{code: "unknown_work_item", message: "unknown work item: #{work_item_id}"}
+
+                 {:ambiguous, error} ->
+                   error
+               end
+             end) do
+          {:ok, result} -> result
+          {:error, reason} -> raise "artifact record transaction failed: #{inspect(reason)}"
+        end
 
       {{:session, session_key}, session_key, _work_item_id} when is_binary(session_key) ->
         %{code: "invalid", message: "artifact-record requires provenance edges"}
@@ -205,6 +224,21 @@ defmodule Tightbeam.Artifacts do
       )
 
     Enum.map(rows, &artifact/1)
+  end
+
+  @doc false
+  def list_result(db, filters) do
+    case filters[:work_item_id] do
+      nil ->
+        %{artifacts: list(db, filters)}
+
+      supplied ->
+        case IdPrefix.resolve(db, :work_item, supplied) do
+          {:ok, id} -> %{artifacts: list(db, Map.put(filters, :work_item_id, id))}
+          :unknown -> %{code: "unknown_work_item", message: "unknown work item: #{supplied}"}
+          {:ambiguous, error} -> error
+        end
+    end
   end
 
   @doc """

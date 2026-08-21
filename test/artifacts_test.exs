@@ -141,6 +141,53 @@ defmodule Tightbeam.ArtifactsTest do
     assert Artifacts.list(ctx.db, %{session_key: ctx.child.session_key}) == [row]
   end
 
+  test "public work-item prefixes store canonical ids and refusals record nothing", ctx do
+    handlers = Gateway.handlers(%{db: ctx.db})
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO work_items (id, title, ownerUserId, createdByUser, createdAt) VALUES ('wi_prefix_alpha', 'alpha', 'flynn', 'flynn', 2)"
+      )
+
+    call = %{
+      principal: {:session, ctx.child.session_key},
+      session_key: ctx.child.session_key,
+      params: %{
+        kind: "report",
+        title: "Prefix proof",
+        origin_path: "prefix.md",
+        work_item_id: "wi_prefix_a"
+      }
+    }
+
+    row = handlers["artifact-record"].(call)
+    assert row.work_item_id == "wi_prefix_alpha"
+
+    assert handlers["artifacts"].(%{params: %{work_item_id: "wi_prefix_a"}}) == %{
+             artifacts: [row]
+           }
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO work_items (id, title, ownerUserId, createdByUser, createdAt) VALUES ('wi_prefix_beta', 'beta', 'flynn', 'flynn', 3)"
+      )
+
+    {:ok, [[before_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM artifacts")
+
+    ambiguous = put_in(call, [:params, :work_item_id], "wi_prefix_")
+
+    assert %{code: "ambiguous_id", candidates: ["wi_prefix_alpha", "wi_prefix_beta"]} =
+             handlers["artifact-record"].(ambiguous)
+
+    missing = put_in(call, [:params, :work_item_id], "wi_missing")
+    assert %{code: "unknown_work_item"} = handlers["artifact-record"].(missing)
+
+    {:ok, [[after_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM artifacts")
+    assert after_count == before_count
+  end
+
   test "schema is idempotent and enforces the closed kind/state sets", ctx do
     assert :ok = Artifacts.ensure_schema(ctx.db)
 

@@ -772,6 +772,48 @@ defmodule Tightbeam.ExecutionMapTest do
     assert admin.no_item == ["asg_none_theirs"]
   end
 
+  test "typed prefixes cover topline assignments, under anchors, and roster cursors", ctx do
+    session!(ctx.db, "s_prefix_mine", "flynn")
+    session!(ctx.db, "s_prefix_theirs", "kay")
+    item!(ctx.db, "wi_prefix_alpha", created_at: at(1))
+    item!(ctx.db, "wi_prefix_hidden", owner: "kay", created_at: at(2))
+    item!(ctx.db, "wi_prefix_zulu", created_at: at(3))
+
+    assignment!(ctx.db, "asg_prefix_alpha",
+      work_item_id: "wi_prefix_alpha",
+      holder: "s_prefix_mine"
+    )
+
+    assignment!(ctx.db, "asg_prefix_hidden",
+      work_item_id: "wi_prefix_hidden",
+      holder: "s_prefix_theirs"
+    )
+
+    assert nested_ids(read(ctx, :topline, %{under: "wi_prefix_a"})) == ["wi_prefix_alpha"]
+
+    assert ids(roster(ctx, %{after: "wi_prefix_a", limit: 1})) == ["wi_prefix_zulu"]
+
+    assert ids(read(ctx, :topline, %{assignments: ["asg_prefix_a"]})) == [
+             "wi_prefix_alpha"
+           ]
+
+    item!(ctx.db, "wi_prefix_atom", created_at: at(4))
+
+    assignment!(ctx.db, "asg_prefix_atom",
+      work_item_id: "wi_prefix_atom",
+      holder: "s_prefix_mine"
+    )
+
+    assert %{code: "ambiguous_id", candidates: ["wi_prefix_alpha", "wi_prefix_atom"]} =
+             read(ctx, :topline, %{under: "wi_prefix_a"})
+
+    assert %{code: "ambiguous_id", candidates: ["wi_prefix_alpha", "wi_prefix_atom"]} =
+             roster(ctx, %{after: "wi_prefix_a", limit: 1})
+
+    assert %{code: "ambiguous_id", candidates: ["asg_prefix_alpha", "asg_prefix_atom"]} =
+             read(ctx, :topline, %{assignments: ["asg_prefix_a"]})
+  end
+
   ## Proof 13 — deterministic order under every filter combination
 
   test "proof 13: roster order is createdAt ASC then id ASC under every filter combination",

@@ -16,7 +16,7 @@ defmodule Tightbeam.WorkItems do
   fail/reopen) are owner-or-admin verbs that write `state`/`failReason`.
   """
 
-  alias Tightbeam.{CausalEvents, DB, Org, Wakes}
+  alias Tightbeam.{CausalEvents, DB, IdPrefix, Org, Wakes}
   alias Tightbeam.DB.Txn
 
   @origin "process:tightbeam"
@@ -284,7 +284,26 @@ defmodule Tightbeam.WorkItems do
       reason = call.params[:reason]
 
       result =
-        transaction(db, fn txn -> dispose_in_txn(txn, call.principal, id, verb, reason) end)
+        transaction(db, fn txn ->
+          visible? = fn candidate ->
+            case fetch_in_txn(txn, candidate) do
+              nil -> false
+              item -> disposition_allowed?(txn, call.principal, item)
+            end
+          end
+
+          case IdPrefix.resolve_in_txn(txn, :work_item, id, visible?) do
+            {:ok, resolved} ->
+              id_resolved(call, txn, :work_item, resolved)
+              dispose_in_txn(txn, call.principal, resolved, verb, reason)
+
+            :unknown ->
+              unknown(id)
+
+            {:ambiguous, error} ->
+              error
+          end
+        end)
 
       case result do
         {:disposed, item, changed?} ->
@@ -609,32 +628,51 @@ defmodule Tightbeam.WorkItems do
 
   defp get_result(db, call) do
     with :ok <- principal_allowed(call.principal) do
-      case fetch(db, call.params[:work_item_id]) do
-        nil ->
-          unknown(call.params[:work_item_id])
+      supplied = call.params[:work_item_id]
 
-        item ->
+      case IdPrefix.resolve(db, :work_item, supplied) do
+        {:ok, id} ->
+          item = fetch(db, id)
+
           %{
             workItem: public_work_item(item),
             assignments: Tightbeam.Assignments.__for_work_item__(db, item.id)
           }
+
+        :unknown ->
+          unknown(supplied)
+
+        {:ambiguous, error} ->
+          error
       end
     end
   end
 
   defp trace_result(db, call) do
-    id = call.params[:work_item_id]
+    supplied = call.params[:work_item_id]
 
-    case fetch(db, id) do
-      item when not is_nil(item) ->
+    visible? = fn id ->
+      case fetch(db, id) do
+        nil -> false
+        item -> trace_allowed?(db, call.principal, item)
+      end
+    end
+
+    case IdPrefix.resolve(db, :work_item, supplied, visible?) do
+      {:ok, id} ->
+        item = fetch(db, id)
+
         if trace_allowed?(db, call.principal, item) do
           Tightbeam.JobTrace.build(db, item)
         else
           trace_not_found()
         end
 
-      nil ->
+      :unknown ->
         trace_not_found()
+
+      {:ambiguous, error} ->
+        error
     end
   end
 
@@ -757,6 +795,13 @@ defmodule Tightbeam.WorkItems do
   defp creator({:session, session}), do: {nil, session}
   defp unknown(id), do: error("unknown_work_item", "unknown work item: #{id}")
   defp error(code, message), do: %{code: code, message: message}
+
+  defp id_resolved(call, txn, type, id) do
+    case Map.get(call, :on_id_resolved_in_txn) do
+      fun when is_function(fun, 3) -> fun.(txn, type, id)
+      _ -> :ok
+    end
+  end
 
   defp metadata(item), do: {item.title, item.specRefName, item.specRefSha256, item.isBug}
 

@@ -7,7 +7,7 @@ defmodule Tightbeam.Escalation do
   batch must fail closed if any CAS loses; earlier winners stay consumed.
   """
 
-  alias Tightbeam.{ConditionFacts, DB, EventLog, Org, Roles, Wakes}
+  alias Tightbeam.{ConditionFacts, DB, EventLog, IdPrefix, Org, Roles, Wakes}
   alias Tightbeam.DB.Txn
 
   @default_decision_deadline_ms 86_400_000
@@ -388,8 +388,7 @@ defmodule Tightbeam.Escalation do
 
     with {:ok, asker_session_key} <- asking_session(call),
          {:ok, asked} <- asked_principal(db, asked_session_key, asker_session_key),
-         {:ok, text} <- asked_question(question),
-         {:ok, about} <- asked_about(db, call, asker_session_key) do
+         {:ok, text} <- asked_question(question) do
       file_agent_request(db, %{
         asker_session_key: asker_session_key,
         owner_user_id: owner_user_id!(db, call),
@@ -397,7 +396,7 @@ defmodule Tightbeam.Escalation do
         asked_of_role: Map.get(call, :target_role),
         role_fallback: Map.get(call, :role_fallback, false) == true,
         question: text,
-        assignment_id: about
+        assignment_id: assignment_id(call)
       })
     else
       {:error, error} -> error
@@ -468,55 +467,62 @@ defmodule Tightbeam.Escalation do
         "roleFallback" => input.role_fallback
       })
 
-    {:ok, request} =
-      DB.transaction(db, fn txn ->
-        Txn.q(
-          txn,
-          """
-          INSERT INTO decision_requests
-            (id, kind, raiserId, raiserSessionKey, ownerUserId, assignmentId,
-             expecterSessionKey, expecterUserId, raisedAt, deadlineAt,
-             question, context, status, askedOfRole)
-          VALUES (?1, 'agent', ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10, 'open', ?11)
-          """,
-          [
-            request_id,
-            "session:" <> input.asker_session_key,
-            input.asker_session_key,
-            input.owner_user_id,
-            input.assignment_id,
-            input.asked.session_key,
-            input.asked.owner_user_id,
-            now,
-            input.question,
-            context,
-            input.asked_of_role
-          ]
-        )
+    case DB.transaction(db, fn txn ->
+           with {:ok, about} <-
+                  asked_about_in_txn(txn, input.assignment_id, input.asker_session_key) do
+             resolved_input = Map.put(input, :assignment_id, about)
 
-        EventLog.lifecycle_in_txn(
-          txn,
-          "decision_request_asked",
-          request_id,
-          "asker=session:#{input.asker_session_key} askedOf=#{input.asked.session_key} " <>
-            "role=#{input.asked_of_role || "nil"} assignment=#{input.assignment_id || "nil"}"
-        )
+             Txn.q(
+               txn,
+               """
+               INSERT INTO decision_requests
+                 (id, kind, raiserId, raiserSessionKey, ownerUserId, assignmentId,
+                  expecterSessionKey, expecterUserId, raisedAt, deadlineAt,
+                  question, context, status, askedOfRole)
+               VALUES (?1, 'agent', ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10, 'open', ?11)
+               """,
+               [
+                 request_id,
+                 "session:" <> resolved_input.asker_session_key,
+                 resolved_input.asker_session_key,
+                 resolved_input.owner_user_id,
+                 resolved_input.assignment_id,
+                 resolved_input.asked.session_key,
+                 resolved_input.asked.owner_user_id,
+                 now,
+                 resolved_input.question,
+                 context,
+                 resolved_input.asked_of_role
+               ]
+             )
 
-        # Transactional outbox. `target_gate: 0` because a question the target
-        # never sees is not a question; the class is what shapes WHEN it lands.
-        Wakes.schedule_in_txn(txn, %{
-          session_key: input.asked.session_key,
-          origin: "session:" <> input.asker_session_key,
-          prompt: ask_notification(request_id, input),
-          due_at: now,
-          target_gate: 0,
-          class: "input-needed"
-        })
+             EventLog.lifecycle_in_txn(
+               txn,
+               "decision_request_asked",
+               request_id,
+               "asker=session:#{resolved_input.asker_session_key} askedOf=#{resolved_input.asked.session_key} " <>
+                 "role=#{resolved_input.asked_of_role || "nil"} assignment=#{resolved_input.assignment_id || "nil"}"
+             )
 
-        request_in_txn(txn, request_id)
-      end)
+             # Transactional outbox. `target_gate: 0` because a question the target
+             # never sees is not a question; the class is what shapes WHEN it lands.
+             Wakes.schedule_in_txn(txn, %{
+               session_key: resolved_input.asked.session_key,
+               origin: "session:" <> resolved_input.asker_session_key,
+               prompt: ask_notification(request_id, resolved_input),
+               due_at: now,
+               target_gate: 0,
+               class: "input-needed"
+             })
 
-    request
+             request_in_txn(txn, request_id)
+           else
+             {:error, error} -> error
+           end
+         end) do
+      {:ok, request} -> request
+      {:error, reason} -> raise "agent request transaction failed: #{inspect(reason)}"
+    end
   end
 
   defp answer_open(db, request, text, answered_by) do
@@ -607,16 +613,25 @@ defmodule Tightbeam.Escalation do
   # the minimal one: the asker must hold the assignment, have opened it, or be
   # the one it reviews. Both an invisible id and a nonexistent one refuse
   # identically.
-  defp asked_about(db, call, asker_session_key) do
-    case assignment_id(call) do
+  defp asked_about_in_txn(txn, supplied, asker_session_key) do
+    case supplied do
       nil ->
         {:ok, nil}
 
       id when is_binary(id) ->
-        if askable_assignment?(db, id, asker_session_key) do
-          {:ok, id}
-        else
-          {:error, error("not_found", "unknown assignment: #{id}")}
+        visible? = &askable_assignment_in_txn?(txn, &1, asker_session_key)
+
+        case IdPrefix.resolve_in_txn(txn, :assignment, id, visible?) do
+          {:ok, canonical} ->
+            if askable_assignment_in_txn?(txn, canonical, asker_session_key),
+              do: {:ok, canonical},
+              else: {:error, error("not_found", "unknown assignment: #{id}")}
+
+          :unknown ->
+            {:error, error("not_found", "unknown assignment: #{id}")}
+
+          {:ambiguous, error} ->
+            {:error, error}
         end
 
       _ ->
@@ -624,18 +639,18 @@ defmodule Tightbeam.Escalation do
     end
   end
 
-  defp askable_assignment?(db, assignment_id, asker_session_key) do
-    case DB.query(
-           db,
+  defp askable_assignment_in_txn?(txn, assignment_id, asker_session_key) do
+    case Txn.q(
+           txn,
            "SELECT holderKey, openedBySession, reviewsAssignmentId FROM assignments WHERE id = ?1",
            [assignment_id]
          ) do
-      {:ok, [[holder_key, opened_by_session, reviews_id]]} ->
+      [[holder_key, opened_by_session, reviews_id]] ->
         holder_key == asker_session_key or
           opened_by_session == asker_session_key or
-          (is_binary(reviews_id) and reviewed_holder?(db, reviews_id, asker_session_key))
+          (is_binary(reviews_id) and reviewed_holder_in_txn?(txn, reviews_id, asker_session_key))
 
-      {:ok, []} ->
+      [] ->
         false
     end
   end
@@ -643,10 +658,10 @@ defmodule Tightbeam.Escalation do
   # The assignment named by `--about` reviews another one: the session being
   # reviewed is legitimately referenced by that review even though it holds
   # neither the review assignment nor opened it.
-  defp reviewed_holder?(db, reviewed_assignment_id, asker_session_key) do
-    case DB.query(db, "SELECT holderKey FROM assignments WHERE id = ?1", [reviewed_assignment_id]) do
-      {:ok, [[holder_key]]} -> holder_key == asker_session_key
-      {:ok, []} -> false
+  defp reviewed_holder_in_txn?(txn, reviewed_assignment_id, asker_session_key) do
+    case Txn.q(txn, "SELECT holderKey FROM assignments WHERE id = ?1", [reviewed_assignment_id]) do
+      [[holder_key]] -> holder_key == asker_session_key
+      [] -> false
     end
   end
 

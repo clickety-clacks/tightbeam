@@ -40,7 +40,7 @@ defmodule Tightbeam.ExecutionMap do
      through any item-attributed carrier.
   """
 
-  alias Tightbeam.{CausalEvents, DB, Escalation}
+  alias Tightbeam.{CausalEvents, DB, Escalation, IdPrefix}
 
   @edge_basis "concurrent_turn"
   @coverage_basis "conservative_shared"
@@ -90,15 +90,21 @@ defmodule Tightbeam.ExecutionMap do
         world = world(db, call)
         appearing = appearing(world, params)
 
-        cond do
-          truthy?(params[:tree]) and paging?(params) ->
-            invalid("--after/--limit page the flat roster; --tree returns a forest")
+        case resolve_page_selection(world, selection) do
+          {:error, error} ->
+            error
 
-          truthy?(params[:tree]) ->
-            forest(world, appearing)
+          canonical_selection ->
+            cond do
+              truthy?(params[:tree]) and paging?(params) ->
+                invalid("--after/--limit page the flat roster; --tree returns a forest")
 
-          true ->
-            page(world, appearing, selection)
+              truthy?(params[:tree]) ->
+                forest(world, appearing)
+
+              true ->
+                page(world, appearing, canonical_selection)
+            end
         end
     end
   end
@@ -123,7 +129,13 @@ defmodule Tightbeam.ExecutionMap do
         invalid("--under and --assignments are mutually exclusive")
 
       is_binary(params[:under]) and params[:under] != "" ->
-        under(world(db, call), params, params[:under])
+        world = world(db, call)
+
+        case IdPrefix.resolve_ids(:work_item, params[:under], Map.keys(world.items_by_id)) do
+          {:ok, id} -> under(world, params, id)
+          :unknown -> not_found("work item not found")
+          {:ambiguous, error} -> error
+        end
 
       not is_nil(params[:assignments]) ->
         assignment_selection(world(db, call), params[:assignments])
@@ -181,23 +193,44 @@ defmodule Tightbeam.ExecutionMap do
         invalid("--assignments requires at least one assignment id")
 
       ids ->
-        case classify(world, ids, [], []) do
-          :not_found ->
-            # An unknown id and an id this caller may not see are ONE answer;
-            # a visible NONE id is substrate truth and uses `no_item`.
-            not_found("assignment not found")
+        case resolve_assignment_ids(world, ids) do
+          {:error, error} ->
+            error
 
-          {items, no_item} ->
-            selected =
-              world.items
-              |> Enum.filter(&MapSet.member?(MapSet.new(items), &1.id))
-              |> Enum.map(&node(world, &1))
+          {:ok, canonical_ids} ->
+            case classify(world, canonical_ids, [], []) do
+              :not_found ->
+                # An unknown id and an id this caller may not see are ONE answer;
+                # a visible NONE id is substrate truth and uses `no_item`.
+                not_found("assignment not found")
 
-            envelope(world)
-            |> Map.put(:items, selected)
-            |> Map.put(:no_item, Enum.sort(no_item))
+              {items, no_item} ->
+                selected =
+                  world.items
+                  |> Enum.filter(&MapSet.member?(MapSet.new(items), &1.id))
+                  |> Enum.map(&node(world, &1))
+
+                envelope(world)
+                |> Map.put(:items, selected)
+                |> Map.put(:no_item, Enum.sort(no_item))
+            end
         end
     end
+  end
+
+  defp resolve_assignment_ids(world, supplied_ids) do
+    visible_ids =
+      world.assignments_by_id
+      |> Map.keys()
+      |> Enum.filter(&(classify(world, [&1], [], []) != :not_found))
+
+    Enum.reduce_while(supplied_ids, {:ok, []}, fn supplied, {:ok, resolved} ->
+      case IdPrefix.resolve_ids(:assignment, supplied, visible_ids) do
+        {:ok, id} -> {:cont, {:ok, resolved ++ [id]}}
+        :unknown -> {:halt, {:error, not_found("assignment not found")}}
+        {:ambiguous, error} -> {:halt, {:error, error}}
+      end
+    end)
   end
 
   defp classify(_world, [], items, no_item), do: {Enum.uniq(items), Enum.uniq(no_item)}
@@ -1036,6 +1069,17 @@ defmodule Tightbeam.ExecutionMap do
 
       true ->
         {:page, cursor, limit && min(limit, @max_limit)}
+    end
+  end
+
+  defp resolve_page_selection(_world, :all), do: :all
+  defp resolve_page_selection(_world, {:page, nil, limit}), do: {:page, nil, limit}
+
+  defp resolve_page_selection(world, {:page, supplied, limit}) do
+    case IdPrefix.resolve_ids(:work_item, supplied, Map.keys(world.items_by_id)) do
+      {:ok, id} -> {:page, id, limit}
+      :unknown -> {:error, cursor_not_found("work item not found")}
+      {:ambiguous, error} -> {:error, error}
     end
   end
 

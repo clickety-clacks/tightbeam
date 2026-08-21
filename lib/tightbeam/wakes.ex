@@ -2019,6 +2019,20 @@ defmodule Tightbeam.Wakes do
     rows != []
   end
 
+  @doc false
+  def rumination_exists_in_txn?(%Txn{} = txn, work_item_id, caller_session) do
+    Txn.q(
+      txn,
+      """
+      SELECT 1 FROM wakes
+      WHERE rumination = 1 AND work_item_id = ?1 AND creatorSessionKey = ?2
+        AND state = 'fired'
+      LIMIT 1
+      """,
+      [work_item_id, caller_session]
+    ) != []
+  end
+
   ## Scheduler process
 
   @doc """
