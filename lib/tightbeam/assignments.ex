@@ -552,7 +552,10 @@ defmodule Tightbeam.Assignments do
         [work_item_id]
       )
 
-    Enum.map(rows, &assignment/1)
+    Enum.map(rows, fn row ->
+      assignment = assignment(row)
+      Map.put(assignment, :files, declared_files(db, assignment.id))
+    end)
   end
 
   @doc "Resolve an assignment's story membership without changing direct ownership readers."
