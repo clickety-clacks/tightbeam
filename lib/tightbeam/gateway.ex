@@ -633,6 +633,7 @@ defmodule Tightbeam.Gateway do
           outcome =
             deliver_prompt(call.session_key, call.origin, p.content,
               db: db,
+              sender: call.origin,
               device_id: p.device_id,
               client_message_id: p.client_message_id,
               attachments: Map.get(p, :attachments, []),

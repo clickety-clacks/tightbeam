@@ -128,7 +128,8 @@ defmodule Tightbeam.Wire.SocketTest do
       "type" => "message",
       "id" => "c_once",
       "content" => "hello",
-      "sessionKey" => main
+      "sessionKey" => main,
+      "sender" => "user:mallory"
     }
 
     {:push, {:text, ack}, live} =
@@ -136,10 +137,28 @@ defmodule Tightbeam.Wire.SocketTest do
 
     assert JSON.decode!(ack) == %{"type" => "ack", "id" => "c_once"}
 
+    authenticated_sender = "user:#{device.user_id}"
+
+    assert_receive {:push_message, ^main, _seq,
+                    %{
+                      "type" => "message",
+                      "role" => "user",
+                      "sender" => ^authenticated_sender,
+                      "deviceId" => "chat-e2e",
+                      "clientMessageId" => "c_once"
+                    }}
+
+    assert {:ok, [[^authenticated_sender, "chat-e2e"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sender, deviceId FROM messages WHERE clientMessageId='c_once'"
+             )
+
     {:push, {:text, duplicate_ack}, live} =
       Socket.handle_in({JSON.encode!(message), opcode: :text}, live)
 
     assert JSON.decode!(duplicate_ack) == %{"type" => "ack", "id" => "c_once"}
+    refute_receive {:push_message, ^main, _seq, _payload}
 
     {:push, {:text, conflict}, live} =
       Socket.handle_in(
@@ -210,10 +229,86 @@ defmodule Tightbeam.Wire.SocketTest do
              "messageId" => "c_foreign"
            }
 
+    {:pending, pending_admin} =
+      Devices.pair(ctx.db, %{
+        device_id: "chat-admin",
+        claimed_name: "Admin",
+        platform: nil,
+        model: nil
+      })
+
+    admin_device = Devices.approve(ctx.db, pending_admin.device_id)
+    Devices.set_user_admin(ctx.db, admin_device.user_id, true)
+
+    {:ok, admin_socket} = Socket.init(deps)
+
+    admin_auth = %{
+      "type" => "auth",
+      "token" => admin_device.token,
+      "deviceId" => admin_device.device_id
+    }
+
+    {:push, _admin_auth_frames, admin_replaying} =
+      Socket.handle_in({JSON.encode!(admin_auth), opcode: :text}, admin_socket)
+
+    {:push, _admin_sync_frame, admin_live} =
+      Socket.handle_info(:finish_replay, admin_replaying)
+
+    {:ok, _ref, nil} =
+      ConnRegistry.register(Tightbeam.ConnRegistry, %{
+        pid: self(),
+        user_id: "other",
+        device_id: "other-observer",
+        is_admin: false,
+        subscriptions: MapSet.new(["chat"])
+      })
+
+    admin_message = %{
+      "type" => "message",
+      "id" => "c_admin_once",
+      "content" => "admin hello",
+      "sessionKey" => "other-session",
+      "sender" => "user:mallory"
+    }
+
+    {:push, {:text, admin_ack}, admin_live} =
+      Socket.handle_in({JSON.encode!(admin_message), opcode: :text}, admin_live)
+
+    assert JSON.decode!(admin_ack) == %{"type" => "ack", "id" => "c_admin_once"}
+
+    admin_sender = "user:#{admin_device.user_id}"
+
+    assert_receive {:push_message, "other-session", _seq,
+                    %{
+                      "type" => "message",
+                      "role" => "user",
+                      "sender" => ^admin_sender,
+                      "deviceId" => "chat-admin",
+                      "clientMessageId" => "c_admin_once"
+                    }}
+
+    assert {:ok, [[^admin_sender, "chat-admin"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sender, deviceId FROM messages WHERE clientMessageId='c_admin_once'"
+             )
+
+    {:push, {:text, admin_duplicate_ack}, _admin_live} =
+      Socket.handle_in({JSON.encode!(admin_message), opcode: :text}, admin_live)
+
+    assert JSON.decode!(admin_duplicate_ack) == %{"type" => "ack", "id" => "c_admin_once"}
+    refute_receive {:push_message, "other-session", _seq, _payload}
+
     assert {:ok, [[1]]} =
              DB.query(
                ctx.db,
                "SELECT COUNT(*) FROM messages WHERE clientMessageId='c_once'"
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM messages WHERE clientMessageId='c_admin_once'"
              )
 
     assert {:ok, [[1]]} =
