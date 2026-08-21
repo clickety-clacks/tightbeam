@@ -6484,16 +6484,29 @@ defmodule Tightbeam.GatewayTest do
     assert rows == [[nil, nil], [nil, "wi_nag"]]
   end
 
-  test "wake_id dedupes the transaction including its second echo", ctx do
+  test "wake_id dedupes a synthetic-pair wake and preserves its sender envelope", ctx do
     opts = [
       db: ctx.db,
       conn_registry: ctx.registry,
       lane_manager: ctx.lane,
       wake_id: "w_1",
-      sender: "agent:caller"
+      sender: "agent:caller",
+      device_id: "process:tightbeam",
+      client_message_id: "synthetic:w_1"
     ]
 
     assert Gateway.deliver_prompt("k1", "agent:caller", "wake", opts) == :appended
+
+    assert_receive {:push_message, "k1", _seq,
+                    %{
+                      "type" => "message",
+                      "role" => "user",
+                      "sender" => "agent:caller",
+                      "deviceId" => "process:tightbeam",
+                      "clientMessageId" => "synthetic:w_1",
+                      "content" => "[from agent:caller]\n\nwake"
+                    }}
+
     assert Gateway.deliver_prompt("k1", "agent:caller", "wake", opts) == :duplicate
     assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM messages")
     assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId = 'w_1'")
@@ -6505,6 +6518,29 @@ defmodule Tightbeam.GatewayTest do
                SELECT m.content, t.prompt
                FROM messages m JOIN turns t ON t.messageId=m.id
                WHERE t.wakeId='w_1'
+               """
+             )
+  end
+
+  test "an incomplete authenticated-device shape cannot suppress the sender envelope", ctx do
+    opts = [
+      db: ctx.db,
+      conn_registry: ctx.registry,
+      lane_manager: ctx.lane,
+      sender: "user:flynn",
+      authenticated_device_message: true,
+      device_id: "d1"
+    ]
+
+    assert Gateway.deliver_prompt("k1", "user:flynn", "partial", opts) == :appended
+
+    assert {:ok, [["[from user:flynn]\n\npartial", "[from user:flynn]\n\npartial"]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT m.content, t.prompt
+               FROM messages m JOIN turns t ON t.messageId=m.id
+               WHERE m.content LIKE '%partial'
                """
              )
   end
