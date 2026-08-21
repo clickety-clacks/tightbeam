@@ -30,6 +30,14 @@ defmodule Tightbeam.Harness do
 
   @type target :: map()
   @type launch_plan :: keyword()
+  @type launch_refusal :: %{
+          required(:code) => String.t(),
+          required(:message) => String.t(),
+          optional(:details) => map()
+        }
+  @type preflight_result :: {:ok, keyword()} | {:error, launch_refusal()}
+  @type launch_result :: {:ok, launch_plan()} | {:error, launch_refusal()}
+  @type ensure_result :: {:ok, String.t()} | {:error, launch_refusal()}
   @type desired_home :: map()
   @type credential_liveness ::
           :live | {:dead, term()} | {:unknown, term()}
@@ -75,8 +83,9 @@ defmodule Tightbeam.Harness do
   """
   @callback cli_binary() :: binary()
   @callback wire_projection() :: binary()
-  @callback prepare_launch(target(), String.t(), keyword()) :: launch_plan()
-  @callback ensure_adapter(target()) :: {:ok, String.t()} | {:error, map()}
+  @callback preflight_launch(target(), String.t(), keyword()) :: preflight_result()
+  @callback prepare_launch(target(), String.t(), keyword()) :: launch_plan() | launch_result()
+  @callback ensure_adapter(target()) :: ensure_result()
   @callback session_config(map(), binary()) :: map()
   @doc "The harness-owned leaf entries of a projected home."
   @callback owned_home_entries() :: [String.t()]
@@ -118,11 +127,36 @@ defmodule Tightbeam.Harness do
   @callback install_cli_projection(String.t()) :: :ok
   @callback probe_cli(target()) ::
               {:ok, %{bin: String.t(), version: String.t()}}
-              | {:error, :not_found | {:exec_failed, String.t()}}
+              | {:error, :not_found | {:exec_failed, String.t()} | launch_refusal()}
   @callback classify_auth_event(map()) :: :terminal | :transient | :unknown
   @callback classify_subagent_event(map()) ::
               {:subagent_start | :subagent_stop, map()} | :skip
   @callback fetch_catalog(map()) :: {:ok, [map()]} | {:error, term()}
+
+  @optional_callbacks preflight_launch: 3
+
+  @spec preflight_launch(module(), target(), String.t(), keyword()) :: preflight_result()
+  def preflight_launch(module, target, home, opts) do
+    if function_exported?(module, :preflight_launch, 3),
+      do: module.preflight_launch(target, home, opts),
+      else: {:ok, opts}
+  end
+
+  @spec prepare_launch(module(), target(), String.t(), keyword()) :: launch_result()
+  def prepare_launch(module, target, home, opts) do
+    case module.prepare_launch(target, home, opts) do
+      {:ok, plan} when is_list(plan) ->
+        {:ok, plan}
+
+      {:error, %{code: code, message: message} = refusal}
+      when is_binary(code) and is_binary(message) ->
+        {:error, refusal}
+
+      plan when is_list(plan) ->
+        {:ok, plan}
+    end
+  end
+
   @optional_callbacks warm_home: 2, requires_zero_listeners?: 0
 
   @doc """

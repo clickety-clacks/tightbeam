@@ -6,6 +6,8 @@ defmodule Tightbeam.Harness.Cursor do
   alias Tightbeam.Model
 
   @adapter_version "2026.08.11-e8db854"
+  @launcher_sha256 "eed61c5224668c9236334c4c68936a16aecc37374b592f59e31eb50433817831"
+  @bundle_sha256 "6aceb24b7c7ecddb1993946ebb18a7dd4d025842e6efda955eb0c13255b1e5f0"
   @credential_file "cli-config.json"
   @api_key_file "api-key"
   @rails_file "hooks.json"
@@ -50,56 +52,62 @@ defmodule Tightbeam.Harness.Cursor do
 
   @impl true
   def ensure_adapter(target) do
-    Tightbeam.Spinup.ensure_shim_adapter(
-      target,
-      adapter_binary(target),
-      cli_binary(),
-      ["acp"]
-    )
+    with {:ok, %{launcher: launcher}} <- verify_installed_cli(target) do
+      Tightbeam.Spinup.ensure_shim_adapter(target, adapter_binary(target), launcher, ["acp"])
+    end
+  end
+
+  @impl true
+  def preflight_launch(target, _home, opts) do
+    case Keyword.fetch(opts, :credential_kind) do
+      {:ok, :api_key} -> load_api_key(target, opts)
+      _ -> credential_refusal()
+    end
   end
 
   @impl true
   def prepare_launch(target, home, opts) do
-    binary = adapter_binary(target)
-    key_path = api_key_path(target.host_config.base_dir)
+    with {:ok, _verified} <- verify_installed_cli(target) do
+      if Support.local?(target) do
+        case Keyword.fetch(opts, :cursor_api_key) do
+          {:ok, key} ->
+            {:ok,
+             [
+               readiness_rendezvous: true,
+               cmd: [adapter_binary(target)],
+               env: [
+                 {"CURSOR_CONFIG_DIR", home},
+                 {"AGENT_CLI_CREDENTIAL_STORE", "memory"},
+                 {"CURSOR_API_KEY", key}
+                 | Keyword.fetch!(opts, :common_env)
+               ]
+             ]}
 
-    if Support.local?(target) do
-      credential_env =
-        case Keyword.fetch!(opts, :credential_kind) do
-          :api_key ->
-            case File.read(key_path) do
-              {:ok, key} -> [{"CURSOR_API_KEY", String.trim(key)}]
-              _ -> []
-            end
-
-          :subscription ->
-            []
+          :error ->
+            credential_refusal()
         end
+      else
+        key_path = api_key_path(target.host_config.base_dir)
 
-      [
-        cmd: [binary],
-        env: [{"CURSOR_CONFIG_DIR", home} | Keyword.fetch!(opts, :common_env) ++ credential_env]
-      ]
-    else
-      remote_env =
-        case Keyword.fetch!(opts, :credential_kind) do
-          :api_key ->
-            [
-              "CURSOR_API_KEY=$(cat #{key_path} 2>/dev/null)",
-              "CURSOR_CONFIG_DIR=#{home}"
-              | Keyword.fetch!(opts, :remote_env)
-            ]
+        remote_env = [
+          "AGENT_CLI_CREDENTIAL_STORE=memory",
+          "CURSOR_CONFIG_DIR=#{Support.shell_quote(home)}"
+          | Keyword.fetch!(opts, :remote_env)
+        ]
 
-          :subscription ->
-            ["CURSOR_CONFIG_DIR=#{home}" | Keyword.fetch!(opts, :remote_env)]
-        end
+        script =
+          "exec env CURSOR_API_KEY=\"$(cat #{Support.shell_quote(key_path)})\" " <>
+            Enum.join(remote_env, " ") <> " " <> Support.shell_quote(adapter_binary(target))
 
-      [
-        cmd:
-          ["ssh" | Support.ssh_opts()] ++
-            [target.host_config.ssh, "exec", "env" | remote_env] ++ [binary],
-        env: [{"TIGHTBEAM_LINEAGE", Keyword.fetch!(opts, :lineage)}]
-      ]
+        {:ok,
+         [
+           readiness_rendezvous: true,
+           cmd:
+             ["ssh" | Support.ssh_opts()] ++
+               [target.host_config.ssh, "sh", "-c", Support.shell_quote(script)],
+           env: [{"TIGHTBEAM_LINEAGE", Keyword.fetch!(opts, :lineage)}]
+         ]}
+      end
     end
   end
 
@@ -170,8 +178,23 @@ defmodule Tightbeam.Harness.Cursor do
 
   @impl true
   def probe_cli(target) do
-    find = Map.get(target, :find_executable, &System.find_executable/1)
-    Support.bounded_probe(find.(cli_binary()), target)
+    with {:ok, %{launcher: launcher}} <- verify_installed_cli(target) do
+      Support.bounded_probe(launcher, target)
+    end
+  end
+
+  @doc false
+  def verify_installed_cli(target) do
+    with launcher when is_binary(launcher) <- resolve_launcher(target),
+         {:ok, canonical} <- canonical_path(target, launcher),
+         true <- Path.basename(Path.dirname(canonical)) == @adapter_version,
+         :ok <- verify_hash(target, canonical, @launcher_sha256),
+         :ok <-
+           verify_hash(target, Path.join(Path.dirname(canonical), "index.js"), @bundle_sha256) do
+      {:ok, %{launcher: canonical, version: @adapter_version}}
+    else
+      _ -> integrity_refusal()
+    end
   end
 
   @impl true
@@ -233,6 +256,7 @@ defmodule Tightbeam.Harness.Cursor do
       rails: %{"hooks" => %{"PreToolUse" => []}},
       skills_path: Path.join([".cursor", "skills"]),
       local_extra_env: %{subscription: [], api_key: [{"CURSOR_API_KEY", "vector-token"}]},
+      unsupported_launch_kinds: [:subscription],
       rails_env: nil,
       remote_prefix: fn base, home, kind ->
         case kind do
@@ -253,6 +277,7 @@ defmodule Tightbeam.Harness.Cursor do
       provisioning: :shim,
       adapter_bin: "cursor-agent",
       cli_name: "cursor-agent",
+      pinned_cli_path: Path.join([@adapter_version, "cursor-agent"]),
       shim_exec_args: ["acp"],
       session_meta: %{instructions: "vector guidance"},
       cli_version: "cursor-agent vector 1.0",
@@ -342,6 +367,111 @@ defmodule Tightbeam.Harness.Cursor do
 
   defp api_key_path(base_dir),
     do: Path.join([base_dir, "auth", "cursor", @api_key_file])
+
+  defp load_api_key(target, opts) do
+    loader = Keyword.get(opts, :cursor_api_key_loader, &read_api_key(target, &1))
+
+    case loader.(api_key_path(target.host_config.base_dir)) do
+      {:ok, :remote_banked} when not is_nil(target.host_config.ssh) ->
+        {:ok, Keyword.put(opts, :cursor_api_key_remote, true)}
+
+      {:ok, key} when is_binary(key) ->
+        case String.trim(key) do
+          "" -> credential_refusal()
+          trimmed -> {:ok, Keyword.put(opts, :cursor_api_key, trimmed)}
+        end
+
+      _ ->
+        credential_refusal()
+    end
+  end
+
+  defp read_api_key(target, path) do
+    if Support.local?(target) do
+      File.read(path)
+    else
+      script = "test -r #{Support.shell_quote(path)} && test -s #{Support.shell_quote(path)}"
+
+      case target.sh.(
+             ["ssh" | Support.ssh_opts()] ++
+               [target.host_config.ssh, "sh", "-c", Support.shell_quote(script)]
+           ) do
+        {_output, 0} -> {:ok, :remote_banked}
+        _ -> {:error, :unreadable}
+      end
+    end
+  end
+
+  defp credential_refusal do
+    {:error, %{code: "DIV-CURSOR-API-KEY-ONLY", message: "Cursor requires a banked API key"}}
+  end
+
+  defp integrity_refusal do
+    {:error,
+     %{code: "cursor_cli_integrity_mismatch", message: "Cursor CLI integrity check failed"}}
+  end
+
+  defp canonical_path(target, path) do
+    realpath =
+      Map.get_lazy(target, :realpath, fn ->
+        if Support.local?(target), do: &default_realpath/1, else: &remote_realpath(target, &1)
+      end)
+
+    case realpath.(path) do
+      {:ok, canonical} when is_binary(canonical) -> {:ok, canonical}
+      canonical when is_binary(canonical) -> {:ok, canonical}
+      _ -> {:error, :canonical_path}
+    end
+  end
+
+  defp default_realpath(path) do
+    case System.cmd("realpath", [path], stderr_to_stdout: true) do
+      {canonical, 0} -> {:ok, String.trim(canonical)}
+      _ -> {:error, :canonical_path}
+    end
+  end
+
+  defp verify_hash(target, path, expected) do
+    hash =
+      Map.get_lazy(target, :sha256, fn ->
+        if Support.local?(target), do: &local_sha256/1, else: &remote_sha256(target, &1)
+      end)
+
+    digest = hash.(path)
+    if digest == expected or digest == {:ok, expected}, do: :ok, else: {:error, :hash}
+  end
+
+  defp resolve_launcher(%{find_executable: find}), do: find.(cli_binary())
+
+  defp resolve_launcher(target) do
+    if Support.local?(target) do
+      System.find_executable(cli_binary())
+    else
+      remote_value(target, "command -v #{Support.shell_quote(cli_binary())}")
+    end
+  end
+
+  defp remote_realpath(target, path),
+    do: remote_value(target, "realpath #{Support.shell_quote(path)}")
+
+  defp remote_sha256(target, path),
+    do: remote_value(target, "shasum -a 256 #{Support.shell_quote(path)} | cut -d' ' -f1")
+
+  defp remote_value(target, script) do
+    command =
+      ["ssh" | Support.ssh_opts()] ++
+        [target.host_config.ssh, "sh", "-c", Support.shell_quote(script)]
+
+    case target.sh.(command) do
+      {output, 0} -> output |> String.trim() |> String.split("\n") |> List.last()
+      _ -> nil
+    end
+  end
+
+  defp local_sha256(path) do
+    with {:ok, bytes} <- File.read(path),
+         do: Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
+  end
 
   defp adapter_binary(target) do
     Map.get(target, :adapter_binary) ||

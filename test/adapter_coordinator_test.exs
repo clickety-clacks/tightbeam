@@ -26,6 +26,74 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     %{db: db, sup: sup, test_dir: test_dir}
   end
 
+  test "typed launch refusal is coalesced and never starts an adapter child", ctx do
+    parent = self()
+    refusal = %{code: "DIV-CURSOR-API-KEY-ONLY", message: "Cursor requires a banked API key"}
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn _, _ ->
+           send(parent, :preflight)
+           Process.sleep(25)
+           {:error, refusal}
+         end,
+         db: ctx.db,
+         name: :typed_refusal_coordinator}
+      )
+
+    key = {:cursor, "default", "testhost"}
+
+    callers =
+      for _ <- 1..3, do: Task.async(fn -> AdapterCoordinator.adapter_for(coordinator, key) end)
+
+    assert Enum.map(callers, &Task.await/1) ==
+             List.duplicate({:error, {:launch_refused, refusal}}, 3)
+
+    assert_receive :preflight
+    refute_receive :preflight
+    assert DynamicSupervisor.count_children(ctx.sup).active == 0
+  end
+
+  test "generation readiness timeout flushes callers and ignores its late preflight", ctx do
+    parent = self()
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn _, _ ->
+           send(parent, {:preflight_waiting, self()})
+
+           receive do
+             :release -> [harness: :cursor]
+           end
+         end,
+         db: ctx.db,
+         name: :readiness_timeout_coordinator}
+      )
+
+    key = {:cursor, "default", "testhost"}
+    caller = Task.async(fn -> AdapterCoordinator.adapter_for(coordinator, key) end)
+    assert_receive {:preflight_waiting, task}
+
+    state = :sys.get_state(coordinator)
+    entry = state.adapters[key]
+
+    send(
+      coordinator,
+      {:adapter_readiness_timeout, key, entry.generation, entry.readiness_token}
+    )
+
+    assert {:error, {:launch_refused, %{code: "adapter_readiness_timeout"}}} = Task.await(caller)
+
+    refute Process.alive?(task)
+    assert DynamicSupervisor.count_children(ctx.sup).active == 0
+  end
+
   test "five consecutive boot failures open the circuit (async boot)", ctx do
     coordinator =
       start_supervised!(
@@ -151,10 +219,13 @@ defmodule Tightbeam.AdapterCoordinatorTest do
       )
 
     key = {:claude, "default", "testhost"}
+
     assert {:ok, adapter, _generation} = AdapterCoordinator.adapter_for(coordinator, key)
+
     assert_receive {:adapter_context, context_worker, ^key}
     refute context_worker == coordinator
-    assert_receive {:adapter_opts, ^adapter, ^key, [credential_kind: :subscription]}
+    assert_receive {:adapter_opts, readiness_task, ^key, [credential_kind: :subscription]}
+    refute readiness_task == adapter
   end
 
   test "context capture frees the coordinator mailbox for a lifecycle callback", ctx do
@@ -220,7 +291,8 @@ defmodule Tightbeam.AdapterCoordinatorTest do
 
     key = {:claude, "default", "testhost"}
     assert {:ok, first, 1} = AdapterCoordinator.adapter_for(coordinator, key)
-    assert_receive {:boot_context, ^first, [credential_kind: :subscription]}
+    assert_receive {:boot_context, first_readiness, [credential_kind: :subscription]}
+    refute first_readiness == first
     first_ref = Process.monitor(first)
 
     assert {:ok, second, 2} =
@@ -228,7 +300,8 @@ defmodule Tightbeam.AdapterCoordinatorTest do
 
     refute second == first
     assert_receive {:DOWN, ^first_ref, :process, ^first, _reason}
-    assert_receive {:boot_context, ^second, [credential_kind: :api_key]}
+    assert_receive {:boot_context, second_readiness, [credential_kind: :api_key]}
+    refute second_readiness == second
   end
 
   test "failure circuit threshold uses application config", ctx do

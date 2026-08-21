@@ -1136,7 +1136,7 @@ defmodule Tightbeam.Placement do
   `config` is the Gateway config map (base_dir, cwd, …). Local keys must
   produce exactly the pre-placement behavior. Calls deliver_home/3.
   """
-  @spec adapter_opts(map(), adapter_key()) :: keyword()
+  @spec adapter_opts(map(), adapter_key()) :: keyword() | {:error, Harness.launch_refusal()}
   def adapter_opts(config, {harness, identity_name, host} = key) do
     module = Harness.module!(harness)
 
@@ -1203,8 +1203,8 @@ defmodule Tightbeam.Placement do
         []
       end
 
-    plan =
-      module.prepare_launch(target, home,
+    launch_opts =
+      [
         common_env: common_env,
         remote_env: remote_env,
         lineage: lineage,
@@ -1214,9 +1214,9 @@ defmodule Tightbeam.Placement do
           credential_kind(config, module.credential_provider(), host, module.wire_name()),
         ensure_workdir: &ensure_workdir/4,
         sh_out: Map.get(config, :sh_out)
-      )
+      ]
 
-    [
+    base = [
       harness: harness,
       home: home,
       cwd: config.cwd,
@@ -1228,7 +1228,11 @@ defmodule Tightbeam.Placement do
       on_subagent_event: subagent_event_handler(config, host, module),
       env: []
     ]
-    |> Keyword.merge(plan)
+
+    with {:ok, checked_opts} <- Harness.preflight_launch(module, target, home, launch_opts),
+         {:ok, plan} <- Harness.prepare_launch(module, target, home, checked_opts) do
+      Keyword.merge(base, plan)
+    end
   end
 
   @doc "Preview the exact PATH an adapter on a configured host will receive."
