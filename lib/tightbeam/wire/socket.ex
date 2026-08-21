@@ -47,6 +47,8 @@ defmodule Tightbeam.Wire.Socket do
     from the gateway config — NEVER hardcoded here), register, replay, live.
   - message: id must start with "c_" (else invalid_message); content ≤ 64KiB
     utf8 (else payload_too_large); session ownership enforced (not_found);
+    zero or one reply entry in the existing references array resolves by
+    llmVisibleMessageId inside the selected session's append transaction;
     then verb "post" through Dispatch. dedupe: :duplicate → ack again;
     :conflict → invalid_message and NO ack.
   - stream_read: write read state, echo stream_read_state.
@@ -411,6 +413,7 @@ defmodule Tightbeam.Wire.Socket do
     content = string(msg["content"])
     session_key = string(msg["sessionKey"] || Org.personal_session_key(state.user_id))
     session = Org.get(db(state), session_key)
+    reply_reference = reply_reference(msg)
 
     cond do
       not String.starts_with?(id, "c_") ->
@@ -422,7 +425,12 @@ defmodule Tightbeam.Wire.Socket do
       is_nil(session) or (session.owner_user_id != state.user_id and not state.is_admin) ->
         push(Payloads.wire_error("not_found", nil, id), state)
 
+      reply_reference == :error ->
+        push(Payloads.wire_error("invalid_message", "invalid reply reference", id), state)
+
       true ->
+        {:ok, reply_to_llm_visible_message_id} = reply_reference
+
         call = %{
           verb: "post",
           origin: "user:#{state.user_id}",
@@ -431,7 +439,8 @@ defmodule Tightbeam.Wire.Socket do
             content: content,
             device_id: state.device_id,
             client_message_id: id,
-            attachments: msg["attachments"] || []
+            attachments: msg["attachments"] || [],
+            reply_to_llm_visible_message_id: reply_to_llm_visible_message_id
           }
         }
 
@@ -454,6 +463,30 @@ defmodule Tightbeam.Wire.Socket do
         end
     end
   end
+
+  defp reply_reference(msg) do
+    case Map.fetch(msg, "references") do
+      :error ->
+        {:ok, nil}
+
+      {:ok, references} when is_list(references) ->
+        if Enum.all?(references, &valid_reference_entry?/1) do
+          case Enum.filter(references, &(&1["kind"] == "reply")) do
+            [] -> {:ok, nil}
+            [%{"llmVisibleMessageId" => id}] when is_binary(id) and id != "" -> {:ok, id}
+            _ -> :error
+          end
+        else
+          :error
+        end
+
+      _ ->
+        :error
+    end
+  end
+
+  defp valid_reference_entry?(%{"kind" => kind}) when is_binary(kind) and kind != "", do: true
+  defp valid_reference_entry?(_entry), do: false
 
   defp seed_main_stream(user_id, state) do
     key = Org.personal_session_key(user_id)

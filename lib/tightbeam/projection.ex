@@ -86,10 +86,10 @@ defmodule Tightbeam.Projection do
   @doc """
   Append a message, idempotently per client send. Dedupe scope is
   `(session_key, device_id, client_message_id)` — when both ids are present
-  and a row already exists: same content → `{:duplicate, msg}` (safe client
-  retry), different content → `{:conflict, msg}` (id reuse; caller rejects).
-  Otherwise inserts and returns `{:appended, msg}`. Runs in one transaction so
-  the check and insert are atomic.
+  and a row already exists: same content and resolved reply target →
+  `{:duplicate, msg}` (safe client retry), different content or reply target →
+  `{:conflict, msg}` (id reuse; caller rejects). Otherwise inserts and returns
+  `{:appended, msg}`. Runs in one transaction so the check and insert are atomic.
   """
   @spec append(db(), map()) ::
           {:appended, message()} | {:duplicate, message()} | {:conflict, message()}
@@ -125,9 +125,11 @@ defmodule Tightbeam.Projection do
       [row] ->
         message = to_message(row)
 
-        if message.content == Map.fetch!(input, :content),
-          do: {:duplicate, message},
-          else: {:conflict, message}
+        if message.content == Map.fetch!(input, :content) and
+             message.reply_to_message_id == Map.get(input, :reply_to_message_id) and
+             message.reply_to_client_message_id == Map.get(input, :reply_to_client_message_id),
+           do: {:duplicate, message},
+           else: {:conflict, message}
 
       [] ->
         id = "s_" <> Tightbeam.Id.uuid4()

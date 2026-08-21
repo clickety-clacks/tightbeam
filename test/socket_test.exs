@@ -227,6 +227,202 @@ defmodule Tightbeam.Wire.SocketTest do
              )
   end
 
+  test "chat ingress resolves one reply reference transactionally and rejects unsafe replays",
+       ctx do
+    start_supervised!(%{
+      id: :reply_reference_conn_registry,
+      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+    })
+
+    start_supervised!(%{
+      id: :reply_reference_lane_manager,
+      start: {LaneDoorbell, :start_link, [{self(), Tightbeam.LaneManager}]}
+    })
+
+    config = %{db: ctx.db, base_dir: System.tmp_dir!(), port: 0}
+    handlers = Gateway.handlers(config)
+    Rules.load!(Path.join(System.tmp_dir!(), "missing-reply-reference-rules"), Map.keys(handlers))
+
+    on_exit(fn ->
+      Rules.load!(Path.join(System.tmp_dir!(), "missing-reply-reference-reset"), [])
+    end)
+
+    {:paired, device} =
+      Devices.pair(ctx.db, %{
+        device_id: "reply-reference",
+        claimed_name: "Flynn",
+        platform: nil,
+        model: nil
+      })
+
+    deps = %{ctx.deps | conn_registry: Tightbeam.ConnRegistry, handlers: handlers}
+    {:ok, socket} = Socket.init(deps)
+    auth = %{"type" => "auth", "token" => device.token, "deviceId" => device.device_id}
+
+    {:push, _auth_frames, replaying} =
+      Socket.handle_in({JSON.encode!(auth), opcode: :text}, socket)
+
+    {:push, _sync_frame, live} = Socket.handle_info(:finish_replay, replaying)
+    main = Org.personal_session_key(device.user_id)
+
+    {:appended, target} =
+      Projection.append(ctx.db, %{
+        session_key: main,
+        role: "user",
+        content: "target",
+        device_id: "earlier-device",
+        client_message_id: "c_target",
+        llm_visible_message_id: "visible-target"
+      })
+
+    {:appended, second_target} =
+      Projection.append(ctx.db, %{
+        session_key: main,
+        role: "assistant",
+        content: "second target",
+        llm_visible_message_id: "visible-second"
+      })
+
+    Org.create(ctx.db, %{
+      session_key: "same-user-other-session",
+      display_name: "Other",
+      owner_user_id: device.user_id,
+      origin: "user:#{device.user_id}",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("fable")
+    })
+
+    {:appended, _cross_session_target} =
+      Projection.append(ctx.db, %{
+        session_key: "same-user-other-session",
+        role: "assistant",
+        content: "cross-session target",
+        llm_visible_message_id: "visible-cross-session"
+      })
+
+    for content <- ["ambiguous one", "ambiguous two"] do
+      assert {:appended, _message} =
+               Projection.append(ctx.db, %{
+                 session_key: main,
+                 role: "assistant",
+                 content: content,
+                 llm_visible_message_id: "visible-duplicate"
+               })
+    end
+
+    reply = %{
+      "type" => "message",
+      "id" => "c_reply",
+      "content" => "answer",
+      "sessionKey" => main,
+      "references" => [
+        %{"kind" => "citation", "opaque" => %{"future" => true}},
+        %{
+          "kind" => "reply",
+          "llmVisibleMessageId" => "visible-target",
+          "role" => "user",
+          "preview" => "target"
+        }
+      ]
+    }
+
+    assert %{"type" => "ack", "id" => "c_reply"} = send_message(reply, live)
+    assert %{"type" => "ack", "id" => "c_reply"} = send_message(reply, live)
+
+    assert {:ok, [[reply_id]]} =
+             DB.query(ctx.db, "SELECT id FROM messages WHERE clientMessageId = 'c_reply'")
+
+    stored = Projection.get(ctx.db, reply_id)
+    assert stored.reply_to_message_id == target.id
+    assert stored.reply_to_client_message_id == "c_target"
+
+    changed_target =
+      put_in(
+        reply,
+        ["references"],
+        [%{"kind" => "reply", "llmVisibleMessageId" => "visible-second"}]
+      )
+
+    assert send_message(changed_target, live) == %{
+             "type" => "error",
+             "code" => "invalid_message",
+             "message" => "clientMessageId reused with different content",
+             "messageId" => "c_reply"
+           }
+
+    invalid_references = [
+      {"c_malformed", %{}},
+      {"c_missing_id", [%{"kind" => "reply"}]},
+      {"c_missing_target", [%{"kind" => "reply", "llmVisibleMessageId" => "missing"}]},
+      {"c_cross_session",
+       [%{"kind" => "reply", "llmVisibleMessageId" => "visible-cross-session"}]},
+      {"c_duplicate_visible",
+       [%{"kind" => "reply", "llmVisibleMessageId" => "visible-duplicate"}]},
+      {"c_multiple",
+       [
+         %{"kind" => "reply", "llmVisibleMessageId" => "visible-target"},
+         %{"kind" => "reply", "llmVisibleMessageId" => "visible-second"}
+       ]}
+    ]
+
+    for {id, references} <- invalid_references do
+      frame = send_message(%{reply | "id" => id, "references" => references}, live)
+
+      assert frame == %{
+               "type" => "error",
+               "code" => "invalid_message",
+               "message" => "invalid reply reference",
+               "messageId" => id
+             }
+    end
+
+    assert {:ok, event_payloads} = DB.query(ctx.db, "SELECT payload FROM events")
+    serialized_payloads = Enum.map_join(event_payloads, "\n", fn [payload] -> payload end)
+    refute serialized_payloads =~ "visible-cross-session"
+    refute serialized_payloads =~ "visible-duplicate"
+    refute serialized_payloads =~ ~s("llmVisibleMessageId")
+
+    race_frames =
+      ["visible-target", "visible-second"]
+      |> Task.async_stream(
+        fn visible_id ->
+          send_message(
+            %{
+              reply
+              | "id" => "c_reply_race",
+                "references" => [%{"kind" => "reply", "llmVisibleMessageId" => visible_id}]
+            },
+            live
+          )
+        end,
+        max_concurrency: 2,
+        ordered: false
+      )
+      |> Enum.map(fn {:ok, frame} -> frame end)
+
+    assert Enum.count(race_frames, &(&1["type"] == "ack")) == 1
+    assert Enum.count(race_frames, &(&1["code"] == "invalid_message")) == 1
+
+    assert {:ok, [[2]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM messages WHERE clientMessageId IN ('c_reply', 'c_reply_race')"
+             )
+
+    assert {:ok, [[2]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
+
+    assert {:ok, [[race_reply_id]]} =
+             DB.query(ctx.db, "SELECT id FROM messages WHERE clientMessageId = 'c_reply_race'")
+
+    assert Projection.get(ctx.db, race_reply_id).reply_to_message_id in [
+             target.id,
+             second_target.id
+           ]
+  end
+
   test "pair and auth failures use the contract reasons", ctx do
     {:ok, state} = Socket.init(ctx.deps)
 
@@ -274,6 +470,13 @@ defmodule Tightbeam.Wire.SocketTest do
       Socket.handle_in({JSON.encode!(auth), opcode: :text}, state)
 
     assert %{"success" => false, "reason" => "device_not_approved"} = JSON.decode!(frame)
+  end
+
+  defp send_message(message, state) do
+    {:push, {:text, frame}, _state} =
+      Socket.handle_in({JSON.encode!(message), opcode: :text}, state)
+
+    JSON.decode!(frame)
   end
 
   test "auth registers, replays at most 500, then sends sync_complete", ctx do
