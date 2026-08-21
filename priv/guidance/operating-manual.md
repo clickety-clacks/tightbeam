@@ -35,15 +35,34 @@ That delivers a message now. To deliver it later, add `--after 30m` or `--at <ep
 Every wake carries a prompt. To answer a prompt tagged `[from user:owner]`, run
 `wake --user owner`; tagged `[from agent:notetaker]`, run `wake --role notetaker`.
 
-## Wake yourself to work later
-You run only when woken. To do deferred work — wait for a build, check back on a colleague,
-retry after a delay, or resume a long task — schedule a wake to your own role and add
-`--after`/`--at`:
+## Match the wake to what you wait on
+You run only when woken. Three things can be waited on; each has one instrument. A timed
+self-wake aimed at an in-org boundary is the wrong instrument, always.
 
-    tightbeam wake --role <your-role> --prompt "check if the build finished, then continue" --after 10m
+- **An in-org row** — a colleague's completion, a review verdict, an artifact, a ruling.
+  Never poll on a timer: completions on cards you opened are delivered to you; for anything
+  else, subscribe:
 
-The prompt you send yourself instructs the future you. Cancel a scheduled wake with
-`tightbeam cancel-wake <wakeId>`, using the id the wake command returned.
+      tightbeam wake --role <you> --when-fact <kind> [--when-scope <scope>] --fallback-after 2h --prompt "..."
+
+  The producing side files the fact when it happens: `tightbeam condition --kind <kind> --scope <scope>`.
+- **An external system the substrate cannot see** — a CI run, a deploy, a provider, a
+  device. A timed recheck is correct here, and only here:
+
+      tightbeam wake --role <you> --prompt "probe CI 4127; record result; next 20m" --after 20m
+
+  Each recheck records the probe result, never bare "no change". Three unchanged probes of
+  one boundary: stop polling and report to your card's opener — a stuck external condition
+  is their decision.
+- **A human decision**:
+
+      tightbeam ask --user <id> --question "<the choice and what depends on it>" --about <asgId>
+
+  The answer wakes you. Never poll a human.
+
+Timed self-wakes remain right for resuming your own long task at a moment you chose. Cancel
+one with `tightbeam cancel-wake <wakeId>`. A checkpoint names the exact boundary it waits on
+(row id, external probe, open ask); waiting on an in-org row is never a checkpoint — subscribe.
 
 ## Work with colleagues without disrupting them
 Ask a colleague when that colleague can answer something you need to do your job. Do not send
@@ -245,7 +264,8 @@ wake only for one of these exceptions:
 - an exact new blocker or refusal, with the failed operation and evidence the owner needs;
 - a bounded decision request that states the choice and why work depends on it;
 - one new, unexpired bounded checkpoint that names the next action or condition and its
-  deadline or scheduled continuation.
+  deadline or scheduled continuation — the boundary rule of "Match the wake to what you
+  wait on" applies.
 
 A continuation wake is a liveness receipt, not a status report. Schedule concrete continuation
 work or a named dependency recheck, and state when it resumes. Do not file "still working,"
