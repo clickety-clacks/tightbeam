@@ -64,10 +64,6 @@ defmodule Tightbeam.StateResourceEquivalenceTest do
     Enum.each(rows, fn {class, row} ->
       fixture = Map.fetch!(ctx.fixtures, row.resource)
 
-      assert function_exported?(StateResources, row.query, 4), class
-      assert function_exported?(StateResources, row.serializer, 1), class
-      assert function_exported?(StateVisibility, row.visibility, 4), class
-
       queried =
         apply(StateResources, row.query, [ctx.db, row.resource, fixture.id, fixture.context])
 
@@ -79,7 +75,9 @@ defmodule Tightbeam.StateResourceEquivalenceTest do
       assert notice["resource"] == row.resource, class
       assert notice["op"] == row.op, class
       assert JSON.encode!(detail) == JSON.encode!(notice["payload"]), class
-      assert notice["refs"][row.primary_ref] == detail[row.primary_ref] || detail["id"], class
+
+      expected_primary_id = detail[row.primary_ref] || detail["id"]
+      assert notice["refs"][row.primary_ref] == expected_primary_id, class
       assert is_integer(detail["rowVersion"]), class
 
       refute contains_secret_key?(detail), class
