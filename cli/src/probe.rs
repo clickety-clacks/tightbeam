@@ -11,6 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::{Map, Value};
 
 const LINEAGE_KEY: &[u8] = b"TIGHTBEAM_LINEAGE=";
+const MACOS_LSOF_PATH: &str = "/usr/sbin/lsof";
 const CANONICAL_ENTRIES: [&str; 10] = [
     "adapters",
     "assets",
@@ -243,6 +244,7 @@ struct RawFacts {
     pids_env_unreadable: Option<usize>,
     processes: Vec<RawProcess>,
     notes: Vec<String>,
+    collection_failure: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -535,6 +537,7 @@ fn collect_linux(
         pids_env_unreadable: Some(pids_env_unreadable),
         processes,
         notes: Vec::new(),
+        collection_failure: None,
     })
 }
 
@@ -784,6 +787,7 @@ fn collect_darwin(
         .filter(|line| !line.iter().all(|byte| byte.is_ascii_whitespace()))
         .count();
     let mut notes = Vec::new();
+    let mut collection_failure = None;
     let (mut processes, unparseable_rows) = parse_darwin_pass1(&pass1, own_pid, catalog);
     note_unparseable_rows(&mut notes, "ps enumeration", unparseable_rows);
     for process in &mut processes {
@@ -820,7 +824,7 @@ fn collect_darwin(
             Err(failure) => note_failure(&mut notes, "ps pass 2", failure),
         }
         match io.command(
-            "lsof",
+            MACOS_LSOF_PATH,
             &[
                 "-n".into(),
                 "-a".into(),
@@ -838,7 +842,14 @@ fn collect_darwin(
                     process.cwd = cwd.get(&process.pid).cloned();
                 }
             }
-            Err(failure) => note_failure(&mut notes, "lsof", failure),
+            Err(failure) => {
+                let failure = match failure {
+                    CommandFailure::Timeout => format!("probe: {MACOS_LSOF_PATH} timed out"),
+                    CommandFailure::Failed => format!("probe: {MACOS_LSOF_PATH} failed"),
+                };
+                notes.push(failure.clone());
+                collection_failure = Some(failure);
+            }
         }
     }
     Ok(RawFacts {
@@ -847,6 +858,7 @@ fn collect_darwin(
         pids_env_unreadable: None,
         processes,
         notes,
+        collection_failure,
     })
 }
 
@@ -1377,6 +1389,7 @@ pub fn run(json: bool, base_dir: Option<String>) -> Result<(), String> {
         "macos" => collect_darwin(&io, std::process::id(), harness_catalog.as_ref())?,
         _ => return Err("probe: unsupported platform".to_owned()),
     };
+    let collection_failure = raw.collection_failure.clone();
     raw.notes.extend(harness_notes);
     add_elapsed(&io, &mut raw);
     let hostname = hostname(&io, &mut raw.notes);
@@ -1389,7 +1402,11 @@ pub fn run(json: bool, base_dir: Option<String>) -> Result<(), String> {
     } else {
         println!("{}", human(&report));
     }
-    require_runnable_harness_cli(harness_catalog.as_ref())
+    require_runnable_harness_cli(harness_catalog.as_ref())?;
+    match collection_failure {
+        Some(failure) => Err(failure),
+        None => Ok(()),
+    }
 }
 
 fn require_runnable_harness_cli(
@@ -1546,6 +1563,7 @@ mod tests {
         start_time_sequences:
             std::cell::RefCell<BTreeMap<u32, Vec<Result<ProcessStartTime, io::ErrorKind>>>>,
         commands: std::cell::RefCell<Vec<Result<Vec<u8>, CommandFailure>>>,
+        programs: std::cell::RefCell<Vec<String>>,
         metadata_error: Option<io::ErrorKind>,
         directory_error: Option<io::ErrorKind>,
     }
@@ -1593,10 +1611,11 @@ mod tests {
         }
         fn command(
             &self,
-            _program: &str,
+            program: &str,
             _args: &[OsString],
             _deadline: Duration,
         ) -> Result<Vec<u8>, CommandFailure> {
+            self.programs.borrow_mut().push(program.to_owned());
             self.commands.borrow_mut().remove(0)
         }
     }
@@ -1861,7 +1880,18 @@ mod tests {
         assert_eq!(raw.processes[0].ppid, None);
         assert_eq!(raw.processes[0].executable, None);
         assert_eq!(raw.processes[0].cwd, None);
-        assert_eq!(raw.notes, vec!["ps pass 2 timed out", "lsof failed"]);
+        assert_eq!(
+            raw.notes,
+            vec!["ps pass 2 timed out", "probe: /usr/sbin/lsof failed"]
+        );
+        assert_eq!(
+            raw.collection_failure.as_deref(),
+            Some("probe: /usr/sbin/lsof failed")
+        );
+        assert_eq!(
+            io.programs.borrow().as_slice(),
+            ["ps", "ps", "/usr/sbin/lsof"]
+        );
 
         let io = FakeIo {
             commands: std::cell::RefCell::new(vec![Ok(pass1), Ok(Vec::new()), Ok(Vec::new())]),
@@ -2035,6 +2065,7 @@ mod tests {
                 harnesses: vec!["codex".to_owned()],
             }],
             notes: Vec::new(),
+            collection_failure: None,
         };
         let report = assemble(
             raw,
@@ -2099,6 +2130,7 @@ mod tests {
             pids_env_unreadable: None,
             processes: Vec::new(),
             notes: vec!["lsof timed out".to_owned()],
+            collection_failure: None,
         };
         let report = assemble(
             raw,
@@ -2144,6 +2176,7 @@ mod tests {
             pids_env_unreadable: Some(0),
             processes: Vec::new(),
             notes: Vec::new(),
+            collection_failure: None,
         };
         let report = assemble(
             raw,
@@ -2245,6 +2278,7 @@ mod tests {
                 },
             ],
             notes: vec!["ps etime timed out".to_owned()],
+            collection_failure: None,
         };
         let report = assemble(
             raw,
