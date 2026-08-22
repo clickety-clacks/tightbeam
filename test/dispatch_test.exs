@@ -108,6 +108,22 @@ defmodule Tightbeam.DispatchTest do
            ]
   end
 
+  test "a Cursor launch refusal remains a structured code across Dispatch", %{db: db} do
+    refusal = %{
+      code: "DIV-CURSOR-API-KEY-ONLY",
+      message: "Cursor requires a banked API key"
+    }
+
+    call = %{verb: "cursor-checkout", origin: "system", session_key: "cursor", params: %{}}
+
+    assert {:error, ^refusal} =
+             Dispatch.dispatch(db, %{"cursor-checkout" => fn _ -> refusal end}, call)
+
+    assert [%{kind: "denied"}] = EventLog.events_after(db, 0, 10)
+    assert {:ok, [[payload]]} = DB.query(db, "SELECT payload FROM events")
+    assert payload =~ "DIV-CURSOR-API-KEY-ONLY"
+  end
+
   test "raising handler returns server_error and appends a verb event with the error", %{db: db} do
     handlers = %{"post" => fn _call -> raise "boom" end}
     call = %{verb: "post", origin: "system", session_key: nil, params: %{}}

@@ -396,5 +396,7 @@ defmodule Tightbeam.SessionLane do
   defp publish_terminal(state, seq), do: Ledger.mark_published(state.db, seq)
 
   defp error_text(reason) when is_binary(reason), do: reason
+  defp error_text(%{code: code} = reason) when is_binary(code), do: JSON.encode!(reason)
+  defp error_text(%{"code" => code} = reason) when is_binary(code), do: JSON.encode!(reason)
   defp error_text(reason), do: inspect(reason)
 end

@@ -3,6 +3,8 @@ defmodule Tightbeam.AdapterCoordinatorTest do
 
   alias Tightbeam.{AdapterCoordinator, DB, EventLog}
 
+  @process_helper Path.expand("../cli/target/release/tightbeam", __DIR__)
+
   @fake ~S"""
   const rl = require("node:readline").createInterface({ input: process.stdin });
   const send = (o) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...o }) + "\n");
@@ -142,6 +144,106 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     assert Task.await(authoritative) == expected
   end
 
+  test "authoritative replacement of a booting child settles its old launch and transfers both callers",
+       ctx do
+    slow = Path.join(ctx.test_dir, "slow_authoritative.js")
+    fast = Path.join(ctx.test_dir, "fast_authoritative.js")
+
+    File.write!(slow, """
+    const rl = require("node:readline").createInterface({ input: process.stdin });
+    const send = (o) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...o }) + "\\n");
+    rl.on("line", (line) => {
+      const m = JSON.parse(line);
+      if (m.method === "initialize") setTimeout(() => send({ id: m.id, result: { protocolVersion: 1 } }), 10000);
+    });
+    """)
+
+    File.write!(fast, @fake)
+    parent = self()
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         adapter_context: fn _ -> [credential_kind: :subscription] end,
+         adapter_opts: fn _, context ->
+           kind = context[:credential_kind]
+           send(parent, {:authoritative_child_opts, kind})
+
+           [
+             harness: :cursor,
+             readiness_rendezvous: true,
+             cmd: [System.find_executable("node"), if(kind == :api_key, do: fast, else: slow)],
+             home: ctx.test_dir,
+             cwd: ctx.test_dir,
+             process_identity_dir: ctx.test_dir,
+             process_helper: @process_helper
+           ]
+         end,
+         db: ctx.db,
+         name: :authoritative_child_replacement_coordinator}
+      )
+
+    key = {:cursor, "shared", "testhost"}
+    first = Task.async(fn -> AdapterCoordinator.adapter_for(coordinator, key) end)
+    assert_receive {:authoritative_child_opts, :subscription}
+
+    assert wait_until(fn ->
+             match?(
+               [%{state: "running", resolved_at: nil}],
+               Tightbeam.HarnessProcess.list(ctx.db)
+             )
+           end)
+
+    old = :sys.get_state(coordinator).adapters[key]
+    assert is_pid(old.pid)
+    assert is_reference(old.monitor)
+    assert is_reference(old.readiness_token)
+
+    second =
+      Task.async(fn ->
+        AdapterCoordinator.adapter_for(coordinator, key, credential_kind: :api_key)
+      end)
+
+    assert_receive {:authoritative_child_opts, :api_key}
+    assert {:ok, replacement, 2} = Task.await(first, 5_000)
+    assert {:ok, ^replacement, 2} = Task.await(second, 5_000)
+
+    [current, replaced] = Tightbeam.HarnessProcess.list(ctx.db)
+    assert current.state == "running"
+    assert current.resolved_at == nil
+    assert replaced.state == "exited"
+    assert is_integer(replaced.resolved_at)
+
+    current_entry = :sys.get_state(coordinator).adapters[key]
+    assert current_entry.pid == replacement
+    assert current_entry.generation == 2
+
+    send(
+      coordinator,
+      {:adapter_readiness_timeout, key, old.generation, old.readiness_token}
+    )
+
+    send(coordinator, {:adapter_ready, key, old.pid, old.generation, old.readiness_token})
+
+    send(
+      coordinator,
+      {:adapter_readiness_result, key, old.generation, old.readiness_token, self(),
+       {:error, %{code: "stale"}}}
+    )
+
+    send(coordinator, {:DOWN, old.monitor, :process, old.pid, :killed})
+    Process.sleep(20)
+
+    after_stale = :sys.get_state(coordinator).adapters[key]
+    assert after_stale.pid == replacement
+    assert after_stale.generation == 2
+    assert after_stale.ready
+
+    assert Enum.map(Tightbeam.HarnessProcess.list(ctx.db), &{&1.state, &1.resolved_at}) ==
+             [{"running", nil}, {"exited", replaced.resolved_at}]
+  end
+
   test "hung readiness task times out, removes its child state, and flushes caller", ctx do
     coordinator =
       start_supervised!(
@@ -190,6 +292,42 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     assert wait_until(fn -> :sys.get_state(coordinator).adapters[key].waiters == [] end)
     entry = :sys.get_state(coordinator).adapters[key]
     assert is_reference(entry.readiness_timer)
+  end
+
+  test "duplicate restart messages coalesce behind one generation readiness task", ctx do
+    parent = self()
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         adapter_context: fn _ ->
+           send(parent, {:restart_generation_preflight, self()})
+
+           receive do
+             :release -> []
+           end
+         end,
+         adapter_opts: fn _, _ ->
+           {:error, %{code: "bounded", message: "bounded test refusal"}}
+         end,
+         db: ctx.db,
+         name: :restart_generation_coalescing_coordinator}
+      )
+
+    key = {:cursor, "default", "testhost"}
+    caller = Task.async(fn -> AdapterCoordinator.adapter_for(coordinator, key) end)
+    assert_receive {:restart_generation_preflight, task}
+    generation = :sys.get_state(coordinator).adapters[key].generation
+
+    send(coordinator, {:restart_adapter, key, generation})
+    send(coordinator, {:restart_adapter, key, generation})
+    _ = :sys.get_state(coordinator)
+    refute_receive {:restart_generation_preflight, _}
+
+    send(task, :release)
+
+    assert {:error, {:launch_refused, %{code: "bounded"}}} = Task.await(caller)
   end
 
   test "rendezvous does not release checkout before a delayed valid ready signal", ctx do

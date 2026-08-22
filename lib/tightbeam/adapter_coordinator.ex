@@ -814,7 +814,7 @@ defmodule Tightbeam.AdapterCoordinator do
 
   defp replace_pending_readiness(key, entry, state, context, from) do
     waiters = live_waiters(entry.waiters)
-    state = terminate_readiness_generation(key, entry, state, false)
+    state = terminate_readiness_generation(key, entry, state, true)
 
     replacement = %{
       fresh_entry()
