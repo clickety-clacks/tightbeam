@@ -34,7 +34,8 @@ defmodule Tightbeam.SchemaShapeTest do
 
   alias Tightbeam.{Assignments, DB, Schema}
 
-  @shape "operator-decision-requests-v1"
+  @shape "cursor-harness-v1"
+  @operator_decision_shape "operator-decision-requests-v1"
   @model_identity_shape "model-identity-v1"
   @be61_shape "model-identity-message-envelope-v2"
 
@@ -134,6 +135,19 @@ defmodule Tightbeam.SchemaShapeTest do
 
     assert operator_index =~ "(ownerUserId, raiserId, actionKey)"
     assert operator_index =~ ~r/WHERE\s+kind\s*=\s*'operator'\s+AND\s+status\s*=\s*'open'/
+
+    assert :ok =
+             DB.execute(db, """
+             INSERT INTO users (userId, isAdmin, createdAt) VALUES ('george', 1, 1);
+             INSERT INTO sessions
+               (sessionKey, displayName, ownerUserId, origin, archetype, harness,
+                provider, model, createdAt, updatedAt)
+             VALUES ('cursor-session', 'cursor', 'george', 'user:george', 'coder',
+                     'cursor', 'cursor', 'auto', 1, 1);
+             INSERT INTO subagent_markers
+               (kind, principal, subagentRef, sourceEventRef, harness, at)
+             VALUES ('subagent_start', 'cursor-session', 'sub', 'event', 'cursor', 1);
+             """)
   end
 
   test "model-identity-v1 migrates exact requests, messages, and wakes", %{db: db} do
@@ -587,7 +601,8 @@ defmodule Tightbeam.SchemaShapeTest do
     assert error.message =~ @be61_shape
     assert error.message =~ @shape
 
-    assert error.message =~ "can migrate only #{@model_identity_shape} to #{@shape}"
+    assert error.message =~
+             "can migrate #{@model_identity_shape} through #{@operator_decision_shape}"
 
     assert {:ok, [[@be61_shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
     refute "ruledViaSessionKey" in table_columns(db, "decision_requests")

@@ -37,8 +37,37 @@ defmodule Tightbeam.Schema do
   # The shape this build writes. Bump it when a production table changes in a
   # way that makes an older database unreadable, and give the refusal below a
   # sentence saying what changed.
-  @shape "operator-decision-requests-v1"
+  @shape "cursor-harness-v1"
+  @operator_decision_shape "operator-decision-requests-v1"
   @model_identity_shape "model-identity-v1"
+
+  @cursor_sessions_ddl """
+  CREATE TABLE sessions_cursor_harness_v1 (
+    sessionKey TEXT PRIMARY KEY, displayName TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'custom' CHECK (kind IN ('main','dm','custom')),
+    orderIndex INTEGER NOT NULL DEFAULT 0, isBuiltIn INTEGER NOT NULL DEFAULT 0,
+    adopted INTEGER NOT NULL DEFAULT 0, ownerUserId TEXT NOT NULL, origin TEXT NOT NULL,
+    spawnedBy TEXT, handle TEXT UNIQUE, archetype TEXT NOT NULL, overrides TEXT,
+    identityName TEXT, identityRevision TEXT, cliToken TEXT,
+    harness TEXT NOT NULL CHECK (harness IN ('claude','codex','cursor')),
+    provider TEXT NOT NULL CHECK (provider IN ('anthropic','openai','cursor')),
+    model TEXT NOT NULL, thinkingLevel TEXT, modelContext TEXT,
+    host TEXT NOT NULL DEFAULT 'local', clearedThroughSeq INTEGER NOT NULL DEFAULT 0,
+    state TEXT NOT NULL DEFAULT 'active' CHECK (state IN ('active','retired')),
+    createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL
+  )
+  """
+
+  @cursor_markers_ddl """
+  CREATE TABLE subagent_markers_cursor_harness_v1 (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL CHECK (kind IN ('subagent_start','subagent_stop')),
+    principal TEXT NOT NULL REFERENCES sessions(sessionKey),
+    subagentRef TEXT NOT NULL, sourceEventRef TEXT NOT NULL,
+    harness TEXT NOT NULL CHECK (harness IN ('claude','codex','cursor')),
+    at INTEGER NOT NULL, assignmentId TEXT, UNIQUE (kind, sourceEventRef)
+  )
+  """
 
   # The one predecessor shape this build can migrate. This is deliberately a
   # complete target table, not an ALTER inferred from sqlite_master: the stamp
@@ -1035,8 +1064,12 @@ defmodule Tightbeam.Schema do
       {:ok, [[@shape]]} ->
         :ok
 
+      {:ok, [[@operator_decision_shape]]} ->
+        migrate_cursor_harness_v1(db)
+
       {:ok, [[@model_identity_shape]]} ->
-        migrate_model_identity_v1(db)
+        :ok = migrate_model_identity_v1(db)
+        migrate_cursor_harness_v1(db)
 
       {:ok, []} ->
         # No stamp. Either a database this build is about to create, or one
@@ -1052,7 +1085,8 @@ defmodule Tightbeam.Schema do
           stamped: #{found}
           this build: #{@shape}
 
-        This build can migrate only #{@model_identity_shape} to #{@shape}.
+        This build can migrate #{@model_identity_shape} through #{@operator_decision_shape},
+        or #{@operator_decision_shape} directly, to #{@shape}.
 
         No migration is defined for the stamped shape above. Keep the database
         in place and run a Tightbeam build that recognizes that exact stamp.
@@ -1092,7 +1126,7 @@ defmodule Tightbeam.Schema do
         {:error, error} ->
           raise ShapeError,
             message:
-              "migration #{@model_identity_shape} -> #{@shape} failed and was rolled back: #{Exception.message(error)}"
+              "migration #{@model_identity_shape} -> #{@operator_decision_shape} failed and was rolled back: #{Exception.message(error)}"
       end
     after
       :ok = DB.execute(db, "PRAGMA foreign_keys = ON")
@@ -1147,7 +1181,7 @@ defmodule Tightbeam.Schema do
     if Txn.changes(txn) != decision_request_count do
       raise ShapeError,
         message:
-          "migration #{@model_identity_shape} -> #{@shape} copied #{Txn.changes(txn)} of #{decision_request_count} decision requests"
+          "migration #{@model_identity_shape} -> #{@operator_decision_shape} copied #{Txn.changes(txn)} of #{decision_request_count} decision requests"
     end
 
     [[^decision_request_count]] = Txn.q(txn, "SELECT COUNT(*) FROM decision_requests_new")
@@ -1176,7 +1210,7 @@ defmodule Tightbeam.Schema do
     if Txn.changes(txn) != message_count do
       raise ShapeError,
         message:
-          "migration #{@model_identity_shape} -> #{@shape} copied #{Txn.changes(txn)} of #{message_count} messages"
+          "migration #{@model_identity_shape} -> #{@operator_decision_shape} copied #{Txn.changes(txn)} of #{message_count} messages"
     end
 
     [[^message_count]] = Txn.q(txn, "SELECT COUNT(*) FROM messages_new")
@@ -1203,21 +1237,134 @@ defmodule Tightbeam.Schema do
       rows ->
         raise ShapeError,
           message:
-            "migration #{@model_identity_shape} -> #{@shape} left invalid foreign keys: #{inspect(rows)}"
+            "migration #{@model_identity_shape} -> #{@operator_decision_shape} left invalid foreign keys: #{inspect(rows)}"
     end
 
     Txn.q(
       txn,
       "UPDATE schema_stamp SET shape = ?1, stampedAt = ?2 WHERE shape = ?3",
-      [@shape, System.system_time(:millisecond), @model_identity_shape]
+      [@operator_decision_shape, System.system_time(:millisecond), @model_identity_shape]
     )
 
     if Txn.changes(txn) != 1 do
       raise ShapeError,
-        message: "migration #{@model_identity_shape} -> #{@shape} lost its exact stamp transition"
+        message:
+          "migration #{@model_identity_shape} -> #{@operator_decision_shape} lost its exact stamp transition"
     end
 
     :ok
+  end
+
+  defp migrate_cursor_harness_v1(db) do
+    :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
+
+    try do
+      case DB.transaction(db, &migrate_cursor_harness_v1_in_txn/1) do
+        {:ok, :ok} ->
+          :ok
+
+        {:error, %ShapeError{} = error} ->
+          raise error
+
+        {:error, error} ->
+          raise ShapeError,
+            message:
+              "migration #{@operator_decision_shape} -> #{@shape} failed and was rolled back: #{Exception.message(error)}"
+      end
+    after
+      :ok = DB.execute(db, "PRAGMA foreign_keys = ON")
+    end
+  end
+
+  defp migrate_cursor_harness_v1_in_txn(%Txn{} = txn) do
+    session_columns =
+      "sessionKey,displayName,kind,orderIndex,isBuiltIn,adopted,ownerUserId,origin," <>
+        "spawnedBy,handle,archetype,overrides,identityName,identityRevision,cliToken," <>
+        "harness,provider,model,thinkingLevel,modelContext,host,clearedThroughSeq,state," <>
+        "createdAt,updatedAt"
+
+    marker_columns =
+      "id,kind,principal,subagentRef,sourceEventRef,harness,at,assignmentId"
+
+    [[session_count]] = Txn.q(txn, "SELECT COUNT(*) FROM sessions")
+    [[marker_count]] = Txn.q(txn, "SELECT COUNT(*) FROM subagent_markers")
+
+    :ok = Txn.exec(txn, @cursor_sessions_ddl)
+    :ok = Txn.exec(txn, @cursor_markers_ddl)
+
+    Txn.q(
+      txn,
+      "INSERT INTO sessions_cursor_harness_v1 (#{session_columns}) " <>
+        "SELECT #{session_columns} FROM sessions"
+    )
+
+    if Txn.changes(txn) != session_count,
+      do: incompatible_cursor_harness!("copied #{Txn.changes(txn)} of #{session_count} sessions")
+
+    Txn.q(
+      txn,
+      "INSERT INTO subagent_markers_cursor_harness_v1 (#{marker_columns}) " <>
+        "SELECT #{marker_columns} FROM subagent_markers"
+    )
+
+    if Txn.changes(txn) != marker_count,
+      do: incompatible_cursor_harness!("copied #{Txn.changes(txn)} of #{marker_count} markers")
+
+    assert_exact_copy!(txn, "sessions", "sessions_cursor_harness_v1", session_columns)
+
+    assert_exact_copy!(
+      txn,
+      "subagent_markers",
+      "subagent_markers_cursor_harness_v1",
+      marker_columns
+    )
+
+    :ok =
+      Txn.exec(
+        txn,
+        """
+        DROP INDEX subagent_markers_one_stop;
+        DROP INDEX subagent_markers_principal;
+        DROP TABLE subagent_markers;
+        DROP INDEX sessions_owner;
+        DROP INDEX sessions_cli_token;
+        DROP TABLE sessions;
+        ALTER TABLE sessions_cursor_harness_v1 RENAME TO sessions;
+        ALTER TABLE subagent_markers_cursor_harness_v1 RENAME TO subagent_markers;
+        CREATE INDEX sessions_owner ON sessions (ownerUserId, state);
+        CREATE UNIQUE INDEX sessions_cli_token ON sessions(cliToken);
+        CREATE UNIQUE INDEX subagent_markers_one_stop
+          ON subagent_markers (subagentRef) WHERE kind = 'subagent_stop';
+        CREATE INDEX subagent_markers_principal ON subagent_markers (principal, id);
+        """
+      )
+
+    case Txn.q(txn, "PRAGMA foreign_key_check") do
+      [] -> :ok
+      rows -> incompatible_cursor_harness!("left invalid foreign keys: #{inspect(rows)}")
+    end
+
+    Txn.q(txn, "UPDATE schema_stamp SET shape=?1, stampedAt=?2 WHERE shape=?3", [
+      @shape,
+      System.system_time(:millisecond),
+      @operator_decision_shape
+    ])
+
+    if Txn.changes(txn) != 1,
+      do: incompatible_cursor_harness!("lost its exact stamp transition")
+
+    :ok
+  end
+
+  defp assert_exact_copy!(txn, old, new, columns) do
+    forward = Txn.q(txn, "SELECT #{columns} FROM #{old} EXCEPT SELECT #{columns} FROM #{new}")
+    reverse = Txn.q(txn, "SELECT #{columns} FROM #{new} EXCEPT SELECT #{columns} FROM #{old}")
+    if forward != [] or reverse != [], do: incompatible_cursor_harness!("changed stored rows")
+  end
+
+  defp incompatible_cursor_harness!(reason) do
+    raise ShapeError,
+      message: "migration #{@operator_decision_shape} -> #{@shape} #{reason}"
   end
 
   # A FRESH DATABASE MUST NEVER BE REFUSED, which is why the stamp is written
