@@ -224,7 +224,7 @@ defmodule Tightbeam.Spinup do
     script = "npm install --prefix #{shell_quote(install_dir)} --no-save " <> packages
 
     case locality do
-      :local -> ["sh", "-c", script]
+      :local -> ["/bin/sh", "-c", script]
       {:remote, _check} -> remote_command(target.host_config.ssh, script)
     end
   end

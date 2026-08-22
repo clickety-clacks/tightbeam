@@ -74,7 +74,7 @@ defmodule Tightbeam.SpinupTest do
                patch_adapter: no_patch()
              )
 
-    assert [["sh", "-c", script]] = receive_commands(1)
+    assert [["/bin/sh", "-c", script]] = receive_commands(1)
 
     # Local means local: no ssh hop to reach the machine tightbeam is running on.
     refute script =~ "ssh"
