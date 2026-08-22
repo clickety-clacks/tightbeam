@@ -809,10 +809,18 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             identity,
             session_key,
             all,
+            idempotency_key,
+            operation_id,
         } => {
             let mut params = vec![format!("\"all\":{all}")];
             if let Some(value) = session_key {
                 params.push(string_field("sessionKey", value));
+            }
+            if let Some(value) = idempotency_key {
+                params.push(string_field("key", value));
+            }
+            if let Some(value) = operation_id {
+                params.push(string_field("operationId", value));
             }
             Ok(request(identity, "identity-apply", vec![], params))
         }
@@ -1398,6 +1406,26 @@ where
                 load_harnesses,
             )
         }
+        command @ Command::IdentityApply { .. } => {
+            let endpoint = discover_endpoint()?;
+            if let Some(identity) = command_identity(&command) {
+                require_session_endpoint(identity, &endpoint)?;
+            }
+            let request = build_request(&command)?;
+            if let Some(result) = send_request(&endpoint, &request, None)? {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result).expect("JSON value serializes")
+                );
+                if identity_apply_failed(&result) {
+                    // The result remains machine-readable stdout. An empty dispatch error
+                    // carries only the nonzero status; main deliberately prints no second
+                    // copy of the already-rendered result to stderr.
+                    return Err(String::new());
+                }
+            }
+            Ok(())
+        }
         command => {
             let endpoint = discover_endpoint()?;
             if let Some(identity) = command_identity(&command) {
@@ -1413,6 +1441,13 @@ where
             Ok(())
         }
     }
+}
+
+fn identity_apply_failed(result: &Value) -> bool {
+    matches!(
+        result.get("outcome").and_then(Value::as_str),
+        Some("partial" | "failed")
+    )
 }
 
 fn add_user_target_is_local(endpoint: &Endpoint) -> bool {
@@ -2550,6 +2585,22 @@ mod tests {
         ] {
             assert_eq!(body(args), expected);
         }
+    }
+
+    #[test]
+    fn identity_apply_result_exit_policy_matches_the_terminal_outcome() {
+        assert!(!identity_apply_failed(
+            &serde_json::json!({"outcome": "succeeded"})
+        ));
+        assert!(identity_apply_failed(
+            &serde_json::json!({"outcome": "partial"})
+        ));
+        assert!(identity_apply_failed(
+            &serde_json::json!({"outcome": "failed"})
+        ));
+        assert!(!identity_apply_failed(
+            &serde_json::json!({"outcome": null})
+        ));
     }
 
     #[test]

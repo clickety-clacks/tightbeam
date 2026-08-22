@@ -424,14 +424,55 @@ defmodule FeatureSmoke do
       })
 
     session_key = get_in(session, ["stream", "sessionKey"]) || session["sessionKey"]
-    applied = ok!(state, "identity-apply", %{"sessionKey" => session_key, "all" => false})
+    rollout_marker = "\n\nfeature-smoke identity apply #{unique()}\n"
+
+    ok!(state, "identity-edit", %{
+      "archetype" => "default",
+      "manifest" => false,
+      "remove" => false,
+      "content" => original_guidance <> rollout_marker
+    })
+
+    apply_key = "identity-apply-session-#{unique()}"
+
+    applied =
+      ok!(state, "identity-apply", %{
+        "sessionKey" => session_key,
+        "all" => false,
+        "key" => apply_key
+      })
+
     assert(state, session_key in (applied["applied"] || []), "identity-apply missed its session")
-    _all = ok!(state, "identity-apply", %{"all" => true})
+
+    operation_id = applied["operationId"]
+    assert(state, is_binary(operation_id), "identity-apply returned no operation ID")
+
+    replay = ok!(state, "identity-apply", %{"operationId" => operation_id})
+
+    assert(
+      state,
+      replay == applied,
+      "identity-apply operation query changed its durable result: #{inspect(replay)}"
+    )
+
+    await_turn_boundary!(state, session_key)
+
+    ok!(state, "identity-edit", %{
+      "archetype" => "default",
+      "manifest" => false,
+      "remove" => false,
+      "content" => original_guidance
+    })
+
+    all_key = "identity-apply-all-#{unique()}"
+    all = ok!(state, "identity-apply", %{"all" => true, "key" => all_key})
+    assert(state, is_binary(all["operationId"]), "identity-apply --all returned no operation ID")
+    await_turn_boundary!(state, session_key)
     retire(state, session)
 
     pass(
       state,
-      "identity status/edit guidance/edit manifest/skill put+rm/relearn/apply session+all"
+      "identity status/edit guidance/edit manifest/skill put+rm/relearn/apply session+query+all"
     )
   end
 

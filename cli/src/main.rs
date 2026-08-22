@@ -116,7 +116,9 @@ fn main() {
         }
         Ok(command) => {
             if let Err(error) = dispatch::run(command) {
-                eprintln!("{error}");
+                if !error.is_empty() {
+                    eprintln!("{error}");
+                }
                 std::process::exit(1);
             }
         }

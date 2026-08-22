@@ -327,6 +327,8 @@ pub enum Command {
         identity: Identity,
         session_key: Option<String>,
         all: bool,
+        idempotency_key: Option<String>,
+        operation_id: Option<String>,
     },
     Onboard {
         identity: Identity,
@@ -679,8 +681,12 @@ COMMANDS:
       Remove a learned kungfu bundle by its committed receipt.
   identity status [<archetype>]
       Report the live revision, session revisions, staleness, and conflicts.
-  identity apply (<session> | --all)
-      Refresh selected sessions from the current live identity revision.
+  identity apply (<session> | --all) [--key <idempotencyKey>]
+      tightbeam identity apply --operation <operationId>
+      Apply the current live identity revision through a durable operation, or
+      inspect one operation without applying. Use --key when a lost effect-form
+      response must coalesce with the original request.
+      Applying identity resets/reloads each selected session. If a turn is running, Tight Beam cancels that turn before reload. After a successful reload, Tight Beam queues exactly one new continuation turn from the durable transcript and assignment state. It does not retry the interrupted turn. If the caller is a selected agent session, that turn can end before the command receives its final response; before interruption, Tight Beam durably stages a continuation containing the operation ID and exact result command, then releases it after reload succeeds or the prior context is restored.
   onboard openai|anthropic [--api-key]
       Run this machine's credential onboarding flow. Without --api-key this is
       the interactive subscription ceremony. With it the flow is
@@ -2127,13 +2133,33 @@ fn parse_identity_command(
         Some("apply") => {
             let session_key = parsed.positional.get(2).cloned();
             let all = flags.contains_key("all");
-            if parsed.positional.len() > 3 || all == session_key.is_some() {
-                return Err("usage: tightbeam identity apply (<session> | --all)".to_owned());
+            let operation_id = nonempty(flags, "operation");
+            let idempotency_key = nonempty(flags, "key");
+
+            if flags.get("operation").is_some_and(String::is_empty)
+                || flags.get("key").is_some_and(String::is_empty)
+            {
+                return Err("--operation and --key require nonempty values".to_owned());
+            }
+
+            let query = operation_id.is_some();
+            let invalid_query = query
+                && (parsed.positional.len() != 2
+                    || all
+                    || session_key.is_some()
+                    || idempotency_key.is_some());
+            let invalid_effect =
+                !query && (parsed.positional.len() > 3 || all == session_key.is_some());
+
+            if invalid_query || invalid_effect {
+                return Err("usage: tightbeam identity apply (<session> | --all) [--key <idempotencyKey>] | tightbeam identity apply --operation <operationId>".to_owned());
             }
             Ok(Command::IdentityApply {
                 identity: identity(flags)?,
                 session_key,
                 all,
+                idempotency_key,
+                operation_id,
             })
         }
         _ => Err("usage: tightbeam identity edit|status|relearn|repoint|apply ...".to_owned()),
@@ -2802,7 +2828,8 @@ mod tests {
             "identity relearn [--abort | --resolve]",
             "identity repoint <retired-session> <archetype>",
             "identity status [<archetype>]",
-            "identity apply (<session> | --all)",
+            "identity apply (<session> | --all) [--key <idempotencyKey>]",
+            "identity apply --operation <operationId>",
             "onboard openai|anthropic [--api-key]",
             "add-user <userId> [--admin]",
             "config get default-archetype",
@@ -3660,6 +3687,43 @@ mod tests {
                     identity: Identity::User("flynn".to_owned()),
                     session_key: None,
                     all: true,
+                    idempotency_key: None,
+                    operation_id: None,
+                },
+            ),
+            (
+                strings(&[
+                    "identity",
+                    "apply",
+                    "agent:coder:app",
+                    "--key",
+                    "apply-key",
+                    "--as-user",
+                    "flynn",
+                ]),
+                Command::IdentityApply {
+                    identity: Identity::User("flynn".to_owned()),
+                    session_key: Some("agent:coder:app".to_owned()),
+                    all: false,
+                    idempotency_key: Some("apply-key".to_owned()),
+                    operation_id: None,
+                },
+            ),
+            (
+                strings(&[
+                    "identity",
+                    "apply",
+                    "--operation",
+                    "iap_1",
+                    "--as-user",
+                    "flynn",
+                ]),
+                Command::IdentityApply {
+                    identity: Identity::User("flynn".to_owned()),
+                    session_key: None,
+                    all: false,
+                    idempotency_key: None,
+                    operation_id: Some("iap_1".to_owned()),
                 },
             ),
             (
