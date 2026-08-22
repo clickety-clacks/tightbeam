@@ -467,7 +467,7 @@ defmodule FeatureSmoke do
       "identity-apply operation query changed its durable result: #{inspect(replay)}"
     )
 
-    await_turn_boundary!(state, session_key)
+    await_lane_idle!(state, session_key, "after single-session identity apply")
 
     ok!(state, "identity-edit", %{
       "archetype" => "default",
@@ -479,7 +479,7 @@ defmodule FeatureSmoke do
     all_key = "identity-apply-all-#{unique()}"
     all = ok!(state, "identity-apply", %{"all" => true, "key" => all_key})
     assert(state, is_binary(all["operationId"]), "identity-apply --all returned no operation ID")
-    await_turn_boundary!(state, session_key)
+    await_lane_idle!(state, session_key, "after all-session identity apply")
     retire(state, session)
 
     pass(
