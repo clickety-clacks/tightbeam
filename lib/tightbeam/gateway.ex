@@ -575,6 +575,7 @@ defmodule Tightbeam.Gateway do
               case result do
                 {:error, :not_found} -> "not found"
                 {:error, {:exec_failed, exec_detail}} -> "exec failed: #{exec_detail}"
+                {:error, %{code: code, message: message}} -> "#{code}: #{message}"
               end
 
             "#{harness}: #{reason}"
@@ -2385,11 +2386,19 @@ defmodule Tightbeam.Gateway do
         {:error,
          "adapter for #{session.harness} on host #{session.host} remains fenced by an incomplete park: #{inspect(detail)}"}
 
+      {:error, {:launch_refused, refusal}} ->
+        {:error, adapter_launch_refusal(refusal)}
+
       {:error, reason} ->
         {:error,
          "adapter for #{session.harness}/#{session.identity_name} on host #{session.host} is unavailable: #{inspect(reason)}"}
     end
   end
+
+  @doc false
+  def adapter_launch_refusal(%{code: code, message: message})
+      when is_binary(code) and is_binary(message),
+      do: %{code: code, message: message}
 
   @doc false
   def mcp_servers_for_archetype(archetype_name, archetypes \\ Archetypes) do

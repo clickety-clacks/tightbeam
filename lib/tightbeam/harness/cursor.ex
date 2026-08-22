@@ -67,8 +67,9 @@ defmodule Tightbeam.Harness.Cursor do
 
   @impl true
   def prepare_launch(target, home, opts) do
-    with {:ok, _verified} <- verify_installed_cli(target) do
-      if Support.local?(target) do
+    with {:ok, %{launcher: launcher}} <- verify_installed_cli(target),
+         :ok <- verify_adapter_shim(target, launcher) do
+      if local?(target) do
         case Keyword.fetch(opts, :cursor_api_key) do
           {:ok, key} ->
             {:ok,
@@ -178,8 +179,14 @@ defmodule Tightbeam.Harness.Cursor do
 
   @impl true
   def probe_cli(target) do
-    with {:ok, %{launcher: launcher}} <- verify_installed_cli(target) do
-      Support.bounded_probe(launcher, target)
+    case resolve_launcher(target) do
+      nil ->
+        {:error, :not_found}
+
+      _launcher ->
+        with {:ok, %{launcher: launcher}} <- verify_installed_cli(target) do
+          Support.bounded_probe(launcher, target)
+        end
     end
   end
 
@@ -387,10 +394,12 @@ defmodule Tightbeam.Harness.Cursor do
   end
 
   defp read_api_key(target, path) do
-    if Support.local?(target) do
+    if local?(target) do
       File.read(path)
     else
-      script = "test -r #{Support.shell_quote(path)} && test -s #{Support.shell_quote(path)}"
+      script =
+        "test -r #{Support.shell_quote(path)} && " <>
+          "test -n \"$(tr -d '[:space:]' < #{Support.shell_quote(path)})\""
 
       case target.sh.(
              ["ssh" | Support.ssh_opts()] ++
@@ -414,7 +423,7 @@ defmodule Tightbeam.Harness.Cursor do
   defp canonical_path(target, path) do
     realpath =
       Map.get_lazy(target, :realpath, fn ->
-        if Support.local?(target), do: &default_realpath/1, else: &remote_realpath(target, &1)
+        if local?(target), do: &default_realpath/1, else: &remote_realpath(target, &1)
       end)
 
     case realpath.(path) do
@@ -434,7 +443,7 @@ defmodule Tightbeam.Harness.Cursor do
   defp verify_hash(target, path, expected) do
     hash =
       Map.get_lazy(target, :sha256, fn ->
-        if Support.local?(target), do: &local_sha256/1, else: &remote_sha256(target, &1)
+        if local?(target), do: &local_sha256/1, else: &remote_sha256(target, &1)
       end)
 
     digest = hash.(path)
@@ -444,7 +453,7 @@ defmodule Tightbeam.Harness.Cursor do
   defp resolve_launcher(%{find_executable: find}), do: find.(cli_binary())
 
   defp resolve_launcher(target) do
-    if Support.local?(target) do
+    if local?(target) do
       System.find_executable(cli_binary())
     else
       remote_value(target, "command -v #{Support.shell_quote(cli_binary())}")
@@ -473,6 +482,44 @@ defmodule Tightbeam.Harness.Cursor do
          do: Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
   end
 
+  defp verify_adapter_shim(target, launcher) do
+    case Map.get(target, :verify_adapter_shim) do
+      verify when is_function(verify, 2) -> verify.(adapter_binary(target), launcher)
+      nil -> verify_adapter_shim_on_target(target, launcher)
+    end
+  end
+
+  defp verify_adapter_shim_on_target(target, launcher) do
+    shim = adapter_binary(target)
+    expected = "#!/bin/sh\nexec \"#{launcher}\" acp \"$@\"\n"
+
+    if local?(target) do
+      with {:ok, ^expected} <- File.read(shim),
+           {:ok, stat} <- File.stat(shim),
+           true <- Bitwise.band(stat.mode, 0o111) != 0 do
+        :ok
+      else
+        _ -> integrity_refusal()
+      end
+    else
+      expected_hash = Base.encode16(:crypto.hash(:sha256, expected), case: :lower)
+
+      script =
+        "test -x #{Support.shell_quote(shim)} && " <>
+          "test \"$(shasum -a 256 #{Support.shell_quote(shim)} | cut -d' ' -f1)\" = " <>
+          Support.shell_quote(expected_hash)
+
+      command =
+        ["ssh" | Support.ssh_opts()] ++
+          [target.host_config.ssh, "sh", "-c", Support.shell_quote(script)]
+
+      case target.sh.(command) do
+        {_output, 0} -> :ok
+        _ -> integrity_refusal()
+      end
+    end
+  end
+
   defp adapter_binary(target) do
     Map.get(target, :adapter_binary) ||
       Path.join([
@@ -483,4 +530,6 @@ defmodule Tightbeam.Harness.Cursor do
         install_package()
       ])
   end
+
+  defp local?(target), do: get_in(target, [:host_config, :ssh]) == nil
 end

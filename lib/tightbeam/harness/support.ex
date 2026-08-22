@@ -310,7 +310,8 @@ defmodule Tightbeam.Harness.Support do
         sh: fn _command -> {"", 0} end,
         find_executable: fn _ -> Path.join([base, "2026.08.11-e8db854", "cursor-agent"]) end,
         realpath: fn path -> {:ok, path} end,
-        sha256: &cursor_vector_sha256/1
+        sha256: &cursor_vector_sha256/1,
+        verify_adapter_shim: fn _shim, _launcher -> :ok end
       }
 
       opts = [
@@ -518,7 +519,7 @@ defmodule Tightbeam.Harness.Support do
         sh: sh
       }
 
-      result = module.ensure_adapter(target)
+      result = Tightbeam.Harness.ensure_adapter(module, target)
       commands = drain_commands(ref, [])
       stat = File.stat!(adapter)
 
@@ -594,7 +595,7 @@ defmodule Tightbeam.Harness.Support do
         sh: sh
       }
 
-      result = module.ensure_adapter(target)
+      result = Tightbeam.Harness.ensure_adapter(module, target)
       commands = drain_commands(ref, [])
       Process.delete({ref, :checks})
       stat = File.stat!(bundle)
@@ -1088,7 +1089,7 @@ defmodule Tightbeam.Harness.Support do
       File.mkdir_p!(Path.dirname(discovered))
       File.write!(discovered, "#!/bin/sh\n")
 
-      module.probe_cli(%{
+      Tightbeam.Harness.probe_cli(module, %{
         cli_bin: Path.join(base, "bin"),
         find_executable: fn ^cli_name -> discovered end,
         realpath: fn path -> {:ok, path} end,
