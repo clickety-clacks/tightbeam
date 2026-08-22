@@ -20,7 +20,7 @@ defmodule Tightbeam.ApplicationRefusalTest do
   # own "application exited" notice quote the same words mid-line behind a timestamp and
   # a level tag, so only a line that BEGINS with them can have come from
   # `IO.puts(:stderr, ...)`.
-  @refusal "Tight Beam cannot start because no registered harness CLI is installed"
+  @refusal "Tight Beam cannot start because no usable harness CLI is installed"
 
   # A PATH with a real Elixir toolchain and NO harness CLI.
   #
@@ -91,7 +91,7 @@ defmodule Tightbeam.ApplicationRefusalTest do
   test "a first run with no harness CLI on PATH says so, exits 1, and writes no crash dump" do
     dirs = harnessless_path()
 
-    for dir <- dirs, harness <- ["claude", "codex"] do
+    for dir <- dirs, harness <- ["claude", "codex", "cursor-agent"] do
       refute File.exists?(Path.join(dir, harness)),
              "#{harness} is on the PATH this test builds (#{dir}), so the boot would " <>
                "succeed and this test could not fail for its stated reason"
@@ -145,7 +145,7 @@ defmodule Tightbeam.ApplicationRefusalTest do
     #    halts, it took the whole suite VM down with it. There is now one test of this
     #    behaviour and it exercises the real path.
     assert output =~ "expected on a fresh machine"
-    assert output =~ "Install `claude` or `codex`"
+    assert output =~ "Install a registered harness CLI"
     assert output =~ "Run `tightbeam doctor`"
 
     refute output =~ "** (",

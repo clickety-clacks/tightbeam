@@ -554,13 +554,14 @@ defmodule Tightbeam.Gateway do
 
         {:ok, for({harness, {:ok, _}} <- results, do: harness)}
 
-      Enum.all?(results, fn {_harness, result} -> result == {:error, :not_found} end) ->
+      Enum.all?(results, fn {_harness, result} -> harness_cli_absent?(result) end) ->
         binaries = Enum.map_join(Harness.all(), " or ", &"`#{&1.cli_binary()}`")
 
         {:error,
          {:no_harness_cli,
-          "Tight Beam cannot start because no registered harness CLI is installed. " <>
-            "That is expected on a fresh machine. Install #{binaries}, ensure it is on PATH, " <>
+          "Tight Beam cannot start because no usable harness CLI is installed. " <>
+            "That is expected on a fresh machine. Install a registered harness CLI " <>
+            "(#{binaries}), ensure it is on PATH, " <>
             "then start Tight Beam again. Run `tightbeam doctor` to check this machine."}}
 
       true ->
@@ -586,6 +587,15 @@ defmodule Tightbeam.Gateway do
     do: "its CLI is on PATH but failed to execute (#{String.trim(detail)})"
 
   defp describe_probe_failure(other), do: inspect(other)
+
+  defp harness_cli_absent?({:error, :not_found}), do: true
+
+  defp harness_cli_absent?(
+         {:error, %{code: "cursor_cli_integrity_mismatch", reason: :not_found}}
+       ),
+       do: true
+
+  defp harness_cli_absent?(_result), do: false
 
   @doc """
   Install the pinned ACP adapters for every registered harness on the local host.
