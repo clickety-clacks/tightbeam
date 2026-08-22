@@ -38,6 +38,135 @@ defmodule Tightbeam.Schema do
   # way that makes an older database unreadable, and give the refusal below a
   # sentence saying what changed.
   @shape "operator-decision-requests-v1"
+  @model_identity_shape "model-identity-v1"
+
+  # The one predecessor shape this build can migrate. This is deliberately a
+  # complete target table, not an ALTER inferred from sqlite_master: the stamp
+  # identifies the exact source contract, and this DDL names the exact target.
+  # The temporary name also keeps the live request-site audit honest: this is a
+  # bulk schema copy, not a new decision request that owes a prompt wake.
+  @operator_decision_requests_ddl """
+  CREATE TABLE decision_requests_new (
+    id                TEXT PRIMARY KEY,
+    kind              TEXT NOT NULL DEFAULT 'statute' CHECK (kind IN ('statute','effort','operator')),
+    raiserId          TEXT NOT NULL,
+    raiserSessionKey  TEXT,
+    ownerUserId       TEXT NOT NULL,
+    assignmentId      TEXT,
+    expecterSessionKey TEXT,
+    expecterUserId    TEXT,
+    lineageRung       INTEGER,
+    effortGeneration  INTEGER,
+    deadlineWakeId    TEXT,
+    raisedAt          INTEGER NOT NULL,
+    deadlineAt        INTEGER NOT NULL,
+    statuteName       TEXT,
+    actionKey         TEXT,
+    question          TEXT NOT NULL,
+    options           TEXT,
+    context           TEXT NOT NULL,
+    status            TEXT NOT NULL CHECK (status IN ('open','ruled','consumed','withdrawn','superseded')),
+    decision          TEXT,
+    rationale         TEXT,
+    ruledBy           TEXT,
+    ruledViaSessionKey TEXT,
+    ruledAt           INTEGER,
+    rulingFactId      INTEGER,
+    consumedAt        INTEGER,
+    parkWakeId        TEXT,
+    withdrawnBy       TEXT,
+    withdrawnReason   TEXT,
+    withdrawnAt       INTEGER,
+    CHECK (
+      (kind = 'statute' AND statuteName IS NOT NULL AND actionKey IS NOT NULL
+       AND expecterSessionKey IS NULL AND expecterUserId IS NULL
+       AND lineageRung IS NULL AND effortGeneration IS NULL AND deadlineWakeId IS NULL
+       AND ruledViaSessionKey IS NULL
+       AND (decision IS NULL OR decision IN ('allow','deny','waived')))
+      OR
+      (kind = 'effort' AND raiserId = 'process:tightbeam'
+       AND raiserSessionKey IS NULL
+       AND statuteName IS NULL AND actionKey IS NULL AND assignmentId IS NOT NULL
+       AND ((expecterSessionKey IS NOT NULL) != (expecterUserId IS NOT NULL))
+       AND lineageRung IS NOT NULL AND effortGeneration IS NOT NULL AND deadlineWakeId IS NOT NULL
+       AND ruledViaSessionKey IS NULL
+       AND (decision IS NULL OR decision IN ('continue','dismiss')))
+      OR
+      (kind = 'operator'
+       AND raiserSessionKey IS NOT NULL
+       AND statuteName IS NULL AND actionKey IS NOT NULL
+       AND expecterSessionKey IS NULL AND expecterUserId IS NULL
+       AND lineageRung IS NULL AND effortGeneration IS NULL
+       AND deadlineWakeId IS NULL
+       AND options IS NOT NULL
+       AND parkWakeId IS NULL AND consumedAt IS NULL
+       AND status <> 'consumed'
+       AND (
+         (status = 'ruled'
+          AND decision IS NOT NULL
+          AND ruledBy = 'user:' || ownerUserId
+          AND ruledAt IS NOT NULL AND rulingFactId IS NOT NULL)
+         OR
+         (status <> 'ruled'
+          AND decision IS NULL AND rationale IS NULL
+          AND ruledBy IS NULL AND ruledAt IS NULL AND rulingFactId IS NULL
+          AND ruledViaSessionKey IS NULL)
+       ))
+    )
+  );
+  """
+
+  @operator_decision_requests_indexes_ddl """
+  CREATE INDEX decision_requests_owner
+    ON decision_requests (ownerUserId, status);
+  CREATE INDEX decision_requests_key
+    ON decision_requests (raiserId, statuteName, actionKey);
+  CREATE UNIQUE INDEX decision_requests_one_open
+    ON decision_requests (raiserId, statuteName, actionKey)
+    WHERE kind = 'statute' AND status = 'open';
+  CREATE UNIQUE INDEX decision_requests_effort_generation
+    ON decision_requests (assignmentId, effortGeneration) WHERE kind = 'effort';
+  CREATE UNIQUE INDEX decision_requests_operator_open
+    ON decision_requests (ownerUserId, raiserId, actionKey)
+    WHERE kind = 'operator' AND status = 'open';
+  """
+
+  @operator_messages_ddl """
+  CREATE TABLE messages_new (
+    seq                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    id                     TEXT NOT NULL UNIQUE,
+    sessionKey             TEXT NOT NULL,
+    role                   TEXT NOT NULL CHECK (role IN ('user','assistant')),
+    content                TEXT NOT NULL,
+    timestamp              INTEGER NOT NULL,
+    sender                 TEXT,
+    deviceId               TEXT,
+    clientMessageId        TEXT,
+    replyToMessageId       TEXT,
+    replyToClientMessageId TEXT,
+    llmVisibleMessageId    TEXT NOT NULL,
+    attachments            TEXT NOT NULL DEFAULT '[]',
+    attentionTier          INTEGER NOT NULL DEFAULT 0,
+    messageType            TEXT,
+    markerKind             TEXT CHECK (
+      markerKind IS NULL OR markerKind IN ('harness-switch','model-retune','session-restart')
+    ),
+    markerFrom             TEXT,
+    markerTo               TEXT,
+    CHECK (
+      (messageType IS 'marker' AND markerKind IS NOT NULL AND markerFrom IS NOT NULL AND markerTo IS NOT NULL)
+      OR
+      (messageType IS NOT 'marker' AND markerKind IS NULL AND markerFrom IS NULL AND markerTo IS NULL)
+    )
+  );
+  """
+
+  @operator_messages_indexes_ddl """
+  CREATE INDEX messages_session ON messages (sessionKey, seq);
+  CREATE UNIQUE INDEX messages_client_dedupe
+    ON messages (sessionKey, deviceId, clientMessageId)
+    WHERE clientMessageId IS NOT NULL AND deviceId IS NOT NULL;
+  """
 
   @supervision_liveness_objects [
     %{
@@ -706,7 +835,7 @@ defmodule Tightbeam.Schema do
   ]
 
   defmodule ShapeError do
-    @moduledoc "A database whose shape this build cannot read. Never repaired in place."
+    @moduledoc "A database whose stamped shape this build cannot read or migrate exactly."
     defexception [:message]
   end
 
@@ -724,8 +853,8 @@ defmodule Tightbeam.Schema do
   So the shape is STAMPED at creation and CHECKED here, per the house rule: a
   missing or unknown stamp is a refusal and a bug report, never an inference.
   Note the direction — the one existence question below is asked to REFUSE,
-  never to deduce a shape and accommodate it. Nothing here migrates, ALTERs,
-  or sniffs stored DDL, and nothing should learn to.
+  never to deduce a shape and accommodate it. The sole migration is selected
+  by the exact `model-identity-v1` stamp; it does not sniff stored DDL.
   """
   @spec ensure_all(DB.server()) :: :ok
   def ensure_all(db) do
@@ -906,6 +1035,9 @@ defmodule Tightbeam.Schema do
       {:ok, [[@shape]]} ->
         :ok
 
+      {:ok, [[@model_identity_shape]]} ->
+        migrate_model_identity_v1(db)
+
       {:ok, []} ->
         # No stamp. Either a database this build is about to create, or one
         # written before stamping existed. Those are DIFFERENT, and telling
@@ -920,9 +1052,10 @@ defmodule Tightbeam.Schema do
           stamped: #{found}
           this build: #{@shape}
 
-        operator decision requests changed the decision_requests and wakes shape.
+        This build can migrate only #{@model_identity_shape} to #{@shape}.
 
-        There is no migration. Move the database aside and let it be recreated.
+        No migration is defined for the stamped shape above. Keep the database
+        in place and run a Tightbeam build that recognizes that exact stamp.
         """
 
       # More than one shape stamped. Nothing writes a second row, so this is a
@@ -939,6 +1072,152 @@ defmodule Tightbeam.Schema do
         assembled by something else. Move it aside and let it be recreated.
         """
     end
+  end
+
+  defp migrate_model_identity_v1(db) do
+    # SQLite checks child rows during DROP TABLE even when constraints are
+    # deferred. The DB owner is the only connection and serializes this whole
+    # call, so suspend enforcement around the transaction, verify every FK
+    # before commit, and restore enforcement even when the transaction raises.
+    :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
+
+    try do
+      case DB.transaction(db, &migrate_model_identity_v1_in_txn/1) do
+        {:ok, :ok} ->
+          :ok
+
+        {:error, %ShapeError{} = error} ->
+          raise error
+
+        {:error, error} ->
+          raise ShapeError,
+            message:
+              "migration #{@model_identity_shape} -> #{@shape} failed and was rolled back: #{Exception.message(error)}"
+      end
+    after
+      :ok = DB.execute(db, "PRAGMA foreign_keys = ON")
+    end
+  end
+
+  defp migrate_model_identity_v1_in_txn(%Txn{} = txn) do
+    # Read every commissioned population before any DDL. A missing table is an
+    # incompatible instance of the stamped predecessor and fails the transaction;
+    # the values are preservation checks, never inputs used to infer a shape.
+    [[decision_request_count]] = Txn.q(txn, "SELECT COUNT(*) FROM decision_requests")
+    [[wake_count]] = Txn.q(txn, "SELECT COUNT(*) FROM wakes")
+    [[message_count]] = Txn.q(txn, "SELECT COUNT(*) FROM messages")
+
+    :ok =
+      Txn.exec(txn, "ALTER TABLE decision_requests RENAME TO decision_requests_model_identity_v1")
+
+    :ok =
+      Txn.exec(
+        txn,
+        """
+        DROP INDEX decision_requests_owner;
+        DROP INDEX decision_requests_key;
+        DROP INDEX decision_requests_one_open;
+        DROP INDEX decision_requests_effort_generation;
+        #{@operator_decision_requests_ddl}
+        """
+      )
+
+    Txn.q(
+      txn,
+      """
+      INSERT INTO decision_requests_new (
+        id, kind, raiserId, raiserSessionKey, ownerUserId, assignmentId,
+        expecterSessionKey, expecterUserId, lineageRung, effortGeneration,
+        deadlineWakeId, raisedAt, deadlineAt, statuteName, actionKey, question,
+        options, context, status, decision, rationale, ruledBy,
+        ruledViaSessionKey, ruledAt, rulingFactId, consumedAt, parkWakeId,
+        withdrawnBy, withdrawnReason, withdrawnAt
+      )
+      SELECT
+        id, kind, raiserId, raiserSessionKey, ownerUserId, assignmentId,
+        expecterSessionKey, expecterUserId, lineageRung, effortGeneration,
+        deadlineWakeId, raisedAt, deadlineAt, statuteName, actionKey, question,
+        options, context, status, decision, rationale, ruledBy,
+        NULL, ruledAt, rulingFactId, consumedAt, parkWakeId,
+        withdrawnBy, withdrawnReason, withdrawnAt
+      FROM decision_requests_model_identity_v1
+      """
+    )
+
+    if Txn.changes(txn) != decision_request_count do
+      raise ShapeError,
+        message:
+          "migration #{@model_identity_shape} -> #{@shape} copied #{Txn.changes(txn)} of #{decision_request_count} decision requests"
+    end
+
+    [[^decision_request_count]] = Txn.q(txn, "SELECT COUNT(*) FROM decision_requests_new")
+    [[^wake_count]] = Txn.q(txn, "SELECT COUNT(*) FROM wakes")
+
+    :ok = Txn.exec(txn, @operator_messages_ddl)
+
+    Txn.q(
+      txn,
+      """
+      INSERT INTO messages_new (
+        seq, id, sessionKey, role, content, timestamp, sender, deviceId,
+        clientMessageId, replyToMessageId, replyToClientMessageId,
+        llmVisibleMessageId, attachments, attentionTier,
+        messageType, markerKind, markerFrom, markerTo
+      )
+      SELECT
+        seq, id, sessionKey, role, content, timestamp, sender, deviceId,
+        clientMessageId, replyToMessageId, replyToClientMessageId,
+        llmVisibleMessageId, attachments, attentionTier,
+        NULL, NULL, NULL, NULL
+      FROM messages
+      """
+    )
+
+    if Txn.changes(txn) != message_count do
+      raise ShapeError,
+        message:
+          "migration #{@model_identity_shape} -> #{@shape} copied #{Txn.changes(txn)} of #{message_count} messages"
+    end
+
+    [[^message_count]] = Txn.q(txn, "SELECT COUNT(*) FROM messages_new")
+
+    :ok =
+      Txn.exec(
+        txn,
+        """
+        DROP TABLE decision_requests_model_identity_v1;
+        ALTER TABLE decision_requests_new RENAME TO decision_requests;
+        #{@operator_decision_requests_indexes_ddl}
+        DROP INDEX messages_session;
+        DROP INDEX messages_client_dedupe;
+        DROP TABLE messages;
+        ALTER TABLE messages_new RENAME TO messages;
+        #{@operator_messages_indexes_ddl}
+        """
+      )
+
+    case Txn.q(txn, "PRAGMA foreign_key_check") do
+      [] ->
+        :ok
+
+      rows ->
+        raise ShapeError,
+          message:
+            "migration #{@model_identity_shape} -> #{@shape} left invalid foreign keys: #{inspect(rows)}"
+    end
+
+    Txn.q(
+      txn,
+      "UPDATE schema_stamp SET shape = ?1, stampedAt = ?2 WHERE shape = ?3",
+      [@shape, System.system_time(:millisecond), @model_identity_shape]
+    )
+
+    if Txn.changes(txn) != 1 do
+      raise ShapeError,
+        message: "migration #{@model_identity_shape} -> #{@shape} lost its exact stamp transition"
+    end
+
+    :ok
   end
 
   # A FRESH DATABASE MUST NEVER BE REFUSED, which is why the stamp is written
