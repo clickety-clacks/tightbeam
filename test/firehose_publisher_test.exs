@@ -1,7 +1,7 @@
 defmodule Tightbeam.Firehose.PublisherTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{ConnRegistry, DB, Dispatch, Gateway, Org, Rules, Wakes}
+  alias Tightbeam.{ConnRegistry, DB, Dispatch, Gateway, Ledger, Org, Rules, Wakes}
   alias Tightbeam.Firehose.{Hub, Publisher}
 
   defmodule LaneStub do
@@ -349,6 +349,125 @@ defmodule Tightbeam.Firehose.PublisherTest do
              "refs" => %{"messageId" => "s_1"},
              "payload" => %{"id" => "s_1", "rowVersion" => 9}
            } = receive_notice()
+  end
+
+  test "ledger transitions hand off turn notices only after their commits" do
+    db = :firehose_turn_transition_db
+    start_supervised!({DB, path: ":memory:", name: db})
+    :ok = Tightbeam.Schema.ensure_all(db)
+    {:ok, _} = DB.query(db, "INSERT INTO users VALUES ('flynn', 1, 1)")
+
+    Org.create(db, %{
+      session_key: "turn-target",
+      display_name: "Turn target",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Tightbeam.Model.new("fable")
+    })
+
+    assert {:ok, seq} =
+             Ledger.enqueue(db, %{
+               session_key: "turn-target",
+               message_id: "turn-message",
+               origin: "user:flynn",
+               prompt: "run"
+             })
+
+    assert {:ok, %{seq: ^seq}} = Ledger.claim_next(db, "turn-target", "lane:test")
+
+    assert %{
+             "class" => "turn.started",
+             "payload" => %{"status" => "running", "turnSeq" => ^seq}
+           } = receive_notice()
+
+    assert :ok = Ledger.finish(db, seq, "delivered")
+
+    assert %{
+             "class" => "turn.ended",
+             "payload" => %{"status" => "delivered", "turnSeq" => ^seq}
+           } = receive_notice()
+  end
+
+  test "concurrent transaction handoffs reach the firehose in database commit order" do
+    db = :firehose_commit_order_db
+    parent = self()
+    start_supervised!({DB, path: ":memory:", name: db})
+    :ok = DB.execute(db, "CREATE TABLE committed_messages (id TEXT PRIMARY KEY, body TEXT)")
+
+    first =
+      Task.async(fn ->
+        DB.transaction(db, fn txn ->
+          DB.Txn.q(txn, "INSERT INTO committed_messages VALUES ('first', 'one')")
+
+          Publisher.committed_in_txn(
+            txn,
+            "message.created",
+            %{id: "first", seq: 1, session_key: "agent:first", content: "one"},
+            %{"sessionKey" => "agent:first"}
+          )
+
+          send(parent, :first_commit_held)
+
+          receive do
+            :release_first_commit -> :ok
+          end
+        end)
+      end)
+
+    assert_receive :first_commit_held
+    db_pid = Process.whereis(db)
+    :erlang.trace(db_pid, true, [:receive])
+
+    second =
+      Task.async(fn ->
+        DB.transaction(db, fn txn ->
+          DB.Txn.q(txn, "INSERT INTO committed_messages VALUES ('second', 'two')")
+
+          Publisher.committed_in_txn(
+            txn,
+            "message.created",
+            %{id: "second", seq: 2, session_key: "agent:second", content: "two"},
+            %{"sessionKey" => "agent:second"}
+          )
+        end)
+      end)
+
+    assert_receive {:trace, ^db_pid, :receive, {:"$gen_call", _from, {:transaction, _fun}}}
+    :erlang.trace(db_pid, false, [:receive])
+    send(db_pid, :release_first_commit)
+
+    assert {:ok, :ok} = Task.await(first)
+    assert {:ok, :ok} = Task.await(second)
+
+    assert %{"class" => "message.created", "payload" => %{"id" => "first"}} =
+             receive_notice()
+
+    assert %{"class" => "message.created", "payload" => %{"id" => "second"}} =
+             receive_notice()
+  end
+
+  test "a rolled-back transaction emits no firehose notice" do
+    db = :firehose_rollback_db
+    start_supervised!({DB, path: ":memory:", name: db})
+
+    assert {:error, %RuntimeError{message: "forced rollback"}} =
+             DB.transaction(db, fn txn ->
+               Publisher.committed_in_txn(
+                 txn,
+                 "message.created",
+                 %{id: "rolled-back", seq: 1, session_key: "agent:none", content: "none"},
+                 %{"sessionKey" => "agent:none"}
+               )
+
+               raise "forced rollback"
+             end)
+
+    _ = :sys.get_state(Hub)
+    refute_receive {:firehose_notice, %{"payload" => %{"id" => "rolled-back"}}}
   end
 
   test "a role delete carries its last visible pre-delete row" do

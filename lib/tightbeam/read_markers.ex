@@ -3,6 +3,7 @@ defmodule Tightbeam.ReadMarkers do
 
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
+  alias Tightbeam.Firehose.Publisher
 
   @ddl """
   CREATE TABLE IF NOT EXISTS read_markers (
@@ -37,33 +38,48 @@ defmodule Tightbeam.ReadMarkers do
     case DB.transaction(db, fn txn ->
            current = current_in_txn(txn, user_id, scope_key)
 
-           cond do
-             expected? and current_marker(current) != expected ->
-               {:error,
-                %{
-                  code: "read_marker_conflict",
-                  message: "read marker no longer matches expected-current"
-                }}
+           result =
+             cond do
+               expected? and current_marker(current) != expected ->
+                 {:error,
+                  %{
+                    code: "read_marker_conflict",
+                    message: "read marker no longer matches expected-current"
+                  }}
 
-             current_marker(current) == marker ->
-               {:ok, false, current}
+               current_marker(current) == marker ->
+                 {:ok, false, current}
 
-             true ->
-               updated_at = max(System.system_time(:millisecond), current_version(current) + 1)
+               true ->
+                 updated_at = max(System.system_time(:millisecond), current_version(current) + 1)
 
-               Txn.q(
-                 txn,
-                 """
-                 INSERT INTO read_markers (userId, scopeKey, marker, updatedAt)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(userId, scopeKey) DO UPDATE
-                 SET marker = excluded.marker, updatedAt = excluded.updatedAt
-                 """,
-                 [user_id, scope_key, marker, updated_at]
-               )
+                 Txn.q(
+                   txn,
+                   """
+                   INSERT INTO read_markers (userId, scopeKey, marker, updatedAt)
+                   VALUES (?1, ?2, ?3, ?4)
+                   ON CONFLICT(userId, scopeKey) DO UPDATE
+                   SET marker = excluded.marker, updatedAt = excluded.updatedAt
+                   """,
+                   [user_id, scope_key, marker, updated_at]
+                 )
 
-               {:ok, true, row(user_id, scope_key, marker, updated_at)}
+                 {:ok, true, row(user_id, scope_key, marker, updated_at)}
+             end
+
+           case {result, opts[:firehose_call]} do
+             {{:ok, changed?, row}, %{firehose_in_txn: true} = call} ->
+               Publisher.maybe_accepted_in_txn(txn, call, %{
+                 changed: changed?,
+                 read_marker: row,
+                 user_id: user_id
+               })
+
+             _ ->
+               :ok
            end
+
+           result
          end) do
       {:ok, result} -> result
       {:error, error} -> raise error

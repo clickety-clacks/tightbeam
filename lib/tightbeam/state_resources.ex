@@ -8,6 +8,15 @@ defmodule Tightbeam.StateResources do
 
   @secret_keys MapSet.new(["cliToken", "token", "identityToken"])
 
+  @turn_select """
+  SELECT t.seq, t.sessionKey, t.messageId, t.wakeId, t.origin, t.roleRef,
+         t.roleFallback, t.assignmentId, t.jobRef, t.model, t.thinkingLevel,
+         t.modelContext, t.harness, t.replyAttention, t.status, t.owner,
+         t.adapterGen, t.requestRef, t.error, t.createdAt, t.startedAt,
+         t.endedAt, t.publishedAt
+  FROM turns AS t
+  """
+
   alias Tightbeam.{Artifacts, Assignments, Devices, Org, ReadMarkers, Wakes, WorkItems}
 
   def query_work_item(db, id, call) do
@@ -94,21 +103,23 @@ defmodule Tightbeam.StateResources do
     {:ok, rows} =
       Tightbeam.DB.query(
         db,
-        """
-        SELECT t.seq, t.sessionKey, t.messageId, t.wakeId, t.origin, t.roleRef,
-               t.roleFallback, t.assignmentId, t.jobRef, t.model, t.thinkingLevel,
-               t.modelContext, t.harness, t.replyAttention, t.status, t.owner,
-               t.adapterGen, t.requestRef, t.error, t.createdAt, t.startedAt,
-               t.endedAt, t.publishedAt
-        FROM turns AS t
-        LEFT JOIN messages AS m ON m.id = t.messageId
-        WHERE t.sessionKey = ?1 AND (t.messageId = ?2 OR m.clientMessageId = ?2)
-        ORDER BY t.seq DESC LIMIT 1
-        """,
+        @turn_select <>
+          """
+          LEFT JOIN messages AS m ON m.id = t.messageId
+          WHERE t.sessionKey = ?1 AND (t.messageId = ?2 OR m.clientMessageId = ?2)
+          ORDER BY t.seq DESC LIMIT 1
+          """,
         [session_key, message_id]
       )
 
     case rows do
+      [row] -> turn_row(row)
+      [] -> nil
+    end
+  end
+
+  def query_turn_in_txn(txn, seq) do
+    case Tightbeam.DB.Txn.q(txn, @turn_select <> " WHERE t.seq = ?1", [seq]) do
       [row] -> turn_row(row)
       [] -> nil
     end

@@ -14,6 +14,7 @@ defmodule Tightbeam.Devices do
 
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
+  alias Tightbeam.Firehose.Publisher
 
   @type db :: GenServer.server()
 
@@ -182,6 +183,25 @@ defmodule Tightbeam.Devices do
     end)
   end
 
+  @doc false
+  def approve_with_firehose(db, device_id, user_id, call) do
+    transaction!(db, fn txn ->
+      must_get(txn, device_id)
+      if user_id, do: ensure_user(txn, user_id)
+
+      Txn.q(
+        txn,
+        "UPDATE devices SET status = 'allowlisted', userId = COALESCE(?2, userId), token = ?3 WHERE deviceId = ?1",
+        [device_id, user_id, mint_token()]
+      )
+
+      stamp_device_in_txn(txn, device_id, now())
+      device = firehose_device_in_txn(txn, device_id)
+      Publisher.maybe_accepted_in_txn(txn, call, %{device: device})
+      device
+    end)
+  end
+
   @doc "Deny a device: status → denied, token cleared. Raises on unknown device."
   @spec deny(db(), String.t()) :: :ok
   def deny(db \\ Tightbeam.DB, device_id) do
@@ -198,6 +218,23 @@ defmodule Tightbeam.Devices do
     end)
   end
 
+  @doc false
+  def deny_with_firehose(db, device_id, call) do
+    transaction!(db, fn txn ->
+      must_get(txn, device_id)
+
+      Txn.q(txn, "UPDATE devices SET status = 'denied', token = NULL WHERE deviceId = ?1", [
+        device_id
+      ])
+
+      stamp_device_in_txn(txn, device_id, now())
+
+      Publisher.maybe_accepted_in_txn(txn, call, %{device: firehose_device_in_txn(txn, device_id)})
+
+      :ok
+    end)
+  end
+
   @doc "Revoke a device's token (status unchanged — it re-pairs). Raises on unknown device."
   @spec revoke(db(), String.t()) :: :ok
   def revoke(db \\ Tightbeam.DB, device_id) do
@@ -205,6 +242,19 @@ defmodule Tightbeam.Devices do
       must_get(txn, device_id)
       Txn.q(txn, "UPDATE devices SET token = NULL WHERE deviceId = ?1", [device_id])
       stamp_device_in_txn(txn, device_id, now())
+      :ok
+    end)
+  end
+
+  @doc false
+  def revoke_with_firehose(db, device_id, call) do
+    transaction!(db, fn txn ->
+      must_get(txn, device_id)
+      Txn.q(txn, "UPDATE devices SET token = NULL WHERE deviceId = ?1", [device_id])
+      stamp_device_in_txn(txn, device_id, now())
+
+      Publisher.maybe_accepted_in_txn(txn, call, %{device: firehose_device_in_txn(txn, device_id)})
+
       :ok
     end)
   end
@@ -237,6 +287,16 @@ defmodule Tightbeam.Devices do
       insert_user(txn, user_id, is_admin)
 
       must_get_user(txn, user_id)
+    end)
+  end
+
+  @doc false
+  def add_user_with_firehose(db, user_id, is_admin, call) do
+    transaction!(db, fn txn ->
+      insert_user(txn, user_id, is_admin)
+      user = must_get_user(txn, user_id)
+      Publisher.maybe_accepted_in_txn(txn, call, %{user: user})
+      user
     end)
   end
 
@@ -290,6 +350,15 @@ defmodule Tightbeam.Devices do
       [row] -> to_device(row)
       [] -> raise ArgumentError, "unknown device: #{device_id}"
     end
+  end
+
+  defp firehose_device_in_txn(txn, device_id) do
+    device = must_get(txn, device_id)
+
+    [[row_version]] =
+      Txn.q(txn, "SELECT rowVersion FROM device_versions WHERE deviceId = ?1", [device_id])
+
+    Map.put(device, :row_version, row_version)
   end
 
   defp one_device_or_nil([row]), do: to_device(row)

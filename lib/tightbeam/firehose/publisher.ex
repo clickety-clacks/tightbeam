@@ -1,6 +1,7 @@
 defmodule Tightbeam.Firehose.Publisher do
   @moduledoc "Post-commit translation from accepted dispatch verbs to live notices."
 
+  alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.{Hub, Registry}
   alias Tightbeam.StateResources
 
@@ -38,11 +39,42 @@ defmodule Tightbeam.Firehose.Publisher do
     "critical" => {"critical_lease.updated", &StateResources.critical_state/1}
   }
 
+  @transactional_verbs MapSet.new(
+                         ~w(work-item-create work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail assign dispatch attest reopen-assignment revoke-assignment wake condition artifact-record read-marker-set read-marker-clear critical role-create role-bind role-rm spawn retire ask answer rule effort-rule withdraw approve-device deny-device revoke-device add-user)
+                       )
+
   @spec accepted(map(), term()) :: :ok
   def accepted(call, result), do: Hub.accepted(nil, call, result)
 
   @spec accepted(GenServer.server(), map(), term()) :: :ok
   def accepted(db, call, result), do: Hub.accepted(db, call, result)
+
+  @spec transactional_verb?(String.t()) :: boolean()
+  def transactional_verb?(verb), do: MapSet.member?(@transactional_verbs, verb)
+
+  @spec accepted_after_handler(GenServer.server(), map(), term()) :: :ok
+  def accepted_after_handler(db, call, result) do
+    if transactional_verb?(call.verb),
+      do: :ok,
+      else: accepted(db, call, result)
+  end
+
+  @doc "Queue accepted notices on the transaction that committed their state."
+  @spec accepted_in_txn(Txn.t(), map(), term()) :: :ok
+  def accepted_in_txn(%Txn{} = txn, call, result) do
+    Txn.handoff(txn, Hub, {:accepted, nil, call, result})
+  end
+
+  @spec maybe_accepted_in_txn(Txn.t(), map(), term()) :: :ok
+  def maybe_accepted_in_txn(%Txn{} = txn, %{firehose_in_txn: true} = call, result),
+    do: accepted_in_txn(txn, call, result)
+
+  def maybe_accepted_in_txn(%Txn{}, _call, _result), do: :ok
+
+  @spec observed_accepted_in_txn(Txn.t(), map()) :: :ok
+  def observed_accepted_in_txn(%Txn{} = txn, call) do
+    Txn.handoff(txn, Hub, {:publish, observation_notice("verb.accepted", call)})
+  end
 
   @doc "Capture state needed to authorize and serialize a delete after it commits."
   @spec capture_before(GenServer.server(), map()) :: map()
@@ -54,6 +86,11 @@ defmodule Tightbeam.Firehose.Publisher do
 
   @spec denied(map(), map()) :: :ok
   def denied(call, error), do: Hub.denied(call, error)
+
+  @spec denied_in_txn(Txn.t(), map(), map()) :: :ok
+  def denied_in_txn(%Txn{} = txn, call, error) do
+    Txn.handoff(txn, Hub, {:denied, call, error})
+  end
 
   @spec observed_accepted(map()) :: :ok
   def observed_accepted(call), do: Hub.publish(observation_notice("verb.accepted", call))
@@ -90,6 +127,50 @@ defmodule Tightbeam.Firehose.Publisher do
   @spec committed(String.t(), map(), map()) :: :ok
   def committed(class, payload, refs \\ %{}), do: Hub.committed(class, payload, refs)
 
+  @doc "Queue one committed state notice on the transaction that produced it."
+  @spec committed_in_txn(Txn.t(), String.t(), map(), map()) :: :ok
+  def committed_in_txn(%Txn{} = txn, class, payload, refs \\ %{}) do
+    Txn.handoff(txn, Hub, {:committed, class, payload, refs})
+  end
+
+  @doc "Queue the existing message-created notice on the transaction that appended it."
+  @spec message_in_txn(Txn.t(), String.t(), map(), String.t() | nil) :: :ok
+  def message_in_txn(%Txn{} = txn, session_key, message, owner_user_id \\ nil) do
+    owner_user_id =
+      owner_user_id ||
+        case Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey = ?1", [session_key]) do
+          [[owner]] -> owner
+          [] -> nil
+        end
+
+    if is_binary(owner_user_id) do
+      committed_in_txn(txn, "message.created", message, %{
+        "messageId" => message.id,
+        "sessionKey" => session_key,
+        "ownerUserId" => owner_user_id
+      })
+    else
+      :ok
+    end
+  end
+
+  @doc "Queue the existing turn notice on the transaction that changed its state."
+  @spec turn_in_txn(Txn.t(), String.t(), integer()) :: :ok
+  def turn_in_txn(%Txn{} = txn, class, seq) when class in ~w(turn.started turn.ended) do
+    case StateResources.query_turn_in_txn(txn, seq) do
+      %{} = turn ->
+        committed_in_txn(txn, class, turn, %{
+          "turnSeq" => turn.seq,
+          "sessionKey" => turn.session_key,
+          "assignmentId" => turn.assignment_id,
+          "workItemId" => turn.job_ref
+        })
+
+      nil ->
+        :ok
+    end
+  end
+
   @spec lifecycle(String.t(), map(), map()) :: :ok
   def lifecycle(class, payload, refs \\ %{}) do
     Hub.publish(%{
@@ -99,6 +180,20 @@ defmodule Tightbeam.Firehose.Publisher do
       "refs" => refs,
       "payload" => StateResources.observation(payload)
     })
+  end
+
+  @doc "Queue one lifecycle observation on the transaction that recorded it."
+  @spec lifecycle_in_txn(Txn.t(), String.t(), map(), map()) :: :ok
+  def lifecycle_in_txn(%Txn{} = txn, class, payload, refs \\ %{}) do
+    notice = %{
+      "class" => class,
+      "op" => "observe",
+      "occurredAt" => System.system_time(:millisecond),
+      "refs" => refs,
+      "payload" => StateResources.observation(payload)
+    }
+
+    Txn.handoff(txn, Hub, {:publish, notice})
   end
 
   @spec committed_notice(String.t(), map(), map()) :: map()

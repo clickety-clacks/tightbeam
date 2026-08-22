@@ -718,12 +718,17 @@ defmodule Tightbeam.Gateway do
           true ->
             scheduler = Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler)
 
-            case ConditionFacts.file_idempotent_with_effect(db, scheduler, %{
-                   kind: p.kind,
-                   scope: p[:scope],
-                   origin: call.origin,
-                   idempotency_key: p[:idempotency_key]
-                 }) do
+            case ConditionFacts.file_idempotent_with_effect(
+                   db,
+                   scheduler,
+                   %{
+                     kind: p.kind,
+                     scope: p[:scope],
+                     origin: call.origin,
+                     idempotency_key: p[:idempotency_key]
+                   },
+                   call
+                 ) do
               {{:error, error}, _filed?} ->
                 error
 
@@ -799,18 +804,21 @@ defmodule Tightbeam.Gateway do
         end
       end,
       {"approve-device", ["device.approved"]} =>
-        admin_handler(db, fn p ->
-          d = Devices.approve(db, p.device_id, p[:user_id])
+        admin_call_handler(db, fn call ->
+          p = call.params
+          d = Devices.approve_with_firehose(db, p.device_id, p[:user_id], call)
           %{approved: %{device_id: d.device_id, user_id: d.user_id, is_admin: d.is_admin}}
         end),
       {"deny-device", ["device.denied"]} =>
-        admin_handler(db, fn p ->
-          Devices.deny(db, p.device_id)
+        admin_call_handler(db, fn call ->
+          p = call.params
+          Devices.deny_with_firehose(db, p.device_id, call)
           %{denied: p.device_id}
         end),
       {"revoke-device", ["device.revoked"]} =>
-        admin_handler(db, fn p ->
-          Devices.revoke(db, p.device_id)
+        admin_call_handler(db, fn call ->
+          p = call.params
+          Devices.revoke_with_firehose(db, p.device_id, call)
           %{revoked: p.device_id}
         end),
       {"host-env-set", []} =>
@@ -927,8 +935,13 @@ defmodule Tightbeam.Gateway do
           %{user: Devices.set_user_admin(db, p.user_id, Map.get(p, :is_admin, true))}
         end),
       {"add-user", ["user.added"]} =>
-        admin_handler(db, fn p ->
-          %{user: Devices.add_user(db, p.user_id, Map.get(p, :is_admin, false))}
+        admin_call_handler(db, fn call ->
+          p = call.params
+
+          %{
+            user:
+              Devices.add_user_with_firehose(db, p.user_id, Map.get(p, :is_admin, false), call)
+          }
         end),
       {"read-marker-set", ["read_marker.updated"]} => fn call ->
         read_marker_result(db, call, :set)
@@ -952,8 +965,9 @@ defmodule Tightbeam.Gateway do
           "work-item-create",
           call
           |> Map.put(:on_work_item_change, item_change)
-          |> Map.put(:on_routing_wake_scheduled, fn wake ->
-            Tightbeam.Firehose.Publisher.committed(
+          |> Map.put(:on_routing_wake_scheduled_in_txn, fn txn, wake ->
+            Tightbeam.Firehose.Publisher.committed_in_txn(
+              txn,
               "wake.scheduled",
               wake,
               %{"workItemId" => wake.work_item_id}
@@ -1261,6 +1275,7 @@ defmodule Tightbeam.Gateway do
               # No-ops for every non-bracket wake (the discriminator is the item's
               # routing/slate wake-id matching this wake).
               WorkItems.rearm_on_fire_in_txn(txn, opts[:wake_id], opts[:target_gate])
+              Tightbeam.Firehose.Publisher.message_in_txn(txn, target, message)
 
               {:appended, target, message, opts}
 
@@ -1315,6 +1330,9 @@ defmodule Tightbeam.Gateway do
         "UPDATE wakes SET state = 'fired', firedAt = ?2 WHERE wakeId = ?1 AND state = 'pending'",
         [opts[:wake_id], System.system_time(:millisecond)]
       )
+
+      if DB.Txn.changes(txn) == 1,
+        do: Wakes.publish_change_in_txn(txn, "wake.fired", opts[:wake_id])
     end
   end
 
@@ -2338,6 +2356,7 @@ defmodule Tightbeam.Gateway do
               attention_tier: attention_tier
             })
 
+          Tightbeam.Firehose.Publisher.message_in_txn(txn, turn.session_key, reply)
           reply
         end)
       end)
@@ -2747,7 +2766,13 @@ defmodule Tightbeam.Gateway do
                  caller.owner_user_id,
                  call.params[:bind]
                ) do
-          case Roles.create!(db, call.params[:name], caller.owner_user_id, call.params[:bind]) do
+          case Roles.create_with_firehose!(
+                 db,
+                 call.params[:name],
+                 caller.owner_user_id,
+                 call.params[:bind],
+                 call
+               ) do
             {:error, error} -> error
             role -> %{role: role}
           end
@@ -3369,7 +3394,7 @@ defmodule Tightbeam.Gateway do
          {:ok, caller} <- caller_for_role_mutation(db, call.origin),
          :ok <- role_mutation_allowed(db, caller, call.origin, role),
          :ok <- binding_owner_allowed(db, call.origin, role, session_key),
-         :ok <- Roles.bind(db, name, session_key) do
+         :ok <- Roles.bind_with_firehose(db, name, session_key, call) do
       %{role: Roles.get(db, name)}
     else
       nil -> %{code: "unknown_role", message: "unknown role: #{name}"}
@@ -3383,7 +3408,7 @@ defmodule Tightbeam.Gateway do
     with role when not is_nil(role) <- Roles.get(db, name),
          {:ok, caller} <- caller_for_role_mutation(db, call.origin),
          :ok <- role_mutation_allowed(db, caller, call.origin, role),
-         :ok <- Roles.rm(db, name) do
+         :ok <- Roles.rm_with_firehose(db, name, call) do
       %{removed: name}
     else
       nil -> %{code: "unknown_role", message: "unknown role: #{name}"}
@@ -3400,7 +3425,8 @@ defmodule Tightbeam.Gateway do
          %{owner_user_id: user_id} when is_binary(user_id) <- resolve_caller(db, call.origin) do
       case Tightbeam.ReadMarkers.set(db, user_id, scope_key, marker,
              expected?: Map.has_key?(call.params, :expected_current),
-             expected: call.params[:expected_current]
+             expected: call.params[:expected_current],
+             firehose_call: call
            ) do
         {:error, error} ->
           error
@@ -3729,32 +3755,43 @@ defmodule Tightbeam.Gateway do
             ]) == [[1]]
           end
 
-          case IdPrefix.resolve_in_txn(txn, :wake, wake_id, visible?) do
-            {:ok, resolved} ->
-              id_resolved(call, txn, :wake, resolved)
+          result =
+            case IdPrefix.resolve_in_txn(txn, :wake, wake_id, visible?) do
+              {:ok, resolved} ->
+                id_resolved(call, txn, :wake, resolved)
 
-              Wakes.cancel_in_txn(txn, %{
-                wake_id: resolved,
-                expected_origin: call.origin,
-                requester: requester,
-                reason_kind: "requester_withdrew",
-                causal_source: %{
-                  kind: "verb_call",
-                  accepted_event: %{
-                    origin: call.origin,
-                    session_key: call.session_key,
-                    principal: call.principal
-                  }
-                },
-                outcome: %{kind: "no_replacement"}
-              })
+                result =
+                  Wakes.cancel_in_txn(txn, %{
+                    wake_id: resolved,
+                    expected_origin: call.origin,
+                    requester: requester,
+                    reason_kind: "requester_withdrew",
+                    causal_source: %{
+                      kind: "verb_call",
+                      accepted_event: %{
+                        origin: call.origin,
+                        session_key: call.session_key,
+                        principal: call.principal
+                      }
+                    },
+                    outcome: %{kind: "no_replacement"}
+                  })
 
-            :unknown ->
-              false
+                if match?({:accepted_in_txn, _event_id, %{canceled: true}}, result) do
+                  Tightbeam.Firehose.Publisher.observed_accepted_in_txn(txn, call)
+                  Wakes.publish_change_in_txn(txn, "wake.canceled", resolved)
+                end
 
-            {:ambiguous, error} ->
-              error
-          end
+                result
+
+              :unknown ->
+                false
+
+              {:ambiguous, error} ->
+                error
+            end
+
+          result
         end)
 
       case result do
@@ -3810,25 +3847,31 @@ defmodule Tightbeam.Gateway do
               if p[:idempotency_key],
                 do: Idempotency.get_in_txn(txn, call.origin, "wake", p.idempotency_key)
 
-            if prior do
-              case DB.Txn.q(txn, select_wake_in_txn_sql(), [prior.session_key]) do
-                [row] -> wake_from_in_txn_row(row)
-                [] -> nil
-              end
-            else
-              wake = schedule_wake_in_txn(txn, call, session_key, due_at)
+            wake =
+              if prior do
+                case DB.Txn.q(txn, select_wake_in_txn_sql(), [prior.session_key]) do
+                  [row] -> wake_from_in_txn_row(row)
+                  [] -> nil
+                end
+              else
+                wake = schedule_wake_in_txn(txn, call, session_key, due_at)
 
-              if p[:idempotency_key] && is_binary(wake[:wake_id]) do
-                Idempotency.put_in_txn(txn, %{
-                  owner_user_id: call.origin,
-                  operation: "wake",
-                  idempotency_key: p.idempotency_key,
-                  session_key: wake.wake_id
-                })
+                if p[:idempotency_key] && is_binary(wake[:wake_id]) do
+                  Idempotency.put_in_txn(txn, %{
+                    owner_user_id: call.origin,
+                    operation: "wake",
+                    idempotency_key: p.idempotency_key,
+                    session_key: wake.wake_id
+                  })
+                end
+
+                wake
               end
 
-              wake
-            end
+            if is_map(wake) and not Map.has_key?(wake, :code),
+              do: Tightbeam.Firehose.Publisher.maybe_accepted_in_txn(txn, call, wake)
+
+            wake
           end)
 
         wake =
@@ -4077,7 +4120,18 @@ defmodule Tightbeam.Gateway do
 
         cond do
           prior ->
-            spawn_replay(db, prior.session_key)
+            result = spawn_replay(db, prior.session_key)
+
+            {:ok, :ok} =
+              DB.transaction(db, fn txn ->
+                Tightbeam.Firehose.Publisher.maybe_accepted_in_txn(
+                  txn,
+                  call,
+                  Org.get_in_txn(txn, prior.session_key)
+                )
+              end)
+
+            result
 
           is_integer(max_live_sessions) and max_live_sessions > 0 and
               length(Org.list_for_user(db, caller.owner_user_id, false)) >= max_live_sessions ->
@@ -4329,6 +4383,7 @@ defmodule Tightbeam.Gateway do
                     session_key: session.session_key
                   })
 
+                  Tightbeam.Firehose.Publisher.maybe_accepted_in_txn(txn, call, session)
                   {:created, session}
                 end
               else
@@ -4336,6 +4391,8 @@ defmodule Tightbeam.Gateway do
               end
 
             prior ->
+              session = Org.get_in_txn(txn, prior.session_key)
+              Tightbeam.Firehose.Publisher.maybe_accepted_in_txn(txn, call, session)
               {:replayed, prior.session_key}
           end
         end)
@@ -5328,6 +5385,13 @@ defmodule Tightbeam.Gateway do
                     retune_marker(record_model, new_ref)
                   )
 
+                Tightbeam.Firehose.Publisher.message_in_txn(
+                  txn,
+                  session.session_key,
+                  marker,
+                  session.owner_user_id
+                )
+
                 {:changed, marker}
             end
           end)
@@ -5556,6 +5620,13 @@ defmodule Tightbeam.Gateway do
             session.session_key,
             retune_marker(record_model, new_ref)
           )
+
+        Tightbeam.Firehose.Publisher.message_in_txn(
+          txn,
+          session.session_key,
+          marker,
+          session.owner_user_id
+        )
 
         {:changed, marker}
 
@@ -5862,12 +5933,33 @@ defmodule Tightbeam.Gateway do
        ) do
     Enum.each(sessions, fn session ->
       best_effort(fn ->
-        case Projection.append(db, %{
-               session_key: session.session_key,
-               role: "user",
-               content: credential_transition_message(provider, machine, transition),
-               sender: "process:tightbeam"
-             }) do
+        {:ok, outcome} =
+          DB.transaction(db, fn txn ->
+            outcome =
+              Projection.append_in_txn(txn, %{
+                session_key: session.session_key,
+                role: "user",
+                content: credential_transition_message(provider, machine, transition),
+                sender: "process:tightbeam"
+              })
+
+            case outcome do
+              {:appended, message} ->
+                Tightbeam.Firehose.Publisher.message_in_txn(
+                  txn,
+                  session.session_key,
+                  message,
+                  session.owner_user_id
+                )
+
+              _ ->
+                :ok
+            end
+
+            outcome
+          end)
+
+        case outcome do
           {:appended, message} -> publish_message(db, session.session_key, message)
           _ -> :ok
         end
@@ -6250,11 +6342,11 @@ defmodule Tightbeam.Gateway do
 
     cond do
       prior && prior.session_key == call.session_key ->
-        %{
+        retire_replay_notice(db, call, %{
           deleted_session_key: call.session_key,
           retired_session_keys: retired_subtree_keys(db, call.session_key),
           deferred: []
-        }
+        })
 
       true ->
         case Org.get(db, call.session_key) do
@@ -6291,6 +6383,22 @@ defmodule Tightbeam.Gateway do
                     })
                   end
 
+                  case Enum.find(result.retired, &(&1.session_key == session.session_key)) do
+                    %{session: retired_session} ->
+                      Tightbeam.Firehose.Publisher.maybe_accepted_in_txn(
+                        txn,
+                        call,
+                        retired_session
+                      )
+
+                    nil ->
+                      Tightbeam.Firehose.Publisher.maybe_accepted_in_txn(
+                        txn,
+                        call,
+                        Org.get_in_txn(txn, session.session_key)
+                      )
+                  end
+
                   result
                 end)
 
@@ -6311,7 +6419,11 @@ defmodule Tightbeam.Gateway do
                 deferred: result.deferred
               }
             else
-              %{deleted_session_key: session.session_key, retired_session_keys: [], deferred: []}
+              retire_replay_notice(db, call, %{
+                deleted_session_key: session.session_key,
+                retired_session_keys: [],
+                deferred: []
+              })
             end
 
           _ ->
@@ -6320,13 +6432,26 @@ defmodule Tightbeam.Gateway do
     end
   end
 
+  defp retire_replay_notice(db, call, result) do
+    {:ok, :ok} =
+      DB.transaction(db, fn txn ->
+        Tightbeam.Firehose.Publisher.maybe_accepted_in_txn(
+          txn,
+          call,
+          Org.get_in_txn(txn, call.session_key)
+        )
+      end)
+
+    result
+  end
+
   defp critical_result(config, db, call) do
     with {:session, session_key} <- call[:principal],
          %{state: "active"} <- Org.get(db, session_key),
          duration when is_integer(duration) and duration > 0 <- call.params[:for_ms],
          reason when is_binary(reason) and reason != "" <- call.params[:reason] do
       hard_cap = Map.get(config, :critical_lease_hard_cap_ms, 14_400_000)
-      lease = CriticalLeases.declare(db, session_key, duration, reason, hard_cap)
+      lease = CriticalLeases.declare(db, session_key, duration, reason, hard_cap, call)
 
       %{
         session_key: session_key,
@@ -6413,7 +6538,7 @@ defmodule Tightbeam.Gateway do
     if leased == [] do
       retired =
         Enum.map(subtree, fn member ->
-          assignments =
+          {assignments, session} =
             retire_session_in_txn(
               txn,
               member.session_key,
@@ -6423,7 +6548,7 @@ defmodule Tightbeam.Gateway do
               drain_reason
             )
 
-          %{session_key: member.session_key, assignments: assignments}
+          %{session_key: member.session_key, assignments: assignments, session: session}
         end)
 
       %{retired: retired, deferred: []}
@@ -6482,9 +6607,9 @@ defmodule Tightbeam.Gateway do
          drain_reason
        ) do
     assignments = Assignments.interrupt_for_retire_in_txn(txn, session_key, owner, principal)
-    Org.retire_in_txn(txn, session_key, principal, supervision_interval_ms)
+    session = Org.retire_in_txn(txn, session_key, principal, supervision_interval_ms)
     Ledger.drain_queued_for_retire_in_txn(txn, session_key, drain_reason)
-    assignments
+    {assignments, session}
   end
 
   # Retire durability owns the ordering: every DB transition commits before
@@ -6752,12 +6877,28 @@ defmodule Tightbeam.Gateway do
   # anti-forgery — real model output always commits with sender
   # "tightbeam", so no session can emit a marker by typing one.
   defp append_marker(db, session_key, content) do
-    case Projection.append(db, %{
-           session_key: session_key,
-           role: "assistant",
-           content: content,
-           sender: "process:tightbeam"
-         }) do
+    {:ok, outcome} =
+      DB.transaction(db, fn txn ->
+        outcome =
+          Projection.append_in_txn(txn, %{
+            session_key: session_key,
+            role: "assistant",
+            content: content,
+            sender: "process:tightbeam"
+          })
+
+        case outcome do
+          {:appended, marker} ->
+            Tightbeam.Firehose.Publisher.message_in_txn(txn, session_key, marker)
+
+          _ ->
+            :ok
+        end
+
+        outcome
+      end)
+
+    case outcome do
       # The row is committed. Pushing it is delivery, and delivery that cannot
       # run is a delay replay settles — so it never fails the change that
       # produced the marker.
@@ -6773,17 +6914,6 @@ defmodule Tightbeam.Gateway do
 
       session ->
         seq = message.seq
-
-        :ok =
-          Tightbeam.Firehose.Publisher.committed(
-            "message.created",
-            message,
-            %{
-              "messageId" => message.id,
-              "sessionKey" => session_key,
-              "ownerUserId" => session.owner_user_id
-            }
-          )
 
         Tightbeam.ConnRegistry.publish_message(
           registry,
@@ -6837,8 +6967,6 @@ defmodule Tightbeam.Gateway do
          error,
          registry \\ Tightbeam.ConnRegistry
        ) do
-    publish_turn_change(db, session_key, correlation, state)
-
     case Org.get(db, session_key) do
       nil ->
         :ok
@@ -6855,27 +6983,6 @@ defmodule Tightbeam.Gateway do
           }),
           &deliver/2
         )
-    end
-  end
-
-  defp publish_turn_change(db, session_key, correlation, state) do
-    class =
-      case state do
-        "running" -> "turn.started"
-        terminal when terminal in ~w(delivered canceled failed failed_unknown) -> "turn.ended"
-        _ -> nil
-      end
-
-    with class when is_binary(class) <- class,
-         %{} = turn <- Tightbeam.StateResources.query_turn(db, session_key, correlation) do
-      Tightbeam.Firehose.Publisher.committed(class, turn, %{
-        "turnSeq" => turn.seq,
-        "sessionKey" => session_key,
-        "assignmentId" => turn.assignment_id,
-        "workItemId" => turn.job_ref
-      })
-    else
-      _ -> :ok
     end
   end
 

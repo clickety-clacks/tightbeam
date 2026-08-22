@@ -215,6 +215,7 @@ defmodule Tightbeam.Productions.Bubble do
         case DB.Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey = ?1", [main_key]) do
           [["active"]] ->
             {:appended, marker} = Projection.append_marker_in_txn(txn, main_key, message, :high)
+            Tightbeam.Firehose.Publisher.message_in_txn(txn, main_key, marker, turn.owner)
             {:ok, marker}
 
           _ ->
@@ -224,17 +225,6 @@ defmodule Tightbeam.Productions.Bubble do
 
     case published do
       {:ok, marker} ->
-        :ok =
-          Tightbeam.Firehose.Publisher.committed(
-            "message.created",
-            marker,
-            %{
-              "messageId" => marker.id,
-              "sessionKey" => main_key,
-              "ownerUserId" => turn.owner
-            }
-          )
-
         ConnRegistry.publish_message(
           Tightbeam.ConnRegistry,
           main_key,

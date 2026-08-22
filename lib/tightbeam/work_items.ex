@@ -18,6 +18,7 @@ defmodule Tightbeam.WorkItems do
 
   alias Tightbeam.{CausalEvents, DB, IdPrefix, Org, Wakes}
   alias Tightbeam.DB.Txn
+  alias Tightbeam.Firehose.Publisher
 
   @origin "process:tightbeam"
   @default_triage_deadline_ms 86_400_000
@@ -123,10 +124,15 @@ defmodule Tightbeam.WorkItems do
                 )
               end
 
-              {:created, fetch_in_txn(txn, id), routing_wake}
+              item = fetch_in_txn(txn, id)
+              on_routing_wake_scheduled_in_txn(call).(txn, routing_wake)
+              Publisher.maybe_accepted_in_txn(txn, call, public_work_item(item))
+              {:created, item, routing_wake}
 
             item_id ->
-              {:replayed, fetch_in_txn(txn, item_id)}
+              item = fetch_in_txn(txn, item_id)
+              Publisher.maybe_accepted_in_txn(txn, call, public_work_item(item))
+              {:replayed, item}
           end
         end)
 
@@ -173,7 +179,20 @@ defmodule Tightbeam.WorkItems do
 
   defp update_result(db, call) do
     with :ok <- principal_allowed(call.principal) do
-      result = transaction(db, fn txn -> update_in_txn(txn, call.params) end)
+      result =
+        transaction(db, fn txn ->
+          result = update_in_txn(txn, call.params)
+
+          case result do
+            {:updated, item, _changed?} ->
+              Publisher.maybe_accepted_in_txn(txn, call, public_work_item(item))
+
+            _ ->
+              :ok
+          end
+
+          result
+        end)
 
       case result do
         {:updated, item, changed?} ->
@@ -293,17 +312,31 @@ defmodule Tightbeam.WorkItems do
             end
           end
 
-          case IdPrefix.resolve_in_txn(txn, :work_item, id, visible?) do
-            {:ok, resolved} ->
-              id_resolved(call, txn, :work_item, resolved)
-              dispose_in_txn(txn, call.principal, resolved, verb, reason)
+          result =
+            case IdPrefix.resolve_in_txn(txn, :work_item, id, visible?) do
+              {:ok, resolved} ->
+                id_resolved(call, txn, :work_item, resolved)
+                dispose_in_txn(txn, call.principal, resolved, verb, reason)
 
-            :unknown ->
-              unknown(id)
+              :unknown ->
+                unknown(id)
 
-            {:ambiguous, error} ->
-              error
+              {:ambiguous, error} ->
+                error
+            end
+
+          case result do
+            {:disposed, item, _changed?} ->
+              Publisher.maybe_accepted_in_txn(txn, call, %{
+                ok: true,
+                workItem: public_work_item(item)
+              })
+
+            _ ->
+              :ok
           end
+
+          result
         end)
 
       case result do
@@ -807,6 +840,9 @@ defmodule Tightbeam.WorkItems do
   defp metadata(item), do: {item.title, item.specRefName, item.specRefSha256, item.isBug}
 
   defp on_change(call), do: Map.get(call, :on_work_item_change, fn _, _ -> :ok end)
+
+  defp on_routing_wake_scheduled_in_txn(call),
+    do: Map.get(call, :on_routing_wake_scheduled_in_txn, fn _, _ -> :ok end)
 
   defp on_routing_wake_scheduled(call),
     do: Map.get(call, :on_routing_wake_scheduled, fn _ -> :ok end)

@@ -27,6 +27,7 @@ defmodule Tightbeam.Wakes do
 
   alias Tightbeam.{ConditionFacts, DB, Escalation, EventLog, Gateway}
   alias Tightbeam.DB.Txn
+  alias Tightbeam.Firehose.Publisher
 
   @type db :: GenServer.server()
 
@@ -2383,18 +2384,17 @@ defmodule Tightbeam.Wakes do
   end
 
   defp mark_fired(db, wake_id) do
-    changed? =
-      transaction!(db, fn txn ->
-        Txn.q(
-          txn,
-          "UPDATE wakes SET state = 'fired', firedAt = ?2 WHERE wakeId = ?1 AND state = 'pending'",
-          [wake_id, now()]
-        )
+    transaction!(db, fn txn ->
+      Txn.q(
+        txn,
+        "UPDATE wakes SET state = 'fired', firedAt = ?2 WHERE wakeId = ?1 AND state = 'pending'",
+        [wake_id, now()]
+      )
 
-        Txn.changes(txn) == 1
-      end)
+      if Txn.changes(txn) == 1, do: publish_change_in_txn(txn, "wake.fired", wake_id)
+    end)
 
-    if changed?, do: publish_change(db, "wake.fired", wake_id), else: :ok
+    :ok
   end
 
   defp evaluate_conditions(%{db: db, batch: batch}, mode) do
@@ -2537,7 +2537,6 @@ defmodule Tightbeam.Wakes do
 
     case result do
       {:ok, {:fired, delivery}} ->
-        publish_change(db, "wake.fired", wake_id)
         Gateway.complete_delivery(db, delivery)
 
       {:ok, _} ->
@@ -2600,6 +2599,7 @@ defmodule Tightbeam.Wakes do
           )
 
         lifecycle_for_fire(txn, wake, cause, match, delivery)
+        publish_change_in_txn(txn, "wake.fired", wake.wake_id)
         {:fired, delivery}
       else
         :noop
@@ -2611,16 +2611,19 @@ defmodule Tightbeam.Wakes do
 
   defp fire_in_txn(_txn, _wake), do: :noop
 
-  defp publish_change(db, class, wake_id) do
-    case get(db, wake_id) do
-      nil ->
-        :ok
+  @doc false
+  def publish_change_in_txn(%Txn{} = txn, class, wake_id) do
+    case Txn.q(txn, select_wake_sql() <> " WHERE wakeId = ?1", [wake_id]) do
+      [row] ->
+        wake = to_wake(row)
 
-      wake ->
-        Tightbeam.Firehose.Publisher.committed(class, wake, %{
+        Publisher.committed_in_txn(txn, class, wake, %{
           "wakeId" => wake_id,
           "sessionKey" => wake.session_key
         })
+
+      [] ->
+        :ok
     end
   end
 

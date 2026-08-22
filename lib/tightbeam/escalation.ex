@@ -9,6 +9,7 @@ defmodule Tightbeam.Escalation do
 
   alias Tightbeam.{ConditionFacts, DB, EventLog, IdPrefix, Org, Roles, Wakes}
   alias Tightbeam.DB.Txn
+  alias Tightbeam.Firehose.Publisher
 
   @default_decision_deadline_ms 86_400_000
 
@@ -396,7 +397,8 @@ defmodule Tightbeam.Escalation do
         asked_of_role: Map.get(call, :target_role),
         role_fallback: Map.get(call, :role_fallback, false) == true,
         question: text,
-        assignment_id: assignment_id(call)
+        assignment_id: assignment_id(call),
+        firehose_call: call
       })
     else
       {:error, error} -> error
@@ -438,7 +440,12 @@ defmodule Tightbeam.Escalation do
               error("not_open", "decision request is not open")
 
             true ->
-              answer_open(db, request, String.trim(text), answered_by(call))
+              answer_open(
+                db,
+                Map.put(request, :firehose_call, call),
+                String.trim(text),
+                answered_by(call)
+              )
           end
         else
           error("not_found", "decision request not found")
@@ -515,7 +522,9 @@ defmodule Tightbeam.Escalation do
                class: "input-needed"
              })
 
-             request_in_txn(txn, request_id)
+             request = request_in_txn(txn, request_id)
+             Publisher.maybe_accepted_in_txn(txn, input.firehose_call, request)
+             request
            else
              {:error, error} -> error
            end
@@ -560,7 +569,9 @@ defmodule Tightbeam.Escalation do
             target_gate: 0
           })
 
-          request_in_txn(txn, request.id)
+          answered = request_in_txn(txn, request.id)
+          Publisher.maybe_accepted_in_txn(txn, request.firehose_call, answered)
+          answered
         else
           error("not_open", "decision request is not open")
         end
@@ -743,10 +754,17 @@ defmodule Tightbeam.Escalation do
          {:ok, decision} <- resolve_decision(request, param(call, :decision)) do
       case request.status do
         status when status in ["ruled", "consumed"] and request.decision == decision ->
-          request
+          publish_request_replay(db, call, request)
 
         "open" ->
-          rule_open(db, request, decision, param(call, :rationale), call.origin, opts)
+          rule_open(
+            db,
+            request,
+            decision,
+            param(call, :rationale),
+            call.origin,
+            Keyword.put(opts, :firehose_call, call)
+          )
 
         _ ->
           error("not_open", "decision request is not open")
@@ -872,7 +890,7 @@ defmodule Tightbeam.Escalation do
             error("not_raiser", "raiser required")
 
           request ->
-            withdraw_open(db, request, call.origin, reason)
+            withdraw_open(db, Map.put(request, :firehose_call, call), call.origin, reason)
         end
     end
   end
@@ -1574,15 +1592,20 @@ defmodule Tightbeam.Escalation do
             "by=#{origin} decision=#{decision} factId=#{fact_id}"
           )
 
-          {request_in_txn(txn, request.id), fact_id}
+          ruled = request_in_txn(txn, request.id)
+          Publisher.maybe_accepted_in_txn(txn, opts[:firehose_call], ruled)
+          {ruled, fact_id}
         else
           current = request_in_txn(txn, request.id)
 
           # A concurrent-ruler loser filed nothing: it must not nudge (F13 —
           # one post-commit nudge per filed fact, owned by the filer).
-          if current.status == "ruled" and current.decision == decision,
-            do: {current, nil},
-            else: {error("not_open", "decision request is not open"), nil}
+          if current.status == "ruled" and current.decision == decision do
+            Publisher.maybe_accepted_in_txn(txn, opts[:firehose_call], current)
+            {current, nil}
+          else
+            {error("not_open", "decision request is not open"), nil}
+          end
         end
       end)
 
@@ -1681,13 +1704,24 @@ defmodule Tightbeam.Escalation do
             "by=#{by} reason=#{reason}"
           )
 
-          request_in_txn(txn, request.id)
+          withdrawn = request_in_txn(txn, request.id)
+          Publisher.maybe_accepted_in_txn(txn, request.firehose_call, withdrawn)
+          withdrawn
         else
           error("not_open", "decision request is not open")
         end
       end)
 
     result
+  end
+
+  defp publish_request_replay(db, call, request) do
+    {:ok, :ok} =
+      DB.transaction(db, fn txn ->
+        Publisher.maybe_accepted_in_txn(txn, call, request)
+      end)
+
+    request
   end
 
   defp resolve_decision(_request, decision) when decision in ["allow", "deny"],

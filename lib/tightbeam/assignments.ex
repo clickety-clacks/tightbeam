@@ -5,6 +5,7 @@ defmodule Tightbeam.Assignments do
 
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
+  alias Tightbeam.Firehose.Publisher
   alias Tightbeam.Harness.Support
 
   alias Tightbeam.{
@@ -805,14 +806,31 @@ defmodule Tightbeam.Assignments do
 
       result =
         transaction(db, fn txn ->
-          case open_assignment_in_txn(txn, call, owner, key, files, verb) do
-            {:created, assignment} ->
-              created = after_create.(txn, assignment)
-              accept_assignment_in_txn(created, txn, call)
+          result =
+            case open_assignment_in_txn(txn, call, owner, key, files, verb) do
+              {:created, assignment} ->
+                created = after_create.(txn, assignment)
+                accept_assignment_in_txn(created, txn, call)
 
-            other ->
-              other
+              other ->
+                other
+            end
+
+          case result do
+            {:accepted_in_txn, _event_id, {:created, assignment, _delivery}} ->
+              Publisher.maybe_accepted_in_txn(txn, call, assignment)
+
+            {:created, assignment, _delivery} ->
+              Publisher.maybe_accepted_in_txn(txn, call, assignment)
+
+            {:replayed, assignment} ->
+              Publisher.maybe_accepted_in_txn(txn, call, assignment)
+
+            _ ->
+              :ok
           end
+
+          result
         end)
 
       case result do
@@ -902,21 +920,27 @@ defmodule Tightbeam.Assignments do
 
       result =
         transaction(db, fn txn ->
-          case IdPrefix.resolve_in_txn(txn, :assignment, supplied) do
-            {:ok, id} ->
-              id_resolved(call, txn, :assignment, id)
-              resolved_call = put_in(call, [:params, :assignment_id], id)
+          result =
+            case IdPrefix.resolve_in_txn(txn, :assignment, supplied) do
+              {:ok, id} ->
+                id_resolved(call, txn, :assignment, id)
+                resolved_call = put_in(call, [:params, :assignment_id], id)
 
-              with :ok <- commit_ref_filing_allowed_in_txn(txn, resolved_call) do
-                attest_in_txn(txn, resolved_call)
-              end
+                with :ok <- commit_ref_filing_allowed_in_txn(txn, resolved_call) do
+                  attest_in_txn(txn, resolved_call)
+                end
 
-            :unknown ->
-              error("unknown_assignment", "unknown assignment: #{supplied}")
+              :unknown ->
+                error("unknown_assignment", "unknown assignment: #{supplied}")
 
-            {:ambiguous, error} ->
-              error
-          end
+              {:ambiguous, error} ->
+                error
+            end
+
+          if is_map(result) and not Map.has_key?(result, :code),
+            do: Publisher.maybe_accepted_in_txn(txn, call, result)
+
+          result
         end)
 
       if not Map.has_key?(result, :code) and match?({_id, {:ok, _}}, from) do
@@ -1101,17 +1125,23 @@ defmodule Tightbeam.Assignments do
             end
           end
 
-          case IdPrefix.resolve_in_txn(txn, :assignment, supplied, visible?) do
-            {:ok, id} ->
-              id_resolved(call, txn, :assignment, id)
-              revoke_in_txn(txn, put_in(call, [:params, :assignment_id], id))
+          result =
+            case IdPrefix.resolve_in_txn(txn, :assignment, supplied, visible?) do
+              {:ok, id} ->
+                id_resolved(call, txn, :assignment, id)
+                revoke_in_txn(txn, put_in(call, [:params, :assignment_id], id))
 
-            :unknown ->
-              error("unknown_assignment", "unknown assignment: #{supplied}")
+              :unknown ->
+                error("unknown_assignment", "unknown assignment: #{supplied}")
 
-            {:ambiguous, error} ->
-              error
-          end
+              {:ambiguous, error} ->
+                error
+            end
+
+          if is_map(result) and not Map.has_key?(result, :code),
+            do: Publisher.maybe_accepted_in_txn(txn, call, result)
+
+          result
         end)
 
       if not Map.has_key?(result, :code) and match?({_id, {:ok, _}}, from) do
@@ -1160,17 +1190,23 @@ defmodule Tightbeam.Assignments do
             end
           end
 
-          case IdPrefix.resolve_in_txn(txn, :assignment, supplied, visible?) do
-            {:ok, id} ->
-              id_resolved(call, txn, :assignment, id)
-              reopen_in_txn(txn, put_in(call, [:params, :assignment_id], id))
+          result =
+            case IdPrefix.resolve_in_txn(txn, :assignment, supplied, visible?) do
+              {:ok, id} ->
+                id_resolved(call, txn, :assignment, id)
+                reopen_in_txn(txn, put_in(call, [:params, :assignment_id], id))
 
-            :unknown ->
-              error("unknown_assignment", "unknown assignment: #{supplied}")
+              :unknown ->
+                error("unknown_assignment", "unknown assignment: #{supplied}")
 
-            {:ambiguous, error} ->
-              error
-          end
+              {:ambiguous, error} ->
+                error
+            end
+
+          if is_map(result) and not Map.has_key?(result, :code),
+            do: Publisher.maybe_accepted_in_txn(txn, call, result)
+
+          result
         end)
 
       if not Map.has_key?(result, :code) and match?({_id, {:ok, _}}, from) do

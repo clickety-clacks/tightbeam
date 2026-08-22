@@ -19,6 +19,7 @@ defmodule Tightbeam.Ledger do
 
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
+  alias Tightbeam.Firehose.Publisher
 
   require Logger
 
@@ -254,6 +255,8 @@ defmodule Tightbeam.Ledger do
                   [session_key]
                 )
 
+              Publisher.turn_in_txn(txn, "turn.started", seq)
+
               {:ok,
                %{
                  seq: seq,
@@ -334,21 +337,25 @@ defmodule Tightbeam.Ledger do
   def fail_unclaimable(db \\ Tightbeam.DB, session_key, reason) do
     {:ok, seqs} =
       DB.transaction(db, fn txn ->
-        txn
-        |> Txn.q(
-          """
-          UPDATE turns SET status = 'failed', endedAt = ?2, error = ?3
-          WHERE sessionKey = ?1 AND status = 'queued'
-            AND NOT EXISTS (
-              SELECT 1 FROM sessions AS s
-              WHERE s.sessionKey = ?1 AND s.state = 'active'
-            )
-          RETURNING seq
-          """,
-          [session_key, System.system_time(:millisecond), unclaimable_error(reason)]
-        )
-        |> Enum.map(&hd/1)
-        |> Enum.sort()
+        seqs =
+          txn
+          |> Txn.q(
+            """
+            UPDATE turns SET status = 'failed', endedAt = ?2, error = ?3
+            WHERE sessionKey = ?1 AND status = 'queued'
+              AND NOT EXISTS (
+                SELECT 1 FROM sessions AS s
+                WHERE s.sessionKey = ?1 AND s.state = 'active'
+              )
+            RETURNING seq
+            """,
+            [session_key, System.system_time(:millisecond), unclaimable_error(reason)]
+          )
+          |> Enum.map(&hd/1)
+          |> Enum.sort()
+
+        Enum.each(seqs, &Publisher.turn_in_txn(txn, "turn.ended", &1))
+        seqs
       end)
 
     seqs
@@ -387,7 +394,9 @@ defmodule Tightbeam.Ledger do
       [seq, terminal, now, error]
     )
 
-    Txn.changes(txn) == 1
+    changed? = Txn.changes(txn) == 1
+    if changed?, do: Publisher.turn_in_txn(txn, "turn.ended", seq)
+    changed?
   end
 
   @doc """
@@ -415,7 +424,9 @@ defmodule Tightbeam.Ledger do
       [session_key, System.system_time(:millisecond), reason]
     )
 
-    Enum.map(rows, &hd/1)
+    seqs = Enum.map(rows, &hd/1)
+    Enum.each(seqs, &Publisher.turn_in_txn(txn, "turn.ended", &1))
+    seqs
   end
 
   @doc """
@@ -442,6 +453,7 @@ defmodule Tightbeam.Ledger do
           [now]
         )
 
+        Enum.each(seqs, &Publisher.turn_in_txn(txn, "turn.ended", &1))
         seqs
       end)
 
