@@ -10087,7 +10087,9 @@ defmodule Tightbeam.GatewayTest do
     _ = :sys.get_state(Hub)
 
     receive do
-      {:firehose_notice, %{"class" => class}} -> observed_state_classes([class | acc])
+      {:firehose_notice, %{"class" => class}} ->
+        Hub.delivered(Hub, self())
+        observed_state_classes([class | acc])
     after
       0 ->
         acc

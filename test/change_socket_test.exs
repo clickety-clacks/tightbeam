@@ -59,12 +59,20 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
       "payload" => %{"id" => "wi_1", "ownerUserId" => "flynn", "rowVersion" => 1}
     }
 
-    assert {:push, frames, state} = ChangeSocket.handle_info({:firehose_notice, notice}, state)
-    decoded = Enum.map(frames, fn {:text, bytes} -> JSON.decode!(bytes) end)
+    Hub.publish(ctx.hub, notice)
+
+    decoded =
+      Enum.map(1..2, fn _ ->
+        assert_receive {:firehose_notice, frame}
+
+        assert {:push, {:text, bytes}, ^state} =
+                 ChangeSocket.handle_info({:firehose_notice, frame}, state)
+
+        JSON.decode!(bytes)
+      end)
 
     assert Enum.map(decoded, & &1["subscriptionId"]) |> Enum.sort() == ["all-work", "work"]
     assert Enum.map(decoded, & &1["seq"]) |> Enum.sort() == [1, 2]
-    assert state.seq == 2
   end
 
   test "the 101st subscription is a typed invalid_request", ctx do
@@ -102,23 +110,90 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
     {:push, {:text, _auth}, state} =
       inbound(%{"type" => "auth", "token" => ctx.device.token}, ctx.state)
 
-    state = %{state | seq: 7}
+    {:push, {:text, _ready}, state} =
+      inbound(
+        %{"type" => "subscribe", "protocolVersion" => 1, "subscriptionId" => "all"},
+        state
+      )
+
+    Hub.publish(ctx.hub, notice("wi_trailing"))
+    assert_receive {:firehose_notice, _suppressed_delivery}
+
     assert {:push, {:text, bytes}, _state} = ChangeSocket.handle_info(:firehose_heartbeat, state)
-    assert JSON.decode!(bytes) == %{"type" => "heartbeat", "seq" => 7}
+    assert JSON.decode!(bytes) == %{"type" => "heartbeat", "seq" => 1}
   end
 
   test "a retirement affecting the authenticated owner closes with policy code", ctx do
     {:push, {:text, _auth}, state} =
       inbound(%{"type" => "auth", "token" => ctx.device.token}, ctx.state)
 
-    notice = %{
+    retirement = %{
       "class" => "session.retired",
       "refs" => %{"sessionKey" => "agent:worker"},
       "payload" => %{"sessionKey" => "agent:worker", "ownerUserId" => "flynn"}
     }
 
+    Hub.publish(ctx.hub, retirement)
+    assert_receive :firehose_revoked
+
     assert {:stop, :normal, 1008, ^state} =
-             ChangeSocket.handle_info({:firehose_notice, notice}, state)
+             ChangeSocket.handle_info(:firehose_revoked, state)
+  end
+
+  test "publication before the registration cut is never delivered", ctx do
+    {:push, {:text, _auth}, _state} =
+      inbound(%{"type" => "auth", "token" => ctx.device.token}, ctx.state)
+
+    socket = self()
+    :ok = :sys.suspend(ctx.hub)
+    Hub.publish(ctx.hub, notice("wi_before"))
+    subscribe = Task.async(fn -> Hub.subscribe(ctx.hub, socket, "work", %{}) end)
+    :ok = :sys.resume(ctx.hub)
+    assert :ok = Task.await(subscribe)
+    refute_receive {:firehose_notice, _notice}, 50
+
+    Hub.publish(ctx.hub, notice("wi_after"))
+    assert_receive {:firehose_notice, %{"refs" => %{"workItemId" => "wi_after"}, "seq" => 1}}
+  end
+
+  test "the per-connection queue is exact and overflow closes once", ctx do
+    {:push, {:text, _auth}, _state} =
+      inbound(%{"type" => "auth", "token" => ctx.device.token}, ctx.state)
+
+    :ok = Hub.subscribe(ctx.hub, self(), "work", %{})
+
+    Enum.each(1..1_500, fn index -> Hub.publish(ctx.hub, notice("wi_#{index}")) end)
+
+    assert %{in_flight: true, overflowed: true, queued: 0, seq: 1_001} =
+             Hub.connection_stats(ctx.hub, self())
+
+    assert_receive {:firehose_notice, %{"seq" => 1}}
+    assert_receive :firehose_overflow
+    refute_receive :firehose_overflow, 50
+    refute_receive {:firehose_notice, _notice}, 50
+  end
+
+  test "gateway shutdown closes change sockets with restarting code", ctx do
+    {:push, {:text, _auth}, state} =
+      inbound(%{"type" => "auth", "token" => ctx.device.token}, ctx.state)
+
+    shutdown = Task.async(fn -> Hub.shutdown(ctx.hub) end)
+    assert_receive :firehose_shutdown
+    refute Task.yield(shutdown, 0)
+    assert {:stop, :normal, 1012, ^state} = ChangeSocket.handle_info(:firehose_shutdown, state)
+    assert :ok = Task.await(shutdown)
+  end
+
+  test "gateway shutdown closes an upgraded pre-auth socket with restarting code", ctx do
+    state = ctx.state
+    shutdown = Task.async(fn -> Hub.shutdown(ctx.hub) end)
+    assert_receive :firehose_shutdown
+    refute Task.yield(shutdown, 0)
+
+    assert {:stop, :normal, 1012, ^state} =
+             ChangeSocket.handle_info(:firehose_shutdown, state)
+
+    assert :ok = Task.await(shutdown)
   end
 
   test "registry rows are both-way unique and cover effects from the real gateway table", ctx do
@@ -207,5 +282,16 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
     end
 
     :ok
+  end
+
+  defp notice(id) do
+    %{
+      "class" => "work_item.updated",
+      "resource" => "work-items",
+      "op" => "upsert",
+      "occurredAt" => 1,
+      "refs" => %{"workItemId" => id, "ownerUserId" => "flynn"},
+      "payload" => %{"id" => id, "ownerUserId" => "flynn", "rowVersion" => 1}
+    }
   end
 end

@@ -40,16 +40,15 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     assert {:ok, item} = Dispatch.dispatch(db, handlers, call)
 
-    assert_receive {:firehose_notice,
-                    %{
-                      "class" => "wake.scheduled",
-                      "refs" => %{"wakeId" => wake_id, "workItemId" => work_item_id}
-                    }}
+    assert %{
+             "class" => "wake.scheduled",
+             "refs" => %{"wakeId" => wake_id, "workItemId" => work_item_id}
+           } = receive_notice()
 
     assert work_item_id == item.id
     assert Wakes.get(db, wake_id).work_item_id == item.id
-    assert_receive {:firehose_notice, %{"class" => "verb.accepted"}}
-    assert_receive {:firehose_notice, %{"class" => "work_item.created"}}
+    assert %{"class" => "verb.accepted"} = receive_notice()
+    assert %{"class" => "work_item.created"} = receive_notice()
 
     declared = Gateway.handler_effects(%{db: db})["work-item-create"]
     observed = ["wake.scheduled", "work_item.created"]
@@ -61,8 +60,8 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     assert {:ok, replay} = Dispatch.dispatch(db, handlers, call)
     assert replay.id == item.id
-    assert_receive {:firehose_notice, %{"class" => "verb.accepted"}}
-    assert_receive {:firehose_notice, %{"class" => "work_item.created"}}
+    assert %{"class" => "verb.accepted"} = receive_notice()
+    assert %{"class" => "work_item.created"} = receive_notice()
     refute_receive {:firehose_notice, %{"class" => "wake.scheduled"}}
   end
 
@@ -102,11 +101,10 @@ defmodule Tightbeam.Firehose.PublisherTest do
                authenticated_device_message: true
              )
 
-    assert_receive {:firehose_notice,
-                    %{
-                      "class" => "message.created",
-                      "payload" => %{"content" => "exact A1 post reproduction"}
-                    }}
+    assert %{
+             "class" => "message.created",
+             "payload" => %{"content" => "exact A1 post reproduction"}
+           } = receive_notice()
 
     declared = Gateway.handler_effects(%{db: db})["post"]
     observed = ["message.created"]
@@ -279,11 +277,12 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert {:error, %{code: "server_error", message: "review boom"}} =
              Dispatch.dispatch(db, %{"work-item-create" => fn _ -> raise "review boom" end}, call)
 
-    assert_receive {:firehose_notice,
-                    %{
-                      "class" => "verb.denied",
-                      "payload" => %{"code" => "server_error", "verb" => "work-item-create"}
-                    }}
+    assert %{
+             "class" => "verb.denied",
+             "payload" => %{"code" => "server_error", "verb" => "work-item-create"}
+           } = receive_notice()
+
+    _ = :sys.get_state(Hub)
 
     refute_receive {:firehose_notice, %{"class" => "verb.accepted"}}
     refute_receive {:firehose_notice, %{"class" => "work_item.created"}}
@@ -308,19 +307,18 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     assert :ok = Publisher.accepted(call, result)
 
-    assert_receive {:firehose_notice,
-                    %{"class" => "verb.accepted", "op" => "observe", "refs" => refs}}
+    assert %{"class" => "verb.accepted", "op" => "observe", "refs" => refs} =
+             receive_notice()
 
     assert refs["origin"] == "user:flynn"
 
-    assert_receive {:firehose_notice,
-                    %{
-                      "class" => "work_item.updated",
-                      "resource" => "work-items",
-                      "op" => "upsert",
-                      "refs" => %{"workItemId" => "wi_1"},
-                      "payload" => payload
-                    }}
+    assert %{
+             "class" => "work_item.updated",
+             "resource" => "work-items",
+             "op" => "upsert",
+             "refs" => %{"workItemId" => "wi_1"},
+             "payload" => payload
+           } = receive_notice()
 
     assert payload["id"] == "wi_1"
     assert payload["rowVersion"] == 123
@@ -334,7 +332,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
                %{assignments: []}
              )
 
-    assert_receive {:firehose_notice, %{"class" => "verb.accepted"}}
+    assert %{"class" => "verb.accepted"} = receive_notice()
     refute_receive {:firehose_notice, _notice}
   end
 
@@ -346,12 +344,11 @@ defmodule Tightbeam.Firehose.PublisherTest do
                %{"ownerUserId" => "flynn", "sessionKey" => "agent:one"}
              )
 
-    assert_receive {:firehose_notice,
-                    %{
-                      "class" => "message.created",
-                      "refs" => %{"messageId" => "s_1"},
-                      "payload" => %{"id" => "s_1", "rowVersion" => 9}
-                    }}
+    assert %{
+             "class" => "message.created",
+             "refs" => %{"messageId" => "s_1"},
+             "payload" => %{"id" => "s_1", "rowVersion" => 9}
+           } = receive_notice()
   end
 
   test "a role delete carries its last visible pre-delete row" do
@@ -372,15 +369,14 @@ defmodule Tightbeam.Firehose.PublisherTest do
     :ok = Tightbeam.Roles.rm(db, "worker")
     :ok = Publisher.accepted(db, captured, %{removed: "worker"})
 
-    assert_receive {:firehose_notice, %{"class" => "verb.accepted"}}
+    assert %{"class" => "verb.accepted"} = receive_notice()
 
-    assert_receive {:firehose_notice,
-                    %{
-                      "class" => "role.removed",
-                      "op" => "delete",
-                      "refs" => %{"role" => "worker"},
-                      "payload" => %{"role" => "worker", "ownerUserId" => "flynn"}
-                    }}
+    assert %{
+             "class" => "role.removed",
+             "op" => "delete",
+             "refs" => %{"role" => "worker"},
+             "payload" => %{"role" => "worker", "ownerUserId" => "flynn"}
+           } = receive_notice()
   end
 
   test "a rail denial emits both observational classes" do
@@ -394,13 +390,12 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     :ok = Publisher.denied(call, %{code: "rule_denied", rule: "tests-before-success"})
 
-    assert_receive {:firehose_notice, %{"class" => "verb.denied"}}
+    assert %{"class" => "verb.denied"} = receive_notice()
 
-    assert_receive {:firehose_notice,
-                    %{
-                      "class" => "rail.denied",
-                      "payload" => %{"rule" => "tests-before-success", "verb" => "attest"}
-                    }}
+    assert %{
+             "class" => "rail.denied",
+             "payload" => %{"rule" => "tests-before-success", "verb" => "attest"}
+           } = receive_notice()
   end
 
   test "condition and critical projections carry stable ids and last-version-wins" do
@@ -458,12 +453,20 @@ defmodule Tightbeam.Firehose.PublisherTest do
     _ = :sys.get_state(Hub)
 
     receive do
-      {:firehose_notice, %{"class" => class}} -> observed_state_classes([class | acc])
+      {:firehose_notice, %{"class" => class}} ->
+        Hub.delivered(Hub, self())
+        observed_state_classes([class | acc])
     after
       0 ->
         acc
         |> Enum.filter(&match?({:ok, _row}, Tightbeam.Firehose.Registry.fetch(&1)))
         |> Enum.reverse()
     end
+  end
+
+  defp receive_notice do
+    assert_receive {:firehose_notice, notice}
+    Hub.delivered(Hub, self())
+    notice
   end
 end
