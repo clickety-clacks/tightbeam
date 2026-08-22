@@ -247,44 +247,58 @@ defmodule Tightbeam.SessionLane do
   end
 
   defp finalize(state, seq, outcome) do
-    {terminal, error, publish, in_txn} =
+    {terminal, error, publish, in_txn, after_commit} =
       case outcome do
         {:ok, %{terminal_publish: fun}} when is_function(fun, 1) ->
-          {"delivered", nil, fun, nil}
+          {"delivered", nil, fun, nil, nil}
 
         {:ok, _} ->
-          {"delivered", nil, nil, nil}
+          {"delivered", nil, nil, nil, nil}
+
+        {:error,
+         %{
+           reason: reason,
+           terminal_publish: fun,
+           record_in_txn: action,
+           after_commit: committed
+         }}
+        when is_function(fun, 1) and is_function(action, 1) and is_function(committed, 1) ->
+          {"failed", error_text(reason), fun, action, committed}
 
         {:error, %{reason: reason, terminal_publish: fun, record_in_txn: action}}
         when is_function(fun, 1) and is_function(action, 1) ->
-          {"failed", error_text(reason), fun, action}
+          {"failed", error_text(reason), fun, action, nil}
 
         {:error, %{reason: reason, terminal_publish: fun}} when is_function(fun, 1) ->
-          {"failed", error_text(reason), fun, nil}
+          {"failed", error_text(reason), fun, nil, nil}
 
         {:error, reason} ->
-          {"failed", error_text(reason), nil, nil}
+          {"failed", error_text(reason), nil, nil, nil}
       end
 
-    finish_result =
+    {finish_result, recorded} =
       if in_txn do
-        {:ok, won} =
+        {:ok, result} =
           DB.transaction(state.db, fn txn ->
             if Ledger.finish_in_txn(txn, seq, terminal, error) do
-              in_txn.(txn)
-              true
+              {:won, in_txn.(txn)}
             else
-              false
+              :already_terminal
             end
           end)
 
-        if won, do: :ok, else: :already_terminal
+        case result do
+          {:won, value} -> {:ok, value}
+          :already_terminal -> {:already_terminal, nil}
+        end
       else
-        Ledger.finish(state.db, seq, terminal, error)
+        {Ledger.finish(state.db, seq, terminal, error), nil}
       end
 
     case finish_result do
       :ok ->
+        if after_commit, do: after_commit.(recorded)
+
         if publish do
           publish.(terminal)
         else

@@ -322,46 +322,73 @@ defmodule Tightbeam.EventLog do
   """
   @spec notice(db(), String.t(), String.t(), String.t() | nil, keyword()) :: :ok
   def notice(db \\ Tightbeam.DB, kind, subject, detail, opts) do
-    audience = Keyword.fetch!(opts, :audience)
+    notice_fields!(opts)
 
-    {message, attention} =
-      case audience do
-        :record_only ->
-          {nil, nil}
-
-        _ ->
-          {Keyword.fetch!(opts, :message), Keyword.fetch!(opts, :attention)}
-      end
-
-    {:ok, {appended, undeliverable}} =
+    {:ok, delivery} =
       DB.transaction(db, fn txn ->
-        lifecycle_in_txn(txn, kind, subject, detail)
-
-        # The record and the markers commit together: a crash between them
-        # would leave exactly the split this function exists to prevent.
-        Enum.reduce(candidates(audience), {[], []}, fn session_key, {appended, undeliverable} ->
-          case active_owner(txn, session_key) do
-            nil ->
-              {appended, [session_key | undeliverable]}
-
-            owner ->
-              {:appended, marker} =
-                Projection.append_marker_in_txn(txn, session_key, message, attention)
-
-              {[{session_key, owner, marker} | appended], undeliverable}
-          end
-        end)
+        notice_in_txn(txn, kind, subject, detail, opts)
       end)
 
+    complete_notice(delivery, opts)
+  end
+
+  @doc "Record a notice inside an existing transaction; publish it only after commit."
+  @spec notice_in_txn(Txn.t(), String.t(), String.t(), String.t() | nil, keyword()) :: map()
+  def notice_in_txn(%Txn{} = txn, kind, subject, detail, opts) do
+    {audience, message, attention} = notice_fields!(opts)
+
+    lifecycle_in_txn(txn, kind, subject, detail)
+
+    # The record and the markers commit together: a crash between them
+    # would leave exactly the split this function exists to prevent.
+    {appended, undeliverable} =
+      Enum.reduce(candidates(audience), {[], []}, fn session_key, {appended, undeliverable} ->
+        case active_owner(txn, session_key) do
+          nil ->
+            {appended, [session_key | undeliverable]}
+
+          owner ->
+            {:appended, marker} =
+              Projection.append_marker_in_txn(txn, session_key, message, attention)
+
+            {[{session_key, owner, marker} | appended], undeliverable}
+        end
+      end)
+
+    %{kind: kind, subject: subject, appended: appended, undeliverable: undeliverable}
+  end
+
+  @doc "Publish the live half of a notice whose transaction committed."
+  @spec complete_notice(map() | nil, keyword()) :: :ok
+  def complete_notice(delivery, opts \\ [])
+
+  def complete_notice(nil, _opts), do: :ok
+
+  def complete_notice(delivery, opts) do
     registry = Keyword.get(opts, :conn_registry, ConnRegistry)
 
-    Enum.each(Enum.reverse(undeliverable), fn session_key ->
+    Enum.each(Enum.reverse(delivery.undeliverable), fn session_key ->
       Logger.info(
-        "#{kind} for #{subject} was not delivered to #{session_key}: no active session there"
+        "#{delivery.kind} for #{delivery.subject} was not delivered to #{session_key}: " <>
+          "no active session there"
       )
     end)
 
-    Enum.each(Enum.reverse(appended), &publish_marker(registry, &1))
+    Enum.each(Enum.reverse(delivery.appended), &publish_marker(registry, &1))
+
+    :ok
+  end
+
+  defp notice_fields!(opts) do
+    audience = Keyword.fetch!(opts, :audience)
+
+    case audience do
+      :record_only ->
+        {audience, nil, nil}
+
+      _ ->
+        {audience, Keyword.fetch!(opts, :message), Keyword.fetch!(opts, :attention)}
+    end
   end
 
   defp candidates(:record_only), do: []
