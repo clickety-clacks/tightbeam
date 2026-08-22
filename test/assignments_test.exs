@@ -1224,6 +1224,94 @@ defmodule Tightbeam.AssignmentsTest do
     assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == []
   end
 
+  test "a later revoked verdictless review cannot displace holder-reviewed-clean", ctx do
+    producer = handle(ctx, "assign", assign_call({:user, "flynn"}, "Surf Ace producer"))
+
+    clean_review =
+      assign_call({:user, "flynn"}, "independent clean review")
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :reviews_assignment_id], producer.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    _ =
+      attest_call({:session, "other-session"}, clean_review.id, "verdict")
+      |> put_in([:params, :verdict_kind], "reviewed-clean")
+      |> then(&handle(ctx, "attest", &1))
+
+    _ =
+      handle(
+        ctx,
+        "attest",
+        attest_call({:session, "other-session"}, clean_review.id, "completion")
+      )
+
+    verdictless_review =
+      assign_call({:user, "flynn"}, "later verdictless review")
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :reviews_assignment_id], producer.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    _ =
+      handle(
+        ctx,
+        "revoke-assignment",
+        revoke_call({:user, "flynn"}, verdictless_review.id)
+      )
+
+    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == [
+             "reviewed-clean"
+           ]
+
+    completed =
+      handle(ctx, "attest", attest_call({:session, "holder"}, producer.id, "completion"))
+
+    assert completed.assignment.state == "closed"
+    assert completed.assignment.outcome == "completed"
+  end
+
+  test "the exact newest holder verdict row still controls review and independence", ctx do
+    producer = handle(ctx, "assign", assign_call({:user, "flynn"}, "verdict ordering"))
+
+    older =
+      assign_call({:user, "flynn"}, "older review")
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :reviews_assignment_id], producer.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    newer =
+      assign_call({:user, "flynn"}, "newer self-held review")
+      |> put_in([:params, :reviews_assignment_id], producer.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    _ =
+      attest_call({:session, "other-session"}, older.id, "verdict")
+      |> put_in([:params, :verdict_kind], "reviewed-clean")
+      |> then(&handle(ctx, "attest", &1))
+
+    _ =
+      attest_call({:session, "holder"}, newer.id, "verdict")
+      |> put_in([:params, :verdict_kind], "reviewed-clean")
+      |> then(&handle(ctx, "attest", &1))
+
+    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == []
+
+    _ =
+      attest_call({:session, "other-session"}, older.id, "verdict")
+      |> put_in([:params, :verdict_kind], "changes-requested")
+      |> then(&handle(ctx, "attest", &1))
+
+    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == []
+
+    _ =
+      attest_call({:session, "other-session"}, older.id, "verdict")
+      |> put_in([:params, :verdict_kind], "reviewed-clean")
+      |> then(&handle(ctx, "attest", &1))
+
+    assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == [
+             "reviewed-clean"
+           ]
+  end
+
   test "prefixed idempotency scopes disjoint equal user and session strings", ctx do
     user = handle(ctx, "assign", assign_call({:user, "holder"}, "user", "collision"))
     session = handle(ctx, "assign", assign_call({:session, "holder"}, "session", "collision"))
