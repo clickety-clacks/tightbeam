@@ -1729,13 +1729,37 @@ defmodule FeatureSmoke do
   end
 
   defp redeploy!(state, session_key) do
-    ok!(state, "tune", %{
+    current_harness = recorded_harness(state, session_key)
+
+    params = %{
       "sessionKey" => session_key,
-      "setting" => "set_harness",
-      "harness" => state.leg.wire_name,
+      "setting" =>
+        if(current_harness == state.leg.wire_name, do: "set_model", else: "set_harness"),
       "model" => state.leg.model,
       "effort" => state.leg.effort
-    })
+    }
+
+    params =
+      if current_harness == state.leg.wire_name,
+        do: params,
+        else: Map.put(params, "harness", state.leg.wire_name)
+
+    ok!(state, "tune", params)
+  end
+
+  defp recorded_harness(state, session_key) do
+    db = Path.join(state.base_dir, "state.db")
+
+    {out, 0} =
+      System.cmd("sqlite3", [
+        db,
+        "SELECT harness FROM sessions WHERE sessionKey = #{sql_quote(session_key)}"
+      ])
+
+    case String.trim(out) do
+      "" -> fail(state, "no recorded harness for session #{session_key}")
+      harness -> harness
+    end
   end
 
   # --- facts-read: file a condition fact, read it back -----------------------
