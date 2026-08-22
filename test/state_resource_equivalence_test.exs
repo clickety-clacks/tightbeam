@@ -76,7 +76,8 @@ defmodule Tightbeam.StateResourceEquivalenceTest do
       assert notice["op"] == row.op, class
       assert JSON.encode!(detail) == JSON.encode!(notice["payload"]), class
 
-      expected_primary_id = detail[row.primary_ref] || detail["id"]
+      expected_primary_id = Map.fetch!(detail, row.projection_primary_key)
+      refute is_nil(expected_primary_id), class
       assert notice["refs"][row.primary_ref] == expected_primary_id, class
       assert is_integer(detail["rowVersion"]), class
 
@@ -113,6 +114,16 @@ defmodule Tightbeam.StateResourceEquivalenceTest do
     end)
 
     assert map_size(rows) == 33
+  end
+
+  test "committed notices reject missing declared projection primary ids" do
+    assert_raise ArgumentError, ~r/wake\.scheduled.*wakeId/, fn ->
+      Publisher.committed_notice("wake.scheduled", %{id: "generic-id"}, %{})
+    end
+
+    assert_raise ArgumentError, ~r/wake\.scheduled.*wakeId/, fn ->
+      Publisher.committed_notice("wake.scheduled", %{}, %{})
+    end
   end
 
   test "storage credentials exist in query rows but are structurally absent after serialization",

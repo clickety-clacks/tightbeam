@@ -120,6 +120,16 @@ defmodule Tightbeam.Firehose.Publisher do
     {:ok, row} = Registry.fetch(class)
     projection = apply(StateResources, row.serializer, [payload])
 
+    projection_primary_id =
+      case Map.fetch(projection, row.projection_primary_key) do
+        {:ok, id} when not is_nil(id) ->
+          id
+
+        _missing_or_nil ->
+          raise ArgumentError,
+                "projection for #{class} must include non-nil #{inspect(row.projection_primary_key)}"
+      end
+
     %{
       "class" => class,
       "resource" => row.resource,
@@ -127,7 +137,7 @@ defmodule Tightbeam.Firehose.Publisher do
       "occurredAt" => occurred_at(projection),
       "refs" =>
         refs
-        |> Map.put_new(row.primary_ref, projection[row.primary_ref] || projection["id"])
+        |> Map.put_new(row.primary_ref, projection_primary_id)
         |> Map.reject(fn {_key, value} -> is_nil(value) end),
       "payload" => projection
     }

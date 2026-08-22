@@ -67,6 +67,25 @@ defmodule Tightbeam.Firehose.Registry do
     "critical-state" => :critical_state
   }
 
+  @projection_primary_keys %{
+    "work-items" => "id",
+    "assignments" => "id",
+    "attests" => "id",
+    "wakes" => "wakeId",
+    "productions" => "eventId",
+    "turns" => "turnSeq",
+    "decision-requests" => "id",
+    "sessions" => "sessionKey",
+    "roles" => "role",
+    "users" => "userId",
+    "devices" => "deviceId",
+    "artifacts" => "artifactId",
+    "read-markers" => "scopeKey",
+    "messages" => "id",
+    "condition-facts" => "factId",
+    "critical-state" => "sessionKey"
+  }
+
   @rows Map.new(@state_rows, fn {class, resource, op, primary_ref} ->
           {class,
            %{
@@ -74,6 +93,7 @@ defmodule Tightbeam.Firehose.Registry do
              resource: resource,
              op: op,
              primary_ref: primary_ref,
+             projection_primary_key: Map.fetch!(@projection_primary_keys, resource),
              serializer: Map.fetch!(@serializers, resource),
              query: :query,
              visibility: :visible?
