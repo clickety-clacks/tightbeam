@@ -7641,6 +7641,16 @@ defmodule Tightbeam.GatewayTest do
         )
     end
 
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO assignments
+          (id, subject, holderKey, openedByUser, openedAt)
+        VALUES ('asg_holder_fallback', 'Holder fallback test', 'k1', 'flynn', 1)
+        """
+      )
+
     base = gateway_children_base!()
 
     config = %{
@@ -7664,14 +7674,21 @@ defmodule Tightbeam.GatewayTest do
     runner = Keyword.fetch!(lane_opts, :runner)
 
     run_failure = fn prompt, assignment_id ->
+      client_key = assignment_id || "no_assignment"
+
+      job_ref =
+        if assignment_id in [nil, "asg_holder_fallback"],
+          do: nil,
+          else: "wi_process_cause"
+
       assert :appended =
                Gateway.deliver_prompt("k1", "user:flynn", prompt,
                  db: ctx.db,
                  conn_registry: exact_registry,
                  lane_manager: ctx.lane,
                  assignment_id: assignment_id,
-                 job_ref: "wi_process_cause",
-                 client_message_id: "c_#{assignment_id}"
+                 job_ref: job_ref,
+                 client_message_id: "c_#{client_key}"
                )
 
       assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
@@ -7693,7 +7710,7 @@ defmodule Tightbeam.GatewayTest do
 
       after_commit.(notice)
       publish.("failed")
-      {turn, collect_pushes_until_failed("c_#{assignment_id}", [])}
+      {turn, collect_pushes_until_failed("c_#{client_key}", [])}
     end
 
     {codex_turn, codex_frames} = run_failure.("known codex failure", "asg_codex")
@@ -7799,6 +7816,59 @@ defmodule Tightbeam.GatewayTest do
              EventLog.lifecycle_events(ctx.db),
              &(&1.kind == "harness_turn_error" and &1.subject == "k1")
            ) == 3
+
+    {fallback_turn, _fallback_frames} =
+      run_failure.("known claude failure", "asg_holder_fallback")
+
+    fallback_event =
+      ctx.db
+      |> EventLog.lifecycle_events()
+      |> Enum.filter(&(&1.kind == "assignment_process_failure"))
+      |> List.last()
+
+    assert fallback_event.subject == "asg_holder_fallback"
+    assert JSON.decode!(fallback_event.detail)["turnSeq"] == fallback_turn.seq
+
+    fallback_marker =
+      ctx.db
+      |> Projection.list_after(owner_session, nil, 100)
+      |> Enum.filter(&String.starts_with?(&1.content || "", "[assignment action needed]"))
+      |> List.last()
+
+    assert fallback_marker.content ==
+             "[assignment action needed]\n\nReview assignment asg_holder_fallback: " <>
+               "Claude rate limit reached."
+
+    typed_count_before_no_assignment =
+      Enum.count(EventLog.lifecycle_events(ctx.db), &(&1.kind == "assignment_process_failure"))
+
+    owner_marker_count_before_no_assignment =
+      ctx.db
+      |> Projection.list_after(owner_session, nil, 100)
+      |> Enum.count(&String.starts_with?(&1.content || "", "[assignment action needed]"))
+
+    {no_assignment_turn, _no_assignment_frames} =
+      run_failure.("known codex failure", nil)
+
+    refute Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
+             event.kind == "assignment_process_failure" and
+               JSON.decode!(event.detail)["turnSeq"] == no_assignment_turn.seq
+           end)
+
+    assert Enum.count(
+             EventLog.lifecycle_events(ctx.db),
+             &(&1.kind == "assignment_process_failure")
+           ) == typed_count_before_no_assignment
+
+    assert ctx.db
+           |> Projection.list_after(owner_session, nil, 100)
+           |> Enum.count(&String.starts_with?(&1.content || "", "[assignment action needed]")) ==
+             owner_marker_count_before_no_assignment
+
+    assert Enum.count(
+             EventLog.lifecycle_events(ctx.db),
+             &(&1.kind == "harness_turn_error" and &1.subject == "k1")
+           ) == 5
 
     degrade_host_catalog("testhost", "claude", {:needs_onboarding, :missing})
 

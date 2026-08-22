@@ -218,6 +218,65 @@ defmodule Tightbeam.LaneTest do
     {:ok, [["failed"]]} = DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [seq])
   end
 
+  test "a losing terminal CAS records and delivers no process-failure notice", ctx do
+    parent = self()
+    seq = enqueue!(ctx.db, "k1", "known process failure")
+
+    :ok =
+      DB.execute(ctx.db, """
+      CREATE TABLE owner_markers (
+        id INTEGER PRIMARY KEY,
+        content TEXT NOT NULL
+      )
+      """)
+
+    runner = fn turn ->
+      assert :ok = Ledger.finish(ctx.db, turn.seq, "failed", "preempted winner")
+
+      {:error,
+       %{
+         reason: "known process failure",
+         record_in_txn: fn txn ->
+           EventLog.lifecycle_in_txn(txn, "assignment_process_failure", "asg_loser", nil)
+
+           :ok =
+             DB.Txn.exec(
+               txn,
+               "INSERT INTO owner_markers (id, content) VALUES (1, 'action needed')"
+             )
+
+           :process_failure_notice
+         end,
+         after_commit: fn :process_failure_notice -> send(parent, :process_failure_delivered) end,
+         terminal_publish: fn terminal -> send(parent, {:published, terminal}) end
+       }}
+    end
+
+    {:ok, mgr} =
+      LaneManager.start_link(
+        db: ctx.db,
+        lane_sup: ctx.lane_sup,
+        task_sup: ctx.task_sup,
+        runner: runner,
+        interval: 60_000,
+        name: :losing_process_failure_lane_manager
+      )
+
+    :ok = LaneManager.reconcile(mgr)
+    assert eventually(fn -> Ledger.pending_sessions(ctx.db) == [] end)
+
+    assert {:ok, [["failed", "preempted winner"]]} =
+             DB.query(ctx.db, "SELECT status, error FROM turns WHERE seq=?1", [seq])
+
+    refute Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
+             event.kind == "assignment_process_failure" and event.subject == "asg_loser"
+           end)
+
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM owner_markers")
+    refute_receive :process_failure_delivered, 100
+    refute_receive {:published, _terminal}, 100
+  end
+
   defp eventually(fun, tries \\ 60) do
     cond do
       fun.() ->
