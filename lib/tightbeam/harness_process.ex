@@ -13,6 +13,7 @@ defmodule Tightbeam.HarnessProcess do
 
   @ssh_opts ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
   @command_timeout_ms 5_000
+  @macos_lsof_path "/usr/sbin/lsof"
   @old_schema_refusal "The database carries a pre-release harness_processes shape; it is not upgraded by design. Reset the database and restart Tightbeam."
 
   @process_ddl """
@@ -640,7 +641,8 @@ defmodule Tightbeam.HarnessProcess do
   has booted. A running process's sockets are observable only at runtime, so a runtime assert is
   as structural as invariant 3 can be. HONEST RESIDUAL: neither a settle window nor a
   post-initialize probe can catch a listener bound strictly later — that gap is for the go-live
-  adjudication. Local host only for now; the remote probe is a tracked follow-on.
+  adjudication. Local macOS host only for now; other operating systems and the remote probe are
+  refused with named errors.
   """
   @spec assert_zero_listeners(DB.server(), String.t(), (integer() -> tuple())) ::
           :ok | {:error, term()}
@@ -689,12 +691,42 @@ defmodule Tightbeam.HarnessProcess do
   # LISTEN TCP sockets held by ANY process in the launched process group. Returns the runner's
   # `{output, status}` (or `{:error, :timeout}`) for `listener_sample/2` to classify.
   defp lsof_listen_probe(pgid) do
-    args = ["-nP", "-a", "-g", Integer.to_string(pgid), "-iTCP", "-sTCP:LISTEN", "-Fn"]
     # This runs in the gateway LaunchDaemon, whose deliberately small PATH does
     # not include /usr/sbin. Use the macOS system path directly: an unavailable
     # probe must fail closed, but a PATH omission is not evidence of a listener.
-    bounded_command("/usr/sbin/lsof", args, 5_000)
+    case :os.type() do
+      {:unix, :darwin} -> lsof_listen_probe(pgid, @macos_lsof_path)
+      _other -> {:error, :listener_probe_unsupported_os}
+    end
   end
+
+  defp lsof_listen_probe(pgid, lsof_path) do
+    args = ["-nP", "-a", "-g", Integer.to_string(pgid), "-iTCP", "-sTCP:LISTEN", "-Fn"]
+
+    with {:ok, executable} <- lsof_executable(lsof_path) do
+      bounded_command(executable, args, 5_000)
+    end
+  end
+
+  defp lsof_executable(path) do
+    case File.stat(path) do
+      {:ok, %{type: :regular, mode: mode}} when Bitwise.band(mode, 0o111) != 0 ->
+        {:ok, path}
+
+      {:ok, _stat} ->
+        {:error, {:lsof_not_executable, path}}
+
+      {:error, :enoent} ->
+        {:error, {:lsof_executable_absent, path}}
+
+      {:error, reason} ->
+        {:error, {:lsof_executable_unavailable, path, reason}}
+    end
+  end
+
+  @doc false
+  def lsof_listen_probe_for_test(pgid, path \\ @macos_lsof_path),
+    do: lsof_listen_probe(pgid, path)
 
   # `-a` ANDs the pgid and socket-state filters; `-Fn` prints one field per line, so a socket name
   # is an `n`-prefixed line. An empty selection is lsof exit 1 with no output — the zero-listener
@@ -704,6 +736,9 @@ defmodule Tightbeam.HarnessProcess do
     case run.(pgid) do
       {:error, :timeout} ->
         {:error, :timeout}
+
+      {:error, reason} ->
+        {:error, reason}
 
       {output, status} when status in [0, 1] ->
         lines = String.split(output, "\n", trim: true)

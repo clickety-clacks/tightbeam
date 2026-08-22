@@ -12,6 +12,8 @@ defmodule Tightbeam.HarnessProcessTest do
   alias Tightbeam.{AdapterCoordinator, DB, EventLog, HarnessProcess}
   alias Tightbeam.HarnessProcessCensus
 
+  @darwin? :os.type() == {:unix, :darwin}
+
   # A BARE NAME MUST RESOLVE. `Port.open({:spawn_executable, name})` never searches PATH --
   # it raises `:enoent` for anything that is not a real path. Call sites pass "ssh", so every
   # remote identity read and every remote `harness-group` failed BEFORE it was attempted, and
@@ -116,6 +118,55 @@ defmodule Tightbeam.HarnessProcessTest do
   end
 
   describe "assert_zero_listeners/3 (rails invariant 3)" do
+    if @darwin? do
+      test "the real probe ignores a daemon-minimal PATH and passes an empty selection", ctx do
+        :ok = insert_launch!(ctx.db, "l-daemon-path", nil, 2_147_483_647)
+        previous_path = System.get_env("PATH")
+
+        on_exit(fn ->
+          if previous_path,
+            do: System.put_env("PATH", previous_path),
+            else: System.delete_env("PATH")
+        end)
+
+        System.put_env("PATH", "/usr/bin:/bin")
+        assert :ok = HarnessProcess.assert_zero_listeners(ctx.db, "l-daemon-path")
+      end
+
+      test "the real probe detects the listening socket held by this process group", ctx do
+        {:ok, socket} = :gen_tcp.listen(0, [:binary, active: false, ip: {127, 0, 0, 1}])
+        on_exit(fn -> :gen_tcp.close(socket) end)
+        {:ok, {{127, 0, 0, 1}, port}} = :inet.sockname(socket)
+
+        {pgid, 0} =
+          System.cmd("/bin/ps", ["-o", "pgid=", "-p", System.pid()], stderr_to_stdout: true)
+
+        pgid = pgid |> String.trim() |> String.to_integer()
+        :ok = insert_launch!(ctx.db, "l-real-listener", nil, pgid)
+
+        assert {:error, {:listeners_present, listeners}} =
+                 HarnessProcess.assert_zero_listeners(ctx.db, "l-real-listener")
+
+        assert Enum.any?(listeners, &String.ends_with?(&1, ":#{port}"))
+      end
+    end
+
+    test "a missing absolute lsof executable is refused with its classified path" do
+      path = Path.join(System.tmp_dir!(), "tightbeam-no-lsof-#{System.unique_integer()}")
+
+      assert {:error, {:lsof_executable_absent, ^path}} =
+               HarnessProcess.lsof_listen_probe_for_test(4244, path)
+    end
+
+    test "a non-executable lsof file is refused before spawn", ctx do
+      path = Path.join(ctx.test_dir, "not-executable-lsof")
+      File.write!(path, "#!/bin/sh\nexit 1\n")
+      File.chmod!(path, 0o644)
+
+      assert {:error, {:lsof_not_executable, ^path}} =
+               HarnessProcess.lsof_listen_probe_for_test(4244, path)
+    end
+
     test "a LISTEN socket in the group is caught and refused", ctx do
       :ok = insert_launch!(ctx.db, "l-present", nil, 4242)
       # lsof -Fn output: a socket name is an `n`-prefixed line.
