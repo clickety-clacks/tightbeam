@@ -125,12 +125,27 @@ defmodule Tightbeam.Harness.Codex do
   def cli_binary, do: "codex"
 
   @impl true
+  def identity_apply_capabilities do
+    %{
+      "durableEffectStatus" => true,
+      "runnerStopCoalescing" => true,
+      "readOnlySnapshot" => true,
+      "reloadCoalescing" => true,
+      "reloadReadback" => true,
+      "targetStaging" => true,
+      "atomicReplacement" => true,
+      "exactPriorContextRestore" => true
+    }
+  end
+
+  @impl true
   def wire_projection do
     JSON.encode!(%{
       "id" => "codex",
       "wire_name" => wire_name(),
       "install_package" => install_package(),
       "cli_binary" => cli_binary(),
+      "identity_apply_capabilities" => identity_apply_capabilities(),
       "process_markers" => ["codex-acp"]
     })
   end

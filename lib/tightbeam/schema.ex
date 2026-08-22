@@ -7,6 +7,7 @@ defmodule Tightbeam.Schema do
   @schema_modules [
     Tightbeam.Ledger,
     Tightbeam.EventLog,
+    Tightbeam.IdentityApply,
     Tightbeam.Assets,
     Tightbeam.Artifacts,
     Tightbeam.CausalEvents,

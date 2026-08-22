@@ -58,6 +58,7 @@ defmodule Tightbeam.Harness do
   projected on the wire so the satellite probe can check for it by name.
   """
   @callback cli_binary() :: binary()
+  @callback identity_apply_capabilities() :: map()
   @callback wire_projection() :: binary()
   @callback prepare_launch(target(), String.t(), keyword()) :: launch_plan()
   @callback ensure_adapter(target()) :: {:ok, String.t()} | {:error, map()}

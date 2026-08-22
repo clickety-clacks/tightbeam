@@ -5,6 +5,7 @@
     "wire_name": "claude",
     "install_package": "@agentclientprotocol/claude-agent-acp",
     "cli_binary": "claude",
+    "identity_apply_capabilities": {"durableEffectStatus":true,"runnerStopCoalescing":true,"readOnlySnapshot":true,"reloadCoalescing":true,"reloadReadback":true,"targetStaging":true,"atomicReplacement":true,"exactPriorContextRestore":true},
     "process_markers": ["claude-agent-acp"]
   },
   {
@@ -13,6 +14,7 @@
     "wire_name": "codex",
     "install_package": "@agentclientprotocol/codex-acp",
     "cli_binary": "codex",
+    "identity_apply_capabilities": {"durableEffectStatus":true,"runnerStopCoalescing":true,"readOnlySnapshot":true,"reloadCoalescing":true,"reloadReadback":true,"targetStaging":true,"atomicReplacement":true,"exactPriorContextRestore":true},
     "process_markers": ["codex-acp"]
   }
 ]

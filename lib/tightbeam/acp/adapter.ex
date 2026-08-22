@@ -117,6 +117,42 @@ defmodule Tightbeam.Acp.Adapter do
         :infinity
       )
 
+  @doc "Read the adapter-owned residency and model snapshot used by identity apply."
+  @spec identity_context_snapshot(adapter(), String.t() | nil) ::
+          {:ok, %{resident: boolean(), model: model_ref() | nil}}
+          | {:error, {:adapter_unavailable, term()}}
+  def identity_context_snapshot(_adapter, nil), do: {:ok, %{resident: false, model: nil}}
+
+  def identity_context_snapshot(adapter, session_id),
+    do: call(adapter, {:identity_context_snapshot, session_id}, @boot_boundary_timeout)
+
+  @doc "Replace one runtime context inside the adapter mailbox without an interleaving turn."
+  @spec identity_replace_session(
+          adapter(),
+          String.t() | nil,
+          boolean(),
+          model_ref() | nil,
+          String.t(),
+          [map()],
+          String.t()
+        ) :: {:ok, String.t(), String.t()} | {:error, term()}
+  def identity_replace_session(
+        adapter,
+        prior_session_id,
+        prior_resident,
+        model,
+        cwd,
+        mcp_servers,
+        guidance
+      ) do
+    call(
+      adapter,
+      {:identity_replace_session, prior_session_id, prior_resident, model, cwd, mcp_servers,
+       guidance},
+      65_000
+    )
+  end
+
   @doc """
   Move a resident session to a new model without losing its conversation.
 
@@ -474,6 +510,38 @@ defmodule Tightbeam.Acp.Adapter do
     load_session_reply(state, sid, model, cwd, mcp_servers, guidance, request_timeout)
   end
 
+  def handle_call({:identity_context_snapshot, sid}, _from, state) do
+    {:reply,
+     {:ok,
+      %{
+        resident: MapSet.member?(state.known, sid),
+        model: Map.get(state.models, sid)
+      }}, state}
+  end
+
+  def handle_call(
+        {:identity_replace_session, sid, resident, model, cwd, mcp_servers, guidance},
+        _from,
+        state
+      ) do
+    case identity_replace(
+           state,
+           sid,
+           resident,
+           model,
+           cwd,
+           mcp_servers,
+           guidance,
+           60_000
+         ) do
+      {:ok, target_sid, reason, next_state} ->
+        {:reply, {:ok, target_sid, reason}, next_state}
+
+      {:error, reason, next_state} ->
+        {:reply, {:error, reason}, next_state}
+    end
+  end
+
   def handle_call(
         {:switch_model_session, sid, model, cwd, mcp_servers, guidance},
         _from,
@@ -628,6 +696,117 @@ defmodule Tightbeam.Acp.Adapter do
       {:reply, {:ok, sid}, put_in(state.chunks[sid], [])}
     else
       {:error, error} -> {:reply, {:error, error}, state}
+    end
+  end
+
+  defp identity_replace(
+         state,
+         sid,
+         resident,
+         model,
+         cwd,
+         mcp_servers,
+         guidance,
+         request_timeout
+       ) do
+    cond do
+      is_binary(sid) and resident ->
+        with {:ok, closed_state} <- close_identity_session(state, sid),
+             {:ok, loaded_state} <-
+               load_identity_session(
+                 closed_state,
+                 sid,
+                 model,
+                 cwd,
+                 mcp_servers,
+                 guidance,
+                 request_timeout
+               ) do
+          {:ok, sid, "loaded", loaded_state}
+        else
+          {:error, reason, next_state} -> {:error, reason, next_state}
+        end
+
+      is_binary(sid) ->
+        case load_identity_session(
+               state,
+               sid,
+               model,
+               cwd,
+               mcp_servers,
+               guidance,
+               request_timeout
+             ) do
+          {:ok, loaded_state} ->
+            {:ok, sid, "loaded", loaded_state}
+
+          {:error, {:adapter_unavailable, _} = reason, next_state} ->
+            {:error, reason, next_state}
+
+          {:error, _lost, next_state} ->
+            new_identity_session(
+              next_state,
+              model,
+              cwd,
+              mcp_servers,
+              guidance,
+              request_timeout,
+              "fallback"
+            )
+        end
+
+      true ->
+        new_identity_session(
+          state,
+          model,
+          cwd,
+          mcp_servers,
+          guidance,
+          request_timeout,
+          "created"
+        )
+    end
+  end
+
+  defp close_identity_session(state, sid) do
+    case Conn.request(state.conn, "session/close", %{sessionId: sid}) do
+      {:ok, _result} ->
+        next_state = %{
+          state
+          | known: MapSet.delete(state.known, sid),
+            models: Map.delete(state.models, sid),
+            unprompted: MapSet.delete(state.unprompted, sid),
+            switchable_models: Map.delete(state.switchable_models, sid),
+            chunks: Map.delete(state.chunks, sid),
+            progress: Map.delete(state.progress, sid)
+        }
+
+        {:ok, next_state}
+
+      {:error, reason} ->
+        {:error, reason, state}
+    end
+  end
+
+  defp load_identity_session(state, sid, model, cwd, mcp_servers, guidance, request_timeout) do
+    case load_session_reply(state, sid, model, cwd, mcp_servers, guidance, request_timeout) do
+      {:reply, {:ok, _model}, next_state} -> {:ok, next_state}
+      {:reply, {:error, reason}, next_state} -> {:error, reason, next_state}
+    end
+  end
+
+  defp new_identity_session(
+         state,
+         model,
+         cwd,
+         mcp_servers,
+         guidance,
+         request_timeout,
+         pointer_reason
+       ) do
+    case new_session_reply(state, model, cwd, mcp_servers, guidance, request_timeout) do
+      {:reply, {:ok, sid}, next_state} -> {:ok, sid, pointer_reason, next_state}
+      {:reply, {:error, reason}, next_state} -> {:error, reason, next_state}
     end
   end
 

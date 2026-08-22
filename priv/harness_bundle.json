@@ -55,6 +55,7 @@
     "credential_provider",
     "default_model",
     "id",
+    "identity_apply_capabilities",
     "install_package",
     "wire_name"
   ],
@@ -175,6 +176,7 @@
     "wire_name",
     "install_package",
     "cli_binary",
+    "identity_apply_capabilities",
     "process_markers"
   ]
 }

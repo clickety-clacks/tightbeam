@@ -30,6 +30,20 @@ defmodule Tightbeam.Harness.Fixture do
   @impl true
   def cli_binary, do: "fixture"
 
+  @impl true
+  def identity_apply_capabilities do
+    %{
+      "durableEffectStatus" => true,
+      "runnerStopCoalescing" => true,
+      "readOnlySnapshot" => true,
+      "reloadCoalescing" => true,
+      "reloadReadback" => true,
+      "targetStaging" => true,
+      "atomicReplacement" => true,
+      "exactPriorContextRestore" => true
+    }
+  end
+
   @doc false
   def adapter_version, do: @adapter_version
 
@@ -40,6 +54,7 @@ defmodule Tightbeam.Harness.Fixture do
       "wire_name" => wire_name(),
       "install_package" => install_package(),
       "cli_binary" => cli_binary(),
+      "identity_apply_capabilities" => identity_apply_capabilities(),
       "process_markers" => ["fixture-acp"]
     })
   end

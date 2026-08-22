@@ -155,12 +155,27 @@ defmodule Tightbeam.Harness.Claude do
   def cli_binary, do: "claude"
 
   @impl true
+  def identity_apply_capabilities do
+    %{
+      "durableEffectStatus" => true,
+      "runnerStopCoalescing" => true,
+      "readOnlySnapshot" => true,
+      "reloadCoalescing" => true,
+      "reloadReadback" => true,
+      "targetStaging" => true,
+      "atomicReplacement" => true,
+      "exactPriorContextRestore" => true
+    }
+  end
+
+  @impl true
   def wire_projection do
     JSON.encode!(%{
       "id" => "claude",
       "wire_name" => wire_name(),
       "install_package" => install_package(),
       "cli_binary" => cli_binary(),
+      "identity_apply_capabilities" => identity_apply_capabilities(),
       "process_markers" => ["claude-agent-acp"]
     })
   end

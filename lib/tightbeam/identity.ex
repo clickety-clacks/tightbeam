@@ -121,6 +121,44 @@ defmodule Tightbeam.Identity do
     git_output!(identity_dir(base_dir), ["rev-parse", @live])
   end
 
+  @doc "Classify whether `target` can replace `recorded` without a downgrade."
+  @spec revision_relation(String.t(), String.t(), String.t()) ::
+          :valid | {:error, :apply_superseded | :identity_revision_unavailable}
+  def revision_relation(base_dir, recorded, target) do
+    dir = identity_dir(base_dir)
+
+    with :ok <- readable_revision(dir, recorded),
+         :ok <- readable_revision(dir, target) do
+      cond do
+        ancestor?(dir, recorded, target) -> :valid
+        ancestor?(dir, target, recorded) -> {:error, :apply_superseded}
+        true -> {:error, :identity_revision_unavailable}
+      end
+    else
+      _ -> {:error, :identity_revision_unavailable}
+    end
+  end
+
+  defp readable_revision(dir, revision) do
+    case System.cmd("git", ["cat-file", "-e", "#{revision}^{commit}"],
+           cd: dir,
+           stderr_to_stdout: true
+         ) do
+      {_output, 0} -> :ok
+      _ -> :error
+    end
+  end
+
+  defp ancestor?(dir, ancestor, descendant) do
+    match?(
+      {_output, 0},
+      System.cmd("git", ["merge-base", "--is-ancestor", ancestor, descendant],
+        cd: dir,
+        stderr_to_stdout: true
+      )
+    )
+  end
+
   @doc "Read one archetype's complete immutable served snapshot."
   @spec snapshot!(String.t(), String.t(), harness()) :: snapshot()
   def snapshot!(base_dir, archetype_name, harness) do
