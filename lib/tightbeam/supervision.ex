@@ -1900,27 +1900,43 @@ defmodule Tightbeam.Supervision do
   end
 
   defp success_clear(db, pending) do
-    transaction!(db, fn txn ->
-      if clear_pending_in_txn(txn, pending) do
-        Txn.q(
-          txn,
-          "UPDATE assignment_prods SET prodCount = prodCount + 1, lastProdAt = ?2, deniedStreak = 0 WHERE assignmentId = ?1",
-          [pending.pendingAssignment, now()]
-        )
+    event_seq =
+      transaction!(db, fn txn ->
+        if clear_pending_in_txn(txn, pending) do
+          Txn.q(
+            txn,
+            "UPDATE assignment_prods SET prodCount = prodCount + 1, lastProdAt = ?2, deniedStreak = 0 WHERE assignmentId = ?1",
+            [pending.pendingAssignment, now()]
+          )
 
-        # prodCount is a mutable aggregate that RESETS on attest, and pendingK is
-        # overwritten every evaluation: the tier that fired has no other home.
-        if pending.pendingBranch == "prod" do
-          CausalEvents.append_in_txn(txn, %{
-            kind: "prod_fired",
-            assignment_id: pending.pendingAssignment,
-            job_ref: job_ref_in_txn(txn, pending.pendingAssignment),
-            session_key: pending.sessionKey,
-            detail: %{tier: pending.pendingK}
-          })
+          # prodCount is a mutable aggregate that RESETS on attest, and pendingK is
+          # overwritten every evaluation: the tier that fired has no other home.
+          if pending.pendingBranch == "prod" do
+            CausalEvents.append_in_txn(txn, %{
+              kind: "prod_fired",
+              assignment_id: pending.pendingAssignment,
+              job_ref: job_ref_in_txn(txn, pending.pendingAssignment),
+              session_key: pending.sessionKey,
+              detail: %{tier: pending.pendingK}
+            })
+
+            [[seq]] = Txn.q(txn, "SELECT last_insert_rowid()")
+            seq
+          end
         end
-      end
-    end)
+      end)
+
+    with seq when is_integer(seq) <- event_seq,
+         %{} = event <- Tightbeam.StateResources.query_production(db, seq) do
+      Tightbeam.Firehose.Publisher.committed("prod.fired", event, %{
+        "eventId" => seq,
+        "assignmentId" => event.assignment_id,
+        "workItemId" => event.job_ref,
+        "sessionKey" => event.session_key
+      })
+    else
+      _ -> :ok
+    end
   end
 
   defp denied_clear(db, pending) do

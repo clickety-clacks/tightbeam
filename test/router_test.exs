@@ -234,6 +234,19 @@ defmodule Tightbeam.Wire.RouterTest do
     assert body["sha"] == Tightbeam.BuildStamp.sha()
   end
 
+  test "the change socket requires protocolVersion 1 at upgrade", ctx do
+    response =
+      conn(:get, "/ws/changes")
+      |> put_req_header("upgrade", "websocket")
+      |> Router.call(Router.init(ctx.opts))
+
+    assert response.status == 426
+
+    assert JSON.decode!(response.resp_body) == %{
+             "error" => %{"code" => "unsupported_protocol_version"}
+           }
+  end
+
   test "CLI exact-version refusal is loud and precedes bearer authentication", ctx do
     body = JSON.encode!(%{verb: "inspect", asUser: "flynn", params: %{}})
     required_version = Tightbeam.CliCompatibility.required_version()

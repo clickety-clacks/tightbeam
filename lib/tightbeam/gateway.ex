@@ -210,6 +210,7 @@ defmodule Tightbeam.Gateway do
       db: db,
       handlers: handler_table,
       conn_registry: Tightbeam.ConnRegistry,
+      firehose_hub: Tightbeam.Firehose.Hub,
       defaults: defaults
     }
 
@@ -281,6 +282,7 @@ defmodule Tightbeam.Gateway do
       [
         {ModelCatalog, base_dir: config.base_dir, db: db},
         {Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry},
+        {Tightbeam.Firehose.Hub, name: Tightbeam.Firehose.Hub},
         # Ahead of Supervision and Bandit deliberately: both can reach a check-tier
         # statute, and the episode writer must already own the ordering before the first
         # evaluation runs. Explicitly a child rather than lazily started — a lazy start
@@ -716,14 +718,19 @@ defmodule Tightbeam.Gateway do
           true ->
             scheduler = Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler)
 
-            case ConditionFacts.file_idempotent(db, scheduler, %{
+            case ConditionFacts.file_idempotent_with_effect(db, scheduler, %{
                    kind: p.kind,
                    scope: p[:scope],
                    origin: call.origin,
                    idempotency_key: p[:idempotency_key]
                  }) do
-              {:error, error} -> error
-              fact -> fact
+              {{:error, error}, _filed?} ->
+                error
+
+              {fact, filed?} ->
+                if call[:firehose_effect_requested],
+                  do: {:firehose_effect, fact, filed?},
+                  else: fact
             end
         end
       end,
@@ -917,6 +924,8 @@ defmodule Tightbeam.Gateway do
         admin_handler(db, fn p ->
           %{user: Devices.add_user(db, p.user_id, Map.get(p, :is_admin, false))}
         end),
+      "read-marker-set" => fn call -> read_marker_result(db, call, :set) end,
+      "read-marker-clear" => fn call -> read_marker_result(db, call, :clear) end,
       "config" => admin_handler(db, fn p -> config_result(db, p) end),
       "harness-processes" =>
         admin_handler(db, fn _params ->
@@ -3301,6 +3310,36 @@ defmodule Tightbeam.Gateway do
       {:error, error} -> error
     end
   end
+
+  defp read_marker_result(db, call, operation) do
+    scope_key = call.params[:scope_key]
+    marker = if operation == :clear, do: nil, else: call.params[:marker]
+
+    with true <- is_binary(scope_key) and scope_key != "",
+         true <- operation == :clear or valid_read_marker?(marker),
+         %{owner_user_id: user_id} when is_binary(user_id) <- resolve_caller(db, call.origin) do
+      case Tightbeam.ReadMarkers.set(db, user_id, scope_key, marker,
+             expected?: Map.has_key?(call.params, :expected_current),
+             expected: call.params[:expected_current]
+           ) do
+        {:error, error} ->
+          error
+
+        {:ok, changed, row} ->
+          %{changed: changed, read_marker: row, user_id: user_id}
+      end
+    else
+      false ->
+        %{code: "invalid", message: "scopeKey and a row-id or timestamp marker are required"}
+
+      _ ->
+        %{code: "unknown_caller"}
+    end
+  end
+
+  defp valid_read_marker?(marker) when is_integer(marker), do: marker >= 0
+  defp valid_read_marker?(marker) when is_binary(marker), do: marker != ""
+  defp valid_read_marker?(_marker), do: false
 
   defp role_list_result(db) do
     roles =
@@ -6655,6 +6694,17 @@ defmodule Tightbeam.Gateway do
       session ->
         seq = message.seq
 
+        :ok =
+          Tightbeam.Firehose.Publisher.committed(
+            "message.created",
+            message,
+            %{
+              "messageId" => message.id,
+              "sessionKey" => session_key,
+              "ownerUserId" => session.owner_user_id
+            }
+          )
+
         Tightbeam.ConnRegistry.publish_message(
           registry,
           session_key,
@@ -6707,6 +6757,8 @@ defmodule Tightbeam.Gateway do
          error,
          registry \\ Tightbeam.ConnRegistry
        ) do
+    publish_turn_change(db, session_key, correlation, state)
+
     case Org.get(db, session_key) do
       nil ->
         :ok
@@ -6723,6 +6775,27 @@ defmodule Tightbeam.Gateway do
           }),
           &deliver/2
         )
+    end
+  end
+
+  defp publish_turn_change(db, session_key, correlation, state) do
+    class =
+      case state do
+        "running" -> "turn.started"
+        terminal when terminal in ~w(delivered canceled failed failed_unknown) -> "turn.ended"
+        _ -> nil
+      end
+
+    with class when is_binary(class) <- class,
+         %{} = turn <- Tightbeam.StateResources.query_turn(db, session_key, correlation) do
+      Tightbeam.Firehose.Publisher.committed(class, turn, %{
+        "turnSeq" => turn.seq,
+        "sessionKey" => session_key,
+        "assignmentId" => turn.assignment_id,
+        "workItemId" => turn.job_ref
+      })
+    else
+      _ -> :ok
     end
   end
 

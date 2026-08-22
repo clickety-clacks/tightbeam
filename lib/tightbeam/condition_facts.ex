@@ -86,6 +86,14 @@ defmodule Tightbeam.ConditionFacts do
 
   @spec file_idempotent(DB.server(), GenServer.server(), map()) :: map() | {:error, map()}
   def file_idempotent(db, scheduler, input) do
+    {result, _filed?} = file_idempotent_with_effect(db, scheduler, input)
+    result
+  end
+
+  @doc false
+  @spec file_idempotent_with_effect(DB.server(), GenServer.server(), map()) ::
+          {map() | {:error, map()}, boolean()}
+  def file_idempotent_with_effect(db, scheduler, input) do
     {result, filed?} =
       transaction!(db, fn txn ->
         key = Map.get(input, :idempotency_key)
@@ -117,7 +125,7 @@ defmodule Tightbeam.ConditionFacts do
       end)
 
     if filed?, do: Wakes.fire_matching(scheduler, result.fact_id)
-    result
+    {result, filed?}
   end
 
   @spec latest(DB.server(), String.t(), String.t() | nil) :: map() | nil

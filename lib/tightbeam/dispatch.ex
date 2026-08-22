@@ -28,6 +28,7 @@ defmodule Tightbeam.Dispatch do
     Assignments,
     Escalation,
     EventLog,
+    Firehose.Publisher,
     Placement,
     RailEpisodes,
     RailRemedy,
@@ -84,6 +85,7 @@ defmodule Tightbeam.Dispatch do
         # A keyed replay bypasses the rail entirely (statute inertness): the
         # original assignment is returned, no rumination, no terminal guard.
         :ok = EventLog.append_event(db, "verb", verb, origin, session_key, assignment, principal)
+        :ok = Publisher.observed_accepted(call)
         {:ok, assignment}
 
       {:refuse, error} ->
@@ -180,41 +182,69 @@ defmodule Tightbeam.Dispatch do
     do: RailRemedy.notice(db, handlers, statute, subject, call)
 
   defp dispatch_to_handler(db, handlers, call, verb, origin, principal, session_key) do
+    publisher_call = Publisher.capture_before(db, call)
+
     case Map.fetch(handlers, verb) do
       :error ->
         error = %{code: "unknown_verb"}
         :ok = EventLog.append_event(db, "denied", verb, origin, session_key, error, principal)
+        :ok = Publisher.denied(publisher_call, error)
         {:error, error}
 
       {:ok, handler} ->
         handler_call =
-          if verb in ["assign", "dispatch"],
-            do: Map.put(call, :accepted_event_in_txn, true),
-            else: call
+          case verb do
+            verb when verb in ["assign", "dispatch"] ->
+              Map.put(call, :accepted_event_in_txn, true)
+
+            "condition" ->
+              Map.put(call, :firehose_effect_requested, true)
+
+            _ ->
+              call
+          end
 
         case invoke(handler, handler_call) do
           {:returned, %{code: _} = error} ->
             :ok = EventLog.append_event(db, "denied", verb, origin, session_key, error, principal)
+            :ok = Publisher.denied(publisher_call, error)
             {:error, error}
 
           {:returned, {:accepted_in_txn, event_id, %{canceled: true} = result}}
           when is_integer(event_id) and event_id > 0 and map_size(result) == 1 ->
+            :ok = Publisher.accepted(db, publisher_call, result)
             {:ok, result}
 
           {:returned, {:accepted_in_txn, event_id, %{assignment: assignment} = envelope}}
           when is_integer(event_id) and event_id > 0 and map_size(envelope) == 1 and
                  is_map(assignment) ->
+            :ok = Publisher.accepted(db, publisher_call, assignment)
             {:ok, assignment}
+
+          {:returned, {:firehose_effect, result, changed?}} when is_boolean(changed?) ->
+            payload = outcome_payload(verb, call, {:returned, result})
+            :ok = EventLog.append_event(db, "verb", verb, origin, session_key, payload, principal)
+
+            :ok =
+              Publisher.accepted(
+                db,
+                Map.put(publisher_call, :firehose_changed, changed?),
+                result
+              )
+
+            {:ok, result}
 
           {:returned, result} ->
             payload = outcome_payload(verb, call, {:returned, result})
             :ok = EventLog.append_event(db, "verb", verb, origin, session_key, payload, principal)
+            :ok = Publisher.accepted(db, publisher_call, result)
             {:ok, result}
 
           {:raised, exception} ->
             error = %{code: "server_error", message: Exception.message(exception)}
             payload = outcome_payload(verb, call, {:raised, exception})
             :ok = EventLog.append_event(db, "verb", verb, origin, session_key, payload, principal)
+            :ok = Publisher.accepted(db, publisher_call, payload)
             {:error, error}
         end
     end
@@ -279,14 +309,26 @@ defmodule Tightbeam.Dispatch do
 
   defp best_effort_denial(db, verb, origin, principal, session_key, error) do
     try do
-      EventLog.append_event(
-        db,
-        "denied",
-        verb,
-        origin,
-        session_key,
-        JSON.encode!(error),
-        principal
+      :ok =
+        EventLog.append_event(
+          db,
+          "denied",
+          verb,
+          origin,
+          session_key,
+          JSON.encode!(error),
+          principal
+        )
+
+      Publisher.denied(
+        %{
+          verb: verb,
+          origin: origin,
+          principal: principal,
+          session_key: session_key,
+          params: %{}
+        },
+        error
       )
     catch
       _kind, _reason -> :ok

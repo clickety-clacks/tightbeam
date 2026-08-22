@@ -48,14 +48,15 @@ defmodule Tightbeam.CriticalLeases do
 
           current ->
             expires_at = min(current.hard_deadline, max(now, current.expires_at) + duration_ms)
+            updated_at = max(now, current.updated_at + 1)
 
             Txn.q(
               txn,
               "UPDATE critical_leases SET reason=?2, expiresAt=?3, updatedAt=?4 WHERE sessionKey=?1",
-              [session_key, reason, expires_at, now]
+              [session_key, reason, expires_at, updated_at]
             )
 
-            %{current | reason: reason, expires_at: expires_at, updated_at: now}
+            %{current | reason: reason, expires_at: expires_at, updated_at: updated_at}
         end
       end)
 
@@ -74,6 +75,22 @@ defmodule Tightbeam.CriticalLeases do
         lease(session_key, reason, started_at, expires_at, hard_deadline, updated_at)
 
       [] ->
+        nil
+    end
+  end
+
+  @doc "Return a lease row regardless of expiry, or nil."
+  @spec get(DB.server(), String.t()) :: map() | nil
+  def get(db \\ DB, session_key) do
+    case DB.query(
+           db,
+           "SELECT reason, startedAt, expiresAt, hardDeadline, updatedAt FROM critical_leases WHERE sessionKey=?1",
+           [session_key]
+         ) do
+      {:ok, [[reason, started_at, expires_at, hard_deadline, updated_at]]} ->
+        lease(session_key, reason, started_at, expires_at, hard_deadline, updated_at)
+
+      {:ok, []} ->
         nil
     end
   end

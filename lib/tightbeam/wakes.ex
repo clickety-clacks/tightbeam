@@ -2383,15 +2383,18 @@ defmodule Tightbeam.Wakes do
   end
 
   defp mark_fired(db, wake_id) do
-    transaction!(db, fn txn ->
-      Txn.q(
-        txn,
-        "UPDATE wakes SET state = 'fired', firedAt = ?2 WHERE wakeId = ?1 AND state = 'pending'",
-        [wake_id, now()]
-      )
+    changed? =
+      transaction!(db, fn txn ->
+        Txn.q(
+          txn,
+          "UPDATE wakes SET state = 'fired', firedAt = ?2 WHERE wakeId = ?1 AND state = 'pending'",
+          [wake_id, now()]
+        )
 
-      :ok
-    end)
+        Txn.changes(txn) == 1
+      end)
+
+    if changed?, do: publish_change(db, "wake.fired", wake_id), else: :ok
   end
 
   defp evaluate_conditions(%{db: db, batch: batch}, mode) do
@@ -2533,9 +2536,15 @@ defmodule Tightbeam.Wakes do
       end)
 
     case result do
-      {:ok, {:fired, delivery}} -> Gateway.complete_delivery(db, delivery)
-      {:ok, _} -> :ok
-      {:error, error} -> raise error
+      {:ok, {:fired, delivery}} ->
+        publish_change(db, "wake.fired", wake_id)
+        Gateway.complete_delivery(db, delivery)
+
+      {:ok, _} ->
+        :ok
+
+      {:error, error} ->
+        raise error
     end
   end
 
@@ -2601,6 +2610,19 @@ defmodule Tightbeam.Wakes do
   end
 
   defp fire_in_txn(_txn, _wake), do: :noop
+
+  defp publish_change(db, class, wake_id) do
+    case get(db, wake_id) do
+      nil ->
+        :ok
+
+      wake ->
+        Tightbeam.Firehose.Publisher.committed(class, wake, %{
+          "wakeId" => wake_id,
+          "sessionKey" => wake.session_key
+        })
+    end
+  end
 
   defp lifecycle_for_fire(txn, wake, cause, match, :skipped) do
     matched =

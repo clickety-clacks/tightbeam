@@ -20,6 +20,7 @@ defmodule Tightbeam.Schema do
     Tightbeam.Org,
     Tightbeam.CriticalLeases,
     Tightbeam.Roles,
+    Tightbeam.ReadMarkers,
     Tightbeam.WorkItems,
     Tightbeam.Assignments,
     Tightbeam.EffortCheckin,

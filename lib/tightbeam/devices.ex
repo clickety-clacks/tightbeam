@@ -52,6 +52,10 @@ defmodule Tightbeam.Devices do
     model       TEXT,
     createdAt   INTEGER NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS device_versions (
+    deviceId   TEXT PRIMARY KEY REFERENCES devices(deviceId),
+    rowVersion INTEGER NOT NULL
+  );
   """
 
   @spec ensure_schema(db()) :: :ok | {:error, term()}
@@ -87,10 +91,14 @@ defmodule Tightbeam.Devices do
               {:pending, device}
 
             %{status: "allowlisted"} ->
+              updated_at = now()
+
               Txn.q(txn, "UPDATE devices SET token = ?2 WHERE deviceId = ?1", [
                 device_id,
                 mint_token()
               ])
+
+              stamp_device_in_txn(txn, device_id, updated_at)
 
               {:paired, must_get(txn, device_id)}
           end
@@ -123,6 +131,7 @@ defmodule Tightbeam.Devices do
           )
 
           device = must_get(txn, device_id)
+          stamp_device_in_txn(txn, device_id, device.created_at)
           if first_ever?, do: {:paired, device}, else: {:pending, device}
       end
     end)
@@ -167,6 +176,8 @@ defmodule Tightbeam.Devices do
         [device_id, user_id, mint_token()]
       )
 
+      stamp_device_in_txn(txn, device_id, now())
+
       must_get(txn, device_id)
     end)
   end
@@ -181,6 +192,8 @@ defmodule Tightbeam.Devices do
         device_id
       ])
 
+      stamp_device_in_txn(txn, device_id, now())
+
       :ok
     end)
   end
@@ -191,8 +204,18 @@ defmodule Tightbeam.Devices do
     transaction!(db, fn txn ->
       must_get(txn, device_id)
       Txn.q(txn, "UPDATE devices SET token = NULL WHERE deviceId = ?1", [device_id])
+      stamp_device_in_txn(txn, device_id, now())
       :ok
     end)
+  end
+
+  @doc "Monotonic public version for a device row."
+  @spec version(db(), String.t()) :: integer() | nil
+  def version(db \\ Tightbeam.DB, device_id) do
+    case DB.query(db, "SELECT rowVersion FROM device_versions WHERE deviceId = ?1", [device_id]) do
+      {:ok, [[version]]} -> version
+      {:ok, []} -> nil
+    end
   end
 
   @doc "User row by id, or nil."
@@ -271,6 +294,18 @@ defmodule Tightbeam.Devices do
 
   defp one_device_or_nil([row]), do: to_device(row)
   defp one_device_or_nil([]), do: nil
+
+  defp stamp_device_in_txn(txn, device_id, proposed) do
+    Txn.q(
+      txn,
+      """
+      INSERT INTO device_versions (deviceId, rowVersion) VALUES (?1, ?2)
+      ON CONFLICT(deviceId) DO UPDATE
+      SET rowVersion = MAX(excluded.rowVersion, device_versions.rowVersion + 1)
+      """,
+      [device_id, proposed]
+    )
+  end
 
   defp to_device([
          device_id,
