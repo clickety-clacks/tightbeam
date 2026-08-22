@@ -1136,24 +1136,57 @@ defmodule Tightbeam.Placement do
   `config` is the Gateway config map (base_dir, cwd, …). Local keys must
   produce exactly the pre-placement behavior. Calls deliver_home/3.
   """
-  @spec adapter_opts(map(), adapter_key()) :: keyword() | {:error, Harness.launch_refusal()}
+  @spec adapter_opts(map(), adapter_key()) ::
+          {:ok, keyword()} | {:error, Harness.launch_refusal()}
   def adapter_opts(config, {harness, identity_name, host} = key) do
     module = Harness.module!(harness)
-
-    lineage =
-      "tb1-" <> Base.url_encode64("#{harness}@#{host}", padding: false)
-
     host_config = Map.fetch!(hosts_for(config), host)
     sh = Map.get(config, :sh, &system_cmd/1)
-    ensure_toolchain_dirs!(host, host_config, sh)
 
-    target = %{
-      base_dir: config.base_dir,
-      host_config: host_config,
-      host_name: host,
-      sh: sh,
-      cli_bin: config.cli_bin
-    }
+    target =
+      Map.merge(
+        %{
+          base_dir: config.base_dir,
+          host_config: host_config,
+          host_name: host,
+          sh: sh,
+          cli_bin: config.cli_bin
+        },
+        Map.get(config, :harness_target_overrides, %{})
+      )
+
+    kind = credential_kind(config, module.credential_provider(), host, module.wire_name())
+    projected_home = Homes.home_path(host_config.base_dir, host, module.id())
+
+    with {:ok, checked_opts} <-
+           Harness.preflight_launch(module, target, projected_home, credential_kind: kind) do
+      build_adapter_opts(
+        config,
+        key,
+        module,
+        target,
+        checked_opts,
+        identity_name,
+        host,
+        host_config,
+        sh
+      )
+    end
+  end
+
+  defp build_adapter_opts(
+         config,
+         {harness, _identity_name, _host} = key,
+         module,
+         target,
+         checked_opts,
+         identity_name,
+         host,
+         host_config,
+         sh
+       ) do
+    ensure_toolchain_dirs!(host, host_config, sh)
+    lineage = "tb1-" <> Base.url_encode64("#{harness}@#{host}", padding: false)
 
     deliver_opts =
       []
@@ -1210,11 +1243,9 @@ defmodule Tightbeam.Placement do
         lineage: lineage,
         rails: Rails.hook_settings(),
         statutes: Rails.statutes?(),
-        credential_kind:
-          credential_kind(config, module.credential_provider(), host, module.wire_name()),
         ensure_workdir: &ensure_workdir/4,
         sh_out: Map.get(config, :sh_out)
-      ]
+      ] ++ checked_opts
 
     base = [
       harness: harness,
@@ -1229,10 +1260,15 @@ defmodule Tightbeam.Placement do
       env: []
     ]
 
-    with {:ok, checked_opts} <- Harness.preflight_launch(module, target, home, launch_opts),
-         {:ok, plan} <- Harness.prepare_launch(module, target, home, checked_opts) do
-      Keyword.merge(base, plan)
+    with {:ok, plan} <- Harness.prepare_launch(module, target, home, launch_opts) do
+      {:ok, Keyword.merge(base, plan)}
     end
+  end
+
+  @doc false
+  def adapter_opts!(config, key) do
+    {:ok, opts} = adapter_opts(config, key)
+    opts
   end
 
   @doc "Preview the exact PATH an adapter on a configured host will receive."
@@ -1387,7 +1423,9 @@ defmodule Tightbeam.Placement do
           | {:error, :not_found}
           | {:error, {:exec_failed, String.t()}}
   def harness_binary_probe(harness, cli_bin, opts \\ []) do
-    Harness.module!(harness).probe_cli(%{
+    module = Harness.module!(harness)
+
+    Harness.probe_cli(module, %{
       cli_bin: cli_bin,
       find_executable: Keyword.get(opts, :find_executable, &System.find_executable/1),
       timeout: Keyword.get(opts, :timeout, 2_000),

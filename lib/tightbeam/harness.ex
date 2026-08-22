@@ -38,6 +38,9 @@ defmodule Tightbeam.Harness do
   @type preflight_result :: {:ok, keyword()} | {:error, launch_refusal()}
   @type launch_result :: {:ok, launch_plan()} | {:error, launch_refusal()}
   @type ensure_result :: {:ok, String.t()} | {:error, launch_refusal()}
+  @type probe_result ::
+          {:ok, %{bin: String.t(), version: String.t()}}
+          | {:error, :not_found | {:exec_failed, String.t()} | launch_refusal()}
   @type desired_home :: map()
   @type credential_liveness ::
           :live | {:dead, term()} | {:unknown, term()}
@@ -156,6 +159,12 @@ defmodule Tightbeam.Harness do
         {:ok, plan}
     end
   end
+
+  @spec ensure_adapter(module(), target()) :: ensure_result()
+  def ensure_adapter(module, target), do: module.ensure_adapter(target)
+
+  @spec probe_cli(module(), target()) :: probe_result()
+  def probe_cli(module, target), do: module.probe_cli(target)
 
   @optional_callbacks warm_home: 2, requires_zero_listeners?: 0
 

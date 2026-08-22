@@ -28,9 +28,12 @@ defmodule Tightbeam.CursorRegistrationTest do
   test "Cursor refuses every unsupported credential before launch planning" do
     target = cursor_target()
 
-    for kind <- [:subscription, :fixture_provider] do
+    for kind <- [:subscription, :fixture_provider, :arbitrary_invalid] do
       assert {:error, %{code: "DIV-CURSOR-API-KEY-ONLY"}} =
-               Cursor.preflight_launch(target, "/managed", credential_kind: kind)
+               Cursor.preflight_launch(target, "/managed",
+                 credential_kind: kind,
+                 cursor_api_key_loader: fn _ -> flunk("unsupported kind loaded a credential") end
+               )
     end
 
     for result <- [{:error, :missing}, {:error, :unreadable}, {:ok, ""}, {:ok, "  \n"}] do
@@ -42,7 +45,7 @@ defmodule Tightbeam.CursorRegistrationTest do
     end
   end
 
-  test "Cursor valid API-key launch selects the pinned memory store" do
+  test "Cursor valid API-key worker selects memory store without a Keychain command" do
     target = cursor_target()
 
     assert {:ok, checked} =
@@ -60,6 +63,8 @@ defmodule Tightbeam.CursorRegistrationTest do
 
     assert {"CURSOR_API_KEY", "secret"} in plan[:env]
     assert {"AGENT_CLI_CREDENTIAL_STORE", "memory"} in plan[:env]
+    refute Enum.join(plan[:cmd], " ") =~ "security"
+    refute Enum.join(plan[:cmd], " ") =~ "secret"
   end
 
   test "remote Cursor launch validates the banked file without putting its key in argv" do
@@ -103,6 +108,97 @@ defmodule Tightbeam.CursorRegistrationTest do
                remote_env: [],
                lineage: "lineage"
              )
+  end
+
+  test "Cursor refuses a tampered managed shim immediately before launch" do
+    base = Path.join(System.tmp_dir!(), "cursor-shim-#{System.unique_integer([:positive])}")
+    launcher = Path.join([base, "2026.08.11-e8db854", "cursor-agent"])
+    shim = Path.join(base, "cursor-agent-acp")
+    File.mkdir_p!(Path.dirname(launcher))
+    File.write!(launcher, "launcher")
+    File.write!(Path.join(Path.dirname(launcher), "index.js"), "bundle")
+    File.write!(shim, "#!/bin/sh\nexec hacked\n")
+    File.chmod!(shim, 0o755)
+    on_exit(fn -> File.rm_rf!(base) end)
+
+    target =
+      Map.merge(cursor_target(), %{
+        adapter_binary: shim,
+        find_executable: fn _ -> launcher end
+      })
+
+    target = Map.delete(target, :verify_adapter_shim)
+
+    assert {:error, %{code: "cursor_cli_integrity_mismatch"}} =
+             Cursor.prepare_launch(target, "/managed",
+               cursor_api_key: "secret",
+               common_env: [],
+               remote_env: [],
+               lineage: "lineage"
+             )
+  end
+
+  test "remote whitespace-only API keys fail the one bounded load" do
+    parent = self()
+    target = %{cursor_target() | host_config: %{base_dir: "/remote", ssh: "host"}}
+
+    target =
+      Map.put(target, :sh, fn argv ->
+        send(parent, {:remote_load, argv})
+        {"", 1}
+      end)
+
+    assert {:error, %{code: "DIV-CURSOR-API-KEY-ONLY"}} =
+             Cursor.preflight_launch(target, "/managed", credential_kind: :api_key)
+
+    assert_receive {:remote_load, argv}
+    assert Enum.join(argv, " ") =~ "tr -d"
+    refute_receive {:remote_load, _}
+  end
+
+  test "Harness typed ensure and probe dispatchers preserve Cursor integrity codes" do
+    target = %{cursor_target() | sha256: fn _ -> "wrong" end}
+
+    assert {:error, %{code: "cursor_cli_integrity_mismatch"}} =
+             Harness.ensure_adapter(Cursor, target)
+
+    assert {:error, %{code: "cursor_cli_integrity_mismatch"}} =
+             Harness.probe_cli(Cursor, target)
+  end
+
+  test "Gateway public refusal projection preserves the stable code without internal detail" do
+    assert Tightbeam.Gateway.adapter_launch_refusal(%{
+             code: "DIV-CURSOR-API-KEY-ONLY",
+             message: "Cursor requires a banked API key",
+             details: %{path: "/secret", hash: "hidden"}
+           }) == %{
+             code: "DIV-CURSOR-API-KEY-ONLY",
+             message: "Cursor requires a banked API key"
+           }
+  end
+
+  test "Cursor integrity guard refuses every pinned launcher and bundle drift class" do
+    base = cursor_target()
+
+    cases = [
+      %{base | find_executable: fn _ -> nil end},
+      %{base | realpath: fn _ -> {:error, :failed} end},
+      %{base | find_executable: fn _ -> "/tmp/wrong-version/cursor-agent" end},
+      %{base | sha256: fn _ -> "wrong" end},
+      %{
+        base
+        | sha256: fn path ->
+            if Path.basename(path) == "index.js",
+              do: "wrong",
+              else: "eed61c5224668c9236334c4c68936a16aecc37374b592f59e31eb50433817831"
+          end
+      }
+    ]
+
+    Enum.each(cases, fn target ->
+      assert {:error, %{code: "cursor_cli_integrity_mismatch"}} =
+               Cursor.verify_installed_cli(target)
+    end)
   end
 
   test "Cursor owns only its non-secret config and compiled hooks" do
@@ -152,7 +248,8 @@ defmodule Tightbeam.CursorRegistrationTest do
         if Path.basename(path) == "index.js",
           do: "6aceb24b7c7ecddb1993946ebb18a7dd4d025842e6efda955eb0c13255b1e5f0",
           else: "eed61c5224668c9236334c4c68936a16aecc37374b592f59e31eb50433817831"
-      end
+      end,
+      verify_adapter_shim: fn _shim, _launcher -> :ok end
     }
   end
 end

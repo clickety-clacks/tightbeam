@@ -200,7 +200,7 @@ defmodule Tightbeam.ServedIdentityPlacementTest do
     config = %{base_dir: ctx.base, db: ctx.db, cwd: "/work", cli_bin: "/bin"}
 
     for _index <- 1..20 do
-      opts = Placement.adapter_opts(config, {:claude, "shared", "eezo"})
+      opts = Placement.adapter_opts!(config, {:claude, "shared", "eezo"})
       assert Enum.any?(opts[:env], fn {name, _} -> name == "CLAUDE_CONFIG_DIR" end)
       refute Enum.any?(opts[:env], fn {name, _} -> name == "CLAUDE_CODE_OAUTH_TOKEN" end)
       refute inspect(opts) =~ "sk-ant-oat01-shared"
