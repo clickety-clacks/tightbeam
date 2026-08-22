@@ -1705,7 +1705,7 @@ defmodule Tightbeam.Gateway do
          {:ok, result} <-
            at_session_turn_boundary(config, session.session_key, fn ->
              run_session_mutation(session.session_key, fn ->
-               with {:ok, adapter, generation} <- checkout_adapter(session),
+               with {:ok, adapter, generation} <- checkout_adapter(session, config),
                     {:ok, sid} <- harness_session(config, db, adapter, generation, session, nil),
                     {:ok, %Model{}} <- Adapter.current_model(adapter, sid) do
                  :ok
@@ -2075,7 +2075,7 @@ defmodule Tightbeam.Gateway do
 
       outcome =
         with {:ok, adapter, generation} <-
-               stage(:checkout, checkout_adapter(session)),
+               stage(:checkout, checkout_adapter(session, config)),
              {:ok, harness_session_id} <-
                stage(
                  :session,
@@ -2152,7 +2152,7 @@ defmodule Tightbeam.Gateway do
               # its message, and a failure that lost its brief showed Flynn
               # "agent progress interrupted" with no reason attached.
               append_turn_failed_marker(db, turn.session_key, error_sentence(reason))
-              publish_turn_state(db, turn.session_key, correlation, "failed", inspect(reason))
+              publish_turn_state(db, turn.session_key, correlation, "failed", reason)
               publish_session_indicator(db, turn.session_key, session.owner_user_id)
 
               broadcast(
@@ -2267,9 +2267,18 @@ defmodule Tightbeam.Gateway do
 
       {state, error} =
         case status do
-          "delivered" -> {"delivered", nil}
-          "canceled" -> {"canceled", nil}
-          _ -> {"failed", Map.get(row, :error) || "interrupted: outcome unknown"}
+          "delivered" ->
+            {"delivered", nil}
+
+          "canceled" ->
+            {"canceled", nil}
+
+          _ ->
+            {"failed",
+             row
+             |> Map.get(:error)
+             |> decode_public_error()
+             |> Kernel.||("interrupted: outcome unknown")}
         end
 
       # Crash-recovered failures get the in-chat marker too — this path IS
@@ -2366,10 +2375,11 @@ defmodule Tightbeam.Gateway do
     :exit, _ -> :ok
   end
 
-  defp checkout_adapter(session) do
+  defp checkout_adapter(session, config) do
     key = {Harness.parse!(session.harness).id(), "shared", session.host}
+    coordinator = Map.get(config, :adapter_coordinator, Tightbeam.AdapterCoordinator)
 
-    case AdapterCoordinator.adapter_for_turn(Tightbeam.AdapterCoordinator, key) do
+    case AdapterCoordinator.adapter_for_turn(coordinator, key) do
       {:ok, adapter, generation} ->
         {:ok, adapter, generation}
 
@@ -6638,6 +6648,17 @@ defmodule Tightbeam.Gateway do
         )
     end
   end
+
+  defp decode_public_error(nil), do: nil
+
+  defp decode_public_error(error) when is_binary(error) do
+    case JSON.decode(error) do
+      {:ok, %{"code" => code} = decoded} when is_binary(code) -> decoded
+      _ -> error
+    end
+  end
+
+  defp decode_public_error(error), do: error
 
   defp broadcast(_db, owner, payload),
     do: Tightbeam.ConnRegistry.broadcast(Tightbeam.ConnRegistry, owner, payload, &deliver/2)

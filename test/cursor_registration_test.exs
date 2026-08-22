@@ -67,6 +67,36 @@ defmodule Tightbeam.CursorRegistrationTest do
     refute Enum.join(plan[:cmd], " ") =~ "secret"
   end
 
+  test "the exact pinned vendor bundle recognizes memory and bypasses the login-Keychain selector" do
+    launcher = System.find_executable("cursor-agent")
+    assert is_binary(launcher), "the pinned Cursor acceptance fixture is not installed"
+    {canonical, 0} = System.cmd("realpath", [launcher])
+    canonical = String.trim(canonical)
+    bundle_path = Path.join(Path.dirname(canonical), "index.js")
+    bundle = File.read!(bundle_path)
+
+    assert Path.basename(Path.dirname(canonical)) == Cursor.adapter_version()
+    assert sha256(canonical) == "eed61c5224668c9236334c4c68936a16aecc37374b592f59e31eb50433817831"
+
+    assert sha256(bundle_path) ==
+             "6aceb24b7c7ecddb1993946ebb18a7dd4d025842e6efda955eb0c13255b1e5f0"
+
+    assert bundle =~ ~s("file"===t?"file":"memory"===t?"memory":"default")
+    assert bundle =~ ~s("darwin"===e&&t&&!n&&"default"===r)
+    assert bundle =~ "process.env.CURSOR_API_KEY"
+    assert bundle =~ "/usr/bin/security"
+
+    selector = fn
+      "file" -> "file"
+      "memory" -> "memory"
+      _invalid -> "default"
+    end
+
+    assert selector.("memory") == "memory"
+    assert selector.("arbitrary-invalid") == "default"
+    refute "default" == selector.("memory")
+  end
+
   test "remote Cursor launch validates the banked file without putting its key in argv" do
     parent = self()
     target = %{cursor_target() | host_config: %{base_dir: "/remote", ssh: "host"}}
@@ -74,7 +104,7 @@ defmodule Tightbeam.CursorRegistrationTest do
     target =
       Map.put(target, :sh, fn argv ->
         send(parent, {:remote_check, argv})
-        {"", 0}
+        {" remote-secret \n", 0}
       end)
 
     assert {:ok, checked} =
@@ -82,6 +112,7 @@ defmodule Tightbeam.CursorRegistrationTest do
 
     assert_receive {:remote_check, check_argv}
     assert Enum.join(check_argv, " ") =~ "test -r"
+    assert Enum.join(check_argv, " ") =~ "cat"
 
     assert {:ok, plan} =
              Cursor.prepare_launch(
@@ -92,9 +123,10 @@ defmodule Tightbeam.CursorRegistrationTest do
 
     serialized = Enum.join(plan[:cmd], " ")
     assert serialized =~ "AGENT_CLI_CREDENTIAL_STORE=memory"
-    assert serialized =~ "api-key"
-    refute serialized =~ "secret"
-    refute Enum.any?(plan[:env], fn {name, _} -> name == "CURSOR_API_KEY" end)
+    assert serialized =~ "SendEnv=CURSOR_API_KEY"
+    refute serialized =~ "api-key"
+    refute serialized =~ "remote-secret"
+    assert {"CURSOR_API_KEY", "remote-secret"} in plan[:env]
   end
 
   test "Cursor integrity failures remain typed at probe and launch" do
@@ -145,15 +177,26 @@ defmodule Tightbeam.CursorRegistrationTest do
     target =
       Map.put(target, :sh, fn argv ->
         send(parent, {:remote_load, argv})
-        {"", 1}
+        {"  \n", 0}
       end)
 
     assert {:error, %{code: "DIV-CURSOR-API-KEY-ONLY"}} =
              Cursor.preflight_launch(target, "/managed", credential_kind: :api_key)
 
     assert_receive {:remote_load, argv}
-    assert Enum.join(argv, " ") =~ "tr -d"
+    assert Enum.join(argv, " ") =~ "cat"
     refute_receive {:remote_load, _}
+  end
+
+  test "remote missing, unreadable, empty, and whitespace keys refuse before planning" do
+    target = %{cursor_target() | host_config: %{base_dir: "/remote", ssh: "host"}}
+
+    for result <- [{"", 1}, {"cat: permission denied", 1}, {"", 0}, {" \n\t", 0}] do
+      target = Map.put(target, :sh, fn _argv -> result end)
+
+      assert {:error, %{code: "DIV-CURSOR-API-KEY-ONLY"}} =
+               Cursor.preflight_launch(target, "/managed", credential_kind: :api_key)
+    end
   end
 
   test "Harness typed ensure and probe dispatchers preserve Cursor integrity codes" do
@@ -199,6 +242,74 @@ defmodule Tightbeam.CursorRegistrationTest do
       assert {:error, %{code: "cursor_cli_integrity_mismatch"}} =
                Cursor.verify_installed_cli(target)
     end)
+  end
+
+  test "every local integrity drift refuses at ensure, probe, and prepare before spawn" do
+    base = cursor_target()
+
+    cases = [
+      %{base | find_executable: fn _ -> nil end},
+      %{base | realpath: fn _ -> {:error, :unreadable} end},
+      %{base | find_executable: fn _ -> "/tmp/PATH-fallback/cursor-agent" end},
+      %{base | sha256: fn _ -> {:error, :unreadable} end},
+      %{base | sha256: fn _ -> "damaged" end},
+      %{
+        base
+        | sha256: fn path ->
+            if Path.basename(path) == "index.js",
+              do: "damaged-bundle",
+              else: "eed61c5224668c9236334c4c68936a16aecc37374b592f59e31eb50433817831"
+          end
+      }
+    ]
+
+    Enum.each(cases, &assert_integrity_refusal_at_every_seam/1)
+  end
+
+  test "remote command, canonicalization, and hash failures refuse at every seam" do
+    parent = self()
+
+    for failure <- [:command, :realpath, :launcher_hash, :bundle_hash] do
+      target = %{
+        base_dir: "/remote",
+        host_name: "vector",
+        host_config: %{base_dir: "/remote", ssh: "host"},
+        sh: fn argv ->
+          command = Enum.join(argv, " ")
+          send(parent, {:remote_integrity_command, failure, command})
+
+          cond do
+            failure == :command and command =~ "command -v" ->
+              {"", 127}
+
+            command =~ "command -v" ->
+              {"/remote/2026.08.11-e8db854/cursor-agent\n", 0}
+
+            failure == :realpath and command =~ "realpath" ->
+              {"", 1}
+
+            command =~ "realpath" ->
+              {"/remote/2026.08.11-e8db854/cursor-agent\n", 0}
+
+            failure == :launcher_hash and command =~ "cursor-agent" ->
+              {"bad\n", 0}
+
+            failure == :bundle_hash and command =~ "index.js" ->
+              {"bad\n", 0}
+
+            command =~ "cursor-agent" ->
+              {"eed61c5224668c9236334c4c68936a16aecc37374b592f59e31eb50433817831\n", 0}
+
+            command =~ "index.js" ->
+              {"6aceb24b7c7ecddb1993946ebb18a7dd4d025842e6efda955eb0c13255b1e5f0\n", 0}
+          end
+        end
+      }
+
+      assert_integrity_refusal_at_every_seam(target)
+    end
+
+    assert_receive {:remote_integrity_command, _, _}
   end
 
   test "Cursor owns only its non-secret config and compiled hooks" do
@@ -251,5 +362,28 @@ defmodule Tightbeam.CursorRegistrationTest do
       end,
       verify_adapter_shim: fn _shim, _launcher -> :ok end
     }
+  end
+
+  defp assert_integrity_refusal_at_every_seam(target) do
+    assert {:error, %{code: "cursor_cli_integrity_mismatch"}} =
+             Harness.ensure_adapter(Cursor, target)
+
+    assert {:error, %{code: "cursor_cli_integrity_mismatch"}} =
+             Harness.probe_cli(Cursor, target)
+
+    assert {:error, %{code: "cursor_cli_integrity_mismatch"}} =
+             Harness.prepare_launch(Cursor, target, "/managed",
+               cursor_api_key: "in-memory-only",
+               common_env: [],
+               remote_env: [],
+               lineage: "lineage"
+             )
+  end
+
+  defp sha256(path) do
+    path
+    |> File.read!()
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.encode16(case: :lower)
   end
 end

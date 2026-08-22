@@ -1422,6 +1422,7 @@ defmodule Tightbeam.Placement do
           {:ok, %{bin: String.t(), version: String.t()}}
           | {:error, :not_found}
           | {:error, {:exec_failed, String.t()}}
+          | {:error, Harness.launch_refusal()}
   def harness_binary_probe(harness, cli_bin, opts \\ []) do
     module = Harness.module!(harness)
 

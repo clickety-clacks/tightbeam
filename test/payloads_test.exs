@@ -153,6 +153,19 @@ defmodule Tightbeam.Wire.PayloadsTest do
     assert failed["payload"]["correlationId"] == "client-1"
     assert failed["payload"]["terminalState"] == true
     assert failed["payload"]["error"] == "boom"
+
+    refused =
+      Payloads.prompt_turn_state_event(%{
+        client_message_id: "client-2",
+        session_key: "s1",
+        state: "failed",
+        error: %{"code" => "DIV-CURSOR-API-KEY-ONLY", "message" => "API key required"}
+      })
+
+    assert refused["payload"]["error"] == %{
+             "code" => "DIV-CURSOR-API-KEY-ONLY",
+             "message" => "API key required"
+           }
   end
 
   test "stream builders preserve exact wrapper shapes" do

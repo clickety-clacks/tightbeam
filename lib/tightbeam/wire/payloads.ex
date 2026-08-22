@@ -218,7 +218,8 @@ defmodule Tightbeam.Wire.Payloads do
           client_message_id: String.t(),
           session_key: String.t(),
           state: turn_state(),
-          error: String.t() | nil
+          error:
+            String.t() | %{required(:code) => String.t(), optional(:message) => String.t()} | nil
         }) :: payload()
   def prompt_turn_state_event(input) do
     client_message_id = Map.fetch!(input, :client_message_id)

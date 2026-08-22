@@ -366,16 +366,17 @@ defmodule Tightbeam.Harness.Support do
             ]
           ]
         else
-          key_path = Path.join([base, "auth", "cursor", "api-key"])
-
-          script =
-            "exec env CURSOR_API_KEY=\"$(cat #{shell_quote(key_path)})\" " <>
-              "AGENT_CLI_CREDENTIAL_STORE=memory CURSOR_CONFIG_DIR=#{shell_quote(home)} " <>
-              "REMOTE=1 #{shell_quote(adapter)}"
-
           [
-            cmd: ["ssh" | ssh_opts()] ++ ["vector@remote", "sh", "-c", shell_quote(script)],
-            env: [{"TIGHTBEAM_LINEAGE", "tb-vector"}]
+            cmd:
+              ["ssh" | ssh_opts()] ++
+                ["-o", "SendEnv=CURSOR_API_KEY", "vector@remote", "exec", "env"] ++
+                [
+                  "AGENT_CLI_CREDENTIAL_STORE=memory",
+                  "CURSOR_CONFIG_DIR=#{shell_quote(home)}",
+                  "REMOTE=1",
+                  adapter
+                ],
+            env: [{"CURSOR_API_KEY", "vector-token"}, {"TIGHTBEAM_LINEAGE", "tb-vector"}]
           ]
         end
       else
