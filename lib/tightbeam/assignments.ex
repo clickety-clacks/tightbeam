@@ -694,16 +694,20 @@ defmodule Tightbeam.Assignments do
                 if Wakes.rumination_exists_in_txn?(txn, id, caller_session) do
                   {:open, resolved_call}
                 else
-                  Wakes.schedule_in_txn(txn, %{
-                    session_key: caller_session,
-                    origin: call.origin,
-                    creator_session_key: caller_session,
-                    prompt:
-                      "digest: Ruminate on work-item #{id} against the whole spec and its spirit before you fan out. Intent you were about to dispatch: subject=#{call.params[:subject]} brief=#{call.params[:brief]}. When you've thought it through, re-issue the dispatch.",
-                    due_at: now(),
-                    rumination: true,
-                    work_item_id: id
-                  })
+                  wake =
+                    Wakes.schedule_in_txn(txn, %{
+                      session_key: caller_session,
+                      origin: call.origin,
+                      creator_session_key: caller_session,
+                      prompt:
+                        "digest: Ruminate on work-item #{id} against the whole spec and its spirit before you fan out. Intent you were about to dispatch: subject=#{call.params[:subject]} brief=#{call.params[:brief]}. When you've thought it through, re-issue the dispatch.",
+                      due_at: now(),
+                      rumination: true,
+                      work_item_id: id
+                    })
+
+                  Publisher.maybe_observed_accepted_in_txn(txn, call)
+                  Wakes.publish_change_in_txn(txn, "wake.scheduled", wake.wake_id)
 
                   %{
                     rumination_required: true,

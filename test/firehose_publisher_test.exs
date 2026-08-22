@@ -136,6 +136,18 @@ defmodule Tightbeam.Firehose.PublisherTest do
       model: Tightbeam.Model.new("fable")
     })
 
+    Org.create(db, %{
+      session_key: "effect-dispatcher",
+      display_name: "Effect dispatcher",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Tightbeam.Model.new("fable")
+    })
+
     start_supervised!(
       {Wakes,
        db: db,
@@ -197,6 +209,10 @@ defmodule Tightbeam.Firehose.PublisherTest do
       wake_observed ++ observed_state_classes()
     )
 
+    cancel_miss = put_in(cancel_wake, [:params, :cancel_wake_id], "w_missing_effect")
+    assert {:ok, %{canceled: false}} = Dispatch.dispatch(db, handlers, cancel_miss)
+    assert observed_classes() == ["verb.accepted"]
+
     _condition_wake =
       Wakes.schedule(db, %{
         session_key: "effect-target",
@@ -229,7 +245,45 @@ defmodule Tightbeam.Firehose.PublisherTest do
     }
 
     assert {:ok, assignment} = Dispatch.dispatch(db, handlers, dispatch)
-    assert_per_verb_effects!(config, "dispatch", observed_state_classes())
+    dispatch_observed = observed_state_classes()
+
+    work_item_create = %{
+      verb: "work-item-create",
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      session_key: nil,
+      params: %{title: "Exercise the rumination dispatch effect"}
+    }
+
+    assert {:ok, work_item} = Dispatch.dispatch(db, handlers, work_item_create)
+    _ = observed_classes()
+
+    rumination_dispatch = %{
+      verb: "dispatch",
+      origin: "agent:effect-dispatcher",
+      principal: {:session, "effect-dispatcher"},
+      session_key: "effect-target",
+      target_role: nil,
+      role_fallback: false,
+      params: %{
+        subject: "Effect rumination dispatch",
+        brief: "Exercise the committed internal wake path.",
+        work_item_id: work_item.id
+      }
+    }
+
+    assert {:ok, %{rumination_required: true, work_item_id: work_item_id}} =
+             Dispatch.dispatch(db, handlers, rumination_dispatch)
+
+    assert work_item_id == work_item.id
+    rumination_classes = observed_classes()
+    assert rumination_classes == ["verb.accepted", "wake.scheduled"]
+
+    assert_per_verb_effects!(
+      config,
+      "dispatch",
+      dispatch_observed ++ state_classes(rumination_classes)
+    )
 
     tests_passed = %{
       verb: "attest",
@@ -568,19 +622,25 @@ defmodule Tightbeam.Firehose.PublisherTest do
     end
   end
 
-  defp observed_state_classes(acc \\ []) do
+  defp observed_classes(acc \\ []) do
     _ = :sys.get_state(Hub)
 
     receive do
       {:firehose_notice, %{"class" => class}} ->
         Hub.delivered(Hub, self())
-        observed_state_classes([class | acc])
+        observed_classes([class | acc])
     after
-      0 ->
-        acc
-        |> Enum.filter(&match?({:ok, _row}, Tightbeam.Firehose.Registry.fetch(&1)))
-        |> Enum.reverse()
+      0 -> Enum.reverse(acc)
     end
+  end
+
+  defp observed_state_classes do
+    observed_classes()
+    |> state_classes()
+  end
+
+  defp state_classes(classes) do
+    Enum.filter(classes, &match?({:ok, _row}, Tightbeam.Firehose.Registry.fetch(&1)))
   end
 
   defp receive_notice do

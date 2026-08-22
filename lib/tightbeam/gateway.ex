@@ -1008,7 +1008,7 @@ defmodule Tightbeam.Gateway do
 
         Assignments.__handle__(db, "assign", call)
       end,
-      {"dispatch", ["assignment.opened", "message.created"]} => fn call ->
+      {"dispatch", ["assignment.opened", "message.created", "wake.scheduled"]} => fn call ->
         call =
           call
           |> Map.put(:supervision_interval_ms, Map.fetch!(config, :wake_tick_ms))
@@ -3787,6 +3787,7 @@ defmodule Tightbeam.Gateway do
                 result
 
               :unknown ->
+                Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
                 false
 
               {:ambiguous, error} ->
