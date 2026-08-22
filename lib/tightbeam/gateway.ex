@@ -100,6 +100,58 @@ defmodule Tightbeam.Gateway do
   alias Tightbeam.Wire.Payloads
   require Logger
 
+  # Every immutable handler has one accepted-result effect declaration here.
+  # Empty entries are deliberate: adding or removing a handler without deciding
+  # its effects makes handlers/1 refuse to build.
+  @handler_effects Map.merge(
+                     Map.new(
+                       ~w(
+                         post facts-read artifact-get artifacts waive revoke-waiver
+                         decision-requests decision-request host-env-set host-env-list
+                         host-env-unset register-host update-clients identity-edit
+                         identity-status identity-relearn identity-repoint learn unlearn
+                         kungfu-list identity-apply kungfu-scaffold onboard promote-user
+                         config harness-processes role-list work-item-get work-item-trace
+                         transcript attend toplines topline coordination-share digest-members
+                         work-item-list attests assignment-get assignments inspect cancel tune
+                       ),
+                       &{&1, []}
+                     ),
+                     %{
+                       "wake" => ["wake.scheduled", "wake.canceled"],
+                       "condition" => ["condition_fact.filed"],
+                       "artifact-record" => ["artifact.recorded"],
+                       "rule" => ["decision_request.ruled"],
+                       "effort-rule" => ["decision_request.ruled"],
+                       "withdraw" => ["decision_request.withdrawn"],
+                       "ask" => ["decision_request.opened"],
+                       "answer" => ["decision_request.ruled"],
+                       "approve-device" => ["device.approved"],
+                       "deny-device" => ["device.denied"],
+                       "revoke-device" => ["device.revoked"],
+                       "add-user" => ["user.added"],
+                       "read-marker-set" => ["read_marker.updated"],
+                       "read-marker-clear" => ["read_marker.updated"],
+                       "role-create" => ["role.created"],
+                       "role-bind" => ["role.bound"],
+                       "role-rm" => ["role.removed"],
+                       "work-item-create" => ["work_item.created", "wake.scheduled"],
+                       "work-item-update" => ["work_item.updated"],
+                       "work-item-icebox" => ["work_item.iceboxed"],
+                       "work-item-reopen" => ["work_item.reopened"],
+                       "work-item-close" => ["work_item.closed"],
+                       "work-item-fail" => ["work_item.failed"],
+                       "assign" => ["assignment.opened"],
+                       "dispatch" => ["assignment.opened"],
+                       "attest" => ["attest.filed", "assignment.closed"],
+                       "revoke-assignment" => ["assignment.closed"],
+                       "reopen-assignment" => ["assignment.reopened"],
+                       "critical" => ["critical_lease.updated"],
+                       "spawn" => ["session.spawned"],
+                       "retire" => ["session.retired"]
+                     }
+                   )
+
   defmodule EffortRearmRace do
     @moduledoc false
     defexception message: "effort rearm snapshot changed"
@@ -1031,6 +1083,30 @@ defmodule Tightbeam.Gateway do
       "tune" => fn call -> tune_result(config, db, call) end,
       "retire" => fn call -> retire_result(config, db, call) end
     }
+    |> validate_handler_effects!()
+  end
+
+  @doc "Accepted-result state effects declared by the actual immutable handler table."
+  @spec handler_effects(Tightbeam.Dispatch.handlers()) :: %{String.t() => [String.t()]}
+  def handler_effects(handlers) do
+    handler_verbs = handlers |> Map.keys() |> MapSet.new()
+    effect_verbs = @handler_effects |> Map.keys() |> MapSet.new()
+
+    if handler_verbs != effect_verbs do
+      missing = effect_verbs |> MapSet.difference(handler_verbs) |> Enum.sort()
+      undeclared = handler_verbs |> MapSet.difference(effect_verbs) |> Enum.sort()
+
+      raise ArgumentError,
+            "gateway handler effect table mismatch: missing handlers=#{inspect(missing)} " <>
+              "undeclared handlers=#{inspect(undeclared)}"
+    end
+
+    @handler_effects
+  end
+
+  defp validate_handler_effects!(handlers) do
+    _effects = handler_effects(handlers)
+    handlers
   end
 
   # A terminal-disposition handler routes the owner doorbell through the same

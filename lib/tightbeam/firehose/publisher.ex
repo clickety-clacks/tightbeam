@@ -48,31 +48,22 @@ defmodule Tightbeam.Firehose.Publisher do
   @spec state_verbs() :: [String.t()]
   def state_verbs, do: Map.keys(@state_verbs)
 
-  @doc "State effects attached to the gateway's actual immutable handler table."
-  @spec handler_effects(Tightbeam.Dispatch.handlers()) :: %{String.t() => [String.t()]}
-  def handler_effects(handlers) do
-    Map.new(handlers, fn {verb, _handler} -> {verb, effect_classes(verb)} end)
+  @doc "State effects the accepted-result publisher actually emits, by verb."
+  @spec verb_effects() :: %{String.t() => [String.t()]}
+  def verb_effects do
+    Map.new(@state_verbs, fn {verb, {class, _serializer}} ->
+      {verb, [class | Map.get(@variant_verb_effects, verb, [])]}
+    end)
   end
 
-  @spec emitted_state_classes(Tightbeam.Dispatch.handlers()) :: [String.t()]
-  def emitted_state_classes(handlers) do
-    handlers
-    |> handler_effects()
+  @spec emitted_state_classes(%{String.t() => [String.t()]}) :: [String.t()]
+  def emitted_state_classes(handler_effects) do
+    handler_effects
     |> Map.values()
     |> List.flatten()
     |> Kernel.++(@direct_state_classes)
     |> Enum.uniq()
     |> Enum.sort()
-  end
-
-  defp effect_classes(verb) do
-    primary =
-      case @state_verbs[verb] do
-        {class, _serializer} -> [class]
-        nil -> []
-      end
-
-    primary ++ Map.get(@variant_verb_effects, verb, [])
   end
 
   @spec accepted(map(), term()) :: :ok
