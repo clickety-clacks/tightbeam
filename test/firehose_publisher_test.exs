@@ -1,12 +1,77 @@
 defmodule Tightbeam.Firehose.PublisherTest do
   use Tightbeam.TestCase, async: false
 
+  alias Tightbeam.{DB, Dispatch, Gateway, Rules, Wakes}
   alias Tightbeam.Firehose.{Hub, Publisher}
 
   setup do
+    :persistent_term.erase(Rules)
     start_supervised!({Hub, name: Hub})
     :ok = Hub.register(Hub, self())
+    on_exit(fn -> :persistent_term.erase(Rules) end)
     :ok
+  end
+
+  test "work-item-create emits its committed routing wake once, never on keyed replay" do
+    db = :firehose_work_item_create_db
+    start_supervised!({DB, path: ":memory:", name: db})
+    :ok = Tightbeam.Schema.ensure_all(db)
+    {:ok, _} = DB.query(db, "INSERT INTO users VALUES ('flynn', 1, 1)")
+
+    handlers = Gateway.handlers(%{db: db})
+
+    call = %{
+      verb: "work-item-create",
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      session_key: nil,
+      params: %{title: "Route this", idempotency_key: "firehose-create"}
+    }
+
+    assert {:ok, item} = Dispatch.dispatch(db, handlers, call)
+
+    assert_receive {:firehose_notice,
+                    %{
+                      "class" => "wake.scheduled",
+                      "refs" => %{"wakeId" => wake_id, "workItemId" => work_item_id}
+                    }}
+
+    assert work_item_id == item.id
+    assert Wakes.get(db, wake_id).work_item_id == item.id
+    assert_receive {:firehose_notice, %{"class" => "verb.accepted"}}
+    assert_receive {:firehose_notice, %{"class" => "work_item.created"}}
+
+    assert {:ok, replay} = Dispatch.dispatch(db, handlers, call)
+    assert replay.id == item.id
+    assert_receive {:firehose_notice, %{"class" => "verb.accepted"}}
+    assert_receive {:firehose_notice, %{"class" => "work_item.created"}}
+    refute_receive {:firehose_notice, %{"class" => "wake.scheduled"}}
+  end
+
+  test "a raised state handler emits denied and never accepted state effects" do
+    db = :firehose_raised_handler_db
+    start_supervised!({DB, path: ":memory:", name: db})
+    :ok = Tightbeam.Schema.ensure_all(db)
+
+    call = %{
+      verb: "work-item-create",
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      session_key: nil,
+      params: %{title: "Will raise"}
+    }
+
+    assert {:error, %{code: "server_error", message: "review boom"}} =
+             Dispatch.dispatch(db, %{"work-item-create" => fn _ -> raise "review boom" end}, call)
+
+    assert_receive {:firehose_notice,
+                    %{
+                      "class" => "verb.denied",
+                      "payload" => %{"code" => "server_error", "verb" => "work-item-create"}
+                    }}
+
+    refute_receive {:firehose_notice, %{"class" => "verb.accepted"}}
+    refute_receive {:firehose_notice, %{"class" => "work_item.created"}}
   end
 
   test "an accepted state verb emits its observation and canonical state notice" do

@@ -1,8 +1,8 @@
 defmodule Tightbeam.Wire.ChangeSocketTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Devices}
-  alias Tightbeam.Firehose.{Hub, Registry}
+  alias Tightbeam.{DB, Devices, Gateway}
+  alias Tightbeam.Firehose.{Hub, Publisher, Registry}
   alias Tightbeam.Wire.ChangeSocket
 
   setup do
@@ -121,8 +121,11 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
              ChangeSocket.handle_info({:firehose_notice, notice}, state)
   end
 
-  test "registry rows are both-way unique and observational classes have no resource row" do
+  test "registry rows are both-way unique and cover effects from the real gateway table", ctx do
     rows = Registry.rows()
+    handlers = Gateway.handlers(%{db: ctx.db})
+    handler_effects = Publisher.handler_effects(handlers)
+    {:module, Tightbeam.StateResources} = Code.ensure_loaded(Tightbeam.StateResources)
 
     assert map_size(rows) ==
              rows |> Map.values() |> Enum.map(& &1.class) |> Enum.uniq() |> length()
@@ -135,8 +138,14 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
     assert Enum.all?(Registry.observational_classes(), &match?(:error, Registry.fetch(&1)))
     assert Enum.sort(Map.keys(rows) ++ Registry.observational_classes()) == Registry.classes()
 
-    assert Tightbeam.Firehose.Publisher.emitted_state_classes() ==
-             rows |> Map.keys() |> Enum.sort()
+    assert Publisher.state_verbs() -- Map.keys(handlers) == []
+    assert Publisher.emitted_state_classes(handlers) == rows |> Map.keys() |> Enum.sort()
+
+    assert handler_effects
+           |> Enum.reject(fn {_verb, classes} -> classes == [] end)
+           |> Map.new()
+           |> Map.keys()
+           |> Enum.sort() == Publisher.state_verbs() |> Enum.sort()
   end
 
   test "condition facts share owner visibility and critical state is admin-only", ctx do

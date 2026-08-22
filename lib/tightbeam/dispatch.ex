@@ -244,7 +244,7 @@ defmodule Tightbeam.Dispatch do
             error = %{code: "server_error", message: Exception.message(exception)}
             payload = outcome_payload(verb, call, {:raised, exception})
             :ok = EventLog.append_event(db, "verb", verb, origin, session_key, payload, principal)
-            :ok = Publisher.accepted(db, publisher_call, payload)
+            :ok = Publisher.denied(publisher_call, error)
             {:error, error}
         end
     end

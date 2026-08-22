@@ -113,7 +113,7 @@ defmodule Tightbeam.WorkItems do
                 ]
               )
 
-              arm_routing_in_txn(txn, id, owner, call.params.title)
+              routing_wake = arm_routing_in_txn(txn, id, owner, call.params.title)
 
               if key do
                 Txn.q(
@@ -123,7 +123,7 @@ defmodule Tightbeam.WorkItems do
                 )
               end
 
-              {:created, fetch_in_txn(txn, id)}
+              {:created, fetch_in_txn(txn, id), routing_wake}
 
             item_id ->
               {:replayed, fetch_in_txn(txn, item_id)}
@@ -134,8 +134,9 @@ defmodule Tightbeam.WorkItems do
         # An actual create makes an owner-visible item — one owner-routed
         # metadata doorbell (constitution §2: the owner is nagged about their
         # unassigned item). A keyed replay created nothing, so it stays silent.
-        {:created, item} ->
+        {:created, item, routing_wake} ->
           best_effort(fn -> on_change(call).(item.id, "metadata") end)
+          best_effort(fn -> on_routing_wake_scheduled(call).(routing_wake) end)
           public_work_item(item)
 
         {:replayed, item} ->
@@ -617,7 +618,7 @@ defmodule Tightbeam.WorkItems do
       })
 
     Txn.q(txn, "UPDATE work_items SET routingWakeId = ?2 WHERE id = ?1", [id, wake.wake_id])
-    :ok
+    wake
   end
 
   defp triage_deadline_ms do
@@ -806,6 +807,9 @@ defmodule Tightbeam.WorkItems do
   defp metadata(item), do: {item.title, item.specRefName, item.specRefSha256, item.isBug}
 
   defp on_change(call), do: Map.get(call, :on_work_item_change, fn _, _ -> :ok end)
+
+  defp on_routing_wake_scheduled(call),
+    do: Map.get(call, :on_routing_wake_scheduled, fn _ -> :ok end)
 
   defp best_effort(fun) do
     try do

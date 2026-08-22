@@ -940,7 +940,15 @@ defmodule Tightbeam.Gateway do
         WorkItems.__handle__(
           db,
           "work-item-create",
-          Map.put(call, :on_work_item_change, item_change)
+          call
+          |> Map.put(:on_work_item_change, item_change)
+          |> Map.put(:on_routing_wake_scheduled, fn wake ->
+            Tightbeam.Firehose.Publisher.committed(
+              "wake.scheduled",
+              wake,
+              %{"workItemId" => wake.work_item_id}
+            )
+          end)
         )
       end,
       "work-item-get" => fn call -> WorkItems.__handle__(db, "work-item-get", call) end,
