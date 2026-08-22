@@ -76,6 +76,15 @@ defmodule Tightbeam.Firehose.Publisher do
     Txn.handoff(txn, Hub, {:publish, observation_notice("verb.accepted", call)})
   end
 
+  @spec maybe_observed_accepted_in_txn(Txn.t(), map()) :: :ok
+  def maybe_observed_accepted_in_txn(
+        %Txn{} = txn,
+        %{firehose_in_txn: true} = call
+      ),
+      do: observed_accepted_in_txn(txn, call)
+
+  def maybe_observed_accepted_in_txn(%Txn{}, _call), do: :ok
+
   @doc "Capture state needed to authorize and serialize a delete after it commits."
   @spec capture_before(GenServer.server(), map()) :: map()
   def capture_before(db, %{verb: "role-rm"} = call) do

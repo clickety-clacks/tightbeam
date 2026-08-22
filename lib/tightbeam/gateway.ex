@@ -1057,7 +1057,9 @@ defmodule Tightbeam.Gateway do
       {"critical", ["critical_lease.updated"]} => fn call -> critical_result(config, db, call) end,
       {"spawn", ["session.spawned"]} => fn call -> spawn_result(config, db, call) end,
       {"tune", ["message.created"]} => fn call -> tune_result(config, db, call) end,
-      {"retire", ["session.retired"]} => fn call -> retire_result(config, db, call) end
+      {"retire", ["session.retired", "wake.scheduled"]} => fn call ->
+        retire_result(config, db, call)
+      end
     }
     |> compile_handler_specs!()
   end
@@ -6342,7 +6344,7 @@ defmodule Tightbeam.Gateway do
 
     cond do
       prior && prior.session_key == call.session_key ->
-        retire_replay_notice(db, call, %{
+        retire_replay_observation(db, call, %{
           deleted_session_key: call.session_key,
           retired_session_keys: retired_subtree_keys(db, call.session_key),
           deferred: []
@@ -6364,6 +6366,8 @@ defmodule Tightbeam.Gateway do
             if session.state == "active" do
               {:ok, result} =
                 DB.transaction(db, fn txn ->
+                  Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
+
                   result =
                     retire_cascade_in_txn(
                       txn,
@@ -6383,21 +6387,14 @@ defmodule Tightbeam.Gateway do
                     })
                   end
 
-                  case Enum.find(result.retired, &(&1.session_key == session.session_key)) do
-                    %{session: retired_session} ->
-                      Tightbeam.Firehose.Publisher.maybe_accepted_in_txn(
-                        txn,
-                        call,
-                        retired_session
-                      )
-
-                    nil ->
-                      Tightbeam.Firehose.Publisher.maybe_accepted_in_txn(
-                        txn,
-                        call,
-                        Org.get_in_txn(txn, session.session_key)
-                      )
-                  end
+                  Enum.each(result.retired, fn %{session: retired_session} ->
+                    Tightbeam.Firehose.Publisher.committed_in_txn(
+                      txn,
+                      "session.retired",
+                      retired_session,
+                      %{"sessionKey" => retired_session.session_key}
+                    )
+                  end)
 
                   result
                 end)
@@ -6419,7 +6416,7 @@ defmodule Tightbeam.Gateway do
                 deferred: result.deferred
               }
             else
-              retire_replay_notice(db, call, %{
+              retire_replay_observation(db, call, %{
                 deleted_session_key: session.session_key,
                 retired_session_keys: [],
                 deferred: []
@@ -6432,14 +6429,10 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp retire_replay_notice(db, call, result) do
+  defp retire_replay_observation(db, call, result) do
     {:ok, :ok} =
       DB.transaction(db, fn txn ->
-        Tightbeam.Firehose.Publisher.maybe_accepted_in_txn(
-          txn,
-          call,
-          Org.get_in_txn(txn, call.session_key)
-        )
+        Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
       end)
 
     result
@@ -6579,14 +6572,17 @@ defmodule Tightbeam.Gateway do
 
     case Txn.q(txn, "SELECT 1 FROM wakes WHERE wakeId=?1", [wake_id]) do
       [] ->
-        Wakes.schedule_in_txn(txn, %{
-          wake_id: wake_id,
-          session_key: session_key,
-          origin: "user:#{owner}",
-          prompt:
-            "FINAL RETIRE INSTRUCTION: clean up critical section '#{lease.reason}'; retirement is deferred only until hard deadline #{lease.hard_deadline}.",
-          due_at: lease.hard_deadline
-        })
+        wake =
+          Wakes.schedule_in_txn(txn, %{
+            wake_id: wake_id,
+            session_key: session_key,
+            origin: "user:#{owner}",
+            prompt:
+              "FINAL RETIRE INSTRUCTION: clean up critical section '#{lease.reason}'; retirement is deferred only until hard deadline #{lease.hard_deadline}.",
+            due_at: lease.hard_deadline
+          })
+
+        Wakes.publish_change_in_txn(txn, "wake.scheduled", wake.wake_id)
 
       [[1]] ->
         :ok
