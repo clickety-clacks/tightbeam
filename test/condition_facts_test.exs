@@ -3,12 +3,17 @@ defmodule Tightbeam.ConditionFactsTest do
   alias Tightbeam.Model
 
   alias Tightbeam.{
+    Assignments,
     ConditionFacts,
     ConnRegistry,
     DB,
     EventLog,
     Gateway,
+    Ledger,
     Org,
+    Projection,
+    Roles,
+    WorkItems,
     Wakes
   }
 
@@ -62,11 +67,24 @@ defmodule Tightbeam.ConditionFactsTest do
     start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
     start_supervised!({LaneDoorbell, self()})
 
-    start_supervised!(
-      {Wakes, db: db, name: scheduler, tick_ms: 60_000, batch: 2, deliver: fn _wake -> :ok end}
-    )
+    wake_opts = [
+      db: db,
+      name: scheduler,
+      tick_ms: 60_000,
+      batch: 2,
+      deliver: fn wake ->
+        Gateway.deliver_prompt(wake.session_key, wake.origin, wake.prompt,
+          db: db,
+          wake_id: wake.wake_id,
+          sender: wake.origin,
+          target_gate: wake
+        )
+      end
+    ]
 
-    %{db: db, scheduler: scheduler, session: session}
+    start_supervised!({Wakes, wake_opts})
+
+    %{db: db, scheduler: scheduler, session: session, wake_opts: wake_opts}
   end
 
   test "condition wake uses an id cursor, fires once on a literal fact, and stays count-visible",
@@ -405,6 +423,167 @@ defmodule Tightbeam.ConditionFactsTest do
            }
   end
 
+  test "agent wakes keep the exact running-turn carrier through every delivery boundary", ctx do
+    %{assignment: assignment, caller: caller, turn_seq: turn_seq, work_item: work_item} =
+      attributed_caller(ctx)
+
+    wake_handler = Gateway.handlers(%{db: ctx.db, wake_scheduler: ctx.scheduler})["wake"]
+
+    timed_call =
+      agent_wake_call(caller.session_key, ctx.session.session_key, %{
+        prompt: "timed follow-up",
+        after_ms: 0,
+        assignment_id: "asg_forged",
+        idempotency_key: "agent-timed"
+      })
+
+    timed = wake_handler.(timed_call)
+    replayed = wake_handler.(timed_call)
+    assert replayed.wake_id == timed.wake_id
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM wakes WHERE wakeId = ?1", [timed.wake_id])
+
+    assert_wake_carrier(ctx.db, timed.wake_id, assignment.id)
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    assert_turn_carrier(ctx.db, timed.wake_id, assignment.id, work_item.id)
+
+    condition =
+      wake_handler.(
+        agent_wake_call(caller.session_key, ctx.session.session_key, %{
+          prompt: "condition follow-up",
+          after_ms: 60_000,
+          condition_kind: "agent-condition",
+          condition_scope: "prod",
+          idempotency_key: "agent-condition"
+        })
+      )
+
+    assert_wake_carrier(ctx.db, condition.wake_id, assignment.id)
+
+    ConditionFacts.file(ctx.db, ctx.scheduler, %{
+      kind: "agent-condition",
+      scope: "prod",
+      origin: "process:ci"
+    })
+
+    assert_turn_carrier(ctx.db, condition.wake_id, assignment.id, work_item.id)
+
+    fallback =
+      wake_handler.(
+        agent_wake_call(caller.session_key, ctx.session.session_key, %{
+          prompt: "fallback follow-up",
+          after_ms: 0,
+          condition_kind: "agent-fallback",
+          condition_scope: "prod",
+          idempotency_key: "agent-fallback"
+        })
+      )
+
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    assert %{state: "fired", fired_by: "fallback"} = Wakes.get(ctx.db, fallback.wake_id)
+    assert_turn_carrier(ctx.db, fallback.wake_id, assignment.id, work_item.id)
+
+    canceled =
+      wake_handler.(
+        agent_wake_call(caller.session_key, ctx.session.session_key, %{
+          prompt: "canceled follow-up",
+          after_ms: 60_000,
+          condition_kind: "agent-canceled",
+          condition_scope: "prod",
+          idempotency_key: "agent-canceled"
+        })
+      )
+
+    assert {:accepted_in_txn, _event_id, %{canceled: true}} =
+             cancel_linked_wake(ctx.db, canceled, caller.session_key, assignment.id)
+
+    ConditionFacts.file(ctx.db, ctx.scheduler, %{
+      kind: "agent-canceled",
+      scope: "prod",
+      origin: "process:ci"
+    })
+
+    assert Wakes.get(ctx.db, canceled.wake_id).state == "canceled"
+    assert turn_count(ctx.db, canceled.wake_id) == 0
+
+    restart =
+      wake_handler.(
+        agent_wake_call(caller.session_key, ctx.session.session_key, %{
+          prompt: "restart follow-up",
+          after_ms: 60_000,
+          condition_kind: "agent-restart",
+          condition_scope: "prod",
+          idempotency_key: "agent-restart"
+        })
+      )
+
+    stop_supervised!(Wakes)
+    start_supervised!({Wakes, ctx.wake_opts})
+
+    ConditionFacts.file(ctx.db, ctx.scheduler, %{
+      kind: "agent-restart",
+      scope: "prod",
+      origin: "process:ci"
+    })
+
+    assert_turn_carrier(ctx.db, restart.wake_id, assignment.id, work_item.id)
+
+    for index <- 1..10 do
+      target =
+        Org.create(ctx.db, %{
+          session_key: "agent:race:#{index}",
+          display_name: "Race target #{index}",
+          owner_user_id: "flynn",
+          origin: "user:flynn",
+          archetype: "default",
+          host: "testhost",
+          harness: "claude",
+          provider: "anthropic",
+          model: Model.new("fable")
+        })
+
+      race =
+        wake_handler.(
+          agent_wake_call(caller.session_key, target.session_key, %{
+            prompt: "race follow-up #{index}",
+            after_ms: 0,
+            idempotency_key: "agent-race-#{index}"
+          })
+        )
+
+      fire = Task.async(fn -> Wakes.fire_due(ctx.scheduler) end)
+      retire = Task.async(fn -> Org.retire(ctx.db, target.session_key, "user:flynn", 1_000) end)
+      assert :ok = Task.await(fire)
+      assert %{state: "retired"} = Task.await(retire)
+
+      assert {:ok, rows} =
+               DB.query(
+                 ctx.db,
+                 "SELECT assignmentId, jobRef FROM turns WHERE wakeId = ?1",
+                 [race.wake_id]
+               )
+
+      assert rows in [[], [[assignment.id, work_item.id]]]
+    end
+
+    assert :ok = Ledger.finish(ctx.db, turn_seq, "delivered")
+
+    unscoped =
+      wake_handler.(
+        agent_wake_call(caller.session_key, ctx.session.session_key, %{
+          prompt: "free-choice follow-up",
+          after_ms: 0,
+          assignment_id: assignment.id,
+          idempotency_key: "agent-unscoped"
+        })
+      )
+
+    assert_wake_carrier(ctx.db, unscoped.wake_id, nil)
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    assert_turn_carrier(ctx.db, unscoped.wake_id, nil, nil)
+  end
+
   test "ordered multi-fact eager nudge: a later fact never overtakes an unserved earlier fact",
        ctx do
     # Fan-out (5) > 2×batch (2) forces at least two saturation continuations
@@ -484,8 +663,135 @@ defmodule Tightbeam.ConditionFactsTest do
     result
   end
 
+  defp cancel_linked_wake(db, wake, caller_session_key, assignment_id) do
+    wake = Wakes.get(db, wake.wake_id)
+
+    {:ok, result} =
+      DB.transaction(db, fn txn ->
+        [[generation]] =
+          DB.Txn.q(
+            txn,
+            "SELECT generation FROM supervision_entitlements WHERE assignmentId = ?1",
+            [assignment_id]
+          )
+
+        Wakes.cancel_in_txn(txn, %{
+          wake_id: wake.wake_id,
+          expected_origin: wake.origin,
+          requester: %{kind: "session", id: caller_session_key},
+          reason_kind: "requester_withdrew",
+          causal_source: %{
+            kind: "verb_call",
+            accepted_event: %{
+              origin: wake.origin,
+              session_key: caller_session_key,
+              principal: {:session, caller_session_key}
+            }
+          },
+          outcome: %{
+            kind: "no_replacement",
+            liveness_trigger: %{
+              kind: "supervision_entitlement",
+              id: "#{assignment_id}##{generation}"
+            }
+          }
+        })
+      end)
+
+    result
+  end
+
   defp turn_count(db, wake_id) do
     {:ok, [[count]]} = DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId = ?1", [wake_id])
     count
+  end
+
+  defp attributed_caller(ctx) do
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT OR IGNORE INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1)"
+      )
+
+    caller =
+      Org.create(ctx.db, %{
+        session_key: "agent:creator:app",
+        display_name: "Wake creator",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+
+    Roles.create!(ctx.db, "creator", "flynn", caller.session_key)
+
+    work_item =
+      WorkItems.__handle__(ctx.db, "work-item-create", %{
+        verb: "work-item-create",
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        session_key: nil,
+        params: %{title: "Wake carrier proof"}
+      })
+
+    assignment =
+      Assignments.__handle__(ctx.db, "assign", %{
+        verb: "assign",
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        session_key: caller.session_key,
+        target_role: nil,
+        role_fallback: false,
+        supervision_interval_ms: 60_000,
+        params: %{
+          subject: "Create a card-scoped wake",
+          work_item_id: work_item.id,
+          idempotency_key: nil
+        }
+      })
+
+    {:appended, message} =
+      Projection.append(ctx.db, %{
+        session_key: caller.session_key,
+        role: "user",
+        content: "schedule the follow-up",
+        sender: "user:flynn"
+      })
+
+    {:ok, turn_seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: caller.session_key,
+        message_id: message.id,
+        origin: "user:flynn",
+        prompt: "schedule the follow-up",
+        assignment_id: assignment.id,
+        job_ref: work_item.id
+      })
+
+    assert {:ok, %{seq: ^turn_seq}} = Ledger.claim_next(ctx.db, caller.session_key, "test")
+
+    %{assignment: assignment, caller: caller, turn_seq: turn_seq, work_item: work_item}
+  end
+
+  defp agent_wake_call(caller_session_key, target_session_key, params) do
+    %{
+      origin: "agent:creator",
+      principal: {:session, caller_session_key},
+      session_key: target_session_key,
+      params: params
+    }
+  end
+
+  defp assert_wake_carrier(db, wake_id, assignment_id) do
+    assert {:ok, [[^assignment_id]]} =
+             DB.query(db, "SELECT assignmentId FROM wakes WHERE wakeId = ?1", [wake_id])
+  end
+
+  defp assert_turn_carrier(db, wake_id, assignment_id, job_ref) do
+    assert {:ok, [[^assignment_id, ^job_ref]]} =
+             DB.query(db, "SELECT assignmentId, jobRef FROM turns WHERE wakeId = ?1", [wake_id])
   end
 end

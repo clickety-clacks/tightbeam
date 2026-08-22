@@ -401,6 +401,7 @@ defmodule Tightbeam.RailRemedy do
             verb: "wake",
             origin: "remedy:#{rule.name}",
             principal: principal,
+            bound_assignment_id: context.assignment_id,
             session_key: target,
             params: %{
               prompt: "Remedy #{rule.name} remains pending for #{subject}.",

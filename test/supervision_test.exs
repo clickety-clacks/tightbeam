@@ -3224,7 +3224,7 @@ defmodule Tightbeam.SupervisionTest do
              })
 
     wake = Wakes.get(ctx.db, wake_id)
-    assert wake.assignment_id == nil
+    assert wake.assignment_id == "asg_1"
     assert wake.creator_session_key == "holder"
 
     assert {:ok, [["asg_1", "holder", ^seq, "process:tightbeam"]]} =

@@ -16,7 +16,8 @@ defmodule Tightbeam.RailRemedyTest do
     RailRemedy,
     Roles,
     Rules,
-    Wakes
+    Wakes,
+    WorkItems
   }
 
   setup do
@@ -656,7 +657,8 @@ defmodule Tightbeam.RailRemedyTest do
   end
 
   test "live episode re-wakes with a fresh occurrence-plus-counter key", ctx do
-    assignment = assignment(ctx, "rewake")
+    work_item = work_item(ctx, "Rail re-wake carrier")
+    assignment = assignment(ctx, "rewake", work_item.id)
     load_review_gate(ctx)
     reviewer_key = ctx.reviewer.session_key
 
@@ -691,6 +693,37 @@ defmodule Tightbeam.RailRemedyTest do
                """,
                []
              )
+
+    second_key = "rail-rewake:completion-needs-review:#{assignment.id}:1:2"
+
+    assert %{session_key: second_wake_id} =
+             Idempotency.get(ctx.db, "remedy:completion-needs-review", "wake", second_key)
+
+    assert %{assignment_id: assignment_id} = second_wake = Wakes.get(ctx.db, second_wake_id)
+    assert assignment_id == assignment.id
+
+    assert {:ok, {:appended, ^reviewer_key, _message, _opts}} =
+             DB.transaction(ctx.db, fn txn ->
+               Gateway.deliver_prompt_in_txn(
+                 txn,
+                 second_wake.session_key,
+                 second_wake.origin,
+                 second_wake.prompt,
+                 wake_id: second_wake.wake_id,
+                 sender: second_wake.origin,
+                 target_gate: second_wake,
+                 fire_wake_in_txn: true
+               )
+             end)
+
+    assert {:ok, [[^assignment_id, job_ref]]} =
+             DB.query(
+               ctx.db,
+               "SELECT assignmentId, jobRef FROM turns WHERE wakeId = ?1",
+               [second_wake_id]
+             )
+
+    assert job_ref == work_item.id
   end
 
   test "foreign linked verdict keeps the re-wake on the pending review holder", ctx do
@@ -1223,7 +1256,12 @@ defmodule Tightbeam.RailRemedyTest do
     """
   end
 
-  defp assignment(ctx, subject) do
+  defp assignment(ctx, subject, work_item_id \\ nil) do
+    params = %{subject: subject, idempotency_key: nil}
+
+    params =
+      if is_binary(work_item_id), do: Map.put(params, :work_item_id, work_item_id), else: params
+
     Assignments.__handle__(ctx.db, "assign", %{
       verb: "assign",
       origin: "user:flynn",
@@ -1232,7 +1270,17 @@ defmodule Tightbeam.RailRemedyTest do
       target_role: nil,
       role_fallback: false,
       supervision_interval_ms: 1_000,
-      params: %{subject: subject, idempotency_key: nil}
+      params: params
+    })
+  end
+
+  defp work_item(ctx, title) do
+    WorkItems.__handle__(ctx.db, "work-item-create", %{
+      verb: "work-item-create",
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      session_key: nil,
+      params: %{title: title}
     })
   end
 

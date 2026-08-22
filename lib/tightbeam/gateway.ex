@@ -3809,14 +3809,12 @@ defmodule Tightbeam.Gateway do
         reresolve: p[:reresolve],
         reresolve_seed: p[:reresolve_seed],
         reresolve_rung: p[:reresolve_rung],
-        # SUBSTRATE-ONLY carrier. `wake` is an agent-callable verb, so an arbitrary
-        # params value here would let an agent stamp a conversational wake with any
-        # assignment and have delivery promote that forged carrier into the turn and
-        # the trace — agent-authored attribution, which Law 0 forbids (F6). Only the
-        # substrate's own principal may set it; the router reserves
-        # process:tightbeam, so it cannot be claimed over the wire. Conversational
-        # and owner wakes stay NULL, as the spec requires.
-        assignment_id: substrate_assignment_id(call)
+        # `wake` is agent-callable, so an agent-supplied assignment param is never
+        # trusted. An agent wake inherits only the caller's exact RUNNING turn in
+        # this transaction. Reserved process calls keep their explicit carrier;
+        # RailRemedy keeps the canonical assignment it already bound. A free-choice
+        # turn has no running carrier and stays honestly NULL.
+        assignment_id: wake_assignment_id_in_txn(txn, call)
       })
 
     bind_liveness_checkpoint_in_txn(txn, call, wake)
@@ -3877,10 +3875,31 @@ defmodule Tightbeam.Gateway do
 
   defp schedule_supervision_controller_in_txn(_txn, _call, _wake), do: :ok
 
-  defp substrate_assignment_id(%{principal: {:process, "tightbeam"}} = call),
+  defp wake_assignment_id_in_txn(_txn, %{principal: {:process, "tightbeam"}} = call),
     do: call.params[:assignment_id]
 
-  defp substrate_assignment_id(_call), do: nil
+  defp wake_assignment_id_in_txn(
+         _txn,
+         %{
+           principal: {:remedy, %{action: "wake"}},
+           bound_assignment_id: assignment_id
+         }
+       )
+       when is_binary(assignment_id),
+       do: assignment_id
+
+  defp wake_assignment_id_in_txn(txn, %{principal: {:session, session_key}}) do
+    case DB.Txn.q(
+           txn,
+           "SELECT assignmentId FROM turns WHERE sessionKey = ?1 AND status = 'running' LIMIT 1",
+           [session_key]
+         ) do
+      [[assignment_id]] -> assignment_id
+      [] -> nil
+    end
+  end
+
+  defp wake_assignment_id_in_txn(_txn, _call), do: nil
 
   defp creator_session_key({:session, key}), do: key
   defp creator_session_key(_principal), do: nil
