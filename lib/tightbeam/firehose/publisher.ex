@@ -120,25 +120,12 @@ defmodule Tightbeam.Firehose.Publisher do
     {:ok, row} = Registry.fetch(class)
     projection = apply(StateResources, row.serializer, [payload])
 
-    projection_primary_id =
-      case Map.fetch(projection, row.projection_primary_key) do
-        {:ok, id} when not is_nil(id) ->
-          id
-
-        _missing_or_nil ->
-          raise ArgumentError,
-                "projection for #{class} must include non-nil #{inspect(row.projection_primary_key)}"
-      end
-
     %{
       "class" => class,
       "resource" => row.resource,
       "op" => row.op,
       "occurredAt" => occurred_at(projection),
-      "refs" =>
-        refs
-        |> Map.put_new(row.primary_ref, projection_primary_id)
-        |> Map.reject(fn {_key, value} -> is_nil(value) end),
+      "refs" => projection_refs(class, row, projection, refs),
       "payload" => projection
     }
   end
@@ -234,14 +221,13 @@ defmodule Tightbeam.Firehose.Publisher do
   defp build(class, call, result, serializer) do
     {:ok, row} = Registry.fetch(class)
     payload = result |> unwrap(row.resource) |> serializer.()
-    refs = refs(call, payload, row.primary_ref)
 
     %{
       "class" => class,
       "resource" => row.resource,
       "op" => row.op,
       "occurredAt" => occurred_at(payload),
-      "refs" => refs,
+      "refs" => projection_refs(class, row, payload, base_refs(call)),
       "payload" => payload
     }
   end
@@ -291,10 +277,20 @@ defmodule Tightbeam.Firehose.Publisher do
 
   defp wrapped(result, _keys), do: %{"value" => result}
 
-  defp refs(call, payload, primary_ref) do
-    base_refs(call)
-    |> Map.put(primary_ref, primary_value(payload, primary_ref, call))
-    |> Map.reject(fn {_key, value} -> is_nil(value) or value == "" end)
+  defp projection_refs(class, row, projection, refs) do
+    primary_id =
+      case Map.fetch(projection, row.projection_primary_key) do
+        {:ok, id} when not is_nil(id) ->
+          id
+
+        _missing_or_nil ->
+          raise ArgumentError,
+                "projection for #{class} must include non-nil #{inspect(row.projection_primary_key)}"
+      end
+
+    refs
+    |> Map.put(row.primary_ref, primary_id)
+    |> Map.reject(fn {_key, value} -> is_nil(value) end)
   end
 
   defp base_refs(call) do
@@ -309,25 +305,6 @@ defmodule Tightbeam.Firehose.Publisher do
     }
     |> Map.reject(fn {_key, value} -> is_nil(value) end)
   end
-
-  defp primary_value(payload, key, call) do
-    params = Map.get(call, :params, %{})
-    atom_key = primary_param(key)
-
-    payload[key] || payload["id"] || params[atom_key] ||
-      if(key == "sessionKey", do: Map.get(call, :session_key), else: nil)
-  end
-
-  defp primary_param("workItemId"), do: :work_item_id
-  defp primary_param("assignmentId"), do: :assignment_id
-  defp primary_param("attestId"), do: :attest_id
-  defp primary_param("wakeId"), do: :wake_id
-  defp primary_param("decisionRequestId"), do: :request_id
-  defp primary_param("sessionKey"), do: :session_key
-  defp primary_param("artifactId"), do: :artifact_id
-  defp primary_param("deviceId"), do: :device_id
-  defp primary_param("role"), do: :name
-  defp primary_param(_key), do: :id
 
   defp occurred_at(payload) do
     payload["updatedAt"] || payload["createdAt"] || payload["openedAt"] || payload["ts"] ||

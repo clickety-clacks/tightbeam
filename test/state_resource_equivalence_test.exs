@@ -116,7 +116,40 @@ defmodule Tightbeam.StateResourceEquivalenceTest do
     assert map_size(rows) == 33
   end
 
-  test "committed notices reject missing declared projection primary ids" do
+  test "all notice paths enforce declared projection primary ids" do
+    wake_call = %{
+      verb: "wake",
+      origin: "agent:projection:worker",
+      principal: {:session, "agent:projection:worker"},
+      session_key: "agent:projection:worker",
+      params: %{}
+    }
+
+    accepted_notice = Publisher.state_notice(wake_call, %{wake_id: "w_good"})
+    assert accepted_notice["refs"]["wakeId"] == "w_good"
+
+    assert_raise ArgumentError, ~r/wake\.scheduled.*wakeId/, fn ->
+      Publisher.state_notice(wake_call, %{id: "generic-id"})
+    end
+
+    assert_raise ArgumentError, ~r/wake\.scheduled.*wakeId/, fn ->
+      Publisher.state_notice(wake_call, %{})
+    end
+
+    conflicting_ref_notice =
+      Publisher.committed_notice(
+        "wake.scheduled",
+        %{wake_id: "w_good"},
+        %{"wakeId" => "w_bad"}
+      )
+
+    assert conflicting_ref_notice["refs"]["wakeId"] == "w_good"
+
+    nil_ref_notice =
+      Publisher.committed_notice("wake.scheduled", %{wake_id: "w_good"}, %{"wakeId" => nil})
+
+    assert nil_ref_notice["refs"]["wakeId"] == "w_good"
+
     assert_raise ArgumentError, ~r/wake\.scheduled.*wakeId/, fn ->
       Publisher.committed_notice("wake.scheduled", %{id: "generic-id"}, %{})
     end
