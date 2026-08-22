@@ -409,6 +409,7 @@ defmodule FeatureSmoke do
       "remove" => true
     })
 
+    live_before_relearn = Identity.live_revision!(state.base_dir)
     relearn = ok!(state, "identity-relearn", %{})
 
     assert(
@@ -416,6 +417,17 @@ defmodule FeatureSmoke do
       relearn["state"] in ["published", "relearn-conflicted"],
       "identity-relearn returned #{inspect(relearn)}"
     )
+
+    relearn =
+      case relearn["state"] do
+        "published" ->
+          relearn
+
+        "relearn-conflicted" ->
+          resolve_disposable_relearn!(state, relearn, live_before_relearn)
+      end
+
+    assert(state, relearn["state"] == "published", "identity-relearn did not publish")
 
     session =
       ok!(state, "spawn", %{
@@ -474,6 +486,54 @@ defmodule FeatureSmoke do
       state,
       "identity status/edit guidance/edit manifest/skill put+rm/relearn/apply session+query+all"
     )
+  end
+
+  defp resolve_disposable_relearn!(state, conflict, live_before_relearn) do
+    root = Path.expand(Path.join(state.base_dir, "identity"))
+    paths = conflict["conflictingPaths"]
+
+    assert(state, conflict["resolutionRoot"] == root, "identity-relearn returned wrong root")
+    assert(state, paths == Enum.sort(paths), "identity-relearn conflict paths are not sorted")
+    assert(state, paths != [], "identity-relearn conflict result named no paths")
+
+    assert(
+      state,
+      conflict["resolveCommand"] == "tightbeam identity relearn --resolve",
+      "identity-relearn returned wrong resolve command"
+    )
+
+    assert(
+      state,
+      Identity.live_revision!(state.base_dir) == live_before_relearn,
+      "identity-relearn advanced live while conflicts remained"
+    )
+
+    Enum.each(paths, fn path -> resolve_disposable_path_from_org!(state, root, path) end)
+    ok!(state, "identity-relearn", %{"action" => "resolve"})
+  end
+
+  # The product leaves both conflict sides for the administrator. This smoke is
+  # that administrator for its disposable identity tree: it explicitly keeps
+  # the copied organization's side, stages those bytes, then calls the exact
+  # public resolve operation. Nothing in the gateway chooses a side.
+  defp resolve_disposable_path_from_org!(state, root, path) do
+    expanded = Path.expand(path)
+    relative = Path.relative_to(expanded, root)
+
+    assert(
+      state,
+      expanded == path and relative != ".." and not String.starts_with?(relative, "../"),
+      "identity-relearn conflict escaped its resolution root: #{path}"
+    )
+
+    bytes =
+      case System.cmd("git", ["show", ":2:#{relative}"], cd: root, stderr_to_stdout: true) do
+        {bytes, 0} -> bytes
+        {output, status} -> fail(state, "git show :2:#{relative} failed (#{status}): #{output}")
+      end
+
+    File.write!(expanded, bytes)
+    smoke_git!(root, ["add", "--", relative])
   end
 
   # Exercise the public entry without beginning a credential mutation. The
