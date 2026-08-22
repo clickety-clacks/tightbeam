@@ -129,6 +129,66 @@ defmodule Tightbeam.CursorRegistrationTest do
     assert {"CURSOR_API_KEY", "remote-secret"} in plan[:env]
   end
 
+  test "Cursor derives the production catalog from the pinned CLI without putting the key in argv" do
+    parent = self()
+    target = cursor_target()
+
+    sh = fn argv ->
+      send(parent, {:catalog_probe, argv})
+
+      {"Available models\n\nauto - Auto (default)\ngpt-5.3-codex - Codex 5.3\n\n" <>
+         "Tip: use --model <id> to select a model.\n", 0}
+    end
+
+    assert {:ok, [auto, codex]} =
+             Cursor.fetch_catalog(%{
+               base_dir: target.host_config.base_dir,
+               host_config: target.host_config,
+               credential_kind: :api_key,
+               options: %{
+                 sh: sh,
+                 find_executable: target.find_executable,
+                 realpath: target.realpath,
+                 sha256: target.sha256
+               }
+             })
+
+    assert {auto.family, auto.display_name, auto.provider} == {"auto", "Auto", :cursor}
+
+    assert {codex.family, codex.display_name, codex.efforts} ==
+             {"gpt-5.3-codex", "Codex 5.3", []}
+
+    assert_receive {:catalog_probe, argv}
+    serialized = Enum.join(argv, " ")
+    assert serialized =~ "AGENT_CLI_CREDENTIAL_STORE=memory"
+    assert serialized =~ "CURSOR_API_KEY=\"$(cat "
+    assert serialized =~ "cursor-agent' --list-models"
+    refute serialized =~ "secret"
+  end
+
+  test "Cursor refuses malformed or failed model-list output" do
+    target = cursor_target()
+
+    base_state = %{
+      base_dir: target.host_config.base_dir,
+      host_config: target.host_config,
+      credential_kind: :api_key,
+      options: %{
+        find_executable: target.find_executable,
+        realpath: target.realpath,
+        sha256: target.sha256
+      }
+    }
+
+    assert {:error, :malformed_catalog} =
+             Cursor.fetch_catalog(
+               put_in(base_state, [:options, :sh], fn _ -> {"nonsense", 0} end)
+             )
+
+    assert {:error, {:cursor_catalog_probe_failed, 42, "denied"}} =
+             Cursor.fetch_catalog(put_in(base_state, [:options, :sh], fn _ -> {"denied", 42} end))
+  end
+
   test "Cursor integrity failures remain typed at probe and launch" do
     target = %{cursor_target() | sha256: fn _ -> "wrong" end}
     assert {:error, %{code: "cursor_cli_integrity_mismatch"}} = Cursor.probe_cli(target)
