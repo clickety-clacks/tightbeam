@@ -198,6 +198,7 @@ defmodule Tightbeam.Harness.Cursor do
            verify_hash(target, Path.join(Path.dirname(canonical), "index.js"), @bundle_sha256) do
       {:ok, %{launcher: canonical, version: @adapter_version}}
     else
+      nil -> integrity_refusal(:not_found)
       _ -> integrity_refusal()
     end
   end
@@ -411,6 +412,15 @@ defmodule Tightbeam.Harness.Cursor do
   defp integrity_refusal do
     {:error,
      %{code: "cursor_cli_integrity_mismatch", message: "Cursor CLI integrity check failed"}}
+  end
+
+  defp integrity_refusal(reason) do
+    {:error,
+     %{
+       code: "cursor_cli_integrity_mismatch",
+       message: "Cursor CLI integrity check failed",
+       reason: reason
+     }}
   end
 
   defp canonical_path(target, path) do
