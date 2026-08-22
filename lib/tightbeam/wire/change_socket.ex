@@ -18,7 +18,11 @@ defmodule Tightbeam.Wire.ChangeSocket do
             deps: %{}
 
   @impl true
-  def init(deps), do: {:ok, %__MODULE__{deps: Map.new(deps)}}
+  def init(deps) do
+    state = %__MODULE__{deps: Map.new(deps)}
+    :ok = Hub.register(hub(state), self(), %{mode: :pending})
+    {:ok, state}
+  end
 
   @impl true
   def handle_in({bytes, opcode: :text}, state) do
@@ -63,7 +67,7 @@ defmodule Tightbeam.Wire.ChangeSocket do
   @impl true
   def terminate(_reason, state) do
     cancel_timer(state.heartbeat_timer)
-    if state.phase == :live, do: Hub.unregister(hub(state), self())
+    Hub.unregister(hub(state), self())
     :ok
   end
 

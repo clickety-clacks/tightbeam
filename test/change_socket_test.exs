@@ -184,6 +184,18 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
     assert :ok = Task.await(shutdown)
   end
 
+  test "gateway shutdown closes an upgraded pre-auth socket with restarting code", ctx do
+    state = ctx.state
+    shutdown = Task.async(fn -> Hub.shutdown(ctx.hub) end)
+    assert_receive :firehose_shutdown
+    refute Task.yield(shutdown, 0)
+
+    assert {:stop, :normal, 1012, ^state} =
+             ChangeSocket.handle_info(:firehose_shutdown, state)
+
+    assert :ok = Task.await(shutdown)
+  end
+
   test "registry rows are both-way unique and observational classes have no resource row" do
     rows = Registry.rows()
 

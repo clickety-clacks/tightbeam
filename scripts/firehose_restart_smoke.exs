@@ -23,6 +23,10 @@ defmodule Tightbeam.FirehoseRestartSmoke do
 
       cli_token = gateway_token(base_dir)
       ws = connect(port, device.token)
+
+      {:ok, pre_auth_ws} =
+        WS.connect("127.0.0.1", port, "/ws/changes?protocolVersion=1")
+
       first = create_item(port, cli_token, "Before gateway restart")
       {first_notice, ws} = recv_change(ws)
       first_model = %{first_notice["refs"]["workItemId"] => first_notice["payload"]}
@@ -30,6 +34,7 @@ defmodule Tightbeam.FirehoseRestartSmoke do
 
       restart = Task.async(fn -> LegGateway.restart(gateway, repo_root: File.cwd!()) end)
       {:ok, {:closed, 1012}, _ws} = recv_close(ws, 30_000)
+      {:ok, {:closed, 1012}, _pre_auth_ws} = recv_close(pre_auth_ws, 30_000)
       {:ok, restarted} = Task.await(restart, 120_000)
       Process.put(:firehose_restart_gateway, restarted)
 
@@ -46,7 +51,7 @@ defmodule Tightbeam.FirehoseRestartSmoke do
 
       IO.puts(
         "PASS gateway_pid=#{gateway.os_pid} restarted_pid=#{restarted.os_pid} " <>
-          "close_code=1012 rebuilt=#{map_size(rebuilt)}"
+          "close_code=1012 pre_auth_close_code=1012 rebuilt=#{map_size(rebuilt)}"
       )
     after
       active = Process.get(:firehose_restart_gateway, gateway)

@@ -111,19 +111,12 @@ defmodule Tightbeam.Firehose.Hub do
       nil ->
         monitor = Process.monitor(pid)
 
-        socket = %Socket{
-          monitor: monitor,
-          mode: Map.get(opts, :mode, :filtered),
-          db: Map.get(opts, :db),
-          user_id: Map.get(opts, :user_id),
-          device_id: Map.get(opts, :device_id),
-          is_admin: Map.get(opts, :is_admin, false)
-        }
+        socket = configure_socket(%Socket{monitor: monitor}, opts)
 
         {:reply, :ok, put_socket(state, pid, socket)}
 
-      _socket ->
-        {:reply, :ok, state}
+      socket ->
+        {:reply, :ok, put_socket(state, pid, configure_socket(socket, opts))}
     end
   end
 
@@ -234,6 +227,9 @@ defmodule Tightbeam.Firehose.Hub do
 
   defp deliver_notice(pid, socket, notice) do
     cond do
+      socket.mode == :pending ->
+        socket
+
       revoked?(notice, socket) ->
         send(pid, :firehose_revoked)
         socket
@@ -357,6 +353,17 @@ defmodule Tightbeam.Firehose.Hub do
       nil -> state
       socket -> put_socket(state, pid, fun.(socket))
     end
+  end
+
+  defp configure_socket(socket, opts) do
+    %{
+      socket
+      | mode: Map.get(opts, :mode, socket.mode),
+        db: Map.get(opts, :db, socket.db),
+        user_id: Map.get(opts, :user_id, socket.user_id),
+        device_id: Map.get(opts, :device_id, socket.device_id),
+        is_admin: Map.get(opts, :is_admin, socket.is_admin)
+    }
   end
 
   defp put_socket(state, pid, socket), do: %{state | sockets: Map.put(state.sockets, pid, socket)}
