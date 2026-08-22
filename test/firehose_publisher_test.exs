@@ -1,8 +1,18 @@
 defmodule Tightbeam.Firehose.PublisherTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Dispatch, Gateway, Rules, Wakes}
+  alias Tightbeam.{ConnRegistry, DB, Dispatch, Gateway, Org, Rules, Wakes}
   alias Tightbeam.Firehose.{Hub, Publisher}
+
+  defmodule LaneStub do
+    use GenServer
+
+    def start_link(opts),
+      do: GenServer.start_link(__MODULE__, :ok, name: Keyword.fetch!(opts, :name))
+
+    def init(:ok), do: {:ok, :ok}
+    def handle_call({:ensure_lane, _session_key}, _from, state), do: {:reply, :ok, state}
+  end
 
   setup do
     :persistent_term.erase(Rules)
@@ -41,11 +51,70 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert_receive {:firehose_notice, %{"class" => "verb.accepted"}}
     assert_receive {:firehose_notice, %{"class" => "work_item.created"}}
 
+    declared = Gateway.handler_effects(%{db: db})["work-item-create"]
+    observed = ["wake.scheduled", "work_item.created"]
+    assert_effects_match!(declared, observed)
+
+    assert_raise ArgumentError, ~r/missing=\["wake.scheduled"\]/, fn ->
+      assert_effects_match!(List.delete(declared, "wake.scheduled"), observed)
+    end
+
     assert {:ok, replay} = Dispatch.dispatch(db, handlers, call)
     assert replay.id == item.id
     assert_receive {:firehose_notice, %{"class" => "verb.accepted"}}
     assert_receive {:firehose_notice, %{"class" => "work_item.created"}}
     refute_receive {:firehose_notice, %{"class" => "wake.scheduled"}}
+  end
+
+  test "post declares the message effect its committed delivery actually emits" do
+    db = :firehose_post_effect_db
+    registry = :firehose_post_effect_registry
+    lane = :firehose_post_effect_lane
+    start_supervised!({DB, path: ":memory:", name: db})
+    :ok = Tightbeam.Schema.ensure_all(db)
+    {:ok, _} = DB.query(db, "INSERT INTO users VALUES ('flynn', 1, 1)")
+    start_supervised!({ConnRegistry, name: registry})
+    start_supervised!({LaneStub, name: lane})
+
+    Org.create(db, %{
+      session_key: "post-target",
+      display_name: "Post target",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Tightbeam.Model.new("fable")
+    })
+
+    assert :appended =
+             Gateway.deliver_prompt(
+               "post-target",
+               "user:flynn",
+               "exact A1 post reproduction",
+               db: db,
+               conn_registry: registry,
+               lane_manager: lane,
+               sender: "user:flynn",
+               device_id: "device-1",
+               client_message_id: "client-message-1",
+               authenticated_device_message: true
+             )
+
+    assert_receive {:firehose_notice,
+                    %{
+                      "class" => "message.created",
+                      "payload" => %{"content" => "exact A1 post reproduction"}
+                    }}
+
+    declared = Gateway.handler_effects(%{db: db})["post"]
+    observed = ["message.created"]
+    assert_effects_match!(declared, observed)
+
+    assert_raise ArgumentError, ~r/missing=\["message.created"\]/, fn ->
+      assert_effects_match!([], observed)
+    end
   end
 
   test "a raised state handler emits denied and never accepted state effects" do
@@ -210,5 +279,17 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
   defp lww(current, candidate) do
     if candidate["rowVersion"] >= current["rowVersion"], do: candidate, else: current
+  end
+
+  defp assert_effects_match!(declared, observed) do
+    extra = declared -- observed
+    missing = observed -- declared
+
+    if extra != [] or missing != [] do
+      raise ArgumentError,
+            "handler effect mismatch: extra=#{inspect(extra)} missing=#{inspect(missing)}"
+    end
+
+    :ok
   end
 end

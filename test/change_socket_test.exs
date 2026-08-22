@@ -2,7 +2,7 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
   use Tightbeam.TestCase, async: false
 
   alias Tightbeam.{DB, Devices, Gateway}
-  alias Tightbeam.Firehose.{Hub, Publisher, Registry}
+  alias Tightbeam.Firehose.{Hub, Registry}
   alias Tightbeam.Wire.ChangeSocket
 
   setup do
@@ -123,9 +123,9 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
 
   test "registry rows are both-way unique and cover effects from the real gateway table", ctx do
     rows = Registry.rows()
-    handlers = Gateway.handlers(%{db: ctx.db})
-    handler_effects = Gateway.handler_effects(handlers)
-    publisher_effects = Publisher.verb_effects()
+    config = %{db: ctx.db}
+    handlers = Gateway.handlers(config)
+    handler_effects = Gateway.handler_effects(config)
     {:module, Tightbeam.StateResources} = Code.ensure_loaded(Tightbeam.StateResources)
 
     assert map_size(rows) ==
@@ -138,24 +138,37 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
 
     assert Enum.all?(Registry.observational_classes(), &match?(:error, Registry.fetch(&1)))
     assert Enum.sort(Map.keys(rows) ++ Registry.observational_classes()) == Registry.classes()
+    assert Map.keys(handlers) |> Enum.sort() == Map.keys(handler_effects) |> Enum.sort()
+    assert_registry_match!(handler_effects, rows)
 
-    assert Publisher.state_verbs() -- Map.keys(handlers) == []
-    assert Publisher.emitted_state_classes(handler_effects) == rows |> Map.keys() |> Enum.sort()
-
-    declared_publisher_effects =
-      handler_effects
-      |> Enum.reject(fn {_verb, classes} -> classes == [] end)
-      |> Map.new()
-
-    assert declared_publisher_effects == publisher_effects
-
-    assert_raise ArgumentError, ~r/undeclared handlers=\["unclassified-mutator"\]/, fn ->
-      Gateway.handler_effects(Map.put(handlers, "unclassified-mutator", fn _call -> %{} end))
+    assert_raise ArgumentError, ~r/every executable handler must bind/, fn ->
+      Gateway.compile_handler_specs!(%{"unclassified-mutator" => fn _call -> %{} end})
     end
 
-    assert_raise ArgumentError, ~r/missing handlers=\["post"\]/, fn ->
-      Gateway.handler_effects(Map.delete(handlers, "post"))
-    end
+    assert_raise ArgumentError,
+                 ~r/registry mismatch.*extra classes=\["critical_lease.updated"\]/,
+                 fn ->
+                   assert_registry_match!(
+                     handler_effects,
+                     Map.delete(rows, "critical_lease.updated")
+                   )
+                 end
+
+    extra_row = %{class: "unregistered.extra", op: "upsert", serializer: :work_item}
+
+    assert_raise ArgumentError,
+                 ~r/registry mismatch.*missing classes=\["unregistered.extra"\]/,
+                 fn ->
+                   assert_registry_match!(
+                     handler_effects,
+                     Map.put(rows, "unregistered.extra", extra_row)
+                   )
+                 end
+
+    held_admin_classes =
+      ~w(config.updated host_env.updated identity.updated host.registered kungfu.updated user.promoted)
+
+    assert held_admin_classes -- Registry.classes() == held_admin_classes
   end
 
   test "condition facts share owner visibility and critical state is admin-only", ctx do
@@ -180,4 +193,19 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
 
   defp inbound(payload, state),
     do: ChangeSocket.handle_in({JSON.encode!(payload), opcode: :text}, state)
+
+  defp assert_registry_match!(handler_effects, rows) do
+    declared = Gateway.emitted_state_classes(handler_effects)
+    registered = rows |> Map.keys() |> Enum.sort()
+    extra = declared -- registered
+    missing = registered -- declared
+
+    if extra != [] or missing != [] do
+      raise ArgumentError,
+            "firehose registry mismatch: extra classes=#{inspect(extra)} " <>
+              "missing classes=#{inspect(missing)}"
+    end
+
+    :ok
+  end
 end

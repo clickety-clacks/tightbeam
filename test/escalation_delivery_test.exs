@@ -498,7 +498,7 @@ defmodule Tightbeam.EscalationDeliveryTest do
     assert sink_sites() == %{
              {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt/4",
               "children_after_preflight/1"} => 2,
-             {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt/4", "handlers/1"} => 1,
+             {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt/4", "handler_specs/1"} => 1,
              {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt/4", "notify_session/4"} => 1,
              # The fault bubble's notice enqueue (production-machine-v1): a
              # substrate-authored turn to the failing session's nearest active

@@ -100,57 +100,7 @@ defmodule Tightbeam.Gateway do
   alias Tightbeam.Wire.Payloads
   require Logger
 
-  # Every immutable handler has one accepted-result effect declaration here.
-  # Empty entries are deliberate: adding or removing a handler without deciding
-  # its effects makes handlers/1 refuse to build.
-  @handler_effects Map.merge(
-                     Map.new(
-                       ~w(
-                         post facts-read artifact-get artifacts waive revoke-waiver
-                         decision-requests decision-request host-env-set host-env-list
-                         host-env-unset register-host update-clients identity-edit
-                         identity-status identity-relearn identity-repoint learn unlearn
-                         kungfu-list identity-apply kungfu-scaffold onboard promote-user
-                         config harness-processes role-list work-item-get work-item-trace
-                         transcript attend toplines topline coordination-share digest-members
-                         work-item-list attests assignment-get assignments inspect cancel tune
-                       ),
-                       &{&1, []}
-                     ),
-                     %{
-                       "wake" => ["wake.scheduled", "wake.canceled"],
-                       "condition" => ["condition_fact.filed"],
-                       "artifact-record" => ["artifact.recorded"],
-                       "rule" => ["decision_request.ruled"],
-                       "effort-rule" => ["decision_request.ruled"],
-                       "withdraw" => ["decision_request.withdrawn"],
-                       "ask" => ["decision_request.opened"],
-                       "answer" => ["decision_request.ruled"],
-                       "approve-device" => ["device.approved"],
-                       "deny-device" => ["device.denied"],
-                       "revoke-device" => ["device.revoked"],
-                       "add-user" => ["user.added"],
-                       "read-marker-set" => ["read_marker.updated"],
-                       "read-marker-clear" => ["read_marker.updated"],
-                       "role-create" => ["role.created"],
-                       "role-bind" => ["role.bound"],
-                       "role-rm" => ["role.removed"],
-                       "work-item-create" => ["work_item.created", "wake.scheduled"],
-                       "work-item-update" => ["work_item.updated"],
-                       "work-item-icebox" => ["work_item.iceboxed"],
-                       "work-item-reopen" => ["work_item.reopened"],
-                       "work-item-close" => ["work_item.closed"],
-                       "work-item-fail" => ["work_item.failed"],
-                       "assign" => ["assignment.opened"],
-                       "dispatch" => ["assignment.opened"],
-                       "attest" => ["attest.filed", "assignment.closed"],
-                       "revoke-assignment" => ["assignment.closed"],
-                       "reopen-assignment" => ["assignment.reopened"],
-                       "critical" => ["critical_lease.updated"],
-                       "spawn" => ["session.spawned"],
-                       "retire" => ["session.retired"]
-                     }
-                   )
+  @direct_state_classes ~w(message.created wake.fired prod.fired turn.started turn.ended)
 
   defmodule EffortRearmRace do
     @moduledoc false
@@ -667,9 +617,7 @@ defmodule Tightbeam.Gateway do
     :ok
   end
 
-  @doc "The immutable verb-handler table (see moduledoc list) — built once, passed to Dispatch."
-  @spec handlers(config()) :: Tightbeam.Dispatch.handlers()
-  def handlers(config) do
+  defp handler_specs(config) do
     db = Map.get(config, :db, Tightbeam.DB)
 
     assignment_change = fn assignment_id, from ->
@@ -679,7 +627,7 @@ defmodule Tightbeam.Gateway do
     item_change = fn work_item_id, kind -> emit_item_change(db, work_item_id, kind) end
 
     %{
-      "post" => fn call ->
+      {"post", ["message.created"]} => fn call ->
         p = call.params
 
         if p[:invalid_reply_reference] == true do
@@ -708,7 +656,7 @@ defmodule Tightbeam.Gateway do
           end
         end
       end,
-      "wake" => fn call ->
+      {"wake", ["wake.scheduled", "wake.canceled", "wake.fired", "message.created"]} => fn call ->
         p = call.params
 
         cond do
@@ -746,7 +694,7 @@ defmodule Tightbeam.Gateway do
             wake_result(config, db, call)
         end
       end,
-      "condition" => fn call ->
+      {"condition", ["condition_fact.filed", "wake.fired", "message.created"]} => fn call ->
         p = call.params
 
         cond do
@@ -786,36 +734,42 @@ defmodule Tightbeam.Gateway do
             end
         end
       end,
-      "facts-read" => fn call -> facts_read_result(db, call) end,
-      "artifact-record" => fn call -> Artifacts.record(db, call) end,
-      "artifact-get" => fn call ->
+      {"facts-read", []} => fn call -> facts_read_result(db, call) end,
+      {"artifact-record", ["artifact.recorded"]} => fn call -> Artifacts.record(db, call) end,
+      {"artifact-get", []} => fn call ->
         Artifacts.get(db, call.params[:artifact_id]) || %{code: "not_found"}
       end,
-      "artifacts" => fn call -> Artifacts.list_result(db, call.params) end,
-      "rule" => fn call ->
+      {"artifacts", []} => fn call -> Artifacts.list_result(db, call.params) end,
+      {"rule", ["decision_request.ruled"]} => fn call ->
         Escalation.rule(db, call,
           authorized: admin_origin?(db, call.origin),
           scheduler: Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler)
         )
       end,
-      "effort-rule" => fn call -> EffortCheckin.rule(db, config, call) end,
-      "waive" => fn call ->
+      {"effort-rule", ["decision_request.ruled"]} => fn call ->
+        EffortCheckin.rule(db, config, call)
+      end,
+      {"waive", []} => fn call ->
         Escalation.waive(db, call,
           authorized: admin_origin?(db, call.origin),
           scheduler: Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler)
         )
       end,
-      "revoke-waiver" => fn call ->
+      {"revoke-waiver", []} => fn call ->
         Escalation.revoke_waiver(db, call, authorized: admin_origin?(db, call.origin))
       end,
-      "withdraw" => fn call -> Escalation.withdraw(db, call) end,
+      {"withdraw", ["decision_request.withdrawn"]} => fn call -> Escalation.withdraw(db, call) end,
       # The `input-needed` carrier (fabric §7, GitHub #11). Both verbs are
       # ordinary routed verbs and nothing more: `Rules.decide` sees them at the
       # Dispatch chokepoint like every other, the target is resolved by the same
       # typed-target machinery `wake` uses, and neither one blocks anything.
-      "ask" => fn call -> decision_request_result(Escalation.ask(db, call)) end,
-      "answer" => fn call -> decision_request_result(Escalation.answer(db, call)) end,
-      "decision-requests" => fn call ->
+      {"ask", ["decision_request.opened"]} => fn call ->
+        decision_request_result(Escalation.ask(db, call))
+      end,
+      {"answer", ["decision_request.ruled"]} => fn call ->
+        decision_request_result(Escalation.answer(db, call))
+      end,
+      {"decision-requests", []} => fn call ->
         case Escalation.list_status(call.params[:status]) do
           {:ok, status} ->
             caller = resolve_caller(db, call.origin)
@@ -832,7 +786,7 @@ defmodule Tightbeam.Gateway do
             err
         end
       end,
-      "decision-request" => fn call ->
+      {"decision-request", []} => fn call ->
         caller = resolve_caller(db, call.origin)
         id = call.params[:request_id] || call.params[:request]
 
@@ -844,22 +798,22 @@ defmodule Tightbeam.Gateway do
           request -> %{decision_request: request}
         end
       end,
-      "approve-device" =>
+      {"approve-device", ["device.approved"]} =>
         admin_handler(db, fn p ->
           d = Devices.approve(db, p.device_id, p[:user_id])
           %{approved: %{device_id: d.device_id, user_id: d.user_id, is_admin: d.is_admin}}
         end),
-      "deny-device" =>
+      {"deny-device", ["device.denied"]} =>
         admin_handler(db, fn p ->
           Devices.deny(db, p.device_id)
           %{denied: p.device_id}
         end),
-      "revoke-device" =>
+      {"revoke-device", ["device.revoked"]} =>
         admin_handler(db, fn p ->
           Devices.revoke(db, p.device_id)
           %{revoked: p.device_id}
         end),
-      "host-env-set" =>
+      {"host-env-set", []} =>
         admin_call_handler(db, fn call ->
           p = call.params
 
@@ -882,17 +836,17 @@ defmodule Tightbeam.Gateway do
               denial
           end
         end),
-      "host-env-list" => fn call ->
+      {"host-env-list", []} => fn call ->
         %{
           overlays: Placement.env_overlays(db, call.params[:host], call.params[:harness])
         }
       end,
-      "host-env-unset" =>
+      {"host-env-unset", []} =>
         admin_call_handler(db, fn call ->
           p = call.params
           Placement.unset_env_overlay(db, p.host, p.harness, p.name)
         end),
-      "register-host" =>
+      {"register-host", []} =>
         admin_handler(db, fn p ->
           # The dumb half of assimilation (spec §Placement): the CLI ceremony
           # prepared the machine; this records the fact. The topology is the
@@ -925,7 +879,7 @@ defmodule Tightbeam.Gateway do
               %{code: to_string(reason), message: endpoint_failure_message(reason, p.name)}
           end
         end),
-      "update-clients" =>
+      {"update-clients", []} =>
         admin_handler(db, fn _params ->
           hosts =
             config.base_dir
@@ -941,21 +895,21 @@ defmodule Tightbeam.Gateway do
 
           %{hosts: hosts}
         end),
-      "identity-edit" =>
+      {"identity-edit", []} =>
         admin_call_handler(db, fn call -> identity_edit_result(config, call) end),
-      "identity-status" =>
+      {"identity-status", []} =>
         admin_call_handler(db, fn call -> identity_status_result(config, db, call) end),
-      "identity-relearn" =>
+      {"identity-relearn", []} =>
         admin_call_handler(db, fn call -> identity_relearn_result(config, call) end),
-      "identity-repoint" =>
+      {"identity-repoint", []} =>
         admin_call_handler(db, fn call -> identity_repoint_result(config, db, call) end),
-      "learn" => admin_call_handler(db, fn call -> identity_learn_result(config, call) end),
-      "unlearn" =>
+      {"learn", []} => admin_call_handler(db, fn call -> identity_learn_result(config, call) end),
+      {"unlearn", []} =>
         admin_call_handler(db, fn call -> identity_unlearn_result(config, db, call) end),
-      "kungfu-list" => fn _call -> %{bundles: Identity.available_bundles()} end,
-      "identity-apply" =>
+      {"kungfu-list", []} => fn _call -> %{bundles: Identity.available_bundles()} end,
+      {"identity-apply", []} =>
         admin_call_handler(db, fn call -> identity_apply_result(config, db, call) end),
-      "kungfu-scaffold" =>
+      {"kungfu-scaffold", []} =>
         admin_call_handler(db, fn call ->
           paths =
             Archetypes.scaffold_kungfu!(
@@ -967,28 +921,32 @@ defmodule Tightbeam.Gateway do
 
           %{kungfu: call.params.name, paths: paths}
         end),
-      "onboard" => admin_call_handler(db, fn call -> onboard_result(config, call) end),
-      "promote-user" =>
+      {"onboard", []} => admin_call_handler(db, fn call -> onboard_result(config, call) end),
+      {"promote-user", []} =>
         admin_handler(db, fn p ->
           %{user: Devices.set_user_admin(db, p.user_id, Map.get(p, :is_admin, true))}
         end),
-      "add-user" =>
+      {"add-user", ["user.added"]} =>
         admin_handler(db, fn p ->
           %{user: Devices.add_user(db, p.user_id, Map.get(p, :is_admin, false))}
         end),
-      "read-marker-set" => fn call -> read_marker_result(db, call, :set) end,
-      "read-marker-clear" => fn call -> read_marker_result(db, call, :clear) end,
-      "config" => admin_handler(db, fn p -> config_result(db, p) end),
-      "harness-processes" =>
+      {"read-marker-set", ["read_marker.updated"]} => fn call ->
+        read_marker_result(db, call, :set)
+      end,
+      {"read-marker-clear", ["read_marker.updated"]} => fn call ->
+        read_marker_result(db, call, :clear)
+      end,
+      {"config", []} => admin_handler(db, fn p -> config_result(db, p) end),
+      {"harness-processes", []} =>
         admin_handler(db, fn _params ->
           coordinator = Map.get(config, :adapter_coordinator, Tightbeam.AdapterCoordinator)
           %{harness_processes: AdapterCoordinator.harness_processes(coordinator)}
         end),
-      "role-create" => fn call -> role_create_result(db, call) end,
-      "role-bind" => fn call -> role_bind_result(db, call) end,
-      "role-rm" => fn call -> role_rm_result(db, call) end,
-      "role-list" => fn _call -> role_list_result(db) end,
-      "work-item-create" => fn call ->
+      {"role-create", ["role.created"]} => fn call -> role_create_result(db, call) end,
+      {"role-bind", ["role.bound"]} => fn call -> role_bind_result(db, call) end,
+      {"role-rm", ["role.removed"]} => fn call -> role_rm_result(db, call) end,
+      {"role-list", []} => fn _call -> role_list_result(db) end,
+      {"work-item-create", ["work_item.created", "wake.scheduled"]} => fn call ->
         WorkItems.__handle__(
           db,
           "work-item-create",
@@ -1003,27 +961,31 @@ defmodule Tightbeam.Gateway do
           end)
         )
       end,
-      "work-item-get" => fn call -> WorkItems.__handle__(db, "work-item-get", call) end,
-      "work-item-trace" => fn call -> WorkItems.__handle__(db, "work-item-trace", call) end,
-      "transcript" => fn call -> Tightbeam.Transcript.read(db, call) end,
-      "attend" => fn call -> attend_result(db, call) end,
-      "toplines" => fn call -> Tightbeam.Toplines.roster(db, call) end,
-      "topline" => fn call -> Tightbeam.Toplines.topline(db, call) end,
-      "coordination-share" => fn call -> coordination_share_result(db, call) end,
-      "digest-members" => fn call -> digest_members_result(db, call) end,
-      "work-item-list" => fn call -> WorkItems.__handle__(db, "work-item-list", call) end,
-      "work-item-update" => fn call ->
+      {"work-item-get", []} => fn call -> WorkItems.__handle__(db, "work-item-get", call) end,
+      {"work-item-trace", []} => fn call -> WorkItems.__handle__(db, "work-item-trace", call) end,
+      {"transcript", []} => fn call -> Tightbeam.Transcript.read(db, call) end,
+      {"attend", []} => fn call -> attend_result(db, call) end,
+      {"toplines", []} => fn call -> Tightbeam.Toplines.roster(db, call) end,
+      {"topline", []} => fn call -> Tightbeam.Toplines.topline(db, call) end,
+      {"coordination-share", []} => fn call -> coordination_share_result(db, call) end,
+      {"digest-members", []} => fn call -> digest_members_result(db, call) end,
+      {"work-item-list", []} => fn call -> WorkItems.__handle__(db, "work-item-list", call) end,
+      {"work-item-update", ["work_item.updated"]} => fn call ->
         WorkItems.__handle__(
           db,
           "work-item-update",
           Map.put(call, :on_work_item_change, item_change)
         )
       end,
-      "work-item-icebox" => work_item_disposition(db, "work-item-icebox", item_change),
-      "work-item-reopen" => work_item_disposition(db, "work-item-reopen", item_change),
-      "work-item-close" => work_item_disposition(db, "work-item-close", item_change),
-      "work-item-fail" => work_item_disposition(db, "work-item-fail", item_change),
-      "assign" => fn call ->
+      {"work-item-icebox", ["work_item.iceboxed"]} =>
+        work_item_disposition(db, "work-item-icebox", item_change),
+      {"work-item-reopen", ["work_item.reopened"]} =>
+        work_item_disposition(db, "work-item-reopen", item_change),
+      {"work-item-close", ["work_item.closed"]} =>
+        work_item_disposition(db, "work-item-close", item_change),
+      {"work-item-fail", ["work_item.failed"]} =>
+        work_item_disposition(db, "work-item-fail", item_change),
+      {"assign", ["assignment.opened"]} => fn call ->
         call =
           call
           |> Map.put(:supervision_interval_ms, Map.fetch!(config, :wake_tick_ms))
@@ -1032,7 +994,7 @@ defmodule Tightbeam.Gateway do
 
         Assignments.__handle__(db, "assign", call)
       end,
-      "dispatch" => fn call ->
+      {"dispatch", ["assignment.opened", "message.created"]} => fn call ->
         call =
           call
           |> Map.put(:supervision_interval_ms, Map.fetch!(config, :wake_tick_ms))
@@ -1043,7 +1005,7 @@ defmodule Tightbeam.Gateway do
 
         Assignments.__handle__(db, "dispatch", call)
       end,
-      "attest" => fn call ->
+      {"attest", ["attest.filed", "assignment.closed"]} => fn call ->
         Assignments.__handle__(
           db,
           "attest",
@@ -1055,16 +1017,16 @@ defmodule Tightbeam.Gateway do
           |> Map.put(:effort_config, config)
         )
       end,
-      "attests" => fn call -> Assignments.__handle__(db, "attests", call) end,
-      "assignment-get" => fn call -> Assignments.__handle__(db, "assignment-get", call) end,
-      "revoke-assignment" => fn call ->
+      {"attests", []} => fn call -> Assignments.__handle__(db, "attests", call) end,
+      {"assignment-get", []} => fn call -> Assignments.__handle__(db, "assignment-get", call) end,
+      {"revoke-assignment", ["assignment.closed"]} => fn call ->
         Assignments.__handle__(
           db,
           "revoke-assignment",
           Map.put(call, :on_assignment_change, assignment_change)
         )
       end,
-      "reopen-assignment" => fn call ->
+      {"reopen-assignment", ["assignment.reopened"]} => fn call ->
         Assignments.__handle__(
           db,
           "reopen-assignment",
@@ -1075,38 +1037,72 @@ defmodule Tightbeam.Gateway do
           |> Map.put(:supervision_interval_ms, Map.fetch!(config, :wake_tick_ms))
         )
       end,
-      "assignments" => fn call -> Assignments.__handle__(db, "assignments", call) end,
-      "inspect" => fn call -> inspect_result(config, db, call) end,
-      "cancel" => fn call -> cancel_result(db, call) end,
-      "critical" => fn call -> critical_result(config, db, call) end,
-      "spawn" => fn call -> spawn_result(config, db, call) end,
-      "tune" => fn call -> tune_result(config, db, call) end,
-      "retire" => fn call -> retire_result(config, db, call) end
+      {"assignments", []} => fn call -> Assignments.__handle__(db, "assignments", call) end,
+      {"inspect", []} => fn call -> inspect_result(config, db, call) end,
+      {"cancel", ["turn.ended"]} => fn call -> cancel_result(db, call) end,
+      {"critical", ["critical_lease.updated"]} => fn call -> critical_result(config, db, call) end,
+      {"spawn", ["session.spawned"]} => fn call -> spawn_result(config, db, call) end,
+      {"tune", ["message.created"]} => fn call -> tune_result(config, db, call) end,
+      {"retire", ["session.retired"]} => fn call -> retire_result(config, db, call) end
     }
-    |> validate_handler_effects!()
+    |> compile_handler_specs!()
   end
 
-  @doc "Accepted-result state effects declared by the actual immutable handler table."
-  @spec handler_effects(Tightbeam.Dispatch.handlers()) :: %{String.t() => [String.t()]}
-  def handler_effects(handlers) do
-    handler_verbs = handlers |> Map.keys() |> MapSet.new()
-    effect_verbs = @handler_effects |> Map.keys() |> MapSet.new()
+  @doc false
+  @spec compile_handler_specs!(map()) ::
+          %{String.t() => %{handler: (map() -> term()), effects: [String.t()]}}
+  def compile_handler_specs!(raw_specs) when is_map(raw_specs) do
+    specs =
+      Enum.map(raw_specs, fn
+        {{verb, effects}, handler}
+        when is_binary(verb) and is_list(effects) and is_function(handler, 1) ->
+          if Enum.all?(effects, &is_binary/1) and Enum.uniq(effects) == effects do
+            {verb, %{handler: handler, effects: effects}}
+          else
+            raise ArgumentError,
+                  "invalid gateway handler spec for #{inspect(verb)}: effects must be unique class names"
+          end
 
-    if handler_verbs != effect_verbs do
-      missing = effect_verbs |> MapSet.difference(handler_verbs) |> Enum.sort()
-      undeclared = handler_verbs |> MapSet.difference(effect_verbs) |> Enum.sort()
+        {key, _handler} ->
+          raise ArgumentError,
+                "invalid gateway handler spec entry #{inspect(key)}: " <>
+                  "every executable handler must bind its accepted-result effects"
+      end)
 
-      raise ArgumentError,
-            "gateway handler effect table mismatch: missing handlers=#{inspect(missing)} " <>
-              "undeclared handlers=#{inspect(undeclared)}"
+    duplicates =
+      specs
+      |> Enum.group_by(&elem(&1, 0))
+      |> Enum.filter(fn {_verb, entries} -> length(entries) > 1 end)
+      |> Enum.map(&elem(&1, 0))
+      |> Enum.sort()
+
+    if duplicates != [] do
+      raise ArgumentError, "duplicate gateway handler specs: #{inspect(duplicates)}"
     end
 
-    @handler_effects
+    Map.new(specs)
   end
 
-  defp validate_handler_effects!(handlers) do
-    _effects = handler_effects(handlers)
-    handlers
+  @doc "The immutable verb-handler table (see moduledoc list) — built once, passed to Dispatch."
+  @spec handlers(config()) :: Tightbeam.Dispatch.handlers()
+  def handlers(config) do
+    Map.new(handler_specs(config), fn {verb, spec} -> {verb, spec.handler} end)
+  end
+
+  @doc "Accepted-result state effects from the same entries as the immutable handler table."
+  @spec handler_effects(config()) :: %{String.t() => [String.t()]}
+  def handler_effects(config) do
+    Map.new(handler_specs(config), fn {verb, spec} -> {verb, spec.effects} end)
+  end
+
+  @spec emitted_state_classes(%{String.t() => [String.t()]}) :: [String.t()]
+  def emitted_state_classes(handler_effects) do
+    handler_effects
+    |> Map.values()
+    |> List.flatten()
+    |> Kernel.++(@direct_state_classes)
+    |> Enum.uniq()
+    |> Enum.sort()
   end
 
   # A terminal-disposition handler routes the owner doorbell through the same

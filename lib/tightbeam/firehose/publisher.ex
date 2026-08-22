@@ -38,34 +38,6 @@ defmodule Tightbeam.Firehose.Publisher do
     "critical" => {"critical_lease.updated", &StateResources.critical_state/1}
   }
 
-  @direct_state_classes ~w(message.created wake.fired prod.fired turn.started turn.ended)
-  @variant_verb_effects %{
-    "work-item-create" => ["wake.scheduled"],
-    "wake" => ["wake.canceled"],
-    "attest" => ["assignment.closed"]
-  }
-
-  @spec state_verbs() :: [String.t()]
-  def state_verbs, do: Map.keys(@state_verbs)
-
-  @doc "State effects the accepted-result publisher actually emits, by verb."
-  @spec verb_effects() :: %{String.t() => [String.t()]}
-  def verb_effects do
-    Map.new(@state_verbs, fn {verb, {class, _serializer}} ->
-      {verb, [class | Map.get(@variant_verb_effects, verb, [])]}
-    end)
-  end
-
-  @spec emitted_state_classes(%{String.t() => [String.t()]}) :: [String.t()]
-  def emitted_state_classes(handler_effects) do
-    handler_effects
-    |> Map.values()
-    |> List.flatten()
-    |> Kernel.++(@direct_state_classes)
-    |> Enum.uniq()
-    |> Enum.sort()
-  end
-
   @spec accepted(map(), term()) :: :ok
   def accepted(call, result), do: Hub.accepted(nil, call, result)
 
