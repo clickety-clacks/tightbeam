@@ -88,26 +88,30 @@ defmodule Tightbeam.Harness.Cursor do
             credential_refusal()
         end
       else
-        key_path = api_key_path(target.host_config.base_dir)
-
         remote_env = [
           "AGENT_CLI_CREDENTIAL_STORE=memory",
           "CURSOR_CONFIG_DIR=#{Support.shell_quote(home)}"
           | Keyword.fetch!(opts, :remote_env)
         ]
 
-        script =
-          "exec env CURSOR_API_KEY=\"$(cat #{Support.shell_quote(key_path)})\" " <>
-            Enum.join(remote_env, " ") <> " " <> Support.shell_quote(adapter_binary(target))
+        case Keyword.fetch(opts, :cursor_api_key) do
+          {:ok, key} ->
+            {:ok,
+             [
+               readiness_rendezvous: true,
+               cmd:
+                 ["ssh" | Support.ssh_opts()] ++
+                   ["-o", "SendEnv=CURSOR_API_KEY", target.host_config.ssh, "exec", "env"] ++
+                   remote_env ++ [adapter_binary(target)],
+               env: [
+                 {"CURSOR_API_KEY", key},
+                 {"TIGHTBEAM_LINEAGE", Keyword.fetch!(opts, :lineage)}
+               ]
+             ]}
 
-        {:ok,
-         [
-           readiness_rendezvous: true,
-           cmd:
-             ["ssh" | Support.ssh_opts()] ++
-               [target.host_config.ssh, "sh", "-c", Support.shell_quote(script)],
-           env: [{"TIGHTBEAM_LINEAGE", Keyword.fetch!(opts, :lineage)}]
-         ]}
+          :error ->
+            credential_refusal()
+        end
       end
     end
   end
@@ -179,14 +183,8 @@ defmodule Tightbeam.Harness.Cursor do
 
   @impl true
   def probe_cli(target) do
-    case resolve_launcher(target) do
-      nil ->
-        {:error, :not_found}
-
-      _launcher ->
-        with {:ok, %{launcher: launcher}} <- verify_installed_cli(target) do
-          Support.bounded_probe(launcher, target)
-        end
+    with {:ok, %{launcher: launcher}} <- verify_installed_cli(target) do
+      Support.bounded_probe(launcher, target)
     end
   end
 
@@ -379,9 +377,6 @@ defmodule Tightbeam.Harness.Cursor do
     loader = Keyword.get(opts, :cursor_api_key_loader, &read_api_key(target, &1))
 
     case loader.(api_key_path(target.host_config.base_dir)) do
-      {:ok, :remote_banked} when not is_nil(target.host_config.ssh) ->
-        {:ok, Keyword.put(opts, :cursor_api_key_remote, true)}
-
       {:ok, key} when is_binary(key) ->
         case String.trim(key) do
           "" -> credential_refusal()
@@ -397,15 +392,13 @@ defmodule Tightbeam.Harness.Cursor do
     if local?(target) do
       File.read(path)
     else
-      script =
-        "test -r #{Support.shell_quote(path)} && " <>
-          "test -n \"$(tr -d '[:space:]' < #{Support.shell_quote(path)})\""
+      script = "test -r #{Support.shell_quote(path)} && cat #{Support.shell_quote(path)}"
 
       case target.sh.(
              ["ssh" | Support.ssh_opts()] ++
                [target.host_config.ssh, "sh", "-c", Support.shell_quote(script)]
            ) do
-        {_output, 0} -> {:ok, :remote_banked}
+        {output, 0} -> {:ok, output}
         _ -> {:error, :unreadable}
       end
     end
