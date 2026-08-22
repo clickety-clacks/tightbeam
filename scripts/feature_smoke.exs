@@ -409,7 +409,7 @@ defmodule FeatureSmoke do
       "remove" => true
     })
 
-    live_before_relearn = Identity.live_revision!(state.base_dir)
+    live_before_relearn = Tightbeam.Identity.live_revision!(state.base_dir)
     relearn = ok!(state, "identity-relearn", %{})
 
     assert(
@@ -504,7 +504,7 @@ defmodule FeatureSmoke do
 
     assert(
       state,
-      Identity.live_revision!(state.base_dir) == live_before_relearn,
+      Tightbeam.Identity.live_revision!(state.base_dir) == live_before_relearn,
       "identity-relearn advanced live while conflicts remained"
     )
 
