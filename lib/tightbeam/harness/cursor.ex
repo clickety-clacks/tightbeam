@@ -212,8 +212,87 @@ defmodule Tightbeam.Harness.Cursor do
   @impl true
   def fetch_catalog(state) do
     case get_in(state, [:options, :cursor_fetch]) do
-      nil -> {:error, :cursor_catalog_source_unwired}
+      nil -> fetch_installed_catalog(state)
       fetch -> derive_catalog(fetch.())
+    end
+  end
+
+  defp fetch_installed_catalog(state) do
+    options = Map.get(state, :options, %{})
+    sh = Map.get(options, :sh, &Support.system_cmd_out/1)
+    host_config = Map.get(state, :host_config, %{base_dir: state.base_dir, ssh: nil})
+
+    target =
+      options
+      |> Map.take([:find_executable, :realpath, :sha256])
+      |> Map.merge(%{host_config: host_config, sh: sh})
+
+    with {:ok, %{launcher: launcher}} <- verify_installed_cli(target),
+         {output, 0} <- sh.(catalog_argv(host_config, launcher, state.base_dir)),
+         {:ok, entries} <- parse_catalog(output),
+         true <- entries != [] do
+      {:ok, entries}
+    else
+      {output, exit} when is_binary(output) and is_integer(exit) ->
+        {:error, {:cursor_catalog_probe_failed, exit, String.trim(output)}}
+
+      false ->
+        {:error, :empty_inventory}
+
+      {:error, reason} ->
+        {:error, reason}
+
+      _ ->
+        {:error, :malformed_catalog}
+    end
+  end
+
+  defp catalog_argv(host_config, launcher, base_dir) do
+    key_path = api_key_path(base_dir)
+
+    script =
+      "test -r #{Support.shell_quote(key_path)} && " <>
+        "exec env AGENT_CLI_CREDENTIAL_STORE=memory " <>
+        "CURSOR_API_KEY=\"$(cat #{Support.shell_quote(key_path)})\" " <>
+        "#{Support.shell_quote(launcher)} --list-models"
+
+    Support.catalog_probe_argv(host_config.ssh, script)
+  end
+
+  defp parse_catalog(output) when is_binary(output) do
+    entries =
+      output
+      |> String.split("\n")
+      |> Enum.map(&String.trim/1)
+      |> Enum.reject(&(&1 == "" or &1 == "Available models" or String.starts_with?(&1, "Tip:")))
+      |> Enum.map(&parse_catalog_line/1)
+
+    if entries != [] and Enum.all?(entries, &match?({:ok, _}, &1)) do
+      {:ok, Enum.map(entries, fn {:ok, entry} -> entry end)}
+    else
+      {:error, :malformed_catalog}
+    end
+  end
+
+  defp parse_catalog_line(line) do
+    case String.split(line, " - ", parts: 2) do
+      [family, display_name] when family != "" and display_name != "" ->
+        name = String.replace_suffix(display_name, " (default)", "")
+
+        {:ok,
+         %{
+           family: family,
+           context: nil,
+           display_name: name,
+           name: name,
+           efforts: [],
+           max_input_tokens: nil,
+           capabilities: %{},
+           provider: credential_provider()
+         }}
+
+      _ ->
+        :error
     end
   end
 
