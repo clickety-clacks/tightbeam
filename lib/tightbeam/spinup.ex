@@ -293,7 +293,7 @@ defmodule Tightbeam.Spinup do
 
         case dirs_result do
           {:error, path, reason} when is_binary(path) ->
-            location = if path, do: " at #{path}", else: ""
+            location = " at #{path}"
 
             message =
               "host #{target.host_name} is not ready for #{module.wire_name()}: directory setup failed#{location}: #{:file.format_error(reason)} " <>
@@ -311,7 +311,7 @@ defmodule Tightbeam.Spinup do
           :ok ->
             home = Homes.home_path(host.base_dir, target.host_name, module.id())
 
-            case module.ensure_adapter(target) do
+            case Harness.ensure_adapter(module, target) do
               {:error, denial} ->
                 {{:error, denial}, "reached; directories ensured; DENIED: #{denial.message}"}
 

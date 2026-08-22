@@ -26,6 +26,14 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     %{db: db, sup: sup, test_dir: test_dir}
   end
 
+  test "all public checkout APIs retain the reviewed 190s budget over the 185s generation deadline" do
+    source = File.read!("lib/tightbeam/adapter_coordinator.ex")
+    assert source =~ "@adapter_readiness_timeout 185_000"
+    assert source =~ "@adapter_checkout_timeout 190_000"
+    assert length(Regex.scan(~r/GenServer\.call\([^\n]+@adapter_checkout_timeout\)/, source)) == 3
+    refute source =~ "{:adapter_for, key}, 30_000"
+  end
+
   test "typed launch refusal is coalesced and never starts an adapter child", ctx do
     parent = self()
     refusal = %{code: "DIV-CURSOR-API-KEY-ONLY", message: "Cursor requires a banked API key"}
@@ -92,6 +100,169 @@ defmodule Tightbeam.AdapterCoordinatorTest do
 
     refute Process.alive?(task)
     assert DynamicSupervisor.count_children(ctx.sup).active == 0
+  end
+
+  test "authoritative credential context replaces pending stale preflight", ctx do
+    parent = self()
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         adapter_context: fn _ -> [credential_kind: :subscription] end,
+         adapter_opts: fn _, context ->
+           send(parent, {:preflight_context, self(), context})
+
+           if context[:credential_kind] == :subscription do
+             receive do
+               :release_stale -> :ok
+             end
+           end
+
+           {:error, %{code: Atom.to_string(context[:credential_kind]), message: "context used"}}
+         end,
+         db: ctx.db,
+         name: :authoritative_pending_coordinator}
+      )
+
+    key = {:cursor, "default", "testhost"}
+    initial = Task.async(fn -> AdapterCoordinator.adapter_for(coordinator, key) end)
+    assert_receive {:preflight_context, stale_task, [credential_kind: :subscription]}
+
+    authoritative =
+      Task.async(fn ->
+        AdapterCoordinator.adapter_for(coordinator, key, credential_kind: :api_key)
+      end)
+
+    assert_receive {:preflight_context, _replacement_task, [credential_kind: :api_key]}
+    refute Process.alive?(stale_task)
+
+    expected = {:error, {:launch_refused, %{code: "api_key", message: "context used"}}}
+    assert Task.await(initial) == expected
+    assert Task.await(authoritative) == expected
+  end
+
+  test "hung readiness task times out, removes its child state, and flushes caller", ctx do
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         readiness_timeout_ms: 30,
+         adapter_context: fn _ -> Process.sleep(:infinity) end,
+         adapter_opts: fn _, _ -> flunk("hung context reached adapter opts") end,
+         db: ctx.db,
+         name: :hung_readiness_coordinator}
+      )
+
+    assert {:error, {:launch_refused, %{code: "adapter_readiness_timeout"}}} =
+             AdapterCoordinator.adapter_for(coordinator, {:cursor, "default", "testhost"})
+
+    state = :sys.get_state(coordinator)
+    entry = state.adapters[{:cursor, "default", "testhost"}]
+    assert entry.pid == nil
+    assert entry.readiness_task == nil
+    assert entry.readiness_timer == nil
+    assert entry.waiters == []
+    assert DynamicSupervisor.count_children(ctx.sup).active == 0
+  end
+
+  test "caller cancellation removes its readiness waiter without extending the generation", ctx do
+    parent = self()
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         adapter_context: fn _ ->
+           send(parent, :context_blocked)
+           Process.sleep(:infinity)
+         end,
+         adapter_opts: fn _, _ -> [] end,
+         db: ctx.db,
+         name: :caller_cancel_coordinator}
+      )
+
+    key = {:cursor, "default", "testhost"}
+    caller = spawn(fn -> AdapterCoordinator.adapter_for(coordinator, key) end)
+    assert_receive :context_blocked
+    Process.exit(caller, :kill)
+
+    assert wait_until(fn -> :sys.get_state(coordinator).adapters[key].waiters == [] end)
+    entry = :sys.get_state(coordinator).adapters[key]
+    assert is_reference(entry.readiness_timer)
+  end
+
+  test "rendezvous does not release checkout before a delayed valid ready signal", ctx do
+    path = Path.join(ctx.test_dir, "slow_ready.js")
+
+    File.write!(path, """
+    const rl = require("node:readline").createInterface({ input: process.stdin });
+    const send = (o) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...o }) + "\\n");
+    rl.on("line", (line) => {
+      const m = JSON.parse(line);
+      if (m.method === "initialize") setTimeout(() => send({ id: m.id, result: { protocolVersion: 1 } }), 75);
+    });
+    """)
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         readiness_timeout_ms: 500,
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn _, _ ->
+           [
+             harness: :cursor,
+             readiness_rendezvous: true,
+             cmd: [System.find_executable("node"), path],
+             home: ctx.test_dir,
+             cwd: ctx.test_dir
+           ]
+         end,
+         db: ctx.db,
+         name: :slow_valid_readiness_coordinator}
+      )
+
+    started = System.monotonic_time(:millisecond)
+
+    assert {:ok, _pid, 1} =
+             AdapterCoordinator.adapter_for(coordinator, {:cursor, "default", "testhost"})
+
+    assert System.monotonic_time(:millisecond) - started >= 50
+  end
+
+  test "hung live rendezvous child is terminated through its supervisor at deadline", ctx do
+    path = Path.join(ctx.test_dir, "never_ready.js")
+
+    File.write!(
+      path,
+      "process.stdin.resume(); process.stdin.on('end', () => process.exit(0)); setInterval(() => {}, 1000);\n"
+    )
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         readiness_timeout_ms: 75,
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn _, _ ->
+           [
+             harness: :cursor,
+             readiness_rendezvous: true,
+             cmd: [System.find_executable("node"), path],
+             home: ctx.test_dir,
+             cwd: ctx.test_dir
+           ]
+         end,
+         db: ctx.db,
+         name: :hung_child_readiness_coordinator}
+      )
+
+    assert {:error, {:launch_refused, %{code: "adapter_readiness_timeout"}}} =
+             AdapterCoordinator.adapter_for(coordinator, {:cursor, "default", "testhost"})
+
+    assert DynamicSupervisor.count_children(ctx.sup).active == 0
+    Process.sleep(100)
   end
 
   test "five consecutive boot failures open the circuit (async boot)", ctx do

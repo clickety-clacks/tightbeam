@@ -690,7 +690,17 @@ defmodule Tightbeam.PlacementTest do
       db: db,
       cwd: "/work",
       cli_bin: Path.join(base_dir, "bin"),
-      credential_kind: :api_key
+      credential_kind: :api_key,
+      harness_target_overrides: %{
+        find_executable: fn _ -> Path.join([base_dir, "2026.08.11-e8db854", "cursor-agent"]) end,
+        realpath: fn path -> {:ok, path} end,
+        sha256: fn path ->
+          if Path.basename(path) == "index.js",
+            do: "6aceb24b7c7ecddb1993946ebb18a7dd4d025842e6efda955eb0c13255b1e5f0",
+            else: "eed61c5224668c9236334c4c68936a16aecc37374b592f59e31eb50433817831"
+        end,
+        verify_adapter_shim: fn _shim, _launcher -> :ok end
+      }
     }
 
     cursor_auth = Path.join([base_dir, "auth", "cursor"])
@@ -698,7 +708,7 @@ defmodule Tightbeam.PlacementTest do
     File.write!(Path.join(cursor_auth, "api-key"), "fixture-cursor-key\n")
 
     for module <- Tightbeam.Harness.all() do
-      opts = Placement.adapter_opts(config, {module.id(), "shared", "testhost"})
+      opts = Placement.adapter_opts!(config, {module.id(), "shared", "testhost"})
       binary = hd(opts[:cmd])
 
       assert String.ends_with?(
@@ -717,6 +727,28 @@ defmodule Tightbeam.PlacementTest do
     end
   end
 
+  test "Cursor kind refusal precedes toolchain and home side effects", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    config = %{
+      base_dir: base_dir,
+      db: db,
+      cwd: "/work",
+      cli_bin: Path.join(base_dir, "bin"),
+      credential_kind: :arbitrary_invalid,
+      sh: fn _ -> flunk("credential refusal executed a target command") end,
+      harness_target_overrides: %{
+        find_executable: fn _ -> flunk("credential refusal resolved an executable") end
+      }
+    }
+
+    assert {:error, %{code: "DIV-CURSOR-API-KEY-ONLY"}} =
+             Placement.adapter_opts(config, {:cursor, "shared", "testhost"})
+
+    refute File.exists?(Tightbeam.Homes.home_path(base_dir, "testhost", :cursor))
+  end
+
   test "adapter_opts preserves the pre-placement local shape", %{base_dir: base_dir, db: db} do
     parent = self()
 
@@ -732,7 +764,7 @@ defmodule Tightbeam.PlacementTest do
       end
     }
 
-    opts = Placement.adapter_opts(config, {:codex, "default", "testhost"})
+    opts = Placement.adapter_opts!(config, {:codex, "default", "testhost"})
 
     # The adapter lives under the host's OWN base_dir, not a sibling checkout (#46).
     expected_binary =
@@ -772,7 +804,7 @@ defmodule Tightbeam.PlacementTest do
       sh: fn _command -> {"", 0} end
     }
 
-    handler = Placement.adapter_opts(config, {:codex, "default", "testhost"})[:on_auth_event]
+    handler = Placement.adapter_opts!(config, {:codex, "default", "testhost"})[:on_auth_event]
     handler.(:transient, %{"authMode" => "chatgpt"})
     refute eventually(fn -> HarnessHealth.active(db) != [] end, 4)
 
@@ -803,7 +835,7 @@ defmodule Tightbeam.PlacementTest do
       default_model: Model.new("fable")
     }
 
-    baseline = Placement.adapter_opts(config, {:claude, "default", "testhost"})[:env]
+    baseline = Placement.adapter_opts!(config, {:claude, "default", "testhost"})[:env]
     refute {"EXAMPLE_OVERLAY_VAR", "example-local"} in baseline
 
     assert {:ok, _row} =
@@ -816,7 +848,7 @@ defmodule Tightbeam.PlacementTest do
                "agent:test"
              )
 
-    assert Placement.adapter_opts(config, {:claude, "default", "testhost"})[:env] ==
+    assert Placement.adapter_opts!(config, {:claude, "default", "testhost"})[:env] ==
              baseline ++ [{"EXAMPLE_OVERLAY_VAR", "example-local"}]
   end
 
@@ -856,7 +888,7 @@ defmodule Tightbeam.PlacementTest do
       sh: sh
     }
 
-    command = Placement.adapter_opts(config, {:codex, "default", "worker"})[:cmd]
+    command = Placement.adapter_opts!(config, {:codex, "default", "worker"})[:cmd]
     assignment = "EXAMPLE_OVERLAY_VAR='example remote'"
     assert assignment in command
 
@@ -902,9 +934,9 @@ defmodule Tightbeam.PlacementTest do
       sh: sh
     }
 
-    gibson_claude = Placement.adapter_opts(config, {:claude, "default", "gibson"})[:cmd]
-    gibson_codex = Placement.adapter_opts(config, {:codex, "default", "gibson"})[:cmd]
-    other_claude = Placement.adapter_opts(config, {:claude, "default", "other-host"})[:cmd]
+    gibson_claude = Placement.adapter_opts!(config, {:claude, "default", "gibson"})[:cmd]
+    gibson_codex = Placement.adapter_opts!(config, {:codex, "default", "gibson"})[:cmd]
+    other_claude = Placement.adapter_opts!(config, {:claude, "default", "other-host"})[:cmd]
 
     assert "EXAMPLE_OVERLAY_VAR='isolated'" in gibson_claude
     refute Enum.any?(gibson_codex, &String.starts_with?(&1, "EXAMPLE_OVERLAY_VAR="))
@@ -933,7 +965,7 @@ defmodule Tightbeam.PlacementTest do
       default_model: Model.new("fable")
     }
 
-    opts = Placement.adapter_opts(config, {:codex, "default", "testhost"})
+    opts = Placement.adapter_opts!(config, {:codex, "default", "testhost"})
 
     assert {"CODEX_CONFIG", ~s({"bypass_hook_trust":true})} in opts[:env]
     refute Enum.any?(opts[:env], fn {key, _value} -> key == "CODEX_PATH" end)
@@ -942,7 +974,7 @@ defmodule Tightbeam.PlacementTest do
     refute opts[:probe_model] == config.default_model
     refute File.exists?(Path.join(probe_cwd, "stale"))
 
-    claude_opts = Placement.adapter_opts(config, {:claude, "default", "testhost"})
+    claude_opts = Placement.adapter_opts!(config, {:claude, "default", "testhost"})
     refute Keyword.has_key?(claude_opts, :probe_cwd)
     refute Keyword.has_key?(claude_opts, :probe_model)
     refute Enum.any?(claude_opts[:env], fn {key, _value} -> key == "CODEX_CONFIG" end)
@@ -972,7 +1004,7 @@ defmodule Tightbeam.PlacementTest do
     # A subscription credential reaches the harness as a FILE in its home, never as an
     # environment variable: it carries a refresh token that Claude Code rotates in place,
     # and an env var has nowhere to keep one.
-    claude_env = Placement.adapter_opts(config, {:claude, "default", "testhost"})[:env]
+    claude_env = Placement.adapter_opts!(config, {:claude, "default", "testhost"})[:env]
     refute Enum.any?(claude_env, fn {k, _} -> k == "CLAUDE_CODE_OAUTH_TOKEN" end)
     assert Enum.any?(claude_env, fn {k, _} -> k == "CLAUDE_CONFIG_DIR" end)
 
@@ -1011,7 +1043,7 @@ defmodule Tightbeam.PlacementTest do
       sh: sh
     }
 
-    opts = Placement.adapter_opts(config, {:codex, "default", "worker"})
+    opts = Placement.adapter_opts!(config, {:codex, "default", "worker"})
     remote_home = "/srv/tb/homes/worker/codex"
 
     assert opts[:cmd] == [
@@ -1041,7 +1073,7 @@ defmodule Tightbeam.PlacementTest do
     assert lineage_assignment == "TIGHTBEAM_LINEAGE=tb1-Y29kZXhAd29ya2Vy"
     refute Enum.any?(opts[:cmd], &String.contains?(&1, "'TIGHTBEAM_LINEAGE="))
 
-    claude_opts = Placement.adapter_opts(config, {:claude, "default", "worker"})
+    claude_opts = Placement.adapter_opts!(config, {:claude, "default", "worker"})
 
     # No credential expansion for a subscription: the remote reads its own home file.
     refute Enum.any?(claude_opts[:cmd], &String.contains?(&1, "CLAUDE_CODE_OAUTH_TOKEN"))
@@ -1083,7 +1115,7 @@ defmodule Tightbeam.PlacementTest do
       sh: sh
     }
 
-    opts = Placement.adapter_opts(config, {:codex, "default", "worker"})
+    opts = Placement.adapter_opts!(config, {:codex, "default", "worker"})
     assert ~s(CODEX_CONFIG='{"bypass_hook_trust":true}') in opts[:cmd]
     assert opts[:probe_cwd] == "/srv/tb/work/gate-probe"
     assert opts[:probe_model] == Model.new("gpt-5.6-sol", effort: "medium")
@@ -1093,7 +1125,7 @@ defmodule Tightbeam.PlacementTest do
                "-rf" in command
            end)
 
-    claude_opts = Placement.adapter_opts(config, {:claude, "default", "worker"})
+    claude_opts = Placement.adapter_opts!(config, {:claude, "default", "worker"})
     refute Enum.any?(claude_opts[:cmd], &String.starts_with?(&1, "CODEX_CONFIG="))
     refute Keyword.has_key?(claude_opts, :probe_cwd)
 
@@ -1103,7 +1135,7 @@ defmodule Tightbeam.PlacementTest do
     # when trust is bypassed.
     File.rm_rf!(Path.join([base_dir, "identity", "rails"]))
     Rails.load!(base_dir)
-    lawless_opts = Placement.adapter_opts(config, {:codex, "default", "worker"})
+    lawless_opts = Placement.adapter_opts!(config, {:codex, "default", "worker"})
     assert ~s(CODEX_CONFIG='{"bypass_hook_trust":true}') in lawless_opts[:cmd]
     refute Keyword.has_key?(lawless_opts, :probe_cwd)
     refute Keyword.has_key?(lawless_opts, :probe_model)
@@ -1124,7 +1156,7 @@ defmodule Tightbeam.PlacementTest do
       default_model: Model.new("fable")
     }
 
-    opts = Placement.adapter_opts(config, {:codex, identity_name, "testhost"})
+    opts = Placement.adapter_opts!(config, {:codex, identity_name, "testhost"})
 
     {"TIGHTBEAM_LINEAGE", "tb1-" <> encoded} =
       Enum.find(opts[:env], fn {key, _value} -> key == "TIGHTBEAM_LINEAGE" end)

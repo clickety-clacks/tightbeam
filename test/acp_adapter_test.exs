@@ -1673,7 +1673,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     )
 
     placement_opts =
-      Tightbeam.Placement.adapter_opts(
+      Tightbeam.Placement.adapter_opts!(
         %{
           base_dir: base,
           db: db,
@@ -1792,7 +1792,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     start_supervised!({AdapterCallingWakeScheduler, {adapter_slot, self()}})
 
     placement_opts =
-      Tightbeam.Placement.adapter_opts(
+      Tightbeam.Placement.adapter_opts!(
         %{
           base_dir: base,
           db: db,
@@ -1886,7 +1886,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     Tightbeam.Org.append_pointer(db, session.session_key, "sess-1", "created")
 
     placement_opts =
-      Tightbeam.Placement.adapter_opts(
+      Tightbeam.Placement.adapter_opts!(
         %{
           base_dir: base,
           db: db,
