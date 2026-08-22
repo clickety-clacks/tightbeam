@@ -5,7 +5,6 @@ defmodule Tightbeam.Wire.ChangeSocket do
 
   alias Tightbeam.Devices
   alias Tightbeam.Firehose.Hub
-  alias Tightbeam.StateVisibility
 
   @max_subscriptions 100
   @filter_keys ~w(classes sessionKey workItemId origin principal)
@@ -15,7 +14,6 @@ defmodule Tightbeam.Wire.ChangeSocket do
             device_id: nil,
             is_admin: false,
             subscriptions: %{},
-            seq: 0,
             heartbeat_timer: nil,
             deps: %{}
 
@@ -35,34 +33,28 @@ defmodule Tightbeam.Wire.ChangeSocket do
 
   @impl true
   def handle_info({:firehose_notice, notice}, %{phase: :live} = state) do
-    cond do
-      revoked?(notice, state) ->
-        {:stop, :normal, 1008, state}
-
-      visible?(notice, state) ->
-        {frames, seq} = matching_frames(notice, state)
-
-        case frames do
-          [] -> {:ok, state}
-          _ -> {:push, Enum.map(frames, &{:text, JSON.encode!(&1)}), %{state | seq: seq}}
-        end
-
-      true ->
-        {:ok, state}
-    end
+    Hub.delivered(hub(state), self())
+    push(notice, state)
   end
 
   def handle_info({:firehose_notice, _notice}, state), do: {:ok, state}
 
   def handle_info(:firehose_heartbeat, %{phase: :live} = state) do
     state = schedule_heartbeat(state)
-    push(%{"type" => "heartbeat", "seq" => state.seq}, state)
+    push(%{"type" => "heartbeat", "seq" => Hub.sequence(hub(state), self())}, state)
   end
 
   def handle_info(:firehose_heartbeat, state), do: {:ok, state}
 
   def handle_info(:firehose_overflow, state),
     do: {:stop, :normal, 4008, {:text, JSON.encode!(error("slow consumer"))}, state}
+
+  def handle_info(:firehose_revoked, state), do: {:stop, :normal, 1008, state}
+
+  def handle_info(:firehose_shutdown, state) do
+    Hub.shutdown_delivered(hub(state), self())
+    {:stop, :normal, 1012, state}
+  end
 
   @impl true
   def handle_control({_bytes, opcode: :ping}, state), do: {:ok, state}
@@ -100,7 +92,14 @@ defmodule Tightbeam.Wire.ChangeSocket do
         stop_with(auth_failure(reason), 1008, state)
 
       device ->
-        :ok = Hub.register(hub(state), self())
+        :ok =
+          Hub.register(hub(state), self(), %{
+            mode: :filtered,
+            db: db(state),
+            user_id: device.user_id,
+            device_id: device.device_id,
+            is_admin: device.is_admin
+          })
 
         state = %{
           state
@@ -141,6 +140,7 @@ defmodule Tightbeam.Wire.ChangeSocket do
       true ->
         case normalize_filters(message["filters"]) do
           {:ok, filters} ->
+            :ok = Hub.subscribe(hub(state), self(), id, filters)
             state = %{state | subscriptions: Map.put(state.subscriptions, id, filters)}
             push(%{"type" => "subscription_ready", "subscriptionId" => id}, state)
 
@@ -154,6 +154,7 @@ defmodule Tightbeam.Wire.ChangeSocket do
     id = message["subscriptionId"]
 
     if is_binary(id) and Map.has_key?(state.subscriptions, id) do
+      :ok = Hub.unsubscribe(hub(state), self(), id)
       state = %{state | subscriptions: Map.delete(state.subscriptions, id)}
       push(%{"type" => "subscription_removed", "subscriptionId" => id}, state)
     else
@@ -177,68 +178,6 @@ defmodule Tightbeam.Wire.ChangeSocket do
   end
 
   defp normalize_filters(_filters), do: :error
-
-  defp matching_frames(notice, state) do
-    Enum.reduce(state.subscriptions, {[], state.seq}, fn {id, filters}, {frames, seq} ->
-      if matches?(notice, filters) do
-        next = seq + 1
-
-        frame =
-          notice
-          |> Map.put("type", "change")
-          |> Map.put("schemaVersion", 1)
-          |> Map.put("subscriptionId", id)
-          |> Map.put("seq", next)
-
-        {[frame | frames], next}
-      else
-        {frames, seq}
-      end
-    end)
-    |> then(fn {frames, seq} -> {Enum.reverse(frames), seq} end)
-  end
-
-  defp matches?(notice, filters) do
-    refs = notice["refs"] || %{}
-
-    class_match? =
-      case filters["classes"] do
-        nil -> true
-        prefixes -> Enum.any?(prefixes, &String.starts_with?(notice["class"] || "", &1))
-      end
-
-    class_match? and
-      Enum.all?(~w(sessionKey workItemId origin principal), fn key ->
-        is_nil(filters[key]) or filters[key] == refs[key]
-      end)
-  end
-
-  defp visible?(notice, state) do
-    payload = notice["payload"] || %{}
-
-    not secret_payload?(payload) and
-      StateVisibility.visible?(db(state), notice, state.user_id, state.is_admin)
-  end
-
-  defp revoked?(%{"class" => "device.revoked", "refs" => refs}, state),
-    do: refs["deviceId"] == state.device_id
-
-  defp revoked?(%{"class" => "session.retired"} = notice, state) do
-    payload = notice["payload"] || %{}
-    refs = notice["refs"] || %{}
-    payload["ownerUserId"] == state.user_id or refs["ownerUserId"] == state.user_id
-  end
-
-  defp revoked?(_notice, _state), do: false
-
-  defp secret_payload?(payload) when is_map(payload) do
-    Enum.any?(payload, fn {key, value} ->
-      key in ["cliToken", "token", "identityToken"] or secret_payload?(value)
-    end)
-  end
-
-  defp secret_payload?(payload) when is_list(payload), do: Enum.any?(payload, &secret_payload?/1)
-  defp secret_payload?(_payload), do: false
 
   defp schedule_heartbeat(state) do
     cancel_timer(state.heartbeat_timer)

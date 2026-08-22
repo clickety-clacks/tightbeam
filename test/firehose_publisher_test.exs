@@ -28,19 +28,18 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     assert :ok = Publisher.accepted(call, result)
 
-    assert_receive {:firehose_notice,
-                    %{"class" => "verb.accepted", "op" => "observe", "refs" => refs}}
+    assert %{"class" => "verb.accepted", "op" => "observe", "refs" => refs} =
+             receive_notice()
 
     assert refs["origin"] == "user:flynn"
 
-    assert_receive {:firehose_notice,
-                    %{
-                      "class" => "work_item.updated",
-                      "resource" => "work-items",
-                      "op" => "upsert",
-                      "refs" => %{"workItemId" => "wi_1"},
-                      "payload" => payload
-                    }}
+    assert %{
+             "class" => "work_item.updated",
+             "resource" => "work-items",
+             "op" => "upsert",
+             "refs" => %{"workItemId" => "wi_1"},
+             "payload" => payload
+           } = receive_notice()
 
     assert payload["id"] == "wi_1"
     assert payload["rowVersion"] == 123
@@ -54,7 +53,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
                %{assignments: []}
              )
 
-    assert_receive {:firehose_notice, %{"class" => "verb.accepted"}}
+    assert %{"class" => "verb.accepted"} = receive_notice()
     refute_receive {:firehose_notice, _notice}
   end
 
@@ -66,12 +65,11 @@ defmodule Tightbeam.Firehose.PublisherTest do
                %{"ownerUserId" => "flynn", "sessionKey" => "agent:one"}
              )
 
-    assert_receive {:firehose_notice,
-                    %{
-                      "class" => "message.created",
-                      "refs" => %{"messageId" => "s_1"},
-                      "payload" => %{"id" => "s_1", "rowVersion" => 9}
-                    }}
+    assert %{
+             "class" => "message.created",
+             "refs" => %{"messageId" => "s_1"},
+             "payload" => %{"id" => "s_1", "rowVersion" => 9}
+           } = receive_notice()
   end
 
   test "a role delete carries its last visible pre-delete row" do
@@ -92,15 +90,14 @@ defmodule Tightbeam.Firehose.PublisherTest do
     :ok = Tightbeam.Roles.rm(db, "worker")
     :ok = Publisher.accepted(db, captured, %{removed: "worker"})
 
-    assert_receive {:firehose_notice, %{"class" => "verb.accepted"}}
+    assert %{"class" => "verb.accepted"} = receive_notice()
 
-    assert_receive {:firehose_notice,
-                    %{
-                      "class" => "role.removed",
-                      "op" => "delete",
-                      "refs" => %{"role" => "worker"},
-                      "payload" => %{"role" => "worker", "ownerUserId" => "flynn"}
-                    }}
+    assert %{
+             "class" => "role.removed",
+             "op" => "delete",
+             "refs" => %{"role" => "worker"},
+             "payload" => %{"role" => "worker", "ownerUserId" => "flynn"}
+           } = receive_notice()
   end
 
   test "a rail denial emits both observational classes" do
@@ -114,13 +111,12 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     :ok = Publisher.denied(call, %{code: "rule_denied", rule: "tests-before-success"})
 
-    assert_receive {:firehose_notice, %{"class" => "verb.denied"}}
+    assert %{"class" => "verb.denied"} = receive_notice()
 
-    assert_receive {:firehose_notice,
-                    %{
-                      "class" => "rail.denied",
-                      "payload" => %{"rule" => "tests-before-success", "verb" => "attest"}
-                    }}
+    assert %{
+             "class" => "rail.denied",
+             "payload" => %{"rule" => "tests-before-success", "verb" => "attest"}
+           } = receive_notice()
   end
 
   test "condition and critical projections carry stable ids and last-version-wins" do
@@ -145,5 +141,11 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
   defp lww(current, candidate) do
     if candidate["rowVersion"] >= current["rowVersion"], do: candidate, else: current
+  end
+
+  defp receive_notice do
+    assert_receive {:firehose_notice, notice}
+    Hub.delivered(Hub, self())
+    notice
   end
 end
