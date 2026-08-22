@@ -3,11 +3,12 @@
 ## THIS LINE: main = the 0.2 fabric program (flipped 2026-08-12)
 
 The pre-flip tip lives on branch 0.1.x — the maintenance line the live org
-patches. THE GIT PROCESS ON THIS LINE (ruled 2026-08-13, program doc SS8b —
-no door, no PR ceremony): run the verification gates below and record
-baseline+after counts; review evidence lands in the specs repo first; then
-push main DIRECTLY. CI on every main push is the tripwire; git history is
-the audit. If your assignment card names a different integration branch,
+patches. THE GIT PROCESS ON THIS LINE (corrected 2026-08-22 — this file was stale
+against the standing pattern; decisions ledger): work on YOUR OWN branch
+in YOUR OWN workspace; main receives MERGES ONLY, never direct work or
+direct pushes. A merge requires the full verification gate GREEN — a red
+suite blocks every merge, with no baseline-matching exception to
+adjudicate. Review evidence lands in the specs repo first. If your assignment card names a different integration branch,
 the card wins. If you are a 0.1.x-org agent reading this: your line is
 0.1.x and this checkout is the wrong one — do not push here. Fixes cross
 0.1.x -> main by cherry-pick election only, Mike-authorized.
