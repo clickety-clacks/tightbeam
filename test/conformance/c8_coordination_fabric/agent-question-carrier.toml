@@ -21,6 +21,7 @@ legibility = "lifecycle:decision_request_asked"
 # with a ruling fact, a park wake, and a consume edge behind it. Refused by
 # name, and the schema arm pins every one of those columns NULL besides.
 #
-# Every case crosses `Dispatch.dispatch/3` — `Rules.decide` sees `ask` and
-# `answer` exactly as it sees every other verb. There is no [[fixture.rule]]:
+# Every case crosses `Dispatch.dispatch/3` — `Rules.decide` sees `ask`,
+# `answer`, and the reasoned `return` disposition exactly as it sees every
+# other verb. There is no [[fixture.rule]]:
 # the carrier is substrate mechanism, and nothing here evaluates a statute.

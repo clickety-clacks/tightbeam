@@ -43,7 +43,7 @@ defmodule Tightbeam.ConformanceSupport do
                ~w(case kind expect reason emits input script_return world call phase2 phase)
              )
   @expects MapSet.new(
-             ~w(deny pass refuse run-remedy re-obligate escalate-park none escalate-halt escalate-open escalate-continue load-raise load-clean digest immediate bypass inhibited unclassed filed gates-nothing answered withdrawn not-rulable page resume unpaged exhausted roster-page)
+             ~w(deny pass refuse run-remedy re-obligate escalate-park none escalate-halt escalate-open escalate-continue load-raise load-clean digest immediate bypass inhibited unclassed filed gates-nothing answered withdrawn returned not-rulable page resume unpaged exhausted roster-page)
            )
   @case_expects %{
     "harness-gate" => ~w(deny pass),
@@ -60,7 +60,7 @@ defmodule Tightbeam.ConformanceSupport do
     # Seam ③. `gates-nothing` is the anti-adjudication outcome and is a WORD OF
     # ITS OWN rather than a flavour of `filed`, so a change that quietly let a
     # question hold a completion would have to delete a named outcome to pass.
-    "question-carrier" => ~w(filed gates-nothing answered withdrawn not-rulable refuse),
+    "question-carrier" => ~w(filed gates-nothing answered withdrawn returned not-rulable refuse),
     # Seam ④. `unpaged` is likewise its own word: the contract that an unlimited
     # read still returns everything is the one a default page size would break.
     "read-cursor" => ~w(page resume unpaged exhausted roster-page refuse),
@@ -1208,6 +1208,65 @@ defmodule Tightbeam.ConformanceSupport do
     assert current_status(db, request.id) == "withdrawn"
   end
 
+  defp assert_question_outcome("returned", kase, db, handlers, _ids, result) do
+    request = filed!(kase, result)
+
+    # An unasked bystander learns no more than a caller probing a fake id.
+    assert {:error, %{code: "not_found"}} =
+             Dispatch.dispatch(
+               db,
+               handlers,
+               return_call("bystander", request.id, "missing the rollback boundary")
+             )
+
+    assert {:ok, %{decision_request: returned}} =
+             Dispatch.dispatch(
+               db,
+               handlers,
+               return_call(
+                 request.expecter_session_key,
+                 request.id,
+                 "missing the rollback boundary"
+               )
+             )
+
+    assert returned.status == "returned"
+    assert returned.question == request.question
+    assert returned.return_reason == "missing the rollback boundary"
+    assert returned.returned_by == "session:" <> request.expecter_session_key
+    assert is_integer(returned.returned_at)
+    assert returned.answer == nil
+
+    # Default open retrieval no longer includes the returned row, while the
+    # explicit terminal filter preserves its full reasoned history.
+    assert {:ok, %{decision_requests: []}} =
+             Dispatch.dispatch(db, handlers, %{
+               verb: "decision-requests",
+               origin: "agent:#{request.raiser_session_key}",
+               principal: {:session, request.raiser_session_key},
+               session_key: nil,
+               params: %{status: "open"}
+             })
+
+    assert {:ok, %{decision_requests: [%{id: id, status: "returned"}]}} =
+             Dispatch.dispatch(db, handlers, %{
+               verb: "decision-requests",
+               origin: "agent:#{request.raiser_session_key}",
+               principal: {:session, request.raiser_session_key},
+               session_key: nil,
+               params: %{status: "returned"}
+             })
+
+    assert id == request.id
+    assert [notice] = prompt_wakes(db, request.raiser_session_key)
+    assert notice.prompt =~ request.question
+    assert notice.prompt =~ returned.return_reason
+    assert notice.prompt =~ "Revise or replace"
+
+    detail = question_lifecycle(db, "decision_request_returned", request.id)
+    assert detail =~ "by=#{returned.returned_by}"
+  end
+
   defp assert_question_outcome("not-rulable", kase, db, handlers, _ids, result) do
     request = filed!(kase, result)
 
@@ -1242,6 +1301,16 @@ defmodule Tightbeam.ConformanceSupport do
       principal: {:session, session_key},
       session_key: nil,
       params: %{request: request_id, answer: text}
+    }
+  end
+
+  defp return_call(session_key, request_id, reason) do
+    %{
+      verb: "return",
+      origin: "agent:#{session_key}",
+      principal: {:session, session_key},
+      session_key: nil,
+      params: %{request: request_id, reason: reason}
     }
   end
 

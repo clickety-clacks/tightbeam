@@ -62,7 +62,12 @@ defmodule Tightbeam.Schema do
   # read or write this build makes against the NEW columns/constraints would
   # die on a raw, unnamed SQLite error instead of a refusal that names what
   # changed. Refuse, name it, and let the database be recreated.
-  @shape "coordination-fabric-v1-phase1-v3"
+  # Mike's 2026-08-22 decision-reader return ruling adds the `returned`
+  # disposition and three audit columns to `decision_requests`. SQLite cannot
+  # widen the existing status/arm CHECKs or add those columns through
+  # `CREATE TABLE IF NOT EXISTS`, so a v3 database must refuse by name rather
+  # than failing on the first return with a raw column/CHECK error.
+  @shape "coordination-fabric-v1-phase1-v4"
 
   @supervision_liveness_objects [
     %{

@@ -456,6 +456,20 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 string_field("answer", answer),
             ],
         )),
+        // `return` has the same no-target privacy boundary as `answer`.
+        Command::ReturnRequest {
+            identity,
+            request_id,
+            reason,
+        } => Ok(request(
+            identity,
+            "return",
+            vec![],
+            vec![
+                string_field("request", request_id),
+                string_field("reason", reason),
+            ],
+        )),
         Command::RevokeAssignment {
             identity,
             assignment_id,
@@ -1473,6 +1487,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::DecisionRequests { identity, .. }
         | Command::Ask { identity, .. }
         | Command::Answer { identity, .. }
+        | Command::ReturnRequest { identity, .. }
         | Command::RevokeAssignment { identity, .. }
         | Command::ReopenAssignment { identity, .. }
         | Command::WorkItemCreate { identity, .. }
@@ -1891,9 +1906,9 @@ mod tests {
     }
 
     #[test]
-    fn builds_byte_exact_ask_answer_and_cursor_bodies() {
-        // `ask` carries a typed target; `answer` carries none, because the
-        // request id already names who was asked (seam ③).
+    fn builds_byte_exact_ask_answer_return_and_cursor_bodies() {
+        // `ask` carries a typed target; `answer` and `return` carry none,
+        // because the request id already names who was asked (seam ③).
         assert_eq!(
             body(&[
                 "ask",
@@ -1932,6 +1947,18 @@ mod tests {
             ]),
             r#"{"asUser":"flynn","verb":"answer","params":{"request":"dr_1","answer":"behind a flag"}}"#
         );
+        assert_eq!(
+            body(&[
+                "return",
+                "--request",
+                "dr_1",
+                "--reason",
+                "name the migration",
+                "--as-user",
+                "flynn",
+            ]),
+            r#"{"asUser":"flynn","verb":"return","params":{"request":"dr_1","reason":"name the migration"}}"#
+        );
         for missing in [
             &["ask", "--question", "q"][..],
             &["ask", "--role", "owner"][..],
@@ -1946,6 +1973,8 @@ mod tests {
             ][..],
             &["answer", "--request", "dr_1"][..],
             &["answer", "--answer", "text"][..],
+            &["return", "--request", "dr_1"][..],
+            &["return", "--reason", "unclear"][..],
         ] {
             let mut argv = missing.to_vec();
             argv.extend_from_slice(&["--as", "coder"]);
