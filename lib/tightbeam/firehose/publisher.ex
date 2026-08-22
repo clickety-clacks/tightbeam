@@ -67,8 +67,8 @@ defmodule Tightbeam.Firehose.Publisher do
     primary = List.wrap(state_notice(db, call, result))
 
     case {call.verb, result} do
-      {"attest", %{assignment: %{state: state} = assignment}}
-      when state in ~w(completed surrendered revoked) ->
+      {"attest", %{assignment: %{state: "closed", outcome: outcome} = assignment}}
+      when outcome in ~w(completed surrendered revoked) ->
         primary ++ [build("assignment.closed", call, assignment, &StateResources.assignment/1)]
 
       _ ->

@@ -117,6 +117,152 @@ defmodule Tightbeam.Firehose.PublisherTest do
     end
   end
 
+  test "per-verb effects match real wake, condition, dispatch, and attest outcomes" do
+    db = :firehose_per_verb_effect_db
+    scheduler = :firehose_per_verb_effect_scheduler
+    start_supervised!({DB, path: ":memory:", name: db})
+    :ok = Tightbeam.Schema.ensure_all(db)
+    {:ok, _} = DB.query(db, "INSERT INTO users VALUES ('flynn', 1, 1)")
+    start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
+    start_supervised!({LaneStub, name: Tightbeam.LaneManager})
+
+    Org.create(db, %{
+      session_key: "effect-target",
+      display_name: "Effect target",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Tightbeam.Model.new("fable")
+    })
+
+    start_supervised!(
+      {Wakes,
+       db: db,
+       name: scheduler,
+       tick_ms: 60_000,
+       deliver: fn wake ->
+         Gateway.deliver_prompt(wake.session_key, wake.origin, wake.prompt,
+           db: db,
+           wake_id: wake.wake_id,
+           sender: wake.origin,
+           target_gate: wake
+         )
+       end}
+    )
+
+    config = %{
+      db: db,
+      wake_scheduler: scheduler,
+      wake_tick_ms: 1_000,
+      effort_checkin_horizon_ms: 60_000,
+      base_dir: System.tmp_dir!()
+    }
+
+    handlers = Gateway.handlers(config)
+
+    immediate_wake = %{
+      verb: "wake",
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      session_key: "effect-target",
+      params: %{prompt: "immediate effect", after_ms: 0, idempotency_key: "effect-immediate"}
+    }
+
+    assert {:ok, %{wake_id: immediate_id}} = Dispatch.dispatch(db, handlers, immediate_wake)
+    assert %{state: "fired"} = Wakes.get(db, immediate_id)
+    wake_observed = observed_state_classes()
+
+    pending =
+      Wakes.schedule(db, %{
+        session_key: "effect-target",
+        origin: "user:flynn",
+        prompt: "cancel effect",
+        due_at: System.system_time(:millisecond) + 60_000
+      })
+
+    cancel_wake = %{
+      verb: "wake",
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      session_key: nil,
+      params: %{cancel_wake_id: pending.wake_id}
+    }
+
+    assert {:ok, %{canceled: true}} = Dispatch.dispatch(db, handlers, cancel_wake)
+
+    assert_per_verb_effects!(
+      config,
+      "wake",
+      wake_observed ++ observed_state_classes()
+    )
+
+    _condition_wake =
+      Wakes.schedule(db, %{
+        session_key: "effect-target",
+        origin: "user:flynn",
+        prompt: "condition effect",
+        due_at: System.system_time(:millisecond) + 60_000,
+        condition_kind: "effect-ready",
+        condition_scope: "matrix"
+      })
+
+    condition = %{
+      verb: "condition",
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      session_key: nil,
+      params: %{kind: "effect-ready", scope: "matrix", idempotency_key: "effect-fact"}
+    }
+
+    assert {:ok, %{kind: "effect-ready"}} = Dispatch.dispatch(db, handlers, condition)
+    assert_per_verb_effects!(config, "condition", observed_state_classes())
+
+    dispatch = %{
+      verb: "dispatch",
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      session_key: "effect-target",
+      target_role: nil,
+      role_fallback: false,
+      params: %{subject: "Effect dispatch", brief: "Exercise every dispatch effect."}
+    }
+
+    assert {:ok, assignment} = Dispatch.dispatch(db, handlers, dispatch)
+    assert_per_verb_effects!(config, "dispatch", observed_state_classes())
+
+    tests_passed = %{
+      verb: "attest",
+      origin: "agent:effect-target",
+      principal: {:session, "effect-target"},
+      session_key: nil,
+      params: %{
+        assignment_id: assignment.id,
+        kind: "verdict",
+        verdict_kind: "tests-passed",
+        note: "effect matrix tests passed"
+      }
+    }
+
+    assert {:ok, %{attest: %{verdictKind: "tests-passed"}}} =
+             Dispatch.dispatch(db, handlers, tests_passed)
+
+    completion = %{
+      verb: "attest",
+      origin: "agent:effect-target",
+      principal: {:session, "effect-target"},
+      session_key: nil,
+      params: %{assignment_id: assignment.id, kind: "completion", note: "effect matrix complete"}
+    }
+
+    assert {:ok, %{assignment: %{state: "closed", outcome: "completed"}}} =
+             Dispatch.dispatch(db, handlers, completion)
+
+    assert_per_verb_effects!(config, "attest", observed_state_classes())
+  end
+
   test "a raised state handler emits denied and never accepted state effects" do
     db = :firehose_raised_handler_db
     start_supervised!({DB, path: ":memory:", name: db})
@@ -291,5 +437,33 @@ defmodule Tightbeam.Firehose.PublisherTest do
     end
 
     :ok
+  end
+
+  defp assert_per_verb_effects!(config, verb, observed) do
+    declared = Gateway.handler_effects(config)[verb]
+    observed = observed |> Enum.uniq() |> Enum.sort()
+    assert_effects_match!(declared, observed)
+
+    for effect <- declared do
+      error =
+        assert_raise ArgumentError, fn ->
+          assert_effects_match!(List.delete(declared, effect), observed)
+        end
+
+      assert Exception.message(error) =~ effect
+    end
+  end
+
+  defp observed_state_classes(acc \\ []) do
+    _ = :sys.get_state(Hub)
+
+    receive do
+      {:firehose_notice, %{"class" => class}} -> observed_state_classes([class | acc])
+    after
+      0 ->
+        acc
+        |> Enum.filter(&match?({:ok, _row}, Tightbeam.Firehose.Registry.fetch(&1)))
+        |> Enum.reverse()
+    end
   end
 end

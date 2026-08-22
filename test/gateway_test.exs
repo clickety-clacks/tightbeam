@@ -73,6 +73,7 @@ defmodule Tightbeam.GatewayTest do
     WorkItems
   }
 
+  alias Tightbeam.Firehose.Hub
   alias Tightbeam.Wire.Payloads
 
   defmodule LaneDoorbell do
@@ -3255,7 +3256,10 @@ defmodule Tightbeam.GatewayTest do
     })
 
     start_lane!(ctx.db, "retune")
-    handlers = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))
+    config = gateway_config(base_dir, ctx.db, 0)
+    handlers = Gateway.handlers(config)
+    start_supervised!({Hub, name: Hub})
+    :ok = Hub.register(Hub, self())
 
     assert %{ok: true} =
              handlers["tune"].(%{
@@ -3270,6 +3274,8 @@ defmodule Tightbeam.GatewayTest do
     assert marker.content =~ "claude-fable-5"
     assert marker.content =~ "claude-sonnet-4-6"
 
+    assert_per_verb_effects!(config, "tune", observed_state_classes())
+
     refute marker.content =~ "RETAINED",
            "a retune hides nothing, so it must not borrow the engine swap's promise"
 
@@ -3283,6 +3289,7 @@ defmodule Tightbeam.GatewayTest do
              })
 
     assert length(Projection.list_after(ctx.db, "retune", nil, 50, 0)) == 1
+    assert observed_state_classes() == []
   end
 
   test "a failure between the barrier and its tombstone rolls BOTH back", ctx do
@@ -5888,6 +5895,8 @@ defmodule Tightbeam.GatewayTest do
     Org.append_pointer(ctx.db, "k1", "cancel-session", "created")
 
     task_sup = start_supervised!({Task.Supervisor, name: :override_cancel_tasks})
+    start_supervised!({Hub, name: Hub})
+    :ok = Hub.register(Hub, self())
 
     start_supervised!(%{
       id: :override_cancel_conn_registry,
@@ -5920,6 +5929,7 @@ defmodule Tightbeam.GatewayTest do
 
     barrier_lane_started(lane)
     assert_receive :cancel_runner_started
+    _prior_effects = observed_state_classes()
 
     assert %{ok: true} =
              Gateway.handlers(config)["cancel"].(%{
@@ -5927,6 +5937,8 @@ defmodule Tightbeam.GatewayTest do
                session_key: "k1",
                params: %{}
              })
+
+    assert_per_verb_effects!(config, "cancel", observed_state_classes())
 
     assert_receive {:adapter_key, {:claude, "shared", "testhost"}}
     assert Process.alive?(lane)
@@ -10043,6 +10055,46 @@ defmodule Tightbeam.GatewayTest do
 
   defp assert_process_mailbox(name, minimum, 0),
     do: flunk("#{inspect(name)} mailbox did not reach #{minimum} queued message(s)")
+
+  defp assert_per_verb_effects!(config, verb, observed) do
+    declared = Gateway.handler_effects(config)[verb]
+    observed = observed |> Enum.uniq() |> Enum.sort()
+    assert_effects_match!(declared, observed)
+
+    for effect <- declared do
+      error =
+        assert_raise ArgumentError, fn ->
+          assert_effects_match!(List.delete(declared, effect), observed)
+        end
+
+      assert Exception.message(error) =~ effect
+    end
+  end
+
+  defp assert_effects_match!(declared, observed) do
+    extra = declared -- observed
+    missing = observed -- declared
+
+    if extra != [] or missing != [] do
+      raise ArgumentError,
+            "handler effect mismatch: extra=#{inspect(extra)} missing=#{inspect(missing)}"
+    end
+
+    :ok
+  end
+
+  defp observed_state_classes(acc \\ []) do
+    _ = :sys.get_state(Hub)
+
+    receive do
+      {:firehose_notice, %{"class" => class}} -> observed_state_classes([class | acc])
+    after
+      0 ->
+        acc
+        |> Enum.filter(&match?({:ok, _row}, Tightbeam.Firehose.Registry.fetch(&1)))
+        |> Enum.reverse()
+    end
+  end
 
   defp credential_probe(parent, command) do
     send(parent, {:credential_command, command})
