@@ -132,6 +132,14 @@ defmodule Tightbeam.HarnessProcessTest do
       assert :ok = HarnessProcess.assert_zero_listeners(ctx.db, "l-zero", run)
     end
 
+    test "the real local probe does not depend on the LaunchDaemon PATH", ctx do
+      # No process group can have this value on Darwin. The system lsof therefore
+      # returns its documented empty-selection status, which the probe accepts.
+      :ok = insert_launch!(ctx.db, "l-system-path", nil, 2_147_483_647)
+
+      assert :ok = HarnessProcess.assert_zero_listeners(ctx.db, "l-system-path")
+    end
+
     test "an lsof that is not on PATH fails CLOSED (never silently passes)", ctx do
       :ok = insert_launch!(ctx.db, "l-absent", nil, 4244)
       run = fn 4244 -> {"lsof is not on this gateway's PATH", 127} end

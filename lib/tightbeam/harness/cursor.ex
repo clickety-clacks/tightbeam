@@ -516,7 +516,7 @@ defmodule Tightbeam.Harness.Cursor do
   end
 
   defp default_realpath(path) do
-    case System.cmd("realpath", [path], stderr_to_stdout: true) do
+    case System.cmd("/bin/realpath", [path], stderr_to_stdout: true) do
       {canonical, 0} -> {:ok, String.trim(canonical)}
       _ -> {:error, :canonical_path}
     end

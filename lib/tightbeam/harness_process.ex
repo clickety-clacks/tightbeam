@@ -690,7 +690,10 @@ defmodule Tightbeam.HarnessProcess do
   # `{output, status}` (or `{:error, :timeout}`) for `listener_sample/2` to classify.
   defp lsof_listen_probe(pgid) do
     args = ["-nP", "-a", "-g", Integer.to_string(pgid), "-iTCP", "-sTCP:LISTEN", "-Fn"]
-    bounded_command("lsof", args, 5_000)
+    # This runs in the gateway LaunchDaemon, whose deliberately small PATH does
+    # not include /usr/sbin. Use the macOS system path directly: an unavailable
+    # probe must fail closed, but a PATH omission is not evidence of a listener.
+    bounded_command("/usr/sbin/lsof", args, 5_000)
   end
 
   # `-a` ANDs the pgid and socket-state filters; `-Fn` prints one field per line, so a socket name
