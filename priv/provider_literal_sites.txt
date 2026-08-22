@@ -6,3 +6,4 @@ cli/src/onboard_emit.rs
 lib/tightbeam/credentials.ex
 lib/tightbeam/gateway.ex
 lib/tightbeam/org.ex
+lib/tightbeam/schema.ex
