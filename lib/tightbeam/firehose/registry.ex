@@ -74,7 +74,9 @@ defmodule Tightbeam.Firehose.Registry do
              resource: resource,
              op: op,
              primary_ref: primary_ref,
-             serializer: Map.fetch!(@serializers, resource)
+             serializer: Map.fetch!(@serializers, resource),
+             query: :query,
+             visibility: :visible?
            }}
         end)
 

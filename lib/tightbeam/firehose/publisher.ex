@@ -161,28 +161,28 @@ defmodule Tightbeam.Firehose.Publisher do
   defp canonical_result(db, %{verb: verb} = call, result)
        when verb in ~w(work-item-create work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail) do
     id = result[:id] || result["id"] || call.params[:work_item_id]
-    StateResources.query_work_item(db, id, call) || result
+    StateResources.query(db, "work-items", id, %{call: call}) || result
   end
 
   defp canonical_result(db, %{verb: verb} = call, result)
        when verb in ~w(assign dispatch reopen-assignment revoke-assignment) do
     id = result[:id] || result["id"] || result[:assignment_id] || call.params[:assignment_id]
-    StateResources.query_assignment(db, id, call) || result
+    StateResources.query(db, "assignments", id, %{call: call}) || result
   end
 
   defp canonical_result(db, %{verb: "wake"} = call, result) do
     id = result[:wake_id] || result["wakeId"] || call.params[:wake_id]
-    StateResources.query_wake(db, id) || result
+    StateResources.query(db, "wakes", id) || result
   end
 
   defp canonical_result(db, %{verb: "artifact-record"}, result) do
     id = result[:artifact_id] || result["artifactId"] || result[:id]
-    StateResources.query_artifact(db, id) || result
+    StateResources.query(db, "artifacts", id) || result
   end
 
   defp canonical_result(db, %{verb: verb} = call, result)
        when verb in ~w(role-create role-bind) do
-    StateResources.query_role(db, call.params[:name]) || result
+    StateResources.query(db, "roles", call.params[:name]) || result
   end
 
   defp canonical_result(_db, %{verb: "role-rm"} = call, result) do
@@ -191,30 +191,32 @@ defmodule Tightbeam.Firehose.Publisher do
 
   defp canonical_result(db, %{verb: "spawn"}, result) do
     id = result[:session_key] || result["sessionKey"] || result[:key]
-    StateResources.query_session(db, id) || result
+    StateResources.query(db, "sessions", id) || result
   end
 
   defp canonical_result(db, %{verb: "retire"} = call, result) do
-    StateResources.query_session(db, call.session_key) || result
+    StateResources.query(db, "sessions", call.session_key) || result
   end
 
   defp canonical_result(db, %{verb: verb} = call, result)
        when verb in ~w(approve-device deny-device revoke-device) do
-    StateResources.query_device(db, call.params[:device_id]) || result
+    StateResources.query(db, "devices", call.params[:device_id]) || result
   end
 
   defp canonical_result(db, %{verb: "add-user"} = call, result) do
-    StateResources.query_user(db, call.params[:user_id]) || result
+    StateResources.query(db, "users", call.params[:user_id]) || result
   end
 
   defp canonical_result(db, %{verb: verb} = call, result)
        when verb in ~w(read-marker-set read-marker-clear) do
     user_id = result[:user_id] || result["userId"]
-    StateResources.query_read_marker(db, user_id, call.params[:scope_key]) || result
+
+    StateResources.query(db, "read-markers", call.params[:scope_key], %{user_id: user_id}) ||
+      result
   end
 
   defp canonical_result(db, %{verb: "critical"} = call, result) do
-    StateResources.query_critical_state(db, call.session_key) || result
+    StateResources.query(db, "critical-state", call.session_key) || result
   end
 
   defp canonical_result(_db, _call, result), do: result

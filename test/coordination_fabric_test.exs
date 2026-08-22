@@ -1646,7 +1646,10 @@ defmodule Tightbeam.CoordinationFabricTest do
       withdraw_episodes: [{"lib/tightbeam/rail_episodes.ex", "handle_call/3"}],
       recover_retired: [{"lib/tightbeam/boot.ex", "start_link/1"}],
       list: [{"lib/tightbeam/gateway.ex", "handlers/1"}],
-      get: [{"lib/tightbeam/gateway.ex", "handlers/1"}],
+      get: [
+        {"lib/tightbeam/gateway.ex", "handlers/1"},
+        {"lib/tightbeam/state_resources.ex", "query/4"}
+      ],
       effort_rule_in_txn: [{"lib/tightbeam/effort_checkin.ex", "rule_in_txn/7"}],
       claim_park_wake_in_txn: [{"lib/tightbeam/supervision.ex", "park_escalation/3"}],
       decision_trace_rows: [{"lib/tightbeam/job_trace.ex", "decision_entries/2"}],

@@ -8,7 +8,53 @@ defmodule Tightbeam.StateResources do
 
   @secret_keys MapSet.new(["cliToken", "token", "identityToken"])
 
-  alias Tightbeam.{Artifacts, Assignments, Devices, Org, ReadMarkers, Wakes, WorkItems}
+  alias Tightbeam.{
+    Artifacts,
+    Assignments,
+    Devices,
+    Escalation,
+    Org,
+    Projection,
+    ReadMarkers,
+    Wakes,
+    WorkItems
+  }
+
+  @doc "Fetch one canonical resource row before public serialization."
+  def query(db, resource, id, context \\ %{})
+
+  def query(db, "work-items", id, %{call: call}), do: query_work_item(db, id, call)
+  def query(db, "assignments", id, %{call: call}), do: query_assignment(db, id, call)
+
+  def query(db, "attests", id, _context) do
+    with {:ok, [[assignment_id]]} <-
+           Tightbeam.DB.query(db, "SELECT assignmentId FROM attests WHERE id = ?1", [id]) do
+      Enum.find(Assignments.list_attests(db, assignment_id), &(&1.id == id))
+    else
+      {:ok, []} -> nil
+    end
+  end
+
+  def query(db, "wakes", id, _context), do: Wakes.get(db, id)
+  def query(db, "productions", id, _context), do: query_production(db, id)
+  def query(db, "turns", id, _context), do: query_turn(db, id)
+
+  def query(db, "decision-requests", id, %{call: call} = context) do
+    Escalation.get(db, call, id, owner_user_id: context[:owner_user_id])
+  end
+
+  def query(db, "sessions", id, _context), do: Org.get(db, id)
+  def query(db, "roles", id, _context), do: query_role(db, id)
+  def query(db, "users", id, _context), do: Devices.user(db, id)
+  def query(db, "devices", id, _context), do: query_device(db, id)
+  def query(db, "artifacts", id, _context), do: Artifacts.get(db, id)
+
+  def query(db, "read-markers", id, %{user_id: user_id}),
+    do: ReadMarkers.get(db, user_id, id)
+
+  def query(db, "messages", id, _context), do: Projection.get(db, id)
+  def query(db, "condition-facts", id, _context), do: query_condition_fact(db, id)
+  def query(db, "critical-state", id, _context), do: Tightbeam.CriticalLeases.get(db, id)
 
   def query_work_item(db, id, call) do
     case WorkItems.__handle__(db, "work-item-get", %{call | params: %{work_item_id: id}}) do
@@ -22,6 +68,8 @@ defmodule Tightbeam.StateResources do
     case Assignments.__handle__(db, "assignment-get", %{call | params: %{assignment_id: id}}) do
       %{assignment: row} -> row
       %{"assignment" => row} -> row
+      %{code: _code} -> nil
+      %{} = row -> row
       _ -> nil
     end
   end
@@ -111,6 +159,41 @@ defmodule Tightbeam.StateResources do
     case rows do
       [row] -> turn_row(row)
       [] -> nil
+    end
+  end
+
+  def query_turn(db, seq) do
+    {:ok, rows} =
+      Tightbeam.DB.query(
+        db,
+        """
+        SELECT seq, sessionKey, messageId, wakeId, origin, roleRef,
+               roleFallback, assignmentId, jobRef, model, thinkingLevel,
+               modelContext, harness, replyAttention, status, owner,
+               adapterGen, requestRef, error, createdAt, startedAt,
+               endedAt, publishedAt
+        FROM turns WHERE seq = ?1
+        """,
+        [seq]
+      )
+
+    case rows do
+      [row] -> turn_row(row)
+      [] -> nil
+    end
+  end
+
+  defp query_condition_fact(db, id) do
+    case Tightbeam.DB.query(
+           db,
+           "SELECT id, ts, kind, scope, origin FROM condition_facts WHERE id = ?1",
+           [id]
+         ) do
+      {:ok, [[fact_id, ts, kind, scope, origin]]} ->
+        %{fact_id: fact_id, ts: ts, kind: kind, scope: scope, origin: origin}
+
+      {:ok, []} ->
+        nil
     end
   end
 
@@ -219,7 +302,7 @@ defmodule Tightbeam.StateResources do
   end
 
   defp natural_version(row) do
-    ~w(updatedAt endedAt firedAt canceledAt closedAt retiredAt ruledAt withdrawnAt startedAt createdAt openedAt ts seq id)
+    ~w(updatedAt endedAt firedAt canceledAt closedAt retiredAt ruledAt answeredAt withdrawnAt consumedAt startedAt createdAt openedAt raisedAt ts seq id)
     |> Enum.map(&row[&1])
     |> Enum.filter(&is_integer/1)
     |> Enum.max(fn -> nil end)

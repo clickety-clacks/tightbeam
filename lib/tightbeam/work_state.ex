@@ -326,7 +326,8 @@ defmodule Tightbeam.WorkState do
   defp item_columns,
     do:
       "id, title, specRefName, specRefSha256, isBug, ownerUserId, state, failReason, " <>
-        "createdByUser, createdBySession, createdAt"
+        "createdByUser, createdBySession, createdAt, " <>
+        "COALESCE((SELECT rowVersion FROM work_item_versions WHERE workItemId = work_items.id), createdAt)"
 
   defp assignment([
          id,
@@ -379,7 +380,8 @@ defmodule Tightbeam.WorkState do
          fail_reason,
          user,
          session,
-         created_at
+         created_at,
+         row_version
        ]) do
     %{
       id: id,
@@ -392,7 +394,8 @@ defmodule Tightbeam.WorkState do
       failReason: fail_reason,
       createdByUser: user,
       createdBySession: session,
-      createdAt: created_at
+      createdAt: created_at,
+      rowVersion: row_version
     }
   end
 

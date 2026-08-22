@@ -122,6 +122,7 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
   end
 
   test "registry rows are both-way unique and observational classes have no resource row" do
+    Code.ensure_loaded!(Tightbeam.StateResources)
     rows = Registry.rows()
 
     assert map_size(rows) ==

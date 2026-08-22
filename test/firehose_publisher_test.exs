@@ -47,6 +47,55 @@ defmodule Tightbeam.Firehose.PublisherTest do
     refute Map.has_key?(payload, "cliToken")
   end
 
+  test "successive work item commits have strictly increasing notice versions" do
+    db = :firehose_work_item_version_db
+    start_supervised!({Tightbeam.DB, path: ":memory:", name: db})
+    :ok = Tightbeam.Schema.ensure_all(db)
+
+    {:ok, _} =
+      Tightbeam.DB.query(
+        db,
+        "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1)"
+      )
+
+    handlers = Tightbeam.Gateway.handlers(%{db: db})
+    Tightbeam.Rules.load!(System.tmp_dir!(), Map.keys(handlers))
+
+    create = %{
+      verb: "work-item-create",
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      session_key: nil,
+      params: %{title: "Before"}
+    }
+
+    assert {:ok, created} = Tightbeam.Dispatch.dispatch(db, handlers, create)
+    assert_receive {:firehose_notice, %{"class" => "verb.accepted"}}
+
+    assert_receive {:firehose_notice,
+                    %{
+                      "class" => "work_item.created",
+                      "payload" => %{"title" => "Before", "rowVersion" => created_version}
+                    }}
+
+    update = %{
+      create
+      | verb: "work-item-update",
+        params: %{work_item_id: created.id, title: "After"}
+    }
+
+    assert {:ok, %{title: "After"}} = Tightbeam.Dispatch.dispatch(db, handlers, update)
+    assert_receive {:firehose_notice, %{"class" => "verb.accepted"}}
+
+    assert_receive {:firehose_notice,
+                    %{
+                      "class" => "work_item.updated",
+                      "payload" => %{"title" => "After", "rowVersion" => updated_version}
+                    }}
+
+    assert updated_version > created_version
+  end
+
   test "unmapped reads emit only the observational verb notice" do
     assert :ok =
              Publisher.accepted(
