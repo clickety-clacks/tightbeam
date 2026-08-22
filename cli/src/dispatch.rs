@@ -1024,7 +1024,11 @@ where
     let token = get_env("TIGHTBEAM_TOKEN").filter(|value| !value.is_empty());
     if let (Some(base), Some(token)) = (url, token) {
         return Ok(Endpoint {
-            base,
+            // The configured URL names the advertised websocket endpoint in the
+            // same way gateway.json and .tightbeam-session do. Every configured
+            // client path roots the HTTP dispatch route, so all three readers
+            // must apply the same scheme conversion.
+            base: http_scheme(&base),
             token,
             origin: Origin::Named,
         });
@@ -1198,6 +1202,36 @@ fn send_to_with_timeout(
     request: &RequestSpec,
     timeout: Option<Duration>,
 ) -> Result<Option<Value>, String> {
+    with_one_dns_retry(|| send_once(endpoint, request, timeout))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SendAttemptError {
+    Dns(String),
+    Final(String),
+}
+
+/// Retry exactly one failure that proves no request reached the gateway.
+///
+/// DNS failure happens before a connection exists, so this is safe for reads and
+/// mutations alike. No status, body, connection, or timeout error is replayed.
+fn with_one_dns_retry<T>(
+    mut attempt: impl FnMut() -> Result<T, SendAttemptError>,
+) -> Result<T, String> {
+    match attempt() {
+        Err(SendAttemptError::Dns(_)) => attempt().map_err(|error| match error {
+            SendAttemptError::Dns(message) | SendAttemptError::Final(message) => message,
+        }),
+        Err(SendAttemptError::Final(message)) => Err(message),
+        Ok(value) => Ok(value),
+    }
+}
+
+fn send_once(
+    endpoint: &Endpoint,
+    request: &RequestSpec,
+    timeout: Option<Duration>,
+) -> Result<Option<Value>, SendAttemptError> {
     let call = gateway_request("POST", endpoint, request.path, timeout)
         .set("content-type", "application/json")
         .send_string(&request.body_json);
@@ -1205,10 +1239,17 @@ fn send_to_with_timeout(
     let (status, response) = match call {
         Ok(response) => (response.status(), response),
         Err(ureq::Error::Status(status, response)) => (status, response),
-        Err(ureq::Error::Transport(error)) => return Err(error.to_string()),
+        Err(ureq::Error::Transport(error)) if error.kind() == ureq::ErrorKind::Dns => {
+            return Err(SendAttemptError::Dns(error.to_string()));
+        }
+        Err(ureq::Error::Transport(error)) => {
+            return Err(SendAttemptError::Final(error.to_string()));
+        }
     };
-    let encoded = response.into_string().map_err(|error| error.to_string())?;
-    parse_response(status, &encoded)
+    let encoded = response
+        .into_string()
+        .map_err(|error| SendAttemptError::Final(error.to_string()))?;
+    parse_response(status, &encoded).map_err(SendAttemptError::Final)
 }
 
 pub(crate) fn gateway_request(
@@ -2584,7 +2625,7 @@ mod tests {
         );
 
         let env = HashMap::from([
-            ("TIGHTBEAM_URL".to_owned(), "https://gateway".to_owned()),
+            ("TIGHTBEAM_URL".to_owned(), "ws://gateway".to_owned()),
             ("TIGHTBEAM_TOKEN".to_owned(), "env-token".to_owned()),
             (
                 "TIGHTBEAM_HOME".to_owned(),
@@ -2594,7 +2635,7 @@ mod tests {
         assert_eq!(
             discover_with(|name| env.get(name).cloned(), &root, &root),
             Ok(Endpoint {
-                base: "https://gateway".to_owned(),
+                base: "http://gateway".to_owned(),
                 token: "env-token".to_owned(),
                 origin: Origin::Named,
             })
@@ -3198,6 +3239,39 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("onboarding lease expired"), "{error}");
+    }
+
+    #[test]
+    fn dns_failure_retries_once_and_no_other_failure_replays() {
+        let mut recovered_calls = 0;
+        let recovered = with_one_dns_retry(|| {
+            recovered_calls += 1;
+            if recovered_calls == 1 {
+                Err(SendAttemptError::Dns("temporary dns failure".to_owned()))
+            } else {
+                Ok("open decisions")
+            }
+        });
+        assert_eq!(recovered, Ok("open decisions"));
+        assert_eq!(recovered_calls, 2);
+
+        let mut persistent_calls = 0;
+        let persistent = with_one_dns_retry::<()>(|| {
+            persistent_calls += 1;
+            Err(SendAttemptError::Dns(format!(
+                "dns failure {persistent_calls}"
+            )))
+        });
+        assert_eq!(persistent, Err("dns failure 2".to_owned()));
+        assert_eq!(persistent_calls, 2);
+
+        let mut final_calls = 0;
+        let final_error = with_one_dns_retry::<()>(|| {
+            final_calls += 1;
+            Err(SendAttemptError::Final("gateway denied".to_owned()))
+        });
+        assert_eq!(final_error, Err("gateway denied".to_owned()));
+        assert_eq!(final_calls, 1);
     }
 
     #[test]
