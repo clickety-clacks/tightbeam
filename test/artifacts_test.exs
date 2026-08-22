@@ -2,12 +2,13 @@ defmodule Tightbeam.ArtifactsTest do
   use Tightbeam.TestCase, async: false
   alias Tightbeam.Model
 
-  alias Tightbeam.{Artifacts, DB, Gateway, Ledger, Org, Projection, WorkItems}
+  alias Tightbeam.{Artifacts, DB, Gateway, IdentityApply, Ledger, Org, Projection, WorkItems}
 
   setup do
     db = :"artifacts_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Org.ensure_schema(db)
+    :ok = IdentityApply.ensure_schema(db)
     :ok = Projection.ensure_schema(db)
     :ok = WorkItems.ensure_schema(db)
     :ok = Ledger.ensure_schema(db)

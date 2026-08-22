@@ -297,6 +297,30 @@ defmodule Tightbeam.GatewayTest do
     # A RESIDENT session: the adapter still holds it, so apply bounces it.
     def handle_call({:knows_session?, _sid}, _from, parent), do: {:reply, true, parent}
 
+    def handle_call({:identity_context_snapshot, sid}, _from, parent) do
+      {:reply, {:ok, %{resident: is_binary(sid), model: nil}}, parent}
+    end
+
+    def handle_call(
+          {:identity_replace_session, nil, false, model, cwd, mcp_servers, guidance},
+          _from,
+          parent
+        ) do
+      sid = "identity-apply-" <> (:crypto.hash(:sha256, cwd) |> Base.encode16(case: :lower))
+      send(parent, {:identity_apply_new, sid, model, cwd, mcp_servers, guidance})
+      {:reply, {:ok, sid, "created"}, parent}
+    end
+
+    def handle_call(
+          {:identity_replace_session, sid, resident, model, cwd, mcp_servers, guidance},
+          _from,
+          parent
+        ) do
+      if resident, do: send(parent, {:identity_apply_close, sid})
+      send(parent, {:identity_apply_load, sid, model, cwd, mcp_servers, guidance})
+      {:reply, {:ok, sid, "loaded"}, parent}
+    end
+
     def handle_call({:close_session, sid}, _from, parent) do
       send(parent, {:identity_apply_close, sid})
       {:reply, :ok, parent}
@@ -310,6 +334,12 @@ defmodule Tightbeam.GatewayTest do
       send(parent, {:identity_apply_load, sid, model, cwd, mcp_servers, guidance})
       {:reply, {:ok, model}, parent}
     end
+
+    def handle_call({:new_session, model, cwd, mcp_servers, guidance}, _from, parent) do
+      sid = "identity-apply-" <> (:crypto.hash(:sha256, cwd) |> Base.encode16(case: :lower))
+      send(parent, {:identity_apply_new, sid, model, cwd, mcp_servers, guidance})
+      {:reply, {:ok, sid}, parent}
+    end
   end
 
   # Holds the bounce OPEN, so the apply-vs-claim window is real elapsed time
@@ -321,6 +351,25 @@ defmodule Tightbeam.GatewayTest do
     def init(parent), do: {:ok, parent}
 
     def handle_call({:knows_session?, _sid}, _from, parent), do: {:reply, true, parent}
+
+    def handle_call({:identity_context_snapshot, _sid}, _from, parent) do
+      {:reply, {:ok, %{resident: true, model: nil}}, parent}
+    end
+
+    def handle_call(
+          {:identity_replace_session, sid, true, _model, _cwd, _mcp, _guidance},
+          _from,
+          parent
+        ) do
+      send(parent, {:holding_close, sid})
+
+      receive do
+        :release -> :ok
+      end
+
+      send(parent, {:holding_load, sid})
+      {:reply, {:ok, sid, "loaded"}, parent}
+    end
 
     def handle_call({:close_session, sid}, _from, parent) do
       send(parent, {:holding_close, sid})
@@ -350,6 +399,20 @@ defmodule Tightbeam.GatewayTest do
       {:reply, false, parent}
     end
 
+    def handle_call({:identity_context_snapshot, sid}, _from, parent) do
+      send(parent, {:gone_residency_asked, sid})
+      {:reply, {:ok, %{resident: false, model: nil}}, parent}
+    end
+
+    def handle_call(
+          {:identity_replace_session, sid, false, _model, _cwd, _mcp, _guidance},
+          _from,
+          parent
+        ) do
+      send(parent, {:gone_load_attempted, sid})
+      {:reply, {:ok, sid, "loaded"}, parent}
+    end
+
     # Answering these at all is the point: the harness never heard of this
     # session, so asking it to close one is what produced the raw -32603.
     def handle_call({:close_session, sid}, _from, parent) do
@@ -373,6 +436,30 @@ defmodule Tightbeam.GatewayTest do
     def handle_call({:knows_session?, sid}, _from, parent),
       do: {:reply, sid == "thread-resident", parent}
 
+    def handle_call({:identity_context_snapshot, sid}, _from, parent) do
+      {:reply, {:ok, %{resident: sid == "thread-resident", model: nil}}, parent}
+    end
+
+    def handle_call(
+          {:identity_replace_session, nil, false, _model, cwd, _mcp, _guidance},
+          _from,
+          parent
+        ) do
+      sid = "mixed-" <> (:crypto.hash(:sha256, cwd) |> Base.encode16(case: :lower))
+      send(parent, {:mixed_new, sid})
+      {:reply, {:ok, sid, "created"}, parent}
+    end
+
+    def handle_call(
+          {:identity_replace_session, sid, resident, _model, _cwd, _mcp, _guidance},
+          _from,
+          parent
+        ) do
+      if resident, do: send(parent, {:mixed_close, sid})
+      send(parent, {:mixed_load, sid})
+      {:reply, {:ok, sid, "loaded"}, parent}
+    end
+
     def handle_call({:close_session, sid}, _from, parent) do
       send(parent, {:mixed_close, sid})
       {:reply, :ok, parent}
@@ -381,6 +468,12 @@ defmodule Tightbeam.GatewayTest do
     def handle_call({:load_session, sid, model, _cwd, _mcp, _guidance}, _from, parent) do
       send(parent, {:mixed_load, sid})
       {:reply, {:ok, model}, parent}
+    end
+
+    def handle_call({:new_session, _model, cwd, _mcp, _guidance}, _from, parent) do
+      sid = "mixed-" <> (:crypto.hash(:sha256, cwd) |> Base.encode16(case: :lower))
+      send(parent, {:mixed_new, sid})
+      {:reply, {:ok, sid}, parent}
     end
   end
 
@@ -393,9 +486,28 @@ defmodule Tightbeam.GatewayTest do
 
     def handle_call({:knows_session?, _sid}, _from, parent), do: {:reply, true, parent}
 
+    def handle_call({:identity_context_snapshot, _sid}, _from, parent) do
+      {:reply, {:ok, %{resident: true, model: nil}}, parent}
+    end
+
+    def handle_call(
+          {:identity_replace_session, sid, true, _model, _cwd, _mcp, _guidance},
+          _from,
+          parent
+        ) do
+      send(parent, {:apply_error_close, sid})
+      send(parent, {:apply_error_restore, sid})
+      {:reply, {:error, %{"code" => -32000, "message" => "harness is shutting down"}}, parent}
+    end
+
     def handle_call({:close_session, sid}, _from, parent) do
       send(parent, {:apply_error_close, sid})
       {:reply, {:error, %{"code" => -32000, "message" => "harness is shutting down"}}, parent}
+    end
+
+    def handle_call({:load_session, sid, model, _cwd, _mcp, _guidance}, _from, parent) do
+      send(parent, {:apply_error_restore, sid})
+      {:reply, {:ok, model}, parent}
     end
   end
 
@@ -8168,6 +8280,7 @@ defmodule Tightbeam.GatewayTest do
     start_lane!(ctx.db, main.session_key)
     adapter = start_supervised!({IdentityApplyAdapterStub, self()})
     start_supervised!({CoordinatorStub, {adapter, self()}})
+    ensure_global_registry()
     :ok = Org.put_setting(ctx.db, "default-archetype", "coder")
 
     assert %{state: "referenced", references: references} =
@@ -8298,27 +8411,10 @@ defmodule Tightbeam.GatewayTest do
     assert File.read!(Path.join(cwd, ".codex/skills/tightbeam__worktree-session/SKILL.md")) ==
              "new served skill"
 
-    assert {:ok, seq} =
-             Ledger.enqueue(ctx.db, %{
-               session_key: session.session_key,
-               message_id: "identity-apply-busy",
-               origin: "user:flynn",
-               prompt: "busy"
-             })
-
-    # Claimed, not merely enqueued: the boundary is a turn IN FLIGHT. This test
-    # once asserted the refusal on the queued row alone, which is the conflation
-    # T-CONCURRENCY names.
-    assert {:ok, %{seq: ^seq}} = Ledger.claim_next(ctx.db, session.session_key, "test")
-
-    assert %{code: "turn_in_progress", sessions: [session_key]} =
-             apply.(%{
-               origin: "user:flynn",
-               params: %{session_key: session.session_key}
-             })
-
-    assert session_key == session.session_key
-    refute_receive {:push, %{"type" => "stream_updated"}}
+    assert Enum.any?(Projection.list_after(ctx.db, session.session_key, nil, 100), fn message ->
+             message.sender == "process:tightbeam" and
+               String.contains?(message.content, "Identity apply operation")
+           end)
   end
 
   # T-CONCURRENCY (PRIME INVARIANT): an org-wide operation may wait on RUNNING
@@ -8362,6 +8458,10 @@ defmodule Tightbeam.GatewayTest do
     assert Ledger.pending_count(ctx.db, session.session_key) == 3
     refute Ledger.running?(ctx.db, session.session_key)
 
+    adapter = start_supervised!({IdentityApplyAdapterStub, self()})
+    start_supervised!({CoordinatorStub, {adapter, self()}})
+    ensure_global_registry()
+
     apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
 
     assert %{applied: [session_key], identity_revision: ^revision} =
@@ -8369,15 +8469,11 @@ defmodule Tightbeam.GatewayTest do
 
     assert session_key == session.session_key
 
-    # The queued turns are untouched — apply is not a drain.
-    assert Ledger.pending_count(ctx.db, session.session_key) == 3
+    # The queued turns are untouched. The fourth row is the required continuation.
+    assert Ledger.pending_count(ctx.db, session.session_key) == 4
   end
 
-  # The other half of the same line, and the one that must NOT weaken: a turn
-  # whose world is already composed still defers apply. `claim_next/3` sets
-  # `status = 'running'` and `startedAt` in one UPDATE, so this is the honest
-  # started-and-not-terminal discriminator.
-  test "identity apply refuses while a turn is genuinely running", ctx do
+  test "identity apply durably cancels a genuinely running turn before reload", ctx do
     base_dir = role_test_base("identity-apply-running")
     learn_engineering_identity!(base_dir)
     revision = Identity.live_revision!(base_dir)
@@ -8408,25 +8504,24 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, %{seq: ^seq}} = Ledger.claim_next(ctx.db, session.session_key, "test")
     assert Ledger.running?(ctx.db, session.session_key)
 
+    adapter = start_supervised!({IdentityApplyAdapterStub, self()})
+    start_supervised!({CoordinatorStub, {adapter, self()}})
+    ensure_global_registry()
+
     apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
 
-    assert %{code: "turn_in_progress", sessions: [session_key]} =
+    assert %{
+             applied: [session_key],
+             sessions: [%{session_key: session_key, turn_outcome: "canceled"}]
+           } =
              apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
 
     assert session_key == session.session_key
 
-    # And org-wide is refused for the same reason, naming only the running session.
-    assert %{code: "turn_in_progress", sessions: [^session_key]} =
-             apply.(%{origin: "user:flynn", params: %{all: true}})
+    assert {:ok, [["canceled"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [seq])
 
-    # Terminalizing it releases the boundary — nothing else had to change.
-    assert Ledger.finish(ctx.db, seq, "delivered") == :ok
     refute Ledger.running?(ctx.db, session.session_key)
-
-    assert %{applied: applied, identity_revision: ^revision} =
-             apply.(%{origin: "user:flynn", params: %{all: true}})
-
-    assert session.session_key in applied
   end
 
   # The parity scenario, as a fixture. Measured on shrdlu 2026-07-30 13:47Z:
@@ -8455,6 +8550,10 @@ defmodule Tightbeam.GatewayTest do
         model: Model.new("gpt-5.6-sol", effort: "medium")
       })
     end
+
+    adapter = start_supervised!({IdentityApplyAdapterStub, self()})
+    start_supervised!({CoordinatorStub, {adapter, self()}})
+    ensure_global_registry()
 
     # Leg one's own bracket nags and DR notifications, as the smoke produces them.
     for n <- 1..8 do
@@ -8695,7 +8794,7 @@ defmodule Tightbeam.GatewayTest do
   # during a bounce died of timeout instead of answering. Nothing was running, so
   # the true answer was :not_running all along — a timeout exit reads as "something
   # is broken" when the truth is "nothing was running".
-  test "cancel waits for the boundary instead of timing out under it", ctx do
+  test "cancel remains responsive while identity reload is held", ctx do
     base_dir = role_test_base("identity-apply-cancel-wait")
     learn_engineering_identity!(base_dir)
     revision = Identity.live_revision!(base_dir)
@@ -8741,7 +8840,8 @@ defmodule Tightbeam.GatewayTest do
 
     assert_receive {:holding_close, "thread-cancel-wait"}, 5_000
 
-    # A cancel arrives while the lane is occupied by the bounce.
+    # A cancel arrives while reload owns the durable fence. No turn is running,
+    # so the lane can answer from its own observable state without waiting.
     parent = self()
 
     canceller =
@@ -8750,16 +8850,11 @@ defmodule Tightbeam.GatewayTest do
       end)
 
     ref = Process.monitor(canceller)
-
-    # The wait is the subject, not incidental: it must outlast the 5s default this
-    # call used to inherit. Under that default the caller is already dead here.
-    refute_receive {:DOWN, ^ref, :process, _, _}, 5_500
-    refute_received {:cancel_result, _}
+    assert_receive {:cancel_result, :not_running}, 1_000
+    assert_receive {:DOWN, ^ref, :process, ^canceller, :normal}, 1_000
 
     send(adapter, :release)
 
-    # The true answer, late rather than never: nothing was running.
-    assert_receive {:cancel_result, :not_running}, 10_000
     assert %{applied: [_]} = Task.await(applier, 10_000)
   end
 
@@ -8786,7 +8881,7 @@ defmodule Tightbeam.GatewayTest do
   # whole pass (identity_apply_at_boundary's reduce_while), so one such session defers
   # the org-wide apply. Changing that is a product decision about partial results, not
   # this seam's to make.
-  test "a lane ensured over queued work defers, and the retry after it succeeds", ctx do
+  test "a lane ensured over queued work stays fenced until apply succeeds", ctx do
     base_dir = role_test_base("identity-apply-residual")
     learn_engineering_identity!(base_dir)
     revision = Identity.live_revision!(base_dir)
@@ -8872,28 +8967,19 @@ defmodule Tightbeam.GatewayTest do
     config = Map.put(gateway_config(base_dir, ctx.db, 0), :lane_manager, manager_name)
     apply = Gateway.handlers(config)["identity-apply"]
 
-    assert %{code: "turn_in_progress", sessions: [session_key]} =
+    assert %{applied: [session_key], identity_revision: ^next} =
              apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
 
     assert session_key == session.session_key
 
-    # The refusal is TRUE, not a lie: the newborn lane really did start the turn, and
-    # the stamp is untouched because nothing was bounced.
+    # The queued turn begins only after the success transaction removes the fence.
     assert_receive {:turn_started, _}, 5_000
     assert Ledger.running?(ctx.db, session.session_key)
-    assert Org.get(ctx.db, session.session_key).identity_revision == revision
+    assert Org.get(ctx.db, session.session_key).identity_revision == next
 
-    # TRANSIENT: the turn terminals and the retry lands. This is the "try again in a
-    # second" half, and it is what makes the trade a trade.
     Enum.each(Task.Supervisor.children(task_sup), &send(&1, :finish_turn))
 
     assert_receive {:turn_terminal, _, _}, 5_000
-    refute Ledger.running?(ctx.db, session.session_key)
-
-    assert %{applied: [^session_key], identity_revision: ^next} =
-             apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
-
-    assert Org.get(ctx.db, session.session_key).identity_revision == next
   end
 
   # Regression: spawn creates the harness session LAZILY, so a freshly spawned session
@@ -8901,7 +8987,7 @@ defmodule Tightbeam.GatewayTest do
   # bricking `--all` org-wide whenever any never-started session existed (found by
   # feature_smoke: it applied to the session it had just spawned). A pointer-less
   # session is a no-op: it materializes from live at first start, already current.
-  test "identity apply skips a never-started session instead of raising", ctx do
+  test "identity apply starts a never-started session on the target revision", ctx do
     base_dir = role_test_base("identity-apply-unstarted")
     learn_engineering_identity!(base_dir)
     revision = Identity.live_revision!(base_dir)
@@ -8921,8 +9007,9 @@ defmodule Tightbeam.GatewayTest do
         model: Model.new("gpt-5.6-sol", effort: "medium")
       })
 
-    # No pointer appended: the session has never started. No adapter stub either —
-    # a no-op must not touch the adapter at all.
+    # No pointer appended: the durable reload effect creates its first context.
+    adapter = start_supervised!({IdentityApplyAdapterStub, self()})
+    start_supervised!({CoordinatorStub, {adapter, self()}})
     ensure_global_registry()
 
     {:ok, _ref, nil} =
@@ -8943,8 +9030,11 @@ defmodule Tightbeam.GatewayTest do
              })
 
     assert session_key == session.session_key
-    assert Org.current_pointer(ctx.db, session.session_key) == nil
-    refute_receive {:push, %{"type" => "stream_updated"}}
+
+    assert Org.current_pointer(ctx.db, session.session_key).harness_session_id =~
+             "identity-apply-"
+
+    assert_receive {:push, %{"type" => "stream_updated"}}
   end
 
   # Regression, found live on shrdlu: a pointer row outlives the adapter that
@@ -9007,20 +9097,20 @@ defmodule Tightbeam.GatewayTest do
     assert session_key == session.session_key
     assert_receive {:gone_residency_asked, "thread-vanished"}
 
-    # Nothing is asked of a harness that never heard of this session.
+    # A nonresident pointer is loaded without a close.
     refute_receive {:gone_close_attempted, _}
-    refute_receive {:gone_load_attempted, _}
+    assert_receive {:gone_load_attempted, "thread-vanished"}
 
     # THE STAMP IS THE APPLICATION here. The next start reloads from
     # `identity_revision`, not from live, so a session left behind would
     # materialize stale forever while `identity status` kept calling it stale.
     assert Org.get(ctx.db, session.session_key).identity_revision == next
 
-    # And the pointer chain records only what happened: nothing was loaded.
+    # And the pointer chain records the successful reload.
     assert Org.current_pointer(ctx.db, session.session_key).harness_session_id ==
              "thread-vanished"
 
-    assert Org.current_pointer(ctx.db, session.session_key).reason == "created"
+    assert Org.current_pointer(ctx.db, session.session_key).reason == "loaded"
   end
 
   # The condition this fix meets FIRST, not someday: deploying it restarts the
@@ -9081,25 +9171,24 @@ defmodule Tightbeam.GatewayTest do
       assert key in applied
     end
 
-    # Only the resident one is bounced, and only it.
+    # The resident context is closed and loaded; the nonresident pointer is loaded;
+    # the never-started session gets a new target context.
     assert_receive {:mixed_close, "thread-resident"}
     assert_receive {:mixed_load, "thread-resident"}
     refute_receive {:mixed_close, "thread-gone"}
-    refute_receive {:mixed_load, "thread-gone"}
+    assert_receive {:mixed_load, "thread-gone"}
+    assert_receive {:mixed_new, _}
 
     # Both started sessions come out on the applied revision — the resident one
     # through the bounce, the gone one through its stamp.
     assert Org.get(ctx.db, resident.session_key).identity_revision == next
     assert Org.get(ctx.db, gone.session_key).identity_revision == next
 
-    # The never-started one is left alone and does not need the stamp: it reads
-    # `live` at its first start rather than its stamp, so it self-corrects. That
-    # is the whole difference between it and the gone session, which reads its
-    # stamp and would otherwise materialize stale forever.
-    assert Org.current_pointer(ctx.db, unstarted.session_key) == nil
+    assert Org.get(ctx.db, unstarted.session_key).identity_revision == next
+    assert Org.current_pointer(ctx.db, unstarted.session_key)
   end
 
-  test "identity apply refuses by name when a live adapter fails for its own reason", ctx do
+  test "identity apply reports a safe named failure after restoring the prior context", ctx do
     base_dir = role_test_base("identity-apply-error")
     learn_engineering_identity!(base_dir)
     revision = Identity.live_revision!(base_dir)
@@ -9140,11 +9229,15 @@ defmodule Tightbeam.GatewayTest do
 
     # A NAMED refusal, not a raise and not a raw JSON-RPC envelope from three
     # layers down. The residency branch must not have swallowed this.
-    assert %{code: "apply_failed", sessions: [session_key]} = result
+    assert %{
+             outcome: "failed",
+             failed: [session_key],
+             sessions: [%{error: %{code: "harness_reload_failed", retryable: true}}]
+           } = result
+
     assert session_key == session.session_key
-    assert result.message =~ "harness is shutting down"
-    refute result.message =~ "-32000"
     assert_receive {:apply_error_close, "thread-resident"}
+    assert_receive {:apply_error_restore, "thread-resident"}
 
     # A refused apply changes nothing.
     assert Org.get(ctx.db, session.session_key).identity_revision == revision

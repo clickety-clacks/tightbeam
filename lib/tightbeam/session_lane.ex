@@ -87,6 +87,17 @@ defmodule Tightbeam.SessionLane do
     end
   end
 
+  @doc "Stop the lane task after identity apply has durably canceled its turn."
+  @spec stop_canceled(String.t(), integer()) :: :ok | :not_running | :no_lane
+  def stop_canceled(session_key, seq) when is_integer(seq) do
+    case Registry.lookup(Tightbeam.LaneRegistry, session_key) do
+      [{pid, _}] -> GenServer.call(pid, {:stop_canceled, seq}, :infinity)
+      [] -> :no_lane
+    end
+  end
+
+  def stop_canceled(_session_key, nil), do: :not_running
+
   @doc """
   Run `fun` at a turn boundary, or refuse — the lane IS the serialization point.
 
@@ -149,6 +160,23 @@ defmodule Tightbeam.SessionLane do
         {:reply, :not_running, state}
     end
   end
+
+  def handle_call({:stop_canceled, seq}, _from, %{current_seq: seq, task_pid: pid} = state)
+      when is_pid(pid) do
+    state.terminal_publisher.(%{
+      session_key: state.session_key,
+      message_id: state.current_message_id,
+      status: "canceled",
+      error: nil
+    })
+
+    publish_terminal(state, seq)
+    state.on_terminal.(state.session_key, seq)
+    Process.exit(pid, :kill)
+    {:reply, :ok, state}
+  end
+
+  def handle_call({:stop_canceled, _seq}, _from, state), do: {:reply, :not_running, state}
 
   def handle_call({:at_turn_boundary, _fun}, _from, %{task_ref: ref} = state)
       when not is_nil(ref),

@@ -229,6 +229,10 @@ defmodule Tightbeam.Ledger do
                                  SELECT 1 FROM sessions AS s
                                  WHERE s.sessionKey = t.sessionKey AND s.state = 'active'
                                )
+                               AND NOT EXISTS (
+                                 SELECT 1 FROM identity_apply_fences AS f
+                                 WHERE f.sessionKey = t.sessionKey
+                               )
                              ORDER BY seq LIMIT 1)
                   AND status = 'queued'
               """,
@@ -288,29 +292,42 @@ defmodule Tightbeam.Ledger do
         [["retired"]] ->
           {:unclaimable, :session_retired}
 
-        # UNREACHABLE BY CONSTRUCTION since adjudication was deleted. The claim
-        # UPDATE's only session predicate is `state = 'active'`, so an active
-        # session with queued work and no running row must have matched it in
-        # this same transaction. The hold used to make this arm ordinary
-        # ("designed waiting, healed by the ruling"); nothing does now.
+        # An active session with a durable identity-apply fence is designed
+        # waiting. The claim and fence read share this transaction, so no turn
+        # can cross the apply acceptance boundary.
+        [["active"]] ->
+          if Tightbeam.IdentityApply.fenced_in_txn?(txn, session_key) do
+            :none
+          else
+            log_active_claim_mismatch(session_key)
+          end
+
+        # UNREACHABLE BY CONSTRUCTION once the active/fenced case above is
+        # removed. The claim UPDATE and this read use the same predicates in
+        # this transaction.
         #
         # It stays `:none` rather than raising because a lane must not crash on
         # a queue read, but it must not be SILENT either: reaching here means
         # the claim UPDATE and this read disagree inside one transaction, and
         # reporting that as a plain empty queue is the same collapse the
         # `:unclaimable` split above exists to prevent.
-        [[state]] ->
-          Logger.error(
-            "claim_next: #{session_key} is #{state} with queued work that the claim " <>
-              "UPDATE did not match, in one transaction — reporting :none, but this " <>
-              "is an invariant violation, not an idle queue"
-          )
-
+        [[_state]] ->
+          log_active_claim_mismatch(session_key)
           :none
       end
     else
       :none
     end
+  end
+
+  defp log_active_claim_mismatch(session_key) do
+    Logger.error(
+      "claim_next: #{session_key} is active with queued work that the claim " <>
+        "UPDATE did not match, in one transaction — reporting :none, but this " <>
+        "is an invariant violation, not an idle queue"
+    )
+
+    :none
   end
 
   @doc """

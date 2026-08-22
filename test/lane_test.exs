@@ -1,7 +1,7 @@
 defmodule Tightbeam.LaneTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Ledger, EventLog, LaneManager, Placement, SessionLane}
+  alias Tightbeam.{DB, Ledger, EventLog, IdentityApply, LaneManager, Placement, SessionLane}
 
   setup do
     db = :"db_#{System.unique_integer([:positive])}"
@@ -25,6 +25,8 @@ defmodule Tightbeam.LaneTest do
         ('k1', 'claude-sonnet-5', 'medium', 'claude'),
         ('k2', 'claude-sonnet-5', 'medium', 'claude');
       """)
+
+    :ok = IdentityApply.ensure_schema(db)
 
     reg = start_supervised!({Registry, keys: :unique, name: Tightbeam.LaneRegistry})
 

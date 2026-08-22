@@ -147,6 +147,11 @@ defmodule Tightbeam.Gateway do
 
     :ok = Schema.ensure_all(db)
 
+    # Apply fences must have one current durable owner before any lane or HTTP
+    # endpoint can admit work. The executor starts later, after its adapter
+    # dependency, and resumes only these adopted obligations.
+    adopted_identity_apply_operations = Tightbeam.IdentityApply.adopt_all!(db)
+
     :ok = Assignments.audit_review_item_conflicts(db)
 
     # Recover durable liveness before any runtime child can consume wakes or
@@ -279,6 +284,10 @@ defmodule Tightbeam.Gateway do
 
     credential_children(config, db) ++
       [
+        %{
+          id: Tightbeam.IdentityApply.FenceNotifications,
+          start: {:pg, :start_link, [Tightbeam.IdentityApply.FenceNotifications]}
+        },
         {ModelCatalog, base_dir: config.base_dir, db: db},
         {Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry},
         # Ahead of Supervision and Bandit deliberately: both can reach a check-tier
@@ -314,6 +323,12 @@ defmodule Tightbeam.Gateway do
          adapter_opts: adapter_opts,
          db: db,
          name: Tightbeam.AdapterCoordinator},
+        {Tightbeam.IdentityApply.Executor,
+         db: db,
+         config: config,
+         adopted_operation_ids: adopted_identity_apply_operations,
+         adopt: false,
+         name: Tightbeam.IdentityApply.Executor},
         {Tightbeam.Productions.BubbleSweeper, db: db},
         {Tightbeam.LaneManager,
          db: db,
@@ -1068,9 +1083,15 @@ defmodule Tightbeam.Gateway do
         is_binary(opts[:client_message_id])
 
     stamped =
-      case {opts[:sender], authenticated_device_message?} do
-        {sender, false} when is_binary(sender) -> "[from #{sender}]\n\n" <> prompt
-        _ -> prompt
+      cond do
+        is_map(opts[:identity_apply_cause]) ->
+          prompt
+
+        is_binary(opts[:sender]) and not authenticated_device_message? ->
+          "[from #{opts[:sender]}]\n\n" <> prompt
+
+        true ->
+          prompt
       end
 
     case delivery_target(txn, session_key, opts[:target_gate]) do
@@ -2600,20 +2621,24 @@ defmodule Tightbeam.Gateway do
   defp identity_relearn_result(config, %{params: %{action: "resolve"}} = call) do
     revision = Identity.resolve_relearn!(config.base_dir, call.origin)
     reload_law!(config)
-    %{state: "published", live_revision: revision}
+    Tightbeam.IdentityApply.successful_relearn_result(gateway_db(config), revision)
   end
 
   defp identity_relearn_result(config, call) do
     case Identity.relearn!(config.base_dir, call.origin) do
       {:ok, revision} ->
         reload_law!(config)
-        %{state: "published", live_revision: revision}
+        Tightbeam.IdentityApply.successful_relearn_result(gateway_db(config), revision)
 
       {:conflict, paths} ->
+        resolution_root = config.base_dir |> Path.join("identity") |> Path.expand()
+
         %{
           state: "relearn-conflicted",
-          conflicting_paths: paths,
-          live_revision: Identity.live_revision!(config.base_dir)
+          conflicting_paths: paths |> Enum.map(&Path.expand(&1, resolution_root)) |> Enum.sort(),
+          live_revision: Identity.live_revision!(config.base_dir),
+          resolution_root: resolution_root,
+          resolve_command: "tightbeam identity relearn --resolve"
         }
 
       {:error, message} ->
@@ -2850,80 +2875,50 @@ defmodule Tightbeam.Gateway do
   defp maybe_put_guidance(status, nil), do: status
   defp maybe_put_guidance(status, guidance), do: Map.put(status, :guidance, guidance)
 
-  defp identity_apply_result(config, db, %{params: %{all: true}}) do
-    sessions = Org.list_for_user(db, "", true)
-    identity_apply_sessions(config, db, sessions)
+  defp identity_apply_result(_config, db, %{params: %{operation_id: operation_id}}) do
+    Tightbeam.IdentityApply.operation(db, operation_id) ||
+      %{code: "not_found", message: "no matching identity apply operation"}
   end
 
-  defp identity_apply_result(config, db, %{params: %{session_key: session_key}}) do
-    sessions =
-      case Org.get(db, session_key) do
-        nil -> []
-        session -> [session]
+  defp identity_apply_result(config, db, %{origin: principal, params: params}) do
+    selector =
+      case params do
+        %{all: true} -> %{kind: "all", session_key: nil}
+        %{session_key: session_key} -> %{kind: "session", session_key: session_key}
       end
 
-    identity_apply_sessions(config, db, sessions)
-  end
-
-  defp identity_apply_sessions(_config, _db, []),
-    do: %{code: "not_found", message: "no matching session"}
-
-  defp identity_apply_sessions(config, db, sessions) do
-    # Busy means RUNNING, never merely queued (tenet T-CONCURRENCY). The hazard
-    # this guard exists for is work IN FLIGHT: instructions must not change under
-    # a turn whose world is already composed. A queued turn has composed nothing
-    # and reads live identity when it starts, which is indistinguishable from any
-    # turn started after the apply.
-    busy =
-      sessions
-      |> Enum.filter(&Ledger.running?(db, &1.session_key))
-      |> Enum.map(& &1.session_key)
-
-    identity_apply_at_boundary(config, db, sessions, busy)
-  end
-
-  defp identity_apply_at_boundary(_config, _db, _sessions, [_ | _] = busy),
-    do: turn_in_progress(busy)
-
-  defp identity_apply_at_boundary(config, db, sessions, []) do
-    live = Identity.live_revision!(config.base_dir)
-
-    sessions
-    |> Enum.reduce_while([], fn session, applied ->
-      case identity_apply_session(config, db, session, live) do
-        :applied ->
-          best_effort(fn ->
-            stream = db |> Org.get(session.session_key) |> Payloads.stream_session()
-            broadcast(db, session.owner_user_id, Payloads.stream_updated(stream))
-          end)
-
-          {:cont, [session.session_key | applied]}
-
-        :noop ->
-          {:cont, [session.session_key | applied]}
-
-        {:error, refusal} ->
-          {:halt, refusal}
-      end
-    end)
-    |> case do
-      applied when is_list(applied) ->
-        %{applied: Enum.reverse(applied), identity_revision: live}
-
-      refusal ->
-        refusal
+    capabilities = fn session ->
+      Tightbeam.IdentityApply.RuntimeAdapter.capabilities(session, config)
     end
-  end
 
-  defp identity_apply_session(config, db, session, revision) do
-    case Org.current_pointer(db, session.session_key) do
-      # A session that has never started has no harness session to bounce AND no
-      # stamp to correct: it materializes from `tightbeam/live` at its first
-      # start (§Sessions stamp the revision they materialized from), so it is
-      # already on the applied revision by construction. Nothing to do is the
-      # true answer here, and the only place it is.
-      nil -> :noop
-      pointer -> identity_apply_at_lane(config, db, session, revision, pointer)
+    case Tightbeam.IdentityApply.accept(
+           db,
+           config.base_dir,
+           selector,
+           principal,
+           idempotency_key: params[:key],
+           capabilities: capabilities
+         ) do
+      {:ok, operation_id, _acceptance} ->
+        result =
+          Tightbeam.IdentityApply.Executor.start_operation(config, db, operation_id)
+
+        Enum.each(result.applied, fn session_key ->
+          best_effort(fn ->
+            session = Org.get(db, session_key)
+
+            broadcast(
+              db,
+              session.owner_user_id,
+              Payloads.stream_updated(Payloads.stream_session(session))
+            )
+          end)
+        end)
+
+        result
+
+      {:error, error} ->
+        error
     end
   end
 
@@ -2935,95 +2930,6 @@ defmodule Tightbeam.Gateway do
     }
   end
 
-  # The busy check and this bounce are separated by adapter work, and the lane can
-  # claim a queued turn in that window — so sampling status in the gateway would
-  # leave apply reloading a session whose turn had just started. Claiming is
-  # serialized in the LANE, so the decision belongs in its mailbox: while it runs
-  # this call it cannot claim, and a nudge that arrives waits behind it.
-  #
-  # There is no direct path for a session that has no lane. "No lane exists" is a
-  # sample of a mutable fact, and a lane can be BORN inside the window — a
-  # delivery calls ensure_lane and the newborn claims on its own init nudge — so
-  # ensuring first leaves ONE path to keep correct. Either ordering then resolves
-  # inside the lane: if the init nudge claims first we get :busy and defer; if
-  # this call lands first, the nudge waits behind it.
-  #
-  # QUIET, deliberately: ensure_lane/2 also nudges, which would make an idle lane
-  # claim a queued turn and hand back the very refusal the queued/running boundary
-  # exists to remove. Apply must never manufacture the turn it then defers to.
-  defp identity_apply_at_lane(config, db, session, revision, pointer) do
-    bounce = fn -> identity_apply_started_session(config, db, session, revision, pointer) end
-    LaneManager.ensure_lane_quiet(config[:lane_manager] || LaneManager, session.session_key)
-
-    case Tightbeam.SessionLane.at_turn_boundary(session.session_key, bounce) do
-      {:ok, result} ->
-        result
-
-      :busy ->
-        {:error, turn_in_progress([session.session_key])}
-
-      # Unreachable once the lane is ensured — this is the lane dying in the gap,
-      # not a state to design around. Defer rather than bounce outside a lane:
-      # the point of the seam is that no bounce happens unowned.
-      :no_lane ->
-        {:error, turn_in_progress([session.session_key])}
-    end
-  end
-
-  defp identity_apply_started_session(config, db, session, revision, pointer) do
-    harness = Harness.parse!(session.harness).id()
-    key = {harness, "shared", session.host}
-    cwd = Placement.holder_workdir(config, session)
-    snapshot = served_snapshot(config, session, harness, revision)
-    mcp_servers = mcp_servers_for_archetype(session.archetype)
-
-    with {:ok, adapter, _generation} <-
-           AdapterCoordinator.adapter_for(Tightbeam.AdapterCoordinator, key),
-         # The adapter PROCESS is the authority on residency, the same way the
-         # start and tune paths ask it. A pointer row only records that a harness
-         # session once existed; after a gateway restart every pointer names a
-         # session no adapter holds, and bouncing it asks the harness to close
-         # something it has never heard of.
-         true <- Adapter.knows_session?(adapter, pointer.harness_session_id),
-         :ok <- Adapter.close_session(adapter, pointer.harness_session_id),
-         {:ok, _pushed_or_unknown} <-
-           Adapter.load_session(
-             adapter,
-             pointer.harness_session_id,
-             session.model,
-             cwd,
-             mcp_servers,
-             snapshot.guidance
-           ) do
-      Org.append_pointer(db, session.session_key, pointer.harness_session_id, "loaded")
-      Org.set_identity_revision(db, session.session_key, snapshot.revision)
-      :applied
-    else
-      # No resident session to bounce, so the stamp IS the application. The next
-      # start reloads from `session.identity_revision`, not from `live`, so
-      # leaving the stamp behind would mean this session materialized stale
-      # forever while `identity status` kept calling it stale and apply kept
-      # reporting it applied. No pointer event is appended: nothing was loaded,
-      # and the pointer chain does not record things that did not happen.
-      false ->
-        Org.set_identity_revision(db, session.session_key, snapshot.revision)
-        :applied
-
-      {:error, reason} ->
-        {:error,
-         %{
-           code: "apply_failed",
-           message:
-             "identity apply could not reach #{session.session_key}: #{apply_failure(reason)}",
-           sessions: [session.session_key]
-         }}
-    end
-  end
-
-  # A live adapter that fails for its own reasons still surfaces, but as this
-  # verb's named refusal rather than as a raw JSON-RPC envelope from three layers
-  # down. The general error-boundary seam is its own ticket; this is one call
-  # site's error made legible.
   defp apply_failure(%{"message" => message}) when is_binary(message), do: message
   defp apply_failure(reason), do: inspect(reason)
 
@@ -6033,28 +5939,30 @@ defmodule Tightbeam.Gateway do
 
           %{owner_user_id: ^owner} = session ->
             if session.state == "active" do
-              {:ok, result} =
-                DB.transaction(db, fn txn ->
-                  result =
-                    retire_cascade_in_txn(
-                      txn,
-                      session.session_key,
-                      owner,
-                      call.origin,
-                      Map.fetch!(config, :wake_tick_ms),
-                      "retired: session retired before execution"
-                    )
+              result =
+                retire_after_identity_apply(db, fn ->
+                  DB.transaction(db, fn txn ->
+                    result =
+                      retire_cascade_in_txn(
+                        txn,
+                        session.session_key,
+                        owner,
+                        call.origin,
+                        Map.fetch!(config, :wake_tick_ms),
+                        "retired: session retired before execution"
+                      )
 
-                  if result.retired != [] and p[:idempotency_key] do
-                    Idempotency.put_in_txn(txn, %{
-                      owner_user_id: owner,
-                      operation: "retire",
-                      idempotency_key: p.idempotency_key,
-                      session_key: session.session_key
-                    })
-                  end
+                    if result.retired != [] and p[:idempotency_key] do
+                      Idempotency.put_in_txn(txn, %{
+                        owner_user_id: owner,
+                        operation: "retire",
+                        idempotency_key: p.idempotency_key,
+                        session_key: session.session_key
+                      })
+                    end
 
-                  result
+                    result
+                  end)
                 end)
 
               Enum.each(result.retired, fn retired ->
@@ -6080,6 +5988,20 @@ defmodule Tightbeam.Gateway do
           _ ->
             %{code: "not_found"}
         end
+    end
+  end
+
+  defp retire_after_identity_apply(db, transaction) do
+    case transaction.() do
+      {:ok, result} ->
+        result
+
+      {:error, %Tightbeam.IdentityApply.FencedError{session_key: fenced_session}} ->
+        :ok = Tightbeam.IdentityApply.await_fence_release(db, fenced_session)
+        retire_after_identity_apply(db, transaction)
+
+      {:error, error} ->
+        raise error
     end
   end
 

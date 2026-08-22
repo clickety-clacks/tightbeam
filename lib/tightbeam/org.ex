@@ -524,9 +524,15 @@ defmodule Tightbeam.Org do
   """
   @spec retire(db(), String.t(), String.t(), pos_integer()) :: session()
   def retire(db \\ Tightbeam.DB, session_key, principal, supervision_interval_ms) do
-    transaction!(db, fn txn ->
-      retire_in_txn(txn, session_key, principal, supervision_interval_ms)
-    end)
+    try do
+      transaction!(db, fn txn ->
+        retire_in_txn(txn, session_key, principal, supervision_interval_ms)
+      end)
+    rescue
+      _error in Tightbeam.IdentityApply.FencedError ->
+        :ok = Tightbeam.IdentityApply.await_fence_release(db, session_key)
+        retire(db, session_key, principal, supervision_interval_ms)
+    end
   end
 
   @doc false
@@ -534,6 +540,8 @@ defmodule Tightbeam.Org do
   def retire_in_txn(%Txn{} = txn, session_key, principal, supervision_interval_ms)
       when is_binary(principal) and principal != "" and is_integer(supervision_interval_ms) and
              supervision_interval_ms > 0 do
+    Tightbeam.IdentityApply.ensure_unfenced_in_txn!(txn, session_key)
+
     case must_get(txn, session_key) do
       %{state: "retired"} = session ->
         session

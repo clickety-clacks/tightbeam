@@ -500,6 +500,10 @@ defmodule Tightbeam.EscalationDeliveryTest do
               "children_after_preflight/1"} => 2,
              {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt/4", "handlers/1"} => 1,
              {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt/4", "notify_session/4"} => 1,
+             {"lib/tightbeam/identity_apply.ex", "Gateway.deliver_prompt_in_txn/5",
+              "commit_success/4"} => 1,
+             {"lib/tightbeam/identity_apply.ex", "Gateway.deliver_prompt_in_txn/5",
+              "fail_outcome/7"} => 1,
              # The fault bubble's notice enqueue (production-machine-v1): a
              # substrate-authored turn to the failing session's nearest active
              # ancestor, deduped by deterministic wakeId.
