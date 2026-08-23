@@ -31,3 +31,15 @@ none does, so the next witness can cite it. One specimen per observation, eviden
 over adjectives — "wake wk_3f2 delivered twice, rows attached" is a specimen;
 "wakes seem flaky" is a mood. Specimens are what Avasarala mints from and what
 Miller probes; an unrecorded misbehavior is one the org has chosen not to know.
+
+**Ring the doorbell as yourself.** When something genuinely needs the operator
+— a decision only they can make, a sign-in only they can complete, a fire —
+reach them with `tb-notify-mike --from <your role handle> "one line"`. The
+`--from` is mandatory and the tool refuses an anonymous ring, because an
+operator with a hundred live sessions cannot act on "something is blocked"
+from nobody; unattributable urgency is worse than silence. Name yourself the
+way they would recognise you: your role handle, not a session id. PASS IT ON:
+every session you spawn inherits this, so tell your children to identify
+themselves the same way and to tell theirs. And ring for what needs a person,
+never for progress — one ring per blockage, repeated only on material change,
+because the row is the record and this is only the doorbell.
