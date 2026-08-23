@@ -1475,6 +1475,7 @@ defmodule Tightbeam.CoordinationFabricTest do
       current_request: "statute",
       file_agent_request: "agent",
       answer_open: "agent",
+      return_open: "agent",
       effort_open_by_deadline_wake_in_txn: "effort",
       effort_insert_in_txn: "effort",
       effort_id_by_generation_in_txn: "effort",
@@ -1498,6 +1499,7 @@ defmodule Tightbeam.CoordinationFabricTest do
       get_raw: "any",
       request_in_txn: "any",
       answer: "agent",
+      return_request: "agent",
       ask: "agent",
       raw_by_id: "any",
       raw_by_id_in_txn!: "any",
@@ -1523,6 +1525,7 @@ defmodule Tightbeam.CoordinationFabricTest do
       current_request: 4,
       file_agent_request: 2,
       answer_open: 4,
+      return_open: 4,
       effort_open_by_deadline_wake_in_txn: 2,
       effort_insert_in_txn: 2,
       effort_id_by_generation_in_txn: 3,
@@ -1546,6 +1549,7 @@ defmodule Tightbeam.CoordinationFabricTest do
       get_raw: 2,
       request_in_txn: 2,
       answer: 2,
+      return_request: 2,
       ask: 2,
       raw_by_id: 2,
       raw_by_id_in_txn!: 2,
@@ -1635,7 +1639,7 @@ defmodule Tightbeam.CoordinationFabricTest do
              "#{inspect(MapSet.difference(pinned_dynamic_queries, found_dynamic_queries))}"
 
     # (c): every "any"-scoped, non-verb helper's external callers are pinned.
-    # The verb surface (`ask`/`answer`/`rule`/`waive`/`withdraw`/`resolve`/
+    # The verb surface (`ask`/`answer`/`return_request`/`rule`/`waive`/`withdraw`/`resolve`/
     # `escalate`/`summon`/`revoke_waiver`) is reached exclusively through
     # Dispatch/Gateway's own routing tables, proved elsewhere (router
     # allowlist, dispatch conformance) — not a "helper" another module reaches
@@ -1661,7 +1665,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     }
 
     verb_surface =
-      ~w(ask answer rule waive withdraw resolve escalate summon revoke_waiver)a
+      ~w(ask answer return_request rule waive withdraw resolve escalate summon revoke_waiver)a
 
     any_kind_public =
       for {ref, "any"} <- pinned_kinds,
@@ -3430,6 +3434,141 @@ defmodule Tightbeam.CoordinationFabricTest do
              answer(db, {:session, "agent:po"}, request.id, "too late")
   end
 
+  test "the decision reader returns insufficient questions with an immutable audit trail",
+       %{db: db} do
+    seed_session(db, "agent:coder", "flynn")
+    seed_session(db, "agent:po", "flynn")
+    seed_session(db, "agent:stranger", "outsider")
+
+    assert {:ok, %{decision_request: request}} =
+             ask(db, "agent:coder", "agent:po", "ship which migration?")
+
+    assert {:error, %{code: "invalid"}} =
+             return_request(db, {:session, "agent:po"}, request.id, "  ")
+
+    # The same privacy wall as answer: neither an outsider nor a non-agent id
+    # becomes an existence/kind oracle through the new verb.
+    assert {:error, %{code: "not_found"}} =
+             return_request(db, {:session, "agent:stranger"}, request.id, "unclear")
+
+    assert {:error, %{code: "not_found"}} =
+             return_request(db, {:session, "agent:po"}, "dr_missing", "unclear")
+
+    before_facts = fact_count(db)
+
+    assert {:ok, %{decision_request: returned}} =
+             return_request(
+               db,
+               {:session, "agent:po"},
+               request.id,
+               "  name the migration and rollback boundary  "
+             )
+
+    assert returned.status == "returned"
+    assert returned.question == request.question
+    assert returned.context == request.context
+    assert returned.assignment_id == request.assignment_id
+    assert returned.raiser_session_key == request.raiser_session_key
+    assert returned.expecter_session_key == request.expecter_session_key
+    assert returned.return_reason == "name the migration and rollback boundary"
+    assert returned.returned_by == "session:agent:po"
+    assert is_integer(returned.returned_at)
+    assert returned.answer == nil
+    assert fact_count(db) == before_facts
+
+    assert [] = list_requests(db, {:session, "agent:coder"})
+
+    assert {:ok, %{decision_requests: [%{id: id, status: "returned"} = listed]}} =
+             verb(db, {:session, "agent:coder"}, "decision-requests", %{status: "returned"})
+
+    assert id == request.id
+    assert listed.return_reason == returned.return_reason
+    assert listed.returned_by == returned.returned_by
+
+    assert [notice] = wakes_for(db, "agent:coder")
+    assert notice.prompt =~ request.question
+    assert notice.prompt =~ returned.return_reason
+    assert notice.prompt =~ "Revise or replace"
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               db,
+               "SELECT count(*) FROM lifecycle_events WHERE kind = 'decision_request_returned' AND subject = ?1",
+               [request.id]
+             )
+
+    # An exact retry is idempotent: it returns the same row and emits neither a
+    # second event nor a second wake. A changed reason is not an edit of history.
+    assert {:ok, %{decision_request: exact_retry}} =
+             return_request(
+               db,
+               {:session, "agent:po"},
+               request.id,
+               "name the migration and rollback boundary"
+             )
+
+    assert exact_retry.returned_at == returned.returned_at
+    assert [_one_notice] = wakes_for(db, "agent:coder")
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               db,
+               "SELECT count(*) FROM lifecycle_events WHERE kind = 'decision_request_returned' AND subject = ?1",
+               [request.id]
+             )
+
+    assert {:error, %{code: "not_open"}} =
+             return_request(db, {:session, "agent:po"}, request.id, "different reason")
+
+    assert {:error, %{code: "not_open"}} =
+             answer(db, {:session, "agent:po"}, request.id, "too late")
+  end
+
+  test "answer, withdraw, and return race to one terminal winner", %{db: db} do
+    seed_session(db, "agent:coder", "flynn")
+    seed_session(db, "agent:po", "flynn")
+
+    assert {:ok, %{decision_request: request}} =
+             ask(db, "agent:coder", "agent:po", "enough context?")
+
+    barrier = :atomics.new(1, [])
+
+    race = fn fun ->
+      Task.async(fn ->
+        :atomics.add(barrier, 1, 1)
+
+        until = System.monotonic_time(:millisecond) + 2_000
+
+        while = fn while ->
+          if :atomics.get(barrier, 1) < 3 and System.monotonic_time(:millisecond) < until,
+            do: while.(while),
+            else: :ok
+        end
+
+        while.(while)
+        fun.()
+      end)
+    end
+
+    outcomes =
+      [
+        race.(fn -> answer(db, {:session, "agent:po"}, request.id, "yes") end),
+        race.(fn ->
+          withdraw(db, {:session, "agent:coder"}, request.id, "no longer needed")
+        end),
+        race.(fn -> return_request(db, {:session, "agent:po"}, request.id, "not enough") end)
+      ]
+      |> Task.await_many(5_000)
+
+    assert Enum.count(outcomes, &match?({:ok, _}, &1)) == 1
+    assert Enum.count(outcomes, &match?({:error, %{code: "not_open"}}, &1)) == 2
+
+    assert {:ok, [[status]]} =
+             DB.query(db, "SELECT status FROM decision_requests WHERE id = ?1", [request.id])
+
+    assert status in ~w(answered withdrawn returned)
+  end
+
   test "the schema refuses every shape the agent arm forbids", %{db: db} do
     seed_session(db, "agent:coder", "flynn")
     seed_session(db, "agent:po", "flynn")
@@ -3460,6 +3599,15 @@ defmodule Tightbeam.CoordinationFabricTest do
          "'agent:po','flynn',1,'q','{}','answered')"},
       {", answer) VALUES ('d7','agent','session:agent:coder','agent:coder','flynn'," <>
          "'agent:po','flynn',1,'q','{}','answered','yes')"},
+      # `returned` without all three audit fields, or audit fields on an open
+      # row, can never be stored.
+      {") VALUES ('d11','agent','session:agent:coder','agent:coder','flynn'," <>
+         "'agent:po','flynn',1,'q','{}','returned')"},
+      {", returnReason) VALUES ('d12','agent','session:agent:coder','agent:coder','flynn'," <>
+         "'agent:po','flynn',1,'q','{}','open','unclear')"},
+      {", returnedBy, returnReason, returnedAt) VALUES ('d13','agent'," <>
+         "'session:agent:coder','agent:coder','flynn','agent:po','flynn',1,'q','{}'," <>
+         "'returned','session:agent:po','   ',2)"},
       # `raiserId` must name the asking session, not some other principal.
       {") VALUES ('d8','agent','user:flynn','agent:coder','flynn'," <>
          "'agent:po','flynn',1,'q','{}','open')"}
@@ -3746,6 +3894,9 @@ defmodule Tightbeam.CoordinationFabricTest do
 
   defp answer(db, principal, request_id, text),
     do: verb(db, principal, "answer", %{request: request_id, answer: text})
+
+  defp return_request(db, principal, request_id, reason),
+    do: verb(db, principal, "return", %{request: request_id, reason: reason})
 
   defp withdraw(db, principal, request_id, reason),
     do: verb(db, principal, "withdraw", %{request: request_id, reason: reason})

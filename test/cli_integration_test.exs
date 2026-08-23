@@ -1098,6 +1098,93 @@ defmodule Tightbeam.CliIntegrationTest do
                     }}
   end
 
+  test "real CLI returns an insufficient question and removes it from the open queue", ctx do
+    {asked, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "ask",
+          "--session",
+          ctx.worker.session_key,
+          "--question",
+          "which migration should ship?"
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "ask",
+                      principal: {:session, "cli-holder"},
+                      session_key: "cli-worker"
+                    }}
+
+    assert {:ok, [[request_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT id FROM decision_requests WHERE kind='agent' ORDER BY rowid DESC LIMIT 1"
+             )
+
+    assert asked =~ request_id
+    worker_dir = session_workdir!(ctx, ctx.worker)
+
+    {returned, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "return",
+          "--request",
+          request_id,
+          "--reason",
+          "name the migration and rollback boundary"
+        ],
+        cd: worker_dir,
+        stderr_to_stdout: true
+      )
+
+    assert returned =~ request_id
+    assert returned =~ "returned"
+    assert returned =~ "name the migration and rollback boundary"
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "return",
+                      principal: {:session, "cli-worker"},
+                      params: %{
+                        request: ^request_id,
+                        reason: "name the migration and rollback boundary"
+                      }
+                    }}
+
+    assert {:ok, [["returned", "session:cli-worker", reason, returned_at]]} =
+             DB.query(
+               ctx.db,
+               "SELECT status, returnedBy, returnReason, returnedAt FROM decision_requests WHERE id=?1",
+               [request_id]
+             )
+
+    assert reason == "name the migration and rollback boundary"
+    assert is_integer(returned_at)
+
+    {open, 0} =
+      System.cmd(ctx.binary, ["decision-requests", "--status", "open"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    refute open =~ request_id
+
+    {history, 0} =
+      System.cmd(ctx.binary, ["decision-requests", "--status", "returned"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert history =~ request_id
+    assert history =~ reason
+  end
+
   test "real CLI retrieves open decisions through the configured client gateway path", ctx do
     request_id = "dr_configured-client_#{System.unique_integer([:positive])}"
     now = System.system_time(:millisecond)

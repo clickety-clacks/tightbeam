@@ -190,6 +190,11 @@ pub enum Command {
         request_id: String,
         answer: String,
     },
+    ReturnRequest {
+        identity: Identity,
+        request_id: String,
+        reason: String,
+    },
     RevokeAssignment {
         identity: Identity,
         assignment_id: String,
@@ -616,7 +621,7 @@ COMMANDS:
       Atomically open an assignment and wake its holder with the card id.
   effort-rule --request <decisionRequestId> --action continue|dismiss
       Rule an effort-without-effect check-in routed to your principal.
-  decision-requests [--status open|ruled|consumed|withdrawn|superseded|all]
+  decision-requests [--status open|ruled|consumed|withdrawn|superseded|returned|all]
       List decision requests visible to your principal.
   ask (--session <key> | --role <name> | --user <id>) --question "<text>"
       [--about <assignmentId>]
@@ -632,6 +637,10 @@ COMMANDS:
       Answer a question that was put to you. It is an answer, not a ruling: it
       authorizes nothing and unblocks nothing on its own. Only the principal
       the question was asked of can answer it.
+  return --request <decisionRequestId> --reason "<text>"
+      Return an open question for insufficient information. The original row
+      and reason remain in history, it leaves the open queue, and its asker
+      must revise or replace it with a new request if an answer is still needed.
   revoke-assignment <assignmentId>
       Revoke when the assignment handler already authorizes your principal.
   reopen-assignment <assignmentId> --reason "..."
@@ -942,6 +951,8 @@ const ASK_USAGE: &str = "usage: tightbeam ask (--session <key> | --role <name> |
 
 const ANSWER_USAGE: &str =
     "usage: tightbeam answer --request <decisionRequestId> --answer \"<text>\"";
+const RETURN_USAGE: &str =
+    "usage: tightbeam return --request <decisionRequestId> --reason \"<text>\"";
 
 const COORDINATION_SHARE_USAGE: &str =
     "usage: tightbeam coordination-share --session <key> --from <epochMs> --to <epochMs>";
@@ -1510,7 +1521,7 @@ fn parse_with_optional_catalog(
         "decision-requests" => {
             if parsed.positional.len() != 1 {
                 return Err(
-                    "usage: tightbeam decision-requests [--status open|ruled|consumed|withdrawn|superseded|all]".to_owned(),
+                    "usage: tightbeam decision-requests [--status open|ruled|consumed|withdrawn|superseded|returned|all]".to_owned(),
                 );
             }
             Ok(Command::DecisionRequests {
@@ -1551,6 +1562,18 @@ fn parse_with_optional_catalog(
                 identity: identity(flags)?,
                 request_id: request_id.expect("checked above"),
                 answer: answer.expect("checked above"),
+            })
+        }
+        "return" => {
+            let request_id = nonempty(flags, "request");
+            let reason = nonempty(flags, "reason");
+            if parsed.positional.get(1).is_some() || request_id.is_none() || reason.is_none() {
+                return Err(RETURN_USAGE.to_owned());
+            }
+            Ok(Command::ReturnRequest {
+                identity: identity(flags)?,
+                request_id: request_id.expect("checked above"),
+                reason: reason.expect("checked above"),
             })
         }
         "revoke-assignment" => {
@@ -1957,7 +1980,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, ask, answer, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, ask, answer, return, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -2776,6 +2799,7 @@ mod tests {
                 "list",
                 "onboard",
                 "retire",
+                "return",
                 "reopen-assignment",
                 "revoke-assignment",
                 "spawn",
@@ -3367,7 +3391,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, ask, answer, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, ask, answer, return, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned())
         );
     }
 

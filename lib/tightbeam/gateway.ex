@@ -756,6 +756,7 @@ defmodule Tightbeam.Gateway do
       # typed-target machinery `wake` uses, and neither one blocks anything.
       "ask" => fn call -> decision_request_result(Escalation.ask(db, call)) end,
       "answer" => fn call -> decision_request_result(Escalation.answer(db, call)) end,
+      "return" => fn call -> decision_request_result(Escalation.return_request(db, call)) end,
       "decision-requests" => fn call ->
         case Escalation.list_status(call.params[:status]) do
           {:ok, status} ->

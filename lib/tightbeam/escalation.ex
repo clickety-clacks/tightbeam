@@ -16,7 +16,7 @@ defmodule Tightbeam.Escalation do
   # (see @ddl). `list/4` accepts these plus the sentinel "all" (no status filter); any
   # other value is refused by `list_status/1` so a typo names the legal set instead of
   # silently filtering on a status that can never exist.
-  @request_statuses ~w(open ruled consumed withdrawn superseded)
+  @request_statuses ~w(open ruled consumed withdrawn superseded returned)
   @list_status_filters @request_statuses ++ ["all"]
 
   # Marks an `actionKey` as naming a CONDITION rather than one caller's action. Reserved
@@ -58,7 +58,7 @@ defmodule Tightbeam.Escalation do
     question          TEXT NOT NULL,
     options           TEXT,
     context           TEXT NOT NULL,
-    status            TEXT NOT NULL CHECK (status IN ('open','ruled','consumed','withdrawn','superseded','answered')),
+    status            TEXT NOT NULL CHECK (status IN ('open','ruled','consumed','withdrawn','superseded','answered','returned')),
     decision          TEXT,
     rationale         TEXT,
     ruledBy           TEXT,
@@ -76,6 +76,9 @@ defmodule Tightbeam.Escalation do
     answer            TEXT,
     answeredBy        TEXT,
     answeredAt        INTEGER,
+    returnedBy        TEXT,
+    returnReason      TEXT,
+    returnedAt        INTEGER,
     CHECK (
       (kind = 'statute' AND statuteName IS NOT NULL AND actionKey IS NOT NULL
        AND expecterSessionKey IS NULL AND expecterUserId IS NULL
@@ -128,17 +131,23 @@ defmodule Tightbeam.Escalation do
        AND options IS NULL
        -- Its own three-word status vocabulary. `ruled`, `consumed` and
        -- `superseded` are the other arms' words and are unreachable here.
-       AND status IN ('open','answered','withdrawn')
+       AND status IN ('open','answered','withdrawn','returned')
        AND (status = 'answered') = (answer IS NOT NULL)
        AND (answer IS NULL) = (answeredBy IS NULL)
-       AND (answer IS NULL) = (answeredAt IS NULL))
+       AND (answer IS NULL) = (answeredAt IS NULL)
+       AND (status = 'returned') = (returnReason IS NOT NULL)
+       AND (returnReason IS NULL OR length(trim(returnReason)) > 0)
+       AND (returnReason IS NULL) = (returnedBy IS NULL)
+       AND (returnReason IS NULL) = (returnedAt IS NULL))
     ),
     -- The fence, stated once: the agent arm's columns and its terminal word do
     -- not exist for the other two kinds. Without this a `statute` row could be
     -- marked `answered` and every kind-scoped reader above would miss it.
     CHECK (kind = 'agent' OR (askedOfRole IS NULL AND answer IS NULL AND
                               answeredBy IS NULL AND answeredAt IS NULL AND
-                              status <> 'answered'))
+                              returnedBy IS NULL AND returnReason IS NULL AND
+                              returnedAt IS NULL AND
+                              status NOT IN ('answered','returned')))
   );
   CREATE INDEX IF NOT EXISTS decision_requests_owner
     ON decision_requests (ownerUserId, status);
@@ -174,7 +183,8 @@ defmodule Tightbeam.Escalation do
   raisedAt, deadlineAt,
   statuteName, actionKey, question, options, context, status, decision, rationale,
   ruledBy, ruledAt, rulingFactId, consumedAt, parkWakeId, withdrawnBy,
-  withdrawnReason, withdrawnAt, askedOfRole, answer, answeredBy, answeredAt
+  withdrawnReason, withdrawnAt, askedOfRole, answer, answeredBy, answeredAt,
+  returnedBy, returnReason, returnedAt
   """
 
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
@@ -429,7 +439,7 @@ defmodule Tightbeam.Escalation do
 
     case get_raw(db, request_id) do
       %{kind: "agent"} = request ->
-        if answerer?(call, request) do
+        if decision_reader?(call, request) do
           cond do
             not (is_binary(text) and String.trim(text) != "") ->
               error("invalid", "an answer requires text")
@@ -439,6 +449,50 @@ defmodule Tightbeam.Escalation do
 
             true ->
               answer_open(db, request, String.trim(text), answered_by(call))
+          end
+        else
+          error("not_found", "decision request not found")
+        end
+
+      _ ->
+        error("not_found", "decision request not found")
+    end
+  end
+
+  @doc """
+  Return one open agent question because the reader lacks enough information.
+
+  A return is a terminal, reasoned disposition of the exact immutable request,
+  not an answer or ruling. The same principal boundary as `answer/2` applies:
+  the session resolved when the question was filed, or its stamped accountable
+  owner. Unauthorized, nonexistent, and non-agent ids refuse identically.
+  """
+  @spec return_request(DB.server(), map()) :: map()
+  def return_request(db, call) do
+    request_id = param(call, :request_id) || param(call, :request)
+    reason = param(call, :reason)
+
+    case get_raw(db, request_id) do
+      %{kind: "agent"} = request ->
+        if decision_reader?(call, request) do
+          by = reader_by(call)
+
+          case trimmed_reason(reason) do
+            {:ok, text} ->
+              cond do
+                request.status == "open" ->
+                  return_open(db, request, text, by)
+
+                request.status == "returned" and request.returned_by == by and
+                    request.return_reason == text ->
+                  request
+
+                true ->
+                  error("not_open", "decision request is not open")
+              end
+
+            {:error, error} ->
+              error
           end
         else
           error("not_found", "decision request not found")
@@ -569,6 +623,61 @@ defmodule Tightbeam.Escalation do
     result
   end
 
+  defp return_open(db, request, reason, returned_by) do
+    returned_at = now()
+
+    {:ok, result} =
+      DB.transaction(db, fn txn ->
+        Txn.q(
+          txn,
+          """
+          UPDATE decision_requests
+          SET status = 'returned', returnedBy = ?2, returnReason = ?3, returnedAt = ?4
+          WHERE id = ?1 AND kind = 'agent' AND status = 'open'
+          """,
+          [request.id, returned_by, reason, returned_at]
+        )
+
+        if Txn.changes(txn) == 1 do
+          EventLog.lifecycle_in_txn(
+            txn,
+            "decision_request_returned",
+            request.id,
+            "by=#{returned_by} askedOf=#{request.expecter_session_key}"
+          )
+
+          Wakes.schedule_in_txn(txn, %{
+            session_key: request.raiser_session_key,
+            origin: "process:tightbeam",
+            prompt: return_notification(request, reason, returned_by),
+            due_at: returned_at,
+            target_gate: 0
+          })
+
+          request_in_txn(txn, request.id)
+        else
+          current = request_in_txn(txn, request.id)
+
+          if current.status == "returned" and current.returned_by == returned_by and
+               current.return_reason == reason,
+             do: current,
+             else: error("not_open", "decision request is not open")
+        end
+      end)
+
+    result
+  end
+
+  defp trimmed_reason(reason) when is_binary(reason) do
+    case String.trim(reason) do
+      "" -> {:error, error("invalid", "a return reason is required")}
+      text -> {:ok, text}
+    end
+  end
+
+  defp trimmed_reason(_reason),
+    do: {:error, error("invalid", "a return reason is required")}
+
   defp asking_session(%{principal: {:session, key}}), do: {:ok, key}
 
   defp asking_session(_call),
@@ -665,13 +774,16 @@ defmodule Tightbeam.Escalation do
     end
   end
 
-  defp answerer?(%{principal: {:session, key}}, request),
+  defp decision_reader?(%{principal: {:session, key}}, request),
     do: key == request.expecter_session_key
 
-  defp answerer?(%{principal: {:user, user_id}}, request),
+  defp decision_reader?(%{principal: {:user, user_id}}, request),
     do: user_id == request.expecter_user_id
 
-  defp answerer?(_call, _request), do: false
+  defp decision_reader?(_call, _request), do: false
+
+  defp reader_by(%{principal: {:session, key}}), do: "session:" <> key
+  defp reader_by(%{principal: {:user, user_id}}), do: "user:" <> user_id
 
   defp answered_by(%{principal: {:session, key}}), do: "session:" <> key
   defp answered_by(%{principal: {:user, user_id}}), do: "user:" <> user_id
@@ -689,6 +801,13 @@ defmodule Tightbeam.Escalation do
     "Question #{request.id} was answered by #{answered_by}.\n" <>
       "You asked: #{request.question}\n" <>
       "Answer: #{text}"
+  end
+
+  defp return_notification(request, reason, returned_by) do
+    "Question #{request.id} was returned by #{returned_by} for insufficient information.\n" <>
+      "You asked: #{request.question}\n" <>
+      "Reason: #{reason}\n" <>
+      "Revise or replace it by filing a new tightbeam ask; this request remains returned."
   end
 
   @doc "Spend one ruled authorization. Batch rollback is deliberately not provided."
@@ -1164,6 +1283,7 @@ defmodule Tightbeam.Escalation do
     current_request: "statute",
     file_agent_request: "agent",
     answer_open: "agent",
+    return_open: "agent",
     effort_open_by_deadline_wake_in_txn: "effort",
     effort_insert_in_txn: "effort",
     effort_id_by_generation_in_txn: "effort",
@@ -1189,12 +1309,13 @@ defmodule Tightbeam.Escalation do
     get_raw: "any",
     request_in_txn: "any",
     # DELEGATE: no SQL literal of its own — reaches one of the entries above
-    # by a local call. `answer/2`/`ask/2`/`rule/3`/`waive/3`/`withdraw/2`/
+    # by a local call. `answer/2`/`return_request/2`/`ask/2`/`rule/3`/`waive/3`/`withdraw/2`/
     # `resolve/3`/`summon/4` are this module's PUBLIC VERB SURFACE, reached
     # exclusively through Dispatch/Gateway's own routing tables and proved
     # there by other tests — not "helpers" another module reaches on its own
     # initiative, so (c)'s pinned-caller treatment does not apply to them.
     answer: "agent",
+    return_request: "agent",
     ask: "agent",
     raw_by_id: "any",
     raw_by_id_in_txn!: "any",
@@ -1799,7 +1920,10 @@ defmodule Tightbeam.Escalation do
          asked_of_role,
          answer,
          answered_by,
-         answered_at
+         answered_at,
+         returned_by,
+         return_reason,
+         returned_at
        ]) do
     %{
       id: id,
@@ -1834,7 +1958,10 @@ defmodule Tightbeam.Escalation do
       asked_of_role: asked_of_role,
       answer: answer,
       answered_by: answered_by,
-      answered_at: answered_at
+      answered_at: answered_at,
+      returned_by: returned_by,
+      return_reason: return_reason,
+      returned_at: returned_at
     }
   end
 
