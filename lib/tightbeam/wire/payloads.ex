@@ -188,6 +188,7 @@ defmodule Tightbeam.Wire.Payloads do
         "createdAt" => Map.fetch!(s, :created_at),
         "updatedAt" => Map.fetch!(s, :updated_at),
         "adopted" => Map.fetch!(s, :adopted),
+        "operationalParent" => Map.fetch!(s, :operational_parent),
         "startedBy" => Tightbeam.Origin.started_by(s[:origin])
       },
       for(

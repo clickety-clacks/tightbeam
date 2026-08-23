@@ -13,6 +13,7 @@ defmodule Tightbeam.ArtifactsTest do
     :ok = Ledger.ensure_schema(db)
     :ok = Artifacts.ensure_schema(db)
 
+    ensure_main_session(db, "flynn")
     parent = session(db, "parent", nil)
     child = session(db, "child", parent.session_key)
     seed_work_items(db)
@@ -90,6 +91,27 @@ defmodule Tightbeam.ArtifactsTest do
              }),
              & &1.artifact_id
            ) == [first.artifact_id]
+  end
+
+  test "records artifact ancestry from the operational parent, not spawn provenance", ctx do
+    operational_parent = session(ctx.db, "operational-parent", nil)
+
+    child =
+      Org.set_operational_parent(
+        ctx.db,
+        ctx.child.session_key,
+        operational_parent.session_key
+      )
+
+    artifact =
+      record(ctx.db, child.session_key, %{
+        kind: "report",
+        title: "Operational ancestry",
+        origin_path: "reports/operational-ancestry.md"
+      })
+
+    assert child.spawned_by == ctx.parent.session_key
+    assert artifact.parent_session == operational_parent.session_key
   end
 
   test "gateway verbs return rows, filtered lists, not-found, and the session-caller error",

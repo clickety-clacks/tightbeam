@@ -93,6 +93,22 @@ defmodule Tightbeam.ArtifactCarrierTest do
     {:ok, _} =
       DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1)")
 
+    main_key = Org.personal_session_key("flynn")
+
+    Org.create(db, %{
+      session_key: main_key,
+      display_name: "Main",
+      kind: "main",
+      is_built_in: true,
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("fable")
+    })
+
     coder =
       Org.create(db, %{
         session_key: "carrier-coder",

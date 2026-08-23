@@ -1297,7 +1297,7 @@ defmodule Tightbeam.SupervisionTest do
              )
   end
 
-  test "n zero escalates, retired rungs are skipped, and the holder-seeded cycle sinks at Main",
+  test "n zero escalates through operational parents and skips retired rungs to Main",
        ctx do
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
     seq = terminal!(ctx.db, "holder")
@@ -1310,9 +1310,6 @@ defmodule Tightbeam.SupervisionTest do
     assert wake.reresolve_seed == "holder"
     assert wake.reresolve_rung == 1
 
-    {:ok, _} =
-      DB.query(ctx.db, "UPDATE sessions SET spawnedBy = 'holder' WHERE sessionKey = 'supervisor'")
-
     assert Supervision.ladder_target(ctx.db, "holder", 1) == "supervisor"
     assert Supervision.ladder_target(ctx.db, "holder", 2) == ctx.main.session_key
 
@@ -1320,20 +1317,17 @@ defmodule Tightbeam.SupervisionTest do
     assert Supervision.ladder_target(ctx.db, "holder", 1) == ctx.main.session_key
   end
 
-  # The ladder's last rung is the owner's MAIN session, and that key is composed
-  # from a user id rather than read from a row. Every substrate notice addressed
-  # to a user with no main session went to a session that does not exist, was
-  # accepted by delivery, and queued forever — six of them in one soak.
-  test "the ladder answers nobody rather than composing a key for a session that has no row",
+  test "the session graph refuses deleting Main while operational children depend on it",
        ctx do
     assert Supervision.ladder_target(ctx.db, "holder", 2) == ctx.main.session_key
 
-    {:ok, _} =
-      DB.query(ctx.db, "DELETE FROM sessions WHERE sessionKey = ?1", [ctx.main.session_key])
+    assert {:error, %DB.Error{message: message}} =
+             DB.query(ctx.db, "DELETE FROM sessions WHERE sessionKey = ?1", [
+               ctx.main.session_key
+             ])
 
-    assert Supervision.ladder_target(ctx.db, "holder", 2) == nil
-    # Rungs above the chain are the same answer, not a deeper composed key.
-    assert Supervision.ladder_target(ctx.db, "holder", 9) == nil
+    assert message =~ "FOREIGN KEY constraint failed"
+    assert Supervision.ladder_target(ctx.db, "holder", 2) == ctx.main.session_key
   end
 
   test "a retired main session is nobody too — the ladder verifies, it does not compose", ctx do
@@ -1365,9 +1359,7 @@ defmodule Tightbeam.SupervisionTest do
       )
 
     retire!(ctx.db, "supervisor")
-
-    {:ok, _} =
-      DB.query(ctx.db, "DELETE FROM sessions WHERE sessionKey = ?1", [ctx.main.session_key])
+    retire!(ctx.db, ctx.main.session_key)
 
     Supervision.evaluate(ctx.db, ctx.handlers, 0, "holder", seq)
 
@@ -1379,9 +1371,7 @@ defmodule Tightbeam.SupervisionTest do
   # `process:tightbeam` re-resolving a lineage whose owner has no main session.
   test "a lineage notice for an owner with no main session enqueues nothing and is named", ctx do
     retire!(ctx.db, "supervisor")
-
-    {:ok, _} =
-      DB.query(ctx.db, "DELETE FROM sessions WHERE sessionKey = ?1", [ctx.main.session_key])
+    retire!(ctx.db, ctx.main.session_key)
 
     gate = %{reresolve: "lineage", reresolve_seed: "holder", reresolve_rung: 1}
 
@@ -2800,10 +2790,7 @@ defmodule Tightbeam.SupervisionTest do
     assert Ledger.pending_count(ctx.db, ctx.main.session_key) == 0
   end
 
-  test "N=0 cross-assignment re-entry exceeds N+1 and then quiesces at Main", ctx do
-    {:ok, _} =
-      DB.query(ctx.db, "UPDATE sessions SET spawnedBy='holder' WHERE sessionKey='supervisor'")
-
+  test "N=0 cross-assignment re-entry follows operational parents and quiesces at Main", ctx do
     assignment(ctx.db, "asg_2", "supervisor", "second", 2)
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
     insert_entitlement!(ctx.db, "asg_2", generation: 1, due_at: 0)
@@ -2816,20 +2803,10 @@ defmodule Tightbeam.SupervisionTest do
     fire_all_pending(ctx.db)
     s1 = terminal!(ctx.db, "supervisor")
 
-    assert {:escalated, 1, "holder"} =
+    assert {:escalated, 1, main} =
              Supervision.evaluate(ctx.db, ctx.handlers, 0, "supervisor", s1)
 
-    fire_all_pending(ctx.db)
-    insert_entitlement!(ctx.db, "asg_1", generation: 2, due_at: 0)
-    h2 = terminal!(ctx.db, "holder")
-
-    assert {:escalated, 2, main} =
-             Supervision.evaluate(ctx.db, ctx.handlers, 0, "holder", h2)
-
     assert main == ctx.main.session_key
-    assert Supervision.prod_state(ctx.db, "asg_1").prodCount == 2
-    assert Supervision.prod_state(ctx.db, "asg_1").prodCount > 0 + 1
-
     fire_all_pending(ctx.db)
     main_terminal = terminal!(ctx.db, ctx.main.session_key)
 
@@ -2841,7 +2818,7 @@ defmodule Tightbeam.SupervisionTest do
 
   test "past-sink open assignment emits one escalation per external terminal and duplicate re-entry is inert",
        ctx do
-    {:ok, _} = DB.query(ctx.db, "UPDATE sessions SET spawnedBy=NULL WHERE sessionKey='holder'")
+    Org.set_operational_parent(ctx.db, "holder", ctx.main.session_key)
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
 
     first = terminal!(ctx.db, "holder")
@@ -2871,8 +2848,7 @@ defmodule Tightbeam.SupervisionTest do
       target = "race_target_#{iteration}"
       session(ctx.db, target, ctx.main.session_key)
 
-      {:ok, _} =
-        DB.query(ctx.db, "UPDATE sessions SET spawnedBy=?1 WHERE sessionKey='holder'", [target])
+      Org.set_operational_parent(ctx.db, "holder", target)
 
       gate = %{reresolve: "lineage", reresolve_seed: "holder", reresolve_rung: 1}
 

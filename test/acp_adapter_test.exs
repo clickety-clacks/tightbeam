@@ -1590,6 +1590,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     db = :"auth_callback_db_#{System.unique_integer([:positive])}"
     start_supervised!({Tightbeam.DB, path: ":memory:", name: db})
     :ok = Tightbeam.Schema.ensure_all(db)
+    ensure_main_session(db, "flynn")
     Tightbeam.Archetypes.load!(base)
     Tightbeam.Rails.load!(base)
 
@@ -1695,6 +1696,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     db = :"subagent_callback_db_#{System.unique_integer([:positive])}"
     start_supervised!({Tightbeam.DB, path: ":memory:", name: db})
     :ok = Tightbeam.Schema.ensure_all(db)
+    ensure_main_session(db, "flynn")
 
     Tightbeam.Archetypes.load!(base)
     Tightbeam.Rails.load!(base)
@@ -1800,6 +1802,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     db = :"subagent_failure_db_#{System.unique_integer([:positive])}"
     db_pid = start_supervised!({Tightbeam.DB, path: ":memory:", name: db})
     :ok = Tightbeam.Schema.ensure_all(db)
+    ensure_main_session(db, "flynn")
 
     Tightbeam.Archetypes.load!(base)
     Tightbeam.Rails.load!(base)

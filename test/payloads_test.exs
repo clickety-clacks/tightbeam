@@ -140,6 +140,7 @@ defmodule Tightbeam.Wire.PayloadsTest do
       owner_user_id: "flynn",
       origin: "user:flynn",
       spawned_by: "agent:main:clawline:flynn:main",
+      operational_parent: "agent:main:clawline:flynn:main",
       handle: nil,
       archetype: "default",
       harness: "claude",
@@ -160,6 +161,7 @@ defmodule Tightbeam.Wire.PayloadsTest do
       "createdAt" => 1,
       "updatedAt" => 2,
       "adopted" => true,
+      "operationalParent" => "agent:main:clawline:flynn:main",
       "startedBy" => "user"
     }
 

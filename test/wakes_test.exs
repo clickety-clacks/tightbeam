@@ -189,13 +189,19 @@ defmodule Tightbeam.WakesTest do
         """
         INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1);
         INSERT INTO sessions
-          (sessionKey, displayName, ownerUserId, origin, archetype, harness,
+          (sessionKey, displayName, kind, isBuiltIn, ownerUserId, origin,
+           operationalParent, archetype, harness,
            provider, model, host, state, createdAt, updatedAt)
         VALUES
-          ('retiring', 'retiring', 'flynn', 'user:flynn', 'default', 'claude',
+          ('agent:main:clawline:flynn:main', 'Main', 'main', 1, 'flynn', 'user:flynn',
+           'agent:main:clawline:flynn:main', 'default', 'claude',
            'anthropic', 'fable', 'eezo', 'active', 1, 1),
-          ('replacement', 'replacement', 'flynn', 'user:flynn', 'default',
-           'claude', 'anthropic', 'fable', 'eezo', 'active', 1, 1);
+          ('retiring', 'retiring', 'custom', 0, 'flynn', 'user:flynn',
+           'agent:main:clawline:flynn:main', 'default', 'claude',
+           'anthropic', 'fable', 'eezo', 'active', 1, 1),
+          ('replacement', 'replacement', 'custom', 0, 'flynn', 'user:flynn',
+           'agent:main:clawline:flynn:main', 'default', 'claude', 'anthropic',
+           'fable', 'eezo', 'active', 1, 1);
         INSERT INTO work_items
           (id, title, ownerUserId, state, createdByUser, createdAt)
         VALUES ('wi_retarget', 'Retarget work', 'flynn', 'open', 'flynn', 1);
@@ -446,10 +452,12 @@ defmodule Tightbeam.WakesTest do
   end
 
   defp active_sessions!(db, keys) do
+    main = "agent:main:clawline:flynn:main"
+
     values =
       keys
       |> Enum.map(fn key ->
-        "('#{key}', '#{key}', 'flynn', 'user:flynn', 'default', 'claude', 'anthropic', 'fable', 'eezo', 'active', 1, 1)"
+        "('#{key}', '#{key}', 'flynn', 'user:flynn', '#{main}', 'default', 'claude', 'anthropic', 'fable', 'eezo', 'active', 1, 1)"
       end)
       |> Enum.join(",\n")
 
@@ -458,9 +466,16 @@ defmodule Tightbeam.WakesTest do
         db,
         """
         INSERT OR IGNORE INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1);
+        INSERT OR IGNORE INTO sessions
+          (sessionKey, displayName, kind, isBuiltIn, ownerUserId, origin,
+           operationalParent, archetype, harness, provider, model, host, state,
+           createdAt, updatedAt)
+        VALUES
+          ('#{main}', 'Main', 'main', 1, 'flynn', 'user:flynn', '#{main}',
+           'default', 'claude', 'anthropic', 'fable', 'eezo', 'active', 1, 1);
         INSERT INTO sessions
-          (sessionKey, displayName, ownerUserId, origin, archetype, harness,
-           provider, model, host, state, createdAt, updatedAt)
+          (sessionKey, displayName, ownerUserId, origin, operationalParent,
+           archetype, harness, provider, model, host, state, createdAt, updatedAt)
         VALUES
           #{values};
         """

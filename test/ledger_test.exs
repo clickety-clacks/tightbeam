@@ -15,12 +15,18 @@ defmodule Tightbeam.LedgerTest do
     :ok =
       DB.execute(db, """
       INSERT INTO sessions
-        (sessionKey, displayName, ownerUserId, origin, archetype, identityName,
+        (sessionKey, displayName, kind, isBuiltIn, ownerUserId, origin, operationalParent,
+         archetype, identityName,
          harness, provider, model, thinkingLevel, modelContext, createdAt, updatedAt)
       VALUES
-        ('k1', 'K1', 'flynn', 'user:flynn', 'default', 'default',
+        ('ledger-main', 'Ledger Main', 'main', 1, 'flynn', 'user:flynn',
+         'ledger-main', 'default', 'default',
          'claude', 'anthropic', 'claude-sonnet-5', 'medium', NULL, 1, 1),
-        ('k2', 'K2', 'flynn', 'user:flynn', 'default', 'default',
+        ('k1', 'K1', 'custom', 0, 'flynn', 'user:flynn',
+         'ledger-main', 'default', 'default',
+         'claude', 'anthropic', 'claude-sonnet-5', 'medium', NULL, 1, 1),
+        ('k2', 'K2', 'custom', 0, 'flynn', 'user:flynn',
+         'ledger-main', 'default', 'default',
          'claude', 'anthropic', 'claude-sonnet-5', 'medium', NULL, 1, 1);
       """)
   end
@@ -235,10 +241,12 @@ defmodule Tightbeam.LedgerTest do
     :ok =
       DB.execute(db, """
       INSERT INTO sessions
-        (sessionKey, displayName, ownerUserId, origin, archetype, identityName,
+        (sessionKey, displayName, kind, isBuiltIn, ownerUserId, origin, operationalParent,
+         archetype, identityName,
          harness, provider, model, thinkingLevel, modelContext, createdAt, updatedAt)
       VALUES
-        ('agent:main:clawline:flynn:main', 'Flynn', 'flynn', 'user:flynn', 'default',
+        ('agent:main:clawline:flynn:main', 'Flynn', 'main', 1, 'flynn', 'user:flynn',
+         'agent:main:clawline:flynn:main', 'default',
          'default', 'claude', 'anthropic', 'claude-sonnet-5', 'medium', NULL, 1, 1);
       """)
 

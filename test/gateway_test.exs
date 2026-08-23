@@ -95,6 +95,17 @@ defmodule Tightbeam.GatewayTest do
     end
   end
 
+  defmodule ConditionSchedulerStub do
+    use GenServer
+    def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
+    def init(parent), do: {:ok, parent}
+
+    def handle_call({:fire_matching, fact_id}, _from, parent) do
+      send(parent, {:fire_matching, fact_id})
+      {:reply, :ok, parent}
+    end
+  end
+
   defmodule CoordinatorStub do
     use GenServer
 
@@ -585,9 +596,25 @@ defmodule Tightbeam.GatewayTest do
         model: nil
       })
 
+    main_key = Org.personal_session_key("flynn")
+
+    Org.create(db, %{
+      session_key: main_key,
+      display_name: "Main",
+      kind: "main",
+      is_built_in: true,
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "mainhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("fable")
+    })
+
     Org.create(db, %{
       session_key: "k1",
-      display_name: "Main",
+      display_name: "Test session",
       owner_user_id: "flynn",
       origin: "user:flynn",
       archetype: "default",
@@ -606,7 +633,7 @@ defmodule Tightbeam.GatewayTest do
         subscriptions: MapSet.new(["chat"])
       })
 
-    %{db: db, registry: registry, lane: lane, catalog_base: catalog_base}
+    %{db: db, registry: registry, lane: lane, catalog_base: catalog_base, main_key: main_key}
   end
 
   test "assignment handlers inject the configured supervision interval before mutation", ctx do
@@ -666,20 +693,6 @@ defmodule Tightbeam.GatewayTest do
   end
 
   test "retire refuses built-in mains — the fallback target is permanent", ctx do
-    Org.create(ctx.db, %{
-      session_key: Org.personal_session_key("flynn"),
-      display_name: "Main",
-      kind: "main",
-      is_built_in: true,
-      owner_user_id: "flynn",
-      origin: "user:flynn",
-      archetype: "default",
-      host: "testhost",
-      harness: "claude",
-      provider: "anthropic",
-      model: Model.new("fable")
-    })
-
     handlers =
       Gateway.handlers(%{
         db: ctx.db,
@@ -692,12 +705,12 @@ defmodule Tightbeam.GatewayTest do
     assert %{code: "denied", message: message} =
              handlers["retire"].(%{
                origin: "user:flynn",
-               session_key: Org.personal_session_key("flynn"),
+               session_key: ctx.main_key,
                params: %{}
              })
 
     assert message =~ "permanent"
-    assert Org.get(ctx.db, Org.personal_session_key("flynn")).state == "active"
+    assert Org.get(ctx.db, ctx.main_key).state == "active"
   end
 
   test "admin operator handler lists durable harness launches", ctx do
@@ -780,6 +793,60 @@ defmodule Tightbeam.GatewayTest do
                ctx.db,
                "SELECT sessionKey, reason FROM assignment_interruptions WHERE assignmentId='asg_retire'"
              )
+  end
+
+  test "retire follows the operational subtree, not spawn provenance", ctx do
+    ensure_global_registry()
+    root = create_session(ctx.db, "operational-root", "flynn")
+    provenance_child = create_session(ctx.db, "provenance-child", "flynn", root.session_key)
+    operational_child = create_session(ctx.db, "operational-child", "flynn", ctx.main_key)
+
+    Org.set_operational_parent(ctx.db, provenance_child.session_key, ctx.main_key)
+    Org.set_operational_parent(ctx.db, operational_child.session_key, root.session_key)
+
+    result =
+      Gateway.handlers(%{db: ctx.db, wake_tick_ms: 1_000})["retire"].(%{
+        origin: "user:flynn",
+        session_key: root.session_key,
+        params: %{}
+      })
+
+    assert result.retired_session_keys == [operational_child.session_key, root.session_key]
+    assert Org.get(ctx.db, provenance_child.session_key).state == "active"
+    assert Org.get(ctx.db, operational_child.session_key).spawned_by == ctx.main_key
+  end
+
+  test "work-block authority follows operational parents, not spawn provenance", ctx do
+    spawn_parent = create_session(ctx.db, "block-spawn-parent", "flynn")
+    operational_parent = create_session(ctx.db, "block-operational-parent", "flynn")
+    child = create_session(ctx.db, "block-child", "flynn", spawn_parent.session_key)
+    child = Org.set_operational_parent(ctx.db, child.session_key, operational_parent.session_key)
+    scheduler = start_supervised!({ConditionSchedulerStub, self()})
+    condition = Gateway.handlers(%{db: ctx.db, wake_scheduler: scheduler})["condition"]
+
+    call = %{
+      params: %{kind: "work-blocked", scope: child.session_key}
+    }
+
+    assert %{code: "not_authorized"} =
+             condition.(
+               Map.merge(call, %{
+                 origin: "agent:block-spawn-parent",
+                 principal: {:session, spawn_parent.session_key}
+               })
+             )
+
+    assert %{kind: "work-blocked", scope: scope, fact_id: fact_id} =
+             condition.(
+               Map.merge(call, %{
+                 origin: "agent:block-operational-parent",
+                 principal: {:session, operational_parent.session_key}
+               })
+             )
+
+    assert scope == child.session_key
+    assert_receive {:fire_matching, ^fact_id}
+    assert child.spawned_by == spawn_parent.session_key
   end
 
   test "retiring the last live session closes its harness session and shared adapter", ctx do
@@ -1350,7 +1417,9 @@ defmodule Tightbeam.GatewayTest do
         params: %{}
       })
 
-    assert [%{created_at: created_at}] = inspect.sessions
+    assert %{created_at: created_at} =
+             Enum.find(inspect.sessions, &(&1.session_key == session.session_key))
+
     assert created_at == session.created_at
 
     projections = [
@@ -1819,7 +1888,10 @@ defmodule Tightbeam.GatewayTest do
     create_session(ctx.db, "effort-parent", "flynn")
 
     :ok =
-      DB.execute(ctx.db, "UPDATE sessions SET spawnedBy='effort-parent' WHERE sessionKey='k1'")
+      DB.execute(
+        ctx.db,
+        "UPDATE sessions SET kind='main',isBuiltIn=1,operationalParent='effort-parent' WHERE sessionKey='effort-parent'; UPDATE sessions SET operationalParent='effort-parent' WHERE sessionKey='k1'"
+      )
 
     assignment =
       Gateway.handlers(config)["dispatch"].(%{
@@ -1842,7 +1914,7 @@ defmodule Tightbeam.GatewayTest do
     assert %{consumer: "effort_probe", state: "pending"} = Wakes.get(ctx.db, wake_id)
     {:ok, _} = DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [wake_id])
 
-    # Rung one prods the HOLDER and re-arms; the owner's request is rung two.
+    # Rung one prods the HOLDER and re-arms; the parent escalation is rung two.
     assert :ok = Wakes.fire_due(scheduler)
 
     {:ok, [[rearmed_wake_id]]} =
@@ -1855,22 +1927,27 @@ defmodule Tightbeam.GatewayTest do
     {:ok, _} = DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [rearmed_wake_id])
     assert :ok = Wakes.fire_due(scheduler)
 
-    assert {:ok, [[request_id]]} =
-             DB.query(
-               ctx.db,
-               "SELECT id FROM decision_requests WHERE kind='effort' AND assignmentId=?1",
-               [assignment.id]
-             )
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE kind='effort'")
 
-    assert is_binary(request_id)
     assert Wakes.get(ctx.db, wake_id).state == "fired"
 
-    # The expecter notification is a durable ungated wake armed with the request,
-    # still pending: the same tick that opened the request delivers nothing.
-    assert {:ok, [[notify_id]]} =
+    # The parent escalation is a durable agent-targeted wake. Main is terminal,
+    # so there is no third effort generation and no user/decision rung.
+    assert {:ok, [[notify_id, prompt]]} =
              DB.query(
                ctx.db,
-               "SELECT wakeId FROM wakes WHERE targetGate = 0 AND state = 'pending'"
+               "SELECT wakeId,prompt FROM wakes WHERE sessionKey='effort-parent' AND state='pending' AND consumer='prompt'"
+             )
+
+    assert prompt =~ "[effort escalation]"
+    assert prompt =~ "Child session k1 remains inactive"
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM effort_checkin_generations WHERE assignmentId=?1 AND state='armed'",
+               [assignment.id]
              )
 
     assert %{consumer: "prompt", session_key: expecter} = Wakes.get(ctx.db, notify_id)
@@ -1885,7 +1962,7 @@ defmodule Tightbeam.GatewayTest do
 
     assert_received {:ensure_lane, ^expecter}
 
-    assert {:ok, [[1]]} =
+    assert {:ok, [[0]]} =
              DB.query(
                ctx.db,
                "SELECT COUNT(*) FROM decision_requests WHERE kind='effort' AND assignmentId=?1",
@@ -2021,7 +2098,7 @@ defmodule Tightbeam.GatewayTest do
     spawn =
       base_dir
       |> gateway_config(ctx.db, 0)
-      |> Map.put(:max_live_sessions_per_user, 2)
+      |> Map.put(:max_live_sessions_per_user, 3)
       |> Map.put(:credential_status, fn _provider ->
         send(parent, {:past_cap_precheck, self()})
 
@@ -2067,7 +2144,7 @@ defmodule Tightbeam.GatewayTest do
              "spawn-cap-race-#{rejected_index}"
            ) == nil
 
-    assert length(Org.list_for_user(ctx.db, "flynn", false)) == 2
+    assert length(Org.list_for_user(ctx.db, "flynn", false)) == 3
   end
 
   test "spawn serves a populated stale catalog while preserving its health", ctx do
@@ -2677,6 +2754,8 @@ defmodule Tightbeam.GatewayTest do
       # by the time the gateway processes it — the OLD code re-resolved
       # "worker" at THAT later moment, found it now bound to "live", and
       # authorized "live"'s owner against itself: trivially true, and wrong.
+      ensure_main_session(ctx.db, "mallory")
+
       Org.create(ctx.db, %{
         session_key: "agent-a",
         display_name: "Agent A",
@@ -7611,7 +7690,7 @@ defmodule Tightbeam.GatewayTest do
     adapter = start_supervised!({AdapterStub, self()})
     start_supervised!({CoordinatorStub, adapter})
     owner_session = Org.personal_session_key("flynn")
-    create_session(ctx.db, owner_session, "flynn")
+    ensure_main_session(ctx.db, "flynn")
 
     {:ok, _ref, nil} =
       ConnRegistry.register(exact_registry, %{
@@ -7911,7 +7990,7 @@ defmodule Tightbeam.GatewayTest do
     adapter = start_supervised!({AdapterStub, self()})
     start_supervised!({CoordinatorStub, adapter})
     owner_session = Org.personal_session_key("flynn")
-    create_session(ctx.db, owner_session, "flynn")
+    ensure_main_session(ctx.db, "flynn")
 
     :ok =
       DB.execute(ctx.db, """
@@ -9980,6 +10059,8 @@ defmodule Tightbeam.GatewayTest do
   end
 
   defp create_session(db, session_key, owner_user_id, spawned_by \\ nil) do
+    ensure_main_session(db, owner_user_id)
+
     Org.create(db, %{
       session_key: session_key,
       display_name: session_key,

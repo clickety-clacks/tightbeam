@@ -796,12 +796,16 @@ defmodule Tightbeam.Supervision do
   """
   @spec ladder_target(DB.server() | Txn.t(), String.t(), pos_integer()) :: String.t() | nil
   def ladder_target(db_or_txn, holder_key, rung) do
-    [[owner, spawned_by]] =
-      query(db_or_txn, "SELECT ownerUserId, spawnedBy FROM sessions WHERE sessionKey = ?1", [
-        holder_key
-      ])
+    [[owner, operational_parent]] =
+      query(
+        db_or_txn,
+        "SELECT ownerUserId, operationalParent FROM sessions WHERE sessionKey = ?1",
+        [
+          holder_key
+        ]
+      )
 
-    chain = lineage(db_or_txn, spawned_by, MapSet.new([holder_key]), [])
+    chain = lineage(db_or_txn, operational_parent, MapSet.new([holder_key]), [])
 
     case Enum.at(chain, rung - 1) do
       nil -> active_personal_key(db_or_txn, owner)
@@ -2946,10 +2950,12 @@ defmodule Tightbeam.Supervision do
     if MapSet.member?(visited, session_key) do
       Enum.reverse(acc)
     else
-      case query(db, "SELECT state, spawnedBy FROM sessions WHERE sessionKey = ?1", [session_key]) do
-        [[state, spawned_by]] ->
+      case query(db, "SELECT state, operationalParent FROM sessions WHERE sessionKey = ?1", [
+             session_key
+           ]) do
+        [[state, operational_parent]] ->
           next_acc = if state == "active", do: [session_key | acc], else: acc
-          lineage(db, spawned_by, MapSet.put(visited, session_key), next_acc)
+          lineage(db, operational_parent, MapSet.put(visited, session_key), next_acc)
 
         [] ->
           Enum.reverse(acc)
@@ -3855,12 +3861,23 @@ defmodule Tightbeam.Supervision do
   end
 
   defp ladder_target_excluding(db_or_txn, holder_key, rung, excluded) do
-    [[owner, spawned_by]] =
-      query(db_or_txn, "SELECT ownerUserId, spawnedBy FROM sessions WHERE sessionKey=?1", [
-        holder_key
-      ])
+    [[owner, operational_parent]] =
+      query(
+        db_or_txn,
+        "SELECT ownerUserId, operationalParent FROM sessions WHERE sessionKey=?1",
+        [
+          holder_key
+        ]
+      )
 
-    chain = lineage_excluding(db_or_txn, spawned_by, excluded, MapSet.new([holder_key]), [])
+    chain =
+      lineage_excluding(
+        db_or_txn,
+        operational_parent,
+        excluded,
+        MapSet.new([holder_key]),
+        []
+      )
 
     case Enum.at(chain, rung - 1) do
       nil ->
@@ -3878,10 +3895,10 @@ defmodule Tightbeam.Supervision do
     if MapSet.member?(visited, session_key) do
       Enum.reverse(acc)
     else
-      case query(db_or_txn, "SELECT state, spawnedBy FROM sessions WHERE sessionKey=?1", [
+      case query(db_or_txn, "SELECT state, operationalParent FROM sessions WHERE sessionKey=?1", [
              session_key
            ]) do
-        [[state, spawned_by]] ->
+        [[state, operational_parent]] ->
           next_acc =
             if state == "active" and session_key != excluded,
               do: [session_key | acc],
@@ -3889,7 +3906,7 @@ defmodule Tightbeam.Supervision do
 
           lineage_excluding(
             db_or_txn,
-            spawned_by,
+            operational_parent,
             excluded,
             MapSet.put(visited, session_key),
             next_acc

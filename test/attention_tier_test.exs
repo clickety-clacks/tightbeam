@@ -117,6 +117,8 @@ defmodule Tightbeam.AttentionTierTest do
 
     :ok = DB.execute(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn',0,1)")
 
+    ensure_main_session(db, "flynn")
+
     Org.create(db, %{
       session_key: "k1",
       display_name: "Main",

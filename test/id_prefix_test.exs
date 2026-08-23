@@ -108,6 +108,8 @@ defmodule Tightbeam.IdPrefixOperationsTest do
     {:ok, _} =
       DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1)")
 
+    ensure_main_session(db, "flynn")
+
     Org.create(db, %{
       session_key: "holder",
       display_name: "holder",

@@ -36,6 +36,8 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
         "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1)"
       )
 
+    ensure_main_session(db, "flynn")
+
     holder = session(db, "fix-holder", "coder", "claude", "anthropic")
     recon = session(db, "recon-holder", "recon", "codex", "openai")
     Roles.create!(db, "recon", "flynn", recon.session_key)
