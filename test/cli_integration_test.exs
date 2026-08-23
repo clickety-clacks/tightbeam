@@ -30,12 +30,26 @@ defmodule Tightbeam.CliIntegrationTest do
 
   alias Tightbeam.Wire.Router
 
-  setup do
-    binary = Path.expand("../cli/target/release/tightbeam", __DIR__)
+  setup_all do
+    cli_dir = Path.expand("../cli", __DIR__)
+    binary = Path.join(cli_dir, "target/release/tightbeam")
+
+    if cargo = System.find_executable("cargo") do
+      {output, status} =
+        System.cmd(cargo, ["build", "--release"], cd: cli_dir, stderr_to_stdout: true)
+
+      if status != 0, do: raise("release CLI build failed:\n#{output}")
+    end
 
     unless File.exists?(binary) do
       raise "CLI integration binary missing: #{binary}; run cargo build --release in cli/"
     end
+
+    :ok
+  end
+
+  setup do
+    binary = Path.expand("../cli/target/release/tightbeam", __DIR__)
 
     db = :"cli_integration_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
@@ -1169,6 +1183,47 @@ defmodule Tightbeam.CliIntegrationTest do
 
     assert history =~ request_id
     assert history =~ reason
+  end
+
+  test "real CLI retrieves open decisions through the configured client gateway path", ctx do
+    request_id = "dr_configured-client_#{System.unique_integer([:positive])}"
+    now = System.system_time(:millisecond)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO decision_requests
+          (id, raiserId, ownerUserId, raisedAt, deadlineAt, statuteName, actionKey,
+           question, context, status)
+        VALUES (?1, 'process:tightbeam', 'flynn', ?2, ?3,
+                'configured-client-retrieval', ?4, 'Continue?', '{}', 'open')
+        """,
+        [request_id, now, now + 60_000, request_id]
+      )
+
+    {requests, 0} =
+      System.cmd(
+        ctx.binary,
+        ["decision-requests", "--status", "open", "--as-user", "flynn"],
+        cd: ctx.outside,
+        stderr_to_stdout: true,
+        env: [
+          {"TIGHTBEAM_URL", "ws://127.0.0.1:#{ctx.port}"},
+          {"TIGHTBEAM_TOKEN", ctx.session.cli_token},
+          {"TIGHTBEAM_BASE_DIR", nil},
+          {"TIGHTBEAM_HOME", nil}
+        ]
+      )
+
+    assert requests =~ request_id
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "decision-requests",
+                      principal: {:user, "flynn"},
+                      params: %{status: "open"}
+                    }}
   end
 
   test "real CLI creates and gets work items and enforces spec-ref pairing", ctx do
