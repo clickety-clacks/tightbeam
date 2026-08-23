@@ -6,6 +6,8 @@ mod ceremonies;
 mod child_process;
 mod contain;
 mod dispatch;
+#[allow(dead_code)]
+mod fleet_proof;
 mod harness_process;
 mod harnesses;
 mod lease;
