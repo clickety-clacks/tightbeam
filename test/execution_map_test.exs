@@ -76,6 +76,8 @@ defmodule Tightbeam.ExecutionMapTest do
         "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn',0,1),('kay',0,1),('root',1,1)"
       )
 
+    Enum.each(~w(flynn kay root), &ensure_main_session(db, &1))
+
     # The epoch is stamped once at table creation, so a test that needs a known
     # cutoff moves the single row rather than pretending to control the clock.
     :ok = DB.execute(db, "UPDATE causal_events_epoch SET at = #{@cutoff} WHERE id = 0")
