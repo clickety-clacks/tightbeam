@@ -14,6 +14,7 @@ defmodule Tightbeam.Assignments do
     Org,
     Placement,
     Projection,
+    Productions.CompletionEscalation,
     Supervision,
     Wakes
   }
@@ -1614,6 +1615,12 @@ defmodule Tightbeam.Assignments do
           )
         end)
 
+        CompletionEscalation.supersede_open_for_assignment_in_txn(
+          txn,
+          call.session_key,
+          id
+        )
+
         supervision_transition!(txn, :armed, %{
           kind: "assignment_open",
           assignment_id: id,
@@ -1770,6 +1777,11 @@ defmodule Tightbeam.Assignments do
 
                 if Txn.changes(txn) != 1, do: raise(TransitionRace)
                 closed_assignment = fetch_assignment!(txn, assignment_id)
+
+                if call.params.kind == "completion" do
+                  CompletionEscalation.open_in_txn(txn, closed_assignment, attest)
+                end
+
                 Tightbeam.WorkItems.arm_slate_in_txn(txn, closed_assignment.workItemId)
 
                 liveness_trigger =

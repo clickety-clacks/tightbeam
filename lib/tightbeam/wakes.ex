@@ -628,14 +628,16 @@ defmodule Tightbeam.Wakes do
   defp retarget_delivery(source, _created_at), do: {source.delivery_rule, source.due_at}
 
   @requester_kinds ~w(user session process)
-  @reason_kinds ~w(requester_withdrew superseded obligation_disposed routing_bracket_satisfied target_retired production_unmatched consumer_unavailable target_unresolvable)
-  @source_kinds ~w(verb_call wake progress_attest condition_fact assignment_transition work_item_transition decision_request monitor_generation routing_bracket session_transition scheduler_delivery)
-  @disposition_kinds ~w(assignment_transition work_item_transition decision_request_transition monitor_generation_transition)
+  @reason_kinds ~w(requester_withdrew superseded obligation_disposed routing_bracket_satisfied target_retired production_unmatched consumer_unavailable target_unresolvable completion_generation_replaced completion_request_disposed completion_delivery_ineligible)
+  @source_kinds ~w(verb_call wake progress_attest condition_fact assignment_transition work_item_transition decision_request monitor_generation routing_bracket session_transition scheduler_delivery lifecycle_event)
+  @disposition_kinds ~w(assignment_transition work_item_transition decision_request_transition monitor_generation_transition completion_transition)
   @liveness_kinds ~w(supervision_entitlement supervision_transfer pending_wake routing_bracket)
 
   @process_reasons %{
     "tightbeam:wake-scheduler" =>
-      ~w(production_unmatched consumer_unavailable target_unresolvable),
+      ~w(production_unmatched consumer_unavailable target_unresolvable completion_delivery_ineligible),
+    "tightbeam:completion-escalation" =>
+      ~w(completion_generation_replaced completion_request_disposed),
     "tightbeam:work-items" => ~w(routing_bracket_satisfied),
     "tightbeam:assignments" => ~w(obligation_disposed),
     "tightbeam:effort-checkin" => ~w(superseded obligation_disposed),
@@ -661,7 +663,10 @@ defmodule Tightbeam.Wakes do
     "target_retired" => {~w(session_transition), ~w(replacement no_replacement)},
     "production_unmatched" => {~w(condition_fact), ~w(no_replacement)},
     "consumer_unavailable" => {~w(scheduler_delivery), ~w(no_replacement)},
-    "target_unresolvable" => {~w(scheduler_delivery), ~w(no_replacement)}
+    "target_unresolvable" => {~w(scheduler_delivery), ~w(no_replacement)},
+    "completion_generation_replaced" => {~w(lifecycle_event), ~w(replacement no_replacement)},
+    "completion_request_disposed" => {~w(lifecycle_event), ~w(disposition)},
+    "completion_delivery_ineligible" => {~w(scheduler_delivery), ~w(no_replacement)}
   }
 
   @doc """
@@ -933,6 +938,17 @@ defmodule Tightbeam.Wakes do
            do: :ok,
            else: :error
 
+      reason == "completion_delivery_ineligible" ->
+        if requester_id == "tightbeam:wake-scheduler" and source == "scheduler_delivery" and
+             outcome == "no_replacement",
+           do: :ok,
+           else: :error
+
+      reason in ["completion_generation_replaced", "completion_request_disposed"] ->
+        if requester_id == "tightbeam:completion-escalation" and source == "lifecycle_event",
+          do: :ok,
+          else: :error
+
       reason == "superseded" and outcome == "no_replacement" ->
         :error
 
@@ -945,9 +961,56 @@ defmodule Tightbeam.Wakes do
     do: row_exists(txn, "SELECT 1 FROM wakes WHERE wakeId=?1", source_id)
 
   defp validate_source(txn, "scheduler_delivery", source_id, wake) do
-    if source_id == wake.wake_id,
-      do: row_exists(txn, "SELECT 1 FROM wakes WHERE wakeId=?1", source_id),
-      else: :error
+    if source_id == wake.wake_id do
+      case Txn.q(
+             txn,
+             """
+             SELECT 1
+             FROM wakes w
+             LEFT JOIN completion_escalation_wakes cew ON cew.wakeId=w.wakeId
+             WHERE w.wakeId=?1
+               AND (
+                 cew.wakeId IS NULL OR
+                 (cew.kind='notice' AND EXISTS (
+                   SELECT 1 FROM completion_escalations ce
+                   WHERE ce.id=cew.completionId
+                 ))
+               )
+             """,
+             [source_id]
+           ) do
+        [[1]] -> :ok
+        _ -> :error
+      end
+    else
+      :error
+    end
+  end
+
+  defp validate_source(txn, "lifecycle_event", source_id, wake) do
+    case Txn.q(
+           txn,
+           """
+           SELECT le.kind, cew.kind, ce.currentNoticeWakeId, ce.deadlineWakeId
+           FROM lifecycle_events le
+           JOIN completion_escalations ce ON ce.id=le.subject
+           JOIN completion_escalation_wakes cew
+             ON cew.completionId=ce.id AND cew.wakeId=?2
+           WHERE CAST(le.id AS TEXT)=?1
+           """,
+           [source_id, wake.wake_id]
+         ) do
+      [[kind, _wake_kind, current_notice, deadline]]
+      when kind in [
+             "completion_escalation_reissued",
+             "completion_escalation_superseded",
+             "completion_escalation_acknowledged"
+           ] and wake.wake_id in [current_notice, deadline] ->
+        :ok
+
+      _ ->
+        :error
+    end
   end
 
   defp validate_source(txn, "progress_attest", source_id, wake) do
@@ -999,6 +1062,7 @@ defmodule Tightbeam.Wakes do
     with true <- primary.impact != "linked_work_not_open",
          true <- is_binary(replacement_id) and replacement_id != wake.wake_id,
          :ok <- replacement_matches(txn, replacement_id, primary, requester_id),
+         :ok <- completion_replacement_matches(txn, requester_id, wake.wake_id, replacement_id),
          true <- is_nil(Map.get(outcome, :disposition_kind)),
          true <- is_nil(Map.get(outcome, :disposition_id)),
          true <- is_nil(Map.get(outcome, :liveness_trigger)) do
@@ -1053,6 +1117,30 @@ defmodule Tightbeam.Wakes do
       _ -> :error
     end
   end
+
+  defp completion_replacement_matches(
+         txn,
+         "tightbeam:completion-escalation",
+         source_wake_id,
+         replacement_wake_id
+       ) do
+    case Txn.q(
+           txn,
+           """
+           SELECT 1
+           FROM completion_escalation_wakes old
+           JOIN completion_escalation_wakes new ON new.completionId=old.completionId
+           WHERE old.wakeId=?1 AND new.wakeId=?2
+             AND new.generation=old.generation+1 AND new.kind='notice'
+           """,
+           [source_wake_id, replacement_wake_id]
+         ) do
+      [[1]] -> :ok
+      _ -> :error
+    end
+  end
+
+  defp completion_replacement_matches(_txn, _requester_id, _source, _replacement), do: :ok
 
   defp validate_required_liveness(_txn, outcome, _wake, %{impact: impact})
        when impact != "linked_work_open" do
@@ -1152,6 +1240,19 @@ defmodule Tightbeam.Wakes do
 
   defp validate_disposition(txn, "monitor_generation_transition", id),
     do: generation_exists(txn, id)
+
+  defp validate_disposition(txn, "completion_transition", id),
+    do:
+      row_exists(
+        txn,
+        """
+        SELECT 1 FROM lifecycle_events le
+        JOIN completion_escalations ce ON ce.id=le.subject
+        WHERE CAST(le.id AS TEXT)=?1
+          AND le.kind IN ('completion_escalation_superseded','completion_escalation_acknowledged')
+        """,
+        id
+      )
 
   defp validate_liveness(txn, "supervision_entitlement", id, wake, primary) do
     with {:ok, assignment_id, generation} <- split_generation(id),
@@ -2393,6 +2494,24 @@ defmodule Tightbeam.Wakes do
       :ok
     end)
   end
+
+  @doc "Fire one pending internal wake through the wake-owned compare-and-set seam."
+  @spec fire_internal_in_txn(Txn.t(), String.t(), String.t(), non_neg_integer()) :: boolean()
+  def fire_internal_in_txn(%Txn{} = txn, wake_id, consumer, fired_at)
+      when is_binary(wake_id) and is_binary(consumer) and is_integer(fired_at) and fired_at >= 0 do
+    Txn.q(
+      txn,
+      """
+      UPDATE wakes SET state='fired', firedAt=?3, firedBy='internal'
+      WHERE wakeId=?1 AND consumer=?2 AND state='pending'
+      """,
+      [wake_id, consumer, fired_at]
+    )
+
+    Txn.changes(txn) == 1
+  end
+
+  def fire_internal_in_txn(%Txn{}, _wake_id, _consumer, _fired_at), do: false
 
   defp evaluate_conditions(%{db: db, batch: batch}, mode) do
     {rows, watermark} = select_candidates(db, batch, mode)
