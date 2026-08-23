@@ -8,15 +8,6 @@ defmodule Tightbeam.StateResources do
 
   @secret_keys MapSet.new(["cliToken", "token", "identityToken"])
 
-  defmodule RawJSON do
-    @moduledoc false
-    defstruct [:bytes]
-
-    defimpl JSON.Encoder do
-      def encode(%{bytes: bytes}, _encoder), do: bytes
-    end
-  end
-
   @turn_select """
   SELECT t.seq, t.sessionKey, t.messageId, t.wakeId, t.origin, t.roleRef,
          t.roleFallback, t.assignmentId, t.jobRef, t.model, t.thinkingLevel,
