@@ -101,6 +101,15 @@ impl Snapshot {
 /// `sigkill_delivery_unconfirmed` — a kill_failed row, and a fence on the adapter key —
 /// over a process table. Giving up SAYS SO and lets the floor degrade to the recorded
 /// group, which is what it signalled before this walk existed.
+///
+/// `proc_listallpids` answers in PIDS, not bytes. It is a wrapper over `proc_listpids`,
+/// which answers in bytes, and it has already divided by `sizeof(int)` before it returns.
+/// Dividing again is the defect review caught at 9e8245c: it kept the first quarter of the
+/// table (1635 pids read, 408 kept) and dropped the rest. That failure is invisible to any
+/// test that spawns its own tree, because a newly forked process is at the FRONT of the
+/// list and survives the truncation — the leak only appears for a harness whose group has
+/// since been pushed past the cut by newer processes. `the_live_process_table_reaches_the_oldest_process`
+/// is the assertion that now fails instead of passing quietly.
 #[cfg(target_os = "macos")]
 fn list_all_pids() -> Result<Vec<i32>, String> {
     let mut capacity = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
@@ -113,20 +122,20 @@ fn list_all_pids() -> Result<Vec<i32>, String> {
 
     for _ in 0..8 {
         let mut pids = vec![0i32; capacity as usize + 64];
-        let bytes = unsafe {
+        let listed = unsafe {
             libc::proc_listallpids(
                 pids.as_mut_ptr().cast(),
                 (pids.len() * size_of::<i32>()) as libc::c_int,
             )
         };
-        if bytes <= 0 {
+        if listed <= 0 {
             return Err(format!(
                 "process table unavailable: {}",
                 std::io::Error::last_os_error()
             ));
         }
 
-        let listed = bytes as usize / size_of::<i32>();
+        let listed = listed as usize;
         if listed < pids.len() {
             pids.truncate(listed);
             return Ok(pids);
@@ -347,5 +356,74 @@ mod tests {
 
         assert_eq!(mine.ppid, unsafe { libc::getppid() });
         assert_eq!(mine.pgid, unsafe { libc::getpgrp() });
+    }
+
+    /// The table must reach the OLDEST process, not merely the newest ones.
+    ///
+    /// This is the assertion that was missing at 9e8245c, and its absence is why a real
+    /// truncation bug shipped through a green suite. `list_all_pids` divided
+    /// `proc_listallpids`' answer by `sizeof(int)` — but that function already divides, so
+    /// only the first quarter of the table survived. Every test in this file spawned its own
+    /// processes and then looked for them, and `proc_listallpids` answers NEWEST FIRST
+    /// (MEASURED on this host: 1618 pids, pid 1 at index 1616), so a freshly forked process
+    /// is at the very front and rides out any truncation. The suite was green and the floor
+    /// leaked an aged harness tree, which is exactly what review reproduced.
+    ///
+    /// launchd is the fixed point that cannot be gamed: always pid 1, always the oldest, and
+    /// therefore always the LAST thing a truncated read would keep.
+    ///
+    /// Asserted against the raw pid list rather than a `Snapshot`, because `proc_pidinfo`
+    /// refuses root-owned processes for a non-root caller and pid 1 is root — see
+    /// `a_snapshot_holds_the_processes_it_could_read`.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn the_live_process_table_reaches_the_oldest_process() {
+        let pids = list_all_pids().expect("the process table must be listable");
+
+        assert!(
+            pids.contains(&1),
+            "the listing stopped before launchd: {} pids, ending {:?} — the table is \
+             truncated and an aged harness tree would be invisible to the floor",
+            pids.len(),
+            &pids[pids.len().saturating_sub(3)..]
+        );
+
+        // The magnitude, alongside the mechanism above: a quartered table is the specific
+        // shape of the shipped defect, and halving is comfortably inside a real reading's
+        // drift between the sizing call and the fetch.
+        let quoted = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+        assert!(
+            pids.len() as i32 >= quoted / 2,
+            "the kernel quoted {quoted} pids and the listing kept {} — most of the table \
+             was dropped",
+            pids.len()
+        );
+    }
+
+    /// What a snapshot can and cannot see, stated so it is not mistaken for completeness.
+    ///
+    /// `proc_pidinfo(PROC_PIDTBSDINFO)` refuses processes this user does not own, so a
+    /// snapshot is the readable subset of the listing, not the whole table (MEASURED here:
+    /// 1618 listed, 1246 readable). That is the right subset for this floor — a harness and
+    /// its descendants run as the user that launched them — but it does mean a root-owned
+    /// process cannot be walked THROUGH, so a descendant behind a `sudo` would be invisible.
+    /// Named rather than fixed: reading the whole table means running the floor as root.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_snapshot_holds_the_processes_it_could_read() {
+        let listed = list_all_pids().expect("the process table must be listable");
+        let snapshot = Snapshot::capture().expect("the process table must be readable");
+
+        assert!(
+            snapshot.processes.len() <= listed.len(),
+            "a snapshot cannot hold more processes than were listed"
+        );
+        assert!(
+            snapshot.processes.len() * 2 >= listed.len(),
+            "only {} of {} listed processes were readable — too few for the walk to be \
+             trusted; proc_pidinfo may be failing for a reason other than ownership",
+            snapshot.processes.len(),
+            listed.len()
+        );
     }
 }
