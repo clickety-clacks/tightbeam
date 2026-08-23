@@ -25,6 +25,13 @@ defmodule Tightbeam.CursorRegistrationTest do
            }
   end
 
+  test "Cursor maps its public auto ref onto the opaque ACP value" do
+    config = Cursor.session_config(%{}, "guidance")
+
+    assert config.effort_config == nil
+    assert config.model_option_aliases == %{"auto-smart[optimize_for=balanced]" => "auto"}
+  end
+
   test "Cursor refuses every unsupported credential before launch planning" do
     target = cursor_target()
 
