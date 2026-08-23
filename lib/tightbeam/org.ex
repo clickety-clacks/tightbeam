@@ -333,11 +333,9 @@ defmodule Tightbeam.Org do
     spawned_by = Map.get(input, :spawned_by)
 
     operational_parent =
-      Map.get(input, :operational_parent) ||
-        if(Map.get(input, :kind, "custom") == "main",
-          do: session_key,
-          else: spawned_by || personal_session_key(owner_user_id)
-        )
+      if Map.get(input, :kind, "custom") == "main",
+        do: session_key,
+        else: spawned_by || personal_session_key(owner_user_id)
 
     Txn.q(
       txn,
