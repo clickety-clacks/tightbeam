@@ -95,6 +95,17 @@ defmodule Tightbeam.GatewayTest do
     end
   end
 
+  defmodule ConditionSchedulerStub do
+    use GenServer
+    def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
+    def init(parent), do: {:ok, parent}
+
+    def handle_call({:fire_matching, fact_id}, _from, parent) do
+      send(parent, {:fire_matching, fact_id})
+      {:reply, :ok, parent}
+    end
+  end
+
   defmodule CoordinatorStub do
     use GenServer
 
@@ -782,6 +793,60 @@ defmodule Tightbeam.GatewayTest do
                ctx.db,
                "SELECT sessionKey, reason FROM assignment_interruptions WHERE assignmentId='asg_retire'"
              )
+  end
+
+  test "retire follows the operational subtree, not spawn provenance", ctx do
+    ensure_global_registry()
+    root = create_session(ctx.db, "operational-root", "flynn")
+    provenance_child = create_session(ctx.db, "provenance-child", "flynn", root.session_key)
+    operational_child = create_session(ctx.db, "operational-child", "flynn", ctx.main_key)
+
+    Org.set_operational_parent(ctx.db, provenance_child.session_key, ctx.main_key)
+    Org.set_operational_parent(ctx.db, operational_child.session_key, root.session_key)
+
+    result =
+      Gateway.handlers(%{db: ctx.db, wake_tick_ms: 1_000})["retire"].(%{
+        origin: "user:flynn",
+        session_key: root.session_key,
+        params: %{}
+      })
+
+    assert result.retired_session_keys == [operational_child.session_key, root.session_key]
+    assert Org.get(ctx.db, provenance_child.session_key).state == "active"
+    assert Org.get(ctx.db, operational_child.session_key).spawned_by == ctx.main_key
+  end
+
+  test "work-block authority follows operational parents, not spawn provenance", ctx do
+    spawn_parent = create_session(ctx.db, "block-spawn-parent", "flynn")
+    operational_parent = create_session(ctx.db, "block-operational-parent", "flynn")
+    child = create_session(ctx.db, "block-child", "flynn", spawn_parent.session_key)
+    child = Org.set_operational_parent(ctx.db, child.session_key, operational_parent.session_key)
+    scheduler = start_supervised!({ConditionSchedulerStub, self()})
+    condition = Gateway.handlers(%{db: ctx.db, wake_scheduler: scheduler})["condition"]
+
+    call = %{
+      params: %{kind: "work-blocked", scope: child.session_key}
+    }
+
+    assert %{code: "not_authorized"} =
+             condition.(
+               Map.merge(call, %{
+                 origin: "agent:block-spawn-parent",
+                 principal: {:session, spawn_parent.session_key}
+               })
+             )
+
+    assert %{kind: "work-blocked", scope: scope, fact_id: fact_id} =
+             condition.(
+               Map.merge(call, %{
+                 origin: "agent:block-operational-parent",
+                 principal: {:session, operational_parent.session_key}
+               })
+             )
+
+    assert scope == child.session_key
+    assert_receive {:fire_matching, ^fact_id}
+    assert child.spawned_by == spawn_parent.session_key
   end
 
   test "retiring the last live session closes its harness session and shared adapter", ctx do

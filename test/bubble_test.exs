@@ -47,6 +47,7 @@ defmodule Tightbeam.Productions.BubbleTest do
       Org.create(db, %{
         session_key: key,
         display_name: key,
+        kind: if(built_in?, do: "main", else: "custom"),
         owner_user_id: "flynn",
         origin: "user:flynn",
         archetype: "default",
@@ -104,6 +105,27 @@ defmodule Tightbeam.Productions.BubbleTest do
     # deterministic wakeId absorbs it. One notice, not two.
     :ok = Bubble.recognize_terminal(ctx.db, seq)
     assert [_] = notice_turn(ctx.db, "supervisor")
+  end
+
+  test "a failed turn bubbles to the operational parent, not the spawning session", ctx do
+    operational_supervisor = session(ctx.db, "operational-supervisor", ctx.main.session_key)
+
+    holder =
+      Org.set_operational_parent(
+        ctx.db,
+        ctx.holder.session_key,
+        operational_supervisor.session_key
+      )
+
+    seq = fail_turn!(ctx.db, holder.session_key)
+    :ok = Bubble.recognize_terminal(ctx.db, seq)
+
+    assert holder.spawned_by == ctx.supervisor.session_key
+
+    assert [[_, "bubble:" <> _, _, _, _]] =
+             notice_turn(ctx.db, operational_supervisor.session_key)
+
+    assert notice_turn(ctx.db, ctx.supervisor.session_key) == []
   end
 
   test "a canceled cause turn never bubbles — cancellation is a decision", ctx do
