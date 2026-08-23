@@ -1246,16 +1246,9 @@ defmodule Tightbeam.Acp.Adapter do
   defp apply_model_to_session(state, sid, %Model{} = model_ref, request) do
     effort = model_ref.effort
 
-    with {:ok, base_result} <-
-           map_model_refusal(
-             request.("session/set_config_option", %{
-               sessionId: sid,
-               configId: "model",
-               value: Model.to_ref(model_ref)
-             })
-           ),
+    with {:ok, base_result} <- apply_model_value(state, sid, model_ref, request),
          {:ok, effort_result} <-
-           (if effort do
+           (if effort && state.preset.effort_config do
               request.("session/set_config_option", %{
                 sessionId: sid,
                 configId: state.preset.effort_config,
@@ -1269,6 +1262,39 @@ defmodule Tightbeam.Acp.Adapter do
         :error -> {:ok, model_ref}
       end
     end
+  end
+
+  defp apply_model_value(state, sid, %Model{} = model_ref, request) do
+    canonical = Model.to_ref(model_ref)
+
+    aliases =
+      state.preset.model_option_aliases
+      |> Enum.filter(fn {_wire, public} -> public == canonical end)
+      |> Enum.map(&elem(&1, 0))
+
+    Enum.reduce_while([canonical | aliases], {:error, :model_unavailable}, fn value, _acc ->
+      result =
+        map_model_refusal(
+          request.("session/set_config_option", %{
+            sessionId: sid,
+            configId: "model",
+            value: value
+          })
+        )
+
+      case result do
+        {:ok, response} ->
+          if read_back?(response, "model", value),
+            do: {:halt, {:ok, response}},
+            else: {:halt, {:error, :model_verification_failed}}
+
+        {:error, :model_unavailable} ->
+          {:cont, {:error, :model_unavailable}}
+
+        {:error, _reason} = error ->
+          {:halt, error}
+      end
+    end)
   end
 
   # The adapter's own refusal of a model value — JSON-RPC -32602 Invalid params,
@@ -1289,7 +1315,7 @@ defmodule Tightbeam.Acp.Adapter do
     case map_model_refusal(strict_model_request(state, sid, "model", model, deadline)) do
       {:ok, base_result} ->
         effort_result =
-          if effort do
+          if effort && state.preset.effort_config do
             strict_model_request(
               state,
               sid,

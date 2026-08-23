@@ -131,9 +131,14 @@ defmodule Tightbeam.Harness.Cursor do
       guidance: guidance,
       meta: %{instructions: guidance},
       permission_mode: "full",
-      effort_config: "effort",
+      # Cursor folds its tuning into the opaque ACP model value. It exposes no
+      # separate effort config option, unlike Claude/Codex.
+      effort_config: nil,
       resident_model_switch: :in_place,
-      model_option_aliases: %{},
+      # `cursor-agent --list-models` publishes `auto`, while ACP exposes this
+      # exact value. Tightbeam keeps the stable public ref and translates only
+      # at the adapter boundary, with config readback verification.
+      model_option_aliases: %{"auto-smart[optimize_for=balanced]" => "auto"},
       canonical_model_prefixes: []
     }
   end
