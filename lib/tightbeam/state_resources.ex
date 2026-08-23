@@ -478,7 +478,8 @@ defmodule Tightbeam.StateResources do
 
     encoded =
       Enum.map_join(fields, ",", fn field ->
-        JSON.encode!(field) <> ":" <> JSON.encode!(Map.fetch!(item, field))
+        JSON.encode!(field) <>
+          ":" <> encode_admin_field(resource, field, Map.fetch!(item, field))
       end)
 
     "{" <> encoded <> "}"
@@ -633,14 +634,34 @@ defmodule Tightbeam.StateResources do
   end
 
   defp sorted_string_map!(value) when is_map(value) do
+    value |> sorted_string_pairs!() |> Map.new()
+  end
+
+  defp sorted_string_map!(_value),
+    do: raise(ArgumentError, "sessionRevisions must be a string-to-string map")
+
+  defp encode_admin_field("identity", "sessionRevisions", value) do
+    encoded =
+      value
+      |> sorted_string_pairs!()
+      |> Enum.map_join(",", fn {key, item} ->
+        JSON.encode!(key) <> ":" <> JSON.encode!(item)
+      end)
+
+    "{" <> encoded <> "}"
+  end
+
+  defp encode_admin_field(_resource, _field, value), do: JSON.encode!(value)
+
+  defp sorted_string_pairs!(value) when is_map(value) do
     if Enum.all?(value, fn {key, item} -> is_binary(key) and is_binary(item) end) do
-      value |> Enum.sort_by(&elem(&1, 0)) |> Map.new()
+      Enum.sort_by(value, &elem(&1, 0))
     else
       raise ArgumentError, "sessionRevisions must be a string-to-string map"
     end
   end
 
-  defp sorted_string_map!(_value),
+  defp sorted_string_pairs!(_value),
     do: raise(ArgumentError, "sessionRevisions must be a string-to-string map")
 
   defp state_name(:ready), do: "ready"

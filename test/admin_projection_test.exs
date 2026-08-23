@@ -221,6 +221,42 @@ defmodule Tightbeam.AdminProjectionTest do
     end)
   end
 
+  test "identity sessionRevisions use Unicode key order above the BEAM map threshold" do
+    numbered_keys =
+      Enum.map(1..40, &"session-#{String.pad_leading(Integer.to_string(&1), 2, "0")}")
+
+    ordered_keys = ["alpha" | numbered_keys] ++ ["éclair", "Ωmega", "😀"]
+
+    session_revisions =
+      ordered_keys
+      |> Enum.reverse()
+      |> Map.new(fn key -> {key, "revision-for-#{key}"} end)
+
+    raw = %{
+      name: "served",
+      live_revision: "live-revision",
+      state: "ready",
+      session_revisions: session_revisions,
+      staleness: [],
+      conflicts: [],
+      row_version: 1
+    }
+
+    expected_map_bytes =
+      "{" <>
+        Enum.map_join(ordered_keys, ",", fn key ->
+          JSON.encode!(key) <> ":" <> JSON.encode!(Map.fetch!(session_revisions, key))
+        end) <> "}"
+
+    item = StateResources.identity(raw)
+    item_bytes = StateResources.encode_admin_item("identity", item)
+    notice = Publisher.committed_notice("identity.updated", raw, %{"name" => "served"})
+    wire_bytes = Publisher.encode_wire_notice(notice)
+
+    assert item_bytes =~ ~s("sessionRevisions":#{expected_map_bytes})
+    assert wire_bytes =~ ~s("payload":#{item_bytes})
+  end
+
   test "DB-backed resources allocate only for material commits and retain absent markers", ctx do
     handlers = Tightbeam.Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})
 
