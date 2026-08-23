@@ -840,6 +840,7 @@ defmodule Tightbeam.Identity do
   defp public_kungfu_documents(dir, base_dir, name) do
     allowed = MapSet.new(~w(README.md capabilities.md preferred-models.md))
     root = Path.join(["kungfu", name])
+    banked_secret_values = banked_secret_values(base_dir)
 
     git_output!(dir, ["ls-tree", "-r", @live, "--", root])
     |> String.split("\n", trim: true)
@@ -851,7 +852,10 @@ defmodule Tightbeam.Identity do
           if Path.dirname(relative) == "." and MapSet.member?(allowed, relative) and
                Regex.match?(~r/^[A-Za-z0-9][A-Za-z0-9._\/-]*$/, relative) and
                ".." not in Path.split(relative) do
-            content = dir |> git_show!(@live, path) |> sanitize_public_document(base_dir)
+            content =
+              dir
+              |> git_show!(@live, path)
+              |> sanitize_public_document(base_dir, banked_secret_values)
 
             [
               %{
@@ -871,8 +875,9 @@ defmodule Tightbeam.Identity do
     |> Enum.sort_by(& &1["path"])
   end
 
-  defp sanitize_public_document(content, base_dir) do
+  defp sanitize_public_document(content, base_dir, banked_secret_values) do
     content
+    |> replace_banked_secret_values(banked_secret_values)
     |> replace_literal_path(base_dir)
     |> String.replace(
       ~r/-----BEGIN [^-\r\n]*PRIVATE KEY-----.*?-----END [^-\r\n]*PRIVATE KEY-----/s,
@@ -894,6 +899,66 @@ defmodule Tightbeam.Identity do
   end
 
   defp replace_literal_path(content, _base_dir), do: content
+
+  defp banked_secret_values(base_dir) do
+    auth_dir = Path.join(base_dir, "auth")
+
+    case File.lstat(auth_dir) do
+      {:ok, %File.Stat{type: :directory}} ->
+        auth_dir
+        |> regular_files_beneath!()
+        |> Enum.flat_map(fn path ->
+          bytes = File.read!(path)
+
+          if bytes != "" and String.valid?(bytes) do
+            [bytes, String.trim(bytes)]
+          else
+            []
+          end
+        end)
+        |> Enum.reject(&(&1 == ""))
+        |> Enum.uniq()
+        |> Enum.sort_by(&byte_size/1, :desc)
+
+      {:error, :enoent} ->
+        []
+
+      {:ok, %File.Stat{type: type}} ->
+        raise ArgumentError, "credential bank must be a directory, found #{type}"
+
+      {:error, reason} ->
+        raise File.Error, action: "read credential bank", path: auth_dir, reason: reason
+    end
+  end
+
+  defp regular_files_beneath!(dir) do
+    dir
+    |> File.ls!()
+    |> Enum.sort()
+    |> Enum.flat_map(fn entry ->
+      path = Path.join(dir, entry)
+
+      case File.lstat(path) do
+        {:ok, %File.Stat{type: :directory}} ->
+          regular_files_beneath!(path)
+
+        {:ok, %File.Stat{type: :regular}} ->
+          [path]
+
+        {:ok, %File.Stat{}} ->
+          []
+
+        {:error, reason} ->
+          raise File.Error, action: "inspect credential bank", path: path, reason: reason
+      end
+    end)
+  end
+
+  defp replace_banked_secret_values(content, banked_secret_values) do
+    Enum.reduce(banked_secret_values, content, fn value, sanitized ->
+      String.replace(sanitized, value, "[redacted-secret]")
+    end)
+  end
 
   defp validate_public_kungfu_name!(name) do
     unless is_binary(name) and Regex.match?(~r/^[A-Za-z0-9][A-Za-z0-9_-]*$/, name) do

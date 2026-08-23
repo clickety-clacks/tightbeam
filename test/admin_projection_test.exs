@@ -4,6 +4,7 @@ defmodule Tightbeam.AdminProjectionTest do
   alias Tightbeam.{
     AdminProjection,
     Archetypes,
+    Credentials,
     DB,
     Devices,
     Harness,
@@ -729,11 +730,15 @@ defmodule Tightbeam.AdminProjectionTest do
       """
     )
 
+    banked_secret = "opaque-bank-value-7f4d3c2b1a998877"
+    :ok = Credentials.store_harvested(ctx.base_dir, :fixture_provider, banked_secret)
+
     secret_content = """
     token = tbs_1234567890abcdef
     authorization: Bearer credential-value-12345678
     password = credential-password-12345678
     api_key: sk-1234567890abcdef
+    The banked value appears verbatim: #{banked_secret}
     -----BEGIN OPENSSH PRIVATE KEY-----
     private-material
     -----END OPENSSH PRIVATE KEY-----
@@ -781,6 +786,7 @@ defmodule Tightbeam.AdminProjectionTest do
     refute encoded =~ "1234567890abcdef"
     refute encoded =~ "credential-value"
     refute encoded =~ "credential-password"
+    refute encoded =~ banked_secret
     refute encoded =~ "private-material"
     refute encoded =~ ctx.base_dir
     refute encoded =~ "/home/alice"
@@ -788,6 +794,20 @@ defmodule Tightbeam.AdminProjectionTest do
     refute encoded =~ "hidden-secret"
     assert encoded =~ "[redacted-secret]"
     assert encoded =~ "[redacted-host-path]"
+
+    raw_item = Map.put(item, "rowVersion", 1)
+    shared_item = StateResources.kungfu(raw_item)
+    shared_bytes = StateResources.encode_admin_item("kungfu", shared_item)
+
+    notice =
+      Publisher.committed_notice("kungfu.updated", raw_item, %{
+        "name" => "agentic-engineering"
+      })
+
+    wire_bytes = Publisher.encode_wire_notice(notice)
+    assert wire_bytes =~ ~s("payload":#{shared_bytes})
+    refute shared_bytes =~ banked_secret
+    refute wire_bytes =~ banked_secret
 
     assert_raise ArgumentError, ~r/invalid kungfu name/, fn ->
       Identity.public_kungfu(ctx.base_dir, "../agentic-engineering")
