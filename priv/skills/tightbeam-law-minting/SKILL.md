@@ -97,8 +97,8 @@ the probe cannot reach the subject.
 
 ## 7. Escalation ceiling
 
-Route exhausted work to Relief stall patrol for adjudication. Never route it to
-Mike unless Mike's own standing law requires that escalation.
+Route exhausted work to the nurse/patrol for adjudication against its casebook.
+Never route it to the human except by the human's own standing law.
 
 **Prevents:** using the human operator as a control loop.
 
