@@ -290,6 +290,11 @@ defmodule Tightbeam.Acp.AdapterTest do
           // catalog advertised (`gpt-5.1-codex`) — JSON-RPC -32602 Invalid params.
           return send({ id: m.id, error: { code: -32602, message: "Invalid params" } });
         }
+        if (failMode === "cursor-auto-alias" &&
+            m.params.configId === "model" &&
+            m.params.value === "auto") {
+          return send({ id: m.id, error: { code: -32602, message: "Invalid params" } });
+        }
         if (failMode === "fast-refusal" && m.params.configId === "fast") {
           return send({ id: m.id, error: { code: -32000, message: "fast refused" } });
         }
@@ -1224,6 +1229,33 @@ defmodule Tightbeam.Acp.AdapterTest do
              )
 
     refute Adapter.knows_session?(adapter, "sess-1")
+  end
+
+  test "Cursor retries its verified ACP alias and does not send a separate effort option" do
+    {adapter, capture} = start_adapter(harness: :cursor, fail_mode: "cursor-auto-alias")
+
+    assert {:ok, "sess-1"} =
+             Adapter.new_session(
+               adapter,
+               Model.new("auto", effort: "medium"),
+               "/tmp",
+               [],
+               "guidance"
+             )
+
+    requests = captured_requests(capture)
+
+    assert ["auto", "auto-smart[optimize_for=balanced]"] ==
+             requests
+             |> Enum.filter(
+               &(&1["method"] == "session/set_config_option" and &1["configId"] == "model")
+             )
+             |> Enum.map(& &1["value"])
+
+    refute Enum.any?(
+             requests,
+             &(&1["method"] == "session/set_config_option" and &1["configId"] == "effort")
+           )
   end
 
   test "a rejected candidate reports verified teardown" do
