@@ -4,7 +4,7 @@ defmodule Tightbeam.Wire.ChangeSocket do
   @behaviour WebSock
 
   alias Tightbeam.Devices
-  alias Tightbeam.Firehose.Hub
+  alias Tightbeam.Firehose.{Hub, Publisher}
 
   @max_subscriptions 100
   @filter_keys ~w(classes sessionKey workItemId origin principal)
@@ -196,6 +196,9 @@ defmodule Tightbeam.Wire.ChangeSocket do
 
   defp auth_failure(reason),
     do: %{"type" => "auth_result", "success" => false, "reason" => reason}
+
+  defp push(%{"class" => _class} = payload, state),
+    do: {:push, {:text, Publisher.encode_wire_notice(payload)}, state}
 
   defp push(payload, state), do: {:push, {:text, JSON.encode!(payload)}, state}
 

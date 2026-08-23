@@ -240,10 +240,27 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
                    )
                  end
 
-    held_admin_classes =
-      ~w(config.updated host_env.updated identity.updated host.registered kungfu.updated user.promoted)
+    expected_admin_rows = %{
+      "config.updated" => {"config", ["key"], :query_config, :config, :config_visible?},
+      "host_env.updated" =>
+        {"host environment", ["host", "harness", "name"], :query_host_environment,
+         :host_environment, :host_environment_visible?},
+      "identity.updated" =>
+        {"identity", ["name"], :query_identity, :identity, :identity_visible?},
+      "host.registered" => {"hosts", ["host"], :query_host, :host, :host_visible?},
+      "kungfu.updated" => {"kungfu", ["name"], :query_kungfu, :kungfu, :kungfu_visible?},
+      "user.promoted" => {"users", ["userId"], :query_user, :user, :user_visible?}
+    }
 
-    assert held_admin_classes -- Registry.classes() == held_admin_classes
+    assert Map.new(expected_admin_rows, fn {class, expected} ->
+             row = Map.fetch!(rows, class)
+
+             actual =
+               {row.resource, row.primary_refs, row.query, row.serializer, row.visibility}
+
+             assert actual == expected
+             {class, actual}
+           end) == expected_admin_rows
   end
 
   test "condition facts share owner visibility and critical state is admin-only", ctx do

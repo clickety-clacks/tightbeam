@@ -2,9 +2,9 @@ defmodule Tightbeam.Firehose.Registry do
   @moduledoc """
   The v1 class vocabulary and its state-resource mapping.
 
-  Observational classes intentionally have no resource mapping. Admin-state
-  classes are held out until the open projection ruling freezes their public
-  resource bytes.
+  Observational classes intentionally have no resource mapping. Every state
+  row names the shared query, serializer, visibility, primary refs, and durable
+  version source used by rebuilds and notices.
   """
 
   @observational ~w(
@@ -48,6 +48,69 @@ defmodule Tightbeam.Firehose.Registry do
     {"critical_lease.updated", "critical-state", "upsert", "sessionKey"}
   ]
 
+  @admin_rows [
+    %{
+      class: "config.updated",
+      resource: "config",
+      op: "upsert",
+      primary_refs: ["key"],
+      query: :query_config,
+      serializer: :config,
+      visibility: :config_visible?,
+      version_source: "admin_projection_versions"
+    },
+    %{
+      class: "host_env.updated",
+      resource: "host environment",
+      op: "upsert",
+      primary_refs: ["host", "harness", "name"],
+      query: :query_host_environment,
+      serializer: :host_environment,
+      visibility: :host_environment_visible?,
+      version_source: "admin_projection_versions+host_environment_projection"
+    },
+    %{
+      class: "host.registered",
+      resource: "hosts",
+      op: "upsert",
+      primary_refs: ["host"],
+      query: :query_host,
+      serializer: :host,
+      visibility: :host_visible?,
+      version_source: "admin_projection_versions"
+    },
+    %{
+      class: "user.promoted",
+      resource: "users",
+      op: "upsert",
+      primary_refs: ["userId"],
+      query: :query_user,
+      serializer: :user,
+      visibility: :user_visible?,
+      version_source: "admin_projection_versions"
+    },
+    %{
+      class: "identity.updated",
+      resource: "identity",
+      op: "upsert",
+      primary_refs: ["name"],
+      query: :query_identity,
+      serializer: :identity,
+      visibility: :identity_visible?,
+      version_source: "admin_projection_versions.publication_stamp"
+    },
+    %{
+      class: "kungfu.updated",
+      resource: "kungfu",
+      op: "upsert",
+      primary_refs: ["name"],
+      query: :query_kungfu,
+      serializer: :kungfu,
+      visibility: :kungfu_visible?,
+      version_source: "admin_projection_versions.publication_stamp"
+    }
+  ]
+
   @serializers %{
     "work-items" => :work_item,
     "assignments" => :assignment,
@@ -64,19 +127,36 @@ defmodule Tightbeam.Firehose.Registry do
     "read-markers" => :read_marker,
     "messages" => :message,
     "condition-facts" => :condition_fact,
-    "critical-state" => :critical_state
+    "critical-state" => :critical_state,
+    "config" => :config,
+    "host environment" => :host_environment,
+    "hosts" => :host,
+    "identity" => :identity,
+    "kungfu" => :kungfu
   }
 
-  @rows Map.new(@state_rows, fn {class, resource, op, primary_ref} ->
+  @rows @state_rows
+        |> Map.new(fn {class, resource, op, primary_ref} ->
           {class,
            %{
              class: class,
              resource: resource,
              op: op,
              primary_ref: primary_ref,
+             primary_refs: [primary_ref],
              serializer: Map.fetch!(@serializers, resource)
            }}
         end)
+        |> Map.update!("user.added", fn row ->
+          Map.merge(row, %{
+            query: :query_user,
+            visibility: :user_visible?,
+            version_source: "admin_projection_versions"
+          })
+        end)
+        |> Map.merge(
+          Map.new(@admin_rows, &{&1.class, Map.put(&1, :primary_ref, hd(&1.primary_refs))})
+        )
 
   @spec rows() :: %{String.t() => map()}
   def rows, do: @rows

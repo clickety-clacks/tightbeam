@@ -40,7 +40,7 @@ defmodule Tightbeam.Firehose.Publisher do
   }
 
   @transactional_verbs MapSet.new(
-                         ~w(work-item-create work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail assign dispatch attest reopen-assignment revoke-assignment wake condition artifact-record read-marker-set read-marker-clear critical role-create role-bind role-rm spawn retire ask answer rule effort-rule withdraw approve-device deny-device revoke-device add-user)
+                         ~w(work-item-create work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail assign dispatch attest reopen-assignment revoke-assignment wake condition artifact-record read-marker-set read-marker-clear critical role-create role-bind role-rm spawn retire ask answer rule effort-rule withdraw approve-device deny-device revoke-device add-user promote-user config host-env-set host-env-unset register-host identity-edit identity-relearn learn unlearn kungfu-scaffold)
                        )
 
   @spec accepted(map(), term()) :: :ok
@@ -205,20 +205,45 @@ defmodule Tightbeam.Firehose.Publisher do
     Txn.handoff(txn, Hub, {:publish, notice})
   end
 
+  @doc false
+  def encode_wire_notice(%{"class" => class, "payload" => payload} = notice) do
+    case Registry.fetch(class) do
+      {:ok, %{resource: resource}} when is_map(payload) ->
+        if StateResources.admin_resource?(resource) do
+          bytes = StateResources.encode_admin_item(resource, payload)
+          JSON.encode!(Map.put(notice, "payload", %StateResources.RawJSON{bytes: bytes}))
+        else
+          JSON.encode!(notice)
+        end
+
+      _ ->
+        JSON.encode!(notice)
+    end
+  end
+
   @spec committed_notice(String.t(), map(), map()) :: map()
   def committed_notice(class, payload, refs) do
     {:ok, row} = Registry.fetch(class)
     projection = apply(StateResources, row.serializer, [payload])
+
+    resolved_refs =
+      Enum.reduce(row.primary_refs, refs, fn primary_ref, resolved ->
+        Map.put_new(
+          resolved,
+          primary_ref,
+          projection[primary_ref] || projection["id"]
+        )
+      end)
+      |> Map.reject(fn {_key, value} -> is_nil(value) end)
+
+    require_primary_refs!(class, row.primary_refs, resolved_refs)
 
     %{
       "class" => class,
       "resource" => row.resource,
       "op" => row.op,
       "occurredAt" => occurred_at(projection),
-      "refs" =>
-        refs
-        |> Map.put_new(row.primary_ref, projection[row.primary_ref] || projection["id"])
-        |> Map.reject(fn {_key, value} -> is_nil(value) end),
+      "refs" => resolved_refs,
       "payload" => projection
     }
   end
@@ -312,7 +337,8 @@ defmodule Tightbeam.Firehose.Publisher do
   defp build(class, call, result, serializer) do
     {:ok, row} = Registry.fetch(class)
     payload = result |> unwrap(row.resource) |> serializer.()
-    refs = refs(call, payload, row.primary_ref)
+    refs = refs(call, payload, row.primary_refs)
+    require_primary_refs!(class, row.primary_refs, refs)
 
     %{
       "class" => class,
@@ -369,9 +395,10 @@ defmodule Tightbeam.Firehose.Publisher do
 
   defp wrapped(result, _keys), do: %{"value" => result}
 
-  defp refs(call, payload, primary_ref) do
-    base_refs(call)
-    |> Map.put(primary_ref, primary_value(payload, primary_ref, call))
+  defp refs(call, payload, primary_refs) do
+    Enum.reduce(primary_refs, base_refs(call), fn primary_ref, refs ->
+      Map.put(refs, primary_ref, primary_value(payload, primary_ref, call))
+    end)
     |> Map.reject(fn {_key, value} -> is_nil(value) or value == "" end)
   end
 
@@ -405,6 +432,11 @@ defmodule Tightbeam.Firehose.Publisher do
   defp primary_param("artifactId"), do: :artifact_id
   defp primary_param("deviceId"), do: :device_id
   defp primary_param("role"), do: :name
+  defp primary_param("key"), do: :key
+  defp primary_param("host"), do: :host
+  defp primary_param("harness"), do: :harness
+  defp primary_param("name"), do: :name
+  defp primary_param("userId"), do: :user_id
   defp primary_param(_key), do: :id
 
   defp occurred_at(payload) do
@@ -416,4 +448,15 @@ defmodule Tightbeam.Firehose.Publisher do
   defp principal({kind, value}) when is_binary(value), do: "#{kind}:#{value}"
   defp principal(value) when is_binary(value), do: value
   defp principal(_value), do: nil
+
+  defp require_primary_refs!(class, primary_refs, refs) do
+    missing = Enum.reject(primary_refs, &(is_binary(refs[&1]) or is_integer(refs[&1])))
+
+    if missing != [] do
+      raise ArgumentError,
+            "firehose #{class} projection is missing primary refs: #{Enum.join(missing, ", ")}"
+    end
+
+    :ok
+  end
 end

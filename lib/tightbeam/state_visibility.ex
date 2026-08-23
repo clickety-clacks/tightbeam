@@ -3,8 +3,14 @@ defmodule Tightbeam.StateVisibility do
 
   alias Tightbeam.{DB, Org}
 
+  @admin_classes ~w(config.updated host_env.updated host.registered user.added user.promoted identity.updated kungfu.updated)
+
   @spec visible?(DB.server(), map(), String.t(), boolean()) :: boolean()
   def visible?(_db, _notice, _user_id, true), do: true
+
+  def visible?(_db, %{"class" => class}, _user_id, false) when class in @admin_classes do
+    admin_resource_visible?(class, false)
+  end
 
   def visible?(_db, %{"class" => "critical_lease.updated"}, _user_id, false), do: false
 
@@ -17,6 +23,35 @@ defmodule Tightbeam.StateVisibility do
       work_item_owner?(db, refs, payload, user_id) or
       assignment_owner?(db, refs, payload, user_id)
   end
+
+  @doc "Config is admin-only."
+  def config_visible?(is_admin), do: is_admin
+
+  @doc "Host-environment metadata is admin-only."
+  def host_environment_visible?(is_admin), do: is_admin
+
+  @doc "Host inventory is admin-only."
+  def host_visible?(is_admin), do: is_admin
+
+  @doc "User administration is admin-only."
+  def user_visible?(is_admin), do: is_admin
+
+  @doc "Served identity publication state is admin-only."
+  def identity_visible?(is_admin), do: is_admin
+
+  @doc "Kungfu publication state is admin-only."
+  def kungfu_visible?(is_admin), do: is_admin
+
+  defp admin_resource_visible?("config.updated", is_admin), do: config_visible?(is_admin)
+
+  defp admin_resource_visible?("host_env.updated", is_admin),
+    do: host_environment_visible?(is_admin)
+
+  defp admin_resource_visible?("host.registered", is_admin), do: host_visible?(is_admin)
+  defp admin_resource_visible?("user.added", is_admin), do: user_visible?(is_admin)
+  defp admin_resource_visible?("user.promoted", is_admin), do: user_visible?(is_admin)
+  defp admin_resource_visible?("identity.updated", is_admin), do: identity_visible?(is_admin)
+  defp admin_resource_visible?("kungfu.updated", is_admin), do: kungfu_visible?(is_admin)
 
   defp direct_owner?(refs, payload, user_id) do
     Enum.any?(

@@ -39,13 +39,14 @@ defmodule Tightbeam.GatewayTest do
   @archetype_reference_writers [
     {:main_session_seed, "lib/tightbeam/wire/socket.ex", "Org.create_in_txn"},
     {:typed_spawn, "lib/tightbeam/gateway.ex", "Org.create_in_txn"},
-    {:default_setting, "lib/tightbeam/gateway.ex", "Org.put_setting_in_txn"},
+    {:default_setting, "lib/tightbeam/gateway.ex", "Org.put_setting_projected_in_txn"},
     {:identity_repoint, "lib/tightbeam/gateway.ex", "Org.repoint_archetype_in_txn"}
   ]
 
   import ExUnit.CaptureLog
 
   alias Tightbeam.{
+    AdminProjection,
     Archetypes,
     Artifacts,
     Assignments,
@@ -3877,7 +3878,10 @@ defmodule Tightbeam.GatewayTest do
       Supervisor.delete_child(Tightbeam.Supervisor, child_id)
     end)
 
-    assert %{host: ^machine} =
+    assert %{
+             host: %{"host" => ^machine, "rowVersion" => host_row_version},
+             changed: false
+           } =
              handlers["register-host"].(%{
                origin: "user:flynn",
                session_key: nil,
@@ -3926,13 +3930,20 @@ defmodule Tightbeam.GatewayTest do
       # bound itself, which is the racing regime; 3.5s is the middle of the only
       # room the interval leaves. Widening past 5s would not be a safer budget,
       # it would be a different and weaker test.
-      assert %{host: ^machine} = Task.await(reregister, 3_500)
+      assert %{
+               host: %{"host" => ^machine, "rowVersion" => ^host_row_version},
+               changed: false
+             } = Task.await(reregister, 3_500)
+
       assert GenServer.whereis(server) == first_pid
     after
       :ok = :sys.resume(first_pid)
     end
 
-    assert %{host: ^machine} =
+    assert %{
+             host: %{"host" => ^machine, "rowVersion" => ^host_row_version},
+             changed: false
+           } =
              handlers["register-host"].(%{
                origin: "user:flynn",
                session_key: nil,
@@ -3977,42 +3988,63 @@ defmodule Tightbeam.GatewayTest do
        ctx do
     handlers = Gateway.handlers(%{db: ctx.db})
     host = Placement.local_host_name()
+    expected_effect = "takes effect on next claude adapter start on #{host}"
 
-    set =
-      handlers["host-env-set"].(%{
-        origin: "user:flynn",
-        params: %{
-          host: host,
-          harness: "claude",
-          name: "EXAMPLE_OVERLAY_VAR",
-          value: "example"
-        }
-      })
+    assert %{
+             host_environment: set,
+             changed: true,
+             effect: ^expected_effect
+           } =
+             handlers["host-env-set"].(%{
+               origin: "user:flynn",
+               params: %{
+                 host: host,
+                 harness: "claude",
+                 name: "EXAMPLE_OVERLAY_VAR",
+                 value: "example"
+               }
+             })
 
-    assert set.host == host
-    assert set.harness == "claude"
-    assert set.name == "EXAMPLE_OVERLAY_VAR"
-    assert set.value == "example"
-    assert set.set_by == "user:flynn"
-    assert is_integer(set.set_at)
-    assert set.effect == "takes effect on next claude adapter start on #{host}"
+    assert set == %{
+             "host" => host,
+             "harness" => "claude",
+             "name" => "EXAMPLE_OVERLAY_VAR",
+             "value" => nil,
+             "valuePresent" => true,
+             "updatedAt" => set["updatedAt"],
+             "rowVersion" => 1
+           }
+
+    assert is_integer(set["updatedAt"])
 
     assert %{overlays: [listed]} =
              handlers["host-env-list"].(%{
-               origin: "agent:operator",
+               origin: "user:flynn",
                params: %{host: host, harness: "claude"}
              })
 
-    assert listed == Map.delete(set, :effect)
+    assert listed == set
 
-    assert %{host: ^host, harness: "claude", name: "EXAMPLE_OVERLAY_VAR", removed: true} =
+    assert %{host_environment: unset, changed: true, removed: true} =
              handlers["host-env-unset"].(%{
                origin: "user:flynn",
                params: %{host: host, harness: "claude", name: "EXAMPLE_OVERLAY_VAR"}
              })
 
-    assert %{overlays: []} =
-             handlers["host-env-list"].(%{origin: "agent:operator", params: %{}})
+    assert unset == %{
+             "host" => host,
+             "harness" => "claude",
+             "name" => "EXAMPLE_OVERLAY_VAR",
+             "value" => nil,
+             "valuePresent" => false,
+             "updatedAt" => unset["updatedAt"],
+             "rowVersion" => 2
+           }
+
+    assert is_integer(unset["updatedAt"])
+
+    assert %{overlays: [^unset]} =
+             handlers["host-env-list"].(%{origin: "user:flynn", params: %{}})
   end
 
   test "host-env-set names every reserved and malformed boundary refusal", ctx do
@@ -4091,7 +4123,7 @@ defmodule Tightbeam.GatewayTest do
     assert Placement.env_overlays(ctx.db) == []
   end
 
-  test "host env writes refuse a resolved non-admin agent while list stays readable", ctx do
+  test "host env verbs refuse a resolved non-admin agent", ctx do
     handlers = Gateway.handlers(%{db: ctx.db})
     host = Placement.local_host_name()
 
@@ -4108,7 +4140,7 @@ defmodule Tightbeam.GatewayTest do
     operator = create_session(ctx.db, "operator-session", "operator")
     Roles.create!(ctx.db, "operator", "operator", operator.session_key)
 
-    assert %{set_by: "user:flynn"} =
+    assert %{host_environment: %{"valuePresent" => true}, changed: true} =
              handlers["host-env-set"].(%{
                origin: "user:flynn",
                params: %{
@@ -4136,7 +4168,7 @@ defmodule Tightbeam.GatewayTest do
                params: %{host: host, harness: "claude", name: "EXAMPLE_OVERLAY_VAR"}
              })
 
-    assert %{overlays: [%{name: "EXAMPLE_OVERLAY_VAR", value: "example"}]} =
+    assert %{code: "forbidden", message: "admin required"} =
              handlers["host-env-list"].(%{
                origin: "agent:operator",
                params: %{host: host, harness: "claude"}
@@ -4198,19 +4230,37 @@ defmodule Tightbeam.GatewayTest do
   test "add-user lets an admin add admins and non-admins but refuses a non-admin", ctx do
     handler = Gateway.handlers(gateway_config(ctx.catalog_base, ctx.db, 0))["add-user"]
 
-    assert %{user: %{user_id: "second-admin", is_admin: true}} =
+    assert %{
+             user: %{
+               "userId" => "second-admin",
+               "isAdmin" => true,
+               "createdAt" => second_admin_created_at,
+               "rowVersion" => 1
+             }
+           } =
              handler.(%{
                origin: "user:flynn",
                session_key: nil,
                params: %{user_id: "second-admin", is_admin: true}
              })
 
-    assert %{user: %{user_id: "guest", is_admin: false}} =
+    assert is_integer(second_admin_created_at)
+
+    assert %{
+             user: %{
+               "userId" => "guest",
+               "isAdmin" => false,
+               "createdAt" => guest_created_at,
+               "rowVersion" => 1
+             }
+           } =
              handler.(%{
                origin: "user:second-admin",
                session_key: nil,
                params: %{user_id: "guest", is_admin: false}
              })
+
+    assert is_integer(guest_created_at)
 
     assert %{code: "forbidden", message: "admin required"} =
              handler.(%{
@@ -4305,7 +4355,7 @@ defmodule Tightbeam.GatewayTest do
     # server with a foreign base_dir + non-nil ssh wedges every local spawn
     # until restart (fail-closed), and Placement.hosts/1 ignores the registry
     # entry for the local name anyway.
-    assert %{host: ^local} =
+    assert %{host: %{"host" => ^local, "rowVersion" => row_version}, changed: false} =
              handlers["register-host"].(%{
                origin: "user:flynn",
                session_key: nil,
@@ -4315,6 +4365,8 @@ defmodule Tightbeam.GatewayTest do
                  base_dir: "/remote/definitely-elsewhere"
                }
              })
+
+    assert is_integer(row_version) and row_version > 0
 
     assert GenServer.whereis(Credentials.server(local)) == local_server,
            "local credential server was replaced by re-registering the local hostname"
@@ -4362,12 +4414,14 @@ defmodule Tightbeam.GatewayTest do
 
     handlers = Gateway.handlers(gateway_config(base_dir, ctx.db, 11_373) |> Map.put(:sh, sh))
 
-    assert %{host: ^machine} =
+    assert %{host: %{"host" => ^machine, "rowVersion" => row_version}, changed: false} =
              handlers["register-host"].(%{
                origin: "user:flynn",
                session_key: nil,
                params: %{name: machine, ssh: machine, base_dir: "/remote/tb"}
              })
+
+    assert is_integer(row_version) and row_version > 0
 
     assert_receive {:staged, content, 0o600}
 
@@ -8506,22 +8560,27 @@ defmodule Tightbeam.GatewayTest do
     assert :persistent_term.get(Rules, []) == []
   end
 
-  test "kungfu list reports shipped bundles and their offer metadata",
+  test "kungfu list returns canonical admin-only resource items",
        ctx do
     base_dir = role_test_base("kungfu-list")
+    :ok = AdminProjection.bootstrap_served(ctx.db, base_dir)
     list = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["kungfu-list"]
 
     assert %{
              bundles: [
                %{
-                 name: "agentic-engineering",
-                 purpose: purpose,
-                 phrases: phrases,
-                 root_archetype: "product-owner"
+                 "name" => "agentic-engineering",
+                 "purpose" => purpose,
+                 "phrases" => phrases,
+                 "rootArchetype" => "product-owner",
+                 "installedRevision" => nil,
+                 "status" => "available",
+                 "documents" => [],
+                 "rowVersion" => 1
                }
              ]
            } =
-             list.(%{origin: "agent:k1", params: %{}})
+             list.(%{origin: "user:flynn", params: %{}})
 
     assert purpose =~ "turn product ideas and bug reports into shipped software"
     assert "I want my code reviewed before it merges." in phrases
@@ -8529,6 +8588,9 @@ defmodule Tightbeam.GatewayTest do
     # The point of phrases is DISCRIMINATION: a phrase another domain's bundle could
     # honestly claim buys nothing. This one could only be a software-engineering bundle.
     refute Enum.any?(phrases, &(&1 == "I keep losing track of what I asked for."))
+
+    assert %{code: "forbidden", message: "admin required"} =
+             list.(%{origin: "user:not-admin", params: %{}})
   end
 
   test "every unlearn reference kind supplies supported commands that clear it", ctx do

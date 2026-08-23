@@ -4,7 +4,7 @@ defmodule Tightbeam.Org do
   and append-only harness-session pointer chains.
   """
 
-  alias Tightbeam.{DB, Supervision, Wakes}
+  alias Tightbeam.{AdminProjection, DB, Supervision, Wakes}
   alias Tightbeam.DB.Txn
   alias Tightbeam.Model
 
@@ -138,7 +138,7 @@ defmodule Tightbeam.Org do
         """
       )
 
-    result
+    with :ok <- result, do: AdminProjection.ensure_storage(db)
   end
 
   @doc "Read an organization setting, or nil when it is unset."
@@ -155,22 +155,40 @@ defmodule Tightbeam.Org do
   @doc "Write an organization setting."
   @spec put_setting(db(), String.t(), String.t()) :: :ok
   def put_setting(db \\ Tightbeam.DB, key, value) do
-    transaction!(db, fn txn -> put_setting_in_txn(txn, key, value) end)
+    transaction!(db, fn txn ->
+      put_setting_projected_in_txn(txn, key, value)
+      :ok
+    end)
   end
 
   @doc false
   @spec put_setting_in_txn(Txn.t(), String.t(), String.t()) :: :ok
   def put_setting_in_txn(%Txn{} = txn, key, value) do
+    put_setting_projected_in_txn(txn, key, value)
+    :ok
+  end
+
+  @doc false
+  def put_setting_projected_in_txn(%Txn{} = txn, key, value) do
+    updated_at = now()
+
     Txn.q(
       txn,
       """
       INSERT INTO org_settings (key, value, updatedAt) VALUES (?1, ?2, ?3)
       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updatedAt = excluded.updatedAt
+      WHERE org_settings.value != excluded.value
       """,
-      [key, value, now()]
+      [key, value, updated_at]
     )
 
-    :ok
+    changed = Txn.changes(txn) == 1
+
+    if changed do
+      AdminProjection.allocate_in_txn(txn, "config", key, updated_at)
+    end
+
+    %{changed: changed, projection: Tightbeam.StateResources.query_config(txn, key)}
   end
 
   @doc """

@@ -12,7 +12,7 @@ defmodule Tightbeam.Devices do
   gateway-owned; prefix `tbt_`).
   """
 
-  alias Tightbeam.DB
+  alias Tightbeam.{AdminProjection, DB, StateResources}
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.Publisher
 
@@ -60,7 +60,9 @@ defmodule Tightbeam.Devices do
   """
 
   @spec ensure_schema(db()) :: :ok | {:error, term()}
-  def ensure_schema(db \\ Tightbeam.DB), do: DB.execute(db, @ddl)
+  def ensure_schema(db \\ Tightbeam.DB) do
+    with :ok <- DB.execute(db, @ddl), do: AdminProjection.ensure_storage(db)
+  end
 
   @doc """
   Pair a device. Semantics (devices.ts `pair`) — all in ONE transaction:
@@ -294,9 +296,29 @@ defmodule Tightbeam.Devices do
   def add_user_with_firehose(db, user_id, is_admin, call) do
     transaction!(db, fn txn ->
       insert_user(txn, user_id, is_admin)
-      user = must_get_user(txn, user_id)
+      user = StateResources.query_user(txn, user_id)
       Publisher.maybe_accepted_in_txn(txn, call, %{user: user})
       user
+    end)
+  end
+
+  @doc false
+  def promote_user_with_firehose(db, user_id, call) do
+    transaction!(db, fn txn ->
+      user = must_get_user(txn, user_id)
+
+      if user.is_admin do
+        Publisher.maybe_observed_accepted_in_txn(txn, call)
+        %{user: StateResources.query_user(txn, user_id), changed: false}
+      else
+        Txn.q(txn, "UPDATE users SET isAdmin = 1 WHERE userId = ?1 AND isAdmin = 0", [user_id])
+        updated_at = System.system_time(:millisecond)
+        AdminProjection.allocate_in_txn(txn, "users", user_id, updated_at)
+        projection = StateResources.query_user(txn, user_id)
+        Publisher.maybe_observed_accepted_in_txn(txn, call)
+        Publisher.committed_in_txn(txn, "user.promoted", projection, %{"userId" => user_id})
+        %{user: projection, changed: true}
+      end
     end)
   end
 
@@ -411,6 +433,8 @@ defmodule Tightbeam.Devices do
   end
 
   defp insert_user(txn, user_id, requested_admin) do
+    created_at = now()
+
     Txn.q(
       txn,
       """
@@ -421,8 +445,10 @@ defmodule Tightbeam.Devices do
         ?3
       )
       """,
-      [user_id, if(requested_admin, do: 1, else: 0), now()]
+      [user_id, if(requested_admin, do: 1, else: 0), created_at]
     )
+
+    AdminProjection.allocate_in_txn(txn, "users", user_id, created_at)
   end
 
   defp must_get_user(txn, user_id) do

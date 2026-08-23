@@ -60,6 +60,7 @@ defmodule Tightbeam.Gateway do
 
   alias Tightbeam.{
     AdapterCoordinator,
+    AdminProjection,
     Archetypes,
     Artifacts,
     Assignments,
@@ -87,6 +88,7 @@ defmodule Tightbeam.Gateway do
     Roles,
     Schema,
     Spinup,
+    StateResources,
     SubagentMarkers,
     Supervision,
     Unroutable,
@@ -148,6 +150,7 @@ defmodule Tightbeam.Gateway do
     File.mkdir_p!(config.base_dir)
 
     :ok = Schema.ensure_all(db)
+    :ok = AdminProjection.bootstrap_served(db, config.base_dir)
 
     :ok = Assignments.audit_review_item_conflicts(db)
 
@@ -821,53 +824,75 @@ defmodule Tightbeam.Gateway do
           Devices.revoke_with_firehose(db, p.device_id, call)
           %{revoked: p.device_id}
         end),
-      {"host-env-set", []} =>
+      {"host-env-set", ["host_env.updated"]} =>
         admin_call_handler(db, fn call ->
           p = call.params
 
-          case Placement.set_env_overlay(
+          case Placement.set_env_overlay_with_firehose(
                  db,
                  p.host,
                  p.harness,
                  p.name,
                  p.value,
-                 call.origin
+                 call.origin,
+                 call
                ) do
-            {:ok, row} ->
-              Map.put(
-                row,
-                :effect,
-                "takes effect on next #{p.harness} adapter start on #{p.host}"
-              )
+            %{projection: projection, changed: changed} ->
+              %{
+                host_environment: StateResources.host_environment(projection),
+                changed: changed,
+                effect: "takes effect on next #{p.harness} adapter start on #{p.host}"
+              }
 
             {:error, denial} ->
               denial
           end
         end),
-      {"host-env-list", []} => fn call ->
-        %{
-          overlays: Placement.env_overlays(db, call.params[:host], call.params[:harness])
-        }
-      end,
-      {"host-env-unset", []} =>
+      {"host-env-list", []} =>
+        admin_call_handler(db, fn call ->
+          %{
+            overlays:
+              db
+              |> StateResources.query_host_environment(call.params)
+              |> Enum.map(&StateResources.host_environment/1)
+          }
+        end),
+      {"host-env-unset", ["host_env.updated"]} =>
         admin_call_handler(db, fn call ->
           p = call.params
-          Placement.unset_env_overlay(db, p.host, p.harness, p.name)
+
+          result =
+            Placement.unset_env_overlay_with_firehose(db, p.host, p.harness, p.name, call)
+
+          %{
+            host_environment:
+              result.projection && StateResources.host_environment(result.projection),
+            changed: result.changed,
+            removed: result.changed
+          }
         end),
-      {"register-host", []} =>
-        admin_handler(db, fn p ->
+      {"register-host", ["host.registered"]} =>
+        admin_call_handler(db, fn call ->
+          p = call.params
           # The dumb half of assimilation (spec §Placement): the CLI ceremony
           # prepared the machine; this records the fact. The topology is the
           # operator's to declare.
           previous_entry = Placement.hosts(config.base_dir, db)[p.name]
 
-          {:ok, entry} =
-            Placement.register_host(db, p.name, %{
-              ssh: p[:ssh] || p.name,
-              base_dir: Map.fetch!(p, :base_dir),
-              cli_bin: p[:cli_bin],
-              adapter_bin_dir: p[:adapter_bin_dir]
-            })
+          {:ok, registration} =
+            Placement.register_host_with_firehose(
+              db,
+              p.name,
+              %{
+                ssh: p[:ssh] || p.name,
+                base_dir: Map.fetch!(p, :base_dir),
+                cli_bin: p[:cli_bin],
+                adapter_bin_dir: p[:adapter_bin_dir]
+              },
+              call
+            )
+
+          entry = registration.entry
 
           :ok = start_credential_child(config, db, p.name, previous_entry, entry)
 
@@ -881,7 +906,10 @@ defmodule Tightbeam.Gateway do
                  provision_opts(config)
                ) do
             :ok ->
-              %{host: p.name, config: entry}
+              %{
+                host: StateResources.host(registration.projection),
+                changed: registration.changed
+              }
 
             {:error, reason} ->
               %{code: to_string(reason), message: endpoint_failure_message(reason, p.name)}
@@ -903,21 +931,35 @@ defmodule Tightbeam.Gateway do
 
           %{hosts: hosts}
         end),
-      {"identity-edit", []} =>
-        admin_call_handler(db, fn call -> identity_edit_result(config, call) end),
+      {"identity-edit", ["identity.updated"]} =>
+        admin_call_handler(db, fn call -> identity_edit_result(config, db, call) end),
       {"identity-status", []} =>
         admin_call_handler(db, fn call -> identity_status_result(config, db, call) end),
-      {"identity-relearn", []} =>
-        admin_call_handler(db, fn call -> identity_relearn_result(config, call) end),
+      {"identity-relearn", ["identity.updated", "kungfu.updated"]} =>
+        admin_call_handler(db, fn call -> identity_relearn_result(config, db, call) end),
       {"identity-repoint", []} =>
         admin_call_handler(db, fn call -> identity_repoint_result(config, db, call) end),
-      {"learn", []} => admin_call_handler(db, fn call -> identity_learn_result(config, call) end),
-      {"unlearn", []} =>
+      {"learn", ["identity.updated", "kungfu.updated"]} =>
+        admin_call_handler(db, fn call -> identity_learn_result(config, db, call) end),
+      {"unlearn", ["identity.updated", "kungfu.updated"]} =>
         admin_call_handler(db, fn call -> identity_unlearn_result(config, db, call) end),
-      {"kungfu-list", []} => fn _call -> %{bundles: Identity.available_bundles()} end,
+      {"kungfu-list", []} =>
+        admin_call_handler(db, fn _call ->
+          bundles =
+            config.base_dir
+            |> StateResources.kungfu_names()
+            |> Enum.flat_map(fn name ->
+              case StateResources.query_kungfu(db, name) do
+                nil -> []
+                item -> [StateResources.kungfu(item)]
+              end
+            end)
+
+          %{bundles: bundles}
+        end),
       {"identity-apply", []} =>
         admin_call_handler(db, fn call -> identity_apply_result(config, db, call) end),
-      {"kungfu-scaffold", []} =>
+      {"kungfu-scaffold", ["identity.updated", "kungfu.updated"]} =>
         admin_call_handler(db, fn call ->
           paths =
             Archetypes.scaffold_kungfu!(
@@ -927,12 +969,18 @@ defmodule Tightbeam.Gateway do
               call.origin
             )
 
-          %{kungfu: call.params.name, paths: paths}
+          stamp_served_publication(
+            config,
+            db,
+            call,
+            %{kungfu: call.params.name, paths: paths}
+          )
         end),
       {"onboard", []} => admin_call_handler(db, fn call -> onboard_result(config, call) end),
-      {"promote-user", []} =>
-        admin_handler(db, fn p ->
-          %{user: Devices.set_user_admin(db, p.user_id, Map.get(p, :is_admin, true))}
+      {"promote-user", ["user.promoted"]} =>
+        admin_call_handler(db, fn call ->
+          result = Devices.promote_user_with_firehose(db, call.params.user_id, call)
+          %{user: StateResources.user(result.user), changed: result.changed}
         end),
       {"add-user", ["user.added"]} =>
         admin_call_handler(db, fn call ->
@@ -940,7 +988,13 @@ defmodule Tightbeam.Gateway do
 
           %{
             user:
-              Devices.add_user_with_firehose(db, p.user_id, Map.get(p, :is_admin, false), call)
+              db
+              |> Devices.add_user_with_firehose(
+                p.user_id,
+                Map.get(p, :is_admin, false),
+                call
+              )
+              |> StateResources.user()
           }
         end),
       {"read-marker-set", ["read_marker.updated"]} => fn call ->
@@ -949,7 +1003,8 @@ defmodule Tightbeam.Gateway do
       {"read-marker-clear", ["read_marker.updated"]} => fn call ->
         read_marker_result(db, call, :clear)
       end,
-      {"config", []} => admin_handler(db, fn p -> config_result(db, p) end),
+      {"config", ["config.updated"]} =>
+        admin_call_handler(db, fn call -> config_result(db, call) end),
       {"harness-processes", []} =>
         admin_handler(db, fn _params ->
           coordinator = Map.get(config, :adapter_coordinator, Tightbeam.AdapterCoordinator)
@@ -2784,7 +2839,7 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp identity_edit_result(config, call) do
+  defp identity_edit_result(config, db, call) do
     p = call.params
     target = identity_edit_target(p)
 
@@ -2798,7 +2853,7 @@ defmodule Tightbeam.Gateway do
       )
 
     Archetypes.load!(config.base_dir)
-    %{live_revision: revision}
+    stamp_served_publication(config, db, call, %{live_revision: revision})
   end
 
   defp identity_edit_target(%{skill: name, remove: remove}) when is_binary(name),
@@ -2807,24 +2862,33 @@ defmodule Tightbeam.Gateway do
   defp identity_edit_target(%{manifest: true}), do: :manifest
   defp identity_edit_target(_params), do: :guidance
 
-  defp identity_relearn_result(config, %{params: %{action: "abort"}}) do
+  defp identity_relearn_result(config, db, %{params: %{action: "abort"}} = call) do
     :ok = Identity.abort_relearn!(config.base_dir)
+    accepted_without_state(db, call)
     %{state: "aborted", live_revision: Identity.live_revision!(config.base_dir)}
   end
 
-  defp identity_relearn_result(config, %{params: %{action: "resolve"}} = call) do
+  defp identity_relearn_result(config, db, %{params: %{action: "resolve"}} = call) do
     revision = Identity.resolve_relearn!(config.base_dir, call.origin)
     reload_law!(config)
-    %{state: "published", live_revision: revision}
+    stamp_served_publication(config, db, call, %{state: "published", live_revision: revision})
   end
 
-  defp identity_relearn_result(config, call) do
+  defp identity_relearn_result(config, db, call) do
     case Identity.relearn!(config.base_dir, call.origin) do
       {:ok, revision} ->
         reload_law!(config)
-        %{state: "published", live_revision: revision}
+
+        stamp_served_publication(
+          config,
+          db,
+          call,
+          %{state: "published", live_revision: revision}
+        )
 
       {:conflict, paths} ->
+        accepted_without_state(db, call)
+
         %{
           state: "relearn-conflicted",
           conflicting_paths: paths,
@@ -2841,17 +2905,31 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp identity_learn_result(config, call) do
+  defp identity_learn_result(config, db, call) do
     case Identity.learn!(config.base_dir, call.params.name, call.origin) do
       {:ok, revision} ->
         reload_law!(config)
-        %{state: "published", kungfu: call.params.name, live_revision: revision}
+
+        stamp_served_publication(
+          config,
+          db,
+          call,
+          %{state: "published", kungfu: call.params.name, live_revision: revision}
+        )
 
       {:noop, revision} ->
         reload_law!(config)
-        %{state: "already-learned", kungfu: call.params.name, live_revision: revision}
+
+        stamp_served_publication(
+          config,
+          db,
+          call,
+          %{state: "already-learned", kungfu: call.params.name, live_revision: revision}
+        )
 
       {:conflict, paths} ->
+        accepted_without_state(db, call)
+
         %{
           state: "relearn-conflicted",
           kungfu: call.params.name,
@@ -2885,7 +2963,32 @@ defmodule Tightbeam.Gateway do
         unlearn_referenced_result(name, references)
 
       {:released, revision} ->
-        %{state: "published", kungfu: name, live_revision: revision}
+        stamp_served_publication(
+          config,
+          db,
+          call,
+          %{state: "published", kungfu: name, live_revision: revision}
+        )
+    end
+  end
+
+  defp stamp_served_publication(config, db, call, result) do
+    case AdminProjection.stamp_publication(
+           db,
+           call,
+           AdminProjection.served_entries(db, config.base_dir)
+         ) do
+      {:ok, _changed} -> result
+      {:error, error} -> error
+    end
+  end
+
+  defp accepted_without_state(db, call) do
+    case DB.transaction(db, fn txn ->
+           Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
+         end) do
+      {:ok, :ok} -> :ok
+      {:error, error} -> raise error
     end
   end
 
@@ -3057,7 +3160,14 @@ defmodule Tightbeam.Gateway do
           nil
       end
 
+    public_identity =
+      case StateResources.query_identity(db, "served") do
+        nil -> nil
+        item -> StateResources.identity(item)
+      end
+
     identity
+    |> Map.put(:identity, public_identity)
     |> Map.put(:sessions, sessions)
     |> maybe_put_guidance(guidance)
   end
@@ -3557,27 +3667,54 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp config_result(db, %{action: "get", setting: "default-archetype"}) do
+  defp config_result(db, %{params: %{action: "get", setting: "default-archetype"}}) do
+    item = StateResources.query_config(db, "default-archetype")
+
     %{
       setting: "default-archetype",
-      value: Org.get_setting(db, "default-archetype") || "default"
+      value: Org.get_setting(db, "default-archetype") || "default",
+      config: item && StateResources.config(item)
     }
   end
 
-  defp config_result(db, %{
-         action: "set",
-         setting: "default-archetype",
-         value: archetype_name
-       }) do
+  defp config_result(
+         db,
+         %{
+           params: %{
+             action: "set",
+             setting: "default-archetype",
+             value: archetype_name
+           }
+         } = call
+       ) do
     case DB.transaction(db, fn txn ->
            if Archetypes.get(archetype_name) do
-             Org.put_setting_in_txn(txn, "default-archetype", archetype_name)
+             result =
+               Org.put_setting_projected_in_txn(txn, "default-archetype", archetype_name)
+
+             Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
+
+             if result.changed do
+               Tightbeam.Firehose.Publisher.committed_in_txn(
+                 txn,
+                 "config.updated",
+                 result.projection,
+                 %{"key" => "default-archetype"}
+               )
+             end
+
+             {:ok, result}
            else
              {:error, :unknown_archetype}
            end
          end) do
-      {:ok, :ok} ->
-        %{setting: "default-archetype", value: archetype_name}
+      {:ok, {:ok, result}} ->
+        %{
+          setting: "default-archetype",
+          value: archetype_name,
+          config: StateResources.config(result.projection),
+          changed: result.changed
+        }
 
       {:ok, {:error, :unknown_archetype}} ->
         %{code: "unknown_archetype", message: "no such archetype: #{archetype_name}"}
@@ -3587,7 +3724,7 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp config_result(_db, _params) do
+  defp config_result(_db, _call) do
     %{code: "invalid", message: "config supports get/set default-archetype"}
   end
 
