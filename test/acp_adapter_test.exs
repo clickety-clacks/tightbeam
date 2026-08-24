@@ -175,6 +175,13 @@ defmodule Tightbeam.Acp.AdapterTest do
     "default", "opus[1m]", "claude-fable-5[1m]", "sonnet", "haiku",
     "gpt-old", "gpt-new", "gpt-blocking", "gpt-5.6-sol"
   ];
+  // Cursor's live grammar, recorded 2026-08-24: a closed enum of decorated
+  // wire values whose option name is the public ref; anything else is -32602.
+  const cursorWireOptions = [
+    { value: "auto-smart[optimize_for=balanced]", name: "Auto Balance" },
+    { value: "composer-2.5[fast=true]", name: "composer-2.5" },
+    { value: "claude-opus-5[thinking=true,context=300k,effort=high,fast=false]", name: "claude-opus-5" }
+  ];
   const publicModelOption = (value) => {
     const opus5Vocabulary = failMode === "canonical-opus5-alias" || failMode === "opus-alias-drift";
     switch (value) {
@@ -206,8 +213,10 @@ defmodule Tightbeam.Acp.AdapterTest do
     }] : []),
     {
       id: "model",
-      currentValue: models[sid] || "haiku",
-      options: (offeredModels[sid] || defaultOfferedModels).map(publicModelOption)
+      currentValue: models[sid] || (failMode === "cursor-wire-enum" ? "auto-smart[optimize_for=balanced]" : "haiku"),
+      options: failMode === "cursor-wire-enum"
+        ? cursorWireOptions
+        : (offeredModels[sid] || defaultOfferedModels).map(publicModelOption)
     },
     { id: "effort", currentValue: efforts[sid] || "default" },
     { id: "reasoning_effort", currentValue: efforts[sid] || "medium" }
@@ -294,6 +303,13 @@ defmodule Tightbeam.Acp.AdapterTest do
             m.params.configId === "model" &&
             m.params.value === "auto") {
           return send({ id: m.id, error: { code: -32602, message: "Invalid params" } });
+        }
+        if (failMode === "cursor-wire-enum" && m.params.configId === "model") {
+          if (!cursorWireOptions.some((o) => o.value === m.params.value)) {
+            return send({ id: m.id, error: { code: -32602, message: "Invalid params" } });
+          }
+          models[m.params.sessionId] = m.params.value;
+          return send({ id: m.id, result: configOptions(m.params.sessionId) });
         }
         if (failMode === "fast-refusal" && m.params.configId === "fast") {
           return send({ id: m.id, error: { code: -32000, message: "fast refused" } });
@@ -1262,6 +1278,80 @@ defmodule Tightbeam.Acp.AdapterTest do
              requests,
              &(&1["method"] == "session/set_config_option" and &1["configId"] == "effort")
            )
+  end
+
+  test "Cursor resolves a bare ref to the closed wire enum through the option name" do
+    {adapter, capture} = start_adapter(harness: :cursor, fail_mode: "cursor-wire-enum")
+
+    assert {:ok, "sess-1"} =
+             Adapter.new_session(
+               adapter,
+               Model.new("composer-2.5"),
+               "/tmp",
+               [],
+               "guidance"
+             )
+
+    model_writes =
+      captured_requests(capture)
+      |> Enum.filter(
+        &(&1["method"] == "session/set_config_option" and &1["configId"] == "model")
+      )
+      |> Enum.map(& &1["value"])
+
+    # Canonical first (the architecture's rule), then the name-paired wire value.
+    assert model_writes == ["composer-2.5", "composer-2.5[fast=true]"]
+  end
+
+  test "Cursor strict in-place switch resolves the wire value by option name" do
+    {adapter, capture} = start_adapter(harness: :cursor, fail_mode: "cursor-wire-enum")
+
+    assert {:ok, "sess-1"} =
+             Adapter.new_session(adapter, Model.new("auto"), "/tmp", [], "guidance")
+
+    assert {:ok, prior_model} = Adapter.current_model(adapter, "sess-1")
+
+    assert {:ok, _model} =
+             Adapter.apply_model_strict(
+               adapter,
+               "sess-1",
+               Model.new("composer-2.5"),
+               prior_model
+             )
+
+    strict_writes =
+      captured_requests(capture)
+      |> Enum.filter(
+        &(&1["method"] == "session/set_config_option" and &1["configId"] == "model")
+      )
+      |> Enum.map(& &1["value"])
+      |> Enum.drop_while(&(&1 != "composer-2.5"))
+
+    assert strict_writes == ["composer-2.5", "composer-2.5[fast=true]"]
+  end
+
+  test "Cursor refuses a ref no wire option is named for" do
+    {adapter, capture} = start_adapter(harness: :cursor, fail_mode: "cursor-wire-enum")
+
+    assert {:error, {:session_prepare_failed, :model_unavailable, "sess-1", _teardown}} =
+             Adapter.new_candidate_session(
+               adapter,
+               Model.new("composer-2.5-fast"),
+               "/tmp",
+               [],
+               "guidance"
+             )
+
+    model_writes =
+      captured_requests(capture)
+      |> Enum.filter(
+        &(&1["method"] == "session/set_config_option" and &1["configId"] == "model")
+      )
+      |> Enum.map(& &1["value"])
+
+    # Only the canonical ref is ever sent: no option is named for it, so no
+    # wire candidate exists and no invented decoration is guessed at.
+    assert model_writes == ["composer-2.5-fast"]
   end
 
   test "a rejected candidate reports verified teardown" do

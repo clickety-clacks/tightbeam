@@ -751,6 +751,10 @@ defmodule Tightbeam.Acp.Adapter do
            timeout: request_timeout
          ) do
       {:ok, %{"sessionId" => sid} = result} when is_binary(sid) ->
+        # The apply below resolves wire-by-name candidates from the cached
+        # option list, so the session/new options must be remembered first.
+        state = remember_config_options(state, sid, result)
+
         with {:ok, applied_model} <-
                establish_new_session_model(state, sid, model, result, request_timeout),
              :ok <- set_mode(state, sid, request_timeout) do
@@ -765,6 +769,10 @@ defmodule Tightbeam.Acp.Adapter do
           {:reply, {:ok, sid}, put_in(state.chunks[sid], [])}
         else
           {:error, error} ->
+            # The options were remembered before the apply; a session that
+            # failed to prepare must not leave them cached.
+            state = %{state | config_options: Map.delete(state.config_options, sid)}
+
             if report_cleanup? do
               cleanup = close_failed_new_session(state, sid)
               {:reply, {:error, {:session_prepare_failed, error, sid, cleanup}}, state}
@@ -1309,7 +1317,11 @@ defmodule Tightbeam.Acp.Adapter do
       |> Enum.filter(fn {_wire, public} -> public == canonical end)
       |> Enum.map(&elem(&1, 0))
 
-    Enum.reduce_while([canonical | aliases], {:error, :model_unavailable}, fn value, _acc ->
+    wire_candidates = cached_wire_values_by_name(state, sid, model_ref)
+
+    candidates = Enum.uniq([canonical | aliases] ++ wire_candidates)
+
+    Enum.reduce_while(candidates, {:error, :model_unavailable}, fn value, _acc ->
       result =
         map_model_refusal(
           request.("session/set_config_option", %{
@@ -1346,7 +1358,27 @@ defmodule Tightbeam.Acp.Adapter do
   defp map_model_refusal(result), do: result
 
   defp strict_apply(state, sid, %Model{} = model_ref, deadline) do
-    model = Model.to_ref(model_ref)
+    canonical = Model.to_ref(model_ref)
+
+    aliases =
+      state.preset.model_option_aliases
+      |> Enum.filter(fn {_wire, public} -> public == canonical end)
+      |> Enum.map(&elem(&1, 0))
+
+    wire_candidates = cached_wire_values_by_name(state, sid, model_ref)
+
+    [canonical | aliases]
+    |> Kernel.++(wire_candidates)
+    |> Enum.uniq()
+    |> Enum.reduce_while({:error, :model_unavailable}, fn value, _acc ->
+      case strict_apply_value(state, sid, model_ref, value, deadline) do
+        {:error, :model_unavailable} -> {:cont, {:error, :model_unavailable}}
+        other -> {:halt, other}
+      end
+    end)
+  end
+
+  defp strict_apply_value(state, sid, %Model{} = model_ref, model, deadline) do
     effort = model_ref.effort
 
     case map_model_refusal(strict_model_request(state, sid, "model", model, deadline)) do
@@ -1521,7 +1553,37 @@ defmodule Tightbeam.Acp.Adapter do
       |> model_option_values()
       |> Enum.filter(&(Map.get(preset.model_option_aliases, &1) == canonical_ref))
 
-    Enum.uniq([canonical_ref | aliases])
+    Enum.uniq([canonical_ref | aliases] ++ wire_values_by_name(preset, result, model))
+  end
+
+  # Cursor's ACP publishes each selectable model as a decorated wire value
+  # (`composer-2.5[fast=true]`) whose option `name` is the public catalog ref
+  # (`composer-2.5`). The wire enum is closed — a bare ref or an invented
+  # parameter combination is refused with -32602 — so when a preset opts in,
+  # the live option whose name equals the requested ref supplies the wire
+  # value. The name↔value pairing in the adapter's own init data is the
+  # identity proof; value-echo readback then confirms application.
+  defp wire_values_by_name(preset, result, %Model{} = model) do
+    if Map.get(preset, :model_wire_by_name, false) do
+      canonical_ref = Model.to_ref(model)
+
+      result
+      |> model_option_entries()
+      |> Enum.filter(&(&1["name"] == canonical_ref and is_binary(&1["value"])))
+      |> Enum.map(& &1["value"])
+    else
+      []
+    end
+  end
+
+  defp cached_wire_values_by_name(state, sid, %Model{} = model) do
+    case Map.fetch(state.config_options, sid) do
+      {:ok, options} ->
+        wire_values_by_name(state.preset, %{"configOptions" => options}, model)
+
+      :error ->
+        []
+    end
   end
 
   defp canonical_offered_models(preset, result) do
@@ -1616,10 +1678,19 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   defp public_option_model(preset, %{"value" => value} = option) when is_binary(value) do
-    if Enum.any?(preset.canonical_model_prefixes, &String.starts_with?(value, &1)) do
-      Model.parse_ref(value)
-    else
-      public_model_from_label(option)
+    cond do
+      Enum.any?(preset.canonical_model_prefixes, &String.starts_with?(value, &1)) ->
+        Model.parse_ref(value)
+
+      # Wire-by-name presets: the option name IS the public ref — except where
+      # the static alias table already names the option's public identity
+      # (`auto`, whose display name "Auto Balance" is a label, not a ref).
+      Map.get(preset, :model_wire_by_name, false) and is_binary(option["name"]) and
+          not Map.has_key?(preset.model_option_aliases, value) ->
+        Model.parse_ref(option["name"])
+
+      true ->
+        public_model_from_label(option)
     end
   end
 
