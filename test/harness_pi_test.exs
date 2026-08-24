@@ -141,6 +141,48 @@ defmodule Tightbeam.HarnessPiTest do
     assert Pi.extension_source(%{"hooks" => %{}}) =~ ~s(spawnSync("/bin/sh")
   end
 
+  test "remote adapter rejects relative node candidates before probing them" do
+    owner = self()
+    adapter = "/remote/base/adapters/node_modules/.bin/pi-acp"
+
+    target = fn toolchain_dirs, label ->
+      %{
+        adapter_binary: adapter,
+        base_dir: "/local/base",
+        find_executable: fn "ssh" -> "/usr/bin/ssh" end,
+        host_name: "worker",
+        host_config: %{
+          base_dir: "/remote/base",
+          ssh: "fixture@worker",
+          toolchain_dirs: toolchain_dirs
+        },
+        sh: fn command ->
+          send(owner, {label, command})
+          {"", 0}
+        end
+      }
+    end
+
+    assert {:error, %{code: "host_unready", message: "remote node executable not found"}} =
+             target.(["relative-bin"], :relative) |> Pi.ensure_adapter()
+
+    assert_receive {:relative, _adapter_presence_check}
+    refute_receive {:relative, _node_command}
+
+    assert {:ok, "adapters present; pi adapter verified"} =
+             target.(["/opt/toolchain"], :absolute) |> Pi.ensure_adapter()
+
+    assert_receive {:absolute, _adapter_presence_check}
+
+    assert_receive {:absolute,
+                    ["/usr/bin/ssh" | [_, _, _, _, "fixture@worker", "/bin/test", "-x", node]]}
+
+    assert node == "/opt/toolchain/node"
+
+    assert_receive {:absolute,
+                    ["/usr/bin/ssh" | [_, _, _, _, "fixture@worker", ^node, "-e", _script]]}
+  end
+
   defp tmp_dir!(label) do
     root =
       Path.join(System.tmp_dir!(), "tightbeam-#{label}-#{System.unique_integer([:positive])}")

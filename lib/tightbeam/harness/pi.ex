@@ -589,12 +589,14 @@ defmodule Tightbeam.Harness.Pi do
            Enum.find_value(Map.get(target.host_config, :toolchain_dirs, []), fn dir ->
              path = Path.join(dir, "node")
 
-             case target.sh.(
-                    [ssh | Support.ssh_opts()] ++
-                      [target.host_config.ssh, "/bin/test", "-x", path]
-                  ) do
-               {_output, 0} -> path
-               _ -> nil
+             if Path.type(path) == :absolute do
+               case target.sh.(
+                      [ssh | Support.ssh_opts()] ++
+                        [target.host_config.ssh, "/bin/test", "-x", path]
+                    ) do
+                 {_output, 0} -> path
+                 _ -> nil
+               end
              end
            end) do
       case target.sh.(
