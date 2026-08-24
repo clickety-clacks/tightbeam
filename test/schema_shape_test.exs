@@ -34,7 +34,8 @@ defmodule Tightbeam.SchemaShapeTest do
 
   alias Tightbeam.{Assignments, DB, Schema}
 
-  @shape "operator-decision-requests-v1"
+  @shape "pi-harness-v1"
+  @operator_decision_shape "operator-decision-requests-v1"
   @model_identity_shape "model-identity-v1"
   @be61_shape "model-identity-message-envelope-v2"
 
@@ -134,6 +135,53 @@ defmodule Tightbeam.SchemaShapeTest do
 
     assert operator_index =~ "(ownerUserId, raiserId, actionKey)"
     assert operator_index =~ ~r/WHERE\s+kind\s*=\s*'operator'\s+AND\s+status\s*=\s*'open'/
+  end
+
+  test "operator-decision shape migrates sessions intact and admits Pi", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO users (userId, isAdmin, createdAt) VALUES ('owner', 1, 1)
+        """
+      )
+
+    existing =
+      Tightbeam.Org.create(db, %{
+        session_key: "existing-claude",
+        display_name: "Existing Claude",
+        owner_user_id: "owner",
+        origin: "user:owner",
+        archetype: "default",
+        harness: "claude",
+        provider: "anthropic",
+        model: Tightbeam.Model.new("claude-existing", effort: "medium"),
+        host: "local"
+      })
+
+    downgrade_sessions_to_operator_decision_shape(db)
+
+    assert :ok = Schema.ensure_all(db)
+    assert Tightbeam.Org.get(db, existing.session_key).model.family == "claude-existing"
+
+    pi =
+      Tightbeam.Org.create(db, %{
+        session_key: "new-pi",
+        display_name: "New Pi",
+        owner_user_id: "owner",
+        origin: "user:owner",
+        archetype: "default",
+        harness: "pi",
+        provider: "opencode_go",
+        model: Tightbeam.Model.new("opencode-go/gpt-5.6-luna", effort: "medium"),
+        host: "local"
+      })
+
+    assert pi.harness == "pi"
+    assert pi.provider == "opencode_go"
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
   end
 
   test "model-identity-v1 migrates exact requests, messages, and wakes", %{db: db} do
@@ -587,7 +635,8 @@ defmodule Tightbeam.SchemaShapeTest do
     assert error.message =~ @be61_shape
     assert error.message =~ @shape
 
-    assert error.message =~ "can migrate only #{@model_identity_shape} to #{@shape}"
+    assert error.message =~
+             "can migrate #{@model_identity_shape} through\n#{@operator_decision_shape} to #{@shape}"
 
     assert {:ok, [[@be61_shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
     refute "ruledViaSessionKey" in table_columns(db, "decision_requests")
@@ -713,6 +762,40 @@ defmodule Tightbeam.SchemaShapeTest do
       """)
 
     :ok
+  end
+
+  defp downgrade_sessions_to_operator_decision_shape(db) do
+    :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
+
+    try do
+      :ok =
+        DB.execute(db, """
+        CREATE TABLE sessions_old (
+          sessionKey TEXT PRIMARY KEY, displayName TEXT NOT NULL,
+          kind TEXT NOT NULL DEFAULT 'custom' CHECK (kind IN ('main','dm','custom')),
+          orderIndex INTEGER NOT NULL DEFAULT 0, isBuiltIn INTEGER NOT NULL DEFAULT 0,
+          adopted INTEGER NOT NULL DEFAULT 0, ownerUserId TEXT NOT NULL, origin TEXT NOT NULL,
+          spawnedBy TEXT, handle TEXT UNIQUE, archetype TEXT NOT NULL, overrides TEXT,
+          identityName TEXT, identityRevision TEXT, cliToken TEXT,
+          harness TEXT NOT NULL CHECK (harness IN ('claude','codex','fixture')),
+          provider TEXT NOT NULL CHECK (provider IN ('anthropic','openai','fixture_provider')),
+          model TEXT NOT NULL, thinkingLevel TEXT, modelContext TEXT,
+          host TEXT NOT NULL DEFAULT 'local', clearedThroughSeq INTEGER NOT NULL DEFAULT 0,
+          state TEXT NOT NULL DEFAULT 'active' CHECK (state IN ('active','retired')),
+          createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL
+        );
+        INSERT INTO sessions_old SELECT * FROM sessions;
+        DROP INDEX sessions_owner;
+        DROP INDEX sessions_cli_token;
+        DROP TABLE sessions;
+        ALTER TABLE sessions_old RENAME TO sessions;
+        CREATE INDEX sessions_owner ON sessions (ownerUserId, state);
+        CREATE UNIQUE INDEX sessions_cli_token ON sessions(cliToken);
+        UPDATE schema_stamp SET shape = '#{@operator_decision_shape}', stampedAt = 1;
+        """)
+    after
+      :ok = DB.execute(db, "PRAGMA foreign_keys = ON")
+    end
   end
 
   defp model_identity_request_columns do

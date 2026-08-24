@@ -37,8 +37,19 @@ defmodule Tightbeam.Schema do
   # The shape this build writes. Bump it when a production table changes in a
   # way that makes an older database unreadable, and give the refusal below a
   # sentence saying what changed.
-  @shape "operator-decision-requests-v1"
+  @shape "pi-harness-v1"
+  @operator_decision_shape "operator-decision-requests-v1"
   @model_identity_shape "model-identity-v1"
+  @pi_provider_values "'anthropic','openai','opencode_go'" <>
+                        if(Application.compile_env(:tightbeam, :fixture_harness, false),
+                          do: ",'fixture_provider'",
+                          else: ""
+                        )
+
+  @sessions_indexes_ddl """
+  CREATE INDEX sessions_owner ON sessions (ownerUserId, state);
+  CREATE UNIQUE INDEX sessions_cli_token ON sessions(cliToken);
+  """
 
   # The one predecessor shape this build can migrate. This is deliberately a
   # complete target table, not an ALTER inferred from sqlite_master: the stamp
@@ -1035,8 +1046,12 @@ defmodule Tightbeam.Schema do
       {:ok, [[@shape]]} ->
         :ok
 
+      {:ok, [[@operator_decision_shape]]} ->
+        migrate_pi_harness_v1(db)
+
       {:ok, [[@model_identity_shape]]} ->
         migrate_model_identity_v1(db)
+        migrate_pi_harness_v1(db)
 
       {:ok, []} ->
         # No stamp. Either a database this build is about to create, or one
@@ -1052,7 +1067,8 @@ defmodule Tightbeam.Schema do
           stamped: #{found}
           this build: #{@shape}
 
-        This build can migrate only #{@model_identity_shape} to #{@shape}.
+        This build can migrate #{@model_identity_shape} through
+        #{@operator_decision_shape} to #{@shape}.
 
         No migration is defined for the stamped shape above. Keep the database
         in place and run a Tightbeam build that recognizes that exact stamp.
@@ -1092,7 +1108,7 @@ defmodule Tightbeam.Schema do
         {:error, error} ->
           raise ShapeError,
             message:
-              "migration #{@model_identity_shape} -> #{@shape} failed and was rolled back: #{Exception.message(error)}"
+              "migration #{@model_identity_shape} -> #{@operator_decision_shape} failed and was rolled back: #{Exception.message(error)}"
       end
     after
       :ok = DB.execute(db, "PRAGMA foreign_keys = ON")
@@ -1147,7 +1163,7 @@ defmodule Tightbeam.Schema do
     if Txn.changes(txn) != decision_request_count do
       raise ShapeError,
         message:
-          "migration #{@model_identity_shape} -> #{@shape} copied #{Txn.changes(txn)} of #{decision_request_count} decision requests"
+          "migration #{@model_identity_shape} -> #{@operator_decision_shape} copied #{Txn.changes(txn)} of #{decision_request_count} decision requests"
     end
 
     [[^decision_request_count]] = Txn.q(txn, "SELECT COUNT(*) FROM decision_requests_new")
@@ -1176,7 +1192,7 @@ defmodule Tightbeam.Schema do
     if Txn.changes(txn) != message_count do
       raise ShapeError,
         message:
-          "migration #{@model_identity_shape} -> #{@shape} copied #{Txn.changes(txn)} of #{message_count} messages"
+          "migration #{@model_identity_shape} -> #{@operator_decision_shape} copied #{Txn.changes(txn)} of #{message_count} messages"
     end
 
     [[^message_count]] = Txn.q(txn, "SELECT COUNT(*) FROM messages_new")
@@ -1203,21 +1219,145 @@ defmodule Tightbeam.Schema do
       rows ->
         raise ShapeError,
           message:
-            "migration #{@model_identity_shape} -> #{@shape} left invalid foreign keys: #{inspect(rows)}"
+            "migration #{@model_identity_shape} -> #{@operator_decision_shape} left invalid foreign keys: #{inspect(rows)}"
     end
 
     Txn.q(
       txn,
       "UPDATE schema_stamp SET shape = ?1, stampedAt = ?2 WHERE shape = ?3",
-      [@shape, System.system_time(:millisecond), @model_identity_shape]
+      [@operator_decision_shape, System.system_time(:millisecond), @model_identity_shape]
     )
 
     if Txn.changes(txn) != 1 do
       raise ShapeError,
-        message: "migration #{@model_identity_shape} -> #{@shape} lost its exact stamp transition"
+        message:
+          "migration #{@model_identity_shape} -> #{@operator_decision_shape} lost its exact stamp transition"
     end
 
     :ok
+  end
+
+  defp migrate_pi_harness_v1(db) do
+    :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
+
+    try do
+      case DB.transaction(db, &migrate_pi_harness_v1_in_txn/1) do
+        {:ok, :ok} ->
+          :ok
+
+        {:error, %ShapeError{} = error} ->
+          raise error
+
+        {:error, error} ->
+          raise ShapeError,
+            message:
+              "migration #{@operator_decision_shape} -> #{@shape} failed and was rolled back: #{Exception.message(error)}"
+      end
+    after
+      :ok = DB.execute(db, "PRAGMA foreign_keys = ON")
+    end
+  end
+
+  defp migrate_pi_harness_v1_in_txn(%Txn{} = txn) do
+    [[session_count]] = Txn.q(txn, "SELECT COUNT(*) FROM sessions")
+
+    :ok = Txn.exec(txn, pi_sessions_ddl())
+
+    Txn.q(
+      txn,
+      """
+      INSERT INTO sessions_new (
+        sessionKey, displayName, kind, orderIndex, isBuiltIn, adopted,
+        ownerUserId, origin, spawnedBy, handle, archetype, overrides,
+        identityName, identityRevision, cliToken, harness, provider, model,
+        thinkingLevel, modelContext, host, clearedThroughSeq, state, createdAt, updatedAt
+      )
+      SELECT
+        sessionKey, displayName, kind, orderIndex, isBuiltIn, adopted,
+        ownerUserId, origin, spawnedBy, handle, archetype, overrides,
+        identityName, identityRevision, cliToken, harness, provider, model,
+        thinkingLevel, modelContext, host, clearedThroughSeq, state, createdAt, updatedAt
+      FROM sessions
+      """
+    )
+
+    if Txn.changes(txn) != session_count do
+      raise ShapeError,
+        message:
+          "migration #{@operator_decision_shape} -> #{@shape} copied #{Txn.changes(txn)} of #{session_count} sessions"
+    end
+
+    [[^session_count]] = Txn.q(txn, "SELECT COUNT(*) FROM sessions_new")
+
+    :ok =
+      Txn.exec(
+        txn,
+        """
+        DROP INDEX sessions_owner;
+        DROP INDEX sessions_cli_token;
+        DROP TABLE sessions;
+        ALTER TABLE sessions_new RENAME TO sessions;
+        #{@sessions_indexes_ddl}
+        """
+      )
+
+    case Txn.q(txn, "PRAGMA foreign_key_check") do
+      [] ->
+        :ok
+
+      rows ->
+        raise ShapeError,
+          message:
+            "migration #{@operator_decision_shape} -> #{@shape} left invalid foreign keys: #{inspect(rows)}"
+    end
+
+    Txn.q(
+      txn,
+      "UPDATE schema_stamp SET shape = ?1, stampedAt = ?2 WHERE shape = ?3",
+      [@shape, System.system_time(:millisecond), @operator_decision_shape]
+    )
+
+    if Txn.changes(txn) != 1 do
+      raise ShapeError,
+        message:
+          "migration #{@operator_decision_shape} -> #{@shape} lost its exact stamp transition"
+    end
+
+    :ok
+  end
+
+  defp pi_sessions_ddl do
+    harnesses = Enum.map_join(Tightbeam.Harness.all(), ",", &"'#{&1.wire_name()}'")
+
+    """
+    CREATE TABLE sessions_new (
+      sessionKey    TEXT PRIMARY KEY,
+      displayName   TEXT NOT NULL,
+      kind          TEXT NOT NULL DEFAULT 'custom' CHECK (kind IN ('main','dm','custom')),
+      orderIndex    INTEGER NOT NULL DEFAULT 0,
+      isBuiltIn     INTEGER NOT NULL DEFAULT 0,
+      adopted       INTEGER NOT NULL DEFAULT 0,
+      ownerUserId   TEXT NOT NULL,
+      origin        TEXT NOT NULL,
+      spawnedBy     TEXT,
+      handle        TEXT UNIQUE,
+      archetype     TEXT NOT NULL,
+      overrides     TEXT,
+      identityName  TEXT,
+      identityRevision TEXT,
+      cliToken      TEXT,
+      harness       TEXT NOT NULL CHECK (harness IN (#{harnesses})),
+      provider      TEXT NOT NULL CHECK (provider IN (#{@pi_provider_values})),
+      model         TEXT NOT NULL,
+      thinkingLevel TEXT,
+      modelContext  TEXT,
+      host          TEXT NOT NULL DEFAULT 'local',
+      clearedThroughSeq INTEGER NOT NULL DEFAULT 0,
+      state         TEXT NOT NULL DEFAULT 'active' CHECK (state IN ('active','retired')),
+      createdAt     INTEGER NOT NULL,
+      updatedAt     INTEGER NOT NULL
+    );
+    """
   end
 
   # A FRESH DATABASE MUST NEVER BE REFUSED, which is why the stamp is written
