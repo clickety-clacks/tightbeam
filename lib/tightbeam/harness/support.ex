@@ -359,6 +359,9 @@ defmodule Tightbeam.Harness.Support do
           env: [{profile.home_env, home}, {"COMMON", "1"} | extra]
         ]
       else
+        ssh = if profile.wire_name == "pi", do: System.find_executable("ssh"), else: "ssh"
+        env = if profile.wire_name == "pi", do: "/usr/bin/env", else: "env"
+
         remote_env =
           profile.remote_prefix.(base, home, kind) ++
             ["REMOTE=1"] ++
@@ -369,8 +372,8 @@ defmodule Tightbeam.Harness.Support do
 
         [
           cmd:
-            ["ssh" | ssh_opts()] ++
-              ["vector@remote", "exec", "env" | remote_env] ++ [adapter],
+            [ssh | ssh_opts()] ++
+              ["vector@remote", "exec", env | remote_env] ++ [adapter],
           env: [{"TIGHTBEAM_LINEAGE", "tb-vector"}]
         ]
       end

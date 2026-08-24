@@ -59,6 +59,14 @@ defmodule Tightbeam.Harness.Pi do
   def prepare_launch(target, home, opts) do
     binary = adapter_binary(target)
 
+    ssh =
+      if Support.local?(target) do
+        nil
+      else
+        {:ok, ssh} = absolute_executable(target, "ssh")
+        ssh
+      end
+
     probe =
       if Keyword.fetch!(opts, :statutes) do
         probe_cwd = Path.join(target.host_config.base_dir, "work/gate-probe")
@@ -68,8 +76,8 @@ defmodule Tightbeam.Harness.Pi do
         else
           Support.run!(
             target,
-            ["ssh" | Support.ssh_opts()] ++
-              [target.host_config.ssh, "rm", "-rf", probe_cwd]
+            [ssh | Support.ssh_opts()] ++
+              [target.host_config.ssh, "/bin/rm", "-rf", probe_cwd]
           )
         end
 
@@ -104,8 +112,8 @@ defmodule Tightbeam.Harness.Pi do
 
         [
           cmd:
-            ["ssh" | Support.ssh_opts()] ++
-              [target.host_config.ssh, "exec", "env" | remote_env] ++ [binary],
+            [ssh | Support.ssh_opts()] ++
+              [target.host_config.ssh, "exec", "/usr/bin/env" | remote_env] ++ [binary],
           env: [{"TIGHTBEAM_LINEAGE", Keyword.fetch!(opts, :lineage)}]
         ]
       end
@@ -576,12 +584,29 @@ defmodule Tightbeam.Harness.Pi do
         "const v=JSON.parse(require('fs').readFileSync(p,'utf8')).version;" <>
         "if(v!==#{JSON.encode!(@adapter_version)})throw new Error('unsupported pi-acp version '+v);"
 
-    case target.sh.(
-           ["ssh" | Support.ssh_opts()] ++
-             [target.host_config.ssh, "node", "-e", script]
-         ) do
-      {_output, 0} -> {:ok, detail <> "; pi adapter verified"}
-      {output, _exit} -> {:error, %{code: "host_unready", message: String.trim(output)}}
+    with {:ok, ssh} <- absolute_executable(target, "ssh"),
+         node when is_binary(node) <-
+           Enum.find_value(Map.get(target.host_config, :toolchain_dirs, []), fn dir ->
+             path = Path.join(dir, "node")
+
+             case target.sh.(
+                    [ssh | Support.ssh_opts()] ++
+                      [target.host_config.ssh, "/bin/test", "-x", path]
+                  ) do
+               {_output, 0} -> path
+               _ -> nil
+             end
+           end) do
+      case target.sh.(
+             [ssh | Support.ssh_opts()] ++
+               [target.host_config.ssh, node, "-e", script]
+           ) do
+        {_output, 0} -> {:ok, detail <> "; pi adapter verified"}
+        {output, _exit} -> {:error, %{code: "host_unready", message: String.trim(output)}}
+      end
+    else
+      :error -> {:error, %{code: "host_unready", message: "ssh executable not found"}}
+      nil -> {:error, %{code: "host_unready", message: "remote node executable not found"}}
     end
   end
 
