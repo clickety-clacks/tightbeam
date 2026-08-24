@@ -24,7 +24,8 @@ defmodule Tightbeam.JobTrace do
     "causal_event" => 5,
     "effort_generation" => 6,
     "attest" => 7,
-    "turn_end" => 8
+    "commit_ref_correction" => 8,
+    "turn_end" => 9
   }
 
   @spec build(DB.server(), map()) :: map()
@@ -44,6 +45,7 @@ defmodule Tightbeam.JobTrace do
       timeline:
         (turn_entries(db, item.id) ++
            attest_entries(db, assignment_ids) ++
+           correction_entries(db, assignment_ids) ++
            wake_entries(db, item.id, assignment_ids) ++
            decision_entries(db, assignment_ids) ++
            effort_entries(db, assignment_ids) ++
@@ -102,6 +104,7 @@ defmodule Tightbeam.JobTrace do
         openerRef: opener_ref(opened_user, opened_session),
         state: state,
         files: assignment_files(db, id),
+        commitRefCorrections: Tightbeam.AssignmentCommitRefCorrections.list(db, id),
         reviewsAssignmentId: reviews
       }
     end)
@@ -160,6 +163,49 @@ defmodule Tightbeam.JobTrace do
 
       [Map.merge(base, %{type: "turn_start", at: created})] ++
         if ended, do: [Map.merge(base, %{type: "turn_end", at: ended})], else: []
+    end)
+  end
+
+  defp correction_entries(_db, []), do: []
+
+  defp correction_entries(db, assignment_ids) do
+    {clause, params} = in_clause(assignment_ids)
+
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT id, assignmentId, commitRefs, evidenceArtifactId, actorKind,
+               actorRef, cause, verifiedAt, createdAt
+        FROM assignment_commit_ref_corrections
+        WHERE assignmentId IN (#{clause})
+        """,
+        params
+      )
+
+    Enum.map(rows, fn [
+                        id,
+                        assignment_id,
+                        refs,
+                        artifact_id,
+                        actor_kind,
+                        actor_ref,
+                        cause,
+                        verified_at,
+                        at
+                      ] ->
+      %{
+        at: at,
+        type: "commit_ref_correction",
+        id: id,
+        assignmentId: assignment_id,
+        commitRefs: JSON.decode!(refs),
+        evidenceArtifactId: artifact_id,
+        actorKind: actor_kind,
+        actorRef: actor_ref,
+        cause: cause,
+        verifiedAt: verified_at
+      }
     end)
   end
 

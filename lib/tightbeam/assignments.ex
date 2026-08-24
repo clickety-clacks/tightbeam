@@ -307,7 +307,13 @@ defmodule Tightbeam.Assignments do
 
     Enum.map(rows, fn row ->
       assignment = assignment(row)
-      Map.put(assignment, :files, declared_files(db, assignment.id))
+
+      assignment
+      |> Map.put(:files, declared_files(db, assignment.id))
+      |> Map.put(
+        :commitRefCorrections,
+        Tightbeam.AssignmentCommitRefCorrections.list(db, assignment.id)
+      )
     end)
   end
 
@@ -1405,7 +1411,12 @@ defmodule Tightbeam.Assignments do
           # assignment must be able to answer "why is this open again", not just
           # "database" — this is that answer, in the same list-of-rows shape
           # `attests` already reads via `list_attests/2`.
-          Map.put(assignment(row), :reopenings, list_reopenings(db, assignment_id))
+          assignment(row)
+          |> Map.put(:reopenings, list_reopenings(db, assignment_id))
+          |> Map.put(
+            :commitRefCorrections,
+            Tightbeam.AssignmentCommitRefCorrections.list(db, assignment_id)
+          )
 
         {:ok, []} ->
           error("not_found", "unknown assignment: #{assignment_id}")
