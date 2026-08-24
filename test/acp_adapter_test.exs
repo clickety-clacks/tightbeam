@@ -1301,9 +1301,7 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     model_writes =
       captured_requests(capture)
-      |> Enum.filter(
-        &(&1["method"] == "session/set_config_option" and &1["configId"] == "model")
-      )
+      |> Enum.filter(&(&1["method"] == "session/set_config_option" and &1["configId"] == "model"))
       |> Enum.map(& &1["value"])
 
     # Canonical first (the architecture's rule), then the name-paired wire value.
@@ -1328,9 +1326,7 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     strict_writes =
       captured_requests(capture)
-      |> Enum.filter(
-        &(&1["method"] == "session/set_config_option" and &1["configId"] == "model")
-      )
+      |> Enum.filter(&(&1["method"] == "session/set_config_option" and &1["configId"] == "model"))
       |> Enum.map(& &1["value"])
       |> Enum.drop_while(&(&1 != "composer-2.5"))
 
@@ -1351,9 +1347,7 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     model_writes =
       captured_requests(capture)
-      |> Enum.filter(
-        &(&1["method"] == "session/set_config_option" and &1["configId"] == "model")
-      )
+      |> Enum.filter(&(&1["method"] == "session/set_config_option" and &1["configId"] == "model"))
       |> Enum.map(& &1["value"])
 
     # Only the canonical ref is ever sent: no option is named for it, so no
