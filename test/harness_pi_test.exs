@@ -101,7 +101,9 @@ defmodule Tightbeam.HarnessPiTest do
                timeout_ms: 5_000
              )
 
-    assert_receive {:command, ["node", "--no-warnings", "-e", script, auth_path]}
+    assert_receive {:command, [node, "--no-warnings", "-e", script, auth_path]}
+    assert Path.type(node) == :absolute
+    assert Path.basename(node) == "node"
     assert auth_path == "/vector/home/auth.json"
     assert script =~ ~s("x-opencode-client": "pi")
     assert script =~ ~s("x-opencode-session": requestId)
@@ -112,6 +114,31 @@ defmodule Tightbeam.HarnessPiTest do
     refute script =~ "session_id"
     assert script =~ ~s(auth["opencode-go"]?.key)
     refute auth_path =~ "api-key"
+  end
+
+  test "catalog and generated gate launch only absolute executables" do
+    owner = self()
+
+    state = %{
+      options: %{
+        find_executable: fn
+          "sh" -> "/absolute/sh"
+          "curl" -> "/absolute/curl"
+        end,
+        sh: fn command ->
+          send(owner, {:catalog_command, command})
+
+          {~s({"gpt-5.6-luna":{"id":"gpt-5.6-luna","name":"Luna","provider":"opencode-go","contextWindow":1050000,"maxTokens":128000,"reasoningLevels":["medium"]}}) <>
+             "\n200", 0}
+        end
+      },
+      host_config: %{ssh: nil}
+    }
+
+    assert {:ok, [_model]} = Pi.fetch_catalog(state)
+    assert_receive {:catalog_command, ["/absolute/sh", "-c", script]}
+    assert script =~ "'/absolute/curl'"
+    assert Pi.extension_source(%{"hooks" => %{}}) =~ ~s(spawnSync("/bin/sh")
   end
 
   defp tmp_dir!(label) do

@@ -53,6 +53,12 @@ defmodule Tightbeam.Harness.Support do
   def catalog_probe_argv(dest, script),
     do: ["ssh" | @ssh_opts] ++ [dest, "sh", "-c", shell_quote(script)]
 
+  @doc false
+  def catalog_probe_argv(nil, script, %{sh: sh}), do: [sh, "-c", script]
+
+  def catalog_probe_argv(dest, script, %{ssh: ssh, sh: sh}),
+    do: [ssh | @ssh_opts] ++ [dest, sh, "-c", shell_quote(script)]
+
   @doc """
   The curl line every catalog probe ends in.
 
@@ -64,9 +70,14 @@ defmodule Tightbeam.Harness.Support do
   """
   @spec catalog_curl(String.t(), [String.t()], String.t()) :: String.t()
   def catalog_curl(url, headers, trailer \\ "") do
+    catalog_curl(url, headers, trailer, "curl")
+  end
+
+  @doc false
+  def catalog_curl(url, headers, trailer, curl) do
     header_args = Enum.map_join(headers, " ", &~s(-H "#{&1}"))
 
-    ~s(curl -sS --max-time #{@catalog_probe_timeout_s} ) <>
+    ~s(#{shell_quote(curl)} -sS --max-time #{@catalog_probe_timeout_s} ) <>
       ~s(-w "\\n%{http_code}#{trailer}" ) <> header_args <> " " <> ~s("#{url}")
   end
 
