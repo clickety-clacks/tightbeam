@@ -374,6 +374,18 @@ the harness name. `<userId>` is the admin created by that first pairing. From a
 release install `tightbeam` is already on PATH, so the `<base_dir>/bin/` prefix
 is only needed on a source install.
 
+**IF AN AGENT IS DOING THIS INSTALL, THIS IS ITS LAST STEP, AND IT CANNOT
+FINISH IT ALONE.** Without `--api-key` this is an interactive subscription
+ceremony: a sign-in URL that a person has to open, in a browser, on the machine
+they are sitting at. An agent cannot complete that on the user's behalf and must
+not try. So the closing act of an agent-driven install is to hand the ceremony
+over: say which providers still need a credential, give the exact command for
+each, and open the sign-in where the user actually is. Do not report the install
+as finished first — an org with no credential serves, accepts commands, and
+cannot run a single turn, which reads as working right up until the first real
+request fails. Onboarding the first account is what turns the install into an
+org, and it belongs to the human.
+
 **RUN IT ONCE PER HARNESS YOU INTEND TO USE.** A credential is per provider, and
 onboarding one leaves the other unusable — a session placed on an un-onboarded
 harness fails naming the credential it lacks. The boot summary already lists
