@@ -74,6 +74,10 @@ defmodule Tightbeam.CursorRegistrationTest do
     refute Enum.join(plan[:cmd], " ") =~ "secret"
   end
 
+  # Runs only where the pinned cursor-agent bundle is installed — see the
+  # :cursor_bundle exclusion rule in test_helper.exs for why absence is a
+  # declared exclusion here rather than a suite refusal or a silent skip.
+  @tag :cursor_bundle
   test "the exact pinned vendor bundle recognizes memory and bypasses the login-Keychain selector" do
     launcher = System.find_executable("cursor-agent")
     assert is_binary(launcher), "the pinned Cursor acceptance fixture is not installed"
