@@ -584,20 +584,26 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   def handle_call({:apply_model_strict, sid, model, prior_model, caller_deadline}, _from, state) do
-    case Map.fetch(state.models, sid) do
-      {:ok, ^prior_model} ->
-        case strict_apply(state, sid, model, caller_deadline) do
-          :ok -> {:reply, {:ok, model}, put_in(state.models[sid], model)}
-          error -> {:reply, error, drop_model_residency(state, sid)}
+    cond do
+      caller_deadline - System.monotonic_time(:millisecond) <= 0 ->
+        {:reply, {:error, :model_transport_failure}, state}
+
+      true ->
+        case Map.fetch(state.models, sid) do
+          {:ok, ^prior_model} ->
+            case strict_apply(state, sid, model, caller_deadline) do
+              :ok -> {:reply, {:ok, model}, put_in(state.models[sid], model)}
+              error -> {:reply, error, drop_model_residency(state, sid)}
+            end
+
+          {:ok, _cached_model} ->
+            # Cache disagreement proves only that the cache cannot justify this
+            # mutation. It does not reveal the harness owner's current value.
+            {:reply, {:error, :model_readback_unavailable}, drop_model_residency(state, sid)}
+
+          :error ->
+            {:reply, {:error, :model_readback_unavailable}, state}
         end
-
-      {:ok, _cached_model} ->
-        # Cache disagreement proves only that the cache cannot justify this
-        # mutation. It does not reveal the harness owner's current value.
-        {:reply, {:error, :model_readback_unavailable}, drop_model_residency(state, sid)}
-
-      :error ->
-        {:reply, {:error, :model_readback_unavailable}, state}
     end
   end
 
