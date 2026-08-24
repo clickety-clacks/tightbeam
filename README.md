@@ -29,7 +29,7 @@ from the failure — see `mix tightbeam.doctor` and the notes below.
 
 Needed by **both** paths:
 
-- **A registered harness CLI** — `claude` and/or `codex` — installed and on
+- **A registered harness CLI** — `claude`, `codex`, and/or `pi` — installed and on
   PATH *before* you start. Boot refuses by name when it cannot find a usable
   registered harness. `mix tightbeam.doctor` reports each as
   `harness_binary:<harness>`.
@@ -161,13 +161,13 @@ confirm before and after.
   `--security-opt seccomp=unconfined` or an equivalent. A host that cannot
   provide the namespace at all cannot run Codex agents.
 
-If a host cannot be fixed, it can still run `claude` harness sessions, which do
-not use bubblewrap.
+If a host cannot be fixed, it can still run `claude` or `pi` harness sessions,
+which do not use bubblewrap.
 
 ## Install
 
 Install at least one harness first. These are the vendors' install commands;
-install both if you want both harnesses:
+install every harness you intend to use:
 
 ```sh
 npm install -g @anthropic-ai/claude-code
@@ -179,6 +179,13 @@ and/or:
 ```sh
 npm install -g @openai/codex
 codex --version
+```
+
+and/or:
+
+```sh
+npm install -g @earendil-works/pi-coding-agent
+pi --version
 ```
 
 ### From a release package
@@ -347,8 +354,14 @@ vendor's own `login` does not onboard Tightbeam:
 <base_dir>/bin/tightbeam onboard <provider> --as-user <userId>
 ```
 
-`<provider>` is the credential provider — **`anthropic`** or **`openai`** — not
-the harness name. `<userId>` is the admin created by that first pairing. From a
+`<provider>` is the credential provider — **`anthropic`**, **`openai`**, or
+**`opencode-go`** — not the harness name. OpenCode Go is API-key-only:
+
+```sh
+printenv OPENCODE_API_KEY | <base_dir>/bin/tightbeam onboard opencode-go --api-key
+```
+
+`<userId>` is the admin created by that first pairing. From a
 release install `tightbeam` is already on PATH, so the `<base_dir>/bin/` prefix
 is only needed on a source install.
 
