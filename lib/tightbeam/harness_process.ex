@@ -14,6 +14,8 @@ defmodule Tightbeam.HarnessProcess do
   @ssh_opts ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
   @command_timeout_ms 5_000
   @macos_lsof_path "/usr/sbin/lsof"
+  # Debian/Ubuntu install lsof at /usr/bin; some distros keep the sbin legacy path.
+  @linux_lsof_paths ["/usr/bin/lsof", "/usr/sbin/lsof"]
   @old_schema_refusal "The database carries a pre-release harness_processes shape; it is not upgraded by design. Reset the database and restart Tightbeam."
 
   @process_ddl """
@@ -691,12 +693,23 @@ defmodule Tightbeam.HarnessProcess do
   # LISTEN TCP sockets held by ANY process in the launched process group. Returns the runner's
   # `{output, status}` (or `{:error, :timeout}`) for `listener_sample/2` to classify.
   defp lsof_listen_probe(pgid) do
-    # This runs in the gateway LaunchDaemon, whose deliberately small PATH does
-    # not include /usr/sbin. Use the macOS system path directly: an unavailable
-    # probe must fail closed, but a PATH omission is not evidence of a listener.
+    # This runs in the gateway daemon, whose deliberately small PATH does not
+    # include the sbin directories. Use absolute system paths per platform: an
+    # unavailable probe must fail closed, but a PATH omission is not evidence
+    # of a listener. Both supported platforms (darwin-aarch64, linux-x86_64)
+    # resolve here; anything else is honestly unsupported.
     case :os.type() do
-      {:unix, :darwin} -> lsof_listen_probe(pgid, @macos_lsof_path)
-      _other -> {:error, :listener_probe_unsupported_os}
+      {:unix, :darwin} ->
+        lsof_listen_probe(pgid, @macos_lsof_path)
+
+      {:unix, :linux} ->
+        case Enum.find(@linux_lsof_paths, &match?({:ok, _}, lsof_executable(&1))) do
+          nil -> {:error, {:lsof_executable_absent, @linux_lsof_paths}}
+          path -> lsof_listen_probe(pgid, path)
+        end
+
+      _other ->
+        {:error, :listener_probe_unsupported_os}
     end
   end
 
