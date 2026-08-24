@@ -19,7 +19,8 @@ from `<base_dir>/gateway.json`).
 
 This runbook is a MATRIX, not a list: one full pass PER HARNESS the org
 supports (today: claude on `claude-sonnet-5` at effort `medium`, codex on
-`gpt-5.6-sol` at effort `medium`), using a
+`gpt-5.6-sol` at effort `medium`, Pi on `opencode-go/gpt-5.6-luna` at effort
+`medium`), using a
 session of that harness for every step. A smoke run's verdict is
 INCOMPLETE — not passed — until every harness leg has run or been WAIVED by
 name with the blocker stated (e.g. "codex leg waived: no codex grant in the
@@ -31,7 +32,7 @@ Steps behave identically across harnesses unless annotated:
   codex the step becomes its NEGATIVE check where one is stated.
 - **[codex-only]** — the mechanism exists only on codex; claude does not run
   that step.
-- **[divergent]** — both harnesses run it, PASS conditions differ as noted.
+- **[divergent]** — all harnesses run it, PASS conditions differ as noted.
 
 Every `codex exec` invocation redirects `</dev/null`; an open stdin hangs it.
 
@@ -48,12 +49,15 @@ Per-harness annotations for the existing sections:
   `gpt-5.6-sol[low..xhigh]`, `gpt-5.6-luna[medium]`.
 - §9 rails (17–24): [divergent]. Claude asserts hooks in `settings.json`;
   codex asserts `hooks.json` with the org entries plus the trailing
-  `tightbeam-probe` entry, still NO `settings.json` in the codex home.
-  Neither home contains archetype guidance.
+  `tightbeam-probe` entry, still NO `settings.json` in the codex home; Pi
+  asserts `extensions/tightbeam.ts`, whose embedded hook map has the same
+  entries and trailing probe.
+  No projected home contains archetype guidance.
 - Skills verification (when a step exercises one): [divergent] — claude
   invokes via its native Skill tool; codex must READ the skill file by the
   path the Operations pointer names. PASS for codex is the agent quoting
-  skill content it read on demand, not a claim of native discovery.
+  skill content it read on demand, not a claim of native discovery. Pi uses
+  native discovery under `.pi/skills`.
 
 ## Preflight: harnesses are installed and logged in
 
@@ -104,6 +108,9 @@ on 2026-07-25:
   binary — so a working credential and a current `codex` on PATH are the whole
   requirement. An outdated `codex` yields an EMPTY catalog with no error from
   the provider; the refusal names the version and says to upgrade the binary.
+- **Pi model catalog** is a host-local call to Pi's public provider catalog.
+  The credential gate still requires the host's banked OpenCode Go key before
+  the inventory is routable; catalog membership alone is not model liveness.
 - **Default model must match default harness** (`TIGHTBEAM_DEFAULT_HARNESS` /
   `TIGHTBEAM_DEFAULT_MODEL`, or archetype `[defaults]`); the claude default
   against a codex org fails `model_unavailable` at spawn.
@@ -151,6 +158,7 @@ on 2026-07-25:
   TIGHTBEAM_BASE_DIR=~/.tightbeam-beam \
   TIGHTBEAM_SMOKE_MODEL_CLAUDE='claude-sonnet-5' TIGHTBEAM_SMOKE_EFFORT_CLAUDE='medium' \
   TIGHTBEAM_SMOKE_MODEL_CODEX='gpt-5.6-sol' TIGHTBEAM_SMOKE_EFFORT_CODEX='medium' \
+  TIGHTBEAM_SMOKE_MODEL_PI='opencode-go/gpt-5.6-luna' TIGHTBEAM_SMOKE_EFFORT_PI='medium' \
   mix run --no-start scripts/feature_smoke.exs
   ```
 
@@ -352,7 +360,9 @@ the tool call, with the statute text delivered only as the denial reason.
     `settings.json` decodes with one `hooks.PreToolUse` entry per statute
     (matcher "Bash"). The codex home's `hooks.json` decodes with one entry
     per statute plus `tightbeam-probe` LAST; the codex home still has NO
-    `settings.json`. Existing sessions are not refreshed automatically.
+    `settings.json`. The Pi home's `extensions/tightbeam.ts` embeds that same
+    ordered hook set and trailing probe. Existing sessions are not refreshed
+    automatically.
     **Count every statute the org has, not just the ones you copied.**
     `mix tightbeam.init` seeds `identity/rails/engineering.toml` (5 statutes),
     so a real org shows those plus the example's — the assertion is a 1:1
@@ -362,28 +372,32 @@ the tool call, with the statute text delivered only as the denial reason.
     `AGENTS.md`, nor archetype skill directories. Run `tightbeam identity
     status <archetype>` and inspect both composed instruction channels.
     PASS: statute names/text are absent from the composed guidance; guidance
-    arrives only through the Codex developer message / Claude system prompt.
+    arrives only through the Codex developer message, Claude system prompt, or
+    Pi's Tightbeam-owned `before_agent_start` carrier.
 19. [manual] Live refusal [divergent]: in a scratch git repo, tell a real session to
     run exactly `git reset --hard HEAD`, then `git status`, and report what
     happened. The claude fallback is `claude -p
     --dangerously-skip-permissions` inside the projected home.
     PASS: the reset is refused BEFORE execution. Claude's reply quotes
     `[gate: no-history-rewrites]`; codex quotes `Command blocked by
-    PreToolUse hook: [gate: no-history-rewrites] …`. In both, the agent must
+    PreToolUse hook: [gate: no-history-rewrites] …`; Pi receives the same
+    `[gate: no-history-rewrites]` reason from its pre-tool extension. In every
+    leg, the agent must
     report that the runtime refused it, not that it declined; `git status`
     runs normally and the repo is untouched. Repeat with `git push origin
     main` → `[gate: no-push-main]` refusal.
-20. [manual] Boot wiring-check evidence [codex-only]: confirm the codex adapter boot
-    log contains `gate wiring-check PASS [gate: tightbeam-probe]`. Delete the
-    projected home's `hooks.json` and restart the adapter.
+20. [manual] Boot wiring-check evidence [divergent]: for Codex and Pi, confirm
+    the adapter boot log contains `gate wiring-check PASS [gate:
+    tightbeam-probe]`. Delete Codex's projected `hooks.json` or Pi's projected
+    `extensions/tightbeam.ts`, then restart that adapter.
     PASS: the adapter REFUSES to boot with `gate_attestation_failed`, and no
-    codex session is served. Restore by changing MANIFEST BYTES: edit a
+    session on that harness is served. Restore by changing MANIFEST BYTES: edit a
     statute, or delete the home's `.tightbeam/manifest` stamp, then **spawn a
     session** — regeneration is ownership-scoped to projection, which happens at
     SPAWN, not at gateway restart. A restart alone does not rewrite `hooks.json`,
-    and waiting for one to leaves the adapter looping on `wiring-check FAIL`.
+    and waiting for one leaves the adapter looping on `wiring-check FAIL`.
     Then confirm regeneration is real rather than cached: the rewritten
-    `hooks.json` must carry the edited statute's current text.
+    regenerated harness artifact must carry the edited statute's current text.
     This demonstrates silent-misconfig detection, NOT tamper resistance.
 
     Do NOT assert that `sessions/`, history, transcripts and memory stay
