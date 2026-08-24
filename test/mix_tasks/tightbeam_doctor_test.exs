@@ -34,6 +34,7 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
        %{
          "claude" => [entry("claude-live", ["medium"])],
          "codex" => [entry("codex-live", ["high"])],
+         "pi" => [entry("opencode-go/gpt-5.6-luna", ["medium"])],
          "fixture" => [entry("fixture-model", [])]
        }}
 
@@ -156,6 +157,7 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
     probe = fn
       :claude, _cli_bin -> {:ok, %{bin: "/fake/claude", version: "claude 1.0"}}
       :codex, _cli_bin -> {:error, :not_found}
+      :pi, _cli_bin -> {:error, :not_found}
       :fixture, _cli_bin -> {:error, :not_found}
     end
 
@@ -449,6 +451,7 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
     probe = fn
       :claude, _cli_bin -> {:ok, %{bin: "/fake/claude", version: "claude 1.0"}}
       :codex, _cli_bin -> {:error, {:exec_failed, "node: not found"}}
+      :pi, _cli_bin -> {:ok, %{bin: "/fake/pi", version: "pi 1.0"}}
       :fixture, _cli_bin -> {:ok, %{bin: "/fake/fixture", version: "fixture 1.0"}}
     end
 
