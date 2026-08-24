@@ -3066,7 +3066,7 @@ defmodule Tightbeam.Gateway do
   defp apply_failure(%{"message" => message}) when is_binary(message), do: message
   defp apply_failure(reason), do: inspect(reason)
 
-  @onboarding_providers ["openai", "anthropic"] ++
+  @onboarding_providers ["openai", "anthropic", "opencode-go"] ++
                           if(Application.compile_env(:tightbeam, :fixture_harness, false),
                             do: ["fixture-provider"],
                             else: []
@@ -3077,7 +3077,7 @@ defmodule Tightbeam.Gateway do
     machine = params[:machine] || Placement.local_host_name()
 
     with true <- Map.has_key?(Placement.hosts(config.base_dir, gateway_db(config)), machine),
-         {:ok, kind} <- onboarding_kind(params[:kind]) do
+         {:ok, kind} <- provider_onboarding_kind(provider, params[:kind]) do
       config
       |> onboard_phase(
         provider_atom(provider),
@@ -3091,6 +3091,12 @@ defmodule Tightbeam.Gateway do
     else
       false ->
         %{code: "unknown_host", message: "unknown onboarding machine #{machine}"}
+
+      {:error, :api_key_only} ->
+        %{
+          code: "invalid_message",
+          message: "opencode-go requires credential kind apiKey; subscription is unsupported"
+        }
 
       :error ->
         %{
@@ -3208,8 +3214,13 @@ defmodule Tightbeam.Gateway do
   defp onboarding_kind("apiKey"), do: {:ok, :api_key}
   defp onboarding_kind(_unknown), do: :error
 
+  defp provider_onboarding_kind("opencode-go", "apiKey"), do: {:ok, :api_key}
+  defp provider_onboarding_kind("opencode-go", _kind), do: {:error, :api_key_only}
+  defp provider_onboarding_kind(_provider, kind), do: onboarding_kind(kind)
+
   defp provider_atom("openai"), do: :openai
   defp provider_atom("anthropic"), do: :anthropic
+  defp provider_atom("opencode-go"), do: :opencode_go
   defp provider_atom("fixture-provider"), do: :fixture_provider
 
   defp role_bind_result(db, call) do

@@ -32,7 +32,7 @@ defmodule Tightbeam.Credentials do
   @ssh_opts ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
   @fixture_provider? Application.compile_env(:tightbeam, :fixture_harness, false)
 
-  @type provider :: :openai | :anthropic | :fixture_provider
+  @type provider :: :openai | :anthropic | :opencode_go | :fixture_provider
   @type kind :: :api_key | :subscription
   @type status :: :onboarded | {:needs_onboarding, term()}
 
@@ -151,6 +151,7 @@ defmodule Tightbeam.Credentials do
       case provider do
         :openai -> Path.join([base_dir, "auth", "codex", "auth.json"])
         :anthropic -> Path.join([base_dir, "auth", "claude", ".credentials.json"])
+        :opencode_go -> Path.join([base_dir, "auth", "pi", "auth.json"])
         :fixture_provider -> Path.join([base_dir, "auth", "fixture", "fixture.json"])
       end
 
@@ -175,9 +176,10 @@ defmodule Tightbeam.Credentials do
   the existing good credential must survive the refusal, which is why this runs BEFORE the
   write rather than validating after.
 
-  The deep check is anthropic-only ON PURPOSE. That is the record shape this incident
-  produced and the one shape verified against a live file; openai and fixture get the blank
-  check alone, because inventing structure a file never had is how this area breaks.
+  A deep check exists only for observed vendor records. Anthropic checks the OAuth shape
+  that produced the original incident. OpenCode Go checks Pi's native provider map, which
+  was verified with Pi 0.84.1. OpenAI and fixture get the blank check alone, because
+  inventing structure a file never had is how this area breaks.
 
   What decides the deep test is the PRESENCE of the `claudeAiOauth` key, not its type. A
   populated object is inspected field by field; a present but unusable one — `null`, `""`, a
@@ -210,12 +212,14 @@ defmodule Tightbeam.Credentials do
         :ok
 
       found ->
+        provider_name = provider_cli_name(provider)
+
         sentence =
-          "refusing to bank a hollow #{provider} credential from #{source}: #{found}. " <>
+          "refusing to bank a hollow #{provider_name} credential from #{source}: #{found}. " <>
             "Nothing was banked — the credential on this host is unchanged. A credential " <>
             "with no usable token cannot authenticate a turn, and writing it would report " <>
             "success now and fail every session later. Delete that file and re-run " <>
-            "`tightbeam onboard #{provider}`."
+            "`tightbeam onboard #{provider_name}`."
 
         {:error, {:hollow_credential, %{source: source, found: found, sentence: sentence}}}
     end
@@ -256,7 +260,37 @@ defmodule Tightbeam.Credentials do
     end
   end
 
+  # Recorded from Pi 0.84.1 on 2026-08-23. Pi's native file is a provider map,
+  # and `pi auth check --provider opencode-go` accepts this exact API-key shape.
+  # A missing or differently typed key cannot authenticate, so refuse it at the
+  # write seam rather than banking a file that Pi will later report as absent.
+  defp deep_hollow(:opencode_go, bytes) do
+    case JSON.decode(bytes) do
+      {:ok, %{"opencode-go" => %{"type" => "api_key", "key" => key}}}
+      when is_binary(key) ->
+        if String.trim(key) == "", do: "opencode-go.key is empty", else: nil
+
+      {:ok, %{"opencode-go" => %{"type" => "api_key"}}} ->
+        "opencode-go.key is missing or is not text"
+
+      {:ok, %{"opencode-go" => %{"type" => type}}} ->
+        "opencode-go.type is #{inspect(type)}; Pi requires api_key"
+
+      {:ok, %{"opencode-go" => _other}} ->
+        "opencode-go is present but is not a Pi API-key record"
+
+      {:ok, _other} ->
+        "the Pi auth.json has no opencode-go API-key record"
+
+      {:error, _reason} ->
+        "the Pi auth.json is not valid JSON"
+    end
+  end
+
   defp deep_hollow(_provider, _bytes), do: nil
+
+  defp provider_cli_name(:opencode_go), do: "opencode-go"
+  defp provider_cli_name(provider), do: Atom.to_string(provider)
 
   # Each answer names the FIELD, not just "invalid": the operator reading this has a file in
   # front of them and needs to know which value went missing.
@@ -752,6 +786,14 @@ defmodule Tightbeam.Credentials do
     end
   end
 
+  defp write_credential!(state, :opencode_go, credential) do
+    with :ok <- refuse_hollow(:opencode_go, credential.bytes, "the onboarding ceremony") do
+      atomic_write!(credential_store_path(state, :opencode_go), credential.bytes)
+      reconcile_provider_homes(state, :opencode_go)
+      :ok
+    end
+  end
+
   defp write_credential!(state, :fixture_provider, credential) do
     with :ok <- refuse_hollow(:fixture_provider, credential.bytes, "the onboarding ceremony") do
       atomic_write!(credential_store_path(state, :fixture_provider), credential.bytes)
@@ -1153,11 +1195,15 @@ defmodule Tightbeam.Credentials do
   defp credential_store_path(state, :anthropic),
     do: Path.join([state.base_dir, "auth", "claude", ".credentials.json"])
 
+  defp credential_store_path(state, :opencode_go),
+    do: Path.join([state.base_dir, "auth", "pi", "auth.json"])
+
   defp credential_store_path(state, :fixture_provider),
     do: Path.join([state.base_dir, "auth", "fixture", "fixture.json"])
 
   defp harness_name(:openai), do: "codex"
   defp harness_name(:anthropic), do: "claude"
+  defp harness_name(:opencode_go), do: "pi"
   defp harness_name(:fixture_provider), do: "fixture"
 
   defp atomic_write!(path, bytes) do
@@ -1216,6 +1262,13 @@ defmodule Tightbeam.Credentials do
     end
   end
 
+  defp staged_credential(:opencode_go, kind, path) do
+    case File.read(Path.join(path, "auth.json")) do
+      {:ok, bytes} -> {:ok, Map.put(installed_metadata(:opencode_go, kind), :bytes, bytes)}
+      {:error, reason} -> {:error, {:opencode_go_failed, reason}}
+    end
+  end
+
   defp staged_credential(:fixture_provider, kind, path) do
     case File.read(Path.join(path, "fixture.json")) do
       {:ok, bytes} -> {:ok, Map.put(installed_metadata(:fixture_provider, kind), :bytes, bytes)}
@@ -1267,6 +1320,7 @@ defmodule Tightbeam.Credentials do
 
   defp staged_path(:openai, path), do: Path.join(path, "auth.json")
   defp staged_path(:anthropic, path), do: Path.join(path, ".credentials.json")
+  defp staged_path(:opencode_go, path), do: Path.join(path, "auth.json")
   defp staged_path(:fixture_provider, path), do: Path.join(path, "fixture.json")
 
   defp onboarding_staging_path(%{ssh: nil}, provider) do

@@ -599,6 +599,10 @@ COMMANDS:
         printenv ANTHROPIC_API_KEY | tightbeam onboard anthropic --api-key
       The key is validated against the provider before it is banked, and it
       never leaves this machine.
+  onboard opencode-go --api-key
+      Bank an OpenCode Go API key for Pi. The key is read from stdin, validated
+      by one live Pi-shaped model request, and stored in Pi's native auth.json
+      form. OpenCode Go has no subscription onboarding path here.
   onboard github [--hostname github.com] [--remote URL]
       Prove or create this host's GitHub CLI browser/device login, then stamp
       non-secret capability metadata. The credential is banked file-backed
@@ -1952,8 +1956,12 @@ fn parse_onboard(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Comm
     }
     let provider = parsed.positional[1].clone();
     let fixture_provider = cfg!(test) && provider == "fixture-provider";
-    if !matches!(provider.as_str(), "openai" | "anthropic" | "github") && !fixture_provider {
-        return Err("provider must be openai, anthropic, or github".to_owned());
+    if !matches!(
+        provider.as_str(),
+        "openai" | "anthropic" | "opencode-go" | "github"
+    ) && !fixture_provider
+    {
+        return Err("provider must be openai, anthropic, opencode-go, or github".to_owned());
     }
     let allowed = [
         "api-key",
@@ -1971,6 +1979,12 @@ fn parse_onboard(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Comm
     if provider == "github" && flags.contains_key("api-key") {
         return Err(
             "tightbeam onboard github does not accept --api-key; use GitHub CLI browser/device auth"
+                .to_owned(),
+        );
+    }
+    if provider == "opencode-go" && !flags.contains_key("api-key") {
+        return Err(
+            "tightbeam onboard opencode-go requires --api-key; OpenCode Go has no subscription onboarding path"
                 .to_owned(),
         );
     }
@@ -2477,6 +2491,33 @@ mod tests {
     }
 
     #[test]
+    fn opencode_go_onboard_is_api_key_only() {
+        assert_eq!(
+            parse(strings(&[
+                "onboard",
+                "opencode-go",
+                "--api-key",
+                "--as-user",
+                "flynn"
+            ])),
+            Ok(Command::Onboard {
+                identity: Identity::User("flynn".to_owned()),
+                provider: "opencode-go".to_owned(),
+                api_key: true,
+                hostname: None,
+                remote: None,
+            })
+        );
+        assert_eq!(
+            parse(strings(&["onboard", "opencode-go"])),
+            Err(
+                "tightbeam onboard opencode-go requires --api-key; OpenCode Go has no subscription onboarding path"
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
     fn update_clients_is_an_admin_fleet_ceremony() {
         assert_eq!(
             parse(strings(&["update-clients", "--as-user", "flynn"])),
@@ -2605,6 +2646,7 @@ mod tests {
             "identity status [<archetype>]",
             "identity apply (<session> | --all)",
             "onboard openai|anthropic [--api-key]",
+            "onboard opencode-go --api-key",
             "onboard github [--hostname github.com] [--remote URL]",
             "add-user <userId> [--admin]",
             "config get default-archetype",
