@@ -368,7 +368,12 @@ defmodule Tightbeam.Harness.Support do
       if railed? and profile.railed_probe do
         Keyword.merge(plan,
           probe_cwd: Path.join(base, "work/gate-probe"),
-          probe_model: Tightbeam.Model.new("gpt-5.6-sol", effort: "medium")
+          probe_model:
+            Map.get(
+              profile,
+              :probe_model,
+              Tightbeam.Model.new("gpt-5.6-sol", effort: "medium")
+            )
         )
       else
         plan
@@ -949,7 +954,16 @@ defmodule Tightbeam.Harness.Support do
 
   defp install_fake_adapter!(adapter, profile) do
     node_modules = adapter |> Path.dirname() |> Path.dirname()
-    package_dir = Path.join([node_modules, "@agentclientprotocol", profile.adapter_package])
+
+    package_dir =
+      case Map.get(profile, :adapter_scope, :agentclientprotocol) do
+        :unscoped ->
+          Path.join(node_modules, profile.adapter_package)
+
+        :agentclientprotocol ->
+          Path.join([node_modules, "@agentclientprotocol", profile.adapter_package])
+      end
+
     bundle = Path.join([package_dir, "dist", profile.adapter_bundle])
     File.mkdir_p!(Path.dirname(adapter))
     File.mkdir_p!(Path.dirname(bundle))
