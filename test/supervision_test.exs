@@ -2477,6 +2477,45 @@ defmodule Tightbeam.SupervisionTest do
            ) == 1
   end
 
+  test "a typed filing committed after claim suppresses delivery without advancing the ladder",
+       ctx do
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
+    transient = Map.put(ctx.handlers, "wake", fn _ -> %{code: "server_error"} end)
+    seq = terminal!(ctx.db, "holder")
+
+    assert {:refused, "server_error"} =
+             Supervision.evaluate(ctx.db, transient, 3, "holder", seq)
+
+    assert %{attemptCount: 1, prodCount: 0} = Supervision.prod_state(ctx.db, "asg_1")
+
+    assert %{pendingBranch: "prod", lastEvaluatedTerminal: ^seq} =
+             pending =
+             Supervision.watermark(ctx.db, "holder")
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO attests (id, assignmentId, kind, verdictKind, byUser, ts) VALUES ('att_between','asg_1','verdict','verified','flynn',2)"
+      )
+
+    assert :duplicate = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
+
+    assert %{pendingBranch: nil, lastEvaluatedTerminal: ^seq} =
+             Supervision.watermark(ctx.db, "holder")
+
+    assert %{attemptCount: 0, prodCount: 0, attestCount: 1} =
+             Supervision.prod_state(ctx.db, "asg_1")
+
+    assert Wakes.list_pending(ctx.db) == []
+
+    assert Enum.any?(
+             EventLog.lifecycle_events(ctx.db),
+             &(&1.kind == "supervision_delivery_suppressed" and &1.subject == "asg_1")
+           )
+
+    assert pending.pendingAssignment == "asg_1"
+  end
+
   test "statute-tier denials clear atomically, count attempts only, and block at the threshold",
        ctx do
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)

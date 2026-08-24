@@ -4443,6 +4443,32 @@ defmodule Tightbeam.Gateway do
        ) do
     p = call.params
 
+    case revalidate_supervision_delivery_in_txn(txn, call) do
+      :ready ->
+        schedule_validated_wake_row_in_txn(
+          txn,
+          call,
+          session_key,
+          due_at,
+          condition_kind,
+          condition_scope
+        )
+
+      reason when reason in [:suppressed, :stale] ->
+        %{suppressed: true, reason: reason, assignment_id: p[:assignment_id]}
+    end
+  end
+
+  defp schedule_validated_wake_row_in_txn(
+         txn,
+         call,
+         session_key,
+         due_at,
+         condition_kind,
+         condition_scope
+       ) do
+    p = call.params
+
     wake =
       Wakes.schedule_in_txn(txn, %{
         session_key: session_key,
@@ -4480,6 +4506,33 @@ defmodule Tightbeam.Gateway do
     schedule_supervision_controller_in_txn(txn, call, wake)
     wake
   end
+
+  defp revalidate_supervision_delivery_in_txn(
+         txn,
+         %{
+           principal: {:process, "tightbeam"},
+           params: %{
+             supervision_wake_kind: branch,
+             supervision_session_key: session_key,
+             supervision_terminal_seq: terminal_seq,
+             supervision_k: k,
+             supervision_n: n,
+             assignment_id: assignment_id
+           }
+         }
+       )
+       when branch in ["prod", "escalation"] do
+    Supervision.revalidate_delivery_in_txn(txn, %{
+      sessionKey: session_key,
+      lastEvaluatedTerminal: terminal_seq,
+      pendingBranch: branch,
+      pendingAssignment: assignment_id,
+      pendingK: k,
+      pendingN: n
+    })
+  end
+
+  defp revalidate_supervision_delivery_in_txn(_txn, _call), do: :ready
 
   defp bind_liveness_checkpoint_in_txn(
          txn,
