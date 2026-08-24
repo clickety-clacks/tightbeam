@@ -612,11 +612,12 @@ fn run_api_key_onboarding(
     machine: Option<&str>,
     ceremony: &Ceremony<'_>,
 ) -> Result<(), String> {
-    let key = read_api_key()?;
+    let key = read_api_key(provider)?;
     validate_api_key(provider, &key, machine, ceremony.deadline)?;
     match provider {
         "openai" => bank_openai_api_key(staging, &key, ceremony),
         "anthropic" => bank_anthropic_api_key(staging, &key),
+        "opencode-go" => bank_opencode_go_api_key(staging, &key),
         #[cfg(test)]
         "fixture-provider" => fs::write(std::path::Path::new(staging).join("fixture.json"), &key)
             .map_err(|error| error.to_string()),
@@ -633,9 +634,9 @@ fn run_api_key_onboarding(
 /// path is non-interactive by design anyway. So the terminal case is refused
 /// with the exact command that works, which is also the form codex's own
 /// `login --with-api-key` documents.
-fn read_api_key() -> Result<String, String> {
+fn read_api_key(provider: &str) -> Result<String, String> {
     if unsafe { libc::isatty(libc::STDIN_FILENO) } == 1 {
-        return Err(api_key_needs_a_pipe());
+        return Err(api_key_needs_a_pipe(provider));
     }
     read_api_key_from(&mut io::stdin())
 }
@@ -655,11 +656,38 @@ fn read_api_key_from(reader: &mut impl io::Read) -> Result<String, String> {
 /// `isatty` directly and a unit test cannot stub that, but the remedy it prints
 /// is the whole value of the refusal. Same shape, and same reason, as
 /// `unnamed_machine`.
-fn api_key_needs_a_pipe() -> String {
-    "--api-key reads the key from stdin and will not read from a terminal, because a key \
-     typed at a prompt ends up in your shell scrollback. Pipe it in instead, e.g.\n  \
-     printenv ANTHROPIC_API_KEY | tightbeam onboard anthropic --api-key"
-        .to_owned()
+fn api_key_needs_a_pipe(provider: &str) -> String {
+    let variable = match provider {
+        "openai" => "OPENAI_API_KEY",
+        "opencode-go" => "OPENCODE_API_KEY",
+        _ => "ANTHROPIC_API_KEY",
+    };
+    format!(
+        "--api-key reads the key from stdin and will not read from a terminal, because a key \
+         typed at a prompt ends up in your shell scrollback. Pipe it in instead, e.g.\n  \
+         printenv {variable} | tightbeam onboard {provider} --api-key"
+    )
+}
+
+fn opencode_go_validation_request_id() -> String {
+    let minted = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("tightbeam-onboard-{}-{minted}", std::process::id())
+}
+
+fn opencode_go_validation_body() -> serde_json::Value {
+    serde_json::json!({
+        "model": "gpt-5.6-luna",
+        "input": [{
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Reply with OK."}]
+        }],
+        "max_output_tokens": 16,
+        "stream": false,
+        "store": false
+    })
 }
 
 /// One authenticated models call, made from THIS host, before anything is banked.
@@ -668,13 +696,15 @@ fn api_key_needs_a_pipe() -> String {
 /// reaches a command line -- not even a `curl` invocation this process would
 /// spawn, which would put a billing credential in the process table.
 ///
-/// Recorded 2026-07-28 against both routes with deliberately invalid keys:
+/// Recorded 2026-07-28 against both original routes with deliberately invalid keys:
 /// anthropic answers `x-api-key` with 401 "API key is invalid.", and openai
 /// answers a bearer key with 401 `invalid_api_key`. The openai result is the
 /// load-bearing one: a ChatGPT subscription token is refused from that same route
 /// with 403 naming the missing scope `api.model.read`, so the route does
-/// distinguish the two kinds. A VALID key has not been exercised against either
-/// route from this fleet -- see credential-kinds-v1.
+/// distinguish the two kinds. Recorded 2026-08-23 against OpenCode Go with a
+/// valid key: a Pi-shaped Responses request for `gpt-5.6-luna` returned 200 and
+/// Pi reported `stop_reason=stop`. The request floor of 16 output tokens is the
+/// provider minimum that Pi applies itself.
 fn validate_api_key(
     provider: &str,
     key: &str,
@@ -696,20 +726,33 @@ fn validate_api_key_with_timeout(
     timeout: Duration,
 ) -> Result<(), String> {
     let agent = validation_agent(timeout);
-    let request = match provider {
+    let response = match provider {
         "anthropic" => agent
             .get("https://api.anthropic.com/v1/models?limit=1")
             .set("x-api-key", key)
-            .set("anthropic-version", "2023-06-01"),
+            .set("anthropic-version", "2023-06-01")
+            .call(),
         "openai" => agent
             .get("https://api.openai.com/v1/models")
-            .set("authorization", &format!("Bearer {key}")),
+            .set("authorization", &format!("Bearer {key}"))
+            .call(),
+        "opencode-go" => {
+            let request_id = opencode_go_validation_request_id();
+            agent
+                .post("https://opencode.ai/zen/go/v1/responses")
+                .set("authorization", &format!("Bearer {key}"))
+                .set("x-opencode-client", "pi")
+                .set("x-opencode-session", &request_id)
+                .set("x-client-request-id", &request_id)
+                .set("content-type", "application/json")
+                .send_string(&opencode_go_validation_body().to_string())
+        }
         #[cfg(test)]
         "fixture-provider" => return Ok(()),
         _ => return Err(format!("unsupported provider: {provider}")),
     };
 
-    match request.call() {
+    match response {
         Ok(_response) => Ok(()),
         Err(ureq::Error::Status(status, response)) => {
             let body = match response.into_string() {
@@ -826,6 +869,26 @@ fn bank_anthropic_api_key(staging: &str, key: &str) -> Result<(), String> {
         .open(&path)
         .map_err(|error| format!("could not stage the API key at {}: {error}", path.display()))?;
     file.write_all(key.as_bytes())
+        .map_err(|error| format!("could not stage the API key at {}: {error}", path.display()))
+}
+
+/// Pi reads OpenCode Go credentials from its native `auth.json` provider map.
+/// The key is serialized directly into the file; it never reaches a child
+/// process, an argument, or an environment variable.
+fn bank_opencode_go_api_key(staging: &str, key: &str) -> Result<(), String> {
+    let path = std::path::Path::new(staging).join("auth.json");
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "opencode-go": {"type": "api_key", "key": key}
+    }))
+    .map_err(|error| format!("could not encode the Pi credential: {error}"))?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|error| format!("could not stage the API key at {}: {error}", path.display()))?;
+    file.write_all(&bytes)
         .map_err(|error| format!("could not stage the API key at {}: {error}", path.display()))
 }
 
@@ -2190,11 +2253,31 @@ mod tests {
     /// guessing at an invocation that does not exist anywhere else.
     #[test]
     fn refusing_a_terminal_names_the_pipe_form() {
-        let message = api_key_needs_a_pipe();
+        let message = api_key_needs_a_pipe("anthropic");
 
         assert!(message.contains("printenv"));
         assert!(message.contains("--api-key"));
         assert!(message.contains("scrollback"));
+    }
+
+    #[test]
+    fn opencode_go_terminal_remedy_names_only_the_environment_variable() {
+        let message = api_key_needs_a_pipe("opencode-go");
+
+        assert!(message.contains("printenv OPENCODE_API_KEY"));
+        assert!(message.contains("onboard opencode-go --api-key"));
+    }
+
+    #[test]
+    fn opencode_go_validation_uses_the_live_pi_request_shape() {
+        let body = opencode_go_validation_body();
+
+        assert_eq!(body["model"], "gpt-5.6-luna");
+        assert_eq!(body["max_output_tokens"], 16);
+        assert_eq!(body["stream"], false);
+        assert_eq!(body["store"], false);
+        assert!(body.get("session_id").is_none());
+        assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
     }
 
     /// A subscription credential is a BEARER token, and sending it as `x-api-key` would
@@ -2319,6 +2402,39 @@ mod tests {
         assert_eq!(fs::read_to_string(&staged).unwrap(), "sk-ant-api03-test");
         let mode = fs::metadata(&staged).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+
+        let _ = fs::remove_dir_all(&staging);
+    }
+
+    #[test]
+    fn an_opencode_go_key_stages_native_pi_auth_without_an_argv_secret() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let staging = std::env::temp_dir().join(format!(
+            "tightbeam-opencode-go-stage-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = fs::remove_dir_all(&staging);
+        fs::create_dir_all(&staging).unwrap();
+
+        bank_opencode_go_api_key(staging.to_str().unwrap(), "fixture-go-key").unwrap();
+
+        let staged = staging.join("auth.json");
+        let decoded: serde_json::Value =
+            serde_json::from_slice(&fs::read(&staged).unwrap()).unwrap();
+        assert_eq!(
+            decoded,
+            serde_json::json!({
+                "opencode-go": {"type": "api_key", "key": "fixture-go-key"}
+            })
+        );
+        let mode = fs::metadata(&staged).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        let gateway = include_str!("../../lib/tightbeam/credentials.ex");
+        assert!(gateway.contains("staged_credential(:opencode_go"));
+        assert!(gateway.contains("Path.join(path, \"auth.json\")"));
 
         let _ = fs::remove_dir_all(&staging);
     }
