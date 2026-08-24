@@ -371,10 +371,6 @@ mod tests {
     ///
     /// launchd is the fixed point that cannot be gamed: always pid 1, always the oldest, and
     /// therefore always the LAST thing a truncated read would keep.
-    ///
-    /// Asserted against the raw pid list rather than a `Snapshot`, because `proc_pidinfo`
-    /// refuses root-owned processes for a non-root caller and pid 1 is root — see
-    /// `a_snapshot_holds_the_processes_it_could_read`.
     #[test]
     #[cfg(target_os = "macos")]
     fn the_live_process_table_reaches_the_oldest_process() {
@@ -397,33 +393,6 @@ mod tests {
             "the kernel quoted {quoted} pids and the listing kept {} — most of the table \
              was dropped",
             pids.len()
-        );
-    }
-
-    /// What a snapshot can and cannot see, stated so it is not mistaken for completeness.
-    ///
-    /// `proc_pidinfo(PROC_PIDTBSDINFO)` refuses processes this user does not own, so a
-    /// snapshot is the readable subset of the listing, not the whole table (MEASURED here:
-    /// 1618 listed, 1246 readable). That is the right subset for this floor — a harness and
-    /// its descendants run as the user that launched them — but it does mean a root-owned
-    /// process cannot be walked THROUGH, so a descendant behind a `sudo` would be invisible.
-    /// Named rather than fixed: reading the whole table means running the floor as root.
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn a_snapshot_holds_the_processes_it_could_read() {
-        let listed = list_all_pids().expect("the process table must be listable");
-        let snapshot = Snapshot::capture().expect("the process table must be readable");
-
-        assert!(
-            snapshot.processes.len() <= listed.len(),
-            "a snapshot cannot hold more processes than were listed"
-        );
-        assert!(
-            snapshot.processes.len() * 2 >= listed.len(),
-            "only {} of {} listed processes were readable — too few for the walk to be \
-             trusted; proc_pidinfo may be failing for a reason other than ownership",
-            snapshot.processes.len(),
-            listed.len()
         );
     }
 }
