@@ -310,7 +310,19 @@ defmodule Tightbeam.Assignments do
     end)
   end
 
-  @doc "Return the latest linked review round holder's qualifying verdict kind."
+  @doc """
+  Return the latest linked review round holder's qualifying verdict kind.
+
+  Holder verdicts are the judgments. Assignment lifecycle rows are only their
+  durable history, so an open, completed, surrendered, or revoked review card
+  with no verdict by its holder cannot displace a standing judgment.
+
+  Each candidate card is joined to its exact latest holder-verdict row. The
+  winning card and verdict therefore come from one identity, ordered by verdict
+  time and row identity rather than by when the card opened. Once selected, the
+  existing independence guard still applies: a newer self-held verdict cannot
+  launder an older independent reviewed-clean verdict.
+  """
   @spec qualifying_review_verdict_kinds(DB.server(), String.t(), String.t()) :: [String.t()]
   def qualifying_review_verdict_kinds(db, assignment_id, assignment_holder_key) do
     {:ok, rows} =
@@ -318,24 +330,30 @@ defmodule Tightbeam.Assignments do
         db,
         """
         WITH latest_review AS (
-          SELECT id, holderKey
-          FROM assignments
-          WHERE reviewsAssignmentId = ?1
-          ORDER BY openedAt DESC, rowid DESC
+          SELECT
+            r.holderKey,
+            lv.verdictKind AS latestVerdictKind,
+            lv.ts AS latestVerdictTs,
+            lv.rowid AS latestVerdictRowid
+          FROM assignments AS r
+          JOIN attests AS lv
+            ON lv.rowid = (
+              SELECT v.rowid
+              FROM attests AS v
+              WHERE v.assignmentId = r.id
+                AND v.kind = 'verdict'
+                AND v.bySession = r.holderKey
+              ORDER BY v.ts DESC, v.rowid DESC
+              LIMIT 1
+            )
+          WHERE r.reviewsAssignmentId = ?1
+          ORDER BY latestVerdictTs DESC, latestVerdictRowid DESC
           LIMIT 1
         )
-        SELECT 'reviewed-clean'
+        SELECT latestVerdictKind
         FROM latest_review AS r
         WHERE r.holderKey != ?2
-          AND (
-          SELECT v.verdictKind
-          FROM attests AS v
-          WHERE v.assignmentId = r.id
-            AND v.kind = 'verdict'
-            AND v.bySession = r.holderKey
-          ORDER BY v.ts DESC, v.rowid DESC
-          LIMIT 1
-          ) = 'reviewed-clean'
+          AND latestVerdictKind = 'reviewed-clean'
         """,
         [assignment_id, assignment_holder_key]
       )

@@ -204,7 +204,8 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
     assert ci_workflow =~
              "if: startsWith(github.ref, 'refs/heads/0.1.') || startsWith(github.ref, 'refs/tags/v')"
 
-    assert ci_workflow =~ "maintenance_ref=$(sh scripts/highest_0_1_branch.sh)"
+    assert ci_workflow =~
+             ~s(sh scripts/validate_release_tag.sh "$GITHUB_REF_NAME" "$GITHUB_SHA")
   end
 
   test "workflow publishes final proof only behind all test and package jobs" do
