@@ -58,7 +58,7 @@ defmodule Tightbeam.ClientFleetProof do
          {:ok, manifest_sha} <- lower_sha(Map.get(proof, :manifest_sha256)),
          {:ok, terminal} <- protocols(Map.get(proof, :terminal_protocols)),
          {:ok, transitions} <- protocols(Map.get(proof, :release_transition_protocols)),
-         results when is_list(results) <- Map.get(proof, :results),
+         {:ok, results} <- proof_results(Map.get(proof, :results)),
          :ok <- matching_results(hosts, results),
          {:ok, result_body} <- encode_results(results) do
       bytes =
@@ -73,13 +73,16 @@ defmodule Tightbeam.ClientFleetProof do
       {:ok, fleet_receipt} = receipt(bytes)
       {:ok, Map.put(fleet_receipt, :host_set_sha256, host_receipt.sha256)}
     else
-      nil -> {:error, :missing_results}
       false -> {:error, :invalid_proof}
       error -> error
     end
   end
 
   def fleet_proof(_, _), do: {:error, :invalid_proof}
+
+  defp proof_results(nil), do: {:error, :missing_results}
+  defp proof_results(results) when is_list(results), do: {:ok, results}
+  defp proof_results(_), do: {:error, :invalid_proof}
 
   @doc "Validate canonical fleet-proof bytes against the exact persisted registered hosts."
   @spec validate_fleet_proof(binary(), [host_row()]) :: :ok | {:error, atom()}

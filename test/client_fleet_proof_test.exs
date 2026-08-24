@@ -43,6 +43,14 @@ defmodule Tightbeam.ClientFleetProofTest do
     assert {:error, :host_result_mismatch} =
              ClientFleetProof.fleet_proof(hosts, %{input | results: tl(input.results)})
 
+    for results <- [42, %{}, "not-results", false] do
+      assert {:error, :invalid_proof} =
+               ClientFleetProof.fleet_proof(hosts, %{input | results: results})
+    end
+
+    assert {:error, :missing_results} =
+             ClientFleetProof.fleet_proof(hosts, Map.delete(input, :results))
+
     assert {:error, :duplicate_name} =
              ClientFleetProof.fleet_proof(hosts, %{
                input
