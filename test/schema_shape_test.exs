@@ -34,7 +34,8 @@ defmodule Tightbeam.SchemaShapeTest do
 
   alias Tightbeam.{Assignments, DB, Schema}
 
-  @shape "identity-universal-root-render-v1-019"
+  @shape "pi-harness-v1"
+  @identity_render_shape "identity-universal-root-render-v1-019"
   @identity_render_stamp_previous_shape "effort-request-exit-v1-019"
   @effort_request_exit_previous_shape "notice-batching-v1-019"
   @notice_batching_pre_liveness_shape "notice-batching-pre-liveness-v1-019"
@@ -139,6 +140,78 @@ defmodule Tightbeam.SchemaShapeTest do
 
     assert operator_index =~ "(ownerUserId, raiserId, actionKey)"
     assert operator_index =~ ~r/WHERE\s+kind\s*=\s*'operator'\s+AND\s+status\s*=\s*'open'/
+  end
+
+  test "the identity-render tip migrates sessions intact and admits Pi", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    {:ok, _} =
+      DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('owner', 1, 1)")
+
+    existing =
+      Tightbeam.Org.create(db, %{
+        session_key: "existing-claude",
+        display_name: "Existing Claude",
+        owner_user_id: "owner",
+        origin: "user:owner",
+        archetype: "default",
+        harness: "claude",
+        provider: "anthropic",
+        model: Tightbeam.Model.new("claude-existing", effort: "medium"),
+        host: "local"
+      })
+
+    # A foreign-key child of the session, to prove the rebuild preserves FKs.
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO harness_pointers
+          (sessionKey, harnessSessionId, sourceSessionRef, harness, machine, reason, createdAt)
+        VALUES ('existing-claude', 'h-1', 'src-1', 'claude', 'local', 'created', 1)
+        """
+      )
+
+    downgrade_sessions_to_identity_render_shape(db)
+    assert {:ok, [[@identity_render_shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert :ok = Schema.ensure_all(db)
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+
+    # Rows survive the sessions rebuild.
+    assert Tightbeam.Org.get(db, existing.session_key).model.family == "claude-existing"
+
+    # c329's identity-render columns survive the rebuild.
+    assert "identityRenderContract" in table_columns(db, "sessions")
+    assert "identityGuidanceDigest" in table_columns(db, "sessions")
+
+    # The indexes are rebuilt exactly once each.
+    assert {:ok, [[1]]} = index_count(db, "sessions_owner")
+    assert {:ok, [[1]]} = index_count(db, "sessions_cli_token")
+
+    # The foreign-key child row still resolves to its session.
+    assert {:ok, [[1]]} =
+             DB.query(
+               db,
+               "SELECT COUNT(*) FROM harness_pointers WHERE sessionKey = 'existing-claude'"
+             )
+
+    # The widened provider CHECK now admits Pi's opencode_go.
+    pi =
+      Tightbeam.Org.create(db, %{
+        session_key: "new-pi",
+        display_name: "New Pi",
+        owner_user_id: "owner",
+        origin: "user:owner",
+        archetype: "default",
+        harness: "pi",
+        provider: "opencode_go",
+        model: Tightbeam.Model.new("opencode-go/gpt-5.6-luna", effort: "medium"),
+        host: "local"
+      })
+
+    assert pi.harness == "pi"
+    assert pi.provider == "opencode_go"
   end
 
   test "the exact effort-request predecessor gains nullable identity render stamps", %{db: db} do
@@ -1124,6 +1197,44 @@ defmodule Tightbeam.SchemaShapeTest do
         ALTER TABLE sessions DROP COLUMN identityGuidanceDigest;
         ALTER TABLE sessions DROP COLUMN identityRenderContract;
         UPDATE schema_stamp SET shape = '#{@terminal_decision_shape}', stampedAt = 1;
+        """)
+    after
+      :ok = DB.execute(db, "PRAGMA foreign_keys = ON")
+    end
+  end
+
+  # Rebuild `sessions` to the exact identity-render tip shape (all current
+  # columns, pre-Pi narrow provider/harness CHECKs) and stamp it, so the forward
+  # Pi migration runs from a real current-shape database.
+  defp downgrade_sessions_to_identity_render_shape(db) do
+    :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
+
+    try do
+      :ok =
+        DB.execute(db, """
+        CREATE TABLE sessions_old (
+          sessionKey TEXT PRIMARY KEY, displayName TEXT NOT NULL,
+          kind TEXT NOT NULL DEFAULT 'custom' CHECK (kind IN ('main','dm','custom')),
+          orderIndex INTEGER NOT NULL DEFAULT 0, isBuiltIn INTEGER NOT NULL DEFAULT 0,
+          adopted INTEGER NOT NULL DEFAULT 0, ownerUserId TEXT NOT NULL, origin TEXT NOT NULL,
+          spawnedBy TEXT, handle TEXT UNIQUE, archetype TEXT NOT NULL, overrides TEXT,
+          identityName TEXT, identityRevision TEXT,
+          identityRenderContract TEXT, identityGuidanceDigest TEXT, cliToken TEXT,
+          harness TEXT NOT NULL CHECK (harness IN ('claude','codex','fixture')),
+          provider TEXT NOT NULL CHECK (provider IN ('anthropic','openai','fixture_provider')),
+          model TEXT NOT NULL, thinkingLevel TEXT, modelContext TEXT,
+          host TEXT NOT NULL DEFAULT 'local', clearedThroughSeq INTEGER NOT NULL DEFAULT 0,
+          state TEXT NOT NULL DEFAULT 'active' CHECK (state IN ('active','retired')),
+          createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL
+        );
+        INSERT INTO sessions_old SELECT * FROM sessions;
+        DROP INDEX sessions_owner;
+        DROP INDEX sessions_cli_token;
+        DROP TABLE sessions;
+        ALTER TABLE sessions_old RENAME TO sessions;
+        CREATE INDEX sessions_owner ON sessions (ownerUserId, state);
+        CREATE UNIQUE INDEX sessions_cli_token ON sessions(cliToken);
+        UPDATE schema_stamp SET shape = '#{@identity_render_shape}', stampedAt = 1;
         """)
     after
       :ok = DB.execute(db, "PRAGMA foreign_keys = ON")
