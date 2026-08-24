@@ -139,6 +139,12 @@ defmodule Tightbeam.Harness.Cursor do
       # exact value. Tightbeam keeps the stable public ref and translates only
       # at the adapter boundary, with config readback verification.
       model_option_aliases: %{"auto-smart[optimize_for=balanced]" => "auto"},
+      # Cursor's ACP model enum is closed and decorated: every selectable model
+      # is one exact wire value (`composer-2.5[fast=true]`) whose option `name`
+      # is the public ref (`composer-2.5`). A bare ref is refused (-32602), so
+      # the adapter resolves refs to wire values through the live option list
+      # rather than a static table the server-side menu would drift past.
+      model_wire_by_name: true,
       canonical_model_prefixes: []
     }
   end
