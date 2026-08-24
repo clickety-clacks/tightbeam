@@ -920,7 +920,13 @@ defmodule Tightbeam.Acp.AdapterTest do
       start_adapter(harness: :codex, fail_mode: "silent-model-no-take")
 
     assert {:ok, "sess-1"} =
-             Adapter.new_session(adapter, Model.new("gpt-old"), "/tmp", [], "guidance")
+             Adapter.new_session(
+               adapter,
+               Model.new("haiku", effort: "medium"),
+               "/tmp",
+               [],
+               "guidance"
+             )
 
     assert {:error, :model_verification_failed} =
              Adapter.switch_model_session(
