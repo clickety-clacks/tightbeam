@@ -330,7 +330,10 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
              storage: "file"
            }
 
-    refute Doctor.format(report, :human) =~ "PAT"
+    # Word-boundary match: the report legitimately prints filesystem paths, and
+    # a random temp dir name can embed the substring (observed live in CI:
+    # `…0PATJgI2…`). The assertion is about the WORD "PAT", not those bytes.
+    refute Doctor.format(report, :human) =~ ~r/\bPAT\b/
   end
 
   test "github auth failure names onboarding repair and never asks for a PAT", ctx do
