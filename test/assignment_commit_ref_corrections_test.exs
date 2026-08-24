@@ -87,6 +87,23 @@ defmodule Tightbeam.AssignmentCommitRefCorrectionsTest do
              })
   end
 
+  test "one SHA-bound backfill artifact can support a target on another work item", ctx do
+    call = with_param(ctx, :evidence_artifact_id, "art_wrong_item")
+
+    assert %{correction: correction} = correct(call, {:session, "po-owner"})
+    assert correction.assignmentId == "asg_closed"
+    assert correction.evidenceArtifactId == "art_wrong_item"
+
+    assert {:ok, [["wi_other", sha]]} =
+             DB.query(
+               ctx.db,
+               "SELECT workItemId, contentSha256 FROM artifacts WHERE artifactId='art_wrong_item'"
+             )
+
+    assert Regex.match?(~r/\A[0-9a-f]{64}\z/, sha)
+    assert %{commitRefCorrections: [^correction]} = assignment_get(ctx.db, "asg_closed")
+  end
+
   test "wrong product lane and hidden target fail identically before git proof", ctx do
     parent = self()
     old_runner = Application.get_env(:tightbeam, :commit_ref_command)
@@ -107,7 +124,7 @@ defmodule Tightbeam.AssignmentCommitRefCorrectionsTest do
     refute_received {:git_ran, _, _, _}
   end
 
-  test "open, mismatched, absent, and unbound evidence refuse before git proof", ctx do
+  test "open, absent, and unbound evidence refuse before git proof", ctx do
     parent = self()
     old_runner = Application.get_env(:tightbeam, :commit_ref_command)
     on_exit(fn -> restore_env(:commit_ref_command, old_runner) end)
@@ -119,9 +136,6 @@ defmodule Tightbeam.AssignmentCommitRefCorrectionsTest do
 
     open = with_param(ctx, :assignment_id, "asg_open")
     assert %{code: "assignment_open"} = correct(open, {:session, "po-owner"})
-
-    wrong = with_param(ctx, :evidence_artifact_id, "art_wrong_item")
-    assert %{code: "invalid_evidence"} = correct(wrong, {:session, "po-owner"})
 
     unsigned = with_param(ctx, :evidence_artifact_id, "art_unsigned")
     assert %{code: "invalid_evidence"} = correct(unsigned, {:session, "po-owner"})

@@ -209,7 +209,7 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
 
   defp authorize_context(txn, actor, assignment_id, artifact_id) do
     with {:ok, context} <- authorize_assignment(txn, actor, assignment_id),
-         :ok <- evidence_matches(txn, artifact_id, context.work_item_id) do
+         :ok <- evidence_is_immutable(txn, artifact_id) do
       {:ok, Map.put(context, :evidence_artifact_id, artifact_id)}
     end
   end
@@ -279,31 +279,27 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
     end
   end
 
-  defp evidence_matches(_txn, _artifact_id, nil),
-    do: {:error, error("missing_work_item", "correction target must belong to a work item")}
-
-  defp evidence_matches(txn, artifact_id, work_item_id) do
+  # Historical backfill evidence can describe assignments across several work
+  # items. The correction keeps the exact artifact id and its immutable hash as
+  # provenance; it does not require synthetic copies on every target item.
+  defp evidence_is_immutable(txn, artifact_id) do
     case Txn.q(
            txn,
-           "SELECT workItemId, contentSha256 FROM artifacts WHERE artifactId = ?1",
+           "SELECT contentSha256 FROM artifacts WHERE artifactId = ?1",
            [artifact_id]
          ) do
-      [[^work_item_id, sha]] when is_binary(sha) ->
+      [[sha]] when is_binary(sha) ->
         if Regex.match?(~r/\A[0-9a-f]{64}\z/, sha),
           do: :ok,
           else:
             {:error,
              error(
                "invalid_evidence",
-               "evidence must be SHA-bound and belong to the target work item"
+               "evidence must be SHA-bound"
              )}
 
       _ ->
-        {:error,
-         error(
-           "invalid_evidence",
-           "evidence must be SHA-bound and belong to the target work item"
-         )}
+        {:error, error("invalid_evidence", "evidence must be SHA-bound")}
     end
   end
 
