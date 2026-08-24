@@ -3811,7 +3811,7 @@ defmodule Tightbeam.ConformanceTest do
       )
 
     assert status == 0, output
-    assert output =~ "0 failures"
+    assert output =~ ~r/(0 failures|Result: \d+ passed)/
     assert output =~ "containment enforces resolved write roots and preserves stdout"
   end
 

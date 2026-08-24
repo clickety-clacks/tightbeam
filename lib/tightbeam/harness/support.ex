@@ -682,7 +682,7 @@ defmodule Tightbeam.Harness.Support do
 
     case locality do
       :local ->
-        Enum.join(["sh", "-c", script], " ")
+        Enum.join(["/bin/sh", "-c", script], " ")
 
       :remote ->
         (["ssh" | ssh_opts()] ++ ["vector@remote", "sh", "-c", shell_quote(script)])
