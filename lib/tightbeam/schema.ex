@@ -18,6 +18,7 @@ defmodule Tightbeam.Schema do
     Tightbeam.Wakes,
     Tightbeam.Projection,
     Tightbeam.Org,
+    Tightbeam.HarnessRecovery,
     Tightbeam.CriticalLeases,
     Tightbeam.Roles,
     Tightbeam.WorkItems,

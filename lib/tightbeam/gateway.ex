@@ -2040,7 +2040,17 @@ defmodule Tightbeam.Gateway do
                  progress_fun(db, turn.session_key, session.owner_user_id, correlation)
                ),
              :ok <- append_assistant_messages(db, turn, echo, result) do
-          {:ok, %{terminal_publish: terminal_publish}}
+
+          record_in_txn = fn txn ->
+            Tightbeam.HarnessRecovery.observe_success_in_txn(txn, %{
+              owner_user_id: session.owner_user_id,
+              harness: session.harness,
+              session_key: turn.session_key,
+              turn_seq: turn.seq
+            })
+          end
+
+          {:ok, %{terminal_publish: terminal_publish, record_in_txn: record_in_txn}}
         else
           {:error, {:assistant_commit, reason}} ->
             {:error, {:prompt, {:lifecycle_trace_failed_after_prompt, :assistant_commit, reason}}}
@@ -2150,11 +2160,22 @@ defmodule Tightbeam.Gateway do
 
               EventLog.lifecycle_in_txn(txn, "harness_turn_error", turn.session_key, detail)
 
-              assignment_process_failure_notice_in_txn(
-                txn,
-                turn.seq,
-                safe_failure
-              )
+              notice =
+                assignment_process_failure_notice_in_txn(
+                  txn,
+                  turn.seq,
+                  safe_failure
+                )
+
+              Tightbeam.HarnessRecovery.observe_failure_in_txn(txn, %{
+                owner_user_id: session.owner_user_id,
+                harness: session.harness,
+                session_key: turn.session_key,
+                turn_seq: turn.seq,
+                reason: raw_reason
+              })
+
+              notice
             end
 
             terminal =

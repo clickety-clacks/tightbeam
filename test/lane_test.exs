@@ -100,6 +100,40 @@ defmodule Tightbeam.LaneTest do
     assert Agent.get(agent, & &1) == ["orphaned-commit"]
   end
 
+  test "a delivered turn commits its record action before terminal publication", ctx do
+    parent = self()
+    seq = enqueue!(ctx.db, "k1", "recovered")
+
+    runner = fn _turn ->
+      {:ok,
+       %{
+         terminal_publish: fn terminal -> send(parent, {:published, terminal}) end,
+         record_in_txn: fn txn ->
+           EventLog.lifecycle_in_txn(txn, "delivered_record", "k1", "atomic")
+         end
+       }}
+    end
+
+    {:ok, mgr} =
+      LaneManager.start_link(
+        db: ctx.db,
+        lane_sup: ctx.lane_sup,
+        task_sup: ctx.task_sup,
+        runner: runner,
+        interval: 60_000,
+        name: :delivered_record_lane_manager
+      )
+
+    :ok = LaneManager.reconcile(mgr)
+    assert_receive {:published, "delivered"}
+
+    assert {:ok, [["delivered"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [seq])
+
+    assert [%{kind: "delivered_record", subject: "k1", detail: "atomic"}] =
+             EventLog.lifecycle_events(ctx.db)
+  end
+
   test "a crashing runner marks the turn failed and the lane drains on", ctx do
     {:ok, agent} = Agent.start_link(fn -> [] end)
 
