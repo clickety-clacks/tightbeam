@@ -1666,8 +1666,11 @@ defmodule Tightbeam.ModelCatalogTest do
       end
 
       probing_codex = fn command ->
-        generation = Agent.get_and_update(codex_generation, fn n -> {n + 1, n + 1} end)
-        send(test_pid, {:catalog_generation, :codex, generation})
+        if inspect(command) =~ "chatgpt.com" or inspect(command) =~ "api.openai.com" do
+          generation = Agent.get_and_update(codex_generation, fn n -> {n + 1, n + 1} end)
+          send(test_pid, {:catalog_generation, :codex, generation})
+        end
+
         ctx.codex_sh.(command)
       end
 

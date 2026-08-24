@@ -200,17 +200,21 @@ defmodule Tightbeam.Harness.Pi do
 
   @impl true
   def credential_live?(target, home, opts) do
-    request = %{
-      command: [
-        "node",
-        "--no-warnings",
-        "-e",
-        liveness_script(),
-        Path.join(home, @credential_file)
-      ]
-    }
+    with {:ok, node} <- absolute_executable(target, "node") do
+      request = %{
+        command: [
+          node,
+          "--no-warnings",
+          "-e",
+          liveness_script(),
+          Path.join(home, @credential_file)
+        ]
+      }
 
-    Support.credential_live_result(target, request, opts)
+      Support.credential_live_result(target, request, opts)
+    else
+      :error -> {:unknown, {:executable_not_found, "node"}}
+    end
   end
 
   @impl true
@@ -233,12 +237,18 @@ defmodule Tightbeam.Harness.Pi do
     sh = Map.get(state.options, :sh, &Support.system_cmd_out/1)
     destination = Map.get(state, :host_config, %{ssh: nil}).ssh
 
-    case Support.catalog_probe(
-           sh,
-           Support.catalog_probe_argv(destination, Support.catalog_curl(@models_url, []))
-         ) do
-      {:ok, body, _trailer} -> decode_catalog(body)
-      {:error, reason} -> {:error, reason}
+    with {:ok, paths} <- catalog_executables(state, destination) do
+      script = Support.catalog_curl(@models_url, [], "", paths.curl)
+
+      case Support.catalog_probe(
+             sh,
+             Support.catalog_probe_argv(destination, script, paths)
+           ) do
+        {:ok, body, _trailer} -> decode_catalog(body)
+        {:error, reason} -> {:error, reason}
+      end
+    else
+      {:error, executable} -> {:error, {:executable_not_found, executable}}
     end
   end
 
@@ -401,7 +411,7 @@ defmodule Tightbeam.Harness.Pi do
           for (const hook of entry?.hooks ?? []) {
             if (hook?.type !== "command" || typeof hook?.command !== "string") continue;
 
-            const result = spawnSync("sh", ["-c", hook.command], {
+            const result = spawnSync("/bin/sh", ["-c", hook.command], {
               input: payload,
               encoding: "utf8",
               env: process.env,
@@ -578,5 +588,37 @@ defmodule Tightbeam.Harness.Pi do
   defp adapter_package_json(binary_path) do
     node_modules = binary_path |> Path.dirname() |> Path.dirname()
     Path.join([node_modules, @adapter_package, "package.json"])
+  end
+
+  defp catalog_executables(state, nil) do
+    with {:ok, sh} <- absolute_executable(state, "sh"),
+         {:ok, curl} <- absolute_executable(state, "curl") do
+      {:ok, %{sh: sh, curl: curl}}
+    else
+      :error -> {:error, "sh or curl"}
+    end
+  end
+
+  defp catalog_executables(state, _destination) do
+    with {:ok, ssh} <- absolute_executable(state, "ssh") do
+      {:ok, %{ssh: ssh, sh: "/bin/sh", curl: "/usr/bin/curl"}}
+    else
+      :error -> {:error, "ssh"}
+    end
+  end
+
+  defp absolute_executable(container, name) do
+    find =
+      Map.get(container, :find_executable) ||
+        get_in(container, [:options, :find_executable]) ||
+        (&System.find_executable/1)
+
+    case find.(name) do
+      path when is_binary(path) ->
+        if Path.type(path) == :absolute, do: {:ok, path}, else: :error
+
+      _ ->
+        :error
+    end
   end
 end
