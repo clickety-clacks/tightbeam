@@ -14,5 +14,13 @@
     "install_package": "@agentclientprotocol/codex-acp",
     "cli_binary": "codex",
     "process_markers": ["codex-acp"]
+  },
+  {
+    "module": "Tightbeam.Harness.Pi",
+    "id": "pi",
+    "wire_name": "pi",
+    "install_package": "pi-acp",
+    "cli_binary": "pi",
+    "process_markers": ["pi-acp"]
   }
 ]
