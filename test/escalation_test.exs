@@ -6,7 +6,6 @@ defmodule Tightbeam.EscalationTest do
     ConditionFacts,
     ConnRegistry,
     DB,
-    Devices,
     Escalation,
     EventLog,
     Gateway,
@@ -35,17 +34,15 @@ defmodule Tightbeam.EscalationTest do
 
     :ok = ensure_all_schemas(db)
 
-    ensure_main_session(db, "flynn")
-
-    raiser = session(db, "raiser", "flynn")
-
     _admin_device =
-      Devices.pair(db, %{
+      claim_org(db, %{
         device_id: "admin-device",
         claimed_name: "flynn",
         platform: nil,
         model: nil
       })
+
+    raiser = session(db, "raiser", "flynn")
 
     start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
     start_supervised!({LaneDoorbell, self()})

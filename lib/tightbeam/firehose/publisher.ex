@@ -378,6 +378,7 @@ defmodule Tightbeam.Firehose.Publisher do
 
   defp unwrap(result, "sessions"), do: wrapped(result, [:session, "session"])
   defp unwrap(result, "roles"), do: wrapped(result, [:role, "role"])
+  defp unwrap(result, "users"), do: wrapped(result, [:user, "user"])
   defp unwrap(result, "artifacts"), do: wrapped(result, [:artifact, "artifact"])
   defp unwrap(result, "read-markers"), do: wrapped(result, [:read_marker, "readMarker"])
   defp unwrap(result, "messages"), do: wrapped(result, [:message, "message"])

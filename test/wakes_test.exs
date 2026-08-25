@@ -187,7 +187,7 @@ defmodule Tightbeam.WakesTest do
       DB.execute(
         db,
         """
-        INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1);
+        INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 1, 'admin_add', 1);
         INSERT INTO sessions
           (sessionKey, displayName, kind, isBuiltIn, ownerUserId, origin,
            operationalParent, archetype, harness,
@@ -465,7 +465,7 @@ defmodule Tightbeam.WakesTest do
       DB.execute(
         db,
         """
-        INSERT OR IGNORE INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1);
+        INSERT OR IGNORE INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 1, 'admin_add', 1);
         INSERT OR IGNORE INTO sessions
           (sessionKey, displayName, kind, isBuiltIn, ownerUserId, origin,
            operationalParent, archetype, harness, provider, model, host, state,

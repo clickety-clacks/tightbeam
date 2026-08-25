@@ -396,6 +396,14 @@ defmodule Tightbeam.Org do
   end
 
   @doc false
+  @spec resolve_personal_main_defaults(map()) :: map()
+  def resolve_personal_main_defaults(defaults) do
+    provider = Map.fetch!(defaults, :provider)
+    provider = if is_function(provider, 0), do: provider.(), else: provider
+    Map.put(defaults, :provider, provider)
+  end
+
+  @doc false
   @spec ensure_personal_main_in_txn(Txn.t(), String.t(), map()) :: session()
   def ensure_personal_main_in_txn(%Txn{} = txn, user_id, defaults) do
     key = personal_session_key(user_id)
@@ -403,7 +411,11 @@ defmodule Tightbeam.Org do
     case get_in_txn(txn, key) do
       nil ->
         provider = Map.fetch!(defaults, :provider)
-        provider = if is_function(provider, 0), do: provider.(), else: provider
+
+        if is_function(provider) do
+          raise ArgumentError,
+                "personal Main provider must be resolved before entering a DB transaction"
+        end
 
         archetype =
           case Txn.q(txn, "SELECT value FROM org_settings WHERE key = 'default-archetype'") do

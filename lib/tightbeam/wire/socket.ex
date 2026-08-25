@@ -58,7 +58,7 @@ defmodule Tightbeam.Wire.Socket do
 
   @behaviour WebSock
 
-  alias Tightbeam.{ConnRegistry, DB, Devices, Dispatch, Org, Projection}
+  alias Tightbeam.{ColdStart, ConnRegistry, DB, Devices, Dispatch, Org, Projection}
   alias Tightbeam.Wire.Payloads
 
   @max_content_bytes 64 * 1024
@@ -246,29 +246,41 @@ defmodule Tightbeam.Wire.Socket do
       true ->
         info = if is_map(msg["deviceInfo"]), do: msg["deviceInfo"], else: %{}
 
-        result =
-          Devices.pair(db(state), %{
-            device_id: device_id,
-            claimed_name: string(msg["claimedName"] || "device"),
-            platform: info["platform"],
-            model: info["model"]
-          })
+        case ColdStart.decode_replay_secret(msg["claimReplaySecret"]) do
+          {:error, :invalid_message} ->
+            stop_with(Payloads.wire_error("invalid_message"), state)
 
-        payload =
-          case result do
-            {:paired, device} -> Payloads.pair_result({:ok, device.token, device.user_id})
-            {:pending, _device} -> Payloads.pair_result({:error, "pair_pending"})
-            :denied -> Payloads.pair_result({:error, "pair_denied"})
-          end
+          {:ok, replay_secret} ->
+            result =
+              ColdStart.pair(
+                db(state),
+                %{
+                  device_id: device_id,
+                  claimed_name: string(msg["claimedName"] || "device"),
+                  platform: info["platform"],
+                  model: info["model"],
+                  replay_secret: replay_secret
+                },
+                Map.fetch!(state.deps, :defaults)
+              )
 
-        stop_with(payload, state)
+            payload =
+              case result do
+                {:paired, device} -> Payloads.pair_result({:ok, device.token, device.user_id})
+                {:pending, _device} -> Payloads.pair_result({:error, "pair_pending"})
+                :denied -> Payloads.pair_result({:error, "pair_denied"})
+                {:error, reason} -> Payloads.pair_result({:error, reason})
+              end
+
+            stop_with(payload, state)
+        end
     end
   end
 
   defp auth(msg, state) do
     token = string(msg["token"])
 
-    case Devices.by_token(db(state), token) do
+    case ColdStart.authenticate(db(state), token) do
       nil ->
         known = Devices.by_id(db(state), string(msg["deviceId"]))
 
@@ -495,7 +507,7 @@ defmodule Tightbeam.Wire.Socket do
     key = Org.personal_session_key(user_id)
 
     unless Org.get(db(state), key) do
-      defaults = Map.fetch!(state.deps, :defaults)
+      defaults = state.deps |> Map.fetch!(:defaults) |> Org.resolve_personal_main_defaults()
 
       try do
         {:ok, _session} =

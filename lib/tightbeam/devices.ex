@@ -31,7 +31,12 @@ defmodule Tightbeam.Devices do
           created_at: integer()
         }
 
-  @type user :: %{user_id: String.t(), is_admin: boolean(), created_at: integer()}
+  @type user :: %{
+          user_id: String.t(),
+          is_admin: boolean(),
+          creation_kind: String.t(),
+          created_at: integer()
+        }
 
   @typedoc "Pairing outcome — mirrors the TS PairOutcome union."
   @type pair_outcome ::
@@ -39,9 +44,12 @@ defmodule Tightbeam.Devices do
 
   @ddl """
   CREATE TABLE IF NOT EXISTS users (
-    userId    TEXT PRIMARY KEY,
-    isAdmin   INTEGER NOT NULL DEFAULT 0,
-    createdAt INTEGER NOT NULL
+    userId       TEXT PRIMARY KEY,
+    isAdmin      INTEGER NOT NULL DEFAULT 0,
+    creationKind TEXT NOT NULL DEFAULT 'legacy' CHECK (creationKind IN (
+      'cold_start','gateway_local_bootstrap','device_pair','admin_add','legacy'
+    )),
+    createdAt    INTEGER NOT NULL
   );
   CREATE TABLE IF NOT EXISTS devices (
     deviceId    TEXT PRIMARY KEY,
@@ -57,6 +65,12 @@ defmodule Tightbeam.Devices do
     deviceId   TEXT PRIMARY KEY REFERENCES devices(deviceId),
     rowVersion INTEGER NOT NULL
   );
+  CREATE TRIGGER IF NOT EXISTS users_gateway_owned_insert
+  BEFORE INSERT ON users
+  WHEN NEW.creationKind = 'legacy'
+  BEGIN
+    SELECT RAISE(ABORT, 'bootstrap_owned_by_gateway');
+  END;
   """
 
   @spec ensure_schema(db()) :: :ok | {:error, term()}
@@ -69,10 +83,9 @@ defmodule Tightbeam.Devices do
   - Known denied device → :denied. Known pending → {:pending, device}.
   - Known allowlisted → rotate its token, {:paired, device}.
   - Unknown device: user_id is slugged from claimed_name
-    (lowercase, non-alphanumerics → "-", trimmed; empty → "user"). If NO users
-    exist yet, the user bootstraps as admin and the device is allowlisted with
-    a fresh token ({:paired, _}); otherwise the device is pending with a nil
-    token ({:pending, _}) — including new devices claiming an EXISTING user.
+    (lowercase, non-alphanumerics → "-", trimmed; empty → "user") and the
+    device is pending with a nil token. `Tightbeam.ColdStart` owns the only
+    first-device exception and calls the in-transaction helpers below.
   """
   @spec pair(db(), %{
           device_id: String.t(),
@@ -114,33 +127,9 @@ defmodule Tightbeam.Devices do
       [] ->
         claimed_name = Map.fetch!(input, :claimed_name)
         user_id = slug_user_id(claimed_name)
-        first_ever? = Txn.q(txn, "SELECT COUNT(*) FROM users") == [[0]]
-        ensure_user_in_txn(txn, user_id)
-        status = if first_ever?, do: "allowlisted", else: "pending"
-        token = if first_ever?, do: mint_token(), else: nil
-
-        Txn.q(
-          txn,
-          """
-            INSERT INTO devices
-              (deviceId, userId, claimedName, status, token, platform, model, createdAt)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-          """,
-          [
-            device_id,
-            user_id,
-            claimed_name,
-            status,
-            token,
-            Map.fetch!(input, :platform),
-            Map.fetch!(input, :model),
-            now()
-          ]
-        )
-
-        device = must_get(txn, device_id)
-        stamp_device_in_txn(txn, device_id, device.created_at)
-        if first_ever?, do: {:paired, device}, else: {:pending, device}
+        ensure_user_in_txn(txn, user_id, "device_pair")
+        device = insert_device_in_txn(txn, Map.put(input, :user_id, user_id), "pending", nil)
+        {:pending, device}
     end
   end
 
@@ -278,7 +267,13 @@ defmodule Tightbeam.Devices do
   @spec user(db(), String.t()) :: user() | nil
   def user(db \\ Tightbeam.DB, user_id) do
     {:ok, rows} =
-      DB.query(db, "SELECT userId, isAdmin, createdAt FROM users WHERE userId = ?1", [user_id])
+      DB.query(
+        db,
+        "SELECT userId, isAdmin, creationKind, createdAt FROM users WHERE userId = ?1",
+        [
+          user_id
+        ]
+      )
 
     case rows do
       [row] -> to_user(row)
@@ -371,6 +366,64 @@ defmodule Tightbeam.Devices do
     Txn.q(txn, select_device_sql() <> " WHERE #{where}", params)
   end
 
+  @doc false
+  def get_device_in_txn(%Txn{} = txn, device_id) do
+    case select_device(txn, "d.deviceId = ?1", [device_id]) do
+      [row] -> to_device(row)
+      [] -> nil
+    end
+  end
+
+  @doc false
+  def get_device_by_token_in_txn(%Txn{} = txn, token) do
+    case select_device(txn, "d.token = ?1 AND d.status = 'allowlisted'", [token]) do
+      [row] -> to_device(row)
+      [] -> nil
+    end
+  end
+
+  @doc false
+  def get_user_in_txn(%Txn{} = txn, user_id) do
+    case Txn.q(
+           txn,
+           "SELECT userId, isAdmin, creationKind, createdAt FROM users WHERE userId = ?1",
+           [
+             user_id
+           ]
+         ) do
+      [row] -> to_user(row)
+      [] -> nil
+    end
+  end
+
+  @doc false
+  def insert_device_in_txn(%Txn{} = txn, input, status, token)
+      when status in ~w(allowlisted pending denied) do
+    created_at = now()
+
+    Txn.q(
+      txn,
+      """
+      INSERT INTO devices
+        (deviceId, userId, claimedName, status, token, platform, model, createdAt)
+      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+      """,
+      [
+        Map.fetch!(input, :device_id),
+        Map.fetch!(input, :user_id),
+        Map.fetch!(input, :claimed_name),
+        status,
+        token,
+        Map.get(input, :platform),
+        Map.get(input, :model),
+        created_at
+      ]
+    )
+
+    stamp_device_in_txn(txn, Map.fetch!(input, :device_id), created_at)
+    must_get(txn, Map.fetch!(input, :device_id))
+  end
+
   defp must_get(txn, device_id) do
     case select_device(txn, "d.deviceId = ?1", [device_id]) do
       [row] -> to_device(row)
@@ -427,10 +480,11 @@ defmodule Tightbeam.Devices do
   end
 
   @doc false
-  def ensure_user_in_txn(%Txn{} = txn, user_id) do
+  def ensure_user_in_txn(%Txn{} = txn, user_id, creation_kind \\ "device_pair")
+      when creation_kind in ~w(cold_start gateway_local_bootstrap device_pair admin_add legacy) do
     case Txn.q(txn, "SELECT userId FROM users WHERE userId = ?1", [user_id]) do
       [] ->
-        insert_user_in_txn(txn, user_id, false)
+        insert_user_in_txn(txn, user_id, false, creation_kind)
 
       [_] ->
         :ok
@@ -438,34 +492,47 @@ defmodule Tightbeam.Devices do
   end
 
   @doc false
-  def insert_user_in_txn(%Txn{} = txn, user_id, requested_admin) do
+  def insert_user_in_txn(%Txn{} = txn, user_id, requested_admin, creation_kind \\ "admin_add")
+      when creation_kind in ~w(cold_start gateway_local_bootstrap device_pair admin_add legacy) do
     created_at = now()
 
     Txn.q(
       txn,
       """
-      INSERT INTO users (userId, isAdmin, createdAt)
+      INSERT INTO users (userId, isAdmin, creationKind, createdAt)
       VALUES (
         ?1,
         CASE WHEN (SELECT COUNT(*) FROM users) = 0 THEN 1 ELSE ?2 END,
-        ?3
+        ?3,
+        ?4
       )
       """,
-      [user_id, if(requested_admin, do: 1, else: 0), created_at]
+      [user_id, if(requested_admin, do: 1, else: 0), creation_kind, created_at]
     )
 
     AdminProjection.allocate_in_txn(txn, "users", user_id, created_at)
   end
 
   defp must_get_user(txn, user_id) do
-    case Txn.q(txn, "SELECT userId, isAdmin, createdAt FROM users WHERE userId = ?1", [user_id]) do
+    case Txn.q(
+           txn,
+           "SELECT userId, isAdmin, creationKind, createdAt FROM users WHERE userId = ?1",
+           [
+             user_id
+           ]
+         ) do
       [row] -> to_user(row)
       [] -> raise ArgumentError, "unknown user: #{user_id}"
     end
   end
 
-  defp to_user([user_id, is_admin, created_at]) do
-    %{user_id: user_id, is_admin: is_admin == 1, created_at: created_at}
+  defp to_user([user_id, is_admin, creation_kind, created_at]) do
+    %{
+      user_id: user_id,
+      is_admin: is_admin == 1,
+      creation_kind: creation_kind,
+      created_at: created_at
+    }
   end
 
   @doc false
@@ -479,7 +546,8 @@ defmodule Tightbeam.Devices do
     end
   end
 
-  defp mint_token do
+  @doc false
+  def mint_token do
     "tbt_" <> (:crypto.strong_rand_bytes(24) |> Base.url_encode64(padding: false))
   end
 

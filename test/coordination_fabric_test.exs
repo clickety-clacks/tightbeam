@@ -646,9 +646,13 @@ defmodule Tightbeam.CoordinationFabricTest do
     base = System.system_time(:millisecond)
 
     {:ok, _} =
-      DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('owner', 0, ?1)", [
-        base
-      ])
+      DB.query(
+        db,
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('owner', 0, 'admin_add', ?1)",
+        [
+          base
+        ]
+      )
 
     {:ok, _} =
       DB.query(
@@ -696,9 +700,13 @@ defmodule Tightbeam.CoordinationFabricTest do
     base = System.system_time(:millisecond)
 
     {:ok, _} =
-      DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('owner', 0, ?1)", [
-        base
-      ])
+      DB.query(
+        db,
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('owner', 0, 'admin_add', ?1)",
+        [
+          base
+        ]
+      )
 
     {:ok, _} =
       DB.query(
@@ -750,9 +758,13 @@ defmodule Tightbeam.CoordinationFabricTest do
     base = System.system_time(:millisecond)
 
     {:ok, _} =
-      DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('owner', 0, ?1)", [
-        base
-      ])
+      DB.query(
+        db,
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('owner', 0, 'admin_add', ?1)",
+        [
+          base
+        ]
+      )
 
     {:ok, _} =
       DB.query(
@@ -824,9 +836,13 @@ defmodule Tightbeam.CoordinationFabricTest do
     base = System.system_time(:millisecond)
 
     {:ok, _} =
-      DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('owner', 0, ?1)", [
-        base
-      ])
+      DB.query(
+        db,
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('owner', 0, 'admin_add', ?1)",
+        [
+          base
+        ]
+      )
 
     {:ok, _} =
       DB.query(
@@ -1145,7 +1161,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('roleowner', 0, 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('roleowner', 0, 'admin_add', 1)"
       )
 
     Roles.create!(db, "orphan-role", "roleowner", nil)
@@ -1320,7 +1336,10 @@ defmodule Tightbeam.CoordinationFabricTest do
     # prove the collision cannot happen once the field round-trips through
     # `URI.encode_www_form/1`/`URI.decode_www_form/1`.
     {:ok, _} =
-      DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('alice', 0, 1)")
+      DB.query(
+        db,
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('alice', 0, 'admin_add', 1)"
+      )
 
     seed_session(db, "agent:filer6", "alice bob")
     seed_session(db, "agent:stranger6", "outsider6")
@@ -3922,7 +3941,10 @@ defmodule Tightbeam.CoordinationFabricTest do
 
   defp admin_call(db, name, params) do
     {:ok, _} =
-      DB.query(db, "INSERT OR IGNORE INTO users (userId, isAdmin, createdAt) VALUES ('root',1,1)")
+      DB.query(
+        db,
+        "INSERT OR IGNORE INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('root', 1, 'admin_add', 1)"
+      )
 
     verb(db, {:user, "root"}, name, params)
   end
@@ -3994,9 +4016,13 @@ defmodule Tightbeam.CoordinationFabricTest do
 
   defp seed_session(db, session_key, owner) do
     {:ok, _} =
-      DB.query(db, "INSERT OR IGNORE INTO users (userId, isAdmin, createdAt) VALUES (?1, 0, 1)", [
-        owner
-      ])
+      DB.query(
+        db,
+        "INSERT OR IGNORE INTO users (userId, isAdmin, creationKind, createdAt) VALUES (?1, 0, 'admin_add', 1)",
+        [
+          owner
+        ]
+      )
 
     ensure_main_session(db, owner)
 

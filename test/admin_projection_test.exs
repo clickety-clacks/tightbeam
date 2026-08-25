@@ -30,7 +30,14 @@ defmodule Tightbeam.AdminProjectionTest do
     :ok = Schema.ensure_all(db)
     :ok = AdminProjection.bootstrap_served(db, base_dir)
 
-    Devices.add_user(db, "flynn", true)
+    {:paired, _device} =
+      claim_org(db, %{
+        device_id: "admin-projection-device",
+        claimed_name: "flynn",
+        platform: nil,
+        model: nil
+      })
+
     Devices.add_user(db, "operator", false)
 
     start_supervised!({Hub, name: Hub})

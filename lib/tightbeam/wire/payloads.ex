@@ -89,6 +89,15 @@ defmodule Tightbeam.Wire.Payloads do
     %{"type" => "pair_result", "success" => true, "token" => token, "userId" => user_id}
   end
 
+  def pair_result({:error, "bootstrap_closed"}) do
+    %{
+      "type" => "pair_result",
+      "success" => false,
+      "reason" => "bootstrap_closed",
+      "recovery" => "Recover an unusable fresh database"
+    }
+  end
+
   def pair_result({:error, reason}) do
     %{"type" => "pair_result", "success" => false, "reason" => reason}
   end

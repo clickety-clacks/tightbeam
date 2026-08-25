@@ -100,7 +100,7 @@ defmodule Tightbeam.Wire.SocketTest do
     end)
 
     {:paired, device} =
-      Devices.pair(ctx.db, %{
+      claim_org(ctx.db, %{
         device_id: "chat-e2e",
         claimed_name: "Flynn",
         platform: nil,
@@ -206,7 +206,7 @@ defmodule Tightbeam.Wire.SocketTest do
     :ok =
       DB.execute(
         ctx.db,
-        "INSERT OR IGNORE INTO users (userId,isAdmin,createdAt) VALUES ('other',0,1)"
+        "INSERT OR IGNORE INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('other',0,'admin_add',1)"
       )
 
     ensure_main_session(ctx.db, "other")
@@ -355,7 +355,7 @@ defmodule Tightbeam.Wire.SocketTest do
     end)
 
     {:paired, device} =
-      Devices.pair(ctx.db, %{
+      claim_org(ctx.db, %{
         device_id: "reply-reference",
         claimed_name: "Flynn",
         platform: nil,
@@ -554,7 +554,7 @@ defmodule Tightbeam.Wire.SocketTest do
 
   test "chat ingress preserves post params for zero reply references", ctx do
     {:paired, device} =
-      Devices.pair(ctx.db, %{
+      claim_org(ctx.db, %{
         device_id: "zero-reply-reference",
         claimed_name: "Flynn",
         platform: nil,
@@ -665,6 +665,29 @@ defmodule Tightbeam.Wire.SocketTest do
     assert %{"success" => false, "reason" => "device_not_approved"} = JSON.decode!(frame)
   end
 
+  test "malformed replay secrets refuse before a cold-start transaction", ctx do
+    malformed = ["%%%", Base.url_encode64(:binary.copy(<<1>>, 31), padding: false)]
+    oversized = Base.url_encode64(:binary.copy(<<2>>, 33), padding: false)
+
+    for secret <- malformed ++ [oversized] do
+      {:ok, state} = Socket.init(ctx.deps)
+
+      pair = %{
+        "type" => "pair_request",
+        "protocolVersion" => 1,
+        "deviceId" => "d1",
+        "claimedName" => "Flynn",
+        "claimReplaySecret" => secret
+      }
+
+      assert {:stop, :normal, 1000, {:text, frame}, _state} =
+               Socket.handle_in({JSON.encode!(pair), opcode: :text}, state)
+
+      assert JSON.decode!(frame) == %{"type" => "error", "code" => "invalid_message"}
+      assert {:ok, [[0, 0, 0, 0]]} = identity_census(ctx.db)
+    end
+  end
+
   defp send_message(message, state) do
     {:push, {:text, frame}, _state} =
       Socket.handle_in({JSON.encode!(message), opcode: :text}, state)
@@ -672,25 +695,20 @@ defmodule Tightbeam.Wire.SocketTest do
     JSON.decode!(frame)
   end
 
+  defp identity_census(db) do
+    DB.query(db, """
+    SELECT (SELECT COUNT(*) FROM users), (SELECT COUNT(*) FROM devices),
+           (SELECT COUNT(*) FROM sessions), (SELECT COUNT(*) FROM cold_start_receipts)
+    """)
+  end
+
   test "auth registers, replays at most 500, then sends sync_complete", ctx do
     {:paired, device} =
-      Devices.pair(ctx.db, %{device_id: "d1", claimed_name: "Flynn", platform: nil, model: nil})
+      claim_org(ctx.db, %{device_id: "d1", claimed_name: "Flynn", platform: nil, model: nil})
 
     key = Org.personal_session_key(device.user_id)
 
-    Org.create(ctx.db, %{
-      session_key: key,
-      display_name: "Main",
-      kind: "main",
-      is_built_in: true,
-      owner_user_id: device.user_id,
-      origin: "user:#{device.user_id}",
-      archetype: "default",
-      host: "testhost",
-      harness: "claude",
-      provider: "anthropic",
-      model: Model.new("fable")
-    })
+    ensure_main_session(ctx.db, device.user_id)
 
     for n <- 1..501,
         do: Projection.append(ctx.db, %{session_key: key, role: "assistant", content: "m#{n}"})
@@ -715,7 +733,7 @@ defmodule Tightbeam.Wire.SocketTest do
 
   test "concurrent first auths converge on one personal main stream", ctx do
     {:paired, device} =
-      Devices.pair(ctx.db, %{device_id: "race", claimed_name: "Flynn", platform: nil, model: nil})
+      claim_org(ctx.db, %{device_id: "race", claimed_name: "Flynn", platform: nil, model: nil})
 
     proxy = :"main_seed_race_db_#{System.unique_integer([:positive])}"
     start_supervised!({MainSeedRaceDB, {proxy, ctx.db}})
@@ -750,23 +768,11 @@ defmodule Tightbeam.Wire.SocketTest do
 
   test "drain filters a mid-replay push already covered by the replay window", ctx do
     {:paired, device} =
-      Devices.pair(ctx.db, %{device_id: "d1", claimed_name: "Flynn", platform: nil, model: nil})
+      claim_org(ctx.db, %{device_id: "d1", claimed_name: "Flynn", platform: nil, model: nil})
 
     key = Org.personal_session_key(device.user_id)
 
-    Org.create(ctx.db, %{
-      session_key: key,
-      display_name: "Main",
-      kind: "main",
-      is_built_in: true,
-      owner_user_id: device.user_id,
-      origin: "user:#{device.user_id}",
-      archetype: "default",
-      host: "testhost",
-      harness: "claude",
-      provider: "anthropic",
-      model: Model.new("fable")
-    })
+    ensure_main_session(ctx.db, device.user_id)
 
     {:appended, replayed} =
       Projection.append(ctx.db, %{session_key: key, role: "assistant", content: "old"})
@@ -801,23 +807,11 @@ defmodule Tightbeam.Wire.SocketTest do
 
   test "drain never deletes a stalled frame the replay window excluded", ctx do
     {:paired, device} =
-      Devices.pair(ctx.db, %{device_id: "d1", claimed_name: "Flynn", platform: nil, model: nil})
+      claim_org(ctx.db, %{device_id: "d1", claimed_name: "Flynn", platform: nil, model: nil})
 
     key = Org.personal_session_key(device.user_id)
 
-    Org.create(ctx.db, %{
-      session_key: key,
-      display_name: "Main",
-      kind: "main",
-      is_built_in: true,
-      owner_user_id: device.user_id,
-      origin: "user:#{device.user_id}",
-      archetype: "default",
-      host: "testhost",
-      harness: "claude",
-      provider: "anthropic",
-      model: Model.new("fable")
-    })
+    ensure_main_session(ctx.db, device.user_id)
 
     # Three committed rows. Row ONE's publisher stalled between commit and
     # publish; the client saw row TWO live, so its cursor sits at two.
@@ -865,7 +859,7 @@ defmodule Tightbeam.Wire.SocketTest do
   test "work-state-only auth skips chat material, gates inbound chat, and preserves class on re-auth",
        ctx do
     {:paired, device} =
-      Devices.pair(ctx.db, %{device_id: "state", claimed_name: "State", platform: nil, model: nil})
+      claim_org(ctx.db, %{device_id: "state", claimed_name: "State", platform: nil, model: nil})
 
     {:ok, state} = Socket.init(ctx.deps)
 
@@ -885,7 +879,7 @@ defmodule Tightbeam.Wire.SocketTest do
     assert decoded["streamReadStates"] == %{}
     assert decoded["streamTailStates"] == %{}
     assert decoded["replayCount"] == 0
-    assert Org.list_for_user(ctx.db, device.user_id, false) == []
+    assert [%{kind: "main"}] = Org.list_for_user(ctx.db, device.user_id, false)
 
     {:push, [{:text, sync}], live} = Socket.handle_info(:finish_replay, replaying)
     assert JSON.decode!(sync) == %{"type" => "sync_complete"}
@@ -909,7 +903,7 @@ defmodule Tightbeam.Wire.SocketTest do
 
     assert reauthing.conn_ref == live.conn_ref
     assert reauthing.subscriptions == MapSet.new(["work_state"])
-    assert Org.list_for_user(ctx.db, device.user_id, false) == []
+    assert [%{kind: "main"}] = Org.list_for_user(ctx.db, device.user_id, false)
 
     {:push, [{:text, _}], live_again} = Socket.handle_info(:finish_replay, reauthing)
 
@@ -936,7 +930,7 @@ defmodule Tightbeam.Wire.SocketTest do
 
   test "default connection re-auth preserves its lifetime class without re-registration", ctx do
     {:paired, device} =
-      Devices.pair(ctx.db, %{
+      claim_org(ctx.db, %{
         device_id: "default-reauth",
         claimed_name: "Default",
         platform: nil,
@@ -982,7 +976,7 @@ defmodule Tightbeam.Wire.SocketTest do
 
   test "invalid subscription sets fail before seeding or registration", ctx do
     {:paired, device} =
-      Devices.pair(ctx.db, %{device_id: "bad", claimed_name: "Bad", platform: nil, model: nil})
+      claim_org(ctx.db, %{device_id: "bad", claimed_name: "Bad", platform: nil, model: nil})
 
     for subscriptions <- [[], ["unknown"]] do
       {:ok, state} = Socket.init(ctx.deps)
@@ -999,7 +993,7 @@ defmodule Tightbeam.Wire.SocketTest do
 
       assert JSON.decode!(error)["code"] == "invalid_message"
       assert map_size(:sys.get_state(ctx.registry).conns) == 0
-      assert Org.list_for_user(ctx.db, device.user_id, false) == []
+      assert [%{kind: "main"}] = Org.list_for_user(ctx.db, device.user_id, false)
     end
   end
 end
