@@ -327,7 +327,7 @@ defmodule Tightbeam.EffortCheckin do
   def rule(db, config, call) do
     request_id = call.params[:request_id] || call.params[:request]
     action = call.params[:action]
-    request = request_row(db, request_id)
+    request = visible_response_request(db, call, request_id)
 
     cond do
       is_nil(request) ->
@@ -342,7 +342,8 @@ defmodule Tightbeam.EffortCheckin do
       not authorized?(call.principal, request) ->
         error("not_authorized", "current expecter required")
 
-      request.status == "ruled" and request.decision == action ->
+      request.status == "ruled" and request.decision == action and
+          request.ruled_by == Escalation.responder_ref(call.principal) ->
         request
 
       request.status != "open" ->
@@ -370,7 +371,7 @@ defmodule Tightbeam.EffortCheckin do
                  config,
                  request,
                  action,
-                 call.origin,
+                 Escalation.responder_ref(call.principal),
                  call.principal,
                  fresh
                )
@@ -589,12 +590,16 @@ defmodule Tightbeam.EffortCheckin do
     end
   end
 
-  defp rule_in_txn(txn, config, request, action, origin, principal, fresh) do
+  defp rule_in_txn(txn, config, request, action, responder_by, principal, fresh) do
     current = request_for_id(txn, request.id)
 
     cond do
       not authorized?(principal, current) ->
         error("not_authorized", "current expecter required")
+
+      current.status == "ruled" and current.decision == action and
+          current.ruled_by == responder_by ->
+        current
 
       action == "dismiss" and
           not prepared_rearms_current?(
@@ -611,7 +616,7 @@ defmodule Tightbeam.EffortCheckin do
       current.status == "open" ->
         ruled_at = now()
 
-        if Escalation.effort_rule_in_txn(txn, current.id, action, origin, ruled_at) do
+        if Escalation.effort_rule_in_txn(txn, current.id, action, responder_by, ruled_at) do
           ruled = request_for_id(txn, current.id)
 
           cancel_pending_wake_in_txn!(
@@ -658,7 +663,12 @@ defmodule Tightbeam.EffortCheckin do
 
           request_for_id(txn, current.id)
         else
-          error("not_open", "decision request is not open")
+          winner = request_for_id(txn, current.id)
+
+          if winner.status == "ruled" and winner.decision == action and
+               winner.ruled_by == responder_by,
+             do: winner,
+             else: error("not_open", "decision request is not open")
         end
 
       true ->
@@ -1190,7 +1200,7 @@ defmodule Tightbeam.EffortCheckin do
     end
   end
 
-  defp authorized?({:session, key}, request), do: request.expecter_session_key == key
+  defp authorized?({:session, _key}, %{kind: "effort"}), do: true
   defp authorized?({:user, user}, request), do: request.expecter_user_id == user
   defp authorized?(_, _request), do: false
 
@@ -1389,6 +1399,36 @@ defmodule Tightbeam.EffortCheckin do
   defp request_for_id(txn, id), do: Escalation.raw_by_id_in_txn!(txn, id)
 
   defp request_row(db, id), do: Escalation.raw_by_id(db, id)
+
+  defp visible_response_request(db, call, id) do
+    case request_row(db, id) do
+      %{kind: "effort"} = request ->
+        request
+
+      request when is_map(request) ->
+        owner_user_id =
+          case call.principal do
+            {:user, user_id} ->
+              user_id
+
+            {:session, key} ->
+              case Org.get(db, key) do
+                %{owner_user_id: user_id} -> user_id
+                _ -> nil
+              end
+
+            _ ->
+              nil
+          end
+
+        if Escalation.get(db, call, id, owner_user_id: owner_user_id),
+          do: request,
+          else: nil
+
+      nil ->
+        nil
+    end
+  end
 
   defp mark_wake_fired(txn, wake_id) do
     Txn.q(

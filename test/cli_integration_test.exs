@@ -1130,7 +1130,7 @@ defmodule Tightbeam.CliIntegrationTest do
                     }}
   end
 
-  test "real CLI returns an insufficient question and removes it from the open queue", ctx do
+  test "real CLI reads and non-expecter returns an exact question", ctx do
     {asked, 0} =
       System.cmd(
         ctx.binary,
@@ -1159,7 +1159,24 @@ defmodule Tightbeam.CliIntegrationTest do
              )
 
     assert asked =~ request_id
-    worker_dir = session_workdir!(ctx, ctx.worker)
+
+    {read, 0} =
+      System.cmd(
+        ctx.binary,
+        ["decision-request", "--request", request_id],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert read =~ request_id
+    assert read =~ "which migration should ship?"
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "decision-request",
+                      principal: {:session, "cli-holder"},
+                      params: %{request: ^request_id}
+                    }}
 
     {returned, 0} =
       System.cmd(
@@ -1171,7 +1188,7 @@ defmodule Tightbeam.CliIntegrationTest do
           "--reason",
           "name the migration and rollback boundary"
         ],
-        cd: worker_dir,
+        cd: ctx.workdir,
         stderr_to_stdout: true
       )
 
@@ -1182,14 +1199,14 @@ defmodule Tightbeam.CliIntegrationTest do
     assert_receive {:cli_call,
                     %{
                       verb: "return",
-                      principal: {:session, "cli-worker"},
+                      principal: {:session, "cli-holder"},
                       params: %{
                         request: ^request_id,
                         reason: "name the migration and rollback boundary"
                       }
                     }}
 
-    assert {:ok, [["returned", "session:cli-worker", reason, returned_at]]} =
+    assert {:ok, [["returned", "session:cli-holder", reason, returned_at]]} =
              DB.query(
                ctx.db,
                "SELECT status, returnedBy, returnReason, returnedAt FROM decision_requests WHERE id=?1",
@@ -1215,6 +1232,68 @@ defmodule Tightbeam.CliIntegrationTest do
 
     assert history =~ request_id
     assert history =~ reason
+  end
+
+  test "real CLI non-expecter answer records the authenticated session and conflicts stay typed",
+       ctx do
+    {_asked, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "ask",
+          "--session",
+          ctx.worker.session_key,
+          "--question",
+          "ship behind a flag?"
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert {:ok, [[request_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT id FROM decision_requests WHERE kind='agent' ORDER BY rowid DESC LIMIT 1"
+             )
+
+    {answered, 0} =
+      System.cmd(
+        ctx.binary,
+        ["answer", "--request", request_id, "--answer", "  yes, behind a flag  "],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert answered =~ request_id
+    assert answered =~ "session:cli-holder"
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "answer",
+                      principal: {:session, "cli-holder"},
+                      params: %{request: ^request_id, answer: "  yes, behind a flag  "}
+                    }}
+
+    assert {:ok, [["answered", "yes, behind a flag", "session:cli-holder"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT status,answer,answeredBy FROM decision_requests WHERE id=?1",
+               [request_id]
+             )
+
+    worker_dir = session_workdir!(ctx, ctx.worker)
+
+    {conflict, status} =
+      System.cmd(
+        ctx.binary,
+        ["answer", "--request", request_id, "--answer", "yes, behind a flag"],
+        cd: worker_dir,
+        stderr_to_stdout: true
+      )
+
+    assert status != 0
+    assert conflict =~ "not_open"
+    assert conflict =~ "decision request is not open"
   end
 
   test "real CLI retrieves open decisions through the configured client gateway path", ctx do

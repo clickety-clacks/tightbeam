@@ -422,6 +422,15 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             }
             Ok(request(identity, "decision-requests", vec![], params))
         }
+        Command::DecisionRequest {
+            identity,
+            request_id,
+        } => Ok(request(
+            identity,
+            "decision-request",
+            vec![],
+            vec![string_field("request", request_id)],
+        )),
         // `ask` carries a TYPED TARGET, exactly like `wake`: the gateway resolves
         // a role's binding (and its fallback) once, at the door.
         Command::Ask {
@@ -1539,6 +1548,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::Dispatch { identity, .. }
         | Command::EffortRule { identity, .. }
         | Command::DecisionRequests { identity, .. }
+        | Command::DecisionRequest { identity, .. }
         | Command::Ask { identity, .. }
         | Command::Answer { identity, .. }
         | Command::ReturnRequest { identity, .. }
@@ -2352,6 +2362,10 @@ mod tests {
         assert_eq!(
             body(&["decision-requests", "--status", "open", "--as", "parent"]),
             r#"{"as":"parent","verb":"decision-requests","params":{"status":"open"}}"#
+        );
+        assert_eq!(
+            body(&["decision-request", "--request", "dr_1", "--as", "observer",]),
+            r#"{"as":"observer","verb":"decision-request","params":{"request":"dr_1"}}"#
         );
         assert_eq!(
             body(&["revoke-assignment", "asg_1", "--as", "parent",]),

@@ -116,13 +116,15 @@ act for you to move on:
 
     tightbeam withdraw --request <id> --reason "worked it out from the spec"
 
-Answer a question that was put to you — and only you, or your owner, can:
+The expecter is the preferred responder. Another authenticated agent session with the complete
+id may inspect and respond when it has enough context:
 
     tightbeam answer --request <id> --answer "behind a flag; the migration lands next week"
 
 It is an answer, not a ruling. It authorizes nothing and unblocks nothing on its own; the agent
-who asked reads it and decides what to do. Questions arrive as `input-needed` traffic, so one
-lands at your next turn boundary or within 30 minutes, whichever comes first.
+who asked reads it and decides what to do. Response standing is not an instruction to respond;
+use your own judgment. Questions arrive as `input-needed` traffic, so one lands at your next
+turn boundary or within 30 minutes, whichever comes first.
 
 A need that is not a row reaches no one. Never bury "this needs the owner" in an attest note
 or a progress report and consider it raised — prose pages nobody and expires with attention.

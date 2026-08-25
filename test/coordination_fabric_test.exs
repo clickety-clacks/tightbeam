@@ -1656,7 +1656,10 @@ defmodule Tightbeam.CoordinationFabricTest do
       withdraw_episodes: [{"lib/tightbeam/rail_episodes.ex", "handle_call/3"}],
       recover_retired: [{"lib/tightbeam/boot.ex", "start_link/1"}],
       list: [{"lib/tightbeam/gateway.ex", "handlers/1"}],
-      get: [{"lib/tightbeam/gateway.ex", "handlers/1"}],
+      get: [
+        {"lib/tightbeam/effort_checkin.ex", "visible_response_request/3"},
+        {"lib/tightbeam/gateway.ex", "handlers/1"}
+      ],
       effort_rule_in_txn: [{"lib/tightbeam/effort_checkin.ex", "rule_in_txn/7"}],
       claim_park_wake_in_txn: [{"lib/tightbeam/supervision.ex", "park_escalation/3"}],
       decision_trace_rows: [{"lib/tightbeam/job_trace.ex", "decision_entries/2"}],
@@ -3300,22 +3303,12 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert snapshot.() == before
   end
 
-  test "the asker's exits are its own, and only the asked principal answers", %{db: db} do
+  test "the asker keeps its exit while a non-expecter session may answer by exact id", %{db: db} do
     seed_session(db, "agent:coder", "flynn")
     seed_session(db, "agent:po", "flynn")
     seed_session(db, "agent:stranger", "outsider")
 
     assert {:ok, %{decision_request: request}} = ask(db, "agent:coder", "agent:po", "which way?")
-
-    # Not the asker, not a bystander, not an admin: the principal that was
-    # asked. Refused as `not_found` rather than a kind-revealing `not_asked`
-    # (Sol xhigh review, finding 4) — an unauthorized caller learns nothing an
-    # unauthorized caller probing a fake id would not also learn.
-    assert {:error, %{code: "not_found"}} =
-             answer(db, {:session, "agent:coder"}, request.id, "myself")
-
-    assert {:error, %{code: "not_found"}} =
-             answer(db, {:session, "agent:stranger"}, request.id, "not mine to answer")
 
     # `rule` and `waive` refuse BY NAME rather than quietly doing something.
     assert {:error, %{code: "invalid", message: ruled}} =
@@ -3333,11 +3326,12 @@ defmodule Tightbeam.CoordinationFabricTest do
     before_facts = fact_count(db)
 
     assert {:ok, %{decision_request: answered}} =
-             answer(db, {:session, "agent:po"}, request.id, "behind a flag")
+             answer(db, {:session, "agent:stranger"}, request.id, "  behind a flag  ")
 
     assert answered.status == "answered"
     assert answered.answer == "behind a flag"
-    assert answered.answered_by == "session:agent:po"
+    assert answered.answered_by == "session:agent:stranger"
+    assert answered.expecter_session_key == "agent:po"
     assert answered.decision == nil
     assert answered.consumed_at == nil
     assert fact_count(db) == before_facts
@@ -3346,12 +3340,71 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert reply.prompt =~ "behind a flag"
     assert reply.class == nil, "the substrate does not elect a class on a mind's behalf"
 
-    # Answered once is answered: a second answer is refused, not overwritten.
+    # The actual responder's normalized exact retry is idempotent. Another
+    # principal or another payload cannot overwrite history.
+    assert {:ok, %{decision_request: exact_retry}} =
+             answer(db, {:session, "agent:stranger"}, request.id, "behind a flag")
+
+    assert exact_retry.answered_at == answered.answered_at
+    assert [_one_reply] = wakes_for(db, "agent:coder")
+
     assert {:error, %{code: "not_open"}} =
-             answer(db, {:session, "agent:po"}, request.id, "changed my mind")
+             answer(db, {:session, "agent:po"}, request.id, "behind a flag")
+
+    assert {:error, %{code: "not_open"}} =
+             answer(db, {:session, "agent:stranger"}, request.id, "changed my mind")
   end
 
-  test "answer and rule refuse a fake id, an agent question, and a non-agent request identically to an unauthorized caller",
+  test "the stamped expecter user keeps the existing human response boundary", %{db: db} do
+    seed_session(db, "agent:coder", "asker-owner")
+    seed_session(db, "agent:po", "expecter-owner")
+    seed_session(db, "agent:other", "other-owner")
+
+    assert {:ok, %{decision_request: answer_request}} =
+             ask(db, "agent:coder", "agent:po", "which way?")
+
+    for {principal, origin} <- [
+          {{:process, "ci"}, "process:ci"},
+          {{:role, "owner"}, "role:owner"},
+          {nil, "anonymous"}
+        ] do
+      call = %{origin: origin, principal: principal, params: %{}}
+      assert Escalation.get(db, call, answer_request.id) == nil
+
+      assert %{code: "not_found"} =
+               Escalation.answer(db, %{
+                 call
+                 | params: %{request: answer_request.id, answer: "guess"}
+               })
+
+      assert %{code: "not_found"} =
+               Escalation.return_request(db, %{
+                 call
+                 | params: %{request: answer_request.id, reason: "unclear"}
+               })
+    end
+
+    assert {:error, %{code: "not_found"}} =
+             answer(db, {:user, "other-owner"}, answer_request.id, "guess")
+
+    assert {:ok, %{decision_request: answered}} =
+             answer(db, {:user, "expecter-owner"}, answer_request.id, "behind a flag")
+
+    assert answered.answered_by == "user:expecter-owner"
+
+    assert {:ok, %{decision_request: return_request}} =
+             ask(db, "agent:coder", "agent:po", "which migration?")
+
+    assert {:error, %{code: "not_found"}} =
+             return_request(db, {:user, "other-owner"}, return_request.id, "unclear")
+
+    assert {:ok, %{decision_request: returned}} =
+             return_request(db, {:user, "expecter-owner"}, return_request.id, "name it")
+
+    assert returned.returned_by == "user:expecter-owner"
+  end
+
+  test "agent response standing preserves hidden statute and ordinary rule boundaries",
        %{db: db} do
     seed_session(db, "agent:coder", "flynn")
     seed_session(db, "agent:po", "flynn")
@@ -3372,18 +3425,48 @@ defmodule Tightbeam.CoordinationFabricTest do
         [statute_id]
       )
 
-    # `answer`: a caller that was never asked cannot tell a fake id, someone
-    # else's question, and a non-agent request apart — ONE refusal for all
-    # three (Sol xhigh review, finding 4). Authority is checked before
-    # existence or kind is revealed.
+    # Exact standing does not turn an absent or statute id into a kind oracle.
     assert {:error, %{code: "not_found"}} =
              answer(db, {:session, "agent:outsider"}, "dr_nonexistent", "guess")
 
-    assert {:error, %{code: "not_found"}} =
-             answer(db, {:session, "agent:outsider"}, agent_request.id, "not mine")
+    assert {:ok, %{decision_request: answered}} =
+             answer(db, {:session, "agent:outsider"}, agent_request.id, "known answer")
+
+    assert answered.answered_by == "session:agent:outsider"
 
     assert {:error, %{code: "not_found"}} =
              answer(db, {:session, "agent:outsider"}, statute_id, "not agent-kind")
+
+    assert {:ok, %{decision_request: %{id: id, status: "answered"}}} =
+             verb(db, {:session, "agent:outsider"}, "decision-request", %{
+               request: agent_request.id
+             })
+
+    assert id == agent_request.id
+
+    assert {:error, %{code: "not_found", message: hidden_statute}} =
+             verb(db, {:session, "agent:outsider"}, "decision-request", %{
+               request: statute_id
+             })
+
+    assert {:error, %{code: "not_found", message: absent}} =
+             verb(db, {:session, "agent:outsider"}, "decision-request", %{
+               request: "dr_nonexistent"
+             })
+
+    assert hidden_statute == absent
+
+    assert {:error, %{code: "invalid"}} =
+             verb(db, {:session, "agent:outsider"}, "effort-rule", %{
+               request: agent_request.id,
+               action: "continue"
+             })
+
+    assert {:error, %{code: "not_found", message: ^hidden_statute}} =
+             verb(db, {:session, "agent:outsider"}, "effort-rule", %{
+               request: statute_id,
+               action: "continue"
+             })
 
     # `rule`: an unauthorized (non-admin) caller gets the SAME refusal whether
     # the id is fake, names an agent question, or names a real, rulable
@@ -3452,11 +3535,6 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert {:error, %{code: "invalid"}} =
              return_request(db, {:session, "agent:po"}, request.id, "  ")
 
-    # The same privacy wall as answer: neither an outsider nor a non-agent id
-    # becomes an existence/kind oracle through the new verb.
-    assert {:error, %{code: "not_found"}} =
-             return_request(db, {:session, "agent:stranger"}, request.id, "unclear")
-
     assert {:error, %{code: "not_found"}} =
              return_request(db, {:session, "agent:po"}, "dr_missing", "unclear")
 
@@ -3465,7 +3543,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert {:ok, %{decision_request: returned}} =
              return_request(
                db,
-               {:session, "agent:po"},
+               {:session, "agent:stranger"},
                request.id,
                "  name the migration and rollback boundary  "
              )
@@ -3477,7 +3555,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert returned.raiser_session_key == request.raiser_session_key
     assert returned.expecter_session_key == request.expecter_session_key
     assert returned.return_reason == "name the migration and rollback boundary"
-    assert returned.returned_by == "session:agent:po"
+    assert returned.returned_by == "session:agent:stranger"
     assert is_integer(returned.returned_at)
     assert returned.answer == nil
     assert fact_count(db) == before_facts
@@ -3508,7 +3586,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert {:ok, %{decision_request: exact_retry}} =
              return_request(
                db,
-               {:session, "agent:po"},
+               {:session, "agent:stranger"},
                request.id,
                "name the migration and rollback boundary"
              )
@@ -3524,7 +3602,10 @@ defmodule Tightbeam.CoordinationFabricTest do
              )
 
     assert {:error, %{code: "not_open"}} =
-             return_request(db, {:session, "agent:po"}, request.id, "different reason")
+             return_request(db, {:session, "agent:po"}, request.id, returned.return_reason)
+
+    assert {:error, %{code: "not_open"}} =
+             return_request(db, {:session, "agent:stranger"}, request.id, "different reason")
 
     assert {:error, %{code: "not_open"}} =
              answer(db, {:session, "agent:po"}, request.id, "too late")
@@ -3533,6 +3614,7 @@ defmodule Tightbeam.CoordinationFabricTest do
   test "answer, withdraw, and return race to one terminal winner", %{db: db} do
     seed_session(db, "agent:coder", "flynn")
     seed_session(db, "agent:po", "flynn")
+    seed_session(db, "agent:observer", "outsider")
 
     assert {:ok, %{decision_request: request}} =
              ask(db, "agent:coder", "agent:po", "enough context?")
@@ -3558,7 +3640,7 @@ defmodule Tightbeam.CoordinationFabricTest do
 
     outcomes =
       [
-        race.(fn -> answer(db, {:session, "agent:po"}, request.id, "yes") end),
+        race.(fn -> answer(db, {:session, "agent:observer"}, request.id, "yes") end),
         race.(fn ->
           withdraw(db, {:session, "agent:coder"}, request.id, "no longer needed")
         end),
@@ -3668,7 +3750,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert list_requests(db, {:user, "outsider"}) == []
   end
 
-  test "a sibling session sharing the asker's owner is not one of the three visible principals",
+  test "a sibling session gets exact access without gaining list discovery",
        %{db: db} do
     seed_session(db, "agent:coder", "flynn")
     seed_session(db, "agent:po", "flynn")
@@ -3693,7 +3775,24 @@ defmodule Tightbeam.CoordinationFabricTest do
     }
 
     assert Escalation.list(db, reviewer_call, "open", owner_user_id: "flynn") == []
-    assert Escalation.get(db, reviewer_call, request.id, owner_user_id: "flynn") == nil
+
+    assert %{id: request_id, context: %{"verb" => "ask"}} =
+             Escalation.get(db, reviewer_call, request.id, owner_user_id: "flynn")
+
+    assert request_id == request.id
+
+    assert {:ok, %{decision_request: %{id: ^request_id, expecter_session_key: "agent:bob-app"}}} =
+             verb(db, {:session, "agent:reviewer"}, "decision-request", %{
+               request: request.id
+             })
+
+    shortened = String.slice(request.id, 0, byte_size(request.id) - 1)
+    assert Escalation.get(db, reviewer_call, shortened, owner_user_id: "flynn") == nil
+
+    assert {:error, %{code: "not_found"}} =
+             verb(db, {:session, "agent:reviewer"}, "decision-request", %{
+               request: shortened
+             })
 
     # The owner acting AS itself — a user principal, not merely a session
     # resolving to the same owner — is the one the `ownerUserId` branch exists

@@ -420,17 +420,16 @@ defmodule Tightbeam.Escalation do
   nothing, and fires no condition fact. It writes the text, names who wrote it,
   and wakes the asker — which is the whole of what the substrate owes here.
 
-  Who may answer: the asked SESSION itself, or the accountable owner that
-  session resolved to when the question was filed. Nobody else — an admin
-  answering a question addressed to someone else would be the substrate letting
-  authority stand in for the mind that was actually asked.
+  The asked session remains the preferred responder. Any authenticated agent
+  session that has the complete request id may answer when its own judgment says
+  it has enough context. The stamped expecter user retains the existing human
+  response boundary.
 
-  Authority is checked BEFORE anything about the request is revealed: a
-  nonexistent id, an existing non-agent id, and an existing agent question
-  addressed to someone else are ONE identical refusal (Sol xhigh review,
-  finding 4). Distinguishing them would let an unauthorized caller probe
-  request ids for existence and kind — the same existence-oracle risk
-  `page/3`'s cursor resolution refuses (seam ④).
+  The principal boundary is checked before anything about the request is
+  revealed. For a principal without response standing, a nonexistent id, an
+  existing non-agent id, and an existing agent question are one identical
+  refusal. Distinguishing them would let that caller probe request ids for
+  existence and kind.
   """
   @spec answer(DB.server(), map()) :: map()
   def answer(db, call) do
@@ -440,15 +439,21 @@ defmodule Tightbeam.Escalation do
     case get_raw(db, request_id) do
       %{kind: "agent"} = request ->
         if decision_reader?(call, request) do
+          by = responder_ref(call.principal)
+
           cond do
             not (is_binary(text) and String.trim(text) != "") ->
               error("invalid", "an answer requires text")
 
-            request.status != "open" ->
-              error("not_open", "decision request is not open")
+            request.status == "open" ->
+              answer_open(db, request, String.trim(text), by)
+
+            request.status == "answered" and request.answered_by == by and
+                request.answer == String.trim(text) ->
+              request
 
             true ->
-              answer_open(db, request, String.trim(text), answered_by(call))
+              error("not_open", "decision request is not open")
           end
         else
           error("not_found", "decision request not found")
@@ -464,8 +469,9 @@ defmodule Tightbeam.Escalation do
 
   A return is a terminal, reasoned disposition of the exact immutable request,
   not an answer or ruling. The same principal boundary as `answer/2` applies:
-  the session resolved when the question was filed, or its stamped accountable
-  owner. Unauthorized, nonexistent, and non-agent ids refuse identically.
+  any authenticated agent session with the complete id, or the stamped
+  expecter user. Unauthorized, nonexistent, and non-agent ids refuse
+  identically.
   """
   @spec return_request(DB.server(), map()) :: map()
   def return_request(db, call) do
@@ -475,7 +481,7 @@ defmodule Tightbeam.Escalation do
     case get_raw(db, request_id) do
       %{kind: "agent"} = request ->
         if decision_reader?(call, request) do
-          by = reader_by(call)
+          by = responder_ref(call.principal)
 
           case trimmed_reason(reason) do
             {:ok, text} ->
@@ -616,7 +622,12 @@ defmodule Tightbeam.Escalation do
 
           request_in_txn(txn, request.id)
         else
-          error("not_open", "decision request is not open")
+          current = request_in_txn(txn, request.id)
+
+          if current.status == "answered" and current.answered_by == answered_by and
+               current.answer == text,
+             do: current,
+             else: error("not_open", "decision request is not open")
         end
       end)
 
@@ -774,19 +785,18 @@ defmodule Tightbeam.Escalation do
     end
   end
 
-  defp decision_reader?(%{principal: {:session, key}}, request),
-    do: key == request.expecter_session_key
+  defp decision_reader?(%{principal: {:session, _key}}, _request), do: true
 
   defp decision_reader?(%{principal: {:user, user_id}}, request),
     do: user_id == request.expecter_user_id
 
   defp decision_reader?(_call, _request), do: false
 
-  defp reader_by(%{principal: {:session, key}}), do: "session:" <> key
-  defp reader_by(%{principal: {:user, user_id}}), do: "user:" <> user_id
-
-  defp answered_by(%{principal: {:session, key}}), do: "session:" <> key
-  defp answered_by(%{principal: {:user, user_id}}), do: "user:" <> user_id
+  @doc "Canonical durable identity for an authenticated response principal."
+  @spec responder_ref(term()) :: String.t() | nil
+  def responder_ref({:session, key}), do: "session:" <> key
+  def responder_ref({:user, user_id}), do: "user:" <> user_id
+  def responder_ref(_principal), do: nil
 
   defp ask_notification(request_id, input) do
     about = if input.assignment_id, do: "\nAbout: #{input.assignment_id}", else: ""
@@ -1194,18 +1204,34 @@ defmodule Tightbeam.Escalation do
   def get(db, call, id, opts \\ [])
 
   def get(db, call, id, opts) do
-    {where, params} = visibility(call, Keyword.get(opts, :owner_user_id))
+    direct =
+      case call.principal do
+        {:session, _key} ->
+          case get_raw(db, id) do
+            %{kind: kind} = request when kind in ["agent", "effort"] -> request
+            _ -> nil
+          end
 
-    {:ok, rows} =
-      DB.query(
-        db,
-        "SELECT #{@request_columns} FROM decision_requests WHERE id = ?1 AND (#{shift_params(where)})",
-        [id | params]
-      )
+        _ ->
+          nil
+      end
 
-    case rows do
-      [row] -> request_from_row(row)
-      [] -> nil
+    if direct do
+      direct
+    else
+      {where, params} = visibility(call, Keyword.get(opts, :owner_user_id))
+
+      {:ok, rows} =
+        DB.query(
+          db,
+          "SELECT #{@request_columns} FROM decision_requests WHERE id = ?1 AND (#{shift_params(where)})",
+          [id | params]
+        )
+
+      case rows do
+        [row] -> request_from_row(row)
+        [] -> nil
+      end
     end
   end
 

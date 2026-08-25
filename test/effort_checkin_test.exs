@@ -9,6 +9,7 @@ defmodule Tightbeam.EffortCheckinTest do
     ConnRegistry,
     DB,
     EffortCheckin,
+    Escalation,
     Gateway,
     Ledger,
     Org,
@@ -30,6 +31,157 @@ defmodule Tightbeam.EffortCheckinTest do
       send(parent, {:lane_nudged, session_key})
       {:reply, :ok, parent}
     end
+  end
+
+  test "a non-expecter session reads and continues an exact effort request once", ctx do
+    session(ctx.db, "observer", "h2", Placement.local_host_name())
+    session(ctx.db, "other-observer", "h2", Placement.local_host_name())
+    request = open_effort_request(ctx, {:session, "parent"}, "continue")
+
+    observer_call = %{
+      origin: "agent:role-alias",
+      principal: {:session, "observer"},
+      params: %{}
+    }
+
+    assert Escalation.list(ctx.db, observer_call, "open", owner_user_id: "h2") == []
+
+    assert %{id: request_id, expecter_session_key: "parent", status: "open"} =
+             Escalation.get(ctx.db, observer_call, request.id, owner_user_id: "h2")
+
+    assert request_id == request.id
+
+    for {principal, origin} <- [
+          {{:process, "ci"}, "process:ci"},
+          {{:role, "owner"}, "role:owner"},
+          {nil, "anonymous"}
+        ] do
+      call = %{origin: origin, principal: principal, params: %{}}
+      assert Escalation.get(ctx.db, call, request.id) == nil
+
+      assert %{code: "not_authorized"} =
+               EffortCheckin.rule(ctx.db, ctx.config, %{
+                 call
+                 | params: %{request_id: request.id, action: "continue"}
+               })
+    end
+
+    generations_before = generation_count(ctx.db, request.assignment_id)
+    events_before = lifecycle_count(ctx.db, request.id)
+
+    assert %{status: "ruled", decision: "continue", ruled_by: "session:observer"} =
+             ruled =
+             effort_rule(ctx, {:session, "observer"}, request.id, "continue",
+               origin: "agent:untrusted-role-alias"
+             )
+
+    assert is_integer(ruled.ruled_at)
+    assert generation_count(ctx.db, request.assignment_id) == generations_before + 1
+    assert Wakes.get(ctx.db, request.deadline_wake_id).state == "canceled"
+    assert lifecycle_count(ctx.db, request.id) == events_before
+
+    # The canonical principal, verb, and action define the retry. Caller origin
+    # is not the audit identity and cannot change the stored actor.
+    assert %{ruled_at: ruled_at, ruled_by: "session:observer"} =
+             effort_rule(ctx, {:session, "observer"}, request.id, "continue",
+               origin: "agent:different-alias"
+             )
+
+    assert ruled_at == ruled.ruled_at
+    assert generation_count(ctx.db, request.assignment_id) == generations_before + 1
+    assert lifecycle_count(ctx.db, request.id) == events_before
+
+    assert %{code: "not_open"} =
+             effort_rule(ctx, {:session, "other-observer"}, request.id, "continue")
+
+    assert %{code: "not_open"} =
+             effort_rule(ctx, {:session, "observer"}, request.id, "dismiss")
+  end
+
+  test "effort response standing keeps the human boundary and dismiss snapshot safety", ctx do
+    session(ctx.db, "observer", "h2", Placement.local_host_name())
+    human_request = open_effort_request(ctx, {:user, "h1"}, "continue")
+
+    assert %{code: "not_authorized"} =
+             effort_rule(ctx, {:user, "h2"}, human_request.id, "continue")
+
+    assert %{status: "ruled", ruled_by: "user:h1"} =
+             effort_rule(ctx, {:user, "h1"}, human_request.id, "continue")
+
+    dismiss_request = open_effort_request(ctx, {:session, "parent"}, "dismiss")
+    old_wake_id = dismiss_request.deadline_wake_id
+    raced = :atomics.new(1, [])
+
+    racing_config =
+      Map.put(ctx.config, :sh, fn invocation ->
+        if :atomics.compare_exchange(raced, 1, 0, 1) == :ok do
+          {:ok, _} =
+            DB.query(
+              ctx.db,
+              "UPDATE effort_checkin_generations SET wakeId='stale-raced' WHERE assignmentId=?1 AND generation=?2",
+              [dismiss_request.assignment_id, dismiss_request.effort_generation]
+            )
+        end
+
+        System.cmd(hd(invocation), tl(invocation), stderr_to_stdout: true)
+      end)
+
+    assert %{code: "stale_effort_snapshot"} =
+             effort_rule(
+               %{ctx | config: racing_config},
+               {:session, "observer"},
+               dismiss_request.id,
+               "dismiss"
+             )
+
+    assert %{status: "open", ruled_by: nil} =
+             Escalation.raw_by_id(ctx.db, dismiss_request.id)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE effort_checkin_generations SET wakeId=?3 WHERE assignmentId=?1 AND generation=?2",
+        [dismiss_request.assignment_id, dismiss_request.effort_generation, old_wake_id]
+      )
+
+    assert %{status: "ruled", decision: "dismiss", ruled_by: "session:observer"} =
+             effort_rule(ctx, {:session, "observer"}, dismiss_request.id, "dismiss")
+  end
+
+  test "deadline rotation and distinct-session rulings preserve one effort disposition", ctx do
+    session(ctx.db, "observer", "h2", Placement.local_host_name())
+    session(ctx.db, "other-observer", "h2", Placement.local_host_name())
+
+    rotated_first = open_effort_request(ctx, {:session, "parent"}, "dismiss")
+    old_deadline = Wakes.get(ctx.db, rotated_first.deadline_wake_id)
+    assert :ok = EffortCheckin.deadline(ctx.db, ctx.config, old_deadline)
+
+    assert %{status: "open", deadline_wake_id: replacement_id} =
+             Escalation.raw_by_id(ctx.db, rotated_first.id)
+
+    refute replacement_id == old_deadline.wake_id
+
+    assert %{status: "ruled", decision: "dismiss", ruled_by: "session:observer"} =
+             effort_rule(ctx, {:session, "observer"}, rotated_first.id, "dismiss")
+
+    assert Wakes.get(ctx.db, replacement_id).state == "canceled"
+    assert :ok = EffortCheckin.deadline(ctx.db, ctx.config, old_deadline)
+
+    response_first = open_effort_request(ctx, {:session, "parent"}, "continue")
+    response_deadline = Wakes.get(ctx.db, response_first.deadline_wake_id)
+
+    assert %{status: "ruled", decision: "continue", ruled_by: "session:other-observer"} =
+             effort_rule(ctx, {:session, "other-observer"}, response_first.id, "continue")
+
+    generations = generation_count(ctx.db, response_first.assignment_id)
+    assert :ok = EffortCheckin.deadline(ctx.db, ctx.config, response_deadline)
+    assert generation_count(ctx.db, response_first.assignment_id) == generations
+
+    assert %{status: "ruled", ruled_by: "session:other-observer"} =
+             Escalation.raw_by_id(ctx.db, response_first.id)
+
+    assert lifecycle_count(ctx.db, rotated_first.id) == 0
+    assert lifecycle_count(ctx.db, response_first.id) == 0
   end
 
   setup do
@@ -1117,6 +1269,90 @@ defmodule Tightbeam.EffortCheckinTest do
     assert rows(ctx.db, "SELECT COUNT(*) FROM effort_checkin_generations WHERE assignmentId=?1", [
              bare.id
            ]) == [[0]]
+  end
+
+  defp open_effort_request(ctx, expecter, action) do
+    assignment =
+      dispatch(
+        ctx,
+        {:session, "parent"},
+        "holder",
+        "#{action}-#{System.unique_integer([:positive])}"
+      )
+
+    [[generation, wake_id]] =
+      rows(
+        ctx.db,
+        "SELECT generation,wakeId FROM effort_checkin_generations WHERE assignmentId=?1",
+        [assignment.id]
+      )
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE effort_checkin_generations SET state='probed' WHERE assignmentId=?1",
+        [assignment.id]
+      )
+
+    request_id = "dr_#{action}_#{System.unique_integer([:positive])}"
+    now = System.system_time(:millisecond)
+
+    {expecter_session_key, expecter_user_id} =
+      case expecter do
+        {:session, key} -> {key, nil}
+        {:user, user_id} -> {nil, user_id}
+      end
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO decision_requests
+          (id, kind, raiserId, ownerUserId, assignmentId, expecterSessionKey,
+           expecterUserId, lineageRung, effortGeneration, deadlineWakeId,
+           raisedAt, deadlineAt, question, options, context, status)
+        VALUES (?1, 'effort', 'process:tightbeam', 'h2', ?2, ?3, ?4,
+                1, ?5, ?6, ?7, ?8, 'Continue or dismiss?', ?9, ?10, 'open')
+        """,
+        [
+          request_id,
+          assignment.id,
+          expecter_session_key,
+          expecter_user_id,
+          generation,
+          wake_id,
+          now,
+          now + 60_000,
+          JSON.encode!(["continue", "dismiss"]),
+          JSON.encode!(%{"actions" => ["continue", "dismiss"]})
+        ]
+      )
+
+    Escalation.raw_by_id(ctx.db, request_id)
+  end
+
+  defp effort_rule(ctx, principal, request_id, action, opts \\ []) do
+    EffortCheckin.rule(ctx.db, ctx.config, %{
+      origin: Keyword.get(opts, :origin, origin(principal)),
+      principal: principal,
+      params: %{request_id: request_id, action: action}
+    })
+  end
+
+  defp generation_count(db, assignment_id) do
+    [[count]] =
+      rows(db, "SELECT COUNT(*) FROM effort_checkin_generations WHERE assignmentId=?1", [
+        assignment_id
+      ])
+
+    count
+  end
+
+  defp lifecycle_count(db, request_id) do
+    [[count]] =
+      rows(db, "SELECT COUNT(*) FROM lifecycle_events WHERE subject=?1", [request_id])
+
+    count
   end
 
   defp dispatch(ctx, principal, holder, subject) do

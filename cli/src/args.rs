@@ -176,6 +176,10 @@ pub enum Command {
         identity: Identity,
         status: Option<String>,
     },
+    DecisionRequest {
+        identity: Identity,
+        request_id: String,
+    },
     /// File one question at a named principal (coordination-fabric-v1 §7
     /// `input-needed` carrier). The row is data its asker chooses to honor:
     /// filing it blocks nothing, here or on the gateway.
@@ -632,6 +636,10 @@ COMMANDS:
       Rule an effort-without-effect check-in routed to your principal.
   decision-requests [--status open|ruled|consumed|withdrawn|superseded|returned|all]
       List decision requests visible to your principal.
+  decision-request --request <decisionRequestId>
+      Read one exact decision request. An authenticated agent session with the
+      complete id may inspect an agent or effort request. This is direct access,
+      not list discovery, and it does not instruct the session to respond.
   ask (--session <key> | --role <name> | --user <id>) --question "<text>"
       [--about <assignmentId>]
       Put one question to another principal and get back its id. THE QUESTION
@@ -644,8 +652,9 @@ COMMANDS:
         tightbeam ask --role owner --question "ship behind a flag or block?" --as coder
   answer --request <decisionRequestId> --answer "<text>"
       Answer a question that was put to you. It is an answer, not a ruling: it
-      authorizes nothing and unblocks nothing on its own. Only the principal
-      the question was asked of can answer it.
+      authorizes nothing and unblocks nothing on its own. The expecter is the
+      preferred responder; another authenticated agent session with the complete
+      id may answer when its own judgment says it has enough context.
   return --request <decisionRequestId> --reason "<text>"
       Return an open question for insufficient information. The original row
       and reason remain in history, it leaves the open queue, and its asker
@@ -1538,6 +1547,21 @@ fn parse_with_optional_catalog(
                 status: nonempty(flags, "status"),
             })
         }
+        "decision-request" => {
+            let request_id = nonempty(flags, "request");
+            let has_target = ["session", "role", "user", "to"]
+                .iter()
+                .any(|name| flags.contains_key(*name));
+            if parsed.positional.len() != 1 || request_id.is_none() || has_target {
+                return Err(
+                    "usage: tightbeam decision-request --request <decisionRequestId>".to_owned(),
+                );
+            }
+            Ok(Command::DecisionRequest {
+                identity: identity(flags)?,
+                request_id: request_id.expect("checked above"),
+            })
+        }
         "ask" => {
             let targets = [
                 nonempty(flags, "session").map(Target::Session),
@@ -2004,7 +2028,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, ask, answer, return, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, decision-request, ask, answer, return, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -2808,6 +2832,7 @@ mod tests {
                 "condition",
                 "config",
                 "coordination-share",
+                "decision-request",
                 "decision-requests",
                 "digest-members",
                 "dispatch",
@@ -3413,10 +3438,47 @@ mod tests {
     }
 
     #[test]
+    fn decision_request_requires_one_exact_flag_and_no_target() {
+        assert_eq!(
+            parse(strings(&[
+                "decision-request",
+                "--request",
+                "dr_1",
+                "--as-user",
+                "flynn",
+            ])),
+            Ok(Command::DecisionRequest {
+                identity: Identity::User("flynn".to_owned()),
+                request_id: "dr_1".to_owned(),
+            })
+        );
+
+        for args in [
+            strings(&["decision-request", "--as-user", "flynn"]),
+            strings(&["decision-request", "--request", "", "--as-user", "flynn"]),
+            strings(&["decision-request", "dr_1", "--as-user", "flynn"]),
+            strings(&[
+                "decision-request",
+                "--request",
+                "dr_1",
+                "--session",
+                "agent:other",
+                "--as-user",
+                "flynn",
+            ]),
+        ] {
+            assert_eq!(
+                parse(args),
+                Err("usage: tightbeam decision-request --request <decisionRequestId>".to_owned())
+            );
+        }
+    }
+
+    #[test]
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, ask, answer, return, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, decision-request, ask, answer, return, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned())
         );
     }
 
@@ -3462,7 +3524,6 @@ mod tests {
             "waive",
             "revoke-waiver",
             "withdraw",
-            "decision-request",
             "critical",
             "work-item-update",
             "work-item-list",
