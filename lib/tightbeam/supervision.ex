@@ -616,6 +616,58 @@ defmodule Tightbeam.Supervision do
 
   def transition_in_txn(%Txn{}, _observation), do: :duplicate
 
+  @doc false
+  def revalidate_delivery_in_txn(
+        %Txn{} = txn,
+        %{
+          sessionKey: session_key,
+          lastEvaluatedTerminal: terminal_seq,
+          pendingBranch: branch,
+          pendingAssignment: assignment_id,
+          pendingK: k,
+          pendingN: n
+        } = pending
+      ) do
+    case Txn.q(
+           txn,
+           """
+           SELECT e.supervisionIntervalMs
+           FROM supervision_watermarks w
+           LEFT JOIN supervision_entitlements e ON e.assignmentId=w.pendingAssignment
+           WHERE w.sessionKey=?1 AND w.lastEvaluatedTerminal IS ?2
+             AND w.pendingBranch=?3 AND w.pendingAssignment=?4
+             AND w.pendingK IS ?5 AND w.pendingN IS ?6
+           """,
+           [session_key, terminal_seq, branch, assignment_id, k, n]
+         ) do
+      [] ->
+        :stale
+
+      [[nil]] ->
+        :ready
+
+      [[interval]] ->
+        case absorb_liveness_receipts_in_txn(txn, assignment_id, interval) do
+          :rebased ->
+            if clear_pending_in_txn(txn, pending) do
+              EventLog.lifecycle_in_txn(
+                txn,
+                "supervision_delivery_suppressed",
+                assignment_id,
+                "branch=#{branch} terminal=#{terminal_seq} cause=liveness_receipt principal=process:tightbeam"
+              )
+
+              :suppressed
+            else
+              :stale
+            end
+
+          :duplicate ->
+            :ready
+        end
+    end
+  end
+
   @spec liveness_trigger_in_txn(Txn.t(), {:assignment | :work_item, String.t()}) ::
           {:ok, %{kind: String.t(), id: String.t()}} | :none | {:error, atom()}
   def liveness_trigger_in_txn(txn, {:assignment, assignment_id}) do
@@ -1848,7 +1900,11 @@ defmodule Tightbeam.Supervision do
       after_ms: 0,
       nudge: false,
       assignment_id: pending.pendingAssignment,
-      supervision_wake_kind: pending.pendingBranch
+      supervision_wake_kind: pending.pendingBranch,
+      supervision_session_key: pending.sessionKey,
+      supervision_terminal_seq: pending.lastEvaluatedTerminal,
+      supervision_k: pending.pendingK,
+      supervision_n: pending.pendingN
     }
 
     params =
@@ -1871,6 +1927,9 @@ defmodule Tightbeam.Supervision do
     }
 
     case Dispatch.dispatch(db, handlers, call) do
+      {:ok, %{suppressed: true}} ->
+        {:cleared, nil}
+
       {:ok, _} ->
         success_clear(db, pending)
 
@@ -1988,8 +2047,16 @@ defmodule Tightbeam.Supervision do
       UPDATE supervision_watermarks
       SET pendingBranch = NULL, pendingAssignment = NULL, pendingK = NULL, pendingN = NULL
       WHERE sessionKey = ?1 AND pendingBranch = ?2 AND pendingAssignment = ?3
+        AND lastEvaluatedTerminal IS ?4 AND pendingK IS ?5 AND pendingN IS ?6
       """,
-      [pending.sessionKey, pending.pendingBranch, pending.pendingAssignment]
+      [
+        pending.sessionKey,
+        pending.pendingBranch,
+        pending.pendingAssignment,
+        pending.lastEvaluatedTerminal,
+        pending.pendingK,
+        pending.pendingN
+      ]
     )
 
     Txn.changes(txn) == 1
