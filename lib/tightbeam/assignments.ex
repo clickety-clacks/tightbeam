@@ -1258,24 +1258,14 @@ defmodule Tightbeam.Assignments do
 
           assignment.outcome == "surrendered" and assignment.closedBySession == holder_key and
               is_binary(assignment.closingAttestId) ->
-            case DB.query(
-                   db,
-                   "SELECT id, assignmentId, kind, verdictKind, note, bySession, byUser, producer, producerCommand, byHarness, byProvider, commitRefs, ts FROM attests WHERE id = ?1",
-                   [assignment.closingAttestId]
-                 ) do
-              {:ok, [attest_row]} ->
-                closing = attest(attest_row)
-
-                if closing.assignmentId == assignment.id and closing.kind == "surrender" and
-                     closing.bySession == holder_key do
-                  {:replay, %{assignment: assignment, attest: closing, replayed: true}}
-                else
-                  {:refuse, terminal_conflict()}
-                end
-
-              _ ->
-                {:refuse, terminal_conflict()}
-            end
+            terminal_surrender_replay(
+              assignment,
+              holder_key,
+              case DB.query(db, closing_attest_query(), [assignment.closingAttestId]) do
+                {:ok, rows} -> rows
+                _ -> []
+              end
+            )
 
           true ->
             {:refuse, terminal_conflict()}
@@ -1884,6 +1874,39 @@ defmodule Tightbeam.Assignments do
       {:refuse, error} -> error
       :proceed -> assignment_closed()
     end
+  end
+
+  # A terminal caller that passed Dispatch's open-state precheck can lose the
+  # race before this transaction reads its assignment. That ordinary closed
+  # branch must classify the winner too: the fixed same-holder surrender is
+  # idempotent whether the winner committed before or during this transaction.
+  defp terminal_surrender_after_closed_read(txn, assignment, holder_key) do
+    case terminal_surrender_replay(
+           assignment,
+           holder_key,
+           Txn.q(txn, closing_attest_query(), [assignment.closingAttestId])
+         ) do
+      {:replay, result} -> result
+      {:refuse, error} -> error
+    end
+  end
+
+  defp terminal_surrender_replay(assignment, holder_key, [attest_row]) do
+    closing = attest(attest_row)
+
+    if closing.assignmentId == assignment.id and closing.kind == "surrender" and
+         closing.bySession == holder_key do
+      {:replay, %{assignment: assignment, attest: closing, replayed: true}}
+    else
+      {:refuse, terminal_conflict()}
+    end
+  end
+
+  defp terminal_surrender_replay(_assignment, _holder_key, _rows),
+    do: {:refuse, terminal_conflict()}
+
+  defp closing_attest_query do
+    "SELECT id, assignmentId, kind, verdictKind, note, bySession, byUser, producer, producerCommand, byHarness, byProvider, commitRefs, ts FROM attests WHERE id = ?1"
   end
 
   defp session_key!({:session, session_key}), do: session_key
@@ -2820,7 +2843,11 @@ defmodule Tightbeam.Assignments do
             error("not_holder", "assignment is held by session #{holder}")
 
           assignment.state != "open" ->
-            assignment_closed()
+            if call[:terminal_surrender] do
+              terminal_surrender_after_closed_read(txn, assignment, holder)
+            else
+              assignment_closed()
+            end
 
           true ->
             with :ok <- valid_lifecycle_kind(call),
