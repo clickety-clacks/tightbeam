@@ -108,7 +108,7 @@ defmodule Tightbeam.CursorRegistrationTest do
     refute "default" == selector.("memory")
   end
 
-  test "remote Cursor launch validates the banked file without putting its key in argv" do
+  test "remote Cursor launch is refused before planning — gateway-local only" do
     parent = self()
     target = %{cursor_target() | host_config: %{base_dir: "/remote", ssh: "host"}}
 
@@ -125,33 +125,27 @@ defmodule Tightbeam.CursorRegistrationTest do
     assert Enum.join(check_argv, " ") =~ "test -r"
     assert Enum.join(check_argv, " ") =~ "cat"
 
-    assert {:ok, plan} =
+    assert {:error, %{code: "DIV-CURSOR-LOCAL-ONLY"}} =
              Cursor.prepare_launch(
                target,
                "/managed",
                checked ++ [common_env: [], remote_env: [], lineage: "lineage"]
              )
-
-    serialized = Enum.join(plan[:cmd], " ")
-    assert serialized =~ "AGENT_CLI_CREDENTIAL_STORE=memory"
-    assert serialized =~ "SendEnv=CURSOR_API_KEY"
-    refute serialized =~ "api-key"
-    refute serialized =~ "remote-secret"
-    assert {"CURSOR_API_KEY", "remote-secret"} in plan[:env]
   end
 
-  test "Cursor derives the production catalog from the pinned CLI without putting the key in argv" do
+  test "Cursor derives the production catalog from selectable ACP refs, not the full CLI list" do
     parent = self()
     target = cursor_target()
 
     sh = fn argv ->
       send(parent, {:catalog_probe, argv})
 
-      {"Available models\n\nauto - Auto (default)\ngpt-5.3-codex - Codex 5.3\n\n" <>
+      {"Available models\n\nauto - Auto (default)\ngpt-5.3-codex - Codex 5.3\n" <>
+         "gpt-5.3-codex-low - Codex 5.3 Low\ncomposer-2.5-fast - Composer 2.5 Fast\n\n" <>
          "Tip: use --model <id> to select a model.\n", 0}
     end
 
-    assert {:ok, [auto, codex]} =
+    assert {:ok, entries} =
              Cursor.fetch_catalog(%{
                base_dir: target.host_config.base_dir,
                host_config: target.host_config,
@@ -164,10 +158,22 @@ defmodule Tightbeam.CursorRegistrationTest do
                }
              })
 
-    assert {auto.family, auto.display_name, auto.provider} == {"auto", "Auto", :cursor}
+    selectable = Cursor.adapter_selectable_models()
+    families = entries |> Enum.map(& &1.family) |> Enum.sort()
 
-    assert {codex.family, codex.display_name, codex.efforts} ==
-             {"gpt-5.3-codex", "Codex 5.3", []}
+    assert length(entries) == length(selectable)
+    assert families == Enum.sort(selectable)
+    refute "gpt-5.3-codex-low" in families
+    refute "composer-2.5-fast" in families
+
+    auto = Enum.find(entries, &(&1.family == "auto"))
+    assert auto.display_name == "Auto"
+
+    codex = Enum.find(entries, &(&1.family == "gpt-5.3-codex"))
+    assert codex.display_name == "Codex 5.3"
+
+    composer = Enum.find(entries, &(&1.family == "composer-2.5"))
+    assert composer.display_name == "composer-2.5"
 
     assert_receive {:catalog_probe, argv}
     serialized = Enum.join(argv, " ")
