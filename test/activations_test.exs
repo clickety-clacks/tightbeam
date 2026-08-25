@@ -297,9 +297,11 @@ defmodule Tightbeam.ActivationsTest do
   test "exact pre-activation schema opens the additive database without interpreting it" do
     unique = System.unique_integer([:positive])
     path = Path.join(System.tmp_dir!(), "activation-downgrade-#{unique}.sqlite3")
+    legacy_root = Path.join(System.tmp_dir!(), "activation-legacy-binary-#{unique}")
 
     on_exit(fn ->
       Enum.each([path, path <> "-shm", path <> "-wal"], &File.rm/1)
+      File.rm_rf(legacy_root)
     end)
 
     current_db = String.to_atom("activation_current_#{unique}")
@@ -317,34 +319,31 @@ defmodule Tightbeam.ActivationsTest do
 
     assert :ok = stop_supervised(DB)
 
-    legacy_schema = compile_pre_activation_schema!()
-    legacy_db = String.to_atom("activation_legacy_#{unique}")
-    start_supervised!({DB, path: path, name: legacy_db})
-
-    assert :ok = apply(legacy_schema, :ensure_all, [legacy_db])
-
     assert %{
-             workItem: %{
-               id: "wi_activation",
-               title: "Activation fixture",
-               ownerUserId: "work_owner",
-               state: "open"
-             },
-             assignments: assignments
-           } =
-             Tightbeam.WorkItems.__handle__(legacy_db, "work-item-get", %{
-               principal: {:user, "work_owner"},
-               params: %{work_item_id: "wi_activation"}
-             })
+             source: legacy_source,
+             response: %{
+               workItem: %{
+                 id: "wi_activation",
+                 title: "Activation fixture",
+                 ownerUserId: "work_owner",
+                 state: "open"
+               },
+               assignments: assignments
+             }
+           } = run_pre_activation_binary!(path, legacy_root)
 
+    assert legacy_source == Path.join(legacy_root, "schema.ex")
     assert Enum.map(assignments, & &1.id) |> Enum.sort() == ["asg_actor", "asg_root"]
 
+    observer_db = String.to_atom("activation_observer_#{unique}")
+    start_supervised!({DB, path: path, name: observer_db})
+
     assert {:ok, [["coordination-fabric-v1-phase1-v5"]]} =
-             DB.query(legacy_db, "SELECT shape FROM schema_stamp")
+             DB.query(observer_db, "SELECT shape FROM schema_stamp")
 
     assert {:ok, [["aev_downgrade", "act_downgrade"]]} =
              DB.query(
-               legacy_db,
+               observer_db,
                "SELECT eventId,activationId FROM activation_events ORDER BY seq"
              )
   end
@@ -356,7 +355,7 @@ defmodule Tightbeam.ActivationsTest do
     db
   end
 
-  defp compile_pre_activation_schema! do
+  defp run_pre_activation_binary!(database_path, legacy_root) do
     source_path = Path.expand("../lib/tightbeam/schema.ex", __DIR__)
 
     source =
@@ -370,16 +369,70 @@ defmodule Tightbeam.ActivationsTest do
       raise "pre-activation schema fixture drifted: expected #{@pre_activation_schema_sha256}, got #{digest}"
     end
 
-    legacy_source =
-      String.replace(
-        source,
-        "defmodule Tightbeam.Schema do",
-        "defmodule Tightbeam.PreActivationSchemaFixture do",
-        global: false
+    legacy_source_path = Path.join(legacy_root, "schema.ex")
+    legacy_ebin = Path.join(legacy_root, "ebin")
+    File.mkdir_p!(legacy_ebin)
+    File.write!(legacy_source_path, source)
+
+    elixirc = System.find_executable("elixirc") || raise "elixirc is required for A-32 proof"
+
+    code_path_args =
+      :code.get_path()
+      |> Enum.map(&List.to_string/1)
+      |> Enum.reject(&(&1 == "."))
+      |> Enum.flat_map(&["-pa", &1])
+
+    compile_args = code_path_args ++ ["-o", legacy_ebin, legacy_source_path]
+
+    case System.cmd(elixirc, compile_args, stderr_to_stdout: true) do
+      {_output, 0} -> :ok
+      {output, status} -> raise "legacy schema compilation failed (#{status}): #{output}"
+    end
+
+    script = """
+    :code.purge(Tightbeam.Schema)
+    :code.delete(Tightbeam.Schema)
+
+    legacy_beam =
+      #{inspect(Path.join(legacy_ebin, "Elixir.Tightbeam.Schema"))}
+      |> String.to_charlist()
+
+    {:module, Tightbeam.Schema} = :code.load_abs(legacy_beam)
+    source = Tightbeam.Schema.module_info(:compile) |> Keyword.fetch!(:source) |> List.to_string()
+
+    if Path.expand(source) != Path.expand(#{inspect(legacy_source_path)}) do
+      raise "legacy schema beam source mismatch: got " <> inspect(source)
+    end
+
+    {:ok, _apps} = Application.ensure_all_started(:exqlite)
+    {:ok, db} = Tightbeam.DB.start_link(path: hd(System.argv()), name: Tightbeam.LegacyActivationDB)
+    :ok = Tightbeam.Schema.ensure_all(Tightbeam.LegacyActivationDB)
+
+    response =
+      Tightbeam.WorkItems.__handle__(Tightbeam.LegacyActivationDB, "work-item-get", %{
+        principal: {:user, "work_owner"},
+        params: %{work_item_id: "wi_activation"}
+      })
+
+    :ok = GenServer.stop(db)
+    result = :erlang.term_to_binary(%{source: source, response: response}) |> Base.encode64()
+    IO.puts("LEGACY_RESULT=" <> result)
+    """
+
+    elixir = System.find_executable("elixir") || raise "elixir is required for A-32 proof"
+
+    {output, status} =
+      System.cmd(elixir, code_path_args ++ ["-e", script, "--", database_path],
+        stderr_to_stdout: true
       )
 
-    Code.compile_string(legacy_source, "pre_activation_schema_fixture.ex")
-    Tightbeam.PreActivationSchemaFixture
+    if status != 0, do: raise("legacy binary failed (#{status}): #{output}")
+
+    [encoded] = Regex.run(~r/^LEGACY_RESULT=(.+)$/m, output, capture: :all_but_first)
+
+    encoded
+    |> Base.decode64!()
+    |> :erlang.binary_to_term([:safe])
   end
 
   defp seed_graph(db) do
