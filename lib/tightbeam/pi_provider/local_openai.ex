@@ -2,7 +2,6 @@ defmodule Tightbeam.PiProvider.LocalOpenAi do
   @moduledoc false
 
   alias Tightbeam.Harness.Support
-  alias Tightbeam.LocalOpenAi.Providers
 
   @default_max_output 32_768
 

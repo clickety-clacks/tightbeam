@@ -50,11 +50,24 @@ defmodule Tightbeam.PiProvider do
     entries = ocgo ++ local_entries
 
     if entries == [] do
-      {:error, {:no_pi_catalog, %{opencode_go: ocgo_error, local_openai: local_errors}}}
+      errors =
+        %{}
+        |> maybe_put_catalog_error(:opencode_go, ocgo_error)
+        |> Map.merge(local_errors)
+
+      case map_size(errors) do
+        0 -> {:error, {:no_pi_catalog, %{}}}
+        1 -> {:error, errors |> Map.values() |> hd()}
+        _ -> {:error, {:no_pi_catalog, errors}}
+      end
     else
       {:ok, Enum.sort_by(entries, & &1.family)}
     end
   end
+
+  defp maybe_put_catalog_error(errors, _key, nil), do: errors
+  defp maybe_put_catalog_error(errors, _key, :not_onboarded), do: errors
+  defp maybe_put_catalog_error(errors, key, reason), do: Map.put(errors, key, reason)
 
   @doc false
   def pi_catalog_ready?(state) do
@@ -192,9 +205,7 @@ defmodule Tightbeam.PiProvider do
               else: {:needs_onboarding, :missing}
 
           :opencode_go ->
-            auth = Path.join([state.base_dir, "auth", "pi", "auth.json"])
-
-            if File.regular?(auth),
+            if OpenCodeGo.onboarded_at?(state.base_dir),
               do: :onboarded,
               else: {:needs_onboarding, :missing}
 

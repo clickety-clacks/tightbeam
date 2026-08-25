@@ -119,12 +119,12 @@ defmodule Tightbeam.Harness.Support do
   end
 
   @doc false
-  def owned_home_entries(credential_file, rails_file) do
+  def owned_home_entries(credential_file, rails_file, extra \\ []) do
     [
       ".tightbeam/manifest",
       credential_file,
       rails_file
-      | Enum.map(Tightbeam.Homes.baseline_skill_names(), &"skills/#{&1}")
+      | Enum.map(Tightbeam.Homes.baseline_skill_names(), &"skills/#{&1}") ++ extra
     ]
     |> Enum.sort()
   end

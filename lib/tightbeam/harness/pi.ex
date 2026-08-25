@@ -200,8 +200,7 @@ defmodule Tightbeam.Harness.Pi do
 
   @impl true
   def owned_home_entries do
-    (Support.owned_home_entries(@credential_file, "extensions/tightbeam.ts") ++ [@models_json])
-    |> Enum.sort()
+    Support.owned_home_entries(@credential_file, "extensions/tightbeam.ts", [@models_json])
   end
 
   @impl true
@@ -231,31 +230,27 @@ defmodule Tightbeam.Harness.Pi do
   end
 
   defp materialize_models_json!(target, home) do
-    if Providers.list(target.host_config.base_dir) == [] do
-      :ok
+    bytes = PiProvider.build_pi_models_json(target.host_config.base_dir)
+    path = Path.join(home, @models_json)
+
+    if Support.local?(target) do
+      File.mkdir_p!(Path.dirname(path))
+      File.write!(path, bytes)
+      File.chmod!(path, 0o600)
     else
-      bytes = PiProvider.build_pi_models_json(target.host_config.base_dir)
-      path = Path.join(home, @models_json)
+      with {:ok, ssh} <- absolute_executable(target, "ssh") do
+        tmp = path <> ".tmp-#{System.unique_integer([:positive])}"
+        encoded = Base.encode64(bytes)
 
-      if Support.local?(target) do
-        File.mkdir_p!(Path.dirname(path))
-        File.write!(path, bytes)
-        File.chmod!(path, 0o600)
-      else
-        with {:ok, ssh} <- absolute_executable(target, "ssh") do
-          tmp = path <> ".tmp-#{System.unique_integer([:positive])}"
-          encoded = Base.encode64(bytes)
+        script =
+          "printf %s #{JSON.encode!(encoded)} | base64 -d > #{JSON.encode!(tmp)} && " <>
+            "chmod 600 #{JSON.encode!(tmp)} && mv #{JSON.encode!(tmp)} #{JSON.encode!(path)}"
 
-          script =
-            "printf %s #{JSON.encode!(encoded)} | base64 -d > #{JSON.encode!(tmp)} && " <>
-              "chmod 600 #{JSON.encode!(tmp)} && mv #{JSON.encode!(tmp)} #{JSON.encode!(path)}"
-
-          Support.run!(
-            target,
-            [ssh | Support.ssh_opts()] ++
-              [target.host_config.ssh, "sh", "-c", script]
-          )
-        end
+        Support.run!(
+          target,
+          [ssh | Support.ssh_opts()] ++
+            [target.host_config.ssh, "sh", "-c", script]
+        )
       end
     end
   end
@@ -422,6 +417,7 @@ defmodule Tightbeam.Harness.Pi do
         %{
           base_dir: base,
           credential_kind: if(case_name == "valid_api_key", do: :api_key, else: :subscription),
+          credential_status: fn :opencode_go, _ -> :onboarded end,
           options: %{sh: sh},
           host_config: %{ssh: nil}
         }

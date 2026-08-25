@@ -18,6 +18,12 @@ defmodule Tightbeam.PiProvider.OpenCodeGo do
   def model_prefix, do: "opencode-go/"
 
   @doc false
+  def onboarded_at?(base_dir) when is_binary(base_dir) do
+    auth = Path.join([base_dir, "auth", "pi", @credential_file])
+    File.regular?(auth)
+  end
+
+  @doc false
   def models_url, do: @models_url
 
   @impl true
