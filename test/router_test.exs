@@ -6,9 +6,11 @@ defmodule Tightbeam.Wire.RouterTest do
 
   alias Tightbeam.{
     Assignments,
+    ConditionFacts,
     Credentials,
     DB,
     Devices,
+    Dispatch,
     Gateway,
     Org,
     Placement,
@@ -478,7 +480,7 @@ defmodule Tightbeam.Wire.RouterTest do
            }
   end
 
-  test "CLI exact-version refusal is loud and precedes bearer authentication", ctx do
+  test "CLI exact-version refusal is loud after bearer authentication", ctx do
     body = JSON.encode!(%{verb: "inspect", asUser: "flynn", params: %{}})
     required_version = Tightbeam.CliCompatibility.required_version()
     %Version{major: required_major} = Version.parse!(required_version)
@@ -518,6 +520,100 @@ defmodule Tightbeam.Wire.RouterTest do
       |> Router.call(Router.init(ctx.opts))
 
     assert non_cli.status == 200
+  end
+
+  test "terminal v1 permits only an authenticated holder's fixed surrender while ordinary mismatch stays closed",
+       ctx do
+    holder = create_session(ctx.db, "terminal-holder", ctx.device.user_id)
+    handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir, wake_tick_ms: 1_000})
+    opts = Keyword.put(ctx.opts, :handlers, handlers)
+
+    {:ok, assignment} =
+      Dispatch.dispatch(ctx.db, handlers, %{
+        verb: "assign",
+        origin: "user:#{ctx.device.user_id}",
+        principal: {:user, ctx.device.user_id},
+        session_key: holder.session_key,
+        target_role: nil,
+        role_fallback: false,
+        params: %{subject: "terminal path", idempotency_key: nil, work_item_id: nil}
+      })
+
+    ordinary =
+      conn(
+        :post,
+        "/agent/dispatch",
+        JSON.encode!(%{verb: "attest", params: %{assignmentId: assignment.id, kind: "surrender"}})
+      )
+      |> put_req_header("authorization", "Bearer #{holder.cli_token}")
+      |> put_req_header("x-tightbeam-cli-version", "0.0.0")
+      |> Router.call(Router.init(opts))
+
+    assert ordinary.status == 426
+    assert ConditionFacts.standing?(ctx.db, "cli-incompatible", holder.session_key)
+
+    recovered =
+      conn(
+        :post,
+        "/agent/dispatch",
+        JSON.encode!(%{
+          verb: "attests",
+          asUser: ctx.device.user_id,
+          params: %{assignmentId: assignment.id}
+        })
+      )
+      |> put_req_header("authorization", "Bearer #{holder.cli_token}")
+      |> put_req_header("x-tightbeam-cli-version", Tightbeam.CliCompatibility.required_version())
+      |> Router.call(Router.init(opts))
+
+    assert recovered.status == 200
+    refute ConditionFacts.standing?(ctx.db, "cli-incompatible", holder.session_key)
+
+    surrendered =
+      terminal_surrender(ctx, opts, holder.cli_token, %{
+        "assignmentId" => assignment.id,
+        "disposition" => "surrender",
+        "note" => "version mismatch"
+      })
+
+    assert surrendered.status == 200
+    body = JSON.decode!(surrendered.resp_body)["result"]
+    assert body["assignment"]["outcome"] == "surrendered"
+    assert body["attest"]["kind"] == "surrender"
+
+    replay =
+      terminal_surrender(ctx, opts, holder.cli_token, %{
+        "assignmentId" => assignment.id,
+        "disposition" => "surrender",
+        "note" => "version mismatch"
+      })
+
+    assert replay.status == 200
+    replay_body = JSON.decode!(replay.resp_body)["result"]
+    assert replay_body["replayed"] == true
+    assert replay_body["attest"]["id"] == body["attest"]["id"]
+    assert Assignments.attest_count(ctx.db, assignment.id) == 1
+
+    rejected =
+      terminal_surrender(ctx, opts, holder.cli_token, %{
+        "assignmentId" => assignment.id,
+        "disposition" => "completion",
+        "note" => "no"
+      })
+
+    assert rejected.status == 400
+    assert JSON.decode!(rejected.resp_body)["error"]["code"] == "invalid_terminal_request"
+
+    forged =
+      terminal_surrender(ctx, opts, holder.cli_token, %{
+        "assignmentId" => assignment.id,
+        "disposition" => "surrender",
+        "note" => "no",
+        "asUser" => ctx.device.user_id
+      })
+
+    assert forged.status == 400
+    assert JSON.decode!(forged.resp_body)["error"]["code"] == "invalid_terminal_request"
   end
 
   test "kungfu scaffold crosses the closed CLI verb router with its attributed name", ctx do
@@ -1872,6 +1968,14 @@ defmodule Tightbeam.Wire.RouterTest do
       )
 
     {db, opts}
+  end
+
+  defp terminal_surrender(_ctx, opts, bearer, body) do
+    conn(:post, "/agent/terminal", JSON.encode!(body))
+    |> put_req_header("authorization", "Bearer #{bearer}")
+    |> put_req_header("x-tightbeam-cli-version", "0.0.0")
+    |> put_req_header("x-tightbeam-terminal-version", "1")
+    |> Router.call(Router.init(opts))
   end
 
   # INVARIANT: a non-ok session-control response always carries a code.
