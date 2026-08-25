@@ -20,11 +20,6 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FaultPoint {
-    TargetGenerationFsync,
-    IntentFsync,
-    ActiveRename,
-    RootFsync,
-    ActiveReread,
     AuditAppend,
 }
 
@@ -734,26 +729,6 @@ impl DeploymentFs {
         Ok(Digest::from_bytes(bytes))
     }
 
-    #[cfg(test)]
-    pub(crate) fn publish_immutable_with_fault(
-        &self,
-        path: &Path,
-        bytes: &[u8],
-        mode: u32,
-        point: FaultPoint,
-    ) -> Result<Digest, FsError> {
-        if matches!(
-            point,
-            FaultPoint::TargetGenerationFsync | FaultPoint::IntentFsync
-        ) {
-            return Err(FsError::InvalidPointer(format!(
-                "fault injected at {:?}",
-                point
-            )));
-        }
-        self.publish_immutable(path, bytes, mode)
-    }
-
     pub(crate) fn replace_relative_symlink(
         &self,
         path: &Path,
@@ -814,43 +789,6 @@ impl DeploymentFs {
         }
         let generation = GenerationId::new(&components[1]).map_err(FsError::InvalidPointer)?;
         Ok(Some(self.read_generation(&generation)?))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn read_active_with_fault(
-        &self,
-        point: FaultPoint,
-    ) -> Result<Option<Pointer>, FsError> {
-        if point == FaultPoint::ActiveReread {
-            return Err(FsError::InvalidPointer(format!(
-                "fault injected at {:?}",
-                point
-            )));
-        }
-        self.read_active()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn replace_relative_symlink_with_fault(
-        &self,
-        path: &Path,
-        target: &Path,
-        point: FaultPoint,
-    ) -> Result<(), FsError> {
-        if point == FaultPoint::ActiveRename {
-            return Err(FsError::InvalidPointer(format!(
-                "fault injected at {:?}",
-                point
-            )));
-        }
-        self.replace_relative_symlink(path, target)?;
-        if point == FaultPoint::RootFsync {
-            return Err(FsError::InvalidPointer(format!(
-                "fault injected at {:?}",
-                point
-            )));
-        }
-        Ok(())
     }
 
     pub(crate) fn validate_generation_target(&self, target: &Pointer) -> Result<(), FsError> {
@@ -1046,11 +984,7 @@ fn host_identity_path(_root: &Path) -> PathBuf {
 }
 
 fn read_host_identity(path: &Path) -> Result<HostIdentity, FsError> {
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(path)
-        .map_err(|error| io("open host identity without following links", path, error))?;
+    let mut file = open_host_identity_without_following_ancestors(path)?;
     let metadata = file
         .metadata()
         .map_err(|error| io("stat host identity descriptor", path, error))?;
@@ -1076,6 +1010,91 @@ fn read_host_identity(path: &Path) -> Result<HostIdentity, FsError> {
         ));
     }
     Ok(HostIdentity::from_bytes(&bytes))
+}
+
+fn open_host_identity_without_following_ancestors(path: &Path) -> Result<File, FsError> {
+    if !path.is_absolute() {
+        return Err(FsError::InvalidPath(format!(
+            "host identity must be absolute: {}",
+            path.display()
+        )));
+    }
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(component) => components.push(
+                component
+                    .to_str()
+                    .ok_or_else(|| {
+                        FsError::InvalidPath(format!(
+                            "host identity has non-UTF8 component: {}",
+                            path.display()
+                        ))
+                    })?
+                    .to_owned(),
+            ),
+            _ => {
+                return Err(FsError::InvalidPath(format!(
+                    "host identity has non-normal component: {}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    let (name, parents) = components.split_last().ok_or_else(|| {
+        FsError::InvalidPath(format!("host identity has no name: {}", path.display()))
+    })?;
+    let root = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open("/")
+        .map_err(|error| io("open host identity root descriptor", "/", error))?;
+    let mut directory: OwnedFd = root.into();
+    let mut traversed = PathBuf::from("/");
+    #[cfg(not(test))]
+    validate_host_identity_ancestor(directory.as_raw_fd(), &traversed)?;
+    for parent in parents {
+        directory = open_dir_at(directory.as_raw_fd(), parent)?;
+        traversed.push(parent);
+        #[cfg(not(test))]
+        validate_host_identity_ancestor(directory.as_raw_fd(), &traversed)?;
+    }
+    let name = c_string(name)?;
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(io(
+            "open host identity through confined descriptors",
+            path,
+            std::io::Error::last_os_error(),
+        ));
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(not(test))]
+fn validate_host_identity_ancestor(fd: RawFd, path: &Path) -> Result<(), FsError> {
+    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+    if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+        return Err(io(
+            "stat host identity ancestor descriptor",
+            path,
+            std::io::Error::last_os_error(),
+        ));
+    }
+    if stat.st_uid != 0 || (stat.st_mode as u32 & 0o022) != 0 {
+        return Err(FsError::InvalidPointer(format!(
+            "host identity ancestor must be root-owned and not group/world writable: {}",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 fn read_json_directory(root: RawFd, name: &str, path: &Path) -> Result<Vec<Vec<u8>>, FsError> {
@@ -1372,6 +1391,19 @@ mod tests {
             DeploymentFs::open(&directory.0),
             Err(FsError::Io { source, .. }) if source.raw_os_error() == Some(libc::ELOOP)
         ));
+    }
+
+    #[test]
+    fn host_identity_reader_rejects_a_symlinked_ancestor() {
+        let (directory, _fs) = fixture();
+        let alias = directory.0.parent().unwrap().join(format!(
+            "tightbeam-deploy-host-id-alias-{}",
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::os::unix::fs::symlink(&directory.0, &alias).unwrap();
+        let result = read_host_identity(&alias.join("deploy-host-id"));
+        let _ = fs::remove_file(&alias);
+        assert!(matches!(result, Err(FsError::Io { .. })));
     }
 
     #[test]

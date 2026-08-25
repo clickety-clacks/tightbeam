@@ -209,7 +209,10 @@ pub(crate) fn audit_conflict(
         });
     };
     if terminal.is_empty() {
-        return None;
+        return Some(format!(
+            "audit transition chain has no link for generation: {}",
+            active.generation
+        ));
     }
     let mut predecessor = BTreeMap::<String, Option<String>>::new();
     let mut successor = BTreeMap::<String, String>::new();
@@ -467,6 +470,65 @@ fn assess_intent(
             state: IntentState::None,
             error: Some(format!("activation intent target is invalid: {error}")),
         };
+    }
+    let prior = value
+        .get("prior")
+        .and_then(|value| (!value.is_null()).then_some(value))
+        .map(|value| super::parse_pointer(Some(value)));
+    let prior = match prior.transpose() {
+        Ok(prior) => prior,
+        Err(error) => {
+            return IntentAssessment {
+                state: IntentState::None,
+                error: Some(error.to_string()),
+            };
+        }
+    };
+    let prior_error = match (&expected, &prior) {
+        (ExpectedActive::Virgin { .. }, None) => None,
+        (
+            ExpectedActive::Generation {
+                generation,
+                release,
+            },
+            Some(prior),
+        ) if &prior.generation == generation && &prior.release == release => None,
+        (ExpectedActive::Virgin { .. }, Some(_)) => {
+            Some("virgin activation intent names a prior generation".to_owned())
+        }
+        (ExpectedActive::Generation { .. }, None) => {
+            Some("activation intent omits its expected prior generation".to_owned())
+        }
+        (ExpectedActive::Generation { .. }, Some(_)) => {
+            Some("activation intent prior disagrees with expectedActive".to_owned())
+        }
+    };
+    if let Some(error) = prior_error {
+        return IntentAssessment {
+            state: IntentState::None,
+            error: Some(error),
+        };
+    }
+    match fs.generation_prior(&target.generation) {
+        Ok(manifest_prior)
+            if manifest_prior == prior.as_ref().map(|pointer| pointer.generation.clone()) => {}
+        Ok(_) => {
+            return IntentAssessment {
+                state: IntentState::None,
+                error: Some(
+                    "activation intent prior disagrees with target generation prior_generation"
+                        .to_owned(),
+                ),
+            };
+        }
+        Err(error) => {
+            return IntentAssessment {
+                state: IntentState::None,
+                error: Some(format!(
+                    "activation intent target succession is invalid: {error}"
+                )),
+            };
+        }
     }
     let authority = match parse_activation_authority(&value) {
         Ok(authority) => authority,
@@ -936,10 +998,11 @@ mod tests {
         let status = read(&directory.0).unwrap();
         assert!(matches!(
             status.restart_loadable,
-            RestartLoadable::Managed { .. }
+            RestartLoadable::Unavailable { .. }
         ));
-        assert_eq!(status.transaction.as_str(), "committed-recovered");
-        assert_eq!(status.audit, "none");
+        assert_eq!(status.transaction.as_str(), "indeterminate");
+        assert_eq!(status.audit, "contradictory");
+        assert!(status.gc_hold);
 
         fs::create_dir_all(directory.0.join("audit/tx-1")).unwrap();
         fs::create_dir_all(directory.0.join("audit/tx-2")).unwrap();
@@ -981,7 +1044,7 @@ mod tests {
     }
 
     #[test]
-    fn status_uses_target_pointer_truth_after_active_rename() {
+    fn status_holds_target_pointer_until_recovery_records_its_audit_link() {
         let directory = tempdir();
         let payload = b"payload";
         let payload_digest = Digest::from_bytes(payload);
@@ -995,12 +1058,17 @@ mod tests {
         fs::create_dir_all(release_root.join("tightbeam")).unwrap();
         fs::write(release_root.join("release-manifest.json"), release_manifest).unwrap();
         fs::write(release_root.join("tightbeam/bin"), payload).unwrap();
-        for generation in ["g1", "g2"] {
+        for (generation, prior) in [("g1", None), ("g2", Some("g1"))] {
             let generation_root = directory.0.join(format!("generations/{generation}"));
             fs::create_dir_all(&generation_root).unwrap();
             fs::write(
                 generation_root.join("manifest.json"),
-                format!(r#"{{"releaseDigest":"{digest}"}}"#),
+                format!(
+                    r#"{{"prior_generation":{},"releaseDigest":"{digest}"}}"#,
+                    prior
+                        .map(|prior| format!("\"{prior}\""))
+                        .unwrap_or("null".to_owned())
+                ),
             )
             .unwrap();
             std::os::unix::fs::symlink(
@@ -1017,7 +1085,7 @@ mod tests {
         fs::write(
             directory.0.join("intents/tx.json"),
             format!(
-                r#"{{"transactionId":"tx-1","action":"activation","expectedActive":"generation:g1:{digest}","target":{{"generation":"g2","releaseDigest":"{digest}"}},"hostIdentity":"{host_identity}","deploymentRoot":"{}","serviceSetDigest":"{}"}}"#,
+                r#"{{"transactionId":"tx-1","action":"activation","expectedActive":"generation:g1:{digest}","prior":{{"generation":"g1","releaseDigest":"{digest}"}},"target":{{"generation":"g2","releaseDigest":"{digest}"}},"hostIdentity":"{host_identity}","deploymentRoot":"{}","serviceSetDigest":"{}"}}"#,
                 root_identity.as_str(),
                 service_set_digest
             ),
@@ -1026,9 +1094,9 @@ mod tests {
         std::os::unix::fs::symlink("generations/g2", directory.0.join("active")).unwrap();
 
         let status = read(&directory.0).unwrap();
-        assert_eq!(status.transaction.as_str(), "committed-recovered");
-        assert_eq!(status.audit, "recovered-missing-row");
-        assert_eq!(status.observation, "pending");
+        assert_eq!(status.transaction.as_str(), "indeterminate");
+        assert_eq!(status.audit, "contradictory");
+        assert_eq!(status.observation, "held");
         assert!(status.gc_hold);
     }
 
