@@ -496,41 +496,11 @@ defmodule Tightbeam.Wire.Socket do
 
     unless Org.get(db(state), key) do
       defaults = Map.fetch!(state.deps, :defaults)
-      provider = Map.fetch!(defaults, :provider)
-      provider = if is_function(provider, 0), do: provider.(), else: provider
 
       try do
         {:ok, _session} =
           DB.transaction(db(state), fn txn ->
-            case DB.Txn.q(txn, "SELECT 1 FROM sessions WHERE sessionKey = ?1", [key]) do
-              [[1]] ->
-                :ok
-
-              [] ->
-                archetype =
-                  case DB.Txn.q(
-                         txn,
-                         "SELECT value FROM org_settings WHERE key = 'default-archetype'"
-                       ) do
-                    [[configured]] -> configured
-                    [] -> "default"
-                  end
-
-                Org.create_in_txn(txn, %{
-                  session_key: key,
-                  display_name: "Main",
-                  kind: "main",
-                  is_built_in: true,
-                  order_index: 0,
-                  owner_user_id: user_id,
-                  origin: "user:#{user_id}",
-                  archetype: archetype,
-                  host: Tightbeam.Placement.local_host_name(),
-                  harness: defaults |> Map.fetch!(:harness) |> to_string(),
-                  provider: to_string(provider),
-                  model: Map.fetch!(defaults, :model)
-                })
-            end
+            Org.ensure_personal_main_in_txn(txn, user_id, defaults)
           end)
       rescue
         error in Tightbeam.DB.Error ->
