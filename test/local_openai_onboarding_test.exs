@@ -7,12 +7,14 @@ defmodule Tightbeam.LocalOpenAiOnboardingTest do
     DB,
     Devices,
     Gateway,
+    LocalOpenAi.Providers,
     Placement,
     Rules
   }
 
   alias Tightbeam.Wire.Router
 
+  @provider_name "spark"
   @spark_endpoint "https://spark.tailf064dc.ts.net/v1"
   @release_binary Path.expand("../cli/target/release/tightbeam", __DIR__)
   @cli_token "tbc_local_openai_live"
@@ -41,17 +43,24 @@ defmodule Tightbeam.LocalOpenAiOnboardingTest do
   end
 
   defp local_openai_bytes(endpoint, api_key \\ nil) do
+    record = %{
+      "name" => @provider_name,
+      "type" => "local-openai",
+      "endpoint" => endpoint
+    }
+
     record =
-      case api_key do
-        nil -> %{"local-openai" => %{"endpoint" => endpoint}}
-        key -> %{"local-openai" => %{"endpoint" => endpoint, "apiKey" => key}}
+      if api_key do
+        Map.put(record, "apiKey", api_key)
+      else
+        record
       end
 
     JSON.encode!(record)
   end
 
   describe "host-scoped local-openai persistence" do
-    test "banks endpoint-only credentials under auth/pi-local", ctx do
+    test "banks endpoint-only credentials under auth/pi-local/providers", ctx do
       seed_admin(ctx.db)
       start_supervised!({Credentials, name: Credentials, base_dir: ctx.base, machine: "testhost"})
 
@@ -71,7 +80,7 @@ defmodule Tightbeam.LocalOpenAiOnboardingTest do
              } = onboard.(call)
 
       File.write!(
-        Path.join(staging_path, "local-openai.json"),
+        Path.join(staging_path, "#{@provider_name}.json"),
         local_openai_bytes(@spark_endpoint)
       )
 
@@ -82,11 +91,13 @@ defmodule Tightbeam.LocalOpenAiOnboardingTest do
                  |> put_in([:params, :lease_id], lease_id)
                )
 
-      store = Path.join([ctx.base, "auth", "pi-local", "local-openai.json"])
+      store = Providers.provider_path(ctx.base, @provider_name)
       metadata_path = Path.join([ctx.base, "auth", "pi-local", ".tightbeam", "credential.json"])
 
       assert JSON.decode!(File.read!(store)) == %{
-               "local-openai" => %{"endpoint" => @spark_endpoint}
+               "name" => @provider_name,
+               "type" => "local-openai",
+               "endpoint" => @spark_endpoint
              }
 
       assert File.stat!(store).mode |> Bitwise.band(0o777) == 0o600
@@ -114,7 +125,7 @@ defmodule Tightbeam.LocalOpenAiOnboardingTest do
       assert %{staging_path: staging_path, lease_id: lease_id} = onboard.(call)
 
       File.write!(
-        Path.join(staging_path, "local-openai.json"),
+        Path.join(staging_path, "#{@provider_name}.json"),
         local_openai_bytes(@spark_endpoint, "spark-local")
       )
 
@@ -129,13 +140,11 @@ defmodule Tightbeam.LocalOpenAiOnboardingTest do
                  other -> flunk("expected onboarded, got #{inspect(other)}")
                end)
 
-      assert JSON.decode!(
-               File.read!(Path.join([ctx.base, "auth", "pi-local", "local-openai.json"]))
-             ) == %{
-               "local-openai" => %{
-                 "endpoint" => @spark_endpoint,
-                 "apiKey" => "spark-local"
-               }
+      assert JSON.decode!(File.read!(Providers.provider_path(ctx.base, @provider_name))) == %{
+               "name" => @provider_name,
+               "type" => "local-openai",
+               "endpoint" => @spark_endpoint,
+               "apiKey" => "spark-local"
              }
     end
 
@@ -153,8 +162,8 @@ defmodule Tightbeam.LocalOpenAiOnboardingTest do
       assert %{staging_path: staging_path, lease_id: lease_id} = onboard.(call)
 
       File.write!(
-        Path.join(staging_path, "local-openai.json"),
-        ~s({"local-openai":{"endpoint":""}})
+        Path.join(staging_path, "#{@provider_name}.json"),
+        ~s({"name":"spark","type":"local-openai","endpoint":""})
       )
 
       assert {:error, {:hollow_credential, %{found: found, sentence: sentence}}} =
@@ -162,7 +171,7 @@ defmodule Tightbeam.LocalOpenAiOnboardingTest do
 
       assert found =~ "endpoint is empty"
       assert sentence =~ "tightbeam onboard local-openai"
-      refute File.exists?(Path.join([ctx.base, "auth", "pi-local", "local-openai.json"]))
+      refute File.exists?(Providers.provider_path(ctx.base, @provider_name))
     end
 
     test "local-openai refuses subscription kind before opening a lease", ctx do
@@ -256,7 +265,15 @@ defmodule Tightbeam.LocalOpenAiOnboardingTest do
     workdir = Path.join(isolated, "work/cli")
     File.mkdir_p!(workdir)
 
-    prod_store = Path.join([Path.expand("~/.tightbeam"), "auth", "pi-local", "local-openai.json"])
+    prod_store =
+      Path.join([
+        Path.expand("~/.tightbeam"),
+        "auth",
+        "pi-local",
+        "providers",
+        "#{@provider_name}.json"
+      ])
+
     prod_before = if File.exists?(prod_store), do: File.read!(prod_store), else: nil
 
     env = [
@@ -271,6 +288,8 @@ defmodule Tightbeam.LocalOpenAiOnboardingTest do
         [
           "onboard",
           "local-openai",
+          "--name",
+          @provider_name,
           "--endpoint",
           @spark_endpoint,
           "--as-user",
@@ -288,13 +307,15 @@ defmodule Tightbeam.LocalOpenAiOnboardingTest do
     assert result["provider"] == "local_openai"
     assert result["credentialKind"] == "apiKey"
 
-    store = Path.join([isolated, "auth", "pi-local", "local-openai.json"])
+    store = Providers.provider_path(isolated, @provider_name)
     metadata_path = Path.join([isolated, "auth", "pi-local", ".tightbeam", "credential.json"])
 
     assert File.regular?(store)
 
     assert JSON.decode!(File.read!(store)) == %{
-             "local-openai" => %{"endpoint" => @spark_endpoint}
+             "name" => @provider_name,
+             "type" => "local-openai",
+             "endpoint" => @spark_endpoint
            }
 
     assert File.stat!(store).mode |> Bitwise.band(0o777) == 0o600

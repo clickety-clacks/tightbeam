@@ -26,7 +26,7 @@ defmodule Tightbeam.Credentials do
 
   use GenServer
 
-  alias Tightbeam.{CommandEdge, Harness, Homes, Rails}
+  alias Tightbeam.{CommandEdge, Harness, Homes, LocalOpenAi.Providers, Rails}
   alias Tightbeam.CommandEdge.CredentialPark
 
   @ssh_opts ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
@@ -149,11 +149,23 @@ defmodule Tightbeam.Credentials do
   def store_harvested(base_dir, provider, bytes, source \\ "a harness home") do
     path =
       case provider do
-        :openai -> Path.join([base_dir, "auth", "codex", "auth.json"])
-        :anthropic -> Path.join([base_dir, "auth", "claude", ".credentials.json"])
-        :opencode_go -> Path.join([base_dir, "auth", "pi", "auth.json"])
-        :local_openai -> Path.join([base_dir, "auth", "pi-local", "local-openai.json"])
-        :fixture_provider -> Path.join([base_dir, "auth", "fixture", "fixture.json"])
+        :openai ->
+          Path.join([base_dir, "auth", "codex", "auth.json"])
+
+        :anthropic ->
+          Path.join([base_dir, "auth", "claude", ".credentials.json"])
+
+        :opencode_go ->
+          Path.join([base_dir, "auth", "pi", "auth.json"])
+
+        :local_openai ->
+          case provider_name_from_bytes(bytes) do
+            {:ok, name} -> Providers.provider_path(base_dir, name)
+            {:error, reason} -> raise "refusing harvested local-openai bytes: #{inspect(reason)}"
+          end
+
+        :fixture_provider ->
+          Path.join([base_dir, "auth", "fixture", "fixture.json"])
       end
 
     refuse_hollow!(provider, bytes, source)
@@ -265,36 +277,7 @@ defmodule Tightbeam.Credentials do
   # and `pi auth check --provider opencode-go` accepts this exact API-key shape.
   # A missing or differently typed key cannot authenticate, so refuse it at the
   # write seam rather than banking a file that Pi will later report as absent.
-  defp deep_hollow(:local_openai, bytes) do
-    case JSON.decode(bytes) do
-      {:ok, %{"local-openai" => %{"endpoint" => endpoint} = record}} when is_binary(endpoint) ->
-        trimmed = String.trim(endpoint)
-
-        cond do
-          trimmed == "" ->
-            "local-openai.endpoint is empty"
-
-          not String.starts_with?(trimmed, "http://") and
-              not String.starts_with?(trimmed, "https://") ->
-            "local-openai.endpoint must be an http(s) URL"
-
-          Map.has_key?(record, "apiKey") and blank_token?(Map.get(record, "apiKey")) ->
-            "local-openai.apiKey is present but empty"
-
-          true ->
-            nil
-        end
-
-      {:ok, %{"local-openai" => _other}} ->
-        "local-openai is present but has no endpoint"
-
-      {:ok, _other} ->
-        "the local-openai store has no local-openai record"
-
-      {:error, _reason} ->
-        "the local-openai store is not valid JSON"
-    end
-  end
+  defp deep_hollow(:local_openai, bytes), do: Providers.hollow_reason(bytes)
 
   defp deep_hollow(:opencode_go, bytes) do
     case JSON.decode(bytes) do
@@ -784,10 +767,13 @@ defmodule Tightbeam.Credentials do
   defp expired?(_unknown, _now), do: false
 
   defp credential_present?(state, :local_openai) do
-    case read_local_openai_store(state) do
-      {:ok, bytes} -> hollow(:local_openai, bytes) == nil
-      _ -> false
-    end
+    Providers.list(state.base_dir) != [] and
+      Enum.any?(Providers.list(state.base_dir), fn name ->
+        case Providers.read(state.base_dir, name) do
+          {:ok, _} -> true
+          _ -> false
+        end
+      end)
   end
 
   defp credential_present?(state, provider) do
@@ -848,8 +834,12 @@ defmodule Tightbeam.Credentials do
   end
 
   defp write_credential!(state, :local_openai, credential) do
-    with :ok <- refuse_hollow(:local_openai, credential.bytes, "the onboarding ceremony") do
-      atomic_write!(credential_store_path(state, :local_openai), credential.bytes)
+    with :ok <- refuse_hollow(:local_openai, credential.bytes, "the onboarding ceremony"),
+         {:ok, name} <- provider_name_from_bytes(credential.bytes) do
+      path = Providers.provider_path(state.base_dir, name)
+      File.mkdir_p!(Providers.providers_dir(state.base_dir))
+      atomic_write!(path, credential.bytes)
+      reconcile_provider_homes(state, :local_openai)
       :ok
     end
   end
@@ -938,6 +928,8 @@ defmodule Tightbeam.Credentials do
       onboarders
     end
   end
+
+  defp harnesses_for_provider(:local_openai), do: [Tightbeam.Harness.Pi]
 
   defp harnesses_for_provider(provider),
     do: Enum.filter(Harness.all(), &(&1.credential_provider() == provider))
@@ -1259,7 +1251,7 @@ defmodule Tightbeam.Credentials do
     do: Path.join([state.base_dir, "auth", "pi", "auth.json"])
 
   defp credential_store_path(state, :local_openai),
-    do: Path.join([state.base_dir, "auth", "pi-local", "local-openai.json"])
+    do: Providers.providers_dir(state.base_dir)
 
   defp credential_store_path(state, :fixture_provider),
     do: Path.join([state.base_dir, "auth", "fixture", "fixture.json"])
@@ -1334,7 +1326,7 @@ defmodule Tightbeam.Credentials do
   end
 
   defp staged_credential(:local_openai, kind, path) do
-    case File.read(Path.join(path, "local-openai.json")) do
+    case staged_local_openai_bytes(path) do
       {:ok, bytes} -> {:ok, Map.put(installed_metadata(:local_openai, kind), :bytes, bytes)}
       {:error, reason} -> {:error, {:local_openai_failed, reason}}
     end
@@ -1351,6 +1343,31 @@ defmodule Tightbeam.Credentials do
     with {:ok, credential} <- staged_credential(provider, kind, path),
          :ok <- write_credential!(state, provider, credential) do
       {:ok, credential}
+    end
+  end
+
+  defp install_staged!(state, :local_openai, kind, path) do
+    with {:ok, credential} <- staged_credential(:local_openai, kind, path),
+         {:ok, name} <- provider_name_from_bytes(credential.bytes) do
+      source = staged_local_openai_path!(path)
+      store = Providers.provider_path(state.base_dir, name)
+      providers_dir = Providers.providers_dir(state.base_dir)
+
+      script =
+        "test -f #{shell_quote(source)} && " <>
+          "mkdir -p #{shell_quote(providers_dir)} && " <>
+          "chmod 600 #{shell_quote(source)} && " <>
+          "mv #{shell_quote(source)} #{shell_quote(store)} && " <>
+          "chmod 600 #{shell_quote(store)}"
+
+      case remote_command(state, ["sh", "-c", shell_quote(script)]) do
+        {_output, 0} ->
+          reconcile_provider_homes(state, :local_openai)
+          {:ok, installed_metadata(:local_openai, kind)}
+
+        {output, status} ->
+          {:error, {:credential_install_failed, status, String.trim(output)}}
+      end
     end
   end
 
@@ -1392,7 +1409,7 @@ defmodule Tightbeam.Credentials do
   defp staged_path(:openai, path), do: Path.join(path, "auth.json")
   defp staged_path(:anthropic, path), do: Path.join(path, ".credentials.json")
   defp staged_path(:opencode_go, path), do: Path.join(path, "auth.json")
-  defp staged_path(:local_openai, path), do: Path.join(path, "local-openai.json")
+  defp staged_path(:local_openai, path), do: staged_local_openai_path!(path)
   defp staged_path(:fixture_provider, path), do: Path.join(path, "fixture.json")
 
   defp onboarding_staging_path(%{ssh: nil}, provider) do
@@ -1448,5 +1465,44 @@ defmodule Tightbeam.Credentials do
 
   defp shell_quote(value) do
     "'" <> String.replace(value, "'", "'\"'\"'") <> "'"
+  end
+
+  defp provider_name_from_bytes(bytes) do
+    with {:ok, %{"name" => name}} <- JSON.decode(bytes),
+         {:ok, name} <- Providers.validate_name(name) do
+      {:ok, name}
+    else
+      _ -> {:error, :invalid_local_openai_name}
+    end
+  end
+
+  defp staged_local_openai_bytes(path) do
+    case staged_local_openai_path(path) do
+      {:ok, file} -> File.read(file)
+      error -> error
+    end
+  end
+
+  defp staged_local_openai_path!(path) do
+    case staged_local_openai_path(path) do
+      {:ok, file} -> file
+      {:error, reason} -> raise "local-openai staging file missing: #{inspect(reason)}"
+    end
+  end
+
+  defp staged_local_openai_path(path) do
+    case File.ls(path) do
+      {:ok, files} ->
+        json_files = Enum.filter(files, &String.ends_with?(&1, ".json"))
+
+        case json_files do
+          [one] -> {:ok, Path.join(path, one)}
+          [] -> {:error, :missing_staged_local_openai}
+          many -> {:error, {:ambiguous_staged_local_openai, many}}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
   end
 end

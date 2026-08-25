@@ -143,7 +143,11 @@ defmodule Tightbeam.HarnessPiTest do
   end
 
   test "catalog refuses a provider mismatch instead of relabeling it" do
+    base = tmp_dir!("pi-catalog-mismatch")
+
     state = %{
+      base_dir: base,
+      credential_status: fn :opencode_go, _ -> :onboarded end,
       options: %{
         sh: fn _command ->
           {~s({"wrong":{"id":"wrong","name":"Wrong","provider":"other","contextWindow":1,"maxTokens":1}}) <>
@@ -153,7 +157,8 @@ defmodule Tightbeam.HarnessPiTest do
       host_config: %{ssh: nil}
     }
 
-    assert {:error, :malformed_catalog} = Pi.fetch_catalog(state)
+    assert {:error, {:no_pi_catalog, %{opencode_go: :malformed_catalog}}} =
+             Pi.fetch_catalog(state)
   end
 
   test "liveness uses the live-proven Pi request without putting the key in argv" do
@@ -189,8 +194,11 @@ defmodule Tightbeam.HarnessPiTest do
 
   test "catalog and generated gate launch only absolute executables" do
     owner = self()
+    base = tmp_dir!("pi-catalog-abs")
 
     state = %{
+      base_dir: base,
+      credential_status: fn :opencode_go, _ -> :onboarded end,
       options: %{
         find_executable: fn
           "sh" -> "/absolute/sh"

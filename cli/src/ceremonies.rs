@@ -125,6 +125,7 @@ pub fn onboard<S, H>(
     provider: &str,
     api_key: bool,
     local_endpoint: Option<&str>,
+    provider_name: Option<&str>,
     endpoint: &Endpoint,
     send_request: S,
     load_harnesses: H,
@@ -221,6 +222,8 @@ where
     let staged: Result<(), StageFailure> = if provider == "local-openai" {
         run_local_openai_onboarding(
             staging,
+            provider_name
+                .ok_or_else(|| "tightbeam onboard local-openai requires --name NAME".to_owned())?,
             local_endpoint.ok_or_else(|| {
                 "tightbeam onboard local-openai requires --endpoint URL".to_owned()
             })?,
@@ -598,11 +601,13 @@ fn deliver(supervised: &mut Supervised, bytes: &[u8]) -> Result<(), RunError> {
 
 fn run_local_openai_onboarding(
     staging: &str,
+    provider_name: &str,
     endpoint: &str,
     api_key: bool,
     machine: Option<&str>,
     ceremony: &Ceremony<'_>,
 ) -> Result<(), String> {
+    let provider_name = normalize_local_openai_name(provider_name)?;
     let endpoint = normalize_local_openai_endpoint(endpoint)?;
     let optional_key = if api_key {
         Some(read_api_key("local-openai")?)
@@ -615,7 +620,35 @@ fn run_local_openai_onboarding(
         machine,
         ceremony.deadline,
     )?;
-    bank_local_openai_credential(staging, &endpoint, optional_key.as_deref())
+    bank_local_openai_credential(staging, &provider_name, &endpoint, optional_key.as_deref())
+}
+
+fn normalize_local_openai_name(name: &str) -> Result<String, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("tightbeam onboard local-openai requires --name NAME".to_owned());
+    }
+    if trimmed == "opencode-go" {
+        return Err("local-openai provider name opencode-go is reserved".to_owned());
+    }
+    if !trimmed
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase())
+    {
+        return Err(format!(
+            "local-openai provider name must start with a lowercase letter, got: {trimmed}"
+        ));
+    }
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return Err(format!(
+            "local-openai provider name must contain only lowercase letters, digits, and hyphens, got: {trimmed}"
+        ));
+    }
+    Ok(trimmed.to_owned())
 }
 
 fn normalize_local_openai_endpoint(endpoint: &str) -> Result<String, String> {
@@ -726,18 +759,19 @@ fn local_openai_model_ids(value: &serde_json::Value) -> Vec<String> {
 
 fn bank_local_openai_credential(
     staging: &str,
+    provider_name: &str,
     endpoint: &str,
     api_key: Option<&str>,
 ) -> Result<(), String> {
     let mut record = serde_json::json!({
-        "local-openai": {
-            "endpoint": endpoint
-        }
+        "name": provider_name,
+        "type": "local-openai",
+        "endpoint": endpoint
     });
     if let Some(key) = api_key {
-        record["local-openai"]["apiKey"] = serde_json::json!(key);
+        record["apiKey"] = serde_json::json!(key);
     }
-    let path = std::path::Path::new(staging).join("local-openai.json");
+    let path = std::path::Path::new(staging).join(format!("{provider_name}.json"));
     let bytes = serde_json::to_vec_pretty(&record)
         .map_err(|error| format!("could not encode the local-openai credential: {error}"))?;
     let mut file = fs::OpenOptions::new()
@@ -848,7 +882,7 @@ fn api_key_needs_a_pipe(provider: &str) -> String {
         ),
         "local-openai" => (
             "LOCAL_OPENAI_API_KEY",
-            format!("tightbeam onboard {provider} --endpoint URL --api-key"),
+            format!("tightbeam onboard {provider} --name NAME --endpoint URL --api-key"),
         ),
         _ => (
             "ANTHROPIC_API_KEY",
@@ -2466,7 +2500,7 @@ mod tests {
         let message = api_key_needs_a_pipe("local-openai");
 
         assert!(message.contains("printenv LOCAL_OPENAI_API_KEY"));
-        assert!(message.contains("onboard local-openai --endpoint URL --api-key"));
+        assert!(message.contains("onboard local-openai --name NAME --endpoint URL --api-key"));
         assert!(!message.contains("ANTHROPIC_API_KEY"));
     }
 
@@ -2815,6 +2849,7 @@ mod tests {
                 &Identity::User("signal-fixture".to_owned()),
                 "openai",
                 false,
+                None,
                 None,
                 &endpoint,
                 |_, request, _| {

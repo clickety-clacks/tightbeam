@@ -22,7 +22,7 @@ defmodule Tightbeam.ModelCatalog do
 
   use GenServer
   require Logger
-  alias Tightbeam.{Harness, Model, Placement, Unroutable}
+  alias Tightbeam.{Harness, Model, PiProvider, Placement, Unroutable}
 
   @default_ttl_ms :timer.minutes(15)
 
@@ -499,11 +499,18 @@ defmodule Tightbeam.ModelCatalog do
   defp safely_derive({host, harness}, probe, state) do
     try do
       module = Harness.parse!(harness)
-      provider = module.credential_provider()
 
-      with :onboarded <- credential_status(state, provider, host),
+      catalog_state =
+        probe
+        |> Map.put(:host_name, host)
+        |> Map.put(:options, state.options)
+        |> Map.put(:credential_status, fn provider, machine ->
+          credential_status(state, provider, machine)
+        end)
+
+      with :onboarded <- catalog_onboarding_status(module, catalog_state, state, host),
            kind when kind in [:api_key, :subscription] <-
-             credential_kind(state, provider, host) do
+             catalog_credential_kind(module, catalog_state, state, host) do
         probe = Map.put(probe, :credential_kind, kind)
 
         probe
@@ -513,12 +520,6 @@ defmodule Tightbeam.ModelCatalog do
         {:needs_onboarding, reason} ->
           {:error, {:needs_onboarding, reason}}
 
-        # Onboarded, but the store records no kind. Refused rather than
-        # defaulted: the two kinds read different routes, so a catalog derived
-        # against a guessed kind would be a confident answer about the wrong
-        # account. Production cannot reach this — `:onboarded` and a readable
-        # kind have the same preconditions — but a half-migrated or
-        # hand-assembled store can, and it deserves a refusal, not a guess.
         :none ->
           {:error, {:needs_onboarding, :missing}}
 
@@ -530,6 +531,33 @@ defmodule Tightbeam.ModelCatalog do
     catch
       kind, reason -> {:error, {kind, reason}}
     end
+  end
+
+  defp catalog_onboarding_status(Tightbeam.Harness.Pi, catalog_state, _state, _host) do
+    if PiProvider.pi_catalog_ready?(catalog_state),
+      do: :onboarded,
+      else: {:needs_onboarding, :missing}
+  end
+
+  defp catalog_onboarding_status(module, _catalog_state, state, host) do
+    credential_status(state, module.credential_provider(), host)
+  end
+
+  defp catalog_credential_kind(Tightbeam.Harness.Pi, _catalog_state, state, host) do
+    cond do
+      credential_status(state, :opencode_go, host) == :onboarded ->
+        credential_kind(state, :opencode_go, host)
+
+      credential_status(state, :local_openai, host) == :onboarded ->
+        :api_key
+
+      true ->
+        :api_key
+    end
+  end
+
+  defp catalog_credential_kind(module, _catalog_state, state, host) do
+    credential_kind(state, module.credential_provider(), host)
   end
 
   # A subscription bearer 401 on the STORE copy can mean the credential is

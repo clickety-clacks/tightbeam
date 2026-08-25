@@ -4,8 +4,11 @@ defmodule Tightbeam.Harness.Pi do
 
   alias Tightbeam.Harness.Support
   alias Tightbeam.Model
+  alias Tightbeam.LocalOpenAi.Providers
   alias Tightbeam.PiProvider
   alias Tightbeam.PiProvider.OpenCodeGo
+
+  @models_json "models.json"
 
   @adapter_version "0.0.33"
   @adapter_package "pi-acp"
@@ -171,13 +174,35 @@ defmodule Tightbeam.Harness.Pi do
       effort_config: "thought_level",
       resident_model_switch: :in_place,
       model_option_aliases: %{},
-      canonical_model_prefixes: ["opencode-go/"]
+      canonical_model_prefixes: canonical_model_prefixes(session)
     }
   end
 
+  defp canonical_model_prefixes(session) do
+    base_dir = session_base_dir(session)
+
+    local_prefixes =
+      if is_binary(base_dir) do
+        Providers.list(base_dir) |> Enum.map(&"#{&1}/")
+      else
+        []
+      end
+
+    ["opencode-go/" | local_prefixes]
+  end
+
+  defp session_base_dir(%{base_dir: base_dir}) when is_binary(base_dir), do: base_dir
+
+  defp session_base_dir(%{host_config: %{base_dir: base_dir}}) when is_binary(base_dir),
+    do: base_dir
+
+  defp session_base_dir(_), do: nil
+
   @impl true
-  def owned_home_entries,
-    do: Support.owned_home_entries(@credential_file, "extensions/tightbeam.ts")
+  def owned_home_entries do
+    (Support.owned_home_entries(@credential_file, "extensions/tightbeam.ts") ++ [@models_json])
+    |> Enum.sort()
+  end
 
   @impl true
   def reconcile_home(target, home, desired) do
@@ -195,10 +220,44 @@ defmodule Tightbeam.Harness.Pi do
           |> extension_source()
       end
 
-    Tightbeam.Homes.reconcile(target, home, %{desired | rails: rails},
-      credential_names: [@credential_file],
-      rails_filename: "extensions/tightbeam.ts"
-    )
+    result =
+      Tightbeam.Homes.reconcile(target, home, %{desired | rails: rails},
+        credential_names: [@credential_file],
+        rails_filename: "extensions/tightbeam.ts"
+      )
+
+    materialize_models_json!(target, home)
+    result
+  end
+
+  defp materialize_models_json!(target, home) do
+    if Providers.list(target.host_config.base_dir) == [] do
+      :ok
+    else
+      bytes = PiProvider.build_pi_models_json(target.host_config.base_dir)
+      path = Path.join(home, @models_json)
+
+      if Support.local?(target) do
+        File.mkdir_p!(Path.dirname(path))
+        File.write!(path, bytes)
+        File.chmod!(path, 0o600)
+      else
+        with {:ok, ssh} <- absolute_executable(target, "ssh") do
+          tmp = path <> ".tmp-#{System.unique_integer([:positive])}"
+          encoded = Base.encode64(bytes)
+
+          script =
+            "printf %s #{JSON.encode!(encoded)} | base64 -d > #{JSON.encode!(tmp)} && " <>
+              "chmod 600 #{JSON.encode!(tmp)} && mv #{JSON.encode!(tmp)} #{JSON.encode!(path)}"
+
+          Support.run!(
+            target,
+            [ssh | Support.ssh_opts()] ++
+              [target.host_config.ssh, "sh", "-c", script]
+          )
+        end
+      end
+    end
   end
 
   @impl true
@@ -250,7 +309,7 @@ defmodule Tightbeam.Harness.Pi do
 
   @impl true
   def fetch_catalog(state) do
-    PiProvider.for_id(credential_provider()).fetch_catalog(state)
+    PiProvider.fetch_pi_catalog(state)
   end
 
   @impl true
