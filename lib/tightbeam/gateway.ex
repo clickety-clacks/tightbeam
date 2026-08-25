@@ -3645,7 +3645,8 @@ defmodule Tightbeam.Gateway do
         machine,
         kind,
         params[:lease_id],
-        params[:reason]
+        params[:reason],
+        onboarding_caller(gateway_db(config), call)
       )
       |> with_owner_user_id(phase, gateway_db(config), call.origin)
     else
@@ -3668,7 +3669,7 @@ defmodule Tightbeam.Gateway do
     }
   end
 
-  defp onboard_phase(config, provider, "begin", machine, kind, _lease_id, _reason) do
+  defp onboard_phase(config, provider, "begin", machine, kind, _lease_id, _reason, _caller) do
     case Tightbeam.Credentials.begin_onboard(provider, Tightbeam.Credentials.server(machine)) do
       {:ok, path, lease_id} ->
         # The lease TTL rides the reply so the CLI's ceremony watchdog and the
@@ -3696,7 +3697,7 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp onboard_phase(_config, provider, "finish", machine, kind, lease_id, _reason) do
+  defp onboard_phase(config, provider, "finish", machine, kind, lease_id, _reason, caller) do
     case Tightbeam.Credentials.finish_onboard(
            provider,
            kind,
@@ -3704,13 +3705,7 @@ defmodule Tightbeam.Gateway do
            Tightbeam.Credentials.server(machine)
          ) do
       :ok ->
-        # The result the CLI prints. It names the kind that was banked, so a
-        # successful ceremony says which of the two it installed rather than
-        # leaving the operator to go read the store — in the WIRE spelling
-        # (`wire_credential_kind/1`), like every other surface: the camelizer
-        # rewrites keys, not atom values, so a bare `kind` here put the store's
-        # "api_key" on a wire whose contract says "apiKey".
-        %{provider: provider, credential_kind: wire_credential_kind(kind), status: "onboarded"}
+        finish_onboard_result(config, caller, provider, machine, kind)
 
       {:error, reason} ->
         %{
@@ -3720,7 +3715,7 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp onboard_phase(_config, provider, "cancel", machine, _kind, lease_id, reason) do
+  defp onboard_phase(_config, provider, "cancel", machine, _kind, lease_id, reason, _caller) do
     case Tightbeam.Credentials.cancel_onboard(
            provider,
            lease_id,
@@ -3734,6 +3729,89 @@ defmodule Tightbeam.Gateway do
         %{code: "needs_onboarding", message: inspect(reason)}
     end
   end
+
+  defp finish_onboard_result(config, caller, provider, machine, :subscription)
+       when provider in [:openai, :anthropic] do
+    case schedule_oauth_recovery_wake(config, caller, provider, machine) do
+      :ok ->
+        onboarded_result(provider, :subscription)
+
+      {:error, reason} ->
+        %{
+          code: "credential_recovered_wake_failed",
+          message:
+            "#{provider} subscription credential on #{machine} recovered, but its Main " <>
+              "recovery wake could not be scheduled: #{describe_error(reason)}",
+          provider: provider,
+          host: machine,
+          credential_recovered: true,
+          wake_scheduled: false
+        }
+    end
+  end
+
+  defp finish_onboard_result(_config, _caller, provider, _machine, :subscription),
+    do: onboarded_result(provider, :subscription)
+
+  defp finish_onboard_result(_config, _caller, provider, _machine, :api_key),
+    do: onboarded_result(provider, :api_key)
+
+  # The result the CLI prints names the kind that was banked in the wire
+  # vocabulary. `wire_credential_kind/1` is the single translation boundary.
+  defp onboarded_result(provider, kind),
+    do: %{provider: provider, credential_kind: wire_credential_kind(kind), status: "onboarded"}
+
+  # OAuth recovery is one neutral event instruction to the authenticated
+  # operator's native Main. Main, not the credential substrate, reads Kung Fu
+  # manifests and selects live agents. API-key completion never reaches here.
+  defp schedule_oauth_recovery_wake(
+         config,
+         %{owner_user_id: owner},
+         provider,
+         machine
+       )
+       when is_binary(owner) do
+    prompt =
+      "The OAuth token for #{provider} on #{machine} was refreshed. " <>
+        "Read the manifests for every installed or learned Kung Fu. " <>
+        "Read each manifest's declared main archetype. " <>
+        "Find live agents with those archetypes. " <>
+        "Notify each that the OAuth token was refreshed, and require each to inspect and " <>
+        "resume any stalled agent graph."
+
+    case DB.transaction(gateway_db(config), fn txn ->
+           Wakes.schedule_in_txn(txn, %{
+             session_key: Org.personal_session_key(owner),
+             origin: "process:tightbeam",
+             prompt: prompt,
+             consumer: "prompt",
+             due_at: System.system_time(:millisecond),
+             target_gate: 1
+           })
+         end) do
+      {:ok, _wake} ->
+        Wakes.fire_due(Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler))
+        :ok
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp schedule_oauth_recovery_wake(_config, _caller, _provider, _machine),
+    do: {:error, :authenticated_operator_unavailable}
+
+  defp onboarding_caller(_db, %{principal: {:user, owner}}) when is_binary(owner),
+    do: %{owner_user_id: owner, caller_session: nil}
+
+  defp onboarding_caller(db, %{principal: {:session, session_key}}) do
+    case Org.get(db, session_key) do
+      %{owner_user_id: owner} = session -> %{owner_user_id: owner, caller_session: session}
+      nil -> nil
+    end
+  end
+
+  defp onboarding_caller(db, call), do: resolve_caller(db, call.origin)
 
   # The begin reply carries the OWNER user id so the CLI can wake THAT user with the
   # sign-in URL+code the ceremony is about to surface (wi_0535922b). An onboarding run
