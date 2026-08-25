@@ -673,6 +673,21 @@ impl DeploymentFs {
         fsync_fd(current.as_raw_fd(), &rendered)
     }
 
+    #[cfg(test)]
+    pub(crate) fn fsync_relative_dir_with_fault(
+        &self,
+        path: &Path,
+        point: FaultPoint,
+    ) -> Result<(), FsError> {
+        let components = relative_components(path)?;
+        let dir = self.parent_dir(&components)?;
+        fsync_fd(dir.as_raw_fd(), &join_components(&self.root, &components))?;
+        if point == FaultPoint::AfterTargetGenerationFsync {
+            return Err(injected_fault(point));
+        }
+        Ok(())
+    }
+
     pub(crate) fn publish_immutable(
         &self,
         path: &Path,
@@ -768,9 +783,7 @@ impl DeploymentFs {
         fsync_fd(dir.as_raw_fd(), &join_components(&self.root, &parent))?;
         #[cfg(test)]
         if let Some(
-            point @ (FaultPoint::AfterTargetGenerationFsync
-            | FaultPoint::AfterIntentFsync
-            | FaultPoint::AfterRecoveredAuditPublication),
+            point @ (FaultPoint::AfterIntentFsync | FaultPoint::AfterRecoveredAuditPublication),
         ) = point
         {
             return Err(injected_fault(point));

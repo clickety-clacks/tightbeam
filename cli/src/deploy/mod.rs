@@ -704,43 +704,61 @@ mod tests {
         Ok(())
     }
 
-    fn add_generation_with_fault(
+    fn add_complete_generation_with_fault(
         manager: &DeployManager,
         generation: &str,
         release: &model::Digest,
         prior: Option<&str>,
         point: fs::FaultPoint,
     ) -> Result<(), FsError> {
+        add_generation(manager, generation, release, prior);
+        // A generation is its manifest plus root link. Inject only after the
+        // complete generation's parent-directory publication barrier.
         manager
             .fs
-            .ensure_dir(&Path::new("generations").join(generation), 0o755)?;
-        manager.fs.publish_immutable_with_fault(
-            &Path::new("generations")
-                .join(generation)
-                .join("manifest.json"),
-            format!(
-                r#"{{"prior_generation":{},"releaseDigest":"{release}"}}"#,
-                prior
-                    .map(|prior| format!("\"{prior}\""))
-                    .unwrap_or("null".to_owned())
-            )
-            .as_bytes(),
-            0o444,
-            point,
-        )?;
-        let release_name = format!("sha256-{release}");
-        manager.fs.replace_relative_symlink(
-            &Path::new("generations").join(generation).join("root"),
-            &Path::new("../../releases")
-                .join(release_name)
-                .join("tightbeam"),
-        )?;
-        Ok(())
+            .fsync_relative_dir_with_fault(Path::new("generations"), point)
     }
 
-    fn assert_protected_transition_objects(directory: &TempDir, transaction: &str) {
+    fn assert_complete_target_generation(
+        manager: &DeployManager,
+        directory: &TempDir,
+        target: &Pointer,
+    ) {
+        let generation = directory
+            .0
+            .join("generations")
+            .join(target.generation.as_str());
+        assert!(generation.join("manifest.json").is_file());
+        let root = generation.join("root");
+        assert!(
+            stdfs::symlink_metadata(&root)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            stdfs::read_link(root).unwrap(),
+            Path::new("../../releases")
+                .join(format!("sha256-{}", target.release))
+                .join("tightbeam")
+        );
+        manager.fs.validate_generation_target(target).unwrap();
+    }
+
+    fn assert_protected_transition_objects(
+        manager: &DeployManager,
+        directory: &TempDir,
+        target: &Pointer,
+        transaction: &str,
+    ) {
         assert!(directory.0.join("generations/g1").is_dir());
-        assert!(directory.0.join("generations/g2").is_dir());
+        assert!(
+            stdfs::symlink_metadata(directory.0.join("generations/g1/root"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_complete_target_generation(manager, directory, target);
         assert!(
             directory
                 .0
@@ -950,7 +968,7 @@ mod tests {
         let transaction = if u0 { "tx-u0" } else { "tx-ordinary" };
         if point == fs::FaultPoint::AfterTargetGenerationFsync {
             assert!(matches!(
-                add_generation_with_fault(
+                add_complete_generation_with_fault(
                     &manager,
                     "g2",
                     &target.release,
@@ -959,6 +977,7 @@ mod tests {
                 ),
                 Err(FsError::InvalidPointer(reason)) if reason.contains("fault injected")
             ));
+            assert_complete_target_generation(&manager, &directory, &target);
         } else {
             add_generation(
                 &manager,
@@ -1037,9 +1056,17 @@ mod tests {
             RecoveryClass::ActivationNotCommitted
         };
         assert_eq!(recovery.class, expected_class, "u0={u0}, point={point:?}");
-        assert!(directory.0.join("generations/g2").is_dir());
+        assert_complete_target_generation(&restarted, &directory, &target);
         if point != fs::FaultPoint::AfterTargetGenerationFsync {
-            assert_protected_transition_objects(&directory, transaction);
+            assert_protected_transition_objects(&restarted, &directory, &target, transaction);
+        } else {
+            assert!(directory.0.join("generations/g1/manifest.json").is_file());
+            assert!(
+                stdfs::symlink_metadata(directory.0.join("generations/g1/root"))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
         }
         let expected_audits = if post_pointer {
             if u0 { 1 } else { 2 }
@@ -1125,7 +1152,8 @@ mod tests {
                     manager.recover_with_fault(point),
                     Err(FsError::InvalidPointer(reason)) if reason.contains("fault injected")
                 ));
-                assert_protected_transition_objects(&directory, transaction);
+                let target = manager.fs.read_active().unwrap().unwrap();
+                assert_protected_transition_objects(&manager, &directory, &target, transaction);
                 let before_restart = manager.fs.read_audit().unwrap().len();
                 assert_eq!(
                     before_restart,
