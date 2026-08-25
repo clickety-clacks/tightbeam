@@ -40,6 +40,8 @@ defmodule Tightbeam.Identity do
     "guidance/staffing.md"
   ]
   @bundle_doc_paths ~w(capabilities.md intake.md preferred-models.md manifest.toml)
+  @engineering_bundle "agentic-engineering"
+  @engineering_activity_table_path "kungfu/agentic-engineering/preferred-models.md"
 
   @type harness :: atom()
   @type snapshot :: %{
@@ -158,6 +160,10 @@ defmodule Tightbeam.Identity do
       end)
 
     archetype_guidance = Archetypes.guidance(archetype, fragments)
+
+    engineering_activity_table =
+      engineering_activity_table(identity_dir, revision, manifest_path)
+
     operating_manual = Map.fetch!(fragments, "operating-manual.md")
 
     # Appended once: an archetype whose guidance already includes the manual
@@ -170,12 +176,28 @@ defmodule Tightbeam.Identity do
     guidance =
       ([
          archetype_guidance,
+         engineering_activity_table,
          required_fragment!(fragments, "operating-model.md", revision)
        ] ++ manual_part)
+      |> Enum.reject(&is_nil/1)
       |> Enum.join("\n\n")
       |> then(&Harness.module!(harness).session_config(%{identity: true}, &1).guidance)
 
     %{revision: revision, archetype: archetype, guidance: guidance, skills: skills}
+  end
+
+  # Membership and policy bytes come from one revision so a snapshot cannot
+  # combine a current receipt with a table or manifest from another history point.
+  defp engineering_activity_table(dir, revision, manifest_path) do
+    case receipt_at(dir, revision, @engineering_bundle) do
+      {:ok, %{paths: paths}} ->
+        if manifest_path in paths,
+          do: git_show_bytes!(dir, revision, @engineering_activity_table_path),
+          else: nil
+
+      :error ->
+        nil
+    end
   end
 
   # A fragment the SUBSTRATE requires, which an org's tree may predate.

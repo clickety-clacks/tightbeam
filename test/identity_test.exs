@@ -248,6 +248,174 @@ defmodule Tightbeam.IdentityTest do
     assert {:noop, ^revision} = Identity.learn!(ctx.base, "agentic-engineering", "operator")
   end
 
+  test "engineering receipt members receive one exact activity table in a stable prompt", ctx do
+    shipped = Path.expand("priv/kungfu/agentic-engineering")
+    Application.put_env(:tightbeam, :identity_source_dir, shipped)
+    base = Path.join(ctx.root, "engineering-projection")
+    table = File.read!(Path.join(shipped, "preferred-models.md"))
+
+    assert {:ok, revision} = Identity.learn!(base, "agentic-engineering", "operator")
+
+    assert git_bytes!(
+             Path.join(base, "identity"),
+             revision,
+             "kungfu/agentic-engineering/preferred-models.md"
+           ) == table
+
+    for name <- ~w(coder orchestrator product-owner recon reviewer spec-writer) do
+      manifest_path = "archetypes/#{name}.toml"
+      guidance = Identity.snapshot_at!(base, revision, name, :codex).guidance
+
+      assert occurrence_count(guidance, table) == 1
+      assert guidance == Identity.snapshot_at!(base, revision, name, :codex).guidance
+
+      assert git_bytes!(Path.join(base, "identity"), revision, manifest_path) ==
+               File.read!(Path.join(shipped, manifest_path))
+    end
+
+    neutral = Identity.snapshot_at!(base, revision, "default", :codex).guidance
+    assert occurrence_count(neutral, table) == 0
+
+    coder = Identity.snapshot_at!(base, revision, "coder", :codex).guidance
+    assert text_offset(coder, "# Tightbeam · coder") < text_offset(coder, table)
+    assert text_offset(coder, "# Preferred models (substrate)") < text_offset(coder, table)
+    assert text_offset(coder, table) < text_offset(coder, "# Your served identity")
+
+    assert :noop = Identity.init!(base)
+    assert coder == Identity.snapshot_at!(base, revision, "coder", :codex).guidance
+  end
+
+  test "pinned snapshots compose manifests and activity tables from one revision", ctx do
+    assert {:ok, revision_a} = Identity.learn!(ctx.base, "agentic-engineering", "operator")
+    dir = Path.join(ctx.base, "identity")
+    table_path = "kungfu/agentic-engineering/preferred-models.md"
+    manifest_path = "archetypes/coder.toml"
+    table_a = git_bytes!(dir, revision_a, table_path)
+    manifest_a = git_bytes!(dir, revision_a, manifest_path)
+    cwd = Path.join(ctx.root, "pinned-session")
+    served_a = Identity.provision_at!(ctx.base, revision_a, "coder", :codex, cwd)
+
+    table_b =
+      String.replace(
+        table_a,
+        "# Preferred models — engineering kungfu",
+        "# Preferred models — engineering kungfu revision B"
+      )
+
+    manifest_b = """
+    name = "coder"
+    skills = ["role-skill"]
+
+    [guidance]
+    text = "manifest-b-guidance"
+    """
+
+    File.write!(Path.join(dir, table_path), table_b)
+    File.write!(Path.join(dir, manifest_path), manifest_b)
+    revision_b = publish_test_identity!(dir, "test: revision-b identity")
+
+    snapshot_a = Identity.snapshot_at!(ctx.base, revision_a, "coder", :codex)
+    snapshot_b = Identity.snapshot_at!(ctx.base, revision_b, "coder", :codex)
+
+    assert snapshot_a.guidance =~ "role-v1"
+    assert occurrence_count(snapshot_a.guidance, table_a) == 1
+    assert occurrence_count(snapshot_a.guidance, table_b) == 0
+    assert git_bytes!(dir, revision_a, manifest_path) == manifest_a
+
+    assert snapshot_b.guidance =~ "manifest-b-guidance"
+    assert occurrence_count(snapshot_b.guidance, table_b) == 1
+    assert occurrence_count(snapshot_b.guidance, table_a) == 0
+    assert git_bytes!(dir, revision_b, manifest_path) == manifest_b
+
+    assert served_a == snapshot_a
+    assert Identity.provision_at!(ctx.base, revision_a, "coder", :codex, cwd) == snapshot_a
+    assert Identity.provision!(ctx.base, "coder", :codex, cwd) == snapshot_b
+  end
+
+  test "the revision-pinned receipt alone controls engineering projection membership", ctx do
+    probe_manifest = """
+    name = "receipt-probe"
+    skills = ["role-skill"]
+
+    [guidance]
+    text = '#include "coder.md"'
+    """
+
+    File.write!(Path.join(ctx.source, "archetypes/receipt-probe.toml"), probe_manifest)
+
+    assert {:ok, learned_revision} =
+             Identity.learn!(ctx.base, "agentic-engineering", "operator")
+
+    dir = Path.join(ctx.base, "identity")
+    receipt_path = Path.join(dir, "kungfu/agentic-engineering/installed.toml")
+    table_path = "kungfu/agentic-engineering/preferred-models.md"
+    coder_path = "archetypes/coder.toml"
+    probe_path = "archetypes/receipt-probe.toml"
+    table = git_bytes!(dir, learned_revision, table_path)
+    coder_manifest = git_bytes!(dir, learned_revision, coder_path)
+    probe_manifest = git_bytes!(dir, learned_revision, probe_path)
+    learned_paths = receipt_path |> File.read!() |> Toml.decode!() |> Map.fetch!("paths")
+
+    paths_a = List.delete(learned_paths, probe_path)
+    write_test_receipt!(receipt_path, paths_a)
+    revision_a = publish_test_identity!(dir, "test: coder receipt member")
+
+    paths_b = paths_a |> List.delete(coder_path) |> then(&[probe_path | &1])
+    write_test_receipt!(receipt_path, paths_b)
+    revision_b = publish_test_identity!(dir, "test: receipt probe member")
+
+    assert occurrence_count(
+             Identity.snapshot_at!(ctx.base, revision_a, "coder", :codex).guidance,
+             table
+           ) == 1
+
+    assert occurrence_count(
+             Identity.snapshot_at!(ctx.base, revision_a, "receipt-probe", :codex).guidance,
+             table
+           ) == 0
+
+    assert occurrence_count(
+             Identity.snapshot_at!(ctx.base, revision_b, "coder", :codex).guidance,
+             table
+           ) == 0
+
+    assert occurrence_count(
+             Identity.snapshot_at!(ctx.base, revision_b, "receipt-probe", :codex).guidance,
+             table
+           ) == 1
+
+    for revision <- [revision_a, revision_b] do
+      assert git_bytes!(dir, revision, table_path) == table
+      assert git_bytes!(dir, revision, coder_path) == coder_manifest
+      assert git_bytes!(dir, revision, probe_path) == probe_manifest
+    end
+
+    assert git!(dir, ["diff", "--name-only", revision_a, revision_b]) ==
+             "kungfu/agentic-engineering/installed.toml"
+  end
+
+  test "unlearn removes current projection while the learned revision remains readable", ctx do
+    assert {:ok, revision_a} = Identity.learn!(ctx.base, "agentic-engineering", "operator")
+    dir = Path.join(ctx.base, "identity")
+    table_path = "kungfu/agentic-engineering/preferred-models.md"
+    receipt_path = "kungfu/agentic-engineering/installed.toml"
+    table = git_bytes!(dir, revision_a, table_path)
+
+    learned = Identity.snapshot_at!(ctx.base, revision_a, "coder", :codex)
+    assert occurrence_count(learned.guidance, table) == 1
+
+    revision_b = Identity.unlearn!(ctx.base, "agentic-engineering", "operator")
+    refute git_path_exists?(dir, revision_b, table_path)
+    refute git_path_exists?(dir, revision_b, receipt_path)
+
+    neutral = Identity.snapshot_at!(ctx.base, revision_b, "default", :codex)
+    assert occurrence_count(neutral.guidance, table) == 0
+
+    pinned = Identity.snapshot_at!(ctx.base, revision_a, "coder", :codex)
+    assert pinned == learned
+    assert occurrence_count(pinned.guidance, table) == 1
+  end
+
   test "shipped engineering bundle imports the test receipt rule and coder guidance", ctx do
     shipped = Path.expand("priv/kungfu/agentic-engineering")
     Application.put_env(:tightbeam, :identity_source_dir, shipped)
@@ -973,6 +1141,44 @@ defmodule Tightbeam.IdentityTest do
         end
       end
     end)
+  end
+
+  defp occurrence_count(content, bytes), do: length(:binary.matches(content, bytes))
+
+  defp text_offset(content, bytes) do
+    {offset, _length} = :binary.match(content, bytes)
+    offset
+  end
+
+  defp publish_test_identity!(dir, subject) do
+    git!(dir, ["add", "-A"])
+    git!(dir, ["commit", "-m", subject], "test")
+    revision = git!(dir, ["rev-parse", "main"])
+    live = git!(dir, ["rev-parse", "tightbeam/live"])
+    git!(dir, ["update-ref", "refs/heads/tightbeam/live", revision, live])
+    revision
+  end
+
+  defp write_test_receipt!(path, paths) do
+    rendered_paths = paths |> Enum.sort() |> Enum.map_join(",\n", &"  #{inspect(&1)}")
+    File.write!(path, "name = \"agentic-engineering\"\npaths = [\n#{rendered_paths}\n]\n")
+  end
+
+  defp git_bytes!(dir, revision, path) do
+    case System.cmd("git", ["show", "#{revision}:#{path}"], cd: dir, stderr_to_stdout: true) do
+      {output, 0} -> output
+      {output, status} -> raise "git show failed #{status}: #{output}"
+    end
+  end
+
+  defp git_path_exists?(dir, revision, path) do
+    case System.cmd("git", ["cat-file", "-e", "#{revision}:#{path}"],
+           cd: dir,
+           stderr_to_stdout: true
+         ) do
+      {_output, 0} -> true
+      {_output, _status} -> false
+    end
   end
 
   defp git!(dir, args, author \\ nil) do
