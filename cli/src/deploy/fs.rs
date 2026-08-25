@@ -531,12 +531,14 @@ impl DeploymentFs {
                 root.display()
             )));
         }
+        let root = fs::canonicalize(&root)
+            .map_err(|error| io("canonicalize deployment root", &root, error))?;
         let file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
             .open(&root)
             .map_err(|error| io("open deployment root", &root, error))?;
-        let host_identity = local_host_identity()?;
+        let host_identity = read_host_identity(&host_identity_path(&root))?;
         Ok(Self {
             root,
             root_fd: file.into(),
@@ -553,10 +555,16 @@ impl DeploymentFs {
     }
 
     pub fn root_identity_digest(&self) -> Result<DeploymentRootIdentity, FsError> {
-        let (host, device, inode) = self.namespace_identity()?;
-        let identity = format!("host:{};device:{device};inode:{inode}", host.as_str());
+        let root = self.root.to_str().ok_or_else(|| {
+            FsError::InvalidPointer("deployment root is not valid UTF-8".to_owned())
+        })?;
+        let identity = serde_json::to_vec(&serde_json::json!({
+            "hostIdentity": self.host_identity.as_str(),
+            "deploymentRoot": root,
+        }))
+        .map_err(|error| FsError::InvalidPointer(format!("serialize root identity: {error}")))?;
         Ok(DeploymentRootIdentity::from_digest(Digest::from_bytes(
-            identity.as_bytes(),
+            &identity,
         )))
     }
 
@@ -774,6 +782,21 @@ impl DeploymentFs {
             )));
         }
         let generation = GenerationId::new(&components[1]).map_err(FsError::InvalidPointer)?;
+        Ok(Some(self.read_generation(&generation)?))
+    }
+
+    pub(crate) fn validate_generation_target(&self, target: &Pointer) -> Result<(), FsError> {
+        let observed = self.read_generation(&target.generation)?;
+        if observed.release != target.release {
+            return Err(FsError::InvalidPointer(format!(
+                "target generation {} selects release {}, requested {}",
+                target.generation, observed.release, target.release
+            )));
+        }
+        Ok(())
+    }
+
+    fn read_generation(&self, generation: &GenerationId) -> Result<Pointer, FsError> {
         let manifest_path = Path::new("generations")
             .join(generation.as_str())
             .join("manifest.json");
@@ -827,10 +850,10 @@ impl DeploymentFs {
             &self.root.join("releases").join(release_name),
             &release,
         )?;
-        Ok(Some(Pointer {
-            generation,
+        Ok(Pointer {
+            generation: generation.clone(),
             release,
-        }))
+        })
     }
 
     pub(crate) fn same_filesystem(&self, other: &Path) -> Result<(), FsError> {
@@ -917,13 +940,33 @@ impl DeploymentFs {
     }
 }
 
-fn local_host_identity() -> Result<HostIdentity, FsError> {
-    let bytes = fs::read("/etc/machine-id")
-        .or_else(|_| fs::read("/etc/hostname"))
-        .map_err(|error| io("read host identity", "/etc/machine-id", error))?;
-    if bytes.iter().all(u8::is_ascii_whitespace) {
+fn host_identity_path(_root: &Path) -> PathBuf {
+    #[cfg(test)]
+    if _root != Path::new("/opt/tightbeam") {
+        return _root.join("deploy-host-id");
+    }
+    PathBuf::from("/etc/tightbeam/deploy-host-id")
+}
+
+fn read_host_identity(path: &Path) -> Result<HostIdentity, FsError> {
+    let metadata = fs::metadata(path).map_err(|error| io("stat host identity", path, error))?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o7777 != 0o400 {
+        return Err(FsError::InvalidPointer(format!(
+            "host identity must be a regular root-owned mode-0400 file: {}",
+            path.display()
+        )));
+    }
+    #[cfg(not(test))]
+    if metadata.uid() != 0 {
+        return Err(FsError::InvalidPointer(format!(
+            "host identity is not root-owned: {}",
+            path.display()
+        )));
+    }
+    let bytes = fs::read(path).map_err(|error| io("read host identity", path, error))?;
+    if bytes.len() != 32 {
         return Err(FsError::InvalidPointer(
-            "host identity source is empty".to_owned(),
+            "host identity must contain exactly 32 bytes".to_owned(),
         ));
     }
     Ok(HostIdentity::from_bytes(&bytes))
@@ -1064,6 +1107,12 @@ mod tests {
             TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir(&path).unwrap();
+        fs::write(path.join("deploy-host-id"), [7_u8; 32]).unwrap();
+        fs::set_permissions(
+            path.join("deploy-host-id"),
+            fs::Permissions::from_mode(0o400),
+        )
+        .unwrap();
         TempDir(path)
     }
 
@@ -1192,6 +1241,29 @@ mod tests {
             fs.same_filesystem(Path::new("/proc")),
             Err(FsError::CrossDevice { .. })
         ));
+    }
+
+    #[test]
+    fn host_identity_refuses_a_malformed_fixture_file() {
+        let (directory, _fs) = fixture();
+        let path = directory.0.join("deploy-host-id");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&path, [3_u8; 31]).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(matches!(
+            DeploymentFs::open(&directory.0),
+            Err(FsError::InvalidPointer(reason)) if reason.contains("exactly 32 bytes")
+        ));
+    }
+
+    #[test]
+    fn deployment_root_identity_is_stable_for_the_same_host_and_path() {
+        let (directory, fs) = fixture();
+        let other = DeploymentFs::open(&directory.0).unwrap();
+        assert_eq!(
+            fs.root_identity_digest().unwrap(),
+            other.root_identity_digest().unwrap()
+        );
     }
 
     #[test]

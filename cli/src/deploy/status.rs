@@ -56,13 +56,11 @@ pub fn read(root: &Path) -> Result<DeployStatus, FsError> {
         &root_identity,
         fs.host_identity(),
     );
-    let durable_history_error =
-        (active.is_none() && intent.state == IntentState::None && !audit_records.is_empty())
-            .then(|| "durable activation history exists without an active pointer".to_owned());
+    let audit_state_error = audit_conflict(active.as_ref(), &audit_records);
     let state_error = pointer_error
         .or(intent.error.clone())
         .or(audit_error)
-        .or(durable_history_error);
+        .or(audit_state_error);
     let transaction = match state_error.as_deref() {
         Some(reason) => TransactionStatus::Indeterminate {
             reason: reason.to_owned(),
@@ -158,8 +156,8 @@ pub fn read(root: &Path) -> Result<DeployStatus, FsError> {
         }
         .to_owned(),
         gc_hold: state_error.is_some() || intent.state != IntentState::None,
-        gc_hold_transactions: if state_error.is_some() {
-            vec!["invalid active pointer".to_owned()]
+        gc_hold_transactions: if let Some(reason) = state_error.as_ref() {
+            vec![reason.clone()]
         } else if intent.state == IntentState::None {
             Vec::new()
         } else {
@@ -169,19 +167,59 @@ pub fn read(root: &Path) -> Result<DeployStatus, FsError> {
     })
 }
 
-fn parse_audit_records(records: &[Vec<u8>]) -> (Vec<AuditFactRecord>, Option<String>) {
+pub(crate) fn parse_audit_records(records: &[Vec<u8>]) -> (Vec<AuditFactRecord>, Option<String>) {
     let mut parsed = Vec::new();
     for record in records {
         match parse_audit_record(record) {
             Ok(record)
-                if parsed
-                    .iter()
-                    .any(|known: &AuditFactRecord| known.fact_digest == record.fact_digest) => {}
+                if parsed.iter().any(|known: &AuditFactRecord| {
+                    known.transaction_id == record.transaction_id
+                        && known.state == record.state
+                        && known.observed == record.observed
+                }) => {}
             Ok(record) => parsed.push(record),
             Err(error) => return (Vec::new(), Some(error)),
         }
     }
     (parsed, None)
+}
+
+pub(crate) fn audit_conflict(
+    active: Option<&Pointer>,
+    records: &[AuditFactRecord],
+) -> Option<String> {
+    for record in records {
+        if !matches!(
+            record.state,
+            TransactionState::Activated | TransactionState::Restarted | TransactionState::Observed
+        ) {
+            continue;
+        }
+        let matches_active = match (&record.observed, active) {
+            (
+                NamespaceIdentity::Generation {
+                    generation,
+                    release,
+                },
+                Some(pointer),
+            ) => generation == &pointer.generation && release == &pointer.release,
+            _ => false,
+        };
+        if !matches_active {
+            return Some(if active.is_none() {
+                format!(
+                    "durable activation history exists without active pointer (transaction {})",
+                    record.transaction_id.as_str()
+                )
+            } else {
+                format!(
+                    "audit namespace fact conflicts with active pointer (transaction {})",
+                    record.transaction_id.as_str()
+                )
+            });
+        }
+    }
+    None
 }
 
 fn parse_audit_record(record: &[u8]) -> Result<AuditFactRecord, String> {
@@ -598,6 +636,7 @@ mod tests {
     use super::*;
     use crate::deploy::model::Digest;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
 
     struct TempDir(PathBuf);
 
@@ -617,6 +656,12 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir(&path).unwrap();
+        fs::write(path.join("deploy-host-id"), [7_u8; 32]).unwrap();
+        fs::set_permissions(
+            path.join("deploy-host-id"),
+            fs::Permissions::from_mode(0o400),
+        )
+        .unwrap();
         TempDir(path)
     }
 
@@ -670,6 +715,22 @@ mod tests {
         ));
         assert_eq!(status.transaction.as_str(), "committed-recovered");
         assert_eq!(status.audit, "none");
+
+        fs::create_dir_all(directory.0.join("audit/tx-old")).unwrap();
+        let fact_digest = Digest::from_bytes(b"old-fact");
+        fs::write(
+            directory.0.join("audit/tx-old/fact.json"),
+            format!(
+                r#"{{"transactionId":"tx-old","state":"activated","observed":{{"kind":"generation","generation":"g-other","releaseDigest":"{}"}},"factDigest":"{}"}}"#,
+                digest, fact_digest
+            ),
+        )
+        .unwrap();
+        let held = read(&directory.0).unwrap();
+        assert_eq!(held.transaction.as_str(), "indeterminate");
+        assert_eq!(held.audit, "contradictory");
+        assert_eq!(held.observation, "held");
+        assert!(held.gc_hold);
     }
 
     #[test]
@@ -753,6 +814,22 @@ mod tests {
             status.gc_hold_transactions,
             vec!["unresolved activation intent"]
         );
+
+        fs::create_dir_all(directory.0.join("audit/tx-old")).unwrap();
+        fs::write(
+            directory.0.join("audit/tx-old/fact.json"),
+            format!(
+                r#"{{"transactionId":"tx-old","state":"activated","observed":{{"kind":"generation","generation":"g-old","releaseDigest":"{}"}},"factDigest":"{}"}}"#,
+                Digest::from_bytes(b"old-release"),
+                Digest::from_bytes(b"old-fact")
+            ),
+        )
+        .unwrap();
+        let held = read(&directory.0).unwrap();
+        assert_eq!(held.transaction.as_str(), "indeterminate");
+        assert_eq!(held.audit, "contradictory");
+        assert_eq!(held.observation, "held");
+        assert_eq!(held.next_authority, "adjudicate");
     }
 
     #[test]
@@ -834,9 +911,29 @@ mod tests {
     }
 
     #[test]
+    fn status_holds_multiple_intents_instead_of_claiming_virgin() {
+        let directory = tempdir();
+        fs::create_dir_all(directory.0.join("intents")).unwrap();
+        fs::write(directory.0.join("intents/a.json"), b"{}\n").unwrap();
+        fs::write(directory.0.join("intents/b.json"), b"{}\n").unwrap();
+        let status = read(&directory.0).unwrap();
+        assert_eq!(status.transaction.as_str(), "indeterminate");
+        assert_eq!(status.observation, "held");
+        assert_eq!(status.next_authority, "adjudicate");
+        assert!(status.gc_hold);
+    }
+
+    #[test]
     fn duplicate_audit_facts_are_idempotent() {
         let fact = br#"{"transactionId":"tx-1","state":"activated","observed":{"kind":"generation","generation":"g1","releaseDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"factDigest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}"#;
-        let (records, error) = parse_audit_records(&[fact.to_vec(), fact.to_vec()]);
+        let mut second = fact.to_vec();
+        second.splice(
+            second.len() - 64 - 2..second.len() - 2,
+            b"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                .iter()
+                .copied(),
+        );
+        let (records, error) = parse_audit_records(&[fact.to_vec(), second]);
         assert!(error.is_none());
         assert_eq!(records.len(), 1);
     }

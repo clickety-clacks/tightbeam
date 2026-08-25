@@ -40,17 +40,38 @@ impl DeployManager {
             Ok(observed) => (observed, None),
             Err(error) => (None, Some(error.to_string())),
         };
-        let intent = self.read_activation_intent()?;
-        let durable_history = !self.fs.read_audit()?.is_empty();
-        let class = match (pointer_error.as_deref(), &observed, &intent) {
-            (Some(_), _, _) => RecoveryClass::ActivationIndeterminate,
-            (None, None, None) => RecoveryClass::VirginReady,
-            (None, None, Some(intent))
+        let (intent, intent_error) = match self.read_activation_intent() {
+            Ok(intent) => (intent, None),
+            Err(error) => {
+                let error = error.to_string();
+                let reason = error
+                    .strip_prefix("invalid active pointer: ")
+                    .unwrap_or(&error)
+                    .to_owned();
+                (None, Some(reason))
+            }
+        };
+        let audits = self.fs.read_audit()?;
+        let (audit_records, audit_parse_error) = status::parse_audit_records(&audits);
+        let audit_error =
+            audit_parse_error.or_else(|| status::audit_conflict(observed.as_ref(), &audit_records));
+        let class = match (
+            pointer_error.as_deref(),
+            intent_error.as_deref(),
+            audit_error.as_deref(),
+            &observed,
+            &intent,
+        ) {
+            (Some(_), _, _, _, _) | (_, Some(_), _, _, _) | (_, _, Some(_), _, _) => {
+                RecoveryClass::ActivationIndeterminate
+            }
+            (None, None, None, None, None) => RecoveryClass::VirginReady,
+            (None, None, None, None, Some(intent))
                 if matches!(intent.expected_active, ExpectedActive::Virgin { .. }) =>
             {
                 RecoveryClass::ActivationNotCommitted
             }
-            (None, Some(pointer), Some(intent))
+            (None, None, None, Some(pointer), Some(intent))
                 if pointer == &intent.target
                     && matches!(
                         intent.action,
@@ -59,30 +80,19 @@ impl DeployManager {
             {
                 RecoveryClass::ActivationCommittedRecovered
             }
-            (None, Some(pointer), Some(intent))
+            (None, None, None, Some(pointer), Some(intent))
                 if intent.prior.as_ref().is_some_and(|prior| pointer == prior) =>
             {
                 RecoveryClass::ActivationNotCommitted
             }
-            (None, Some(_), Some(_)) => RecoveryClass::ActivationIndeterminate,
-            (None, Some(_), None) => RecoveryClass::ActivationCommittedRecovered,
-            (None, None, Some(_)) => RecoveryClass::ActivationIndeterminate,
+            (None, None, None, Some(_), Some(_)) => RecoveryClass::ActivationIndeterminate,
+            (None, None, None, Some(_), None) => RecoveryClass::ActivationCommittedRecovered,
+            (None, None, None, None, Some(_)) => RecoveryClass::ActivationIndeterminate,
         };
-        let class = if observed.is_none() && intent.is_none() && durable_history {
-            RecoveryClass::ActivationIndeterminate
-        } else {
-            class
-        };
-        let reason = pointer_error
-            .or_else(|| {
-                (observed.is_none() && intent.is_none() && durable_history).then(|| {
-                    "durable activation history exists without an active pointer".to_owned()
-                })
-            })
-            .or_else(|| {
-                (class == RecoveryClass::ActivationIndeterminate)
-                    .then(|| "active pointer and unresolved intent do not agree".to_owned())
-            });
+        let reason = pointer_error.or(intent_error).or(audit_error).or_else(|| {
+            (class == RecoveryClass::ActivationIndeterminate)
+                .then(|| "active pointer and unresolved intent do not agree".to_owned())
+        });
         Ok(Recovery {
             class,
             observed,
@@ -97,7 +107,9 @@ impl DeployManager {
             return Ok(None);
         }
         if records.len() != 1 {
-            return Ok(None);
+            return Err(FsError::InvalidPointer(
+                "multiple unresolved activation intents".to_owned(),
+            ));
         }
         let value: serde_json::Value =
             serde_json::from_slice(&records.remove(0)).map_err(|error| {
@@ -209,6 +221,16 @@ impl DeployManager {
         expected: &ExpectedActive,
         target: &Pointer,
     ) -> Result<(), FsError> {
+        self.replace_active_inner(lock, expected, target, &self.fs.root().join("generations"))
+    }
+
+    fn replace_active_inner(
+        &self,
+        lock: &DeploymentLock,
+        expected: &ExpectedActive,
+        target: &Pointer,
+        filesystem_peer: &Path,
+    ) -> Result<(), FsError> {
         lock.belongs_to(&self.fs)?;
         let observed = self.fs.read_active()?;
         let matches = match (expected, observed.as_ref()) {
@@ -230,9 +252,22 @@ impl DeployManager {
                 expected.as_wire()
             )));
         }
+        self.fs.same_filesystem(filesystem_peer)?;
+        self.fs.validate_generation_target(target)?;
         let target = Path::new("generations").join(target.generation.as_str());
         self.fs
             .replace_relative_symlink(Path::new("active"), &target)
+    }
+
+    #[cfg(test)]
+    fn replace_active_for_test(
+        &self,
+        lock: &DeploymentLock,
+        expected: &ExpectedActive,
+        target: &Pointer,
+        filesystem_peer: &Path,
+    ) -> Result<(), FsError> {
+        self.replace_active_inner(lock, expected, target, filesystem_peer)
     }
 }
 
@@ -257,6 +292,7 @@ fn parse_pointer(value: Option<&serde_json::Value>) -> Result<Pointer, FsError> 
 mod tests {
     use super::*;
     use std::fs as stdfs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
     struct TempDir(PathBuf);
@@ -277,6 +313,12 @@ mod tests {
                 .as_nanos()
         ));
         stdfs::create_dir(&path).unwrap();
+        stdfs::write(path.join("deploy-host-id"), [7_u8; 32]).unwrap();
+        stdfs::set_permissions(
+            path.join("deploy-host-id"),
+            stdfs::Permissions::from_mode(0o400),
+        )
+        .unwrap();
         TempDir(path)
     }
 
@@ -328,6 +370,33 @@ mod tests {
         directory
     }
 
+    fn add_generation(manager: &DeployManager, generation: &str, release: &model::Digest) {
+        manager
+            .fs
+            .ensure_dir(&Path::new("generations").join(generation), 0o755)
+            .unwrap();
+        manager
+            .fs
+            .publish_immutable(
+                &Path::new("generations")
+                    .join(generation)
+                    .join("manifest.json"),
+                format!(r#"{{"releaseDigest":"{release}"}}"#).as_bytes(),
+                0o444,
+            )
+            .unwrap();
+        let release_name = format!("sha256-{release}");
+        manager
+            .fs
+            .replace_relative_symlink(
+                &Path::new("generations").join(generation).join("root"),
+                &Path::new("../../releases")
+                    .join(release_name)
+                    .join("tightbeam"),
+            )
+            .unwrap();
+    }
+
     #[test]
     fn recover_classifies_a_valid_active_pointer_after_process_death() {
         let directory = active_fixture();
@@ -343,7 +412,31 @@ mod tests {
     fn recover_holds_durable_history_when_active_pointer_is_missing() {
         let directory = tempdir();
         stdfs::create_dir_all(directory.0.join("audit/tx-1")).unwrap();
-        stdfs::write(directory.0.join("audit/tx-1/fact.json"), b"{}\n").unwrap();
+        let manager = DeployManager::open(&directory.0).unwrap();
+        let root_identity = manager.fs.root_identity_digest().unwrap();
+        stdfs::write(
+            directory.0.join("audit/tx-1/fact.json"),
+            format!(
+                r#"{{"transactionId":"tx-1","state":"activated","observed":{{"kind":"virgin","deploymentRoot":"{}"}},"factDigest":"{}"}}"#,
+                root_identity.as_str(),
+                model::Digest::from_bytes(b"fact")
+            ),
+        )
+        .unwrap();
+        let recovery = manager.recover().unwrap();
+        assert_eq!(recovery.class, RecoveryClass::ActivationIndeterminate);
+        assert_eq!(
+            recovery.reason.as_deref(),
+            Some("durable activation history exists without active pointer (transaction tx-1)")
+        );
+    }
+
+    #[test]
+    fn recover_holds_multiple_unresolved_intents_instead_of_calling_virgin() {
+        let directory = tempdir();
+        stdfs::create_dir_all(directory.0.join("intents")).unwrap();
+        stdfs::write(directory.0.join("intents/a.json"), b"{}\n").unwrap();
+        stdfs::write(directory.0.join("intents/b.json"), b"{}\n").unwrap();
         let recovery = DeployManager::open(&directory.0)
             .unwrap()
             .recover()
@@ -351,7 +444,48 @@ mod tests {
         assert_eq!(recovery.class, RecoveryClass::ActivationIndeterminate);
         assert_eq!(
             recovery.reason.as_deref(),
-            Some("durable activation history exists without an active pointer")
+            Some("multiple unresolved activation intents")
         );
+    }
+
+    #[test]
+    fn replace_active_reaches_same_filesystem_rail_before_pointer_mutation() {
+        let directory = active_fixture();
+        let manager = DeployManager::open(&directory.0).unwrap();
+        let current = manager.fs.read_active().unwrap().unwrap();
+        add_generation(&manager, "g2", &current.release);
+        let lock = manager.lock().unwrap();
+        let target = Pointer {
+            generation: model::GenerationId::new("g2").unwrap(),
+            release: current.release.clone(),
+        };
+        let expected =
+            ExpectedActive::generation(current.generation.clone(), current.release.clone());
+        assert!(matches!(
+            manager.replace_active_for_test(&lock, &expected, &target, Path::new("/proc")),
+            Err(FsError::CrossDevice { .. })
+        ));
+        assert_eq!(manager.fs.read_active().unwrap(), Some(current));
+    }
+
+    #[test]
+    fn replace_active_refuses_a_target_release_mismatch() {
+        let directory = active_fixture();
+        let manager = DeployManager::open(&directory.0).unwrap();
+        let current = manager.fs.read_active().unwrap().unwrap();
+        add_generation(&manager, "g2", &current.release);
+        let wrong_release = model::Digest::from_bytes(b"wrong-release");
+        let target = Pointer {
+            generation: model::GenerationId::new("g2").unwrap(),
+            release: wrong_release,
+        };
+        let expected =
+            ExpectedActive::generation(current.generation.clone(), current.release.clone());
+        let lock = manager.lock().unwrap();
+        assert!(matches!(
+            manager.replace_active(&lock, &expected, &target),
+            Err(FsError::InvalidPointer(_))
+        ));
+        assert_eq!(manager.fs.read_active().unwrap(), Some(current));
     }
 }
