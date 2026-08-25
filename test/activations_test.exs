@@ -4,6 +4,7 @@ defmodule Tightbeam.ActivationsTest do
   alias Tightbeam.{Activations, DB, Schema}
 
   @sha String.duplicate("a", 64)
+  @pre_activation_schema_sha256 "3c0299ae9fb040b2e2fa6dc328778ab21d0f8416af42c40eeb798d6f23022a02"
 
   test "fresh schema adds one exact inert activation store" do
     db = database("fresh")
@@ -293,22 +294,59 @@ defmodule Tightbeam.ActivationsTest do
              DB.query(db, "SELECT shape FROM schema_stamp")
   end
 
-  test "activation rows leave existing non-activation data readable at the unchanged stamp" do
-    db = database("downgrade")
-    seed_graph(db)
-    assert :ok = insert_declaration(db, "aev_downgrade", "act_downgrade", "downgrade")
+  test "exact pre-activation schema opens the additive database without interpreting it" do
+    unique = System.unique_integer([:positive])
+    path = Path.join(System.tmp_dir!(), "activation-downgrade-#{unique}.sqlite3")
 
-    assert {:ok, [["wi_activation", "Activation fixture", "work_owner", "open"]]} =
-             DB.query(
-               db,
-               "SELECT id,title,ownerUserId,state FROM work_items WHERE id='wi_activation'"
+    on_exit(fn ->
+      Enum.each([path, path <> "-shm", path <> "-wal"], &File.rm/1)
+    end)
+
+    current_db = String.to_atom("activation_current_#{unique}")
+    start_supervised!({DB, path: path, name: current_db})
+    assert :ok = Schema.ensure_all(current_db)
+    seed_graph(current_db)
+
+    assert :ok =
+             insert_declaration(
+               current_db,
+               "aev_downgrade",
+               "act_downgrade",
+               "downgrade"
              )
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v5"]]} =
-             DB.query(db, "SELECT shape FROM schema_stamp")
+    assert :ok = stop_supervised(DB)
 
-    assert :ok = Schema.ensure_all(db)
-    assert {:ok, [[1]]} = DB.query(db, "SELECT count(*) FROM activation_events")
+    legacy_schema = compile_pre_activation_schema!()
+    legacy_db = String.to_atom("activation_legacy_#{unique}")
+    start_supervised!({DB, path: path, name: legacy_db})
+
+    assert :ok = apply(legacy_schema, :ensure_all, [legacy_db])
+
+    assert %{
+             workItem: %{
+               id: "wi_activation",
+               title: "Activation fixture",
+               ownerUserId: "work_owner",
+               state: "open"
+             },
+             assignments: assignments
+           } =
+             Tightbeam.WorkItems.__handle__(legacy_db, "work-item-get", %{
+               principal: {:user, "work_owner"},
+               params: %{work_item_id: "wi_activation"}
+             })
+
+    assert Enum.map(assignments, & &1.id) |> Enum.sort() == ["asg_actor", "asg_root"]
+
+    assert {:ok, [["coordination-fabric-v1-phase1-v5"]]} =
+             DB.query(legacy_db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok, [["aev_downgrade", "act_downgrade"]]} =
+             DB.query(
+               legacy_db,
+               "SELECT eventId,activationId FROM activation_events ORDER BY seq"
+             )
   end
 
   defp database(label) do
@@ -316,6 +354,32 @@ defmodule Tightbeam.ActivationsTest do
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Schema.ensure_all(db)
     db
+  end
+
+  defp compile_pre_activation_schema! do
+    source_path = Path.expand("../lib/tightbeam/schema.ex", __DIR__)
+
+    source =
+      source_path
+      |> File.read!()
+      |> String.replace("    Tightbeam.Activations,\n", "", global: false)
+
+    digest = :crypto.hash(:sha256, source) |> Base.encode16(case: :lower)
+
+    if digest != @pre_activation_schema_sha256 do
+      raise "pre-activation schema fixture drifted: expected #{@pre_activation_schema_sha256}, got #{digest}"
+    end
+
+    legacy_source =
+      String.replace(
+        source,
+        "defmodule Tightbeam.Schema do",
+        "defmodule Tightbeam.PreActivationSchemaFixture do",
+        global: false
+      )
+
+    Code.compile_string(legacy_source, "pre_activation_schema_fixture.ex")
+    Tightbeam.PreActivationSchemaFixture
   end
 
   defp seed_graph(db) do
