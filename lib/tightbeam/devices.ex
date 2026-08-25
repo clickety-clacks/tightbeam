@@ -81,63 +81,67 @@ defmodule Tightbeam.Devices do
           model: String.t() | nil
         }) :: pair_outcome()
   def pair(db \\ Tightbeam.DB, input) do
-    transaction!(db, fn txn ->
-      device_id = Map.fetch!(input, :device_id)
+    transaction!(db, fn txn -> pair_in_txn(txn, input) end)
+  end
 
-      case select_device(txn, "d.deviceId = ?1", [device_id]) do
-        [row] ->
-          case to_device(row) do
-            %{status: "denied"} ->
-              :denied
+  @doc false
+  @spec pair_in_txn(Txn.t(), map()) :: pair_outcome()
+  def pair_in_txn(%Txn{} = txn, input) do
+    device_id = Map.fetch!(input, :device_id)
 
-            %{status: "pending"} = device ->
-              {:pending, device}
+    case select_device(txn, "d.deviceId = ?1", [device_id]) do
+      [row] ->
+        case to_device(row) do
+          %{status: "denied"} ->
+            :denied
 
-            %{status: "allowlisted"} ->
-              updated_at = now()
+          %{status: "pending"} = device ->
+            {:pending, device}
 
-              Txn.q(txn, "UPDATE devices SET token = ?2 WHERE deviceId = ?1", [
-                device_id,
-                mint_token()
-              ])
+          %{status: "allowlisted"} ->
+            updated_at = now()
 
-              stamp_device_in_txn(txn, device_id, updated_at)
-
-              {:paired, must_get(txn, device_id)}
-          end
-
-        [] ->
-          claimed_name = Map.fetch!(input, :claimed_name)
-          user_id = slug_user_id(claimed_name)
-          first_ever? = Txn.q(txn, "SELECT COUNT(*) FROM users") == [[0]]
-          ensure_user(txn, user_id)
-          status = if first_ever?, do: "allowlisted", else: "pending"
-          token = if first_ever?, do: mint_token(), else: nil
-
-          Txn.q(
-            txn,
-            """
-              INSERT INTO devices
-                (deviceId, userId, claimedName, status, token, platform, model, createdAt)
-              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-            """,
-            [
+            Txn.q(txn, "UPDATE devices SET token = ?2 WHERE deviceId = ?1", [
               device_id,
-              user_id,
-              claimed_name,
-              status,
-              token,
-              Map.fetch!(input, :platform),
-              Map.fetch!(input, :model),
-              now()
-            ]
-          )
+              mint_token()
+            ])
 
-          device = must_get(txn, device_id)
-          stamp_device_in_txn(txn, device_id, device.created_at)
-          if first_ever?, do: {:paired, device}, else: {:pending, device}
-      end
-    end)
+            stamp_device_in_txn(txn, device_id, updated_at)
+
+            {:paired, must_get(txn, device_id)}
+        end
+
+      [] ->
+        claimed_name = Map.fetch!(input, :claimed_name)
+        user_id = slug_user_id(claimed_name)
+        first_ever? = Txn.q(txn, "SELECT COUNT(*) FROM users") == [[0]]
+        ensure_user_in_txn(txn, user_id)
+        status = if first_ever?, do: "allowlisted", else: "pending"
+        token = if first_ever?, do: mint_token(), else: nil
+
+        Txn.q(
+          txn,
+          """
+            INSERT INTO devices
+              (deviceId, userId, claimedName, status, token, platform, model, createdAt)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+          """,
+          [
+            device_id,
+            user_id,
+            claimed_name,
+            status,
+            token,
+            Map.fetch!(input, :platform),
+            Map.fetch!(input, :model),
+            now()
+          ]
+        )
+
+        device = must_get(txn, device_id)
+        stamp_device_in_txn(txn, device_id, device.created_at)
+        if first_ever?, do: {:paired, device}, else: {:pending, device}
+    end
   end
 
   @doc "Device by bearer token — ONLY if allowlisted (revoked/pending tokens never resolve)."
@@ -167,7 +171,7 @@ defmodule Tightbeam.Devices do
   def approve(db \\ Tightbeam.DB, device_id, user_id \\ nil) do
     transaction!(db, fn txn ->
       must_get(txn, device_id)
-      if user_id, do: ensure_user(txn, user_id)
+      if user_id, do: ensure_user_in_txn(txn, user_id)
 
       Txn.q(
         txn,
@@ -189,7 +193,7 @@ defmodule Tightbeam.Devices do
   def approve_with_firehose(db, device_id, user_id, call) do
     transaction!(db, fn txn ->
       must_get(txn, device_id)
-      if user_id, do: ensure_user(txn, user_id)
+      if user_id, do: ensure_user_in_txn(txn, user_id)
 
       Txn.q(
         txn,
@@ -286,7 +290,7 @@ defmodule Tightbeam.Devices do
   @spec add_user(db(), String.t(), boolean()) :: user()
   def add_user(db \\ Tightbeam.DB, user_id, is_admin) do
     transaction!(db, fn txn ->
-      insert_user(txn, user_id, is_admin)
+      insert_user_in_txn(txn, user_id, is_admin)
 
       must_get_user(txn, user_id)
     end)
@@ -295,7 +299,7 @@ defmodule Tightbeam.Devices do
   @doc false
   def add_user_with_firehose(db, user_id, is_admin, call) do
     transaction!(db, fn txn ->
-      insert_user(txn, user_id, is_admin)
+      insert_user_in_txn(txn, user_id, is_admin)
       user = StateResources.query_user(txn, user_id)
       Publisher.maybe_accepted_in_txn(txn, call, %{user: user})
       user
@@ -422,17 +426,19 @@ defmodule Tightbeam.Devices do
     }
   end
 
-  defp ensure_user(txn, user_id) do
+  @doc false
+  def ensure_user_in_txn(%Txn{} = txn, user_id) do
     case Txn.q(txn, "SELECT userId FROM users WHERE userId = ?1", [user_id]) do
       [] ->
-        insert_user(txn, user_id, false)
+        insert_user_in_txn(txn, user_id, false)
 
       [_] ->
         :ok
     end
   end
 
-  defp insert_user(txn, user_id, requested_admin) do
+  @doc false
+  def insert_user_in_txn(%Txn{} = txn, user_id, requested_admin) do
     created_at = now()
 
     Txn.q(
@@ -462,7 +468,8 @@ defmodule Tightbeam.Devices do
     %{user_id: user_id, is_admin: is_admin == 1, created_at: created_at}
   end
 
-  defp slug_user_id(claimed_name) do
+  @doc false
+  def slug_user_id(claimed_name) do
     case claimed_name
          |> String.downcase()
          |> String.replace(~r/[^a-z0-9]+/, "-")
