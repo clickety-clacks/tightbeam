@@ -1,21 +1,20 @@
 //! Read-only deployment status projection.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
 use super::fs::{DeploymentFs, FsError};
 use super::model::{
-    ActivationAuthority, AuditFactRecord, DeployAction, DeployStatus, DeploymentRootIdentity,
-    Digest, ExpectedActive, GenerationId, HostIdentity, NamespaceIdentity, Pointer,
-    RestartLoadable, RunningService, ServiceSetDigest, ServiceSetStatus, ServiceStatus,
+    ActivationAuthority, AuditFactRecord, AuditTransition, DeployAction, DeployStatus,
+    DeploymentRootIdentity, Digest, ExpectedActive, GenerationId, HostIdentity, NamespaceIdentity,
+    Pointer, RestartLoadable, RunningService, ServiceSetDigest, ServiceSetStatus, ServiceStatus,
     TransactionId, TransactionState, TransactionStatus,
 };
 
 pub fn default_root() -> PathBuf {
-    std::env::var_os("TIGHTBEAM_DEPLOY_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/opt/tightbeam"))
+    PathBuf::from("/opt/tightbeam")
 }
 
 pub fn run(json_output: bool) -> Result<(), String> {
@@ -55,8 +54,9 @@ pub fn read(root: &Path) -> Result<DeployStatus, FsError> {
         &intents,
         &root_identity,
         fs.host_identity(),
+        &fs,
     );
-    let audit_state_error = audit_conflict(active.as_ref(), &audit_records);
+    let audit_state_error = audit_conflict(&fs, active.as_ref(), &audit_records);
     let state_error = pointer_error
         .or(intent.error.clone())
         .or(audit_error)
@@ -176,6 +176,7 @@ pub(crate) fn parse_audit_records(records: &[Vec<u8>]) -> (Vec<AuditFactRecord>,
                     known.transaction_id == record.transaction_id
                         && known.state == record.state
                         && known.observed == record.observed
+                        && known.transition == record.transition
                 }) => {}
             Ok(record) => parsed.push(record),
             Err(error) => return (Vec::new(), Some(error)),
@@ -185,41 +186,115 @@ pub(crate) fn parse_audit_records(records: &[Vec<u8>]) -> (Vec<AuditFactRecord>,
 }
 
 pub(crate) fn audit_conflict(
+    fs: &DeploymentFs,
     active: Option<&Pointer>,
     records: &[AuditFactRecord],
 ) -> Option<String> {
-    for record in records {
+    let terminal = records.iter().filter(|record| {
         if !matches!(
             record.state,
             TransactionState::Activated | TransactionState::Restarted | TransactionState::Observed
         ) {
-            continue;
+            return false;
         }
-        let matches_active = match (&record.observed, active) {
-            (
-                NamespaceIdentity::Generation {
-                    generation,
-                    release,
-                },
-                Some(pointer),
-            ) => generation == &pointer.generation && release == &pointer.release,
-            _ => false,
+        true
+    });
+    let terminal = terminal.collect::<Vec<_>>();
+    let Some(active) = active else {
+        return terminal.first().map(|record| {
+            format!(
+                "durable activation history exists without active pointer (transaction {})",
+                record.transaction_id.as_str()
+            )
+        });
+    };
+    if terminal.is_empty() {
+        return None;
+    }
+    let mut predecessor = BTreeMap::<String, Option<String>>::new();
+    let mut successor = BTreeMap::<String, String>::new();
+    for record in terminal {
+        let Some(transition) = &record.transition else {
+            return Some(format!(
+                "audit fact has no succession link (transaction {})",
+                record.transaction_id.as_str()
+            ));
         };
-        if !matches_active {
-            return Some(if active.is_none() {
-                format!(
-                    "durable activation history exists without active pointer (transaction {})",
-                    record.transaction_id.as_str()
-                )
-            } else {
-                format!(
-                    "audit namespace fact conflicts with active pointer (transaction {})",
-                    record.transaction_id.as_str()
-                )
-            });
+        let NamespaceIdentity::Generation {
+            generation,
+            release,
+        } = &record.observed
+        else {
+            return Some(format!(
+                "audit fact has non-generation transition target (transaction {})",
+                record.transaction_id.as_str()
+            ));
+        };
+        if generation != &transition.target_generation {
+            return Some(format!(
+                "audit transition target disagrees with observed namespace (transaction {})",
+                record.transaction_id.as_str()
+            ));
+        }
+        let target = Pointer {
+            generation: generation.clone(),
+            release: release.clone(),
+        };
+        if let Err(error) = fs.validate_generation_target(&target) {
+            return Some(format!("audit transition target is invalid: {error}"));
+        }
+        match fs.generation_prior(generation) {
+            Ok(manifest_prior) if manifest_prior == transition.prior_generation => {}
+            Ok(_) => {
+                return Some(format!(
+                    "generation manifest prior_generation disagrees with audit transition: {}",
+                    generation
+                ));
+            }
+            Err(error) => return Some(format!("generation succession is invalid: {error}")),
+        }
+        let target_name = transition.target_generation.as_str().to_owned();
+        let prior_name = transition
+            .prior_generation
+            .as_ref()
+            .map(|generation| generation.as_str().to_owned());
+        if let Some(known) = predecessor.insert(target_name.clone(), prior_name.clone())
+            && known != prior_name
+        {
+            return Some(format!(
+                "audit transition has contradictory prior: {target_name}"
+            ));
+        }
+        if let Some(prior_name) = prior_name
+            && let Some(known) = successor.insert(prior_name.clone(), target_name.clone())
+            && known != target_name
+        {
+            return Some(format!(
+                "audit transition branches at generation: {prior_name}"
+            ));
         }
     }
-    None
+
+    let mut chain = BTreeSet::new();
+    let mut generation = active.generation.as_str().to_owned();
+    loop {
+        if !chain.insert(generation.clone()) {
+            return Some(format!(
+                "audit transition chain is cyclic at generation: {generation}"
+            ));
+        }
+        let Some(prior) = predecessor.get(&generation) else {
+            return Some(format!(
+                "audit transition chain has no link for generation: {generation}"
+            ));
+        };
+        let Some(prior) = prior else {
+            break;
+        };
+        generation = prior.clone();
+    }
+    (chain.len() != predecessor.len())
+        .then(|| "audit transition chain is disconnected from current active generation".to_owned())
 }
 
 fn parse_audit_record(record: &[u8]) -> Result<AuditFactRecord, String> {
@@ -280,10 +355,43 @@ fn parse_audit_record(record: &[u8]) -> Result<AuditFactRecord, String> {
             .and_then(Value::as_str)
             .ok_or_else(|| "audit fact has no factDigest".to_owned())?,
     )?;
+    let transition = match value.get("transition") {
+        None => None,
+        Some(transition) => {
+            let target_generation = GenerationId::new(
+                transition
+                    .get("targetGeneration")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "audit transition has no targetGeneration".to_owned())?,
+            )?;
+            let prior_generation = match transition.get("priorGeneration") {
+                Some(Value::Null) => None,
+                Some(Value::String(value)) => Some(GenerationId::new(value)?),
+                Some(_) => return Err("audit transition has invalid priorGeneration".to_owned()),
+                None => return Err("audit transition has no priorGeneration".to_owned()),
+            };
+            let unsigned = json!({
+                "transactionId": transaction_id.as_str(),
+                "state": state.as_str(),
+                "observed": observed_value,
+                "transition": transition,
+            });
+            let bytes = serde_json::to_vec(&unsigned)
+                .map_err(|error| format!("serialize audit transition: {error}"))?;
+            if Digest::from_bytes(&bytes) != fact_digest {
+                return Err("audit factDigest does not bind transition".to_owned());
+            }
+            Some(AuditTransition {
+                prior_generation,
+                target_generation,
+            })
+        }
+    };
     Ok(AuditFactRecord {
         transaction_id,
         state,
         observed,
+        transition,
         fact_digest,
     })
 }
@@ -305,6 +413,7 @@ fn assess_intent(
     records: &[Vec<u8>],
     root_identity: &DeploymentRootIdentity,
     host_identity: &HostIdentity,
+    fs: &DeploymentFs,
 ) -> IntentAssessment {
     if records.len() > 1 {
         return IntentAssessment {
@@ -353,6 +462,12 @@ fn assess_intent(
             };
         }
     };
+    if let Err(error) = fs.validate_generation_target(&target) {
+        return IntentAssessment {
+            state: IntentState::None,
+            error: Some(format!("activation intent target is invalid: {error}")),
+        };
+    }
     let authority = match parse_activation_authority(&value) {
         Ok(authority) => authority,
         Err(error) => {
@@ -665,6 +780,105 @@ mod tests {
         TempDir(path)
     }
 
+    fn succession_fixture(generations: &[(&str, Option<&str>)], active: &str) -> (TempDir, Digest) {
+        let directory = tempdir();
+        let payload = b"payload";
+        let payload_digest = Digest::from_bytes(payload);
+        let release_manifest = format!(
+            r#"{{"payload":[{{"path":"bin","type":"file","mode":420,"size":{},"sha256":"{}"}}]}}"#,
+            payload.len(),
+            payload_digest
+        );
+        let digest = Digest::from_bytes(release_manifest.as_bytes());
+        fs::create_dir_all(
+            directory
+                .0
+                .join(format!("releases/sha256-{digest}/tightbeam")),
+        )
+        .unwrap();
+        fs::write(
+            directory
+                .0
+                .join(format!("releases/sha256-{digest}/release-manifest.json")),
+            release_manifest,
+        )
+        .unwrap();
+        fs::write(
+            directory
+                .0
+                .join(format!("releases/sha256-{digest}/tightbeam/bin")),
+            payload,
+        )
+        .unwrap();
+        for (generation, prior) in generations {
+            let generation_root = directory.0.join(format!("generations/{generation}"));
+            fs::create_dir_all(&generation_root).unwrap();
+            fs::write(
+                generation_root.join("manifest.json"),
+                format!(
+                    r#"{{"prior_generation":{},"releaseDigest":"{digest}"}}"#,
+                    prior
+                        .map(|generation| format!("\"{generation}\""))
+                        .unwrap_or("null".to_owned())
+                ),
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(
+                format!("../../releases/sha256-{digest}/tightbeam"),
+                generation_root.join("root"),
+            )
+            .unwrap();
+        }
+        std::os::unix::fs::symlink(format!("generations/{active}"), directory.0.join("active"))
+            .unwrap();
+        (directory, digest)
+    }
+
+    fn transition_fact(
+        transaction: &str,
+        prior: Option<&str>,
+        target: &str,
+        release: &Digest,
+    ) -> (Digest, Vec<u8>) {
+        let observed = json!({
+            "kind": "generation",
+            "generation": target,
+            "releaseDigest": release.as_str(),
+        });
+        let transition = json!({
+            "priorGeneration": prior,
+            "targetGeneration": target,
+        });
+        let unsigned = json!({
+            "transactionId": transaction,
+            "state": "activated",
+            "observed": observed,
+            "transition": transition,
+        });
+        let fact_digest = Digest::from_bytes(&serde_json::to_vec(&unsigned).unwrap());
+        let fact = json!({
+            "transactionId": transaction,
+            "state": "activated",
+            "observed": unsigned["observed"].clone(),
+            "transition": unsigned["transition"].clone(),
+            "factDigest": fact_digest.as_str(),
+        });
+        (fact_digest, serde_json::to_vec(&fact).unwrap())
+    }
+
+    fn write_transition_fact(
+        directory: &TempDir,
+        transaction: &str,
+        prior: Option<&str>,
+        target: &str,
+        release: &Digest,
+    ) {
+        let (fact_digest, bytes) = transition_fact(transaction, prior, target, release);
+        let transaction_dir = directory.0.join(format!("audit/{transaction}"));
+        fs::create_dir_all(&transaction_dir).unwrap();
+        fs::write(transaction_dir.join(format!("{fact_digest}.json")), bytes).unwrap();
+    }
+
     #[test]
     fn status_reads_active_pointer_as_restart_loadable_truth() {
         let directory = tempdir();
@@ -697,9 +911,20 @@ mod tests {
             payload,
         )
         .unwrap();
+        fs::create_dir_all(directory.0.join("generations/g0")).unwrap();
+        fs::write(
+            directory.0.join("generations/g0/manifest.json"),
+            format!(r#"{{"prior_generation":null,"releaseDigest":"{digest}"}}"#),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            format!("../../releases/sha256-{digest}/tightbeam"),
+            directory.0.join("generations/g0/root"),
+        )
+        .unwrap();
         fs::write(
             directory.0.join("generations/g1/manifest.json"),
-            format!(r#"{{"releaseDigest":"{digest}"}}"#),
+            format!(r#"{{"prior_generation":"g0","releaseDigest":"{digest}"}}"#),
         )
         .unwrap();
         std::os::unix::fs::symlink(
@@ -716,21 +941,43 @@ mod tests {
         assert_eq!(status.transaction.as_str(), "committed-recovered");
         assert_eq!(status.audit, "none");
 
-        fs::create_dir_all(directory.0.join("audit/tx-old")).unwrap();
-        let fact_digest = Digest::from_bytes(b"old-fact");
-        fs::write(
-            directory.0.join("audit/tx-old/fact.json"),
-            format!(
-                r#"{{"transactionId":"tx-old","state":"activated","observed":{{"kind":"generation","generation":"g-other","releaseDigest":"{}"}},"factDigest":"{}"}}"#,
-                digest, fact_digest
-            ),
-        )
-        .unwrap();
-        let held = read(&directory.0).unwrap();
-        assert_eq!(held.transaction.as_str(), "indeterminate");
-        assert_eq!(held.audit, "contradictory");
-        assert_eq!(held.observation, "held");
-        assert!(held.gc_hold);
+        fs::create_dir_all(directory.0.join("audit/tx-1")).unwrap();
+        fs::create_dir_all(directory.0.join("audit/tx-2")).unwrap();
+        for (transaction, prior, target) in [("tx-1", None, "g0"), ("tx-2", Some("g0"), "g1")] {
+            let observed = json!({
+                "kind": "generation",
+                "generation": target,
+                "releaseDigest": digest,
+            });
+            let transition = json!({
+                "priorGeneration": prior,
+                "targetGeneration": target,
+            });
+            let unsigned = json!({
+                "transactionId": transaction,
+                "state": "activated",
+                "observed": observed,
+                "transition": transition,
+            });
+            let fact_digest = Digest::from_bytes(&serde_json::to_vec(&unsigned).unwrap());
+            let fact = json!({
+                "transactionId": transaction,
+                "state": "activated",
+                "observed": unsigned["observed"].clone(),
+                "transition": unsigned["transition"].clone(),
+                "factDigest": fact_digest.as_str(),
+            });
+            fs::write(
+                directory.0.join(format!("audit/{transaction}/fact.json")),
+                serde_json::to_vec(&fact).unwrap(),
+            )
+            .unwrap();
+        }
+        let status = read(&directory.0).unwrap();
+        assert_eq!(status.transaction.as_str(), "committed-recovered");
+        assert_eq!(status.audit, "complete");
+        assert_eq!(status.observation, "pending");
+        assert!(!status.gc_hold);
     }
 
     #[test]
@@ -786,6 +1033,74 @@ mod tests {
     }
 
     #[test]
+    fn status_holds_legacy_unlinked_multi_generation_audit_without_inferring_order() {
+        let (directory, digest) = succession_fixture(&[("g0", None), ("g1", Some("g0"))], "g1");
+        for (transaction, generation) in [("tx-0", "g0"), ("tx-1", "g1")] {
+            let fact = json!({
+                "transactionId": transaction,
+                "state": "activated",
+                "observed": {
+                    "kind": "generation",
+                    "generation": generation,
+                    "releaseDigest": digest.as_str(),
+                },
+                "factDigest": Digest::from_bytes(transaction.as_bytes()).as_str(),
+            });
+            let transaction_dir = directory.0.join(format!("audit/{transaction}"));
+            fs::create_dir_all(&transaction_dir).unwrap();
+            fs::write(
+                transaction_dir.join("legacy.json"),
+                serde_json::to_vec(&fact).unwrap(),
+            )
+            .unwrap();
+        }
+
+        let status = read(&directory.0).unwrap();
+        assert_eq!(status.audit, "contradictory");
+        assert_eq!(status.observation, "held");
+        assert!(status.gc_hold);
+        assert!(status.gc_hold_transactions[0].contains("no succession link"));
+    }
+
+    #[test]
+    fn status_holds_branching_succession_chain() {
+        let (directory, digest) = succession_fixture(
+            &[("g0", None), ("g1", Some("g0")), ("g2", Some("g0"))],
+            "g2",
+        );
+        write_transition_fact(&directory, "tx-0", None, "g0", &digest);
+        write_transition_fact(&directory, "tx-1", Some("g0"), "g1", &digest);
+        write_transition_fact(&directory, "tx-2", Some("g0"), "g2", &digest);
+
+        let status = read(&directory.0).unwrap();
+        assert_eq!(status.audit, "contradictory");
+        assert!(status.gc_hold_transactions[0].contains("branches at generation: g0"));
+    }
+
+    #[test]
+    fn status_holds_cyclic_succession_chain() {
+        let (directory, digest) =
+            succession_fixture(&[("g1", Some("g2")), ("g2", Some("g1"))], "g2");
+        write_transition_fact(&directory, "tx-1", Some("g2"), "g1", &digest);
+        write_transition_fact(&directory, "tx-2", Some("g1"), "g2", &digest);
+
+        let status = read(&directory.0).unwrap();
+        assert_eq!(status.audit, "contradictory");
+        assert!(status.gc_hold_transactions[0].contains("chain is cyclic at generation: g2"));
+    }
+
+    #[test]
+    fn status_holds_audit_link_that_contradicts_its_generation_manifest() {
+        let (directory, digest) = succession_fixture(&[("g0", None), ("g1", None)], "g1");
+        write_transition_fact(&directory, "tx-0", None, "g0", &digest);
+        write_transition_fact(&directory, "tx-1", Some("g0"), "g1", &digest);
+
+        let status = read(&directory.0).unwrap();
+        assert_eq!(status.audit, "contradictory");
+        assert!(status.gc_hold_transactions[0].contains("prior_generation disagrees"));
+    }
+
+    #[test]
     fn status_holds_unresolved_intent_during_gc_recovery() {
         let directory = tempdir();
         let deployment_fs = DeploymentFs::open(&directory.0).unwrap();
@@ -807,13 +1122,10 @@ mod tests {
         .unwrap();
 
         let status = read(&directory.0).unwrap();
-        assert_eq!(status.transaction.as_str(), "not-committed");
-        assert_eq!(status.next_authority, "resume-activation");
+        assert_eq!(status.transaction.as_str(), "indeterminate");
+        assert_eq!(status.next_authority, "adjudicate");
         assert!(status.gc_hold);
-        assert_eq!(
-            status.gc_hold_transactions,
-            vec!["unresolved activation intent"]
-        );
+        assert!(status.gc_hold_transactions[0].contains("target is invalid"));
 
         fs::create_dir_all(directory.0.join("audit/tx-old")).unwrap();
         fs::write(
@@ -925,16 +1237,25 @@ mod tests {
 
     #[test]
     fn duplicate_audit_facts_are_idempotent() {
-        let fact = br#"{"transactionId":"tx-1","state":"activated","observed":{"kind":"generation","generation":"g1","releaseDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"factDigest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}"#;
-        let mut second = fact.to_vec();
-        second.splice(
-            second.len() - 64 - 2..second.len() - 2,
-            b"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
-                .iter()
-                .copied(),
-        );
-        let (records, error) = parse_audit_records(&[fact.to_vec(), second]);
+        let release =
+            Digest::parse("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                .unwrap();
+        let (_, fact) = transition_fact("tx-1", Some("g0"), "g1", &release);
+        let (records, error) = parse_audit_records(&[fact.clone(), fact]);
         assert!(error.is_none());
         assert_eq!(records.len(), 1);
+    }
+
+    #[test]
+    fn audit_dedup_identity_includes_the_succession_link() {
+        let release =
+            Digest::parse("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                .unwrap();
+        let (_, first) = transition_fact("tx-1", Some("g0"), "g1", &release);
+        let (_, second) = transition_fact("tx-1", Some("g2"), "g1", &release);
+
+        let (records, error) = parse_audit_records(&[first, second]);
+        assert!(error.is_none());
+        assert_eq!(records.len(), 2);
     }
 }

@@ -53,8 +53,8 @@ impl DeployManager {
         };
         let audits = self.fs.read_audit()?;
         let (audit_records, audit_parse_error) = status::parse_audit_records(&audits);
-        let audit_error =
-            audit_parse_error.or_else(|| status::audit_conflict(observed.as_ref(), &audit_records));
+        let audit_error = audit_parse_error
+            .or_else(|| status::audit_conflict(&self.fs, observed.as_ref(), &audit_records));
         let class = match (
             pointer_error.as_deref(),
             intent_error.as_deref(),
@@ -89,6 +89,15 @@ impl DeployManager {
             (None, None, None, Some(_), None) => RecoveryClass::ActivationCommittedRecovered,
             (None, None, None, None, Some(_)) => RecoveryClass::ActivationIndeterminate,
         };
+        if pointer_error.is_none()
+            && intent_error.is_none()
+            && audit_error.is_none()
+            && class == RecoveryClass::ActivationCommittedRecovered
+            && let (Some(pointer), Some(intent)) = (&observed, &intent)
+            && pointer == &intent.target
+        {
+            self.append_recovered_commit(intent)?;
+        }
         let reason = pointer_error.or(intent_error).or(audit_error).or_else(|| {
             (class == RecoveryClass::ActivationIndeterminate)
                 .then(|| "active pointer and unresolved intent do not agree".to_owned())
@@ -99,6 +108,82 @@ impl DeployManager {
             intent,
             reason,
         })
+    }
+
+    // The filename derives from the exact transaction/state/namespace fact.
+    // Repeating recovery therefore publishes the same immutable bytes or refuses;
+    // it cannot create a second recovered-commit authority.
+    fn append_recovered_commit(&self, intent: &ActivationIntent) -> Result<(), FsError> {
+        let transaction = intent.transaction_id.as_str();
+        let observed = serde_json::json!({
+            "kind": "generation",
+            "generation": intent.target.generation.as_str(),
+            "releaseDigest": intent.target.release.as_str(),
+        });
+        let transition = serde_json::json!({
+            "priorGeneration": intent.prior.as_ref().map(|pointer| pointer.generation.as_str()),
+            "targetGeneration": intent.target.generation.as_str(),
+        });
+        let unsigned = serde_json::json!({
+            "transactionId": transaction,
+            "state": "activated",
+            "observed": observed,
+            "transition": transition,
+        });
+        let unsigned_bytes = serde_json::to_vec(&unsigned).map_err(|error| {
+            FsError::InvalidPointer(format!("serialize recovered commit fact: {error}"))
+        })?;
+        let fact_digest = model::Digest::from_bytes(&unsigned_bytes);
+        let fact = serde_json::json!({
+            "transactionId": transaction,
+            "state": "activated",
+            "observed": unsigned["observed"].clone(),
+            "transition": unsigned["transition"].clone(),
+            "factDigest": fact_digest.as_str(),
+        });
+        let bytes = serde_json::to_vec(&fact).map_err(|error| {
+            FsError::InvalidPointer(format!("serialize recovered commit fact: {error}"))
+        })?;
+        self.fs
+            .ensure_dir(&Path::new("audit").join(transaction), 0o755)?;
+        self.fs.publish_immutable(
+            &Path::new("audit")
+                .join(transaction)
+                .join(format!("{fact_digest}.json")),
+            &bytes,
+            0o444,
+        )?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn append_recovered_commit_with_fault(
+        &self,
+        intent: &ActivationIntent,
+        point: fs::FaultPoint,
+    ) -> Result<(), FsError> {
+        if point == fs::FaultPoint::AuditAppend {
+            return Err(FsError::InvalidPointer(format!(
+                "fault injected at {:?}",
+                point
+            )));
+        }
+        self.append_recovered_commit(intent)
+    }
+
+    pub(crate) fn gc_guard(&self) -> Result<(), FsError> {
+        let status = self.status()?;
+        if status.gc_hold {
+            return Err(FsError::InvalidPointer(format!(
+                "GC refused while deployment state is held: {}",
+                status
+                    .gc_hold_transactions
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or("unresolved deployment state")
+            )));
+        }
+        Ok(())
     }
 
     fn read_activation_intent(&self) -> Result<Option<ActivationIntent>, FsError> {
@@ -148,6 +233,11 @@ impl DeployManager {
         )
         .map_err(FsError::InvalidPointer)?;
         let target = parse_pointer(value.get("target"))?;
+        self.fs
+            .validate_generation_target(&target)
+            .map_err(|error| {
+                FsError::InvalidPointer(format!("activation intent target is invalid: {error}"))
+            })?;
         let prior = value
             .get("prior")
             .and_then(|value| (!value.is_null()).then_some(value));
@@ -356,7 +446,7 @@ mod tests {
         fs.ensure_dir(Path::new("generations/g1"), 0o755).unwrap();
         fs.publish_immutable(
             Path::new("generations/g1/manifest.json"),
-            format!(r#"{{"releaseDigest":"{release_digest}"}}"#).as_bytes(),
+            format!(r#"{{"prior_generation":null,"releaseDigest":"{release_digest}"}}"#).as_bytes(),
             0o444,
         )
         .unwrap();
@@ -381,7 +471,7 @@ mod tests {
                 &Path::new("generations")
                     .join(generation)
                     .join("manifest.json"),
-                format!(r#"{{"releaseDigest":"{release}"}}"#).as_bytes(),
+                format!(r#"{{"prior_generation":null,"releaseDigest":"{release}"}}"#).as_bytes(),
                 0o444,
             )
             .unwrap();
@@ -449,6 +539,36 @@ mod tests {
     }
 
     #[test]
+    fn recover_holds_an_unresolved_intent_with_an_invalid_target() {
+        let directory = tempdir();
+        let manager = DeployManager::open(&directory.0).unwrap();
+        let root_identity = manager.fs.root_identity_digest().unwrap();
+        let host_identity = manager.fs.host_identity().as_str().to_owned();
+        stdfs::create_dir_all(directory.0.join("intents")).unwrap();
+        stdfs::write(
+            directory.0.join("intents/tx-invalid-target.json"),
+            format!(
+                r#"{{"transactionId":"tx-invalid-target","action":"first-cutover","expectedActive":"virgin:{}","target":{{"generation":"missing","releaseDigest":"{}"}},"hostIdentity":"{}","deploymentRoot":"{}","serviceSetDigest":"{}"}}"#,
+                root_identity.as_str(),
+                model::Digest::from_bytes(b"missing-release"),
+                host_identity,
+                root_identity.as_str(),
+                model::Digest::from_bytes(b"service-set"),
+            ),
+        )
+        .unwrap();
+
+        let recovery = manager.recover().unwrap();
+        assert_eq!(recovery.class, RecoveryClass::ActivationIndeterminate);
+        assert!(
+            recovery
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("target is invalid"))
+        );
+    }
+
+    #[test]
     fn replace_active_reaches_same_filesystem_rail_before_pointer_mutation() {
         let directory = active_fixture();
         let manager = DeployManager::open(&directory.0).unwrap();
@@ -487,5 +607,111 @@ mod tests {
             Err(FsError::InvalidPointer(_))
         ));
         assert_eq!(manager.fs.read_active().unwrap(), Some(current));
+    }
+
+    #[test]
+    fn recover_appends_one_idempotent_commit_fact_for_a_target_pointer() {
+        let directory = active_fixture();
+        let manager = DeployManager::open(&directory.0).unwrap();
+        let current = manager.fs.read_active().unwrap().unwrap();
+        let root_identity = manager.fs.root_identity_digest().unwrap();
+        let host_identity = manager.fs.host_identity().as_str().to_owned();
+        let service_set = model::Digest::from_bytes(b"service-set");
+        manager.fs.ensure_dir(Path::new("intents"), 0o755).unwrap();
+        stdfs::write(
+            directory.0.join("intents/tx-recover.json"),
+            format!(
+                r#"{{"transactionId":"tx-recover","action":"activation","expectedActive":"virgin:{}","target":{{"generation":"{}","releaseDigest":"{}"}},"hostIdentity":"{}","deploymentRoot":"{}","serviceSetDigest":"{}"}}"#,
+                root_identity.as_str(),
+                current.generation,
+                current.release,
+                host_identity,
+                root_identity.as_str(),
+                service_set
+            ),
+        )
+        .unwrap();
+
+        let first = manager.recover().unwrap();
+        assert_eq!(first.class, RecoveryClass::ActivationCommittedRecovered);
+        assert_eq!(manager.fs.read_audit().unwrap().len(), 1);
+        let intent = manager.read_activation_intent().unwrap().unwrap();
+        assert!(matches!(
+            manager.append_recovered_commit_with_fault(&intent, fs::FaultPoint::AuditAppend),
+            Err(FsError::InvalidPointer(reason)) if reason.contains("fault injected")
+        ));
+        assert_eq!(manager.fs.read_audit().unwrap().len(), 1);
+        let second = manager.recover().unwrap();
+        assert_eq!(second.class, RecoveryClass::ActivationCommittedRecovered);
+        assert_eq!(manager.fs.read_audit().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn deterministic_barrier_faults_keep_pointer_states_explicit() {
+        let directory = active_fixture();
+        let manager = DeployManager::open(&directory.0).unwrap();
+        let current = manager.fs.read_active().unwrap().unwrap();
+        add_generation(&manager, "g2", &current.release);
+
+        for point in [
+            fs::FaultPoint::TargetGenerationFsync,
+            fs::FaultPoint::IntentFsync,
+        ] {
+            assert!(
+                manager
+                    .fs
+                    .publish_immutable_with_fault(
+                        Path::new("intents/fault.json"),
+                        b"{}",
+                        0o444,
+                        point
+                    )
+                    .is_err()
+            );
+        }
+        assert!(matches!(
+            manager.fs.replace_relative_symlink_with_fault(
+                Path::new("active"),
+                Path::new("generations/g2"),
+                fs::FaultPoint::ActiveRename,
+            ),
+            Err(FsError::InvalidPointer(reason)) if reason.contains("fault injected")
+        ));
+        assert_eq!(manager.fs.read_active().unwrap(), Some(current.clone()));
+        assert!(matches!(
+            manager.fs.replace_relative_symlink_with_fault(
+                Path::new("active"),
+                Path::new("generations/g2"),
+                fs::FaultPoint::RootFsync,
+            ),
+            Err(FsError::InvalidPointer(reason)) if reason.contains("fault injected")
+        ));
+        assert_eq!(
+            manager
+                .fs
+                .read_active()
+                .unwrap()
+                .unwrap()
+                .generation
+                .as_str(),
+            "g2"
+        );
+        assert!(matches!(
+            manager.fs.read_active_with_fault(fs::FaultPoint::ActiveReread),
+            Err(FsError::InvalidPointer(reason)) if reason.contains("fault injected")
+        ));
+    }
+
+    #[test]
+    fn gc_guard_refuses_before_deletion_when_recovery_has_an_unresolved_intent() {
+        let directory = tempdir();
+        let manager = DeployManager::open(&directory.0).unwrap();
+        manager.fs.ensure_dir(Path::new("intents"), 0o755).unwrap();
+        stdfs::write(directory.0.join("intents/tx.json"), b"{}\n").unwrap();
+        assert!(matches!(
+            manager.gc_guard(),
+            Err(FsError::InvalidPointer(reason)) if reason.contains("GC refused")
+        ));
+        assert!(directory.0.join("intents/tx.json").exists());
     }
 }

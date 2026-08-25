@@ -288,7 +288,14 @@ pub struct AuditFactRecord {
     pub transaction_id: TransactionId,
     pub state: TransactionState,
     pub observed: NamespaceIdentity,
+    pub transition: Option<AuditTransition>,
     pub fact_digest: Digest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditTransition {
+    pub prior_generation: Option<GenerationId>,
+    pub target_generation: GenerationId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

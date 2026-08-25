@@ -17,6 +17,17 @@ use super::model::{DeploymentRootIdentity, Digest, GenerationId, HostIdentity, P
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FaultPoint {
+    TargetGenerationFsync,
+    IntentFsync,
+    ActiveRename,
+    RootFsync,
+    ActiveReread,
+    AuditAppend,
+}
+
 #[derive(Debug)]
 pub enum FsError {
     Io {
@@ -723,6 +734,26 @@ impl DeploymentFs {
         Ok(Digest::from_bytes(bytes))
     }
 
+    #[cfg(test)]
+    pub(crate) fn publish_immutable_with_fault(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+        mode: u32,
+        point: FaultPoint,
+    ) -> Result<Digest, FsError> {
+        if matches!(
+            point,
+            FaultPoint::TargetGenerationFsync | FaultPoint::IntentFsync
+        ) {
+            return Err(FsError::InvalidPointer(format!(
+                "fault injected at {:?}",
+                point
+            )));
+        }
+        self.publish_immutable(path, bytes, mode)
+    }
+
     pub(crate) fn replace_relative_symlink(
         &self,
         path: &Path,
@@ -785,6 +816,43 @@ impl DeploymentFs {
         Ok(Some(self.read_generation(&generation)?))
     }
 
+    #[cfg(test)]
+    pub(crate) fn read_active_with_fault(
+        &self,
+        point: FaultPoint,
+    ) -> Result<Option<Pointer>, FsError> {
+        if point == FaultPoint::ActiveReread {
+            return Err(FsError::InvalidPointer(format!(
+                "fault injected at {:?}",
+                point
+            )));
+        }
+        self.read_active()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_relative_symlink_with_fault(
+        &self,
+        path: &Path,
+        target: &Path,
+        point: FaultPoint,
+    ) -> Result<(), FsError> {
+        if point == FaultPoint::ActiveRename {
+            return Err(FsError::InvalidPointer(format!(
+                "fault injected at {:?}",
+                point
+            )));
+        }
+        self.replace_relative_symlink(path, target)?;
+        if point == FaultPoint::RootFsync {
+            return Err(FsError::InvalidPointer(format!(
+                "fault injected at {:?}",
+                point
+            )));
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate_generation_target(&self, target: &Pointer) -> Result<(), FsError> {
         let observed = self.read_generation(&target.generation)?;
         if observed.release != target.release {
@@ -794,6 +862,35 @@ impl DeploymentFs {
             )));
         }
         Ok(())
+    }
+
+    pub(crate) fn generation_prior(
+        &self,
+        generation: &GenerationId,
+    ) -> Result<Option<GenerationId>, FsError> {
+        let manifest_path = Path::new("generations")
+            .join(generation.as_str())
+            .join("manifest.json");
+        let generations = open_dir_at(self.root_fd.as_raw_fd(), "generations")?;
+        let generation_dir = open_dir_at(generations.as_raw_fd(), generation.as_str())?;
+        let manifest = read_at(generation_dir.as_raw_fd(), "manifest.json", &manifest_path)?;
+        let value: serde_json::Value = serde_json::from_slice(&manifest).map_err(|error| {
+            FsError::InvalidPointer(format!("invalid generation manifest: {error}"))
+        })?;
+        match value.get("prior_generation") {
+            Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(value)) => GenerationId::new(value)
+                .map(Some)
+                .map_err(FsError::InvalidPointer),
+            Some(_) => Err(FsError::InvalidPointer(format!(
+                "generation manifest has invalid prior_generation: {}",
+                generation
+            ))),
+            None => Err(FsError::InvalidPointer(format!(
+                "generation manifest has no prior_generation: {}",
+                generation
+            ))),
+        }
     }
 
     fn read_generation(&self, generation: &GenerationId) -> Result<Pointer, FsError> {
@@ -949,7 +1046,14 @@ fn host_identity_path(_root: &Path) -> PathBuf {
 }
 
 fn read_host_identity(path: &Path) -> Result<HostIdentity, FsError> {
-    let metadata = fs::metadata(path).map_err(|error| io("stat host identity", path, error))?;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| io("open host identity without following links", path, error))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| io("stat host identity descriptor", path, error))?;
     if !metadata.is_file() || metadata.permissions().mode() & 0o7777 != 0o400 {
         return Err(FsError::InvalidPointer(format!(
             "host identity must be a regular root-owned mode-0400 file: {}",
@@ -963,7 +1067,9 @@ fn read_host_identity(path: &Path) -> Result<HostIdentity, FsError> {
             path.display()
         )));
     }
-    let bytes = fs::read(path).map_err(|error| io("read host identity", path, error))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| io("read host identity", path, error))?;
     if bytes.len() != 32 {
         return Err(FsError::InvalidPointer(
             "host identity must contain exactly 32 bytes".to_owned(),
@@ -1253,6 +1359,18 @@ mod tests {
         assert!(matches!(
             DeploymentFs::open(&directory.0),
             Err(FsError::InvalidPointer(reason)) if reason.contains("exactly 32 bytes")
+        ));
+    }
+
+    #[test]
+    fn host_identity_reader_rejects_a_symlink_even_when_its_target_is_valid() {
+        let (directory, _fs) = fixture();
+        let real = directory.0.join("real-host-id");
+        fs::rename(directory.0.join("deploy-host-id"), &real).unwrap();
+        std::os::unix::fs::symlink(&real, directory.0.join("deploy-host-id")).unwrap();
+        assert!(matches!(
+            DeploymentFs::open(&directory.0),
+            Err(FsError::Io { source, .. }) if source.raw_os_error() == Some(libc::ELOOP)
         ));
     }
 
