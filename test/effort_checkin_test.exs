@@ -51,28 +51,42 @@ defmodule Tightbeam.EffortCheckinTest do
 
     assert request_id == request.id
 
+    privacy_generations = generation_count(ctx.db, request.assignment_id)
+
     for {principal, origin} <- [
           {{:process, "ci"}, "process:ci"},
           {{:role, "owner"}, "role:owner"},
           {nil, "anonymous"}
-        ] do
+        ],
+        action <- ["continue", "invalid-action"] do
       call = %{origin: origin, principal: principal, params: %{}}
       assert Escalation.get(ctx.db, call, request.id) == nil
 
-      assert %{code: "not_found", message: hidden} =
+      assert %{code: "not_found"} =
+               hidden =
                EffortCheckin.rule(ctx.db, ctx.config, %{
                  call
-                 | params: %{request_id: request.id, action: "continue"}
+                 | params: %{request_id: request.id, action: action}
                })
 
-      assert %{code: "not_found", message: absent} =
+      assert %{code: "not_found"} =
+               absent =
                EffortCheckin.rule(ctx.db, ctx.config, %{
                  call
-                 | params: %{request_id: "dr_absent", action: "continue"}
+                 | params: %{request_id: "dr_absent", action: action}
                })
 
       assert hidden == absent
     end
+
+    assert generation_count(ctx.db, request.assignment_id) == privacy_generations
+    assert %{status: "open", ruled_by: nil} = Escalation.raw_by_id(ctx.db, request.id)
+
+    assert %{code: "invalid_action"} =
+             effort_rule(ctx, {:session, "observer"}, request.id, "invalid-action")
+
+    assert %{code: "not_found"} =
+             effort_rule(ctx, {:session, "observer"}, "dr_absent", "invalid-action")
 
     generations_before = generation_count(ctx.db, request.assignment_id)
     events_before = lifecycle_count(ctx.db, request.id)
@@ -110,13 +124,25 @@ defmodule Tightbeam.EffortCheckinTest do
     session(ctx.db, "observer", "h2", Placement.local_host_name())
     human_request = open_effort_request(ctx, {:user, "h1"}, "continue")
 
-    assert %{code: "not_authorized", message: hidden} =
-             effort_rule(ctx, {:user, "h2"}, human_request.id, "continue")
+    human_generations = generation_count(ctx.db, human_request.assignment_id)
 
-    assert %{code: "not_authorized", message: absent} =
-             effort_rule(ctx, {:user, "h2"}, "dr_absent", "continue")
+    for action <- ["continue", "invalid-action"] do
+      assert %{code: "not_authorized"} =
+               hidden =
+               effort_rule(ctx, {:user, "h2"}, human_request.id, action)
 
-    assert hidden == absent
+      assert %{code: "not_authorized"} =
+               absent =
+               effort_rule(ctx, {:user, "h2"}, "dr_absent", action)
+
+      assert hidden == absent
+    end
+
+    assert generation_count(ctx.db, human_request.assignment_id) == human_generations
+    assert %{status: "open", ruled_by: nil} = Escalation.raw_by_id(ctx.db, human_request.id)
+
+    assert %{code: "invalid_action"} =
+             effort_rule(ctx, {:user, "h1"}, human_request.id, "invalid-action")
 
     assert %{status: "ruled", ruled_by: "user:h1"} =
              effort_rule(ctx, {:user, "h1"}, human_request.id, "continue")

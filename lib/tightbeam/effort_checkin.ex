@@ -327,14 +327,11 @@ defmodule Tightbeam.EffortCheckin do
   def rule(db, config, call) do
     request_id = call.params[:request_id] || call.params[:request]
     action = call.params[:action]
-    request = visible_response_request(db, call, request_id)
+    {request, standing_error} = response_standing(db, call, request_id)
 
     cond do
-      is_nil(request) and match?({:user, _user_id}, call.principal) ->
-        error("not_authorized", "current expecter required")
-
-      is_nil(request) ->
-        error("not_found", "decision request not found")
+      standing_error ->
+        standing_error
 
       request.kind != "effort" ->
         error("invalid", "effort-rule requires an effort request")
@@ -1403,10 +1400,15 @@ defmodule Tightbeam.EffortCheckin do
 
   defp request_row(db, id), do: Escalation.raw_by_id(db, id)
 
-  defp visible_response_request(db, call, id) do
+  # Standing is classified before any request-dependent validation. A caller
+  # that cannot see the row receives an envelope determined only by its
+  # principal class, never by row existence, action, or hidden row fields.
+  defp response_standing(db, call, id) do
     case {request_row(db, id), call.principal} do
-      {%{kind: "effort"} = request, {kind, _id}} when kind in [:session, :user] ->
-        request
+      {%{kind: "effort"} = request, principal} ->
+        if authorized?(principal, request),
+          do: {request, nil},
+          else: {nil, hidden_response(principal)}
 
       {request, _principal} when is_map(request) ->
         owner_user_id =
@@ -1425,13 +1427,18 @@ defmodule Tightbeam.EffortCheckin do
           end
 
         if Escalation.get(db, call, id, owner_user_id: owner_user_id),
-          do: request,
-          else: nil
+          do: {request, nil},
+          else: {nil, hidden_response(call.principal)}
 
-      {nil, _principal} ->
-        nil
+      {nil, principal} ->
+        {nil, hidden_response(principal)}
     end
   end
+
+  defp hidden_response({:user, _user_id}),
+    do: error("not_authorized", "current expecter required")
+
+  defp hidden_response(_principal), do: error("not_found", "decision request not found")
 
   defp mark_wake_fired(txn, wake_id) do
     Txn.q(

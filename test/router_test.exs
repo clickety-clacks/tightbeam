@@ -1088,10 +1088,11 @@ defmodule Tightbeam.Wire.RouterTest do
         """
         INSERT INTO decision_requests
           (id, kind, raiserId, ownerUserId, assignmentId, expecterSessionKey,
+           expecterUserId,
            lineageRung, effortGeneration, deadlineWakeId, raisedAt, deadlineAt,
            question, options, context, status)
         VALUES ('dr_hidden_effort', 'effort', 'process:tightbeam', 'flynn',
-                'asg_hidden', 'expected-session', 1, 1, 'w_hidden', 1, 2,
+                'asg_hidden', NULL, 'flynn', 1, 1, 'w_hidden', 1, 2,
                 'Continue or dismiss?', '["continue","dismiss"]', '{}', 'open')
         """
       )
@@ -1101,49 +1102,68 @@ defmodule Tightbeam.Wire.RouterTest do
         EffortCheckin.rule(ctx.db, %{}, call)
       end)
 
-    responses =
-      for request <- ["dr_hidden_effort", "dr_absent"] do
-        dispatch_cli(%{ctx | opts: opts}, "tbc_test", %{
-          verb: "effort-rule",
-          asProcess: "ci",
-          params: %{request: request, action: "continue"}
-        })
-      end
+    observer = create_session(ctx.db, "effort-observer", "flynn")
+    Roles.create!(ctx.db, "effort-role", "flynn", observer.session_key)
 
-    assert Enum.map(responses, & &1.status) == [404, 404]
+    for {bearer, identity, status, code} <- [
+          {"tbc_test", %{asProcess: "ci"}, 404, "not_found"},
+          {"tbc_test", %{as: "effort-role"}, 404, "not_found"},
+          {"tbc_test", %{}, 400, "invalid_message"},
+          {"tbc_test", %{asUser: "other"}, 403, "not_authorized"}
+        ],
+        action <- ["continue", "invalid-action"] do
+      responses =
+        for request <- ["dr_hidden_effort", "dr_absent"] do
+          dispatch_cli(
+            %{ctx | opts: opts},
+            bearer,
+            %{
+              verb: "effort-rule",
+              params: %{request: request, action: action}
+            }
+            |> Map.merge(identity)
+          )
+        end
 
-    assert responses
-           |> Enum.map(&JSON.decode!(&1.resp_body))
-           |> Enum.uniq() == [
-             %{
-               "error" => %{
-                 "code" => "not_found",
-                 "message" => "decision request not found"
-               }
-             }
-           ]
+      assert Enum.map(responses, & &1.status) == [status, status],
+             inspect({identity, action, Enum.map(responses, & &1.resp_body)})
 
-    user_responses =
-      for request <- ["dr_hidden_effort", "dr_absent"] do
-        dispatch_cli(%{ctx | opts: opts}, "tbc_test", %{
-          verb: "effort-rule",
-          asUser: "flynn",
-          params: %{request: request, action: "continue"}
-        })
-      end
+      assert responses
+             |> Enum.map(&JSON.decode!(&1.resp_body))
+             |> Enum.uniq()
+             |> hd()
+             |> get_in(["error", "code"]) == code
 
-    assert Enum.map(user_responses, & &1.status) == [403, 403]
+      assert responses
+             |> Enum.map(&JSON.decode!(&1.resp_body))
+             |> Enum.uniq()
+             |> length() == 1
+    end
 
-    assert user_responses
-           |> Enum.map(&JSON.decode!(&1.resp_body))
-           |> Enum.uniq() == [
-             %{
-               "error" => %{
-                 "code" => "not_authorized",
-                 "message" => "current expecter required"
-               }
-             }
-           ]
+    for {bearer, identity} <- [
+          {observer.cli_token, %{}},
+          {"tbc_test", %{asUser: "flynn"}}
+        ] do
+      response =
+        dispatch_cli(
+          %{ctx | opts: opts},
+          bearer,
+          %{
+            verb: "effort-rule",
+            params: %{request: "dr_hidden_effort", action: "invalid-action"}
+          }
+          |> Map.merge(identity)
+        )
+
+      assert response.status == 400
+      assert get_in(JSON.decode!(response.resp_body), ["error", "code"]) == "invalid_action"
+    end
+
+    assert {:ok, [["open", nil]]} =
+             DB.query(
+               ctx.db,
+               "SELECT status,ruledBy FROM decision_requests WHERE id='dr_hidden_effort'"
+             )
   end
 
   test "org CLI reserves process:tightbeam while other process origins still attribute", ctx do
