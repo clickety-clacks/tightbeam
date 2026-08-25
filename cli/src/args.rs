@@ -879,7 +879,8 @@ COMMANDS:
          [--release-fact-kind <kind> --release-fact-scope <scope>
           --release-fact-principal-ref <principal>]
       File against an assignment. Verdicts on review cards require the review
-      holder; producer-card verdicts may be filed by any session or user.
+      holder; producer-card verdicts may be filed by any session or user. A
+      surrender requires --note and uses the session's implicit identity.
       cannot-proceed requires a non-empty --note, keeps the card open, and
       accepts the three release-fact flags only as one complete tuple.
   attests <assignmentId> [--after <attestId>] [--limit <n>]
@@ -2573,6 +2574,12 @@ fn parse_with_optional_catalog(
             let note = nonempty(flags, "note");
             if kind == "cannot-proceed" && note.is_none() {
                 return Err("--note is required when --kind is cannot-proceed".to_owned());
+            }
+            if kind == "surrender" && note.is_none() {
+                return Err("--note is required when --kind is surrender".to_owned());
+            }
+            if kind == "surrender" && commit_refs.is_some() {
+                return Err("--commit-refs is not valid when --kind is surrender".to_owned());
             }
             Ok(Command::Attest {
                 identity: identity(flags)?,
@@ -4815,6 +4822,23 @@ mod tests {
                 "flynn",
             ])),
             Err("--verdict is only valid when --kind is verdict".to_owned())
+        );
+        assert_eq!(
+            parse(strings(&["attest", "asg_1", "--kind", "surrender"])),
+            Err("--note is required when --kind is surrender".to_owned())
+        );
+        assert_eq!(
+            parse(strings(&[
+                "attest",
+                "asg_1",
+                "--kind",
+                "surrender",
+                "--note",
+                "done",
+                "--commit-refs",
+                "[]",
+            ])),
+            Err("--commit-refs is not valid when --kind is surrender".to_owned())
         );
     }
 
