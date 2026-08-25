@@ -32,7 +32,7 @@ defmodule Tightbeam.Credentials do
   @ssh_opts ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
   @fixture_provider? Application.compile_env(:tightbeam, :fixture_harness, false)
 
-  @type provider :: :openai | :anthropic | :opencode_go | :fixture_provider
+  @type provider :: :openai | :anthropic | :opencode_go | :local_openai | :fixture_provider
   @type kind :: :api_key | :subscription
   @type status :: :onboarded | {:needs_onboarding, term()}
 
@@ -152,6 +152,7 @@ defmodule Tightbeam.Credentials do
         :openai -> Path.join([base_dir, "auth", "codex", "auth.json"])
         :anthropic -> Path.join([base_dir, "auth", "claude", ".credentials.json"])
         :opencode_go -> Path.join([base_dir, "auth", "pi", "auth.json"])
+        :local_openai -> Path.join([base_dir, "auth", "pi-local", "local-openai.json"])
         :fixture_provider -> Path.join([base_dir, "auth", "fixture", "fixture.json"])
       end
 
@@ -264,6 +265,37 @@ defmodule Tightbeam.Credentials do
   # and `pi auth check --provider opencode-go` accepts this exact API-key shape.
   # A missing or differently typed key cannot authenticate, so refuse it at the
   # write seam rather than banking a file that Pi will later report as absent.
+  defp deep_hollow(:local_openai, bytes) do
+    case JSON.decode(bytes) do
+      {:ok, %{"local-openai" => %{"endpoint" => endpoint} = record}} when is_binary(endpoint) ->
+        trimmed = String.trim(endpoint)
+
+        cond do
+          trimmed == "" ->
+            "local-openai.endpoint is empty"
+
+          not String.starts_with?(trimmed, "http://") and
+              not String.starts_with?(trimmed, "https://") ->
+            "local-openai.endpoint must be an http(s) URL"
+
+          Map.has_key?(record, "apiKey") and blank_token?(Map.get(record, "apiKey")) ->
+            "local-openai.apiKey is present but empty"
+
+          true ->
+            nil
+        end
+
+      {:ok, %{"local-openai" => _other}} ->
+        "local-openai is present but has no endpoint"
+
+      {:ok, _other} ->
+        "the local-openai store has no local-openai record"
+
+      {:error, _reason} ->
+        "the local-openai store is not valid JSON"
+    end
+  end
+
   defp deep_hollow(:opencode_go, bytes) do
     case JSON.decode(bytes) do
       {:ok, %{"opencode-go" => %{"type" => "api_key", "key" => key}}}
@@ -290,6 +322,7 @@ defmodule Tightbeam.Credentials do
   defp deep_hollow(_provider, _bytes), do: nil
 
   defp provider_cli_name(:opencode_go), do: "opencode-go"
+  defp provider_cli_name(:local_openai), do: "local-openai"
   defp provider_cli_name(provider), do: Atom.to_string(provider)
 
   # Each answer names the FIELD, not just "invalid": the operator reading this has a file in
@@ -750,6 +783,13 @@ defmodule Tightbeam.Credentials do
   defp expired?(expires_at, now) when is_integer(expires_at), do: expires_at <= now
   defp expired?(_unknown, _now), do: false
 
+  defp credential_present?(state, :local_openai) do
+    case read_local_openai_store(state) do
+      {:ok, bytes} -> hollow(:local_openai, bytes) == nil
+      _ -> false
+    end
+  end
+
   defp credential_present?(state, provider) do
     target = credential_target(state)
 
@@ -761,6 +801,19 @@ defmodule Tightbeam.Credentials do
         Homes.home_path(state.base_dir, state.machine, module.id())
       )
     end)
+  end
+
+  defp read_local_openai_store(%{ssh: nil} = state) do
+    File.read(credential_store_path(state, :local_openai))
+  end
+
+  defp read_local_openai_store(state) do
+    path = credential_store_path(state, :local_openai)
+
+    case remote_command(state, ["cat", path]) do
+      {output, 0} -> {:ok, output}
+      _ -> :error
+    end
   end
 
   # The hollow check returns rather than raises here: both callers thread
@@ -790,6 +843,13 @@ defmodule Tightbeam.Credentials do
     with :ok <- refuse_hollow(:opencode_go, credential.bytes, "the onboarding ceremony") do
       atomic_write!(credential_store_path(state, :opencode_go), credential.bytes)
       reconcile_provider_homes(state, :opencode_go)
+      :ok
+    end
+  end
+
+  defp write_credential!(state, :local_openai, credential) do
+    with :ok <- refuse_hollow(:local_openai, credential.bytes, "the onboarding ceremony") do
+      atomic_write!(credential_store_path(state, :local_openai), credential.bytes)
       :ok
     end
   end
@@ -1198,12 +1258,16 @@ defmodule Tightbeam.Credentials do
   defp credential_store_path(state, :opencode_go),
     do: Path.join([state.base_dir, "auth", "pi", "auth.json"])
 
+  defp credential_store_path(state, :local_openai),
+    do: Path.join([state.base_dir, "auth", "pi-local", "local-openai.json"])
+
   defp credential_store_path(state, :fixture_provider),
     do: Path.join([state.base_dir, "auth", "fixture", "fixture.json"])
 
   defp harness_name(:openai), do: "codex"
   defp harness_name(:anthropic), do: "claude"
   defp harness_name(:opencode_go), do: "pi"
+  defp harness_name(:local_openai), do: "pi-local"
   defp harness_name(:fixture_provider), do: "fixture"
 
   defp atomic_write!(path, bytes) do
@@ -1269,6 +1333,13 @@ defmodule Tightbeam.Credentials do
     end
   end
 
+  defp staged_credential(:local_openai, kind, path) do
+    case File.read(Path.join(path, "local-openai.json")) do
+      {:ok, bytes} -> {:ok, Map.put(installed_metadata(:local_openai, kind), :bytes, bytes)}
+      {:error, reason} -> {:error, {:local_openai_failed, reason}}
+    end
+  end
+
   defp staged_credential(:fixture_provider, kind, path) do
     case File.read(Path.join(path, "fixture.json")) do
       {:ok, bytes} -> {:ok, Map.put(installed_metadata(:fixture_provider, kind), :bytes, bytes)}
@@ -1321,6 +1392,7 @@ defmodule Tightbeam.Credentials do
   defp staged_path(:openai, path), do: Path.join(path, "auth.json")
   defp staged_path(:anthropic, path), do: Path.join(path, ".credentials.json")
   defp staged_path(:opencode_go, path), do: Path.join(path, "auth.json")
+  defp staged_path(:local_openai, path), do: Path.join(path, "local-openai.json")
   defp staged_path(:fixture_provider, path), do: Path.join(path, "fixture.json")
 
   defp onboarding_staging_path(%{ssh: nil}, provider) do

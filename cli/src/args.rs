@@ -325,6 +325,7 @@ pub enum Command {
         identity: Identity,
         provider: String,
         api_key: bool,
+        endpoint: Option<String>,
         hostname: Option<String>,
         remote: Option<String>,
     },
@@ -652,6 +653,11 @@ COMMANDS:
       Bank an OpenCode Go API key for Pi. The key is read from stdin, validated
       by one live Pi-shaped model request, and stored in Pi's native auth.json
       form. OpenCode Go has no subscription onboarding path here.
+  onboard local-openai --endpoint URL [--api-key]
+      Bank a host-scoped local OpenAI-compatible provider. The endpoint base URL
+      is required. An API key is optional and, when present, is read from stdin
+      -- never as an argument. The endpoint is live-probed with GET /v1/models
+      before anything is banked.
   onboard github [--hostname github.com] [--remote URL]
       Prove or create this host's GitHub CLI browser/device login, then stamp
       non-secret capability metadata. The credential is banked file-backed
@@ -2167,19 +2173,25 @@ fn parse_identity_command(
 
 fn parse_onboard(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Command, String> {
     if parsed.positional.len() != 2 {
-        return Err("usage: tightbeam onboard <provider> [--api-key] [--hostname HOST]".to_owned());
+        return Err(
+            "usage: tightbeam onboard <provider> [--endpoint URL] [--api-key] [--hostname HOST]"
+                .to_owned(),
+        );
     }
     let provider = parsed.positional[1].clone();
     let fixture_provider = cfg!(test) && provider == "fixture-provider";
     if !matches!(
         provider.as_str(),
-        "openai" | "anthropic" | "opencode-go" | "github"
+        "openai" | "anthropic" | "opencode-go" | "local-openai" | "github"
     ) && !fixture_provider
     {
-        return Err("provider must be openai, anthropic, opencode-go, or github".to_owned());
+        return Err(
+            "provider must be openai, anthropic, opencode-go, local-openai, or github".to_owned(),
+        );
     }
     let allowed = [
         "api-key",
+        "endpoint",
         "hostname",
         "remote",
         "as",
@@ -2187,8 +2199,12 @@ fn parse_onboard(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Comm
         "as-process",
     ];
     if flags.keys().any(|flag| !allowed.contains(&flag.as_str())) {
-        return Err("usage: tightbeam onboard <provider> [--api-key] [--hostname HOST]".to_owned());
+        return Err(
+            "usage: tightbeam onboard <provider> [--endpoint URL] [--api-key] [--hostname HOST]"
+                .to_owned(),
+        );
     }
+    let endpoint = nonempty(flags, "endpoint");
     let hostname = nonempty(flags, "hostname");
     let remote = nonempty(flags, "remote");
     if provider == "github" && flags.contains_key("api-key") {
@@ -2202,6 +2218,18 @@ fn parse_onboard(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Comm
             "tightbeam onboard opencode-go requires --api-key; OpenCode Go has no subscription onboarding path"
                 .to_owned(),
         );
+    }
+    if provider == "local-openai" {
+        if endpoint.is_none() {
+            return Err("tightbeam onboard local-openai requires --endpoint URL".to_owned());
+        }
+        if hostname.is_some() || remote.is_some() {
+            return Err(
+                "tightbeam onboard local-openai does not accept --hostname or --remote".to_owned(),
+            );
+        }
+    } else if endpoint.is_some() {
+        return Err("--endpoint is only valid for tightbeam onboard local-openai".to_owned());
     }
     if provider == "github"
         && ["as", "as-user", "as-process"]
@@ -2225,6 +2253,7 @@ fn parse_onboard(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Comm
         // this process's argv, where anyone on the box can read it out of the
         // process table. The key arrives on stdin instead.
         api_key: flags.contains_key("api-key"),
+        endpoint,
         hostname,
         remote,
     })
@@ -2647,6 +2676,7 @@ mod tests {
                 identity: Identity::User("flynn".to_owned()),
                 provider: "fixture-provider".to_owned(),
                 api_key: false,
+                endpoint: None,
                 hostname: None,
                 remote: None,
             })
@@ -2666,6 +2696,7 @@ mod tests {
                 identity: Identity::Session,
                 provider: "github".to_owned(),
                 api_key: false,
+                endpoint: None,
                 hostname: Some("github.example".to_owned()),
                 remote: None,
             })
@@ -2681,6 +2712,7 @@ mod tests {
                 identity: Identity::Session,
                 provider: "github".to_owned(),
                 api_key: false,
+                endpoint: None,
                 hostname: None,
                 remote: Some("https://github.com/example/project.git".to_owned()),
             })
@@ -2719,6 +2751,7 @@ mod tests {
                 identity: Identity::User("flynn".to_owned()),
                 provider: "opencode-go".to_owned(),
                 api_key: true,
+                endpoint: None,
                 hostname: None,
                 remote: None,
             })
@@ -2729,6 +2762,41 @@ mod tests {
                 "tightbeam onboard opencode-go requires --api-key; OpenCode Go has no subscription onboarding path"
                     .to_owned()
             )
+        );
+    }
+
+    #[test]
+    fn local_openai_onboard_requires_endpoint() {
+        assert_eq!(
+            parse(strings(&[
+                "onboard",
+                "local-openai",
+                "--endpoint",
+                "https://spark.example/v1",
+                "--as-user",
+                "flynn"
+            ])),
+            Ok(Command::Onboard {
+                identity: Identity::User("flynn".to_owned()),
+                provider: "local-openai".to_owned(),
+                api_key: false,
+                endpoint: Some("https://spark.example/v1".to_owned()),
+                hostname: None,
+                remote: None,
+            })
+        );
+        assert_eq!(
+            parse(strings(&["onboard", "local-openai", "--as-user", "flynn"])),
+            Err("tightbeam onboard local-openai requires --endpoint URL".to_owned())
+        );
+        assert_eq!(
+            parse(strings(&[
+                "onboard",
+                "openai",
+                "--endpoint",
+                "https://x/v1"
+            ])),
+            Err("--endpoint is only valid for tightbeam onboard local-openai".to_owned())
         );
     }
 
@@ -2865,6 +2933,7 @@ mod tests {
             "identity apply (<session> | --all)",
             "onboard openai|anthropic [--api-key]",
             "onboard opencode-go --api-key",
+            "onboard local-openai --endpoint URL [--api-key]",
             "onboard github [--hostname github.com] [--remote URL]",
             "add-user <userId> [--admin]",
             "config get default-archetype|default-priority",
@@ -3956,6 +4025,7 @@ mod tests {
                     identity: Identity::User("flynn".to_owned()),
                     provider: "openai".to_owned(),
                     api_key: false,
+                    endpoint: None,
                     hostname: None,
                     remote: None,
                 },

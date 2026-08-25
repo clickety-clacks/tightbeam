@@ -55,7 +55,7 @@ defmodule Tightbeam.Org do
           created_at: integer()
         }
 
-  @provider_values "'anthropic','openai','opencode_go'" <>
+  @provider_values "'anthropic','openai','opencode_go','local_openai'" <>
                      if(Application.compile_env(:tightbeam, :fixture_harness, false),
                        do: ",'fixture_provider'",
                        else: ""

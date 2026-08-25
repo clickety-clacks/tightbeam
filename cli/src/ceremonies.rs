@@ -124,6 +124,7 @@ pub fn onboard<S, H>(
     identity: &Identity,
     provider: &str,
     api_key: bool,
+    local_endpoint: Option<&str>,
     endpoint: &Endpoint,
     send_request: S,
     load_harnesses: H,
@@ -132,7 +133,11 @@ where
     S: Fn(&Endpoint, &RequestSpec, Option<Instant>) -> Result<Option<serde_json::Value>, String>,
     H: Fn(&Endpoint, Instant) -> Result<Option<HarnessCatalog>, String>,
 {
-    let kind = if api_key { "apiKey" } else { "subscription" };
+    let kind = if provider == "local-openai" || api_key {
+        "apiKey"
+    } else {
+        "subscription"
+    };
     let machine = onboard_machine(
         std::env::var("TIGHTBEAM_MACHINE")
             .ok()
@@ -213,7 +218,18 @@ where
         }
     };
 
-    let staged: Result<(), StageFailure> = if api_key {
+    let staged: Result<(), StageFailure> = if provider == "local-openai" {
+        run_local_openai_onboarding(
+            staging,
+            local_endpoint.ok_or_else(|| {
+                "tightbeam onboard local-openai requires --endpoint URL".to_owned()
+            })?,
+            api_key,
+            machine.as_deref(),
+            &ceremony,
+        )
+        .map_err(StageFailure::from)
+    } else if api_key {
         run_api_key_onboarding(provider, staging, machine.as_deref(), &ceremony)
             .map_err(StageFailure::from)
     } else {
@@ -578,6 +594,132 @@ fn deliver(supervised: &mut Supervised, bytes: &[u8]) -> Result<(), RunError> {
     };
     nonblocking(pipe.as_raw_fd())?;
     supervised.write_all(pipe.as_raw_fd(), bytes)
+}
+
+fn run_local_openai_onboarding(
+    staging: &str,
+    endpoint: &str,
+    api_key: bool,
+    machine: Option<&str>,
+    ceremony: &Ceremony<'_>,
+) -> Result<(), String> {
+    let endpoint = normalize_local_openai_endpoint(endpoint)?;
+    let optional_key = if api_key {
+        Some(read_api_key("local-openai")?)
+    } else {
+        None
+    };
+    validate_local_openai_endpoint(
+        &endpoint,
+        optional_key.as_deref(),
+        machine,
+        ceremony.deadline,
+    )?;
+    bank_local_openai_credential(staging, &endpoint, optional_key.as_deref())
+}
+
+fn normalize_local_openai_endpoint(endpoint: &str) -> Result<String, String> {
+    let trimmed = endpoint.trim();
+    if trimmed.is_empty() {
+        return Err("tightbeam onboard local-openai requires --endpoint URL".to_owned());
+    }
+    if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
+        return Err(format!(
+            "local-openai endpoint must be an http(s) URL, got: {trimmed}"
+        ));
+    }
+    Ok(trimmed.trim_end_matches('/').to_owned())
+}
+
+fn validate_local_openai_endpoint(
+    endpoint: &str,
+    api_key: Option<&str>,
+    machine: Option<&str>,
+    deadline: Instant,
+) -> Result<(), String> {
+    let host = machine.map(str::to_owned).unwrap_or_else(this_host);
+    let endpoint = endpoint.to_owned();
+    let api_key = api_key.map(str::to_owned);
+    validation_before_deadline(
+        deadline,
+        "local-openai endpoint validation",
+        move |remaining| {
+            validate_local_openai_endpoint_with_timeout(
+                &endpoint,
+                api_key.as_deref(),
+                &host,
+                remaining,
+            )
+        },
+    )
+}
+
+fn validate_local_openai_endpoint_with_timeout(
+    endpoint: &str,
+    api_key: Option<&str>,
+    host: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let agent = validation_agent(timeout);
+    let url = format!("{endpoint}/models");
+    let mut request = agent.get(&url);
+    if let Some(key) = api_key {
+        request = request.set("authorization", &format!("Bearer {key}"));
+    }
+    match request.call() {
+        Ok(_response) => Ok(()),
+        Err(ureq::Error::Status(status, response)) => {
+            let body = response
+                .into_string()
+                .unwrap_or_else(|_| "<unreadable response body>".to_owned());
+            Err(format!(
+                "the local-openai endpoint was rejected on {host}: HTTP {status} {}. Nothing was \
+                 banked -- the local-openai credential on {host} is unchanged.",
+                body.trim()
+            ))
+        }
+        Err(ureq::Error::Transport(error)) => Err(unvalidated_api_key(
+            "local-openai",
+            &error.to_string(),
+            host,
+        )),
+    }
+}
+
+fn bank_local_openai_credential(
+    staging: &str,
+    endpoint: &str,
+    api_key: Option<&str>,
+) -> Result<(), String> {
+    let mut record = serde_json::json!({
+        "local-openai": {
+            "endpoint": endpoint
+        }
+    });
+    if let Some(key) = api_key {
+        record["local-openai"]["apiKey"] = serde_json::json!(key);
+    }
+    let path = std::path::Path::new(staging).join("local-openai.json");
+    let bytes = serde_json::to_vec_pretty(&record)
+        .map_err(|error| format!("could not encode the local-openai credential: {error}"))?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|error| {
+            format!(
+                "could not stage the local-openai credential at {}: {error}",
+                path.display()
+            )
+        })?;
+    file.write_all(&bytes).map_err(|error| {
+        format!(
+            "could not stage the local-openai credential at {}: {error}",
+            path.display()
+        )
+    })
 }
 
 fn run_provider_onboarding(
@@ -2563,6 +2705,7 @@ mod tests {
                 &Identity::User("signal-fixture".to_owned()),
                 "openai",
                 false,
+                None,
                 &endpoint,
                 |_, request, _| {
                     let request: serde_json::Value =

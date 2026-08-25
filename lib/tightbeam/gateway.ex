@@ -3643,7 +3643,7 @@ defmodule Tightbeam.Gateway do
   defp apply_failure(%{"message" => message}) when is_binary(message), do: message
   defp apply_failure(reason), do: inspect(reason)
 
-  @onboarding_providers ["openai", "anthropic", "opencode-go"] ++
+  @onboarding_providers ["openai", "anthropic", "opencode-go", "local-openai"] ++
                           if(Application.compile_env(:tightbeam, :fixture_harness, false),
                             do: ["fixture-provider"],
                             else: []
@@ -3672,7 +3672,7 @@ defmodule Tightbeam.Gateway do
       {:error, :api_key_only} ->
         %{
           code: "invalid_message",
-          message: "opencode-go requires credential kind apiKey; subscription is unsupported"
+          message: "#{provider} requires credential kind apiKey; subscription is unsupported"
         }
 
       :error ->
@@ -3793,11 +3793,14 @@ defmodule Tightbeam.Gateway do
 
   defp provider_onboarding_kind("opencode-go", "apiKey"), do: {:ok, :api_key}
   defp provider_onboarding_kind("opencode-go", _kind), do: {:error, :api_key_only}
+  defp provider_onboarding_kind("local-openai", "subscription"), do: {:error, :api_key_only}
+  defp provider_onboarding_kind("local-openai", _kind), do: {:ok, :api_key}
   defp provider_onboarding_kind(_provider, kind), do: onboarding_kind(kind)
 
   defp provider_atom("openai"), do: :openai
   defp provider_atom("anthropic"), do: :anthropic
   defp provider_atom("opencode-go"), do: :opencode_go
+  defp provider_atom("local-openai"), do: :local_openai
   defp provider_atom("fixture-provider"), do: :fixture_provider
 
   defp role_bind_result(db, call) do
