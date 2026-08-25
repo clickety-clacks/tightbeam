@@ -667,7 +667,12 @@ fn validate_local_openai_endpoint_with_timeout(
         request = request.set("authorization", &format!("Bearer {key}"));
     }
     match request.call() {
-        Ok(_response) => Ok(()),
+        Ok(response) => {
+            let body = response
+                .into_string()
+                .unwrap_or_else(|_| "<unreadable response body>".to_owned());
+            parse_local_openai_models_body(&body)
+        }
         Err(ureq::Error::Status(status, response)) => {
             let body = response
                 .into_string()
@@ -684,6 +689,45 @@ fn validate_local_openai_endpoint_with_timeout(
             host,
         )),
     }
+}
+
+/// Fail closed unless the captured OpenAI `/models` shape carries at least one
+/// non-empty model id. Pure so malformed, empty, and positive bodies pin without
+/// a live HTTP server.
+fn parse_local_openai_models_body(body: &str) -> Result<(), String> {
+    let value: serde_json::Value = serde_json::from_str(body).map_err(|_| {
+        "the local-openai endpoint returned a /models response that is not valid JSON".to_owned()
+    })?;
+    if local_openai_model_ids(&value)
+        .into_iter()
+        .any(|id| !id.is_empty())
+    {
+        Ok(())
+    } else {
+        Err(
+            "the local-openai endpoint returned a /models response with no usable model id"
+                .to_owned(),
+        )
+    }
+}
+
+fn local_openai_model_ids(value: &serde_json::Value) -> Vec<String> {
+    let Some(items) = value
+        .get("data")
+        .or_else(|| value.get("models"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            item.get("id")
+                .or_else(|| item.get("name"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect()
 }
 
 fn bank_local_openai_credential(
@@ -799,15 +843,28 @@ fn read_api_key_from(reader: &mut impl io::Read) -> Result<String, String> {
 /// is the whole value of the refusal. Same shape, and same reason, as
 /// `unnamed_machine`.
 fn api_key_needs_a_pipe(provider: &str) -> String {
-    let variable = match provider {
-        "openai" => "OPENAI_API_KEY",
-        "opencode-go" => "OPENCODE_API_KEY",
-        _ => "ANTHROPIC_API_KEY",
+    let (variable, command) = match provider {
+        "openai" => (
+            "OPENAI_API_KEY",
+            format!("tightbeam onboard {provider} --api-key"),
+        ),
+        "opencode-go" => (
+            "OPENCODE_API_KEY",
+            format!("tightbeam onboard {provider} --api-key"),
+        ),
+        "local-openai" => (
+            "LOCAL_OPENAI_API_KEY",
+            format!("tightbeam onboard {provider} --endpoint URL --api-key"),
+        ),
+        _ => (
+            "ANTHROPIC_API_KEY",
+            format!("tightbeam onboard {provider} --api-key"),
+        ),
     };
     format!(
         "--api-key reads the key from stdin and will not read from a terminal, because a key \
          typed at a prompt ends up in your shell scrollback. Pipe it in instead, e.g.\n  \
-         printenv {variable} | tightbeam onboard {provider} --api-key"
+         printenv {variable} | {command}"
     )
 }
 
@@ -2408,6 +2465,44 @@ mod tests {
 
         assert!(message.contains("printenv OPENCODE_API_KEY"));
         assert!(message.contains("onboard opencode-go --api-key"));
+    }
+
+    #[test]
+    fn local_openai_terminal_remedy_names_endpoint_and_local_key_variable() {
+        let message = api_key_needs_a_pipe("local-openai");
+
+        assert!(message.contains("printenv LOCAL_OPENAI_API_KEY"));
+        assert!(message.contains("onboard local-openai --endpoint URL --api-key"));
+        assert!(!message.contains("ANTHROPIC_API_KEY"));
+    }
+
+    #[test]
+    fn local_openai_models_body_requires_a_non_empty_model_id() {
+        assert!(parse_local_openai_models_body(r#"{"data":[{"id":"spark-qwen"}]}"#).is_ok());
+
+        assert_eq!(
+            parse_local_openai_models_body(r#"{"data":[{"id":""}]}"#),
+            Err(
+                "the local-openai endpoint returned a /models response with no usable model id"
+                    .to_owned()
+            )
+        );
+
+        assert_eq!(
+            parse_local_openai_models_body(r#"{"data":[]}"#),
+            Err(
+                "the local-openai endpoint returned a /models response with no usable model id"
+                    .to_owned()
+            )
+        );
+
+        assert_eq!(
+            parse_local_openai_models_body("not json"),
+            Err(
+                "the local-openai endpoint returned a /models response that is not valid JSON"
+                    .to_owned()
+            )
+        );
     }
 
     #[test]
