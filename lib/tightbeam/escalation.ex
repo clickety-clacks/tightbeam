@@ -492,6 +492,12 @@ defmodule Tightbeam.Escalation do
 
                 request.status == "returned" and request.returned_by == by and
                     request.return_reason == text ->
+                  {:ok, request} =
+                    DB.transaction(db, fn txn ->
+                      Publisher.maybe_observed_accepted_in_txn(txn, call)
+                      request
+                    end)
+
                   request
 
                 true ->

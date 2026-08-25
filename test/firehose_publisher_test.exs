@@ -454,6 +454,11 @@ defmodule Tightbeam.Firehose.PublisherTest do
              Dispatch.dispatch(db, handlers, returned)
 
     assert "decision_request.returned" in observed_state_classes()
+
+    assert {:ok, %{decision_request: %{status: "returned"}}} =
+             Dispatch.dispatch(db, handlers, returned)
+
+    assert observed_classes() == ["verb.accepted"]
     assert Gateway.handler_effects(%{db: db})["return"] == ["decision_request.returned"]
   end
 
