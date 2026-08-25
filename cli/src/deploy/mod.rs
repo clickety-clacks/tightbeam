@@ -41,6 +41,7 @@ impl DeployManager {
             Err(error) => (None, Some(error.to_string())),
         };
         let intent = self.read_activation_intent()?;
+        let durable_history = !self.fs.read_audit()?.is_empty();
         let class = match (pointer_error.as_deref(), &observed, &intent) {
             (Some(_), _, _) => RecoveryClass::ActivationIndeterminate,
             (None, None, None) => RecoveryClass::VirginReady,
@@ -67,10 +68,21 @@ impl DeployManager {
             (None, Some(_), None) => RecoveryClass::ActivationCommittedRecovered,
             (None, None, Some(_)) => RecoveryClass::ActivationIndeterminate,
         };
-        let reason = pointer_error.or_else(|| {
-            (class == RecoveryClass::ActivationIndeterminate)
-                .then(|| "active pointer and unresolved intent do not agree".to_owned())
-        });
+        let class = if observed.is_none() && intent.is_none() && durable_history {
+            RecoveryClass::ActivationIndeterminate
+        } else {
+            class
+        };
+        let reason = pointer_error
+            .or_else(|| {
+                (observed.is_none() && intent.is_none() && durable_history).then(|| {
+                    "durable activation history exists without an active pointer".to_owned()
+                })
+            })
+            .or_else(|| {
+                (class == RecoveryClass::ActivationIndeterminate)
+                    .then(|| "active pointer and unresolved intent do not agree".to_owned())
+            });
         Ok(Recovery {
             class,
             observed,
@@ -165,6 +177,19 @@ impl DeployManager {
                 .map_err(FsError::InvalidPointer)?,
             ),
         };
+        let observed_root = self.fs.root_identity_digest()?;
+        if authority.host != *self.fs.host_identity() {
+            return Err(FsError::InvalidPointer(
+                "activation intent names another host".to_owned(),
+            ));
+        }
+        if authority.deployment_root != observed_root {
+            return Err(FsError::InvalidPointer(format!(
+                "activation intent names deployment root {}, observed {}",
+                authority.deployment_root.as_str(),
+                observed_root.as_str()
+            )));
+        }
         Ok(Some(ActivationIntent {
             transaction_id,
             action,
@@ -188,7 +213,7 @@ impl DeployManager {
         let observed = self.fs.read_active()?;
         let matches = match (expected, observed.as_ref()) {
             (ExpectedActive::Virgin { deployment_root }, None) => {
-                deployment_root == &self.fs.root_identity_digest()
+                deployment_root == &self.fs.root_identity_digest()?
             }
             (
                 ExpectedActive::Generation {
@@ -226,4 +251,107 @@ fn parse_pointer(value: Option<&serde_json::Value>) -> Result<Pointer, FsError> 
         generation: model::GenerationId::new(generation).map_err(FsError::InvalidPointer)?,
         release: model::Digest::parse(release).map_err(FsError::InvalidPointer)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs as stdfs;
+    use std::path::PathBuf;
+
+    struct TempDir(PathBuf);
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = stdfs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn tempdir() -> TempDir {
+        let path = std::env::temp_dir().join(format!(
+            "tightbeam-deploy-recovery-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        stdfs::create_dir(&path).unwrap();
+        TempDir(path)
+    }
+
+    fn active_fixture() -> TempDir {
+        let directory = tempdir();
+        let fs = DeploymentFs::open(&directory.0).unwrap();
+        let payload = b"payload";
+        let payload_digest = model::Digest::from_bytes(payload);
+        let release_manifest = format!(
+            r#"{{"payload":[{{"path":"bin","type":"file","mode":292,"size":{},"sha256":"{}"}}]}}"#,
+            payload.len(),
+            payload_digest
+        );
+        let release_digest = model::Digest::from_bytes(release_manifest.as_bytes());
+        let release = format!("sha256-{release_digest}");
+        fs.ensure_dir(
+            &Path::new("releases").join(&release).join("tightbeam"),
+            0o755,
+        )
+        .unwrap();
+        fs.publish_immutable(
+            &Path::new("releases")
+                .join(&release)
+                .join("release-manifest.json"),
+            release_manifest.as_bytes(),
+            0o444,
+        )
+        .unwrap();
+        fs.publish_immutable(
+            &Path::new("releases").join(&release).join("tightbeam/bin"),
+            payload,
+            0o444,
+        )
+        .unwrap();
+        fs.ensure_dir(Path::new("generations/g1"), 0o755).unwrap();
+        fs.publish_immutable(
+            Path::new("generations/g1/manifest.json"),
+            format!(r#"{{"releaseDigest":"{release_digest}"}}"#).as_bytes(),
+            0o444,
+        )
+        .unwrap();
+        fs.replace_relative_symlink(
+            Path::new("generations/g1/root"),
+            &Path::new("../../releases").join(&release).join("tightbeam"),
+        )
+        .unwrap();
+        fs.replace_relative_symlink(Path::new("active"), Path::new("generations/g1"))
+            .unwrap();
+        directory
+    }
+
+    #[test]
+    fn recover_classifies_a_valid_active_pointer_after_process_death() {
+        let directory = active_fixture();
+        let recovery = DeployManager::open(&directory.0)
+            .unwrap()
+            .recover()
+            .unwrap();
+        assert_eq!(recovery.class, RecoveryClass::ActivationCommittedRecovered);
+        assert!(recovery.reason.is_none());
+    }
+
+    #[test]
+    fn recover_holds_durable_history_when_active_pointer_is_missing() {
+        let directory = tempdir();
+        stdfs::create_dir_all(directory.0.join("audit/tx-1")).unwrap();
+        stdfs::write(directory.0.join("audit/tx-1/fact.json"), b"{}\n").unwrap();
+        let recovery = DeployManager::open(&directory.0)
+            .unwrap()
+            .recover()
+            .unwrap();
+        assert_eq!(recovery.class, RecoveryClass::ActivationIndeterminate);
+        assert_eq!(
+            recovery.reason.as_deref(),
+            Some("durable activation history exists without an active pointer")
+        );
+    }
 }

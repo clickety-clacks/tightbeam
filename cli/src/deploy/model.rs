@@ -48,6 +48,10 @@ impl HostIdentity {
         Ok(Self(Digest::parse(value)?))
     }
 
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        Self(Digest::from_bytes(bytes))
+    }
+
     pub fn as_str(&self) -> &str {
         self.0.as_str()
     }

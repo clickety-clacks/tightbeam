@@ -6,9 +6,10 @@ use serde_json::{Value, json};
 
 use super::fs::{DeploymentFs, FsError};
 use super::model::{
-    AuditFactRecord, DeployStatus, DeploymentRootIdentity, Digest, ExpectedActive, GenerationId,
-    NamespaceIdentity, Pointer, RestartLoadable, RunningService, ServiceSetDigest,
-    ServiceSetStatus, ServiceStatus, TransactionId, TransactionState, TransactionStatus,
+    ActivationAuthority, AuditFactRecord, DeployAction, DeployStatus, DeploymentRootIdentity,
+    Digest, ExpectedActive, GenerationId, HostIdentity, NamespaceIdentity, Pointer,
+    RestartLoadable, RunningService, ServiceSetDigest, ServiceSetStatus, ServiceStatus,
+    TransactionId, TransactionState, TransactionStatus,
 };
 
 pub fn default_root() -> PathBuf {
@@ -48,8 +49,20 @@ pub fn read(root: &Path) -> Result<DeployStatus, FsError> {
     let audits = fs.read_audit()?;
     let (audit_records, audit_error) = parse_audit_records(&audits);
     let staged = fs.list_staging()?;
-    let intent = assess_intent(active.as_ref(), &intents, &fs.root_identity_digest());
-    let state_error = pointer_error.or(intent.error.clone()).or(audit_error);
+    let root_identity = fs.root_identity_digest()?;
+    let intent = assess_intent(
+        active.as_ref(),
+        &intents,
+        &root_identity,
+        fs.host_identity(),
+    );
+    let durable_history_error =
+        (active.is_none() && intent.state == IntentState::None && !audit_records.is_empty())
+            .then(|| "durable activation history exists without an active pointer".to_owned());
+    let state_error = pointer_error
+        .or(intent.error.clone())
+        .or(audit_error)
+        .or(durable_history_error);
     let transaction = match state_error.as_deref() {
         Some(reason) => TransactionStatus::Indeterminate {
             reason: reason.to_owned(),
@@ -160,6 +173,10 @@ fn parse_audit_records(records: &[Vec<u8>]) -> (Vec<AuditFactRecord>, Option<Str
     let mut parsed = Vec::new();
     for record in records {
         match parse_audit_record(record) {
+            Ok(record)
+                if parsed
+                    .iter()
+                    .any(|known: &AuditFactRecord| known.fact_digest == record.fact_digest) => {}
             Ok(record) => parsed.push(record),
             Err(error) => return (Vec::new(), Some(error)),
         }
@@ -249,6 +266,7 @@ fn assess_intent(
     active: Option<&Pointer>,
     records: &[Vec<u8>],
     root_identity: &DeploymentRootIdentity,
+    host_identity: &HostIdentity,
 ) -> IntentAssessment {
     if records.len() > 1 {
         return IntentAssessment {
@@ -297,6 +315,31 @@ fn assess_intent(
             };
         }
     };
+    let authority = match parse_activation_authority(&value) {
+        Ok(authority) => authority,
+        Err(error) => {
+            return IntentAssessment {
+                state: IntentState::None,
+                error: Some(format!("invalid activation intent authority: {error}")),
+            };
+        }
+    };
+    if authority.host != *host_identity {
+        return IntentAssessment {
+            state: IntentState::None,
+            error: Some("activation intent names another host".to_owned()),
+        };
+    }
+    if authority.deployment_root != *root_identity {
+        return IntentAssessment {
+            state: IntentState::None,
+            error: Some(format!(
+                "activation intent names deployment root {}, observed {}",
+                authority.deployment_root.as_str(),
+                root_identity.as_str()
+            )),
+        };
+    }
     if let ExpectedActive::Virgin { deployment_root } = &expected
         && deployment_root != root_identity
     {
@@ -427,6 +470,45 @@ fn read_service_set(fs: &DeploymentFs) -> ServiceSet {
         },
         units,
     }
+}
+
+fn parse_activation_authority(value: &Value) -> Result<ActivationAuthority, String> {
+    match value.get("action").and_then(Value::as_str) {
+        Some("activation") | Some("first-cutover") => {}
+        Some(other) => return Err(format!("unsupported activation action: {other}")),
+        None => return Err("activation intent has no action".to_owned()),
+    }
+    let _action = match value.get("action").and_then(Value::as_str) {
+        Some("activation") => DeployAction::Activation,
+        Some("first-cutover") => DeployAction::FirstCutover,
+        _ => unreachable!("action validated above"),
+    };
+    TransactionId::new(
+        value
+            .get("transactionId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "activation intent has no transactionId".to_owned())?,
+    )?;
+    Ok(ActivationAuthority {
+        host: HostIdentity::parse(
+            value
+                .get("hostIdentity")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "activation intent has no hostIdentity".to_owned())?,
+        )?,
+        deployment_root: DeploymentRootIdentity::from_digest(Digest::parse(
+            value
+                .get("deploymentRoot")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "activation intent has no deploymentRoot".to_owned())?,
+        )?),
+        service_set: ServiceSetDigest::from_digest(Digest::parse(
+            value
+                .get("serviceSetDigest")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "activation intent has no serviceSetDigest".to_owned())?,
+        )?),
+    })
 }
 
 fn restart_loadable_text(value: &RestartLoadable) -> String {
@@ -619,11 +701,17 @@ mod tests {
             )
             .unwrap();
         }
+        let deployment_fs = DeploymentFs::open(&directory.0).unwrap();
+        let root_identity = deployment_fs.root_identity_digest().unwrap();
+        let host_identity = deployment_fs.host_identity().as_str().to_owned();
+        let service_set_digest = Digest::from_bytes(b"service-set");
         fs::create_dir_all(directory.0.join("intents")).unwrap();
         fs::write(
             directory.0.join("intents/tx.json"),
             format!(
-                r#"{{"expectedActive":"generation:g1:{digest}","target":{{"generation":"g2","releaseDigest":"{digest}"}}}}"#
+                r#"{{"transactionId":"tx-1","action":"activation","expectedActive":"generation:g1:{digest}","target":{{"generation":"g2","releaseDigest":"{digest}"}},"hostIdentity":"{host_identity}","deploymentRoot":"{}","serviceSetDigest":"{}"}}"#,
+                root_identity.as_str(),
+                service_set_digest
             ),
         )
         .unwrap();
@@ -634,6 +722,37 @@ mod tests {
         assert_eq!(status.audit, "recovered-missing-row");
         assert_eq!(status.observation, "pending");
         assert!(status.gc_hold);
+    }
+
+    #[test]
+    fn status_holds_unresolved_intent_during_gc_recovery() {
+        let directory = tempdir();
+        let deployment_fs = DeploymentFs::open(&directory.0).unwrap();
+        let root_identity = deployment_fs.root_identity_digest().unwrap();
+        let host_identity = deployment_fs.host_identity().as_str().to_owned();
+        let service_set_digest = Digest::from_bytes(b"service-set");
+        fs::create_dir_all(directory.0.join("intents")).unwrap();
+        fs::write(
+            directory.0.join("intents/tx.json"),
+            format!(
+                r#"{{"transactionId":"tx-1","action":"first-cutover","expectedActive":"virgin:{}","target":{{"generation":"g1","releaseDigest":"{}"}},"hostIdentity":"{}","deploymentRoot":"{}","serviceSetDigest":"{}"}}"#,
+                root_identity.as_str(),
+                Digest::from_bytes(b"release"),
+                host_identity,
+                root_identity.as_str(),
+                service_set_digest
+            ),
+        )
+        .unwrap();
+
+        let status = read(&directory.0).unwrap();
+        assert_eq!(status.transaction.as_str(), "not-committed");
+        assert_eq!(status.next_authority, "resume-activation");
+        assert!(status.gc_hold);
+        assert_eq!(
+            status.gc_hold_transactions,
+            vec!["unresolved activation intent"]
+        );
     }
 
     #[test]
@@ -683,22 +802,25 @@ mod tests {
     }
 
     #[test]
-    fn status_parses_typed_nested_audit_facts_and_holds_malformed_facts() {
+    fn status_holds_durable_history_without_an_active_pointer() {
         let directory = tempdir();
         fs::create_dir_all(directory.0.join("audit/tx-1")).unwrap();
-        let root_digest = Digest::from_bytes(directory.0.to_string_lossy().as_bytes());
+        let deployment_fs = DeploymentFs::open(&directory.0).unwrap();
+        let root_identity = deployment_fs.root_identity_digest().unwrap();
         let fact_digest = Digest::from_bytes(b"fact");
         fs::write(
             directory.0.join("audit/tx-1/fact.json"),
             format!(
                 r#"{{"transactionId":"tx-1","state":"activated","observed":{{"kind":"virgin","deploymentRoot":"{}"}},"factDigest":"{}"}}"#,
-                root_digest, fact_digest
+                root_identity.as_str(), fact_digest
             ),
         )
         .unwrap();
         let status = read(&directory.0).unwrap();
-        assert_eq!(status.audit, "complete");
-        assert_eq!(status.transaction.as_str(), "virgin-ready");
+        assert_eq!(status.audit, "contradictory");
+        assert_eq!(status.transaction.as_str(), "indeterminate");
+        assert_eq!(status.observation, "held");
+        assert!(status.gc_hold);
 
         fs::write(
             directory.0.join("audit/tx-1/fact.json"),
@@ -709,5 +831,13 @@ mod tests {
         assert_eq!(status.audit, "contradictory");
         assert_eq!(status.transaction.as_str(), "indeterminate");
         assert_eq!(status.observation, "held");
+    }
+
+    #[test]
+    fn duplicate_audit_facts_are_idempotent() {
+        let fact = br#"{"transactionId":"tx-1","state":"activated","observed":{"kind":"generation","generation":"g1","releaseDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"factDigest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}"#;
+        let (records, error) = parse_audit_records(&[fact.to_vec(), fact.to_vec()]);
+        assert!(error.is_none());
+        assert_eq!(records.len(), 1);
     }
 }

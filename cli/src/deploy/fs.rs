@@ -13,7 +13,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::model::{DeploymentRootIdentity, Digest, GenerationId, Pointer};
+use super::model::{DeploymentRootIdentity, Digest, GenerationId, HostIdentity, Pointer};
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -519,6 +519,7 @@ fn read_link_at(dir: RawFd, name: &str, path: &Path) -> Result<PathBuf, FsError>
 pub struct DeploymentFs {
     root: PathBuf,
     root_fd: OwnedFd,
+    host_identity: HostIdentity,
 }
 
 impl DeploymentFs {
@@ -535,9 +536,11 @@ impl DeploymentFs {
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
             .open(&root)
             .map_err(|error| io("open deployment root", &root, error))?;
+        let host_identity = local_host_identity()?;
         Ok(Self {
             root,
             root_fd: file.into(),
+            host_identity,
         })
     }
 
@@ -545,13 +548,19 @@ impl DeploymentFs {
         &self.root
     }
 
-    pub fn root_identity_digest(&self) -> DeploymentRootIdentity {
-        DeploymentRootIdentity::from_digest(Digest::from_bytes(
-            self.root.to_string_lossy().as_bytes(),
-        ))
+    pub fn host_identity(&self) -> &HostIdentity {
+        &self.host_identity
     }
 
-    fn namespace_identity(&self) -> Result<(u64, u64), FsError> {
+    pub fn root_identity_digest(&self) -> Result<DeploymentRootIdentity, FsError> {
+        let (host, device, inode) = self.namespace_identity()?;
+        let identity = format!("host:{};device:{device};inode:{inode}", host.as_str());
+        Ok(DeploymentRootIdentity::from_digest(Digest::from_bytes(
+            identity.as_bytes(),
+        )))
+    }
+
+    fn namespace_identity(&self) -> Result<(HostIdentity, u64, u64), FsError> {
         let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
         if unsafe { libc::fstat(self.root_fd.as_raw_fd(), &mut stat) } != 0 {
             return Err(io(
@@ -560,7 +569,11 @@ impl DeploymentFs {
                 std::io::Error::last_os_error(),
             ));
         }
-        Ok((stat.st_dev as u64, stat.st_ino as u64))
+        Ok((
+            self.host_identity.clone(),
+            stat.st_dev as u64,
+            stat.st_ino as u64,
+        ))
     }
 
     fn parent_dir(&self, parent: &[String]) -> Result<OwnedFd, FsError> {
@@ -904,6 +917,18 @@ impl DeploymentFs {
     }
 }
 
+fn local_host_identity() -> Result<HostIdentity, FsError> {
+    let bytes = fs::read("/etc/machine-id")
+        .or_else(|_| fs::read("/etc/hostname"))
+        .map_err(|error| io("read host identity", "/etc/machine-id", error))?;
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        return Err(FsError::InvalidPointer(
+            "host identity source is empty".to_owned(),
+        ));
+    }
+    Ok(HostIdentity::from_bytes(&bytes))
+}
+
 fn read_json_directory(root: RawFd, name: &str, path: &Path) -> Result<Vec<Vec<u8>>, FsError> {
     let Some(directory) = open_optional_dir_at(root, name)? else {
         return Ok(Vec::new());
@@ -964,7 +989,7 @@ fn relative_link_target(target: &Path) -> Result<String, FsError> {
 
 pub struct DeploymentLock {
     file: File,
-    namespace_identity: (u64, u64),
+    namespace_identity: (HostIdentity, u64, u64),
 }
 
 impl DeploymentLock {
@@ -1022,6 +1047,7 @@ impl Drop for DeploymentLock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     struct TempDir(PathBuf);
 
@@ -1157,5 +1183,90 @@ mod tests {
         let pointer = fs.read_active().unwrap().unwrap();
         assert_eq!(pointer.generation.as_str(), "g1");
         assert_eq!(pointer.release, digest);
+    }
+
+    #[test]
+    fn same_filesystem_classifies_a_separate_proc_mount_as_cross_device() {
+        let (_directory, fs) = fixture();
+        assert!(matches!(
+            fs.same_filesystem(Path::new("/proc")),
+            Err(FsError::CrossDevice { .. })
+        ));
+    }
+
+    #[test]
+    fn concurrent_pointer_readers_see_only_complete_known_generations() {
+        let (_directory, fs) = fixture();
+        let payload = b"payload";
+        let payload_digest = Digest::from_bytes(payload);
+        let release_manifest = format!(
+            r#"{{"payload":[{{"path":"bin","type":"file","mode":292,"size":{},"sha256":"{}"}}]}}"#,
+            payload.len(),
+            payload_digest
+        );
+        let release_digest = Digest::from_bytes(release_manifest.as_bytes());
+        let release = format!("sha256-{release_digest}");
+        fs.ensure_dir(
+            &Path::new("releases").join(&release).join("tightbeam"),
+            0o755,
+        )
+        .unwrap();
+        fs.publish_immutable(
+            &Path::new("releases")
+                .join(&release)
+                .join("release-manifest.json"),
+            release_manifest.as_bytes(),
+            0o444,
+        )
+        .unwrap();
+        fs.publish_immutable(
+            &Path::new("releases").join(&release).join("tightbeam/bin"),
+            payload,
+            0o444,
+        )
+        .unwrap();
+        for generation in ["g1", "g2"] {
+            fs.ensure_dir(&Path::new("generations").join(generation), 0o755)
+                .unwrap();
+            fs.publish_immutable(
+                &Path::new("generations")
+                    .join(generation)
+                    .join("manifest.json"),
+                format!(r#"{{"releaseDigest":"{release_digest}"}}"#).as_bytes(),
+                0o444,
+            )
+            .unwrap();
+            fs.replace_relative_symlink(
+                &Path::new("generations").join(generation).join("root"),
+                &Path::new("../../releases").join(&release).join("tightbeam"),
+            )
+            .unwrap();
+        }
+        fs.replace_relative_symlink(Path::new("active"), Path::new("generations/g1"))
+            .unwrap();
+
+        let fs = Arc::new(fs);
+        let writer_fs = Arc::clone(&fs);
+        let writer = std::thread::spawn(move || {
+            for index in 0..80 {
+                let generation = if index % 2 == 0 { "g2" } else { "g1" };
+                writer_fs
+                    .replace_relative_symlink(
+                        Path::new("active"),
+                        &Path::new("generations").join(generation),
+                    )
+                    .unwrap();
+            }
+        });
+        let reader_fs = Arc::clone(&fs);
+        let reader = std::thread::spawn(move || {
+            for _ in 0..160 {
+                let pointer = reader_fs.read_active().unwrap().unwrap();
+                assert!(matches!(pointer.generation.as_str(), "g1" | "g2"));
+                assert_eq!(pointer.release, release_digest);
+            }
+        });
+        writer.join().unwrap();
+        reader.join().unwrap();
     }
 }
