@@ -167,6 +167,25 @@ defmodule Tightbeam.ColdStartTest do
     assert identity_census(db) == [1, 1, 1, 1, 1]
   end
 
+  test "a denied receipt device takes precedence over a changed fingerprint", %{db: db} do
+    secret = :crypto.strong_rand_bytes(32)
+    input = pair_input("d1", "Alice") |> Map.put(:replay_secret, secret)
+
+    assert {:paired, _device} = ColdStart.pair(db, input, @defaults)
+    :ok = DB.execute(db, "UPDATE devices SET status='denied',token=NULL WHERE deviceId='d1'")
+
+    assert {:ok, [before]} =
+             DB.query(db, "SELECT userId,status,token FROM devices WHERE deviceId='d1'")
+
+    assert :denied = ColdStart.pair(db, %{input | claimed_name: "Bob"}, @defaults)
+
+    assert {:ok, [^before]} =
+             DB.query(db, "SELECT userId,status,token FROM devices WHERE deviceId='d1'")
+
+    assert Devices.user(db, "bob") == nil
+    assert identity_census(db) == [1, 1, 1, 1, 1]
+  end
+
   test "host-local reservation is idempotent and only the same normalized user completes it", %{
     db: db
   } do

@@ -401,10 +401,16 @@ defmodule Tightbeam.ColdStart do
 
     cond do
       is_nil(receipt.activated_at) and device_id == receipt.device_id ->
-        if fingerprint(device_id, user_id) == receipt.request_fingerprint do
-          replay_or_refuse(txn, receipt, input[:replay_secret])
-        else
-          {:error, "bootstrap_closed"}
+        case Devices.get_device_in_txn(txn, receipt.device_id) do
+          %{status: "denied"} ->
+            :denied
+
+          _ ->
+            if fingerprint(device_id, user_id) == receipt.request_fingerprint do
+              replay_or_refuse(txn, receipt, input[:replay_secret])
+            else
+              {:error, "bootstrap_closed"}
+            end
         end
 
       true ->
