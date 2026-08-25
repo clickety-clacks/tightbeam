@@ -891,11 +891,20 @@ defmodule Tightbeam.Acp.Adapter do
       {:acp_request_not_dispatched, ^dispatched, reason} ->
         Process.demonitor(conn_monitor, [:flush])
         Process.exit(prompt_worker, :kill)
-        send(parent, {:prompt_done, sid, from, {:error, reason}})
+
+        send(
+          parent,
+          {:prompt_done, sid, from, {:error, {:acp_request_not_dispatched, reason}}}
+        )
 
       {:DOWN, ^conn_monitor, :process, _pid, _reason} ->
         Process.exit(prompt_worker, :kill)
-        send(parent, {:prompt_done, sid, from, {:error, :prompt_dispatch_failed}})
+
+        send(
+          parent,
+          {:prompt_done, sid, from,
+           {:error, {:acp_request_not_dispatched, :prompt_dispatch_failed}}}
+        )
     end
 
     {:noreply, state}

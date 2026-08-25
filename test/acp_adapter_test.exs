@@ -956,7 +956,9 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     :sys.replace_state(adapter, &%{&1 | conn: dead_conn})
 
-    assert {:error, :prompt_dispatch_failed} = Adapter.prompt(adapter, "sess-1", "never sent")
+    assert {:error, {:acp_request_not_dispatched, :prompt_dispatch_failed}} =
+             Adapter.prompt(adapter, "sess-1", "never sent")
+
     assert Adapter.conn(adapter) == dead_conn
   end
 
@@ -967,7 +969,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert :sys.get_state(conn).closed
     owner = self()
 
-    assert {:error, :closed} =
+    assert {:error, {:acp_request_not_dispatched, :closed}} =
              Adapter.prompt(adapter, "sess-1", "never sent",
                trace_dispatch: fn request_id ->
                  send(owner, {:dispatch_recorded, request_id})
@@ -996,7 +998,9 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert Task.yield(prompt, 50) == nil
 
     send(inert_conn, :stop)
-    assert {:error, :prompt_dispatch_failed} = Task.await(prompt)
+
+    assert {:error, {:acp_request_not_dispatched, :prompt_dispatch_failed}} =
+             Task.await(prompt)
 
     assert Adapter.conn(adapter) == inert_conn
   end

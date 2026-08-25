@@ -193,6 +193,10 @@ defmodule Tightbeam.GatewayTest do
        parent}
     end
 
+    def handle_call({:prompt, _sid, "fail before dispatch", _opts}, _from, parent) do
+      {:reply, {:error, {:acp_request_not_dispatched, :closed}}, parent}
+    end
+
     # The typed fields are the concrete ACP response specimens frozen in the
     # reviewed provenance recon. The surrounding prose is deliberately hostile
     # so the public projection proves that it copies none of it.
@@ -7781,6 +7785,50 @@ defmodule Tightbeam.GatewayTest do
                &1
              )
            )
+
+    assert :appended =
+             Gateway.deliver_prompt("k1", "user:flynn", "fail before dispatch",
+               db: ctx.db,
+               conn_registry: exact_registry,
+               lane_manager: ctx.lane,
+               device_id: "failed",
+               client_message_id: "c_pre_dispatch"
+             )
+
+    assert {:ok, pre_dispatch_turn} = Ledger.claim_next(ctx.db, "k1", "test")
+
+    assert {:error, %{reason: _, terminal_publish: pre_dispatch_publish, record_in_txn: record}} =
+             runner.(Map.put(pre_dispatch_turn, :session_key, "k1"))
+
+    assert {:ok, true} =
+             DB.transaction(ctx.db, fn txn ->
+               assert Ledger.finish_in_txn(txn, pre_dispatch_turn.seq, "failed", "closed",
+                        owner_lease: pre_dispatch_turn.owner_lease
+                      )
+
+               record.(txn)
+               true
+             end)
+
+    pre_dispatch_publish.("failed")
+
+    pre_dispatch_trace =
+      Tightbeam.TurnLifecycle.read(ctx.db, %{
+        params: %{session_key: "k1", turn_seq: pre_dispatch_turn.seq},
+        principal: {:user, "flynn"}
+      })
+
+    assert Enum.map(pre_dispatch_trace.events, & &1.event_key) == [
+             "accepted",
+             "claimed",
+             "checkout:started",
+             "checkout:succeeded",
+             "session:started",
+             "session:succeeded",
+             "prompt:started",
+             "prompt:failed",
+             "terminal:committed"
+           ]
   end
 
   test "known process causes persist safely on the assignment and route to its owner", ctx do

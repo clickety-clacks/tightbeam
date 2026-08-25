@@ -2350,6 +2350,16 @@ defmodule Tightbeam.Gateway do
     end
   end
 
+  defp trace_prompt_result(db, turn, {:error, {:acp_request_not_dispatched, reason}}) do
+    case trace_stage_failed(db, turn, :prompt, reason) do
+      :ok ->
+        {:error, {:prompt, reason}}
+
+      {:error, trace_reason} ->
+        {:error, {:prompt, {:lifecycle_trace_failed_after_prompt, :resolution, trace_reason}}}
+    end
+  end
+
   defp trace_prompt_result(db, turn, {:error, reason}) do
     trace_result =
       with :ok <-
