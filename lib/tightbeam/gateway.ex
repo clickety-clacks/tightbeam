@@ -4689,10 +4689,16 @@ defmodule Tightbeam.Gateway do
       Enum.reduce_while(archetype.where, [], fn host, failures ->
         candidate =
           with {:ok, ^host} <- Placement.resolve(archetype, host, hosts),
-               :ok <- validate_credential(config, harness, host),
                model = spawn_model_selection(host, harness, p, default_model),
+               :ok <- validate_credential(config, harness, host, model),
                {:ok, routed} <- route_spawn_candidate(host, harness, model),
-               :ok <- Spinup.ensure_ready(config, module.id(), host, spinup_opts(config, db)) do
+               :ok <-
+                 Spinup.ensure_ready(
+                   config,
+                   module.id(),
+                   host,
+                   spinup_opts(config, db, harness, host, model)
+                 ) do
             {:ok, %{host: host, model: model, routed: routed}}
           end
 
@@ -4760,10 +4766,16 @@ defmodule Tightbeam.Gateway do
         %{host: ^host} ->
           model = spawn_model_selection(host, harness_string, p, default_model)
 
-          with :ok <- validate_credential(config, harness_string, host),
+          with :ok <- validate_credential(config, harness_string, host, model),
                {:ok, routed} <-
                  validate_catalog_model(host, harness_string, model, from_default?(p)),
-               :ok <- Spinup.ensure_ready(config, harness_atom, host, spinup_opts(config, db)),
+               :ok <-
+                 Spinup.ensure_ready(
+                   config,
+                   harness_atom,
+                   host,
+                   spinup_opts(config, db, harness_string, host, model)
+                 ),
                do: {:ok, {model, routed}}
       end
 
@@ -4974,7 +4986,7 @@ defmodule Tightbeam.Gateway do
                     resolve_selection(session.host, harness, p, selection_base)
                   )
 
-                with :ok <- validate_credential(config, harness, session.host),
+                with :ok <- validate_credential(config, harness, session.host, model),
                      {:ok, routed} <-
                        validate_catalog_model(
                          session.host,
@@ -4987,7 +4999,7 @@ defmodule Tightbeam.Gateway do
                          config,
                          harness_atom,
                          session.host,
-                         spinup_opts(config, db)
+                         spinup_opts(config, db, harness, session.host, model)
                        ) do
                   case at_tune_boundary(config, db, session.session_key, fn ->
                          run_session_mutation(session.session_key, fn ->
@@ -5027,7 +5039,12 @@ defmodule Tightbeam.Gateway do
               {:ok, host} ->
                 harness = Harness.parse!(session.harness).id()
 
-                case Spinup.ensure_ready(config, harness, host, spinup_opts(config, db)) do
+                case Spinup.ensure_ready(
+                       config,
+                       harness,
+                       host,
+                       spinup_opts(config, db, session.harness, host, session.model)
+                     ) do
                   {:error, denial} ->
                     denial
 
@@ -6049,8 +6066,8 @@ defmodule Tightbeam.Gateway do
     %{code: Unroutable.code(unroutable), message: Unroutable.message(unroutable)}
   end
 
-  defp validate_credential(config, harness, machine) do
-    provider = Harness.parse!(harness).credential_provider()
+  defp validate_credential(config, harness, machine, model) do
+    provider = selected_credential_provider(harness, machine, model)
     status = credential_status(config, provider, machine)
 
     case status do
@@ -6065,6 +6082,21 @@ defmodule Tightbeam.Gateway do
          }}
     end
   end
+
+  # Pi is one harness with independently banked providers. The selected live
+  # catalog row, not the harness's historical default, owns the credential
+  # preflight. When there is no selected row, preserve the established harness
+  # fallback so an unavailable catalog still names the credential that can make
+  # that harness bootable.
+  defp selected_credential_provider(harness, machine, %Model{} = model) do
+    case ModelCatalog.entry(machine, harness, model, ModelCatalog) do
+      {%{provider: provider}, _health} when is_atom(provider) -> provider
+      _ -> Harness.parse!(harness).credential_provider()
+    end
+  end
+
+  defp selected_credential_provider(harness, _machine, _model),
+    do: Harness.parse!(harness).credential_provider()
 
   # Single source of truth: a credential-failure `reason` -> the actionable remedy
   # sentence. Every credential-refusal seam (spawn `validate_credential`, the turn
@@ -6412,11 +6444,23 @@ defmodule Tightbeam.Gateway do
   defp empty_override_to_nil(map) when map_size(map) == 0, do: nil
   defp empty_override_to_nil(map), do: map
 
-  defp spinup_opts(config, db) do
-    [db: db]
+  defp spinup_opts(config, db, harness, host, model) do
+    provider = selected_credential_provider(harness, host, model)
+
+    [db: db, credential_provider: provider]
     |> maybe_put_opt(:sh, config[:sh])
     |> maybe_put_opt(:patch_adapter, config[:patch_adapter])
+    |> maybe_put_opt(:credential_names, selected_credential_names(provider, model))
   end
+
+  defp selected_credential_names(:local_openai, %Model{family: family}) do
+    case String.split(family, "/", parts: 2) do
+      [name, _model] -> ["#{name}.json"]
+      _ -> nil
+    end
+  end
+
+  defp selected_credential_names(_provider, _model), do: nil
 
   defp maybe_put_opt(opts, _key, nil), do: opts
   defp maybe_put_opt(opts, key, value), do: Keyword.put(opts, key, value)

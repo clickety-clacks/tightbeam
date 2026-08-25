@@ -2,6 +2,7 @@ defmodule Tightbeam.LocalOpenAiRuntimeTest do
   use Tightbeam.TestCase, async: false
 
   alias Tightbeam.LocalOpenAi.Providers
+  alias Tightbeam.Harness.Support
   alias Tightbeam.PiProvider
   alias Tightbeam.PiProvider.LocalOpenAi
 
@@ -35,6 +36,73 @@ defmodule Tightbeam.LocalOpenAiRuntimeTest do
       assert {:error, _} = Providers.validate_name("Spark")
       assert {:error, _} = Providers.validate_name("1spark")
     end
+  end
+
+  describe "Pi models.json materialization" do
+    test "a keyless named provider uses Pi's non-secret local sentinel" do
+      record = %{
+        name: "spark",
+        endpoint: "https://spark.example/v1",
+        api_key: nil
+      }
+
+      {"spark", provider} = LocalOpenAi.pi_models_json_entry(record, @models_body)
+
+      assert provider["apiKey"] == "local"
+      assert provider["authHeader"] == false
+    end
+
+    test "an API-key provider materializes its banked key without the keyless marker" do
+      record = %{
+        name: "spark",
+        endpoint: "https://spark.example/v1",
+        api_key: "fixture-key"
+      }
+
+      {"spark", provider} = LocalOpenAi.pi_models_json_entry(record, @models_body)
+
+      assert provider["apiKey"] == "fixture-key"
+      refute Map.has_key?(provider, "authHeader")
+    end
+  end
+
+  test "keyless liveness marks its curl response as a catalog trailer" do
+    owner = self()
+
+    transport = fn _target, request ->
+      send(owner, {:request, request})
+      {:ok, %{status: 200, headers: %{}, body: @models_body}}
+    end
+
+    target = %{
+      host_config: %{ssh: nil},
+      find_executable: fn
+        "sh" -> "/bin/sh"
+        "curl" -> "/usr/bin/curl"
+      end
+    }
+
+    assert :live =
+             LocalOpenAi.credential_live?(
+               target,
+               %{name: "spark", endpoint: "https://spark.example/v1", api_key: nil},
+               transport: transport
+             )
+
+    assert_receive {:request, %{response: :catalog, command: ["/bin/sh", "-c", _script]}}
+  end
+
+  test "catalog credential transport decodes the trailing HTTP status" do
+    target = %{
+      host_config: %{ssh: nil},
+      sh: fn ["/bin/sh", "-c", "probe"] -> {@models_body <> "\n200", 0} end
+    }
+
+    assert {:ok, %{status: 200, headers: %{}, body: @models_body}} =
+             Support.credential_transport(target, %{
+               command: ["/bin/sh", "-c", "probe"],
+               response: :catalog
+             })
   end
 
   describe "fetch_pi_catalog/1" do

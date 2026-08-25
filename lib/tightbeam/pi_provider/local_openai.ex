@@ -34,7 +34,8 @@ defmodule Tightbeam.PiProvider.LocalOpenAi do
       script = Support.catalog_curl(url, headers, "", paths.curl)
 
       request = %{
-        command: Support.catalog_probe_argv(destination(target), script, paths)
+        command: Support.catalog_probe_argv(destination(target), script, paths),
+        response: :catalog
       }
 
       case Support.credential_live_result(target, request, opts) do
@@ -92,7 +93,12 @@ defmodule Tightbeam.PiProvider.LocalOpenAi do
       if is_binary(record.api_key) and record.api_key != "" do
         Map.put(provider, "apiKey", record.api_key)
       else
+        # Pi requires an apiKey field before it will run a provider. "local" is
+        # its conventional non-secret sentinel for a keyless local endpoint;
+        # authHeader=false makes explicit that it is configuration, not a grant.
         provider
+        |> Map.put("apiKey", "local")
+        |> Map.put("authHeader", false)
       end
 
     {record.name, provider}

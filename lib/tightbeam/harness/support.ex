@@ -129,7 +129,7 @@ defmodule Tightbeam.Harness.Support do
     |> Enum.sort()
   end
 
-  def credential_transport(target, %{command: command}) do
+  def credential_transport(target, %{command: command} = request) do
     invocation =
       if local?(target) do
         command
@@ -145,21 +145,34 @@ defmodule Tightbeam.Harness.Support do
 
     case target.sh.(invocation) do
       {output, 0} ->
-        case JSON.decode(output) do
-          {:ok, decoded} ->
-            {:ok,
-             %{
-               status: decoded["status"],
-               headers: decoded["headers"],
-               body: decoded["body"]
-             }}
-
-          {:error, reason} ->
-            {:error, {:malformed_transport_response, reason}}
-        end
+        decode_credential_transport(request, output)
 
       {output, exit} ->
         {:error, {:transport_exit, exit, String.trim(output)}}
+    end
+  end
+
+  defp decode_credential_transport(%{response: :catalog}, output) do
+    {body, trailer} = split_trailing_line(output)
+
+    case Integer.parse(String.trim(trailer)) do
+      {status, ""} -> {:ok, %{status: status, headers: %{}, body: body}}
+      _ -> {:error, {:malformed_transport_response, :missing_http_status}}
+    end
+  end
+
+  defp decode_credential_transport(_request, output) do
+    case JSON.decode(output) do
+      {:ok, decoded} ->
+        {:ok,
+         %{
+           status: decoded["status"],
+           headers: decoded["headers"],
+           body: decoded["body"]
+         }}
+
+      {:error, reason} ->
+        {:error, {:malformed_transport_response, reason}}
     end
   end
 
