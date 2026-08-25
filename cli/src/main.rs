@@ -5,6 +5,7 @@ mod catalog_probe;
 mod ceremonies;
 mod child_process;
 mod contain;
+mod deploy;
 mod dispatch;
 mod harness_process;
 mod harnesses;
@@ -112,6 +113,12 @@ fn main() {
                     eprintln!("no such command: {command} — run 'tightbeam help' for usage");
                     std::process::exit(1);
                 }
+            }
+        }
+        Ok(args::Command::DeployStatus { json }) => {
+            if let Err(error) = deploy::status::run(json) {
+                eprintln!("{error}");
+                std::process::exit(1);
             }
         }
         Ok(command) => {

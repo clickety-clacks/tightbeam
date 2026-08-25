@@ -74,6 +74,11 @@ pub enum Command {
         json: bool,
         base_dir: Option<String>,
     },
+    /// Read-only deployment projection. Mutation verbs are intentionally not
+    /// part of the CLI surface in the first deployment-kernel slice.
+    DeployStatus {
+        json: bool,
+    },
     Wake {
         identity: Identity,
         target: Target,
@@ -727,6 +732,9 @@ COMMANDS:
   doctor [--json] [--base-dir p]
       Check the local Tightbeam installation and report its health.
 
+  deploy status [--json]
+      Report deployment state from the local deployment root without mutating it.
+
   assimilate <ssh-dest> [--name n] [--base-dir p] [--harness {{HARNESSES_CSV}}]
              [--dry-run]
       Prepare a machine to run agent harnesses and register it as a host
@@ -1165,6 +1173,16 @@ fn parse_with_optional_catalog(
             Ok(Command::Doctor {
                 json: flags.contains_key("json"),
                 base_dir,
+            })
+        }
+        "deploy" => {
+            if parsed.positional.as_slice() != ["deploy", "status"]
+                || flags.keys().any(|flag| flag != "json")
+            {
+                return Err("usage: tightbeam deploy status [--json]".to_owned());
+            }
+            Ok(Command::DeployStatus {
+                json: flags.contains_key("json"),
             })
         }
         "harness-process" => parse_harness_process(&parsed, flags),
@@ -2004,7 +2022,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, ask, answer, return, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, ask, answer, return, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, deploy, assimilate, harness-process"
         )),
     }
 }
@@ -2811,6 +2829,7 @@ mod tests {
                 "decision-requests",
                 "digest-members",
                 "dispatch",
+                "deploy",
                 "doctor",
                 "effort-rule",
                 "harness-process",
@@ -2861,6 +2880,7 @@ mod tests {
             "host-env-unset --host <host> --harness <harness> NAME",
             "harness-process list",
             "kungfu list",
+            "deploy status [--json]",
         ] {
             assert!(help.contains(syntax), "missing HELP syntax: {syntax}");
         }
@@ -3416,7 +3436,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, ask, answer, return, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, ask, answer, return, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, deploy, assimilate, harness-process".to_owned())
         );
     }
 
@@ -3506,6 +3526,24 @@ mod tests {
             assert_eq!(
                 parse(args),
                 Err("usage: tightbeam doctor [--json] [--base-dir DIR]".to_owned())
+            );
+        }
+    }
+
+    #[test]
+    fn deploy_exposes_only_read_only_status() {
+        assert_eq!(
+            parse(strings(&["deploy", "status", "--json"])),
+            Ok(Command::DeployStatus { json: true })
+        );
+        for args in [
+            strings(&["deploy"]),
+            strings(&["deploy", "activate"]),
+            strings(&["deploy", "status", "--root", "/tmp/deploy"]),
+        ] {
+            assert_eq!(
+                parse(args),
+                Err("usage: tightbeam deploy status [--json]".to_owned())
             );
         }
     }

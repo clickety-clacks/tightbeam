@@ -118,6 +118,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
         Command::Help
         | Command::CommandHelp(_)
         | Command::Doctor { .. }
+        | Command::DeployStatus { .. }
         | Command::UpdateClients { .. }
         | Command::Assimilate(_) => {
             Err("command does not dispatch through /agent/dispatch".to_owned())
@@ -1581,6 +1582,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         Command::Help
         | Command::CommandHelp(_)
         | Command::Doctor { .. }
+        | Command::DeployStatus { .. }
         | Command::ToolCallObserved
         | Command::UpdateClients { .. }
         | Command::Assimilate(_) => None,
