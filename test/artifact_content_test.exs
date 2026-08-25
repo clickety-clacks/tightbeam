@@ -460,6 +460,14 @@ defmodule Tightbeam.ArtifactContentTest do
     snapshot_digest = sha256(File.read!(snapshot))
     File.write!(Path.join(backup_dir, "state.sha256"), snapshot_digest <> "\n")
 
+    manifest_query =
+      "SELECT DISTINCT contentSha256 || ' ' || contentSize " <>
+        "FROM artifacts WHERE state='released' ORDER BY contentSha256;"
+
+    assert {manifest, 0} = System.cmd("sqlite3", [snapshot, manifest_query])
+    assert manifest == "#{released.content_sha256} #{released.content_size}\n"
+    File.write!(Path.join(backup_dir, "artifact-content.manifest"), manifest)
+
     backup_blob =
       Path.join([
         backup_dir,
@@ -476,6 +484,9 @@ defmodule Tightbeam.ArtifactContentTest do
       backup_blob
     )
 
+    assert File.stat!(backup_blob).size == released.content_size
+    assert sha256(File.read!(backup_blob)) == released.content_sha256
+
     restored_db_path = Path.join(restored_base, "state.db")
     File.mkdir_p!(restored_base)
     File.cp!(snapshot, restored_db_path)
@@ -484,9 +495,13 @@ defmodule Tightbeam.ArtifactContentTest do
     restored_blob = ArtifactContent.cas_path(restored_base, released.content_sha256)
     File.mkdir_p!(Path.dirname(restored_blob))
     File.cp!(backup_blob, restored_blob)
+    assert File.stat!(restored_blob).size == released.content_size
+    assert sha256(File.read!(restored_blob)) == released.content_sha256
 
     restored_db = :artifact_restore_installed
     start_supervised!({DB, path: restored_db_path, name: restored_db}, id: restored_db)
+    assert {:ok, [["ok"]]} = DB.query(restored_db, "PRAGMA integrity_check")
+    assert {:ok, []} = DB.query(restored_db, "PRAGMA foreign_key_check")
     :ok = Schema.ensure_all(restored_db)
     :ok = ArtifactContent.cleanup_temps(restored_base)
     :ok = ArtifactContent.boot_scrub!(restored_db, restored_base)
