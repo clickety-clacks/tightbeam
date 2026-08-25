@@ -15,7 +15,6 @@ boundary.
    so one agent's `fetch --prune` or branch delete reaches into another's live checkout;
    and its disk belongs to a session that can retire out from under you, taking every
    checkout hanging off it. Disk is cheap. A checkout that vanishes mid-assignment is not.
-   If the agent that assigned the work hands you a specific checkout, use that one.
 2. **Push, so the remote holds the record.** Your workdir is durable; your checkout is
    not the record. Commit and push at every natural stopping point, not once at the end.
    Work that exists only in a local directory is one cleanup away from gone, and the

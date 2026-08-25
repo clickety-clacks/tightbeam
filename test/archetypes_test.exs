@@ -204,6 +204,9 @@ defmodule Tightbeam.ArchetypesTest do
     assert product_owner.skills["worktree-session"] =~
              "After your branch merges, delete your clone"
 
+    refute product_owner.skills["worktree-session"] =~
+             "hands you a specific checkout"
+
     refute File.regular?(
              Path.join([
                ctx.base_dir,
