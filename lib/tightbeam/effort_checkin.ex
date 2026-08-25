@@ -330,6 +330,9 @@ defmodule Tightbeam.EffortCheckin do
     request = visible_response_request(db, call, request_id)
 
     cond do
+      is_nil(request) and match?({:user, _user_id}, call.principal) ->
+        error("not_authorized", "current expecter required")
+
       is_nil(request) ->
         error("not_found", "decision request not found")
 

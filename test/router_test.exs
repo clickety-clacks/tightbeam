@@ -1081,7 +1081,7 @@ defmodule Tightbeam.Wire.RouterTest do
            ]
   end
 
-  test "process effort-rule returns the same wire envelope for hidden and absent ids", ctx do
+  test "unauthorized effort-rule returns matching hidden and absent wire envelopes", ctx do
     {:ok, _} =
       DB.query(
         ctx.db,
@@ -1119,6 +1119,28 @@ defmodule Tightbeam.Wire.RouterTest do
                "error" => %{
                  "code" => "not_found",
                  "message" => "decision request not found"
+               }
+             }
+           ]
+
+    user_responses =
+      for request <- ["dr_hidden_effort", "dr_absent"] do
+        dispatch_cli(%{ctx | opts: opts}, "tbc_test", %{
+          verb: "effort-rule",
+          asUser: "flynn",
+          params: %{request: request, action: "continue"}
+        })
+      end
+
+    assert Enum.map(user_responses, & &1.status) == [403, 403]
+
+    assert user_responses
+           |> Enum.map(&JSON.decode!(&1.resp_body))
+           |> Enum.uniq() == [
+             %{
+               "error" => %{
+                 "code" => "not_authorized",
+                 "message" => "current expecter required"
                }
              }
            ]

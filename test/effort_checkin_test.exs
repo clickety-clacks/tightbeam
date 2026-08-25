@@ -110,8 +110,13 @@ defmodule Tightbeam.EffortCheckinTest do
     session(ctx.db, "observer", "h2", Placement.local_host_name())
     human_request = open_effort_request(ctx, {:user, "h1"}, "continue")
 
-    assert %{code: "not_authorized"} =
+    assert %{code: "not_authorized", message: hidden} =
              effort_rule(ctx, {:user, "h2"}, human_request.id, "continue")
+
+    assert %{code: "not_authorized", message: absent} =
+             effort_rule(ctx, {:user, "h2"}, "dr_absent", "continue")
+
+    assert hidden == absent
 
     assert %{status: "ruled", ruled_by: "user:h1"} =
              effort_rule(ctx, {:user, "h1"}, human_request.id, "continue")
