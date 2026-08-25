@@ -27,7 +27,7 @@ defmodule Tightbeam.RecordNoticeTest do
     :ok =
       DB.execute(
         db,
-        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 0, 'admin_add', 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn',0,'admin_add',1)"
       )
 
     create_session(db, Org.personal_session_key("flynn"), "Main")
@@ -97,6 +97,109 @@ defmodule Tightbeam.RecordNoticeTest do
     assert_receive {:push_message, "work", ^seq, %{"type" => "message"} = payload}
     assert payload["content"] == "[adapter down]\n\nThe engine stopped."
     assert payload["attentionTier"] == 0
+  end
+
+  test "a caller transaction commits the marker before publishing its captured plan", ctx do
+    connect(ctx.registry, "d1")
+
+    assert {:ok, plan} =
+             DB.transaction(ctx.db, fn txn ->
+               plan =
+                 EventLog.notice_in_txn(
+                   txn,
+                   "wake_failed_delivery",
+                   "w_failed",
+                   "target_retired",
+                   audience: {:session, "work"},
+                   attention: :normal,
+                   message: "[wake failed]\n\nThe target retired before delivery."
+                 )
+
+               refute_received {:push_message, _, _, _}
+               plan
+             end)
+
+    assert [%{kind: "wake_failed_delivery", subject: "w_failed"}] =
+             EventLog.lifecycle_events(ctx.db)
+
+    assert [marker] = Projection.list_after(ctx.db, "work", nil, 10)
+
+    :ok = EventLog.publish(plan, conn_registry: ctx.registry)
+
+    seq = marker.seq
+    assert_receive {:push_message, "work", ^seq, payload}
+    assert payload == Payloads.server_message(marker)
+    assert [%{kind: "wake_failed_delivery"}] = EventLog.lifecycle_events(ctx.db)
+    assert [^marker] = Projection.list_after(ctx.db, "work", nil, 10)
+  end
+
+  test "an empty transaction plan publishes nothing", ctx do
+    connect(ctx.registry, "d1")
+
+    assert {:ok, []} =
+             DB.transaction(ctx.db, fn txn ->
+               EventLog.notice_in_txn(
+                 txn,
+                 "wake_failed_delivery",
+                 "w_record_only",
+                 "target_missing",
+                 audience: :record_only
+               )
+             end)
+
+    :ok = EventLog.publish([], conn_registry: ctx.registry)
+
+    refute_received {:push_message, _, _, _}
+    assert [%{kind: "wake_failed_delivery"}] = EventLog.lifecycle_events(ctx.db)
+    assert Projection.list_after(ctx.db, "work", nil, 10) == []
+  end
+
+  test "a retired transaction audience stores one marker without a live push plan", ctx do
+    Org.retire(ctx.db, "work", "user:flynn", 1_000)
+    connect(ctx.registry, "d1")
+
+    assert {:ok, []} =
+             DB.transaction(ctx.db, fn txn ->
+               EventLog.notice_in_txn(
+                 txn,
+                 "wake_failed_delivery",
+                 "w_inactive",
+                 "target_retired",
+                 audience: {:session, "work"},
+                 attention: :normal,
+                 message: "[wake failed]\n\nThe target retired before delivery."
+               )
+             end)
+
+    refute_received {:push_message, _, _, _}
+    assert [%{kind: "wake_failed_delivery"}] = EventLog.lifecycle_events(ctx.db)
+
+    assert [marker] = Projection.list_after(ctx.db, "work", nil, 10)
+    assert marker.sender == "process:tightbeam"
+    assert marker.content == "[wake failed]\n\nThe target retired before delivery."
+  end
+
+  test "a failed post-commit publish leaves one marker for replay", ctx do
+    absent = :"no_such_registry_#{System.unique_integer([:positive])}"
+
+    assert {:ok, plan} =
+             DB.transaction(ctx.db, fn txn ->
+               EventLog.notice_in_txn(
+                 txn,
+                 "wake_failed_delivery",
+                 "w_failed",
+                 "target_retired",
+                 audience: {:session, "work"},
+                 attention: :normal,
+                 message: "[wake failed]\n\nThe target retired before delivery."
+               )
+             end)
+
+    log = capture_log(fn -> assert :ok = EventLog.publish(plan, conn_registry: absent) end)
+
+    assert log =~ "replays on the next connect"
+    assert [marker] = Projection.list_after(ctx.db, "work", nil, 10)
+    assert Payloads.server_message(marker)["content"] =~ "target retired"
   end
 
   test "the same notice replays to a client that reconnects after it", ctx do
@@ -194,6 +297,42 @@ defmodule Tightbeam.RecordNoticeTest do
     assert lifecycle_kinds(ctx.db) == ["adapter_down"]
     assert [_] = Projection.list_after(ctx.db, "work", nil, 10)
     assert [_] = Projection.list_after(ctx.db, "second", nil, 10)
+  end
+
+  test "a caller-owned notice publishes only after commit and rolls back as one act", ctx do
+    connect(ctx.registry, "txn-notice")
+
+    assert {:error, %RuntimeError{message: "abort notice"}} =
+             DB.transaction(ctx.db, fn txn ->
+               EventLog.notice_in_txn(txn, "probe", "rolled-back", "detail",
+                 audience: {:session, "work"},
+                 attention: :high,
+                 message: "[rolled back]\n\nThis must not survive."
+               )
+
+               raise "abort notice"
+             end)
+
+    assert EventLog.lifecycle_events(ctx.db) == []
+    assert Projection.list_after(ctx.db, "work", nil, 10) == []
+    refute_received {:push_message, _, _, _}
+
+    assert {:ok, publication} =
+             DB.transaction(ctx.db, fn txn ->
+               EventLog.notice_in_txn(txn, "probe", "committed", "detail",
+                 audience: {:session, "work"},
+                 attention: :high,
+                 message: "[committed]\n\nPublish after commit."
+               )
+             end)
+
+    assert [_marker] = Projection.list_after(ctx.db, "work", nil, 10)
+    refute_received {:push_message, _, _, _}
+
+    assert :ok = EventLog.publish(publication, conn_registry: ctx.registry)
+
+    assert_receive {:push_message, "work", _seq,
+                    %{"content" => "[committed]\n\nPublish after commit."}}
   end
 
   test "record_only writes the row and interrupts nobody", ctx do

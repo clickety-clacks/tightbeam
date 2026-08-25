@@ -118,6 +118,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
         Command::Help
         | Command::CommandHelp(_)
         | Command::Doctor { .. }
+        | Command::GithubAuthCheck
         | Command::UpdateClients { .. }
         | Command::Assimilate(_) => {
             Err("command does not dispatch through /agent/dispatch".to_owned())
@@ -131,7 +132,6 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             condition_kind,
             condition_scope,
             idempotency_key,
-            class,
         } => {
             let target = match target {
                 Target::Session(value) => string_field("sessionKey", value),
@@ -149,7 +149,6 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 ("conditionKind", condition_kind),
                 ("conditionScope", condition_scope),
                 ("idempotencyKey", idempotency_key),
-                ("class", class),
             ] {
                 if let Some(value) = value {
                     params.push(string_field(name, value));
@@ -253,69 +252,6 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             }
             Ok(request(identity, "spawn", vec![], params))
         }
-        Command::Tune {
-            identity,
-            session_key,
-            control,
-        } => {
-            // The `setting` word is chosen HERE from the variant the parser
-            // built, never taken from the caller. There is no spelling of this
-            // command that lets a caller name an arbitrary setting and have it
-            // forwarded: the typed path is the only path, and the generic
-            // live-config passthrough it replaced is not coming back. A
-            // control Tightbeam has no vocabulary for is a control it cannot
-            // verify, cannot report in sessionStatus, and must not pretend to
-            // have applied.
-            let mut params = Vec::new();
-            let mut model_fields = Vec::new();
-            match control {
-                TuneControl::Harness {
-                    harness,
-                    model,
-                    effort,
-                    context,
-                } => {
-                    params.push(string_field("setting", "set_harness"));
-                    params.push(string_field("harness", harness));
-                    // `model` is REQUIRED on this variant (v0.2 program §4):
-                    // parsing cannot build a `TuneControl::Harness` without
-                    // one, so it always crosses as a named, non-empty value.
-                    model_fields.push(("model", Some(Some(model.clone()))));
-                    model_fields.push(("effort", effort.clone()));
-                    model_fields.push(("context", context.clone()));
-                }
-                TuneControl::Model {
-                    model,
-                    effort,
-                    context,
-                } => {
-                    params.push(string_field("setting", "set_model"));
-                    model_fields.push(("model", Some(Some(model.clone()))));
-                    model_fields.push(("effort", effort.clone()));
-                    model_fields.push(("context", context.clone()));
-                }
-                TuneControl::Effort(effort) => {
-                    params.push(string_field("setting", "set_reasoning"));
-                    params.push(string_field("reasoningLevel", effort));
-                }
-            }
-            // Same rule as `spawn`: a model field NAMED but empty crosses as
-            // JSON null, an omitted one stays omitted. Inheritance on the far
-            // side depends on telling those apart.
-            for (name, value) in model_fields {
-                match value {
-                    Some(Some(value)) => params.push(string_field(name, &value)),
-                    Some(None) => params.push(format!("\"{name}\":null")),
-                    None => {}
-                }
-            }
-            Ok(request(
-                identity,
-                "tune",
-                vec![string_field("sessionKey", session_key)],
-                params,
-            ))
-        }
         Command::List { identity } => Ok(request(identity, "inspect", vec![], vec![])),
         Command::Retire {
             identity,
@@ -329,6 +265,39 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             Ok(request(
                 identity,
                 "retire",
+                vec![string_field("sessionKey", session_key)],
+                params,
+            ))
+        }
+        Command::Tune {
+            identity,
+            session_key,
+            control,
+        } => {
+            let params = match control {
+                TuneControl::Harness {
+                    harness,
+                    model,
+                    effort,
+                    context,
+                } => tune_model_params("set_harness", Some(harness), model, effort, context),
+                TuneControl::Model {
+                    model,
+                    effort,
+                    context,
+                } => tune_model_params("set_model", None, model, effort, context),
+                TuneControl::Effort(effort) => vec![
+                    string_field("setting", "set_reasoning"),
+                    string_field("reasoningLevel", effort),
+                ],
+                TuneControl::Fast(value) => vec![
+                    string_field("setting", "set_fast_mode"),
+                    string_field("fastMode", value),
+                ],
+            };
+            Ok(request(
+                identity,
+                "tune",
                 vec![string_field("sessionKey", session_key)],
                 params,
             ))
@@ -415,6 +384,72 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 string_field("action", action),
             ],
         )),
+        Command::OperatorAsk {
+            identity,
+            question,
+            note,
+            options,
+            assignment_id,
+            deadline_ms,
+            supersedes,
+        } => {
+            let mut params = vec![string_field("question", question)];
+            if let Some(value) = note {
+                params.push(string_field("note", value));
+            }
+            if let Some(labels) = options {
+                let options = labels
+                    .iter()
+                    .map(|label| serde_json::json!({"label": label}))
+                    .collect::<Vec<_>>();
+                params.push(format!(
+                    "\"options\":{}",
+                    serde_json::to_string(&options).expect("operator option labels serialize")
+                ));
+            }
+            if let Some(value) = assignment_id {
+                params.push(string_field("assignment", value));
+            }
+            if let Some(value) = deadline_ms {
+                params.push(format!("\"deadline\":{value}"));
+            }
+            if let Some(value) = supersedes {
+                params.push(string_field("supersedes", value));
+            }
+            Ok(request(identity, "operator-ask", vec![], params))
+        }
+        Command::OperatorRule {
+            identity,
+            request_id,
+            decision,
+            response,
+            rationale,
+        } => {
+            let mut params = vec![string_field("request", request_id)];
+            if let Some(value) = decision {
+                params.push(string_field("decision", value));
+            }
+            if let Some(value) = response {
+                params.push(string_field("response", value));
+            }
+            if let Some(value) = rationale {
+                params.push(string_field("rationale", value));
+            }
+            Ok(request(identity, "operator-rule", vec![], params))
+        }
+        Command::OperatorWithdraw {
+            identity,
+            request_id,
+            reason,
+        } => Ok(request(
+            identity,
+            "operator-withdraw",
+            vec![],
+            vec![
+                string_field("request", request_id),
+                string_field("reason", reason),
+            ],
+        )),
         Command::DecisionRequests { identity, status } => {
             let mut params = Vec::new();
             if let Some(value) = status {
@@ -422,54 +457,6 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             }
             Ok(request(identity, "decision-requests", vec![], params))
         }
-        // `ask` carries a TYPED TARGET, exactly like `wake`: the gateway resolves
-        // a role's binding (and its fallback) once, at the door.
-        Command::Ask {
-            identity,
-            target,
-            question,
-            about,
-        } => {
-            let target = match target {
-                Target::Session(value) => string_field("sessionKey", value),
-                Target::Role(value) => string_field("role", value),
-                Target::User(value) => string_field("userId", value),
-            };
-            let mut params = vec![string_field("question", question)];
-            if let Some(value) = about {
-                params.push(string_field("assignmentId", value));
-            }
-            Ok(request(identity, "ask", vec![target], params))
-        }
-        // `answer` carries NO target: the request id already names who was asked,
-        // and volunteering a session here would make the verb an existence oracle.
-        Command::Answer {
-            identity,
-            request_id,
-            answer,
-        } => Ok(request(
-            identity,
-            "answer",
-            vec![],
-            vec![
-                string_field("request", request_id),
-                string_field("answer", answer),
-            ],
-        )),
-        // `return` has the same no-target privacy boundary as `answer`.
-        Command::ReturnRequest {
-            identity,
-            request_id,
-            reason,
-        } => Ok(request(
-            identity,
-            "return",
-            vec![],
-            vec![
-                string_field("request", request_id),
-                string_field("reason", reason),
-            ],
-        )),
         Command::RevokeAssignment {
             identity,
             assignment_id,
@@ -478,19 +465,6 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             "revoke-assignment",
             vec![],
             vec![string_field("assignmentId", assignment_id)],
-        )),
-        Command::ReopenAssignment {
-            identity,
-            assignment_id,
-            reason,
-        } => Ok(request(
-            identity,
-            "reopen-assignment",
-            vec![],
-            vec![
-                string_field("assignmentId", assignment_id),
-                string_field("reason", reason),
-            ],
         )),
         Command::WorkItemCreate {
             identity,
@@ -568,35 +542,14 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             }
             Ok(request(identity, "transcript", vec![], params))
         }
-        Command::TurnTrace {
-            identity,
-            session,
-            seq,
-        } => Ok(request(
-            identity,
-            "turn-trace",
-            vec![],
-            vec![
-                string_field("sessionKey", session),
-                format!("\"turnSeq\":{seq}"),
-            ],
-        )),
         Command::Toplines {
             identity,
             filters,
             tree,
-            after,
-            limit,
         } => {
             let mut params = filter_params(filters);
             if *tree {
                 params.push("\"tree\":true".to_owned());
-            }
-            if let Some(value) = after {
-                params.push(string_field("after", value));
-            }
-            if let Some(value) = limit {
-                params.push(format!("\"limit\":{value}"));
             }
             Ok(request(identity, "toplines", vec![], params))
         }
@@ -705,41 +658,11 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
         Command::Attests {
             identity,
             assignment_id,
-            after,
-            limit,
-        } => {
-            let mut params = vec![string_field("assignmentId", assignment_id)];
-            if let Some(value) = after {
-                params.push(string_field("after", value));
-            }
-            if let Some(value) = limit {
-                params.push(format!("\"limit\":{value}"));
-            }
-            Ok(request(identity, "attests", vec![], params))
-        }
-        Command::CoordinationShare {
-            identity,
-            session,
-            from,
-            to,
         } => Ok(request(
             identity,
-            "coordination-share",
+            "attests",
             vec![],
-            // The measured session travels as an ordinary param: the router
-            // declares this verb non-target so the read never doubles as a
-            // session-existence oracle.
-            vec![
-                string_field("session", session),
-                format!("\"from\":{from}"),
-                format!("\"to\":{to}"),
-            ],
-        )),
-        Command::DigestMembers { identity, wake_id } => Ok(request(
-            identity,
-            "digest-members",
-            vec![],
-            vec![string_field("wakeId", wake_id)],
+            vec![string_field("assignmentId", assignment_id)],
         )),
         Command::Assignments {
             identity,
@@ -933,6 +856,22 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 string_field("name", name),
             ],
         )),
+        Command::HostToolchainSet {
+            identity,
+            host,
+            dirs,
+        } => Ok(request(
+            identity,
+            "host-toolchain-set",
+            vec![],
+            vec![
+                string_field("host", host),
+                format!(
+                    "\"dirs\":{}",
+                    serde_json::to_string(dirs).expect("toolchain directories serialize")
+                ),
+            ],
+        )),
         Command::HarnessProcesses { identity } => {
             Ok(request(identity, "harness-processes", vec![], vec![]))
         }
@@ -1051,11 +990,7 @@ where
     let token = get_env("TIGHTBEAM_TOKEN").filter(|value| !value.is_empty());
     if let (Some(base), Some(token)) = (url, token) {
         return Ok(Endpoint {
-            // The configured URL names the advertised websocket endpoint in the
-            // same way gateway.json and .tightbeam-session do. Every configured
-            // client path roots the HTTP dispatch route, so all three readers
-            // must apply the same scheme conversion.
-            base: http_scheme(&base),
+            base,
             token,
             origin: Origin::Named,
         });
@@ -1235,36 +1170,6 @@ fn send_to_with_timeout(
     request: &RequestSpec,
     timeout: Option<Duration>,
 ) -> Result<Option<Value>, String> {
-    with_one_dns_retry(|| send_once(endpoint, request, timeout))
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum SendAttemptError {
-    Dns(String),
-    Final(String),
-}
-
-/// Retry exactly one failure that proves no request reached the gateway.
-///
-/// DNS failure happens before a connection exists, so this is safe for reads and
-/// mutations alike. No status, body, connection, or timeout error is replayed.
-fn with_one_dns_retry<T>(
-    mut attempt: impl FnMut() -> Result<T, SendAttemptError>,
-) -> Result<T, String> {
-    match attempt() {
-        Err(SendAttemptError::Dns(_)) => attempt().map_err(|error| match error {
-            SendAttemptError::Dns(message) | SendAttemptError::Final(message) => message,
-        }),
-        Err(SendAttemptError::Final(message)) => Err(message),
-        Ok(value) => Ok(value),
-    }
-}
-
-fn send_once(
-    endpoint: &Endpoint,
-    request: &RequestSpec,
-    timeout: Option<Duration>,
-) -> Result<Option<Value>, SendAttemptError> {
     let call = gateway_request("POST", endpoint, request.path, timeout)
         .set("content-type", "application/json")
         .send_string(&request.body_json);
@@ -1272,17 +1177,35 @@ fn send_once(
     let (status, response) = match call {
         Ok(response) => (response.status(), response),
         Err(ureq::Error::Status(status, response)) => (status, response),
-        Err(ureq::Error::Transport(error)) if error.kind() == ureq::ErrorKind::Dns => {
-            return Err(SendAttemptError::Dns(error.to_string()));
-        }
-        Err(ureq::Error::Transport(error)) => {
-            return Err(SendAttemptError::Final(error.to_string()));
+        Err(ureq::Error::Transport(error)) => return Err(error.to_string()),
+    };
+    let encoded = response.into_string().map_err(|error| error.to_string())?;
+    if !(200..300).contains(&status) && request.body_json.contains(r#""verb":"tune""#) {
+        return Err(tune_refusal_json(&encoded));
+    }
+    parse_response(status, &encoded)
+}
+
+fn tune_refusal_json(encoded: &str) -> String {
+    let parsed: Value = match serde_json::from_str(encoded) {
+        Ok(parsed) => parsed,
+        Err(error) => return error.to_string(),
+    };
+    let error = parsed.get("error").unwrap_or(&parsed);
+    let mut refusal = match error.as_object() {
+        Some(fields) => fields.clone(),
+        None => {
+            return serde_json::to_string(&serde_json::json!({
+                "ok": false,
+                "code": "undefined",
+                "message": ""
+            }))
+            .expect("JSON value serializes");
         }
     };
-    let encoded = response
-        .into_string()
-        .map_err(|error| SendAttemptError::Final(error.to_string()))?;
-    parse_response(status, &encoded).map_err(SendAttemptError::Final)
+    refusal.insert("ok".to_owned(), Value::Bool(false));
+
+    serde_json::to_string(&Value::Object(refusal)).expect("JSON value serializes")
 }
 
 pub(crate) fn gateway_request(
@@ -1457,11 +1380,20 @@ where
         }
         Command::UpdateClients { as_user } => crate::ceremonies::update_clients(&as_user),
         Command::Assimilate(args) => crate::ceremonies::assimilate(args),
+        Command::GithubAuthCheck => crate::github_auth::check_tool_call_stdin(),
         Command::Onboard {
             identity,
             provider,
             api_key,
+            hostname,
+            remote,
         } => {
+            if provider == "github" {
+                return crate::github_auth::onboard(
+                    hostname.as_deref().unwrap_or("github.com"),
+                    remote.as_deref(),
+                );
+            }
             let endpoint = discover_endpoint()?;
             require_session_endpoint(&identity, &endpoint)?;
             crate::ceremonies::onboard(
@@ -1523,27 +1455,23 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::Artifacts { identity, .. }
         | Command::Spawn { identity, .. }
         | Command::List { identity }
-        | Command::Tune { identity, .. }
         | Command::Retire { identity, .. }
+        | Command::Tune { identity, .. }
         | Command::Assign { identity, .. }
         | Command::Dispatch { identity, .. }
         | Command::EffortRule { identity, .. }
+        | Command::OperatorAsk { identity, .. }
+        | Command::OperatorRule { identity, .. }
+        | Command::OperatorWithdraw { identity, .. }
         | Command::DecisionRequests { identity, .. }
-        | Command::Ask { identity, .. }
-        | Command::Answer { identity, .. }
-        | Command::ReturnRequest { identity, .. }
         | Command::RevokeAssignment { identity, .. }
-        | Command::ReopenAssignment { identity, .. }
         | Command::WorkItemCreate { identity, .. }
         | Command::WorkItemGet { identity, .. }
         | Command::WorkItemTrace { identity, .. }
         | Command::Attend { identity, .. }
         | Command::Transcript { identity, .. }
-        | Command::TurnTrace { identity, .. }
         | Command::Toplines { identity, .. }
         | Command::Topline { identity, .. }
-        | Command::CoordinationShare { identity, .. }
-        | Command::DigestMembers { identity, .. }
         | Command::WorkItemIcebox { identity, .. }
         | Command::WorkItemReopen { identity, .. }
         | Command::WorkItemClose { identity, .. }
@@ -1567,14 +1495,39 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::HostEnvSet { identity, .. }
         | Command::HostEnvList { identity, .. }
         | Command::HostEnvUnset { identity, .. }
+        | Command::HostToolchainSet { identity, .. }
         | Command::HarnessProcesses { identity } => Some(identity),
         Command::Help
         | Command::CommandHelp(_)
         | Command::Doctor { .. }
         | Command::ToolCallObserved
+        | Command::GithubAuthCheck
         | Command::UpdateClients { .. }
         | Command::Assimilate(_) => None,
     }
+}
+
+fn tune_model_params(
+    setting: &str,
+    harness: Option<&String>,
+    model: &String,
+    effort: &Option<String>,
+    context: &Option<String>,
+) -> Vec<String> {
+    let mut params = vec![
+        string_field("setting", setting),
+        string_field("model", model),
+    ];
+    if let Some(harness) = harness {
+        params.push(string_field("harness", harness));
+    }
+    if let Some(effort) = effort {
+        params.push(string_field("effort", effort));
+    }
+    if let Some(context) = context {
+        params.push(string_field("context", context));
+    }
+    params
 }
 
 #[cfg(test)]
@@ -1593,126 +1546,40 @@ mod tests {
     }
 
     #[test]
-    fn builds_byte_exact_tune_bodies_for_each_typed_control() {
-        // The `setting` word comes from the VARIANT, not from the caller.
-        // `sessionKey` is a body-root target field (the router resolves it),
-        // and the model identity crosses as separate fields.
-        assert_eq!(
-            body(&[
-                "tune",
-                "--session",
-                "agent:coder:x s_1",
-                "--harness",
-                "codex",
-                "--model",
-                "gpt-5.6-sol",
-                "--effort",
-                "high",
-                "--as-user",
-                "flynn",
-            ]),
-            r#"{"asUser":"flynn","verb":"tune","sessionKey":"agent:coder:x s_1","params":{"setting":"set_harness","harness":"codex","model":"gpt-5.6-sol","effort":"high"}}"#
-        );
-
-        // No model named: REFUSED at parse time (v0.2 program §4 — the
-        // substrate never elects a destination model). This body can no
-        // longer be built at all, so there is nothing byte-exact to assert
-        // here; `args::tune_refuses_a_packed_model_an_invented_harness_and_a_partial_naming`
-        // covers the refusal itself.
-        assert_eq!(
-            args::parse(
-                [
-                    "tune",
-                    "--session",
-                    "s_1",
-                    "--harness",
-                    "codex",
-                    "--as-user",
-                    "flynn"
-                ]
-                .iter()
-                .map(|value| (*value).to_owned())
-                .collect()
-            ),
-            Err(
-                "--harness requires --model: the substrate does not choose one \
-                 (model_required)"
-                    .to_owned()
-            )
-        );
-
-        assert_eq!(
-            body(&[
-                "tune",
-                "--session",
-                "s_1",
-                "--model",
-                "claude-fable-5",
-                "--context",
-                "1m",
-                "--as-user",
-                "flynn",
-            ]),
-            r#"{"asUser":"flynn","verb":"tune","sessionKey":"s_1","params":{"setting":"set_model","model":"claude-fable-5","context":"1m"}}"#
-        );
-
-        // NAMED EMPTY crosses as JSON null, exactly as it does on spawn: the
-        // vendor's default window is a selection, not a silence.
-        assert_eq!(
-            body(&[
-                "tune",
-                "--session",
-                "s_1",
-                "--model",
-                "claude-fable-5",
-                "--context",
-                "",
-                "--as-user",
-                "flynn",
-            ]),
-            r#"{"asUser":"flynn","verb":"tune","sessionKey":"s_1","params":{"setting":"set_model","model":"claude-fable-5","context":null}}"#
-        );
-
-        // The effort form spells the gateway's column word. Without the
-        // router's `tune` param alias this arrives as `reasoning_level`,
-        // matches no branch, and comes back "tune does not support
-        // set_reasoning yet" — a caller's election answered as an unbuilt
-        // feature.
-        assert_eq!(
-            body(&[
-                "tune",
-                "--session",
-                "s_1",
-                "--effort",
-                "xhigh",
-                "--as-user",
-                "flynn"
-            ]),
-            r#"{"asUser":"flynn","verb":"tune","sessionKey":"s_1","params":{"setting":"set_reasoning","reasoningLevel":"xhigh"}}"#
-        );
-    }
-
-    #[test]
-    fn turn_trace_is_a_non_target_read_with_numeric_sequence() {
-        assert_eq!(
-            body(&[
-                "turn-trace",
-                "--session",
-                "agent:coder:x s_1",
-                "--seq",
-                "17",
-                "--as-user",
-                "flynn",
-            ]),
-            r#"{"asUser":"flynn","verb":"turn-trace","params":{"sessionKey":"agent:coder:x s_1","turnSeq":17}}"#
-        );
-    }
-
-    #[test]
     fn builds_harness_process_list_request() {
         assert_eq!(
             body(&["harness-process", "list", "--as-user", "flynn"]),
             r#"{"asUser":"flynn","verb":"harness-processes","params":{}}"#
+        );
+    }
+
+    #[test]
+    fn tune_refusals_remain_machine_readable_json() {
+        assert_eq!(
+            tune_refusal_json(r#"{"error":{"code":"same_harness","message":"omit --harness"}}"#),
+            r#"{"code":"same_harness","message":"omit --harness","ok":false}"#
+        );
+    }
+
+    #[test]
+    fn tune_refusals_preserve_verified_runtime_and_cleanup_fields() {
+        let refusal = tune_refusal_json(
+            r#"{"error":{"code":"runtime_config_mismatch","message":"readback differed","model":"gpt-5.6-sol","effort":"high","projectionCommitted":false,"cleanupStatus":"unverified","lifecycleEventId":"le_123","warnings":["candidate close unverified"]}}"#,
+        );
+
+        assert_eq!(
+            serde_json::from_str::<Value>(&refusal).unwrap(),
+            serde_json::json!({
+                "ok": false,
+                "code": "runtime_config_mismatch",
+                "message": "readback differed",
+                "model": "gpt-5.6-sol",
+                "effort": "high",
+                "projectionCommitted": false,
+                "cleanupStatus": "unverified",
+                "lifecycleEventId": "le_123",
+                "warnings": ["candidate close unverified"]
+            })
         );
     }
 
@@ -1883,229 +1750,6 @@ mod tests {
             ]),
             r#"{"asUser":"flynn","verb":"wake","userId":"mike","params":{"prompt":"go","at":16}}"#
         );
-    }
-
-    #[test]
-    fn builds_byte_exact_classed_wake_and_coordination_share_bodies() {
-        // The sender's election rides as an ordinary param, and an EXTENDED
-        // class travels unchanged: the CLI validates that a class is a name,
-        // never that it is one of the five (coordination-fabric-v1 §7).
-        assert_eq!(
-            body(&[
-                "wake",
-                "--role",
-                "owner",
-                "--prompt",
-                "the build finished",
-                "--class",
-                "fyi",
-                "--as",
-                "coder",
-            ]),
-            r#"{"as":"coder","verb":"wake","role":"owner","params":{"prompt":"the build finished","class":"fyi"}}"#
-        );
-        assert_eq!(
-            body(&[
-                "wake",
-                "--role",
-                "owner",
-                "--prompt",
-                "pain",
-                "--class",
-                "kungfu:deploy-window",
-                "--as",
-                "coder",
-            ]),
-            r#"{"as":"coder","verb":"wake","role":"owner","params":{"prompt":"pain","class":"kungfu:deploy-window"}}"#
-        );
-        assert_eq!(
-            args::parse(
-                [
-                    "wake", "--role", "owner", "--prompt", "go", "--class", "", "--as", "coder"
-                ]
-                .iter()
-                .map(|v| (*v).to_owned())
-                .collect()
-            )
-            .unwrap_err(),
-            "--class requires a class name"
-        );
-        // The measured session is a param, never a typed target: the router
-        // declares this verb non-target so the read is not an existence oracle.
-        assert_eq!(
-            body(&[
-                "coordination-share",
-                "--session",
-                "agent:po",
-                "--from",
-                "100",
-                "--to",
-                "200",
-                "--as-user",
-                "flynn",
-            ]),
-            r#"{"asUser":"flynn","verb":"coordination-share","params":{"session":"agent:po","from":100,"to":200}}"#
-        );
-        for missing in [
-            &["coordination-share", "--from", "1", "--to", "2"][..],
-            &["coordination-share", "--session", "agent:po", "--to", "2"][..],
-            &["coordination-share", "--session", "agent:po", "--from", "1"][..],
-        ] {
-            let mut argv = missing.to_vec();
-            argv.extend_from_slice(&["--as-user", "flynn"]);
-            assert!(args::parse(argv.iter().map(|v| (*v).to_owned()).collect()).is_err());
-        }
-    }
-
-    #[test]
-    fn builds_byte_exact_digest_members_body() {
-        // O5: the same positional-id shape `work-item-get` uses — the wake id
-        // travels as an ordinary `wakeId` param, never a typed target.
-        assert_eq!(
-            body(&["digest-members", "w_abc123", "--as-user", "flynn"]),
-            r#"{"asUser":"flynn","verb":"digest-members","params":{"wakeId":"w_abc123"}}"#
-        );
-        assert!(
-            args::parse(
-                ["digest-members", "--as-user", "flynn"]
-                    .iter()
-                    .map(|v| (*v).to_owned())
-                    .collect()
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn builds_byte_exact_ask_answer_return_and_cursor_bodies() {
-        // `ask` carries a typed target; `answer` and `return` carry none,
-        // because the request id already names who was asked (seam ③).
-        assert_eq!(
-            body(&[
-                "ask",
-                "--role",
-                "owner",
-                "--question",
-                "ship behind a flag or block?",
-                "--as",
-                "coder",
-            ]),
-            r#"{"as":"coder","verb":"ask","role":"owner","params":{"question":"ship behind a flag or block?"}}"#
-        );
-        assert_eq!(
-            body(&[
-                "ask",
-                "--session",
-                "agent:po",
-                "--question",
-                "which?",
-                "--about",
-                "as_1",
-                "--as",
-                "coder",
-            ]),
-            r#"{"as":"coder","verb":"ask","sessionKey":"agent:po","params":{"question":"which?","assignmentId":"as_1"}}"#
-        );
-        assert_eq!(
-            body(&[
-                "answer",
-                "--request",
-                "dr_1",
-                "--answer",
-                "behind a flag",
-                "--as-user",
-                "flynn",
-            ]),
-            r#"{"asUser":"flynn","verb":"answer","params":{"request":"dr_1","answer":"behind a flag"}}"#
-        );
-        assert_eq!(
-            body(&[
-                "return",
-                "--request",
-                "dr_1",
-                "--reason",
-                "name the migration",
-                "--as-user",
-                "flynn",
-            ]),
-            r#"{"asUser":"flynn","verb":"return","params":{"request":"dr_1","reason":"name the migration"}}"#
-        );
-        for missing in [
-            &["ask", "--question", "q"][..],
-            &["ask", "--role", "owner"][..],
-            &[
-                "ask",
-                "--role",
-                "owner",
-                "--session",
-                "s",
-                "--question",
-                "q",
-            ][..],
-            &["answer", "--request", "dr_1"][..],
-            &["answer", "--answer", "text"][..],
-            &["return", "--request", "dr_1"][..],
-            &["return", "--reason", "unclear"][..],
-        ] {
-            let mut argv = missing.to_vec();
-            argv.extend_from_slice(&["--as", "coder"]);
-            assert!(args::parse(argv.iter().map(|v| (*v).to_owned()).collect()).is_err());
-        }
-
-        // Seam ④. `--limit` is a JSON NUMBER, and neither flag carries a default:
-        // an unpaged call must build exactly the body it built before.
-        assert_eq!(
-            body(&["attests", "as_1", "--as-user", "flynn"]),
-            r#"{"asUser":"flynn","verb":"attests","params":{"assignmentId":"as_1"}}"#
-        );
-        assert_eq!(
-            body(&[
-                "attests",
-                "as_1",
-                "--after",
-                "at_9",
-                "--limit",
-                "50",
-                "--as-user",
-                "flynn",
-            ]),
-            r#"{"asUser":"flynn","verb":"attests","params":{"assignmentId":"as_1","after":"at_9","limit":50}}"#
-        );
-        assert_eq!(
-            body(&[
-                "toplines",
-                "--after",
-                "wi_1",
-                "--limit",
-                "25",
-                "--as-user",
-                "flynn",
-            ]),
-            r#"{"asUser":"flynn","verb":"toplines","params":{"after":"wi_1","limit":25}}"#
-        );
-        // A forest has no lawful page boundary, and the CLI says so before the
-        // round trip rather than after it.
-        assert_eq!(
-            args::parse(
-                ["toplines", "--tree", "--limit", "5", "--as-user", "flynn"]
-                    .iter()
-                    .map(|v| (*v).to_owned())
-                    .collect()
-            )
-            .unwrap_err(),
-            "--after/--limit page the flat roster; --tree returns a forest"
-        );
-        for bad in [
-            &["attests", "as_1", "--limit", "0"][..],
-            &["attests", "as_1", "--limit", "-1"][..],
-            &["attests", "as_1", "--limit", "abc"][..],
-            &["attests", "as_1", "--after", ""][..],
-            &["toplines", "--after", ""][..],
-        ] {
-            let mut argv = bad.to_vec();
-            argv.extend_from_slice(&["--as-user", "flynn"]);
-            assert!(args::parse(argv.iter().map(|v| (*v).to_owned()).collect()).is_err());
-        }
     }
 
     #[test]
@@ -2354,19 +1998,52 @@ mod tests {
             r#"{"as":"parent","verb":"decision-requests","params":{"status":"open"}}"#
         );
         assert_eq!(
-            body(&["revoke-assignment", "asg_1", "--as", "parent",]),
-            r#"{"as":"parent","verb":"revoke-assignment","params":{"assignmentId":"asg_1"}}"#
-        );
-        assert_eq!(
             body(&[
-                "reopen-assignment",
+                "operator-ask",
+                "--question",
+                "ship window?",
+                "--note",
+                "release train",
+                "--options",
+                "accept,wait",
+                "--assignment",
                 "asg_1",
-                "--reason",
-                "the verdict this card owes was wrong",
+                "--deadline",
+                "2h",
+                "--supersedes",
+                "dr_old",
                 "--as",
                 "parent",
             ]),
-            r#"{"as":"parent","verb":"reopen-assignment","params":{"assignmentId":"asg_1","reason":"the verdict this card owes was wrong"}}"#
+            r#"{"as":"parent","verb":"operator-ask","params":{"question":"ship window?","note":"release train","options":[{"label":"accept"},{"label":"wait"}],"assignment":"asg_1","deadline":7200000,"supersedes":"dr_old"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "operator-rule",
+                "dr_1",
+                "--decision",
+                "accept",
+                "--rationale",
+                "ship 013 first",
+                "--as-user",
+                "mike",
+            ]),
+            r#"{"asUser":"mike","verb":"operator-rule","params":{"request":"dr_1","decision":"accept","rationale":"ship 013 first"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "operator-withdraw",
+                "dr_2",
+                "--reason",
+                "moot after 013",
+                "--as",
+                "parent",
+            ]),
+            r#"{"as":"parent","verb":"operator-withdraw","params":{"request":"dr_2","reason":"moot after 013"}}"#
+        );
+        assert_eq!(
+            body(&["revoke-assignment", "asg_1", "--as", "parent",]),
+            r#"{"as":"parent","verb":"revoke-assignment","params":{"assignmentId":"asg_1"}}"#
         );
         assert_eq!(
             body(&[
@@ -2555,6 +2232,22 @@ mod tests {
     }
 
     #[test]
+    fn builds_byte_exact_host_toolchain_body() {
+        assert_eq!(
+            body(&[
+                "host-toolchain-set",
+                "--host",
+                "gibson",
+                "--dirs",
+                r#"["/tools/one","/tools/two"]"#,
+                "--as-user",
+                "flynn",
+            ]),
+            r#"{"asUser":"flynn","verb":"host-toolchain-set","params":{"host":"gibson","dirs":["/tools/one","/tools/two"]}}"#
+        );
+    }
+
+    #[test]
     fn onboarding_phase_names_the_machine_without_transporting_credentials() {
         let request = build_onboard_phase_request(
             &Identity::User("flynn".to_owned()),
@@ -2684,7 +2377,7 @@ mod tests {
         );
 
         let env = HashMap::from([
-            ("TIGHTBEAM_URL".to_owned(), "ws://gateway".to_owned()),
+            ("TIGHTBEAM_URL".to_owned(), "https://gateway".to_owned()),
             ("TIGHTBEAM_TOKEN".to_owned(), "env-token".to_owned()),
             (
                 "TIGHTBEAM_HOME".to_owned(),
@@ -2694,7 +2387,7 @@ mod tests {
         assert_eq!(
             discover_with(|name| env.get(name).cloned(), &root, &root),
             Ok(Endpoint {
-                base: "http://gateway".to_owned(),
+                base: "https://gateway".to_owned(),
                 token: "env-token".to_owned(),
                 origin: Origin::Named,
             })
@@ -3087,6 +2780,8 @@ mod tests {
                 identity: Identity::User("flynn".to_owned()),
                 provider: "openai".to_owned(),
                 api_key: false,
+                hostname: None,
+                remote: None,
             },
             || {
                 discoveries.set(discoveries.get() + 1);
@@ -3194,6 +2889,8 @@ mod tests {
                 identity: Identity::User("flynn".to_owned()),
                 provider: "openai".to_owned(),
                 api_key: false,
+                hostname: None,
+                remote: None,
             },
             || {
                 Ok(Endpoint {
@@ -3298,39 +2995,6 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("onboarding lease expired"), "{error}");
-    }
-
-    #[test]
-    fn dns_failure_retries_once_and_no_other_failure_replays() {
-        let mut recovered_calls = 0;
-        let recovered = with_one_dns_retry(|| {
-            recovered_calls += 1;
-            if recovered_calls == 1 {
-                Err(SendAttemptError::Dns("temporary dns failure".to_owned()))
-            } else {
-                Ok("open decisions")
-            }
-        });
-        assert_eq!(recovered, Ok("open decisions"));
-        assert_eq!(recovered_calls, 2);
-
-        let mut persistent_calls = 0;
-        let persistent = with_one_dns_retry::<()>(|| {
-            persistent_calls += 1;
-            Err(SendAttemptError::Dns(format!(
-                "dns failure {persistent_calls}"
-            )))
-        });
-        assert_eq!(persistent, Err("dns failure 2".to_owned()));
-        assert_eq!(persistent_calls, 2);
-
-        let mut final_calls = 0;
-        let final_error = with_one_dns_retry::<()>(|| {
-            final_calls += 1;
-            Err(SendAttemptError::Final("gateway denied".to_owned()))
-        });
-        assert_eq!(final_error, Err("gateway denied".to_owned()));
-        assert_eq!(final_calls, 1);
     }
 
     #[test]

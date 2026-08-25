@@ -12,7 +12,7 @@ end
 defmodule Tightbeam.ConformanceSupport do
   alias Tightbeam.Model
   import ExUnit.Assertions
-  import Tightbeam.TestCase, only: [catalog_reply: 1, ensure_main_session: 2]
+  import Tightbeam.TestCase, only: [catalog_reply: 1]
 
   alias Tightbeam.{
     Archetypes,
@@ -43,7 +43,7 @@ defmodule Tightbeam.ConformanceSupport do
                ~w(case kind expect reason emits input script_return world call phase2 phase)
              )
   @expects MapSet.new(
-             ~w(deny pass refuse run-remedy re-obligate escalate-park none escalate-halt escalate-open escalate-continue load-raise load-clean digest immediate bypass inhibited unclassed filed gates-nothing answered withdrawn returned not-rulable page resume unpaged exhausted roster-page)
+             ~w(deny pass refuse run-remedy re-obligate escalate-park none escalate-halt escalate-open escalate-continue load-raise load-clean)
            )
   @case_expects %{
     "harness-gate" => ~w(deny pass),
@@ -52,25 +52,7 @@ defmodule Tightbeam.ConformanceSupport do
     "handler-refusal" => ~w(refuse pass),
     "remedy" => ~w(run-remedy none escalate-halt escalate-open escalate-continue),
     "sweep" => ~w(run-remedy re-obligate escalate-park none escalate-continue),
-    "capstone" => ~w(deny pass run-remedy re-obligate none),
-    # The five outcomes the delivery policy can reach, plus the one refusal it
-    # owes. Named exhaustively so a sixth outcome cannot be smuggled in as a
-    # variant of an existing word (coordination-fabric-v1 §5, §7).
-    "delivery-policy" => ~w(digest immediate bypass inhibited unclassed refuse),
-    # Seam ③. `gates-nothing` is the anti-adjudication outcome and is a WORD OF
-    # ITS OWN rather than a flavour of `filed`, so a change that quietly let a
-    # question hold a completion would have to delete a named outcome to pass.
-    "question-carrier" => ~w(filed gates-nothing answered withdrawn returned not-rulable refuse),
-    # Seam ④. `unpaged` is likewise its own word: the contract that an unlimited
-    # read still returns everything is the one a default page size would break.
-    "read-cursor" => ~w(page resume unpaged exhausted roster-page refuse),
-    # A live engine switch has exactly two outcomes the substrate may reach: it
-    # applies, or it says no by name. There is no third word — no "queued", no
-    # "applied at the next boundary", no "switched to the nearest available" —
-    # because each of those would be the substrate deciding something on the
-    # caller's behalf (v0.2 program §4). Enumerated so adding one would have to
-    # be written down here first.
-    "live-switch" => ~w(refuse pass)
+    "capstone" => ~w(deny pass run-remedy re-obligate none)
   }
   @load_twins [
     ~w(remedy-target-missing remedy-target-present),
@@ -229,27 +211,7 @@ defmodule Tightbeam.ConformanceSupport do
   defp applicable_runners("script-guard", runners),
     do: Enum.filter(runners, &(&1 == "rail_exec"))
 
-  defp applicable_runners("delivery-policy", runners),
-    do: Enum.filter(runners, &(&1 == "delivery_policy"))
-
-  defp applicable_runners("question-carrier", runners),
-    do: Enum.filter(runners, &(&1 == "question_carrier"))
-
-  defp applicable_runners("read-cursor", runners),
-    do: Enum.filter(runners, &(&1 == "read_cursor"))
-
-  defp applicable_runners("live-switch", runners),
-    do: Enum.filter(runners, &(&1 == "live_switch"))
-
-  defp applicable_runners("harness-gate", runners),
-    do: Enum.filter(runners, &(&1 == "compiled_hook_grep"))
-
-  # F10 (Sol xhigh review): NO CATCH-ALL. Every fixture `kind` this manifest
-  # actually uses has its own clause above; a kind that matches none of them
-  # — a typo, or a future kind nobody wired a runner for — must run NOTHING
-  # and fail loudly (`runners != []` at the call site), not fall back to
-  # every runner the class happens to declare. A silent `runners` pass-through
-  # here is exactly the kind/runner mismatch this function exists to catch.
+  defp applicable_runners(_kind, runners), do: runners
 
   defp load_loadset!(path, class) do
     loadset = path |> decode_toml!() |> Map.fetch!("loadset")
@@ -534,9 +496,6 @@ defmodule Tightbeam.ConformanceSupport do
 
       {"C4", _, "declared-files-overlap"} ->
         run_handler_refusal_fixture(fixture)
-
-      {"C4", _, "reopen-assignment-repair"} ->
-        run_reopen_assignment_fixture(fixture)
 
       {"C4", _, _} ->
         run_rules_fixture(fixture)
@@ -895,635 +854,6 @@ defmodule Tightbeam.ConformanceSupport do
 
   defp assert_fixture_world(_fixture, _kase, _db, _ids), do: :ok
 
-  # The delivery-policy contract (coordination-fabric-v1 §5, §7, Invariant 3).
-  #
-  # Every case goes through `Dispatch.dispatch/3` on the `wake` verb — the same
-  # chokepoint the wire router uses — so the sender's election crosses the real
-  # boundary rather than being handed straight to `Wakes.schedule`. The
-  # assertions below are keyed on the case's DECLARED expect and, for a digest,
-  # its declared exit `reason`: there is no shared "and also check whatever
-  # happened" tail, because a batching mechanism that quietly took a different
-  # exit than the one its case names is exactly the failure worth catching.
-  def run_delivery_policy_fixture(fixture) do
-    Enum.each(fixture["cases"], fn kase ->
-      {db, pid} = memory_db!()
-
-      try do
-        ids = materialize_world(db, Map.get(kase, "world", %{}))
-        call = build_call(kase["call"], ids)
-        handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
-
-        assert_delivery_outcome(kase, db, Dispatch.dispatch(db, handlers, call))
-      after
-        GenServer.stop(pid)
-      end
-    end)
-  end
-
-  defp assert_delivery_outcome(%{"expect" => "refuse"} = kase, db, result) do
-    assert {:error, %{code: code}} = result, "#{kase["case"]}: expected a refusal"
-    assert code == kase["reason"]
-
-    # A refused election writes NOTHING. A wake row here would mean the
-    # substrate accepted a message it told the sender it had rejected.
-    assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM wakes")
-
-    if kase["kind"] == "legibility",
-      do: assert(kase["emits"] == "handler:#{code}")
-  end
-
-  defp assert_delivery_outcome(kase, db, result) do
-    assert {:ok, %{wake_id: wake_id}} = result, "#{kase["case"]}: expected the wake to land"
-    wake = Wakes.get(db, wake_id)
-
-    assert_delivery_policy(kase["expect"], kase, db, wake)
-  end
-
-  defp assert_delivery_policy("unclassed", _kase, db, wake) do
-    assert wake.class == nil
-    assert wake.class_election == nil
-    assert wake.delivery_rule == nil
-    assert Wakes.materialize_digests(db, wake.due_at + 1) == []
-  end
-
-  defp assert_delivery_policy("immediate", _kase, db, wake) do
-    assert wake.delivery_rule =~ "immediate-delivery"
-    assert wake.due_at <= wake.created_at
-    assert Wakes.materialize_digests(db, wake.due_at + 1) == []
-  end
-
-  defp assert_delivery_policy("bypass", _kase, db, wake) do
-    assert wake.delivery_rule =~ "algedonic-bypass"
-    assert wake.due_at <= wake.created_at
-
-    assert Wakes.materialize_digests(db, wake.due_at + 1) == [],
-           "an alarm the batcher can absorb is not an alarm"
-  end
-
-  defp assert_delivery_policy("inhibited", _kase, db, wake) do
-    assert wake.delivery_rule == Wakes.inhibited_rule()
-    assert wake.class != nil, "inhibiting the batcher must not erase what was said"
-    assert wake.due_at > wake.created_at
-    assert Wakes.materialize_digests(db, wake.due_at + 1) == []
-  end
-
-  defp assert_delivery_policy("digest", kase, db, wake) do
-    policy = Wakes.delivery_policy(wake.class)
-
-    assert wake.delivery_rule == Wakes.digest_rule()
-    assert wake.class_election == "sender"
-    assert wake.due_at - wake.created_at == policy.ceiling_ms
-
-    if policy.skew do
-      assert lifecycle_detail(db, "wake_class_policy_skew", wake.wake_id) =~
-               "class=#{wake.class}"
-    else
-      assert lifecycle_detail(db, "wake_class_policy_skew", wake.wake_id) == nil
-    end
-
-    case kase["reason"] do
-      "ceiling" -> assert_ceiling_exit(kase, db, wake, policy)
-      "turn-boundary" -> assert_turn_boundary_exit(db, wake)
-      nil -> :ok
-    end
-  end
-
-  # INVARIANT 3, the idle half: nobody comes back for this session, and the
-  # digest still materializes its own turn at the ceiling.
-  defp assert_ceiling_exit(kase, db, wake, policy) do
-    assert Wakes.materialize_digests(db, wake.created_at + policy.ceiling_ms - 1) == []
-    assert [digest_id] = Wakes.materialize_digests(db, wake.created_at + policy.ceiling_ms)
-
-    digest = Wakes.get(db, digest_id)
-    assert digest.digest
-    assert digest.class == wake.class
-    assert digest.prompt =~ Wakes.digest_signature(1)
-
-    # LAW 2: the source row is still here, and it names where its payload went.
-    carried = Wakes.get(db, wake.wake_id)
-    assert carried.state == "canceled"
-    assert carried.prompt == wake.prompt
-    assert [%{wake_id: source}] = Wakes.digest_members(db, digest_id)
-    assert source == wake.wake_id
-
-    if kase["kind"] == "legibility" do
-      detail = lifecycle_detail(db, "wake_digest_materialized", digest_id)
-      assert kase["emits"] == "lifecycle:wake_digest_materialized"
-      assert detail =~ "rule=#{Wakes.digest_rule()}"
-      assert detail =~ "trigger=ceiling"
-    end
-  end
-
-  # INVARIANT 3, the boundary half: a turn of the target's own ends, and the
-  # digest lands there rather than waiting out the ceiling.
-  defp assert_turn_boundary_exit(db, wake) do
-    seq = System.unique_integer([:positive, :monotonic])
-
-    {:ok, _} =
-      DB.query(
-        db,
-        """
-        INSERT INTO turns
-          (seq, sessionKey, messageId, origin, prompt, status, createdAt, endedAt)
-        VALUES (?1, ?2, ?3, 'user:owner', 'go', 'delivered', ?4, ?5)
-        """,
-        [seq, wake.session_key, "m_#{seq}", wake.created_at + 1, wake.created_at + 2]
-      )
-
-    assert [digest_id] = Wakes.materialize_digests(db, wake.created_at + 3)
-    assert Wakes.get(db, digest_id).due_at < wake.due_at
-    assert [%{wake_id: source}] = Wakes.digest_members(db, digest_id)
-    assert source == wake.wake_id
-  end
-
-  defp lifecycle_detail(db, kind, subject) do
-    {:ok, rows} =
-      DB.query(
-        db,
-        "SELECT detail FROM lifecycle_events WHERE kind = ?1 AND subject = ?2 ORDER BY id DESC LIMIT 1",
-        [kind, subject]
-      )
-
-    case rows do
-      [[detail]] -> detail
-      [] -> nil
-    end
-  end
-
-  # The agent question-carrier contract (fabric §7, §10; GitHub #11).
-  #
-  # Every case FILES the question through `Dispatch.dispatch/3` and then, per its
-  # declared outcome, takes exactly one more step through the same chokepoint.
-  # There is no shared tail: a carrier that reached a different outcome than the
-  # one its case names is the failure worth catching.
-  def run_question_carrier_fixture(fixture) do
-    Enum.each(fixture["cases"], fn kase ->
-      {db, pid} = memory_db!()
-
-      try do
-        ids = materialize_world(db, Map.get(kase, "world", %{}))
-        handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
-        call = build_call(kase["call"], ids)
-
-        assert_question_outcome(
-          kase["expect"],
-          kase,
-          db,
-          handlers,
-          ids,
-          Dispatch.dispatch(db, handlers, call)
-        )
-      after
-        GenServer.stop(pid)
-      end
-    end)
-  end
-
-  defp assert_question_outcome("refuse", kase, db, _handlers, _ids, result) do
-    assert {:error, %{code: code}} = result, "#{kase["case"]}: expected a refusal"
-    assert code == kase["reason"]
-
-    # A refused question writes NOTHING: no row, and no notification promising
-    # a mind something the substrate told the asker it had rejected.
-    assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM decision_requests")
-    assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM wakes WHERE consumer = 'prompt'")
-  end
-
-  defp assert_question_outcome("filed", kase, db, _handlers, _ids, result) do
-    request = filed!(kase, result)
-
-    assert request.kind == "agent"
-    assert request.status == "open"
-    assert request.raiser_id == "session:" <> request.raiser_session_key
-
-    # NO ADJUDICATION VOCABULARY. Each of these is a column a gate would need.
-    for {field, value} <-
-          Map.take(request, [
-            :statute_name,
-            :action_key,
-            :decision,
-            :rationale,
-            :ruled_by,
-            :ruling_fact_id,
-            :consumed_at,
-            :park_wake_id,
-            :answer
-          ]) do
-      assert value == nil, "#{kase["case"]}: agent question carries #{field}"
-    end
-
-    # The carrier: ONE classed notification at the asked session, elected
-    # `input-needed` by the asker, batched by seam ②'s own policy.
-    assert [wake] = prompt_wakes(db, request.expecter_session_key)
-    # The case DECLARES the class the carrier must elect; nothing here infers it.
-    assert wake.class == (kase["reason"] || "input-needed")
-    assert wake.class_election == "sender"
-    assert wake.delivery_rule == Wakes.digest_rule()
-    assert wake.prompt =~ request.id
-
-    if kase["kind"] == "legibility" do
-      assert kase["emits"] == "lifecycle:decision_request_asked"
-      detail = question_lifecycle(db, "decision_request_asked", request.id)
-      assert detail =~ "asker=#{request.raiser_id}"
-      assert detail =~ "askedOf=#{request.expecter_session_key}"
-    end
-  end
-
-  # THE TRIPWIRE (fabric §10). The question names the assignment its asker
-  # holds, and the completion of that assignment goes through untouched.
-  defp assert_question_outcome("gates-nothing", kase, db, handlers, ids, result) do
-    request = filed!(kase, result)
-    assignment_id = Map.fetch!(ids.assignments, "a1")
-    assert request.assignment_id == assignment_id
-
-    assert {:ok, %{attest: %{kind: "completion"}}} =
-             Dispatch.dispatch(db, handlers, %{
-               verb: "attest",
-               origin: "agent:#{request.raiser_session_key}",
-               principal: {:session, request.raiser_session_key},
-               session_key: nil,
-               params: %{assignment_id: assignment_id, kind: "completion"}
-             })
-
-    # Still open. The asker disposed of its obligation by its own choice and the
-    # question held nothing while it did.
-    assert current_status(db, request.id) == "open"
-  end
-
-  defp assert_question_outcome("answered", kase, db, handlers, _ids, result) do
-    request = filed!(kase, result)
-
-    # A bystander is refused `not_found`, not a kind/authority-revealing
-    # `not_asked` (Sol xhigh review, finding 4): an unauthorized caller must
-    # not be able to tell this id apart from a fake one.
-    assert {:error, %{code: "not_found"}} =
-             Dispatch.dispatch(db, handlers, answer_call("bystander", request.id, "not mine"))
-
-    assert {:ok, %{decision_request: answered}} =
-             Dispatch.dispatch(
-               db,
-               handlers,
-               answer_call(request.expecter_session_key, request.id, "behind a flag")
-             )
-
-    assert answered.status == "answered"
-    assert answered.answer == "behind a flag"
-    assert answered.answered_by == "session:" <> request.expecter_session_key
-
-    # AN ANSWER IS NOT A RULING: nothing is spent and no condition fact is filed,
-    # so no halted call anywhere can be released by it.
-    assert answered.decision == nil
-    assert answered.consumed_at == nil
-    assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM condition_facts")
-
-    # The asker hears about it, unclassed — delivered as every wake was before
-    # Phase 1, because the substrate elects no class on a mind's behalf.
-    assert [reply] = prompt_wakes(db, request.raiser_session_key)
-    assert reply.class == nil
-    assert reply.prompt =~ "behind a flag"
-  end
-
-  defp assert_question_outcome("withdrawn", kase, db, handlers, _ids, result) do
-    request = filed!(kase, result)
-
-    # The principal that was ASKED cannot take the question away from its asker.
-    assert {:error, %{code: "not_raiser"}} =
-             Dispatch.dispatch(db, handlers, %{
-               verb: "withdraw",
-               origin: "agent:#{request.expecter_session_key}",
-               principal: {:session, request.expecter_session_key},
-               session_key: nil,
-               params: %{request: request.id, reason: "not mine"}
-             })
-
-    assert {:ok, %{status: "withdrawn"}} =
-             Dispatch.dispatch(db, handlers, %{
-               verb: "withdraw",
-               origin: "agent:#{request.raiser_session_key}",
-               principal: {:session, request.raiser_session_key},
-               session_key: nil,
-               params: %{request: request.id, reason: "worked it out myself"}
-             })
-
-    assert current_status(db, request.id) == "withdrawn"
-  end
-
-  defp assert_question_outcome("returned", kase, db, handlers, _ids, result) do
-    request = filed!(kase, result)
-
-    # An unasked bystander learns no more than a caller probing a fake id.
-    assert {:error, %{code: "not_found"}} =
-             Dispatch.dispatch(
-               db,
-               handlers,
-               return_call("bystander", request.id, "missing the rollback boundary")
-             )
-
-    assert {:ok, %{decision_request: returned}} =
-             Dispatch.dispatch(
-               db,
-               handlers,
-               return_call(
-                 request.expecter_session_key,
-                 request.id,
-                 "missing the rollback boundary"
-               )
-             )
-
-    assert returned.status == "returned"
-    assert returned.question == request.question
-    assert returned.return_reason == "missing the rollback boundary"
-    assert returned.returned_by == "session:" <> request.expecter_session_key
-    assert is_integer(returned.returned_at)
-    assert returned.answer == nil
-
-    # Default open retrieval no longer includes the returned row, while the
-    # explicit terminal filter preserves its full reasoned history.
-    assert {:ok, %{decision_requests: []}} =
-             Dispatch.dispatch(db, handlers, %{
-               verb: "decision-requests",
-               origin: "agent:#{request.raiser_session_key}",
-               principal: {:session, request.raiser_session_key},
-               session_key: nil,
-               params: %{status: "open"}
-             })
-
-    assert {:ok, %{decision_requests: [%{id: id, status: "returned"}]}} =
-             Dispatch.dispatch(db, handlers, %{
-               verb: "decision-requests",
-               origin: "agent:#{request.raiser_session_key}",
-               principal: {:session, request.raiser_session_key},
-               session_key: nil,
-               params: %{status: "returned"}
-             })
-
-    assert id == request.id
-    assert [notice] = prompt_wakes(db, request.raiser_session_key)
-    assert notice.prompt =~ request.question
-    assert notice.prompt =~ returned.return_reason
-    assert notice.prompt =~ "Revise or replace"
-
-    detail = question_lifecycle(db, "decision_request_returned", request.id)
-    assert detail =~ "by=#{returned.returned_by}"
-  end
-
-  defp assert_question_outcome("not-rulable", kase, db, handlers, _ids, result) do
-    request = filed!(kase, result)
-
-    for verb <- ~w(rule waive) do
-      assert {:error, %{code: "invalid", message: message}} =
-               Dispatch.dispatch(db, handlers, %{
-                 verb: verb,
-                 origin: "user:root",
-                 principal: {:user, "root"},
-                 session_key: nil,
-                 params: %{request: request.id, decision: "allow"}
-               }),
-             "#{kase["case"]}: #{verb} reached an agent question"
-
-      assert message =~ "answered, not"
-    end
-
-    assert current_status(db, request.id) == "open"
-  end
-
-  defp filed!(kase, result) do
-    assert {:ok, %{decision_request: request}} = result,
-           "#{kase["case"]}: expected the question to be filed"
-
-    request
-  end
-
-  defp answer_call(session_key, request_id, text) do
-    %{
-      verb: "answer",
-      origin: "agent:#{session_key}",
-      principal: {:session, session_key},
-      session_key: nil,
-      params: %{request: request_id, answer: text}
-    }
-  end
-
-  defp return_call(session_key, request_id, reason) do
-    %{
-      verb: "return",
-      origin: "agent:#{session_key}",
-      principal: {:session, session_key},
-      session_key: nil,
-      params: %{request: request_id, reason: reason}
-    }
-  end
-
-  defp current_status(db, id) do
-    {:ok, [[status]]} = DB.query(db, "SELECT status FROM decision_requests WHERE id = ?1", [id])
-    status
-  end
-
-  defp prompt_wakes(db, session_key) do
-    {:ok, rows} =
-      DB.query(
-        db,
-        "SELECT wakeId FROM wakes WHERE sessionKey = ?1 AND consumer = 'prompt' AND state = 'pending' ORDER BY createdAt, wakeId",
-        [session_key]
-      )
-
-    Enum.map(rows, fn [id] -> Wakes.get(db, id) end)
-  end
-
-  defp question_lifecycle(db, kind, subject) do
-    {:ok, [[detail]]} =
-      DB.query(
-        db,
-        "SELECT detail FROM lifecycle_events WHERE kind = ?1 AND subject = ?2 ORDER BY id DESC LIMIT 1",
-        [kind, subject]
-      )
-
-    detail
-  end
-
-  # The read-cursor contract (fabric §13 Phase 1 seam ④; GitHub #13).
-  #
-  # Cursor VALUES are not written into the cases: the fixture states the law
-  # over pages, and the runner reads the full list to learn the ids. A fixture
-  # that hardcoded them would be pinning today's uuids, not the contract.
-  def run_read_cursor_fixture(fixture) do
-    Enum.each(fixture["cases"], fn kase ->
-      {db, pid} = memory_db!()
-
-      try do
-        ids = materialize_world(db, Map.get(kase, "world", %{}))
-        handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
-        call = build_call(kase["call"], ids)
-
-        assert_cursor_outcome(kase["expect"], kase, db, handlers, call)
-      after
-        GenServer.stop(pid)
-      end
-    end)
-  end
-
-  defp assert_cursor_outcome("refuse", kase, db, handlers, call) do
-    assert {:error, %{code: code}} = Dispatch.dispatch(db, handlers, call),
-           "#{kase["case"]}: expected a refusal"
-
-    assert code == kase["reason"]
-
-    if kase["kind"] == "legibility", do: assert(kase["emits"] == "handler:#{code}")
-  end
-
-  defp assert_cursor_outcome("unpaged", kase, db, handlers, call) do
-    assert {:ok, page} = Dispatch.dispatch(db, handlers, call)
-
-    # NO DEFAULT LIMIT. Every row the assignment carries. And, since neither
-    # `--after` nor `--limit` was named, the response carries ONLY `attests`
-    # — no `next_after`/`has_more_after` paging vocabulary added (Sol xhigh
-    # review, finding 8: those keys are PAGING vocabulary, and a caller that
-    # never asked to page must see zero payload change).
-    assert length(page.attests) == length(Map.get(kase["world"], "attests"))
-    assert page == %{attests: page.attests}
-  end
-
-  defp assert_cursor_outcome("page", kase, db, handlers, call) do
-    limit = call.params.limit
-    assert kase["reason"] == "limit", "#{kase["case"]}: this page is bounded by its limit"
-    assert {:ok, page} = Dispatch.dispatch(db, handlers, call)
-
-    assert length(page.attests) == limit
-    assert page.has_more_after, "#{kase["case"]}: a short page must say more follows"
-    assert page.next_after == List.last(page.attests).id
-  end
-
-  # THE WHOLE LAW, stated over the concatenation rather than any one page: the
-  # walk reproduces the unpaged list exactly — no row lost, none repeated, even
-  # across attests that share a millisecond.
-  defp assert_cursor_outcome("resume", _kase, db, handlers, call) do
-    assert {:ok, whole} =
-             Dispatch.dispatch(db, handlers, %{call | params: %{call.params | limit: nil}})
-
-    expected = Enum.map(whole.attests, & &1.id)
-    assert length(expected) > call.params.limit
-
-    assert walk(db, handlers, call, nil, []) == expected
-  end
-
-  defp assert_cursor_outcome("exhausted", _kase, db, handlers, call) do
-    assert {:ok, whole} = Dispatch.dispatch(db, handlers, call)
-    last = List.last(whole.attests).id
-
-    assert {:ok, past} =
-             Dispatch.dispatch(db, handlers, %{
-               call
-               | params: Map.put(call.params, :after, last)
-             })
-
-    assert past.attests == []
-    assert past.next_after == nil
-    assert past.has_more_after == false
-  end
-
-  defp assert_cursor_outcome("roster-page", _kase, db, handlers, call) do
-    assert {:ok, whole} = Dispatch.dispatch(db, handlers, %{call | params: %{}})
-    expected = Enum.map(whole.items, & &1.id)
-
-    assert {:ok, first} = Dispatch.dispatch(db, handlers, call)
-    assert Enum.map(first.items, & &1.id) == Enum.take(expected, call.params.limit)
-    assert first.has_more_after
-
-    assert {:ok, second} =
-             Dispatch.dispatch(db, handlers, %{
-               call
-               | params: Map.put(call.params, :after, first.next_after)
-             })
-
-    assert Enum.map(first.items, & &1.id) ++ Enum.map(second.items, & &1.id) == expected
-    assert second.has_more_after == false
-  end
-
-  defp walk(db, handlers, call, cursor, seen) do
-    params = if cursor, do: Map.put(call.params, :after, cursor), else: call.params
-    assert {:ok, page} = Dispatch.dispatch(db, handlers, %{call | params: params})
-    seen = seen ++ Enum.map(page.attests, & &1.id)
-
-    if page.has_more_after, do: walk(db, handlers, call, page.next_after, seen), else: seen
-  end
-
-  @doc """
-  A live engine switch, driven through the DISPATCH CHOKEPOINT so the election
-  crosses the same seam an org would rail, and answered with a NAMED refusal.
-
-  Every case asserts three things, not one: the refusal is named, the session's
-  engine identity is byte-identical afterwards, and no transcript row was
-  appended. The second and third are what make a refusal free — a "no" that
-  still moved the history barrier would satisfy the first assertion alone.
-  """
-  def run_live_switch_fixture(fixture) do
-    Enum.each(fixture["cases"], fn kase ->
-      {db, pid} = memory_db!()
-
-      try do
-        ids = materialize_world(db, Map.get(kase, "world", %{}))
-        call = build_call(kase["call"], ids)
-        handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
-        before = live_switch_identity(db, call.session_key)
-
-        result = Dispatch.dispatch(db, handlers, call)
-
-        case kase["expect"] do
-          "refuse" ->
-            assert {:error, %{code: code}} = result,
-                   "#{kase["case"]}: expected a named refusal, got #{inspect(result)}"
-
-            assert code == kase["reason"],
-                   "#{kase["case"]}: the refusal must be named #{kase["reason"]}, got #{code}"
-
-          "pass" ->
-            assert {:ok, _} = result, "#{kase["case"]}: expected the switch to apply"
-        end
-
-        if kase["expect"] == "refuse" do
-          assert live_switch_identity(db, call.session_key) == before,
-                 "#{kase["case"]}: a refused switch must leave the session's engine untouched"
-
-          {:ok, [[appended]]} =
-            DB.query(db, "SELECT count(*) FROM messages WHERE sessionKey = ?1", [
-              call.session_key
-            ])
-
-          assert appended == 0,
-                 "#{kase["case"]}: a refused switch must append no marker and bury no row"
-        end
-
-        # A refusal an operator cannot find afterwards is a refusal that will be
-        # argued about. The denial rides the ordinary verb event log, so "who
-        # tried to re-engine this session, and what did the substrate say" is a
-        # question rows answer.
-        if kase["kind"] == "legibility" do
-          assert kase["emits"] == "eventlog:denied verb=tune"
-
-          assert Enum.any?(
-                   EventLog.events_after(db, 0, 50),
-                   &(&1.kind == "denied" and &1.verb == "tune")
-                 ),
-                 "#{kase["case"]}: the refused switch left no denied verb event"
-        end
-      after
-        GenServer.stop(pid)
-      end
-    end)
-  end
-
-  defp live_switch_identity(db, session_key) do
-    {:ok, rows} =
-      DB.query(
-        db,
-        "SELECT harness, provider, model, thinkingLevel, modelContext, clearedThroughSeq " <>
-          "FROM sessions WHERE sessionKey = ?1",
-        [session_key]
-      )
-
-    rows
-  end
-
   def run_handler_refusal_fixture(fixture) do
     Enum.each(fixture["cases"], fn kase ->
       {db, pid} = memory_db!()
@@ -1533,15 +863,6 @@ defmodule Tightbeam.ConformanceSupport do
         call = build_call(kase["call"], ids)
         handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
         {:ok, [[before_count]]} = DB.query(db, "SELECT count(*) FROM assignments")
-        files = call.params[:files]
-
-        overlap? =
-          is_list(files) and files != [] and
-            Enum.all?(files, fn path ->
-              is_binary(path) and String.length(String.trim(path)) in 1..2_000
-            end) and Assignments.open_assignments_touching(db, Enum.uniq(files)) != []
-
-        assert_overlap_observation(fixture, db, call, overlap?)
 
         if String.contains?(kase["case"], "concurrent") do
           results =
@@ -1549,15 +870,11 @@ defmodule Tightbeam.ConformanceSupport do
             |> Enum.map(fn _ -> Task.async(fn -> Dispatch.dispatch(db, handlers, call) end) end)
             |> Task.await_many()
 
+          assignments = Enum.map(results, fn {:ok, assignment} -> assignment end)
           {:ok, [[after_count]]} = DB.query(db, "SELECT count(*) FROM assignments")
-          assert Enum.all?(results, &match?({:ok, _}, &1))
-
-          assert results
-                 |> Enum.map(fn {:ok, assignment} -> assignment.id end)
-                 |> Enum.uniq()
-                 |> length() == 2
-
+          assert length(assignments) == 2
           assert after_count == before_count + 2
+          Enum.each(assignments, &assert_advisory_assignment(db, call, &1))
         else
           result = Dispatch.dispatch(db, handlers, call)
           {:ok, [[after_count]]} = DB.query(db, "SELECT count(*) FROM assignments")
@@ -1569,8 +886,13 @@ defmodule Tightbeam.ConformanceSupport do
               assert after_count == before_count
 
             "pass" ->
-              assert {:ok, _} = result
+              assert {:ok, assignment} = result
               assert after_count == before_count + 1
+              assert_advisory_assignment(db, call, assignment)
+
+              if kase["kind"] == "legibility" do
+                assert kase["emits"] == fixture["legibility"]
+              end
           end
         end
       after
@@ -1579,140 +901,23 @@ defmodule Tightbeam.ConformanceSupport do
     end)
   end
 
-  defp assert_overlap_observation(%{"rule" => [_ | _]} = fixture, db, call, overlap?) do
-    base = temp_dir!("conformance-overlap-observation")
-    prepare_rule_base!(base, fixture)
-    Rules.load!(base, Map.keys(Gateway.handlers(%{})))
+  defp assert_advisory_assignment(db, call, assignment) do
+    expected_files = call.params |> Map.get(:files, []) |> Enum.uniq() |> Enum.sort()
+    assert Assignments.declared_files(db, assignment.id) == expected_files
 
-    try do
-      if overlap?,
-        do:
-          assert(
-            match?(
-              {:deny, %{rule: "declared-files-overlap-observation"}},
-              Rules.evaluate(db, call)
-            )
-          ),
-        else: assert(Rules.evaluate(db, call) == :ok)
-    after
-      File.rm_rf!(base)
-      :persistent_term.erase(Rules)
+    if expected_files != [] do
+      assert assignment.id in Assignments.open_assignments_touching(db, expected_files)
     end
-  end
 
-  defp assert_overlap_observation(_fixture, _db, _call, _overlap?), do: :ok
+    assert {:ok, [[1]]} =
+             DB.query(
+               db,
+               "SELECT count(*) FROM messages WHERE content = ?1",
+               ["[assignment opened: #{assignment.id}]"]
+             )
 
-  # `reopen-assignment`'s own conformance exercise (Sol xhigh review, finding
-  # 4). `holder-verdict-wins` calls only `attest`; this fixture routes
-  # `reopen-assignment` itself through `Dispatch.dispatch/3` — the same
-  # chokepoint the wire router uses, which is also what puts the verb through
-  # `Rules.decide`. The case named `earlier-verdict-round-displaces-…`
-  # additionally proves the repair itself, not just the reopen, by re-filing a
-  # verdict and re-checking the producer's completion against the fixture's
-  # own rule.
-  def run_reopen_assignment_fixture(fixture) do
-    Enum.each(fixture["cases"], fn kase ->
-      {db, pid} = memory_db!()
-
-      try do
-        ids = materialize_world(db, Map.get(kase, "world", %{}))
-        call = build_call(kase["call"], ids)
-        handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
-        assignment_id = call.params[:assignment_id]
-
-        before_row = reopen_fixture_row(db, assignment_id)
-        before_reopenings = reopen_fixture_count(db, assignment_id)
-
-        result = Dispatch.dispatch(db, handlers, call)
-
-        case kase["expect"] do
-          "refuse" ->
-            assert {:error, %{code: code}} = result
-            assert code == kase["reason"]
-            assert reopen_fixture_row(db, assignment_id) == before_row
-            assert reopen_fixture_count(db, assignment_id) == before_reopenings
-
-          "pass" ->
-            assert {:ok, reopened} = result
-            assert reopened.state == "open"
-            assert reopen_fixture_count(db, assignment_id) == before_reopenings + 1
-
-            if kase["case"] ==
-                 "earlier-verdict-round-displaces-later-verdictless-round-when-reopened" do
-              verify_reopen_repairs_displacement!(fixture, db, handlers, ids)
-            end
-        end
-      after
-        GenServer.stop(pid)
-      end
-    end)
-  end
-
-  defp reopen_fixture_row(db, assignment_id) do
-    {:ok, [row]} =
-      DB.query(
-        db,
-        "SELECT state, outcome, closedAt, closedByUser, closedBySession, closingAttestId " <>
-          "FROM assignments WHERE id = ?1",
-        [assignment_id]
-      )
-
-    row
-  end
-
-  defp reopen_fixture_count(db, assignment_id) do
-    {:ok, [[count]]} =
-      DB.query(db, "SELECT count(*) FROM assignment_reopenings WHERE assignmentId = ?1", [
-        assignment_id
-      ])
-
-    count
-  end
-
-  # THE REPAIR, proven end to end: r1 — the round `reopen-assignment` just
-  # reopened — files the corrected verdict, and the producer's completion,
-  # which the fixture's own rule denies without a qualifying `reviewed-clean`,
-  # is checked against BOTH the raw `qualifying_review_verdict_kinds` read and
-  # a real `Dispatch.dispatch/3` attest call gated by that rule. r2 (later,
-  # verdictless, closed) sits in the world throughout and never qualifies.
-  defp verify_reopen_repairs_displacement!(fixture, db, handlers, ids) do
-    producer_id = ids.assignments["a"]
-    r1_id = ids.assignments["r1"]
-
-    verdict_call = %{
-      verb: "attest",
-      origin: "agent:reviewer",
-      principal: {:session, "reviewer"},
-      session_key: nil,
-      params: %{assignment_id: r1_id, kind: "verdict", verdict_kind: "reviewed-clean"}
-    }
-
-    assert {:ok, %{attest: %{verdictKind: "reviewed-clean"}}} =
-             Dispatch.dispatch(db, handlers, verdict_call)
-
-    assert Assignments.qualifying_review_verdict_kinds(db, producer_id, "holder") == [
-             "reviewed-clean"
-           ]
-
-    base = temp_dir!("conformance-reopen-repair")
-    prepare_rule_base!(base, fixture)
-    Rules.load!(base, Map.keys(handlers))
-
-    try do
-      completion_call = %{
-        verb: "attest",
-        origin: "agent:holder",
-        principal: {:session, "holder"},
-        session_key: nil,
-        params: %{assignment_id: producer_id, kind: "completion"}
-      }
-
-      assert {:ok, %{assignment: %{state: "closed"}}} =
-               Dispatch.dispatch(db, handlers, completion_call)
-    after
-      File.rm_rf!(base)
-      :persistent_term.erase(Rules)
-    end
+    assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM events WHERE kind = 'denied'")
+    assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM rail_remedy_episodes")
   end
 
   def run_load_assert(loadset) do
@@ -2359,11 +1564,10 @@ defmodule Tightbeam.ConformanceSupport do
               assert {{:deny, %{code: "escalation_denied", rule: ^statute}}, [], []} =
                        Rules.decide(db, turn_call)
 
-              assert {:ok, %{seq: wake_seq, owner_lease: owner_lease}} =
+              assert {:ok, %{seq: wake_seq}} =
                        Ledger.claim_next(db, session_key, "conformance-ruling-wake")
 
-              assert :ok =
-                       Ledger.finish(db, wake_seq, "delivered", nil, owner_lease: owner_lease)
+              assert :ok = Ledger.finish(db, wake_seq, "delivered")
 
               assert {:prodded, 1} =
                        Supervision.evaluate(
@@ -2392,11 +1596,10 @@ defmodule Tightbeam.ConformanceSupport do
               assert {{:deny, %{rule: "later-sweep-statute"}}, [], [^request_id]} =
                        Rules.decide(db, turn_call)
 
-              assert {:ok, %{seq: wake_seq, owner_lease: owner_lease}} =
+              assert {:ok, %{seq: wake_seq}} =
                        Ledger.claim_next(db, session_key, "conformance-ruling-wake")
 
-              assert :ok =
-                       Ledger.finish(db, wake_seq, "delivered", nil, owner_lease: owner_lease)
+              assert :ok = Ledger.finish(db, wake_seq, "delivered")
 
               assert {:prodded, 1} =
                        Supervision.evaluate(
@@ -3525,12 +2728,6 @@ defmodule Tightbeam.ConformanceSupport do
         )
     end)
 
-    world
-    |> Map.get("sessions", [])
-    |> Enum.map(& &1["owner"])
-    |> Enum.uniq()
-    |> Enum.each(&ensure_main_session(db, &1))
-
     Enum.each(Map.get(world, "sessions", []), fn session ->
       Org.create(db, %{
         session_key: session["key"],
@@ -3689,11 +2886,8 @@ defmodule Tightbeam.ConformanceSupport do
                    })
 
           assert seq == turn["seq"]
-
-          assert {:ok, %{seq: ^seq, owner_lease: owner_lease}} =
-                   Ledger.claim_next(db, turn["session"], "conformance")
-
-          assert :ok = Ledger.finish(db, seq, "delivered", nil, owner_lease: owner_lease)
+          assert {:ok, %{seq: ^seq}} = Ledger.claim_next(db, turn["session"], "conformance")
+          assert :ok = Ledger.finish(db, seq, "delivered")
           Map.put(turns, turn["session"], seq)
         end
       end)
@@ -4253,35 +3447,15 @@ defmodule Tightbeam.ConformanceTest do
     # adjudication-hold-order, whose whole subject was a hold freezing the
     # turn-end shift. The shift itself is unchanged minus that first slot.
     #
-    # Fabric §13 Phase 0 (2026-08-13) adds one: C4's holder-verdict-wins, which
-    # pins review-round selection against the wi_1b0237fe wedge class. It is a
-    # pending C4 dispatch-rule fixture with its own cases, so it lands in the
-    # active and activated counts, not in the exact-mechanism skips.
-    #
-    # Sol xhigh review, finding 4 (2026-08-13) adds a second: C4's
-    # reopen-assignment-repair, which routes `reopen-assignment` itself
-    # through the dispatch chokepoint (holder-verdict-wins only ever calls
-    # `attest`) and exercises the defining displacement shape. It is also a
-    # pending C4 fixture with its own named runner clause, not a catch-all.
-    #
-    # Phase 1 of the coordination fabric (2026-08-13) adds the C8 class and two
-    # GREEN fixtures — class-delivery-policy and class-election-and-skew. Green
-    # on both axes, so they raise the total and the active count and leave the
-    # ACTIVATED counts alone: those measure fixtures still waiting on a
-    # mechanism, and this mechanism ships on this branch.
-    # Second wave (2026-08-13) adds two more GREEN C8 fixtures —
-    # agent-question-carrier (seam ③) and read-cursors (seam ④) — on the same
-    # both-axes rule as the first two.
-    # The live engine switch (2026-08-14) adds the C9 class and one GREEN
-    # fixture, live-engine-switch. Green on both axes, so it raises the total
-    # and the active count and leaves the ACTIVATED counts alone. The class is
-    # green too, so it adds no class registration either.
-    assert length(@fixtures) == 71
-    assert active_fixtures == 61
+    # Fabric §13 Phase 0 adds C4/holder-verdict-wins. It has its own cases and
+    # runner, so it increases the active and activated counts, not the exact
+    # mechanism skips.
+    assert length(@fixtures) == 65
+    assert active_fixtures == 55
     assert exact_skips == 10
-    assert activated_fixture_tests == 43
+    assert activated_fixture_tests == 42
     assert activated_class_tests == 5
-    assert activated_tests == 48
+    assert activated_tests == 47
   end
 
   # The structural guard for the defect this file used to carry: a catch-all clause
@@ -4328,9 +3502,8 @@ defmodule Tightbeam.ConformanceTest do
       )
     end)
 
-    # 52 since C4/holder-verdict-wins joined the corpus (fabric §13 Phase 0); 53
-    # since C4/reopen-assignment-repair joined it (Sol xhigh review, finding 4).
-    assert Enum.count(entries, &(&1.scope == "fixture")) == 53
+    # C4/holder-verdict-wins is the 52nd pending fixture annotation.
+    assert Enum.count(entries, &(&1.scope == "fixture")) == 52
 
     assert %{
              scope: "case",
@@ -4456,7 +3629,7 @@ defmodule Tightbeam.ConformanceTest do
     )
   end
 
-  test "declared-file fixture preserves advisory overlap and malformed-input refusal" do
+  test "declared-file cases preserve validation and expose advisory assignments" do
     Corpus.run_handler_refusal_fixture(fixture!("C4", "declared-files-overlap"))
   end
 
@@ -4675,10 +3848,6 @@ defmodule Tightbeam.ConformanceTest do
             "load_assert" -> Corpus.run_load_assert(fixture)
             "rules_decide" -> Corpus.run_rules_decide(fixture)
             "acting_layer" -> Corpus.run_acting_layer(fixture)
-            "delivery_policy" -> Corpus.run_delivery_policy_fixture(fixture)
-            "question_carrier" -> Corpus.run_question_carrier_fixture(fixture)
-            "read_cursor" -> Corpus.run_read_cursor_fixture(fixture)
-            "live_switch" -> Corpus.run_live_switch_fixture(fixture)
           end)
         end
 

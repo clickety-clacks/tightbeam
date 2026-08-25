@@ -177,39 +177,6 @@ defmodule Tightbeam.RulesTest do
     assert error.message =~ "same-table"
   end
 
-  test "notice is a predicate-only wake effect with a named target", ctx do
-    valid =
-      """
-      [[rule]]
-      name = "doorbell"
-      verb = "post"
-      text = "look at this"
-      effect = "notice"
-      deny_when = [{ fact = "caller.origin_class", op = "eq", value = "user" }]
-
-      [rule.remedy]
-      action = "wake"
-      target_session = "work"
-
-      [rule.remedy.params]
-      prompt = "look"
-      """
-
-    put_raw(ctx, valid)
-
-    assert [%{effect: "notice", remedy: %{action: "wake"}}] =
-             Rules.load!(ctx.base_dir, ["post", "wake"])
-
-    for {contents, reason} <- [
-          {String.replace(valid, "\n[rule.remedy]\n", "\n[rule.remedy-disabled]\n"),
-           "unknown keys"}
-        ] do
-      put_raw(ctx, contents)
-      error = assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, ["post"]) end
-      assert error.message =~ reason
-    end
-  end
-
   test "scalar and ordered operators cover positive negative and boundaries", ctx do
     scalar_cases = [
       {"eq", "user", true},
@@ -397,7 +364,7 @@ defmodule Tightbeam.RulesTest do
     :ok =
       DB.execute(
         ctx.db,
-        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('fact_flynn', 0, 'admin_add', 1),('fact_kay', 0, 'admin_add', 1),('fact_root', 1, 'admin_add', 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('fact_flynn',0,'admin_add',1),('fact_kay',0,'admin_add',1),('fact_root',1,'admin_add',1)"
       )
 
     for {id, owner} <- [
@@ -1195,6 +1162,64 @@ defmodule Tightbeam.RulesTest do
     assert {:ok, %{reviewsAssignmentId: ^producer_id, effectKind: "review"}} =
              Dispatch.dispatch(ctx.db, ctx.handlers, review_call)
 
+    assert review_count(ctx.db, producer.id) == 1
+  end
+
+  test "shipped completion remedy waits for the holder receipt and creates one review", ctx do
+    holder = session(ctx.db, "receipt-remedy-holder", "flynn", archetype: "coder")
+    reviewer = session(ctx.db, "receipt-remedy-reviewer", "flynn", archetype: "reviewer")
+
+    Roles.create!(ctx.db, "reviewer", "flynn", reviewer.session_key)
+    producer = assignment(ctx, holder.session_key, {:user, "flynn"})
+
+    put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    completion =
+      p3_call("attest", {:session, holder.session_key}, %{
+        assignment_id: producer.id,
+        kind: "completion"
+      })
+
+    assert {:error,
+            %{
+              reason: "remedy_blocked",
+              producer: nil,
+              rule: "code-review-requires-passing-tests",
+              ref: producer_id
+            }} = Dispatch.dispatch(ctx.db, ctx.handlers, completion)
+
+    assert producer_id == producer.id
+    assert review_count(ctx.db, producer.id) == 0
+
+    verdict(
+      ctx,
+      holder.session_key,
+      producer.id,
+      "tests-passed",
+      "gibson:/repo 378807eabb39cecc25ea801494053f8aa20feafa; " <>
+        "mix test test/rules_test.exs; passed: 1 test"
+    )
+
+    assert {:error,
+            %{
+              reason: "remedy_fired",
+              producer: review_id,
+              rule: "completion-requires-review"
+            }} = Dispatch.dispatch(ctx.db, ctx.handlers, completion)
+
+    assert review_count(ctx.db, producer.id) == 1
+
+    assert {:error, %{reason: "remedy_fired", producer: ^review_id}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, completion)
+
+    assert review_count(ctx.db, producer.id) == 1
+    verdict(ctx, reviewer.session_key, review_id, "reviewed-clean", "reviewed exact receipt tip")
+
+    assert {:ok, %{assignment: %{id: completed_id, state: "closed"}}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, completion)
+
+    assert completed_id == producer.id
     assert review_count(ctx.db, producer.id) == 1
   end
 

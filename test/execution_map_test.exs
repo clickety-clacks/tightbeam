@@ -30,7 +30,6 @@ defmodule Tightbeam.ExecutionMapTest do
     Dispatch,
     Org,
     ExecutionMap,
-    Wakes,
     WorkItems,
     WorkState
   }
@@ -73,10 +72,8 @@ defmodule Tightbeam.ExecutionMapTest do
     :ok =
       DB.execute(
         db,
-        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 0, 'admin_add', 1),('kay', 0, 'admin_add', 1),('root', 1, 'admin_add', 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn',0,'admin_add',1),('kay',0,'admin_add',1),('root',1,'admin_add',1)"
       )
-
-    Enum.each(~w(flynn kay root), &ensure_main_session(db, &1))
 
     # The epoch is stamped once at table creation, so a test that needs a known
     # cutoff moves the single row rather than pretending to control the clock.
@@ -580,50 +577,6 @@ defmodule Tightbeam.ExecutionMapTest do
     assert "wi_stale" in ids(roster(ctx, %{quiet_over: bound}))
   end
 
-  # S5 coverage pin: `pending_wake_classes` (fabric §13 Phase 1 exit — classes
-  # visible in toplines rows) had zero tests before this. Real classed wakes
-  # (`Wakes.schedule/2`, not staged rows) on an item's current holders,
-  # summed across holders and grouped by class, with an unclassed wake on the
-  # same session proving it never joins the count.
-  test "a work item's pending_wake_classes sums classed pending wakes across its current holders",
-       ctx do
-    item!(ctx.db, "wi_classed", created_at: 2_000_000)
-    session!(ctx.db, "s_classed_a", "flynn")
-    session!(ctx.db, "s_classed_b", "flynn")
-    assignment!(ctx.db, "asg_classed_a", work_item_id: "wi_classed", holder: "s_classed_a")
-    assignment!(ctx.db, "asg_classed_b", work_item_id: "wi_classed", holder: "s_classed_b")
-
-    Wakes.schedule(ctx.db, %{
-      session_key: "s_classed_a",
-      origin: "agent:sender",
-      prompt: "one",
-      due_at: @default_created,
-      class: "fyi"
-    })
-
-    Wakes.schedule(ctx.db, %{
-      session_key: "s_classed_a",
-      origin: "agent:sender",
-      prompt: "two",
-      due_at: @default_created,
-      class: "fyi"
-    })
-
-    Wakes.schedule(ctx.db, %{
-      session_key: "s_classed_b",
-      origin: "agent:sender",
-      prompt: "three",
-      due_at: @default_created,
-      class: "blocker"
-    })
-
-    # An unclassed pending wake on the same holder must not appear at all.
-    wake!(ctx.db, "wk_unclassed", "s_classed_a", state: "pending", work_item_id: "wi_classed")
-
-    classed = node(roster(ctx), "wi_classed")
-    assert classed.active.pending_wake_classes == %{"fyi" => 2, "blocker" => 1}
-  end
-
   ## Proof 10 — coverage: absence before the cutoff is unknown, never zero
 
   test "proof 10: a pre-cutoff item nulls attribution-dependent counts and keeps durable facts",
@@ -772,48 +725,6 @@ defmodule Tightbeam.ExecutionMapTest do
     # An admin sees the NONE assignment under the assignment-detail rule.
     admin = read(ctx, :topline, %{assignments: ["asg_none_theirs"]}, principal: {:user, "root"})
     assert admin.no_item == ["asg_none_theirs"]
-  end
-
-  test "typed prefixes cover topline assignments, under anchors, and roster cursors", ctx do
-    session!(ctx.db, "s_prefix_mine", "flynn")
-    session!(ctx.db, "s_prefix_theirs", "kay")
-    item!(ctx.db, "wi_prefix_alpha", created_at: at(1))
-    item!(ctx.db, "wi_prefix_hidden", owner: "kay", created_at: at(2))
-    item!(ctx.db, "wi_prefix_zulu", created_at: at(3))
-
-    assignment!(ctx.db, "asg_prefix_alpha",
-      work_item_id: "wi_prefix_alpha",
-      holder: "s_prefix_mine"
-    )
-
-    assignment!(ctx.db, "asg_prefix_hidden",
-      work_item_id: "wi_prefix_hidden",
-      holder: "s_prefix_theirs"
-    )
-
-    assert nested_ids(read(ctx, :topline, %{under: "wi_prefix_a"})) == ["wi_prefix_alpha"]
-
-    assert ids(roster(ctx, %{after: "wi_prefix_a", limit: 1})) == ["wi_prefix_zulu"]
-
-    assert ids(read(ctx, :topline, %{assignments: ["asg_prefix_a"]})) == [
-             "wi_prefix_alpha"
-           ]
-
-    item!(ctx.db, "wi_prefix_atom", created_at: at(4))
-
-    assignment!(ctx.db, "asg_prefix_atom",
-      work_item_id: "wi_prefix_atom",
-      holder: "s_prefix_mine"
-    )
-
-    assert %{code: "ambiguous_id", candidates: ["wi_prefix_alpha", "wi_prefix_atom"]} =
-             read(ctx, :topline, %{under: "wi_prefix_a"})
-
-    assert %{code: "ambiguous_id", candidates: ["wi_prefix_alpha", "wi_prefix_atom"]} =
-             roster(ctx, %{after: "wi_prefix_a", limit: 1})
-
-    assert %{code: "ambiguous_id", candidates: ["asg_prefix_alpha", "asg_prefix_atom"]} =
-             read(ctx, :topline, %{assignments: ["asg_prefix_a"]})
   end
 
   ## Proof 13 — deterministic order under every filter combination

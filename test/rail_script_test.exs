@@ -43,8 +43,6 @@ defmodule Tightbeam.RailScriptTest do
     :ok = Wakes.ensure_schema(db)
     :ok = Placement.ensure_schema(db)
 
-    ensure_main_session(db, "flynn")
-
     {tmp, 0} = System.cmd("/bin/realpath", [System.tmp_dir!()])
 
     base_dir =

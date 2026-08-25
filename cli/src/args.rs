@@ -25,42 +25,23 @@ pub enum Target {
     User(String),
 }
 
-/// The ONE runtime control a `tune` call changes.
-///
-/// A model is named by FIELDS — harness, model, effort, context — never by one
-/// packed string, and these variants are how the CLI makes a partial naming
-/// unrepresentable rather than merely discouraged. There is no state here
-/// holding a `--context` with no model for it to qualify, or an effort tier
-/// with nothing to apply it to: each variant is a complete election the
-/// gateway can answer against the destination host's catalog.
-///
-/// Every field the caller does not name is left for the CATALOG to complete,
-/// never for the CLI to invent — which is why the model fields are
-/// `Option<Option<String>>` (see `Command::Spawn`): a flag not passed and a
-/// flag passed empty are different requests.
+/// One tune invocation changes one control dimension. Encoding the legal forms
+/// here keeps partial multi-control requests out of the gateway entirely.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TuneControl {
-    /// A different HARNESS. The engine changes, so the engine's conversation
-    /// cannot come with it — Tightbeam's session, role, work, and graph
-    /// position do. `model` is REQUIRED (v0.2 program §4: the substrate
-    /// never elects) — the SOURCE model and its effort tier are never
-    /// inherited across the boundary either, because a tier is vocabulary
-    /// the destination may not have, so an omitted `--effort` on a model
-    /// that offers tiers is refused rather than guessed.
     Harness {
         harness: String,
         model: String,
-        effort: Option<Option<String>>,
-        context: Option<Option<String>>,
+        effort: Option<String>,
+        context: Option<String>,
     },
-    /// A different MODEL on the resident harness. The conversation survives.
     Model {
         model: String,
-        effort: Option<Option<String>>,
-        context: Option<Option<String>>,
+        effort: Option<String>,
+        context: Option<String>,
     },
-    /// A different reasoning tier for the resident model.
     Effort(String),
+    Fast(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -83,11 +64,6 @@ pub enum Command {
         condition_kind: Option<String>,
         condition_scope: Option<String>,
         idempotency_key: Option<String>,
-        /// The coordination class the SENDER elects (fabric v1 §7). Deliberately
-        /// an unvalidated string: a kungfu may extend the vocabulary, and the
-        /// substrate answers an unknown class with `fyi` delivery plus a named
-        /// skew row, never a refusal.
-        class: Option<String>,
     },
     Condition {
         identity: Identity,
@@ -114,6 +90,10 @@ pub enum Command {
     /// observation is the session's by definition — the gateway resolves the
     /// turn from the session token, so there is nothing for a flag to say.
     ToolCallObserved,
+    /// Substrate-reserved: the GitHub PreToolUse hook guard. It reads the raw
+    /// tool-call JSON from stdin and refuses only GitHub-dependent calls when
+    /// this host's GitHub auth is not ready.
+    GithubAuthCheck,
     Spawn {
         identity: Identity,
         display_name: String,
@@ -131,14 +111,6 @@ pub enum Command {
         handle: Option<String>,
         host: Option<String>,
     },
-    /// Change one runtime control on a LIVE session. This is an ELECTION by
-    /// the caller: nothing in Tightbeam re-engines a session on its own, so
-    /// there is no form of this command that asks the substrate to choose.
-    Tune {
-        identity: Identity,
-        session_key: String,
-        control: TuneControl,
-    },
     List {
         identity: Identity,
     },
@@ -146,6 +118,11 @@ pub enum Command {
         identity: Identity,
         session_key: String,
         idempotency_key: Option<String>,
+    },
+    Tune {
+        identity: Identity,
+        session_key: String,
+        control: TuneControl,
     },
     Assign {
         identity: Identity,
@@ -172,37 +149,34 @@ pub enum Command {
         request_id: String,
         action: String,
     },
+    OperatorAsk {
+        identity: Identity,
+        question: String,
+        note: Option<String>,
+        options: Option<Vec<String>>,
+        assignment_id: Option<String>,
+        deadline_ms: Option<String>,
+        supersedes: Option<String>,
+    },
+    OperatorRule {
+        identity: Identity,
+        request_id: String,
+        decision: Option<String>,
+        response: Option<String>,
+        rationale: Option<String>,
+    },
+    OperatorWithdraw {
+        identity: Identity,
+        request_id: String,
+        reason: String,
+    },
     DecisionRequests {
         identity: Identity,
         status: Option<String>,
     },
-    /// File one question at a named principal (coordination-fabric-v1 §7
-    /// `input-needed` carrier). The row is data its asker chooses to honor:
-    /// filing it blocks nothing, here or on the gateway.
-    Ask {
-        identity: Identity,
-        target: Target,
-        question: String,
-        about: Option<String>,
-    },
-    Answer {
-        identity: Identity,
-        request_id: String,
-        answer: String,
-    },
-    ReturnRequest {
-        identity: Identity,
-        request_id: String,
-        reason: String,
-    },
     RevokeAssignment {
         identity: Identity,
         assignment_id: String,
-    },
-    ReopenAssignment {
-        identity: Identity,
-        assignment_id: String,
-        reason: String,
     },
     WorkItemCreate {
         identity: Identity,
@@ -231,18 +205,10 @@ pub enum Command {
         after: Option<String>,
         limit: Option<String>,
     },
-    TurnTrace {
-        identity: Identity,
-        session: String,
-        seq: String,
-    },
     Toplines {
         identity: Identity,
         filters: ToplineFilters,
         tree: bool,
-        /// Keyset cursor: the work item id the previous page ended on.
-        after: Option<String>,
-        limit: Option<String>,
     },
     Topline {
         identity: Identity,
@@ -276,21 +242,6 @@ pub enum Command {
     Attests {
         identity: Identity,
         assignment_id: String,
-        /// Keyset cursor: the attest id the previous page ended on.
-        after: Option<String>,
-        /// Page size, rendered as a JSON number. No default — an audit list that
-        /// silently shortens itself is worse than a long one.
-        limit: Option<String>,
-    },
-    CoordinationShare {
-        identity: Identity,
-        session: String,
-        from: String,
-        to: String,
-    },
-    DigestMembers {
-        identity: Identity,
-        wake_id: String,
     },
     Assignments {
         identity: Identity,
@@ -342,6 +293,8 @@ pub enum Command {
         identity: Identity,
         provider: String,
         api_key: bool,
+        hostname: Option<String>,
+        remote: Option<String>,
     },
     AddUser {
         identity: Identity,
@@ -374,6 +327,11 @@ pub enum Command {
         host: String,
         harness: String,
         name: String,
+    },
+    HostToolchainSet {
+        identity: Identity,
+        host: String,
+        dirs: Vec<String>,
     },
     HarnessProcesses {
         identity: Identity,
@@ -457,7 +415,6 @@ TARGET (for commands that take one — pass exactly one):
 COMMANDS:
   wake (--session <key> | --role <name> | --user <id>) --prompt "<text>"
        [--after 30s|5m|2h] [--at <epochMs>]
-       [--class fyi|status-query|input-needed|blocker|algedonic]
       Condition wake:
         tightbeam wake (--session <key> | --role <name> | --user <id>)
           --when-fact <kind> [--when-scope <scope>]
@@ -473,14 +430,6 @@ COMMANDS:
       The fallback timer detects silence only; it does not select an action.
       --prompt is the caller's explicit instruction override.
       Tightbeam carries it without rewriting it.
-      --class says how URGENT this is for the receiver, and you elect it: fyi and
-      status-query and input-needed are batched into one digest turn at the
-      receiver's next turn boundary (or their class ceiling — 4h, 30m, 30m —
-      whichever comes first); blocker delivers immediately; algedonic bypasses
-      batching entirely and is for genuine pain only. Without --class the wake
-      delivers exactly as it always has. --after/--at is your own delivery
-      election and always wins over batching. Every batched digest names the
-      rule that produced it, so you can see what held your message.
         tightbeam wake --role reviewer --prompt "review PR 12" --as coder
         tightbeam wake --session agent:coder:app --prompt "check CI" --after 5m --as coder
         tightbeam wake --role owner --when-fact build-finished --when-scope app \
@@ -514,31 +463,6 @@ COMMANDS:
       context-window variant when it offers more than one. All must come from
       list's model catalog — never invent one.
 
-  tune --session <key> (--harness {{HARNESSES_PIPE}} --model <model> |
-       --model <model> | --effort <level>)
-       [--effort <level>] [--context <variant>]
-      Change ONE runtime control on a session that is already running. Model
-      identity remains separate fields, exactly as in spawn, and every field is
-      answered against that host's catalog — an invented harness or model is
-      refused by name, never substituted.
-        tightbeam tune --session "agent:coder:x s_1" \
-          --harness {{EXAMPLE_HARNESS}} --model <catalog-model> --as orchestrator:news
-      --model on its own retunes the model on the RESIDENT harness and the
-      engine's conversation survives. --harness changes the engine, so its
-      conversation cannot come along: the visible transcript restarts from an
-      [engine swap] marker (earlier rows are retained, not deleted) while the
-      Tightbeam session, its role, its work, and its graph position stay put.
-      Naming the resident harness again is refused — omit --harness for a
-      same-harness model change. --harness REQUIRES --model: crossing an
-      engine boundary is a model election, and Tightbeam never elects on
-      your behalf (omitting it is refused as model_required). The source
-      model and its effort tier are never carried across the boundary.
-      A switch is YOUR election and lands only at a turn boundary: while the
-      session has a running or queued turn the call is refused with
-      turn_in_progress and nothing changes. Retry once the turn finishes —
-      Tightbeam will not queue the switch behind it, and never re-engines a
-      session on its own initiative.
-
   list
       Show the sessions you can address (with handles + provenance), the
       org's shape — archetypes (with allowed hosts), known hosts, and the
@@ -547,6 +471,17 @@ COMMANDS:
 
   retire --session <key> [--key <idempotencyKey>]
       End a session deliberately.
+
+  tune --session <key> (--harness <harness> --model <model> |
+       --model <model> | --effort <level> | --fast on|off)
+       [--effort <level>] [--context <variant>]
+      Change one runtime control on an existing session. Model identity remains
+      separate fields. Same-harness model, effort, and Fast changes preserve the
+      engine conversation; a harness change starts a fresh engine context while
+      keeping the Tightbeam session, role, work, and graph position. Fast is
+      ephemeral and uses only the resident adapter's live advertised option;
+      unsupported sessions refuse it. Naming the resident harness again is a
+      refusal: omit --harness for a same-harness model change.
 
   work-item-create --title "<title>" [--spec-ref <name> --spec-sha256 <hex>]
                    [--key <idempotencyKey>]
@@ -568,13 +503,9 @@ COMMANDS:
       No cursor reads the tail (newest first page, shown oldest-first); page
       back with --before <oldestId> and catch up with --after <newestId>, both
       ids the previous response handed you. --limit defaults to 50, caps at 500.
-  turn-trace --session <key> --seq <turnSeq>
-      Read the ordered lifecycle boundaries for one turn. The same owner-or-
-      admin visibility rule as transcript applies; hidden and unknown turns
-      both return not_found.
   toplines [--origin user|session|all] [--owner <userId>] [--state <state>]
            [--quiet-over <duration>] [--spec <name> [--spec-sha <sha>]]
-           [--session <key>] [--tree] [--after <workItemId>] [--limit <n>]
+           [--session <key>] [--tree]
       The work telemetry the substrate already knows: every work item you can
       see, with its assignment/job/attest/turn counts, who holds it, whether
       anything is running, and how long it has been quiet. --tree renders the
@@ -584,32 +515,13 @@ COMMANDS:
       epistemic status (linked, from_turn, no_turn_observed, unrecorded).
       No percentages and no completion estimates: the rows do not support them.
         tightbeam toplines --origin user --state open --as-user flynn
-      --after/--limit page the FLAT roster on a stable (createdAt, id) cursor;
-      the response carries nextAfter and hasMoreAfter. They bound the RESPONSE,
-      not the gateway's work — the reader still computes telemetry over every
-      item you can see. They are refused with --tree, because a forest has no
-      page boundary that is not also a wrong answer.
         tightbeam toplines --quiet-over 2h --as-user flynn
-        tightbeam toplines --limit 25 --after wi_abc123 --as-user flynn
   topline (--under <workItemId> [roster filters] | --assignments <id,...>)
       --under walks one item's causal subtree (the anchor plus its visible
       linked descendants). --assignments names an explicit assignment set and
       reports the items they resolve to; an assignment belonging to no item
       comes back in noItem rather than being silently dropped.
         tightbeam topline --under wi_abc123 --as-user flynn
-  coordination-share --session <key> --from <epochMs> --to <epochMs>
-      What share of a session's turns were spent on coordination traffic over a
-      window — every turn a wake materialized, classed or not, except an
-      algedonic alarm or a deliberate summon, against all its turns. Counts
-      rows and names no threshold; a window with no turns reports a null
-      share, not zero.
-        tightbeam coordination-share --session agent:po --from 1 --to 2 --as-user flynn
-  digest-members <wakeId>
-      Every source wake a digest carries, oldest first — the C4/acceptance-2
-      audit as a status question, answerable from rows. Refuses by name if
-      the id is unknown, is not a digest carrier, or names a carrier you
-      cannot see — the same not_found either way.
-        tightbeam digest-members w_abc123 --as-user flynn
   work-item-icebox <workItemId>
       Shelve an unstaffed item (open → iceboxed). Requires zero open
       assignments; work-item-reopen resumes it.
@@ -623,53 +535,33 @@ COMMANDS:
          [--reviews <assignmentId>] [--effect-kind <kind>]
          [--files '["lib/a.ex","test/a_test.exs"]']
       Open an obligation held by a session; a work item is the durable thread
-      across assignments.
+      across assignments. --files is an advisory suggestion that others can see;
+      it reserves no path and does not limit the assignment's work.
   dispatch (--to <sessionKey> | --holder <sessionKey>) --subject "<work>"
            --brief "<one sentence>" [--work-item <workItemId>]
            [--effect-kind <kind>] [--workdir-root <relativePath>] [--key <key>]
       Atomically open an assignment and wake its holder with the card id.
   effort-rule --request <decisionRequestId> --action continue|dismiss
       Rule an effort-without-effect check-in routed to your principal.
-  decision-requests [--status open|ruled|consumed|withdrawn|superseded|returned|all]
+  operator-ask --question <q> [--note <t>] [--options a,b,c]
+               [--assignment <asgId>] [--deadline <dur>] [--supersedes <dr_id>]
+      File an owner-scoped operator decision request.
+  operator-rule <dr_id> (--decision <label> | --response <text>)
+                [--rationale <text>]
+      Record the operator's resolution. Main and presenting proxies never run this command.
+  operator-withdraw <dr_id> --reason <text>
+      Withdraw an operator decision request as its owner or original asker.
+  decision-requests [--status open|ruled|consumed|withdrawn|superseded|all]
       List decision requests visible to your principal.
-  ask (--session <key> | --role <name> | --user <id>) --question "<text>"
-      [--about <assignmentId>]
-      Put one question to another principal and get back its id. THE QUESTION
-      HOLDS NOTHING: filing it does not pause your assignment, your turn, or
-      anything else — you still owe what you owed, and you choose whether to
-      wait for the answer, work something else, or surrender the card. Read the
-      answer with decision-requests / decision-request, take the question back
-      with withdraw --request <id> --reason "...". The person you asked gets it
-      at their next turn boundary, or within 30 minutes, whichever is first.
-        tightbeam ask --role owner --question "ship behind a flag or block?" --as coder
-  answer --request <decisionRequestId> --answer "<text>"
-      Answer a question that was put to you. It is an answer, not a ruling: it
-      authorizes nothing and unblocks nothing on its own. Only the principal
-      the question was asked of can answer it.
-  return --request <decisionRequestId> --reason "<text>"
-      Return an open question for insufficient information. The original row
-      and reason remain in history, it leaves the open queue, and its asker
-      must revise or replace it with a new request if an answer is still needed.
   revoke-assignment <assignmentId>
       Revoke when the assignment handler already authorizes your principal.
-  reopen-assignment <assignmentId> --reason "..."
-      Move a CLOSED assignment back to open so its holder can file the verdict
-      or lifecycle row the card still owes — the agent-reachable repair for a
-      card that closed carrying the wrong judgment. The prior close is kept on
-      the record. Refuses by name when the card is already open, its holder is
-      retired, its work item is not open, or its files collide.
   attest <assignmentId> --kind progress|completion|surrender|verdict
       [--commit-refs '[{"repo":"host:/abs/path","commit":"<commit>"}]']
          [--verdict <kind>] [--note "..."]
       File against an assignment. Verdicts on review cards require the review
       holder; producer-card verdicts may be filed by any session or user.
-  attests <assignmentId> [--after <attestId>] [--limit <n>]
-      List every attest filed against an assignment. Without --limit you get
-      all of them: an audit list that shortens itself silently is worse than a
-      long one. --after <attestId> resumes strictly after the attest you name,
-      so you can walk a long trail without re-reading it; the response carries
-      nextAfter and hasMoreAfter to drive the next call.
-        tightbeam attests as_abc --limit 50 --as-user flynn
+  attests <assignmentId>
+      List every attest filed against an assignment.
   assignments [--session <key> | --role <name>] [--state open|closed|all]
       List assignments (open by default).
 
@@ -700,13 +592,20 @@ COMMANDS:
   identity apply (<session> | --all)
       Refresh selected sessions from the current live identity revision.
   onboard openai|anthropic [--api-key]
-      Run this machine's credential onboarding flow. Without --api-key this is
-      the interactive subscription ceremony. With it the flow is
+      Run this machine's model-provider credential onboarding flow. Without
+      --api-key this is the interactive subscription ceremony. With it the flow is
       non-interactive and the KEY is read from stdin -- never as an argument,
       which would put a secret in this machine's process table:
         printenv ANTHROPIC_API_KEY | tightbeam onboard anthropic --api-key
       The key is validated against the provider before it is banked, and it
       never leaves this machine.
+  onboard github [--hostname github.com] [--remote URL]
+      Prove or create this host's GitHub CLI browser/device login, then stamp
+      non-secret capability metadata. The credential is banked file-backed
+      (0600) in Tightbeam's own gh config dir and agents reach it via
+      GH_CONFIG_DIR, because daemon-descended agent environments cannot read
+      the OS login keychain. With --remote, also prove git can read that
+      repository. This never asks an agent for a PAT.
 
   add-user <userId> [--admin]
       Add a user, optionally as an admin. An existing admin may run this over
@@ -721,6 +620,9 @@ COMMANDS:
       List environment overlays, optionally filtered by exact host and harness.
   host-env-unset --host <host> --harness <harness> NAME
       Remove one exact environment overlay.
+  host-toolchain-set --host <host> --dirs '<json-array>'
+      Replace the host's ordered toolchain directories. An empty array restores
+      the inherited PATH. The result previews the PATH shape adapters will use.
   harness-process list
       List the durable harness launch ledger, newest launch first.
 
@@ -734,7 +636,7 @@ COMMANDS:
       being enabled, creates the base dir, installs the ACP adapters and
       this CLI, and records the host. --dry-run runs that probe for real
       and writes nothing else.
-      HARNESS CLIs ARE YOURS TO INSTALL. Tightbeam installs its own
+      HARNESS CLIs ARE YOURS TO INSTALL. Tight Beam installs its own
       plumbing on a satellite — adapters, CLI, base dir — never the
       vendors' software, and --harness <h> means "enable h here", which
       presupposes h's CLI is already there. The probe sees only what a
@@ -841,30 +743,6 @@ fn nonempty(flags: &HashMap<String, String>, name: &str) -> Option<String> {
     flags.get(name).filter(|value| !value.is_empty()).cloned()
 }
 
-const TUNE_USAGE: &str = "usage: tightbeam tune --session <key> (--harness <harness> --model <model> | --model <model> | --effort <level>) [--effort <level>] [--context <variant>]";
-
-/// TIGHTBEAM'S FIELDS ARE NEVER PACKED INTO ONE STRING.
-///
-/// `--model`, `--effort`, and `--context` are separate flags for a reason:
-/// Tightbeam once spelled a reasoning tier `gpt-5.6-sol[high]`, colliding with
-/// the vendor's own context-variant syntax (`claude-fable-5[1m]`), and a
-/// catalog read the vendor's bracket as ours — the 1M-context model silently
-/// ceased to exist.
-///
-/// This function used to allow the vendor's syntax through by checking the
-/// bracket's CONTENTS against a hardcoded list of Tightbeam's own tier words
-/// (`low`/`medium`/`high`/`xhigh`/`max`). That list already went stale once —
-/// the reviewed catalog offers `ultra` too (`test/model_catalog_test.exs`) —
-/// and a fixed vocabulary can never keep up with a PER-MODEL catalog this
-/// binary does not always carry at parse time (F7, Sol xhigh review). So the
-/// check no longer inspects what is inside the brackets at all: ANY bracketed
-/// suffix on `--model` is packed form and is refused, naming where the field
-/// actually belongs. A caller who wants a vendor context variant passes it as
-/// `--context`, the field that exists for exactly that.
-fn has_packed_effort(model: &str) -> bool {
-    model.ends_with(']') && model.contains('[')
-}
-
 /// PRESENCE, for the fields where an empty value means something. `nonempty`
 /// answers "is there a value here", which silently merges "not passed" with
 /// "passed empty"; a model selection needs those apart, because an empty
@@ -924,47 +802,6 @@ fn parse_duration(flag: &str, text: &str) -> Result<String, String> {
         .expect("an ASCII digit sequence parses as a JavaScript number");
     Ok(js_number_json(value * multiplier))
 }
-
-const ATTESTS_USAGE: &str =
-    "usage: tightbeam attests <assignmentId> [--after <attestId>] [--limit <n>]";
-
-// `--after`/`--limit` are shared by `attests` and `toplines` (seam ④), so the
-// two flags are parsed once. An EMPTY value is a refusal rather than "no
-// cursor": a caller that typed the flag meant something by it, and quietly
-// dropping it would return page one while the caller believes it holds page two.
-fn cursor_flag(
-    flags: &HashMap<String, String>,
-    name: &str,
-    expects: &str,
-) -> Result<Option<String>, String> {
-    if flags.get(name).is_some_and(String::is_empty) {
-        return Err(format!("--{name} requires {expects}"));
-    }
-    Ok(nonempty(flags, name))
-}
-
-fn page_limit(flags: &HashMap<String, String>) -> Result<Option<String>, String> {
-    match nonempty(flags, "limit") {
-        None if flags.contains_key("limit") => {
-            Err("--limit requires a positive integer".to_owned())
-        }
-        None => Ok(None),
-        Some(text) => match text.parse::<u32>() {
-            Ok(value) if value > 0 => Ok(Some(value.to_string())),
-            _ => Err("--limit requires a positive integer".to_owned()),
-        },
-    }
-}
-
-const ASK_USAGE: &str = "usage: tightbeam ask (--session <key> | --role <name> | --user <id>) --question \"<text>\" [--about <assignmentId>]";
-
-const ANSWER_USAGE: &str =
-    "usage: tightbeam answer --request <decisionRequestId> --answer \"<text>\"";
-const RETURN_USAGE: &str =
-    "usage: tightbeam return --request <decisionRequestId> --reason \"<text>\"";
-
-const COORDINATION_SHARE_USAGE: &str =
-    "usage: tightbeam coordination-share --session <key> --from <epochMs> --to <epochMs>";
 
 const TOPLINES_USAGE: &str = "usage: tightbeam toplines [--origin user|session|all] [--owner <userId>] [--state <state>] [--quiet-over <duration>] [--spec <name> [--spec-sha <sha>]] [--session <key>] [--tree]";
 
@@ -1225,9 +1062,6 @@ fn parse_with_optional_catalog(
                 return Err("--fallback-after and --at are mutually exclusive".to_owned());
             }
             let idempotency_key = condition_kind.as_ref().and_then(|_| nonempty(flags, "key"));
-            if flags.get("class").is_some_and(String::is_empty) {
-                return Err("--class requires a class name".to_owned());
-            }
             Ok(Command::Wake {
                 identity: identity(flags)?,
                 target: targets.into_iter().next().expect("exactly one target"),
@@ -1237,7 +1071,6 @@ fn parse_with_optional_catalog(
                 condition_kind,
                 condition_scope,
                 idempotency_key,
-                class: nonempty(flags, "class"),
             })
         }
         "condition" => {
@@ -1276,6 +1109,12 @@ fn parse_with_optional_catalog(
                 return Err("usage: tightbeam tool-call-observed".to_owned());
             }
             Ok(Command::ToolCallObserved)
+        }
+        "github-auth-check" => {
+            if parsed.positional.len() != 1 || !flags.is_empty() {
+                return Err("usage: tightbeam github-auth-check".to_owned());
+            }
+            Ok(Command::GithubAuthCheck)
         }
         "artifacts" => {
             if parsed.positional.len() != 1
@@ -1323,121 +1162,6 @@ fn parse_with_optional_catalog(
                 host: nonempty(flags, "host"),
             })
         }
-        "tune" => {
-            // A CLOSED flag set, unlike most commands. On every other verb an
-            // unrecognised flag is inert; here it is dangerous — `--modle
-            // claude-opus-5` would drop the model the caller named and switch
-            // the session to the destination harness's default instead, and
-            // the caller would read "ok: true" and believe otherwise.
-            const ALLOWED: &[&str] = &[
-                "session",
-                "harness",
-                "model",
-                "effort",
-                "context",
-                "as",
-                "as-user",
-                "as-process",
-            ];
-
-            // A live switch names ONE session. `--role`/`--user` are refused
-            // rather than resolved: re-engining "whoever currently holds
-            // reviewer" is a different act from re-engining a session, and
-            // which session that is must be the caller's own answer.
-            if parsed.positional.get(1).is_some()
-                || flags.keys().any(|flag| !ALLOWED.contains(&flag.as_str()))
-            {
-                return Err(TUNE_USAGE.to_owned());
-            }
-            // PRESENT-BUT-EMPTY is a real answer for `--effort` and
-            // `--context` — "no tier", "the vendor's default window" — and is
-            // carried through as one. It is not an answer for the other three:
-            // there is no session named "", no engine named "", no model
-            // named "".
-            for name in ["session", "harness", "model"] {
-                if flags.get(name).is_some_and(String::is_empty) {
-                    return Err(format!("--{name} requires a non-empty value"));
-                }
-            }
-            let session_key = nonempty(flags, "session").ok_or_else(|| TUNE_USAGE.to_owned())?;
-            let harness = nonempty(flags, "harness");
-            let model = nonempty(flags, "model");
-            let effort = named(flags, "effort");
-            let context = named(flags, "context");
-
-            if model.as_deref().is_some_and(has_packed_effort) {
-                return Err(
-                    "--model must not carry a bracketed suffix; pass --effort or --context \
-                     separately"
-                        .to_owned(),
-                );
-            }
-            if let Some(name) = harness.as_deref() {
-                let catalog = match supplied_catalog {
-                    Some(catalog) => catalog.clone(),
-                    None => crate::harnesses::catalog()?,
-                };
-                if !catalog.contains(name) {
-                    return Err(format!("unsupported harness: {name}"));
-                }
-            }
-
-            // THE SUBSTRATE NEVER ELECTS (v0.2 program §4). A harness swap
-            // re-engines the mind answering a session; the CLI does not let
-            // that request leave with no model named and trust the far side
-            // to pick one, the same way it does not let `--context` (a
-            // QUALIFIER of a model) leave with no model for it to qualify.
-            // Both are refused BY NAME here, and the gateway enforces the
-            // same two rules independently — the server is the contract,
-            // this is only its earliest, friendliest echo.
-            let control = match (harness, model, effort, context) {
-                (Some(harness), Some(model), effort, context) => TuneControl::Harness {
-                    harness,
-                    model,
-                    effort,
-                    context,
-                },
-                (Some(_), None, _, Some(_)) => {
-                    return Err(
-                        "--context qualifies a --model; name one, or drop --context \
-                         (context_requires_model)"
-                            .to_owned(),
-                    );
-                }
-                (Some(_), None, _, None) => {
-                    return Err(
-                        "--harness requires --model: the substrate does not choose one \
-                         (model_required)"
-                            .to_owned(),
-                    );
-                }
-                (None, Some(model), effort, context) => TuneControl::Model {
-                    model,
-                    effort,
-                    context,
-                },
-                // An effort alone retunes the resident model's tier. A context
-                // alone qualifies nothing — there is no model in the request
-                // for it to be a variant OF — and an empty effort alone elects
-                // "no tier" on a model nobody named. Both are usage errors
-                // rather than a guess.
-                (None, None, Some(Some(effort)), None) => TuneControl::Effort(effort),
-                (None, None, _, Some(_)) => {
-                    return Err(
-                        "--context qualifies a --model; name one, or drop --context \
-                         (context_requires_model)"
-                            .to_owned(),
-                    );
-                }
-                (None, None, _, _) => return Err(TUNE_USAGE.to_owned()),
-            };
-
-            Ok(Command::Tune {
-                identity: identity(flags)?,
-                session_key,
-                control,
-            })
-        }
         "list" => Ok(Command::List {
             identity: identity(flags)?,
         }),
@@ -1456,6 +1180,7 @@ fn parse_with_optional_catalog(
                 idempotency_key: nonempty(flags, "key"),
             })
         }
+        "tune" => parse_tune(&parsed, flags),
         "assign" => {
             let targets = [
                 nonempty(flags, "session").map(Target::Session),
@@ -1527,62 +1252,68 @@ fn parse_with_optional_catalog(
                 action,
             })
         }
+        "operator-ask" => {
+            if parsed.positional.len() != 1 {
+                return Err("usage: tightbeam operator-ask --question <q> [--note <t>] [--options a,b,c] [--assignment <asgId>] [--deadline <dur>] [--supersedes <dr_id>]".to_owned());
+            }
+            let question =
+                nonempty(flags, "question").ok_or_else(|| "--question is required".to_owned())?;
+            let options = flags
+                .get("options")
+                .map(|value| value.split(',').map(str::to_owned).collect::<Vec<_>>());
+            let deadline_ms = flags
+                .get("deadline")
+                .map(|value| parse_duration("deadline", value))
+                .transpose()?;
+            Ok(Command::OperatorAsk {
+                identity: identity(flags)?,
+                question,
+                note: nonempty(flags, "note"),
+                options,
+                assignment_id: nonempty(flags, "assignment"),
+                deadline_ms,
+                supersedes: nonempty(flags, "supersedes"),
+            })
+        }
+        "operator-rule" => {
+            if parsed.positional.len() != 2 {
+                return Err("usage: tightbeam operator-rule <dr_id> (--decision <label> | --response <text>) [--rationale <text>]".to_owned());
+            }
+            let decision = flags.get("decision").cloned();
+            let response = flags.get("response").cloned();
+            if decision.is_some() == response.is_some() {
+                return Err(
+                    "operator-rule requires exactly one of --decision or --response".to_owned(),
+                );
+            }
+            Ok(Command::OperatorRule {
+                identity: identity(flags)?,
+                request_id: parsed.positional[1].clone(),
+                decision,
+                response,
+                rationale: nonempty(flags, "rationale"),
+            })
+        }
+        "operator-withdraw" => {
+            if parsed.positional.len() != 2 {
+                return Err("usage: tightbeam operator-withdraw <dr_id> --reason <text>".to_owned());
+            }
+            Ok(Command::OperatorWithdraw {
+                identity: identity(flags)?,
+                request_id: parsed.positional[1].clone(),
+                reason: nonempty(flags, "reason")
+                    .ok_or_else(|| "--reason is required".to_owned())?,
+            })
+        }
         "decision-requests" => {
             if parsed.positional.len() != 1 {
                 return Err(
-                    "usage: tightbeam decision-requests [--status open|ruled|consumed|withdrawn|superseded|returned|all]".to_owned(),
+                    "usage: tightbeam decision-requests [--status open|ruled|consumed|withdrawn|superseded|all]".to_owned(),
                 );
             }
             Ok(Command::DecisionRequests {
                 identity: identity(flags)?,
                 status: nonempty(flags, "status"),
-            })
-        }
-        "ask" => {
-            let targets = [
-                nonempty(flags, "session").map(Target::Session),
-                nonempty(flags, "role").map(Target::Role),
-                nonempty(flags, "user").map(Target::User),
-            ]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
-            if parsed.positional.get(1).is_some() || targets.len() != 1 {
-                return Err(ASK_USAGE.to_owned());
-            }
-            let question = nonempty(flags, "question").ok_or_else(|| ASK_USAGE.to_owned())?;
-            if flags.get("about").is_some_and(String::is_empty) {
-                return Err("--about requires an assignment id".to_owned());
-            }
-            Ok(Command::Ask {
-                identity: identity(flags)?,
-                target: targets.into_iter().next().expect("exactly one target"),
-                question,
-                about: nonempty(flags, "about"),
-            })
-        }
-        "answer" => {
-            let request_id = nonempty(flags, "request");
-            let answer = nonempty(flags, "answer");
-            if parsed.positional.get(1).is_some() || request_id.is_none() || answer.is_none() {
-                return Err(ANSWER_USAGE.to_owned());
-            }
-            Ok(Command::Answer {
-                identity: identity(flags)?,
-                request_id: request_id.expect("checked above"),
-                answer: answer.expect("checked above"),
-            })
-        }
-        "return" => {
-            let request_id = nonempty(flags, "request");
-            let reason = nonempty(flags, "reason");
-            if parsed.positional.get(1).is_some() || request_id.is_none() || reason.is_none() {
-                return Err(RETURN_USAGE.to_owned());
-            }
-            Ok(Command::ReturnRequest {
-                identity: identity(flags)?,
-                request_id: request_id.expect("checked above"),
-                reason: reason.expect("checked above"),
             })
         }
         "revoke-assignment" => {
@@ -1592,23 +1323,6 @@ fn parse_with_optional_catalog(
             Ok(Command::RevokeAssignment {
                 identity: identity(flags)?,
                 assignment_id: parsed.positional[1].clone(),
-            })
-        }
-        "reopen-assignment" => {
-            if parsed.positional.len() != 2 {
-                return Err(
-                    "usage: tightbeam reopen-assignment <assignmentId> --reason \"...\"".to_owned(),
-                );
-            }
-            let Some(reason) = nonempty(flags, "reason") else {
-                return Err(
-                    "usage: tightbeam reopen-assignment <assignmentId> --reason \"...\"".to_owned(),
-                );
-            };
-            Ok(Command::ReopenAssignment {
-                identity: identity(flags)?,
-                assignment_id: parsed.positional[1].clone(),
-                reason,
             })
         }
         "work-item-create" => {
@@ -1692,42 +1406,14 @@ fn parse_with_optional_catalog(
                     .map(|value| js_number_json(number_coercion(&value))),
             })
         }
-        "turn-trace" => {
-            if parsed.positional.len() != 1 {
-                return Err(
-                    "usage: tightbeam turn-trace --session <key> --seq <turnSeq>".to_owned(),
-                );
-            }
-            Ok(Command::TurnTrace {
-                identity: identity(flags)?,
-                session: nonempty(flags, "session")
-                    .ok_or_else(|| "turn-trace requires --session <key>".to_owned())?,
-                seq: nonempty(flags, "seq")
-                    .map(|value| js_number_json(number_coercion(&value)))
-                    .ok_or_else(|| "turn-trace requires --seq <turnSeq>".to_owned())?,
-            })
-        }
         "toplines" => {
             if parsed.positional.len() != 1 {
                 return Err(TOPLINES_USAGE.to_owned());
-            }
-            let after = cursor_flag(flags, "after", "a work item id")?;
-            let limit = page_limit(flags)?;
-            // Refused HERE as well as at the gateway. A forest has no page
-            // boundary that is not also a wrong answer, and finding that out
-            // after a round trip is worse than finding it out on the command
-            // line (coordination-fabric-v1 §13 seam ④).
-            if flags.contains_key("tree") && (after.is_some() || limit.is_some()) {
-                return Err(
-                    "--after/--limit page the flat roster; --tree returns a forest".to_owned(),
-                );
             }
             Ok(Command::Toplines {
                 identity: identity(flags)?,
                 filters: topline_filters(flags)?,
                 tree: flags.contains_key("tree"),
-                after,
-                limit,
             })
         }
         "topline" => {
@@ -1852,42 +1538,13 @@ fn parse_with_optional_catalog(
                 commit_refs,
             })
         }
-        "coordination-share" => {
-            if parsed.positional.len() != 1 {
-                return Err(COORDINATION_SHARE_USAGE.to_owned());
-            }
-            let session =
-                nonempty(flags, "session").ok_or_else(|| COORDINATION_SHARE_USAGE.to_owned())?;
-            let from =
-                nonempty(flags, "from").ok_or_else(|| COORDINATION_SHARE_USAGE.to_owned())?;
-            let to = nonempty(flags, "to").ok_or_else(|| COORDINATION_SHARE_USAGE.to_owned())?;
-            Ok(Command::CoordinationShare {
-                identity: identity(flags)?,
-                session,
-                // The same numeric coercion transcript's --limit uses, rendered
-                // as a JSON number so the handler receives epoch integers.
-                from: js_number_json(number_coercion(&from)),
-                to: js_number_json(number_coercion(&to)),
-            })
-        }
-        "digest-members" => {
-            if parsed.positional.len() != 2 {
-                return Err("usage: tightbeam digest-members <wakeId>".to_owned());
-            }
-            Ok(Command::DigestMembers {
-                identity: identity(flags)?,
-                wake_id: parsed.positional[1].clone(),
-            })
-        }
         "attests" => {
             if parsed.positional.len() != 2 {
-                return Err(ATTESTS_USAGE.to_owned());
+                return Err("usage: tightbeam attests <assignmentId>".to_owned());
             }
             Ok(Command::Attests {
                 identity: identity(flags)?,
                 assignment_id: parsed.positional[1].clone(),
-                after: cursor_flag(flags, "after", "an attest id")?,
-                limit: page_limit(flags)?,
             })
         }
         "assignments" => {
@@ -1962,6 +1619,7 @@ fn parse_with_optional_catalog(
         "host-env-set" => parse_host_env_set(&parsed, flags),
         "host-env-list" => parse_host_env_list(&parsed, flags),
         "host-env-unset" => parse_host_env_unset(&parsed, flags),
+        "host-toolchain-set" => parse_host_toolchain_set(&parsed, flags),
         "update-clients" => {
             if parsed.positional.len() != 1 {
                 return Err("usage: tightbeam update-clients --as-user <adminUserId>".to_owned());
@@ -2004,7 +1662,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, ask, answer, return, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, host-toolchain-set, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -2058,6 +1716,107 @@ fn parse_host_env_unset(
         harness: nonempty(flags, "harness").ok_or_else(|| usage.to_owned())?,
         name: name.clone(),
     })
+}
+
+fn parse_host_toolchain_set(
+    parsed: &Flags,
+    flags: &HashMap<String, String>,
+) -> Result<Command, String> {
+    let usage = "usage: tightbeam host-toolchain-set --host <host> --dirs '<json-array>'";
+    if parsed.positional.len() != 1 {
+        return Err(usage.to_owned());
+    }
+
+    let encoded = nonempty(flags, "dirs").ok_or_else(|| usage.to_owned())?;
+    let dirs = serde_json::from_str::<Vec<String>>(&encoded)
+        .map_err(|_| "--dirs must be a JSON array of strings".to_owned())?;
+
+    Ok(Command::HostToolchainSet {
+        identity: identity(flags)?,
+        host: nonempty(flags, "host").ok_or_else(|| usage.to_owned())?,
+        dirs,
+    })
+}
+
+fn parse_tune(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Command, String> {
+    const USAGE: &str = "usage: tightbeam tune --session <key> (--harness <harness> --model <model> [--effort <level>] [--context <variant>] | --model <model> [--effort <level>] [--context <variant>] | --effort <level> | --fast on|off)";
+    const ALLOWED: &[&str] = &[
+        "session",
+        "harness",
+        "model",
+        "effort",
+        "context",
+        "fast",
+        "as",
+        "as-user",
+        "as-process",
+    ];
+
+    if parsed.positional.len() != 1 || flags.keys().any(|name| !ALLOWED.contains(&name.as_str())) {
+        return Err(USAGE.to_owned());
+    }
+
+    let required = |name: &str| {
+        nonempty(flags, name).ok_or_else(|| format!("--{name} requires a non-empty value"))
+    };
+    let session_key = required("session")?;
+
+    for name in ["harness", "model", "effort", "context", "fast"] {
+        if flags.contains_key(name) && nonempty(flags, name).is_none() {
+            return Err(format!("--{name} requires a non-empty value"));
+        }
+    }
+
+    let harness = nonempty(flags, "harness");
+    let model = nonempty(flags, "model");
+    let effort = nonempty(flags, "effort");
+    let context = nonempty(flags, "context");
+    let fast = nonempty(flags, "fast");
+
+    if model.as_deref().is_some_and(has_packed_effort) {
+        return Err("--model must not pack an effort; pass --effort separately".to_owned());
+    }
+
+    let control = match (harness, model, effort, context, fast) {
+        (Some(harness), Some(model), effort, context, None) => TuneControl::Harness {
+            harness,
+            model,
+            effort,
+            context,
+        },
+        (None, Some(model), effort, context, None) => TuneControl::Model {
+            model,
+            effort,
+            context,
+        },
+        (None, None, Some(effort), None, None) => TuneControl::Effort(effort),
+        (None, None, None, None, Some(fast)) if fast == "on" || fast == "off" => {
+            TuneControl::Fast(fast)
+        }
+        (None, None, None, None, Some(_)) => return Err("--fast must be on or off".to_owned()),
+        (Some(_), None, _, _, None) => return Err("--harness requires --model".to_owned()),
+        (None, None, None, Some(_), None) => return Err("--context requires --model".to_owned()),
+        (_, _, _, _, Some(_)) => {
+            return Err(
+                "--fast is mutually exclusive with --harness, --model, --effort, and --context"
+                    .to_owned(),
+            );
+        }
+        _ => return Err(USAGE.to_owned()),
+    };
+
+    Ok(Command::Tune {
+        identity: identity(flags)?,
+        session_key,
+        control,
+    })
+}
+
+fn has_packed_effort(model: &str) -> bool {
+    model
+        .rsplit_once('[')
+        .and_then(|(_, suffix)| suffix.strip_suffix(']'))
+        .is_some_and(|suffix| matches!(suffix, "low" | "medium" | "high" | "xhigh" | "max"))
 }
 
 fn parse_harness_process(
@@ -2189,12 +1948,46 @@ fn parse_identity_command(
 
 fn parse_onboard(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Command, String> {
     if parsed.positional.len() != 2 {
-        return Err("usage: tightbeam onboard <provider> [--api-key]".to_owned());
+        return Err("usage: tightbeam onboard <provider> [--api-key] [--hostname HOST]".to_owned());
     }
     let provider = parsed.positional[1].clone();
     let fixture_provider = cfg!(test) && provider == "fixture-provider";
-    if !matches!(provider.as_str(), "openai" | "anthropic") && !fixture_provider {
-        return Err("provider must be openai or anthropic".to_owned());
+    if !matches!(provider.as_str(), "openai" | "anthropic" | "github") && !fixture_provider {
+        return Err("provider must be openai, anthropic, or github".to_owned());
+    }
+    let allowed = [
+        "api-key",
+        "hostname",
+        "remote",
+        "as",
+        "as-user",
+        "as-process",
+    ];
+    if flags.keys().any(|flag| !allowed.contains(&flag.as_str())) {
+        return Err("usage: tightbeam onboard <provider> [--api-key] [--hostname HOST]".to_owned());
+    }
+    let hostname = nonempty(flags, "hostname");
+    let remote = nonempty(flags, "remote");
+    if provider == "github" && flags.contains_key("api-key") {
+        return Err(
+            "tightbeam onboard github does not accept --api-key; use GitHub CLI browser/device auth"
+                .to_owned(),
+        );
+    }
+    if provider == "github"
+        && ["as", "as-user", "as-process"]
+            .iter()
+            .any(|flag| flags.contains_key(*flag))
+    {
+        return Err(
+            "tightbeam onboard github is host-local and does not accept identity flags".to_owned(),
+        );
+    }
+    if provider != "github" && hostname.is_some() {
+        return Err("--hostname is only valid for tightbeam onboard github".to_owned());
+    }
+    if provider != "github" && remote.is_some() {
+        return Err("--remote is only valid for tightbeam onboard github".to_owned());
     }
     Ok(Command::Onboard {
         identity: identity(flags)?,
@@ -2203,6 +1996,8 @@ fn parse_onboard(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Comm
         // this process's argv, where anyone on the box can read it out of the
         // process table. The key arrives on stdin instead.
         api_key: flags.contains_key("api-key"),
+        hostname,
+        remote,
     })
 }
 
@@ -2324,6 +2119,66 @@ mod tests {
         }
     }
 
+    #[test]
+    fn host_toolchain_set_parses_an_ordered_json_array_and_allows_the_empty_exit() {
+        assert_eq!(
+            parse(strings(&[
+                "host-toolchain-set",
+                "--host",
+                "gibson",
+                "--dirs",
+                r#"["/tools/one","/tools/two"]"#,
+                "--as-user",
+                "flynn",
+            ])),
+            Ok(Command::HostToolchainSet {
+                identity: Identity::User("flynn".to_owned()),
+                host: "gibson".to_owned(),
+                dirs: vec!["/tools/one".to_owned(), "/tools/two".to_owned()],
+            })
+        );
+
+        assert_eq!(
+            parse(strings(&[
+                "host-toolchain-set",
+                "--host",
+                "gibson",
+                "--dirs",
+                "[]",
+            ])),
+            Ok(Command::HostToolchainSet {
+                identity: Identity::Session,
+                host: "gibson".to_owned(),
+                dirs: vec![],
+            })
+        );
+    }
+
+    #[test]
+    fn host_toolchain_set_refuses_missing_or_non_string_directory_lists() {
+        let usage =
+            "usage: tightbeam host-toolchain-set --host <host> --dirs '<json-array>'".to_owned();
+
+        assert_eq!(
+            parse(strings(&["host-toolchain-set", "--host", "gibson"])),
+            Err(usage.clone())
+        );
+        assert_eq!(
+            parse(strings(&["host-toolchain-set", "--dirs", r#"["/tools"]"#,])),
+            Err(usage)
+        );
+        assert_eq!(
+            parse(strings(&[
+                "host-toolchain-set",
+                "--host",
+                "gibson",
+                "--dirs",
+                r#"[1]"#,
+            ])),
+            Err("--dirs must be a JSON array of strings".to_owned())
+        );
+    }
+
     /// `--help` was consumed before the command was ever looked at, so every
     /// subcommand answered with the whole manual — the operator asking about one
     /// command got 150 lines and had to find the answer themselves.
@@ -2357,6 +2212,24 @@ mod tests {
             !entry.contains("DISCOVERY:") && !entry.contains("  doctor "),
             "the entry must stop at its own last line: {entry}"
         );
+    }
+
+    #[test]
+    fn assign_help_calls_files_advisory_not_a_reservation_or_limit() {
+        let entry = render_command_help(None, "assign").unwrap();
+
+        for required in [
+            "--files",
+            "advisory suggestion",
+            "others can see",
+            "reserves no path",
+            "does not limit",
+        ] {
+            assert!(
+                entry.contains(required),
+                "missing {required:?} from:\n{entry}"
+            );
+        }
     }
 
     #[test]
@@ -2395,6 +2268,144 @@ mod tests {
     }
 
     #[test]
+    fn tune_legal_forms_are_typed_as_one_control_and_dispatch_separate_fields() {
+        let cases = [
+            (
+                strings(&[
+                    "tune",
+                    "--session",
+                    "agent:coder:x s_1",
+                    "--harness",
+                    "codex",
+                    "--model",
+                    "gpt-5.6-sol",
+                    "--effort",
+                    "high",
+                    "--context",
+                    "1m",
+                    "--as",
+                    "owner",
+                ]),
+                serde_json::json!({
+                    "as": "owner",
+                    "verb": "tune",
+                    "sessionKey": "agent:coder:x s_1",
+                    "params": {
+                        "setting": "set_harness",
+                        "harness": "codex",
+                        "model": "gpt-5.6-sol",
+                        "effort": "high",
+                        "context": "1m"
+                    }
+                }),
+            ),
+            (
+                strings(&[
+                    "tune",
+                    "--session",
+                    "agent:coder:x s_1",
+                    "--model",
+                    "claude-fable-5[1m]",
+                    "--effort",
+                    "high",
+                    "--as-user",
+                    "mike",
+                ]),
+                serde_json::json!({
+                    "asUser": "mike",
+                    "verb": "tune",
+                    "sessionKey": "agent:coder:x s_1",
+                    "params": {
+                        "setting": "set_model",
+                        "model": "claude-fable-5[1m]",
+                        "effort": "high"
+                    }
+                }),
+            ),
+            (
+                strings(&[
+                    "tune",
+                    "--session",
+                    "agent:coder:x s_1",
+                    "--effort",
+                    "xhigh",
+                ]),
+                serde_json::json!({
+                    "verb": "tune",
+                    "sessionKey": "agent:coder:x s_1",
+                    "params": {"setting": "set_reasoning", "reasoningLevel": "xhigh"}
+                }),
+            ),
+            (
+                strings(&["tune", "--session", "agent:coder:x s_1", "--fast", "on"]),
+                serde_json::json!({
+                    "verb": "tune",
+                    "sessionKey": "agent:coder:x s_1",
+                    "params": {"setting": "set_fast_mode", "fastMode": "on"}
+                }),
+            ),
+        ];
+
+        for (args, expected) in cases {
+            let command = parse(args).expect("legal tune form parses");
+            let request = crate::dispatch::build_request(&command).expect("tune dispatches");
+            assert_eq!(request.path, "/agent/dispatch");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&request.body_json).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn tune_rejects_illegal_combinations_before_dispatch() {
+        for args in [
+            strings(&["tune", "--model", "gpt-5.6-sol"]),
+            strings(&["tune", "--session", "s_1"]),
+            strings(&["tune", "--session", "s_1", "--harness", "codex"]),
+            strings(&["tune", "--session", "s_1", "--context", "1m"]),
+            strings(&[
+                "tune",
+                "--session",
+                "s_1",
+                "--model",
+                "gpt-5.6-sol",
+                "--fast",
+                "on",
+            ]),
+            strings(&["tune", "--session", "s_1", "--fast", "yes"]),
+            strings(&["tune", "--session", "s_1", "--model", "gpt-5.6-sol[high]"]),
+            strings(&["tune", "--session", "s_1", "--model", ""]),
+            strings(&[
+                "tune",
+                "--session",
+                "s_1",
+                "--effort",
+                "high",
+                "--unknown",
+                "value",
+            ]),
+        ] {
+            assert!(parse(args).is_err());
+        }
+    }
+
+    #[test]
+    fn tune_help_names_continuity_and_live_fast_limit() {
+        let entry = render_command_help(None, "tune").expect("tune has help");
+        let prose = entry.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(prose.contains("one runtime control"), "{entry}");
+        assert!(
+            prose.contains("preserve the engine conversation"),
+            "{entry}"
+        );
+        assert!(prose.contains("fresh engine context"), "{entry}");
+        assert!(prose.contains("live advertised option"), "{entry}");
+        assert!(prose.contains("ephemeral"), "{entry}");
+        assert!(prose.contains("omit --harness"), "{entry}");
+    }
+
+    #[test]
     fn fixture_provider_is_additive_inside_the_test_provider_bundle() {
         assert_eq!(
             parse(strings(&[
@@ -2407,7 +2418,61 @@ mod tests {
                 identity: Identity::User("flynn".to_owned()),
                 provider: "fixture-provider".to_owned(),
                 api_key: false,
+                hostname: None,
+                remote: None,
             })
+        );
+    }
+
+    #[test]
+    fn github_onboard_is_host_local_and_has_no_api_key_path() {
+        assert_eq!(
+            parse(strings(&[
+                "onboard",
+                "github",
+                "--hostname",
+                "github.example"
+            ])),
+            Ok(Command::Onboard {
+                identity: Identity::Session,
+                provider: "github".to_owned(),
+                api_key: false,
+                hostname: Some("github.example".to_owned()),
+                remote: None,
+            })
+        );
+        assert_eq!(
+            parse(strings(&[
+                "onboard",
+                "github",
+                "--remote",
+                "https://github.com/example/project.git"
+            ])),
+            Ok(Command::Onboard {
+                identity: Identity::Session,
+                provider: "github".to_owned(),
+                api_key: false,
+                hostname: None,
+                remote: Some("https://github.com/example/project.git".to_owned()),
+            })
+        );
+        assert_eq!(
+            parse(strings(&["onboard", "github", "--as-user", "flynn"])),
+            Err(
+                "tightbeam onboard github is host-local and does not accept identity flags"
+                    .to_owned()
+            )
+        );
+        assert_eq!(
+            parse(strings(&["onboard", "github", "--api-key"])),
+            Err(
+                "tightbeam onboard github does not accept --api-key; use GitHub CLI browser/device auth"
+                    .to_owned()
+            )
+        );
+        assert_eq!(
+            parse(strings(&["onboard", "openai", "--hostname", "github.com"])),
+            Err("--hostname is only valid for tightbeam onboard github".to_owned())
         );
     }
 
@@ -2451,316 +2516,6 @@ mod tests {
         );
     }
 
-    /// The catalog every tune test validates `--harness` against.
-    fn tune_catalog() -> crate::harnesses::HarnessCatalog {
-        crate::harnesses::HarnessCatalog {
-            harnesses: vec![
-                crate::harnesses::HarnessProjection {
-                    wire_name: "fixture".to_owned(),
-                    install_package: "fixture-package".to_owned(),
-                    cli_binary: "fixture".to_owned(),
-                    process_markers: vec!["fixture-acp".to_owned()],
-                },
-                crate::harnesses::HarnessProjection {
-                    wire_name: "codex".to_owned(),
-                    install_package: "codex-package".to_owned(),
-                    cli_binary: "codex".to_owned(),
-                    process_markers: vec!["codex-acp".to_owned()],
-                },
-            ],
-        }
-    }
-
-    fn tune(args: &[&str]) -> Result<Command, String> {
-        parse_with_catalog(strings(args), &tune_catalog())
-    }
-
-    #[test]
-    fn tune_names_one_control_and_a_model_by_fields() {
-        // A HARNESS switch. The model fields ride along as fields; none of
-        // them is packed into the harness or into each other.
-        assert_eq!(
-            tune(&[
-                "tune",
-                "--session",
-                "s_1",
-                "--harness",
-                "codex",
-                "--model",
-                "gpt-5.6-sol",
-                "--effort",
-                "high",
-                "--as-user",
-                "flynn",
-            ]),
-            Ok(Command::Tune {
-                identity: Identity::User("flynn".to_owned()),
-                session_key: "s_1".to_owned(),
-                control: TuneControl::Harness {
-                    harness: "codex".to_owned(),
-                    model: "gpt-5.6-sol".to_owned(),
-                    effort: Some(Some("high".to_owned())),
-                    context: None,
-                },
-            })
-        );
-
-        // A harness switch with NO model is REFUSED (v0.2 program §4): the
-        // substrate does not compose the destination's own default, and the
-        // CLI does not invent one either — it does not know what the
-        // destination host offers, and inventing one is the whole failure
-        // this design exists to prevent.
-        assert_eq!(
-            tune(&[
-                "tune",
-                "--session",
-                "s_1",
-                "--harness",
-                "codex",
-                "--as-user",
-                "flynn"
-            ]),
-            Err(
-                "--harness requires --model: the substrate does not choose one \
-                 (model_required)"
-                    .to_owned()
-            )
-        );
-
-        // `--context` with no `--model` for it to qualify — even alongside
-        // `--harness` — is refused by the more specific name: the caller's
-        // actual mistake is the stray `--context`, not a bare missing model.
-        assert_eq!(
-            tune(&[
-                "tune",
-                "--session",
-                "s_1",
-                "--harness",
-                "codex",
-                "--context",
-                "1m",
-                "--as-user",
-                "flynn"
-            ]),
-            Err(
-                "--context qualifies a --model; name one, or drop --context \
-                 (context_requires_model)"
-                    .to_owned()
-            )
-        );
-
-        // A same-harness MODEL retune.
-        assert_eq!(
-            tune(&[
-                "tune",
-                "--session",
-                "s_1",
-                "--model",
-                "claude-fable-5",
-                "--context",
-                "1m",
-                "--as-user",
-                "flynn",
-            ]),
-            Ok(Command::Tune {
-                identity: Identity::User("flynn".to_owned()),
-                session_key: "s_1".to_owned(),
-                control: TuneControl::Model {
-                    model: "claude-fable-5".to_owned(),
-                    effort: None,
-                    context: Some(Some("1m".to_owned())),
-                },
-            })
-        );
-
-        // An EFFORT alone retunes the resident model's tier.
-        assert_eq!(
-            tune(&[
-                "tune",
-                "--session",
-                "s_1",
-                "--effort",
-                "xhigh",
-                "--as-user",
-                "flynn"
-            ]),
-            Ok(Command::Tune {
-                identity: Identity::User("flynn".to_owned()),
-                session_key: "s_1".to_owned(),
-                control: TuneControl::Effort("xhigh".to_owned()),
-            })
-        );
-
-        // NAMED EMPTY survives as a named empty: `--context ""` is the
-        // vendor's default window, a real selection, and it must reach the
-        // gateway as one rather than as silence to be inherited over.
-        assert_eq!(
-            tune(&[
-                "tune",
-                "--session",
-                "s_1",
-                "--model",
-                "claude-fable-5",
-                "--context",
-                "",
-                "--as-user",
-                "flynn",
-            ]),
-            Ok(Command::Tune {
-                identity: Identity::User("flynn".to_owned()),
-                session_key: "s_1".to_owned(),
-                control: TuneControl::Model {
-                    model: "claude-fable-5".to_owned(),
-                    effort: None,
-                    context: Some(None),
-                },
-            })
-        );
-    }
-
-    #[test]
-    fn tune_refuses_a_packed_model_an_invented_harness_and_a_partial_naming() {
-        // OUR effort word packed into the model string. Refused, and told
-        // where the field actually lives.
-        assert_eq!(
-            tune(&[
-                "tune",
-                "--session",
-                "s_1",
-                "--model",
-                "gpt-5.6-sol[high]",
-                "--as-user",
-                "flynn",
-            ]),
-            Err(
-                "--model must not carry a bracketed suffix; pass --effort or --context \
-                 separately"
-                    .to_owned()
-            )
-        );
-
-        // F7 (Sol xhigh review): the VENDOR's context variant in the same
-        // syntax is ALSO refused now — a hardcoded list of Tightbeam's own
-        // tier words already went stale once (the catalog offers `ultra`
-        // too), and a per-model catalog is not always available to check
-        // against at CLI parse time. Any bracket is packed form; a context
-        // variant is named through `--context`, the field that exists for
-        // it.
-        assert_eq!(
-            tune(&[
-                "tune",
-                "--session",
-                "s_1",
-                "--model",
-                "claude-fable-5[1m]",
-                "--as-user",
-                "flynn",
-            ]),
-            Err(
-                "--model must not carry a bracketed suffix; pass --effort or --context \
-                 separately"
-                    .to_owned()
-            )
-        );
-
-        // An engine this build does not carry is refused by name at the CLI,
-        // before a session is ever addressed.
-        assert_eq!(
-            tune(&[
-                "tune",
-                "--session",
-                "s_1",
-                "--harness",
-                "gemini",
-                "--as-user",
-                "flynn"
-            ]),
-            Err("unsupported harness: gemini".to_owned())
-        );
-
-        // A context qualifies a MODEL. Alone it qualifies nothing, and the
-        // CLI does not guess which model the caller meant — named by the
-        // more specific cause rather than the generic usage line.
-        assert_eq!(
-            tune(&[
-                "tune",
-                "--session",
-                "s_1",
-                "--context",
-                "1m",
-                "--as-user",
-                "flynn"
-            ]),
-            Err(
-                "--context qualifies a --model; name one, or drop --context \
-                 (context_requires_model)"
-                    .to_owned()
-            )
-        );
-
-        // No control named at all.
-        assert_eq!(
-            tune(&["tune", "--session", "s_1", "--as-user", "flynn"]),
-            Err(TUNE_USAGE.to_owned())
-        );
-
-        // No session named.
-        assert_eq!(
-            tune(&["tune", "--model", "claude-fable-5", "--as-user", "flynn"]),
-            Err(TUNE_USAGE.to_owned())
-        );
-
-        // A live switch names ONE session. Re-engining "whoever holds
-        // reviewer" is a different act and is not spelled here.
-        assert_eq!(
-            tune(&[
-                "tune",
-                "--role",
-                "reviewer",
-                "--model",
-                "m",
-                "--as-user",
-                "flynn"
-            ]),
-            Err(TUNE_USAGE.to_owned())
-        );
-
-        // A MISTYPED flag is the dangerous case: silently ignored, `--modle`
-        // would switch the session to the destination default and report
-        // success. The flag set is closed so it cannot.
-        assert_eq!(
-            tune(&[
-                "tune",
-                "--session",
-                "s_1",
-                "--harness",
-                "codex",
-                "--modle",
-                "gpt-5.6-sol",
-                "--as-user",
-                "flynn",
-            ]),
-            Err(TUNE_USAGE.to_owned())
-        );
-
-        // Empty values for the three fields that have no meaningful empty.
-        for name in ["session", "harness", "model"] {
-            let flag = format!("--{name}");
-            assert_eq!(
-                tune(&[
-                    "tune",
-                    "--session",
-                    "s_1",
-                    flag.as_str(),
-                    "",
-                    "--as-user",
-                    "flynn",
-                ]),
-                Err(format!("--{name} requires a non-empty value"))
-            );
-        }
-    }
-
     #[test]
     fn help_enumerates_exactly_cli_surface_v1() {
         let help = render_help(Some(&crate::harnesses::catalog().unwrap()));
@@ -2794,8 +2549,6 @@ mod tests {
         assert_eq!(
             headings,
             [
-                "answer",
-                "ask",
                 "assimilate",
                 "assign",
                 "assignments",
@@ -2807,9 +2560,7 @@ mod tests {
                 "cancel-wake",
                 "condition",
                 "config",
-                "coordination-share",
                 "decision-requests",
-                "digest-members",
                 "dispatch",
                 "doctor",
                 "effort-rule",
@@ -2817,17 +2568,18 @@ mod tests {
                 "host-env-list",
                 "host-env-set",
                 "host-env-unset",
+                "host-toolchain-set",
                 "identity",
                 "kungfu",
                 "learn",
                 "list",
                 "onboard",
+                "operator-ask",
+                "operator-rule",
+                "operator-withdraw",
                 "retire",
-                "return",
-                "reopen-assignment",
                 "revoke-assignment",
                 "spawn",
-                "tune",
                 "wake",
                 "work-item-close",
                 "work-item-create",
@@ -2835,7 +2587,7 @@ mod tests {
                 "work-item-get",
                 "attend",
                 "transcript",
-                "turn-trace",
+                "tune",
                 "unlearn",
                 "topline",
                 "toplines",
@@ -2853,12 +2605,14 @@ mod tests {
             "identity status [<archetype>]",
             "identity apply (<session> | --all)",
             "onboard openai|anthropic [--api-key]",
+            "onboard github [--hostname github.com] [--remote URL]",
             "add-user <userId> [--admin]",
             "config get default-archetype",
             "config set default-archetype <name>",
             "host-env-set --host <host> --harness <harness> NAME=VALUE",
             "host-env-list [--host <host>] [--harness <harness>]",
             "host-env-unset --host <host> --harness <harness> NAME",
+            "host-toolchain-set --host <host> --dirs '<json-array>'",
             "harness-process list",
             "kungfu list",
         ] {
@@ -3106,7 +2860,6 @@ mod tests {
                 condition_kind: Some("build-finished".to_owned()),
                 condition_scope: Some("app".to_owned()),
                 idempotency_key: Some("wake-1".to_owned()),
-                class: None,
             })
         );
         assert_eq!(
@@ -3132,7 +2885,6 @@ mod tests {
                 condition_kind: Some("review-landed".to_owned()),
                 condition_scope: None,
                 idempotency_key: None,
-                class: None,
             })
         );
         assert_eq!(
@@ -3377,78 +3129,98 @@ mod tests {
         }
     }
 
-    // The repair verb names its reason or it does not run: an unexplained
-    // reopen is exactly the unrecorded repair the papertrail exists to prevent.
-    #[test]
-    fn reopen_assignment_requires_an_id_and_a_reason() {
-        for args in [
-            strings(&["reopen-assignment", "--as-user", "flynn"]),
-            strings(&["reopen-assignment", "asg_1", "asg_2", "--as-user", "flynn"]),
-            strings(&["reopen-assignment", "asg_1", "--as-user", "flynn"]),
-        ] {
-            assert_eq!(
-                parse(args),
-                Err(
-                    "usage: tightbeam reopen-assignment <assignmentId> --reason \"...\"".to_owned()
-                )
-            );
-        }
-
-        assert!(matches!(
-            parse(strings(&[
-                "reopen-assignment",
-                "asg_1",
-                "--reason",
-                "stale verdict",
-                "--as-user",
-                "flynn",
-            ]))
-            .unwrap(),
-            Command::ReopenAssignment {
-                assignment_id,
-                reason,
-                ..
-            } if assignment_id == "asg_1" && reason == "stale verdict"
-        ));
-    }
-
     #[test]
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, ask, answer, return, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, host-toolchain-set, doctor, assimilate, harness-process".to_owned())
         );
     }
 
     #[test]
-    fn turn_trace_requires_one_session_and_a_numeric_sequence() {
+    fn operator_decision_commands_parse_the_exact_surface() {
         assert_eq!(
             parse(strings(&[
-                "turn-trace",
-                "--session",
-                "agent:coder:x s_1",
-                "--seq",
-                "17",
-                "--as-user",
-                "flynn",
+                "operator-ask",
+                "--question",
+                "ship window?",
+                "--note",
+                "release train",
+                "--options",
+                "accept,wait",
+                "--assignment",
+                "asg_1",
+                "--deadline",
+                "2h",
+                "--supersedes",
+                "dr_old",
+                "--as",
+                "coder:release",
             ])),
-            Ok(Command::TurnTrace {
-                identity: Identity::User("flynn".to_owned()),
-                session: "agent:coder:x s_1".to_owned(),
-                seq: "17".to_owned(),
+            Ok(Command::OperatorAsk {
+                identity: Identity::Role("coder:release".to_owned()),
+                question: "ship window?".to_owned(),
+                note: Some("release train".to_owned()),
+                options: Some(vec!["accept".to_owned(), "wait".to_owned()]),
+                assignment_id: Some("asg_1".to_owned()),
+                deadline_ms: Some("7200000".to_owned()),
+                supersedes: Some("dr_old".to_owned()),
             })
         );
 
         assert_eq!(
             parse(strings(&[
-                "turn-trace",
-                "--seq",
-                "17",
+                "operator-rule",
+                "dr_1",
+                "--response",
+                "ship after 013",
+                "--rationale",
+                "dependency first",
                 "--as-user",
-                "flynn"
+                "mike",
             ])),
-            Err("turn-trace requires --session <key>".to_owned())
+            Ok(Command::OperatorRule {
+                identity: Identity::User("mike".to_owned()),
+                request_id: "dr_1".to_owned(),
+                decision: None,
+                response: Some("ship after 013".to_owned()),
+                rationale: Some("dependency first".to_owned()),
+            })
         );
+
+        assert_eq!(
+            parse(strings(&[
+                "operator-withdraw",
+                "dr_2",
+                "--reason",
+                "moot after 013",
+            ])),
+            Ok(Command::OperatorWithdraw {
+                identity: Identity::Session,
+                request_id: "dr_2".to_owned(),
+                reason: "moot after 013".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn operator_rule_requires_one_answer_form() {
+        for args in [
+            strings(&["operator-rule", "dr_1"]),
+            strings(&[
+                "operator-rule",
+                "dr_1",
+                "--decision",
+                "accept",
+                "--response",
+                "yes",
+            ]),
+        ] {
+            assert_eq!(
+                parse(args),
+                Err("operator-rule requires exactly one of --decision or --response".to_owned())
+            );
+        }
     }
 
     #[test]
@@ -3463,6 +3235,7 @@ mod tests {
             "revoke-waiver",
             "withdraw",
             "decision-request",
+            "operator-supersede",
             "critical",
             "work-item-update",
             "work-item-list",
@@ -3611,7 +3384,6 @@ mod tests {
                     condition_kind: None,
                     condition_scope: None,
                     idempotency_key: None,
-                    class: None,
                 },
             ),
             (
@@ -3783,6 +3555,8 @@ mod tests {
                     identity: Identity::User("flynn".to_owned()),
                     provider: "openai".to_owned(),
                     api_key: false,
+                    hostname: None,
+                    remote: None,
                 },
             ),
             (

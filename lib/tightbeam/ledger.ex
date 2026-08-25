@@ -17,9 +17,8 @@ defmodule Tightbeam.Ledger do
   - No automatic retries: `failed_unknown` is terminal; nothing here re-sends.
   """
 
-  alias Tightbeam.{DB, TurnLifecycle}
+  alias Tightbeam.DB
   alias Tightbeam.DB.Txn
-  alias Tightbeam.Firehose.Publisher
 
   require Logger
 
@@ -29,8 +28,7 @@ defmodule Tightbeam.Ledger do
           message_id: String.t(),
           origin: String.t(),
           prompt: String.t(),
-          wake_id: String.t() | nil,
-          owner_lease: String.t()
+          wake_id: String.t() | nil
         }
 
   @typedoc "Terminal states — one-way; no transition leaves them."
@@ -78,9 +76,7 @@ defmodule Tightbeam.Ledger do
   """
 
   @spec ensure_schema(db()) :: :ok | {:error, term()}
-  def ensure_schema(db \\ Tightbeam.DB) do
-    with :ok <- DB.execute(db, @ddl), do: TurnLifecycle.ensure_schema(db)
-  end
+  def ensure_schema(db \\ Tightbeam.DB), do: DB.execute(db, @ddl)
 
   @doc """
   Transactionally enqueue a turn (call inside the same DB.transaction that
@@ -132,34 +128,6 @@ defmodule Tightbeam.Ledger do
       )
 
       [[seq]] = Txn.q(txn, "SELECT last_insert_rowid()")
-      principal = TurnLifecycle.principal(Map.get(attrs, :principal, Map.fetch!(attrs, :origin)))
-
-      detail =
-        %{
-          v: 1,
-          origin: Map.fetch!(attrs, :origin),
-          wakeId: Map.get(attrs, :wake_id),
-          clientMessageId: Map.get(attrs, :client_message_id),
-          authenticatedCaller: principal
-        }
-        |> Enum.reject(fn {_key, value} -> is_nil(value) end)
-        |> Map.new()
-
-      TurnLifecycle.append_in_txn(txn, seq, %{
-        event_key: "accepted",
-        producer_event_id: "ledger:accepted",
-        kind: "accepted",
-        cause:
-          if(Map.get(attrs, :wake_id),
-            do: "wake:#{Map.fetch!(attrs, :wake_id)}",
-            else:
-              "client-message:#{Map.get(attrs, :client_message_id, Map.fetch!(attrs, :message_id))}"
-          ),
-        principal: principal,
-        detail: detail,
-        at: now
-      })
-
       {:ok, seq}
     else
       {:error, :no_session}
@@ -276,8 +244,6 @@ defmodule Tightbeam.Ledger do
             )
 
             if Txn.changes(txn) == 1 do
-              owner_lease = owner_lease()
-
               [[seq, message_id, origin, prompt, wake_id]] =
                 Txn.q(
                   txn,
@@ -288,27 +254,13 @@ defmodule Tightbeam.Ledger do
                   [session_key]
                 )
 
-              TurnLifecycle.append_in_txn(txn, seq, %{
-                event_key: "claimed",
-                producer_event_id: "ledger:claimed",
-                kind: "claimed",
-                cause: "session-lane:claim",
-                principal: "process:tightbeam",
-                owner_lease: owner_lease,
-                detail: %{v: 1, owner: owner},
-                at: now
-              })
-
-              Publisher.turn_in_txn(txn, "turn.started", seq)
-
               {:ok,
                %{
                  seq: seq,
                  message_id: message_id,
                  origin: origin,
                  prompt: prompt,
-                 wake_id: wake_id,
-                 owner_lease: owner_lease
+                 wake_id: wake_id
                }}
             else
               no_claim(txn, session_key)
@@ -382,36 +334,21 @@ defmodule Tightbeam.Ledger do
   def fail_unclaimable(db \\ Tightbeam.DB, session_key, reason) do
     {:ok, seqs} =
       DB.transaction(db, fn txn ->
-        seqs =
-          txn
-          |> Txn.q(
-            """
-            UPDATE turns SET status = 'failed', endedAt = ?2, error = ?3
-            WHERE sessionKey = ?1 AND status = 'queued'
-              AND NOT EXISTS (
-                SELECT 1 FROM sessions AS s
-                WHERE s.sessionKey = ?1 AND s.state = 'active'
-              )
-            RETURNING seq
-            """,
-            [session_key, System.system_time(:millisecond), unclaimable_error(reason)]
-          )
-          |> Enum.map(&hd/1)
-          |> Enum.sort()
-
-        Enum.each(seqs, fn seq ->
-          TurnLifecycle.append_in_txn(
-            txn,
-            seq,
-            terminal_event(seq, "failed", %{
-              cause: "unclaimable:#{reason}",
-              principal: "process:tightbeam"
-            })
-          )
-        end)
-
-        Enum.each(seqs, &Publisher.turn_in_txn(txn, "turn.ended", &1))
-        seqs
+        txn
+        |> Txn.q(
+          """
+          UPDATE turns SET status = 'failed', endedAt = ?2, error = ?3
+          WHERE sessionKey = ?1 AND status = 'queued'
+            AND NOT EXISTS (
+              SELECT 1 FROM sessions AS s
+              WHERE s.sessionKey = ?1 AND s.state = 'active'
+            )
+          RETURNING seq
+          """,
+          [session_key, System.system_time(:millisecond), unclaimable_error(reason)]
+        )
+        |> Enum.map(&hd/1)
+        |> Enum.sort()
       end)
 
     seqs
@@ -427,32 +364,22 @@ defmodule Tightbeam.Ledger do
   Exactly-one durable terminal transition (CAS). Returns :ok if this caller
   won the transition, :already_terminal otherwise.
   """
-  @spec finish(db(), integer(), terminal(), String.t() | nil, keyword()) ::
-          :ok
-          | :already_terminal
-          | {:error, {:turn_lifecycle_write_rejected, atom()}}
-  def finish(db \\ Tightbeam.DB, seq, terminal, error \\ nil, opts \\ [])
+  @spec finish(db(), integer(), terminal(), String.t() | nil) :: :ok | :already_terminal
+  def finish(db \\ Tightbeam.DB, seq, terminal, error \\ nil)
       when terminal in ~w(delivered canceled failed failed_unknown) do
-    case DB.transaction(db, fn txn ->
-           finish_in_txn(txn, seq, terminal, error, opts)
-         end) do
-      {:ok, true} ->
-        :ok
+    {:ok, won} =
+      DB.transaction(db, fn txn ->
+        finish_in_txn(txn, seq, terminal, error)
+      end)
 
-      {:ok, false} ->
-        :already_terminal
-
-      {:error, %TurnLifecycle.WriteError{code: code}} ->
-        {:error, {:turn_lifecycle_write_rejected, code}}
-    end
+    if won, do: :ok, else: :already_terminal
   end
 
   @doc "Terminal transition inside the caller's transaction."
-  @spec finish_in_txn(Txn.t(), integer(), terminal(), String.t() | nil, keyword()) :: boolean()
-  def finish_in_txn(%Txn{} = txn, seq, terminal, error \\ nil, opts \\ [])
+  @spec finish_in_txn(Txn.t(), integer(), terminal(), String.t() | nil) :: boolean()
+  def finish_in_txn(%Txn{} = txn, seq, terminal, error \\ nil)
       when terminal in ~w(delivered canceled failed failed_unknown) do
     now = System.system_time(:millisecond)
-    opts = Map.new(opts)
 
     Txn.q(
       txn,
@@ -460,19 +387,7 @@ defmodule Tightbeam.Ledger do
       [seq, terminal, now, error]
     )
 
-    won = Txn.changes(txn) == 1
-
-    if won do
-      TurnLifecycle.append_in_txn(
-        txn,
-        seq,
-        terminal_event(seq, terminal, opts) |> Map.put(:at, now)
-      )
-
-      Publisher.turn_in_txn(txn, "turn.ended", seq)
-    end
-
-    won
+    Txn.changes(txn) == 1
   end
 
   @doc """
@@ -482,8 +397,8 @@ defmodule Tightbeam.Ledger do
   turns are canceled, not failed; this is the single drain point for every retire.
   Setting endedAt routes each row through the existing terminal publication sweep.
   """
-  @spec drain_queued_for_retire_in_txn(Txn.t(), String.t(), String.t(), keyword()) :: [integer()]
-  def drain_queued_for_retire_in_txn(%Txn{} = txn, session_key, reason, opts \\ []) do
+  @spec drain_queued_for_retire_in_txn(Txn.t(), String.t(), String.t()) :: [integer()]
+  def drain_queued_for_retire_in_txn(%Txn{} = txn, session_key, reason) do
     rows =
       Txn.q(
         txn,
@@ -500,18 +415,7 @@ defmodule Tightbeam.Ledger do
       [session_key, System.system_time(:millisecond), reason]
     )
 
-    seqs = Enum.map(rows, &hd/1)
-
-    Enum.each(seqs, fn seq ->
-      TurnLifecycle.append_in_txn(
-        txn,
-        seq,
-        terminal_event(seq, "canceled", Map.new(opts))
-      )
-    end)
-
-    Enum.each(seqs, &Publisher.turn_in_txn(txn, "turn.ended", &1))
-    seqs
+    Enum.map(rows, &hd/1)
   end
 
   @doc """
@@ -538,18 +442,6 @@ defmodule Tightbeam.Ledger do
           [now]
         )
 
-        Enum.each(seqs, fn seq ->
-          TurnLifecycle.append_in_txn(
-            txn,
-            seq,
-            terminal_event(seq, "failed_unknown", %{
-              cause: "boot-recovery",
-              principal: "process:tightbeam"
-            })
-          )
-        end)
-
-        Enum.each(seqs, &Publisher.turn_in_txn(txn, "turn.ended", &1))
         seqs
       end)
 
@@ -571,30 +463,6 @@ defmodule Tightbeam.Ledger do
     {:ok, [[count]]} =
       DB.query(
         db,
-        "SELECT count(*) FROM turns WHERE sessionKey = ?1 AND status IN ('queued','running')",
-        [session_key]
-      )
-
-    count
-  end
-
-  @doc """
-  `pending_count/2`, inside the caller's own transaction.
-
-  The in-txn form matters, not just the query: `DB` is single-writer and
-  serializes one `DB.transaction/2` call at a time, so a count taken as its
-  OWN transaction (as `pending_count/2` does) can never rule out a prompt
-  committing in the gap before the caller's next transaction opens. A count
-  read inside the SAME transaction that goes on to perform the swap+barrier
-  closes that gap: no other write (`deliver_prompt`'s echo+enqueue included)
-  can land between this read and the writes that follow it, because none can
-  run until this transaction commits (Sol xhigh review, live-switch finding 1).
-  """
-  @spec pending_count_in_txn(Txn.t(), String.t()) :: non_neg_integer()
-  def pending_count_in_txn(%Txn{} = txn, session_key) do
-    [[count]] =
-      Txn.q(
-        txn,
         "SELECT count(*) FROM turns WHERE sessionKey = ?1 AND status IN ('queued','running')",
         [session_key]
       )
@@ -678,90 +546,20 @@ defmodule Tightbeam.Ledger do
   @spec mark_published(db(), integer()) :: :ok
   def mark_published(db \\ Tightbeam.DB, seq) do
     now = System.system_time(:millisecond)
-
-    {:ok, _} =
-      DB.transaction(db, fn txn ->
-        Txn.q(
-          txn,
-          "UPDATE turns SET publishedAt = ?2 WHERE seq = ?1 AND publishedAt IS NULL",
-          [seq, now]
-        )
-
-        if Txn.changes(txn) == 1 do
-          [[status]] = Txn.q(txn, "SELECT status FROM turns WHERE seq = ?1", [seq])
-
-          TurnLifecycle.append_in_txn(txn, seq, %{
-            event_key: "terminal:published",
-            producer_event_id: "ledger:terminal:published",
-            kind: "terminal_published",
-            outcome: status,
-            cause: "terminal-publisher",
-            principal: "process:tightbeam",
-            detail: %{v: 1, status: status},
-            at: now
-          })
-        end
-      end)
-
+    {:ok, _} = DB.query(db, "UPDATE turns SET publishedAt = ?2 WHERE seq = ?1", [seq, now])
     :ok
   end
 
   @doc "Stamp the adapter generation selected for a running turn."
   @spec stamp_adapter(db(), integer(), non_neg_integer()) :: :ok
-  def stamp_adapter(db, seq, generation) do
-    {:ok, [[owner_lease]]} =
-      DB.query(
-        db,
-        "SELECT ownerLease FROM turn_lifecycle_events WHERE turnSeq=?1 AND kind='claimed'",
-        [seq]
-      )
-
-    stamp_adapter(db, seq, generation, owner_lease)
-  end
-
-  @spec stamp_adapter(db(), integer(), non_neg_integer(), String.t()) :: :ok
-  def stamp_adapter(db, seq, generation, owner_lease) do
+  def stamp_adapter(db \\ Tightbeam.DB, seq, generation) do
     {:ok, _} =
-      DB.transaction(db, fn txn ->
-        Txn.q(txn, "UPDATE turns SET adapterGen = ?2 WHERE seq = ?1 AND status = 'running'", [
-          seq,
-          generation
-        ])
-
-        if Txn.changes(txn) == 1 do
-          TurnLifecycle.append_in_txn(txn, seq, %{
-            event_key: "checkout:succeeded",
-            producer_event_id: "gateway:checkout:succeeded",
-            kind: "stage_succeeded",
-            stage: "checkout",
-            outcome: "succeeded",
-            cause: "adapter-coordinator:checkout",
-            principal: "process:tightbeam",
-            owner_lease: owner_lease,
-            adapter_gen: generation,
-            detail: %{v: 1}
-          })
-        end
-      end)
+      DB.query(db, "UPDATE turns SET adapterGen = ?2 WHERE seq = ?1 AND status = 'running'", [
+        seq,
+        generation
+      ])
 
     :ok
-  end
-
-  defp terminal_event(seq, terminal, opts) do
-    %{
-      event_key: "terminal:committed",
-      producer_event_id: "ledger:terminal:committed",
-      kind: "terminal_committed",
-      outcome: terminal,
-      cause: Map.get(opts, :cause, "turn:#{seq}"),
-      principal: Map.get(opts, :principal, "process:tightbeam"),
-      owner_lease: Map.get(opts, :owner_lease),
-      detail: %{v: 1, status: terminal}
-    }
-  end
-
-  defp owner_lease do
-    "ol_" <> (:crypto.strong_rand_bytes(24) |> Base.url_encode64(padding: false))
   end
 
   @doc "Conservation audit: non-terminal rows older than max_age_ms. Must be []."

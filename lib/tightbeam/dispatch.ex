@@ -26,9 +26,9 @@ defmodule Tightbeam.Dispatch do
 
   alias Tightbeam.{
     Assignments,
+    DB,
     Escalation,
     EventLog,
-    Firehose.Publisher,
     Placement,
     RailEpisodes,
     RailRemedy,
@@ -84,18 +84,7 @@ defmodule Tightbeam.Dispatch do
       {:replay, assignment} ->
         # A keyed replay bypasses the rail entirely (statute inertness): the
         # original assignment is returned, no rumination, no terminal guard.
-        :ok =
-          EventLog.append_event_with_handoff(
-            db,
-            "verb",
-            verb,
-            origin,
-            session_key,
-            assignment,
-            principal,
-            &Publisher.observed_accepted_in_txn(&1, call)
-          )
-
+        :ok = EventLog.append_event(db, "verb", verb, origin, session_key, assignment, principal)
         {:ok, assignment}
 
       {:refuse, error} ->
@@ -117,7 +106,7 @@ defmodule Tightbeam.Dispatch do
 
   defp dispatch_through_rail(db, handlers, call, verb, origin, principal, session_key) do
     {decision, to_close, to_consume} = Rules.decide(db, call)
-    Enum.each(to_close, &close(db, handlers, &1))
+    Enum.each(to_close, &close(db, &1))
 
     case decision do
       {:deny, error} ->
@@ -182,140 +171,48 @@ defmodule Tightbeam.Dispatch do
   # whose statute passed; a malfunction episode closes because the statute's check
   # answered at all, whatever it answered. The atom tag is unambiguous — a statute name
   # is a lowercase string, never an atom.
-  defp close(db, _handlers, {:episodes, statute, position}),
+  defp close(db, {:episodes, statute, position}),
     do: RailEpisodes.recovered(db, statute, position)
 
-  defp close(db, _handlers, {statute, subject, occurrence}),
+  defp close(db, {statute, subject, occurrence}),
     do: RailRemedy.close(db, statute, subject, occurrence)
 
-  defp close(db, handlers, {:notice, statute, subject, call}),
-    do: RailRemedy.notice(db, handlers, statute, subject, call)
-
   defp dispatch_to_handler(db, handlers, call, verb, origin, principal, session_key) do
-    publisher_call = Publisher.capture_before(db, call)
-
     case Map.fetch(handlers, verb) do
       :error ->
         error = %{code: "unknown_verb"}
-
-        :ok =
-          EventLog.append_event_with_handoff(
-            db,
-            "denied",
-            verb,
-            origin,
-            session_key,
-            error,
-            principal,
-            &Publisher.denied_in_txn(&1, publisher_call, error)
-          )
-
+        :ok = EventLog.append_event(db, "denied", verb, origin, session_key, error, principal)
         {:error, error}
 
       {:ok, handler} ->
-        publisher_call =
-          if Publisher.transactional_verb?(verb),
-            do: Map.put(publisher_call, :firehose_in_txn, true),
-            else: publisher_call
-
         handler_call =
-          case verb do
-            verb when verb in ["assign", "dispatch"] ->
-              Map.put(publisher_call, :accepted_event_in_txn, true)
-
-            "condition" ->
-              Map.put(publisher_call, :firehose_effect_requested, true)
-
-            _ ->
-              publisher_call
-          end
+          if verb in ["assign", "dispatch"],
+            do: Map.put(call, :accepted_event_in_txn, true),
+            else: call
 
         case invoke(handler, handler_call) do
           {:returned, %{code: _} = error} ->
-            :ok =
-              EventLog.append_event_with_handoff(
-                db,
-                "denied",
-                verb,
-                origin,
-                session_key,
-                error,
-                principal,
-                &Publisher.denied_in_txn(&1, publisher_call, error)
-              )
-
+            :ok = EventLog.append_event(db, "denied", verb, origin, session_key, error, principal)
             {:error, error}
 
           {:returned, {:accepted_in_txn, event_id, %{canceled: true} = result}}
           when is_integer(event_id) and event_id > 0 and map_size(result) == 1 ->
-            :ok = Publisher.accepted_after_handler(db, publisher_call, result)
             {:ok, result}
 
           {:returned, {:accepted_in_txn, event_id, %{assignment: assignment} = envelope}}
           when is_integer(event_id) and event_id > 0 and map_size(envelope) == 1 and
                  is_map(assignment) ->
-            :ok = Publisher.accepted_after_handler(db, publisher_call, assignment)
             {:ok, assignment}
-
-          {:returned, {:firehose_effect, result, changed?}} when is_boolean(changed?) ->
-            payload = outcome_payload(verb, call, {:returned, result})
-            :ok = EventLog.append_event(db, "verb", verb, origin, session_key, payload, principal)
-
-            :ok =
-              Publisher.accepted_after_handler(
-                db,
-                Map.put(publisher_call, :firehose_changed, changed?),
-                result
-              )
-
-            {:ok, result}
 
           {:returned, result} ->
             payload = outcome_payload(verb, call, {:returned, result})
-
-            if Publisher.transactional_verb?(verb) do
-              :ok =
-                EventLog.append_event(
-                  db,
-                  "verb",
-                  verb,
-                  origin,
-                  session_key,
-                  payload,
-                  principal
-                )
-            else
-              :ok =
-                EventLog.append_event_with_handoff(
-                  db,
-                  "verb",
-                  verb,
-                  origin,
-                  session_key,
-                  payload,
-                  principal,
-                  &Publisher.accepted_in_txn(&1, publisher_call, result)
-                )
-            end
-
+            :ok = EventLog.append_event(db, "verb", verb, origin, session_key, payload, principal)
             {:ok, result}
 
           {:raised, exception} ->
             error = %{code: "server_error", message: Exception.message(exception)}
             payload = outcome_payload(verb, call, {:raised, exception})
-
-            :ok =
-              EventLog.append_event_with_handoff(
-                db,
-                "verb",
-                verb,
-                origin,
-                session_key,
-                payload,
-                principal,
-                &Publisher.denied_in_txn(&1, publisher_call, error)
-              )
-
+            :ok = EventLog.append_event(db, "verb", verb, origin, session_key, payload, principal)
             {:error, error}
         end
     end
@@ -380,29 +277,15 @@ defmodule Tightbeam.Dispatch do
 
   defp best_effort_denial(db, verb, origin, principal, session_key, error) do
     try do
-      :ok =
-        EventLog.append_event_with_handoff(
-          db,
-          "denied",
-          verb,
-          origin,
-          session_key,
-          JSON.encode!(error),
-          principal,
-          fn txn ->
-            Publisher.denied_in_txn(
-              txn,
-              %{
-                verb: verb,
-                origin: origin,
-                principal: principal,
-                session_key: session_key,
-                params: %{}
-              },
-              error
-            )
-          end
-        )
+      EventLog.append_event(
+        db,
+        "denied",
+        verb,
+        origin,
+        session_key,
+        JSON.encode!(error),
+        principal
+      )
     catch
       _kind, _reason -> :ok
     end
@@ -436,9 +319,9 @@ defmodule Tightbeam.Dispatch do
     do: %{error | reason: "remedy_fired", producer: outcome.producer_id}
 
   defp ruling_statute(db, ruling_id) do
-    case Escalation.statute_name_for_ruling(db, ruling_id) do
-      {:ok, statute} -> statute
-      :not_found -> "ruling-authorization"
+    case DB.query(db, "SELECT statuteName FROM decision_requests WHERE id = ?1", [ruling_id]) do
+      {:ok, [[statute]]} -> statute
+      _ -> "ruling-authorization"
     end
   end
 end

@@ -32,7 +32,81 @@ end
 defmodule Tightbeam.SchemaShapeTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Schema}
+  alias Tightbeam.{Assignments, DB, Schema}
+
+  @shape "operator-decision-requests-cold-start-v1"
+  @previous_shape "operator-decision-requests-v1"
+  @model_identity_shape "model-identity-v1"
+  @be61_shape "model-identity-message-envelope-v2"
+
+  # Captured from Schema.ensure_all/1 at be61cfc98df6b18c0cc280adeca42cba3fbf14b5.
+  # Keep the old table exact: its missing ruledViaSessionKey column is why this
+  # build must refuse the old stamp before it serves a decision-request read.
+  @be61_decision_requests_ddl """
+  CREATE TABLE decision_requests (
+    id                TEXT PRIMARY KEY,
+    kind              TEXT NOT NULL DEFAULT 'statute' CHECK (kind IN ('statute','effort')),
+    raiserId          TEXT NOT NULL,
+    raiserSessionKey  TEXT,
+    ownerUserId       TEXT NOT NULL,
+    assignmentId      TEXT,
+    expecterSessionKey TEXT,
+    expecterUserId    TEXT,
+    lineageRung       INTEGER,
+    effortGeneration  INTEGER,
+    deadlineWakeId    TEXT,
+    raisedAt          INTEGER NOT NULL,
+    deadlineAt        INTEGER NOT NULL,
+    statuteName       TEXT,
+    actionKey         TEXT,
+    question          TEXT NOT NULL,
+    options           TEXT,
+    context           TEXT NOT NULL,
+    status            TEXT NOT NULL CHECK (status IN ('open','ruled','consumed','withdrawn','superseded')),
+    decision          TEXT,
+    rationale         TEXT,
+    ruledBy           TEXT,
+    ruledAt           INTEGER,
+    rulingFactId      INTEGER,
+    consumedAt        INTEGER,
+    parkWakeId        TEXT,
+    withdrawnBy       TEXT,
+    withdrawnReason   TEXT,
+    withdrawnAt       INTEGER,
+    CHECK (
+      (kind = 'statute' AND statuteName IS NOT NULL AND actionKey IS NOT NULL
+       AND expecterSessionKey IS NULL AND expecterUserId IS NULL
+       AND lineageRung IS NULL AND effortGeneration IS NULL AND deadlineWakeId IS NULL
+       AND (decision IS NULL OR decision IN ('allow','deny','waived')))
+      OR
+      (kind = 'effort' AND raiserId = 'process:tightbeam'
+       AND raiserSessionKey IS NULL
+       AND statuteName IS NULL AND actionKey IS NULL AND assignmentId IS NOT NULL
+       AND ((expecterSessionKey IS NOT NULL) != (expecterUserId IS NOT NULL))
+       AND lineageRung IS NOT NULL AND effortGeneration IS NOT NULL AND deadlineWakeId IS NOT NULL
+       AND (decision IS NULL OR decision IN ('continue','dismiss')))
+    )
+  )
+  """
+
+  @model_identity_messages_ddl """
+  CREATE TABLE messages (
+    seq                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    id                     TEXT NOT NULL UNIQUE,
+    sessionKey             TEXT NOT NULL,
+    role                   TEXT NOT NULL CHECK (role IN ('user','assistant')),
+    content                TEXT NOT NULL,
+    timestamp              INTEGER NOT NULL,
+    sender                 TEXT,
+    deviceId               TEXT,
+    clientMessageId        TEXT,
+    replyToMessageId       TEXT,
+    replyToClientMessageId TEXT,
+    llmVisibleMessageId    TEXT NOT NULL,
+    attachments            TEXT NOT NULL DEFAULT '[]',
+    attentionTier          INTEGER NOT NULL DEFAULT 0
+  )
+  """
 
   setup do
     name = :"schema_shape_#{System.unique_integer([:positive])}"
@@ -42,15 +116,238 @@ defmodule Tightbeam.SchemaShapeTest do
 
   test "a fresh database is created and stamped", %{db: db} do
     assert :ok = Schema.ensure_all(db)
+    assert "executionId" in table_columns(db, "command_executions")
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v6"]]} =
+    assert {:ok, [[@shape]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     # Idempotent: booting twice is the ordinary case, not a shape change.
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v6"]]} =
+    assert {:ok, [[@shape]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok, [[1, operator_index]]} =
+             DB.query(
+               db,
+               "SELECT COUNT(*), MIN(sql) FROM sqlite_master WHERE type='index' AND name='decision_requests_operator_open'"
+             )
+
+    assert operator_index =~ "(ownerUserId, raiserId, actionKey)"
+    assert operator_index =~ ~r/WHERE\s+kind\s*=\s*'operator'\s+AND\s+status\s*=\s*'open'/
+  end
+
+  test "model-identity-v1 migrates exact requests, messages, and wakes", %{db: db} do
+    :ok = Schema.ensure_all(db)
+    downgrade_decision_requests_to_model_identity(db)
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO decision_requests
+        (id, kind, raiserId, ownerUserId, raisedAt, deadlineAt, statuteName,
+         actionKey, question, context, status)
+      VALUES
+        ('dr_statute', 'statute', 'session:holder', 'mike', 1, 2, 'law-a',
+         'action-a', 'allow?', '{}', 'open');
+
+      INSERT INTO decision_requests
+        (id, kind, raiserId, ownerUserId, assignmentId, expecterSessionKey,
+         lineageRung, effortGeneration, deadlineWakeId, raisedAt, deadlineAt,
+         question, context, status, decision, ruledBy, ruledAt)
+      VALUES
+        ('dr_effort', 'effort', 'process:tightbeam', 'mike', 'asg_a', 'holder',
+         2, 3, 'w_deadline', 3, 4, 'continue?', '{}', 'ruled', 'continue',
+         'user:mike', 5);
+
+      INSERT INTO wakes
+        (wakeId, sessionKey, origin, prompt, dueAt, state, createdAt, firedAt)
+      VALUES
+        ('w_pending', 'holder', 'process:test', 'resume', 10, 'pending', 6, NULL),
+        ('w_fired', 'holder', 'process:test', 'done', 11, 'fired', 7, 12);
+
+      INSERT INTO messages
+        (seq, id, sessionKey, role, content, timestamp, sender, deviceId,
+         clientMessageId, replyToMessageId, replyToClientMessageId,
+         llmVisibleMessageId, attachments, attentionTier)
+      VALUES
+        (7, 'm_one', 'holder', 'user', 'hello', 13, 'user:mike', 'device-a',
+         'client-a', NULL, NULL, 'm_one', '[{"kind":"text"}]', 1),
+        (11, 'm_two', 'holder', 'assistant', 'world', 14, 'session:holder', NULL,
+         NULL, 'm_one', NULL, 'm_two', '[]', 0);
+
+      INSERT INTO users (userId, isAdmin, createdAt)
+      VALUES ('mike', 1, 1);
+      INSERT INTO devices
+        (deviceId,userId,claimedName,status,token,platform,model,createdAt)
+      VALUES ('mike-device','mike','Mike','allowlisted','tbt_migration',NULL,NULL,1);
+      INSERT INTO sessions
+        (sessionKey, displayName, kind, isBuiltIn, ownerUserId, origin, archetype,
+         harness, provider, model, createdAt, updatedAt)
+      VALUES
+        ('agent:main:clawline:mike:main', 'Main', 'main', 1, 'mike', 'user:mike',
+         'default', 'claude', 'anthropic', 'fixture-model', 1, 1);
+      INSERT INTO sessions
+        (sessionKey, displayName, ownerUserId, origin, archetype, harness,
+         provider, model, createdAt, updatedAt)
+      VALUES
+        ('holder', 'holder', 'mike', 'user:mike', 'coder', 'codex', 'openai',
+         'fixture-model', 1, 1);
+      INSERT INTO work_items
+        (id, title, ownerUserId, createdByUser, createdAt)
+      VALUES ('wi_one', 'one', 'mike', 'mike', 1);
+      INSERT INTO artifacts
+        (artifactId, kind, title, createdBySession, workItemId, originPath,
+         recordedMessageId, createdAt, updatedAt)
+      VALUES
+        ('art_one', 'report', 'one', 'holder', 'wi_one', '/tmp/one',
+         'm_one', 1, 1);
+      """)
+
+    {:ok, decision_requests_before} =
+      DB.query(
+        db,
+        "SELECT #{model_identity_request_columns()} FROM decision_requests ORDER BY id"
+      )
+
+    {:ok, wakes_before} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
+
+    {:ok, messages_before} =
+      DB.query(db, "SELECT #{model_identity_message_columns()} FROM messages ORDER BY seq")
+
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok, ^decision_requests_before} =
+             DB.query(
+               db,
+               "SELECT #{model_identity_request_columns()} FROM decision_requests ORDER BY id"
+             )
+
+    assert {:ok, [[nil], [nil]]} =
+             DB.query(db, "SELECT ruledViaSessionKey FROM decision_requests ORDER BY id")
+
+    assert {:ok, ^wakes_before} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
+
+    assert {:ok, ^messages_before} =
+             DB.query(db, "SELECT #{model_identity_message_columns()} FROM messages ORDER BY seq")
+
+    assert {:ok, [[nil, nil, nil, nil], [nil, nil, nil, nil]]} =
+             DB.query(
+               db,
+               "SELECT messageType, markerKind, markerFrom, markerTo FROM messages ORDER BY seq"
+             )
+
+    assert {:ok, []} = table_names(db, "decision_requests_model_identity_v1")
+    assert {:ok, []} = table_names(db, "messages_new")
+    assert {:ok, [[1]]} = index_count(db, "decision_requests_operator_open")
+    assert {:ok, [["m_one"]]} = DB.query(db, "SELECT recordedMessageId FROM artifacts")
+    assert {:ok, [[1]]} = DB.query(db, "PRAGMA foreign_keys")
+
+    # The rebuilt table is the same target shape a fresh 0.1.8 database gets.
+    fresh = :"schema_shape_fresh_#{System.unique_integer([:positive])}"
+    start_supervised!({DB, path: ":memory:", name: fresh}, id: fresh)
+    assert :ok = Schema.ensure_all(fresh)
+
+    assert object_sql(db, "table", "decision_requests") ==
+             object_sql(fresh, "table", "decision_requests")
+
+    for name <-
+          ~w(decision_requests_owner decision_requests_key decision_requests_one_open decision_requests_effort_generation decision_requests_operator_open) do
+      assert object_sql(db, "index", name) == object_sql(fresh, "index", name)
+    end
+
+    assert object_sql(db, "table", "messages") == object_sql(fresh, "table", "messages")
+
+    for name <- ~w(messages_session messages_client_dedupe) do
+      assert object_sql(db, "index", name) == object_sql(fresh, "index", name)
+    end
+
+    # A second boot is ordinary and leaves both commissioned populations exact.
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:ok, ^decision_requests_before} =
+             DB.query(
+               db,
+               "SELECT #{model_identity_request_columns()} FROM decision_requests ORDER BY id"
+             )
+
+    assert {:ok, ^wakes_before} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
+
+    assert {:ok, ^messages_before} =
+             DB.query(db, "SELECT #{model_identity_message_columns()} FROM messages ORDER BY seq")
+  end
+
+  test "a failed exact migration rolls back the rename and stamp", %{db: db} do
+    :ok = Schema.ensure_all(db)
+    downgrade_decision_requests_to_model_identity(db)
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO decision_requests
+        (id, kind, raiserId, ownerUserId, raisedAt, deadlineAt, statuteName,
+         actionKey, question, context, status)
+      VALUES
+        ('dr_kept', 'statute', 'session:holder', 'mike', 1, 2, 'law-a',
+         'action-a', 'allow?', '{}', 'open');
+      DROP INDEX decision_requests_key;
+      """)
+
+    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
+    assert error.message =~ "failed and was rolled back"
+    assert {:ok, [[@model_identity_shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+    assert {:ok, [["dr_kept"]]} = DB.query(db, "SELECT id FROM decision_requests")
+    assert {:ok, []} = table_names(db, "decision_requests_model_identity_v1")
+    refute "ruledViaSessionKey" in table_columns(db, "decision_requests")
+  end
+
+  test "a message rebuild failure rolls back requests, messages, and stamp", %{db: db} do
+    :ok = Schema.ensure_all(db)
+    downgrade_decision_requests_to_model_identity(db)
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO decision_requests
+        (id, kind, raiserId, ownerUserId, raisedAt, deadlineAt, statuteName,
+         actionKey, question, context, status)
+      VALUES
+        ('dr_kept', 'statute', 'session:holder', 'mike', 1, 2, 'law-a',
+         'action-a', 'allow?', '{}', 'open');
+      INSERT INTO messages
+        (seq, id, sessionKey, role, content, timestamp, llmVisibleMessageId)
+      VALUES (9, 'm_kept', 'holder', 'user', 'hello', 3, 'm_kept');
+      DROP INDEX messages_client_dedupe;
+      """)
+
+    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
+    assert error.message =~ "failed and was rolled back"
+    assert {:ok, [[@model_identity_shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+    assert {:ok, [["dr_kept"]]} = DB.query(db, "SELECT id FROM decision_requests")
+    assert {:ok, [[9, "m_kept"]]} = DB.query(db, "SELECT seq, id FROM messages")
+    assert {:ok, []} = table_names(db, "decision_requests_model_identity_v1")
+    assert {:ok, []} = table_names(db, "messages_new")
+    refute "ruledViaSessionKey" in table_columns(db, "decision_requests")
+    refute "messageType" in table_columns(db, "messages")
+    assert {:ok, [[1]]} = DB.query(db, "PRAGMA foreign_keys")
+  end
+
+  test "the harness health foundation is additive and exact", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    assert table_columns(db, "harness_health_observations") ==
+             ~w(id correlationId harness host failureClass evidenceKind sessionKey assignmentId observedAt cause principal incidentId)
+
+    assert table_columns(db, "harness_health_incidents") ==
+             ~w(id harness host failureClass state openedAt openObservationId openedFactId resolvedAt resolutionObservationId resolvedFactId)
+
+    assert table_columns(db, "harness_health_members") == ~w(incidentId sessionKey)
+
+    assert table_columns(db, "harness_health_assignments") ==
+             ~w(incidentId assignmentId sessionKey)
+
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+    assert :ok = Schema.ensure_all(db)
+    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM harness_health_incidents")
   end
 
   test "the shared liveness activation creates one exact additive shape", %{db: db} do
@@ -186,6 +483,58 @@ defmodule Tightbeam.SchemaShapeTest do
     end
   end
 
+  test "predecessor assignment file rows stay exact across ensure_all", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:paired, _device} =
+             claim_org(db, %{
+               device_id: "flynn-device",
+               claimed_name: "Flynn",
+               platform: nil,
+               model: nil
+             })
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO sessions
+        (sessionKey,displayName,ownerUserId,origin,archetype,harness,provider,
+         model,createdAt,updatedAt)
+      VALUES
+        ('holder','holder','flynn','user:flynn','coder','claude','anthropic',
+         'fixture-model',1,1);
+      """)
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO assignments
+        (id,subject,holderKey,holderRole,holderFallback,openedByUser,
+         openedBySession,openedAt,state,outcome,closedAt,closedByUser,
+         closedBySession,closingAttestId)
+      VALUES
+        ('asg_predecessor','advisory files','holder',NULL,0,'flynn',
+         NULL,1,'open',NULL,NULL,NULL,NULL,NULL)
+      """)
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO assignment_files (assignmentId, path)
+      VALUES ('asg_predecessor','lib/a.ex'), ('asg_predecessor','test/a_test.exs')
+      """)
+
+    assert {:ok, before_rows} =
+             DB.query(db, "SELECT * FROM assignment_files ORDER BY assignmentId, path")
+
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:ok, ^before_rows} =
+             DB.query(db, "SELECT * FROM assignment_files ORDER BY assignmentId, path")
+
+    assert Assignments.declared_files(db, "asg_predecessor") ==
+             ["lib/a.ex", "test/a_test.exs"]
+
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+  end
+
   test "an incomplete activation and an empty epoch refuse without repair", %{db: db} do
     assert :ok = Schema.ensure_all(db)
 
@@ -232,8 +581,32 @@ defmodule Tightbeam.SchemaShapeTest do
     assert {:ok, ^before_rows} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
     assert {:ok, []} = DB.query(db, "SELECT wakeId FROM wake_cancellations")
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v6"]]} =
+    assert {:ok, [[@shape]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
+  end
+
+  test "the real be61 decision-request shape is refused before it can be read", %{db: db} do
+    :ok =
+      DB.execute(db, """
+      CREATE TABLE schema_stamp (
+        shape     TEXT PRIMARY KEY,
+        stampedAt INTEGER NOT NULL
+      );
+      INSERT INTO schema_stamp (shape, stampedAt) VALUES ('#{@be61_shape}', 1);
+      #{@be61_decision_requests_ddl};
+      """)
+
+    refute "ruledViaSessionKey" in table_columns(db, "decision_requests")
+
+    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
+
+    assert error.message =~ @be61_shape
+    assert error.message =~ @shape
+
+    assert error.message =~ "can migrate only #{@model_identity_shape} through #{@previous_shape}"
+
+    assert {:ok, [[@be61_shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+    refute "ruledViaSessionKey" in table_columns(db, "decision_requests")
   end
 
   # The defect this refuses: `CREATE TABLE IF NOT EXISTS` is SILENT about a
@@ -308,429 +681,14 @@ defmodule Tightbeam.SchemaShapeTest do
     assert error.message =~ "other-shape"
   end
 
-  test "a database stamped by a different build is refused, naming both shapes", %{db: db} do
+  test "a database stamped with the nullable marker constraint is refused", %{db: db} do
     :ok = Schema.ensure_all(db)
-    {:ok, _} = DB.query(db, "UPDATE schema_stamp SET shape='some-later-shape'")
+    {:ok, _} = DB.query(db, "UPDATE schema_stamp SET shape='model-identity-message-envelope-v1'")
 
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
-    assert error.message =~ "some-later-shape"
-    assert error.message =~ "coordination-fabric-v1-phase1-v6"
-  end
-
-  # Sol xhigh review round 2, finding 2 (wave 1): `classElection`'s CHECK
-  # constraint gained `'batcher'` (round-1 finding 7), but `CREATE TABLE IF
-  # NOT EXISTS` does not widen an existing table's CHECK any more than it
-  # adds a column. A `coordination-fabric-classes-v1` database's `wakes`
-  # table — reconstructed here byte-for-byte from cafe321's DDL — still
-  # enforces the OLD two-value CHECK. Without the shape bump, this database
-  # would boot silently (its stamp used to match `@shape`) and the first
-  # digest-carrier insert would die on a raw, unnamed `CHECK constraint
-  # failed` deep inside the batcher. This proves the boot gate now refuses it
-  # BY NAME first, before any DDL or insert ever reaches the stale
-  # constraint. Kept working across the wave-1/wave-2 merge (Sol xhigh review
-  # round 3, item 2): the oldest vintage on EITHER line must still refuse.
-  test "a coordination-fabric-classes-v1 database is refused by name, never a raw CHECK violation",
-       %{db: db} do
-    :ok =
-      DB.execute(db, """
-      CREATE TABLE schema_stamp (
-        shape     TEXT PRIMARY KEY,
-        stampedAt INTEGER NOT NULL
-      );
-      INSERT INTO schema_stamp (shape, stampedAt) VALUES ('coordination-fabric-classes-v1', 1);
-      CREATE TABLE wakes (
-        wakeId     TEXT PRIMARY KEY,
-        sessionKey TEXT NOT NULL,
-        targetRole TEXT,
-        origin     TEXT NOT NULL,
-        prompt     TEXT,
-        consumer   TEXT NOT NULL DEFAULT 'prompt',
-        dueAt      INTEGER NOT NULL,
-        state      TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','fired','canceled')),
-        createdAt  INTEGER NOT NULL,
-        firedAt    INTEGER,
-        reresolve  TEXT NULL CHECK (reresolve IN ('lineage')),
-        reresolveSeed TEXT NULL,
-        reresolveRung INTEGER NULL,
-        conditionKind TEXT NULL,
-        conditionScope TEXT NULL,
-        conditionAfterId INTEGER NULL,
-        firedBy TEXT NULL CHECK (firedBy IN ('condition','fallback')),
-        creatorSessionKey TEXT NULL,
-        rumination INTEGER NOT NULL DEFAULT 0,
-        work_item_id TEXT,
-        assignmentId TEXT,
-        canceledAt INTEGER,
-        targetGate INTEGER NOT NULL DEFAULT 1,
-        class TEXT,
-        classElection TEXT CHECK (classElection IN ('sender','classifier')),
-        deliveryRule TEXT,
-        digest INTEGER NOT NULL DEFAULT 0 CHECK (digest IN (0,1)),
-        summon INTEGER NOT NULL DEFAULT 0 CHECK (summon IN (0,1)),
-        CHECK (consumer != 'prompt' OR prompt IS NOT NULL),
-        CHECK ((class IS NULL) = (classElection IS NULL)),
-        CHECK (digest = 0 OR class IS NOT NULL)
-      );
-      """)
-
-    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
-
-    assert error.message =~ "coordination-fabric-classes-v1"
-    assert error.message =~ "coordination-fabric-v1-phase1-v6"
-    assert error.message =~ "no migration"
-
-    # It REFUSED — it did not repair or widen the constraint in place.
-    assert {:ok, [[ddl]]} =
-             DB.query(
-               db,
-               "SELECT sql FROM sqlite_master WHERE type='table' AND name='wakes'"
-             )
-
-    assert ddl =~ "classElection IN ('sender','classifier')"
-    refute ddl =~ "batcher"
-  end
-
-  # Sol xhigh review round 2, finding 2 (wave 2): `decision_requests.deadlineAt`
-  # went from `NOT NULL` to nullable (round-1 finding 1's fix), and the
-  # per-kind CHECK arm grew explicit `deadlineAt IS NOT NULL`/`IS NULL`
-  # clauses — a real DDL change that landed in `2a3b24a` without bumping
-  # `@shape`, so `coordination-fabric-v1-phase1` named two different table
-  # shapes at once. `CREATE TABLE IF NOT EXISTS` does not relax an existing
-  # table's `NOT NULL` any more than it widens a `CHECK`: a
-  # `coordination-fabric-v1-phase1` database's `decision_requests` table —
-  # reconstructed here byte-exact from `git show
-  # f65c996:lib/tightbeam/escalation.ex` — still enforces `deadlineAt INTEGER
-  # NOT NULL`. Without the bump this database would boot silently (its stamp
-  # used to match `@shape`) and the first agent `ask` would die on a raw,
-  # unnamed `NOT NULL constraint failed` deep inside `file_agent_request/2`.
-  # This proves the boot gate now refuses it BY NAME first, before any DDL or
-  # insert ever reaches the stale constraint. Kept working across the
-  # wave-1/wave-2 merge (Sol xhigh review round 3, item 2).
-  test "a coordination-fabric-v1-phase1 database is refused by name, never a raw NOT NULL violation",
-       %{db: db} do
-    :ok =
-      DB.execute(db, """
-      CREATE TABLE schema_stamp (
-        shape     TEXT PRIMARY KEY,
-        stampedAt INTEGER NOT NULL
-      );
-      INSERT INTO schema_stamp (shape, stampedAt) VALUES ('coordination-fabric-v1-phase1', 1);
-      CREATE TABLE IF NOT EXISTS decision_requests (
-        id                TEXT PRIMARY KEY,
-        kind              TEXT NOT NULL DEFAULT 'statute' CHECK (kind IN ('statute','effort','agent')),
-        raiserId          TEXT NOT NULL,
-        raiserSessionKey  TEXT,
-        ownerUserId       TEXT NOT NULL,
-        assignmentId      TEXT,
-        expecterSessionKey TEXT,
-        expecterUserId    TEXT,
-        lineageRung       INTEGER,
-        effortGeneration  INTEGER,
-        deadlineWakeId    TEXT,
-        raisedAt          INTEGER NOT NULL,
-        deadlineAt        INTEGER NOT NULL,
-        statuteName       TEXT,
-        actionKey         TEXT,
-        question          TEXT NOT NULL,
-        options           TEXT,
-        context           TEXT NOT NULL,
-        status            TEXT NOT NULL CHECK (status IN ('open','ruled','consumed','withdrawn','superseded','answered')),
-        decision          TEXT,
-        rationale         TEXT,
-        ruledBy           TEXT,
-        ruledAt           INTEGER,
-        rulingFactId      INTEGER,
-        consumedAt        INTEGER,
-        parkWakeId        TEXT,
-        withdrawnBy       TEXT,
-        withdrawnReason   TEXT,
-        withdrawnAt       INTEGER,
-        askedOfRole       TEXT,
-        answer            TEXT,
-        answeredBy        TEXT,
-        answeredAt        INTEGER,
-        CHECK (
-          (kind = 'statute' AND statuteName IS NOT NULL AND actionKey IS NOT NULL
-           AND expecterSessionKey IS NULL AND expecterUserId IS NULL
-           AND lineageRung IS NULL AND effortGeneration IS NULL AND deadlineWakeId IS NULL
-           AND (decision IS NULL OR decision IN ('allow','deny','waived')))
-          OR
-          (kind = 'effort' AND raiserId = 'process:tightbeam'
-           AND raiserSessionKey IS NULL
-           AND statuteName IS NULL AND actionKey IS NULL AND assignmentId IS NOT NULL
-           AND ((expecterSessionKey IS NOT NULL) != (expecterUserId IS NOT NULL))
-           AND lineageRung IS NOT NULL AND effortGeneration IS NOT NULL AND deadlineWakeId IS NOT NULL
-           AND (decision IS NULL OR decision IN ('continue','dismiss')))
-          OR
-          (kind = 'agent'
-           AND raiserSessionKey IS NOT NULL AND raiserId = 'session:' || raiserSessionKey
-           AND expecterSessionKey IS NOT NULL AND expecterUserId IS NOT NULL
-           AND statuteName IS NULL AND actionKey IS NULL
-           AND decision IS NULL AND rationale IS NULL
-           AND ruledBy IS NULL AND ruledAt IS NULL AND rulingFactId IS NULL
-           AND consumedAt IS NULL AND parkWakeId IS NULL
-           AND lineageRung IS NULL AND effortGeneration IS NULL AND deadlineWakeId IS NULL
-           AND options IS NULL
-           AND status IN ('open','answered','withdrawn')
-           AND (status = 'answered') = (answer IS NOT NULL)
-           AND (answer IS NULL) = (answeredBy IS NULL)
-           AND (answer IS NULL) = (answeredAt IS NULL))
-        ),
-        CHECK (kind = 'agent' OR (askedOfRole IS NULL AND answer IS NULL AND
-                                  answeredBy IS NULL AND answeredAt IS NULL AND
-                                  status <> 'answered'))
-      );
-      CREATE INDEX IF NOT EXISTS decision_requests_owner
-        ON decision_requests (ownerUserId, status);
-      CREATE INDEX IF NOT EXISTS decision_requests_key
-        ON decision_requests (raiserId, statuteName, actionKey);
-      CREATE UNIQUE INDEX IF NOT EXISTS decision_requests_one_open
-        ON decision_requests (raiserId, statuteName, actionKey)
-        WHERE kind = 'statute' AND status = 'open';
-      CREATE UNIQUE INDEX IF NOT EXISTS decision_requests_effort_generation
-        ON decision_requests (assignmentId, effortGeneration) WHERE kind = 'effort';
-      CREATE INDEX IF NOT EXISTS decision_requests_asked
-        ON decision_requests (expecterSessionKey, status) WHERE kind = 'agent';
-      """)
-
-    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
-
-    assert error.message =~ "coordination-fabric-v1-phase1"
-    assert error.message =~ "coordination-fabric-v1-phase1-v6"
-    assert error.message =~ "no migration"
-
-    # It REFUSED — it did not repair or relax the constraint in place.
-    assert {:ok, [[ddl]]} =
-             DB.query(
-               db,
-               "SELECT sql FROM sqlite_master WHERE type='table' AND name='decision_requests'"
-             )
-
-    assert ddl =~ "deadlineAt        INTEGER NOT NULL,"
-    refute ddl =~ "deadlineAt IS NOT NULL"
-    refute ddl =~ "deadlineAt IS NULL"
-  end
-
-  # Sol xhigh review round 3, item 2: the rebase merges wave 1 (main,
-  # `coordination-fabric-classes-v2` as of `eeb5be4`) and wave 2 (this branch,
-  # `coordination-fabric-v1-phase1-v2` as of `c555dda`) onto one line under a
-  # brand-new stamp. Both parents' LATEST pre-merge vintage — not just the
-  # oldest — must refuse by name too, or a database someone actually ran
-  # between the two rounds of review boots silently against the merged build.
-  # `wakes` reconstructed byte-for-byte from `git show
-  # eeb5be4:lib/tightbeam/wakes.ex` (already carrying `'batcher'`, so this is
-  # NOT the same shape the classes-v1 test above proves).
-  test "a coordination-fabric-classes-v2 database is refused by name, never a raw error",
-       %{db: db} do
-    :ok =
-      DB.execute(db, """
-      CREATE TABLE schema_stamp (
-        shape     TEXT PRIMARY KEY,
-        stampedAt INTEGER NOT NULL
-      );
-      INSERT INTO schema_stamp (shape, stampedAt) VALUES ('coordination-fabric-classes-v2', 1);
-      CREATE TABLE wakes (
-        wakeId     TEXT PRIMARY KEY,
-        sessionKey TEXT NOT NULL,
-        targetRole TEXT,
-        origin     TEXT NOT NULL,
-        prompt     TEXT,
-        consumer   TEXT NOT NULL DEFAULT 'prompt',
-        dueAt      INTEGER NOT NULL,
-        state      TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','fired','canceled')),
-        createdAt  INTEGER NOT NULL,
-        firedAt    INTEGER,
-        reresolve  TEXT NULL CHECK (reresolve IN ('lineage')),
-        reresolveSeed TEXT NULL,
-        reresolveRung INTEGER NULL,
-        conditionKind TEXT NULL,
-        conditionScope TEXT NULL,
-        conditionAfterId INTEGER NULL,
-        firedBy TEXT NULL CHECK (firedBy IN ('condition','fallback')),
-        creatorSessionKey TEXT NULL,
-        rumination INTEGER NOT NULL DEFAULT 0,
-        work_item_id TEXT,
-        assignmentId TEXT,
-        canceledAt INTEGER,
-        targetGate INTEGER NOT NULL DEFAULT 1,
-        class TEXT,
-        classElection TEXT CHECK (classElection IN ('sender','classifier','batcher')),
-        deliveryRule TEXT,
-        digest INTEGER NOT NULL DEFAULT 0 CHECK (digest IN (0,1)),
-        summon INTEGER NOT NULL DEFAULT 0 CHECK (summon IN (0,1)),
-        CHECK (consumer != 'prompt' OR prompt IS NOT NULL),
-        CHECK ((class IS NULL) = (classElection IS NULL)),
-        CHECK (digest = 0 OR class IS NOT NULL)
-      );
-      """)
-
-    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
-
-    assert error.message =~ "coordination-fabric-classes-v2"
-    assert error.message =~ "coordination-fabric-v1-phase1-v6"
-    assert error.message =~ "no migration"
-
-    # It REFUSED — the merged build's decision_requests columns were never
-    # even attempted against this database.
-    refute table?(db, "decision_requests")
-
-    assert {:ok, [[ddl]]} =
-             DB.query(
-               db,
-               "SELECT sql FROM sqlite_master WHERE type='table' AND name='wakes'"
-             )
-
-    assert ddl =~ "classElection IN ('sender','classifier','batcher')"
-  end
-
-  # The branch's LATEST pre-merge vintage. `decision_requests` reconstructed
-  # byte-for-byte from `git show b2b81df:lib/tightbeam/escalation.ex`
-  # (`c555dda`'s content post-rebase) — nullable `deadlineAt`, with the
-  # explicit per-arm `IS NOT NULL`/`IS NULL` clauses round 2 added.
-  test "a coordination-fabric-v1-phase1-v2 database is refused by name, never a raw error",
-       %{db: db} do
-    :ok =
-      DB.execute(db, """
-      CREATE TABLE schema_stamp (
-        shape     TEXT PRIMARY KEY,
-        stampedAt INTEGER NOT NULL
-      );
-      INSERT INTO schema_stamp (shape, stampedAt) VALUES ('coordination-fabric-v1-phase1-v2', 1);
-      CREATE TABLE IF NOT EXISTS decision_requests (
-        id                TEXT PRIMARY KEY,
-        kind              TEXT NOT NULL DEFAULT 'statute' CHECK (kind IN ('statute','effort','agent')),
-        raiserId          TEXT NOT NULL,
-        raiserSessionKey  TEXT,
-        ownerUserId       TEXT NOT NULL,
-        assignmentId      TEXT,
-        expecterSessionKey TEXT,
-        expecterUserId    TEXT,
-        lineageRung       INTEGER,
-        effortGeneration  INTEGER,
-        deadlineWakeId    TEXT,
-        raisedAt          INTEGER NOT NULL,
-        deadlineAt        INTEGER,
-        statuteName       TEXT,
-        actionKey         TEXT,
-        question          TEXT NOT NULL,
-        options           TEXT,
-        context           TEXT NOT NULL,
-        status            TEXT NOT NULL CHECK (status IN ('open','ruled','consumed','withdrawn','superseded','answered')),
-        decision          TEXT,
-        rationale         TEXT,
-        ruledBy           TEXT,
-        ruledAt           INTEGER,
-        rulingFactId      INTEGER,
-        consumedAt        INTEGER,
-        parkWakeId        TEXT,
-        withdrawnBy       TEXT,
-        withdrawnReason   TEXT,
-        withdrawnAt       INTEGER,
-        askedOfRole       TEXT,
-        answer            TEXT,
-        answeredBy        TEXT,
-        answeredAt        INTEGER,
-        CHECK (
-          (kind = 'statute' AND statuteName IS NOT NULL AND actionKey IS NOT NULL
-           AND expecterSessionKey IS NULL AND expecterUserId IS NULL
-           AND lineageRung IS NULL AND effortGeneration IS NULL AND deadlineWakeId IS NULL
-           AND deadlineAt IS NOT NULL
-           AND (decision IS NULL OR decision IN ('allow','deny','waived')))
-          OR
-          (kind = 'effort' AND raiserId = 'process:tightbeam'
-           AND raiserSessionKey IS NULL
-           AND statuteName IS NULL AND actionKey IS NULL AND assignmentId IS NOT NULL
-           AND ((expecterSessionKey IS NOT NULL) != (expecterUserId IS NOT NULL))
-           AND lineageRung IS NOT NULL AND effortGeneration IS NOT NULL AND deadlineWakeId IS NOT NULL
-           AND deadlineAt IS NOT NULL
-           AND (decision IS NULL OR decision IN ('continue','dismiss')))
-          OR
-          (kind = 'agent'
-           AND raiserSessionKey IS NOT NULL AND raiserId = 'session:' || raiserSessionKey
-           AND expecterSessionKey IS NOT NULL AND expecterUserId IS NOT NULL
-           AND statuteName IS NULL AND actionKey IS NULL
-           AND decision IS NULL AND rationale IS NULL
-           AND ruledBy IS NULL AND ruledAt IS NULL AND rulingFactId IS NULL
-           AND consumedAt IS NULL AND parkWakeId IS NULL
-           AND lineageRung IS NULL AND effortGeneration IS NULL AND deadlineWakeId IS NULL
-           AND deadlineAt IS NULL
-           AND options IS NULL
-           AND status IN ('open','answered','withdrawn')
-           AND (status = 'answered') = (answer IS NOT NULL)
-           AND (answer IS NULL) = (answeredBy IS NULL)
-           AND (answer IS NULL) = (answeredAt IS NULL))
-        ),
-        CHECK (kind = 'agent' OR (askedOfRole IS NULL AND answer IS NULL AND
-                                  answeredBy IS NULL AND answeredAt IS NULL AND
-                                  status <> 'answered'))
-      );
-      CREATE INDEX IF NOT EXISTS decision_requests_owner
-        ON decision_requests (ownerUserId, status);
-      CREATE INDEX IF NOT EXISTS decision_requests_key
-        ON decision_requests (raiserId, statuteName, actionKey);
-      CREATE UNIQUE INDEX IF NOT EXISTS decision_requests_one_open
-        ON decision_requests (raiserId, statuteName, actionKey)
-        WHERE kind = 'statute' AND status = 'open';
-      CREATE UNIQUE INDEX IF NOT EXISTS decision_requests_effort_generation
-        ON decision_requests (assignmentId, effortGeneration) WHERE kind = 'effort';
-      CREATE INDEX IF NOT EXISTS decision_requests_asked
-        ON decision_requests (expecterSessionKey, status) WHERE kind = 'agent';
-      """)
-
-    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
-
-    assert error.message =~ "coordination-fabric-v1-phase1-v2"
-    assert error.message =~ "coordination-fabric-v1-phase1-v6"
-    assert error.message =~ "no migration"
-
-    # It REFUSED — the merged build's wakes class/delivery columns were never
-    # even attempted against this database.
-    refute table?(db, "wakes")
-
-    assert {:ok, [[ddl]]} =
-             DB.query(
-               db,
-               "SELECT sql FROM sqlite_master WHERE type='table' AND name='decision_requests'"
-             )
-
-    assert ddl =~ "deadlineAt        INTEGER,"
-    assert ddl =~ "deadlineAt IS NOT NULL"
-    assert ddl =~ "deadlineAt IS NULL"
-  end
-
-  test "a phase1-v3 database is refused before return columns or status are used", %{db: db} do
-    :ok =
-      DB.execute(db, """
-      CREATE TABLE schema_stamp (
-        shape TEXT PRIMARY KEY,
-        stampedAt INTEGER NOT NULL
-      );
-      INSERT INTO schema_stamp (shape, stampedAt)
-      VALUES ('coordination-fabric-v1-phase1-v3', 1);
-      CREATE TABLE decision_requests (
-        id TEXT PRIMARY KEY,
-        status TEXT NOT NULL CHECK (
-          status IN ('open','ruled','consumed','withdrawn','superseded','answered')
-        ),
-        answeredAt INTEGER
-      );
-      """)
-
-    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
-
-    assert error.message =~ "coordination-fabric-v1-phase1-v3"
-    assert error.message =~ "coordination-fabric-v1-phase1-v6"
-    assert error.message =~ "no migration"
-
-    assert {:ok, [[ddl]]} =
-             DB.query(
-               db,
-               "SELECT sql FROM sqlite_master WHERE type='table' AND name='decision_requests'"
-             )
-
-    refute ddl =~ "returned"
-    assert table_columns(db, "decision_requests") == ~w(id status answeredAt)
+    assert error.message =~ "model-identity-message-envelope-v1"
+    assert error.message =~ @shape
   end
 
   defp table?(db, name) do
@@ -740,13 +698,81 @@ defmodule Tightbeam.SchemaShapeTest do
     rows == [[1]]
   end
 
-  defp table_columns(db, name) do
-    Enum.map(table_info(db, name), fn [_cid, column | _] -> column end)
+  defp downgrade_decision_requests_to_model_identity(db) do
+    :ok =
+      DB.execute(db, """
+      DROP INDEX decision_requests_owner;
+      DROP INDEX decision_requests_key;
+      DROP INDEX decision_requests_one_open;
+      DROP INDEX decision_requests_effort_generation;
+      DROP INDEX decision_requests_operator_open;
+      DROP TABLE decision_requests;
+      #{@be61_decision_requests_ddl};
+      CREATE INDEX decision_requests_owner
+        ON decision_requests (ownerUserId, status);
+      CREATE INDEX decision_requests_key
+        ON decision_requests (raiserId, statuteName, actionKey);
+      CREATE UNIQUE INDEX decision_requests_one_open
+        ON decision_requests (raiserId, statuteName, actionKey)
+        WHERE kind = 'statute' AND status = 'open';
+      CREATE UNIQUE INDEX decision_requests_effort_generation
+        ON decision_requests (assignmentId, effortGeneration) WHERE kind = 'effort';
+      DROP INDEX messages_session;
+      DROP INDEX messages_client_dedupe;
+      DROP TABLE messages;
+      #{@model_identity_messages_ddl};
+      CREATE INDEX messages_session ON messages (sessionKey, seq);
+      CREATE UNIQUE INDEX messages_client_dedupe
+        ON messages (sessionKey, deviceId, clientMessageId)
+        WHERE clientMessageId IS NOT NULL AND deviceId IS NOT NULL;
+      DROP TRIGGER users_gateway_owned_insert;
+      DROP TABLE cold_start_receipts;
+      ALTER TABLE users DROP COLUMN creationKind;
+      UPDATE schema_stamp SET shape = '#{@model_identity_shape}', stampedAt = 1;
+      """)
+
+    :ok
   end
 
-  defp table_info(db, name) do
+  defp model_identity_request_columns do
+    """
+    id, kind, raiserId, raiserSessionKey, ownerUserId, assignmentId,
+    expecterSessionKey, expecterUserId, lineageRung, effortGeneration,
+    deadlineWakeId, raisedAt, deadlineAt, statuteName, actionKey, question,
+    options, context, status, decision, rationale, ruledBy, ruledAt,
+    rulingFactId, consumedAt, parkWakeId, withdrawnBy, withdrawnReason, withdrawnAt
+    """
+  end
+
+  defp model_identity_message_columns do
+    """
+    seq, id, sessionKey, role, content, timestamp, sender, deviceId,
+    clientMessageId, replyToMessageId, replyToClientMessageId,
+    llmVisibleMessageId, attachments, attentionTier
+    """
+  end
+
+  defp table_names(db, name) do
+    DB.query(db, "SELECT name FROM sqlite_master WHERE type='table' AND name=?1", [name])
+  end
+
+  defp index_count(db, name) do
+    DB.query(db, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?1", [name])
+  end
+
+  defp object_sql(db, type, name) do
+    {:ok, [[sql]]} =
+      DB.query(db, "SELECT sql FROM sqlite_master WHERE type=?1 AND name=?2", [type, name])
+
+    sql
+    |> String.downcase()
+    |> String.replace("\"", "")
+    |> String.replace(~r/\s+/u, "")
+  end
+
+  defp table_columns(db, name) do
     {:ok, rows} = DB.query(db, "PRAGMA table_info(#{name})")
-    rows
+    Enum.map(rows, fn [_cid, column | _] -> column end)
   end
 
   defp owned_activation_objects(db) do

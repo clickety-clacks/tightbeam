@@ -34,8 +34,6 @@ defmodule Tightbeam.Wire.RouterTest do
     {:paired, device} =
       claim_org(db, %{device_id: "d1", claimed_name: "Flynn", platform: nil, model: nil})
 
-    ensure_main_session(db, device.user_id)
-
     parent = self()
 
     handlers = %{
@@ -46,6 +44,10 @@ defmodule Tightbeam.Wire.RouterTest do
       "inspect" => fn call ->
         send(parent, {:call, call})
         %{sessions: [], wakes: []}
+      end,
+      "tune" => fn call ->
+        send(parent, {:call, call})
+        %{ok: false, code: "not_found", message: "session not found"}
       end,
       "assign" => fn call ->
         send(parent, {:call, call})
@@ -156,6 +158,192 @@ defmodule Tightbeam.Wire.RouterTest do
     assert agent_verbs -- handler_keys == []
   end
 
+  # The seam gh#11 named: operator-ask/-rule/-withdraw had a working Escalation
+  # implementation, a CLI that sent them, and unit tests that called Escalation
+  # DIRECTLY — but the wire router omitted them from @agent_verbs (rejected as
+  # "verb not allowed") and the Gateway handler table had no entry (unknown_verb).
+  # The unit tests never crossed the router, so the dead seam shipped. This test
+  # drives the whole operator lifecycle THROUGH /agent/dispatch against the REAL
+  # Gateway handlers, so the allowlist and the handler table must both carry the
+  # verbs for it to pass.
+  test "operator decision lifecycle crosses the wire router: ask -> list -> rule -> withdraw",
+       ctx do
+    owner = ctx.device.user_id
+    raiser = create_session(ctx.db, "operator-raiser", owner, is_built_in: true)
+    handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})
+    ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, handlers)}
+
+    # ask — as the raiser session (a session principal, which operator-ask requires)
+    ask =
+      dispatch_cli(ctx, raiser.cli_token, %{
+        verb: "operator-ask",
+        params: %{question: "ship 0.1.8?", options: [%{label: "ship"}, %{label: "hold"}]}
+      })
+
+    assert ask.status == 200
+    asked = JSON.decode!(ask.resp_body)["result"]
+    assert asked["status"] == "open"
+    assert is_binary(dr_id = asked["id"])
+
+    # list — as the owner over the org transport; the open request appears
+    listed =
+      dispatch_cli(ctx, "tbc_test", %{verb: "decision-requests", asUser: owner, params: %{}})
+
+    assert listed.status == 200
+
+    ids =
+      JSON.decode!(listed.resp_body)["result"]["decisionRequests"] |> Enum.map(& &1["id"])
+
+    assert dr_id in ids
+
+    # rule — as the owner; org transport (not the owner's personal session) so it
+    # is a genuine ruling, not the proxy_only refusal
+    ruled =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "operator-rule",
+        asUser: owner,
+        params: %{request: dr_id, decision: "ship"}
+      })
+
+    assert ruled.status == 200
+    assert JSON.decode!(ruled.resp_body)["result"]["status"] == "ruled"
+
+    # withdraw — needs an open request, so open a second and withdraw it, closing
+    # the fourth verb through the same seam
+    ask2 =
+      dispatch_cli(ctx, raiser.cli_token, %{
+        verb: "operator-ask",
+        params: %{question: "cut 0.1.9?", options: [%{label: "cut"}, %{label: "wait"}]}
+      })
+
+    assert is_binary(dr2 = JSON.decode!(ask2.resp_body)["result"]["id"])
+
+    withdrawn =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "operator-withdraw",
+        asUser: owner,
+        params: %{request: dr2, reason: "moot after ship"}
+      })
+
+    assert withdrawn.status == 200
+    assert JSON.decode!(withdrawn.resp_body)["result"]["status"] == "withdrawn"
+
+    # The negative side of the SAME seam. The defect was the allowlist gate: a
+    # verb it omits is refused here, before any handler, with this exact shape —
+    # the refusal the three operator verbs used to draw. Assert it directly so a
+    # future drop from @agent_verbs is caught as a refusal, not a silent 200.
+    denied = dispatch_cli(ctx, raiser.cli_token, %{verb: "operator-nonsense", params: %{}})
+
+    assert denied.status == 400
+
+    assert JSON.decode!(denied.resp_body) == %{
+             "error" => %{
+               "code" => "invalid_message",
+               "message" => "verb not allowed: operator-nonsense"
+             }
+           }
+
+    # And an allowed operator verb still enforces its owner authorization THROUGH
+    # the router: a session principal (not the human owner) is refused not_owner,
+    # proving the verb is genuinely routed to its handler's auth, not merely let
+    # past the allowlist.
+    ask3 =
+      dispatch_cli(ctx, raiser.cli_token, %{
+        verb: "operator-ask",
+        params: %{question: "who rules?", options: [%{label: "a"}, %{label: "b"}]}
+      })
+
+    assert is_binary(dr3 = JSON.decode!(ask3.resp_body)["result"]["id"])
+
+    not_owner =
+      dispatch_cli(ctx, raiser.cli_token, %{
+        verb: "operator-rule",
+        params: %{request: dr3, decision: "a"}
+      })
+
+    assert JSON.decode!(not_owner.resp_body)["error"]["code"] == "not_owner"
+  end
+
+  # The --status filter had the same shape of defect the operator verbs did: a working
+  # unit but an unproven wire path. Escalation.list appended `AND status = ?` for ANY
+  # binary status, so `decision-requests --status all` filtered on the literal 'all' and
+  # returned nothing. The unit tests in escalation_test.exs call Escalation.list/list_status
+  # DIRECTLY; this drives the filter THROUGH /agent/dispatch against the REAL Gateway
+  # handler, so status=all listing rows and status=bogus reaching the client as a named
+  # refusal are both proven on the wire, not just at the seam.
+  test "decision-requests status filter crosses the wire router: all lists, illegal refuses",
+       ctx do
+    owner = ctx.device.user_id
+    raiser = create_session(ctx.db, "dr-filter-raiser", owner, is_built_in: true)
+    handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})
+    ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, handlers)}
+
+    # Two requests spanning two statuses: one left open, one ruled.
+    open_ask =
+      dispatch_cli(ctx, raiser.cli_token, %{
+        verb: "operator-ask",
+        params: %{question: "q-open?", options: [%{label: "a"}, %{label: "b"}]}
+      })
+
+    assert is_binary(open_id = JSON.decode!(open_ask.resp_body)["result"]["id"])
+
+    ruled_ask =
+      dispatch_cli(ctx, raiser.cli_token, %{
+        verb: "operator-ask",
+        params: %{question: "q-ruled?", options: [%{label: "a"}, %{label: "b"}]}
+      })
+
+    assert is_binary(ruled_id = JSON.decode!(ruled_ask.resp_body)["result"]["id"])
+
+    ruled =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "operator-rule",
+        asUser: owner,
+        params: %{request: ruled_id, decision: "a"}
+      })
+
+    assert ruled.status == 200
+
+    list_ids = fn params ->
+      resp =
+        dispatch_cli(ctx, "tbc_test", %{verb: "decision-requests", asUser: owner, params: params})
+
+      assert resp.status == 200
+      JSON.decode!(resp.resp_body)["result"]["decisionRequests"] |> Enum.map(& &1["id"])
+    end
+
+    # status=all returns rows in BOTH statuses over the wire — the regression: before the
+    # fix this filtered on literal 'all' and returned [].
+    all_ids = list_ids.(%{status: "all"})
+    assert open_id in all_ids
+    assert ruled_id in all_ids
+
+    # Absent status defaults to "open" through the router: the open row shows, the ruled
+    # one is filtered out.
+    default_ids = list_ids.(%{})
+    assert open_id in default_ids
+    refute ruled_id in default_ids
+
+    # An explicit legal status filters over the wire to exactly that status.
+    open_only = list_ids.(%{status: "open"})
+    assert open_id in open_only
+    refute ruled_id in open_only
+
+    # An illegal status reaches the client as a NAMED refusal (HTTP 400), not a silent
+    # empty 200 — the refusal names the legal set.
+    bogus =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "decision-requests",
+        asUser: owner,
+        params: %{status: "bogus"}
+      })
+
+    assert bogus.status == 400
+    error = JSON.decode!(bogus.resp_body)["error"]
+    assert error["code"] == "invalid"
+    assert error["message"] =~ "open, ruled, consumed, withdrawn, superseded, all"
+  end
+
   test "identity status crosses the closed CLI verb router", ctx do
     response =
       dispatch_cli(ctx, "tbc_test", %{
@@ -174,6 +362,100 @@ defmodule Tightbeam.Wire.RouterTest do
                       verb: "identity-status",
                       origin: "user:flynn",
                       params: %{}
+                    }}
+  end
+
+  test "agent tune defers an unknown session key to the gateway privacy seam", ctx do
+    response =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "tune",
+        asUser: "flynn",
+        sessionKey: "unknown-private-target",
+        params: %{setting: "set_model", model: "claude-fable-5"}
+      })
+
+    assert response.status == 404
+
+    assert_receive {:call,
+                    %{
+                      verb: "tune",
+                      origin: "user:flynn",
+                      session_key: "unknown-private-target",
+                      params: %{setting: "set_model", model: "claude-fable-5"}
+                    }}
+
+    assert JSON.decode!(response.resp_body) == %{
+             "error" => %{"code" => "not_found", "message" => "session not found"}
+           }
+  end
+
+  test "agent tune preserves public control keys and structured failure fields", ctx do
+    parent = self()
+
+    handlers =
+      Map.put(ctx.opts[:handlers], "tune", fn call ->
+        send(parent, {:call, call})
+
+        %{
+          ok: false,
+          code: "runtime_config_mismatch",
+          message: "readback differed",
+          model: "gpt-5.6-sol",
+          effort: "high",
+          projection_committed: false,
+          cleanup_status: "unverified",
+          lifecycle_event_id: "le_123",
+          warnings: ["candidate close unverified"]
+        }
+      end)
+
+    ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, handlers)}
+
+    response =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "tune",
+        asUser: "flynn",
+        sessionKey: "live-session",
+        params: %{setting: "set_fast_mode", fastMode: "on"}
+      })
+
+    assert response.status == 400
+
+    assert_receive {:call,
+                    %{
+                      verb: "tune",
+                      session_key: "live-session",
+                      params: %{setting: "set_fast_mode", fastMode: "on"}
+                    }}
+
+    assert JSON.decode!(response.resp_body) == %{
+             "error" => %{
+               "code" => "runtime_config_mismatch",
+               "message" => "readback differed",
+               "model" => "gpt-5.6-sol",
+               "effort" => "high",
+               "projectionCommitted" => false,
+               "cleanupStatus" => "unverified",
+               "lifecycleEventId" => "le_123",
+               "warnings" => ["candidate close unverified"]
+             }
+           }
+
+    effort =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "tune",
+        asUser: "flynn",
+        sessionKey: "live-session",
+        params: %{setting: "set_reasoning", reasoningLevel: "high"}
+      })
+
+    assert effort.status == 400
+
+    assert_receive {:call,
+                    %{
+                      verb: "tune",
+                      session_key: "live-session",
+                      params: %{setting: "set_reasoning", reasoningLevel: "high"}
                     }}
   end
 
@@ -292,32 +574,13 @@ defmodule Tightbeam.Wire.RouterTest do
     assert body["sha"] == Tightbeam.BuildStamp.sha()
   end
 
-  test "the change socket requires protocolVersion 1 at upgrade", ctx do
-    response =
-      conn(:get, "/ws/changes")
-      |> put_req_header("upgrade", "websocket")
-      |> Router.call(Router.init(ctx.opts))
-
-    assert response.status == 426
-
-    assert JSON.decode!(response.resp_body) == %{
-             "error" => %{"code" => "unsupported_protocol_version"}
-           }
-  end
-
   test "CLI exact-version refusal is loud and precedes bearer authentication", ctx do
     body = JSON.encode!(%{verb: "inspect", asUser: "flynn", params: %{}})
-    required_version = Tightbeam.CliCompatibility.required_version()
-    %Version{major: required_major} = Version.parse!(required_version)
-    offered_version = "#{required_major + 1}.0.0"
-
-    refute offered_version == required_version
-    assert {:error, _message} = Tightbeam.CliCompatibility.check(offered_version)
 
     incompatible =
       conn(:post, "/agent/dispatch", body)
       |> put_req_header("authorization", "Bearer tbc_test")
-      |> put_req_header("x-tightbeam-cli-version", offered_version)
+      |> put_req_header("x-tightbeam-cli-version", "0.2.0")
       |> Router.call(Router.init(ctx.opts))
 
     assert incompatible.status == 426
@@ -326,14 +589,14 @@ defmodule Tightbeam.Wire.RouterTest do
              "error" => %{
                "code" => "incompatible_cli",
                "message" =>
-                 "your CLI offered #{offered_version}; this gateway requires #{required_version}"
+                 "your CLI offered 0.2.0; this gateway requires #{Tightbeam.CliCompatibility.required_version()}"
              }
            }
 
     auth_failure =
       conn(:post, "/agent/dispatch", body)
       |> put_req_header("authorization", "Bearer wrong")
-      |> put_req_header("x-tightbeam-cli-version", required_version)
+      |> put_req_header("x-tightbeam-cli-version", Tightbeam.CliCompatibility.required_version())
       |> Router.call(Router.init(ctx.opts))
 
     assert auth_failure.status == 401
@@ -525,47 +788,6 @@ defmodule Tightbeam.Wire.RouterTest do
                "message" => "overrides are unsupported on /api/streams; use /agent/dispatch"
              }
            }
-  end
-
-  test "an agent's typed tune fields reach the handler under the names it reads", ctx do
-    # `atomize_params` underscores every wire word, so `reasoningLevel` arrives
-    # as `:reasoning_level` — a spelling no tune branch reads. The device path
-    # builds that param by hand and so never noticed; an AGENT's `--effort`
-    # crossed /agent/dispatch, matched nothing, and came back "tune does not
-    # support set_reasoning yet": a caller's explicit election answered as an
-    # unbuilt feature. The alias is what makes the CLI's effort form real.
-    key = "agent-tune-fields"
-    create_session(ctx.db, key, ctx.device.user_id)
-    opts = with_handler(ctx.opts, "tune", &send_call/1)
-
-    for {params, assertion} <- [
-          {%{setting: "set_reasoning", reasoningLevel: "xhigh"},
-           fn p -> assert p[:reasoningLevel] == "xhigh" end},
-          {%{setting: "set_harness", harness: "codex", model: "gpt-5.6-sol", effort: "high"},
-           fn p ->
-             assert p[:setting] == "set_harness"
-             assert p[:harness] == "codex"
-             assert p[:model] == "gpt-5.6-sol"
-             assert p[:effort] == "high"
-           end}
-        ] do
-      response =
-        conn(
-          :post,
-          "/agent/dispatch",
-          JSON.encode!(%{verb: "tune", asUser: "flynn", sessionKey: key, params: params})
-        )
-        |> put_req_header("authorization", "Bearer tbc_test")
-        |> put_req_header(
-          "x-tightbeam-cli-version",
-          Tightbeam.CliCompatibility.required_version()
-        )
-        |> Router.call(Router.init(opts))
-
-      assert response.status == 200
-      assert_received {:call, %{verb: "tune", session_key: ^key, params: delivered}}
-      assertion.(delivered)
-    end
   end
 
   test "PATCH /api/streams/:key decodes a clawline '+' path key as a space", ctx do
@@ -893,7 +1115,7 @@ defmodule Tightbeam.Wire.RouterTest do
     assert disallowed.status == 400
   end
 
-  test "F6: the dispatch boundary strips a wake's substrate-only carrier", ctx do
+  test "the dispatch boundary strips a wake's substrate-only carriers", ctx do
     # Law 0: a client-supplied wake `assignmentId` would forge
     # wake -> turn -> trace attribution. The spec pins that it is STRIPPED at the
     # dispatch boundary, so this drives a REAL authenticated /agent/dispatch
@@ -908,7 +1130,11 @@ defmodule Tightbeam.Wire.RouterTest do
       JSON.encode!(%{
         verb: "wake",
         asUser: "flynn",
-        params: %{prompt: "an ordinary conversational wake", assignmentId: "asg_victim"}
+        params: %{
+          prompt: "an ordinary conversational wake",
+          assignmentId: "asg_victim",
+          requestRef: "dr_forged"
+        }
       })
 
     response =
@@ -930,8 +1156,22 @@ defmodule Tightbeam.Wire.RouterTest do
     refute Map.has_key?(wake_params, :assignment_id),
            "a client-supplied wake assignmentId must never reach the handler"
 
+    refute Map.has_key?(wake_params, :request_ref),
+           "a client-supplied wake requestRef must never reach the handler"
+
     assert wake_params[:prompt] == "an ordinary conversational wake"
     assert response.status == 200
+  end
+
+  test "operator ruling provenance is substrate-only" do
+    params =
+      Router.atomize_params_for_test("operator-rule", %{
+        "request" => "dr_1",
+        "decision" => "accept",
+        "ruledViaSessionKey" => "forged-session"
+      })
+
+    assert params == %{request: "dr_1", decision: "accept"}
   end
 
   test "Proof 2: agent-supplied createdInTurnSeq and createdContextKnown are stripped from work-item-create",
@@ -1177,8 +1417,8 @@ defmodule Tightbeam.Wire.RouterTest do
              DB.query(ctx.db, "SELECT origin, state FROM wakes")
   end
 
-  test "assign resolves bound and fallback roles and refuses unusable references", ctx do
-    main = create_session(ctx.db, Org.personal_session_key("flynn"), "flynn")
+  test "assign resolves a live-bound role and refuses unusable references", ctx do
+    ensure_main_session(ctx.db, "flynn")
     holder = create_session(ctx.db, "assign-holder", "flynn")
     retired = create_session(ctx.db, "assign-retired", "flynn")
     Roles.create!(ctx.db, "bound-assignment", "flynn", holder.session_key)
@@ -1200,22 +1440,19 @@ defmodule Tightbeam.Wire.RouterTest do
                       role_fallback: false
                     }}
 
-    assert dispatch_cli(ctx, "tbc_test", %{
-             verb: "assign",
-             asUser: "flynn",
-             role: "fallback-assignment",
-             params: %{subject: "x"}
-           }).status == 200
+    # Previously 200 on the owner's personal session with role_fallback: true —
+    # the phantom binding of wi_756153b7. The seam refuses it now.
+    unbound =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "assign",
+        asUser: "flynn",
+        role: "fallback-assignment",
+        params: %{subject: "x"}
+      })
 
-    assert_receive {:call,
-                    %{
-                      verb: "assign",
-                      session_key: key,
-                      target_role: "fallback-assignment",
-                      role_fallback: true
-                    }}
-
-    assert key == main.session_key
+    assert unbound.status == 400
+    assert JSON.decode!(unbound.resp_body)["error"]["code"] == "no_live_role_holder"
+    refute_receive {:call, %{verb: "assign", target_role: "fallback-assignment"}}
 
     for body <- [
           %{verb: "assign", asUser: "flynn", role: "missing-assignment", params: %{subject: "x"}},
@@ -1236,6 +1473,66 @@ defmodule Tightbeam.Wire.RouterTest do
 
     assert response.status == 400
     assert JSON.decode!(response.resp_body)["error"]["code"] == "session_retired"
+  end
+
+  # wi_756153b7. Assigning to a role with no live holder used to bind the owner's
+  # personal session with holderFallback=1: an obligation on a session that is not
+  # the role's holder and commonly not even the requested provider, while the
+  # requester believed it dispatched. Specimens asg_6f380b79 (unbound role) and
+  # asg_388a5a54 (role whose bound session had been retired) — both shapes below.
+  #
+  # Run against the REAL assign/dispatch handlers over a session-authenticated
+  # request, because the claim is "no row", and a mocked handler writes none either
+  # way. The positive control proves this same wiring DOES write a row for a live
+  # holder, so the zero rows above it is the refusal and not dead plumbing.
+  test "assign and dispatch refuse a role with no live holder and open no assignment", ctx do
+    ensure_main_session(ctx.db, "flynn")
+    live = create_session(ctx.db, "live-holder", "flynn")
+    dead = create_session(ctx.db, "dead-holder", "flynn")
+    caller = create_session(ctx.db, "phantom-caller", "flynn")
+
+    Roles.create!(ctx.db, "live-role", "flynn", live.session_key)
+    Roles.create!(ctx.db, "unbound-role", "flynn", nil)
+    Roles.create!(ctx.db, "retired-role", "flynn", dead.session_key)
+    Roles.create!(ctx.db, "caller-role", "flynn", caller.session_key)
+    Org.retire(ctx.db, dead.session_key, "user:flynn", 1_000)
+
+    ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, observed_real_handlers(ctx))}
+
+    for verb <- ["assign", "dispatch"], role <- ["unbound-role", "retired-role"] do
+      response =
+        dispatch_session(ctx, caller, %{
+          verb: verb,
+          role: role,
+          params: %{subject: "phantom #{verb} on #{role}", brief: "Bind no ghost."}
+        })
+
+      assert response.status == 400
+
+      assert JSON.decode!(response.resp_body)["error"] == %{
+               "code" => "no_live_role_holder",
+               "message" =>
+                 "role #{role} has no live bound session; spawn one and bind the role, " <>
+                   "or target an active sessionKey"
+             }
+
+      refute_receive {:call, %{verb: ^verb}}
+    end
+
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM assignments")
+
+    accepted =
+      dispatch_session(ctx, caller, %{
+        verb: "assign",
+        role: "live-role",
+        params: %{subject: "work a live holder can actually do"}
+      })
+
+    assert accepted.status == 200
+    assert_receive {:call, %{verb: "assign", session_key: "live-holder", role_fallback: false}}
+
+    assert {:ok, [["live-holder", "live-role", 0]]} =
+             DB.query(ctx.db, "SELECT holderKey, holderRole, holderFallback FROM assignments")
   end
 
   test "acting as a role requires its active binding", ctx do
@@ -1407,13 +1704,25 @@ defmodule Tightbeam.Wire.RouterTest do
     Roles.create!(ctx.db, "beta", "flynn", several.session_key)
 
     assert dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", as: "held"}).status == 200
-    assert_receive {:call, %{origin: "agent:held", principal: {:session, "holder-token"}}}
+
+    assert_receive {:call,
+                    %{
+                      origin: "agent:held",
+                      principal: {:session, "holder-token"},
+                      transport_session_key: "holder-token"
+                    }}
 
     assert dispatch_cli(ctx, holder.cli_token, %{verb: "inspect"}).status == 200
     assert_receive {:call, %{origin: "agent:held", principal: {:session, "holder-token"}}}
 
     assert dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", asUser: "flynn"}).status == 200
-    assert_receive {:call, %{origin: "user:flynn", principal: {:user, "flynn"}}}
+
+    assert_receive {:call,
+                    %{
+                      origin: "user:flynn",
+                      principal: {:user, "flynn"},
+                      transport_session_key: "holder-token"
+                    }}
 
     # Registering a satellite also provisions its operator endpoint over ssh; this
     # test is about the identity ladder, so the reach is stubbed and the gateway
@@ -1490,7 +1799,13 @@ defmodule Tightbeam.Wire.RouterTest do
     assert_receive {:call, %{origin: "agent:main-role", principal: {:session, "main-token"}}}
 
     assert dispatch_cli(ctx, "tbc_test", %{verb: "inspect", asUser: "flynn"}).status == 200
-    assert_receive {:call, %{origin: "user:flynn", principal: {:user, "flynn"}}}
+
+    assert_receive {:call,
+                    %{
+                      origin: "user:flynn",
+                      principal: {:user, "flynn"},
+                      transport_session_key: nil
+                    }}
 
     assert dispatch_cli(ctx, "tbc_test", %{verb: "inspect", asProcess: "cron"}).status == 200
     assert_receive {:call, %{origin: "process:cron", principal: {:process, "cron"}}}
@@ -1678,6 +1993,28 @@ defmodule Tightbeam.Wire.RouterTest do
     |> put_req_header("authorization", "Bearer tbc_test")
     |> put_req_header("x-tightbeam-cli-version", Tightbeam.CliCompatibility.required_version())
     |> Router.call(Router.init(ctx.opts))
+  end
+
+  # Authenticate as the session itself — the path a working agent actually takes
+  # when it assigns to a role, and the one the phantom specimens came in on.
+  defp dispatch_session(ctx, session, body) do
+    dispatch_cli(ctx, session.cli_token, body)
+  end
+
+  # The real handler table, each verb announcing its call before it runs. A mock
+  # cannot answer "was a row written"; this can, and it still proves "no handler
+  # ran" the same way the mocked table does.
+  defp observed_real_handlers(ctx) do
+    parent = self()
+
+    Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir, wake_tick_ms: 1_000})
+    |> Map.new(fn {verb, handler} ->
+      {verb,
+       fn call ->
+         send(parent, {:call, call})
+         handler.(call)
+       end}
+    end)
   end
 
   defp dispatch_cli(ctx, bearer, body) do
@@ -1957,76 +2294,6 @@ defmodule Tightbeam.Wire.RouterTest do
     assert blank.context == nil
   end
 
-  test "F6: a malformed model field on the DEVICE path reaches the gateway named, not silently dropped",
-       ctx do
-    # Sol xhigh review, live-switch finding 6. `model_params/1` used to drop
-    # a non-string field entirely, so the gateway saw a params map
-    # indistinguishable from "no model named" — which, before F2 closed it,
-    # activated the destination's default and reported `ok: true` on a
-    # switch the caller never elected. This exercises the REAL gateway
-    # handler (not a stub) through the full device path.
-    key = "control-malformed-model"
-    create_session(ctx.db, key, ctx.device.user_id)
-
-    opts =
-      with_handler(ctx.opts, "tune", fn call ->
-        Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})["tune"].(call)
-      end)
-
-    response =
-      conn(
-        :post,
-        "/api/session-control",
-        JSON.encode!(%{
-          "sessionKey" => key,
-          "action" => "set_harness",
-          "harness" => "codex",
-          "model" => 123
-        })
-      )
-      |> put_req_header("authorization", "Bearer #{ctx.device.token}")
-      |> Router.call(Router.init(opts))
-
-    assert response.status == 200
-    body = JSON.decode!(response.resp_body)
-    assert body["code"] == "invalid_model_field"
-    assert Org.get(ctx.db, key).harness == "claude"
-  end
-
-  test "F6: an unknown tune param key on RAW DISPATCH is refused by name, never silently forwarded",
-       ctx do
-    # Sol xhigh review, live-switch finding 6. Raw `/agent/dispatch` has no
-    # closed flag set the way the CLI does — `atomize_params/2` forwards
-    # whatever the caller sent. A mistyped `modle` used to be inert: no
-    # branch read it, `model` stayed absent, and (before F2 closed it) the
-    # switch silently completed on the destination's default while the
-    # caller believed it named `gpt-5.6-sol`.
-    key = "dispatch-unknown-param"
-    create_session(ctx.db, key, ctx.device.user_id)
-
-    opts =
-      with_handler(ctx.opts, "tune", fn call ->
-        Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})["tune"].(call)
-      end)
-
-    request =
-      dispatch_cli(%{ctx | opts: opts}, "tbc_test", %{
-        verb: "tune",
-        asUser: ctx.device.user_id,
-        sessionKey: key,
-        params: %{setting: "set_harness", harness: "codex", modle: "gpt-5.6-sol"}
-      })
-
-    # A handler result carrying `code` (no `ok: true`) is a REFUSAL as far as
-    # `Dispatch.dispatch/3` is concerned, not a success payload to unwrap —
-    # it renders as the wire's ordinary error envelope.
-    assert request.status == 400
-    body = JSON.decode!(request.resp_body)["error"]
-    assert body["code"] == "unknown_param"
-    assert body["message"] =~ "modle"
-    assert Org.get(ctx.db, key).harness == "claude"
-  end
-
   defp post_control(opts, token, session_key, action) do
     conn(
       :post,
@@ -2047,24 +2314,18 @@ defmodule Tightbeam.Wire.RouterTest do
   end
 
   defp create_session(db, key, owner, extra \\ []) do
-    if key == Org.personal_session_key(owner) do
-      ensure_main_session(db, owner)
-    else
-      ensure_main_session(db, owner)
-
-      Org.create(db, %{
-        session_key: key,
-        display_name: key,
-        owner_user_id: owner,
-        origin: "user:#{owner}",
-        archetype: "default",
-        host: "testhost",
-        harness: "claude",
-        provider: "anthropic",
-        model: Model.new("fable"),
-        is_built_in: Keyword.get(extra, :is_built_in, false),
-        kind: Keyword.get(extra, :kind, "custom")
-      })
-    end
+    Org.create(db, %{
+      session_key: key,
+      display_name: key,
+      owner_user_id: owner,
+      origin: "user:#{owner}",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("fable"),
+      is_built_in: Keyword.get(extra, :is_built_in, false),
+      kind: Keyword.get(extra, :kind, "custom")
+    })
   end
 end

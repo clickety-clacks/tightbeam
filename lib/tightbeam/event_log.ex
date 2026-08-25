@@ -127,49 +127,6 @@ defmodule Tightbeam.EventLog do
     :ok
   end
 
-  @doc "Append an event and queue its nonblocking handoff on the same transaction."
-  @spec append_event_with_handoff(
-          db(),
-          String.t(),
-          String.t(),
-          String.t(),
-          String.t() | nil,
-          term(),
-          term(),
-          (Txn.t() -> term())
-        ) :: :ok
-  def append_event_with_handoff(
-        db,
-        kind,
-        verb,
-        origin,
-        session_key,
-        payload,
-        principal,
-        handoff
-      )
-      when kind in ~w(verb denied) and is_function(handoff, 1) do
-    {:ok, _event_id} =
-      DB.transaction(db, fn txn ->
-        event_id =
-          append_event_in_txn(
-            txn,
-            kind,
-            verb,
-            origin,
-            session_key,
-            payload,
-            principal,
-            now()
-          )
-
-        handoff.(txn)
-        event_id
-      end)
-
-    :ok
-  end
-
   @doc "Append an event inside its caller's transaction and return its durable id."
   @spec append_event_in_txn(
           Txn.t(),
@@ -296,9 +253,16 @@ defmodule Tightbeam.EventLog do
   @spec lifecycle(db(), String.t(), String.t(), String.t() | nil) :: :ok
   def lifecycle(db \\ Tightbeam.DB, kind, subject, detail \\ nil) do
     {:ok, _} =
-      DB.transaction(db, fn txn ->
-        lifecycle_in_txn(txn, kind, subject, detail)
-      end)
+      DB.query(
+        db,
+        "INSERT INTO lifecycle_events (ts, kind, subject, detail) VALUES (?1, ?2, ?3, ?4)",
+        [
+          now(),
+          kind,
+          subject,
+          detail
+        ]
+      )
 
     :ok
   end
@@ -312,7 +276,6 @@ defmodule Tightbeam.EventLog do
       [now(), kind, subject, detail]
     )
 
-    publish_lifecycle_in_txn(txn, kind, subject, detail)
     :ok
   end
 
@@ -335,6 +298,11 @@ defmodule Tightbeam.EventLog do
           | {:sessions, [String.t()]}
           | {:ambient, String.t()}
           | :record_only
+
+  @opaque publication_plan :: [
+            {session_key :: String.t(), owner_user_id :: String.t(), seq :: pos_integer(),
+             payload :: map()}
+          ]
 
   @doc """
   Record an event AND tell whoever it happened to, in one call.
@@ -359,75 +327,131 @@ defmodule Tightbeam.EventLog do
   """
   @spec notice(db(), String.t(), String.t(), String.t() | nil, keyword()) :: :ok
   def notice(db \\ Tightbeam.DB, kind, subject, detail, opts) do
-    notice_fields!(opts)
+    {audience, message, attention} = notice_options(opts)
 
-    {:ok, delivery} =
+    {:ok, {plan, undeliverable}} =
       DB.transaction(db, fn txn ->
-        notice_in_txn(txn, kind, subject, detail, opts)
+        notice_in_txn_with_undeliverable(
+          txn,
+          kind,
+          subject,
+          detail,
+          audience,
+          message,
+          attention,
+          false
+        )
       end)
 
-    complete_notice(delivery, opts)
+    Enum.each(Enum.reverse(undeliverable), fn session_key ->
+      Logger.info(
+        "#{kind} for #{subject} was not delivered to #{session_key}: no active session there"
+      )
+    end)
+
+    publish(plan, opts)
   end
 
-  @doc "Record a notice inside an existing transaction; publish it only after commit."
-  @spec notice_in_txn(Txn.t(), String.t(), String.t(), String.t() | nil, keyword()) :: map()
-  def notice_in_txn(%Txn{} = txn, kind, subject, detail, opts) do
-    {audience, message, attention} = notice_fields!(opts)
+  @doc """
+  Record a lifecycle event and its process marker inside the caller's transaction.
 
+  The returned plan is immutable data captured from the committed marker. The caller
+  must publish it only after the surrounding transaction returns successfully. A
+  record-only audience returns an empty plan. An existing inactive session keeps
+  its durable marker but also returns an empty plan, because it has no live client.
+  """
+  @spec notice_in_txn(Txn.t(), String.t(), String.t(), String.t() | nil, keyword()) ::
+          publication_plan()
+  def notice_in_txn(%Txn{} = txn, kind, subject, detail, opts) do
+    {audience, message, attention} = notice_options(opts)
+    audience = transactional_audience!(audience)
+
+    {plan, _undeliverable} =
+      notice_in_txn_with_undeliverable(
+        txn,
+        kind,
+        subject,
+        detail,
+        audience,
+        message,
+        attention,
+        true
+      )
+
+    plan
+  end
+
+  @doc "Publish a committed notice plan to connected clients."
+  @spec publish(publication_plan(), keyword()) :: :ok
+  def publish(plan, opts \\ []) when is_list(plan) do
+    registry = Keyword.get(opts, :conn_registry, ConnRegistry)
+    Enum.each(plan, &publish_marker(registry, &1))
+  end
+
+  defp notice_options(opts) do
+    audience = Keyword.fetch!(opts, :audience)
+
+    {message, attention} =
+      case audience do
+        :record_only ->
+          {nil, nil}
+
+        _ ->
+          {Keyword.fetch!(opts, :message), Keyword.fetch!(opts, :attention)}
+      end
+
+    {audience, message, attention}
+  end
+
+  defp transactional_audience!(:record_only), do: :record_only
+  defp transactional_audience!({:session, session_key}), do: {:session, session_key}
+
+  defp transactional_audience!(audience) do
+    raise ArgumentError,
+          "notice_in_txn requires zero or one recipient, got audience: #{inspect(audience)}"
+  end
+
+  defp notice_in_txn_with_undeliverable(
+         txn,
+         kind,
+         subject,
+         detail,
+         audience,
+         message,
+         attention,
+         store_inactive_marker
+       ) do
     lifecycle_in_txn(txn, kind, subject, detail)
 
     # The record and the markers commit together: a crash between them
     # would leave exactly the split this function exists to prevent.
-    {appended, undeliverable} =
-      Enum.reduce(candidates(audience), {[], []}, fn session_key, {appended, undeliverable} ->
-        case active_owner(txn, session_key) do
-          nil ->
-            {appended, [session_key | undeliverable]}
+    {plan, undeliverable} =
+      Enum.reduce(candidates(audience), {[], []}, fn session_key, {plan, undeliverable} ->
+        case session_recipient(txn, session_key) do
+          :missing ->
+            {plan, [session_key | undeliverable]}
 
-          owner ->
+          {:inactive, _owner} when not store_inactive_marker ->
+            {plan, [session_key | undeliverable]}
+
+          {:inactive, _owner} ->
+            {:appended, _marker} =
+              Projection.append_substrate_in_txn(txn, session_key, message, attention)
+
+            {plan, undeliverable}
+
+          {:active, owner} ->
             {:appended, marker} =
-              Projection.append_marker_in_txn(txn, session_key, message, attention)
+              Projection.append_substrate_in_txn(txn, session_key, message, attention)
 
-            Tightbeam.Firehose.Publisher.message_in_txn(txn, session_key, marker, owner)
+            publication =
+              {session_key, owner, marker.seq, Payloads.server_message(marker)}
 
-            {[{session_key, owner, marker} | appended], undeliverable}
+            {[publication | plan], undeliverable}
         end
       end)
 
-    %{kind: kind, subject: subject, appended: appended, undeliverable: undeliverable}
-  end
-
-  @doc "Publish the live half of a notice whose transaction committed."
-  @spec complete_notice(map() | nil, keyword()) :: :ok
-  def complete_notice(delivery, opts \\ [])
-
-  def complete_notice(nil, _opts), do: :ok
-
-  def complete_notice(delivery, opts) do
-    registry = Keyword.get(opts, :conn_registry, ConnRegistry)
-
-    Enum.each(Enum.reverse(delivery.undeliverable), fn session_key ->
-      Logger.info(
-        "#{delivery.kind} for #{delivery.subject} was not delivered to #{session_key}: " <>
-          "no active session there"
-      )
-    end)
-
-    Enum.each(Enum.reverse(delivery.appended), &publish_marker(registry, &1))
-
-    :ok
-  end
-
-  defp notice_fields!(opts) do
-    audience = Keyword.fetch!(opts, :audience)
-
-    case audience do
-      :record_only ->
-        {audience, nil, nil}
-
-      _ ->
-        {audience, Keyword.fetch!(opts, :message), Keyword.fetch!(opts, :attention)}
-    end
+    {Enum.reverse(plan), undeliverable}
   end
 
   defp candidates(:record_only), do: []
@@ -438,23 +462,20 @@ defmodule Tightbeam.EventLog do
   # Read through the transaction handle, not Org: a `DB.query` from inside a
   # transaction re-enters the owner process that is running it.
   #
-  # The OWNER comes back with the answer rather than being re-read after the
-  # commit. `ownerUserId` is NOT NULL, so nil here means exactly one thing —
-  # no active session by that key — and the publish below then needs no second
-  # trip through the single-writer DB owner. That trip was the wide half of
-  # the publication race: it can queue behind another session's transaction,
-  # during which the lane that owns this session can commit AND publish a
-  # LATER seq. ConnRegistry no longer drops the earlier one (delivery is
-  # unconditional now); skipping the second trip still narrows the window in
-  # which frames leave in an order the client must settle by seq.
-  defp active_owner(txn, session_key) do
+  # The owner and state come back with the answer rather than being re-read
+  # after commit. The transactional seam must distinguish a missing session
+  # from a retired one: a retired self-wake still gets its durable audit marker,
+  # but it has no live publication plan. The public notice path keeps its
+  # established active-only audience behavior.
+  defp session_recipient(txn, session_key) do
     case Txn.q(
            txn,
-           "SELECT ownerUserId FROM sessions WHERE sessionKey = ?1 AND state = 'active'",
+           "SELECT ownerUserId,state FROM sessions WHERE sessionKey = ?1",
            [session_key]
          ) do
-      [[owner]] -> owner
-      [] -> nil
+      [[owner, "active"]] -> {:active, owner}
+      [[owner, _state]] -> {:inactive, owner}
+      [] -> :missing
     end
   end
 
@@ -463,19 +484,19 @@ defmodule Tightbeam.EventLog do
   # the next socket that drains this session. Letting the exit through would
   # take out the caller — a dying adapter's own coordinator, in the case that
   # found this — over a process whose absence means the wire is down anyway.
-  defp publish_marker(registry, {session_key, owner, marker}) do
+  defp publish_marker(registry, {session_key, owner, seq, payload}) do
     ConnRegistry.publish_message(
       registry,
       session_key,
       owner,
-      marker.seq,
-      Payloads.server_message(marker),
-      fn pid, payload -> send(pid, {:push_message, session_key, marker.seq, payload}) end
+      seq,
+      payload,
+      fn pid, payload -> send(pid, {:push_message, session_key, seq, payload}) end
     )
   catch
     :exit, reason ->
       Logger.warning(
-        "live push of #{session_key} seq #{marker.seq} failed (#{inspect(reason)}); " <>
+        "live push of #{session_key} seq #{seq} failed (#{inspect(reason)}); " <>
           "the message is stored and replays on the next connect"
       )
 
@@ -503,7 +524,7 @@ defmodule Tightbeam.EventLog do
   """
   @spec boot(db()) :: pos_integer()
   def boot(db \\ Tightbeam.DB) do
-    {:ok, {epoch, _prior_epoch}} =
+    {:ok, epoch} =
       DB.transaction(db, fn txn ->
         prior =
           Tightbeam.DB.Txn.q(txn, """
@@ -511,44 +532,26 @@ defmodule Tightbeam.EventLog do
             WHERE cleanShutdownAt IS NULL ORDER BY epoch DESC LIMIT 1
           """)
 
-        prior_epoch =
-          case prior do
-            [[e]] ->
-              Tightbeam.DB.Txn.q(
-                txn,
-                "INSERT INTO lifecycle_events (ts, kind, subject, detail) VALUES (?1,?2,?3,?4)",
-                [
-                  now(),
-                  "dirty_exit",
-                  "epoch:#{e}",
-                  "prior epoch had no clean shutdown"
-                ]
-              )
+        case prior do
+          [[e]] ->
+            Tightbeam.DB.Txn.q(
+              txn,
+              "INSERT INTO lifecycle_events (ts, kind, subject, detail) VALUES (?1,?2,?3,?4)",
+              [
+                now(),
+                "dirty_exit",
+                "epoch:#{e}",
+                "prior epoch had no clean shutdown"
+              ]
+            )
 
-              Tightbeam.Firehose.Publisher.lifecycle_in_txn(
-                txn,
-                "lifecycle.dirty_exit",
-                %{epoch: e, detail: "prior epoch had no clean shutdown"},
-                %{"epoch" => e}
-              )
-
-              e
-
-            [] ->
-              nil
-          end
+          [] ->
+            :ok
+        end
 
         Tightbeam.DB.Txn.q(txn, "INSERT INTO boot_epochs (bootedAt) VALUES (?1)", [now()])
         [[epoch]] = Tightbeam.DB.Txn.q(txn, "SELECT last_insert_rowid()")
-
-        Tightbeam.Firehose.Publisher.lifecycle_in_txn(
-          txn,
-          "lifecycle.boot",
-          %{epoch: epoch},
-          %{"epoch" => epoch}
-        )
-
-        {epoch, prior_epoch}
+        epoch
       end)
 
     epoch
@@ -562,31 +565,10 @@ defmodule Tightbeam.EventLog do
   @spec clean_shutdown(db(), pos_integer()) :: :ok
   def clean_shutdown(db \\ Tightbeam.DB, epoch) do
     {:ok, _} =
-      DB.transaction(db, fn txn ->
-        Txn.q(txn, "UPDATE boot_epochs SET cleanShutdownAt = ?2 WHERE epoch = ?1", [epoch, now()])
-
-        Tightbeam.Firehose.Publisher.lifecycle_in_txn(
-          txn,
-          "lifecycle.clean_shutdown",
-          %{epoch: epoch},
-          %{"epoch" => epoch}
-        )
-      end)
+      DB.query(db, "UPDATE boot_epochs SET cleanShutdownAt = ?2 WHERE epoch = ?1", [epoch, now()])
 
     :ok
   end
-
-  defp publish_lifecycle_in_txn(txn, kind, subject, detail)
-       when kind in ~w(boot clean_shutdown dirty_exit takeover) do
-    Tightbeam.Firehose.Publisher.lifecycle_in_txn(
-      txn,
-      "lifecycle.#{kind}",
-      %{subject: subject, detail: detail},
-      %{"subject" => subject}
-    )
-  end
-
-  defp publish_lifecycle_in_txn(_txn, _kind, _subject, _detail), do: :ok
 
   defp now, do: System.system_time(:millisecond)
 

@@ -455,8 +455,7 @@ defmodule Tightbeam.ColdStart do
         "rootSessionKey" => root.session_key,
         "isAdmin" => true,
         "deviceStatus" => device && device.status,
-        "rootKind" => root.kind,
-        "operationalParent" => root.operational_parent
+        "rootKind" => root.kind
       },
       {:process, "tightbeam"},
       ts
@@ -585,7 +584,7 @@ defmodule Tightbeam.ColdStart do
 
   defp personal_main?(root, user_id) do
     root.owner_user_id == user_id and root.session_key == Org.personal_session_key(user_id) and
-      root.kind == "main" and root.is_built_in and root.operational_parent == root.session_key
+      root.kind == "main" and root.is_built_in
   end
 
   defp event_referents_valid?(_txn, %{
@@ -692,8 +691,7 @@ defmodule Tightbeam.ColdStart do
       "rootSessionKey" => receipt.root_session_key,
       "isAdmin" => true,
       "deviceStatus" => device_id && "allowlisted",
-      "rootKind" => "main",
-      "operationalParent" => receipt.root_session_key
+      "rootKind" => "main"
     }
   end
 

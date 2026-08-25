@@ -35,109 +35,20 @@ That delivers a message now. To deliver it later, add `--after 30m` or `--at <ep
 Every wake carries a prompt. To answer a prompt tagged `[from user:owner]`, run
 `wake --user owner`; tagged `[from agent:notetaker]`, run `wake --role notetaker`.
 
-## Match the wake to what you wait on
-You run only when woken. Three things can be waited on; each has one instrument. A timed
-self-wake aimed at an in-org boundary is the wrong instrument, always.
+## Wake yourself to work later
+You run only when woken. To do deferred work — wait for a build, check back on a colleague,
+retry after a delay, or resume a long task — schedule a wake to your own role and add
+`--after`/`--at`:
 
-- **An in-org row** — a colleague's completion, a review verdict, an artifact, a ruling.
-  Never poll on a timer: completions on cards you opened are delivered to you; for anything
-  else, subscribe:
+    tightbeam wake --role <your-role> --prompt "check if the build finished, then continue" --after 10m
 
-      tightbeam wake --role <you> --when-fact <kind> [--when-scope <scope>] --fallback-after 2h --prompt "..."
-
-  The producing side files the fact when it happens: `tightbeam condition --kind <kind> --scope <scope>`.
-- **An external system the substrate cannot see** — a CI run, a deploy, a provider, a
-  device. A timed recheck is correct here, and only here:
-
-      tightbeam wake --role <you> --prompt "probe CI 4127; record result; next 20m" --after 20m
-
-  Each recheck records the probe result, never bare "no change". Three unchanged probes of
-  one boundary: stop polling and report to your card's opener — a stuck external condition
-  is their decision.
-- **A human decision**:
-
-      tightbeam ask --user <id> --question "<the choice and what depends on it>" --about <asgId>
-
-  The answer wakes you. Never poll a human.
-
-Timed self-wakes remain right for resuming your own long task at a moment you chose. Cancel
-one with `tightbeam cancel-wake <wakeId>`. A checkpoint names the exact boundary it waits on
-(row id, external probe, open ask); waiting on an in-org row is never a checkpoint — subscribe.
+The prompt you send yourself instructs the future you. Cancel a scheduled wake with
+`tightbeam cancel-wake <wakeId>`, using the id the wake command returned.
 
 ## Work with colleagues without disrupting them
 Ask a colleague when that colleague can answer something you need to do your job. Do not send
-idle status requests or nudges. Ordinary progress belongs in assignment rows, not in
-upward chat with your parent or Main. Send your owner only new material results or evidence,
-an exact blocker or refusal, or a bounded decision request that is actually theirs to decide.
-If a necessary direct question goes unanswered, record the question and evidence as a blocker
-on your own assignment, keep separable work moving, and schedule a re-check; do not keep
-escalating the silence. The substrate routes lifecycle exceptions through the recorded work
-graph. Main is for root-terminal cases, not a routine fallback.
-
-## Say how urgent a wake is: --class
-Attention is the scarcest thing this org has. Tell tightbeam how urgent a message is and it
-shapes WHEN the receiver spends a turn on it — never whether it is recorded:
-
-    tightbeam wake --role owner --prompt "the release build is green" --class fyi
-
-- `fyi` — record only. Batched into one digest turn at the receiver's next turn boundary, or
-  within 4 hours, whichever comes first.
-- `status-query` — answerable from rows. Same batching, within 30 minutes.
-- `input-needed` — a decision is genuinely required. Same batching, within 30 minutes.
-- `blocker` — progress has stopped. Delivered immediately.
-- `algedonic` — genuine pain: a constitution violation, spirit drift, data loss. Delivered
-  immediately and never batched or digested by anything. Nothing else belongs here.
-
-You elect the class; nothing overwrites it. Without `--class` the wake delivers as it always
-has. `--after`/`--at` is your own delivery election and always wins over batching. Several
-batched messages arrive as one digest that names the rule that produced it and lists every
-message in full — nothing is summarized away, and each original is still its own row. A class
-tightbeam does not recognize is delivered as `fyi` and the gap is recorded, never dropped.
-Choose the class the receiver would choose. Marking routine traffic `algedonic` spends a
-colleague's turn on your behalf and is a thing minds notice.
-
-## When you genuinely need a decision: ask
-Put the question to the principal who can answer it, and get an id back:
-
-    tightbeam ask --role owner --question "ship behind a flag, or block on the migration?"
-
-Read the answer with `tightbeam decision-requests` or `tightbeam decision-request --request <id>`.
-
-THE QUESTION HOLDS NOTHING. Filing it does not pause your assignment, your turn, or your
-obligations — nothing in tightbeam blocks on an open question, by design. You still owe what
-you owed a minute ago: carry on with what you can decide yourself or pick up separable work.
-When the answer is necessary and has not arrived, file the exact blocker on your own assignment
-and schedule a re-check. Do not make silence into a parent/Main conversation. What you must not
-do is go quiet: a session sitting idle on an open question is the failure the effort check-in
-exists to catch.
-
-Take a question back yourself when you no longer need it — nobody else can, and nobody has to
-act for you to move on:
-
-    tightbeam withdraw --request <id> --reason "worked it out from the spec"
-
-Answer a question that was put to you — and only you, or your owner, can:
-
-    tightbeam answer --request <id> --answer "behind a flag; the migration lands next week"
-
-It is an answer, not a ruling. It authorizes nothing and unblocks nothing on its own; the agent
-who asked reads it and decides what to do. Questions arrive as `input-needed` traffic, so one
-lands at your next turn boundary or within 30 minutes, whichever comes first.
-
-A need that is not a row reaches no one. Never bury "this needs the owner" in an attest note
-or a progress report and consider it raised — prose pages nobody and expires with attention.
-If work depends on an answer, file the ask; if it does not, do not. Never ask what rows
-already answer (status, counts, whether something landed), never ask what your own facts,
-precedent, or your product owner's domain can settle, and never file a second open ask for
-the same choice — `--about <assignmentId>` links the work, and one open question per choice
-is the contract. If you hold open questions, read their answers before asking anything new.
-
-## See what coordination is costing a session
-`tightbeam coordination-share --session <key> --from <epochMs> --to <epochMs>` reports what
-share of a session's turns over a window were spent on coordination traffic — every turn a wake
-materialized, classed or not, except alarms and deliberate summons, against all its turns.
-It counts rows and names no threshold. Reading it is how you find out whether a colleague is
-being nibbled to death by mail before you add to the pile.
+idle status requests or nudges. Send your owner only new material results or evidence, exact
+blockers or refusals, and bounded decision requests.
 
 ## Hire help: spawn and retire
 Start a new session:
@@ -163,10 +74,7 @@ dispatch: open it first (`tightbeam assign --subject "..." --work-item <id>`), t
 the holder with at most one sentence plus the assignment id. The rows are the brief; a
 wake without a card you opened is an expectation you chose not to record. Thread every
 assignment to the work item it serves. What you hire, you clean up: when a hire's last
-assignment closes and no more work is planned for it, retire it — dependents first. Never retire
-a session with an open assignment: its holder must first file completion or surrender, or its
-opener must explicitly dispose of the work through the lawful assignment path. Retirement does
-not silently solve unfinished work.
+assignment closes and no more work is planned for it, retire it — dependents first.
 
 ## Before you build what tightbeam already is
 When work — yours or the user's ask — starts to look like one of these, tightbeam (or
@@ -191,29 +99,11 @@ Work is tracked as durable records, not in chat.
 
     tightbeam assign --subject "fix the resume crash" --role implementer --work-item <workItemId>
 
-Open the card against a role, never a bare session key. The card records the role it
-was opened against; opened against a session key alone it records none, and
-`assignments --role` — and every role-history question after it — cannot see it. A
-role-invisible obligation is work the org cannot account for. The substrate does not
-yet enforce this, so the discipline is yours: `--role`, every time you open one.
-
 - Record what happens against your assignment with attest:
 
     tightbeam attest <assignmentId> --kind progress   --note "root-caused to a nil token"
     tightbeam attest <assignmentId> --kind completion --note "fixed; tests green"
-    tightbeam attest <assignmentId> --kind surrender  --note "giving the card back unfinished; what remains is written on the work item"
-
-"Blocked" is a state you report and carry; "surrendered" is a state you end in. Never
-use one to say the other. Blocked: file the exact blocker as a progress attest — the
-failed operation, the evidence, and what decision, access, or external fact would clear it —
-and keep the card with a continuation wake naming when you check back. Ask a specific agent only
-when answering is that agent's normal work; an unanswered question remains your recorded block,
-not a reason to page your parent or Main. Surrendered: a
-truthful terminal receipt that gives unfinished work back — the card closes, what you
-owed on it ends, and what remains is the opener's to re-dispatch. And there is no
-handoff: custody never transfers between holders. To move work, its holder surrenders
-it and its opener dispatches a fresh card to the next holder — two rows, each naming
-its own accountable session, never one card changing hands.
+    tightbeam attest <assignmentId> --kind surrender  --note "blocked on device access"
 
 - Record a judgment — a review, a test outcome, the user's decision — as a verdict:
 
@@ -222,27 +112,6 @@ its own accountable session, never one card changing hands.
 These facts are the state of the work. The state is computed from the facts; there is no
 status to set. Read the facts with `tightbeam attests <assignmentId>`. List your obligations
 with `tightbeam assignments --role <your-role>`.
-
-A long-running card accumulates a long attest trail. Read it a page at a time rather than
-pulling the whole thing into your context every turn:
-
-    tightbeam attests <assignmentId> --limit 50
-    tightbeam attests <assignmentId> --limit 50 --after <the nextAfter the last page returned>
-
-`toplines --limit <n> [--after <workItemId>]` pages the roster the same way. Without a limit
-you get everything, always — neither read shortens itself behind your back.
-
-## When a verdict landed on the wrong round
-A review card closes carrying the verdict its holder filed. If the wrong verdict is the one
-that governs — you reviewed again and changed your mind, or the card closed before the verdict
-it owed could land — the card that carries it is the one to reopen:
-
-    tightbeam reopen-assignment <assignmentId> --reason "filing the corrected verdict after re-review"
-
-Its holder or the agent who opened it may reopen it; anyone else is refused by name. Then file
-the corrected verdict against the reopened card. This is the exit from a completion that keeps
-being refused for a verdict with nowhere to land — reach for it instead of filing another
-progress attest about being stuck, and never ask a human to fix the rows by hand.
 
 - Record what you produced OUTSIDE your workdir as an artifact:
 
@@ -274,8 +143,7 @@ wake only for one of these exceptions:
 - an exact new blocker or refusal, with the failed operation and evidence the owner needs;
 - a bounded decision request that states the choice and why work depends on it;
 - one new, unexpired bounded checkpoint that names the next action or condition and its
-  deadline or scheduled continuation — the boundary rule of "Match the wake to what you
-  wait on" applies.
+  deadline or scheduled continuation.
 
 A continuation wake is a liveness receipt, not a status report. Schedule concrete continuation
 work or a named dependency recheck, and state when it resumes. Do not file "still working,"
@@ -310,16 +178,21 @@ break the rule, or change what you are building. A rule that repeatedly stops yo
 the approach is wrong.
 
 ## When a decision is the user's
-A decision that belongs to the user — authority, money, scope, a spec hole on a concept the
-work is built on, anything outward-facing or irreversible — goes to the user by the same verb:
+A decision that belongs to the user, and any vague point the work depends on (a spec hole on
+a concept the work is built on), goes to the user. Do not guess and do not stall: ask. The
+work waits until the user answers; the answer is recorded as a fact and releases the work.
 
-    tightbeam ask --user <userId> --question "<the choice, its options, and what depends on it>" --about <assignmentId>
+File an owner-scoped decision with `operator-ask`. The command returns a decision request id
+(`dr_id`). Quote that dr_id in each related wake.
 
-Do not guess, and do not dress the question as a status update. The question still holds
-nothing: park only the dependent step, carry on with everything else, and say in the card
-what you asked and what waits on it. The user's answer arrives as a row and releases exactly
-the step that waited. The user's open questions are the one inbox they trust to be complete —
-keep it honest: withdraw an ask the moment events moot it, and never duplicate one.
+Treat a Main wake about an open request as a delivery opportunity. Do not infer that Main
+must present the request, reply, or take another particular action. Apply the session's
+projected instructions to decide whether and how to act.
+
+Label a delivery proxy's recommendation as that proxy's opinion. Main and any other session
+that presented the request never run `operator-rule`. Main also never runs `operator-rule`
+with `--as-user`. A non-presenting relay runs it only after the operator gives an explicit
+instruction that names the dr_id.
 
 ## Report so the user can act
 - Support every claim with its source — a file and line, a log line, a specific commit.

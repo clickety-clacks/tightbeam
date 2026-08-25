@@ -83,24 +83,21 @@ deny_when = [
   { fact = "work_item.verdict_kinds", op = "not_in", value = ["spirit-approved"] },
 ]
 
-# The review-rounds doorbell. Product goal:
+# STAGED, NOT ARMED — the review-rounds doorbell. Product goal:
 # at round four (recent norm is 1-2; the old process ran 4-10; grace built
 # in), SHINE LIGHT on a review that may be spinning by summoning the product
-# owner — while limiting nothing. The notice effect records and wakes once
-# for this rule and reviewed assignment, then always allows later attests.
-[[rule]]
-name = "review-rounds-doorbell"
-verb = "attest"
-text = "four or more review rounds on one assignment — the product owner should look"
-effect = "notice"
-deny_when = [
-  { fact = "attest.kind", op = "eq", value = "verdict" },
-  { fact = "assignment.review_verdict_count", op = "gte", value = 4 },
-]
-
-[rule.remedy]
-action = "wake"
-target_role = "product-owner"
-
-[rule.remedy.params]
-prompt = "Review-rounds doorbell for {assignment_id}: four or more review rounds have landed. Inspect the durable review history and decide whether scope or process needs correction."
+# owner — while limiting nothing. The rails grammar has no non-blocking
+# effect today (deny/remedy/escalate all gate the verb), and a doorbell that
+# blocks IS the artificial limit the ruling forbids. Armed the day the
+# grammar grows a `notice` effect (record + summon + allow); the fact it
+# needs (assignment.review_verdict_count) ships now.
+#
+# [[rule]]
+# name = "review-rounds-doorbell"
+# verb = "attest"
+# text = "four or more review rounds on one assignment — the product owner should look"
+# effect = "notice"
+# deny_when = [
+#   { fact = "attest.kind", op = "eq", value = "verdict" },
+#   { fact = "assignment.review_verdict_count", op = "gte", value = 4 },
+# ]

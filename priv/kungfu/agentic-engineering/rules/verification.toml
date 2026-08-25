@@ -19,7 +19,7 @@ prompt = "Your completion of {assignment_id} is blocked: no verification verdict
 
 # Widened 2026-08-18 from coder-only to the other archetypes whose deliverable is
 # a FILE. The shape was right and already proven; only its reach was short, and
-# the loss concentrated exactly where it did not reach. Production measurement showed that
+# the loss concentrated exactly where it did not reach. Measured across the fleet that
 # day, closed assignments carrying NO artifact on their work item: reviewer
 # 456/682, spec-writer 35/71, recon 34/148 — against coder's 118/397, the one
 # archetype this rule already covered.
@@ -33,7 +33,7 @@ prompt = "Your completion of {assignment_id} is blocked: no verification verdict
 # the DECISION and dropped the REASONING behind it. The review document is the
 # verdict's substance, not an optional companion to it.
 #
-# The product ruling: a verdict should POINT AT an artifact
+# The product owner ruled the real fix on 2026-08-18: a verdict should POINT AT an artifact
 # rather than carry a capped note, which makes review context durable by
 # construction and retires this clause for reviewers. Until that lands (0.2
 # design), this rail is the interim that keeps the reasoning attached to the

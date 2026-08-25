@@ -27,7 +27,7 @@ defmodule Tightbeam.ColdStartTest do
     root = Org.get(db, Org.personal_session_key("alice"))
     assert root.kind == "main"
     assert root.is_built_in
-    assert root.operational_parent == root.session_key
+    assert root.session_key == Org.personal_session_key("alice")
     assert root.origin == "process:tightbeam"
 
     assert %{
@@ -230,7 +230,7 @@ defmodule Tightbeam.ColdStartTest do
              "action" => "choose pair-first or host-local bootstrap"
            }
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v6"]]} =
+    assert {:ok, [["operator-decision-requests-cold-start-v1"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
   end
 

@@ -8,7 +8,7 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    branches: ["0.1.*"]
     tags: ["v*.*.*"]
   pull_request:
 
@@ -30,7 +30,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 2
+          # The public-rule compatibility gate scans every rule-fact revision
+          # since its ratified baseline and refuses incomplete history.
+          fetch-depth: 0
 
       - name: Shipped assets contain no internal identifiers
         run: python3 scripts/verify_shipped_privacy.py
@@ -161,7 +163,7 @@ jobs:
   # not pass on that platform.
   release:
     needs: test
-    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/heads/0.1.') || startsWith(github.ref, 'refs/tags/v')
     strategy:
       matrix:
         include:
@@ -174,8 +176,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # A tagged release must prove that its commit is the canonical main tip.
-          # The full history exposes origin/main for the exact-tip check below.
+          # A tagged 0.1 release must prove that its commit is the highest 0.1.* tip.
           fetch-depth: 0
 
       - name: Validate the release tag

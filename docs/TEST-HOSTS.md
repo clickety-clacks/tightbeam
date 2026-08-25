@@ -10,7 +10,7 @@ confused with one.
 that is **`clu`**; on tars it is **`mike`**. Not a purpose-made account.
 
 This is not convenience — it is the only way the test measures the thing that
-ships. Tightbeam installs as a **system service** (see
+ships. Tight Beam installs as a **system service** (see
 `service-mode-install-v1.md`), and the service runs as the account that installed
 it. So that account's **permissions, paths, PATH, home layout, and credential
 visibility are part of the artifact under test.** Run it somewhere else and you
@@ -26,7 +26,7 @@ test itself created.
 **Never delete or reset the operator account.** Cleanup removes what this run
 added, nothing else.
 
-## 1. A clean start means Tightbeam is ABSENT — not that the identity is new
+## 1. A clean start means Tight Beam is ABSENT — not that the identity is new
 
 Before a run, for the operator account:
 
@@ -38,8 +38,8 @@ Before a run, for the operator account:
   rustup, Elixir, Hex/rebar or the harness CLIs there, they mask the prerequisite
   checks the procedure exists to exercise
 
-Anything the account had **before** Tightbeam ever touched it stays. The
-distinction is provenance, not tidiness: remove what a Tightbeam run added,
+Anything the account had **before** Tight Beam ever touched it stays. The
+distinction is provenance, not tidiness: remove what a Tight Beam run added,
 preserve what the machine already was.
 
 ## 2. Baseline BEFORE anything else
@@ -96,7 +96,7 @@ condition presumes a connected client.
 
 ## 3b. Credentials are always onboarded fresh — never adopted
 
-Tightbeam's onboarding stages into an isolated directory and installs only the
+Tight Beam's onboarding stages into an isolated directory and installs only the
 bytes that ceremony produces. It **cannot** adopt the operator account's existing
 `claude` or `codex` login, and running as `clu` does not change that: the CLI is
 invoked with `CODEX_HOME` / `CLAUDE_CONFIG_DIR` pointed at the staging dir.
@@ -122,7 +122,7 @@ not evidence for logout, reboot, or a turn.
 
 ## 5. End of run — the installation STAYS
 
-**Do not uninstall.** The smoke installs Tightbeam and then runs the complete
+**Do not uninstall.** The smoke installs Tight Beam and then runs the complete
 functional and system test sequence against that installation; the install is the
 thing the rest of the run is performed on, so tearing it down ends the run early
 and destroys the only environment those tests have. Uninstall is not a product

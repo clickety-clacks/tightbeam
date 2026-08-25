@@ -1,38 +1,14 @@
 # Tightbeam
 
-**Tightbeam runs an organization of AI agents that works for you.**
+Agent orchestration needs a real machine part—not another layer of ad hoc glue.
+Tightbeam coordinates the vendors’ own harnesses rather than repackaging models
+in a generic shell: Claude runs in Claude Code; Codex runs in Codex.
 
-Agents like OpenClaw and Hermes give you a capable individual: one
-persistent mind that chats, remembers, acts, and improves. Tightbeam is the
-layer such individuals work *inside*. It is the difference between hiring a
-brilliant freelancer and owning a company. Agents plug in as staff, each
-running in its vendor's own harness: Claude in Claude Code, Codex in Codex.
-Tightbeam adds what turns staff into an institution: durable work, review
-across competing model vendors, enforceable rules, and a paper trail behind
-every claim.
+It keeps durable, first-party facts about work in one shared source of truth.
+At the substrate layer, it turns guidance into deterministic rails: rules
+enforced across agents and sessions, not left to each model’s inference.
 
-You act as the owner. File what you want as tickets.
-Decisions that only an owner can make reach you pre-triaged, even on your
-phone. The organization handles the rest. At times it goes further and
-[improves itself unasked](https://tightbeam.clawline.chat/watchdog/).
-
-Three properties make that safe to trust:
-
-- **Everything is on the record.** Tightbeam keeps a permanent, attributed
-  history of the organization: every job, hire, and claim, and who made it.
-  You can always establish what happened, straight from the record.
-- **You and your agents write the law.** Guidance shapes how agents work.
-  On top of it, you and your agents can create deterministic rules that
-  govern the system itself: guarantees the organization keeps automatically,
-  whichever model is doing the work.
-- **The organization belongs to its agents, and to you.** Every decision
-  stays with you and them. Tightbeam remembers, reminds, and enforces the
-  rules you have written. That is why the organization survives failure: any
-  agent, or the substrate itself, can go down, and work resumes from the
-  record.
-
-Tightbeam is a standalone service: install it and run it, the way you would
-a database.
+You RUN tightbeam; you do not depend on it. There is no Hex package.
 
 ## Two ways to install
 
@@ -211,7 +187,9 @@ Download the package for your platform from the
 [GitHub Releases](https://github.com/clickety-clacks/tightbeam/releases) page.
 Each release contains packages for `darwin-aarch64` and `linux-x86_64`, a
 `SHA256SUMS` file, and `release-provenance.json` naming the exact tagged commit
-and workflow run that produced them. Verify the downloaded package before
+and workflow run that produced them. (Exception: `v0.1.8+1325` was published
+manually from the e2e-proven packages; its SHA-256 hashes are in the release
+notes instead of a `SHA256SUMS` asset.) Verify the downloaded package before
 installing it:
 
 ```sh
@@ -225,7 +203,7 @@ shasum -a 256 -c SHA256SUMS --ignore-missing
 Install the verified package:
 
 ```sh
-npm install -g ./tightbeam-<version>-<os>-<arch>-<commit>.tgz
+npm install -g ./tightbeam-<version>-<os>-<arch>-build<N>.tgz
 tightbeam --version
 tightbeam-gateway                  # boots the gateway in the foreground
 ```

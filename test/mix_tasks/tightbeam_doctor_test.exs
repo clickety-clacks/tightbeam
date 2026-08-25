@@ -23,6 +23,7 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
       hosts: %{"local-test" => %{ssh: nil, base_dir: base_dir, cli_bin: nil}},
       local_host_name: "local-test",
       cli_bin: Path.join(base_dir, "bin"),
+      github_gh_path: "/fixture/bin/gh",
       harness_binary_probe: fn harness, _cli_bin ->
         {:ok, %{bin: "/fake/#{harness}", version: "#{harness} 1.0"}}
       end
@@ -287,6 +288,96 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
     refute check.ok
     assert check.detail =~ "local-test"
     assert check.fix == "Register a host."
+  end
+
+  test "github auth is not checked when the project has no github remote", ctx do
+    {0, report} = Doctor.evaluate(ctx.catalog, ctx.inputs)
+
+    refute find(report, "github_auth:github.com")
+    assert report.github == nil
+  end
+
+  test "github auth passes only when the host probe reports live cli and git auth", ctx do
+    inputs =
+      ctx.inputs
+      |> put(:github_remote_url, "https://github.com/example/project.git")
+      |> put(:github_probe, fn "github.com", "https://github.com/example/project.git" ->
+        {:ok, %{account: "octo", git_protocol: "https"}}
+      end)
+
+    {0, report} = Doctor.evaluate(ctx.catalog, inputs)
+    check = find(report, "github_auth:github.com")
+
+    assert check.ok
+    assert check.detail =~ "GitHub github.com is live for octo via https"
+    assert check.detail =~ "host local-test"
+    assert check.detail =~ "gh /fixture/bin/gh"
+    assert check.detail =~ "state live"
+    assert check.detail =~ "storage file"
+
+    assert report.github == %{
+             account: "octo",
+             gh_path: "/fixture/bin/gh",
+             git_protocol: "https",
+             host: "local-test",
+             hostname: "github.com",
+             repair: nil,
+             state: "live",
+             storage: "file"
+           }
+
+    refute Doctor.format(report, :human) =~ "PAT"
+  end
+
+  test "github auth failure names onboarding repair and never asks for a PAT", ctx do
+    inputs =
+      ctx.inputs
+      |> put(:github_remote_url, "git@github.com:example/project.git")
+      |> put(:github_probe, fn "github.com", "git@github.com:example/project.git" ->
+        {:error, :needs_onboarding,
+         "not logged in github_pat_secret https://user:ghp_secret@github.com/example/project.git"}
+      end)
+
+    {1, report} = Doctor.evaluate(ctx.catalog, inputs)
+    check = find(report, "github_auth:github.com")
+
+    refute report.ready
+    refute check.ok
+    assert check.detail =~ "needs_onboarding: not logged in"
+    refute check.detail =~ "github_pat_secret"
+    refute check.detail =~ "ghp_secret"
+    assert check.detail =~ "https://[redacted]@github.com/example/project.git"
+    assert check.detail =~ "host local-test"
+    assert check.detail =~ "gh /fixture/bin/gh"
+    assert check.detail =~ "storage file"
+    assert check.fix =~ "tightbeam onboard github --hostname github.com"
+    assert check.fix =~ "--remote git@github.com:example/project.git"
+    assert check.fix =~ "Do not paste a PAT into an agent."
+    assert report.github.state == "needs_onboarding"
+    assert report.github.host == "local-test"
+    assert report.github.gh_path == "/fixture/bin/gh"
+    assert report.github.storage == "file"
+    assert report.github.repair =~ "--remote git@github.com:example/project.git"
+  end
+
+  test "github missing CLI reports storage as unknown", ctx do
+    inputs =
+      ctx.inputs
+      |> put(:github_remote_url, "https://github.com/example/project.git")
+      |> put(:github_gh_path, nil)
+      |> put(:github_probe, fn "github.com", "https://github.com/example/project.git" ->
+        {:error, :missing_cli, "gh is missing from PATH"}
+      end)
+
+    {1, report} = Doctor.evaluate(ctx.catalog, inputs)
+    check = find(report, "github_auth:github.com")
+
+    refute check.ok
+    assert check.detail =~ "gh missing"
+    assert check.detail =~ "storage unknown"
+    assert report.github.state == "missing_cli"
+    assert report.github.gh_path == nil
+    assert report.github.storage == nil
   end
 
   # RULED: doctor never creates org state. An org that has not booted has no DB,

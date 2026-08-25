@@ -47,8 +47,6 @@ defmodule Tightbeam.Wire.Socket do
     from the gateway config — NEVER hardcoded here), register, replay, live.
   - message: id must start with "c_" (else invalid_message); content ≤ 64KiB
     utf8 (else payload_too_large); session ownership enforced (not_found);
-    zero or one reply entry in the existing references array resolves by
-    llmVisibleMessageId inside the selected session's append transaction;
     then verb "post" through Dispatch. dedupe: :duplicate → ack again;
     :conflict → invalid_message and NO ack.
   - stream_read: write read state, echo stream_read_state.
@@ -425,7 +423,6 @@ defmodule Tightbeam.Wire.Socket do
     content = string(msg["content"])
     session_key = string(msg["sessionKey"] || Org.personal_session_key(state.user_id))
     session = Org.get(db(state), session_key)
-    reply_reference = reply_reference(msg)
 
     cond do
       not String.starts_with?(id, "c_") ->
@@ -438,25 +435,22 @@ defmodule Tightbeam.Wire.Socket do
         push(Payloads.wire_error("not_found", nil, id), state)
 
       true ->
-        params = %{
-          content: content,
-          device_id: state.device_id,
-          client_message_id: id,
-          attachments: msg["attachments"] || []
-        }
-
-        params =
-          case reply_reference do
-            {:ok, nil} -> params
-            {:ok, reply_id} -> Map.put(params, :reply_to_llm_visible_message_id, reply_id)
-            :error -> Map.put(params, :invalid_reply_reference, true)
-          end
+        reply_params = reply_reference_params(db(state), session_key, msg["references"])
 
         call = %{
           verb: "post",
           origin: "user:#{state.user_id}",
           session_key: session_key,
-          params: params
+          params:
+            Map.merge(
+              %{
+                content: content,
+                device_id: state.device_id,
+                client_message_id: id,
+                attachments: msg["attachments"] || []
+              },
+              reply_params
+            )
         }
 
         case Dispatch.dispatch(db(state), state.deps.handlers, call) do
@@ -479,29 +473,36 @@ defmodule Tightbeam.Wire.Socket do
     end
   end
 
-  defp reply_reference(msg) do
-    case Map.fetch(msg, "references") do
-      :error ->
-        {:ok, nil}
+  defp reply_reference_params(_db, _session_key, nil), do: %{}
 
-      {:ok, references} when is_list(references) ->
-        if Enum.all?(references, &valid_reference_entry?/1) do
-          case Enum.filter(references, &(&1["kind"] == "reply")) do
-            [] -> {:ok, nil}
-            [%{"llmVisibleMessageId" => id}] when is_binary(id) and id != "" -> {:ok, id}
-            _ -> :error
-          end
-        else
-          :error
+  defp reply_reference_params(db, session_key, references) when is_list(references) do
+    case Enum.filter(references, &match?(%{"kind" => "reply"}, &1)) do
+      [] ->
+        %{}
+
+      [%{"llmVisibleMessageId" => visible_id}] when is_binary(visible_id) and visible_id != "" ->
+        case DB.query(
+               db,
+               "SELECT id, clientMessageId FROM messages WHERE sessionKey = ?1 AND llmVisibleMessageId = ?2",
+               [session_key, visible_id]
+             ) do
+          {:ok, [[message_id, client_message_id]]} ->
+            %{
+              reply_to_message_id: message_id,
+              reply_to_client_message_id: client_message_id
+            }
+
+          _ ->
+            %{invalid_reply_reference: true}
         end
 
       _ ->
-        :error
+        %{invalid_reply_reference: true}
     end
   end
 
-  defp valid_reference_entry?(%{"kind" => kind}) when is_binary(kind) and kind != "", do: true
-  defp valid_reference_entry?(_entry), do: false
+  defp reply_reference_params(_db, _session_key, _references),
+    do: %{invalid_reply_reference: true}
 
   defp seed_main_stream(user_id, state) do
     key = Org.personal_session_key(user_id)

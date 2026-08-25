@@ -5,10 +5,17 @@ defmodule Tightbeam.CliIntegrationTest do
   @moduletag :cli_integration
 
   alias Tightbeam.{
+    Assets,
     Archetypes,
+    Assignments,
     CliCompatibility,
+    ConditionFacts,
     DB,
+    Devices,
+    Escalation,
+    EventLog,
     Gateway,
+    Idempotency,
     Ledger,
     Org,
     Projection,
@@ -16,31 +23,19 @@ defmodule Tightbeam.CliIntegrationTest do
     Rails,
     Roles,
     Rules,
-    Wakes
+    Wakes,
+    WorkItems,
+    WorkState
   }
 
   alias Tightbeam.Wire.Router
 
-  setup_all do
-    cli_dir = Path.expand("../cli", __DIR__)
-    binary = Path.join(cli_dir, "target/release/tightbeam")
-
-    if cargo = System.find_executable("cargo") do
-      {output, status} =
-        System.cmd(cargo, ["build", "--release"], cd: cli_dir, stderr_to_stdout: true)
-
-      if status != 0, do: raise("release CLI build failed:\n#{output}")
-    end
+  setup do
+    binary = Path.expand("../cli/target/release/tightbeam", __DIR__)
 
     unless File.exists?(binary) do
       raise "CLI integration binary missing: #{binary}; run cargo build --release in cli/"
     end
-
-    :ok
-  end
-
-  setup do
-    binary = Path.expand("../cli/target/release/tightbeam", __DIR__)
 
     db = :"cli_integration_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
@@ -62,27 +57,13 @@ defmodule Tightbeam.CliIntegrationTest do
     # did not.
     :ok = Tightbeam.Schema.ensure_all(db)
 
+    register_hosts(db, %{"testhost" => %{ssh: nil, base_dir: base_dir, cli_bin: nil}})
+
     {:ok, _} =
       DB.query(
         db,
         "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 1, 'admin_add', 1)"
       )
-
-    main_key = Org.personal_session_key("flynn")
-
-    Org.create(db, %{
-      session_key: main_key,
-      display_name: "Main",
-      kind: "main",
-      is_built_in: true,
-      owner_user_id: "flynn",
-      origin: "user:flynn",
-      archetype: "default",
-      host: "testhost",
-      harness: "claude",
-      provider: "anthropic",
-      model: Model.new("fable")
-    })
 
     session =
       Org.create(db, %{
@@ -127,12 +108,20 @@ defmodule Tightbeam.CliIntegrationTest do
     test_pid = self()
 
     handlers =
-      Map.new(real_handlers, fn {verb, handler} ->
-        {verb,
-         fn call ->
-           send(test_pid, {:cli_call, call})
-           handler.(call)
-         end}
+      Map.new(real_handlers, fn
+        {"tune", _handler} ->
+          {"tune",
+           fn call ->
+             send(test_pid, {:cli_call, call})
+             %{ok: false, code: "same_harness", message: "omit --harness"}
+           end}
+
+        {verb, handler} ->
+          {verb,
+           fn call ->
+             send(test_pid, {:cli_call, call})
+             handler.(call)
+           end}
       end)
 
     router_opts =
@@ -189,6 +178,76 @@ defmodule Tightbeam.CliIntegrationTest do
     version = String.trim(version)
 
     assert version == CliCompatibility.required_version()
+  end
+
+  test "real tune CLI uses session identity, typed fields, and structured refusals", ctx do
+    {output, 1} =
+      System.cmd(
+        ctx.binary,
+        [
+          "tune",
+          "--session",
+          ctx.worker.session_key,
+          "--harness",
+          "claude",
+          "--model",
+          "fable"
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert String.starts_with?(output, "{"), output
+    assert %{"code" => "same_harness", "ok" => false} = JSON.decode!(output)
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "tune",
+                      origin: "agent:cli-holder",
+                      session_key: "cli-worker",
+                      params: %{setting: "set_harness", harness: "claude", model: "fable"}
+                    }}
+
+    {_effort, 1} =
+      System.cmd(
+        ctx.binary,
+        ["tune", "--session", ctx.worker.session_key, "--effort", "high"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "tune",
+                      session_key: "cli-worker",
+                      params: %{setting: "set_reasoning", reasoningLevel: "high"}
+                    }}
+
+    {_fast, 1} =
+      System.cmd(
+        ctx.binary,
+        ["tune", "--session", ctx.worker.session_key, "--fast", "on"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "tune",
+                      session_key: "cli-worker",
+                      params: %{setting: "set_fast_mode", fastMode: "on"}
+                    }}
+
+    {usage, 1} =
+      System.cmd(
+        ctx.binary,
+        ["tune", "--session", ctx.worker.session_key, "--fast", "on", "--effort", "high"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert usage =~ "--fast is mutually exclusive"
+    refute_receive {:cli_call, %{verb: "tune"}}
   end
 
   test "version refusal is distinguishable from auth and network failures", ctx do
@@ -276,22 +335,6 @@ defmodule Tightbeam.CliIntegrationTest do
         ctx.db,
         "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('other', 0, 'admin_add', 1)"
       )
-
-    other_main_key = Org.personal_session_key("other")
-
-    Org.create(ctx.db, %{
-      session_key: other_main_key,
-      display_name: "Other Main",
-      kind: "main",
-      is_built_in: true,
-      owner_user_id: "other",
-      origin: "user:other",
-      archetype: "default",
-      host: "testhost",
-      harness: "claude",
-      provider: "anthropic",
-      model: Model.new("fable")
-    })
 
     other =
       Org.create(ctx.db, %{
@@ -1118,134 +1161,6 @@ defmodule Tightbeam.CliIntegrationTest do
                       verb: "effort-rule",
                       principal: {:session, "cli-holder"},
                       params: %{request: ^dismiss_request, action: "dismiss"}
-                    }}
-  end
-
-  test "real CLI returns an insufficient question and removes it from the open queue", ctx do
-    {asked, 0} =
-      System.cmd(
-        ctx.binary,
-        [
-          "ask",
-          "--session",
-          ctx.worker.session_key,
-          "--question",
-          "which migration should ship?"
-        ],
-        cd: ctx.workdir,
-        stderr_to_stdout: true
-      )
-
-    assert_receive {:cli_call,
-                    %{
-                      verb: "ask",
-                      principal: {:session, "cli-holder"},
-                      session_key: "cli-worker"
-                    }}
-
-    assert {:ok, [[request_id]]} =
-             DB.query(
-               ctx.db,
-               "SELECT id FROM decision_requests WHERE kind='agent' ORDER BY rowid DESC LIMIT 1"
-             )
-
-    assert asked =~ request_id
-    worker_dir = session_workdir!(ctx, ctx.worker)
-
-    {returned, 0} =
-      System.cmd(
-        ctx.binary,
-        [
-          "return",
-          "--request",
-          request_id,
-          "--reason",
-          "name the migration and rollback boundary"
-        ],
-        cd: worker_dir,
-        stderr_to_stdout: true
-      )
-
-    assert returned =~ request_id
-    assert returned =~ "returned"
-    assert returned =~ "name the migration and rollback boundary"
-
-    assert_receive {:cli_call,
-                    %{
-                      verb: "return",
-                      principal: {:session, "cli-worker"},
-                      params: %{
-                        request: ^request_id,
-                        reason: "name the migration and rollback boundary"
-                      }
-                    }}
-
-    assert {:ok, [["returned", "session:cli-worker", reason, returned_at]]} =
-             DB.query(
-               ctx.db,
-               "SELECT status, returnedBy, returnReason, returnedAt FROM decision_requests WHERE id=?1",
-               [request_id]
-             )
-
-    assert reason == "name the migration and rollback boundary"
-    assert is_integer(returned_at)
-
-    {open, 0} =
-      System.cmd(ctx.binary, ["decision-requests", "--status", "open"],
-        cd: ctx.workdir,
-        stderr_to_stdout: true
-      )
-
-    refute open =~ request_id
-
-    {history, 0} =
-      System.cmd(ctx.binary, ["decision-requests", "--status", "returned"],
-        cd: ctx.workdir,
-        stderr_to_stdout: true
-      )
-
-    assert history =~ request_id
-    assert history =~ reason
-  end
-
-  test "real CLI retrieves open decisions through the configured client gateway path", ctx do
-    request_id = "dr_configured-client_#{System.unique_integer([:positive])}"
-    now = System.system_time(:millisecond)
-
-    {:ok, _} =
-      DB.query(
-        ctx.db,
-        """
-        INSERT INTO decision_requests
-          (id, raiserId, ownerUserId, raisedAt, deadlineAt, statuteName, actionKey,
-           question, context, status)
-        VALUES (?1, 'process:tightbeam', 'flynn', ?2, ?3,
-                'configured-client-retrieval', ?4, 'Continue?', '{}', 'open')
-        """,
-        [request_id, now, now + 60_000, request_id]
-      )
-
-    {requests, 0} =
-      System.cmd(
-        ctx.binary,
-        ["decision-requests", "--status", "open", "--as-user", "flynn"],
-        cd: ctx.outside,
-        stderr_to_stdout: true,
-        env: [
-          {"TIGHTBEAM_URL", "ws://127.0.0.1:#{ctx.port}"},
-          {"TIGHTBEAM_TOKEN", ctx.session.cli_token},
-          {"TIGHTBEAM_BASE_DIR", nil},
-          {"TIGHTBEAM_HOME", nil}
-        ]
-      )
-
-    assert requests =~ request_id
-
-    assert_receive {:cli_call,
-                    %{
-                      verb: "decision-requests",
-                      principal: {:user, "flynn"},
-                      params: %{status: "open"}
                     }}
   end
 

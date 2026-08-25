@@ -8,7 +8,6 @@ defmodule Tightbeam.RolesTest do
     db = :"roles_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Tightbeam.Schema.ensure_all(db)
-    ensure_main_session(db, "flynn")
     %{db: db}
   end
 
@@ -71,6 +70,7 @@ defmodule Tightbeam.RolesTest do
 
   test "resolution pins active bindings and falls back for every other incarnation", %{db: db} do
     main = Org.personal_session_key("flynn")
+    session(db, main, "flynn")
     active = session(db, "agent:held", "flynn")
     stale = session(db, "agent:stale", "flynn")
 

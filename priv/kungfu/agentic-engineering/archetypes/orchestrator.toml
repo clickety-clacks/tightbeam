@@ -1,5 +1,5 @@
 name = "orchestrator"
-skills = ["worktree-session", "feature-cycle", "work-tracking", "unblocking", "tightbeam-law-minting", "tightbeam-guidance-authoring", "human-communication", "security-incident"]
+skills = ["worktree-session", "feature-cycle", "work-tracking", "unblocking", "tightbeam-law-minting", "tightbeam-guidance-authoring", "human-communication"]
 
 [guidance]
 text = """
@@ -14,8 +14,4 @@ text = """
 #include "model-policy.md"
 
 #include "orchestrator.md"
-
-#include "comms-discipline.md"
-
-#include "altitude-statute.md"
 """

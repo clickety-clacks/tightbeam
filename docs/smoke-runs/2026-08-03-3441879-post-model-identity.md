@@ -116,9 +116,9 @@ Preconditions otherwise hold: `clu@eurisko` reachable with codex auth and node v
 **N3 ran and passed.** Gateway booted from a PATH with no harness CLI: refuses by name,
 exits 1, binds no port, leaves no partial daemon.
 
-    Tightbeam cannot start because no registered harness CLI is installed. That is
+    Tight Beam cannot start because no registered harness CLI is installed. That is
     expected on a fresh machine. Install `claude` or `codex`, ensure it is on PATH, then
-    start Tightbeam again. Run `tightbeam doctor` to check this machine.
+    start Tight Beam again. Run `tightbeam doctor` to check this machine.
 
 Rails honored: hostname verified before every remote operation; both run roots created
 under `~/.tightbeam-e2e-<runid>/` with `RUN_MARKER` and removed only after marker

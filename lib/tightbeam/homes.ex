@@ -2,7 +2,7 @@ defmodule Tightbeam.Homes do
   @moduledoc """
   Projects one generic shared home per `{harness, machine}`.
 
-  Tightbeam owns exactly the credential entry, the harness rails artifact,
+  Tight Beam owns exactly the credential entry, the harness rails artifact,
   `.tightbeam/`, and the substrate baseline skills. Regeneration is
   ownership-scoped: it never removes the home and therefore preserves
   harness-owned sessions, history, projects, transcripts, and memory

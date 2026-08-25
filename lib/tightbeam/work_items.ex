@@ -16,9 +16,8 @@ defmodule Tightbeam.WorkItems do
   fail/reopen) are owner-or-admin verbs that write `state`/`failReason`.
   """
 
-  alias Tightbeam.{CausalEvents, DB, IdPrefix, Org, Wakes}
+  alias Tightbeam.{CausalEvents, DB, Org, Wakes}
   alias Tightbeam.DB.Txn
-  alias Tightbeam.Firehose.Publisher
 
   @origin "process:tightbeam"
   @default_triage_deadline_ms 86_400_000
@@ -114,7 +113,7 @@ defmodule Tightbeam.WorkItems do
                 ]
               )
 
-              routing_wake = arm_routing_in_txn(txn, id, owner, call.params.title)
+              arm_routing_in_txn(txn, id, owner, call.params.title)
 
               if key do
                 Txn.q(
@@ -124,15 +123,10 @@ defmodule Tightbeam.WorkItems do
                 )
               end
 
-              item = fetch_in_txn(txn, id)
-              on_routing_wake_scheduled_in_txn(call).(txn, routing_wake)
-              Publisher.maybe_accepted_in_txn(txn, call, public_work_item(item))
-              {:created, item, routing_wake}
+              {:created, fetch_in_txn(txn, id)}
 
             item_id ->
-              item = fetch_in_txn(txn, item_id)
-              Publisher.maybe_accepted_in_txn(txn, call, public_work_item(item))
-              {:replayed, item}
+              {:replayed, fetch_in_txn(txn, item_id)}
           end
         end)
 
@@ -140,9 +134,8 @@ defmodule Tightbeam.WorkItems do
         # An actual create makes an owner-visible item — one owner-routed
         # metadata doorbell (constitution §2: the owner is nagged about their
         # unassigned item). A keyed replay created nothing, so it stays silent.
-        {:created, item, routing_wake} ->
+        {:created, item} ->
           best_effort(fn -> on_change(call).(item.id, "metadata") end)
-          best_effort(fn -> on_routing_wake_scheduled(call).(routing_wake) end)
           public_work_item(item)
 
         {:replayed, item} ->
@@ -179,20 +172,7 @@ defmodule Tightbeam.WorkItems do
 
   defp update_result(db, call) do
     with :ok <- principal_allowed(call.principal) do
-      result =
-        transaction(db, fn txn ->
-          result = update_in_txn(txn, call.params)
-
-          case result do
-            {:updated, item, _changed?} ->
-              Publisher.maybe_accepted_in_txn(txn, call, public_work_item(item))
-
-            _ ->
-              :ok
-          end
-
-          result
-        end)
+      result = transaction(db, fn txn -> update_in_txn(txn, call.params) end)
 
       case result do
         {:updated, item, changed?} ->
@@ -304,40 +284,7 @@ defmodule Tightbeam.WorkItems do
       reason = call.params[:reason]
 
       result =
-        transaction(db, fn txn ->
-          visible? = fn candidate ->
-            case fetch_in_txn(txn, candidate) do
-              nil -> false
-              item -> disposition_allowed?(txn, call.principal, item)
-            end
-          end
-
-          result =
-            case IdPrefix.resolve_in_txn(txn, :work_item, id, visible?) do
-              {:ok, resolved} ->
-                id_resolved(call, txn, :work_item, resolved)
-                dispose_in_txn(txn, call.principal, resolved, verb, reason)
-
-              :unknown ->
-                unknown(id)
-
-              {:ambiguous, error} ->
-                error
-            end
-
-          case result do
-            {:disposed, item, _changed?} ->
-              Publisher.maybe_accepted_in_txn(txn, call, %{
-                ok: true,
-                workItem: public_work_item(item)
-              })
-
-            _ ->
-              :ok
-          end
-
-          result
-        end)
+        transaction(db, fn txn -> dispose_in_txn(txn, call.principal, id, verb, reason) end)
 
       case result do
         {:disposed, item, changed?} ->
@@ -651,7 +598,7 @@ defmodule Tightbeam.WorkItems do
       })
 
     Txn.q(txn, "UPDATE work_items SET routingWakeId = ?2 WHERE id = ?1", [id, wake.wake_id])
-    wake
+    :ok
   end
 
   defp triage_deadline_ms do
@@ -662,51 +609,32 @@ defmodule Tightbeam.WorkItems do
 
   defp get_result(db, call) do
     with :ok <- principal_allowed(call.principal) do
-      supplied = call.params[:work_item_id]
+      case fetch(db, call.params[:work_item_id]) do
+        nil ->
+          unknown(call.params[:work_item_id])
 
-      case IdPrefix.resolve(db, :work_item, supplied) do
-        {:ok, id} ->
-          item = fetch(db, id)
-
+        item ->
           %{
             workItem: public_work_item(item),
             assignments: Tightbeam.Assignments.__for_work_item__(db, item.id)
           }
-
-        :unknown ->
-          unknown(supplied)
-
-        {:ambiguous, error} ->
-          error
       end
     end
   end
 
   defp trace_result(db, call) do
-    supplied = call.params[:work_item_id]
+    id = call.params[:work_item_id]
 
-    visible? = fn id ->
-      case fetch(db, id) do
-        nil -> false
-        item -> trace_allowed?(db, call.principal, item)
-      end
-    end
-
-    case IdPrefix.resolve(db, :work_item, supplied, visible?) do
-      {:ok, id} ->
-        item = fetch(db, id)
-
+    case fetch(db, id) do
+      item when not is_nil(item) ->
         if trace_allowed?(db, call.principal, item) do
           Tightbeam.JobTrace.build(db, item)
         else
           trace_not_found()
         end
 
-      :unknown ->
+      nil ->
         trace_not_found()
-
-      {:ambiguous, error} ->
-        error
     end
   end
 
@@ -830,22 +758,9 @@ defmodule Tightbeam.WorkItems do
   defp unknown(id), do: error("unknown_work_item", "unknown work item: #{id}")
   defp error(code, message), do: %{code: code, message: message}
 
-  defp id_resolved(call, txn, type, id) do
-    case Map.get(call, :on_id_resolved_in_txn) do
-      fun when is_function(fun, 3) -> fun.(txn, type, id)
-      _ -> :ok
-    end
-  end
-
   defp metadata(item), do: {item.title, item.specRefName, item.specRefSha256, item.isBug}
 
   defp on_change(call), do: Map.get(call, :on_work_item_change, fn _, _ -> :ok end)
-
-  defp on_routing_wake_scheduled_in_txn(call),
-    do: Map.get(call, :on_routing_wake_scheduled_in_txn, fn _, _ -> :ok end)
-
-  defp on_routing_wake_scheduled(call),
-    do: Map.get(call, :on_routing_wake_scheduled, fn _ -> :ok end)
 
   defp best_effort(fun) do
     try do

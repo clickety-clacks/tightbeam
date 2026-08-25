@@ -194,14 +194,10 @@ defmodule Tightbeam.Transcript do
         """
         SELECT m.id, m.timestamp, m.role, m.sender, m.content, m.attachments,
                m.replyToMessageId, t.seq, t.model, t.thinkingLevel, t.modelContext,
-               t.harness, t.assignmentId, t.jobRef, w.class, w.deliveryRule
+               t.harness, t.assignmentId, t.jobRef
         FROM messages AS m
         LEFT JOIN turns AS t
           ON t.messageId = CASE m.role WHEN 'user' THEN m.id ELSE m.replyToMessageId END
-        -- The coordination class of the wake that MATERIALIZED this turn
-        -- (fabric §7). Null for a turn no wake materialized, and null for a
-        -- wake whose sender elected nothing — absence is absence, never `fyi`.
-        LEFT JOIN wakes AS w ON w.wakeId = t.wakeId
         WHERE m.sessionKey = ?1 #{range_sql}
         """,
         params
@@ -224,9 +220,7 @@ defmodule Tightbeam.Transcript do
          model_context,
          harness,
          assignment_id,
-         job_ref,
-         class,
-         delivery_rule
+         job_ref
        ]) do
     %{
       id: id,
@@ -242,9 +236,7 @@ defmodule Tightbeam.Transcript do
       effort: effort,
       harness: harness,
       assignment_id: assignment_id,
-      job_ref: job_ref,
-      class: class,
-      delivery_rule: delivery_rule
+      job_ref: job_ref
     }
   end
 
@@ -391,12 +383,7 @@ defmodule Tightbeam.Transcript do
   ## Errors — the two not_found bodies are each byte-identical across their cases
 
   defp not_found, do: %{code: "not_found", message: "session not found"}
-
-  # O3: `cursor_not_found` — the same code `attests` names, not a bare
-  # `not_found` — so a caller distinguishes "the session doesn't exist or
-  # isn't yours" from "the cursor you passed doesn't resolve." Every read
-  # verb's cursor miss uses this code (execution_map's roster page, attests).
-  defp cursor_not_found, do: %{code: "cursor_not_found", message: "cursor message not found"}
+  defp cursor_not_found, do: %{code: "not_found", message: "cursor message not found"}
   defp invalid(message), do: %{code: "invalid", message: message}
 
   defp string_param(params, key) do

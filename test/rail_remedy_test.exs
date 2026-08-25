@@ -16,8 +16,7 @@ defmodule Tightbeam.RailRemedyTest do
     RailRemedy,
     Roles,
     Rules,
-    Wakes,
-    WorkItems
+    Wakes
   }
 
   setup do
@@ -31,8 +30,6 @@ defmodule Tightbeam.RailRemedyTest do
         db,
         "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 0, 'admin_add', 1)"
       )
-
-    ensure_main_session(db, "flynn")
 
     holder = session(db, "holder", "flynn", "claude", "coder")
     reviewer = session(db, "reviewer-session", "flynn", "claude", "reviewer")
@@ -116,6 +113,27 @@ defmodule Tightbeam.RailRemedyTest do
 
     assert %{status: "closed"} =
              RailRemedy.episode(ctx.db, "completion-needs-review", assignment.id)
+  end
+
+  test "assign remedy preserves declared file metadata", ctx do
+    assignment = assignment(ctx, "declared files")
+
+    put_rules(
+      ctx,
+      String.replace(
+        review_gate(),
+        ~s(reviews = "{assignment_id}"),
+        ~s(reviews = "{assignment_id}"\nfiles = ["lib/a.ex", "{assignment_id}"])
+      )
+    )
+
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    assert {:error, %{reason: "remedy_fired", producer: review_id}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, completion_call(assignment.id))
+
+    assert Enum.sort(Assignments.declared_files(ctx.db, review_id)) ==
+             Enum.sort(["lib/a.ex", assignment.id])
   end
 
   test "declared recurrence suppression stops a repeat before another producer turn", ctx do
@@ -659,8 +677,7 @@ defmodule Tightbeam.RailRemedyTest do
   end
 
   test "live episode re-wakes with a fresh occurrence-plus-counter key", ctx do
-    work_item = work_item(ctx, "Rail re-wake carrier")
-    assignment = assignment(ctx, "rewake", work_item.id)
+    assignment = assignment(ctx, "rewake")
     load_review_gate(ctx)
     reviewer_key = ctx.reviewer.session_key
 
@@ -695,37 +712,6 @@ defmodule Tightbeam.RailRemedyTest do
                """,
                []
              )
-
-    second_key = "rail-rewake:completion-needs-review:#{assignment.id}:1:2"
-
-    assert %{session_key: second_wake_id} =
-             Idempotency.get(ctx.db, "remedy:completion-needs-review", "wake", second_key)
-
-    assert %{assignment_id: assignment_id} = second_wake = Wakes.get(ctx.db, second_wake_id)
-    assert assignment_id == assignment.id
-
-    assert {:ok, {:appended, ^reviewer_key, _message, _opts}} =
-             DB.transaction(ctx.db, fn txn ->
-               Gateway.deliver_prompt_in_txn(
-                 txn,
-                 second_wake.session_key,
-                 second_wake.origin,
-                 second_wake.prompt,
-                 wake_id: second_wake.wake_id,
-                 sender: second_wake.origin,
-                 target_gate: second_wake,
-                 fire_wake_in_txn: true
-               )
-             end)
-
-    assert {:ok, [[^assignment_id, job_ref]]} =
-             DB.query(
-               ctx.db,
-               "SELECT assignmentId, jobRef FROM turns WHERE wakeId = ?1",
-               [second_wake_id]
-             )
-
-    assert job_ref == work_item.id
   end
 
   test "foreign linked verdict keeps the re-wake on the pending review holder", ctx do
@@ -1258,12 +1244,7 @@ defmodule Tightbeam.RailRemedyTest do
     """
   end
 
-  defp assignment(ctx, subject, work_item_id \\ nil) do
-    params = %{subject: subject, idempotency_key: nil}
-
-    params =
-      if is_binary(work_item_id), do: Map.put(params, :work_item_id, work_item_id), else: params
-
+  defp assignment(ctx, subject) do
     Assignments.__handle__(ctx.db, "assign", %{
       verb: "assign",
       origin: "user:flynn",
@@ -1272,17 +1253,7 @@ defmodule Tightbeam.RailRemedyTest do
       target_role: nil,
       role_fallback: false,
       supervision_interval_ms: 1_000,
-      params: params
-    })
-  end
-
-  defp work_item(ctx, title) do
-    WorkItems.__handle__(ctx.db, "work-item-create", %{
-      verb: "work-item-create",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
-      session_key: nil,
-      params: %{title: title}
+      params: %{subject: subject, idempotency_key: nil}
     })
   end
 

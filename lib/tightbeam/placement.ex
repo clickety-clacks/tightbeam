@@ -6,7 +6,8 @@ defmodule Tightbeam.Placement do
 
   Hosts are DB ROWS behind the org's DB owner — the serialization seam — written
   by `assimilate` through `register_host/3` and read back as name =>
-  %{ssh: destination-or-nil, base_dir: path, cli_bin: path-or-nil}
+  %{ssh: destination-or-nil, base_dir: path, cli_bin: path-or-nil,
+  toolchain_dirs: ordered-paths-when-configured}
   (host-registry-v1). `gateway.json` stays a FILE — the CLI reads it
   before any DB exists. The gateway's own machine is under its
   REAL hostname (`local_host_name/0`; ssh: nil) — never under an indexical
@@ -69,18 +70,7 @@ defmodule Tightbeam.Placement do
 
   require Logger
 
-  alias Tightbeam.{
-    AdminProjection,
-    Archetypes,
-    DB,
-    Harness,
-    Homes,
-    Identity,
-    Org,
-    Rails,
-    StateResources
-  }
-
+  alias Tightbeam.{Archetypes, DB, Harness, HarnessHealth, Homes, Identity, Org, Rails}
   import Bitwise
 
   defmodule Refusal do
@@ -102,7 +92,8 @@ defmodule Tightbeam.Placement do
   @type host_config :: %{
           required(:ssh) => String.t() | nil,
           required(:base_dir) => String.t(),
-          optional(:cli_bin) => String.t() | nil
+          optional(:cli_bin) => String.t() | nil,
+          optional(:toolchain_dirs) => [String.t()]
         }
 
   @typedoc "Adapter key. The reserved identity `shared` is the one runtime per harness+host."
@@ -130,6 +121,19 @@ defmodule Tightbeam.Placement do
   )
   """
 
+  @host_toolchain_dirs_ddl """
+  CREATE TABLE IF NOT EXISTS host_toolchain_dirs (
+    host     TEXT NOT NULL,
+    position INTEGER NOT NULL CHECK (position >= 0),
+    dir      TEXT NOT NULL,
+    setBy    TEXT NOT NULL,
+    setAt    INTEGER NOT NULL,
+    PRIMARY KEY (host, position)
+  )
+  """
+
+  @posix_path ["/usr/local/bin", "/usr/bin", "/bin"]
+
   @env_name ~r/^[A-Z_][A-Z0-9_]*$/
 
   @doc "Create the placement schema."
@@ -137,7 +141,7 @@ defmodule Tightbeam.Placement do
   def ensure_schema(db \\ DB) do
     with :ok <- DB.execute(db, @hosts_ddl),
          :ok <- DB.execute(db, @harness_env_overlays_ddl),
-         do: AdminProjection.ensure_storage(db)
+         do: DB.execute(db, @host_toolchain_dirs_ddl)
   end
 
   @doc """
@@ -157,9 +161,20 @@ defmodule Tightbeam.Placement do
   """
   @spec hosts(String.t(), DB.server()) :: %{optional(String.t()) => host_config()}
   def hosts(base_dir, db \\ DB) do
-    db
-    |> registered_hosts()
-    |> Map.put(local_host_name(), %{ssh: nil, base_dir: base_dir, cli_bin: nil})
+    configured =
+      db
+      |> registered_hosts()
+      |> Map.put(local_host_name(), %{ssh: nil, base_dir: base_dir, cli_bin: nil})
+
+    Enum.reduce(registered_toolchain_dirs(db), configured, fn {host, dirs}, acc ->
+      case Map.fetch(acc, host) do
+        {:ok, host_config} ->
+          Map.put(acc, host, Map.put(host_config, :toolchain_dirs, dirs))
+
+        :error ->
+          raise "host toolchain registry contains rows for unknown host: #{host}"
+      end
+    end)
   end
 
   # Placement's own callers hand it the gateway config, which carries both the
@@ -233,79 +248,6 @@ defmodule Tightbeam.Placement do
     end
   end
 
-  @doc false
-  def set_env_overlay_with_firehose(db, host, harness, name, value, set_by, call) do
-    with :ok <- valid_env_name(name),
-         {:ok, _module} <- known_harness(harness),
-         :ok <- unreserved_env_name(name) do
-      updated_at = System.system_time(:millisecond)
-
-      case DB.transaction(db, fn txn ->
-             if known_host_in_txn?(txn, host) do
-               DB.Txn.q(
-                 txn,
-                 """
-                 INSERT INTO harness_env_overlays (host, harness, name, value, setBy, setAt)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT(host, harness, name) DO UPDATE SET
-                   value = excluded.value,
-                   setBy = excluded.setBy,
-                   setAt = excluded.setAt
-                 WHERE harness_env_overlays.value != excluded.value
-                 """,
-                 [host, harness, name, value, set_by, updated_at]
-               )
-
-               changed = DB.Txn.changes(txn) == 1
-               Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
-
-               if changed do
-                 row_version =
-                   AdminProjection.allocate_in_txn(
-                     txn,
-                     "host environment",
-                     [host, harness, name],
-                     updated_at
-                   )
-
-                 DB.Txn.q(
-                   txn,
-                   """
-                   INSERT INTO host_environment_projection
-                     (host, harness, name, valuePresent, updatedAt, rowVersion)
-                   VALUES (?1, ?2, ?3, 1, ?4, ?5)
-                   ON CONFLICT(host, harness, name) DO UPDATE SET
-                     valuePresent = 1, updatedAt = excluded.updatedAt,
-                     rowVersion = excluded.rowVersion
-                   """,
-                   [host, harness, name, updated_at, row_version]
-                 )
-
-                 projection = StateResources.query_host_environment(txn, host, harness, name)
-
-                 Tightbeam.Firehose.Publisher.committed_in_txn(
-                   txn,
-                   "host_env.updated",
-                   projection,
-                   %{"host" => host, "harness" => harness, "name" => name}
-                 )
-               end
-
-               %{
-                 projection: StateResources.query_host_environment(txn, host, harness, name),
-                 changed: changed
-               }
-             else
-               denial = unknown_host_denial(host, harness)
-               {:error, %{denial | message: "unknown_host rule: " <> denial.message}}
-             end
-           end) do
-        {:ok, result} -> result
-        {:error, error} -> raise error
-      end
-    end
-  end
-
   @doc "List stored overlay rows, optionally filtered by exact host and harness."
   @spec env_overlays(DB.server(), String.t() | nil, String.t() | nil) :: [map()]
   def env_overlays(db, host \\ nil, harness \\ nil) do
@@ -354,59 +296,38 @@ defmodule Tightbeam.Placement do
     %{host: host, harness: harness, name: name, removed: removed}
   end
 
-  @doc false
-  def unset_env_overlay_with_firehose(db, host, harness, name, call) do
-    {:ok, result} =
-      DB.transaction(db, fn txn ->
-        DB.Txn.q(
-          txn,
-          "DELETE FROM harness_env_overlays WHERE host = ?1 AND harness = ?2 AND name = ?3",
-          [host, harness, name]
-        )
+  @doc "Replace one host's ordered toolchain directories in the host registry."
+  @spec set_toolchain_dirs(DB.server(), String.t(), [String.t()], String.t()) ::
+          {:ok, map()} | {:error, map()}
+  def set_toolchain_dirs(db, host, dirs, set_by) when is_list(dirs) do
+    set_at = System.system_time(:millisecond)
 
-        changed = DB.Txn.changes(txn) == 1
-        Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
+    case DB.transaction(db, fn txn ->
+           if known_host_in_txn?(txn, host) do
+             DB.Txn.q(txn, "DELETE FROM host_toolchain_dirs WHERE host = ?1", [host])
 
-        if changed do
-          updated_at = System.system_time(:millisecond)
+             dirs
+             |> Enum.with_index()
+             |> Enum.each(fn {dir, position} ->
+               DB.Txn.q(
+                 txn,
+                 """
+                 INSERT INTO host_toolchain_dirs (host, position, dir, setBy, setAt)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 """,
+                 [host, position, dir, set_by, set_at]
+               )
+             end)
 
-          row_version =
-            AdminProjection.allocate_in_txn(
-              txn,
-              "host environment",
-              [host, harness, name],
-              updated_at
-            )
-
-          DB.Txn.q(
-            txn,
-            """
-            INSERT INTO host_environment_projection
-              (host, harness, name, valuePresent, updatedAt, rowVersion)
-            VALUES (?1, ?2, ?3, 0, ?4, ?5)
-            ON CONFLICT(host, harness, name) DO UPDATE SET
-              valuePresent = 0, updatedAt = excluded.updatedAt,
-              rowVersion = excluded.rowVersion
-            """,
-            [host, harness, name, updated_at, row_version]
-          )
-
-          item = StateResources.query_host_environment(txn, host, harness, name)
-
-          Tightbeam.Firehose.Publisher.committed_in_txn(
-            txn,
-            "host_env.updated",
-            item,
-            %{"host" => host, "harness" => harness, "name" => name}
-          )
-        end
-
-        projection = StateResources.query_host_environment(txn, host, harness, name)
-
-        %{projection: projection, changed: changed}
-      end)
-
-    result
+             {:ok, %{host: host, dirs: dirs, set_by: set_by, set_at: set_at}}
+           else
+             denial = unknown_host_denial(host)
+             {:error, %{denial | message: "unknown_host rule: " <> denial.message}}
+           end
+         end) do
+      {:ok, result} -> result
+      {:error, error} -> raise error
+    end
   end
 
   @doc """
@@ -645,66 +566,11 @@ defmodule Tightbeam.Placement do
     # first, so there is no window to lose a concurrent registration in.
     {:ok, :ok} =
       DB.transaction(db, fn txn ->
-        new_public_identity? = DB.Txn.q(txn, "SELECT 1 FROM hosts WHERE name = ?1", [name]) == []
         upsert_host_in_txn(txn, name, entry)
-
-        if new_public_identity? do
-          AdminProjection.allocate_in_txn(
-            txn,
-            "hosts",
-            name,
-            System.system_time(:millisecond)
-          )
-        end
-
         :ok
       end)
 
     {:ok, entry}
-  end
-
-  @doc false
-  def register_host_with_firehose(db, name, config, call) do
-    entry = %{
-      ssh: Map.fetch!(config, :ssh),
-      base_dir: Map.fetch!(config, :base_dir),
-      cli_bin: Map.get(config, :cli_bin),
-      adapter_bin_dir: Map.get(config, :adapter_bin_dir)
-    }
-
-    {:ok, result} =
-      DB.transaction(db, fn txn ->
-        new_public_identity? = DB.Txn.q(txn, "SELECT 1 FROM hosts WHERE name = ?1", [name]) == []
-        upsert_host_in_txn(txn, name, entry)
-        Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
-
-        projection =
-          if new_public_identity? do
-            AdminProjection.allocate_in_txn(
-              txn,
-              "hosts",
-              name,
-              System.system_time(:millisecond)
-            )
-
-            item = StateResources.query_host(txn, name)
-
-            Tightbeam.Firehose.Publisher.committed_in_txn(
-              txn,
-              "host.registered",
-              item,
-              %{"host" => name}
-            )
-
-            item
-          else
-            StateResources.query_host(txn, name)
-          end
-
-        %{entry: entry, projection: projection, changed: new_public_identity?}
-      end)
-
-    {:ok, result}
   end
 
   @doc """
@@ -989,6 +855,16 @@ defmodule Tightbeam.Placement do
     end)
   end
 
+  defp registered_toolchain_dirs(db) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT host, dir FROM host_toolchain_dirs ORDER BY host, position"
+      )
+
+    Enum.group_by(rows, fn [host, _dir] -> host end, fn [_host, dir] -> dir end)
+  end
+
   @doc "Ensure a session workdir and its converged credential file."
   @spec ensure_workdir(host_config(), String.t(), String.t(), keyword()) :: :ok
   def ensure_workdir(%{ssh: nil}, path, content, _opts) do
@@ -1269,6 +1145,7 @@ defmodule Tightbeam.Placement do
 
     host_config = Map.fetch!(hosts_for(config), host)
     sh = Map.get(config, :sh, &system_cmd/1)
+    ensure_toolchain_dirs!(host, host_config, sh)
 
     target = %{
       base_dir: config.base_dir,
@@ -1294,13 +1171,15 @@ defmodule Tightbeam.Placement do
       |> env_overlays(host, module.wire_name())
       |> Enum.map(&{&1.name, &1.value})
 
+    path = adapter_path(config, host_config)
+
     common_env =
       [
         {"TIGHTBEAM_HOME", config.base_dir},
         {"TIGHTBEAM_MACHINE", host},
-        {"PATH", config.cli_bin <> ":" <> (System.get_env("PATH") || "")},
+        {"PATH", path},
         {"TIGHTBEAM_LINEAGE", lineage}
-      ] ++ overlay_env
+      ] ++ github_env(config.base_dir) ++ overlay_env
 
     remote_env =
       if host_config.ssh do
@@ -1308,8 +1187,14 @@ defmodule Tightbeam.Placement do
           "TIGHTBEAM_HOME=#{host_config.base_dir}",
           "TIGHTBEAM_MACHINE=#{host}",
           "TIGHTBEAM_URL=#{Application.fetch_env!(:tightbeam, :advertised_url)}",
-          "PATH=#{host_config[:cli_bin] || ""}:$PATH",
-          "TIGHTBEAM_LINEAGE=#{lineage}"
+          "PATH=#{path}",
+          "TIGHTBEAM_LINEAGE=#{lineage}",
+          # Unconditional on satellites: existence of the banked dir cannot be
+          # checked cheaply over ssh, and pointing gh at an absent dir yields
+          # the correct answer anyway (needs_onboarding on the satellite's own
+          # store), where inheriting the remote user's keyring would repeat the
+          # local trap: live from a terminal, unreadable from project work.
+          "GH_CONFIG_DIR=#{Tightbeam.Harness.Support.shell_quote(Tightbeam.GithubAuth.config_dir(host_config.base_dir))}"
         ] ++
           Enum.map(overlay_env, fn {name, value} ->
             "#{name}=#{Tightbeam.Harness.Support.shell_quote(value)}"
@@ -1339,12 +1224,73 @@ defmodule Tightbeam.Placement do
       process_ssh: host_config.ssh,
       process_identity_dir: host_config.base_dir,
       process_helper: Path.join(host_config[:cli_bin] || config.cli_bin, "tightbeam"),
-      on_auth_event: auth_event_handler(host, module),
+      on_auth_event: auth_event_handler(config, host, module),
       on_subagent_event: subagent_event_handler(config, host, module),
       env: []
     ]
     |> Keyword.merge(plan)
   end
+
+  @doc "Preview the exact PATH an adapter on a configured host will receive."
+  @spec toolchain_path_preview(map(), String.t()) :: String.t()
+  def toolchain_path_preview(config, host) do
+    config
+    |> hosts_for()
+    |> Map.fetch!(host)
+    |> then(&adapter_path(config, &1))
+  end
+
+  defp adapter_path(config, %{ssh: ssh} = host_config) do
+    case Map.fetch(host_config, :toolchain_dirs) do
+      {:ok, dirs} ->
+        cli_bin = if ssh, do: host_config[:cli_bin], else: config.cli_bin
+
+        [cli_bin | dirs ++ @posix_path]
+        |> Enum.reject(&(&1 in [nil, ""]))
+        |> Enum.join(":")
+
+      :error when is_nil(ssh) ->
+        config.cli_bin <> ":" <> (System.get_env("PATH") || "")
+
+      :error ->
+        "#{host_config[:cli_bin] || ""}:$PATH"
+    end
+  end
+
+  defp ensure_toolchain_dirs!(_host, host_config, _sh)
+       when not is_map_key(host_config, :toolchain_dirs), do: :ok
+
+  defp ensure_toolchain_dirs!(host, %{ssh: nil, toolchain_dirs: dirs}, _sh) do
+    Enum.each(dirs, fn dir ->
+      unless File.dir?(dir) do
+        raise "host #{host} toolchain directory is unavailable at adapter start: #{dir}"
+      end
+    end)
+  end
+
+  defp ensure_toolchain_dirs!(host, %{ssh: destination, toolchain_dirs: dirs}, sh) do
+    Enum.each(dirs, fn dir ->
+      case sh.(["ssh" | @ssh_opts] ++ [destination, "test", "-d", dir]) do
+        {_output, 0} ->
+          :ok
+
+        {_output, exit} ->
+          raise "host #{host} toolchain directory is unavailable at adapter start (exit #{exit}): #{dir}"
+      end
+    end)
+  end
+
+  # The GitHub host capability reaches agents as a path, never as token bytes:
+  # `tightbeam onboard github` banks a file-backed gh credential under the base
+  # dir, and GH_CONFIG_DIR points gh (and git, through gh's credential helper)
+  # at it. The OS login keychain is not an alternative here — agent processes
+  # descend from the gateway daemon, and that context cannot read it
+  # (errSecInteractionNotAllowed), so a keyring credential probes live from an
+  # operator terminal while failing everywhere project work actually runs.
+  # Unconditional, banked or not: pointing gh at an absent dir yields the
+  # honest answer (needs_onboarding) where ambient fallback would let a store
+  # agents cannot reach answer "live".
+  defp github_env(base_dir), do: Tightbeam.GithubAuth.env(base_dir)
 
   @doc """
   Capture same-tier adapter boot inputs in the higher-tier coordinator.
@@ -1445,15 +1391,36 @@ defmodule Tightbeam.Placement do
     })
   end
 
-  defp auth_event_handler(host, module) do
+  defp auth_event_handler(config, host, module) do
+    db = Map.get(config, :db, DB)
+
     fn classification, event ->
       if classification == :terminal do
         Task.Supervisor.start_child(Tightbeam.TurnTaskSupervisor, fn ->
-          case Tightbeam.Credentials.mark_terminal(
-                 module.credential_provider(),
-                 event,
-                 Tightbeam.Credentials.server(host)
-               ) do
+          try do
+            HarnessHealth.observe_provider_invalidation(db, module.id(), host, event,
+              principal: "process:tightbeam/provider:#{module.credential_provider()}"
+            )
+          rescue
+            error ->
+              Logger.error(
+                "harness auth incident record failed for #{module.id()} on #{host}: " <>
+                  Exception.format(:error, error, __STACKTRACE__)
+              )
+          end
+
+          mark_result =
+            try do
+              Tightbeam.Credentials.mark_terminal(
+                module.credential_provider(),
+                event,
+                Tightbeam.Credentials.server(host)
+              )
+            catch
+              :exit, reason -> {:error, {:credential_owner_exit, reason}}
+            end
+
+          case mark_result do
             :ok ->
               :ok
 

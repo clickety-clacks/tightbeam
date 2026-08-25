@@ -12,9 +12,8 @@ defmodule Tightbeam.Devices do
   gateway-owned; prefix `tbt_`).
   """
 
-  alias Tightbeam.{AdminProjection, DB, StateResources}
+  alias Tightbeam.DB
   alias Tightbeam.DB.Txn
-  alias Tightbeam.Firehose.Publisher
 
   @type db :: GenServer.server()
 
@@ -61,10 +60,6 @@ defmodule Tightbeam.Devices do
     model       TEXT,
     createdAt   INTEGER NOT NULL
   );
-  CREATE TABLE IF NOT EXISTS device_versions (
-    deviceId   TEXT PRIMARY KEY REFERENCES devices(deviceId),
-    rowVersion INTEGER NOT NULL
-  );
   CREATE TRIGGER IF NOT EXISTS users_gateway_owned_insert
   BEFORE INSERT ON users
   WHEN NEW.creationKind = 'legacy'
@@ -74,9 +69,7 @@ defmodule Tightbeam.Devices do
   """
 
   @spec ensure_schema(db()) :: :ok | {:error, term()}
-  def ensure_schema(db \\ Tightbeam.DB) do
-    with :ok <- DB.execute(db, @ddl), do: AdminProjection.ensure_storage(db)
-  end
+  def ensure_schema(db \\ Tightbeam.DB), do: DB.execute(db, @ddl)
 
   @doc """
   Pair a device. Semantics (devices.ts `pair`) — all in ONE transaction:
@@ -112,14 +105,10 @@ defmodule Tightbeam.Devices do
             {:pending, device}
 
           %{status: "allowlisted"} ->
-            updated_at = now()
-
             Txn.q(txn, "UPDATE devices SET token = ?2 WHERE deviceId = ?1", [
               device_id,
               mint_token()
             ])
-
-            stamp_device_in_txn(txn, device_id, updated_at)
 
             {:paired, must_get(txn, device_id)}
         end
@@ -172,28 +161,7 @@ defmodule Tightbeam.Devices do
         [device_id, user_id, mint_token()]
       )
 
-      stamp_device_in_txn(txn, device_id, now())
-
       must_get(txn, device_id)
-    end)
-  end
-
-  @doc false
-  def approve_with_firehose(db, device_id, user_id, call) do
-    transaction!(db, fn txn ->
-      must_get(txn, device_id)
-      if user_id, do: ensure_user_in_txn(txn, user_id)
-
-      Txn.q(
-        txn,
-        "UPDATE devices SET status = 'allowlisted', userId = COALESCE(?2, userId), token = ?3 WHERE deviceId = ?1",
-        [device_id, user_id, mint_token()]
-      )
-
-      stamp_device_in_txn(txn, device_id, now())
-      device = firehose_device_in_txn(txn, device_id)
-      Publisher.maybe_accepted_in_txn(txn, call, %{device: device})
-      device
     end)
   end
 
@@ -207,25 +175,6 @@ defmodule Tightbeam.Devices do
         device_id
       ])
 
-      stamp_device_in_txn(txn, device_id, now())
-
-      :ok
-    end)
-  end
-
-  @doc false
-  def deny_with_firehose(db, device_id, call) do
-    transaction!(db, fn txn ->
-      must_get(txn, device_id)
-
-      Txn.q(txn, "UPDATE devices SET status = 'denied', token = NULL WHERE deviceId = ?1", [
-        device_id
-      ])
-
-      stamp_device_in_txn(txn, device_id, now())
-
-      Publisher.maybe_accepted_in_txn(txn, call, %{device: firehose_device_in_txn(txn, device_id)})
-
       :ok
     end)
   end
@@ -236,31 +185,8 @@ defmodule Tightbeam.Devices do
     transaction!(db, fn txn ->
       must_get(txn, device_id)
       Txn.q(txn, "UPDATE devices SET token = NULL WHERE deviceId = ?1", [device_id])
-      stamp_device_in_txn(txn, device_id, now())
       :ok
     end)
-  end
-
-  @doc false
-  def revoke_with_firehose(db, device_id, call) do
-    transaction!(db, fn txn ->
-      must_get(txn, device_id)
-      Txn.q(txn, "UPDATE devices SET token = NULL WHERE deviceId = ?1", [device_id])
-      stamp_device_in_txn(txn, device_id, now())
-
-      Publisher.maybe_accepted_in_txn(txn, call, %{device: firehose_device_in_txn(txn, device_id)})
-
-      :ok
-    end)
-  end
-
-  @doc "Monotonic public version for a device row."
-  @spec version(db(), String.t()) :: integer() | nil
-  def version(db \\ Tightbeam.DB, device_id) do
-    case DB.query(db, "SELECT rowVersion FROM device_versions WHERE deviceId = ?1", [device_id]) do
-      {:ok, [[version]]} -> version
-      {:ok, []} -> nil
-    end
   end
 
   @doc "User row by id, or nil."
@@ -288,36 +214,6 @@ defmodule Tightbeam.Devices do
       insert_user_in_txn(txn, user_id, is_admin)
 
       must_get_user(txn, user_id)
-    end)
-  end
-
-  @doc false
-  def add_user_with_firehose(db, user_id, is_admin, call) do
-    transaction!(db, fn txn ->
-      insert_user_in_txn(txn, user_id, is_admin)
-      user = StateResources.query_user(txn, user_id)
-      Publisher.maybe_accepted_in_txn(txn, call, %{user: user})
-      user
-    end)
-  end
-
-  @doc false
-  def promote_user_with_firehose(db, user_id, call) do
-    transaction!(db, fn txn ->
-      user = must_get_user(txn, user_id)
-
-      if user.is_admin do
-        Publisher.maybe_observed_accepted_in_txn(txn, call)
-        %{user: StateResources.query_user(txn, user_id), changed: false}
-      else
-        Txn.q(txn, "UPDATE users SET isAdmin = 1 WHERE userId = ?1 AND isAdmin = 0", [user_id])
-        updated_at = System.system_time(:millisecond)
-        AdminProjection.allocate_in_txn(txn, "users", user_id, updated_at)
-        projection = StateResources.query_user(txn, user_id)
-        Publisher.maybe_observed_accepted_in_txn(txn, call)
-        Publisher.committed_in_txn(txn, "user.promoted", projection, %{"userId" => user_id})
-        %{user: projection, changed: true}
-      end
     end)
   end
 
@@ -420,7 +316,6 @@ defmodule Tightbeam.Devices do
       ]
     )
 
-    stamp_device_in_txn(txn, Map.fetch!(input, :device_id), created_at)
     must_get(txn, Map.fetch!(input, :device_id))
   end
 
@@ -431,29 +326,8 @@ defmodule Tightbeam.Devices do
     end
   end
 
-  defp firehose_device_in_txn(txn, device_id) do
-    device = must_get(txn, device_id)
-
-    [[row_version]] =
-      Txn.q(txn, "SELECT rowVersion FROM device_versions WHERE deviceId = ?1", [device_id])
-
-    Map.put(device, :row_version, row_version)
-  end
-
   defp one_device_or_nil([row]), do: to_device(row)
   defp one_device_or_nil([]), do: nil
-
-  defp stamp_device_in_txn(txn, device_id, proposed) do
-    Txn.q(
-      txn,
-      """
-      INSERT INTO device_versions (deviceId, rowVersion) VALUES (?1, ?2)
-      ON CONFLICT(deviceId) DO UPDATE
-      SET rowVersion = MAX(excluded.rowVersion, device_versions.rowVersion + 1)
-      """,
-      [device_id, proposed]
-    )
-  end
 
   defp to_device([
          device_id,
@@ -510,7 +384,7 @@ defmodule Tightbeam.Devices do
       [user_id, if(requested_admin, do: 1, else: 0), creation_kind, created_at]
     )
 
-    AdminProjection.allocate_in_txn(txn, "users", user_id, created_at)
+    :ok
   end
 
   defp must_get_user(txn, user_id) do

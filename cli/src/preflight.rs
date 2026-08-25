@@ -24,7 +24,7 @@ const ABSENT_BASE_DIR: &str = "ABSENT";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Kind {
-    /// Required to install and run Tightbeam's own plumbing on the satellite.
+    /// Required to install and run Tight Beam's own plumbing on the satellite.
     Runtime,
     /// The vendor CLI a named harness invokes directly. Never installed by us.
     HarnessCli(String),
@@ -179,13 +179,13 @@ pub fn on_path(binary: &str, search_path: &str) -> Option<PathBuf> {
 /// An onboarding ceremony runs where the operator is, so the PATH that matters is this
 /// process's rather than a non-interactive ssh session's -- but the rest of the prose is
 /// deliberately the satellite wording. An operator who has read one of these should
-/// recognise the other, and both refusals are about the same boundary: Tightbeam
+/// recognise the other, and both refusals are about the same boundary: Tight Beam
 /// installs its own plumbing, never the vendors' software.
 pub fn missing_harness_cli(binary: &str, harness: &str, host: &str, search_path: &str) -> String {
     format!(
         "{binary} is missing on {host}: it is not on this shell's PATH. It is the CLI \
          harness {harness} invokes directly, and onboarding {harness} on this host \
-         presupposes it -- Tightbeam installs its own plumbing (adapters, CLI, base dir) \
+         presupposes it -- Tight Beam installs its own plumbing (adapters, CLI, base dir) \
          and never the vendors' software. Install {binary} on {host} and re-run.\n\
          PATH searched: {search_path}"
     )
@@ -213,7 +213,7 @@ pub fn verdict(
     // tripped over buys itself another round trip.
     let header = format!(
         "satellite {ssh_dest} is missing {} {}, yours to install rather than \
-         assimilation's -- Tightbeam installs its own plumbing on a satellite \
+         assimilation's -- Tight Beam installs its own plumbing on a satellite \
          (adapters, CLI, base dir) and never the vendors' software. What counts is the \
          PATH a non-interactive ssh session sees; a tool reachable only from a login \
          shell profile does not. Install on {ssh_dest} and re-run:",
@@ -227,7 +227,7 @@ pub fn verdict(
     Err(std::iter::once(header)
         .chain(missing.iter().map(|requirement| match &requirement.kind {
             Kind::Runtime => format!(
-                "  {} -- needed to install and run Tightbeam's plumbing there",
+                "  {} -- needed to install and run Tight Beam's plumbing there",
                 requirement.binary
             ),
             Kind::HarnessCli(harness) => format!(

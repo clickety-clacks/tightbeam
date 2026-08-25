@@ -1,6 +1,6 @@
 # Assimilation runbook — bringing a satellite into an org
 
-The golden path for turning a reachable machine into a Tightbeam satellite, and
+The golden path for turning a reachable machine into a Tight Beam satellite, and
 proving it worked. This **replaces** the manual host-declaration procedure as the
 tested path: `docs/SATELLITE.md` remains the conceptual reference for what a
 satellite *is* and what its operator must do by hand, and this runbook is what you
@@ -17,13 +17,13 @@ This is a product runbook; it names no machines. Pick a target that satisfies al
 of:
 
 1. **Reachable non-interactively over ssh from the gateway host.** `ssh <dest> true`
-   exits 0 with no prompt. You bring the keys; Tightbeam never creates them.
+   exits 0 with no prompt. You bring the keys; Tight Beam never creates them.
 2. **Has `node`, `npm`, and `rsync`** on a PATH the ssh session sees. A
    non-login shell is what assimilation gets — a tool installed only by `.bashrc`
    is not installed.
 2b. **Has the harness CLI of every harness you intend to enable** — `claude`,
    `codex` — on that same non-login PATH. These are an operator prerequisite,
-   not something assimilation provides: Tightbeam installs its own plumbing on
+   not something assimilation provides: Tight Beam installs its own plumbing on
    a satellite, never the vendors' software. Onboarding and turns invoke these
    binaries directly; the ACP adapters wrap them and cannot substitute.
    Assimilation probes for them and refuses a host that is missing one, naming
@@ -128,7 +128,7 @@ installing. It was removed in `8c0dfa0`; assimilate is the only route.
 
 ## 4. Credentials — onboarded ON the satellite, never transported
 
-Run Tightbeam onboarding independently on the satellite, once per harness that
+Run Tight Beam onboarding independently on the satellite, once per harness that
 will run there:
 
 ```

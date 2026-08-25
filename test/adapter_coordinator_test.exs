@@ -956,7 +956,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     :ok =
       DB.execute(
         db,
-        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 0, 'admin_add', 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn',0,'admin_add',1)"
       )
 
     session_key = "agent:main:clawline:flynn:main"

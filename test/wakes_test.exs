@@ -52,6 +52,18 @@ defmodule Tightbeam.WakesTest do
     assert Wakes.get(db, wake.wake_id).state == "pending"
 
     refute public_cancel(db, wake.wake_id, "agent:b")
+    assert cancellation_event_count(db, wake.wake_id) == 0
+
+    :ok =
+      EventLog.append_event(
+        db,
+        "denied",
+        "wake",
+        "agent:seed",
+        nil,
+        %{seed: true},
+        {:process, "tightbeam"}
+      )
 
     assert {:accepted_in_txn, event_id, %{canceled: true}} =
              public_cancel(db, wake.wake_id, "agent:a")
@@ -69,8 +81,53 @@ defmodule Tightbeam.WakesTest do
              )
 
     assert causal_source_id == Integer.to_string(event_id)
+
+    assert {:ok, [[carrier_rowid]]} =
+             DB.query(db, "SELECT rowid FROM wake_cancellations WHERE wakeId=?1", [wake.wake_id])
+
+    refute carrier_rowid == event_id,
+           "the returned identity must be the EventLog id, not the later carrier rowid"
+
+    assert cancellation_event_count(db, wake.wake_id) == 1
     assert Wakes.get(db, wake.wake_id).state == "canceled"
     refute public_cancel(db, wake.wake_id, "agent:a")
+    assert cancellation_event_count(db, wake.wake_id) == 1
+  end
+
+  test "public cancellation event, carrier, and CAS share one rollback boundary", %{db: db} do
+    wake =
+      Wakes.schedule(db, %{
+        session_key: "rollback-session",
+        origin: "agent:rollback",
+        prompt: "roll every cancellation row back",
+        due_at: 1
+      })
+
+    command =
+      public_cancel_command(
+        wake.wake_id,
+        "agent:rollback",
+        %{kind: "session", id: "rollback-session"}
+      )
+
+    assert {:error, %RuntimeError{message: "force public cancellation rollback"}} =
+             DB.transaction(db, fn txn ->
+               assert {:accepted_in_txn, event_id, %{canceled: true}} =
+                        Wakes.cancel_in_txn(txn, command)
+
+               assert event_id > 0
+               assert [[1]] = Txn.q(txn, "SELECT COUNT(*) FROM events")
+               assert [[1]] = Txn.q(txn, "SELECT COUNT(*) FROM wake_cancellations")
+
+               assert [["canceled"]] =
+                        Txn.q(txn, "SELECT state FROM wakes WHERE wakeId=?1", [wake.wake_id])
+
+               raise "force public cancellation rollback"
+             end)
+
+    assert cancellation_event_count(db, wake.wake_id) == 0
+    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM wake_cancellations")
+    assert Wakes.get(db, wake.wake_id).state == "pending"
   end
 
   test "typed cancellation validates the closed process matrix and preserves first provenance", %{
@@ -189,19 +246,13 @@ defmodule Tightbeam.WakesTest do
         """
         INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 1, 'admin_add', 1);
         INSERT INTO sessions
-          (sessionKey, displayName, kind, isBuiltIn, ownerUserId, origin,
-           operationalParent, archetype, harness,
+          (sessionKey, displayName, ownerUserId, origin, archetype, harness,
            provider, model, host, state, createdAt, updatedAt)
         VALUES
-          ('agent:main:clawline:flynn:main', 'Main', 'main', 1, 'flynn', 'user:flynn',
-           'agent:main:clawline:flynn:main', 'default', 'claude',
+          ('retiring', 'retiring', 'flynn', 'user:flynn', 'default', 'claude',
            'anthropic', 'fable', 'eezo', 'active', 1, 1),
-          ('retiring', 'retiring', 'custom', 0, 'flynn', 'user:flynn',
-           'agent:main:clawline:flynn:main', 'default', 'claude',
-           'anthropic', 'fable', 'eezo', 'active', 1, 1),
-          ('replacement', 'replacement', 'custom', 0, 'flynn', 'user:flynn',
-           'agent:main:clawline:flynn:main', 'default', 'claude', 'anthropic',
-           'fable', 'eezo', 'active', 1, 1);
+          ('replacement', 'replacement', 'flynn', 'user:flynn', 'default',
+           'claude', 'anthropic', 'fable', 'eezo', 'active', 1, 1);
         INSERT INTO work_items
           (id, title, ownerUserId, state, createdByUser, createdAt)
         VALUES ('wi_retarget', 'Retarget work', 'flynn', 'open', 'flynn', 1);
@@ -324,164 +375,6 @@ defmodule Tightbeam.WakesTest do
 
     assert states[original.wake_id] == {"settled", 2}
     assert states[replacement.wake_id] == {"pending", 2}
-  end
-
-  test "O1: retarget carries the sender's class election AND the original ceiling verbatim — never restarts it",
-       %{db: db} do
-    active_sessions!(db, ["a", "b"])
-
-    original =
-      Wakes.schedule(db, %{
-        session_key: "a",
-        origin: "agent:sender",
-        creator_session_key: "agent:sender",
-        prompt: "fyi note",
-        due_at: 0,
-        class: "fyi"
-      })
-
-    assert original.class == "fyi"
-    assert original.class_election == "sender"
-    assert original.delivery_rule == Wakes.digest_rule()
-    refute original.digest
-    refute original.summon
-
-    # Backdate the original's filing time deep into its own ceiling window —
-    # 3h59m into a 4h `fyi` ceiling — so a restarted ceiling (retarget-moment
-    # + ceiling_ms) is provably DIFFERENT from the preserved one, not a
-    # coincidental match (Sol xhigh review round 2, finding 1: Invariant 3 —
-    # the ceiling anchors on the wake's own creation, never on when it
-    # happened to get retargeted; recomputing it here would let this `fyi`
-    # land at 7h59m, a straight §7 violation).
-    ceiling = Wakes.delivery_policy("fyi").ceiling_ms
-    original_created_at = 1000
-    original_due_at = original_created_at + ceiling - 60_000
-
-    {:ok, _} =
-      DB.query(db, "UPDATE wakes SET createdAt=?2, dueAt=?3 WHERE wakeId=?1", [
-        original.wake_id,
-        original_created_at,
-        original_due_at
-      ])
-
-    original = Wakes.get(db, original.wake_id)
-
-    assert {:ok, replacement} =
-             DB.transaction(db, fn txn ->
-               Wakes.retarget_in_txn(txn, original.wake_id, "b")
-             end)
-
-    # THE SENDER'S ELECTION SURVIVES RETARGET (O1, Law 2) — never destroyed,
-    # never re-elected.
-    assert replacement.class == "fyi"
-    assert replacement.class_election == "sender"
-    refute replacement.digest
-    refute replacement.summon
-    assert replacement.session_key == "b"
-
-    # THE CEILING IS PRESERVED, NOT RESTARTED: the replacement's `dueAt` is
-    # the ORIGINAL's, byte-identical — never `replacement.created_at +
-    # ceiling`, which would extend it. B's own turn-boundary eligibility is
-    # handled dynamically, by grouping on the row's new `sessionKey` at the
-    # next materialization pass — nothing here needs to move `dueAt` for
-    # that to be true.
-    assert replacement.delivery_rule == Wakes.digest_rule()
-    assert replacement.due_at == original_due_at
-    assert replacement.due_at == original.due_at
-    refute replacement.due_at == replacement.created_at + ceiling
-  end
-
-  test "O1: a retargeted summon keeps summon, and a sender-scheduled moment stays unmoved",
-       %{db: db} do
-    active_sessions!(db, ["a", "b"])
-
-    original =
-      Wakes.schedule(db, %{
-        session_key: "a",
-        origin: "agent:sender",
-        creator_session_key: "agent:sender",
-        prompt: "come look at this",
-        due_at: System.system_time(:millisecond) + 60_000,
-        class: "input-needed",
-        sender_scheduled: true,
-        summon: true
-      })
-
-    assert original.summon
-    assert original.delivery_rule == Wakes.inhibited_rule()
-
-    assert {:ok, replacement} =
-             DB.transaction(db, fn txn ->
-               Wakes.retarget_in_txn(txn, original.wake_id, "b")
-             end)
-
-    assert replacement.summon
-    assert replacement.class == "input-needed"
-    assert replacement.class_election == "sender"
-    assert replacement.session_key == "b"
-
-    # The sender already named this moment (batcher-inhibited); retarget
-    # must not start batching it now.
-    assert replacement.delivery_rule == Wakes.inhibited_rule()
-    assert replacement.due_at == original.due_at
-  end
-
-  test "O1: an immediate class's own election is unmoved by retarget", %{db: db} do
-    active_sessions!(db, ["a", "b"])
-    at = System.system_time(:millisecond)
-
-    original =
-      Wakes.schedule(db, %{
-        session_key: "a",
-        origin: "agent:sender",
-        creator_session_key: "agent:sender",
-        prompt: "stopped",
-        due_at: at,
-        class: "blocker"
-      })
-
-    assert {:ok, replacement} =
-             DB.transaction(db, fn txn ->
-               Wakes.retarget_in_txn(txn, original.wake_id, "b")
-             end)
-
-    assert replacement.class == "blocker"
-    assert replacement.class_election == "sender"
-    assert replacement.due_at == at
-    assert replacement.delivery_rule == original.delivery_rule
-  end
-
-  defp active_sessions!(db, keys) do
-    main = "agent:main:clawline:flynn:main"
-
-    values =
-      keys
-      |> Enum.map(fn key ->
-        "('#{key}', '#{key}', 'flynn', 'user:flynn', '#{main}', 'default', 'claude', 'anthropic', 'fable', 'eezo', 'active', 1, 1)"
-      end)
-      |> Enum.join(",\n")
-
-    :ok =
-      DB.execute(
-        db,
-        """
-        INSERT OR IGNORE INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 1, 'admin_add', 1);
-        INSERT OR IGNORE INTO sessions
-          (sessionKey, displayName, kind, isBuiltIn, ownerUserId, origin,
-           operationalParent, archetype, harness, provider, model, host, state,
-           createdAt, updatedAt)
-        VALUES
-          ('#{main}', 'Main', 'main', 1, 'flynn', 'user:flynn', '#{main}',
-           'default', 'claude', 'anthropic', 'fable', 'eezo', 'active', 1, 1);
-        INSERT INTO sessions
-          (sessionKey, displayName, ownerUserId, origin, operationalParent,
-           archetype, harness, provider, model, host, state, createdAt, updatedAt)
-        VALUES
-          #{values};
-        """
-      )
-
-    :ok
   end
 
   test "fire_due claims each due wake once across synchronous passes", %{
@@ -767,29 +660,50 @@ defmodule Tightbeam.WakesTest do
          expected_origin,
          requester \\ %{kind: "session", id: "test-session"}
        ) do
-    principal = requester_principal(requester)
-    session_key = if requester.kind == "session", do: requester.id
-
     case DB.transaction(db, fn txn ->
-           Wakes.cancel_in_txn(txn, %{
-             wake_id: wake_id,
-             expected_origin: expected_origin,
-             requester: requester,
-             reason_kind: "requester_withdrew",
-             causal_source: %{
-               kind: "verb_call",
-               accepted_event: %{
-                 origin: expected_origin,
-                 session_key: session_key,
-                 principal: principal
-               }
-             },
-             outcome: %{kind: "no_replacement"}
-           })
+           Wakes.cancel_in_txn(txn, public_cancel_command(wake_id, expected_origin, requester))
          end) do
       {:ok, result} -> result
       {:error, _} -> false
     end
+  end
+
+  defp public_cancel_command(wake_id, expected_origin, requester) do
+    principal = requester_principal(requester)
+    session_key = if requester.kind == "session", do: requester.id
+
+    %{
+      wake_id: wake_id,
+      expected_origin: expected_origin,
+      requester: requester,
+      reason_kind: "requester_withdrew",
+      causal_source: %{
+        kind: "verb_call",
+        accepted_event: %{
+          origin: expected_origin,
+          session_key: session_key,
+          principal: principal
+        }
+      },
+      outcome: %{kind: "no_replacement"}
+    }
+  end
+
+  defp cancellation_event_count(db, wake_id) do
+    {:ok, [[count]]} =
+      DB.query(
+        db,
+        """
+        SELECT COUNT(*)
+        FROM events
+        WHERE kind='verb' AND verb='wake'
+          AND json_extract(payload, '$.cancel_wake_id')=?1
+          AND json_extract(payload, '$.canceled')=1
+        """,
+        [wake_id]
+      )
+
+    count
   end
 
   defp requester_principal(%{kind: "user", id: id}), do: {:user, id}

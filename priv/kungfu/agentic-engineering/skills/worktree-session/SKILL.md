@@ -21,11 +21,9 @@ boundary.
    agent that deletes it will not know it was yours.
 3. A repo below your session root does not announce its conventions: its `AGENTS.md`
    and committed skills do not load into your session. Read them when you enter it.
-4. Treat an assignment's `--files '["path", ...]'` list as optional bootstrap context.
-   It names likely starting paths; it is not custody, authorization, or a complete source
-   boundary. Read and edit every path the assigned work needs. If current source inspection
-   shows that another holder is changing the same code, report the real collision truthfully
-   and coordinate the order or reconciliation before both changes proceed.
+4. Add `--files '["path", ...]'` when an advisory suggestion will help others
+   discover where you expect the work to land. It grants no path and forbids no work.
+   Reconcile real overlaps normally, and preserve work that another agent already made.
 5. Destructive git that hides or discards another agent's uncommitted work is refused
    at the gate before it runs — `git stash` (mutating forms), `git reset --hard`,
    forced `git clean`, `git checkout -- <path>`, and `git restore` all hit a refusal

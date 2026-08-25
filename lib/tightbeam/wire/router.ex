@@ -50,11 +50,11 @@ defmodule Tightbeam.Wire.Router do
   use Plug.Router
 
   alias Tightbeam.{Assets, CliCompatibility, ColdStart, Devices, Dispatch, Org, Roles, WorkState}
-  alias Tightbeam.Wire.{ChangeSocket, Payloads, Socket}
+  alias Tightbeam.Wire.{Payloads, Socket}
 
   Module.register_attribute(__MODULE__, :agent_verbs, persist: true)
 
-  @agent_verbs ~w(wake condition facts-read artifact-record artifact-get artifacts spawn retire critical inspect cancel tune approve-device deny-device revoke-device promote-user add-user read-marker-set read-marker-clear config register-host host-env-set host-env-list host-env-unset update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests revoke-assignment reopen-assignment assignments work-item-create work-item-get work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail rule effort-rule waive revoke-waiver withdraw ask answer return decision-requests decision-request transcript turn-trace attend toplines topline coordination-share digest-members harness-processes)
+  @agent_verbs ~w(wake condition facts-read artifact-record artifact-get artifacts spawn retire critical inspect cancel tune approve-device deny-device revoke-device promote-user add-user config register-host host-env-set host-env-list host-env-unset host-toolchain-set update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests revoke-assignment assignments work-item-create work-item-get work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail rule effort-rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request transcript attend toplines topline harness-processes)
   @max_upload_bytes 32 * 1024 * 1024
   @multipart_opts Plug.Parsers.init(
                     parsers: [{:multipart, length: @max_upload_bytes + 1_000_000}],
@@ -80,17 +80,6 @@ defmodule Tightbeam.Wire.Router do
 
   get "/ws" do
     upgrade_socket(conn)
-  end
-
-  get "/ws/changes" do
-    conn = Plug.Conn.fetch_query_params(conn)
-
-    if Plug.Conn.get_req_header(conn, "upgrade") == ["websocket"] and
-         conn.query_params["protocolVersion"] == "1" do
-      WebSockAdapter.upgrade(conn, ChangeSocket, deps(conn), max_frame_size: 2 * 1024 * 1024)
-    else
-      error(conn, 426, "unsupported_protocol_version")
-    end
   end
 
   defp upgrade_socket(conn) do
@@ -495,6 +484,7 @@ defmodule Tightbeam.Wire.Router do
         verb: verb,
         origin: origin,
         principal: principal,
+        transport_session_key: authenticated_session_key(auth),
         session_key: artifact_caller_session(verb, session_key, principal),
         target_role: target_meta.role,
         role_fallback: target_meta.fallback,
@@ -533,6 +523,9 @@ defmodule Tightbeam.Wire.Router do
   end
 
   defp canonical_actor_exists(_origin, _principal, _conn), do: :ok
+
+  defp authenticated_session_key({:session, session}), do: session.session_key
+  defp authenticated_session_key(:org), do: nil
 
   defp user_exists(user_id, conn) do
     if Devices.user(db(conn), user_id), do: :ok, else: invalid_identity()
@@ -664,20 +657,7 @@ defmodule Tightbeam.Wire.Router do
   # `--session <key>` is a COHORT FILTER over creator identity, not a target, so
   # resolving it as one would turn a roster filter into a session-existence
   # oracle. Both verbs' selectors travel as ordinary body params.
-  # `coordination-share` joins them for transcript's exact reason: its
-  # `--session <key>` names the session being MEASURED, and resolving it as a
-  # target would answer "does this session exist?" ahead of the read's own
-  # owner-or-admin check. Same not-found body either way.
-  # `answer` joins them because it addresses a REQUEST ID, never a principal: the
-  # row already records who was asked. Resolving a volunteered `--session` here
-  # would answer "does this session exist?" ahead of the answerer check that
-  # actually decides. (`ask` is deliberately NOT here — its target IS a
-  # principal, resolved by the same machinery `wake` uses.)
-  # `digest-members` (O5) addresses a WAKE ID, never a principal — its own
-  # owner-or-admin check (mirroring `coordination-share`'s) is the read's
-  # actual gate, and a volunteered `--session` alongside `--wake-id` must not
-  # get answered by the router first.
-  @non_target_verbs ~w(transcript turn-trace toplines topline coordination-share digest-members answer return)
+  @non_target_verbs ~w(transcript toplines topline)
 
   # PRESENCE of the field, not the type of its value. `sessionKey: null` — and a
   # number, a boolean or an object — is still a caller volunteering a typed target
@@ -716,15 +696,23 @@ defmodule Tightbeam.Wire.Router do
         {:ok, nil, %{role: nil, fallback: false}}
 
       given == ["sessionKey"] ->
-        case Org.get(db(conn), body["sessionKey"]) do
-          nil ->
-            {:error, 404, "not_found", "unknown sessionKey: #{body["sessionKey"]}"}
+        if verb == "tune" do
+          # Runtime tuning authorizes before existence can become visible. The
+          # gateway receives the opaque key and returns the same not_found for
+          # unknown, retired, foreign, and process callers. Other verbs retain
+          # the router's existing eager target semantics.
+          {:ok, body["sessionKey"], %{role: nil, fallback: false}}
+        else
+          case Org.get(db(conn), body["sessionKey"]) do
+            nil ->
+              {:error, 404, "not_found", "unknown sessionKey: #{body["sessionKey"]}"}
 
-          %{state: "retired"} when verb in ["assign", "dispatch"] ->
-            {:error, 400, "session_retired", "assignments require an active holder session"}
+            %{state: "retired"} when verb in ["assign", "dispatch"] ->
+              {:error, 400, "session_retired", "assignments require an active holder session"}
 
-          session ->
-            {:ok, session.session_key, %{role: nil, fallback: false}}
+            session ->
+              {:ok, session.session_key, %{role: nil, fallback: false}}
+          end
         end
 
       given == ["userId"] ->
@@ -734,6 +722,22 @@ defmodule Tightbeam.Wire.Router do
 
       given == ["role"] ->
         case Roles.resolve(db(conn), body["role"]) do
+          # `Roles.resolve/2` answers "who stands in for this role", falling back to
+          # the owner's personal session when the role is unbound or its binding is
+          # not active. That is a fair answer for a wake and a PHANTOM for an
+          # assignment: assign/dispatch BIND an obligation, and the owner's session
+          # is not the requested role's holder — commonly not even its provider — so
+          # the card lands on a session that cannot do the work while the requester
+          # believes it dispatched (wi_756153b7, specimens asg_6f380b79 and
+          # asg_388a5a54, the latter against a role whose bound session was retired).
+          # Refuse HERE, the one place the fallback is still distinguishable: past
+          # this seam only a boolean survives, and the handler sees an active session
+          # it has no reason to doubt. Every other consumer keeps the fallback.
+          {:ok, _session_key, true} when verb in ["assign", "dispatch"] ->
+            {:error, 400, "no_live_role_holder",
+             "role #{body["role"]} has no live bound session; spawn one and bind the role, " <>
+               "or target an active sessionKey"}
+
           {:ok, session_key, fallback} ->
             {:ok, session_key, %{role: body["role"], fallback: fallback}}
 
@@ -894,18 +898,9 @@ defmodule Tightbeam.Wire.Router do
         {:ok, value} when is_nil(value) or value == "" ->
           Map.put(params, String.to_existing_atom(key), nil)
 
-        # F6 (Sol xhigh review): a value this seam does not know how to read
-        # (a number, a bool, an object) is NOT a field value it silently
-        # discards. Dropping it here used to hand the gateway a params map
-        # indistinguishable from "the caller named nothing", which activated
-        # the destination's default — the caller's malformed input read back
-        # as `ok: true` on a switch it never elected. Carried through AS SENT
-        # instead, so the gateway's own field validation names it
-        # (`invalid_model_field`), not this mapper's silence.
-        {:ok, value} ->
-          Map.put(params, String.to_existing_atom(key), value)
-
-        :error ->
+        # Anything else is not a field value this seam knows how to read, and
+        # it is not turned into one by guessing.
+        _ ->
           params
       end
     end)
@@ -953,7 +948,7 @@ defmodule Tightbeam.Wire.Router do
         json(conn, success_status, shape.(result))
 
       {:error, result} ->
-        error(conn, error_status(result[:code]), result[:code], result[:message])
+        dispatch_error(conn, call, error_status(result[:code]), result)
 
       {:decision_pending, decision_request_id} ->
         decision_pending(conn, decision_request_id)
@@ -1078,13 +1073,19 @@ defmodule Tightbeam.Wire.Router do
   # wake -> turn -> trace attribution, which Law 0 forbids (cross-review F6), so
   # it is stripped before the handler sees it.
   #
+  # An operator ruling's transport provenance follows the same rule: the router
+  # derives it from bearer authentication above, so `ruledViaSessionKey` cannot
+  # enter through params. `wake.requestRef` is also internal because delayed
+  # delivery uses it to bind the wake to its authoritative decision row.
+  #
   # Scoped per verb deliberately: `assignmentId` is an ORDINARY caller param on
   # attest/assign/dispatch/effort-rule, which name the assignment they act on. A
   # blanket strip breaks all of those (the CLI round-trip suite proves it), so the
   # spec's "stripped from any agent/dispatch param map" is read as scoped to the
   # carrier it is written about, not to the parameter name everywhere.
   @substrate_only_params %{
-    "wake" => ~w(assignment_id)a,
+    "wake" => ~w(assignment_id request_ref)a,
+    "operator-rule" => ~w(ruled_via_session_key)a,
     "work-item-create" => ~w(created_in_turn_seq created_context_known)a,
     # The artifact's turn edge and the class of evidence behind it are the
     # substrate's own observation, resolved in `Artifacts.record/2` from the hook
@@ -1108,17 +1109,12 @@ defmodule Tightbeam.Wire.Router do
   # §Review-of relation pins both names ("wire `reviews`, atomized
   # `:reviews_assignment_id`"). Underscoring alone yields `:reviews`, which no
   # handler reads, so the link silently never landed.
-  #
-  # `tune.reasoningLevel` is the second: `Macro.underscore` turns the wire word
-  # into `:reasoning_level`, but the handler reads `:reasoningLevel` — the raw
-  # COLUMN spelling, which the device path builds by hand and so never went
-  # through atomization. Without this alias an agent's `--effort` crossed
-  # `/agent/dispatch`, matched no branch, and came back "tune does not support
-  # set_reasoning yet": a caller's explicit election answered as an unbuilt
-  # feature.
   @param_aliases %{
     "assign" => %{reviews: :reviews_assignment_id},
-    "tune" => %{reasoning_level: :reasoningLevel}
+    "tune" => %{
+      reasoning_level: :reasoningLevel,
+      fast_mode: :fastMode
+    }
   }
 
   @doc false
@@ -1147,6 +1143,14 @@ defmodule Tightbeam.Wire.Router do
   defp error(conn, status, code, message \\ nil) do
     detail = %{"code" => code} |> put_optional("message", message)
     json(conn, status, %{"error" => detail})
+  end
+
+  defp dispatch_error(conn, %{verb: "tune"}, status, result) do
+    json(conn, status, %{"error" => Map.delete(result, :ok)})
+  end
+
+  defp dispatch_error(conn, _call, status, result) do
+    error(conn, status, result[:code], result[:message])
   end
 
   defp put_optional(map, _key, nil), do: map

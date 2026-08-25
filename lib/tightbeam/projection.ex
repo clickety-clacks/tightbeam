@@ -12,6 +12,7 @@ defmodule Tightbeam.Projection do
 
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
+  alias Tightbeam.Origin
 
   @type db :: GenServer.server()
 
@@ -48,8 +49,12 @@ defmodule Tightbeam.Projection do
           reply_to_client_message_id: String.t() | nil,
           llm_visible_message_id: String.t(),
           attachments: list(),
-          attention_tier: integer()
+          attention_tier: integer(),
+          message_type: String.t() | nil,
+          marker: %{kind: String.t(), from: String.t(), to: String.t()} | nil
         }
+
+  @marker_kinds ["harness-switch", "model-retune", "session-restart"]
 
   @ddl """
   CREATE TABLE IF NOT EXISTS messages (
@@ -66,7 +71,18 @@ defmodule Tightbeam.Projection do
     replyToClientMessageId TEXT,
     llmVisibleMessageId    TEXT NOT NULL,
     attachments            TEXT NOT NULL DEFAULT '[]',
-    attentionTier          INTEGER NOT NULL DEFAULT 0
+    attentionTier          INTEGER NOT NULL DEFAULT 0,
+    messageType            TEXT,
+    markerKind             TEXT CHECK (
+      markerKind IS NULL OR markerKind IN ('harness-switch','model-retune','session-restart')
+    ),
+    markerFrom             TEXT,
+    markerTo               TEXT,
+    CHECK (
+      (messageType IS 'marker' AND markerKind IS NOT NULL AND markerFrom IS NOT NULL AND markerTo IS NOT NULL)
+      OR
+      (messageType IS NOT 'marker' AND markerKind IS NULL AND markerFrom IS NULL AND markerTo IS NULL)
+    )
   );
   CREATE INDEX IF NOT EXISTS messages_session ON messages (sessionKey, seq);
   CREATE UNIQUE INDEX IF NOT EXISTS messages_client_dedupe
@@ -86,10 +102,10 @@ defmodule Tightbeam.Projection do
   @doc """
   Append a message, idempotently per client send. Dedupe scope is
   `(session_key, device_id, client_message_id)` — when both ids are present
-  and a row already exists: same content and resolved reply target →
-  `{:duplicate, msg}` (safe client retry), different content or reply target →
-  `{:conflict, msg}` (id reuse; caller rejects). Otherwise inserts and returns
-  `{:appended, msg}`. Runs in one transaction so the check and insert are atomic.
+  and a row already exists: same content → `{:duplicate, msg}` (safe client
+  retry), different content → `{:conflict, msg}` (id reuse; caller rejects).
+  Otherwise inserts and returns `{:appended, msg}`. Runs in one transaction so
+  the check and insert are atomic.
   """
   @spec append(db(), map()) ::
           {:appended, message()} | {:duplicate, message()} | {:conflict, message()}
@@ -110,7 +126,8 @@ defmodule Tightbeam.Projection do
             """
               SELECT seq, id, sessionKey, role, content, timestamp, sender, deviceId,
                      clientMessageId, replyToMessageId, replyToClientMessageId,
-                     llmVisibleMessageId, attachments, attentionTier
+                     llmVisibleMessageId, attachments, attentionTier,
+                     messageType, markerKind, markerFrom, markerTo
               FROM messages
               WHERE sessionKey = ?1 AND deviceId = ?2 AND clientMessageId = ?3
             """,
@@ -134,14 +151,18 @@ defmodule Tightbeam.Projection do
       [] ->
         id = "s_" <> Tightbeam.Id.uuid4()
         client_message_id = Map.get(input, :client_message_id)
+        message_type = message_type(input)
+
+        {marker_kind, marker_from, marker_to} =
+          marker_columns(Map.get(input, :marker), message_type)
 
         Txn.q(
           txn,
           """
             INSERT INTO messages (id, sessionKey, role, content, timestamp, sender, deviceId,
               clientMessageId, replyToMessageId, replyToClientMessageId, llmVisibleMessageId, attachments,
-              attentionTier)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+              attentionTier, messageType, markerKind, markerFrom, markerTo)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
           """,
           [
             id,
@@ -156,7 +177,11 @@ defmodule Tightbeam.Projection do
             Map.get(input, :reply_to_client_message_id),
             Map.get(input, :llm_visible_message_id) || client_message_id || id,
             JSON.encode!(Map.get(input, :attachments, [])),
-            Map.get(input, :attention_tier, 0)
+            Map.get(input, :attention_tier, 0),
+            message_type,
+            marker_kind,
+            marker_from,
+            marker_to
           ]
         )
 
@@ -166,22 +191,63 @@ defmodule Tightbeam.Projection do
   end
 
   @doc """
-  Append a Tightbeam-authored transcript marker inside an existing
-  transaction. The marker elects its own attention the way an agent elects
-  its reply's — markers are not turns, so the election rides the message
-  rather than `turns.replyAttention`, but it is the same vocabulary and
-  reaches the client through the same `attentionTier` key.
+  Append a Tightbeam-authored substrate notice inside an existing transaction.
+  Notices are records, not structural boundaries. Their readable content is
+  caller-authored, while their class comes from the process origin.
   """
-  @spec append_marker_in_txn(Txn.t(), String.t(), String.t(), attention()) ::
+  @spec append_substrate_in_txn(Txn.t(), String.t(), String.t(), attention()) ::
           {:appended, message()}
-  def append_marker_in_txn(%Txn{} = txn, session_key, content, attention \\ :normal) do
+  def append_substrate_in_txn(%Txn{} = txn, session_key, content, attention \\ :normal) do
     append_in_txn(txn, %{
       session_key: session_key,
       role: "assistant",
       content: content,
       sender: "process:tightbeam",
+      message_type: "substrate",
       attention_tier: attention_tier(attention)
     })
+  end
+
+  @doc """
+  Append one structural transcript boundary. Callers supply facts only;
+  Tightbeam owns the readable label template, so a marker can never smuggle
+  arbitrary prose into the structural payload.
+  """
+  @spec append_marker_in_txn(
+          Txn.t(),
+          String.t(),
+          %{kind: String.t(), from: String.t(), to: String.t()},
+          attention()
+        ) :: {:appended, message()}
+  def append_marker_in_txn(txn, session_key, marker, attention \\ :normal)
+
+  def append_marker_in_txn(
+        %Txn{} = txn,
+        session_key,
+        %{kind: kind, from: from, to: to} = marker,
+        attention
+      )
+      when kind in @marker_kinds and is_binary(from) and is_binary(to) do
+    append_in_txn(txn, %{
+      session_key: session_key,
+      role: "assistant",
+      content: marker_content(kind, from, to),
+      sender: "process:tightbeam",
+      message_type: "marker",
+      marker: marker,
+      attention_tier: attention_tier(attention)
+    })
+  end
+
+  def append_marker_in_txn(%Txn{}, _session_key, marker, _attention) do
+    raise ArgumentError,
+          "marker must be %{kind: kind, from: from, to: to}; kind must be one of #{inspect(@marker_kinds)}, got: #{inspect(marker)}"
+  end
+
+  @doc "Append a structural boundary outside an existing transaction."
+  @spec append_marker(db(), String.t(), map(), attention()) :: {:appended, message()}
+  def append_marker(db, session_key, marker, attention \\ :normal) do
+    transaction!(db, &append_marker_in_txn(&1, session_key, marker, attention))
   end
 
   @doc "The stored tier for an elected attention name."
@@ -208,7 +274,8 @@ defmodule Tightbeam.Projection do
         """
           SELECT seq, id, sessionKey, role, content, timestamp, sender, deviceId,
                  clientMessageId, replyToMessageId, replyToClientMessageId,
-                 llmVisibleMessageId, attachments, attentionTier
+                 llmVisibleMessageId, attachments, attentionTier,
+                 messageType, markerKind, markerFrom, markerTo
           FROM messages WHERE id = ?1
         """,
         [id]
@@ -243,7 +310,8 @@ defmodule Tightbeam.Projection do
         """
           SELECT seq, id, sessionKey, role, content, timestamp, sender, deviceId,
                  clientMessageId, replyToMessageId, replyToClientMessageId,
-                 llmVisibleMessageId, attachments, attentionTier
+                 llmVisibleMessageId, attachments, attentionTier,
+                 messageType, markerKind, markerFrom, markerTo
           FROM messages WHERE sessionKey = ?1 AND seq > ?2 ORDER BY seq ASC LIMIT ?3
         """,
         [session_key, after_seq, limit]
@@ -306,7 +374,8 @@ defmodule Tightbeam.Projection do
       """
         SELECT seq, id, sessionKey, role, content, timestamp, sender, deviceId,
                clientMessageId, replyToMessageId, replyToClientMessageId,
-               llmVisibleMessageId, attachments, attentionTier
+               llmVisibleMessageId, attachments, attentionTier,
+               messageType, markerKind, markerFrom, markerTo
         FROM messages WHERE id = ?1
       """,
       [id]
@@ -327,7 +396,11 @@ defmodule Tightbeam.Projection do
          reply_to_client_message_id,
          llm_visible_message_id,
          attachments,
-         attention_tier
+         attention_tier,
+         message_type,
+         marker_kind,
+         marker_from,
+         marker_to
        ]) do
     %{
       seq: seq,
@@ -343,9 +416,72 @@ defmodule Tightbeam.Projection do
       reply_to_client_message_id: reply_to_client_message_id,
       llm_visible_message_id: llm_visible_message_id,
       attachments: JSON.decode!(attachments),
-      attention_tier: attention_tier
+      attention_tier: attention_tier,
+      message_type: message_type,
+      marker: marker(marker_kind, marker_from, marker_to)
     }
   end
+
+  defp message_type(input) do
+    case Map.fetch(input, :message_type) do
+      {:ok, value} when is_binary(value) or is_nil(value) ->
+        value
+
+      {:ok, value} ->
+        raise ArgumentError, "message_type must be a string or nil, got: #{inspect(value)}"
+
+      :error ->
+        inferred_message_type(Map.get(input, :sender))
+    end
+  end
+
+  defp inferred_message_type("tightbeam"), do: "assistant"
+
+  defp inferred_message_type(sender) do
+    case Origin.parse(sender) do
+      {:agent, _} -> "agent"
+      {:process, _} -> "substrate"
+      {:remedy, _} -> "substrate"
+      _ -> nil
+    end
+  end
+
+  defp marker_columns(nil, message_type) when message_type != "marker", do: {nil, nil, nil}
+
+  defp marker_columns(%{kind: kind, from: from, to: to}, "marker")
+       when kind in @marker_kinds and is_binary(from) and is_binary(to),
+       do: {kind, from, to}
+
+  defp marker_columns(marker, message_type) do
+    raise ArgumentError,
+          "message_type=marker requires %{kind: kind, from: string, to: string}; " <>
+            "other message types must omit marker, got: #{inspect({message_type, marker})}"
+  end
+
+  defp marker(nil, _from, _to), do: nil
+  defp marker(kind, from, to), do: %{kind: kind, from: from, to: to}
+
+  defp marker_content("harness-switch", from, to) do
+    "[engine swap]\n\n" <>
+      "This session's engine changed from #{marker_endpoint(from)} to #{marker_endpoint(to)}.\n\n" <>
+      "Earlier messages are RETAINED and are not deleted, but they are no longer " <>
+      "shown here: a new engine cannot load the previous engine's session, so the " <>
+      "visible transcript starts fresh from this point. This is expected after a " <>
+      "harness swap, not a fault."
+  end
+
+  defp marker_content("model-retune", from, to) do
+    "[model retune]\n\nThis session's model changed from #{marker_endpoint(from)} " <>
+      "to #{marker_endpoint(to)}."
+  end
+
+  defp marker_content("session-restart", from, to) do
+    "[context reset]\n\nThe agent's working memory was reset from #{marker_endpoint(from)} " <>
+      "to #{marker_endpoint(to)} while handling the message above. Earlier messages stay " <>
+      "visible here, but the agent no longer remembers them."
+  end
+
+  defp marker_endpoint(value), do: value
 
   defp transaction!(db, fun) do
     case DB.transaction(db, fun) do

@@ -23,8 +23,6 @@ defmodule Tightbeam.CheckTierTest do
         "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 1, 'admin_add', 1), ('other', 0, 'admin_add', 1)"
       )
 
-    Enum.each(~w(flynn other), &ensure_main_session(db, &1))
-
     holder = session(db, "holder", "flynn", "coder")
     reviewer = session(db, "reviewer", "other", "reviewer")
     base_dir = Path.join(System.tmp_dir!(), "check-tier-#{System.unique_integer([:positive])}")

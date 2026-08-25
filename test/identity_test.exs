@@ -38,26 +38,7 @@ defmodule Tightbeam.IdentityTest do
 
     assert git!(dir, ["ls-tree", "-r", "--name-only", "main"])
            |> String.split("\n", trim: true) ==
-             [
-               "archetypes/avasarala.toml",
-               "archetypes/default.toml",
-               "archetypes/exec.toml",
-               "archetypes/miller.toml",
-               "guidance/altitude-statute.md",
-               "guidance/avasarala.md",
-               "guidance/comms-discipline.md",
-               "guidance/delegation-card.md",
-               "guidance/desk-playbook.md",
-               "guidance/directive-vocabulary.md",
-               "guidance/dispatch-rules.md",
-               "guidance/exec.md",
-               "guidance/inception.md",
-               "guidance/miller.md",
-               "guidance/office-convention.md",
-               "guidance/operating-model.md",
-               "guidance/role-charter.md",
-               "guidance/staffing.md"
-             ]
+             ["archetypes/default.toml", "guidance/operating-model.md"]
 
     snapshot = Identity.snapshot!(ctx.base, "default", :codex)
     assert snapshot.skills == %{}
@@ -82,43 +63,6 @@ defmodule Tightbeam.IdentityTest do
            ]
   end
 
-  # S4 coverage pin: the file-list assertion above proves the seed ships
-  # `guidance/delegation-card.md`, `guidance/office-convention.md`, and
-  # `guidance/directive-vocabulary.md` by NAME — it would not fail if any of
-  # the three were emptied. These three pin the load-bearing CONTENT
-  # (coordination-fabric-v1 §6) so an edit that keeps the filename but guts
-  # the substance is caught here, not discovered by an exec acting off-card.
-  test "the delegation card's verb lists carry §6's MAY and MUST NOT content, not just a filename" do
-    card =
-      File.read!(Application.app_dir(:tightbeam, "priv/seed/guidance/delegation-card.md"))
-
-    # A handful of exact, load-bearing phrases — not the whole text, which
-    # would make this test as brittle as the thing it exists to catch.
-    assert card =~
-             "MAY: read substrate rows; file its own lifecycle attests on its own card"
-
-    assert card =~
-             "batch, schedule, and deliver to its principal within §7's ceilings; summon"
-
-    assert card =~ "MUST NOT: file verdicts on substance"
-    assert card =~ "accept or reject work; make product judgments;"
-    assert card =~ ~s(Its only "no" is "later")
-    assert card =~ "the prodder bounds starvation across its watermark"
-
-    # Receipt is behavior, never an acknowledgment filing (no-ack law, §6 r5) —
-    # pin the new phrasing and refute the receipt turn it deleted.
-    assert card =~ "directive receipt is proven by BEHAVIOR"
-    assert card =~ "never by an acknowledgment filing"
-    refute card =~ "acknowledge directives there"
-
-    # The r5 additions are §6 verb law too: the D2 spawn clause and the D3
-    # containment compilation are load-bearing the same way the lists are.
-    assert card =~ "DIRECTED EXECUTION of its principal's recorded decision"
-    assert card =~ "hold or RECEIVE\n    implementation cards"
-    assert card =~ "file\n    completions off the delegation card"
-    assert card =~ "spawn uncited"
-  end
-
   # Work-custody pin: operating-model.md is composed into EVERY archetype, so
   # the custody rail reaches every session including learned-kungfu archetypes.
   # The forensic reason it exists (2026-08-18): retirement deletes a workdir
@@ -138,42 +82,6 @@ defmodule Tightbeam.IdentityTest do
     assert model =~ "an unneeded artifact costs one row, an unrecorded one costs the work"
     assert model =~ "that\nfile must be an artifact FIRST"
     assert model =~ "the handoff is the artifact, never the\npath"
-  end
-
-  test "the casebook and probe-list templates require evidence citations and hit counts" do
-    avasarala =
-      File.read!(Application.app_dir(:tightbeam, "priv/seed/guidance/avasarala.md"))
-
-    assert avasarala =~ "evidence: <observed row ids — REQUIRED, every entry, kept current>"
-    assert avasarala =~ "hits: <count>, last-hit: <date, row id> — REQUIRED"
-    assert avasarala =~ "The casebook ships EMPTY."
-
-    miller = File.read!(Application.app_dir(:tightbeam, "priv/seed/guidance/miller.md"))
-    assert miller =~ "It ships EMPTY"
-  end
-
-  test "the office convention's dissolution sequence names REBIND before revoke" do
-    convention =
-      File.read!(Application.app_dir(:tightbeam, "priv/seed/guidance/office-convention.md"))
-
-    assert convention =~ "REBIND, then revoke"
-    assert convention =~ "the order is rebind-first"
-
-    # ORDERING, not just presence: REBIND must textually precede revoke, the
-    # same discipline the sequence itself enforces (a revoke-first sequence
-    # leaves a dual-authority window the doc names as the failure to avoid).
-    rebind_at = :binary.match(convention, "REBIND") |> elem(0)
-    revoke_at = :binary.match(convention, "revoke") |> elem(0)
-    assert rebind_at < revoke_at
-  end
-
-  test "the directive vocabulary seed doc names all five base keys" do
-    vocabulary =
-      File.read!(Application.app_dir(:tightbeam, "priv/seed/guidance/directive-vocabulary.md"))
-
-    for key <- ~w(focus interrupt-only-for digest dnd-until escalate-to) do
-      assert vocabulary =~ "`#{key}:`", "directive vocabulary is missing key #{key}"
-    end
   end
 
   test "a shipped bundle manifest without purpose is refused when bundles are read", ctx do
@@ -248,7 +156,7 @@ defmodule Tightbeam.IdentityTest do
     assert {:noop, ^revision} = Identity.learn!(ctx.base, "agentic-engineering", "operator")
   end
 
-  test "shipped engineering bundle imports the test receipt rule and coder guidance", ctx do
+  test "shipped engineering bundle imports the test receipt rule and role guidance", ctx do
     shipped = Path.expand("priv/kungfu/agentic-engineering")
     Application.put_env(:tightbeam, :identity_source_dir, shipped)
     base = Path.join(ctx.root, "shipped-runtime")
@@ -258,6 +166,9 @@ defmodule Tightbeam.IdentityTest do
     engineering_rule = File.read!(Path.join(base, "identity/rules/engineering.toml"))
     assert engineering_rule =~ ~s(name = "code-review-requires-passing-tests")
     assert engineering_rule =~ ~s(on_rule_denied = "surface")
+
+    reviewer = Identity.snapshot!(base, "reviewer", :codex)
+    assert reviewer.guidance =~ "producer holder filed the `tests-passed`"
 
     coder = Identity.snapshot!(base, "coder", :codex)
     assert coder.guidance =~ "Before the ready-for-review progress attest"

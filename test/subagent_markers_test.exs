@@ -33,8 +33,6 @@ defmodule Tightbeam.SubagentMarkersTest do
 
     :ok = Tightbeam.Schema.ensure_all(db)
 
-    ensure_main_session(db, "flynn")
-
     start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
     start_supervised!({LaneDoorbell, self()})
 

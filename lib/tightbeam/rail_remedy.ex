@@ -58,26 +58,6 @@ defmodule Tightbeam.RailRemedy do
     result
   end
 
-  @doc "Record and dispatch one non-blocking notice per live statute/subject crossing."
-  @spec notice(DB.server(), Dispatch.handlers(), map(), String.t(), map()) :: outcome()
-  def notice(db, handlers, rule, subject, call) do
-    call = put_in(call, [:params, :assignment_id], subject)
-
-    result =
-      with {:ok, context} <- binding_context(db, subject, call),
-           {:ok, resolved} <- resolve_remedy(rule.remedy, context),
-           {:ok, resolved} <- bind_target(db, "wake", resolved) do
-        route_notice_episode(db, handlers, rule, subject, call, context, resolved)
-      else
-        {:error, _unbound} -> %{outcome: "unbound", producer_id: nil}
-      end
-
-    if result.outcome != "notice-suppressed",
-      do: lifecycle(db, rule, subject, call, result, "rail_notice")
-
-    result
-  end
-
   @doc "Return the occurrence when one statute/subject episode is live."
   @spec live?(DB.server(), String.t(), String.t()) :: pos_integer() | nil
   def live?(db, statute, subject) do
@@ -124,44 +104,11 @@ defmodule Tightbeam.RailRemedy do
           resolved,
           token,
           occurrence,
-          reopened?,
-          :release
+          reopened?
         )
 
       :occupied ->
         occupied_episode(db, handlers, rule, subject, call, context, resolved)
-    end
-  end
-
-  # A notice is a durable one-shot for one statute/subject. Unlike a gating
-  # remedy, it does not close when a later call misses the predicate: an
-  # unrelated attest must not rearm a round-count doorbell. A repeated match
-  # observes the live row and does not send again.
-  defp route_notice_episode(db, handlers, rule, subject, call, context, resolved) do
-    case read_episode(db, rule.name, subject) do
-      %{status: "live", producer_key: producer_key} ->
-        %{outcome: "notice-suppressed", producer_id: producer_key}
-
-      row ->
-        case claim(db, rule, subject, context, row) do
-          {:claimed, token, occurrence, reopened?} ->
-            lease_and_dispatch(
-              db,
-              handlers,
-              rule,
-              subject,
-              call,
-              context,
-              resolved,
-              token,
-              occurrence,
-              reopened?,
-              :latch
-            )
-
-          :occupied ->
-            %{outcome: "notice-suppressed", producer_id: Map.get(row || %{}, :producer_key)}
-        end
     end
   end
 
@@ -271,8 +218,7 @@ defmodule Tightbeam.RailRemedy do
          resolved,
          token,
          occurrence,
-         reopened?,
-         failure_mode
+         reopened?
        ) do
     won? =
       cas(
@@ -316,11 +262,11 @@ defmodule Tightbeam.RailRemedy do
       else
         {:error, %{code: "rule_denied"} = denial}
         when rule.remedy.on_rule_denied == "surface" ->
-          settle_dispatch_failure(db, rule.name, subject, token, failure_mode)
+          release_dispatch(db, rule.name, subject, token)
           %{outcome: "blocked", producer_id: nil, denial: denial}
 
         _ ->
-          settle_dispatch_failure(db, rule.name, subject, token, failure_mode)
+          release_dispatch(db, rule.name, subject, token)
           %{outcome: "blocked", producer_id: nil}
       end
     else
@@ -401,7 +347,6 @@ defmodule Tightbeam.RailRemedy do
             verb: "wake",
             origin: "remedy:#{rule.name}",
             principal: principal,
-            bound_assignment_id: context.assignment_id,
             session_key: target,
             params: %{
               prompt: "Remedy #{rule.name} remains pending for #{subject}.",
@@ -649,21 +594,6 @@ defmodule Tightbeam.RailRemedy do
     )
   end
 
-  defp settle_dispatch_failure(db, statute, subject, token, :release),
-    do: release_dispatch(db, statute, subject, token)
-
-  defp settle_dispatch_failure(db, statute, subject, token, :latch) do
-    cas(
-      db,
-      """
-      UPDATE rail_remedy_episodes
-      SET status = 'live', producerKey = NULL
-      WHERE statute = ?1 AND subject = ?2 AND status = 'dispatched' AND claimToken = ?3
-      """,
-      [statute, subject, token]
-    )
-  end
-
   defp binding_context(db, subject, call) do
     assignment_id = binding_assignment_id(db, subject, call)
 
@@ -834,7 +764,7 @@ defmodule Tightbeam.RailRemedy do
     end
   end
 
-  defp lifecycle(db, rule, subject, call, result, kind \\ "rail_remedy") do
+  defp lifecycle(db, rule, subject, call, result) do
     detail =
       JSON.encode!(%{
         edge: if(Map.get(call, :edge, :verb) == :turn_end, do: "turn-end", else: "verb"),
@@ -846,7 +776,7 @@ defmodule Tightbeam.RailRemedy do
       })
 
     try do
-      EventLog.lifecycle(db, kind, rule.name, detail)
+      EventLog.lifecycle(db, "rail_remedy", rule.name, detail)
     rescue
       _reason -> :ok
     catch

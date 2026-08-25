@@ -7,12 +7,9 @@ kind = "dispatch-rule"
 source = "coordination-fabric-v1 §13 Phase 0; wi_1b0237fe wedge class"
 legibility = "event:denied(rule=coder-completion-needs-independent-review)"
 
-# The wedge CLASS, pinned. Review-round selection is anchored on the rounds that
-# CARRY a holder-filed verdict, never on assignment-lifecycle recency alone: a
-# round holding no verdict by its own holder carries no judgment and may not
-# displace one. A round closed without a verdict never can acquire one — `attest`
-# refuses a verdict on a closed assignment — so the pre-fix selection left the
-# producer denied with no lawful exit, which is the Law 3 violation Phase 0 repairs.
+# Review judgments come from holder-filed verdict rows, never from bare card
+# lifecycle recency. A verdictless round therefore cannot displace a standing
+# judgment, even when the verdictless card is terminal.
 [[fixture.rule]]
 name = "coder-completion-needs-independent-review"
 verb = "attest"

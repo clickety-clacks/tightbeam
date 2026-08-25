@@ -1,9 +1,10 @@
 # Upgrading a running instance
 
-Stop it, swap the code, start it, check four things. There is no upgrade
-machinery and none is needed — the ledger is durable, so a restart is an
-ordinary event. What follows is what the stop actually does, established by
-running it rather than by reading `application.ex`.
+Stop it, back it up, swap the code, start it, and verify the durable rows.
+Most upgrades are ordinary restarts because the ledger is durable. Tightbeam
+0.1.8 also carries one exact migration: `model-identity-v1` (0.1.7) to
+`operator-decision-requests-v1` (0.1.8). The gateway refuses every other old
+stamp. It never infers a schema from stored DDL.
 
 If the gateway is service-managed, installing a new package only swaps the
 executable on disk; it does not restart the running process. After the package
@@ -19,10 +20,167 @@ genuinely in flight.
 
 ## Take a backup first
 
-`sqlite3 "$TIGHTBEAM_BASE_DIR/state.db" ".backup '$DEST/pre-upgrade.db'"` — safe
-while running, and the restore is already proven. See **[BACKUP.md](BACKUP.md)**
-for the procedure and, more importantly, for what `state.db` does *not* cover
-(`gateway.json` especially — losing it rotates the org token).
+Use `VACUUM INTO` from a read-only SQLite handle when the source is a live WAL
+database. It takes one consistent read snapshot. Do not use `.backup` for this
+release check: a continuously written WAL source can make that API restart its
+copy indefinitely. See **[BACKUP.md](BACKUP.md)** for what `state.db` does *not*
+cover (`gateway.json` especially — losing it rotates the org token).
+
+Back up **every registered base directory**. Each host owns its own `state.db`.
+The primary database does not migrate a satellite database for it. A macOS host
+whose registry entry says `baseDir=/Users/mike/.tightbeam`, for example, must be
+stopped, backed up, upgraded, and started on that host.
+
+## The supported 0.1.7 to 0.1.8 migration
+
+Let the 0.1.8 gateway perform this migration at first boot. Do not edit the
+stamp or issue manual `ALTER TABLE` statements.
+
+The migration accepts exactly one source stamp:
+
+```text
+model-identity-v1 -> operator-decision-requests-v1
+```
+
+It runs in one SQLite transaction. It rebuilds `decision_requests` with the
+0.1.8 operator-request constraint and `ruledViaSessionKey` column. It also
+rebuilds `messages` with the 0.1.8 marker-envelope columns and constraint. It
+copies every 0.1.7 row, sets the new fields to `NULL`, and creates the exact
+0.1.8 indexes. The 0.1.7 and 0.1.8 `wakes` table definitions are identical, so
+the migration does not rewrite wakes; it checks that their row count is
+unchanged in the same transaction. The stamp changes last. Any failure rolls
+back both table rebuilds, copied rows, indexes, and the stamp together.
+The serialized database owner suspends foreign-key enforcement only around the
+transaction because SQLite otherwise checks child rows during `DROP TABLE`.
+The transaction runs `foreign_key_check` before it stamps or commits, and the
+owner restores enforcement after success or rollback.
+
+An unstamped database, an unknown stamp, an intermediate development stamp, or
+more than one stamp is a refusal. Keep that database in place and use a build
+that recognizes its exact stamp. Do not rename it away and silently create an
+empty org.
+
+## Dedicated 0.1.7 to 0.1.8 upgrade E2E
+
+Run this check separately from the cold-install matrix. Use a consistent backup
+of a real 0.1.7 `state.db`; never point the test at the live org.
+
+The release gate covers both platforms in two parts:
+
+- Run the full row-preservation proof once on Linux with the largest real
+  fixture. The migration logic is shared across release packages.
+- Run a macOS install/start smoke on a fresh copy of the same pre-upgrade
+  fixture. This covers the different package path, launch mechanism, and
+  registered `baseDir`. It does not repeat the large row-hash proof.
+
+This two-platform rule applies because satellite bases migrate independently.
+It is not a second implementation test.
+
+### Linux: full preservation proof
+
+Choose isolated paths and an unused port before the run:
+
+```sh
+upgrade_root="$(mktemp -d)"
+upgrade_base="$upgrade_root/base"
+upgrade_db="$upgrade_base/state.db"
+upgrade_prefix="$upgrade_root/prefix"
+upgrade_port=12384
+```
+
+1. Copy the consistent 0.1.7 backup into an isolated base directory. Record the
+   source file digest. Do not copy `-wal` or `-shm` files from a running org.
+2. Install the verified 0.1.7 package into an isolated npm prefix. Start it on
+   an unused port against the fixture. Require `/version` to report 0.1.7, then
+   stop it cleanly.
+3. Install an unmodified 0.1.8 package in a second isolated prefix and start it
+   against a fresh copy of the fixture. Require a named `ShapeError` that shows
+   `model-identity-v1` as the stored stamp and
+   `operator-decision-requests-v1` as the build stamp. It must not serve. Keep
+   the migrated-run copy separate from this refusal control.
+4. Before installing the migration candidate, require this exact stamp and
+   record the populations:
+
+   ```sh
+   sqlite3 -readonly "$upgrade_db" "SELECT shape FROM schema_stamp;"
+   sqlite3 -readonly "$upgrade_db" \
+      "SELECT 'work_items',count(*) FROM work_items UNION ALL
+      SELECT 'assignments',count(*) FROM assignments UNION ALL
+      SELECT 'sessions',count(*) FROM sessions UNION ALL
+      SELECT 'attests',count(*) FROM attests UNION ALL
+      SELECT 'decision_requests',count(*) FROM decision_requests UNION ALL
+      SELECT 'wakes',count(*) FROM wakes UNION ALL
+      SELECT 'messages',count(*) FROM messages;"
+   ```
+
+5. Hash the complete rebuilt rows in deterministic order. Select only the
+   0.1.7 columns so the new nullable columns do not change the digest:
+
+   ```sh
+   request_columns='id,kind,raiserId,raiserSessionKey,ownerUserId,assignmentId,expecterSessionKey,expecterUserId,lineageRung,effortGeneration,deadlineWakeId,raisedAt,deadlineAt,statuteName,actionKey,question,options,context,status,decision,rationale,ruledBy,ruledAt,rulingFactId,consumedAt,parkWakeId,withdrawnBy,withdrawnReason,withdrawnAt'
+   sqlite3 -readonly "$upgrade_db" ".mode quote" \
+     "SELECT $request_columns FROM decision_requests ORDER BY id;" | shasum -a 256
+   sqlite3 -readonly "$upgrade_db" ".mode quote" \
+     "SELECT * FROM wakes ORDER BY wakeId;" | shasum -a 256
+   message_columns='seq,id,sessionKey,role,content,timestamp,sender,deviceId,clientMessageId,replyToMessageId,replyToClientMessageId,llmVisibleMessageId,attachments,attentionTier'
+   sqlite3 -readonly "$upgrade_db" ".mode quote" \
+     "SELECT $message_columns FROM messages ORDER BY seq;" | shasum -a 256
+   ```
+
+6. Install the verified migration-candidate package into the same isolated
+   prefix. Start the gateway once against the same base and port. This boot
+   performs the migration. Do not run a separate SQL migration command.
+7. Require `/version` to report the expected 0.1.8 build and source SHA. Then
+   require all of these database checks:
+
+   ```sh
+   sqlite3 -readonly "$upgrade_db" "SELECT shape FROM schema_stamp;"
+   sqlite3 -readonly "$upgrade_db" "PRAGMA quick_check;"
+   sqlite3 -readonly "$upgrade_db" "PRAGMA foreign_key_check;"
+   sqlite3 -readonly "$upgrade_db" \
+     "SELECT count(*) FROM pragma_table_info('decision_requests')
+      WHERE name='ruledViaSessionKey';"
+   sqlite3 -readonly "$upgrade_db" \
+     "SELECT count(*) FROM pragma_table_info('messages')
+      WHERE name IN ('messageType','markerKind','markerFrom','markerTo');"
+   sqlite3 -readonly "$upgrade_db" \
+     "SELECT count(*) FROM sqlite_master
+      WHERE type='index' AND name='decision_requests_operator_open';"
+   sqlite3 -readonly "$upgrade_db" \
+     "SELECT count(*) FROM sqlite_master
+      WHERE type='table' AND name IN
+        ('decision_requests_model_identity_v1','messages_new');"
+   ```
+
+   PASS means the stamp is `operator-decision-requests-v1`, `quick_check` is
+   `ok`, `foreign_key_check` prints nothing, the new request-column and index
+   counts are `1`, the new message-column count is `4`, and the temporary-table
+   count is `0`.
+8. Repeat all population counts and deterministic hashes. Require exact
+   equality with steps 4 and 5. Start the 0.1.8 gateway a second time and
+   require the same stamp timestamp, counts, and hashes again; this proves an
+   ordinary restart does not replay the migration.
+9. On a disposable copy, replace the stamp with an unknown value and require a
+   named refusal with no table or stamp mutation.
+
+### macOS: package and base-directory smoke
+
+Use a fresh copy of the same pre-upgrade fixture, the Darwin package, an unused
+port, and the host registry's real base-directory convention. Stop only the
+isolated test gateway.
+
+1. Boot the fixture once with the 0.1.7 Darwin package and require `/version`
+   0.1.7. Stop it cleanly.
+2. Install the 0.1.8 Darwin package into the same isolated prefix and restart
+   against the same base directory.
+3. Require `/version` to report the expected 0.1.8 build and source SHA.
+4. Require the new stamp; unchanged `work_items`, `assignments`, `sessions`,
+   `attests`, `decision_requests`, `wakes`, and `messages` counts;
+   `PRAGMA quick_check = ok`; no foreign key failures; all new columns and
+   indexes; and no migration temporary table.
+
+Do not run the TARS or Shrdlu cold-install custody matrix again. This is the
+upgrade-preservation check that matrix did not cover.
 
 ## The cycle
 
@@ -152,9 +310,7 @@ opened a fresh epoch with no `dirty_exit`, and all four checks below returned
 what this document says they return, including `/version` answering
 `{"adapters":{},"protocolVersion":1,"server":"tightbeam"}`.
 
-**Not verified:** running two *different* code versions against one `state.db`. The
-"swap the code" step is `git checkout` plus a recompile and touches nothing the
-database sees, so the restart half was exercised as two boots of the same code
-against one file. A migration-bearing upgrade is a different question and this
-document does not cover it — schemas are created additively at boot
-(`ensure_schema`), and no destructive migration path exists to describe.
+The historical measurements above used two boots of the same code against one
+file. They do not prove the 0.1.7 to 0.1.8 migration. Use the dedicated E2E in
+this document for that release transition; do not substitute a cold install or
+an ordinary restart result.

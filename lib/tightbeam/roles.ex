@@ -8,7 +8,6 @@ defmodule Tightbeam.Roles do
 
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
-  alias Tightbeam.Firehose.Publisher
   alias Tightbeam.Org
 
   @type db :: GenServer.server()
@@ -71,20 +70,6 @@ defmodule Tightbeam.Roles do
   end
 
   @doc false
-  def create_with_firehose!(db, name, owner_user_id, bound_session_key, call) do
-    transaction!(db, fn txn ->
-      case create!(txn, name, owner_user_id, bound_session_key) do
-        {:error, _} = error ->
-          error
-
-        role ->
-          Publisher.maybe_accepted_in_txn(txn, call, %{role: firehose_role_in_txn(txn, name)})
-          role
-      end
-    end)
-  end
-
-  @doc false
   @spec create_in_txn!(Txn.t(), String.t(), String.t(), String.t() | nil) :: role()
   def create_in_txn!(%Txn{} = txn, name, owner_user_id, bound_session_key) do
     case create!(txn, name, owner_user_id, bound_session_key) do
@@ -111,23 +96,6 @@ defmodule Tightbeam.Roles do
     end)
   end
 
-  @doc false
-  def bind_with_firehose(db, name, session_key, call) do
-    transaction!(db, fn txn ->
-      with :ok <- role_present(txn, name),
-           :ok <- active_session(txn, session_key) do
-        Txn.q(
-          txn,
-          "UPDATE roles SET boundSessionKey = ?2, updatedAt = ?3 WHERE name = ?1",
-          [name, session_key, now()]
-        )
-
-        Publisher.maybe_accepted_in_txn(txn, call, %{role: firehose_role_in_txn(txn, name)})
-        :ok
-      end
-    end)
-  end
-
   @doc "Names of roles currently bound to an active session, in deterministic order."
   @spec for_session(db(), String.t()) :: [String.t()]
   def for_session(db \\ Tightbeam.DB, session_key) do
@@ -145,17 +113,6 @@ defmodule Tightbeam.Roles do
     transaction!(db, fn txn ->
       with :ok <- role_present(txn, name) do
         Txn.q(txn, "DELETE FROM roles WHERE name = ?1", [name])
-        :ok
-      end
-    end)
-  end
-
-  @doc false
-  def rm_with_firehose(db, name, call) do
-    transaction!(db, fn txn ->
-      with :ok <- role_present(txn, name) do
-        Txn.q(txn, "DELETE FROM roles WHERE name = ?1", [name])
-        Publisher.maybe_accepted_in_txn(txn, call, %{removed: name})
         :ok
       end
     end)
@@ -252,23 +209,6 @@ defmodule Tightbeam.Roles do
 
   defp to_role([name, bound_session_key, owner_user_id]) do
     %{name: name, bound_session_key: bound_session_key, owner_user_id: owner_user_id}
-  end
-
-  defp firehose_role_in_txn(txn, name) do
-    [[name, bound_session_key, owner_user_id, created_at, updated_at]] =
-      Txn.q(
-        txn,
-        "SELECT name, boundSessionKey, ownerUserId, createdAt, updatedAt FROM roles WHERE name = ?1",
-        [name]
-      )
-
-    %{
-      name: name,
-      bound_session_key: bound_session_key,
-      owner_user_id: owner_user_id,
-      created_at: created_at,
-      updated_at: updated_at
-    }
   end
 
   defp transaction!(db, fun) do

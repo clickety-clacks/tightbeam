@@ -30,8 +30,7 @@ defmodule Tightbeam.SessionLane do
     task_ref: nil,
     task_pid: nil,
     current_seq: nil,
-    current_message_id: nil,
-    current_owner_lease: nil
+    current_message_id: nil
   ]
 
   @doc """
@@ -79,11 +78,11 @@ defmodule Tightbeam.SessionLane do
   eventually give. Waiting for the true answer beats inventing a second, smaller,
   unrelated number that turns a clean `:not_running` into a timeout exit.
   """
-  @spec cancel_current(String.t(), keyword()) ::
+  @spec cancel_current(String.t()) ::
           {:ok, %{seq: integer(), message_id: String.t()}} | :not_running | :no_lane
-  def cancel_current(session_key, opts \\ []) do
+  def cancel_current(session_key) do
     case Registry.lookup(Tightbeam.LaneRegistry, session_key) do
-      [{pid, _}] -> GenServer.call(pid, {:cancel_current, opts}, :infinity)
+      [{pid, _}] -> GenServer.call(pid, :cancel_current, :infinity)
       [] -> :no_lane
     end
   end
@@ -133,13 +132,11 @@ defmodule Tightbeam.SessionLane do
   end
 
   @impl true
-  def handle_call({:cancel_current, _opts}, _from, %{task_ref: nil} = state),
+  def handle_call(:cancel_current, _from, %{task_ref: nil} = state),
     do: {:reply, :not_running, state}
 
-  def handle_call({:cancel_current, opts}, _from, state) do
-    opts = Keyword.put(opts, :owner_lease, state.current_owner_lease)
-
-    case Ledger.finish(state.db, state.current_seq, "canceled", nil, opts) do
+  def handle_call(:cancel_current, _from, state) do
+    case Ledger.finish(state.db, state.current_seq, "canceled") do
       :ok ->
         state.on_terminal.(state.session_key, state.current_seq)
         reply = {:ok, %{seq: state.current_seq, message_id: state.current_message_id}}
@@ -168,7 +165,7 @@ defmodule Tightbeam.SessionLane do
   # TurnTask finished normally.
   def handle_info({ref, {seq, outcome}}, %{task_ref: ref} = state) do
     Process.demonitor(ref, [:flush])
-    finalize(state, seq, outcome, cause: "turn-runner", principal: "process:tightbeam")
+    finalize(state, seq, outcome)
     {:noreply, maybe_start(%{state | task_ref: nil})}
   end
 
@@ -179,12 +176,7 @@ defmodule Tightbeam.SessionLane do
       )
       when not is_nil(reason) do
     EventLog.lifecycle(state.db, "turn_task_crash", state.session_key, inspect(reason))
-
-    finalize(state, seq, crash_outcome(reason),
-      cause: "turn-task-crash",
-      principal: "process:tightbeam"
-    )
-
+    finalize(state, seq, crash_outcome(reason))
     {:noreply, maybe_start(%{state | task_ref: nil})}
   end
 
@@ -229,7 +221,6 @@ defmodule Tightbeam.SessionLane do
         |> Map.put(:task_pid, task.pid)
         |> Map.put(:current_seq, turn.seq)
         |> Map.put(:current_message_id, turn.message_id)
-        |> Map.put(:current_owner_lease, turn.owner_lease)
 
       :busy ->
         state
@@ -255,72 +246,49 @@ defmodule Tightbeam.SessionLane do
     end
   end
 
-  defp finalize(state, seq, outcome, terminal_opts) do
-    terminal_opts = Keyword.put(terminal_opts, :owner_lease, state.current_owner_lease)
-
-    {terminal, error, publish, in_txn, after_commit} =
+  defp finalize(state, seq, outcome) do
+    {terminal, error, publish, in_txn} =
       case outcome do
+        {:ok, %{terminal_publish: fun, record_in_txn: action}}
+        when is_function(fun, 1) and is_function(action, 1) ->
+          {"delivered", nil, fun, action}
+
         {:ok, %{terminal_publish: fun}} when is_function(fun, 1) ->
-          {"delivered", nil, fun, nil, nil}
+          {"delivered", nil, fun, nil}
 
         {:ok, _} ->
-          {"delivered", nil, nil, nil, nil}
-
-        {:error,
-         %{
-           reason: reason,
-           terminal: terminal,
-           terminal_publish: fun,
-           record_in_txn: action,
-           after_commit: committed
-         }}
-        when terminal in ["failed", "failed_unknown"] and is_function(fun, 1) and
-               is_function(action, 1) and is_function(committed, 1) ->
-          {terminal, error_text(reason), fun, action, committed}
-
-        {:error,
-         %{
-           reason: reason,
-           terminal_publish: fun,
-           record_in_txn: action,
-           after_commit: committed
-         }}
-        when is_function(fun, 1) and is_function(action, 1) and is_function(committed, 1) ->
-          {"failed", error_text(reason), fun, action, committed}
+          {"delivered", nil, nil, nil}
 
         {:error, %{reason: reason, terminal_publish: fun, record_in_txn: action}}
         when is_function(fun, 1) and is_function(action, 1) ->
-          {"failed", error_text(reason), fun, action, nil}
+          {"failed", error_text(reason), fun, action}
 
         {:error, %{reason: reason, terminal_publish: fun}} when is_function(fun, 1) ->
-          {"failed", error_text(reason), fun, nil, nil}
+          {"failed", error_text(reason), fun, nil}
 
         {:error, reason} ->
-          {"failed", error_text(reason), nil, nil, nil}
+          {"failed", error_text(reason), nil, nil}
       end
 
-    {finish_result, recorded} =
+    {finish_result, post_commit} =
       if in_txn do
-        {:ok, result} =
+        {:ok, {won, post_commit}} =
           DB.transaction(state.db, fn txn ->
-            if Ledger.finish_in_txn(txn, seq, terminal, error, terminal_opts) do
-              {:won, in_txn.(txn)}
+            if Ledger.finish_in_txn(txn, seq, terminal, error) do
+              {true, in_txn.(txn)}
             else
-              :already_terminal
+              {false, nil}
             end
           end)
 
-        case result do
-          {:won, value} -> {:ok, value}
-          :already_terminal -> {:already_terminal, nil}
-        end
+        {if(won, do: :ok, else: :already_terminal), post_commit}
       else
-        {Ledger.finish(state.db, seq, terminal, error, terminal_opts), nil}
+        {Ledger.finish(state.db, seq, terminal, error), nil}
       end
 
     case finish_result do
       :ok ->
-        if after_commit, do: after_commit.(recorded)
+        if is_function(post_commit, 0), do: post_commit.()
 
         if publish do
           publish.(terminal)

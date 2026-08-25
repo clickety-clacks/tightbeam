@@ -1,7 +1,7 @@
 defmodule Tightbeam.Productions.BubbleTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{ConditionFacts, ConnRegistry, DB, Ledger, Model, Org}
+  alias Tightbeam.{ConditionFacts, ConnRegistry, DB, HarnessHealth, Ledger, Model, Org}
   alias Tightbeam.Productions.Bubble
 
   defmodule LaneDoorbell do
@@ -50,7 +50,6 @@ defmodule Tightbeam.Productions.BubbleTest do
       Org.create(db, %{
         session_key: key,
         display_name: key,
-        kind: if(built_in?, do: "main", else: "custom"),
         owner_user_id: "flynn",
         origin: "user:flynn",
         archetype: "default",
@@ -76,7 +75,7 @@ defmodule Tightbeam.Productions.BubbleTest do
       )
 
     {:ok, turn} = Ledger.claim_next(db, session_key, "test-lane")
-    :ok = Ledger.finish(db, turn.seq, terminal, error, owner_lease: turn.owner_lease)
+    :ok = Ledger.finish(db, turn.seq, terminal, error)
     turn.seq
   end
 
@@ -100,7 +99,6 @@ defmodule Tightbeam.Productions.BubbleTest do
     assert request_ref == "bubble:#{seq}"
     assert wake_id == "bubble:#{seq}:supervisor"
     assert origin == "process:tightbeam"
-    assert String.starts_with?(prompt, "[from process:tightbeam]\n\nTurn #{seq}")
     assert prompt =~ "holder"
     assert prompt =~ "quota exhausted"
 
@@ -110,25 +108,45 @@ defmodule Tightbeam.Productions.BubbleTest do
     assert [_] = notice_turn(ctx.db, "supervisor")
   end
 
-  test "a failed turn bubbles to the operational parent, not the spawning session", ctx do
-    operational_supervisor = session(ctx.db, "operational-supervisor", ctx.main.session_key)
+  test "an open incident suppresses only its affected harness", ctx do
+    assert {:opened, _incident} =
+             HarnessHealth.observe(ctx.db, %{
+               correlation_id: "bubble-rate-limit",
+               harness: "claude",
+               host: "testhost",
+               failure_class: "rate-limit-dead",
+               evidence_kind: "authoritative-provider",
+               session_key: ctx.holder.session_key,
+               assignment_id: nil,
+               observed_at: 1,
+               cause: "provider rate limit",
+               principal: "process:tightbeam"
+             })
 
-    holder =
-      Org.set_operational_parent(
-        ctx.db,
-        ctx.holder.session_key,
-        operational_supervisor.session_key
-      )
-
-    seq = fail_turn!(ctx.db, holder.session_key)
-    :ok = Bubble.recognize_terminal(ctx.db, seq)
-
-    assert holder.spawned_by == ctx.supervisor.session_key
-
-    assert [[_, "bubble:" <> _, _, _, _]] =
-             notice_turn(ctx.db, operational_supervisor.session_key)
-
+    affected_seq = fail_turn!(ctx.db, ctx.holder.session_key)
+    :ok = Bubble.recognize_terminal(ctx.db, affected_seq)
     assert notice_turn(ctx.db, ctx.supervisor.session_key) == []
+
+    healthy =
+      Org.create(ctx.db, %{
+        session_key: "healthy-holder",
+        display_name: "Healthy holder",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        harness: "claude",
+        provider: "anthropic",
+        host: "healthy-host",
+        model: Model.new("fable"),
+        spawned_by: ctx.supervisor.session_key
+      })
+
+    healthy_seq = fail_turn!(ctx.db, healthy.session_key)
+    :ok = Bubble.recognize_terminal(ctx.db, healthy_seq)
+    healthy_ref = "bubble:#{healthy_seq}"
+
+    assert [[_, ^healthy_ref, _, _, _]] =
+             notice_turn(ctx.db, ctx.supervisor.session_key)
   end
 
   test "a canceled cause turn never bubbles — cancellation is a decision", ctx do
@@ -159,12 +177,7 @@ defmodule Tightbeam.Productions.BubbleTest do
 
     # The supervisor cannot run either: its notice fails. Same wall.
     {:ok, notice} = Ledger.claim_next(ctx.db, "supervisor", "test-lane")
-
-    :ok =
-      Ledger.finish(ctx.db, notice.seq, "failed", "quota exhausted",
-        owner_lease: notice.owner_lease
-      )
-
+    :ok = Ledger.finish(ctx.db, notice.seq, "failed", "quota exhausted")
     :ok = Bubble.recognize_terminal(ctx.db, notice.seq)
 
     # The SAME cause climbed — not a notice about the notice.
@@ -177,10 +190,7 @@ defmodule Tightbeam.Productions.BubbleTest do
     # the lineage: the alert is a substrate message in the owner's stream (no
     # turn, no tokens) and the fact stands for the OWNER, not a session.
     {:ok, top} = Ledger.claim_next(ctx.db, ctx.main.session_key, "test-lane")
-
-    :ok =
-      Ledger.finish(ctx.db, top.seq, "failed", "quota exhausted", owner_lease: top.owner_lease)
-
+    :ok = Ledger.finish(ctx.db, top.seq, "failed", "quota exhausted")
     :ok = Bubble.recognize_terminal(ctx.db, top.seq)
 
     assert ConditionFacts.standing?(ctx.db, "user-alerted", "flynn")
@@ -224,12 +234,12 @@ defmodule Tightbeam.Productions.BubbleTest do
     assert ref == "bubble:#{cause_seq}"
   end
 
-  test "Main is the operational-parent terminus for its own failure", ctx do
+  test "a parentless session's failure marks its own stream and climbs nowhere", ctx do
     seq = fail_turn!(ctx.db, ctx.main.session_key)
     :ok = Bubble.recognize_terminal(ctx.db, seq)
 
     assert notice_turn(ctx.db, "supervisor") == []
-    assert ConditionFacts.standing?(ctx.db, "user-alerted", "flynn")
+    refute ConditionFacts.standing?(ctx.db, "user-alerted", "flynn")
   end
 
   test "the first delivered turn for an alerted owner clears the alert", ctx do
@@ -252,10 +262,7 @@ defmodule Tightbeam.Productions.BubbleTest do
       )
 
     {:ok, turn} = Ledger.claim_next(ctx.db, "holder", "test-lane")
-
-    :ok =
-      Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
-
+    :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
     :ok = Bubble.recognize_terminal(ctx.db, turn.seq)
 
     refute ConditionFacts.standing?(ctx.db, "user-alerted", "flynn")
@@ -269,10 +276,7 @@ defmodule Tightbeam.Productions.BubbleTest do
 
     for rung <- ["supervisor", ctx.main.session_key] do
       {:ok, notice} = Ledger.claim_next(ctx.db, rung, "test-lane")
-
-      :ok =
-        Ledger.finish(ctx.db, notice.seq, "failed", "new wall", owner_lease: notice.owner_lease)
-
+      :ok = Ledger.finish(ctx.db, notice.seq, "failed", "new wall")
       :ok = Bubble.recognize_terminal(ctx.db, notice.seq)
     end
 

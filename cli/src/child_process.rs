@@ -99,7 +99,22 @@ pub(crate) fn terminate_process_group(
     child: &mut std::process::Child,
     grace: Duration,
 ) -> io::Result<()> {
-    signal_process_group(child, libc::SIGTERM)?;
+    match signal_process_group(child, libc::SIGTERM) {
+        Ok(()) => {}
+        // The forwarding handler may have delivered TERM immediately before cleanup
+        // repeats it. Darwin reports EPERM, rather than ESRCH, when the group now contains
+        // only exited processes. Re-read the still-waitable leader before accepting that
+        // state: a live descendant with the same credentials remains signalable, so an
+        // EPERM while the leader is still live is still a real cleanup failure.
+        #[cfg(target_os = "macos")]
+        Err(error)
+            if error.raw_os_error() == Some(libc::EPERM)
+                && exited_without_reaping(child).unwrap_or(false) =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    }
     let deadline = Instant::now() + grace;
     let mut leader_exited = false;
     while Instant::now() < deadline {

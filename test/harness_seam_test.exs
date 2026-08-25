@@ -48,11 +48,7 @@ defmodule Tightbeam.HarnessSeamTest do
     File.write!(Path.join(home, "durable-session"), "unchanged")
     on_exit(fn -> File.rm_rf!(base_dir) end)
 
-    assert {:ok,
-            [
-              %{family: "fixture-model", context: nil, provider: :fixture_provider},
-              %{family: "fixture-tiered", context: nil, provider: :fixture_provider}
-            ]} =
+    assert {:ok, [%{family: "fixture-model", context: nil, provider: :fixture_provider}]} =
              Harness.Fixture.fetch_catalog(%{})
 
     assert %{home_path: ^home, linked_auth_files: ["fixture.json"]} =

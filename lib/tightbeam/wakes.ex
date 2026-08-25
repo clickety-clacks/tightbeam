@@ -25,9 +25,8 @@ defmodule Tightbeam.Wakes do
   use GenServer
   require Logger
 
-  alias Tightbeam.{ConditionFacts, DB, Escalation, EventLog, Gateway}
+  alias Tightbeam.{ConditionFacts, DB, EventLog, Gateway}
   alias Tightbeam.DB.Txn
-  alias Tightbeam.Firehose.Publisher
 
   @type db :: GenServer.server()
 
@@ -52,12 +51,7 @@ defmodule Tightbeam.Wakes do
           target_gate: integer(),
           reresolve: String.t() | nil,
           reresolve_seed: String.t() | nil,
-          reresolve_rung: integer() | nil,
-          class: String.t() | nil,
-          class_election: String.t() | nil,
-          delivery_rule: String.t() | nil,
-          digest: boolean(),
-          summon: boolean()
+          reresolve_rung: integer() | nil
         }
 
   @typedoc "Delivery fun injected by the composition root: fires the prompt into the turn pipeline."
@@ -91,42 +85,9 @@ defmodule Tightbeam.Wakes do
     assignmentId TEXT,
     canceledAt INTEGER,
     targetGate INTEGER NOT NULL DEFAULT 1,
-    -- COORDINATION CLASS (fabric §7). Deliberately UNCONSTRAINED: the five seed
-    -- names are ANATOMY, and a kungfu may extend the vocabulary freely, so a
-    -- CHECK here would make an org's own extension a substrate refusal — a cage.
-    -- What the substrate owes is the truth of what the sender said; an extension
-    -- the receiver has no mapping for is delivered as `fyi` with a named skew
-    -- row (§5 policy-skew rule), never dropped and never promoted.
-    class TEXT,
-    -- WHO elected the class. The classifier stamps ONLY unclassified traffic
-    -- (§5); this column is the proof it never overwrote a sender. A digest
-    -- CARRIER is attributed 'batcher' — it was built by the batcher, not
-    -- elected by any sender or the classifier, and claiming 'sender' here
-    -- would be an untrue audit fact (Sol xhigh review, finding 7). Members
-    -- keep their own true election; only the carrier row uses this value.
-    -- `'batcher'` is a SHAPE change (schema.ex's `@shape` bumped to
-    -- `coordination-fabric-classes-v2`, Sol xhigh review round 2, finding 2):
-    -- `CREATE TABLE IF NOT EXISTS` cannot widen this CHECK on a table that
-    -- already exists, so a database from the OLD shape is refused by name
-    -- rather than dying on a raw CHECK violation at the first carrier insert.
-    classElection TEXT CHECK (classElection IN ('sender','classifier','batcher')),
-    -- SIGNED PROVENANCE (§8 legibility): the named rule + revision that decided
-    -- THIS wake's delivery, so any agent knows which reflex to inhibit.
-    deliveryRule TEXT,
-    -- 1 = this wake IS a digest carrier; 0 = an ordinary wake (possibly a
-    -- digest MEMBER, which the wake_cancellations replacement row records).
-    digest INTEGER NOT NULL DEFAULT 0 CHECK (digest IN (0,1)),
-    -- The desk's deliberate spend of its principal's turn (fabric §Terms).
-    -- Sender-elected, NEVER substrate-inferred; the acceptance-№1 query (§11.1)
-    -- subtracts these, and both its windows must run the SAME query, so the
-    -- carrier ships in Phase 1 even though Phase 3 stands up the first desk.
-    summon INTEGER NOT NULL DEFAULT 0 CHECK (summon IN (0,1)),
-    CHECK (consumer != 'prompt' OR prompt IS NOT NULL),
-    CHECK ((class IS NULL) = (classElection IS NULL)),
-    CHECK (digest = 0 OR class IS NOT NULL)
+    CHECK (consumer != 'prompt' OR prompt IS NOT NULL)
   );
   CREATE INDEX IF NOT EXISTS wakes_due ON wakes (state, dueAt);
-  CREATE INDEX IF NOT EXISTS wakes_delivery ON wakes (state, deliveryRule, sessionKey, class);
   CREATE TABLE IF NOT EXISTS scheduler_state (
     id INTEGER PRIMARY KEY CHECK (id = 0),
     afterFact INTEGER NOT NULL DEFAULT 0
@@ -137,128 +98,6 @@ defmodule Tightbeam.Wakes do
 
   @spec ensure_schema(db()) :: :ok | {:error, term()}
   def ensure_schema(db \\ Tightbeam.DB), do: DB.execute(db, @ddl)
-
-  ## Delivery policy (coordination-fabric-v1 §5 `classifier` + `batcher`, §7 table)
-  #
-  # THE MAXIM: a wake's class decides WHEN a mind's turn is spent, never WHETHER
-  # the message is recorded (Law 2). Every row below lands durably at its own
-  # `schedule_in_txn`; batching only moves the moment the turn materializes, and
-  # every batched delivery exits on TIME or a TURN BOUNDARY — never on anyone's
-  # decision (Invariant 3).
-  #
-  # LAYER. The mechanism — stamp a class, look up an immediacy, enforce a
-  # ceiling, sign the result — is PHYSICS. The names and the numbers are
-  # ANATOMY: seed defaults, verbatim from §7's table, reshapeable by an org
-  # through the identity tree. Phase 6 lifts them into policy rows; until a row
-  # exists these hardcoded defaults are the fallback (§5). Nothing here judges
-  # the CONTENT of a message — the sender elects, the substrate obeys.
-  #
-  # §7's immediacy column reads "desk exists / no desk". No desk exists on this
-  # line (Phase 3 stands up the first one), so the NO-DESK column governs every
-  # row below, and each is annotated with the phrase it implements.
-
-  @doc "The class the classifier stamps on unclassified traffic (fabric §5 seed default)."
-  @spec classifier_default() :: String.t()
-  def classifier_default, do: "fyi"
-
-  @doc "The five seed-shipped base classes (fabric §7). A kungfu may extend past these."
-  @spec seed_classes() :: [String.t()]
-  def seed_classes, do: ~w(fyi status-query input-needed blocker algedonic)
-
-  # Rule revision. Bump when a rule's BEHAVIOUR changes, so a digest signed by
-  # the old revision stays honest about which reflex produced it.
-  @rules_rev "r1"
-
-  @digest_rule "turn-boundary-digest #{@rules_rev}"
-  @immediate_rule "immediate-delivery #{@rules_rev}"
-  @bypass_rule "algedonic-bypass #{@rules_rev}"
-  @inhibited_rule "batcher-inhibited #{@rules_rev}"
-
-  @minute 60_000
-  @hour 3_600_000
-
-  @class_policy %{
-    # "digest at next turn boundary / same" — ceiling 4 h.
-    "fyi" => %{immediacy: :digest, ceiling_ms: 4 * @hour},
-    # "rows answer (Phase 5), else parent" — no responder exists yet, so the
-    # target still receives it; the 30-minute ceiling is what §7 pins.
-    "status-query" => %{immediacy: :digest, ceiling_ms: 30 * @minute},
-    # "principal at next turn boundary" — ceiling is the prodder floor.
-    "input-needed" => %{immediacy: :digest, ceiling_ms: 30 * @minute},
-    # "principal immediately". NO CEILING (O7): `immediate`/`bypass` classes
-    # never pass through the ceiling arithmetic (`apply_delivery_policy`'s
-    # ceiling branch only runs for `policy.immediacy == :digest`), so `0` here
-    # was inert but FALSE — a datum nobody read today that a future Phase 6
-    # policy-extraction pass could still lift and publish as "blocker's
-    # ceiling is zero," which is not what §7 says (no ceiling governs an
-    # immediate/bypass delivery at all). `nil` is the honest value: there is
-    # no ceiling to report.
-    "blocker" => %{immediacy: :immediate, ceiling_ms: nil},
-    # "bypasses every bone and every desk. Never batched, never digested."
-    #
-    # PARTIAL AGAINST §7, and named rather than papered over: the seed default
-    # routes an alarm to the principal AND the org's configured human channel.
-    # The bypass half ships here. The dual-routing half does NOT — there is no
-    # human-channel carrier on this line to route to, and inventing one inside
-    # the batching seam would be a routing decision smuggled in under a timing
-    # mechanism. An alarm reaches its target and skips every bone; it does not
-    # yet reach a human by a second path.
-    "algedonic" => %{immediacy: :bypass, ceiling_ms: nil}
-  }
-
-  @doc """
-  Stamp a class on inbound traffic (fabric §5 `classifier`).
-
-  Returns `{class, election}`. A sender's election is returned VERBATIM and is
-  NEVER overwritten — including an extended class this build has never heard of,
-  which the policy below maps down to `fyi` while the row keeps what was said.
-  """
-  @spec classify(String.t() | nil) :: {String.t(), String.t()}
-  def classify(elected) when is_binary(elected) and elected != "", do: {elected, "sender"}
-  def classify(_unclassified), do: {classifier_default(), "classifier"}
-
-  @doc """
-  The delivery policy for a class (fabric §7 seed table).
-
-  An unknown class takes `fyi`'s policy and reports `skew: true` — the §5
-  policy-skew rule: never dropped (Law 2), never promoted to immediate, and the
-  caller files a named skew row so the vocabulary gap is visible and repairable.
-  """
-  @spec delivery_policy(String.t()) :: %{
-          immediacy: :digest | :immediate | :bypass,
-          ceiling_ms: non_neg_integer() | nil,
-          rule: String.t(),
-          skew: boolean()
-        }
-  def delivery_policy(class) when is_binary(class) do
-    case Map.fetch(@class_policy, class) do
-      {:ok, policy} -> Map.merge(policy, %{rule: rule_for(policy.immediacy), skew: false})
-      :error -> known_policy_for_skew()
-    end
-  end
-
-  defp known_policy_for_skew do
-    policy = Map.fetch!(@class_policy, classifier_default())
-    Map.merge(policy, %{rule: rule_for(policy.immediacy), skew: true})
-  end
-
-  defp rule_for(:digest), do: @digest_rule
-  defp rule_for(:immediate), do: @immediate_rule
-  defp rule_for(:bypass), do: @bypass_rule
-
-  @doc "The signature line a digest carries (fabric §8: every bone signs its work)."
-  @spec digest_signature(non_neg_integer()) :: String.t()
-  def digest_signature(count) do
-    "coalesced by #{@digest_rule} (#{count} #{if count == 1, do: "notice", else: "notices"})"
-  end
-
-  @doc false
-  @spec digest_rule() :: String.t()
-  def digest_rule, do: @digest_rule
-
-  @doc false
-  @spec inhibited_rule() :: String.t()
-  def inhibited_rule, do: @inhibited_rule
 
   ## Store (pure DB ops — callable without the scheduler process, e.g. by inspect)
 
@@ -274,18 +113,7 @@ defmodule Tightbeam.Wakes do
     transaction!(db, &schedule_in_txn(&1, input))
   end
 
-  @doc """
-  Persist a pending wake inside an existing DB transaction.
-
-  CLASSED TRAFFIC. When the input carries `:class` (or `:classify` to request the
-  classifier's stamp on unclassified traffic), the delivery policy above decides
-  the wake's `dueAt` and signs the row with the rule that decided it. The
-  BATCHER's inhibition seam is named and small: a caller that elected its own
-  delivery time (`:sender_scheduled`), a condition wake, a digest carrier, or a
-  non-prompt consumer is stamped `batcher-inhibited` and keeps the `due_at` it
-  was given. The class is still recorded either way — timing is shaped, truth
-  is not.
-  """
+  @doc "Persist a pending wake inside an existing DB transaction."
   @spec schedule_in_txn(Txn.t(), map()) :: wake()
   def schedule_in_txn(%Txn{} = txn, input) do
     condition_kind = Map.get(input, :condition_kind)
@@ -296,12 +124,6 @@ defmodule Tightbeam.Wakes do
         cursor
       end
 
-    created_at = now()
-    {class, class_election} = elected_class(input)
-
-    {delivery_rule, due_at} =
-      apply_delivery_policy(txn, input, class, created_at, condition_kind)
-
     wake = %{
       wake_id: Map.get(input, :wake_id, "w_" <> Tightbeam.Id.uuid4()),
       session_key: Map.fetch!(input, :session_key),
@@ -309,9 +131,9 @@ defmodule Tightbeam.Wakes do
       origin: Map.fetch!(input, :origin),
       prompt: Map.get(input, :prompt),
       consumer: Map.get(input, :consumer, "prompt"),
-      due_at: due_at,
+      due_at: Map.fetch!(input, :due_at),
       state: "pending",
-      created_at: created_at,
+      created_at: now(),
       fired_at: nil,
       condition_kind: condition_kind,
       condition_scope: Map.get(input, :condition_scope),
@@ -328,12 +150,7 @@ defmodule Tightbeam.Wakes do
       target_gate: Map.get(input, :target_gate, 1),
       reresolve: Map.get(input, :reresolve),
       reresolve_seed: Map.get(input, :reresolve_seed),
-      reresolve_rung: Map.get(input, :reresolve_rung),
-      class: class,
-      class_election: class_election,
-      delivery_rule: delivery_rule,
-      digest: Map.get(input, :digest, false),
-      summon: Map.get(input, :summon, false)
+      reresolve_rung: Map.get(input, :reresolve_rung)
     }
 
     Txn.q(
@@ -343,9 +160,9 @@ defmodule Tightbeam.Wakes do
           (wakeId, sessionKey, targetRole, origin, prompt, consumer, dueAt, state, createdAt, firedAt,
            reresolve, reresolveSeed, reresolveRung, conditionKind, conditionScope,
            conditionAfterId, firedBy, creatorSessionKey, rumination, work_item_id, assignmentId,
-           targetGate, class, classElection, deliveryRule, digest, summon)
+           targetGate)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, NULL, ?9, ?10, ?11,
-                ?12, ?13, ?14, NULL, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
+                ?12, ?13, ?14, NULL, ?15, ?16, ?17, ?18, ?19)
       """,
       [
         wake.wake_id,
@@ -366,12 +183,7 @@ defmodule Tightbeam.Wakes do
         if(wake.rumination, do: 1, else: 0),
         wake.work_item_id,
         wake.assignment_id,
-        wake.target_gate,
-        wake.class,
-        wake.class_election,
-        wake.delivery_rule,
-        if(wake.digest, do: 1, else: 0),
-        if(wake.summon, do: 1, else: 0)
+        wake.target_gate
       ]
     )
 
@@ -384,110 +196,8 @@ defmodule Tightbeam.Wakes do
       )
     end
 
-    file_policy_skew(txn, wake)
-
     wake
   end
-
-  # The class this wake carries, and who put it there. A caller that names
-  # `:class` elects; a caller that asks to be `:classify`-ed accepts the
-  # classifier's stamp; a caller that does neither gets no class at all, which
-  # is how every wake predating the fabric keeps behaving exactly as it did.
-  #
-  # A DIGEST CARRIER is neither of those: the batcher built the row, so
-  # `classify/1`'s "sender" stamp would be a false audit fact (Sol xhigh
-  # review, finding 7) — checked first because `:digest` always carries
-  # `:class` too and would otherwise be read as a sender election.
-  defp elected_class(input) do
-    cond do
-      Map.get(input, :digest, false) and is_binary(Map.get(input, :class)) ->
-        {Map.fetch!(input, :class), "batcher"}
-
-      is_binary(Map.get(input, :class)) and Map.get(input, :class) != "" ->
-        classify(Map.fetch!(input, :class))
-
-      Map.get(input, :classify, false) ->
-        classify(nil)
-
-      true ->
-        {nil, nil}
-    end
-  end
-
-  # An unclassed wake is not fabric traffic and the policy does not touch it.
-  defp apply_delivery_policy(_txn, input, nil, _created_at, _condition_kind),
-    do: {nil, Map.fetch!(input, :due_at)}
-
-  defp apply_delivery_policy(_txn, input, class, created_at, condition_kind) do
-    policy = delivery_policy(class)
-
-    cond do
-      # The carrier the batcher itself just built. Signed with the rule that
-      # produced it, delivered at the moment that rule chose, and never a
-      # member of anything: `digest = 1` is what keeps it out of its own group.
-      Map.get(input, :digest, false) ->
-        {@digest_rule, Map.fetch!(input, :due_at)}
-
-      # THE CLASS CHECK PRECEDES THE INHIBITION BRANCH (Sol xhigh review,
-      # finding 1). `immediate` and `bypass` classes were never the batcher's
-      # to hold in the first place — §7: algedonic "bypasses every bone...
-      # never batched, never digested, never triaged" — so there is nothing
-      # for `batcher-inhibited` to name here. A sender's own --after/--at on
-      # one of these classes is not the batcher inhibiting anything; it is
-      # the sender's own election, unchanged, and the row must say so: the
-      # rule stays `algedonic-bypass`/`immediate-delivery`, never
-      # `batcher-inhibited`. `due_at` is exactly what the caller supplied
-      # either way — scheduled or not, an alarm is never delayed BY POLICY.
-      policy.immediacy != :digest ->
-        {policy.rule, Map.fetch!(input, :due_at)}
-
-      batcher_inhibited?(input, condition_kind) ->
-        {@inhibited_rule, Map.fetch!(input, :due_at)}
-
-      # THE CEILING IS THE EXIT (Invariant 3). The wake is due at its class
-      # ceiling from the moment it is filed; the batcher may materialize the
-      # digest EARLIER at a turn boundary, but nothing can make it later, and
-      # an idle session's digest materializes its own turn right here.
-      true ->
-        {@digest_rule, created_at + policy.ceiling_ms}
-    end
-  end
-
-  # THE INHIBITION SEAM, named (philosophy gate Q2). The batcher is a default,
-  # not a cage: a sender that elected its own delivery moment keeps it, a
-  # condition wake keeps its own firing mechanics, and an internal consumer is
-  # not an agent's attention to protect. In every case the class is still
-  # RECORDED — inhibiting the reflex never erases what the sender said.
-  defp batcher_inhibited?(input, condition_kind) do
-    Map.get(input, :sender_scheduled, false) or is_binary(condition_kind) or
-      Map.get(input, :consumer, "prompt") != "prompt"
-  end
-
-  # FAIL QUIET AND VISIBLE (§5 policy-skew rule). An extended class this build
-  # has no mapping for is delivered as `fyi` — never dropped, never promoted —
-  # and the gap is a durable row somebody can act on, not a silent downgrade.
-  #
-  # THE ROW NAMES THE RULE THAT ACTUALLY DECIDED (O6 / §8 legibility): a
-  # batcher-inhibited wake (a sender's own `--after`, a condition wake, an
-  # internal consumer) never reaches the digest rule at all — hardcoding
-  # `@digest_rule` here claimed a reflex that never fired. `wake.delivery_rule`
-  # is the row's own already-computed fact, so the skew row and the wake it
-  # describes can never disagree about which rule produced it.
-  defp file_policy_skew(txn, %{class: class, wake_id: wake_id, delivery_rule: delivery_rule})
-       when is_binary(class) do
-    if delivery_policy(class).skew do
-      EventLog.lifecycle_in_txn(
-        txn,
-        "wake_class_policy_skew",
-        wake_id,
-        "class=#{class} deliveredAs=#{classifier_default()} rule=#{delivery_rule}"
-      )
-    end
-
-    :ok
-  end
-
-  defp file_policy_skew(_txn, _wake), do: :ok
 
   @doc false
   @spec retarget_in_txn(Txn.t(), String.t(), String.t()) :: wake() | :error
@@ -496,137 +206,86 @@ defmodule Tightbeam.Wakes do
     replacement_id = "w_" <> Tightbeam.Id.uuid4()
     created_at = now()
 
-    with [[1]] <-
-           Txn.q(
-             txn,
-             "SELECT 1 FROM sessions WHERE sessionKey=?1 AND state='active'",
-             [replacement_target]
-           ),
-         [row] <-
-           Txn.q(txn, select_wake_sql() <> " WHERE wakeId=?1 AND state='pending'", [wake_id]) do
-      source = to_wake(row)
-      {delivery_rule, due_at} = retarget_delivery(source, created_at)
+    case Txn.q(
+           txn,
+           "SELECT 1 FROM sessions WHERE sessionKey=?1 AND state='active'",
+           [replacement_target]
+         ) do
+      [[1]] ->
+        Txn.q(
+          txn,
+          """
+          INSERT INTO wakes
+            (wakeId, sessionKey, targetRole, origin, prompt, consumer, dueAt, state,
+             createdAt, firedAt, reresolve, reresolveSeed, reresolveRung,
+             conditionKind, conditionScope, conditionAfterId, firedBy,
+             creatorSessionKey, rumination, work_item_id, assignmentId, canceledAt,
+             targetGate)
+          SELECT ?2, ?3, targetRole, origin, prompt, consumer, dueAt, 'pending', ?4, NULL,
+                 reresolve, reresolveSeed, reresolveRung, conditionKind,
+                 conditionScope, conditionAfterId, NULL, creatorSessionKey,
+                 rumination, work_item_id, assignmentId, NULL, targetGate
+          FROM wakes
+          WHERE wakeId=?1 AND state='pending'
+          """,
+          [wake_id, replacement_id, replacement_target, created_at]
+        )
 
-      Txn.q(
-        txn,
-        """
-        INSERT INTO wakes
-          (wakeId, sessionKey, targetRole, origin, prompt, consumer, dueAt, state,
-           createdAt, firedAt, reresolve, reresolveSeed, reresolveRung,
-           conditionKind, conditionScope, conditionAfterId, firedBy,
-           creatorSessionKey, rumination, work_item_id, assignmentId,
-           targetGate, class, classElection, deliveryRule, digest, summon)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, NULL, ?9, ?10, ?11,
-                ?12, ?13, ?14, NULL, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
-        """,
-        [
-          replacement_id,
-          replacement_target,
-          source.target_role,
-          source.origin,
-          source.prompt,
-          source.consumer,
-          due_at,
-          created_at,
-          source.reresolve,
-          source.reresolve_seed,
-          source.reresolve_rung,
-          source.condition_kind,
-          source.condition_scope,
-          source.condition_after_id,
-          source.creator_session_key,
-          if(source.rumination, do: 1, else: 0),
-          source.work_item_id,
-          source.assignment_id,
-          source.target_gate,
-          source.class,
-          source.class_election,
-          delivery_rule,
-          if(source.digest, do: 1, else: 0),
-          if(source.summon, do: 1, else: 0)
-        ]
-      )
+        if Txn.changes(txn) == 1 do
+          case Txn.q(
+                 txn,
+                 """
+                 SELECT assignmentId, controllerOrigin, wakeKind, chargedGeneration
+                 FROM supervision_liveness_sidecar
+                 WHERE wakeId=?1 AND controllerOrigin='scheduled'
+                   AND controllerState='pending'
+                 """,
+                 [wake_id]
+               ) do
+            [[assignment_id, controller_origin, wake_kind, charged_generation]] ->
+              Txn.q(
+                txn,
+                """
+                UPDATE supervision_liveness_sidecar
+                SET controllerState='settled'
+                WHERE wakeId=?1 AND controllerState='pending'
+                """,
+                [wake_id]
+              )
 
-      if Txn.changes(txn) == 1 do
-        case Txn.q(
-               txn,
-               """
-               SELECT assignmentId, controllerOrigin, wakeKind, chargedGeneration
-               FROM supervision_liveness_sidecar
-               WHERE wakeId=?1 AND controllerOrigin='scheduled'
-                 AND controllerState='pending'
-               """,
-               [wake_id]
-             ) do
-          [[assignment_id, controller_origin, wake_kind, charged_generation]] ->
-            Txn.q(
-              txn,
-              """
-              UPDATE supervision_liveness_sidecar
-              SET controllerState='settled'
-              WHERE wakeId=?1 AND controllerState='pending'
-              """,
-              [wake_id]
-            )
+              Txn.q(
+                txn,
+                """
+                INSERT INTO supervision_liveness_sidecar
+                  (wakeId, assignmentId, controllerOrigin, wakeKind,
+                   controllerState, chargedGeneration)
+                VALUES (?1, ?2, ?3, ?4, 'pending', ?5)
+                """,
+                [
+                  replacement_id,
+                  assignment_id,
+                  controller_origin,
+                  wake_kind,
+                  charged_generation
+                ]
+              )
 
-            Txn.q(
-              txn,
-              """
-              INSERT INTO supervision_liveness_sidecar
-                (wakeId, assignmentId, controllerOrigin, wakeKind,
-                 controllerState, chargedGeneration)
-              VALUES (?1, ?2, ?3, ?4, 'pending', ?5)
-              """,
-              [
-                replacement_id,
-                assignment_id,
-                controller_origin,
-                wake_kind,
-                charged_generation
-              ]
-            )
+            [] ->
+              :ok
+          end
 
-          [] ->
-            :ok
+          [row] = Txn.q(txn, select_wake_sql() <> " WHERE wakeId=?1", [replacement_id])
+          to_wake(row)
+        else
+          :error
         end
 
-        [row] = Txn.q(txn, select_wake_sql() <> " WHERE wakeId=?1", [replacement_id])
-        to_wake(row)
-      else
+      [] ->
         :error
-      end
-    else
-      _ -> :error
     end
   end
 
   def retarget_in_txn(%Txn{}, _wake_id, _replacement_target), do: :error
-
-  # O1 (HIGH, Law 2): `class`/`classElection`/`digest`/`summon` are the
-  # SENDER's facts, not the batcher's — retarget is org.ex:688's unroutable
-  # remedy (a target session retired), and moving WHO receives a wake must
-  # never destroy WHAT the sender elected or what the row IS. The INSERT
-  # above now carries all five columns verbatim.
-  #
-  # `deliveryRule`/`dueAt` are carried VERBATIM too, and deliberately (Sol
-  # xhigh review round 2, finding 1 — Invariant 3): the CEILING anchors on
-  # the wake's own CREATION, never on when it happened to get retargeted.
-  # `created_at + ceiling_ms`, computed against the RETARGET moment, was
-  # this function's first draft and it was wrong — it RESTARTS the ceiling,
-  # so an `fyi` retargeted at 3h59m could land at 7h59m, a straight §7
-  # violation (a wake held longer because its target retired is a worse
-  # answer than the one Law 2 already gives: the row's original `dueAt` is
-  # already the correct ceiling, computed once, honestly, at filing time).
-  # There is nothing to recompute here, and nothing to tighten either —
-  # `source.due_at` already IS the anchor.
-  #
-  # The new target's own turn-boundary eligibility needs no help from this
-  # function: `materialize_due/4` re-reads `group_boundary/2` FRESH every
-  # materialization pass, against whatever session or role the row names
-  # NOW — retargeting a digest-held member into the new target's group is
-  # the whole mechanism. Nothing about WHEN it is due needs to move for that
-  # to be true.
-  defp retarget_delivery(source, _created_at), do: {source.delivery_rule, source.due_at}
 
   @requester_kinds ~w(user session process)
   @reason_kinds ~w(requester_withdrew superseded obligation_disposed routing_bracket_satisfied target_retired production_unmatched consumer_unavailable target_unresolvable)
@@ -641,11 +300,7 @@ defmodule Tightbeam.Wakes do
     "tightbeam:assignments" => ~w(obligation_disposed),
     "tightbeam:effort-checkin" => ~w(superseded obligation_disposed),
     "tightbeam:supervision" => ~w(superseded),
-    "tightbeam:retirement" => ~w(target_retired obligation_disposed),
-    # The batcher consumes a digest MEMBER exactly one way: superseded by the
-    # digest that carries it, named as the replacement. It has no other verb —
-    # it cannot withdraw, dispose, or retire anyone's mail.
-    "tightbeam:batcher" => ~w(superseded)
+    "tightbeam:retirement" => ~w(target_retired obligation_disposed)
   }
 
   @reason_matrix %{
@@ -839,8 +494,7 @@ defmodule Tightbeam.Wakes do
     source_id = Map.get(causal_source, :id)
 
     with :ok <- compatible?(requester_id, reason_kind, source_kind, outcome_kind),
-         {:ok, tagged} <-
-           validate_outcome(txn, outcome_kind, outcome, wake, primary, requester_id),
+         {:ok, tagged} <- validate_outcome(txn, outcome_kind, outcome, wake, primary),
          {:ok, durable_source_id, accepted_event_id} <-
            durable_source(txn, command, source_kind, source_id, wake, canceled_at) do
       {:ok,
@@ -983,7 +637,7 @@ defmodule Tightbeam.Wakes do
       )
 
   defp validate_source(txn, "decision_request", source_id, _wake),
-    do: if(Escalation.raw_exists_in_txn?(txn, source_id), do: :ok, else: :error)
+    do: row_exists(txn, "SELECT 1 FROM decision_requests WHERE id=?1", source_id)
 
   defp validate_source(txn, "monitor_generation", source_id, _wake),
     do: generation_exists(txn, source_id)
@@ -994,12 +648,12 @@ defmodule Tightbeam.Wakes do
   defp validate_source(txn, "session_transition", source_id, _wake),
     do: row_exists(txn, "SELECT 1 FROM sessions WHERE sessionKey=?1", source_id)
 
-  defp validate_outcome(txn, "replacement", outcome, wake, primary, requester_id) do
+  defp validate_outcome(txn, "replacement", outcome, wake, primary) do
     replacement_id = Map.get(outcome, :replacement_wake_id)
 
     with true <- primary.impact != "linked_work_not_open",
          true <- is_binary(replacement_id) and replacement_id != wake.wake_id,
-         :ok <- replacement_matches(txn, replacement_id, primary, requester_id),
+         :ok <- replacement_matches(txn, replacement_id, primary),
          true <- is_nil(Map.get(outcome, :disposition_kind)),
          true <- is_nil(Map.get(outcome, :disposition_id)),
          true <- is_nil(Map.get(outcome, :liveness_trigger)) do
@@ -1018,7 +672,7 @@ defmodule Tightbeam.Wakes do
     end
   end
 
-  defp validate_outcome(txn, "disposition", outcome, wake, primary, _requester_id) do
+  defp validate_outcome(txn, "disposition", outcome, wake, primary) do
     disposition_kind = Map.get(outcome, :disposition_kind)
     disposition_id = Map.get(outcome, :disposition_id)
 
@@ -1038,7 +692,7 @@ defmodule Tightbeam.Wakes do
     end
   end
 
-  defp validate_outcome(txn, "no_replacement", outcome, wake, primary, _requester_id) do
+  defp validate_outcome(txn, "no_replacement", outcome, wake, primary) do
     with true <- is_nil(Map.get(outcome, :replacement_wake_id)),
          true <- is_nil(Map.get(outcome, :disposition_kind)),
          true <- is_nil(Map.get(outcome, :disposition_id)),
@@ -1077,21 +731,13 @@ defmodule Tightbeam.Wakes do
     end
   end
 
-  # The plain 3-arity form is every OTHER caller of this check (today, only
-  # `validate_liveness/5`'s `pending_wake` clause, which is not a batcher
-  # supersession) — `requester_id: nil` never qualifies for the exemption
-  # below, so those callers keep the exact same-primary-work rule they
-  # always had.
-  defp replacement_matches(txn, replacement_id, primary),
-    do: replacement_matches(txn, replacement_id, primary, nil)
-
-  defp replacement_matches(txn, replacement_id, primary, requester_id) do
+  defp replacement_matches(txn, replacement_id, primary) do
     case Txn.q(
            txn,
-           "SELECT wakeId, origin, state, conditionKind, work_item_id, assignmentId, digest FROM wakes WHERE wakeId=?1",
+           "SELECT wakeId, origin, state, conditionKind, work_item_id, assignmentId FROM wakes WHERE wakeId=?1",
            [replacement_id]
          ) do
-      [[^replacement_id, origin, "pending", condition_kind, work_item_id, assignment_id, digest]] ->
+      [[^replacement_id, origin, "pending", condition_kind, work_item_id, assignment_id]] ->
         replacement = %{
           wake_id: replacement_id,
           origin: origin,
@@ -1102,19 +748,10 @@ defmodule Tightbeam.Wakes do
 
         case primary_work(txn, replacement) do
           {:ok, replacement_primary} ->
-            cond do
-              is_nil(primary.kind) ->
-                :ok
-
-              {replacement_primary.kind, replacement_primary.id} == {primary.kind, primary.id} ->
-                :ok
-
-              digest_carrier_exemption?(requester_id, digest) ->
-                :ok
-
-              true ->
-                :error
-            end
+            if is_nil(primary.kind) or
+                 {replacement_primary.kind, replacement_primary.id} == {primary.kind, primary.id},
+               do: :ok,
+               else: :error
 
           :error ->
             :error
@@ -1124,18 +761,6 @@ defmodule Tightbeam.Wakes do
         :error
     end
   end
-
-  # O4 ROOT CAUSE, THE NAMED EXEMPTION — not a general bypass. A digest
-  # carrier's own linked work is inherited from its group when every linked
-  # member agrees on one (`shared_work/1`); this exemption is reached only
-  # for a GENUINELY mixed group, where no single work item or assignment
-  # could honestly describe the carrier. It is scoped as tight as the
-  # mechanism it exists for: the replacement must actually BE a digest
-  # carrier (`digest = 1`, not merely claimed to be one), and the requester
-  # must be the batcher's own reserved process id — nobody else's
-  # "replacement" outcome gets a pass on matching its primary work.
-  defp digest_carrier_exemption?("tightbeam:batcher", 1), do: true
-  defp digest_carrier_exemption?(_requester_id, _digest), do: false
 
   defp validate_disposition(txn, "assignment_transition", id),
     do: row_exists(txn, "SELECT 1 FROM assignments WHERE id=?1", id)
@@ -1149,7 +774,7 @@ defmodule Tightbeam.Wakes do
       )
 
   defp validate_disposition(txn, "decision_request_transition", id),
-    do: if(Escalation.raw_exists_in_txn?(txn, id), do: :ok, else: :error)
+    do: row_exists(txn, "SELECT 1 FROM decision_requests WHERE id=?1", id)
 
   defp validate_disposition(txn, "monitor_generation_transition", id),
     do: generation_exists(txn, id)
@@ -1350,31 +975,6 @@ defmodule Tightbeam.Wakes do
     end
   end
 
-  @doc """
-  Recent digest carriers targeting a session, regardless of pending state (O5
-  follow-up; F9, Sol xhigh review). `list_pending/1` is scoped to PENDING
-  work, and a delivered carrier is not that — it already fired. But its own
-  wake id is the only sanctioned key into `digest_members/2`, and the
-  delivered digest MESSAGE that ordinarily names it (`digest_prompt/3`) stops
-  being served across a cross-harness history barrier: the transcript is
-  exactly what stopped being read. Without this, a session that switched
-  engines mid-batch has no lawful way back to its own digest's payload — a
-  status question rows already answer (philosophy gate Q9). Bounded and
-  newest-first: a discovery aid for `inspect`, not an audit log.
-  """
-  @spec list_digest_carriers(db(), String.t(), pos_integer()) :: [wake()]
-  def list_digest_carriers(db \\ Tightbeam.DB, session_key, limit \\ 20) do
-    {:ok, rows} =
-      DB.query(
-        db,
-        select_wake_sql() <>
-          " WHERE sessionKey = ?1 AND digest = 1 ORDER BY createdAt DESC LIMIT ?2",
-        [session_key, limit]
-      )
-
-    Enum.map(rows, &to_wake/1)
-  end
-
   @doc "All pending wakes, soonest first (inspect filters to owned sessions)."
   @spec list_pending(db()) :: [wake()]
   def list_pending(db \\ Tightbeam.DB) do
@@ -1401,18 +1001,7 @@ defmodule Tightbeam.Wakes do
     count
   end
 
-  @doc """
-  Count pending wakes targeting a session that were durably created by that
-  same session.
-
-  HELD CLASSED MEMBERS DO NOT COUNT (Sol xhigh review, finding 8). A row still
-  waiting on the batcher (`digest = 0` under `deliveryRule = digest_rule`) is
-  not a queued continuation supervision can rely on — it may not actually
-  reach the session for up to a class ceiling's worth of time. Counting it
-  here let an unrelated `fyi` self-wake suppress the turn-end remedy for as
-  long as four hours. The materialized CARRIER (`digest = 1`) is not held —
-  it is what the batcher already decided to deliver — and counts normally.
-  """
+  @doc "Count pending wakes targeting a session that were durably created by that same session."
   @spec self_pending_count(db(), String.t()) :: non_neg_integer()
   def self_pending_count(db \\ Tightbeam.DB, session_key) do
     {:ok, [[count]]} =
@@ -1422,584 +1011,11 @@ defmodule Tightbeam.Wakes do
         SELECT count(*) FROM wakes
         WHERE state = 'pending' AND consumer = 'prompt'
           AND sessionKey = ?1 AND creatorSessionKey = ?1
-          -- `IS`, not `=`: an unclassed wake's deliveryRule is NULL, and
-          -- `NULL = ?2` is NULL (neither true nor false) under SQL's
-          -- three-valued logic, which would silently exclude it too. `IS`
-          -- compares NULL correctly and only the true digest-held case matches.
-          AND NOT (digest = 0 AND deliveryRule IS ?2)
         """,
-        [session_key, @digest_rule]
+        [session_key]
       )
 
     count
-  end
-
-  ## The batcher (fabric §5 `batcher`; Invariant 3)
-
-  @doc """
-  Materialize every digest whose delivery moment has arrived.
-
-  ONE TURN FOR N PAYLOADS. Members are grouped by target AND class — per-class,
-  because the ceiling is per-class and mixing a four-hour `fyi` with a
-  thirty-minute `input-needed` would either delay one or promote the other.
-  The TARGET half of the group key is the session for a session-addressed
-  member, but the ROLE itself for a role-addressed one (O2): a role's bound
-  session can change between two members' filing times, and grouping by
-  whatever session each one happened to resolve to at that moment would
-  split one audience into several groups and leave the carrier unable to
-  re-resolve at delivery. A role group's carrier carries `targetRole`
-  forward so it re-resolves the SAME way any other role-addressed wake does.
-
-  THE EXIT IS TIME OR A TURN BOUNDARY, never a decision (Invariant 3):
-
-    * the target's next turn boundary — a turn of its own ended at or after
-      THIS member was filed; a turn boundary is a turn ENDING, so queued or
-      running work behind it is not a reason to hold (the wake joins the
-      queue — that IS what "materializing one turn" means); or
-    * the class ceiling — which is the member's own `dueAt`, so an idle session
-      that never takes another turn still has its digest materialize one.
-
-  ELIGIBILITY AND MEMBERSHIP ARE ONE TRANSACTIONALLY COHERENT SNAPSHOT (Sol
-  xhigh review, finding 2). There is no outer "is this group due" query whose
-  answer the transaction later trusts: each member's OWN ceiling and OWN
-  filing time are re-read and re-judged from the SAME snapshot the transaction
-  uses to select members, so a wake filed after another member's boundary or
-  ceiling already passed waits for its own — never absorbed by somebody
-  else's trigger. `due_reason` is computed exactly once, from that snapshot,
-  per member (finding 4): a member with no named reason is left pending, never
-  materialized under an empty `trigger=`.
-
-  SOURCE ROWS ARE PRESERVED (Law 2, wi_1100e078's title). A member is consumed
-  through the typed cancellation seam as `superseded` with the digest named as
-  its REPLACEMENT — the same shape re-resolution already uses. Its prompt, its
-  sender, its class and its election all stay on the row; the digest-member
-  audit is one join over `wake_cancellations`. Nothing is deleted and nothing
-  is summarized away.
-  """
-  @spec materialize_digests(db()) :: [String.t()]
-  def materialize_digests(db \\ Tightbeam.DB), do: materialize_digests(db, now())
-
-  @doc false
-  @spec materialize_digests(db(), integer()) :: [String.t()]
-  def materialize_digests(db, at) do
-    # A candidate LIST only — which groups currently hold any digest-ruled
-    # pending wake at all. Nothing about WHETHER a group is due is decided
-    # here; that judgment happens exactly once, per member, inside the
-    # transaction below, against this same `at`.
-    {:ok, groups} =
-      DB.query(
-        db,
-        """
-        SELECT DISTINCT targetRole, sessionKey, class
-        FROM wakes
-        WHERE state = 'pending' AND consumer = 'prompt' AND digest = 0
-          AND deliveryRule = ?1
-        """,
-        [@digest_rule]
-      )
-
-    # A role-addressed row's group key is the ROLE (O2), collapsing every
-    # member of that role regardless of which session each one resolved to
-    # at filing time; a session-addressed row's group key is the session,
-    # exactly as before. These are DIFFERENT ADDRESSES even when they
-    # resolve to the same session today, so `Enum.uniq/1` never merges a
-    # role group into a session group or vice versa.
-    group_keys =
-      groups
-      |> Enum.map(fn
-        [target_role, _session_key, class] when is_binary(target_role) ->
-          {:role, target_role, class}
-
-        [nil, session_key, class] ->
-          {:session, session_key, class}
-      end)
-      |> Enum.uniq()
-
-    Enum.flat_map(group_keys, fn group_key ->
-      case safe_materialize_digest(db, group_key, at) do
-        nil -> []
-        wake_id -> [wake_id]
-      end
-    end)
-  end
-
-  # PER-GROUP ISOLATION (O4; philosophy gate Q3/Q7). A raise inside
-  # `materialize_members/4` still rolls back atomically for ITS OWN group —
-  # Law 2 holds, nothing is half-consumed — but letting it escape this far
-  # would crash the scheduler's GenServer on every tick until an operator
-  # intervened at a console, which is exactly the repair-requires-an-admin
-  # shape the gate forbids. Catching it HERE, one group at a time, makes the
-  # repair agent-reachable: the named row below is the visible, actionable
-  # failure; the group's own members stay genuinely pending, not silently
-  # dropped, and the SAME group is retried next tick — bounded by the
-  # prodder floor on whichever member's obligation is oldest.
-  defp safe_materialize_digest(db, group_key, at) do
-    materialize_digest(db, group_key, at)
-  rescue
-    error -> file_materialization_failure(db, group_key, Exception.message(error))
-  catch
-    kind, reason -> file_materialization_failure(db, group_key, inspect({kind, reason}))
-  end
-
-  # SIGNED LIKE THE SUCCESS PATH (Sol xhigh review, finding 3 — §8
-  # legibility): `wake_digest_materialized` names `rule=` alongside its
-  # target/class/trigger, and a FAILURE is exactly the row an agent most
-  # needs to know which reflex to inhibit — `@digest_rule` names the batcher
-  # revision that was attempting this materialization when it failed, not
-  # just where and why.
-  defp file_materialization_failure(db, group_key, detail) do
-    label = group_label(group_key)
-    record = "rule=#{@digest_rule} target=#{label} reason=#{detail}"
-    Logger.error("wake digest materialization failed for #{label}: #{detail}")
-    best_effort_lifecycle(db, "wake_digest_materialization_failed", label, record)
-    nil
-  end
-
-  defp group_label({:session, session_key, class}), do: "#{session_key}/#{class}"
-  defp group_label({:role, role, class}), do: "role:#{role}/#{class}"
-
-  defp materialize_digest(db, group_key, at) do
-    transaction!(db, fn txn ->
-      members = group_members(txn, group_key)
-      materialize_due(txn, group_key, at, members)
-    end)
-  end
-
-  # Filing order. `createdAt` ties inside a millisecond, and the tie must not
-  # be broken by an id, which is random: rowid IS the order the org filed
-  # them in, and a digest that reordered its members would misreport the
-  # sequence a reader is trying to reconstruct. `work_item_id`/`assignmentId`
-  # ride along for `shared_work/1` (O4) — the carrier's own linked-work
-  # inheritance, decided once membership is known.
-  defp group_members(txn, {:role, role, class}) do
-    Txn.q(
-      txn,
-      """
-      SELECT wakeId, prompt, origin, creatorSessionKey, createdAt, dueAt,
-             work_item_id, assignmentId
-      FROM wakes
-      WHERE state = 'pending' AND consumer = 'prompt' AND digest = 0
-        AND deliveryRule = ?1 AND targetRole = ?2 AND class = ?3
-      ORDER BY createdAt ASC, rowid ASC
-      """,
-      [@digest_rule, role, class]
-    )
-  end
-
-  defp group_members(txn, {:session, session_key, class}) do
-    Txn.q(
-      txn,
-      """
-      SELECT wakeId, prompt, origin, creatorSessionKey, createdAt, dueAt,
-             work_item_id, assignmentId
-      FROM wakes
-      WHERE state = 'pending' AND consumer = 'prompt' AND digest = 0
-        AND deliveryRule = ?1 AND targetRole IS NULL AND sessionKey = ?2 AND class = ?3
-      ORDER BY createdAt ASC, rowid ASC
-      """,
-      [@digest_rule, session_key, class]
-    )
-  end
-
-  # Nothing pending for this group in THIS snapshot — a race with another
-  # materialization, not an error: nothing to carry, nothing to sign.
-  defp materialize_due(_txn, _group_key, _at, []), do: nil
-
-  defp materialize_due(txn, group_key, at, members) do
-    boundary = group_boundary(txn, group_key)
-
-    due =
-      members
-      |> Enum.map(fn [
-                       wake_id,
-                       prompt,
-                       origin,
-                       creator,
-                       created_at,
-                       due_at,
-                       work_item_id,
-                       assignment_id
-                     ] ->
-        {[wake_id, prompt, origin, creator, created_at, work_item_id, assignment_id],
-         member_due_reason(at, due_at, boundary, created_at)}
-      end)
-      |> Enum.filter(fn {_row, reason} -> reason != nil end)
-
-    case due do
-      # Candidate group, but not ONE of its current members has reached its
-      # own ceiling or seen a boundary since it was filed. Nothing is due —
-      # refuse silently rather than materialize under a reason nobody can
-      # name (finding 4): every member simply waits for its own trigger.
-      [] ->
-        nil
-
-      _ ->
-        # Ceiling wins the tie: a digest whose members are due by both
-        # guarantees reports the one that bounds it.
-        reason =
-          if Enum.any?(due, fn {_row, r} -> r == "ceiling" end),
-            do: "ceiling",
-            else: "turn-boundary"
-
-        rows = Enum.map(due, fn {row, _reason} -> row end)
-        materialize_members(txn, group_key, reason, at, rows)
-    end
-  end
-
-  # THE TARGET WHOSE BOUNDARY GOVERNS THIS GROUP (O2). A session-addressed
-  # group's target is fixed. A role-addressed group's target is whoever the
-  # role resolves to RIGHT NOW, re-read every materialization pass through
-  # the SAME txn-safe resolution `Gateway.delivery_target/3` already uses for
-  # an ordinary role-addressed wake at fire time — so a rebind between ticks
-  # changes whose turns release the digest early, exactly as it changes who
-  # receives it. An unresolvable role reports no boundary; the ceiling still
-  # governs, and delivery-time resolution (or its `wake_unresolved` row) is
-  # what actually happens when the carrier fires.
-  defp group_boundary(txn, {:session, session_key, _class}), do: latest_turn_end(txn, session_key)
-
-  defp group_boundary(txn, {:role, role, _class}) do
-    case Gateway.delivery_target(txn, nil, %{target_role: role}) do
-      {session_key, _role, _fallback} -> latest_turn_end(txn, session_key)
-      nil -> nil
-    end
-  end
-
-  # A member's OWN eligibility (Sol xhigh review, finding 2): its own class
-  # ceiling, or a turn of the target's own that ended STRICTLY AFTER THIS
-  # member's own filing time — never another member's ceiling or another
-  # member's boundary.
-  #
-  # STRICT `>`, not `>=` (Sol xhigh review round 2, finding 1): timestamps
-  # here are millisecond-resolution wall-clock reads. A wake filed in the
-  # SAME millisecond a turn ended is not provably filed BEFORE that turn's
-  # end — the ordering is ambiguous, and ambiguous is not "the boundary
-  # happened after this member was filed." An equal timestamp waits for the
-  # member's own NEXT boundary or its ceiling, same as a wake filed a moment
-  # later would.
-  defp member_due_reason(at, due_at, boundary, created_at) do
-    cond do
-      at >= due_at -> "ceiling"
-      is_integer(boundary) and boundary > created_at -> "turn-boundary"
-      true -> nil
-    end
-  end
-
-  # THE LATEST turn end for this session, or nil if none has ever ended. A
-  # turn boundary is the moment an in-flight turn ENDS (finding 3) — nothing
-  # here judges whether the session is otherwise busy; queued or running work
-  # behind the boundary is not a reason to hold what already crossed it.
-  defp latest_turn_end(txn, session_key) do
-    case Txn.q(
-           txn,
-           "SELECT MAX(endedAt) FROM turns WHERE sessionKey = ?1 AND endedAt IS NOT NULL",
-           [session_key]
-         ) do
-      [[nil]] -> nil
-      [[ended]] -> ended
-    end
-  end
-
-  defp materialize_members(txn, group_key, reason, at, members) do
-    {class, target_label, carrier_fields, pinned_owner} = carrier_shape(txn, group_key)
-    {work_item_id, assignment_id} = shared_work(members)
-
-    # MINTED HERE, not left to `schedule_in_txn`'s default (O5 follow-up: Sol
-    # xhigh review, finding 2 — `digest-members` needs a wake id no agent
-    # could otherwise discover). Minting it before the prompt is built is
-    # what lets the delivered digest sign itself with its OWN id.
-    carrier_wake_id = "w_" <> Tightbeam.Id.uuid4()
-
-    digest =
-      schedule_in_txn(
-        txn,
-        Map.merge(
-          %{
-            wake_id: carrier_wake_id,
-            origin: "process:tightbeam",
-            prompt: digest_prompt(class, members, carrier_wake_id),
-            due_at: at,
-            class: class,
-            digest: true,
-            target_gate: 0,
-            work_item_id: work_item_id,
-            assignment_id: assignment_id
-          },
-          carrier_fields
-        )
-      )
-
-    carried =
-      Enum.count(members, fn [wake_id | _rest] ->
-        cancel_in_txn(txn, %{
-          wake_id: wake_id,
-          requester: %{kind: "process", id: "tightbeam:batcher"},
-          reason_kind: "superseded",
-          causal_source: %{kind: "wake", id: digest.wake_id},
-          outcome: %{kind: "replacement", replacement_wake_id: digest.wake_id}
-        }) == true
-      end)
-
-    # ALL OR NOTHING. A member the batcher could not consume is a member whose
-    # own wake is still pending WHILE a digest carrying its payload is about to
-    # fire — the one failure worse than not batching at all, because the payload
-    # lands twice and the record says once. There is nothing to accommodate
-    # here: roll the whole materialization back and name what refused. (O4:
-    # the caller — `safe_materialize_digest/3` — is what keeps this raise
-    # scoped to ITS OWN group instead of taking the whole tick loop down.)
-    if carried != length(members) do
-      raise "incompatible_delivery_policy_v1: batcher consumed #{carried} of " <>
-              "#{length(members)} digest members for #{target_label}/#{class}"
-    end
-
-    EventLog.lifecycle_in_txn(
-      txn,
-      "wake_digest_materialized",
-      digest.wake_id,
-      "rule=#{@digest_rule} target=#{target_label} class=#{class} members=#{carried} " <>
-        "trigger=#{reason}" <> pinned_owner_field(pinned_owner)
-    )
-
-    digest.wake_id
-  end
-
-  # PIN THE PAST (specs roles-registry-v1.md:31 — Sol xhigh review round 2):
-  # a role carrier's authority fact is decided HERE, once, in the SAME
-  # transaction as the carrier itself, and never re-derived from a live role
-  # lookup later. `nil` for a session group (there is no role to pin; the
-  # carrier's own `sessionKey` already IS the pinned fact, durably, since
-  # sessions are never hard-deleted).
-  #
-  # `URI.encode_www_form/1` (Sol xhigh review round 3 — the same convention
-  # `client_e2e/sim_client.ex` already uses for embedding an opaque value in
-  # a `key=value` text field): a user id is opaque text, not a token — a raw
-  # `ownerUserId=#{owner}` was LOSSY for one containing a space, and lossy in
-  # a way that transfers authority: "alice bob" pinned and read back as
-  # bare "alice" would hand the OLD carrier's audit to a real user named
-  # "alice" while denying the true owner. Encoding makes the field
-  # unambiguous and round-trippable regardless of what the id contains;
-  # `pinned_carrier_owner/2` (gateway.ex) decodes it back.
-  defp pinned_owner_field(nil), do: ""
-  defp pinned_owner_field(owner), do: " ownerUserId=#{URI.encode_www_form(owner)}"
-
-  # THE CARRIER'S OWN TARGET (O2). A session group's carrier addresses that
-  # session directly, exactly as before. A role group's carrier carries
-  # `targetRole` forward so it re-resolves at delivery the SAME way any other
-  # role-addressed wake does (gateway.ex's composition-root `deliver` fn) —
-  # a rebind inside the ceiling window reaches the role's new holder, not
-  # whoever held it when the members were filed. `sessionKey` still needs a
-  # value (the column is NOT NULL) but delivery never reads it once
-  # `targetRole` is set; it names the role's CURRENT resolution, audit-only,
-  # never a fallback if that resolution later fails.
-  #
-  # THE FOURTH ELEMENT is the role's owner AT THIS MOMENT — read directly
-  # off the `roles` table, once, here — for `materialize_members/4` to pin
-  # into the SAME transaction's `wake_digest_materialized` lifecycle event.
-  # A session group has no role, so it pins nothing (gateway.ex's read path
-  # never needs it: `Org.get/2` on a real, permanently-resolvable session
-  # already answers the ownership question for that case).
-  defp carrier_shape(_txn, {:session, session_key, class}),
-    do: {class, session_key, %{session_key: session_key}, nil}
-
-  defp carrier_shape(txn, {:role, role, class}) do
-    session_key =
-      case Gateway.delivery_target(txn, nil, %{target_role: role}) do
-        {resolved, _role, _fallback} -> resolved
-        nil -> "role:#{role}"
-      end
-
-    {class, "role:#{role}", %{session_key: session_key, target_role: role}, role_owner(txn, role)}
-  end
-
-  defp role_owner(txn, role) do
-    case Txn.q(txn, "SELECT ownerUserId FROM roles WHERE name=?1", [role]) do
-      [[owner]] -> owner
-      [] -> nil
-    end
-  end
-
-  # O4 ROOT CAUSE: the carrier inherits the group's linked work WHEN EVERY
-  # member that has one agrees on the SAME one — so `replacement_matches/4`'s
-  # ordinary same-primary-work check passes genuinely, not through a bypass.
-  # A member with no linked work never needed the carrier to match anything
-  # (`validate_outcome`'s `is_nil(primary.kind)` clause already lets it
-  # through unconditionally), so it is excluded from the agreement check
-  # entirely — only a GENUINE conflict between two linked members leaves the
-  # carrier unlinked, and that narrower case is what
-  # `digest_carrier_exemption?/2` names honestly, below.
-  defp shared_work(members) do
-    linked =
-      members
-      |> Enum.map(fn [_wid, _prompt, _origin, _creator, _created_at, work_item_id, assignment_id] ->
-        {work_item_id, assignment_id}
-      end)
-      |> Enum.reject(&(&1 == {nil, nil}))
-      |> Enum.uniq()
-
-    case linked do
-      [one] -> one
-      _ -> {nil, nil}
-    end
-  end
-
-  # THE BRIEF. Every payload appears in full and in filing order; the digest
-  # summarizes nothing, because an optimization that loses rows is wrong. The
-  # signature names the rule and its revision so a reader knows which reflex to
-  # inhibit (§8 legibility) — and now names the carrier's OWN wake id (O5
-  # follow-up), so the recipient can ask `digest-members <id>` about the
-  # payload it just received without any surface but the message itself.
-  defp digest_prompt(class, members, wake_id) do
-    body =
-      members
-      |> Enum.with_index(1)
-      |> Enum.map(fn {[
-                        _wake_id,
-                        prompt,
-                        origin,
-                        creator,
-                        _created_at,
-                        _work_item_id,
-                        _assignment_id
-                      ], index} ->
-        "#{index}. [#{class} from #{creator || origin}] #{prompt}"
-      end)
-      |> Enum.join("\n")
-
-    "[digest] #{digest_signature(length(members))} wake #{wake_id}\n\n#{body}"
-  end
-
-  @doc """
-  Every source wake a digest carries, oldest first (fabric §11 acceptance 2).
-
-  The audit that proves zero information loss: a digest that named a member it
-  did not carry, or carried one it did not name, is visible here as a mismatch.
-
-  PROVENANCE-TOTAL (Sol xhigh review, finding 6). Matching only
-  `replacementWakeId`/`reasonKind`/`outcomeKind` proves a row was superseded
-  BY SOMETHING naming this carrier as its replacement — not that the BATCHER
-  carried it. The join also binds `requesterId` to the batcher and
-  `causalSourceKind`/`causalSourceId` to THIS digest wake, so a non-batcher
-  supersession that happens to point at the carrier (or a malformed
-  cancellation whose causal wake differs from its replacement) cannot be
-  reported as a member Law 2 never actually carried.
-  """
-  @spec digest_members(db(), String.t()) :: [map()]
-  def digest_members(db \\ Tightbeam.DB, digest_wake_id) do
-    {:ok, rows} =
-      DB.query(
-        db,
-        """
-        SELECT w.wakeId, w.prompt, w.class, w.classElection, w.createdAt
-        FROM wake_cancellations c
-        JOIN wakes w ON w.wakeId = c.wakeId
-        WHERE c.replacementWakeId = ?1 AND c.reasonKind = 'superseded'
-          AND c.outcomeKind = 'replacement'
-          AND c.requesterId = 'tightbeam:batcher'
-          AND c.causalSourceKind = 'wake'
-          AND c.causalSourceId = ?1
-        ORDER BY w.createdAt ASC, w.rowid ASC
-        """,
-        [digest_wake_id]
-      )
-
-    Enum.map(rows, fn [wake_id, prompt, class, election, created_at] ->
-      %{
-        wake_id: wake_id,
-        prompt: prompt,
-        class: class,
-        class_election: election,
-        created_at: created_at
-      }
-    end)
-  end
-
-  ## The classed-row read (fabric §12 Q5; §11 acceptance 1)
-
-  @doc """
-  A session's coordination share over a window: turns materialized by
-  non-summon, non-algedonic wakes, against all its turns.
-
-  §11's acceptance 1 measures the pilot with THIS query on both sides of desk
-  stand-up, so it ships in Phase 1 — the before-window opens the moment classed
-  rows exist. Its two exclusions are the two ways spending a mind's turn is the
-  POINT rather than the waste: an `algedonic` alarm, which bypasses every bone
-  by design, and a `summon`, which is a desk deliberately buying its principal's
-  attention.
-
-  A window with no turns reports `share: nil`, not `0.0`. Zero would be a claim
-  about a session that did nothing, and the rows do not support it.
-
-  This is a READ. It counts rows and files none; it makes no judgment about
-  whether a share is good, and it names no threshold — the ruling on §11's
-  acceptance is a mind's (Phase 3 exit), never this function's.
-  """
-  @spec coordination_share(db(), String.t(), integer(), integer()) :: map()
-  def coordination_share(db \\ Tightbeam.DB, session_key, from, to) do
-    {:ok, [[turns, wake_turns, classed, coordination, summons, algedonic]]} =
-      DB.query(
-        db,
-        """
-        SELECT
-          COUNT(*),
-          COALESCE(SUM(CASE WHEN t.wakeId IS NOT NULL THEN 1 ELSE 0 END), 0),
-          COALESCE(SUM(CASE WHEN w.class IS NOT NULL THEN 1 ELSE 0 END), 0),
-          -- §11.1's numerator: ALL non-summon, non-algedonic wake-materialized
-          -- turns, CLASSED OR NOT (Sol xhigh review, finding 5). `w.class IS
-          -- NOT NULL` excluded legacy unclassed wake turns entirely, undercounting
-          -- the share this query exists to measure — a wake-materialized turn
-          -- counts here whether or not the fabric ever stamped it.
-          --
-          -- `w.wakeId IS NOT NULL` — not `t.wakeId IS NOT NULL` (Sol xhigh
-          -- review round 2, finding 3): the LEFT JOIN's `w.*` columns are also
-          -- NULL when `t.wakeId` names a wake that does not exist (a dangling
-          -- reference), and a naive `COALESCE(w.class, '') <> 'algedonic'`
-          -- treats a JOIN MISS exactly like a real unclassed wake — counting
-          -- a dangling reference as coordination traffic that was never
-          -- actually materialized by any wake. Requiring the joined row
-          -- excludes that case while still allowing a real wake's NULL class
-          -- through: `w.class IS NOT 'algedonic'` is NULL-safe (`IS`/`IS NOT`
-          -- never themselves evaluate to NULL), so it is true for a real
-          -- unclassed wake and false only for an actual `algedonic` class —
-          -- and once `w.wakeId IS NOT NULL` holds, `w.summon` is a real,
-          -- NOT NULL column, so a plain `= 0` is safe without COALESCE.
-          COALESCE(SUM(CASE WHEN w.wakeId IS NOT NULL
-                             AND w.summon = 0
-                             AND w.class IS NOT 'algedonic' THEN 1 ELSE 0 END), 0),
-          COALESCE(SUM(CASE WHEN w.summon = 1 THEN 1 ELSE 0 END), 0),
-          COALESCE(SUM(CASE WHEN w.class = 'algedonic' THEN 1 ELSE 0 END), 0)
-        FROM turns AS t
-        LEFT JOIN wakes AS w ON w.wakeId = t.wakeId
-        WHERE t.sessionKey = ?1 AND t.createdAt >= ?2 AND t.createdAt < ?3
-        """,
-        [session_key, from, to]
-      )
-
-    {:ok, by_class} =
-      DB.query(
-        db,
-        """
-        SELECT w.class, COUNT(*)
-        FROM turns AS t
-        JOIN wakes AS w ON w.wakeId = t.wakeId
-        WHERE t.sessionKey = ?1 AND t.createdAt >= ?2 AND t.createdAt < ?3
-          AND w.class IS NOT NULL
-        GROUP BY w.class
-        """,
-        [session_key, from, to]
-      )
-
-    %{
-      session_key: session_key,
-      from: from,
-      to: to,
-      turns: turns,
-      wake_turns: wake_turns,
-      classed_turns: classed,
-      coordination_turns: coordination,
-      summon_turns: summons,
-      algedonic_turns: algedonic,
-      share: if(turns > 0, do: coordination / turns),
-      by_class: Map.new(by_class, fn [class, count] -> {class, count} end)
-    }
   end
 
   @doc "Whether a delivered rumination wake exists for this work-item and caller session."
@@ -2018,20 +1034,6 @@ defmodule Tightbeam.Wakes do
       )
 
     rows != []
-  end
-
-  @doc false
-  def rumination_exists_in_txn?(%Txn{} = txn, work_item_id, caller_session) do
-    Txn.q(
-      txn,
-      """
-      SELECT 1 FROM wakes
-      WHERE rumination = 1 AND work_item_id = ?1 AND creatorSessionKey = ?2
-        AND state = 'fired'
-      LIMIT 1
-      """,
-      [work_item_id, caller_session]
-    ) != []
   end
 
   ## Scheduler process
@@ -2165,11 +1167,6 @@ defmodule Tightbeam.Wakes do
   # leaves its wake pending for the next tick; a crash between deliver and
   # mark redelivers, deduped by turns.wakeId.
   defp deliver_due(%{db: db, deliver: deliver, internal_consumers: consumers} = state) do
-    # THE BATCHER RUNS FIRST, so a digest that just came due is delivered in
-    # this same pass rather than waiting a tick. Held members are consumed here
-    # and never reach the loop below as individual deliveries.
-    materialize_digests(db)
-
     {:ok, rows} =
       DB.query(
         db,
@@ -2216,23 +1213,17 @@ defmodule Tightbeam.Wakes do
   # work-blocked fact asserted after the drain's recheck but before the fire
   # still has one effectful edge left to recognize at. Only supervision's own
   # wakes are eligible: origin `process:tightbeam` AND an assignmentId AND the
-  # prompt consumer AND NOT a digest carrier — today that combination is
-  # scheduled nowhere else (the escalation decision notices carry no
-  # assignmentId), and it must stay that way or this discriminator learns to
-  # suppress someone else's mail. The `not wake.digest` guard is load-bearing
-  # since O4: the batcher's own carrier can now inherit an assignmentId too
-  # (its group's shared linked work, so the replacement-validation match is
-  # genuine rather than a special-cased bypass) — `digest = 1` is the same bit
-  # that already keeps a carrier out of its own materialization group, and it
-  # is what keeps THIS discriminator from mistaking a digest for a supervision
-  # prod. The holder is `reresolveSeed` for an escalation wake (its TARGET is
-  # the ancestor being told) and the target itself for a prod. Nothing here
-  # gates the turn queue: a suppressed wake is supervision's own prompt
-  # withdrawn by recognition, consumed as `canceled` with the reason named —
-  # never a turn, never an agent's wake.
+  # prompt consumer — today that combination is scheduled nowhere else (the
+  # escalation decision notices carry no assignmentId), and it must stay that
+  # way or this discriminator learns to suppress someone else's mail. The
+  # holder is `reresolveSeed` for an escalation wake (its TARGET is the
+  # ancestor being told) and the target itself for a prod. Nothing here gates
+  # the turn queue: a suppressed wake is supervision's own prompt withdrawn by
+  # recognition, consumed as `canceled` with the reason named — never a turn,
+  # never an agent's wake.
   defp suppressed_by_recognition?(db, wake) do
     supervision_owned? =
-      wake.origin == "process:tightbeam" and is_binary(wake.assignment_id) and not wake.digest
+      wake.origin == "process:tightbeam" and is_binary(wake.assignment_id)
 
     holder = wake.reresolve_seed || wake.session_key
 
@@ -2391,10 +1382,8 @@ defmodule Tightbeam.Wakes do
         [wake_id, now()]
       )
 
-      if Txn.changes(txn) == 1, do: publish_change_in_txn(txn, "wake.fired", wake_id)
+      :ok
     end)
-
-    :ok
   end
 
   defp evaluate_conditions(%{db: db, batch: batch}, mode) do
@@ -2536,14 +1525,9 @@ defmodule Tightbeam.Wakes do
       end)
 
     case result do
-      {:ok, {:fired, delivery}} ->
-        Gateway.complete_delivery(db, delivery)
-
-      {:ok, _} ->
-        :ok
-
-      {:error, error} ->
-        raise error
+      {:ok, {:fired, delivery}} -> Gateway.complete_delivery(db, delivery)
+      {:ok, _} -> :ok
+      {:error, error} -> raise error
     end
   end
 
@@ -2599,7 +1583,6 @@ defmodule Tightbeam.Wakes do
           )
 
         lifecycle_for_fire(txn, wake, cause, match, delivery)
-        publish_change_in_txn(txn, "wake.fired", wake.wake_id)
         {:fired, delivery}
       else
         :noop
@@ -2610,22 +1593,6 @@ defmodule Tightbeam.Wakes do
   end
 
   defp fire_in_txn(_txn, _wake), do: :noop
-
-  @doc false
-  def publish_change_in_txn(%Txn{} = txn, class, wake_id) do
-    case Txn.q(txn, select_wake_sql() <> " WHERE wakeId = ?1", [wake_id]) do
-      [row] ->
-        wake = to_wake(row)
-
-        Publisher.committed_in_txn(txn, class, wake, %{
-          "wakeId" => wake_id,
-          "sessionKey" => wake.session_key
-        })
-
-      [] ->
-        :ok
-    end
-  end
 
   defp lifecycle_for_fire(txn, wake, cause, match, :skipped) do
     matched =
@@ -2662,7 +1629,7 @@ defmodule Tightbeam.Wakes do
   end
 
   defp select_wake_sql do
-    "SELECT wakeId, sessionKey, targetRole, origin, prompt, consumer, dueAt, state, createdAt, firedAt, reresolve, reresolveSeed, reresolveRung, conditionKind, conditionScope, conditionAfterId, firedBy, creatorSessionKey, rumination, work_item_id, assignmentId, canceledAt, targetGate, class, classElection, deliveryRule, digest, summon FROM wakes"
+    "SELECT wakeId, sessionKey, targetRole, origin, prompt, consumer, dueAt, state, createdAt, firedAt, reresolve, reresolveSeed, reresolveRung, conditionKind, conditionScope, conditionAfterId, firedBy, creatorSessionKey, rumination, work_item_id, assignmentId, canceledAt, targetGate FROM wakes"
   end
 
   defp to_wake([
@@ -2688,12 +1655,7 @@ defmodule Tightbeam.Wakes do
          work_item_id,
          assignment_id,
          canceled_at,
-         target_gate,
-         class,
-         class_election,
-         delivery_rule,
-         digest,
-         summon
+         target_gate
        ]) do
     %{
       wake_id: wake_id,
@@ -2718,12 +1680,7 @@ defmodule Tightbeam.Wakes do
       work_item_id: work_item_id,
       assignment_id: assignment_id,
       canceled_at: canceled_at,
-      target_gate: target_gate,
-      class: class,
-      class_election: class_election,
-      delivery_rule: delivery_rule,
-      digest: digest == 1,
-      summon: summon == 1
+      target_gate: target_gate
     }
   end
 

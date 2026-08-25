@@ -29,7 +29,6 @@ defmodule Tightbeam.ClientE2E.WS do
 
   @type t :: %__MODULE__{socket: :gen_tcp.socket(), buffer: binary(), fragment: binary() | nil}
   @type frame :: {:text, binary()} | :closed
-  @type event :: {:text, binary()} | {:closed, non_neg_integer() | nil}
 
   defstruct [:socket, buffer: <<>>, fragment: nil]
 
@@ -80,17 +79,6 @@ defmodule Tightbeam.ClientE2E.WS do
   """
   @spec recv(t(), timeout()) :: {:ok, frame(), t()} | {:error, :timeout | term(), t()}
   def recv(ws, timeout_ms) do
-    deadline = System.monotonic_time(:millisecond) + timeout_ms
-
-    case recv_until(ws, deadline) do
-      {:ok, {:closed, _code}, ws} -> {:ok, :closed, ws}
-      other -> other
-    end
-  end
-
-  @doc "Reads the next text or close event, retaining the peer's close code."
-  @spec recv_event(t(), timeout()) :: {:ok, event(), t()} | {:error, :timeout | term(), t()}
-  def recv_event(ws, timeout_ms) do
     deadline = System.monotonic_time(:millisecond) + timeout_ms
     recv_until(ws, deadline)
   end
@@ -178,8 +166,7 @@ defmodule Tightbeam.ClientE2E.WS do
     end
   end
 
-  defp dispatch_frame(ws, _fin, 0x8, payload, _deadline),
-    do: {:ok, {:closed, close_code(payload)}, ws}
+  defp dispatch_frame(ws, _fin, 0x8, _payload, _deadline), do: {:ok, :closed, ws}
 
   defp dispatch_frame(ws, _fin, 0x9, payload, deadline) do
     case :gen_tcp.send(ws.socket, encode(0xA, payload)) do
@@ -240,9 +227,6 @@ defmodule Tightbeam.ClientE2E.WS do
   defp decode_mask(0, rest), do: {:ok, nil, rest}
   defp decode_mask(1, <<mask::binary-size(4), rest::binary>>), do: {:ok, mask, rest}
   defp decode_mask(_, _), do: :incomplete
-
-  defp close_code(<<code::16, _reason::binary>>), do: code
-  defp close_code(_payload), do: nil
 
   defp apply_mask(payload, nil), do: payload
 

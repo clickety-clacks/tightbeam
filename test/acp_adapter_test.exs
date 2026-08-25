@@ -92,6 +92,30 @@ defmodule Tightbeam.Acp.AdapterTest do
              |> Enum.map(& &1["value"])
   end
 
+  test "Fast is normalized from Claude fast and Codex fast-mode live options" do
+    {claude, _capture_path} = start_adapter(fail_mode: "fast-live")
+    assert {:ok, "sess-1"} = Adapter.new_session(claude, nil, "/tmp", [], "guidance")
+    assert {:ok, %{fast: "off", option_id: "fast"}} = Adapter.fast_status(claude, "sess-1")
+    assert {:ok, %{fast: "on", option_id: "fast"}} = Adapter.apply_fast(claude, "sess-1", "on")
+
+    {codex, capture_path} = start_adapter(harness: :codex, fail_mode: "fast-live-codex")
+    assert {:ok, "sess-1"} = Adapter.new_session(codex, nil, "/tmp", [], "guidance")
+
+    assert {:ok, %{fast: "off", option_id: "fast-mode"}} =
+             Adapter.fast_status(codex, "sess-1")
+
+    assert {:ok, %{fast: "on", option_id: "fast-mode"}} =
+             Adapter.apply_fast(codex, "sess-1", "on")
+
+    assert [true] =
+             capture_path
+             |> captured_requests()
+             |> Enum.filter(
+               &(&1["method"] == "session/set_config_option" and &1["configId"] == "fast-mode")
+             )
+             |> Enum.map(& &1["value"])
+  end
+
   test "residency waits behind slow adapter boot and dead adapters fail promptly" do
     adapter = start_supervised!({SlowBootAdapter, self()})
     assert_receive {:adapter_booting, ^adapter}
@@ -145,6 +169,7 @@ defmodule Tightbeam.Acp.AdapterTest do
   let forkCalls = 0;
   const models = {};
   const efforts = {};
+  const fastValues = {};
   const offeredModels = {};
   const defaultOfferedModels = [
     "default", "opus[1m]", "claude-fable-5[1m]", "sonnet", "haiku",
@@ -168,6 +193,17 @@ defmodule Tightbeam.Acp.AdapterTest do
     }
   };
   const configOptions = (sid) => ({ configOptions: [
+    ...(failMode.startsWith("fast-") ? [{
+      id: failMode === "fast-live-codex" ? "fast-mode" : "fast",
+      name: "Fast mode",
+      type: failMode === "fast-live-codex" ? "boolean" : "select",
+      currentValue: Object.hasOwn(fastValues, sid)
+        ? fastValues[sid]
+        : (failMode === "fast-live-codex" ? false : "off"),
+      options: failMode === "fast-live-codex"
+        ? [{ value: true, name: "On" }, { value: false, name: "Off" }]
+        : [{ value: "on", name: "On" }, { value: "off", name: "Off" }]
+    }] : []),
     {
       id: "model",
       currentValue: models[sid] || "haiku",
@@ -254,6 +290,12 @@ defmodule Tightbeam.Acp.AdapterTest do
           // catalog advertised (`gpt-5.1-codex`) — JSON-RPC -32602 Invalid params.
           return send({ id: m.id, error: { code: -32602, message: "Invalid params" } });
         }
+        if (failMode === "fast-refusal" && m.params.configId === "fast") {
+          return send({ id: m.id, error: { code: -32000, message: "fast refused" } });
+        }
+        if (failMode === "fast-mismatch" && m.params.configId === "fast") {
+          return send({ id: m.id, result: configOptions(m.params.sessionId) });
+        }
         if (failMode === "strict-partial-apply" &&
             m.params.configId === "reasoning_effort" &&
             m.params.value === "high") {
@@ -291,6 +333,7 @@ defmodule Tightbeam.Acp.AdapterTest do
         }
         if (m.params.configId === "model") models[m.params.sessionId] = m.params.value;
         if (m.params.configId === "effort" || m.params.configId === "reasoning_effort") efforts[m.params.sessionId] = m.params.value;
+        if (m.params.configId === "fast" || m.params.configId === "fast-mode") fastValues[m.params.sessionId] = m.params.value;
         return send({ id: m.id, result: configOptions(m.params.sessionId) });
       }
       case "session/set_mode": {
@@ -917,7 +960,8 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert {:ok, "sess-1"} =
              Adapter.new_session(adapter, Model.new("gpt-old"), "/tmp", [], "guidance")
 
-    assert {:error, :model_verification_failed} =
+    assert {:error,
+            {:runtime_config_mismatch, %Model{family: "haiku", effort: "medium", context: nil}}} =
              Adapter.switch_model_session(
                adapter,
                "sess-1",
@@ -927,7 +971,9 @@ defmodule Tightbeam.Acp.AdapterTest do
                "guidance"
              )
 
-    assert {:error, :model_readback_unavailable} = Adapter.current_model(adapter, "sess-1")
+    assert {:ok, %Model{family: "haiku", effort: "medium", context: nil}} =
+             Adapter.current_model(adapter, "sess-1")
+
     refute Enum.any?(captured_requests(capture_path), &(&1["method"] == "session/fork"))
   end
 
@@ -956,29 +1002,8 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     :sys.replace_state(adapter, &%{&1 | conn: dead_conn})
 
-    assert {:error, {:acp_request_not_dispatched, :prompt_dispatch_failed}} =
-             Adapter.prompt(adapter, "sess-1", "never sent")
-
+    assert {:error, :prompt_dispatch_failed} = Adapter.prompt(adapter, "sess-1", "never sent")
     assert Adapter.conn(adapter) == dead_conn
-  end
-
-  test "a live closed connection returns its pre-dispatch error without wedging the adapter" do
-    {adapter, _capture_path} = start_adapter()
-    conn = Adapter.conn(adapter)
-    Tightbeam.Acp.Conn.close(conn)
-    assert :sys.get_state(conn).closed
-    owner = self()
-
-    assert {:error, {:acp_request_not_dispatched, :closed}} =
-             Adapter.prompt(adapter, "sess-1", "never sent",
-               trace_dispatch: fn request_id ->
-                 send(owner, {:dispatch_recorded, request_id})
-                 :ok
-               end
-             )
-
-    refute_receive {:dispatch_recorded, _request_id}
-    assert Process.alive?(adapter)
   end
 
   test "a missing prompt dispatch acknowledgement stays live until the connection dies" do
@@ -998,9 +1023,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert Task.yield(prompt, 50) == nil
 
     send(inert_conn, :stop)
-
-    assert {:error, {:acp_request_not_dispatched, :prompt_dispatch_failed}} =
-             Task.await(prompt)
+    assert {:error, :prompt_dispatch_failed} = Task.await(prompt)
 
     assert Adapter.conn(adapter) == inert_conn
   end
@@ -1046,19 +1069,8 @@ defmodule Tightbeam.Acp.AdapterTest do
     {adapter, _capture_path} = start_adapter(gate_mode: "stall-turn", probe: false)
     assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
     conn = Adapter.conn(adapter)
-    owner = self()
 
-    caller =
-      Task.async(fn ->
-        Adapter.prompt(adapter, sid, "stall",
-          trace_dispatch: fn request_id ->
-            send(owner, {:durable_dispatch_before_loss, request_id})
-            :ok
-          end
-        )
-      end)
-
-    assert_receive {:durable_dispatch_before_loss, request_id} when is_integer(request_id)
+    caller = Task.async(fn -> Adapter.prompt(adapter, sid, "stall") end)
     assert pending_count?(conn, 1)
     worker = prompt_requester(conn)
     worker_monitor = Process.monitor(worker)
@@ -1079,39 +1091,14 @@ defmodule Tightbeam.Acp.AdapterTest do
     caller =
       Task.async(fn ->
         Adapter.prompt(adapter, sid, "report progress",
-          progress: fn status, seq -> send(owner, {:progress, status, seq}) end,
-          trace_dispatch: fn request_id ->
-            send(owner, {:dispatch, request_id})
-            :ok
-          end,
-          trace_progress: fn observation, seq ->
-            send(owner, {:durable_progress, observation, seq})
-            :ok
-          end
+          progress: fn status, seq -> send(owner, {:progress, status, seq}) end
         )
       end)
 
     assert {:ok, %{stop_reason: "end_turn", text: "progressed"}} = Task.await(caller)
 
-    assert_receive {:dispatch, request_id} when is_integer(request_id)
-    assert_receive {:durable_progress, %{class: "thought", label: "Thinking"}, 1}
-
-    assert_receive {:durable_progress, %{class: "tool_call", label: "Tool activity"}, 2}
-
     assert_receive {:progress, "Thinking…", 1}
     assert_receive {:progress, "Read config/runtime.exs", 2}
-  end
-
-  test "a durable progress failure turns a dispatched prompt into unknown outcome" do
-    {adapter, _capture_path} = start_adapter(gate_mode: "progress-turn", probe: false)
-    assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
-
-    assert {:error, {:lifecycle_trace_failed_after_prompt, :progress, :storage_down}} =
-             Adapter.prompt(adapter, sid, "report progress",
-               progress: fn _status, _seq -> flunk("live progress followed a failed trace") end,
-               trace_dispatch: fn _request_id -> :ok end,
-               trace_progress: fn _observation, _seq -> {:error, :storage_down} end
-             )
   end
 
   test "close_session sends ACP session/close with the harness session id" do
@@ -1142,23 +1129,28 @@ defmodule Tightbeam.Acp.AdapterTest do
            ] = session_requests(capture_path)
   end
 
-  test "guidance uses the harness-accurate ACP metadata channel on new and load" do
+  test "bounded continuity guidance uses the harness-accurate metadata channel on new and load" do
+    guidance =
+      "served guidance\n\n" <>
+        "Run `tightbeam transcript --session \"same-key\" --limit 50`. " <>
+        "Do not replay or inject earlier messages."
+
     for {harness, expected} <- [
-          {:codex, %{"developerInstructions" => "served guidance"}},
+          {:codex, %{"developerInstructions" => guidance}},
           {:claude,
            %{
              "systemPrompt" => %{
                "type" => "preset",
                "preset" => "claude_code",
-               "append" => "served guidance"
+               "append" => guidance
              }
            }},
-          {:fixture, %{"instructions" => "served guidance"}}
+          {:fixture, %{"instructions" => guidance}}
         ] do
       {adapter, capture_path} = start_adapter(harness: harness)
 
       assert {:ok, "sess-1"} =
-               Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "served guidance")
+               Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], guidance)
 
       assert {:ok, _pushed_model} =
                Adapter.load_session(
@@ -1167,7 +1159,7 @@ defmodule Tightbeam.Acp.AdapterTest do
                  "haiku",
                  "/tmp",
                  [],
-                 "served guidance"
+                 guidance
                )
 
       assert Enum.all?(session_requests(capture_path), &(&1["meta"] == expected))
@@ -1232,6 +1224,26 @@ defmodule Tightbeam.Acp.AdapterTest do
              )
 
     refute Adapter.knows_session?(adapter, "sess-1")
+  end
+
+  test "a rejected candidate reports verified teardown" do
+    {adapter, capture_path} = start_adapter(harness: :codex, fail_mode: "model-invalid-params")
+
+    assert {:error,
+            {:session_prepare_failed, :model_unavailable, "sess-1",
+             %{status: "verified", reason: nil}}} =
+             Adapter.new_candidate_session(
+               adapter,
+               Model.new("gpt-5.1-codex"),
+               "/tmp",
+               [],
+               "guidance"
+             )
+
+    assert Enum.any?(captured_requests(capture_path), fn request ->
+             request["method"] == "session/close" and
+               request["sessionId"] == "sess-1"
+           end)
   end
 
   test "strict apply does not retry an invalid-params model refusal" do
@@ -1649,7 +1661,6 @@ defmodule Tightbeam.Acp.AdapterTest do
     db = :"auth_callback_db_#{System.unique_integer([:positive])}"
     start_supervised!({Tightbeam.DB, path: ":memory:", name: db})
     :ok = Tightbeam.Schema.ensure_all(db)
-    ensure_main_session(db, "flynn")
     Tightbeam.Archetypes.load!(base)
     Tightbeam.Rails.load!(base)
 
@@ -1755,7 +1766,6 @@ defmodule Tightbeam.Acp.AdapterTest do
     db = :"subagent_callback_db_#{System.unique_integer([:positive])}"
     start_supervised!({Tightbeam.DB, path: ":memory:", name: db})
     :ok = Tightbeam.Schema.ensure_all(db)
-    ensure_main_session(db, "flynn")
 
     Tightbeam.Archetypes.load!(base)
     Tightbeam.Rails.load!(base)
@@ -1785,7 +1795,7 @@ defmodule Tightbeam.Acp.AdapterTest do
         assignment_id: "assignment-running"
       })
 
-    assert {:ok, %{seq: ^turn_seq, owner_lease: owner_lease}} =
+    assert {:ok, %{seq: ^turn_seq}} =
              Tightbeam.Ledger.claim_next(db, session.session_key, "test-owner")
 
     {:ok, adapter_slot} = Agent.start_link(fn -> nil end)
@@ -1839,10 +1849,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     )
 
     assert_receive :subagent_event_captured
-
-    :ok =
-      Tightbeam.Ledger.finish(db, turn_seq, "delivered", nil, owner_lease: owner_lease)
-
+    :ok = Tightbeam.Ledger.finish(db, turn_seq, "delivered")
     assert_receive {:matching_fired, fact_id, false}, 2_000
     assert is_integer(fact_id)
     assert [%{assignment_id: "assignment-running"}] = Tightbeam.SubagentMarkers.list(db)
@@ -1864,7 +1871,6 @@ defmodule Tightbeam.Acp.AdapterTest do
     db = :"subagent_failure_db_#{System.unique_integer([:positive])}"
     db_pid = start_supervised!({Tightbeam.DB, path: ":memory:", name: db})
     :ok = Tightbeam.Schema.ensure_all(db)
-    ensure_main_session(db, "flynn")
 
     Tightbeam.Archetypes.load!(base)
     Tightbeam.Rails.load!(base)

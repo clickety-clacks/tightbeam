@@ -34,6 +34,7 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
         System.get_env("TIGHTBEAM_ADVERTISED_URL") ||
           Application.get_env(:tightbeam, :advertised_url),
       hosts: org_hosts(base_dir),
+      github_remote_url: github_remote_url(),
       local_host_name: Placement.local_host_name(),
       credential_state: &local_credential_state(base_dir, &1),
       cli_bin: Path.join(base_dir, "bin")
@@ -62,6 +63,17 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
     cli_bin = Keyword.get(inputs, :cli_bin, Path.join(base_dir, "bin"))
     binary_probe = Keyword.get(inputs, :harness_binary_probe, &Placement.harness_binary_probe/2)
     credential_probe = Keyword.get(inputs, :credential_state, fn _provider -> :unknown end)
+
+    github_probe =
+      Keyword.get(inputs, :github_probe, fn hostname, remote_url ->
+        Tightbeam.GithubAuth.probe(base_dir, hostname, remote_url)
+      end)
+
+    github_remote_url = Keyword.get(inputs, :github_remote_url)
+
+    github_gh_path =
+      Keyword.get_lazy(inputs, :github_gh_path, fn -> System.find_executable("gh") end)
+
     harnesses = Enum.map(Tightbeam.Harness.all(), & &1.wire_name())
 
     credential_states =
@@ -106,19 +118,25 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
         end)
       end)
 
-    non_harness_checks = [
-      default_model_check(
-        catalog,
-        default_harness,
-        default_model,
-        Map.fetch!(credential_states, default_harness),
-        base_dir,
-        local_host_name
-      ),
-      identity_check(base_dir),
-      advertised_url_check(advertised_url),
-      hosts_check(hosts, local_host_name)
-    ]
+    {github_check, github_status} =
+      github_check(github_remote_url, github_probe, local_host_name, github_gh_path)
+
+    non_harness_checks =
+      [
+        default_model_check(
+          catalog,
+          default_harness,
+          default_model,
+          Map.fetch!(credential_states, default_harness),
+          base_dir,
+          local_host_name
+        ),
+        identity_check(base_dir),
+        advertised_url_check(advertised_url),
+        hosts_check(hosts, local_host_name),
+        github_check
+      ]
+      |> Enum.reject(&is_nil/1)
 
     checks = [hd(non_harness_checks)] ++ harness_checks ++ tl(non_harness_checks)
 
@@ -126,7 +144,7 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
       ready_harnesses != [] and
         Enum.all?(non_harness_checks, &(&1.ok or &1.unverifiable))
 
-    {if(ready, do: 0, else: 1), %{checks: checks, ready: ready}}
+    {if(ready, do: 0, else: 1), %{checks: checks, github: github_status, ready: ready}}
   end
 
   @doc false
@@ -361,6 +379,91 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
 
   defp onboard_command(provider, _host),
     do: "tightbeam onboard #{provider} --as-user <userId>"
+
+  # Doctor formats and reports; Tightbeam.GithubAuth judges. This check owns
+  # only the presentation of the probe result — the readiness model lives in
+  # one place, like local_credential_state asking Tightbeam.Credentials.
+  defp github_check(nil, _github_probe, _host, _gh_path), do: {nil, nil}
+
+  defp github_check(remote_url, github_probe, host, configured_gh_path) do
+    case Tightbeam.GithubAuth.hostname(remote_url) do
+      nil ->
+        {nil, nil}
+
+      hostname ->
+        scrubbed_remote = Tightbeam.GithubAuth.scrub_detail(remote_url)
+
+        repair =
+          "tightbeam onboard github --hostname #{hostname} --remote #{scrubbed_remote}"
+
+        case github_probe.(hostname, remote_url) do
+          {:ok, status} ->
+            account = Map.get(status, :account)
+            protocol = Map.get(status, :git_protocol)
+            gh_path = Map.get(status, :gh_path) || configured_gh_path
+            storage = Map.get(status, :storage, "file")
+
+            detail =
+              "GitHub #{hostname} is live for #{account || "active account"}" <>
+                if(protocol, do: " via #{protocol}", else: "") <>
+                "; host #{host}; gh #{gh_path || "missing"}; state live; " <>
+                "account #{account || "unknown"}; protocol #{protocol || "unknown"}; " <>
+                "storage #{storage}"
+
+            readiness = %{
+              account: account,
+              gh_path: gh_path,
+              git_protocol: protocol,
+              host: host,
+              hostname: hostname,
+              repair: nil,
+              state: "live",
+              storage: storage
+            }
+
+            {check("github_auth:#{hostname}", true, detail, ""), readiness}
+
+          {:error, state, detail} ->
+            state = to_string(state)
+            gh_path = configured_gh_path
+            storage = if state == "missing_cli", do: nil, else: "file"
+            detail = Tightbeam.GithubAuth.scrub_detail(detail)
+
+            readiness = %{
+              account: nil,
+              gh_path: gh_path,
+              git_protocol: nil,
+              host: host,
+              hostname: hostname,
+              repair: repair,
+              state: state,
+              storage: storage
+            }
+
+            {check(
+               "github_auth:#{hostname}",
+               false,
+               "#{state}: #{detail}; host #{host}; hostname #{hostname}; " <>
+                 "gh #{gh_path || "missing"}; state #{state}; account unknown; " <>
+                 "protocol unknown; storage #{storage || "unknown"}",
+               "Run on this host: #{repair}. Do not paste a PAT into an agent."
+             ), readiness}
+        end
+    end
+  end
+
+  defp github_remote_url do
+    case System.cmd("git", ["config", "--get", "remote.origin.url"], stderr_to_stdout: true) do
+      {url, 0} ->
+        url = String.trim(url)
+        if url == "", do: nil, else: url
+
+      _ ->
+        nil
+    end
+  rescue
+    ErlangError -> nil
+  end
 
   defp local_credential_state(base_dir, provider) do
     host = Placement.local_host_name()

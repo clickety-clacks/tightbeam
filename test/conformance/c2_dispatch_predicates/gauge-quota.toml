@@ -11,4 +11,4 @@ legibility = "event:denied(rule=gauge-quota)"
 name = "gauge-quota"
 verb = "spawn"
 text = "the caller has reached the live-session gauge"
-deny_when = [{ fact = "org.live_sessions_owned_by_caller", op = "gte", value = 3 }]
+deny_when = [{ fact = "org.live_sessions_owned_by_caller", op = "gte", value = 2 }]

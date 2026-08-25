@@ -6,12 +6,10 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
     Archetypes,
     DB,
     Dispatch,
-    EventLog,
     Gateway,
     Identity,
     Roles,
     Rules,
-    Wakes,
     WorkItems
   }
 
@@ -39,16 +37,9 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
         "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 1, 'admin_add', 1)"
       )
 
-    ensure_main_session(db, "flynn")
-
     holder = session(db, "impl-holder", "coder", "claude", "anthropic")
     owner = session(db, "po-holder", "product-owner", "codex", "openai")
     Roles.create!(db, "product-owner", "flynn", owner.session_key)
-
-    start_supervised!(
-      {Wakes,
-       db: db, deliver: fn _wake -> true end, tick_ms: 60_000, name: Tightbeam.WakeScheduler}
-    )
 
     base_dir =
       Path.join(System.tmp_dir!(), "tightbeam-spirit-gate-#{System.unique_integer([:positive])}")
@@ -187,7 +178,8 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
 
   # The round counter, proven through the ENGINE rather than by reading the
   # function: a synthetic org statute denies past 2 rounds; two verdicts pass,
-  # the third is refused.
+  # the third is refused. This is the fact the (staged) review-rounds doorbell
+  # will read the day the grammar grows a non-blocking effect.
   test "assignment.review_verdict_count counts rounds through the rules engine", ctx do
     rules_dir = Path.join(ctx.base_dir, "identity/rules")
     File.mkdir_p!(rules_dir)
@@ -272,219 +264,5 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
       )
 
     assert {:error, %{rule: "round-cap-probe"}} = r3_result
-  end
-
-  test "review-rounds doorbell records and summons once without blocking attests", ctx do
-    item = work_item(ctx, nil)
-
-    {:ok, subject} =
-      Dispatch.dispatch(
-        ctx.db,
-        ctx.handlers,
-        dispatch_call(ctx.holder.session_key, item.id, "work under repeated review")
-      )
-
-    assert {:ok, %{attest: %{verdictKind: "tests-passed"}}} =
-             Dispatch.dispatch(
-               ctx.db,
-               ctx.handlers,
-               verdict_call(
-                 ctx.holder.session_key,
-                 subject.id,
-                 "tests-passed",
-                 "fixture suite passed at the reviewed revision"
-               )
-             )
-
-    review_call = fn n ->
-      %{
-        verb: "assign",
-        origin: "user:flynn",
-        principal: {:user, "flynn"},
-        session_key: ctx.owner.session_key,
-        target_role: nil,
-        role_fallback: false,
-        params: %{
-          subject: "doorbell round #{n}",
-          reviews_assignment_id: subject.id
-        }
-      }
-    end
-
-    for n <- 1..4 do
-      {:ok, review} = Dispatch.dispatch(ctx.db, ctx.handlers, review_call.(n))
-
-      assert {:ok, %{attest: %{verdictKind: "changes-requested"}}} =
-               Dispatch.dispatch(
-                 ctx.db,
-                 ctx.handlers,
-                 verdict_call(ctx.owner.session_key, review.id, "changes-requested")
-               )
-    end
-
-    assert {:ok, [[0]]} =
-             DB.query(
-               ctx.db,
-               "SELECT COUNT(*) FROM wakes WHERE origin = 'remedy:review-rounds-doorbell'"
-             )
-
-    {:ok, crossing} = Dispatch.dispatch(ctx.db, ctx.handlers, review_call.(5))
-
-    assert {:ok, %{attest: %{verdictKind: "changes-requested"}}} =
-             Dispatch.dispatch(
-               ctx.db,
-               ctx.handlers,
-               verdict_call(ctx.owner.session_key, crossing.id, "changes-requested")
-             )
-
-    owner_session_key = ctx.owner.session_key
-
-    assert {:ok, [[1, ^owner_session_key]]} =
-             DB.query(
-               ctx.db,
-               """
-               SELECT COUNT(*), sessionKey
-               FROM wakes
-               WHERE origin = 'remedy:review-rounds-doorbell'
-               """
-             )
-
-    assert [%{kind: "rail_notice", subject: "review-rounds-doorbell", detail: detail}] =
-             ctx.db
-             |> EventLog.lifecycle_events()
-             |> Enum.filter(&(&1.kind == "rail_notice"))
-
-    assert %{"ref" => ref, "outcome" => "claimed-dispatched"} = JSON.decode!(detail)
-    assert ref == subject.id
-
-    {:ok, repeated} = Dispatch.dispatch(ctx.db, ctx.handlers, review_call.(6))
-
-    assert {:ok, %{attest: %{kind: "progress"}}} =
-             Dispatch.dispatch(ctx.db, ctx.handlers, %{
-               verb: "attest",
-               origin: "session:#{ctx.owner.session_key}",
-               principal: {:session, ctx.owner.session_key},
-               session_key: ctx.owner.session_key,
-               params: %{
-                 assignment_id: repeated.id,
-                 kind: "progress",
-                 note: "sixth review is still in progress"
-               }
-             })
-
-    assert {:ok, %{attest: %{verdictKind: "changes-requested"}}} =
-             Dispatch.dispatch(
-               ctx.db,
-               ctx.handlers,
-               verdict_call(ctx.owner.session_key, repeated.id, "changes-requested")
-             )
-
-    assert {:ok, [[1]]} =
-             DB.query(
-               ctx.db,
-               "SELECT COUNT(*) FROM wakes WHERE origin = 'remedy:review-rounds-doorbell'"
-             )
-
-    assert 1 ==
-             ctx.db
-             |> EventLog.lifecycle_events()
-             |> Enum.count(&(&1.kind == "rail_notice"))
-  end
-
-  test "review-rounds doorbell stays latched when its wake is refused", ctx do
-    item = work_item(ctx, nil)
-
-    {:ok, subject} =
-      Dispatch.dispatch(
-        ctx.db,
-        ctx.handlers,
-        dispatch_call(ctx.holder.session_key, item.id, "work under refused doorbell wake")
-      )
-
-    assert {:ok, %{attest: %{verdictKind: "tests-passed"}}} =
-             Dispatch.dispatch(
-               ctx.db,
-               ctx.handlers,
-               verdict_call(
-                 ctx.holder.session_key,
-                 subject.id,
-                 "tests-passed",
-                 "fixture suite passed at the reviewed revision"
-               )
-             )
-
-    review_call = fn n ->
-      %{
-        verb: "assign",
-        origin: "user:flynn",
-        principal: {:user, "flynn"},
-        session_key: ctx.owner.session_key,
-        target_role: nil,
-        role_fallback: false,
-        params: %{
-          subject: "refused doorbell round #{n}",
-          reviews_assignment_id: subject.id
-        }
-      }
-    end
-
-    for n <- 1..4 do
-      {:ok, review} = Dispatch.dispatch(ctx.db, ctx.handlers, review_call.(n))
-
-      assert {:ok, %{attest: %{verdictKind: "changes-requested"}}} =
-               Dispatch.dispatch(
-                 ctx.db,
-                 ctx.handlers,
-                 verdict_call(ctx.owner.session_key, review.id, "changes-requested")
-               )
-    end
-
-    refusing_handlers =
-      Map.put(ctx.handlers, "wake", fn _call ->
-        %{code: "forced_notice_refusal", message: "the notice target refused the wake"}
-      end)
-
-    {:ok, crossing} = Dispatch.dispatch(ctx.db, ctx.handlers, review_call.(5))
-
-    assert {:ok, %{attest: %{verdictKind: "changes-requested"}}} =
-             Dispatch.dispatch(
-               ctx.db,
-               refusing_handlers,
-               verdict_call(ctx.owner.session_key, crossing.id, "changes-requested")
-             )
-
-    {:ok, repeated} = Dispatch.dispatch(ctx.db, ctx.handlers, review_call.(6))
-
-    assert {:ok, %{attest: %{verdictKind: "changes-requested"}}} =
-             Dispatch.dispatch(
-               ctx.db,
-               refusing_handlers,
-               verdict_call(ctx.owner.session_key, repeated.id, "changes-requested")
-             )
-
-    assert {:ok, [[0]]} =
-             DB.query(
-               ctx.db,
-               "SELECT COUNT(*) FROM wakes WHERE origin = 'remedy:review-rounds-doorbell'"
-             )
-
-    assert {:ok, [["live", nil]]} =
-             DB.query(
-               ctx.db,
-               """
-               SELECT status, producerKey
-               FROM rail_remedy_episodes
-               WHERE statute = 'review-rounds-doorbell' AND subject = ?1
-               """,
-               [subject.id]
-             )
-
-    assert [%{kind: "rail_notice", subject: "review-rounds-doorbell", detail: detail}] =
-             ctx.db
-             |> EventLog.lifecycle_events()
-             |> Enum.filter(&(&1.kind == "rail_notice"))
-
-    assert %{"outcome" => "blocked", "ref" => ref} = JSON.decode!(detail)
-    assert ref == subject.id
   end
 end

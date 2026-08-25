@@ -40,7 +40,7 @@ defmodule Tightbeam.ExecutionMap do
      through any item-attributed carrier.
   """
 
-  alias Tightbeam.{CausalEvents, DB, Escalation, IdPrefix}
+  alias Tightbeam.{CausalEvents, DB}
 
   @edge_basis "concurrent_turn"
   @coverage_basis "conservative_shared"
@@ -49,63 +49,16 @@ defmodule Tightbeam.ExecutionMap do
   @doc """
   The `toplines` verb: the roster with full telemetry, or the caller-visible
   causal forest when `--tree` is set.
-
-  ## `--after` / `--limit` (fabric §13 Phase 1 seam ④, GitHub #13)
-
-  A keyset cursor over the FLAT roster, and honest about what it is and is not.
-
-  WHAT IT IS: the roster's outermost ordering is `work_items` by
-  `(createdAt, id)` — a stable total order that does not move when a row is
-  updated — and the filters in `appearing/2` are per-item. So "everything
-  ordered after this item" is a well-defined, repeatable page boundary, and a
-  caller can walk the whole roster without skipping or repeating an item that
-  existed for the whole walk. The cursor is compared against the item's ORDER
-  KEY, not its membership, so an item that has since dropped out of the filter
-  still positions the page correctly instead of stranding the caller.
-
-  WHAT IT IS NOT — and this half must not be oversold, because a pager that
-  claims a cost it does not pay is worse than none: this bounds the RESPONSE,
-  not the work. `world/2` still loads every visible work item, assignment, turn,
-  attest and wake to compute per-item telemetry, and `--quiet-over` is a
-  predicate over that telemetry. A SQL `LIMIT` on `work_items` would page a
-  DIFFERENT population — the rows before filtering — and hand back short pages
-  with no way to tell a short page from the last one. That pager is not built
-  here.
-
-  `--tree` REFUSES BY NAME rather than paging. Nesting is derived across the
-  whole appearing set, so a page boundary drawn through a forest either cuts
-  subtrees off from parents that were on the previous page or silently pulls in
-  nodes the limit excluded. Neither is a page; both are a wrong answer that
-  looks like a right one.
   """
   @spec roster(DB.server(), map()) :: map()
   def roster(db, call) do
-    params = call.params
+    world = world(db, call)
+    appearing = appearing(world, call.params)
 
-    case page_selection(params) do
-      {:error, error} ->
-        error
-
-      selection ->
-        world = world(db, call)
-        appearing = appearing(world, params)
-
-        case resolve_page_selection(world, selection) do
-          {:error, error} ->
-            error
-
-          canonical_selection ->
-            cond do
-              truthy?(params[:tree]) and paging?(params) ->
-                invalid("--after/--limit page the flat roster; --tree returns a forest")
-
-              truthy?(params[:tree]) ->
-                forest(world, appearing)
-
-              true ->
-                page(world, appearing, canonical_selection)
-            end
-        end
+    if truthy?(call.params[:tree]) do
+      forest(world, appearing)
+    else
+      Map.put(envelope(world), :items, Enum.map(appearing, &node(world, &1)))
     end
   end
 
@@ -118,24 +71,12 @@ defmodule Tightbeam.ExecutionMap do
     params = call.params
 
     cond do
-      # Both of this verb's shapes are already bounded selections — a subtree the
-      # caller anchored, or an assignment list the caller wrote out. Accepting a
-      # cursor and ignoring it would be the worse failure, so it is named.
-      paging?(params) ->
-        invalid("--after/--limit page toplines; topline returns a selection the caller bounded")
-
       is_binary(params[:under]) and params[:under] != "" and
           not is_nil(params[:assignments]) ->
         invalid("--under and --assignments are mutually exclusive")
 
       is_binary(params[:under]) and params[:under] != "" ->
-        world = world(db, call)
-
-        case IdPrefix.resolve_ids(:work_item, params[:under], Map.keys(world.items_by_id)) do
-          {:ok, id} -> under(world, params, id)
-          :unknown -> not_found("work item not found")
-          {:ambiguous, error} -> error
-        end
+        under(world(db, call), params, params[:under])
 
       not is_nil(params[:assignments]) ->
         assignment_selection(world(db, call), params[:assignments])
@@ -193,44 +134,23 @@ defmodule Tightbeam.ExecutionMap do
         invalid("--assignments requires at least one assignment id")
 
       ids ->
-        case resolve_assignment_ids(world, ids) do
-          {:error, error} ->
-            error
+        case classify(world, ids, [], []) do
+          :not_found ->
+            # An unknown id and an id this caller may not see are ONE answer;
+            # a visible NONE id is substrate truth and uses `no_item`.
+            not_found("assignment not found")
 
-          {:ok, canonical_ids} ->
-            case classify(world, canonical_ids, [], []) do
-              :not_found ->
-                # An unknown id and an id this caller may not see are ONE answer;
-                # a visible NONE id is substrate truth and uses `no_item`.
-                not_found("assignment not found")
+          {items, no_item} ->
+            selected =
+              world.items
+              |> Enum.filter(&MapSet.member?(MapSet.new(items), &1.id))
+              |> Enum.map(&node(world, &1))
 
-              {items, no_item} ->
-                selected =
-                  world.items
-                  |> Enum.filter(&MapSet.member?(MapSet.new(items), &1.id))
-                  |> Enum.map(&node(world, &1))
-
-                envelope(world)
-                |> Map.put(:items, selected)
-                |> Map.put(:no_item, Enum.sort(no_item))
-            end
+            envelope(world)
+            |> Map.put(:items, selected)
+            |> Map.put(:no_item, Enum.sort(no_item))
         end
     end
-  end
-
-  defp resolve_assignment_ids(world, supplied_ids) do
-    visible_ids =
-      world.assignments_by_id
-      |> Map.keys()
-      |> Enum.filter(&(classify(world, [&1], [], []) != :not_found))
-
-    Enum.reduce_while(supplied_ids, {:ok, []}, fn supplied, {:ok, resolved} ->
-      case IdPrefix.resolve_ids(:assignment, supplied, visible_ids) do
-        {:ok, id} -> {:cont, {:ok, resolved ++ [id]}}
-        :unknown -> {:halt, {:error, not_found("assignment not found")}}
-        {:ambiguous, error} -> {:halt, {:error, error}}
-      end
-    end)
   end
 
   defp classify(_world, [], items, no_item), do: {Enum.uniq(items), Enum.uniq(no_item)}
@@ -416,15 +336,7 @@ defmodule Tightbeam.ExecutionMap do
       # session-keyed through durable assignment columns.
       active: %{
         running_turn: Enum.any?(union, &(&1.status == "running")),
-        pending_session_wake: pending_session_wake?(world, holders),
-        # THE FABRIC'S CLASSED MAIL, visible where the org already looks
-        # (fabric §13 Phase 1 exit: classes visible in toplines rows). Counts of
-        # PENDING classed wakes for this item's current open holders, keyed by
-        # the class their senders elected — so a reader can see what is queued
-        # for a mind, and under which class, without reading its transcript.
-        # Empty map, never null: absence of classed mail is knowable from these
-        # rows, unlike the coverage-nulled counts above.
-        pending_wake_classes: pending_wake_classes(world, holders)
+        pending_session_wake: pending_session_wake?(world, holders)
       },
       since_progress_ms: world.now - anchor(world, item, set, union)
     }
@@ -566,18 +478,6 @@ defmodule Tightbeam.ExecutionMap do
   # item-attributed wakes.
   defp pending_session_wake?(world, holders) do
     Enum.any?(holders, &MapSet.member?(world.pending_wake_sessions, &1))
-  end
-
-  # Summed across holders, because the row is about the ITEM's exposure, not any
-  # one session's. A digest carrier is counted as the one turn it will spend,
-  # and its members are already `canceled` — so the count never double-reports
-  # a payload that a digest already absorbed.
-  defp pending_wake_classes(world, holders) do
-    holders
-    |> Enum.flat_map(&Map.to_list(Map.get(world.pending_wake_classes, &1, %{})))
-    |> Enum.reduce(%{}, fn {class, count}, acc ->
-      Map.update(acc, class, count, &(&1 + count))
-    end)
   end
 
   ## The progress clock
@@ -726,12 +626,8 @@ defmodule Tightbeam.ExecutionMap do
       attests_by_assignment: attests_by_assignment(db),
       commit_refs: commit_refs(db),
       markers_by_assignment: markers_by_assignment(db),
-      # STATUTE+EFFORT only (Sol xhigh review round 2, finding 1):
-      # `Escalation.open_counts_by_assignment/1` is now the sole owner of this
-      # query. Agent questions gate nothing (fabric §10) and are not tallied.
-      open_requests: Escalation.open_counts_by_assignment(db),
+      open_requests: open_requests(db),
       pending_wake_sessions: pending_wake_sessions(db),
-      pending_wake_classes: pending_wake_classes(db),
       dispositions: dispositions(db),
       session_owners: session_owners(db)
     }
@@ -933,6 +829,17 @@ defmodule Tightbeam.ExecutionMap do
     |> Map.new(fn {assignment_id, refs} -> {assignment_id, Enum.uniq(refs)} end)
   end
 
+  defp open_requests(db) do
+    {:ok, rows} =
+      DB.query(db, """
+      SELECT assignmentId, COUNT(*) FROM decision_requests
+      WHERE status = 'open' AND assignmentId IS NOT NULL
+      GROUP BY assignmentId
+      """)
+
+    Map.new(rows, fn [assignment_id, count] -> {assignment_id, count} end)
+  end
+
   defp pending_wake_sessions(db) do
     {:ok, rows} =
       DB.query(
@@ -941,23 +848,6 @@ defmodule Tightbeam.ExecutionMap do
       )
 
     MapSet.new(rows, &hd/1)
-  end
-
-  defp pending_wake_classes(db) do
-    {:ok, rows} =
-      DB.query(
-        db,
-        """
-        SELECT sessionKey, class, COUNT(*)
-        FROM wakes
-        WHERE state = 'pending' AND consumer = 'prompt' AND class IS NOT NULL
-        GROUP BY sessionKey, class
-        """
-      )
-
-    Enum.reduce(rows, %{}, fn [session_key, class, count], acc ->
-      Map.update(acc, session_key, %{class => count}, &Map.put(&1, class, count))
-    end)
   end
 
   # Dispositions append a `disposition_transition` causal event with
@@ -1032,105 +922,4 @@ defmodule Tightbeam.ExecutionMap do
 
   defp invalid(message), do: %{code: "invalid", message: message}
   defp not_found(message), do: %{code: "not_found", message: message}
-
-  # O3: the roster page's cursor miss names itself `cursor_not_found`, the
-  # same code `attests` and `transcript` use for the identical shape of
-  # refusal — an id that does not resolve, whether because it never existed
-  # or because this caller cannot see it. `not_found/1` above stays the
-  # code for a genuinely different refusal (`--under`'s anchor lookup).
-  defp cursor_not_found(message), do: %{code: "cursor_not_found", message: message}
-
-  ## The flat-roster cursor (seam ④)
-
-  # The hard cap. A larger request is CLAMPED and the clamp is observable in the
-  # returned count, exactly as `transcript` behaves.
-  @max_limit 500
-
-  defp paging?(params), do: not is_nil(params[:after]) or not is_nil(params[:limit])
-
-  # NO DEFAULT LIMIT, deliberately, and this is where it differs from
-  # `transcript`. A transcript is an unbounded conversation read tail-first, so a
-  # default page is a kindness. A roster is a work census, and a default limit
-  # would silently shorten every existing caller's answer — an optimization that
-  # loses rows is wrong, full stop (Law 2). Paging happens when a caller asks.
-  defp page_selection(params) do
-    cursor = params[:after]
-    limit = params[:limit]
-
-    cond do
-      not (is_nil(cursor) or (is_binary(cursor) and cursor != "")) ->
-        {:error, invalid("--after takes a work item id")}
-
-      not (is_nil(limit) or (is_integer(limit) and limit > 0)) ->
-        {:error, invalid("--limit takes a positive integer")}
-
-      is_nil(cursor) and is_nil(limit) ->
-        :all
-
-      true ->
-        {:page, cursor, limit && min(limit, @max_limit)}
-    end
-  end
-
-  defp resolve_page_selection(_world, :all), do: :all
-  defp resolve_page_selection(_world, {:page, nil, limit}), do: {:page, nil, limit}
-
-  defp resolve_page_selection(world, {:page, supplied, limit}) do
-    case IdPrefix.resolve_ids(:work_item, supplied, Map.keys(world.items_by_id)) do
-      {:ok, id} -> {:page, id, limit}
-      :unknown -> {:error, cursor_not_found("work item not found")}
-      {:ambiguous, error} -> {:error, error}
-    end
-  end
-
-  defp page(world, appearing, :all),
-    do: Map.put(envelope(world), :items, Enum.map(appearing, &node(world, &1)))
-
-  defp page(world, appearing, {:page, cursor, limit}) do
-    case cursor_key(world, cursor) do
-      :error ->
-        # An unknown id and an id this caller cannot see are ONE answer — the
-        # cursor is resolved against the VISIBLE item map rather than the
-        # table, so a stranger's id and a nonexistent one land here
-        # identically. Named `cursor_not_found` (O3), unified with
-        # `attests`/`transcript`'s cursor refusals.
-        cursor_not_found("work item not found")
-
-      key ->
-        # `--limit` alone is the first page: there is no cursor to be after.
-        after_cursor =
-          if is_nil(key), do: appearing, else: Enum.filter(appearing, &(order_key(&1) > key))
-
-        {selected, rest} = take(after_cursor, limit)
-
-        envelope(world)
-        |> Map.put(:items, Enum.map(selected, &node(world, &1)))
-        |> Map.put(:next_after, next_after(selected))
-        |> Map.put(:has_more_after, rest != [])
-    end
-  end
-
-  # `false` is not an id: an exhausted page must hand back an explicit `nil`
-  # cursor, the same ID-or-null shape every other page carries, never a
-  # boolean a client could round-trip back in as `--after` (Sol xhigh review,
-  # finding 6).
-  defp next_after([]), do: nil
-  defp next_after(selected), do: List.last(selected).id
-
-  defp cursor_key(_world, nil), do: nil
-
-  defp cursor_key(world, id) do
-    case Map.fetch(world.items_by_id, id) do
-      {:ok, item} -> order_key(item)
-      :error -> :error
-    end
-  end
-
-  # The roster's outermost ordering, verbatim from `visible_items/2`'s
-  # `ORDER BY createdAt ASC, id ASC`. Both components are immutable for the life
-  # of the row, which is what makes the boundary stable across pages.
-  defp order_key(item), do: {item.created_at, item.id}
-
-  defp take(items, nil), do: {items, []}
-  defp take(items, limit), do: Enum.split(items, limit)
 end

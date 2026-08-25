@@ -36,8 +36,6 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
         "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 1, 'admin_add', 1)"
       )
 
-    ensure_main_session(db, "flynn")
-
     holder = session(db, "fix-holder", "coder", "claude", "anthropic")
     recon = session(db, "recon-holder", "recon", "codex", "openai")
     Roles.create!(db, "recon", "flynn", recon.session_key)
@@ -79,7 +77,6 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
              "refix-requires-diagnosis",
              "code-review-requires-passing-tests",
              "spec-dispatch-requires-spirit",
-             "review-rounds-doorbell",
              "completion-requires-verification",
              "completion-requires-results-artifact"
            ]

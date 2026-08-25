@@ -201,7 +201,7 @@ defmodule Mix.Tasks.Tightbeam.Catalog.Diff do
     lines
     |> Enum.take_while(&(not String.starts_with?(&1, "## ")))
     |> Enum.flat_map(fn line ->
-      case Regex.run(~r/^- \*\*([^*]+)\*\*/, line) do
+      case Regex.run(~r/^- \*\*([^*]+)\*\* —/, line) do
         [_, model_id] -> [model_id]
         nil -> []
       end

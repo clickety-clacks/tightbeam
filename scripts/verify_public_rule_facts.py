@@ -8,6 +8,7 @@ from pathlib import Path
 
 
 SOURCE = Path("lib/tightbeam/rules.ex")
+COMPATIBILITY_BASELINE = "6c13efcbe9e1ae247b8aa7e91a374015c74dc947"
 FACTS = re.compile(r'@facts %\{\n(.*?)\n  \}', re.DOTALL)
 FACT_NAME = re.compile(r'^\s*"([^"]+)"\s*=>', re.MULTILINE)
 
@@ -19,18 +20,53 @@ def fact_names(source: str) -> set[str]:
     return set(FACT_NAME.findall(match.group(1)))
 
 
-def parent_source() -> str:
+def history_refs() -> list[str]:
+    shallow = subprocess.check_output(
+        ["git", "rev-parse", "--is-shallow-repository"],
+        text=True,
+        stderr=subprocess.PIPE,
+    ).strip()
+    if shallow != "false":
+        raise ValueError("repository history is shallow")
+
+    subprocess.check_call(
+        ["git", "merge-base", "--is-ancestor", COMPATIBILITY_BASELINE, "HEAD"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    refs = subprocess.check_output(
+        [
+            "git",
+            "rev-list",
+            "--full-history",
+            f"{COMPATIBILITY_BASELINE}^..HEAD",
+            "--",
+            str(SOURCE),
+        ],
+        text=True,
+        stderr=subprocess.PIPE,
+    ).splitlines()
+    if COMPATIBILITY_BASELINE not in refs:
+        raise ValueError("compatibility baseline is not in the rule-fact history")
+    return refs
+
+
+def source_at(ref: str) -> str:
     return subprocess.check_output(
-        ["git", "show", f"HEAD^:{SOURCE}"], text=True, stderr=subprocess.PIPE
+        ["git", "show", f"{ref}:{SOURCE}"], text=True, stderr=subprocess.PIPE
     )
 
 
 def main() -> int:
     try:
-        previous = fact_names(parent_source())
-    except subprocess.CalledProcessError:
-        print("public rule-fact compatibility: no parent commit to compare")
-        return 0
+        history = history_refs()
+        previous = set().union(*(fact_names(source_at(ref)) for ref in history))
+    except (subprocess.CalledProcessError, ValueError) as error:
+        print(
+            f"public rule-fact compatibility: cannot inspect complete history: {error}",
+            file=sys.stderr,
+        )
+        return 1
 
     current = fact_names(SOURCE.read_text())
     removed = sorted(previous - current)

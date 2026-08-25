@@ -96,22 +96,6 @@ defmodule Tightbeam.ArtifactCarrierTest do
         "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 1, 'admin_add', 1)"
       )
 
-    main_key = Org.personal_session_key("flynn")
-
-    Org.create(db, %{
-      session_key: main_key,
-      display_name: "Main",
-      kind: "main",
-      is_built_in: true,
-      owner_user_id: "flynn",
-      origin: "user:flynn",
-      archetype: "default",
-      host: "testhost",
-      harness: "claude",
-      provider: "anthropic",
-      model: Model.new("fable")
-    })
-
     coder =
       Org.create(db, %{
         session_key: "carrier-coder",
@@ -186,8 +170,8 @@ defmodule Tightbeam.ArtifactCarrierTest do
 
   test "an unobserved record with no running turn is none, with a null edge", ctx do
     seq = enqueue_turn(ctx)
-    {:ok, turn} = Ledger.claim_next(ctx.db, ctx.coder.session_key, "owner")
-    :ok = Ledger.finish(ctx.db, seq, "delivered", nil, owner_lease: turn.owner_lease)
+    {:ok, _turn} = Ledger.claim_next(ctx.db, ctx.coder.session_key, "owner")
+    :ok = Ledger.finish(ctx.db, seq, "delivered")
 
     result = record_over_wire(ctx, %{"kind" => "doc", "title" => "Operator shell"})
 
@@ -203,7 +187,7 @@ defmodule Tightbeam.ArtifactCarrierTest do
     observed_message = start_turn(ctx)
     assert observe_over_wire(ctx) == 200
 
-    :ok = finish_running(ctx, "delivered")
+    :ok = Ledger.finish(ctx.db, running_seq(ctx), "delivered")
     next_message = start_turn(ctx)
     refute next_message == observed_message
 
@@ -219,7 +203,7 @@ defmodule Tightbeam.ArtifactCarrierTest do
 
     # Cancel terminalizes BEFORE the serving task dies (session_lane.ex), which is
     # what used to make a legitimate mid-work record bind nothing.
-    :ok = finish_running(ctx, "canceled")
+    :ok = Ledger.finish(ctx.db, running_seq(ctx), "canceled")
 
     result = record_over_wire(ctx, %{"kind" => "report", "title" => "Mid-work"})
 
@@ -231,7 +215,7 @@ defmodule Tightbeam.ArtifactCarrierTest do
 
   test "caller-supplied provenance never reaches the row", ctx do
     forged = start_turn(ctx)
-    :ok = finish_running(ctx, "delivered")
+    :ok = Ledger.finish(ctx.db, running_seq(ctx), "delivered")
 
     result =
       record_over_wire(ctx, %{
@@ -289,7 +273,7 @@ defmodule Tightbeam.ArtifactCarrierTest do
   test "a fresher observation supersedes the session's window", ctx do
     first = start_turn(ctx)
     assert observe_over_wire(ctx) == 200
-    :ok = finish_running(ctx, "delivered")
+    :ok = Ledger.finish(ctx.db, running_seq(ctx), "delivered")
 
     second = start_turn(ctx)
     assert observe_over_wire(ctx) == 200
@@ -304,7 +288,7 @@ defmodule Tightbeam.ArtifactCarrierTest do
        ctx do
     _stale = start_turn(ctx)
     assert observe_over_wire(ctx) == 200
-    :ok = finish_running(ctx, "delivered")
+    :ok = Ledger.finish(ctx.db, running_seq(ctx), "delivered")
 
     # A second hook fire with nothing running: the freshest look saw no turn, so
     # the stale message must not survive to be bound.
@@ -582,18 +566,5 @@ defmodule Tightbeam.ArtifactCarrierTest do
       )
 
     seq
-  end
-
-  defp finish_running(ctx, terminal) do
-    seq = running_seq(ctx)
-
-    {:ok, [[lease]]} =
-      DB.query(
-        ctx.db,
-        "SELECT ownerLease FROM turn_lifecycle_events WHERE turnSeq=?1 AND kind='claimed'",
-        [seq]
-      )
-
-    Ledger.finish(ctx.db, seq, terminal, nil, owner_lease: lease)
   end
 end

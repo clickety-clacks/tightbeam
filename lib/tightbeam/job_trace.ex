@@ -1,7 +1,7 @@
 defmodule Tightbeam.JobTrace do
   @moduledoc "Pinned, read-only work-item trace artifact."
 
-  alias Tightbeam.{CausalEvents, DB, Escalation}
+  alias Tightbeam.{CausalEvents, DB}
 
   defmodule MissingCancellationProvenance do
     @moduledoc false
@@ -230,11 +230,6 @@ defmodule Tightbeam.JobTrace do
         ids ->
           {clause, params} = in_clause(ids)
 
-          # The `decision_requests` clause of this UNION is text supplied by
-          # `Escalation.wake_link_fragment/1` (Sol xhigh
-          # review round 2, finding 1) — no SQL naming that table is written
-          # here. It shares this SAME numbered `clause`/`params` pair with the
-          # other two tables' clauses, so all three placeholder sets line up.
           wake_rows(
             db,
             """
@@ -242,7 +237,8 @@ defmodule Tightbeam.JobTrace do
               SELECT wakeId, assignmentId FROM effort_checkin_generations
               WHERE assignmentId IN (#{clause})
               UNION
-              #{Escalation.wake_link_fragment(clause)}
+              SELECT deadlineWakeId, assignmentId FROM decision_requests
+              WHERE assignmentId IN (#{clause})
               UNION
               SELECT wakeId, assignmentId FROM wakes
               WHERE assignmentId IN (#{clause})
@@ -491,12 +487,21 @@ defmodule Tightbeam.JobTrace do
 
   defp decision_entries(_db, []), do: []
 
-  # `Escalation.decision_trace_rows/2` is now the sole owner of this query
-  # (Sol xhigh review round 2, finding 1) — ANY kind, deliberately: a job
-  # trace answers "what happened here", not "what could have gated it".
   defp decision_entries(db, assignment_ids) do
-    Escalation.decision_trace_rows(db, assignment_ids)
-    |> Enum.map(fn [id, assignment_id, state, ruling, at] ->
+    {clause, params} = in_clause(assignment_ids)
+
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT id, assignmentId, status, decision, raisedAt
+        FROM decision_requests
+        WHERE assignmentId IN (#{clause})
+        """,
+        params
+      )
+
+    Enum.map(rows, fn [id, assignment_id, state, ruling, at] ->
       %{
         at: at,
         type: "decision_request",

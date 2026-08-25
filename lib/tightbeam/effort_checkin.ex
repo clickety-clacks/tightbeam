@@ -11,18 +11,17 @@ defmodule Tightbeam.EffortCheckin do
   it.
 
   Zero effect on every channel prods the AGENT first — one wake naming the four
-  channels. Continued silence climbs the holder's active operational parents
-  and terminates at Main. This production reports agent inactivity to agents;
-  it never manufactures an operator decision.
+  channels. Only continued silence at the next bracket escalates to the owner's
+  decision request. Owners get decisions, not status.
 
   Filesystem observation is performed before the callback transaction. The
   transaction then CASes the exact generation/wake pair and either re-arms,
-  prods, or schedules the next parent escalation.
+  prods, or opens one parent-routed decision request with its durable deadline
+  wake.
   """
 
-  alias Tightbeam.{CausalEvents, DB, Escalation, Org, Placement, Supervision, Wakes}
+  alias Tightbeam.{CausalEvents, DB, Org, Placement, Supervision, Wakes}
   alias Tightbeam.DB.Txn
-  alias Tightbeam.Firehose.Publisher
 
   @origin "process:tightbeam"
   @default_horizon_ms 900_000
@@ -344,11 +343,6 @@ defmodule Tightbeam.EffortCheckin do
         error("not_authorized", "current expecter required")
 
       request.status == "ruled" and request.decision == action ->
-        {:ok, :ok} =
-          DB.transaction(db, fn txn ->
-            Publisher.maybe_accepted_in_txn(txn, call, request)
-          end)
-
         request
 
       request.status != "open" ->
@@ -371,21 +365,15 @@ defmodule Tightbeam.EffortCheckin do
           end
 
         case DB.transaction(db, fn txn ->
-               result =
-                 rule_in_txn(
-                   txn,
-                   config,
-                   request,
-                   action,
-                   call.origin,
-                   call.principal,
-                   fresh
-                 )
-
-               if is_map(result) and not Map.has_key?(result, :code),
-                 do: Publisher.maybe_accepted_in_txn(txn, call, result)
-
-               result
+               rule_in_txn(
+                 txn,
+                 config,
+                 request,
+                 action,
+                 call.origin,
+                 call.principal,
+                 fresh
+               )
              end) do
           {:ok, result} -> result
           {:error, error} -> raise error
@@ -500,14 +488,7 @@ defmodule Tightbeam.EffortCheckin do
 
                 nil
               else
-                escalate_parent_in_txn(
-                  txn,
-                  config,
-                  generation,
-                  evidence,
-                  session,
-                  advanced_baseline(generation.baseline, inspection)
-                )
+                open_request_in_txn(txn, config, generation, evidence)
               end
             end
           end
@@ -539,64 +520,73 @@ defmodule Tightbeam.EffortCheckin do
             assignment_id: request.assignment_id
           })
 
-        outcome =
-          Escalation.effort_update_generation_in_txn(txn, request.id, wake.wake_id, %{
-            expecter_session_key: next.session_key,
-            expecter_user_id: next.user_id,
-            lineage_rung: next.rung,
-            deadline_at: deadline,
-            deadline_wake_id: replacement.wake_id,
-            options_json: JSON.encode!(menu),
-            context_json: JSON.encode!(context)
+        Txn.q(
+          txn,
+          """
+          UPDATE decision_requests
+          SET expecterSessionKey = ?2, expecterUserId = ?3, lineageRung = ?4,
+              deadlineAt = ?5, deadlineWakeId = ?6, options = ?7, context = ?8
+          WHERE id = ?1 AND kind = 'effort' AND status = 'open' AND deadlineWakeId = ?9
+          """,
+          [
+            request.id,
+            next.session_key,
+            next.user_id,
+            next.rung,
+            deadline,
+            replacement.wake_id,
+            JSON.encode!(menu),
+            JSON.encode!(context),
+            wake.wake_id
+          ]
+        )
+
+        if Txn.changes(txn) == 1 do
+          mark_wake_fired(txn, wake.wake_id)
+
+          # The request row is overwritten in place and the replacement deadline
+          # wake carries no rung, so the rung it advanced FROM has no other home.
+          CausalEvents.append_in_txn(txn, %{
+            kind: "effort_rung_advance",
+            assignment_id: request.assignment_id,
+            job_ref: job_ref_in_txn(txn, request.assignment_id),
+            session_key: next.session_key,
+            detail: %{
+              requestId: request.id,
+              fromRung: request.lineage_rung,
+              toRung: next.rung,
+              fromExpecter: expecter_ref(request.expecter_session_key, request.expecter_user_id),
+              toExpecter: expecter_ref(next.session_key, next.user_id)
+            }
           })
 
-        case outcome do
-          {:advanced, advanced} ->
-            mark_wake_fired(txn, wake.wake_id)
+          advanced = request_for_id(txn, request.id)
+          arm_notification_in_txn(txn, advanced)
+          advanced
+        else
+          winner = request_for_id(txn, request.id)
 
-            # The request row is overwritten in place and the replacement deadline
-            # wake carries no rung, so the rung it advanced FROM has no other home.
-            CausalEvents.append_in_txn(txn, %{
-              kind: "effort_rung_advance",
-              assignment_id: request.assignment_id,
-              job_ref: job_ref_in_txn(txn, request.assignment_id),
-              session_key: next.session_key,
-              detail: %{
-                requestId: request.id,
-                fromRung: request.lineage_rung,
-                toRung: next.rung,
-                fromExpecter:
-                  expecter_ref(request.expecter_session_key, request.expecter_user_id),
-                toExpecter: expecter_ref(next.session_key, next.user_id)
-              }
-            })
-
-            advanced
-
-          :lost ->
-            winner = request_for_id(txn, request.id)
-
-            command =
-              if winner.status == "open" and winner.deadline_wake_id != replacement.wake_id do
-                %{
-                  requester: %{kind: "process", id: "tightbeam:effort-checkin"},
-                  reason_kind: "superseded",
-                  causal_source: %{kind: "wake", id: winner.deadline_wake_id},
-                  outcome: %{
-                    kind: "replacement",
-                    replacement_wake_id: winner.deadline_wake_id
-                  }
+          command =
+            if winner.status == "open" and winner.deadline_wake_id != replacement.wake_id do
+              %{
+                requester: %{kind: "process", id: "tightbeam:effort-checkin"},
+                reason_kind: "superseded",
+                causal_source: %{kind: "wake", id: winner.deadline_wake_id},
+                outcome: %{
+                  kind: "replacement",
+                  replacement_wake_id: winner.deadline_wake_id
                 }
-              else
-                decision_disposition_command(
-                  txn,
-                  winner,
-                  liveness_trigger_in_txn!(txn, winner.assignment_id)
-                )
-              end
+              }
+            else
+              decision_disposition_command(
+                txn,
+                winner,
+                liveness_trigger_in_txn!(txn, winner.assignment_id)
+              )
+            end
 
-            cancel_pending_wake_in_txn!(txn, replacement.wake_id, command)
-            nil
+          cancel_pending_wake_in_txn!(txn, replacement.wake_id, command)
+          nil
         end
     end
   end
@@ -623,7 +613,13 @@ defmodule Tightbeam.EffortCheckin do
       current.status == "open" ->
         ruled_at = now()
 
-        if Escalation.effort_rule_in_txn(txn, current.id, action, origin, ruled_at) do
+        Txn.q(
+          txn,
+          "UPDATE decision_requests SET status = 'ruled', decision = ?2, ruledBy = ?3, ruledAt = ?4 WHERE id = ?1 AND status = 'open'",
+          [current.id, action, origin, ruled_at]
+        )
+
+        if Txn.changes(txn) == 1 do
           ruled = request_for_id(txn, current.id)
 
           cancel_pending_wake_in_txn!(
@@ -675,6 +671,103 @@ defmodule Tightbeam.EffortCheckin do
 
       true ->
         error("not_open", "decision request is not open")
+    end
+  end
+
+  defp open_request_in_txn(txn, config, generation, evidence) do
+    assignment = assignment_in_txn(txn, generation.assignment_id)
+    expecter = initial_expecter(txn, assignment)
+    menu = menu_in_txn(txn, assignment, expecter)
+    request_id = "dr_" <> Tightbeam.Id.uuid4()
+    deadline_at = now() + deadline_ms(config)
+
+    deadline =
+      Wakes.schedule_in_txn(txn, %{
+        session_key: expecter.session_key || Org.personal_session_key(expecter.user_id),
+        origin: @origin,
+        consumer: "effort_deadline",
+        due_at: deadline_at,
+        assignment_id: generation.assignment_id
+      })
+
+    context = Map.put(evidence, :actions, menu)
+
+    Txn.q(
+      txn,
+      """
+      INSERT INTO decision_requests
+        (id, kind, raiserId, ownerUserId, assignmentId, expecterSessionKey,
+         expecterUserId, lineageRung, effortGeneration, deadlineWakeId,
+         raisedAt, deadlineAt, statuteName, actionKey, question, options,
+         context, status)
+      VALUES
+        (?1, 'effort', 'process:tightbeam', ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+         ?9, ?10, NULL, NULL, ?11, ?12, ?13, 'open')
+      ON CONFLICT DO NOTHING
+      """,
+      [
+        request_id,
+        expecter.owner_user_id,
+        generation.assignment_id,
+        expecter.session_key,
+        expecter.user_id,
+        expecter.rung,
+        generation.generation,
+        deadline.wake_id,
+        now(),
+        deadline_at,
+        "Assignment #{generation.assignment_id} effort check-in outcome: #{evidence.outcome}. " <>
+          "The holder was prodded and stayed silent. Channels checked since arm — " <>
+          "workspace writes: #{evidence.channels.writes} (#{evidence.workspace}); " <>
+          "artifacts recorded: #{evidence.channels.artifacts}; " <>
+          "attests: #{evidence.channels.attests}; " <>
+          "work-item updates: #{evidence.channels.workItems}. " <>
+          "Terminal turns since arm: #{evidence.turnsSinceArmed}; minutes since arm: #{evidence.minutesSinceArmed}. " <>
+          "Choose continue or dismiss, or use an available ordinary power.",
+        JSON.encode!(menu),
+        JSON.encode!(context)
+      ]
+    )
+
+    if Txn.changes(txn) == 1 do
+      request = request_for_id(txn, request_id)
+      arm_notification_in_txn(txn, request)
+      request
+    else
+      case Txn.q(
+             txn,
+             "SELECT id FROM decision_requests WHERE kind = 'effort' AND assignmentId = ?1 AND effortGeneration = ?2",
+             [generation.assignment_id, generation.generation]
+           ) do
+        [[id]] ->
+          winner = request_for_id(txn, id)
+
+          command =
+            if winner.status == "open" do
+              %{
+                requester: %{kind: "process", id: "tightbeam:effort-checkin"},
+                reason_kind: "superseded",
+                causal_source: %{kind: "decision_request", id: winner.id},
+                outcome: %{
+                  kind: "replacement",
+                  replacement_wake_id: winner.deadline_wake_id
+                }
+              }
+            else
+              decision_disposition_command(
+                txn,
+                winner,
+                liveness_trigger_in_txn!(txn, winner.assignment_id)
+              )
+            end
+
+          cancel_pending_wake_in_txn!(txn, deadline.wake_id, command)
+
+          winner
+
+        [] ->
+          raise "decision request conflict has no durable winner"
+      end
     end
   end
 
@@ -744,17 +837,40 @@ defmodule Tightbeam.EffortCheckin do
   end
 
   defp supersede_requests_in_txn(txn, assignment_id, command) do
-    txn
-    |> Escalation.effort_supersede_open_in_txn(assignment_id)
-    |> Enum.each(&cancel_pending_wake_in_txn!(txn, &1, command))
+    wake_ids =
+      Txn.q(
+        txn,
+        "SELECT deadlineWakeId FROM decision_requests WHERE kind = 'effort' AND assignmentId = ?1 AND status = 'open'",
+        [assignment_id]
+      )
+      |> List.flatten()
 
+    Txn.q(
+      txn,
+      "UPDATE decision_requests SET status = 'superseded' WHERE kind = 'effort' AND assignmentId = ?1 AND status = 'open'",
+      [assignment_id]
+    )
+
+    Enum.each(wake_ids, &cancel_pending_wake_in_txn!(txn, &1, command))
     :ok
   end
 
   defp dispose_requests_in_txn(txn, assignment_id, command) do
-    txn
-    |> Escalation.effort_supersede_open_in_txn(assignment_id)
-    |> Enum.each(&cancel_pending_wake_in_txn!(txn, &1, command))
+    wake_ids =
+      Txn.q(
+        txn,
+        "SELECT deadlineWakeId FROM decision_requests WHERE kind = 'effort' AND assignmentId = ?1 AND status = 'open'",
+        [assignment_id]
+      )
+      |> List.flatten()
+
+    Txn.q(
+      txn,
+      "UPDATE decision_requests SET status = 'superseded' WHERE kind = 'effort' AND assignmentId = ?1 AND status = 'open'",
+      [assignment_id]
+    )
+
+    Enum.each(wake_ids, &cancel_pending_wake_in_txn!(txn, &1, command))
 
     :ok
   end
@@ -838,6 +954,38 @@ defmodule Tightbeam.EffortCheckin do
     end
   end
 
+  defp initial_expecter(txn, assignment) do
+    cond do
+      assignment.opened_by_user ->
+        %{
+          session_key: nil,
+          user_id: assignment.opened_by_user,
+          owner_user_id: assignment.opened_by_user,
+          principal_user_id: assignment.opened_by_user,
+          rung: 0
+        }
+
+      assignment.opened_by_session == assignment.holder_key ->
+        holder = session_in_txn(txn, assignment.holder_key)
+
+        if holder.spawned_by do
+          route_session(txn, holder.spawned_by, holder.owner_user_id, 1, assignment.holder_key)
+        else
+          %{
+            session_key: nil,
+            user_id: holder.owner_user_id,
+            owner_user_id: holder.owner_user_id,
+            principal_user_id: holder.owner_user_id,
+            rung: 1
+          }
+        end
+
+      true ->
+        opener = session_in_txn(txn, assignment.opened_by_session)
+        route_session(txn, opener.session_key, opener.owner_user_id, 0, assignment.holder_key)
+    end
+  end
+
   defp advance_expecter(_txn, %{expecter_user_id: user, lineage_rung: rung})
        when is_binary(user) do
     %{
@@ -853,10 +1001,10 @@ defmodule Tightbeam.EffortCheckin do
     current = session_in_txn(txn, request.expecter_session_key)
     assignment = assignment_in_txn(txn, request.assignment_id)
 
-    if current.kind != "main" do
+    if current.spawned_by do
       route_session(
         txn,
-        current.operational_parent,
+        current.spawned_by,
         request.owner_user_id,
         request.lineage_rung + 1,
         assignment.holder_key
@@ -876,8 +1024,8 @@ defmodule Tightbeam.EffortCheckin do
     session = session_in_txn(txn, key)
 
     cond do
-      key == holder_key and session.kind != "main" ->
-        route_session(txn, session.operational_parent, owner_user_id, rung + 1, holder_key)
+      key == holder_key and session.spawned_by ->
+        route_session(txn, session.spawned_by, owner_user_id, rung + 1, holder_key)
 
       key == holder_key ->
         %{
@@ -897,8 +1045,8 @@ defmodule Tightbeam.EffortCheckin do
           rung: rung
         }
 
-      session.kind != "main" ->
-        route_session(txn, session.operational_parent, owner_user_id, rung + 1, holder_key)
+      session.spawned_by ->
+        route_session(txn, session.spawned_by, owner_user_id, rung + 1, holder_key)
 
       true ->
         %{
@@ -1011,7 +1159,7 @@ defmodule Tightbeam.EffortCheckin do
         workItems: channels.workItems
       },
       workspace: generation.root,
-      agentProdded: generation.agent_prodded > 0,
+      agentProdded: generation.agent_prodded == 1,
       turnsSinceArmed: channels.turns,
       minutesSinceArmed: div(max(now() - generation.armed_at, 0), 60_000)
     }
@@ -1037,110 +1185,6 @@ defmodule Tightbeam.EffortCheckin do
       due_at: now(),
       assignment_id: generation.assignment_id
     })
-  end
-
-  defp escalate_parent_in_txn(_txn, _config, _generation, _evidence, %{kind: "main"}, _baseline),
-    do: nil
-
-  defp escalate_parent_in_txn(txn, config, generation, evidence, session, baseline) do
-    chain = active_operational_chain!(txn, session)
-    visited = parent_targets_in_streak(txn, generation)
-
-    case Enum.find(chain, &(not MapSet.member?(visited, &1))) do
-      nil ->
-        nil
-
-      target ->
-        target_session = session_in_txn(txn, target)
-
-        Wakes.schedule_in_txn(txn, %{
-          session_key: target,
-          origin: @origin,
-          prompt:
-            "[effort escalation] Child session #{generation.holder_key} remains inactive on " <>
-              "assignment #{generation.assignment_id} after its prod: " <>
-              channel_sentence(evidence) <>
-              " Act through your ordinary session powers. Main is the terminal agent rung; " <>
-              "only Main may ask its operator for a real decision.",
-          due_at: now(),
-          assignment_id: generation.assignment_id
-        })
-
-        if target_session.kind == "main" do
-          nil
-        else
-          insert_generation(
-            txn,
-            config,
-            generation.assignment_id,
-            session,
-            generation.root,
-            baseline,
-            generation.generation + 1,
-            generation.multiplier,
-            generation.agent_prodded + 1
-          )
-        end
-    end
-  end
-
-  # The count brackets the current silent streak; the wake rows preserve the
-  # identities already notified in it. Re-reading the live chain and choosing
-  # its first unvisited member makes a concurrent reparent observable here.
-  defp parent_targets_in_streak(txn, generation) do
-    count = generation.agent_prodded - 1
-
-    if count > 0 do
-      txn
-      |> Txn.q(
-        """
-        SELECT sessionKey
-        FROM wakes
-        WHERE assignmentId=?1 AND prompt LIKE '[effort escalation]%'
-        ORDER BY rowid DESC
-        LIMIT ?2
-        """,
-        [generation.assignment_id, count]
-      )
-      |> Enum.map(fn [session_key] -> session_key end)
-      |> MapSet.new()
-    else
-      MapSet.new()
-    end
-  end
-
-  defp active_operational_chain!(txn, session) do
-    operational_chain!(
-      txn,
-      session.operational_parent,
-      MapSet.new([session.session_key]),
-      []
-    )
-  end
-
-  defp operational_chain!(txn, key, visited, acc) do
-    if MapSet.member?(visited, key) do
-      raise "incompatible_operational_parent_v1: cycle before Main at #{key}"
-    end
-
-    parent = session_in_txn(txn, key)
-    next_acc = if parent.state == "active", do: [key | acc], else: acc
-
-    cond do
-      parent.kind == "main" and parent.operational_parent == key and parent.state == "active" ->
-        Enum.reverse(next_acc)
-
-      parent.kind == "main" ->
-        raise "incompatible_operational_parent_v1: Main #{key} is not an active self-root"
-
-      true ->
-        operational_chain!(
-          txn,
-          parent.operational_parent,
-          MapSet.put(visited, key),
-          next_acc
-        )
-    end
   end
 
   defp channel_sentence(evidence) do
@@ -1202,6 +1246,26 @@ defmodule Tightbeam.EffortCheckin do
     end
   end
 
+  # Transactional outbox: the expecter notification is a durable wake armed with
+  # the request insert or the winning rung CAS. Its assignmentId is the carrier
+  # delivery derives assignment/job attribution from.
+  defp arm_notification_in_txn(txn, request) do
+    prompt =
+      "Effort check-in #{request.id} for assignment #{request.assignment_id}.\n" <>
+        request.question <>
+        "\nActions: #{Enum.join(request.options || [], ", ")}"
+
+    Wakes.schedule_in_txn(txn, %{
+      session_key:
+        request.expecter_session_key || Org.personal_session_key(request.expecter_user_id),
+      origin: @origin,
+      prompt: prompt,
+      due_at: now(),
+      assignment_id: request.assignment_id,
+      target_gate: 0
+    })
+  end
+
   defp authorized?({:session, key}, request), do: request.expecter_session_key == key
   defp authorized?({:user, user}, request), do: request.expecter_user_id == user
   defp authorized?(_, _request), do: false
@@ -1246,21 +1310,20 @@ defmodule Tightbeam.EffortCheckin do
   end
 
   defp session_in_txn(txn, key) do
-    [[key, owner, operational_parent, host, state, built_in, kind]] =
+    [[key, owner, spawned_by, host, state, built_in]] =
       Txn.q(
         txn,
-        "SELECT sessionKey, ownerUserId, operationalParent, host, state, isBuiltIn, kind FROM sessions WHERE sessionKey = ?1",
+        "SELECT sessionKey, ownerUserId, spawnedBy, host, state, isBuiltIn FROM sessions WHERE sessionKey = ?1",
         [key]
       )
 
     %{
       session_key: key,
       owner_user_id: owner,
-      operational_parent: operational_parent,
+      spawned_by: spawned_by,
       host: host,
       state: state,
-      is_built_in: built_in == 1,
-      kind: kind
+      is_built_in: built_in == 1
     }
   end
 
@@ -1385,22 +1448,79 @@ defmodule Tightbeam.EffortCheckin do
     }
   end
 
-  # Thin wrappers, kept under their existing local names so the (many) call
-  # sites below are untouched — the SQL itself now lives nowhere in this file
-  # (Sol xhigh review round 2, finding 1). `Escalation.request_from_row/1`'s
-  # map already carries every field this module ever read from its own
-  # narrower 18-column parser (`owner_user_id`, `assignment_id`,
-  # `expecter_session_key`, `expecter_user_id`, `lineage_rung`,
-  # `effort_generation`, `deadline_wake_id`, `raised_at`, `deadline_at`,
-  # `question`, `options` decoded, `context` decoded, `status`, `decision`,
-  # `ruled_by`, `ruled_at`) under the identical names, plus the columns only
-  # the other two arms use — harmless extras, never read here.
-  defp request_for_deadline(txn, wake_id),
-    do: Escalation.effort_open_by_deadline_wake_in_txn(txn, wake_id)
+  defp request_for_deadline(txn, wake_id) do
+    case Txn.q(
+           txn,
+           request_select() <>
+             " WHERE kind = 'effort' AND status = 'open' AND deadlineWakeId = ?1",
+           [wake_id]
+         ) do
+      [row] -> request(row)
+      [] -> nil
+    end
+  end
 
-  defp request_for_id(txn, id), do: Escalation.raw_by_id_in_txn!(txn, id)
+  defp request_for_id(txn, id) do
+    [row] = Txn.q(txn, request_select() <> " WHERE id = ?1", [id])
+    request(row)
+  end
 
-  defp request_row(db, id), do: Escalation.raw_by_id(db, id)
+  defp request_row(_db, nil), do: nil
+
+  defp request_row(db, id) do
+    {:ok, rows} = DB.query(db, request_select() <> " WHERE id = ?1", [id])
+
+    case rows do
+      [row] -> request(row)
+      [] -> nil
+    end
+  end
+
+  defp request_select do
+    "SELECT id, kind, ownerUserId, assignmentId, expecterSessionKey, expecterUserId, lineageRung, effortGeneration, deadlineWakeId, raisedAt, deadlineAt, question, options, context, status, decision, ruledBy, ruledAt FROM decision_requests"
+  end
+
+  defp request([
+         id,
+         kind,
+         owner,
+         assignment_id,
+         expecter_session,
+         expecter_user,
+         rung,
+         effort_generation,
+         deadline_wake_id,
+         raised_at,
+         deadline_at,
+         question,
+         options,
+         context,
+         status,
+         decision,
+         ruled_by,
+         ruled_at
+       ]) do
+    %{
+      id: id,
+      kind: kind,
+      owner_user_id: owner,
+      assignment_id: assignment_id,
+      expecter_session_key: expecter_session,
+      expecter_user_id: expecter_user,
+      lineage_rung: rung,
+      effort_generation: effort_generation,
+      deadline_wake_id: deadline_wake_id,
+      raised_at: raised_at,
+      deadline_at: deadline_at,
+      question: question,
+      options: options && JSON.decode!(options),
+      context: JSON.decode!(context),
+      status: status,
+      decision: decision,
+      ruled_by: ruled_by,
+      ruled_at: ruled_at
+    }
+  end
 
   defp mark_wake_fired(txn, wake_id) do
     Txn.q(

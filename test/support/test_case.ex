@@ -94,7 +94,7 @@ defmodule Tightbeam.TestCase do
     })
   end
 
-  @doc "Create the canonical self-parented Main fixture for an owner when absent."
+  @doc "Create the canonical built-in Main fixture for an owner when absent."
   def ensure_main_session(db, owner) do
     key = Tightbeam.Org.personal_session_key(owner)
 
@@ -114,7 +114,7 @@ defmodule Tightbeam.TestCase do
           host: "testhost"
         })
 
-      %{kind: "main", operational_parent: ^key} = session ->
+      %{kind: "main", is_built_in: true, session_key: ^key} = session ->
         session
 
       session ->

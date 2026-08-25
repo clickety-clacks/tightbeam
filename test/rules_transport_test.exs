@@ -109,6 +109,7 @@ defmodule Tightbeam.RulesTransportTest do
     %{
       db: db,
       device: device,
+      event_cursor: EventLog.events_after(db, 0, 10) |> List.last() |> Map.fetch!(:id),
       main: main,
       router_opts: router_opts,
       socket_deps: socket_deps
@@ -164,10 +165,7 @@ defmodule Tightbeam.RulesTransportTest do
     refute_received {:handler_invoked, _}
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM domain_mutations")
 
-    events =
-      ctx.db
-      |> EventLog.events_after(0, 10)
-      |> Enum.reject(&(&1.verb == "cold-start"))
+    events = EventLog.events_after(ctx.db, ctx.event_cursor, 10)
 
     assert Enum.map(events, &{&1.kind, &1.verb}) == [
              {"denied", "post"},
@@ -213,8 +211,6 @@ defmodule Tightbeam.RulesTransportTest do
     refute_received {:handler_invoked, "tune"}
 
     assert [%{kind: "denied", verb: "tune"}] =
-             ctx.db
-             |> EventLog.events_after(0, 10)
-             |> Enum.reject(&(&1.verb == "cold-start"))
+             EventLog.events_after(ctx.db, ctx.event_cursor, 10)
   end
 end

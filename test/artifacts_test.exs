@@ -13,7 +13,6 @@ defmodule Tightbeam.ArtifactsTest do
     :ok = Ledger.ensure_schema(db)
     :ok = Artifacts.ensure_schema(db)
 
-    ensure_main_session(db, "flynn")
     parent = session(db, "parent", nil)
     child = session(db, "child", parent.session_key)
     seed_work_items(db)
@@ -93,27 +92,6 @@ defmodule Tightbeam.ArtifactsTest do
            ) == [first.artifact_id]
   end
 
-  test "records artifact ancestry from the operational parent, not spawn provenance", ctx do
-    operational_parent = session(ctx.db, "operational-parent", nil)
-
-    child =
-      Org.set_operational_parent(
-        ctx.db,
-        ctx.child.session_key,
-        operational_parent.session_key
-      )
-
-    artifact =
-      record(ctx.db, child.session_key, %{
-        kind: "report",
-        title: "Operational ancestry",
-        origin_path: "reports/operational-ancestry.md"
-      })
-
-    assert child.spawned_by == ctx.parent.session_key
-    assert artifact.parent_session == operational_parent.session_key
-  end
-
   test "gateway verbs return rows, filtered lists, not-found, and the session-caller error",
        ctx do
     handlers = Gateway.handlers(%{db: ctx.db})
@@ -161,53 +139,6 @@ defmodule Tightbeam.ArtifactsTest do
            }
 
     assert Artifacts.list(ctx.db, %{session_key: ctx.child.session_key}) == [row]
-  end
-
-  test "public work-item prefixes store canonical ids and refusals record nothing", ctx do
-    handlers = Gateway.handlers(%{db: ctx.db})
-
-    {:ok, _} =
-      DB.query(
-        ctx.db,
-        "INSERT INTO work_items (id, title, ownerUserId, createdByUser, createdAt) VALUES ('wi_prefix_alpha', 'alpha', 'flynn', 'flynn', 2)"
-      )
-
-    call = %{
-      principal: {:session, ctx.child.session_key},
-      session_key: ctx.child.session_key,
-      params: %{
-        kind: "report",
-        title: "Prefix proof",
-        origin_path: "prefix.md",
-        work_item_id: "wi_prefix_a"
-      }
-    }
-
-    row = handlers["artifact-record"].(call)
-    assert row.work_item_id == "wi_prefix_alpha"
-
-    assert handlers["artifacts"].(%{params: %{work_item_id: "wi_prefix_a"}}) == %{
-             artifacts: [row]
-           }
-
-    {:ok, _} =
-      DB.query(
-        ctx.db,
-        "INSERT INTO work_items (id, title, ownerUserId, createdByUser, createdAt) VALUES ('wi_prefix_beta', 'beta', 'flynn', 'flynn', 3)"
-      )
-
-    {:ok, [[before_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM artifacts")
-
-    ambiguous = put_in(call, [:params, :work_item_id], "wi_prefix_")
-
-    assert %{code: "ambiguous_id", candidates: ["wi_prefix_alpha", "wi_prefix_beta"]} =
-             handlers["artifact-record"].(ambiguous)
-
-    missing = put_in(call, [:params, :work_item_id], "wi_missing")
-    assert %{code: "unknown_work_item"} = handlers["artifact-record"].(missing)
-
-    {:ok, [[after_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM artifacts")
-    assert after_count == before_count
   end
 
   test "schema is idempotent and enforces the closed kind/state sets", ctx do

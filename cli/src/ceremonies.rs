@@ -223,7 +223,19 @@ where
     if let Err(failure) = staged {
         let _ = fs::remove_dir_all(staging);
         if failure.interrupted {
-            return Err(failure.reason);
+            let reason = failure.reason;
+            let _ = cancel_after_begin(
+                identity,
+                provider,
+                kind,
+                machine.as_deref(),
+                Some(lease_id),
+                None,
+                &reason,
+                &ceremony,
+                &send_request,
+            );
+            return Err(reason);
         }
         let reason = failure.reason;
         let classified = if reason.contains("unsupported (no subscription)") {
@@ -960,7 +972,12 @@ fn notify_operator(ceremony: &Ceremony<'_>, deliverable: &Deliverable, machine: 
 
     let prompt = onboard_emit::operator_prompt(ceremony.provider, machine, deliverable);
     let request = dispatch::build_operator_wake_request(ceremony.identity, owner, &prompt);
-    match (ceremony.send)(ceremony.endpoint, &request, None) {
+    // Bound the wake to the SAME lease the child runs under. This send is synchronous inside
+    // emit_delivery, reached from tee_pump mid-poll: an unbounded send to a hung gateway would
+    // outlive the ceremony deadline -- the notification defeating the very lease the watchdog
+    // enforces. Some(deadline) routes through send_to_with_deadline's lease::until, so a hang
+    // expires loudly here and falls through to the still-written file + stdout channels below.
+    match (ceremony.send)(ceremony.endpoint, &request, Some(ceremony.deadline)) {
         Ok(reply) => Notified::Waked {
             user_id: owner.to_owned(),
             wake_id: reply.as_ref().and_then(wake_id_of),
@@ -987,9 +1004,13 @@ fn write_delivery_file(provider: &str, minted_ms: i64, contents: &str) -> Option
     let path = std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .join(&name);
+    // create_new (O_CREAT|O_EXCL): on Unix the mode argument is honored ONLY when the file is
+    // created, so a create+truncate of an existing name would keep that file's old, possibly
+    // world-readable mode. Refusing to reuse a name makes a non-0600 delivery file
+    // unrepresentable -- a name collision (two deliveries in the same millisecond into one cwd)
+    // becomes the loud named failure below, never a silent 0644.
     let open = fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .write(true)
         .mode(0o600)
         .open(&path);
@@ -1034,14 +1055,17 @@ fn run_openai_onboarding(staging: &str, ceremony: &Ceremony<'_>) -> Result<(), S
     // Miss path: codex produced a sign-in block we could not parse (a format drift), and it
     // was not an operator cancel. Record the raw teed tail so the deliverable is never
     // invisible -- loud degradation, exactly as ruled.
+    // The fallback must NOT gate on codex's vendor wording ("device", "one-time code"): the
+    // drift it exists to survive is precisely a change to that wording, so gating on it
+    // reintroduces the silent-loss class this work item removes. Any non-empty output we
+    // failed to parse into a code, that was not an operator cancel, earns the raw tail;
+    // raw_tail's own trim guards the whitespace-only case.
     let interrupted = matches!(&outcome, Err(error) if error.is_interrupted());
     if !emitted && !interrupted {
         let text = String::from_utf8_lossy(&buffer);
-        if text.contains("device") || text.contains("one-time code") {
-            let tail = onboard_emit::raw_tail(&text, 4096);
-            if !tail.is_empty() {
-                emit_delivery(ceremony, &Deliverable::RawTail { tail }, None);
-            }
+        let tail = onboard_emit::raw_tail(&text, 4096);
+        if !tail.is_empty() {
+            emit_delivery(ceremony, &Deliverable::RawTail { tail }, None);
         }
     }
 
@@ -2402,9 +2426,9 @@ mod tests {
 
     /// Codex uses the pipe-backed bounded runner rather than the Anthropic pty runner.
     /// Its signal has to retain the same interrupted classification all the way through
-    /// onboarding, or `onboard` mistakes TERM for a staging failure and waits on cancel.
+    /// onboarding while still releasing the exact lease created by `begin`.
     #[test]
-    fn term_during_codex_onboarding_kills_the_tree_without_entering_cancel() {
+    fn term_during_codex_onboarding_cancels_its_exact_lease_and_keeps_the_interrupt() {
         const INNER: &str = "TIGHTBEAM_CODEX_SIGNAL_INNER";
         const MARKER: &str = "TIGHTBEAM_CODEX_SIGNAL_MARKER";
         const STAGING: &str = "TIGHTBEAM_CODEX_SIGNAL_STAGING";
@@ -2437,9 +2461,12 @@ mod tests {
                             "leaseTtlMs": 300_000
                         }))),
                         Some("cancel") => {
-                            fs::write(&cancel, "entered").unwrap();
-                            thread::sleep(Duration::from_secs(300));
-                            Ok(None)
+                            let lease = request
+                                .pointer("/params/leaseId")
+                                .and_then(serde_json::Value::as_str)
+                                .expect("cancel must identify the lease from begin");
+                            fs::write(&cancel, lease).unwrap();
+                            Err("cancel transport failed".to_owned())
                         }
                         phase => panic!("unexpected onboarding phase: {phase:?}"),
                     }
@@ -2447,7 +2474,10 @@ mod tests {
                 |_, _| Ok(None),
             );
             let error = result.expect_err("TERM must abort codex onboarding");
-            assert!(error.contains("interrupted by signal"), "{error}");
+            assert_eq!(
+                error,
+                "codex device-code login was interrupted by signal 15"
+            );
             assert!(!std::path::Path::new(&staging).exists());
             assert!(std::path::Path::new(&marker).exists());
             return;
@@ -2479,7 +2509,7 @@ mod tests {
         inner
             .args([
                 "--exact",
-                "ceremonies::tests::term_during_codex_onboarding_kills_the_tree_without_entering_cancel",
+                "ceremonies::tests::term_during_codex_onboarding_cancels_its_exact_lease_and_keeps_the_interrupt",
                 "--nocapture",
             ])
             .env(INNER, "1")
@@ -2489,8 +2519,8 @@ mod tests {
             .env("TIGHTBEAM_MACHINE", "signal-fixture-host")
             .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
         let mut inner = inner.spawn().unwrap();
 
         let ready_by = Instant::now() + Duration::from_secs(5);
@@ -2503,10 +2533,11 @@ mod tests {
             0
         );
 
-        let mut stdout = inner.stdout.take().unwrap();
+        let mut stderr = inner.stderr.take().unwrap();
         let drain = thread::spawn(move || {
             let mut discarded = Vec::new();
-            let _ = stdout.read_to_end(&mut discarded);
+            let _ = stderr.read_to_end(&mut discarded);
+            discarded
         });
         let exit_by = Instant::now() + Duration::from_secs(5);
         let mut status = None;
@@ -2522,21 +2553,31 @@ mod tests {
             );
             let _ = inner.wait();
         }
-        drain.join().unwrap();
+        let stderr = String::from_utf8_lossy(&drain.join().unwrap()).into_owned();
 
         let grandchild_pid: libc::pid_t = grandchild.trim().parse().unwrap();
         let alive = unsafe { libc::kill(grandchild_pid, 0) } == 0
             || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH);
-        let cancel_entered = cancel.exists();
+        let canceled_lease = fs::read_to_string(&cancel).ok();
         let staging_survived = staging.exists();
         let _ = fs::remove_dir_all(&root);
 
         assert!(
             !required_kill,
-            "TERM did not promptly exit codex onboarding; cancel={cancel_entered}, \
+            "TERM did not promptly exit codex onboarding; canceled_lease={canceled_lease:?}, \
              staging={staging_survived}, descendant_alive={alive}"
         );
-        assert!(!cancel_entered, "TERM entered the lease-cancellation wait");
+        assert!(
+            status
+                .expect("promptly exited inner test must have a status")
+                .success(),
+            "the inner interrupted-reason assertion failed; stderr={stderr:?}"
+        );
+        assert_eq!(
+            canceled_lease.as_deref(),
+            Some("signal-fixture-lease"),
+            "TERM did not cancel the lease returned by begin"
+        );
         assert!(!alive, "codex descendant {grandchild} survived TERM");
         assert!(!staging_survived, "TERM left codex staging behind");
     }
@@ -2915,6 +2956,286 @@ mod tests {
         assert!(
             contents.contains("auth.openai.com/codex/device"),
             "url missing from delivery file: {contents}"
+        );
+    }
+
+    /// The operator wake is bounded by the ceremony lease, and losing it does not lose the file.
+    ///
+    /// F1 (independent review of e75b8ce): `notify_operator` sent the wake with deadline `None`,
+    /// so a hung gateway could make the notification outlive the very lease the watchdog
+    /// enforces. This drives the real tee so `emit_delivery` -> `notify_operator` runs, records
+    /// the deadline the send is handed, and fails that send the way a lease-expired hang would --
+    /// proving both halves: the send carries `Some(ceremony.deadline)`, and the lost wake still
+    /// leaves the 0600 file behind (loud degradation, not a sunk deliverable).
+    #[test]
+    fn the_operator_wake_is_bounded_by_the_ceremony_lease() {
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/codex-device-auth-0.146.0.txt"
+        );
+
+        let _cwd_guard = DELIVERY_CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        let before = openai_delivery_files(&cwd);
+
+        let mut command = ProcessCommand::new("/bin/sh");
+        command
+            .args(["-c", &format!("cat {fixture}; sleep 0.2; exit 0")])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null());
+
+        let endpoint = Endpoint {
+            base: "http://gateway.test".to_owned(),
+            token: "tbc_test".to_owned(),
+            origin: crate::dispatch::Origin::Provisioned,
+        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        // Record the deadline each send is handed, and fail the send as a hung gateway would once
+        // its lease elapsed, so the fallback (file + stdout) is exercised at the same time.
+        let seen: std::cell::RefCell<Vec<Option<Instant>>> = std::cell::RefCell::new(Vec::new());
+        let send = |_: &Endpoint,
+                    _request: &RequestSpec,
+                    d: Option<Instant>|
+         -> Result<Option<serde_json::Value>, String> {
+            seen.borrow_mut().push(d);
+            Err("gateway request refused because the onboarding lease expired".to_owned())
+        };
+        let ceremony = Ceremony {
+            endpoint: &endpoint,
+            deadline,
+            load_harnesses: &|_, _| Ok(None),
+            identity: &Identity::User("mike".to_owned()),
+            send: &send,
+            provider: "openai",
+            machine: Some("shrdlu"),
+            owner_user_id: Some("mike".to_owned()),
+        };
+
+        let mut emitted = false;
+        let mut buffer = Vec::<u8>::new();
+        let status = supervise_teed(command, &ceremony, &mut emitted, &mut buffer).unwrap();
+
+        // Capture whether the file survived, then clean up before any assertion can unwind.
+        let fresh: Vec<PathBuf> = openai_delivery_files(&cwd)
+            .difference(&before)
+            .cloned()
+            .collect();
+        let file_written = !fresh.is_empty();
+        for path in &fresh {
+            let _ = fs::remove_file(path);
+        }
+
+        assert!(
+            status.success(),
+            "the stub child exited non-zero: {status:?}"
+        );
+        assert!(
+            emitted,
+            "the drive should have emitted the delivery mid-run"
+        );
+        let seen = seen.into_inner();
+        assert_eq!(
+            seen.len(),
+            1,
+            "expected exactly one wake send, got {seen:?}"
+        );
+        // F1: the wake carries the ceremony lease, never an unbounded None.
+        assert_eq!(
+            seen[0],
+            Some(deadline),
+            "the operator wake must be bounded by the ceremony deadline"
+        );
+        // The lost wake did not sink the local copy: loud degradation, file still written.
+        assert!(
+            file_written,
+            "the delivery file must survive a failed/hung wake"
+        );
+    }
+
+    /// F2: a fresh delivery file is created private (0600).
+    #[test]
+    fn a_fresh_delivery_file_is_created_private_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let _cwd_guard = DELIVERY_CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        // A distinctive minted timestamp so the name cannot clash with a real delivery file.
+        let minted = 1_700_000_000_000 + std::process::id() as i64;
+        let path = cwd.join(format!("onboard-delivery-openai-{minted}.json"));
+        let _ = fs::remove_file(&path);
+
+        let written = write_delivery_file("openai", minted, "{\"x\":1}");
+
+        let mode = fs::metadata(&path)
+            .ok()
+            .map(|meta| meta.permissions().mode() & 0o777);
+        let _ = fs::remove_file(&path);
+
+        assert!(written.is_some(), "a fresh name must be written");
+        assert_eq!(
+            mode,
+            Some(0o600),
+            "a fresh delivery file must be created 0600"
+        );
+    }
+
+    /// F2 (independent review of e75b8ce): the claimed 0600 file could be 0644.
+    ///
+    /// `create(true).truncate(true).mode(0o600)` honored the mode only on creation, so writing
+    /// over an existing name kept that file's old, possibly world-readable mode -- the reviewer's
+    /// repro pre-seeded a 0644 file and the pairing code landed at 0644. `create_new` refuses the
+    /// collision loudly instead, so the secret is never written into a non-private file.
+    #[test]
+    fn an_existing_delivery_name_is_refused_not_silently_reused() {
+        use std::os::unix::fs::PermissionsExt;
+        let _cwd_guard = DELIVERY_CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        let minted = 1_700_000_000_001 + std::process::id() as i64;
+        let path = cwd.join(format!("onboard-delivery-openai-{minted}.json"));
+
+        // Pre-seed the exact target name as a world-readable file with prior contents.
+        fs::write(&path, "PRIOR").unwrap();
+        fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let written = write_delivery_file("openai", minted, "{\"secret\":\"VG6S-L35ON\"}");
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        let contents = fs::read_to_string(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(
+            written, None,
+            "an existing name must be refused, not reused"
+        );
+        assert_eq!(mode, 0o644, "the pre-existing file must be left untouched");
+        assert_eq!(
+            contents, "PRIOR",
+            "the secret must NOT be written into the world-readable file"
+        );
+    }
+
+    /// F3 (independent review of e75b8ce): the raw-tail miss must survive vendor-wording drift.
+    ///
+    /// The integrated fallback used to fire only when the failed stream contained lowercase
+    /// `device` or `one-time code` -- so a sign-in block whose wording drifted past both phrases
+    /// (the exact case the fallback exists to survive) took no path and vanished. This drives a
+    /// synthetic drifted block -- a parse miss carrying NEITHER phrase -- through the LITERAL
+    /// `run_openai_onboarding`, and proves the raw tail still reaches the operator wake and the
+    /// local file.
+    #[test]
+    fn a_drifted_sign_in_block_records_the_raw_tail_without_vendor_wording() {
+        use std::os::unix::fs::PermissionsExt;
+        // A plausible future codex format our extractor cannot parse (no "one-time code" marker)
+        // and which contains neither phrase the old gate keyed on. Synthetic by necessity: it is
+        // a format that does not exist yet -- the drift the fallback is built to survive.
+        let drift = "To finish signing in, open https://auth.openai.com/activate and type the pairing key: WXYZ-1234";
+        assert!(
+            onboard_emit::extract_codex_device(drift).is_none(),
+            "the drifted block must be a genuine parse miss"
+        );
+        assert!(
+            !drift.contains("device") && !drift.contains("one-time code"),
+            "the drifted block must lack the old gate's vendor phrases"
+        );
+
+        let unique = format!(
+            "{}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            std::process::id()
+        );
+        let root = std::env::temp_dir().join(format!("tightbeam-onboard-drift-{unique}"));
+        let staging = root.join("staging");
+        fs::create_dir_all(&staging).unwrap();
+
+        // Emit the drifted block, then exit 0 banking NO credential -- a real miss.
+        let stub = root.join("codex-stub.sh");
+        fs::write(
+            &stub,
+            format!("#!/bin/sh\nprintf %s '{drift}'\nsleep 0.2\nexit 0\n"),
+        )
+        .unwrap();
+        fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let endpoint = Endpoint {
+            base: "http://gateway.test".to_owned(),
+            token: "tbc_test".to_owned(),
+            origin: crate::dispatch::Origin::Provisioned,
+        };
+        let sent = std::cell::RefCell::new(Vec::<String>::new());
+        let send = |_: &Endpoint, request: &RequestSpec, _: Option<Instant>| {
+            sent.borrow_mut().push(request.body_json.clone());
+            Ok(Some(serde_json::json!({ "wakeId": "w_test" })))
+        };
+        let catalog = crate::harnesses::HarnessCatalog {
+            harnesses: vec![crate::harnesses::HarnessProjection {
+                wire_name: "codex".to_owned(),
+                install_package: "codex".to_owned(),
+                cli_binary: stub.to_string_lossy().into_owned(),
+                process_markers: vec![],
+            }],
+        };
+        let load = |_: &Endpoint, _: Instant| Ok(Some(catalog.clone()));
+        let ceremony = Ceremony {
+            endpoint: &endpoint,
+            deadline: Instant::now() + Duration::from_secs(30),
+            load_harnesses: &load,
+            identity: &Identity::User("mike".to_owned()),
+            send: &send,
+            provider: "openai",
+            machine: Some("shrdlu"),
+            owner_user_id: Some("mike".to_owned()),
+        };
+
+        let _cwd_guard = DELIVERY_CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        let before = openai_delivery_files(&cwd);
+
+        let result = run_openai_onboarding(staging.to_str().unwrap(), &ceremony);
+
+        let fresh: Vec<PathBuf> = openai_delivery_files(&cwd)
+            .difference(&before)
+            .cloned()
+            .collect();
+        let file_body = fresh.first().map(|path| fs::read_to_string(path).unwrap());
+        for path in &fresh {
+            let _ = fs::remove_file(path);
+        }
+        let _ = fs::remove_dir_all(&root);
+
+        // Sign-in did not complete (no credential banked) -- the leg fails loudly...
+        assert!(
+            result.is_err(),
+            "a miss that banked no credential must not report success"
+        );
+        // ...but the deliverable was NOT lost: exactly one raw-tail wake carried the drifted block.
+        let sent = sent.into_inner();
+        assert_eq!(
+            sent.len(),
+            1,
+            "expected exactly one raw-tail wake, got {sent:?}"
+        );
+        assert!(
+            sent[0].contains("WXYZ-1234"),
+            "raw tail missing the drifted code: {}",
+            sent[0]
+        );
+        assert!(
+            sent[0].contains("activate"),
+            "raw tail missing the drifted url: {}",
+            sent[0]
+        );
+        // The 0600 local copy carries it too.
+        assert_eq!(
+            fresh.len(),
+            1,
+            "expected exactly one delivery file, got {fresh:?}"
+        );
+        let file_body = file_body.expect("a delivery file must be written for the raw tail");
+        assert!(
+            file_body.contains("WXYZ-1234"),
+            "raw tail missing from delivery file: {file_body}"
         );
     }
 

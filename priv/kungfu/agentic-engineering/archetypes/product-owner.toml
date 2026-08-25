@@ -14,10 +14,4 @@ text = """
 #include "model-policy.md"
 
 #include "product-owner.md"
-
-#include "inception.md"
-
-#include "comms-discipline.md"
-
-#include "altitude-statute.md"
 """

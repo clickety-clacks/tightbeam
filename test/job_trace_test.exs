@@ -18,10 +18,8 @@ defmodule Tightbeam.JobTraceTest do
     :ok =
       DB.execute(
         db,
-        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('owner', 0, 'admin_add', 1),('admin', 1, 'admin_add', 1),('other', 0, 'admin_add', 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('owner',0,'admin_add',1),('admin',1,'admin_add',1),('other',0,'admin_add',1)"
       )
-
-    Enum.each(~w(owner admin other), &ensure_main_session(db, &1))
 
     session(db, "holder", "owner")
     session(db, "reviewer", "other")
@@ -174,11 +172,8 @@ defmodule Tightbeam.JobTraceTest do
     end)
 
     direct = Enum.find(trace.assignments, &(&1.id == "asg_direct"))
-    legacy = Enum.find(trace.assignments, &(&1.id == "asg_bad"))
     review = Enum.find(trace.assignments, &(&1.id == "asg_review"))
     assert direct.files == ["a.ex", "z.ex"]
-    assert legacy.files == []
-    assert review.files == []
     assert direct.openerRef == "user:owner"
     assert review.openerRef == "session:reviewer"
     assert review.reviewsAssignmentId == "asg_direct"

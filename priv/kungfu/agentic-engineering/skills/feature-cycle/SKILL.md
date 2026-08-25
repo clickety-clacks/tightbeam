@@ -12,9 +12,9 @@ canonical path, bind it to the work-item by content, not by memory:
 serves, so every coder and reviewer reads the same one. Every assignment below threads
 to the work-item (`--work-item <id>`). `tightbeam dispatch --to <holder> --subject "…"
 --brief "…" --work-item <id>` opens a plain card and wakes its holder in one atomic step;
-a card that declares files (`--files`) or links a review (`--reviews`) opens with `assign`
-and is then woken, because those flags live on `assign` — so the steps below that need
-them keep that two-step form.
+a card that includes an advisory file suggestion (`--files`) or links a review
+(`--reviews`) opens with `assign` and is then woken, because those flags live on
+`assign` — so the steps below that use them keep that two-step form.
 
 Keep only a handful of goals truly in-flight at once (see the kernel); this loop is
 per-feature, but your attention across features is the scarce resource.
@@ -28,9 +28,8 @@ per-feature, but your attention across features is the scarce resource.
 2. **Adversarial spec review.** A spec is authoritative policy, so it requires review.
    Select the first qualified permitted candidate from the ordered spec-review row in
    `preferred-models.md`. Try each candidate once; on an unavailable candidate, step
-   right once. When the row is exhausted, record the attempted rungs and evidence as
-   the assignment's capability block, keep separable work moving, and schedule a
-   re-check. Do not use Main as a model fallback.
+   right once. Send ambiguous qualification to your parent, and when the row is
+   exhausted have the parent record `work-blocked` or surface the missing credential.
    Spawn the selected reviewer as a fresh session. Link the review to the work it
    reviews so the substrate can witness the independence:
    `tightbeam assign --subject "review of spec <id>" --role reviewer:<slug> --work-item <id> --reviews <specAssignmentId>`.
@@ -42,10 +41,9 @@ per-feature, but your attention across features is the scarce resource.
    one objective per dispatch, together covering every clause. Cut along the seams that
    minimize what crosses between goals: defects cluster at the interfaces between
    different agents' work. Run independent goals in parallel; order goals that touch
-   the same code. Use `--files '["path", ...]'` only when likely starting paths help
-   the holder begin. The list is optional bootstrap context, not custody, authorization,
-   or a complete source boundary. When current source inspection exposes a real
-   collision, require truthful reporting and coordinate the order or reconciliation.
+   the same code. Add `--files '["path", ...]'` when an advisory suggestion will help
+   others discover the expected work area. It grants no path and forbids no work.
+   Reconcile real overlaps normally.
 4. **Implement.** For each goal, assign a coder one goal with the spec path and the
    work-item id. The coder attests progress as it works — including when the goal
    builds clean and is ready for review. Completion is attested only after the review
@@ -62,9 +60,8 @@ per-feature, but your attention across features is the scarce resource.
    For a review-required effect, select the first qualified permitted candidate from
    the ordered code-review row in `preferred-models.md`. Try each candidate once. An
    unavailable candidate advances the selection one place to the right; never retry
-   the same candidate. If the row is exhausted, record the attempted rungs and evidence
-   as the assignment's capability block, keep separable work moving, and schedule a
-   re-check. Do not use Main as a model fallback. Spawn
+   the same candidate. Send ambiguous qualification to your parent. If the row is
+   exhausted, the parent records `work-blocked` or surfaces the credential need. Spawn
    the selected reviewer as a fresh session with the capability the effect requires.
    Same model, provider, or harness remains eligible. Link the single review card to
    the reviewed work:
@@ -119,9 +116,8 @@ per-feature, but your attention across features is the scarce resource.
    Done means the user can try it; the user's verdict, when given, is attested on the
    work-item's assignment as `--kind verdict`.
 10. **Teardown.** Retire sessions whose job has ended
-   (`tightbeam retire --session <key>`), dependents first; never retire one with an
-   open assignment. Close or surrender its work, or explicitly dispose of it through
-   the lawful assignment path, first. A finished feature leaves no idle hires behind.
+   (`tightbeam retire --session <key>`), dependents first; a finished feature leaves no
+   idle hires behind.
 
 When a goal is broken and not converging after two attempts, revert to the last
 known-good state and re-dispatch from there — the pull to spend a third attempt on an

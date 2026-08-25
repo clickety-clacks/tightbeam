@@ -2,7 +2,17 @@ defmodule Tightbeam.PlacementTest do
   use Tightbeam.TestCase, async: false
   alias Tightbeam.Model
 
-  alias Tightbeam.{Archetypes, Credentials, DB, EventLog, Homes, Identity, Org, Placement, Rails}
+  alias Tightbeam.{
+    Archetypes,
+    Credentials,
+    DB,
+    HarnessHealth,
+    Homes,
+    Identity,
+    Org,
+    Placement,
+    Rails
+  }
 
   setup do
     base_dir = Path.join(System.tmp_dir!(), "tb-placement-#{System.unique_integer([:positive])}")
@@ -10,9 +20,7 @@ defmodule Tightbeam.PlacementTest do
     File.write!(Path.join(base_dir, "gateway.json"), JSON.encode!(%{cliToken: "tbc_test"}))
     db = :"placement_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
-    :ok = Org.ensure_schema(db)
-    :ok = EventLog.ensure_schema(db)
-    :ok = Placement.ensure_schema(db)
+    :ok = Tightbeam.Schema.ensure_all(db)
     Archetypes.load!(base_dir)
     Rails.load!(base_dir)
 
@@ -739,6 +747,54 @@ defmodule Tightbeam.PlacementTest do
     refute_receive {:unexpected_sh, _}
   end
 
+  test "a terminal provider callback opens one authoritative auth incident", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    unless Process.whereis(Tightbeam.TurnTaskSupervisor) do
+      start_supervised!({Task.Supervisor, name: Tightbeam.TurnTaskSupervisor})
+    end
+
+    Org.create(db, %{
+      session_key: Org.personal_session_key("flynn"),
+      display_name: "Main",
+      kind: "main",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "operator-host",
+      harness: "codex",
+      provider: "openai",
+      model: Model.new("gpt-5")
+    })
+
+    config = %{
+      base_dir: base_dir,
+      db: db,
+      cwd: "/work",
+      cli_bin: "/local/bin",
+      sh: fn _command -> {"", 0} end
+    }
+
+    handler = Placement.adapter_opts(config, {:codex, "default", "testhost"})[:on_auth_event]
+    handler.(:transient, %{"authMode" => "chatgpt"})
+    refute eventually(fn -> HarnessHealth.active(db) != [] end, 4)
+
+    handler.(:terminal, %{"authMode" => nil, "planType" => nil})
+
+    assert eventually(fn ->
+             match?(
+               [%{failureClass: "auth-dead", harness: "codex", host: "testhost"}],
+               HarnessHealth.active(db)
+             )
+           end)
+
+    assert Enum.any?(
+             Tightbeam.EventLog.lifecycle_events(db),
+             &(&1.kind == "harness_health_auth_blocker")
+           )
+  end
+
   test "adapter_opts appends a local overlay and absent rows leave env unchanged", %{
     base_dir: base_dir,
     db: db
@@ -766,6 +822,186 @@ defmodule Tightbeam.PlacementTest do
 
     assert Placement.adapter_opts(config, {:claude, "default", "testhost"})[:env] ==
              baseline ++ [{"EXAMPLE_OVERLAY_VAR", "example-local"}]
+  end
+
+  test "host toolchain rows construct local PATH in order and clearing them restores bytes", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    first = Path.join(base_dir, "toolchain-one")
+    second = Path.join(base_dir, "toolchain-two")
+    File.mkdir_p!(first)
+    File.mkdir_p!(second)
+
+    config = %{
+      base_dir: base_dir,
+      db: db,
+      cwd: "/work",
+      cli_bin: "/local/bin",
+      default_model: Model.new("fable")
+    }
+
+    assert {:ok, []} = DB.query(db, "SELECT host FROM host_toolchain_dirs")
+    refute Map.has_key?(Placement.hosts(base_dir, db)["testhost"], :toolchain_dirs)
+
+    baseline = Placement.adapter_opts(config, {:claude, "default", "testhost"})[:env]
+
+    assert {:ok, %{dirs: [^first, ^second]}} =
+             Placement.set_toolchain_dirs(
+               db,
+               "testhost",
+               [first, second],
+               "user:operator"
+             )
+
+    assert Placement.hosts(base_dir, db)["testhost"].toolchain_dirs == [first, second]
+
+    configured = Placement.adapter_opts(config, {:claude, "default", "testhost"})[:env]
+
+    assert {"PATH", "/local/bin:#{first}:#{second}:/usr/local/bin:/usr/bin:/bin"} in configured
+
+    refute {"PATH", "/local/bin:" <> (System.get_env("PATH") || "")} in configured
+
+    assert {:ok, %{dirs: []}} =
+             Placement.set_toolchain_dirs(db, "testhost", [], "user:operator")
+
+    refute Map.has_key?(Placement.hosts(base_dir, db)["testhost"], :toolchain_dirs)
+    assert Placement.adapter_opts(config, {:claude, "default", "testhost"})[:env] == baseline
+  end
+
+  test "host toolchain rows use the same constructed PATH for ssh adapters", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    Application.put_env(:tightbeam, :advertised_url, "http://gateway.example:4000")
+
+    assert {:ok, _} =
+             Placement.register_host(db, "worker", %{
+               ssh: "codex@worker",
+               base_dir: "/srv/tb",
+               cli_bin: "/srv/tb/bin"
+             })
+
+    assert {:ok, _} =
+             Placement.set_toolchain_dirs(
+               db,
+               "worker",
+               ["/tools/one", "/tools/two"],
+               "user:operator"
+             )
+
+    parent = self()
+
+    sh = fn command ->
+      send(parent, {:toolchain_sh, command})
+
+      if Enum.any?(command, &String.contains?(&1, "credential-harvest")) and
+           Enum.any?(command, &String.contains?(&1, "cat")),
+         do: {"", 42},
+         else: {"", 0}
+    end
+
+    config = %{
+      base_dir: base_dir,
+      db: db,
+      cwd: "/work",
+      cli_bin: "/local/bin",
+      default_model: Model.new("fable"),
+      sh: sh
+    }
+
+    command = Placement.adapter_opts(config, {:codex, "default", "worker"})[:cmd]
+
+    assert "PATH=/srv/tb/bin:/tools/one:/tools/two:/usr/local/bin:/usr/bin:/bin" in command
+    refute "PATH=/srv/tb/bin:$PATH" in command
+
+    assert_receive {:toolchain_sh,
+                    [
+                      "ssh",
+                      "-o",
+                      "BatchMode=yes",
+                      "-o",
+                      "ConnectTimeout=5",
+                      "codex@worker",
+                      "test",
+                      "-d",
+                      "/tools/one"
+                    ]}
+
+    assert_receive {:toolchain_sh,
+                    [
+                      "ssh",
+                      "-o",
+                      "BatchMode=yes",
+                      "-o",
+                      "ConnectTimeout=5",
+                      "codex@worker",
+                      "test",
+                      "-d",
+                      "/tools/two"
+                    ]}
+  end
+
+  test "a configured but unavailable toolchain directory refuses adapter start loudly", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    config = %{
+      base_dir: base_dir,
+      db: db,
+      cwd: "/work",
+      cli_bin: "/local/bin",
+      default_model: Model.new("fable")
+    }
+
+    missing = Path.join(base_dir, "missing-toolchain")
+
+    assert {:ok, _} =
+             Placement.set_toolchain_dirs(db, "testhost", [missing], "user:operator")
+
+    assert_raise RuntimeError,
+                 "host testhost toolchain directory is unavailable at adapter start: #{missing}",
+                 fn -> Placement.adapter_opts(config, {:claude, "default", "testhost"}) end
+
+    assert {:ok, _} =
+             Placement.register_host(db, "worker", %{
+               ssh: "codex@worker",
+               base_dir: "/srv/tb",
+               cli_bin: "/srv/tb/bin"
+             })
+
+    assert {:ok, _} =
+             Placement.set_toolchain_dirs(db, "worker", ["/missing-remote"], "user:operator")
+
+    remote = Map.put(config, :sh, fn _command -> {"", 1} end)
+
+    assert_raise RuntimeError,
+                 "host worker toolchain directory is unavailable at adapter start (exit 1): /missing-remote",
+                 fn -> Placement.adapter_opts(remote, {:codex, "default", "worker"}) end
+  end
+
+  test "adapter_opts always pins GH_CONFIG_DIR at the banked github dir", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    config = %{
+      base_dir: base_dir,
+      db: db,
+      cwd: "/work",
+      cli_bin: "/local/bin",
+      default_model: Model.new("fable")
+    }
+
+    # Unconditional even before onboarding: an absent banked dir makes gh
+    # answer needs_onboarding, where ambient fallback would let a keyring
+    # credential agents cannot read answer "live".
+    gh_dir = Path.join([base_dir, "auth", "github", "gh"])
+    refute File.dir?(gh_dir)
+
+    assert {"GH_CONFIG_DIR", gh_dir} in Placement.adapter_opts(
+             config,
+             {:claude, "default", "testhost"}
+           )[:env]
   end
 
   test "adapter_opts appends an ssh overlay to remote_env", %{base_dir: base_dir, db: db} do
@@ -977,6 +1213,7 @@ defmodule Tightbeam.PlacementTest do
              "TIGHTBEAM_URL=http://gateway.example:4000",
              "PATH=/srv/tb/bin:$PATH",
              "TIGHTBEAM_LINEAGE=tb1-Y29kZXhAd29ya2Vy",
+             "GH_CONFIG_DIR='/srv/tb/auth/github/gh'",
              ~s(CODEX_CONFIG='{"bypass_hook_trust":true}'),
              "/srv/tb/adapters/node_modules/.bin/codex-acp"
            ]
@@ -1111,7 +1348,11 @@ defmodule Tightbeam.PlacementTest do
 
     assert hooks == %{
              "hooks" => %{
-               "PreToolUse" => [Rails.observation_entry(), Rails.probe_entry()]
+               "PreToolUse" => [
+                 Rails.github_auth_entry(),
+                 Rails.observation_entry(),
+                 Rails.probe_entry()
+               ]
              }
            }
   end
@@ -1272,6 +1513,22 @@ defmodule Tightbeam.PlacementTest do
     assert {:ok, "testhost"} = Placement.resolve(anywhere, nil, hosts)
     assert {:ok, "work-1"} = Placement.resolve(anywhere, "work-1", hosts)
     assert {:error, %{code: "unknown_host"}} = Placement.resolve(anywhere, "nope", hosts)
+  end
+
+  defp eventually(fun, tries \\ 60)
+
+  defp eventually(fun, tries) do
+    cond do
+      fun.() ->
+        true
+
+      tries == 0 ->
+        false
+
+      true ->
+        Process.sleep(25)
+        eventually(fun, tries - 1)
+    end
   end
 
   defp install_statute(base_dir, text \\ "History-rewriting git commands are forbidden here.") do

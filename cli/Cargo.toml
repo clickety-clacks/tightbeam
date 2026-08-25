@@ -1,6 +1,6 @@
 [package]
 name = "tightbeam"
-version = "0.2.0"
+version = "0.1.8"
 edition = "2024"
 # edition 2024 needs Rust >= 1.85. Without this field cargo reports the mismatch as
 # "feature `edition2024` is required ... not stabilized in this version of Cargo",
