@@ -15,6 +15,11 @@ defmodule Tightbeam.ArtifactContent do
     defexception [:code, :message]
   end
 
+  defmodule CaptureReuseError do
+    @moduledoc false
+    defexception [:digest, :failure, :principal, message: "capture reuse failed"]
+  end
+
   @migration_id "0.1.9/artifact-content-v1"
   @max_object_bytes 32 * 1024 * 1024
 
@@ -90,8 +95,7 @@ defmodule Tightbeam.ArtifactContent do
       try do
         with :ok <- validate_declared(staged, opts),
              :ok <- validate_expected(staged, opts),
-             {:ok, blob} <- publish_staged(staged, opts),
-             {:ok, row} <- persist_release(db, blob, quota, opts),
+             {:ok, blob, row} <- publish_and_persist_release(db, staged, quota, opts),
              :ok <- verify_after_release(db, blob, opts) do
           {:ok, row}
         end
@@ -108,8 +112,9 @@ defmodule Tightbeam.ArtifactContent do
   @doc """
   Prepare every retirement source before releasing any row.
 
-  CAS publication can precede the transaction, so a failed batch may leave an
-  immutable orphan. It can never leave a partial set of released rows.
+  All sources are staged before one serialized quota/publication/release
+  transaction. A failed batch can retain only objects that fit the physical
+  quota, and it can never leave a partial set of released rows.
   """
   @spec capture_many(DB.server(), [map()], map()) :: {:ok, [map()]} | {:error, map()}
   def capture_many(db \\ Tightbeam.DB, captures, common_opts)
@@ -117,10 +122,15 @@ defmodule Tightbeam.ArtifactContent do
     with {:ok, quota} <- configured_bytes(common_opts, :quota_bytes),
          {:ok, reserved} <- configured_bytes(common_opts, :reserved_free_bytes),
          :ok <- filesystem_preflight(common_opts, reserved),
-         {:ok, blobs} <- prepare_all(captures, common_opts),
-         {:ok, rows} <- persist_releases(db, blobs, quota),
-         :ok <- verify_many_after_release(db, blobs) do
-      {:ok, rows}
+         {:ok, prepared} <- prepare_all(captures, common_opts) do
+      try do
+        with {:ok, blobs, rows} <- persist_releases(db, prepared, quota),
+             :ok <- verify_many_after_release(db, blobs) do
+          {:ok, rows}
+        end
+      after
+        Enum.each(prepared, &File.rm(&1.blob.path))
+      end
     else
       {:error, %{code: _} = refusal} -> {:error, refusal}
       {:error, reason} -> {:error, refusal("content_capture_failed", inspect(reason))}
@@ -158,20 +168,22 @@ defmodule Tightbeam.ArtifactContent do
     end
   end
 
-  @doc "Remove incomplete temps; immutable published CAS objects are retained."
+  @doc "Remove incomplete capture, fetch, and authenticated-import staging."
   @spec cleanup_temps(String.t()) :: :ok
   def cleanup_temps(base_dir) do
-    temp_dir = Path.join([base_dir, "artifact-content", "tmp"])
+    for staging <- ~w(tmp import) do
+      staging_dir = Path.join([base_dir, "artifact-content", staging])
 
-    case File.ls(temp_dir) do
-      {:ok, names} ->
-        Enum.each(names, fn name -> File.rm_rf!(Path.join(temp_dir, name)) end)
+      case File.ls(staging_dir) do
+        {:ok, names} ->
+          Enum.each(names, fn name -> File.rm_rf!(Path.join(staging_dir, name)) end)
 
-      {:error, :enoent} ->
-        :ok
+        {:error, :enoent} ->
+          :ok
 
-      {:error, reason} ->
-        raise "artifact content temp inventory failed: #{reason}"
+        {:error, reason} ->
+          raise "artifact content #{staging} inventory failed: #{reason}"
+      end
     end
 
     :ok
@@ -308,20 +320,29 @@ defmodule Tightbeam.ArtifactContent do
       result =
         with :ok <- validate_capture_options(opts),
              {:ok, staged} <- stage_from_custody(opts) do
-          try do
+          validation =
             with :ok <- validate_declared(staged, opts),
-                 :ok <- validate_expected(staged, opts),
-                 {:ok, blob} <- publish_staged(staged, opts) do
-              {:ok, %{blob: blob, opts: opts}}
+                 :ok <- validate_expected(staged, opts) do
+              {:ok, %{blob: staged, opts: opts}}
             end
-          after
-            File.rm(staged.path)
+
+          case validation do
+            {:ok, _item} = success ->
+              success
+
+            {:error, _refusal} = error ->
+              File.rm(staged.path)
+              error
           end
         end
 
       case result do
-        {:ok, item} -> {:cont, {:ok, prepared ++ [item]}}
-        {:error, refusal} -> {:halt, {:error, refusal}}
+        {:ok, item} ->
+          {:cont, {:ok, prepared ++ [item]}}
+
+        {:error, refusal} ->
+          Enum.each(prepared, &File.rm(&1.blob.path))
+          {:halt, {:error, refusal}}
       end
     end)
   end
@@ -531,32 +552,42 @@ defmodule Tightbeam.ArtifactContent do
 
   defp validate_expected(_staged, _opts), do: :ok
 
-  defp publish_staged(staged, opts) do
+  defp publish_staged_in_txn!(_txn, staged, opts) do
     target = cas_path(opts.base_dir, staged.digest)
     parent = Path.dirname(target)
     File.mkdir_p!(parent)
 
-    with :ok <- File.chmod(staged.path, 0o400) do
-      case File.ln(staged.path, target) do
-        :ok ->
-          File.rm!(staged.path)
+    case File.chmod(staged.path, 0o400) do
+      :ok -> :ok
+      {:error, reason} -> fail!("content_capture_failed", "CAS mode: #{reason}")
+    end
 
-          with :ok <- sync_directory(parent) do
-            {:ok, Map.put(staged, :path, target)}
-          end
+    case File.ln(staged.path, target) do
+      :ok ->
+        File.rm!(staged.path)
 
-        {:error, :eexist} ->
-          File.rm!(staged.path)
+        case sync_directory(parent) do
+          :ok -> Map.put(staged, :path, target)
+          {:error, reason} -> fail!("content_capture_failed", "CAS sync: #{reason}")
+        end
 
-          case verify_path(target, staged.digest, staged.size) do
-            :ok -> {:ok, Map.put(staged, :path, target)}
-            {:error, failure} -> {:error, refusal("content_corrupt", failure)}
-          end
+      {:error, :eexist} ->
+        File.rm!(staged.path)
 
-        {:error, reason} ->
-          File.rm(staged.path)
-          {:error, refusal("content_capture_failed", "CAS publish: #{reason}")}
-      end
+        case verify_path(target, staged.digest, staged.size) do
+          :ok ->
+            Map.put(staged, :path, target)
+
+          {:error, failure} ->
+            raise CaptureReuseError,
+              digest: staged.digest,
+              failure: failure,
+              principal: opts.principal
+        end
+
+      {:error, reason} ->
+        File.rm(staged.path)
+        fail!("content_capture_failed", "CAS publish: #{reason}")
     end
   end
 
@@ -570,15 +601,20 @@ defmodule Tightbeam.ArtifactContent do
     end
   end
 
-  defp persist_release(db, blob, quota, opts) do
+  defp publish_and_persist_release(db, staged, quota, opts) do
     case DB.transaction(db, fn txn ->
-           ensure_quota_in_txn!(txn, blob, quota)
+           ensure_physical_quota!(staged, quota, opts.base_dir)
+           blob = publish_staged_in_txn!(txn, staged, opts)
            ensure_blob_in_txn!(txn, blob)
            ensure_request_in_txn!(txn, opts)
            release_in_txn(txn, blob, opts)
+           blob
          end) do
-      {:ok, :ok} ->
-        {:ok, Artifacts.get(db, opts.artifact_id)}
+      {:ok, blob} ->
+        {:ok, blob, Artifacts.get(db, opts.artifact_id)}
+
+      {:error, error} when is_struct(error, CaptureReuseError) ->
+        capture_reuse_refusal(db, error)
 
       {:error, error} when is_struct(error, CaptureError) ->
         {:error, refusal(error.code, error.message)}
@@ -588,18 +624,21 @@ defmodule Tightbeam.ArtifactContent do
     end
   end
 
-  defp persist_releases(db, blobs, quota) do
+  defp persist_releases(db, prepared, quota) do
     case DB.transaction(db, fn txn ->
-           Enum.each(blobs, fn %{blob: blob, opts: opts} ->
-             ensure_quota_in_txn!(txn, blob, quota)
+           Enum.map(prepared, fn %{blob: staged, opts: opts} ->
+             ensure_physical_quota!(staged, quota, opts.base_dir)
+             blob = publish_staged_in_txn!(txn, staged, opts)
              ensure_blob_in_txn!(txn, blob)
              release_in_txn(txn, blob, opts)
+             %{blob: blob, opts: opts}
            end)
-
-           :ok
          end) do
-      {:ok, :ok} ->
-        {:ok, Enum.map(blobs, &Artifacts.get(db, &1.opts.artifact_id))}
+      {:ok, blobs} ->
+        {:ok, blobs, Enum.map(blobs, &Artifacts.get(db, &1.opts.artifact_id))}
+
+      {:error, error} when is_struct(error, CaptureReuseError) ->
+        capture_reuse_refusal(db, error)
 
       {:error, error} when is_struct(error, CaptureError) ->
         {:error, refusal(error.code, error.message)}
@@ -609,18 +648,89 @@ defmodule Tightbeam.ArtifactContent do
     end
   end
 
-  defp ensure_quota_in_txn!(txn, blob, quota) do
-    [[used]] =
-      DB.Txn.q(
-        txn,
-        "SELECT COALESCE(SUM(size), 0) FROM artifact_blobs WHERE status = 'verified'"
-      )
+  defp ensure_physical_quota!(blob, quota, base_dir) do
+    target = cas_path(base_dir, blob.digest)
 
     already_present =
-      DB.Txn.q(txn, "SELECT 1 FROM artifact_blobs WHERE digest = ?1", [blob.digest]) != []
+      case File.lstat(target) do
+        {:ok, _stat} -> true
+        {:error, :enoent} -> false
+        {:error, reason} -> fail!("capture_preflight", "CAS target inventory: #{reason}")
+      end
+
+    used = physical_cas_bytes!(base_dir)
 
     if not already_present and used + blob.size > quota,
       do: fail!("content_quota_exceeded", "artifact content quota exceeded")
+  end
+
+  defp physical_cas_bytes!(base_dir) do
+    root = Path.join([base_dir, "artifact-content", "sha256"])
+
+    case File.ls(root) do
+      {:ok, prefixes} ->
+        Enum.reduce(prefixes, 0, fn prefix, total ->
+          directory = Path.join(root, prefix)
+
+          case File.lstat(directory) do
+            {:ok, %File.Stat{type: :directory}} ->
+              total + physical_cas_directory_bytes!(directory)
+
+            {:ok, _stat} ->
+              fail!("capture_preflight", "CAS inventory contains a non-directory prefix")
+
+            {:error, reason} ->
+              fail!("capture_preflight", "CAS prefix inventory: #{reason}")
+          end
+        end)
+
+      {:error, :enoent} ->
+        0
+
+      {:error, reason} ->
+        fail!("capture_preflight", "CAS inventory: #{reason}")
+    end
+  end
+
+  defp physical_cas_directory_bytes!(directory) do
+    case File.ls(directory) do
+      {:ok, names} ->
+        Enum.reduce(names, 0, fn name, total ->
+          case File.lstat(Path.join(directory, name)) do
+            {:ok, %File.Stat{type: :regular, size: size}} ->
+              total + size
+
+            {:ok, _stat} ->
+              fail!("capture_preflight", "CAS inventory contains a non-regular object")
+
+            {:error, reason} ->
+              fail!("capture_preflight", "CAS object inventory: #{reason}")
+          end
+        end)
+
+      {:error, reason} ->
+        fail!("capture_preflight", "CAS directory inventory: #{reason}")
+    end
+  end
+
+  defp capture_reuse_refusal(db, error) do
+    case corrupt_shared(
+           db,
+           error.digest,
+           error.failure,
+           "capture-reuse",
+           error.principal
+         ) do
+      :ok ->
+        {:error,
+         refusal(
+           "content_corrupt",
+           "existing CAS object failed #{error.failure} verification"
+         )}
+
+      {:error, _reason} ->
+        {:error, refusal("corruption_transition_failed", "corruption transition failed")}
+    end
   end
 
   defp ensure_blob_in_txn!(txn, blob) do
@@ -957,53 +1067,58 @@ defmodule Tightbeam.ArtifactContent do
 
   defp corrupt_shared(db, digest, failure, operation, principal) do
     case DB.transaction(db, fn txn ->
-           now = now()
-
-           DB.Txn.q(
-             txn,
-             """
-             UPDATE artifact_blobs
-             SET status = 'corrupt', corruptAt = ?2, corruptReason = ?3
-             WHERE digest = ?1 AND status = 'verified'
-             """,
-             [digest, now, "cas-" <> failure]
-           )
-
-           if DB.Txn.changes(txn) == 1 do
-             ids =
-               DB.Txn.q(
-                 txn,
-                 "SELECT artifactId FROM artifacts WHERE contentSha256 = ?1 ORDER BY artifactId",
-                 [digest]
-               )
-               |> List.flatten()
-
-             DB.Txn.q(
-               txn,
-               """
-               UPDATE artifacts
-               SET state = 'corrupt-unavailable', contentRecoverySha256 = ?1,
-                   contentSha256 = NULL, contentSize = NULL,
-                   unavailableReason = ?2, home = NULL, updatedAt = ?3
-               WHERE contentSha256 = ?1
-               """,
-               [digest, "cas-" <> failure, now]
-             )
-
-             EventLog.lifecycle_in_txn(
-               txn,
-               "artifact_content_corrupt",
-               digest,
-               "ids=#{Enum.join(ids, ",")} cause=cas-verification-failed " <>
-                 "failure=#{failure} operation=#{operation} principal=#{principal}"
-             )
-           end
-
+           corrupt_shared_in_txn!(txn, digest, failure, operation, principal)
            :ok
          end) do
       {:ok, :ok} -> :ok
       {:error, error} -> {:error, error}
     end
+  end
+
+  defp corrupt_shared_in_txn!(txn, digest, failure, operation, principal) do
+    now = now()
+
+    DB.Txn.q(
+      txn,
+      """
+      UPDATE artifact_blobs
+      SET status = 'corrupt', corruptAt = ?2, corruptReason = ?3
+      WHERE digest = ?1 AND status = 'verified'
+      """,
+      [digest, now, "cas-" <> failure]
+    )
+
+    if DB.Txn.changes(txn) == 1 do
+      ids =
+        DB.Txn.q(
+          txn,
+          "SELECT artifactId FROM artifacts WHERE contentSha256 = ?1 ORDER BY artifactId",
+          [digest]
+        )
+        |> List.flatten()
+
+      DB.Txn.q(
+        txn,
+        """
+        UPDATE artifacts
+        SET state = 'corrupt-unavailable', contentRecoverySha256 = ?1,
+            contentSha256 = NULL, contentSize = NULL,
+            unavailableReason = ?2, home = NULL, updatedAt = ?3
+        WHERE contentSha256 = ?1
+        """,
+        [digest, "cas-" <> failure, now]
+      )
+
+      EventLog.lifecycle_in_txn(
+        txn,
+        "artifact_content_corrupt",
+        digest,
+        "ids=#{Enum.join(ids, ",")} cause=cas-verification-failed " <>
+          "failure=#{failure} operation=#{operation} principal=#{principal}"
+      )
+    end
+
+    :ok
   end
 
   defp fail!(code, message), do: raise(CaptureError, code: code, message: message)

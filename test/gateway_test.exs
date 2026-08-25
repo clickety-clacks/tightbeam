@@ -43,6 +43,12 @@ defmodule Tightbeam.GatewayTest do
     {:identity_repoint, "lib/tightbeam/gateway.ex", "Org.repoint_archetype_in_txn"}
   ]
 
+  @null_hash_fixture Path.expand(
+                       "fixtures/artifacts/dark-factory-flow-watchdog-design-final.md",
+                       __DIR__
+                     )
+  @null_hash_fixture_digest "550139de0f0e4732bd6e68f88a66c5d7e2533a9f44d81badcefe0b4253336c80"
+
   import ExUnit.CaptureLog
 
   alias Tightbeam.{
@@ -1140,6 +1146,88 @@ defmodule Tightbeam.GatewayTest do
     assert first["cliToken"] == second["cliToken"]
     assert second["port"] == 5_432
     assert File.stat!(Path.join(base_dir, "gateway.json")).mode |> Bitwise.band(0o777) == 0o600
+  end
+
+  test "boot promotes the verbatim null-hash archive fixture and fetch survives archive removal",
+       ctx do
+    base_dir =
+      Path.join(System.tmp_dir!(), "gateway_null_hash_#{System.unique_integer([:positive])}")
+
+    archive = Path.join([base_dir, "archive", "dark-factory-flow-watchdog-design-final.md"])
+    File.mkdir_p!(Path.dirname(archive))
+    File.cp!(@null_hash_fixture, archive)
+
+    assert :crypto.hash(:sha256, File.read!(@null_hash_fixture))
+           |> Base.encode16(case: :lower) == @null_hash_fixture_digest
+
+    item = create_work_item(ctx.db, "Null-hash archive migration")
+    artifact_id = "art_null_hash_fixture"
+    now = System.system_time(:millisecond)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO artifacts
+          (artifactId, kind, title, createdBySession, workItemId, originPath,
+           recordedTurnEvidence, state, home, unavailableReason, createdAt, updatedAt)
+        VALUES (?1, 'report', 'Null-hash fixture', 'k1', ?2, ?3,
+                'none', 'legacy-unavailable', ?4, 'migration-pending', ?5, ?5)
+        """,
+        [artifact_id, item.id, archive, archive, now]
+      )
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO artifact_content_migrations
+          (migrationId, artifactId, sourceState, outcome, updatedAt, cause, principal)
+        VALUES (?1, ?2, 'archived', 'pending', ?3, 'shape-migration', 'process:tightbeam')
+        """,
+        [Tightbeam.ArtifactContent.migration_id(), artifact_id, now]
+      )
+
+    previous_quota = Application.get_env(:tightbeam, :artifact_content_quota_bytes)
+    previous_floor = Application.get_env(:tightbeam, :artifact_content_reserved_free_bytes)
+    previous_release_root = System.get_env("RELEASE_ROOT")
+    Application.put_env(:tightbeam, :artifact_content_quota_bytes, "33554432")
+    Application.put_env(:tightbeam, :artifact_content_reserved_free_bytes, "0")
+    System.delete_env("RELEASE_ROOT")
+
+    on_exit(fn ->
+      restore_application_env(:artifact_content_quota_bytes, previous_quota)
+      restore_application_env(:artifact_content_reserved_free_bytes, previous_floor)
+      restore_system_env("RELEASE_ROOT", previous_release_root)
+      File.rm_rf!(base_dir)
+    end)
+
+    Gateway.children(gateway_config(base_dir, ctx.db, 0))
+
+    released = Artifacts.get(ctx.db, artifact_id)
+    assert released.state == "released"
+    assert released.content_sha256 == @null_hash_fixture_digest
+    assert released.content_size == File.stat!(@null_hash_fixture).size
+
+    File.rm!(archive)
+
+    assert {:ok, fetched} =
+             Tightbeam.ArtifactContent.fetch(
+               ctx.db,
+               base_dir,
+               artifact_id,
+               "user:flynn"
+             )
+
+    assert IO.binread(fetched.descriptor, :eof) == File.read!(@null_hash_fixture)
+    File.close(fetched.descriptor)
+
+    assert {:ok, [["released"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT outcome FROM artifact_content_migrations WHERE artifactId=?1",
+               [artifact_id]
+             )
   end
 
   test "children recovers liveness before any runtime child can start", ctx do
@@ -9064,6 +9152,11 @@ defmodule Tightbeam.GatewayTest do
       patch_adapter: fn _harness, _path -> :ok end
     }
   end
+
+  defp restore_application_env(key, nil), do: Application.delete_env(:tightbeam, key)
+  defp restore_application_env(key, value), do: Application.put_env(:tightbeam, key, value)
+  defp restore_system_env(key, nil), do: System.delete_env(key)
+  defp restore_system_env(key, value), do: System.put_env(key, value)
 
   defp make_model_unknown(db, session_key) do
     :ok = DB.execute(db, "PRAGMA foreign_keys=OFF")

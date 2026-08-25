@@ -1,7 +1,7 @@
 defmodule Tightbeam.ArtifactContentTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{ArtifactContent, Artifacts, DB, Gateway, Model, Org}
+  alias Tightbeam.{ArtifactContent, Artifacts, DB, EventLog, Gateway, Model, Org, Schema}
 
   setup do
     db = :artifact_content_db
@@ -211,6 +211,89 @@ defmodule Tightbeam.ArtifactContentTest do
     assert Artifacts.get(ctx.db, refused.artifact_id).state == "in-workspace"
   end
 
+  test "unique quota refusals publish no unaccounted CAS objects", ctx do
+    captures = ["one1", "two2", "tri3"]
+
+    [first | refused] =
+      Enum.map(captures, fn bytes ->
+        path = "#{bytes}.txt"
+        File.write!(Path.join(ctx.source_root, path), bytes)
+        {record(ctx, path), path, bytes}
+      end)
+
+    {first_artifact, first_path, _bytes} = first
+
+    assert {:ok, %{state: "released"}} =
+             ArtifactContent.capture(
+               ctx.db,
+               capture_opts(ctx, first_artifact, first_path) |> Map.put(:quota_bytes, 4)
+             )
+
+    for {artifact, path, _bytes} <- refused do
+      assert {:error, %{code: "content_quota_exceeded"}} =
+               ArtifactContent.capture(
+                 ctx.db,
+                 capture_opts(ctx, artifact, path) |> Map.put(:quota_bytes, 4)
+               )
+
+      assert Artifacts.get(ctx.db, artifact.artifact_id).state == "in-workspace"
+    end
+
+    objects =
+      Path.wildcard(Path.join([ctx.base_dir, "artifact-content", "sha256", "*", "*"]))
+
+    assert length(objects) == 1
+    assert Enum.sum(Enum.map(objects, &File.stat!(&1).size)) == 4
+    assert {:ok, [[1, 4]]} = DB.query(ctx.db, "SELECT COUNT(*), SUM(size) FROM artifact_blobs")
+  end
+
+  test "capture reuse corruption closes every trusted row and leaves the new row unreleased",
+       ctx do
+    bytes = "reuse bytes"
+    File.write!(Path.join(ctx.source_root, "reuse.txt"), bytes)
+    first = record(ctx, "reuse.txt")
+    second = record(ctx, "reuse.txt")
+    third = record(ctx, "reuse.txt")
+
+    for artifact <- [first, second] do
+      assert {:ok, %{state: "released"}} =
+               ArtifactContent.capture(ctx.db, capture_opts(ctx, artifact, "reuse.txt"))
+    end
+
+    digest = sha256(bytes)
+    cas = ArtifactContent.cas_path(ctx.base_dir, digest)
+    File.chmod!(cas, 0o600)
+    File.write!(cas, "corrupt")
+
+    assert {:error, %{code: "content_corrupt"}} =
+             ArtifactContent.capture(ctx.db, capture_opts(ctx, third, "reuse.txt"))
+
+    for artifact <- [first, second] do
+      row = Artifacts.get(ctx.db, artifact.artifact_id)
+      assert row.state == "corrupt-unavailable"
+      assert row.content_sha256 == nil
+      assert row.content_size == nil
+      assert row.content_recovery_sha256 == digest
+      assert row.unavailable_reason == "cas-size"
+    end
+
+    assert Artifacts.get(ctx.db, third.artifact_id).state == "in-workspace"
+
+    assert {:ok, [["corrupt", "cas-size"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT status, corruptReason FROM artifact_blobs WHERE digest=?1",
+               [digest]
+             )
+
+    assert [event] =
+             ctx.db
+             |> EventLog.lifecycle_events()
+             |> Enum.filter(&(&1.kind == "artifact_content_corrupt"))
+
+    assert event.detail =~ "operation=capture-reuse"
+  end
+
   test "missing shared CAS closes every trusting row before returning content_corrupt", ctx do
     bytes = "shared bytes"
     File.write!(Path.join(ctx.source_root, "shared.txt"), bytes)
@@ -248,7 +331,7 @@ defmodule Tightbeam.ArtifactContentTest do
              ArtifactContent.fetch(ctx.db, ctx.base_dir, second.artifact_id, "session:holder")
   end
 
-  test "boot cleanup removes only temps and scrub closes a damaged release", ctx do
+  test "boot cleanup removes all incomplete staging and scrub closes a damaged release", ctx do
     File.write!(Path.join(ctx.source_root, "boot.txt"), "boot bytes")
     artifact = record(ctx, "boot.txt")
 
@@ -259,6 +342,20 @@ defmodule Tightbeam.ArtifactContentTest do
     temp = Path.join(temp_dir, "interrupted")
     File.write!(temp, "partial")
 
+    import =
+      Path.join([
+        ctx.base_dir,
+        "artifact-content",
+        "import",
+        "session",
+        "holder",
+        "upload",
+        "content"
+      ])
+
+    File.mkdir_p!(Path.dirname(import))
+    File.write!(import, "authenticated partial")
+
     orphan =
       Path.join([ctx.base_dir, "artifact-content", "sha256", "ff", String.duplicate("f", 64)])
 
@@ -267,6 +364,7 @@ defmodule Tightbeam.ArtifactContentTest do
 
     assert :ok = ArtifactContent.cleanup_temps(ctx.base_dir)
     refute File.exists?(temp)
+    refute File.exists?(import)
     assert File.read!(orphan) == "orphan evidence"
 
     cas = ArtifactContent.cas_path(ctx.base_dir, released.content_sha256)
@@ -278,6 +376,139 @@ defmodule Tightbeam.ArtifactContentTest do
     end
 
     assert Artifacts.get(ctx.db, artifact.artifact_id).state == "corrupt-unavailable"
+  end
+
+  test "scratch snapshot and CAS restore verify installed bytes before boot fetch" do
+    root =
+      Path.join(System.tmp_dir!(), "artifact-restore-#{System.unique_integer([:positive])}")
+
+    original_base = Path.join(root, "original")
+    backup_dir = Path.join(root, "backup")
+    restored_base = Path.join(root, "restored")
+    original_db_path = Path.join(original_base, "state.db")
+    snapshot = Path.join(backup_dir, "state.db")
+    File.mkdir_p!(original_base)
+    File.mkdir_p!(backup_dir)
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    original_db = :artifact_restore_original
+    start_supervised!({DB, path: original_db_path, name: original_db}, id: original_db)
+    :ok = Schema.ensure_all(original_db)
+
+    {:ok, _} =
+      DB.query(
+        original_db,
+        "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('restore-owner', 1, 1)"
+      )
+
+    session =
+      Org.create(original_db, %{
+        session_key: "restore-holder",
+        display_name: "restore-holder",
+        owner_user_id: "restore-owner",
+        origin: "user:restore-owner",
+        spawned_by: nil,
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+
+    {:ok, _} =
+      DB.query(
+        original_db,
+        """
+        INSERT INTO work_items
+          (id, title, ownerUserId, createdByUser, createdAt)
+        VALUES ('wi_restore', 'restore', 'restore-owner', 'restore-owner', 1)
+        """
+      )
+
+    source_root = Path.join(original_base, "workspace")
+    File.mkdir_p!(source_root)
+    bytes = <<0, 255, "restored bytes", 0>>
+    File.write!(Path.join(source_root, "content.bin"), bytes)
+    install_cli!(original_base)
+
+    artifact =
+      Artifacts.record(original_db, %{
+        principal: {:session, session.session_key},
+        session_key: session.session_key,
+        params: %{
+          kind: "report",
+          title: "restore fixture",
+          origin_path: "content.bin",
+          work_item_id: "wi_restore"
+        }
+      })
+
+    assert {:ok, released} =
+             ArtifactContent.capture(original_db, %{
+               artifact_id: artifact.artifact_id,
+               base_dir: original_base,
+               source_root: source_root,
+               relative_path: "content.bin",
+               quota_bytes: 1024,
+               reserved_free_bytes: 0,
+               principal: "session:restore-holder"
+             })
+
+    backup_command = ".backup '#{snapshot}'"
+    assert {"", 0} = System.cmd("sqlite3", [original_db_path, backup_command])
+
+    snapshot_digest = sha256(File.read!(snapshot))
+    File.write!(Path.join(backup_dir, "state.sha256"), snapshot_digest <> "\n")
+
+    backup_blob =
+      Path.join([
+        backup_dir,
+        "artifact-content",
+        "sha256",
+        binary_part(released.content_sha256, 0, 2),
+        released.content_sha256
+      ])
+
+    File.mkdir_p!(Path.dirname(backup_blob))
+
+    File.cp!(
+      ArtifactContent.cas_path(original_base, released.content_sha256),
+      backup_blob
+    )
+
+    restored_db_path = Path.join(restored_base, "state.db")
+    File.mkdir_p!(restored_base)
+    File.cp!(snapshot, restored_db_path)
+    assert sha256(File.read!(restored_db_path)) == snapshot_digest
+
+    restored_blob = ArtifactContent.cas_path(restored_base, released.content_sha256)
+    File.mkdir_p!(Path.dirname(restored_blob))
+    File.cp!(backup_blob, restored_blob)
+
+    restored_db = :artifact_restore_installed
+    start_supervised!({DB, path: restored_db_path, name: restored_db}, id: restored_db)
+    :ok = Schema.ensure_all(restored_db)
+    :ok = ArtifactContent.cleanup_temps(restored_base)
+    :ok = ArtifactContent.boot_scrub!(restored_db, restored_base)
+
+    assert {:ok, fetched} =
+             ArtifactContent.fetch(
+               restored_db,
+               restored_base,
+               released.artifact_id,
+               "user:restore-owner"
+             )
+
+    assert IO.binread(fetched.descriptor, :eof) == bytes
+    File.close(fetched.descriptor)
+
+    File.rm!(restored_blob)
+
+    assert_raise RuntimeError, ~r/artifact content boot scrub refused/, fn ->
+      ArtifactContent.boot_scrub!(restored_db, restored_base)
+    end
+
+    assert Artifacts.get(restored_db, released.artifact_id).state == "corrupt-unavailable"
   end
 
   test "recovery permits the active creator or administrator and pins corrupt bytes", ctx do

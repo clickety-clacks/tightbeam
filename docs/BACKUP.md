@@ -49,7 +49,7 @@ while read -r digest size; do
   test "$(sha256sum "$DEST/artifact-content/sha256/${digest%${digest#??}}/$digest" | cut -d' ' -f1)" = "$digest"
 done < "$DEST/artifact-content.manifest"
 
-sha256sum "$SNAPSHOT" > "$DEST/state.sha256"
+sha256sum "$SNAPSHOT" | cut -d' ' -f1 > "$DEST/state.sha256"
 ```
 
 Use `shasum -a 256` in place of `sha256sum` on macOS. V1 has no artifact
@@ -106,8 +106,12 @@ Performed end to end on 2026-07-26; these are the steps that were actually run.
    ```sh
    sqlite3 "$TIGHTBEAM_BASE_DIR/state.db" "PRAGMA integrity_check;"    # expect: ok
    sqlite3 "$TIGHTBEAM_BASE_DIR/state.db" "PRAGMA foreign_key_check;"  # expect: no output
-   sha256sum -c "$BACKUP_DIR/state.sha256"
+   test "$(sha256sum "$TIGHTBEAM_BASE_DIR/state.db" | cut -d' ' -f1)" = \
+     "$(tr -d '[:space:]' < "$BACKUP_DIR/state.sha256")"
    ```
+   The digest file contains only the snapshot digest. The restore command hashes
+   the installed `state.db`, so a valid backup source cannot mask a damaged
+   restored database.
    `foreign_key_check` is the one that matters — it is what proves the snapshot
    caught whole transactions rather than half of one.
    Rehash each restored CAS file and compare its byte count and digest to

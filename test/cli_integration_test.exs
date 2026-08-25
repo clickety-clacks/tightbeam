@@ -19,6 +19,7 @@ defmodule Tightbeam.CliIntegrationTest do
     Idempotency,
     Ledger,
     Org,
+    Placement,
     Projection,
     RailRemedy,
     Rails,
@@ -156,7 +157,8 @@ defmodule Tightbeam.CliIntegrationTest do
 
     bandit =
       start_supervised!(
-        {Bandit, plug: {Router, router_opts}, port: 0, ip: {127, 0, 0, 1}, startup_log: false}
+        {Bandit, plug: {Router, router_opts}, port: 0, ip: {127, 0, 0, 1}, startup_log: false},
+        restart: :temporary
       )
 
     {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
@@ -175,7 +177,9 @@ defmodule Tightbeam.CliIntegrationTest do
       binary: test_binary,
       db: db,
       handlers: handlers,
+      bandit: bandit,
       port: port,
+      router_opts: router_opts,
       session: session,
       worker: worker,
       workdir: workdir,
@@ -269,6 +273,123 @@ defmodule Tightbeam.CliIntegrationTest do
     assert File.read!(output) == bytes
     assert_receive {:cli_call, %{verb: "artifact-content-fetch"}}
     refute_receive {:cli_call, %{verb: "artifact-content-fetch-complete"}}
+  end
+
+  test "real CLI fetch survives retirement, workspace removal, and gateway restart", ctx do
+    session =
+      Org.create(ctx.db, %{
+        session_key: "cli-retirement-holder",
+        display_name: "CLI retirement holder",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+
+    Roles.create!(ctx.db, "cli-retirement-holder", "flynn", session.session_key)
+
+    workspace = Placement.workdir_path(%{base_dir: ctx.base_dir, db: ctx.db}, session)
+    File.mkdir_p!(workspace)
+
+    File.write!(
+      Path.join(workspace, ".tightbeam-session"),
+      JSON.encode!(%{
+        url: "http://127.0.0.1:#{ctx.port}",
+        token: session.cli_token,
+        sessionKey: session.session_key
+      })
+    )
+
+    bytes = <<0, 255, "post-retirement", 0>>
+    File.write!(Path.join(workspace, "retired.bin"), bytes)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO work_items
+          (id, title, ownerUserId, createdByUser, createdAt)
+        VALUES ('wi_retirement_fetch', 'Retirement fetch', 'flynn', 'flynn', 1)
+        """
+      )
+
+    {recorded, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "artifact-record",
+          "--kind",
+          "report",
+          "--title",
+          "Post-retirement bytes",
+          "--path",
+          "retired.bin",
+          "--work-item",
+          "wi_retirement_fetch",
+          "--key",
+          "retirement-fetch-record"
+        ],
+        cd: workspace,
+        stderr_to_stdout: true
+      )
+
+    artifact_id = JSON.decode!(recorded)["artifactId"]
+    assert Artifacts.get(ctx.db, artifact_id).state == "released"
+
+    org_env = [
+      {"TIGHTBEAM_URL", "http://127.0.0.1:#{ctx.port}"},
+      {"TIGHTBEAM_TOKEN", "tbc_cli_integration"}
+    ]
+
+    if Process.whereis(Tightbeam.ConnRegistry) == nil do
+      start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
+    end
+
+    {retired, 0} =
+      System.cmd(
+        ctx.binary,
+        ["retire", "--session", session.session_key, "--as-user", "flynn"],
+        cd: ctx.outside,
+        env: org_env,
+        stderr_to_stdout: true
+      )
+
+    assert JSON.decode!(retired)["retiredSessionKeys"] == [session.session_key]
+    refute File.exists?(workspace)
+
+    GenServer.stop(ctx.bandit)
+    :ok = Tightbeam.ArtifactContent.cleanup_temps(ctx.base_dir)
+    :ok = Tightbeam.ArtifactContent.boot_scrub!(ctx.db, ctx.base_dir)
+
+    restarted =
+      start_supervised!(
+        {Bandit,
+         plug: {Router, ctx.router_opts}, port: 0, ip: {127, 0, 0, 1}, startup_log: false},
+        restart: :temporary
+      )
+
+    {:ok, {_address, restarted_port}} = ThousandIsland.listener_info(restarted)
+    output = Path.join(ctx.outside, "post-retirement.bin")
+
+    fetch_env = [
+      {"TIGHTBEAM_URL", "http://127.0.0.1:#{restarted_port}"},
+      {"TIGHTBEAM_TOKEN", "tbc_cli_integration"}
+    ]
+
+    {receipt, 0} =
+      System.cmd(
+        ctx.binary,
+        ["artifact-content-fetch", artifact_id, "--output", output, "--as-user", "flynn"],
+        cd: ctx.outside,
+        env: fetch_env,
+        stderr_to_stdout: true
+      )
+
+    assert File.read!(output) == bytes
+    assert JSON.decode!(receipt)["completed"] == true
   end
 
   test "real CLI recovers legacy bytes through authenticated import custody", ctx do

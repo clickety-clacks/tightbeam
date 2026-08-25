@@ -2078,7 +2078,7 @@ mod tests {
         build_request(&parse(values)).unwrap().body_json
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn custody_root(label: &str) -> PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2093,7 +2093,7 @@ mod tests {
         root
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn artifact_custody_opens_valid_file_once_and_survives_path_replacement() {
         let root = custody_root("stable");
@@ -2114,7 +2114,7 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn artifact_custody_rejects_final_and_intermediate_symlinks() {
         use std::os::unix::fs::symlink;
@@ -2132,7 +2132,7 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn artifact_custody_rejects_escape_and_special_file() {
         use std::os::unix::ffi::OsStrExt;
