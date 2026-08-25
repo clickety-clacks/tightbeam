@@ -9,6 +9,7 @@ defmodule Tightbeam.Wire.RouterTest do
     Credentials,
     DB,
     Devices,
+    EffortCheckin,
     Gateway,
     Org,
     Placement,
@@ -1051,6 +1052,76 @@ defmodule Tightbeam.Wire.RouterTest do
       })
 
     assert missing_assignment.status == 404
+  end
+
+  test "decision-request refuses typed targets before resolving their existence", ctx do
+    create_session(ctx.db, "known-session", "flynn")
+
+    responses =
+      for key <- ["known-session", "missing-session"] do
+        dispatch_cli(ctx, "tbc_test", %{
+          verb: "decision-request",
+          asUser: "flynn",
+          sessionKey: key,
+          params: %{request: "dr_absent"}
+        })
+      end
+
+    assert Enum.map(responses, & &1.status) == [400, 400]
+
+    assert responses
+           |> Enum.map(&JSON.decode!(&1.resp_body))
+           |> Enum.uniq() == [
+             %{
+               "error" => %{
+                 "code" => "invalid_message",
+                 "message" => "decision-request takes no typed target"
+               }
+             }
+           ]
+  end
+
+  test "process effort-rule returns the same wire envelope for hidden and absent ids", ctx do
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO decision_requests
+          (id, kind, raiserId, ownerUserId, assignmentId, expecterSessionKey,
+           lineageRung, effortGeneration, deadlineWakeId, raisedAt, deadlineAt,
+           question, options, context, status)
+        VALUES ('dr_hidden_effort', 'effort', 'process:tightbeam', 'flynn',
+                'asg_hidden', 'expected-session', 1, 1, 'w_hidden', 1, 2,
+                'Continue or dismiss?', '["continue","dismiss"]', '{}', 'open')
+        """
+      )
+
+    opts =
+      with_handler(ctx.opts, "effort-rule", fn call ->
+        EffortCheckin.rule(ctx.db, %{}, call)
+      end)
+
+    responses =
+      for request <- ["dr_hidden_effort", "dr_absent"] do
+        dispatch_cli(%{ctx | opts: opts}, "tbc_test", %{
+          verb: "effort-rule",
+          asProcess: "ci",
+          params: %{request: request, action: "continue"}
+        })
+      end
+
+    assert Enum.map(responses, & &1.status) == [404, 404]
+
+    assert responses
+           |> Enum.map(&JSON.decode!(&1.resp_body))
+           |> Enum.uniq() == [
+             %{
+               "error" => %{
+                 "code" => "not_found",
+                 "message" => "decision request not found"
+               }
+             }
+           ]
   end
 
   test "org CLI reserves process:tightbeam while other process origins still attribute", ctx do

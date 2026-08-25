@@ -59,11 +59,19 @@ defmodule Tightbeam.EffortCheckinTest do
       call = %{origin: origin, principal: principal, params: %{}}
       assert Escalation.get(ctx.db, call, request.id) == nil
 
-      assert %{code: "not_authorized"} =
+      assert %{code: "not_found", message: hidden} =
                EffortCheckin.rule(ctx.db, ctx.config, %{
                  call
                  | params: %{request_id: request.id, action: "continue"}
                })
+
+      assert %{code: "not_found", message: absent} =
+               EffortCheckin.rule(ctx.db, ctx.config, %{
+                 call
+                 | params: %{request_id: "dr_absent", action: "continue"}
+               })
+
+      assert hidden == absent
     end
 
     generations_before = generation_count(ctx.db, request.assignment_id)

@@ -1549,7 +1549,7 @@ fn parse_with_optional_catalog(
         }
         "decision-request" => {
             let request_id = nonempty(flags, "request");
-            let has_target = ["session", "role", "user", "to"]
+            let has_target = ["session", "role", "user", "to", "target"]
                 .iter()
                 .any(|name| flags.contains_key(*name));
             if parsed.positional.len() != 1 || request_id.is_none() || has_target {
@@ -3462,6 +3462,15 @@ mod tests {
                 "--request",
                 "dr_1",
                 "--session",
+                "agent:other",
+                "--as-user",
+                "flynn",
+            ]),
+            strings(&[
+                "decision-request",
+                "--request",
+                "dr_1",
+                "--target",
                 "agent:other",
                 "--as-user",
                 "flynn",

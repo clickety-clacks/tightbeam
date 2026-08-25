@@ -1401,11 +1401,11 @@ defmodule Tightbeam.EffortCheckin do
   defp request_row(db, id), do: Escalation.raw_by_id(db, id)
 
   defp visible_response_request(db, call, id) do
-    case request_row(db, id) do
-      %{kind: "effort"} = request ->
+    case {request_row(db, id), call.principal} do
+      {%{kind: "effort"} = request, {kind, _id}} when kind in [:session, :user] ->
         request
 
-      request when is_map(request) ->
+      {request, _principal} when is_map(request) ->
         owner_user_id =
           case call.principal do
             {:user, user_id} ->
@@ -1425,7 +1425,7 @@ defmodule Tightbeam.EffortCheckin do
           do: request,
           else: nil
 
-      nil ->
+      {nil, _principal} ->
         nil
     end
   end

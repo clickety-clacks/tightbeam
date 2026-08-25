@@ -586,8 +586,9 @@ defmodule Tightbeam.Wire.Router do
   # `--session <key>` names the session being MEASURED, and resolving it as a
   # target would answer "does this session exist?" ahead of the read's own
   # owner-or-admin check. Same not-found body either way.
-  # `answer` joins them because it addresses a REQUEST ID, never a principal: the
-  # row already records who was asked. Resolving a volunteered `--session` here
+  # `answer` and `decision-request` join them because they address a REQUEST ID,
+  # never a principal: the row already records who was asked. Resolving a
+  # volunteered `--session` here
   # would answer "does this session exist?" ahead of the answerer check that
   # actually decides. (`ask` is deliberately NOT here — its target IS a
   # principal, resolved by the same machinery `wake` uses.)
@@ -595,7 +596,7 @@ defmodule Tightbeam.Wire.Router do
   # owner-or-admin check (mirroring `coordination-share`'s) is the read's
   # actual gate, and a volunteered `--session` alongside `--wake-id` must not
   # get answered by the router first.
-  @non_target_verbs ~w(transcript turn-trace toplines topline coordination-share digest-members answer return)
+  @non_target_verbs ~w(transcript turn-trace toplines topline coordination-share digest-members decision-request answer return)
 
   # PRESENCE of the field, not the type of its value. `sessionKey: null` — and a
   # number, a boolean or an object — is still a caller volunteering a typed target
