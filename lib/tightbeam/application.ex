@@ -282,6 +282,12 @@ defmodule Tightbeam.Application do
 
     drain_until(deadline)
 
+    try do
+      Tightbeam.Firehose.Hub.shutdown()
+    catch
+      _, _ -> :ok
+    end
+
     # Clean-shutdown stamp MUST happen in prep_stop: stop/1 runs after the
     # supervision tree (and the DB) is already down, so stamping there would
     # silently fail and every shutdown would be inferred dirty at next boot.

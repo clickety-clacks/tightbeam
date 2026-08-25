@@ -26,6 +26,7 @@ defmodule Tightbeam.Artifacts do
 
   alias Tightbeam.{DB, IdPrefix, TurnObservations}
   alias Tightbeam.DB.Txn
+  alias Tightbeam.Firehose.Publisher
 
   @outside_workspace "artifact origin is outside its session workspace"
 
@@ -123,7 +124,9 @@ defmodule Tightbeam.Artifacts do
                        artifact_id
                      ])
 
-                   artifact(row)
+                   artifact = artifact(row)
+                   Publisher.maybe_accepted_in_txn(txn, call, artifact)
+                   artifact
 
                  :unknown ->
                    %{code: "unknown_work_item", message: "unknown work item: #{work_item_id}"}

@@ -19,6 +19,7 @@ defmodule Tightbeam.Ledger do
 
   alias Tightbeam.{DB, TurnLifecycle}
   alias Tightbeam.DB.Txn
+  alias Tightbeam.Firehose.Publisher
 
   require Logger
 
@@ -298,6 +299,8 @@ defmodule Tightbeam.Ledger do
                 at: now
               })
 
+              Publisher.turn_in_txn(txn, "turn.started", seq)
+
               {:ok,
                %{
                  seq: seq,
@@ -379,33 +382,36 @@ defmodule Tightbeam.Ledger do
   def fail_unclaimable(db \\ Tightbeam.DB, session_key, reason) do
     {:ok, seqs} =
       DB.transaction(db, fn txn ->
-        txn
-        |> Txn.q(
-          """
-          UPDATE turns SET status = 'failed', endedAt = ?2, error = ?3
-          WHERE sessionKey = ?1 AND status = 'queued'
-            AND NOT EXISTS (
-              SELECT 1 FROM sessions AS s
-              WHERE s.sessionKey = ?1 AND s.state = 'active'
-            )
-          RETURNING seq
-          """,
-          [session_key, System.system_time(:millisecond), unclaimable_error(reason)]
-        )
-        |> Enum.map(&hd/1)
-        |> Enum.sort()
-        |> tap(fn seqs ->
-          Enum.each(seqs, fn seq ->
-            TurnLifecycle.append_in_txn(
-              txn,
-              seq,
-              terminal_event(seq, "failed", %{
-                cause: "unclaimable:#{reason}",
-                principal: "process:tightbeam"
-              })
-            )
-          end)
+        seqs =
+          txn
+          |> Txn.q(
+            """
+            UPDATE turns SET status = 'failed', endedAt = ?2, error = ?3
+            WHERE sessionKey = ?1 AND status = 'queued'
+              AND NOT EXISTS (
+                SELECT 1 FROM sessions AS s
+                WHERE s.sessionKey = ?1 AND s.state = 'active'
+              )
+            RETURNING seq
+            """,
+            [session_key, System.system_time(:millisecond), unclaimable_error(reason)]
+          )
+          |> Enum.map(&hd/1)
+          |> Enum.sort()
+
+        Enum.each(seqs, fn seq ->
+          TurnLifecycle.append_in_txn(
+            txn,
+            seq,
+            terminal_event(seq, "failed", %{
+              cause: "unclaimable:#{reason}",
+              principal: "process:tightbeam"
+            })
+          )
         end)
+
+        Enum.each(seqs, &Publisher.turn_in_txn(txn, "turn.ended", &1))
+        seqs
       end)
 
     seqs
@@ -462,6 +468,8 @@ defmodule Tightbeam.Ledger do
         seq,
         terminal_event(seq, terminal, opts) |> Map.put(:at, now)
       )
+
+      Publisher.turn_in_txn(txn, "turn.ended", seq)
     end
 
     won
@@ -502,6 +510,7 @@ defmodule Tightbeam.Ledger do
       )
     end)
 
+    Enum.each(seqs, &Publisher.turn_in_txn(txn, "turn.ended", &1))
     seqs
   end
 
@@ -540,6 +549,7 @@ defmodule Tightbeam.Ledger do
           )
         end)
 
+        Enum.each(seqs, &Publisher.turn_in_txn(txn, "turn.ended", &1))
         seqs
       end)
 

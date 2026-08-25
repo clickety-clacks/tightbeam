@@ -20,6 +20,7 @@ defmodule Tightbeam.Schema do
     Tightbeam.Org,
     Tightbeam.CriticalLeases,
     Tightbeam.Roles,
+    Tightbeam.ReadMarkers,
     Tightbeam.WorkItems,
     Tightbeam.Assignments,
     Tightbeam.EffortCheckin,
@@ -29,7 +30,8 @@ defmodule Tightbeam.Schema do
     Tightbeam.Supervision,
     Tightbeam.WorkState,
     Tightbeam.Productions.BubbleSweeper,
-    Tightbeam.HarnessProcess
+    Tightbeam.HarnessProcess,
+    Tightbeam.AdminProjection
   ]
 
   # The shape this build writes. Bump it when a production table changes in a

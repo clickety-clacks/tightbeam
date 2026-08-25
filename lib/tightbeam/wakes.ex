@@ -27,6 +27,7 @@ defmodule Tightbeam.Wakes do
 
   alias Tightbeam.{ConditionFacts, DB, Escalation, EventLog, Gateway}
   alias Tightbeam.DB.Txn
+  alias Tightbeam.Firehose.Publisher
 
   @type db :: GenServer.server()
 
@@ -2390,8 +2391,10 @@ defmodule Tightbeam.Wakes do
         [wake_id, now()]
       )
 
-      :ok
+      if Txn.changes(txn) == 1, do: publish_change_in_txn(txn, "wake.fired", wake_id)
     end)
+
+    :ok
   end
 
   defp evaluate_conditions(%{db: db, batch: batch}, mode) do
@@ -2533,9 +2536,14 @@ defmodule Tightbeam.Wakes do
       end)
 
     case result do
-      {:ok, {:fired, delivery}} -> Gateway.complete_delivery(db, delivery)
-      {:ok, _} -> :ok
-      {:error, error} -> raise error
+      {:ok, {:fired, delivery}} ->
+        Gateway.complete_delivery(db, delivery)
+
+      {:ok, _} ->
+        :ok
+
+      {:error, error} ->
+        raise error
     end
   end
 
@@ -2591,6 +2599,7 @@ defmodule Tightbeam.Wakes do
           )
 
         lifecycle_for_fire(txn, wake, cause, match, delivery)
+        publish_change_in_txn(txn, "wake.fired", wake.wake_id)
         {:fired, delivery}
       else
         :noop
@@ -2601,6 +2610,22 @@ defmodule Tightbeam.Wakes do
   end
 
   defp fire_in_txn(_txn, _wake), do: :noop
+
+  @doc false
+  def publish_change_in_txn(%Txn{} = txn, class, wake_id) do
+    case Txn.q(txn, select_wake_sql() <> " WHERE wakeId = ?1", [wake_id]) do
+      [row] ->
+        wake = to_wake(row)
+
+        Publisher.committed_in_txn(txn, class, wake, %{
+          "wakeId" => wake_id,
+          "sessionKey" => wake.session_key
+        })
+
+      [] ->
+        :ok
+    end
+  end
 
   defp lifecycle_for_fire(txn, wake, cause, match, :skipped) do
     matched =
