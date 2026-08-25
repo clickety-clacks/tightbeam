@@ -262,7 +262,7 @@ defmodule Tightbeam.SessionLane do
       case outcome do
         {:ok, %{terminal_publish: fun, record_in_txn: action}}
         when is_function(fun, 1) and is_function(action, 1) ->
-          {"delivered", nil, fun, action}
+          {"delivered", nil, fun, action, nil}
 
         {:ok, %{terminal_publish: fun}} when is_function(fun, 1) ->
           {"delivered", nil, fun, nil, nil}

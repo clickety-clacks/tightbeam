@@ -1,0 +1,16 @@
+{
+  "provenance": {
+    "artifactId": "art_054cb5af",
+    "contentSha256": "f8ec787572c32922d04a431a713f9634131eeef4e79828728c99930df5b66e88",
+    "specimen": "S1",
+    "boundary": "captured ACP/provider-adapter response projection",
+    "observedTurnIds": [9136, 9143, 9144, 9145, 9154, 9184]
+  },
+  "capturedResponseProjection": {
+    "code": -32603,
+    "message": "Internal error",
+    "data": {
+      "codexErrorInfo": "usageLimitExceeded"
+    }
+  }
+}

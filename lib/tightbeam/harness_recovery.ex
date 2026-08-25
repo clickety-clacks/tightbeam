@@ -208,7 +208,7 @@ defmodule Tightbeam.HarnessRecovery do
             txn,
             "harness_recovery_wake_undeliverable",
             "#{owner}/#{harness}",
-            "turn=#{turn} target=#{main} reason=no_active_main principal=#{@origin}"
+            "turn=#{turn} session=#{session} target=#{main} reason=no_active_main principal=#{@origin}"
           )
 
           :no_main

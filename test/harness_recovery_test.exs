@@ -3,6 +3,12 @@ defmodule Tightbeam.HarnessRecoveryTest do
 
   alias Tightbeam.{DB, HarnessRecovery, Model, Org, Wakes}
 
+  @codex_usage_limit_fixture Path.join(
+                               __DIR__,
+                               "fixtures/harness_recovery/codex-usage-limit-s1.json"
+                             )
+  @codex_usage_limit_provenance_sha256 "f8ec787572c32922d04a431a713f9634131eeef4e79828728c99930df5b66e88"
+
   setup do
     db = :"db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
@@ -15,10 +21,12 @@ defmodule Tightbeam.HarnessRecoveryTest do
     assert HarnessRecovery.unavailable?({:adapter_unavailable, ":shutdown"})
     assert HarnessRecovery.unavailable?({:model_apply_failed, :model_unavailable})
 
-    assert HarnessRecovery.unavailable?(%{
-             "code" => -32603,
-             "data" => %{"codexErrorInfo" => %{"code" => "usageLimitExceeded"}}
-           })
+    fixture = @codex_usage_limit_fixture |> File.read!() |> JSON.decode!()
+
+    assert fixture["provenance"]["artifactId"] == "art_054cb5af"
+    assert fixture["provenance"]["contentSha256"] == @codex_usage_limit_provenance_sha256
+    assert fixture["provenance"]["specimen"] == "S1"
+    assert HarnessRecovery.unavailable?(fixture["capturedResponseProjection"])
 
     refute HarnessRecovery.unavailable?(:closed)
     refute HarnessRecovery.unavailable?(%{"code" => "oauth_org_not_allowed"})
@@ -122,7 +130,11 @@ defmodule Tightbeam.HarnessRecoveryTest do
 
     assert Enum.any?(Tightbeam.EventLog.lifecycle_events(db), fn event ->
              event.kind == "harness_recovery_wake_undeliverable" and
-               event.subject == "flynn/codex"
+               event.subject == "flynn/codex" and
+               event.detail =~ "turn=41" and
+               event.detail =~ "session=worker" and
+               event.detail =~ "reason=no_active_main" and
+               event.detail =~ "principal=process:tightbeam"
            end)
   end
 
