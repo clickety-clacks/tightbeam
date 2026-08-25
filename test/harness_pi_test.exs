@@ -157,8 +157,7 @@ defmodule Tightbeam.HarnessPiTest do
       host_config: %{ssh: nil}
     }
 
-    assert {:error, {:no_pi_catalog, %{opencode_go: :malformed_catalog}}} =
-             Pi.fetch_catalog(state)
+    assert {:error, :malformed_catalog} = Pi.fetch_catalog(state)
   end
 
   test "liveness uses the live-proven Pi request without putting the key in argv" do

@@ -533,10 +533,22 @@ defmodule Tightbeam.ModelCatalog do
     end
   end
 
-  defp catalog_onboarding_status(Tightbeam.Harness.Pi, catalog_state, _state, _host) do
-    if PiProvider.pi_catalog_ready?(catalog_state),
-      do: :onboarded,
-      else: {:needs_onboarding, :missing}
+  defp catalog_onboarding_status(Tightbeam.Harness.Pi, catalog_state, state, host) do
+    cond do
+      credential_status(state, :opencode_go, host) ==
+          {:needs_onboarding, :credential_server_unavailable} ->
+        {:needs_onboarding, :credential_server_unavailable}
+
+      credential_status(state, :local_openai, host) ==
+          {:needs_onboarding, :credential_server_unavailable} ->
+        {:needs_onboarding, :credential_server_unavailable}
+
+      PiProvider.pi_catalog_ready?(catalog_state) ->
+        :onboarded
+
+      true ->
+        {:needs_onboarding, :missing}
+    end
   end
 
   defp catalog_onboarding_status(module, _catalog_state, state, host) do
