@@ -153,10 +153,15 @@ defmodule Tightbeam.ArchetypesTest do
              ~w(coder default orchestrator product-owner recon reviewer spec-writer)
 
     assert loaded["product-owner"].skills == [
+             "worktree-session",
              "tightbeam-dispatching",
              "product-discovery",
              "human-communication"
            ]
+
+    for role <- ~w(coder orchestrator product-owner reviewer) do
+      assert "worktree-session" in loaded[role].skills
+    end
 
     coder =
       Identity.snapshot_at!(
@@ -176,7 +181,23 @@ defmodule Tightbeam.ArchetypesTest do
         :codex
       )
 
-    assert Map.keys(product_owner.skills) == ["human-communication", "product-discovery"]
+    assert Map.keys(product_owner.skills) == [
+             "human-communication",
+             "product-discovery",
+             "worktree-session"
+           ]
+
+    assert product_owner.skills["worktree-session"] =~
+             "Clone your own copy, into your own workdir"
+
+    assert product_owner.skills["worktree-session"] =~
+             "Push, so the remote holds the record"
+
+    assert product_owner.skills["worktree-session"] =~
+             "After your branch merges, delete your clone"
+
+    refute product_owner.skills["worktree-session"] =~
+             "hands you a specific checkout"
 
     refute File.regular?(
              Path.join([
