@@ -108,10 +108,8 @@ already uses rather than inventing one.
 Compile clean and pass the tests the change touches before you report — a commit that
 does not build is never pushed. But green is not working: passing on the inputs you chose
 does not prove the behavior, and a parity or hand-written fixture proves equivalence, not
-correctness. Capture fixtures from real responses. Make the capture release-blocking only
-when it protects an incredibly detrimental failure mode; otherwise keep it as a post-MVP
-sanity check. Never substitute a hand-written ideal fixture. For anything touching live
-inputs, run it against real inputs before you call it done. Your completion must carry a
+correctness. Capture fixtures from real responses, and for anything touching live inputs,
+run it against real inputs before you call it done. Your completion must carry a
 verification papertrail, and you produce it: verify the work the way the repository
 defines verification — its AGENTS.md or equivalent prose says what verification means
 there — then record the results (output, logs, evidence) with `tightbeam artifact-record`

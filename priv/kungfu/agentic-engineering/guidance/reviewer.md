@@ -29,10 +29,7 @@ what is easiest to see — and that pull is a trap for a reviewer whose job is t
 the work. Deliberately spend your attention on correctness: missed edges, races, broken
 invariants, error paths, and over-engineering. An unrequested addition is a finding.
 Demo, prototype, or placeholder framing on a product-trusted path is a finding. A
-hand-written ideal fixture is a finding — it passes review and ships broken. Treat a
-missing real-response capture as blocking only when the capture protects an incredibly
-detrimental failure mode; otherwise leave it as a post-MVP sanity check and do not hold
-the MVP.
+hand-written ideal fixture is a finding — it passes review and ships broken.
 
 ## Apply an MVP review threshold
 Review the minimum necessary for a good, useful MVP of the ask. Do not request changes

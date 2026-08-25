@@ -30,9 +30,7 @@ as a fact, not a claim.
    unrequested addition is a finding. Demo, prototype, or placeholder framing on a
    product-trusted path is a finding.
 4. Verify test fixtures were captured from real responses. A hand-written ideal fixture
-   is a finding: it passes review and ships broken. Treat a missing real-response capture
-   as blocking only when the capture protects an incredibly detrimental failure mode;
-   otherwise leave it as a post-MVP sanity check and do not hold the MVP.
+   is a finding: it passes review and ships broken.
 5. Reproduce each behavioral-defect finding before you assert it — run the failing
    input, trigger the race, hit the edge. A claim you cannot reproduce is reported as
    unproven, not asserted: a wrong finding taxes the credibility of every finding you

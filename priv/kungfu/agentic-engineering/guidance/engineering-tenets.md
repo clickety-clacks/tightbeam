@@ -9,11 +9,7 @@
 - Passing is not working. Compiling, green tests, and a clean review are not proof it works.
   Run it against real inputs before you call it done.
 - Capture test fixtures from real responses. A hand-written ideal fixture passes review and
-  ships broken. Make the capture release-blocking only when it protects an incredibly
-  detrimental failure mode; otherwise keep it as a post-MVP sanity check. A capture proves
-  today's reading of the contract, nothing more. When capturing needs a human or a live
-  credential, let the fixture test skip honestly and make the code refuse loudly on a
-  contract mismatch. Never fabricate the fixture.
+  ships broken.
 - Read code and its provenance before you change it. Do not modify or delete code you do not
   understand.
 - Build exactly the spec. Unrequested additions are defects. If the spec has a hole on a
