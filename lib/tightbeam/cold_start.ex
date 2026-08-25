@@ -400,9 +400,12 @@ defmodule Tightbeam.ColdStart do
     user_id = Devices.slug_user_id(Map.fetch!(input, :claimed_name))
 
     cond do
-      is_nil(receipt.activated_at) and device_id == receipt.device_id and
-          fingerprint(device_id, user_id) == receipt.request_fingerprint ->
-        replay_or_refuse(txn, receipt, input[:replay_secret])
+      is_nil(receipt.activated_at) and device_id == receipt.device_id ->
+        if fingerprint(device_id, user_id) == receipt.request_fingerprint do
+          replay_or_refuse(txn, receipt, input[:replay_secret])
+        else
+          {:error, "bootstrap_closed"}
+        end
 
       true ->
         Devices.pair_in_txn(txn, input)

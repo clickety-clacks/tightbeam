@@ -141,6 +141,32 @@ defmodule Tightbeam.ColdStartTest do
     refute rotated.token == first.token
   end
 
+  test "an unactivated claim refuses a changed fingerprint without mutation", %{db: db} do
+    secret = :crypto.strong_rand_bytes(32)
+    input = pair_input("d1", "Alice") |> Map.put(:replay_secret, secret)
+
+    assert {:paired, first} = ColdStart.pair(db, input, @defaults)
+
+    assert {:ok, [before]} =
+             DB.query(
+               db,
+               "SELECT userId,status,token FROM devices WHERE deviceId='d1'"
+             )
+
+    assert {:error, "bootstrap_closed"} =
+             ColdStart.pair(db, %{input | claimed_name: "Bob"}, @defaults)
+
+    assert {:ok, [^before]} =
+             DB.query(
+               db,
+               "SELECT userId,status,token FROM devices WHERE deviceId='d1'"
+             )
+
+    assert Devices.by_id(db, "d1").token == first.token
+    assert Devices.user(db, "bob") == nil
+    assert identity_census(db) == [1, 1, 1, 1, 1]
+  end
+
   test "host-local reservation is idempotent and only the same normalized user completes it", %{
     db: db
   } do
