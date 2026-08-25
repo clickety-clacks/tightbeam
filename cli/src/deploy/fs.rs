@@ -20,7 +20,19 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FaultPoint {
-    AuditAppend,
+    AfterTargetGenerationFsync,
+    AfterIntentFsync,
+    AfterActiveRename,
+    AfterRootFsync,
+    AfterActiveReread,
+    BeforeRecoveredAuditPublication,
+    DuringRecoveredAuditPublication,
+    AfterRecoveredAuditPublication,
+}
+
+#[cfg(test)]
+pub(crate) fn injected_fault(point: FaultPoint) -> FsError {
+    FsError::InvalidPointer(format!("fault injected at {point:?}"))
 }
 
 #[derive(Debug)]
@@ -667,6 +679,28 @@ impl DeploymentFs {
         bytes: &[u8],
         mode: u32,
     ) -> Result<Digest, FsError> {
+        self.publish_immutable_inner(path, bytes, mode, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_immutable_with_fault(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+        mode: u32,
+        point: FaultPoint,
+    ) -> Result<Digest, FsError> {
+        self.publish_immutable_inner(path, bytes, mode, Some(point))
+    }
+
+    fn publish_immutable_inner(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+        mode: u32,
+        #[cfg(test)] point: Option<FaultPoint>,
+        #[cfg(not(test))] _point: Option<()>,
+    ) -> Result<Digest, FsError> {
         let (parent, name) = parent_and_name(path)?;
         let dir = self.parent_dir(&parent)?;
         let temp_name = format!(
@@ -725,7 +759,22 @@ impl DeploymentFs {
             let _ = unsafe { libc::unlinkat(dir.as_raw_fd(), temp.as_ptr(), 0) };
             return Err(io("publish immutable file", path, error));
         }
+        #[cfg(test)]
+        if point == Some(FaultPoint::DuringRecoveredAuditPublication) {
+            // The immutable name now resolves to complete bytes, but its parent
+            // directory has not reached the publication fsync yet.
+            return Err(injected_fault(FaultPoint::DuringRecoveredAuditPublication));
+        }
         fsync_fd(dir.as_raw_fd(), &join_components(&self.root, &parent))?;
+        #[cfg(test)]
+        if let Some(
+            point @ (FaultPoint::AfterTargetGenerationFsync
+            | FaultPoint::AfterIntentFsync
+            | FaultPoint::AfterRecoveredAuditPublication),
+        ) = point
+        {
+            return Err(injected_fault(point));
+        }
         Ok(Digest::from_bytes(bytes))
     }
 
@@ -733,6 +782,26 @@ impl DeploymentFs {
         &self,
         path: &Path,
         target: &Path,
+    ) -> Result<(), FsError> {
+        self.replace_relative_symlink_inner(path, target, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_relative_symlink_with_fault(
+        &self,
+        path: &Path,
+        target: &Path,
+        point: FaultPoint,
+    ) -> Result<(), FsError> {
+        self.replace_relative_symlink_inner(path, target, Some(point))
+    }
+
+    fn replace_relative_symlink_inner(
+        &self,
+        path: &Path,
+        target: &Path,
+        #[cfg(test)] point: Option<FaultPoint>,
+        #[cfg(not(test))] _point: Option<()>,
     ) -> Result<(), FsError> {
         let (parent, name) = parent_and_name(path)?;
         let target = relative_link_target(target)?;
@@ -767,7 +836,18 @@ impl DeploymentFs {
             let _ = unsafe { libc::unlinkat(dir.as_raw_fd(), temp.as_ptr(), 0) };
             return Err(io("replace active pointer", path, error));
         }
-        fsync_fd(dir.as_raw_fd(), &join_components(&self.root, &parent))
+        #[cfg(test)]
+        if point == Some(FaultPoint::AfterActiveRename) {
+            // The active link has changed but the containing root is not yet
+            // fsynced, which is the precise crash boundary under test.
+            return Err(injected_fault(FaultPoint::AfterActiveRename));
+        }
+        fsync_fd(dir.as_raw_fd(), &join_components(&self.root, &parent))?;
+        #[cfg(test)]
+        if point == Some(FaultPoint::AfterRootFsync) {
+            return Err(injected_fault(FaultPoint::AfterRootFsync));
+        }
+        Ok(())
     }
 
     pub fn read_active(&self) -> Result<Option<Pointer>, FsError> {
@@ -789,6 +869,18 @@ impl DeploymentFs {
         }
         let generation = GenerationId::new(&components[1]).map_err(FsError::InvalidPointer)?;
         Ok(Some(self.read_generation(&generation)?))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_active_with_fault(
+        &self,
+        point: FaultPoint,
+    ) -> Result<Option<Pointer>, FsError> {
+        let active = self.read_active()?;
+        if point == FaultPoint::AfterActiveReread {
+            return Err(injected_fault(point));
+        }
+        Ok(active)
     }
 
     pub(crate) fn validate_generation_target(&self, target: &Pointer) -> Result<(), FsError> {

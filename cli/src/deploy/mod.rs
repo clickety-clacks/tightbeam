@@ -202,14 +202,32 @@ impl DeployManager {
     #[cfg(test)]
     fn recover_with_fault(&self, point: fs::FaultPoint) -> Result<Recovery, FsError> {
         self.recover_with_append(|intent| {
-            if point == fs::FaultPoint::AuditAppend {
-                return Err(FsError::InvalidPointer(format!(
-                    "fault injected at {:?}",
-                    point
-                )));
+            if point == fs::FaultPoint::BeforeRecoveredAuditPublication {
+                return Err(fs::injected_fault(point));
             }
-            self.append_recovered_commit(intent)
+            self.append_recovered_commit_with_fault(intent, point)
         })
+    }
+
+    #[cfg(test)]
+    fn append_recovered_commit_with_fault(
+        &self,
+        intent: &ActivationIntent,
+        point: fs::FaultPoint,
+    ) -> Result<(), FsError> {
+        let (fact, bytes) = self.recovered_commit_fact(intent)?;
+        let transaction = intent.transaction_id.as_str();
+        self.fs
+            .ensure_dir(&Path::new("audit").join(transaction), 0o755)?;
+        self.fs.publish_immutable_with_fault(
+            &Path::new("audit")
+                .join(transaction)
+                .join(format!("{}.json", fact.fact_digest.as_str())),
+            &bytes,
+            0o444,
+            point,
+        )?;
+        Ok(())
     }
 
     pub(crate) fn gc_guard(&self) -> Result<(), FsError> {
@@ -617,6 +635,121 @@ mod tests {
         .unwrap();
     }
 
+    fn activation_intent_bytes(
+        manager: &DeployManager,
+        transaction: &str,
+        action: &str,
+        expected: &ExpectedActive,
+        prior: Option<&Pointer>,
+        target: &Pointer,
+    ) -> Vec<u8> {
+        let root_identity = manager.fs.root_identity_digest().unwrap();
+        let host_identity = manager.fs.host_identity().as_str().to_owned();
+        serde_json::to_vec(&serde_json::json!({
+            "transactionId": transaction,
+            "action": action,
+            "expectedActive": expected.as_wire(),
+            "prior": prior.map(|pointer| serde_json::json!({
+                "generation": pointer.generation.as_str(),
+                "releaseDigest": pointer.release.as_str(),
+            })),
+            "target": {
+                "generation": target.generation.as_str(),
+                "releaseDigest": target.release.as_str(),
+            },
+            "hostIdentity": host_identity,
+            "deploymentRoot": root_identity.as_str(),
+            "serviceSetDigest": model::Digest::from_bytes(b"service-set").as_str(),
+        }))
+        .unwrap()
+    }
+
+    fn write_activation_intent(
+        manager: &DeployManager,
+        transaction: &str,
+        action: &str,
+        expected: &ExpectedActive,
+        prior: Option<&Pointer>,
+        target: &Pointer,
+    ) {
+        let bytes = activation_intent_bytes(manager, transaction, action, expected, prior, target);
+        manager.fs.ensure_dir(Path::new("intents"), 0o755).unwrap();
+        manager
+            .fs
+            .publish_immutable(
+                &Path::new("intents").join(format!("{transaction}.json")),
+                &bytes,
+                0o444,
+            )
+            .unwrap();
+    }
+
+    fn write_activation_intent_with_fault(
+        manager: &DeployManager,
+        transaction: &str,
+        action: &str,
+        expected: &ExpectedActive,
+        prior: Option<&Pointer>,
+        target: &Pointer,
+        point: fs::FaultPoint,
+    ) -> Result<(), FsError> {
+        let bytes = activation_intent_bytes(manager, transaction, action, expected, prior, target);
+        manager.fs.ensure_dir(Path::new("intents"), 0o755)?;
+        manager.fs.publish_immutable_with_fault(
+            &Path::new("intents").join(format!("{transaction}.json")),
+            &bytes,
+            0o444,
+            point,
+        )?;
+        Ok(())
+    }
+
+    fn add_generation_with_fault(
+        manager: &DeployManager,
+        generation: &str,
+        release: &model::Digest,
+        prior: Option<&str>,
+        point: fs::FaultPoint,
+    ) -> Result<(), FsError> {
+        manager
+            .fs
+            .ensure_dir(&Path::new("generations").join(generation), 0o755)?;
+        manager.fs.publish_immutable_with_fault(
+            &Path::new("generations")
+                .join(generation)
+                .join("manifest.json"),
+            format!(
+                r#"{{"prior_generation":{},"releaseDigest":"{release}"}}"#,
+                prior
+                    .map(|prior| format!("\"{prior}\""))
+                    .unwrap_or("null".to_owned())
+            )
+            .as_bytes(),
+            0o444,
+            point,
+        )?;
+        let release_name = format!("sha256-{release}");
+        manager.fs.replace_relative_symlink(
+            &Path::new("generations").join(generation).join("root"),
+            &Path::new("../../releases")
+                .join(release_name)
+                .join("tightbeam"),
+        )?;
+        Ok(())
+    }
+
+    fn assert_protected_transition_objects(directory: &TempDir, transaction: &str) {
+        assert!(directory.0.join("generations/g1").is_dir());
+        assert!(directory.0.join("generations/g2").is_dir());
+        assert!(
+            directory
+                .0
+                .join("intents")
+                .join(format!("{transaction}.json"))
+                .is_file()
+        );
+    }
+
     #[test]
     fn recover_holds_an_active_pointer_without_a_durable_audit_link() {
         let directory = active_fixture();
@@ -794,133 +927,232 @@ mod tests {
         assert_eq!(manager.fs.read_active().unwrap(), Some(current));
     }
 
-    #[test]
-    fn recover_appends_one_idempotent_commit_fact_for_a_target_pointer() {
+    fn assert_recovery_after_barrier(u0: bool, point: fs::FaultPoint) {
         let directory = active_fixture();
         let manager = DeployManager::open(&directory.0).unwrap();
         let current = manager.fs.read_active().unwrap().unwrap();
-        let root_identity = manager.fs.root_identity_digest().unwrap();
-        let host_identity = manager.fs.host_identity().as_str().to_owned();
-        let service_set = model::Digest::from_bytes(b"service-set");
-        manager.fs.ensure_dir(Path::new("intents"), 0o755).unwrap();
-        stdfs::write(
-            directory.0.join("intents/tx-recover.json"),
-            format!(
-                r#"{{"transactionId":"tx-recover","action":"activation","expectedActive":"virgin:{}","target":{{"generation":"{}","releaseDigest":"{}"}},"hostIdentity":"{}","deploymentRoot":"{}","serviceSetDigest":"{}"}}"#,
-                root_identity.as_str(),
-                current.generation,
-                current.release,
-                host_identity,
-                root_identity.as_str(),
-                service_set
-            ),
-        )
-        .unwrap();
-
-        assert!(matches!(
-            manager.recover_with_fault(fs::FaultPoint::AuditAppend),
-            Err(FsError::InvalidPointer(reason)) if reason.contains("fault injected")
-        ));
-        assert!(manager.fs.read_audit().unwrap().is_empty());
-        let first = manager.recover().unwrap();
-        assert_eq!(first.class, RecoveryClass::ActivationCommittedRecovered);
-        assert_eq!(manager.fs.read_audit().unwrap().len(), 1);
-        let second = manager.recover().unwrap();
-        assert_eq!(second.class, RecoveryClass::ActivationCommittedRecovered);
-        assert_eq!(manager.fs.read_audit().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn deterministic_recovery_matrix_classifies_ordinary_and_u0_durable_boundaries() {
-        let directory = active_fixture();
-        let manager = DeployManager::open(&directory.0).unwrap();
-        let current = manager.fs.read_active().unwrap().unwrap();
-        write_transition_fact(&manager, "tx-g1", None, &current);
-        assert_eq!(
-            manager.recover().unwrap().class,
-            RecoveryClass::ActivationCommittedRecovered
-        );
-
-        add_generation(
-            &manager,
-            "g2",
-            &current.release,
-            Some(current.generation.as_str()),
-        );
+        if u0 {
+            stdfs::remove_file(directory.0.join("active")).unwrap();
+        } else {
+            write_transition_fact(&manager, "tx-g1", None, &current);
+        }
+        let prior = (!u0).then_some(current.clone());
         let target = Pointer {
             generation: model::GenerationId::new("g2").unwrap(),
             release: current.release.clone(),
         };
-        let root_identity = manager.fs.root_identity_digest().unwrap();
-        let host_identity = manager.fs.host_identity().as_str().to_owned();
-        manager.fs.ensure_dir(Path::new("intents"), 0o755).unwrap();
-        stdfs::write(
-            directory.0.join("intents/tx-ordinary.json"),
-            format!(
-                r#"{{"transactionId":"tx-ordinary","action":"activation","expectedActive":"generation:{}:{}","prior":{{"generation":"{}","releaseDigest":"{}"}},"target":{{"generation":"{}","releaseDigest":"{}"}},"hostIdentity":"{}","deploymentRoot":"{}","serviceSetDigest":"{}"}}"#,
-                current.generation,
-                current.release,
-                current.generation,
-                current.release,
-                target.generation,
-                target.release,
-                host_identity,
-                root_identity.as_str(),
-                model::Digest::from_bytes(b"service-set"),
-            ),
-        )
-        .unwrap();
-        assert_eq!(
-            manager.recover().unwrap().class,
+        let expected = prior.as_ref().map_or_else(
+            || ExpectedActive::virgin(manager.fs.root_identity_digest().unwrap()),
+            |pointer| {
+                ExpectedActive::generation(pointer.generation.clone(), pointer.release.clone())
+            },
+        );
+        let transaction = if u0 { "tx-u0" } else { "tx-ordinary" };
+        if point == fs::FaultPoint::AfterTargetGenerationFsync {
+            assert!(matches!(
+                add_generation_with_fault(
+                    &manager,
+                    "g2",
+                    &target.release,
+                    prior.as_ref().map(|pointer| pointer.generation.as_str()),
+                    point,
+                ),
+                Err(FsError::InvalidPointer(reason)) if reason.contains("fault injected")
+            ));
+        } else {
+            add_generation(
+                &manager,
+                "g2",
+                &target.release,
+                prior.as_ref().map(|pointer| pointer.generation.as_str()),
+            );
+            if point == fs::FaultPoint::AfterIntentFsync {
+                assert!(matches!(
+                    write_activation_intent_with_fault(
+                        &manager,
+                        transaction,
+                        if u0 { "first-cutover" } else { "activation" },
+                        &expected,
+                        prior.as_ref(),
+                        &target,
+                        point,
+                    ),
+                    Err(FsError::InvalidPointer(reason)) if reason.contains("fault injected")
+                ));
+            } else {
+                write_activation_intent(
+                    &manager,
+                    transaction,
+                    if u0 { "first-cutover" } else { "activation" },
+                    &expected,
+                    prior.as_ref(),
+                    &target,
+                );
+                let replacement = match point {
+                    fs::FaultPoint::AfterActiveRename | fs::FaultPoint::AfterRootFsync => {
+                        manager.fs.replace_relative_symlink_with_fault(
+                            Path::new("active"),
+                            Path::new("generations/g2"),
+                            point,
+                        )
+                    }
+                    _ => manager
+                        .fs
+                        .replace_relative_symlink(Path::new("active"), Path::new("generations/g2")),
+                };
+                if matches!(
+                    point,
+                    fs::FaultPoint::AfterActiveRename | fs::FaultPoint::AfterRootFsync
+                ) {
+                    assert!(matches!(
+                        replacement,
+                        Err(FsError::InvalidPointer(reason)) if reason.contains("fault injected")
+                    ));
+                } else {
+                    replacement.unwrap();
+                    if point == fs::FaultPoint::AfterActiveReread {
+                        assert!(matches!(
+                            manager.fs.read_active_with_fault(point),
+                            Err(FsError::InvalidPointer(reason)) if reason.contains("fault injected")
+                        ));
+                        assert_eq!(manager.fs.read_active().unwrap(), Some(target.clone()));
+                    }
+                }
+            }
+        }
+
+        let restarted = DeployManager::open(&directory.0).unwrap();
+        let recovery = restarted.recover().unwrap();
+        let post_pointer = !matches!(
+            point,
+            fs::FaultPoint::AfterTargetGenerationFsync | fs::FaultPoint::AfterIntentFsync
+        );
+        let expected_class = if post_pointer {
+            RecoveryClass::ActivationCommittedRecovered
+        } else if point == fs::FaultPoint::AfterTargetGenerationFsync && u0 {
+            RecoveryClass::VirginReady
+        } else if point == fs::FaultPoint::AfterTargetGenerationFsync {
+            RecoveryClass::ActivationCommittedRecovered
+        } else {
             RecoveryClass::ActivationNotCommitted
+        };
+        assert_eq!(recovery.class, expected_class, "u0={u0}, point={point:?}");
+        assert!(directory.0.join("generations/g2").is_dir());
+        if point != fs::FaultPoint::AfterTargetGenerationFsync {
+            assert_protected_transition_objects(&directory, transaction);
+        }
+        let expected_audits = if post_pointer {
+            if u0 { 1 } else { 2 }
+        } else if u0 {
+            0
+        } else {
+            1
+        };
+        assert_eq!(restarted.fs.read_audit().unwrap().len(), expected_audits);
+        let repeated = restarted.recover().unwrap();
+        assert_eq!(repeated.class, expected_class);
+        assert_eq!(restarted.fs.read_audit().unwrap().len(), expected_audits);
+    }
+
+    #[test]
+    fn deterministic_recovery_matrix_runs_ordinary_and_u0_at_every_named_barrier() {
+        for u0 in [false, true] {
+            for point in [
+                fs::FaultPoint::AfterTargetGenerationFsync,
+                fs::FaultPoint::AfterIntentFsync,
+                fs::FaultPoint::AfterActiveRename,
+                fs::FaultPoint::AfterRootFsync,
+                fs::FaultPoint::AfterActiveReread,
+            ] {
+                assert_recovery_after_barrier(u0, point);
+            }
+        }
+    }
+
+    fn target_pointer_recovery_fixture(u0: bool) -> (TempDir, DeployManager, &'static str) {
+        let directory = active_fixture();
+        let manager = DeployManager::open(&directory.0).unwrap();
+        let current = manager.fs.read_active().unwrap().unwrap();
+        if u0 {
+            stdfs::remove_file(directory.0.join("active")).unwrap();
+        } else {
+            write_transition_fact(&manager, "tx-g1", None, &current);
+        }
+        let target = Pointer {
+            generation: model::GenerationId::new("g2").unwrap(),
+            release: current.release.clone(),
+        };
+        add_generation(
+            &manager,
+            "g2",
+            &target.release,
+            (!u0).then_some(current.generation.as_str()),
+        );
+        let transaction = if u0 {
+            "tx-audit-u0"
+        } else {
+            "tx-audit-ordinary"
+        };
+        write_activation_intent(
+            &manager,
+            transaction,
+            if u0 { "first-cutover" } else { "activation" },
+            &if u0 {
+                ExpectedActive::virgin(manager.fs.root_identity_digest().unwrap())
+            } else {
+                ExpectedActive::generation(current.generation.clone(), current.release.clone())
+            },
+            (!u0).then_some(&current),
+            &target,
         );
         manager
             .fs
             .replace_relative_symlink(Path::new("active"), Path::new("generations/g2"))
             .unwrap();
-        assert_eq!(
-            manager.recover().unwrap().class,
-            RecoveryClass::ActivationCommittedRecovered
-        );
-        assert_eq!(manager.fs.read_audit().unwrap().len(), 2);
-        assert_eq!(
-            manager.recover().unwrap().class,
-            RecoveryClass::ActivationCommittedRecovered
-        );
-        assert_eq!(manager.fs.read_audit().unwrap().len(), 2);
+        (directory, manager, transaction)
+    }
 
-        let u0_directory = active_fixture();
-        let u0 = DeployManager::open(&u0_directory.0).unwrap();
-        let u0_target = u0.fs.read_active().unwrap().unwrap();
-        stdfs::remove_file(u0_directory.0.join("active")).unwrap();
-        let u0_root_identity = u0.fs.root_identity_digest().unwrap();
-        let u0_host_identity = u0.fs.host_identity().as_str().to_owned();
-        u0.fs.ensure_dir(Path::new("intents"), 0o755).unwrap();
-        stdfs::write(
-            u0_directory.0.join("intents/tx-u0.json"),
-            format!(
-                r#"{{"transactionId":"tx-u0","action":"first-cutover","expectedActive":"virgin:{}","target":{{"generation":"{}","releaseDigest":"{}"}},"hostIdentity":"{}","deploymentRoot":"{}","serviceSetDigest":"{}"}}"#,
-                u0_root_identity.as_str(),
-                u0_target.generation,
-                u0_target.release,
-                u0_host_identity,
-                u0_root_identity.as_str(),
-                model::Digest::from_bytes(b"service-set"),
-            ),
-        )
-        .unwrap();
-        assert_eq!(
-            u0.recover().unwrap().class,
-            RecoveryClass::ActivationNotCommitted
-        );
-        u0.fs
-            .replace_relative_symlink(Path::new("active"), Path::new("generations/g1"))
-            .unwrap();
-        assert_eq!(
-            u0.recover().unwrap().class,
-            RecoveryClass::ActivationCommittedRecovered
-        );
-        assert_eq!(u0.fs.read_audit().unwrap().len(), 1);
+    #[test]
+    fn recovered_audit_publication_matrix_preserves_one_digest_bound_authority() {
+        for u0 in [false, true] {
+            for point in [
+                fs::FaultPoint::BeforeRecoveredAuditPublication,
+                fs::FaultPoint::DuringRecoveredAuditPublication,
+                fs::FaultPoint::AfterRecoveredAuditPublication,
+            ] {
+                let (directory, manager, transaction) = target_pointer_recovery_fixture(u0);
+                assert!(matches!(
+                    manager.recover_with_fault(point),
+                    Err(FsError::InvalidPointer(reason)) if reason.contains("fault injected")
+                ));
+                assert_protected_transition_objects(&directory, transaction);
+                let before_restart = manager.fs.read_audit().unwrap().len();
+                assert_eq!(
+                    before_restart,
+                    if point == fs::FaultPoint::BeforeRecoveredAuditPublication {
+                        if u0 { 0 } else { 1 }
+                    } else if u0 {
+                        1
+                    } else {
+                        2
+                    },
+                    "u0={u0}, point={point:?}"
+                );
+
+                let restarted = DeployManager::open(&directory.0).unwrap();
+                assert_eq!(
+                    restarted.recover().unwrap().class,
+                    RecoveryClass::ActivationCommittedRecovered
+                );
+                let expected_audits = if u0 { 1 } else { 2 };
+                assert_eq!(restarted.fs.read_audit().unwrap().len(), expected_audits);
+                assert_eq!(
+                    restarted.recover().unwrap().class,
+                    RecoveryClass::ActivationCommittedRecovered
+                );
+                assert_eq!(restarted.fs.read_audit().unwrap().len(), expected_audits);
+            }
+        }
     }
 
     #[test]
