@@ -49,7 +49,17 @@ defmodule Tightbeam.Wire.Router do
 
   use Plug.Router
 
-  alias Tightbeam.{Assets, CliCompatibility, Devices, Dispatch, Org, Roles, WorkState}
+  alias Tightbeam.{
+    Assets,
+    CliCompatibility,
+    ConditionFacts,
+    Devices,
+    Dispatch,
+    Org,
+    Roles,
+    WorkState
+  }
+
   alias Tightbeam.Wire.{Payloads, Socket}
 
   Module.register_attribute(__MODULE__, :agent_verbs, persist: true)
@@ -147,6 +157,17 @@ defmodule Tightbeam.Wire.Router do
         params: atomize_params(verb, body["params"] || %{})
       }
 
+      dispatch_response(conn, call, 200, &%{"result" => &1})
+    else
+      {:error, status, code, message} -> error(conn, status, code, message)
+    end
+  end
+
+  post "/agent/terminal" do
+    with {:ok, {:session, session}} <- terminal_session_auth(conn),
+         :ok <- terminal_version_supported(conn),
+         {:ok, body, conn} <- read_json(conn),
+         {:ok, call} <- terminal_surrender_call(session, body) do
       dispatch_response(conn, call, 200, &%{"result" => &1})
     else
       {:error, status, code, message} -> error(conn, status, code, message)
@@ -404,12 +425,13 @@ defmodule Tightbeam.Wire.Router do
     do: deps(conn)[:session_status] || (&Tightbeam.Gateway.session_status/1)
 
   defp cli_auth(conn) do
-    with :ok <- cli_version_compatible(conn) do
-      cli_token_auth(conn)
+    with {:ok, auth} <- cli_token_auth(conn),
+         :ok <- cli_version_compatible(conn, auth) do
+      {:ok, auth}
     end
   end
 
-  defp cli_version_compatible(conn) do
+  defp cli_version_compatible(conn, auth) do
     version =
       case Plug.Conn.get_req_header(conn, "x-tightbeam-cli-version") do
         [version] -> version
@@ -417,8 +439,36 @@ defmodule Tightbeam.Wire.Router do
       end
 
     case CliCompatibility.check(version) do
-      :ok -> :ok
-      {:error, message} -> {:error, 426, "incompatible_cli", message}
+      :ok ->
+        observe_cli_compatibility(conn, auth, version, :compatible)
+
+      {:error, message} ->
+        case observe_cli_compatibility(conn, auth, version, :incompatible) do
+          :ok -> {:error, 426, "incompatible_cli", message}
+          error -> error
+        end
+    end
+  end
+
+  defp observe_cli_compatibility(_conn, :org, _offered, _state), do: :ok
+
+  defp observe_cli_compatibility(conn, {:session, session}, offered, state) do
+    required = CliCompatibility.required_version()
+    offered = if is_binary(offered), do: offered, else: "missing"
+
+    case ConditionFacts.observe_cli_compatibility(
+           db(conn),
+           session.session_key,
+           state,
+           offered,
+           required,
+           conn.request_path
+         ) do
+      {:error, _reason} ->
+        {:error, 503, "mismatch_state_unavailable", "CLI mismatch state could not be recorded"}
+
+      _ ->
+        :ok
     end
   end
 
@@ -443,6 +493,58 @@ defmodule Tightbeam.Wire.Router do
       error -> error
     end
   end
+
+  defp terminal_session_auth(conn) do
+    case cli_token_auth(conn) do
+      {:ok, {:session, _session} = session} -> {:ok, session}
+      {:ok, :org} -> {:error, 403, "session_required", "a session token is required"}
+      error -> error
+    end
+  end
+
+  defp terminal_version_supported(conn) do
+    case Plug.Conn.get_req_header(conn, "x-tightbeam-terminal-version") do
+      ["1"] ->
+        :ok
+
+      _ ->
+        {:error, 400, "unsupported_terminal_protocol", "terminal protocol version 1 is required"}
+    end
+  end
+
+  defp terminal_surrender_call(session, body) when is_map(body) do
+    with :ok <- exact_terminal_body(body),
+         {:ok, assignment_id} <- required_string(body["assignmentId"]),
+         :ok <- terminal_disposition(body["disposition"]),
+         {:ok, note} <- required_string(body["note"]) do
+      {:ok,
+       %{
+         verb: "attest",
+         origin: "agent:terminal",
+         principal: {:session, session.session_key},
+         session_key: nil,
+         params: %{assignment_id: assignment_id, kind: "surrender", note: note},
+         terminal_surrender: true
+       }}
+    end
+  end
+
+  defp terminal_surrender_call(_session, _body),
+    do: {:error, 400, "invalid_terminal_request", "terminal request must be a JSON object"}
+
+  defp exact_terminal_body(body) do
+    if Map.keys(body) |> Enum.sort() == ["assignmentId", "disposition", "note"] do
+      :ok
+    else
+      {:error, 400, "invalid_terminal_request",
+       "terminal surrender accepts assignmentId, disposition, and note only"}
+    end
+  end
+
+  defp terminal_disposition("surrender"), do: :ok
+
+  defp terminal_disposition(_),
+    do: {:error, 400, "invalid_terminal_request", "disposition must be surrender"}
 
   defp device_auth(conn) do
     token =

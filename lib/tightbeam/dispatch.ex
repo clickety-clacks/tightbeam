@@ -87,6 +87,10 @@ defmodule Tightbeam.Dispatch do
         :ok = EventLog.append_event(db, "verb", verb, origin, session_key, assignment, principal)
         {:ok, assignment}
 
+      {:terminal_replay, result} ->
+        :ok = EventLog.append_event(db, "verb", verb, origin, session_key, result, principal)
+        {:ok, result}
+
       {:refuse, error} ->
         # Terminal guard fires BEFORE Rules.decide: no statute or remedy episode
         # touches a non-open item (work-item-brackets §Mechanism, Proof 12).
@@ -100,6 +104,18 @@ defmodule Tightbeam.Dispatch do
   # before the rail so both the guard and Rules.decide see the replay outcome.
   defp bracket_precheck(db, call, verb) when verb in ["assign", "dispatch"] do
     Assignments.dispatch_precheck(db, call)
+  end
+
+  defp bracket_precheck(
+         db,
+         %{terminal_surrender: true, principal: {:session, holder}, params: params},
+         "attest"
+       ) do
+    case Assignments.terminal_surrender_precheck(db, params.assignment_id, holder) do
+      :proceed -> :proceed
+      {:replay, result} -> {:terminal_replay, result}
+      {:refuse, error} -> {:refuse, error}
+    end
   end
 
   defp bracket_precheck(_db, _call, _verb), do: :proceed

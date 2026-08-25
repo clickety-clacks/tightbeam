@@ -401,6 +401,48 @@ defmodule Tightbeam.Assignments do
     Enum.map(rows, &attest/1)
   end
 
+  @doc "Classify the fixed same-holder terminal-surrender replay before Rules run."
+  @spec terminal_surrender_precheck(DB.server(), String.t(), String.t()) ::
+          :proceed | {:replay, map()} | {:refuse, map()}
+  def terminal_surrender_precheck(db, assignment_id, holder_key) do
+    case DB.query(db, "SELECT #{columns()} FROM assignments WHERE id = ?1", [assignment_id]) do
+      {:ok, []} ->
+        {:refuse, error("unknown_assignment", "unknown assignment: #{assignment_id}")}
+
+      {:ok, [row]} ->
+        assignment = assignment(row)
+
+        cond do
+          assignment.state == "open" ->
+            :proceed
+
+          assignment.outcome == "surrendered" and assignment.closedBySession == holder_key and
+              is_binary(assignment.closingAttestId) ->
+            case DB.query(
+                   db,
+                   "SELECT id, assignmentId, kind, verdictKind, note, bySession, byUser, producer, producerCommand, byHarness, byProvider, commitRefs, ts FROM attests WHERE id = ?1",
+                   [assignment.closingAttestId]
+                 ) do
+              {:ok, [attest_row]} ->
+                closing = attest(attest_row)
+
+                if closing.assignmentId == assignment.id and closing.kind == "surrender" and
+                     closing.bySession == holder_key do
+                  {:replay, %{assignment: assignment, attest: closing, replayed: true}}
+                else
+                  {:refuse, terminal_conflict()}
+                end
+
+              _ ->
+                {:refuse, terminal_conflict()}
+            end
+
+          true ->
+            {:refuse, terminal_conflict()}
+        end
+    end
+  end
+
   @doc false
   def __for_work_item__(db, work_item_id) do
     {:ok, rows} =
@@ -741,8 +783,30 @@ defmodule Tightbeam.Assignments do
       end
     end
   rescue
-    TransitionRace -> assignment_closed()
+    TransitionRace ->
+      if call[:terminal_surrender] do
+        terminal_surrender_after_race(db, call)
+      else
+        assignment_closed()
+      end
   end
+
+  defp terminal_surrender_after_race(db, call) do
+    case terminal_surrender_precheck(db, call.params.assignment_id, session_key!(call.principal)) do
+      {:replay, result} -> result
+      {:refuse, error} -> error
+      :proceed -> assignment_closed()
+    end
+  end
+
+  defp session_key!({:session, session_key}), do: session_key
+
+  defp terminal_conflict,
+    do:
+      error(
+        "terminal_conflict",
+        "terminal surrender does not match this assignment's closed outcome"
+      )
 
   # Per effort-checkin-v2 §Design 5 and the provenance it cites verbatim —
   # "Artifacts are the referents" — an attest's referents are the artifacts the
