@@ -1,7 +1,7 @@
 defmodule Tightbeam.Schema do
   @moduledoc "The single production-owned schema bootstrap for a Tightbeam database."
 
-  alias Tightbeam.DB
+  alias Tightbeam.{ArtifactContent, Artifacts, DB}
   alias Tightbeam.DB.Txn
 
   @schema_modules [
@@ -9,6 +9,7 @@ defmodule Tightbeam.Schema do
     Tightbeam.EventLog,
     Tightbeam.Assets,
     Tightbeam.Artifacts,
+    Tightbeam.ArtifactContent,
     Tightbeam.CausalEvents,
     Tightbeam.Devices,
     Tightbeam.Idempotency,
@@ -37,136 +38,8 @@ defmodule Tightbeam.Schema do
   # The shape this build writes. Bump it when a production table changes in a
   # way that makes an older database unreadable, and give the refusal below a
   # sentence saying what changed.
-  @shape "operator-decision-requests-v1"
-  @model_identity_shape "model-identity-v1"
-
-  # The one predecessor shape this build can migrate. This is deliberately a
-  # complete target table, not an ALTER inferred from sqlite_master: the stamp
-  # identifies the exact source contract, and this DDL names the exact target.
-  # The temporary name also keeps the live request-site audit honest: this is a
-  # bulk schema copy, not a new decision request that owes a prompt wake.
-  @operator_decision_requests_ddl """
-  CREATE TABLE decision_requests_new (
-    id                TEXT PRIMARY KEY,
-    kind              TEXT NOT NULL DEFAULT 'statute' CHECK (kind IN ('statute','effort','operator')),
-    raiserId          TEXT NOT NULL,
-    raiserSessionKey  TEXT,
-    ownerUserId       TEXT NOT NULL,
-    assignmentId      TEXT,
-    expecterSessionKey TEXT,
-    expecterUserId    TEXT,
-    lineageRung       INTEGER,
-    effortGeneration  INTEGER,
-    deadlineWakeId    TEXT,
-    raisedAt          INTEGER NOT NULL,
-    deadlineAt        INTEGER NOT NULL,
-    statuteName       TEXT,
-    actionKey         TEXT,
-    question          TEXT NOT NULL,
-    options           TEXT,
-    context           TEXT NOT NULL,
-    status            TEXT NOT NULL CHECK (status IN ('open','ruled','consumed','withdrawn','superseded')),
-    decision          TEXT,
-    rationale         TEXT,
-    ruledBy           TEXT,
-    ruledViaSessionKey TEXT,
-    ruledAt           INTEGER,
-    rulingFactId      INTEGER,
-    consumedAt        INTEGER,
-    parkWakeId        TEXT,
-    withdrawnBy       TEXT,
-    withdrawnReason   TEXT,
-    withdrawnAt       INTEGER,
-    CHECK (
-      (kind = 'statute' AND statuteName IS NOT NULL AND actionKey IS NOT NULL
-       AND expecterSessionKey IS NULL AND expecterUserId IS NULL
-       AND lineageRung IS NULL AND effortGeneration IS NULL AND deadlineWakeId IS NULL
-       AND ruledViaSessionKey IS NULL
-       AND (decision IS NULL OR decision IN ('allow','deny','waived')))
-      OR
-      (kind = 'effort' AND raiserId = 'process:tightbeam'
-       AND raiserSessionKey IS NULL
-       AND statuteName IS NULL AND actionKey IS NULL AND assignmentId IS NOT NULL
-       AND ((expecterSessionKey IS NOT NULL) != (expecterUserId IS NOT NULL))
-       AND lineageRung IS NOT NULL AND effortGeneration IS NOT NULL AND deadlineWakeId IS NOT NULL
-       AND ruledViaSessionKey IS NULL
-       AND (decision IS NULL OR decision IN ('continue','dismiss')))
-      OR
-      (kind = 'operator'
-       AND raiserSessionKey IS NOT NULL
-       AND statuteName IS NULL AND actionKey IS NOT NULL
-       AND expecterSessionKey IS NULL AND expecterUserId IS NULL
-       AND lineageRung IS NULL AND effortGeneration IS NULL
-       AND deadlineWakeId IS NULL
-       AND options IS NOT NULL
-       AND parkWakeId IS NULL AND consumedAt IS NULL
-       AND status <> 'consumed'
-       AND (
-         (status = 'ruled'
-          AND decision IS NOT NULL
-          AND ruledBy = 'user:' || ownerUserId
-          AND ruledAt IS NOT NULL AND rulingFactId IS NOT NULL)
-         OR
-         (status <> 'ruled'
-          AND decision IS NULL AND rationale IS NULL
-          AND ruledBy IS NULL AND ruledAt IS NULL AND rulingFactId IS NULL
-          AND ruledViaSessionKey IS NULL)
-       ))
-    )
-  );
-  """
-
-  @operator_decision_requests_indexes_ddl """
-  CREATE INDEX decision_requests_owner
-    ON decision_requests (ownerUserId, status);
-  CREATE INDEX decision_requests_key
-    ON decision_requests (raiserId, statuteName, actionKey);
-  CREATE UNIQUE INDEX decision_requests_one_open
-    ON decision_requests (raiserId, statuteName, actionKey)
-    WHERE kind = 'statute' AND status = 'open';
-  CREATE UNIQUE INDEX decision_requests_effort_generation
-    ON decision_requests (assignmentId, effortGeneration) WHERE kind = 'effort';
-  CREATE UNIQUE INDEX decision_requests_operator_open
-    ON decision_requests (ownerUserId, raiserId, actionKey)
-    WHERE kind = 'operator' AND status = 'open';
-  """
-
-  @operator_messages_ddl """
-  CREATE TABLE messages_new (
-    seq                    INTEGER PRIMARY KEY AUTOINCREMENT,
-    id                     TEXT NOT NULL UNIQUE,
-    sessionKey             TEXT NOT NULL,
-    role                   TEXT NOT NULL CHECK (role IN ('user','assistant')),
-    content                TEXT NOT NULL,
-    timestamp              INTEGER NOT NULL,
-    sender                 TEXT,
-    deviceId               TEXT,
-    clientMessageId        TEXT,
-    replyToMessageId       TEXT,
-    replyToClientMessageId TEXT,
-    llmVisibleMessageId    TEXT NOT NULL,
-    attachments            TEXT NOT NULL DEFAULT '[]',
-    attentionTier          INTEGER NOT NULL DEFAULT 0,
-    messageType            TEXT,
-    markerKind             TEXT CHECK (
-      markerKind IS NULL OR markerKind IN ('harness-switch','model-retune','session-restart')
-    ),
-    markerFrom             TEXT,
-    markerTo               TEXT,
-    CHECK (
-      (messageType IS 'marker' AND markerKind IS NOT NULL AND markerFrom IS NOT NULL AND markerTo IS NOT NULL)
-      OR
-      (messageType IS NOT 'marker' AND markerKind IS NULL AND markerFrom IS NULL AND markerTo IS NULL)
-    )
-  );
-  """
-
-  @operator_messages_indexes_ddl """
-  CREATE INDEX messages_session ON messages (sessionKey, seq);
-  CREATE UNIQUE INDEX messages_client_dedupe
-    ON messages (sessionKey, deviceId, clientMessageId)
-    WHERE clientMessageId IS NOT NULL AND deviceId IS NOT NULL;
-  """
+  @shape "operator-decision-requests-v1-artifact-content-v1"
+  @source_shape "operator-decision-requests-v1"
 
   @supervision_liveness_objects [
     %{
@@ -854,16 +727,19 @@ defmodule Tightbeam.Schema do
   missing or unknown stamp is a refusal and a bug report, never an inference.
   Note the direction — the one existence question below is asked to REFUSE,
   never to deduce a shape and accommodate it. The sole migration is selected
-  by the exact `model-identity-v1` stamp; it does not sniff stored DDL.
+  by the exact `operator-decision-requests-v1` stamp; it does not sniff stored
+  DDL.
   """
   @spec ensure_all(DB.server()) :: :ok
   def ensure_all(db) do
     :ok = ensure_stamp_table(db)
-    :ok = check_shape(db)
+    shape_status = check_shape(db)
 
     Enum.each(@schema_modules, fn module ->
       :ok = module.ensure_schema(db)
     end)
+
+    if shape_status == :fresh, do: validate_artifact_content_shape!(db)
 
     activated_at = System.system_time(:millisecond)
 
@@ -1033,10 +909,12 @@ defmodule Tightbeam.Schema do
   defp check_shape(db) do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
       {:ok, [[@shape]]} ->
-        :ok
+        validate_artifact_content_shape!(db)
+        :target
 
-      {:ok, [[@model_identity_shape]]} ->
-        migrate_model_identity_v1(db)
+      {:ok, [[@source_shape]]} ->
+        migrate_artifact_content_v1(db)
+        :target
 
       {:ok, []} ->
         # No stamp. Either a database this build is about to create, or one
@@ -1044,6 +922,7 @@ defmodule Tightbeam.Schema do
         # them apart is the whole point — an unstamped database with a
         # `sessions` table in it predates the structured model identity.
         unstamped(db)
+        :fresh
 
       {:ok, [[found]]} ->
         raise ShapeError, """
@@ -1052,7 +931,7 @@ defmodule Tightbeam.Schema do
           stamped: #{found}
           this build: #{@shape}
 
-        This build can migrate only #{@model_identity_shape} to #{@shape}.
+        This build can migrate only #{@source_shape} to #{@shape}.
 
         No migration is defined for the stamped shape above. Keep the database
         in place and run a Tightbeam build that recognizes that exact stamp.
@@ -1074,15 +953,63 @@ defmodule Tightbeam.Schema do
     end
   end
 
-  defp migrate_model_identity_v1(db) do
-    # SQLite checks child rows during DROP TABLE even when constraints are
-    # deferred. The DB owner is the only connection and serializes this whole
-    # call, so suspend enforcement around the transaction, verify every FK
-    # before commit, and restore enforcement even when the transaction raises.
+  defp validate_artifact_content_shape!(db) do
+    required_tables =
+      ~w(artifacts artifact_blobs artifact_content_requests artifact_content_migrations)
+
+    {:ok, table_rows} =
+      DB.query(
+        db,
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (?1, ?2, ?3, ?4) ORDER BY name",
+        required_tables
+      )
+
+    found_tables = List.flatten(table_rows)
+    missing_tables = required_tables -- found_tables
+
+    required_columns = %{
+      "artifacts" =>
+        ~w(contentSha256 contentSize contentRecoverySha256 legacyDeclaredSha256 unavailableReason),
+      "artifact_blobs" =>
+        ~w(digest size storageVersion status createdAt verifiedAt corruptAt corruptReason),
+      "artifact_content_requests" =>
+        ~w(principalKind principalId operation idempotencyKey requestHash artifactId createdAt),
+      "artifact_content_migrations" =>
+        ~w(migrationId artifactId sourceState outcome contentSha256 contentSize reason updatedAt cause principal)
+    }
+
+    missing_columns =
+      Enum.flat_map(required_columns, fn {table, required} ->
+        found =
+          case DB.query(db, "PRAGMA table_info(#{table})") do
+            {:ok, rows} -> Enum.map(rows, &Enum.at(&1, 1))
+            _ -> []
+          end
+
+        Enum.map(required -- found, &"#{table}.#{&1}")
+      end)
+
+    if missing_tables != [] or missing_columns != [] do
+      raise ShapeError, """
+      this Tightbeam database carries an incomplete #{@shape} shape.
+
+        found artifact-content tables: #{Enum.join(found_tables, ", ")}
+        missing artifact-content tables: #{Enum.join(missing_tables, ", ")}
+        missing artifacts columns: #{Enum.join(missing_columns, ", ")}
+
+      The #{@shape} stamp requires all R1 tables and columns. Nothing here will
+      infer or repair a partial target shape.
+      """
+    end
+
+    :ok
+  end
+
+  defp migrate_artifact_content_v1(db) do
     :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
 
     try do
-      case DB.transaction(db, &migrate_model_identity_v1_in_txn/1) do
+      case DB.transaction(db, &migrate_artifact_content_v1_in_txn/1) do
         {:ok, :ok} ->
           :ok
 
@@ -1092,107 +1019,100 @@ defmodule Tightbeam.Schema do
         {:error, error} ->
           raise ShapeError,
             message:
-              "migration #{@model_identity_shape} -> #{@shape} failed and was rolled back: #{Exception.message(error)}"
+              "migration #{@source_shape} -> #{@shape} failed and was rolled back: #{Exception.message(error)}"
       end
     after
       :ok = DB.execute(db, "PRAGMA foreign_keys = ON")
     end
+
+    validate_artifact_content_shape!(db)
   end
 
-  defp migrate_model_identity_v1_in_txn(%Txn{} = txn) do
-    # Read every commissioned population before any DDL. A missing table is an
-    # incompatible instance of the stamped predecessor and fails the transaction;
-    # the values are preservation checks, never inputs used to infer a shape.
-    [[decision_request_count]] = Txn.q(txn, "SELECT COUNT(*) FROM decision_requests")
-    [[wake_count]] = Txn.q(txn, "SELECT COUNT(*) FROM wakes")
-    [[message_count]] = Txn.q(txn, "SELECT COUNT(*) FROM messages")
+  defp migrate_artifact_content_v1_in_txn(%Txn{} = txn) do
+    existing_content_tables =
+      Txn.q(
+        txn,
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('artifact_blobs','artifact_content_requests','artifact_content_migrations') ORDER BY name"
+      )
 
-    :ok =
-      Txn.exec(txn, "ALTER TABLE decision_requests RENAME TO decision_requests_model_identity_v1")
+    if existing_content_tables != [] do
+      raise ShapeError,
+        message:
+          "migration #{@source_shape} -> #{@shape} found partial target tables: #{inspect(List.flatten(existing_content_tables))}"
+    end
+
+    [[artifact_count]] = Txn.q(txn, "SELECT COUNT(*) FROM artifacts")
+    migrated_at = System.system_time(:millisecond)
+
+    :ok = Txn.exec(txn, "ALTER TABLE artifacts RENAME TO artifacts_operator_decision_requests_v1")
 
     :ok =
       Txn.exec(
         txn,
         """
-        DROP INDEX decision_requests_owner;
-        DROP INDEX decision_requests_key;
-        DROP INDEX decision_requests_one_open;
-        DROP INDEX decision_requests_effort_generation;
-        #{@operator_decision_requests_ddl}
+        DROP INDEX artifacts_work_item;
+        DROP INDEX artifacts_created_by_session;
+        DROP INDEX artifacts_recorded_message;
+        CREATE TABLE artifacts_new (
+        #{Artifacts.table_definition()}
+        );
         """
       )
 
     Txn.q(
       txn,
       """
-      INSERT INTO decision_requests_new (
-        id, kind, raiserId, raiserSessionKey, ownerUserId, assignmentId,
-        expecterSessionKey, expecterUserId, lineageRung, effortGeneration,
-        deadlineWakeId, raisedAt, deadlineAt, statuteName, actionKey, question,
-        options, context, status, decision, rationale, ruledBy,
-        ruledViaSessionKey, ruledAt, rulingFactId, consumedAt, parkWakeId,
-        withdrawnBy, withdrawnReason, withdrawnAt
+      INSERT INTO artifacts_new (
+        artifactId, kind, title, description, createdBySession, workItemId,
+        parentSession, originPath, contentSha256, contentSize,
+        contentRecoverySha256, legacyDeclaredSha256, unavailableReason,
+        recordedMessageId, recordedTurnEvidence, state, home, createdAt, updatedAt
       )
       SELECT
-        id, kind, raiserId, raiserSessionKey, ownerUserId, assignmentId,
-        expecterSessionKey, expecterUserId, lineageRung, effortGeneration,
-        deadlineWakeId, raisedAt, deadlineAt, statuteName, actionKey, question,
-        options, context, status, decision, rationale, ruledBy,
-        NULL, ruledAt, rulingFactId, consumedAt, parkWakeId,
-        withdrawnBy, withdrawnReason, withdrawnAt
-      FROM decision_requests_model_identity_v1
+        artifactId, kind, title, description, createdBySession, workItemId,
+        parentSession, originPath, NULL, NULL, NULL, contentSha256,
+        'migration-pending', recordedMessageId, recordedTurnEvidence,
+        'legacy-unavailable', home, createdAt, updatedAt
+      FROM artifacts_operator_decision_requests_v1
       """
     )
 
-    if Txn.changes(txn) != decision_request_count do
+    if Txn.changes(txn) != artifact_count do
       raise ShapeError,
         message:
-          "migration #{@model_identity_shape} -> #{@shape} copied #{Txn.changes(txn)} of #{decision_request_count} decision requests"
+          "migration #{@source_shape} -> #{@shape} copied #{Txn.changes(txn)} of #{artifact_count} artifacts"
     end
 
-    [[^decision_request_count]] = Txn.q(txn, "SELECT COUNT(*) FROM decision_requests_new")
-    [[^wake_count]] = Txn.q(txn, "SELECT COUNT(*) FROM wakes")
-
-    :ok = Txn.exec(txn, @operator_messages_ddl)
+    :ok = Txn.exec(txn, ArtifactContent.ddl())
 
     Txn.q(
       txn,
       """
-      INSERT INTO messages_new (
-        seq, id, sessionKey, role, content, timestamp, sender, deviceId,
-        clientMessageId, replyToMessageId, replyToClientMessageId,
-        llmVisibleMessageId, attachments, attentionTier,
-        messageType, markerKind, markerFrom, markerTo
+      INSERT INTO artifact_content_migrations (
+        migrationId, artifactId, sourceState, outcome, contentSha256,
+        contentSize, reason, updatedAt, cause, principal
       )
       SELECT
-        seq, id, sessionKey, role, content, timestamp, sender, deviceId,
-        clientMessageId, replyToMessageId, replyToClientMessageId,
-        llmVisibleMessageId, attachments, attentionTier,
-        NULL, NULL, NULL, NULL
-      FROM messages
-      """
+        ?1, artifactId, state, 'pending', NULL, NULL, 'migration-pending',
+        ?2, 'shape-migration', 'process:tightbeam'
+      FROM artifacts_operator_decision_requests_v1
+      """,
+      [ArtifactContent.migration_id(), migrated_at]
     )
 
-    if Txn.changes(txn) != message_count do
+    if Txn.changes(txn) != artifact_count do
       raise ShapeError,
         message:
-          "migration #{@model_identity_shape} -> #{@shape} copied #{Txn.changes(txn)} of #{message_count} messages"
+          "migration #{@source_shape} -> #{@shape} censused #{Txn.changes(txn)} of #{artifact_count} artifacts"
     end
-
-    [[^message_count]] = Txn.q(txn, "SELECT COUNT(*) FROM messages_new")
 
     :ok =
       Txn.exec(
         txn,
         """
-        DROP TABLE decision_requests_model_identity_v1;
-        ALTER TABLE decision_requests_new RENAME TO decision_requests;
-        #{@operator_decision_requests_indexes_ddl}
-        DROP INDEX messages_session;
-        DROP INDEX messages_client_dedupe;
-        DROP TABLE messages;
-        ALTER TABLE messages_new RENAME TO messages;
-        #{@operator_messages_indexes_ddl}
+        DROP TABLE artifacts_operator_decision_requests_v1;
+        ALTER TABLE artifacts_new RENAME TO artifacts;
+        #{Artifacts.index_ddl()}
         """
       )
 
@@ -1203,18 +1123,18 @@ defmodule Tightbeam.Schema do
       rows ->
         raise ShapeError,
           message:
-            "migration #{@model_identity_shape} -> #{@shape} left invalid foreign keys: #{inspect(rows)}"
+            "migration #{@source_shape} -> #{@shape} left invalid foreign keys: #{inspect(rows)}"
     end
 
     Txn.q(
       txn,
       "UPDATE schema_stamp SET shape = ?1, stampedAt = ?2 WHERE shape = ?3",
-      [@shape, System.system_time(:millisecond), @model_identity_shape]
+      [@shape, migrated_at, @source_shape]
     )
 
     if Txn.changes(txn) != 1 do
       raise ShapeError,
-        message: "migration #{@model_identity_shape} -> #{@shape} lost its exact stamp transition"
+        message: "migration #{@source_shape} -> #{@shape} lost its exact stamp transition"
     end
 
     :ok
@@ -1228,9 +1148,9 @@ defmodule Tightbeam.Schema do
   # absence class again: "interrupted fresh bootstrap" and "genuine old
   # database" sharing one representation.
   #
-  # Stamping first cannot lose that way. Interrupted after the stamp, the next
-  # boot reads its own shape and carries on creating what is missing, which is
-  # exactly what `CREATE TABLE IF NOT EXISTS` is for.
+  # Stamping first cannot lose that way. Artifact content strengthens the next
+  # boot: a target stamp with only part of its R1 shape is a named refusal, not
+  # an inferred repair.
   defp unstamped(db) do
     case DB.query(db, "SELECT name FROM sqlite_master WHERE type='table' AND name='sessions'") do
       {:ok, []} ->

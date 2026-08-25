@@ -113,14 +113,26 @@ These facts are the state of the work. The state is computed from the facts; the
 status to set. Read the facts with `tightbeam attests <assignmentId>`. List your obligations
 with `tightbeam assignments --role <your-role>`.
 
-- Record what you produced OUTSIDE your workdir as an artifact:
+- Record a metadata pointer to work that is not a local file you can import:
 
     tightbeam artifact-record --kind report --title "nginx config on host-b" \
       --path "host-b:/etc/nginx/sites-enabled/app" --work-item <workItemId>
 
-Tightbeam sees the files you write in your own workdir. Work on another machine, in a
-service, or in a conversation is invisible until you point at it — an artifact row is how
-you declare it.
+This JSON-only form records provenance but does not claim that Tightbeam can
+return the bytes. A normal local-file record uses an idempotency key and imports
+the opened file into immutable content custody:
+
+    tightbeam artifact-record --kind report --title "test evidence" \
+      --path "reports/evidence.bin" --work-item <workItemId> --key <stableKey>
+
+After the row is released, retrieve verified bytes without replacing an existing file:
+
+    tightbeam artifact-content-fetch <artifactId> --output ./evidence.bin
+
+Retirement refuses while any recorded local source cannot be captured. It keeps
+the workdir and artifact states so you can restore the source and retry. Work on
+another machine, in a service, or in a conversation remains invisible until you
+record a pointer, but that pointer alone is not released content.
 
 ## Recover after losing context
 You can lose context to compaction or a restart. On waking, re-derive the state from the

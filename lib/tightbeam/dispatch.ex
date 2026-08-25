@@ -105,7 +105,12 @@ defmodule Tightbeam.Dispatch do
   defp bracket_precheck(_db, _call, _verb), do: :proceed
 
   defp dispatch_through_rail(db, handlers, call, verb, origin, principal, session_key) do
-    {decision, to_close, to_consume} = Rules.decide(db, call)
+    rules_call =
+      if verb == "artifact-content-fetch",
+        do: Map.put(call, :verb, "artifact-get"),
+        else: call
+
+    {decision, to_close, to_consume} = Rules.decide(db, rules_call)
     Enum.each(to_close, &close(db, &1))
 
     case decision do
@@ -230,7 +235,7 @@ defmodule Tightbeam.Dispatch do
   # whose result carries ONE page list. A verb returning two lists would have them
   # summed, and one returning none would report 0 — so a second member either
   # accepts that meaning of N or brings its own counter.
-  @result_elided ~w(transcript)
+  @result_elided ~w(transcript artifact-content-fetch)
 
   # The CALL is audited with its params — that IS the access trail — and the
   # RESULT is replaced by a count. Denials are NOT elided: an error map is useful
@@ -249,6 +254,18 @@ defmodule Tightbeam.Dispatch do
   # behavior change no spec here authorizes. Elision governs the audit row only.
   defp outcome_payload("onboard", _call, {:returned, result}) when is_map(result),
     do: Map.delete(result, :lease_id)
+
+  defp outcome_payload("artifact-content-fetch", call, {:returned, result})
+       when is_map(result) do
+    %{
+      elided: true,
+      artifact_id: call.params[:artifact_id],
+      digest: result[:digest],
+      size: result[:size],
+      outcome: if(result[:code], do: "refused", else: "verified"),
+      refusal_code: result[:code]
+    }
+  end
 
   defp outcome_payload(verb, call, outcome) do
     if verb in @result_elided do

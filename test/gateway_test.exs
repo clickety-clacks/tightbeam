@@ -850,7 +850,8 @@ defmodule Tightbeam.GatewayTest do
     assert_receive {:DOWN, ^monitor, :process, ^adapter, :normal}
   end
 
-  test "reap archives a local workspace with artifacts before adapter teardown", ctx do
+  test "retire refuses an uncapturable local artifact, then releases all bytes before cleanup",
+       ctx do
     ensure_global_registry()
 
     base_dir =
@@ -870,8 +871,17 @@ defmodule Tightbeam.GatewayTest do
     session = Org.get(ctx.db, session.session_key)
     workspace = Placement.workdir_path(%{base_dir: base_dir, db: ctx.db}, session)
     artifact_path = Path.join(workspace, "specs/banana.md")
+    second_path = Path.join(workspace, "reports/result.md")
     File.mkdir_p!(Path.dirname(artifact_path))
     File.write!(artifact_path, "banana")
+
+    cli_source = Path.expand("../cli/target/debug/tightbeam", __DIR__)
+    cli_target = Path.join([base_dir, "bin", "tightbeam"])
+    File.mkdir_p!(Path.dirname(cli_target))
+    File.cp!(cli_source, cli_target)
+    File.chmod!(cli_target, 0o755)
+    Application.put_env(:tightbeam, :artifact_content_quota_bytes, "1024")
+    Application.put_env(:tightbeam, :artifact_content_reserved_free_bytes, "0")
 
     {:ok, _} =
       DB.query(
@@ -909,18 +919,70 @@ defmodule Tightbeam.GatewayTest do
         }
       })
 
-    external =
+    second =
       Artifacts.record(ctx.db, %{
         principal: {:session, session.session_key},
         session_key: session.session_key,
         recorded_message_id: "msg_external_artifact",
         params: %{
           kind: "report",
-          title: "External report",
-          origin_path: "/outside/report.md",
+          title: "Result report",
+          origin_path: second_path,
           work_item_id: "wi_banana"
         }
       })
+
+    refused =
+      Gateway.handlers(%{db: ctx.db, base_dir: base_dir, wake_tick_ms: 1_000})["retire"].(%{
+        origin: "user:flynn",
+        session_key: session.session_key,
+        params: %{}
+      })
+
+    assert refused.code == "source_unavailable"
+    assert Org.get(ctx.db, session.session_key).state == "active"
+    assert File.exists?(workspace)
+    assert Artifacts.get(ctx.db, artifact.artifact_id).state == "in-workspace"
+    assert Artifacts.get(ctx.db, second.artifact_id).state == "in-workspace"
+
+    File.mkdir_p!(Path.dirname(second_path))
+    File.write!(second_path, "result")
+
+    recovery_digest = :crypto.hash(:sha256, "result") |> Base.encode16(case: :lower)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        UPDATE artifacts
+        SET state='corrupt-unavailable', contentRecoverySha256=?2,
+            unavailableReason='cas-missing'
+        WHERE artifactId=?1
+        """,
+        [second.artifact_id, recovery_digest]
+      )
+
+    corrupt_refusal =
+      Gateway.handlers(%{db: ctx.db, base_dir: base_dir, wake_tick_ms: 1_000})["retire"].(%{
+        origin: "user:flynn",
+        session_key: session.session_key,
+        params: %{}
+      })
+
+    assert corrupt_refusal.code == "content_corrupt"
+    assert Org.get(ctx.db, session.session_key).state == "active"
+    assert File.exists?(workspace)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        UPDATE artifacts
+        SET state='in-workspace', contentRecoverySha256=NULL, unavailableReason=NULL
+        WHERE artifactId=?1
+        """,
+        [second.artifact_id]
+      )
 
     result =
       Gateway.handlers(%{db: ctx.db, base_dir: base_dir, wake_tick_ms: 1_000})["retire"].(%{
@@ -932,15 +994,20 @@ defmodule Tightbeam.GatewayTest do
     assert result.retired_session_keys == [session.session_key]
     refute File.exists?(workspace)
 
-    [archive_dir] = Path.wildcard(Path.join(base_dir, "archive/artifact_writer-*"))
-    archived = Artifacts.get(ctx.db, artifact.artifact_id)
-    assert archived.state == "archived"
-    assert archived.home == Path.join(archive_dir, "specs/banana.md")
-    assert File.read!(archived.home) == "banana"
+    released = Artifacts.get(ctx.db, artifact.artifact_id)
+    assert released.state == "released"
+    assert released.home == nil
 
-    unchanged_external = Artifacts.get(ctx.db, external.artifact_id)
-    assert unchanged_external.state == "in-workspace"
-    assert unchanged_external.home == nil
+    assert File.read!(Tightbeam.ArtifactContent.cas_path(base_dir, released.content_sha256)) ==
+             "banana"
+
+    released_second = Artifacts.get(ctx.db, second.artifact_id)
+    assert released_second.state == "released"
+    assert released_second.home == nil
+
+    assert File.read!(
+             Tightbeam.ArtifactContent.cas_path(base_dir, released_second.content_sha256)
+           ) == "result"
   end
 
   test "retiring with a live adapter sibling leaves the adapter up and records residency", ctx do
@@ -1436,6 +1503,8 @@ defmodule Tightbeam.GatewayTest do
   end
 
   test "children installs the release Rust CLI, and refuses instead of falling back", ctx do
+    System.delete_env("RELEASE_ROOT")
+
     repo_dir =
       Path.join(
         System.tmp_dir!(),

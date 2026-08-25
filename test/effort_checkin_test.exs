@@ -1050,9 +1050,14 @@ defmodule Tightbeam.EffortCheckinTest do
     released = artifact!(ctx.db, "holder", item.id, "released.md")
 
     {:ok, _} =
-      DB.query(ctx.db, "UPDATE artifacts SET state='released' WHERE artifactId=?1", [
-        released.artifact_id
-      ])
+      DB.query(
+        ctx.db,
+        "UPDATE artifacts SET state='released', contentSha256=?2, contentSize=8 WHERE artifactId=?1",
+        [
+          released.artifact_id,
+          "d29eae1372c396247daf62745d10c3513eb46f9f232b4527e0f5298e5dca5cd0"
+        ]
+      )
 
     # Archived — archival moved these bytes into `home` itself, so originPath is
     # knowingly stale and stat-ing it would manufacture an absence we caused.

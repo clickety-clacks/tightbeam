@@ -54,7 +54,7 @@ defmodule Tightbeam.Wire.Router do
 
   Module.register_attribute(__MODULE__, :agent_verbs, persist: true)
 
-  @agent_verbs ~w(wake condition facts-read artifact-record artifact-get artifacts spawn retire critical inspect cancel tune approve-device deny-device revoke-device promote-user add-user config register-host host-env-set host-env-list host-env-unset host-toolchain-set update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests revoke-assignment assignments work-item-create work-item-get work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail rule effort-rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request transcript attend toplines topline harness-processes)
+  @agent_verbs ~w(wake condition facts-read artifact-record artifact-get artifact-content-fetch artifact-content-fetch-complete artifact-content-recover artifacts spawn retire critical inspect cancel tune approve-device deny-device revoke-device promote-user add-user config register-host host-env-set host-env-list host-env-unset host-toolchain-set update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests revoke-assignment assignments work-item-create work-item-get work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail rule effort-rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request transcript attend toplines topline harness-processes)
   @max_upload_bytes 32 * 1024 * 1024
   @multipart_opts Plug.Parsers.init(
                     parsers: [{:multipart, length: @max_upload_bytes + 1_000_000}],
@@ -147,7 +147,9 @@ defmodule Tightbeam.Wire.Router do
         params: atomize_params(verb, body["params"] || %{})
       }
 
-      dispatch_response(conn, call, 200, &%{"result" => &1})
+      if verb == "artifact-content-fetch",
+        do: artifact_fetch_response(conn, call),
+        else: dispatch_response(conn, call, 200, &%{"result" => &1})
     else
       {:error, status, code, message} -> error(conn, status, code, message)
     end
@@ -168,6 +170,87 @@ defmodule Tightbeam.Wire.Router do
       {:error, status, code, message} -> error(conn, status, code, message)
     end
   end
+
+  post "/agent/artifact-content-import" do
+    with {:ok, auth} <- cli_auth(conn),
+         {:ok, metadata, bytes, conn} <- read_artifact_import(conn),
+         verb when verb in ["artifact-record", "artifact-content-recover"] <- metadata["verb"],
+         {:ok, origin, principal} <- agent_identity(metadata, auth, conn),
+         {:ok, principal_kind, principal_id, session_key} <-
+           artifact_import_principal(verb, principal) do
+      upload_id = "upload_" <> (:crypto.strong_rand_bytes(16) |> Base.encode16(case: :lower))
+
+      import_root =
+        Path.join([
+          deps(conn).base_dir,
+          "artifact-content",
+          "import",
+          principal_kind,
+          Base.url_encode64(principal_id, padding: false),
+          upload_id
+        ])
+
+      import_path = Path.join(import_root, "content")
+      File.mkdir_p!(import_root)
+
+      try do
+        with {:ok, io} <- File.open(import_path, [:write, :binary, :exclusive]) do
+          try do
+            :ok = File.chmod(import_path, 0o600)
+            :ok = IO.binwrite(io, bytes)
+            :ok = :file.sync(io)
+          after
+            File.close(io)
+          end
+        end
+
+        params =
+          verb
+          |> atomize_params(metadata["params"] || %{})
+          |> Map.merge(%{
+            import_root: import_root,
+            import_relative_path: "content",
+            declared_length: byte_size(bytes)
+          })
+
+        call = %{
+          verb: verb,
+          origin: origin,
+          principal: principal,
+          transport_session_key: authenticated_session_key(auth),
+          session_key: session_key,
+          target_role: nil,
+          role_fallback: false,
+          params: params
+        }
+
+        dispatch_response(conn, call, 200, &%{"result" => &1})
+      after
+        File.rm_rf!(import_root)
+      end
+    else
+      nil -> error(conn, 400, "invalid", "artifact import metadata must name record or recovery")
+      {:error, status, code, message} -> error(conn, status, code, message)
+      _ -> error(conn, 400, "invalid", "artifact import metadata must name record or recovery")
+    end
+  end
+
+  defp artifact_import_principal("artifact-record", {:session, session_key}),
+    do: {:ok, "session", session_key, session_key}
+
+  defp artifact_import_principal("artifact-record", _principal),
+    do: {:error, 403, "session_required", "artifact record import requires a session principal"}
+
+  defp artifact_import_principal("artifact-content-recover", {:session, session_key}),
+    do: {:ok, "session", session_key, nil}
+
+  defp artifact_import_principal("artifact-content-recover", {:user, user_id}),
+    do: {:ok, "user", user_id, nil}
+
+  defp artifact_import_principal("artifact-content-recover", _principal),
+    do:
+      {:error, 403, "principal_required",
+       "artifact recovery requires a session or user principal"}
 
   get "/api/streams" do
     with {:ok, device} <- device_auth(conn) do
@@ -887,6 +970,51 @@ defmodule Tightbeam.Wire.Router do
     end
   end
 
+  defp artifact_fetch_response(conn, call) do
+    case Dispatch.dispatch(db(conn), handlers(conn), call) do
+      {:ok, result} ->
+        descriptor = result.descriptor
+
+        try do
+          case IO.binread(descriptor, :eof) do
+            bytes when is_binary(bytes) ->
+              conn
+              |> Plug.Conn.put_resp_content_type("application/octet-stream")
+              |> Plug.Conn.put_resp_header("content-length", Integer.to_string(result.size))
+              |> Plug.Conn.put_resp_header(
+                "x-tightbeam-content-size",
+                Integer.to_string(result.size)
+              )
+              |> Plug.Conn.put_resp_header("x-tightbeam-content-sha256", result.digest)
+              |> Plug.Conn.put_resp_header("x-tightbeam-artifact-id", result.artifact_id)
+              |> Plug.Conn.put_resp_header("x-tightbeam-fetch-id", result.fetch_id)
+              |> Plug.Conn.send_resp(200, bytes)
+
+            {:error, _reason} ->
+              Plug.Conn.send_resp(conn, 503, "")
+          end
+        after
+          File.close(descriptor)
+        end
+
+      {:error, %{code: code}} when code in ["content_corrupt", "content_unavailable"] ->
+        conn
+        |> Plug.Conn.put_resp_header("x-tightbeam-error-code", code)
+        |> Plug.Conn.send_resp(410, "")
+
+      {:error, %{code: "corruption_transition_failed"}} ->
+        conn
+        |> Plug.Conn.put_resp_header("x-tightbeam-error-code", "corruption_transition_failed")
+        |> Plug.Conn.send_resp(503, "")
+
+      {:error, result} ->
+        dispatch_error(conn, call, error_status(result[:code]), result)
+
+      {:decision_pending, decision_request_id} ->
+        decision_pending(conn, decision_request_id)
+    end
+  end
+
   # THE THIRD OUTCOME. `Dispatch.dispatch/3` has always declared three returns and
   # this seam served two, so an escalating verb reached `case` with no clause:
   # CaseClauseError, empty body, and a CLI dying on EOF. The effect had already
@@ -966,6 +1094,10 @@ defmodule Tightbeam.Wire.Router do
        do: 403
 
   defp error_status("not_found"), do: 404
+  defp error_status("content_not_released"), do: 409
+  defp error_status("content_unavailable"), do: 410
+  defp error_status("content_corrupt"), do: 410
+  defp error_status("corruption_transition_failed"), do: 503
   defp error_status("unknown_assignment"), do: 404
   defp error_status("unknown_work_item"), do: 404
   defp error_status("server_error"), do: 500
@@ -984,6 +1116,46 @@ defmodule Tightbeam.Wire.Router do
 
       _ ->
         {:error, 400, "invalid_message", nil}
+    end
+  end
+
+  defp read_artifact_import(conn) do
+    case read_import_body(conn, [], 0) do
+      {:ok, payload, conn} when byte_size(payload) >= 4 ->
+        <<metadata_size::unsigned-big-integer-size(32), rest::binary>> = payload
+
+        if metadata_size <= byte_size(rest) do
+          <<encoded::binary-size(metadata_size), bytes::binary>> = rest
+
+          case JSON.decode(encoded) do
+            {:ok, metadata} when is_map(metadata) -> {:ok, metadata, bytes, conn}
+            _ -> {:error, 400, "invalid_json", "artifact import metadata is invalid"}
+          end
+        else
+          {:error, 400, "invalid", "artifact import metadata is truncated"}
+        end
+
+      {:ok, _payload, _conn} ->
+        {:error, 400, "invalid", "artifact import body is truncated"}
+
+      error ->
+        error
+    end
+  end
+
+  defp read_import_body(conn, chunks, size) do
+    case Plug.Conn.read_body(conn, length: @max_upload_bytes + 1_000_000, read_length: 1_000_000) do
+      {:ok, bytes, conn} ->
+        {:ok, chunks |> Enum.reverse([bytes]) |> IO.iodata_to_binary(), conn}
+
+      {:more, bytes, conn} when size + byte_size(bytes) <= @max_upload_bytes + 1_000_000 ->
+        read_import_body(conn, [bytes | chunks], size + byte_size(bytes))
+
+      {:more, _bytes, _conn} ->
+        {:error, 413, "content_too_large", "artifact import exceeds 32 MiB"}
+
+      {:error, reason} ->
+        {:error, 400, "invalid", inspect(reason)}
     end
   end
 
@@ -1024,7 +1196,9 @@ defmodule Tightbeam.Wire.Router do
     # window and the ledger. A caller-filled edge would be forgeable, which is
     # precisely why no wire carrier can be proof (artifact-carrier-proposal-v1
     # §1.2) — so the words are refused entry rather than trusted and checked.
-    "artifact-record" => ~w(recorded_message_id recorded_turn_evidence)a,
+    "artifact-record" =>
+      ~w(recorded_message_id recorded_turn_evidence import_root import_relative_path declared_length)a,
+    "artifact-content-recover" => ~w(import_root import_relative_path declared_length)a,
     # `attend` carries the agent's TIER election and nothing else. The turn it
     # applies to is the caller's running turn, derived by the substrate, and the
     # raw column value is never accepted — so a caller cannot elect on someone
