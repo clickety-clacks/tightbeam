@@ -116,7 +116,7 @@ defmodule Tightbeam.Acp.Conn do
         {:noreply, %{state | next_id: id + 1, pending: Map.put(state.pending, id, entry)}}
       else
         notify_not_dispatched(opts, :closed)
-        {:reply, {:error, :closed}, state}
+        {:reply, {:error, :closed}, %{state | closed: true}}
       end
     end
   end
@@ -247,7 +247,19 @@ defmodule Tightbeam.Acp.Conn do
     end
   end
 
-  defp send_json(port, map), do: Port.command(port, JSON.encode!(map) <> "\n")
+  defp send_json(port, map) do
+    payload = JSON.encode!(map) <> "\n"
+
+    try do
+      Port.command(port, payload)
+    rescue
+      # The OS process can exit after the owner reads `closed: false` but before
+      # this write. `Port.command/2` raises for that observable closed-port
+      # event; it does not return false. Keep the request at the pre-dispatch
+      # seam so callers never mistake a failed write for an ACP dispatch.
+      ArgumentError -> false
+    end
+  end
 
   defp split_lines(buf) do
     parts = String.split(buf, "\n")
