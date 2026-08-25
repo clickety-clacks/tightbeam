@@ -606,6 +606,60 @@ defmodule Tightbeam.Wire.RouterTest do
     assert JSON.decode!(forged.resp_body)["error"]["code"] == "invalid_terminal_request"
   end
 
+  test "concurrent same-holder terminal surrenders replay the committed winner", ctx do
+    holder = create_session(ctx.db, "terminal-race-holder", ctx.device.user_id)
+    handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir, wake_tick_ms: 1_000})
+
+    {:ok, assignment} =
+      Dispatch.dispatch(ctx.db, handlers, %{
+        verb: "assign",
+        origin: "user:#{ctx.device.user_id}",
+        principal: {:user, ctx.device.user_id},
+        session_key: holder.session_key,
+        target_role: nil,
+        role_fallback: false,
+        params: %{subject: "terminal race", idempotency_key: nil, work_item_id: nil}
+      })
+
+    parent = self()
+    real_attest = Map.fetch!(handlers, "attest")
+
+    barrier_attest = fn call ->
+      send(parent, {:terminal_surrender_ready, self()})
+
+      receive do
+        :terminal_surrender_go -> real_attest.(call)
+      end
+    end
+
+    handlers = Map.put(handlers, "attest", barrier_attest)
+
+    call = %{
+      verb: "attest",
+      origin: "agent:terminal",
+      principal: {:session, holder.session_key},
+      session_key: nil,
+      params: %{assignment_id: assignment.id, kind: "surrender", note: "version mismatch"},
+      terminal_surrender: true
+    }
+
+    tasks = for _ <- 1..2, do: Task.async(fn -> Dispatch.dispatch(ctx.db, handlers, call) end)
+
+    pids =
+      for _ <- 1..2 do
+        receive do
+          {:terminal_surrender_ready, pid} -> pid
+        end
+      end
+
+    Enum.each(pids, &send(&1, :terminal_surrender_go))
+    results = Task.await_many(tasks, 5_000)
+
+    assert Enum.all?(results, &match?({:ok, _}, &1))
+    assert Enum.count(results, fn {:ok, result} -> result[:replayed] == true end) == 1
+    assert Assignments.attest_count(ctx.db, assignment.id) == 1
+  end
+
   test "kungfu scaffold crosses the closed CLI verb router with its attributed name", ctx do
     response =
       dispatch_cli(ctx, "tbc_test", %{
