@@ -444,28 +444,42 @@ defmodule Tightbeam.Acp.Adapter do
   # it binds DURING boot is now observable. A pre-initialize probe raced the bind: OpenCode's
   # :4096 HTTP server comes up ~0.3–1.1s after spawn, AFTER `capture_identity`. Fail-closed: a
   # listener (or an inconclusive probe) refuses the launch. Applies automatically to the :shim
-  # harness class (`Harness.requires_zero_listeners?/1`); a launch with no recorded process group
-  # cannot be probed and is skipped here.
+  # harness class (`Harness.requires_zero_listeners?/1`) on production launches that
+  # recorded a process identity directory; a launch with identity dir but no recorded
+  # launch id cannot be probed and is refused for :shim harnesses.
   #
   # RESIDUAL (honest, unclosable by this mechanism): even a settle-window probe cannot catch a
   # listener bound strictly AFTER the last sample. That gap is input for the go-live threat-model
   # adjudication, not something the assert can eliminate.
   defp listener_guard(opts, module, harness, state, stderr_path, offset) do
-    with true <- Harness.requires_zero_listeners?(module),
-         {:ok, launch_id} <- Keyword.fetch(opts, :harness_process_launch_id) do
-      db = Keyword.get(opts, :db, Tightbeam.DB)
+    cond do
+      not Harness.requires_zero_listeners?(module) ->
+        :ok
 
-      case Tightbeam.HarnessProcess.assert_zero_listeners(db, launch_id) do
-        :ok ->
-          :ok
+      not Keyword.has_key?(opts, :process_identity_dir) ->
+        :ok
 
-        {:error, reason} ->
-          {:stop,
-           adapter_failure_reason({:listener_present, harness, reason}, stderr_path, offset),
-           state}
-      end
-    else
-      _ -> :ok
+      match?({:ok, _launch_id}, Keyword.fetch(opts, :harness_process_launch_id)) ->
+        launch_id = Keyword.fetch!(opts, :harness_process_launch_id)
+        db = Keyword.get(opts, :db, Tightbeam.DB)
+
+        case Tightbeam.HarnessProcess.assert_zero_listeners(db, launch_id) do
+          :ok ->
+            :ok
+
+          {:error, reason} ->
+            {:stop,
+             adapter_failure_reason({:listener_present, harness, reason}, stderr_path, offset),
+             state}
+        end
+
+      true ->
+        {:stop,
+         adapter_failure_reason(
+           {:listener_present, harness, :launch_identity_missing},
+           stderr_path,
+           offset
+         ), state}
     end
   end
 

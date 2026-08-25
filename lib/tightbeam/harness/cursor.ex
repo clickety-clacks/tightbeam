@@ -1,6 +1,13 @@
 defmodule Tightbeam.Harness.Cursor do
-  @moduledoc false
+  @moduledoc """
+  Cursor harness — gateway-local shim ACP adapter only.
+
+  Remote zero-listener assertion is unimplemented (`HarnessProcess.assert_zero_listeners/3`
+  refuses ssh rows), so launch planning refuses non-local targets until that probe exists.
+  """
   @behaviour Tightbeam.Harness
+
+  require Logger
 
   alias Tightbeam.Harness.{CursorRails, Support}
   alias Tightbeam.Model
@@ -11,6 +18,26 @@ defmodule Tightbeam.Harness.Cursor do
   @credential_file "cli-config.json"
   @api_key_file "api-key"
   @rails_file "hooks.json"
+
+  # The catalog must not advertise what the adapter will refuse. `cursor-agent
+  # --list-models` publishes ~200 refs; ACP `session/new` exposes a closed enum
+  # of ~35 decorated wire values whose option `name` is the public ref. Re-probe
+  # live against cursor-agent #{@adapter_version} before changing this pin.
+  @adapter_selectable_models ~w(auto grok-4.6 composer-2.5 claude-opus-5 claude-opus-4-8
+                                gpt-5.6-sol gpt-5.5 claude-fable-5 grok-4.5 gemini-3.7-flash
+                                gpt-5.6-terra claude-sonnet-5 claude-sonnet-4-6 gpt-5.3-codex
+                                claude-opus-4-7 gpt-5.4 claude-opus-4-6 claude-opus-4-5 gpt-5.2
+                                gpt-5.6-luna gemini-3.6-flash gemini-3.1-pro gpt-5.4-mini
+                                gpt-5.4-nano claude-haiku-4-5 claude-sonnet-4-5 gpt-5.1
+                                gemini-3-flash gemini-3.5-flash claude-sonnet-4 gpt-5-mini
+                                gemini-2.5-flash kimi-k3 kimi-k2.7-code glm-5.2)
+
+  @doc """
+  Model values this adapter version accepts at `session/set_config_option`.
+
+  Narrower than `cursor-agent --list-models` — see the note above the attribute.
+  """
+  def adapter_selectable_models, do: @adapter_selectable_models
 
   @impl true
   def id, do: :cursor
@@ -88,30 +115,7 @@ defmodule Tightbeam.Harness.Cursor do
             credential_refusal()
         end
       else
-        remote_env = [
-          "AGENT_CLI_CREDENTIAL_STORE=memory",
-          "CURSOR_CONFIG_DIR=#{Support.shell_quote(home)}"
-          | Keyword.fetch!(opts, :remote_env)
-        ]
-
-        case Keyword.fetch(opts, :cursor_api_key) do
-          {:ok, key} ->
-            {:ok,
-             [
-               readiness_rendezvous: true,
-               cmd:
-                 ["ssh" | Support.ssh_opts()] ++
-                   ["-o", "SendEnv=CURSOR_API_KEY", target.host_config.ssh, "exec", "env"] ++
-                   remote_env ++ [adapter_binary(target)],
-               env: [
-                 {"CURSOR_API_KEY", key},
-                 {"TIGHTBEAM_LINEAGE", Keyword.fetch!(opts, :lineage)}
-               ]
-             ]}
-
-          :error ->
-            credential_refusal()
-        end
+        local_only_refusal()
       end
     end
   end
@@ -241,6 +245,7 @@ defmodule Tightbeam.Harness.Cursor do
     with {:ok, %{launcher: launcher}} <- verify_installed_cli(target),
          {output, 0} <- sh.(catalog_argv(host_config, launcher, state.base_dir)),
          {:ok, entries} <- parse_catalog(output),
+         entries <- build_selectable_catalog(entries, selectable_models(state)),
          true <- entries != [] do
       {:ok, entries}
     else
@@ -431,12 +436,29 @@ defmodule Tightbeam.Harness.Cursor do
 
     vectors = Support.conformance_vectors(__MODULE__, profile)
 
+    local_only_error =
+      {:error,
+       %{
+         code: "DIV-CURSOR-LOCAL-ONLY",
+         message:
+           "Cursor shim harness is gateway-local only until remote zero-listener probe exists"
+       }}
+
     launch_vectors =
       Enum.map(vectors["prepare_launch"], fn vector ->
-        if String.ends_with?(vector.case, "_subscription") do
-          %{vector | support: {:unsupported, "DIV-CURSOR-API-KEY-ONLY"}}
-        else
-          vector
+        cond do
+          String.ends_with?(vector.case, "_subscription") ->
+            %{vector | support: {:unsupported, "DIV-CURSOR-API-KEY-ONLY"}}
+
+          String.starts_with?(vector.case, "remote_") ->
+            %{
+              vector
+              | support: {:unsupported, "DIV-CURSOR-LOCAL-ONLY"},
+                expected: local_only_error
+            }
+
+          true ->
+            vector
         end
       end)
 
@@ -495,8 +517,55 @@ defmodule Tightbeam.Harness.Cursor do
     end
   end
 
+  defp selectable_models(state),
+    do: Map.get(state.options, :cursor_selectable_models, @adapter_selectable_models)
+
+  defp build_selectable_catalog(entries, :all), do: entries
+
+  defp build_selectable_catalog(entries, selectable) do
+    by_family = Map.new(entries, &{&1.family, &1})
+    dropped_count = entries |> Enum.reject(&(vendor_ref(&1) in selectable)) |> length()
+
+    if dropped_count > 0 do
+      Logger.info(
+        "cursor catalog: #{dropped_count} model(s) from --list-models are not selectable by " <>
+          "cursor-agent #{@adapter_version} ACP and were withheld — re-probe " <>
+          "@adapter_selectable_models in harness/cursor.ex if this looks wrong"
+      )
+    end
+
+    Enum.map(selectable, fn ref ->
+      Map.get(by_family, ref, synthetic_catalog_entry(ref))
+    end)
+  end
+
+  defp synthetic_catalog_entry(ref) do
+    %{
+      family: ref,
+      context: nil,
+      display_name: ref,
+      name: ref,
+      efforts: [],
+      max_input_tokens: nil,
+      capabilities: %{},
+      provider: credential_provider()
+    }
+  end
+
+  defp vendor_ref(entry),
+    do: Model.to_ref(Model.new(entry.family, context: entry.context))
+
   defp credential_refusal do
     {:error, %{code: "DIV-CURSOR-API-KEY-ONLY", message: "Cursor requires a banked API key"}}
+  end
+
+  defp local_only_refusal do
+    {:error,
+     %{
+       code: "DIV-CURSOR-LOCAL-ONLY",
+       message:
+         "Cursor shim harness is gateway-local only until remote zero-listener probe exists"
+     }}
   end
 
   defp integrity_refusal do

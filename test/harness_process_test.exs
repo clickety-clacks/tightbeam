@@ -227,7 +227,12 @@ defmodule Tightbeam.HarnessProcessTest do
       # A remote row makes assert_zero_listeners return {:error, :remote_...} deterministically.
       :ok = insert_launch!(ctx.db, "l-guard", "vector@remote", 4247)
       state = %Tightbeam.Acp.Adapter{harness: :shimstub, cwd: "/tmp"}
-      opts = [harness_process_launch_id: "l-guard", db: ctx.db]
+
+      opts = [
+        harness_process_launch_id: "l-guard",
+        db: ctx.db,
+        process_identity_dir: ctx.test_dir
+      ]
 
       assert {:stop, {:listener_present, :shimstub, :remote_listener_probe_unimplemented}, ^state} =
                Tightbeam.Acp.Adapter.listener_guard_for_test(
@@ -248,6 +253,20 @@ defmodule Tightbeam.HarnessProcessTest do
                  [db: ctx.db],
                  Tightbeam.Harness.Claude,
                  :claude,
+                 state,
+                 "/no/such/stderr",
+                 0
+               )
+    end
+
+    test "the adapter REFUSES (stops) when a :shim harness has no launch identity", ctx do
+      state = %Tightbeam.Acp.Adapter{harness: :shimstub, cwd: "/tmp"}
+
+      assert {:stop, {:listener_present, :shimstub, :launch_identity_missing}, ^state} =
+               Tightbeam.Acp.Adapter.listener_guard_for_test(
+                 [db: ctx.db, process_identity_dir: ctx.test_dir],
+                 __MODULE__.ShimStub,
+                 :shimstub,
                  state,
                  "/no/such/stderr",
                  0
