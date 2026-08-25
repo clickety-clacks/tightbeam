@@ -698,33 +698,27 @@ fn parse_local_openai_models_body(body: &str) -> Result<(), String> {
     let value: serde_json::Value = serde_json::from_str(body).map_err(|_| {
         "the local-openai endpoint returned a /models response that is not valid JSON".to_owned()
     })?;
-    if local_openai_model_ids(&value)
-        .into_iter()
-        .any(|id| !id.is_empty())
-    {
-        Ok(())
-    } else {
+    if local_openai_model_ids(&value).is_empty() {
         Err(
             "the local-openai endpoint returned a /models response with no usable model id"
                 .to_owned(),
         )
+    } else {
+        Ok(())
     }
 }
 
 fn local_openai_model_ids(value: &serde_json::Value) -> Vec<String> {
-    let Some(items) = value
-        .get("data")
-        .or_else(|| value.get("models"))
-        .and_then(serde_json::Value::as_array)
-    else {
+    let Some(items) = value.get("data").and_then(serde_json::Value::as_array) else {
         return Vec::new();
     };
     items
         .iter()
         .filter_map(|item| {
             item.get("id")
-                .or_else(|| item.get("name"))
                 .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
                 .map(str::to_owned)
         })
         .collect()
@@ -2502,6 +2496,27 @@ mod tests {
                 "the local-openai endpoint returned a /models response that is not valid JSON"
                     .to_owned()
             )
+        );
+    }
+
+    #[test]
+    fn local_openai_models_body_rejects_fallback_shapes_and_whitespace_ids() {
+        let no_id = Err(
+            "the local-openai endpoint returned a /models response with no usable model id"
+                .to_owned(),
+        );
+
+        assert_eq!(
+            parse_local_openai_models_body(r#"{"models":[{"id":"spark-qwen"}]}"#),
+            no_id
+        );
+        assert_eq!(
+            parse_local_openai_models_body(r#"{"data":[{"name":"spark-qwen"}]}"#),
+            no_id
+        );
+        assert_eq!(
+            parse_local_openai_models_body(r#"{"data":[{"id":"   "}]}"#),
+            no_id
         );
     }
 
