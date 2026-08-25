@@ -20,6 +20,7 @@ defmodule Tightbeam.ConditionFacts do
     quota-recovered escalation-ruled user-alerted user-alert-cleared credential-present
     harness-auth-dead harness-auth-restored
     harness-rate-limit-dead harness-rate-limit-restored
+    cli-incompatible cli-compatible
   )
   @agent_only_kinds ~w(work-blocked work-unblocked)
 
@@ -27,7 +28,8 @@ defmodule Tightbeam.ConditionFacts do
     "work-blocked" => "work-unblocked",
     "user-alerted" => "user-alert-cleared",
     "harness-auth-dead" => "harness-auth-restored",
-    "harness-rate-limit-dead" => "harness-rate-limit-restored"
+    "harness-rate-limit-dead" => "harness-rate-limit-restored",
+    "cli-incompatible" => "cli-compatible"
   }
 
   @harness_health_kinds %{
@@ -198,6 +200,50 @@ defmodule Tightbeam.ConditionFacts do
       )
 
     match?([[^assert_kind]], rows)
+  end
+
+  @doc "Record one authenticated CLI-version observation without fabricating an agent judgment."
+  @spec observe_cli_compatibility(
+          DB.server(),
+          String.t(),
+          :compatible | :incompatible,
+          String.t(),
+          String.t(),
+          String.t()
+        ) ::
+          :recorded | :cleared | :unchanged | {:error, term()}
+  def observe_cli_compatibility(db, session_key, state, offered, required, path)
+      when state in [:compatible, :incompatible] and is_binary(session_key) and is_binary(offered) and
+             is_binary(required) and is_binary(path) do
+    kind = if state == :compatible, do: "cli-compatible", else: "cli-incompatible"
+
+    case DB.transaction(db, fn txn ->
+           incompatible? = standing_in_txn?(txn, "cli-incompatible", session_key)
+
+           if (kind == "cli-incompatible" and incompatible?) or
+                (kind == "cli-compatible" and not incompatible?) do
+             :unchanged
+           else
+             fact =
+               file_in_txn(txn, %{
+                 kind: kind,
+                 scope: session_key,
+                 origin: "process:tightbeam"
+               })
+
+             EventLog.lifecycle_in_txn(
+               txn,
+               "cli_compatibility_observed",
+               to_string(fact.fact_id),
+               "session=#{session_key} offered=#{offered} required=#{required} path=#{path}"
+             )
+
+             if kind == "cli-incompatible", do: :recorded, else: :cleared
+           end
+         end) do
+      {:ok, result} -> result
+      {:error, reason} -> {:error, reason}
+    end
   end
 
   @doc "The literal condition scope for one shared harness process."
