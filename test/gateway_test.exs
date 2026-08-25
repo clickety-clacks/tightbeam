@@ -9027,6 +9027,13 @@ defmodule Tightbeam.GatewayTest do
                     %Model{family: "gpt-5.6-sol", effort: "medium"}, ^cwd, _mcp, guidance}
 
     assert guidance =~ "Codex developer message"
+
+    engineering_table =
+      File.read!(
+        Application.app_dir(:tightbeam, "priv/kungfu/agentic-engineering/preferred-models.md")
+      )
+
+    assert length(:binary.matches(guidance, engineering_table)) == 1
     assert Process.alive?(runtime_pid)
     assert Org.current_pointer(ctx.db, session.session_key).harness_session_id == "thread-stable"
     assert Org.get(ctx.db, session.session_key).identity_revision == next
