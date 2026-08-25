@@ -12,6 +12,7 @@ defmodule Tightbeam.Schema do
     Tightbeam.CausalEvents,
     Tightbeam.Devices,
     Tightbeam.Idempotency,
+    Tightbeam.Activations,
     Tightbeam.ConditionFacts,
     Tightbeam.SubagentMarkers,
     Tightbeam.Escalation,
