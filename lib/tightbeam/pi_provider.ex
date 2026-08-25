@@ -9,7 +9,6 @@ defmodule Tightbeam.PiProvider do
   @callback fetch_catalog(state :: map()) :: {:ok, [map()]} | {:error, term()}
   @callback credential_live?(target :: map(), home :: String.t(), opts :: keyword()) ::
               credential_liveness()
-  @callback hollow_check(bytes :: binary()) :: nil | String.t()
 
   @providers [
     Tightbeam.PiProvider.OpenCodeGo

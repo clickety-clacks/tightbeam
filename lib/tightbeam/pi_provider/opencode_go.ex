@@ -59,30 +59,6 @@ defmodule Tightbeam.PiProvider.OpenCodeGo do
     end
   end
 
-  @impl true
-  def hollow_check(bytes) when is_binary(bytes) do
-    case JSON.decode(bytes) do
-      {:ok, %{"opencode-go" => %{"type" => "api_key", "key" => key}}}
-      when is_binary(key) ->
-        if String.trim(key) == "", do: "opencode-go.key is empty", else: nil
-
-      {:ok, %{"opencode-go" => %{"type" => "api_key"}}} ->
-        "opencode-go.key is missing or is not text"
-
-      {:ok, %{"opencode-go" => %{"type" => type}}} ->
-        "opencode-go.type is #{inspect(type)}; Pi requires api_key"
-
-      {:ok, %{"opencode-go" => _other}} ->
-        "opencode-go is present but is not a Pi API-key record"
-
-      {:ok, _other} ->
-        "the Pi auth.json has no opencode-go API-key record"
-
-      {:error, _reason} ->
-        "the Pi auth.json is not valid JSON"
-    end
-  end
-
   defp liveness_script do
     """
     const fs = require("node:fs");
