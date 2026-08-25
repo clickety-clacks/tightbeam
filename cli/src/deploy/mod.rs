@@ -10,7 +10,10 @@ pub mod status;
 use std::path::Path;
 
 use fs::{DeploymentFs, DeploymentLock, FsError};
-use model::{ActivationIntent, DeployAction, ExpectedActive, Pointer, Recovery, RecoveryClass};
+use model::{
+    ActivationAuthority, ActivationIntent, DeployAction, ExpectedActive, HostIdentity, Pointer,
+    Recovery, RecoveryClass, ServiceSetDigest, TransactionId,
+};
 
 #[derive(Debug)]
 pub struct DeployManager {
@@ -88,13 +91,15 @@ impl DeployManager {
             serde_json::from_slice(&records.remove(0)).map_err(|error| {
                 FsError::InvalidPointer(format!("invalid activation intent: {error}"))
             })?;
-        let transaction_id = value
-            .get("transactionId")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| {
-                FsError::InvalidPointer("activation intent has no transactionId".to_owned())
-            })?
-            .to_owned();
+        let transaction_id = TransactionId::new(
+            value
+                .get("transactionId")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    FsError::InvalidPointer("activation intent has no transactionId".to_owned())
+                })?,
+        )
+        .map_err(FsError::InvalidPointer)?;
         let action = match value.get("action").and_then(serde_json::Value::as_str) {
             Some("activation") => DeployAction::Activation,
             Some("first-cutover") => DeployAction::FirstCutover,
@@ -123,12 +128,50 @@ impl DeployManager {
             .get("prior")
             .and_then(|value| (!value.is_null()).then_some(value));
         let prior = prior.map(|value| parse_pointer(Some(value))).transpose()?;
+        let authority = ActivationAuthority {
+            host: HostIdentity::parse(
+                value
+                    .get("hostIdentity")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        FsError::InvalidPointer("activation intent has no hostIdentity".to_owned())
+                    })?,
+            )
+            .map_err(FsError::InvalidPointer)?,
+            deployment_root: model::DeploymentRootIdentity::from_digest(
+                model::Digest::parse(
+                    value
+                        .get("deploymentRoot")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| {
+                            FsError::InvalidPointer(
+                                "activation intent has no deploymentRoot".to_owned(),
+                            )
+                        })?,
+                )
+                .map_err(FsError::InvalidPointer)?,
+            ),
+            service_set: ServiceSetDigest::from_digest(
+                model::Digest::parse(
+                    value
+                        .get("serviceSetDigest")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| {
+                            FsError::InvalidPointer(
+                                "activation intent has no serviceSetDigest".to_owned(),
+                            )
+                        })?,
+                )
+                .map_err(FsError::InvalidPointer)?,
+            ),
+        };
         Ok(Some(ActivationIntent {
             transaction_id,
             action,
             expected_active,
             target,
             prior,
+            authority,
         }))
     }
 
@@ -137,12 +180,16 @@ impl DeployManager {
     /// never falls back to copying or deleting a pointer.
     pub fn replace_active(
         &self,
+        lock: &DeploymentLock,
         expected: &ExpectedActive,
         target: &Pointer,
     ) -> Result<(), FsError> {
+        lock.belongs_to(&self.fs)?;
         let observed = self.fs.read_active()?;
         let matches = match (expected, observed.as_ref()) {
-            (ExpectedActive::Virgin { .. }, None) => true,
+            (ExpectedActive::Virgin { deployment_root }, None) => {
+                deployment_root == &self.fs.root_identity_digest()
+            }
             (
                 ExpectedActive::Generation {
                     generation,

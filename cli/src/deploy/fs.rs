@@ -4,7 +4,7 @@
 //! path components. The public manager is the only caller that should compose
 //! these primitives into a deployment transition.
 
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -13,7 +13,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::model::{Digest, GenerationId, Pointer};
+use super::model::{DeploymentRootIdentity, Digest, GenerationId, Pointer};
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -135,6 +135,58 @@ fn open_dir_at(parent: RawFd, component: &str) -> Result<OwnedFd, FsError> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
+fn open_optional_dir_at(parent: RawFd, component: &str) -> Result<Option<OwnedFd>, FsError> {
+    match open_dir_at(parent, component) {
+        Ok(directory) => Ok(Some(directory)),
+        Err(FsError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn read_dir_names(fd: RawFd, path: &Path) -> Result<Vec<String>, FsError> {
+    let duplicate = unsafe { libc::dup(fd) };
+    if duplicate < 0 {
+        return Err(io(
+            "duplicate directory descriptor",
+            path,
+            std::io::Error::last_os_error(),
+        ));
+    }
+    let directory = unsafe { libc::fdopendir(duplicate) };
+    if directory.is_null() {
+        let error = std::io::Error::last_os_error();
+        unsafe { libc::close(duplicate) };
+        return Err(io("open directory stream", path, error));
+    }
+    let mut names = Vec::new();
+    loop {
+        let entry = unsafe { libc::readdir(directory) };
+        if entry.is_null() {
+            break;
+        }
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+            continue;
+        }
+        let name = std::str::from_utf8(name.to_bytes()).map_err(|_| {
+            FsError::InvalidPath(format!("non-UTF8 directory entry: {}", path.display()))
+        })?;
+        names.push(name.to_owned());
+    }
+    let result = unsafe { libc::closedir(directory) };
+    if result != 0 {
+        return Err(io(
+            "close directory stream",
+            path,
+            std::io::Error::last_os_error(),
+        ));
+    }
+    names.sort();
+    Ok(names)
+}
+
 fn open_relative_dir(root: RawFd, components: &[String]) -> Result<OwnedFd, FsError> {
     let duplicate = unsafe { libc::dup(root) };
     if duplicate < 0 {
@@ -208,6 +260,227 @@ fn read_at(dir: RawFd, name: &str, path: &Path) -> Result<Vec<u8>, FsError> {
     Ok(bytes)
 }
 
+fn open_relative_file(root: RawFd, components: &[String], path: &Path) -> Result<File, FsError> {
+    let (name, parent) = components
+        .split_last()
+        .ok_or_else(|| FsError::InvalidPath(format!("empty file path: {}", path.display())))?;
+    let directory = open_relative_dir(root, parent)?;
+    let name = c_string(name)?;
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(io(
+            "open confined payload",
+            path,
+            std::io::Error::last_os_error(),
+        ));
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+fn file_mode(file: &File, path: &Path) -> Result<u32, FsError> {
+    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+    if unsafe { libc::fstat(file.as_raw_fd(), &mut stat) } != 0 {
+        return Err(io(
+            "stat confined payload",
+            path,
+            std::io::Error::last_os_error(),
+        ));
+    }
+    Ok(stat.st_mode as u32)
+}
+
+fn validate_release_payload(
+    release_dir: RawFd,
+    release_path: &Path,
+    release_digest: &Digest,
+) -> Result<(), FsError> {
+    let manifest_path = release_path.join("release-manifest.json");
+    let manifest = read_at(release_dir, "release-manifest.json", &manifest_path)?;
+    if Digest::from_bytes(&manifest) != *release_digest {
+        return Err(FsError::InvalidPointer(format!(
+            "release manifest digest does not match {}",
+            release_path.display()
+        )));
+    }
+    let value: serde_json::Value = serde_json::from_slice(&manifest)
+        .map_err(|error| FsError::InvalidPointer(format!("invalid release manifest: {error}")))?;
+    let payload = value
+        .get("payload")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| FsError::InvalidPointer("release manifest has no payload".to_owned()))?;
+    if payload.is_empty() {
+        return Err(FsError::InvalidPointer(
+            "release manifest payload is empty".to_owned(),
+        ));
+    }
+    let mut expected_files = std::collections::BTreeSet::new();
+    for entry in payload {
+        let raw_path = entry
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| FsError::InvalidPointer("payload entry has no path".to_owned()))?;
+        let raw_path = raw_path.strip_prefix("tightbeam/").unwrap_or(raw_path);
+        let payload_components = relative_components(Path::new(raw_path))?;
+        let payload_path = Path::new("tightbeam").join(raw_path);
+        if kind_is_file(entry) && !expected_files.insert(raw_path.to_owned()) {
+            return Err(FsError::InvalidPointer(format!(
+                "duplicate payload path: {raw_path}"
+            )));
+        }
+        let kind = entry
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| FsError::InvalidPointer("payload entry has no type".to_owned()))?;
+        let mode = entry
+            .get("mode")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| FsError::InvalidPointer("payload entry has no mode".to_owned()))?
+            as u32;
+        match kind {
+            "directory" => {
+                let directory_components =
+                    [vec!["tightbeam".to_owned()], payload_components].concat();
+                let directory = open_relative_dir(release_dir, &directory_components)?;
+                let actual_mode = file_mode_fd(directory.as_raw_fd(), &payload_path)?;
+                if actual_mode & 0o7777 != mode & 0o7777 {
+                    return Err(FsError::InvalidPointer(format!(
+                        "payload mode mismatch: {}",
+                        payload_path.display()
+                    )));
+                }
+            }
+            "file" => {
+                let file_components = [vec!["tightbeam".to_owned()], payload_components].concat();
+                let mut file = open_relative_file(release_dir, &file_components, &payload_path)?;
+                let actual_mode = file_mode(&file, &payload_path)?;
+                if actual_mode & 0o7777 != mode & 0o7777 {
+                    return Err(FsError::InvalidPointer(format!(
+                        "payload mode mismatch: {}",
+                        payload_path.display()
+                    )));
+                }
+                let expected_size = entry
+                    .get("size")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| {
+                        FsError::InvalidPointer("payload file has no size".to_owned())
+                    })?;
+                let expected_digest = entry
+                    .get("sha256")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        FsError::InvalidPointer("payload file has no sha256".to_owned())
+                    })?;
+                let expected_digest =
+                    Digest::parse(expected_digest).map_err(FsError::InvalidPointer)?;
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes)
+                    .map_err(|error| io("read release payload", &payload_path, error))?;
+                if bytes.len() as u64 != expected_size
+                    || Digest::from_bytes(&bytes) != expected_digest
+                {
+                    return Err(FsError::InvalidPointer(format!(
+                        "payload content mismatch: {}",
+                        payload_path.display()
+                    )));
+                }
+            }
+            other => {
+                return Err(FsError::InvalidPointer(format!(
+                    "unsupported payload type: {other}"
+                )));
+            }
+        }
+    }
+    let tightbeam = open_dir_at(release_dir, "tightbeam")?;
+    let mut actual_files = std::collections::BTreeSet::new();
+    collect_payload_files(
+        tightbeam.as_raw_fd(),
+        Path::new(""),
+        &mut actual_files,
+        release_path,
+    )?;
+    if actual_files != expected_files {
+        return Err(FsError::InvalidPointer(format!(
+            "release payload inventory mismatch in {}",
+            release_path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn kind_is_file(entry: &serde_json::Value) -> bool {
+    entry.get("type").and_then(serde_json::Value::as_str) == Some("file")
+}
+
+fn collect_payload_files(
+    directory: RawFd,
+    prefix: &Path,
+    files: &mut std::collections::BTreeSet<String>,
+    release_path: &Path,
+) -> Result<(), FsError> {
+    for name in read_dir_names(directory, release_path)? {
+        let child_path = prefix.join(&name);
+        match open_dir_at(directory, &name) {
+            Ok(child) => {
+                collect_payload_files(child.as_raw_fd(), &child_path, files, release_path)?
+            }
+            Err(FsError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotADirectory
+                    || source.raw_os_error() == Some(libc::ELOOP) =>
+            {
+                let child_name = c_string(&name)?;
+                let fd = unsafe {
+                    libc::openat(
+                        directory,
+                        child_name.as_ptr(),
+                        libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                    )
+                };
+                if fd < 0 {
+                    return Err(io(
+                        "open release payload entry",
+                        release_path.join(&child_path),
+                        std::io::Error::last_os_error(),
+                    ));
+                }
+                let file = unsafe { File::from_raw_fd(fd) };
+                let mode = file_mode(&file, &release_path.join(&child_path))?;
+                if mode & libc::S_IFMT as u32 != libc::S_IFREG as u32 {
+                    return Err(FsError::InvalidPointer(format!(
+                        "non-regular release payload entry: {}",
+                        child_path.display()
+                    )));
+                }
+                let rendered = child_path
+                    .to_str()
+                    .ok_or_else(|| FsError::InvalidPath("non-UTF8 payload path".to_owned()))?;
+                files.insert(rendered.to_owned());
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn file_mode_fd(fd: RawFd, path: &Path) -> Result<u32, FsError> {
+    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+    if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+        return Err(io(
+            "stat confined directory",
+            path,
+            std::io::Error::last_os_error(),
+        ));
+    }
+    Ok(stat.st_mode as u32)
+}
+
 fn read_link_at(dir: RawFd, name: &str, path: &Path) -> Result<PathBuf, FsError> {
     let name = c_string(name)?;
     let mut buffer = vec![0_u8; 256];
@@ -270,6 +543,24 @@ impl DeploymentFs {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub fn root_identity_digest(&self) -> DeploymentRootIdentity {
+        DeploymentRootIdentity::from_digest(Digest::from_bytes(
+            self.root.to_string_lossy().as_bytes(),
+        ))
+    }
+
+    fn namespace_identity(&self) -> Result<(u64, u64), FsError> {
+        let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+        if unsafe { libc::fstat(self.root_fd.as_raw_fd(), &mut stat) } != 0 {
+            return Err(io(
+                "stat deployment root descriptor",
+                &self.root,
+                std::io::Error::last_os_error(),
+            ));
+        }
+        Ok((stat.st_dev as u64, stat.st_ino as u64))
     }
 
     fn parent_dir(&self, parent: &[String]) -> Result<OwnedFd, FsError> {
@@ -516,12 +807,13 @@ impl DeploymentFs {
                 "generation root selects {release_name}, manifest selects {expected_release_name}"
             )));
         }
-        let release_components = vec![
-            "releases".to_owned(),
-            release_name.to_owned(),
-            "tightbeam".to_owned(),
-        ];
-        let _release_dir = open_relative_dir(self.root_fd.as_raw_fd(), &release_components)?;
+        let release_components = vec!["releases".to_owned(), release_name.to_owned()];
+        let release_dir = open_relative_dir(self.root_fd.as_raw_fd(), &release_components)?;
+        validate_release_payload(
+            release_dir.as_raw_fd(),
+            &self.root.join("releases").join(release_name),
+            &release,
+        )?;
         Ok(Some(Pointer {
             generation,
             release,
@@ -576,53 +868,57 @@ impl DeploymentFs {
     }
 
     pub fn list_staging(&self) -> Result<Vec<String>, FsError> {
-        let path = self.root.join("staging");
-        let directory = match fs::read_dir(&path) {
-            Ok(directory) => directory,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => return Err(io("read staging directory", &path, error)),
+        let path = Path::new("staging");
+        let Some(directory) = open_optional_dir_at(self.root_fd.as_raw_fd(), "staging")? else {
+            return Ok(Vec::new());
         };
         let mut entries = Vec::new();
-        for entry in directory {
-            let entry = entry.map_err(|error| io("read staging entry", &path, error))?;
-            let file_type = entry
-                .file_type()
-                .map_err(|error| io("inspect staging entry", entry.path(), error))?;
-            if file_type.is_dir() {
-                entries.push(entry.file_name().to_string_lossy().into_owned());
+        for name in read_dir_names(directory.as_raw_fd(), path)? {
+            let child = open_dir_at(directory.as_raw_fd(), &name)?;
+            drop(child);
+            entries.push(name);
+        }
+        Ok(entries)
+    }
+
+    pub fn read_intents(&self) -> Result<Vec<Vec<u8>>, FsError> {
+        read_json_directory(self.root_fd.as_raw_fd(), "intents", Path::new("intents"))
+    }
+
+    pub fn read_audit(&self) -> Result<Vec<Vec<u8>>, FsError> {
+        let path = Path::new("audit");
+        let Some(directory) = open_optional_dir_at(self.root_fd.as_raw_fd(), "audit")? else {
+            return Ok(Vec::new());
+        };
+        let mut entries = Vec::new();
+        for transaction in read_dir_names(directory.as_raw_fd(), path)? {
+            let transaction_path = path.join(&transaction);
+            let transaction_dir = open_dir_at(directory.as_raw_fd(), &transaction)?;
+            for fact in read_dir_names(transaction_dir.as_raw_fd(), &transaction_path)? {
+                let fact_path = transaction_path.join(&fact);
+                entries.push(read_at(transaction_dir.as_raw_fd(), &fact, &fact_path)?);
             }
         }
         entries.sort();
         Ok(entries)
     }
-
-    pub fn read_intents(&self) -> Result<Vec<Vec<u8>>, FsError> {
-        read_json_entries(&self.root.join("intents"))
-    }
-
-    pub fn read_audit(&self) -> Result<Vec<Vec<u8>>, FsError> {
-        read_json_entries(&self.root.join("audit"))
-    }
 }
 
-fn read_json_entries(path: &Path) -> Result<Vec<Vec<u8>>, FsError> {
-    let directory = match fs::read_dir(path) {
-        Ok(directory) => directory,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(io("read deployment directory", path, error)),
+fn read_json_directory(root: RawFd, name: &str, path: &Path) -> Result<Vec<Vec<u8>>, FsError> {
+    let Some(directory) = open_optional_dir_at(root, name)? else {
+        return Ok(Vec::new());
     };
     let mut entries = Vec::new();
-    for entry in directory {
-        let entry = entry.map_err(|error| io("read deployment entry", path, error))?;
-        let file_type = entry
-            .file_type()
-            .map_err(|error| io("inspect deployment entry", entry.path(), error))?;
-        if file_type.is_file() {
-            entries.push(
-                fs::read(entry.path())
-                    .map_err(|error| io("read deployment record", entry.path(), error))?,
-            );
+    for name in read_dir_names(directory.as_raw_fd(), path)? {
+        let entry_path = path.join(&name);
+        let bytes = read_at(directory.as_raw_fd(), &name, &entry_path)?;
+        if serde_json::from_slice::<serde_json::Value>(&bytes).is_err() {
+            return Err(FsError::InvalidPointer(format!(
+                "invalid JSON record: {}",
+                entry_path.display()
+            )));
         }
+        entries.push(bytes);
     }
     entries.sort();
     Ok(entries)
@@ -668,6 +964,7 @@ fn relative_link_target(target: &Path) -> Result<String, FsError> {
 
 pub struct DeploymentLock {
     file: File,
+    namespace_identity: (u64, u64),
 }
 
 impl DeploymentLock {
@@ -697,7 +994,20 @@ impl DeploymentLock {
             }
             return Err(io("acquire deployment lock", &path, error));
         }
-        Ok(Self { file })
+        Ok(Self {
+            file,
+            namespace_identity: fs.namespace_identity()?,
+        })
+    }
+
+    pub(crate) fn belongs_to(&self, fs: &DeploymentFs) -> Result<(), FsError> {
+        if self.namespace_identity == fs.namespace_identity()? {
+            Ok(())
+        } else {
+            Err(FsError::InvalidPointer(
+                "deployment lock belongs to another namespace".to_owned(),
+            ))
+        }
     }
 }
 
@@ -761,13 +1071,76 @@ mod tests {
     }
 
     #[test]
+    fn deployment_lock_is_exclusive_and_descriptor_bound() {
+        let (directory, fs) = fixture();
+        fs.ensure_dir(Path::new("intents"), 0o755).unwrap();
+        let first = DeploymentLock::acquire(&fs).unwrap();
+        assert!(matches!(DeploymentLock::acquire(&fs), Err(FsError::Busy)));
+        first.belongs_to(&fs).unwrap();
+
+        let other = DeploymentFs::open(&directory.0).unwrap();
+        first.belongs_to(&other).unwrap();
+    }
+
+    #[test]
+    fn descriptor_readers_refuse_symlinked_staging_and_intent_entries() {
+        let (_directory, fs) = fixture();
+        fs.ensure_dir(Path::new("staging"), 0o755).unwrap();
+        fs.ensure_dir(Path::new("intents"), 0o755).unwrap();
+        std::os::unix::fs::symlink("/tmp", fs.root().join("staging/escape")).unwrap();
+        std::os::unix::fs::symlink("/tmp/escape.json", fs.root().join("intents/escape.json"))
+            .unwrap();
+        assert!(fs.list_staging().is_err());
+        assert!(fs.read_intents().is_err());
+    }
+
+    #[test]
+    fn audit_reader_accepts_only_confined_nested_facts() {
+        let (_directory, fs) = fixture();
+        fs.ensure_dir(Path::new("audit/tx-1"), 0o755).unwrap();
+        fs.publish_immutable(
+            Path::new("audit/tx-1/fact.json"),
+            br#"{"state":"ok"}"#,
+            0o444,
+        )
+        .unwrap();
+        assert_eq!(
+            fs.read_audit().unwrap(),
+            vec![br#"{"state":"ok"}"#.to_vec()]
+        );
+    }
+
+    #[test]
     fn active_replacement_is_a_complete_relative_pointer() {
         let (_directory, fs) = fixture();
         fs.ensure_dir(Path::new("generations/g1"), 0o755).unwrap();
-        let release = format!("sha256-{}/tightbeam", "a".repeat(64));
+        let payload = b"payload";
+        let payload_digest = Digest::from_bytes(payload);
+        let release_manifest = format!(
+            r#"{{"payload":[{{"path":"bin","type":"file","mode":292,"size":{},"sha256":"{}"}}]}}"#,
+            payload.len(),
+            payload_digest
+        );
+        let digest = Digest::from_bytes(release_manifest.as_bytes());
+        let release = format!("sha256-{}/tightbeam", digest);
         fs.ensure_dir(&Path::new("releases").join(&release), 0o755)
             .unwrap();
-        let digest = "a".repeat(64);
+        fs.publish_immutable(
+            &Path::new("releases")
+                .join(format!("sha256-{digest}"))
+                .join("release-manifest.json"),
+            release_manifest.as_bytes(),
+            0o444,
+        )
+        .unwrap();
+        fs.publish_immutable(
+            &Path::new("releases")
+                .join(format!("sha256-{digest}"))
+                .join("tightbeam/bin"),
+            payload,
+            0o444,
+        )
+        .unwrap();
         fs.publish_immutable(
             Path::new("generations/g1/manifest.json"),
             format!(r#"{{"releaseDigest":"{digest}"}}"#).as_bytes(),
@@ -783,6 +1156,6 @@ mod tests {
             .unwrap();
         let pointer = fs.read_active().unwrap().unwrap();
         assert_eq!(pointer.generation.as_str(), "g1");
-        assert_eq!(pointer.release.as_str(), digest);
+        assert_eq!(pointer.release, digest);
     }
 }

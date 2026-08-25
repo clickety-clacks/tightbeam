@@ -35,6 +35,71 @@ impl std::fmt::Display for Digest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostIdentity(Digest);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeploymentRootIdentity(Digest);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceSetDigest(Digest);
+
+impl HostIdentity {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        Ok(Self(Digest::parse(value)?))
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl DeploymentRootIdentity {
+    pub fn from_digest(digest: Digest) -> Self {
+        Self(digest)
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl ServiceSetDigest {
+    pub fn from_digest(digest: Digest) -> Self {
+        Self(digest)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        Self(Digest::from_bytes(bytes))
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransactionId(String);
+
+impl TransactionId {
+    pub fn new(value: &str) -> Result<Self, String> {
+        if value.is_empty()
+            || value == "."
+            || value == ".."
+            || value.contains('/')
+            || value.contains('\\')
+            || value.bytes().any(|byte| byte.is_ascii_whitespace())
+        {
+            return Err(format!("invalid transaction id: {value}"));
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenerationId(String);
 
 impl GenerationId {
@@ -66,7 +131,7 @@ impl std::fmt::Display for GenerationId {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExpectedActive {
     Virgin {
-        deployment_root: Digest,
+        deployment_root: DeploymentRootIdentity,
     },
     Generation {
         generation: GenerationId,
@@ -75,7 +140,7 @@ pub enum ExpectedActive {
 }
 
 impl ExpectedActive {
-    pub fn virgin(deployment_root: Digest) -> Self {
+    pub fn virgin(deployment_root: DeploymentRootIdentity) -> Self {
         Self::Virgin { deployment_root }
     }
 
@@ -88,7 +153,7 @@ impl ExpectedActive {
 
     pub fn as_wire(&self) -> String {
         match self {
-            Self::Virgin { deployment_root } => format!("virgin:{deployment_root}"),
+            Self::Virgin { deployment_root } => format!("virgin:{}", deployment_root.as_str()),
             Self::Generation {
                 generation,
                 release,
@@ -99,7 +164,7 @@ impl ExpectedActive {
     pub fn parse(value: &str) -> Result<Self, String> {
         if let Some(digest) = value.strip_prefix("virgin:") {
             return Ok(Self::Virgin {
-                deployment_root: Digest::parse(digest)?,
+                deployment_root: DeploymentRootIdentity::from_digest(Digest::parse(digest)?),
             });
         }
         let Some(value) = value.strip_prefix("generation:") else {
@@ -190,11 +255,36 @@ pub struct Pointer {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActivationIntent {
-    pub transaction_id: String,
+    pub transaction_id: TransactionId,
     pub action: DeployAction,
     pub expected_active: ExpectedActive,
     pub target: Pointer,
     pub prior: Option<Pointer>,
+    pub authority: ActivationAuthority,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivationAuthority {
+    pub host: HostIdentity,
+    pub deployment_root: DeploymentRootIdentity,
+    pub service_set: ServiceSetDigest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NamespaceIdentity {
+    Virgin(DeploymentRootIdentity),
+    Generation {
+        generation: GenerationId,
+        release: Digest,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditFactRecord {
+    pub transaction_id: TransactionId,
+    pub state: TransactionState,
+    pub observed: NamespaceIdentity,
+    pub fact_digest: Digest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -268,7 +358,7 @@ pub struct DeployStatus {
     pub transaction: TransactionStatus,
     pub audit: String,
     pub running: Vec<RunningService>,
-    pub service_set: String,
+    pub service_set: ServiceSetStatus,
     pub services: Vec<ServiceStatus>,
     pub observation: String,
     pub prior_known_good: String,
@@ -281,6 +371,13 @@ pub struct DeployStatus {
     pub gc_hold: bool,
     pub gc_hold_transactions: Vec<String>,
     pub last_results: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceSetStatus {
+    pub digest: Option<ServiceSetDigest>,
+    pub units: Vec<String>,
+    pub description: String,
 }
 
 #[cfg(test)]
