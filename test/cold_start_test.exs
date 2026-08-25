@@ -218,6 +218,32 @@ defmodule Tightbeam.ColdStartTest do
            } = ColdStart.state(db)
   end
 
+  test "boot rejects corrupted accepted-event referents", %{db: db} do
+    assert {:paired, _device} = ColdStart.pair(db, pair_input("d1", "Alice"), @defaults)
+
+    assert {:ok, [[claim_event_id]]} =
+             DB.query(db, "SELECT claimEventId FROM cold_start_receipts")
+
+    assert_event_corruptions_refuse(db, claim_event_id)
+
+    other = :"cold_start_event_db_#{System.unique_integer([:positive])}"
+
+    start_supervised!(%{
+      id: other,
+      start: {DB, :start_link, [[path: ":memory:", name: other]]}
+    })
+
+    :ok = Schema.ensure_all(other)
+    assert {:ok, %{phase: "reserved"}} = ColdStart.bootstrap_user(other, "alice", @defaults)
+    assert {:paired, _device} = ColdStart.pair(other, pair_input("d1", "Alice"), @defaults)
+
+    assert {:ok, [[reserved_event_id, device_event_id]]} =
+             DB.query(other, "SELECT claimEventId,deviceEventId FROM cold_start_receipts")
+
+    assert_event_corruptions_refuse(other, reserved_event_id)
+    assert_event_corruptions_refuse(other, device_event_id)
+  end
+
   test "each interrupted healthy-v5 migration rolls back and a retry converges", _ctx do
     for point <- [:after_copy, :after_drop, :after_schema, :after_receipt, :after_stamp] do
       db = captured_db!("v5-healthy")
@@ -316,6 +342,47 @@ defmodule Tightbeam.ColdStartTest do
       """)
 
     {stamp, objects, census}
+  end
+
+  defp assert_event_corruptions_refuse(db, event_id) do
+    assert {:ok, [original]} =
+             DB.query(
+               db,
+               "SELECT id,ts,kind,verb,origin,principal,sessionKey,payload FROM events WHERE id=?1",
+               [event_id]
+             )
+
+    for {column, corrupt} <- [
+          {"kind", "denied"},
+          {"verb", "wrong"},
+          {"origin", "user:wrong"},
+          {"principal", "user:wrong"},
+          {"sessionKey", "agent:missing"},
+          {"payload", "%{}"}
+        ] do
+      assert {:ok, _} =
+               DB.query(db, "UPDATE events SET #{column}=?1 WHERE id=?2", [corrupt, event_id])
+
+      error = assert_raise Tightbeam.Schema.ShapeError, fn -> ColdStart.validate!(db) end
+
+      assert error.message ==
+               "incompatible_cold_start_v1: receipt_event_shape_invalid; recovery: Recover an unusable fresh database"
+
+      restore_event!(db, original)
+      assert :ok = ColdStart.validate!(db)
+    end
+  end
+
+  defp restore_event!(db, [id, ts, kind, verb, origin, principal, session_key, payload]) do
+    assert {:ok, _} =
+             DB.query(
+               db,
+               """
+               UPDATE events SET ts=?1,kind=?2,verb=?3,origin=?4,principal=?5,sessionKey=?6,payload=?7
+               WHERE id=?8
+               """,
+               [ts, kind, verb, origin, principal, session_key, payload, id]
+             )
   end
 
   defp concurrent(functions) do

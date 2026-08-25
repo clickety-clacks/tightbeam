@@ -482,7 +482,7 @@ defmodule Tightbeam.ColdStart do
         not personal_main?(root, receipt.user_id) ->
           "root_not_personal_main"
 
-        not event_shape_valid?(receipt) ->
+        not event_referents_valid?(txn, receipt) ->
           "receipt_event_shape_invalid"
 
         not replay_shape_valid?(receipt) ->
@@ -579,33 +579,114 @@ defmodule Tightbeam.ColdStart do
       root.kind == "main" and root.is_built_in and root.operational_parent == root.session_key
   end
 
-  defp event_shape_valid?(%{cause: "v5_observed", claim_event_id: nil, device_event_id: nil}),
-    do: true
-
-  defp event_shape_valid?(%{
-         cause: "first_device_pair",
-         claim_event_id: id,
+  defp event_referents_valid?(_txn, %{
+         cause: "v5_observed",
+         claim_event_id: nil,
          device_event_id: nil
        }),
-       do: is_integer(id)
+       do: true
 
-  defp event_shape_valid?(%{
-         cause: "gateway_local_bootstrap",
-         phase: "reserved",
-         claim_event_id: id,
-         device_event_id: nil
-       }),
-       do: is_integer(id)
+  defp event_referents_valid?(
+         txn,
+         %{
+           cause: "first_device_pair",
+           claim_event_id: id,
+           device_event_id: nil
+         } = receipt
+       ) do
+    accepted_event_valid?(
+      txn,
+      id,
+      "cold-start",
+      {:exact, receipt.created_at},
+      event_payload(receipt, "complete", receipt.device_id)
+    )
+  end
 
-  defp event_shape_valid?(%{
-         cause: "gateway_local_bootstrap",
-         phase: "complete",
-         claim_event_id: claim,
-         device_event_id: device
-       }),
-       do: is_integer(claim) and is_integer(device)
+  defp event_referents_valid?(
+         txn,
+         %{
+           cause: "gateway_local_bootstrap",
+           phase: "reserved",
+           claim_event_id: id,
+           device_event_id: nil
+         } = receipt
+       ) do
+    accepted_event_valid?(
+      txn,
+      id,
+      "cold-start",
+      {:exact, receipt.created_at},
+      event_payload(receipt, "reserved", nil)
+    )
+  end
 
-  defp event_shape_valid?(_), do: false
+  defp event_referents_valid?(
+         txn,
+         %{
+           cause: "gateway_local_bootstrap",
+           phase: "complete",
+           claim_event_id: claim,
+           device_event_id: device
+         } = receipt
+       ) do
+    accepted_event_valid?(
+      txn,
+      claim,
+      "cold-start",
+      {:exact, receipt.created_at},
+      event_payload(receipt, "reserved", nil)
+    ) and
+      accepted_event_valid?(
+        txn,
+        device,
+        "cold-start-device",
+        {:at_or_after, receipt.created_at},
+        event_payload(receipt, "complete", receipt.device_id)
+      )
+  end
+
+  defp event_referents_valid?(_txn, _receipt), do: false
+
+  defp accepted_event_valid?(txn, id, verb, timestamp, expected_payload)
+       when is_integer(id) do
+    case Txn.q(
+           txn,
+           "SELECT ts,kind,verb,origin,principal,sessionKey,payload FROM events WHERE id=?1",
+           [id]
+         ) do
+      [[ts, kind, actual_verb, origin, principal, session_key, payload]] ->
+        valid_event_timestamp?(ts, timestamp) and kind == "verb" and actual_verb == verb and
+          origin == @principal and principal == @principal and
+          session_key == expected_payload["rootSessionKey"] and
+          payload == inspect(expected_payload)
+
+      _ ->
+        false
+    end
+  end
+
+  defp accepted_event_valid?(_txn, _id, _verb, _timestamp, _payload), do: false
+
+  defp valid_event_timestamp?(ts, {:exact, expected}), do: ts == expected
+
+  defp valid_event_timestamp?(ts, {:at_or_after, minimum}),
+    do: is_integer(ts) and ts >= minimum
+
+  defp event_payload(receipt, phase, device_id) do
+    %{
+      "receiptId" => 1,
+      "cause" => receipt.cause,
+      "phase" => phase,
+      "userId" => receipt.user_id,
+      "deviceId" => device_id,
+      "rootSessionKey" => receipt.root_session_key,
+      "isAdmin" => true,
+      "deviceStatus" => device_id && "allowlisted",
+      "rootKind" => "main",
+      "operationalParent" => receipt.root_session_key
+    }
+  end
 
   defp replay_shape_valid?(%{
          cause: "v5_observed",
