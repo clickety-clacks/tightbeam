@@ -1,5 +1,5 @@
 name = "orchestrator"
-skills = ["feature-cycle", "work-tracking", "unblocking", "tightbeam-law-minting", "tightbeam-guidance-authoring", "human-communication", "security-incident"]
+skills = ["worktree-session", "feature-cycle", "work-tracking", "unblocking", "tightbeam-law-minting", "tightbeam-guidance-authoring", "human-communication", "security-incident"]
 
 [guidance]
 text = """
