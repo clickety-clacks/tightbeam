@@ -873,7 +873,7 @@ COMMANDS:
   repair-assignment <assignmentId> --action tune|restart|rerun|resume|relaunch --key <key>
       Repair a failed or never-launched holder without revoking its work.
       tune also requires --model; rerun requires --outcome not-completed.
-  attest <assignmentId> --kind progress|completion|cannot-proceed|verdict
+  attest <assignmentId> --kind progress|completion|surrender|cannot-proceed|verdict
       [--commit-refs '[{"repo":"host:/abs/path","commit":"<commit>"}]']
          [--verdict <kind>] [--note "..."]
          [--release-fact-kind <kind> --release-fact-scope <scope>
@@ -889,6 +889,7 @@ COMMANDS:
       so you can walk a long trail without re-reading it; the response carries
       nextAfter and hasMoreAfter to drive the next call.
         tightbeam attests as_abc --limit 50 --as-user flynn
+      surrender requires --note and uses the session's implicit identity.
   assignments [--session <key> | --role <name>] [--state open|closed|all]
       List assignments (open by default).
 
@@ -2573,6 +2574,12 @@ fn parse_with_optional_catalog(
             let note = nonempty(flags, "note");
             if kind == "cannot-proceed" && note.is_none() {
                 return Err("--note is required when --kind is cannot-proceed".to_owned());
+            }
+            if kind == "surrender" && note.is_none() {
+                return Err("--note is required when --kind is surrender".to_owned());
+            }
+            if kind == "surrender" && commit_refs.is_some() {
+                return Err("--commit-refs is not valid when --kind is surrender".to_owned());
             }
             Ok(Command::Attest {
                 identity: identity(flags)?,
@@ -4815,6 +4822,23 @@ mod tests {
                 "flynn",
             ])),
             Err("--verdict is only valid when --kind is verdict".to_owned())
+        );
+        assert_eq!(
+            parse(strings(&["attest", "asg_1", "--kind", "surrender"])),
+            Err("--note is required when --kind is surrender".to_owned())
+        );
+        assert_eq!(
+            parse(strings(&[
+                "attest",
+                "asg_1",
+                "--kind",
+                "surrender",
+                "--note",
+                "done",
+                "--commit-refs",
+                "[]",
+            ])),
+            Err("--commit-refs is not valid when --kind is surrender".to_owned())
         );
     }
 
