@@ -60,7 +60,7 @@ defmodule Tightbeam.LedgerTest do
     {:ok, t} = Ledger.claim_next(db, "k1", "lane")
     assert :busy = Ledger.claim_next(db, "k1", "lane")
 
-    :ok = Ledger.finish(db, t.seq, "delivered")
+    :ok = Ledger.finish(db, t.seq, "delivered", nil, owner_lease: t.owner_lease)
     {:ok, t2} = Ledger.claim_next(db, "k1", "lane")
     assert t2.prompt == "b"
     assert :none = Ledger.claim_next(db, "k2", "lane")
@@ -70,8 +70,10 @@ defmodule Tightbeam.LedgerTest do
     enqueue!(db, "k1", "a")
     {:ok, t} = Ledger.claim_next(db, "k1", "lane")
 
-    assert :ok = Ledger.finish(db, t.seq, "delivered")
-    assert :already_terminal = Ledger.finish(db, t.seq, "failed")
+    assert :ok = Ledger.finish(db, t.seq, "delivered", nil, owner_lease: t.owner_lease)
+
+    assert :already_terminal =
+             Ledger.finish(db, t.seq, "failed", nil, owner_lease: t.owner_lease)
   end
 
   test "wakeId dedupe: at-least-once attempts, exactly-once enqueue", %{db: db} do
@@ -128,12 +130,12 @@ defmodule Tightbeam.LedgerTest do
         """
       )
 
-    assert {:ok, %{seq: ^first}} = Ledger.claim_next(db, "k1", "lane")
+    assert {:ok, %{seq: ^first, owner_lease: lease}} = Ledger.claim_next(db, "k1", "lane")
 
     assert {:ok, [["running", "gpt-5.6-sol", "high", "1m", "codex"]]} = mind(db, first)
 
     # The trace reads TERMINAL turns — the stamp must survive terminalization.
-    :ok = Ledger.finish(db, first, "delivered")
+    :ok = Ledger.finish(db, first, "delivered", nil, owner_lease: lease)
 
     assert {:ok, [["delivered", "gpt-5.6-sol", "high", "1m", "codex"]]} = mind(db, first)
   end
@@ -149,7 +151,7 @@ defmodule Tightbeam.LedgerTest do
   test "publication feed: terminal rows surface until marked published", %{db: db} do
     enqueue!(db, "k1", "a")
     {:ok, t} = Ledger.claim_next(db, "k1", "lane")
-    :ok = Ledger.finish(db, t.seq, "delivered")
+    :ok = Ledger.finish(db, t.seq, "delivered", nil, owner_lease: t.owner_lease)
 
     assert [%{seq: seq, status: "delivered"}] = Ledger.unpublished_terminals(db)
     :ok = Ledger.mark_published(db, seq)

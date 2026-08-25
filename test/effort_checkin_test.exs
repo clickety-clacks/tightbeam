@@ -1434,7 +1434,27 @@ defmodule Tightbeam.EffortCheckinTest do
         prompt: id
       })
 
-    :ok = DB.execute(db, "UPDATE turns SET status='running' WHERE seq=#{seq}")
-    :ok = Ledger.finish(db, seq, terminal)
+    lease = "ol_test_#{System.unique_integer([:positive])}"
+
+    {:ok, :appended} =
+      DB.transaction(db, fn txn ->
+        DB.Txn.q(
+          txn,
+          "UPDATE turns SET status='running', startedAt=?2, owner='test' WHERE seq=?1 AND status='queued'",
+          [seq, System.system_time(:millisecond)]
+        )
+
+        Tightbeam.TurnLifecycle.append_in_txn(txn, seq, %{
+          event_key: "claimed",
+          producer_event_id: "effort-checkin-fixture:claimed",
+          kind: "claimed",
+          cause: "test-fixture:claim",
+          principal: "process:tightbeam",
+          owner_lease: lease,
+          detail: %{v: 1, owner: "test"}
+        })
+      end)
+
+    :ok = Ledger.finish(db, seq, terminal, nil, owner_lease: lease)
   end
 end

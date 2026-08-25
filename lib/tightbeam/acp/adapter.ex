@@ -57,6 +57,7 @@ defmodule Tightbeam.Acp.Adapter do
     stderr_offset: 0,
     chunks: %{},
     progress: %{},
+    trace_errors: %{},
     subagent_tasks: %{},
     known: MapSet.new(),
     models: %{},
@@ -830,12 +831,20 @@ defmodule Tightbeam.Acp.Adapter do
 
   defp start_prompt(state, sid, text, opts, from) do
     state = put_in(state.chunks[sid], [])
-    # Per-turn progress channel: {fun, last_status, seq}. Deduped on text so
+    state = %{state | trace_errors: Map.delete(state.trace_errors, sid)}
+    # Per-turn progress channel: {live_fun, trace_fun, last_status, seq}.
+    # Deduped on text so
     # per-token thought chunks emit ONE "Thinking…" until something changes.
     state =
       case Keyword.get(opts, :progress) do
-        fun when is_function(fun, 2) -> put_in(state.progress[sid], {fun, nil, 0})
-        _ -> state
+        fun when is_function(fun, 2) ->
+          put_in(
+            state.progress[sid],
+            {fun, Keyword.get(opts, :trace_progress), nil, 0}
+          )
+
+        _ ->
+          state
       end
 
     # Fire the ACP prompt asynchronously so this GenServer keeps routing
@@ -852,15 +861,37 @@ defmodule Tightbeam.Acp.Adapter do
             "session/prompt",
             %{sessionId: sid, prompt: [%{type: "text", text: text}]},
             timeout: :infinity,
-            notify_dispatched: {parent, {:prompt_dispatched, dispatched}}
+            notify_dispatched: {parent, dispatched}
           )
 
-        send(parent, {:prompt_done, sid, from, result})
+        receive do
+          {:dispatch_trace_recorded, ^dispatched} ->
+            send(parent, {:prompt_done, sid, from, result})
+        end
       end)
 
     receive do
-      {:prompt_dispatched, ^dispatched} ->
+      {:acp_request_dispatched, ^dispatched, request_id} ->
         Process.demonitor(conn_monitor, [:flush])
+
+        case trace_dispatch(opts, request_id) do
+          :ok ->
+            send(prompt_worker, {:dispatch_trace_recorded, dispatched})
+
+          {:error, reason} ->
+            Process.exit(prompt_worker, :kill)
+
+            send(
+              parent,
+              {:prompt_done, sid, from,
+               {:error, {:lifecycle_trace_failed_after_prompt, :dispatch, reason}}}
+            )
+        end
+
+      {:acp_request_not_dispatched, ^dispatched, reason} ->
+        Process.demonitor(conn_monitor, [:flush])
+        Process.exit(prompt_worker, :kill)
+        send(parent, {:prompt_done, sid, from, {:error, reason}})
 
       {:DOWN, ^conn_monitor, :process, _pid, _reason} ->
         Process.exit(prompt_worker, :kill)
@@ -904,17 +935,21 @@ defmodule Tightbeam.Acp.Adapter do
     text = Enum.map_join(messages, & &1.text)
 
     reply =
-      case result do
-        {:ok, response} ->
-          {:ok,
-           %{stop_reason: response["stopReason"] || "unknown", text: text, messages: messages}}
+      case Map.get(state.trace_errors, sid) do
+        nil ->
+          prompt_reply(result, text, messages)
 
-        {:error, reason} ->
-          {:error, reason}
+        reason ->
+          {:error, {:lifecycle_trace_failed_after_prompt, :progress, reason}}
       end
 
     GenServer.reply(from, reply)
-    state = %{state | progress: Map.delete(state.progress, sid)}
+
+    state = %{
+      state
+      | progress: Map.delete(state.progress, sid),
+        trace_errors: Map.delete(state.trace_errors, sid)
+    }
 
     state =
       if match?({:ok, _response}, result),
@@ -922,6 +957,16 @@ defmodule Tightbeam.Acp.Adapter do
         else: state
 
     {:noreply, put_in(state.chunks[sid], [])}
+  end
+
+  defp prompt_reply(result, text, messages) do
+    case result do
+      {:ok, response} ->
+        {:ok, %{stop_reason: response["stopReason"] || "unknown", text: text, messages: messages}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
   end
 
   def handle_info({:subagent_event_ingested, event_ref, {:ok, _result}}, state) do
@@ -1071,18 +1116,57 @@ defmodule Tightbeam.Acp.Adapter do
     end
   end
 
-  # Invoke the per-turn progress fun on status CHANGE only. The fun is fast
-  # by contract (an in-memory registry broadcast) — see PATTERNS on shared
-  # serializers; anything slower belongs to the turn, not here.
+  # Invoke per-turn progress on status CHANGE only. The durable callback runs
+  # first. A failed durable observation suppresses the live-only frame and is
+  # returned to the turn as an unknown post-dispatch outcome.
   defp emit_progress(state, sid, update) do
-    with {fun, last, seq} <- Map.get(state.progress, sid),
+    with nil <- Map.get(state.trace_errors, sid),
+         {fun, trace_fun, last, seq} <- Map.get(state.progress, sid),
          {:ok, text} when text != last <- progress_status(update) do
-      fun.(text, seq + 1)
-      put_in(state.progress[sid], {fun, text, seq + 1})
+      next_seq = seq + 1
+
+      case trace_progress(trace_fun, update, next_seq) do
+        :ok ->
+          fun.(text, next_seq)
+          put_in(state.progress[sid], {fun, trace_fun, text, next_seq})
+
+        {:error, reason} ->
+          state
+          |> put_in([Access.key(:progress), sid], {fun, trace_fun, text, next_seq})
+          |> put_in([Access.key(:trace_errors), sid], reason)
+      end
     else
       _ -> state
     end
   end
+
+  defp trace_dispatch(opts, request_id) do
+    case Keyword.get(opts, :trace_dispatch) do
+      fun when is_function(fun, 1) -> normalize_trace_result(fun.(request_id))
+      _ -> :ok
+    end
+  rescue
+    error -> {:error, error}
+  catch
+    kind, reason -> {:error, {kind, reason}}
+  end
+
+  defp trace_progress(fun, update, seq) when is_function(fun, 2) do
+    case Tightbeam.TurnLifecycle.progress_observation(update) do
+      nil -> :ok
+      observation -> normalize_trace_result(fun.(observation, seq))
+    end
+  rescue
+    error -> {:error, error}
+  catch
+    kind, reason -> {:error, {kind, reason}}
+  end
+
+  defp trace_progress(_fun, _update, _seq), do: :ok
+
+  defp normalize_trace_result(result) when result in [:ok, :duplicate, :legacy], do: :ok
+  defp normalize_trace_result({:error, reason}), do: {:error, reason}
+  defp normalize_trace_result(other), do: {:error, {:invalid_trace_callback_result, other}}
 
   ## Model application (the fable-trap rule)
 

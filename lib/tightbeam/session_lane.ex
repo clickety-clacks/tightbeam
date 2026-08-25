@@ -30,7 +30,8 @@ defmodule Tightbeam.SessionLane do
     task_ref: nil,
     task_pid: nil,
     current_seq: nil,
-    current_message_id: nil
+    current_message_id: nil,
+    current_owner_lease: nil
   ]
 
   @doc """
@@ -78,11 +79,11 @@ defmodule Tightbeam.SessionLane do
   eventually give. Waiting for the true answer beats inventing a second, smaller,
   unrelated number that turns a clean `:not_running` into a timeout exit.
   """
-  @spec cancel_current(String.t()) ::
+  @spec cancel_current(String.t(), keyword()) ::
           {:ok, %{seq: integer(), message_id: String.t()}} | :not_running | :no_lane
-  def cancel_current(session_key) do
+  def cancel_current(session_key, opts \\ []) do
     case Registry.lookup(Tightbeam.LaneRegistry, session_key) do
-      [{pid, _}] -> GenServer.call(pid, :cancel_current, :infinity)
+      [{pid, _}] -> GenServer.call(pid, {:cancel_current, opts}, :infinity)
       [] -> :no_lane
     end
   end
@@ -132,11 +133,13 @@ defmodule Tightbeam.SessionLane do
   end
 
   @impl true
-  def handle_call(:cancel_current, _from, %{task_ref: nil} = state),
+  def handle_call({:cancel_current, _opts}, _from, %{task_ref: nil} = state),
     do: {:reply, :not_running, state}
 
-  def handle_call(:cancel_current, _from, state) do
-    case Ledger.finish(state.db, state.current_seq, "canceled") do
+  def handle_call({:cancel_current, opts}, _from, state) do
+    opts = Keyword.put(opts, :owner_lease, state.current_owner_lease)
+
+    case Ledger.finish(state.db, state.current_seq, "canceled", nil, opts) do
       :ok ->
         state.on_terminal.(state.session_key, state.current_seq)
         reply = {:ok, %{seq: state.current_seq, message_id: state.current_message_id}}
@@ -165,7 +168,7 @@ defmodule Tightbeam.SessionLane do
   # TurnTask finished normally.
   def handle_info({ref, {seq, outcome}}, %{task_ref: ref} = state) do
     Process.demonitor(ref, [:flush])
-    finalize(state, seq, outcome)
+    finalize(state, seq, outcome, cause: "turn-runner", principal: "process:tightbeam")
     {:noreply, maybe_start(%{state | task_ref: nil})}
   end
 
@@ -176,7 +179,12 @@ defmodule Tightbeam.SessionLane do
       )
       when not is_nil(reason) do
     EventLog.lifecycle(state.db, "turn_task_crash", state.session_key, inspect(reason))
-    finalize(state, seq, crash_outcome(reason))
+
+    finalize(state, seq, crash_outcome(reason),
+      cause: "turn-task-crash",
+      principal: "process:tightbeam"
+    )
+
     {:noreply, maybe_start(%{state | task_ref: nil})}
   end
 
@@ -221,6 +229,7 @@ defmodule Tightbeam.SessionLane do
         |> Map.put(:task_pid, task.pid)
         |> Map.put(:current_seq, turn.seq)
         |> Map.put(:current_message_id, turn.message_id)
+        |> Map.put(:current_owner_lease, turn.owner_lease)
 
       :busy ->
         state
@@ -246,7 +255,9 @@ defmodule Tightbeam.SessionLane do
     end
   end
 
-  defp finalize(state, seq, outcome) do
+  defp finalize(state, seq, outcome, terminal_opts) do
+    terminal_opts = Keyword.put(terminal_opts, :owner_lease, state.current_owner_lease)
+
     {terminal, error, publish, in_txn, after_commit} =
       case outcome do
         {:ok, %{terminal_publish: fun}} when is_function(fun, 1) ->
@@ -254,6 +265,18 @@ defmodule Tightbeam.SessionLane do
 
         {:ok, _} ->
           {"delivered", nil, nil, nil, nil}
+
+        {:error,
+         %{
+           reason: reason,
+           terminal: terminal,
+           terminal_publish: fun,
+           record_in_txn: action,
+           after_commit: committed
+         }}
+        when terminal in ["failed", "failed_unknown"] and is_function(fun, 1) and
+               is_function(action, 1) and is_function(committed, 1) ->
+          {terminal, error_text(reason), fun, action, committed}
 
         {:error,
          %{
@@ -280,7 +303,7 @@ defmodule Tightbeam.SessionLane do
       if in_txn do
         {:ok, result} =
           DB.transaction(state.db, fn txn ->
-            if Ledger.finish_in_txn(txn, seq, terminal, error) do
+            if Ledger.finish_in_txn(txn, seq, terminal, error, terminal_opts) do
               {:won, in_txn.(txn)}
             else
               :already_terminal
@@ -292,7 +315,7 @@ defmodule Tightbeam.SessionLane do
           :already_terminal -> {:already_terminal, nil}
         end
       else
-        {Ledger.finish(state.db, seq, terminal, error), nil}
+        {Ledger.finish(state.db, seq, terminal, error, terminal_opts), nil}
       end
 
     case finish_result do

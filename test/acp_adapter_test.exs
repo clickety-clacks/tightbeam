@@ -960,6 +960,25 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert Adapter.conn(adapter) == dead_conn
   end
 
+  test "a live closed connection returns its pre-dispatch error without wedging the adapter" do
+    {adapter, _capture_path} = start_adapter()
+    conn = Adapter.conn(adapter)
+    Tightbeam.Acp.Conn.close(conn)
+    assert :sys.get_state(conn).closed
+    owner = self()
+
+    assert {:error, :closed} =
+             Adapter.prompt(adapter, "sess-1", "never sent",
+               trace_dispatch: fn request_id ->
+                 send(owner, {:dispatch_recorded, request_id})
+                 :ok
+               end
+             )
+
+    refute_receive {:dispatch_recorded, _request_id}
+    assert Process.alive?(adapter)
+  end
+
   test "a missing prompt dispatch acknowledgement stays live until the connection dies" do
     {adapter, _capture_path} = start_adapter()
 
@@ -1023,8 +1042,19 @@ defmodule Tightbeam.Acp.AdapterTest do
     {adapter, _capture_path} = start_adapter(gate_mode: "stall-turn", probe: false)
     assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
     conn = Adapter.conn(adapter)
+    owner = self()
 
-    caller = Task.async(fn -> Adapter.prompt(adapter, sid, "stall") end)
+    caller =
+      Task.async(fn ->
+        Adapter.prompt(adapter, sid, "stall",
+          trace_dispatch: fn request_id ->
+            send(owner, {:durable_dispatch_before_loss, request_id})
+            :ok
+          end
+        )
+      end)
+
+    assert_receive {:durable_dispatch_before_loss, request_id} when is_integer(request_id)
     assert pending_count?(conn, 1)
     worker = prompt_requester(conn)
     worker_monitor = Process.monitor(worker)
@@ -1045,14 +1075,39 @@ defmodule Tightbeam.Acp.AdapterTest do
     caller =
       Task.async(fn ->
         Adapter.prompt(adapter, sid, "report progress",
-          progress: fn status, seq -> send(owner, {:progress, status, seq}) end
+          progress: fn status, seq -> send(owner, {:progress, status, seq}) end,
+          trace_dispatch: fn request_id ->
+            send(owner, {:dispatch, request_id})
+            :ok
+          end,
+          trace_progress: fn observation, seq ->
+            send(owner, {:durable_progress, observation, seq})
+            :ok
+          end
         )
       end)
 
     assert {:ok, %{stop_reason: "end_turn", text: "progressed"}} = Task.await(caller)
 
+    assert_receive {:dispatch, request_id} when is_integer(request_id)
+    assert_receive {:durable_progress, %{class: "thought", label: "Thinking"}, 1}
+
+    assert_receive {:durable_progress, %{class: "tool_call", label: "Tool activity"}, 2}
+
     assert_receive {:progress, "Thinking…", 1}
     assert_receive {:progress, "Read config/runtime.exs", 2}
+  end
+
+  test "a durable progress failure turns a dispatched prompt into unknown outcome" do
+    {adapter, _capture_path} = start_adapter(gate_mode: "progress-turn", probe: false)
+    assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+
+    assert {:error, {:lifecycle_trace_failed_after_prompt, :progress, :storage_down}} =
+             Adapter.prompt(adapter, sid, "report progress",
+               progress: fn _status, _seq -> flunk("live progress followed a failed trace") end,
+               trace_dispatch: fn _request_id -> :ok end,
+               trace_progress: fn _observation, _seq -> {:error, :storage_down} end
+             )
   end
 
   test "close_session sends ACP session/close with the harness session id" do
@@ -1726,7 +1781,7 @@ defmodule Tightbeam.Acp.AdapterTest do
         assignment_id: "assignment-running"
       })
 
-    assert {:ok, %{seq: ^turn_seq}} =
+    assert {:ok, %{seq: ^turn_seq, owner_lease: owner_lease}} =
              Tightbeam.Ledger.claim_next(db, session.session_key, "test-owner")
 
     {:ok, adapter_slot} = Agent.start_link(fn -> nil end)
@@ -1780,7 +1835,10 @@ defmodule Tightbeam.Acp.AdapterTest do
     )
 
     assert_receive :subagent_event_captured
-    :ok = Tightbeam.Ledger.finish(db, turn_seq, "delivered")
+
+    :ok =
+      Tightbeam.Ledger.finish(db, turn_seq, "delivered", nil, owner_lease: owner_lease)
+
     assert_receive {:matching_fired, fact_id, false}, 2_000
     assert is_integer(fact_id)
     assert [%{assignment_id: "assignment-running"}] = Tightbeam.SubagentMarkers.list(db)

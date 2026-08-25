@@ -89,6 +89,7 @@ defmodule Tightbeam.Gateway do
     Spinup,
     SubagentMarkers,
     Supervision,
+    TurnLifecycle,
     Unroutable,
     Wakes,
     WorkItems,
@@ -245,6 +246,7 @@ defmodule Tightbeam.Gateway do
                   db: db,
                   wake_id: wake.wake_id,
                   sender: wake.origin,
+                  principal: wake_delivery_principal(wake),
                   role_ref: role,
                   role_fallback: fallback
                 ] ++ delivery_config
@@ -268,6 +270,7 @@ defmodule Tightbeam.Gateway do
               db: db,
               wake_id: wake.wake_id,
               sender: wake.origin,
+              principal: wake_delivery_principal(wake),
               # targetGate = 0 (decision notifications) delivers to the recorded
               # sessionKey unconditionally; every other wake keeps its gate.
               target_gate: if(wake.target_gate == 0, do: nil, else: wake),
@@ -938,6 +941,7 @@ defmodule Tightbeam.Gateway do
       "work-item-get" => fn call -> WorkItems.__handle__(db, "work-item-get", call) end,
       "work-item-trace" => fn call -> WorkItems.__handle__(db, "work-item-trace", call) end,
       "transcript" => fn call -> Tightbeam.Transcript.read(db, call) end,
+      "turn-trace" => fn call -> TurnLifecycle.read(db, call) end,
       "attend" => fn call -> attend_result(db, call) end,
       "toplines" => fn call -> Tightbeam.Toplines.roster(db, call) end,
       "topline" => fn call -> Tightbeam.Toplines.topline(db, call) end,
@@ -1152,6 +1156,8 @@ defmodule Tightbeam.Gateway do
             Ledger.enqueue_in_txn(txn, %{
               session_key: target,
               message_id: message.id,
+              client_message_id: message.client_message_id,
+              principal: opts[:principal] || origin,
               wake_id: opts[:wake_id],
               origin: origin,
               prompt: stamped,
@@ -2006,11 +2012,9 @@ defmodule Tightbeam.Gateway do
       end
 
       outcome =
-        with {:ok, adapter, generation} <-
-               stage(:checkout, checkout_adapter(session)),
-             {:ok, harness_session_id} <-
-               stage(
-                 :session,
+        with {:ok, adapter, generation} <- traced_checkout(db, turn, session),
+             {:ok, harness_session} <-
+               traced_stage(db, turn, :session, fn ->
                  with_session_mutation_lock(turn.session_key, fn ->
                    # Tune holds this same lock across adapter apply and record
                    # commit. Re-read inside it so the push cannot use the
@@ -2026,22 +2030,21 @@ defmodule Tightbeam.Gateway do
                      turn.seq
                    )
                  end)
-               ),
+               end),
              {:ok, result} <-
-               stage(
-                 :prompt,
-                 Adapter.prompt(
-                   adapter,
-                   harness_session_id,
-                   turn.prompt,
-                   progress:
-                     progress_fun(db, turn.session_key, session.owner_user_id, correlation)
-                 )
-               ) do
-          append_assistant_messages(db, turn, echo, result)
-
+               traced_prompt(
+                 db,
+                 turn,
+                 adapter,
+                 harness_session.id,
+                 progress_fun(db, turn.session_key, session.owner_user_id, correlation)
+               ),
+             :ok <- append_assistant_messages(db, turn, echo, result) do
           {:ok, %{terminal_publish: terminal_publish}}
         else
+          {:error, {:assistant_commit, reason}} ->
+            {:error, {:prompt, {:lifecycle_trace_failed_after_prompt, :assistant_commit, reason}}}
+
           {:error, {failed_stage, reason}} ->
             # A FAILED TURN FAILS. It does not freeze the session behind a
             # ruling. Adjudication — episodes, holds, an escalation ladder, a
@@ -2080,9 +2083,16 @@ defmodule Tightbeam.Gateway do
             # diagnostic below; arbitrary provider prose must not ride the
             # target marker, terminal state, or stored turn error.
             public_reason =
-              if not is_nil(safe_failure) and not credential_refused?,
-                do: safe_failure.message,
-                else: reason
+              cond do
+                match?({:lifecycle_trace_failed_after_prompt, _, _}, raw_reason) ->
+                  "turn lifecycle trace failed after prompt dispatch; outcome unknown"
+
+                not is_nil(safe_failure) and not credential_refused? ->
+                  safe_failure.message
+
+                true ->
+                  reason
+              end
 
             public_state_error =
               if not is_nil(safe_failure) and not credential_refused?,
@@ -2147,9 +2157,15 @@ defmodule Tightbeam.Gateway do
               )
             end
 
+            terminal =
+              if match?({:lifecycle_trace_failed_after_prompt, _, _}, raw_reason),
+                do: "failed_unknown",
+                else: "failed"
+
             {:error,
              %{
                reason: public_reason,
+               terminal: terminal,
                terminal_publish: failure_publish,
                record_in_txn: record_in_txn,
                after_commit: fn notice ->
@@ -2229,6 +2245,233 @@ defmodule Tightbeam.Gateway do
 
   defp safe_process_failure(_failed_stage, _reason), do: nil
 
+  defp traced_checkout(db, turn, session) do
+    with :ok <- trace_stage_started(db, turn, :checkout) do
+      case traced_call(db, turn, :checkout, fn -> checkout_adapter(session) end) do
+        {:ok, adapter, generation} ->
+          case trace_call(fn ->
+                 Ledger.stamp_adapter(db, turn.seq, generation, turn.owner_lease)
+               end) do
+            :ok -> {:ok, adapter, generation}
+            {:error, reason} -> {:error, {:checkout, {:lifecycle_trace_failed, reason}}}
+          end
+
+        {:error, reason} ->
+          with :ok <- trace_stage_failed(db, turn, :checkout, reason) do
+            {:error, {:checkout, reason}}
+          end
+      end
+    else
+      {:error, reason} -> {:error, {:checkout, {:lifecycle_trace_failed, reason}}}
+    end
+  end
+
+  defp traced_stage(db, turn, stage, fun) when stage in [:session] and is_function(fun, 0) do
+    with :ok <- trace_stage_started(db, turn, stage) do
+      case traced_call(db, turn, stage, fun) do
+        {:ok, value} ->
+          detail = %{v: 1, mode: value.mode}
+
+          with :ok <-
+                 trace_event(db, turn.seq, %{
+                   event_key: "#{stage}:succeeded",
+                   producer_event_id: "gateway:#{stage}:succeeded",
+                   kind: "stage_succeeded",
+                   stage: Atom.to_string(stage),
+                   outcome: "succeeded",
+                   cause: "turn:#{turn.seq}",
+                   principal: "process:tightbeam",
+                   owner_lease: turn.owner_lease,
+                   detail: detail
+                 }) do
+            {:ok, value}
+          else
+            {:error, reason} -> {:error, {stage, {:lifecycle_trace_failed, reason}}}
+          end
+
+        {:error, reason} ->
+          with :ok <- trace_stage_failed(db, turn, stage, reason) do
+            {:error, {stage, reason}}
+          end
+      end
+    else
+      {:error, reason} -> {:error, {stage, {:lifecycle_trace_failed, reason}}}
+    end
+  end
+
+  defp traced_prompt(db, turn, adapter, harness_session_id, live_progress) do
+    with :ok <- trace_stage_started(db, turn, :prompt) do
+      result =
+        traced_call(db, turn, :prompt, fn ->
+          Adapter.prompt(adapter, harness_session_id, turn.prompt,
+            progress: live_progress,
+            trace_dispatch: fn request_id -> trace_prompt_dispatch(db, turn, request_id) end,
+            trace_progress: fn observation, seq ->
+              trace_progress_observation(db, turn, observation, seq)
+            end
+          )
+        end)
+
+      trace_prompt_result(db, turn, result)
+    else
+      {:error, reason} -> {:error, {:prompt, {:lifecycle_trace_failed, reason}}}
+    end
+  end
+
+  defp trace_prompt_result(db, turn, {:ok, value}) do
+    with :ok <-
+           trace_event(db, turn.seq, %{
+             event_key: "prompt:resolved",
+             producer_event_id: "gateway:prompt:resolved",
+             kind: "prompt_resolved",
+             stage: "prompt",
+             outcome: "delivered",
+             cause: "acp:response",
+             principal: "process:tightbeam",
+             owner_lease: turn.owner_lease,
+             detail: %{v: 1, result: "delivered"}
+           }),
+         :ok <-
+           trace_event(db, turn.seq, %{
+             event_key: "prompt:succeeded",
+             producer_event_id: "gateway:prompt:succeeded",
+             kind: "stage_succeeded",
+             stage: "prompt",
+             outcome: "succeeded",
+             cause: "turn:#{turn.seq}",
+             principal: "process:tightbeam",
+             owner_lease: turn.owner_lease,
+             detail: %{v: 1}
+           }) do
+      {:ok, value}
+    else
+      {:error, reason} ->
+        {:error, {:prompt, {:lifecycle_trace_failed_after_prompt, :resolution, reason}}}
+    end
+  end
+
+  defp trace_prompt_result(db, turn, {:error, reason}) do
+    trace_result =
+      with :ok <-
+             trace_event(db, turn.seq, %{
+               event_key: "prompt:resolved",
+               producer_event_id: "gateway:prompt:resolved",
+               kind: "prompt_resolved",
+               stage: "prompt",
+               outcome: "failed",
+               cause: "acp:response",
+               principal: "process:tightbeam",
+               owner_lease: turn.owner_lease,
+               detail: %{v: 1, result: "failed"}
+             }),
+           :ok <- trace_stage_failed(db, turn, :prompt, reason) do
+        :ok
+      end
+
+    cond do
+      match?({:lifecycle_trace_failed_after_prompt, _, _}, reason) ->
+        {:error, {:prompt, reason}}
+
+      trace_result == :ok ->
+        {:error, {:prompt, reason}}
+
+      true ->
+        {:error, {:prompt, {:lifecycle_trace_failed_after_prompt, :resolution, trace_result}}}
+    end
+  end
+
+  defp trace_stage_started(db, turn, stage) do
+    trace_event(db, turn.seq, %{
+      event_key: "#{stage}:started",
+      producer_event_id: "gateway:#{stage}:started",
+      kind: "stage_started",
+      stage: Atom.to_string(stage),
+      outcome: "started",
+      cause: "turn:#{turn.seq}",
+      principal: "process:tightbeam",
+      owner_lease: turn.owner_lease,
+      detail: %{v: 1}
+    })
+  end
+
+  defp trace_stage_failed(db, turn, stage, reason) do
+    trace_event(db, turn.seq, %{
+      event_key: "#{stage}:failed",
+      producer_event_id: "gateway:#{stage}:failed",
+      kind: "stage_failed",
+      stage: Atom.to_string(stage),
+      outcome: "failed",
+      cause: "turn:#{turn.seq}",
+      principal: "process:tightbeam",
+      owner_lease: turn.owner_lease,
+      detail: Map.put(TurnLifecycle.failure_detail(reason), :v, 1)
+    })
+  end
+
+  defp trace_prompt_dispatch(db, turn, request_id) do
+    trace_event(db, turn.seq, %{
+      event_key: "prompt:dispatched",
+      producer_event_id: "acp:#{turn.owner_lease}:request:#{request_id}:prompt-dispatched",
+      kind: "prompt_dispatched",
+      stage: "prompt",
+      outcome: "dispatched",
+      cause: "acp:port-write",
+      principal: "process:tightbeam",
+      owner_lease: turn.owner_lease,
+      acp_request_id: request_id,
+      detail: %{v: 1}
+    })
+  end
+
+  defp trace_progress_observation(db, turn, observation, seq) do
+    trace_event(db, turn.seq, %{
+      event_key: "progress:#{seq}",
+      producer_event_id: "adapter:#{turn.owner_lease}:progress:#{seq}",
+      kind: "progress_observed",
+      stage: "prompt",
+      outcome: "observed",
+      cause: "acp:session-update",
+      principal: "process:tightbeam",
+      owner_lease: turn.owner_lease,
+      detail: %{v: 1, class: observation.class, label: observation.label}
+    })
+  end
+
+  defp trace_event(db, turn_seq, event) do
+    case TurnLifecycle.append(db, turn_seq, event) do
+      result when result in [:ok, :duplicate, :legacy] -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  rescue
+    error -> {:error, error}
+  catch
+    kind, reason -> {:error, {kind, reason}}
+  end
+
+  defp trace_call(fun) do
+    case fun.() do
+      result when result in [:ok, :duplicate, :legacy] -> :ok
+      {:error, reason} -> {:error, reason}
+      other -> {:error, {:invalid_trace_result, other}}
+    end
+  rescue
+    error -> {:error, error}
+  catch
+    kind, reason -> {:error, {kind, reason}}
+  end
+
+  defp traced_call(db, turn, stage, fun) do
+    fun.()
+  rescue
+    error ->
+      _ = trace_stage_failed(db, turn, stage, error)
+      reraise error, __STACKTRACE__
+  catch
+    kind, reason ->
+      _ = trace_stage_failed(db, turn, stage, {kind, reason})
+      :erlang.raise(kind, reason, __STACKTRACE__)
+  end
+
   # The adapter groups chunks by ACP's public messageId. Commit the whole set
   # before publishing any row so a crash cannot expose half of one turn's
   # assistant messages. Legacy adapters and test doubles return only `text`;
@@ -2237,25 +2480,43 @@ defmodule Tightbeam.Gateway do
     texts = assistant_message_texts(result)
     attention_tier = elected_attention(db, turn.seq)
 
-    {:ok, replies} =
-      DB.transaction(db, fn txn ->
-        Enum.map(texts, fn text ->
-          {:appended, reply} =
-            Projection.append_in_txn(txn, %{
-              session_key: turn.session_key,
-              role: "assistant",
-              content: text,
-              sender: "tightbeam",
-              reply_to_message_id: echo && echo.id,
-              reply_to_client_message_id: echo && echo.client_message_id,
-              attention_tier: attention_tier
-            })
+    case DB.transaction(db, fn txn ->
+           replies =
+             Enum.map(texts, fn text ->
+               {:appended, reply} =
+                 Projection.append_in_txn(txn, %{
+                   session_key: turn.session_key,
+                   role: "assistant",
+                   content: text,
+                   sender: "tightbeam",
+                   reply_to_message_id: echo && echo.id,
+                   reply_to_client_message_id: echo && echo.client_message_id,
+                   attention_tier: attention_tier
+                 })
 
-          reply
-        end)
-      end)
+               reply
+             end)
 
-    Enum.each(replies, &publish_message(db, turn.session_key, &1))
+           TurnLifecycle.append_in_txn(txn, turn.seq, %{
+             event_key: "assistant:committed",
+             producer_event_id: "projection:assistant:committed",
+             kind: "assistant_committed",
+             outcome: "committed",
+             cause: "projection:append",
+             principal: "process:tightbeam",
+             owner_lease: turn.owner_lease,
+             detail: %{v: 1, messageCount: length(replies)}
+           })
+
+           replies
+         end) do
+      {:ok, replies} ->
+        Enum.each(replies, &publish_message(db, turn.session_key, &1))
+        :ok
+
+      {:error, reason} ->
+        {:error, {:assistant_commit, reason}}
+    end
   end
 
   defp assistant_message_texts(%{messages: messages}) when is_list(messages) and messages != [] do
@@ -2263,9 +2524,6 @@ defmodule Tightbeam.Gateway do
   end
 
   defp assistant_message_texts(%{text: text}) when is_binary(text), do: [text]
-
-  defp stage(stage, {:error, reason}), do: {:error, {stage, reason}}
-  defp stage(_stage, result), do: result
 
   defp adapter_key(session), do: {Harness.parse!(session.harness).id(), "shared", session.host}
 
@@ -2341,7 +2599,10 @@ defmodule Tightbeam.Gateway do
   # tell the harness to stop generating (ACP session/cancel notification —
   # fire-and-forget; the substrate's truth is the ledger row either way).
   defp cancel_result(db, call) do
-    case Tightbeam.SessionLane.cancel_current(call.session_key) do
+    case Tightbeam.SessionLane.cancel_current(call.session_key,
+           cause: "cancel-request",
+           principal: TurnLifecycle.principal(Map.get(call, :principal, call.origin))
+         ) do
       {:ok, %{message_id: message_id, seq: seq}} ->
         echo = Projection.get(db, message_id)
         correlation = (echo && echo.client_message_id) || message_id
@@ -2419,7 +2680,7 @@ defmodule Tightbeam.Gateway do
     |> archetypes.acp_mcp_servers()
   end
 
-  defp harness_session(config, db, adapter, generation, session, turn_seq) do
+  defp harness_session(config, db, adapter, generation, session, _turn_seq) do
     cwd = Placement.holder_workdir(config, session)
     mcp_servers = mcp_servers_for_archetype(session.archetype)
     harness = Harness.parse!(session.harness).id()
@@ -2451,7 +2712,7 @@ defmodule Tightbeam.Gateway do
                    ) do
               Org.append_pointer(db, session.session_key, sid, "created")
               Org.set_identity_revision(db, session.session_key, snapshot.revision)
-              {:ok, sid}
+              {:ok, %{id: sid, mode: "new"}}
             end
           end)
 
@@ -2461,7 +2722,7 @@ defmodule Tightbeam.Gateway do
           case Adapter.knows_session_for_turn?(adapter, pointer.harness_session_id) do
             true ->
               case push_known_model_for_turn(adapter, pointer.harness_session_id, session.model) do
-                :ok -> {:ok, pointer.harness_session_id}
+                :ok -> {:ok, %{id: pointer.harness_session_id, mode: "reuse"}}
                 {:error, _reason} = error -> error
               end
 
@@ -2500,7 +2761,7 @@ defmodule Tightbeam.Gateway do
                         )
 
                         Org.set_identity_revision(db, session.session_key, snapshot.revision)
-                        {:ok, pointer.harness_session_id}
+                        {:ok, %{id: pointer.harness_session_id, mode: "load"}}
 
                       {:error, {:model_apply_failed, _reason}} = error ->
                         error
@@ -2536,7 +2797,7 @@ defmodule Tightbeam.Gateway do
                           Org.append_pointer(db, session.session_key, sid, "fallback")
                           Org.set_identity_revision(db, session.session_key, snapshot.revision)
                           append_context_reset_marker(db, session)
-                          {:ok, sid}
+                          {:ok, %{id: sid, mode: "new"}}
                         end
                     end
                   end
@@ -2549,9 +2810,8 @@ defmodule Tightbeam.Gateway do
       end
 
     case enrich_adapter_unavailable(config, result, adapter_key(session), generation) do
-      {:ok, sid} ->
-        :ok = Ledger.stamp_adapter(db, turn_seq, generation)
-        {:ok, sid}
+      {:ok, %{id: _sid, mode: _mode}} = success ->
+        success
 
       error ->
         error
@@ -3470,6 +3730,11 @@ defmodule Tightbeam.Gateway do
       lane_manager: config[:lane_manager] || Tightbeam.LaneManager
     )
   end
+
+  defp wake_delivery_principal(%{creator_session_key: key}) when is_binary(key) and key != "",
+    do: {:session, key}
+
+  defp wake_delivery_principal(%{origin: origin}), do: origin
 
   defp override_skill_names(nil), do: []
   defp override_skill_names(overrides), do: Map.get(overrides, "skills_add", [])
@@ -6368,7 +6633,12 @@ defmodule Tightbeam.Gateway do
        ) do
     assignments = Assignments.interrupt_for_retire_in_txn(txn, session_key, owner, principal)
     Org.retire_in_txn(txn, session_key, principal, supervision_interval_ms)
-    Ledger.drain_queued_for_retire_in_txn(txn, session_key, drain_reason)
+
+    Ledger.drain_queued_for_retire_in_txn(txn, session_key, drain_reason,
+      cause: "session-retired",
+      principal: TurnLifecycle.principal(principal)
+    )
+
     assignments
   end
 

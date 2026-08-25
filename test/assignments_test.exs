@@ -285,8 +285,10 @@ defmodule Tightbeam.AssignmentsTest do
         assignment_id: assignment.id
       })
 
-    assert {:ok, %{seq: ^turn_seq}} = Ledger.claim_next(ctx.db, "holder", "test")
-    assert :ok = Ledger.finish(ctx.db, turn_seq, "delivered")
+    assert {:ok, %{seq: ^turn_seq, owner_lease: lease}} =
+             Ledger.claim_next(ctx.db, "holder", "test")
+
+    assert :ok = Ledger.finish(ctx.db, turn_seq, "delivered", nil, owner_lease: lease)
 
     liveness = start_liveness!(ctx)
 

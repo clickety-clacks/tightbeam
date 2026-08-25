@@ -150,7 +150,7 @@ defmodule Tightbeam.WorkItemsTest do
     assert {:ok, [[^running_seq, 1]]} =
              creation_context(ctx.db, during.id)
 
-    :ok = Ledger.finish(ctx.db, running_seq, "delivered")
+    :ok = finish_running(ctx.db, running_seq, "delivered")
     idle = create(ctx, {:session, "holder"}, %{title: "No running turn"})
 
     assert {:ok, [[nil, 1]]} = creation_context(ctx.db, idle.id)
@@ -175,7 +175,7 @@ defmodule Tightbeam.WorkItemsTest do
 
   test "Proof 5: a cancel-then-arriving create lands known = 1, seq = NULL", ctx do
     running_seq = running_turn!(ctx.db, "holder")
-    :ok = Ledger.finish(ctx.db, running_seq, "canceled")
+    :ok = finish_running(ctx.db, running_seq, "canceled")
 
     item = create(ctx, {:session, "holder"}, %{title: "Arrived after cancel"})
 
@@ -369,6 +369,17 @@ defmodule Tightbeam.WorkItemsTest do
 
     assert {:ok, %{seq: ^seq}} = Ledger.claim_next(db, session_key, "test-owner")
     seq
+  end
+
+  defp finish_running(db, seq, terminal) do
+    {:ok, [[lease]]} =
+      DB.query(
+        db,
+        "SELECT ownerLease FROM turn_lifecycle_events WHERE turnSeq=?1 AND kind='claimed'",
+        [seq]
+      )
+
+    Ledger.finish(db, seq, terminal, nil, owner_lease: lease)
   end
 
   defp update(ctx, principal, id, patch),

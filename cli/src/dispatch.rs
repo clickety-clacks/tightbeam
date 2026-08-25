@@ -568,6 +568,19 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             }
             Ok(request(identity, "transcript", vec![], params))
         }
+        Command::TurnTrace {
+            identity,
+            session,
+            seq,
+        } => Ok(request(
+            identity,
+            "turn-trace",
+            vec![],
+            vec![
+                string_field("sessionKey", session),
+                format!("\"turnSeq\":{seq}"),
+            ],
+        )),
         Command::Toplines {
             identity,
             filters,
@@ -1536,6 +1549,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::WorkItemTrace { identity, .. }
         | Command::Attend { identity, .. }
         | Command::Transcript { identity, .. }
+        | Command::TurnTrace { identity, .. }
         | Command::Toplines { identity, .. }
         | Command::Topline { identity, .. }
         | Command::CoordinationShare { identity, .. }
@@ -1685,6 +1699,22 @@ mod tests {
                 "flynn"
             ]),
             r#"{"asUser":"flynn","verb":"tune","sessionKey":"s_1","params":{"setting":"set_reasoning","reasoningLevel":"xhigh"}}"#
+        );
+    }
+
+    #[test]
+    fn turn_trace_is_a_non_target_read_with_numeric_sequence() {
+        assert_eq!(
+            body(&[
+                "turn-trace",
+                "--session",
+                "agent:coder:x s_1",
+                "--seq",
+                "17",
+                "--as-user",
+                "flynn",
+            ]),
+            r#"{"asUser":"flynn","verb":"turn-trace","params":{"sessionKey":"agent:coder:x s_1","turnSeq":17}}"#
         );
     }
 

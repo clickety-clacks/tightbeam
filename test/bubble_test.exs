@@ -73,7 +73,7 @@ defmodule Tightbeam.Productions.BubbleTest do
       )
 
     {:ok, turn} = Ledger.claim_next(db, session_key, "test-lane")
-    :ok = Ledger.finish(db, turn.seq, terminal, error)
+    :ok = Ledger.finish(db, turn.seq, terminal, error, owner_lease: turn.owner_lease)
     turn.seq
   end
 
@@ -156,7 +156,12 @@ defmodule Tightbeam.Productions.BubbleTest do
 
     # The supervisor cannot run either: its notice fails. Same wall.
     {:ok, notice} = Ledger.claim_next(ctx.db, "supervisor", "test-lane")
-    :ok = Ledger.finish(ctx.db, notice.seq, "failed", "quota exhausted")
+
+    :ok =
+      Ledger.finish(ctx.db, notice.seq, "failed", "quota exhausted",
+        owner_lease: notice.owner_lease
+      )
+
     :ok = Bubble.recognize_terminal(ctx.db, notice.seq)
 
     # The SAME cause climbed — not a notice about the notice.
@@ -169,7 +174,10 @@ defmodule Tightbeam.Productions.BubbleTest do
     # the lineage: the alert is a substrate message in the owner's stream (no
     # turn, no tokens) and the fact stands for the OWNER, not a session.
     {:ok, top} = Ledger.claim_next(ctx.db, ctx.main.session_key, "test-lane")
-    :ok = Ledger.finish(ctx.db, top.seq, "failed", "quota exhausted")
+
+    :ok =
+      Ledger.finish(ctx.db, top.seq, "failed", "quota exhausted", owner_lease: top.owner_lease)
+
     :ok = Bubble.recognize_terminal(ctx.db, top.seq)
 
     assert ConditionFacts.standing?(ctx.db, "user-alerted", "flynn")
@@ -241,7 +249,10 @@ defmodule Tightbeam.Productions.BubbleTest do
       )
 
     {:ok, turn} = Ledger.claim_next(ctx.db, "holder", "test-lane")
-    :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
+
+    :ok =
+      Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+
     :ok = Bubble.recognize_terminal(ctx.db, turn.seq)
 
     refute ConditionFacts.standing?(ctx.db, "user-alerted", "flynn")
@@ -255,7 +266,10 @@ defmodule Tightbeam.Productions.BubbleTest do
 
     for rung <- ["supervisor", ctx.main.session_key] do
       {:ok, notice} = Ledger.claim_next(ctx.db, rung, "test-lane")
-      :ok = Ledger.finish(ctx.db, notice.seq, "failed", "new wall")
+
+      :ok =
+        Ledger.finish(ctx.db, notice.seq, "failed", "new wall", owner_lease: notice.owner_lease)
+
       :ok = Bubble.recognize_terminal(ctx.db, notice.seq)
     end
 

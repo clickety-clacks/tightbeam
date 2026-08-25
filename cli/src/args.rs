@@ -231,6 +231,11 @@ pub enum Command {
         after: Option<String>,
         limit: Option<String>,
     },
+    TurnTrace {
+        identity: Identity,
+        session: String,
+        seq: String,
+    },
     Toplines {
         identity: Identity,
         filters: ToplineFilters,
@@ -563,6 +568,10 @@ COMMANDS:
       No cursor reads the tail (newest first page, shown oldest-first); page
       back with --before <oldestId> and catch up with --after <newestId>, both
       ids the previous response handed you. --limit defaults to 50, caps at 500.
+  turn-trace --session <key> --seq <turnSeq>
+      Read the ordered lifecycle boundaries for one turn. The same owner-or-
+      admin visibility rule as transcript applies; hidden and unknown turns
+      both return not_found.
   toplines [--origin user|session|all] [--owner <userId>] [--state <state>]
            [--quiet-over <duration>] [--spec <name> [--spec-sha <sha>]]
            [--session <key>] [--tree] [--after <workItemId>] [--limit <n>]
@@ -1683,6 +1692,21 @@ fn parse_with_optional_catalog(
                     .map(|value| js_number_json(number_coercion(&value))),
             })
         }
+        "turn-trace" => {
+            if parsed.positional.len() != 1 {
+                return Err(
+                    "usage: tightbeam turn-trace --session <key> --seq <turnSeq>".to_owned(),
+                );
+            }
+            Ok(Command::TurnTrace {
+                identity: identity(flags)?,
+                session: nonempty(flags, "session")
+                    .ok_or_else(|| "turn-trace requires --session <key>".to_owned())?,
+                seq: nonempty(flags, "seq")
+                    .map(|value| js_number_json(number_coercion(&value)))
+                    .ok_or_else(|| "turn-trace requires --seq <turnSeq>".to_owned())?,
+            })
+        }
         "toplines" => {
             if parsed.positional.len() != 1 {
                 return Err(TOPLINES_USAGE.to_owned());
@@ -1980,7 +2004,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, ask, answer, return, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, ask, answer, return, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -2811,6 +2835,7 @@ mod tests {
                 "work-item-get",
                 "attend",
                 "transcript",
+                "turn-trace",
                 "unlearn",
                 "topline",
                 "toplines",
@@ -3391,7 +3416,38 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, ask, answer, return, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, ask, answer, return, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned())
+        );
+    }
+
+    #[test]
+    fn turn_trace_requires_one_session_and_a_numeric_sequence() {
+        assert_eq!(
+            parse(strings(&[
+                "turn-trace",
+                "--session",
+                "agent:coder:x s_1",
+                "--seq",
+                "17",
+                "--as-user",
+                "flynn",
+            ])),
+            Ok(Command::TurnTrace {
+                identity: Identity::User("flynn".to_owned()),
+                session: "agent:coder:x s_1".to_owned(),
+                seq: "17".to_owned(),
+            })
+        );
+
+        assert_eq!(
+            parse(strings(&[
+                "turn-trace",
+                "--seq",
+                "17",
+                "--as-user",
+                "flynn"
+            ])),
+            Err("turn-trace requires --session <key>".to_owned())
         );
     }
 

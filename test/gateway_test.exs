@@ -185,41 +185,48 @@ defmodule Tightbeam.GatewayTest do
       {:reply, :ok, parent}
     end
 
-    def handle_call({:prompt, _sid, "fail this turn", _opts}, _from, parent),
-      do:
-        {:reply,
-         {:error, %{"message" => "Internal error", "data" => %{"details" => "auth expired"}}},
-         parent}
+    def handle_call({:prompt, _sid, "fail this turn", opts}, _from, parent) do
+      trace_dispatch(opts)
+
+      {:reply,
+       {:error, %{"message" => "Internal error", "data" => %{"details" => "auth expired"}}},
+       parent}
+    end
 
     # The typed fields are the concrete ACP response specimens frozen in the
     # reviewed provenance recon. The surrounding prose is deliberately hostile
     # so the public projection proves that it copies none of it.
-    def handle_call({:prompt, _sid, "known codex failure", _opts}, _from, parent),
-      do:
-        {:reply,
-         {:error,
-          %{
-            "code" => -32603,
-            "message" => "Internal error",
-            "data" => %{
-              "codexErrorInfo" => "usageLimitExceeded",
-              "details" => "token=provider-secret /private/provider/payload.json"
-            }
-          }}, parent}
+    def handle_call({:prompt, _sid, "known codex failure", opts}, _from, parent) do
+      trace_dispatch(opts)
 
-    def handle_call({:prompt, _sid, "known claude failure", _opts}, _from, parent),
-      do:
-        {:reply,
-         {:error,
-          %{
-            "message" => "provider payload",
-            "data" => %{
-              "errorKind" => "rate_limit",
-              "details" => "credential=provider-secret https://provider.invalid/account"
-            }
-          }}, parent}
+      {:reply,
+       {:error,
+        %{
+          "code" => -32603,
+          "message" => "Internal error",
+          "data" => %{
+            "codexErrorInfo" => "usageLimitExceeded",
+            "details" => "token=provider-secret /private/provider/payload.json"
+          }
+        }}, parent}
+    end
 
-    def handle_call({:prompt, _sid, prompt, _opts}, from, parent) do
+    def handle_call({:prompt, _sid, "known claude failure", opts}, _from, parent) do
+      trace_dispatch(opts)
+
+      {:reply,
+       {:error,
+        %{
+          "message" => "provider payload",
+          "data" => %{
+            "errorKind" => "rate_limit",
+            "details" => "credential=provider-secret https://provider.invalid/account"
+          }
+        }}, parent}
+    end
+
+    def handle_call({:prompt, _sid, prompt, opts}, from, parent) do
+      trace_dispatch(opts)
       send(parent, {:prompt_started, self()})
 
       messages =
@@ -246,6 +253,13 @@ defmodule Tightbeam.GatewayTest do
                      ))
 
       {:noreply, parent}
+    end
+
+    defp trace_dispatch(opts) do
+      case Keyword.get(opts, :trace_dispatch) do
+        fun when is_function(fun, 1) -> :ok = fun.(73)
+        _ -> :ok
+      end
     end
   end
 
@@ -6360,8 +6374,34 @@ defmodule Tightbeam.GatewayTest do
 
     send(adapter, :continue_prompt)
     assert {:ok, %{terminal_publish: publish}} = Task.await(task)
-    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
+
+    assert :ok =
+             Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+
     publish.("delivered")
+
+    trace =
+      Tightbeam.TurnLifecycle.read(ctx.db, %{
+        params: %{session_key: "k1", turn_seq: turn.seq},
+        principal: {:user, "flynn"}
+      })
+
+    assert Enum.map(trace.events, & &1.event_key) == [
+             "accepted",
+             "claimed",
+             "checkout:started",
+             "checkout:succeeded",
+             "session:started",
+             "session:succeeded",
+             "prompt:started",
+             "prompt:dispatched",
+             "prompt:resolved",
+             "prompt:succeeded",
+             "assistant:committed",
+             "terminal:committed"
+           ]
+
+    assert Enum.find(trace.events, &(&1.event_key == "prompt:dispatched")).acp_request_id == 73
 
     assert %{harness_session_id: "harness-1", harness: "codex"} =
              Org.current_pointer(ctx.db, "k1")
@@ -6711,7 +6751,10 @@ defmodule Tightbeam.GatewayTest do
     assert_receive {:prompt_started, ^adapter}, @cold_runner_prompt_timeout
     send(adapter, :continue_prompt)
     assert {:ok, %{terminal_publish: publish}} = Task.await(task)
-    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
+
+    assert :ok =
+             Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+
     publish.("delivered")
 
     replies =
@@ -6853,7 +6896,10 @@ defmodule Tightbeam.GatewayTest do
     send(self(), {:push, Tightbeam.Wire.Payloads.ack("c_gold")})
     send(adapter, :continue_prompt)
     assert {:ok, %{terminal_publish: publish}} = Task.await(task)
-    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
+
+    assert :ok =
+             Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+
     publish.("delivered")
 
     frames = collect_pushes(10, [])
@@ -6962,6 +7008,25 @@ defmodule Tightbeam.GatewayTest do
              _ ->
                false
            end)
+
+    turn_seq = Ledger.last_terminal_seq(ctx.db, "k1")
+
+    trace =
+      Tightbeam.TurnLifecycle.read(ctx.db, %{
+        params: %{session_key: "k1", turn_seq: turn_seq},
+        principal: {:user, "flynn"}
+      })
+
+    assert Enum.map(trace.events, & &1.event_key) == [
+             "accepted",
+             "claimed",
+             "checkout:started",
+             "checkout:succeeded",
+             "session:started",
+             "session:failed",
+             "terminal:committed",
+             "terminal:published"
+           ]
   end
 
   # Install a fresh catalog for one {host, harness}, so a test can give two hosts
@@ -7250,7 +7315,10 @@ defmodule Tightbeam.GatewayTest do
     assert_receive {:prompt_started, ^adapter}, @cold_runner_prompt_timeout
     send(adapter, :continue_prompt)
     assert {:ok, %{terminal_publish: publish}} = Task.await(task)
-    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
+
+    assert :ok =
+             Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+
     publish.("delivered")
   end
 
@@ -7409,7 +7477,10 @@ defmodule Tightbeam.GatewayTest do
     assert_receive {:prompt_started, ^adapter}, @cold_runner_prompt_timeout
     send(adapter, :continue_prompt)
     assert {:ok, %{terminal_publish: publish}} = Task.await(task)
-    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
+
+    assert :ok =
+             Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+
     publish.("delivered")
 
     frames = collect_pushes(10, [])
@@ -7491,7 +7562,9 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, %{terminal_publish: publish}} =
              runner.(Map.put(turn, :session_key, "k1"))
 
-    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
+    assert :ok =
+             Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+
     publish.("delivered")
     assert_receive {:load_apply_residency, "load-apply-session"}
 
@@ -7557,7 +7630,10 @@ defmodule Tightbeam.GatewayTest do
 
     assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
     assert {:ok, %{terminal_publish: publish}} = runner.(Map.put(turn, :session_key, "k1"))
-    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
+
+    assert :ok =
+             Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+
     publish.("delivered")
 
     assert_receive {:unknown_new_session, nil}
@@ -7582,7 +7658,11 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, %{terminal_publish: fallback_publish}} =
              runner.(Map.put(fallback_turn, :session_key, "k1"))
 
-    assert :ok = Ledger.finish(ctx.db, fallback_turn.seq, "delivered")
+    assert :ok =
+             Ledger.finish(ctx.db, fallback_turn.seq, "delivered", nil,
+               owner_lease: fallback_turn.owner_lease
+             )
+
     fallback_publish.("delivered")
 
     assert_receive {:unknown_load_lost, "default-session", nil}
@@ -7649,12 +7729,35 @@ defmodule Tightbeam.GatewayTest do
 
     assert {:ok, true} =
              DB.transaction(ctx.db, fn txn ->
-               assert Ledger.finish_in_txn(txn, turn.seq, "failed", "boom")
+               assert Ledger.finish_in_txn(txn, turn.seq, "failed", "boom",
+                        owner_lease: turn.owner_lease
+                      )
+
                record.(txn)
                true
              end)
 
     publish.("failed")
+
+    trace =
+      Tightbeam.TurnLifecycle.read(ctx.db, %{
+        params: %{session_key: "k1", turn_seq: turn.seq},
+        principal: {:user, "flynn"}
+      })
+
+    assert Enum.map(trace.events, & &1.event_key) == [
+             "accepted",
+             "claimed",
+             "checkout:started",
+             "checkout:succeeded",
+             "session:started",
+             "session:succeeded",
+             "prompt:started",
+             "prompt:dispatched",
+             "prompt:resolved",
+             "prompt:failed",
+             "terminal:committed"
+           ]
 
     # EVERY failed turn speaks now. Adjudication used to route a failure into a
     # brief instead of the marker, so deleting the brief (2026-08-05) would have
@@ -7783,7 +7886,11 @@ defmodule Tightbeam.GatewayTest do
       assert {:ok, notice} =
                DB.transaction(ctx.db, fn txn ->
                  stored_error = if is_binary(reason), do: reason, else: inspect(reason)
-                 assert Ledger.finish_in_txn(txn, turn.seq, "failed", stored_error)
+
+                 assert Ledger.finish_in_txn(txn, turn.seq, "failed", stored_error,
+                          owner_lease: turn.owner_lease
+                        )
+
                  record.(txn)
                end)
 
@@ -8040,7 +8147,10 @@ defmodule Tightbeam.GatewayTest do
 
     assert {:error, %RuntimeError{message: "forced process-cause rollback"}} =
              DB.transaction(ctx.db, fn txn ->
-               assert Ledger.finish_in_txn(txn, turn.seq, "failed", "known failure")
+               assert Ledger.finish_in_txn(txn, turn.seq, "failed", "known failure",
+                        owner_lease: turn.owner_lease
+                      )
+
                record.(txn)
                raise "forced process-cause rollback"
              end)
@@ -8139,7 +8249,10 @@ defmodule Tightbeam.GatewayTest do
     # the STAGE (:checkout — pre-engine) and the raw fault the user-facing sentence flattened.
     assert {:ok, true} =
              DB.transaction(ctx.db, fn txn ->
-               assert Ledger.finish_in_txn(txn, turn.seq, "failed", reason)
+               assert Ledger.finish_in_txn(txn, turn.seq, "failed", reason,
+                        owner_lease: turn.owner_lease
+                      )
+
                record.(txn)
                true
              end)
@@ -8153,6 +8266,25 @@ defmodule Tightbeam.GatewayTest do
 
     assert lifecycle, "the refusal must record a harness_turn_error lifecycle event"
     assert lifecycle.detail =~ "checkout"
+
+    trace =
+      Tightbeam.TurnLifecycle.read(ctx.db, %{
+        params: %{session_key: "k1", turn_seq: turn.seq},
+        principal: {:user, "flynn"}
+      })
+
+    assert Enum.map(trace.events, & &1.event_key) == [
+             "accepted",
+             "claimed",
+             "checkout:started",
+             "checkout:failed",
+             "terminal:committed"
+           ]
+
+    checkout_failure = Enum.find(trace.events, &(&1.event_key == "checkout:failed")).detail
+    assert Map.keys(checkout_failure) |> Enum.sort() == ~w(failureClass failureDigest v)
+    assert checkout_failure["failureClass"] == "error"
+    assert byte_size(checkout_failure["failureDigest"]) == 64
 
     # TELLS (chat channel): the remedy reaches the user durably as the `[turn failed]`
     # marker, read from the projection rather than a brittle push count.
@@ -8406,7 +8538,10 @@ defmodule Tightbeam.GatewayTest do
     # error_text would produce one.
     assert {:ok, true} =
              DB.transaction(ctx.db, fn txn ->
-               assert Ledger.finish_in_txn(txn, turn.seq, "failed", "prompt auth 401")
+               assert Ledger.finish_in_txn(txn, turn.seq, "failed", "prompt auth 401",
+                        owner_lease: turn.owner_lease
+                      )
+
                record.(txn)
                true
              end)
@@ -8887,7 +9022,9 @@ defmodule Tightbeam.GatewayTest do
                prompt: "in flight"
              })
 
-    assert {:ok, %{seq: ^seq}} = Ledger.claim_next(ctx.db, session.session_key, "test")
+    assert {:ok, %{seq: ^seq, owner_lease: owner_lease}} =
+             Ledger.claim_next(ctx.db, session.session_key, "test")
+
     assert Ledger.running?(ctx.db, session.session_key)
 
     apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
@@ -8902,7 +9039,7 @@ defmodule Tightbeam.GatewayTest do
              apply.(%{origin: "user:flynn", params: %{all: true}})
 
     # Terminalizing it releases the boundary — nothing else had to change.
-    assert Ledger.finish(ctx.db, seq, "delivered") == :ok
+    assert Ledger.finish(ctx.db, seq, "delivered", nil, owner_lease: owner_lease) == :ok
     refute Ledger.running?(ctx.db, session.session_key)
 
     assert %{applied: applied, identity_revision: ^revision} =

@@ -426,7 +426,13 @@ defmodule Tightbeam.ConditionFactsTest do
   end
 
   test "agent wakes keep the exact running-turn carrier through every delivery boundary", ctx do
-    %{assignment: assignment, caller: caller, turn_seq: turn_seq, work_item: work_item} =
+    %{
+      assignment: assignment,
+      caller: caller,
+      owner_lease: owner_lease,
+      turn_seq: turn_seq,
+      work_item: work_item
+    } =
       attributed_caller(ctx)
 
     wake_handler = Gateway.handlers(%{db: ctx.db, wake_scheduler: ctx.scheduler})["wake"]
@@ -569,7 +575,8 @@ defmodule Tightbeam.ConditionFactsTest do
       assert rows in [[], [[assignment.id, work_item.id]]]
     end
 
-    assert :ok = Ledger.finish(ctx.db, turn_seq, "delivered")
+    assert :ok =
+             Ledger.finish(ctx.db, turn_seq, "delivered", nil, owner_lease: owner_lease)
 
     unscoped =
       wake_handler.(
@@ -773,9 +780,16 @@ defmodule Tightbeam.ConditionFactsTest do
         job_ref: work_item.id
       })
 
-    assert {:ok, %{seq: ^turn_seq}} = Ledger.claim_next(ctx.db, caller.session_key, "test")
+    assert {:ok, %{seq: ^turn_seq, owner_lease: owner_lease}} =
+             Ledger.claim_next(ctx.db, caller.session_key, "test")
 
-    %{assignment: assignment, caller: caller, turn_seq: turn_seq, work_item: work_item}
+    %{
+      assignment: assignment,
+      caller: caller,
+      owner_lease: owner_lease,
+      turn_seq: turn_seq,
+      work_item: work_item
+    }
   end
 
   defp agent_wake_call(caller_session_key, target_session_key, params) do
