@@ -9,8 +9,13 @@ import json
 import re
 import subprocess
 import sys
+import tarfile
 from pathlib import Path
 from typing import Any
+
+from package_manifest import Refusal as PayloadRefusal
+from package_manifest import load_canonical as load_payload_manifest
+from package_manifest import verify as verify_payload_manifest
 
 PLATFORMS = ("darwin-aarch64", "linux-x86_64")
 SHA_RE = re.compile(r"[0-9a-f]{40}")
@@ -23,7 +28,14 @@ INPUT_KEYS = {
     "schema",
     "source_sha",
 }
-PROOF_KEYS = INPUT_KEYS | {"packages", "run_id", "toolchains", "workflow_sha"}
+PROOF_KEYS = INPUT_KEYS | {
+    "packages",
+    "payload_manifests",
+    "run_id",
+    "toolchains",
+    "verification_evidence",
+    "workflow_sha",
+}
 EVIDENCE_KEYS = {"path", "platform", "sha256"}
 
 
@@ -115,6 +127,14 @@ def evidence_entries(root: Path, kind: str) -> list[dict[str, str]]:
             path = matches[0]
             if not path.name.endswith(f"-{platform}.tgz"):
                 refuse(f"evidence: package name does not match platform {platform}")
+        elif kind == "payload_manifests":
+            path = root / "payload-manifests" / f"{platform}.json"
+            if not path.is_file():
+                refuse(f"evidence: missing {platform} payload manifest")
+        elif kind == "verification_evidence":
+            path = root / "verification-evidence" / f"{platform}.json"
+            if not path.is_file():
+                refuse(f"evidence: missing {platform} verification evidence")
         else:
             path = root / "toolchains" / f"{platform}.txt"
             if not path.is_file():
@@ -140,11 +160,13 @@ def create(args: argparse.Namespace) -> None:
     if not args.run_id.isdigit():
         refuse("run_id must contain decimal digits only")
     proof = dict(candidate)
-    proof["schema"] = "tightbeam-release-candidate-proof/v1"
+    proof["schema"] = "tightbeam-release-candidate-proof/v2"
     proof["workflow_sha"] = workflow_sha
     proof["run_id"] = args.run_id
     proof["packages"] = evidence_entries(args.evidence_root, "packages")
+    proof["payload_manifests"] = evidence_entries(args.evidence_root, "payload_manifests")
     proof["toolchains"] = evidence_entries(args.evidence_root, "toolchains")
+    proof["verification_evidence"] = evidence_entries(args.evidence_root, "verification_evidence")
     args.output.write_bytes(canonical_bytes(proof))
 
 
@@ -191,6 +213,36 @@ def verify_evidence(value: dict[str, Any], root: Path, kind: str) -> None:
         if kind == "packages":
             if not path.name.endswith(f"-{platform}.tgz"):
                 refuse(f"manifest: package name does not match platform {platform}")
+        if kind == "payload_manifests":
+            expected_path = Path("payload-manifests") / f"{platform}.json"
+            if relative != expected_path:
+                refuse(f"manifest: payload manifest path does not match platform {platform}")
+            try:
+                payload = load_payload_manifest(path)
+            except (OSError, PayloadRefusal) as error:
+                refuse(f"manifest: cannot read payload manifest {relative}: {error}")
+            if payload.get("schema") != "tightbeam-payload-manifest/v1":
+                refuse(f"manifest: {relative} has the wrong payload manifest schema")
+        if kind == "verification_evidence":
+            expected_path = Path("verification-evidence") / f"{platform}.json"
+            if relative != expected_path:
+                refuse(f"manifest: verification evidence path does not match platform {platform}")
+            evidence = load_canonical(path)
+            exact_keys(
+                evidence,
+                {
+                    "artifact_sha256",
+                    "checks",
+                    "package_version",
+                    "payload_manifest_sha256",
+                    "schema",
+                },
+                f"manifest {relative}",
+            )
+            if evidence["schema"] != "tightbeam-verification-evidence/v1":
+                refuse(f"manifest: {relative} has the wrong verification-evidence schema")
+            if evidence["checks"] != ["version-smoke", "payload-manifest"]:
+                refuse(f"manifest: {relative} has incomplete verification checks")
         if kind == "toolchains":
             if relative != Path("toolchains") / f"{platform}.txt":
                 refuse(f"manifest: toolchain path does not match platform {platform}")
@@ -200,13 +252,38 @@ def verify_evidence(value: dict[str, Any], root: Path, kind: str) -> None:
                     refuse(f"manifest: {relative} lacks {marker}")
 
 
+def verify_payload_bindings(value: dict[str, Any], root: Path) -> None:
+    packages = {row["platform"]: row for row in value["packages"]}
+    manifests = {row["platform"]: row for row in value["payload_manifests"]}
+    evidence = {row["platform"]: row for row in value["verification_evidence"]}
+    for platform in PLATFORMS:
+        package_path = root / packages[platform]["path"]
+        manifest_path = root / manifests[platform]["path"]
+        evidence_path = root / evidence[platform]["path"]
+        evidence_value = load_canonical(evidence_path)
+        if packages[platform]["sha256"] != evidence_value["artifact_sha256"]:
+            refuse(f"manifest: package digest is not bound by verification evidence for {platform}")
+        if manifests[platform]["sha256"] != evidence_value["payload_manifest_sha256"]:
+            refuse(f"manifest: payload manifest digest is not bound by verification evidence for {platform}")
+        if file_digest(package_path) != evidence_value["artifact_sha256"]:
+            refuse(f"manifest: verification evidence package digest mismatch for {platform}")
+        if file_digest(manifest_path) != evidence_value["payload_manifest_sha256"]:
+            refuse(f"manifest: verification evidence payload digest mismatch for {platform}")
+        try:
+            verify_payload_manifest(
+                argparse.Namespace(artifact=package_path, manifest=manifest_path)
+            )
+        except (OSError, PayloadRefusal, tarfile.TarError) as error:
+            refuse(f"manifest: payload verification failed for {platform}: {error}")
+
+
 def verify(args: argparse.Namespace) -> None:
     value = load_canonical(args.manifest)
     exact_keys(value, PROOF_KEYS, "manifest")
     input_value = {key: value[key] for key in INPUT_KEYS}
     input_value["schema"] = "tightbeam-release-candidate-input/v1"
     validate_input(input_value)
-    if value["schema"] != "tightbeam-release-candidate-proof/v1":
+    if value["schema"] != "tightbeam-release-candidate-proof/v2":
         refuse("manifest: wrong schema")
     exact_sha(value["workflow_sha"], "manifest workflow_sha")
     if not isinstance(value["run_id"], str) or not value["run_id"].isdigit():
@@ -222,7 +299,10 @@ def verify(args: argparse.Namespace) -> None:
             refuse(f"manifest: {field} mismatch; expected {wanted}, found {value[field]}")
     verify_graph(value, args.repository_root)
     verify_evidence(value, args.evidence_root, "packages")
+    verify_evidence(value, args.evidence_root, "payload_manifests")
     verify_evidence(value, args.evidence_root, "toolchains")
+    verify_evidence(value, args.evidence_root, "verification_evidence")
+    verify_payload_bindings(value, args.evidence_root)
 
 
 def parser() -> argparse.ArgumentParser:

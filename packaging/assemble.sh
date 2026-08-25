@@ -40,7 +40,19 @@ cp -R _build/prod/rel/tightbeam_gateway "$OUT/release"
 sed "s/\"name\": \"tightbeam\"/\"name\": \"tightbeam\",\n  \"version\": \"$VERSION\",\n  \"os\": [\"$OS\"],\n  \"cpu\": [\"$NPM_CPU\"]/" packaging/package.json > "$OUT/package.json"
 ARTIFACT="_build/npm/tightbeam-$VERSION-$OS-$ARCH.tgz"
 TEMP_ARTIFACT="$ARTIFACT.tmp.$$"
-trap 'rm -f "$TEMP_ARTIFACT"' EXIT HUP INT TERM
+PAYLOAD_MANIFEST="${ARTIFACT%.tgz}.payload-manifest.json"
+TEMP_PAYLOAD_MANIFEST="$PAYLOAD_MANIFEST.tmp.$$"
+VERIFICATION_EVIDENCE="${ARTIFACT%.tgz}.verification-evidence.json"
+trap 'rm -f "$TEMP_ARTIFACT" "$TEMP_PAYLOAD_MANIFEST"' EXIT HUP INT TERM
 (cd _build/npm && tar czf "$(basename "$TEMP_ARTIFACT")" tightbeam)
-sh packaging/finalize-artifact.sh "$TEMP_ARTIFACT" "$ARTIFACT" "$VERSION"
+python3 scripts/package_manifest.py create \
+  --root "$OUT" \
+  --output "$TEMP_PAYLOAD_MANIFEST"
+sh packaging/finalize-artifact.sh \
+  "$TEMP_ARTIFACT" \
+  "$ARTIFACT" \
+  "$VERSION" \
+  "$TEMP_PAYLOAD_MANIFEST" \
+  "$PAYLOAD_MANIFEST" \
+  "$VERIFICATION_EVIDENCE"
 echo "artifact: $ARTIFACT"

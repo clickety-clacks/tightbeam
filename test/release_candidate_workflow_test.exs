@@ -24,6 +24,17 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
     assert {_, 0} = command("git", ["archive", "--format=tar", "-o", archive, "HEAD"], cd: @root)
     assert {_, 0} = command("tar", ["xf", archive, "-C", capture_root])
     File.rm!(archive)
+
+    for path <- [
+          "packaging/assemble.sh",
+          "packaging/finalize-artifact.sh",
+          "scripts/package_manifest.py"
+        ] do
+      destination = Path.join(capture_root, path)
+      File.mkdir_p!(Path.dirname(destination))
+      File.cp!(Path.join(@root, path), destination)
+    end
+
     File.ln_s!(Path.join(@root, "deps"), Path.join(capture_root, "deps"))
     File.ln_s!(Path.join(@root, "cli/target"), Path.join(capture_root, "cli/target"))
 
@@ -34,6 +45,9 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
 
     {:ok,
      real_package: package,
+     real_payload_manifest: package |> String.replace_suffix(".tgz", ".payload-manifest.json"),
+     real_verification_evidence:
+       package |> String.replace_suffix(".tgz", ".verification-evidence.json"),
      real_toolchain: toolchain_record!(),
      fixture_provenance: "sh packaging/assemble.sh; elixir --version; rustc --version"}
   end
@@ -172,6 +186,8 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
     assert workflow =~ "platform: linux-x86_64"
     assert workflow =~ "platform: darwin-aarch64"
     assert workflow =~ "sh packaging/assemble.sh"
+    assert workflow =~ "payload-manifest.json"
+    assert workflow =~ "verification-evidence.json"
   end
 
   test "workflow publishes final proof only behind all test and package jobs" do
@@ -193,12 +209,14 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
     assert {"", 0} = create_manifest(fixture)
     assert {"", 0} = verify_manifest(fixture)
     manifest = File.read!(fixture.manifest)
-    assert manifest =~ ~s("schema":"tightbeam-release-candidate-proof/v1")
+    assert manifest =~ ~s("schema":"tightbeam-release-candidate-proof/v2")
     assert manifest =~ ~s("protected_base_sha":"#{fixture.base}")
     assert manifest =~ ~s("source_sha":"#{fixture.f2}")
     assert manifest =~ ~s("workflow_sha":"#{fixture.workflow_sha}")
     assert manifest =~ ~s("packages":[)
+    assert manifest =~ ~s("payload_manifests":[)
     assert manifest =~ ~s("toolchains":[)
+    assert manifest =~ ~s("verification_evidence":[)
   end
 
   test "manifest verifier fails closed on wrong source and package hashes", evidence do
@@ -264,7 +282,9 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
     evidence = Path.join(fixture.root, "evidence")
     File.mkdir_p!(Path.join(evidence, "packages/darwin-aarch64"))
     File.mkdir_p!(Path.join(evidence, "packages/linux-x86_64"))
+    File.mkdir_p!(Path.join(evidence, "payload-manifests"))
     File.mkdir_p!(Path.join(evidence, "toolchains"))
+    File.mkdir_p!(Path.join(evidence, "verification-evidence"))
     input = Path.join(evidence, "candidate-input.json")
     File.write!(input, candidate_input)
 
@@ -274,6 +294,27 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
     linux_package = Path.join(evidence, "packages/linux-x86_64/tightbeam-1.0.0-linux-x86_64.tgz")
     File.cp!(real_evidence.real_package, darwin_package)
     File.cp!(real_evidence.real_package, linux_package)
+
+    File.cp!(
+      real_evidence.real_payload_manifest,
+      Path.join(evidence, "payload-manifests/darwin-aarch64.json")
+    )
+
+    File.cp!(
+      real_evidence.real_payload_manifest,
+      Path.join(evidence, "payload-manifests/linux-x86_64.json")
+    )
+
+    File.cp!(
+      real_evidence.real_verification_evidence,
+      Path.join(evidence, "verification-evidence/darwin-aarch64.json")
+    )
+
+    File.cp!(
+      real_evidence.real_verification_evidence,
+      Path.join(evidence, "verification-evidence/linux-x86_64.json")
+    )
+
     darwin_toolchain = Path.join(evidence, "toolchains/darwin-aarch64.txt")
     linux_toolchain = Path.join(evidence, "toolchains/linux-x86_64.txt")
     File.write!(darwin_toolchain, real_evidence.real_toolchain)

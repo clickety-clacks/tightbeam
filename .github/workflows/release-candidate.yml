@@ -169,8 +169,12 @@ jobs:
           sh packaging/assemble.sh
           package=$(find _build/npm -maxdepth 1 -type f -name 'tightbeam-*.tgz')
           [ "$(printf '%s\n' "$package" | sed '/^$/d' | wc -l | tr -d ' ')" -eq 1 ]
-          mkdir -p "stage/packages/$PLATFORM" stage/toolchains
+          mkdir -p "stage/packages/$PLATFORM" stage/payload-manifests stage/verification-evidence stage/toolchains
           cp "$package" "stage/packages/$PLATFORM/"
+          cp "${package%.tgz}.payload-manifest.json" "stage/payload-manifests/$PLATFORM.json"
+          cp "${package%.tgz}.verification-evidence.json" "stage/verification-evidence/$PLATFORM.json"
+          test -s "stage/payload-manifests/$PLATFORM.json"
+          test -s "stage/verification-evidence/$PLATFORM.json"
           {
             elixir --version
             rustc --version
