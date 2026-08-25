@@ -1233,6 +1233,48 @@ defmodule Tightbeam.Assignments do
     Enum.map(rows, &reopening/1)
   end
 
+  @doc "Classify the fixed same-holder terminal-surrender replay before Rules run."
+  @spec terminal_surrender_precheck(DB.server(), String.t(), String.t()) ::
+          :proceed | {:replay, map()} | {:refuse, map()}
+  def terminal_surrender_precheck(db, assignment_id, holder_key) do
+    case DB.query(db, "SELECT #{columns()} FROM assignments WHERE id = ?1", [assignment_id]) do
+      {:ok, []} ->
+        {:refuse, error("unknown_assignment", "unknown assignment: #{assignment_id}")}
+
+      {:ok, [row]} ->
+        assignment = assignment(row)
+
+        cond do
+          assignment.state == "open" ->
+            :proceed
+
+          assignment.outcome == "surrendered" and assignment.closedBySession == holder_key and
+              is_binary(assignment.closingAttestId) ->
+            case DB.query(
+                   db,
+                   "SELECT id, assignmentId, kind, verdictKind, note, bySession, byUser, producer, producerCommand, byHarness, byProvider, commitRefs, ts FROM attests WHERE id = ?1",
+                   [assignment.closingAttestId]
+                 ) do
+              {:ok, [attest_row]} ->
+                closing = attest(attest_row)
+
+                if closing.assignmentId == assignment.id and closing.kind == "surrender" and
+                     closing.bySession == holder_key do
+                  {:replay, %{assignment: assignment, attest: closing, replayed: true}}
+                else
+                  {:refuse, terminal_conflict()}
+                end
+
+              _ ->
+                {:refuse, terminal_conflict()}
+            end
+
+          true ->
+            {:refuse, terminal_conflict()}
+        end
+    end
+  end
+
   @doc false
   def __for_work_item__(db, work_item_id) do
     {:ok, rows} =
@@ -1677,7 +1719,13 @@ defmodule Tightbeam.Assignments do
       end
     end
   rescue
-    TransitionRace -> assignment_closed()
+    TransitionRace ->
+      if call[:terminal_surrender] do
+        terminal_surrender_after_race(db, call)
+      else
+        assignment_closed()
+      end
+
     error in Tightbeam.DeliverableContract.MutationError -> error.response
   end
 
@@ -1821,6 +1869,23 @@ defmodule Tightbeam.Assignments do
   end
 
   defp project_completion_markers(_db, _result), do: :ok
+
+  defp terminal_surrender_after_race(db, call) do
+    case terminal_surrender_precheck(db, call.params.assignment_id, session_key!(call.principal)) do
+      {:replay, result} -> result
+      {:refuse, error} -> error
+      :proceed -> assignment_closed()
+    end
+  end
+
+  defp session_key!({:session, session_key}), do: session_key
+
+  defp terminal_conflict,
+    do:
+      error(
+        "terminal_conflict",
+        "terminal surrender does not match this assignment's closed outcome"
+      )
 
   # Per effort-checkin-v2 §Design 5 and the provenance it cites verbatim —
   # "Artifacts are the referents" — an attest's referents are the artifacts the
@@ -2752,7 +2817,7 @@ defmodule Tightbeam.Assignments do
             assignment_closed()
 
           true ->
-            with :ok <- valid_kind(call.params[:kind]),
+            with :ok <- valid_lifecycle_kind(call),
                  :ok <- valid_note(call.params[:note]),
                  :ok <- valid_cannot_proceed_reason(call.params),
                  :ok <- absent_verdict_kind(call.params[:verdict_kind]),
@@ -2810,30 +2875,39 @@ defmodule Tightbeam.Assignments do
 
   defp apply_lifecycle_attest(txn, call, assignment, attest, holder) do
     attest =
-      case Tightbeam.DeliverableContract.record_completion_claim_in_txn(
-             txn,
-             assignment.id,
-             attest
-           ) do
-        :ok ->
-          Map.put(
-            attest,
-            :deliverableClaim,
-            Tightbeam.DeliverableContract.attest_claim_projection_in_txn(txn, attest.id)
-          )
+      if call[:terminal_surrender] == true and call.params.kind == "surrender" do
+        attest
+      else
+        case Tightbeam.DeliverableContract.record_completion_claim_in_txn(
+               txn,
+               assignment.id,
+               attest
+             ) do
+          :ok ->
+            Map.put(
+              attest,
+              :deliverableClaim,
+              Tightbeam.DeliverableContract.attest_claim_projection_in_txn(txn, attest.id)
+            )
 
-        contract_error ->
-          raise Tightbeam.DeliverableContract.MutationError, response: contract_error
+          contract_error ->
+            raise Tightbeam.DeliverableContract.MutationError, response: contract_error
+        end
       end
+
+    outcome =
+      if call[:terminal_surrender] == true and call.params.kind == "surrender",
+        do: "surrendered",
+        else: "completed"
 
     Txn.q(
       txn,
       """
-      UPDATE assignments SET state = 'closed', outcome = 'completed', closedAt = ?2,
-        closedBySession = ?3, closingAttestId = ?4
+      UPDATE assignments SET state = 'closed', outcome = ?2, closedAt = ?3,
+        closedBySession = ?4, closingAttestId = ?5
       WHERE id = ?1 AND state = 'open'
       """,
-      [assignment.id, attest.ts, holder, attest.id]
+      [assignment.id, outcome, attest.ts, holder, attest.id]
     )
 
     if Txn.changes(txn) != 1, do: raise(TransitionRace)
@@ -3880,6 +3954,12 @@ defmodule Tightbeam.Assignments do
 
   defp valid_kind(_),
     do: error("invalid_kind", "kind must be progress, completion, or cannot-proceed")
+
+  # Main retired generic surrender filing. The terminal seam remains the sole
+  # compatibility escape hatch, so only its fixed, internally marked call may
+  # introduce a new surrender outcome.
+  defp valid_lifecycle_kind(%{terminal_surrender: true, params: %{kind: "surrender"}}), do: :ok
+  defp valid_lifecycle_kind(call), do: valid_kind(call.params[:kind])
 
   defp valid_release_tuple_for_kind(%{kind: "cannot-proceed"} = params),
     do: valid_release_tuple(params)

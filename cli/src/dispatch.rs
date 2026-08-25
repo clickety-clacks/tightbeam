@@ -1097,6 +1097,34 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             release_fact_principal_ref,
             idempotency_key,
         } => {
+            // A surrender is the sole terminal operation a stale session may make.
+            // Keep its wire shape apart from generic dispatch: that endpoint remains
+            // release-gated, and this one must never accept an asserted identity or
+            // ordinary attest fields.
+            if kind == "surrender" {
+                if !matches!(identity, Identity::Session) {
+                    return Err(
+                        "terminal surrender must use the session's implicit identity".to_owned(),
+                    );
+                }
+                let note = note
+                    .as_deref()
+                    .ok_or_else(|| "--note is required when --kind is surrender".to_owned())?;
+                if verdict.is_some() || commit_refs.is_some() {
+                    return Err(
+                        "terminal surrender accepts only --kind surrender and --note".to_owned(),
+                    );
+                }
+                return Ok(RequestSpec {
+                    method: "POST",
+                    path: "/agent/terminal",
+                    body_json: object(vec![
+                        string_field("assignmentId", assignment_id),
+                        string_field("disposition", "surrender"),
+                        string_field("note", note),
+                    ]),
+                });
+            }
             let mut params = vec![
                 string_field("assignmentId", assignment_id),
                 string_field("kind", kind),
@@ -1772,11 +1800,16 @@ pub(crate) fn gateway_request(
     if let Some(timeout) = timeout {
         builder = builder.timeout(timeout).timeout_connect(timeout);
     }
-    builder
+    let request = builder
         .build()
         .request(method, &format!("{}{path}", endpoint.base))
         .set("authorization", &format!("Bearer {}", endpoint.token))
-        .set("x-tightbeam-cli-version", env!("CARGO_PKG_VERSION"))
+        .set("x-tightbeam-cli-version", env!("CARGO_PKG_VERSION"));
+    if path == "/agent/terminal" {
+        request.set("x-tightbeam-terminal-version", "1")
+    } else {
+        request
+    }
 }
 
 /// LOAD-BEARING WORDING. This sentence is control flow, not just prose.
@@ -2775,10 +2808,11 @@ mod tests {
             origin: Origin::Provisioned,
         };
 
-        for (method, path) in [
-            ("POST", "/agent/dispatch"),
-            ("POST", "/agent/tool-call-observed"),
-            ("GET", "/harnesses"),
+        for (method, path, terminal_protocol) in [
+            ("POST", "/agent/dispatch", false),
+            ("POST", "/agent/tool-call-observed", false),
+            ("POST", "/agent/terminal", true),
+            ("GET", "/harnesses", false),
         ] {
             let request = gateway_request(method, &endpoint, path, None);
             assert_eq!(request.method(), method);
@@ -2788,7 +2822,42 @@ mod tests {
                 request.header("x-tightbeam-cli-version"),
                 Some(env!("CARGO_PKG_VERSION"))
             );
+            assert_eq!(
+                request.header("x-tightbeam-terminal-version"),
+                terminal_protocol.then_some("1")
+            );
         }
+    }
+
+    #[test]
+    fn terminal_surrender_has_its_own_fixed_request_shape() {
+        let request = build_request(&parse(&[
+            "attest",
+            "asg_1",
+            "--kind",
+            "surrender",
+            "--note",
+            "incompatible client",
+        ]))
+        .unwrap();
+        assert_eq!(request.path, "/agent/terminal");
+        assert_eq!(
+            request.body_json,
+            r#"{"assignmentId":"asg_1","disposition":"surrender","note":"incompatible client"}"#
+        );
+        assert_eq!(
+            build_request(&parse(&[
+                "attest",
+                "asg_1",
+                "--kind",
+                "surrender",
+                "--note",
+                "no",
+                "--as",
+                "coder",
+            ])),
+            Err("terminal surrender must use the session's implicit identity".to_owned())
+        );
     }
 
     #[test]
