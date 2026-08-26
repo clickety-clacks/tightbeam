@@ -416,6 +416,19 @@ defmodule Tightbeam.ColdStartTest do
     assert_event_corruptions_refuse(other, device_event_id)
   end
 
+  test "boot rejects a claimed v6 receipt with a corrupted principal", %{db: db} do
+    assert {:paired, _device} = ColdStart.pair(db, pair_input("d1", "Alice"), @defaults)
+
+    :ok = DB.execute(db, "PRAGMA ignore_check_constraints = ON")
+    :ok = DB.execute(db, "UPDATE cold_start_receipts SET principal='user:tampered'")
+    :ok = DB.execute(db, "PRAGMA ignore_check_constraints = OFF")
+
+    error = assert_raise Schema.ShapeError, fn -> Boot.ensure_schema!(db) end
+
+    assert error.message ==
+             "incompatible_cold_start_v1: receipt_principal_invalid; recovery: Recover an unusable fresh database"
+  end
+
   test "each interrupted healthy-v5 migration rolls back and a retry converges", _ctx do
     for point <- [:after_copy, :after_drop, :after_schema, :after_receipt, :after_stamp] do
       db = captured_db!("v5-healthy")

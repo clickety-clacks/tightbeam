@@ -482,6 +482,9 @@ defmodule Tightbeam.ColdStart do
         receipt.phase not in ~w(reserved complete) ->
           "receipt_phase_invalid"
 
+        receipt.principal != @principal ->
+          "receipt_principal_invalid"
+
         is_nil(user) ->
           "receipt_missing_user"
 

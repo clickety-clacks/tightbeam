@@ -18,6 +18,7 @@ defmodule Tightbeam.Boot do
     receiptless_nonempty_users
     receipt_cause_invalid
     receipt_phase_invalid
+    receipt_principal_invalid
     receipt_missing_user
     receipt_missing_root
     receipt_missing_device
