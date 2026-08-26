@@ -96,13 +96,14 @@ defmodule Tightbeam.Artifacts do
         parent_session = parent_session(db, session_key)
         {recorded_message_id, evidence} = turn_evidence(db, session_key)
         digest_source = digest_source(db, config, session_key, call.params.origin_path)
+        digest = content_digest(digest_source, call.params[:content_sha256])
         now = now()
 
-        case DB.transaction(db, fn txn ->
-               case IdPrefix.resolve_in_txn(txn, :work_item, work_item_id) do
-                 {:ok, canonical_id} ->
-                   case content_digest(digest_source, call.params[:content_sha256]) do
-                     {:ok, content_sha256, verified} ->
+        case digest do
+          {:ok, content_sha256, verified} ->
+            case DB.transaction(db, fn txn ->
+                   case IdPrefix.resolve_in_txn(txn, :work_item, work_item_id) do
+                     {:ok, canonical_id} ->
                        Txn.q(
                          txn,
                          """
@@ -141,23 +142,23 @@ defmodule Tightbeam.Artifacts do
                        Publisher.maybe_accepted_in_txn(txn, call, artifact)
                        artifact
 
-                     {:error, expected, actual} ->
-                       %{
-                         code: "content_sha256_mismatch",
-                         message:
-                           "artifact content SHA-256 mismatch: supplied #{expected}, computed #{actual}"
-                       }
+                     :unknown ->
+                       %{code: "unknown_work_item", message: "unknown work item: #{work_item_id}"}
+
+                     {:ambiguous, error} ->
+                       error
                    end
+                 end) do
+              {:ok, result} -> result
+              {:error, reason} -> raise "artifact record transaction failed: #{inspect(reason)}"
+            end
 
-                 :unknown ->
-                   %{code: "unknown_work_item", message: "unknown work item: #{work_item_id}"}
-
-                 {:ambiguous, error} ->
-                   error
-               end
-             end) do
-          {:ok, result} -> result
-          {:error, reason} -> raise "artifact record transaction failed: #{inspect(reason)}"
+          {:error, expected, actual} ->
+            %{
+              code: "content_sha256_mismatch",
+              message:
+                "artifact content SHA-256 mismatch: supplied #{expected}, computed #{actual}"
+            }
         end
 
       {{:session, session_key}, session_key, _work_item_id} when is_binary(session_key) ->

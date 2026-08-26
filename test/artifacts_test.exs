@@ -141,6 +141,74 @@ defmodule Tightbeam.ArtifactsTest do
     assert {:ok, [[^before_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM artifacts")
   end
 
+  test "local hashing does not hold the database transaction owner", ctx do
+    base_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "artifact-digest-liveness-#{System.unique_integer([:positive])}"
+      )
+
+    local_host = Placement.local_host_name()
+    child = Org.set_host(ctx.db, ctx.child.session_key, local_host)
+    workdir = Placement.workdir_path(%{base_dir: base_dir, db: ctx.db}, child)
+    artifact_path = Path.join(workdir, "reports/held-open.bin")
+    File.mkdir_p!(Path.dirname(artifact_path))
+    assert {"", 0} = System.cmd("mkfifo", [artifact_path])
+    on_exit(fn -> File.rm_rf(base_dir) end)
+
+    handler = Gateway.handlers(%{db: ctx.db, base_dir: base_dir})["artifact-record"]
+
+    writer =
+      Port.open(
+        {:spawn_executable, System.find_executable("sh")},
+        [
+          :binary,
+          :exit_status,
+          {:line, 1_024},
+          args: [
+            "-c",
+            ~S'exec 3>"$1"; printf "reader-connected\n"; IFS= read -r _; printf "streamed artifact bytes" >&3',
+            "artifact-fifo-writer",
+            artifact_path
+          ]
+        ]
+      )
+
+    record =
+      Task.async(fn ->
+        handler.(%{
+          principal: {:session, child.session_key},
+          session_key: child.session_key,
+          params: %{
+            kind: "report",
+            title: "Held-open digest proof",
+            origin_path: "reports/held-open.bin",
+            work_item_id: "wi_banana"
+          }
+        })
+      end)
+
+    try do
+      assert_receive {^writer, {:data, {:eol, "reader-connected"}}}, 2_000
+
+      query = Task.async(fn -> DB.query(ctx.db, "SELECT 1") end)
+      assert {:ok, [[1]]} = Task.await(query, 2_000)
+
+      assert Port.command(writer, "release\n")
+      assert_receive {^writer, {:exit_status, 0}}, 2_000
+
+      artifact = Task.await(record, 2_000)
+      assert artifact.content_sha256_status == "verified"
+
+      assert artifact.content_sha256 ==
+               :crypto.hash(:sha256, "streamed artifact bytes")
+               |> Base.encode16(case: :lower)
+    after
+      if Port.info(writer), do: Port.close(writer)
+      Task.shutdown(record, :brutal_kill)
+    end
+  end
+
   test "same-host pointers verify while remote digest claims stay explicitly unverified", ctx do
     base_dir =
       Path.join(System.tmp_dir!(), "artifact-host-digest-#{System.unique_integer([:positive])}")
