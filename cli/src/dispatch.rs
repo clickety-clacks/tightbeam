@@ -3006,13 +3006,18 @@ mod tests {
         fs::create_dir_all(&cwd).unwrap();
         fs::write(
             root.join(".tightbeam-session"),
-            r#"{"url":"https://gateway.example","token":"must-not-escape","sessionKey":"agent:coder:x s_safe"}"#,
+            r#"{"url":"https://ancestor.example","token":"ancestor-must-not-escape","sessionKey":"agent:coder:x s_ancestor"}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("nested").join(".tightbeam-session"),
+            r#"{"url":"https://nested.example","token":"nested-must-not-escape","sessionKey":"agent:coder:x s_nested"}"#,
         )
         .unwrap();
 
         assert_eq!(
             current_session_key_from(&cwd),
-            Ok("agent:coder:x s_safe".to_owned())
+            Ok("agent:coder:x s_nested".to_owned())
         );
 
         fs::remove_dir_all(root).unwrap();
