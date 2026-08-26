@@ -232,6 +232,22 @@ defmodule Tightbeam.ReadinessTest do
     assert line =~ "on testhost"
   end
 
+  test "a missing Cursor credential renders the legal API-key command", ctx do
+    module = Tightbeam.Harness.Cursor
+    install_adapter!(ctx.base, module)
+
+    catalog =
+      catalog!(%{module.wire_name() => {[], {:unavailable, {:needs_onboarding, :missing}}}})
+
+    line =
+      ctx.config
+      |> Readiness.summary(catalog)
+      |> Readiness.render(ctx.config)
+      |> Enum.find(&(&1 =~ "Tightbeam has no credential for cursor"))
+
+    assert line =~ "tightbeam onboard cursor --api-key --as-user <userId>"
+  end
+
   test "a default model outside the live catalog is named by its fields", ctx do
     [module | _] = Harness.all()
     install_adapter!(ctx.base, module)

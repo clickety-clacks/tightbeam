@@ -9,7 +9,7 @@ defmodule Tightbeam.Spinup do
 
   require Logger
 
-  alias Tightbeam.{EventLog, Harness, Homes, Placement}
+  alias Tightbeam.{Credentials, EventLog, Harness, Homes, Placement}
   alias Tightbeam.Harness.Support
 
   @type denial :: %{code: String.t(), message: String.t()}
@@ -331,7 +331,8 @@ defmodule Tightbeam.Spinup do
                       "#{target.host_name}. It does not use or import your normal " <>
                       "#{module.wire_name()} CLI login; Tightbeam keeps its own credential " <>
                       "under #{Path.dirname(auth_dir)}. Run on #{target.host_name}: " <>
-                      "tightbeam onboard #{module.credential_provider()} --as-user <userId>"
+                      "#{Credentials.onboard_command(module.credential_provider())} " <>
+                      "--as-user <userId>"
 
                   {{:error, host_unready(message)},
                    "reached; directories ensured; #{adapter_detail}; DENIED: #{message}"}

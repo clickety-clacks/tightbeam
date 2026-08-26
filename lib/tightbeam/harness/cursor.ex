@@ -523,33 +523,17 @@ defmodule Tightbeam.Harness.Cursor do
   defp build_selectable_catalog(entries, :all), do: entries
 
   defp build_selectable_catalog(entries, selectable) do
-    by_family = Map.new(entries, &{&1.family, &1})
-    dropped_count = entries |> Enum.reject(&(vendor_ref(&1) in selectable)) |> length()
+    {kept, dropped} = Enum.split_with(entries, &(vendor_ref(&1) in selectable))
 
-    if dropped_count > 0 do
+    if dropped != [] do
       Logger.info(
-        "cursor catalog: #{dropped_count} model(s) from --list-models are not selectable by " <>
+        "cursor catalog: #{length(dropped)} model(s) from --list-models are not selectable by " <>
           "cursor-agent #{@adapter_version} ACP and were withheld — re-probe " <>
           "@adapter_selectable_models in harness/cursor.ex if this looks wrong"
       )
     end
 
-    Enum.map(selectable, fn ref ->
-      Map.get(by_family, ref, synthetic_catalog_entry(ref))
-    end)
-  end
-
-  defp synthetic_catalog_entry(ref) do
-    %{
-      family: ref,
-      context: nil,
-      display_name: ref,
-      name: ref,
-      efforts: [],
-      max_input_tokens: nil,
-      capabilities: %{},
-      provider: credential_provider()
-    }
+    kept
   end
 
   defp vendor_ref(entry),

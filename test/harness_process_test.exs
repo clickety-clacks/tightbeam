@@ -207,6 +207,22 @@ defmodule Tightbeam.HarnessProcessTest do
                HarnessProcess.assert_zero_listeners(ctx.db, "l-diag", run)
     end
 
+    test "the Gibson tracefs warning passes only for an empty socket selection", ctx do
+      tracefs_warning =
+        "lsof: WARNING: can't stat() tracefs file system /sys/kernel/debug/tracing\n" <>
+          "      Output information may be incomplete.\n"
+
+      :ok = insert_launch!(ctx.db, "l-tracefs-empty", nil, 4247)
+      empty = fn 4247 -> {tracefs_warning, 1} end
+      assert :ok = HarnessProcess.assert_zero_listeners(ctx.db, "l-tracefs-empty", empty)
+
+      :ok = insert_launch!(ctx.db, "l-tracefs-listener", nil, 4248)
+      listening = fn 4248 -> {tracefs_warning <> "p4248\nf10\nn127.0.0.1:4096\n", 0} end
+
+      assert {:error, {:listener_probe_failed, {:lsof_diagnostic, _}}} =
+               HarnessProcess.assert_zero_listeners(ctx.db, "l-tracefs-listener", listening)
+    end
+
     test "a remote (ssh) launch is refused — probe unimplemented, not silently passed", ctx do
       :ok = insert_launch!(ctx.db, "l-remote", "vector@remote", 4246)
       run = fn _ -> flunk("remote must not run the local probe") end

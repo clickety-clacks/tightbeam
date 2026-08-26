@@ -36,6 +36,13 @@ defmodule Tightbeam.Credentials do
   @type kind :: :api_key | :subscription
   @type status :: :onboarded | {:needs_onboarding, term()}
 
+  @doc "The provider-specific onboarding command prefix."
+  @spec onboard_command(provider() | String.t()) :: String.t()
+  def onboard_command(provider) when provider in [:cursor, "cursor"],
+    do: "tightbeam onboard cursor --api-key"
+
+  def onboard_command(provider), do: "tightbeam onboard #{provider}"
+
   @doc "Start one lifecycle owner for this machine."
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
@@ -215,7 +222,7 @@ defmodule Tightbeam.Credentials do
             "Nothing was banked — the credential on this host is unchanged. A credential " <>
             "with no usable token cannot authenticate a turn, and writing it would report " <>
             "success now and fail every session later. Delete that file and re-run " <>
-            "`tightbeam onboard #{provider}`."
+            "`#{onboard_command(provider)}`."
 
         {:error, {:hollow_credential, %{source: source, found: found, sentence: sentence}}}
     end

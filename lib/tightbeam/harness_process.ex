@@ -743,8 +743,9 @@ defmodule Tightbeam.HarnessProcess do
 
   # `-a` ANDs the pgid and socket-state filters; `-Fn` prints one field per line, so a socket name
   # is an `n`-prefixed line. An empty selection is lsof exit 1 with no output — the zero-listener
-  # case. A status outside {0,1}, or an `lsof:` diagnostic, is an inconclusive probe and fails
-  # closed.
+  # case. A status outside {0,1}, or an unknown `lsof:` diagnostic, is an inconclusive probe and
+  # fails closed. Linux tracefs can emit its known incomplete-output warning even when the
+  # socket selection is empty; that one warning is benign only while no `n` field is present.
   defp listener_sample(pgid, run) do
     case run.(pgid) do
       {:error, :timeout} ->
@@ -755,18 +756,33 @@ defmodule Tightbeam.HarnessProcess do
 
       {output, status} when status in [0, 1] ->
         lines = String.split(output, "\n", trim: true)
+        listeners = Enum.filter(lines, &String.starts_with?(&1, "n"))
 
         cond do
+          listeners == [] and benign_empty_tracefs_warning?(lines) ->
+            {:ok, []}
+
           Enum.any?(lines, &String.starts_with?(&1, "lsof:")) ->
             {:error, {:lsof_diagnostic, one_line(output)}}
 
           true ->
-            {:ok, Enum.filter(lines, &String.starts_with?(&1, "n"))}
+            {:ok, listeners}
         end
 
       {output, status} ->
         {:error, {:lsof_failed, status, one_line(output)}}
     end
+  end
+
+  defp benign_empty_tracefs_warning?(lines) do
+    warning = "lsof: WARNING: can't stat() tracefs file system /sys/kernel/debug/tracing"
+    continuation = "Output information may be incomplete."
+
+    lines != [] and
+      Enum.all?(lines, fn line ->
+        line == warning or String.trim(line) == continuation
+      end) and
+      warning in lines
   end
 
   defp run_group_command(%{ssh: nil} = row, timeout_ms) do
