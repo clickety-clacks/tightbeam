@@ -1803,16 +1803,11 @@ fn assimilate_with(io: &mut dyn CeremonyIo, args: AssimilateArgs) -> Result<(), 
     })?;
 
     let resolved_base = step(io, "DIRS", command_failure, |io| {
-        let auth_dirs = args
-            .harnesses
-            .iter()
-            .map(|harness| remote_path(&format!("{}/auth/{harness}", args.base_dir)))
-            .collect::<Vec<_>>();
         ssh(
             io,
             dry_run,
             &args.ssh_dest,
-            &format!("mkdir -p {}", auth_dirs.join(" ")),
+            &format!("mkdir -p {}", remote_path(&args.base_dir)),
         )?;
         if dry_run {
             // The probe already resolved this read-only. On a host that has never been
@@ -3788,6 +3783,9 @@ mod tests {
             io.commands[0].1[..4],
             ["-o", "BatchMode=yes", "--", "flynn@work-1.local"]
         );
+        let dirs = io.commands[1].1.last().unwrap();
+        assert_eq!(dirs, "mkdir -p ~/.tightbeam");
+        assert!(!dirs.contains("/auth/"));
         for expected in [
             "uname -sm",
             "'node'",

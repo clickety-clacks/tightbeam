@@ -1158,11 +1158,9 @@ defmodule Tightbeam.Credentials do
   defp credential_home_path(state, provider),
     do: credential_path(state.base_dir, state.machine, provider)
 
-  defp harness_name(:openai), do: "codex"
-  defp harness_name(:anthropic), do: "claude"
-  defp harness_name(:fixture_provider), do: "fixture"
-
-  defp harness_id(provider), do: provider |> harness_name() |> String.to_existing_atom()
+  defp harness_id(:openai), do: :codex
+  defp harness_id(:anthropic), do: :claude
+  defp harness_id(:fixture_provider), do: :fixture
 
   defp credential_filename(:openai), do: "auth.json"
   defp credential_filename(:anthropic), do: ".credentials.json"
