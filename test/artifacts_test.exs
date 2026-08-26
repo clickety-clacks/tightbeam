@@ -2,7 +2,7 @@ defmodule Tightbeam.ArtifactsTest do
   use Tightbeam.TestCase, async: false
   alias Tightbeam.Model
 
-  alias Tightbeam.{Artifacts, DB, Gateway, Ledger, Org, Projection, WorkItems}
+  alias Tightbeam.{Artifacts, DB, Gateway, Ledger, Org, Placement, Projection, WorkItems}
 
   setup do
     db = :"artifacts_db_#{System.unique_integer([:positive])}"
@@ -11,6 +11,7 @@ defmodule Tightbeam.ArtifactsTest do
     :ok = Projection.ensure_schema(db)
     :ok = WorkItems.ensure_schema(db)
     :ok = Ledger.ensure_schema(db)
+    :ok = Placement.ensure_schema(db)
     :ok = Artifacts.ensure_schema(db)
 
     ensure_main_session(db, "flynn")
@@ -71,6 +72,8 @@ defmodule Tightbeam.ArtifactsTest do
     assert first.home == nil
     assert first.origin_path == "specs/banana.md"
     assert first.content_sha256 == "abc123"
+    assert first.content_sha256_status == "attested-not-verified"
+    assert second.content_sha256_status == "none"
 
     assert Artifacts.get(ctx.db, first.artifact_id) == first
 
@@ -91,6 +94,98 @@ defmodule Tightbeam.ArtifactsTest do
              }),
              & &1.artifact_id
            ) == [first.artifact_id]
+  end
+
+  test "readable local bytes are hashed and a supplied mismatch records nothing", ctx do
+    base_dir =
+      Path.join(System.tmp_dir!(), "artifact-digest-#{System.unique_integer([:positive])}")
+
+    local_host = Placement.local_host_name()
+    child = Org.set_host(ctx.db, ctx.child.session_key, local_host)
+    workdir = Placement.workdir_path(%{base_dir: base_dir, db: ctx.db}, child)
+    artifact_path = Path.join(workdir, "reports/result.bin")
+    File.mkdir_p!(Path.dirname(artifact_path))
+    File.write!(artifact_path, <<0, 1, 2, 3, 255>>)
+    on_exit(fn -> File.rm_rf(base_dir) end)
+
+    actual = "ff5d8507b6a72bee2debce2c0054798deaccdc5d8a1b945b6280ce8aa9cba52e"
+    handler = Gateway.handlers(%{db: ctx.db, base_dir: base_dir})["artifact-record"]
+
+    call = %{
+      principal: {:session, child.session_key},
+      session_key: child.session_key,
+      params: %{
+        kind: "report",
+        title: "Digest proof",
+        origin_path: "reports/result.bin",
+        work_item_id: "wi_banana"
+      }
+    }
+
+    computed = handler.(call)
+    assert computed.content_sha256 == actual
+    assert computed.content_sha256_status == "verified"
+
+    matching = handler.(put_in(call, [:params, :content_sha256], String.upcase(actual)))
+    assert matching.content_sha256 == actual
+    assert matching.content_sha256_status == "verified"
+
+    {:ok, [[before_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM artifacts")
+
+    mismatch = handler.(put_in(call, [:params, :content_sha256], "wrong"))
+    assert mismatch.code == "content_sha256_mismatch"
+
+    assert mismatch.message ==
+             "artifact content SHA-256 mismatch: supplied wrong, computed #{actual}"
+
+    assert {:ok, [[^before_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM artifacts")
+  end
+
+  test "same-host pointers verify while remote digest claims stay explicitly unverified", ctx do
+    base_dir =
+      Path.join(System.tmp_dir!(), "artifact-host-digest-#{System.unique_integer([:positive])}")
+
+    local_host = Placement.local_host_name()
+    file = Path.join(base_dir, "same-host.txt")
+    File.mkdir_p!(base_dir)
+    File.write!(file, "same host")
+    on_exit(fn -> File.rm_rf(base_dir) end)
+
+    actual = "9b1898dfe88032ddaa5525aa8513dce60273048ffefde0161c3a758a13ff117a"
+    handler = Gateway.handlers(%{db: ctx.db, base_dir: base_dir})["artifact-record"]
+
+    same_host =
+      handler.(%{
+        principal: {:session, ctx.child.session_key},
+        session_key: ctx.child.session_key,
+        params: %{
+          kind: "report",
+          title: "Same host",
+          origin_path: "#{local_host}:#{file}",
+          content_sha256: actual,
+          work_item_id: "wi_banana"
+        }
+      })
+
+    assert same_host.content_sha256 == actual
+    assert same_host.content_sha256_status == "verified"
+
+    remote =
+      handler.(%{
+        principal: {:session, ctx.child.session_key},
+        session_key: ctx.child.session_key,
+        params: %{
+          kind: "report",
+          title: "Remote",
+          origin_path: "shrdlu:/srv/result.txt",
+          content_sha256: actual,
+          work_item_id: "wi_banana"
+        }
+      })
+
+    assert remote.content_sha256 == actual
+    assert remote.content_sha256_status == "attested-not-verified"
+    assert Artifacts.get(ctx.db, remote.artifact_id) == remote
   end
 
   test "records artifact ancestry from the operational parent, not spawn provenance", ctx do
@@ -217,13 +312,39 @@ defmodule Tightbeam.ArtifactsTest do
 
     assert Enum.map(columns, &Enum.at(&1, 1)) == ~w(
              artifactId kind title description createdBySession workItemId parentSession
-             originPath contentSha256 recordedMessageId recordedTurnEvidence state home
+             originPath contentSha256 contentSha256Verified recordedMessageId
+             recordedTurnEvidence state home
              createdAt updatedAt
            )
 
     # NULLABLE now, and paired with a closed evidence domain.
     assert Enum.find(columns, &(Enum.at(&1, 1) == "recordedMessageId")) |> Enum.at(3) == 0
     assert Enum.find(columns, &(Enum.at(&1, 1) == "recordedTurnEvidence")) |> Enum.at(3) == 1
+    assert Enum.find(columns, &(Enum.at(&1, 1) == "contentSha256Verified")) |> Enum.at(3) == 1
+
+    assert {:error, _} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO artifacts
+                 (artifactId, kind, title, createdBySession, workItemId, originPath,
+                  contentSha256, contentSha256Verified, state, createdAt, updatedAt)
+               VALUES ('art_verified_without_digest', 'other', 'Bad', 'child', 'wi_banana',
+                       'bad', NULL, 1, 'in-workspace', 1, 1)
+               """
+             )
+
+    assert {:error, _} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO artifacts
+                 (artifactId, kind, title, createdBySession, workItemId, originPath,
+                  contentSha256, contentSha256Verified, state, createdAt, updatedAt)
+               VALUES ('art_invalid_digest_status', 'other', 'Bad', 'child', 'wi_banana',
+                       'bad', 'digest', 2, 'in-workspace', 1, 1)
+               """
+             )
 
     for class <- ~w(tool-call-observed session-concurrent none) do
       assert {:ok, _} =
