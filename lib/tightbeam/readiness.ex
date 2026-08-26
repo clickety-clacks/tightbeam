@@ -473,14 +473,15 @@ defmodule Tightbeam.Readiness do
        }) do
     "Tightbeam has no credential for #{provider} on #{host}. It does not use or import " <>
       "your normal #{harness} CLI login; Tightbeam keeps its own credential under " <>
-      "#{Path.join(base_dir, "auth")}. Run on #{host}: tightbeam onboard #{provider} " <>
+      "#{Path.join(base_dir, "auth")}. Run on #{host}: " <>
+      "#{Tightbeam.Credentials.onboard_command(provider)} " <>
       "--as-user <userId>"
   end
 
   defp credential_line(%{provider: provider, host: host, credential: {:absent, reason}}) do
     "no credential on #{host} (#{inspect(reason)}) — this host's model catalog is " <>
       "empty, so no model can be selected here. Onboard it with: " <>
-      "tightbeam onboard #{provider} --as-user <userId> on #{host}"
+      "#{Tightbeam.Credentials.onboard_command(provider)} --as-user <userId> on #{host}"
   end
 
   defp credential_line(%{harness: wire, host: host, credential: {:unknown, reason}}) do

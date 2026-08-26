@@ -133,7 +133,7 @@ defmodule Tightbeam.CursorRegistrationTest do
              )
   end
 
-  test "Cursor derives the production catalog from selectable ACP refs, not the full CLI list" do
+  test "Cursor advertises only the selectable refs present in authenticated inventory" do
     parent = self()
     target = cursor_target()
 
@@ -158,11 +158,10 @@ defmodule Tightbeam.CursorRegistrationTest do
                }
              })
 
-    selectable = Cursor.adapter_selectable_models()
-    families = entries |> Enum.map(& &1.family) |> Enum.sort()
+    families = Enum.map(entries, & &1.family)
 
-    assert length(entries) == length(selectable)
-    assert families == Enum.sort(selectable)
+    assert families == ["auto", "gpt-5.3-codex"]
+    refute "composer-2.5" in families
     refute "gpt-5.3-codex-low" in families
     refute "composer-2.5-fast" in families
 
@@ -171,9 +170,6 @@ defmodule Tightbeam.CursorRegistrationTest do
 
     codex = Enum.find(entries, &(&1.family == "gpt-5.3-codex"))
     assert codex.display_name == "Codex 5.3"
-
-    composer = Enum.find(entries, &(&1.family == "composer-2.5"))
-    assert composer.display_name == "composer-2.5"
 
     assert_receive {:catalog_probe, argv}
     serialized = Enum.join(argv, " ")

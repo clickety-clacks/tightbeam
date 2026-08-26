@@ -360,7 +360,7 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
   end
 
   defp onboard_command(provider, _host),
-    do: "tightbeam onboard #{provider} --as-user <userId>"
+    do: "#{Tightbeam.Credentials.onboard_command(provider)} --as-user <userId>"
 
   defp local_credential_state(base_dir, provider) do
     host = Placement.local_host_name()

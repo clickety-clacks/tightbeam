@@ -9,6 +9,11 @@ defmodule Tightbeam.CredentialsTest do
     %{base: base}
   end
 
+  test "Cursor onboarding commands require the API-key ceremony" do
+    assert Credentials.onboard_command(:cursor) == "tightbeam onboard cursor --api-key"
+    assert Credentials.onboard_command(:openai) == "tightbeam onboard openai"
+  end
+
   test "onboarding commits before the credential-present callback and success publication", ctx do
     owner = self()
 

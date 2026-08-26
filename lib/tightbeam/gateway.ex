@@ -4422,7 +4422,8 @@ defmodule Tightbeam.Gateway do
   defp onboard_result(_config, %{params: %{provider: provider}}) do
     %{
       code: "interactive_required",
-      message: "run tightbeam onboard #{provider} from a terminal on this machine"
+      message:
+        "run #{Tightbeam.Credentials.onboard_command(provider)} from a terminal on this machine"
     }
   end
 
@@ -7280,7 +7281,9 @@ defmodule Tightbeam.Gateway do
   # interim flatten still removes the old false "run onboard" (the r4.2 fix). This mirrors the
   # :prompt-401 deferral to Card 2 — defer the precise naming to the card that owns the signal.
   defp credential_remedy(reason, provider, host) do
-    onboard = "Run on #{host}: tightbeam onboard #{provider} --as-user <userId>"
+    onboard =
+      "Run on #{host}: #{Tightbeam.Credentials.onboard_command(provider)} " <>
+        "--as-user <userId>"
 
     case reason do
       :missing ->
