@@ -53,6 +53,11 @@ defmodule Tightbeam.FeatureSmokePlanTest do
     end
   end
 
+  test "redelivery refreshes identity without restating the resident harness" do
+    assert FeatureSmokePlan.redelivery("agent:smoke") ==
+             {"identity-apply", %{"sessionKey" => "agent:smoke", "all" => false}}
+  end
+
   # e2e-tier-map-v1 GAP-3. Written against the REGISTRY rather than against literal harness
   # names, so the seam guard stays satisfied and a third registered harness does not
   # silently invalidate the cases.

@@ -105,7 +105,8 @@ defmodule Tightbeam.Harness.Claude do
   # now identifies Opus 5. Tightbeam therefore tries a requested canonical id
   # first and treats this table only as fallback candidates. The selected
   # configOption's public currentValue plus init-derived name/description is the
-  # switch-time authority; a real next-turn modelUsage probe is the release gate.
+  # switch-time authority. Token accounting is a separate PromptResponse.usage
+  # fact and is never a model-selection release gate.
 
   @adapter_selectable_models ~w(default sonnet opus haiku fable claude-sonnet-5
                                 claude-opus-4-8 claude-haiku-4-5-20251001 claude-fable-5

@@ -18,6 +18,7 @@ defmodule Tightbeam.Schema do
     Tightbeam.Wakes,
     Tightbeam.Projection,
     Tightbeam.Org,
+    Tightbeam.SessionUsage,
     Tightbeam.CriticalLeases,
     Tightbeam.Roles,
     Tightbeam.ReadMarkers,

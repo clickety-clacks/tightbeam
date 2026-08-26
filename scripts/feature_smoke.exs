@@ -136,7 +136,25 @@ defmodule FeatureSmoke do
     cwd = local_workdir_path(state.base_dir, session_key)
 
     try do
-      redeploy!(state, session_key)
+      snapshot = Tightbeam.Identity.snapshot!(state.base_dir, "reviewer", harness)
+
+      assert(
+        state,
+        map_size(snapshot.skills) > 0,
+        "local deployment elected no skills for reviewer at #{cwd}"
+      )
+
+      # A new session materializes lazily on its first real turn. `identity-apply`
+      # deliberately no-ops before that point because there is no harness session to
+      # refresh. Wake first, then observe the home and cwd that the real start path
+      # projected; the later call to `redeploy!/2` exercises started-session redelivery.
+      ok!(state, "wake", %{
+        "sessionKey" => session_key,
+        "prompt" => "Reply with exactly: LOCAL DEPLOYMENT READY",
+        "idempotencyKey" => "local-deploy-wake-#{unique()}"
+      })
+
+      await_materialized_skills!(state, cwd, snapshot.skills)
 
       assert(state, File.dir?(home), "local deployment HOME missing: #{home}")
 
@@ -162,22 +180,6 @@ defmodule FeatureSmoke do
           "local deployment HOME contains stray path: #{Path.join(home, relative)}"
         )
       end)
-
-      snapshot = Tightbeam.Identity.snapshot!(state.base_dir, "reviewer", harness)
-
-      assert(
-        state,
-        map_size(snapshot.skills) > 0,
-        "local deployment elected no skills for reviewer at #{cwd}"
-      )
-
-      ok!(state, "wake", %{
-        "sessionKey" => session_key,
-        "prompt" => "Reply with exactly: LOCAL DEPLOYMENT READY",
-        "idempotencyKey" => "local-deploy-wake-#{unique()}"
-      })
-
-      await_materialized_skills!(state, cwd, snapshot.skills)
 
       # One SESSION-principal work-item create, deliberately placed INSIDE this
       # group's running-turn window (after the wake, before the turn boundary) —
@@ -735,6 +737,23 @@ defmodule FeatureSmoke do
     end
 
     try do
+      # `open_grounded_assignment!/5` ran the assigned check in the holder's workdir,
+      # observed exit 0, and retained the exact command and output in this note. File the
+      # receipt only after that observation; a bare assertion would not satisfy the law.
+      tested =
+        post_as(state, holder.token, "attest", %{
+          "assignmentId" => asg_id,
+          "kind" => "verdict",
+          "verdictKind" => "tests-passed",
+          "note" => holder.check.note
+        })
+
+      assert(
+        state,
+        not (is_map(tested) and Map.has_key?(tested, "error")),
+        "gate chain: the holder-token tests-passed verdict failed: #{inspect(tested)}"
+      )
+
       # 1. Review gate. Its remedy assigns the bound reviewer, synchronously inside the
       # attest, so the review exists by the time the denial response returns.
       denied!(state, "completion-requires-review", asg_id, complete)
@@ -1688,13 +1707,8 @@ defmodule FeatureSmoke do
   end
 
   defp redeploy!(state, session_key) do
-    ok!(state, "tune", %{
-      "sessionKey" => session_key,
-      "setting" => "set_harness",
-      "harness" => state.leg.wire_name,
-      "model" => state.leg.model,
-      "effort" => state.leg.effort
-    })
+    {verb, params} = Tightbeam.FeatureSmokePlan.redelivery(session_key)
+    ok!(state, verb, params)
   end
 
   # --- facts-read: file a condition fact, read it back -----------------------
@@ -1852,10 +1866,11 @@ defmodule FeatureSmoke do
     pass(state, "dispatch opens an assignment linked to its work item (brackets F7)")
   end
 
-  # --- effort-without-effect: durable parent check-in and reassignment ----------
-  # Run the smoke gateway with TIGHTBEAM_EFFORT_CHECKIN_HORIZON_MS=250 (or another
-  # short value). The child is never prompted by this probe; its unavailable/idle
-  # workdir is adjudicated only by the opening user.
+  # --- effort-without-effect: durable escalation chain and reassignment ----------
+  # Run the smoke gateway with TIGHTBEAM_EFFORT_CHECKIN_HORIZON_MS=2500. The current
+  # mechanism never manufactures an operator decision: it prods the holder once,
+  # escalates through active operational parents, and stops at Main. This check reads
+  # those durable wake rows because no wire projection exposes the escalation chain.
   defp check_effort_without_effect(state) do
     u = unique()
 
@@ -1892,20 +1907,22 @@ defmodule FeatureSmoke do
       })
 
     first_id = first["id"] || first["assignmentId"]
-    request1 = await_effort_request!(parent_state, first_id, nil)
-    request1_id = request1["id"]
+    main_key = Tightbeam.Org.personal_session_key(@owner)
 
-    continued =
-      ok!(parent_state, "effort-rule", %{"request" => request1_id, "action" => "continue"})
+    await_effort_escalation!(state, first_id, first_holder_key, parent_key, main_key)
+
+    automatic_requests =
+      sqlite(
+        state,
+        "SELECT COUNT(*) FROM decision_requests " <>
+          "WHERE assignmentId = #{sql_quote(first_id)} AND kind = 'effort'"
+      )
 
     assert(
       state,
-      continued["decision"] == "continue",
-      "effort-rule continue did not rule request: #{inspect(continued)}"
+      automatic_requests == "0",
+      "effort check-in manufactured an operator decision: #{automatic_requests}"
     )
-
-    request2 = await_effort_request!(parent_state, first_id, request1_id)
-    request2_id = request2["id"]
 
     revoked = ok!(parent_state, "revoke-assignment", %{"assignmentId" => first_id})
 
@@ -1915,13 +1932,17 @@ defmodule FeatureSmoke do
       "effort smoke revoke did not close old assignment: #{inspect(revoked)}"
     )
 
-    old_request = ok!(parent_state, "decision-request", %{"request" => request2_id})
+    canceled =
+      sqlite(
+        state,
+        "SELECT state FROM effort_checkin_generations " <>
+          "WHERE assignmentId = #{sql_quote(first_id)} ORDER BY generation DESC LIMIT 1"
+      )
 
     assert(
       state,
-      (old_request["decision_request"] || old_request["decisionRequest"])["status"] ==
-        "superseded",
-      "effort smoke revoke did not supersede old request: #{inspect(old_request)}"
+      canceled == "canceled",
+      "effort smoke revoke did not cancel its current generation: #{inspect(canceled)}"
     )
 
     second_holder =
@@ -1943,12 +1964,12 @@ defmodule FeatureSmoke do
     second_id = second["id"] || second["assignmentId"]
     assert(state, second_id != first_id, "effort smoke re-dispatch reused the old assignment")
 
-    replacement_request = await_effort_request!(parent_state, second_id, nil)
+    fresh_generation = await_effort_generation!(state, second_id)
 
     assert(
       state,
-      replacement_request["status"] == "open",
-      "replacement dispatch did not arm a fresh bracket: #{inspect(replacement_request)}"
+      fresh_generation == 1,
+      "replacement dispatch did not arm generation 1: #{inspect(fresh_generation)}"
     )
 
     ok!(parent_state, "revoke-assignment", %{"assignmentId" => second_id})
@@ -1958,42 +1979,83 @@ defmodule FeatureSmoke do
 
     pass(
       state,
-      "effort check-in: idle request → continue widens → fresh request → revoke supersedes → re-dispatch"
+      "effort check-in: holder prod → operational parent → Main terminal → revoke cancels → re-dispatch"
     )
   end
 
-  defp await_effort_request!(state, assignment_id, prior_id) do
+  defp await_effort_escalation!(state, assignment_id, holder_key, parent_key, main_key) do
     deadline = System.monotonic_time(:millisecond) + 30_000
-    await_effort_request!(state, assignment_id, prior_id, deadline)
+    await_effort_escalation!(state, assignment_id, holder_key, parent_key, main_key, deadline)
   end
 
-  defp await_effort_request!(state, assignment_id, prior_id, deadline) do
-    requests = ok!(state, "decision-requests", %{})
-
-    request =
-      (requests["decision_requests"] || requests["decisionRequests"] || requests)
-      |> List.wrap()
-      |> Enum.find(fn candidate ->
-        candidate["kind"] == "effort" and
-          (candidate["assignment_id"] || candidate["assignmentId"]) == assignment_id and
-          candidate["id"] != prior_id
-      end)
+  defp await_effort_escalation!(
+         state,
+         assignment_id,
+         holder_key,
+         parent_key,
+         main_key,
+         deadline
+       ) do
+    observed =
+      sqlite(
+        state,
+        "SELECT " <>
+          "EXISTS(SELECT 1 FROM wakes WHERE assignmentId = #{sql_quote(assignment_id)} " <>
+          "AND sessionKey = #{sql_quote(holder_key)} AND prompt LIKE '[effort check-in]%'), " <>
+          "EXISTS(SELECT 1 FROM wakes WHERE assignmentId = #{sql_quote(assignment_id)} " <>
+          "AND sessionKey = #{sql_quote(parent_key)} AND prompt LIKE '[effort escalation]%'), " <>
+          "EXISTS(SELECT 1 FROM wakes WHERE assignmentId = #{sql_quote(assignment_id)} " <>
+          "AND sessionKey = #{sql_quote(main_key)} AND prompt LIKE '[effort escalation]%')"
+      )
 
     cond do
-      is_map(request) ->
-        request
+      observed == "1|1|1" ->
+        state
 
       System.monotonic_time(:millisecond) >= deadline ->
         raise(
-          "effort smoke timed out; run the gateway with a short " <>
-            "TIGHTBEAM_EFFORT_CHECKIN_HORIZON_MS (2500 works; the deadline " <>
-            "shares this config, so 250 rung-rotates requests away from the " <>
-            "parent before it can rule)"
+          "effort smoke timed out waiting for holder -> operational-parent -> Main " <>
+            "escalation (observed #{inspect(observed)}); run the gateway with " <>
+            "TIGHTBEAM_EFFORT_CHECKIN_HORIZON_MS=2500"
         )
 
       true ->
         Process.sleep(100)
-        await_effort_request!(state, assignment_id, prior_id, deadline)
+
+        await_effort_escalation!(
+          state,
+          assignment_id,
+          holder_key,
+          parent_key,
+          main_key,
+          deadline
+        )
+    end
+  end
+
+  defp await_effort_generation!(state, assignment_id) do
+    deadline = System.monotonic_time(:millisecond) + 5_000
+    await_effort_generation!(state, assignment_id, deadline)
+  end
+
+  defp await_effort_generation!(state, assignment_id, deadline) do
+    generation =
+      sqlite(
+        state,
+        "SELECT MIN(generation) FROM effort_checkin_generations " <>
+          "WHERE assignmentId = #{sql_quote(assignment_id)}"
+      )
+
+    cond do
+      generation != "" ->
+        String.to_integer(generation)
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        raise("effort smoke replacement dispatch did not arm a generation")
+
+      true ->
+        Process.sleep(100)
+        await_effort_generation!(state, assignment_id, deadline)
     end
   end
 

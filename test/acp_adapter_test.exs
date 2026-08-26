@@ -322,6 +322,28 @@ defmodule Tightbeam.Acp.AdapterTest do
           send({ method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "progressed" } } } });
           return setTimeout(() => send({ id: m.id, result: { stopReason: "end_turn" } }), 75);
         }
+        if (gateMode === "claude-usage") {
+          return send({ id: m.id, result: { stopReason: "end_turn", usage: {
+            totalTokens: 160, inputTokens: 100, outputTokens: 20,
+            cachedReadTokens: 30, cachedWriteTokens: 10
+          } } });
+        }
+        if (gateMode === "codex-usage") {
+          return send({ id: m.id, result: { stopReason: "end_turn", usage: {
+            totalTokens: 240, inputTokens: 120, outputTokens: 40,
+            thoughtTokens: 50, cachedReadTokens: 30
+          } } });
+        }
+        if (gateMode === "partial-usage") {
+          return send({ id: m.id, result: { stopReason: "end_turn", usage: {
+            totalTokens: 9, inputTokens: 7, outputTokens: null,
+            thoughtTokens: "2", cachedReadTokens: -1,
+            providerAccount: "private-sentinel"
+          } } });
+        }
+        if (gateMode === "absent-usage") {
+          return send({ id: m.id, result: { stopReason: "end_turn" } });
+        }
         if (sid === "probe-sess") {
           if (gateMode === "pass-message") {
             send({ method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Command blocked [gate: tightbeam-probe]" } } } });
@@ -600,6 +622,50 @@ defmodule Tightbeam.Acp.AdapterTest do
               text: "pong[allow-once]",
               messages: [%{message_id: nil, text: "pong[allow-once]"}]
             }} = Adapter.prompt(a, "sess-1", "say pong")
+  end
+
+  test "prompt captures the Claude and Codex ACP usage variants" do
+    {claude, _capture_path} =
+      start_adapter(harness: :claude, gate_mode: "claude-usage", probe: false)
+
+    assert {:ok,
+            %{
+              usage: %{
+                totalTokens: 160,
+                inputTokens: 100,
+                outputTokens: 20,
+                cachedReadTokens: 30,
+                cachedWriteTokens: 10
+              }
+            }} = Adapter.prompt(claude, "sess-1", "measure")
+
+    {codex, _capture_path} =
+      start_adapter(harness: :codex, gate_mode: "codex-usage", probe: false)
+
+    assert {:ok,
+            %{
+              usage: %{
+                totalTokens: 240,
+                inputTokens: 120,
+                outputTokens: 40,
+                thoughtTokens: 50,
+                cachedReadTokens: 30
+              }
+            }} = Adapter.prompt(codex, "sess-1", "measure")
+  end
+
+  test "prompt preserves partial usage as partial and omits absent usage" do
+    {partial, _capture_path} =
+      start_adapter(harness: :codex, gate_mode: "partial-usage", probe: false)
+
+    assert {:ok, %{usage: %{totalTokens: 9, inputTokens: 7}}} =
+             Adapter.prompt(partial, "sess-1", "measure")
+
+    {absent, _capture_path} =
+      start_adapter(harness: :claude, gate_mode: "absent-usage", probe: false)
+
+    assert {:ok, result} = Adapter.prompt(absent, "sess-1", "measure")
+    refute Map.has_key?(result, :usage)
   end
 
   test "new_session with an unknown record keeps and captures the harness default" do

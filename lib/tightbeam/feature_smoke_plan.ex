@@ -101,6 +101,12 @@ defmodule Tightbeam.FeatureSmokePlan do
     |> put_unless_nil("context", leg.context)
   end
 
+  @doc "The supported wire call for refreshing one session's projected identity and home."
+  @spec redelivery(String.t()) :: {String.t(), map()}
+  def redelivery(session_key) when is_binary(session_key) do
+    {"identity-apply", %{"sessionKey" => session_key, "all" => false}}
+  end
+
   defp put_unless_nil(params, _key, nil), do: params
   defp put_unless_nil(params, key, value), do: Map.put(params, key, value)
 end

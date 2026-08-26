@@ -1228,7 +1228,16 @@ defmodule Tightbeam.Wire.RouterTest do
 
     opts =
       Keyword.put(ctx.opts, :session_status, fn _key ->
-        %{sessionKey: "k1", display: %{credential_kind: :api_key}}
+        %{
+          sessionKey: "k1",
+          display: %{credential_kind: :api_key},
+          sessionUsage: %{
+            observedTurns: 2,
+            totalTokens: 42,
+            inputTokens: 30,
+            outputTokens: 12
+          }
+        }
       end)
 
     conn =
@@ -1244,6 +1253,13 @@ defmodule Tightbeam.Wire.RouterTest do
     # literal instead of leaning on this transform.
     assert conn.resp_body =~ ~s("credentialKind":"api_key")
     refute conn.resp_body =~ "apiKey"
+
+    assert JSON.decode!(conn.resp_body)["sessionUsage"] == %{
+             "observedTurns" => 2,
+             "totalTokens" => 42,
+             "inputTokens" => 30,
+             "outputTokens" => 12
+           }
   end
 
   test "facts-read routes as a read verb and list sessions use createdAt on the wire", ctx do

@@ -87,6 +87,7 @@ defmodule Tightbeam.Gateway do
     Rules,
     Roles,
     Schema,
+    SessionUsage,
     Spinup,
     StateResources,
     SubagentMarkers,
@@ -1822,6 +1823,12 @@ defmodule Tightbeam.Gateway do
           }
         }
 
+        payload =
+          case SessionUsage.project(db, session_key) do
+            nil -> payload
+            usage -> Map.put(payload, :sessionUsage, usage)
+          end
+
         case credential_kind do
           {:error, reason} ->
             {:error, 503, "credential_store_unreadable", describe_error(reason)}
@@ -2657,6 +2664,14 @@ defmodule Tightbeam.Gateway do
     attention_tier = elected_attention(db, turn.seq)
 
     case DB.transaction(db, fn txn ->
+           :ok =
+             SessionUsage.record_in_txn(
+               txn,
+               turn.seq,
+               turn.session_key,
+               Map.get(result, :usage)
+             )
+
            replies =
              Enum.map(texts, fn text ->
                {:appended, reply} =

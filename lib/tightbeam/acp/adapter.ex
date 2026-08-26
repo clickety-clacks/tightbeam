@@ -21,7 +21,7 @@ defmodule Tightbeam.Acp.Adapter do
 
   use GenServer
   require Logger
-  alias Tightbeam.{Harness, Model}
+  alias Tightbeam.{Harness, Model, SessionUsage}
   alias Tightbeam.Acp.Conn
 
   # Boot may spend 60s initializing ACP before the separate 120s gate
@@ -971,7 +971,14 @@ defmodule Tightbeam.Acp.Adapter do
   defp prompt_reply(result, text, messages) do
     case result do
       {:ok, response} ->
-        {:ok, %{stop_reason: response["stopReason"] || "unknown", text: text, messages: messages}}
+        reply = %{
+          stop_reason: response["stopReason"] || "unknown",
+          text: text,
+          messages: messages
+        }
+
+        usage = SessionUsage.normalize(response["usage"])
+        {:ok, if(map_size(usage) == 0, do: reply, else: Map.put(reply, :usage, usage))}
 
       {:error, reason} ->
         {:error, reason}

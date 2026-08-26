@@ -70,6 +70,7 @@ defmodule Tightbeam.GatewayTest do
     Roles,
     Rules,
     SessionLane,
+    SessionUsage,
     Wakes,
     WorkItems
   }
@@ -248,14 +249,26 @@ defmodule Tightbeam.GatewayTest do
         end
 
       receive do: (:continue_prompt ->
+                     result = %{
+                       text: Enum.map_join(messages, & &1.text),
+                       messages: messages,
+                       stop_reason: "end_turn"
+                     }
+
+                     result =
+                       if prompt == "split assistant messages" do
+                         Map.put(result, :usage, %{
+                           totalTokens: 21,
+                           inputTokens: 13,
+                           outputTokens: 8
+                         })
+                       else
+                         result
+                       end
+
                      GenServer.reply(
                        from,
-                       {:ok,
-                        %{
-                          text: Enum.map_join(messages, & &1.text),
-                          messages: messages,
-                          stop_reason: "end_turn"
-                        }}
+                       {:ok, result}
                      ))
 
       {:noreply, parent}
@@ -6836,6 +6849,17 @@ defmodule Tightbeam.GatewayTest do
     assert Enum.map(replies, & &1.reply_to_message_id) == [echo.id, echo.id]
     assert Enum.map(replies, & &1.reply_to_client_message_id) == ["c_boundaries", "c_boundaries"]
     assert Enum.map(replies, & &1.seq) == Enum.sort(Enum.map(replies, & &1.seq))
+
+    assert SessionUsage.project(ctx.db, "k1") == %{
+             observedTurns: 1,
+             totalTokens: 21,
+             inputTokens: 13,
+             outputTokens: 8
+           }
+
+    status = Gateway.session_status("k1", ctx.db)
+    assert status.sessionUsage == SessionUsage.project(ctx.db, "k1")
+    refute Map.has_key?(status.display, :codexUsage)
 
     frames = collect_pushes(10, [])
 
