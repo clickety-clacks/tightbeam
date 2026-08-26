@@ -12,6 +12,7 @@ mod lease;
 mod onboard_emit;
 mod preflight;
 mod probe;
+mod rail_action;
 mod users;
 
 fn main() {
@@ -19,6 +20,16 @@ fn main() {
 
     if args.first().is_some_and(|arg| arg == "rail-exec") {
         match contain::rail_exec(&args[1..]) {
+            Ok(status) => std::process::exit(status),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if args.first().is_some_and(|arg| arg == "rail-action") {
+        match rail_action::run(&args[1..]) {
             Ok(status) => std::process::exit(status),
             Err(error) => {
                 eprintln!("{error}");

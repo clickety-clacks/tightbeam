@@ -37,7 +37,7 @@ defmodule Tightbeam.ConformanceSupport do
   }
 
   @fixture_keys MapSet.new(
-                  ~w(class name phase blocking_phase kind source legibility shipped_ref pattern rule)
+                  ~w(class name phase blocking_phase kind source legibility shipped_ref pattern action rule)
                 )
   @case_keys MapSet.new(
                ~w(case kind expect reason emits input script_return world call phase2 phase)
@@ -688,7 +688,12 @@ defmodule Tightbeam.ConformanceSupport do
       ref = "engineering.toml:#{statute["name"]}"
       matches = Enum.filter(fixtures, &(&1["shipped_ref"] == ref))
       assert matches != [], "shipped statute #{statute["name"]} has no C1 fixture"
-      assert Enum.all?(matches, &(&1["pattern"] == statute["pattern"])), "#{ref} pattern drift"
+
+      assert Enum.all?(matches, fn fixture ->
+               fixture["pattern"] == statute["pattern"] and
+                 fixture["action"] == statute["action"]
+             end),
+             "#{ref} classifier drift"
     end)
   end
 

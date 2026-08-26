@@ -62,13 +62,25 @@ defmodule Tightbeam.Rails do
 
   Hook commands are self-contained (no file paths, no environment
   dependencies — homes live at different paths on gateway, staging, and
-  satellites) and match the statute's POSIX ERE against the RAW tool-call
-  JSON on stdin, so no jq is required on satellites; patterns should not
-  rely on matching bare `"` characters, which arrive JSON-escaped.
+  satellites). Pattern statutes match their POSIX ERE against the RAW
+  tool-call JSON on stdin, so no jq is required on satellites; patterns
+  should not rely on matching bare `"` characters, which arrive
+  JSON-escaped. Closed action statutes parse `tool_input.command` and classify
+  executable argv instead, so quoted prose cannot impersonate an action.
   """
 
   @persist_key __MODULE__
-  @statute_keys MapSet.new(["name", "on", "mode", "text", "check", "tool", "pattern"])
+  @statute_keys MapSet.new([
+                  "name",
+                  "on",
+                  "mode",
+                  "text",
+                  "check",
+                  "tool",
+                  "pattern",
+                  "action"
+                ])
+  @actions ~w(git-stash git-reset-hard git-clean-force git-checkout-discard git-restore)
   @probe_statute %{
     name: "tightbeam-probe",
     on: :tool_call,
@@ -90,7 +102,8 @@ defmodule Tightbeam.Rails do
           on: :tool_call,
           mode: :gate,
           tool: String.t(),
-          pattern: String.t(),
+          pattern: String.t() | nil,
+          action: String.t() | nil,
           text: String.t()
         }
 
@@ -253,14 +266,31 @@ defmodule Tightbeam.Rails do
     end
 
     pattern = Map.get(statute, "pattern")
+    action = Map.get(statute, "action")
 
-    unless is_binary(pattern) and String.trim(pattern) != "" do
-      raise ArgumentError, ~s(statute #{name} is missing "pattern")
-    end
+    case {pattern, action} do
+      {pattern, nil} when is_binary(pattern) ->
+        if String.trim(pattern) == "" do
+          raise ArgumentError,
+                ~s(statute #{name} requires exactly one of "pattern" or "action")
+        else
+          case Regex.compile(pattern) do
+            {:ok, _} -> :ok
+            {:error, _} -> raise ArgumentError, "invalid gate pattern: #{inspect(pattern)}"
+          end
+        end
 
-    case Regex.compile(pattern) do
-      {:ok, _} -> :ok
-      {:error, _} -> raise ArgumentError, "invalid gate pattern: #{inspect(pattern)}"
+      {nil, action} when action in @actions ->
+        :ok
+
+      {nil, nil} ->
+        raise ArgumentError, ~s(statute #{name} requires exactly one of "pattern" or "action")
+
+      {nil, action} ->
+        raise ArgumentError, "unknown gate action: #{inspect(action)}"
+
+      {_pattern, _action} ->
+        raise ArgumentError, ~s(statute #{name} requires exactly one of "pattern" or "action")
     end
 
     text = Map.get(statute, "text")
@@ -275,14 +305,24 @@ defmodule Tightbeam.Rails do
       mode: mode,
       tool: String.trim(tool),
       pattern: pattern,
+      action: action,
       text: String.trim(text)
     }
   end
 
   defp pre_tool_use_entry(statute) do
+    action = Map.get(statute, :action)
+
+    predicate =
+      if action do
+        "tightbeam rail-action #{action} || exit 0"
+      else
+        "grep -qE \"#{escape_double_quoted(statute.pattern)}\" - || exit 0"
+      end
+
     payload =
-      "grep -qE \"#{escape_double_quoted(statute.pattern)}\" - || exit 0; " <>
-        "echo \"[gate: #{statute.name}] #{escape_double_quoted(one_line(statute.text))}\" >&2; exit 2"
+      predicate <>
+        "; echo \"[gate: #{statute.name}] #{escape_double_quoted(one_line(statute.text))}\" >&2; exit 2"
 
     %{
       "matcher" => statute.tool,

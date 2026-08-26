@@ -105,6 +105,9 @@ jobs:
         working-directory: cli
         run: cargo build --release
 
+      - name: Put the source-built Tightbeam CLI on PATH (suite prerequisite)
+        run: echo "$GITHUB_WORKSPACE/cli/target/release" >> "$GITHUB_PATH"
+
       # Make the runner's containment environment VISIBLE. Three fleet hosts at one
       # kernel version are not the platform gate; this job is. When a Landlock grant
       # behaves differently here than on the fleet, this prints the OS release, the
