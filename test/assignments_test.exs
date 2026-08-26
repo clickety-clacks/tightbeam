@@ -1990,6 +1990,12 @@ defmodule Tightbeam.AssignmentsTest do
              |> update_in([:params], &Map.delete(&1, :note))
              |> then(&handle(ctx, "attest", &1))
 
+    assert %{code: "invalid_note", message: "note must be text"} =
+             attest_call({:session, "holder"}, assignment.id, "verdict")
+             |> put_in([:params, :verdict_kind], "reviewed-clean")
+             |> put_in([:params, :note], false)
+             |> then(&handle(ctx, "attest", &1))
+
     assert %{code: "invalid_note"} =
              handle(ctx, "attest", %{
                attest_call({:session, "holder"}, assignment.id, "progress")

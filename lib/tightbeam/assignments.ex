@@ -1860,7 +1860,8 @@ defmodule Tightbeam.Assignments do
 
           true ->
             with :ok <- valid_verdict_kind(call.params[:verdict_kind]),
-                 :ok <- valid_note(call.params[:note] || "") do
+                 :ok <-
+                   valid_note(if(is_nil(call.params[:note]), do: "", else: call.params[:note])) do
               if Txn.q(txn, "SELECT 1 FROM assignments WHERE id = ?1 AND state = 'open'", [
                    assignment_id
                  ]) != [[1]],
