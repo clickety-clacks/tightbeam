@@ -243,6 +243,9 @@ systemctl is-active tightbeam.service
 On macOS, restart the installed Tightbeam launchd service, then verify it with
 `sudo launchctl print system/com.tightbeam.gateway`.
 
+Finish every upgrade with the identity and kungfu checks in
+[Upgrading a running instance](docs/UPGRADE.md#refresh-shipped-identity-and-kungfu).
+
 `tightbeam-gateway` is the release equivalent of `mix run --no-halt`: same
 foreground process, same environment contract, same first-boot behaviour. It
 creates the base dir, seeds the identity repository, creates `state.db` and

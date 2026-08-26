@@ -2,9 +2,7 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
   use Mix.Task
 
   alias Mix.Tasks.Tightbeam.Catalog.Diff
-  alias Tightbeam.Model
-  alias Tightbeam.ModelCatalog
-  alias Tightbeam.Placement
+  alias Tightbeam.{Identity, Model, ModelCatalog, Placement}
 
   @shortdoc "Check inference-free Tightbeam bootstrap readiness"
 
@@ -62,6 +60,10 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
     cli_bin = Keyword.get(inputs, :cli_bin, Path.join(base_dir, "bin"))
     binary_probe = Keyword.get(inputs, :harness_binary_probe, &Placement.harness_binary_probe/2)
     credential_probe = Keyword.get(inputs, :credential_state, fn _provider -> :unknown end)
+
+    kungfu_status =
+      Keyword.get_lazy(inputs, :kungfu_status, fn -> Identity.shipped_kungfu_status(base_dir) end)
+
     harnesses = Enum.map(Tightbeam.Harness.all(), & &1.wire_name())
 
     credential_states =
@@ -120,7 +122,11 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
       hosts_check(hosts, local_host_name)
     ]
 
-    checks = [hd(non_harness_checks)] ++ harness_checks ++ tl(non_harness_checks)
+    checks =
+      [hd(non_harness_checks)] ++
+        harness_checks ++
+        [Enum.at(non_harness_checks, 1), kungfu_check(kungfu_status)] ++
+        Enum.drop(non_harness_checks, 2)
 
     ready =
       ready_harnesses != [] and
@@ -407,6 +413,30 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
     check("base_dir_identity", populated?, detail, "Run mix tightbeam.init.")
   end
 
+  defp kungfu_check({:ok, %{stale: []}}) do
+    check("shipped_kungfu", true, "learned kungfu matches this Tightbeam build", "")
+  end
+
+  defp kungfu_check({:ok, %{stale: stale}}) do
+    names = Enum.join(stale, ", ")
+
+    warning(
+      "shipped_kungfu",
+      "updated shipped kungfu is available for: #{names}",
+      "Ask the user: “Updated Tightbeam kungfu is available for #{names}. " <>
+        "Run tightbeam identity relearn now?” Run it only after the user says yes; " <>
+        "never auto-relearn."
+    )
+  end
+
+  defp kungfu_check({:error, reason}) do
+    unverifiable(
+      "shipped_kungfu",
+      "not verified: #{reason}",
+      "Repair the identity repository, then run tightbeam doctor again."
+    )
+  end
+
   defp advertised_url_check(url) when is_binary(url) do
     ok = String.trim(url) != ""
     detail = if ok, do: url, else: "advertised URL is empty"
@@ -509,6 +539,10 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
       detail: detail,
       fix: if(ok, do: "", else: fix)
     }
+  end
+
+  defp warning(name, detail, fix) do
+    %{name: name, ok: false, unverifiable: false, level: :warn, detail: detail, fix: fix}
   end
 
   # A check that could not be PERFORMED is not a check that FAILED. It stays in

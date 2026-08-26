@@ -206,6 +206,24 @@ defmodule Tightbeam.IdentityTest do
     assert [%{phrases: []}] = Identity.available_bundles()
   end
 
+  test "shipped kungfu status compares the imported baseline without mutating identity", ctx do
+    assert {:ok, _revision} = Identity.learn!(ctx.base, "agentic-engineering", "operator")
+    dir = Path.join(ctx.base, "identity")
+    before_refs = git!(dir, ["show-ref"])
+    before_status = git!(dir, ["status", "--porcelain"])
+
+    assert {:ok, %{current: ["agentic-engineering"], stale: []}} =
+             Identity.shipped_kungfu_status(ctx.base)
+
+    File.write!(Path.join(ctx.source, "intake.md"), "updated shipped intake\n")
+
+    assert {:ok, %{current: [], stale: ["agentic-engineering"]}} =
+             Identity.shipped_kungfu_status(ctx.base)
+
+    assert git!(dir, ["show-ref"]) == before_refs
+    assert git!(dir, ["status", "--porcelain"]) == before_status
+  end
+
   test "a manifest with invalid phrases is refused before identity mutation", ctx do
     for phrases <- [
           ~s(phrases = "A useful signal."),
