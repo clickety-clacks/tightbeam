@@ -76,6 +76,7 @@ defmodule Tightbeam.Wire.PayloadsTest do
     assert user["clientMessageId"] == "client-1"
     refute Map.has_key?(user, "sender")
     refute Map.has_key?(user, "replyToMessageId")
+    refute Map.has_key?(user, "displayLabel")
 
     attributed_user = Payloads.server_message(%{base | sender: "user:flynn"})
     assert attributed_user["sender"] == "user:flynn"
@@ -95,6 +96,20 @@ defmodule Tightbeam.Wire.PayloadsTest do
     assert assistant["replyToMessageId"] == "m1"
     assert assistant["replyToClientMessageId"] == "client-1"
     refute Map.has_key?(assistant, "deviceId")
+    refute Map.has_key?(assistant, "displayLabel")
+
+    substrate = Payloads.server_message(%{base | sender: "process:tightbeam"})
+    assert substrate["displayLabel"] == "[substrate]"
+
+    marker =
+      Payloads.server_message(%{
+        base
+        | role: "assistant",
+          sender: "process:tightbeam",
+          content: "[adapter down]\n\nThe engine stopped."
+      })
+
+    assert marker["displayLabel"] == "[marker]"
   end
 
   test "wire error and prompt state omit optional nil keys" do

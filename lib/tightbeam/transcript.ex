@@ -21,7 +21,7 @@ defmodule Tightbeam.Transcript do
   `id` is random and `timestamp` can tie or regress, so neither may order a page.
   """
 
-  alias Tightbeam.{DB, Org}
+  alias Tightbeam.{DB, Org, Projection}
 
   @default_limit 50
   @max_limit 500
@@ -228,7 +228,7 @@ defmodule Tightbeam.Transcript do
          class,
          delivery_rule
        ]) do
-    %{
+    entry = %{
       id: id,
       at: at,
       role: role,
@@ -246,6 +246,8 @@ defmodule Tightbeam.Transcript do
       class: class,
       delivery_rule: delivery_rule
     }
+
+    Map.put(entry, :display_label, Projection.display_label(entry))
   end
 
   ## Page flags — barrier-relative: cleared rows never make either flag true

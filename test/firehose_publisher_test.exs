@@ -405,6 +405,27 @@ defmodule Tightbeam.Firehose.PublisherTest do
              "class" => "message.created",
              "refs" => %{"messageId" => "s_1"},
              "payload" => %{"id" => "s_1", "rowVersion" => 9}
+           } = ordinary_notice = receive_notice()
+
+    refute Map.has_key?(ordinary_notice["payload"], "displayLabel")
+
+    assert :ok =
+             Publisher.committed(
+               "message.created",
+               %{
+                 id: "s_marker",
+                 seq: 10,
+                 session_key: "agent:one",
+                 role: "assistant",
+                 sender: "process:tightbeam",
+                 content: "[adapter down]\n\nThe engine stopped."
+               },
+               %{"ownerUserId" => "flynn", "sessionKey" => "agent:one"}
+             )
+
+    assert %{
+             "class" => "message.created",
+             "payload" => %{"id" => "s_marker", "displayLabel" => "[marker]"}
            } = receive_notice()
   end
 

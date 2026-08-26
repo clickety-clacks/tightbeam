@@ -56,6 +56,7 @@ defmodule Tightbeam.StateResources do
     Devices,
     Identity,
     Org,
+    Projection,
     ReadMarkers,
     Wakes,
     WorkItems
@@ -493,7 +494,15 @@ defmodule Tightbeam.StateResources do
   def session(row), do: public(row)
   def role(row), do: row |> public() |> correlate("role", "name")
   def artifact(row), do: public(row)
-  def message(row), do: public(row)
+
+  def message(row) do
+    projection = public(row)
+
+    case Projection.display_label(row) do
+      nil -> projection
+      label -> Map.put(projection, "displayLabel", label)
+    end
+  end
 
   def condition_fact(row) do
     row = public(row)

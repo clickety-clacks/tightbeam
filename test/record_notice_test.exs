@@ -93,6 +93,7 @@ defmodule Tightbeam.RecordNoticeTest do
     assert_receive {:push_message, "work", ^seq, %{"type" => "message"} = payload}
     assert payload["content"] == "[adapter down]\n\nThe engine stopped."
     assert payload["attentionTier"] == 0
+    assert payload["displayLabel"] == "[marker]"
   end
 
   test "the same notice replays to a client that reconnects after it", ctx do
@@ -114,6 +115,7 @@ defmodule Tightbeam.RecordNoticeTest do
     assert frame["content"] == "[adapter down]\n\nThe engine stopped."
     assert frame["sender"] == "process:tightbeam"
     assert frame["attentionTier"] == 0
+    assert frame["displayLabel"] == "[marker]"
   end
 
   ## Flynn ruling 2: no session is a log line, never a mailbox

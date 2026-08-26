@@ -25,6 +25,10 @@ defmodule Tightbeam.Wire.Payloads do
     role=user + deviceId/clientMessageId + no matching stamp → typed on a
     device; sender, when present, is its authenticated user attribution;
     role=assistant (+ sender "tightbeam") → the session's own output.
+  - `displayLabel` is the substrate's canonical reader-facing vocabulary:
+    `[marker]` for marker messages and `[substrate]` for its process voice.
+    It is absent on every other message, so older stored rows and unaware
+    clients preserve their existing display behavior.
   - Wake-delivered messages carry a first-line `[from <origin>]` stamp in
     BOTH stored content and the model prompt — one string, three
     audiences: readable text in any client, a rendering cue in aware ones
@@ -142,6 +146,7 @@ defmodule Tightbeam.Wire.Payloads do
     |> put_if_present("deviceId", Map.get(m, :device_id))
     |> put_if_present("clientMessageId", Map.get(m, :client_message_id))
     |> put_if_present("sender", Map.get(m, :sender))
+    |> put_if_present("displayLabel", Tightbeam.Projection.display_label(m))
     |> put_if_present("replyToMessageId", Map.get(m, :reply_to_message_id))
     |> put_if_present("replyToClientMessageId", Map.get(m, :reply_to_client_message_id))
   end

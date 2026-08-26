@@ -51,6 +51,11 @@ defmodule Tightbeam.Projection do
           attention_tier: integer()
         }
 
+  @typedoc "Closed classification behind the canonical reader-facing label."
+  @type display_kind :: :marker | :substrate
+
+  @display_labels %{marker: "[marker]", substrate: "[substrate]"}
+
   @ddl """
   CREATE TABLE IF NOT EXISTS messages (
     seq                    INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -198,6 +203,25 @@ defmodule Tightbeam.Projection do
   def attention_name(-1), do: "low"
   def attention_name(0), do: "normal"
   def attention_name(1), do: "high"
+
+  @doc "The canonical label a reader displays for a substrate-authored message."
+  @spec display_label(message() | map()) :: String.t() | nil
+  def display_label(%{
+        role: "assistant",
+        sender: "process:tightbeam",
+        content: content
+      })
+      when is_binary(content) do
+    if Regex.match?(~r/^\[[^\]\r\n]+\](?:\r?\n|$)/, content),
+      do: label(:marker),
+      else: label(:substrate)
+  end
+
+  def display_label(%{sender: "process:tightbeam"}), do: label(:substrate)
+  def display_label(_message), do: nil
+
+  @spec label(display_kind()) :: String.t()
+  defp label(kind), do: Map.fetch!(@display_labels, kind)
 
   @doc "Fetch one message by store id, or nil."
   @spec get(db(), String.t()) :: message() | nil

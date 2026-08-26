@@ -27,7 +27,7 @@ defmodule Tightbeam.TranscriptTest do
 
   alias Tightbeam.Wire.Router
 
-  @entry_keys ~w(id at role sender content attachments reply_to_message_id
+  @entry_keys ~w(id at role sender content attachments display_label reply_to_message_id
                  turn_seq model context effort harness assignment_id job_ref
                  class delivery_rule)a
 
@@ -398,17 +398,23 @@ defmodule Tightbeam.TranscriptTest do
         sender: "tightbeam"
       )
 
-    marker_id = message!(ctx.db, "owned", "assistant", "[context cleared]")
+    marker_id =
+      message!(ctx.db, "owned", "assistant", "[context cleared]", sender: "process:tightbeam")
+
+    substrate_id =
+      message!(ctx.db, "owned", "user", "resume the bounded checkpoint",
+        sender: "process:tightbeam"
+      )
 
     page = read(ctx, %{session_key: "owned", limit: 50})
-    assert Enum.map(page.messages, & &1.id) == [prompt_id, reply_id, marker_id]
+    assert Enum.map(page.messages, & &1.id) == [prompt_id, reply_id, marker_id, substrate_id]
 
     # EXACT key set — a missing or extra key fails.
     for entry <- page.messages do
       assert Enum.sort(Map.keys(entry)) == Enum.sort(@entry_keys)
     end
 
-    [prompt, reply, marker] = page.messages
+    [prompt, reply, marker, substrate] = page.messages
 
     # A `user` entry joins on turns.messageId = entry.id.
     assert prompt.role == "user"
@@ -419,6 +425,7 @@ defmodule Tightbeam.TranscriptTest do
     assert prompt.harness == "claude"
     assert prompt.assignment_id == "asg_1"
     assert prompt.job_ref == "wi_1"
+    assert prompt.display_label == nil
 
     # An `assistant` entry joins through its replyToMessageId.
     assert reply.role == "assistant"
@@ -426,9 +433,14 @@ defmodule Tightbeam.TranscriptTest do
     assert reply.reply_to_message_id == prompt_id
     assert reply.turn_seq == turn_seq
     assert reply.assignment_id == "asg_1"
+    assert reply.display_label == nil
 
     # A marker message has no reply link, so no turn and null attribution.
     assert marker.reply_to_message_id == nil
+    assert marker.display_label == "[marker]"
+
+    assert substrate.sender == "process:tightbeam"
+    assert substrate.display_label == "[substrate]"
 
     for field <- [:turn_seq, :model, :harness, :assignment_id, :job_ref] do
       assert Map.fetch!(marker, field) == nil
