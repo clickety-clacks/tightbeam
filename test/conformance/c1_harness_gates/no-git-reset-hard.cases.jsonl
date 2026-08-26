@@ -2,6 +2,8 @@
 {"case":"bare-hard-reset-denied","kind":"positive","expect":"deny","reason":"no-git-reset-hard","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git reset --hard\"}}"}
 {"case":"path-reset-passes","kind":"negative","expect":"pass","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git reset HEAD file\"}}"}
 {"case":"soft-reset-passes","kind":"negative","expect":"pass","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git reset --soft HEAD~1\"}}"}
+{"case":"reset-short-help-passes","kind":"negative","expect":"pass","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git reset -h\"}}"}
+{"case":"reset-long-help-passes","kind":"negative","expect":"pass","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git reset --help\"}}"}
 {"case":"hard-reset-search-pattern-passes","kind":"negative","expect":"pass","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"rg -n 'git reset --hard' lib test\"}}"}
 {"case":"hard-reset-note-passes","kind":"negative","expect":"pass","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"tightbeam attest asg_1 --kind progress --note 'git reset --hard was refused'\"}}"}
 {"case":"reset-denial-is-legible","kind":"legibility","expect":"deny","reason":"no-git-reset-hard","emits":"gate:no-git-reset-hard","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git reset --hard\"}}"}

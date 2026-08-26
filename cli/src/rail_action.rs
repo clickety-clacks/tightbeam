@@ -72,6 +72,10 @@ fn argv_matches(action: Action, argv: &[String]) -> bool {
         return false;
     };
 
+    if matches!(rest, [argument] if matches!(argument.as_str(), "-h" | "--help")) {
+        return false;
+    }
+
     match action {
         Action::GitStash if subcommand == "stash" => match rest.first().map(String::as_str) {
             None => true,
@@ -98,7 +102,8 @@ fn nested_shell_command(argv: &[String]) -> Option<&str> {
     let [shell, args @ ..] = argv else {
         return None;
     };
-    if !matches!(program_name(shell), "sh" | "bash" | "zsh") {
+    let shell = program_name(shell);
+    if !matches!(shell, "sh" | "bash" | "zsh") {
         return None;
     }
 
@@ -123,11 +128,9 @@ fn nested_shell_command(argv: &[String]) -> Option<&str> {
             return args.get(command_index).map(String::as_str);
         }
 
-        index += if matches!(argument.as_str(), "-o" | "-O") {
-            2
-        } else {
-            1
-        };
+        let takes_separate_value = matches!(argument.as_str(), "-o" | "-O" | "+o" | "+O")
+            || shell == "bash" && matches!(argument.as_str(), "--init-file" | "--rcfile");
+        index += if takes_separate_value { 2 } else { 1 };
     }
 
     None
@@ -507,6 +510,30 @@ mod tests {
     }
 
     #[test]
+    fn shell_option_operands_cannot_impersonate_the_command_switch() {
+        for (action, nested) in [
+            (Action::GitStash, "git stash"),
+            (Action::GitResetHard, "git reset --hard HEAD"),
+            (Action::GitCleanForce, "git clean -xdf"),
+            (Action::GitCheckoutDiscard, "git checkout main -- path"),
+            (Action::GitRestore, "git restore path"),
+        ] {
+            assert!(!command_matches(
+                action,
+                &format!("bash --rcfile -c '{nested}'")
+            ));
+            assert!(!command_matches(
+                action,
+                &format!("bash --init-file -c '{nested}'")
+            ));
+            assert!(command_matches(
+                action,
+                &format!("bash --rcfile /tmp/bashrc -c '{nested}'")
+            ));
+        }
+    }
+
+    #[test]
     fn heredoc_report_bodies_are_not_executable_segments() {
         let report = "cat <<'REPORT'\ngit stash\nREPORT";
         assert!(!command_matches(Action::GitStash, report));
@@ -552,5 +579,27 @@ mod tests {
             Action::GitRestore,
             "echo 'git restore path'"
         ));
+    }
+
+    #[test]
+    fn help_only_invocations_are_not_destructive_actions() {
+        for (action, subcommand, destructive) in [
+            (Action::GitStash, "stash", "git stash"),
+            (Action::GitResetHard, "reset", "git reset --hard HEAD"),
+            (Action::GitCleanForce, "clean", "git clean -xdf"),
+            (
+                Action::GitCheckoutDiscard,
+                "checkout",
+                "git checkout main -- path",
+            ),
+            (Action::GitRestore, "restore", "git restore path"),
+        ] {
+            assert!(command_matches(action, destructive));
+            assert!(!command_matches(action, &format!("git {subcommand} -h")));
+            assert!(!command_matches(
+                action,
+                &format!("git {subcommand} --help")
+            ));
+        }
     }
 }

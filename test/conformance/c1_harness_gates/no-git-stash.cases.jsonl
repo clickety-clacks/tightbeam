@@ -9,7 +9,11 @@
 {"case":"stash-path-prefix-denied","kind":"positive","expect":"deny","reason":"no-git-stash","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"env HOME=/tmp /usr/bin/git stash\"}}"}
 {"case":"stash-shell-option-denied","kind":"positive","expect":"deny","reason":"no-git-stash","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"bash --noprofile -c 'git stash'\"}}"}
 {"case":"stash-shell-c-terminator-denied","kind":"positive","expect":"deny","reason":"no-git-stash","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"sh -c -- 'git stash'\"}}"}
+{"case":"stash-shell-rcfile-command-denied","kind":"positive","expect":"deny","reason":"no-git-stash","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"bash --rcfile /tmp/bashrc -c 'git stash'\"}}"}
+{"case":"stash-shell-rcfile-operand-passes","kind":"negative","expect":"pass","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"bash --rcfile -c 'git stash'\"}}"}
 {"case":"stash-list-passes","kind":"negative","expect":"pass","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git stash list\"}}"}
+{"case":"stash-short-help-passes","kind":"negative","expect":"pass","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git stash -h\"}}"}
+{"case":"stash-long-help-passes","kind":"negative","expect":"pass","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git stash --help\"}}"}
 {"case":"stash-show-passes","kind":"negative","expect":"pass","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git stash show -p\"}}"}
 {"case":"stash-prose-passes","kind":"negative","expect":"pass","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"echo git stashing is fun\"}}"}
 {"case":"stash-search-pattern-passes","kind":"negative","expect":"pass","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"rg -n 'git stash' lib test\"}}"}
