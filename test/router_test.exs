@@ -86,6 +86,13 @@ defmodule Tightbeam.Wire.RouterTest do
         send(parent, {:call, call})
         %{id: call.params.work_item_id, title: call.params[:title]}
       end,
+      "work-item-bind-spec" => fn call ->
+        send(parent, {:call, call})
+
+        if call.params[:return_code],
+          do: %{code: call.params.return_code, message: "binding refusal"},
+          else: %{changed: true, workItem: %{id: call.params.work_item_id}}
+      end,
       "artifact-record" => fn call ->
         send(parent, {:call, call})
         %{artifact_id: "art_12345678", created_by_session: call.session_key}
@@ -1068,6 +1075,56 @@ defmodule Tightbeam.Wire.RouterTest do
     assert JSON.decode!(unknown.resp_body) == %{
              "error" => %{"code" => "not_found", "message" => "unknown role: unknown-role"}
            }
+  end
+
+  test "reviewed spec binding rejects every typed target before lookup and maps conflict", ctx do
+    base = %{
+      verb: "work-item-bind-spec",
+      asUser: "flynn",
+      params: %{
+        workItemId: "wi_1",
+        specRefName: "feature-v1.md",
+        specRefSha256: String.duplicate("a", 64),
+        specArtifactId: "art_1",
+        reviewAttestId: "att_1",
+        reviewReportArtifactId: "art_2"
+      }
+    }
+
+    for target <- [
+          %{sessionKey: nil},
+          %{role: "missing"},
+          %{userId: "missing"},
+          %{target: "retired"}
+        ] do
+      response = dispatch_cli(ctx, "tbc_test", Map.merge(base, target))
+      assert response.status == 400
+
+      assert JSON.decode!(response.resp_body) == %{
+               "error" => %{
+                 "code" => "invalid_message",
+                 "message" => "work-item-bind-spec takes no typed target"
+               }
+             }
+
+      refute_receive {:call, %{verb: "work-item-bind-spec"}}
+    end
+
+    conflict = put_in(base, [:params, :returnCode], "spec_binding_conflict")
+    response = dispatch_cli(ctx, "tbc_test", conflict)
+    assert response.status == 409
+    assert JSON.decode!(response.resp_body)["error"]["code"] == "spec_binding_conflict"
+
+    assert_receive {:call,
+                    %{
+                      verb: "work-item-bind-spec",
+                      params: %{
+                        work_item_id: "wi_1",
+                        spec_artifact_id: "art_1",
+                        review_attest_id: "att_1",
+                        review_report_artifact_id: "art_2"
+                      }
+                    }}
   end
 
   test "assignment typed-target teaching errors precede Dispatch and status classes are pinned",

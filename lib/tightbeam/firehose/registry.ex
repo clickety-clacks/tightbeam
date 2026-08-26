@@ -15,6 +15,7 @@ defmodule Tightbeam.Firehose.Registry do
   @state_rows [
     {"work_item.created", "work-items", "upsert", "workItemId"},
     {"work_item.updated", "work-items", "upsert", "workItemId"},
+    {"work_item.spec_bound", "work-items", "upsert", "workItemId"},
     {"work_item.iceboxed", "work-items", "upsert", "workItemId"},
     {"work_item.reopened", "work-items", "upsert", "workItemId"},
     {"work_item.closed", "work-items", "upsert", "workItemId"},

@@ -42,9 +42,6 @@ defmodule Tightbeam.CliIntegrationTest do
   setup do
     binary = Path.expand("../cli/target/release/tightbeam", __DIR__)
 
-    db = :"cli_integration_db_#{System.unique_integer([:positive])}"
-    start_supervised!({DB, path: ":memory:", name: db})
-
     base_dir =
       Path.join(
         System.tmp_dir!(),
@@ -57,32 +54,23 @@ defmodule Tightbeam.CliIntegrationTest do
     File.mkdir_p!(outside)
     on_exit(fn -> File.rm_rf!(base_dir) end)
 
+    db = :"cli_integration_db_#{System.unique_integer([:positive])}"
+    db_path = Path.join(base_dir, "tightbeam.sqlite3")
+    db_child_id = {:cli_integration_db, db}
+    start_supervised!({DB, path: db_path, name: db}, id: db_child_id)
+
     # Delegate to the ONE canonical schema list. A hand-kept copy here is how
     # this test ran without one of the schema modules: three lists had to agree and
     # did not.
     :ok = Tightbeam.Schema.ensure_all(db)
 
-    {:ok, _} =
-      DB.query(
-        db,
-        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 1, 'admin_add', 1)"
-      )
-
-    main_key = Org.personal_session_key("flynn")
-
-    Org.create(db, %{
-      session_key: main_key,
-      display_name: "Main",
-      kind: "main",
-      is_built_in: true,
-      owner_user_id: "flynn",
-      origin: "user:flynn",
-      archetype: "default",
-      host: "testhost",
-      harness: "claude",
-      provider: "anthropic",
-      model: Model.new("fable")
-    })
+    assert {:paired, %{user_id: "flynn", is_admin: true}} =
+             claim_org(db, %{
+               device_id: "cli-integration-owner",
+               claimed_name: "Flynn",
+               platform: nil,
+               model: nil
+             })
 
     session =
       Org.create(db, %{
@@ -144,9 +132,12 @@ defmodule Tightbeam.CliIntegrationTest do
         session_status: fn _ -> nil end
       )
 
+    gateway_child_id = {:cli_integration_gateway, db}
+
     bandit =
       start_supervised!(
-        {Bandit, plug: {Router, router_opts}, port: 0, ip: {127, 0, 0, 1}, startup_log: false}
+        {Bandit, plug: {Router, router_opts}, port: 0, ip: {127, 0, 0, 1}, startup_log: false},
+        id: gateway_child_id
       )
 
     {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
@@ -164,6 +155,10 @@ defmodule Tightbeam.CliIntegrationTest do
       base_dir: base_dir,
       binary: binary,
       db: db,
+      db_child_id: db_child_id,
+      db_path: db_path,
+      gateway_child_id: gateway_child_id,
+      gateway_config: gateway_config,
       handlers: handlers,
       port: port,
       session: session,
@@ -1294,6 +1289,296 @@ defmodule Tightbeam.CliIntegrationTest do
       )
 
     assert pairing =~ "supplied together"
+  end
+
+  test "built CLI binds reviewed structured evidence and replays without rewriting", ctx do
+    digest = String.duplicate("c", 64)
+    producer_dir = session_workdir!(ctx, ctx.session)
+    reviewer_dir = session_workdir!(ctx, ctx.worker)
+    File.write!(Path.join(producer_dir, "reviewed-spec-v1.md"), "SPEC_BYTES_SENTINEL")
+    File.write!(Path.join(reviewer_dir, "review-report.txt"), "REPORT_BYTES_SENTINEL")
+
+    {created, 0} =
+      System.cmd(
+        ctx.binary,
+        ["work-item-create", "--title", "Reviewed binding smoke", "--as-user", "flynn"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    work_item_id = JSON.decode!(created)["id"]
+
+    {producer, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "assign",
+          "--subject",
+          "Produce reviewed spec",
+          "--session",
+          ctx.session.session_key,
+          "--work-item",
+          work_item_id,
+          "--as-user",
+          "flynn"
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    producer_assignment_id = JSON.decode!(producer)["id"]
+
+    {spec, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "artifact-record",
+          "--kind",
+          "spec",
+          "--title",
+          "Reviewed spec",
+          "--path",
+          "reviewed-spec-v1.md",
+          "--sha256",
+          digest,
+          "--work-item",
+          work_item_id
+        ],
+        cd: producer_dir,
+        stderr_to_stdout: true
+      )
+
+    spec_artifact_id = JSON.decode!(spec)["artifactId"]
+
+    {review, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "assign",
+          "--subject",
+          "Independent review",
+          "--session",
+          ctx.worker.session_key,
+          "--work-item",
+          work_item_id,
+          "--reviews",
+          producer_assignment_id,
+          "--as-user",
+          "flynn"
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    review_assignment_id = JSON.decode!(review)["id"]
+
+    {report, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "artifact-record",
+          "--kind",
+          "report",
+          "--title",
+          "Review report",
+          "--path",
+          "review-report.txt",
+          "--work-item",
+          work_item_id
+        ],
+        cd: reviewer_dir,
+        stderr_to_stdout: true
+      )
+
+    report_artifact_id = JSON.decode!(report)["artifactId"]
+
+    {verdict, 0} =
+      System.cmd(
+        ctx.binary,
+        ["attest", review_assignment_id, "--kind", "verdict", "--verdict", "reviewed-clean"],
+        cd: reviewer_dir,
+        stderr_to_stdout: true
+      )
+
+    review_attest_id = JSON.decode!(verdict)["attest"]["id"]
+
+    {_completed, 0} =
+      System.cmd(ctx.binary, ["attest", review_assignment_id, "--kind", "completion"],
+        cd: reviewer_dir,
+        stderr_to_stdout: true
+      )
+
+    {:ok, [[doorbells_before_bind]]} =
+      DB.query(
+        ctx.db,
+        "SELECT count(*) FROM work_item_events WHERE workItemId=?1 AND kind='metadata'",
+        [work_item_id]
+      )
+
+    bind_args = [
+      "work-item-bind-spec",
+      work_item_id,
+      "--spec-ref",
+      "reviewed-spec-v1.md",
+      "--spec-sha256",
+      digest,
+      "--spec-artifact",
+      spec_artifact_id,
+      "--review-attest",
+      review_attest_id,
+      "--review-report",
+      report_artifact_id,
+      "--as-user",
+      "flynn"
+    ]
+
+    {bound, 0} = System.cmd(ctx.binary, bind_args, cd: ctx.workdir, stderr_to_stdout: true)
+    bound = JSON.decode!(bound)
+    assert bound["changed"]
+    assert bound["specBinding"]["producerAssignmentId"] == producer_assignment_id
+    assert bound["specBinding"]["reviewAssignmentId"] == review_assignment_id
+    assert bound["specBinding"]["boundByUser"] == "flynn"
+    assert bound["specBinding"]["boundBySession"] == nil
+    bound_at = bound["specBinding"]["boundAt"]
+
+    assert {:ok, [[first_event_id, ^bound_at, "user:flynn"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT id,ts,principal FROM events WHERE verb='work-item-bind-spec' ORDER BY id",
+               []
+             )
+
+    assert is_integer(first_event_id)
+
+    assert {:ok, state_rows_before_restart} =
+             DB.query(
+               ctx.db,
+               "SELECT id,ts,workItemId,kind FROM work_item_events WHERE workItemId=?1 AND kind='metadata' ORDER BY id",
+               [work_item_id]
+             )
+
+    assert length(state_rows_before_restart) == doorbells_before_bind + 1
+
+    {got, 0} =
+      System.cmd(ctx.binary, ["work-item-get", work_item_id, "--as-user", "flynn"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    got = JSON.decode!(got)
+    assert got["specBinding"] == bound["specBinding"]
+    refute got["specBinding"] |> JSON.encode!() |> String.contains?("BYTES_SENTINEL")
+
+    ctx =
+      restart_cli_gateway!(ctx, [
+        {Path.join(ctx.base_dir, "work/session"), ctx.session},
+        {producer_dir, ctx.session},
+        {reviewer_dir, ctx.worker}
+      ])
+
+    {got_after_restart, 0} =
+      System.cmd(ctx.binary, ["work-item-get", work_item_id, "--as-user", "flynn"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    got_after_restart = JSON.decode!(got_after_restart)
+    assert got_after_restart["specBinding"] == bound["specBinding"]
+
+    assert {:ok, ^state_rows_before_restart} =
+             DB.query(
+               ctx.db,
+               "SELECT id,ts,workItemId,kind FROM work_item_events WHERE workItemId=?1 AND kind='metadata' ORDER BY id",
+               [work_item_id]
+             )
+
+    assert {:ok, [[^first_event_id, ^bound_at, "user:flynn"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT id,ts,principal FROM events WHERE verb='work-item-bind-spec' ORDER BY id",
+               []
+             )
+
+    {replayed, 0} = System.cmd(ctx.binary, bind_args, cd: ctx.workdir, stderr_to_stdout: true)
+    replayed = JSON.decode!(replayed)
+    refute replayed["changed"]
+    assert replayed["specBinding"]["boundAt"] == bound_at
+    assert replayed["specBinding"]["boundByUser"] == "flynn"
+
+    assert {:ok, ^state_rows_before_restart} =
+             DB.query(
+               ctx.db,
+               "SELECT id,ts,workItemId,kind FROM work_item_events WHERE workItemId=?1 AND kind='metadata' ORDER BY id",
+               [work_item_id]
+             )
+
+    conflict_args = List.replace_at(bind_args, 3, "other.md")
+    {conflict, 1} = System.cmd(ctx.binary, conflict_args, cd: ctx.workdir, stderr_to_stdout: true)
+    assert conflict =~ "spec_binding_conflict"
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM work_item_spec_bindings WHERE workItemId=?1",
+               [work_item_id]
+             )
+  end
+
+  defp restart_cli_gateway!(ctx, session_credentials) do
+    stop_supervised!(ctx.gateway_child_id)
+    stop_supervised!(ctx.db_child_id)
+
+    start_supervised!({DB, path: ctx.db_path, name: ctx.db}, id: ctx.db_child_id)
+    :ok = Tightbeam.Schema.ensure_all(ctx.db)
+
+    real_handlers = Gateway.handlers(ctx.gateway_config)
+    Rules.load!(ctx.base_dir, Map.keys(real_handlers))
+    test_pid = self()
+
+    handlers =
+      Map.new(real_handlers, fn {verb, handler} ->
+        {verb,
+         fn call ->
+           send(test_pid, {:cli_call, call})
+           handler.(call)
+         end}
+      end)
+
+    router_opts =
+      Router.init(
+        db: ctx.db,
+        base_dir: ctx.base_dir,
+        handlers: handlers,
+        cli_token: "tbc_cli_integration",
+        session_status: fn _ -> nil end
+      )
+
+    bandit =
+      start_supervised!(
+        {Bandit, plug: {Router, router_opts}, port: 0, ip: {127, 0, 0, 1}, startup_log: false},
+        id: ctx.gateway_child_id
+      )
+
+    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+
+    for {dir, session} <- session_credentials do
+      write_session_credential!(dir, session, port)
+    end
+
+    %{ctx | handlers: handlers, port: port}
+  end
+
+  defp write_session_credential!(dir, session, port) do
+    File.mkdir_p!(dir)
+
+    File.write!(
+      Path.join(dir, ".tightbeam-session"),
+      JSON.encode!(%{
+        url: "http://127.0.0.1:#{port}",
+        token: session.cli_token,
+        sessionKey: session.session_key
+      })
+    )
   end
 
   defp open_effort_request(ctx, action) do

@@ -16,7 +16,7 @@ defmodule Tightbeam.WorkItems do
   fail/reopen) are owner-or-admin verbs that write `state`/`failReason`.
   """
 
-  alias Tightbeam.{CausalEvents, DB, IdPrefix, Org, Wakes}
+  alias Tightbeam.{CausalEvents, DB, IdPrefix, Org, Wakes, WorkItemSpecBindings}
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.Publisher
 
@@ -65,6 +65,7 @@ defmodule Tightbeam.WorkItems do
   def __handle__(db, "work-item-trace", call), do: trace_result(db, call)
   def __handle__(db, "work-item-list", call), do: list_result(db, call)
   def __handle__(db, "work-item-update", call), do: update_result(db, call)
+  def __handle__(db, "work-item-bind-spec", call), do: WorkItemSpecBindings.bind(db, call)
   def __handle__(db, "work-item-icebox", call), do: dispose_result(db, call, :icebox)
   def __handle__(db, "work-item-reopen", call), do: dispose_result(db, call, :reopen)
   def __handle__(db, "work-item-close", call), do: dispose_result(db, call, :close)
@@ -181,7 +182,7 @@ defmodule Tightbeam.WorkItems do
     with :ok <- principal_allowed(call.principal) do
       result =
         transaction(db, fn txn ->
-          result = update_in_txn(txn, call.params)
+          result = update_in_txn(txn, call)
 
           case result do
             {:updated, item, _changed?} ->
@@ -205,7 +206,9 @@ defmodule Tightbeam.WorkItems do
     end
   end
 
-  defp update_in_txn(txn, params) do
+  defp update_in_txn(txn, call) do
+    params = call.params
+
     case fetch_in_txn(txn, params[:work_item_id]) do
       nil ->
         unknown(params[:work_item_id])
@@ -217,9 +220,19 @@ defmodule Tightbeam.WorkItems do
         is_bug = if Map.has_key?(params, :is_bug), do: params.is_bug, else: item.isBug
 
         with :ok <- valid_title(title),
+             :ok <- invoke_injection(call, :on_work_item_update_before_guard, txn),
+             {:ok, guarded_params} <-
+               WorkItemSpecBindings.guard_metadata_update_in_txn(
+                 txn,
+                 item,
+                 params,
+                 {spec_ref_name, spec_ref_sha256}
+               ),
              :ok <- valid_spec_ref(spec_ref_name, spec_ref_sha256),
              :ok <- valid_is_bug(is_bug) do
-          updates = patch_updates(params, title, spec_ref_name, spec_ref_sha256, is_bug)
+          updates =
+            patch_updates(guarded_params, title, spec_ref_name, spec_ref_sha256, is_bug)
+
           updated = apply_updates(txn, item, updates)
           {:updated, updated, metadata(item) != metadata(updated)}
         end
@@ -293,6 +306,13 @@ defmodule Tightbeam.WorkItems do
           if(name_present, do: name, else: item.specRefName),
           if(sha_present, do: sha, else: item.specRefSha256)
         }
+    end
+  end
+
+  defp invoke_injection(call, key, txn) do
+    case call[key] do
+      fun when is_function(fun, 1) -> fun.(txn)
+      _ -> :ok
     end
   end
 
@@ -664,20 +684,34 @@ defmodule Tightbeam.WorkItems do
     with :ok <- principal_allowed(call.principal) do
       supplied = call.params[:work_item_id]
 
-      case IdPrefix.resolve(db, :work_item, supplied) do
-        {:ok, id} ->
-          item = fetch(db, id)
+      resolved =
+        DB.transaction(db, fn txn ->
+          case IdPrefix.resolve_in_txn(txn, :work_item, supplied) do
+            {:ok, id} ->
+              item = fetch_in_txn(txn, id)
+              {:ok, item, WorkItemSpecBindings.get_in_txn(txn, id)}
 
+            other ->
+              other
+          end
+        end)
+
+      case resolved do
+        {:ok, {:ok, item, spec_binding}} ->
           %{
             workItem: public_work_item(item),
-            assignments: Tightbeam.Assignments.__for_work_item__(db, item.id)
+            assignments: Tightbeam.Assignments.__for_work_item__(db, item.id),
+            specBinding: spec_binding
           }
 
-        :unknown ->
+        {:ok, :unknown} ->
           unknown(supplied)
 
-        {:ambiguous, error} ->
+        {:ok, {:ambiguous, error}} ->
           error
+
+        {:error, error} ->
+          raise error
       end
     end
   end
@@ -754,12 +788,24 @@ defmodule Tightbeam.WorkItems do
     end
   end
 
-  defp fetch_in_txn(txn, id) do
+  @doc false
+  def fetch_in_txn(txn, id) do
     case Txn.q(txn, "SELECT #{columns()} FROM work_items WHERE id = ?1", [id]) do
       [row] -> work_item(row)
       [] -> nil
     end
   end
+
+  @doc false
+  def fetch_public_in_txn(txn, id) do
+    case fetch_in_txn(txn, id) do
+      nil -> nil
+      item -> public_work_item(item)
+    end
+  end
+
+  @doc false
+  def id_resolved_in_txn(call, txn, type, id), do: id_resolved(call, txn, type, id)
 
   ## Validation + principals
 

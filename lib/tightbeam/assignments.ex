@@ -567,6 +567,12 @@ defmodule Tightbeam.Assignments do
     work_item_id
   end
 
+  @doc false
+  @spec resolved_work_item_id_in_txn(Txn.t(), String.t()) :: String.t() | nil
+  def resolved_work_item_id_in_txn(%Txn{} = txn, assignment_id) do
+    resolve_work_item_id_in_txn(txn, assignment_id, MapSet.new())
+  end
+
   @doc "Log legacy review/item conflicts without mutating assignment rows."
   @spec audit_review_item_conflicts(DB.server()) :: :ok
   def audit_review_item_conflicts(db) do

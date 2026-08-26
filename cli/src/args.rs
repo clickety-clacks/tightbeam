@@ -4,7 +4,7 @@
 //! omission lets the gateway derive the principal from the discovered session
 //! credential.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -214,6 +214,15 @@ pub enum Command {
     WorkItemGet {
         identity: Identity,
         work_item_id: String,
+    },
+    WorkItemBindSpec {
+        identity: Identity,
+        work_item_id: String,
+        spec_ref_name: String,
+        spec_ref_sha256: String,
+        spec_artifact_id: String,
+        review_attest_id: String,
+        review_report_artifact_id: String,
     },
     WorkItemTrace {
         identity: Identity,
@@ -554,6 +563,8 @@ COMMANDS:
       it, then route it (assign/dispatch) or icebox it. --key makes create
       idempotent (same key returns the same item).
   work-item-get <workItemId>
+  work-item-bind-spec <workItemId> --spec-ref <name> --spec-sha256 <64-lowercase-hex> --spec-artifact <artifactId> --review-attest <attestId> --review-report <artifactId>
+      Bind one independently reviewed canonical spec revision to an existing open item.
   work-item-trace <workItemId>
   attend [--high]
       Elect the attention tier of the reply you are about to give, during your
@@ -813,15 +824,20 @@ const BOOLEAN_FLAGS: &[&str] = &[
 struct Flags {
     positional: Vec<String>,
     flags: HashMap<String, String>,
+    duplicates: HashSet<String>,
 }
 
 fn split_args(args: Vec<String>) -> Flags {
     let mut positional = Vec::new();
     let mut flags = HashMap::new();
+    let mut duplicates = HashSet::new();
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
         if let Some(name) = arg.strip_prefix("--") {
+            if flags.contains_key(name) {
+                duplicates.insert(name.to_owned());
+            }
             if BOOLEAN_FLAGS.contains(&name) {
                 flags.insert(name.to_owned(), String::new());
             } else {
@@ -834,8 +850,14 @@ fn split_args(args: Vec<String>) -> Flags {
         }
         index += 1;
     }
-    Flags { positional, flags }
+    Flags {
+        positional,
+        flags,
+        duplicates,
+    }
 }
+
+const WORK_ITEM_BIND_SPEC_USAGE: &str = "usage: tightbeam work-item-bind-spec <workItemId> --spec-ref <name> --spec-sha256 <64-lowercase-hex> --spec-artifact <artifactId> --review-attest <attestId> --review-report <artifactId>";
 
 fn nonempty(flags: &HashMap<String, String>, name: &str) -> Option<String> {
     flags.get(name).filter(|value| !value.is_empty()).cloned()
@@ -1643,6 +1665,64 @@ fn parse_with_optional_catalog(
                 work_item_id: parsed.positional[1].clone(),
             })
         }
+        "work-item-bind-spec" => {
+            let allowed = [
+                "spec-ref",
+                "spec-sha256",
+                "spec-artifact",
+                "review-attest",
+                "review-report",
+                "as",
+                "as-user",
+                "as-process",
+            ]
+            .into_iter()
+            .collect::<HashSet<_>>();
+            let strict_flags = flags.keys().all(|name| allowed.contains(name.as_str()));
+            let spec_ref_name = nonempty(flags, "spec-ref");
+            let spec_ref_sha256 = nonempty(flags, "spec-sha256");
+            let spec_artifact_id = nonempty(flags, "spec-artifact");
+            let review_attest_id = nonempty(flags, "review-attest");
+            let review_report_artifact_id = nonempty(flags, "review-report");
+            let valid_sha = spec_ref_sha256.as_ref().is_some_and(|value| {
+                value.len() == 64
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            });
+            let valid_name = spec_ref_name
+                .as_ref()
+                .is_some_and(|value| !value.trim().is_empty() && value.chars().count() <= 2_000);
+            let valid_id = |value: &Option<String>| {
+                value.as_ref().is_some_and(|value| !value.trim().is_empty())
+            };
+
+            if parsed.positional.len() != 2
+                || parsed
+                    .positional
+                    .get(1)
+                    .is_none_or(|value| value.trim().is_empty())
+                || !strict_flags
+                || !parsed.duplicates.is_empty()
+                || !valid_name
+                || !valid_sha
+                || !valid_id(&spec_artifact_id)
+                || !valid_id(&review_attest_id)
+                || !valid_id(&review_report_artifact_id)
+            {
+                return Err(WORK_ITEM_BIND_SPEC_USAGE.to_owned());
+            }
+
+            Ok(Command::WorkItemBindSpec {
+                identity: identity(flags)?,
+                work_item_id: parsed.positional[1].clone(),
+                spec_ref_name: spec_ref_name.expect("validated above"),
+                spec_ref_sha256: spec_ref_sha256.expect("validated above"),
+                spec_artifact_id: spec_artifact_id.expect("validated above"),
+                review_attest_id: review_attest_id.expect("validated above"),
+                review_report_artifact_id: review_report_artifact_id.expect("validated above"),
+            })
+        }
         "work-item-trace" => {
             if parsed.positional.len() != 2 {
                 return Err("usage: tightbeam work-item-trace <workItemId>".to_owned());
@@ -2004,7 +2084,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, ask, answer, return, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, ask, answer, return, revoke-assignment, reopen-assignment, work-item-create, work-item-get, work-item-bind-spec, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -2831,6 +2911,7 @@ mod tests {
                 "wake",
                 "work-item-close",
                 "work-item-create",
+                "work-item-bind-spec",
                 "work-item-fail",
                 "work-item-get",
                 "attend",
@@ -3416,8 +3497,86 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, ask, answer, return, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, ask, answer, return, revoke-assignment, reopen-assignment, work-item-create, work-item-get, work-item-bind-spec, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned())
         );
+    }
+
+    #[test]
+    fn reviewed_spec_binding_parser_is_strict_and_carries_no_generic_patch_surface() {
+        let digest = "a".repeat(64);
+        let valid = vec![
+            "work-item-bind-spec".to_owned(),
+            "wi_1".to_owned(),
+            "--spec-ref".to_owned(),
+            "feature-v1.md".to_owned(),
+            "--spec-sha256".to_owned(),
+            digest.clone(),
+            "--spec-artifact".to_owned(),
+            "art_1".to_owned(),
+            "--review-attest".to_owned(),
+            "att_1".to_owned(),
+            "--review-report".to_owned(),
+            "art_2".to_owned(),
+            "--as-user".to_owned(),
+            "flynn".to_owned(),
+        ];
+
+        assert!(matches!(
+            parse(valid.clone()),
+            Ok(Command::WorkItemBindSpec {
+                identity: Identity::User(ref user),
+                ref work_item_id,
+                ref spec_ref_name,
+                ref spec_ref_sha256,
+                ref spec_artifact_id,
+                ref review_attest_id,
+                ref review_report_artifact_id,
+            }) if user == "flynn"
+                && work_item_id == "wi_1"
+                && spec_ref_name == "feature-v1.md"
+                && spec_ref_sha256 == &digest
+                && spec_artifact_id == "art_1"
+                && review_attest_id == "att_1"
+                && review_report_artifact_id == "art_2"
+        ));
+
+        let usage = WORK_ITEM_BIND_SPEC_USAGE.to_owned();
+        let mut cases = Vec::new();
+        cases.push(strings(&["work-item-bind-spec", "wi_1"]));
+        cases.push({
+            let mut args = valid.clone();
+            args.push("extra".to_owned());
+            args
+        });
+        cases.push({
+            let mut args = valid.clone();
+            args.extend(["--title".to_owned(), "forbidden".to_owned()]);
+            args
+        });
+        cases.push({
+            let mut args = valid.clone();
+            args.extend(["--spec-artifact".to_owned(), "art_repeat".to_owned()]);
+            args
+        });
+
+        for replacement in [
+            "A".repeat(64),
+            "abc".to_owned(),
+            format!("{}g", "a".repeat(63)),
+        ] {
+            let mut args = valid.clone();
+            let index = args
+                .iter()
+                .position(|value| value == "--spec-sha256")
+                .unwrap()
+                + 1;
+            args[index] = replacement;
+            cases.push(args);
+        }
+
+        for args in cases {
+            assert_eq!(parse(args), Err(usage.clone()));
+        }
     }
 
     #[test]

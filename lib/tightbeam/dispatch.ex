@@ -57,8 +57,11 @@ defmodule Tightbeam.Dispatch do
   @type accepted_in_txn ::
           {:accepted_in_txn, pos_integer(), %{canceled: true} | %{assignment: map()}}
 
+  @typedoc "A generic accepted result whose audit and firehose handoff committed with state."
+  @type accepted_effect_in_txn :: {:accepted_effect_in_txn, pos_integer(), map()}
+
   @typedoc "A handler: pure-ish fun; returns a result map, or %{code: _} to deny."
-  @type handler :: (call() -> map() | accepted_in_txn())
+  @type handler :: (call() -> map() | accepted_in_txn() | accepted_effect_in_txn())
 
   @type handlers :: %{optional(String.t()) => handler()}
 
@@ -246,6 +249,11 @@ defmodule Tightbeam.Dispatch do
 
             {:error, error}
 
+          {:returned, {:accepted_effect_in_txn, event_id, response}}
+          when is_integer(event_id) and event_id > 0 and is_map(response) and
+                 not is_map_key(response, :code) and not is_map_key(response, "code") ->
+            {:ok, response}
+
           {:returned, {:accepted_in_txn, event_id, %{canceled: true} = result}}
           when is_integer(event_id) and event_id > 0 and map_size(result) == 1 ->
             :ok = Publisher.accepted_after_handler(db, publisher_call, result)
@@ -299,6 +307,23 @@ defmodule Tightbeam.Dispatch do
             end
 
             {:ok, result}
+
+          {:raised, _exception} when verb == "work-item-bind-spec" ->
+            error = %{code: "server_error", message: "work-item bind failed"}
+
+            :ok =
+              EventLog.append_event_with_handoff(
+                db,
+                "verb",
+                verb,
+                origin,
+                session_key,
+                error,
+                principal,
+                &Publisher.denied_in_txn(&1, publisher_call, error)
+              )
+
+            {:error, error}
 
           {:raised, exception} ->
             error = %{code: "server_error", message: Exception.message(exception)}

@@ -1053,6 +1053,13 @@ defmodule Tightbeam.Gateway do
           Map.put(call, :on_work_item_change, item_change)
         )
       end,
+      {"work-item-bind-spec", ["work_item.spec_bound"]} => fn call ->
+        WorkItems.__handle__(
+          db,
+          "work-item-bind-spec",
+          Map.put(call, :on_work_item_change, item_change)
+        )
+      end,
       {"work-item-icebox", ["work_item.iceboxed"]} =>
         work_item_disposition(db, "work-item-icebox", item_change),
       {"work-item-reopen", ["work_item.reopened"]} =>

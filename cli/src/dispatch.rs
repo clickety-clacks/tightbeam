@@ -520,6 +520,27 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             vec![],
             vec![string_field("workItemId", work_item_id)],
         )),
+        Command::WorkItemBindSpec {
+            identity,
+            work_item_id,
+            spec_ref_name,
+            spec_ref_sha256,
+            spec_artifact_id,
+            review_attest_id,
+            review_report_artifact_id,
+        } => Ok(request(
+            identity,
+            "work-item-bind-spec",
+            vec![],
+            vec![
+                string_field("workItemId", work_item_id),
+                string_field("specRefName", spec_ref_name),
+                string_field("specRefSha256", spec_ref_sha256),
+                string_field("specArtifactId", spec_artifact_id),
+                string_field("reviewAttestId", review_attest_id),
+                string_field("reviewReportArtifactId", review_report_artifact_id),
+            ],
+        )),
         Command::WorkItemTrace {
             identity,
             work_item_id,
@@ -1536,6 +1557,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::ReopenAssignment { identity, .. }
         | Command::WorkItemCreate { identity, .. }
         | Command::WorkItemGet { identity, .. }
+        | Command::WorkItemBindSpec { identity, .. }
         | Command::WorkItemTrace { identity, .. }
         | Command::Attend { identity, .. }
         | Command::Transcript { identity, .. }
@@ -2451,6 +2473,26 @@ mod tests {
         assert_eq!(
             body(&["work-item-get", "wi_1", "--as-user", "flynn"]),
             r#"{"asUser":"flynn","verb":"work-item-get","params":{"workItemId":"wi_1"}}"#
+        );
+
+        assert_eq!(
+            body(&[
+                "work-item-bind-spec",
+                "wi_1",
+                "--spec-ref",
+                "feature-v1.md",
+                "--spec-sha256",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "--spec-artifact",
+                "art_1",
+                "--review-attest",
+                "att_1",
+                "--review-report",
+                "art_2",
+                "--as-user",
+                "flynn",
+            ]),
+            r#"{"asUser":"flynn","verb":"work-item-bind-spec","params":{"workItemId":"wi_1","specRefName":"feature-v1.md","specRefSha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","specArtifactId":"art_1","reviewAttestId":"att_1","reviewReportArtifactId":"art_2"}}"#
         );
         assert_eq!(
             body(&["work-item-trace", "wi_1", "--as-user", "flynn"]),
