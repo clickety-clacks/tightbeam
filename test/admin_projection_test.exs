@@ -1,3 +1,29 @@
+defmodule Tightbeam.AdminProjectionTest.QuerySpyDB do
+  use GenServer
+
+  def start_link(opts), do: GenServer.start_link(__MODULE__, Map.new(opts))
+  def queries(server), do: GenServer.call(server, :queries)
+
+  @impl true
+  def init(opts) do
+    {:ok, %{db: Map.fetch!(opts, :db), queries: []}}
+  end
+
+  @impl true
+  def handle_call(:queries, _from, state), do: {:reply, Enum.reverse(state.queries), state}
+
+  def handle_call({:query, sql, params} = request, _from, state) do
+    {:reply, GenServer.call(state.db, request), record_query(state, sql, params)}
+  end
+
+  def handle_call(request, _from, state), do: {:reply, GenServer.call(state.db, request), state}
+
+  defp record_query(state, sql, params) do
+    query = {sql |> String.replace(~r/\s+/, " ") |> String.trim(), params}
+    %{state | queries: [query | state.queries]}
+  end
+end
+
 defmodule Tightbeam.AdminProjectionTest do
   use Tightbeam.TestCase, async: false
 
@@ -17,6 +43,7 @@ defmodule Tightbeam.AdminProjectionTest do
   }
 
   alias Tightbeam.Firehose.{Hub, Publisher, Registry}
+  alias Tightbeam.AdminProjectionTest.QuerySpyDB
 
   setup do
     base_dir =
@@ -497,6 +524,62 @@ defmodule Tightbeam.AdminProjectionTest do
                false
              )
     end
+  end
+
+  test "identity detail lookups use the same canonical statement for known and unknown names",
+       ctx do
+    proxy = start_supervised!({QuerySpyDB, db: ctx.db})
+
+    assert %{"name" => "served"} = StateResources.query_identity(proxy, "served")
+    assert StateResources.query_identity(proxy, "missing-identity") == nil
+
+    assert [
+             {known_sql, ["identity", "served"]},
+             {unknown_sql, ["identity", "missing-identity"]}
+           ] = QuerySpyDB.queries(proxy)
+
+    assert known_sql ==
+             "SELECT item, rowVersion FROM admin_projection_versions " <>
+               "WHERE resource = ?1 AND primaryKey = ?2"
+
+    assert unknown_sql == known_sql
+  end
+
+  test "identity visibility applies after the shared lookup and hidden names leak no payload oracle",
+       ctx do
+    served = StateResources.query_identity(ctx.db, "served")
+
+    assert %{"name" => "served"} = served
+    refute StateVisibility.identity_visible?(false)
+
+    assert public_identity_or_absent(ctx.db, "served", false) == :absent
+    assert public_identity_or_absent(ctx.db, "missing-identity", false) == :absent
+
+    assert public_identity_or_absent(ctx.db, "served", true) ==
+             {:visible, StateResources.identity(served)}
+  end
+
+  test "identity-status preserves the served identity through the shared query seam", ctx do
+    call = %{origin: "user:flynn", params: %{}}
+
+    expected =
+      Tightbeam.Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})["identity-status"].(call)
+
+    proxy = start_supervised!({QuerySpyDB, db: ctx.db})
+
+    actual =
+      Tightbeam.Gateway.handlers(%{db: proxy, base_dir: ctx.base_dir})["identity-status"].(call)
+
+    assert actual.identity == expected.identity
+
+    assert Enum.any?(QuerySpyDB.queries(proxy), fn
+             {"SELECT item, rowVersion FROM admin_projection_versions WHERE resource = ?1 " <>
+                  "AND primaryKey = ?2", ["identity", "served"]} ->
+               true
+
+             _ ->
+               false
+           end)
   end
 
   test "identity sessionRevisions use Unicode key order above the BEAM map threshold" do
@@ -1116,6 +1199,20 @@ defmodule Tightbeam.AdminProjectionTest do
       end)
 
     assert positions == Enum.sort(positions)
+  end
+
+  defp public_identity_or_absent(db, name, is_admin) do
+    case StateResources.query_identity(db, name) do
+      nil ->
+        :absent
+
+      item ->
+        if StateVisibility.identity_visible?(is_admin) do
+          {:visible, StateResources.identity(item)}
+        else
+          :absent
+        end
+    end
   end
 
   defp notice_primary_key(%{"resource" => "host environment", "refs" => refs}) do

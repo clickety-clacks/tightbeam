@@ -287,10 +287,8 @@ defmodule Tightbeam.StateResources do
     |> Enum.sort_by(&Map.fetch!(&1, "name"))
   end
 
-  def query_identity(source, "served"),
-    do: AdminProjection.stamped_item(source, "identity", "served")
-
-  def query_identity(_source, _name), do: nil
+  def query_identity(source, name) when is_binary(name),
+    do: AdminProjection.stamped_item(source, "identity", name)
 
   @doc "Canonical kungfu query. Only committed, sanitized stamps are readable."
   def query_kungfu(source, filters) when is_map(filters) do
