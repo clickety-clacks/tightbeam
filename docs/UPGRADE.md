@@ -62,11 +62,25 @@ sqlite3 -header -column "$TIGHTBEAM_BASE_DIR/state.db" \
 ```
 
 The query supplies the SSH destination and registered CLI path that
-`update-clients` uses. For every returned row, run the following read-only probe
-with that row's values. Shell-quote the registered path when you substitute it.
+`update-clients` uses. Run the rest of this stage in Bash. Define the same
+apostrophe-safe remote-shell quoting rule that the CLI uses:
 
 ```sh
-ssh <ssh-destination> "'<registered-cli-bin>/tightbeam' version; uname -sm"
+# BEGIN fleet-shell-quote
+shell_quote() {
+  local value=${1//\'/\'"\'"\'}
+  printf "'%s'" "$value"
+}
+# END fleet-shell-quote
+```
+
+For every returned row, run this read-only probe with that row's exact values:
+
+```sh
+SSH_DEST=<registered-ssh-destination>
+CLI_BIN=<registered-cli-bin>
+REMOTE_CLI_Q=$(shell_quote "$CLI_BIN/tightbeam")
+ssh -- "$SSH_DEST" "$REMOTE_CLI_Q version; uname -sm"
 ```
 
 Retain the inventory, every `update-clients` line, and every probe result. A
@@ -92,16 +106,18 @@ SSH_DEST=<registered-ssh-destination>
 CLI_BIN=<registered-cli-bin>
 LOCAL_STAGE=$(mktemp -d)
 REMOTE_STAGE="$CLI_BIN/.tightbeam.release-$VERSION"
+REMOTE_STAGE_Q=$(shell_quote "$REMOTE_STAGE")
+REMOTE_CLI_Q=$(shell_quote "$CLI_BIN/tightbeam")
 
 tar -xzf "$PACKAGE" -C "$LOCAL_STAGE" tightbeam/bin/tightbeam
 scp -- "$LOCAL_STAGE/tightbeam/bin/tightbeam" "$SSH_DEST:$REMOTE_STAGE"
-REMOTE_VERSION=$(ssh "$SSH_DEST" "chmod +x '$REMOTE_STAGE' && '$REMOTE_STAGE' version")
+REMOTE_VERSION=$(ssh -- "$SSH_DEST" "chmod +x $REMOTE_STAGE_Q && $REMOTE_STAGE_Q version")
 if [ "$REMOTE_VERSION" != "$VERSION" ]; then
-  ssh "$SSH_DEST" "rm -f '$REMOTE_STAGE'"
+  ssh -- "$SSH_DEST" "rm -f $REMOTE_STAGE_Q"
   echo "staged CLI version mismatch: $REMOTE_VERSION" >&2
   exit 1
 fi
-ssh "$SSH_DEST" "mv -f '$REMOTE_STAGE' '$CLI_BIN/tightbeam'"
+ssh -- "$SSH_DEST" "mv -f $REMOTE_STAGE_Q $REMOTE_CLI_Q"
 ```
 
 Run `update-clients` again. Repeat the inventory and per-host probe. Retain the
