@@ -1,7 +1,9 @@
 defmodule Tightbeam.ColdStartTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{ColdStart, DB, Devices, Model, Org, Schema}
+  import ExUnit.CaptureLog
+
+  alias Tightbeam.{Boot, ColdStart, DB, Devices, Model, Org, Schema}
 
   @defaults %{
     host: "testhost",
@@ -138,7 +140,7 @@ defmodule Tightbeam.ColdStartTest do
                @defaults
              )
 
-    assert ColdStart.authenticate(db, first.token).device_id == "d1"
+    assert ColdStart.activate(db, first.token).device_id == "d1"
     assert {:paired, rotated} = ColdStart.pair(db, input, @defaults)
     refute rotated.token == first.token
   end
@@ -205,6 +207,56 @@ defmodule Tightbeam.ColdStartTest do
     assert device.user_id == "alice"
     assert ColdStart.state(db)["state"] == "claimed"
     assert {:ok, [[2]]} = DB.query(db, "SELECT COUNT(*) FROM events")
+  end
+
+  test "host-local reservation rolls back when its Main referent is malformed", %{db: db} do
+    :ok =
+      DB.execute(db, """
+      CREATE TRIGGER corrupt_reserved_main
+      AFTER INSERT ON sessions
+      WHEN NEW.kind = 'main'
+      BEGIN
+        UPDATE sessions SET isBuiltIn = 0 WHERE sessionKey = NEW.sessionKey;
+      END;
+      """)
+
+    assert {:error, "bootstrap_failed"} = ColdStart.bootstrap_user(db, "alice", @defaults)
+    assert identity_census(db) == [0, 0, 0, 0, 0]
+  end
+
+  test "boot logs reset guidance only for the closed cold-start shape family", %{db: db} do
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('alice',1,'cold_start',1)"
+             )
+
+    log =
+      capture_log([metadata: [:code, :invariant, :recoverySection]], fn ->
+        error = assert_raise Schema.ShapeError, fn -> Boot.ensure_schema!(db) end
+
+        assert error.message ==
+                 "incompatible_cold_start_v1: receiptless_nonempty_users; recovery: Recover an unusable fresh database"
+      end)
+
+    assert log =~ "cold-start schema is incompatible"
+    assert log =~ "code=incompatible_cold_start_v1"
+    assert log =~ "invariant=receiptless_nonempty_users"
+    assert log =~ "recoverySection=Recover an unusable fresh database"
+  end
+
+  test "boot does not label an unrelated shape error as a cold-start reset", %{db: db} do
+    :ok = DB.execute(db, "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v3'")
+
+    log =
+      capture_log(fn ->
+        error = assert_raise Schema.ShapeError, fn -> Boot.ensure_schema!(db) end
+        assert error.message =~ "written by a different build"
+      end)
+
+    refute log =~ "cold-start schema is incompatible"
+    refute log =~ "incompatible_cold_start_v1"
+    refute log =~ "Recover an unusable fresh database"
   end
 
   test "a different device after claim remains an ordinary pending pair", %{db: db} do

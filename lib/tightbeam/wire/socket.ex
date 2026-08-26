@@ -278,59 +278,70 @@ defmodule Tightbeam.Wire.Socket do
   end
 
   defp auth(msg, state) do
-    token = string(msg["token"])
+    case auth_frame(msg, state) do
+      {:ok, token, device_id, subscriptions} ->
+        case ColdStart.authenticate(db(state), token) do
+          %{device_id: ^device_id} = device ->
+            auth_success(msg, device, token, subscriptions, state)
 
-    case ColdStart.authenticate(db(state), token) do
-      nil ->
-        known = Devices.by_id(db(state), string(msg["deviceId"]))
-
-        reason =
-          case known do
-            %{status: "pending"} -> "device_not_approved"
-            %{status: "allowlisted"} -> "token_revoked"
-            _ -> "auth_failed"
-          end
-
-        stop_with(Payloads.auth_result_failure(reason), state)
-
-      device ->
-        auth_success(msg, device, state)
-    end
-  end
-
-  defp auth_success(msg, device, %{conn_ref: nil} = state) do
-    case parse_subscriptions(msg, MapSet.new(["chat"])) do
-      {:ok, subscriptions} ->
-        if MapSet.member?(subscriptions, "chat"), do: seed_main_stream(device.user_id, state)
-
-        {:ok, conn_ref, _replaced} =
-          ConnRegistry.register(conn_registry(state), %{
-            pid: self(),
-            user_id: device.user_id,
-            device_id: device.device_id,
-            is_admin: device.is_admin,
-            subscriptions: subscriptions
-          })
-
-        auth_replay(msg, device, conn_ref, subscriptions, state)
+          _device_or_nil ->
+            auth_failure(device_id, state)
+        end
 
       :error ->
         stop_with(Payloads.wire_error("invalid_message"), state)
     end
   end
 
-  defp auth_success(msg, device, state) do
-    case parse_subscriptions(msg, state.subscriptions) do
-      {:ok, subscriptions} when subscriptions == state.subscriptions ->
-        if MapSet.member?(subscriptions, "chat"), do: seed_main_stream(device.user_id, state)
-        auth_replay(msg, device, state.conn_ref, subscriptions, state)
+  defp auth_frame(msg, state) do
+    token = msg["token"]
+    device_id = msg["deviceId"]
+    default = if state.conn_ref, do: state.subscriptions, else: MapSet.new(["chat"])
 
-      _ ->
-        stop_with(Payloads.wire_error("invalid_message"), state)
+    with true <- is_binary(token) and token != "",
+         true <- is_binary(device_id) and device_id != "",
+         {:ok, subscriptions} <- parse_subscriptions(msg, default),
+         true <- is_nil(state.conn_ref) or subscriptions == state.subscriptions do
+      {:ok, token, device_id, subscriptions}
+    else
+      _ -> :error
     end
   end
 
-  defp auth_replay(msg, device, conn_ref, subscriptions, state) do
+  defp auth_failure(device_id, state) do
+    known = Devices.by_id(db(state), device_id)
+
+    reason =
+      case known do
+        %{status: "pending"} -> "device_not_approved"
+        %{status: "allowlisted"} -> "token_revoked"
+        _ -> "auth_failed"
+      end
+
+    stop_with(Payloads.auth_result_failure(reason), state)
+  end
+
+  defp auth_success(msg, device, token, subscriptions, %{conn_ref: nil} = state) do
+    if MapSet.member?(subscriptions, "chat"), do: seed_main_stream(device.user_id, state)
+
+    {:ok, conn_ref, _replaced} =
+      ConnRegistry.register(conn_registry(state), %{
+        pid: self(),
+        user_id: device.user_id,
+        device_id: device.device_id,
+        is_admin: device.is_admin,
+        subscriptions: subscriptions
+      })
+
+    auth_replay(msg, device, token, conn_ref, subscriptions, state)
+  end
+
+  defp auth_success(msg, device, token, subscriptions, state) do
+    if MapSet.member?(subscriptions, "chat"), do: seed_main_stream(device.user_id, state)
+    auth_replay(msg, device, token, state.conn_ref, subscriptions, state)
+  end
+
+  defp auth_replay(msg, device, token, conn_ref, subscriptions, state) do
     chat? = MapSet.member?(subscriptions, "chat")
     sessions = if chat?, do: Org.list_for_user(db(state), device.user_id, false), else: []
     keys = Enum.map(sessions, & &1.session_key)
@@ -402,7 +413,12 @@ defmodule Tightbeam.Wire.Socket do
         do: [auth_payload, snapshot | Enum.map(replay, &Payloads.server_message/1)],
         else: [auth_payload]
 
-    push_many(frames, state)
+    result = push_many(frames, state)
+
+    case ColdStart.activate(db(state), token) do
+      %{device_id: device_id} when device_id == device.device_id -> result
+      _ -> stop_with(Payloads.auth_result_failure("token_revoked"), state)
+    end
   end
 
   defp parse_subscriptions(msg, default) do

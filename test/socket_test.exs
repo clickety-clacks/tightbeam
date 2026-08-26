@@ -3,6 +3,7 @@ defmodule Tightbeam.Wire.SocketTest do
   alias Tightbeam.Model
 
   alias Tightbeam.{
+    ColdStart,
     ConnRegistry,
     DB,
     Devices,
@@ -975,8 +976,21 @@ defmodule Tightbeam.Wire.SocketTest do
   end
 
   test "invalid subscription sets fail before seeding or registration", ctx do
+    replay_secret = :crypto.strong_rand_bytes(32)
+
+    claim = %{
+      device_id: "bad",
+      claimed_name: "Bad",
+      platform: nil,
+      model: nil,
+      replay_secret: replay_secret
+    }
+
     {:paired, device} =
-      claim_org(ctx.db, %{device_id: "bad", claimed_name: "Bad", platform: nil, model: nil})
+      claim_org(ctx.db, claim)
+
+    assert {:ok, [[nil]]} =
+             DB.query(ctx.db, "SELECT activatedAt FROM cold_start_receipts WHERE id=1")
 
     for subscriptions <- [[], ["unknown"]] do
       {:ok, state} = Socket.init(ctx.deps)
@@ -994,6 +1008,31 @@ defmodule Tightbeam.Wire.SocketTest do
       assert JSON.decode!(error)["code"] == "invalid_message"
       assert map_size(:sys.get_state(ctx.registry).conns) == 0
       assert [%{kind: "main"}] = Org.list_for_user(ctx.db, device.user_id, false)
+
+      assert {:ok, [[nil]]} =
+               DB.query(ctx.db, "SELECT activatedAt FROM cold_start_receipts WHERE id=1")
     end
+
+    assert {:paired, replay} = ColdStart.pair(ctx.db, claim, ctx.deps.defaults)
+    assert replay.token == device.token
+
+    {:ok, state} = Socket.init(ctx.deps)
+
+    valid_auth = %{
+      "type" => "auth",
+      "token" => device.token,
+      "deviceId" => device.device_id,
+      "subscriptions" => ["chat"]
+    }
+
+    assert {:push, _frames, _replaying} =
+             Socket.handle_in({JSON.encode!(valid_auth), opcode: :text}, state)
+
+    assert {:ok, [[activated_at]]} =
+             DB.query(ctx.db, "SELECT activatedAt FROM cold_start_receipts WHERE id=1")
+
+    assert is_integer(activated_at)
+    assert {:paired, rotated} = ColdStart.pair(ctx.db, claim, ctx.deps.defaults)
+    refute rotated.token == device.token
   end
 end

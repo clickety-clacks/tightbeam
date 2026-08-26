@@ -217,8 +217,13 @@ defmodule Tightbeam.ColdStart do
     end
   end
 
-  @doc "Authenticate and mark the first credential activated in the same transaction."
+  @doc "Authenticate a current allowlisted token without changing cold-start state."
   def authenticate(db \\ Tightbeam.DB, token) do
+    Devices.by_token(db, token)
+  end
+
+  @doc "Mark the first credential activated after its socket handshake succeeds."
+  def activate(db \\ Tightbeam.DB, token) do
     case DB.transaction(db, fn txn ->
            case Devices.get_device_by_token_in_txn(txn, token) do
              nil ->
@@ -347,7 +352,8 @@ defmodule Tightbeam.ColdStart do
       [user_id, root.session_key, @principal, event_id, ts]
     )
 
-    bootstrap_result(receipt_in_txn(txn))
+    receipt = assert_reserved!(txn, user_id, root.session_key)
+    bootstrap_result(receipt)
   end
 
   defp complete_reserved_in_txn(txn, receipt, input) do
@@ -740,6 +746,23 @@ defmodule Tightbeam.ColdStart do
              receipt.device_id == device_id do
       claim_error!("bootstrap_failed")
     end
+  end
+
+  defp assert_reserved!(txn, user_id, root_key) do
+    user = Devices.get_user_in_txn(txn, user_id)
+    root = Org.get_in_txn(txn, root_key)
+    receipt = receipt_in_txn(txn)
+
+    unless user && user.is_admin && personal_main?(root, user_id) && root.state == "active" &&
+             receipt && receipt.phase == "reserved" &&
+             receipt.cause == "gateway_local_bootstrap" && receipt.principal == @principal &&
+             receipt.user_id == user_id && receipt.root_session_key == root_key &&
+             is_nil(receipt.device_id) && event_referents_valid?(txn, receipt) &&
+             replay_shape_valid?(receipt) do
+      claim_error!("bootstrap_failed")
+    end
+
+    receipt
   end
 
   defp bootstrap_result(receipt) do
