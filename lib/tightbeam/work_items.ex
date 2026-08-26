@@ -16,7 +16,7 @@ defmodule Tightbeam.WorkItems do
   fail/reopen) are owner-or-admin verbs that write `state`/`failReason`.
   """
 
-  alias Tightbeam.{CausalEvents, DB, IdPrefix, Org, Wakes}
+  alias Tightbeam.{CausalEvents, DB, IdPrefix, Org, SpecCustody, Wakes}
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.Publisher
 
@@ -88,50 +88,61 @@ defmodule Tightbeam.WorkItems do
         transaction(db, fn txn ->
           case key && idempotency_item(txn, owner, key) do
             nil ->
-              id = "wi_" <> Tightbeam.Id.uuid4()
-              created_in_turn_seq = running_turn_seq(txn, created_by_session)
+              case SpecCustody.admit_in_txn(
+                     txn,
+                     call.params[:spec_ref_name],
+                     call.params[:spec_ref_sha256],
+                     call.params[:spec_ref_text]
+                   ) do
+                {:ok, _custody_changed?} ->
+                  id = "wi_" <> Tightbeam.Id.uuid4()
+                  created_in_turn_seq = running_turn_seq(txn, created_by_session)
 
-              Txn.q(
-                txn,
-                """
-                INSERT INTO work_items
-                  (id, title, specRefName, specRefSha256, isBug, ownerUserId,
-                   state, createdByUser, createdBySession, createdInTurnSeq,
-                   createdContextKnown, createdAt)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', ?7, ?8, ?9, 1, ?10)
-                """,
-                [
-                  id,
-                  call.params.title,
-                  call.params[:spec_ref_name],
-                  call.params[:spec_ref_sha256],
-                  bool_to_int(is_bug),
-                  owner,
-                  created_by_user,
-                  created_by_session,
-                  created_in_turn_seq,
-                  now()
-                ]
-              )
+                  Txn.q(
+                    txn,
+                    """
+                    INSERT INTO work_items
+                      (id, title, specRefName, specRefSha256, isBug, ownerUserId,
+                       state, createdByUser, createdBySession, createdInTurnSeq,
+                       createdContextKnown, createdAt)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', ?7, ?8, ?9, 1, ?10)
+                    """,
+                    [
+                      id,
+                      call.params.title,
+                      call.params[:spec_ref_name],
+                      call.params[:spec_ref_sha256],
+                      bool_to_int(is_bug),
+                      owner,
+                      created_by_user,
+                      created_by_session,
+                      created_in_turn_seq,
+                      now()
+                    ]
+                  )
 
-              routing_wake = arm_routing_in_txn(txn, id, owner, call.params.title)
+                  routing_wake = arm_routing_in_txn(txn, id, owner, call.params.title)
 
-              if key do
-                Txn.q(
-                  txn,
-                  "INSERT INTO wire_idempotency (ownerUserId, operation, idempotencyKey, sessionKey) VALUES (?1, 'work-item-create', ?2, ?3)",
-                  [owner, key, id]
-                )
+                  if key do
+                    Txn.q(
+                      txn,
+                      "INSERT INTO wire_idempotency (ownerUserId, operation, idempotencyKey, sessionKey) VALUES (?1, 'work-item-create', ?2, ?3)",
+                      [owner, key, id]
+                    )
+                  end
+
+                  item = fetch_in_txn(txn, id)
+                  on_routing_wake_scheduled_in_txn(call).(txn, routing_wake)
+                  Publisher.maybe_accepted_in_txn(txn, call, public_work_item(item, txn))
+                  {:created, item, routing_wake}
+
+                error when is_map(error) ->
+                  error
               end
-
-              item = fetch_in_txn(txn, id)
-              on_routing_wake_scheduled_in_txn(call).(txn, routing_wake)
-              Publisher.maybe_accepted_in_txn(txn, call, public_work_item(item))
-              {:created, item, routing_wake}
 
             item_id ->
               item = fetch_in_txn(txn, item_id)
-              Publisher.maybe_accepted_in_txn(txn, call, public_work_item(item))
+              Publisher.maybe_accepted_in_txn(txn, call, public_work_item(item, txn))
               {:replayed, item}
           end
         end)
@@ -143,10 +154,13 @@ defmodule Tightbeam.WorkItems do
         {:created, item, routing_wake} ->
           best_effort(fn -> on_change(call).(item.id, "metadata") end)
           best_effort(fn -> on_routing_wake_scheduled(call).(routing_wake) end)
-          public_work_item(item)
+          public_work_item(item, db)
 
         {:replayed, item} ->
-          public_work_item(item)
+          public_work_item(item, db)
+
+        error when is_map(error) ->
+          error
       end
     end
   end
@@ -185,7 +199,7 @@ defmodule Tightbeam.WorkItems do
 
           case result do
             {:updated, item, _changed?} ->
-              Publisher.maybe_accepted_in_txn(txn, call, public_work_item(item))
+              Publisher.maybe_accepted_in_txn(txn, call, public_work_item(item, txn))
 
             _ ->
               :ok
@@ -197,7 +211,7 @@ defmodule Tightbeam.WorkItems do
       case result do
         {:updated, item, changed?} ->
           if changed?, do: best_effort(fn -> on_change(call).(item.id, "metadata") end)
-          public_work_item(item)
+          public_work_item(item, db)
 
         error ->
           error
@@ -218,10 +232,17 @@ defmodule Tightbeam.WorkItems do
 
         with :ok <- valid_title(title),
              :ok <- valid_spec_ref(spec_ref_name, spec_ref_sha256),
-             :ok <- valid_is_bug(is_bug) do
+             :ok <- valid_is_bug(is_bug),
+             {:ok, custody_changed?} <-
+               SpecCustody.admit_in_txn(
+                 txn,
+                 spec_ref_name,
+                 spec_ref_sha256,
+                 params[:spec_ref_text]
+               ) do
           updates = patch_updates(params, title, spec_ref_name, spec_ref_sha256, is_bug)
           updated = apply_updates(txn, item, updates)
-          {:updated, updated, metadata(item) != metadata(updated)}
+          {:updated, updated, custody_changed? or metadata(item) != metadata(updated)}
         end
     end
   end
@@ -329,7 +350,7 @@ defmodule Tightbeam.WorkItems do
             {:disposed, item, _changed?} ->
               Publisher.maybe_accepted_in_txn(txn, call, %{
                 ok: true,
-                workItem: public_work_item(item)
+                workItem: public_work_item(item, txn)
               })
 
             _ ->
@@ -342,7 +363,7 @@ defmodule Tightbeam.WorkItems do
       case result do
         {:disposed, item, changed?} ->
           if changed?, do: best_effort(fn -> on_change(call).(item.id, "metadata") end)
-          %{ok: true, workItem: public_work_item(item)}
+          %{ok: true, workItem: public_work_item(item, db)}
 
         error ->
           error
@@ -669,7 +690,7 @@ defmodule Tightbeam.WorkItems do
           item = fetch(db, id)
 
           %{
-            workItem: public_work_item(item),
+            workItem: public_work_item(item, db),
             assignments: Tightbeam.Assignments.__for_work_item__(db, item.id)
           }
 
@@ -743,7 +764,7 @@ defmodule Tightbeam.WorkItems do
       {:ok, rows} =
         DB.query(db, "SELECT #{columns()} FROM work_items ORDER BY createdAt DESC, id DESC")
 
-      %{workItems: Enum.map(rows, &(work_item(&1) |> public_work_item()))}
+      %{workItems: Enum.map(rows, &(work_item(&1) |> public_work_item(db)))}
     end
   end
 
@@ -905,7 +926,14 @@ defmodule Tightbeam.WorkItems do
     }
   end
 
-  defp public_work_item(item), do: Map.drop(item, [:routingWakeId, :slateWakeId])
+  defp public_work_item(item, source) do
+    item
+    |> Map.drop([:routingWakeId, :slateWakeId])
+    |> Map.put(
+      :specRefResolution,
+      SpecCustody.resolution(source, item.specRefName, item.specRefSha256)
+    )
+  end
 
   defp bool_to_int(true), do: 1
   defp bool_to_int(false), do: 0

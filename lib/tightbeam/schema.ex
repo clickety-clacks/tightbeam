@@ -21,6 +21,7 @@ defmodule Tightbeam.Schema do
     Tightbeam.CriticalLeases,
     Tightbeam.Roles,
     Tightbeam.ReadMarkers,
+    Tightbeam.SpecCustody,
     Tightbeam.WorkItems,
     Tightbeam.Assignments,
     Tightbeam.EffortCheckin,

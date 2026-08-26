@@ -209,6 +209,7 @@ pub enum Command {
         title: String,
         spec_ref_name: Option<String>,
         spec_ref_sha256: Option<String>,
+        spec_ref_text: Option<String>,
         idempotency_key: Option<String>,
     },
     WorkItemGet {
@@ -548,11 +549,13 @@ COMMANDS:
   retire --session <key> [--key <idempotencyKey>]
       End a session deliberately.
 
-  work-item-create --title "<title>" [--spec-ref <name> --spec-sha256 <hex>]
+  work-item-create --title "<title>" [--spec-ref <name> --spec-sha256 <hex> [--spec-file <path>]]
                    [--key <idempotencyKey>]
       File a work item. Unrouted, it becomes YOUR problem on a deadline: file
       it, then route it (assign/dispatch) or icebox it. --key makes create
-      idempotent (same key returns the same item).
+      idempotent (same key returns the same item). Pass --spec-file to copy the
+      exact ruling text into canonical custody; its SHA-256 must match
+      --spec-sha256. Without custodied bytes, read specRefResolution as unresolved.
   work-item-get <workItemId>
   work-item-trace <workItemId>
   attend [--high]
@@ -1613,7 +1616,7 @@ fn parse_with_optional_catalog(
         }
         "work-item-create" => {
             if parsed.positional.len() != 1 {
-                return Err("usage: tightbeam work-item-create --title <title> [--spec-ref <name> --spec-sha256 <hex>]".to_owned());
+                return Err("usage: tightbeam work-item-create --title <title> [--spec-ref <name> --spec-sha256 <hex> [--spec-file <path>]]".to_owned());
             }
             let spec_ref_name = nonempty(flags, "spec-ref");
             let spec_ref_sha256 = nonempty(flags, "spec-sha256");
@@ -1626,11 +1629,27 @@ fn parse_with_optional_catalog(
                     "usage: --spec-ref and --spec-sha256 must be supplied together".to_owned(),
                 );
             }
+            let spec_ref_text = match nonempty(flags, "spec-file") {
+                Some(path) if spec_ref_present => Some(
+                    fs::read_to_string(&path)
+                        .map_err(|error| format!("could not read --spec-file {path}: {error}"))?,
+                ),
+                Some(_) => {
+                    return Err(
+                        "usage: --spec-file requires --spec-ref and --spec-sha256".to_owned()
+                    );
+                }
+                None if flags.contains_key("spec-file") => {
+                    return Err("--spec-file must name a readable file".to_owned());
+                }
+                None => None,
+            };
             Ok(Command::WorkItemCreate {
                 identity: identity(flags)?,
                 title: nonempty(flags, "title").ok_or_else(|| "--title is required".to_owned())?,
                 spec_ref_name,
                 spec_ref_sha256,
+                spec_ref_text,
                 idempotency_key: nonempty(flags, "key"),
             })
         }

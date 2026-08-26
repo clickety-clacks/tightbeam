@@ -1,7 +1,7 @@
 defmodule Tightbeam.WorkState do
   @moduledoc "Grain-agnostic, query-time work observability."
 
-  alias Tightbeam.DB
+  alias Tightbeam.{DB, SpecCustody}
   alias Tightbeam.DB.Txn
 
   @ddl """
@@ -102,7 +102,7 @@ defmodule Tightbeam.WorkState do
         txn
         |> item_rows(filters)
         |> Enum.map(fn row ->
-          item = work_item(row)
+          item = work_item(row, txn)
           %{workItem: item, assignments: assignments_for_item(txn, item.id)}
         end)
 
@@ -120,7 +120,7 @@ defmodule Tightbeam.WorkState do
 
         [row] ->
           %{
-            workItem: work_item(row),
+            workItem: work_item(row, txn),
             assignments: assignments_for_item(txn, work_item_id),
             cursor: cursors(txn)
           }
@@ -209,7 +209,7 @@ defmodule Tightbeam.WorkState do
 
     Txn.q(txn, "SELECT #{item_columns()} FROM work_items ORDER BY createdAt DESC, id DESC")
     |> Enum.filter(fn row ->
-      item = work_item(row)
+      item = work_item(row, txn)
 
       # Owner visibility (observability-v1 amendment): an item is visible to its
       # ownerUserId regardless of assignments — an unassigned item still reaches
@@ -368,19 +368,22 @@ defmodule Tightbeam.WorkState do
     }
   end
 
-  defp work_item([
-         id,
-         title,
-         spec_ref_name,
-         spec_ref_sha256,
-         is_bug,
-         owner_user_id,
-         state,
-         fail_reason,
-         user,
-         session,
-         created_at
-       ]) do
+  defp work_item(
+         [
+           id,
+           title,
+           spec_ref_name,
+           spec_ref_sha256,
+           is_bug,
+           owner_user_id,
+           state,
+           fail_reason,
+           user,
+           session,
+           created_at
+         ],
+         txn
+       ) do
     %{
       id: id,
       title: title,
@@ -392,7 +395,8 @@ defmodule Tightbeam.WorkState do
       failReason: fail_reason,
       createdByUser: user,
       createdBySession: session,
-      createdAt: created_at
+      createdAt: created_at,
+      specRefResolution: SpecCustody.resolution(txn, spec_ref_name, spec_ref_sha256)
     }
   end
 

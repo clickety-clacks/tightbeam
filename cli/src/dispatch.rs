@@ -497,6 +497,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             title,
             spec_ref_name,
             spec_ref_sha256,
+            spec_ref_text,
             idempotency_key,
         } => {
             let mut params = vec![string_field("title", title)];
@@ -505,6 +506,9 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             }
             if let Some(value) = spec_ref_sha256 {
                 params.push(string_field("specRefSha256", value));
+            }
+            if let Some(value) = spec_ref_text {
+                params.push(string_field("specRefText", value));
             }
             if let Some(value) = idempotency_key {
                 params.push(string_field("idempotencyKey", value));
@@ -2452,6 +2456,32 @@ mod tests {
             body(&["work-item-get", "wi_1", "--as-user", "flynn"]),
             r#"{"asUser":"flynn","verb":"work-item-get","params":{"workItemId":"wi_1"}}"#
         );
+
+        let spec_file =
+            std::env::temp_dir().join(format!("tightbeam-spec-custody-{}", std::process::id()));
+        std::fs::write(&spec_file, "canonical ruling\n").unwrap();
+        let spec_path = spec_file.to_string_lossy().into_owned();
+        let custody_sha = "cc4025961482ad65144b277dfb8531d024449b34491a0e952c10869ae9f50c32";
+
+        assert_eq!(
+            body(&[
+                "work-item-create",
+                "--title",
+                "Custodied",
+                "--spec-ref",
+                "spec.md",
+                "--spec-sha256",
+                custody_sha,
+                "--spec-file",
+                &spec_path,
+                "--as-user",
+                "flynn",
+            ]),
+            format!(
+                r#"{{"asUser":"flynn","verb":"work-item-create","params":{{"title":"Custodied","specRefName":"spec.md","specRefSha256":"{custody_sha}","specRefText":"canonical ruling\n"}}}}"#
+            )
+        );
+        std::fs::remove_file(spec_file).unwrap();
         assert_eq!(
             body(&["work-item-trace", "wi_1", "--as-user", "flynn"]),
             r#"{"asUser":"flynn","verb":"work-item-trace","params":{"workItemId":"wi_1"}}"#

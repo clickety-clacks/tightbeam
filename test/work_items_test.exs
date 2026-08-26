@@ -122,6 +122,7 @@ defmodule Tightbeam.WorkItemsTest do
     assert user.createdBySession == nil
     assert user.specRefName == nil
     assert user.specRefSha256 == nil
+    assert user.specRefResolution == %{status: "none"}
     refute user.isBug
 
     assert %{code: "invalid_is_bug"} =
@@ -139,7 +140,115 @@ defmodule Tightbeam.WorkItemsTest do
     assert session.createdByUser == nil
     assert session.specRefName == "spec.md"
     assert session.specRefSha256 == @sha
+    assert session.specRefResolution == %{status: "unresolved", reason: "missing_custody"}
     assert session.isBug
+  end
+
+  test "spec custody resolves exact ruling bytes and reports every unresolved or conflicting case",
+       ctx do
+    ruling = "# Canonical ruling\n\nThe substrate records truth.\n"
+    sha = sha256(ruling)
+
+    resolved =
+      create(ctx, {:user, "flynn"}, %{
+        title: "Resolved",
+        spec_ref_name: "rulings/canonical.md",
+        spec_ref_sha256: sha,
+        spec_ref_text: ruling,
+        idempotency_key: "resolved-once"
+      })
+
+    assert resolved.specRefName == "rulings/canonical.md"
+    assert resolved.specRefSha256 == sha
+    assert resolved.specRefResolution == %{status: "resolved", rulingText: ruling}
+
+    # A keyed replay and an independent duplicate reference both reuse the one
+    # immutable custody row. Neither manufactures another copy or another shape.
+    assert create(ctx, {:user, "flynn"}, %{
+             title: "Resolved",
+             spec_ref_name: "rulings/canonical.md",
+             spec_ref_sha256: sha,
+             spec_ref_text: ruling,
+             idempotency_key: "resolved-once"
+           }) == resolved
+
+    duplicate =
+      create(ctx, {:user, "flynn"}, %{
+        title: "Same ruling, another item",
+        spec_ref_name: "rulings/canonical.md",
+        spec_ref_sha256: sha,
+        spec_ref_text: ruling
+      })
+
+    assert duplicate.specRefResolution == %{status: "resolved", rulingText: ruling}
+    assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT count(*) FROM spec_custody")
+
+    conflict_ruling = "Canonical bytes that conflict with a corrupt custody row."
+    conflict_sha = sha256(conflict_ruling)
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO spec_custody (sha256, rulingText, recordedAt) VALUES (?1, 'different bytes', 1)",
+               [conflict_sha]
+             )
+
+    assert Tightbeam.SpecCustody.resolution(
+             ctx.db,
+             "rulings/conflict.md",
+             conflict_sha
+           ) == %{status: "unresolved", reason: "custody_digest_mismatch"}
+
+    assert %{code: "spec_custody_conflict"} =
+             create(ctx, {:user, "flynn"}, %{
+               title: "Conflicting custody",
+               spec_ref_name: "rulings/conflict.md",
+               spec_ref_sha256: conflict_sha,
+               spec_ref_text: conflict_ruling
+             })
+
+    assert %{code: "spec_digest_mismatch"} =
+             create(ctx, {:user, "flynn"}, %{
+               title: "Malformed digest",
+               spec_ref_name: "rulings/bad.md",
+               spec_ref_sha256: String.duplicate("c", 64),
+               spec_ref_text: ruling
+             })
+
+    assert %{code: "invalid_spec_ruling"} =
+             create(ctx, {:user, "flynn"}, %{
+               title: "Blank ruling",
+               spec_ref_name: "rulings/blank.md",
+               spec_ref_sha256: sha256("   "),
+               spec_ref_text: "   "
+             })
+
+    missing_ruling = "The formerly missing ruling."
+    missing_sha = sha256(missing_ruling)
+
+    missing =
+      create(ctx, {:user, "flynn"}, %{
+        title: "Missing custody",
+        spec_ref_name: "rulings/missing.md",
+        spec_ref_sha256: missing_sha
+      })
+
+    assert missing.specRefResolution == %{status: "unresolved", reason: "missing_custody"}
+
+    assert get(ctx, {:user, "flynn"}, missing.id).workItem.specRefResolution == %{
+             status: "unresolved",
+             reason: "missing_custody"
+           }
+
+    custody_update =
+      update_call({:user, "flynn"}, missing.id, %{spec_ref_text: missing_ruling})
+      |> Map.put(:on_work_item_change, fn _, _ -> send(self(), :custody_resolved) end)
+
+    repinned = WorkItems.__handle__(ctx.db, "work-item-update", custody_update)
+
+    assert repinned.specRefResolution == %{status: "resolved", rulingText: missing_ruling}
+    assert_received :custody_resolved
+    assert get(ctx, {:user, "flynn"}, missing.id).workItem == repinned
   end
 
   test "Proof 1: an item created during a running turn carries that seq with known = 1; created with no running turn carries NULL with known = 1",
@@ -447,4 +556,6 @@ defmodule Tightbeam.WorkItemsTest do
       host: "eezo"
     })
   end
+
+  defp sha256(bytes), do: :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
 end
