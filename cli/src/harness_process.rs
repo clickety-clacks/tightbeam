@@ -1,7 +1,9 @@
 use crate::process_tree::Snapshot;
+use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::fs;
 use std::fs::OpenOptions;
+use std::io;
 use std::io::{Read, Write};
 #[cfg(target_os = "macos")]
 use std::os::darwin::fs::MetadataExt as DarwinMetadataExt;
@@ -188,6 +190,233 @@ fn verify_session_leader_alive(pgid: libc::pid_t) -> Result<(), String> {
     Ok(())
 }
 
+/// Kernel start time — the stable instance token that survives only for THIS process.
+///
+/// Numeric pids and pgids are reused once a leader is reaped; start time is what
+/// probe.rs and child_process.rs already use to tell the same slot from a new occupant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProcessStartTime {
+    seconds: libc::time_t,
+    microseconds: i32,
+}
+
+/// One process the freeze proved was ours, bound to the start time read at capture.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProcessInstance {
+    pid: libc::pid_t,
+    pgid: libc::pid_t,
+    start_time: ProcessStartTime,
+}
+
+impl Ord for ProcessInstance {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.pid.cmp(&other.pid)
+    }
+}
+
+impl PartialOrd for ProcessInstance {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn read_process_start_time(pid: libc::pid_t) -> io::Result<ProcessStartTime> {
+    let pid = libc::c_int::try_from(pid)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "pid exceeds c_int"))?;
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
+    let mut size = 0;
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } == -1
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if size < std::mem::size_of::<libc::timeval>() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "KERN_PROC_PID returned no kinfo_proc",
+        ));
+    }
+
+    let mut buffer = vec![0u8; size];
+    let mut written = buffer.len();
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            buffer.as_mut_ptr().cast(),
+            &mut written,
+            std::ptr::null_mut(),
+            0,
+        )
+    } == -1
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if written < std::mem::size_of::<libc::timeval>() {
+        if unsafe { libc::kill(pid, 0) } == -1 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                return Err(error);
+            }
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "KERN_PROC_PID returned truncated kinfo_proc",
+        ));
+    }
+
+    let start = unsafe { buffer.as_ptr().cast::<libc::timeval>().read_unaligned() };
+    Ok(ProcessStartTime {
+        seconds: start.tv_sec,
+        microseconds: start.tv_usec,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn read_process_start_time(pid: libc::pid_t) -> io::Result<ProcessStartTime> {
+    let stat = std::fs::read(format!("/proc/{pid}/stat"))
+        .map_err(|error| io::Error::new(error.kind(), error))?;
+    let start_ticks = parse_proc_starttime(&stat).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "process stat did not carry a start time",
+        )
+    })?;
+    Ok(ProcessStartTime {
+        seconds: start_ticks as libc::time_t,
+        microseconds: 0,
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn read_process_start_time(_pid: libc::pid_t) -> io::Result<ProcessStartTime> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "process start time is only available on linux and macOS",
+    ))
+}
+
+/// Field 22 of `/proc/<pid>/stat` after the closing paren — starttime in clock ticks.
+#[cfg(any(target_os = "linux", test))]
+fn parse_proc_starttime(stat: &[u8]) -> Option<u64> {
+    let close = stat.iter().rposition(|byte| *byte == b')')?;
+    let rest = stat.get(close + 2..)?;
+    let fields = rest
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|field| !field.is_empty())
+        .collect::<Vec<_>>();
+    std::str::from_utf8(fields.get(19)?).ok()?.parse().ok()
+}
+
+/// The captured instance must still be the same process before a pid signal is sent.
+fn verify_process_instance(instance: &ProcessInstance) -> Result<(), String> {
+    match read_process_start_time(instance.pid) {
+        Ok(current) if current == instance.start_time => {
+            let actual_pgid = unsafe { libc::getpgid(instance.pid) };
+            if actual_pgid == -1 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ESRCH) {
+                    return Ok(());
+                }
+                return Err(format!(
+                    "process {} process group could not be read: {error}",
+                    instance.pid
+                ));
+            }
+            if actual_pgid != instance.pgid {
+                return Err(format!(
+                    "process {} moved from group {} to {actual_pgid} (group reuse)",
+                    instance.pid, instance.pgid
+                ));
+            }
+            Ok(())
+        }
+        Ok(_) => Err(format!(
+            "process {} no longer matches its captured instance (pid reuse)",
+            instance.pid
+        )),
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(()),
+        Err(error) => Err(format!(
+            "process {} start time could not be read: {error}",
+            instance.pid
+        )),
+    }
+}
+
+enum EscapeeGroupAuthority {
+    Live,
+    Gone,
+}
+
+/// An inferred escapee group may be signalled only while a captured member still matches.
+fn authorize_escapee_group(
+    pgid: libc::pid_t,
+    frozen: &BTreeSet<ProcessInstance>,
+) -> Result<EscapeeGroupAuthority, String> {
+    let members: Vec<_> = frozen
+        .iter()
+        .filter(|instance| instance.pgid == pgid)
+        .collect();
+    if members.is_empty() {
+        return Ok(EscapeeGroupAuthority::Gone);
+    }
+
+    let mut any_live = false;
+    for instance in members {
+        match read_process_start_time(instance.pid) {
+            Ok(current) if current == instance.start_time => {
+                let actual_pgid = unsafe { libc::getpgid(instance.pid) };
+                if actual_pgid == -1 {
+                    let error = io::Error::last_os_error();
+                    if error.raw_os_error() == Some(libc::ESRCH) {
+                        continue;
+                    }
+                    return Err(format!(
+                        "process {} process group could not be read: {error}",
+                        instance.pid
+                    ));
+                }
+                if actual_pgid != pgid {
+                    return Err(format!(
+                        "process group {pgid} no longer matches captured member {} \
+                         (now in group {actual_pgid})",
+                        instance.pid
+                    ));
+                }
+                any_live = true;
+            }
+            Ok(_) => {
+                return Err(format!(
+                    "process {} no longer matches its captured instance (pid reuse)",
+                    instance.pid
+                ));
+            }
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
+            Err(error) => {
+                return Err(format!(
+                    "process {} start time could not be read: {error}",
+                    instance.pid
+                ));
+            }
+        }
+    }
+
+    if any_live {
+        Ok(EscapeeGroupAuthority::Live)
+    } else {
+        Ok(EscapeeGroupAuthority::Gone)
+    }
+}
+
 /// How many times the sweep re-reads the table looking for something new to freeze.
 ///
 /// Each round freezes everything the last one found, so a tree that is merely deep or
@@ -261,11 +490,29 @@ fn freeze_harness_tree(target: &HarnessTarget) -> Result<Sweep, String> {
 
         found_more = false;
         for pid in tree {
-            if pid == me || !sweep.frozen.insert(pid) {
+            if pid == me || sweep.frozen.iter().any(|instance| instance.pid == pid) {
                 continue;
             }
+            let Some(member_pgid) = snapshot.pgid_of(pid) else {
+                continue;
+            };
+            let start_time = match read_process_start_time(pid) {
+                Ok(start_time) => start_time,
+                Err(error) if error.raw_os_error() == Some(libc::ESRCH) => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "process {pid} start time could not be read before freeze: {error}"
+                    ));
+                }
+            };
+            let instance = ProcessInstance {
+                pid,
+                pgid: member_pgid,
+                start_time,
+            };
             found_more = true;
-            signal_process(pid, libc::SIGSTOP, target)?;
+            sweep.frozen.insert(instance);
+            signal_process(instance, libc::SIGSTOP, target)?;
         }
 
         // The exit condition is the state itself — a reading that adds nobody — not a
@@ -288,7 +535,7 @@ fn freeze_harness_tree(target: &HarnessTarget) -> Result<Sweep, String> {
 /// Neither set ever names this process or its group — `freeze_harness_tree` is the only
 /// thing that fills them, and it excludes both. Everything in here is signalable.
 struct Sweep {
-    frozen: BTreeSet<libc::pid_t>,
+    frozen: BTreeSet<ProcessInstance>,
     groups: BTreeSet<libc::pid_t>,
     /// True when the walk could not prove it saw the whole tree before the kill.
     incomplete: bool,
@@ -313,25 +560,35 @@ fn signal_process_group(
 }
 
 fn signal_process(
-    pid: libc::pid_t,
+    instance: ProcessInstance,
     signal: libc::c_int,
     target: &HarnessTarget,
 ) -> Result<(), String> {
     target.revalidate_before_signal()?;
-    if unsafe { libc::kill(pid, signal) } == 0 {
+    verify_process_instance(&instance)?;
+    if unsafe { libc::kill(instance.pid, signal) } == 0 {
         return Ok(());
     }
     let error = std::io::Error::last_os_error();
-    if group_signal_target_gone(&error) {
+    if process_signal_target_gone(&error) {
         return Ok(());
     }
-    Err(format!("process {pid} could not be signalled: {error}"))
+    Err(format!(
+        "process {} could not be signalled: {error}",
+        instance.pid
+    ))
 }
 
 /// A group with no live members to signal — linux says ESRCH, darwin often EPERM.
 fn group_signal_target_gone(error: &std::io::Error) -> bool {
     error.raw_os_error() == Some(libc::ESRCH)
         || (cfg!(target_os = "macos") && error.raw_os_error() == Some(libc::EPERM))
+}
+
+/// An individual pid that is already gone. Darwin EPERM is NOT absence here — unlike
+/// killpg, kill(pid) has no leader-exited proof path on this floor.
+fn process_signal_target_gone(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ESRCH)
 }
 
 /// SIGKILL everything the freeze proved was ours, then the recorded group last.
@@ -359,13 +616,13 @@ fn kill_harness_tree(target: &HarnessTarget, sweep: Sweep) -> Result<i32, String
     }
 
     for group in sweep.groups.iter().filter(|group| **group != pgid) {
-        if let Some(reason) = sigkill_stray(Stray::Group(*group), target) {
+        if let Some(reason) = sigkill_stray(Stray::Group(*group), target, &sweep.frozen) {
             cleanup_failures.push(reason);
         }
     }
 
-    for pid in &sweep.frozen {
-        if let Some(reason) = sigkill_stray(Stray::Process(*pid), target) {
+    for instance in &sweep.frozen {
+        if let Some(reason) = sigkill_stray(Stray::Process(*instance), target, &sweep.frozen) {
             cleanup_failures.push(reason);
         }
     }
@@ -390,7 +647,7 @@ fn kill_harness_tree(target: &HarnessTarget, sweep: Sweep) -> Result<i32, String
 /// One escapee the walk found — a whole group of them, or a single process.
 enum Stray {
     Group(libc::pid_t),
-    Process(libc::pid_t),
+    Process(ProcessInstance),
 }
 
 /// SIGKILL one escapee, and report if it would not die.
@@ -403,30 +660,48 @@ enum Stray {
 /// process that had already exited, and darwin reports an emptied group as EPERM — the same
 /// fact `classify_group_kill` records for the recorded group, for the same reason, which is
 /// that the target was established as ours before it was signalled.
-fn sigkill_stray(stray: Stray, target: &HarnessTarget) -> Option<String> {
+fn sigkill_stray(
+    stray: Stray,
+    target: &HarnessTarget,
+    frozen: &BTreeSet<ProcessInstance>,
+) -> Option<String> {
     if let Err(error) = target.revalidate_before_signal() {
         return Some(error);
     }
 
-    let (result, target_label) = match stray {
-        Stray::Group(pgid) => (
-            unsafe { libc::killpg(pgid, libc::SIGKILL) },
-            format!("process group {pgid}"),
-        ),
-        Stray::Process(pid) => (
-            unsafe { libc::kill(pid, libc::SIGKILL) },
-            format!("process {pid}"),
-        ),
-    };
+    match stray {
+        Stray::Group(pgid) => match authorize_escapee_group(pgid, frozen) {
+            Ok(EscapeeGroupAuthority::Gone) => None,
+            Ok(EscapeeGroupAuthority::Live) => report_sigkill_result(
+                unsafe { libc::killpg(pgid, libc::SIGKILL) },
+                format!("process group {pgid}"),
+                group_signal_target_gone,
+            ),
+            Err(reason) => Some(reason),
+        },
+        Stray::Process(instance) => match verify_process_instance(&instance) {
+            Ok(()) => report_sigkill_result(
+                unsafe { libc::kill(instance.pid, libc::SIGKILL) },
+                format!("process {}", instance.pid),
+                process_signal_target_gone,
+            ),
+            Err(reason) => Some(reason),
+        },
+    }
+}
 
+fn report_sigkill_result(
+    result: libc::c_int,
+    target_label: String,
+    gone: fn(&std::io::Error) -> bool,
+) -> Option<String> {
     if result == 0 {
         return None;
     }
 
     let error = std::io::Error::last_os_error();
-    let gone = group_signal_target_gone(&error);
 
-    if gone {
+    if gone(&error) {
         None
     } else {
         let reason = format!("escaped {target_label} outlived SIGKILL: {error}");
@@ -492,6 +767,71 @@ mod group_kill_tests {
         let error = classify_group_kill(4321, Error::from_raw_os_error(libc::EINVAL)).unwrap_err();
         assert!(error.contains("4321"), "{error}");
         assert!(error.contains("could not be signalled"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod signal_target_gone_tests {
+    use super::{group_signal_target_gone, process_signal_target_gone};
+    use std::io::Error;
+
+    #[test]
+    fn esrch_means_gone_for_individual_process_signals() {
+        assert!(process_signal_target_gone(&Error::from_raw_os_error(
+            libc::ESRCH
+        )));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn eperm_is_not_gone_for_individual_process_signals_on_darwin() {
+        assert!(!process_signal_target_gone(&Error::from_raw_os_error(
+            libc::EPERM
+        )));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn eperm_is_gone_for_group_signals_on_darwin() {
+        assert!(group_signal_target_gone(&Error::from_raw_os_error(
+            libc::EPERM
+        )));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn eperm_is_not_gone_for_group_signals_on_linux() {
+        assert!(!group_signal_target_gone(&Error::from_raw_os_error(
+            libc::EPERM
+        )));
+    }
+}
+
+#[cfg(test)]
+mod instance_authority_tests {
+    use super::{ProcessInstance, ProcessStartTime, parse_proc_starttime, verify_process_instance};
+
+    #[test]
+    fn linux_starttime_is_read_from_proc_stat() {
+        let stat = b"4242 (sleep) S 1 4242 4242 0 -1 0 0 0 0 0 0 0 0 20 0 1 0 0 31415926";
+        assert_eq!(parse_proc_starttime(stat), Some(31415926));
+    }
+
+    #[test]
+    fn pgid_reuse_is_refused_when_a_captured_member_moved_groups() {
+        let instance = ProcessInstance {
+            pid: unsafe { libc::getpid() },
+            pgid: 1,
+            start_time: ProcessStartTime {
+                seconds: 0,
+                microseconds: 0,
+            },
+        };
+        let error = verify_process_instance(&instance).unwrap_err();
+        assert!(
+            error.contains("group reuse") || error.contains("pid reuse"),
+            "{error}"
+        );
     }
 }
 
