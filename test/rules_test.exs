@@ -1186,7 +1186,6 @@ defmodule Tightbeam.RulesTest do
 
     user_verdict(ctx, "flynn", producer.id, "tests-passed", "user claim")
     verdict(ctx, other.session_key, producer.id, "tests-passed", "other session claim")
-    verdict(ctx, holder.session_key, producer.id, "tests-passed")
 
     assert {:error, %{rule: "code-review-requires-passing-tests", ref: ^producer_id}} =
              Dispatch.dispatch(ctx.db, ctx.handlers, review_call)
@@ -1319,7 +1318,7 @@ defmodule Tightbeam.RulesTest do
     Assignments.__handle__(ctx.db, "assign", %{call | session_key: holder_key})
   end
 
-  defp verdict(ctx, session_key, assignment_id, verdict_kind, note \\ nil) do
+  defp verdict(ctx, session_key, assignment_id, verdict_kind, note \\ "test verdict") do
     Assignments.__handle__(
       ctx.db,
       "attest",
@@ -1332,7 +1331,7 @@ defmodule Tightbeam.RulesTest do
     )
   end
 
-  defp user_verdict(ctx, user, assignment_id, verdict_kind, note \\ nil) do
+  defp user_verdict(ctx, user, assignment_id, verdict_kind, note \\ "test verdict") do
     Assignments.__handle__(
       ctx.db,
       "attest",

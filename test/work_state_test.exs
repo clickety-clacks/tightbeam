@@ -485,7 +485,12 @@ defmodule Tightbeam.WorkStateTest do
       origin: "agent:#{holder}",
       principal: {:session, holder},
       session_key: holder,
-      params: %{assignment_id: assignment_id, kind: kind, verdict_kind: verdict_kind},
+      params: %{
+        assignment_id: assignment_id,
+        kind: kind,
+        verdict_kind: verdict_kind,
+        note: if(kind == "verdict", do: "test verdict")
+      },
       on_assignment_change: ctx.assignment_change
     })
   end

@@ -116,7 +116,7 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
     }
   end
 
-  defp verdict_call(session_key, assignment_id, kind, note \\ nil) do
+  defp verdict_call(session_key, assignment_id, kind, note \\ "test verdict") do
     %{
       verb: "attest",
       origin: "session:#{session_key}",

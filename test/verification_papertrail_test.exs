@@ -382,8 +382,16 @@ defmodule Tightbeam.VerificationPapertrailTest do
   defp attest_call(session_key, assignment_id, kind, verdict_kind \\ nil) do
     params =
       case verdict_kind do
-        nil -> %{assignment_id: assignment_id, kind: kind}
-        verdict -> %{assignment_id: assignment_id, kind: kind, verdict_kind: verdict}
+        nil ->
+          %{assignment_id: assignment_id, kind: kind}
+
+        verdict ->
+          %{
+            assignment_id: assignment_id,
+            kind: kind,
+            verdict_kind: verdict,
+            note: "test verdict"
+          }
       end
 
     %{

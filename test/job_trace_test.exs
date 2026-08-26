@@ -120,12 +120,14 @@ defmodule Tightbeam.JobTraceTest do
     assert %{attest: %{verdictKind: "reviewed-clean", commitRefs: ^commit_refs}} =
              attest(db, {:session, "reviewer"}, "asg_review", "verdict", %{
                verdict_kind: "reviewed-clean",
+               note: "reviewed clean",
                commit_refs: commit_refs
              })
 
     assert %{code: "invalid_commit_refs"} =
              attest(db, {:session, "holder"}, "asg_bad", "verdict", %{
                verdict_kind: "reviewed-clean",
+               note: "reviewed clean",
                commit_refs: commit_refs
              })
 
@@ -136,7 +138,8 @@ defmodule Tightbeam.JobTraceTest do
 
     assert %{attest: %{verdictKind: "changes-requested"}} =
              attest(db, {:session, "reviewer"}, "asg_review", "verdict", %{
-               verdict_kind: "changes-requested"
+               verdict_kind: "changes-requested",
+               note: "changes requested"
              })
 
     :ok = DB.execute(db, "UPDATE attests SET ts = 100")

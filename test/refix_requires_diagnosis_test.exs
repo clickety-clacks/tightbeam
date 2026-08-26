@@ -296,7 +296,12 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
       origin: "agent:recon",
       principal: {:session, holder_key},
       session_key: nil,
-      params: %{assignment_id: assignment_id, kind: "verdict", verdict_kind: kind}
+      params: %{
+        assignment_id: assignment_id,
+        kind: "verdict",
+        verdict_kind: kind,
+        note: "test verdict"
+      }
     }
   end
 
