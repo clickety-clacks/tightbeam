@@ -3447,28 +3447,31 @@ defmodule Tightbeam.Gateway do
 
   defp public_served_identity(db, call) do
     request_binding = make_ref()
-    principal_binding = identity_query_principal(call)
-    is_admin = admin_caller?(db, call)
+    principal_binding = identity_query_principal(db, call)
 
-    with {:ok, descriptor} <-
-           StateResources.query_identity(
-             db,
-             {:metadata, "served", request_binding, principal_binding}
-           ),
-         true <- Tightbeam.StateVisibility.identity_visible?(is_admin),
-         {:ok, hydrated} <-
-           hydrate_served_identity(
-             db,
-             descriptor,
-             request_binding,
-             principal_binding
-           ) do
-      StateResources.identity(hydrated)
-    else
-      false -> nil
-      :not_found -> nil
-      :stale -> nil
-      {:error, :invalid_identity_descriptor} -> nil
+    try do
+      with {:ok, descriptor} <-
+             StateResources.query_identity(
+               db,
+               {:metadata, "served", request_binding, principal_binding}
+             ),
+           true <- identity_principal_visible?(db, principal_binding),
+           {:ok, hydrated} <-
+             hydrate_served_identity(
+               db,
+               descriptor,
+               request_binding,
+               principal_binding
+             ) do
+        StateResources.identity(hydrated)
+      else
+        false -> nil
+        :not_found -> nil
+        :stale -> nil
+        {:error, :invalid_identity_descriptor} -> nil
+      end
+    after
+      :ok = StateResources.query_identity(db, {:close, request_binding})
     end
   end
 
@@ -3482,7 +3485,8 @@ defmodule Tightbeam.Gateway do
                StateResources.query_identity(
                  db,
                  {:metadata, "served", request_binding, principal_binding}
-               ) do
+               ),
+             true <- identity_principal_visible?(db, principal_binding) do
           case StateResources.query_identity(
                  db,
                  {:hydrate, retry_descriptor, request_binding, principal_binding}
@@ -3490,6 +3494,8 @@ defmodule Tightbeam.Gateway do
             :stale -> :not_found
             other -> other
           end
+        else
+          false -> :not_found
         end
 
       other ->
@@ -3497,12 +3503,58 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp identity_query_principal(%{principal: principal})
-       when principal in [:error, nil],
-       do: nil
+  defp identity_query_principal(_db, %{auth_principal: principal}) when not is_nil(principal),
+    do: principal
 
-  defp identity_query_principal(%{principal: principal}), do: principal
-  defp identity_query_principal(%{origin: origin}), do: origin
+  defp identity_query_principal(_db, %{principal: principal}) when not is_nil(principal) do
+    normalize_identity_principal(principal)
+  end
+
+  defp identity_query_principal(db, call) do
+    case principal_caller(db, call) do
+      %{caller_session: %{session_key: session_key}} when is_binary(session_key) ->
+        {:session, session_key}
+
+      %{owner_user_id: user_id} when is_binary(user_id) ->
+        {:user, user_id}
+
+      _ ->
+        nil
+    end
+  end
+
+  defp normalize_identity_principal({:session, session_key}) when is_binary(session_key),
+    do: {:session, session_key}
+
+  defp normalize_identity_principal({:user, user_id}) when is_binary(user_id),
+    do: {:user, user_id}
+
+  defp normalize_identity_principal({:process, name}) when is_binary(name),
+    do: {:process, name}
+
+  defp normalize_identity_principal("user:" <> user_id), do: {:user, user_id}
+  defp normalize_identity_principal("process:" <> name), do: {:process, name}
+  defp normalize_identity_principal(_principal), do: nil
+
+  defp identity_principal_visible?(db, principal_binding) do
+    Tightbeam.StateVisibility.identity_visible?(principal_binding_admin?(db, principal_binding))
+  end
+
+  defp principal_binding_admin?(db, {:session, session_key}) do
+    case Org.get(db, session_key) do
+      %{owner_user_id: user_id} ->
+        match?(%{is_admin: true}, Devices.user(db, user_id))
+
+      _ ->
+        false
+    end
+  end
+
+  defp principal_binding_admin?(db, {:user, user_id}) do
+    match?(%{is_admin: true}, Devices.user(db, user_id))
+  end
+
+  defp principal_binding_admin?(_db, _principal_binding), do: false
 
   defp identity_apply_result(config, db, %{params: %{all: true}}) do
     sessions = Org.list_for_user(db, "", true)
@@ -4145,9 +4197,13 @@ defmodule Tightbeam.Gateway do
 
   defp admin_call_handler(db, fun) do
     fn call ->
-      if admin_origin?(db, call.origin),
-        do: fun.(call),
-        else: %{code: "forbidden", message: "admin required"}
+      principal_binding = identity_query_principal(db, call)
+
+      if principal_binding_admin?(db, principal_binding) do
+        fun.(Map.put(call, :auth_principal, principal_binding))
+      else
+        %{code: "forbidden", message: "admin required"}
+      end
     end
   end
 

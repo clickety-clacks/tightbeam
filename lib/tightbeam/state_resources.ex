@@ -323,19 +323,24 @@ defmodule Tightbeam.StateResources do
     [[present, row_version]] =
       query(source, @identity_metadata_sql, [@identity_resource, AdminProjection.key(name)])
 
-    {:ok,
-     seal_identity_descriptor(%{
-       resource: @identity_resource,
-       name: name,
-       present: present == 1,
-       row_version: row_version,
-       source_identity: identity_source_identity(source),
-       source_generation: identity_source_generation(source),
-       request_binding: request_binding,
-       principal_binding: principal_binding,
-       issuer: self(),
-       nonce: System.unique_integer([:positive, :monotonic])
-     })}
+    nonce = System.unique_integer([:positive, :monotonic])
+
+    descriptor =
+      seal_identity_descriptor(%{
+        resource: @identity_resource,
+        name: name,
+        present: present == 1,
+        row_version: row_version,
+        source_identity: identity_source_identity(source),
+        source_generation: identity_source_generation(source),
+        request_binding: request_binding,
+        principal_binding: principal_binding,
+        issuer: self(),
+        nonce: nonce
+      })
+
+    :ok = open_identity_operation_nonce(request_binding, nonce)
+    {:ok, descriptor}
   end
 
   def query_identity(source, {:hydrate, descriptor, request_binding, principal_binding}) do
@@ -348,6 +353,11 @@ defmodule Tightbeam.StateResources do
            ) do
       hydrate_identity(source, payload)
     end
+  end
+
+  def query_identity(_source, {:close, request_binding}) do
+    close_identity_operation(request_binding)
+    :ok
   end
 
   def query_identity(_source, name) when is_binary(name),
@@ -889,13 +899,14 @@ defmodule Tightbeam.StateResources do
            source_generation: source_generation,
            request_binding: request_binding,
            principal_binding: principal_binding,
-           issuer: issuer
+           issuer: issuer,
+           nonce: nonce
          },
          source,
          expected_request_binding,
          expected_principal_binding
        )
-       when is_binary(name) and is_boolean(present?) do
+       when is_binary(name) and is_boolean(present?) and is_integer(nonce) do
     cond do
       present? and not (is_integer(row_version) and row_version > 0) ->
         {:error, :invalid_row_version}
@@ -918,6 +929,9 @@ defmodule Tightbeam.StateResources do
       principal_binding != expected_principal_binding ->
         {:error, :wrong_principal}
 
+      not identity_operation_open?(expected_request_binding, nonce) ->
+        {:error, :closed_operation}
+
       true ->
         :ok
     end
@@ -937,6 +951,34 @@ defmodule Tightbeam.StateResources do
         key = :crypto.strong_rand_bytes(32)
         Process.put(key_name, key)
         key
+    end
+  end
+
+  defp open_identity_operation_nonce(request_binding, nonce) do
+    key_name = {__MODULE__, :identity_descriptor_operations}
+    operations = Process.get(key_name, %{})
+    updated = Map.update(operations, request_binding, MapSet.new([nonce]), &MapSet.put(&1, nonce))
+    Process.put(key_name, updated)
+    :ok
+  end
+
+  defp close_identity_operation(request_binding) do
+    key_name = {__MODULE__, :identity_descriptor_operations}
+    operations = Process.get(key_name, %{})
+    Process.put(key_name, Map.delete(operations, request_binding))
+    :ok
+  end
+
+  defp identity_operation_open?(request_binding, nonce) do
+    case Process.get({__MODULE__, :identity_descriptor_operations}, %{}) do
+      operations when is_map(operations) ->
+        case Map.get(operations, request_binding) do
+          nil -> false
+          nonces -> MapSet.member?(nonces, nonce)
+        end
+
+      _ ->
+        false
     end
   end
 

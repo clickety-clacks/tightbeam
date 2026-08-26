@@ -6,22 +6,26 @@ defmodule Tightbeam.AdminProjectionTest.QuerySpyDB do
 
   @impl true
   def init(opts) do
-    {:ok, %{db: Map.fetch!(opts, :db), queries: []}}
+    {:ok, %{db: Map.fetch!(opts, :db), queries: [], before_query: Map.get(opts, :before_query)}}
   end
 
   @impl true
   def handle_call(:queries, _from, state), do: {:reply, Enum.reverse(state.queries), state}
 
   def handle_call({:query, sql, params} = request, _from, state) do
-    {:reply, GenServer.call(state.db, request), record_query(state, sql, params)}
+    query = normalize_query(sql, params)
+
+    if is_function(state.before_query, 2) do
+      state.before_query.(elem(query, 0), elem(query, 1))
+    end
+
+    {:reply, GenServer.call(state.db, request), %{state | queries: [query | state.queries]}}
   end
 
   def handle_call(request, _from, state), do: {:reply, GenServer.call(state.db, request), state}
 
-  defp record_query(state, sql, params) do
-    query = {sql |> String.replace(~r/\s+/, " ") |> String.trim(), params}
-    %{state | queries: [query | state.queries]}
-  end
+  defp normalize_query(sql, params),
+    do: {sql |> String.replace(~r/\s+/, " ") |> String.trim(), params}
 end
 
 defmodule Tightbeam.AdminProjectionTest do
@@ -33,10 +37,12 @@ defmodule Tightbeam.AdminProjectionTest do
     Credentials,
     DB,
     Devices,
+    Gateway,
     Harness,
     Identity,
     Org,
     Placement,
+    Roles,
     Schema,
     StateResources,
     StateVisibility
@@ -636,6 +642,44 @@ defmodule Tightbeam.AdminProjectionTest do
     assert [{_metadata_sql, _metadata_params}] = QuerySpyDB.queries(proxy)
   end
 
+  test "identity descriptors stay reusable only inside the open operation and close before replay",
+       ctx do
+    proxy = start_supervised!({QuerySpyDB, db: ctx.db})
+    principal = principal_binding("flynn", true)
+    request_binding = make_ref()
+
+    assert {:ok, descriptor} =
+             StateResources.query_identity(
+               proxy,
+               {:metadata, "served", request_binding, principal}
+             )
+
+    assert {:ok, first} =
+             StateResources.query_identity(
+               proxy,
+               {:hydrate, descriptor, request_binding, principal}
+             )
+
+    assert {:ok, second} =
+             StateResources.query_identity(
+               proxy,
+               {:hydrate, descriptor, request_binding, principal}
+             )
+
+    assert first == second
+    query_count = length(QuerySpyDB.queries(proxy))
+
+    assert :ok = StateResources.query_identity(proxy, {:close, request_binding})
+
+    assert {:error, :invalid_identity_descriptor} =
+             StateResources.query_identity(
+               proxy,
+               {:hydrate, descriptor, request_binding, principal}
+             )
+
+    assert length(QuerySpyDB.queries(proxy)) == query_count
+  end
+
   test "identity hydration reports stale after a row-version race", ctx do
     call = firehose_call("identity-edit", %{})
     entries = AdminProjection.served_entries(ctx.db, ctx.base_dir)
@@ -662,16 +706,114 @@ defmodule Tightbeam.AdminProjectionTest do
              )
   end
 
+  test "identity-status binds org role calls to one resolved principal across a stale retry",
+       ctx do
+    create_session!(ctx.db, "agent:identity-role-primary", "flynn")
+    create_session!(ctx.db, "agent:identity-role-rebound", "operator")
+    Roles.create!(ctx.db, "identity-reviewer", "flynn", "agent:identity-role-primary")
+
+    call = firehose_call("identity-edit", %{})
+    entries = AdminProjection.served_entries(ctx.db, ctx.base_dir)
+    identity = Enum.find(entries, &(&1.resource == "identity"))
+    changed = put_in(identity.item["liveRevision"], "staged-role-retry")
+
+    parent = self()
+    {:ok, hook_state} = Agent.start_link(fn -> false end)
+
+    proxy =
+      start_supervised!(
+        {QuerySpyDB,
+         db: ctx.db,
+         before_query: fn sql, _params ->
+           if String.contains?(sql, "WITH observed AS") do
+             should_fire = Agent.get_and_update(hook_state, fn fired -> {not fired, true} end)
+
+             if should_fire do
+               assert :ok = Roles.bind(ctx.db, "identity-reviewer", "agent:identity-role-rebound")
+               assert {:ok, [_item]} = AdminProjection.stamp_publication(ctx.db, call, [changed])
+               send(parent, :role_retry_rebound)
+             end
+           end
+         end}
+      )
+
+    actual =
+      Gateway.handlers(%{db: proxy, base_dir: ctx.base_dir})["identity-status"].(%{
+        origin: "agent:identity-reviewer",
+        principal: nil,
+        params: %{}
+      })
+
+    assert_receive :role_retry_rebound
+    assert actual.identity == StateResources.identity(hydrated_identity!(ctx.db, "served"))
+
+    assert [
+             {metadata_sql, _metadata_params},
+             {hydration_sql, _hydration_params},
+             {retry_metadata_sql, _retry_metadata_params},
+             {retry_hydration_sql, _retry_hydration_params}
+           ] = identity_stage_queries(proxy)
+
+    assert metadata_sql == retry_metadata_sql
+    assert String.contains?(hydration_sql, "WITH observed AS")
+    assert retry_hydration_sql == hydration_sql
+  end
+
+  test "identity-status rechecks visibility after a stale refresh and stops before retry hydration",
+       ctx do
+    call = firehose_call("identity-edit", %{})
+    entries = AdminProjection.served_entries(ctx.db, ctx.base_dir)
+    identity = Enum.find(entries, &(&1.resource == "identity"))
+    changed = put_in(identity.item["liveRevision"], "staged-visibility-loss")
+
+    parent = self()
+    {:ok, hook_state} = Agent.start_link(fn -> false end)
+
+    proxy =
+      start_supervised!(
+        {QuerySpyDB,
+         db: ctx.db,
+         before_query: fn sql, _params ->
+           if String.contains?(sql, "WITH observed AS") do
+             should_fire = Agent.get_and_update(hook_state, fn fired -> {not fired, true} end)
+
+             if should_fire do
+               Devices.set_user_admin(ctx.db, "flynn", false)
+               assert {:ok, [_item]} = AdminProjection.stamp_publication(ctx.db, call, [changed])
+               send(parent, :visibility_lost_before_retry)
+             end
+           end
+         end}
+      )
+
+    actual =
+      Gateway.handlers(%{db: proxy, base_dir: ctx.base_dir})["identity-status"].(%{
+        origin: "user:flynn",
+        principal: nil,
+        params: %{}
+      })
+
+    assert_receive :visibility_lost_before_retry
+    assert actual.identity == nil
+
+    assert [
+             {metadata_sql, _metadata_params},
+             {hydration_sql, _hydration_params},
+             {retry_metadata_sql, _retry_metadata_params}
+           ] = identity_stage_queries(proxy)
+
+    assert metadata_sql == retry_metadata_sql
+    assert String.contains?(hydration_sql, "WITH observed AS")
+  end
+
   test "identity-status preserves the served identity through the staged query seam", ctx do
     call = %{origin: "user:flynn", params: %{}}
 
-    expected =
-      Tightbeam.Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})["identity-status"].(call)
+    expected = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})["identity-status"].(call)
 
     proxy = start_supervised!({QuerySpyDB, db: ctx.db})
 
-    actual =
-      Tightbeam.Gateway.handlers(%{db: proxy, base_dir: ctx.base_dir})["identity-status"].(call)
+    actual = Gateway.handlers(%{db: proxy, base_dir: ctx.base_dir})["identity-status"].(call)
 
     assert actual.identity == expected.identity
 
@@ -1317,22 +1459,26 @@ defmodule Tightbeam.AdminProjectionTest do
   defp public_identity_or_absent(db, name, principal_binding, is_admin) do
     request_binding = make_ref()
 
-    assert {:ok, descriptor} =
-             StateResources.query_identity(
-               db,
-               {:metadata, name, request_binding, principal_binding}
-             )
-
-    if StateVisibility.identity_visible?(is_admin) do
-      assert {:ok, item} =
+    try do
+      assert {:ok, descriptor} =
                StateResources.query_identity(
                  db,
-                 {:hydrate, descriptor, request_binding, principal_binding}
+                 {:metadata, name, request_binding, principal_binding}
                )
 
-      {:visible, StateResources.identity(item)}
-    else
-      :absent
+      if StateVisibility.identity_visible?(is_admin) do
+        assert {:ok, item} =
+                 StateResources.query_identity(
+                   db,
+                   {:hydrate, descriptor, request_binding, principal_binding}
+                 )
+
+        {:visible, StateResources.identity(item)}
+      else
+        :absent
+      end
+    after
+      assert :ok = StateResources.query_identity(db, {:close, request_binding})
     end
   end
 
@@ -1340,22 +1486,54 @@ defmodule Tightbeam.AdminProjectionTest do
     request_binding = make_ref()
     principal_binding = principal_binding("flynn", true)
 
-    assert {:ok, descriptor} =
-             StateResources.query_identity(
-               db,
-               {:metadata, name, request_binding, principal_binding}
-             )
+    try do
+      assert {:ok, descriptor} =
+               StateResources.query_identity(
+                 db,
+                 {:metadata, name, request_binding, principal_binding}
+               )
 
-    assert {:ok, item} =
-             StateResources.query_identity(
-               db,
-               {:hydrate, descriptor, request_binding, principal_binding}
-             )
+      assert {:ok, item} =
+               StateResources.query_identity(
+                 db,
+                 {:hydrate, descriptor, request_binding, principal_binding}
+               )
 
-    item
+      item
+    after
+      assert :ok = StateResources.query_identity(db, {:close, request_binding})
+    end
   end
 
-  defp principal_binding(user_id, is_admin), do: {:user, user_id, is_admin}
+  defp principal_binding(user_id, _is_admin), do: {:user, user_id}
+
+  defp identity_stage_queries(proxy) do
+    QuerySpyDB.queries(proxy)
+    |> Enum.filter(fn
+      {sql, ["identity", "served" | _rest]} when is_binary(sql) ->
+        String.starts_with?(sql, "SELECT CASE WHEN v.rowVersion IS NULL THEN 0 ELSE 1 END") or
+          String.contains?(sql, "WITH observed AS")
+
+      _ ->
+        false
+    end)
+  end
+
+  defp create_session!(db, key, owner) do
+    ensure_main_session(db, owner)
+
+    Org.create(db, %{
+      session_key: key,
+      display_name: key,
+      owner_user_id: owner,
+      origin: "user:#{owner}",
+      archetype: "default",
+      harness: "claude",
+      provider: "anthropic",
+      model: Tightbeam.Model.new("fable"),
+      host: "testhost"
+    })
+  end
 
   defp notice_primary_key(%{"resource" => "host environment", "refs" => refs}) do
     AdminProjection.key([refs["host"], refs["harness"], refs["name"]])
