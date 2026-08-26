@@ -107,10 +107,15 @@ defmodule Tightbeam.SupervisionTest do
 
     :ok = Tightbeam.Schema.ensure_all(db)
 
-    {:ok, _} =
-      DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1)")
+    {:paired, _device} =
+      claim_org(db, %{
+        device_id: "supervision-device",
+        claimed_name: "flynn",
+        platform: nil,
+        model: nil
+      })
 
-    main = session(db, Org.personal_session_key("flynn"), nil, true)
+    main = Org.get(db, Org.personal_session_key("flynn"))
     supervisor = session(db, "supervisor", main.session_key)
     holder = session(db, "holder", supervisor.session_key)
     assignment(db, "asg_1", holder.session_key, "ship it", 1)

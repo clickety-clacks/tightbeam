@@ -336,28 +336,74 @@ terminal.
 
 ### Connect your first client — do this BEFORE onboarding
 
-A fresh org has no users. The first user becomes the admin through either of
-these bootstrap paths:
+A fresh org supports two bootstrap sequences. Choose one.
 
-- For an agent-driven install on the box, create the user locally:
+For a human-first install:
 
-  ```sh
-  <base_dir>/bin/tightbeam add-user <userId>
-  ```
+1. Start the gateway.
+2. Point the client at `TIGHTBEAM_ADVERTISED_URL` and pair with the intended
+   user name.
+3. Verify that pairing created the admin user and that user's built-in `Main`.
+4. Onboard provider credentials as that admin.
+5. Learn the working identity.
+6. Send a real turn to `Main`.
+7. Add later users through authenticated `tightbeam add-user` requests.
 
-  This empty-org exception is local to the box. After the first user exists,
-  the same command uses ordinary admin authentication, for example
-  `tightbeam add-user <userId> --as-user <adminUserId>`; pass `--admin` when the
-  new user should also be an admin.
-- For a human with a client, point it at `TIGHTBEAM_ADVERTISED_URL` and pair
-  with a claimed name. The first client is auto-approved and its user becomes
-  the admin immediately, with no approval step because nobody exists to
-  approve it yet.
+For a headless install on the gateway host:
 
-Do one of these first. Onboarding is admin-only, so it fails with
-`forbidden: admin required` until the first admin exists.
+1. Start the gateway, then reserve the intended first user locally:
+
+   ```sh
+   <base_dir>/bin/tightbeam add-user <userId>
+   ```
+
+2. The gateway creates the forced-admin user and built-in `Main`. `tightbeam doctor`
+   reports the cold-start state as `reserved`.
+3. Complete the authorized headless onboarding or spawn flow.
+4. Pair a client with the same normalized user name.
+5. Verify that `tightbeam doctor` reports the state as `claimed`.
+6. Onboard credentials, learn the identity, and send a real turn to `Main`.
+7. Add later users through authenticated `tightbeam add-user` requests.
+
+The bare `add-user` command is a loopback-only gateway request. It never writes
+SQLite directly. A remote bare request is refused. After cold start, use an
+explicit authenticated identity, for example `tightbeam add-user <userId>
+--as-user <adminUserId>`. Pass `--admin` only when the later user must also be
+an admin.
+
+Do one sequence first. Onboarding is admin-only, so it fails with `forbidden:
+admin required` until the first admin exists.
 
 Every client after this one pairs as `pending` and must be approved by the admin.
+
+A replay-capable client keeps its claim replay secret until its first
+authenticated handshake succeeds. If the first pairing response is lost, it
+repeats the exact pair request with that secret. A legacy client, or a client
+that loses the secret, receives `bootstrap_closed`. Use the recovery below
+only when that fresh installation is safe to discard.
+
+### Recover an unusable fresh database
+
+Use this recovery only for an incomplete identity graph or a lost first-pair
+response before activation in a fresh installation that the operator intends
+to discard. The database contains organization identity, sessions, work, and
+audit history. Restore or investigate a non-fresh database instead of
+resetting it.
+
+1. Stop the gateway.
+2. Locate `state.db` and its `state.db-wal` and `state.db-shm` companions, if
+   they exist.
+3. Verify that no gateway process still has the database open.
+4. Move the complete database set to a timestamped backup directory. Do not
+   delete it.
+5. Keep the gateway configuration, authentication files, binaries, and
+   provider credentials in place.
+6. Restart the gateway and run `tightbeam doctor`. Verify that cold start is
+   `open`.
+7. Choose the human-first or headless sequence above.
+8. Verify exactly one admin user, one allowlisted first device, one complete
+   cold-start receipt, and one active, self-parented built-in `Main` for that
+   user.
 
 ### Then onboard a credential, per provider
 

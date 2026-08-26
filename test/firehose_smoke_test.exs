@@ -4,7 +4,7 @@ defmodule Tightbeam.FirehoseSmokeTest do
   alias Tightbeam.ClientE2E.WS
   alias Tightbeam.Firehose.Hub
   alias Tightbeam.Wire.Router
-  alias Tightbeam.{DB, Devices, Gateway, Rules}
+  alias Tightbeam.{DB, Gateway, Rules}
 
   setup do
     db = :firehose_smoke_db
@@ -22,7 +22,7 @@ defmodule Tightbeam.FirehoseSmokeTest do
     on_exit(fn -> File.rm_rf!(base_dir) end)
 
     {:paired, device} =
-      Devices.pair(db, %{
+      claim_org(db, %{
         device_id: "smoke-device",
         claimed_name: "Flynn",
         platform: nil,

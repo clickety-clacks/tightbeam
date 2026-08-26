@@ -1203,6 +1203,12 @@ pub fn send(request: &RequestSpec) -> Result<Option<Value>, String> {
     send_to(&endpoint, request)
 }
 
+pub(crate) fn cold_start_for_doctor(base_dir: &Path) -> Result<Value, String> {
+    let endpoint = discover_from(base_dir)?;
+    let request = request(&Identity::Session, "cold-start-state", vec![], vec![]);
+    send_to(&endpoint, &request)?.ok_or_else(|| "cold-start-state returned no result".to_owned())
+}
+
 pub(crate) fn send_to(endpoint: &Endpoint, request: &RequestSpec) -> Result<Option<Value>, String> {
     send_to_with_deadline(endpoint, request, None)
 }
@@ -1363,8 +1369,7 @@ pub fn run(command: Command) -> Result<(), String> {
     // `command_identity`; it is nonetheless a session call and only a session
     // call, and saying so here makes a run from outside a workdir fail with the
     // reason rather than with a 403 from the org token.
-    let session_identity = matches!(command, Command::ToolCallObserved)
-        || command_identity(&command).is_some_and(|identity| matches!(identity, Identity::Session));
+    let session_identity = requires_session_discovery(&command);
     run_with(
         command,
         move || {
@@ -1378,6 +1383,21 @@ pub fn run(command: Command) -> Result<(), String> {
         send_to_with_deadline,
         crate::harnesses::load_optional_from,
     )
+}
+
+fn requires_session_discovery(command: &Command) -> bool {
+    if matches!(
+        command,
+        Command::AddUser {
+            identity: Identity::Session,
+            ..
+        }
+    ) {
+        return false;
+    }
+
+    matches!(command, Command::ToolCallObserved)
+        || command_identity(command).is_some_and(|identity| matches!(identity, Identity::Session))
 }
 
 fn run_with<D, S, H>(
@@ -1401,52 +1421,39 @@ where
             user_id,
             admin,
         } => {
-            // Resolve the requested org before inspecting or mutating local state. An
-            // explicit remote endpoint must not get a user inserted into whichever
-            // empty state.db happens to exist on this machine.
             let endpoint = discover_endpoint()?;
-            let first_user = first_user_for_target(add_user_target_is_local(&endpoint), || {
-                crate::users::create_first_if_local(&user_id, admin)
-            })?;
-            match first_user {
-                crate::users::FirstUser::Created {
-                    user_id,
-                    is_admin,
-                    created_at,
-                } => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&serde_json::json!({
-                            "user": {
-                                "userId": user_id,
-                                "isAdmin": is_admin,
-                                "createdAt": created_at
-                            }
-                        }))
-                        .expect("JSON value serializes")
+            let request = if matches!(identity, Identity::Session) {
+                if !add_user_target_is_local(&endpoint) {
+                    return Err(
+                        "bootstrap requires a locally discovered loopback gateway".to_owned()
                     );
-                    Ok(())
                 }
-                crate::users::FirstUser::Dispatch => {
-                    require_session_endpoint(&identity, &endpoint)?;
-                    let request = request(
-                        &identity,
-                        "add-user",
-                        vec![],
-                        vec![
-                            string_field("userId", &user_id),
-                            format!("\"isAdmin\":{admin}"),
-                        ],
-                    );
-                    if let Some(result) = send_request(&endpoint, &request, None)? {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&result).expect("JSON value serializes")
-                        );
-                    }
-                    Ok(())
-                }
+
+                request(
+                    &identity,
+                    "bootstrap-user",
+                    vec![],
+                    vec![string_field("userId", &user_id)],
+                )
+            } else {
+                request(
+                    &identity,
+                    "add-user",
+                    vec![],
+                    vec![
+                        string_field("userId", &user_id),
+                        format!("\"isAdmin\":{admin}"),
+                    ],
+                )
+            };
+
+            if let Some(result) = send_request(&endpoint, &request, None)? {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result).expect("JSON value serializes")
+                );
             }
+            Ok(())
         }
         Command::UpdateClients { as_user } => crate::ceremonies::update_clients(&as_user),
         Command::Assimilate(args) => crate::ceremonies::assimilate(args),
@@ -1487,24 +1494,7 @@ fn add_user_target_is_local(endpoint: &Endpoint) -> bool {
     add_user_endpoint_matches_local(endpoint, &provisioned())
 }
 
-fn first_user_for_target<F>(local: bool, create: F) -> Result<crate::users::FirstUser, String>
-where
-    F: FnOnce() -> Result<crate::users::FirstUser, String>,
-{
-    if local {
-        create()
-    } else {
-        Ok(crate::users::FirstUser::Dispatch)
-    }
-}
-
-/// The one case that may create a user without asking a gateway: this machine IS the
-/// gateway host, and the request resolved to it because nothing else was named.
-///
-/// Both halves are provenance, not comparison. `Origin::Named` and `Origin::Session` each
-/// say an endpoint was chosen deliberately, and a deliberate choice is honoured as made
-/// even when it resolves to the same address and the same token as the local gateway --
-/// which is precisely the case that used to fall through to a local mutation.
+/// Bare add-user is available only through this host's provisioned gateway.
 fn add_user_endpoint_matches_local(endpoint: &Endpoint, provisioned: &Provisioned) -> bool {
     matches!(provisioned, Provisioned::GatewayHost)
         && matches!(endpoint.origin, Origin::Provisioned)
@@ -1734,6 +1724,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn bare_add_user_discovers_the_provisioned_gateway_without_a_session_identity() {
+        let command = Command::AddUser {
+            identity: Identity::Session,
+            user_id: "alice".to_owned(),
+            admin: false,
+        };
+
+        assert!(!requires_session_discovery(&command));
+        assert!(requires_session_discovery(&Command::List {
+            identity: Identity::Session,
+        }));
+    }
+
     /// The case the value comparison could not see.
     ///
     /// `--url` naming a remote gateway that happens to share the local token -- one org's
@@ -1781,10 +1785,6 @@ mod tests {
                 machine: Some("worker".to_owned())
             }
         ));
-        assert_eq!(
-            first_user_for_target(false, || panic!("remote target attempted local mutation")),
-            Ok(crate::users::FirstUser::Dispatch)
-        );
     }
 
     #[test]

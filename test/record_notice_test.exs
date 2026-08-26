@@ -24,7 +24,11 @@ defmodule Tightbeam.RecordNoticeTest do
 
     :ok = ensure_all_schemas(db)
 
-    :ok = DB.execute(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn',0,1)")
+    :ok =
+      DB.execute(
+        db,
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 0, 'admin_add', 1)"
+      )
 
     create_session(db, Org.personal_session_key("flynn"), "Main")
     create_session(db, "work", "Work")

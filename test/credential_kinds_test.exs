@@ -425,7 +425,7 @@ defmodule Tightbeam.CredentialKindsTest do
       {:ok, _rows} =
         Tightbeam.DB.query(
           ctx.db,
-          "INSERT INTO users (userId, isAdmin, createdAt) VALUES (?1, 1, ?2)",
+          "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES (?1, 1, 'admin_add', ?2)",
           ["kind-admin", System.system_time(:second)]
         )
 
@@ -470,7 +470,7 @@ defmodule Tightbeam.CredentialKindsTest do
       {:ok, _rows} =
         Tightbeam.DB.query(
           ctx.db,
-          "INSERT INTO users (userId, isAdmin, createdAt) VALUES (?1, 1, ?2)",
+          "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES (?1, 1, 'admin_add', ?2)",
           ["owner-admin", System.system_time(:second)]
         )
 
@@ -500,7 +500,7 @@ defmodule Tightbeam.CredentialKindsTest do
       {:ok, _rows} =
         Tightbeam.DB.query(
           ctx.db,
-          "INSERT INTO users (userId, isAdmin, createdAt) VALUES (?1, 1, ?2)",
+          "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES (?1, 1, 'admin_add', ?2)",
           ["kind-admin", System.system_time(:second)]
         )
 
