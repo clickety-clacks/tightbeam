@@ -78,6 +78,9 @@ defmodule Tightbeam.Wire.PayloadsTest do
     refute Map.has_key?(user, "replyToMessageId")
     refute Map.has_key?(user, "displayLabel")
 
+    bracketed_user = Payloads.server_message(%{base | content: "[marker] ordinary user text"})
+    refute Map.has_key?(bracketed_user, "displayLabel")
+
     attributed_user = Payloads.server_message(%{base | sender: "user:flynn"})
     assert attributed_user["sender"] == "user:flynn"
 
