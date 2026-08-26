@@ -322,7 +322,7 @@ fn signal_process(
         return Ok(());
     }
     let error = std::io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::ESRCH) {
+    if group_signal_target_gone(&error) {
         return Ok(());
     }
     Err(format!("process {pid} could not be signalled: {error}"))
