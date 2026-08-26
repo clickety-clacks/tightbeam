@@ -24,6 +24,11 @@
   understand.
 - Build exactly the spec. Unrequested additions are defects. If the spec has a hole on a
   load-bearing concept, ask the user.
+- Keep review and product authority independent. A linked different-session
+  `reviewed-clean` verdict proves the spec met its quality floor. A final
+  `scope-accepted` verdict from the product owner or requesting user authorizes its
+  product boundary. Require both before implementation dispatch; let neither waive
+  the other or any law floor.
 - Produce the evidence the next step needs, one step at a time. A rejected final step means
   an earlier proof was skipped.
 - Find what changed before fixing a regression.

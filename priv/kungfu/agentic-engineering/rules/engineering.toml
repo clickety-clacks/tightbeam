@@ -61,10 +61,10 @@ deny_when = [
   { fact = "assignment.holder_noted_verdict_kinds", op = "not_in", value = ["tests-passed"] },
 ]
 
-# Spec-backed work is a slice of product: before its implementation
-# dispatches, the product owner has rendered a spirit verdict on the spec.
-# The rail checks that the verdict EXISTS; what it says — and who arranges
-# the review — is entirely inference's (substrate records, inference acts).
+# Spec-backed work is a slice of product. Before implementation dispatches,
+# an independent reviewer has cleared the spec and the product owner or
+# requesting user has accepted its final scope. These are separate gates:
+# review protects the quality floor; scope acceptance names product authority.
 # A DENY rather than an auto-summoning remedy, deliberately: the remedy
 # engine anchors on an existing assignment, and a spec item's FIRST dispatch
 # has none — and per the subtraction doctrine, teaching the engine a new
@@ -72,15 +72,27 @@ deny_when = [
 # Born from the adjudication postmortem: an 11-round spec pipeline ran
 # spec->review->implementation with no product-owner edge to cross.
 [[rule]]
-name = "spec-dispatch-requires-spirit"
+name = "spec-dispatch-requires-independent-review"
 verb = "dispatch"
-text = "spec-backed work needs a product-owner spirit verdict first: assign your product-owner a spirit review of this work item; a spirit-approved verdict releases this dispatch"
+text = "spec-backed implementation requires a --reviews-linked spec review held by a different session whose latest holder-filed verdict is reviewed-clean"
 external_producer = true
 edges = ["verb"]
 effect = "deny"
 deny_when = [
   { fact = "work_item.has_spec_ref", op = "eq", value = true },
-  { fact = "work_item.verdict_kinds", op = "not_in", value = ["spirit-approved"] },
+  { fact = "work_item.qualifying_spec_review_verdict_kinds", op = "not_in", value = ["reviewed-clean"] },
+]
+
+[[rule]]
+name = "spec-dispatch-requires-scope-acceptance"
+verb = "dispatch"
+text = "spec-backed implementation requires a final scope-accepted verdict from the work item's requesting user or the bound product owner; review quality and law floors remain independently mandatory"
+external_producer = true
+edges = ["verb"]
+effect = "deny"
+deny_when = [
+  { fact = "work_item.has_spec_ref", op = "eq", value = true },
+  { fact = "work_item.verdict_kinds", op = "not_in", value = ["scope-accepted"] },
 ]
 
 # The review-rounds doorbell. Product goal:

@@ -16,6 +16,7 @@ defmodule Tightbeam.Rules do
   `caller.roles`, `assignment.verdicts`,
   `assignment.independent_verdict_kinds`,
   `assignment.qualifying_review_verdict_kinds`, and
+  `work_item.qualifying_spec_review_verdict_kinds`,
   `assignment.artifact_kinds` (the distinct artifact kinds the assignment's
   holder recorded on its work item, in every artifact state). Assignment
   caller identity comes from the optional dispatch principal rather than the
@@ -104,6 +105,7 @@ defmodule Tightbeam.Rules do
     assignment.verdicts
     assignment.independent_verdict_kinds
     assignment.qualifying_review_verdict_kinds
+    work_item.qualifying_spec_review_verdict_kinds
     work_item.verdict_kinds
   )
   @linked_review_facts ~w(
@@ -137,6 +139,7 @@ defmodule Tightbeam.Rules do
     "work_item.is_bug" => :bool,
     "work_item.has_topline" => :bool,
     "work_item.has_spec_ref" => :bool,
+    "work_item.qualifying_spec_review_verdict_kinds" => {:list, :string},
     "work_item.verdict_kinds" => {:list, :string},
     "assignment.review_verdict_count" => :int,
     "assignment.prior_completed_fix_count" => :int,
@@ -1430,6 +1433,16 @@ defmodule Tightbeam.Rules do
           )
 
         {Enum.map(rows, &hd/1), cache}
+    end)
+  end
+
+  defp compute_fact("work_item.qualifying_spec_review_verdict_kinds", db, call, cache) do
+    with_dependency("$work_item_id", db, call, cache, fn
+      nil, cache ->
+        {nil, cache}
+
+      work_item_id, cache ->
+        {Assignments.qualifying_spec_review_verdict_kinds(db, work_item_id), cache}
     end)
   end
 

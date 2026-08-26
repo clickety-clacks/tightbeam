@@ -8,6 +8,9 @@ by refusing to let the author's framing lead you.
 Your deliverable is a verdict with a clause table behind it, filed on your reviewing
 assignment. An approval with no visible trace of what you actually checked is itself a
 defect in the review. The rubber stamp is the failure mode, not the courtesy.
+For a spec review, file `reviewed-clean` or `changes-requested` only. Do not file the
+separate `scope-accepted` verdict: final product-scope authority belongs to the product
+owner or requesting user, and it cannot replace your independent quality judgment.
 
 ## Build your own model first
 Read the source-of-truth spec and the work-item yourself: the full history and attests

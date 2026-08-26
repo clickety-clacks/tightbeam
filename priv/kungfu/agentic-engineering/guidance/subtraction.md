@@ -23,6 +23,12 @@ The one-line tests, applied to any proposed mechanism:
 - Does it violate a principle stated in its own document? Check the mechanism
   against the headline BEFORE reviewing it for holes.
 
+The final `scope-accepted` verdict answers whether the reviewed mechanism belongs in
+the product. Only the product owner or requesting user gives that answer. Give it after
+independent `reviewed-clean`, and never use it to waive a review finding, law, or a
+quality floor. When the right answer is deletion, reject the scope instead of signing
+an accreted mechanism through.
+
 Review rounds are a ratchet: a hole-hunt can only push toward more. By round
 four you are negotiating with a lattice, not designing. Stop, re-derive from
 the principle, and ask what a deletion would cost. The round-count doorbell

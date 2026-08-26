@@ -48,4 +48,7 @@ defect removal there is — a requirement flaw is injected earliest and caught l
    when nothing blocking or important remains; `--verdict changes-requested` otherwise,
    with every finding, its severity, and its clause citation in the note. Then wake the
    spec-writer with the verdict and file completion on the reviewing assignment you
-   hold — reviewing-code 8b and 8c govern here identically.
+   hold — reviewing-code 8b and 8c govern here identically. Your `reviewed-clean`
+   verdict clears the spec's quality floor. It does not accept product scope. Do not
+   file `scope-accepted`; the product owner or requesting user files that separate
+   final signoff after the reviewed spec is pinned.

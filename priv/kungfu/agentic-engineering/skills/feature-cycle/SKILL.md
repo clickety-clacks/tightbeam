@@ -1,6 +1,6 @@
 ---
 name: feature-cycle
-description: The loop that takes a feature from intent to a user-verified result — spec, adversarial spec review, decompose, implement, review, spirit review for substantial changes, integrate, real run, user verification, teardown. Use when you own a feature or bug and are driving it end to end.
+description: The loop that takes a feature from intent to a user-verified result — spec, adversarial spec review, scope acceptance, decompose, implement, review, spirit review for substantial changes, integrate, real run, user verification, teardown. Use when you own a feature or bug and are driving it end to end.
 ---
 
 # Feature cycle
@@ -37,7 +37,14 @@ per-feature, but your attention across features is the scarce resource.
    The reviewer works per `reviewing-specs`. On `changes-requested`, wake the
    spec-writer to revise; repeat until `reviewed-clean`. The spec-writer then pins (or
    re-pins) the reviewed spec's hash on the work item (spec-handoff skill), so builders
-   build from the cleared text.
+   build from the cleared text. The product owner or the requesting user then reads
+   that final reviewed scope and files the named signoff on the spec assignment:
+   `tightbeam attest <specAssignmentId> --kind verdict --verdict scope-accepted
+   --note "<spec ref, sha256, and accepted scope>"`. No other agent files
+   `scope-accepted`. Do not dispatch implementation until BOTH the latest qualifying
+   linked spec review is `reviewed-clean` AND this final `scope-accepted` verdict
+   exists. Review enforces the quality floor; scope acceptance exercises product
+   authority. Neither substitutes for or waives the other, and neither waives law.
 3. **Decompose.** Break the spec into focused, independently verifiable coding goals —
    one objective per dispatch, together covering every clause. Cut along the seams that
    minimize what crosses between goals: defects cluster at the interfaces between

@@ -39,6 +39,7 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
     ensure_main_session(db, "flynn")
 
     holder = session(db, "impl-holder", "coder", "claude", "anthropic")
+    writer = session(db, "spec-holder", "spec-writer", "claude", "anthropic")
     owner = session(db, "po-holder", "product-owner", "codex", "openai")
     Roles.create!(db, "product-owner", "flynn", owner.session_key)
 
@@ -63,7 +64,15 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
       :persistent_term.erase(Archetypes)
     end)
 
-    %{db: db, handlers: handlers, holder: holder, owner: owner, rules: rules, base_dir: base_dir}
+    %{
+      db: db,
+      handlers: handlers,
+      holder: holder,
+      writer: writer,
+      owner: owner,
+      rules: rules,
+      base_dir: base_dir
+    }
   end
 
   defp session(db, key, archetype, harness, provider) do
@@ -131,6 +140,61 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
     }
   end
 
+  defp user_verdict_call(user_id, assignment_id, kind, note \\ nil) do
+    %{
+      verb: "attest",
+      origin: "user:#{user_id}",
+      principal: {:user, user_id},
+      session_key: nil,
+      params: %{
+        assignment_id: assignment_id,
+        kind: "verdict",
+        verdict_kind: kind,
+        note: note
+      }
+    }
+  end
+
+  defp spec_assignment(ctx, item) do
+    {:ok, assignment} =
+      Dispatch.dispatch(ctx.db, ctx.handlers, %{
+        verb: "assign",
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        session_key: ctx.writer.session_key,
+        target_role: nil,
+        role_fallback: false,
+        params: %{subject: "specification", work_item_id: item.id}
+      })
+
+    assignment
+  end
+
+  defp review_spec(ctx, spec) do
+    {:ok, review} =
+      Dispatch.dispatch(ctx.db, ctx.handlers, %{
+        verb: "assign",
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        session_key: ctx.owner.session_key,
+        target_role: nil,
+        role_fallback: false,
+        params: %{
+          subject: "review of specification",
+          reviews_assignment_id: spec.id
+        }
+      })
+
+    assert {:ok, %{attest: %{verdictKind: "reviewed-clean"}}} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               verdict_call(ctx.owner.session_key, review.id, "reviewed-clean")
+             )
+
+    review
+  end
+
   test "unspecced work dispatches without a spirit verdict", ctx do
     item = work_item(ctx, nil)
 
@@ -144,42 +208,88 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
     assert assignment.subject == "routine fix"
   end
 
-  test "spec-backed dispatch summons the product owner and the verdict releases it", ctx do
+  test "spec-backed dispatch requires independent review and product-owner scope acceptance",
+       ctx do
     item = work_item(ctx, "some-spec-v1.md")
-
     call = dispatch_call(ctx.holder.session_key, item.id, "build the spec")
 
     assert {:error,
-            %{code: "rule_denied", rule: "spec-dispatch-requires-spirit", message: message}} =
+            %{
+              code: "rule_denied",
+              rule: "spec-dispatch-requires-independent-review",
+              message: message
+            }} =
              Dispatch.dispatch(ctx.db, ctx.handlers, call)
 
-    assert message =~ "spirit review"
+    assert message =~ "reviewed-clean"
+    spec = spec_assignment(ctx, item)
+    review = review_spec(ctx, spec)
 
-    # A MIND arranges the review the deny named (here, the test as the org's
-    # inference): assign the product owner a spirit review of the item.
-    {:ok, spirit} =
-      Dispatch.dispatch(ctx.db, ctx.handlers, %{
-        verb: "assign",
-        origin: "user:flynn",
-        principal: {:user, "flynn"},
-        session_key: ctx.owner.session_key,
-        target_role: nil,
-        role_fallback: false,
-        params: %{
-          subject: "spirit review of work item #{item.id}",
-          work_item_id: item.id
-        }
-      })
+    assert {:error,
+            %{
+              code: "rule_denied",
+              rule: "spec-dispatch-requires-scope-acceptance",
+              message: message
+            }} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
 
-    assert {:ok, %{attest: %{verdictKind: "spirit-approved"}}} =
+    assert message =~ "scope-accepted"
+
+    assert {:ok, %{attest: %{verdictKind: "changes-requested"}}} =
              Dispatch.dispatch(
                ctx.db,
                ctx.handlers,
-               verdict_call(ctx.owner.session_key, spirit.id, "spirit-approved")
+               verdict_call(ctx.owner.session_key, review.id, "changes-requested")
+             )
+
+    assert {:error, %{rule: "spec-dispatch-requires-independent-review"}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, call)
+
+    assert {:ok, %{attest: %{verdictKind: "reviewed-clean"}}} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               verdict_call(ctx.owner.session_key, review.id, "reviewed-clean")
+             )
+
+    assert {:error, %{code: "not_authorized", message: authority_message}} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               verdict_call(ctx.holder.session_key, spec.id, "scope-accepted")
+             )
+
+    assert authority_message =~ "requesting user or the bound product-owner session"
+
+    assert {:ok, %{attest: %{verdictKind: "scope-accepted"}}} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               verdict_call(ctx.owner.session_key, spec.id, "scope-accepted")
              )
 
     assert {:ok, assignment} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
     assert assignment.subject == "build the spec"
+  end
+
+  test "requesting-user scope acceptance cannot replace independent review", ctx do
+    item = work_item(ctx, "some-spec-v2.md")
+    spec = spec_assignment(ctx, item)
+    call = dispatch_call(ctx.holder.session_key, item.id, "build reviewed scope")
+
+    assert {:ok, %{attest: %{verdictKind: "scope-accepted"}}} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               user_verdict_call("flynn", spec.id, "scope-accepted")
+             )
+
+    assert {:error, %{code: "rule_denied", rule: "spec-dispatch-requires-independent-review"}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, call)
+
+    _review = review_spec(ctx, spec)
+
+    assert {:ok, assignment} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
+    assert assignment.subject == "build reviewed scope"
   end
 
   # The round counter, proven through the ENGINE rather than by reading the

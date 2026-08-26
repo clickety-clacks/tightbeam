@@ -428,6 +428,48 @@ defmodule Tightbeam.Assignments do
     end
   end
 
+  @doc "Return reviewed-clean when a spec-writing assignment on the work item has a qualifying review."
+  @spec qualifying_spec_review_verdict_kinds(DB.server(), String.t()) :: [String.t()]
+  def qualifying_spec_review_verdict_kinds(db, work_item_id) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        WITH latest_spec_review AS (
+          SELECT
+            subject.holderKey AS subjectHolderKey,
+            review.holderKey AS reviewHolderKey,
+            latest.verdictKind AS verdictKind
+          FROM assignments AS subject
+          JOIN sessions AS producer ON producer.sessionKey = subject.holderKey
+          JOIN assignments AS review ON review.reviewsAssignmentId = subject.id
+          JOIN attests AS latest
+            ON latest.rowid = (
+              SELECT verdict.rowid
+              FROM attests AS verdict
+              WHERE verdict.assignmentId = review.id
+                AND verdict.kind = 'verdict'
+                AND verdict.bySession = review.holderKey
+              ORDER BY verdict.ts DESC, verdict.rowid DESC
+              LIMIT 1
+            )
+          WHERE subject.workItemId = ?1
+            AND subject.reviewsAssignmentId IS NULL
+            AND producer.archetype = 'spec-writer'
+          ORDER BY latest.ts DESC, latest.rowid DESC
+          LIMIT 1
+        )
+        SELECT verdictKind
+        FROM latest_spec_review
+        WHERE reviewHolderKey != subjectHolderKey
+          AND verdictKind = 'reviewed-clean'
+        """,
+        [work_item_id]
+      )
+
+    Enum.map(rows, &hd/1)
+  end
+
   @doc "Return the declared file paths for an assignment."
   @spec declared_files(DB.server(), String.t()) :: [String.t()]
   def declared_files(db, assignment_id) do
@@ -1860,6 +1902,7 @@ defmodule Tightbeam.Assignments do
 
           true ->
             with :ok <- valid_verdict_kind(call.params[:verdict_kind]),
+                 :ok <- scope_acceptance_allowed(txn, call, assignment),
                  :ok <- valid_note(call.params[:note]) do
               if Txn.q(txn, "SELECT 1 FROM assignments WHERE id = ?1 AND state = 'open'", [
                    assignment_id
@@ -1871,6 +1914,70 @@ defmodule Tightbeam.Assignments do
               %{assignment: assignment, attest: attest}
             end
         end
+    end
+  end
+
+  defp scope_acceptance_allowed(_txn, %{params: %{verdict_kind: kind}}, _assignment)
+       when kind != "scope-accepted",
+       do: :ok
+
+  defp scope_acceptance_allowed(txn, call, assignment) do
+    target? =
+      Txn.q(
+        txn,
+        """
+        SELECT 1
+        FROM assignments AS assignment
+        JOIN sessions AS holder ON holder.sessionKey = assignment.holderKey
+        JOIN work_items AS item ON item.id = assignment.workItemId
+        WHERE assignment.id = ?1
+          AND assignment.reviewsAssignmentId IS NULL
+          AND holder.archetype = 'spec-writer'
+          AND item.specRefName IS NOT NULL
+        """,
+        [assignment.id]
+      ) == [[1]]
+
+    if target? do
+      allowed =
+        case call.principal do
+          {:user, user_id} ->
+            Txn.q(
+              txn,
+              "SELECT 1 FROM work_items WHERE id = ?1 AND ownerUserId = ?2",
+              [assignment.workItemId, user_id]
+            ) == [[1]]
+
+          {:session, session_key} ->
+            Txn.q(
+              txn,
+              """
+              SELECT 1
+              FROM roles AS role
+              JOIN sessions AS session ON session.sessionKey = role.boundSessionKey
+              WHERE role.name = 'product-owner'
+                AND role.boundSessionKey = ?1
+                AND session.state = 'active'
+              """,
+              [session_key]
+            ) == [[1]]
+
+          _ ->
+            false
+        end
+
+      if allowed,
+        do: :ok,
+        else:
+          error(
+            "not_authorized",
+            "scope-accepted requires the work item's requesting user or the bound product-owner session"
+          )
+    else
+      error(
+        "invalid_scope_acceptance_target",
+        "scope-accepted must be filed on a spec-writer assignment for a spec-backed work item"
+      )
     end
   end
 

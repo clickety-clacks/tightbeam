@@ -21,7 +21,13 @@ description: How a spec moves to implementation and stays authoritative while it
    content the work-item is bound to (`--spec-ref`/`--spec-sha256`, see spec-homing),
    the in-scope goals, and the work-item id. Bind (or re-bind) the hash AFTER the
    adversarial spec review clears — builders build from the cleared text.
-5. The spec states what operating pattern it teaches agents — "none," or the
+5. After the reviewed hash is bound, obtain the final `scope-accepted` verdict on the
+   spec assignment from the product owner or requesting user. Name the spec ref, hash,
+   and accepted boundary in the note. Do not accept a signoff from the spec-writer,
+   reviewer, orchestrator, or coder. Do not hand implementation off until the linked
+   independent review is `reviewed-clean` AND `scope-accepted` exists; keep law and
+   quality floors independently mandatory.
+6. The spec states what operating pattern it teaches agents — "none," or the
    substrate-manual amendment lands with the spec.
 
 ## During implementation

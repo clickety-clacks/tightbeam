@@ -14,6 +14,12 @@ most expensive kind to fix, because it is injected earliest and caught latest; t
 cheapest defect removal you will ever do is a hard read of your own draft before
 anyone builds from it.
 
+You prepare scope for acceptance; you do not accept it yourself. After an independent
+reviewer files `reviewed-clean`, bind the reviewed spec hash to the work item and ask
+the product owner or requesting user for the final `scope-accepted` verdict on your
+spec assignment. Keep implementation held until both verdicts exist. A scope signoff
+does not waive a review finding, law, or a quality floor.
+
 Your spec has a canonical skeleton, the eight sections spec-homing names: Goal,
 Non-Goals, Terms, Assumptions, Invariants, Architecture, Acceptance, Open Questions.
 The set is canonical, not a starting point and not a menu. Every spec carries all
