@@ -32,6 +32,8 @@ defmodule Tightbeam.Org do
           overrides: map() | nil,
           identity_name: String.t(),
           identity_revision: String.t() | nil,
+          development_mode_value: String.t() | nil,
+          development_mode_revision: non_neg_integer() | nil,
           cli_token: String.t() | nil,
           harness: String.t(),
           provider: String.t(),
@@ -77,6 +79,8 @@ defmodule Tightbeam.Org do
     overrides     TEXT,
     identityName  TEXT,
     identityRevision TEXT,
+    developmentModeValue TEXT CHECK (developmentModeValue IN ('on','off')),
+    developmentModeRevision INTEGER CHECK (developmentModeRevision >= 0),
     cliToken      TEXT,
     harness       TEXT NOT NULL CHECK (harness IN (__TIGHTBEAM_HARNESSES__)),
     provider      TEXT NOT NULL CHECK (provider IN (__TIGHTBEAM_PROVIDERS__)),
@@ -206,6 +210,14 @@ defmodule Tightbeam.Org do
         "CREATE TABLE sessions_operational_parent_v1",
         global: false
       )
+      |> String.replace(
+        "developmentModeValue TEXT CHECK (developmentModeValue IN ('on','off')),\n",
+        ""
+      )
+      |> String.replace(
+        "developmentModeRevision INTEGER CHECK (developmentModeRevision >= 0),\n",
+        ""
+      )
       |> String.replace("__TIGHTBEAM_HARNESSES__", harnesses)
       |> String.replace("__TIGHTBEAM_PROVIDERS__", @provider_values)
 
@@ -277,6 +289,33 @@ defmodule Tightbeam.Org do
     end
   end
 
+  @doc false
+  @spec migrate_development_mode_v1_in_txn(Txn.t()) :: :ok
+  def migrate_development_mode_v1_in_txn(%Txn{} = txn) do
+    :ok =
+      Txn.exec(
+        txn,
+        "ALTER TABLE sessions ADD COLUMN developmentModeValue TEXT CHECK (developmentModeValue IN ('on','off'))"
+      )
+
+    :ok =
+      Txn.exec(
+        txn,
+        "ALTER TABLE sessions ADD COLUMN developmentModeRevision INTEGER CHECK (developmentModeRevision >= 0)"
+      )
+
+    Txn.q(
+      txn,
+      """
+      UPDATE sessions
+      SET developmentModeValue = 'off', developmentModeRevision = 0
+      WHERE identityRevision IS NOT NULL
+      """
+    )
+
+    :ok
+  end
+
   @doc "Read an organization setting, or nil when it is unset."
   @spec get_setting(db(), String.t()) :: String.t() | nil
   def get_setting(db \\ Tightbeam.DB, key) do
@@ -327,6 +366,13 @@ defmodule Tightbeam.Org do
     %{changed: changed, projection: Tightbeam.StateResources.query_config(txn, key)}
   end
 
+  @doc false
+  @spec put_development_mode_projected_in_txn(Txn.t(), String.t()) :: map()
+  def put_development_mode_projected_in_txn(%Txn{} = txn, value)
+      when value in ["on", "off"] do
+    put_setting_projected_in_txn(txn, "development-mode", value)
+  end
+
   @doc """
   Create a session. Required: `:display_name`, `:owner_user_id`, `:origin`,
   `:archetype`, `:harness`, `:provider`, `:model`. `:session_key` defaults to
@@ -360,10 +406,10 @@ defmodule Tightbeam.Org do
       """
         INSERT INTO sessions (sessionKey, displayName, kind, orderIndex, isBuiltIn, adopted,
           ownerUserId, origin, spawnedBy, operationalParent, handle, archetype, overrides, identityName,
-          identityRevision, cliToken,
+          identityRevision, developmentModeValue, developmentModeRevision, cliToken,
           harness, provider, model, thinkingLevel, modelContext, host, state, createdAt, updatedAt)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-          ?16, ?17, ?18, ?19, ?20, ?21, ?22, 'active', ?23, ?23)
+          ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, 'active', ?25, ?25)
       """,
       [
         session_key,
@@ -381,6 +427,8 @@ defmodule Tightbeam.Org do
         encode_overrides(Map.get(input, :overrides)),
         Map.get(input, :identity_name, Map.fetch!(input, :archetype)),
         Map.get(input, :identity_revision),
+        Map.get(input, :development_mode_value),
+        Map.get(input, :development_mode_revision),
         cli_token,
         Map.fetch!(input, :harness),
         Map.fetch!(input, :provider),
@@ -680,6 +728,30 @@ defmodule Tightbeam.Org do
   @spec set_identity_revision(db(), String.t(), String.t()) :: session()
   def set_identity_revision(db \\ Tightbeam.DB, session_key, revision) do
     update(db, session_key, "identityRevision = ?2", [revision])
+  end
+
+  @doc "Stamp the identity revision and development-mode pair whose snapshot loaded."
+  @spec set_served_snapshot(db(), String.t(), String.t(), map()) :: session()
+  def set_served_snapshot(db \\ Tightbeam.DB, session_key, identity_revision, development_mode) do
+    transaction!(db, fn txn ->
+      set_served_snapshot_in_txn(txn, session_key, identity_revision, development_mode)
+    end)
+  end
+
+  @doc false
+  @spec set_served_snapshot_in_txn(Txn.t(), String.t(), String.t(), map()) :: session()
+  def set_served_snapshot_in_txn(
+        %Txn{} = txn,
+        session_key,
+        identity_revision,
+        development_mode
+      ) do
+    update_in_txn(
+      txn,
+      session_key,
+      "identityRevision = ?2, developmentModeValue = ?3, developmentModeRevision = ?4",
+      [identity_revision, development_mode.value, development_mode.revision]
+    )
   end
 
   @doc """
@@ -1069,7 +1141,8 @@ defmodule Tightbeam.Org do
             """
             UPDATE sessions
             SET archetype = ?2, overrides = NULL, identityName = ?2,
-                identityRevision = NULL, updatedAt = ?3
+                identityRevision = NULL, developmentModeValue = NULL,
+                developmentModeRevision = NULL, updatedAt = ?3
             WHERE sessionKey = ?1
             """,
             [session_key, archetype, now()]
@@ -1348,7 +1421,7 @@ defmodule Tightbeam.Org do
     """
     SELECT sessionKey, displayName, kind, orderIndex, isBuiltIn, adopted,
            ownerUserId, origin, spawnedBy, operationalParent, handle, archetype, overrides, identityName,
-           identityRevision, cliToken, harness, provider,
+           identityRevision, developmentModeValue, developmentModeRevision, cliToken, harness, provider,
            model, thinkingLevel, modelContext, host, clearedThroughSeq, state, createdAt, updatedAt
     FROM sessions
     """
@@ -1370,6 +1443,8 @@ defmodule Tightbeam.Org do
          overrides,
          identity_name,
          identity_revision,
+         development_mode_value,
+         development_mode_revision,
          cli_token,
          harness,
          provider,
@@ -1398,6 +1473,8 @@ defmodule Tightbeam.Org do
       overrides: decode_overrides(overrides),
       identity_name: identity_name || archetype,
       identity_revision: identity_revision,
+      development_mode_value: development_mode_value,
+      development_mode_revision: development_mode_revision,
       cli_token: cli_token,
       harness: harness,
       provider: provider,

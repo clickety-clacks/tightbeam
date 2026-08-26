@@ -66,6 +66,7 @@ defmodule Tightbeam.Gateway do
     Assignments,
     ConditionFacts,
     CriticalLeases,
+    DevelopmentMode,
     Placement,
     DB,
     Devices,
@@ -1010,7 +1011,7 @@ defmodule Tightbeam.Gateway do
         read_marker_result(db, call, :clear)
       end,
       {"config", ["config.updated"]} =>
-        admin_call_handler(db, fn call -> config_result(db, call) end),
+        admin_call_handler(db, fn call -> config_result(config, db, call) end),
       {"harness-processes", []} =>
         admin_handler(db, fn _params ->
           coordinator = Map.get(config, :adapter_coordinator, Tightbeam.AdapterCoordinator)
@@ -2866,7 +2867,7 @@ defmodule Tightbeam.Gateway do
       case Org.current_pointer(db, session.session_key) do
         nil ->
           revision = Identity.live_revision!(config.base_dir)
-          snapshot = served_snapshot(config, session, harness, revision)
+          snapshot = served_snapshot(config, db, session, harness, revision)
 
           with_home_pin_lock(harness, session.host, fn ->
             # Pin the shared home to THIS session's model, then session/new,
@@ -2888,7 +2889,7 @@ defmodule Tightbeam.Gateway do
                      snapshot.guidance
                    ) do
               Org.append_pointer(db, session.session_key, sid, "created")
-              Org.set_identity_revision(db, session.session_key, snapshot.revision)
+              stamp_served_snapshot(db, session, snapshot)
               {:ok, %{id: sid, mode: "new"}}
             end
           end)
@@ -2906,7 +2907,7 @@ defmodule Tightbeam.Gateway do
             false ->
               revision = session.identity_revision || Identity.live_revision!(config.base_dir)
 
-              snapshot = served_snapshot(config, session, harness, revision)
+              snapshot = served_snapshot(config, db, session, harness, revision)
 
               with_home_pin_lock(harness, session.host, fn ->
                 # Same atomic [pin -> provision] as the fresh-session branch;
@@ -2937,7 +2938,7 @@ defmodule Tightbeam.Gateway do
                           "loaded"
                         )
 
-                        Org.set_identity_revision(db, session.session_key, snapshot.revision)
+                        stamp_served_snapshot(db, session, snapshot)
                         {:ok, %{id: pointer.harness_session_id, mode: "load"}}
 
                       {:error, {:model_apply_failed, _reason}} = error ->
@@ -2972,7 +2973,7 @@ defmodule Tightbeam.Gateway do
                                  snapshot.guidance
                                ) do
                           Org.append_pointer(db, session.session_key, sid, "fallback")
-                          Org.set_identity_revision(db, session.session_key, snapshot.revision)
+                          stamp_served_snapshot(db, session, snapshot)
                           append_context_reset_marker(db, session)
                           {:ok, %{id: sid, mode: "new"}}
                         end
@@ -3074,11 +3075,24 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp served_snapshot(config, session, harness, revision) do
+  defp served_snapshot(config, db, session, harness, revision) do
+    development_mode = DevelopmentMode.current(db)
+
     snapshot =
-      Identity.snapshot_at!(config.base_dir, revision, session.archetype, harness)
+      Identity.snapshot_at!(config.base_dir, revision, session.archetype, harness,
+        development_mode: development_mode
+      )
 
     Placement.materialize_identity(config, session, snapshot)
+  end
+
+  defp stamp_served_snapshot(db, session, snapshot) do
+    Org.set_served_snapshot(
+      db,
+      session.session_key,
+      snapshot.revision,
+      snapshot.development_mode
+    )
   end
 
   defp role_create_result(db, call) do
@@ -3410,6 +3424,7 @@ defmodule Tightbeam.Gateway do
   defp identity_status_result(config, db, call) do
     identity = Identity.status(config.base_dir)
     live = identity.live_revision
+    development_mode = DevelopmentMode.current(db)
 
     sessions =
       db
@@ -3426,7 +3441,11 @@ defmodule Tightbeam.Gateway do
       case call.params[:archetype] do
         archetype when is_binary(archetype) ->
           Map.new(Harness.all(), fn module ->
-            snapshot = Identity.snapshot_at!(config.base_dir, live, archetype, module.id())
+            snapshot =
+              Identity.snapshot_at!(config.base_dir, live, archetype, module.id(),
+                development_mode: development_mode
+              )
+
             {module.id(), module.session_config(%{}, snapshot.guidance).guidance}
           end)
 
@@ -3573,7 +3592,7 @@ defmodule Tightbeam.Gateway do
     harness = Harness.parse!(session.harness).id()
     key = {harness, "shared", session.host}
     cwd = Placement.holder_workdir(config, session)
-    snapshot = served_snapshot(config, session, harness, revision)
+    snapshot = served_snapshot(config, db, session, harness, revision)
     mcp_servers = mcp_servers_for_archetype(session.archetype)
 
     with {:ok, adapter, _generation} <-
@@ -3595,7 +3614,7 @@ defmodule Tightbeam.Gateway do
              snapshot.guidance
            ) do
       Org.append_pointer(db, session.session_key, pointer.harness_session_id, "loaded")
-      Org.set_identity_revision(db, session.session_key, snapshot.revision)
+      stamp_served_snapshot(db, session, snapshot)
       :applied
     else
       # No resident session to bounce, so the stamp IS the application. The next
@@ -4019,7 +4038,9 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp config_result(db, %{params: %{action: "get", setting: "default-archetype"}}) do
+  defp config_result(_config, db, %{
+         params: %{action: "get", setting: "default-archetype"}
+       }) do
     item = StateResources.query_config(db, "default-archetype")
 
     %{
@@ -4030,6 +4051,7 @@ defmodule Tightbeam.Gateway do
   end
 
   defp config_result(
+         _config,
          db,
          %{
            params: %{
@@ -4076,8 +4098,120 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp config_result(_db, _call) do
-    %{code: "invalid", message: "config supports get/set default-archetype"}
+  defp config_result(_config, db, %{
+         params: %{action: "get", setting: "development-mode"}
+       }) do
+    setting = DevelopmentMode.current(db)
+    item = StateResources.query_config(db, DevelopmentMode.setting())
+
+    %{
+      setting: DevelopmentMode.setting(),
+      value: setting.value,
+      enabled: setting.enabled,
+      revision: setting.revision,
+      config: item && StateResources.config(item)
+    }
+  end
+
+  defp config_result(
+         config,
+         db,
+         %{params: %{action: "set", setting: "development-mode", value: value}} = call
+       )
+       when value in ["on", "off"] do
+    with :ok <- development_mode_pre_enable(config, db, value) do
+      set_development_mode(db, call, value)
+    else
+      {:error, refusal} -> refusal
+    end
+  end
+
+  defp config_result(_config, _db, %{
+         params: %{action: "set", setting: "development-mode", value: value}
+       }) do
+    %{
+      code: "invalid_value",
+      message: "development-mode must be on or off, got: #{inspect(value)}"
+    }
+  end
+
+  defp config_result(_config, _db, _call) do
+    %{
+      code: "invalid",
+      message: "config supports get/set default-archetype or development-mode"
+    }
+  end
+
+  defp development_mode_pre_enable(_config, _db, "off"), do: :ok
+
+  defp development_mode_pre_enable(config, _db, "on") do
+    case Identity.development_mode_rollout_conflicts(config.base_dir) do
+      [] ->
+        :ok
+
+      conflicts ->
+        {:error,
+         %{
+           code: "legacy_guidance_present",
+           message: "development-mode cannot be enabled while legacy debugging guidance remains",
+           paths: conflicts
+         }}
+    end
+  end
+
+  defp set_development_mode(db, call, value) do
+    case DB.transaction(db, fn txn ->
+           current = DevelopmentMode.current(txn)
+
+           result =
+             if current.revision == 0 and value == "off" do
+               %{changed: false, projection: nil}
+             else
+               Org.put_development_mode_projected_in_txn(txn, value)
+             end
+
+           Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
+
+           if result.changed do
+             Tightbeam.Firehose.Publisher.committed_in_txn(
+               txn,
+               "config.updated",
+               result.projection,
+               %{"key" => DevelopmentMode.setting()}
+             )
+           end
+
+           setting =
+             if result.projection do
+               %{
+                 enabled: value == "on",
+                 value: value,
+                 revision: result.projection.row_version
+               }
+             else
+               current
+             end
+
+           {:ok, result, setting}
+         end) do
+      {:ok, {:ok, result, setting}} ->
+        status =
+          DevelopmentMode.status_for(setting, Org.list_for_user(db, "", true))
+
+        %{
+          setting: DevelopmentMode.setting(),
+          value: setting.value,
+          enabled: setting.enabled,
+          revision: setting.revision,
+          config: result.projection && StateResources.config(result.projection),
+          changed: result.changed,
+          staleSessions: status.stale_sessions,
+          remedy: "tightbeam identity apply --all"
+        }
+
+      {:error, error} ->
+        raise error
+    end
   end
 
   defp admin_handler(db, fun) do
@@ -4157,7 +4291,12 @@ defmodule Tightbeam.Gateway do
           |> Enum.filter(&(&1.origin == call.origin))
           |> Enum.map(&Map.take(&1, [:wake_id, :session_key, :due_at, :prompt]))
 
-        Map.put(%{wakes: wakes}, :roles, role_list_result(db).roles)
+        %{wakes: wakes}
+        |> Map.put(:roles, role_list_result(db).roles)
+        |> Map.put(
+          :developmentMode,
+          DevelopmentMode.wire_status(DevelopmentMode.status(db, []))
+        )
 
       caller ->
         sessions = Org.list_for_user(db, caller.owner_user_id, false)
@@ -4203,7 +4342,8 @@ defmodule Tightbeam.Gateway do
           roles: role_list_result(db).roles,
           archetypes: org_shape.archetypes,
           hosts: org_shape.hosts,
-          models: org_shape.models
+          models: org_shape.models,
+          developmentMode: DevelopmentMode.wire_status(DevelopmentMode.status(db, sessions))
         }
 
         if admin_origin?(db, call.origin) do
@@ -5983,7 +6123,7 @@ defmodule Tightbeam.Gateway do
             true ->
               cwd = Placement.holder_workdir(config, session)
               revision = session.identity_revision || Identity.live_revision!(config.base_dir)
-              snapshot = served_snapshot(config, session, harness, revision)
+              snapshot = served_snapshot(config, db, session, harness, revision)
 
               with_home_pin_lock(harness, session.host, fn ->
                 pin_home_to_session_model(config, Map.put(session, :model, new_ref), harness)
@@ -6007,7 +6147,8 @@ defmodule Tightbeam.Gateway do
                     switched_sid,
                     new_ref,
                     provider,
-                    basis
+                    basis,
+                    snapshot
                   )
                 end
               end)
@@ -6015,7 +6156,7 @@ defmodule Tightbeam.Gateway do
             false ->
               cwd = Placement.holder_workdir(config, session)
               revision = session.identity_revision || Identity.live_revision!(config.base_dir)
-              snapshot = served_snapshot(config, session, harness, revision)
+              snapshot = served_snapshot(config, db, session, harness, revision)
 
               with_home_pin_lock(harness, session.host, fn ->
                 pin_home_to_session_model(config, Map.put(session, :model, new_ref), harness)
@@ -6039,7 +6180,8 @@ defmodule Tightbeam.Gateway do
                     pointer.harness_session_id,
                     new_ref,
                     provider,
-                    basis
+                    basis,
+                    snapshot
                   )
                 end
               end)
@@ -6091,7 +6233,8 @@ defmodule Tightbeam.Gateway do
          switched_sid,
          new_ref,
          provider,
-         basis
+         basis,
+         snapshot
        ) do
     result =
       DB.transaction(db, fn txn ->
@@ -6118,6 +6261,15 @@ defmodule Tightbeam.Gateway do
 
         if outcome != :stale_election and switched_sid != prior_sid do
           Org.append_pointer_in_txn(txn, session.session_key, switched_sid, "loaded")
+        end
+
+        if outcome != :stale_election do
+          Org.set_served_snapshot_in_txn(
+            txn,
+            session.session_key,
+            snapshot.revision,
+            snapshot.development_mode
+          )
         end
 
         outcome

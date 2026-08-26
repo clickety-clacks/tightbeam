@@ -156,8 +156,9 @@ defmodule Tightbeam.GatewayTest do
     def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
     def init(parent), do: {:ok, parent}
 
-    def handle_call({:new_session, _model, _cwd, mcp_servers, _guidance}, _from, parent) do
+    def handle_call({:new_session, _model, _cwd, mcp_servers, guidance}, _from, parent) do
       send(parent, {:new_session_mcp_servers, mcp_servers})
+      send(parent, {:new_session_guidance, guidance})
       {:reply, {:ok, "harness-1"}, parent}
     end
 
@@ -455,6 +456,29 @@ defmodule Tightbeam.GatewayTest do
     def handle_call({:close_session, sid}, _from, parent) do
       send(parent, {:apply_error_close, sid})
       {:reply, {:error, %{"code" => -32000, "message" => "harness is shutting down"}}, parent}
+    end
+  end
+
+  defmodule PartialApplyAdapterStub do
+    use GenServer
+    def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
+    def init(parent), do: {:ok, parent}
+
+    def handle_call({:knows_session?, _sid}, _from, parent), do: {:reply, true, parent}
+
+    def handle_call({:close_session, "thread-partial-fail" = sid}, _from, parent) do
+      send(parent, {:partial_apply_failed, sid})
+      {:reply, {:error, %{"message" => "forced partial failure"}}, parent}
+    end
+
+    def handle_call({:close_session, sid}, _from, parent) do
+      send(parent, {:partial_apply_closed, sid})
+      {:reply, :ok, parent}
+    end
+
+    def handle_call({:load_session, sid, model, _cwd, _mcp, _guidance}, _from, parent) do
+      send(parent, {:partial_apply_loaded, sid})
+      {:reply, {:ok, model}, parent}
     end
   end
 
@@ -1437,6 +1461,14 @@ defmodule Tightbeam.GatewayTest do
         params: %{}
       })
 
+    assert inspect.developmentMode == %{
+             enabled: false,
+             value: "off",
+             revision: 0,
+             staleSessions: [],
+             unmaterializedSessions: Enum.sort([ctx.main_key, "k1"])
+           }
+
     assert %{created_at: created_at} =
              Enum.find(inspect.sessions, &(&1.session_key == session.session_key))
 
@@ -1690,7 +1722,14 @@ defmodule Tightbeam.GatewayTest do
                  due_at: 2_000,
                  prompt: "own wake"
                }
-             ]
+             ],
+             developmentMode: %{
+               enabled: false,
+               value: "off",
+               revision: 0,
+               staleSessions: [],
+               unmaterializedSessions: []
+             }
            }
   end
 
@@ -6423,6 +6462,13 @@ defmodule Tightbeam.GatewayTest do
 
     home = Tightbeam.Homes.home_path(base_dir, local_host, :codex)
 
+    assert %{revision: development_revision} =
+             Gateway.handlers(config)["config"].(%{
+               verb: "config",
+               origin: "user:flynn",
+               params: %{action: "set", setting: "development-mode", value: "on"}
+             })
+
     assert JSON.decode!(File.read!(Path.join([home, ".tightbeam", "manifest"])))["harness"] ==
              "codex"
 
@@ -6440,7 +6486,13 @@ defmodule Tightbeam.GatewayTest do
 
     assert_receive {:adapter_key, {:codex, "shared", ^local_host}}
     assert_receive {:new_session_mcp_servers, _mcp_servers}, @cold_runner_prompt_timeout
+    assert_receive {:new_session_guidance, guidance}, @cold_runner_prompt_timeout
+    assert guidance =~ "# Development mode"
     assert_receive {:prompt_started, ^adapter}, @cold_runner_prompt_timeout
+
+    materialized = Org.get(ctx.db, "k1")
+    assert materialized.development_mode_value == "on"
+    assert materialized.development_mode_revision == development_revision
 
     send(adapter, :continue_prompt)
     assert {:ok, %{terminal_publish: publish}} = Task.await(task)
@@ -8979,6 +9031,12 @@ defmodule Tightbeam.GatewayTest do
         model: Model.new("gpt-5.6-sol", effort: "medium")
       })
 
+    Org.set_served_snapshot(ctx.db, session.session_key, revision, %{
+      enabled: false,
+      value: "off",
+      revision: 0
+    })
+
     Org.append_pointer(ctx.db, session.session_key, "thread-stable", "created")
     start_lane!(ctx.db, session.session_key)
     cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
@@ -9012,7 +9070,17 @@ defmodule Tightbeam.GatewayTest do
         subscriptions: MapSet.new(["chat"])
       })
 
-    apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
+    handlers = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))
+    apply = handlers["identity-apply"]
+
+    assert %{revision: development_revision, staleSessions: [session_key]} =
+             handlers["config"].(%{
+               verb: "config",
+               origin: "user:flynn",
+               params: %{action: "set", setting: "development-mode", value: "on"}
+             })
+
+    assert session_key == session.session_key
 
     assert %{applied: [session_key], identity_revision: ^next} =
              apply.(%{
@@ -9027,6 +9095,7 @@ defmodule Tightbeam.GatewayTest do
                     %Model{family: "gpt-5.6-sol", effort: "medium"}, ^cwd, _mcp, guidance}
 
     assert guidance =~ "Codex developer message"
+    assert guidance =~ "# Development mode"
 
     engineering_table =
       File.read!(
@@ -9036,7 +9105,10 @@ defmodule Tightbeam.GatewayTest do
     assert length(:binary.matches(guidance, engineering_table)) == 1
     assert Process.alive?(runtime_pid)
     assert Org.current_pointer(ctx.db, session.session_key).harness_session_id == "thread-stable"
-    assert Org.get(ctx.db, session.session_key).identity_revision == next
+    applied_session = Org.get(ctx.db, session.session_key)
+    assert applied_session.identity_revision == next
+    assert applied_session.development_mode_value == "on"
+    assert applied_session.development_mode_revision == development_revision
 
     assert_receive {:push,
                     %{"type" => "stream_updated", "stream" => %{"sessionKey" => ^session_key}}}
@@ -9057,6 +9129,13 @@ defmodule Tightbeam.GatewayTest do
     # T-CONCURRENCY names.
     assert {:ok, %{seq: ^seq}} = Ledger.claim_next(ctx.db, session.session_key, "test")
 
+    assert %{revision: off_revision} =
+             handlers["config"].(%{
+               verb: "config",
+               origin: "user:flynn",
+               params: %{action: "set", setting: "development-mode", value: "off"}
+             })
+
     assert %{code: "turn_in_progress", sessions: [session_key]} =
              apply.(%{
                origin: "user:flynn",
@@ -9064,6 +9143,10 @@ defmodule Tightbeam.GatewayTest do
              })
 
     assert session_key == session.session_key
+    assert off_revision > development_revision
+    still_loaded = Org.get(ctx.db, session.session_key)
+    assert still_loaded.development_mode_value == "on"
+    assert still_loaded.development_mode_revision == development_revision
     refute_receive {:push, %{"type" => "stream_updated"}}
   end
 
@@ -9223,6 +9306,83 @@ defmodule Tightbeam.GatewayTest do
     # Neither leg is refused, and leg one's OWN backlog did not exempt it either.
     assert "agent:leg-one" in applied
     assert "agent:leg-two" in applied
+  end
+
+  test "a concurrent setting change leaves the exact pair loaded by apply truthfully stale",
+       ctx do
+    base_dir = role_test_base("development-mode-apply-race")
+    learn_engineering_identity!(base_dir)
+    revision = Identity.live_revision!(base_dir)
+
+    session =
+      Org.create(ctx.db, %{
+        session_key: "agent:development-mode-race",
+        display_name: "Development mode race",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "coder",
+        identity_name: "coder",
+        identity_revision: revision,
+        host: "testhost",
+        harness: "codex",
+        provider: "openai",
+        model: Model.new("gpt-5.6-sol", effort: "medium")
+      })
+
+    Org.set_served_snapshot(ctx.db, session.session_key, revision, %{
+      enabled: false,
+      value: "off",
+      revision: 0
+    })
+
+    Org.append_pointer(ctx.db, session.session_key, "thread-development-race", "created")
+    start_lane!(ctx.db, session.session_key)
+    adapter = start_supervised!({HoldingAdapterStub, self()})
+    start_supervised!({CoordinatorStub, {adapter, self()}})
+    ensure_global_registry()
+
+    handlers = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))
+
+    assert %{revision: on_revision} =
+             handlers["config"].(%{
+               verb: "config",
+               origin: "user:flynn",
+               params: %{action: "set", setting: "development-mode", value: "on"}
+             })
+
+    applier =
+      Task.async(fn ->
+        handlers["identity-apply"].(%{
+          origin: "user:flynn",
+          params: %{session_key: session.session_key}
+        })
+      end)
+
+    assert_receive {:holding_close, "thread-development-race"}, 5_000
+
+    assert %{revision: off_revision} =
+             handlers["config"].(%{
+               verb: "config",
+               origin: "user:flynn",
+               params: %{action: "set", setting: "development-mode", value: "off"}
+             })
+
+    send(adapter, :release)
+    assert %{applied: [session_key]} = Task.await(applier, 10_000)
+    assert session_key == session.session_key
+    assert_receive {:holding_load, "thread-development-race"}
+
+    loaded = Org.get(ctx.db, session.session_key)
+    assert loaded.development_mode_value == "on"
+    assert loaded.development_mode_revision == on_revision
+    assert off_revision > on_revision
+
+    inspect =
+      handlers["inspect"].(%{origin: "user:flynn", session_key: nil, params: %{}})
+
+    assert inspect.developmentMode.value == "off"
+    assert inspect.developmentMode.revision == off_revision
+    assert inspect.developmentMode.staleSessions == [session.session_key]
   end
 
   # TOCTOU regression, found in review of the queued/running fix. The busy check
@@ -9692,6 +9852,9 @@ defmodule Tightbeam.GatewayTest do
 
     assert session_key == session.session_key
     assert Org.current_pointer(ctx.db, session.session_key) == nil
+    unmaterialized = Org.get(ctx.db, session.session_key)
+    assert unmaterialized.development_mode_value == nil
+    assert unmaterialized.development_mode_revision == nil
     refute_receive {:push, %{"type" => "stream_updated"}}
   end
 
@@ -9722,6 +9885,12 @@ defmodule Tightbeam.GatewayTest do
         model: Model.new("gpt-5.6-sol", effort: "medium")
       })
 
+    Org.set_served_snapshot(ctx.db, session.session_key, revision, %{
+      enabled: false,
+      value: "off",
+      revision: 0
+    })
+
     Org.append_pointer(ctx.db, session.session_key, "thread-vanished", "created")
     start_lane!(ctx.db, session.session_key)
 
@@ -9747,7 +9916,16 @@ defmodule Tightbeam.GatewayTest do
         subscriptions: MapSet.new(["chat"])
       })
 
-    apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
+    handlers = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))
+
+    assert %{revision: development_revision} =
+             handlers["config"].(%{
+               verb: "config",
+               origin: "user:flynn",
+               params: %{action: "set", setting: "development-mode", value: "on"}
+             })
+
+    apply = handlers["identity-apply"]
 
     assert %{applied: [session_key], identity_revision: ^next} =
              apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
@@ -9759,10 +9937,14 @@ defmodule Tightbeam.GatewayTest do
     refute_receive {:gone_close_attempted, _}
     refute_receive {:gone_load_attempted, _}
 
-    # THE STAMP IS THE APPLICATION here. The next start reloads from
-    # `identity_revision`, not from live, so a session left behind would
-    # materialize stale forever while `identity status` kept calling it stale.
-    assert Org.get(ctx.db, session.session_key).identity_revision == next
+    # The identity-revision stamp is still the application here. The next start
+    # reloads that immutable Git snapshot. The development-mode stamp is
+    # different: it names resident bytes, so it stays on the pair last loaded.
+    gone = Org.get(ctx.db, session.session_key)
+    assert gone.identity_revision == next
+    assert gone.development_mode_value == "off"
+    assert gone.development_mode_revision == 0
+    assert development_revision > gone.development_mode_revision
 
     # And the pointer chain records only what happened: nothing was loaded.
     assert Org.current_pointer(ctx.db, session.session_key).harness_session_id ==
@@ -9867,6 +10049,12 @@ defmodule Tightbeam.GatewayTest do
         model: Model.new("gpt-5.6-sol", effort: "medium")
       })
 
+    Org.set_served_snapshot(ctx.db, session.session_key, revision, %{
+      enabled: false,
+      value: "off",
+      revision: 0
+    })
+
     Org.append_pointer(ctx.db, session.session_key, "thread-resident", "created")
     start_lane!(ctx.db, session.session_key)
 
@@ -9882,7 +10070,16 @@ defmodule Tightbeam.GatewayTest do
     start_supervised!({CoordinatorStub, {adapter, self()}})
     ensure_global_registry()
 
-    apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
+    handlers = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))
+
+    assert %{revision: development_revision} =
+             handlers["config"].(%{
+               verb: "config",
+               origin: "user:flynn",
+               params: %{action: "set", setting: "development-mode", value: "on"}
+             })
+
+    apply = handlers["identity-apply"]
 
     result = apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
 
@@ -9895,7 +10092,81 @@ defmodule Tightbeam.GatewayTest do
     assert_receive {:apply_error_close, "thread-resident"}
 
     # A refused apply changes nothing.
-    assert Org.get(ctx.db, session.session_key).identity_revision == revision
+    refused = Org.get(ctx.db, session.session_key)
+    assert refused.identity_revision == revision
+    assert refused.development_mode_value == "off"
+    assert refused.development_mode_revision == 0
+    assert development_revision > refused.development_mode_revision
+  end
+
+  test "org-wide apply keeps earlier successful setting stamps when a later session fails",
+       ctx do
+    base_dir = role_test_base("development-mode-partial-apply")
+    learn_engineering_identity!(base_dir)
+    revision = Identity.live_revision!(base_dir)
+
+    make = fn key, order_index, pointer ->
+      session =
+        Org.create(ctx.db, %{
+          session_key: key,
+          display_name: key,
+          order_index: order_index,
+          owner_user_id: "flynn",
+          origin: "user:flynn",
+          archetype: "coder",
+          identity_name: "coder",
+          identity_revision: revision,
+          host: "testhost",
+          harness: "codex",
+          provider: "openai",
+          model: Model.new("gpt-5.6-sol", effort: "medium")
+        })
+
+      Org.set_served_snapshot(ctx.db, key, revision, %{
+        enabled: false,
+        value: "off",
+        revision: 0
+      })
+
+      Org.append_pointer(ctx.db, key, pointer, "created")
+      start_lane!(ctx.db, key)
+      session
+    end
+
+    succeeded = make.("agent:partial-success", 10, "thread-partial-success")
+    failed = make.("agent:partial-fail", 11, "thread-partial-fail")
+    adapter = start_supervised!({PartialApplyAdapterStub, self()})
+    start_supervised!({CoordinatorStub, {adapter, self()}})
+    ensure_global_registry()
+    handlers = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))
+
+    assert %{revision: development_revision} =
+             handlers["config"].(%{
+               verb: "config",
+               origin: "user:flynn",
+               params: %{action: "set", setting: "development-mode", value: "on"}
+             })
+
+    assert %{code: "apply_failed", sessions: [failed_key]} =
+             handlers["identity-apply"].(%{origin: "user:flynn", params: %{all: true}})
+
+    assert failed_key == failed.session_key
+    assert_receive {:partial_apply_closed, "thread-partial-success"}
+    assert_receive {:partial_apply_loaded, "thread-partial-success"}
+    assert_receive {:partial_apply_failed, "thread-partial-fail"}
+
+    success_row = Org.get(ctx.db, succeeded.session_key)
+    assert success_row.development_mode_value == "on"
+    assert success_row.development_mode_revision == development_revision
+
+    failed_row = Org.get(ctx.db, failed.session_key)
+    assert failed_row.development_mode_value == "off"
+    assert failed_row.development_mode_revision == 0
+
+    inspect =
+      handlers["inspect"].(%{origin: "user:flynn", session_key: nil, params: %{}})
+
+    assert inspect.developmentMode.staleSessions == [failed.session_key]
   end
 
   test "credential transitions publish the captured provider-session set exactly once", ctx do

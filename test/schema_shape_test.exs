@@ -43,13 +43,13 @@ defmodule Tightbeam.SchemaShapeTest do
   test "a fresh database is created and stamped", %{db: db} do
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v5"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v6"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     # Idempotent: booting twice is the ordinary case, not a shape change.
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v5"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v6"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
   end
 
@@ -232,7 +232,7 @@ defmodule Tightbeam.SchemaShapeTest do
     assert {:ok, ^before_rows} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
     assert {:ok, []} = DB.query(db, "SELECT wakeId FROM wake_cancellations")
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v5"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v6"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
   end
 
@@ -261,7 +261,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v5"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v6"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert {:ok,
@@ -284,6 +284,42 @@ defmodule Tightbeam.SchemaShapeTest do
       end)
 
     assert Enum.at(column, 3) == 1
+  end
+
+  test "the development-mode predecessor gains truthful nullable setting stamps", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+    main = session(db, Org.personal_session_key("flynn"), "flynn", kind: "main")
+    materialized = session(db, "materialized", "flynn")
+    unmaterialized = session(db, "unmaterialized", "flynn")
+    Org.set_identity_revision(db, materialized.session_key, "identity-before-development-mode")
+
+    downgrade_to_development_mode_predecessor(db)
+
+    assert {:ok, [["coordination-fabric-v1-phase1-v5"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+
+    refute "developmentModeValue" in table_columns(db, "sessions")
+    refute "developmentModeRevision" in table_columns(db, "sessions")
+
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:ok,
+            [
+              [main_key, nil, nil],
+              [materialized_key, "off", 0],
+              [unmaterialized_key, nil, nil]
+            ]} =
+             DB.query(
+               db,
+               """
+               SELECT sessionKey, developmentModeValue, developmentModeRevision
+               FROM sessions ORDER BY createdAt, sessionKey
+               """
+             )
+
+    assert main_key == main.session_key
+    assert materialized_key == materialized.session_key
+    assert unmaterialized_key == unmaterialized.session_key
   end
 
   test "an interrupted operational-parent upgrade rolls back and retries exactly", %{db: db} do
@@ -391,7 +427,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "some-later-shape"
-    assert error.message =~ "coordination-fabric-v1-phase1-v5"
+    assert error.message =~ "coordination-fabric-v1-phase1-v6"
   end
 
   # Sol xhigh review round 2, finding 2 (wave 1): `classElection`'s CHECK
@@ -453,7 +489,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-classes-v1"
-    assert error.message =~ "coordination-fabric-v1-phase1-v5"
+    assert error.message =~ "coordination-fabric-v1-phase1-v6"
     assert error.message =~ "no migration"
 
     # It REFUSED — it did not repair or widen the constraint in place.
@@ -573,7 +609,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-v1-phase1"
-    assert error.message =~ "coordination-fabric-v1-phase1-v5"
+    assert error.message =~ "coordination-fabric-v1-phase1-v6"
     assert error.message =~ "no migration"
 
     # It REFUSED — it did not repair or relax the constraint in place.
@@ -644,7 +680,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-classes-v2"
-    assert error.message =~ "coordination-fabric-v1-phase1-v5"
+    assert error.message =~ "coordination-fabric-v1-phase1-v6"
     assert error.message =~ "no migration"
 
     # It REFUSED — the merged build's decision_requests columns were never
@@ -757,7 +793,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-v1-phase1-v2"
-    assert error.message =~ "coordination-fabric-v1-phase1-v5"
+    assert error.message =~ "coordination-fabric-v1-phase1-v6"
     assert error.message =~ "no migration"
 
     # It REFUSED — the merged build's wakes class/delivery columns were never
@@ -796,7 +832,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-v1-phase1-v3"
-    assert error.message =~ "coordination-fabric-v1-phase1-v5"
+    assert error.message =~ "coordination-fabric-v1-phase1-v6"
     assert error.message =~ "no migration"
 
     assert {:ok, [[ddl]]} =
@@ -827,12 +863,27 @@ defmodule Tightbeam.SchemaShapeTest do
   end
 
   defp downgrade_to_previous_shape(db) do
+    :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN developmentModeRevision")
+    :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN developmentModeValue")
     :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN operationalParent")
 
     {:ok, _} =
       DB.query(
         db,
         "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v4', stampedAt=1"
+      )
+
+    :ok
+  end
+
+  defp downgrade_to_development_mode_predecessor(db) do
+    :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN developmentModeRevision")
+    :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN developmentModeValue")
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v5', stampedAt=1"
       )
 
     :ok

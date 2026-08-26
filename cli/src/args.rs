@@ -714,6 +714,8 @@ COMMANDS:
       created directly and becomes admin by the existing cold-start rule.
   config get default-archetype                   read the default spawn archetype
   config set default-archetype <name>            set the default spawn archetype
+  config get development-mode                    read the typed organization mode
+  config set development-mode on|off             set the typed organization mode
   host-env-set --host <host> --harness <harness> NAME=VALUE
       Set one host- and harness-scoped environment overlay. The result states
       when the adapter will observe the new value.
@@ -2092,9 +2094,24 @@ fn parse_config(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Comma
             setting: "default-archetype".to_owned(),
             value: value.clone(),
         }),
+        (Some("get"), Some("development-mode"), None, None) => Ok(Command::ConfigGet {
+            identity: identity(flags)?,
+            setting: "development-mode".to_owned(),
+        }),
+        (Some("set"), Some("development-mode"), Some(value), None)
+            if value == "on" || value == "off" =>
+        {
+            Ok(Command::ConfigSet {
+                identity: identity(flags)?,
+                setting: "development-mode".to_owned(),
+                value: value.clone(),
+            })
+        }
+        (Some("set"), Some("development-mode"), Some(_value), None) => {
+            Err("development-mode must be on or off".to_owned())
+        }
         _ => Err(
-            "usage: tightbeam config get default-archetype | config set default-archetype <name>"
-                .to_owned(),
+            "usage: tightbeam config get default-archetype | config set default-archetype <name> | tightbeam config get development-mode | tightbeam config set development-mode on|off".to_owned(),
         ),
     }
 }
@@ -2856,6 +2873,8 @@ mod tests {
             "add-user <userId> [--admin]",
             "config get default-archetype",
             "config set default-archetype <name>",
+            "config get development-mode",
+            "config set development-mode on|off",
             "host-env-set --host <host> --harness <harness> NAME=VALUE",
             "host-env-list [--host <host>] [--harness <harness>]",
             "host-env-unset --host <host> --harness <harness> NAME",
@@ -3344,6 +3363,36 @@ mod tests {
         assert_eq!(
             parse(strings(&["list", "--as", "coder", "--as-user", "flynn"])),
             Err("identity flags are mutually exclusive: pass exactly one of --as, --as-user, or --as-process".to_owned())
+        );
+    }
+
+    #[test]
+    fn development_mode_is_a_closed_cli_value() {
+        for value in ["on", "off"] {
+            assert!(matches!(
+                parse(strings(&[
+                    "config",
+                    "set",
+                    "development-mode",
+                    value,
+                    "--as-user",
+                    "flynn",
+                ])),
+                Ok(Command::ConfigSet { setting, value: parsed, .. })
+                    if setting == "development-mode" && parsed == value
+            ));
+        }
+
+        assert_eq!(
+            parse(strings(&[
+                "config",
+                "set",
+                "development-mode",
+                "true",
+                "--as-user",
+                "flynn",
+            ])),
+            Err("development-mode must be on or off".to_owned())
         );
     }
 

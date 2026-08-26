@@ -40,7 +40,7 @@ defmodule Tightbeam.Readiness do
   thing it names.
   """
 
-  alias Tightbeam.{Harness, Model, ModelCatalog, Placement, Unroutable}
+  alias Tightbeam.{DevelopmentMode, Harness, Model, ModelCatalog, Placement, Unroutable}
 
   @type harness_row :: %{
           host: String.t(),
@@ -103,7 +103,8 @@ defmodule Tightbeam.Readiness do
   @spec summary(map(), GenServer.server(), %{optional(String.t()) => map()}) :: %{
           harnesses: [harness_row()],
           runnable?: boolean(),
-          unplaceable_archetypes: [%{name: String.t(), where: [String.t()]}]
+          unplaceable_archetypes: [%{name: String.t(), where: [String.t()]}],
+          development_mode: map()
         }
   def summary(config, catalog \\ ModelCatalog, archetypes \\ %{}) do
     local = Placement.local_host_name()
@@ -121,7 +122,8 @@ defmodule Tightbeam.Readiness do
     %{
       harnesses: rows,
       runnable?: Enum.any?(rows, & &1.runnable?),
-      unplaceable_archetypes: unplaceable_archetypes(archetypes, Enum.map(hosts, &elem(&1, 0)))
+      unplaceable_archetypes: unplaceable_archetypes(archetypes, Enum.map(hosts, &elem(&1, 0))),
+      development_mode: DevelopmentMode.status(Map.get(config, :db, Tightbeam.DB))
     }
   end
 
@@ -281,6 +283,7 @@ defmodule Tightbeam.Readiness do
     blocked = Enum.reject(rows, & &1.runnable?)
 
     ["READY: #{ready} can run turns."] ++
+      development_mode_lines(summary) ++
       Enum.flat_map(blocked, &harness_lines/1) ++
       pre_expiry_lines(rows) ++
       archetype_lines(summary) ++
@@ -293,10 +296,31 @@ defmodule Tightbeam.Readiness do
       "serving, so clients can connect, but every turn will fail until the",
       "gaps below are closed."
     ] ++
+      development_mode_lines(summary) ++
       Enum.flat_map(rows, &harness_lines/1) ++
       pre_expiry_lines(rows) ++
       archetype_lines(summary) ++
       ["", "Diagnose further with: mix tightbeam.doctor (base_dir #{config.base_dir})"]
+  end
+
+  defp development_mode_lines(summary) do
+    case Map.get(summary, :development_mode) do
+      %{enabled: true, stale_sessions: stale} ->
+        [
+          "DEVELOPMENT MODE ON: served identities preserve Tightbeam failures as specimens; GitHub",
+          "issues require explicit user permission per issue."
+        ] ++
+          if stale == [] do
+            []
+          else
+            [
+              "DEVELOPMENT MODE INCOMPLETE: #{length(stale)} materialized session(s) need identity apply."
+            ]
+          end
+
+      _ ->
+        []
+    end
   end
 
   # O7/I8 (PO ruling 2026-08-06): no credential kind carries a readable expiry, so

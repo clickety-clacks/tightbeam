@@ -2510,6 +2510,21 @@ mod tests {
             ]),
             r#"{"asUser":"flynn","verb":"config","params":{"action":"set","setting":"default-archetype","value":"coder"}}"#
         );
+        assert_eq!(
+            body(&["config", "get", "development-mode", "--as-user", "flynn"]),
+            r#"{"asUser":"flynn","verb":"config","params":{"action":"get","setting":"development-mode"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "config",
+                "set",
+                "development-mode",
+                "on",
+                "--as-user",
+                "flynn",
+            ]),
+            r#"{"asUser":"flynn","verb":"config","params":{"action":"set","setting":"development-mode","value":"on"}}"#
+        );
     }
 
     #[test]

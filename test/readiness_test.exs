@@ -14,9 +14,7 @@ defmodule Tightbeam.ReadinessTest do
   it promised not to do.
   """
   use Tightbeam.TestCase, async: false
-  alias Tightbeam.Model
-
-  alias Tightbeam.{Harness, Readiness}
+  alias Tightbeam.{DB, Harness, Model, Org, Readiness}
 
   defmodule StubCatalog do
     @moduledoc false
@@ -44,6 +42,7 @@ defmodule Tightbeam.ReadinessTest do
     db = :"readiness_db_#{System.unique_integer([:positive])}"
     start_supervised!({Tightbeam.DB, path: ":memory:", name: db})
     :ok = Tightbeam.Placement.ensure_schema(db)
+    :ok = Tightbeam.Org.ensure_schema(db)
     on_exit(fn -> File.rm_rf!(base) end)
 
     %{
@@ -103,6 +102,55 @@ defmodule Tightbeam.ReadinessTest do
     # Serving is still correct — the summary must say so rather than implying
     # the gateway is down.
     assert Enum.any?(lines, &(&1 =~ "serving"))
+  end
+
+  test "development mode is conspicuous and truthful without changing runnable readiness", ctx do
+    catalog = catalog!(%{})
+    before = Readiness.summary(ctx.config, catalog)
+    main = ensure_main_session(ctx.config.db, "flynn")
+
+    materialized =
+      Org.create(ctx.config.db, %{
+        session_key: "agent:materialized",
+        display_name: "Materialized",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("m")
+      })
+
+    Org.set_served_snapshot(ctx.config.db, materialized.session_key, "identity-off", %{
+      enabled: false,
+      value: "off",
+      revision: 0
+    })
+
+    assert {:ok, _result} =
+             DB.transaction(ctx.config.db, fn txn ->
+               Org.put_development_mode_projected_in_txn(txn, "on")
+             end)
+
+    summary = Readiness.summary(ctx.config, catalog)
+    assert summary.runnable? == before.runnable?
+
+    assert summary.development_mode == %{
+             enabled: true,
+             value: "on",
+             revision: 1,
+             stale_sessions: [materialized.session_key],
+             unmaterialized_sessions: [main.session_key]
+           }
+
+    lines = Readiness.render(summary, ctx.config)
+
+    assert Enum.slice(lines, 3, 3) == [
+             "DEVELOPMENT MODE ON: served identities preserve Tightbeam failures as specimens; GitHub",
+             "issues require explicit user permission per issue.",
+             "DEVELOPMENT MODE INCOMPLETE: 1 materialized session(s) need identity apply."
+           ]
   end
 
   test "a fully ready install says READY and adds ONLY the mandated pre-expiry advisory", ctx do

@@ -42,13 +42,20 @@ defmodule Tightbeam.Identity do
   @bundle_doc_paths ~w(capabilities.md intake.md preferred-models.md manifest.toml)
   @engineering_bundle "agentic-engineering"
   @engineering_activity_table_path "kungfu/agentic-engineering/preferred-models.md"
+  @legacy_development_mode_heading "## Debugging regime (mike's standing directive, 2026-08-06, until revoked)"
+  @legacy_development_mode_marker "A silent\nworkaround destroys the evidence this org exists to produce."
 
   @type harness :: atom()
   @type snapshot :: %{
           revision: String.t(),
           archetype: Archetypes.t(),
           guidance: String.t(),
-          skills: %{optional(String.t()) => binary()}
+          skills: %{optional(String.t()) => binary()},
+          development_mode: %{
+            enabled: boolean(),
+            value: String.t(),
+            revision: non_neg_integer()
+          }
         }
 
   @doc "Seed a new organization with the neutral identity substrate."
@@ -124,16 +131,19 @@ defmodule Tightbeam.Identity do
   end
 
   @doc "Read one archetype's complete immutable served snapshot."
-  @spec snapshot!(String.t(), String.t(), harness()) :: snapshot()
-  def snapshot!(base_dir, archetype_name, harness) do
+  @spec snapshot!(String.t(), String.t(), harness(), keyword()) :: snapshot()
+  def snapshot!(base_dir, archetype_name, harness, opts \\ []) do
     revision = live_revision!(base_dir)
-    snapshot_at!(base_dir, revision, archetype_name, harness)
+    snapshot_at!(base_dir, revision, archetype_name, harness, opts)
   end
 
   @doc "Read one archetype at an already-resolved publication OID."
-  @spec snapshot_at!(String.t(), String.t(), String.t(), harness()) :: snapshot()
-  def snapshot_at!(base_dir, revision, archetype_name, harness) do
+  @spec snapshot_at!(String.t(), String.t(), String.t(), harness(), keyword()) :: snapshot()
+  def snapshot_at!(base_dir, revision, archetype_name, harness, opts \\ []) do
     identity_dir = identity_dir(base_dir)
+
+    development_mode =
+      Keyword.get(opts, :development_mode, %{enabled: false, value: "off", revision: 0})
 
     # The operating manual is substrate-shipped (priv/guidance/operating-manual.md)
     # and served to every session, like operating-model.md below. An org tree that
@@ -182,8 +192,68 @@ defmodule Tightbeam.Identity do
       |> Enum.reject(&is_nil/1)
       |> Enum.join("\n\n")
       |> then(&Harness.module!(harness).session_config(%{identity: true}, &1).guidance)
+      |> append_development_mode(development_mode)
 
-    %{revision: revision, archetype: archetype, guidance: guidance, skills: skills}
+    %{
+      revision: revision,
+      archetype: archetype,
+      guidance: guidance,
+      skills: skills,
+      development_mode: development_mode
+    }
+  end
+
+  defp append_development_mode(guidance, %{enabled: false}), do: guidance
+
+  defp append_development_mode(guidance, %{enabled: true}) do
+    fragment =
+      :tightbeam
+      |> Application.app_dir("priv/guidance/development-mode.md")
+      |> File.read!()
+      |> String.trim_trailing()
+
+    if String.contains?(guidance, fragment), do: guidance, else: guidance <> "\n\n" <> fragment
+  end
+
+  @doc "List live identity paths that still contain a legacy debugging-regime marker."
+  @spec development_mode_rollout_conflicts(String.t()) :: [String.t()]
+  def development_mode_rollout_conflicts(base_dir) do
+    dir = identity_dir(base_dir)
+    revision = live_revision!(base_dir)
+
+    guidance_paths = revision_paths(dir, revision, "guidance", ".md")
+
+    raw_conflicts =
+      Enum.flat_map(guidance_paths, fn path ->
+        if legacy_development_mode?(git_show!(dir, revision, path)), do: [path], else: []
+      end)
+
+    fragments = revision_fragments!(dir, revision)
+
+    expanded_conflicts =
+      dir
+      |> revision_paths(revision, "archetypes", ".toml")
+      |> Enum.flat_map(fn path ->
+        archetype = dir |> git_show!(revision, path) |> Archetypes.parse_manifest!(path)
+
+        Enum.flat_map(Harness.all(), fn module ->
+          guidance =
+            archetype
+            |> Archetypes.guidance(fragments)
+            |> then(&module.session_config(%{identity: true}, &1).guidance)
+
+          if legacy_development_mode?(guidance),
+            do: ["#{path} (#{module.id()} expanded guidance)"],
+            else: []
+        end)
+      end)
+
+    (raw_conflicts ++ expanded_conflicts) |> Enum.uniq() |> Enum.sort()
+  end
+
+  defp legacy_development_mode?(bytes) do
+    String.contains?(bytes, @legacy_development_mode_heading) or
+      String.contains?(bytes, @legacy_development_mode_marker)
   end
 
   # Membership and policy bytes come from one revision so a snapshot cannot
@@ -1185,21 +1255,18 @@ defmodule Tightbeam.Identity do
   end
 
   defp revision_fragments!(dir, revision) do
-    paths =
-      git_output!(dir, [
-        "ls-tree",
-        "-r",
-        "--name-only",
-        revision,
-        "--",
-        "guidance"
-      ])
-      |> String.split("\n", trim: true)
-      |> Enum.filter(&String.ends_with?(&1, ".md"))
+    paths = revision_paths(dir, revision, "guidance", ".md")
 
     Map.new(paths, fn path ->
       {Path.basename(path), git_show!(dir, revision, path)}
     end)
+  end
+
+  defp revision_paths(dir, revision, root, suffix) do
+    git_output!(dir, ["ls-tree", "-r", "--name-only", revision, "--", root])
+    |> String.split("\n", trim: true)
+    |> Enum.filter(&String.ends_with?(&1, suffix))
+    |> Enum.sort()
   end
 
   defp maybe_exclude_materialized_skills(cwd, relative_skills) do
