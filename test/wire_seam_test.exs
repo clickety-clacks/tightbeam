@@ -41,6 +41,8 @@ defmodule Tightbeam.Wire.SeamTest do
         "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 0, 'admin_add', 1)"
       )
 
+    ensure_main_session(db, "flynn")
+
     base_dir =
       Path.join(System.tmp_dir!(), "tightbeam-wire-seam-#{System.unique_integer([:positive])}")
 

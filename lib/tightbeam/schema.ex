@@ -38,7 +38,7 @@ defmodule Tightbeam.Schema do
   # The shape this build writes. Bump it when a production table changes in a
   # way that makes an older database unreadable, and give the refusal below a
   # sentence saying what changed.
-  @shape "operator-decision-requests-cold-start-v1"
+  @shape "coordination-fabric-v1-phase1-v6"
   @previous_shape "operator-decision-requests-v1"
   @legacy_previous_shape "coordination-fabric-v1-phase1-v5"
   @model_identity_shape "model-identity-v1"
@@ -917,6 +917,10 @@ defmodule Tightbeam.Schema do
 
            ensure_no_migration_objects!(txn)
 
+           unless operational_parent_column?(txn) do
+             :ok = Tightbeam.Org.migrate_operational_parent_v1_in_txn(txn)
+           end
+
            :ok =
              Txn.exec(
                txn,
@@ -1033,7 +1037,7 @@ defmodule Tightbeam.Schema do
       JOIN sessions s ON s.ownerUserId=u.userId
       WHERE d.status='allowlisted' AND d.token IS NOT NULL AND u.isAdmin=1
         AND s.state='active' AND s.isBuiltIn=1 AND s.kind='main'
-        AND s.sessionKey='agent:main:clawline:' || u.userId || ':main'
+        AND s.operationalParent=s.sessionKey
       ORDER BY d.createdAt,d.deviceId,s.createdAt,s.sessionKey
       """
     )
@@ -1054,6 +1058,12 @@ defmodule Tightbeam.Schema do
       rows ->
         incompatible_cold_start!("legacy_witness_missing", "migration objects #{inspect(rows)}")
     end
+  end
+
+  defp operational_parent_column?(txn) do
+    txn
+    |> Txn.q("PRAGMA table_info(sessions)")
+    |> Enum.any?(fn [_cid, name | _rest] -> name == "operationalParent" end)
   end
 
   defp maybe_interrupt_cold_start_migration!(opts, point) do

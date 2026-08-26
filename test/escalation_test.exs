@@ -881,6 +881,8 @@ defmodule Tightbeam.EscalationTest do
   end
 
   defp session(db, name, owner) do
+    ensure_main_session(db, owner)
+
     Org.create(db, %{
       session_key: "agent:#{name}:app",
       display_name: name,

@@ -27,7 +27,7 @@ defmodule Tightbeam.ColdStartTest do
     root = Org.get(db, Org.personal_session_key("alice"))
     assert root.kind == "main"
     assert root.is_built_in
-    assert root.session_key == Org.personal_session_key("alice")
+    assert root.operational_parent == root.session_key
     assert root.origin == "process:tightbeam"
 
     assert %{
@@ -43,6 +43,8 @@ defmodule Tightbeam.ColdStartTest do
     refute payload =~ "tbt_"
     refute payload =~ "claimedName"
     refute payload =~ "replaySecret"
+
+    assert payload =~ ~s("operationalParent" => "#{root.session_key}")
   end
 
   test "each pair-first write fence rolls the transaction back", %{db: db} do
@@ -230,7 +232,7 @@ defmodule Tightbeam.ColdStartTest do
              "action" => "choose pair-first or host-local bootstrap"
            }
 
-    assert {:ok, [["operator-decision-requests-cold-start-v1"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v6"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
   end
 

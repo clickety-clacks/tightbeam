@@ -12,7 +12,7 @@ end
 defmodule Tightbeam.ConformanceSupport do
   alias Tightbeam.Model
   import ExUnit.Assertions
-  import Tightbeam.TestCase, only: [catalog_reply: 1]
+  import Tightbeam.TestCase, only: [catalog_reply: 1, ensure_main_session: 2]
 
   alias Tightbeam.{
     Archetypes,
@@ -2727,6 +2727,12 @@ defmodule Tightbeam.ConformanceSupport do
           ]
         )
     end)
+
+    world
+    |> Map.get("sessions", [])
+    |> Enum.map(& &1["owner"])
+    |> Enum.uniq()
+    |> Enum.each(&ensure_main_session(db, &1))
 
     Enum.each(Map.get(world, "sessions", []), fn session ->
       Org.create(db, %{

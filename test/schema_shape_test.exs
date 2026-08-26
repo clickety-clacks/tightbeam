@@ -34,7 +34,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
   alias Tightbeam.{Assignments, DB, Schema}
 
-  @shape "operator-decision-requests-cold-start-v1"
+  @shape "coordination-fabric-v1-phase1-v6"
   @previous_shape "operator-decision-requests-v1"
   @model_identity_shape "model-identity-v1"
   @be61_shape "model-identity-message-envelope-v2"
@@ -182,16 +182,17 @@ defmodule Tightbeam.SchemaShapeTest do
       VALUES ('mike-device','mike','Mike','allowlisted','tbt_migration',NULL,NULL,1);
       INSERT INTO sessions
         (sessionKey, displayName, kind, isBuiltIn, ownerUserId, origin, archetype,
-         harness, provider, model, createdAt, updatedAt)
+         harness, provider, model, operationalParent, createdAt, updatedAt)
       VALUES
         ('agent:main:clawline:mike:main', 'Main', 'main', 1, 'mike', 'user:mike',
-         'default', 'claude', 'anthropic', 'fixture-model', 1, 1);
+         'default', 'claude', 'anthropic', 'fixture-model',
+         'agent:main:clawline:mike:main', 1, 1);
       INSERT INTO sessions
         (sessionKey, displayName, ownerUserId, origin, archetype, harness,
-         provider, model, createdAt, updatedAt)
+         provider, model, operationalParent, createdAt, updatedAt)
       VALUES
         ('holder', 'holder', 'mike', 'user:mike', 'coder', 'codex', 'openai',
-         'fixture-model', 1, 1);
+         'fixture-model', 'agent:main:clawline:mike:main', 1, 1);
       INSERT INTO work_items
         (id, title, ownerUserId, createdByUser, createdAt)
       VALUES ('wi_one', 'one', 'mike', 'mike', 1);
@@ -498,10 +499,10 @@ defmodule Tightbeam.SchemaShapeTest do
       DB.execute(db, """
       INSERT INTO sessions
         (sessionKey,displayName,ownerUserId,origin,archetype,harness,provider,
-         model,createdAt,updatedAt)
+         model,operationalParent,createdAt,updatedAt)
       VALUES
         ('holder','holder','flynn','user:flynn','coder','claude','anthropic',
-         'fixture-model',1,1);
+         'fixture-model','agent:main:clawline:flynn:main',1,1);
       """)
 
     :ok =

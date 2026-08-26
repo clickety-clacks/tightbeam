@@ -114,7 +114,12 @@ defmodule Tightbeam.TestCase do
           host: "testhost"
         })
 
-      %{kind: "main", is_built_in: true, session_key: ^key} = session ->
+      %{
+        kind: "main",
+        is_built_in: true,
+        session_key: ^key,
+        operational_parent: ^key
+      } = session ->
         session
 
       session ->

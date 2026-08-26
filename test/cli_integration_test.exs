@@ -65,6 +65,8 @@ defmodule Tightbeam.CliIntegrationTest do
         "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 1, 'admin_add', 1)"
       )
 
+    ensure_main_session(db, "flynn")
+
     session =
       Org.create(db, %{
         session_key: "cli-holder",
@@ -335,6 +337,8 @@ defmodule Tightbeam.CliIntegrationTest do
         ctx.db,
         "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('other', 0, 'admin_add', 1)"
       )
+
+    ensure_main_session(ctx.db, "other")
 
     other =
       Org.create(ctx.db, %{

@@ -9061,6 +9061,8 @@ defmodule Tightbeam.GatewayTest do
   end
 
   defp create_session(db, session_key, owner_user_id, spawned_by \\ nil) do
+    ensure_main_session(db, owner_user_id)
+
     Org.create(db, %{
       session_key: session_key,
       display_name: session_key,

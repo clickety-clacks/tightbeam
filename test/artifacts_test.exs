@@ -13,6 +13,7 @@ defmodule Tightbeam.ArtifactsTest do
     :ok = Ledger.ensure_schema(db)
     :ok = Artifacts.ensure_schema(db)
 
+    ensure_main_session(db, "flynn")
     parent = session(db, "parent", nil)
     child = session(db, "child", parent.session_key)
     seed_work_items(db)

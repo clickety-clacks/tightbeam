@@ -53,6 +53,8 @@ defmodule Tightbeam.TranscriptTest do
         "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn',0,'admin_add',1),('kay',0,'admin_add',1),('root',1,'admin_add',1)"
       )
 
+    Enum.each(~w(flynn kay root), &ensure_main_session(db, &1))
+
     owned = session!(db, "owned", "flynn", "Coder Session")
     foreign = session!(db, "foreign", "kay", "Kay Session")
 

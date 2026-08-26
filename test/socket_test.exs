@@ -185,6 +185,8 @@ defmodule Tightbeam.Wire.SocketTest do
         "INSERT OR IGNORE INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('other',0,'admin_add',1)"
       )
 
+    ensure_main_session(ctx.db, "other")
+
     Org.create(ctx.db, %{
       session_key: "other-session",
       display_name: "Other",

@@ -96,6 +96,8 @@ defmodule Tightbeam.ArtifactCarrierTest do
         "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 1, 'admin_add', 1)"
       )
 
+    ensure_main_session(db, "flynn")
+
     coder =
       Org.create(db, %{
         session_key: "carrier-coder",

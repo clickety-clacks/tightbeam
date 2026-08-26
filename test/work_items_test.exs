@@ -28,6 +28,8 @@ defmodule Tightbeam.WorkItemsTest do
         "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 0, 'admin_add', 1), ('other', 0, 'admin_add', 1)"
       )
 
+    Enum.each(~w(flynn other), &ensure_main_session(db, &1))
+
     holder = session(db, "holder", "flynn")
     other = session(db, "other-holder", "other")
     handlers = Gateway.handlers(%{db: db})
