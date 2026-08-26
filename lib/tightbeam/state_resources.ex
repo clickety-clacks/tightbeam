@@ -6,7 +6,38 @@ defmodule Tightbeam.StateResources do
   Storage-secret field names are impossible to emit from this seam.
   """
 
+  require Logger
+
   @secret_keys MapSet.new(["cliToken", "token", "identityToken"])
+  @identity_resource "identity"
+  @identity_descriptor_cipher :aes_256_gcm
+  @identity_metadata_sql """
+  SELECT CASE WHEN v.rowVersion IS NULL THEN 0 ELSE 1 END AS present,
+         v.rowVersion
+  FROM (SELECT ?1 AS resource, ?2 AS primaryKey) AS seed
+  LEFT JOIN admin_projection_versions AS v
+    ON v.resource = seed.resource AND v.primaryKey = seed.primaryKey
+  """
+  @identity_hydration_sql """
+  WITH observed AS (
+    SELECT rowVersion
+    FROM admin_projection_versions
+    WHERE resource = ?1 AND primaryKey = ?2
+  ),
+  matched AS (
+    SELECT item, rowVersion
+    FROM admin_projection_versions
+    WHERE resource = ?1 AND primaryKey = ?2 AND ?3 = 1 AND rowVersion = ?4
+  )
+  SELECT
+    CASE
+      WHEN EXISTS(SELECT 1 FROM matched) THEN 'ok'
+      WHEN ?3 = 0 AND NOT EXISTS(SELECT 1 FROM observed) THEN 'not_found'
+      ELSE 'stale'
+    END AS outcome,
+    (SELECT item FROM matched),
+    (SELECT rowVersion FROM matched)
+  """
 
   @turn_select """
   SELECT t.seq, t.sessionKey, t.messageId, t.wakeId, t.origin, t.roleRef,
@@ -287,10 +318,66 @@ defmodule Tightbeam.StateResources do
     |> Enum.sort_by(&Map.fetch!(&1, "name"))
   end
 
-  def query_identity(source, "served"),
-    do: AdminProjection.stamped_item(source, "identity", "served")
+  def query_identity(source, {:metadata, name, request_binding, principal_binding})
+      when is_binary(name) do
+    with {:ok, principal_binding} <- canonical_identity_principal_binding(principal_binding) do
+      [[present, row_version]] =
+        query(source, @identity_metadata_sql, [@identity_resource, AdminProjection.key(name)])
 
-  def query_identity(_source, _name), do: nil
+      nonce = System.unique_integer([:positive, :monotonic])
+
+      descriptor =
+        seal_identity_descriptor(%{
+          resource: @identity_resource,
+          name: name,
+          present: present == 1,
+          row_version: row_version,
+          source_identity: identity_source_identity(source),
+          source_generation: identity_source_generation(source),
+          request_binding: request_binding,
+          principal_binding: principal_binding,
+          issuer: self(),
+          nonce: nonce
+        })
+
+      :ok = open_identity_operation_nonce(request_binding, nonce)
+      {:ok, descriptor}
+    else
+      {:error, :invalid_principal_binding} ->
+        invalid_identity_descriptor(:invalid_principal_binding)
+    end
+  end
+
+  def query_identity(source, {:hydrate, descriptor, request_binding, principal_binding}) do
+    with {:ok, principal_binding} <- canonical_identity_principal_binding(principal_binding),
+         {:ok, payload} <-
+           open_identity_descriptor(
+             descriptor,
+             source,
+             request_binding,
+             principal_binding
+           ) do
+      hydrate_identity(source, payload)
+    else
+      {:error, :invalid_principal_binding} ->
+        invalid_identity_descriptor(:invalid_principal_binding)
+
+      other ->
+        other
+    end
+  end
+
+  def query_identity(_source, {:close, request_binding}) do
+    close_identity_operation(request_binding)
+    :ok
+  end
+
+  def query_identity(_source, name) when is_binary(name),
+    do:
+      raise(
+        ArgumentError,
+        "exact-name identity reads require tagged metadata/hydrate stages of query_identity/2"
+      )
 
   @doc "Canonical kungfu query. Only committed, sanitized stamps are readable."
   def query_kungfu(source, filters) when is_map(filters) do
@@ -733,6 +820,222 @@ defmodule Tightbeam.StateResources do
   defp state_name(:relearn_conflicted), do: "relearn_conflicted"
   defp state_name(value) when is_binary(value), do: value
   defp state_name(_value), do: raise(ArgumentError, "unknown identity state")
+
+  defp hydrate_identity(source, %{
+         name: name,
+         present: present?,
+         row_version: row_version
+       }) do
+    expected_row_version = row_version || 0
+
+    case query(source, @identity_hydration_sql, [
+           @identity_resource,
+           AdminProjection.key(name),
+           if(present?, do: 1, else: 0),
+           expected_row_version
+         ]) do
+      [["ok", item, hydrated_row_version]]
+      when is_binary(item) and is_integer(hydrated_row_version) ->
+        {:ok, item |> JSON.decode!() |> Map.put("rowVersion", hydrated_row_version)}
+
+      [["not_found", nil, nil]] ->
+        :not_found
+
+      [["stale", nil, nil]] ->
+        :stale
+    end
+  end
+
+  defp seal_identity_descriptor(payload) do
+    plaintext = :erlang.term_to_binary(payload)
+    iv = :crypto.strong_rand_bytes(12)
+
+    {ciphertext, tag} =
+      :crypto.crypto_one_time_aead(
+        @identity_descriptor_cipher,
+        identity_descriptor_key(),
+        iv,
+        plaintext,
+        <<>>,
+        true
+      )
+
+    Base.url_encode64(iv <> tag <> ciphertext, padding: false)
+  end
+
+  defp open_identity_descriptor(descriptor, source, request_binding, principal_binding)
+       when is_binary(descriptor) do
+    with {:ok, payload} <- decrypt_identity_descriptor(descriptor),
+         :ok <- validate_identity_descriptor(payload, source, request_binding, principal_binding) do
+      {:ok, payload}
+    else
+      {:error, reason} ->
+        invalid_identity_descriptor(reason)
+    end
+  end
+
+  defp open_identity_descriptor(_descriptor, _source, _request_binding, _principal_binding) do
+    invalid_identity_descriptor(:non_binary_descriptor)
+  end
+
+  defp decrypt_identity_descriptor(descriptor) do
+    with {:ok, encoded} <- Base.url_decode64(descriptor, padding: false),
+         <<iv::binary-12, tag::binary-16, ciphertext::binary>> <- encoded,
+         plaintext when is_binary(plaintext) <-
+           :crypto.crypto_one_time_aead(
+             @identity_descriptor_cipher,
+             identity_descriptor_key(),
+             iv,
+             ciphertext,
+             <<>>,
+             tag,
+             false
+           ) do
+      {:ok, :erlang.binary_to_term(plaintext)}
+    else
+      _ -> {:error, :malformed_descriptor}
+    end
+  rescue
+    _ -> {:error, :malformed_descriptor}
+  end
+
+  defp validate_identity_descriptor(
+         %{
+           resource: @identity_resource,
+           name: name,
+           present: present?,
+           row_version: row_version,
+           source_identity: source_identity,
+           source_generation: source_generation,
+           request_binding: request_binding,
+           principal_binding: principal_binding,
+           issuer: issuer,
+           nonce: nonce
+         },
+         source,
+         expected_request_binding,
+         expected_principal_binding
+       )
+       when is_binary(name) and is_boolean(present?) and is_integer(nonce) do
+    with {:ok, principal_binding} <- canonical_identity_principal_binding(principal_binding),
+         {:ok, expected_principal_binding} <-
+           canonical_identity_principal_binding(expected_principal_binding) do
+      cond do
+        present? and not (is_integer(row_version) and row_version > 0) ->
+          {:error, :invalid_row_version}
+
+        not present? and not is_nil(row_version) ->
+          {:error, :unexpected_absence_version}
+
+        issuer != self() ->
+          {:error, :wrong_process}
+
+        source_identity != identity_source_identity(source) ->
+          {:error, :wrong_source}
+
+        source_generation != identity_source_generation(source) ->
+          {:error, :wrong_source_generation}
+
+        request_binding != expected_request_binding ->
+          {:error, :wrong_request_binding}
+
+        principal_binding != expected_principal_binding ->
+          {:error, :wrong_principal}
+
+        not identity_operation_open?(expected_request_binding, nonce) ->
+          {:error, :closed_operation}
+
+        true ->
+          :ok
+      end
+    else
+      {:error, :invalid_principal_binding} ->
+        {:error, :invalid_principal_binding}
+    end
+  end
+
+  defp validate_identity_descriptor(_payload, _source, _request_binding, _principal_binding),
+    do: {:error, :bad_descriptor_payload}
+
+  defp canonical_identity_principal_binding({:session, session_key})
+       when is_binary(session_key) and session_key != "",
+       do: {:ok, {:session, session_key}}
+
+  defp canonical_identity_principal_binding({:user, user_id})
+       when is_binary(user_id) and user_id != "",
+       do: {:ok, {:user, user_id}}
+
+  defp canonical_identity_principal_binding({:process, name})
+       when is_binary(name) and name != "",
+       do: {:ok, {:process, name}}
+
+  defp canonical_identity_principal_binding(_principal_binding),
+    do: {:error, :invalid_principal_binding}
+
+  defp invalid_identity_descriptor(reason) do
+    Logger.error("identity_descriptor_invalid reason=#{reason}")
+    {:error, :invalid_identity_descriptor}
+  end
+
+  defp identity_descriptor_key do
+    key_name = {__MODULE__, :identity_descriptor_key}
+
+    case Process.get(key_name) do
+      key when is_binary(key) and byte_size(key) == 32 ->
+        key
+
+      _ ->
+        key = :crypto.strong_rand_bytes(32)
+        Process.put(key_name, key)
+        key
+    end
+  end
+
+  defp open_identity_operation_nonce(request_binding, nonce) do
+    key_name = {__MODULE__, :identity_descriptor_operations}
+    operations = Process.get(key_name, %{})
+    updated = Map.update(operations, request_binding, MapSet.new([nonce]), &MapSet.put(&1, nonce))
+    Process.put(key_name, updated)
+    :ok
+  end
+
+  defp close_identity_operation(request_binding) do
+    key_name = {__MODULE__, :identity_descriptor_operations}
+    operations = Process.get(key_name, %{})
+    Process.put(key_name, Map.delete(operations, request_binding))
+    :ok
+  end
+
+  defp identity_operation_open?(request_binding, nonce) do
+    case Process.get({__MODULE__, :identity_descriptor_operations}, %{}) do
+      operations when is_map(operations) ->
+        case Map.get(operations, request_binding) do
+          nil -> false
+          nonces -> MapSet.member?(nonces, nonce)
+        end
+
+      _ ->
+        false
+    end
+  end
+
+  defp identity_source_identity(%Txn{} = txn),
+    do: {:txn, :erlang.phash2(:erlang.term_to_binary(txn))}
+
+  defp identity_source_identity(source) when is_pid(source), do: {:pid, source}
+  defp identity_source_identity(source) when is_atom(source), do: {:named, source}
+
+  defp identity_source_identity(source),
+    do: {:term, :erlang.phash2(:erlang.term_to_binary(source))}
+
+  defp identity_source_generation(%Txn{} = txn),
+    do: {:txn_generation, :erlang.phash2(:erlang.term_to_binary(txn))}
+
+  defp identity_source_generation(source) when is_pid(source), do: source
+  defp identity_source_generation(source) when is_atom(source), do: Process.whereis(source)
+
+  defp identity_source_generation(source),
+    do: {:term_generation, :erlang.phash2(:erlang.term_to_binary(source))}
 
   defp config_row([key, value, updated_at, row_version]) do
     %{
