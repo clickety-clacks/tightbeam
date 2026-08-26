@@ -10,7 +10,8 @@ defmodule Tightbeam.WorkItemsTest do
     Ledger,
     Org,
     Rules,
-    WorkItems
+    WorkItems,
+    WorkState
   }
 
   @sha String.duplicate("a", 64)
@@ -160,7 +161,7 @@ defmodule Tightbeam.WorkItemsTest do
 
     assert resolved.specRefName == "rulings/canonical.md"
     assert resolved.specRefSha256 == sha
-    assert resolved.specRefResolution == %{status: "resolved", rulingText: ruling}
+    assert resolved.specRefResolution == %{status: "resolved"}
 
     # A keyed replay and an independent duplicate reference both reuse the one
     # immutable custody row. Neither manufactures another copy or another shape.
@@ -180,8 +181,9 @@ defmodule Tightbeam.WorkItemsTest do
         spec_ref_text: ruling
       })
 
-    assert duplicate.specRefResolution == %{status: "resolved", rulingText: ruling}
+    assert duplicate.specRefResolution == %{status: "resolved"}
     assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT count(*) FROM spec_custody")
+    assert Tightbeam.SpecCustody.resolve(ctx.db, "rulings/canonical.md", sha) == {:ok, ruling}
 
     conflict_ruling = "Canonical bytes that conflict with a corrupt custody row."
     conflict_sha = sha256(conflict_ruling)
@@ -246,9 +248,51 @@ defmodule Tightbeam.WorkItemsTest do
 
     repinned = WorkItems.__handle__(ctx.db, "work-item-update", custody_update)
 
-    assert repinned.specRefResolution == %{status: "resolved", rulingText: missing_ruling}
+    assert repinned.specRefResolution == %{status: "resolved"}
     assert_received :custody_resolved
     assert get(ctx, {:user, "flynn"}, missing.id).workItem == repinned
+  end
+
+  test "custodied ruling bytes stay out of public work-item and work-state projections", ctx do
+    ruling = "Owner-only ruling bytes"
+    sha = sha256(ruling)
+
+    created =
+      create(ctx, {:user, "flynn"}, %{
+        title: "Private ruling",
+        spec_ref_name: "rulings/private.md",
+        spec_ref_sha256: sha,
+        spec_ref_text: ruling
+      })
+
+    owner_get = get(ctx, {:user, "flynn"}, created.id).workItem
+    unrelated_get = get(ctx, {:user, "other"}, created.id).workItem
+    owner_list = Enum.find(list(ctx, {:user, "flynn"}).workItems, &(&1.id == created.id))
+    unrelated_list = Enum.find(list(ctx, {:user, "other"}).workItems, &(&1.id == created.id))
+
+    state_list =
+      ctx.db
+      |> WorkState.list_items(%{})
+      |> Map.fetch!(:items)
+      |> Enum.find(&(&1.workItem.id == created.id))
+      |> Map.fetch!(:workItem)
+
+    state_detail = WorkState.item_detail(ctx.db, created.id).workItem
+
+    for projection <- [
+          created,
+          owner_get,
+          unrelated_get,
+          owner_list,
+          unrelated_list,
+          state_list,
+          state_detail
+        ] do
+      assert projection.specRefResolution == %{status: "resolved"}
+      refute inspect(projection) =~ ruling
+    end
+
+    assert Tightbeam.SpecCustody.resolve(ctx.db, "rulings/private.md", sha) == {:ok, ruling}
   end
 
   test "Proof 1: an item created during a running turn carries that seq with known = 1; created with no running turn carries NULL with known = 1",

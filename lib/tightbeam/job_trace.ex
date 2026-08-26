@@ -1,7 +1,7 @@
 defmodule Tightbeam.JobTrace do
   @moduledoc "Pinned, read-only work-item trace artifact."
 
-  alias Tightbeam.{CausalEvents, DB, Escalation}
+  alias Tightbeam.{CausalEvents, DB, Escalation, SpecCustody}
 
   defmodule MissingCancellationProvenance do
     @moduledoc false
@@ -38,7 +38,9 @@ defmodule Tightbeam.JobTrace do
         ownerUserId: item.ownerUserId,
         state: item.state,
         failReason: item.failReason,
-        title: item.title
+        title: item.title,
+        specRefResolution:
+          SpecCustody.authorized_resolution(db, item.specRefName, item.specRefSha256)
       },
       assignments: assignments,
       timeline:

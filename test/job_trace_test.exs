@@ -32,8 +32,16 @@ defmodule Tightbeam.JobTraceTest do
     :ok =
       DB.execute(db, """
       INSERT INTO work_items
-        (id, title, ownerUserId, state, createdByUser, createdAt)
-      VALUES ('wi_trace', 'Trace me', 'owner', 'open', 'owner', 1);
+        (id, title, specRefName, specRefSha256, ownerUserId, state, createdByUser, createdAt)
+      VALUES
+        ('wi_trace', 'Trace me', 'rulings/trace.md',
+         'e4eee61b52006aac71f80179b0c8854ab4ea81b95b33fd5769c1b7b9bdb8cbf7',
+         'owner', 'open', 'owner', 1);
+
+      INSERT INTO spec_custody (sha256, rulingText, recordedAt)
+      VALUES
+        ('e4eee61b52006aac71f80179b0c8854ab4ea81b95b33fd5769c1b7b9bdb8cbf7',
+         'Trace ruling bytes', 1);
 
       INSERT INTO assignments
         (id, subject, holderKey, openedByUser, openedAt, state, workItemId)
@@ -162,7 +170,12 @@ defmodule Tightbeam.JobTraceTest do
     assert %{code: "not_found"} = trace(db, {:user, "owner"}, "wi_missing")
 
     assert_keys(trace, ~w(assignments timeline workItem)a)
-    assert_keys(trace.workItem, ~w(failReason id ownerUserId state title)a)
+    assert_keys(trace.workItem, ~w(failReason id ownerUserId specRefResolution state title)a)
+
+    assert trace.workItem.specRefResolution == %{
+             status: "resolved",
+             rulingText: "Trace ruling bytes"
+           }
 
     assert Enum.map(trace.assignments, & &1.id) == ["asg_bad", "asg_direct", "asg_review"]
 

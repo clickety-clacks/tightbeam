@@ -67,9 +67,18 @@ defmodule Tightbeam.SpecCustody do
     resolve_rows(rows, sha256)
   end
 
-  def resolution(_source, nil, nil), do: %{status: "none"}
-
   def resolution(source, name, sha256) do
+    source
+    |> authorized_resolution(name, sha256)
+    |> Map.delete(:rulingText)
+  end
+
+  # Callers of this detailed projection must establish authorization before
+  # exposing it. Public work-item and work-state projections use resolution/3.
+  @doc false
+  def authorized_resolution(_source, nil, nil), do: %{status: "none"}
+
+  def authorized_resolution(source, name, sha256) do
     case resolve(source, name, sha256) do
       {:ok, ruling_text} ->
         %{status: "resolved", rulingText: ruling_text}
