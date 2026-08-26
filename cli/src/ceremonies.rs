@@ -1,14 +1,18 @@
 //! Interactive `setup` and `assimilate` ceremonies.
 
-use std::fs;
+use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{ChildStdout, Command as ProcessCommand, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use flate2::read::GzDecoder;
+use sha2::{Digest, Sha256};
+use tar::Archive;
 
 use crate::args::{AssimilateArgs, Identity};
 use crate::child_process::{
@@ -1404,6 +1408,46 @@ struct ExecFailure {
 }
 
 const REMOTE_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
+const RELEASE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+const RELEASES_URL: &str =
+    "https://api.github.com/repos/clickety-clacks/tightbeam/releases?per_page=100";
+
+#[derive(Debug)]
+struct ReleaseCli {
+    path: PathBuf,
+    cleanup_dir: Option<PathBuf>,
+}
+
+impl ReleaseCli {
+    fn fixture(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            cleanup_dir: None,
+        }
+    }
+}
+
+impl Drop for ReleaseCli {
+    fn drop(&mut self) {
+        if let Some(dir) = &self.cleanup_dir {
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ReleaseAsset {
+    name: String,
+    url: String,
+    size: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ReleasePlan {
+    tag: String,
+    archive: ReleaseAsset,
+    checksums: ReleaseAsset,
+}
 
 trait CeremonyIo {
     fn log(&mut self, message: &str);
@@ -1415,7 +1459,7 @@ trait CeremonyIo {
         timeout: Duration,
     ) -> Result<String, ExecFailure>;
     fn dispatch(&mut self, request: &RequestSpec) -> Result<Option<serde_json::Value>, String>;
-    fn current_exe(&self) -> Result<PathBuf, String>;
+    fn release_cli(&mut self, target: &str) -> Result<ReleaseCli, ExecFailure>;
 }
 
 struct SystemIo;
@@ -1537,8 +1581,8 @@ impl CeremonyIo for SystemIo {
         dispatch::send(request)
     }
 
-    fn current_exe(&self) -> Result<PathBuf, String> {
-        std::env::current_exe().map_err(|error| error.to_string())
+    fn release_cli(&mut self, target: &str) -> Result<ReleaseCli, ExecFailure> {
+        fetch_release_cli(target).map_err(release_failure)
     }
 }
 
@@ -1633,16 +1677,7 @@ fn update_clients_with(io: &mut dyn CeremonyIo, as_user: &str) -> Result<(), Str
                         ));
                         continue;
                     };
-                    if remote_target != local_target_triple() {
-                        failed += 1;
-                        io.log(&format!(
-                            "[update-clients] {}: incompatible — local target {} differs from satellite target {remote_target}",
-                            host.name,
-                            local_target_triple()
-                        ));
-                        continue;
-                    }
-                    match ship_current_cli(io, false, &host.ssh, &cli_bin) {
+                    match ship_release_cli(io, false, &host.ssh, &cli_bin, &remote_target) {
                         Ok(()) => io.log(&format!(
                             "[update-clients] {}: updated ({version} -> {current_version})",
                             host.name
@@ -1761,6 +1796,284 @@ fn client_update_hosts(
         .collect()
 }
 
+fn release_platform(target: &str) -> Result<&'static str, String> {
+    match target {
+        "aarch64-apple-darwin" => Ok("darwin-aarch64"),
+        "x86_64-unknown-linux-gnu" => Ok("linux-x86_64"),
+        _ => Err(format!(
+            "no published Tightbeam release CLI exists for target {target}; supported release targets are aarch64-apple-darwin and x86_64-unknown-linux-gnu"
+        )),
+    }
+}
+
+fn release_build(tag: &str, version: &str) -> Option<u64> {
+    tag.strip_prefix(&format!("v{version}+"))?
+        .parse::<u64>()
+        .ok()
+}
+
+fn release_asset(value: &serde_json::Value) -> Option<ReleaseAsset> {
+    let name = value.get("name")?.as_str()?.to_owned();
+    let url = value.get("browser_download_url")?.as_str()?.to_owned();
+    let size = value.get("size")?.as_u64()?;
+    let expected_prefix = "https://github.com/clickety-clacks/tightbeam/releases/download/";
+    (size > 0 && url.starts_with(expected_prefix) && url.ends_with(&name)).then_some(ReleaseAsset {
+        name,
+        url,
+        size,
+    })
+}
+
+fn release_plan(releases_json: &str, target: &str, version: &str) -> Result<ReleasePlan, String> {
+    let platform = release_platform(target)?;
+    let releases: serde_json::Value = serde_json::from_str(releases_json)
+        .map_err(|error| format!("GitHub release catalog was not valid JSON: {error}"))?;
+    let releases = releases
+        .as_array()
+        .ok_or_else(|| "GitHub release catalog was not an array".to_owned())?;
+    let release = releases
+        .iter()
+        .filter(|release| {
+            release
+                .get("immutable")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+                && release.get("draft").and_then(serde_json::Value::as_bool) == Some(false)
+                && release
+                    .get("prerelease")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(false)
+        })
+        .filter_map(|release| {
+            let tag = release.get("tag_name")?.as_str()?;
+            release_build(tag, version).map(|build| (build, release))
+        })
+        .max_by_key(|(build, _)| *build)
+        .map(|(_, release)| release)
+        .ok_or_else(|| format!("no immutable Tightbeam release exists for version {version}"))?;
+    let tag = release
+        .get("tag_name")
+        .and_then(serde_json::Value::as_str)
+        .expect("selected release had a tag")
+        .to_owned();
+    let assets = release
+        .get("assets")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| format!("release {tag} has no asset list"))?;
+    let archive_prefix = format!("tightbeam-{version}-{platform}-");
+    let mut archives = assets
+        .iter()
+        .filter_map(release_asset)
+        .filter(|asset| asset.name.starts_with(&archive_prefix) && asset.name.ends_with(".tgz"));
+    let archive = archives
+        .next()
+        .ok_or_else(|| format!("release {tag} has no CLI archive for target {target}"))?;
+    if archives.next().is_some() {
+        return Err(format!(
+            "release {tag} has multiple CLI archives for target {target}"
+        ));
+    }
+    let mut checksum_assets = assets
+        .iter()
+        .filter_map(release_asset)
+        .filter(|asset| asset.name == "SHA256SUMS");
+    let checksums = checksum_assets
+        .next()
+        .ok_or_else(|| format!("release {tag} has no SHA256SUMS asset"))?;
+    if checksum_assets.next().is_some() {
+        return Err(format!("release {tag} has multiple SHA256SUMS assets"));
+    }
+    let release_url = format!(
+        "https://github.com/clickety-clacks/tightbeam/releases/download/{}/",
+        tag.replace('+', "%2B")
+    );
+    if !archive.url.starts_with(&release_url) || !checksums.url.starts_with(&release_url) {
+        return Err(format!(
+            "release {tag} points outside its own immutable release assets"
+        ));
+    }
+    Ok(ReleasePlan {
+        tag,
+        archive,
+        checksums,
+    })
+}
+
+fn checksum_for_asset(checksums: &str, asset_name: &str) -> Result<String, String> {
+    let mut matches = checksums.lines().filter_map(|line| {
+        let mut fields = line.split_whitespace();
+        let digest = fields.next()?;
+        let name = fields.next()?.trim_start_matches('*');
+        (name == asset_name && fields.next().is_none()).then_some(digest)
+    });
+    let digest = matches
+        .next()
+        .ok_or_else(|| format!("SHA256SUMS does not name {asset_name}"))?;
+    if matches.next().is_some() {
+        return Err(format!("SHA256SUMS names {asset_name} more than once"));
+    }
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(format!(
+            "SHA256SUMS carries an invalid digest for {asset_name}"
+        ));
+    }
+    Ok(digest.to_owned())
+}
+
+fn release_get(agent: &ureq::Agent, url: &str) -> Result<ureq::Response, String> {
+    match agent
+        .get(url)
+        .set("Accept", "application/vnd.github+json")
+        .set("User-Agent", "tightbeam-cli")
+        .call()
+    {
+        Ok(response) => Ok(response),
+        Err(ureq::Error::Status(status, _)) => Err(format!("GET {url} returned HTTP {status}")),
+        Err(ureq::Error::Transport(error)) => Err(format!("GET {url} failed: {error}")),
+    }
+}
+
+fn download_asset(
+    agent: &ureq::Agent,
+    asset: &ReleaseAsset,
+    destination: &Path,
+) -> Result<(), String> {
+    let response = release_get(agent, &asset.url)?;
+    let mut reader = response.into_reader();
+    let mut file = File::create(destination)
+        .map_err(|error| format!("could not create {}: {error}", destination.display()))?;
+    let copied = io::copy(&mut reader, &mut file)
+        .map_err(|error| format!("could not download {}: {error}", asset.name))?;
+    if copied != asset.size {
+        return Err(format!(
+            "downloaded {} bytes for {}, expected {}",
+            copied, asset.name, asset.size
+        ));
+    }
+    Ok(())
+}
+
+fn sha256_file(path: &Path) -> Result<String, String> {
+    let mut file =
+        File::open(path).map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("could not hash {}: {error}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn verify_release_archive(path: &Path, asset_name: &str, expected: &str) -> Result<(), String> {
+    let actual = sha256_file(path)?;
+    if actual != expected {
+        return Err(format!(
+            "release archive {asset_name} failed SHA-256 verification: expected {expected}, got {actual}"
+        ));
+    }
+    Ok(())
+}
+
+fn extract_release_cli(archive_path: &Path, cli_path: &Path) -> Result<(), String> {
+    let archive_file = File::open(archive_path)
+        .map_err(|error| format!("could not open {}: {error}", archive_path.display()))?;
+    let mut archive = Archive::new(GzDecoder::new(archive_file));
+    let mut found = false;
+    for entry in archive
+        .entries()
+        .map_err(|error| format!("could not read release archive: {error}"))?
+    {
+        let mut entry = entry.map_err(|error| format!("could not read release entry: {error}"))?;
+        let path = entry
+            .path()
+            .map_err(|error| format!("release archive has an invalid path: {error}"))?;
+        if path.as_ref() != Path::new("tightbeam/bin/tightbeam") {
+            continue;
+        }
+        if found {
+            return Err(
+                "release archive contains tightbeam/bin/tightbeam more than once".to_owned(),
+            );
+        }
+        if !entry.header().entry_type().is_file() {
+            return Err("release archive CLI entry is not a regular file".to_owned());
+        }
+        let mut cli = File::create(cli_path)
+            .map_err(|error| format!("could not create extracted release CLI: {error}"))?;
+        io::copy(&mut entry, &mut cli)
+            .map_err(|error| format!("could not extract release CLI: {error}"))?;
+        found = true;
+    }
+    found
+        .then_some(())
+        .ok_or_else(|| "release archive has no tightbeam/bin/tightbeam".to_owned())
+}
+
+fn fetch_release_cli(target: &str) -> Result<ReleaseCli, String> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout(RELEASE_DOWNLOAD_TIMEOUT)
+        .timeout_connect(RELEASE_DOWNLOAD_TIMEOUT)
+        .build();
+    let releases = release_get(&agent, RELEASES_URL)?
+        .into_string()
+        .map_err(|error| format!("could not read GitHub release catalog: {error}"))?;
+    let plan = release_plan(&releases, target, env!("CARGO_PKG_VERSION"))?;
+    let checksums = release_get(&agent, &plan.checksums.url)?
+        .into_string()
+        .map_err(|error| format!("could not read {}: {error}", plan.checksums.name))?;
+    let expected = checksum_for_asset(&checksums, &plan.archive.name)?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "tightbeam-release-cli-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir(&dir).map_err(|error| format!("could not create {}: {error}", dir.display()))?;
+    let result = (|| {
+        let archive_path = dir.join(&plan.archive.name);
+        download_asset(&agent, &plan.archive, &archive_path)?;
+        verify_release_archive(&archive_path, &plan.archive.name, &expected)?;
+        let cli_path = dir.join("tightbeam");
+        extract_release_cli(&archive_path, &cli_path)?;
+        fs::remove_file(&archive_path).map_err(|error| {
+            format!(
+                "could not remove verified archive {}: {error}",
+                archive_path.display()
+            )
+        })?;
+        Ok(ReleaseCli {
+            path: cli_path,
+            cleanup_dir: Some(dir.clone()),
+        })
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&dir);
+    }
+    result
+}
+
+fn release_failure(message: String) -> ExecFailure {
+    ExecFailure {
+        message: message.clone(),
+        stdout: String::new(),
+        stderr: message,
+        status: None,
+        timed_out: false,
+    }
+}
+
 fn assimilate_with(io: &mut dyn CeremonyIo, args: AssimilateArgs) -> Result<(), String> {
     let catalog = &args.catalog;
     validate_harnesses(&args.harnesses, &catalog)?;
@@ -1803,16 +2116,17 @@ fn assimilate_with(io: &mut dyn CeremonyIo, args: AssimilateArgs) -> Result<(), 
     })?;
 
     let resolved_base = step(io, "DIRS", command_failure, |io| {
-        let auth_dirs = args
+        let mut dirs = args
             .harnesses
             .iter()
             .map(|harness| remote_path(&format!("{}/auth/{harness}", args.base_dir)))
             .collect::<Vec<_>>();
+        dirs.push(remote_path(&format!("{}/bin", args.base_dir)));
         ssh(
             io,
             dry_run,
             &args.ssh_dest,
-            &format!("mkdir -p {}", auth_dirs.join(" ")),
+            &format!("mkdir -p {}", dirs.join(" ")),
         )?;
         if dry_run {
             // The probe already resolved this read-only. On a host that has never been
@@ -1860,17 +2174,15 @@ fn assimilate_with(io: &mut dyn CeremonyIo, args: AssimilateArgs) -> Result<(), 
 
     let cli_bin = format!("{resolved_base}/bin");
     let adapter_bin_dir = format!("{resolved_base}/adapters/node_modules/.bin");
-    let remote_target = target_from_probe(&observation.platform);
-    let cli_compatible = remote_target.as_deref() == Some(local_target_triple());
-    if cli_compatible {
+    let remote_target = target_from_probe(&observation.platform)
+        .ok_or_else(|| "probe did not report a satellite target".to_owned())?;
+    if release_platform(&remote_target).is_ok() {
         step(io, "CLI", command_failure, |io| {
-            ship_current_cli(io, dry_run, &args.ssh_dest, &cli_bin)
+            ship_release_cli(io, dry_run, &args.ssh_dest, &cli_bin, &remote_target)
         })?;
     } else {
-        let target = remote_target.unwrap_or_else(|| "the satellite target".to_owned());
         io.warn(&format!(
-            "[assimilate] WARNING: this binary targets {} but the satellite targets {target}; build for {target} and re-run; skipping CLI",
-            local_target_triple()
+            "[assimilate] WARNING: no published release CLI exists for target {remote_target}; registering without a CLI. After registration, use the tightbeam-assimilate skill's repo/{{cli,priv}} source fallback on the satellite; do not re-run assimilate."
         ));
     }
 
@@ -1939,25 +2251,24 @@ fn run_command(
     }
 }
 
-fn ship_current_cli(
+fn ship_release_cli(
     io: &mut dyn CeremonyIo,
     dry_run: bool,
     ssh_dest: &str,
     cli_bin: &str,
+    target: &str,
 ) -> Result<(), ExecFailure> {
+    let release_cli = if dry_run {
+        ReleaseCli::fixture(format!("<verified release CLI for {target}>"))
+    } else {
+        io.release_cli(target)?
+    };
     ssh(
         io,
         dry_run,
         ssh_dest,
         &format!("mkdir -p {}", remote_path(cli_bin)),
     )?;
-    let executable = io.current_exe().map_err(|message| ExecFailure {
-        message,
-        stdout: String::new(),
-        stderr: String::new(),
-        status: None,
-        timed_out: false,
-    })?;
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -1972,7 +2283,7 @@ fn ship_current_cli(
                 "-o".to_owned(),
                 "BatchMode=yes".to_owned(),
                 "--".to_owned(),
-                executable.display().to_string(),
+                release_cli.path.display().to_string(),
                 // NOT `shell_quote`d, unlike every `ssh` command below. scp has shipped the
                 // SFTP protocol by default since OpenSSH 9.0, and SFTP takes this path
                 // LITERALLY -- there is no remote shell to remove quotes, so quoting it
@@ -2125,6 +2436,7 @@ fn display_command(file: &str, args: &[String]) -> String {
         .join(" ")
 }
 
+#[cfg(test)]
 fn local_target_triple() -> &'static str {
     env!("TIGHTBEAM_BUILD_TARGET")
 }
@@ -3216,6 +3528,8 @@ mod tests {
         responses: Vec<Result<String, ExecFailure>>,
         dispatched: Vec<String>,
         dispatch_responses: Vec<Result<Option<serde_json::Value>, String>>,
+        release_targets: Vec<String>,
+        release_clis: Vec<Result<PathBuf, ExecFailure>>,
     }
 
     impl CeremonyIo for FakeIo {
@@ -3250,8 +3564,13 @@ mod tests {
             }
         }
 
-        fn current_exe(&self) -> Result<PathBuf, String> {
-            Ok(PathBuf::from("/tmp/tightbeam"))
+        fn release_cli(&mut self, target: &str) -> Result<ReleaseCli, ExecFailure> {
+            self.release_targets.push(target.to_owned());
+            if self.release_clis.is_empty() {
+                Ok(ReleaseCli::fixture("/tmp/tightbeam"))
+            } else {
+                self.release_clis.remove(0).map(ReleaseCli::fixture)
+            }
         }
     }
 
@@ -3291,6 +3610,93 @@ mod tests {
             status: Some(1),
             timed_out: false,
         }
+    }
+
+    #[test]
+    fn real_release_catalog_selects_the_matching_target_archive() {
+        let releases = include_str!("../tests/fixtures/github-releases-2026-08-26.json");
+
+        let linux = release_plan(releases, "x86_64-unknown-linux-gnu", "0.2.0").unwrap();
+        assert_eq!(linux.tag, "v0.2.0+1373");
+        assert_eq!(
+            linux.archive.name,
+            "tightbeam-0.2.0-linux-x86_64-78b3340.tgz"
+        );
+        assert_eq!(linux.checksums.name, "SHA256SUMS");
+
+        let darwin = release_plan(releases, "aarch64-apple-darwin", "0.2.0").unwrap();
+        assert_eq!(
+            darwin.archive.name,
+            "tightbeam-0.2.0-darwin-aarch64-78b3340.tgz"
+        );
+    }
+
+    #[test]
+    fn release_archive_verification_refuses_a_digest_mismatch() {
+        let path = std::env::temp_dir().join(format!(
+            "tightbeam-release-digest-test-{}",
+            std::process::id()
+        ));
+        fs::write(&path, b"published archive bytes").unwrap();
+        let expected = sha256_file(&path).unwrap();
+        verify_release_archive(&path, "tightbeam.tgz", &expected).unwrap();
+
+        let error = verify_release_archive(&path, "tightbeam.tgz", &"0".repeat(64)).unwrap_err();
+        fs::remove_file(path).unwrap();
+
+        assert!(error.contains("failed SHA-256 verification"));
+        assert!(error.contains(&expected));
+    }
+
+    #[test]
+    fn real_checksum_manifest_names_one_exact_digest_per_target_archive() {
+        let checksums = include_str!("../tests/fixtures/github-release-v0.2.0+1373-SHA256SUMS");
+        assert_eq!(
+            checksum_for_asset(checksums, "tightbeam-0.2.0-linux-x86_64-78b3340.tgz").unwrap(),
+            "3ef74550ea036dc43014bbc287a381f437f93e4f0a40265059d7f85a2dbc03da"
+        );
+
+        let duplicated = format!("{checksums}{checksums}");
+        let error = checksum_for_asset(&duplicated, "tightbeam-0.2.0-linux-x86_64-78b3340.tgz")
+            .unwrap_err();
+        assert!(error.contains("more than once"));
+    }
+
+    #[test]
+    fn unsupported_release_target_names_the_source_fallback_without_a_rerun() {
+        let mut io = FakeIo {
+            responses: vec![
+                Ok(probe_response(
+                    "Linux aarch64",
+                    &["node", "npm", "rsync", "claude", "codex"],
+                )),
+                Ok(String::new()),
+                Ok("/remote\n".to_owned()),
+                Ok(String::new()),
+            ],
+            ..FakeIo::default()
+        };
+
+        assimilate_with(&mut io, args()).unwrap();
+
+        assert!(io.release_targets.is_empty());
+        assert!(
+            io.dispatched.len() == 1,
+            "the targetless host still registers"
+        );
+        let remedy = io.warnings.join("\n");
+        assert!(remedy.contains("repo/{cli,priv}"), "{remedy}");
+        assert!(remedy.contains("do not re-run assimilate"), "{remedy}");
+        assert!(!remedy.contains("build for"), "{remedy}");
+    }
+
+    #[test]
+    fn assimilate_skill_pins_both_source_directories_and_this_work_item() {
+        let skill = include_str!("../../priv/skills/tightbeam-assimilate/SKILL.md");
+        assert!(skill.contains("wi_984a7d2f-3c87-47b8-945c-222cfcad8dac"));
+        assert!(skill.contains("repo's `cli/` and `priv/` directories"));
+        assert!(skill.contains("Do not re-run assimilate"));
+        assert!(!skill.contains("wi_c729ca10"));
     }
 
     fn unreachable(stderr: &str) -> ExecFailure {
@@ -3491,25 +3897,34 @@ mod tests {
     }
 
     #[test]
-    fn incompatible_target_does_not_ship() {
+    fn update_clients_fetches_the_satellites_cross_arch_release() {
         let remote = if local_target_triple().contains("apple") {
             "Linux x86_64"
         } else {
             "Darwin arm64"
         };
-        let mut io = one_update_host(vec![Ok("0.0.9\n".to_owned()), Ok(format!("{remote}\n"))]);
+        let remote_target = target_from_probe(remote).unwrap();
+        let mut io = one_update_host(vec![
+            Ok("0.0.9\n".to_owned()),
+            Ok(format!("{remote}\n")),
+            Ok(String::new()),
+            Ok(String::new()),
+            Ok(String::new()),
+            Ok(format!("{}\n", env!("CARGO_PKG_VERSION"))),
+            Ok(String::new()),
+        ]);
 
-        let error = update_clients_with(&mut io, "flynn").unwrap_err();
+        update_clients_with(&mut io, "flynn").unwrap();
 
         assert_eq!(
             io.commands
                 .iter()
                 .map(|(file, _)| file.as_str())
                 .collect::<Vec<_>>(),
-            vec!["ssh", "ssh"]
+            vec!["ssh", "ssh", "ssh", "scp", "ssh", "ssh", "ssh"]
         );
-        assert!(io.logs[0].contains("incompatible"));
-        assert!(error.contains("failed for 1 host"));
+        assert_eq!(io.release_targets, vec![remote_target]);
+        assert!(io.logs[0].contains("updated"));
     }
 
     #[test]
@@ -3567,7 +3982,9 @@ mod tests {
             ..FakeIo::default()
         };
 
-        let error = ship_current_cli(&mut io, false, "satellite.local", "/srv/bin").unwrap_err();
+        let target = local_target_triple();
+        let error =
+            ship_release_cli(&mut io, false, "satellite.local", "/srv/bin", target).unwrap_err();
 
         assert_eq!(command_failure(&error), "copy interrupted");
         assert_eq!(io.commands.last().unwrap().0, "ssh");
@@ -3758,7 +4175,7 @@ mod tests {
     }
 
     #[test]
-    fn assimilate_runs_ts_step_order_and_ships_current_binary() {
+    fn assimilate_runs_step_order_and_ships_the_target_release_cli() {
         let mut io = FakeIo {
             responses: vec![
                 Ok(healthy_probe()),
@@ -3798,6 +4215,11 @@ mod tests {
         ] {
             assert!(probe.contains(expected), "probe must observe {expected}");
         }
+        assert!(
+            io.commands[1].1.last().unwrap().contains("/bin"),
+            "DIRS must create the CLI directory"
+        );
+        assert_eq!(io.release_targets, vec![local_target_triple()]);
         // Literal, not shell-quoted — see the SFTP note at the scp call site.
         assert!(
             io.commands[5]
@@ -3987,12 +4409,13 @@ mod tests {
     }
 
     #[test]
-    fn architecture_mismatch_warns_and_skips_cli_step() {
+    fn architecture_mismatch_fetches_and_ships_the_satellite_release() {
         let remote = if local_target_triple().contains("apple") {
             "Linux x86_64"
         } else {
             "Darwin arm64"
         };
+        let remote_target = target_from_probe(remote).unwrap();
         let mut io = FakeIo {
             responses: vec![
                 Ok(probe_response(
@@ -4004,14 +4427,16 @@ mod tests {
                 Ok("present\n".to_owned()),
                 Ok("present\n".to_owned()),
                 Ok(String::new()),
+                Ok(String::new()),
+                Ok(format!("{}\n", env!("CARGO_PKG_VERSION"))),
+                Ok(String::new()),
             ],
             ..FakeIo::default()
         };
         assimilate_with(&mut io, args()).unwrap();
-        assert!(!io.logs.iter().any(|line| line == "[assimilate] CLI... ok"));
-        assert!(io.warnings.iter().any(|line| {
-            line.contains("build for") && line.contains("re-run") && line.contains("skipping CLI")
-        }));
+        assert_eq!(io.release_targets, vec![remote_target]);
+        assert!(io.logs.iter().any(|line| line == "[assimilate] CLI... ok"));
+        assert!(io.warnings.is_empty());
     }
 
     #[test]

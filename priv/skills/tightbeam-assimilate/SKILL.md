@@ -16,16 +16,18 @@ section is the complete procedure.
    non-interactive ssh session sees. Useful flags: --name <hostname>
    (defaults from the destination), --harness claude,codex, --dry-run
    (runs the probe for real and writes nothing, so it can and does fail).
-1b. Cross-architecture satellites. The ceremony installs the CLI by
-   shipping its own running binary, gated on identical target triples: a
-   satellite whose OS/CPU differs from the control node SKIPS the CLI
-   step with a warning (wi_c729ca10 tracks the product fix; the warning's
-   "build for <target> and re-run" hint does not work from the control
-   node — re-running still ships the control node's binary). Build on the
-   satellite instead: copy the repo's cli/ source over (rsync), run
-   `cargo build --release` there (needs a Rust toolchain), install the
-   result at `<base-dir>/bin/tightbeam`, then re-run assimilate — every
-   other step is idempotent.
+1b. Cross-architecture satellites. The ceremony selects the immutable
+   release archive for the satellite's observed OS and CPU. It verifies
+   the archive against the release's `SHA256SUMS` before it ships the CLI.
+   This fixes wi_984a7d2f-3c87-47b8-945c-222cfcad8dac. The release ships
+   CLIs for macOS arm64 and Linux x86_64. For another target, let the
+   ceremony register the host without a CLI, then use this source fallback:
+   copy the repo's `cli/` and `priv/` directories to one repo root on the
+   satellite, run `cargo build --release --manifest-path cli/Cargo.toml`
+   there, and install `cli/target/release/tightbeam` at
+   `<base-dir>/bin/tightbeam`. Do not re-run assimilate. The CLI embeds
+   `priv/harness_registry.json` at build time, so a copied `cli/` directory
+   without its sibling `priv/` directory cannot compile.
 2. Credentials. Doctrine: every {org, host, harness} gets its OWN grant —
    the ceremony's ONBOARD step runs the harness's login on the satellite,
    which needs an interactive terminal. YOU do not have one: assimilate

@@ -1,0 +1,58 @@
+[
+  {
+    "tag_name": "v0.2.0+1373",
+    "immutable": true,
+    "draft": false,
+    "prerelease": false,
+    "assets": [
+      {
+        "name": "release-provenance.json",
+        "browser_download_url": "https://github.com/clickety-clacks/tightbeam/releases/download/v0.2.0%2B1373/release-provenance.json",
+        "size": 360
+      },
+      {
+        "name": "SHA256SUMS",
+        "browser_download_url": "https://github.com/clickety-clacks/tightbeam/releases/download/v0.2.0%2B1373/SHA256SUMS",
+        "size": 216
+      },
+      {
+        "name": "tightbeam-0.2.0-darwin-aarch64-78b3340.tgz",
+        "browser_download_url": "https://github.com/clickety-clacks/tightbeam/releases/download/v0.2.0%2B1373/tightbeam-0.2.0-darwin-aarch64-78b3340.tgz",
+        "size": 16364028
+      },
+      {
+        "name": "tightbeam-0.2.0-linux-x86_64-78b3340.tgz",
+        "browser_download_url": "https://github.com/clickety-clacks/tightbeam/releases/download/v0.2.0%2B1373/tightbeam-0.2.0-linux-x86_64-78b3340.tgz",
+        "size": 32110449
+      }
+    ]
+  },
+  {
+    "tag_name": "v0.1.8+1334",
+    "immutable": true,
+    "draft": false,
+    "prerelease": false,
+    "assets": [
+      {
+        "name": "release-provenance.json",
+        "browser_download_url": "https://github.com/clickety-clacks/tightbeam/releases/download/v0.1.8%2B1334/release-provenance.json",
+        "size": 360
+      },
+      {
+        "name": "SHA256SUMS",
+        "browser_download_url": "https://github.com/clickety-clacks/tightbeam/releases/download/v0.1.8%2B1334/SHA256SUMS",
+        "size": 216
+      },
+      {
+        "name": "tightbeam-0.1.8-darwin-aarch64-2ff4ed2.tgz",
+        "browser_download_url": "https://github.com/clickety-clacks/tightbeam/releases/download/v0.1.8%2B1334/tightbeam-0.1.8-darwin-aarch64-2ff4ed2.tgz",
+        "size": 16353251
+      },
+      {
+        "name": "tightbeam-0.1.8-linux-x86_64-2ff4ed2.tgz",
+        "browser_download_url": "https://github.com/clickety-clacks/tightbeam/releases/download/v0.1.8%2B1334/tightbeam-0.1.8-linux-x86_64-2ff4ed2.tgz",
+        "size": 32113981
+      }
+    ]
+  }
+]
