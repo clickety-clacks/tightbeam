@@ -1,6 +1,7 @@
 # Upgrading a running instance
 
-Stop it, swap the code, start it, check four things. There is no upgrade
+Stop it, swap the code, start it, update every satellite CLI, then check four
+things. There is no upgrade
 machinery and none is needed — the ledger is durable, so a restart is an
 ordinary event. What follows is what the stop actually does, established by
 running it rather than by reading `application.ex`.
@@ -33,8 +34,40 @@ kill -TERM <gateway pid>          # verified: this runs prep_stop, which drains
 git -C <checkout> pull            # or checkout the tag you are deploying
 mix deps.get && mix compile
 # 3. start
-# 4. verify — the four checks below
+# 4. update every registered satellite CLI and retain the per-host readback
+# 5. verify — the four checks below
 ```
+
+## Update every registered satellite CLI
+
+Run this required stage with the CLI from the gateway package that you just
+started:
+
+```sh
+tightbeam update-clients --as-user <adminUserId>
+```
+
+The command reads the registered CLI version from every satellite host. Before
+it replaces an outdated CLI, it also reads `uname -sm` and derives that host's
+target. It copies the running CLI only when the satellite target matches the
+gateway host target. It refuses a cross-architecture replacement instead of
+installing an incompatible binary.
+
+Treat the command output as the fleet readback. Retain every per-host line with
+the upgrade evidence. A complete successful readback has one
+`already current (<version>)` or `updated (<old-version> -> <version>)` outcome
+for every registered satellite. Any missing host, `incompatible`, `unreachable`,
+`timed out`, `question failed`, `target check failed`, or `refused` outcome
+stops the upgrade.
+
+For an incompatible host, install the matching target package from the proved
+release set at that host's registered CLI path. Verify the package against the
+release `SHA256SUMS`, then run `update-clients` again and retain the new per-host
+readback. Do not bypass the target refusal by copying the gateway host binary.
+
+A gateway rollback includes the same stage. Run `update-clients` from the
+restored gateway package, require every satellite to report the restored
+version, and retain that rollback readback with the rollback evidence.
 
 ## What the stop actually does
 

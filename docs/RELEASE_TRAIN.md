@@ -120,6 +120,20 @@ quits: deleting it does not make its tag name reusable. The premature immutable 
 release burned that bare name permanently. The release-candidate workflow has no tag
 trigger.
 
+## Require the fleet CLI stage during deployment
+
+A promoted release is not operationally complete on a gateway until that
+deployment runs the canonical
+[satellite CLI update and readback](UPGRADE.md#update-every-registered-satellite-cli)
+stage. The deployer must retain its per-host version and target evidence with
+the release evidence.
+
+Stop the deployment when any registered satellite does not report the deployed
+version. Use the matching verified target package for a cross-architecture
+satellite; never copy a gateway host binary across targets. A rollback must run
+the same stage from the restored gateway package and retain the rollback
+readback.
+
 ## Prevent duplicate work
 
 Use one candidate branch name for one candidate. The preparation script refuses a reused
