@@ -1181,6 +1181,7 @@ defmodule Tightbeam.Credentials do
     try do
       case System.cmd("codex", ["login", "--device-auth"],
              env: [{"CODEX_HOME", temporary}],
+             cd: temporary,
              stderr_to_stdout: true
            ) do
         {_output, 0} ->

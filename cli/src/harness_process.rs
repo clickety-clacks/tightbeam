@@ -12,13 +12,13 @@ use std::process::Command;
 
 pub fn session_exec(args: &[String]) -> Result<i32, String> {
     let separator = args.iter().position(|arg| arg == "--").ok_or_else(|| {
-        "usage: tightbeam harness-exec <identity-path> <launch-id> -- <command> [args...]"
+        "usage: tightbeam harness-exec <identity-path> <launch-id> <cwd> -- <command> [args...]"
             .to_string()
     })?;
 
-    if separator != 2 || args.len() <= separator + 1 {
+    if separator != 3 || args.len() <= separator + 1 {
         return Err(
-            "usage: tightbeam harness-exec <identity-path> <launch-id> -- <command> [args...]"
+            "usage: tightbeam harness-exec <identity-path> <launch-id> <cwd> -- <command> [args...]"
                 .into(),
         );
     }
@@ -66,6 +66,7 @@ pub fn session_exec(args: &[String]) -> Result<i32, String> {
 
     let boot_identity = boot_identity()?;
     let launch_id = &args[1];
+    let cwd = &args[2];
 
     writeln!(identity, "{pid}\t{pgid}\t{boot_identity}\t{launch_id}")
         .and_then(|_| identity.sync_all())
@@ -73,6 +74,7 @@ pub fn session_exec(args: &[String]) -> Result<i32, String> {
 
     let error = Command::new(&args[separator + 1])
         .args(&args[separator + 2..])
+        .current_dir(cwd)
         .exec();
 
     Err(format!("harness command could not be executed: {error}"))
@@ -305,6 +307,7 @@ mod tests {
         let result = session_exec(&[
             path.to_string_lossy().into_owned(),
             "launch".into(),
+            std::env::temp_dir().to_string_lossy().into_owned(),
             "--".into(),
             "unused".into(),
         ]);
@@ -327,6 +330,7 @@ mod tests {
         let result = session_exec(&[
             path.to_string_lossy().into_owned(),
             "launch".into(),
+            std::env::temp_dir().to_string_lossy().into_owned(),
             "--".into(),
             "unused".into(),
         ]);
@@ -338,5 +342,28 @@ mod tests {
         assert_eq!(fs::read_to_string(&target).unwrap(), "target identity");
         fs::remove_file(path).unwrap();
         fs::remove_file(target).unwrap();
+    }
+
+    #[test]
+    fn session_exec_starts_the_harness_in_the_supplied_cwd() {
+        let cwd = test_path("cwd");
+        let identity = test_path("cwd-identity");
+        fs::create_dir(&cwd).unwrap();
+
+        let result = session_exec(&[
+            identity.to_string_lossy().into_owned(),
+            "launch".into(),
+            cwd.to_string_lossy().into_owned(),
+            "--".into(),
+            "/bin/sh".into(),
+            "-c".into(),
+            "test \"$PWD\" = \"$1\"".into(),
+            "tightbeam-harness-cwd".into(),
+            cwd.to_string_lossy().into_owned(),
+        ]);
+
+        assert_eq!(result, Ok(0));
+        fs::remove_file(identity).unwrap();
+        fs::remove_dir(cwd).unwrap();
     }
 }

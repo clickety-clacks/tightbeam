@@ -74,16 +74,21 @@ defmodule Tightbeam.Acp.Conn do
     cmd = Keyword.fetch!(opts, :cmd)
     stderr = Keyword.get(opts, :stderr_path, "/dev/null")
     env = Keyword.get(opts, :env, [])
+    cwd = Keyword.get(opts, :cwd)
 
     shell_cmd = Enum.map_join(cmd, " ", &shell_escape/1) <> " 2>>" <> shell_escape(stderr)
 
+    port_opts = [
+      :binary,
+      :exit_status,
+      {:args, ["-c", "exec " <> shell_cmd]},
+      {:env, Enum.map(env, fn {k, v} -> {String.to_charlist(k), String.to_charlist(v)} end)}
+    ]
+
+    port_opts = if cwd, do: [{:cd, String.to_charlist(cwd)} | port_opts], else: port_opts
+
     port =
-      Port.open({:spawn_executable, System.find_executable("sh")}, [
-        :binary,
-        :exit_status,
-        {:args, ["-c", "exec " <> shell_cmd]},
-        {:env, Enum.map(env, fn {k, v} -> {String.to_charlist(k), String.to_charlist(v)} end)}
-      ])
+      Port.open({:spawn_executable, System.find_executable("sh")}, port_opts)
 
     {:ok, %__MODULE__{port: port, subscriber: Keyword.get(opts, :subscriber)}}
   end

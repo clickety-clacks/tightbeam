@@ -16,6 +16,7 @@ defmodule Tightbeam.Acp.ConnTest do
     if (!line.trim()) return;
     const m = JSON.parse(line);
     if (m.method === "initialize") send({ id: m.id, result: { protocolVersion: 1 } });
+    else if (m.method === "cwd") send({ id: m.id, result: { cwd: process.cwd() } });
     else if (m.method === "echo") send({ id: m.id, result: m.params });
     else if (m.method === "fail") send({ id: m.id, error: { code: -32000, message: "nope" } });
     else if (m.method === "never") { neverId = m.id; }
@@ -33,13 +34,26 @@ defmodule Tightbeam.Acp.ConnTest do
   });
   """
 
-  defp start_conn(ctx_name) do
+  defp start_conn(ctx_name, opts \\ []) do
     script_path = Path.join(System.tmp_dir!(), "fake_adapter_#{ctx_name}.js")
     File.write!(script_path, @fake)
 
     start_supervised!(
-      {Conn, cmd: [System.find_executable("node"), script_path], subscriber: self()}
+      {Conn,
+       Keyword.merge(
+         [cmd: [System.find_executable("node"), script_path], subscriber: self()],
+         opts
+       )}
     )
+  end
+
+  test "the adapter process starts in its owned cwd" do
+    cwd = Path.join(System.tmp_dir!(), "acp-conn-cwd-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(cwd)
+    on_exit(fn -> File.rm_rf!(cwd) end)
+
+    conn = start_conn("cwd", cwd: cwd)
+    assert {:ok, %{"cwd" => ^cwd}} = Conn.request(conn, "cwd", %{})
   end
 
   test "request/response over ndjson; errors surface as tuples" do

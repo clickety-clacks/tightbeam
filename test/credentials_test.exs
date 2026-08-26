@@ -1650,3 +1650,52 @@ defmodule Tightbeam.CredentialsTest do
     System.cmd("sh", ["-c", remote_command], stderr_to_stdout: true)
   end
 end
+
+defmodule Tightbeam.CredentialsCwdTest do
+  use Tightbeam.TestCase, async: false
+
+  alias Tightbeam.Credentials
+
+  test "default OpenAI onboarding uses its temporary CODEX_HOME as cwd" do
+    root =
+      Path.join(System.tmp_dir!(), "tb-credentials-cwd-#{System.unique_integer([:positive])}")
+
+    base = Path.join(root, "base")
+    bin = Path.join(root, "bin")
+    codex = Path.join(bin, "codex")
+    previous_path = System.get_env("PATH")
+    File.mkdir_p!(bin)
+
+    File.write!(
+      codex,
+      ~S"""
+      #!/bin/sh
+      printf '{"cwd":"%s"}' "$PWD" > "$CODEX_HOME/auth.json"
+      """
+    )
+
+    File.chmod!(codex, 0o755)
+    System.put_env("PATH", bin)
+
+    on_exit(fn ->
+      if previous_path,
+        do: System.put_env("PATH", previous_path),
+        else: System.delete_env("PATH")
+
+      File.rm_rf!(root)
+    end)
+
+    {:ok, server} = Credentials.start_link(name: nil, base_dir: base, machine: "testhost")
+    assert :ok = Credentials.onboard(:openai, server)
+
+    cwd =
+      [base, "auth", "codex", "auth.json"]
+      |> Path.join()
+      |> File.read!()
+      |> JSON.decode!()
+      |> Map.fetch!("cwd")
+
+    assert Path.dirname(cwd) == System.tmp_dir!()
+    assert Path.basename(cwd) =~ ~r/^tightbeam-codex-onboard-/
+  end
+end

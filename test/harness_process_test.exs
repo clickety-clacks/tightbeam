@@ -201,6 +201,7 @@ defmodule Tightbeam.HarnessProcessTest do
              "harness-exec",
              identity_path,
              launch_id,
+             "/srv/tightbeam",
              "--",
              "env",
              "A=B",
@@ -1135,7 +1136,7 @@ defmodule Tightbeam.HarnessProcessTest do
 
     File.write!(
       helper,
-      "#!/bin/sh\nexec \"#{@helper}\" harness-exec \"#{identity_path}\" \"#{launch_id}\" -- sh -c '#{command}'\n"
+      "#!/bin/sh\nexec \"#{@helper}\" harness-exec \"#{identity_path}\" \"#{launch_id}\" \"#{ctx.test_dir}\" -- sh -c '#{command}'\n"
     )
 
     File.chmod!(helper, 0o755)

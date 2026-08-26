@@ -359,6 +359,7 @@ defmodule Tightbeam.Acp.Adapter do
     {:ok, conn} =
       Conn.start_link(
         cmd: Keyword.fetch!(opts, :cmd),
+        cwd: Keyword.fetch!(opts, :cwd),
         env: Keyword.get(opts, :env, []),
         stderr_path: stderr_path,
         subscriber: self()

@@ -238,9 +238,11 @@ defmodule Tightbeam.Application do
   end
 
   defp production_config do
+    base_dir = Application.get_env(:tightbeam, :base_dir, default_base_dir())
+
     %{
-      base_dir: Application.get_env(:tightbeam, :base_dir, default_base_dir()),
-      cwd: Application.get_env(:tightbeam, :cwd, File.cwd!()),
+      base_dir: base_dir,
+      cwd: Application.get_env(:tightbeam, :cwd, base_dir),
       # 11373: the Expanse's 1373 colonized worlds, plus one for Earth (Flynn's
       # port, agreed at project start). The code defaulted to 4321 long after the
       # convention settled, so a bare `tightbeam-gateway` boot landed on a port no

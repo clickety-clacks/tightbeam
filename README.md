@@ -490,6 +490,9 @@ sessions, and work.
 `/Library/LaunchDaemons/com.tightbeam.gateway.plist`, owned `root:wheel` mode
 `644`, loaded with `sudo launchctl bootstrap system <path>`.
 
+Create the owned working directory before loading the service: `mkdir -p
+/Users/you/.tightbeam`.
+
 Use a **LaunchDaemon**, not a LaunchAgent. A LaunchAgent is per-user and starts at
 *login*, so it dies at logout and does not exist until someone signs in — it cannot
 meet the requirements above. `UserName` keeps the process off root.
@@ -507,7 +510,7 @@ meet the requirements above. `UserName` keeps the process off root.
     <!-- npm decides where -g bins land; ask it: `command -v tightbeam-gateway` -->
     <string>/Users/you/.local/bin/tightbeam-gateway</string>
   </array>
-  <key>WorkingDirectory</key><string>/Users/you</string>
+  <key>WorkingDirectory</key><string>/Users/you/.tightbeam</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>TIGHTBEAM_LOCAL_HOST_NAME</key><string>gibson</string>
@@ -536,6 +539,9 @@ Verify: `sudo launchctl print system/com.tightbeam.gateway`.
 `/etc/systemd/system/tightbeam.service`, enabled with
 `sudo systemctl enable --now tightbeam`.
 
+Create the owned working directory before enabling the service: `mkdir -p
+/home/you/.tightbeam`.
+
 Use a **system** unit. A user unit stops at logout unless you also enable
 lingering, and it will not start until that user's manager does — `WantedBy=
 multi-user.target` starts at boot with no login at all.
@@ -550,7 +556,7 @@ Wants=network-online.target
 Type=exec
 User=you
 Group=you
-WorkingDirectory=/home/you
+WorkingDirectory=/home/you/.tightbeam
 # npm decides where -g bins land; use the output of: command -v tightbeam-gateway
 ExecStart=/home/you/.local/bin/tightbeam-gateway
 Environment=TIGHTBEAM_LOCAL_HOST_NAME=gibson

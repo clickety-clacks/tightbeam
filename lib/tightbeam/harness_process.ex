@@ -169,7 +169,14 @@ defmodule Tightbeam.HarnessProcess do
     opts
     |> Keyword.put(
       :cmd,
-      wrap_command(Keyword.fetch!(opts, :cmd), ssh, helper_path, identity_path, launch_id)
+      wrap_command(
+        Keyword.fetch!(opts, :cmd),
+        ssh,
+        helper_path,
+        identity_path,
+        launch_id,
+        root
+      )
     )
     |> Keyword.put(:harness_process_launch_id, launch_id)
   end
@@ -659,11 +666,18 @@ defmodule Tightbeam.HarnessProcess do
     ]
   end
 
-  defp wrap_command(cmd, nil, helper_path, identity_path, launch_id) do
-    [helper_path, "harness-exec", identity_path, launch_id, "--" | cmd]
+  defp wrap_command(cmd, nil, helper_path, identity_path, launch_id, cwd) do
+    [helper_path, "harness-exec", identity_path, launch_id, cwd, "--" | cmd]
   end
 
-  defp wrap_command(["ssh" | rest], destination, helper_path, identity_path, launch_id) do
+  defp wrap_command(
+         ["ssh" | rest],
+         destination,
+         helper_path,
+         identity_path,
+         launch_id,
+         cwd
+       ) do
     {prefix, remote} = Enum.split_while(rest, &(&1 != destination))
 
     case remote do
@@ -678,6 +692,7 @@ defmodule Tightbeam.HarnessProcess do
             "harness-exec",
             identity_path,
             launch_id,
+            cwd,
             "--"
             | remote_cmd
           ]

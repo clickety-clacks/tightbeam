@@ -50,6 +50,16 @@ defmodule Tightbeam.ApplicationDefaultsTest do
 
   defp config(base), do: %{base_dir: base, default_harness: nil, default_model: nil}
 
+  test "production child launches default to the resolved base directory" do
+    source = File.read!(Path.expand("../lib/tightbeam/application.ex", __DIR__))
+
+    assert source =~
+             "base_dir = Application.get_env(:tightbeam, :base_dir, default_base_dir())"
+
+    assert source =~ "cwd: Application.get_env(:tightbeam, :cwd, base_dir)"
+    refute source =~ "cwd: Application.get_env(:tightbeam, :cwd, File.cwd!())"
+  end
+
   test "both CLIs installed but ONLY codex onboarded -> defaults to codex, not sonnet", %{
     base: base
   } do
