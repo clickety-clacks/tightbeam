@@ -1437,6 +1437,28 @@ defmodule Tightbeam.GatewayTest do
         params: %{}
       })
 
+    assert inspect.harnessHealth != %{}
+
+    Enum.each(inspect.harnessHealth, fn {host, harnesses} ->
+      Enum.each(harnesses, fn {harness, report} ->
+        assert report.host == host
+        assert report.harness == harness
+
+        assert Map.keys(report) |> Enum.sort() ==
+                 [
+                   :catalogHealth,
+                   :credentialHealth,
+                   :failureReason,
+                   :harness,
+                   :host,
+                   :modelCount,
+                   :provider,
+                   :remediation
+                 ]
+                 |> Enum.sort()
+      end)
+    end)
+
     assert %{created_at: created_at} =
              Enum.find(inspect.sessions, &(&1.session_key == session.session_key))
 

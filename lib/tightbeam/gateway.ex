@@ -73,6 +73,7 @@ defmodule Tightbeam.Gateway do
     Escalation,
     EventLog,
     Harness,
+    HarnessHealth,
     Homes,
     Identity,
     IdPrefix,
@@ -1639,6 +1640,7 @@ defmodule Tightbeam.Gateway do
     %{
       harnesses: Enum.map(Harness.all(), & &1.wire_name()),
       models: picker_models(base_dir, Tightbeam.DB),
+      harnessHealth: picker_health(base_dir, Tightbeam.DB),
       hosts: base_dir |> Placement.hosts() |> Map.keys() |> Enum.sort(),
       archetypes:
         Enum.map(Archetypes.names(), fn name ->
@@ -1677,6 +1679,19 @@ defmodule Tightbeam.Gateway do
               capabilities: entry.capabilities
             })
           end)}
+       end)}
+    end)
+  end
+
+  defp picker_health(base_dir, db) do
+    base_dir
+    |> Placement.hosts(db)
+    |> Map.keys()
+    |> Map.new(fn host ->
+      {host,
+       Map.new(Harness.all(), fn module ->
+         harness = module.wire_name()
+         {harness, HarnessHealth.report(host, harness)}
        end)}
     end)
   end
@@ -3734,7 +3749,7 @@ defmodule Tightbeam.Gateway do
        when provider in [:openai, :anthropic] do
     case schedule_oauth_recovery_wake(config, caller, provider, machine) do
       :ok ->
-        onboarded_result(provider, :subscription)
+        onboarded_result(provider, :subscription, machine)
 
       {:error, reason} ->
         %{
@@ -3750,16 +3765,33 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp finish_onboard_result(_config, _caller, provider, _machine, :subscription),
-    do: onboarded_result(provider, :subscription)
+  defp finish_onboard_result(_config, _caller, provider, machine, :subscription),
+    do: onboarded_result(provider, :subscription, machine)
 
-  defp finish_onboard_result(_config, _caller, provider, _machine, :api_key),
-    do: onboarded_result(provider, :api_key)
+  defp finish_onboard_result(_config, _caller, provider, machine, :api_key),
+    do: onboarded_result(provider, :api_key, machine)
 
   # The result the CLI prints names the kind that was banked in the wire
   # vocabulary. `wire_credential_kind/1` is the single translation boundary.
-  defp onboarded_result(provider, kind),
-    do: %{provider: provider, credential_kind: wire_credential_kind(kind), status: "onboarded"}
+  defp onboarded_result(provider, kind, machine) do
+    health =
+      Harness.all()
+      |> Enum.filter(&(&1.credential_provider() == provider))
+      |> Map.new(fn module ->
+        harness = module.wire_name()
+
+        {harness,
+         HarnessHealth.report(machine, harness, ModelCatalog, credential_status: :onboarded)}
+      end)
+
+    %{
+      provider: provider,
+      host: machine,
+      credential_kind: wire_credential_kind(kind),
+      status: "onboarded",
+      harnessHealth: health
+    }
+  end
 
   # OAuth recovery is one neutral event instruction to the authenticated
   # operator's native Main. Main, not the credential substrate, reads Kung Fu
@@ -4193,7 +4225,8 @@ defmodule Tightbeam.Gateway do
             end),
           hosts:
             config.base_dir |> Placement.hosts(gateway_db(config)) |> Map.keys() |> Enum.sort(),
-          models: picker_models(config.base_dir, gateway_db(config))
+          models: picker_models(config.base_dir, gateway_db(config)),
+          harnessHealth: picker_health(config.base_dir, gateway_db(config))
         }
 
         result = %{
@@ -4203,7 +4236,8 @@ defmodule Tightbeam.Gateway do
           roles: role_list_result(db).roles,
           archetypes: org_shape.archetypes,
           hosts: org_shape.hosts,
-          models: org_shape.models
+          models: org_shape.models,
+          harnessHealth: org_shape.harnessHealth
         }
 
         if admin_origin?(db, call.origin) do

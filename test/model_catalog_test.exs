@@ -662,6 +662,29 @@ defmodule Tightbeam.ModelCatalogTest do
     assert message =~ "etimedout"
   end
 
+  test "a successfully derived empty inventory remains fresh capability data", ctx do
+    catalog = start_catalog(ctx)
+    await_fresh(catalog, "claude")
+
+    :sys.replace_state(catalog, fn state ->
+      now = state.now.()
+
+      put_in(state.entries[{@host, "claude"}], %{
+        entries: [],
+        derived_at: now,
+        attempted_at: now,
+        reason: nil,
+        refreshing: false,
+        recheck: false
+      })
+    end)
+
+    assert ModelCatalog.get(@host, "claude", catalog) == {[], :fresh}
+
+    assert {:error, %Unroutable{cause: :family_absent, health: [{"claude", :fresh}]}} =
+             ModelCatalog.route(@host, "claude", Model.new("not-offered"), catalog)
+  end
+
   test "an api-key 401 is never treated as a rotation and never harvested", ctx do
     store = Path.join([ctx.base_dir, "auth", "claude", ".credentials.json"])
     File.write!(store, "sk-ant-api03-STALE")

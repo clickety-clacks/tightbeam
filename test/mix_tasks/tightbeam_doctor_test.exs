@@ -42,6 +42,30 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
   test "all bootstrap checks pass with hermetic inputs", ctx do
     assert {0, %{ready: true, checks: checks}} = Doctor.evaluate(ctx.catalog, ctx.inputs)
     assert Enum.all?(checks, & &1.ok)
+
+    auth = find(%{checks: checks}, "harness_auth:claude")
+    assert auth.host == "local-test"
+    assert auth.harness == "claude"
+    assert auth.credentialHealth == "healthy"
+    assert auth.catalogHealth == "healthy"
+    assert auth.failureReason == nil
+    assert auth.remediation == ""
+  end
+
+  test "a fresh empty inventory is healthy capability data, not an onboarding failure", ctx do
+    catalog = {:ok, %{"claude" => [], "codex" => [], "fixture" => []}}
+    {status, report} = Doctor.evaluate(catalog, ctx.inputs)
+
+    auth = find(report, "harness_auth:claude")
+    assert auth.ok
+    assert auth.credentialHealth == "healthy"
+    assert auth.catalogHealth == "healthyEmpty"
+    assert auth.detail =~ "healthy empty capability catalog"
+    refute auth.fix =~ "onboard"
+
+    assert status == 1
+    refute report.ready
+    refute find(report, "default_model").ok
   end
 
   # The ENTRY decides whether an effort is required. Rejecting `nil` out of hand

@@ -271,34 +271,77 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
 
   defp harness_auth_inventory_check(inventories, degraded, harness, base_dir, host) do
     entries = Map.get(inventories, harness, [])
-    ok = entries != []
-
-    reason = Map.get(degraded, harness, :empty_inventory)
+    reason = Map.get(degraded, harness)
+    ok = entries != [] or is_nil(reason)
 
     auth_check(harness, ok, reason, length(entries), base_dir, host)
   end
 
   defp auth_check(harness, ok, reason, live_refs, base_dir, host) do
-    cond do
-      ok ->
-        check("harness_auth:#{harness}", true, "#{harness} fetched #{live_refs} live refs", "")
+    result =
+      cond do
+        ok and live_refs == 0 ->
+          check(
+            "harness_auth:#{harness}",
+            true,
+            "#{harness} on #{host} returned a healthy empty capability catalog",
+            ""
+          )
 
-      unverifiable_credential?(reason) ->
-        unverifiable(
-          "harness_auth:#{harness}",
-          auth_detail(harness, reason, base_dir, host),
-          auth_fix(harness, reason, host)
-        )
+        ok ->
+          check(
+            "harness_auth:#{harness}",
+            true,
+            "#{harness} on #{host} fetched #{live_refs} live refs",
+            ""
+          )
 
-      true ->
-        check(
-          "harness_auth:#{harness}",
-          false,
-          auth_detail(harness, reason, base_dir, host),
-          auth_fix(harness, reason, host)
-        )
-    end
+        unverifiable_credential?(reason) ->
+          unverifiable(
+            "harness_auth:#{harness}",
+            auth_detail(harness, reason, base_dir, host),
+            auth_fix(harness, reason, host)
+          )
+
+        true ->
+          check(
+            "harness_auth:#{harness}",
+            false,
+            auth_detail(harness, reason, base_dir, host),
+            auth_fix(harness, reason, host)
+          )
+      end
+
+    Map.merge(result, %{
+      host: host,
+      harness: harness,
+      credentialHealth: credential_health(ok, reason),
+      catalogHealth: catalog_health(ok, live_refs, reason),
+      failureReason: doctor_reason(reason),
+      remediation: result.fix
+    })
   end
+
+  defp credential_health(true, _reason), do: "healthy"
+
+  defp credential_health(false, reason) do
+    if needs_onboarding_reason?(reason), do: "needsOnboarding", else: "unknown"
+  end
+
+  defp needs_onboarding_reason?({:unavailable, reason}), do: needs_onboarding_reason?(reason)
+  defp needs_onboarding_reason?({:needs_onboarding, _reason}), do: true
+  defp needs_onboarding_reason?(_reason), do: false
+
+  defp catalog_health(true, 0, nil), do: "healthyEmpty"
+  defp catalog_health(true, _count, nil), do: "healthy"
+  defp catalog_health(_ok, _count, _reason), do: "degraded"
+
+  defp doctor_reason(nil), do: nil
+  defp doctor_reason({:unavailable, reason}), do: doctor_reason(reason)
+  defp doctor_reason({:needs_onboarding, reason}), do: doctor_reason(reason)
+  defp doctor_reason({:http_status, status, _body}), do: "http_status_#{status}"
+  defp doctor_reason(reason) when is_atom(reason), do: Atom.to_string(reason)
+  defp doctor_reason(_reason), do: "catalog_error"
 
   # `credential_server_unavailable` is NOT a credential fault — it is this task
   # being unable to look. The Credentials server does not run inside a bare mix

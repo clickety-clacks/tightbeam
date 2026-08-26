@@ -448,12 +448,17 @@ defmodule Tightbeam.CredentialKindsTest do
 
       File.write!(Path.join(staging, ".credentials.json"), "sk-ant-api03-ceremony")
 
-      assert %{provider: :anthropic, credential_kind: "apiKey", status: "onboarded"} =
-               onboard.(
-                 call
-                 |> put_in([:params, :phase], "finish")
-                 |> put_in([:params, :lease_id], lease_id)
-               )
+      result =
+        onboard.(
+          call
+          |> put_in([:params, :phase], "finish")
+          |> put_in([:params, :lease_id], lease_id)
+        )
+
+      assert %{provider: :anthropic, credential_kind: "apiKey", status: "onboarded"} = result
+      assert result.host == "testhost"
+      assert result.harnessHealth["claude"].credentialHealth == "healthy"
+      assert result.harnessHealth["claude"].catalogHealth in ["healthy", "pending", "unavailable"]
 
       # The wire translation did not leak into the store, whose spelling is its
       # own (invariant: one authority per vocabulary).

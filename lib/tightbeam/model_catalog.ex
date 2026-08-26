@@ -168,7 +168,7 @@ defmodule Tightbeam.ModelCatalog do
     end
 
     cond do
-      entries == [] or match?({:unavailable, _reason}, health) ->
+      match?({:unavailable, _reason}, health) ->
         refuse.(:no_catalog, [])
 
       is_nil(entry) ->
@@ -619,8 +619,12 @@ defmodule Tightbeam.ModelCatalog do
     end
   end
 
+  defp health(%{entries: [], reason: nil, derived_at: derived_at}, now, ttl)
+       when not is_nil(derived_at),
+       do: if(now - derived_at < ttl, do: :fresh, else: :stale)
+
   defp health(%{entries: []} = cache, _now, _ttl),
-    do: {:unavailable, cache.reason || :empty_inventory}
+    do: {:unavailable, cache.reason || :not_derived}
 
   defp health(cache, now, ttl) do
     if now - cache.derived_at < ttl, do: :fresh, else: :stale
