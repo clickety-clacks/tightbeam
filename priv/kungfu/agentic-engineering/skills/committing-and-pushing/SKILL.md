@@ -44,6 +44,13 @@ Merging is a semantic integration problem, not a text-selection problem.
    is an ancestor of the reconciled branch
    (`git merge-base --is-ancestor main <branch>`), then advance main from the
    branch — fast-forward, because the reconciliation already happened on the
-   branch.
-6. When main moved during reconciliation, merge it in again and re-prove before
+   branch. Push Tightbeam main only to the explicit canonical URL:
+   `git push git@github.com:clickety-clacks/tightbeam.git <branch>:main`. Never
+   rely on a named remote such as `origin` for this push.
+6. After any claimed push to Tightbeam main, the orchestrator independently runs
+   `git ls-remote git@github.com:clickety-clacks/tightbeam.git refs/heads/main`
+   and requires the returned SHA to equal the expected integrated commit before
+   reporting success. The push exit status, a local remote-tracking ref, or the
+   pusher's report does not satisfy this check.
+7. When main moved during reconciliation, merge it in again and re-prove before
    advancing.
