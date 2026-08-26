@@ -6,17 +6,22 @@ defmodule Tightbeam.DevicesTest do
   setup do
     name = :"db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: name})
-    :ok = Devices.ensure_schema(name)
+    :ok = Tightbeam.Schema.ensure_all(name)
     %{db: name}
   end
 
   defp pair(db, device_id, claimed_name) do
-    Devices.pair(db, %{
+    input = %{
       device_id: device_id,
       claimed_name: claimed_name,
       platform: nil,
       model: nil
-    })
+    }
+
+    case DB.query(db, "SELECT COUNT(*) FROM users") do
+      {:ok, [[0]]} -> claim_org(db, input)
+      {:ok, [[_count]]} -> Devices.pair(db, input)
+    end
   end
 
   test "first user bootstraps as admin and re-pair rotates the token", %{db: db} do

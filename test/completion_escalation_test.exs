@@ -13,7 +13,7 @@ defmodule Tightbeam.CompletionEscalationTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId,isAdmin,createdAt) VALUES ('owner',0,1),('other',0,1),('admin',1,1)"
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('owner',0,'admin_add',1),('other',0,'admin_add',1),('admin',1,'admin_add',1)"
       )
 
     main = ensure_main_session(db, "owner")

@@ -953,7 +953,12 @@ defmodule Tightbeam.AdapterCoordinatorTest do
   end
 
   defp seed_session!(db) do
-    :ok = DB.execute(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn',0,1)")
+    :ok =
+      DB.execute(
+        db,
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 0, 'admin_add', 1)"
+      )
+
     session_key = "agent:main:clawline:flynn:main"
 
     Tightbeam.Org.create(db, %{

@@ -21,7 +21,10 @@ defmodule Tightbeam.RulesTest do
 
     :ok = Tightbeam.Schema.ensure_all(db)
 
-    Enum.each(~w(flynn mike other reviewer), &ensure_main_session(db, &1))
+    {:paired, _device} =
+      claim_org(db, %{device_id: "rules-device", claimed_name: "flynn", platform: nil, model: nil})
+
+    Enum.each(~w(mike other reviewer), &ensure_main_session(db, &1))
 
     base_dir =
       Path.join(System.tmp_dir!(), "tightbeam-rules-#{System.unique_integer([:positive])}")
@@ -336,9 +339,6 @@ defmodule Tightbeam.RulesTest do
 
   test "caller facts cover origin, admin, multi-role, unbound, retired, and malformed cases",
        ctx do
-    {:paired, _} =
-      Devices.pair(ctx.db, %{device_id: "d1", claimed_name: "Flynn", platform: nil, model: nil})
-
     {:pending, _} =
       Devices.pair(ctx.db, %{device_id: "d2", claimed_name: "Mike", platform: nil, model: nil})
 
@@ -397,7 +397,7 @@ defmodule Tightbeam.RulesTest do
     :ok =
       DB.execute(
         ctx.db,
-        "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('fact_flynn',0,1),('fact_kay',0,1),('fact_root',1,1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('fact_flynn', 0, 'admin_add', 1),('fact_kay', 0, 'admin_add', 1),('fact_root', 1, 'admin_add', 1)"
       )
 
     for {id, owner} <- [
@@ -544,8 +544,8 @@ defmodule Tightbeam.RulesTest do
     assert {:error, %{code: "rule_denied", message: "stop: denied"}} =
              Dispatch.dispatch(ctx.db, %{"post" => fn _ -> flunk("handler ran") end}, call())
 
-    assert [%{kind: "denied", verb: "post"}] = EventLog.events_after(ctx.db, 0, 10)
-    {:ok, [[payload]]} = DB.query(ctx.db, "SELECT payload FROM events")
+    assert [%{kind: "denied", verb: "post"}] = events_after_claim(ctx.db)
+    {:ok, [[payload]]} = DB.query(ctx.db, "SELECT payload FROM events WHERE kind='denied'")
     assert payload =~ "rule_denied"
     assert payload =~ "stop"
   end
@@ -565,7 +565,7 @@ defmodule Tightbeam.RulesTest do
              Dispatch.dispatch(ctx.db, %{"post" => fn _ -> %{code: "constitutional"} end}, call())
 
     assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM domain")
-    assert Enum.map(EventLog.events_after(ctx.db, 0, 10), & &1.kind) == ["verb", "denied"]
+    assert Enum.map(events_after_claim(ctx.db), & &1.kind) == ["verb", "denied"]
   end
 
   test "zero rules lets completion close with null verdict filer fields and one verb event",
@@ -587,7 +587,7 @@ defmodule Tightbeam.RulesTest do
               attest: %{kind: "completion", verdictKind: nil, byUser: nil}
             }} = Dispatch.dispatch(ctx.db, ctx.handlers, completion)
 
-    assert [%{kind: "verb", verb: "attest"}] = EventLog.events_after(ctx.db, 0, 10)
+    assert [%{kind: "verb", verb: "attest"}] = events_after_claim(ctx.db)
   end
 
   test "matching a constitutional denial is monotonic and leaves domain state unchanged", ctx do
@@ -935,9 +935,6 @@ defmodule Tightbeam.RulesTest do
   end
 
   test "restored independent verdict fact accepts the prior linked-review shape", ctx do
-    {:ok, _} =
-      DB.query(ctx.db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1)")
-
     holder = session(ctx.db, "producer", "flynn", archetype: "coder")
     reviewer = session(ctx.db, "reviewer", "other", harness: "claude", provider: "anthropic")
     producer = assignment(ctx, holder.session_key, {:user, "flynn"})
@@ -966,9 +963,6 @@ defmodule Tightbeam.RulesTest do
   end
 
   test "qualifying review ignores harness/provider", ctx do
-    {:ok, _} =
-      DB.query(ctx.db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1)")
-
     holder = session(ctx.db, "producer", "flynn", archetype: "coder")
     reviewer = session(ctx.db, "reviewer", "other", harness: "claude", provider: "anthropic")
     third = session(ctx.db, "third", "other", harness: "codex", provider: "openai")
@@ -1164,7 +1158,7 @@ defmodule Tightbeam.RulesTest do
     {:ok, _} =
       DB.query(
         ctx.db,
-        "INSERT OR IGNORE INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1)"
+        "INSERT OR IGNORE INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 0, 'admin_add', 1)"
       )
 
     put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
@@ -1477,6 +1471,12 @@ defmodule Tightbeam.RulesTest do
   defp toml(value) when is_boolean(value) or is_integer(value), do: to_string(value)
   defp toml(value) when is_list(value), do: "[" <> Enum.map_join(value, ", ", &toml/1) <> "]"
 
+  defp events_after_claim(db) do
+    db
+    |> EventLog.events_after(0, 10)
+    |> Enum.reject(&(&1.verb == "cold-start"))
+  end
+
   defp session(db, key, owner, opts \\ []) do
     Org.create(db, %{
       session_key: key,
@@ -1497,7 +1497,7 @@ defmodule Tightbeam.RulesTest do
       {:ok, _} =
         DB.query(
           db,
-          "INSERT OR IGNORE INTO users (userId, isAdmin, createdAt) VALUES (?1, 0, 1)",
+          "INSERT OR IGNORE INTO users (userId, isAdmin, creationKind, createdAt) VALUES (?1, 0, 'admin_add', 1)",
           [user]
         )
     end)

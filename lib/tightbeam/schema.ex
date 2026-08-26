@@ -18,6 +18,7 @@ defmodule Tightbeam.Schema do
     Tightbeam.Wakes,
     Tightbeam.Projection,
     Tightbeam.Org,
+    Tightbeam.ColdStart,
     Tightbeam.CriticalLeases,
     Tightbeam.Roles,
     Tightbeam.ReadMarkers,
@@ -73,8 +74,12 @@ defmodule Tightbeam.Schema do
   # Completion escalation adds the immutable assignment report-to declaration,
   # completion-owned tables, and the `completion_transition` cancellation
   # classification. SQLite cannot widen those existing shapes in place. The
-  # reviewed R17 boundary therefore recreates from the exact v5 predecessor.
-  @shape "coordination-fabric-v1-phase1-v6"
+  # reviewed R17 boundary therefore refuses the exact v6 predecessor and
+  # recreates at v7. The older named migration helpers remain explicit test
+  # seams; boot does not invoke either one.
+  @shape "coordination-fabric-v1-phase1-v7"
+  @cold_start_shape "coordination-fabric-v1-phase1-v6"
+  @cold_start_previous_shape "coordination-fabric-v1-phase1-v5"
   @operational_parent_shape "coordination-fabric-v1-phase1-v5"
   @operational_parent_previous_shape "coordination-fabric-v1-phase1-v4"
 
@@ -794,6 +799,8 @@ defmodule Tightbeam.Schema do
       :ok = module.ensure_schema(db)
     end)
 
+    :ok = Tightbeam.ColdStart.validate!(db)
+
     activated_at = System.system_time(:millisecond)
 
     case DB.transaction(db, fn txn ->
@@ -854,6 +861,174 @@ defmodule Tightbeam.Schema do
           message:
             "incompatible_operational_parent_v1: upgrade failed: #{Exception.message(error)}"
     end
+  end
+
+  @doc false
+  @spec upgrade_cold_start_v1(DB.server(), keyword()) :: :ok
+  def upgrade_cold_start_v1(db, opts \\ []) when is_list(opts) do
+    migration_time = System.system_time(:millisecond)
+
+    case DB.foreign_key_rebuild(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@cold_start_previous_shape]] ->
+               :ok
+
+             rows ->
+               incompatible_cold_start!("legacy_witness_missing", "predecessor #{inspect(rows)}")
+           end
+
+           ensure_no_migration_objects!(txn)
+
+           :ok =
+             Txn.exec(
+               txn,
+               """
+               CREATE TABLE users_cold_start_v1 (
+                 userId       TEXT PRIMARY KEY,
+                 isAdmin      INTEGER NOT NULL DEFAULT 0,
+                 creationKind TEXT NOT NULL DEFAULT 'legacy' CHECK (creationKind IN (
+                   'cold_start','gateway_local_bootstrap','device_pair','admin_add','legacy'
+                 )),
+                 createdAt    INTEGER NOT NULL
+               )
+               """
+             )
+
+           Txn.q(
+             txn,
+             """
+             INSERT INTO users_cold_start_v1 (userId,isAdmin,creationKind,createdAt)
+             SELECT userId,isAdmin,'legacy',createdAt FROM users ORDER BY createdAt,userId
+             """
+           )
+
+           maybe_interrupt_cold_start_migration!(opts, :after_copy)
+           :ok = Txn.exec(txn, "DROP TABLE users")
+           maybe_interrupt_cold_start_migration!(opts, :after_drop)
+           :ok = Txn.exec(txn, "ALTER TABLE users_cold_start_v1 RENAME TO users")
+
+           :ok = Txn.exec(txn, Tightbeam.ColdStart.receipt_ddl())
+
+           :ok =
+             Txn.exec(
+               txn,
+               """
+               CREATE TRIGGER users_gateway_owned_insert
+               BEFORE INSERT ON users
+               WHEN NEW.creationKind = 'legacy'
+               BEGIN
+                 SELECT RAISE(ABORT, 'bootstrap_owned_by_gateway');
+               END
+               """
+             )
+
+           maybe_interrupt_cold_start_migration!(opts, :after_schema)
+
+           case Txn.q(txn, "SELECT COUNT(*) FROM users") do
+             [[0]] ->
+               :ok
+
+             [[_count]] ->
+               case legacy_witness(txn) do
+                 nil ->
+                   incompatible_cold_start!("legacy_witness_missing")
+
+                 %{user_id: user_id, device_id: device_id, root: root} ->
+                   Txn.q(
+                     txn,
+                     """
+                     INSERT INTO cold_start_receipts
+                       (id,userId,deviceId,rootSessionKey,cause,phase,principal,
+                        requestFingerprint,replaySecretHash,claimTokenHash,claimEventId,
+                        deviceEventId,createdAt,activatedAt)
+                     VALUES (1,?1,?2,?3,'v5_observed','complete','process:tightbeam',
+                             NULL,NULL,NULL,NULL,NULL,?4,?4)
+                     """,
+                     [user_id, device_id, root, migration_time]
+                   )
+               end
+           end
+
+           maybe_interrupt_cold_start_migration!(opts, :after_receipt)
+
+           Txn.q(
+             txn,
+             "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1",
+             [@cold_start_previous_shape, @cold_start_shape, migration_time]
+           )
+
+           if Txn.changes(txn) != 1, do: raise("cold-start stamp race")
+           maybe_interrupt_cold_start_migration!(opts, :after_stamp)
+
+           case Txn.q(txn, "PRAGMA foreign_key_check") do
+             [] -> :ok
+             rows -> incompatible_cold_start!("orphan_identity_row", inspect(rows))
+           end
+
+           case Tightbeam.ColdStart.classify_in_txn(txn) do
+             %{state: state} when state in ["open", "claimed"] -> :ok
+             %{invariant: invariant} -> incompatible_cold_start!(invariant)
+           end
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        _ = error
+
+        raise ShapeError,
+          message:
+            "incompatible_cold_start_v1: legacy_witness_missing; recovery: Recover an unusable fresh database"
+    end
+  end
+
+  defp legacy_witness(txn) do
+    Txn.q(
+      txn,
+      """
+      SELECT d.deviceId,d.userId,s.sessionKey
+      FROM devices d
+      JOIN users u ON u.userId=d.userId
+      JOIN sessions s ON s.ownerUserId=u.userId
+      WHERE d.status='allowlisted' AND d.token IS NOT NULL AND u.isAdmin=1
+        AND s.state='active' AND s.isBuiltIn=1 AND s.kind='main'
+        AND s.operationalParent=s.sessionKey
+      ORDER BY d.createdAt,d.deviceId,s.createdAt,s.sessionKey
+      """
+    )
+    |> Enum.find_value(fn [device_id, user_id, root] ->
+      if root == Tightbeam.Org.personal_session_key(user_id),
+        do: %{device_id: device_id, user_id: user_id, root: root}
+    end)
+  end
+
+  defp ensure_no_migration_objects!(txn) do
+    case Txn.q(
+           txn,
+           "SELECT name FROM sqlite_master WHERE name IN ('users_cold_start_v1','cold_start_receipts','users_gateway_owned_insert')"
+         ) do
+      [] ->
+        :ok
+
+      rows ->
+        incompatible_cold_start!("legacy_witness_missing", "migration objects #{inspect(rows)}")
+    end
+  end
+
+  defp maybe_interrupt_cold_start_migration!(opts, point) do
+    if Keyword.get(opts, :fail_at) == point, do: raise("forced cold-start migration interruption")
+    :ok
+  end
+
+  defp incompatible_cold_start!(invariant, detail \\ nil) do
+    _ = detail
+
+    raise ShapeError,
+      message:
+        "incompatible_cold_start_v1: #{invariant}; recovery: Recover an unusable fresh database"
   end
 
   @doc false

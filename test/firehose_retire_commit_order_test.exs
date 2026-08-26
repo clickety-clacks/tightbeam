@@ -15,7 +15,13 @@ defmodule Tightbeam.Firehose.RetireCommitOrderTest do
     db = :firehose_deferred_retire_db
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Tightbeam.Schema.ensure_all(db)
-    {:ok, _} = DB.query(db, "INSERT INTO users VALUES ('flynn', 1, 1)")
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('flynn',1,'admin_add',1)"
+      )
+
     register_testhost(db)
 
     root = create_session(db, "firehose-deferred-root", nil)
@@ -70,7 +76,13 @@ defmodule Tightbeam.Firehose.RetireCommitOrderTest do
     db = :firehose_subtree_retire_db
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Tightbeam.Schema.ensure_all(db)
-    {:ok, _} = DB.query(db, "INSERT INTO users VALUES ('flynn', 1, 1)")
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('flynn',1,'admin_add',1)"
+      )
+
     register_testhost(db)
 
     root = create_session(db, "firehose-retired-root", nil)

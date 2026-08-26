@@ -74,7 +74,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1), ('dana', 0, 1), ('eve', 0, 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 1, 'admin_add', 1), ('dana', 0, 'admin_add', 1), ('eve', 0, 'admin_add', 1)"
       )
 
     # Owners are always users; bracket wakes target the owner's personal session.

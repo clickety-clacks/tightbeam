@@ -34,7 +34,10 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
     })
 
     {:ok, _} =
-      DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1)")
+      DB.query(
+        db,
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 1, 'admin_add', 1)"
+      )
 
     ensure_main_session(db, "flynn")
 

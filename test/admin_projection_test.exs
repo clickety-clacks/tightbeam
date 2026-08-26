@@ -1,3 +1,33 @@
+defmodule Tightbeam.AdminProjectionTest.QuerySpyDB do
+  use GenServer
+
+  def start_link(opts), do: GenServer.start_link(__MODULE__, Map.new(opts))
+  def queries(server), do: GenServer.call(server, :queries)
+
+  @impl true
+  def init(opts) do
+    {:ok, %{db: Map.fetch!(opts, :db), queries: [], before_query: Map.get(opts, :before_query)}}
+  end
+
+  @impl true
+  def handle_call(:queries, _from, state), do: {:reply, Enum.reverse(state.queries), state}
+
+  def handle_call({:query, sql, params} = request, _from, state) do
+    query = normalize_query(sql, params)
+
+    if is_function(state.before_query, 2) do
+      state.before_query.(elem(query, 0), elem(query, 1))
+    end
+
+    {:reply, GenServer.call(state.db, request), %{state | queries: [query | state.queries]}}
+  end
+
+  def handle_call(request, _from, state), do: {:reply, GenServer.call(state.db, request), state}
+
+  defp normalize_query(sql, params),
+    do: {sql |> String.replace(~r/\s+/, " ") |> String.trim(), params}
+end
+
 defmodule Tightbeam.AdminProjectionTest do
   use Tightbeam.TestCase, async: false
 
@@ -7,15 +37,19 @@ defmodule Tightbeam.AdminProjectionTest do
     Credentials,
     DB,
     Devices,
+    Gateway,
     Harness,
     Identity,
     Org,
     Placement,
+    Roles,
     Schema,
-    StateResources
+    StateResources,
+    StateVisibility
   }
 
   alias Tightbeam.Firehose.{Hub, Publisher, Registry}
+  alias Tightbeam.AdminProjectionTest.QuerySpyDB
 
   setup do
     base_dir =
@@ -30,7 +64,14 @@ defmodule Tightbeam.AdminProjectionTest do
     :ok = Schema.ensure_all(db)
     :ok = AdminProjection.bootstrap_served(db, base_dir)
 
-    Devices.add_user(db, "flynn", true)
+    {:paired, _device} =
+      claim_org(db, %{
+        device_id: "admin-projection-device",
+        claimed_name: "flynn",
+        platform: nil,
+        model: nil
+      })
+
     Devices.add_user(db, "operator", false)
 
     start_supervised!({Hub, name: Hub})
@@ -94,7 +135,7 @@ defmodule Tightbeam.AdminProjectionTest do
     assert_notice("verb.accepted")
     user_notice = assert_notice("user.promoted")
 
-    identity = StateResources.query_identity(ctx.db, "served")
+    identity = hydrated_identity!(ctx.db, "served")
     kungfu = StateResources.query_kungfu(ctx.db, "agentic-engineering")
 
     cases = [
@@ -220,6 +261,625 @@ defmodule Tightbeam.AdminProjectionTest do
         apply(StateResources, row.serializer, [Map.delete(detail_item, hd(expected.fields))])
       end
     end)
+  end
+
+  test "M1 collections preserve detail shapes, freeze filters and order, and exclude secrets",
+       ctx do
+    :ok = Org.put_setting(ctx.db, "a-public-fixture", "public-fixture-value")
+    config_secret = "m1-config-secret-7f47f03c"
+    :ok = Org.put_setting(ctx.db, "z-private-fixture", config_secret)
+
+    host_secret = "m1-host-secret-808e4d89"
+
+    for name <- ~w(alpha-fixture zeta-fixture) do
+      assert {:ok, _entry} =
+               Placement.register_host(ctx.db, name, %{
+                 ssh: "#{host_secret}@#{name}",
+                 base_dir: "/#{host_secret}/#{name}",
+                 cli_bin: "/#{host_secret}/tightbeam",
+                 adapter_bin_dir: "/#{host_secret}/adapters"
+               })
+    end
+
+    Devices.add_user(ctx.db, "zeta-fixture", false)
+    Devices.add_user(ctx.db, "alpha-fixture", false)
+
+    assert {:ok, _rows} =
+             DB.query(
+               ctx.db,
+               "UPDATE users SET createdAt = 42 WHERE userId IN ('alpha-fixture', 'zeta-fixture')"
+             )
+
+    harness = hd(Harness.all()).wire_name()
+    host = Placement.local_host_name()
+    host_environment_secret = "m1-host-environment-secret-caa884bc"
+
+    assert %{changed: true} =
+             Placement.set_env_overlay_with_firehose(
+               ctx.db,
+               host,
+               harness,
+               "M1_COLLECTION_SECRET",
+               host_environment_secret,
+               "user:flynn",
+               firehose_call("host-env-set", %{})
+             )
+
+    kungfu_detail = StateResources.query_kungfu(ctx.db, "agentic-engineering")
+
+    extra_kungfu =
+      kungfu_detail
+      |> Map.drop(["rowVersion"])
+      |> Map.merge(%{
+        "name" => "zeta-fixture",
+        "purpose" => "Ordering fixture.",
+        "phrases" => [],
+        "rootArchetype" => "fixture-root",
+        "installedRevision" => nil,
+        "status" => "available",
+        "documents" => []
+      })
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               AdminProjection.seed_stamp_in_txn(
+                 txn,
+                 "kungfu",
+                 "zeta-fixture",
+                 "m1-collection-fixture",
+                 extra_kungfu,
+                 42
+               )
+
+               :ok
+             end)
+
+    public_identity = StateResources.identity(hydrated_identity!(ctx.db, "served"))
+
+    cases = [
+      %{
+        resource: "config",
+        collection: &StateResources.query_config(ctx.db, &1),
+        detail: StateResources.query_config(ctx.db, "a-public-fixture"),
+        serializer: &StateResources.config/1,
+        primary: & &1["key"],
+        order: & &1["key"],
+        filters: [%{"key" => "a-public-fixture"}]
+      },
+      %{
+        resource: "host environment",
+        collection: &StateResources.query_host_environment(ctx.db, &1),
+        detail:
+          StateResources.query_host_environment(
+            ctx.db,
+            host,
+            harness,
+            "M1_COLLECTION_SECRET"
+          ),
+        serializer: &StateResources.host_environment/1,
+        primary: &{&1["host"], &1["harness"], &1["name"]},
+        order: &{&1["host"], &1["harness"], &1["name"]},
+        filters: [
+          %{"host" => host},
+          %{"harness" => harness},
+          %{"name" => "M1_COLLECTION_SECRET"},
+          %{
+            "host" => host,
+            "harness" => harness,
+            "name" => "M1_COLLECTION_SECRET"
+          }
+        ]
+      },
+      %{
+        resource: "hosts",
+        collection: &StateResources.query_host(ctx.db, &1),
+        detail: StateResources.query_host(ctx.db, "alpha-fixture"),
+        serializer: &StateResources.host/1,
+        primary: & &1["host"],
+        order: & &1["host"],
+        filters: [%{"host" => "alpha-fixture"}]
+      },
+      %{
+        resource: "users",
+        collection: &StateResources.query_user(ctx.db, &1),
+        detail: StateResources.query_user(ctx.db, "alpha-fixture"),
+        serializer: &StateResources.user/1,
+        primary: & &1["userId"],
+        order: &{&1["createdAt"], &1["userId"]},
+        filters: [%{"userId" => "alpha-fixture"}]
+      },
+      %{
+        resource: "identity",
+        collection: &StateResources.query_identity(ctx.db, &1),
+        detail: hydrated_identity!(ctx.db, "served"),
+        serializer: &StateResources.identity/1,
+        primary: & &1["name"],
+        order: & &1["name"],
+        filters: [
+          %{"name" => "served"},
+          %{"state" => public_identity["state"]},
+          %{
+            "name" => "served",
+            "state" => public_identity["state"]
+          }
+        ]
+      },
+      %{
+        resource: "kungfu",
+        collection: &StateResources.query_kungfu(ctx.db, &1),
+        detail: kungfu_detail,
+        serializer: &StateResources.kungfu/1,
+        primary: & &1["name"],
+        order: & &1["name"],
+        filters: [
+          %{"status" => kungfu_detail["status"]},
+          %{"rootArchetype" => kungfu_detail["rootArchetype"]},
+          %{
+            "status" => kungfu_detail["status"],
+            "rootArchetype" => kungfu_detail["rootArchetype"]
+          }
+        ]
+      }
+    ]
+
+    Enum.each(cases, fn test_case ->
+      detail_item = test_case.serializer.(test_case.detail)
+      collection_items = Enum.map(test_case.collection.(%{}), test_case.serializer)
+
+      assert Enum.map(collection_items, test_case.order) ==
+               collection_items |> Enum.map(test_case.order) |> Enum.sort()
+
+      assert Enum.find(
+               collection_items,
+               &(test_case.primary.(&1) == test_case.primary.(detail_item))
+             ) ==
+               detail_item
+
+      assert StateResources.encode_admin_item(test_case.resource, detail_item) ==
+               StateResources.encode_admin_item(
+                 test_case.resource,
+                 Enum.find(
+                   collection_items,
+                   &(test_case.primary.(&1) == test_case.primary.(detail_item))
+                 )
+               )
+
+      Enum.each(test_case.filters, fn filters ->
+        filtered_items = Enum.map(test_case.collection.(filters), test_case.serializer)
+        assert detail_item in filtered_items
+
+        assert Enum.all?(filtered_items, fn item ->
+                 Enum.all?(filters, fn {field, value} -> item[field] == value end)
+               end)
+      end)
+    end)
+
+    for {query, allowed_filter} <- [
+          {&StateResources.query_config(ctx.db, &1), "key"},
+          {&StateResources.query_host(ctx.db, &1), "host"},
+          {&StateResources.query_user(ctx.db, &1), "userId"},
+          {&StateResources.query_identity(ctx.db, &1), "name"},
+          {&StateResources.query_kungfu(ctx.db, &1), "status"}
+        ] do
+      assert_raise ArgumentError, ~r/unsupported .* collection filter/, fn ->
+        query.(%{"notAllowlisted" => "value"})
+      end
+
+      assert_raise ArgumentError, ~r/collection filter .* must be a string/, fn ->
+        query.(%{allowed_filter => 1})
+      end
+    end
+
+    config_items = Enum.map(StateResources.query_config(ctx.db, %{}), &StateResources.config/1)
+    private_config = Enum.find(config_items, &(&1["key"] == "z-private-fixture"))
+    assert private_config["value"] == nil
+
+    collection_bytes =
+      cases
+      |> Enum.flat_map(fn test_case ->
+        Enum.map(test_case.collection.(%{}), fn row ->
+          row
+          |> test_case.serializer.()
+          |> then(&StateResources.encode_admin_item(test_case.resource, &1))
+        end)
+      end)
+      |> Enum.join("\n")
+
+    refute collection_bytes =~ config_secret
+    refute collection_bytes =~ host_secret
+    refute collection_bytes =~ host_environment_secret
+  end
+
+  test "M1 visibility makes only host inventory AU4 and preserves firehose seams", ctx do
+    assert StateVisibility.host_visible?(true)
+    assert StateVisibility.host_visible?(false)
+
+    for predicate <- [
+          :config_visible?,
+          :host_environment_visible?,
+          :user_visible?,
+          :identity_visible?,
+          :kungfu_visible?
+        ] do
+      assert apply(StateVisibility, predicate, [true])
+      refute apply(StateVisibility, predicate, [false])
+    end
+
+    expected = %{
+      "config.updated" => {:query_config, :config, :config_visible?},
+      "host_env.updated" =>
+        {:query_host_environment, :host_environment, :host_environment_visible?},
+      "host.registered" => {:query_host, :host, :host_visible?},
+      "user.added" => {:query_user, :user, :user_visible?},
+      "user.promoted" => {:query_user, :user, :user_visible?},
+      "identity.updated" => {:query_identity, :identity, :identity_visible?},
+      "kungfu.updated" => {:query_kungfu, :kungfu, :kungfu_visible?}
+    }
+
+    assert Map.new(expected, fn {class, mapping} ->
+             row = Map.fetch!(Registry.rows(), class)
+             assert {row.query, row.serializer, row.visibility} == mapping
+             {class, mapping}
+           end) == expected
+
+    host_notice = %{
+      "class" => "host.registered",
+      "refs" => %{"host" => "fixture"},
+      "payload" => %{"host" => "fixture", "rowVersion" => 1}
+    }
+
+    assert StateVisibility.visible?(ctx.db, host_notice, "operator", false)
+
+    for class <-
+          ~w(config.updated host_env.updated user.added user.promoted identity.updated kungfu.updated) do
+      refute StateVisibility.visible?(
+               ctx.db,
+               %{"class" => class, "refs" => %{}, "payload" => %{}},
+               "operator",
+               false
+             )
+    end
+  end
+
+  test "identity metadata lookups use the same canonical statement for known forbidden and unknown names",
+       ctx do
+    proxy = start_supervised!({QuerySpyDB, db: ctx.db})
+    admin = principal_binding("flynn", true)
+    forbidden = principal_binding("operator", false)
+
+    assert {:ok, known_descriptor} =
+             StateResources.query_identity(proxy, {:metadata, "served", make_ref(), admin})
+
+    assert is_binary(known_descriptor)
+
+    assert {:ok, forbidden_descriptor} =
+             StateResources.query_identity(proxy, {:metadata, "served", make_ref(), forbidden})
+
+    assert is_binary(forbidden_descriptor)
+
+    assert {:ok, unknown_descriptor} =
+             StateResources.query_identity(
+               proxy,
+               {:metadata, "missing-identity", make_ref(), admin}
+             )
+
+    assert is_binary(unknown_descriptor)
+
+    assert [
+             {known_sql, known_params},
+             {forbidden_sql, forbidden_params},
+             {unknown_sql, unknown_params}
+           ] = QuerySpyDB.queries(proxy)
+
+    assert known_sql ==
+             "SELECT CASE WHEN v.rowVersion IS NULL THEN 0 ELSE 1 END AS present, v.rowVersion " <>
+               "FROM (SELECT ?1 AS resource, ?2 AS primaryKey) AS seed " <>
+               "LEFT JOIN admin_projection_versions AS v " <>
+               "ON v.resource = seed.resource AND v.primaryKey = seed.primaryKey"
+
+    assert forbidden_sql == known_sql
+    assert unknown_sql == known_sql
+    assert known_params == forbidden_params
+    assert length(known_params) == 2
+    assert length(unknown_params) == 2
+  end
+
+  test "identity visibility applies after metadata and hidden names leak no payload oracle",
+       ctx do
+    proxy = start_supervised!({QuerySpyDB, db: ctx.db})
+    hidden = principal_binding("operator", false)
+    visible = principal_binding("flynn", true)
+
+    assert public_identity_or_absent(proxy, "served", hidden, false) == :absent
+    assert public_identity_or_absent(proxy, "missing-identity", hidden, false) == :absent
+
+    assert {:visible, %{"name" => "served"} = visible_identity} =
+             public_identity_or_absent(proxy, "served", visible, true)
+
+    assert [
+             {hidden_known_sql, _hidden_known_params},
+             {hidden_unknown_sql, _hidden_unknown_params},
+             {visible_metadata_sql, _visible_metadata_params},
+             {visible_hydration_sql, _visible_hydration_params}
+           ] = QuerySpyDB.queries(proxy)
+
+    assert hidden_known_sql ==
+             "SELECT CASE WHEN v.rowVersion IS NULL THEN 0 ELSE 1 END AS present, v.rowVersion " <>
+               "FROM (SELECT ?1 AS resource, ?2 AS primaryKey) AS seed " <>
+               "LEFT JOIN admin_projection_versions AS v " <>
+               "ON v.resource = seed.resource AND v.primaryKey = seed.primaryKey"
+
+    assert hidden_unknown_sql == hidden_known_sql
+    assert visible_metadata_sql == hidden_known_sql
+
+    assert visible_identity ==
+             StateResources.identity(hydrated_identity!(ctx.db, "served"))
+
+    assert String.contains?(
+             visible_hydration_sql,
+             "SELECT item, rowVersion FROM admin_projection_versions"
+           )
+
+    assert String.contains?(visible_hydration_sql, "WHEN EXISTS(SELECT 1 FROM matched) THEN 'ok'")
+  end
+
+  test "identity hydration rejects wrong principals and request bindings before database access",
+       ctx do
+    proxy = start_supervised!({QuerySpyDB, db: ctx.db})
+    admin = principal_binding("flynn", true)
+    request_binding = make_ref()
+
+    assert {:ok, descriptor} =
+             StateResources.query_identity(proxy, {:metadata, "served", request_binding, admin})
+
+    assert {:error, :invalid_identity_descriptor} =
+             StateResources.query_identity(
+               proxy,
+               {:hydrate, descriptor, request_binding, principal_binding("operator", true)}
+             )
+
+    assert [{_metadata_sql, _metadata_params}] = QuerySpyDB.queries(proxy)
+
+    assert {:error, :invalid_identity_descriptor} =
+             StateResources.query_identity(
+               proxy,
+               {:hydrate, descriptor, make_ref(), admin}
+             )
+
+    assert [{_metadata_sql, _metadata_params}] = QuerySpyDB.queries(proxy)
+  end
+
+  test "identity staged seam rejects absent and malformed principals before payload access",
+       ctx do
+    proxy = start_supervised!({QuerySpyDB, db: ctx.db})
+    request_binding = make_ref()
+
+    assert {:error, :invalid_identity_descriptor} =
+             StateResources.query_identity(proxy, {:metadata, "served", request_binding, nil})
+
+    assert {:error, :invalid_identity_descriptor} =
+             StateResources.query_identity(
+               proxy,
+               {:metadata, "served", request_binding, "user:flynn"}
+             )
+
+    assert [] = QuerySpyDB.queries(proxy)
+
+    admin = principal_binding("flynn", true)
+
+    assert {:ok, descriptor} =
+             StateResources.query_identity(proxy, {:metadata, "served", request_binding, admin})
+
+    assert [{_metadata_sql, _metadata_params}] = QuerySpyDB.queries(proxy)
+
+    assert {:error, :invalid_identity_descriptor} =
+             StateResources.query_identity(proxy, {:hydrate, descriptor, request_binding, nil})
+
+    assert [{_metadata_sql, _metadata_params}] = QuerySpyDB.queries(proxy)
+
+    assert {:error, :invalid_identity_descriptor} =
+             StateResources.query_identity(
+               proxy,
+               {:hydrate, descriptor, request_binding, "user:flynn"}
+             )
+
+    assert [{_metadata_sql, _metadata_params}] = QuerySpyDB.queries(proxy)
+  end
+
+  test "identity descriptors stay reusable only inside the open operation and close before replay",
+       ctx do
+    proxy = start_supervised!({QuerySpyDB, db: ctx.db})
+    principal = principal_binding("flynn", true)
+    request_binding = make_ref()
+
+    assert {:ok, descriptor} =
+             StateResources.query_identity(
+               proxy,
+               {:metadata, "served", request_binding, principal}
+             )
+
+    assert {:ok, first} =
+             StateResources.query_identity(
+               proxy,
+               {:hydrate, descriptor, request_binding, principal}
+             )
+
+    assert {:ok, second} =
+             StateResources.query_identity(
+               proxy,
+               {:hydrate, descriptor, request_binding, principal}
+             )
+
+    assert first == second
+    query_count = length(QuerySpyDB.queries(proxy))
+
+    assert :ok = StateResources.query_identity(proxy, {:close, request_binding})
+
+    assert {:error, :invalid_identity_descriptor} =
+             StateResources.query_identity(
+               proxy,
+               {:hydrate, descriptor, request_binding, principal}
+             )
+
+    assert length(QuerySpyDB.queries(proxy)) == query_count
+  end
+
+  test "identity hydration reports stale after a row-version race", ctx do
+    call = firehose_call("identity-edit", %{})
+    entries = AdminProjection.served_entries(ctx.db, ctx.base_dir)
+    identity = Enum.find(entries, &(&1.resource == "identity"))
+    principal = principal_binding("flynn", true)
+    request_binding = make_ref()
+
+    assert {:ok, descriptor} =
+             StateResources.query_identity(
+               ctx.db,
+               {:metadata, "served", request_binding, principal}
+             )
+
+    changed = put_in(identity.item["liveRevision"], "staged-race-next")
+
+    assert {:ok, [_item]} = AdminProjection.stamp_publication(ctx.db, call, [changed])
+    assert_notice("verb.accepted")
+    assert_notice("identity.updated")
+
+    assert :stale =
+             StateResources.query_identity(
+               ctx.db,
+               {:hydrate, descriptor, request_binding, principal}
+             )
+  end
+
+  test "identity-status binds org role calls to one resolved principal across a stale retry",
+       ctx do
+    create_session!(ctx.db, "agent:identity-role-primary", "flynn")
+    create_session!(ctx.db, "agent:identity-role-rebound", "operator")
+    Roles.create!(ctx.db, "identity-reviewer", "flynn", "agent:identity-role-primary")
+
+    call = firehose_call("identity-edit", %{})
+    entries = AdminProjection.served_entries(ctx.db, ctx.base_dir)
+    identity = Enum.find(entries, &(&1.resource == "identity"))
+    changed = put_in(identity.item["liveRevision"], "staged-role-retry")
+
+    parent = self()
+    {:ok, hook_state} = Agent.start_link(fn -> false end)
+
+    proxy =
+      start_supervised!(
+        {QuerySpyDB,
+         db: ctx.db,
+         before_query: fn sql, _params ->
+           if String.contains?(sql, "WITH observed AS") do
+             should_fire = Agent.get_and_update(hook_state, fn fired -> {not fired, true} end)
+
+             if should_fire do
+               assert :ok = Roles.bind(ctx.db, "identity-reviewer", "agent:identity-role-rebound")
+               assert {:ok, [_item]} = AdminProjection.stamp_publication(ctx.db, call, [changed])
+               send(parent, :role_retry_rebound)
+             end
+           end
+         end}
+      )
+
+    actual =
+      Gateway.handlers(%{db: proxy, base_dir: ctx.base_dir})["identity-status"].(%{
+        origin: "agent:identity-reviewer",
+        principal: nil,
+        params: %{}
+      })
+
+    assert_receive :role_retry_rebound
+    assert actual.identity == StateResources.identity(hydrated_identity!(ctx.db, "served"))
+
+    assert [
+             {metadata_sql, _metadata_params},
+             {hydration_sql, _hydration_params},
+             {retry_metadata_sql, _retry_metadata_params},
+             {retry_hydration_sql, _retry_hydration_params}
+           ] = identity_stage_queries(proxy)
+
+    assert metadata_sql == retry_metadata_sql
+    assert String.contains?(hydration_sql, "WITH observed AS")
+    assert retry_hydration_sql == hydration_sql
+  end
+
+  test "identity-status rechecks visibility after a stale refresh and stops before retry hydration",
+       ctx do
+    call = firehose_call("identity-edit", %{})
+    entries = AdminProjection.served_entries(ctx.db, ctx.base_dir)
+    identity = Enum.find(entries, &(&1.resource == "identity"))
+    changed = put_in(identity.item["liveRevision"], "staged-visibility-loss")
+
+    parent = self()
+    {:ok, hook_state} = Agent.start_link(fn -> false end)
+
+    proxy =
+      start_supervised!(
+        {QuerySpyDB,
+         db: ctx.db,
+         before_query: fn sql, _params ->
+           if String.contains?(sql, "WITH observed AS") do
+             should_fire = Agent.get_and_update(hook_state, fn fired -> {not fired, true} end)
+
+             if should_fire do
+               Devices.set_user_admin(ctx.db, "flynn", false)
+               assert {:ok, [_item]} = AdminProjection.stamp_publication(ctx.db, call, [changed])
+               send(parent, :visibility_lost_before_retry)
+             end
+           end
+         end}
+      )
+
+    actual =
+      Gateway.handlers(%{db: proxy, base_dir: ctx.base_dir})["identity-status"].(%{
+        origin: "user:flynn",
+        principal: nil,
+        params: %{}
+      })
+
+    assert_receive :visibility_lost_before_retry
+    assert actual.identity == nil
+
+    assert [
+             {metadata_sql, _metadata_params},
+             {hydration_sql, _hydration_params},
+             {retry_metadata_sql, _retry_metadata_params}
+           ] = identity_stage_queries(proxy)
+
+    assert metadata_sql == retry_metadata_sql
+    assert String.contains?(hydration_sql, "WITH observed AS")
+  end
+
+  test "identity-status preserves the served identity through the staged query seam", ctx do
+    call = %{origin: "user:flynn", params: %{}}
+
+    expected = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})["identity-status"].(call)
+
+    proxy = start_supervised!({QuerySpyDB, db: ctx.db})
+
+    actual = Gateway.handlers(%{db: proxy, base_dir: ctx.base_dir})["identity-status"].(call)
+
+    assert actual.identity == expected.identity
+
+    assert Enum.any?(QuerySpyDB.queries(proxy), fn
+             {"SELECT CASE WHEN v.rowVersion IS NULL THEN 0 ELSE 1 END AS present, v.rowVersion " <>
+                  "FROM (SELECT ?1 AS resource, ?2 AS primaryKey) AS seed " <>
+                  "LEFT JOIN admin_projection_versions AS v " <>
+                  "ON v.resource = seed.resource AND v.primaryKey = seed.primaryKey",
+              ["identity", "served"]} ->
+               true
+
+             _ ->
+               false
+           end)
+
+    assert Enum.any?(QuerySpyDB.queries(proxy), fn
+             {sql, _params} when is_binary(sql) ->
+               String.contains?(sql, "SELECT item, rowVersion FROM admin_projection_versions")
+
+             _ ->
+               false
+           end)
   end
 
   test "identity sessionRevisions use Unicode key order above the BEAM map threshold" do
@@ -495,7 +1155,7 @@ defmodule Tightbeam.AdminProjectionTest do
     assert_notice("verb.accepted")
     assert_notice("identity.updated")
 
-    before_failure = StateResources.query_identity(ctx.db, "served")
+    before_failure = hydrated_identity!(ctx.db, "served")
     failed = put_in(changed.item["liveRevision"], "published-but-unstamped")
 
     assert {:error, %{code: "projection_stamp_failed"}} =
@@ -504,7 +1164,7 @@ defmodule Tightbeam.AdminProjectionTest do
              )
 
     refute_receive {:firehose_notice, _notice}
-    assert StateResources.query_identity(ctx.db, "served") == before_failure
+    assert hydrated_identity!(ctx.db, "served") == before_failure
 
     assert {:ok, [["projection_stamp_failed", detail]]} =
              DB.query(
@@ -516,7 +1176,7 @@ defmodule Tightbeam.AdminProjectionTest do
   end
 
   test "a failed Git publication does not advance a stamp or emit state", ctx do
-    before = StateResources.query_identity(ctx.db, "served")
+    before = hydrated_identity!(ctx.db, "served")
     identity_dir = Path.join(ctx.base_dir, "identity")
     main = git!(identity_dir, ["rev-parse", "main"])
 
@@ -546,7 +1206,7 @@ defmodule Tightbeam.AdminProjectionTest do
       )
     end
 
-    assert StateResources.query_identity(ctx.db, "served") == before
+    assert hydrated_identity!(ctx.db, "served") == before
     refute_receive {:firehose_notice, _notice}
   end
 
@@ -644,8 +1304,7 @@ defmodule Tightbeam.AdminProjectionTest do
         {"hosts", "rebuild-alpha",
          StateResources.host(StateResources.query_host(ctx.db, "rebuild-alpha"))},
         {"users", "operator", StateResources.user(StateResources.query_user(ctx.db, "operator"))},
-        {"identity", "served",
-         StateResources.identity(StateResources.query_identity(ctx.db, "served"))},
+        {"identity", "served", StateResources.identity(hydrated_identity!(ctx.db, "served"))},
         {"kungfu", "rebuild-demo",
          StateResources.kungfu(StateResources.query_kungfu(ctx.db, "rebuild-demo"))}
       ]
@@ -839,6 +1498,85 @@ defmodule Tightbeam.AdminProjectionTest do
       end)
 
     assert positions == Enum.sort(positions)
+  end
+
+  defp public_identity_or_absent(db, name, principal_binding, is_admin) do
+    request_binding = make_ref()
+
+    try do
+      assert {:ok, descriptor} =
+               StateResources.query_identity(
+                 db,
+                 {:metadata, name, request_binding, principal_binding}
+               )
+
+      if StateVisibility.identity_visible?(is_admin) do
+        assert {:ok, item} =
+                 StateResources.query_identity(
+                   db,
+                   {:hydrate, descriptor, request_binding, principal_binding}
+                 )
+
+        {:visible, StateResources.identity(item)}
+      else
+        :absent
+      end
+    after
+      assert :ok = StateResources.query_identity(db, {:close, request_binding})
+    end
+  end
+
+  defp hydrated_identity!(db, name) do
+    request_binding = make_ref()
+    principal_binding = principal_binding("flynn", true)
+
+    try do
+      assert {:ok, descriptor} =
+               StateResources.query_identity(
+                 db,
+                 {:metadata, name, request_binding, principal_binding}
+               )
+
+      assert {:ok, item} =
+               StateResources.query_identity(
+                 db,
+                 {:hydrate, descriptor, request_binding, principal_binding}
+               )
+
+      item
+    after
+      assert :ok = StateResources.query_identity(db, {:close, request_binding})
+    end
+  end
+
+  defp principal_binding(user_id, _is_admin), do: {:user, user_id}
+
+  defp identity_stage_queries(proxy) do
+    QuerySpyDB.queries(proxy)
+    |> Enum.filter(fn
+      {sql, ["identity", "served" | _rest]} when is_binary(sql) ->
+        String.starts_with?(sql, "SELECT CASE WHEN v.rowVersion IS NULL THEN 0 ELSE 1 END") or
+          String.contains?(sql, "WITH observed AS")
+
+      _ ->
+        false
+    end)
+  end
+
+  defp create_session!(db, key, owner) do
+    ensure_main_session(db, owner)
+
+    Org.create(db, %{
+      session_key: key,
+      display_name: key,
+      owner_user_id: owner,
+      origin: "user:#{owner}",
+      archetype: "default",
+      harness: "claude",
+      provider: "anthropic",
+      model: Tightbeam.Model.new("fable"),
+      host: "testhost"
+    })
   end
 
   defp notice_primary_key(%{"resource" => "host environment", "refs" => refs}) do

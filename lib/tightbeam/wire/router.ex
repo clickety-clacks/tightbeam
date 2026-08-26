@@ -49,7 +49,7 @@ defmodule Tightbeam.Wire.Router do
 
   use Plug.Router
 
-  alias Tightbeam.{Assets, CliCompatibility, Devices, Dispatch, Org, Roles, WorkState}
+  alias Tightbeam.{Assets, CliCompatibility, ColdStart, Devices, Dispatch, Org, Roles, WorkState}
   alias Tightbeam.Wire.{ChangeSocket, Payloads, Socket}
 
   Module.register_attribute(__MODULE__, :agent_verbs, persist: true)
@@ -140,21 +140,8 @@ defmodule Tightbeam.Wire.Router do
   post "/agent/dispatch" do
     with {:ok, auth} <- cli_auth(conn),
          {:ok, body, conn} <- read_json(conn),
-         {:ok, verb} <- required_string(body["verb"]),
-         :ok <- allowed_agent_verb(verb),
-         {:ok, origin, principal} <- agent_identity(body, auth, conn),
-         {:ok, session_key, target_meta} <- typed_target(verb, body, conn) do
-      call = %{
-        verb: verb,
-        origin: origin,
-        principal: principal,
-        session_key: artifact_caller_session(verb, session_key, principal),
-        target_role: target_meta.role,
-        role_fallback: target_meta.fallback,
-        params: atomize_params(verb, body["params"] || %{})
-      }
-
-      dispatch_response(conn, call, 200, &%{"result" => &1})
+         {:ok, verb} <- required_string(body["verb"]) do
+      dispatch_agent_request(conn, auth, verb, body)
     else
       {:error, status, code, message} -> error(conn, status, code, message)
     end
@@ -470,6 +457,90 @@ defmodule Tightbeam.Wire.Router do
       do: :ok,
       else: {:error, 400, "invalid_message", "verb not allowed: #{verb}"}
   end
+
+  defp dispatch_agent_request(conn, _auth, "cold-start-state", _body) do
+    json(conn, 200, %{"result" => ColdStart.state(db(conn))})
+  end
+
+  defp dispatch_agent_request(conn, :org, "bootstrap-user", body) do
+    with :ok <- loopback_bootstrap(conn),
+         {:ok, user_id} <- required_string(get_in(body, ["params", "userId"])),
+         {:ok, result} <-
+           ColdStart.bootstrap_user(db(conn), user_id, Map.fetch!(deps(conn), :defaults)) do
+      json(conn, 200, %{"result" => result})
+    else
+      {:error, "bootstrap_closed"} ->
+        error(conn, 409, "bootstrap_closed", "bootstrap is already claimed")
+
+      {:error, "bootstrap_incomplete"} ->
+        error(conn, 409, "bootstrap_incomplete", nil)
+
+      {:error, "bootstrap_failed"} ->
+        error(conn, 500, "bootstrap_failed", nil)
+
+      {:error, status, code, message} ->
+        error(conn, status, code, message)
+    end
+  end
+
+  defp dispatch_agent_request(conn, _auth, "bootstrap-user", _body) do
+    error(conn, 403, "forbidden", "local bootstrap required")
+  end
+
+  defp dispatch_agent_request(conn, auth, verb, body) do
+    with :ok <- allowed_agent_verb(verb),
+         {:ok, origin, principal} <- agent_identity(body, auth, conn),
+         :ok <- canonical_actor_exists(origin, principal, conn),
+         {:ok, session_key, target_meta} <- typed_target(verb, body, conn) do
+      call = %{
+        verb: verb,
+        origin: origin,
+        principal: principal,
+        session_key: artifact_caller_session(verb, session_key, principal),
+        target_role: target_meta.role,
+        role_fallback: target_meta.fallback,
+        params: atomize_params(verb, body["params"] || %{})
+      }
+
+      dispatch_response(conn, call, 200, &%{"result" => &1})
+    else
+      {:error, status, code, message} -> error(conn, status, code, message)
+    end
+  end
+
+  defp loopback_bootstrap(%{remote_ip: {127, _, _, _}}), do: :ok
+  defp loopback_bootstrap(%{remote_ip: {0, 0, 0, 0, 0, 0, 0, 1}}), do: :ok
+  defp loopback_bootstrap(_conn), do: {:error, 403, "forbidden", "local bootstrap required"}
+
+  defp canonical_actor_exists("process:" <> _process, _principal, _conn), do: :ok
+
+  defp canonical_actor_exists(_origin, {:user, user_id}, conn),
+    do: user_exists(user_id, conn)
+
+  defp canonical_actor_exists(_origin, {:session, session_key}, conn) do
+    case Org.get(db(conn), session_key) do
+      %{owner_user_id: user_id} -> user_exists(user_id, conn)
+      _ -> invalid_identity()
+    end
+  end
+
+  defp canonical_actor_exists("user:" <> user_id, nil, conn), do: user_exists(user_id, conn)
+
+  defp canonical_actor_exists("agent:" <> role, nil, conn) do
+    case Roles.resolve(db(conn), role) do
+      {:ok, session_key, _fallback} -> canonical_actor_exists(nil, {:session, session_key}, conn)
+      _ -> :ok
+    end
+  end
+
+  defp canonical_actor_exists(_origin, _principal, _conn), do: :ok
+
+  defp user_exists(user_id, conn) do
+    if Devices.user(db(conn), user_id), do: :ok, else: invalid_identity()
+  end
+
+  defp invalid_identity,
+    do: {:error, 403, "invalid_identity", "asserted user does not exist"}
 
   defp agent_identity(%{"asProcess" => "tightbeam"}, :org, _conn) do
     {:error, 403, "reserved_origin", "process:tightbeam is reserved to the substrate"}

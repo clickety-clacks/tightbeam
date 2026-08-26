@@ -37,7 +37,6 @@ defmodule Tightbeam.GatewayTest do
   @cold_runner_prompt_timeout 60_000
 
   @archetype_reference_writers [
-    {:main_session_seed, "lib/tightbeam/wire/socket.ex", "Org.create_in_txn"},
     {:typed_spawn, "lib/tightbeam/gateway.ex", "Org.create_in_txn"},
     {:default_setting, "lib/tightbeam/gateway.ex", "Org.put_setting_projected_in_txn"},
     {:identity_repoint, "lib/tightbeam/gateway.ex", "Org.repoint_archetype_in_txn"}
@@ -609,7 +608,7 @@ defmodule Tightbeam.GatewayTest do
     end)
 
     {:paired, _device} =
-      Devices.pair(db, %{
+      claim_org(db, %{
         device_id: "flynn-device",
         claimed_name: "Flynn",
         platform: nil,
@@ -617,20 +616,6 @@ defmodule Tightbeam.GatewayTest do
       })
 
     main_key = Org.personal_session_key("flynn")
-
-    Org.create(db, %{
-      session_key: main_key,
-      display_name: "Main",
-      kind: "main",
-      is_built_in: true,
-      owner_user_id: "flynn",
-      origin: "user:flynn",
-      archetype: "default",
-      host: "mainhost",
-      harness: "claude",
-      provider: "anthropic",
-      model: Model.new("fable")
-    })
 
     Org.create(db, %{
       session_key: "k1",
@@ -875,6 +860,7 @@ defmodule Tightbeam.GatewayTest do
   test "retiring the last live session closes its harness session and shared adapter", ctx do
     ensure_global_registry()
     Org.retire(ctx.db, "k1", "test:gateway", 1_000)
+    Org.retire(ctx.db, ctx.main_key, "test:gateway", 1_000)
     session = create_session(ctx.db, "reap-last", "flynn")
     session = Org.set_identity(ctx.db, session.session_key, nil, "reap-last-identity")
     Org.append_pointer(ctx.db, session.session_key, "harness-last", "created")
@@ -1045,6 +1031,7 @@ defmodule Tightbeam.GatewayTest do
   test "a harness session close error cannot fail the committed retire", ctx do
     ensure_global_registry()
     Org.retire(ctx.db, "k1", "test:gateway", 1_000)
+    Org.retire(ctx.db, ctx.main_key, "test:gateway", 1_000)
     session = create_session(ctx.db, "reap-close-error", "flynn")
     session = Org.set_identity(ctx.db, session.session_key, nil, "reap-error-identity")
     Org.append_pointer(ctx.db, session.session_key, "harness-close-error", "created")
@@ -1504,6 +1491,9 @@ defmodule Tightbeam.GatewayTest do
   end
 
   test "children installs the release Rust CLI, and refuses instead of falling back", ctx do
+    previous_release_root = System.get_env("RELEASE_ROOT")
+    System.delete_env("RELEASE_ROOT")
+
     repo_dir =
       Path.join(
         System.tmp_dir!(),
@@ -1516,7 +1506,13 @@ defmodule Tightbeam.GatewayTest do
     File.mkdir_p!(Path.dirname(rust_cli))
     File.write!(rust_cli, "rust-cli-binary")
 
-    on_exit(fn -> File.rm_rf!(repo_dir) end)
+    on_exit(fn ->
+      if previous_release_root,
+        do: System.put_env("RELEASE_ROOT", previous_release_root),
+        else: System.delete_env("RELEASE_ROOT")
+
+      File.rm_rf!(repo_dir)
+    end)
 
     File.cd!(repo_dir, fn ->
       Gateway.children(gateway_config(rust_base, ctx.db, 0))
