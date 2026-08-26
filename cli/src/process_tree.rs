@@ -78,6 +78,13 @@ impl Snapshot {
         tree
     }
 
+    pub(crate) fn pgid_of(&self, pid: libc::pid_t) -> Option<libc::pid_t> {
+        self.processes
+            .iter()
+            .find(|process| process.pid == pid)
+            .map(|process| process.pgid)
+    }
+
     /// The distinct process groups those pids sit in — the groups a sweep has to signal.
     pub(crate) fn process_groups(&self, pids: &BTreeSet<libc::pid_t>) -> BTreeSet<libc::pid_t> {
         self.processes
