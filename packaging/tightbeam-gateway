@@ -42,6 +42,81 @@ if [ -z "${RELEASE_NODE:-}" ]; then
   export RELEASE_NODE
 fi
 
+# KEEP THE DISTRIBUTION COOKIE OUTSIDE THE REPLACEABLE PACKAGE.
+#
+# Mix generates a random `release/releases/COOKIE` for every clean release build.
+# An npm upgrade replaces that file while the old BEAM is still running.  The new
+# `stop` command then has the right node name but the wrong cookie, so it reports
+# `nodedown` and cannot ask the old release to run its graceful `prep_stop` path.
+#
+# An explicit RELEASE_COOKIE remains authoritative.  Otherwise the first launch
+# copies the package cookie into the org's durable base dir with mode 0600.  Every
+# later command reads that same file, including commands from a newer package.
+if [ -z "${RELEASE_COOKIE:-}" ]; then
+  if [ "${TIGHTBEAM_BASE_DIR+x}" = x ]; then
+    COOKIE_BASE="$TIGHTBEAM_BASE_DIR"
+  elif [ "${TIGHTBEAM_HOME+x}" = x ]; then
+    COOKIE_BASE="$TIGHTBEAM_HOME"
+  elif [ "${HOME+x}" = x ]; then
+    COOKIE_BASE="$HOME/.tightbeam"
+  else
+    echo "tightbeam-gateway: cannot resolve the base dir for the release cookie" >&2
+    echo "Set TIGHTBEAM_BASE_DIR, TIGHTBEAM_HOME, HOME, or RELEASE_COOKIE." >&2
+    exit 1
+  fi
+
+  case "$COOKIE_BASE" in
+    "") COOKIE_FILE="release.cookie" ;;
+    *) COOKIE_FILE="$COOKIE_BASE/release.cookie" ;;
+  esac
+
+  if [ ! -f "$COOKIE_FILE" ]; then
+    PACKAGED_COOKIE_FILE="$DIR/release/releases/COOKIE"
+    if [ ! -f "$PACKAGED_COOKIE_FILE" ]; then
+      echo "tightbeam-gateway: package has no release cookie at $PACKAGED_COOKIE_FILE" >&2
+      exit 1
+    fi
+
+    if [ -n "$COOKIE_BASE" ]; then
+      mkdir -p "$COOKIE_BASE"
+    fi
+    COOKIE_TEMP="$COOKIE_FILE.tmp.$$"
+    trap 'rm -f "$COOKIE_TEMP"' EXIT HUP INT TERM
+    umask 077
+    cp "$PACKAGED_COOKIE_FILE" "$COOKIE_TEMP"
+    chmod 600 "$COOKIE_TEMP"
+
+    # `ln` is the no-overwrite commit.  Two simultaneous first launches either
+    # publish the same package cookie or one reads the complete file the other won.
+    if ln "$COOKIE_TEMP" "$COOKIE_FILE" 2>/dev/null; then
+      :
+    elif [ ! -f "$COOKIE_FILE" ]; then
+      echo "tightbeam-gateway: could not persist release cookie at $COOKIE_FILE" >&2
+      exit 1
+    fi
+    rm -f "$COOKIE_TEMP"
+    trap - EXIT HUP INT TERM
+  fi
+
+  if [ -L "$COOKIE_FILE" ]; then
+    echo "tightbeam-gateway: release cookie must not be a symlink: $COOKIE_FILE" >&2
+    exit 1
+  fi
+  if ! chmod 600 "$COOKIE_FILE"; then
+    echo "tightbeam-gateway: could not secure release cookie at $COOKIE_FILE" >&2
+    exit 1
+  fi
+
+  RELEASE_COOKIE=$(cat "$COOKIE_FILE")
+  case "$RELEASE_COOKIE" in
+    "" | *[!A-Za-z0-9_]*)
+      echo "tightbeam-gateway: invalid release cookie at $COOKIE_FILE" >&2
+      exit 1
+      ;;
+  esac
+  export RELEASE_COOKIE
+fi
+
 # EVERY release command goes through here, not just `start`. This used to exec
 # `start "$@"` unconditionally, which left `stop`, `restart`, `remote`, `rpc` and `pid`
 # reachable only by invoking `release/bin/tightbeam_gateway` directly — where the

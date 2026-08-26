@@ -234,6 +234,15 @@ For a service-managed installation, `npm install -g` replaces the executable on
 disk but does not restart the running gateway. Restart the service after every
 upgrade, then verify it is active:
 
+`tightbeam-gateway` stores the release's random Erlang cookie at
+`<base_dir>/release.cookie` on its first start. Later `stop`, `restart`, and
+`pid` commands reuse that private file, so replacing the package on disk does
+not make the old running gateway unreachable. An explicit `RELEASE_COOKIE`
+still wins and must remain stable across upgrades. A gateway first started by
+an older package has no durable cookie yet; stop that process before replacing
+that older package once. SIGTERM and SIGINT reach the foreground gateway
+unchanged and run its bounded graceful drain; SIGKILL cannot drain by design.
+
 ```sh
 # Linux
 sudo systemctl restart tightbeam.service
