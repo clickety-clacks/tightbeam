@@ -211,6 +211,11 @@ pub enum Command {
         spec_ref_sha256: Option<String>,
         idempotency_key: Option<String>,
     },
+    WorkItemUpdate {
+        identity: Identity,
+        work_item_id: String,
+        body: Option<String>,
+    },
     WorkItemGet {
         identity: Identity,
         work_item_id: String,
@@ -553,6 +558,9 @@ COMMANDS:
       File a work item. Unrouted, it becomes YOUR problem on a deadline: file
       it, then route it (assign/dispatch) or icebox it. --key makes create
       idempotent (same key returns the same item).
+  work-item-update <workItemId> (--body <text> | --body=<text> | --clear-body)
+      Replace or clear the work-item body. This command does not edit title,
+      bug classification, or the immutable spec reference.
   work-item-get <workItemId>
   work-item-trace <workItemId>
   attend [--high]
@@ -839,6 +847,90 @@ fn split_args(args: Vec<String>) -> Flags {
 
 fn nonempty(flags: &HashMap<String, String>, name: &str) -> Option<String> {
     flags.get(name).filter(|value| !value.is_empty()).cloned()
+}
+
+const WORK_ITEM_UPDATE_USAGE: &str =
+    "usage: tightbeam work-item-update <workItemId> (--body <text> | --body=<text> | --clear-body)";
+
+/// `work-item-update` is the one command whose grammar cannot pass through
+/// `split_args`: empty body text is meaningful, inline `--body=` is scoped to
+/// this command, and duplicate body operations must remain observable rather
+/// than being overwritten in the shared flag map.
+fn parse_work_item_update(args: &[String]) -> Result<Command, String> {
+    let mut work_item_id = None;
+    let mut body_operation = None;
+    let mut identity_flags = HashMap::new();
+    let mut identity_count = 0;
+    let mut index = 1;
+
+    while index < args.len() {
+        let arg = &args[index];
+
+        if let Some(value) = arg.strip_prefix("--body=") {
+            if body_operation.is_some() {
+                return Err(WORK_ITEM_UPDATE_USAGE.to_owned());
+            }
+            body_operation = Some(Some(value.to_owned()));
+            index += 1;
+            continue;
+        }
+
+        match arg.as_str() {
+            "--help" | "-h" => {
+                return Ok(Command::CommandHelp("work-item-update".to_owned()));
+            }
+            "--body" => {
+                if body_operation.is_some() {
+                    return Err(WORK_ITEM_UPDATE_USAGE.to_owned());
+                }
+                let Some(value) = args.get(index + 1) else {
+                    return Err(WORK_ITEM_UPDATE_USAGE.to_owned());
+                };
+                if value.starts_with("--") {
+                    return Err(WORK_ITEM_UPDATE_USAGE.to_owned());
+                }
+                body_operation = Some(Some(value.clone()));
+                index += 2;
+            }
+            "--clear-body" => {
+                if body_operation.is_some() {
+                    return Err(WORK_ITEM_UPDATE_USAGE.to_owned());
+                }
+                body_operation = Some(None);
+                index += 1;
+            }
+            "--as" | "--as-user" | "--as-process" => {
+                identity_count += 1;
+                if identity_count > 1 {
+                    return Err(
+                        "identity flags are mutually exclusive: pass exactly one of --as, --as-user, or --as-process"
+                            .to_owned(),
+                    );
+                }
+                let Some(value) = args.get(index + 1) else {
+                    return Err(WORK_ITEM_UPDATE_USAGE.to_owned());
+                };
+                identity_flags.insert(arg[2..].to_owned(), value.clone());
+                index += 2;
+            }
+            _ if arg.starts_with("--") => {
+                return Err(WORK_ITEM_UPDATE_USAGE.to_owned());
+            }
+            _ => {
+                if work_item_id.is_some() {
+                    return Err(WORK_ITEM_UPDATE_USAGE.to_owned());
+                }
+                work_item_id = Some(arg.clone());
+                index += 1;
+            }
+        }
+    }
+
+    Ok(Command::WorkItemUpdate {
+        identity: identity(&identity_flags)?,
+        work_item_id: work_item_id.ok_or_else(|| WORK_ITEM_UPDATE_USAGE.to_owned())?,
+        body: body_operation.ok_or_else(|| WORK_ITEM_UPDATE_USAGE.to_owned())?,
+    })
 }
 
 const TUNE_USAGE: &str = "usage: tightbeam tune --session <key> (--harness <harness> --model <model> | --model <model> | --effort <level>) [--effort <level>] [--context <variant>]";
@@ -1130,6 +1222,10 @@ fn parse_with_optional_catalog(
     args: Vec<String>,
     supplied_catalog: Option<&HarnessCatalog>,
 ) -> Result<Command, String> {
+    if args.first().is_some_and(|arg| arg == "work-item-update") {
+        return parse_work_item_update(&args);
+    }
+
     let parsed = split_args(args);
     let command = parsed.positional.first().map(String::as_str);
     // `-h` never becomes a flag: split_args only recognizes `--`-prefixed names, so it
@@ -2004,7 +2100,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, ask, answer, return, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, ask, answer, return, revoke-assignment, reopen-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -2833,6 +2929,7 @@ mod tests {
                 "work-item-create",
                 "work-item-fail",
                 "work-item-get",
+                "work-item-update",
                 "attend",
                 "transcript",
                 "turn-trace",
@@ -2864,6 +2961,21 @@ mod tests {
         ] {
             assert!(help.contains(syntax), "missing HELP syntax: {syntax}");
         }
+    }
+
+    #[test]
+    fn work_item_update_help_names_the_exact_body_only_surface() {
+        let syntax = "work-item-update <workItemId> (--body <text> | --body=<text> | --clear-body)";
+        let manual = render_help(None);
+        let entry = render_command_help(None, "work-item-update").unwrap();
+
+        assert!(manual.contains(syntax));
+        assert!(entry.contains(syntax));
+        assert!(entry.contains("Replace or clear the work-item body"));
+        assert!(matches!(
+            parse(strings(&["help", "work-item-update"])),
+            Ok(Command::CommandHelp(command)) if command == "work-item-update"
+        ));
     }
 
     #[test]
@@ -3416,7 +3528,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, ask, answer, return, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, ask, answer, return, revoke-assignment, reopen-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned())
         );
     }
 
@@ -3464,7 +3576,6 @@ mod tests {
             "withdraw",
             "decision-request",
             "critical",
-            "work-item-update",
             "work-item-list",
             "assignment-get",
             "init",
@@ -3581,6 +3692,128 @@ mod tests {
                 "flynn",
             ])),
             Err("--verdict is only valid when --kind is verdict".to_owned())
+        );
+    }
+
+    #[test]
+    fn work_item_update_preserves_body_operations_and_identity() {
+        for (args, identity, body) in [
+            (
+                strings(&["work-item-update", "wi_1", "--body", "text"]),
+                Identity::Session,
+                Some("text".to_owned()),
+            ),
+            (
+                strings(&["work-item-update", "wi_1", "--body", ""]),
+                Identity::Session,
+                Some(String::new()),
+            ),
+            (
+                strings(&["work-item-update", "wi_1", "--body="]),
+                Identity::Session,
+                Some(String::new()),
+            ),
+            (
+                strings(&["work-item-update", "wi_1", "--body=--clear-body"]),
+                Identity::Session,
+                Some("--clear-body".to_owned()),
+            ),
+            (
+                strings(&["work-item-update", "wi_1", "--body=--body"]),
+                Identity::Session,
+                Some("--body".to_owned()),
+            ),
+            (
+                strings(&[
+                    "work-item-update",
+                    "wi_1",
+                    "--clear-body",
+                    "--as-user",
+                    "flynn",
+                ]),
+                Identity::User("flynn".to_owned()),
+                None,
+            ),
+            (
+                strings(&["work-item-update", "--as", "builder", "wi_1", "--body=text"]),
+                Identity::Role("builder".to_owned()),
+                Some("text".to_owned()),
+            ),
+            (
+                strings(&[
+                    "work-item-update",
+                    "wi_1",
+                    "--body",
+                    "text",
+                    "--as-process",
+                    "cron",
+                ]),
+                Identity::Process("cron".to_owned()),
+                Some("text".to_owned()),
+            ),
+        ] {
+            assert_eq!(
+                parse(args),
+                Ok(Command::WorkItemUpdate {
+                    identity,
+                    work_item_id: "wi_1".to_owned(),
+                    body,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn work_item_update_rejects_every_non_body_shape_with_exact_usage() {
+        for args in [
+            strings(&["work-item-update", "--body", "text"]),
+            strings(&["work-item-update", "wi_1", "wi_2", "--body", "text"]),
+            strings(&["work-item-update", "wi_1"]),
+            strings(&["work-item-update", "wi_1", "--body"]),
+            strings(&["work-item-update", "wi_1", "--body", "--clear-body"]),
+            strings(&["work-item-update", "wi_1", "--body", "one", "--body", "two"]),
+            strings(&["work-item-update", "wi_1", "--body=one", "--body=two"]),
+            strings(&["work-item-update", "wi_1", "--clear-body", "--clear-body"]),
+            strings(&["work-item-update", "wi_1", "--title", "new"]),
+            strings(&["work-item-update", "wi_1", "--spec-ref", "spec.md"]),
+            strings(&["work-item-update", "wi_1", "--spec-sha256", "digest"]),
+            strings(&["work-item-update", "wi_1", "--key", "k1"]),
+            strings(&["work-item-update", "wi_1", "--if-body-sha256", "digest"]),
+        ] {
+            assert_eq!(parse(args), Err(WORK_ITEM_UPDATE_USAGE.to_owned()));
+        }
+
+        assert_eq!(
+            parse(strings(&[
+                "work-item-update",
+                "wi_1",
+                "--body",
+                "text",
+                "--as-user",
+                "flynn",
+                "--as",
+                "builder",
+            ])),
+            Err(
+                "identity flags are mutually exclusive: pass exactly one of --as, --as-user, or --as-process"
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn work_item_update_does_not_change_other_commands_tokenization() {
+        let expected = Ok(Command::WorkItemGet {
+            identity: Identity::Session,
+            work_item_id: "wi_1".to_owned(),
+        });
+        assert_eq!(
+            parse(strings(&["work-item-get", "wi_1", "--name=value"])),
+            expected
+        );
+        assert_eq!(
+            parse(strings(&["work-item-get", "wi_1", "--clear-body", "next",])),
+            expected
         );
     }
 
