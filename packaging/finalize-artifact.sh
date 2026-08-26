@@ -21,6 +21,6 @@ python3 "$(dirname "$0")/../scripts/package_manifest.py" evidence \
   --manifest "$TEMP_MANIFEST" \
   --version "$EXPECTED" \
   --output "$TEMP_EVIDENCE"
-mv "$TEMP" "$FINAL"
 mv "$TEMP_MANIFEST" "$FINAL_MANIFEST"
 mv "$TEMP_EVIDENCE" "$FINAL_EVIDENCE"
+mv "$TEMP" "$FINAL"

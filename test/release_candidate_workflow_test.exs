@@ -198,6 +198,9 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
     assert workflow =~ "proof:\n    needs: [metadata, package]\n    if: ${{ success() }}"
     refute before_proof =~ "release-candidate-proof-"
     assert proof_job =~ "release-candidate-proof-${{ needs.metadata.outputs.candidate_sha }}"
+    assert proof_job =~ "find packages payload-manifests toolchains verification-evidence"
+    assert proof_job =~ "evidence/payload-manifests/"
+    assert proof_job =~ "evidence/verification-evidence/"
 
     assert workflow =~
              "No proof artifact exists unless metadata, both test jobs, and both package jobs passed."

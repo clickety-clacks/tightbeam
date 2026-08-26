@@ -231,7 +231,7 @@ jobs:
             --expected-workflow-sha "$WORKFLOW_SHA"
           (
             cd evidence
-            find packages toolchains -type f -print | sort | xargs sha256sum
+            find packages payload-manifests toolchains verification-evidence -type f -print | sort | xargs sha256sum
             sha256sum release-candidate-manifest.json
           ) > evidence/SHA256SUMS
 
@@ -243,6 +243,8 @@ jobs:
             evidence/release-candidate-manifest.json
             evidence/SHA256SUMS
             evidence/packages/
+            evidence/payload-manifests/
             evidence/toolchains/
+            evidence/verification-evidence/
           retention-days: 90
           if-no-files-found: error

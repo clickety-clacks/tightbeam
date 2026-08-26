@@ -73,6 +73,28 @@ defmodule Tightbeam.PackagingTest do
     assert File.exists?(evidence)
   end
 
+  test "a manifest publication failure cannot publish the package" do
+    temporary = artifact_fixture("0.1.6", "0.1.6")
+    final = temporary <> ".final.tgz"
+    manifest = temporary <> ".payload-manifest.json"
+    final_manifest = Path.join(Path.dirname(final), "missing/manifest.json")
+    evidence = final <> ".verification-evidence.json"
+    create_manifest!(temporary, manifest)
+
+    {output, status} =
+      System.cmd(
+        "sh",
+        [@finalize, temporary, final, "0.1.6", manifest, final_manifest, evidence],
+        stderr_to_stdout: true
+      )
+
+    assert status == 1
+    assert output =~ "No such file or directory"
+    refute File.exists?(final)
+    refute File.exists?(final_manifest)
+    refute File.exists?(evidence)
+  end
+
   test "finalization refuses a payload manifest that does not match the archive" do
     temporary = artifact_fixture("0.1.6", "0.1.6")
     final = temporary <> ".final.tgz"
