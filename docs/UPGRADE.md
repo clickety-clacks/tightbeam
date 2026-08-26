@@ -1,6 +1,6 @@
 # Upgrading a running instance
 
-Stop it, swap the code, start it, check four things. There is no upgrade
+Stop it, swap the code, start it, check five things. There is no upgrade
 machinery and none is needed — the ledger is durable, so a restart is an
 ordinary event. What follows is what the stop actually does, established by
 running it rather than by reading `application.ex`.
@@ -33,7 +33,7 @@ kill -TERM <gateway pid>          # verified: this runs prep_stop, which drains
 git -C <checkout> pull            # or checkout the tag you are deploying
 mix deps.get && mix compile
 # 3. start
-# 4. verify — the four checks below
+# 4. verify — the five checks below
 ```
 
 ## What the stop actually does
@@ -112,6 +112,23 @@ faster than the work in flight would explain, treat it as a kill and check
    sender's decision — so anything that mattered has to be re-asked.
 4. **Queued work is moving.** `SELECT count(*) FROM turns WHERE status='queued';`
    should fall as lanes pick it up. If it does not, the lanes are not claiming.
+5. **A fresh agent can answer.** Run the existing feature smoke from the exact
+   source revision that built the installed package. Select one onboarded harness
+   and target the deployed base directory. For example, for Codex:
+   ```sh
+   TIGHTBEAM_BASE_DIR=<deployed-base-dir> \
+   TIGHTBEAM_SMOKE_LEGS=codex \
+   TIGHTBEAM_SMOKE_MODEL_CODEX='gpt-5.6-sol' \
+   TIGHTBEAM_SMOKE_EFFORT_CODEX='medium' \
+   mix run --no-start scripts/feature_smoke.exs
+   ```
+   Use a model that the deployed host currently lists if the example model is
+   unavailable. Require the `local deployment` check to spawn a new agent after
+   the restart, wake it, observe one real turn and reply, and retire it. A reply
+   from an agent that was already open proves only existing-session health. It
+   does not prove fresh-agent readiness. Do not call the deployed package ready
+   until the fresh-agent check passes. A one-leg run reports incomplete harness
+   parity by design; this readiness check does not replace the full release gate.
 
 ## What does NOT survive the restart
 
@@ -148,7 +165,7 @@ despite a timed-out drain; and the catch-all returning in 0ms with the DB down.
 Run and observed on a REAL GATEWAY (scratch org, port 11977, full stop → start →
 stop): `kill -TERM` runs `prep_stop` — the process exited in 2s and the epoch
 came back stamped, which is the whole basis for "SIGTERM is enough". The restart
-opened a fresh epoch with no `dirty_exit`, and all four checks below returned
+opened a fresh epoch with no `dirty_exit`, and the first four checks below returned
 what this document says they return, including `/version` answering
 `{"adapters":{},"protocolVersion":1,"server":"tightbeam"}`.
 
