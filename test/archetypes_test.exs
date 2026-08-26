@@ -143,6 +143,12 @@ defmodule Tightbeam.ArchetypesTest do
     manual = Archetypes.builtin_fragments()["operating-manual.md"]
     assert manual =~ "shell tool"
     assert manual =~ "PATH"
+    assert manual =~ "## Device lifecycle"
+    assert manual =~ "tightbeam approve-device <deviceId>"
+    assert manual =~ "tightbeam deny-device <deviceId>"
+    assert manual =~ "tightbeam revoke-device <deviceId>"
+    assert manual =~ "calling session belongs to an admin"
+    assert manual =~ "role name does not grant admin access"
     assert Map.keys(Archetypes.builtin_fragments()) == ["operating-manual.md"]
     refute manual =~ "--role reviewer"
     refute manual =~ "--role coder"

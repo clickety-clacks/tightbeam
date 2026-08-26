@@ -200,6 +200,153 @@ defmodule Tightbeam.CliIntegrationTest do
     assert version == CliCompatibility.required_version()
   end
 
+  test "device lifecycle CLI exposes safe remedies and preserves admin and version gates", ctx do
+    pending_id = "phone; echo unsafe"
+
+    assert {:pending, _} =
+             Devices.pair(ctx.db, %{
+               device_id: pending_id,
+               claimed_name: "Flynn Phone",
+               platform: "ios",
+               model: "phone"
+             })
+
+    {listed, 0} = System.cmd(ctx.binary, ["list"], cd: ctx.workdir, stderr_to_stdout: true)
+    pending = JSON.decode!(listed)["pendingDevices"]
+
+    assert [
+             %{
+               "deviceId" => ^pending_id,
+               "remedies" => %{
+                 "approve" => "tightbeam approve-device <deviceId> [--user <userId>]",
+                 "deny" => "tightbeam deny-device <deviceId>"
+               }
+             }
+           ] = pending
+
+    refute pending |> hd() |> get_in(["remedies", "approve"]) =~ pending_id
+    refute pending |> hd() |> get_in(["remedies", "deny"]) =~ pending_id
+
+    {approved, 0} =
+      System.cmd(ctx.binary, ["approve-device", pending_id, "--user", "flynn"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert JSON.decode!(approved) == %{
+             "approved" => %{
+               "deviceId" => pending_id,
+               "isAdmin" => true,
+               "userId" => "flynn"
+             }
+           }
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "approve-device",
+                      principal: {:session, "cli-holder"},
+                      params: %{device_id: ^pending_id, user_id: "flynn"}
+                    }}
+
+    approved_device = Devices.by_id(ctx.db, pending_id)
+    assert approved_device.status == "allowlisted"
+    assert is_binary(approved_device.token)
+
+    assert {:pending, _} =
+             Devices.pair(ctx.db, %{
+               device_id: "operator-device",
+               claimed_name: "Operator",
+               platform: nil,
+               model: nil
+             })
+
+    Org.create(ctx.db, %{
+      session_key: Org.personal_session_key("operator"),
+      display_name: "Operator Main",
+      kind: "main",
+      is_built_in: true,
+      owner_user_id: "operator",
+      origin: "user:operator",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("fable")
+    })
+
+    operator =
+      Org.create(ctx.db, %{
+        session_key: "device-operator",
+        display_name: "Device Operator",
+        owner_user_id: "operator",
+        origin: "user:operator",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+
+    Roles.create!(ctx.db, "device-operator", "operator", operator.session_key)
+    operator_dir = session_workdir!(ctx, operator)
+
+    {forbidden, 1} =
+      System.cmd(ctx.binary, ["revoke-device", pending_id],
+        cd: operator_dir,
+        stderr_to_stdout: true
+      )
+
+    assert forbidden =~ "forbidden"
+    assert forbidden =~ "admin required"
+    assert Devices.by_id(ctx.db, pending_id).token == approved_device.token
+
+    {cli_version, 0} = System.cmd(ctx.binary, ["version"])
+    %Version{major: major} = cli_version |> String.trim() |> Version.parse!()
+
+    {:ok, {{_version, 426, _reason}, _headers, raw_body}} =
+      :httpc.request(
+        :post,
+        {~c"http://127.0.0.1:#{ctx.port}/agent/dispatch",
+         [
+           {~c"authorization", ~c"Bearer #{ctx.session.cli_token}"},
+           {~c"x-tightbeam-cli-version", ~c"#{major + 1}.0.0"}
+         ], ~c"application/json",
+         JSON.encode!(%{verb: "revoke-device", params: %{deviceId: pending_id}})},
+        [],
+        []
+      )
+
+    assert get_in(JSON.decode!(to_string(raw_body)), ["error", "code"]) == "incompatible_cli"
+    assert Devices.by_id(ctx.db, pending_id).token == approved_device.token
+
+    assert {:pending, _} =
+             Devices.pair(ctx.db, %{
+               device_id: "denied-device",
+               claimed_name: "Denied Device",
+               platform: nil,
+               model: nil
+             })
+
+    {denied, 0} =
+      System.cmd(ctx.binary, ["deny-device", "denied-device"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert JSON.decode!(denied) == %{"denied" => "denied-device"}
+    assert Devices.by_id(ctx.db, "denied-device").status == "denied"
+
+    {revoked, 0} =
+      System.cmd(ctx.binary, ["revoke-device", pending_id],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert JSON.decode!(revoked) == %{"revoked" => pending_id}
+    assert Devices.by_id(ctx.db, pending_id).status == "allowlisted"
+    assert Devices.by_id(ctx.db, pending_id).token == nil
+  end
+
   test "version refusal is distinguishable from auth and network failures", ctx do
     session_file = Path.join(ctx.base_dir, "work/session/.tightbeam-session")
 

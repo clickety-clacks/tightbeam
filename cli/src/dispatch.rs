@@ -864,6 +864,35 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 format!("\"isAdmin\":{admin}"),
             ],
         )),
+        Command::ApproveDevice {
+            identity,
+            device_id,
+            user_id,
+        } => {
+            let mut params = vec![string_field("deviceId", device_id)];
+            if let Some(value) = user_id {
+                params.push(string_field("userId", value));
+            }
+            Ok(request(identity, "approve-device", vec![], params))
+        }
+        Command::DenyDevice {
+            identity,
+            device_id,
+        } => Ok(request(
+            identity,
+            "deny-device",
+            vec![],
+            vec![string_field("deviceId", device_id)],
+        )),
+        Command::RevokeDevice {
+            identity,
+            device_id,
+        } => Ok(request(
+            identity,
+            "revoke-device",
+            vec![],
+            vec![string_field("deviceId", device_id)],
+        )),
         Command::ConfigGet { identity, setting } => Ok(request(
             identity,
             "config",
@@ -1572,6 +1601,9 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::IdentityApply { identity, .. }
         | Command::Onboard { identity, .. }
         | Command::AddUser { identity, .. }
+        | Command::ApproveDevice { identity, .. }
+        | Command::DenyDevice { identity, .. }
+        | Command::RevokeDevice { identity, .. }
         | Command::ConfigGet { identity, .. }
         | Command::ConfigSet { identity, .. }
         | Command::HostEnvSet { identity, .. }
@@ -1731,6 +1763,33 @@ mod tests {
         assert_eq!(
             body(&["add-user", "guest", "--admin", "--as-user", "flynn"]),
             r#"{"asUser":"flynn","verb":"add-user","params":{"userId":"guest","isAdmin":true}}"#
+        );
+    }
+
+    #[test]
+    fn device_lifecycle_commands_build_byte_exact_gateway_requests() {
+        assert_eq!(
+            body(&[
+                "approve-device",
+                "phone-2",
+                "--user",
+                "flynn",
+                "--as",
+                "operator",
+            ]),
+            r#"{"as":"operator","verb":"approve-device","params":{"deviceId":"phone-2","userId":"flynn"}}"#
+        );
+        assert_eq!(
+            body(&["approve-device", "phone-2", "--as-user", "flynn"]),
+            r#"{"asUser":"flynn","verb":"approve-device","params":{"deviceId":"phone-2"}}"#
+        );
+        assert_eq!(
+            body(&["deny-device", "phone-3", "--as-user", "flynn"]),
+            r#"{"asUser":"flynn","verb":"deny-device","params":{"deviceId":"phone-3"}}"#
+        );
+        assert_eq!(
+            body(&["revoke-device", "phone-1", "--as-user", "flynn"]),
+            r#"{"asUser":"flynn","verb":"revoke-device","params":{"deviceId":"phone-1"}}"#
         );
     }
 

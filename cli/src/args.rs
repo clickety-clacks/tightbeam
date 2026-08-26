@@ -348,6 +348,19 @@ pub enum Command {
         user_id: String,
         admin: bool,
     },
+    ApproveDevice {
+        identity: Identity,
+        device_id: String,
+        user_id: Option<String>,
+    },
+    DenyDevice {
+        identity: Identity,
+        device_id: String,
+    },
+    RevokeDevice {
+        identity: Identity,
+        device_id: String,
+    },
     ConfigGet {
         identity: Identity,
         setting: String,
@@ -542,7 +555,8 @@ COMMANDS:
   list
       Show the sessions you can address (with handles + provenance), the
       org's shape — archetypes (with allowed hosts), known hosts, and the
-      valid model catalog per harness — and, for admins, pending devices.
+      valid model catalog per harness — and, for admins, pending devices with
+      the approve-device and deny-device remedies that act on them.
         tightbeam list --as orchestrator:news
 
   retire --session <key> [--key <idempotencyKey>]
@@ -712,6 +726,14 @@ COMMANDS:
       Add a user, optionally as an admin. An existing admin may run this over
       the ordinary gateway path. On an empty local org, the first user is
       created directly and becomes admin by the existing cold-start rule.
+  approve-device <deviceId> [--user <userId>]
+      Approve one pending device. Without --user, keep the user claimed during
+      pairing. With --user, attach the device to that exact user.
+  deny-device <deviceId>
+      Deny one pending device and clear its token.
+  revoke-device <deviceId>
+      Revoke one device's current token. Its allowlisted status is unchanged,
+      so a later pairing mints a new token.
   config get default-archetype                   read the default spawn archetype
   config set default-archetype <name>            set the default spawn archetype
   host-env-set --host <host> --harness <harness> NAME=VALUE
@@ -1958,6 +1980,55 @@ fn parse_with_optional_catalog(
                 admin: flags.contains_key("admin"),
             })
         }
+        "approve-device" => {
+            let usage = "usage: tightbeam approve-device <deviceId> [--user <userId>]";
+            let device_id = parsed
+                .positional
+                .get(1)
+                .filter(|_| parsed.positional.len() == 2)
+                .cloned()
+                .ok_or_else(|| usage.to_owned())?;
+            if flags
+                .keys()
+                .any(|flag| !matches!(flag.as_str(), "user" | "as" | "as-user" | "as-process"))
+                || flags.get("user").is_some_and(String::is_empty)
+            {
+                return Err(usage.to_owned());
+            }
+            Ok(Command::ApproveDevice {
+                identity: identity(flags)?,
+                device_id,
+                user_id: nonempty(flags, "user"),
+            })
+        }
+        "deny-device" | "revoke-device" => {
+            let command = parsed.positional[0].as_str();
+            let usage = format!("usage: tightbeam {command} <deviceId>");
+            let device_id = parsed
+                .positional
+                .get(1)
+                .filter(|_| parsed.positional.len() == 2)
+                .cloned()
+                .ok_or_else(|| usage.clone())?;
+            if flags
+                .keys()
+                .any(|flag| !matches!(flag.as_str(), "as" | "as-user" | "as-process"))
+            {
+                return Err(usage);
+            }
+            let identity = identity(flags)?;
+            if command == "deny-device" {
+                Ok(Command::DenyDevice {
+                    identity,
+                    device_id,
+                })
+            } else {
+                Ok(Command::RevokeDevice {
+                    identity,
+                    device_id,
+                })
+            }
+        }
         "config" => parse_config(&parsed, flags),
         "host-env-set" => parse_host_env_set(&parsed, flags),
         "host-env-list" => parse_host_env_list(&parsed, flags),
@@ -2004,7 +2075,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, ask, answer, return, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, ask, answer, return, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, approve-device, deny-device, revoke-device, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -2451,6 +2522,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn device_lifecycle_commands_name_only_the_device_and_optional_approval_user() {
+        assert_eq!(
+            parse(strings(&[
+                "approve-device",
+                "phone-2",
+                "--user",
+                "flynn",
+                "--as",
+                "operator",
+            ])),
+            Ok(Command::ApproveDevice {
+                identity: Identity::Role("operator".to_owned()),
+                device_id: "phone-2".to_owned(),
+                user_id: Some("flynn".to_owned()),
+            })
+        );
+        assert_eq!(
+            parse(strings(&["deny-device", "phone-3"])),
+            Ok(Command::DenyDevice {
+                identity: Identity::Session,
+                device_id: "phone-3".to_owned(),
+            })
+        );
+        assert_eq!(
+            parse(strings(
+                &["revoke-device", "phone-1", "--as-user", "flynn",]
+            )),
+            Ok(Command::RevokeDevice {
+                identity: Identity::User("flynn".to_owned()),
+                device_id: "phone-1".to_owned(),
+            })
+        );
+
+        for args in [
+            strings(&["approve-device"]),
+            strings(&["approve-device", "phone-2", "extra"]),
+            strings(&["approve-device", "phone-2", "--user", ""]),
+            strings(&["approve-device", "phone-2", "--admin"]),
+        ] {
+            assert_eq!(
+                parse(args),
+                Err("usage: tightbeam approve-device <deviceId> [--user <userId>]".to_owned())
+            );
+        }
+        for (command, flag) in [("deny-device", "--user"), ("revoke-device", "--admin")] {
+            assert_eq!(
+                parse(strings(&[command, "phone", flag, "flynn"])),
+                Err(format!("usage: tightbeam {command} <deviceId>"))
+            );
+        }
+    }
+
     /// The catalog every tune test validates `--harness` against.
     fn tune_catalog() -> crate::harnesses::HarnessCatalog {
         crate::harnesses::HarnessCatalog {
@@ -2795,6 +2919,7 @@ mod tests {
             headings,
             [
                 "answer",
+                "approve-device",
                 "ask",
                 "assimilate",
                 "assign",
@@ -2809,6 +2934,7 @@ mod tests {
                 "config",
                 "coordination-share",
                 "decision-requests",
+                "deny-device",
                 "digest-members",
                 "dispatch",
                 "doctor",
@@ -2824,6 +2950,7 @@ mod tests {
                 "onboard",
                 "retire",
                 "return",
+                "revoke-device",
                 "reopen-assignment",
                 "revoke-assignment",
                 "spawn",
@@ -2854,6 +2981,9 @@ mod tests {
             "identity apply (<session> | --all)",
             "onboard openai|anthropic [--api-key]",
             "add-user <userId> [--admin]",
+            "approve-device <deviceId> [--user <userId>]",
+            "deny-device <deviceId>",
+            "revoke-device <deviceId>",
             "config get default-archetype",
             "config set default-archetype <name>",
             "host-env-set --host <host> --harness <harness> NAME=VALUE",
@@ -3416,7 +3546,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, ask, answer, return, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, ask, answer, return, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, approve-device, deny-device, revoke-device, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned())
         );
     }
 
@@ -3471,9 +3601,6 @@ mod tests {
             "setup",
             "role",
             "kungfu-scaffold",
-            "approve-device",
-            "deny-device",
-            "revoke-device",
             "promote-user",
         ] {
             assert!(
@@ -3674,6 +3801,35 @@ mod tests {
                 strings(&["list", "--as-process", "cron"]),
                 Command::List {
                     identity: Identity::Process("cron".to_owned()),
+                },
+            ),
+            (
+                strings(&[
+                    "approve-device",
+                    "phone-2",
+                    "--user",
+                    "flynn",
+                    "--as-user",
+                    "flynn",
+                ]),
+                Command::ApproveDevice {
+                    identity: Identity::User("flynn".to_owned()),
+                    device_id: "phone-2".to_owned(),
+                    user_id: Some("flynn".to_owned()),
+                },
+            ),
+            (
+                strings(&["deny-device", "phone-3", "--as-user", "flynn"]),
+                Command::DenyDevice {
+                    identity: Identity::User("flynn".to_owned()),
+                    device_id: "phone-3".to_owned(),
+                },
+            ),
+            (
+                strings(&["revoke-device", "phone-1", "--as-user", "flynn"]),
+                Command::RevokeDevice {
+                    identity: Identity::User("flynn".to_owned()),
+                    device_id: "phone-1".to_owned(),
                 },
             ),
             (

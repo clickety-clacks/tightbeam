@@ -26,6 +26,21 @@ no identity flag is required. Use `--as <role>` to attribute the command to a sp
 the session holds. Use `--as-user <id>` to attribute it to the human. An identity is who the
 command is attributed to, not its target.
 
+## Device lifecycle
+The first device that pairs with an empty org becomes allowlisted. Each later new device
+enters the pending queue. An admin can see that queue with `tightbeam list`; each
+`pendingDevices` row names the safe `approve-device` and `deny-device` command forms.
+
+Run `tightbeam approve-device <deviceId>` to keep the user claimed during pairing. Add
+`--user <userId>` to attach the device to that exact user. Run
+`tightbeam deny-device <deviceId>` to deny the pending device. After approval, pair again
+to receive the minted device token.
+
+Run `tightbeam revoke-device <deviceId>` to clear a device's current token. Revocation keeps
+the device allowlisted, so a later pairing mints a new token. The three lifecycle commands
+require an admin user. An agent can run them when its calling session belongs to an admin
+user; the agent role name does not grant admin access.
+
 ## Talk to a colleague: wake
 Agents communicate by waking each other — delivering a prompt to a mailbox:
 

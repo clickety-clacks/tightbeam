@@ -4320,7 +4320,14 @@ defmodule Tightbeam.Gateway do
         if admin_origin?(db, call.origin) do
           pending =
             Devices.list_pending(db)
-            |> Enum.map(&Map.take(&1, [:device_id, :claimed_name, :user_id, :platform, :model]))
+            |> Enum.map(fn device ->
+              device
+              |> Map.take([:device_id, :claimed_name, :user_id, :platform, :model])
+              |> Map.put(:remedies, %{
+                approve: "tightbeam approve-device <deviceId> [--user <userId>]",
+                deny: "tightbeam deny-device <deviceId>"
+              })
+            end)
 
           Map.put(result, :pending_devices, pending)
         else
