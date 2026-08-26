@@ -1459,6 +1459,7 @@ trait CeremonyIo {
         timeout: Duration,
     ) -> Result<String, ExecFailure>;
     fn dispatch(&mut self, request: &RequestSpec) -> Result<Option<serde_json::Value>, String>;
+    fn current_exe(&self) -> Result<PathBuf, String>;
     fn release_cli(&mut self, target: &str) -> Result<ReleaseCli, ExecFailure>;
 }
 
@@ -1581,6 +1582,10 @@ impl CeremonyIo for SystemIo {
         dispatch::send(request)
     }
 
+    fn current_exe(&self) -> Result<PathBuf, String> {
+        std::env::current_exe().map_err(|error| error.to_string())
+    }
+
     fn release_cli(&mut self, target: &str) -> Result<ReleaseCli, ExecFailure> {
         fetch_release_cli(target).map_err(release_failure)
     }
@@ -1677,7 +1682,16 @@ fn update_clients_with(io: &mut dyn CeremonyIo, as_user: &str) -> Result<(), Str
                         ));
                         continue;
                     };
-                    match ship_release_cli(io, false, &host.ssh, &cli_bin, &remote_target) {
+                    if remote_target != local_target_triple() {
+                        failed += 1;
+                        io.log(&format!(
+                            "[update-clients] {}: incompatible — local target {} differs from satellite target {remote_target}",
+                            host.name,
+                            local_target_triple()
+                        ));
+                        continue;
+                    }
+                    match ship_current_cli(io, false, &host.ssh, &cli_bin) {
                         Ok(()) => io.log(&format!(
                             "[update-clients] {}: updated ({version} -> {current_version})",
                             host.name
@@ -2263,6 +2277,32 @@ fn ship_release_cli(
     } else {
         io.release_cli(target)?
     };
+    ship_cli_path(io, dry_run, ssh_dest, cli_bin, &release_cli.path)
+}
+
+fn ship_current_cli(
+    io: &mut dyn CeremonyIo,
+    dry_run: bool,
+    ssh_dest: &str,
+    cli_bin: &str,
+) -> Result<(), ExecFailure> {
+    let executable = io.current_exe().map_err(|message| ExecFailure {
+        message,
+        stdout: String::new(),
+        stderr: String::new(),
+        status: None,
+        timed_out: false,
+    })?;
+    ship_cli_path(io, dry_run, ssh_dest, cli_bin, &executable)
+}
+
+fn ship_cli_path(
+    io: &mut dyn CeremonyIo,
+    dry_run: bool,
+    ssh_dest: &str,
+    cli_bin: &str,
+    executable: &Path,
+) -> Result<(), ExecFailure> {
     ssh(
         io,
         dry_run,
@@ -2283,7 +2323,7 @@ fn ship_release_cli(
                 "-o".to_owned(),
                 "BatchMode=yes".to_owned(),
                 "--".to_owned(),
-                release_cli.path.display().to_string(),
+                executable.display().to_string(),
                 // NOT `shell_quote`d, unlike every `ssh` command below. scp has shipped the
                 // SFTP protocol by default since OpenSSH 9.0, and SFTP takes this path
                 // LITERALLY -- there is no remote shell to remove quotes, so quoting it
@@ -2436,7 +2476,6 @@ fn display_command(file: &str, args: &[String]) -> String {
         .join(" ")
 }
 
-#[cfg(test)]
 fn local_target_triple() -> &'static str {
     env!("TIGHTBEAM_BUILD_TARGET")
 }
@@ -3572,6 +3611,10 @@ mod tests {
                 self.release_clis.remove(0).map(ReleaseCli::fixture)
             }
         }
+
+        fn current_exe(&self) -> Result<PathBuf, String> {
+            Ok(PathBuf::from("/tmp/tightbeam"))
+        }
     }
 
     fn local_platform() -> &'static str {
@@ -3897,34 +3940,25 @@ mod tests {
     }
 
     #[test]
-    fn update_clients_fetches_the_satellites_cross_arch_release() {
+    fn incompatible_target_does_not_ship() {
         let remote = if local_target_triple().contains("apple") {
             "Linux x86_64"
         } else {
             "Darwin arm64"
         };
-        let remote_target = target_from_probe(remote).unwrap();
-        let mut io = one_update_host(vec![
-            Ok("0.0.9\n".to_owned()),
-            Ok(format!("{remote}\n")),
-            Ok(String::new()),
-            Ok(String::new()),
-            Ok(String::new()),
-            Ok(format!("{}\n", env!("CARGO_PKG_VERSION"))),
-            Ok(String::new()),
-        ]);
+        let mut io = one_update_host(vec![Ok("0.0.9\n".to_owned()), Ok(format!("{remote}\n"))]);
 
-        update_clients_with(&mut io, "flynn").unwrap();
+        let error = update_clients_with(&mut io, "flynn").unwrap_err();
 
         assert_eq!(
             io.commands
                 .iter()
                 .map(|(file, _)| file.as_str())
                 .collect::<Vec<_>>(),
-            vec!["ssh", "ssh", "ssh", "scp", "ssh", "ssh", "ssh"]
+            vec!["ssh", "ssh"]
         );
-        assert_eq!(io.release_targets, vec![remote_target]);
-        assert!(io.logs[0].contains("updated"));
+        assert!(io.logs[0].contains("incompatible"));
+        assert!(error.contains("failed for 1 host"));
     }
 
     #[test]
