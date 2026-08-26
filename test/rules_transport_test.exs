@@ -5,7 +5,7 @@ defmodule Tightbeam.RulesTransportTest do
   import Plug.Conn
   import Plug.Test
 
-  alias Tightbeam.{ConnRegistry, DB, Devices, EventLog, Org, Roles, Rules}
+  alias Tightbeam.{ConnRegistry, DB, EventLog, Org, Roles, Rules}
   alias Tightbeam.Wire.{Router, Socket}
 
   setup do
@@ -59,22 +59,9 @@ defmodule Tightbeam.RulesTransportTest do
       end)
 
     {:paired, device} =
-      Devices.pair(db, %{device_id: "d1", claimed_name: "Flynn", platform: nil, model: nil})
+      claim_org(db, %{device_id: "d1", claimed_name: "Flynn", platform: nil, model: nil})
 
-    main =
-      Org.create(db, %{
-        session_key: Org.personal_session_key(device.user_id),
-        display_name: "Main",
-        kind: "main",
-        is_built_in: true,
-        owner_user_id: device.user_id,
-        origin: "user:#{device.user_id}",
-        archetype: "default",
-        host: "testhost",
-        harness: "claude",
-        provider: "anthropic",
-        model: Model.new("fable")
-      })
+    main = Org.get(db, Org.personal_session_key(device.user_id))
 
     actor =
       Org.create(db, %{
@@ -177,7 +164,10 @@ defmodule Tightbeam.RulesTransportTest do
     refute_received {:handler_invoked, _}
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM domain_mutations")
 
-    events = EventLog.events_after(ctx.db, 0, 10)
+    events =
+      ctx.db
+      |> EventLog.events_after(0, 10)
+      |> Enum.reject(&(&1.verb == "cold-start"))
 
     assert Enum.map(events, &{&1.kind, &1.verb}) == [
              {"denied", "post"},
@@ -221,6 +211,10 @@ defmodule Tightbeam.RulesTransportTest do
            } = JSON.decode!(response.resp_body)
 
     refute_received {:handler_invoked, "tune"}
-    assert [%{kind: "denied", verb: "tune"}] = EventLog.events_after(ctx.db, 0, 10)
+
+    assert [%{kind: "denied", verb: "tune"}] =
+             ctx.db
+             |> EventLog.events_after(0, 10)
+             |> Enum.reject(&(&1.verb == "cold-start"))
   end
 end

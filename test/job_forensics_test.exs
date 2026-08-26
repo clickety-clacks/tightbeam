@@ -58,7 +58,7 @@ defmodule Tightbeam.JobForensicsTest do
     :ok =
       DB.execute(
         db,
-        "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn',1,1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn',1,'admin_add',1)"
       )
 
     ensure_main_session(db, "flynn")
@@ -858,7 +858,10 @@ defmodule Tightbeam.JobForensicsTest do
     :ok = Tightbeam.Schema.ensure_all(legacy_db)
 
     :ok =
-      DB.execute(legacy_db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn',1,1)")
+      DB.execute(
+        legacy_db,
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('flynn',1,'admin_add',1)"
+      )
 
     work_item(legacy_db, "wi_legacy_cancel")
 

@@ -8,6 +8,7 @@ defmodule Tightbeam.EffortCheckinTest do
     Assignments,
     ConnRegistry,
     DB,
+    Devices,
     EffortCheckin,
     Gateway,
     Ledger,
@@ -48,20 +49,16 @@ defmodule Tightbeam.EffortCheckinTest do
 
     :ok = Tightbeam.Schema.ensure_all(db)
 
-    :ok =
-      DB.execute(
-        db,
-        "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('h1',0,1),('h2',0,1),('admin',1,1)"
-      )
+    {:paired, _device} =
+      claim_org(db, %{device_id: "effort-device", claimed_name: "h1", platform: nil, model: nil})
+
+    Devices.add_user(db, "h2", false)
+    Devices.add_user(db, "admin", true)
 
     host = Placement.local_host_name()
     main_key = Org.personal_session_key("h1")
 
-    main =
-      session(db, main_key, "h1", host, %{
-        kind: "main",
-        is_built_in: true
-      })
+    main = Org.get(db, main_key)
 
     ensure_main_session(db, "h2")
     parent = session(db, "parent", "h1", host)

@@ -32,7 +32,7 @@ defmodule Tightbeam.Wire.RouterTest do
     on_exit(fn -> File.rm_rf!(base_dir) end)
 
     {:paired, device} =
-      Devices.pair(db, %{device_id: "d1", claimed_name: "Flynn", platform: nil, model: nil})
+      claim_org(db, %{device_id: "d1", claimed_name: "Flynn", platform: nil, model: nil})
 
     ensure_main_session(db, device.user_id)
 
@@ -134,6 +134,12 @@ defmodule Tightbeam.Wire.RouterTest do
         base_dir: base_dir,
         handlers: handlers,
         cli_token: "tbc_test",
+        defaults: %{
+          host: "testhost",
+          harness: :claude,
+          provider: :anthropic,
+          model: Model.new("fable")
+        },
         session_status: fn _ -> nil end
       ]
     }
@@ -197,10 +203,60 @@ defmodule Tightbeam.Wire.RouterTest do
     assert response.status == 403
 
     assert JSON.decode!(response.resp_body) == %{
-             "error" => %{"code" => "forbidden", "message" => "admin required"}
+             "error" => %{
+               "code" => "invalid_identity",
+               "message" => "asserted user does not exist"
+             }
            }
 
     assert Devices.user(db, "first") == nil
+  end
+
+  test "loopback bootstrap-user reserves the first user and Main through the gateway", ctx do
+    {db, opts} = empty_router(ctx, "loopback_bootstrap")
+
+    response =
+      dispatch_cli(%{ctx | opts: opts}, "tbc_test", %{
+        verb: "bootstrap-user",
+        params: %{userId: "alice"}
+      })
+
+    assert response.status == 200
+
+    assert %{
+             "result" => %{
+               "phase" => "reserved",
+               "userId" => "alice",
+               "isAdmin" => true,
+               "rootSessionKey" => root
+             }
+           } = JSON.decode!(response.resp_body)
+
+    assert root == Org.personal_session_key("alice")
+    assert Devices.user(db, "alice").creation_kind == "gateway_local_bootstrap"
+  end
+
+  test "non-loopback bootstrap-user refuses before any database write", ctx do
+    {db, opts} = empty_router(ctx, "remote_bootstrap")
+
+    response =
+      conn(
+        :post,
+        "/agent/dispatch",
+        JSON.encode!(%{verb: "bootstrap-user", params: %{userId: "alice"}})
+      )
+      |> Map.put(:remote_ip, {10, 0, 0, 8})
+      |> put_req_header("authorization", "Bearer tbc_test")
+      |> put_req_header("x-tightbeam-cli-version", Tightbeam.CliCompatibility.required_version())
+      |> Router.call(Router.init(opts))
+
+    assert response.status == 403
+
+    assert JSON.decode!(response.resp_body) == %{
+             "error" => %{"code" => "forbidden", "message" => "local bootstrap required"}
+           }
+
+    assert Devices.user(db, "alice") == nil
   end
 
   test "authenticated harness projection route returns the registry bytes", ctx do
@@ -1045,7 +1101,7 @@ defmodule Tightbeam.Wire.RouterTest do
       })
 
     assert union.status == 400
-    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM events")
+    assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT count(*) FROM events")
 
     forbidden =
       dispatch_cli(ctx, "tbc_test", %{
@@ -1629,6 +1685,20 @@ defmodule Tightbeam.Wire.RouterTest do
     |> put_req_header("authorization", "Bearer #{bearer}")
     |> put_req_header("x-tightbeam-cli-version", Tightbeam.CliCompatibility.required_version())
     |> Router.call(Router.init(ctx.opts))
+  end
+
+  defp empty_router(ctx, label) do
+    db = :"#{label}_#{System.unique_integer([:positive])}"
+    start_supervised!(%{id: db, start: {DB, :start_link, [[path: ":memory:", name: db]]}})
+    :ok = Tightbeam.Schema.ensure_all(db)
+
+    opts =
+      Keyword.merge(ctx.opts,
+        db: db,
+        handlers: Gateway.handlers(%{db: db, base_dir: ctx.base_dir})
+      )
+
+    {db, opts}
   end
 
   # INVARIANT: a non-ok session-control response always carries a code.
