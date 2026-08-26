@@ -5,6 +5,7 @@ defmodule Tightbeam.Assignments do
 
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
+  alias Tightbeam.Firehose.Publisher
   alias Tightbeam.Harness.Support
 
   alias Tightbeam.{
@@ -61,6 +62,7 @@ defmodule Tightbeam.Assignments do
     closingAttestId TEXT NULL REFERENCES attests(id),
     workItemId TEXT NULL REFERENCES work_items(id),
     reviewsAssignmentId TEXT NULL REFERENCES assignments(id),
+    completionReportToSessionKey TEXT NULL REFERENCES sessions(sessionKey),
     holderHarness TEXT NULL,
     holderProvider TEXT NULL,
     CHECK(holderRole IS NOT NULL OR holderFallback = 0),
@@ -642,7 +644,8 @@ defmodule Tightbeam.Assignments do
          :ok <- valid_subject(call.params[:subject]),
          :ok <- valid_idempotency_key(call.params[:idempotency_key]),
          :ok <- valid_effect_kind(call.params[:effect_kind]),
-         {:ok, _files} <- assignment_files(verb, call.params) do
+         {:ok, _files} <- assignment_files(verb, call.params),
+         :ok <- valid_report_to(db, call.session_key, call.params[:report_to_session_key]) do
       key = call.params[:idempotency_key]
       replay = if is_binary(key), do: replayed_assignment(db, call), else: nil
 
@@ -694,16 +697,20 @@ defmodule Tightbeam.Assignments do
                 if Wakes.rumination_exists_in_txn?(txn, id, caller_session) do
                   {:open, resolved_call}
                 else
-                  Wakes.schedule_in_txn(txn, %{
-                    session_key: caller_session,
-                    origin: call.origin,
-                    creator_session_key: caller_session,
-                    prompt:
-                      "digest: Ruminate on work-item #{id} against the whole spec and its spirit before you fan out. Intent you were about to dispatch: subject=#{call.params[:subject]} brief=#{call.params[:brief]}. When you've thought it through, re-issue the dispatch.",
-                    due_at: now(),
-                    rumination: true,
-                    work_item_id: id
-                  })
+                  wake =
+                    Wakes.schedule_in_txn(txn, %{
+                      session_key: caller_session,
+                      origin: call.origin,
+                      creator_session_key: caller_session,
+                      prompt:
+                        "digest: Ruminate on work-item #{id} against the whole spec and its spirit before you fan out. Intent you were about to dispatch: subject=#{call.params[:subject]} brief=#{call.params[:brief]}. When you've thought it through, re-issue the dispatch.",
+                      due_at: now(),
+                      rumination: true,
+                      work_item_id: id
+                    })
+
+                  Publisher.maybe_observed_accepted_in_txn(txn, call)
+                  Wakes.publish_change_in_txn(txn, "wake.scheduled", wake.wake_id)
 
                   %{
                     rumination_required: true,
@@ -800,20 +807,38 @@ defmodule Tightbeam.Assignments do
          :ok <- valid_idempotency_key(call.params[:idempotency_key]),
          :ok <- valid_effect_kind(call.params[:effect_kind]),
          {:ok, files} <- assignment_files(verb, call.params),
+         :ok <- valid_report_to(db, call.session_key, call.params[:report_to_session_key]),
          :ok <- extra_validation.() do
       owner = principal_id(call.principal)
       key = call.params[:idempotency_key]
 
       result =
         transaction(db, fn txn ->
-          case open_assignment_in_txn(txn, call, owner, key, files, verb) do
-            {:created, assignment} ->
-              created = after_create.(txn, assignment)
-              accept_assignment_in_txn(created, txn, call)
+          result =
+            case open_assignment_in_txn(txn, call, owner, key, files, verb) do
+              {:created, assignment} ->
+                created = after_create.(txn, assignment)
+                accept_assignment_in_txn(created, txn, call)
 
-            other ->
-              other
+              other ->
+                other
+            end
+
+          case result do
+            {:accepted_in_txn, _event_id, {:created, assignment, _delivery}} ->
+              Publisher.maybe_accepted_in_txn(txn, call, assignment)
+
+            {:created, assignment, _delivery} ->
+              Publisher.maybe_accepted_in_txn(txn, call, assignment)
+
+            {:replayed, assignment} ->
+              Publisher.maybe_accepted_in_txn(txn, call, assignment)
+
+            _ ->
+              :ok
           end
+
+          result
         end)
 
       case result do
@@ -903,21 +928,27 @@ defmodule Tightbeam.Assignments do
 
       result =
         transaction(db, fn txn ->
-          case IdPrefix.resolve_in_txn(txn, :assignment, supplied) do
-            {:ok, id} ->
-              id_resolved(call, txn, :assignment, id)
-              resolved_call = put_in(call, [:params, :assignment_id], id)
+          result =
+            case IdPrefix.resolve_in_txn(txn, :assignment, supplied) do
+              {:ok, id} ->
+                id_resolved(call, txn, :assignment, id)
+                resolved_call = put_in(call, [:params, :assignment_id], id)
 
-              with :ok <- commit_ref_filing_allowed_in_txn(txn, resolved_call) do
-                attest_in_txn(txn, resolved_call)
-              end
+                with :ok <- commit_ref_filing_allowed_in_txn(txn, resolved_call) do
+                  attest_in_txn(txn, resolved_call)
+                end
 
-            :unknown ->
-              error("unknown_assignment", "unknown assignment: #{supplied}")
+              :unknown ->
+                error("unknown_assignment", "unknown assignment: #{supplied}")
 
-            {:ambiguous, error} ->
-              error
-          end
+              {:ambiguous, error} ->
+                error
+            end
+
+          if is_map(result) and not Map.has_key?(result, :code),
+            do: Publisher.maybe_accepted_in_txn(txn, call, result)
+
+          result
         end)
 
       if not Map.has_key?(result, :code) and match?({_id, {:ok, _}}, from) do
@@ -1102,17 +1133,23 @@ defmodule Tightbeam.Assignments do
             end
           end
 
-          case IdPrefix.resolve_in_txn(txn, :assignment, supplied, visible?) do
-            {:ok, id} ->
-              id_resolved(call, txn, :assignment, id)
-              revoke_in_txn(txn, put_in(call, [:params, :assignment_id], id))
+          result =
+            case IdPrefix.resolve_in_txn(txn, :assignment, supplied, visible?) do
+              {:ok, id} ->
+                id_resolved(call, txn, :assignment, id)
+                revoke_in_txn(txn, put_in(call, [:params, :assignment_id], id))
 
-            :unknown ->
-              error("unknown_assignment", "unknown assignment: #{supplied}")
+              :unknown ->
+                error("unknown_assignment", "unknown assignment: #{supplied}")
 
-            {:ambiguous, error} ->
-              error
-          end
+              {:ambiguous, error} ->
+                error
+            end
+
+          if is_map(result) and not Map.has_key?(result, :code),
+            do: Publisher.maybe_accepted_in_txn(txn, call, result)
+
+          result
         end)
 
       if not Map.has_key?(result, :code) and match?({_id, {:ok, _}}, from) do
@@ -1161,17 +1198,23 @@ defmodule Tightbeam.Assignments do
             end
           end
 
-          case IdPrefix.resolve_in_txn(txn, :assignment, supplied, visible?) do
-            {:ok, id} ->
-              id_resolved(call, txn, :assignment, id)
-              reopen_in_txn(txn, put_in(call, [:params, :assignment_id], id))
+          result =
+            case IdPrefix.resolve_in_txn(txn, :assignment, supplied, visible?) do
+              {:ok, id} ->
+                id_resolved(call, txn, :assignment, id)
+                reopen_in_txn(txn, put_in(call, [:params, :assignment_id], id))
 
-            :unknown ->
-              error("unknown_assignment", "unknown assignment: #{supplied}")
+              :unknown ->
+                error("unknown_assignment", "unknown assignment: #{supplied}")
 
-            {:ambiguous, error} ->
-              error
-          end
+              {:ambiguous, error} ->
+                error
+            end
+
+          if is_map(result) and not Map.has_key?(result, :code),
+            do: Publisher.maybe_accepted_in_txn(txn, call, result)
+
+          result
         end)
 
       if not Map.has_key?(result, :code) and match?({_id, {:ok, _}}, from) do
@@ -1253,6 +1296,12 @@ defmodule Tightbeam.Assignments do
 
     if Txn.changes(txn) != 1, do: raise(TransitionRace)
     reopened = fetch_assignment!(txn, assignment_id)
+
+    CompletionEscalation.supersede_open_for_assignment_in_txn(
+      txn,
+      reopened.holderKey,
+      assignment_id
+    )
 
     # A terminal disposition DELETEs the entitlement row, so this arms a fresh
     # generation exactly as `assign` does — a reopened card is watched like any
@@ -1492,13 +1541,23 @@ defmodule Tightbeam.Assignments do
     do: {:error, error("invalid", "--after takes an attest id")}
 
   defp create_assignment(txn, call, owner, key, files, verb) do
-    case Txn.q(txn, "SELECT state, harness, provider FROM sessions WHERE sessionKey = ?1", [
-           call.session_key
-         ]) do
-      [["retired", _harness, _provider]] ->
+    case Txn.q(
+           txn,
+           "SELECT state, harness, provider, ownerUserId FROM sessions WHERE sessionKey = ?1",
+           [
+             call.session_key
+           ]
+         ) do
+      [["retired", _harness, _provider, _holder_owner]] ->
         error("session_retired", "assignments require an active holder session")
 
-      [["active", harness, provider]] ->
+      [["active", harness, provider, holder_owner]] ->
+        report_to = call.params[:report_to_session_key]
+
+        if not valid_report_to_in_txn?(txn, report_to, holder_owner) do
+          throw({:invalid_report_to, report_to})
+        end
+
         # F7 amendment: dispatch persists workItemId exactly as assign does.
         supplied_work_item_id = call.params[:work_item_id]
 
@@ -1582,8 +1641,8 @@ defmodule Tightbeam.Assignments do
           INSERT INTO assignments
             (id, subject, holderKey, holderRole, holderFallback, openedByUser,
              openedBySession, openedAt, workItemId, reviewsAssignmentId,
-             holderHarness, holderProvider)
-          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             completionReportToSessionKey, holderHarness, holderProvider)
+          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
           """,
           [
             id,
@@ -1596,6 +1655,7 @@ defmodule Tightbeam.Assignments do
             now,
             work_item_id,
             reviews_assignment_id,
+            report_to,
             harness,
             provider
           ]
@@ -1677,6 +1737,9 @@ defmodule Tightbeam.Assignments do
 
     :review_of_review ->
       error("review_of_review", "a review assignment cannot itself be reviewed")
+
+    {:invalid_report_to, report_to} ->
+      invalid_report_to(report_to)
   end
 
   defp resolve_optional_in_txn(_txn, _type, nil), do: {:ok, nil}
@@ -2532,7 +2595,7 @@ defmodule Tightbeam.Assignments do
   defp columns do
     "id, subject, holderKey, holderRole, holderFallback, openedByUser, openedBySession, " <>
       "openedAt, state, outcome, closedAt, closedByUser, closedBySession, closingAttestId" <>
-      ", workItemId, reviewsAssignmentId, holderHarness, holderProvider, " <>
+      ", workItemId, reviewsAssignmentId, completionReportToSessionKey, holderHarness, holderProvider, " <>
       "COALESCE((SELECT effectKind FROM assignment_effects WHERE assignmentId = assignments.id), " <>
       "CASE WHEN reviewsAssignmentId IS NULL THEN 'code' ELSE 'review' END)"
   end
@@ -2554,6 +2617,7 @@ defmodule Tightbeam.Assignments do
          closing_attest_id,
          work_item_id,
          reviews_assignment_id,
+         completion_report_to_session_key,
          holder_harness,
          holder_provider,
          effect_kind
@@ -2575,11 +2639,47 @@ defmodule Tightbeam.Assignments do
       closingAttestId: closing_attest_id,
       workItemId: work_item_id,
       reviewsAssignmentId: reviews_assignment_id,
+      reportToSessionKey: completion_report_to_session_key,
       holderHarness: holder_harness,
       holderProvider: holder_provider,
       effectKind: effect_kind
     }
   end
+
+  defp valid_report_to(_db, _holder_key, nil), do: :ok
+
+  defp valid_report_to(db, holder_key, report_to) when is_binary(report_to) and report_to != "" do
+    case DB.query(
+           db,
+           """
+           SELECT 1
+           FROM sessions holder
+           JOIN sessions target ON target.sessionKey=?2
+           WHERE holder.sessionKey=?1
+             AND target.state='active'
+             AND target.ownerUserId=holder.ownerUserId
+           """,
+           [holder_key, report_to]
+         ) do
+      {:ok, [[1]]} -> :ok
+      _ -> invalid_report_to(report_to)
+    end
+  end
+
+  defp valid_report_to(_db, _holder_key, report_to), do: invalid_report_to(report_to)
+
+  defp valid_report_to_in_txn?(_txn, nil, _holder_owner), do: true
+
+  defp valid_report_to_in_txn?(txn, report_to, holder_owner) do
+    Txn.q(
+      txn,
+      "SELECT 1 FROM sessions WHERE sessionKey=?1 AND state='active' AND ownerUserId=?2",
+      [report_to, holder_owner]
+    ) == [[1]]
+  end
+
+  defp invalid_report_to(report_to),
+    do: %{code: "invalid_report_to", reportToSessionKey: report_to}
 
   defp attest([
          id,

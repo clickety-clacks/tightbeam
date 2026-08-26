@@ -616,6 +616,58 @@ defmodule Tightbeam.Supervision do
 
   def transition_in_txn(%Txn{}, _observation), do: :duplicate
 
+  @doc false
+  def revalidate_delivery_in_txn(
+        %Txn{} = txn,
+        %{
+          sessionKey: session_key,
+          lastEvaluatedTerminal: terminal_seq,
+          pendingBranch: branch,
+          pendingAssignment: assignment_id,
+          pendingK: k,
+          pendingN: n
+        } = pending
+      ) do
+    case Txn.q(
+           txn,
+           """
+           SELECT e.supervisionIntervalMs
+           FROM supervision_watermarks w
+           LEFT JOIN supervision_entitlements e ON e.assignmentId=w.pendingAssignment
+           WHERE w.sessionKey=?1 AND w.lastEvaluatedTerminal IS ?2
+             AND w.pendingBranch=?3 AND w.pendingAssignment=?4
+             AND w.pendingK IS ?5 AND w.pendingN IS ?6
+           """,
+           [session_key, terminal_seq, branch, assignment_id, k, n]
+         ) do
+      [] ->
+        :stale
+
+      [[nil]] ->
+        :ready
+
+      [[interval]] ->
+        case absorb_liveness_receipts_in_txn(txn, assignment_id, interval) do
+          :rebased ->
+            if clear_pending_in_txn(txn, pending) do
+              EventLog.lifecycle_in_txn(
+                txn,
+                "supervision_delivery_suppressed",
+                assignment_id,
+                "branch=#{branch} terminal=#{terminal_seq} cause=liveness_receipt principal=process:tightbeam"
+              )
+
+              :suppressed
+            else
+              :stale
+            end
+
+          :duplicate ->
+            :ready
+        end
+    end
+  end
+
   @spec liveness_trigger_in_txn(Txn.t(), {:assignment | :work_item, String.t()}) ::
           {:ok, %{kind: String.t(), id: String.t()}} | :none | {:error, atom()}
   def liveness_trigger_in_txn(txn, {:assignment, assignment_id}) do
@@ -796,12 +848,16 @@ defmodule Tightbeam.Supervision do
   """
   @spec ladder_target(DB.server() | Txn.t(), String.t(), pos_integer()) :: String.t() | nil
   def ladder_target(db_or_txn, holder_key, rung) do
-    [[owner, spawned_by]] =
-      query(db_or_txn, "SELECT ownerUserId, spawnedBy FROM sessions WHERE sessionKey = ?1", [
-        holder_key
-      ])
+    [[owner, operational_parent]] =
+      query(
+        db_or_txn,
+        "SELECT ownerUserId, operationalParent FROM sessions WHERE sessionKey = ?1",
+        [
+          holder_key
+        ]
+      )
 
-    chain = lineage(db_or_txn, spawned_by, MapSet.new([holder_key]), [])
+    chain = lineage(db_or_txn, operational_parent, MapSet.new([holder_key]), [])
 
     case Enum.at(chain, rung - 1) do
       nil -> active_personal_key(db_or_txn, owner)
@@ -1844,7 +1900,11 @@ defmodule Tightbeam.Supervision do
       after_ms: 0,
       nudge: false,
       assignment_id: pending.pendingAssignment,
-      supervision_wake_kind: pending.pendingBranch
+      supervision_wake_kind: pending.pendingBranch,
+      supervision_session_key: pending.sessionKey,
+      supervision_terminal_seq: pending.lastEvaluatedTerminal,
+      supervision_k: pending.pendingK,
+      supervision_n: pending.pendingN
     }
 
     params =
@@ -1867,6 +1927,9 @@ defmodule Tightbeam.Supervision do
     }
 
     case Dispatch.dispatch(db, handlers, call) do
+      {:ok, %{suppressed: true}} ->
+        {:cleared, nil}
+
       {:ok, _} ->
         success_clear(db, pending)
 
@@ -1900,27 +1963,55 @@ defmodule Tightbeam.Supervision do
   end
 
   defp success_clear(db, pending) do
-    transaction!(db, fn txn ->
-      if clear_pending_in_txn(txn, pending) do
-        Txn.q(
-          txn,
-          "UPDATE assignment_prods SET prodCount = prodCount + 1, lastProdAt = ?2, deniedStreak = 0 WHERE assignmentId = ?1",
-          [pending.pendingAssignment, now()]
-        )
+    _event_seq =
+      transaction!(db, fn txn ->
+        if clear_pending_in_txn(txn, pending) do
+          Txn.q(
+            txn,
+            "UPDATE assignment_prods SET prodCount = prodCount + 1, lastProdAt = ?2, deniedStreak = 0 WHERE assignmentId = ?1",
+            [pending.pendingAssignment, now()]
+          )
 
-        # prodCount is a mutable aggregate that RESETS on attest, and pendingK is
-        # overwritten every evaluation: the tier that fired has no other home.
-        if pending.pendingBranch == "prod" do
-          CausalEvents.append_in_txn(txn, %{
-            kind: "prod_fired",
-            assignment_id: pending.pendingAssignment,
-            job_ref: job_ref_in_txn(txn, pending.pendingAssignment),
-            session_key: pending.sessionKey,
-            detail: %{tier: pending.pendingK}
-          })
+          # prodCount is a mutable aggregate that RESETS on attest, and pendingK is
+          # overwritten every evaluation: the tier that fired has no other home.
+          if pending.pendingBranch == "prod" do
+            at = now()
+            job_ref = job_ref_in_txn(txn, pending.pendingAssignment)
+
+            CausalEvents.append_in_txn(txn, %{
+              kind: "prod_fired",
+              assignment_id: pending.pendingAssignment,
+              job_ref: job_ref,
+              session_key: pending.sessionKey,
+              at: at,
+              detail: %{tier: pending.pendingK}
+            })
+
+            [[seq]] = Txn.q(txn, "SELECT last_insert_rowid()")
+
+            event = %{
+              seq: seq,
+              at: at,
+              job_ref: job_ref,
+              assignment_id: pending.pendingAssignment,
+              session_key: pending.sessionKey,
+              kind: "prod_fired",
+              detail: %{tier: pending.pendingK}
+            }
+
+            Tightbeam.Firehose.Publisher.committed_in_txn(txn, "prod.fired", event, %{
+              "eventId" => seq,
+              "assignmentId" => pending.pendingAssignment,
+              "workItemId" => job_ref,
+              "sessionKey" => pending.sessionKey
+            })
+
+            seq
+          end
         end
-      end
-    end)
+      end)
+
+    :ok
   end
 
   defp denied_clear(db, pending) do
@@ -1956,8 +2047,16 @@ defmodule Tightbeam.Supervision do
       UPDATE supervision_watermarks
       SET pendingBranch = NULL, pendingAssignment = NULL, pendingK = NULL, pendingN = NULL
       WHERE sessionKey = ?1 AND pendingBranch = ?2 AND pendingAssignment = ?3
+        AND lastEvaluatedTerminal IS ?4 AND pendingK IS ?5 AND pendingN IS ?6
       """,
-      [pending.sessionKey, pending.pendingBranch, pending.pendingAssignment]
+      [
+        pending.sessionKey,
+        pending.pendingBranch,
+        pending.pendingAssignment,
+        pending.lastEvaluatedTerminal,
+        pending.pendingK,
+        pending.pendingN
+      ]
     )
 
     Txn.changes(txn) == 1
@@ -2946,10 +3045,12 @@ defmodule Tightbeam.Supervision do
     if MapSet.member?(visited, session_key) do
       Enum.reverse(acc)
     else
-      case query(db, "SELECT state, spawnedBy FROM sessions WHERE sessionKey = ?1", [session_key]) do
-        [[state, spawned_by]] ->
+      case query(db, "SELECT state, operationalParent FROM sessions WHERE sessionKey = ?1", [
+             session_key
+           ]) do
+        [[state, operational_parent]] ->
           next_acc = if state == "active", do: [session_key | acc], else: acc
-          lineage(db, spawned_by, MapSet.put(visited, session_key), next_acc)
+          lineage(db, operational_parent, MapSet.put(visited, session_key), next_acc)
 
         [] ->
           Enum.reverse(acc)
@@ -3855,12 +3956,23 @@ defmodule Tightbeam.Supervision do
   end
 
   defp ladder_target_excluding(db_or_txn, holder_key, rung, excluded) do
-    [[owner, spawned_by]] =
-      query(db_or_txn, "SELECT ownerUserId, spawnedBy FROM sessions WHERE sessionKey=?1", [
-        holder_key
-      ])
+    [[owner, operational_parent]] =
+      query(
+        db_or_txn,
+        "SELECT ownerUserId, operationalParent FROM sessions WHERE sessionKey=?1",
+        [
+          holder_key
+        ]
+      )
 
-    chain = lineage_excluding(db_or_txn, spawned_by, excluded, MapSet.new([holder_key]), [])
+    chain =
+      lineage_excluding(
+        db_or_txn,
+        operational_parent,
+        excluded,
+        MapSet.new([holder_key]),
+        []
+      )
 
     case Enum.at(chain, rung - 1) do
       nil ->
@@ -3878,10 +3990,10 @@ defmodule Tightbeam.Supervision do
     if MapSet.member?(visited, session_key) do
       Enum.reverse(acc)
     else
-      case query(db_or_txn, "SELECT state, spawnedBy FROM sessions WHERE sessionKey=?1", [
+      case query(db_or_txn, "SELECT state, operationalParent FROM sessions WHERE sessionKey=?1", [
              session_key
            ]) do
-        [[state, spawned_by]] ->
+        [[state, operational_parent]] ->
           next_acc =
             if state == "active" and session_key != excluded,
               do: [session_key | acc],
@@ -3889,7 +4001,7 @@ defmodule Tightbeam.Supervision do
 
           lineage_excluding(
             db_or_txn,
-            spawned_by,
+            operational_parent,
             excluded,
             MapSet.put(visited, session_key),
             next_acc

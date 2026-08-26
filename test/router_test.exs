@@ -34,6 +34,8 @@ defmodule Tightbeam.Wire.RouterTest do
     {:paired, device} =
       Devices.pair(db, %{device_id: "d1", claimed_name: "Flynn", platform: nil, model: nil})
 
+    ensure_main_session(db, device.user_id)
+
     parent = self()
 
     handlers = %{
@@ -232,6 +234,19 @@ defmodule Tightbeam.Wire.RouterTest do
     assert is_integer(body["build"]) and body["build"] > 0
     assert body["build"] == Tightbeam.BuildStamp.build()
     assert body["sha"] == Tightbeam.BuildStamp.sha()
+  end
+
+  test "the change socket requires protocolVersion 1 at upgrade", ctx do
+    response =
+      conn(:get, "/ws/changes")
+      |> put_req_header("upgrade", "websocket")
+      |> Router.call(Router.init(ctx.opts))
+
+    assert response.status == 426
+
+    assert JSON.decode!(response.resp_body) == %{
+             "error" => %{"code" => "unsupported_protocol_version"}
+           }
   end
 
   test "CLI exact-version refusal is loud and precedes bearer authentication", ctx do
@@ -1962,18 +1977,24 @@ defmodule Tightbeam.Wire.RouterTest do
   end
 
   defp create_session(db, key, owner, extra \\ []) do
-    Org.create(db, %{
-      session_key: key,
-      display_name: key,
-      owner_user_id: owner,
-      origin: "user:#{owner}",
-      archetype: "default",
-      host: "testhost",
-      harness: "claude",
-      provider: "anthropic",
-      model: Model.new("fable"),
-      is_built_in: Keyword.get(extra, :is_built_in, false),
-      kind: Keyword.get(extra, :kind, "custom")
-    })
+    if key == Org.personal_session_key(owner) do
+      ensure_main_session(db, owner)
+    else
+      ensure_main_session(db, owner)
+
+      Org.create(db, %{
+        session_key: key,
+        display_name: key,
+        owner_user_id: owner,
+        origin: "user:#{owner}",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable"),
+        is_built_in: Keyword.get(extra, :is_built_in, false),
+        kind: Keyword.get(extra, :kind, "custom")
+      })
+    end
   end
 end

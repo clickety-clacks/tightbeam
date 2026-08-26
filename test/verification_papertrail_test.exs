@@ -36,6 +36,8 @@ defmodule Tightbeam.VerificationPapertrailTest do
     {:ok, _} =
       DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1)")
 
+    ensure_main_session(db, "flynn")
+
     holder = session(db, "vp-coder", "coder", "claude", "anthropic")
     reviewer = session(db, "vp-reviewer", "reviewer", "codex", "openai")
     Roles.create!(db, "reviewer", "flynn", reviewer.session_key)
@@ -328,7 +330,8 @@ defmodule Tightbeam.VerificationPapertrailTest do
 
     refute Enum.any?(
              EventLog.lifecycle_events(ctx.db),
-             &(&1.detail =~ "verification" or &1.kind =~ "verification")
+             &((is_binary(&1.detail) and &1.detail =~ "verification") or
+                 &1.kind =~ "verification")
            )
   end
 

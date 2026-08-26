@@ -49,6 +49,57 @@ defmodule Tightbeam.Acp.ConnTest do
     assert {:error, %{"code" => -32000}} = Conn.request(conn, "fail", %{})
   end
 
+  test "dispatch notification follows the port write and carries the ACP request id" do
+    conn = start_conn("dispatch")
+    assert {:ok, %{"protocolVersion" => 1}} = Conn.request(conn, "initialize", %{})
+    owner = self()
+    ref = make_ref()
+
+    request =
+      Task.async(fn ->
+        Conn.request(conn, "echo", %{boundary: true}, notify_dispatched: {owner, ref})
+      end)
+
+    assert_receive {:acp_request_dispatched, ^ref, 2}
+    assert {:ok, %{"boundary" => true}} = Task.await(request)
+
+    Conn.close(conn)
+    closed_ref = make_ref()
+
+    assert {:error, :closed} =
+             Conn.request(conn, "echo", %{}, notify_dispatched: {owner, closed_ref})
+
+    assert_receive {:acp_request_not_dispatched, ^closed_ref, :closed}
+    refute_receive {:acp_request_dispatched, ^closed_ref, _request_id}
+  end
+
+  test "a port that dies before its exit message is handled reports not dispatched" do
+    conn = start_conn("closed_port_race")
+    assert {:ok, %{"protocolVersion" => 1}} = Conn.request(conn, "initialize", %{})
+
+    port = :sys.get_state(conn).port
+    :ok = :sys.suspend(conn)
+    owner = self()
+    ref = make_ref()
+
+    request =
+      Task.async(fn ->
+        Conn.request(conn, "echo", %{boundary: true}, notify_dispatched: {owner, ref})
+      end)
+
+    assert eventually(fn ->
+             Process.info(conn, :message_queue_len) == {:message_queue_len, 1}
+           end)
+
+    true = Port.close(port)
+    :ok = :sys.resume(conn)
+
+    assert {:error, :closed} = Task.await(request)
+    assert_receive {:acp_request_not_dispatched, ^ref, :closed}
+    refute_receive {:acp_request_dispatched, ^ref, _request_id}
+    assert :sys.get_state(conn).closed
+  end
+
   test "notifications reach the subscriber" do
     conn = start_conn("notif")
     # `notify` is fire-and-forget, so with nothing waited on first the budget below covers

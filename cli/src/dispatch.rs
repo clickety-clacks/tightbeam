@@ -456,6 +456,20 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 string_field("answer", answer),
             ],
         )),
+        // `return` has the same no-target privacy boundary as `answer`.
+        Command::ReturnRequest {
+            identity,
+            request_id,
+            reason,
+        } => Ok(request(
+            identity,
+            "return",
+            vec![],
+            vec![
+                string_field("request", request_id),
+                string_field("reason", reason),
+            ],
+        )),
         Command::RevokeAssignment {
             identity,
             assignment_id,
@@ -554,6 +568,19 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             }
             Ok(request(identity, "transcript", vec![], params))
         }
+        Command::TurnTrace {
+            identity,
+            session,
+            seq,
+        } => Ok(request(
+            identity,
+            "turn-trace",
+            vec![],
+            vec![
+                string_field("sessionKey", session),
+                format!("\"turnSeq\":{seq}"),
+            ],
+        )),
         Command::Toplines {
             identity,
             filters,
@@ -1024,7 +1051,11 @@ where
     let token = get_env("TIGHTBEAM_TOKEN").filter(|value| !value.is_empty());
     if let (Some(base), Some(token)) = (url, token) {
         return Ok(Endpoint {
-            base,
+            // The configured URL names the advertised websocket endpoint in the
+            // same way gateway.json and .tightbeam-session do. Every configured
+            // client path roots the HTTP dispatch route, so all three readers
+            // must apply the same scheme conversion.
+            base: http_scheme(&base),
             token,
             origin: Origin::Named,
         });
@@ -1198,6 +1229,36 @@ fn send_to_with_timeout(
     request: &RequestSpec,
     timeout: Option<Duration>,
 ) -> Result<Option<Value>, String> {
+    with_one_dns_retry(|| send_once(endpoint, request, timeout))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SendAttemptError {
+    Dns(String),
+    Final(String),
+}
+
+/// Retry exactly one failure that proves no request reached the gateway.
+///
+/// DNS failure happens before a connection exists, so this is safe for reads and
+/// mutations alike. No status, body, connection, or timeout error is replayed.
+fn with_one_dns_retry<T>(
+    mut attempt: impl FnMut() -> Result<T, SendAttemptError>,
+) -> Result<T, String> {
+    match attempt() {
+        Err(SendAttemptError::Dns(_)) => attempt().map_err(|error| match error {
+            SendAttemptError::Dns(message) | SendAttemptError::Final(message) => message,
+        }),
+        Err(SendAttemptError::Final(message)) => Err(message),
+        Ok(value) => Ok(value),
+    }
+}
+
+fn send_once(
+    endpoint: &Endpoint,
+    request: &RequestSpec,
+    timeout: Option<Duration>,
+) -> Result<Option<Value>, SendAttemptError> {
     let call = gateway_request("POST", endpoint, request.path, timeout)
         .set("content-type", "application/json")
         .send_string(&request.body_json);
@@ -1205,10 +1266,17 @@ fn send_to_with_timeout(
     let (status, response) = match call {
         Ok(response) => (response.status(), response),
         Err(ureq::Error::Status(status, response)) => (status, response),
-        Err(ureq::Error::Transport(error)) => return Err(error.to_string()),
+        Err(ureq::Error::Transport(error)) if error.kind() == ureq::ErrorKind::Dns => {
+            return Err(SendAttemptError::Dns(error.to_string()));
+        }
+        Err(ureq::Error::Transport(error)) => {
+            return Err(SendAttemptError::Final(error.to_string()));
+        }
     };
-    let encoded = response.into_string().map_err(|error| error.to_string())?;
-    parse_response(status, &encoded)
+    let encoded = response
+        .into_string()
+        .map_err(|error| SendAttemptError::Final(error.to_string()))?;
+    parse_response(status, &encoded).map_err(SendAttemptError::Final)
 }
 
 pub(crate) fn gateway_request(
@@ -1473,6 +1541,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::DecisionRequests { identity, .. }
         | Command::Ask { identity, .. }
         | Command::Answer { identity, .. }
+        | Command::ReturnRequest { identity, .. }
         | Command::RevokeAssignment { identity, .. }
         | Command::ReopenAssignment { identity, .. }
         | Command::WorkItemCreate { identity, .. }
@@ -1480,6 +1549,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::WorkItemTrace { identity, .. }
         | Command::Attend { identity, .. }
         | Command::Transcript { identity, .. }
+        | Command::TurnTrace { identity, .. }
         | Command::Toplines { identity, .. }
         | Command::Topline { identity, .. }
         | Command::CoordinationShare { identity, .. }
@@ -1629,6 +1699,22 @@ mod tests {
                 "flynn"
             ]),
             r#"{"asUser":"flynn","verb":"tune","sessionKey":"s_1","params":{"setting":"set_reasoning","reasoningLevel":"xhigh"}}"#
+        );
+    }
+
+    #[test]
+    fn turn_trace_is_a_non_target_read_with_numeric_sequence() {
+        assert_eq!(
+            body(&[
+                "turn-trace",
+                "--session",
+                "agent:coder:x s_1",
+                "--seq",
+                "17",
+                "--as-user",
+                "flynn",
+            ]),
+            r#"{"asUser":"flynn","verb":"turn-trace","params":{"sessionKey":"agent:coder:x s_1","turnSeq":17}}"#
         );
     }
 
@@ -1891,9 +1977,9 @@ mod tests {
     }
 
     #[test]
-    fn builds_byte_exact_ask_answer_and_cursor_bodies() {
-        // `ask` carries a typed target; `answer` carries none, because the
-        // request id already names who was asked (seam ③).
+    fn builds_byte_exact_ask_answer_return_and_cursor_bodies() {
+        // `ask` carries a typed target; `answer` and `return` carry none,
+        // because the request id already names who was asked (seam ③).
         assert_eq!(
             body(&[
                 "ask",
@@ -1932,6 +2018,18 @@ mod tests {
             ]),
             r#"{"asUser":"flynn","verb":"answer","params":{"request":"dr_1","answer":"behind a flag"}}"#
         );
+        assert_eq!(
+            body(&[
+                "return",
+                "--request",
+                "dr_1",
+                "--reason",
+                "name the migration",
+                "--as-user",
+                "flynn",
+            ]),
+            r#"{"asUser":"flynn","verb":"return","params":{"request":"dr_1","reason":"name the migration"}}"#
+        );
         for missing in [
             &["ask", "--question", "q"][..],
             &["ask", "--role", "owner"][..],
@@ -1946,6 +2044,8 @@ mod tests {
             ][..],
             &["answer", "--request", "dr_1"][..],
             &["answer", "--answer", "text"][..],
+            &["return", "--request", "dr_1"][..],
+            &["return", "--reason", "unclear"][..],
         ] {
             let mut argv = missing.to_vec();
             argv.extend_from_slice(&["--as", "coder"]);
@@ -2584,7 +2684,7 @@ mod tests {
         );
 
         let env = HashMap::from([
-            ("TIGHTBEAM_URL".to_owned(), "https://gateway".to_owned()),
+            ("TIGHTBEAM_URL".to_owned(), "ws://gateway".to_owned()),
             ("TIGHTBEAM_TOKEN".to_owned(), "env-token".to_owned()),
             (
                 "TIGHTBEAM_HOME".to_owned(),
@@ -2594,7 +2694,7 @@ mod tests {
         assert_eq!(
             discover_with(|name| env.get(name).cloned(), &root, &root),
             Ok(Endpoint {
-                base: "https://gateway".to_owned(),
+                base: "http://gateway".to_owned(),
                 token: "env-token".to_owned(),
                 origin: Origin::Named,
             })
@@ -3198,6 +3298,39 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("onboarding lease expired"), "{error}");
+    }
+
+    #[test]
+    fn dns_failure_retries_once_and_no_other_failure_replays() {
+        let mut recovered_calls = 0;
+        let recovered = with_one_dns_retry(|| {
+            recovered_calls += 1;
+            if recovered_calls == 1 {
+                Err(SendAttemptError::Dns("temporary dns failure".to_owned()))
+            } else {
+                Ok("open decisions")
+            }
+        });
+        assert_eq!(recovered, Ok("open decisions"));
+        assert_eq!(recovered_calls, 2);
+
+        let mut persistent_calls = 0;
+        let persistent = with_one_dns_retry::<()>(|| {
+            persistent_calls += 1;
+            Err(SendAttemptError::Dns(format!(
+                "dns failure {persistent_calls}"
+            )))
+        });
+        assert_eq!(persistent, Err("dns failure 2".to_owned()));
+        assert_eq!(persistent_calls, 2);
+
+        let mut final_calls = 0;
+        let final_error = with_one_dns_retry::<()>(|| {
+            final_calls += 1;
+            Err(SendAttemptError::Final("gateway denied".to_owned()))
+        });
+        assert_eq!(final_error, Err("gateway denied".to_owned()));
+        assert_eq!(final_calls, 1);
     }
 
     #[test]

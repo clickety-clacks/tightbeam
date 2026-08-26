@@ -21,6 +21,8 @@ defmodule Tightbeam.RulesTest do
 
     :ok = Tightbeam.Schema.ensure_all(db)
 
+    Enum.each(~w(flynn mike other reviewer), &ensure_main_session(db, &1))
+
     base_dir =
       Path.join(System.tmp_dir!(), "tightbeam-rules-#{System.unique_integer([:positive])}")
 
@@ -379,7 +381,7 @@ defmodule Tightbeam.RulesTest do
 
     put_rule(
       ctx,
-      rule("live-count", "post", "org.live_sessions_owned_by_caller", "eq", 1)
+      rule("live-count", "post", "org.live_sessions_owned_by_caller", "eq", 2)
     )
 
     Rules.load!(ctx.base_dir, ["post"])
@@ -568,6 +570,7 @@ defmodule Tightbeam.RulesTest do
 
   test "zero rules lets completion close with null verdict filer fields and one verb event",
        ctx do
+    ensure_users(ctx.db, ["flynn"])
     holder = session(ctx.db, "zero-rule-holder", "flynn", archetype: "coder")
     assignment = assignment(ctx, holder.session_key, {:user, "flynn"})
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
@@ -598,6 +601,7 @@ defmodule Tightbeam.RulesTest do
 
     handler = Gateway.handlers(config)["spawn"]
     process_call = %{call("process:cron") | verb: "spawn"}
+    {:ok, [[session_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM sessions")
 
     Rules.load!(ctx.base_dir, ["spawn"])
 
@@ -610,7 +614,7 @@ defmodule Tightbeam.RulesTest do
     assert {:error, %{code: "rule_denied"}} =
              Dispatch.dispatch(ctx.db, %{"spawn" => handler}, process_call)
 
-    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM sessions")
+    assert {:ok, [[^session_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM sessions")
   end
 
   test "P3 fact registry has exact names and load-time types", ctx do
@@ -1066,6 +1070,7 @@ defmodule Tightbeam.RulesTest do
   end
 
   test "P3 review and artifact statutes deny before attest and allow after proof", ctx do
+    ensure_users(ctx.db, ["flynn", "other"])
     holder = session(ctx.db, "gate-holder", "flynn", archetype: "coder")
     reviewer = session(ctx.db, "gate-reviewer", "other", archetype: "reviewer")
     assignment = assignment(ctx, holder.session_key, {:user, "flynn"})
@@ -1157,7 +1162,10 @@ defmodule Tightbeam.RulesTest do
     producer = assignment(ctx, holder.session_key, {:user, "flynn"})
 
     {:ok, _} =
-      DB.query(ctx.db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1)")
+      DB.query(
+        ctx.db,
+        "INSERT OR IGNORE INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1)"
+      )
 
     put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
@@ -1205,6 +1213,7 @@ defmodule Tightbeam.RulesTest do
   end
 
   test "typed completion keeps code reviewed while receipt exemptions stay narrow", ctx do
+    ensure_users(ctx.db, ["flynn"])
     coder = session(ctx.db, "receipt-closed", "flynn", archetype: "coder")
     noncoder = session(ctx.db, "receipt-orchestrator", "flynn", archetype: "orchestrator")
     reviewer = session(ctx.db, "receipt-exempt-reviewer", "reviewer", archetype: "reviewer")
@@ -1481,5 +1490,16 @@ defmodule Tightbeam.RulesTest do
       provider: Keyword.get(opts, :provider, "anthropic"),
       model: Model.new("fable")
     })
+  end
+
+  defp ensure_users(db, users) do
+    Enum.each(users, fn user ->
+      {:ok, _} =
+        DB.query(
+          db,
+          "INSERT OR IGNORE INTO users (userId, isAdmin, createdAt) VALUES (?1, 0, 1)",
+          [user]
+        )
+    end)
   end
 end

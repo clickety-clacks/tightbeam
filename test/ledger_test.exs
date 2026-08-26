@@ -15,12 +15,18 @@ defmodule Tightbeam.LedgerTest do
     :ok =
       DB.execute(db, """
       INSERT INTO sessions
-        (sessionKey, displayName, ownerUserId, origin, archetype, identityName,
+        (sessionKey, displayName, kind, isBuiltIn, ownerUserId, origin, operationalParent,
+         archetype, identityName,
          harness, provider, model, thinkingLevel, modelContext, createdAt, updatedAt)
       VALUES
-        ('k1', 'K1', 'flynn', 'user:flynn', 'default', 'default',
+        ('ledger-main', 'Ledger Main', 'main', 1, 'flynn', 'user:flynn',
+         'ledger-main', 'default', 'default',
          'claude', 'anthropic', 'claude-sonnet-5', 'medium', NULL, 1, 1),
-        ('k2', 'K2', 'flynn', 'user:flynn', 'default', 'default',
+        ('k1', 'K1', 'custom', 0, 'flynn', 'user:flynn',
+         'ledger-main', 'default', 'default',
+         'claude', 'anthropic', 'claude-sonnet-5', 'medium', NULL, 1, 1),
+        ('k2', 'K2', 'custom', 0, 'flynn', 'user:flynn',
+         'ledger-main', 'default', 'default',
          'claude', 'anthropic', 'claude-sonnet-5', 'medium', NULL, 1, 1);
       """)
   end
@@ -54,7 +60,7 @@ defmodule Tightbeam.LedgerTest do
     {:ok, t} = Ledger.claim_next(db, "k1", "lane")
     assert :busy = Ledger.claim_next(db, "k1", "lane")
 
-    :ok = Ledger.finish(db, t.seq, "delivered")
+    :ok = Ledger.finish(db, t.seq, "delivered", nil, owner_lease: t.owner_lease)
     {:ok, t2} = Ledger.claim_next(db, "k1", "lane")
     assert t2.prompt == "b"
     assert :none = Ledger.claim_next(db, "k2", "lane")
@@ -64,8 +70,10 @@ defmodule Tightbeam.LedgerTest do
     enqueue!(db, "k1", "a")
     {:ok, t} = Ledger.claim_next(db, "k1", "lane")
 
-    assert :ok = Ledger.finish(db, t.seq, "delivered")
-    assert :already_terminal = Ledger.finish(db, t.seq, "failed")
+    assert :ok = Ledger.finish(db, t.seq, "delivered", nil, owner_lease: t.owner_lease)
+
+    assert :already_terminal =
+             Ledger.finish(db, t.seq, "failed", nil, owner_lease: t.owner_lease)
   end
 
   test "wakeId dedupe: at-least-once attempts, exactly-once enqueue", %{db: db} do
@@ -122,12 +130,12 @@ defmodule Tightbeam.LedgerTest do
         """
       )
 
-    assert {:ok, %{seq: ^first}} = Ledger.claim_next(db, "k1", "lane")
+    assert {:ok, %{seq: ^first, owner_lease: lease}} = Ledger.claim_next(db, "k1", "lane")
 
     assert {:ok, [["running", "gpt-5.6-sol", "high", "1m", "codex"]]} = mind(db, first)
 
     # The trace reads TERMINAL turns — the stamp must survive terminalization.
-    :ok = Ledger.finish(db, first, "delivered")
+    :ok = Ledger.finish(db, first, "delivered", nil, owner_lease: lease)
 
     assert {:ok, [["delivered", "gpt-5.6-sol", "high", "1m", "codex"]]} = mind(db, first)
   end
@@ -143,7 +151,7 @@ defmodule Tightbeam.LedgerTest do
   test "publication feed: terminal rows surface until marked published", %{db: db} do
     enqueue!(db, "k1", "a")
     {:ok, t} = Ledger.claim_next(db, "k1", "lane")
-    :ok = Ledger.finish(db, t.seq, "delivered")
+    :ok = Ledger.finish(db, t.seq, "delivered", nil, owner_lease: t.owner_lease)
 
     assert [%{seq: seq, status: "delivered"}] = Ledger.unpublished_terminals(db)
     :ok = Ledger.mark_published(db, seq)
@@ -235,10 +243,12 @@ defmodule Tightbeam.LedgerTest do
     :ok =
       DB.execute(db, """
       INSERT INTO sessions
-        (sessionKey, displayName, ownerUserId, origin, archetype, identityName,
+        (sessionKey, displayName, kind, isBuiltIn, ownerUserId, origin, operationalParent,
+         archetype, identityName,
          harness, provider, model, thinkingLevel, modelContext, createdAt, updatedAt)
       VALUES
-        ('agent:main:clawline:flynn:main', 'Flynn', 'flynn', 'user:flynn', 'default',
+        ('agent:main:clawline:flynn:main', 'Flynn', 'main', 1, 'flynn', 'user:flynn',
+         'agent:main:clawline:flynn:main', 'default',
          'default', 'claude', 'anthropic', 'claude-sonnet-5', 'medium', NULL, 1, 1);
       """)
 

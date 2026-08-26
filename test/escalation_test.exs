@@ -35,6 +35,8 @@ defmodule Tightbeam.EscalationTest do
 
     :ok = ensure_all_schemas(db)
 
+    ensure_main_session(db, "flynn")
+
     raiser = session(db, "raiser", "flynn")
 
     _admin_device =
@@ -429,13 +431,13 @@ defmodule Tightbeam.EscalationTest do
     assert {:ok, "open"} = Escalation.list_status(nil)
     assert {:ok, "all"} = Escalation.list_status("all")
 
-    for status <- ~w(open ruled consumed withdrawn superseded) do
+    for status <- ~w(open ruled consumed withdrawn superseded returned) do
       assert {:ok, ^status} = Escalation.list_status(status)
     end
 
     assert %{code: "invalid", message: message} = Escalation.list_status("bogus")
     assert message =~ "bogus"
-    assert message =~ "open, ruled, consumed, withdrawn, superseded, all"
+    assert message =~ "open, ruled, consumed, withdrawn, superseded, returned, all"
   end
 
   test "non-session raisers use the origin domain and option labels resolve to effects", ctx do

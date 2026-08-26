@@ -20,6 +20,7 @@ defmodule Tightbeam.Schema do
     Tightbeam.Org,
     Tightbeam.CriticalLeases,
     Tightbeam.Roles,
+    Tightbeam.ReadMarkers,
     Tightbeam.WorkItems,
     Tightbeam.Assignments,
     Tightbeam.Productions.CompletionEscalation,
@@ -30,7 +31,8 @@ defmodule Tightbeam.Schema do
     Tightbeam.Supervision,
     Tightbeam.WorkState,
     Tightbeam.Productions.BubbleSweeper,
-    Tightbeam.HarnessProcess
+    Tightbeam.HarnessProcess,
+    Tightbeam.AdminProjection
   ]
 
   # The shape this build writes. Bump it when a production table changes in a
@@ -63,7 +65,18 @@ defmodule Tightbeam.Schema do
   # read or write this build makes against the NEW columns/constraints would
   # die on a raw, unnamed SQLite error instead of a refusal that names what
   # changed. Refuse, name it, and let the database be recreated.
-  @shape "coordination-fabric-v1-phase1-v3"
+  # Mike's 2026-08-22 decision-reader return ruling adds the `returned`
+  # disposition and three audit columns to `decision_requests`. SQLite cannot
+  # widen the existing status/arm CHECKs or add those columns through
+  # `CREATE TABLE IF NOT EXISTS`, so a v3 database must refuse by name rather
+  # than failing on the first return with a raw column/CHECK error.
+  # Completion escalation adds the immutable assignment report-to declaration,
+  # completion-owned tables, and the `completion_transition` cancellation
+  # classification. SQLite cannot widen those existing shapes in place. The
+  # reviewed R17 boundary therefore recreates from the exact v5 predecessor.
+  @shape "coordination-fabric-v1-phase1-v6"
+  @operational_parent_shape "coordination-fabric-v1-phase1-v5"
+  @operational_parent_previous_shape "coordination-fabric-v1-phase1-v4"
 
   @supervision_liveness_objects [
     %{
@@ -210,7 +223,7 @@ defmodule Tightbeam.Schema do
         causalSourceKind TEXT NOT NULL CHECK (causalSourceKind IN (
           'verb_call','wake','progress_attest','condition_fact','assignment_transition',
           'work_item_transition','decision_request','monitor_generation','routing_bracket',
-          'session_transition','scheduler_delivery'
+          'session_transition','scheduler_delivery','completion_transition'
         )),
         causalSourceId TEXT NOT NULL,
         outcomeKind TEXT NOT NULL CHECK (
@@ -219,7 +232,7 @@ defmodule Tightbeam.Schema do
         replacementWakeId TEXT REFERENCES wakes(wakeId) DEFERRABLE INITIALLY DEFERRED,
         dispositionKind TEXT CHECK (dispositionKind IN (
           'assignment_transition','work_item_transition',
-          'decision_request_transition','monitor_generation_transition'
+          'decision_request_transition','monitor_generation_transition','completion_transition'
         )),
         dispositionId TEXT,
         primaryWorkKind TEXT CHECK (primaryWorkKind IN ('assignment','work_item')),
@@ -283,6 +296,16 @@ defmodule Tightbeam.Schema do
             (requesterId = 'tightbeam:assignments' AND
              reasonKind = 'obligation_disposed' AND causalSourceKind = 'assignment_transition' AND
              outcomeKind = 'disposition')
+            OR
+            (requesterId = 'tightbeam:completion-escalation' AND
+             ((reasonKind = 'superseded' AND causalSourceKind = 'wake' AND
+               outcomeKind = 'replacement')
+              OR
+              (reasonKind = 'obligation_disposed' AND
+               causalSourceKind = 'completion_transition' AND outcomeKind = 'disposition')
+              OR
+              (reasonKind = 'target_unresolvable' AND
+               causalSourceKind = 'scheduler_delivery' AND outcomeKind = 'no_replacement')))
             OR
             (requesterId = 'tightbeam:effort-checkin' AND
              ((reasonKind = 'superseded' AND
@@ -759,8 +782,8 @@ defmodule Tightbeam.Schema do
   So the shape is STAMPED at creation and CHECKED here, per the house rule: a
   missing or unknown stamp is a refusal and a bug report, never an inference.
   Note the direction — the one existence question below is asked to REFUSE,
-  never to deduce a shape and accommodate it. Nothing here migrates, ALTERs,
-  or sniffs stored DDL, and nothing should learn to.
+  never to deduce a shape and accommodate it. No shape is inferred from stored
+  DDL. Completion escalation deliberately accepts no predecessor.
   """
   @spec ensure_all(DB.server()) :: :ok
   def ensure_all(db) do
@@ -786,6 +809,50 @@ defmodule Tightbeam.Schema do
         raise ShapeError,
           message:
             "incompatible_supervision_liveness_v1: additive activation failed: #{Exception.message(error)}"
+    end
+  end
+
+  @doc false
+  @spec upgrade_operational_parent_v1(DB.server(), keyword()) :: :ok
+  def upgrade_operational_parent_v1(db, opts \\ []) when is_list(opts) do
+    case DB.foreign_key_rebuild(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@operational_parent_previous_shape]] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message: "incompatible_operational_parent_v1: predecessor stamp #{inspect(rows)}"
+           end
+
+           :ok = Tightbeam.Org.migrate_operational_parent_v1_in_txn(txn, opts)
+
+           Txn.q(
+             txn,
+             "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1",
+             [
+               @operational_parent_previous_shape,
+               @operational_parent_shape,
+               System.system_time(:millisecond)
+             ]
+           )
+
+           if Txn.changes(txn) != 1 do
+             raise ShapeError, message: "incompatible_operational_parent_v1: stamp race"
+           end
+
+           :ok
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "incompatible_operational_parent_v1: upgrade failed: #{Exception.message(error)}"
     end
   end
 
@@ -955,7 +1022,7 @@ defmodule Tightbeam.Schema do
           stamped: #{found}
           this build: #{@shape}
 
-        There is no migration. Move the database aside and let it be recreated.
+        There is no migration from #{found}. Move this database aside and let it be recreated.
         """
 
       # More than one shape stamped. Nothing writes a second row, so this is a

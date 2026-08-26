@@ -25,6 +25,8 @@ defmodule Tightbeam.WorkStateTest do
         "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1), ('other', 0, 1)"
       )
 
+    Enum.each(~w(flynn other), &ensure_main_session(db, &1))
+
     session(db, "holder", "flynn")
     session(db, "retiring", "flynn")
     session(db, "other-holder", "other")
@@ -402,6 +404,7 @@ defmodule Tightbeam.WorkStateTest do
     result =
       handlers["retire"].(%{
         origin: "user:flynn",
+        principal: {:user, "flynn"},
         session_key: "retiring",
         params: %{}
       })

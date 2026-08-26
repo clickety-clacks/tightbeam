@@ -131,6 +131,16 @@ defmodule Tightbeam.LaneTest do
       {:ok, DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE status='failed'") |> elem(1)}
 
     assert n == 1
+
+    assert {:ok, [["failed", "turn-task-crash", "process:tightbeam"]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT outcome, cause, principal FROM turn_lifecycle_events
+               WHERE eventKey='terminal:committed'
+                 AND turnSeq=(SELECT seq FROM turns WHERE prompt='boom')
+               """
+             )
   end
 
   test "a placement refusal reaches the turn publisher by name, not as task_crash", ctx do
@@ -231,7 +241,10 @@ defmodule Tightbeam.LaneTest do
       """)
 
     runner = fn turn ->
-      assert :ok = Ledger.finish(ctx.db, turn.seq, "failed", "preempted winner")
+      assert :ok =
+               Ledger.finish(ctx.db, turn.seq, "failed", "preempted winner",
+                 owner_lease: turn.owner_lease
+               )
 
       {:error,
        %{
@@ -336,7 +349,12 @@ defmodule Tightbeam.LaneTest do
     :ok = LaneManager.ensure_lane(mgr_name, "k1")
     assert_receive {:started, "hang"}
 
-    assert {:ok, %{seq: ^seq1, message_id: "m_hang"}} = SessionLane.cancel_current("k1")
+    assert {:ok, %{seq: ^seq1, message_id: "m_hang"}} =
+             SessionLane.cancel_current("k1",
+               cause: "cancel-request",
+               principal: "user:flynn"
+             )
+
     assert_receive {:terminal, "k1", ^seq1}
 
     # canceled is terminal and the lane drains to the next queued turn
@@ -346,6 +364,23 @@ defmodule Tightbeam.LaneTest do
     assert SessionLane.cancel_current("k1") == :not_running
     {:ok, [[status]]} = DB.query(ctx.db, "SELECT status FROM turns WHERE seq = ?1", [seq1])
     assert status == "canceled"
+
+    assert {:ok, [["canceled", "cancel-request", "user:flynn"]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT outcome, cause, principal FROM turn_lifecycle_events
+               WHERE turnSeq=?1 AND eventKey='terminal:committed'
+               """,
+               [seq1]
+             )
+
+    assert {:ok, [["accepted"], ["claimed"], ["terminal:committed"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT eventKey FROM turn_lifecycle_events WHERE turnSeq=?1 ORDER BY ordinal",
+               [seq1]
+             )
   end
 
   test "reconcile republishes recovered terminals through the same on_terminal closure", ctx do
@@ -370,6 +405,16 @@ defmodule Tightbeam.LaneTest do
     assert_receive {:recovered_terminal, "k1", ^seq}
     {:ok, [[status]]} = DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [seq])
     assert status == "failed_unknown"
+
+    assert {:ok, [["failed_unknown", "boot-recovery", "process:tightbeam"]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT outcome, cause, principal FROM turn_lifecycle_events
+               WHERE turnSeq=?1 AND eventKey='terminal:committed'
+               """,
+               [seq]
+             )
   end
 
   # The backstop, driven by the reconciler exactly as a real orphan is: the scan

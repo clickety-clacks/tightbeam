@@ -43,13 +43,30 @@ defmodule Tightbeam.SchemaShapeTest do
   test "a fresh database is created and stamped", %{db: db} do
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v3"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v6"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert "completionReportToSessionKey" in table_columns(db, "assignments")
+    assert table?(db, "completion_escalations")
+    assert table?(db, "completion_escalation_wakes")
+
+    assert {:ok, [[wake_sql]]} =
+             DB.query(db, "SELECT sql FROM sqlite_master WHERE type='table' AND name='wakes'")
+
+    assert wake_sql =~ "'internal'"
+
+    assert {:ok, [[cancellation_sql]]} =
+             DB.query(
+               db,
+               "SELECT sql FROM sqlite_master WHERE type='table' AND name='wake_cancellations'"
+             )
+
+    assert cancellation_sql =~ "completion_transition"
 
     # Idempotent: booting twice is the ordinary case, not a shape change.
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v3"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v6"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
   end
 
@@ -232,7 +249,30 @@ defmodule Tightbeam.SchemaShapeTest do
     assert {:ok, ^before_rows} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
     assert {:ok, []} = DB.query(db, "SELECT wakeId FROM wake_cancellations")
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v3"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v6"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+  end
+
+  test "the exact v5 predecessor is refused before v6 DDL", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+    :ok = DB.execute(db, "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v5'")
+    before = table_columns(db, "assignments")
+
+    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
+    assert error.message =~ "stamped: coordination-fabric-v1-phase1-v5"
+    assert error.message =~ "this build: coordination-fabric-v1-phase1-v6"
+    assert error.message =~ "There is no migration"
+    assert table_columns(db, "assignments") == before
+
+    assert {:ok, [["coordination-fabric-v1-phase1-v5"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+
+    migration_error =
+      assert_raise Schema.ShapeError, fn -> Schema.upgrade_operational_parent_v1(db) end
+
+    assert migration_error.message =~ "predecessor stamp"
+
+    assert {:ok, [["coordination-fabric-v1-phase1-v5"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
   end
 
@@ -315,7 +355,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "some-later-shape"
-    assert error.message =~ "coordination-fabric-v1-phase1-v3"
+    assert error.message =~ "coordination-fabric-v1-phase1-v6"
   end
 
   # Sol xhigh review round 2, finding 2 (wave 1): `classElection`'s CHECK
@@ -377,7 +417,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-classes-v1"
-    assert error.message =~ "coordination-fabric-v1-phase1-v3"
+    assert error.message =~ "coordination-fabric-v1-phase1-v6"
     assert error.message =~ "no migration"
 
     # It REFUSED — it did not repair or widen the constraint in place.
@@ -497,7 +537,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-v1-phase1"
-    assert error.message =~ "coordination-fabric-v1-phase1-v3"
+    assert error.message =~ "coordination-fabric-v1-phase1-v6"
     assert error.message =~ "no migration"
 
     # It REFUSED — it did not repair or relax the constraint in place.
@@ -568,7 +608,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-classes-v2"
-    assert error.message =~ "coordination-fabric-v1-phase1-v3"
+    assert error.message =~ "coordination-fabric-v1-phase1-v6"
     assert error.message =~ "no migration"
 
     # It REFUSED — the merged build's decision_requests columns were never
@@ -681,7 +721,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-v1-phase1-v2"
-    assert error.message =~ "coordination-fabric-v1-phase1-v3"
+    assert error.message =~ "coordination-fabric-v1-phase1-v6"
     assert error.message =~ "no migration"
 
     # It REFUSED — the merged build's wakes class/delivery columns were never
@@ -699,6 +739,40 @@ defmodule Tightbeam.SchemaShapeTest do
     assert ddl =~ "deadlineAt IS NULL"
   end
 
+  test "a phase1-v3 database is refused before return columns or status are used", %{db: db} do
+    :ok =
+      DB.execute(db, """
+      CREATE TABLE schema_stamp (
+        shape TEXT PRIMARY KEY,
+        stampedAt INTEGER NOT NULL
+      );
+      INSERT INTO schema_stamp (shape, stampedAt)
+      VALUES ('coordination-fabric-v1-phase1-v3', 1);
+      CREATE TABLE decision_requests (
+        id TEXT PRIMARY KEY,
+        status TEXT NOT NULL CHECK (
+          status IN ('open','ruled','consumed','withdrawn','superseded','answered')
+        ),
+        answeredAt INTEGER
+      );
+      """)
+
+    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
+
+    assert error.message =~ "coordination-fabric-v1-phase1-v3"
+    assert error.message =~ "coordination-fabric-v1-phase1-v6"
+    assert error.message =~ "no migration"
+
+    assert {:ok, [[ddl]]} =
+             DB.query(
+               db,
+               "SELECT sql FROM sqlite_master WHERE type='table' AND name='decision_requests'"
+             )
+
+    refute ddl =~ "returned"
+    assert table_columns(db, "decision_requests") == ~w(id status answeredAt)
+  end
+
   defp table?(db, name) do
     {:ok, rows} =
       DB.query(db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1", [name])
@@ -707,8 +781,12 @@ defmodule Tightbeam.SchemaShapeTest do
   end
 
   defp table_columns(db, name) do
+    Enum.map(table_info(db, name), fn [_cid, column | _] -> column end)
+  end
+
+  defp table_info(db, name) do
     {:ok, rows} = DB.query(db, "PRAGMA table_info(#{name})")
-    Enum.map(rows, fn [_cid, column | _] -> column end)
+    rows
   end
 
   defp owned_activation_objects(db) do

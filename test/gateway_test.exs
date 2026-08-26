@@ -39,13 +39,14 @@ defmodule Tightbeam.GatewayTest do
   @archetype_reference_writers [
     {:main_session_seed, "lib/tightbeam/wire/socket.ex", "Org.create_in_txn"},
     {:typed_spawn, "lib/tightbeam/gateway.ex", "Org.create_in_txn"},
-    {:default_setting, "lib/tightbeam/gateway.ex", "Org.put_setting_in_txn"},
+    {:default_setting, "lib/tightbeam/gateway.ex", "Org.put_setting_projected_in_txn"},
     {:identity_repoint, "lib/tightbeam/gateway.ex", "Org.repoint_archetype_in_txn"}
   ]
 
   import ExUnit.CaptureLog
 
   alias Tightbeam.{
+    AdminProjection,
     Archetypes,
     Artifacts,
     Assignments,
@@ -73,6 +74,7 @@ defmodule Tightbeam.GatewayTest do
     WorkItems
   }
 
+  alias Tightbeam.Firehose.Hub
   alias Tightbeam.Wire.Payloads
 
   defmodule LaneDoorbell do
@@ -91,6 +93,17 @@ defmodule Tightbeam.GatewayTest do
     # boundary they exercise is a real mailbox rather than a stub's reply.
     def handle_call({:ensure_lane_quiet, key}, _from, parent) do
       send(parent, {:ensure_lane_quiet, key})
+      {:reply, :ok, parent}
+    end
+  end
+
+  defmodule ConditionSchedulerStub do
+    use GenServer
+    def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
+    def init(parent), do: {:ok, parent}
+
+    def handle_call({:fire_matching, fact_id}, _from, parent) do
+      send(parent, {:fire_matching, fact_id})
       {:reply, :ok, parent}
     end
   end
@@ -174,41 +187,52 @@ defmodule Tightbeam.GatewayTest do
       {:reply, :ok, parent}
     end
 
-    def handle_call({:prompt, _sid, "fail this turn", _opts}, _from, parent),
-      do:
-        {:reply,
-         {:error, %{"message" => "Internal error", "data" => %{"details" => "auth expired"}}},
-         parent}
+    def handle_call({:prompt, _sid, "fail this turn", opts}, _from, parent) do
+      trace_dispatch(opts)
+
+      {:reply,
+       {:error, %{"message" => "Internal error", "data" => %{"details" => "auth expired"}}},
+       parent}
+    end
+
+    def handle_call({:prompt, _sid, "fail before dispatch", _opts}, _from, parent) do
+      {:reply, {:error, {:acp_request_not_dispatched, :closed}}, parent}
+    end
 
     # The typed fields are the concrete ACP response specimens frozen in the
     # reviewed provenance recon. The surrounding prose is deliberately hostile
     # so the public projection proves that it copies none of it.
-    def handle_call({:prompt, _sid, "known codex failure", _opts}, _from, parent),
-      do:
-        {:reply,
-         {:error,
-          %{
-            "code" => -32603,
-            "message" => "Internal error",
-            "data" => %{
-              "codexErrorInfo" => "usageLimitExceeded",
-              "details" => "token=provider-secret /private/provider/payload.json"
-            }
-          }}, parent}
+    def handle_call({:prompt, _sid, "known codex failure", opts}, _from, parent) do
+      trace_dispatch(opts)
 
-    def handle_call({:prompt, _sid, "known claude failure", _opts}, _from, parent),
-      do:
-        {:reply,
-         {:error,
-          %{
-            "message" => "provider payload",
-            "data" => %{
-              "errorKind" => "rate_limit",
-              "details" => "credential=provider-secret https://provider.invalid/account"
-            }
-          }}, parent}
+      {:reply,
+       {:error,
+        %{
+          "code" => -32603,
+          "message" => "Internal error",
+          "data" => %{
+            "codexErrorInfo" => "usageLimitExceeded",
+            "details" => "token=provider-secret /private/provider/payload.json"
+          }
+        }}, parent}
+    end
 
-    def handle_call({:prompt, _sid, prompt, _opts}, from, parent) do
+    def handle_call({:prompt, _sid, "known claude failure", opts}, _from, parent) do
+      trace_dispatch(opts)
+
+      {:reply,
+       {:error,
+        %{
+          "message" => "provider payload",
+          "data" => %{
+            "errorKind" => "rate_limit",
+            "details" => "credential=provider-secret https://provider.invalid/account"
+          }
+        }}, parent}
+    end
+
+    def handle_call({:prompt, _sid, prompt, opts}, from, parent) do
+      trace_dispatch(opts)
       send(parent, {:prompt_started, self()})
 
       messages =
@@ -235,6 +259,13 @@ defmodule Tightbeam.GatewayTest do
                      ))
 
       {:noreply, parent}
+    end
+
+    defp trace_dispatch(opts) do
+      case Keyword.get(opts, :trace_dispatch) do
+        fun when is_function(fun, 1) -> :ok = fun.(73)
+        _ -> :ok
+      end
     end
   end
 
@@ -585,9 +616,25 @@ defmodule Tightbeam.GatewayTest do
         model: nil
       })
 
+    main_key = Org.personal_session_key("flynn")
+
+    Org.create(db, %{
+      session_key: main_key,
+      display_name: "Main",
+      kind: "main",
+      is_built_in: true,
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "mainhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("fable")
+    })
+
     Org.create(db, %{
       session_key: "k1",
-      display_name: "Main",
+      display_name: "Test session",
       owner_user_id: "flynn",
       origin: "user:flynn",
       archetype: "default",
@@ -606,7 +653,7 @@ defmodule Tightbeam.GatewayTest do
         subscriptions: MapSet.new(["chat"])
       })
 
-    %{db: db, registry: registry, lane: lane, catalog_base: catalog_base}
+    %{db: db, registry: registry, lane: lane, catalog_base: catalog_base, main_key: main_key}
   end
 
   test "assignment handlers inject the configured supervision interval before mutation", ctx do
@@ -666,20 +713,6 @@ defmodule Tightbeam.GatewayTest do
   end
 
   test "retire refuses built-in mains — the fallback target is permanent", ctx do
-    Org.create(ctx.db, %{
-      session_key: Org.personal_session_key("flynn"),
-      display_name: "Main",
-      kind: "main",
-      is_built_in: true,
-      owner_user_id: "flynn",
-      origin: "user:flynn",
-      archetype: "default",
-      host: "testhost",
-      harness: "claude",
-      provider: "anthropic",
-      model: Model.new("fable")
-    })
-
     handlers =
       Gateway.handlers(%{
         db: ctx.db,
@@ -692,12 +725,13 @@ defmodule Tightbeam.GatewayTest do
     assert %{code: "denied", message: message} =
              handlers["retire"].(%{
                origin: "user:flynn",
-               session_key: Org.personal_session_key("flynn"),
+               principal: {:user, "flynn"},
+               session_key: ctx.main_key,
                params: %{}
              })
 
     assert message =~ "permanent"
-    assert Org.get(ctx.db, Org.personal_session_key("flynn")).state == "active"
+    assert Org.get(ctx.db, ctx.main_key).state == "active"
   end
 
   test "admin operator handler lists durable harness launches", ctx do
@@ -751,6 +785,7 @@ defmodule Tightbeam.GatewayTest do
     result =
       handlers["retire"].(%{
         origin: "user:flynn",
+        principal: {:user, "flynn"},
         session_key: root.session_key,
         params: %{}
       })
@@ -782,6 +817,61 @@ defmodule Tightbeam.GatewayTest do
              )
   end
 
+  test "retire follows the operational subtree, not spawn provenance", ctx do
+    ensure_global_registry()
+    root = create_session(ctx.db, "operational-root", "flynn")
+    provenance_child = create_session(ctx.db, "provenance-child", "flynn", root.session_key)
+    operational_child = create_session(ctx.db, "operational-child", "flynn", ctx.main_key)
+
+    Org.set_operational_parent(ctx.db, provenance_child.session_key, ctx.main_key)
+    Org.set_operational_parent(ctx.db, operational_child.session_key, root.session_key)
+
+    result =
+      Gateway.handlers(%{db: ctx.db, wake_tick_ms: 1_000})["retire"].(%{
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        session_key: root.session_key,
+        params: %{}
+      })
+
+    assert result.retired_session_keys == [operational_child.session_key, root.session_key]
+    assert Org.get(ctx.db, provenance_child.session_key).state == "active"
+    assert Org.get(ctx.db, operational_child.session_key).spawned_by == ctx.main_key
+  end
+
+  test "work-block authority follows operational parents, not spawn provenance", ctx do
+    spawn_parent = create_session(ctx.db, "block-spawn-parent", "flynn")
+    operational_parent = create_session(ctx.db, "block-operational-parent", "flynn")
+    child = create_session(ctx.db, "block-child", "flynn", spawn_parent.session_key)
+    child = Org.set_operational_parent(ctx.db, child.session_key, operational_parent.session_key)
+    scheduler = start_supervised!({ConditionSchedulerStub, self()})
+    condition = Gateway.handlers(%{db: ctx.db, wake_scheduler: scheduler})["condition"]
+
+    call = %{
+      params: %{kind: "work-blocked", scope: child.session_key}
+    }
+
+    assert %{code: "not_authorized"} =
+             condition.(
+               Map.merge(call, %{
+                 origin: "agent:block-spawn-parent",
+                 principal: {:session, spawn_parent.session_key}
+               })
+             )
+
+    assert %{kind: "work-blocked", scope: scope, fact_id: fact_id} =
+             condition.(
+               Map.merge(call, %{
+                 origin: "agent:block-operational-parent",
+                 principal: {:session, operational_parent.session_key}
+               })
+             )
+
+    assert scope == child.session_key
+    assert_receive {:fire_matching, ^fact_id}
+    assert child.spawned_by == spawn_parent.session_key
+  end
+
   test "retiring the last live session closes its harness session and shared adapter", ctx do
     ensure_global_registry()
     Org.retire(ctx.db, "k1", "test:gateway", 1_000)
@@ -806,6 +896,7 @@ defmodule Tightbeam.GatewayTest do
         adapter_coordinator: coordinator
       })["retire"].(%{
         origin: "user:flynn",
+        principal: {:user, "flynn"},
         session_key: session.session_key,
         params: %{}
       })
@@ -891,6 +982,7 @@ defmodule Tightbeam.GatewayTest do
     result =
       Gateway.handlers(%{db: ctx.db, base_dir: base_dir, wake_tick_ms: 1_000})["retire"].(%{
         origin: "user:flynn",
+        principal: {:user, "flynn"},
         session_key: session.session_key,
         params: %{}
       })
@@ -933,6 +1025,7 @@ defmodule Tightbeam.GatewayTest do
         adapter_coordinator: coordinator
       })["retire"].(%{
         origin: "user:flynn",
+        principal: {:user, "flynn"},
         session_key: retired.session_key,
         params: %{}
       })
@@ -972,6 +1065,7 @@ defmodule Tightbeam.GatewayTest do
         adapter_coordinator: coordinator
       })["retire"].(%{
         origin: "user:flynn",
+        principal: {:user, "flynn"},
         session_key: session.session_key,
         params: %{}
       })
@@ -1008,7 +1102,13 @@ defmodule Tightbeam.GatewayTest do
     assert renewed.hard_deadline == first.hard_deadline
     assert renewed.expires_at == first.hard_deadline
 
-    call = %{origin: "user:flynn", session_key: root.session_key, params: %{}}
+    call = %{
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      session_key: root.session_key,
+      params: %{}
+    }
+
     deferred = handlers["retire"].(call)
 
     assert deferred.retired_session_keys == []
@@ -1350,7 +1450,9 @@ defmodule Tightbeam.GatewayTest do
         params: %{}
       })
 
-    assert [%{created_at: created_at}] = inspect.sessions
+    assert %{created_at: created_at} =
+             Enum.find(inspect.sessions, &(&1.session_key == session.session_key))
+
     assert created_at == session.created_at
 
     projections = [
@@ -1819,7 +1921,10 @@ defmodule Tightbeam.GatewayTest do
     create_session(ctx.db, "effort-parent", "flynn")
 
     :ok =
-      DB.execute(ctx.db, "UPDATE sessions SET spawnedBy='effort-parent' WHERE sessionKey='k1'")
+      DB.execute(
+        ctx.db,
+        "UPDATE sessions SET kind='main',isBuiltIn=1,operationalParent='effort-parent' WHERE sessionKey='effort-parent'; UPDATE sessions SET operationalParent='effort-parent' WHERE sessionKey='k1'"
+      )
 
     assignment =
       Gateway.handlers(config)["dispatch"].(%{
@@ -1842,7 +1947,7 @@ defmodule Tightbeam.GatewayTest do
     assert %{consumer: "effort_probe", state: "pending"} = Wakes.get(ctx.db, wake_id)
     {:ok, _} = DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [wake_id])
 
-    # Rung one prods the HOLDER and re-arms; the owner's request is rung two.
+    # Rung one prods the HOLDER and re-arms; the parent escalation is rung two.
     assert :ok = Wakes.fire_due(scheduler)
 
     {:ok, [[rearmed_wake_id]]} =
@@ -1855,22 +1960,27 @@ defmodule Tightbeam.GatewayTest do
     {:ok, _} = DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [rearmed_wake_id])
     assert :ok = Wakes.fire_due(scheduler)
 
-    assert {:ok, [[request_id]]} =
-             DB.query(
-               ctx.db,
-               "SELECT id FROM decision_requests WHERE kind='effort' AND assignmentId=?1",
-               [assignment.id]
-             )
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE kind='effort'")
 
-    assert is_binary(request_id)
     assert Wakes.get(ctx.db, wake_id).state == "fired"
 
-    # The expecter notification is a durable ungated wake armed with the request,
-    # still pending: the same tick that opened the request delivers nothing.
-    assert {:ok, [[notify_id]]} =
+    # The parent escalation is a durable agent-targeted wake. Main is terminal,
+    # so there is no third effort generation and no user/decision rung.
+    assert {:ok, [[notify_id, prompt]]} =
              DB.query(
                ctx.db,
-               "SELECT wakeId FROM wakes WHERE targetGate = 0 AND state = 'pending'"
+               "SELECT wakeId,prompt FROM wakes WHERE sessionKey='effort-parent' AND state='pending' AND consumer='prompt'"
+             )
+
+    assert prompt =~ "[effort escalation]"
+    assert prompt =~ "Child session k1 remains inactive"
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM effort_checkin_generations WHERE assignmentId=?1 AND state='armed'",
+               [assignment.id]
              )
 
     assert %{consumer: "prompt", session_key: expecter} = Wakes.get(ctx.db, notify_id)
@@ -1885,7 +1995,7 @@ defmodule Tightbeam.GatewayTest do
 
     assert_received {:ensure_lane, ^expecter}
 
-    assert {:ok, [[1]]} =
+    assert {:ok, [[0]]} =
              DB.query(
                ctx.db,
                "SELECT COUNT(*) FROM decision_requests WHERE kind='effort' AND assignmentId=?1",
@@ -2021,7 +2131,7 @@ defmodule Tightbeam.GatewayTest do
     spawn =
       base_dir
       |> gateway_config(ctx.db, 0)
-      |> Map.put(:max_live_sessions_per_user, 2)
+      |> Map.put(:max_live_sessions_per_user, 3)
       |> Map.put(:credential_status, fn _provider ->
         send(parent, {:past_cap_precheck, self()})
 
@@ -2067,7 +2177,7 @@ defmodule Tightbeam.GatewayTest do
              "spawn-cap-race-#{rejected_index}"
            ) == nil
 
-    assert length(Org.list_for_user(ctx.db, "flynn", false)) == 2
+    assert length(Org.list_for_user(ctx.db, "flynn", false)) == 3
   end
 
   test "spawn serves a populated stale catalog while preserving its health", ctx do
@@ -2677,6 +2787,8 @@ defmodule Tightbeam.GatewayTest do
       # by the time the gateway processes it — the OLD code re-resolved
       # "worker" at THAT later moment, found it now bound to "live", and
       # authorized "live"'s owner against itself: trivially true, and wrong.
+      ensure_main_session(ctx.db, "mallory")
+
       Org.create(ctx.db, %{
         session_key: "agent-a",
         display_name: "Agent A",
@@ -3255,7 +3367,10 @@ defmodule Tightbeam.GatewayTest do
     })
 
     start_lane!(ctx.db, "retune")
-    handlers = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))
+    config = gateway_config(base_dir, ctx.db, 0)
+    handlers = Gateway.handlers(config)
+    start_supervised!({Hub, name: Hub})
+    :ok = Hub.register(Hub, self())
 
     assert %{ok: true} =
              handlers["tune"].(%{
@@ -3270,6 +3385,8 @@ defmodule Tightbeam.GatewayTest do
     assert marker.content =~ "claude-fable-5"
     assert marker.content =~ "claude-sonnet-4-6"
 
+    assert_per_verb_effects!(config, "tune", observed_state_classes())
+
     refute marker.content =~ "RETAINED",
            "a retune hides nothing, so it must not borrow the engine swap's promise"
 
@@ -3283,6 +3400,7 @@ defmodule Tightbeam.GatewayTest do
              })
 
     assert length(Projection.list_after(ctx.db, "retune", nil, 50, 0)) == 1
+    assert observed_state_classes() == []
   end
 
   test "a failure between the barrier and its tombstone rolls BOTH back", ctx do
@@ -3870,7 +3988,10 @@ defmodule Tightbeam.GatewayTest do
       Supervisor.delete_child(Tightbeam.Supervisor, child_id)
     end)
 
-    assert %{host: ^machine} =
+    assert %{
+             host: %{"host" => ^machine, "rowVersion" => host_row_version},
+             changed: false
+           } =
              handlers["register-host"].(%{
                origin: "user:flynn",
                session_key: nil,
@@ -3919,13 +4040,20 @@ defmodule Tightbeam.GatewayTest do
       # bound itself, which is the racing regime; 3.5s is the middle of the only
       # room the interval leaves. Widening past 5s would not be a safer budget,
       # it would be a different and weaker test.
-      assert %{host: ^machine} = Task.await(reregister, 3_500)
+      assert %{
+               host: %{"host" => ^machine, "rowVersion" => ^host_row_version},
+               changed: false
+             } = Task.await(reregister, 3_500)
+
       assert GenServer.whereis(server) == first_pid
     after
       :ok = :sys.resume(first_pid)
     end
 
-    assert %{host: ^machine} =
+    assert %{
+             host: %{"host" => ^machine, "rowVersion" => ^host_row_version},
+             changed: false
+           } =
              handlers["register-host"].(%{
                origin: "user:flynn",
                session_key: nil,
@@ -3970,42 +4098,63 @@ defmodule Tightbeam.GatewayTest do
        ctx do
     handlers = Gateway.handlers(%{db: ctx.db})
     host = Placement.local_host_name()
+    expected_effect = "takes effect on next claude adapter start on #{host}"
 
-    set =
-      handlers["host-env-set"].(%{
-        origin: "user:flynn",
-        params: %{
-          host: host,
-          harness: "claude",
-          name: "EXAMPLE_OVERLAY_VAR",
-          value: "example"
-        }
-      })
+    assert %{
+             host_environment: set,
+             changed: true,
+             effect: ^expected_effect
+           } =
+             handlers["host-env-set"].(%{
+               origin: "user:flynn",
+               params: %{
+                 host: host,
+                 harness: "claude",
+                 name: "EXAMPLE_OVERLAY_VAR",
+                 value: "example"
+               }
+             })
 
-    assert set.host == host
-    assert set.harness == "claude"
-    assert set.name == "EXAMPLE_OVERLAY_VAR"
-    assert set.value == "example"
-    assert set.set_by == "user:flynn"
-    assert is_integer(set.set_at)
-    assert set.effect == "takes effect on next claude adapter start on #{host}"
+    assert set == %{
+             "host" => host,
+             "harness" => "claude",
+             "name" => "EXAMPLE_OVERLAY_VAR",
+             "value" => nil,
+             "valuePresent" => true,
+             "updatedAt" => set["updatedAt"],
+             "rowVersion" => 1
+           }
+
+    assert is_integer(set["updatedAt"])
 
     assert %{overlays: [listed]} =
              handlers["host-env-list"].(%{
-               origin: "agent:operator",
+               origin: "user:flynn",
                params: %{host: host, harness: "claude"}
              })
 
-    assert listed == Map.delete(set, :effect)
+    assert listed == set
 
-    assert %{host: ^host, harness: "claude", name: "EXAMPLE_OVERLAY_VAR", removed: true} =
+    assert %{host_environment: unset, changed: true, removed: true} =
              handlers["host-env-unset"].(%{
                origin: "user:flynn",
                params: %{host: host, harness: "claude", name: "EXAMPLE_OVERLAY_VAR"}
              })
 
-    assert %{overlays: []} =
-             handlers["host-env-list"].(%{origin: "agent:operator", params: %{}})
+    assert unset == %{
+             "host" => host,
+             "harness" => "claude",
+             "name" => "EXAMPLE_OVERLAY_VAR",
+             "value" => nil,
+             "valuePresent" => false,
+             "updatedAt" => unset["updatedAt"],
+             "rowVersion" => 2
+           }
+
+    assert is_integer(unset["updatedAt"])
+
+    assert %{overlays: [^unset]} =
+             handlers["host-env-list"].(%{origin: "user:flynn", params: %{}})
   end
 
   test "host-env-set names every reserved and malformed boundary refusal", ctx do
@@ -4084,7 +4233,7 @@ defmodule Tightbeam.GatewayTest do
     assert Placement.env_overlays(ctx.db) == []
   end
 
-  test "host env writes refuse a resolved non-admin agent while list stays readable", ctx do
+  test "host env verbs refuse a resolved non-admin agent", ctx do
     handlers = Gateway.handlers(%{db: ctx.db})
     host = Placement.local_host_name()
 
@@ -4101,7 +4250,7 @@ defmodule Tightbeam.GatewayTest do
     operator = create_session(ctx.db, "operator-session", "operator")
     Roles.create!(ctx.db, "operator", "operator", operator.session_key)
 
-    assert %{set_by: "user:flynn"} =
+    assert %{host_environment: %{"valuePresent" => true}, changed: true} =
              handlers["host-env-set"].(%{
                origin: "user:flynn",
                params: %{
@@ -4129,7 +4278,7 @@ defmodule Tightbeam.GatewayTest do
                params: %{host: host, harness: "claude", name: "EXAMPLE_OVERLAY_VAR"}
              })
 
-    assert %{overlays: [%{name: "EXAMPLE_OVERLAY_VAR", value: "example"}]} =
+    assert %{code: "forbidden", message: "admin required"} =
              handlers["host-env-list"].(%{
                origin: "agent:operator",
                params: %{host: host, harness: "claude"}
@@ -4191,19 +4340,37 @@ defmodule Tightbeam.GatewayTest do
   test "add-user lets an admin add admins and non-admins but refuses a non-admin", ctx do
     handler = Gateway.handlers(gateway_config(ctx.catalog_base, ctx.db, 0))["add-user"]
 
-    assert %{user: %{user_id: "second-admin", is_admin: true}} =
+    assert %{
+             user: %{
+               "userId" => "second-admin",
+               "isAdmin" => true,
+               "createdAt" => second_admin_created_at,
+               "rowVersion" => 1
+             }
+           } =
              handler.(%{
                origin: "user:flynn",
                session_key: nil,
                params: %{user_id: "second-admin", is_admin: true}
              })
 
-    assert %{user: %{user_id: "guest", is_admin: false}} =
+    assert is_integer(second_admin_created_at)
+
+    assert %{
+             user: %{
+               "userId" => "guest",
+               "isAdmin" => false,
+               "createdAt" => guest_created_at,
+               "rowVersion" => 1
+             }
+           } =
              handler.(%{
                origin: "user:second-admin",
                session_key: nil,
                params: %{user_id: "guest", is_admin: false}
              })
+
+    assert is_integer(guest_created_at)
 
     assert %{code: "forbidden", message: "admin required"} =
              handler.(%{
@@ -4298,7 +4465,7 @@ defmodule Tightbeam.GatewayTest do
     # server with a foreign base_dir + non-nil ssh wedges every local spawn
     # until restart (fail-closed), and Placement.hosts/1 ignores the registry
     # entry for the local name anyway.
-    assert %{host: ^local} =
+    assert %{host: %{"host" => ^local, "rowVersion" => row_version}, changed: false} =
              handlers["register-host"].(%{
                origin: "user:flynn",
                session_key: nil,
@@ -4308,6 +4475,8 @@ defmodule Tightbeam.GatewayTest do
                  base_dir: "/remote/definitely-elsewhere"
                }
              })
+
+    assert is_integer(row_version) and row_version > 0
 
     assert GenServer.whereis(Credentials.server(local)) == local_server,
            "local credential server was replaced by re-registering the local hostname"
@@ -4355,12 +4524,14 @@ defmodule Tightbeam.GatewayTest do
 
     handlers = Gateway.handlers(gateway_config(base_dir, ctx.db, 11_373) |> Map.put(:sh, sh))
 
-    assert %{host: ^machine} =
+    assert %{host: %{"host" => ^machine, "rowVersion" => row_version}, changed: false} =
              handlers["register-host"].(%{
                origin: "user:flynn",
                session_key: nil,
                params: %{name: machine, ssh: machine, base_dir: "/remote/tb"}
              })
+
+    assert is_integer(row_version) and row_version > 0
 
     assert_receive {:staged, content, 0o600}
 
@@ -5888,6 +6059,8 @@ defmodule Tightbeam.GatewayTest do
     Org.append_pointer(ctx.db, "k1", "cancel-session", "created")
 
     task_sup = start_supervised!({Task.Supervisor, name: :override_cancel_tasks})
+    start_supervised!({Hub, name: Hub})
+    :ok = Hub.register(Hub, self())
 
     start_supervised!(%{
       id: :override_cancel_conn_registry,
@@ -5920,6 +6093,7 @@ defmodule Tightbeam.GatewayTest do
 
     barrier_lane_started(lane)
     assert_receive :cancel_runner_started
+    _prior_effects = observed_state_classes()
 
     assert %{ok: true} =
              Gateway.handlers(config)["cancel"].(%{
@@ -5927,6 +6101,8 @@ defmodule Tightbeam.GatewayTest do
                session_key: "k1",
                params: %{}
              })
+
+    assert_per_verb_effects!(config, "cancel", observed_state_classes())
 
     assert_receive {:adapter_key, {:claude, "shared", "testhost"}}
     assert Process.alive?(lane)
@@ -6281,8 +6457,34 @@ defmodule Tightbeam.GatewayTest do
 
     send(adapter, :continue_prompt)
     assert {:ok, %{terminal_publish: publish}} = Task.await(task)
-    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
+
+    assert :ok =
+             Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+
     publish.("delivered")
+
+    trace =
+      Tightbeam.TurnLifecycle.read(ctx.db, %{
+        params: %{session_key: "k1", turn_seq: turn.seq},
+        principal: {:user, "flynn"}
+      })
+
+    assert Enum.map(trace.events, & &1.event_key) == [
+             "accepted",
+             "claimed",
+             "checkout:started",
+             "checkout:succeeded",
+             "session:started",
+             "session:succeeded",
+             "prompt:started",
+             "prompt:dispatched",
+             "prompt:resolved",
+             "prompt:succeeded",
+             "assistant:committed",
+             "terminal:committed"
+           ]
+
+    assert Enum.find(trace.events, &(&1.event_key == "prompt:dispatched")).acp_request_id == 73
 
     assert %{harness_session_id: "harness-1", harness: "codex"} =
              Org.current_pointer(ctx.db, "k1")
@@ -6632,7 +6834,10 @@ defmodule Tightbeam.GatewayTest do
     assert_receive {:prompt_started, ^adapter}, @cold_runner_prompt_timeout
     send(adapter, :continue_prompt)
     assert {:ok, %{terminal_publish: publish}} = Task.await(task)
-    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
+
+    assert :ok =
+             Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+
     publish.("delivered")
 
     replies =
@@ -6774,7 +6979,10 @@ defmodule Tightbeam.GatewayTest do
     send(self(), {:push, Tightbeam.Wire.Payloads.ack("c_gold")})
     send(adapter, :continue_prompt)
     assert {:ok, %{terminal_publish: publish}} = Task.await(task)
-    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
+
+    assert :ok =
+             Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+
     publish.("delivered")
 
     frames = collect_pushes(10, [])
@@ -6883,6 +7091,25 @@ defmodule Tightbeam.GatewayTest do
              _ ->
                false
            end)
+
+    turn_seq = Ledger.last_terminal_seq(ctx.db, "k1")
+
+    trace =
+      Tightbeam.TurnLifecycle.read(ctx.db, %{
+        params: %{session_key: "k1", turn_seq: turn_seq},
+        principal: {:user, "flynn"}
+      })
+
+    assert Enum.map(trace.events, & &1.event_key) == [
+             "accepted",
+             "claimed",
+             "checkout:started",
+             "checkout:succeeded",
+             "session:started",
+             "session:failed",
+             "terminal:committed",
+             "terminal:published"
+           ]
   end
 
   # Install a fresh catalog for one {host, harness}, so a test can give two hosts
@@ -7171,7 +7398,10 @@ defmodule Tightbeam.GatewayTest do
     assert_receive {:prompt_started, ^adapter}, @cold_runner_prompt_timeout
     send(adapter, :continue_prompt)
     assert {:ok, %{terminal_publish: publish}} = Task.await(task)
-    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
+
+    assert :ok =
+             Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+
     publish.("delivered")
   end
 
@@ -7330,7 +7560,10 @@ defmodule Tightbeam.GatewayTest do
     assert_receive {:prompt_started, ^adapter}, @cold_runner_prompt_timeout
     send(adapter, :continue_prompt)
     assert {:ok, %{terminal_publish: publish}} = Task.await(task)
-    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
+
+    assert :ok =
+             Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+
     publish.("delivered")
 
     frames = collect_pushes(10, [])
@@ -7412,7 +7645,9 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, %{terminal_publish: publish}} =
              runner.(Map.put(turn, :session_key, "k1"))
 
-    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
+    assert :ok =
+             Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+
     publish.("delivered")
     assert_receive {:load_apply_residency, "load-apply-session"}
 
@@ -7478,7 +7713,10 @@ defmodule Tightbeam.GatewayTest do
 
     assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
     assert {:ok, %{terminal_publish: publish}} = runner.(Map.put(turn, :session_key, "k1"))
-    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
+
+    assert :ok =
+             Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+
     publish.("delivered")
 
     assert_receive {:unknown_new_session, nil}
@@ -7503,7 +7741,11 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, %{terminal_publish: fallback_publish}} =
              runner.(Map.put(fallback_turn, :session_key, "k1"))
 
-    assert :ok = Ledger.finish(ctx.db, fallback_turn.seq, "delivered")
+    assert :ok =
+             Ledger.finish(ctx.db, fallback_turn.seq, "delivered", nil,
+               owner_lease: fallback_turn.owner_lease
+             )
+
     fallback_publish.("delivered")
 
     assert_receive {:unknown_load_lost, "default-session", nil}
@@ -7570,12 +7812,35 @@ defmodule Tightbeam.GatewayTest do
 
     assert {:ok, true} =
              DB.transaction(ctx.db, fn txn ->
-               assert Ledger.finish_in_txn(txn, turn.seq, "failed", "boom")
+               assert Ledger.finish_in_txn(txn, turn.seq, "failed", "boom",
+                        owner_lease: turn.owner_lease
+                      )
+
                record.(txn)
                true
              end)
 
     publish.("failed")
+
+    trace =
+      Tightbeam.TurnLifecycle.read(ctx.db, %{
+        params: %{session_key: "k1", turn_seq: turn.seq},
+        principal: {:user, "flynn"}
+      })
+
+    assert Enum.map(trace.events, & &1.event_key) == [
+             "accepted",
+             "claimed",
+             "checkout:started",
+             "checkout:succeeded",
+             "session:started",
+             "session:succeeded",
+             "prompt:started",
+             "prompt:dispatched",
+             "prompt:resolved",
+             "prompt:failed",
+             "terminal:committed"
+           ]
 
     # EVERY failed turn speaks now. Adjudication used to route a failure into a
     # brief instead of the marker, so deleting the brief (2026-08-05) would have
@@ -7599,6 +7864,50 @@ defmodule Tightbeam.GatewayTest do
                &1
              )
            )
+
+    assert :appended =
+             Gateway.deliver_prompt("k1", "user:flynn", "fail before dispatch",
+               db: ctx.db,
+               conn_registry: exact_registry,
+               lane_manager: ctx.lane,
+               device_id: "failed",
+               client_message_id: "c_pre_dispatch"
+             )
+
+    assert {:ok, pre_dispatch_turn} = Ledger.claim_next(ctx.db, "k1", "test")
+
+    assert {:error, %{reason: _, terminal_publish: pre_dispatch_publish, record_in_txn: record}} =
+             runner.(Map.put(pre_dispatch_turn, :session_key, "k1"))
+
+    assert {:ok, true} =
+             DB.transaction(ctx.db, fn txn ->
+               assert Ledger.finish_in_txn(txn, pre_dispatch_turn.seq, "failed", "closed",
+                        owner_lease: pre_dispatch_turn.owner_lease
+                      )
+
+               record.(txn)
+               true
+             end)
+
+    pre_dispatch_publish.("failed")
+
+    pre_dispatch_trace =
+      Tightbeam.TurnLifecycle.read(ctx.db, %{
+        params: %{session_key: "k1", turn_seq: pre_dispatch_turn.seq},
+        principal: {:user, "flynn"}
+      })
+
+    assert Enum.map(pre_dispatch_trace.events, & &1.event_key) == [
+             "accepted",
+             "claimed",
+             "checkout:started",
+             "checkout:succeeded",
+             "session:started",
+             "session:succeeded",
+             "prompt:started",
+             "prompt:failed",
+             "terminal:committed"
+           ]
   end
 
   test "known process causes persist safely on the assignment and route to its owner", ctx do
@@ -7611,7 +7920,7 @@ defmodule Tightbeam.GatewayTest do
     adapter = start_supervised!({AdapterStub, self()})
     start_supervised!({CoordinatorStub, adapter})
     owner_session = Org.personal_session_key("flynn")
-    create_session(ctx.db, owner_session, "flynn")
+    ensure_main_session(ctx.db, "flynn")
 
     {:ok, _ref, nil} =
       ConnRegistry.register(exact_registry, %{
@@ -7704,7 +8013,11 @@ defmodule Tightbeam.GatewayTest do
       assert {:ok, notice} =
                DB.transaction(ctx.db, fn txn ->
                  stored_error = if is_binary(reason), do: reason, else: inspect(reason)
-                 assert Ledger.finish_in_txn(txn, turn.seq, "failed", stored_error)
+
+                 assert Ledger.finish_in_txn(txn, turn.seq, "failed", stored_error,
+                          owner_lease: turn.owner_lease
+                        )
+
                  record.(txn)
                end)
 
@@ -7911,7 +8224,7 @@ defmodule Tightbeam.GatewayTest do
     adapter = start_supervised!({AdapterStub, self()})
     start_supervised!({CoordinatorStub, adapter})
     owner_session = Org.personal_session_key("flynn")
-    create_session(ctx.db, owner_session, "flynn")
+    ensure_main_session(ctx.db, "flynn")
 
     :ok =
       DB.execute(ctx.db, """
@@ -7961,7 +8274,10 @@ defmodule Tightbeam.GatewayTest do
 
     assert {:error, %RuntimeError{message: "forced process-cause rollback"}} =
              DB.transaction(ctx.db, fn txn ->
-               assert Ledger.finish_in_txn(txn, turn.seq, "failed", "known failure")
+               assert Ledger.finish_in_txn(txn, turn.seq, "failed", "known failure",
+                        owner_lease: turn.owner_lease
+                      )
+
                record.(txn)
                raise "forced process-cause rollback"
              end)
@@ -8060,7 +8376,10 @@ defmodule Tightbeam.GatewayTest do
     # the STAGE (:checkout — pre-engine) and the raw fault the user-facing sentence flattened.
     assert {:ok, true} =
              DB.transaction(ctx.db, fn txn ->
-               assert Ledger.finish_in_txn(txn, turn.seq, "failed", reason)
+               assert Ledger.finish_in_txn(txn, turn.seq, "failed", reason,
+                        owner_lease: turn.owner_lease
+                      )
+
                record.(txn)
                true
              end)
@@ -8074,6 +8393,25 @@ defmodule Tightbeam.GatewayTest do
 
     assert lifecycle, "the refusal must record a harness_turn_error lifecycle event"
     assert lifecycle.detail =~ "checkout"
+
+    trace =
+      Tightbeam.TurnLifecycle.read(ctx.db, %{
+        params: %{session_key: "k1", turn_seq: turn.seq},
+        principal: {:user, "flynn"}
+      })
+
+    assert Enum.map(trace.events, & &1.event_key) == [
+             "accepted",
+             "claimed",
+             "checkout:started",
+             "checkout:failed",
+             "terminal:committed"
+           ]
+
+    checkout_failure = Enum.find(trace.events, &(&1.event_key == "checkout:failed")).detail
+    assert Map.keys(checkout_failure) |> Enum.sort() == ~w(failureClass failureDigest v)
+    assert checkout_failure["failureClass"] == "error"
+    assert byte_size(checkout_failure["failureDigest"]) == 64
 
     # TELLS (chat channel): the remedy reaches the user durably as the `[turn failed]`
     # marker, read from the projection rather than a brittle push count.
@@ -8327,7 +8665,10 @@ defmodule Tightbeam.GatewayTest do
     # error_text would produce one.
     assert {:ok, true} =
              DB.transaction(ctx.db, fn txn ->
-               assert Ledger.finish_in_txn(txn, turn.seq, "failed", "prompt auth 401")
+               assert Ledger.finish_in_txn(txn, turn.seq, "failed", "prompt auth 401",
+                        owner_lease: turn.owner_lease
+                      )
+
                record.(txn)
                true
              end)
@@ -8462,6 +8803,7 @@ defmodule Tightbeam.GatewayTest do
     assert %{retired_session_keys: [active_key]} =
              retire.(%{
                origin: "user:flynn",
+               principal: {:user, "flynn"},
                session_key: active.session_key,
                params: %{}
              })
@@ -8494,22 +8836,27 @@ defmodule Tightbeam.GatewayTest do
     assert :persistent_term.get(Rules, []) == []
   end
 
-  test "kungfu list reports shipped bundles and their offer metadata",
+  test "kungfu list returns canonical admin-only resource items",
        ctx do
     base_dir = role_test_base("kungfu-list")
+    :ok = AdminProjection.bootstrap_served(ctx.db, base_dir)
     list = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["kungfu-list"]
 
     assert %{
              bundles: [
                %{
-                 name: "agentic-engineering",
-                 purpose: purpose,
-                 phrases: phrases,
-                 root_archetype: "product-owner"
+                 "name" => "agentic-engineering",
+                 "purpose" => purpose,
+                 "phrases" => phrases,
+                 "rootArchetype" => "product-owner",
+                 "installedRevision" => nil,
+                 "status" => "available",
+                 "documents" => [],
+                 "rowVersion" => 1
                }
              ]
            } =
-             list.(%{origin: "agent:k1", params: %{}})
+             list.(%{origin: "user:flynn", params: %{}})
 
     assert purpose =~ "turn product ideas and bug reports into shipped software"
     assert "I want my code reviewed before it merges." in phrases
@@ -8517,6 +8864,9 @@ defmodule Tightbeam.GatewayTest do
     # The point of phrases is DISCRIMINATION: a phrase another domain's bundle could
     # honestly claim buys nothing. This one could only be a software-engineering bundle.
     refute Enum.any?(phrases, &(&1 == "I keep losing track of what I asked for."))
+
+    assert %{code: "forbidden", message: "admin required"} =
+             list.(%{origin: "user:not-admin", params: %{}})
   end
 
   test "every unlearn reference kind supplies supported commands that clear it", ctx do
@@ -8584,7 +8934,14 @@ defmodule Tightbeam.GatewayTest do
 
     for reference <- references, command <- reference.clear_commands do
       assert Map.has_key?(handlers, command.verb)
-      result = handlers[command.verb].(Map.put(command, :origin, "user:flynn"))
+
+      result =
+        handlers[command.verb].(
+          command
+          |> Map.put(:origin, "user:flynn")
+          |> Map.put(:principal, {:user, "flynn"})
+        )
+
       refute result[:code], inspect({reference, command, result})
     end
 
@@ -8691,6 +9048,13 @@ defmodule Tightbeam.GatewayTest do
                     %Model{family: "gpt-5.6-sol", effort: "medium"}, ^cwd, _mcp, guidance}
 
     assert guidance =~ "Codex developer message"
+
+    engineering_table =
+      File.read!(
+        Application.app_dir(:tightbeam, "priv/kungfu/agentic-engineering/preferred-models.md")
+      )
+
+    assert length(:binary.matches(guidance, engineering_table)) == 1
     assert Process.alive?(runtime_pid)
     assert Org.current_pointer(ctx.db, session.session_key).harness_session_id == "thread-stable"
     assert Org.get(ctx.db, session.session_key).identity_revision == next
@@ -8808,7 +9172,9 @@ defmodule Tightbeam.GatewayTest do
                prompt: "in flight"
              })
 
-    assert {:ok, %{seq: ^seq}} = Ledger.claim_next(ctx.db, session.session_key, "test")
+    assert {:ok, %{seq: ^seq, owner_lease: owner_lease}} =
+             Ledger.claim_next(ctx.db, session.session_key, "test")
+
     assert Ledger.running?(ctx.db, session.session_key)
 
     apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
@@ -8823,7 +9189,7 @@ defmodule Tightbeam.GatewayTest do
              apply.(%{origin: "user:flynn", params: %{all: true}})
 
     # Terminalizing it releases the boundary — nothing else had to change.
-    assert Ledger.finish(ctx.db, seq, "delivered") == :ok
+    assert Ledger.finish(ctx.db, seq, "delivered", nil, owner_lease: owner_lease) == :ok
     refute Ledger.running?(ctx.db, session.session_key)
 
     assert %{applied: applied, identity_revision: ^revision} =
@@ -9980,6 +10346,8 @@ defmodule Tightbeam.GatewayTest do
   end
 
   defp create_session(db, session_key, owner_user_id, spawned_by \\ nil) do
+    ensure_main_session(db, owner_user_id)
+
     Org.create(db, %{
       session_key: session_key,
       display_name: session_key,
@@ -10043,6 +10411,48 @@ defmodule Tightbeam.GatewayTest do
 
   defp assert_process_mailbox(name, minimum, 0),
     do: flunk("#{inspect(name)} mailbox did not reach #{minimum} queued message(s)")
+
+  defp assert_per_verb_effects!(config, verb, observed) do
+    declared = Gateway.handler_effects(config)[verb]
+    observed = observed |> Enum.uniq() |> Enum.sort()
+    assert_effects_match!(declared, observed)
+
+    for effect <- declared do
+      error =
+        assert_raise ArgumentError, fn ->
+          assert_effects_match!(List.delete(declared, effect), observed)
+        end
+
+      assert Exception.message(error) =~ effect
+    end
+  end
+
+  defp assert_effects_match!(declared, observed) do
+    extra = declared -- observed
+    missing = observed -- declared
+
+    if extra != [] or missing != [] do
+      raise ArgumentError,
+            "handler effect mismatch: extra=#{inspect(extra)} missing=#{inspect(missing)}"
+    end
+
+    :ok
+  end
+
+  defp observed_state_classes(acc \\ []) do
+    _ = :sys.get_state(Hub)
+
+    receive do
+      {:firehose_notice, %{"class" => class}} ->
+        Hub.delivered(Hub, self())
+        observed_state_classes([class | acc])
+    after
+      0 ->
+        acc
+        |> Enum.filter(&match?({:ok, _row}, Tightbeam.Firehose.Registry.fetch(&1)))
+        |> Enum.reverse()
+    end
+  end
 
   defp credential_probe(parent, command) do
     send(parent, {:credential_command, command})

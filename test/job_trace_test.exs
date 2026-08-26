@@ -21,6 +21,8 @@ defmodule Tightbeam.JobTraceTest do
         "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('owner',0,1),('admin',1,1),('other',0,1)"
       )
 
+    Enum.each(~w(owner admin other), &ensure_main_session(db, &1))
+
     session(db, "holder", "owner")
     session(db, "reviewer", "other")
     session(db, "owner-session", "owner")
@@ -342,6 +344,14 @@ defmodule Tightbeam.JobTraceTest do
         # distinguish absent from null.
         "causal_event" ->
           ~w(assignmentId at detail id jobRef kind seqTiebreak sessionKey type)a
+
+        "completion_escalation" ->
+          ~w(actingPrincipal assignmentId at childSessionKey closingAttestId completionId
+             causePrincipal currentStatus decision id phase supersededByAssignmentId
+             supersededReason type workItemId)a
+
+        "completion_escalation_event" ->
+          ~w(at completionId detail id kind type)a
 
         "wake_canceled" ->
           ~w(assignmentId at id reason seqTiebreak type)a
