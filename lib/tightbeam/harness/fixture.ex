@@ -89,7 +89,7 @@ defmodule Tightbeam.Harness.Fixture do
 
   @impl true
   def owned_home_entries,
-    do: Support.owned_home_entries("fixture.json", "fixture.rails")
+    do: Support.owned_home_entries("fixture.rails")
 
   @impl true
   def reconcile_home(target, home, desired) do
@@ -110,7 +110,6 @@ defmodule Tightbeam.Harness.Fixture do
       end
 
     Tightbeam.Homes.reconcile(target, home, %{desired | rails: rails},
-      credential_names: ["fixture.json"],
       rails_filename: "fixture.rails"
     )
   end
@@ -131,19 +130,9 @@ defmodule Tightbeam.Harness.Fixture do
   end
 
   @impl true
-  def credential_ready?(target, _home) do
-    store =
-      Tightbeam.Credentials.store_dir(
-        target.host_config.base_dir,
-        credential_provider()
-      )
-
-    Tightbeam.Homes.credential_ready?(target, store, ["fixture.json"])
+  def credential_ready?(target, home) do
+    Tightbeam.Homes.credential_ready?(target, home, ["fixture.json"])
   end
-
-  @impl true
-  def harvest_credential(target, home),
-    do: Tightbeam.Homes.harvest_credential(target, home, "fixture.json")
 
   @impl true
   def credential_live?(_target, _home, _opts),

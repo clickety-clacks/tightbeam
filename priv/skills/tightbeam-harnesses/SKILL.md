@@ -27,7 +27,7 @@ Canonical capability IDs (the full proof references live in
   PreToolUse hooks after the fail-closed boot wiring-check.
 - CAP-008 future block/check tiers: reserved named divergence on both; do not
   claim allow/ask/rewrite support.
-- CAP-009 credential file lifecycle: PARITY, including stopped-runtime harvest.
+- CAP-009 harness-home credential lifecycle: PARITY, with no cross-home copy or harvest.
 - CAP-010 token environment: PARITY mechanisms; no subscription-longevity
   equivalence is claimed.
 - CAP-011 onboarding: PARITY through `tightbeam onboard <provider>`.

@@ -4,12 +4,12 @@ defmodule Tightbeam.Credentials do
   @moduledoc """
   Per-machine credential onboarding and lifecycle.
 
-  This process is deliberately not a refresher. Codex owns and rotates the
-  live home `auth.json` while its runtime is running. A Claude subscription is
-  Claude Code's own `.credentials.json`: an OAuth record with a refresh token,
-  linked into the harness home and rotated there by Claude Code. A Claude API
+  This process is deliberately not a refresher. Each harness owns and rotates
+  its credential in its exact Tightbeam home. A Claude subscription is Claude
+  Code's own `.credentials.json`: an OAuth record with a refresh token. A Claude API
   key is a bare secret in the same filename and remains environment-injected.
-  Expiry is compared only at read seams—there is no timer or sweep.
+  Tightbeam never infers expiry from stored bytes or metadata. Only a provider
+  401 observed while using the credential establishes that it is dead.
 
   A host holds ONE active credential per provider, of either KIND: an API key or
   a subscription token. The kind is recorded in that provider's
@@ -66,8 +66,8 @@ defmodule Tightbeam.Credentials do
   @doc """
   The KIND of credential this machine holds for a provider, or `:none`.
 
-  `:none` is the ABSENCE of a credential, not a verdict on one: a revoked or
-  expired credential still has a kind, and reporting it is what lets an operator
+  `:none` is the ABSENCE of a credential, not a verdict on one: a revoked
+  credential still has a kind, and reporting it is what lets an operator
   tell "the API key stopped working" from "nothing is installed here".
   """
   @spec kind(provider(), GenServer.server()) :: kind() | :none | {:error, term()}
@@ -83,15 +83,25 @@ defmodule Tightbeam.Credentials do
   """
   @spec kind_at(String.t(), provider()) :: kind() | :none
   def kind_at(base_dir, provider) do
-    case File.read(metadata_path(base_dir, provider)) do
+    kind_at(base_dir, local_machine_name(), provider)
+  end
+
+  @spec kind_at(String.t(), String.t(), provider()) :: kind() | :none
+  def kind_at(base_dir, machine, provider) do
+    case File.read(metadata_path(base_dir, machine, provider)) do
       {:ok, bytes} ->
         case JSON.decode(bytes) do
-          {:ok, %{"onboarded" => true} = metadata} -> decode_kind(metadata["kind"])
-          _ -> :none
+          {:ok, metadata} when is_map(metadata) ->
+            if credential_present_at?(base_dir, machine, provider),
+              do: decode_kind(metadata["kind"]),
+              else: :none
+
+          _ ->
+            :none
         end
 
       {:error, _reason} ->
-        :none
+        if credential_present_at?(base_dir, machine, provider), do: :subscription, else: :none
     end
   end
 
@@ -145,20 +155,6 @@ defmodule Tightbeam.Credentials do
     end
   end
 
-  @doc false
-  def store_harvested(base_dir, provider, bytes, source \\ "a harness home") do
-    path =
-      case provider do
-        :openai -> Path.join([base_dir, "auth", "codex", "auth.json"])
-        :anthropic -> Path.join([base_dir, "auth", "claude", ".credentials.json"])
-        :fixture_provider -> Path.join([base_dir, "auth", "fixture", "fixture.json"])
-      end
-
-    refuse_hollow!(provider, bytes, source)
-    atomic_write!(path, bytes)
-    :ok
-  end
-
   @doc """
   Refuse a credential that is present but carries nothing usable.
 
@@ -168,12 +164,8 @@ defmodule Tightbeam.Credentials do
   cost two coder sessions before it was traced. So it is refused HERE, at the write, where
   the file that produced it can still be named.
 
-  The vendor owns the credential inside a harness home and rotates it in place, and
-  `Homes.sweep_auth/2` harvests every home into the ONE shared store at gateway boot. That
-  makes an unvalidated harvest a poisoning: one agent's hollow file becomes every agent's
-  credential, and the reboot re-applies it. Refusing to write is therefore only half of it —
-  the existing good credential must survive the refusal, which is why this runs BEFORE the
-  write rather than validating after.
+  The vendor owns the credential inside its harness home and rotates it in place.
+  Tightbeam validates onboarding bytes before replacing that one authoritative file.
 
   The deep check is anthropic-only ON PURPOSE. That is the record shape this incident
   produced and the one shape verified against a live file; openai and fixture get the blank
@@ -282,8 +274,33 @@ defmodule Tightbeam.Credentials do
   defp blank_token?(token) when is_binary(token), do: String.trim(token) == ""
   defp blank_token?(_other), do: true
 
+  @doc "The exact harness-home credential path for one provider on one machine."
+  def credential_path(base_dir, machine, provider) do
+    Path.join([
+      Homes.home_path(base_dir, machine, harness_id(provider)),
+      credential_filename(provider)
+    ])
+  end
+
   @doc false
-  def store_dir(base_dir, provider), do: Path.join([base_dir, "auth", harness_name(provider)])
+  def credential_secret_paths(base_dir) do
+    active =
+      for module <- Harness.all(),
+          path <-
+            Path.wildcard(
+              Path.join([
+                base_dir,
+                "homes",
+                "*",
+                Atom.to_string(module.id()),
+                credential_filename(module.credential_provider())
+              ])
+            ),
+          do: path
+
+    legacy = Path.wildcard(Path.join([base_dir, "auth", "**", "*"]))
+    Enum.uniq(active ++ legacy)
+  end
 
   @impl true
   def init(opts) do
@@ -512,6 +529,7 @@ defmodule Tightbeam.Credentials do
       with :ok <- state.gate.(provider),
            :ok <- state.stop.(provider),
            {:ok, credential} <- Map.fetch!(state.onboarders, provider).(state),
+           :ok <- prepare_staged_activation(state, provider, :subscription),
            :ok <- write_credential!(state, provider, credential),
            :ok <- state.start.(provider, :subscription),
            :ok <- mark_onboarded!(state, provider, :subscription, credential),
@@ -527,8 +545,7 @@ defmodule Tightbeam.Credentials do
             "onboarded" => false,
             "terminal" => false,
             "subscription_status" => "unsupported",
-            "last_health" => "no_subscription",
-            "expires_at" => nil
+            "last_health" => "no_subscription"
           })
 
           error
@@ -643,8 +660,7 @@ defmodule Tightbeam.Credentials do
       "onboarded" => false,
       "terminal" => false,
       "subscription_status" => "unsupported",
-      "last_health" => "no_subscription",
-      "expires_at" => nil
+      "last_health" => "no_subscription"
     })
   end
 
@@ -676,10 +692,7 @@ defmodule Tightbeam.Credentials do
           metadata["terminal"] == true ->
             {:needs_onboarding, :revoked}
 
-          expired?(metadata["expires_at"], state.now.()) ->
-            {:needs_onboarding, :expired}
-
-          metadata["onboarded"] == true and credential_present?(state, provider) ->
+          credential_present?(state, provider) ->
             :onboarded
 
           true ->
@@ -694,7 +707,7 @@ defmodule Tightbeam.Credentials do
   defp credential_kind(state, provider) do
     case read_metadata(state, provider) do
       {:ok, metadata} ->
-        if metadata["onboarded"] == true and credential_present?(state, provider) do
+        if credential_present?(state, provider) do
           decode_kind(metadata["kind"])
         else
           :none
@@ -711,10 +724,6 @@ defmodule Tightbeam.Credentials do
   # an inference from the credential file, which nothing here does.
   defp decode_kind("api_key"), do: :api_key
   defp decode_kind(_recorded), do: :subscription
-
-  defp expired?(nil, _now), do: false
-  defp expired?(expires_at, now) when is_integer(expires_at), do: expires_at <= now
-  defp expired?(_unknown, _now), do: false
 
   defp credential_present?(state, provider) do
     target = credential_target(state)
@@ -734,7 +743,7 @@ defmodule Tightbeam.Credentials do
   # refusal it is, while a raise would kill this GenServer and surface as an exit.
   defp write_credential!(state, :openai, credential) do
     with :ok <- refuse_hollow(:openai, credential.bytes, "the onboarding ceremony") do
-      atomic_write!(credential_store_path(state, :openai), credential.bytes)
+      atomic_write!(credential_home_path(state, :openai), credential.bytes)
       reconcile_provider_homes(state, :openai)
       :ok
     end
@@ -743,7 +752,7 @@ defmodule Tightbeam.Credentials do
   defp write_credential!(state, :anthropic, credential) do
     with :ok <- refuse_hollow(:anthropic, credential.bytes, "the onboarding ceremony") do
       atomic_write!(
-        credential_store_path(state, :anthropic),
+        credential_home_path(state, :anthropic),
         String.trim(credential.bytes) <> "\n"
       )
 
@@ -754,7 +763,7 @@ defmodule Tightbeam.Credentials do
 
   defp write_credential!(state, :fixture_provider, credential) do
     with :ok <- refuse_hollow(:fixture_provider, credential.bytes, "the onboarding ceremony") do
-      atomic_write!(credential_store_path(state, :fixture_provider), credential.bytes)
+      atomic_write!(credential_home_path(state, :fixture_provider), credential.bytes)
       reconcile_provider_homes(state, :fixture_provider)
       :ok
     end
@@ -773,8 +782,7 @@ defmodule Tightbeam.Credentials do
           harness: module.id(),
           machine: state.machine,
           rails: Rails.hook_settings(),
-          auth_dir: Path.dirname(credential_store_path(state, provider)),
-          harvest_auth: false
+          credential_home: home
         }
       )
 
@@ -998,28 +1006,25 @@ defmodule Tightbeam.Credentials do
       "onboarded" => true,
       "terminal" => false,
       "last_health" => "onboarded",
-      "subscription_status" => Map.get(credential, :subscription_status),
-      "expires_at" => Map.get(credential, :expires_at)
+      "subscription_status" => Map.get(credential, :subscription_status)
     })
 
     :ok
   end
 
   defp metadata_path(state, provider) when is_map(state),
-    do: metadata_path(state.base_dir, provider)
+    do: metadata_path(state.base_dir, state.machine, provider)
 
-  defp metadata_path(base_dir, provider) when is_binary(base_dir) do
+  defp metadata_path(base_dir, machine, provider) when is_binary(base_dir) do
     Path.join([
-      base_dir,
-      "auth",
-      harness_name(provider),
+      Homes.home_path(base_dir, machine, harness_id(provider)),
       ".tightbeam",
       "credential.json"
     ])
   end
 
   defp read_metadata(%{ssh: nil} = state, provider) do
-    store = store_dir(state.base_dir, provider)
+    store = Homes.home_path(state.base_dir, state.machine, harness_id(provider))
 
     case File.lstat(store) do
       {:ok, %{type: :directory}} -> read_local_metadata(state, provider)
@@ -1030,7 +1035,7 @@ defmodule Tightbeam.Credentials do
   end
 
   defp read_metadata(state, provider) do
-    store = store_dir(state.base_dir, provider)
+    store = Homes.home_path(state.base_dir, state.machine, harness_id(provider))
 
     case remote_test(state, "-L", store) do
       true ->
@@ -1049,7 +1054,7 @@ defmodule Tightbeam.Credentials do
 
     case File.read(path) do
       {:ok, bytes} -> decode_metadata(bytes, path)
-      {:error, :enoent} -> unreadable_store(path, :missing, :readable_file)
+      {:error, :enoent} -> {:ok, %{}}
       {:error, reason} -> unreadable_store(path, {:unreadable, reason}, :readable_file)
     end
   end
@@ -1090,6 +1095,9 @@ defmodule Tightbeam.Credentials do
     case remote_command(state, ["cat", path]) do
       {bytes, 0} ->
         decode_metadata(bytes, path)
+
+      {_output, 1} ->
+        {:ok, %{}}
 
       {output, status} ->
         unreadable_store(path, {:read_failed, status, String.trim(output)}, :readable_file)
@@ -1147,18 +1155,35 @@ defmodule Tightbeam.Credentials do
     remote_ok!(state, ["sh", "-c", shell_quote(script)])
   end
 
-  defp credential_store_path(state, :openai),
-    do: Path.join([state.base_dir, "auth", "codex", "auth.json"])
-
-  defp credential_store_path(state, :anthropic),
-    do: Path.join([state.base_dir, "auth", "claude", ".credentials.json"])
-
-  defp credential_store_path(state, :fixture_provider),
-    do: Path.join([state.base_dir, "auth", "fixture", "fixture.json"])
+  defp credential_home_path(state, provider),
+    do: credential_path(state.base_dir, state.machine, provider)
 
   defp harness_name(:openai), do: "codex"
   defp harness_name(:anthropic), do: "claude"
   defp harness_name(:fixture_provider), do: "fixture"
+
+  defp harness_id(provider), do: provider |> harness_name() |> String.to_existing_atom()
+
+  defp credential_filename(:openai), do: "auth.json"
+  defp credential_filename(:anthropic), do: ".credentials.json"
+  defp credential_filename(:fixture_provider), do: "fixture.json"
+
+  defp credential_present_at?(base_dir, machine, provider) do
+    module = Harness.module!(harness_id(provider))
+
+    module.credential_ready?(
+      %{base_dir: base_dir, host_name: machine, host_config: %{ssh: nil, base_dir: base_dir}},
+      Homes.home_path(base_dir, machine, module.id())
+    )
+  end
+
+  defp local_machine_name do
+    Application.get_env(:tightbeam, :local_host_name) ||
+      (
+        {:ok, name} = :inet.gethostname()
+        List.to_string(name)
+      )
+  end
 
   defp atomic_write!(path, bytes) do
     File.mkdir_p!(Path.dirname(path))
@@ -1196,9 +1221,8 @@ defmodule Tightbeam.Credentials do
 
   # The staged FILENAME is per provider, not per kind: a host holds one active
   # credential per provider and the ceremony stages it under that provider's one
-  # name. What differs by kind is the metadata written beside it—expiry above
-  # all. An API key is static (no rotation, no refresh), so it has no expiry to
-  # compare and no subscription entitlement to report.
+  # name. What differs by kind is the metadata written beside it. Stored metadata
+  # never establishes expiry; only an observed provider 401 does that.
   defp staged_credential(:openai, kind, path) do
     case File.read(Path.join(path, "auth.json")) do
       {:ok, bytes} -> {:ok, Map.put(installed_metadata(:openai, kind), :bytes, bytes)}
@@ -1206,8 +1230,8 @@ defmodule Tightbeam.Credentials do
     end
   end
 
-  # `.credentials.json` -- Claude Code's own name, because this file is LINKED into the
-  # harness home and read by the harness directly. A subscription credential is the OAuth
+  # `.credentials.json` -- Claude Code's own name in its exact harness home. A
+  # subscription credential is the OAuth
   # record it refreshes in place; an API key is a bare secret. Same path, two contents.
   defp staged_credential(:anthropic, kind, path) do
     case File.read(Path.join(path, ".credentials.json")) do
@@ -1232,7 +1256,7 @@ defmodule Tightbeam.Credentials do
 
   defp install_staged!(state, provider, kind, path) do
     source = staged_path(provider, path)
-    store = credential_store_path(state, provider)
+    store = credential_home_path(state, provider)
 
     script =
       "test -f #{shell_quote(source)} && " <>
@@ -1254,16 +1278,15 @@ defmodule Tightbeam.Credentials do
   # An API key does not expire and carries no subscription entitlement, so it
   # reports neither. Giving one a synthetic expiry would make `credential_status`
   # eventually demand a re-onboard for a credential that is still perfectly good.
-  defp installed_metadata(_provider, :api_key), do: %{expires_at: nil}
+  defp installed_metadata(_provider, :api_key), do: %{}
 
   defp installed_metadata(:anthropic, :subscription) do
     %{
-      expires_at: System.system_time(:second) + 365 * 24 * 60 * 60,
       subscription_status: "supported"
     }
   end
 
-  defp installed_metadata(_provider, :subscription), do: %{expires_at: nil}
+  defp installed_metadata(_provider, :subscription), do: %{}
 
   defp staged_path(:openai, path), do: Path.join(path, "auth.json")
   defp staged_path(:anthropic, path), do: Path.join(path, ".credentials.json")

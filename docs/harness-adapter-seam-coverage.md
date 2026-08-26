@@ -43,11 +43,9 @@ closed-world tests were inspected separately.
 | `lib/tightbeam/acp/adapter.ex:410-419` | Codex-private auth envelope | `classify_auth_event/1` | terminal/transient/unknown parity |
 | `lib/tightbeam/archetypes.ex:20,699-706` | type and closed-world validation/message | registry plus `Harness.parse!/1` | registry-driven error remains specific and rejecting |
 | `lib/tightbeam/codex_acp_patch.ex:53-126` | adapter versions, bundles, package layout, harness dispatch | private implementation used by `ensure_adapter/1`; generic patch primitive may remain substrate-owned | local absence refusal and local/remote patch parity |
-| `lib/tightbeam/credentials.ex:305-330` | provider completion probes and direct home relink | credential-provider registry enumeration plus `reconcile_home/3` | all matching harnesses relink; no provider home write |
-| `lib/tightbeam/credentials.ex:334-357` | direct home symlink writer | removed in favor of `reconcile_home/3` | one-writer enforcement |
-| `lib/tightbeam/credentials.ex:410-422` | provider store layout, canonical path and display mapping | named provider ceremony/store exemption; canonical home path use moves through registry/reconcile | store semantics unchanged |
+| `lib/tightbeam/credentials.ex` | provider completion and exact harness-home install | credential-provider registry lookup plus `credential_path/3` | one regular credential file in the named machine's harness home |
 | `lib/tightbeam/credentials.ex:441-448,464-467,507-567` | ceremony executables/env/staging filenames | named provider ceremony/store exemption | onboarding ceremonies unchanged |
-| `lib/tightbeam/gateway.ex:229-232` | ordered boot auth sweep | registry order calling `harvest_credential`/`reconcile_home` via home sweep seam | all sweeps precede coordinator startup; order follows registry |
+| `lib/tightbeam/gateway.ex` | credential service startup | no boot harvest or projection seam | gateway boot never reads or moves credential bytes between homes |
 | `lib/tightbeam/gateway.ex:287-290` | Codex-specific catalog option | `fetch_catalog/1` state owned by harness module | catalog startup parity |
 | `lib/tightbeam/gateway.ex:353-361` | hard-coded CLI readiness sweep | registry plus `probe_cli/1` | all registered harnesses probed; at least one required |
 | `lib/tightbeam/gateway.ex:808-817` | hard-coded org options and provider inference | registry; provider stamped on catalog entry | returned catalog/provider parity |
@@ -61,7 +59,7 @@ closed-world tests were inspected separately.
 | `lib/tightbeam/gateway.ex:2594-2634` | harness/provider maps | `credential_provider/0` and registry filtering | credential readiness and transition scoping |
 | `lib/tightbeam/gateway.ex:2636-2693` | one-harness provider runtime stop/capture/start | enumerate all registry modules matching `credential_provider/0` | immutable capture and post-success publication; fixture match/nonmatch |
 | `lib/tightbeam/gateway.ex:3515-3537` | two-harness model inference and provider map | registry iteration; provider from matched catalog entry | zero/one/multiple semantics |
-| `lib/tightbeam/homes.ex:18,92-190` | closed type, credential filenames, rails filenames, artifact writer | `reconcile_home/3`; home path helper stays neutral | railed/lawless both harnesses; preservation; harvest-before-wipe |
+| `lib/tightbeam/homes.ex` | rails filenames and projection writer | `reconcile_home/3`; home path helper stays neutral | reconciliation preserves every credential and emits no copy/link command |
 | `lib/tightbeam/identity.ex:19,95-104,312-329` | guidance prose and skill discovery paths | guidance moves into harness session configuration; skill paths/effects into `materialize_skills/3` | local skill materialization parity |
 | `lib/tightbeam/model_catalog.ex:13,29-51,70-161` | closed registry and harness→provider map | registry plus catalog-entry provider stamp | provider authority and registry-driven APIs |
 | `lib/tightbeam/model_catalog.ex:170-215,369-372` | transport/path/parser dispatch | `fetch_catalog/1` per harness | both current catalog fixtures and third fixture |
@@ -116,7 +114,7 @@ argument belongs.
 | `prepare_launch/3` | YES for claude, NO for codex | claude carries its credential in an environment variable whose NAME is the kind; codex reads its own `auth.json`, so its plan is kind-invariant — pinned by running both kinds through the conformance vectors rather than assumed |
 | `fetch_catalog/1` | YES, both | claude: one route, two headers. codex: two ROUTES answering in two SHAPES, so two derivations |
 | `credential_live?/3` | YES, both | no single call authenticates both kinds on either provider |
-| `credential_ready?/2`, `harvest_credential/2`, `reconcile_home/3`, `owned_home_entries/0` | NO | they name the FILE, and the file is the same for both kinds |
+| `credential_ready?/2`, `reconcile_home/3`, `owned_home_entries/0` | NO | they name the exact home and credential file; reconciliation does not own that file |
 
 The kind is never read by a harness module. It is resolved by the caller that
 already knows `{host, provider}` — `ModelCatalog`, `Placement`, the e2e

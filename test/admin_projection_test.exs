@@ -1390,7 +1390,16 @@ defmodule Tightbeam.AdminProjectionTest do
     )
 
     banked_secret = "opaque-bank-value-7f4d3c2b1a998877"
-    :ok = Credentials.store_harvested(ctx.base_dir, :fixture_provider, banked_secret)
+
+    credential =
+      Credentials.credential_path(
+        ctx.base_dir,
+        Placement.local_host_name(),
+        :fixture_provider
+      )
+
+    File.mkdir_p!(Path.dirname(credential))
+    File.write!(credential, banked_secret)
 
     secret_content = """
     token = tbs_1234567890abcdef

@@ -128,7 +128,7 @@ defmodule Tightbeam.PlacementTest do
     db: db
   } do
     host = "unreadable-#{System.unique_integer([:positive])}"
-    store = Path.join(base_dir, "auth/claude")
+    store = Tightbeam.Homes.home_path(base_dir, host, :claude)
     target = Path.join(base_dir, "credential-target")
     File.mkdir_p!(target)
     File.mkdir_p!(Path.dirname(store))
@@ -901,7 +901,7 @@ defmodule Tightbeam.PlacementTest do
     base_dir: base_dir,
     db: db
   } do
-    token_dir = Path.join([base_dir, "auth", "claude"])
+    token_dir = Tightbeam.Homes.home_path(base_dir, "testhost", :claude)
     File.mkdir_p!(token_dir)
 
     File.write!(

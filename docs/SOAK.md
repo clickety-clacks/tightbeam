@@ -41,8 +41,8 @@ mix run scripts/soak.exs -- --minutes 1440
 The default arena is `~/.tightbeam-soak`; use `--base-dir` and `--port` for a
 different dedicated arena. The driver refuses an existing directory unless
 it contains its `.soak-arena` marker, then recreates that marked arena for a
-fresh run. It symlinks the existing `~/.tightbeam-beam/auth/claude` directory
-into the arena; it never copies the OAuth token.
+fresh run. It seeds the arena from the exact Claude harness home under
+`~/.tightbeam-beam/homes/`; it never reads a legacy shared-auth directory.
 
 Results remain in the arena: `state.db` is the audited ledger,
 `soak-events.log` records load, kill, recovery, and audit events,

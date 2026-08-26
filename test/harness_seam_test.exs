@@ -40,10 +40,7 @@ defmodule Tightbeam.HarnessSeamTest do
     base_dir =
       Path.join(System.tmp_dir!(), "tightbeam-fixture-seam-#{System.unique_integer([:positive])}")
 
-    auth_dir = Path.join([base_dir, "auth", "fixture"])
     home = Homes.home_path(base_dir, "testhost", :fixture)
-    File.mkdir_p!(auth_dir)
-    File.write!(Path.join(auth_dir, "fixture.json"), "fixture-token")
     File.mkdir_p!(home)
     File.write!(Path.join(home, "durable-session"), "unchanged")
     on_exit(fn -> File.rm_rf!(base_dir) end)
@@ -55,7 +52,7 @@ defmodule Tightbeam.HarnessSeamTest do
             ]} =
              Harness.Fixture.fetch_catalog(%{})
 
-    assert %{home_path: ^home, linked_auth_files: ["fixture.json"]} =
+    assert %{home_path: ^home} =
              Homes.project(base_dir, %{
                harness: :fixture,
                machine: "testhost",
@@ -64,8 +61,7 @@ defmodule Tightbeam.HarnessSeamTest do
 
     assert File.read!(Path.join(home, "durable-session")) == "unchanged"
 
-    assert File.read_link!(Path.join(home, "fixture.json")) ==
-             Path.join(auth_dir, "fixture.json")
+    refute File.exists?(Path.join(home, "fixture.json"))
   end
 
   test "literal scan passes, fails on a scoped reintroduction, and wire projection has two consumers" do

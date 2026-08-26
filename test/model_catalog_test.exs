@@ -16,7 +16,7 @@ defmodule Tightbeam.ModelCatalogTest do
     db = :"model_catalog_db_#{System.unique_integer([:positive])}"
     start_supervised!({Tightbeam.DB, path: ":memory:", name: db})
     :ok = Placement.ensure_schema(db)
-    token_dir = Path.join([base_dir, "auth", "claude"])
+    token_dir = Path.join([base_dir, "homes", @host, "claude"])
     File.mkdir_p!(token_dir)
 
     File.write!(
@@ -500,7 +500,11 @@ defmodule Tightbeam.ModelCatalogTest do
   test "an unreadable credential store is the catalog health and warning reason", ctx do
     reason =
       {:credential_store_unreadable,
-       %{path: Path.join(ctx.base_dir, "auth/claude"), found: :symlink, expected: :directory}}
+       %{
+         path: Path.join([ctx.base_dir, "homes", @host, "claude"]),
+         found: :symlink,
+         expected: :directory
+       }}
 
     catalog = unique_name(:unreadable_store_catalog)
 
@@ -536,14 +540,7 @@ defmodule Tightbeam.ModelCatalogTest do
                catalog_reply(~s({"detail":"Could not parse your authentication token."}), 401)
              end
            ], "codex",
-           {:rotation_retry_failed,
-            %{
-              initial_401:
-                {:http_status, 401, ~s({"detail":"Could not parse your authentication token."})},
-              initial_guidance: "sign in again to repair the original 401",
-              retry_failure:
-                {:http_status, 401, ~s({"detail":"Could not parse your authentication token."})}
-            }}}
+           {:http_status, 401, ~s({"detail":"Could not parse your authentication token."})}}
         ] do
       name = unique_name(label)
       catalog = start_catalog(ctx, Keyword.put(opts, :name, name))
@@ -561,28 +558,17 @@ defmodule Tightbeam.ModelCatalogTest do
     assert is_map(Gateway.org_options())
   end
 
-  # Issue #9: Claude Code rotates `.credentials.json` inside the harness home
-  # (write-temp-then-rename), which severs the symlink to the store copy. The
-  # store copy freezes on the pre-rotation token and the provider revokes it,
-  # so every refresh 401s "revoked" against a token that is fine everywhere
-  # else. The store credential here is deliberately stale/wrong; the home
-  # copy under `homes/<host>/claude` is the rotated one the vendor actually
-  # wrote, and only it authenticates -- proving the recovered catalog came
-  # from a real harvest-and-retry, not a lucky second read of the same file.
-  test "a subscription 401 harvests the rotated home credential and retries", ctx do
-    stale_store = ~s({"claudeAiOauth":{"accessToken":"fixture-token-STALE"}})
-    File.write!(Path.join([ctx.base_dir, "auth", "claude", ".credentials.json"]), stale_store)
-
-    rotated_home = ~s({"claudeAiOauth":{"accessToken":"fixture-token-ROTATED"}})
+  test "a subscription catalog reads the exact home credential without a store", ctx do
+    home_bytes = ~s({"claudeAiOauth":{"accessToken":"fixture-token-HOME"}})
     home = Path.join([ctx.base_dir, "homes", @host, "claude"])
     File.mkdir_p!(home)
-    File.write!(Path.join(home, ".credentials.json"), rotated_home)
+    File.write!(Path.join(home, ".credentials.json"), home_bytes)
 
     claude_json = fixture_body("claude_models.jsonc")
 
     claude_fetch = fn
       "/v1/models?limit=100", headers ->
-        if bearer(headers) == "fixture-token-ROTATED" do
+        if bearer(headers) == "fixture-token-HOME" do
           {:ok, claude_json}
         else
           {:error,
@@ -604,14 +590,10 @@ defmodule Tightbeam.ModelCatalogTest do
 
     refute log =~ "revoked"
 
-    assert File.read!(Path.join([ctx.base_dir, "auth", "claude", ".credentials.json"])) ==
-             rotated_home
+    refute File.exists?(Path.join([ctx.base_dir, "auth", "claude", ".credentials.json"]))
   end
 
-  test "a failed rotation retry reports the original 401 and distinct retry failure", ctx do
-    stale_store = ~s({"claudeAiOauth":{"accessToken":"fixture-token-STALE"}})
-    File.write!(Path.join([ctx.base_dir, "auth", "claude", ".credentials.json"]), stale_store)
-
+  test "an observed subscription 401 is surfaced once without harvest or retry", ctx do
     home = Path.join([ctx.base_dir, "homes", @host, "claude"])
     File.mkdir_p!(home)
 
@@ -628,47 +610,27 @@ defmodule Tightbeam.ModelCatalogTest do
     claude_fetch = fn "/v1/models?limit=100", _headers ->
       :counters.add(fetches, 1, 1)
 
-      case :counters.get(fetches, 1) do
-        1 -> {:error, {:http_status, 401, revoked}}
-        2 -> {:error, {:network, :etimedout}}
-        count -> flunk("catalog fetched #{count} times")
-      end
+      {:error, {:http_status, 401, revoked}}
     end
 
     catalog = start_catalog(ctx, claude_fetch: claude_fetch)
 
-    combined_failure =
-      {:rotation_retry_failed,
-       %{
-         initial_401: {:http_status, 401, revoked},
-         initial_guidance: "sign in again to repair the original 401",
-         retry_failure: {:network, :etimedout}
-       }}
-
     await(fn ->
       ModelCatalog.get(@host, "claude", catalog) ==
-        {[], {:unavailable, combined_failure}}
+        {[], {:unavailable, {:http_status, 401, revoked}}}
     end)
 
-    assert :counters.get(fetches, 1) == 2
+    assert :counters.get(fetches, 1) == 1
 
     assert {:error, %Unroutable{} = unroutable} =
              ModelCatalog.route(@host, "claude", Model.new("anything"), catalog)
 
-    message = Unroutable.message(unroutable)
-    assert message =~ "initial_401"
-    assert message =~ "sign in again to repair the original 401"
-    assert message =~ "retry_failure"
-    assert message =~ "etimedout"
+    assert Unroutable.message(unroutable) =~ "401"
   end
 
   test "an api-key 401 is never treated as a rotation and never harvested", ctx do
-    store = Path.join([ctx.base_dir, "auth", "claude", ".credentials.json"])
+    store = Path.join([ctx.base_dir, "homes", @host, "claude", ".credentials.json"])
     File.write!(store, "sk-ant-api03-STALE")
-
-    home = Path.join([ctx.base_dir, "homes", @host, "claude"])
-    File.mkdir_p!(home)
-    File.write!(Path.join(home, ".credentials.json"), "sk-ant-api03-ROTATED")
 
     claude_fetch = fn "/v1/models?limit=100", _headers ->
       {:error, {:http_status, 401, ~s({"detail":"API key is invalid."})}}
@@ -688,25 +650,12 @@ defmodule Tightbeam.ModelCatalogTest do
     assert File.read!(store) == "sk-ant-api03-STALE"
   end
 
-  # The harvest reads the LOCAL filesystem, so the `ssh: nil` guard scopes it to
-  # a local probe: a remote host's credential lives on that host, and a 401 from
-  # its probe must fall through untouched rather than sweep this box's homes.
-  # Same rotation, same 401 body -- but the owning host is remote, so the store
-  # is left exactly as stale as it was.
-  test "a subscription 401 on a remote host is never harvested against the local store", ctx do
+  test "a subscription 401 on a remote host leaves its home credential untouched", ctx do
     remote_base = Path.join(ctx.base_dir, "remote-root")
-    store = Path.join([remote_base, "auth", "claude", ".credentials.json"])
+    store = Path.join([remote_base, "homes", "sat", "claude", ".credentials.json"])
     File.mkdir_p!(Path.dirname(store))
     stale_store = ~s({"claudeAiOauth":{"accessToken":"fixture-token-STALE"}})
     File.write!(store, stale_store)
-
-    home = Path.join([remote_base, "homes", "sat", "claude"])
-    File.mkdir_p!(home)
-
-    File.write!(
-      Path.join(home, ".credentials.json"),
-      ~s({"claudeAiOauth":{"accessToken":"fixture-token-ROTATED"}})
-    )
 
     {:ok, _entry} =
       Placement.register_host(ctx.db, "sat", %{
@@ -1177,16 +1126,16 @@ defmodule Tightbeam.ModelCatalogTest do
       # read these files locally and interpolated them, the secret would appear
       # in the command line the test captures.
       satellite_base = Path.join(ctx.base_dir, "satellite-root")
-      File.mkdir_p!(Path.join([satellite_base, "auth", "claude"]))
-      File.mkdir_p!(Path.join([satellite_base, "auth", "codex"]))
+      File.mkdir_p!(Path.join([satellite_base, "homes", "satellite", "claude"]))
+      File.mkdir_p!(Path.join([satellite_base, "homes", "satellite", "codex"]))
 
       File.write!(
-        Path.join([satellite_base, "auth", "claude", ".credentials.json"]),
+        Path.join([satellite_base, "homes", "satellite", "claude", ".credentials.json"]),
         ~s({"claudeAiOauth":{"accessToken":"#{@claude_secret}"}})
       )
 
       File.write!(
-        Path.join([satellite_base, "auth", "codex", "auth.json"]),
+        Path.join([satellite_base, "homes", "satellite", "codex", "auth.json"]),
         JSON.encode!(%{tokens: %{access_token: @codex_secret}})
       )
 
@@ -1256,7 +1205,15 @@ defmodule Tightbeam.ModelCatalogTest do
       # The property this test exists for is stronger now, not weaker: the secret never
       # enters a shell variable at all. Only the PATH is on the command line, asserted here
       # and by the `refute` above.
-      credential_file = Path.join([ctx.satellite_base, "auth", "claude", ".credentials.json"])
+      credential_file =
+        Path.join([
+          ctx.satellite_base,
+          "homes",
+          "satellite",
+          "claude",
+          ".credentials.json"
+        ])
+
       assert claude_line =~ "catalog-probe anthropic subscription"
       assert claude_line =~ credential_file
       refute claude_line =~ "python3"
@@ -1274,14 +1231,17 @@ defmodule Tightbeam.ModelCatalogTest do
       codex_line = Enum.join(codex, " ")
       refute codex_line =~ @codex_secret
       assert codex_line =~ "token=$(node -e "
-      assert codex_line =~ Path.join([ctx.satellite_base, "auth", "codex", "auth.json"])
+
+      assert codex_line =~
+               Path.join([ctx.satellite_base, "homes", "satellite", "codex", "auth.json"])
+
       assert codex_line =~ ~s(-H "authorization: Bearer $token")
 
       # The gateway's own codex probe is the same script without the ssh: one
       # shape for both localities, each reading its own host's grant.
       local_codex = probe_command!(:codex, :local)
       assert ["sh", "-c", script] = local_codex
-      assert script =~ Path.join([ctx.base_dir, "auth", "codex", "auth.json"])
+      assert script =~ Path.join([ctx.base_dir, "homes", @host, "codex", "auth.json"])
       refute script =~ ctx.satellite_base
     end
 
@@ -1307,7 +1267,8 @@ defmodule Tightbeam.ModelCatalogTest do
       refute line =~ ~r/client_version=\d/
 
       # It is read from the host that runs the turn: the satellite's own auth.json.
-      assert line =~ Path.join([ctx.satellite_base, "auth", "codex", "auth.json"])
+      assert line =~
+               Path.join([ctx.satellite_base, "homes", "satellite", "codex", "auth.json"])
     end
 
     test "a 200 with an empty model list names the client_version that produced it", ctx do
@@ -1333,7 +1294,7 @@ defmodule Tightbeam.ModelCatalogTest do
     # shell, which a unit test has no business reaching. The script is the real
     # one; only the hosts we cannot run on are stubbed away.
     test "a torn read of auth.json is transient, and never a credential verdict", ctx do
-      auth = Path.join([ctx.base_dir, "auth", "codex", "auth.json"])
+      auth = Path.join([ctx.base_dir, "homes", @host, "codex", "auth.json"])
       File.mkdir_p!(Path.dirname(auth))
 
       whole =

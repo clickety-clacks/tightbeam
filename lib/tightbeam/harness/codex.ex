@@ -248,7 +248,7 @@ defmodule Tightbeam.Harness.Codex do
 
   @impl true
   def owned_home_entries,
-    do: Support.owned_home_entries("auth.json", "hooks.json")
+    do: Support.owned_home_entries("hooks.json")
 
   @impl true
   def reconcile_home(target, home, desired) do
@@ -267,7 +267,6 @@ defmodule Tightbeam.Harness.Codex do
       end
 
     Tightbeam.Homes.reconcile(target, home, %{desired | rails: rails},
-      credential_names: ["auth.json"],
       rails_filename: "hooks.json"
     )
   end
@@ -283,19 +282,8 @@ defmodule Tightbeam.Harness.Codex do
   end
 
   @impl true
-  def credential_ready?(target, _home) do
-    store =
-      Tightbeam.Credentials.store_dir(
-        target.host_config.base_dir,
-        credential_provider()
-      )
-
-    Tightbeam.Homes.credential_ready?(target, store, ["auth.json"])
-  end
-
-  @impl true
-  def harvest_credential(target, home) do
-    Tightbeam.Homes.harvest_credential(target, home, "auth.json")
+  def credential_ready?(target, home) do
+    Tightbeam.Homes.credential_ready?(target, home, ["auth.json"])
   end
 
   @impl true
@@ -479,7 +467,13 @@ defmodule Tightbeam.Harness.Codex do
 
   defp probe(state, kind) do
     sh = Map.get(state.options, :sh, &Support.system_cmd_out/1)
-    auth = Path.join([state.base_dir, "auth", "codex", "auth.json"])
+
+    auth =
+      Tightbeam.Credentials.credential_path(
+        state.base_dir,
+        Map.get(state, :host_name, Tightbeam.Placement.local_host_name()),
+        credential_provider()
+      )
 
     sh
     |> Support.catalog_probe(
@@ -772,6 +766,7 @@ defmodule Tightbeam.Harness.Codex do
         # reason.
         %{
           base_dir: base,
+          host_name: "vector",
           credential_kind: if(case_name == "valid_api_key", do: :api_key, else: :subscription),
           options: %{sh: sh, codex_selectable_models: :all}
         }

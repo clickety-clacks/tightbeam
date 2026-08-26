@@ -620,10 +620,11 @@ defmodule Tightbeam.EscalationDeliveryTest do
       )
 
     File.rm_rf!(base_dir)
-    File.mkdir_p!(Path.join([base_dir, "auth", "claude"]))
+    claude_home = Tightbeam.Homes.home_path(base_dir, "testhost", :claude)
+    File.mkdir_p!(claude_home)
 
     File.write!(
-      Path.join([base_dir, "auth", "claude", ".credentials.json"]),
+      Path.join(claude_home, ".credentials.json"),
       ~s({"claudeAiOauth":{"accessToken":"test-token"}})
     )
 

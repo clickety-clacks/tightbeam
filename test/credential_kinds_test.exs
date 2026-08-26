@@ -32,7 +32,7 @@ defmodule Tightbeam.CredentialKindsTest do
   end
 
   defp stage!(base, provider, filename, bytes) do
-    path = Path.join([base, "auth", provider, filename])
+    path = Path.join([base, "homes", "eezo", provider, filename])
     File.mkdir_p!(Path.dirname(path))
     File.write!(path, bytes)
     path
@@ -60,7 +60,7 @@ defmodule Tightbeam.CredentialKindsTest do
       assert :ok = Credentials.finish_onboard(:anthropic, :api_key, lease_id, server)
 
       metadata =
-        [ctx.base, "auth", "claude", ".tightbeam", "credential.json"]
+        [ctx.base, "homes", "eezo", "claude", ".tightbeam", "credential.json"]
         |> Path.join()
         |> File.read!()
         |> JSON.decode!()
@@ -75,10 +75,10 @@ defmodule Tightbeam.CredentialKindsTest do
 
       assert Credentials.status(:anthropic, server) == :onboarded
       assert Credentials.kind(:anthropic, server) == :api_key
-      assert Credentials.kind_at(ctx.base, :anthropic) == :api_key
+      assert Credentials.kind_at(ctx.base, "eezo", :anthropic) == :api_key
     end
 
-    test "a subscription banks with its kind and keeps its expiry", ctx do
+    test "a subscription banks with its kind without inferring expiry", ctx do
       {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
 
       {:ok, staging, lease_id} = Credentials.begin_onboard(:anthropic, server)
@@ -91,13 +91,13 @@ defmodule Tightbeam.CredentialKindsTest do
       assert :ok = Credentials.finish_onboard(:anthropic, :subscription, lease_id, server)
 
       metadata =
-        [ctx.base, "auth", "claude", ".tightbeam", "credential.json"]
+        [ctx.base, "homes", "eezo", "claude", ".tightbeam", "credential.json"]
         |> Path.join()
         |> File.read!()
         |> JSON.decode!()
 
       assert metadata["kind"] == "subscription"
-      assert is_integer(metadata["expires_at"])
+      assert metadata["expires_at"] == nil
       assert metadata["subscription_status"] == "supported"
       assert Credentials.kind(:anthropic, server) == :subscription
     end
@@ -107,7 +107,7 @@ defmodule Tightbeam.CredentialKindsTest do
 
       assert Credentials.kind(:anthropic, server) == :none
       assert Credentials.kind(:openai, server) == :none
-      assert Credentials.kind_at(ctx.base, :openai) == :none
+      assert Credentials.kind_at(ctx.base, "eezo", :openai) == :none
     end
 
     test "both providers on one host can hold different kinds", ctx do
@@ -155,9 +155,15 @@ defmodule Tightbeam.CredentialKindsTest do
     end
 
     test "a local api-key host gets ANTHROPIC_API_KEY and nothing else", ctx do
-      stage!(ctx.base, "claude", ".credentials.json", "sk-ant-api03-local\n")
+      credential = stage!(ctx.base, "claude", ".credentials.json", "sk-ant-api03-local\n")
 
-      plan = Claude.prepare_launch(target(ctx.base, nil), "/home", launch_opts(:api_key))
+      plan =
+        Claude.prepare_launch(
+          target(ctx.base, nil),
+          Path.dirname(credential),
+          launch_opts(:api_key)
+        )
+
       env = Keyword.fetch!(plan, :env)
 
       assert {"ANTHROPIC_API_KEY", "sk-ant-api03-local"} in env
@@ -175,13 +181,20 @@ defmodule Tightbeam.CredentialKindsTest do
     # An environment variable has nowhere to put a refresh token, so injecting the access
     # token would work until it lapsed and then fail with no way back.
     test "a local subscription host gets no credential in its environment at all", ctx do
-      stage!(ctx.base, "claude", ".credentials.json", ~s({"claudeAiOauth":{"accessToken":"a"}}))
+      credential =
+        stage!(ctx.base, "claude", ".credentials.json", ~s({"claudeAiOauth":{"accessToken":"a"}}))
 
-      plan = Claude.prepare_launch(target(ctx.base, nil), "/home", launch_opts(:subscription))
+      plan =
+        Claude.prepare_launch(
+          target(ctx.base, nil),
+          Path.dirname(credential),
+          launch_opts(:subscription)
+        )
+
       env = Keyword.fetch!(plan, :env)
 
       assert Enum.filter(env, fn {name, _} -> credential_variable?(name) end) == []
-      assert {"CLAUDE_CONFIG_DIR", "/home"} in env
+      assert {"CLAUDE_CONFIG_DIR", Path.dirname(credential)} in env
     end
 
     test "a remote host expands its own credential and puts no secret in any argv", ctx do
@@ -251,6 +264,7 @@ defmodule Tightbeam.CredentialKindsTest do
       assert {:ok, [entry]} =
                Claude.fetch_catalog(%{
                  base_dir: ctx.base,
+                 host_name: "eezo",
                  credential_kind: :api_key,
                  options: %{claude_fetch: fetch, claude_selectable_models: :all}
                })
@@ -284,6 +298,7 @@ defmodule Tightbeam.CredentialKindsTest do
       assert {:ok, [_entry]} =
                Claude.fetch_catalog(%{
                  base_dir: ctx.base,
+                 host_name: "eezo",
                  credential_kind: :subscription,
                  options: %{claude_fetch: fetch, claude_selectable_models: :all}
                })
@@ -305,6 +320,7 @@ defmodule Tightbeam.CredentialKindsTest do
       assert {:ok, [entry]} =
                Codex.fetch_catalog(%{
                  base_dir: ctx.base,
+                 host_name: "eezo",
                  credential_kind: :api_key,
                  options: %{sh: sh}
                })
@@ -342,6 +358,7 @@ defmodule Tightbeam.CredentialKindsTest do
       assert {:ok, entries} =
                Codex.fetch_catalog(%{
                  base_dir: ctx.base,
+                 host_name: "eezo",
                  credential_kind: :api_key,
                  options: %{sh: sh}
                })
@@ -358,6 +375,7 @@ defmodule Tightbeam.CredentialKindsTest do
       assert {:ok, entries} =
                Codex.fetch_catalog(%{
                  base_dir: ctx.base,
+                 host_name: "eezo",
                  credential_kind: :api_key,
                  options: %{sh: sh, codex_selectable_models: :all}
                })
@@ -378,6 +396,7 @@ defmodule Tightbeam.CredentialKindsTest do
       assert {:ok, [entry]} =
                Codex.fetch_catalog(%{
                  base_dir: ctx.base,
+                 host_name: "eezo",
                  credential_kind: :subscription,
                  options: %{sh: sh}
                })
@@ -392,6 +411,7 @@ defmodule Tightbeam.CredentialKindsTest do
       assert {:error, :empty_inventory} =
                Codex.fetch_catalog(%{
                  base_dir: ctx.base,
+                 host_name: "eezo",
                  credential_kind: :api_key,
                  options: %{sh: sh}
                })
@@ -404,6 +424,7 @@ defmodule Tightbeam.CredentialKindsTest do
       assert {:error, {:empty_catalog_for_client_version, "0.145.0"}} =
                Codex.fetch_catalog(%{
                  base_dir: ctx.base,
+                 host_name: "eezo",
                  credential_kind: :subscription,
                  options: %{sh: sh}
                })

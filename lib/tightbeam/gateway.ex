@@ -73,7 +73,6 @@ defmodule Tightbeam.Gateway do
     Escalation,
     EventLog,
     Harness,
-    Homes,
     Identity,
     IdPrefix,
     Idempotency,
@@ -201,8 +200,6 @@ defmodule Tightbeam.Gateway do
     # Identity is loaded at composition time; a malformed manifest fails the
     # boot (bad law stops the boot). Placement owns every host mechanic.
     reload_law!(config, Map.keys(handler_table))
-    Enum.each(Harness.all(), &Homes.sweep_auth(config.base_dir, &1.id()))
-
     adapter_config = config |> Map.put(:cli_bin, cli_bin) |> Map.put(:db, db)
     adapter_context = fn key -> Placement.adapter_context(adapter_config, key) end
 

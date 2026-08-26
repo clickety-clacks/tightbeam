@@ -18,8 +18,8 @@ it and demands nothing.
 
 ## On the satellite (one-time, by the operator)
 
-1. **Base dir** — `mkdir -p ~/.tightbeam/auth/<harness>` for each harness
-   that will run here (`claude`, `codex`). `homes/` is created by delivery.
+1. **Base dir** — Tightbeam creates `homes/<machine>/<harness>` during
+   onboarding and delivery. Do not create a separate credential store.
 2. **Credentials** — run Tightbeam onboarding independently on this
    machine: `tightbeam onboard openai` for Codex device-code, and
    `tightbeam onboard anthropic` for Claude setup-token. Never copy,

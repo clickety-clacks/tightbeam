@@ -9,7 +9,7 @@ defmodule Tightbeam.ClientE2E.LegGateway do
   Keychain, so a reused org takes the known-device path instead of J0's
   first-user bootstrap, and every prior leg's rows are still in the catalog.
   Leg isolation therefore means a fresh `base_dir` provisioned AND torn down
-  per leg — a fresh state.db over a copy of the org's credential material,
+  per leg — a fresh state.db over a copy of the host-local harness homes,
   which is exactly SMOKE.md's manual recipe for smoke orgs.
 
   What is copied from the template org and why (SMOKE.md §Fresh-org
@@ -22,11 +22,9 @@ defmodule Tightbeam.ClientE2E.LegGateway do
     copy is same-host by construction — the leg gateway runs on the machine
     the template lives on — so native deps and the relative `.bin` symlinks
     are valid as-is.
-  - `auth/` — credentials are STORE ROWS, not loose files: the backing file,
-    the home symlink, and the `.tightbeam/credential.json` metadata row all
-    have to arrive together.
-  - `homes/` — the harness homes themselves. The codex model catalog no
-    longer lives here: it is one HTTPS call the host makes with its own
+  - `homes/` — the harness homes, including each harness's sole credential
+    file and its `.tightbeam/credential.json` kind metadata. The codex model
+    catalog no longer lives here: it is one HTTPS call the host makes with its own
     grant, so nothing has to be seeded for a spawn to find a model.
   - `identity/` — archetypes, guidance and rails, WITH its git repo: the
     identity seam refuses to work from a dirty tree, so the copy keeps
@@ -50,7 +48,7 @@ defmodule Tightbeam.ClientE2E.LegGateway do
 
   defstruct [:base_dir, :port, :os_pid, :os_command, :port_ref, :log_path]
 
-  @copied ~w(adapters auth homes identity)
+  @copied ~w(adapters homes identity)
 
   @doc """
   Copies a provisioned template org into `base_dir` (which must not exist).

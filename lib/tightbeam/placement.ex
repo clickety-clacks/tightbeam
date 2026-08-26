@@ -43,10 +43,9 @@ defmodule Tightbeam.Placement do
        the gateway over the network; the org token is never placed in remote env.
 
   3. `deliver_home/3` — materialize the generic `{harness, machine}` home on
-     the session's host. Regeneration owns only the credential entry, rails
-     artifact, and `.tightbeam/`; every other harness-owned byte survives.
-     Remote regeneration follows the same stop, harvest, replace, and relink
-     order without ever deleting the home. Credentials remain host-local.
+     the session's host. Regeneration owns only the rails artifact, projection
+     manifest, and baseline skills; every harness-owned byte survives.
+     It never reads, removes, copies, links, or writes the credential file.
 
      `materialize_identity/4` separately projects elected skills into the
      exact session cwd and writes the reserved git exclusion only when that
@@ -1574,12 +1573,7 @@ defmodule Tightbeam.Placement do
         # /accepted model set follows this home pin (wi_263814d3), so pinning the
         # selected model is what makes the adapter accept it at session/new — the
         # cure for the accepted-then-dead class.
-        default_model: Keyword.get(opts, :model) || Map.get(config, :default_model),
-        auth_dir:
-          Tightbeam.Credentials.store_dir(
-            host_config.base_dir,
-            module.credential_provider()
-          )
+        default_model: Keyword.get(opts, :model) || Map.get(config, :default_model)
       }
     )
     |> Map.fetch!(:home_path)

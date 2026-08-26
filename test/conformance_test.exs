@@ -3165,7 +3165,7 @@ defmodule Tightbeam.ConformanceSupport do
   end
 
   defp remedy_action_handlers(base, db) do
-    auth_dir = Path.join([base, "auth", "codex"])
+    auth_dir = Tightbeam.Homes.home_path(base, "testhost", :codex)
     File.mkdir_p!(auth_dir)
     File.write!(Path.join(auth_dir, "auth.json"), "{}")
     Archetypes.load!(base)

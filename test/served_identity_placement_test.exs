@@ -38,7 +38,7 @@ defmodule Tightbeam.ServedIdentityPlacementTest do
     %{base: base, db: db}
   end
 
-  test "remote home regeneration harvests before owned removal and never removes the home", ctx do
+  test "remote home regeneration never touches credentials or removes the home", ctx do
     owner = self()
 
     sh = fn command ->
@@ -49,9 +49,7 @@ defmodule Tightbeam.ServedIdentityPlacementTest do
           {"stale", 0}
 
         command when is_list(command) ->
-          if Enum.any?(command, &String.contains?(&1, "credential-harvest")),
-            do: {"", 42},
-            else: {"", 0}
+          {"", 0}
 
         _ ->
           {"", 0}
@@ -63,39 +61,29 @@ defmodule Tightbeam.ServedIdentityPlacementTest do
     commands = collect_commands([])
     assert home == "/srv/tightbeam/homes/worker/codex"
 
-    harvest =
-      Enum.find(commands, fn command ->
-        Enum.any?(command, &String.contains?(&1, "credential-harvest"))
-      end)
-
     regeneration =
       Enum.find(commands, fn command ->
         Enum.any?(command, &String.contains?(&1, ".tightbeam")) and
           Enum.any?(command, &String.contains?(&1, "rm -f"))
       end)
 
-    harvest_script = Enum.join(harvest, " ")
     regeneration_script = Enum.join(regeneration, " ")
-    assert harvest_script =~ "cp"
-    assert harvest_script =~ "chmod 600"
     assert regeneration_script =~ "rm -f"
     assert regeneration_script =~ ".tightbeam"
+    refute Enum.any?(commands, &(Enum.join(&1, " ") =~ "auth.json"))
     refute regeneration_script =~ "rm -rf \"#{home}\""
     refute Enum.any?(commands, &(Enum.join(&1, " ") =~ "rm -rf #{home}"))
   end
 
-  test "remote regeneration preserves durable bytes and harvests a rotated credential first",
+  test "remote regeneration preserves durable bytes including the home credential",
        ctx do
     remote = Path.join(ctx.base, "remote")
     home = Path.join([remote, "homes", "worker", "codex"])
-    store = Path.join([remote, "auth", "codex", "auth.json"])
     File.mkdir_p!(Path.join(home, "sessions"))
-    File.mkdir_p!(Path.dirname(store))
     File.mkdir_p!(Path.join(home, ".tightbeam"))
     File.write!(Path.join(home, "sessions/rollout.jsonl"), "rollout")
     File.write!(Path.join(home, "history.jsonl"), "history")
     File.write!(Path.join(home, "auth.json"), "rotated")
-    File.write!(store, "stale")
     File.write!(Path.join(home, "hooks.json"), "old")
     File.write!(Path.join(home, ".tightbeam/manifest"), "stale")
 
@@ -112,15 +100,6 @@ defmodule Tightbeam.ServedIdentityPlacementTest do
       cond do
         "cat" in command ->
           {File.read!(Path.join(home, ".tightbeam/manifest")), 0}
-
-        String.contains?(joined, "credential-harvest") and String.contains?(joined, "cat") ->
-          run_local_ssh(command)
-
-        String.contains?(joined, "mv -f") ->
-          result = run_local_ssh(command)
-          File.rm!(Path.join(home, "auth.json"))
-          send(owner, :harvested)
-          result
 
         hd(command) == "rsync" ->
           source = Enum.at(command, -2) |> String.trim_trailing("/")
@@ -146,10 +125,9 @@ defmodule Tightbeam.ServedIdentityPlacementTest do
              sh: sh
            ) == home
 
-    assert_receive :harvested
     assert_receive :projected
-    assert File.read!(store) == "rotated"
-    assert File.lstat!(Path.join(home, "auth.json")).type == :symlink
+    assert File.read!(Path.join(home, "auth.json")) == "rotated"
+    assert File.lstat!(Path.join(home, "auth.json")).type == :regular
     assert File.read!(Path.join(home, "sessions/rollout.jsonl")) == "rollout"
     assert File.read!(Path.join(home, "history.jsonl")) == "history"
   end
@@ -193,7 +171,7 @@ defmodule Tightbeam.ServedIdentityPlacementTest do
   # that Claude Code reads and rotates. What must still hold, and is the point of this test,
   # is that many sessions sharing one host put NO secret material into any launch plan.
   test "many Claude sessions share one host credential without it entering a launch plan", ctx do
-    token = Path.join([ctx.base, "auth", "claude", ".credentials.json"])
+    token = Path.join([ctx.base, "homes", "eezo", "claude", ".credentials.json"])
     File.mkdir_p!(Path.dirname(token))
     File.write!(token, ~s({"claudeAiOauth":{"accessToken":"sk-ant-oat01-shared"}}))
 

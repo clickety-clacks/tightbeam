@@ -60,11 +60,11 @@ defmodule Tightbeam.ProviderAdditivityTest do
 
     assert Credentials.status(:fixture_provider) == :onboarded
 
-    store = Path.join([base, "auth", "fixture", "fixture.json"])
+    store = Credentials.credential_path(base, "testhost", :fixture_provider)
     home = Homes.home_path(base, "testhost", :fixture)
 
+    assert store == Path.join(home, "fixture.json")
     assert File.read!(store) == "fixture-provider-credential"
-    assert File.read_link!(Path.join(home, "fixture.json")) == store
 
     {reported, 0} =
       System.cmd(Path.expand("scripts/check_provider_literals.sh"), ["--print"])

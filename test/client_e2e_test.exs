@@ -898,7 +898,7 @@ defmodule Tightbeam.ClientE2ETest do
     # installing, and the run is poisoned before turn 1. The copy is same-host
     # by construction, so the template's node_modules (native deps included)
     # and its relative .bin symlinks are valid as-is.
-    test "provision! copies adapters/ alongside auth/, homes/ and identity/ — never state.db" do
+    test "provision! copies adapters/, homes/ and identity/ — never auth/ or state.db" do
       template =
         Path.join(
           System.tmp_dir!(),
@@ -911,7 +911,7 @@ defmodule Tightbeam.ClientE2ETest do
 
       adapter = Path.join(["adapters", "node_modules", ".bin", "claude-agent-acp"])
 
-      for rel <- [adapter, "auth/claude/token", "homes/marker", "identity/marker"] do
+      for rel <- [adapter, "auth/claude/stale", "homes/marker", "identity/marker"] do
         path = Path.join(template, rel)
         File.mkdir_p!(Path.dirname(path))
         File.write!(path, rel)
@@ -926,10 +926,11 @@ defmodule Tightbeam.ClientE2ETest do
       assert File.exists?(Path.join(base_dir, adapter)),
              "the template's installed adapters must ride into the leg"
 
-      for rel <- ["auth/claude/token", "homes/marker", "identity/marker"] do
+      for rel <- ["homes/marker", "identity/marker"] do
         assert File.exists?(Path.join(base_dir, rel))
       end
 
+      refute File.exists?(Path.join(base_dir, "auth"))
       refute File.exists?(Path.join(base_dir, "state.db"))
     end
   end
@@ -1394,17 +1395,15 @@ defmodule Tightbeam.ClientE2ETest do
           "tightbeam-client-e2e-credential-live-#{System.unique_integer([:positive])}"
         )
 
-      store = Tightbeam.Credentials.store_dir(base_dir, :openai)
       home = Tightbeam.Homes.home_path(base_dir, "testhost", :codex)
-      File.mkdir_p!(store)
       File.mkdir_p!(home)
-      File.write!(Path.join(store, "auth.json"), "{}")
+      File.write!(Path.join(home, "auth.json"), "{}")
 
       # A store row is the credential file AND its metadata. The preflight reads
       # the KIND from here to choose which route to probe, so a file with no
       # metadata beside it is not a seeded credential — it is the half-assembled
       # store the "records no credential kind" row exists to catch.
-      metadata = Path.join([store, ".tightbeam", "credential.json"])
+      metadata = Path.join([home, ".tightbeam", "credential.json"])
       File.mkdir_p!(Path.dirname(metadata))
 
       File.write!(

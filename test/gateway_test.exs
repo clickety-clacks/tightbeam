@@ -552,10 +552,11 @@ defmodule Tightbeam.GatewayTest do
     catalog_base =
       Path.join(System.tmp_dir!(), "gateway-catalog-#{System.unique_integer([:positive])}")
 
-    File.mkdir_p!(Path.join([catalog_base, "auth", "claude"]))
+    claude_home = Tightbeam.Homes.home_path(catalog_base, "testhost", :claude)
+    File.mkdir_p!(claude_home)
 
     File.write!(
-      Path.join([catalog_base, "auth", "claude", ".credentials.json"]),
+      Path.join(claude_home, ".credentials.json"),
       ~s({"claudeAiOauth":{"accessToken":"test-token"}})
     )
 
@@ -1443,22 +1444,21 @@ defmodule Tightbeam.GatewayTest do
     end)
   end
 
-  test "children sweeps newer credentials from abandoned identity homes before adapters", ctx do
+  test "children does not harvest credentials from another harness home", ctx do
     base_dir = Path.join(System.tmp_dir!(), "gateway_sweep_#{System.unique_integer([:positive])}")
-    auth_dir = Path.join([base_dir, "auth", "codex"])
-    abandoned = Path.join([base_dir, "homes", "default--abandoned", "codex"])
-    File.mkdir_p!(auth_dir)
+    home = Tightbeam.Homes.home_path(base_dir, "testhost", :codex)
+    abandoned = Tightbeam.Homes.home_path(base_dir, "default--abandoned", :codex)
+    File.mkdir_p!(home)
     File.mkdir_p!(abandoned)
-    store = Path.join(auth_dir, "auth.json")
+    credential = Path.join(home, "auth.json")
     rotated = Path.join(abandoned, "auth.json")
-    File.write!(store, "stale")
+    File.write!(credential, "current")
     File.write!(rotated, "rotated")
-    File.touch!(store, {{2026, 1, 1}, {0, 0, 0}})
-    File.touch!(rotated, {{2026, 1, 2}, {0, 0, 0}})
 
     Gateway.children(gateway_config(base_dir, ctx.db, 0))
 
-    assert File.read!(store) == "rotated"
+    assert File.read!(credential) == "current"
+    assert File.read!(rotated) == "rotated"
   end
 
   test "children mints a cli token when gateway.json is corrupt", ctx do
@@ -2198,7 +2198,7 @@ defmodule Tightbeam.GatewayTest do
 
   test "registered fixture is selectable as the default spawn path and by tune", ctx do
     base_dir = role_test_base("fixture-default")
-    auth_dir = Path.join([base_dir, "auth", "fixture"])
+    auth_dir = Tightbeam.Homes.home_path(base_dir, "testhost", :fixture)
     adapter = Path.join([base_dir, "adapters", "node_modules", ".bin", "fixture-acp"])
     File.mkdir_p!(auth_dir)
     File.write!(Path.join(auth_dir, "fixture.json"), "fixture-token")
@@ -2249,8 +2249,8 @@ defmodule Tightbeam.GatewayTest do
 
     fixture_home = Tightbeam.Homes.home_path(base_dir, "testhost", :fixture)
 
-    assert File.read_link!(Path.join(fixture_home, "fixture.json")) ==
-             Path.join(auth_dir, "fixture.json")
+    assert fixture_home == auth_dir
+    assert File.read!(Path.join(fixture_home, "fixture.json")) == "fixture-token"
   end
 
   # THE STALE-ELECTION SEAM (Sol round 2, blocking 1-3). Each test pauses a
@@ -2260,7 +2260,7 @@ defmodule Tightbeam.GatewayTest do
 
   defp stale_election_arena!(ctx, name) do
     base_dir = role_test_base(name)
-    auth_dir = Path.join([base_dir, "auth", "fixture"])
+    auth_dir = Tightbeam.Homes.home_path(base_dir, "testhost", :fixture)
     adapter = Path.join([base_dir, "adapters", "node_modules", ".bin", "fixture-acp"])
     File.mkdir_p!(auth_dir)
     File.write!(Path.join(auth_dir, "fixture.json"), "fixture-token")
@@ -2553,7 +2553,7 @@ defmodule Tightbeam.GatewayTest do
 
   test "a harness swap leaves a tombstone ABOVE its own barrier", ctx do
     base_dir = role_test_base("swap-tombstone")
-    auth_dir = Path.join([base_dir, "auth", "fixture"])
+    auth_dir = Tightbeam.Homes.home_path(base_dir, "testhost", :fixture)
     adapter = Path.join([base_dir, "adapters", "node_modules", ".bin", "fixture-acp"])
     File.mkdir_p!(auth_dir)
     File.write!(Path.join(auth_dir, "fixture.json"), "fixture-token")
@@ -2817,7 +2817,7 @@ defmodule Tightbeam.GatewayTest do
     # survives either way (nothing is lost); what would be wrong is running it
     # on an engine its author never chose.
     base_dir = role_test_base("live-switch-queued")
-    auth_dir = Path.join([base_dir, "auth", "fixture"])
+    auth_dir = Tightbeam.Homes.home_path(base_dir, "testhost", :fixture)
     adapter = Path.join([base_dir, "adapters", "node_modules", ".bin", "fixture-acp"])
     File.mkdir_p!(auth_dir)
     File.write!(Path.join(auth_dir, "fixture.json"), "fixture-token")
@@ -2905,7 +2905,7 @@ defmodule Tightbeam.GatewayTest do
     # inside the window, so the prompt is neither buried by the barrier nor
     # claimed under the harness the swap left behind.
     base_dir = role_test_base("swap-enqueue-race")
-    auth_dir = Path.join([base_dir, "auth", "fixture"])
+    auth_dir = Tightbeam.Homes.home_path(base_dir, "testhost", :fixture)
     adapter = Path.join([base_dir, "adapters", "node_modules", ".bin", "fixture-acp"])
     File.mkdir_p!(auth_dir)
     File.write!(Path.join(auth_dir, "fixture.json"), "fixture-token")
@@ -3007,7 +3007,7 @@ defmodule Tightbeam.GatewayTest do
     # (`Org.get_in_txn/2`) closes it: the second request's own transaction
     # now sees the FIRST swap's result and refuses `same_harness`.
     base_dir = role_test_base("swap-duplicate-race")
-    auth_dir = Path.join([base_dir, "auth", "fixture"])
+    auth_dir = Tightbeam.Homes.home_path(base_dir, "testhost", :fixture)
     adapter = Path.join([base_dir, "adapters", "node_modules", ".bin", "fixture-acp"])
     File.mkdir_p!(auth_dir)
     File.write!(Path.join(auth_dir, "fixture.json"), "fixture-token")
@@ -3091,7 +3091,7 @@ defmodule Tightbeam.GatewayTest do
   describe "the substrate never elects a model (F2, Sol xhigh review)" do
     setup ctx do
       base_dir = role_test_base("tune-model-election")
-      codex_auth = Path.join([base_dir, "auth", "codex"])
+      codex_auth = Tightbeam.Homes.home_path(base_dir, "testhost", :codex)
       File.mkdir_p!(codex_auth)
       File.write!(Path.join(codex_auth, "auth.json"), "test-token")
       Archetypes.load!(base_dir)
@@ -3279,7 +3279,7 @@ defmodule Tightbeam.GatewayTest do
 
     # CROSS-HARNESS SWITCH: the barrier hides the delivered digest message.
     base_dir = role_test_base("digest-carrier-discovery")
-    auth_dir = Path.join([base_dir, "auth", "fixture"])
+    auth_dir = Tightbeam.Homes.home_path(base_dir, "testhost", :fixture)
     adapter = Path.join([base_dir, "adapters", "node_modules", ".bin", "fixture-acp"])
     File.mkdir_p!(auth_dir)
     File.write!(Path.join(auth_dir, "fixture.json"), "fixture-token")
@@ -3388,7 +3388,7 @@ defmodule Tightbeam.GatewayTest do
 
   test "a failure between the barrier and its tombstone rolls BOTH back", ctx do
     base_dir = role_test_base("swap-atomic")
-    auth_dir = Path.join([base_dir, "auth", "fixture"])
+    auth_dir = Tightbeam.Homes.home_path(base_dir, "testhost", :fixture)
     adapter = Path.join([base_dir, "adapters", "node_modules", ".bin", "fixture-acp"])
     File.mkdir_p!(auth_dir)
     File.write!(Path.join(auth_dir, "fixture.json"), "fixture-token")
@@ -5189,7 +5189,7 @@ defmodule Tightbeam.GatewayTest do
     end
 
     test "an unreadable credential store refuses status instead of reporting none", ctx do
-      store = Path.join([ctx.cred_base, "auth", "claude"])
+      store = Tightbeam.Homes.home_path(ctx.cred_base, "kindhost", :claude)
       target = Path.join(ctx.cred_base, "credential-target")
       File.mkdir_p!(target)
       File.mkdir_p!(Path.dirname(store))
@@ -6370,7 +6370,7 @@ defmodule Tightbeam.GatewayTest do
 
   test "set_harness changes the engine and projects its home at a turn boundary", ctx do
     base_dir = role_test_base("harness-turn-boundary")
-    codex_auth = Path.join([base_dir, "auth", "codex"])
+    codex_auth = Tightbeam.Homes.home_path(base_dir, "testhost", :codex)
     File.mkdir_p!(codex_auth)
     File.write!(Path.join(codex_auth, "auth.json"), "test-token")
     Archetypes.load!(base_dir)
@@ -6475,7 +6475,7 @@ defmodule Tightbeam.GatewayTest do
 
   test "set_harness refuses before writing the new home while a turn runs", ctx do
     base_dir = role_test_base("harness-running-turn")
-    codex_auth = Path.join([base_dir, "auth", "codex"])
+    codex_auth = Tightbeam.Homes.home_path(base_dir, "testhost", :codex)
     File.mkdir_p!(codex_auth)
     File.write!(Path.join(codex_auth, "auth.json"), "test-token")
     Archetypes.load!(base_dir)
@@ -6516,7 +6516,9 @@ defmodule Tightbeam.GatewayTest do
 
     assert_receive {:set_harness_turn_started, runner}
     home = Tightbeam.Homes.home_path(base_dir, local_host, :codex)
-    refute File.exists?(home)
+    assert File.read!(Path.join(home, "auth.json")) == "test-token"
+    refute File.exists?(Path.join(home, ".tightbeam/manifest"))
+    refute File.exists?(Path.join(home, "hooks.json"))
 
     assert %{ok: false, code: "turn_in_progress", message: message} =
              Gateway.handlers(config)["tune"].(%{
@@ -6532,7 +6534,9 @@ defmodule Tightbeam.GatewayTest do
 
     assert message =~ "Try again once the current turn finishes"
     assert Org.get(ctx.db, "k1") == before
-    refute File.exists?(home)
+    assert File.read!(Path.join(home, "auth.json")) == "test-token"
+    refute File.exists?(Path.join(home, ".tightbeam/manifest"))
+    refute File.exists?(Path.join(home, "hooks.json"))
     send(runner, :finish_set_harness_turn)
   end
 
@@ -6544,7 +6548,7 @@ defmodule Tightbeam.GatewayTest do
   # and was refused by the other as "not offered by codex on testhost" (#69).
   test "set_harness accepts the bare model id the picker advertises", ctx do
     base_dir = role_test_base("harness-bare-model")
-    codex_auth = Path.join([base_dir, "auth", "codex"])
+    codex_auth = Tightbeam.Homes.home_path(base_dir, "testhost", :codex)
     File.mkdir_p!(codex_auth)
     File.write!(Path.join(codex_auth, "auth.json"), "test-token")
     Archetypes.load!(base_dir)
@@ -6596,7 +6600,7 @@ defmodule Tightbeam.GatewayTest do
 
   test "set_harness keeps an overridden identity name and projects the new harness home", ctx do
     base_dir = role_test_base("harness-override")
-    codex_auth = Path.join([base_dir, "auth", "codex"])
+    codex_auth = Tightbeam.Homes.home_path(base_dir, "testhost", :codex)
     File.mkdir_p!(codex_auth)
     File.write!(Path.join(codex_auth, "auth.json"), "test-token")
     put_skill!(base_dir, "review", "# Review")
@@ -10297,7 +10301,7 @@ defmodule Tightbeam.GatewayTest do
     end
 
     if ready? do
-      auth_dir = Path.join([base_dir, "auth", "claude"])
+      auth_dir = Tightbeam.Homes.home_path(base_dir, "testhost", :claude)
       File.mkdir_p!(auth_dir)
 
       File.write!(
@@ -10433,12 +10437,15 @@ defmodule Tightbeam.GatewayTest do
     send(parent, {:credential_command, command})
 
     case Enum.take(command, -3) do
-      ["test", operator, path] when operator in ["-d", "-x"] ->
-        if String.ends_with?(path, "/auth") or String.ends_with?(path, "/auth/") do
+      ["test", "-d", path] ->
+        if Path.basename(path) not in ["claude", "codex", "fixture"] do
           {"", 0}
         else
           {"", 1}
         end
+
+      ["test", "-x", _path] ->
+        {"", 0}
 
       _ ->
         {"", 1}

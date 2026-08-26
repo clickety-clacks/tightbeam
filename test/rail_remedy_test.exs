@@ -1364,7 +1364,7 @@ defmodule Tightbeam.RailRemedyTest do
   end
 
   defp spawn_handlers(ctx) do
-    auth_dir = Path.join([ctx.base_dir, "auth", "codex"])
+    auth_dir = Tightbeam.Homes.home_path(ctx.base_dir, "testhost", :codex)
     File.mkdir_p!(auth_dir)
     File.write!(Path.join(auth_dir, "auth.json"), "{}")
     Archetypes.load!(ctx.base_dir)

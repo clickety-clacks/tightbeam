@@ -94,9 +94,9 @@ A fresh base_dir is NOT ready after copying files around; each item below is a
 seam with its own shape, and every one of these was rediscovered the hard way
 on 2026-07-25:
 
-- **Credentials are store rows, not loose files** — three parts per provider,
-  and the metadata row's `kind` is what every credential seam dispatches on.
-  Copying an org's `auth/` around does not make a host logged in. See
+- **Credentials live only in exact harness homes** — one regular credential file
+  plus the same home's metadata row. The metadata `kind` tells each credential
+  seam which provider route to use. Copying another host's home is not onboarding. See
   `docs/ONBOARDING.md` for the layout and the only sanctioned path to create
   it (`tightbeam onboard <provider>`, run on that host).
 - **Codex model catalog** needs nothing seeded. It is one HTTPS call the host
@@ -117,7 +117,7 @@ on 2026-07-25:
   request away from the parent before it can rule, which loses the race on the
   slower codex leg every time.
 - **"Copy the org" means two DIFFERENT things depending on which harness you
-  are driving.** `ClientE2E.LegGateway.provision!/2` copies `auth/`, `homes/`
+  are driving.** `ClientE2E.LegGateway.provision!/2` copies `homes/`
   and `identity/` and deliberately OMITS `state.db`, because a client-e2e leg
   must have no history and bootstraps its first user through the app's own J0
   pairing. `feature_smoke.exs` needs the opposite: a fully provisioned org

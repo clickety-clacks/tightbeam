@@ -923,13 +923,11 @@ defmodule Tightbeam.Identity do
   defp replace_literal_path(content, _base_dir), do: content
 
   defp banked_secret_values(base_dir) do
-    auth_dir = Path.join(base_dir, "auth")
-
-    case File.lstat(auth_dir) do
-      {:ok, %File.Stat{type: :directory}} ->
-        auth_dir
-        |> regular_files_beneath!()
-        |> Enum.flat_map(fn path ->
+    base_dir
+    |> Tightbeam.Credentials.credential_secret_paths()
+    |> Enum.flat_map(fn path ->
+      case File.lstat(path) do
+        {:ok, %File.Stat{type: :regular}} ->
           bytes = File.read!(path)
 
           if bytes != "" and String.valid?(bytes) do
@@ -937,43 +935,20 @@ defmodule Tightbeam.Identity do
           else
             []
           end
-        end)
-        |> Enum.reject(&(&1 == ""))
-        |> Enum.uniq()
-        |> Enum.sort_by(&byte_size/1, :desc)
-
-      {:error, :enoent} ->
-        []
-
-      {:ok, %File.Stat{type: type}} ->
-        raise ArgumentError, "credential bank must be a directory, found #{type}"
-
-      {:error, reason} ->
-        raise File.Error, action: "read credential bank", path: auth_dir, reason: reason
-    end
-  end
-
-  defp regular_files_beneath!(dir) do
-    dir
-    |> File.ls!()
-    |> Enum.sort()
-    |> Enum.flat_map(fn entry ->
-      path = Path.join(dir, entry)
-
-      case File.lstat(path) do
-        {:ok, %File.Stat{type: :directory}} ->
-          regular_files_beneath!(path)
-
-        {:ok, %File.Stat{type: :regular}} ->
-          [path]
 
         {:ok, %File.Stat{}} ->
           []
 
+        {:error, :enoent} ->
+          []
+
         {:error, reason} ->
-          raise File.Error, action: "inspect credential bank", path: path, reason: reason
+          raise File.Error, action: "inspect credential file", path: path, reason: reason
       end
     end)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.uniq()
+    |> Enum.sort_by(&byte_size/1, :desc)
   end
 
   defp replace_banked_secret_values(content, banked_secret_values) do

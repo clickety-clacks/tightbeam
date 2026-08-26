@@ -34,16 +34,15 @@ defmodule Tightbeam.ModelCatalogRotationE2ETest do
     %{base_dir: base_dir}
   end
 
-  test "E2E: a public catalog route repairs one severed local subscription credential", ctx do
-    stale = ~s({"claudeAiOauth":{"accessToken":"fixture-token-STALE"}})
+  test "E2E: a public catalog route uses only the local harness-home credential", ctx do
     rotated = ~s({"claudeAiOauth":{"accessToken":"fixture-token-ROTATED"}})
 
-    store = Path.join([ctx.base_dir, "auth", "claude", ".credentials.json"])
-    metadata = Path.join([ctx.base_dir, "auth", "claude", ".tightbeam", "credential.json"])
     home = Path.join([ctx.base_dir, "homes", @host, "claude", ".credentials.json"])
 
+    metadata =
+      Path.join([ctx.base_dir, "homes", @host, "claude", ".tightbeam", "credential.json"])
+
     File.mkdir_p!(Path.dirname(metadata))
-    File.write!(store, stale)
 
     File.write!(
       metadata,
@@ -74,10 +73,8 @@ defmodule Tightbeam.ModelCatalogRotationE2ETest do
           "fixture-token-ROTATED" ->
             {:ok, model_list}
 
-          "fixture-token-STALE" ->
-            {:error,
-             {:http_status, 401,
-              ~s({"type":"error","error":{"type":"authentication_error","message":"OAuth access token has been revoked."}})}}
+          other ->
+            flunk("catalog read unexpected credential #{inspect(other)}")
         end
 
       "/v1/models/claude-haiku-4-5-20251001", _headers ->
@@ -104,11 +101,11 @@ defmodule Tightbeam.ModelCatalogRotationE2ETest do
       )
     end)
 
-    assert_receive {:catalog_token, "fixture-token-STALE"}
     assert_receive {:catalog_token, "fixture-token-ROTATED"}
     refute_receive {:catalog_token, _}
 
-    assert File.read!(store) == rotated
+    assert File.read!(home) == rotated
+    refute File.exists?(Path.join([ctx.base_dir, "auth", "claude", ".credentials.json"]))
 
     assert {:ok, %{harness: "claude", provider: "anthropic", health: :fresh}} =
              ModelCatalog.route(

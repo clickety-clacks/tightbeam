@@ -32,7 +32,7 @@ defmodule Tightbeam.CredentialsTest do
           :ok
         end,
         start: fn _, _ ->
-          assert File.read!(Path.join([ctx.base, "auth", "codex", "auth.json"])) ==
+          assert File.read!(credential_path(ctx.base, "eezo", :openai)) ==
                    ~S({"token":"new"})
 
           send(owner, {:step, :start})
@@ -60,12 +60,11 @@ defmodule Tightbeam.CredentialsTest do
     assert steps == [:gate, :stop, :obtain, :start, :credential_present, :resume]
     refute_receive {:step, :credential_present}
 
-    store = Path.join([ctx.base, "auth", "codex", "auth.json"])
-    home = Path.join([ctx.base, "homes", "eezo", "codex", "auth.json"])
-    metadata = Path.join([ctx.base, "auth", "codex", ".tightbeam", "credential.json"])
+    store = credential_path(ctx.base, "eezo", :openai)
+    metadata = metadata_path(ctx.base, "eezo", :openai)
     assert File.stat!(store).mode |> Bitwise.band(0o777) == 0o600
     assert File.stat!(metadata).mode |> Bitwise.band(0o777) == 0o600
-    assert File.lstat!(home).type == :symlink
+    assert File.lstat!(store).type == :regular
     assert Credentials.status(:openai, server) == :onboarded
   end
 
@@ -108,36 +107,38 @@ defmodule Tightbeam.CredentialsTest do
     assert Credentials.status(:openai, server) == {:needs_onboarding, :missing}
   end
 
-  test "an absent credential store is missing rather than unreadable", ctx do
-    store = Path.join([ctx.base, "auth", "codex"])
+  test "an absent harness-home credential is missing", ctx do
+    credential = credential_path(ctx.base, "eezo", :openai)
+    metadata = metadata_path(ctx.base, "eezo", :openai)
     {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
 
-    refute File.exists?(store)
+    refute File.exists?(credential)
     assert Credentials.status(:openai, server) == {:needs_onboarding, :missing}
+
+    File.mkdir_p!(Path.dirname(metadata))
+    File.write!(metadata, JSON.encode!(%{"onboarded" => true, "kind" => "api_key"}))
+    assert Credentials.kind_at(ctx.base, "eezo", :openai) == :none
   end
 
-  test "a symlinked credential store refuses with its path and actual shape", ctx do
-    store = Path.join([ctx.base, "auth", "codex"])
-    target = Path.join(ctx.base, "symlink-target")
-    metadata = Path.join([target, ".tightbeam", "credential.json"])
-    File.mkdir_p!(Path.dirname(metadata))
-    File.write!(Path.join(target, "auth.json"), ~S({"token":"present"}))
-    File.write!(metadata, ~S({"provider":"openai","onboarded":true}))
-    File.mkdir_p!(Path.dirname(store))
-    File.ln_s!(target, store)
+  test "a stale legacy store and a credential symlink are not authority", ctx do
+    legacy = Path.join([ctx.base, "auth", "codex", "auth.json"])
+    target = Path.join(ctx.base, "legacy-token")
+    credential = credential_path(ctx.base, "eezo", :openai)
+    File.mkdir_p!(Path.dirname(legacy))
+    File.write!(legacy, ~S({"token":"stale"}))
+    File.write!(target, ~S({"token":"outside-home"}))
+    File.mkdir_p!(Path.dirname(credential))
+    File.ln_s!(target, credential)
 
     {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
 
-    reason =
-      {:credential_store_unreadable, %{path: store, found: :symlink, expected: :directory}}
-
-    assert Credentials.status(:openai, server) == {:needs_onboarding, reason}
-    assert Credentials.kind(:openai, server) == {:error, reason}
+    assert Credentials.status(:openai, server) == {:needs_onboarding, :missing}
+    assert Credentials.kind(:openai, server) == :none
+    assert File.read!(legacy) == ~S({"token":"stale"})
   end
 
   test "corrupt credential metadata refuses with its path and expected shape", ctx do
-    store = Path.join([ctx.base, "auth", "codex"])
-    metadata = Path.join([store, ".tightbeam", "credential.json"])
+    metadata = metadata_path(ctx.base, "eezo", :openai)
     File.mkdir_p!(Path.dirname(metadata))
     File.write!(metadata, "not json")
 
@@ -150,7 +151,7 @@ defmodule Tightbeam.CredentialsTest do
   end
 
   test "remote absence requires a positively traversable parent", ctx do
-    parent = Path.join([ctx.base, "auth"])
+    parent = Path.join([ctx.base, "homes", "worker"])
     File.mkdir_p!(parent)
 
     {:ok, server} = remote_server(ctx.base)
@@ -159,7 +160,7 @@ defmodule Tightbeam.CredentialsTest do
   end
 
   test "remote store below an untraversable parent refuses rather than guessing absence", ctx do
-    parent = Path.join([ctx.base, "auth"])
+    parent = Path.join([ctx.base, "homes", "worker"])
     File.mkdir_p!(parent)
     File.chmod!(parent, 0o600)
     on_exit(fn -> File.chmod(parent, 0o700) end)
@@ -173,7 +174,7 @@ defmodule Tightbeam.CredentialsTest do
   end
 
   test "Codex credential is never written while stop cannot confirm runtime exit", ctx do
-    store = Path.join([ctx.base, "auth", "codex", "auth.json"])
+    store = credential_path(ctx.base, "eezo", :openai)
     File.mkdir_p!(Path.dirname(store))
     File.write!(store, "runtime-owned")
 
@@ -190,7 +191,7 @@ defmodule Tightbeam.CredentialsTest do
     assert File.read!(store) == "runtime-owned"
   end
 
-  test "expiry is compared only at read seams and schedules no timer", ctx do
+  test "stored expiry is never treated as credential health", ctx do
     {:ok, server} =
       Credentials.start_link(
         name: nil,
@@ -209,7 +210,7 @@ defmodule Tightbeam.CredentialsTest do
     assert {:messages, []} = Process.info(server, :messages)
 
     :sys.replace_state(server, fn state -> %{state | now: fn -> 101 end} end)
-    assert Credentials.status(:anthropic, server) == {:needs_onboarding, :expired}
+    assert Credentials.status(:anthropic, server) == :onboarded
     assert {:messages, []} = Process.info(server, :messages)
   end
 
@@ -271,7 +272,7 @@ defmodule Tightbeam.CredentialsTest do
           :ok
         end,
         start: fn _, _ ->
-          send(owner, {:start, File.read!(Path.join([ctx.base, "auth", "codex", "auth.json"]))})
+          send(owner, {:start, File.read!(credential_path(ctx.base, "eezo", :openai))})
           :ok
         end,
         resume: fn _ ->
@@ -485,7 +486,7 @@ defmodule Tightbeam.CredentialsTest do
         stop: fn :openai ->
           assert Agent.get(runtime, & &1) == {:serving, :subscription}
 
-          assert File.read!(Path.join([ctx.base, "auth", "codex", "auth.json"])) ==
+          assert File.read!(credential_path(ctx.base, "eezo", :openai)) ==
                    "device-code-result"
 
           assert credential_metadata(ctx.base, "codex")["last_health"] ==
@@ -498,7 +499,7 @@ defmodule Tightbeam.CredentialsTest do
         start: fn :openai, :subscription ->
           assert Agent.get(runtime, & &1) == {:stopped, :subscription}
 
-          assert File.read!(Path.join([ctx.base, "auth", "codex", "auth.json"])) ==
+          assert File.read!(credential_path(ctx.base, "eezo", :openai)) ==
                    "device-code-result"
 
           Agent.update(runtime, fn _ -> {:serving, :subscription, :replacement} end)
@@ -537,7 +538,7 @@ defmodule Tightbeam.CredentialsTest do
     assert Agent.get(runtime, & &1) == {:serving, :subscription, :replacement}
     refute File.exists?(staging)
 
-    assert File.read!(Path.join([ctx.base, "auth", "codex", "auth.json"])) ==
+    assert File.read!(credential_path(ctx.base, "eezo", :openai)) ==
              "device-code-result"
   end
 
@@ -625,10 +626,9 @@ defmodule Tightbeam.CredentialsTest do
     assert :ok = Credentials.finish_onboard(:openai, :subscription, lease_id, server)
     assert Credentials.status(:openai, server) == :onboarded
 
-    store = Path.join([ctx.base, "auth", "codex", "auth.json"])
-    home = Path.join([ctx.base, "homes", "worker", "codex", "auth.json"])
+    store = credential_path(ctx.base, "worker", :openai)
     assert File.read!(store) == "satellite-only-secret"
-    assert File.lstat!(home).type == :symlink
+    assert File.lstat!(store).type == :regular
 
     commands = collect_remote_credential_commands([])
     refute Enum.any?(commands, &(Enum.join(&1, " ") =~ "satellite-only-secret"))
@@ -693,7 +693,7 @@ defmodule Tightbeam.CredentialsTest do
     assert {:error, :onboarding_lease_superseded} =
              Credentials.finish_onboard(:openai, :subscription, stale_lease_id, server)
 
-    refute File.exists?(Path.join([ctx.base, "auth", "codex", "auth.json"]))
+    refute File.exists?(credential_path(ctx.base, "eezo", :openai))
     assert File.exists?(fresh)
   end
 
@@ -773,7 +773,7 @@ defmodule Tightbeam.CredentialsTest do
           base_dir: ctx.base,
           machine: "eezo",
           stop: fn :openai ->
-            assert File.read!(Path.join([ctx.base, "auth", "codex", "auth.json"])) ==
+            assert File.read!(credential_path(ctx.base, "eezo", :openai)) ==
                      ~S({"token":"candidate"})
 
             refute credential_metadata(ctx.base, "codex")["onboarded"]
@@ -799,7 +799,7 @@ defmodule Tightbeam.CredentialsTest do
 
       assert_receive :stop_refused
 
-      assert File.read!(Path.join([ctx.base, "auth", "codex", "auth.json"])) ==
+      assert File.read!(credential_path(ctx.base, "eezo", :openai)) ==
                ~S({"token":"candidate"})
 
       assert {:needs_onboarding, {:present_but_unverified, cause}} =
@@ -827,7 +827,7 @@ defmodule Tightbeam.CredentialsTest do
             :ok
           end,
           on_credential_present: fn :openai ->
-            assert File.read!(Path.join([ctx.base, "auth", "codex", "auth.json"])) ==
+            assert File.read!(credential_path(ctx.base, "eezo", :openai)) ==
                      ~S({"token":"candidate"})
 
             assert credential_metadata(ctx.base, "codex")["onboarded"] == true
@@ -887,7 +887,7 @@ defmodule Tightbeam.CredentialsTest do
       # The operator's credential stays where they put it: the substrate holds no
       # opinion about a vendor login, and reverting one silently resumes spend on
       # an account the operator believes is disconnected (Mike, 2026-08-14).
-      assert File.read!(Path.join([ctx.base, "auth", "codex", "auth.json"])) ==
+      assert File.read!(credential_path(ctx.base, "eezo", :openai)) ==
                ~S({"token":"candidate"})
 
       # ...and the org reads FAILED, matching what the operator just watched fail.
@@ -963,7 +963,7 @@ defmodule Tightbeam.CredentialsTest do
 
         # Crashing and exiting starts refuse like any other start failure: the
         # operator's credential stays, the org reads failed.
-        assert File.read!(Path.join([base, "auth", "codex", "auth.json"])) ==
+        assert File.read!(credential_path(base, "eezo", :openai)) ==
                  ~S({"token":"candidate"})
 
         refute File.exists?(staging)
@@ -989,8 +989,8 @@ defmodule Tightbeam.CredentialsTest do
     test "a start failure DISPLACES the prior credential — no silent revival of old spend",
          ctx do
       owner = self()
-      credential = Path.join([ctx.base, "auth", "codex", "auth.json"])
-      metadata = Path.join([ctx.base, "auth", "codex", ".tightbeam", "credential.json"])
+      credential = credential_path(ctx.base, "eezo", :openai)
+      metadata = metadata_path(ctx.base, "eezo", :openai)
       prior_credential = ~S({"token":"prior","spacing":true}) <> "\n"
       prior_metadata = ~S( { "provider": "openai", "onboarded": true, "kind": "api_key" } )
       File.mkdir_p!(Path.dirname(metadata))
@@ -1036,8 +1036,8 @@ defmodule Tightbeam.CredentialsTest do
       # Seed a PRIOR onboarded credential, so the stale-health scenario Sol
       # named has something stale to leave behind if the ordering regresses.
       prior_credential = "prior-satellite-secret"
-      credential_path = Path.join([ctx.base, "auth", "codex", "auth.json"])
-      metadata_path = Path.join([ctx.base, "auth", "codex", ".tightbeam", "credential.json"])
+      credential_path = credential_path(ctx.base, "worker", :openai)
+      metadata_path = metadata_path(ctx.base, "worker", :openai)
       File.mkdir_p!(Path.dirname(metadata_path))
       File.write!(credential_path, prior_credential)
       File.write!(metadata_path, ~S({"provider":"openai","onboarded":true,"kind":"subscription"}))
@@ -1079,7 +1079,7 @@ defmodule Tightbeam.CredentialsTest do
       # credential and its prior metadata still describe each other. The stale
       # `onboarded: true` can never come to describe a candidate that was never
       # activated (Sol xhigh blocking 1).
-      assert File.read!(Path.join([ctx.base, "auth", "codex", "auth.json"])) == prior_credential
+      assert File.read!(credential_path(ctx.base, "worker", :openai)) == prior_credential
 
       # And a restarted gateway reads the same thing from disk, not from memory.
       {:ok, restarted} =
@@ -1091,7 +1091,7 @@ defmodule Tightbeam.CredentialsTest do
           sh: &run_remote_command/1
         )
 
-      assert File.read!(Path.join([ctx.base, "auth", "codex", "auth.json"])) == prior_credential
+      assert File.read!(credential_path(ctx.base, "worker", :openai)) == prior_credential
 
       # `:onboarded` is the CORRECT reading here, and the point of the ordering:
       # the refusal happened before anything was installed, so the prior
@@ -1130,10 +1130,10 @@ defmodule Tightbeam.CredentialsTest do
       assert {:error, :runtime_start_failed} =
                Credentials.finish_onboard(:openai, :subscription, lease_id, server)
 
-      assert File.read!(Path.join([ctx.base, "auth", "codex", "auth.json"])) ==
+      assert File.read!(credential_path(ctx.base, "worker", :openai)) ==
                "candidate-remains-present"
 
-      metadata = credential_metadata(ctx.base, "codex")
+      metadata = metadata_path(ctx.base, "worker", :openai) |> File.read!() |> JSON.decode!()
       assert metadata["onboarded"] == false
       assert metadata["last_health"] == "present_but_unverified"
       assert metadata["present_but_unverified"]["finish"] =~ "runtime_start_failed"
@@ -1153,8 +1153,8 @@ defmodule Tightbeam.CredentialsTest do
     # that `prepare_staged_activation` wrote before the start was attempted.
     test "a failure-marker write failure still makes status fail closed", ctx do
       owner = self()
-      credential = Path.join([ctx.base, "auth", "codex", "auth.json"])
-      metadata = Path.join([ctx.base, "auth", "codex", ".tightbeam", "credential.json"])
+      credential = credential_path(ctx.base, "worker", :openai)
+      metadata = metadata_path(ctx.base, "worker", :openai)
       File.mkdir_p!(Path.dirname(metadata))
       File.write!(credential, ~S({"token":"prior"}))
       File.write!(metadata, ~S({"provider":"openai","onboarded":true,"kind":"api_key"}))
@@ -1240,8 +1240,8 @@ defmodule Tightbeam.CredentialsTest do
     {:ok, two} = server(other, "two", "machine-two")
     assert :ok = Credentials.onboard(:openai, one)
     assert :ok = Credentials.onboard(:openai, two)
-    assert File.read!(Path.join([ctx.base, "auth", "codex", "auth.json"])) == "machine-one"
-    assert File.read!(Path.join([other, "auth", "codex", "auth.json"])) == "machine-two"
+    assert File.read!(credential_path(ctx.base, "one", :openai)) == "machine-one"
+    assert File.read!(credential_path(other, "two", :openai)) == "machine-two"
   end
 
   defp server(base, name, bytes) do
@@ -1274,10 +1274,10 @@ defmodule Tightbeam.CredentialsTest do
 
       assert Credentials.status(:anthropic, server) == :onboarded
       assert Credentials.kind(:anthropic, server) == :api_key
-      assert Credentials.kind_at(ctx.base, :anthropic) == :api_key
+      assert Credentials.kind_at(ctx.base, "eezo", :anthropic) == :api_key
     end
 
-    test "a subscription banks with its kind and keeps its expiry", ctx do
+    test "a subscription banks with its kind and no inferred expiry", ctx do
       {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
 
       {:ok, staging, lease_id} = Credentials.begin_onboard(:anthropic, server)
@@ -1292,7 +1292,7 @@ defmodule Tightbeam.CredentialsTest do
       metadata = credential_metadata(ctx.base, "claude")
 
       assert metadata["kind"] == "subscription"
-      assert is_integer(metadata["expires_at"])
+      refute Map.has_key?(metadata, "expires_at")
       assert metadata["subscription_status"] == "supported"
       assert Credentials.kind(:anthropic, server) == :subscription
     end
@@ -1328,12 +1328,9 @@ defmodule Tightbeam.CredentialsTest do
   # and every session afterwards read "expired", tried to refresh, and died
   # `authentication_failed`. Two coder sessions were killed by it before it was traced.
   #
-  # The writer was never the ceremony. Claude Code OWNS the `.credentials.json` inside a
-  # harness home and rotates it in place; `Homes.sweep_auth/2` harvests that file at every
-  # gateway boot (gateway.ex:193) and `store_harvested/3` wrote the bytes over the SHARED
-  # auth store without ever looking at them. So one agent's hollow home file poisoned the
-  # credential for every agent on the next boot — and the reboot was what re-applied the
-  # poison, which is why restarting never healed it.
+  # The writer is never the ceremony. Claude Code owns the `.credentials.json` inside its
+  # exact harness home and rotates it in place. Tightbeam validates onboarding input before
+  # installing it there, and no later projection copies credential bytes between homes.
   # THE ARTIFACT, NOT AN IDEALISED VERSION OF IT.
   #
   # The key SET is captured from the vendor's own writer, not invented: three independent
@@ -1355,181 +1352,7 @@ defmodule Tightbeam.CredentialsTest do
   # quietly passing because it used a different shape from the one that must fail.
   @healthy_vendor_record ~s({"claudeAiOauth":{"accessToken":"sk-ant-oat01-fresh","refreshToken":"sk-ant-ort01-fresh","expiresAt":4102444800000,"refreshTokenExpiresAt":4102444800000,"scopes":["user:inference","user:sessions:claude_code"],"subscriptionType":"max","rateLimitTier":"default_claude_max_20x"}})
 
-  describe "banking refuses a hollow credential" do
-    test "harvesting a hollow vendor record refuses, names it, and banks nothing", ctx do
-      store = Path.join([ctx.base, "auth", "claude", ".credentials.json"])
-      home = Path.join([ctx.base, "homes", "eezo", "claude"])
-      File.mkdir_p!(Path.dirname(store))
-      File.mkdir_p!(home)
-
-      good =
-        ~s({"claudeAiOauth":{"accessToken":"sk-ant-oat01-good","refreshToken":"sk-ant-ort01-good","expiresAt":4102444800000}})
-
-      File.write!(store, good)
-
-      # The shape observed on gibson: every key present, every value empty or zero.
-      File.write!(
-        Path.join(home, ".credentials.json"),
-        @hollow_vendor_record
-      )
-
-      # THE SWEEP SURVIVES IT. This runs on the gateway boot path, where a raise is not a
-      # refusal anyone reads -- it is a kernel panic and a gateway that will not start.
-      # Refusing to bank is the requirement; taking the org down to announce it is not.
-      log =
-        ExUnit.CaptureLog.capture_log(fn ->
-          assert :ok = Tightbeam.Homes.sweep_auth(ctx.base, :claude)
-        end)
-
-      # NAMED, not merely refused: the operator has to be able to find the file. The home
-      # rather than the file itself, because the credential FILENAME is private to each
-      # harness module and exposing it would mean a new behaviour callback on every
-      # harness — a wider change than this fix earns. The home holds one credential.
-      assert log =~ home
-      assert log =~ "accessToken"
-
-      # And the good credential is still standing. This is the half that matters:
-      # refusing to bank is worthless if the store was already overwritten.
-      assert File.read!(store) == good
-    end
-
-    # ONE POISONED HOME MUST NOT COST THE OTHERS. `sweep_auth/2` globs `homes/*/<harness>`,
-    # so an exception escaping one iteration would abort the `Enum.each` over every
-    # remaining home -- and, one level up, over every remaining harness.
-    test "a hollow home does not stop the sweep from harvesting the healthy ones", ctx do
-      store = Path.join([ctx.base, "auth", "claude", ".credentials.json"])
-      File.mkdir_p!(Path.dirname(store))
-      File.write!(store, ~s({"claudeAiOauth":{"accessToken":"old","expiresAt":1}}))
-
-      # `aaa` sorts before `zzz`, so the poisoned home is swept FIRST and the healthy one
-      # only lands if the sweep kept going.
-      hollow_home = Path.join([ctx.base, "homes", "aaa", "claude"])
-      healthy_home = Path.join([ctx.base, "homes", "zzz", "claude"])
-      File.mkdir_p!(hollow_home)
-      File.mkdir_p!(healthy_home)
-
-      File.write!(
-        Path.join(hollow_home, ".credentials.json"),
-        @hollow_vendor_record
-      )
-
-      rotated = @healthy_vendor_record
-
-      File.write!(Path.join(healthy_home, ".credentials.json"), rotated)
-
-      ExUnit.CaptureLog.capture_log(fn ->
-        assert :ok = Tightbeam.Homes.sweep_auth(ctx.base, :claude)
-      end)
-
-      assert File.read!(store) == rotated
-    end
-
-    test "store_harvested refuses hollow bytes rather than writing them", ctx do
-      store = Path.join([ctx.base, "auth", "claude", ".credentials.json"])
-      File.mkdir_p!(Path.dirname(store))
-      File.write!(store, ~s({"claudeAiOauth":{"accessToken":"sk-ant-oat01-good"}}))
-
-      assert_raise RuntimeError, fn ->
-        Credentials.store_harvested(
-          ctx.base,
-          :anthropic,
-          @hollow_vendor_record
-        )
-      end
-
-      assert File.read!(store) == ~s({"claudeAiOauth":{"accessToken":"sk-ant-oat01-good"}})
-    end
-
-    test "an empty credential file is refused too", ctx do
-      File.mkdir_p!(Path.join([ctx.base, "auth", "claude"]))
-
-      assert_raise RuntimeError, fn ->
-        Credentials.store_harvested(ctx.base, :anthropic, "")
-      end
-    end
-
-    # THE REGRESSION THIS GUARD COULD EASILY CAUSE. An anthropic `.credentials.json` is
-    # not always an OAuth record: `bank_anthropic_api_key` (ceremonies.rs:775) writes a
-    # BARE KEY STRING to the same filename. A validator that assumed JSON would refuse
-    # every api_key install on this path.
-    test "a bare api key still harvests — it is not an OAuth record", ctx do
-      store = Path.join([ctx.base, "auth", "claude", ".credentials.json"])
-      home = Path.join([ctx.base, "homes", "eezo", "claude"])
-      File.mkdir_p!(Path.dirname(store))
-      File.mkdir_p!(home)
-      File.write!(store, "sk-ant-api03-old")
-      File.write!(Path.join(home, ".credentials.json"), "sk-ant-api03-rotated")
-
-      assert :ok = Tightbeam.Homes.sweep_auth(ctx.base, :claude)
-      assert File.read!(store) == "sk-ant-api03-rotated"
-    end
-
-    test "a healthy vendor rotation still harvests", ctx do
-      store = Path.join([ctx.base, "auth", "claude", ".credentials.json"])
-      home = Path.join([ctx.base, "homes", "eezo", "claude"])
-      File.mkdir_p!(Path.dirname(store))
-      File.mkdir_p!(home)
-
-      File.write!(
-        store,
-        ~s({"claudeAiOauth":{"accessToken":"old","refreshToken":"r","expiresAt":1}})
-      )
-
-      rotated = @healthy_vendor_record
-
-      File.write!(Path.join(home, ".credentials.json"), rotated)
-
-      assert :ok = Tightbeam.Homes.sweep_auth(ctx.base, :claude)
-      assert File.read!(store) == rotated
-    end
-
-    # THE REGRESSION AT ITS REAL ALTITUDE: not `sweep_auth/2`, but the function
-    # `Application.start/2` actually calls.
-    #
-    # `sweep_auth/2` returning `:ok` proves the sweep survives; it does NOT prove the BOOT
-    # survives, and the two are different claims — `children_after_preflight/1` is where the
-    # sweep is invoked (gateway.ex), and `application.ex` runs it with no rescue around it.
-    # Asserting at the boot function is what would also catch a NEW raising call added to
-    # this path later, which a test aimed at `sweep_auth` alone would sail straight past.
-    test "a hollow home does not stop the gateway from composing its boot children", ctx do
-      store = Path.join([ctx.base, "auth", "claude", ".credentials.json"])
-      home = Path.join([ctx.base, "homes", "eezo", "claude"])
-      File.mkdir_p!(Path.dirname(store))
-      File.mkdir_p!(home)
-      File.write!(store, @healthy_vendor_record)
-      File.write!(Path.join(home, ".credentials.json"), @hollow_vendor_record)
-
-      db = :"credentials_boot_#{System.unique_integer([:positive])}"
-      start_supervised!({Tightbeam.DB, path: ":memory:", name: db})
-      :ok = Tightbeam.Schema.ensure_all(db)
-
-      config = %{
-        db: db,
-        base_dir: ctx.base,
-        port: 4_321,
-        cwd: ctx.base,
-        default_harness: :claude,
-        default_model: Tightbeam.Model.new("claude-fable-5"),
-        max_live_sessions_per_user: 50,
-        wake_tick_ms: 60_000,
-        onboarding_lease_ms: 1_800_000
-      }
-
-      log =
-        ExUnit.CaptureLog.capture_log(fn ->
-          assert [_ | _] = Tightbeam.Gateway.children_after_preflight(config)
-        end)
-
-      # It refused, and it said so where an operator looks.
-      assert log =~ home
-
-      # And the credential every OTHER agent depends on is untouched.
-      assert File.read!(store) == @healthy_vendor_record
-    end
-
-    # ROUTE 2 OF 3: the ceremony's own bank. Proved by test rather than by construction --
-    # this one goes through `write_credential!/3` and `atomic_write!`, a different mechanism
-    # from the harvest route above, and a guard that is never exercised is not a guard.
+  describe "harness-home credential safety" do
     test "the onboarding ceremony refuses to bank a hollow credential", ctx do
       {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
       {:ok, staging, lease_id} = Credentials.begin_onboard(:anthropic, server)
@@ -1547,64 +1370,56 @@ defmodule Tightbeam.CredentialsTest do
 
       assert found =~ "accessToken"
       assert Process.alive?(server)
-      refute File.exists?(Path.join([ctx.base, "auth", "claude", ".credentials.json"]))
+      refute File.exists?(credential_path(ctx.base, "eezo", :anthropic))
     end
 
-    # ROUTE 3 OF 3: `harvest_auth_back/4`, reached through home reconciliation. This is the
-    # door that most needed its own test: it is `File.read!` + `File.cp!` in a loop, NOT
-    # `atomic_write!`, so "the good credential survives" rests on a different mechanism than
-    # the route that was already covered.
-    test "reconciling a home refuses to copy a hollow credential over the store", ctx do
-      store_dir = Path.join([ctx.base, "auth", "claude"])
-      store = Path.join(store_dir, ".credentials.json")
-      File.mkdir_p!(store_dir)
-
-      good =
-        ~s({"claudeAiOauth":{"accessToken":"sk-ant-oat01-good","refreshToken":"sk-ant-ort01-good","expiresAt":4102444800000}})
-
-      File.write!(store, good)
-
+    test "home reconciliation never reads or rewrites the credential", ctx do
       home = Tightbeam.Homes.home_path(ctx.base, "eezo", :claude)
       File.mkdir_p!(home)
+      credential = Path.join(home, ".credentials.json")
+      File.write!(credential, @healthy_vendor_record)
 
-      # A REGULAR file in the home, not the symlink reconcile normally leaves: that is
-      # exactly the "left by runtime rotation" state harvest exists to pick up.
-      File.write!(
-        Path.join(home, ".credentials.json"),
-        @hollow_vendor_record
-      )
+      Tightbeam.Homes.project(ctx.base, %{harness: :claude, machine: "eezo", rails: nil})
 
-      assert_raise RuntimeError, fn ->
-        Tightbeam.Homes.project(ctx.base, %{harness: :claude, machine: "eezo", rails: nil})
-      end
-
-      assert File.read!(store) == good
+      assert File.read!(credential) == @healthy_vendor_record
+      assert File.lstat!(credential).type == :regular
     end
 
-    # F3: the shapes the `is_map` guard let through. A PRESENT `claudeAiOauth` that carries
-    # no record is hollow by the same reasoning as an empty token — it announces an OAuth
-    # credential and holds nothing to authenticate with.
-    test "a claudeAiOauth key that is not an OAuth record is hollow", ctx do
-      File.mkdir_p!(Path.join([ctx.base, "auth", "claude"]))
-
+    test "the onboarding validator rejects every observed hollow OAuth shape", _ctx do
       for bytes <- [
+            @hollow_vendor_record,
             ~s({"claudeAiOauth":null}),
             ~s({"claudeAiOauth":""}),
             ~s({"claudeAiOauth":[]}),
             ~s({"claudeAiOauth":"sk-ant-oat01-looks-like-a-token"})
           ] do
-        assert_raise RuntimeError, fn ->
-          Credentials.store_harvested(ctx.base, :anthropic, bytes)
-        end
+        assert {:error, {:hollow_credential, _}} =
+                 Credentials.refuse_hollow(:anthropic, bytes, "test onboarding")
       end
+    end
+
+    test "a bare API key remains a valid home credential", _ctx do
+      assert :ok = Credentials.refuse_hollow(:anthropic, "sk-ant-api03-valid", "test onboarding")
     end
   end
 
   defp credential_metadata(base, harness) do
-    [base, "auth", harness, ".tightbeam", "credential.json"]
-    |> Path.join()
+    provider = if harness == "codex", do: :openai, else: :anthropic
+
+    base
+    |> metadata_path("eezo", provider)
     |> File.read!()
     |> JSON.decode!()
+  end
+
+  defp credential_path(base, machine, provider),
+    do: Credentials.credential_path(base, machine, provider)
+
+  defp metadata_path(base, machine, provider) do
+    base
+    |> credential_path(machine, provider)
+    |> Path.dirname()
+    |> Path.join(".tightbeam/credential.json")
   end
 
   defp remote_server(base) do

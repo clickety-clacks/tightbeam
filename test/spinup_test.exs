@@ -16,7 +16,7 @@ defmodule Tightbeam.SpinupTest do
   end
 
   test "local all-present allows without shell calls and records history", ctx do
-    credential = Path.join([ctx.base_dir, "auth", "claude", ".credentials.json"])
+    credential = Path.join([ctx.base_dir, "homes", "testhost", "claude", ".credentials.json"])
     File.mkdir_p!(Path.dirname(credential))
     File.write!(credential, "test-token")
     stage_claude!(ctx.base_dir)
@@ -51,7 +51,7 @@ defmodule Tightbeam.SpinupTest do
   # and at the same pinned versions (#46).
   test "local adapter missing provisions the pinned adapters into the host's base_dir", ctx do
     adapter = Path.join([ctx.base_dir, "adapters", "node_modules", ".bin", "codex-acp"])
-    credential = Path.join([ctx.base_dir, "auth", "codex", "auth.json"])
+    credential = Path.join([ctx.base_dir, "homes", "testhost", "codex", "auth.json"])
     File.mkdir_p!(Path.dirname(credential))
     File.write!(credential, "test-token")
     parent = self()
@@ -99,7 +99,7 @@ defmodule Tightbeam.SpinupTest do
   # a rewording here must carry that hint with it.
   test "adapter provisioning logs a start line and a complete line", ctx do
     adapter = Path.join([ctx.base_dir, "adapters", "node_modules", ".bin", "codex-acp"])
-    credential = Path.join([ctx.base_dir, "auth", "codex", "auth.json"])
+    credential = Path.join([ctx.base_dir, "homes", "testhost", "codex", "auth.json"])
     File.mkdir_p!(Path.dirname(credential))
     File.write!(credential, "test-token")
 
@@ -185,7 +185,7 @@ defmodule Tightbeam.SpinupTest do
   end
 
   test "missing credentials deny with separate login fact and exact remedy", ctx do
-    auth_dir = Path.join(ctx.base_dir, "auth")
+    home = Path.join([ctx.base_dir, "homes", "testhost", "claude"])
     stage_claude!(ctx.base_dir)
 
     assert {:error, %{code: "host_unready", message: message}} =
@@ -196,7 +196,7 @@ defmodule Tightbeam.SpinupTest do
 
     assert message =~ "Tightbeam has no credential for anthropic on testhost"
     assert message =~ "normal claude CLI login"
-    assert message =~ "keeps its own credential under #{auth_dir}"
+    assert message =~ "credential belongs only in #{home}"
     assert message =~ "Run on testhost: tightbeam onboard anthropic --as-user <userId>"
     assert [%{kind: "spinup", detail: detail}] = EventLog.lifecycle_events(ctx.db)
     assert detail =~ "DENIED"

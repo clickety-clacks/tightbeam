@@ -170,7 +170,7 @@ defmodule Tightbeam.ClientE2E do
 
   The harness's `credential_live?/3` callback performs the bounded authenticated
   probe, against the route and header its host's credential KIND can actually
-  reach — the kind is read from the credential store here and handed to the
+  reach — the kind is read from harness-home metadata here and handed to the
   callback, because no single call authenticates both kinds.
   Its result mapping is closed: `:live` passes after catalog readiness is
   confirmed, `{:dead, reason}` fails, and `{:unknown, reason}` is INCOMPLETE —
@@ -204,7 +204,7 @@ defmodule Tightbeam.ClientE2E do
         Scorecard.fail(
           step,
           label,
-          "the harness reports its credential store is not ready in #{base_dir}"
+          "the harness credential file is absent from #{home}"
         )
 
       # A credential with no recorded kind cannot be probed: the two kinds take
@@ -214,7 +214,7 @@ defmodule Tightbeam.ClientE2E do
         Scorecard.fail(
           step,
           label,
-          "the credential store in #{base_dir} records no credential kind for " <>
+          "the harness home in #{base_dir} records no credential kind for " <>
             "#{module.credential_provider()}; re-run onboarding so the metadata records it"
         )
 
@@ -243,7 +243,7 @@ defmodule Tightbeam.ClientE2E do
     case module.fetch_catalog(catalog_target) do
       {:ok, [_ | _]} ->
         Scorecard.pass(step, label,
-          note: "credential store ready; authenticated liveness probe returned :live"
+          note: "harness-home credential ready; authenticated liveness probe returned :live"
         )
 
       {:ok, []} ->
@@ -259,10 +259,10 @@ defmodule Tightbeam.ClientE2E do
   end
 
   @doc """
-  Whether `module`'s catalog fetch actually depends on the credential store.
+  Whether `module`'s catalog fetch actually depends on its harness-home credential.
 
   Measured, not assumed: the org's credential-bearing directories are copied to
-  a scratch org, the credential store is removed from the COPY, and the catalog
+  a scratch org, the exact credential file is removed from the COPY, and the catalog
   is fetched there. The real org is never touched.
   """
   @spec catalog_gated?(module(), String.t()) :: boolean()
@@ -273,11 +273,17 @@ defmodule Tightbeam.ClientE2E do
     try do
       File.mkdir_p!(scratch)
 
-      for dir <- ["auth", "homes"], File.dir?(Path.join(base_dir, dir)) do
+      for dir <- ["homes"], File.dir?(Path.join(base_dir, dir)) do
         File.cp_r!(Path.join(base_dir, dir), Path.join(scratch, dir))
       end
 
-      File.rm_rf!(Tightbeam.Credentials.store_dir(scratch, module.credential_provider()))
+      File.rm!(
+        Tightbeam.Credentials.credential_path(
+          scratch,
+          Tightbeam.Placement.local_host_name(),
+          module.credential_provider()
+        )
+      )
 
       case module.fetch_catalog(target(scratch)) do
         {:ok, [_ | _]} -> false

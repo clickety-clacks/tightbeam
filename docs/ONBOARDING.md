@@ -80,7 +80,7 @@ looking exactly like a hang while the clock runs down.
 
 **An abandoned ceremony reaps itself.** After 1800s the watchdog terminates the
 harness CLI and its whole process group — including children in their own
-process groups — names what it killed, and leaves the credential store
+process groups — names what it killed, and leaves the harness-home credential
 untouched. It does not write a failure log on that path; the watchdog line in
 the gateway log is the record.
 
@@ -124,7 +124,7 @@ one.
 
 Login status and file presence are not liveness.
 
-### Check subscription rotation recovery before a release
+### Check observed authentication failure before a release
 
 Run these checks when model-catalog or credential-home code changes. They use
 fixture credentials and never contact a provider.
@@ -141,9 +141,8 @@ fixture credentials and never contact a provider.
    MIX_ENV=test mix test test/model_catalog_rotation_e2e_test.exs
    ~~~
 
-   PASS: the first catalog request uses the stale store token and gets a 401.
-   Tightbeam harvests the rotated local-home token, retries once, returns a
-   routable model, and writes the rotated bytes back to the store.
+   PASS: a provider 401 is surfaced after exactly one request. Tightbeam does
+   not retry, copy, or replace the harness-owned credential.
 
 2. Run the feature matrix:
 
@@ -151,8 +150,8 @@ fixture credentials and never contact a provider.
    MIX_ENV=test mix test test/model_catalog_test.exs
    ~~~
 
-   PASS: a local subscription 401 repairs and retries. An API-key 401 does not
-   harvest. A remote-host subscription 401 does not harvest the gateway store.
+   PASS: local and remote provider 401 responses are surfaced after one request,
+   for both credential kinds, without changing any credential file.
 
 3. Record every prerequisite and test command exit, plus both test counts. A
    skipped negative row is not a pass. Do not use a real credential to satisfy
@@ -160,23 +159,22 @@ fixture credentials and never contact a provider.
 
 ## What a credential looks like on disk
 
-Credentials are store rows, not loose files. Each provider needs all three:
+Each credential exists only as a regular file in its exact harness home:
 
-- the store backing file — `auth/codex/auth.json`, claude
-  `auth/claude/.credentials.json`;
-- the home symlink `homes/<machine>/<harness>/…` → store file;
-- the metadata row `auth/<harness>/.tightbeam/credential.json` with
+- Codex: `homes/<machine>/codex/auth.json`;
+- Claude: `homes/<machine>/claude/.credentials.json`;
+- kind metadata: `homes/<machine>/<harness>/.tightbeam/credential.json` with
   `"onboarded": true` AND `"kind": "subscription" | "api_key"`.
 
 The KIND is what every credential seam dispatches on; a row without one is not
 usable, because nothing infers it from the file. Under a subscription, the
-claude backing file is Claude Code's OAuth record with a refresh token; it is
-linked into the harness home so Claude Code can rotate it in place. Under an
+Claude file is Claude Code's OAuth record with a refresh token, and Claude Code
+rotates it in place. Under an
 API key, that same filename holds the bare secret, which is still injected
 through `ANTHROPIC_API_KEY`. The filename is NOT evidence of the kind.
 
-The openai path does not populate `expires_at` or `subscription_status` even on
-a fresh write; they are null by design there, not stale.
+Stored metadata never determines expiry. Only a provider 401 is an observed
+authentication failure. File absence is the onboarding signal.
 
 `tightbeam onboard <provider>` on the host is the only sanctioned path. There is
 no credential-import verb, and copying a credential between machines is never
