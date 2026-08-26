@@ -10,12 +10,14 @@ defmodule Tightbeam.OriginTest do
     assert Origin.parse("agent:reviewer") == {:agent, "reviewer"}
     assert Origin.parse("process:tightbeam") == {:process, "tightbeam"}
     assert Origin.parse("remedy:review-before-merge") == {:remedy, "review-before-merge"}
+    assert Origin.parse("bootstrap:first-user") == {:bootstrap, "first-user"}
 
     # The identifier keeps its own colons — sessionKeys are colon-shaped.
     assert Origin.parse("agent:main:clawline:flynn:main") == {:agent, "main:clawline:flynn:main"}
 
     assert Origin.class("user:flynn") == "user"
     assert Origin.class("remedy:r") == "remedy"
+    assert Origin.class("bootstrap:first-user") == "bootstrap"
 
     for bad <- ["", "flynn", "user:", ":flynn", "operator:flynn", nil, 7] do
       assert Origin.parse(bad) == :malformed, inspect(bad)
@@ -31,6 +33,7 @@ defmodule Tightbeam.OriginTest do
     # up: nobody in the org asked for it, so the client hides it until adopted.
     assert Origin.started_by("process:tightbeam") == "substrate"
     assert Origin.started_by("remedy:review-before-merge") == "substrate"
+    assert Origin.started_by("bootstrap:first-user") == "substrate"
   end
 
   test "an origin outside the class set classifies substrate and warns once" do

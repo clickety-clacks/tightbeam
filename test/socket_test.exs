@@ -99,13 +99,7 @@ defmodule Tightbeam.Wire.SocketTest do
       Rules.load!(Path.join(System.tmp_dir!(), "missing-socket-e2e-reset"), [])
     end)
 
-    {:paired, device} =
-      Devices.pair(ctx.db, %{
-        device_id: "chat-e2e",
-        claimed_name: "Flynn",
-        platform: nil,
-        model: nil
-      })
+    device = allowlisted_device(ctx.db, "chat-e2e", "flynn", true)
 
     Devices.set_user_admin(ctx.db, device.user_id, false)
 
@@ -354,13 +348,7 @@ defmodule Tightbeam.Wire.SocketTest do
       Rules.load!(Path.join(System.tmp_dir!(), "missing-reply-reference-reset"), [])
     end)
 
-    {:paired, device} =
-      Devices.pair(ctx.db, %{
-        device_id: "reply-reference",
-        claimed_name: "Flynn",
-        platform: nil,
-        model: nil
-      })
+    device = allowlisted_device(ctx.db, "reply-reference", "flynn", true)
 
     deps = %{ctx.deps | conn_registry: Tightbeam.ConnRegistry, handlers: handlers}
     {:ok, socket} = Socket.init(deps)
@@ -553,13 +541,7 @@ defmodule Tightbeam.Wire.SocketTest do
   end
 
   test "chat ingress preserves post params for zero reply references", ctx do
-    {:paired, device} =
-      Devices.pair(ctx.db, %{
-        device_id: "zero-reply-reference",
-        claimed_name: "Flynn",
-        platform: nil,
-        model: nil
-      })
+    device = allowlisted_device(ctx.db, "zero-reply-reference", "flynn", true)
 
     parent = self()
 
@@ -629,7 +611,18 @@ defmodule Tightbeam.Wire.SocketTest do
     {:stop, :normal, 1000, {:text, frame}, _} =
       Socket.handle_in({JSON.encode!(pair), opcode: :text}, state)
 
-    assert %{"type" => "pair_result", "success" => true, "token" => token} = JSON.decode!(frame)
+    assert %{
+             "type" => "pair_result",
+             "success" => false,
+             "reason" => "first_user_required"
+           } = JSON.decode!(frame)
+
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM users")
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM devices")
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM events")
+
+    device = allowlisted_device(ctx.db, "d1", "flynn", true)
+    token = device.token
 
     Devices.revoke(ctx.db, "d1")
     {:ok, state} = Socket.init(ctx.deps)
@@ -673,8 +666,7 @@ defmodule Tightbeam.Wire.SocketTest do
   end
 
   test "auth registers, replays at most 500, then sends sync_complete", ctx do
-    {:paired, device} =
-      Devices.pair(ctx.db, %{device_id: "d1", claimed_name: "Flynn", platform: nil, model: nil})
+    device = allowlisted_device(ctx.db, "d1", "flynn", true)
 
     key = Org.personal_session_key(device.user_id)
 
@@ -714,8 +706,7 @@ defmodule Tightbeam.Wire.SocketTest do
   end
 
   test "concurrent first auths converge on one personal main stream", ctx do
-    {:paired, device} =
-      Devices.pair(ctx.db, %{device_id: "race", claimed_name: "Flynn", platform: nil, model: nil})
+    device = allowlisted_device(ctx.db, "race", "flynn", true)
 
     proxy = :"main_seed_race_db_#{System.unique_integer([:positive])}"
     start_supervised!({MainSeedRaceDB, {proxy, ctx.db}})
@@ -749,8 +740,7 @@ defmodule Tightbeam.Wire.SocketTest do
   end
 
   test "drain filters a mid-replay push already covered by the replay window", ctx do
-    {:paired, device} =
-      Devices.pair(ctx.db, %{device_id: "d1", claimed_name: "Flynn", platform: nil, model: nil})
+    device = allowlisted_device(ctx.db, "d1", "flynn", true)
 
     key = Org.personal_session_key(device.user_id)
 
@@ -800,8 +790,7 @@ defmodule Tightbeam.Wire.SocketTest do
   end
 
   test "drain never deletes a stalled frame the replay window excluded", ctx do
-    {:paired, device} =
-      Devices.pair(ctx.db, %{device_id: "d1", claimed_name: "Flynn", platform: nil, model: nil})
+    device = allowlisted_device(ctx.db, "d1", "flynn", true)
 
     key = Org.personal_session_key(device.user_id)
 
@@ -864,8 +853,7 @@ defmodule Tightbeam.Wire.SocketTest do
 
   test "work-state-only auth skips chat material, gates inbound chat, and preserves class on re-auth",
        ctx do
-    {:paired, device} =
-      Devices.pair(ctx.db, %{device_id: "state", claimed_name: "State", platform: nil, model: nil})
+    device = allowlisted_device(ctx.db, "state", "state", true)
 
     {:ok, state} = Socket.init(ctx.deps)
 
@@ -935,13 +923,7 @@ defmodule Tightbeam.Wire.SocketTest do
   end
 
   test "default connection re-auth preserves its lifetime class without re-registration", ctx do
-    {:paired, device} =
-      Devices.pair(ctx.db, %{
-        device_id: "default-reauth",
-        claimed_name: "Default",
-        platform: nil,
-        model: nil
-      })
+    device = allowlisted_device(ctx.db, "default-reauth", "default", true)
 
     {:ok, state} = Socket.init(ctx.deps)
     auth = %{"type" => "auth", "token" => device.token, "deviceId" => device.device_id}
@@ -981,8 +963,7 @@ defmodule Tightbeam.Wire.SocketTest do
   end
 
   test "invalid subscription sets fail before seeding or registration", ctx do
-    {:paired, device} =
-      Devices.pair(ctx.db, %{device_id: "bad", claimed_name: "Bad", platform: nil, model: nil})
+    device = allowlisted_device(ctx.db, "bad", "bad", true)
 
     for subscriptions <- [[], ["unknown"]] do
       {:ok, state} = Socket.init(ctx.deps)

@@ -6,7 +6,6 @@ defmodule Tightbeam.EscalationTest do
     ConditionFacts,
     ConnRegistry,
     DB,
-    Devices,
     Escalation,
     EventLog,
     Gateway,
@@ -39,13 +38,7 @@ defmodule Tightbeam.EscalationTest do
 
     raiser = session(db, "raiser", "flynn")
 
-    _admin_device =
-      Devices.pair(db, %{
-        device_id: "admin-device",
-        claimed_name: "flynn",
-        platform: nil,
-        model: nil
-      })
+    _admin_device = allowlisted_device(db, "admin-device", "flynn", true)
 
     start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
     start_supervised!({LaneDoorbell, self()})

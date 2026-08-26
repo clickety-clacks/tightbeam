@@ -1162,6 +1162,9 @@ defmodule Tightbeam.Rules do
       {:remedy, _} ->
         {[], cache}
 
+      {:bootstrap, _} ->
+        {[], cache}
+
       {:agent, role_name} ->
         case Roles.get(db, role_name) do
           %{bound_session_key: key} when is_binary(key) ->
@@ -1661,6 +1664,9 @@ defmodule Tightbeam.Rules do
         {user, cache}
 
       {:process, _} ->
+        {nil, cache}
+
+      {:bootstrap, _} ->
         {nil, cache}
 
       {:remedy, _} ->

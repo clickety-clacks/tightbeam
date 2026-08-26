@@ -608,13 +608,7 @@ defmodule Tightbeam.GatewayTest do
       File.rm_rf!(catalog_base)
     end)
 
-    {:paired, _device} =
-      Devices.pair(db, %{
-        device_id: "flynn-device",
-        claimed_name: "Flynn",
-        platform: nil,
-        model: nil
-      })
+    _device = allowlisted_device(db, "flynn-device", "flynn", true)
 
     main_key = Org.personal_session_key("flynn")
 

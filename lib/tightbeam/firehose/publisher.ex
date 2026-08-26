@@ -383,6 +383,7 @@ defmodule Tightbeam.Firehose.Publisher do
   defp unwrap(result, "messages"), do: wrapped(result, [:message, "message"])
   defp unwrap(result, "condition-facts"), do: wrapped(result, [:fact, "fact"])
   defp unwrap(result, "critical-state"), do: wrapped(result, [:critical_state, "criticalState"])
+  defp unwrap(result, "users"), do: wrapped(result, [:user, "user"])
 
   defp unwrap(result, "devices"),
     do: wrapped(result, [:device, :approved, "device", "approved"])

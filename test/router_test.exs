@@ -31,8 +31,7 @@ defmodule Tightbeam.Wire.RouterTest do
 
     on_exit(fn -> File.rm_rf!(base_dir) end)
 
-    {:paired, device} =
-      Devices.pair(db, %{device_id: "d1", claimed_name: "Flynn", platform: nil, model: nil})
+    device = allowlisted_device(db, "d1", "flynn", true)
 
     ensure_main_session(db, device.user_id)
 
@@ -171,7 +170,7 @@ defmodule Tightbeam.Wire.RouterTest do
                     }}
   end
 
-  test "an empty org cannot use the local first-user exception over the wire", ctx do
+  test "an explicit missing user stays on the authenticated path in an empty org", ctx do
     db = :"empty_wire_add_user_db_#{System.unique_integer([:positive])}"
 
     start_supervised!(%{
@@ -197,10 +196,14 @@ defmodule Tightbeam.Wire.RouterTest do
     assert response.status == 403
 
     assert JSON.decode!(response.resp_body) == %{
-             "error" => %{"code" => "forbidden", "message" => "admin required"}
+             "error" => %{
+               "code" => "invalid_identity",
+               "message" => "asserted user does not exist"
+             }
            }
 
     assert Devices.user(db, "first") == nil
+    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM events")
   end
 
   test "authenticated harness projection route returns the registry bytes", ctx do

@@ -49,16 +49,21 @@ defmodule Tightbeam.Dispatch do
             {:session, String.t()}
             | {:user, String.t()}
             | {:process, String.t()}
+            | {:bootstrap, String.t()}
             | {:remedy, map()}
             | nil
         }
 
   @typedoc "An accepted result whose event was committed by the handler transaction."
   @type accepted_in_txn ::
-          {:accepted_in_txn, pos_integer(), %{canceled: true} | %{assignment: map()}}
+          {:accepted_in_txn, pos_integer(),
+           %{canceled: true} | %{assignment: map()} | %{user: map()}}
+
+  @typedoc "A denied result whose event and notice handoff committed in the handler transaction."
+  @type denied_in_txn :: {:denied_in_txn, pos_integer(), %{required(:code) => String.t()}}
 
   @typedoc "A handler: pure-ish fun; returns a result map, or %{code: _} to deny."
-  @type handler :: (call() -> map() | accepted_in_txn())
+  @type handler :: (call() -> map() | accepted_in_txn() | denied_in_txn())
 
   @type handlers :: %{optional(String.t()) => handler()}
 
@@ -231,6 +236,10 @@ defmodule Tightbeam.Dispatch do
           end
 
         case invoke(handler, handler_call) do
+          {:returned, {:denied_in_txn, event_id, %{code: _} = error}}
+          when is_integer(event_id) and event_id > 0 ->
+            {:error, error}
+
           {:returned, %{code: _} = error} ->
             :ok =
               EventLog.append_event_with_handoff(
@@ -256,6 +265,11 @@ defmodule Tightbeam.Dispatch do
                  is_map(assignment) ->
             :ok = Publisher.accepted_after_handler(db, publisher_call, assignment)
             {:ok, assignment}
+
+          {:returned, {:accepted_in_txn, event_id, %{user: user} = result}}
+          when is_integer(event_id) and event_id > 0 and map_size(result) == 1 and is_map(user) ->
+            :ok = Publisher.accepted_after_handler(db, publisher_call, result)
+            {:ok, result}
 
           {:returned, {:firehose_effect, result, changed?}} when is_boolean(changed?) ->
             payload = outcome_payload(verb, call, {:returned, result})

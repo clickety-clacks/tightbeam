@@ -259,6 +259,7 @@ defmodule Tightbeam.Wire.Socket do
             {:paired, device} -> Payloads.pair_result({:ok, device.token, device.user_id})
             {:pending, _device} -> Payloads.pair_result({:error, "pair_pending"})
             :denied -> Payloads.pair_result({:error, "pair_denied"})
+            :first_user_required -> Payloads.pair_result({:error, "first_user_required"})
           end
 
         stop_with(payload, state)

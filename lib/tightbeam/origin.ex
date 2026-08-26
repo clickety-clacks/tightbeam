@@ -5,9 +5,9 @@ defmodule Tightbeam.Origin do
 
   Origin classes are a CLOSED set (T3, bible §wakes): `user:<id>` (a human),
   `agent:<handle>` (a session), `process:<name>` (automation — cron, CI,
-  webhooks). `remedy:<statute>` is the fourth, substrate-reserved class a rail
-  remedy dispatches under (`rails-mechanism-v1.md`); transports never construct
-  it, but it reaches `sessions.origin` because a remedy may spawn.
+  webhooks), and two substrate-reserved classes that transports cannot name:
+  `remedy:<statute>` for rail remedies and `bootstrap:first-user` for the
+  transaction-scoped first-user authority.
 
   `started_by/1` collapses that set to the three-way axis a chat client renders
   from — did a human start this session, did an agent hire it, or did the
@@ -19,7 +19,7 @@ defmodule Tightbeam.Origin do
 
   @unclassified_key {__MODULE__, :warned_unclassified}
 
-  @type class :: :user | :agent | :process | :remedy
+  @type class :: :user | :agent | :process | :remedy | :bootstrap
   @type started_by :: String.t()
 
   @doc "Parse an origin into `{class, identifier}`, or `:malformed`."
@@ -30,6 +30,7 @@ defmodule Tightbeam.Origin do
       ["agent", rest] when rest != "" -> {:agent, rest}
       ["process", rest] when rest != "" -> {:process, rest}
       ["remedy", rest] when rest != "" -> {:remedy, rest}
+      ["bootstrap", rest] when rest != "" -> {:bootstrap, rest}
       _ -> :malformed
     end
   end
@@ -57,6 +58,7 @@ defmodule Tightbeam.Origin do
       {:agent, _} -> "agent"
       {:process, _} -> "substrate"
       {:remedy, _} -> "substrate"
+      {:bootstrap, _} -> "substrate"
       :malformed -> unclassified(origin)
     end
   end

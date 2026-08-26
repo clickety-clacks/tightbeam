@@ -334,30 +334,32 @@ machine and harness during reconciliation or launch, not necessarily at boot.
 Leave this process running and complete the remaining steps from another
 terminal.
 
-### Connect your first client — do this BEFORE onboarding
+### Create the first user — do this BEFORE onboarding or pairing
 
-A fresh org has no users. The first user becomes the admin through either of
-these bootstrap paths:
+A fresh org has no users. Start the gateway, then send `add-user` to its
+advertised endpoint. The CLI uses that same HTTP route and never opens
+`state.db`:
 
-- For an agent-driven install on the box, create the user locally:
+```sh
+<base_dir>/bin/tightbeam add-user <userId>
+```
 
-  ```sh
-  <base_dir>/bin/tightbeam add-user <userId>
-  ```
+The gateway returns the created user with `isAdmin: true`. Use that admin
+through the ordinary gateway path for every later user, for example:
 
-  This empty-org exception is local to the box. After the first user exists,
-  the same command uses ordinary admin authentication, for example
-  `tightbeam add-user <userId> --as-user <adminUserId>`; pass `--admin` when the
-  new user should also be an admin.
-- For a human with a client, point it at `TIGHTBEAM_ADVERTISED_URL` and pair
-  with a claimed name. The first client is auto-approved and its user becomes
-  the admin immediately, with no approval step because nobody exists to
-  approve it yet.
+```sh
+<base_dir>/bin/tightbeam add-user <userId> --as-user <adminUserId> [--admin]
+```
 
-Do one of these first. Onboarding is admin-only, so it fails with
-`forbidden: admin required` until the first admin exists.
+Any peer that can reach the gateway can win the first `add-user` call while
+the org is empty. Pairing cannot create the first user; it returns
+`first_user_required` with recovery text that tells you to create the first
+user through `add-user`. After the first user exists, pair and approve devices
+through the ordinary device flow.
 
-Every client after this one pairs as `pending` and must be approved by the admin.
+An older Tightbeam binary remains data-compatible with the committed user and
+event rows. It can restore the superseded local SQLite writer or pair-first
+policy, so stop the gateway before selecting an older binary.
 
 ### Then onboard a credential, per provider
 

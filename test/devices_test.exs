@@ -6,7 +6,7 @@ defmodule Tightbeam.DevicesTest do
   setup do
     name = :"db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: name})
-    :ok = Devices.ensure_schema(name)
+    :ok = Tightbeam.Schema.ensure_all(name)
     %{db: name}
   end
 
@@ -19,13 +19,20 @@ defmodule Tightbeam.DevicesTest do
     })
   end
 
-  test "first user bootstraps as admin and re-pair rotates the token", %{db: db} do
-    assert {:paired, first} = pair(db, "dev-1", "Flynn iPhone")
+  test "pairing refuses a zero-user database without writing", %{db: db} do
+    assert :first_user_required = pair(db, "dev-1", "Flynn iPhone")
+    assert Devices.user(db, "flynn-iphone") == nil
+    assert Devices.by_id(db, "dev-1") == nil
+    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM devices WHERE token IS NOT NULL")
+    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM events")
+  end
+
+  test "an approved device re-pairs by rotating its token", %{db: db} do
+    first = allowlisted_device(db, "dev-1", "flynn-iphone", true)
     assert first.user_id == "flynn-iphone"
     assert first.is_admin
     assert first.status == "allowlisted"
     assert first.token =~ ~r/^tbt_[A-Za-z0-9_-]{32}$/
-    assert Devices.user(db, "flynn-iphone").is_admin
 
     assert {:paired, second} = pair(db, "dev-1", "Flynn iPhone")
     refute second.token == first.token
@@ -41,7 +48,7 @@ defmodule Tightbeam.DevicesTest do
   end
 
   test "pending and denied flows preserve the approval queue", %{db: db} do
-    assert {:paired, _} = pair(db, "admin", "Admin")
+    _ = allowlisted_device(db, "admin", "admin", true)
     assert {:pending, pending} = pair(db, "dev-2", "Guest")
     assert pending.token == nil
     assert Enum.map(Devices.list_pending(db), & &1.device_id) == ["dev-2"]
@@ -53,7 +60,7 @@ defmodule Tightbeam.DevicesTest do
   end
 
   test "approve can override the claimed user and derives admin through the join", %{db: db} do
-    assert {:paired, _} = pair(db, "dev-1", "Admin")
+    _ = allowlisted_device(db, "dev-1", "admin", true)
     assert {:pending, _} = pair(db, "dev-2", "Typo Name")
 
     approved = Devices.approve(db, "dev-2", "admin")
@@ -65,14 +72,14 @@ defmodule Tightbeam.DevicesTest do
   end
 
   test "revoke clears token while by_id remains allowlisted", %{db: db} do
-    assert {:paired, device} = pair(db, "dev-1", "Admin")
+    device = allowlisted_device(db, "dev-1", "admin", true)
     assert :ok = Devices.revoke(db, "dev-1")
     assert Devices.by_token(db, device.token) == nil
     assert %{status: "allowlisted", token: nil} = Devices.by_id(db, "dev-1")
   end
 
   test "admin follows the user and unknown mutations raise", %{db: db} do
-    assert {:paired, _} = pair(db, "phone-1", "Flynn")
+    _ = allowlisted_device(db, "phone-1", "flynn", true)
     assert {:pending, _} = pair(db, "phone-2", "Flynn")
     assert Devices.approve(db, "phone-2").is_admin
 

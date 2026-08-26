@@ -336,8 +336,7 @@ defmodule Tightbeam.RulesTest do
 
   test "caller facts cover origin, admin, multi-role, unbound, retired, and malformed cases",
        ctx do
-    {:paired, _} =
-      Devices.pair(ctx.db, %{device_id: "d1", claimed_name: "Flynn", platform: nil, model: nil})
+    _ = allowlisted_device(ctx.db, "d1", "flynn", true)
 
     {:pending, _} =
       Devices.pair(ctx.db, %{device_id: "d2", claimed_name: "Mike", platform: nil, model: nil})

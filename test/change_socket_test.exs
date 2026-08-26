@@ -1,7 +1,7 @@
 defmodule Tightbeam.Wire.ChangeSocketTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Devices, Gateway}
+  alias Tightbeam.{DB, Gateway}
   alias Tightbeam.Firehose.{Hub, Registry}
   alias Tightbeam.Wire.ChangeSocket
 
@@ -12,8 +12,7 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
     start_supervised!({Hub, name: hub})
     :ok = Tightbeam.Schema.ensure_all(db)
 
-    {:paired, device} =
-      Devices.pair(db, %{device_id: "d1", claimed_name: "Flynn", platform: nil, model: nil})
+    device = allowlisted_device(db, "d1", "flynn", true)
 
     {:ok, state} =
       ChangeSocket.init(%{db: db, firehose_hub: hub, firehose_heartbeat_ms: 60_000})

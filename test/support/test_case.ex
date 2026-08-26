@@ -54,7 +54,8 @@ defmodule Tightbeam.TestCase do
           catalog_reply: 2,
           catalog_probe_harness: 1,
           ensure_all_schemas: 1,
-          ensure_main_session: 2
+          ensure_main_session: 2,
+          allowlisted_device: 4
         ]
     end
   end
@@ -82,6 +83,23 @@ defmodule Tightbeam.TestCase do
 
   @doc "Create the complete production schema for a unit-test database."
   def ensure_all_schemas(db), do: Tightbeam.Schema.ensure_all(db)
+
+  @doc "Create an explicit user, then approve one device for that user."
+  def allowlisted_device(db, device_id, user_id, is_admin) do
+    unless Tightbeam.Devices.user(db, user_id) do
+      Tightbeam.Devices.add_user(db, user_id, is_admin)
+    end
+
+    {:pending, device} =
+      Tightbeam.Devices.pair(db, %{
+        device_id: device_id,
+        claimed_name: user_id,
+        platform: nil,
+        model: nil
+      })
+
+    Tightbeam.Devices.approve(db, device.device_id, user_id)
+  end
 
   @doc "Create the canonical self-parented Main fixture for an owner when absent."
   def ensure_main_session(db, owner) do

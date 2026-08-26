@@ -1,18 +1,19 @@
 defmodule Tightbeam.Devices do
   @moduledoc """
   Device pairing + token store (TS reference: src/wire/devices.ts — port its
-  behavior exactly; its test file is the acceptance oracle).
+  behavior at the post-bootstrap device seam; first-user authority belongs to
+  the gateway `add-user` transaction.
 
   USERS own identity and admin-ness; DEVICES are credentials attached to a
   user (membership). Pairing with a claimed name is a request to join that
   user; approval is the authentication ceremony. The FIRST user ever is admin
   (cold-start rule); `is_admin` on a device is DERIVED from the owning user at
   read time, never stored on the device — admin follows the person, not the
-  phone. Tokens are opaque per-device bearers (third credential class,
+  phone. Pairing cannot create the first user. Tokens are opaque per-device bearers (third credential class,
   gateway-owned; prefix `tbt_`).
   """
 
-  alias Tightbeam.{AdminProjection, DB, StateResources}
+  alias Tightbeam.{AdminProjection, DB, EventLog, StateResources}
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.Publisher
 
@@ -35,7 +36,7 @@ defmodule Tightbeam.Devices do
 
   @typedoc "Pairing outcome — mirrors the TS PairOutcome union."
   @type pair_outcome ::
-          {:paired, device()} | {:pending, device()} | :denied
+          {:paired, device()} | {:pending, device()} | :denied | :first_user_required
 
   @ddl """
   CREATE TABLE IF NOT EXISTS users (
@@ -68,11 +69,11 @@ defmodule Tightbeam.Devices do
   Pair a device. Semantics (devices.ts `pair`) — all in ONE transaction:
   - Known denied device → :denied. Known pending → {:pending, device}.
   - Known allowlisted → rotate its token, {:paired, device}.
-  - Unknown device: user_id is slugged from claimed_name
-    (lowercase, non-alphanumerics → "-", trimmed; empty → "user"). If NO users
-    exist yet, the user bootstraps as admin and the device is allowlisted with
-    a fresh token ({:paired, _}); otherwise the device is pending with a nil
-    token ({:pending, _}) — including new devices claiming an EXISTING user.
+  - Unknown device: while no canonical user exists, refuse with
+    `:first_user_required` and write nothing. Otherwise user_id is slugged from
+    claimed_name (lowercase, non-alphanumerics → "-", trimmed; empty → "user")
+    and the device is pending with a nil token — including new devices claiming
+    an existing user.
   """
   @spec pair(db(), %{
           device_id: String.t(),
@@ -107,35 +108,34 @@ defmodule Tightbeam.Devices do
           end
 
         [] ->
-          claimed_name = Map.fetch!(input, :claimed_name)
-          user_id = slug_user_id(claimed_name)
-          first_ever? = Txn.q(txn, "SELECT COUNT(*) FROM users") == [[0]]
-          ensure_user(txn, user_id)
-          status = if first_ever?, do: "allowlisted", else: "pending"
-          token = if first_ever?, do: mint_token(), else: nil
+          if Txn.q(txn, "SELECT COUNT(*) FROM users") == [[0]] do
+            :first_user_required
+          else
+            claimed_name = Map.fetch!(input, :claimed_name)
+            user_id = slug_user_id(claimed_name)
+            ensure_user(txn, user_id)
 
-          Txn.q(
-            txn,
-            """
-              INSERT INTO devices
-                (deviceId, userId, claimedName, status, token, platform, model, createdAt)
-              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-            """,
-            [
-              device_id,
-              user_id,
-              claimed_name,
-              status,
-              token,
-              Map.fetch!(input, :platform),
-              Map.fetch!(input, :model),
-              now()
-            ]
-          )
+            Txn.q(
+              txn,
+              """
+                INSERT INTO devices
+                  (deviceId, userId, claimedName, status, token, platform, model, createdAt)
+                VALUES (?1, ?2, ?3, 'pending', NULL, ?4, ?5, ?6)
+              """,
+              [
+                device_id,
+                user_id,
+                claimed_name,
+                Map.fetch!(input, :platform),
+                Map.fetch!(input, :model),
+                now()
+              ]
+            )
 
-          device = must_get(txn, device_id)
-          stamp_device_in_txn(txn, device_id, device.created_at)
-          if first_ever?, do: {:paired, device}, else: {:pending, device}
+            device = must_get(txn, device_id)
+            stamp_device_in_txn(txn, device_id, device.created_at)
+            {:pending, device}
+          end
       end
     end)
   end
@@ -299,6 +299,51 @@ defmodule Tightbeam.Devices do
       user = StateResources.query_user(txn, user_id)
       Publisher.maybe_accepted_in_txn(txn, call, %{user: user})
       user
+    end)
+  end
+
+  @doc false
+  def add_first_user_with_firehose(db, user_id, call) do
+    transaction!(db, fn txn ->
+      if Txn.q(txn, "SELECT COUNT(*) FROM users") == [[0]] do
+        insert_user(txn, user_id, true)
+        result = %{user: StateResources.query_user(txn, user_id)}
+
+        event_id =
+          EventLog.append_event_in_txn(
+            txn,
+            "verb",
+            call.verb,
+            call.origin,
+            call.session_key,
+            result,
+            call.principal,
+            now()
+          )
+
+        Publisher.maybe_accepted_in_txn(txn, call, result)
+        {:accepted_in_txn, event_id, result}
+      else
+        error = %{
+          code: "approval_required",
+          message: "an existing admin must approve user creation"
+        }
+
+        event_id =
+          EventLog.append_event_in_txn(
+            txn,
+            "denied",
+            call.verb,
+            call.origin,
+            call.session_key,
+            error,
+            call.principal,
+            now()
+          )
+
+        Publisher.denied_in_txn(txn, call, error)
+        {:denied_in_txn, event_id, error}
+      end
     end)
   end
 

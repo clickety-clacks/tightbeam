@@ -7,7 +7,8 @@ defmodule Tightbeam.Wire.Router do
   WebSockAdapter; everything else is JSON.
 
   Conventions (identical to TS — imitate, don't improve):
-  - Bearer auth on everything except /version. Two credential classes here:
+  - Bearer auth on everything except /version and a selector-free `add-user`
+    candidate. Two credential classes here:
     device tokens (Devices.by_token) for client routes; the gateway-owned
     cliToken for POST /agent/dispatch (the tightbeam CLI facade).
   - Errors: `{"error": {"code", "message"?}}` + matching HTTP status.
@@ -22,9 +23,10 @@ defmodule Tightbeam.Wire.Router do
   Routes — the PATHS ARE THE WIRE CONTRACT, verbatim from http.ts as-built
   (the real client and the black-box drivers speak these; never rename):
   - GET  /version              — no auth; protocolVersion + health numbers.
-  - POST /agent/dispatch       — cliToken auth; body {verb, target?, params,
-    as|asUser} → origin resolution; verb must be in the closed AGENT_VERBS
-    set (post excluded on purpose: an agent DM IS a wake-with-prompt).
+  - POST /agent/dispatch       — cliToken auth except for the transaction-scoped
+    first-user candidate; body {verb, target?, params, as|asUser} → origin
+    resolution; verb must be in the closed AGENT_VERBS set (post excluded on
+    purpose: an agent DM IS a wake-with-prompt).
   - POST /agent/tool-call-observed — SESSION token only; no body. The
     substrate-reserved PreToolUse hook reporting that this session is about to
     run `tightbeam artifact-record`. Not a verb: it writes no domain state, only
@@ -138,12 +140,14 @@ defmodule Tightbeam.Wire.Router do
   end
 
   post "/agent/dispatch" do
-    with {:ok, auth} <- cli_auth(conn),
+    with :ok <- cli_version_compatible(conn),
          {:ok, body, conn} <- read_json(conn),
          {:ok, verb} <- required_string(body["verb"]),
          :ok <- allowed_agent_verb(verb),
-         {:ok, origin, principal} <- agent_identity(body, auth, conn),
-         {:ok, session_key, target_meta} <- typed_target(verb, body, conn) do
+         :ok <- add_user_target_shape(verb, body),
+         {:ok, origin, principal} <- agent_dispatch_identity(verb, body, conn),
+         {:ok, session_key, target_meta} <- typed_target(verb, body, conn),
+         :ok <- validate_agent_params(verb, body["params"]) do
       call = %{
         verb: verb,
         origin: origin,
@@ -470,6 +474,69 @@ defmodule Tightbeam.Wire.Router do
       else: {:error, 400, "invalid_message", "verb not allowed: #{verb}"}
   end
 
+  defp agent_dispatch_identity("add-user", body, conn) do
+    case identity_selector(body) do
+      :absent ->
+        with :ok <- validate_agent_params("add-user", body["params"]) do
+          {:ok, "bootstrap:first-user", {:bootstrap, "first-user"}}
+        end
+
+      :present ->
+        authenticated_agent_identity(body, conn)
+
+      :malformed ->
+        {:error, 400, "invalid_message", nil}
+    end
+  end
+
+  defp agent_dispatch_identity(_verb, body, conn), do: authenticated_agent_identity(body, conn)
+
+  defp authenticated_agent_identity(body, conn) do
+    with {:ok, auth} <- cli_token_auth(conn), do: agent_identity(body, auth, conn)
+  end
+
+  defp identity_selector(body) do
+    values =
+      ["as", "asUser", "asProcess"]
+      |> Enum.filter(&Map.has_key?(body, &1))
+      |> Enum.map(fn key -> body[key] end)
+
+    cond do
+      Enum.any?(values, fn value -> not (is_binary(value) and value != "") end) ->
+        :malformed
+
+      values != [] ->
+        :present
+
+      true ->
+        :absent
+    end
+  end
+
+  defp add_user_target_shape("add-user", body) do
+    if volunteers_typed_target?(body),
+      do: {:error, 400, "invalid_message", "add-user takes no typed target"},
+      else: :ok
+  end
+
+  defp add_user_target_shape(_verb, _body), do: :ok
+
+  defp validate_agent_params("add-user", params) when is_map(params) do
+    cond do
+      not (is_binary(params["userId"]) and params["userId"] != "") ->
+        {:error, 400, "invalid_message", nil}
+
+      Map.has_key?(params, "isAdmin") and not is_boolean(params["isAdmin"]) ->
+        {:error, 400, "invalid_message", nil}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_agent_params("add-user", _params), do: {:error, 400, "invalid_message", nil}
+  defp validate_agent_params(_verb, _params), do: :ok
+
   defp agent_identity(%{"asProcess" => "tightbeam"}, :org, _conn) do
     {:error, 403, "reserved_origin", "process:tightbeam is reserved to the substrate"}
   end
@@ -491,7 +558,7 @@ defmodule Tightbeam.Wire.Router do
             nil
         end
 
-      {:ok, origin, principal}
+      with :ok <- authoritative_user_exists(principal, conn), do: {:ok, origin, principal}
     end
   end
 
@@ -516,7 +583,9 @@ defmodule Tightbeam.Wire.Router do
 
       is_binary(body["asUser"]) and body["asUser"] != "" ->
         if body["asUser"] == session.owner_user_id do
-          {:ok, "user:#{session.owner_user_id}", {:user, session.owner_user_id}}
+          with :ok <- authoritative_user_exists({:user, session.owner_user_id}, conn) do
+            {:ok, "user:#{session.owner_user_id}", {:user, session.owner_user_id}}
+          end
         else
           {:error, 403, "identity_not_yours", "this session belongs to #{session.owner_user_id}"}
         end
@@ -528,7 +597,9 @@ defmodule Tightbeam.Wire.Router do
         {:ok, "agent:#{hd(roles)}", session_principal}
 
       roles == [] and session.is_built_in ->
-        {:ok, "user:#{session.owner_user_id}", session_principal}
+        with :ok <- authoritative_user_exists({:user, session.owner_user_id}, conn) do
+          {:ok, "user:#{session.owner_user_id}", session_principal}
+        end
 
       roles == [] ->
         {:error, 403, "no_role",
@@ -539,6 +610,14 @@ defmodule Tightbeam.Wire.Router do
          "this session holds several roles (#{Enum.join(roles, ", ")}); pass --as <role>"}
     end
   end
+
+  defp authoritative_user_exists({:user, user_id}, conn) do
+    if Devices.user(db(conn), user_id),
+      do: :ok,
+      else: {:error, 403, "invalid_identity", "asserted user does not exist"}
+  end
+
+  defp authoritative_user_exists(_principal, _conn), do: :ok
 
   defp agent_origin(%{"asProcess" => "tightbeam"}, _conn) do
     {:error, 403, "reserved_origin", "process:tightbeam is reserved to the substrate"}
@@ -606,7 +685,7 @@ defmodule Tightbeam.Wire.Router do
   # owner-or-admin check (mirroring `coordination-share`'s) is the read's
   # actual gate, and a volunteered `--session` alongside `--wake-id` must not
   # get answered by the router first.
-  @non_target_verbs ~w(transcript turn-trace toplines topline coordination-share digest-members answer return)
+  @non_target_verbs ~w(add-user transcript turn-trace toplines topline coordination-share digest-members answer return)
 
   # PRESENCE of the field, not the type of its value. `sessionKey: null` — and a
   # number, a boolean or an object — is still a caller volunteering a typed target
@@ -961,7 +1040,7 @@ defmodule Tightbeam.Wire.Router do
     end
   end
 
-  defp error_status("forbidden"), do: 403
+  defp error_status(code) when code in ["forbidden", "approval_required"], do: 403
 
   defp error_status(code)
        when code in ["not_holder", "not_authorized", "process_denied", "principal_required"],

@@ -19,15 +19,9 @@ pub struct Endpoint {
     pub origin: Origin,
 }
 
-/// WHERE the endpoint came from, kept because it answers a question its VALUES cannot.
-///
-/// "Is this request aimed at the gateway running on this machine?" was answered by
-/// comparing an endpoint's token to the local one -- so a deliberately remote `--url`
-/// that happened to carry the same token was classified local, and an operator adding a
-/// user to another org got a row inserted into this machine's database instead. Value
-/// equality was never the question. An endpoint is local when it was RESOLVED from this
-/// machine's own provisioning, and that is decided once, where the resolution happens,
-/// and then carried rather than re-derived.
+/// WHERE the endpoint came from. Session-file discovery is the only source that
+/// authorizes the CLI's implicit session identity; every source still sends the
+/// same HTTP request to the discovered gateway.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Origin {
     /// A `.tightbeam-session` file found walking up from the working directory.
@@ -1401,52 +1395,23 @@ where
             user_id,
             admin,
         } => {
-            // Resolve the requested org before inspecting or mutating local state. An
-            // explicit remote endpoint must not get a user inserted into whichever
-            // empty state.db happens to exist on this machine.
             let endpoint = discover_endpoint()?;
-            let first_user = first_user_for_target(add_user_target_is_local(&endpoint), || {
-                crate::users::create_first_if_local(&user_id, admin)
-            })?;
-            match first_user {
-                crate::users::FirstUser::Created {
-                    user_id,
-                    is_admin,
-                    created_at,
-                } => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&serde_json::json!({
-                            "user": {
-                                "userId": user_id,
-                                "isAdmin": is_admin,
-                                "createdAt": created_at
-                            }
-                        }))
-                        .expect("JSON value serializes")
-                    );
-                    Ok(())
-                }
-                crate::users::FirstUser::Dispatch => {
-                    require_session_endpoint(&identity, &endpoint)?;
-                    let request = request(
-                        &identity,
-                        "add-user",
-                        vec![],
-                        vec![
-                            string_field("userId", &user_id),
-                            format!("\"isAdmin\":{admin}"),
-                        ],
-                    );
-                    if let Some(result) = send_request(&endpoint, &request, None)? {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&result).expect("JSON value serializes")
-                        );
-                    }
-                    Ok(())
-                }
+            let request = request(
+                &identity,
+                "add-user",
+                vec![],
+                vec![
+                    string_field("userId", &user_id),
+                    format!("\"isAdmin\":{admin}"),
+                ],
+            );
+            if let Some(result) = send_request(&endpoint, &request, None)? {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result).expect("JSON value serializes")
+                );
             }
+            Ok(())
         }
         Command::UpdateClients { as_user } => crate::ceremonies::update_clients(&as_user),
         Command::Assimilate(args) => crate::ceremonies::assimilate(args),
@@ -1481,33 +1446,6 @@ where
             Ok(())
         }
     }
-}
-
-fn add_user_target_is_local(endpoint: &Endpoint) -> bool {
-    add_user_endpoint_matches_local(endpoint, &provisioned())
-}
-
-fn first_user_for_target<F>(local: bool, create: F) -> Result<crate::users::FirstUser, String>
-where
-    F: FnOnce() -> Result<crate::users::FirstUser, String>,
-{
-    if local {
-        create()
-    } else {
-        Ok(crate::users::FirstUser::Dispatch)
-    }
-}
-
-/// The one case that may create a user without asking a gateway: this machine IS the
-/// gateway host, and the request resolved to it because nothing else was named.
-///
-/// Both halves are provenance, not comparison. `Origin::Named` and `Origin::Session` each
-/// say an endpoint was chosen deliberately, and a deliberate choice is honoured as made
-/// even when it resolves to the same address and the same token as the local gateway --
-/// which is precisely the case that used to fall through to a local mutation.
-fn add_user_endpoint_matches_local(endpoint: &Endpoint, provisioned: &Provisioned) -> bool {
-    matches!(provisioned, Provisioned::GatewayHost)
-        && matches!(endpoint.origin, Origin::Provisioned)
 }
 
 fn require_session_endpoint(identity: &Identity, endpoint: &Endpoint) -> Result<(), String> {
@@ -1727,64 +1665,54 @@ mod tests {
     }
 
     #[test]
-    fn add_user_builds_the_ordinary_authenticated_gateway_request() {
+    fn add_user_builds_the_same_gateway_request_with_or_without_an_identity() {
+        assert_eq!(
+            body(&["add-user", "first"]),
+            r#"{"verb":"add-user","params":{"userId":"first","isAdmin":false}}"#
+        );
+
         assert_eq!(
             body(&["add-user", "guest", "--admin", "--as-user", "flynn"]),
             r#"{"asUser":"flynn","verb":"add-user","params":{"userId":"guest","isAdmin":true}}"#
         );
     }
 
-    /// The case the value comparison could not see.
-    ///
-    /// `--url` naming a remote gateway that happens to share the local token -- one org's
-    /// token deployed on two hosts, or a satellite pointed back at its own gateway -- was
-    /// classified LOCAL and inserted a user into whatever `state.db` this machine had.
-    /// The comparison that shipped could not distinguish it because there is nothing in
-    /// the values to distinguish; the fixtures below share base AND token deliberately,
-    /// so nothing here can pass by comparing them.
     #[test]
-    fn an_explicit_remote_add_user_target_cannot_use_the_local_empty_org_exception() {
-        let base = "http://127.0.0.1:11373".to_owned();
-        let token = "tbc_local".to_owned();
-        let provisioned = Endpoint {
-            base: base.clone(),
-            token: token.clone(),
-            origin: Origin::Provisioned,
-        };
-        let named = Endpoint {
-            base: base.clone(),
-            token: token.clone(),
-            origin: Origin::Named,
-        };
-        let session = Endpoint {
-            base,
-            token,
-            origin: Origin::Session(PathBuf::from("/work/.tightbeam-session")),
-        };
-
-        assert!(add_user_endpoint_matches_local(
-            &provisioned,
-            &Provisioned::GatewayHost
-        ));
-        assert!(
-            !add_user_endpoint_matches_local(&named, &Provisioned::GatewayHost),
-            "an endpoint named on the command line is the operator's choice of target, \
-             whatever it resolves to"
-        );
-        assert!(!add_user_endpoint_matches_local(
-            &session,
-            &Provisioned::GatewayHost
-        ));
-        assert!(!add_user_endpoint_matches_local(
-            &provisioned,
-            &Provisioned::Satellite {
-                machine: Some("worker".to_owned())
-            }
-        ));
-        assert_eq!(
-            first_user_for_target(false, || panic!("remote target attempted local mutation")),
-            Ok(crate::users::FirstUser::Dispatch)
-        );
+    fn bare_add_user_discovers_and_sends_the_same_request_for_local_and_remote_endpoints() {
+        for endpoint in [
+            Endpoint {
+                base: "http://127.0.0.1:11373".to_owned(),
+                token: "local-token-sentinel".to_owned(),
+                origin: Origin::Provisioned,
+            },
+            Endpoint {
+                base: "https://gateway.example".to_owned(),
+                token: "remote-token-sentinel".to_owned(),
+                origin: Origin::Named,
+            },
+        ] {
+            let expected = endpoint.clone();
+            run_with(
+                Command::AddUser {
+                    identity: Identity::Session,
+                    user_id: "first".to_owned(),
+                    admin: false,
+                },
+                || Ok(endpoint),
+                |discovered, request, deadline| {
+                    assert_eq!(discovered, &expected);
+                    assert_eq!(request.path, "/agent/dispatch");
+                    assert_eq!(
+                        request.body_json,
+                        r#"{"verb":"add-user","params":{"userId":"first","isAdmin":false}}"#
+                    );
+                    assert_eq!(deadline, None);
+                    Ok(None)
+                },
+                |_, _| panic!("harness loader must not be called"),
+            )
+            .unwrap();
+        }
     }
 
     #[test]

@@ -1782,6 +1782,8 @@ defmodule Tightbeam.ClientE2ETest do
     setup :real_gateway
 
     test "J0 passes: the wire pairs, authenticates, seeds Main and syncs", ctx do
+      allowlisted_device(ctx.db, "sim-j0", "flynn", true)
+
       {:ok, %{token: token}} =
         SimClient.pair("127.0.0.1", ctx.port, device_id: "sim-j0", claimed_name: "Flynn")
 
@@ -1802,6 +1804,8 @@ defmodule Tightbeam.ClientE2ETest do
     end
 
     test "posting with a malformed id is refused on the wire, not silently dropped", ctx do
+      allowlisted_device(ctx.db, "sim-bad-id", "flynn", true)
+
       {:ok, %{token: token}} =
         SimClient.pair("127.0.0.1", ctx.port, device_id: "sim-bad-id", claimed_name: "Flynn")
 

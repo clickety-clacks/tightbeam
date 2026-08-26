@@ -5,7 +5,7 @@ defmodule Tightbeam.RulesTransportTest do
   import Plug.Conn
   import Plug.Test
 
-  alias Tightbeam.{ConnRegistry, DB, Devices, EventLog, Org, Roles, Rules}
+  alias Tightbeam.{ConnRegistry, DB, EventLog, Org, Roles, Rules}
   alias Tightbeam.Wire.{Router, Socket}
 
   setup do
@@ -58,8 +58,7 @@ defmodule Tightbeam.RulesTransportTest do
          end}
       end)
 
-    {:paired, device} =
-      Devices.pair(db, %{device_id: "d1", claimed_name: "Flynn", platform: nil, model: nil})
+    device = allowlisted_device(db, "d1", "flynn", true)
 
     main =
       Org.create(db, %{

@@ -988,21 +988,28 @@ defmodule Tightbeam.Gateway do
           result = Devices.promote_user_with_firehose(db, call.params.user_id, call)
           %{user: StateResources.user(result.user), changed: result.changed}
         end),
-      {"add-user", ["user.added"]} =>
-        admin_call_handler(db, fn call ->
-          p = call.params
+      {"add-user", ["user.added"]} => fn
+        %{principal: {:bootstrap, "first-user"}} = call ->
+          Devices.add_first_user_with_firehose(db, call.params.user_id, call)
 
-          %{
-            user:
-              db
-              |> Devices.add_user_with_firehose(
-                p.user_id,
-                Map.get(p, :is_admin, false),
-                call
-              )
-              |> StateResources.user()
-          }
-        end),
+        call ->
+          if admin_origin?(db, call.origin) do
+            p = call.params
+
+            %{
+              user:
+                db
+                |> Devices.add_user_with_firehose(
+                  p.user_id,
+                  Map.get(p, :is_admin, false),
+                  call
+                )
+                |> StateResources.user()
+            }
+          else
+            %{code: "forbidden", message: "admin required"}
+          end
+      end,
       {"read-marker-set", ["read_marker.updated"]} => fn call ->
         read_marker_result(db, call, :set)
       end,
