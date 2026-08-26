@@ -247,7 +247,7 @@ On macOS, restart the installed Tightbeam launchd service, then verify it with
 foreground process, same environment contract, same first-boot behaviour. It
 creates the base dir, seeds the identity repository, creates `state.db` and
 `bin/`, and prints the NOT READY summary described below. Continue from
-**Connect your first client**; everything after this point is identical for
+**Create the first user**; everything after this point is identical for
 both install paths.
 
 The CLI and the gateway ship in one package on purpose, so their version
@@ -372,7 +372,7 @@ vendor's own `login` does not onboard Tightbeam:
 ```
 
 `<provider>` is the credential provider — **`anthropic`** or **`openai`** — not
-the harness name. `<userId>` is the admin created by that first pairing. From a
+the harness name. `<userId>` is the admin created by the first `add-user`. From a
 release install `tightbeam` is already on PATH, so the `<base_dir>/bin/` prefix
 is only needed on a source install.
 
