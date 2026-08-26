@@ -217,7 +217,8 @@ defmodule Tightbeam.CheckTierTest do
                call("attest", {:user, "flynn"}, %{
                  assignment_id: assignment.id,
                  kind: "verdict",
-                 verdict_kind: "tests-passed"
+                 verdict_kind: "tests-passed",
+                 note: "tests passed"
                })
              )
 
@@ -342,7 +343,8 @@ defmodule Tightbeam.CheckTierTest do
                call("attest", {:session, "holder"}, %{
                  assignment_id: assignment.id,
                  kind: "verdict",
-                 verdict_kind: "reviewed"
+                 verdict_kind: "reviewed",
+                 note: "reviewed"
                })
              )
 
@@ -353,7 +355,8 @@ defmodule Tightbeam.CheckTierTest do
                call("attest", {:user, "flynn"}, %{
                  assignment_id: assignment.id,
                  kind: "verdict",
-                 verdict_kind: "reviewed"
+                 verdict_kind: "reviewed",
+                 note: "reviewed"
                })
              )
   end
@@ -425,7 +428,10 @@ defmodule Tightbeam.CheckTierTest do
   end
 
   defp verdict(ctx, principal, assignment_id, kind) do
-    attest(ctx, principal, assignment_id, "verdict", %{verdict_kind: kind})
+    attest(ctx, principal, assignment_id, "verdict", %{
+      verdict_kind: kind,
+      note: "test verdict"
+    })
   end
 
   defp revoke(ctx, assignment_id) do

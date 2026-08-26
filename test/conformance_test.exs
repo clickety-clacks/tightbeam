@@ -1684,7 +1684,12 @@ defmodule Tightbeam.ConformanceSupport do
       origin: "agent:reviewer",
       principal: {:session, "reviewer"},
       session_key: nil,
-      params: %{assignment_id: r1_id, kind: "verdict", verdict_kind: "reviewed-clean"}
+      params: %{
+        assignment_id: r1_id,
+        kind: "verdict",
+        verdict_kind: "reviewed-clean",
+        note: "reviewed clean"
+      }
     }
 
     assert {:ok, %{attest: %{verdictKind: "reviewed-clean"}}} =
@@ -3608,7 +3613,8 @@ defmodule Tightbeam.ConformanceSupport do
           params: %{
             assignment_id: assignments[attest["assignment"]],
             kind: attest["kind"],
-            verdict_kind: attest["verdict_kind"]
+            verdict_kind: attest["verdict_kind"],
+            note: if(attest["kind"] == "verdict", do: "fixture verdict")
           }
         })
 
@@ -3970,7 +3976,8 @@ defmodule Tightbeam.ConformanceSupport do
         params: %{
           assignment_id: assignment_id,
           kind: "verdict",
-          verdict_kind: verdict_kind
+          verdict_kind: verdict_kind,
+          note: "test verdict"
         }
       })
 

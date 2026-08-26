@@ -1313,7 +1313,12 @@ defmodule Tightbeam.RailRemedyTest do
       origin: "agent:#{session_key}",
       principal: {:session, session_key},
       session_key: nil,
-      params: %{assignment_id: assignment_id, kind: "verdict", verdict_kind: kind}
+      params: %{
+        assignment_id: assignment_id,
+        kind: "verdict",
+        verdict_kind: kind,
+        note: "test verdict"
+      }
     })
   end
 

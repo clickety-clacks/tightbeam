@@ -1001,7 +1001,12 @@ defmodule Tightbeam.AssignmentsTest do
     ordinary =
       handle(ctx, "attest", %{
         attest_call({:session, "holder"}, assignment.id, "verdict")
-        | params: %{assignment_id: assignment.id, kind: "verdict", verdict_kind: "reviewed-clean"}
+        | params: %{
+            assignment_id: assignment.id,
+            kind: "verdict",
+            verdict_kind: "reviewed-clean",
+            note: "reviewed clean"
+          }
       })
 
     assert ordinary.attest.byHarness == "claude"
@@ -1014,7 +1019,12 @@ defmodule Tightbeam.AssignmentsTest do
     user_verdict =
       handle(ctx, "attest", %{
         attest_call({:user, "flynn"}, assignment.id, "verdict")
-        | params: %{assignment_id: assignment.id, kind: "verdict", verdict_kind: "user-ruling"}
+        | params: %{
+            assignment_id: assignment.id,
+            kind: "verdict",
+            verdict_kind: "user-ruling",
+            note: "user ruling"
+          }
       })
 
     assert user_verdict.attest.byHarness == nil
@@ -1974,6 +1984,18 @@ defmodule Tightbeam.AssignmentsTest do
     assert %{code: "missing_verdict_kind"} =
              handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "verdict"))
 
+    assert %{code: "invalid_note", message: "note must be 1..2000 non-blank characters"} =
+             attest_call({:session, "holder"}, assignment.id, "verdict")
+             |> put_in([:params, :verdict_kind], "reviewed-clean")
+             |> update_in([:params], &Map.delete(&1, :note))
+             |> then(&handle(ctx, "attest", &1))
+
+    assert %{code: "invalid_note", message: "note must be text"} =
+             attest_call({:session, "holder"}, assignment.id, "verdict")
+             |> put_in([:params, :verdict_kind], "reviewed-clean")
+             |> put_in([:params, :note], false)
+             |> then(&handle(ctx, "attest", &1))
+
     assert %{code: "invalid_note"} =
              handle(ctx, "attest", %{
                attest_call({:session, "holder"}, assignment.id, "progress")
@@ -2391,6 +2413,14 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   defp work_item_call(verb, principal, params), do: call(verb, principal, nil, params)
+
+  defp attest_call(principal, id, "verdict" = kind),
+    do:
+      call("attest", principal, nil, %{
+        assignment_id: id,
+        kind: kind,
+        note: "test verdict"
+      })
 
   defp attest_call(principal, id, kind),
     do: call("attest", principal, nil, %{assignment_id: id, kind: kind})

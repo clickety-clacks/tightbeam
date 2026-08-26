@@ -345,6 +345,8 @@ defmodule Tightbeam.CliIntegrationTest do
           "verdict",
           "--verdict",
           "tests-passed",
+          "--note",
+          "tests passed",
           "--as-user",
           "flynn"
         ],
@@ -484,7 +486,16 @@ defmodule Tightbeam.CliIntegrationTest do
     {verdicted, 0} =
       System.cmd(
         ctx.binary,
-        ["attest", dispatch_id, "--kind", "verdict", "--verdict", "tests-passed"],
+        [
+          "attest",
+          dispatch_id,
+          "--kind",
+          "verdict",
+          "--verdict",
+          "tests-passed",
+          "--note",
+          "tests passed"
+        ],
         cd: ctx.workdir,
         stderr_to_stdout: true
       )
@@ -497,7 +508,8 @@ defmodule Tightbeam.CliIntegrationTest do
                       params: %{
                         assignment_id: ^dispatch_id,
                         kind: "verdict",
-                        verdict_kind: "tests-passed"
+                        verdict_kind: "tests-passed",
+                        note: "tests passed"
                       }
                     }}
 
@@ -686,7 +698,16 @@ defmodule Tightbeam.CliIntegrationTest do
     {_verdict, 0} =
       System.cmd(
         ctx.binary,
-        ["attest", review_id, "--kind", "verdict", "--verdict", "reviewed-clean"],
+        [
+          "attest",
+          review_id,
+          "--kind",
+          "verdict",
+          "--verdict",
+          "reviewed-clean",
+          "--note",
+          "reviewed clean"
+        ],
         cd: reviewer_dir,
         stderr_to_stdout: true
       )
@@ -713,7 +734,16 @@ defmodule Tightbeam.CliIntegrationTest do
     {_verified, 0} =
       System.cmd(
         ctx.binary,
-        ["attest", work_id, "--kind", "verdict", "--verdict", "verified"],
+        [
+          "attest",
+          work_id,
+          "--kind",
+          "verdict",
+          "--verdict",
+          "verified",
+          "--note",
+          "verification passed"
+        ],
         cd: coder_dir,
         stderr_to_stdout: true
       )
