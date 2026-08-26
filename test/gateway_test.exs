@@ -4733,6 +4733,37 @@ defmodule Tightbeam.GatewayTest do
     refute message =~ "onboard"
   end
 
+  test "set_harness credential refusal offers the routable resident harness", ctx do
+    base_dir = role_test_base("available-resident-harness")
+    Archetypes.load!(base_dir)
+
+    config =
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.put(:credential_status, fn
+        :openai, _host -> {:needs_onboarding, :missing}
+        :anthropic, _host -> :onboarded
+      end)
+
+    degrade_host_catalog("testhost", "codex", {:needs_onboarding, :missing})
+
+    assert %{code: "needs_onboarding", message: message} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: "user:flynn",
+               session_key: "k1",
+               params: %{
+                 setting: "set_harness",
+                 harness: "codex",
+                 model: "gpt-5.6-sol",
+                 effort: "medium"
+               }
+             })
+
+    assert message =~ "tightbeam onboard openai --as-user <userId>"
+
+    assert message =~
+             "Alternatively, claude is available on testhost; select it with claude-fable-5"
+  end
+
   # Acceptance 2: the gateway no longer needs a credential for a harness it does
   # not itself run. SATELLITE.md carried the opposite rule until this change.
   test "a harness with no GATEWAY credential still spawns on a satellite that has one", ctx do
@@ -8357,6 +8388,10 @@ defmodule Tightbeam.GatewayTest do
     # "adapter is degraded" checkout fault (that fault is kept in the record instead).
     assert reason =~ "tightbeam onboard anthropic --as-user <userId>"
     assert reason =~ "on testhost"
+
+    assert reason =~
+             "Alternatively, codex is available on testhost; select it with gpt-5.6-sol"
+
     refute reason =~ "is degraded"
 
     # RECORDS: the failed row and the lifecycle event, one transaction. The record keeps
@@ -8409,6 +8444,7 @@ defmodule Tightbeam.GatewayTest do
 
     assert marker, "a refused turn must speak its reason in chat"
     assert marker.content =~ "tightbeam onboard anthropic --as-user <userId>"
+    assert marker.content =~ "Alternatively, codex is available on testhost"
 
     # NEVER LAUNCHES A DEAD ENGINE: checkout failed pre-engine, so the session/prompt
     # stages never ran — no engine was asked to serve (belt-and-suspenders to the

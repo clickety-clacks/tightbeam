@@ -6396,7 +6396,7 @@ defmodule Tightbeam.Gateway do
         {:error,
          %{
            code: "needs_onboarding",
-           message: credential_remedy(reason, provider, machine)
+           message: credential_remedy(reason, provider, machine, harness)
          }}
     end
   end
@@ -6418,20 +6418,23 @@ defmodule Tightbeam.Gateway do
   # So the bespoke `:in_progress` remedy is DEFERRED to outcome 2, which owns that data; the
   # interim flatten still removes the old false "run onboard" (the r4.2 fix). This mirrors the
   # :prompt-401 deferral to Card 2 — defer the precise naming to the card that owns the signal.
-  defp credential_remedy(reason, provider, host) do
+  defp credential_remedy(reason, provider, host, unavailable_harness) do
     onboard = "Run on #{host}: tightbeam onboard #{provider} --as-user <userId>"
 
     case reason do
       :missing ->
         "Tightbeam has no credential for #{provider} on #{host}. It does not use or " <>
-          "import your normal CLI login; Tightbeam keeps its own. #{onboard}"
+          "import your normal CLI login; Tightbeam keeps its own. #{onboard}" <>
+          available_harness_alternative(host, unavailable_harness)
 
       :expired ->
-        "Tightbeam's credential for #{provider} on #{host} has expired. #{onboard}"
+        "Tightbeam's credential for #{provider} on #{host} has expired. " <>
+          onboard <> available_harness_alternative(host, unavailable_harness)
 
       :revoked ->
         "Tightbeam's credential for #{provider} on #{host} is no longer valid " <>
-          "(revoked, or rejected in flight). #{onboard}"
+          "(revoked, or rejected in flight). #{onboard}" <>
+          available_harness_alternative(host, unavailable_harness)
 
       :credential_server_unavailable ->
         "Tightbeam could not reach the credential server for #{provider} on #{host}. " <>
@@ -6447,6 +6450,25 @@ defmodule Tightbeam.Gateway do
         "Tightbeam cannot use the credential for #{provider} on #{host}: " <>
           "#{credential_reason_phrase(other)}."
     end
+  end
+
+  # The catalog is the routing truth. A fresh or stale non-empty inventory names a
+  # harness that can accept at least one of the exact model entries it advertises;
+  # an unavailable or empty inventory is never offered as a repair.
+  defp available_harness_alternative(host, unavailable_harness) do
+    Harness.all()
+    |> Enum.map(& &1.wire_name())
+    |> Enum.reject(&(&1 == unavailable_harness))
+    |> Enum.find_value("", fn harness ->
+      case ModelCatalog.get(host, harness, ModelCatalog) do
+        {[entry | _], health} when health in [:fresh, :stale] ->
+          " Alternatively, #{harness} is available on #{host}; select it with " <>
+            "#{ModelCatalog.describe_entry(entry)}."
+
+        _ ->
+          nil
+      end
+    end)
   end
 
   defp unsupported_credential_message(provider, host) do
@@ -6495,7 +6517,7 @@ defmodule Tightbeam.Gateway do
       {:unavailable, {:needs_onboarding, reason}} ->
         if affirmative_credential_reason?(reason) do
           provider = Harness.parse!(session.harness).credential_provider()
-          {:refused, credential_remedy(reason, provider, session.host)}
+          {:refused, credential_remedy(reason, provider, session.host, session.harness)}
         else
           :not_applicable
         end
