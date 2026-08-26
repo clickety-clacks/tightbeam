@@ -30,4 +30,8 @@ fn action_classifier_reserves_two_for_faults() {
     assert_eq!(classify(r#"{"tool_input":{}}"#), 2);
     assert_eq!(classify(r#"{"tool_input":{"command":"echo safe"}}"#), 1);
     assert_eq!(classify(r#"{"tool_input":{"command":"git stash"}}"#), 0);
+    assert_eq!(
+        classify(r#"{"tool_input":{"command":"bash --noprofile -c 'git stash'"}}"#),
+        0
+    );
 }
