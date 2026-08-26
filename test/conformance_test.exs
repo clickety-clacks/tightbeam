@@ -2365,7 +2365,7 @@ defmodule Tightbeam.ConformanceSupport do
               assert :ok =
                        Ledger.finish(db, wake_seq, "delivered", nil, owner_lease: owner_lease)
 
-              assert {:prodded, 1} =
+              assert :rebased =
                        Supervision.evaluate(
                          db,
                          handlers,
@@ -2375,7 +2375,16 @@ defmodule Tightbeam.ConformanceSupport do
                        )
 
               assert sweep_decision?(db, session_key, statute, "re-obligate")
-              assert Supervision.prod_state(db, call.params.assignment_id).prodCount == 1
+              assert Supervision.prod_state(db, call.params.assignment_id).prodCount == 0
+
+              assert {:ok, [["turn", source_id]]} =
+                       DB.query(
+                         db,
+                         "SELECT sourceKind,sourceId FROM supervision_liveness_receipts WHERE assignmentId=?1",
+                         [call.params.assignment_id]
+                       )
+
+              assert source_id == to_string(wake_seq)
 
             "resolve-allow-continues-without-consuming" ->
               {request_id, _park_wake_id} = open_and_park.()
@@ -2398,7 +2407,7 @@ defmodule Tightbeam.ConformanceSupport do
               assert :ok =
                        Ledger.finish(db, wake_seq, "delivered", nil, owner_lease: owner_lease)
 
-              assert {:prodded, 1} =
+              assert :rebased =
                        Supervision.evaluate(
                          db,
                          handlers,
@@ -2418,6 +2427,15 @@ defmodule Tightbeam.ConformanceSupport do
                        "later-sweep-statute",
                        "re-obligate"
                      )
+
+              assert {:ok, [["turn", source_id]]} =
+                       DB.query(
+                         db,
+                         "SELECT sourceKind,sourceId FROM supervision_liveness_receipts WHERE assignmentId=?1",
+                         [call.params.assignment_id]
+                       )
+
+              assert source_id == to_string(wake_seq)
 
             "park-legible" ->
               {_request_id, _park_wake_id} = open_and_park.()

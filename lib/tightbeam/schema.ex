@@ -72,7 +72,10 @@ defmodule Tightbeam.Schema do
   # than failing on the first return with a raw column/CHECK error.
   # The operational-parent port adds a required `sessions.operationalParent`
   # column. The v4 stamp is the one exact predecessor this build upgrades.
-  @shape "coordination-fabric-v1-phase1-v6"
+  # Turn-completion liveness widens a CHECK on the receipt ledger, so v6 is
+  # rebuilt transactionally rather than inferred from stored DDL.
+  @shape "coordination-fabric-v1-phase1-v7"
+  @turn_liveness_previous_shape "coordination-fabric-v1-phase1-v6"
   @previous_shape "coordination-fabric-v1-phase1-v5"
   @operational_parent_shape "coordination-fabric-v1-phase1-v5"
   @operational_parent_previous_shape "coordination-fabric-v1-phase1-v4"
@@ -457,7 +460,7 @@ defmodule Tightbeam.Schema do
         receiptId INTEGER PRIMARY KEY AUTOINCREMENT,
         assignmentId TEXT NOT NULL REFERENCES assignments(id),
         sourceKind TEXT NOT NULL CHECK (sourceKind IN (
-          'artifact','work_item_update','verdict','checkpoint'
+          'artifact','work_item_update','verdict','checkpoint','turn'
         )),
         sourceId TEXT NOT NULL,
         sourceAt INTEGER NOT NULL CHECK (sourceAt >= 0),
@@ -771,9 +774,9 @@ defmodule Tightbeam.Schema do
   So the shape is STAMPED at creation and CHECKED here, per the house rule: a
   missing or unknown stamp is a refusal and a bug report, never an inference.
   Note the direction — the one existence question below is asked to REFUSE,
-  never to deduce a shape and accommodate it. The sole accepted predecessor is
-  named by `@previous_shape`; its operational-parent upgrade is exact and
-  transactional. No shape is inferred from stored DDL.
+  never to deduce a shape and accommodate it. Every accepted predecessor is
+  named above, and each upgrade is exact and transactional. No shape is
+  inferred from stored DDL.
   """
   @spec ensure_all(DB.server()) :: :ok
   def ensure_all(db) do
@@ -939,7 +942,7 @@ defmodule Tightbeam.Schema do
            Txn.q(
              txn,
              "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1",
-             [@previous_shape, @shape, migration_time]
+             [@previous_shape, @turn_liveness_previous_shape, migration_time]
            )
 
            if Txn.changes(txn) != 1, do: raise("cold-start stamp race")
@@ -1014,6 +1017,146 @@ defmodule Tightbeam.Schema do
     raise ShapeError,
       message:
         "incompatible_cold_start_v1: #{invariant}; recovery: Recover an unusable fresh database"
+  end
+
+  @doc false
+  @spec upgrade_turn_liveness_v1(DB.server(), keyword()) :: :ok
+  def upgrade_turn_liveness_v1(db, opts \\ []) when is_list(opts) do
+    migration_time = System.system_time(:millisecond)
+
+    case DB.foreign_key_rebuild(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@turn_liveness_previous_shape]] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message: "incompatible_turn_liveness_v1: predecessor stamp #{inspect(rows)}"
+           end
+
+           :ok =
+             Txn.exec(
+               txn,
+               """
+               CREATE TABLE supervision_liveness_receipts_turn_v1 (
+                 receiptId INTEGER PRIMARY KEY AUTOINCREMENT,
+                 assignmentId TEXT NOT NULL REFERENCES assignments(id),
+                 sourceKind TEXT NOT NULL CHECK (sourceKind IN (
+                   'artifact','work_item_update','verdict','checkpoint','turn'
+                 )),
+                 sourceId TEXT NOT NULL,
+                 sourceAt INTEGER NOT NULL CHECK (sourceAt >= 0),
+                 acceptedAt INTEGER NOT NULL CHECK (acceptedAt >= 0),
+                 generation INTEGER NOT NULL CHECK (generation > 0),
+                 expiresAt INTEGER CHECK (expiresAt >= 0),
+                 UNIQUE (assignmentId, sourceKind, sourceId),
+                 CHECK (
+                   (sourceKind = 'checkpoint' AND expiresAt > acceptedAt)
+                   OR
+                   (sourceKind != 'checkpoint' AND expiresAt IS NULL)
+                 )
+               )
+               """
+             )
+
+           Txn.q(
+             txn,
+             """
+             INSERT INTO supervision_liveness_receipts_turn_v1
+               (receiptId,assignmentId,sourceKind,sourceId,sourceAt,acceptedAt,generation,expiresAt)
+             SELECT receiptId,assignmentId,sourceKind,sourceId,sourceAt,acceptedAt,generation,expiresAt
+             FROM supervision_liveness_receipts
+             ORDER BY receiptId
+             """
+           )
+
+           maybe_interrupt_turn_liveness_migration!(opts, :after_copy)
+           :ok = Txn.exec(txn, "DROP TABLE supervision_liveness_receipts")
+           maybe_interrupt_turn_liveness_migration!(opts, :after_drop)
+
+           :ok =
+             Txn.exec(
+               txn,
+               """
+               CREATE TABLE supervision_liveness_receipts (
+                 receiptId INTEGER PRIMARY KEY AUTOINCREMENT,
+                 assignmentId TEXT NOT NULL REFERENCES assignments(id),
+                 sourceKind TEXT NOT NULL CHECK (sourceKind IN (
+                   'artifact','work_item_update','verdict','checkpoint','turn'
+                 )),
+                 sourceId TEXT NOT NULL,
+                 sourceAt INTEGER NOT NULL CHECK (sourceAt >= 0),
+                 acceptedAt INTEGER NOT NULL CHECK (acceptedAt >= 0),
+                 generation INTEGER NOT NULL CHECK (generation > 0),
+                 expiresAt INTEGER CHECK (expiresAt >= 0),
+                 UNIQUE (assignmentId, sourceKind, sourceId),
+                 CHECK (
+                   (sourceKind = 'checkpoint' AND expiresAt > acceptedAt)
+                   OR
+                   (sourceKind != 'checkpoint' AND expiresAt IS NULL)
+                 )
+               )
+               """
+             )
+
+           Txn.q(
+             txn,
+             """
+             INSERT INTO supervision_liveness_receipts
+               (receiptId,assignmentId,sourceKind,sourceId,sourceAt,acceptedAt,generation,expiresAt)
+             SELECT receiptId,assignmentId,sourceKind,sourceId,sourceAt,acceptedAt,generation,expiresAt
+             FROM supervision_liveness_receipts_turn_v1
+             ORDER BY receiptId
+             """
+           )
+
+           :ok = Txn.exec(txn, "DROP TABLE supervision_liveness_receipts_turn_v1")
+
+           :ok =
+             Txn.exec(
+               txn,
+               "CREATE INDEX supervision_liveness_receipts_assignment ON supervision_liveness_receipts(assignmentId, receiptId)"
+             )
+
+           maybe_interrupt_turn_liveness_migration!(opts, :after_schema)
+
+           Txn.q(
+             txn,
+             "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1",
+             [@turn_liveness_previous_shape, @shape, migration_time]
+           )
+
+           if Txn.changes(txn) != 1,
+             do: raise(ShapeError, message: "incompatible_turn_liveness_v1: stamp race")
+
+           maybe_interrupt_turn_liveness_migration!(opts, :after_stamp)
+
+           case Txn.q(txn, "PRAGMA foreign_key_check") do
+             [] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message: "incompatible_turn_liveness_v1: orphan row #{inspect(rows)}"
+           end
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message: "incompatible_turn_liveness_v1: upgrade failed: #{Exception.message(error)}"
+    end
+  end
+
+  defp maybe_interrupt_turn_liveness_migration!(opts, point) do
+    if Keyword.get(opts, :fail_at) == point,
+      do: raise("forced turn-liveness migration interruption")
+
+    :ok
   end
 
   @doc false
@@ -1168,12 +1311,17 @@ defmodule Tightbeam.Schema do
       {:ok, [[@shape]]} ->
         :ok
 
+      {:ok, [[@turn_liveness_previous_shape]]} ->
+        upgrade_turn_liveness_v1(db)
+
       {:ok, [[@previous_shape]]} ->
-        upgrade_cold_start_v1(db)
+        :ok = upgrade_cold_start_v1(db)
+        upgrade_turn_liveness_v1(db)
 
       {:ok, [[@operational_parent_previous_shape]]} ->
         :ok = upgrade_operational_parent_v1(db)
-        upgrade_cold_start_v1(db)
+        :ok = upgrade_cold_start_v1(db)
+        upgrade_turn_liveness_v1(db)
 
       {:ok, []} ->
         # No stamp. Either a database this build is about to create, or one
@@ -1190,7 +1338,8 @@ defmodule Tightbeam.Schema do
           this build: #{@shape}
 
         There is no migration from #{found}. The only supported upgrade sources
-        are #{@operational_parent_previous_shape} and #{@previous_shape}. Move this
+        are #{@operational_parent_previous_shape}, #{@previous_shape}, and
+        #{@turn_liveness_previous_shape}. Move this
         database aside and let it be recreated.
         """
 

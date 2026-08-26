@@ -17,7 +17,7 @@ defmodule Tightbeam.Ledger do
   - No automatic retries: `failed_unknown` is terminal; nothing here re-sends.
   """
 
-  alias Tightbeam.{DB, TurnLifecycle}
+  alias Tightbeam.{DB, Supervision, TurnLifecycle}
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.Publisher
 
@@ -469,6 +469,7 @@ defmodule Tightbeam.Ledger do
         terminal_event(seq, terminal, opts) |> Map.put(:at, now)
       )
 
+      :ok = Supervision.record_turn_receipt_in_txn(txn, seq)
       Publisher.turn_in_txn(txn, "turn.ended", seq)
     end
 
@@ -547,6 +548,8 @@ defmodule Tightbeam.Ledger do
               principal: "process:tightbeam"
             })
           )
+
+          :ok = Supervision.record_turn_receipt_in_txn(txn, seq)
         end)
 
         Enum.each(seqs, &Publisher.turn_in_txn(txn, "turn.ended", &1))

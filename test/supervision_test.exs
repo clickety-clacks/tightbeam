@@ -493,6 +493,121 @@ defmodule Tightbeam.SupervisionTest do
   # These cases drive explicit durable rows or synchronous process barriers. They
   # deliberately do not sleep, poll, widen a timeout, or infer a deadline from the
   # wall clock.
+  test "terminal assignment turns write one atomic receipt for every lifecycle outcome", ctx do
+    insert_entitlement!(ctx.db, "asg_1", generation: 7, due_at: 0)
+
+    outcomes = [
+      {"delivered", nil},
+      {"failed", "provider blocked: credentials unavailable"},
+      {"canceled", "interrupted by operator"}
+    ]
+
+    seqs =
+      Enum.map(outcomes, fn {terminal, error} ->
+        {seq, owner_lease} = claim_assigned_turn!(ctx.db, "holder", "asg_1")
+
+        assert :ok = Ledger.finish(ctx.db, seq, terminal, error, owner_lease: owner_lease)
+
+        assert :already_terminal =
+                 Ledger.finish(ctx.db, seq, "failed", "replay", owner_lease: owner_lease)
+
+        seq
+      end)
+
+    {recovery_seq, _owner_lease} = claim_assigned_turn!(ctx.db, "holder", "asg_1")
+    assert [^recovery_seq] = Ledger.recover_running(ctx.db)
+    assert [] = Ledger.recover_running(ctx.db)
+
+    expected_ids = Enum.map(seqs ++ [recovery_seq], &to_string/1)
+
+    assert {:ok, rows} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT r.sourceKind,r.sourceId,r.generation,r.sourceAt,r.acceptedAt,t.status
+               FROM supervision_liveness_receipts r
+               JOIN turns t ON CAST(t.seq AS TEXT)=r.sourceId
+               WHERE r.assignmentId='asg_1'
+               ORDER BY r.receiptId
+               """
+             )
+
+    assert Enum.map(rows, &Enum.at(&1, 1)) == expected_ids
+    assert Enum.map(rows, &Enum.at(&1, 5)) == ~w(delivered failed canceled failed_unknown)
+
+    assert Enum.all?(rows, fn ["turn", _id, 8, source_at, accepted_at, _status] ->
+             is_integer(source_at) and source_at == accepted_at
+           end)
+  end
+
+  test "turn terminalization and its receipt commit or roll back together", ctx do
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
+    {seq, owner_lease} = claim_assigned_turn!(ctx.db, "holder", "asg_1")
+
+    assert {:error, %RuntimeError{message: "forced rollback"}} =
+             DB.transaction(ctx.db, fn txn ->
+               assert Ledger.finish_in_txn(txn, seq, "delivered", nil, owner_lease: owner_lease)
+
+               raise "forced rollback"
+             end)
+
+    assert {:ok, [["running"]]} = DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [seq])
+    assert {:ok, []} = DB.query(ctx.db, "SELECT receiptId FROM supervision_liveness_receipts")
+
+    assert :ok = Ledger.finish(ctx.db, seq, "delivered", nil, owner_lease: owner_lease)
+
+    assert {:ok, [["delivered", "turn", source_id]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT t.status,r.sourceKind,r.sourceId
+               FROM turns t
+               JOIN supervision_liveness_receipts r ON r.sourceId=CAST(t.seq AS TEXT)
+               WHERE t.seq=?1
+               """,
+               [seq]
+             )
+
+    assert source_id == to_string(seq)
+  end
+
+  test "the window-free stall query requires no receipt, pending wake, or active turn", ctx do
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
+
+    assert Supervision.stalled_assignment_ids(ctx.db, System.system_time(:millisecond)) == [
+             "asg_1"
+           ]
+
+    wake =
+      Wakes.schedule(ctx.db, %{
+        session_key: "holder",
+        origin: "session:holder",
+        creator_session_key: "holder",
+        prompt: "continue later",
+        due_at: System.system_time(:millisecond) + 60_000,
+        assignment_id: "asg_1"
+      })
+
+    assert Supervision.stalled_assignment_ids(ctx.db, System.system_time(:millisecond)) == []
+    cancel_wake!(ctx.db, wake)
+
+    {seq, owner_lease} = claim_assigned_turn!(ctx.db, "holder", "asg_1")
+    assert Supervision.stalled_assignment_ids(ctx.db, System.system_time(:millisecond)) == []
+
+    assert :ok = Ledger.finish(ctx.db, seq, "delivered", nil, owner_lease: owner_lease)
+
+    # No artifact, verdict, work-item update, or checkpoint exists. The terminal
+    # turn itself is the durable fact that prevents the historical false stall.
+    assert {:ok, [["turn", source_id, 2]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sourceKind,sourceId,generation FROM supervision_liveness_receipts"
+             )
+
+    assert source_id == to_string(seq)
+    assert Supervision.stalled_assignment_ids(ctx.db, System.system_time(:millisecond)) == []
+  end
+
   test "a verdict is a typed fact receipt and resets the ladder once", ctx do
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
     seq1 = terminal!(ctx.db, "holder")
@@ -612,9 +727,7 @@ defmodule Tightbeam.SupervisionTest do
     {:ok, _} =
       DB.query(ctx.db, "UPDATE supervision_entitlements SET dueAt=0 WHERE assignmentId='asg_1'")
 
-    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq2)
-    prod = Enum.find(Wakes.list_pending(ctx.db), &(&1.origin == "process:tightbeam"))
-    cancel_wake!(ctx.db, prod)
+    assert :rebased = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq2)
 
     insert_artifact!(ctx.db, "art_checkpoint_reset", "holder", "wi_checkpoint", now + 1)
     seq3 = terminal!(ctx.db, "holder")
@@ -627,8 +740,11 @@ defmodule Tightbeam.SupervisionTest do
 
     assert {:ok,
             [
+              ["turn", first_turn],
               ["checkpoint", first_id],
+              ["turn", second_turn],
               ["artifact", "art_checkpoint_reset"],
+              ["turn", third_turn],
               ["checkpoint", third_id]
             ]} =
              DB.query(
@@ -639,6 +755,9 @@ defmodule Tightbeam.SupervisionTest do
     assert first_id == first.wake_id
     assert third_id == third.wake_id
     refute second.wake_id in [first_id, third_id]
+    assert first_turn == to_string(seq1)
+    assert second_turn == to_string(seq2)
+    assert third_turn == to_string(seq4)
   end
 
   test "vague progress and unbound, unrelated, or expired wakes are not receipts", ctx do
@@ -1881,7 +2000,7 @@ defmodule Tightbeam.SupervisionTest do
     assert Ledger.pending_count(ctx.db, "holder") == 0
   end
 
-  test "supervision wake is fired in the enqueue transaction before its provoked terminal", ctx do
+  test "a fired supervision wake terminal rebases before another prod can issue", ctx do
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
     seq = terminal!(ctx.db, "holder")
     assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq)
@@ -1925,10 +2044,17 @@ defmodule Tightbeam.SupervisionTest do
       )
 
     assert :ok = Wakes.fire_due(scheduler)
-    assert_receive {:race_result, "fired", {:prodded, 2}}
+    assert_receive {:race_result, "fired", :rebased}
     assert Wakes.get(ctx.db, originating.wake_id).state == "fired"
-    assert [%{prompt: next_prompt}] = Wakes.list_pending(ctx.db)
-    assert next_prompt =~ "prod 2 of 2"
+    assert Wakes.list_pending(ctx.db) == []
+
+    assert {:ok, [["turn", source_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sourceKind,sourceId FROM supervision_liveness_receipts"
+             )
+
+    assert source_id == to_string(Ledger.last_terminal_seq(ctx.db, "holder"))
   end
 
   test "external direct wake keeps deliver-then-mark ordering", ctx do
@@ -1967,7 +2093,7 @@ defmodule Tightbeam.SupervisionTest do
     assert Wakes.get(ctx.db, external.wake_id).state == "fired"
   end
 
-  test "repeated synchronous delivery racer advances every prod and quiesces only at Main terminus",
+  test "a synchronous delivery racer rebases on its terminal instead of issuing the next prod",
        ctx do
     n = 12
     assignment(ctx.db, "asg_main", ctx.main.session_key, "main work", 2)
@@ -2013,24 +2139,16 @@ defmodule Tightbeam.SupervisionTest do
          name: :repeated_race_scheduler}
       )
 
-    for iteration <- 1..n do
-      assert :ok = Wakes.fire_due(scheduler)
-      assert_receive {:iteration_result, wake_id, "fired", result}
-      assert Wakes.get(ctx.db, wake_id).state == "fired"
-
-      if iteration < n do
-        assert result == {:prodded, iteration + 1}
-      else
-        assert result == :terminus
-      end
-    end
+    assert :ok = Wakes.fire_due(scheduler)
+    assert_receive {:iteration_result, wake_id, "fired", :rebased}
+    assert Wakes.get(ctx.db, wake_id).state == "fired"
 
     assert Wakes.pending_count(ctx.db, ctx.main.session_key) == 0
     assert Ledger.pending_count(ctx.db, ctx.main.session_key) == 0
     assert %{pendingBranch: nil} = Supervision.watermark(ctx.db, ctx.main.session_key)
 
     assert Enum.count(EventLog.lifecycle_events(ctx.db), &(&1.kind == "supervision_terminus")) ==
-             1
+             0
   end
 
   test "delivered prod and escalation prompts match the stamped templates byte for byte", ctx do
@@ -3226,6 +3344,24 @@ defmodule Tightbeam.SupervisionTest do
 
     assert :ok = Ledger.finish(db, seq, "delivered", nil, owner_lease: owner_lease)
     seq
+  end
+
+  defp claim_assigned_turn!(db, session_key, assignment_id) do
+    message_id = "assigned_#{System.unique_integer([:positive])}"
+
+    {:ok, seq} =
+      Ledger.enqueue(db, %{
+        session_key: session_key,
+        message_id: message_id,
+        origin: "user:flynn",
+        prompt: "assignment work",
+        assignment_id: assignment_id
+      })
+
+    assert {:ok, %{seq: ^seq, owner_lease: owner_lease}} =
+             Ledger.claim_next(db, session_key, "test")
+
+    {seq, owner_lease}
   end
 
   defp schedule_checkpoint_via_gateway!(ctx, prompt, after_ms) do

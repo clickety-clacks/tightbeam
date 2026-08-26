@@ -33,6 +33,7 @@ defmodule Tightbeam.SchemaShapeTest do
   use Tightbeam.TestCase, async: false
 
   alias Tightbeam.{DB, Model, Org, Schema}
+  alias Tightbeam.DB.Txn
 
   setup do
     name = :"schema_shape_#{System.unique_integer([:positive])}"
@@ -43,13 +44,13 @@ defmodule Tightbeam.SchemaShapeTest do
   test "a fresh database is created and stamped", %{db: db} do
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v6"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v7"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     # Idempotent: booting twice is the ordinary case, not a shape change.
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v6"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v7"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
   end
 
@@ -99,6 +100,92 @@ defmodule Tightbeam.SchemaShapeTest do
 
     assert {:ok, [[1, ^activated_at]]} =
              DB.query(db, "SELECT COUNT(*),MIN(activatedAt) FROM supervision_liveness_epoch")
+  end
+
+  test "the v6 turn-receipt migration preserves prior sources and is restart-idempotent", %{
+    db: db
+  } do
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:paired, _device} =
+             claim_org(db, %{
+               device_id: "turn-receipt-device",
+               claimed_name: "Flynn",
+               platform: nil,
+               model: nil
+             })
+
+    holder = Org.get(db, Org.personal_session_key("flynn"))
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO assignments (id,subject,holderKey,openedByUser,openedAt) VALUES ('asg_turn_migration','migrate receipts',?1,'flynn',1)",
+        [holder.session_key]
+      )
+
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO supervision_liveness_receipts
+          (assignmentId,sourceKind,sourceId,sourceAt,acceptedAt,generation,expiresAt)
+        VALUES
+          ('asg_turn_migration','artifact','art_before',2,3,1,NULL),
+          ('asg_turn_migration','work_item_update','11',3,4,1,NULL),
+          ('asg_turn_migration','verdict','att_before',4,5,1,NULL),
+          ('asg_turn_migration','checkpoint','wake_before',5,6,1,7)
+        """
+      )
+
+    downgrade_turn_receipts_to_v6!(db)
+
+    assert :ok = Schema.ensure_all(db)
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:ok, [["coordination-fabric-v1-phase1-v7"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok,
+            [
+              [1, "artifact", "art_before"],
+              [2, "work_item_update", "11"],
+              [3, "verdict", "att_before"],
+              [4, "checkpoint", "wake_before"]
+            ]} =
+             DB.query(
+               db,
+               "SELECT receiptId,sourceKind,sourceId FROM supervision_liveness_receipts ORDER BY receiptId"
+             )
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "INSERT INTO supervision_liveness_receipts (assignmentId,sourceKind,sourceId,sourceAt,acceptedAt,generation) VALUES ('asg_turn_migration','turn','7',4,4,2)"
+             )
+  end
+
+  test "each interrupted v6 turn-receipt migration rolls back and retries exactly", _ctx do
+    for point <- [:after_copy, :after_drop, :after_schema, :after_stamp] do
+      db = :"turn_receipt_migration_#{point}_#{System.unique_integer([:positive])}"
+      start_supervised!({DB, path: ":memory:", name: db}, id: db)
+      assert :ok = Schema.ensure_all(db)
+      downgrade_turn_receipts_to_v6!(db)
+
+      assert_raise Schema.ShapeError, fn ->
+        Schema.upgrade_turn_liveness_v1(db, fail_at: point)
+      end
+
+      assert {:ok, [["coordination-fabric-v1-phase1-v6"]]} =
+               DB.query(db, "SELECT shape FROM schema_stamp")
+
+      refute table?(db, "supervision_liveness_receipts_turn_v1")
+      assert :ok = Schema.ensure_all(db)
+      assert :ok = Schema.ensure_all(db)
+
+      assert {:ok, [["coordination-fabric-v1-phase1-v7"]]} =
+               DB.query(db, "SELECT shape FROM schema_stamp")
+    end
   end
 
   test "a malformed additive object refuses without partial activation", %{db: db} do
@@ -232,7 +319,7 @@ defmodule Tightbeam.SchemaShapeTest do
     assert {:ok, ^before_rows} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
     assert {:ok, []} = DB.query(db, "SELECT wakeId FROM wake_cancellations")
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v6"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v7"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
   end
 
@@ -269,7 +356,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v6"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v7"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert {:ok,
@@ -408,7 +495,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "some-later-shape"
-    assert error.message =~ "coordination-fabric-v1-phase1-v6"
+    assert error.message =~ "coordination-fabric-v1-phase1-v7"
   end
 
   # Sol xhigh review round 2, finding 2 (wave 1): `classElection`'s CHECK
@@ -470,7 +557,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-classes-v1"
-    assert error.message =~ "coordination-fabric-v1-phase1-v6"
+    assert error.message =~ "coordination-fabric-v1-phase1-v7"
     assert error.message =~ "no migration"
 
     # It REFUSED — it did not repair or widen the constraint in place.
@@ -590,7 +677,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-v1-phase1"
-    assert error.message =~ "coordination-fabric-v1-phase1-v6"
+    assert error.message =~ "coordination-fabric-v1-phase1-v7"
     assert error.message =~ "no migration"
 
     # It REFUSED — it did not repair or relax the constraint in place.
@@ -661,7 +748,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-classes-v2"
-    assert error.message =~ "coordination-fabric-v1-phase1-v6"
+    assert error.message =~ "coordination-fabric-v1-phase1-v7"
     assert error.message =~ "no migration"
 
     # It REFUSED — the merged build's decision_requests columns were never
@@ -774,7 +861,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-v1-phase1-v2"
-    assert error.message =~ "coordination-fabric-v1-phase1-v6"
+    assert error.message =~ "coordination-fabric-v1-phase1-v7"
     assert error.message =~ "no migration"
 
     # It REFUSED — the merged build's wakes class/delivery columns were never
@@ -813,7 +900,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-v1-phase1-v3"
-    assert error.message =~ "coordination-fabric-v1-phase1-v6"
+    assert error.message =~ "coordination-fabric-v1-phase1-v7"
     assert error.message =~ "no migration"
 
     assert {:ok, [[ddl]]} =
@@ -854,6 +941,69 @@ defmodule Tightbeam.SchemaShapeTest do
         db,
         "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v4', stampedAt=1"
       )
+
+    :ok
+  end
+
+  defp downgrade_turn_receipts_to_v6!(db) do
+    assert {:ok, :ok} =
+             DB.foreign_key_rebuild(db, fn txn ->
+               :ok =
+                 Txn.exec(
+                   txn,
+                   """
+                   CREATE TABLE supervision_liveness_receipts_v6 (
+                     receiptId INTEGER PRIMARY KEY AUTOINCREMENT,
+                     assignmentId TEXT NOT NULL REFERENCES assignments(id),
+                     sourceKind TEXT NOT NULL CHECK (sourceKind IN (
+                       'artifact','work_item_update','verdict','checkpoint'
+                     )),
+                     sourceId TEXT NOT NULL,
+                     sourceAt INTEGER NOT NULL CHECK (sourceAt >= 0),
+                     acceptedAt INTEGER NOT NULL CHECK (acceptedAt >= 0),
+                     generation INTEGER NOT NULL CHECK (generation > 0),
+                     expiresAt INTEGER CHECK (expiresAt >= 0),
+                     UNIQUE (assignmentId, sourceKind, sourceId),
+                     CHECK (
+                       (sourceKind = 'checkpoint' AND expiresAt > acceptedAt)
+                       OR
+                       (sourceKind != 'checkpoint' AND expiresAt IS NULL)
+                     )
+                   )
+                   """
+                 )
+
+               Txn.q(
+                 txn,
+                 """
+                 INSERT INTO supervision_liveness_receipts_v6
+                   (receiptId,assignmentId,sourceKind,sourceId,sourceAt,acceptedAt,generation,expiresAt)
+                 SELECT receiptId,assignmentId,sourceKind,sourceId,sourceAt,acceptedAt,generation,expiresAt
+                 FROM supervision_liveness_receipts ORDER BY receiptId
+                 """
+               )
+
+               :ok = Txn.exec(txn, "DROP TABLE supervision_liveness_receipts")
+
+               :ok =
+                 Txn.exec(
+                   txn,
+                   "ALTER TABLE supervision_liveness_receipts_v6 RENAME TO supervision_liveness_receipts"
+                 )
+
+               :ok =
+                 Txn.exec(
+                   txn,
+                   "CREATE INDEX supervision_liveness_receipts_assignment ON supervision_liveness_receipts(assignmentId, receiptId)"
+                 )
+
+               Txn.q(
+                 txn,
+                 "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v6',stampedAt=1"
+               )
+
+               :ok
+             end)
 
     :ok
   end

@@ -235,7 +235,7 @@ defmodule Tightbeam.AssignmentsTest do
              Assignments.__handle__(ctx.db, "assign", raw_call)
   end
 
-  test "same-assignment public cancellation and progress do not re-drive a forced due entitlement",
+  test "a terminal turn re-drives once while public cancellation and progress do not",
        ctx do
     assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "liveness re-drive"))
 
@@ -296,20 +296,26 @@ defmodule Tightbeam.AssignmentsTest do
     sweep_liveness!(liveness)
 
     assert %{
-             supervisionGeneration: 1,
-             supervisionBasisKind: "assignment_open",
-             supervisionBasisId: assignment_id
+             supervisionGeneration: 2,
+             supervisionBasisKind: "liveness_receipt",
+             supervisionBasisId: receipt_id
            } = Supervision.prod_state(ctx.db, assignment.id)
 
-    assert assignment_id == assignment.id
+    assert {:ok, [[^receipt_id, "turn", source_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT CAST(receiptId AS TEXT),sourceKind,sourceId FROM supervision_liveness_receipts"
+             )
+
+    assert source_id == to_string(turn_seq)
 
     _second = handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "progress"))
     sweep_liveness!(liveness)
 
     assert %{
-             supervisionGeneration: 1,
-             supervisionBasisKind: "assignment_open",
-             supervisionBasisId: ^assignment_id
+             supervisionGeneration: 2,
+             supervisionBasisKind: "liveness_receipt",
+             supervisionBasisId: ^receipt_id
            } = Supervision.prod_state(ctx.db, assignment.id)
 
     assert {:ok, _} =

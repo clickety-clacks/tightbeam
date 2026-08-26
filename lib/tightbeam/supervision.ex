@@ -79,6 +79,47 @@ defmodule Tightbeam.Supervision do
   @spec request_sweep(GenServer.server()) :: :ok
   def request_sweep(server \\ __MODULE__), do: GenServer.cast(server, :sweep)
 
+  @doc false
+  @spec record_turn_receipt_in_txn(Txn.t(), integer()) :: :ok
+  def record_turn_receipt_in_txn(%Txn{} = txn, seq) when is_integer(seq) do
+    case Txn.q(txn, "SELECT assignmentId FROM turns WHERE seq=?1", [seq]) do
+      [[nil]] ->
+        :ok
+
+      [[_assignment_id]] ->
+        Txn.q(
+          txn,
+          """
+          INSERT INTO supervision_liveness_receipts
+            (assignmentId,sourceKind,sourceId,sourceAt,acceptedAt,generation,expiresAt)
+          SELECT t.assignmentId,'turn',CAST(t.seq AS TEXT),t.endedAt,t.endedAt,e.generation+1,NULL
+          FROM turns t
+          JOIN assignments a ON a.id=t.assignmentId
+          JOIN supervision_entitlements e ON e.assignmentId=a.id
+          WHERE t.seq=?1 AND t.startedAt IS NOT NULL AND t.endedAt IS NOT NULL
+            AND t.status IN ('delivered','canceled','failed','failed_unknown')
+            AND a.state='open' AND a.holderKey=t.sessionKey
+            AND e.state IN ('armed','claimed')
+          ON CONFLICT(assignmentId,sourceKind,sourceId) DO NOTHING
+          """,
+          [seq]
+        )
+    end
+
+    :ok
+  end
+
+  @doc false
+  @spec stalled_assignment_ids(DB.server(), non_neg_integer()) :: [String.t()]
+  def stalled_assignment_ids(db, evaluation_clock)
+      when is_integer(evaluation_clock) and evaluation_clock >= 0 do
+    transaction!(db, fn txn ->
+      txn
+      |> stalled_assignment_rows_in_txn(evaluation_clock)
+      |> Enum.map(&hd/1)
+    end)
+  end
+
   @spec ensure_schema(DB.server()) :: :ok
   def ensure_schema(db \\ DB) do
     :ok = DB.execute(db, @prods_ddl)
@@ -2451,6 +2492,8 @@ defmodule Tightbeam.Supervision do
         verdict_receipts_in_txn(txn, assignment_id, attest_cursor, attest_max) ++
         work_item_receipts_in_txn(txn, work_item_id, event_cursor, event_max)
 
+    turn_receipts = turn_receipts_in_txn(txn, assignment_id, generation)
+
     checkpoint =
       checkpoint_receipt_in_txn(
         txn,
@@ -2472,7 +2515,7 @@ defmodule Tightbeam.Supervision do
       [assignment_id, artifact_max, attest_max, event_max, wake_max]
     )
 
-    receipts = if effects == [], do: List.wrap(checkpoint), else: effects
+    receipts = effects ++ turn_receipts ++ if(effects == [], do: List.wrap(checkpoint), else: [])
 
     case receipts do
       [] ->
@@ -2482,23 +2525,27 @@ defmodule Tightbeam.Supervision do
         next_generation = generation + 1
         accepted_at = evaluation_clock
 
-        Enum.each(rows, fn %{kind: kind, id: id, at: source_at, expires_at: expires_at} ->
-          Txn.q(
-            txn,
-            """
-            INSERT INTO supervision_liveness_receipts
-              (assignmentId, sourceKind, sourceId, sourceAt, acceptedAt, generation, expiresAt)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-            """,
-            [assignment_id, kind, id, source_at, accepted_at, next_generation, expires_at]
-          )
+        Enum.each(rows, fn
+          %{persisted: true} ->
+            :ok
+
+          %{kind: kind, id: id, at: source_at, expires_at: expires_at} ->
+            Txn.q(
+              txn,
+              """
+              INSERT INTO supervision_liveness_receipts
+                (assignmentId, sourceKind, sourceId, sourceAt, acceptedAt, generation, expiresAt)
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+              """,
+              [assignment_id, kind, id, source_at, accepted_at, next_generation, expires_at]
+            )
         end)
 
         [[basis_id]] =
           Txn.q(
             txn,
-            "SELECT MAX(receiptId) FROM supervision_liveness_receipts WHERE assignmentId=?1",
-            [assignment_id]
+            "SELECT MAX(receiptId) FROM supervision_liveness_receipts WHERE assignmentId=?1 AND generation=?2",
+            [assignment_id, next_generation]
           )
 
         [[attest_count]] =
@@ -2638,6 +2685,28 @@ defmodule Tightbeam.Supervision do
     end)
   end
 
+  defp turn_receipts_in_txn(txn, assignment_id, generation) do
+    Txn.q(
+      txn,
+      """
+      SELECT sourceId,sourceAt
+      FROM supervision_liveness_receipts
+      WHERE assignmentId=?1 AND sourceKind='turn' AND generation=?2
+      ORDER BY receiptId
+      """,
+      [assignment_id, generation + 1]
+    )
+    |> Enum.map(fn [id, at] ->
+      %{
+        kind: "turn",
+        id: id,
+        at: at,
+        expires_at: nil,
+        persisted: true
+      }
+    end)
+  end
+
   defp checkpoint_receipt_in_txn(
          _txn,
          _assignment_id,
@@ -2664,7 +2733,8 @@ defmodule Tightbeam.Supervision do
              txn,
              """
              SELECT sourceKind FROM supervision_liveness_receipts
-             WHERE assignmentId=?1 ORDER BY receiptId DESC LIMIT 1
+             WHERE assignmentId=?1 AND sourceKind!='turn'
+             ORDER BY receiptId DESC LIMIT 1
              """,
              [assignment_id]
            ) do
@@ -2700,31 +2770,19 @@ defmodule Tightbeam.Supervision do
     end
   end
 
-  defp receipt_due_at([%{kind: "checkpoint", expires_at: due_at}], _accepted_at, _interval),
-    do: due_at
-
   defp receipt_due_at(rows, accepted_at, interval) do
-    latest_source = rows |> Enum.map(& &1.at) |> Enum.max()
-    max(accepted_at, latest_source) + interval
+    case Enum.find(rows, &(&1.kind == "checkpoint")) do
+      %{expires_at: due_at} ->
+        due_at
+
+      nil ->
+        latest_source = rows |> Enum.map(& &1.at) |> Enum.max()
+        max(accepted_at, latest_source) + interval
+    end
   end
 
   defp claim_due_in_txn(txn, evaluation_clock, rebased, n) do
-    candidates =
-      Txn.q(
-        txn,
-        """
-        SELECT e.assignmentId, e.generation, e.dueAt, e.lastAttemptGeneration,
-               e.supervisionIntervalMs, e.basisKind, e.basisId,
-               a.subject, a.holderKey
-        FROM supervision_entitlements e
-        JOIN assignments a ON a.id=e.assignmentId
-        JOIN sessions s ON s.sessionKey=a.holderKey
-        WHERE e.state='armed' AND e.dueAt <= ?1
-          AND a.state='open' AND s.state='active'
-        ORDER BY e.dueAt, a.openedAt, a.id
-        """,
-        [evaluation_clock]
-      )
+    candidates = stalled_assignment_rows_in_txn(txn, evaluation_clock)
 
     Enum.reduce_while(candidates, :not_due, fn
       [
@@ -2742,9 +2800,6 @@ defmodule Tightbeam.Supervision do
         cond do
           MapSet.member?(rebased, assignment_id) ->
             {:cont, :not_due}
-
-          due_gate?(txn, assignment_id, holder) ->
-            {:cont, :deferred}
 
           true ->
             case last_terminal_in_txn(txn, holder) do
@@ -2800,6 +2855,47 @@ defmodule Tightbeam.Supervision do
             end
         end
     end)
+  end
+
+  defp stalled_assignment_rows_in_txn(txn, evaluation_clock) do
+    Txn.q(
+      txn,
+      """
+      SELECT e.assignmentId, e.generation, e.dueAt, e.lastAttemptGeneration,
+             e.supervisionIntervalMs, e.basisKind, e.basisId,
+             a.subject, a.holderKey
+      FROM supervision_entitlements e
+      JOIN assignments a ON a.id=e.assignmentId
+      JOIN sessions s ON s.sessionKey=a.holderKey
+      WHERE e.state='armed' AND e.dueAt <= ?1
+        AND a.state='open' AND s.state='active'
+        AND NOT EXISTS (
+          SELECT 1 FROM supervision_liveness_receipts r
+          WHERE r.assignmentId=e.assignmentId AND r.generation > e.generation
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM wakes w
+          WHERE w.assignmentId=a.id AND w.sessionKey=a.holderKey
+            AND w.consumer='prompt' AND w.state='pending'
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM turns t
+          WHERE t.sessionKey=a.holderKey AND t.status IN ('queued','running')
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM condition_facts blocked
+          WHERE blocked.kind='work-blocked' AND blocked.scope=a.holderKey
+            AND blocked.id > COALESCE((
+              SELECT MAX(cleared.id)
+              FROM condition_facts cleared
+              WHERE cleared.kind='work-unblocked' AND cleared.scope=a.holderKey
+            ), 0)
+        )
+      ORDER BY e.dueAt, a.openedAt, a.id
+      """,
+      [evaluation_clock]
+    )
   end
 
   defp due_gate?(txn, assignment_id, holder) do

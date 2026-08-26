@@ -348,7 +348,7 @@ defmodule Tightbeam.ColdStartTest do
     assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM users")
   end
 
-  test "captured empty v5 migrates to open v6", _ctx do
+  test "captured empty v5 migrates to open v7", _ctx do
     db = captured_db!("v5-empty")
     assert :ok = Schema.ensure_all(db)
 
@@ -357,7 +357,7 @@ defmodule Tightbeam.ColdStartTest do
              "action" => "choose pair-first or host-local bootstrap"
            }
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v6"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v7"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
   end
 
@@ -416,7 +416,7 @@ defmodule Tightbeam.ColdStartTest do
     assert_event_corruptions_refuse(other, device_event_id)
   end
 
-  test "boot rejects a claimed v6 receipt with a corrupted principal", %{db: db} do
+  test "boot rejects a claimed v7 receipt with a corrupted principal", %{db: db} do
     assert {:paired, _device} = ColdStart.pair(db, pair_input("d1", "Alice"), @defaults)
 
     :ok = DB.execute(db, "PRAGMA ignore_check_constraints = ON")
