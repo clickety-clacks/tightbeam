@@ -642,6 +642,43 @@ defmodule Tightbeam.AdminProjectionTest do
     assert [{_metadata_sql, _metadata_params}] = QuerySpyDB.queries(proxy)
   end
 
+  test "identity staged seam rejects absent and malformed principals before payload access",
+       ctx do
+    proxy = start_supervised!({QuerySpyDB, db: ctx.db})
+    request_binding = make_ref()
+
+    assert {:error, :invalid_identity_descriptor} =
+             StateResources.query_identity(proxy, {:metadata, "served", request_binding, nil})
+
+    assert {:error, :invalid_identity_descriptor} =
+             StateResources.query_identity(
+               proxy,
+               {:metadata, "served", request_binding, "user:flynn"}
+             )
+
+    assert [] = QuerySpyDB.queries(proxy)
+
+    admin = principal_binding("flynn", true)
+
+    assert {:ok, descriptor} =
+             StateResources.query_identity(proxy, {:metadata, "served", request_binding, admin})
+
+    assert [{_metadata_sql, _metadata_params}] = QuerySpyDB.queries(proxy)
+
+    assert {:error, :invalid_identity_descriptor} =
+             StateResources.query_identity(proxy, {:hydrate, descriptor, request_binding, nil})
+
+    assert [{_metadata_sql, _metadata_params}] = QuerySpyDB.queries(proxy)
+
+    assert {:error, :invalid_identity_descriptor} =
+             StateResources.query_identity(
+               proxy,
+               {:hydrate, descriptor, request_binding, "user:flynn"}
+             )
+
+    assert [{_metadata_sql, _metadata_params}] = QuerySpyDB.queries(proxy)
+  end
+
   test "identity descriptors stay reusable only inside the open operation and close before replay",
        ctx do
     proxy = start_supervised!({QuerySpyDB, db: ctx.db})

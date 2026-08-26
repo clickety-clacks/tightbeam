@@ -320,31 +320,37 @@ defmodule Tightbeam.StateResources do
 
   def query_identity(source, {:metadata, name, request_binding, principal_binding})
       when is_binary(name) do
-    [[present, row_version]] =
-      query(source, @identity_metadata_sql, [@identity_resource, AdminProjection.key(name)])
+    with {:ok, principal_binding} <- canonical_identity_principal_binding(principal_binding) do
+      [[present, row_version]] =
+        query(source, @identity_metadata_sql, [@identity_resource, AdminProjection.key(name)])
 
-    nonce = System.unique_integer([:positive, :monotonic])
+      nonce = System.unique_integer([:positive, :monotonic])
 
-    descriptor =
-      seal_identity_descriptor(%{
-        resource: @identity_resource,
-        name: name,
-        present: present == 1,
-        row_version: row_version,
-        source_identity: identity_source_identity(source),
-        source_generation: identity_source_generation(source),
-        request_binding: request_binding,
-        principal_binding: principal_binding,
-        issuer: self(),
-        nonce: nonce
-      })
+      descriptor =
+        seal_identity_descriptor(%{
+          resource: @identity_resource,
+          name: name,
+          present: present == 1,
+          row_version: row_version,
+          source_identity: identity_source_identity(source),
+          source_generation: identity_source_generation(source),
+          request_binding: request_binding,
+          principal_binding: principal_binding,
+          issuer: self(),
+          nonce: nonce
+        })
 
-    :ok = open_identity_operation_nonce(request_binding, nonce)
-    {:ok, descriptor}
+      :ok = open_identity_operation_nonce(request_binding, nonce)
+      {:ok, descriptor}
+    else
+      {:error, :invalid_principal_binding} ->
+        invalid_identity_descriptor(:invalid_principal_binding)
+    end
   end
 
   def query_identity(source, {:hydrate, descriptor, request_binding, principal_binding}) do
-    with {:ok, payload} <-
+    with {:ok, principal_binding} <- canonical_identity_principal_binding(principal_binding),
+         {:ok, payload} <-
            open_identity_descriptor(
              descriptor,
              source,
@@ -352,6 +358,12 @@ defmodule Tightbeam.StateResources do
              principal_binding
            ) do
       hydrate_identity(source, payload)
+    else
+      {:error, :invalid_principal_binding} ->
+        invalid_identity_descriptor(:invalid_principal_binding)
+
+      other ->
+        other
     end
   end
 
@@ -858,14 +870,12 @@ defmodule Tightbeam.StateResources do
       {:ok, payload}
     else
       {:error, reason} ->
-        Logger.error("identity_descriptor_invalid reason=#{reason}")
-        {:error, :invalid_identity_descriptor}
+        invalid_identity_descriptor(reason)
     end
   end
 
   defp open_identity_descriptor(_descriptor, _source, _request_binding, _principal_binding) do
-    Logger.error("identity_descriptor_invalid reason=non_binary_descriptor")
-    {:error, :invalid_identity_descriptor}
+    invalid_identity_descriptor(:non_binary_descriptor)
   end
 
   defp decrypt_identity_descriptor(descriptor) do
@@ -907,38 +917,65 @@ defmodule Tightbeam.StateResources do
          expected_principal_binding
        )
        when is_binary(name) and is_boolean(present?) and is_integer(nonce) do
-    cond do
-      present? and not (is_integer(row_version) and row_version > 0) ->
-        {:error, :invalid_row_version}
+    with {:ok, principal_binding} <- canonical_identity_principal_binding(principal_binding),
+         {:ok, expected_principal_binding} <-
+           canonical_identity_principal_binding(expected_principal_binding) do
+      cond do
+        present? and not (is_integer(row_version) and row_version > 0) ->
+          {:error, :invalid_row_version}
 
-      not present? and not is_nil(row_version) ->
-        {:error, :unexpected_absence_version}
+        not present? and not is_nil(row_version) ->
+          {:error, :unexpected_absence_version}
 
-      issuer != self() ->
-        {:error, :wrong_process}
+        issuer != self() ->
+          {:error, :wrong_process}
 
-      source_identity != identity_source_identity(source) ->
-        {:error, :wrong_source}
+        source_identity != identity_source_identity(source) ->
+          {:error, :wrong_source}
 
-      source_generation != identity_source_generation(source) ->
-        {:error, :wrong_source_generation}
+        source_generation != identity_source_generation(source) ->
+          {:error, :wrong_source_generation}
 
-      request_binding != expected_request_binding ->
-        {:error, :wrong_request_binding}
+        request_binding != expected_request_binding ->
+          {:error, :wrong_request_binding}
 
-      principal_binding != expected_principal_binding ->
-        {:error, :wrong_principal}
+        principal_binding != expected_principal_binding ->
+          {:error, :wrong_principal}
 
-      not identity_operation_open?(expected_request_binding, nonce) ->
-        {:error, :closed_operation}
+        not identity_operation_open?(expected_request_binding, nonce) ->
+          {:error, :closed_operation}
 
-      true ->
-        :ok
+        true ->
+          :ok
+      end
+    else
+      {:error, :invalid_principal_binding} ->
+        {:error, :invalid_principal_binding}
     end
   end
 
   defp validate_identity_descriptor(_payload, _source, _request_binding, _principal_binding),
     do: {:error, :bad_descriptor_payload}
+
+  defp canonical_identity_principal_binding({:session, session_key})
+       when is_binary(session_key) and session_key != "",
+       do: {:ok, {:session, session_key}}
+
+  defp canonical_identity_principal_binding({:user, user_id})
+       when is_binary(user_id) and user_id != "",
+       do: {:ok, {:user, user_id}}
+
+  defp canonical_identity_principal_binding({:process, name})
+       when is_binary(name) and name != "",
+       do: {:ok, {:process, name}}
+
+  defp canonical_identity_principal_binding(_principal_binding),
+    do: {:error, :invalid_principal_binding}
+
+  defp invalid_identity_descriptor(reason) do
+    Logger.error("identity_descriptor_invalid reason=#{reason}")
+    {:error, :invalid_identity_descriptor}
+  end
 
   defp identity_descriptor_key do
     key_name = {__MODULE__, :identity_descriptor_key}
