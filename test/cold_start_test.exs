@@ -59,6 +59,44 @@ defmodule Tightbeam.ColdStartTest do
     assert {:paired, _device} = ColdStart.pair(db, pair_input("winner", "Alice"), @defaults)
   end
 
+  test "pair-first rolls back when its Main origin is corrupted before the final fence", %{
+    db: db
+  } do
+    :ok =
+      DB.execute(db, """
+      CREATE TRIGGER corrupt_pair_first_main_origin
+      AFTER INSERT ON events
+      WHEN NEW.verb = 'cold-start'
+      BEGIN
+        UPDATE sessions SET origin = 'agent:corrupt' WHERE kind = 'main';
+      END;
+      """)
+
+    assert {:error, "bootstrap_failed"} =
+             ColdStart.pair(db, pair_input("d1", "Alice"), @defaults)
+
+    assert identity_census(db) == [0, 0, 0, 0, 0]
+  end
+
+  test "pair-first rolls back when its Main spawnedBy is corrupted before the final fence", %{
+    db: db
+  } do
+    :ok =
+      DB.execute(db, """
+      CREATE TRIGGER corrupt_pair_first_main_spawner
+      AFTER INSERT ON events
+      WHEN NEW.verb = 'cold-start'
+      BEGIN
+        UPDATE sessions SET spawnedBy = sessionKey WHERE kind = 'main';
+      END;
+      """)
+
+    assert {:error, "bootstrap_failed"} =
+             ColdStart.pair(db, pair_input("d1", "Alice"), @defaults)
+
+    assert identity_census(db) == [0, 0, 0, 0, 0]
+  end
+
   test "concurrent different-device claims serialize to one claim and one pending device", %{
     db: db
   } do

@@ -742,7 +742,8 @@ defmodule Tightbeam.ColdStart do
 
     unless user && user.is_admin && device && device.status == "allowlisted" &&
              is_binary(device.token) && device.user_id == user_id && personal_main?(root, user_id) &&
-             root.state == "active" && receipt && receipt.phase == "complete" &&
+             root.origin == @principal && is_nil(root.spawned_by) && root.state == "active" &&
+             receipt && receipt.phase == "complete" &&
              receipt.device_id == device_id do
       claim_error!("bootstrap_failed")
     end
