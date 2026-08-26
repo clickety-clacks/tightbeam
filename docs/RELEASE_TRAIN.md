@@ -59,6 +59,20 @@ The workflow performs these operations:
 The workflow uses one-day staging artifacts to move files between jobs. A staging artifact
 is not candidate proof. The final artifact is named `release-candidate-proof-<sha>`.
 
+## Prove an installed package
+
+Treat candidate proof and deployed-package readiness as separate evidence. Candidate proof
+shows that the exact package was built and passed its gates. It does not show that a new
+agent can start through the installed gateway.
+
+Install the exact proved package on the sanctioned test host. Restart the service. Complete
+all five checks in
+[UPGRADE.md's **Verify, after starting** procedure](UPGRADE.md#verify-after-starting),
+including the existing `scripts/feature_smoke.exs` fresh-agent check. Do not call the
+installed package ready until that check spawns a new agent, obtains one real turn and
+reply, and retires it. A reply from an agent that was already open proves only
+existing-session health and does not satisfy fresh-agent readiness.
+
 ## Review boundary
 
 Freeze the candidate branch after its proof run starts. Do not add a commit to the branch.
