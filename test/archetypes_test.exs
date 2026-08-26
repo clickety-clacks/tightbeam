@@ -65,6 +65,12 @@ defmodule Tightbeam.ArchetypesTest do
              "bring ONE concrete offer at a natural pause, do it for them if they say yes, and record the answer. Once per need; a decline closes it."
 
     assert flat_guidance =~
+             "WHEN the user's stated goal matches the purpose or phrases of a bundle in the `Available kungfu bundles in this Tightbeam build` section of this composed context, NAME that bundle and OFFER to learn it in one sentence before any other plan."
+
+    assert flat_guidance =~
+             "This matching-goal offer overrides the do-not-lead rule, including on first contact."
+
+    assert flat_guidance =~
              "If two or more user-created default sessions are alive at once (origin `user:*`, archetype default)"
 
     assert flat_guidance =~ "user.md's Onboarding section is the offer record"
@@ -73,7 +79,8 @@ defmodule Tightbeam.ArchetypesTest do
              "Never re-raise after a recorded decline; a deferral waits for a new, stronger signal."
 
     assert snapshot.guidance =~ "default-archetype"
-    refute snapshot.guidance =~ "agentic-engineering"
+    assert snapshot.guidance =~ "## Available kungfu bundles in this Tightbeam build"
+    assert snapshot.guidance =~ "### `agentic-engineering`"
     refute snapshot.guidance =~ "tightbeam learn __list__"
 
     assert Rails.load!(ctx.base_dir) == []

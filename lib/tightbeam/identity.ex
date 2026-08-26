@@ -160,6 +160,7 @@ defmodule Tightbeam.Identity do
       end)
 
     archetype_guidance = Archetypes.guidance(archetype, fragments)
+    bundle_context = available_bundle_context(archetype_name)
 
     engineering_activity_table =
       engineering_activity_table(identity_dir, revision, manifest_path)
@@ -176,6 +177,7 @@ defmodule Tightbeam.Identity do
     guidance =
       ([
          archetype_guidance,
+         bundle_context,
          engineering_activity_table,
          required_fragment!(fragments, "operating-model.md", revision)
        ] ++ manual_part)
@@ -185,6 +187,27 @@ defmodule Tightbeam.Identity do
 
     %{revision: revision, archetype: archetype, guidance: guidance, skills: skills}
   end
+
+  defp available_bundle_context("default") do
+    bundles =
+      available_bundles()
+      |> Enum.map_join("\n\n", fn bundle ->
+        phrases = Enum.map_join(bundle.phrases, "\n", &"- #{&1}")
+        "### `#{bundle.name}`\nPurpose: #{bundle.purpose}\nPhrases:\n#{phrases}"
+      end)
+
+    """
+    ## Available kungfu bundles in this Tightbeam build
+
+    Use these facts, composed from the installed build's shipped bundle manifests, to match a
+    user's stated goal before any tool call.
+
+    #{bundles}
+    """
+    |> String.trim()
+  end
+
+  defp available_bundle_context(_archetype_name), do: nil
 
   # Membership and policy bytes come from one revision so a snapshot cannot
   # combine a current receipt with a table or manifest from another history point.

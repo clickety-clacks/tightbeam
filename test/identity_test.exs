@@ -82,6 +82,25 @@ defmodule Tightbeam.IdentityTest do
            ]
   end
 
+  test "the default snapshot composes every available bundle's offer facts", ctx do
+    assert :initialized = Identity.init!(ctx.base)
+
+    default = Identity.snapshot!(ctx.base, "default", :codex).guidance
+    avasarala = Identity.snapshot!(ctx.base, "avasarala", :codex).guidance
+
+    assert default =~ "## Available kungfu bundles in this Tightbeam build"
+    refute avasarala =~ "## Available kungfu bundles in this Tightbeam build"
+
+    for bundle <- Identity.available_bundles() do
+      assert default =~ "### `#{bundle.name}`"
+      assert default =~ "Purpose: #{bundle.purpose}"
+
+      for phrase <- bundle.phrases do
+        assert default =~ "- #{phrase}"
+      end
+    end
+  end
+
   # S4 coverage pin: the file-list assertion above proves the seed ships
   # `guidance/delegation-card.md`, `guidance/office-convention.md`, and
   # `guidance/directive-vocabulary.md` by NAME — it would not fail if any of
