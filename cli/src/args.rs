@@ -70,6 +70,8 @@ pub enum Command {
     /// assimilate`. Printing the whole manual in answer to a question about one
     /// command buries the answer it was asked for.
     CommandHelp(String),
+    /// Print only the nearest session credential's session key.
+    IdentityCurrent,
     Doctor {
         json: bool,
         base_dir: Option<String>,
@@ -680,6 +682,9 @@ COMMANDS:
   kungfu list
       List the kungfu bundles shipped with this Tightbeam build and each
       bundle's declared root archetype.
+
+  identity current
+      Print this session's key without printing its bearer credential.
 
   ADMIN (require --as-user of an admin, or an admin-owned agent handle):
   identity edit <archetype> [--manifest | --skill <name> [--rm]]
@@ -2104,6 +2109,9 @@ fn parse_identity_command(
     flags: &HashMap<String, String>,
 ) -> Result<Command, String> {
     match parsed.positional.get(1).map(String::as_str) {
+        Some("current") if parsed.positional.len() == 2 && flags.is_empty() => {
+            Ok(Command::IdentityCurrent)
+        }
         Some("edit") => {
             let archetype = parsed.positional.get(2).cloned().ok_or_else(|| {
                 "usage: tightbeam identity edit <archetype> [--manifest | --skill <name> [--rm]] [--file <path>]".to_owned()
@@ -2183,7 +2191,9 @@ fn parse_identity_command(
                 all,
             })
         }
-        _ => Err("usage: tightbeam identity edit|status|relearn|repoint|apply ...".to_owned()),
+        _ => Err(
+            "usage: tightbeam identity current|edit|status|relearn|repoint|apply ...".to_owned(),
+        ),
     }
 }
 
@@ -2847,6 +2857,7 @@ mod tests {
             .collect()
         );
         for syntax in [
+            "identity current",
             "identity edit <archetype>",
             "identity relearn [--abort | --resolve]",
             "identity repoint <retired-session> <archetype>",
@@ -3348,6 +3359,21 @@ mod tests {
     }
 
     #[test]
+    fn identity_current_is_local_and_takes_no_identity_override() {
+        assert_eq!(
+            parse(strings(&["identity", "current"])),
+            Ok(Command::IdentityCurrent)
+        );
+        assert_eq!(
+            parse(strings(&["identity", "current", "--as", "coder"])),
+            Err(
+                "usage: tightbeam identity current|edit|status|relearn|repoint|apply ..."
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
     fn requires_exactly_one_wake_target_and_session_only_retire() {
         for args in [
             strings(&["wake", "--prompt", "hello", "--as-user", "flynn"]),
@@ -3706,6 +3732,7 @@ mod tests {
                     base_dir: Some("/tmp/tightbeam".to_owned()),
                 },
             ),
+            (strings(&["identity", "current"]), Command::IdentityCurrent),
             (
                 strings(&["identity", "status", "coder", "--as-user", "flynn"]),
                 Command::IdentityStatus {

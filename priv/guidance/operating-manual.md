@@ -17,7 +17,8 @@ tightbeam refuses a command, it names the rule that refused it. Read the reason.
 Run `tightbeam list`. It returns the sessions you can address, the archetypes in this org,
 the hosts (machines agents run on), and the model catalog (the model names you may use). Use
 a model name from that catalog exactly. Each session row names the host it runs on — yours
-included; your own session key is in `.tightbeam-session` at the root of your workdir.
+included. Run `tightbeam identity current` to print your own session key. Never open
+`.tightbeam-session`; it contains a bearer credential that the CLI reads for authenticated calls.
 
 ## Identity: who a command is attributed to
 Tightbeam attributes every command to an identity — the accountability record of who acted.
@@ -183,6 +184,9 @@ design. Work wakes from agents need none of this.
 
 ## Track work: work-items, assignments, facts
 Work is tracked as durable records, not in chat.
+Treat work items, assignments, attests, artifacts, and decision requests as durable,
+org-readable records. Name a credential by its kind and location when evidence requires it;
+never paste credential bytes into a durable record.
 - A work-item is the durable thread for one feature or bug:
 
     tightbeam work-item-create --title "voice dictation crash on resume"
