@@ -300,13 +300,16 @@ fn signal_process_group(
     target: &HarnessTarget,
 ) -> Result<(), String> {
     target.revalidate_before_signal()?;
-    if unsafe { libc::killpg(pgid, signal) } == -1 {
-        return Err(format!(
-            "process group {pgid} could not be signalled: {}",
-            std::io::Error::last_os_error()
-        ));
+    if unsafe { libc::killpg(pgid, signal) } == 0 {
+        return Ok(());
     }
-    Ok(())
+    let error = std::io::Error::last_os_error();
+    if group_signal_target_gone(&error) {
+        return Ok(());
+    }
+    Err(format!(
+        "process group {pgid} could not be signalled: {error}"
+    ))
 }
 
 fn signal_process(
@@ -315,13 +318,20 @@ fn signal_process(
     target: &HarnessTarget,
 ) -> Result<(), String> {
     target.revalidate_before_signal()?;
-    if unsafe { libc::kill(pid, signal) } == -1 {
-        return Err(format!(
-            "process {pid} could not be signalled: {}",
-            std::io::Error::last_os_error()
-        ));
+    if unsafe { libc::kill(pid, signal) } == 0 {
+        return Ok(());
     }
-    Ok(())
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(format!("process {pid} could not be signalled: {error}"))
+}
+
+/// A group with no live members to signal — linux says ESRCH, darwin often EPERM.
+fn group_signal_target_gone(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ESRCH)
+        || (cfg!(target_os = "macos") && error.raw_os_error() == Some(libc::EPERM))
 }
 
 /// SIGKILL everything the freeze proved was ours, then the recorded group last.
@@ -414,8 +424,7 @@ fn sigkill_stray(stray: Stray, target: &HarnessTarget) -> Option<String> {
     }
 
     let error = std::io::Error::last_os_error();
-    let gone = error.raw_os_error() == Some(libc::ESRCH)
-        || (cfg!(target_os = "macos") && error.raw_os_error() == Some(libc::EPERM));
+    let gone = group_signal_target_gone(&error);
 
     if gone {
         None
@@ -441,10 +450,7 @@ fn sigkill_stray(stray: Stray, target: &HarnessTarget) -> Option<String> {
 /// darwin-only. `child_process.rs` already carries the same guard for the same reason; this
 /// is the one place that knew the fact in only one language.
 fn classify_group_kill(pgid: libc::pid_t, error: std::io::Error) -> Result<i32, String> {
-    let gone = error.raw_os_error() == Some(libc::ESRCH)
-        || (cfg!(target_os = "macos") && error.raw_os_error() == Some(libc::EPERM));
-
-    if gone {
+    if group_signal_target_gone(&error) {
         Ok(0)
     } else {
         Err(format!(
