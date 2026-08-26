@@ -722,6 +722,31 @@ defmodule Tightbeam.Identity do
     }
   end
 
+  @doc "Compare learned kungfu's imported baseline with this build's shipped bundles."
+  @spec shipped_kungfu_status(String.t()) ::
+          {:ok, %{current: [String.t()], stale: [String.t()]}} | {:error, String.t()}
+  def shipped_kungfu_status(base_dir) do
+    dir = identity_dir(base_dir)
+
+    if File.dir?(Path.join(dir, ".git")) do
+      live = git_output!(dir, ["rev-parse", @live])
+      upstream = git_output!(dir, ["rev-parse", @upstream])
+      available = MapSet.new(available_bundle_names())
+
+      {current, stale} =
+        dir
+        |> learned_bundle_names_at(live)
+        |> Enum.filter(&MapSet.member?(available, &1))
+        |> Enum.split_with(&shipped_bundle_current?(dir, live, upstream, &1))
+
+      {:ok, %{current: Enum.sort(current), stale: Enum.sort(stale)}}
+    else
+      {:error, "#{dir} is not an identity repository"}
+    end
+  rescue
+    error -> {:error, Exception.message(error)}
+  end
+
   defp identity_dir(base_dir), do: Path.join(base_dir, "identity")
 
   defp seed_dir do
@@ -799,6 +824,21 @@ defmodule Tightbeam.Identity do
       name: name,
       paths: bundle_entries(name, bundle) |> Enum.map(&elem(&1, 0)) |> Enum.sort()
     }
+  end
+
+  defp shipped_bundle_current?(dir, live, upstream, name) do
+    with {:ok, receipt} <- receipt_at(dir, live, name) do
+      shipped = bundle_entries(name, bundle_dir(name))
+      shipped_paths = shipped |> Enum.map(&elem(&1, 0)) |> Enum.sort()
+
+      receipt.paths == shipped_paths and
+        Enum.all?(shipped, fn {path, bytes} ->
+          path_exists_at?(dir, upstream, path) and
+            git_show_bytes!(dir, upstream, path) == bytes
+        end)
+    else
+      :error -> false
+    end
   end
 
   defp import_upstream!(dir, bundle_names, message) do

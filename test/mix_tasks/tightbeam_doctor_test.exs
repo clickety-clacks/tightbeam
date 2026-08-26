@@ -23,6 +23,7 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
       hosts: %{"local-test" => %{ssh: nil, base_dir: base_dir, cli_bin: nil}},
       local_host_name: "local-test",
       cli_bin: Path.join(base_dir, "bin"),
+      kungfu_status: {:ok, %{current: [], stale: []}},
       harness_binary_probe: fn harness, _cli_bin ->
         {:ok, %{bin: "/fake/#{harness}", version: "#{harness} 1.0"}}
       end
@@ -345,6 +346,25 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
 
     assert Enum.any?(checks, &(&1["name"] == "advertised_url" and &1["ok"] == true))
     assert Enum.all?(checks, &is_binary(&1["level"]))
+  end
+
+  test "stale shipped kungfu warns and offers relearn without changing readiness", ctx do
+    inputs =
+      put(
+        ctx.inputs,
+        :kungfu_status,
+        {:ok, %{current: [], stale: ["agentic-engineering"]}}
+      )
+
+    {0, %{ready: true} = report} = Doctor.evaluate(ctx.catalog, inputs)
+    row = find(report, "shipped_kungfu")
+
+    refute row.ok
+    assert row.level == :warn
+    assert row.detail =~ "updated shipped kungfu is available for: agentic-engineering"
+    assert row.fix =~ "Ask the user"
+    assert row.fix =~ "Run tightbeam identity relearn now?"
+    assert row.fix =~ "never auto-relearn"
   end
 
   # AC5, doctor's half: an installed-but-unrunnable harness (on PATH but fails to

@@ -113,6 +113,18 @@ faster than the work in flight would explain, treat it as a kill and check
 4. **Queued work is moving.** `SELECT count(*) FROM turns WHERE status='queued';`
    should fall as lanes pick it up. If it does not, the lanes are not claiming.
 
+## Refresh shipped identity and kungfu
+
+Run `tightbeam doctor` after the upgraded gateway starts. The
+`shipped_kungfu` row compares each learned bundle's last imported shipped
+baseline with the bundle in the current Tightbeam build. It does not change the
+identity repository.
+
+If that row reports `WARN`, ASK the user whether to run
+`tightbeam identity relearn`. Run it only after the user says yes. NEVER run
+relearn automatically: it merges new shipped identity and kungfu into the org's
+customized identity, and that merge belongs to a mind.
+
 ## What does NOT survive the restart
 
 - **The in-flight turn, if it outlasts the budget.** `failed_unknown`, terminal,
