@@ -64,10 +64,7 @@ fn command_matches(action: Action, command: &str) -> bool {
 fn argv_matches(action: Action, argv: &[String]) -> bool {
     let argv = command_argv(argv);
 
-    if let [shell, flag, nested, ..] = argv
-        && matches!(program_name(shell), "sh" | "bash" | "zsh")
-        && flag == "-c"
-    {
+    if let Some(nested) = nested_shell_command(argv) {
         return command_matches(action, nested);
     }
 
@@ -95,6 +92,45 @@ fn argv_matches(action: Action, argv: &[String]) -> bool {
         Action::GitRestore if subcommand == "restore" => true,
         _ => false,
     }
+}
+
+fn nested_shell_command(argv: &[String]) -> Option<&str> {
+    let [shell, args @ ..] = argv else {
+        return None;
+    };
+    if !matches!(program_name(shell), "sh" | "bash" | "zsh") {
+        return None;
+    }
+
+    let mut index = 0;
+    while let Some(argument) = args.get(index) {
+        if argument == "--" {
+            return None;
+        }
+
+        let command_option = argument == "-c"
+            || argument.starts_with('-')
+                && !argument.starts_with("--")
+                && argument.chars().skip(1).any(|flag| flag == 'c');
+        if command_option {
+            let mut command_index = index + 1;
+            if args
+                .get(command_index)
+                .is_some_and(|argument| argument == "--")
+            {
+                command_index += 1;
+            }
+            return args.get(command_index).map(String::as_str);
+        }
+
+        index += if matches!(argument.as_str(), "-o" | "-O") {
+            2
+        } else {
+            1
+        };
+    }
+
+    None
 }
 
 fn program_name(value: &str) -> &str {
@@ -434,6 +470,9 @@ mod tests {
             "env HOME=/tmp git stash",
             "command git stash",
             "/bin/sh -c 'git -C repo stash'",
+            "sh -c -- 'git stash clear'",
+            "bash --noprofile -c 'git stash apply'",
+            "zsh -fc 'git stash drop'",
         ] {
             assert!(command_matches(Action::GitStash, command), "{command}");
         }
@@ -447,6 +486,23 @@ mod tests {
             "git commit -m 'do not git stash by hand'",
         ] {
             assert!(!command_matches(Action::GitStash, command), "{command}");
+        }
+    }
+
+    #[test]
+    fn option_bearing_nested_shells_cannot_bypass_any_closed_action() {
+        for (action, nested) in [
+            (Action::GitStash, "git stash"),
+            (Action::GitResetHard, "git reset --hard HEAD"),
+            (Action::GitCleanForce, "git clean -xdf"),
+            (Action::GitCheckoutDiscard, "git checkout main -- path"),
+            (Action::GitRestore, "git restore path"),
+        ] {
+            assert!(command_matches(
+                action,
+                &format!("bash --noprofile -c '{nested}'")
+            ));
+            assert!(command_matches(action, &format!("sh -c -- '{nested}'")));
         }
     }
 
