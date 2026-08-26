@@ -283,14 +283,19 @@ defmodule Tightbeam.Assignments do
     count
   end
 
-  @doc "List assignments using optional holder_key and state filters."
+  @doc "List assignments using optional holder_key, holder_role, and state filters."
   @spec list(DB.server(), map()) :: [map()]
   def list(db, filters) do
     state = Map.get(filters, :state, "open")
-    holder = Map.get(filters, :holder_key)
+    holder_key = Map.get(filters, :holder_key)
+    holder_role = Map.get(filters, :holder_role)
 
     {clauses, params} =
-      [{state != "all", "state", state}, {not is_nil(holder), "holderKey", holder}]
+      [
+        {state != "all", "state", state},
+        {not is_nil(holder_key), "holderKey", holder_key},
+        {not is_nil(holder_role), "holderRole", holder_role}
+      ]
       |> Enum.filter(&elem(&1, 0))
       |> Enum.with_index(1)
       |> Enum.map_reduce([], fn {{_present, column, value}, index}, values ->
@@ -1428,9 +1433,14 @@ defmodule Tightbeam.Assignments do
   defp assignments_result(db, call) do
     with :ok <- principal_allowed(call.principal, "assignments"),
          :ok <- valid_state(call.params[:state]) do
+      holder_filter =
+        case call[:target_role] do
+          role when is_binary(role) -> %{holder_role: role}
+          nil -> %{holder_key: call.session_key}
+        end
+
       %{
-        assignments:
-          list(db, %{holder_key: call.session_key, state: call.params[:state] || "open"})
+        assignments: list(db, Map.put(holder_filter, :state, call.params[:state] || "open"))
       }
     end
   end
@@ -1614,6 +1624,7 @@ defmodule Tightbeam.Assignments do
         id = id("asg_")
         now = now()
         {opened_user, opened_session} = opener(call.principal)
+        holder_role = historical_holder_role_in_txn(txn, call)
 
         Txn.q(
           txn,
@@ -1628,7 +1639,7 @@ defmodule Tightbeam.Assignments do
             id,
             call.params.subject,
             call.session_key,
-            call.target_role,
+            holder_role,
             if(call.role_fallback, do: 1, else: 0),
             opened_user,
             opened_session,
@@ -1710,6 +1721,39 @@ defmodule Tightbeam.Assignments do
 
     :review_of_review ->
       error("review_of_review", "a review assignment cannot itself be reviewed")
+  end
+
+  defp historical_holder_role_in_txn(_txn, %{target_role: role}) when is_binary(role), do: role
+
+  defp historical_holder_role_in_txn(txn, %{session_key: session_key}) do
+    case Txn.q(
+           txn,
+           "SELECT name FROM roles WHERE boundSessionKey = ?1 ORDER BY name LIMIT 2",
+           [session_key]
+         ) do
+      [[role]] -> role
+      _ -> nil
+    end
+  end
+
+  @doc false
+  @spec backfill_holder_roles_in_txn(Txn.t()) :: non_neg_integer()
+  def backfill_holder_roles_in_txn(%Txn{} = txn) do
+    Txn.q(
+      txn,
+      """
+      UPDATE assignments
+      SET holderRole = (
+        SELECT roles.name FROM roles WHERE roles.boundSessionKey = assignments.holderKey
+      )
+      WHERE holderRole IS NULL
+        AND (
+          SELECT COUNT(*) FROM roles WHERE roles.boundSessionKey = assignments.holderKey
+        ) = 1
+      """
+    )
+
+    Txn.changes(txn)
   end
 
   defp resolve_optional_in_txn(_txn, _type, nil), do: {:ok, nil}

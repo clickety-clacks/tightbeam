@@ -10,6 +10,7 @@ defmodule Tightbeam.AssignmentsTest do
     Ledger,
     Org,
     Projection,
+    Roles,
     Rules,
     Supervision,
     Wakes,
@@ -210,6 +211,37 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert {:ok, [[1]]} =
              DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE subject = 'once'")
+  end
+
+  test "session targets snapshot only one proven role and role queries use that history", ctx do
+    Roles.create!(ctx.db, "builder", "flynn", ctx.holder.session_key)
+
+    role_stamped =
+      handle(ctx, "assign", assign_call({:session, "holder"}, "one proven role"))
+
+    assert role_stamped.holderKey == "holder"
+    assert role_stamped.holderRole == "builder"
+
+    Roles.create!(ctx.db, "deployer", "flynn", ctx.holder.session_key)
+
+    ambiguous =
+      handle(ctx, "assign", assign_call({:session, "holder"}, "ambiguous roles"))
+
+    assert ambiguous.holderKey == "holder"
+    assert ambiguous.holderRole == nil
+
+    role_query =
+      query_call({:user, "flynn"}, "open", "other-session")
+      |> Map.put(:target_role, "builder")
+
+    assert %{assignments: [%{id: stamped_id}]} = handle(ctx, "assignments", role_query)
+    assert stamped_id == role_stamped.id
+
+    assert %{assignments: session_history} =
+             handle(ctx, "assignments", query_call({:user, "flynn"}, "open", "holder"))
+
+    assert Enum.map(session_history, & &1.id) |> Enum.sort() ==
+             Enum.sort([role_stamped.id, ambiguous.id])
   end
 
   test "raw dispatch precheck leaves supervision interval validation to the mutation seam", ctx do

@@ -32,7 +32,7 @@ end
 defmodule Tightbeam.SchemaShapeTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Model, Org, Schema}
+  alias Tightbeam.{DB, Model, Org, Roles, Schema}
 
   setup do
     name = :"schema_shape_#{System.unique_integer([:positive])}"
@@ -43,13 +43,13 @@ defmodule Tightbeam.SchemaShapeTest do
   test "a fresh database is created and stamped", %{db: db} do
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v5"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v5-holder-role-v1"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     # Idempotent: booting twice is the ordinary case, not a shape change.
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v5"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v5-holder-role-v1"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
   end
 
@@ -232,7 +232,7 @@ defmodule Tightbeam.SchemaShapeTest do
     assert {:ok, ^before_rows} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
     assert {:ok, []} = DB.query(db, "SELECT wakeId FROM wake_cancellations")
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v5"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v5-holder-role-v1"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
   end
 
@@ -261,7 +261,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v5"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v5-holder-role-v1"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert {:ok,
@@ -310,6 +310,85 @@ defmodule Tightbeam.SchemaShapeTest do
 
     assert {:ok, [[^main_key]]} =
              DB.query(db, "SELECT operationalParent FROM sessions WHERE kind='main'")
+  end
+
+  test "the holder-role predecessor backfills only rows with one durable role", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+    _main = session(db, Org.personal_session_key("flynn"), "flynn", kind: "main")
+
+    unique = session(db, "unique-holder", "flynn")
+    ambiguous = session(db, "ambiguous-holder", "flynn")
+    unbound = session(db, "unbound-holder", "flynn")
+
+    Roles.create!(db, "unique-role", "flynn", unique.session_key)
+    Roles.create!(db, "ambiguous-a", "flynn", ambiguous.session_key)
+    Roles.create!(db, "ambiguous-b", "flynn", ambiguous.session_key)
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO assignments
+        (id,subject,holderKey,holderRole,openedByUser,openedAt)
+      VALUES
+        ('asg_unique','unique','unique-holder',NULL,'flynn',1),
+        ('asg_ambiguous','ambiguous','ambiguous-holder',NULL,'flynn',2),
+        ('asg_unbound','unbound','unbound-holder',NULL,'flynn',3),
+        ('asg_preserved','preserved','unique-holder','historical-role','flynn',4)
+      """)
+
+    downgrade_to_holder_role_predecessor(db)
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:ok,
+            [
+              ["asg_ambiguous", nil],
+              ["asg_preserved", "historical-role"],
+              ["asg_unbound", nil],
+              ["asg_unique", "unique-role"]
+            ]} =
+             DB.query(db, "SELECT id,holderRole FROM assignments ORDER BY id")
+
+    assert {:ok, [["coordination-fabric-v1-phase1-v5-holder-role-v1"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+
+    Roles.create!(db, "later-role", "flynn", unbound.session_key)
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:ok, [[nil]]} =
+             DB.query(db, "SELECT holderRole FROM assignments WHERE id='asg_unbound'")
+  end
+
+  test "an interrupted holder-role backfill rolls back and retries exactly", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+    _main = session(db, Org.personal_session_key("flynn"), "flynn", kind: "main")
+
+    holder = session(db, "holder", "flynn")
+    Roles.create!(db, "holder-role", "flynn", holder.session_key)
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO assignments (id,subject,holderKey,openedByUser,openedAt)
+      VALUES ('asg_holder','holder','holder','flynn',1)
+      """)
+
+    downgrade_to_holder_role_predecessor(db)
+
+    error =
+      assert_raise Schema.ShapeError, fn ->
+        Schema.upgrade_holder_role_v1(db, fail_after_backfill: true)
+      end
+
+    assert error.message =~ "forced holder-role migration interruption"
+
+    assert {:ok, [[nil]]} =
+             DB.query(db, "SELECT holderRole FROM assignments WHERE id='asg_holder'")
+
+    assert {:ok, [["coordination-fabric-v1-phase1-v5"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:ok, [["holder-role"]]} =
+             DB.query(db, "SELECT holderRole FROM assignments WHERE id='asg_holder'")
   end
 
   # The defect this refuses: `CREATE TABLE IF NOT EXISTS` is SILENT about a
@@ -391,7 +470,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "some-later-shape"
-    assert error.message =~ "coordination-fabric-v1-phase1-v5"
+    assert error.message =~ "coordination-fabric-v1-phase1-v5-holder-role-v1"
   end
 
   # Sol xhigh review round 2, finding 2 (wave 1): `classElection`'s CHECK
@@ -453,7 +532,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-classes-v1"
-    assert error.message =~ "coordination-fabric-v1-phase1-v5"
+    assert error.message =~ "coordination-fabric-v1-phase1-v5-holder-role-v1"
     assert error.message =~ "no migration"
 
     # It REFUSED — it did not repair or widen the constraint in place.
@@ -573,7 +652,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-v1-phase1"
-    assert error.message =~ "coordination-fabric-v1-phase1-v5"
+    assert error.message =~ "coordination-fabric-v1-phase1-v5-holder-role-v1"
     assert error.message =~ "no migration"
 
     # It REFUSED — it did not repair or relax the constraint in place.
@@ -644,7 +723,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-classes-v2"
-    assert error.message =~ "coordination-fabric-v1-phase1-v5"
+    assert error.message =~ "coordination-fabric-v1-phase1-v5-holder-role-v1"
     assert error.message =~ "no migration"
 
     # It REFUSED — the merged build's decision_requests columns were never
@@ -757,7 +836,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-v1-phase1-v2"
-    assert error.message =~ "coordination-fabric-v1-phase1-v5"
+    assert error.message =~ "coordination-fabric-v1-phase1-v5-holder-role-v1"
     assert error.message =~ "no migration"
 
     # It REFUSED — the merged build's wakes class/delivery columns were never
@@ -796,7 +875,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-v1-phase1-v3"
-    assert error.message =~ "coordination-fabric-v1-phase1-v5"
+    assert error.message =~ "coordination-fabric-v1-phase1-v5-holder-role-v1"
     assert error.message =~ "no migration"
 
     assert {:ok, [[ddl]]} =
@@ -833,6 +912,16 @@ defmodule Tightbeam.SchemaShapeTest do
       DB.query(
         db,
         "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v4', stampedAt=1"
+      )
+
+    :ok
+  end
+
+  defp downgrade_to_holder_role_predecessor(db) do
+    {:ok, _} =
+      DB.query(
+        db,
+        "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v5', stampedAt=1"
       )
 
     :ok

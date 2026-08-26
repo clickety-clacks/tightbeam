@@ -312,8 +312,8 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
       {:ok, [[0]]},
       DB.query(
         db,
-        "SELECT count(*) FROM assignments WHERE workItemId = ?1 AND holderRole = 'recon'",
-        [work_item_id]
+        "SELECT count(*) FROM assignments WHERE workItemId = ?1 AND subject = ?2",
+        [work_item_id, "diagnosis of prior fix for work item #{work_item_id}"]
       )
     )
   end
