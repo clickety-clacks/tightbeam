@@ -92,6 +92,147 @@ defmodule Tightbeam.LocalOpenAiRuntimeTest do
     assert_receive {:request, %{response: :catalog, command: ["/bin/sh", "-c", _script]}}
   end
 
+  test "optional key is carried by a temporary 0600 header file, never process argv" do
+    owner = self()
+    secret = "TB_ARGV_NEGATIVE_SENTINEL"
+
+    transport = fn _target, %{command: ["/bin/sh", "-c", script]} ->
+      refute script =~ secret
+      assert [_, path] = Regex.run(~r/-H "@([^"]+)"/, script)
+      assert {:ok, %{mode: mode, size: size}} = File.stat(path)
+      assert Bitwise.band(mode, 0o777) == 0o600
+      assert size > 0
+      send(owner, {:auth_path, path})
+      {:ok, %{status: 200, headers: %{}, body: @models_body}}
+    end
+
+    target = %{
+      host_config: %{ssh: nil},
+      find_executable: fn
+        "sh" -> "/bin/sh"
+        "curl" -> "/usr/bin/curl"
+      end
+    }
+
+    assert :live =
+             LocalOpenAi.credential_live?(
+               target,
+               %{name: "keyed", endpoint: "https://keyed.example/v1", api_key: secret},
+               transport: transport
+             )
+
+    assert_receive {:auth_path, path}
+    refute File.exists?(path)
+  end
+
+  test "missing local and remote catalog tools return bounded unknown results" do
+    local = %{
+      host_config: %{ssh: nil},
+      find_executable: fn _ -> nil end
+    }
+
+    assert {:unknown, {:executable_not_found, "sh"}} =
+             LocalOpenAi.credential_live?(
+               local,
+               %{name: "spark", endpoint: "https://spark.example/v1", api_key: nil},
+               transport: fn _, _ -> flunk("transport must not run") end
+             )
+
+    remote = %{
+      host_config: %{ssh: "fixture@remote"},
+      find_executable: fn "ssh" -> "/usr/bin/ssh" end,
+      sh: fn command ->
+        if "/usr/bin/curl" in command, do: {"", 1}, else: {"", 0}
+      end
+    }
+
+    assert {:unknown, {:executable_not_found, "/usr/bin/curl"}} =
+             LocalOpenAi.credential_live?(
+               remote,
+               %{name: "spark", endpoint: "https://spark.example/v1", api_key: nil},
+               transport: fn _, _ -> flunk("transport must not run") end
+             )
+  end
+
+  test "selected remote host owns provider enumeration, keyed probe, and models materialization" do
+    owner = self()
+    remote_base = "/remote/tightbeam"
+    secret = "TB_REMOTE_SECRET_MUST_NOT_APPEAR"
+
+    state = %{
+      base_dir: remote_base,
+      credential_status: fn
+        :opencode_go, _ -> {:needs_onboarding, :missing}
+        :local_openai, _ -> :onboarded
+      end,
+      options: %{
+        find_executable: fn "ssh" -> "/usr/bin/ssh" end,
+        sh: fn command ->
+          send(owner, {:remote_command, command})
+          joined = Enum.join(command, " ")
+
+          cond do
+            String.contains?(joined, "/bin/ls -1") ->
+              {"spark.json\n", 0}
+
+            String.contains?(joined, "__TIGHTBEAM_API_KEY_PRESENT__") ->
+              {~s({"name":"spark","type":"local-openai","endpoint":"https://spark.example/v1"}) <>
+                 "\n__TIGHTBEAM_API_KEY_PRESENT__\n", 0}
+
+            "/bin/test" in command ->
+              {"", 0}
+
+            String.contains?(joined, "spark.example/v1/models") ->
+              refute joined =~ secret
+              assert joined =~ "/usr/bin/plutil"
+              assert joined =~ "/usr/bin/curl"
+              {@models_body <> "\n200", 0}
+
+            true ->
+              flunk("unexpected remote command: #{inspect(command)}")
+          end
+        end
+      },
+      host_config: %{ssh: "fixture@remote", base_dir: remote_base}
+    }
+
+    assert {:ok, [entry]} = PiProvider.fetch_pi_catalog(state)
+    assert entry.family == "spark/qwen3.5-35b"
+
+    materialized = PiProvider.build_pi_models_json(state)
+    assert get_in(JSON.decode!(materialized.bytes), ["providers", "spark", "models"]) != []
+
+    assert materialized.remote_api_key_files == %{
+             "spark" => "/remote/tightbeam/auth/pi-local/providers/spark.json"
+           }
+
+    commands = collect_remote_commands([])
+    assert commands != []
+    assert Enum.all?(commands, &(inspect(&1) =~ "/usr/bin/ssh"))
+    refute Enum.any?(commands, &(inspect(&1) =~ secret))
+  end
+
+  test "unproven local models receive conservative capabilities" do
+    body = ~s({"data":[{"id":"mystery-model","max_model_len":8192}]})
+    record = %{name: "lab", endpoint: "https://lab.example/v1", api_key: nil}
+    {"lab", provider} = LocalOpenAi.pi_models_json_entry(record, body)
+
+    assert [%{"reasoning" => false}] = provider["models"]
+    refute Map.has_key?(provider["compat"], "thinkingFormat")
+
+    state = %{
+      host_config: %{ssh: nil},
+      find_executable: fn
+        "sh" -> "/bin/sh"
+        "curl" -> "/usr/bin/curl"
+      end,
+      options: %{sh: fn _command -> {body <> "\n200", 0} end}
+    }
+
+    assert {:ok, [entry]} = LocalOpenAi.fetch_catalog(state, record)
+    assert entry.capabilities["tool_use"] == false
+  end
+
   test "catalog credential transport decodes the trailing HTTP status" do
     target = %{
       host_config: %{ssh: nil},
@@ -222,6 +363,14 @@ defmodule Tightbeam.LocalOpenAiRuntimeTest do
 
       assert {:ok, entries} = PiProvider.fetch_pi_catalog(state)
       assert Enum.map(entries, & &1.family) == ["spark/qwen3.5-35b"]
+    end
+  end
+
+  defp collect_remote_commands(acc) do
+    receive do
+      {:remote_command, command} -> collect_remote_commands([command | acc])
+    after
+      0 -> Enum.reverse(acc)
     end
   end
 end

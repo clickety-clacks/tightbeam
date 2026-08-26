@@ -130,25 +130,50 @@ defmodule Tightbeam.Harness.Support do
   end
 
   def credential_transport(target, %{command: command} = request) do
-    invocation =
-      if local?(target) do
-        command
-      else
-        ["ssh" | ssh_opts()] ++
-          [
-            target.host_config.ssh,
-            "sh",
-            "-lc",
-            shell_quote(Enum.map_join(command, " ", &shell_quote/1))
-          ]
+    with {:ok, invocation} <- credential_transport_argv(target, command) do
+      case target.sh.(invocation) do
+        {output, 0} ->
+          decode_credential_transport(request, output)
+
+        {output, exit} ->
+          {:error, {:transport_exit, exit, String.trim(output)}}
       end
+    end
+  end
 
-    case target.sh.(invocation) do
-      {output, 0} ->
-        decode_credential_transport(request, output)
+  defp credential_transport_argv(target, command) do
+    if local?(target) do
+      {:ok, command}
+    else
+      case absolute_executable(target, "ssh") do
+        {:ok, ssh} ->
+          {:ok,
+           [ssh | ssh_opts()] ++
+             [
+               target.host_config.ssh,
+               "/bin/sh",
+               "-lc",
+               shell_quote(Enum.map_join(command, " ", &shell_quote/1))
+             ]}
 
-      {output, exit} ->
-        {:error, {:transport_exit, exit, String.trim(output)}}
+        :error ->
+          {:error, {:executable_not_found, "ssh"}}
+      end
+    end
+  end
+
+  defp absolute_executable(container, name) do
+    find =
+      Map.get(container, :find_executable) ||
+        get_in(container, [:options, :find_executable]) ||
+        (&System.find_executable/1)
+
+    case find.(name) do
+      path when is_binary(path) ->
+        if Path.type(path) == :absolute, do: {:ok, path}, else: :error
+
+      _ ->
+        :error
     end
   end
 

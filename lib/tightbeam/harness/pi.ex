@@ -230,7 +230,8 @@ defmodule Tightbeam.Harness.Pi do
   end
 
   defp materialize_models_json!(target, home) do
-    bytes = PiProvider.build_pi_models_json(target.host_config.base_dir)
+    materialized = PiProvider.build_pi_models_json(target)
+    bytes = materialized.bytes
     path = Path.join(home, @models_json)
 
     if Support.local?(target) do
@@ -238,20 +239,100 @@ defmodule Tightbeam.Harness.Pi do
       File.write!(path, bytes)
       File.chmod!(path, 0o600)
     else
-      with {:ok, ssh} <- absolute_executable(target, "ssh") do
+      with {:ok, ssh} <- absolute_executable(target, "ssh"),
+           :ok <- remote_models_executables(target, ssh),
+           {:ok, node} <- remote_models_node(target, ssh, materialized.remote_api_key_files) do
         tmp = path <> ".tmp-#{System.unique_integer([:positive])}"
         encoded = Base.encode64(bytes)
 
-        script =
-          "printf %s #{JSON.encode!(encoded)} | base64 -d > #{JSON.encode!(tmp)} && " <>
-            "chmod 600 #{JSON.encode!(tmp)} && mv #{JSON.encode!(tmp)} #{JSON.encode!(path)}"
+        inject =
+          if map_size(materialized.remote_api_key_files) == 0 do
+            ""
+          else
+            javascript = """
+            const fs=require("fs");
+            const file=process.argv[1];
+            const keyFiles=JSON.parse(process.argv[2]);
+            const models=JSON.parse(fs.readFileSync(file,"utf8"));
+            for(const [name,keyFile] of Object.entries(keyFiles)){
+              const source=JSON.parse(fs.readFileSync(keyFile,"utf8"));
+              if(typeof source.apiKey!=="string"||source.apiKey.trim()==="")throw new Error("missing provider key");
+              models.providers[name].apiKey=source.apiKey;
+              delete models.providers[name].authHeader;
+            }
+            fs.writeFileSync(file,JSON.stringify(models),{mode:0o600});
+            """
 
-        Support.run!(
+            "#{Support.shell_quote(node)} -e #{Support.shell_quote(javascript)} " <>
+              "#{Support.shell_quote(tmp)} " <>
+              "#{Support.shell_quote(JSON.encode!(materialized.remote_api_key_files))} && "
+          end
+
+        script =
+          "/usr/bin/printf %s #{Support.shell_quote(encoded)} | " <>
+            "/usr/bin/base64 -d > #{Support.shell_quote(tmp)} && " <>
+            "/bin/chmod 600 #{Support.shell_quote(tmp)} && " <>
+            inject <>
+            "/bin/mv #{Support.shell_quote(tmp)} #{Support.shell_quote(path)}"
+
+        run_remote_models!(
           target,
           [ssh | Support.ssh_opts()] ++
-            [target.host_config.ssh, "sh", "-c", script]
+            [target.host_config.ssh, "/bin/sh", "-c", Support.shell_quote(script)]
         )
       end
+    end
+  end
+
+  defp remote_models_executables(target, ssh) do
+    Enum.reduce_while(
+      ["/bin/sh", "/usr/bin/printf", "/usr/bin/base64", "/bin/chmod", "/bin/mv"],
+      :ok,
+      fn path, :ok ->
+        command =
+          [ssh | Support.ssh_opts()] ++ [target.host_config.ssh, "/bin/test", "-x", path]
+
+        case Support.bounded_run(target.sh, command, 5_000) do
+          {:ok, {_output, 0}} -> {:cont, :ok}
+          _ -> {:halt, {:error, {:executable_not_found, path}}}
+        end
+      end
+    )
+  end
+
+  defp remote_models_node(_target, _ssh, key_files) when map_size(key_files) == 0,
+    do: {:ok, nil}
+
+  defp remote_models_node(target, ssh, _key_files) do
+    case Enum.find_value(Map.get(target.host_config, :toolchain_dirs, []), fn dir ->
+           path = Path.join(dir, "node")
+
+           if Path.type(path) == :absolute do
+             command =
+               [ssh | Support.ssh_opts()] ++
+                 [target.host_config.ssh, "/bin/test", "-x", path]
+
+             case Support.bounded_run(target.sh, command, 5_000) do
+               {:ok, {_output, 0}} -> path
+               _ -> nil
+             end
+           end
+         end) do
+      path when is_binary(path) -> {:ok, path}
+      nil -> {:error, {:executable_not_found, "remote node"}}
+    end
+  end
+
+  defp run_remote_models!(target, command) do
+    case Support.bounded_run(target.sh, command, 30_000) do
+      {:ok, {_output, 0}} ->
+        :ok
+
+      {:ok, {_output, exit}} ->
+        raise "remote models.json command failed with exit #{exit}"
+
+      {:error, reason} ->
+        raise "remote models.json command failed: #{inspect(reason)}"
     end
   end
 

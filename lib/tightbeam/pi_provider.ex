@@ -82,90 +82,69 @@ defmodule Tightbeam.PiProvider do
     end
   end
 
+  def named_local_providers(%{host_config: _} = target) do
+    case Providers.read_all_target(target) do
+      {:ok, records} -> records
+      {:error, _} -> []
+    end
+  end
+
   @doc false
   def local_provider_live?(target, record, opts) do
     LocalOpenAi.credential_live?(target, record, opts)
   end
 
   @doc false
-  def build_pi_models_json(base_dir) do
-    providers =
-      base_dir
+  def build_pi_models_json(%{host_config: _} = target) do
+    {providers, key_files} =
+      target
       |> named_local_providers()
-      |> Enum.reduce(%{}, fn record, acc ->
-        case fetch_models_body_for_materialization(target_for(base_dir), record) do
+      |> Enum.reduce({%{}, %{}}, fn record, {providers, key_files} ->
+        case fetch_models_body_for_materialization(target, record) do
           {:ok, body} ->
             case LocalOpenAi.pi_models_json_entry(record, body) do
-              {name, provider} when is_binary(name) -> Map.put(acc, name, provider)
-              _ -> acc
+              {name, provider} when is_binary(name) ->
+                key_files =
+                  case Map.get(record, :api_key_file) do
+                    path when is_binary(path) -> Map.put(key_files, name, path)
+                    _ -> key_files
+                  end
+
+                {Map.put(providers, name, provider), key_files}
+
+              _ ->
+                {providers, key_files}
             end
 
           _ ->
-            acc
+            {providers, key_files}
         end
       end)
 
-    JSON.encode!(%{"providers" => providers})
+    %{bytes: JSON.encode!(%{"providers" => providers}), remote_api_key_files: key_files}
+  end
+
+  def build_pi_models_json(base_dir) when is_binary(base_dir) do
+    build_pi_models_json(target_for(base_dir)).bytes
   end
 
   defp fetch_named_local_catalogs(state) do
-    base_dir = Map.fetch!(state, :base_dir)
-
-    Providers.list(base_dir)
-    |> Enum.reduce({[], %{}}, fn name, {entries, errors} ->
-      case Providers.read(base_dir, name) do
-        {:ok, record} ->
+    case Providers.read_all_target(state) do
+      {:ok, records} ->
+        Enum.reduce(records, {[], %{}}, fn record, {entries, errors} ->
           case LocalOpenAi.fetch_catalog(state, record) do
             {:ok, provider_entries} -> {entries ++ provider_entries, errors}
-            {:error, reason} -> {entries, Map.put(errors, name, reason)}
+            {:error, reason} -> {entries, Map.put(errors, record.name, reason)}
           end
+        end)
 
-        {:error, reason} ->
-          {entries, Map.put(errors, name, reason)}
-      end
-    end)
+      {:error, reason} ->
+        {[], %{local_openai_store: reason}}
+    end
   end
 
   defp fetch_models_body_for_materialization(target, record) do
-    url = LocalOpenAi.models_url(record.endpoint)
-
-    headers =
-      if is_binary(record.api_key) and record.api_key != "" do
-        ["Authorization: Bearer #{record.api_key}"]
-      else
-        []
-      end
-
-    with {:ok, paths} <- catalog_executables(target) do
-      script = Tightbeam.Harness.Support.catalog_curl(url, headers, "", paths.curl)
-
-      case Tightbeam.Harness.Support.catalog_probe(
-             &Tightbeam.Harness.Support.system_cmd_out/1,
-             Tightbeam.Harness.Support.catalog_probe_argv(nil, script, paths)
-           ) do
-        {:ok, body, _trailer} -> {:ok, body}
-        {:error, reason} -> {:error, reason}
-      end
-    end
-  end
-
-  defp catalog_executables(_target) do
-    with sh when is_binary(sh) <- absolute_path("sh"),
-         curl when is_binary(curl) <- absolute_path("curl") do
-      {:ok, %{sh: sh, curl: curl}}
-    else
-      _ -> {:error, :executable_not_found}
-    end
-  end
-
-  defp absolute_path(name) do
-    case System.find_executable(name) do
-      path when is_binary(path) ->
-        if Path.type(path) == :absolute, do: path, else: nil
-
-      _ ->
-        nil
-    end
+    LocalOpenAi.fetch_models_body(target, record)
   end
 
   defp target_for(base_dir) do

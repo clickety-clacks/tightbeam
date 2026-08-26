@@ -7,43 +7,60 @@ defmodule Tightbeam.PiProvider.LocalOpenAi do
 
   @doc false
   def fetch_catalog(state, %{name: name} = record) do
-    with {:ok, paths} <- catalog_executables(state, destination(state)) do
-      url = models_url(record.endpoint)
-      headers = auth_headers(record)
-
-      script = Support.catalog_curl(url, headers, "", paths.curl)
-
-      case Support.catalog_probe(
-             sh(state),
-             Support.catalog_probe_argv(destination(state), script, paths)
-           ) do
-        {:ok, body, _trailer} -> decode_catalog(body, name)
-        {:error, reason} -> {:error, {:local_openai_catalog_failed, name, reason}}
-      end
-    else
-      {:error, executable} -> {:error, {:executable_not_found, executable}}
+    case fetch_models_body(state, record) do
+      {:ok, body} -> decode_catalog(body, name)
+      {:error, {:executable_not_found, _} = reason} -> {:error, reason}
+      {:error, reason} -> {:error, {:local_openai_catalog_failed, name, reason}}
     end
   end
 
   @doc false
-  def credential_live?(target, %{name: name, endpoint: endpoint} = record, opts) do
-    with {:ok, paths} <- catalog_executables(target, destination(target)) do
-      url = models_url(endpoint)
-      headers = auth_headers(record)
-
-      script = Support.catalog_curl(url, headers, "", paths.curl)
-
-      request = %{
-        command: Support.catalog_probe_argv(destination(target), script, paths),
-        response: :catalog
-      }
-
-      case Support.credential_live_result(target, request, opts) do
-        :live -> :live
-        other -> tag_liveness(name, other)
+  def fetch_models_body(state, record) do
+    with {:ok, paths} <- catalog_executables(state, destination(state), record),
+         {:ok, script, cleanup} <- catalog_script(state, record, paths) do
+      try do
+        case Support.catalog_probe(
+               sh(state),
+               Support.catalog_probe_argv(destination(state), script, paths)
+             ) do
+          {:ok, body, _trailer} -> {:ok, body}
+          {:error, reason} -> {:error, reason}
+        end
+      after
+        cleanup.()
       end
     else
-      :error -> {:unknown, {:executable_not_found, "sh or curl"}}
+      {:error, executable} when is_binary(executable) ->
+        {:error, {:executable_not_found, executable}}
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  @doc false
+  def credential_live?(target, %{name: name} = record, opts) do
+    with {:ok, paths} <- catalog_executables(target, destination(target), record),
+         {:ok, script, cleanup} <- catalog_script(target, record, paths) do
+      try do
+        request = %{
+          command: Support.catalog_probe_argv(nil, script, paths),
+          response: :catalog
+        }
+
+        case Support.credential_live_result(target, request, opts) do
+          :live -> :live
+          other -> tag_liveness(name, other)
+        end
+      after
+        cleanup.()
+      end
+    else
+      {:error, executable} when is_binary(executable) ->
+        {:unknown, {:executable_not_found, executable}}
+
+      {:error, reason} ->
+        {:unknown, reason}
     end
   end
 
@@ -67,7 +84,7 @@ defmodule Tightbeam.PiProvider.LocalOpenAi do
     models =
       decoded
       |> model_entries()
-      |> Enum.map(&pi_model_entry/1)
+      |> Enum.map(&pi_model_entry(record.name, &1))
 
     base_url =
       if String.ends_with?(record.endpoint, "/v1") do
@@ -76,16 +93,24 @@ defmodule Tightbeam.PiProvider.LocalOpenAi do
         record.endpoint <> "/v1"
       end
 
+    compat = %{
+      "supportsDeveloperRole" => false,
+      "supportsReasoningEffort" => false,
+      "maxTokensField" => "max_tokens",
+      "supportsStrictMode" => false
+    }
+
+    compat =
+      if models != [] and Enum.all?(models, & &1["reasoning"]) do
+        Map.put(compat, "thinkingFormat", "qwen-chat-template")
+      else
+        compat
+      end
+
     provider = %{
       "baseUrl" => base_url,
       "api" => "openai-completions",
-      "compat" => %{
-        "supportsDeveloperRole" => false,
-        "supportsReasoningEffort" => false,
-        "maxTokensField" => "max_tokens",
-        "supportsStrictMode" => false,
-        "thinkingFormat" => "qwen-chat-template"
-      },
+      "compat" => compat,
       "models" => models
     }
 
@@ -156,6 +181,7 @@ defmodule Tightbeam.PiProvider.LocalOpenAi do
 
   defp catalog_entry(name, %{id: id, max_model_len: max_model_len}) do
     context_window = max_model_len || 131_072
+    proven? = proven_spark_model?(name, id)
 
     %{
       family: "#{name}/#{id}",
@@ -167,7 +193,7 @@ defmodule Tightbeam.PiProvider.LocalOpenAi do
       capabilities: %{
         "input" => ["text"],
         "max_output_tokens" => @default_max_output,
-        "tool_use" => true,
+        "tool_use" => proven?,
         "developer_role" => false,
         "reasoning_effort" => false,
         "supported_reasoning_levels" => []
@@ -177,13 +203,13 @@ defmodule Tightbeam.PiProvider.LocalOpenAi do
     }
   end
 
-  defp pi_model_entry(%{id: id, max_model_len: max_model_len}) do
+  defp pi_model_entry(name, %{id: id, max_model_len: max_model_len}) do
     context_window = max_model_len || 131_072
 
     %{
       "id" => id,
       "name" => id,
-      "reasoning" => true,
+      "reasoning" => proven_spark_model?(name, id),
       "input" => ["text"],
       "contextWindow" => context_window,
       "maxTokens" => @default_max_output,
@@ -191,27 +217,90 @@ defmodule Tightbeam.PiProvider.LocalOpenAi do
     }
   end
 
-  defp auth_headers(%{api_key: key}) when is_binary(key) and key != "" do
-    ["Authorization: Bearer #{key}"]
+  defp proven_spark_model?("spark", "qwen3.5-35b"), do: true
+  defp proven_spark_model?(_provider, _model), do: false
+
+  defp catalog_script(_state, %{api_key: key, endpoint: endpoint}, paths)
+       when is_binary(key) and key != "" do
+    path =
+      Path.join(
+        System.tmp_dir!(),
+        "tightbeam-pi-auth-#{System.unique_integer([:positive, :monotonic])}"
+      )
+
+    case File.write(path, "Authorization: Bearer #{key}\n", [:binary, :exclusive]) do
+      :ok ->
+        case File.chmod(path, 0o600) do
+          :ok ->
+            script =
+              Support.catalog_curl(models_url(endpoint), ["@#{path}"], "", paths.curl)
+
+            {:ok, script, fn -> File.rm(path) end}
+
+          {:error, reason} ->
+            File.rm(path)
+            {:error, {:auth_file_failed, reason}}
+        end
+
+      {:error, reason} ->
+        {:error, {:auth_file_failed, reason}}
+    end
   end
 
-  defp auth_headers(_record), do: []
+  defp catalog_script(_state, %{api_key_file: path, endpoint: endpoint}, paths)
+       when is_binary(path) do
+    header = path <> ".header-#{System.unique_integer([:positive, :monotonic])}"
 
-  defp catalog_executables(state, nil) do
+    prepare =
+      "umask 077; " <>
+        "/usr/bin/plutil -extract apiKey raw -o - #{Support.shell_quote(path)} | " <>
+        "/usr/bin/sed 's/^/Authorization: Bearer /' > #{Support.shell_quote(header)} && " <>
+        "/bin/chmod 600 #{Support.shell_quote(header)} && "
+
+    curl = Support.catalog_curl(models_url(endpoint), ["@#{header}"], "", paths.curl)
+
+    script =
+      prepare <> curl <> "; status=$?; /bin/rm -f #{Support.shell_quote(header)}; exit $status"
+
+    {:ok, script, fn -> :ok end}
+  end
+
+  defp catalog_script(_state, %{endpoint: endpoint}, paths) do
+    {:ok, Support.catalog_curl(models_url(endpoint), [], "", paths.curl), fn -> :ok end}
+  end
+
+  defp catalog_executables(state, nil, _record) do
     with {:ok, sh} <- absolute_executable(state, "sh"),
          {:ok, curl} <- absolute_executable(state, "curl") do
       {:ok, %{sh: sh, curl: curl}}
-    else
-      :error -> {:error, "sh or curl"}
     end
   end
 
-  defp catalog_executables(state, _destination) do
-    with {:ok, ssh} <- absolute_executable(state, "ssh") do
+  defp catalog_executables(state, _destination, record) do
+    required =
+      ["/bin/sh", "/usr/bin/curl"] ++
+        if(is_binary(Map.get(record, :api_key_file)),
+          do: ["/usr/bin/plutil", "/usr/bin/sed", "/bin/chmod", "/bin/rm"],
+          else: []
+        )
+
+    with {:ok, ssh} <- absolute_executable(state, "ssh"),
+         :ok <- remote_executables(state, ssh, required) do
       {:ok, %{ssh: ssh, sh: "/bin/sh", curl: "/usr/bin/curl"}}
-    else
-      :error -> {:error, "ssh"}
     end
+  end
+
+  defp remote_executables(state, ssh, paths) do
+    Enum.reduce_while(paths, :ok, fn path, :ok ->
+      argv =
+        [ssh | Support.ssh_opts()] ++
+          [destination(state), "/bin/test", "-x", path]
+
+      case Support.bounded_run(sh(state), argv, 5_000) do
+        {:ok, {_output, 0}} -> {:cont, :ok}
+        _ -> {:halt, {:error, path}}
+      end
+    end)
   end
 
   defp absolute_executable(container, name) do
@@ -222,10 +311,10 @@ defmodule Tightbeam.PiProvider.LocalOpenAi do
 
     case find.(name) do
       path when is_binary(path) ->
-        if Path.type(path) == :absolute, do: {:ok, path}, else: :error
+        if Path.type(path) == :absolute, do: {:ok, path}, else: {:error, name}
 
       _ ->
-        :error
+        {:error, name}
     end
   end
 
@@ -233,6 +322,7 @@ defmodule Tightbeam.PiProvider.LocalOpenAi do
   defp destination(_), do: nil
 
   defp sh(%{options: %{sh: sh}}) when is_function(sh, 1), do: sh
+  defp sh(%{sh: sh}) when is_function(sh, 1), do: sh
   defp sh(_), do: &Support.system_cmd_out/1
 
   defp tag_liveness(name, {:dead, reason}), do: {:dead, {:local_openai, name, reason}}

@@ -346,6 +346,7 @@ defmodule Tightbeam.Credentials do
        log_event: Keyword.get(opts, :log_event, fn _kind, _subject, _detail -> :ok end),
        machine: machine,
        ssh: Keyword.get(opts, :ssh),
+       ssh_bin: Keyword.get(opts, :ssh_bin, System.find_executable("ssh")),
        sh: Keyword.get(opts, :sh, &system_cmd/1),
        sh_out:
          Keyword.get_lazy(opts, :sh_out, fn ->
@@ -1354,13 +1355,13 @@ defmodule Tightbeam.Credentials do
       providers_dir = Providers.providers_dir(state.base_dir)
 
       script =
-        "test -f #{shell_quote(source)} && " <>
-          "mkdir -p #{shell_quote(providers_dir)} && " <>
-          "chmod 600 #{shell_quote(source)} && " <>
-          "mv #{shell_quote(source)} #{shell_quote(store)} && " <>
-          "chmod 600 #{shell_quote(store)}"
+        "/bin/test -f #{shell_quote(source)} && " <>
+          "/bin/mkdir -p #{shell_quote(providers_dir)} && " <>
+          "/bin/chmod 600 #{shell_quote(source)} && " <>
+          "/bin/mv #{shell_quote(source)} #{shell_quote(store)} && " <>
+          "/bin/chmod 600 #{shell_quote(store)}"
 
-      case remote_command(state, ["sh", "-c", shell_quote(script)]) do
+      case remote_command(state, ["/bin/sh", "-c", shell_quote(script)]) do
         {_output, 0} ->
           reconcile_provider_homes(state, :local_openai)
           {:ok, installed_metadata(:local_openai, kind)}
@@ -1454,7 +1455,13 @@ defmodule Tightbeam.Credentials do
   end
 
   defp remote_command(state, command) do
-    state.sh.(["ssh" | @ssh_opts] ++ [state.ssh | command])
+    case state.ssh_bin do
+      path when is_binary(path) and path != "" ->
+        state.sh.([path | @ssh_opts] ++ [state.ssh | command])
+
+      _ ->
+        {"ssh executable not found", 127}
+    end
   end
 
   defp system_cmd([binary | args]) do
