@@ -33,7 +33,7 @@ fn main() {
             Ok(status) => std::process::exit(status),
             Err(error) => {
                 eprintln!("{error}");
-                std::process::exit(1);
+                std::process::exit(2);
             }
         }
     }

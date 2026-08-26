@@ -62,20 +62,18 @@ fn command_matches(action: Action, command: &str) -> bool {
 }
 
 fn argv_matches(action: Action, argv: &[String]) -> bool {
+    let argv = command_argv(argv);
+
     if let [shell, flag, nested, ..] = argv
-        && matches!(shell.as_str(), "sh" | "bash" | "zsh")
+        && matches!(program_name(shell), "sh" | "bash" | "zsh")
         && flag == "-c"
     {
         return command_matches(action, nested);
     }
 
-    let [program, subcommand, rest @ ..] = argv else {
+    let Some((subcommand, rest)) = git_action_argv(argv) else {
         return false;
     };
-
-    if program != "git" {
-        return false;
-    }
 
     match action {
         Action::GitStash if subcommand == "stash" => match rest.first().map(String::as_str) {
@@ -97,6 +95,212 @@ fn argv_matches(action: Action, argv: &[String]) -> bool {
         Action::GitRestore if subcommand == "restore" => true,
         _ => false,
     }
+}
+
+fn program_name(value: &str) -> &str {
+    value.rsplit('/').next().unwrap_or(value)
+}
+
+fn is_assignment(value: &str) -> bool {
+    let Some((name, _)) = value.split_once('=') else {
+        return false;
+    };
+
+    !name.is_empty()
+        && name.chars().enumerate().all(|(index, ch)| {
+            ch == '_' || ch.is_ascii_alphanumeric() && (index > 0 || !ch.is_ascii_digit())
+        })
+}
+
+fn command_argv(mut argv: &[String]) -> &[String] {
+    while argv.first().is_some_and(|arg| is_assignment(arg)) {
+        argv = &argv[1..];
+    }
+
+    if argv
+        .first()
+        .is_some_and(|arg| program_name(arg) == "command")
+    {
+        argv = &argv[1..];
+        while argv.first().is_some_and(|arg| arg.starts_with('-')) {
+            argv = &argv[1..];
+        }
+    }
+
+    if argv.first().is_some_and(|arg| program_name(arg) == "env") {
+        argv = &argv[1..];
+        loop {
+            match argv {
+                [option, _, rest @ ..] if matches!(option.as_str(), "-u" | "--unset") => {
+                    argv = rest
+                }
+                [option, rest @ ..]
+                    if option == "-i"
+                        || option == "--ignore-environment"
+                        || option.starts_with("--unset=") =>
+                {
+                    argv = rest
+                }
+                [assignment, rest @ ..] if is_assignment(assignment) => argv = rest,
+                _ => break,
+            }
+        }
+    }
+
+    argv
+}
+
+fn git_action_argv(argv: &[String]) -> Option<(&str, &[String])> {
+    let argv = command_argv(argv);
+    let [program, rest @ ..] = argv else {
+        return None;
+    };
+    if program_name(program) != "git" {
+        return None;
+    }
+
+    let mut index = 0;
+    while let Some(argument) = rest.get(index) {
+        if !argument.starts_with('-') || argument == "-" {
+            return Some((argument, &rest[index + 1..]));
+        }
+
+        let takes_separate_value = matches!(
+            argument.as_str(),
+            "-C" | "-c"
+                | "--git-dir"
+                | "--work-tree"
+                | "--namespace"
+                | "--exec-path"
+                | "--config-env"
+        );
+        index += if takes_separate_value { 2 } else { 1 };
+    }
+
+    None
+}
+
+fn heredoc_delimiters(line: &str) -> Vec<(String, bool)> {
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum Quote {
+        None,
+        Single,
+        Double,
+    }
+
+    let chars: Vec<char> = line.chars().collect();
+    let mut delimiters = Vec::new();
+    let mut quote = Quote::None;
+    let mut escaped = false;
+    let mut index = 0;
+
+    while index < chars.len() {
+        let ch = chars[index];
+        if escaped {
+            escaped = false;
+            index += 1;
+            continue;
+        }
+        match quote {
+            Quote::Single => {
+                if ch == '\'' {
+                    quote = Quote::None;
+                }
+                index += 1;
+            }
+            Quote::Double => {
+                if ch == '"' {
+                    quote = Quote::None;
+                } else if ch == '\\' {
+                    escaped = true;
+                }
+                index += 1;
+            }
+            Quote::None if ch == '\'' => {
+                quote = Quote::Single;
+                index += 1;
+            }
+            Quote::None if ch == '"' => {
+                quote = Quote::Double;
+                index += 1;
+            }
+            Quote::None if ch == '\\' => {
+                escaped = true;
+                index += 1;
+            }
+            Quote::None if ch == '<' && chars.get(index + 1) == Some(&'<') => {
+                if chars.get(index + 2) == Some(&'<') {
+                    index += 3;
+                    continue;
+                }
+                index += 2;
+                let strip_tabs = chars.get(index) == Some(&'-');
+                if strip_tabs {
+                    index += 1;
+                }
+                while chars.get(index).is_some_and(|ch| ch.is_ascii_whitespace()) {
+                    index += 1;
+                }
+
+                let delimiter_quote = match chars.get(index) {
+                    Some('\'') => {
+                        index += 1;
+                        Some('\'')
+                    }
+                    Some('"') => {
+                        index += 1;
+                        Some('"')
+                    }
+                    _ => None,
+                };
+                let start = index;
+                while let Some(ch) = chars.get(index) {
+                    if delimiter_quote.is_some_and(|closing| *ch == closing)
+                        || delimiter_quote.is_none()
+                            && (ch.is_ascii_whitespace() || matches!(ch, ';' | '&' | '|'))
+                    {
+                        break;
+                    }
+                    index += 1;
+                }
+                if index > start {
+                    delimiters.push((chars[start..index].iter().collect(), strip_tabs));
+                }
+                if delimiter_quote.is_some() && chars.get(index) == delimiter_quote.as_ref() {
+                    index += 1;
+                }
+            }
+            Quote::None => index += 1,
+        }
+    }
+
+    delimiters
+}
+
+fn without_heredoc_bodies(command: &str) -> String {
+    use std::collections::VecDeque;
+
+    let mut pending: VecDeque<(String, bool)> = VecDeque::new();
+    let mut kept = Vec::new();
+
+    for line in command.lines() {
+        if let Some((delimiter, strip_tabs)) = pending.front() {
+            let candidate = if *strip_tabs {
+                line.trim_start_matches('\t')
+            } else {
+                line
+            };
+            if candidate == delimiter {
+                pending.pop_front();
+            }
+            continue;
+        }
+
+        pending.extend(heredoc_delimiters(line));
+        kept.push(line);
+    }
+
+    kept.join("\n")
 }
 
 fn shell_segments(command: &str) -> Vec<Vec<String>> {
@@ -127,6 +331,7 @@ fn shell_segments(command: &str) -> Vec<Vec<String>> {
     let mut quote = Quote::None;
     let mut escaped = false;
     let mut comment = false;
+    let command = without_heredoc_bodies(command);
     let mut chars = command.chars().peekable();
 
     while let Some(ch) = chars.next() {
@@ -224,6 +429,11 @@ mod tests {
             "git stash -u",
             "cd src && git stash push -m wip",
             "sh -c 'git stash pop'",
+            "git -C repo stash",
+            "/usr/bin/git --no-pager stash",
+            "env HOME=/tmp git stash",
+            "command git stash",
+            "/bin/sh -c 'git -C repo stash'",
         ] {
             assert!(command_matches(Action::GitStash, command), "{command}");
         }
@@ -241,10 +451,28 @@ mod tests {
     }
 
     #[test]
+    fn heredoc_report_bodies_are_not_executable_segments() {
+        let report = "cat <<'REPORT'\ngit stash\nREPORT";
+        assert!(!command_matches(Action::GitStash, report));
+
+        let followed_by_action = "cat <<REPORT\ngit stash is prose\nREPORT\ngit stash";
+        assert!(command_matches(Action::GitStash, followed_by_action));
+
+        assert!(!command_matches(
+            Action::GitStash,
+            "printf '%s' 'literal <<REPORT and git stash'"
+        ));
+    }
+
+    #[test]
     fn sibling_git_actions_use_argv_and_preserve_non_destructive_forms() {
         assert!(command_matches(
             Action::GitResetHard,
             "git reset --hard HEAD"
+        ));
+        assert!(command_matches(
+            Action::GitResetHard,
+            "/usr/bin/git -C repo reset --hard HEAD"
         ));
         assert!(!command_matches(
             Action::GitResetHard,

@@ -102,7 +102,10 @@ defmodule Tightbeam.RailsTest do
     assert [%{"command" => command}] = entry["hooks"]
 
     assert command ==
-             "sh -c 'tightbeam rail-action git-stash || exit 0; " <>
+             "sh -c 'tightbeam rail-action git-stash; status=$?; " <>
+               "if [ \"$status\" -eq 1 ]; then exit 0; fi; " <>
+               "if [ \"$status\" -ne 0 ]; then " <>
+               "echo \"[gate: no-history-rewrites] action classifier failed closed (status $status).\" >&2; exit 2; fi; " <>
                "echo \"[gate: no-history-rewrites] History-rewriting git commands are forbidden here: " <>
                "other agents may have uncommitted work in this tree.\" >&2; exit 2'"
   end

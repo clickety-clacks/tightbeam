@@ -315,7 +315,10 @@ defmodule Tightbeam.Rails do
 
     predicate =
       if action do
-        "tightbeam rail-action #{action} || exit 0"
+        "tightbeam rail-action #{action}; status=$?; " <>
+          "if [ \"$status\" -eq 1 ]; then exit 0; fi; " <>
+          "if [ \"$status\" -ne 0 ]; then " <>
+          "echo \"[gate: #{statute.name}] action classifier failed closed (status $status).\" >&2; exit 2; fi"
       else
         "grep -qE \"#{escape_double_quoted(statute.pattern)}\" - || exit 0"
       end
