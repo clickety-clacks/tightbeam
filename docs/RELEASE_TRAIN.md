@@ -126,7 +126,9 @@ A promoted release is not operationally complete on a gateway until that
 deployment runs the canonical
 [satellite CLI update and readback](UPGRADE.md#update-every-registered-satellite-cli)
 stage. The deployer must retain its per-host version and target evidence with
-the release evidence.
+the release evidence. That evidence includes the gateway registry inventory,
+the fleet update outcomes, and the explicit target/version probes required by
+the canonical procedure.
 
 Stop the deployment when any registered satellite does not report the deployed
 version. Use the matching verified target package for a cross-architecture

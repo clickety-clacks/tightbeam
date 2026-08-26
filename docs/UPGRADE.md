@@ -53,21 +53,66 @@ target. It copies the running CLI only when the satellite target matches the
 gateway host target. It refuses a cross-architecture replacement instead of
 installing an incompatible binary.
 
-Treat the command output as the fleet readback. Retain every per-host line with
-the upgrade evidence. A complete successful readback has one
-`already current (<version>)` or `updated (<old-version> -> <version>)` outcome
-for every registered satellite. Any missing host, `incompatible`, `unreachable`,
-`timed out`, `question failed`, `target check failed`, or `refused` outcome
-stops the upgrade.
+Capture the authoritative satellite inventory from the gateway registry. Run
+this read-only query against the same base directory as the running gateway:
 
-For an incompatible host, install the matching target package from the proved
-release set at that host's registered CLI path. Verify the package against the
-release `SHA256SUMS`, then run `update-clients` again and retain the new per-host
-readback. Do not bypass the target refusal by copying the gateway host binary.
+```sh
+sqlite3 -header -column "$TIGHTBEAM_BASE_DIR/state.db" \
+  'SELECT name, ssh, cliBin FROM hosts ORDER BY name;'
+```
+
+The query supplies the SSH destination and registered CLI path that
+`update-clients` uses. For every returned row, run the following read-only probe
+with that row's values. Shell-quote the registered path when you substitute it.
+
+```sh
+ssh <ssh-destination> "'<registered-cli-bin>/tightbeam' version; uname -sm"
+```
+
+Retain the inventory, every `update-clients` line, and every probe result. A
+complete successful readback has one `already current (<version>)` or
+`updated (<old-version> -> <version>)` outcome plus the deployed version and
+`uname -sm` target for every inventory row. Any missing host, missing probe,
+version mismatch, target mismatch, `incompatible`, `unreachable`, `timed out`,
+`question failed`, `target check failed`, or `refused` outcome stops the
+upgrade.
+
+For an incompatible host, map its retained `uname -sm` result to the supported
+release target: `Darwin arm64` selects `darwin-aarch64`, and
+`Linux x86_64` selects `linux-x86_64`. Any other result has no supported
+package and stops the upgrade. Verify the matching package against the release
+`SHA256SUMS`. Then extract only its CLI, copy it to a staged name under the
+registered CLI path, verify the staged CLI on the satellite, and atomically
+replace the old CLI:
+
+```sh
+PACKAGE=<verified-tightbeam-target-package.tgz>
+VERSION=<release-version>
+SSH_DEST=<registered-ssh-destination>
+CLI_BIN=<registered-cli-bin>
+LOCAL_STAGE=$(mktemp -d)
+REMOTE_STAGE="$CLI_BIN/.tightbeam.release-$VERSION"
+
+tar -xzf "$PACKAGE" -C "$LOCAL_STAGE" tightbeam/bin/tightbeam
+scp -- "$LOCAL_STAGE/tightbeam/bin/tightbeam" "$SSH_DEST:$REMOTE_STAGE"
+REMOTE_VERSION=$(ssh "$SSH_DEST" "chmod +x '$REMOTE_STAGE' && '$REMOTE_STAGE' version")
+if [ "$REMOTE_VERSION" != "$VERSION" ]; then
+  ssh "$SSH_DEST" "rm -f '$REMOTE_STAGE'"
+  echo "staged CLI version mismatch: $REMOTE_VERSION" >&2
+  exit 1
+fi
+ssh "$SSH_DEST" "mv -f '$REMOTE_STAGE' '$CLI_BIN/tightbeam'"
+```
+
+Run `update-clients` again. Repeat the inventory and per-host probe. Retain the
+new complete readback. Do not bypass the target refusal by copying the gateway
+host binary.
 
 A gateway rollback includes the same stage. Run `update-clients` from the
-restored gateway package, require every satellite to report the restored
-version, and retain that rollback readback with the rollback evidence.
+restored gateway package. Use the verified restored-version target package for
+each incompatible host. Repeat the inventory and per-host probe, require every
+satellite to report the restored version and target, and retain that complete
+rollback readback with the rollback evidence.
 
 ## What the stop actually does
 

@@ -14,20 +14,37 @@ defmodule Tightbeam.UpgradeProcedureTest do
     assert section =~ "tightbeam update-clients --as-user <adminUserId>"
     assert section =~ "registered CLI version from every satellite host"
     assert section =~ "reads `uname -sm` and derives that host's\ntarget"
-    assert section =~ "`already current (<version>)` or `updated (<old-version> -> <version>)`"
-    assert section =~ "for every registered satellite"
-    assert section =~ "Any missing host"
-    assert section =~ "or `refused` outcome\nstops the upgrade"
+    assert section =~ "SELECT name, ssh, cliBin FROM hosts ORDER BY name;"
+
+    assert section =~
+             ~s(ssh <ssh-destination> "'<registered-cli-bin>/tightbeam' version; uname -sm")
+
+    assert section =~
+             "`already current (<version>)` or\n`updated (<old-version> -> <version>)`"
+
+    assert section =~ "plus the deployed version and\n`uname -sm` target for every inventory row"
+    assert section =~ "Any missing host, missing probe,\nversion mismatch, target mismatch"
+    assert section =~ "or `refused` outcome stops the\nupgrade"
   end
 
   test "upgrade preserves cross-target refusal and rollback readback" do
     section = File.read!(@upgrade) |> section!("## Update every registered satellite CLI")
 
     assert section =~ "It refuses a cross-architecture replacement"
-    assert section =~ "Verify the package against the\nrelease `SHA256SUMS`"
+    assert section =~ "`Darwin arm64` selects `darwin-aarch64`"
+    assert section =~ "`Linux x86_64` selects `linux-x86_64`"
+    assert section =~ "Any other result has no supported\npackage and stops the upgrade"
+    assert section =~ "Verify the matching package against the release\n`SHA256SUMS`"
+    assert section =~ ~s(tar -xzf "$PACKAGE" -C "$LOCAL_STAGE" tightbeam/bin/tightbeam)
+    assert section =~ ~s(scp -- "$LOCAL_STAGE/tightbeam/bin/tightbeam" "$SSH_DEST:$REMOTE_STAGE")
+    assert section =~ ~s(REMOTE_VERSION=$(ssh "$SSH_DEST")
+    assert section =~ ~s(if [ "$REMOTE_VERSION" != "$VERSION" ]; then)
+    assert section =~ ~s("rm -f '$REMOTE_STAGE'")
+    assert section =~ ~s("mv -f '$REMOTE_STAGE' '$CLI_BIN/tightbeam'")
     assert section =~ "Do not bypass the target refusal"
     assert section =~ "A gateway rollback includes the same stage"
-    assert section =~ "retain that rollback readback with the rollback evidence"
+    assert section =~ "Repeat the inventory and per-host probe"
+    assert section =~ "retain that complete\nrollback readback with the rollback evidence"
   end
 
   test "release train requires the canonical upgrade stage without duplicating it" do
@@ -38,6 +55,8 @@ defmodule Tightbeam.UpgradeProcedureTest do
              "[satellite CLI update and readback](UPGRADE.md#update-every-registered-satellite-cli)"
 
     assert section =~ "per-host version and target evidence"
+    assert section =~ "gateway registry inventory"
+    assert section =~ "explicit target/version probes"
     assert section =~ "A rollback must run\nthe same stage"
     refute procedure =~ "tightbeam update-clients"
   end
