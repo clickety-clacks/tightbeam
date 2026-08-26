@@ -719,7 +719,7 @@ defmodule Tightbeam.ConditionFactsTest do
     {:ok, _} =
       DB.query(
         ctx.db,
-        "INSERT OR IGNORE INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1)"
+        "INSERT OR IGNORE INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 0, 'admin_add', 1)"
       )
 
     caller =

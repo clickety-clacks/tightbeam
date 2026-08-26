@@ -9,6 +9,8 @@ defmodule Tightbeam.Boot do
   startup and does not linger as a process.
   """
 
+  require Logger
+
   alias Tightbeam.{Escalation, EventLog, Ledger, Schema}
 
   @spec child_spec(term()) :: Supervisor.child_spec()
@@ -24,7 +26,7 @@ defmodule Tightbeam.Boot do
   @doc "Run the boot sequence; returns :ignore so no process lingers."
   @spec start_link(String.t()) :: :ignore
   def start_link(base_dir) do
-    :ok = Schema.ensure_all(Tightbeam.DB)
+    ensure_schema!()
     epoch = EventLog.boot()
     Application.put_env(:tightbeam, :boot_epoch, epoch)
     # Boot recovery: any 'running' turn from a prior life is UNKNOWN-terminal.
@@ -36,6 +38,25 @@ defmodule Tightbeam.Boot do
 
     write_harnesses!(base_dir, projections)
     :ignore
+  end
+
+  defp ensure_schema! do
+    Schema.ensure_all(Tightbeam.DB)
+  rescue
+    error in Schema.ShapeError ->
+      invariant =
+        case Regex.run(~r/^incompatible_cold_start_v1: ([^;]+)/, error.message) do
+          [_, value] -> value
+          _ -> "unknown"
+        end
+
+      Logger.error("cold-start schema is incompatible",
+        code: "incompatible_cold_start_v1",
+        invariant: invariant,
+        recoverySection: "Recover an unusable fresh database"
+      )
+
+      reraise error, __STACKTRACE__
   end
 
   @doc false

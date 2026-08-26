@@ -58,7 +58,7 @@ defmodule Tightbeam.Wire.Socket do
 
   @behaviour WebSock
 
-  alias Tightbeam.{ConnRegistry, DB, Devices, Dispatch, Org, Projection}
+  alias Tightbeam.{ColdStart, ConnRegistry, DB, Devices, Dispatch, Org, Projection}
   alias Tightbeam.Wire.Payloads
 
   @max_content_bytes 64 * 1024
@@ -246,29 +246,41 @@ defmodule Tightbeam.Wire.Socket do
       true ->
         info = if is_map(msg["deviceInfo"]), do: msg["deviceInfo"], else: %{}
 
-        result =
-          Devices.pair(db(state), %{
-            device_id: device_id,
-            claimed_name: string(msg["claimedName"] || "device"),
-            platform: info["platform"],
-            model: info["model"]
-          })
+        case ColdStart.decode_replay_secret(msg["claimReplaySecret"]) do
+          {:error, :invalid_message} ->
+            stop_with(Payloads.wire_error("invalid_message"), state)
 
-        payload =
-          case result do
-            {:paired, device} -> Payloads.pair_result({:ok, device.token, device.user_id})
-            {:pending, _device} -> Payloads.pair_result({:error, "pair_pending"})
-            :denied -> Payloads.pair_result({:error, "pair_denied"})
-          end
+          {:ok, replay_secret} ->
+            result =
+              ColdStart.pair(
+                db(state),
+                %{
+                  device_id: device_id,
+                  claimed_name: string(msg["claimedName"] || "device"),
+                  platform: info["platform"],
+                  model: info["model"],
+                  replay_secret: replay_secret
+                },
+                Map.fetch!(state.deps, :defaults)
+              )
 
-        stop_with(payload, state)
+            payload =
+              case result do
+                {:paired, device} -> Payloads.pair_result({:ok, device.token, device.user_id})
+                {:pending, _device} -> Payloads.pair_result({:error, "pair_pending"})
+                :denied -> Payloads.pair_result({:error, "pair_denied"})
+                {:error, reason} -> Payloads.pair_result({:error, reason})
+              end
+
+            stop_with(payload, state)
+        end
     end
   end
 
   defp auth(msg, state) do
     token = string(msg["token"])
 
-    case Devices.by_token(db(state), token) do
+    case ColdStart.authenticate(db(state), token) do
       nil ->
         known = Devices.by_id(db(state), string(msg["deviceId"]))
 
@@ -495,42 +507,12 @@ defmodule Tightbeam.Wire.Socket do
     key = Org.personal_session_key(user_id)
 
     unless Org.get(db(state), key) do
-      defaults = Map.fetch!(state.deps, :defaults)
-      provider = Map.fetch!(defaults, :provider)
-      provider = if is_function(provider, 0), do: provider.(), else: provider
+      defaults = state.deps |> Map.fetch!(:defaults) |> Org.resolve_personal_main_defaults()
 
       try do
         {:ok, _session} =
           DB.transaction(db(state), fn txn ->
-            case DB.Txn.q(txn, "SELECT 1 FROM sessions WHERE sessionKey = ?1", [key]) do
-              [[1]] ->
-                :ok
-
-              [] ->
-                archetype =
-                  case DB.Txn.q(
-                         txn,
-                         "SELECT value FROM org_settings WHERE key = 'default-archetype'"
-                       ) do
-                    [[configured]] -> configured
-                    [] -> "default"
-                  end
-
-                Org.create_in_txn(txn, %{
-                  session_key: key,
-                  display_name: "Main",
-                  kind: "main",
-                  is_built_in: true,
-                  order_index: 0,
-                  owner_user_id: user_id,
-                  origin: "user:#{user_id}",
-                  archetype: archetype,
-                  host: Tightbeam.Placement.local_host_name(),
-                  harness: defaults |> Map.fetch!(:harness) |> to_string(),
-                  provider: to_string(provider),
-                  model: Map.fetch!(defaults, :model)
-                })
-            end
+            Org.ensure_personal_main_in_txn(txn, user_id, defaults)
           end)
       rescue
         error in Tightbeam.DB.Error ->

@@ -53,6 +53,7 @@ defmodule Tightbeam.TestCase do
           catalog_reply: 1,
           catalog_reply: 2,
           catalog_probe_harness: 1,
+          claim_org: 2,
           ensure_all_schemas: 1,
           ensure_main_session: 2
         ]
@@ -82,6 +83,16 @@ defmodule Tightbeam.TestCase do
 
   @doc "Create the complete production schema for a unit-test database."
   def ensure_all_schemas(db), do: Tightbeam.Schema.ensure_all(db)
+
+  @doc "Claim a fresh test org through the production cold-start coordinator."
+  def claim_org(db, input) do
+    Tightbeam.ColdStart.pair(db, input, %{
+      host: "testhost",
+      harness: :claude,
+      provider: fn -> :anthropic end,
+      model: Tightbeam.Model.new("fable")
+    })
+  end
 
   @doc "Create the canonical self-parented Main fixture for an owner when absent."
   def ensure_main_session(db, owner) do

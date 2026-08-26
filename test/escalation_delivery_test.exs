@@ -638,14 +638,15 @@ defmodule Tightbeam.EscalationDeliveryTest do
   defp seed_world!(db) do
     :ok = Tightbeam.Schema.ensure_all(db)
 
-    :ok =
-      DB.execute(
-        db,
-        "INSERT OR IGNORE INTO users (userId, isAdmin, createdAt) VALUES ('flynn',0,1)"
-      )
+    {:paired, _device} =
+      claim_org(db, %{
+        device_id: "delivery-device",
+        claimed_name: "flynn",
+        platform: nil,
+        model: nil
+      })
 
     host = Placement.local_host_name()
-    create_session(db, Org.personal_session_key("flynn"), host)
     create_session(db, "top", host)
     create_session(db, "mid", host, "top")
     create_session(db, "holder", host, "mid")

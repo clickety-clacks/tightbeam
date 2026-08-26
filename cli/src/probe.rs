@@ -326,6 +326,7 @@ struct Report {
     marked_candidates: Vec<Candidate>,
     identity_candidates: BTreeMap<String, Vec<u32>>,
     adapter_candidates: Vec<AdapterCandidate>,
+    cold_start: Option<Value>,
     epistemics: Epistemics,
 }
 
@@ -1067,6 +1068,7 @@ fn assemble(
         marked_candidates,
         identity_candidates,
         adapter_candidates,
+        cold_start: None,
         epistemics: Epistemics {
             census_grade: "accident",
             absence_means: "possibly_laundered",
@@ -1093,6 +1095,17 @@ fn human(report: &Report) -> String {
         "{} ({}) — {} {}",
         report.host.hostname, report.host.platform, report.base_dir.path, report.base_dir.status
     )];
+    if let Some(cold_start) = &report.cold_start {
+        let state = cold_start
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let action = cold_start.get("action").and_then(Value::as_str);
+        lines.push(match action {
+            Some(action) => format!("cold start: {state} — {action}"),
+            None => format!("cold start: {state}"),
+        });
+    }
     if report.marked_candidates.is_empty() {
         lines.push("no marked candidates".to_owned());
     } else {
@@ -1288,6 +1301,10 @@ fn report_value(report: &Report) -> Value {
             ),
         ),
         (
+            "cold_start",
+            report.cold_start.clone().unwrap_or(Value::Null),
+        ),
+        (
             "epistemics",
             object([
                 ("census_grade", Value::from(report.epistemics.census_grade)),
@@ -1365,6 +1382,7 @@ pub fn run(json: bool, base_dir: Option<String>) -> Result<(), String> {
     let hostname = hostname(&io, &mut raw.notes);
     let base_dir = inspect_base_dir(&io, &resolved_base_dir, &mut raw.notes);
     let mut report = assemble(raw, probed_at_ms, 0, hostname, base_dir);
+    report.cold_start = crate::dispatch::cold_start_for_doctor(&resolved_base_dir).ok();
     report.collection_ms = u64::try_from(monotonic.elapsed().as_millis()).unwrap_or(u64::MAX);
     if json {
         println!("{}", report_json(&report));
@@ -2147,6 +2165,7 @@ mod tests {
   "schema": "tightbeam.probe.v1",
   "probed_at_ms": 1000,
   "collection_ms": 5,
+  "cold_start": null,
   "host": {
     "hostname": "host",
     "platform": "linux",
@@ -2247,6 +2266,7 @@ mod tests {
   "schema": "tightbeam.probe.v1",
   "probed_at_ms": 10000,
   "collection_ms": 7,
+  "cold_start": null,
   "host": {
     "hostname": "eezo",
     "platform": "linux",

@@ -26,7 +26,13 @@ defmodule Tightbeam.Firehose.PublisherTest do
     db = :firehose_work_item_create_db
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Tightbeam.Schema.ensure_all(db)
-    {:ok, _} = DB.query(db, "INSERT INTO users VALUES ('flynn', 1, 1)")
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('flynn',1,'admin_add',1)"
+      )
+
     register_testhost(db)
 
     handlers = Gateway.handlers(%{db: db})
@@ -72,7 +78,13 @@ defmodule Tightbeam.Firehose.PublisherTest do
     lane = :firehose_post_effect_lane
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Tightbeam.Schema.ensure_all(db)
-    {:ok, _} = DB.query(db, "INSERT INTO users VALUES ('flynn', 1, 1)")
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('flynn',1,'admin_add',1)"
+      )
+
     register_testhost(db)
     start_supervised!({ConnRegistry, name: registry})
     start_supervised!({LaneStub, name: lane})
@@ -122,7 +134,13 @@ defmodule Tightbeam.Firehose.PublisherTest do
     scheduler = :firehose_per_verb_effect_scheduler
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Tightbeam.Schema.ensure_all(db)
-    {:ok, _} = DB.query(db, "INSERT INTO users VALUES ('flynn', 1, 1)")
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('flynn',1,'admin_add',1)"
+      )
+
     register_testhost(db)
     start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
     start_supervised!({LaneStub, name: Tightbeam.LaneManager})
@@ -412,7 +430,13 @@ defmodule Tightbeam.Firehose.PublisherTest do
     db = :firehose_decision_returned_db
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Tightbeam.Schema.ensure_all(db)
-    {:ok, _} = DB.query(db, "INSERT INTO users VALUES ('flynn', 1, 1)")
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('flynn',1,'admin_add',1)"
+      )
+
     register_testhost(db)
 
     Enum.each(["return-asker", "return-reader"], fn session_key ->
@@ -466,7 +490,13 @@ defmodule Tightbeam.Firehose.PublisherTest do
     db = :firehose_turn_transition_db
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Tightbeam.Schema.ensure_all(db)
-    {:ok, _} = DB.query(db, "INSERT INTO users VALUES ('flynn', 1, 1)")
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('flynn',1,'admin_add',1)"
+      )
+
     register_testhost(db)
 
     Org.create(db, %{
@@ -587,7 +617,13 @@ defmodule Tightbeam.Firehose.PublisherTest do
     db = :firehose_role_delete_db
     start_supervised!({Tightbeam.DB, path: ":memory:", name: db})
     :ok = Tightbeam.Schema.ensure_all(db)
-    {:ok, _} = Tightbeam.DB.query(db, "INSERT INTO users VALUES ('flynn', 1, 1)")
+
+    {:ok, _} =
+      Tightbeam.DB.query(
+        db,
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('flynn',1,'admin_add',1)"
+      )
+
     %{name: "worker"} = Tightbeam.Roles.create!(db, "worker", "flynn", nil)
 
     call = %{

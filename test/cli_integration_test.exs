@@ -5,17 +5,10 @@ defmodule Tightbeam.CliIntegrationTest do
   @moduletag :cli_integration
 
   alias Tightbeam.{
-    Assets,
     Archetypes,
-    Assignments,
     CliCompatibility,
-    ConditionFacts,
     DB,
-    Devices,
-    Escalation,
-    EventLog,
     Gateway,
-    Idempotency,
     Ledger,
     Org,
     Projection,
@@ -23,9 +16,7 @@ defmodule Tightbeam.CliIntegrationTest do
     Rails,
     Roles,
     Rules,
-    Wakes,
-    WorkItems,
-    WorkState
+    Wakes
   }
 
   alias Tightbeam.Wire.Router
@@ -74,7 +65,7 @@ defmodule Tightbeam.CliIntegrationTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 1, 'admin_add', 1)"
       )
 
     main_key = Org.personal_session_key("flynn")
@@ -283,7 +274,7 @@ defmodule Tightbeam.CliIntegrationTest do
     {:ok, _} =
       DB.query(
         ctx.db,
-        "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('other', 0, 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('other', 0, 'admin_add', 1)"
       )
 
     other_main_key = Org.personal_session_key("other")

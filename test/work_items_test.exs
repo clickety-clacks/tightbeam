@@ -25,7 +25,7 @@ defmodule Tightbeam.WorkItemsTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1), ('other', 0, 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 0, 'admin_add', 1), ('other', 0, 'admin_add', 1)"
       )
 
     Enum.each(~w(flynn other), &ensure_main_session(db, &1))

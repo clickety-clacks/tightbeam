@@ -3515,10 +3515,14 @@ defmodule Tightbeam.ConformanceSupport do
        ) do
     Enum.each(Map.get(world, "users", []), fn user ->
       {:ok, _} =
-        DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES (?1, ?2, 1)", [
-          user["id"],
-          if(user["admin"], do: 1, else: 0)
-        ])
+        DB.query(
+          db,
+          "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES (?1, ?2, 'admin_add', 1)",
+          [
+            user["id"],
+            if(user["admin"], do: 1, else: 0)
+          ]
+        )
     end)
 
     world
