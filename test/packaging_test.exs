@@ -88,17 +88,27 @@ defmodule Tightbeam.PackagingTest do
     assert File.read!(target) == "DO_NOT_TOUCH\n"
   end
 
-  test "the launcher execs its release so TERM and INT reach the gateway process" do
-    for {signal, expected} <- [{"-TERM", "TERM\n"}, {"-INT", "INT\n"}] do
+  test "an invalid persisted cookie is refused before the release runs" do
+    fixture = gateway_fixture("PACKAGED_COOKIE")
+    File.mkdir_p!(fixture.base_dir)
+    File.write!(fixture.persisted_cookie, "not valid\n")
+
+    assert {output, 1} = run_gateway(fixture, ["pid"])
+    assert output =~ "invalid release cookie"
+    refute File.exists?(fixture.seen_args)
+  end
+
+  test "the launcher maps TERM and INT to graceful TERM for the release" do
+    for signal <- ["-TERM", "-INT"] do
       fixture = gateway_fixture("SIGNAL_COOKIE")
 
-      task = Task.async(fn -> run_gateway(fixture, ["hold"]) end)
+      task = Task.async(fn -> run_gateway(fixture, []) end)
       assert eventually(fn -> File.exists?(fixture.pid) end)
 
       pid = fixture.pid |> File.read!() |> String.trim()
       assert {_, 0} = System.cmd("kill", [signal, pid], stderr_to_stdout: true)
       assert {_, 0} = Task.await(task, 5_000)
-      assert File.read!(fixture.seen_signal) == expected
+      assert File.read!(fixture.seen_signal) == "TERM\n"
       File.rm!(fixture.pid)
     end
   end
@@ -148,10 +158,15 @@ defmodule Tightbeam.PackagingTest do
       #!/bin/sh
       printf '%s\\n' "$RELEASE_COOKIE" > "$SEEN_COOKIE"
       printf '%s\\n' "$@" > "$SEEN_ARGS"
-      if [ "${1:-}" = hold ]; then
+      if [ "${1:-}" = stop ]; then
+        kill -TERM "$(cat "$SEEN_RELEASE_PID")"
+        exit 0
+      fi
+      if [ "${1:-}" = start ]; then
         trap 'printf "TERM\\n" > "$SEEN_SIGNAL"; exit 0' TERM
-        trap 'printf "INT\\n" > "$SEEN_SIGNAL"; exit 0' INT
-        printf '%s\\n' "$$" > "$SEEN_PID"
+        trap 'printf "INT\\n" > "$SEEN_SIGNAL"; exit 2' INT
+        printf '%s\\n' "$$" > "$SEEN_RELEASE_PID"
+        printf '%s\\n' "$PPID" > "$SEEN_PID"
         while :; do sleep 1 & wait $!; done
       fi
       """
@@ -169,6 +184,11 @@ defmodule Tightbeam.PackagingTest do
         System.cmd("kill", ["-KILL", pid], stderr_to_stdout: true)
       end
 
+      if File.exists?(Path.join(root, "release-pid")) do
+        pid = root |> Path.join("release-pid") |> File.read!() |> String.trim()
+        System.cmd("kill", ["-KILL", pid], stderr_to_stdout: true)
+      end
+
       File.rm_rf!(root)
     end)
 
@@ -180,6 +200,7 @@ defmodule Tightbeam.PackagingTest do
       seen_cookie: Path.join(root, "seen-cookie"),
       seen_args: Path.join(root, "seen-args"),
       seen_signal: Path.join(root, "seen-signal"),
+      release_pid: Path.join(root, "release-pid"),
       pid: Path.join(root, "pid")
     }
   end
@@ -191,6 +212,7 @@ defmodule Tightbeam.PackagingTest do
          {"SEEN_COOKIE", fixture.seen_cookie},
          {"SEEN_ARGS", fixture.seen_args},
          {"SEEN_SIGNAL", fixture.seen_signal},
+         {"SEEN_RELEASE_PID", fixture.release_pid},
          {"SEEN_PID", fixture.pid},
          {"RELEASE_COOKIE", nil}
        ] ++ extra_env)

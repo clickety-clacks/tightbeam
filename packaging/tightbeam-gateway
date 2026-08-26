@@ -109,7 +109,7 @@ if [ -z "${RELEASE_COOKIE:-}" ]; then
 
   RELEASE_COOKIE=$(cat "$COOKIE_FILE")
   case "$RELEASE_COOKIE" in
-    "" | *[!A-Za-z0-9_]*)
+    "" | *[!A-Za-z0-9_=]*)
       echo "tightbeam-gateway: invalid release cookie at $COOKIE_FILE" >&2
       exit 1
       ;;
@@ -142,4 +142,32 @@ case "${1:-}" in
   "" | -*) set -- start "$@" ;;
 esac
 
-exec "$DIR/release/bin/tightbeam_gateway" "$@"
+RELEASE_BIN="$DIR/release/bin/tightbeam_gateway"
+
+# ERTS treats SIGINT as an interactive BREAK request, not an orderly application
+# stop. Keep the foreground launcher's pid stable for service managers and map both
+# supported stop signals to SIGTERM on the real VM, which runs Application.prep_stop/1.
+# Other release commands stay direct execs so their exit and terminal behaviour do
+# not acquire an unnecessary wrapper process.
+if [ "${1:-}" = start ]; then
+  "$RELEASE_BIN" "$@" &
+  RELEASE_PID=$!
+
+  graceful_stop() {
+    trap - INT TERM
+    "$RELEASE_BIN" stop || kill -TERM "$RELEASE_PID" 2>/dev/null || :
+  }
+
+  trap graceful_stop INT TERM
+  RELEASE_STATUS=0
+
+  while kill -0 "$RELEASE_PID" 2>/dev/null; do
+    wait "$RELEASE_PID"
+    RELEASE_STATUS=$?
+  done
+
+  trap - INT TERM
+  exit "$RELEASE_STATUS"
+fi
+
+exec "$RELEASE_BIN" "$@"

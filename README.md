@@ -240,8 +240,9 @@ upgrade, then verify it is active:
 not make the old running gateway unreachable. An explicit `RELEASE_COOKIE`
 still wins and must remain stable across upgrades. A gateway first started by
 an older package has no durable cookie yet; stop that process before replacing
-that older package once. SIGTERM and SIGINT reach the foreground gateway
-unchanged and run its bounded graceful drain; SIGKILL cannot drain by design.
+that older package once. The foreground launcher maps SIGTERM and SIGINT to
+SIGTERM on the real gateway VM, which runs its bounded graceful drain; SIGKILL
+cannot drain by design.
 
 ```sh
 # Linux

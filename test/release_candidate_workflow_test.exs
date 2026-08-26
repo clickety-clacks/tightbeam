@@ -187,6 +187,94 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
              "No proof artifact exists unless metadata, both test jobs, and both package jobs passed."
   end
 
+  test "packaged launcher turns SIGINT into a real OTP graceful drain", evidence do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "tightbeam-real-sigint-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(root)
+    on_exit(fn -> File.rm_rf!(root) end)
+    assert {_, 0} = command("tar", ["xzf", evidence.real_package, "-C", root])
+
+    launcher = Path.join(root, "tightbeam/bin/tightbeam-gateway")
+    base_dir = Path.join(root, "base")
+    pid_file = Path.join(root, "launcher.pid")
+    port = unused_port()
+    adapter_bin = Path.join(base_dir, "adapters/node_modules/.bin")
+
+    File.mkdir_p!(adapter_bin)
+
+    for adapter <- ["claude-agent-acp", "codex-acp"] do
+      path = Path.join(adapter_bin, adapter)
+      File.write!(path, "#!/bin/sh\nexit 0\n")
+      File.chmod!(path, 0o755)
+    end
+
+    on_exit(fn ->
+      if File.exists?(pid_file) do
+        pid = pid_file |> File.read!() |> String.trim()
+        command("kill", ["-KILL", pid])
+      end
+    end)
+
+    task =
+      Task.async(fn ->
+        command(
+          "sh",
+          ["-c", "printf '%s\\n' \"$$\" > \"$1\"; exec \"$2\"", "sh", pid_file, launcher],
+          env: [
+            {"TIGHTBEAM_BASE_DIR", base_dir},
+            {"TIGHTBEAM_PORT", Integer.to_string(port)},
+            {"TIGHTBEAM_DRAIN_TIMEOUT_MS", "2000"},
+            {"TIGHTBEAM_LOCAL_HOST_NAME", "gibson"},
+            {"TIGHTBEAM_ADVERTISED_URL", nil},
+            {"TIGHTBEAM_HOME", nil},
+            {"TIGHTBEAM_MACHINE", nil},
+            {"RELEASE_BOOT_SCRIPT", nil},
+            {"RELEASE_BOOT_SCRIPT_CLEAN", nil},
+            {"RELEASE_COMMAND", nil},
+            {"RELEASE_COOKIE", nil},
+            {"RELEASE_DISTRIBUTION", nil},
+            {"RELEASE_MODE", nil},
+            {"RELEASE_NAME", nil},
+            {"RELEASE_NODE", nil},
+            {"RELEASE_PROG", nil},
+            {"RELEASE_REMOTE_VM_ARGS", nil},
+            {"RELEASE_ROOT", nil},
+            {"RELEASE_SYS_CONFIG", nil},
+            {"RELEASE_TMP", nil},
+            {"RELEASE_VM_ARGS", nil},
+            {"RELEASE_VSN", nil}
+          ]
+        )
+      end)
+
+    unless eventually(fn -> gateway_ready?(port) and File.exists?(pid_file) end, 300) do
+      {output, status} = Task.await(task, 10_000)
+      flunk("packaged gateway did not become ready (#{status}):\n#{output}")
+    end
+
+    pid = pid_file |> File.read!() |> String.trim()
+    assert {_, 0} = command("kill", ["-INT", pid])
+    assert {_, 0} = Task.await(task, 10_000)
+    File.rm!(pid_file)
+
+    {:ok, db} = Exqlite.Sqlite3.open(Path.join(base_dir, "state.db"), mode: :readonly)
+
+    try do
+      {:ok, statement} =
+        Exqlite.Sqlite3.prepare(db, "SELECT cleanShutdownAt FROM boot_epochs")
+
+      assert {:ok, [[clean_shutdown_at]]} = Exqlite.Sqlite3.fetch_all(db, statement)
+      assert is_integer(clean_shutdown_at)
+      :ok = Exqlite.Sqlite3.release(db, statement)
+    after
+      :ok = Exqlite.Sqlite3.close(db)
+    end
+  end
+
   test "manifest verifier accepts complete exact evidence", evidence do
     fixture = proof_fixture!(evidence)
 
@@ -289,6 +377,35 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
       workflow_sha: String.duplicate("a", 40)
     })
   end
+
+  defp unused_port do
+    {:ok, listener} = :gen_tcp.listen(0, [:binary, ip: {127, 0, 0, 1}, active: false])
+    {:ok, {_address, port}} = :inet.sockname(listener)
+    :ok = :gen_tcp.close(listener)
+    port
+  end
+
+  defp gateway_ready?(port) do
+    case :gen_tcp.connect({127, 0, 0, 1}, port, [:binary, active: false], 100) do
+      {:ok, socket} ->
+        :ok = :gen_tcp.close(socket)
+        true
+
+      _ ->
+        false
+    end
+  end
+
+  defp eventually(fun, attempts) when attempts > 0 do
+    if fun.() do
+      true
+    else
+      Process.sleep(20)
+      eventually(fun, attempts - 1)
+    end
+  end
+
+  defp eventually(_fun, 0), do: false
 
   defp create_manifest(fixture) do
     command("python3", [
