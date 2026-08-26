@@ -753,7 +753,8 @@ defmodule Tightbeam.ColdStart do
     root = Org.get_in_txn(txn, root_key)
     receipt = receipt_in_txn(txn)
 
-    unless user && user.is_admin && personal_main?(root, user_id) && root.state == "active" &&
+    unless user && user.is_admin && personal_main?(root, user_id) &&
+             root.origin == @principal && is_nil(root.spawned_by) && root.state == "active" &&
              receipt && receipt.phase == "reserved" &&
              receipt.cause == "gateway_local_bootstrap" && receipt.principal == @principal &&
              receipt.user_id == user_id && receipt.root_session_key == root_key &&

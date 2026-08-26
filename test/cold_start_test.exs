@@ -224,6 +224,41 @@ defmodule Tightbeam.ColdStartTest do
     assert identity_census(db) == [0, 0, 0, 0, 0]
   end
 
+  test "host-local reservation rolls back when its Main origin is corrupted after reservation", %{
+    db: db
+  } do
+    :ok =
+      DB.execute(db, """
+      CREATE TRIGGER corrupt_reserved_main_origin
+      AFTER INSERT ON events
+      WHEN NEW.verb = 'cold-start'
+      BEGIN
+        UPDATE sessions SET origin = 'agent:corrupt' WHERE kind = 'main';
+      END;
+      """)
+
+    assert {:error, "bootstrap_failed"} = ColdStart.bootstrap_user(db, "alice", @defaults)
+    assert identity_census(db) == [0, 0, 0, 0, 0]
+  end
+
+  test "host-local reservation rolls back when its Main spawnedBy is corrupted after reservation",
+       %{
+         db: db
+       } do
+    :ok =
+      DB.execute(db, """
+      CREATE TRIGGER corrupt_reserved_main_spawner
+      AFTER INSERT ON events
+      WHEN NEW.verb = 'cold-start'
+      BEGIN
+        UPDATE sessions SET spawnedBy = sessionKey WHERE kind = 'main';
+      END;
+      """)
+
+    assert {:error, "bootstrap_failed"} = ColdStart.bootstrap_user(db, "alice", @defaults)
+    assert identity_census(db) == [0, 0, 0, 0, 0]
+  end
+
   test "boot logs reset guidance only for the closed cold-start shape family", %{db: db} do
     assert {:ok, _} =
              DB.query(
