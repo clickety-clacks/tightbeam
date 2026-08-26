@@ -8,6 +8,24 @@ defmodule Tightbeam.Harness.Pi do
   @adapter_version "0.0.33"
   @adapter_package "pi-acp"
   @adapter_bundle "index.js"
+  @adapter_replacements [
+    {
+      "          list: {},\n          delete: {}",
+      "          list: {},\n          delete: {},\n          close: {}"
+    },
+    {
+      "    this.sessions.closeAllExcept?.(session.sessionId);\n    const response = {",
+      "    // Tightbeam owns explicit session/close; keep sibling sessions alive.\n    const response = {"
+    },
+    {
+      "    const fileCommands = loadSlashCommands(params.cwd);\n    this.sessions.closeAllExcept?.(session.sessionId);\n    this.store.upsert({",
+      "    const fileCommands = loadSlashCommands(params.cwd);\n    this.store.upsert({"
+    },
+    {
+      "  async listSessions(params) {",
+      "  async closeSession(params) {\n    this.sessions.close(params.sessionId);\n    return {};\n  }\n  async listSessions(params) {"
+    }
+  ]
   @credential_file "auth.json"
   @models_url "https://pi.dev/api/models/providers/opencode-go"
   @probe_model %Model{family: "opencode-go/gpt-5.6-luna", effort: "medium", context: nil}
@@ -125,8 +143,8 @@ defmodule Tightbeam.Harness.Pi do
   def ensure_adapter(target) do
     target =
       target
-      |> Map.put_new(:patch_adapter, &verify_local_adapter!/1)
-      |> Map.put_new(:remote_patch, &verify_remote_adapter(target, &1, &2))
+      |> Map.put_new(:patch_adapter, &patch_local/1)
+      |> Map.put_new(:remote_patch, &patch_remote(target, &1, &2))
 
     Tightbeam.Spinup.ensure_adapter(target, __MODULE__, adapter_binary(target))
   end
@@ -262,6 +280,8 @@ defmodule Tightbeam.Harness.Pi do
 
   @impl true
   def conformance_vectors do
+    adapter_source = adapter_patch_fixture()
+
     valid_model = %{
       "id" => "pi-vector",
       "name" => "Pi Vector",
@@ -311,9 +331,9 @@ defmodule Tightbeam.Harness.Pi do
       adapter_scope: :unscoped,
       adapter_bundle: @adapter_bundle,
       adapter_version: @adapter_version,
-      source: "export default function () {}\n",
-      patched: "export default function () {}\n",
-      remote_patch_detail: "; pi adapter verified",
+      source: adapter_source,
+      patched: patch_adapter_source(adapter_source),
+      remote_patch_detail: "; pi adapter patched",
       session_meta: %{},
       cli_name: cli_binary(),
       cli_version: "0.84.1",
@@ -570,19 +590,30 @@ defmodule Tightbeam.Harness.Pi do
       ])
   end
 
-  defp verify_local_adapter!(binary_path) do
-    package = adapter_package_json(binary_path)
-    %{"version" => @adapter_version} = package |> File.read!() |> JSON.decode!()
-    :ok
+  @doc false
+  def patch_adapter_source(source) do
+    Tightbeam.Harness.AdapterPatch.patch(
+      source,
+      @adapter_replacements,
+      wire_name(),
+      @adapter_version
+    )
   end
 
-  defp verify_remote_adapter(target, binary_path, detail) do
-    package = adapter_package_json(binary_path)
+  defp patch_local(path) do
+    Tightbeam.Harness.AdapterPatch.ensure!(
+      path,
+      @adapter_package,
+      @adapter_bundle,
+      @adapter_version,
+      @adapter_replacements,
+      wire_name(),
+      scope: :unscoped
+    )
+  end
 
-    script =
-      "const p=#{JSON.encode!(package)};" <>
-        "const v=JSON.parse(require('fs').readFileSync(p,'utf8')).version;" <>
-        "if(v!==#{JSON.encode!(@adapter_version)})throw new Error('unsupported pi-acp version '+v);"
+  defp patch_remote(target, path, detail) do
+    script = remote_patch_script(path)
 
     with {:ok, ssh} <- absolute_executable(target, "ssh"),
          node when is_binary(node) <-
@@ -603,7 +634,7 @@ defmodule Tightbeam.Harness.Pi do
              [ssh | Support.ssh_opts()] ++
                [target.host_config.ssh, node, "-e", script]
            ) do
-        {_output, 0} -> {:ok, detail <> "; pi adapter verified"}
+        {_output, 0} -> {:ok, detail <> "; pi adapter patched"}
         {output, _exit} -> {:error, %{code: "host_unready", message: String.trim(output)}}
       end
     else
@@ -612,9 +643,26 @@ defmodule Tightbeam.Harness.Pi do
     end
   end
 
-  defp adapter_package_json(binary_path) do
-    node_modules = binary_path |> Path.dirname() |> Path.dirname()
-    Path.join([node_modules, @adapter_package, "package.json"])
+  defp remote_patch_script(path) do
+    Tightbeam.Harness.AdapterPatch.remote_script(
+      path,
+      @adapter_package,
+      @adapter_bundle,
+      @adapter_replacements,
+      wire_name(),
+      scope: :unscoped,
+      version: @adapter_version
+    )
+  end
+
+  defp adapter_patch_fixture do
+    [
+      "          list: {},\n          delete: {}",
+      "    this.sessions.closeAllExcept?.(session.sessionId);\n    const response = {",
+      "    const fileCommands = loadSlashCommands(params.cwd);\n    this.sessions.closeAllExcept?.(session.sessionId);\n    this.store.upsert({",
+      "  async listSessions(params) {"
+    ]
+    |> Enum.join("\n")
   end
 
   defp catalog_executables(state, nil) do

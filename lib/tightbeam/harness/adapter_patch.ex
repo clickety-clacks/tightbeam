@@ -2,8 +2,8 @@ defmodule Tightbeam.Harness.AdapterPatch do
   @moduledoc false
 
   @doc false
-  def ensure!(binary_path, package_name, bundle_name, version, replacements, label) do
-    {package, bundle} = installed_paths(binary_path, package_name, bundle_name)
+  def ensure!(binary_path, package_name, bundle_name, version, replacements, label, opts \\ []) do
+    {package, bundle} = installed_paths(binary_path, package_name, bundle_name, opts)
     %{"version" => installed_version} = package |> File.read!() |> JSON.decode!()
     ^version = installed_version
     source = File.read!(bundle)
@@ -24,8 +24,8 @@ defmodule Tightbeam.Harness.AdapterPatch do
   end
 
   @doc false
-  def remote_script(binary_path, package_name, bundle_name, replacements, label) do
-    {_package, bundle} = installed_paths(binary_path, package_name, bundle_name)
+  def remote_script(binary_path, package_name, bundle_name, replacements, label, opts \\ []) do
+    {package, bundle} = installed_paths(binary_path, package_name, bundle_name, opts)
 
     encoded =
       replacements
@@ -33,8 +33,18 @@ defmodule Tightbeam.Harness.AdapterPatch do
       |> JSON.encode!()
       |> Base.encode64()
 
+    version_check =
+      case Keyword.fetch(opts, :version) do
+        {:ok, version} ->
+          "const v=JSON.parse(fs.readFileSync(#{JSON.encode!(package)},'utf8')).version;" <>
+            "if(v!==#{JSON.encode!(version)})throw new Error('unsupported #{label} adapter version '+v);"
+
+        :error ->
+          ""
+      end
+
     """
-    const fs=require('fs');const p=#{JSON.encode!(bundle)};
+    const fs=require('fs');#{version_check}const p=#{JSON.encode!(bundle)};
     const rs=JSON.parse(Buffer.from(#{JSON.encode!(encoded)},'base64').toString());
     let s=fs.readFileSync(p,'utf8');
     for(const [a,b] of rs){if(!s.includes(a)&&!s.includes(b))throw new Error('unsupported #{label} adapter bundle');s=s.replace(a,b)}
@@ -59,12 +69,18 @@ defmodule Tightbeam.Harness.AdapterPatch do
     end)
   end
 
-  defp installed_paths(binary_path, package_name, bundle_name) do
+  defp installed_paths(binary_path, package_name, bundle_name, opts) do
     node_modules = binary_path |> Path.dirname() |> Path.dirname()
 
+    package_dir =
+      case Keyword.get(opts, :scope, :agentclientprotocol) do
+        :agentclientprotocol -> Path.join([node_modules, "@agentclientprotocol", package_name])
+        :unscoped -> Path.join(node_modules, package_name)
+      end
+
     {
-      Path.join([node_modules, "@agentclientprotocol", package_name, "package.json"]),
-      Path.join([node_modules, "@agentclientprotocol", package_name, "dist", bundle_name])
+      Path.join(package_dir, "package.json"),
+      Path.join([package_dir, "dist", bundle_name])
     }
   end
 end

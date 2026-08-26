@@ -3,6 +3,25 @@ defmodule Tightbeam.HarnessPiTest do
 
   alias Tightbeam.Harness.Pi
 
+  test "adapter patch adds close lifecycle and preserves concurrent sessions idempotently" do
+    source =
+      [
+        "          list: {},\n          delete: {}",
+        "    this.sessions.closeAllExcept?.(session.sessionId);\n    const response = {",
+        "    const fileCommands = loadSlashCommands(params.cwd);\n    this.sessions.closeAllExcept?.(session.sessionId);\n    this.store.upsert({",
+        "  async listSessions(params) {"
+      ]
+      |> Enum.join("\n")
+
+    patched = Pi.patch_adapter_source(source)
+
+    assert patched =~ "          close: {}"
+    assert patched =~ "  async closeSession(params) {"
+    assert patched =~ "    this.sessions.close(params.sessionId);"
+    refute patched =~ "closeAllExcept"
+    assert Pi.patch_adapter_source(patched) == patched
+  end
+
   test "projected extension injects served identity and blocks compiled rails before execution" do
     root = tmp_dir!("pi-extension")
     identity = Path.join([root, ".pi", "skills", "tightbeam__served-identity", "SKILL.md"])
@@ -169,7 +188,7 @@ defmodule Tightbeam.HarnessPiTest do
     assert_receive {:relative, _adapter_presence_check}
     refute_receive {:relative, _node_command}
 
-    assert {:ok, "adapters present; pi adapter verified"} =
+    assert {:ok, "adapters present; pi adapter patched"} =
              target.(["/opt/toolchain"], :absolute) |> Pi.ensure_adapter()
 
     assert_receive {:absolute, _adapter_presence_check}
@@ -180,7 +199,12 @@ defmodule Tightbeam.HarnessPiTest do
     assert node == "/opt/toolchain/node"
 
     assert_receive {:absolute,
-                    ["/usr/bin/ssh" | [_, _, _, _, "fixture@worker", ^node, "-e", _script]]}
+                    ["/usr/bin/ssh" | [_, _, _, _, "fixture@worker", ^node, "-e", script]]}
+
+    assert script =~ "/remote/base/adapters/node_modules/pi-acp/package.json"
+    assert script =~ "unsupported pi adapter version"
+    assert script =~ "0.0.33"
+    assert script =~ "const rs=JSON.parse"
   end
 
   defp tmp_dir!(label) do
