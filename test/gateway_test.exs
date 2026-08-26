@@ -6665,6 +6665,76 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
   end
 
+  test "deliver_prompt renders same-session reply context from the stored target row", ctx do
+    referenced_text = "first line\nsecond line that the client preview did not carry"
+
+    assert {:appended, target} =
+             Projection.append(ctx.db, %{
+               session_key: "k1",
+               role: "assistant",
+               sender: "agent:reviewer",
+               content: referenced_text,
+               llm_visible_message_id: "visible-reply-target"
+             })
+
+    opts = [
+      db: ctx.db,
+      conn_registry: ctx.registry,
+      lane_manager: ctx.lane,
+      sender: "user:flynn",
+      authenticated_device_message: true,
+      device_id: "d1",
+      client_message_id: "c_reply",
+      reply_to_llm_visible_message_id: "visible-reply-target"
+    ]
+
+    expected =
+      "[replying to agent:reviewer: first line second line that the client preview did not carry]\n\n" <>
+        "> first line\n> second line that the client preview did not carry\n\nanswer"
+
+    assert Gateway.deliver_prompt("k1", "user:flynn", "answer", opts) == :appended
+
+    assert {:ok, [[content, prompt, reply_to_message_id]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT m.content, t.prompt, m.replyToMessageId
+               FROM messages m JOIN turns t ON t.messageId=m.id
+               WHERE m.clientMessageId='c_reply'
+               """
+             )
+
+    assert content == "answer"
+    assert prompt == expected
+    assert reply_to_message_id == target.id
+  end
+
+  test "reply context falls back to the stored role when the target has no sender", ctx do
+    assert {:appended, _target} =
+             Projection.append(ctx.db, %{
+               session_key: "k1",
+               role: "assistant",
+               content: "unattributed text",
+               llm_visible_message_id: "visible-role-fallback"
+             })
+
+    assert Gateway.deliver_prompt("k1", "user:flynn", "answer",
+             db: ctx.db,
+             conn_registry: ctx.registry,
+             lane_manager: ctx.lane,
+             reply_to_llm_visible_message_id: "visible-role-fallback"
+           ) == :appended
+
+    assert {:ok, [[prompt]]} =
+             DB.query(
+               ctx.db,
+               "SELECT prompt FROM turns WHERE prompt LIKE '[replying to assistant:%'"
+             )
+
+    assert prompt ==
+             "[replying to assistant: unattributed text]\n\n> unattributed text\n\nanswer"
+  end
+
   test "conversational turns stay unattributed and bracket-1 nags reverse-link jobRef only",
        ctx do
     :ok =

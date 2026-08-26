@@ -1248,6 +1248,8 @@ defmodule Tightbeam.Gateway do
       {target, role_ref, role_fallback} when not is_nil(target) ->
         case resolve_reply_target(txn, target, opts) do
           {:ok, reply_target} ->
+            prompt_with_reply_context = render_reply_context(stamped, reply_target)
+
             if Ledger.enqueueable_in_txn?(txn, target) do
               case admit_supervision_controller_in_txn(txn, opts, target) do
                 :canceled ->
@@ -1262,6 +1264,7 @@ defmodule Tightbeam.Gateway do
                     origin,
                     stamped,
                     opts
+                    |> Keyword.put(:agent_prompt, prompt_with_reply_context)
                     |> Keyword.put(:reply_target, reply_target)
                     |> Keyword.put(:supervision_controller, controller)
                   )
@@ -1322,7 +1325,7 @@ defmodule Tightbeam.Gateway do
               principal: opts[:principal] || origin,
               wake_id: opts[:wake_id],
               origin: origin,
-              prompt: stamped,
+              prompt: opts[:agent_prompt] || stamped,
               role_ref: role_ref || opts[:role_ref],
               role_fallback: role_fallback || opts[:role_fallback] || false,
               assignment_id: assignment_id,
@@ -1366,13 +1369,39 @@ defmodule Tightbeam.Gateway do
       llm_visible_message_id when is_binary(llm_visible_message_id) ->
         case DB.Txn.q(
                txn,
-               "SELECT id, clientMessageId FROM messages WHERE sessionKey = ?1 AND llmVisibleMessageId = ?2 LIMIT 2",
+               "SELECT id, clientMessageId, sender, role, content FROM messages WHERE sessionKey = ?1 AND llmVisibleMessageId = ?2 LIMIT 2",
                [session_key, llm_visible_message_id]
              ) do
-          [[id, client_message_id]] -> {:ok, %{id: id, client_message_id: client_message_id}}
-          _ -> :error
+          [[id, client_message_id, sender, role, content]] ->
+            {:ok,
+             %{
+               id: id,
+               client_message_id: client_message_id,
+               sender: sender || role,
+               content: content
+             }}
+
+          _ ->
+            :error
         end
     end
+  end
+
+  defp render_reply_context(prompt, nil), do: prompt
+
+  defp render_reply_context(prompt, %{sender: sender, content: content}) do
+    snippet =
+      content
+      |> String.replace(~r/\s+/u, " ")
+      |> String.trim()
+      |> String.slice(0, 120)
+
+    quoted =
+      content
+      |> String.split("\n", trim: false)
+      |> Enum.map_join("\n", &"> #{&1}")
+
+    "[replying to #{sender}: #{snippet}]\n\n#{quoted}\n\n#{prompt}"
   end
 
   # The wake is still CONSUMED — leaving it pending would redeliver the same
