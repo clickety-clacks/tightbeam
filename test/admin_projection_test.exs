@@ -122,7 +122,7 @@ defmodule Tightbeam.AdminProjectionTest do
     assert_notice("verb.accepted")
     user_notice = assert_notice("user.promoted")
 
-    identity = StateResources.query_identity(ctx.db, "served")
+    identity = hydrated_identity!(ctx.db, "served")
     kungfu = StateResources.query_kungfu(ctx.db, "agentic-engineering")
 
     cases = [
@@ -321,7 +321,7 @@ defmodule Tightbeam.AdminProjectionTest do
                :ok
              end)
 
-    public_identity = StateResources.identity(StateResources.query_identity(ctx.db, "served"))
+    public_identity = StateResources.identity(hydrated_identity!(ctx.db, "served"))
 
     cases = [
       %{
@@ -378,7 +378,7 @@ defmodule Tightbeam.AdminProjectionTest do
       %{
         resource: "identity",
         collection: &StateResources.query_identity(ctx.db, &1),
-        detail: StateResources.query_identity(ctx.db, "served"),
+        detail: hydrated_identity!(ctx.db, "served"),
         serializer: &StateResources.identity/1,
         primary: & &1["name"],
         order: & &1["name"],
@@ -528,65 +528,141 @@ defmodule Tightbeam.AdminProjectionTest do
     end
   end
 
-  test "identity detail lookups use the same canonical statement for known and unknown names",
+  test "identity metadata lookups use the same canonical statement for known forbidden and unknown names",
        ctx do
     proxy = start_supervised!({QuerySpyDB, db: ctx.db})
+    admin = principal_binding("flynn", true)
+    forbidden = principal_binding("operator", false)
 
-    assert %StateResources.DeferredIdentity{name: "served"} =
-             StateResources.query_identity(proxy, "served")
+    assert {:ok, known_descriptor} =
+             StateResources.query_identity(proxy, {:metadata, "served", make_ref(), admin})
 
-    assert StateResources.query_identity(proxy, "missing-identity") == nil
+    assert is_binary(known_descriptor)
+
+    assert {:ok, forbidden_descriptor} =
+             StateResources.query_identity(proxy, {:metadata, "served", make_ref(), forbidden})
+
+    assert is_binary(forbidden_descriptor)
+
+    assert {:ok, unknown_descriptor} =
+             StateResources.query_identity(
+               proxy,
+               {:metadata, "missing-identity", make_ref(), admin}
+             )
+
+    assert is_binary(unknown_descriptor)
 
     assert [
-             {known_sql, ["identity", "served"]},
-             {unknown_sql, ["identity", "missing-identity"]}
+             {known_sql, known_params},
+             {forbidden_sql, forbidden_params},
+             {unknown_sql, unknown_params}
            ] = QuerySpyDB.queries(proxy)
 
     assert known_sql ==
-             "SELECT rowVersion FROM admin_projection_versions " <>
-               "WHERE resource = ?1 AND primaryKey = ?2"
+             "SELECT CASE WHEN v.rowVersion IS NULL THEN 0 ELSE 1 END AS present, v.rowVersion " <>
+               "FROM (SELECT ?1 AS resource, ?2 AS primaryKey) AS seed " <>
+               "LEFT JOIN admin_projection_versions AS v " <>
+               "ON v.resource = seed.resource AND v.primaryKey = seed.primaryKey"
 
+    assert forbidden_sql == known_sql
     assert unknown_sql == known_sql
+    assert known_params == forbidden_params
+    assert length(known_params) == 2
+    assert length(unknown_params) == 2
   end
 
-  test "identity visibility applies after the shared lookup and hidden names leak no payload oracle",
+  test "identity visibility applies after metadata and hidden names leak no payload oracle",
        ctx do
     proxy = start_supervised!({QuerySpyDB, db: ctx.db})
+    hidden = principal_binding("operator", false)
+    visible = principal_binding("flynn", true)
 
-    refute StateVisibility.identity_visible?(false)
-
-    assert public_identity_or_absent(proxy, "served", false) == :absent
-    assert public_identity_or_absent(proxy, "missing-identity", false) == :absent
+    assert public_identity_or_absent(proxy, "served", hidden, false) == :absent
+    assert public_identity_or_absent(proxy, "missing-identity", hidden, false) == :absent
 
     assert {:visible, %{"name" => "served"} = visible_identity} =
-             public_identity_or_absent(proxy, "served", true)
+             public_identity_or_absent(proxy, "served", visible, true)
 
     assert [
-             {hidden_known_sql, ["identity", "served"]},
-             {hidden_unknown_sql, ["identity", "missing-identity"]},
-             {visible_lookup_sql, ["identity", "served"]},
-             {visible_item_sql, ["identity", "served"]}
+             {hidden_known_sql, _hidden_known_params},
+             {hidden_unknown_sql, _hidden_unknown_params},
+             {visible_metadata_sql, _visible_metadata_params},
+             {visible_hydration_sql, _visible_hydration_params}
            ] = QuerySpyDB.queries(proxy)
 
     assert hidden_known_sql ==
-             "SELECT rowVersion FROM admin_projection_versions " <>
-               "WHERE resource = ?1 AND primaryKey = ?2"
+             "SELECT CASE WHEN v.rowVersion IS NULL THEN 0 ELSE 1 END AS present, v.rowVersion " <>
+               "FROM (SELECT ?1 AS resource, ?2 AS primaryKey) AS seed " <>
+               "LEFT JOIN admin_projection_versions AS v " <>
+               "ON v.resource = seed.resource AND v.primaryKey = seed.primaryKey"
 
     assert hidden_unknown_sql == hidden_known_sql
+    assert visible_metadata_sql == hidden_known_sql
 
     assert visible_identity ==
-             StateResources.identity(StateResources.query_identity(ctx.db, "served"))
+             StateResources.identity(hydrated_identity!(ctx.db, "served"))
 
-    assert visible_lookup_sql ==
-             "SELECT rowVersion FROM admin_projection_versions " <>
-               "WHERE resource = ?1 AND primaryKey = ?2"
+    assert String.contains?(
+             visible_hydration_sql,
+             "SELECT item, rowVersion FROM admin_projection_versions"
+           )
 
-    assert visible_item_sql ==
-             "SELECT item, rowVersion FROM admin_projection_versions " <>
-               "WHERE resource = ?1 AND primaryKey = ?2"
+    assert String.contains?(visible_hydration_sql, "WHEN EXISTS(SELECT 1 FROM matched) THEN 'ok'")
   end
 
-  test "identity-status preserves the served identity through the shared query seam", ctx do
+  test "identity hydration rejects wrong principals and request bindings before database access",
+       ctx do
+    proxy = start_supervised!({QuerySpyDB, db: ctx.db})
+    admin = principal_binding("flynn", true)
+    request_binding = make_ref()
+
+    assert {:ok, descriptor} =
+             StateResources.query_identity(proxy, {:metadata, "served", request_binding, admin})
+
+    assert {:error, :invalid_identity_descriptor} =
+             StateResources.query_identity(
+               proxy,
+               {:hydrate, descriptor, request_binding, principal_binding("operator", true)}
+             )
+
+    assert [{_metadata_sql, _metadata_params}] = QuerySpyDB.queries(proxy)
+
+    assert {:error, :invalid_identity_descriptor} =
+             StateResources.query_identity(
+               proxy,
+               {:hydrate, descriptor, make_ref(), admin}
+             )
+
+    assert [{_metadata_sql, _metadata_params}] = QuerySpyDB.queries(proxy)
+  end
+
+  test "identity hydration reports stale after a row-version race", ctx do
+    call = firehose_call("identity-edit", %{})
+    entries = AdminProjection.served_entries(ctx.db, ctx.base_dir)
+    identity = Enum.find(entries, &(&1.resource == "identity"))
+    principal = principal_binding("flynn", true)
+    request_binding = make_ref()
+
+    assert {:ok, descriptor} =
+             StateResources.query_identity(
+               ctx.db,
+               {:metadata, "served", request_binding, principal}
+             )
+
+    changed = put_in(identity.item["liveRevision"], "staged-race-next")
+
+    assert {:ok, [_item]} = AdminProjection.stamp_publication(ctx.db, call, [changed])
+    assert_notice("verb.accepted")
+    assert_notice("identity.updated")
+
+    assert :stale =
+             StateResources.query_identity(
+               ctx.db,
+               {:hydrate, descriptor, request_binding, principal}
+             )
+  end
+
+  test "identity-status preserves the served identity through the staged query seam", ctx do
     call = %{origin: "user:flynn", params: %{}}
 
     expected =
@@ -600,8 +676,11 @@ defmodule Tightbeam.AdminProjectionTest do
     assert actual.identity == expected.identity
 
     assert Enum.any?(QuerySpyDB.queries(proxy), fn
-             {"SELECT rowVersion FROM admin_projection_versions WHERE resource = ?1 " <>
-                  "AND primaryKey = ?2", ["identity", "served"]} ->
+             {"SELECT CASE WHEN v.rowVersion IS NULL THEN 0 ELSE 1 END AS present, v.rowVersion " <>
+                  "FROM (SELECT ?1 AS resource, ?2 AS primaryKey) AS seed " <>
+                  "LEFT JOIN admin_projection_versions AS v " <>
+                  "ON v.resource = seed.resource AND v.primaryKey = seed.primaryKey",
+              ["identity", "served"]} ->
                true
 
              _ ->
@@ -609,9 +688,8 @@ defmodule Tightbeam.AdminProjectionTest do
            end)
 
     assert Enum.any?(QuerySpyDB.queries(proxy), fn
-             {"SELECT item, rowVersion FROM admin_projection_versions WHERE resource = ?1 " <>
-                  "AND primaryKey = ?2", ["identity", "served"]} ->
-               true
+             {sql, _params} when is_binary(sql) ->
+               String.contains?(sql, "SELECT item, rowVersion FROM admin_projection_versions")
 
              _ ->
                false
@@ -891,7 +969,7 @@ defmodule Tightbeam.AdminProjectionTest do
     assert_notice("verb.accepted")
     assert_notice("identity.updated")
 
-    before_failure = StateResources.query_identity(ctx.db, "served")
+    before_failure = hydrated_identity!(ctx.db, "served")
     failed = put_in(changed.item["liveRevision"], "published-but-unstamped")
 
     assert {:error, %{code: "projection_stamp_failed"}} =
@@ -900,7 +978,7 @@ defmodule Tightbeam.AdminProjectionTest do
              )
 
     refute_receive {:firehose_notice, _notice}
-    assert StateResources.query_identity(ctx.db, "served") == before_failure
+    assert hydrated_identity!(ctx.db, "served") == before_failure
 
     assert {:ok, [["projection_stamp_failed", detail]]} =
              DB.query(
@@ -912,7 +990,7 @@ defmodule Tightbeam.AdminProjectionTest do
   end
 
   test "a failed Git publication does not advance a stamp or emit state", ctx do
-    before = StateResources.query_identity(ctx.db, "served")
+    before = hydrated_identity!(ctx.db, "served")
     identity_dir = Path.join(ctx.base_dir, "identity")
     main = git!(identity_dir, ["rev-parse", "main"])
 
@@ -942,7 +1020,7 @@ defmodule Tightbeam.AdminProjectionTest do
       )
     end
 
-    assert StateResources.query_identity(ctx.db, "served") == before
+    assert hydrated_identity!(ctx.db, "served") == before
     refute_receive {:firehose_notice, _notice}
   end
 
@@ -1040,8 +1118,7 @@ defmodule Tightbeam.AdminProjectionTest do
         {"hosts", "rebuild-alpha",
          StateResources.host(StateResources.query_host(ctx.db, "rebuild-alpha"))},
         {"users", "operator", StateResources.user(StateResources.query_user(ctx.db, "operator"))},
-        {"identity", "served",
-         StateResources.identity(StateResources.query_identity(ctx.db, "served"))},
+        {"identity", "served", StateResources.identity(hydrated_identity!(ctx.db, "served"))},
         {"kungfu", "rebuild-demo",
          StateResources.kungfu(StateResources.query_kungfu(ctx.db, "rebuild-demo"))}
       ]
@@ -1237,19 +1314,48 @@ defmodule Tightbeam.AdminProjectionTest do
     assert positions == Enum.sort(positions)
   end
 
-  defp public_identity_or_absent(db, name, is_admin) do
-    case StateResources.query_identity(db, name) do
-      nil ->
-        :absent
+  defp public_identity_or_absent(db, name, principal_binding, is_admin) do
+    request_binding = make_ref()
 
-      item ->
-        if StateVisibility.identity_visible?(is_admin) do
-          {:visible, StateResources.identity(item)}
-        else
-          :absent
-        end
+    assert {:ok, descriptor} =
+             StateResources.query_identity(
+               db,
+               {:metadata, name, request_binding, principal_binding}
+             )
+
+    if StateVisibility.identity_visible?(is_admin) do
+      assert {:ok, item} =
+               StateResources.query_identity(
+                 db,
+                 {:hydrate, descriptor, request_binding, principal_binding}
+               )
+
+      {:visible, StateResources.identity(item)}
+    else
+      :absent
     end
   end
+
+  defp hydrated_identity!(db, name) do
+    request_binding = make_ref()
+    principal_binding = principal_binding("flynn", true)
+
+    assert {:ok, descriptor} =
+             StateResources.query_identity(
+               db,
+               {:metadata, name, request_binding, principal_binding}
+             )
+
+    assert {:ok, item} =
+             StateResources.query_identity(
+               db,
+               {:hydrate, descriptor, request_binding, principal_binding}
+             )
+
+    item
+  end
+
+  defp principal_binding(user_id, is_admin), do: {:user, user_id, is_admin}
 
   defp notice_primary_key(%{"resource" => "host environment", "refs" => refs}) do
     AdminProjection.key([refs["host"], refs["harness"], refs["name"]])

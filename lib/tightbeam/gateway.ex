@@ -3434,11 +3434,7 @@ defmodule Tightbeam.Gateway do
           nil
       end
 
-    public_identity =
-      case StateResources.query_identity(db, "served") do
-        nil -> nil
-        item -> StateResources.identity(item)
-      end
+    public_identity = public_served_identity(db, call)
 
     identity
     |> Map.put(:identity, public_identity)
@@ -3448,6 +3444,65 @@ defmodule Tightbeam.Gateway do
 
   defp maybe_put_guidance(status, nil), do: status
   defp maybe_put_guidance(status, guidance), do: Map.put(status, :guidance, guidance)
+
+  defp public_served_identity(db, call) do
+    request_binding = make_ref()
+    principal_binding = identity_query_principal(call)
+    is_admin = admin_caller?(db, call)
+
+    with {:ok, descriptor} <-
+           StateResources.query_identity(
+             db,
+             {:metadata, "served", request_binding, principal_binding}
+           ),
+         true <- Tightbeam.StateVisibility.identity_visible?(is_admin),
+         {:ok, hydrated} <-
+           hydrate_served_identity(
+             db,
+             descriptor,
+             request_binding,
+             principal_binding
+           ) do
+      StateResources.identity(hydrated)
+    else
+      false -> nil
+      :not_found -> nil
+      :stale -> nil
+      {:error, :invalid_identity_descriptor} -> nil
+    end
+  end
+
+  defp hydrate_served_identity(db, descriptor, request_binding, principal_binding) do
+    case StateResources.query_identity(
+           db,
+           {:hydrate, descriptor, request_binding, principal_binding}
+         ) do
+      :stale ->
+        with {:ok, retry_descriptor} <-
+               StateResources.query_identity(
+                 db,
+                 {:metadata, "served", request_binding, principal_binding}
+               ) do
+          case StateResources.query_identity(
+                 db,
+                 {:hydrate, retry_descriptor, request_binding, principal_binding}
+               ) do
+            :stale -> :not_found
+            other -> other
+          end
+        end
+
+      other ->
+        other
+    end
+  end
+
+  defp identity_query_principal(%{principal: principal})
+       when principal in [:error, nil],
+       do: nil
+
+  defp identity_query_principal(%{principal: principal}), do: principal
+  defp identity_query_principal(%{origin: origin}), do: origin
 
   defp identity_apply_result(config, db, %{params: %{all: true}}) do
     sessions = Org.list_for_user(db, "", true)
