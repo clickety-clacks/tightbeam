@@ -30,8 +30,8 @@ defmodule Tightbeam.StateVisibility do
   @doc "Host-environment metadata is admin-only."
   def host_environment_visible?(is_admin), do: is_admin
 
-  @doc "Host inventory is admin-only."
-  def host_visible?(is_admin), do: is_admin
+  @doc "Host inventory is visible to every authenticated organization principal."
+  def host_visible?(is_admin) when is_boolean(is_admin), do: true
 
   @doc "User administration is admin-only."
   def user_visible?(is_admin), do: is_admin

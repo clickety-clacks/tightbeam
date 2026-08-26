@@ -12,7 +12,8 @@ defmodule Tightbeam.AdminProjectionTest do
     Org,
     Placement,
     Schema,
-    StateResources
+    StateResources,
+    StateVisibility
   }
 
   alias Tightbeam.Firehose.{Hub, Publisher, Registry}
@@ -220,6 +221,282 @@ defmodule Tightbeam.AdminProjectionTest do
         apply(StateResources, row.serializer, [Map.delete(detail_item, hd(expected.fields))])
       end
     end)
+  end
+
+  test "M1 collections preserve detail shapes, freeze filters and order, and exclude secrets",
+       ctx do
+    :ok = Org.put_setting(ctx.db, "a-public-fixture", "public-fixture-value")
+    config_secret = "m1-config-secret-7f47f03c"
+    :ok = Org.put_setting(ctx.db, "z-private-fixture", config_secret)
+
+    host_secret = "m1-host-secret-808e4d89"
+
+    for name <- ~w(alpha-fixture zeta-fixture) do
+      assert {:ok, _entry} =
+               Placement.register_host(ctx.db, name, %{
+                 ssh: "#{host_secret}@#{name}",
+                 base_dir: "/#{host_secret}/#{name}",
+                 cli_bin: "/#{host_secret}/tightbeam",
+                 adapter_bin_dir: "/#{host_secret}/adapters"
+               })
+    end
+
+    Devices.add_user(ctx.db, "zeta-fixture", false)
+    Devices.add_user(ctx.db, "alpha-fixture", false)
+
+    assert {:ok, _rows} =
+             DB.query(
+               ctx.db,
+               "UPDATE users SET createdAt = 42 WHERE userId IN ('alpha-fixture', 'zeta-fixture')"
+             )
+
+    harness = hd(Harness.all()).wire_name()
+    host = Placement.local_host_name()
+    host_environment_secret = "m1-host-environment-secret-caa884bc"
+
+    assert %{changed: true} =
+             Placement.set_env_overlay_with_firehose(
+               ctx.db,
+               host,
+               harness,
+               "M1_COLLECTION_SECRET",
+               host_environment_secret,
+               "user:flynn",
+               firehose_call("host-env-set", %{})
+             )
+
+    kungfu_detail = StateResources.query_kungfu(ctx.db, "agentic-engineering")
+
+    extra_kungfu =
+      kungfu_detail
+      |> Map.drop(["rowVersion"])
+      |> Map.merge(%{
+        "name" => "zeta-fixture",
+        "purpose" => "Ordering fixture.",
+        "phrases" => [],
+        "rootArchetype" => "fixture-root",
+        "installedRevision" => nil,
+        "status" => "available",
+        "documents" => []
+      })
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               AdminProjection.seed_stamp_in_txn(
+                 txn,
+                 "kungfu",
+                 "zeta-fixture",
+                 "m1-collection-fixture",
+                 extra_kungfu,
+                 42
+               )
+
+               :ok
+             end)
+
+    cases = [
+      %{
+        resource: "config",
+        collection: &StateResources.query_config(ctx.db, &1),
+        detail: StateResources.query_config(ctx.db, "a-public-fixture"),
+        serializer: &StateResources.config/1,
+        primary: & &1["key"],
+        order: & &1["key"],
+        filters: [%{"key" => "a-public-fixture"}]
+      },
+      %{
+        resource: "host environment",
+        collection: &StateResources.query_host_environment(ctx.db, &1),
+        detail:
+          StateResources.query_host_environment(
+            ctx.db,
+            host,
+            harness,
+            "M1_COLLECTION_SECRET"
+          ),
+        serializer: &StateResources.host_environment/1,
+        primary: &{&1["host"], &1["harness"], &1["name"]},
+        order: &{&1["host"], &1["harness"], &1["name"]},
+        filters: [
+          %{"host" => host},
+          %{"harness" => harness},
+          %{"name" => "M1_COLLECTION_SECRET"},
+          %{
+            "host" => host,
+            "harness" => harness,
+            "name" => "M1_COLLECTION_SECRET"
+          }
+        ]
+      },
+      %{
+        resource: "hosts",
+        collection: &StateResources.query_host(ctx.db, &1),
+        detail: StateResources.query_host(ctx.db, "alpha-fixture"),
+        serializer: &StateResources.host/1,
+        primary: & &1["host"],
+        order: & &1["host"],
+        filters: [%{"host" => "alpha-fixture"}]
+      },
+      %{
+        resource: "users",
+        collection: &StateResources.query_user(ctx.db, &1),
+        detail: StateResources.query_user(ctx.db, "alpha-fixture"),
+        serializer: &StateResources.user/1,
+        primary: & &1["userId"],
+        order: &{&1["createdAt"], &1["userId"]},
+        filters: [%{"userId" => "alpha-fixture"}]
+      },
+      %{
+        resource: "identity",
+        collection: &StateResources.query_identity(ctx.db, &1),
+        detail: StateResources.query_identity(ctx.db, "served"),
+        serializer: &StateResources.identity/1,
+        primary: & &1["name"],
+        order: & &1["name"],
+        filters: [
+          %{"name" => "served"},
+          %{"state" => StateResources.query_identity(ctx.db, "served")["state"]},
+          %{
+            "name" => "served",
+            "state" => StateResources.query_identity(ctx.db, "served")["state"]
+          }
+        ]
+      },
+      %{
+        resource: "kungfu",
+        collection: &StateResources.query_kungfu(ctx.db, &1),
+        detail: kungfu_detail,
+        serializer: &StateResources.kungfu/1,
+        primary: & &1["name"],
+        order: & &1["name"],
+        filters: [
+          %{"status" => kungfu_detail["status"]},
+          %{"rootArchetype" => kungfu_detail["rootArchetype"]},
+          %{
+            "status" => kungfu_detail["status"],
+            "rootArchetype" => kungfu_detail["rootArchetype"]
+          }
+        ]
+      }
+    ]
+
+    Enum.each(cases, fn test_case ->
+      detail_item = test_case.serializer.(test_case.detail)
+      collection_items = Enum.map(test_case.collection.(%{}), test_case.serializer)
+
+      assert Enum.map(collection_items, test_case.order) ==
+               collection_items |> Enum.map(test_case.order) |> Enum.sort()
+
+      assert Enum.find(
+               collection_items,
+               &(test_case.primary.(&1) == test_case.primary.(detail_item))
+             ) ==
+               detail_item
+
+      assert StateResources.encode_admin_item(test_case.resource, detail_item) ==
+               StateResources.encode_admin_item(
+                 test_case.resource,
+                 Enum.find(
+                   collection_items,
+                   &(test_case.primary.(&1) == test_case.primary.(detail_item))
+                 )
+               )
+
+      Enum.each(test_case.filters, fn filters ->
+        filtered_items = Enum.map(test_case.collection.(filters), test_case.serializer)
+        assert detail_item in filtered_items
+
+        assert Enum.all?(filtered_items, fn item ->
+                 Enum.all?(filters, fn {field, value} -> item[field] == value end)
+               end)
+      end)
+    end)
+
+    for {query, allowed_filter} <- [
+          {&StateResources.query_config(ctx.db, &1), "key"},
+          {&StateResources.query_host(ctx.db, &1), "host"},
+          {&StateResources.query_user(ctx.db, &1), "userId"},
+          {&StateResources.query_identity(ctx.db, &1), "name"},
+          {&StateResources.query_kungfu(ctx.db, &1), "status"}
+        ] do
+      assert_raise ArgumentError, ~r/unsupported .* collection filter/, fn ->
+        query.(%{"notAllowlisted" => "value"})
+      end
+
+      assert_raise ArgumentError, ~r/collection filter .* must be a string/, fn ->
+        query.(%{allowed_filter => 1})
+      end
+    end
+
+    config_items = Enum.map(StateResources.query_config(ctx.db, %{}), &StateResources.config/1)
+    private_config = Enum.find(config_items, &(&1["key"] == "z-private-fixture"))
+    assert private_config["value"] == nil
+
+    collection_bytes =
+      cases
+      |> Enum.flat_map(fn test_case ->
+        Enum.map(test_case.collection.(%{}), fn row ->
+          row
+          |> test_case.serializer.()
+          |> then(&StateResources.encode_admin_item(test_case.resource, &1))
+        end)
+      end)
+      |> Enum.join("\n")
+
+    refute collection_bytes =~ config_secret
+    refute collection_bytes =~ host_secret
+    refute collection_bytes =~ host_environment_secret
+  end
+
+  test "M1 visibility makes only host inventory AU4 and preserves firehose seams", ctx do
+    assert StateVisibility.host_visible?(true)
+    assert StateVisibility.host_visible?(false)
+
+    for predicate <- [
+          :config_visible?,
+          :host_environment_visible?,
+          :user_visible?,
+          :identity_visible?,
+          :kungfu_visible?
+        ] do
+      assert apply(StateVisibility, predicate, [true])
+      refute apply(StateVisibility, predicate, [false])
+    end
+
+    expected = %{
+      "config.updated" => {:query_config, :config, :config_visible?},
+      "host_env.updated" =>
+        {:query_host_environment, :host_environment, :host_environment_visible?},
+      "host.registered" => {:query_host, :host, :host_visible?},
+      "user.added" => {:query_user, :user, :user_visible?},
+      "user.promoted" => {:query_user, :user, :user_visible?},
+      "identity.updated" => {:query_identity, :identity, :identity_visible?},
+      "kungfu.updated" => {:query_kungfu, :kungfu, :kungfu_visible?}
+    }
+
+    assert Map.new(expected, fn {class, mapping} ->
+             row = Map.fetch!(Registry.rows(), class)
+             assert {row.query, row.serializer, row.visibility} == mapping
+             {class, mapping}
+           end) == expected
+
+    host_notice = %{
+      "class" => "host.registered",
+      "refs" => %{"host" => "fixture"},
+      "payload" => %{"host" => "fixture", "rowVersion" => 1}
+    }
+
+    assert StateVisibility.visible?(ctx.db, host_notice, "operator", false)
+
+    for class <-
+          ~w(config.updated host_env.updated user.added user.promoted identity.updated kungfu.updated) do
+      refute StateVisibility.visible?(
+               ctx.db,
+               %{"class" => class, "refs" => %{}, "payload" => %{}},
+               "operator",
+               false
+             )
+    end
   end
 
   test "identity sessionRevisions use Unicode key order above the BEAM map threshold" do

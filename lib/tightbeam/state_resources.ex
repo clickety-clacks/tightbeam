@@ -90,7 +90,26 @@ defmodule Tightbeam.StateResources do
     end
   end
 
-  @doc "Canonical config detail query; accepts the DB owner or its live transaction."
+  @doc "Canonical config query; a filter map selects the deterministic collection."
+  def query_config(source, filters) when is_map(filters) do
+    filters = collection_filters!("config", filters, ~w(key))
+    {where, params} = collection_where(filters, [{"key", "s.key"}])
+
+    query(
+      source,
+      """
+      SELECT s.key, s.value, s.updatedAt, v.rowVersion
+      FROM org_settings AS s
+      JOIN admin_projection_versions AS v
+        ON v.resource = 'config' AND v.primaryKey = s.key
+      #{where}
+      ORDER BY s.key
+      """,
+      params
+    )
+    |> Enum.map(&config_row/1)
+  end
+
   def query_config(source, key) do
     case query(
            source,
@@ -103,13 +122,8 @@ defmodule Tightbeam.StateResources do
            """,
            [key]
          ) do
-      [[row_key, value, updated_at, row_version]] ->
-        %{
-          key: row_key,
-          value: if(row_key == "default-archetype", do: value, else: nil),
-          updated_at: updated_at,
-          row_version: row_version
-        }
+      [row] ->
+        config_row(row)
 
       [] ->
         nil
@@ -186,7 +200,26 @@ defmodule Tightbeam.StateResources do
     end
   end
 
-  @doc "Canonical host detail query. No connection or filesystem field is selected."
+  @doc "Canonical host query. No connection or filesystem field is selected."
+  def query_host(source, filters) when is_map(filters) do
+    filters = collection_filters!("hosts", filters, ~w(host))
+    {where, params} = collection_where(filters, [{"host", "h.name"}])
+
+    query(
+      source,
+      """
+      SELECT h.name, v.rowVersion
+      FROM hosts AS h
+      JOIN admin_projection_versions AS v
+        ON v.resource = 'hosts' AND v.primaryKey = h.name
+      #{where}
+      ORDER BY h.name
+      """,
+      params
+    )
+    |> Enum.map(&host_row/1)
+  end
+
   def query_host(source, host) do
     case query(
            source,
@@ -199,12 +232,31 @@ defmodule Tightbeam.StateResources do
            """,
            [host]
          ) do
-      [[name, row_version]] -> %{host: name, row_version: row_version}
+      [row] -> host_row(row)
       [] -> nil
     end
   end
 
-  @doc "Canonical user detail query shared by user.added and user.promoted."
+  @doc "Canonical user query shared by user.added and user.promoted."
+  def query_user(source, filters) when is_map(filters) do
+    filters = collection_filters!("users", filters, ~w(userId))
+    {where, params} = collection_where(filters, [{"userId", "u.userId"}])
+
+    query(
+      source,
+      """
+      SELECT u.userId, u.isAdmin, u.createdAt, v.rowVersion
+      FROM users AS u
+      JOIN admin_projection_versions AS v
+        ON v.resource = 'users' AND v.primaryKey = u.userId
+      #{where}
+      ORDER BY u.createdAt, u.userId
+      """,
+      params
+    )
+    |> Enum.map(&user_row/1)
+  end
+
   def query_user(source, id) do
     case query(
            source,
@@ -217,26 +269,39 @@ defmodule Tightbeam.StateResources do
            """,
            [id]
          ) do
-      [[user_id, is_admin, created_at, row_version]] ->
-        %{
-          user_id: user_id,
-          is_admin: is_admin == 1,
-          created_at: created_at,
-          row_version: row_version
-        }
+      [row] ->
+        user_row(row)
 
       [] ->
         nil
     end
   end
 
-  @doc "Canonical served-identity detail query. Only a committed stamp is readable."
+  @doc "Canonical served-identity query. Only committed stamps are readable."
+  def query_identity(source, filters) when is_map(filters) do
+    filters = collection_filters!("identity", filters, ~w(name state))
+
+    source
+    |> stamped_collection("identity")
+    |> Enum.filter(&collection_item_matches?(&1, filters))
+    |> Enum.sort_by(&Map.fetch!(&1, "name"))
+  end
+
   def query_identity(source, "served"),
     do: AdminProjection.stamped_item(source, "identity", "served")
 
   def query_identity(_source, _name), do: nil
 
-  @doc "Canonical kungfu detail query. Only a committed, sanitized stamp is readable."
+  @doc "Canonical kungfu query. Only committed, sanitized stamps are readable."
+  def query_kungfu(source, filters) when is_map(filters) do
+    filters = collection_filters!("kungfu", filters, ~w(status rootArchetype))
+
+    source
+    |> stamped_collection("kungfu")
+    |> Enum.filter(&collection_item_matches?(&1, filters))
+    |> Enum.sort_by(&Map.fetch!(&1, "name"))
+  end
+
   def query_kungfu(source, name), do: AdminProjection.stamped_item(source, "kungfu", name)
 
   @doc false
@@ -668,6 +733,86 @@ defmodule Tightbeam.StateResources do
   defp state_name(:relearn_conflicted), do: "relearn_conflicted"
   defp state_name(value) when is_binary(value), do: value
   defp state_name(_value), do: raise(ArgumentError, "unknown identity state")
+
+  defp config_row([key, value, updated_at, row_version]) do
+    %{
+      key: key,
+      value: if(key == "default-archetype", do: value, else: nil),
+      updated_at: updated_at,
+      row_version: row_version
+    }
+  end
+
+  defp host_row([name, row_version]), do: %{host: name, row_version: row_version}
+
+  defp user_row([user_id, is_admin, created_at, row_version]) do
+    %{
+      user_id: user_id,
+      is_admin: is_admin == 1,
+      created_at: created_at,
+      row_version: row_version
+    }
+  end
+
+  defp collection_filters!(resource, filters, allowed) do
+    Enum.reduce(filters, %{}, fn {key, value}, normalized ->
+      field = if is_atom(key), do: Atom.to_string(key), else: key
+
+      unless is_binary(field) and field in allowed do
+        raise ArgumentError, "unsupported #{resource} collection filter #{inspect(key)}"
+      end
+
+      if Map.has_key?(normalized, field) do
+        raise ArgumentError, "duplicate #{resource} collection filter #{inspect(field)}"
+      end
+
+      cond do
+        is_nil(value) -> normalized
+        is_binary(value) -> Map.put(normalized, field, value)
+        true -> raise ArgumentError, "#{resource} collection filter #{field} must be a string"
+      end
+    end)
+  end
+
+  defp collection_where(filters, fields) do
+    {clauses, params} =
+      fields
+      |> Enum.reduce({[], []}, fn {field, column}, {clauses, params} ->
+        case Map.fetch(filters, field) do
+          {:ok, value} ->
+            index = length(params) + 1
+            {clauses ++ ["#{column} = ?#{index}"], params ++ [value]}
+
+          :error ->
+            {clauses, params}
+        end
+      end)
+
+    where = if clauses == [], do: "", else: "WHERE " <> Enum.join(clauses, " AND ")
+    {where, params}
+  end
+
+  defp stamped_collection(source, resource) do
+    query(
+      source,
+      """
+      SELECT item, rowVersion
+      FROM admin_projection_versions
+      WHERE resource = ?1 AND item IS NOT NULL
+      ORDER BY primaryKey
+      """,
+      [resource]
+    )
+    |> Enum.map(fn [item, row_version] ->
+      item
+      |> JSON.decode!()
+      |> Map.put("rowVersion", row_version)
+    end)
+  end
+
+  defp collection_item_matches?(item, filters) do
+    Enum.all?(filters, fn {field, value} -> item[field] == value end)
+  end
 
   defp camel_key(field) do
     field
