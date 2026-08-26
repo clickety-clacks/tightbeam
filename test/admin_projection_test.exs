@@ -321,6 +321,8 @@ defmodule Tightbeam.AdminProjectionTest do
                :ok
              end)
 
+    public_identity = StateResources.identity(StateResources.query_identity(ctx.db, "served"))
+
     cases = [
       %{
         resource: "config",
@@ -382,10 +384,10 @@ defmodule Tightbeam.AdminProjectionTest do
         order: & &1["name"],
         filters: [
           %{"name" => "served"},
-          %{"state" => StateResources.query_identity(ctx.db, "served")["state"]},
+          %{"state" => public_identity["state"]},
           %{
             "name" => "served",
-            "state" => StateResources.query_identity(ctx.db, "served")["state"]
+            "state" => public_identity["state"]
           }
         ]
       },
@@ -530,7 +532,9 @@ defmodule Tightbeam.AdminProjectionTest do
        ctx do
     proxy = start_supervised!({QuerySpyDB, db: ctx.db})
 
-    assert %{"name" => "served"} = StateResources.query_identity(proxy, "served")
+    assert %StateResources.DeferredIdentity{name: "served"} =
+             StateResources.query_identity(proxy, "served")
+
     assert StateResources.query_identity(proxy, "missing-identity") == nil
 
     assert [
@@ -539,7 +543,7 @@ defmodule Tightbeam.AdminProjectionTest do
            ] = QuerySpyDB.queries(proxy)
 
     assert known_sql ==
-             "SELECT item, rowVersion FROM admin_projection_versions " <>
+             "SELECT rowVersion FROM admin_projection_versions " <>
                "WHERE resource = ?1 AND primaryKey = ?2"
 
     assert unknown_sql == known_sql
@@ -547,16 +551,39 @@ defmodule Tightbeam.AdminProjectionTest do
 
   test "identity visibility applies after the shared lookup and hidden names leak no payload oracle",
        ctx do
-    served = StateResources.query_identity(ctx.db, "served")
+    proxy = start_supervised!({QuerySpyDB, db: ctx.db})
 
-    assert %{"name" => "served"} = served
     refute StateVisibility.identity_visible?(false)
 
-    assert public_identity_or_absent(ctx.db, "served", false) == :absent
-    assert public_identity_or_absent(ctx.db, "missing-identity", false) == :absent
+    assert public_identity_or_absent(proxy, "served", false) == :absent
+    assert public_identity_or_absent(proxy, "missing-identity", false) == :absent
 
-    assert public_identity_or_absent(ctx.db, "served", true) ==
-             {:visible, StateResources.identity(served)}
+    assert {:visible, %{"name" => "served"} = visible_identity} =
+             public_identity_or_absent(proxy, "served", true)
+
+    assert [
+             {hidden_known_sql, ["identity", "served"]},
+             {hidden_unknown_sql, ["identity", "missing-identity"]},
+             {visible_lookup_sql, ["identity", "served"]},
+             {visible_item_sql, ["identity", "served"]}
+           ] = QuerySpyDB.queries(proxy)
+
+    assert hidden_known_sql ==
+             "SELECT rowVersion FROM admin_projection_versions " <>
+               "WHERE resource = ?1 AND primaryKey = ?2"
+
+    assert hidden_unknown_sql == hidden_known_sql
+
+    assert visible_identity ==
+             StateResources.identity(StateResources.query_identity(ctx.db, "served"))
+
+    assert visible_lookup_sql ==
+             "SELECT rowVersion FROM admin_projection_versions " <>
+               "WHERE resource = ?1 AND primaryKey = ?2"
+
+    assert visible_item_sql ==
+             "SELECT item, rowVersion FROM admin_projection_versions " <>
+               "WHERE resource = ?1 AND primaryKey = ?2"
   end
 
   test "identity-status preserves the served identity through the shared query seam", ctx do
@@ -571,6 +598,15 @@ defmodule Tightbeam.AdminProjectionTest do
       Tightbeam.Gateway.handlers(%{db: proxy, base_dir: ctx.base_dir})["identity-status"].(call)
 
     assert actual.identity == expected.identity
+
+    assert Enum.any?(QuerySpyDB.queries(proxy), fn
+             {"SELECT rowVersion FROM admin_projection_versions WHERE resource = ?1 " <>
+                  "AND primaryKey = ?2", ["identity", "served"]} ->
+               true
+
+             _ ->
+               false
+           end)
 
     assert Enum.any?(QuerySpyDB.queries(proxy), fn
              {"SELECT item, rowVersion FROM admin_projection_versions WHERE resource = ?1 " <>

@@ -42,6 +42,13 @@ defmodule Tightbeam.StateResources do
       ~w(name purpose phrases rootArchetype installedRevision status documents rowVersion)
   }
 
+  defmodule DeferredIdentity do
+    @moduledoc false
+
+    @enforce_keys [:source, :name, :row_version]
+    defstruct [:source, :name, :row_version]
+  end
+
   def query_work_item(db, id, call) do
     case WorkItems.__handle__(db, "work-item-get", %{call | params: %{work_item_id: id}}) do
       %{workItem: row} -> row
@@ -287,8 +294,23 @@ defmodule Tightbeam.StateResources do
     |> Enum.sort_by(&Map.fetch!(&1, "name"))
   end
 
-  def query_identity(source, name) when is_binary(name),
-    do: AdminProjection.stamped_item(source, "identity", name)
+  def query_identity(source, name) when is_binary(name) do
+    case query(
+           source,
+           """
+           SELECT rowVersion
+           FROM admin_projection_versions
+           WHERE resource = ?1 AND primaryKey = ?2
+           """,
+           ["identity", AdminProjection.key(name)]
+         ) do
+      [[row_version]] ->
+        %DeferredIdentity{source: source, name: name, row_version: row_version}
+
+      [] ->
+        nil
+    end
+  end
 
   @doc "Canonical kungfu query. Only committed, sanitized stamps are readable."
   def query_kungfu(source, filters) when is_map(filters) do
@@ -476,6 +498,12 @@ defmodule Tightbeam.StateResources do
   end
 
   @doc "Closed served-identity serializer."
+  def identity(%DeferredIdentity{source: source, name: name}) do
+    source
+    |> load_identity!(name)
+    |> identity()
+  end
+
   def identity(row) do
     reject_public_shape_drift!(row, "identity")
     state = required_string!(row, :state)
@@ -731,6 +759,13 @@ defmodule Tightbeam.StateResources do
   defp state_name(:relearn_conflicted), do: "relearn_conflicted"
   defp state_name(value) when is_binary(value), do: value
   defp state_name(_value), do: raise(ArgumentError, "unknown identity state")
+
+  defp load_identity!(source, name) do
+    case AdminProjection.stamped_item(source, "identity", name) do
+      %{} = row -> row
+      nil -> raise ArgumentError, "identity row disappeared before serialization"
+    end
+  end
 
   defp config_row([key, value, updated_at, row_version]) do
     %{
