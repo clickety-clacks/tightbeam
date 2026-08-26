@@ -423,10 +423,28 @@ defmodule Tightbeam.ColdStartTest do
     :ok = DB.execute(db, "UPDATE cold_start_receipts SET principal='user:tampered'")
     :ok = DB.execute(db, "PRAGMA ignore_check_constraints = OFF")
 
+    corrupted = bootstrap_snapshot(db)
+
+    state_error = assert_raise Schema.ShapeError, fn -> ColdStart.state(db) end
+
+    assert state_error.message ==
+             "incompatible_cold_start_v1: receipt_principal_invalid; recovery: Recover an unusable fresh database"
+
+    assert bootstrap_snapshot(db) == corrupted
+
+    validation_error = assert_raise Schema.ShapeError, fn -> ColdStart.validate!(db) end
+
+    assert validation_error.message ==
+             "incompatible_cold_start_v1: receipt_principal_invalid; recovery: Recover an unusable fresh database"
+
+    assert bootstrap_snapshot(db) == corrupted
+
     error = assert_raise Schema.ShapeError, fn -> Boot.ensure_schema!(db) end
 
     assert error.message ==
              "incompatible_cold_start_v1: receipt_principal_invalid; recovery: Recover an unusable fresh database"
+
+    assert bootstrap_snapshot(db) == corrupted
   end
 
   test "each interrupted healthy-v5 migration rolls back and a retry converges", _ctx do
@@ -497,6 +515,19 @@ defmodule Tightbeam.ColdStartTest do
       """)
 
     row
+  end
+
+  defp bootstrap_snapshot(db) do
+    for {table, query} <- [
+          {"users", "SELECT * FROM users ORDER BY userId"},
+          {"devices", "SELECT * FROM devices ORDER BY deviceId"},
+          {"sessions", "SELECT * FROM sessions ORDER BY sessionKey"},
+          {"cold_start_receipts", "SELECT * FROM cold_start_receipts ORDER BY id"},
+          {"events", "SELECT * FROM events ORDER BY id"}
+        ] do
+      assert {:ok, rows} = DB.query(db, query)
+      {table, rows}
+    end
   end
 
   defp table?(db, name) do
