@@ -127,9 +127,65 @@ pub fn group(args: &[String]) -> Result<i32, String> {
         .filter(|pgid| *pgid > 0)
         .ok_or_else(|| "process group id must be a positive integer".to_string())?;
 
-    authorize_group_signal(Path::new(&args[1]), pgid, &args[2], &args[3])?;
+    let target = HarnessTarget {
+        pgid,
+        identity_path: args[1].clone(),
+        boot_identity: args[2].clone(),
+        launch_id: args[3].clone(),
+    };
+    target.revalidate_before_signal()?;
 
-    kill_harness_tree(pgid, freeze_harness_tree(pgid))
+    kill_harness_tree(&target, freeze_harness_tree(&target)?)
+}
+
+/// The authorized harness instance every signal in a sweep must still be killing.
+struct HarnessTarget {
+    pgid: libc::pid_t,
+    identity_path: String,
+    boot_identity: String,
+    launch_id: String,
+}
+
+impl HarnessTarget {
+    /// Re-read boot identity, the identity file, and the live session leader before a signal.
+    ///
+    /// A pgid can be reused once the leader is gone; signalling the number alone is not enough
+    /// to know the process group still belongs to this launch.
+    fn revalidate_before_signal(&self) -> Result<(), String> {
+        authorize_group_signal(
+            Path::new(&self.identity_path),
+            self.pgid,
+            &self.boot_identity,
+            &self.launch_id,
+        )?;
+        verify_session_leader_alive(self.pgid)
+    }
+}
+
+/// The recorded session leader must still lead `pgid` whenever it is still live.
+///
+/// Once the leader has exited, `getpgid` cannot answer for it; the identity file and the
+/// freeze snapshot are what still bind the sweep. A live pid that is no longer the leader
+/// of `pgid` is reuse and must refuse before any signal is sent.
+fn verify_session_leader_alive(pgid: libc::pid_t) -> Result<(), String> {
+    let actual_pgid = unsafe { libc::getpgid(pgid) };
+    if actual_pgid == -1 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(());
+        }
+        return Err(format!(
+            "harness session leader {pgid} process group could not be read: {error}"
+        ));
+    }
+    if actual_pgid != pgid {
+        return Err(format!(
+            "process group {pgid} no longer matches its session leader \
+             (now in group {actual_pgid})"
+        ));
+    }
+
+    Ok(())
 }
 
 /// How many times the sweep re-reads the table looking for something new to freeze.
@@ -156,37 +212,42 @@ const FREEZE_ROUNDS: usize = 8;
 ///
 /// Nothing from here to the kill may return early. A frozen tree that never gets its
 /// SIGKILL never dies at all — strictly worse than the orphan this replaces — so every
-/// failure below is reported and walked past rather than propagated.
-fn freeze_harness_tree(pgid: libc::pid_t) -> Sweep {
+/// failure below is recorded on the sweep rather than silently dropped.
+fn freeze_harness_tree(target: &HarnessTarget) -> Result<Sweep, String> {
+    let pgid = target.pgid;
     // Us, and the group we are in. `harness-group` run BY HAND from inside the very session
     // it is parking is a descendant of the group it sweeps: freezing ourselves there stops
     // this process forever, with the whole tree stopped behind it and nothing left running
-    // to kill any of it. Excluded HERE, at the one place a member enters the sweep, so that
-    // what comes out is safe to signal without a second guard remembering why.
+    // to kill any of it. Same-group protection runs BEFORE any killpg(SIGSTOP), so an
+    // in-group caller can exclude itself instead of stopping the whole walk.
     let me = unsafe { libc::getpid() };
     let my_group = unsafe { libc::getpgrp() };
-
-    // One syscall, before the first reading: the harness itself stops forking here, so the
-    // window in which the tree can still grow is the width of a snapshot rather than of the
-    // whole sweep.
-    unsafe {
-        libc::killpg(pgid, libc::SIGSTOP);
-    }
 
     let mut sweep = Sweep {
         frozen: BTreeSet::new(),
         groups: BTreeSet::from([pgid]),
+        incomplete: false,
     };
+    sweep.groups.remove(&my_group);
 
-    for _ in 0..FREEZE_ROUNDS {
+    target.revalidate_before_signal()?;
+
+    if pgid == my_group {
+        // Never killpg the recorded group: we are in it. The first snapshot round below
+        // SIGSTOPs the other members individually.
+    } else {
+        signal_process_group(pgid, libc::SIGSTOP, target)?;
+    }
+
+    let mut rounds = 0;
+    let mut found_more = true;
+    while rounds < FREEZE_ROUNDS {
+        target.revalidate_before_signal()?;
+
         let snapshot = match Snapshot::capture() {
             Ok(snapshot) => snapshot,
             Err(reason) => {
-                // Not fatal, and deliberately not an Err: an unreadable process table would
-                // otherwise become a `kill_failed` row, and a `kill_failed` row fences its
-                // adapter key until an operator clears it. The recorded group is still
-                // killed below, which is exactly what this floor did before the sweep
-                // existed — degraded to the old behaviour, never worse than it.
+                sweep.incomplete = true;
                 eprintln!(
                     "harness-group: process table unreadable ({reason}); \
                      signalling the recorded group only"
@@ -198,15 +259,13 @@ fn freeze_harness_tree(pgid: libc::pid_t) -> Sweep {
         let tree = snapshot.group_tree(pgid);
         sweep.groups.extend(snapshot.process_groups(&tree));
 
-        let mut found_more = false;
+        found_more = false;
         for pid in tree {
             if pid == me || !sweep.frozen.insert(pid) {
                 continue;
             }
             found_more = true;
-            unsafe {
-                libc::kill(pid, libc::SIGSTOP);
-            }
+            signal_process(pid, libc::SIGSTOP, target)?;
         }
 
         // The exit condition is the state itself — a reading that adds nobody — not a
@@ -214,10 +273,14 @@ fn freeze_harness_tree(pgid: libc::pid_t) -> Sweep {
         if !found_more {
             break;
         }
+        rounds += 1;
     }
 
-    sweep.groups.remove(&my_group);
-    sweep
+    if found_more {
+        sweep.incomplete = true;
+    }
+
+    Ok(sweep)
 }
 
 /// What one freeze pass established: the pids it stopped, and every group they sit in.
@@ -227,6 +290,38 @@ fn freeze_harness_tree(pgid: libc::pid_t) -> Sweep {
 struct Sweep {
     frozen: BTreeSet<libc::pid_t>,
     groups: BTreeSet<libc::pid_t>,
+    /// True when the walk could not prove it saw the whole tree before the kill.
+    incomplete: bool,
+}
+
+fn signal_process_group(
+    pgid: libc::pid_t,
+    signal: libc::c_int,
+    target: &HarnessTarget,
+) -> Result<(), String> {
+    target.revalidate_before_signal()?;
+    if unsafe { libc::killpg(pgid, signal) } == -1 {
+        return Err(format!(
+            "process group {pgid} could not be signalled: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+fn signal_process(
+    pid: libc::pid_t,
+    signal: libc::c_int,
+    target: &HarnessTarget,
+) -> Result<(), String> {
+    target.revalidate_before_signal()?;
+    if unsafe { libc::kill(pid, signal) } == -1 {
+        return Err(format!(
+            "process {pid} could not be signalled: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
 }
 
 /// SIGKILL everything the freeze proved was ours, then the recorded group last.
@@ -242,24 +337,44 @@ struct Sweep {
 /// proved, where the group pass also reaches anything that appeared inside those groups
 /// since the last reading.
 ///
-/// Only the RECORDED group decides the exit status. A group we merely inferred cannot fence
-/// the adapter key: an escapee that outlives its SIGKILL is named on stderr, because the
-/// alternative — reporting it as a failed kill — turns a leaked process into an adapter
-/// that can never launch again.
-fn kill_harness_tree(pgid: libc::pid_t, sweep: Sweep) -> Result<i32, String> {
+/// Incomplete cleanup is a loud failure: exit non-zero so the adapter fence stays up until
+/// an operator clears it. A recorded-group kill that succeeded while escapees remain must
+/// not read as success.
+fn kill_harness_tree(target: &HarnessTarget, sweep: Sweep) -> Result<i32, String> {
+    let pgid = target.pgid;
+    let mut cleanup_failures = Vec::new();
+
+    if sweep.incomplete {
+        cleanup_failures.push("harness tree freeze did not prove complete before kill".to_string());
+    }
+
     for group in sweep.groups.iter().filter(|group| **group != pgid) {
-        sigkill_stray(Stray::Group(*group));
+        if let Some(reason) = sigkill_stray(Stray::Group(*group), target) {
+            cleanup_failures.push(reason);
+        }
     }
 
     for pid in &sweep.frozen {
-        sigkill_stray(Stray::Process(*pid));
+        if let Some(reason) = sigkill_stray(Stray::Process(*pid), target) {
+            cleanup_failures.push(reason);
+        }
     }
 
-    if unsafe { libc::killpg(pgid, libc::SIGKILL) } == 0 {
-        return Ok(0);
-    }
+    target.revalidate_before_signal()?;
+    let recorded = if unsafe { libc::killpg(pgid, libc::SIGKILL) } == 0 {
+        Ok(0)
+    } else {
+        classify_group_kill(pgid, std::io::Error::last_os_error())
+    };
 
-    classify_group_kill(pgid, std::io::Error::last_os_error())
+    if cleanup_failures.is_empty() {
+        recorded
+    } else {
+        Err(format!(
+            "harness cleanup incomplete: {}",
+            cleanup_failures.join("; ")
+        ))
+    }
 }
 
 /// One escapee the walk found — a whole group of them, or a single process.
@@ -268,7 +383,7 @@ enum Stray {
     Process(libc::pid_t),
 }
 
-/// SIGKILL one escapee, and say so only if it would not die.
+/// SIGKILL one escapee, and report if it would not die.
 ///
 /// The signal and the `errno` read are in the same function on purpose: `errno` describes
 /// the last failing call on this thread, and the file already learned once (`bounded_command`)
@@ -278,8 +393,12 @@ enum Stray {
 /// process that had already exited, and darwin reports an emptied group as EPERM — the same
 /// fact `classify_group_kill` records for the recorded group, for the same reason, which is
 /// that the target was established as ours before it was signalled.
-fn sigkill_stray(stray: Stray) {
-    let (result, target) = match stray {
+fn sigkill_stray(stray: Stray, target: &HarnessTarget) -> Option<String> {
+    if let Err(error) = target.revalidate_before_signal() {
+        return Some(error);
+    }
+
+    let (result, target_label) = match stray {
         Stray::Group(pgid) => (
             unsafe { libc::killpg(pgid, libc::SIGKILL) },
             format!("process group {pgid}"),
@@ -291,15 +410,19 @@ fn sigkill_stray(stray: Stray) {
     };
 
     if result == 0 {
-        return;
+        return None;
     }
 
     let error = std::io::Error::last_os_error();
     let gone = error.raw_os_error() == Some(libc::ESRCH)
         || (cfg!(target_os = "macos") && error.raw_os_error() == Some(libc::EPERM));
 
-    if !gone {
-        eprintln!("harness-group: escaped {target} outlived SIGKILL: {error}");
+    if gone {
+        None
+    } else {
+        let reason = format!("escaped {target_label} outlived SIGKILL: {error}");
+        eprintln!("harness-group: {reason}");
+        Some(reason)
     }
 }
 
