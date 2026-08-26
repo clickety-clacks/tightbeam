@@ -3455,6 +3455,7 @@ mod tests {
     fn commands_outside_cli_surface_v1_are_not_exposed() {
         for command in [
             "rail-exec",
+            "rail-action",
             "probe",
             "facts-read",
             "artifact-get",
