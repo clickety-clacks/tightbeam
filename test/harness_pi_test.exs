@@ -10,15 +10,6 @@ defmodule Tightbeam.HarnessPiTest do
     }
   """
 
-  @abort_on_close_session """
-    async closeSession(params) {
-      const session = this.sessions.maybeGet(params.sessionId);
-      if (session) await session.cancel();
-      this.sessions.close(params.sessionId);
-      return {};
-    }
-  """
-
   test "adapter patch adds abort-on-close lifecycle and preserves concurrent sessions idempotently" do
     patched = Pi.patch_adapter_source(pristine_adapter_fixture())
 
@@ -47,18 +38,39 @@ defmodule Tightbeam.HarnessPiTest do
   end
 
   test "patched closeSession sends abort and settles an interrupted turn as cancelled" do
-    assert close_contract(@abort_on_close_session) == %{
-             "abortCount" => 1,
+    patched_close_session =
+      pristine_adapter_fixture()
+      |> Pi.patch_adapter_source()
+      |> close_session_source()
+
+    assert close_contract(patched_close_session) == %{
+             "abortRequests" => [%{"type" => "abort"}],
+             "release" => %{
+               "bundleSha256" =>
+                 "24ff73fda6e3c76ddce2d359a79f5c4b8f292eb290e4d2ab85aac94676b2c2dc",
+               "package" => "pi-acp",
+               "version" => "0.0.33"
+             },
+             "settlements" => ["cancelled"],
+             "sessionClosed" => true,
              "stopReason" => "cancelled",
-             "sessionClosed" => true
+             "trace" => ["request:abort", "dispose"]
            }
   end
 
   test "close-only handler leaves an interrupted turn to complete as end_turn without abort" do
     assert close_contract(@close_only_close_session) == %{
-             "abortCount" => 0,
+             "abortRequests" => [],
+             "release" => %{
+               "bundleSha256" =>
+                 "24ff73fda6e3c76ddce2d359a79f5c4b8f292eb290e4d2ab85aac94676b2c2dc",
+               "package" => "pi-acp",
+               "version" => "0.0.33"
+             },
+             "settlements" => ["end_turn"],
+             "sessionClosed" => true,
              "stopReason" => "end_turn",
-             "sessionClosed" => true
+             "trace" => ["dispose"]
            }
   end
 
@@ -260,65 +272,29 @@ defmodule Tightbeam.HarnessPiTest do
   defp close_contract(close_session_source) do
     root = tmp_dir!("pi-close-contract")
     runner = Path.join(root, "runner.mjs")
+    fixture = Path.expand("fixtures/pi_acp/0.0.33-close-contract.mjs", __DIR__)
 
     File.write!(
       runner,
-      close_contract_runner(close_session_source)
+      """
+      import { runCloseContract } from #{JSON.encode!(fixture)};
+      const result = await runCloseContract(#{JSON.encode!(close_session_source)});
+      process.stdout.write(JSON.stringify(result));
+      """
     )
 
     {output, 0} = System.cmd("node", [runner], cd: root, stderr_to_stdout: true)
     JSON.decode!(output)
   end
 
-  defp close_contract_runner(close_session_source) do
-    """
-    class MockProc {
-      constructor() { this.abortCount = 0; }
-      async abort() { this.abortCount += 1; }
-    }
-    class MockSession {
-      constructor(sessionId) {
-        this.sessionId = sessionId;
-        this.cancelRequested = false;
-        this.proc = new MockProc();
-        this.pendingTurn = null;
-      }
-      async cancel() {
-        this.cancelRequested = true;
-        await this.proc.abort();
-      }
-      wasCancelRequested() { return this.cancelRequested; }
-      beginTurn() {
-        return new Promise((resolve) => { this.pendingTurn = { resolve }; });
-      }
-      settleTurn() {
-        const reason = this.cancelRequested ? "cancelled" : "end_turn";
-        this.pendingTurn?.resolve(reason);
-        this.pendingTurn = null;
-      }
-    }
-    class SessionManager {
-      constructor() { this.sessions = new Map(); }
-      maybeGet(sessionId) { return this.sessions.get(sessionId); }
-      close(sessionId) { this.sessions.delete(sessionId); }
-    }
-    class Agent {
-      constructor() { this.sessions = new SessionManager(); }
-      #{close_session_source}
-    }
-    const agent = new Agent();
-    const session = new MockSession("sess-1");
-    agent.sessions.sessions.set("sess-1", session);
-    const turn = session.beginTurn();
-    await agent.closeSession({ sessionId: "sess-1" });
-    session.settleTurn();
-    const stopReason = await turn;
-    process.stdout.write(JSON.stringify({
-      abortCount: session.proc.abortCount,
-      stopReason,
-      sessionClosed: !agent.sessions.sessions.has("sess-1")
-    }));
-    """
+  defp close_session_source(source) do
+    [_, close_session] =
+      Regex.run(
+        ~r/(  async closeSession\(params\) \{.*?\n  \})\n  async listSessions\(params\)/s,
+        source
+      )
+
+    close_session
   end
 
   defp tmp_dir!(label) do
