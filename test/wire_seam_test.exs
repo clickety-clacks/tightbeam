@@ -56,6 +56,7 @@ defmodule Tightbeam.Wire.SeamTest do
       opts: [
         db: db,
         base_dir: base_dir,
+        cursor_signing: cursor_signing!(base_dir),
         handlers: handlers,
         cli_token: "tbc_wire_seam",
         session_status: fn _ -> nil end

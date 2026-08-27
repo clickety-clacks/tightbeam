@@ -42,9 +42,9 @@ defmodule Tightbeam.Wire.Router do
     any asset.
 
   Elixir shape: `use Plug.Router`; deps (handlers table, db, cli_token,
-  session_status fun) arrive via `init_opts` from the composition root and
-  ride `conn.private`. Handlers run in the request process — fine, because
-  every verb is bounded (long work goes through the Ledger).
+  cursor_signing provider, session_status fun) arrive via `init_opts` from the
+  composition root and ride `conn.private`. Handlers run in the request process
+  — fine, because every verb is bounded (long work goes through the Ledger).
   """
 
   use Plug.Router
@@ -60,6 +60,13 @@ defmodule Tightbeam.Wire.Router do
                     parsers: [{:multipart, length: @max_upload_bytes + 1_000_000}],
                     pass: ["*/*"]
                   )
+
+  @impl Plug
+  def init(opts) do
+    deps = Map.new(opts)
+    _provider = deps |> Map.get(:cursor_signing) |> Tightbeam.CursorSigning.validate!()
+    deps
+  end
 
   @impl Plug
   def call(conn, opts) do

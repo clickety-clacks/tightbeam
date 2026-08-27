@@ -156,6 +156,7 @@ defmodule Tightbeam.AttentionTierTest do
 
     config = %{
       base_dir: base_dir,
+      cursor_signing: cursor_signing!(base_dir),
       cwd: "/tmp",
       port: 0,
       default_harness: :claude,

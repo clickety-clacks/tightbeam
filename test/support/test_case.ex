@@ -54,6 +54,7 @@ defmodule Tightbeam.TestCase do
           catalog_reply: 2,
           catalog_probe_harness: 1,
           claim_org: 2,
+          cursor_signing!: 1,
           ensure_all_schemas: 1,
           ensure_main_session: 2
         ]
@@ -83,6 +84,22 @@ defmodule Tightbeam.TestCase do
 
   @doc "Create the complete production schema for a unit-test database."
   def ensure_all_schemas(db), do: Tightbeam.Schema.ensure_all(db)
+
+  @doc "Provision or load the real durable cursor-signing provider for a test base dir."
+  def cursor_signing!(base_dir) do
+    case Tightbeam.CursorSigning.load(base_dir) do
+      {:ok, provider} ->
+        provider
+
+      {:error, %Tightbeam.CursorSigning.Error{reason: reason}}
+      when reason in [:missing_directory, :missing_material] ->
+        :ok = Tightbeam.CursorSigning.provision(base_dir)
+        Tightbeam.CursorSigning.load!(base_dir)
+
+      {:error, reason} ->
+        raise reason
+    end
+  end
 
   @doc "Claim a fresh test org through the production cold-start coordinator."
   def claim_org(db, input) do

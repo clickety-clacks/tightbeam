@@ -1,6 +1,6 @@
 defmodule Tightbeam.ApplicationTest do
   use Tightbeam.TestCase, async: false
-  alias Tightbeam.{DB, Escalation, EventLog, Ledger}
+  alias Tightbeam.{CursorSigning, DB, Escalation, EventLog, Ledger}
 
   setup do
     base = Path.join(System.tmp_dir!(), "tb_app_#{System.unique_integer([:positive])}")
@@ -158,6 +158,41 @@ defmodule Tightbeam.ApplicationTest do
     end)
 
     assert_raise ArgumentError, ~r|missing required refs: tightbeam/live|, fn ->
+      Tightbeam.Application.start(:normal, [])
+    end
+
+    refute File.exists?(Path.join(base, "state.db"))
+    refute File.exists?(Path.join(base, "gateway.json"))
+    refute File.exists?(Path.join(base, "harnesses.json"))
+  end
+
+  test "production entry refuses missing cursor material before starting its store" do
+    base =
+      Path.join(System.tmp_dir!(), "tb_app_cursor_refused_#{System.unique_integer([:positive])}")
+
+    assert :initialized = Tightbeam.Identity.init!(base)
+
+    previous_base = Application.fetch_env!(:tightbeam, :base_dir)
+    previous_autostart = Application.fetch_env!(:tightbeam, :autostart)
+    previous_path = System.get_env("PATH")
+    bin_dir = Path.join(base, "working-cli")
+    codex = Path.join(bin_dir, "codex")
+    File.mkdir_p!(bin_dir)
+    File.write!(codex, "#!/bin/sh\necho 'codex-cli 0.0.0'\n")
+    File.chmod!(codex, 0o755)
+
+    Application.put_env(:tightbeam, :base_dir, base)
+    Application.put_env(:tightbeam, :autostart, true)
+    System.put_env("PATH", Enum.join(Enum.reject([bin_dir, previous_path], &is_nil/1), ":"))
+
+    on_exit(fn ->
+      Application.put_env(:tightbeam, :base_dir, previous_base)
+      Application.put_env(:tightbeam, :autostart, previous_autostart)
+      restore_path(previous_path)
+      File.rm_rf!(base)
+    end)
+
+    assert_raise CursorSigning.Error, "cursor signing is unavailable", fn ->
       Tightbeam.Application.start(:normal, [])
     end
 

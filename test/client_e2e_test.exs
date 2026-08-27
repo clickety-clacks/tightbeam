@@ -1867,6 +1867,7 @@ defmodule Tightbeam.ClientE2ETest do
       Router.init(
         db: db,
         base_dir: base_dir,
+        cursor_signing: cursor_signing!(base_dir),
         handlers: handlers,
         conn_registry: Tightbeam.ConnRegistry,
         cli_token: "tbc_client_e2e",

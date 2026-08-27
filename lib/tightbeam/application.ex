@@ -59,6 +59,12 @@ defmodule Tightbeam.Application do
   end
 
   defp start_tree(config) do
+    # The server-held cursor signer is composed before any child, including the
+    # listener. Missing or malformed durable material is a typed startup failure;
+    # normal startup never provisions or substitutes it.
+    cursor_signing = Tightbeam.CursorSigning.load!(config.base_dir)
+    config = Map.put(config, :cursor_signing, cursor_signing)
+
     with {:ok, supervisor} <- Supervisor.start_link(children(), root_opts()) do
       Enum.each(Tightbeam.Gateway.children_after_preflight(config), fn child ->
         {:ok, _pid} = Supervisor.start_child(supervisor, child)
