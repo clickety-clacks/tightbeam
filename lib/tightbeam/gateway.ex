@@ -7911,12 +7911,13 @@ defmodule Tightbeam.Gateway do
   # echo and reply — the message directly above IS delivered to the fresh
   # context, everything before it is not.
   defp append_context_reset_marker(db, session) do
-    append_marker(
+    append_stored_notice(
       db,
       session.session_key,
       "[context reset]\n\n" <>
         "The agent's working memory was reset while handling the message above. " <>
-        "Earlier messages stay visible here, but the agent no longer remembers them."
+        "Earlier messages stay visible here, but the agent no longer remembers them.",
+      "marker"
     )
   end
 
@@ -7941,11 +7942,12 @@ defmodule Tightbeam.Gateway do
   defp error_sentence(reason), do: inspect(reason)
 
   defp append_turn_failed_marker(db, session_key, reason) do
-    append_marker(
+    append_stored_notice(
       db,
       session_key,
       "[turn failed]\n\nThe agent could not answer the message above: #{reason}" <>
-        unknown_outcome_warning(reason)
+        unknown_outcome_warning(reason),
+      "substrate"
     )
   end
 
@@ -7965,18 +7967,20 @@ defmodule Tightbeam.Gateway do
 
   defp unknown_outcome_warning(_reason), do: ""
 
-  # MARKER MESSAGES (the normative convention lives in Payloads — the seam
-  # clients render from): an ordinary appended message so it rides replay
-  # and live push with no new frame type. sender "process:tightbeam" is the
-  # anti-forgery — real model output always commits with sender
-  # "tightbeam", so no session can emit a marker by typing one.
-  defp append_marker(db, session_key, content) do
+  # STORED NOTICES: ordinary appended messages so structural boundaries and
+  # failure notices ride replay and live push with no new frame type. The
+  # stored discriminator keeps those two meanings distinct. sender
+  # "process:tightbeam" is the anti-forgery — real model output always commits
+  # with sender "tightbeam", so no session can emit either by typing one.
+  defp append_stored_notice(db, session_key, content, message_type)
+       when message_type in ["marker", "substrate"] do
     {:ok, outcome} =
       DB.transaction(db, fn txn ->
         outcome =
           Projection.append_in_txn(txn, %{
             session_key: session_key,
             role: "assistant",
+            message_type: message_type,
             content: content,
             sender: "process:tightbeam"
           })

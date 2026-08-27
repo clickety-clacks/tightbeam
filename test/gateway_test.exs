@@ -3968,6 +3968,7 @@ defmodule Tightbeam.GatewayTest do
 
     assert [marker] = Projection.list_after(ctx.db, "retune", nil, 50, 0)
     assert marker.sender == "process:tightbeam", "the anti-forgery: no session can type one"
+    assert marker.message_type == "marker"
     assert marker.content =~ "[model retune]"
     assert marker.content =~ "claude-fable-5"
     assert marker.content =~ "claude-sonnet-4-6"
@@ -5010,6 +5011,7 @@ defmodule Tightbeam.GatewayTest do
       |> Enum.find(&String.starts_with?(&1.content || "", "[turn failed]"))
 
     assert marker, "crash recovery must append the turn-failed marker"
+    assert marker.message_type == "substrate"
     assert marker.content =~ "side effects are UNKNOWN, not undone"
     assert marker.content =~ "non-idempotent"
   end
@@ -8170,6 +8172,11 @@ defmodule Tightbeam.GatewayTest do
 
     marker = Enum.find(frames, &(&1["type"] == "message" and &1["sender"] == "process:tightbeam"))
     assert String.starts_with?(marker["content"], "[context reset]\n")
+
+    assert %{message_type: "marker"} =
+             ctx.db
+             |> Projection.list_after("k1", nil, 100)
+             |> Enum.find(&String.starts_with?(&1.content || "", "[context reset]\n"))
 
     assert Enum.map(Org.pointer_chain(ctx.db, "k1"), & &1.reason) == ["created", "fallback"]
 

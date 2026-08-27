@@ -386,7 +386,7 @@ defmodule Tightbeam.EventLog do
 
           owner ->
             {:appended, marker} =
-              Projection.append_marker_in_txn(txn, session_key, message, attention)
+              Projection.append_substrate_in_txn(txn, session_key, message, attention)
 
             Tightbeam.Firehose.Publisher.message_in_txn(txn, session_key, marker, owner)
 

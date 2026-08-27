@@ -226,10 +226,10 @@ defmodule Tightbeam.Productions.BubbleTest do
 
     assert ConditionFacts.standing?(ctx.db, "user-alerted", "flynn")
 
-    {:ok, [[alert_content]]} =
+    {:ok, [[alert_content, "substrate"]]} =
       DB.query(
         ctx.db,
-        "SELECT content FROM messages WHERE sessionKey = ?1 AND content LIKE '[no agent can act]%'",
+        "SELECT content,messageType FROM messages WHERE sessionKey = ?1 AND content LIKE '[no agent can act]%'",
         [ctx.main.session_key]
       )
 

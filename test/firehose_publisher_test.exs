@@ -1,8 +1,9 @@
 defmodule Tightbeam.Firehose.PublisherTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{ConnRegistry, DB, Dispatch, Gateway, Ledger, Org, Rules, Wakes}
-  alias Tightbeam.Firehose.{Hub, Publisher}
+  alias Tightbeam.{ConnRegistry, DB, Dispatch, Gateway, Ledger, Org, Projection, Rules}
+  alias Tightbeam.{StateResources, Wakes}
+  alias Tightbeam.Firehose.{Hub, Publisher, Registry}
 
   defmodule LaneStub do
     use GenServer
@@ -543,9 +544,70 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     assert %{
              "class" => "message.created",
-             "refs" => %{"messageId" => "s_1"},
+             "refs" => %{"messageId" => "s_1", "sessionKey" => "agent:one"},
              "payload" => %{"id" => "s_1", "rowVersion" => 9}
            } = receive_notice()
+  end
+
+  test "message notices are the shared fetched item with both correlation refs" do
+    db = :firehose_message_type_db
+    start_supervised!({DB, path: ":memory:", name: db})
+    :ok = Tightbeam.Schema.ensure_all(db)
+
+    assert %{serializer: :message, primary_refs: ["messageId", "sessionKey"]} =
+             Registry.rows()["message.created"]
+
+    fixtures = [
+      {"assistant", %{role: "assistant", sender: "tightbeam"}, "assistant"},
+      {"agent", %{role: "user", sender: "agent:sender"}, "agent"},
+      {"substrate", %{role: "assistant", sender: "process:scheduler"}, "substrate"},
+      {"marker", %{role: "assistant", sender: "process:tightbeam", message_type: "marker"},
+       "marker"},
+      {"human", %{role: "user", sender: "user:flynn"}, nil},
+      {"historical", %{role: "assistant", sender: nil}, nil}
+    ]
+
+    Enum.each(fixtures, fn {label, fields, expected_type} ->
+      assert {:ok, {:appended, message}} =
+               DB.transaction(db, fn txn ->
+                 {:appended, message} =
+                   Projection.append_in_txn(
+                     txn,
+                     Map.merge(fields, %{
+                       session_key: "message-types",
+                       content: "identical content"
+                     })
+                   )
+
+                 :ok = Publisher.message_in_txn(txn, "message-types", message, "flynn")
+                 {:appended, message}
+               end)
+
+      fetched_item = db |> Projection.get(message.id) |> StateResources.message()
+
+      assert %{
+               "class" => "message.created",
+               "refs" => refs,
+               "payload" => payload
+             } = receive_notice()
+
+      assert refs["messageId"] == fetched_item["id"], label
+      assert refs["sessionKey"] == fetched_item["sessionKey"], label
+      assert payload == fetched_item, label
+      assert JSON.encode!(payload) == JSON.encode!(fetched_item), label
+      assert payload["role"] == fields.role, label
+      assert payload["content"] == "identical content", label
+      refute Map.has_key?(payload, "message_type"), label
+      refute Map.has_key?(payload, "messageKind"), label
+      refute Map.has_key?(payload, "kind"), label
+
+      if is_nil(expected_type) do
+        refute Map.has_key?(payload, "messageType"), label
+        refute JSON.encode!(payload) =~ "messageType", label
+      else
+        assert payload["messageType"] == expected_type, label
+      end
+    end)
   end
 
   test "return emits the ruled decision_request.returned class" do

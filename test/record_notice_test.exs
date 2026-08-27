@@ -91,6 +91,7 @@ defmodule Tightbeam.RecordNoticeTest do
     assert marker.content == "[adapter down]\n\nThe engine stopped."
     assert marker.sender == "process:tightbeam"
     assert marker.role == "assistant"
+    assert marker.message_type == "substrate"
     assert marker.attention_tier == 0
 
     seq = marker.seq
