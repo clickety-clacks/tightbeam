@@ -136,7 +136,8 @@ defmodule Tightbeam.Harness do
               {:subagent_start | :subagent_stop, map()} | :skip
   @callback fetch_catalog(map()) :: {:ok, [map()]} | {:error, term()}
 
-  @optional_callbacks preflight_launch: 3
+  @optional_callbacks preflight_launch: 3, warm_home: 2, requires_zero_listeners?: 0,
+                        adapter_provisioning: 0
 
   @spec preflight_launch(module(), target(), String.t(), keyword()) :: preflight_result()
   def preflight_launch(module, target, home, opts) do
@@ -166,8 +167,6 @@ defmodule Tightbeam.Harness do
   @spec probe_cli(module(), target()) :: probe_result()
   def probe_cli(module, target), do: module.probe_cli(target)
 
-  @optional_callbacks warm_home: 2, requires_zero_listeners?: 0
-
   @doc """
   Whether the shared launch seam asserts the launched process group has ZERO LISTEN sockets,
   aborting fail-closed otherwise (rails-critical launch invariant 3).
@@ -188,7 +187,8 @@ defmodule Tightbeam.Harness do
     if function_exported?(module, :requires_zero_listeners?, 0) do
       module.requires_zero_listeners?()
     else
-      module.adapter_provisioning() == :shim
+      function_exported?(module, :adapter_provisioning, 0) and
+        module.adapter_provisioning() == :shim
     end
   end
 
@@ -221,7 +221,15 @@ defmodule Tightbeam.Harness do
   non-existent spec into the shared install would fail provisioning for every npm harness too.
   """
   @spec npm_provisioned() :: [module()]
-  def npm_provisioned, do: Enum.filter(all(), &(&1.adapter_provisioning() == :npm))
+  def npm_provisioned do
+    Enum.filter(all(), fn module ->
+      if function_exported?(module, :adapter_provisioning, 0) do
+        module.adapter_provisioning() == :npm
+      else
+        true
+      end
+    end)
+  end
 
   @doc "The configured default harness module, or the first registry entry."
   @spec default() :: module()

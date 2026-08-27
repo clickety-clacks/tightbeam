@@ -122,9 +122,6 @@ defmodule Tightbeam.Harness.Codex do
   def install_package, do: "@agentclientprotocol/codex-acp"
 
   @impl true
-  def adapter_provisioning, do: :npm
-
-  @impl true
   def cli_binary, do: "codex"
 
   @impl true
