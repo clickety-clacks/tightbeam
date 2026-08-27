@@ -52,7 +52,7 @@ defmodule Tightbeam.Harness.Cursor do
   def credential_env_vars, do: ["CURSOR_API_KEY"]
 
   @impl true
-  def default_model, do: Model.new("auto", effort: "medium")
+  def default_model, do: Model.new("auto")
 
   @impl true
   def install_package, do: "cursor-agent"

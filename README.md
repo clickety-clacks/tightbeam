@@ -360,10 +360,25 @@ vendor's own `login` does not onboard Tightbeam:
 <base_dir>/bin/tightbeam onboard <provider> --as-user <userId>
 ```
 
-`<provider>` is the credential provider — **`anthropic`** or **`openai`** — not
+`<provider>` is the credential provider — **`anthropic`**, **`openai`**, or **`cursor`** — not
 the harness name. `<userId>` is the admin created by that first pairing. From a
 release install `tightbeam` is already on PATH, so the `<base_dir>/bin/` prefix
 is only needed on a source install.
+
+Anthropic and OpenAI support subscription (interactive) or API-key onboarding:
+
+```sh
+<base_dir>/bin/tightbeam onboard anthropic --as-user <userId>
+<base_dir>/bin/tightbeam onboard openai    --as-user <userId>
+printenv ANTHROPIC_API_KEY | <base_dir>/bin/tightbeam onboard anthropic --api-key --as-user <userId>
+printenv OPENAI_API_KEY    | <base_dir>/bin/tightbeam onboard openai    --api-key --as-user <userId>
+```
+
+Cursor is API-key only; `--api-key` is required (no subscription login):
+
+```sh
+printenv CURSOR_API_KEY | <base_dir>/bin/tightbeam onboard cursor --api-key --as-user <userId>
+```
 
 **RUN IT ONCE PER HARNESS YOU INTEND TO USE.** A credential is per provider, and
 onboarding one leaves the other unusable — a session placed on an un-onboarded

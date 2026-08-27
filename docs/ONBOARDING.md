@@ -27,6 +27,13 @@ subscription. Each session reports its own as `display.credentialKind`
     # API key (non-interactive; the key is read from stdin and never leaves the host)
     printenv ANTHROPIC_API_KEY | tightbeam onboard anthropic --api-key
     printenv OPENAI_API_KEY    | tightbeam onboard openai    --api-key
+    printenv CURSOR_API_KEY    | tightbeam onboard cursor    --api-key
+
+Cursor is API-key-only in Tightbeam. There is no subscription login; the CLI
+requires `--api-key` and reads the key from stdin. At launch the harness injects
+`CURSOR_API_KEY` with `AGENT_CLI_CREDENTIAL_STORE=memory` — the uniform
+file-backed-cred + env-injection model. Cursor placement is gateway-local only;
+see `priv/kungfu/agentic-engineering/guidance/harness-support.md`.
 
 `--api-key` will not read from a terminal — a key typed at a prompt lands in
 shell scrollback.
