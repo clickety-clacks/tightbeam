@@ -175,17 +175,23 @@ defmodule Tightbeam.WorkItems do
     end
   end
 
-  ## Update (title/spec-ref/isBug PATCH — unchanged bracket-wise)
+  ## Update (body replacement or legacy title/spec-ref/isBug PATCH)
 
   defp update_result(db, call) do
     with :ok <- principal_allowed(call.principal) do
       result =
         transaction(db, fn txn ->
-          result = update_in_txn(txn, call.params)
+          result = update_in_txn(txn, call)
 
           case result do
             {:updated, item, _changed?} ->
               Publisher.maybe_accepted_in_txn(txn, call, public_work_item(item))
+
+            {:body_updated, item, descriptor, _changed?} ->
+              Publisher.maybe_accepted_in_txn(txn, call, %{
+                workItem: public_work_item(item),
+                bodyUpdate: descriptor
+              })
 
             _ ->
               :ok
@@ -199,13 +205,19 @@ defmodule Tightbeam.WorkItems do
           if changed?, do: best_effort(fn -> on_change(call).(item.id, "metadata") end)
           public_work_item(item)
 
+        {:body_updated, item, descriptor, changed?} ->
+          if changed?, do: best_effort(fn -> on_change(call).(item.id, "metadata") end)
+          %{workItem: public_work_item(item), bodyUpdate: descriptor}
+
         error ->
           error
       end
     end
   end
 
-  defp update_in_txn(txn, params) do
+  defp update_in_txn(txn, %{params: %{body: _body}} = call), do: update_body_in_txn(txn, call)
+
+  defp update_in_txn(txn, %{params: params}) do
     case fetch_in_txn(txn, params[:work_item_id]) do
       nil ->
         unknown(params[:work_item_id])
@@ -224,6 +236,86 @@ defmodule Tightbeam.WorkItems do
           {:updated, updated, metadata(item) != metadata(updated)}
         end
     end
+  end
+
+  defp update_body_in_txn(txn, call) do
+    params = call.params
+
+    case fetch_in_txn(txn, params[:work_item_id]) do
+      nil ->
+        unknown(params[:work_item_id])
+
+      item ->
+        with :ok <- body_only_patch(params),
+             :ok <- valid_body(params.body) do
+          after_body_validation(call).(params.body)
+          current = body_in_txn(txn, item.id)
+          changed? = current.body != params.body
+
+          body =
+            if changed? do
+              write_body_in_txn(txn, item.id, params.body, call.principal)
+              after_body_write_in_txn(call).(txn)
+              body_in_txn(txn, item.id)
+            else
+              current
+            end
+
+          {:body_updated, item, body_update_descriptor(body, changed?), changed?}
+        end
+    end
+  end
+
+  defp body_only_patch(params) do
+    if Enum.any?([:title, :is_bug, :spec_ref_name, :spec_ref_sha256], &Map.has_key?(params, &1)) do
+      error(
+        "invalid_body_patch",
+        "body cannot be combined with title, isBug, specRefName, or specRefSha256"
+      )
+    else
+      :ok
+    end
+  end
+
+  defp valid_body(nil), do: :ok
+
+  defp valid_body(body) when is_binary(body) do
+    if String.valid?(body) and byte_size(body) <= 65_536 do
+      :ok
+    else
+      invalid_body()
+    end
+  end
+
+  defp valid_body(_body), do: invalid_body()
+
+  defp invalid_body do
+    error("invalid_body", "body must be null or valid UTF-8 text of at most 65536 bytes")
+  end
+
+  defp write_body_in_txn(txn, work_item_id, body, {:user, user}) do
+    upsert_body_in_txn(txn, work_item_id, body, user, nil)
+  end
+
+  defp write_body_in_txn(txn, work_item_id, body, {:session, session}) do
+    upsert_body_in_txn(txn, work_item_id, body, nil, session)
+  end
+
+  defp upsert_body_in_txn(txn, work_item_id, body, user, session) do
+    Txn.q(
+      txn,
+      """
+      INSERT INTO work_item_bodies
+        (workItemId, body, updatedByUser, updatedBySession, updatedAt)
+      VALUES (?1, ?2, ?3, ?4, ?5)
+      ON CONFLICT(workItemId) DO UPDATE SET
+        body = excluded.body,
+        updatedByUser = excluded.updatedByUser,
+        updatedBySession = excluded.updatedBySession,
+        updatedAt = excluded.updatedAt
+      """,
+      [work_item_id, body, user, session, now()]
+    )
   end
 
   defp patch_updates(params, title, spec_ref_name, spec_ref_sha256, is_bug) do
@@ -666,10 +758,11 @@ defmodule Tightbeam.WorkItems do
 
       case IdPrefix.resolve(db, :work_item, supplied) do
         {:ok, id} ->
-          item = fetch(db, id)
+          {item, body} = fetch_detail(db, id)
+          after_body_read(call).(body.body)
 
           %{
-            workItem: public_work_item(item),
+            workItem: public_detail_work_item(item, body),
             assignments: Tightbeam.Assignments.__for_work_item__(db, item.id)
           }
 
@@ -761,6 +854,49 @@ defmodule Tightbeam.WorkItems do
     end
   end
 
+  defp fetch_detail(db, id) do
+    {:ok, [row]} =
+      DB.query(
+        db,
+        """
+        SELECT #{columns()}, b.body, b.updatedByUser, b.updatedBySession, b.updatedAt
+        FROM work_items AS w
+        LEFT JOIN work_item_bodies AS b ON b.workItemId = w.id
+        WHERE w.id = ?1
+        """,
+        [id]
+      )
+
+    {item_columns, [body, updated_by_user, updated_by_session, updated_at]} = Enum.split(row, 13)
+
+    {work_item(item_columns),
+     %{
+       body: body,
+       updatedByUser: updated_by_user,
+       updatedBySession: updated_by_session,
+       updatedAt: updated_at
+     }}
+  end
+
+  defp body_in_txn(txn, work_item_id) do
+    case Txn.q(
+           txn,
+           "SELECT body, updatedByUser, updatedBySession, updatedAt FROM work_item_bodies WHERE workItemId = ?1",
+           [work_item_id]
+         ) do
+      [[body, updated_by_user, updated_by_session, updated_at]] ->
+        %{
+          body: body,
+          updatedByUser: updated_by_user,
+          updatedBySession: updated_by_session,
+          updatedAt: updated_at
+        }
+
+      [] ->
+        %{body: nil, updatedByUser: nil, updatedBySession: nil, updatedAt: nil}
+    end
+  end
+
   ## Validation + principals
 
   defp valid_title(title) when is_binary(title) do
@@ -841,6 +977,14 @@ defmodule Tightbeam.WorkItems do
 
   defp on_change(call), do: Map.get(call, :on_work_item_change, fn _, _ -> :ok end)
 
+  defp after_body_validation(call),
+    do: Map.get(call, :after_body_validation, fn _body -> :ok end)
+
+  defp after_body_write_in_txn(call),
+    do: Map.get(call, :after_body_write_in_txn, fn _txn -> :ok end)
+
+  defp after_body_read(call), do: Map.get(call, :after_body_read, fn _body -> :ok end)
+
   defp on_routing_wake_scheduled_in_txn(call),
     do: Map.get(call, :on_routing_wake_scheduled_in_txn, fn _, _ -> :ok end)
 
@@ -906,6 +1050,38 @@ defmodule Tightbeam.WorkItems do
   end
 
   defp public_work_item(item), do: Map.drop(item, [:routingWakeId, :slateWakeId])
+
+  defp public_detail_work_item(item, body) do
+    item
+    |> public_work_item()
+    |> Map.merge(%{
+      body: body.body,
+      bodyUpdatedByUser: body.updatedByUser,
+      bodyUpdatedBySession: body.updatedBySession,
+      bodyUpdatedAt: body.updatedAt
+    })
+  end
+
+  defp body_update_descriptor(body, changed?) do
+    descriptor = body_descriptor(body.body)
+
+    Map.merge(descriptor, %{
+      changed: changed?,
+      updatedByUser: body.updatedByUser,
+      updatedBySession: body.updatedBySession,
+      updatedAt: body.updatedAt
+    })
+  end
+
+  defp body_descriptor(nil), do: %{state: "absent", byteLength: 0, sha256: nil}
+
+  defp body_descriptor(body) do
+    %{
+      state: "present",
+      byteLength: byte_size(body),
+      sha256: :sha256 |> :crypto.hash(body) |> Base.encode16(case: :lower)
+    }
+  end
 
   defp bool_to_int(true), do: 1
   defp bool_to_int(false), do: 0

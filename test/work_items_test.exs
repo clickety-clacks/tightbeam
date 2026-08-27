@@ -264,7 +264,34 @@ defmodule Tightbeam.WorkItemsTest do
     assert %{code: "unknown_work_item"} = get(ctx, {:user, "flynn"}, "missing")
 
     first = create(ctx, {:user, "flynn"}, %{title: "First"})
-    assert %{workItem: ^first, assignments: []} = get(ctx, {:session, "holder"}, first.id)
+
+    assert %{workItem: first_detail, assignments: []} =
+             get(ctx, {:session, "holder"}, first.id)
+
+    assert Map.drop(first_detail, [
+             :body,
+             :bodyUpdatedByUser,
+             :bodyUpdatedBySession,
+             :bodyUpdatedAt
+           ]) == first
+
+    assert Map.take(first_detail, [
+             :body,
+             :bodyUpdatedByUser,
+             :bodyUpdatedBySession,
+             :bodyUpdatedAt
+           ]) == %{
+             body: nil,
+             bodyUpdatedByUser: nil,
+             bodyUpdatedBySession: nil,
+             bodyUpdatedAt: nil
+           }
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "SELECT workItemId FROM work_item_bodies WHERE workItemId = ?1", [
+               first.id
+             ])
+
     second = create(ctx, {:user, "flynn"}, %{title: "Second"})
     {:ok, _} = DB.query(ctx.db, "UPDATE work_items SET createdAt = 99")
 
@@ -287,6 +314,195 @@ defmodule Tightbeam.WorkItemsTest do
 
     assert Enum.count(detail.assignments, &(&1.state == "open")) == 2
     assert Enum.count(detail.assignments, &(&1.state == "closed")) == 1
+  end
+
+  test "body replacement, empty, clear, and no-op preserve spec refs and attribution", ctx do
+    item =
+      create(ctx, {:user, "flynn"}, %{
+        title: "Body target",
+        spec_ref_name: "specs/tightbeam/body.md",
+        spec_ref_sha256: @sha
+      })
+
+    body = "  Scope\n✓ \"ship\"\n"
+
+    change_call =
+      update_call({:user, "flynn"}, item.id, %{body: body})
+      |> Map.put(:on_work_item_change, fn id, kind -> send(self(), {:changed, id, kind}) end)
+
+    assert %{workItem: updated_item, bodyUpdate: descriptor} =
+             WorkItems.__handle__(ctx.db, "work-item-update", change_call)
+
+    assert updated_item == item
+    assert descriptor.state == "present"
+    assert descriptor.byteLength == byte_size(body)
+    assert descriptor.sha256 == :crypto.hash(:sha256, body) |> Base.encode16(case: :lower)
+    assert descriptor.changed
+    assert descriptor.updatedByUser == "flynn"
+    assert descriptor.updatedBySession == nil
+    assert is_integer(descriptor.updatedAt)
+    item_id = item.id
+    assert_received {:changed, ^item_id, "metadata"}
+
+    assert %{workItem: detail} = get(ctx, {:user, "flynn"}, item.id)
+    assert detail.body == body
+    assert detail.bodyUpdatedByUser == "flynn"
+    assert detail.bodyUpdatedBySession == nil
+    assert detail.bodyUpdatedAt == descriptor.updatedAt
+    assert detail.specRefName == "specs/tightbeam/body.md"
+    assert detail.specRefSha256 == @sha
+
+    noop_call =
+      update_call({:user, "other"}, item.id, %{body: body})
+      |> Map.put(:on_work_item_change, fn _, _ -> send(self(), :unexpected_change) end)
+
+    assert %{bodyUpdate: noop} = WorkItems.__handle__(ctx.db, "work-item-update", noop_call)
+    refute noop.changed
+    assert noop.updatedByUser == "flynn"
+    assert noop.updatedAt == descriptor.updatedAt
+    refute_received :unexpected_change
+
+    assert %{title: "Retitled"} =
+             update(ctx, {:user, "other"}, item.id, %{title: "Retitled"})
+
+    assert %{workItem: after_metadata_update} = get(ctx, {:user, "flynn"}, item.id)
+    assert after_metadata_update.body == body
+    assert after_metadata_update.bodyUpdatedByUser == "flynn"
+    assert after_metadata_update.bodyUpdatedAt == descriptor.updatedAt
+    assert after_metadata_update.specRefName == "specs/tightbeam/body.md"
+    assert after_metadata_update.specRefSha256 == @sha
+
+    assert %{bodyUpdate: empty} = update(ctx, {:session, "holder"}, item.id, %{body: ""})
+    assert empty.state == "present"
+    assert empty.byteLength == 0
+    assert empty.sha256 == :crypto.hash(:sha256, "") |> Base.encode16(case: :lower)
+    assert empty.updatedBySession == "holder"
+    assert empty.updatedByUser == nil
+
+    assert %{bodyUpdate: cleared} = update(ctx, {:session, "holder"}, item.id, %{body: nil})
+    assert cleared.state == "absent"
+    assert cleared.byteLength == 0
+    assert cleared.sha256 == nil
+    assert cleared.changed
+    assert cleared.updatedBySession == "holder"
+    assert is_integer(cleared.updatedAt)
+
+    assert %{workItem: cleared_detail} = get(ctx, {:session, "holder"}, item.id)
+    assert cleared_detail.body == nil
+    assert cleared_detail.bodyUpdatedBySession == "holder"
+    assert cleared_detail.bodyUpdatedAt == cleared.updatedAt
+    assert cleared_detail.specRefName == "specs/tightbeam/body.md"
+    assert cleared_detail.specRefSha256 == @sha
+
+    assert %{workItems: [listed]} = list(ctx, {:user, "flynn"})
+    refute Map.has_key?(listed, :body)
+    refute Map.has_key?(listed, :bodyUpdatedAt)
+  end
+
+  test "body validation and body-only separation refuse before any write", ctx do
+    item =
+      create(ctx, {:user, "flynn"}, %{
+        title: "Pinned",
+        spec_ref_name: "specs/tightbeam/body.md",
+        spec_ref_sha256: @sha
+      })
+
+    accepted = String.duplicate("a", 65_536)
+
+    assert %{bodyUpdate: %{changed: true, byteLength: 65_536}} =
+             update(ctx, {:user, "flynn"}, item.id, %{body: accepted})
+
+    for rejected <- [String.duplicate("a", 65_537), <<255>>] do
+      assert %{code: "invalid_body"} =
+               update(ctx, {:user, "flynn"}, item.id, %{body: rejected})
+
+      assert get(ctx, {:user, "flynn"}, item.id).workItem.body == accepted
+    end
+
+    for legacy_patch <- [
+          %{title: "Changed"},
+          %{is_bug: true},
+          %{spec_ref_name: "other.md"},
+          %{spec_ref_sha256: @sha2}
+        ] do
+      assert %{code: "invalid_body_patch", message: message} =
+               update(ctx, {:user, "flynn"}, item.id, Map.put(legacy_patch, :body, "mixed"))
+
+      assert message ==
+               "body cannot be combined with title, isBug, specRefName, or specRefSha256"
+    end
+
+    detail = get(ctx, {:user, "flynn"}, item.id).workItem
+    assert detail.body == accepted
+    assert detail.title == "Pinned"
+    refute detail.isBug
+    assert detail.specRefName == "specs/tightbeam/body.md"
+    assert detail.specRefSha256 == @sha
+  end
+
+  test "body updates are lifecycle-independent and a failed transaction leaves no partial row",
+       ctx do
+    item = create(ctx, {:user, "flynn"}, %{title: "Any state"})
+
+    for {state, index} <- Enum.with_index(~w(open iceboxed closed failed), 1) do
+      {:ok, _} =
+        DB.query(ctx.db, "UPDATE work_items SET state = ?2 WHERE id = ?1", [item.id, state])
+
+      assert %{bodyUpdate: %{changed: true}} =
+               update(ctx, {:session, "holder"}, item.id, %{body: "body-#{index}"})
+
+      assert get(ctx, {:session, "holder"}, item.id).workItem.state == state
+    end
+
+    rollback_item = create(ctx, {:user, "flynn"}, %{title: "Rollback"})
+
+    call =
+      update_call({:user, "flynn"}, rollback_item.id, %{body: "must roll back"})
+      |> Map.put(:after_body_write_in_txn, fn _txn -> raise "forced after body write" end)
+
+    assert_raise RuntimeError, "forced after body write", fn ->
+      WorkItems.__handle__(ctx.db, "work-item-update", call)
+    end
+
+    assert get(ctx, {:user, "flynn"}, rollback_item.id).workItem.body == nil
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "SELECT workItemId FROM work_item_bodies WHERE workItemId = ?1", [
+               rollback_item.id
+             ])
+
+    callback_item = create(ctx, {:user, "flynn"}, %{title: "Callback failure"})
+
+    callback_call =
+      update_call({:user, "flynn"}, callback_item.id, %{body: "committed first"})
+      |> Map.put(:on_work_item_change, fn id, kind ->
+        send(self(), {:failed_callback, id, kind})
+        raise "forced callback failure"
+      end)
+
+    assert %{bodyUpdate: %{changed: true}} =
+             WorkItems.__handle__(ctx.db, "work-item-update", callback_call)
+
+    callback_item_id = callback_item.id
+    assert_received {:failed_callback, ^callback_item_id, "metadata"}
+    refute_received {:failed_callback, ^callback_item_id, "metadata"}
+    assert get(ctx, {:user, "flynn"}, callback_item.id).workItem.body == "committed first"
+  end
+
+  test "a no-op clear on a legacy item does not create a body row", ctx do
+    item = create(ctx, {:user, "flynn"}, %{title: "Legacy"})
+
+    assert %{bodyUpdate: descriptor} = update(ctx, {:user, "flynn"}, item.id, %{body: nil})
+    refute descriptor.changed
+    assert descriptor.state == "absent"
+    assert descriptor.updatedByUser == nil
+    assert descriptor.updatedBySession == nil
+    assert descriptor.updatedAt == nil
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "SELECT workItemId FROM work_item_bodies WHERE workItemId = ?1", [
+               item.id
+             ])
   end
 
   test "work-item and assignment lifecycles are independent", ctx do
