@@ -63,6 +63,9 @@ pub enum TuneControl {
     Effort(String),
 }
 
+const ARTIFACT_KINDS: &[&str] = &["spec", "report", "doc", "data", "other"];
+const ARTIFACT_KIND_REMEDY: &str = "--kind must be spec, report, doc, data, or other";
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     Help,
@@ -1285,9 +1288,13 @@ fn parse_with_optional_catalog(
             if parsed.positional.len() != 1 {
                 return Err("usage: tightbeam artifact-record --kind <kind> --title <title> --path <originPath> [--description <text>] [--work-item <workItemId>] [--sha256 <hex>]".to_owned());
             }
+            let kind = nonempty(flags, "kind").ok_or_else(|| "--kind is required".to_owned())?;
+            if !ARTIFACT_KINDS.contains(&kind.as_str()) {
+                return Err(ARTIFACT_KIND_REMEDY.to_owned());
+            }
             Ok(Command::ArtifactRecord {
                 identity: identity(flags)?,
-                kind: nonempty(flags, "kind").ok_or_else(|| "--kind is required".to_owned())?,
+                kind,
                 title: nonempty(flags, "title").ok_or_else(|| "--title is required".to_owned())?,
                 origin_path: nonempty(flags, "path")
                     .ok_or_else(|| "--path is required".to_owned())?,
@@ -3640,6 +3647,46 @@ mod tests {
                     "usage: tightbeam artifacts [--work-item <workItemId>] [--session <key>]"
                         .to_owned()
                 )
+            );
+        }
+    }
+
+    #[test]
+    fn artifact_record_refuses_unknown_kinds_at_the_command_boundary() {
+        for kind in ARTIFACT_KINDS {
+            assert!(matches!(
+                parse(strings(&[
+                    "artifact-record",
+                    "--kind",
+                    kind,
+                    "--title",
+                    "Proof",
+                    "--path",
+                    "proof.md",
+                    "--as-user",
+                    "flynn",
+                ])),
+                Ok(Command::ArtifactRecord {
+                    kind: parsed_kind,
+                    ..
+                }) if parsed_kind == *kind
+            ));
+        }
+
+        for kind in ["log", "test-result"] {
+            assert_eq!(
+                parse(strings(&[
+                    "artifact-record",
+                    "--kind",
+                    kind,
+                    "--title",
+                    "Proof",
+                    "--path",
+                    "proof.md",
+                    "--as-user",
+                    "flynn",
+                ])),
+                Err(ARTIFACT_KIND_REMEDY.to_owned())
             );
         }
     }
