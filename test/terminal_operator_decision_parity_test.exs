@@ -183,41 +183,56 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
   test "visible impossible terminal shape refuses and records privacy-safe evidence", ctx do
     request = Escalation.operator_ask(ctx.db, ask_call(ctx.raiser, %{question: "tamper?"}))
     call = rule_call(request.id, %{decision: "accept"})
-    Escalation.operator_rule(ctx.db, call, scheduler: ctx.scheduler)
+    ruled = Escalation.operator_rule(ctx.db, call, scheduler: ctx.scheduler)
 
-    :ok =
-      DB.execute(
-        ctx.db,
-        "DELETE FROM lifecycle_events WHERE kind='decision_request_ruled' AND subject='#{request.id}'"
-      )
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO lifecycle_events (ts, kind, subject, detail) VALUES (?1, 'decision_request_ruled', ?2, NULL)",
+               [System.system_time(:millisecond), request.id]
+             )
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE decision_requests SET options='not-json' WHERE id=?1",
+               [request.id]
+             )
+
+    ensure_main_session(ctx.db, "other")
+    foreign = session(ctx.db, "integrity-foreign", "other")
+    assert [] = Escalation.list(ctx.db, ask_call(foreign, %{}), "ruled")
+    assert nil == Escalation.get(ctx.db, ask_call(foreign, %{}), request.id)
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM decision_request_integrity_evidence WHERE requestId=?1",
+               [request.id]
+             )
 
     assert %{
              code: "decision_request_integrity_invalid",
              request_id: request_id
-           } = Escalation.get(ctx.db, call, request.id, owner_user_id: "flynn")
+           } = Escalation.list(ctx.db, ask_call(ctx.raiser, %{}), "ruled")
 
     assert request_id == request.id
 
-    assert {:ok,
-            [
-              [
-                evidence_request_id,
-                "terminal-operator-decision-parity-v1",
-                "terminal-shape-invalid",
-                failing_fields,
-                "detail",
-                "user:flynn"
-              ]
-            ]} =
+    assert {:ok, [[1, shape_digest, failing_fields, cause, surface, observer]]} =
              DB.query(
                ctx.db,
-               "SELECT requestId,schemaVersion,causeCode,failingFields,firstSurface,observerPrincipal FROM decision_request_integrity_evidence"
+               "SELECT COUNT(*), MIN(shapeDigest), MIN(failingFields), MIN(causeCode), MIN(firstSurface), MIN(observerPrincipal) FROM decision_request_integrity_evidence WHERE requestId=?1",
+               [request.id]
              )
 
-    assert evidence_request_id == request.id
-    assert JSON.decode!(failing_fields) == ["rulingLifecycleEvent"]
+    assert JSON.decode!(failing_fields) == ["options", "rulingLifecycleEvent"]
+    assert cause == "terminal-shape-invalid"
+    assert surface == "list"
+    assert observer == "session:#{ctx.raiser.session_key}"
+    assert shape_digest == "efa9964d4e3857fc094f9b699b19ac1feb91a30b439236e05572b483cb886403"
     refute failing_fields =~ "flynn"
     refute failing_fields =~ "tamper"
+    assert ruled.ruling_fact_id > 0
   end
 
   test "integrity descriptor and digest are stable across private values and surfaces", ctx do
