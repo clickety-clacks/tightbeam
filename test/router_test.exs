@@ -492,6 +492,89 @@ defmodule Tightbeam.Wire.RouterTest do
     assert JSON.decode!(missing.resp_body)["error"]["code"] == "unknown_work_item"
   end
 
+  test "body-only work-item updates cross the wire and mixed patches return HTTP 400", ctx do
+    item =
+      WorkItems.__handle__(ctx.db, "work-item-create", %{
+        principal: {:user, "flynn"},
+        params: %{
+          title: "Pinned",
+          spec_ref_name: "specs/tightbeam/body.md",
+          spec_ref_sha256: String.duplicate("a", 64)
+        }
+      })
+
+    update_handler = fn call -> WorkItems.__handle__(ctx.db, "work-item-update", call) end
+
+    real_ctx = %{
+      ctx
+      | opts:
+          Keyword.update!(ctx.opts, :handlers, &Map.put(&1, "work-item-update", update_handler))
+    }
+
+    accepted =
+      dispatch_cli(real_ctx, "tbc_test", %{
+        verb: "work-item-update",
+        asUser: "flynn",
+        params: %{workItemId: item.id, body: "original"}
+      })
+
+    assert accepted.status == 200
+
+    assert %{
+             "result" => %{
+               "workItem" => %{
+                 "id" => item_id,
+                 "specRefName" => "specs/tightbeam/body.md",
+                 "specRefSha256" => spec_sha
+               },
+               "bodyUpdate" => %{
+                 "state" => "present",
+                 "byteLength" => 8,
+                 "changed" => true
+               }
+             }
+           } = JSON.decode!(accepted.resp_body)
+
+    assert item_id == item.id
+    assert spec_sha == String.duplicate("a", 64)
+
+    mixed =
+      dispatch_cli(real_ctx, "tbc_test", %{
+        verb: "work-item-update",
+        asUser: "flynn",
+        params: %{workItemId: item.id, body: "mixed", title: "Changed"}
+      })
+
+    assert mixed.status == 400
+
+    assert JSON.decode!(mixed.resp_body)["error"] == %{
+             "code" => "invalid_body_patch",
+             "message" =>
+               "body cannot be combined with title, isBug, specRefName, or specRefSha256"
+           }
+
+    oversized =
+      dispatch_cli(real_ctx, "tbc_test", %{
+        verb: "work-item-update",
+        asUser: "flynn",
+        params: %{workItemId: item.id, body: String.duplicate("a", 65_537)}
+      })
+
+    assert oversized.status == 400
+    assert JSON.decode!(oversized.resp_body)["error"]["code"] == "invalid_body"
+
+    assert %{workItem: detail} =
+             WorkItems.__handle__(ctx.db, "work-item-get", %{
+               principal: {:user, "flynn"},
+               params: %{work_item_id: item.id}
+             })
+
+    assert detail.body == "original"
+    assert detail.title == "Pinned"
+    assert detail.specRefName == "specs/tightbeam/body.md"
+    assert detail.specRefSha256 == String.duplicate("a", 64)
+  end
+
   test "device routes require a device bearer", ctx do
     conn = Router.call(conn(:get, "/api/streams"), Router.init(ctx.opts))
     assert conn.status == 401
