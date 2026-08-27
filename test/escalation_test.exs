@@ -1525,10 +1525,7 @@ defmodule Tightbeam.EscalationTest do
         Escalation.operator_rule(
           ctx.db,
           owner_operator_rule(request.id, %{decision: "accept"}),
-          transaction_step_hook: fn
-            ^step -> raise "fixture #{step}"
-            _other -> :ok
-          end
+          transaction_step_hook: {:raise, step, "fixture #{step}"}
         )
       end
 
@@ -1747,22 +1744,14 @@ defmodule Tightbeam.EscalationTest do
 
       winning_task =
         Task.async(fn ->
-          hook = fn
-            :before_terminal_cas ->
-              send(parent, {:terminal_barrier, winner, self()})
-
-              receive do
-                {:release_terminal, ^winner} -> :ok
-              end
-
-            _step ->
-              :ok
-          end
+          hook =
+            {:block, :before_terminal_cas, parent, {:terminal_barrier, winner},
+             {:release_terminal, winner}}
 
           terminal_mutation(ctx, request.id, winner, transaction_step_hook: hook)
         end)
 
-      assert_receive {:terminal_barrier, ^winner, barrier_pid}
+      assert_receive {{:terminal_barrier, ^winner}, barrier_pid}
 
       losers =
         losing_order
@@ -2156,17 +2145,7 @@ defmodule Tightbeam.EscalationTest do
 
     task =
       Task.async(fn ->
-        hook = fn
-          :after_schedule ->
-            send(parent, {:scheduled_uncommitted, self()})
-
-            receive do
-              :commit_terminal_ruling -> :ok
-            end
-
-          _step ->
-            :ok
-        end
+        hook = {:block, :after_schedule, parent, :scheduled_uncommitted, :commit_terminal_ruling}
 
         Escalation.operator_rule(
           writer,
@@ -2208,10 +2187,7 @@ defmodule Tightbeam.EscalationTest do
       Escalation.operator_rule(
         writer,
         owner_operator_rule(rollback.id, %{decision: "accept"}),
-        transaction_step_hook: fn
-          :after_schedule -> raise "fixture after schedule"
-          _step -> :ok
-        end
+        transaction_step_hook: {:raise, :after_schedule, "fixture after schedule"}
       )
     end
 

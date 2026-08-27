@@ -2286,8 +2286,18 @@ defmodule Tightbeam.Escalation do
 
   defp terminal_test_step(opts, step) do
     case Keyword.get(opts, :transaction_step_hook) do
-      hook when is_function(hook, 1) -> hook.(step)
-      nil -> :ok
+      {:raise, ^step, message} when is_binary(message) ->
+        raise message
+
+      {:block, ^step, observer, ready_tag, release_message} when is_pid(observer) ->
+        send(observer, {ready_tag, self()})
+
+        receive do
+          ^release_message -> :ok
+        end
+
+      _other ->
+        :ok
     end
   end
 

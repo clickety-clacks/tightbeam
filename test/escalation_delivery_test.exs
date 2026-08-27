@@ -489,7 +489,7 @@ defmodule Tightbeam.EscalationDeliveryTest do
     # in-transaction prompt arm each one owes.
     request_sites = [
       {"lib/tightbeam/escalation.ex", "escalate/4"},
-      {"lib/tightbeam/escalation.ex", "insert_operator_request_in_txn/6"},
+      {"lib/tightbeam/escalation.ex", "insert_operator_request_in_txn/7"},
       {"lib/tightbeam/effort_checkin.ex", "open_request_in_txn/4"},
       {"lib/tightbeam/effort_checkin.ex", "deadline_in_txn/3"}
     ]
