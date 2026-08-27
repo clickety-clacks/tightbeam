@@ -34,7 +34,8 @@ defmodule Tightbeam.SchemaShapeTest do
 
   alias Tightbeam.{Assignments, DB, Schema}
 
-  @shape "operator-decision-requests-v1"
+  @shape "terminal-operator-decision-parity-v1"
+  @operator_decision_shape "operator-decision-requests-v1"
   @model_identity_shape "model-identity-v1"
   @be61_shape "model-identity-message-envelope-v2"
 
@@ -266,6 +267,131 @@ defmodule Tightbeam.SchemaShapeTest do
 
     assert {:ok, ^messages_before} =
              DB.query(db, "SELECT #{model_identity_message_columns()} FROM messages ORDER BY seq")
+  end
+
+  test "operator-decision predecessor migrates without rewriting legacy rulings", %{db: db} do
+    :ok = Schema.ensure_all(db)
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "INSERT INTO condition_facts (id, ts, kind, scope, origin) VALUES (41, 10, 'escalation-ruled', 'dr_legacy', 'process:tightbeam')"
+             )
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "INSERT INTO lifecycle_events (ts, kind, subject, detail) VALUES (11, 'decision_request_ruled', 'dr_legacy', NULL)"
+             )
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               """
+               INSERT INTO decision_requests
+                 (id, kind, raiserId, raiserSessionKey, ownerUserId, raisedAt,
+                  deadlineAt, actionKey, question, options, context, status,
+                  decision, rationale, ruledBy, ruledViaPrincipal,
+                  ruledViaSessionKey, ruledViaSessionState, ruledAt, rulingFactId)
+               VALUES
+                 ('dr_legacy', 'operator', 'agent:legacy', 'agent:legacy:session',
+                  'mike', 1, 86400001, 'legacy-action', 'legacy?',
+                  '[{"label":"yes"}]', '{}', 'ruled', 'yes', NULL,
+                  'user:mike', 'user:mike', 'agent:presenter:legacy', 'known', 12, 41)
+               """
+             )
+
+    :ok =
+      DB.execute(db, """
+      DROP TRIGGER decision_requests_terminal_insert_guard;
+      DROP TRIGGER decision_requests_terminal_update_guard;
+      DROP TABLE decision_request_integrity_evidence;
+      DROP TABLE decision_request_terminal_epoch;
+      ALTER TABLE decision_requests DROP COLUMN ruledViaPrincipal;
+      ALTER TABLE decision_requests DROP COLUMN ruledViaSessionState;
+      UPDATE schema_stamp SET shape = '#{@operator_decision_shape}', stampedAt = 1;
+      """)
+
+    {:ok, before} =
+      DB.query(
+        db,
+        "SELECT * FROM decision_requests WHERE id='dr_legacy'"
+      )
+
+    assert :ok = Schema.ensure_all(db)
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok, ^before} =
+             DB.query(
+               db,
+               "SELECT id, kind, raiserId, raiserSessionKey, ownerUserId, assignmentId, expecterSessionKey, expecterUserId, lineageRung, effortGeneration, deadlineWakeId, raisedAt, deadlineAt, statuteName, actionKey, question, options, context, status, decision, rationale, ruledBy, ruledViaSessionKey, ruledAt, rulingFactId, consumedAt, parkWakeId, withdrawnBy, withdrawnReason, withdrawnAt FROM decision_requests WHERE id='dr_legacy'"
+             )
+
+    assert {:ok, [[nil, nil]]} =
+             DB.query(
+               db,
+               "SELECT ruledViaPrincipal, ruledViaSessionState FROM decision_requests WHERE id='dr_legacy'"
+             )
+
+    assert {:ok, [[41, "terminal-operator-decision-parity-v1"]]} =
+             DB.query(
+               db,
+               "SELECT legacyRulingFactMaxId, schemaVersion FROM decision_request_terminal_epoch WHERE id=0"
+             )
+
+    call = %{origin: "user:mike", principal: {:user, "mike"}, params: %{}}
+    projected = Tightbeam.Escalation.get(db, call, "dr_legacy")
+
+    assert projected.ruling_attribution == %{
+             on_behalf_of: "user:mike",
+             performer: %{
+               principal: %{state: "legacy-unknown"},
+               session: %{state: "known", key: "agent:presenter:legacy"}
+             }
+           }
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               db,
+               "SELECT COUNT(*) FROM wakes WHERE conditionKind='escalation-ruled' AND conditionScope='dr_legacy'"
+             )
+  end
+
+  test "operator-decision migration survives a database-owner restart", %{db: _setup_db} do
+    unique = System.unique_integer([:positive])
+    path = Path.join(System.tmp_dir!(), "terminal-parity-restart-#{unique}.sqlite3")
+    first = :"terminal_parity_before_#{unique}"
+    second = :"terminal_parity_after_#{unique}"
+
+    on_exit(fn -> File.rm(path) end)
+
+    {:ok, first_pid} = DB.start_link(path: path, name: first)
+    assert :ok = Schema.ensure_all(first)
+
+    :ok =
+      DB.execute(first, """
+      DROP TRIGGER decision_requests_terminal_insert_guard;
+      DROP TRIGGER decision_requests_terminal_update_guard;
+      DROP TABLE decision_request_integrity_evidence;
+      DROP TABLE decision_request_terminal_epoch;
+      ALTER TABLE decision_requests DROP COLUMN ruledViaPrincipal;
+      ALTER TABLE decision_requests DROP COLUMN ruledViaSessionState;
+      UPDATE schema_stamp SET shape = '#{@operator_decision_shape}', stampedAt = 1;
+      """)
+
+    :ok = GenServer.stop(first_pid)
+
+    {:ok, second_pid} = DB.start_link(path: path, name: second)
+    assert :ok = Schema.ensure_all(second)
+    assert {:ok, [[@shape]]} = DB.query(second, "SELECT shape FROM schema_stamp")
+
+    assert {:ok, [[@shape, 0]]} =
+             DB.query(
+               second,
+               "SELECT schemaVersion, legacyRulingFactMaxId FROM decision_request_terminal_epoch WHERE id=0"
+             )
+
+    :ok = GenServer.stop(second_pid)
   end
 
   test "a failed exact migration rolls back the rename and stamp", %{db: db} do
@@ -587,7 +713,8 @@ defmodule Tightbeam.SchemaShapeTest do
     assert error.message =~ @be61_shape
     assert error.message =~ @shape
 
-    assert error.message =~ "can migrate only #{@model_identity_shape} to #{@shape}"
+    assert error.message =~
+             "can migrate only #{@model_identity_shape} or #{@operator_decision_shape} to #{@shape}"
 
     assert {:ok, [[@be61_shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
     refute "ruledViaSessionKey" in table_columns(db, "decision_requests")

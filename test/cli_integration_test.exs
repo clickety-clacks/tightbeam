@@ -1238,6 +1238,85 @@ defmodule Tightbeam.CliIntegrationTest do
                     }}
   end
 
+  test "built CLI renders the real gateway terminal projection and typed integrity identity",
+       ctx do
+    request =
+      Escalation.operator_ask(ctx.db, %{
+        origin: "agent:cli-holder",
+        principal: {:session, ctx.session.session_key},
+        params: %{
+          question: "ship terminal parity?",
+          options: [%{label: "ship"}, %{label: "hold"}]
+        }
+      })
+
+    ruled =
+      Escalation.operator_rule(ctx.db, %{
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        transport_session_key: nil,
+        params: %{request: request.id, decision: "ship"}
+      })
+
+    {detail_bytes, 0} =
+      System.cmd(ctx.binary, ["decision-request", "--request", request.id],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    {list_bytes, 0} =
+      System.cmd(ctx.binary, ["decision-requests", "--status", "ruled"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    detail = JSON.decode!(detail_bytes)["decisionRequest"]
+
+    listed =
+      JSON.decode!(list_bytes)["decisionRequests"]
+      |> Enum.find(&(&1["id"] == request.id))
+
+    parity_fields = ~w(
+      id kind status question options raiserId raiserSessionKey ownerUserId
+      assignmentId raisedAt deadlineAt decision rationale ruledBy
+      ruledViaSessionKey ruledAt rulingFactId consumedAt rulingAttribution
+    )
+
+    assert Map.take(listed, parity_fields) == Map.take(detail, parity_fields)
+    assert detail["rulingFactId"] == ruled.ruling_fact_id
+
+    assert detail["rulingAttribution"] == %{
+             "onBehalfOf" => "user:flynn",
+             "performer" => %{
+               "principal" => %{"state" => "known", "value" => "user:flynn"},
+               "session" => %{"state" => "none"}
+             }
+           }
+
+    assert_receive {:cli_call, %{verb: "decision-request", params: %{request: request_id}}}
+
+    assert request_id == request.id
+    assert_receive {:cli_call, %{verb: "decision-requests", params: %{status: "ruled"}}}
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO lifecycle_events (ts, kind, subject, detail) VALUES (?1, 'decision_request_ruled', ?2, NULL)",
+               [System.system_time(:millisecond), request.id]
+             )
+
+    {refusal, exit_status} =
+      System.cmd(ctx.binary, ["decision-request", "--request", request.id],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert exit_status != 0
+
+    assert String.trim(refusal) ==
+             "decision_request_integrity_invalid: decision request integrity check failed (#{request.id})"
+  end
+
   test "real CLI creates and gets work items and enforces spec-ref pairing", ctx do
     sha = String.duplicate("a", 64)
 

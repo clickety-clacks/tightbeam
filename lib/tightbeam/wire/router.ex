@@ -969,6 +969,15 @@ defmodule Tightbeam.Wire.Router do
   defp error_status("unknown_assignment"), do: 404
   defp error_status("unknown_work_item"), do: 404
   defp error_status("server_error"), do: 500
+
+  defp error_status(code)
+       when code in [
+              "decision_request_integrity_invalid",
+              "decision_request_integrity_evidence_conflict",
+              "decision_request_integrity_evidence_unavailable"
+            ],
+       do: 500
+
   defp error_status(_), do: 400
 
   defp read_json(conn) do
@@ -1078,6 +1087,15 @@ defmodule Tightbeam.Wire.Router do
   end
 
   defp dispatch_error(conn, %{verb: "tune"}, status, result) do
+    json(conn, status, %{"error" => Map.delete(result, :ok)})
+  end
+
+  defp dispatch_error(conn, _call, status, %{code: code} = result)
+       when code in [
+              "decision_request_integrity_invalid",
+              "decision_request_integrity_evidence_conflict",
+              "decision_request_integrity_evidence_unavailable"
+            ] do
     json(conn, status, %{"error" => Map.delete(result, :ok)})
   end
 

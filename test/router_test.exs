@@ -20,11 +20,21 @@ defmodule Tightbeam.Wire.RouterTest do
 
   alias Tightbeam.Wire.Router
 
+  defmodule NudgeSink do
+    use GenServer
+
+    def start_link(name), do: GenServer.start_link(__MODULE__, :ok, name: name)
+    def init(:ok), do: {:ok, :ok}
+    def handle_call({:fire_matching, _fact_id}, _from, state), do: {:reply, :ok, state}
+  end
+
   setup do
     db = :"router_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
 
     :ok = Tightbeam.Schema.ensure_all(db)
+    scheduler = :"router_wakes_#{System.unique_integer([:positive])}"
+    start_supervised!({NudgeSink, scheduler})
 
     base_dir =
       Path.join(System.tmp_dir!(), "tightbeam-router-#{System.unique_integer([:positive])}")
@@ -129,6 +139,7 @@ defmodule Tightbeam.Wire.RouterTest do
 
     %{
       db: db,
+      scheduler: scheduler,
       base_dir: base_dir,
       device: device,
       opts: [
@@ -164,7 +175,14 @@ defmodule Tightbeam.Wire.RouterTest do
        ctx do
     owner = ctx.device.user_id
     raiser = create_session(ctx.db, "operator-raiser", owner, is_built_in: true)
-    handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})
+
+    handlers =
+      Gateway.handlers(%{
+        db: ctx.db,
+        base_dir: ctx.base_dir,
+        wake_scheduler: ctx.scheduler
+      })
+
     ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, handlers)}
 
     # ask — as the raiser session (a session principal, which operator-ask requires)
@@ -200,7 +218,73 @@ defmodule Tightbeam.Wire.RouterTest do
       })
 
     assert ruled.status == 200
-    assert JSON.decode!(ruled.resp_body)["result"]["status"] == "ruled"
+    ruled_row = JSON.decode!(ruled.resp_body)["result"]
+    assert ruled_row["status"] == "ruled"
+
+    ruled_list =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "decision-requests",
+        asUser: owner,
+        params: %{status: "ruled"}
+      })
+
+    exact =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "decision-request",
+        asUser: owner,
+        params: %{request: dr_id}
+      })
+
+    assert ruled_list.status == 200
+    assert exact.status == 200
+
+    [listed_row] = JSON.decode!(ruled_list.resp_body)["result"]["decisionRequests"]
+    exact_row = JSON.decode!(exact.resp_body)["result"]["decisionRequest"]
+
+    parity_fields = ~w(
+      id kind status question options raiserId raiserSessionKey ownerUserId
+      assignmentId raisedAt deadlineAt decision rationale ruledBy
+      ruledViaSessionKey ruledAt rulingFactId consumedAt rulingAttribution
+    )
+
+    assert Map.take(listed_row, parity_fields) == Map.take(exact_row, parity_fields)
+
+    assert Map.keys(Map.take(listed_row, parity_fields)) |> Enum.sort() ==
+             Enum.sort(parity_fields)
+
+    assert exact_row["context"] == %{"note" => nil, "supersedes" => nil}
+    assert is_binary(exact_row["actionKey"])
+
+    assert exact_row["rulingAttribution"] == %{
+             "onBehalfOf" => "user:#{owner}",
+             "performer" => %{
+               "principal" => %{"state" => "known", "value" => "user:#{owner}"},
+               "session" => %{"state" => "none"}
+             }
+           }
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO lifecycle_events (ts, kind, subject, detail) VALUES (?1, 'decision_request_ruled', ?2, NULL)",
+               [System.system_time(:millisecond), dr_id]
+             )
+
+    for corrupt_read <- [
+          %{verb: "decision-request", asUser: owner, params: %{request: dr_id}},
+          %{verb: "decision-requests", asUser: owner, params: %{status: "ruled"}}
+        ] do
+      refused = dispatch_cli(ctx, "tbc_test", corrupt_read)
+      assert refused.status == 500
+
+      assert JSON.decode!(refused.resp_body) == %{
+               "error" => %{
+                 "code" => "decision_request_integrity_invalid",
+                 "message" => "decision request integrity check failed",
+                 "requestId" => dr_id
+               }
+             }
+    end
 
     # withdraw — needs an open request, so open a second and withdraw it, closing
     # the fourth verb through the same seam
@@ -269,7 +353,14 @@ defmodule Tightbeam.Wire.RouterTest do
        ctx do
     owner = ctx.device.user_id
     raiser = create_session(ctx.db, "dr-filter-raiser", owner, is_built_in: true)
-    handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})
+
+    handlers =
+      Gateway.handlers(%{
+        db: ctx.db,
+        base_dir: ctx.base_dir,
+        wake_scheduler: ctx.scheduler
+      })
+
     ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, handlers)}
 
     # Two requests spanning two statuses: one left open, one ruled.

@@ -728,20 +728,24 @@ defmodule Tightbeam.Gateway do
       end,
       "withdraw" => fn call -> Escalation.withdraw(db, call) end,
       "operator-ask" => fn call -> Escalation.operator_ask(db, call) end,
-      "operator-rule" => fn call -> Escalation.operator_rule(db, call) end,
+      "operator-rule" => fn call ->
+        Escalation.operator_rule(db, call,
+          scheduler: Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler)
+        )
+      end,
       "operator-withdraw" => fn call -> Escalation.operator_withdraw(db, call) end,
       "decision-requests" => fn call ->
         case Escalation.list_status(call.params[:status]) do
           {:ok, status} ->
             caller = resolve_caller(db, call.origin)
 
-            %{
-              decision_requests:
-                Escalation.list(db, call, status,
-                  owner_user_id: caller && caller.owner_user_id,
-                  admin: admin_origin?(db, call.origin)
-                )
-            }
+            case Escalation.list(db, call, status,
+                   owner_user_id: caller && caller.owner_user_id,
+                   admin: admin_origin?(db, call.origin)
+                 ) do
+              %{code: _} = error -> error
+              requests -> %{decision_requests: requests}
+            end
 
           %{code: _} = err ->
             err
@@ -774,6 +778,7 @@ defmodule Tightbeam.Gateway do
 
         case request do
           nil -> %{code: "not_found", message: "decision request not found"}
+          %{code: _} = error -> error
           request -> %{decision_request: request}
         end
       end,

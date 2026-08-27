@@ -37,7 +37,8 @@ defmodule Tightbeam.Schema do
   # The shape this build writes. Bump it when a production table changes in a
   # way that makes an older database unreadable, and give the refusal below a
   # sentence saying what changed.
-  @shape "operator-decision-requests-v1"
+  @shape "terminal-operator-decision-parity-v1"
+  @operator_decision_shape "operator-decision-requests-v1"
   @model_identity_shape "model-identity-v1"
 
   # The one predecessor shape this build can migrate. This is deliberately a
@@ -69,7 +70,9 @@ defmodule Tightbeam.Schema do
     decision          TEXT,
     rationale         TEXT,
     ruledBy           TEXT,
+    ruledViaPrincipal TEXT,
     ruledViaSessionKey TEXT,
+    ruledViaSessionState TEXT CHECK (ruledViaSessionState IS NULL OR ruledViaSessionState IN ('known','none')),
     ruledAt           INTEGER,
     rulingFactId      INTEGER,
     consumedAt        INTEGER,
@@ -853,8 +856,8 @@ defmodule Tightbeam.Schema do
   So the shape is STAMPED at creation and CHECKED here, per the house rule: a
   missing or unknown stamp is a refusal and a bug report, never an inference.
   Note the direction — the one existence question below is asked to REFUSE,
-  never to deduce a shape and accommodate it. The sole migration is selected
-  by the exact `model-identity-v1` stamp; it does not sniff stored DDL.
+  never to deduce a shape and accommodate it. Each migration is selected by an
+  exact predecessor stamp; none sniffs stored DDL or infers from a column name.
   """
   @spec ensure_all(DB.server()) :: :ok
   def ensure_all(db) do
@@ -868,6 +871,7 @@ defmodule Tightbeam.Schema do
     activated_at = System.system_time(:millisecond)
 
     case DB.transaction(db, fn txn ->
+           :ok = Tightbeam.Escalation.ensure_terminal_parity_in_txn(txn, activated_at)
            ensure_supervision_liveness_v1_in_txn(txn, activated_at)
          end) do
       {:ok, :ok} ->
@@ -1035,6 +1039,9 @@ defmodule Tightbeam.Schema do
       {:ok, [[@shape]]} ->
         :ok
 
+      {:ok, [[@operator_decision_shape]]} ->
+        migrate_operator_decision_v1(db)
+
       {:ok, [[@model_identity_shape]]} ->
         migrate_model_identity_v1(db)
 
@@ -1052,7 +1059,7 @@ defmodule Tightbeam.Schema do
           stamped: #{found}
           this build: #{@shape}
 
-        This build can migrate only #{@model_identity_shape} to #{@shape}.
+        This build can migrate only #{@model_identity_shape} or #{@operator_decision_shape} to #{@shape}.
 
         No migration is defined for the stamped shape above. Keep the database
         in place and run a Tightbeam build that recognizes that exact stamp.
@@ -1071,6 +1078,51 @@ defmodule Tightbeam.Schema do
         Nothing in Tightbeam writes a second stamp, so this database was
         assembled by something else. Move it aside and let it be recreated.
         """
+    end
+  end
+
+  defp migrate_operator_decision_v1(db) do
+    case DB.transaction(db, fn txn ->
+           :ok =
+             Txn.exec(
+               txn,
+               """
+               ALTER TABLE decision_requests ADD COLUMN ruledViaPrincipal TEXT;
+               ALTER TABLE decision_requests ADD COLUMN ruledViaSessionState TEXT
+                 CHECK (ruledViaSessionState IS NULL OR ruledViaSessionState IN ('known','none'));
+               """
+             )
+
+           :ok =
+             Tightbeam.Escalation.ensure_terminal_parity_in_txn(
+               txn,
+               System.system_time(:millisecond)
+             )
+
+           Txn.q(
+             txn,
+             "UPDATE schema_stamp SET shape = ?1, stampedAt = ?2 WHERE shape = ?3",
+             [@shape, System.system_time(:millisecond), @operator_decision_shape]
+           )
+
+           if Txn.changes(txn) != 1 do
+             raise ShapeError,
+               message:
+                 "migration #{@operator_decision_shape} -> #{@shape} lost its exact stamp transition"
+           end
+
+           :ok
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "migration #{@operator_decision_shape} -> #{@shape} failed and was rolled back: #{Exception.message(error)}"
     end
   end
 

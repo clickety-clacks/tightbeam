@@ -1259,9 +1259,14 @@ pub(crate) fn parse_response(status: u16, encoded: &str) -> Result<Option<Value>
             .and_then(Value::as_str)
             .unwrap_or("undefined");
         let message = json.pointer("/error/message").and_then(Value::as_str);
-        return Err(match message {
+        let request_id = json.pointer("/error/requestId").and_then(Value::as_str);
+        let rendered = match message {
             Some(message) if !message.is_empty() => format!("{code}: {message}"),
             _ => code.to_owned(),
+        };
+        return Err(match request_id {
+            Some(request_id) if !request_id.is_empty() => format!("{rendered} ({request_id})"),
+            _ => rendered,
         });
     }
 
@@ -3041,6 +3046,16 @@ mod tests {
         assert_eq!(
             parse_response(403, r#"{"error":{"code":"denied","message":"no"}}"#),
             Err("denied: no".to_owned())
+        );
+        assert_eq!(
+            parse_response(
+                500,
+                r#"{"error":{"code":"decision_request_integrity_invalid","message":"decision request integrity check failed","requestId":"dr_exact"}}"#
+            ),
+            Err(
+                "decision_request_integrity_invalid: decision request integrity check failed (dr_exact)"
+                    .to_owned()
+            )
         );
     }
 

@@ -10,7 +10,26 @@ defmodule Tightbeam.Escalation do
   alias Tightbeam.{ConditionFacts, DB, EventLog, Org, Roles, Wakes}
   alias Tightbeam.DB.Txn
 
+  defmodule IntegrityEvidenceConflict do
+    @moduledoc false
+    defexception [:message]
+  end
+
+  defmodule IntegrityEvidenceUnavailable do
+    @moduledoc false
+    defexception [:message]
+  end
+
   @default_decision_deadline_ms 86_400_000
+  @terminal_schema_version "terminal-operator-decision-parity-v1"
+  @terminal_condition_kind "escalation-ruled"
+  @terminal_integrity_code "decision_request_integrity_invalid"
+  @terminal_evidence_cause "terminal-shape-invalid"
+  @terminal_failure_fields ~w(
+    requestIdentity ownerOnBehalfOf options decision rationale ruledTimeFact
+    rulingFact performerPrincipal performerSession lifecycleConsumption
+    rulingLifecycleEvent raiserNotificationWake
+  )
 
   # The `status` values a decision request row can hold — the schema CHECK's own set
   # (see @ddl). `list/4` accepts these plus the sentinel "all" (no status filter); any
@@ -55,7 +74,9 @@ defmodule Tightbeam.Escalation do
     decision          TEXT,
     rationale         TEXT,
     ruledBy           TEXT,
+    ruledViaPrincipal TEXT,
     ruledViaSessionKey TEXT,
+    ruledViaSessionState TEXT CHECK (ruledViaSessionState IS NULL OR ruledViaSessionState IN ('known','none')),
     ruledAt           INTEGER,
     rulingFactId      INTEGER,
     consumedAt        INTEGER,
@@ -113,6 +134,44 @@ defmodule Tightbeam.Escalation do
     ON decision_requests (ownerUserId, raiserId, actionKey)
     WHERE kind = 'operator' AND status = 'open';
 
+  CREATE TABLE IF NOT EXISTS decision_request_terminal_epoch (
+    id INTEGER PRIMARY KEY CHECK (id = 0),
+    schemaVersion TEXT NOT NULL,
+    legacyRulingFactMaxId INTEGER NOT NULL,
+    activatedAt INTEGER NOT NULL,
+    cause TEXT NOT NULL,
+    principal TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS decision_request_integrity_evidence (
+    requestId TEXT NOT NULL,
+    shapeDigest TEXT NOT NULL,
+    schemaVersion TEXT NOT NULL,
+    causeCode TEXT NOT NULL,
+    failingFields TEXT NOT NULL,
+    firstSurface TEXT NOT NULL CHECK (firstSurface IN ('list','detail','consume','migration-preflight')),
+    firstObservedAt INTEGER NOT NULL,
+    observerPrincipal TEXT NOT NULL,
+    PRIMARY KEY (requestId, shapeDigest)
+  );
+  CREATE TRIGGER IF NOT EXISTS decision_requests_terminal_insert_guard
+  BEFORE INSERT ON decision_requests
+  WHEN NEW.kind = 'operator' AND NEW.status = 'ruled' AND
+    (NEW.ruledViaPrincipal IS NULL OR NEW.ruledViaSessionState NOT IN ('known','none') OR
+     (NEW.ruledViaSessionState = 'known' AND NEW.ruledViaSessionKey IS NULL) OR
+     (NEW.ruledViaSessionState = 'none' AND NEW.ruledViaSessionKey IS NOT NULL))
+  BEGIN
+    SELECT RAISE(ABORT, 'decision_request_integrity_invalid');
+  END;
+  CREATE TRIGGER IF NOT EXISTS decision_requests_terminal_update_guard
+  BEFORE UPDATE OF status ON decision_requests
+  WHEN OLD.kind = 'operator' AND OLD.status = 'open' AND NEW.status = 'ruled' AND
+    (NEW.ruledViaPrincipal IS NULL OR NEW.ruledViaSessionState NOT IN ('known','none') OR
+     (NEW.ruledViaSessionState = 'known' AND NEW.ruledViaSessionKey IS NULL) OR
+     (NEW.ruledViaSessionState = 'none' AND NEW.ruledViaSessionKey IS NOT NULL))
+  BEGIN
+    SELECT RAISE(ABORT, 'decision_request_integrity_invalid');
+  END;
+
   CREATE TABLE IF NOT EXISTS escalation_waivers (
     id                TEXT PRIMARY KEY,
     raiserId          TEXT NOT NULL,
@@ -132,12 +191,107 @@ defmodule Tightbeam.Escalation do
   expecterSessionKey, expecterUserId, lineageRung, effortGeneration, deadlineWakeId,
   raisedAt, deadlineAt,
   statuteName, actionKey, question, options, context, status, decision, rationale,
-  ruledBy, ruledViaSessionKey, ruledAt, rulingFactId, consumedAt, parkWakeId, withdrawnBy,
+  ruledBy, ruledViaPrincipal, ruledViaSessionKey, ruledViaSessionState, ruledAt, rulingFactId, consumedAt, parkWakeId, withdrawnBy,
   withdrawnReason, withdrawnAt
   """
 
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
   def ensure_schema(db \\ DB), do: DB.execute(db, @ddl)
+
+  @doc false
+  @spec ensure_terminal_parity_in_txn(Txn.t(), non_neg_integer()) :: :ok
+  def ensure_terminal_parity_in_txn(%Txn{} = txn, activated_at) do
+    :ok =
+      Txn.exec(
+        txn,
+        """
+        CREATE TABLE IF NOT EXISTS decision_request_terminal_epoch (
+          id INTEGER PRIMARY KEY CHECK (id = 0),
+          schemaVersion TEXT NOT NULL,
+          legacyRulingFactMaxId INTEGER NOT NULL,
+          activatedAt INTEGER NOT NULL,
+          cause TEXT NOT NULL,
+          principal TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS decision_request_integrity_evidence (
+          requestId TEXT NOT NULL,
+          shapeDigest TEXT NOT NULL,
+          schemaVersion TEXT NOT NULL,
+          causeCode TEXT NOT NULL,
+          failingFields TEXT NOT NULL,
+          firstSurface TEXT NOT NULL CHECK (firstSurface IN ('list','detail','consume','migration-preflight')),
+          firstObservedAt INTEGER NOT NULL,
+          observerPrincipal TEXT NOT NULL,
+          PRIMARY KEY (requestId, shapeDigest)
+        );
+        CREATE TRIGGER IF NOT EXISTS decision_requests_terminal_insert_guard
+        BEFORE INSERT ON decision_requests
+        WHEN NEW.kind = 'operator' AND NEW.status = 'ruled' AND
+          (NEW.ruledViaPrincipal IS NULL OR NEW.ruledViaSessionState NOT IN ('known','none') OR
+           (NEW.ruledViaSessionState = 'known' AND NEW.ruledViaSessionKey IS NULL) OR
+           (NEW.ruledViaSessionState = 'none' AND NEW.ruledViaSessionKey IS NOT NULL))
+        BEGIN
+          SELECT RAISE(ABORT, 'decision_request_integrity_invalid');
+        END;
+        CREATE TRIGGER IF NOT EXISTS decision_requests_terminal_update_guard
+        BEFORE UPDATE OF status ON decision_requests
+        WHEN OLD.kind = 'operator' AND OLD.status = 'open' AND NEW.status = 'ruled' AND
+          (NEW.ruledViaPrincipal IS NULL OR NEW.ruledViaSessionState NOT IN ('known','none') OR
+           (NEW.ruledViaSessionState = 'known' AND NEW.ruledViaSessionKey IS NULL) OR
+           (NEW.ruledViaSessionState = 'none' AND NEW.ruledViaSessionKey IS NOT NULL))
+        BEGIN
+          SELECT RAISE(ABORT, 'decision_request_integrity_invalid');
+        END;
+        """
+      )
+
+    case Txn.q(txn, "SELECT schemaVersion FROM decision_request_terminal_epoch WHERE id = 0") do
+      [] ->
+        [[cutoff]] = Txn.q(txn, "SELECT COALESCE(MAX(id), 0) FROM condition_facts")
+
+        Txn.q(
+          txn,
+          """
+          INSERT INTO decision_request_terminal_epoch
+            (id, schemaVersion, legacyRulingFactMaxId, activatedAt, cause, principal)
+          VALUES (0, ?1, ?2, ?3, ?1, 'process:tightbeam')
+          """,
+          [@terminal_schema_version, cutoff, activated_at]
+        )
+
+        rows =
+          Txn.q(
+            txn,
+            "SELECT #{@request_columns} FROM decision_requests WHERE kind = 'operator' AND status IN ('ruled','consumed') ORDER BY id"
+          )
+
+        Enum.each(rows, fn row ->
+          request = request_from_row(row)
+
+          case validate_terminal_request_in_txn(txn, request) do
+            %{failures: []} ->
+              :ok
+
+            validation ->
+              record_integrity_evidence_in_txn(
+                txn,
+                request.id,
+                validation,
+                :"migration-preflight",
+                "process:tightbeam"
+              )
+          end
+        end)
+
+      [[@terminal_schema_version]] ->
+        :ok
+
+      [[other]] ->
+        raise DB.Error, message: "incompatible terminal decision epoch #{other}"
+    end
+
+    :ok
+  end
 
   @doc "Effect-free consultation of waiver and current decision request."
   @spec resolve(DB.server(), map(), map()) ::
@@ -291,13 +445,17 @@ defmodule Tightbeam.Escalation do
   end
 
   @doc "Resolve one operator request as its owner, retaining authenticated transport provenance."
-  @spec operator_rule(DB.server(), map()) :: map()
-  def operator_rule(db, call) do
+  @spec operator_rule(DB.server(), map(), keyword()) :: map()
+  def operator_rule(db, call, opts \\ []) do
     request_id = param(call, :request_id) || param(call, :request)
 
     with {:ok, answer} <- normalize_operator_answer(call) do
-      {:ok, {result, _fact_id}} =
+      {:ok, {result, fact_id}} =
         DB.transaction(db, fn txn -> operator_rule_in_txn(txn, call, request_id, answer) end)
+
+      if is_integer(fact_id) and Keyword.has_key?(opts, :scheduler) do
+        Wakes.fire_matching(Keyword.fetch!(opts, :scheduler), fact_id)
+      end
 
       result
     else
@@ -683,7 +841,7 @@ defmodule Tightbeam.Escalation do
   List visible decision requests. Owner/admin and raiser visibility are disjoint
   filters.
   """
-  @spec list(DB.server(), map(), String.t() | nil, keyword()) :: [map()]
+  @spec list(DB.server(), map(), String.t() | nil, keyword()) :: [map()] | map()
   def list(db, call, status \\ "open", opts \\ []) do
     {where, params} = visibility(db, call, Keyword.get(opts, :owner_user_id))
 
@@ -696,14 +854,21 @@ defmodule Tightbeam.Escalation do
         {"", params}
       end
 
-    {:ok, rows} =
-      DB.query(
-        db,
-        "SELECT #{@request_columns} FROM decision_requests WHERE (#{where})#{status_clause} ORDER BY rowid DESC",
-        params
-      )
+    case DB.transaction(db, fn txn ->
+           rows =
+             Txn.q(
+               txn,
+               "SELECT #{@request_columns} FROM decision_requests WHERE (#{where})#{status_clause} ORDER BY rowid DESC",
+               params
+             )
 
-    Enum.map(rows, &(request_from_row(&1) |> list_projection()))
+           terminal_project_rows_in_txn(txn, rows, :list, observer_principal(call))
+         end) do
+      {:ok, result} -> result
+      {:error, %IntegrityEvidenceConflict{}} -> integrity_evidence_error("conflict")
+      {:error, %IntegrityEvidenceUnavailable{}} -> integrity_evidence_error("unavailable")
+      {:error, error} -> raise error
+    end
   end
 
   @doc """
@@ -715,16 +880,32 @@ defmodule Tightbeam.Escalation do
   def get(db, call, id, opts) do
     {where, params} = visibility(db, call, Keyword.get(opts, :owner_user_id))
 
-    {:ok, rows} =
-      DB.query(
-        db,
-        "SELECT #{@request_columns} FROM decision_requests WHERE id = ?1 AND (#{shift_params(where)})",
-        [id | params]
-      )
+    result =
+      case DB.transaction(db, fn txn ->
+             rows =
+               Txn.q(
+                 txn,
+                 "SELECT #{@request_columns} FROM decision_requests WHERE id = ?1 AND (#{shift_params(where)})",
+                 [id | params]
+               )
 
-    case rows do
-      [row] -> request_from_row(row)
-      [] -> nil
+             case rows do
+               [row] ->
+                 terminal_project_rows_in_txn(txn, [row], :detail, observer_principal(call))
+
+               [] ->
+                 nil
+             end
+           end) do
+        {:ok, result} -> result
+        {:error, %IntegrityEvidenceConflict{}} -> integrity_evidence_error("conflict")
+        {:error, %IntegrityEvidenceUnavailable{}} -> integrity_evidence_error("unavailable")
+        {:error, error} -> raise error
+      end
+
+    case result do
+      [request] -> request
+      other -> other
     end
   end
 
@@ -885,29 +1066,64 @@ defmodule Tightbeam.Escalation do
   defp rule_operator_request_in_txn(txn, call, request, decision, answer) do
     ruled_by = "user:" <> request.owner_user_id
     via = Map.get(call, :transport_session_key)
+    via_principal = principal_id(Map.fetch!(call, :principal))
+    via_state = if is_binary(via), do: "known", else: "none"
 
     cond do
       request.status == "ruled" and request.decision == decision and
           request.rationale == answer.rationale ->
-        {request, nil}
+        case validate_terminal_request_in_txn(txn, request) do
+          %{failures: []} ->
+            {terminal_projection(request), nil}
+
+          validation ->
+            {record_integrity_refusal_in_txn(
+               txn,
+               request.id,
+               validation,
+               :detail,
+               observer_principal(call)
+             ), nil}
+        end
 
       request.status != "open" ->
         {error("not_open", "decision request is not open"), nil}
 
       true ->
+        ruled_at = now()
+
+        Wakes.schedule_in_txn(txn, %{
+          session_key: request.raiser_session_key,
+          origin: "process:tightbeam",
+          prompt: terminal_notification(request.id),
+          due_at: ruled_at + (request.deadline_at - request.raised_at),
+          target_gate: 0,
+          creator_session_key: via,
+          condition_kind: @terminal_condition_kind,
+          condition_scope: request.id
+        })
+
         %{fact_id: fact_id} =
           ConditionFacts.file_in_txn(txn, %{
-            kind: "escalation-ruled",
+            kind: @terminal_condition_kind,
             scope: request.id,
             origin: "process:tightbeam"
           })
 
-        ruled_at = now()
-
         Txn.q(
           txn,
-          "UPDATE decision_requests SET status = 'ruled', decision = ?2, rationale = ?3, ruledBy = ?4, ruledViaSessionKey = ?5, ruledAt = ?6, rulingFactId = ?7 WHERE id = ?1 AND kind = 'operator' AND status = 'open'",
-          [request.id, decision, answer.rationale, ruled_by, via, ruled_at, fact_id]
+          "UPDATE decision_requests SET status = 'ruled', decision = ?2, rationale = ?3, ruledBy = ?4, ruledViaPrincipal = ?5, ruledViaSessionKey = ?6, ruledViaSessionState = ?7, ruledAt = ?8, rulingFactId = ?9 WHERE id = ?1 AND kind = 'operator' AND status = 'open'",
+          [
+            request.id,
+            decision,
+            answer.rationale,
+            ruled_by,
+            via_principal,
+            via,
+            via_state,
+            ruled_at,
+            fact_id
+          ]
         )
 
         if Txn.changes(txn) != 1,
@@ -920,7 +1136,12 @@ defmodule Tightbeam.Escalation do
           "by=#{ruled_by} decision=#{decision} factId=#{fact_id} mode=#{answer.mode} via=#{via || "direct"}"
         )
 
-        {request_in_txn(txn, request.id), fact_id}
+        ruled = request_in_txn(txn, request.id)
+
+        case validate_terminal_request_in_txn(txn, ruled) do
+          %{failures: []} -> {terminal_projection(ruled), fact_id}
+          %{failures: failures} -> raise DB.Error, message: Enum.join(failures, ",")
+        end
     end
   end
 
@@ -1439,7 +1660,9 @@ defmodule Tightbeam.Escalation do
          decision,
          rationale,
          ruled_by,
+         ruled_via_principal,
          ruled_via_session_key,
+         ruled_via_session_state,
          ruled_at,
          ruling_fact_id,
          consumed_at,
@@ -1465,13 +1688,15 @@ defmodule Tightbeam.Escalation do
       statute_name: statute_name,
       action_key: action_key,
       question: question,
-      options: decode_optional(options),
-      context: JSON.decode!(context),
+      options: decode_optional_safe(options),
+      context: decode_json_safe(context),
       status: status,
       decision: decision,
       rationale: rationale,
       ruled_by: ruled_by,
+      ruled_via_principal: ruled_via_principal,
       ruled_via_session_key: ruled_via_session_key,
+      ruled_via_session_state: ruled_via_session_state,
       ruled_at: ruled_at,
       ruling_fact_id: ruling_fact_id,
       consumed_at: consumed_at,
@@ -1483,18 +1708,7 @@ defmodule Tightbeam.Escalation do
   end
 
   defp list_projection(%{kind: "operator"} = request) do
-    Map.take(request, [
-      :id,
-      :kind,
-      :status,
-      :question,
-      :options,
-      :context,
-      :raised_at,
-      :deadline_at,
-      :raiser_id,
-      :assignment_id
-    ])
+    operator_projection(request, :list)
   end
 
   defp list_projection(request),
@@ -1508,6 +1722,360 @@ defmodule Tightbeam.Escalation do
         :park_wake_id,
         :withdrawn_by
       ])
+
+  defp terminal_project_rows_in_txn(txn, rows, surface, observer_principal) do
+    parsed = Enum.map(rows, &request_from_row/1)
+
+    invalid =
+      parsed
+      |> Enum.filter(&(&1.kind == "operator" and &1.status in ["ruled", "consumed"]))
+      |> Enum.map(fn request -> {request, validate_terminal_request_in_txn(txn, request)} end)
+      |> Enum.reject(fn {_request, validation} -> validation.failures == [] end)
+
+    case invalid do
+      [] ->
+        Enum.map(parsed, fn
+          %{kind: "operator"} = request -> operator_projection(request, surface)
+          request -> if(surface == :list, do: list_projection(request), else: request)
+        end)
+
+      invalid ->
+        Enum.each(invalid, fn {request, validation} ->
+          record_integrity_evidence_in_txn(
+            txn,
+            request.id,
+            validation,
+            surface,
+            observer_principal
+          )
+        end)
+
+        {request, _failures} = Enum.min_by(invalid, fn {request, _} -> request.id end)
+        integrity_error(request.id)
+    end
+  end
+
+  defp operator_projection(request, surface) do
+    if request.status == "ruled" do
+      base =
+        request
+        |> Map.take([
+          :id,
+          :kind,
+          :status,
+          :question,
+          :options,
+          :raiser_id,
+          :raiser_session_key,
+          :owner_user_id,
+          :assignment_id,
+          :raised_at,
+          :deadline_at,
+          :decision,
+          :rationale,
+          :ruled_by,
+          :ruled_via_session_key,
+          :ruled_at,
+          :ruling_fact_id,
+          :consumed_at
+        ])
+        |> Map.put(:ruling_attribution, ruling_attribution(request))
+
+      if surface == :detail do
+        base |> Map.put(:context, request.context) |> Map.put(:action_key, request.action_key)
+      else
+        base
+      end
+    else
+      if surface == :list do
+        Map.take(request, [
+          :id,
+          :kind,
+          :status,
+          :question,
+          :options,
+          :context,
+          :raised_at,
+          :deadline_at,
+          :raiser_id,
+          :assignment_id
+        ])
+      else
+        request
+      end
+    end
+  end
+
+  defp terminal_projection(request), do: operator_projection(request, :detail)
+
+  defp ruling_attribution(%{ruled_via_principal: principal} = request)
+       when is_binary(principal) do
+    session =
+      case request.ruled_via_session_state do
+        "known" -> %{state: "known", key: request.ruled_via_session_key}
+        "none" -> %{state: "none"}
+      end
+
+    %{
+      on_behalf_of: request.ruled_by,
+      performer: %{principal: %{state: "known", value: principal}, session: session}
+    }
+  end
+
+  defp ruling_attribution(request) do
+    session =
+      if is_binary(request.ruled_via_session_key) do
+        %{state: "known", key: request.ruled_via_session_key}
+      else
+        %{state: "legacy-unknown"}
+      end
+
+    %{
+      on_behalf_of: request.ruled_by,
+      performer: %{principal: %{state: "legacy-unknown"}, session: session}
+    }
+  end
+
+  defp validate_terminal_request_in_txn(txn, request) do
+    [[cutoff]] =
+      Txn.q(
+        txn,
+        "SELECT legacyRulingFactMaxId FROM decision_request_terminal_epoch WHERE id = 0"
+      )
+
+    fact_count =
+      if is_integer(request.ruling_fact_id) do
+        [[count]] =
+          Txn.q(
+            txn,
+            "SELECT COUNT(*) FROM condition_facts WHERE id = ?1 AND kind = ?2 AND scope = ?3",
+            [request.ruling_fact_id, @terminal_condition_kind, request.id]
+          )
+
+        count
+      else
+        0
+      end
+
+    [[event_count]] =
+      Txn.q(
+        txn,
+        "SELECT COUNT(*) FROM lifecycle_events WHERE kind = 'decision_request_ruled' AND subject = ?1",
+        [request.id]
+      )
+
+    post_activation? =
+      is_integer(request.ruling_fact_id) and request.ruling_fact_id > cutoff
+
+    session_valid = terminal_session_valid?(request, post_activation?)
+    wake_count = if post_activation?, do: canonical_wake_count_in_txn(txn, request), else: nil
+
+    checks = %{
+      "requestIdentity" =>
+        canonical_request_id?(request.id) and request.kind == "operator" and
+          non_blank?(request.raiser_id) and non_blank?(request.raiser_session_key) and
+          non_blank?(request.owner_user_id) and
+          (is_nil(request.assignment_id) or non_blank?(request.assignment_id)) and
+          non_blank?(request.action_key) and non_blank?(request.question) and
+          non_negative_integer?(request.raised_at) and
+          non_negative_integer?(request.deadline_at) and request.deadline_at > request.raised_at and
+          is_map(request.context),
+      "ownerOnBehalfOf" =>
+        non_blank?(request.owner_user_id) and
+          request.ruled_by == "user:" <> request.owner_user_id,
+      "options" => valid_operator_options?(request.options),
+      "decision" => normalized_text?(request.decision),
+      "rationale" => is_nil(request.rationale) or normalized_text?(request.rationale),
+      "ruledTimeFact" =>
+        non_negative_integer?(request.ruled_at) and positive_integer?(request.ruling_fact_id),
+      "rulingFact" => fact_count == 1,
+      "performerPrincipal" =>
+        if(post_activation?,
+          do: non_blank?(request.ruled_via_principal),
+          else: is_nil(request.ruled_via_principal)
+        ),
+      "performerSession" => session_valid,
+      "lifecycleConsumption" => request.status == "ruled" and is_nil(request.consumed_at),
+      "rulingLifecycleEvent" => event_count == 1,
+      "raiserNotificationWake" => not post_activation? or wake_count == 1
+    }
+
+    failures =
+      @terminal_failure_fields
+      |> Enum.reject(&Map.fetch!(checks, &1))
+      |> Enum.sort()
+
+    %{
+      failures: failures,
+      descriptor: %{
+        "schemaVersion" => @terminal_schema_version,
+        "checks" => checks,
+        "failingFields" => failures
+      }
+    }
+  end
+
+  defp terminal_session_valid?(request, true) do
+    (request.ruled_via_session_state == "known" and
+       non_blank?(request.ruled_via_session_key)) or
+      (request.ruled_via_session_state == "none" and is_nil(request.ruled_via_session_key))
+  end
+
+  defp terminal_session_valid?(request, false),
+    do:
+      is_nil(request.ruled_via_session_state) and
+        (is_nil(request.ruled_via_session_key) or non_blank?(request.ruled_via_session_key))
+
+  defp canonical_wake_count_in_txn(txn, request) do
+    creator =
+      if request.ruled_via_session_state == "known", do: request.ruled_via_session_key, else: nil
+
+    [[count]] =
+      Txn.q(
+        txn,
+        """
+        SELECT COUNT(*) FROM wakes
+        WHERE sessionKey = ?1 AND targetRole IS NULL AND origin = 'process:tightbeam'
+          AND prompt = ?2 AND consumer = 'prompt' AND conditionKind = ?3
+          AND conditionScope = ?4 AND conditionAfterId < ?5
+          AND creatorSessionKey IS ?6 AND dueAt = ?7 AND targetGate = 0
+          AND reresolve IS NULL AND reresolveSeed IS NULL AND reresolveRung IS NULL
+          AND canceledAt IS NULL
+          AND ((state = 'pending' AND firedAt IS NULL AND firedBy IS NULL) OR
+               (state = 'fired' AND firedAt IS NOT NULL AND firedBy = 'condition'))
+        """,
+        [
+          request.raiser_session_key,
+          terminal_notification(request.id),
+          @terminal_condition_kind,
+          request.id,
+          request.ruling_fact_id,
+          creator,
+          request.ruled_at + (request.deadline_at - request.raised_at)
+        ]
+      )
+
+    count
+  end
+
+  defp record_integrity_refusal_in_txn(
+         txn,
+         request_id,
+         validation,
+         surface,
+         observer_principal
+       ) do
+    record_integrity_evidence_in_txn(
+      txn,
+      request_id,
+      validation,
+      surface,
+      observer_principal
+    )
+
+    integrity_error(request_id)
+  end
+
+  defp record_integrity_evidence_in_txn(
+         txn,
+         request_id,
+         validation,
+         surface,
+         observer_principal
+       ) do
+    failures = validation.failures
+    fields = failures |> Enum.sort() |> JSON.encode!()
+    descriptor = canonical_json(validation.descriptor)
+
+    digest = :crypto.hash(:sha256, descriptor) |> Base.encode16(case: :lower)
+
+    try do
+      Txn.q(
+        txn,
+        """
+        INSERT OR IGNORE INTO decision_request_integrity_evidence
+          (requestId, shapeDigest, schemaVersion, causeCode, failingFields,
+           firstSurface, firstObservedAt, observerPrincipal)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        """,
+        [
+          request_id,
+          digest,
+          @terminal_schema_version,
+          @terminal_evidence_cause,
+          fields,
+          to_string(surface),
+          now(),
+          observer_principal
+        ]
+      )
+
+      case Txn.q(
+             txn,
+             "SELECT schemaVersion, causeCode, failingFields FROM decision_request_integrity_evidence WHERE requestId=?1 AND shapeDigest=?2",
+             [request_id, digest]
+           ) do
+        [[@terminal_schema_version, @terminal_evidence_cause, ^fields]] ->
+          :ok
+
+        [_other] ->
+          raise IntegrityEvidenceConflict,
+            message: "integrity evidence immutable payload conflict"
+
+        [] ->
+          raise IntegrityEvidenceUnavailable,
+            message: "integrity evidence insert was not durable"
+      end
+    rescue
+      error in [IntegrityEvidenceConflict, IntegrityEvidenceUnavailable] ->
+        reraise error, __STACKTRACE__
+
+      error ->
+        raise IntegrityEvidenceUnavailable,
+          message: "integrity evidence unavailable: #{Exception.message(error)}"
+    end
+  end
+
+  defp integrity_error(request_id),
+    do: %{
+      code: @terminal_integrity_code,
+      message: "decision request integrity check failed",
+      request_id: request_id
+    }
+
+  defp integrity_evidence_error(suffix),
+    do: %{
+      code: "decision_request_integrity_evidence_#{suffix}",
+      message: "decision request integrity evidence #{suffix}"
+    }
+
+  defp canonical_request_id?("dr_" <> rest), do: String.trim(rest) != ""
+  defp canonical_request_id?(_id), do: false
+  defp non_blank?(value), do: is_binary(value) and String.trim(value) != ""
+  defp normalized_text?(value), do: non_blank?(value) and String.trim(value) == value
+  defp non_negative_integer?(value), do: is_integer(value) and value >= 0
+  defp positive_integer?(value), do: is_integer(value) and value > 0
+
+  defp valid_operator_options?(options) when is_list(options) and options != [] do
+    labels =
+      Enum.map(options, fn
+        %{"label" => label} = option when map_size(option) == 1 -> label
+        _ -> nil
+      end)
+
+    Enum.all?(labels, &normalized_text?/1) and Enum.uniq(labels) == labels
+  end
+
+  defp valid_operator_options?(_options), do: false
+
+  defp terminal_notification(request_id) do
+    "Decision request #{request_id} was ruled. Read it with tightbeam decision-request --request #{request_id}."
+  end
+
+  defp principal_id({kind, value}) when kind in [:user, :session, :process],
+    do: "#{kind}:#{value}"
+
+  defp observer_principal(call), do: call |> Map.fetch!(:principal) |> principal_id()
 
   defp waiver_in_txn(txn, id) do
     [[id, raiser_id, statute_name, granted_by, granted_at, reason, revoked_by, revoked_at]] =
@@ -1732,8 +2300,15 @@ defmodule Tightbeam.Escalation do
 
   defp encode_optional(nil), do: nil
   defp encode_optional(value), do: JSON.encode!(value)
-  defp decode_optional(nil), do: nil
-  defp decode_optional(value), do: JSON.decode!(value)
+  defp decode_optional_safe(nil), do: nil
+  defp decode_optional_safe(value), do: decode_json_safe(value)
+
+  defp decode_json_safe(value) do
+    case JSON.decode(value) do
+      {:ok, decoded} -> decoded
+      {:error, _error} -> :invalid_json
+    end
+  end
 
   defp validate_options!(nil), do: nil
 
