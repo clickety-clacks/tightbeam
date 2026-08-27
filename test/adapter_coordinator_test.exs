@@ -151,7 +151,16 @@ defmodule Tightbeam.AdapterCoordinatorTest do
       )
 
     key = {:claude, "default", "testhost"}
-    assert {:ok, adapter, _generation} = AdapterCoordinator.adapter_for(coordinator, key)
+    assert {:ok, adapter, generation} = AdapterCoordinator.adapter_for(coordinator, key)
+
+    assert {:ok, published_at} =
+             AdapterCoordinator.generation_publication(coordinator, key, generation)
+
+    assert is_integer(published_at)
+
+    assert {:error, :generation_not_published} =
+             AdapterCoordinator.generation_publication(coordinator, key, generation + 1)
+
     assert_receive {:adapter_context, context_worker, ^key}
     refute context_worker == coordinator
     assert_receive {:adapter_opts, ^adapter, ^key, [credential_kind: :subscription]}

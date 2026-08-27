@@ -345,12 +345,26 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
     assert {:ok, %{seq: old_seq, owner_lease: owner_lease}} =
              Ledger.claim_next(ctx.db, @main, "old-owner")
 
+    assert {:ok, [[old_claimed_at]]} =
+             DB.query(
+               ctx.db,
+               "SELECT at FROM turn_lifecycle_events WHERE turnSeq=?1 AND kind='claimed'",
+               [old_seq]
+             )
+
     assert {:ok, activation} =
              CredentialRecovery.prepare(ctx.db, @host, :anthropic, :subscription)
 
-    for edge <- [:credential_installed, :metadata_committed, :adapter_started] do
-      assert {:ok, :ok} = CredentialRecovery.edge(ctx.db, activation.activation_id, edge)
-    end
+    assert {:ok, :ok} =
+             CredentialRecovery.edge(ctx.db, activation.activation_id, :credential_installed)
+
+    publications =
+      record_adapter_publication!(ctx.db, activation.activation_id, 2, old_claimed_at + 1)
+
+    assert {:ok, :ok} =
+             CredentialRecovery.edge(ctx.db, activation.activation_id, :metadata_committed)
+
+    record_resume!(ctx.db, activation.activation_id, publications)
 
     assert {:ok, :ok} =
              CredentialRecovery.mark_ready(ctx.db, activation.activation_id, %{"claude" => 2})
@@ -545,19 +559,42 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
                wake_id: retry_wake_id
              })
 
-    assert {:ok, [["pending", 1, "not_admitted_cycle_closed", 0]]} =
+    assert {:ok, [["pending", 2, 0, "materialized", 1]]} =
              DB.query(
                ctx.db,
                """
-               SELECT state,attempt,attemptState,
+               SELECT state,cycle,attempt,attemptState,
                       (SELECT COUNT(*) FROM wakes WHERE consumer='prompt' AND state='pending')
                FROM credential_recovery_targets WHERE targetId=?1
                """,
                [target_id]
              )
 
-    assert {:ok, %{fire?: true, state: "pending"}} =
-             CredentialRecovery.turn_terminal(ctx.db, carrier_seq)
+    assert {:ok, [[later_wake_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId FROM credential_recovery_targets WHERE targetId=?1",
+               [target_id]
+             )
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "UPDATE credential_recovery_targets SET cycle=1,attempt=1,attemptState='not_admitted_cycle_closed',wakeId=NULL,turnSeq=?2,coveredGeneration=1 WHERE targetId=?1",
+               [target_id, carrier_seq]
+             )
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "DELETE FROM wakes WHERE wakeId=?1", [later_wake_id])
+
+    assert {:ok, [["pending", 1, 1, "not_admitted_cycle_closed", 0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,cycle,attempt,attemptState,(SELECT COUNT(*) FROM wakes WHERE consumer='prompt' AND state='pending') FROM credential_recovery_targets WHERE targetId=?1",
+               [target_id]
+             )
+
+    assert :ok = CredentialRecovery.recover(ctx.db)
 
     assert %{
              targets: [
@@ -568,7 +605,7 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
     assert %{state: "complete", targets: [%{resolution: "undeliverable"}]} =
              CredentialRecovery.readback(ctx.db, first.recovery.activation_id)
 
-    assert {:ok, [[1, 1]]} =
+    assert {:ok, [[1, 1, 1]]} =
              DB.query(
                ctx.db,
                """
@@ -576,7 +613,9 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
                  (SELECT COUNT(*) FROM wakes WHERE consumer='prompt' AND state='pending'),
                  (SELECT COUNT(*) FROM credential_recovery_transition_audit
                   WHERE kind='credential_recovery_attempt_not_admitted_cycle_closed'
-                    AND causeKind='turn_terminal' AND causeRowId=?1)
+                    AND causeKind='turn_terminal' AND causeRowId=?1),
+                 (SELECT COUNT(*) FROM wakes WHERE consumer='prompt'
+                    AND prompt LIKE '%generation 2 completed%')
                """,
                [to_string(carrier_seq)]
              )
@@ -821,6 +860,157 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
              )
   end
 
+  test "a later group failure preserves earlier reconciliation progress", ctx do
+    assert :appended =
+             Gateway.deliver_prompt(@main, "session:test", "first old turn",
+               db: ctx.db,
+               conn_registry: ctx.registry,
+               lane_manager: ctx.lane
+             )
+
+    assert :appended =
+             Gateway.deliver_prompt(@main, "session:test", "second old turn",
+               db: ctx.db,
+               conn_registry: ctx.registry,
+               lane_manager: ctx.lane
+             )
+
+    assert {:ok, %{seq: first_seq, owner_lease: first_lease}} =
+             Ledger.claim_next(ctx.db, @main, "first-old-owner")
+
+    assert {:ok, [[first_claimed_at]]} =
+             DB.query(
+               ctx.db,
+               "SELECT at FROM turn_lifecycle_events WHERE turnSeq=?1 AND kind='claimed'",
+               [first_seq]
+             )
+
+    assert {:ok, first_activation} =
+             CredentialRecovery.prepare(ctx.db, @host, :anthropic, :subscription)
+
+    assert {:ok, :ok} =
+             CredentialRecovery.edge(
+               ctx.db,
+               first_activation.activation_id,
+               :credential_installed
+             )
+
+    first_publications =
+      record_adapter_publication!(
+        ctx.db,
+        first_activation.activation_id,
+        2,
+        first_claimed_at + 1
+      )
+
+    assert {:ok, :ok} =
+             CredentialRecovery.edge(
+               ctx.db,
+               first_activation.activation_id,
+               :metadata_committed
+             )
+
+    record_resume!(ctx.db, first_activation.activation_id, first_publications)
+
+    assert {:ok, :ok} =
+             CredentialRecovery.mark_ready(
+               ctx.db,
+               first_activation.activation_id,
+               %{"claude" => 2}
+             )
+
+    assert {:ok, %{state: "recovering"}} =
+             CredentialRecovery.activation_ready(
+               ctx.db,
+               first_activation.activation_id,
+               %{"claude" => 2}
+             )
+
+    assert :ok = Ledger.finish(ctx.db, first_seq, "delivered", nil, owner_lease: first_lease)
+
+    assert {:ok, %{seq: second_seq}} =
+             Ledger.claim_next(ctx.db, @main, "second-old-owner")
+
+    assert :ok = Ledger.stamp_adapter(ctx.db, second_seq, 1)
+
+    assert {:ok, second_activation} =
+             CredentialRecovery.prepare(ctx.db, @host, :anthropic, :subscription)
+
+    assert {:ok, :ok} =
+             CredentialRecovery.edge(
+               ctx.db,
+               second_activation.activation_id,
+               :credential_installed
+             )
+
+    second_publications =
+      record_adapter_publication!(ctx.db, second_activation.activation_id, 3)
+
+    assert {:ok, :ok} =
+             CredentialRecovery.edge(
+               ctx.db,
+               second_activation.activation_id,
+               :metadata_committed
+             )
+
+    record_resume!(ctx.db, second_activation.activation_id, second_publications)
+
+    assert {:ok, :ok} =
+             CredentialRecovery.mark_ready(
+               ctx.db,
+               second_activation.activation_id,
+               %{"claude" => 3}
+             )
+
+    assert {:ok, %{state: "recovering"}} =
+             CredentialRecovery.activation_ready(
+               ctx.db,
+               second_activation.activation_id,
+               %{"claude" => 3}
+             )
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        """
+        CREATE TRIGGER fail_second_reconciliation_group
+        BEFORE INSERT ON turn_lifecycle_events
+        WHEN NEW.kind='terminal_committed' AND NEW.turnSeq=#{second_seq}
+        BEGIN
+          SELECT RAISE(ABORT, 'forced second group failure');
+        END;
+        """
+      )
+
+    assert {:ok, %{reconciliation_state: "retrying", reconciled_count: 1}} =
+             CredentialRecovery.reconcile_ready_activation(
+               ctx.db,
+               second_activation.activation_id
+             )
+
+    assert {:ok, [["done", "delivered"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT reconciliationState,reconciliationResult FROM credential_recovery_memberships WHERE activationId=?1",
+               [first_activation.activation_id]
+             )
+
+    assert {:ok, [["pending", nil]]} =
+             DB.query(
+               ctx.db,
+               "SELECT reconciliationState,reconciliationResult FROM credential_recovery_memberships WHERE activationId=?1",
+               [second_activation.activation_id]
+             )
+
+    assert {:ok, [["retry_wait", 0, failure]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,attempt,failure FROM credential_recovery_targets"
+             )
+
+    assert failure == "reconciliation_failed:turn_groups_failed"
+  end
+
   test "carrier terminal covers joined generations and completes both activations", ctx do
     start_credentials!(ctx)
     handler = onboard_handler(ctx, start_real_scheduler!(ctx))
@@ -854,19 +1044,15 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
     assert {:ok, second} =
              CredentialRecovery.prepare(ctx.db, @host, :anthropic, :subscription)
 
-    for edge <- [:credential_installed, :metadata_committed] do
-      assert {:ok, :ok} = CredentialRecovery.edge(ctx.db, second.activation_id, edge)
-    end
+    assert {:ok, :ok} =
+             CredentialRecovery.edge(ctx.db, second.activation_id, :credential_installed)
+
+    publications = record_adapter_publication!(ctx.db, second.activation_id, 2)
 
     assert {:ok, :ok} =
-             CredentialRecovery.edge(
-               ctx.db,
-               second.activation_id,
-               {:adapter_generations, %{"claude" => 2}}
-             )
+             CredentialRecovery.edge(ctx.db, second.activation_id, :metadata_committed)
 
-    assert {:ok, :ok} =
-             CredentialRecovery.edge(ctx.db, second.activation_id, :adapter_started)
+    record_resume!(ctx.db, second.activation_id, publications)
 
     assert {:ok, :ok} =
              CredentialRecovery.mark_ready(ctx.db, second.activation_id, %{"claude" => 2})
@@ -990,24 +1176,20 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
     assert %{state: "failed", failure: failure} =
              CredentialRecovery.readback(ctx.db, interrupted.activation_id)
 
-    assert failure == "adapter_generations_missing_after_metadata_committed"
+    assert failure == "adapter_publications_missing_after_metadata_committed"
 
     assert {:ok, replayed} =
              CredentialRecovery.prepare(ctx.db, @host, :anthropic, :subscription)
 
-    for edge <- [:credential_installed, :metadata_committed] do
-      assert {:ok, :ok} = CredentialRecovery.edge(ctx.db, replayed.activation_id, edge)
-    end
+    assert {:ok, :ok} =
+             CredentialRecovery.edge(ctx.db, replayed.activation_id, :credential_installed)
+
+    publications = record_adapter_publication!(ctx.db, replayed.activation_id, 7)
 
     assert {:ok, :ok} =
-             CredentialRecovery.edge(
-               ctx.db,
-               replayed.activation_id,
-               {:adapter_generations, %{"claude" => 7}}
-             )
+             CredentialRecovery.edge(ctx.db, replayed.activation_id, :metadata_committed)
 
-    assert {:ok, :ok} =
-             CredentialRecovery.edge(ctx.db, replayed.activation_id, :adapter_started)
+    record_resume!(ctx.db, replayed.activation_id, publications)
 
     assert :ok = CredentialRecovery.recover(ctx.db)
 
@@ -1025,15 +1207,19 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
     assert {:ok, activation} =
              CredentialRecovery.prepare(ctx.db, @host, :anthropic, :subscription)
 
-    for edge <- [:credential_installed, :metadata_committed] do
-      assert {:ok, :ok} = CredentialRecovery.edge(ctx.db, activation.activation_id, edge)
-    end
+    assert {:ok, :ok} =
+             CredentialRecovery.edge(ctx.db, activation.activation_id, :credential_installed)
+
+    publications = record_adapter_publication!(ctx.db, activation.activation_id, 7)
+
+    assert {:ok, :ok} =
+             CredentialRecovery.edge(ctx.db, activation.activation_id, :metadata_committed)
 
     assert {:ok, :ok} =
              CredentialRecovery.edge(
                ctx.db,
                activation.activation_id,
-               {:adapter_generations, %{"claude" => 7}}
+               {:resume_succeeded, publications}
              )
 
     assert :ok = CredentialRecovery.recover(ctx.db)
@@ -1064,20 +1250,42 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
              )
   end
 
+  test "boot replay refuses generation publication without durable resume proof", ctx do
+    assert {:ok, activation} =
+             CredentialRecovery.prepare(ctx.db, @host, :anthropic, :subscription)
+
+    assert {:ok, :ok} =
+             CredentialRecovery.edge(ctx.db, activation.activation_id, :credential_installed)
+
+    record_adapter_publication!(ctx.db, activation.activation_id, 7)
+
+    assert {:ok, :ok} =
+             CredentialRecovery.edge(ctx.db, activation.activation_id, :metadata_committed)
+
+    assert {:error, %RuntimeError{message: refusal}} =
+             CredentialRecovery.edge(ctx.db, activation.activation_id, :adapter_started)
+
+    assert refusal =~ "expected=metadata_committed_with_adapter_and_resume_proof"
+
+    assert :ok = CredentialRecovery.recover(ctx.db)
+
+    assert %{state: "failed", failure: "resume_not_proven_after_metadata_committed"} =
+             CredentialRecovery.readback(ctx.db, activation.activation_id)
+
+    assert_wake_count(ctx.db, 0)
+  end
+
   test "a post-publication nil-generation claim receives a typed pre-inference refusal", ctx do
     assert {:ok, activation} =
              CredentialRecovery.prepare(ctx.db, @host, :anthropic, :subscription)
 
-    for edge <- [:credential_installed, :metadata_committed] do
-      assert {:ok, :ok} = CredentialRecovery.edge(ctx.db, activation.activation_id, edge)
-    end
+    assert {:ok, :ok} =
+             CredentialRecovery.edge(ctx.db, activation.activation_id, :credential_installed)
+
+    publications = record_adapter_publication!(ctx.db, activation.activation_id, 2)
 
     assert {:ok, :ok} =
-             CredentialRecovery.edge(
-               ctx.db,
-               activation.activation_id,
-               {:adapter_generations, %{"claude" => 2}}
-             )
+             CredentialRecovery.edge(ctx.db, activation.activation_id, :metadata_committed)
 
     Process.sleep(2)
 
@@ -1090,8 +1298,7 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
 
     assert {:ok, %{seq: seq}} = Ledger.claim_next(ctx.db, @main, "post-publication-owner")
 
-    assert {:ok, :ok} =
-             CredentialRecovery.edge(ctx.db, activation.activation_id, :adapter_started)
+    record_resume!(ctx.db, activation.activation_id, publications)
 
     assert {:ok, :ok} =
              CredentialRecovery.mark_ready(ctx.db, activation.activation_id, %{"claude" => 2})
@@ -1132,23 +1339,77 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
              )
   end
 
+  test "a nil-generation claim at the publication timestamp is not historical", ctx do
+    assert :appended =
+             Gateway.deliver_prompt(@main, "session:test", "equal-boundary work",
+               db: ctx.db,
+               conn_registry: ctx.registry,
+               lane_manager: ctx.lane
+             )
+
+    assert {:ok, %{seq: seq}} = Ledger.claim_next(ctx.db, @main, "equal-boundary-owner")
+
+    assert {:ok, [[claimed_at]]} =
+             DB.query(
+               ctx.db,
+               "SELECT at FROM turn_lifecycle_events WHERE turnSeq=?1 AND kind='claimed'",
+               [seq]
+             )
+
+    assert {:ok, activation} =
+             CredentialRecovery.prepare(ctx.db, @host, :anthropic, :subscription)
+
+    assert {:ok, :ok} =
+             CredentialRecovery.edge(ctx.db, activation.activation_id, :credential_installed)
+
+    publications =
+      record_adapter_publication!(ctx.db, activation.activation_id, 2, claimed_at)
+
+    assert {:ok, :ok} =
+             CredentialRecovery.edge(ctx.db, activation.activation_id, :metadata_committed)
+
+    record_resume!(ctx.db, activation.activation_id, publications)
+
+    assert {:ok, :ok} =
+             CredentialRecovery.mark_ready(ctx.db, activation.activation_id, %{"claude" => 2})
+
+    assert {:ok, %{state: "recovering"}} =
+             CredentialRecovery.activation_ready(
+               ctx.db,
+               activation.activation_id,
+               %{"claude" => 2}
+             )
+
+    assert {:ok, [["failed", error, "not_required", nil]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT turns.status,turns.error,
+                      memberships.reconciliationState,memberships.reconciliationResult
+               FROM turns
+               JOIN credential_recovery_memberships memberships
+                 ON memberships.sessionKey=turns.sessionKey
+               WHERE turns.seq=?1 AND memberships.activationId=?2
+               """,
+               [seq, activation.activation_id]
+             )
+
+    assert error =~ "generation_missing"
+  end
+
   test "recovery transition audit records cause row and principal", ctx do
     assert {:ok, activation} =
              CredentialRecovery.prepare(ctx.db, @host, :anthropic, :subscription)
 
-    for edge <- [:credential_installed, :metadata_committed] do
-      assert {:ok, :ok} = CredentialRecovery.edge(ctx.db, activation.activation_id, edge)
-    end
+    assert {:ok, :ok} =
+             CredentialRecovery.edge(ctx.db, activation.activation_id, :credential_installed)
+
+    publications = record_adapter_publication!(ctx.db, activation.activation_id, 3)
 
     assert {:ok, :ok} =
-             CredentialRecovery.edge(
-               ctx.db,
-               activation.activation_id,
-               {:adapter_generations, %{"claude" => 3}}
-             )
+             CredentialRecovery.edge(ctx.db, activation.activation_id, :metadata_committed)
 
-    assert {:ok, :ok} =
-             CredentialRecovery.edge(ctx.db, activation.activation_id, :adapter_started)
+    record_resume!(ctx.db, activation.activation_id, publications)
 
     assert {:ok, :ok} =
              CredentialRecovery.mark_ready(ctx.db, activation.activation_id, %{"claude" => 3})
@@ -1160,6 +1421,47 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
                %{"claude" => 3}
              )
 
+    assert {:ok, [[target_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT targetId FROM credential_recovery_memberships WHERE activationId=?1",
+               [activation.activation_id]
+             )
+
+    membership_subject = "#{activation.activation_id}:#{@main}"
+
+    assert {:ok, [[1, 1]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT
+                 (SELECT COUNT(*) FROM credential_recovery_transition_audit
+                    WHERE kind='credential_recovery_target_created' AND subject=?1
+                      AND causeKind='activation' AND causeRowId=?2
+                      AND principal='process:tightbeam'),
+                 (SELECT COUNT(*) FROM credential_recovery_transition_audit
+                    WHERE kind='credential_recovery_membership_created' AND subject=?3
+                      AND causeKind='activation' AND causeRowId=?2
+                      AND principal='process:tightbeam')
+               """,
+               [target_id, activation.activation_id, membership_subject]
+             )
+
+    assert %{state: "retired"} = Org.retire(ctx.db, @main, "user:#{@owner}", 1_000)
+    assert {:ok, :ok} = CredentialRecovery.session_retired(ctx.db, @main)
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT COUNT(*) FROM credential_recovery_transition_audit
+               WHERE kind='credential_recovery_membership_retired' AND subject=?1
+                 AND causeKind='eligibility_disposition'
+                 AND causeRowId=?2 AND principal='process:tightbeam'
+               """,
+               [membership_subject, "session-retired:#{@main}"]
+             )
+
     assert {:ok, [[count, 0]]} =
              DB.query(
                ctx.db,
@@ -1169,7 +1471,7 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
                """
              )
 
-    assert count >= 8
+    assert count >= 12
   end
 
   test "retirement before delivery durably dispositions the exact target", ctx do
@@ -1353,6 +1655,30 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
                  "agent:unrelated"
                )
              )
+  end
+
+  defp record_adapter_publication!(db, activation_id, generation, published_at \\ nil) do
+    published_at = published_at || System.system_time(:millisecond)
+
+    publications = %{
+      "claude" => %{"generation" => generation, "publishedAt" => published_at}
+    }
+
+    assert {:ok, :ok} =
+             CredentialRecovery.edge(
+               db,
+               activation_id,
+               {:adapter_publications, %{"claude" => generation}, publications}
+             )
+
+    publications
+  end
+
+  defp record_resume!(db, activation_id, publications) do
+    assert {:ok, :ok} =
+             CredentialRecovery.edge(db, activation_id, {:resume_succeeded, publications})
+
+    assert {:ok, :ok} = CredentialRecovery.edge(db, activation_id, :adapter_started)
   end
 
   defp start_credentials!(ctx, opts \\ []) do

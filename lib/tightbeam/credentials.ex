@@ -524,7 +524,7 @@ defmodule Tightbeam.Credentials do
            :ok <- state.stop.(provider),
            {:ok, credential} <- Map.fetch!(state.onboarders, provider).(state),
            :ok <- write_credential!(state, provider, credential),
-           {:ok, _adapter_generations} <- start_for_finish(state, provider, :subscription),
+           {:ok, _adapter_proof} <- start_for_finish(state, provider, :subscription),
            :ok <- mark_onboarded!(state, provider, :subscription, credential),
            :ok <- state.on_credential_present.(provider),
            captured <- capture_sessions(state, provider),
@@ -895,14 +895,19 @@ defmodule Tightbeam.Credentials do
          {:ok, credential} <- install_staged!(state, provider, kind, path),
          :ok <- observe_recovery_edge(recovery_edge, :credential_installed) do
       case activate_staged_credential(state, provider, kind, credential, recovery_edge) do
-        {:ok, adapter_generations} ->
+        {:ok, adapter_proof} ->
           result =
             with :ok <- state.on_credential_present.(provider),
                  captured <- capture_sessions(state, provider),
                  :ok <- state.resume.(provider),
+                 :ok <-
+                   observe_recovery_edge(
+                     recovery_edge,
+                     {:resume_succeeded, adapter_proof.publications}
+                   ),
                  :ok <- observe_recovery_edge(recovery_edge, :adapter_started) do
               publish_sessions(state, captured, :onboarded)
-              {:ok, adapter_generations}
+              {:ok, adapter_proof.generations}
             end
 
           {result, update_in(state.present_but_unverified, &Map.delete(&1, provider))}
@@ -932,24 +937,48 @@ defmodule Tightbeam.Credentials do
 
   defp activate_staged_credential(state, provider, kind, credential, recovery_edge) do
     with :ok <- state.stop.(provider),
-         {:ok, adapter_generations} <- start_for_finish(state, provider, kind),
+         {:ok, adapter_proof} <- start_for_finish(state, provider, kind),
+         :ok <-
+           observe_recovery_edge(
+             recovery_edge,
+             {:adapter_publications, adapter_proof.generations, adapter_proof.publications}
+           ),
          :ok <- mark_onboarded_for_finish(state, provider, kind, credential),
-         :ok <- observe_recovery_edge(recovery_edge, :metadata_committed),
-         :ok <- observe_recovery_edge(recovery_edge, {:adapter_generations, adapter_generations}) do
-      {:ok, adapter_generations}
+         :ok <- observe_recovery_edge(recovery_edge, :metadata_committed) do
+      {:ok, adapter_proof}
     end
   end
 
   defp start_for_finish(state, provider, kind) do
     case state.start.(provider, kind) do
-      :ok -> {:ok, %{}}
-      {:ok, generations} when is_map(generations) -> {:ok, generations}
-      failure -> failure
+      :ok ->
+        {:ok, adapter_proof(%{}, %{})}
+
+      {:ok, %{generations: generations, publications: publications}}
+      when is_map(generations) and is_map(publications) ->
+        {:ok, adapter_proof(generations, publications)}
+
+      {:ok, generations} when is_map(generations) ->
+        at = System.system_time(:millisecond)
+
+        publications =
+          Map.new(generations, fn {wire, generation} ->
+            {wire, %{"generation" => generation, "publishedAt" => at}}
+          end)
+
+        {:ok, adapter_proof(generations, publications)}
+
+      failure ->
+        failure
     end
   rescue
     error -> {:error, {:credential_start_failed, {:exception, Exception.message(error)}}}
   catch
     caught_kind, reason -> {:error, {:credential_start_failed, {caught_kind, reason}}}
+  end
+
+  defp adapter_proof(generations, publications) do
+    %{generations: generations, publications: publications}
   end
 
   defp observe_recovery_edge(nil, _edge), do: :ok

@@ -139,6 +139,13 @@ defmodule Tightbeam.AdapterCoordinator do
   @spec ready?(GenServer.server(), adapter_key()) :: boolean()
   def ready?(server \\ __MODULE__, key), do: GenServer.call(server, {:ready?, key})
 
+  @doc "The exact coordinator publication stamp for one checked-out adapter generation."
+  @spec generation_publication(GenServer.server(), adapter_key(), pos_integer()) ::
+          {:ok, non_neg_integer()} | {:error, :generation_not_published}
+  def generation_publication(server \\ __MODULE__, key, generation) do
+    GenServer.call(server, {:generation_publication, key, generation})
+  end
+
   @doc "The canonical key string `<harness>:<preset>@<host>`, exactly as /version renders it."
   @spec key_name(adapter_key()) :: String.t()
   def key_name({harness, archetype, host}), do: "#{harness}:#{archetype}@#{host}"
@@ -221,6 +228,20 @@ defmodule Tightbeam.AdapterCoordinator do
 
   def handle_call({:ready?, key}, _from, state) do
     {:reply, match?(%{ready: true}, state.adapters[key]), state}
+  end
+
+  def handle_call({:generation_publication, key, generation}, _from, state) do
+    reply =
+      case state.adapters[key] do
+        %{generation: ^generation, published_at: published_at}
+        when is_integer(published_at) ->
+          {:ok, published_at}
+
+        _ ->
+          {:error, :generation_not_published}
+      end
+
+    {:reply, reply, state}
   end
 
   def handle_call({:last_failure, key, generation}, _from, state) do
@@ -432,7 +453,13 @@ defmodule Tightbeam.AdapterCoordinator do
     case state.adapters[key] do
       %{timer: timer} = entry ->
         if is_reference(timer), do: Process.cancel_timer(timer)
-        put_in(state.adapters[key], %{entry | timer: nil, generation: entry.generation + 1})
+
+        put_in(state.adapters[key], %{
+          entry
+          | timer: nil,
+            generation: entry.generation + 1,
+            published_at: nil
+        })
 
       _ ->
         state
@@ -509,7 +536,15 @@ defmodule Tightbeam.AdapterCoordinator do
         if is_reference(monitor), do: Process.demonitor(monitor, [:flush])
         if is_pid(pid) and Process.alive?(pid), do: Process.exit(pid, :kill)
 
-        entry = %{entry | pid: nil, monitor: nil, ready: false, context: nil, timer: nil}
+        entry = %{
+          entry
+          | pid: nil,
+            monitor: nil,
+            ready: false,
+            context: nil,
+            timer: nil,
+            published_at: nil
+        }
 
         %{
           state
@@ -602,6 +637,7 @@ defmodule Tightbeam.AdapterCoordinator do
               circuit: circuit,
               timer: timer,
               ready: false,
+              published_at: nil,
               context: nil,
               last_failure: {died_at, reason}
           }
@@ -720,6 +756,7 @@ defmodule Tightbeam.AdapterCoordinator do
           | pid: pid,
             monitor: ref,
             generation: generation,
+            published_at: System.system_time(:millisecond),
             timer: nil,
             ready: false,
             context: normalize_context(adapter_context)
@@ -752,6 +789,7 @@ defmodule Tightbeam.AdapterCoordinator do
             circuit: circuit,
             timer: timer,
             ready: false,
+            published_at: nil,
             last_failure: {generation, {:adapter_start_failed, start_reason}}
         }
 
@@ -768,6 +806,7 @@ defmodule Tightbeam.AdapterCoordinator do
       circuit: :closed,
       timer: nil,
       ready: false,
+      published_at: nil,
       last_failure: nil,
       context: nil
     }

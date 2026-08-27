@@ -1720,11 +1720,20 @@ defmodule Tightbeam.CliIntegrationTest do
       assert {:ok, :ok} = CredentialRecovery.edge(ctx.db, activation.activation_id, edge)
     end
 
+    publications = %{"claude" => %{"generation" => 1, "publishedAt" => 1_000}}
+
     assert {:ok, :ok} =
              CredentialRecovery.edge(
                ctx.db,
                activation.activation_id,
-               {:adapter_generations, %{"claude" => 1}}
+               {:adapter_publications, %{"claude" => 1}, publications}
+             )
+
+    assert {:ok, :ok} =
+             CredentialRecovery.edge(
+               ctx.db,
+               activation.activation_id,
+               {:resume_succeeded, publications}
              )
 
     assert {:ok, :ok} =

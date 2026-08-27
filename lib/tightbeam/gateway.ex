@@ -7310,7 +7310,17 @@ defmodule Tightbeam.Gateway do
                credential_kind: kind
              ) do
           {:ok, _pid, generation} ->
-            {[{module.wire_name(), generation} | started], failed}
+            case AdapterCoordinator.generation_publication(
+                   Tightbeam.AdapterCoordinator,
+                   key,
+                   generation
+                 ) do
+              {:ok, published_at} ->
+                {[{module.wire_name(), generation, published_at} | started], failed}
+
+              {:error, reason} ->
+                {started, [%{harness: module.wire_name(), reason: reason} | failed]}
+            end
 
           {:error, reason} ->
             {started, [%{harness: module.wire_name(), reason: reason} | failed]}
@@ -7319,7 +7329,17 @@ defmodule Tightbeam.Gateway do
 
     case Enum.reverse(failed) do
       [] ->
-        {:ok, Map.new(started)}
+        {:ok,
+         %{
+           generations:
+             Map.new(started, fn {wire, generation, _published_at} ->
+               {wire, generation}
+             end),
+           publications:
+             Map.new(started, fn {wire, generation, published_at} ->
+               {wire, %{"generation" => generation, "publishedAt" => published_at}}
+             end)
+         }}
 
       failed ->
         {:error,

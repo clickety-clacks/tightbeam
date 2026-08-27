@@ -129,6 +129,9 @@ defmodule Tightbeam.GatewayTest do
     def handle_call({:adapter_for, key, _context}, from, state),
       do: handle_call({:adapter_for, key}, from, state)
 
+    def handle_call({:generation_publication, _key, generation}, _from, state),
+      do: {:reply, {:ok, generation}, state}
+
     def handle_call({:acquire_load_slot, _machine, _borrower}, _from, state),
       do: {:reply, make_ref(), state}
 
