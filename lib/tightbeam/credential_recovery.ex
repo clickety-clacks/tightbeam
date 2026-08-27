@@ -109,6 +109,29 @@ defmodule Tightbeam.CredentialRecovery do
 
   @doc "Replay unfinished recovery from durable rows during gateway boot."
   def recover(db \\ Tightbeam.DB) do
+    {:ok, interrupted} =
+      DB.query(
+        db,
+        "SELECT activationId,state,adapterGenerations FROM credential_recovery_activations WHERE state IN ('prepared','credential_installed','metadata_committed','adapter_started') ORDER BY host,provider,generation"
+      )
+
+    Enum.each(interrupted, fn
+      [activation_id, "adapter_started", encoded_generations] ->
+        case JSON.decode(encoded_generations || "") do
+          {:ok, generations} when is_map(generations) ->
+            case mark_ready(db, activation_id, generations) do
+              {:ok, :ok} -> :ok
+              {:error, reason} -> fail(db, activation_id, {:boot_ready_replay_failed, reason})
+            end
+
+          _ ->
+            fail(db, activation_id, :adapter_generations_missing_after_adapter_started)
+        end
+
+      [activation_id, state, _encoded_generations] ->
+        fail(db, activation_id, %{code: "credential_activation_interrupted_#{state}"})
+    end)
+
     {:ok, activations} =
       DB.query(
         db,
@@ -238,6 +261,29 @@ defmodule Tightbeam.CredentialRecovery do
     transition(db, activation_id, from, state, column)
   end
 
+  def edge(db, activation_id, {:adapter_generations, adapter_generations})
+      when is_map(adapter_generations) do
+    affected_harnesses(adapter_generations)
+    encoded = JSON.encode!(adapter_generations)
+
+    DB.transaction(db, fn txn ->
+      Txn.q(
+        txn,
+        "UPDATE credential_recovery_activations SET adapterGenerations=?2 WHERE activationId=?1 AND state='metadata_committed'",
+        [activation_id, encoded]
+      )
+
+      if Txn.changes(txn) != 1,
+        do:
+          raise(
+            "credential_recovery_adapter_generations_transition_refused activation=#{activation_id}"
+          )
+
+      audit(txn, "credential_recovery_adapter_generations", activation_id, nil)
+      :ok
+    end)
+  end
+
   @doc "Record that every successful activation edge, including resume, completed."
   def mark_ready(db, activation_id, adapter_generations) when is_map(adapter_generations) do
     affected_harnesses(adapter_generations)
@@ -325,7 +371,16 @@ defmodule Tightbeam.CredentialRecovery do
              "targets=#{length(sessions)} state=#{state}"
            )
 
-           %{activation_id: activation_id, state: state, target_count: length(sessions)}
+           %{
+             activation_id: activation_id,
+             state: state,
+             aggregate:
+               if(state == "complete",
+                 do: "credential_recovery_complete",
+                 else: "credential_recovery_in_progress"
+               ),
+             target_count: length(sessions)
+           }
          end) do
       {:ok, result} -> {:ok, result}
       {:error, reason} -> {:error, {:recovery_publication_failed, reason}}
@@ -690,6 +745,23 @@ defmodule Tightbeam.CredentialRecovery do
             [activation_id]
           )
 
+        membership_counts =
+          rows
+          |> Enum.map(&Enum.at(&1, 4))
+          |> Enum.frequencies()
+
+        aggregate =
+          cond do
+            Map.get(membership_counts, "undeliverable", 0) > 0 ->
+              "credential_recovery_incomplete"
+
+            state == "complete" ->
+              "credential_recovery_complete"
+
+            true ->
+              "credential_recovery_in_progress"
+          end
+
         %{
           activation_id: activation_id,
           host: host,
@@ -697,6 +769,7 @@ defmodule Tightbeam.CredentialRecovery do
           credential_kind: kind,
           generation: generation,
           state: state,
+          aggregate: aggregate,
           prepared_at: prepared,
           ready_at: ready,
           completed_at: completed,
@@ -746,10 +819,7 @@ defmodule Tightbeam.CredentialRecovery do
                 failure: target_failure
               }
             end),
-          membership_counts:
-            rows
-            |> Enum.map(&Enum.at(&1, 4))
-            |> Enum.frequencies()
+          membership_counts: membership_counts
         }
 
       {:ok, []} ->
@@ -1142,23 +1212,24 @@ defmodule Tightbeam.CredentialRecovery do
       [target_id, cycle]
     )
 
-    Txn.q(
-      txn,
-      "UPDATE credential_recovery_memberships SET resolution='undeliverable',resolvedCycle=?2,resolvedAt=?3 WHERE targetId=?1 AND resolution='open' AND generation<=?4",
-      [target_id, cycle, at, reconciliation_generation]
-    )
-
     cancel_target_wake(txn, target_id, "consumer_unavailable")
     cancel_internal_retry_wakes(txn, target_id, "consumer_unavailable")
 
-    Txn.q(
-      txn,
-      "UPDATE credential_recovery_targets SET state='undeliverable',attemptState='terminal',wakeId=NULL,dueAt=NULL,failure=?2,updatedAt=?3 WHERE targetId=?1",
-      [target_id, "reconciliation_failed:#{failure_code(reason)}", at]
-    )
+    later? =
+      finalize_undeliverable_generation(
+        txn,
+        target_id,
+        cycle,
+        reconciliation_generation,
+        "reconciliation_failed:#{failure_code(reason)}",
+        nil,
+        at
+      )
 
     complete_activations(txn, target_id)
     audit(txn, "credential_recovery_undeliverable", target_id, "reconciliation-attempt-3")
+
+    if later?, do: materialize_if_needed(txn, nil, target_id)
   end
 
   defp terminalize_claimed_after_crash(db, seq) do
@@ -1441,17 +1512,19 @@ defmodule Tightbeam.CredentialRecovery do
         %{fire?: false, state: "retry_wait"}
 
       _ ->
-        Txn.q(
-          txn,
-          "UPDATE credential_recovery_targets SET state='undeliverable',attemptState='terminal',failure=?2,updatedAt=?3 WHERE targetId=?1",
-          [target.id, disposition, now()]
-        )
+        covered = target.covered || target.required
+        at = now()
 
-        Txn.q(
-          txn,
-          "UPDATE credential_recovery_memberships SET resolution='undeliverable',resolvedCycle=?2,resolvedTurnSeq=?3,resolvedAt=?4 WHERE targetId=?1 AND resolution='open'",
-          [target.id, target.cycle, seq, now()]
-        )
+        later? =
+          finalize_undeliverable_generation(
+            txn,
+            target.id,
+            target.cycle,
+            covered,
+            disposition,
+            seq,
+            at
+          )
 
         complete_activations(txn, target.id)
 
@@ -1462,11 +1535,54 @@ defmodule Tightbeam.CredentialRecovery do
           "turnSeq=#{seq} disposition=#{disposition}"
         )
 
-        %{fire?: false, state: "undeliverable"}
+        if later?, do: materialize_if_needed(txn, nil, target.id)
+
+        %{fire?: later?, state: if(later?, do: "pending", else: "undeliverable")}
     end
   end
 
   defp settle_terminal(_txn, _target, _seq), do: :stale
+
+  defp finalize_undeliverable_generation(
+         txn,
+         target_id,
+         cycle,
+         resolution_generation,
+         failure,
+         turn_seq,
+         at
+       ) do
+    [[required_generation]] =
+      Txn.q(
+        txn,
+        "SELECT requiredGeneration FROM credential_recovery_targets WHERE targetId=?1",
+        [target_id]
+      )
+
+    Txn.q(
+      txn,
+      "UPDATE credential_recovery_memberships SET resolution='undeliverable',resolvedCycle=?2,resolvedTurnSeq=?3,resolvedAt=?4 WHERE targetId=?1 AND resolution='open' AND generation<=?5",
+      [target_id, cycle, turn_seq, at, resolution_generation]
+    )
+
+    if required_generation > resolution_generation do
+      Txn.q(
+        txn,
+        "UPDATE credential_recovery_targets SET state='pending',handledGeneration=?2,cycle=?3,attempt=0,attemptState='reserved',reconciliationGeneration=0,wakeId=NULL,turnSeq=NULL,coveredGeneration=NULL,dueAt=NULL,failure=NULL,updatedAt=?4 WHERE targetId=?1",
+        [target_id, resolution_generation, cycle + 1, at]
+      )
+
+      true
+    else
+      Txn.q(
+        txn,
+        "UPDATE credential_recovery_targets SET state='undeliverable',handledGeneration=?2,attemptState='terminal',wakeId=NULL,dueAt=NULL,failure=?3,updatedAt=?4 WHERE targetId=?1",
+        [target_id, resolution_generation, failure, at]
+      )
+
+      false
+    end
+  end
 
   defp settle_cycle_reconciliations_in_txn(txn, target, seq, disposition) do
     Txn.q(

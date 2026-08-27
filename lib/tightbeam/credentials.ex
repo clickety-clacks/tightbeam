@@ -899,7 +899,8 @@ defmodule Tightbeam.Credentials do
           result =
             with :ok <- state.on_credential_present.(provider),
                  captured <- capture_sessions(state, provider),
-                 :ok <- state.resume.(provider) do
+                 :ok <- state.resume.(provider),
+                 :ok <- observe_recovery_edge(recovery_edge, :adapter_started) do
               publish_sessions(state, captured, :onboarded)
               {:ok, adapter_generations}
             end
@@ -934,7 +935,7 @@ defmodule Tightbeam.Credentials do
          {:ok, adapter_generations} <- start_for_finish(state, provider, kind),
          :ok <- mark_onboarded_for_finish(state, provider, kind, credential),
          :ok <- observe_recovery_edge(recovery_edge, :metadata_committed),
-         :ok <- observe_recovery_edge(recovery_edge, :adapter_started) do
+         :ok <- observe_recovery_edge(recovery_edge, {:adapter_generations, adapter_generations}) do
       {:ok, adapter_generations}
     end
   end

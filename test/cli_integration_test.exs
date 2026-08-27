@@ -7,6 +7,7 @@ defmodule Tightbeam.CliIntegrationTest do
   alias Tightbeam.{
     Archetypes,
     CliCompatibility,
+    CredentialRecovery,
     DB,
     Gateway,
     Ledger,
@@ -1709,6 +1710,53 @@ defmodule Tightbeam.CliIntegrationTest do
       )
 
     assert pairing =~ "supplied together"
+  end
+
+  test "target agent reads its credential recovery through the real CLI", ctx do
+    assert {:ok, activation} =
+             CredentialRecovery.prepare(ctx.db, "testhost", :anthropic, :subscription)
+
+    for edge <- [:credential_installed, :metadata_committed] do
+      assert {:ok, :ok} = CredentialRecovery.edge(ctx.db, activation.activation_id, edge)
+    end
+
+    assert {:ok, :ok} =
+             CredentialRecovery.edge(
+               ctx.db,
+               activation.activation_id,
+               {:adapter_generations, %{"claude" => 1}}
+             )
+
+    assert {:ok, :ok} =
+             CredentialRecovery.edge(ctx.db, activation.activation_id, :adapter_started)
+
+    assert {:ok, :ok} =
+             CredentialRecovery.mark_ready(ctx.db, activation.activation_id, %{"claude" => 1})
+
+    assert {:ok, %{state: "recovering"}} =
+             CredentialRecovery.activation_ready(
+               ctx.db,
+               activation.activation_id,
+               %{"claude" => 1}
+             )
+
+    {readback, 0} =
+      System.cmd(ctx.binary, ["credential-recovery", activation.activation_id],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert readback =~ activation.activation_id
+    assert readback =~ "credential_recovery_in_progress"
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "credential-recovery",
+                      params: %{activation_id: activation_id},
+                      principal: {:session, "cli-holder"}
+                    }}
+
+    assert activation_id == activation.activation_id
   end
 
   defp open_agent_request(ctx, opts \\ []) do

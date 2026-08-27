@@ -230,6 +230,10 @@ pub enum Command {
         identity: Identity,
         work_item_id: String,
     },
+    CredentialRecovery {
+        identity: Identity,
+        activation_id: String,
+    },
     WorkItemTrace {
         identity: Identity,
         work_item_id: String,
@@ -569,6 +573,9 @@ COMMANDS:
       it, then route it (assign/dispatch) or icebox it. --key makes create
       idempotent (same key returns the same item).
   work-item-get <workItemId>
+  credential-recovery <activationId>
+      Read the durable recovery state for one credential activation. A target
+      session, that target's owner, or an admin may read the authorized view.
   work-item-trace <workItemId>
   attend [--high]
       Elect the attention tier of the reply you are about to give, during your
@@ -1715,6 +1722,15 @@ fn parse_with_optional_catalog(
                 work_item_id: parsed.positional[1].clone(),
             })
         }
+        "credential-recovery" => {
+            if parsed.positional.len() != 2 {
+                return Err("usage: tightbeam credential-recovery <activationId>".to_owned());
+            }
+            Ok(Command::CredentialRecovery {
+                identity: identity(flags)?,
+                activation_id: parsed.positional[1].clone(),
+            })
+        }
         "work-item-trace" => {
             if parsed.positional.len() != 2 {
                 return Err("usage: tightbeam work-item-trace <workItemId>".to_owned());
@@ -2076,7 +2092,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, decision-request, ask, answer, return, revoke-assignment, reopen-assignment, repair-assignment, work-item-create, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, decision-request, ask, answer, return, revoke-assignment, reopen-assignment, repair-assignment, work-item-create, work-item-get, credential-recovery, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -2880,6 +2896,7 @@ mod tests {
                 "condition",
                 "config",
                 "coordination-share",
+                "credential-recovery",
                 "decision-request",
                 "decision-requests",
                 "digest-members",
@@ -3490,7 +3507,28 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, decision-request, ask, answer, return, revoke-assignment, reopen-assignment, repair-assignment, work-item-create, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, decision-request, ask, answer, return, revoke-assignment, reopen-assignment, repair-assignment, work-item-create, work-item-get, credential-recovery, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned())
+        );
+    }
+
+    #[test]
+    fn credential_recovery_requires_one_activation_id() {
+        assert_eq!(
+            parse(strings(&[
+                "credential-recovery",
+                "cra_1",
+                "--as",
+                "coder:app",
+            ])),
+            Ok(Command::CredentialRecovery {
+                identity: Identity::Role("coder:app".to_owned()),
+                activation_id: "cra_1".to_owned(),
+            })
+        );
+
+        assert_eq!(
+            parse(strings(&["credential-recovery", "--as", "coder:app"])),
+            Err("usage: tightbeam credential-recovery <activationId>".to_owned())
         );
     }
 

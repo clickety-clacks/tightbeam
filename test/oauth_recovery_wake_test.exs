@@ -213,6 +213,7 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
 
     assert %{
              state: "complete",
+             aggregate: "credential_recovery_complete",
              targets: [
                %{session_key: first, state: "handled", resolution: "handled"},
                %{session_key: second, state: "handled", resolution: "handled"}
@@ -730,9 +731,76 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
     assert {:ok, %{state: "handled"}} = CredentialRecovery.turn_terminal(ctx.db, seq)
 
     for activation_id <- [first.recovery.activation_id, second.recovery.activation_id] do
-      assert %{state: "complete", targets: [%{resolution: "handled"}]} =
+      assert %{
+               state: "complete",
+               aggregate: "credential_recovery_complete",
+               targets: [%{resolution: "handled"}]
+             } =
                CredentialRecovery.readback(ctx.db, activation_id)
     end
+  end
+
+  test "a terminal claimed carrier opens a fresh cycle for a later generation", ctx do
+    start_credentials!(ctx)
+    scheduler = start_real_scheduler!(ctx)
+    first = finish_fresh(onboard_handler(ctx, scheduler), "subscription")
+
+    assert {:ok, %{seq: first_seq, owner_lease: first_lease}} =
+             Ledger.claim_next(ctx.db, @main, "generation-one-carrier")
+
+    assert {:ok, second} =
+             CredentialRecovery.prepare(ctx.db, @host, :anthropic, :subscription)
+
+    for edge <- [:credential_installed, :metadata_committed] do
+      assert {:ok, :ok} = CredentialRecovery.edge(ctx.db, second.activation_id, edge)
+    end
+
+    assert {:ok, :ok} =
+             CredentialRecovery.edge(
+               ctx.db,
+               second.activation_id,
+               {:adapter_generations, %{"claude" => 2}}
+             )
+
+    assert {:ok, :ok} =
+             CredentialRecovery.edge(ctx.db, second.activation_id, :adapter_started)
+
+    assert {:ok, :ok} =
+             CredentialRecovery.mark_ready(ctx.db, second.activation_id, %{"claude" => 2})
+
+    assert {:ok, %{state: "recovering"}} =
+             CredentialRecovery.activation_ready(
+               ctx.db,
+               second.activation_id,
+               %{"claude" => 2}
+             )
+
+    assert :ok =
+             Ledger.finish(ctx.db, first_seq, "canceled", "carrier canceled after admission",
+               owner_lease: first_lease
+             )
+
+    assert {:ok, %{fire?: true, state: "pending"}} =
+             CredentialRecovery.turn_terminal(ctx.db, first_seq)
+
+    assert %{
+             state: "complete",
+             aggregate: "credential_recovery_incomplete",
+             targets: [%{resolution: "undeliverable"}]
+           } = CredentialRecovery.readback(ctx.db, first.recovery.activation_id)
+
+    assert %{
+             state: "recovering",
+             aggregate: "credential_recovery_in_progress",
+             targets: [%{resolution: "open", state: "pending", cycle: 2, attempt: 0}]
+           } = CredentialRecovery.readback(ctx.db, second.activation_id)
+
+    assert :ok = Wakes.fire_due(scheduler)
+
+    assert {:ok, %{seq: second_seq}} =
+             Ledger.claim_next(ctx.db, @main, "generation-two-carrier")
+
+    assert second_seq != first_seq
   end
 
   test "could-not-run carriers retry three times and then surface undeliverable", ctx do
@@ -781,7 +849,11 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
       end
     end)
 
-    assert %{state: "complete", targets: [%{resolution: "undeliverable", attempt: 3}]} =
+    assert %{
+             state: "complete",
+             aggregate: "credential_recovery_incomplete",
+             targets: [%{resolution: "undeliverable", attempt: 3}]
+           } =
              CredentialRecovery.readback(ctx.db, activation_id)
   end
 
@@ -799,6 +871,51 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
 
     assert %{state: "complete", targets: [%{resolution: "undeliverable", state: "undeliverable"}]} =
              CredentialRecovery.readback(ctx.db, activation_id)
+  end
+
+  test "boot replay advances a proven adapter-started activation and fails an unproven edge",
+       ctx do
+    assert {:ok, interrupted} =
+             CredentialRecovery.prepare(ctx.db, @host, :anthropic, :subscription)
+
+    for edge <- [:credential_installed, :metadata_committed] do
+      assert {:ok, :ok} = CredentialRecovery.edge(ctx.db, interrupted.activation_id, edge)
+    end
+
+    assert :ok = CredentialRecovery.recover(ctx.db)
+
+    assert %{state: "failed", failure: failure} =
+             CredentialRecovery.readback(ctx.db, interrupted.activation_id)
+
+    assert failure =~ "credential_activation_interrupted"
+    assert failure =~ "metadata_committed"
+
+    assert {:ok, replayed} =
+             CredentialRecovery.prepare(ctx.db, @host, :anthropic, :subscription)
+
+    for edge <- [:credential_installed, :metadata_committed] do
+      assert {:ok, :ok} = CredentialRecovery.edge(ctx.db, replayed.activation_id, edge)
+    end
+
+    assert {:ok, :ok} =
+             CredentialRecovery.edge(
+               ctx.db,
+               replayed.activation_id,
+               {:adapter_generations, %{"claude" => 7}}
+             )
+
+    assert {:ok, :ok} =
+             CredentialRecovery.edge(ctx.db, replayed.activation_id, :adapter_started)
+
+    assert :ok = CredentialRecovery.recover(ctx.db)
+
+    assert %{
+             state: "recovering",
+             aggregate: "credential_recovery_in_progress",
+             targets: [%{resolution: "open", attempt_state: "materialized"}]
+           } = CredentialRecovery.readback(ctx.db, replayed.activation_id)
+
+    assert_wake_count(ctx.db, 1)
   end
 
   test "retirement before delivery durably dispositions the exact target", ctx do

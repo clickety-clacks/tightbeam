@@ -560,6 +560,15 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             vec![],
             vec![string_field("workItemId", work_item_id)],
         )),
+        Command::CredentialRecovery {
+            identity,
+            activation_id,
+        } => Ok(request(
+            identity,
+            "credential-recovery",
+            vec![],
+            vec![string_field("activationId", activation_id)],
+        )),
         Command::WorkItemTrace {
             identity,
             work_item_id,
@@ -1578,6 +1587,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::RepairAssignment { identity, .. }
         | Command::WorkItemCreate { identity, .. }
         | Command::WorkItemGet { identity, .. }
+        | Command::CredentialRecovery { identity, .. }
         | Command::WorkItemTrace { identity, .. }
         | Command::Attend { identity, .. }
         | Command::Transcript { identity, .. }
@@ -2497,6 +2507,10 @@ mod tests {
         assert_eq!(
             body(&["work-item-get", "wi_1", "--as-user", "flynn"]),
             r#"{"asUser":"flynn","verb":"work-item-get","params":{"workItemId":"wi_1"}}"#
+        );
+        assert_eq!(
+            body(&["credential-recovery", "cra_1", "--as", "coder:app"]),
+            r#"{"as":"coder:app","verb":"credential-recovery","params":{"activationId":"cra_1"}}"#
         );
         assert_eq!(
             body(&["work-item-trace", "wi_1", "--as-user", "flynn"]),

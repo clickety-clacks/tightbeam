@@ -4517,11 +4517,26 @@ defmodule Tightbeam.Gateway do
     if targets == [] do
       :forbidden
     else
+      membership_counts = targets |> Enum.map(& &1.resolution) |> Enum.frequencies()
+
+      aggregate =
+        cond do
+          Map.get(membership_counts, "undeliverable", 0) > 0 ->
+            "credential_recovery_incomplete"
+
+          Enum.all?(targets, &(&1.resolution != "open")) ->
+            "credential_recovery_complete"
+
+          true ->
+            "credential_recovery_in_progress"
+        end
+
       {:ok,
        %{
          readback
          | targets: targets,
-           membership_counts: targets |> Enum.map(& &1.resolution) |> Enum.frequencies()
+           aggregate: aggregate,
+           membership_counts: membership_counts
        }}
     end
   end
