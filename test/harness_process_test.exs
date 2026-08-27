@@ -1154,13 +1154,17 @@ defmodule Tightbeam.HarnessProcessTest do
     assert eventually(fn -> match?({^port, _}, {port, %{state: "running"}}) end)
 
     {output, exit} =
-      System.cmd(@helper, [
-        "harness-group",
-        Integer.to_string(row.process_group_id),
-        row.identity_path,
-        "boot-that-ended",
-        row.launch_id
-      ], stderr_to_stdout: true)
+      System.cmd(
+        @helper,
+        [
+          "harness-group",
+          Integer.to_string(row.process_group_id),
+          row.identity_path,
+          "boot-that-ended",
+          row.launch_id
+        ],
+        stderr_to_stdout: true
+      )
 
     assert exit != 0
     assert output =~ "boot identity"
@@ -1170,7 +1174,10 @@ defmodule Tightbeam.HarnessProcessTest do
 
   test "harness-group run from inside the recorded group does not hang the caller", ctx do
     launch_id = "same-group-#{System.unique_integer([:positive, :monotonic])}"
-    identity_path = Path.join([ctx.test_dir, "helper", "harness-processes", launch_id <> ".identity"])
+
+    identity_path =
+      Path.join([ctx.test_dir, "helper", "harness-processes", launch_id <> ".identity"])
+
     File.mkdir_p!(Path.dirname(identity_path))
 
     helper = Path.join(ctx.test_dir, "same-group-inner.sh")
@@ -1199,7 +1206,8 @@ defmodule Tightbeam.HarnessProcessTest do
       end)
 
     assert {:ok, {_output, _exit}} =
-             Task.yield(task, 20_000) || flunk("same-group harness-group timed out — caller frozen")
+             Task.yield(task, 20_000) ||
+               flunk("same-group harness-group timed out — caller frozen")
   end
 
   defp eventually(fun, attempts \\ 200)
