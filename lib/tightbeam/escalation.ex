@@ -416,23 +416,20 @@ defmodule Tightbeam.Escalation do
   end
 
   @doc """
-  Answer one open agent question, as the principal it was asked of.
+  Answer one open agent question.
 
   An ANSWER, not a ruling: it authorizes nothing, spends nothing, unparks
   nothing, and fires no condition fact. It writes the text, names who wrote it,
   and wakes the asker — which is the whole of what the substrate owes here.
 
-  Who may answer: the asked SESSION itself, or the accountable owner that
-  session resolved to when the question was filed. Nobody else — an admin
-  answering a question addressed to someone else would be the substrate letting
-  authority stand in for the mind that was actually asked.
+  Any authenticated agent session may answer when it holds the request's exact
+  id. The asked session remains the preferred responder, not an authorization
+  gate. A user principal keeps the existing asked-owner boundary.
 
-  Authority is checked BEFORE anything about the request is revealed: a
-  nonexistent id, an existing non-agent id, and an existing agent question
-  addressed to someone else are ONE identical refusal (Sol xhigh review,
-  finding 4). Distinguishing them would let an unauthorized caller probe
-  request ids for existence and kind — the same existence-oracle risk
-  `page/3`'s cursor resolution refuses (seam ④).
+  Kind and principal standing are checked before a non-agent row is revealed.
+  A nonexistent id, a non-agent id, and an agent question outside a user's
+  existing expecter boundary are one identical refusal. An authenticated agent
+  session holding the complete agent-request id has response standing.
   """
   @spec answer(DB.server(), map()) :: map()
   def answer(db, call) do
@@ -446,6 +443,16 @@ defmodule Tightbeam.Escalation do
             not (is_binary(text) and String.trim(text) != "") ->
               error("invalid", "an answer requires text")
 
+            request.status == "answered" and request.answered_by == principal_id(call) and
+                request.answer == String.trim(text) ->
+              {:ok, request} =
+                DB.transaction(db, fn txn ->
+                  Publisher.maybe_observed_accepted_in_txn(txn, call)
+                  request
+                end)
+
+              request
+
             request.status != "open" ->
               error("not_open", "decision request is not open")
 
@@ -454,7 +461,7 @@ defmodule Tightbeam.Escalation do
                 db,
                 Map.put(request, :firehose_call, call),
                 String.trim(text),
-                answered_by(call)
+                principal_id(call)
               )
           end
         else
@@ -470,9 +477,7 @@ defmodule Tightbeam.Escalation do
   Return one open agent question because the reader lacks enough information.
 
   A return is a terminal, reasoned disposition of the exact immutable request,
-  not an answer or ruling. The same principal boundary as `answer/2` applies:
-  the session resolved when the question was filed, or its stamped accountable
-  owner. Unauthorized, nonexistent, and non-agent ids refuse identically.
+  not an answer or ruling. The same principal boundary as `answer/2` applies.
   """
   @spec return_request(DB.server(), map()) :: map()
   def return_request(db, call) do
@@ -482,7 +487,7 @@ defmodule Tightbeam.Escalation do
     case get_raw(db, request_id) do
       %{kind: "agent"} = request ->
         if decision_reader?(call, request) do
-          by = reader_by(call)
+          by = principal_id(call)
 
           case trimmed_reason(reason) do
             {:ok, text} ->
@@ -633,7 +638,15 @@ defmodule Tightbeam.Escalation do
           Publisher.maybe_accepted_in_txn(txn, request.firehose_call, answered)
           answered
         else
-          error("not_open", "decision request is not open")
+          current = request_in_txn(txn, request.id)
+
+          if current.status == "answered" and current.answered_by == answered_by and
+               current.answer == text do
+            Publisher.maybe_observed_accepted_in_txn(txn, request.firehose_call)
+            current
+          else
+            error("not_open", "decision request is not open")
+          end
         end
       end)
 
@@ -796,19 +809,19 @@ defmodule Tightbeam.Escalation do
     end
   end
 
-  defp decision_reader?(%{principal: {:session, key}}, request),
-    do: key == request.expecter_session_key
+  defp decision_reader?(%{principal: {:session, _key}}, _request), do: true
 
   defp decision_reader?(%{principal: {:user, user_id}}, request),
     do: user_id == request.expecter_user_id
 
   defp decision_reader?(_call, _request), do: false
 
-  defp reader_by(%{principal: {:session, key}}), do: "session:" <> key
-  defp reader_by(%{principal: {:user, user_id}}), do: "user:" <> user_id
-
-  defp answered_by(%{principal: {:session, key}}), do: "session:" <> key
-  defp answered_by(%{principal: {:user, user_id}}), do: "user:" <> user_id
+  @doc "Canonical authenticated responder id for decision-request audit fields."
+  @spec principal_id(map() | {:session, String.t()} | {:user, String.t()}) :: String.t() | nil
+  def principal_id(%{principal: principal}), do: principal_id(principal)
+  def principal_id({:session, key}), do: "session:" <> key
+  def principal_id({:user, user_id}), do: "user:" <> user_id
+  def principal_id(_principal), do: nil
 
   defp ask_notification(request_id, input) do
     about = if input.assignment_id, do: "\nAbout: #{input.assignment_id}", else: ""

@@ -1066,29 +1066,57 @@ defmodule Tightbeam.CliIntegrationTest do
     end
   end
 
-  test "real CLI lists decisions and rules effort continue and dismiss", ctx do
+  test "real CLI exact-reads and rules an effort request from a non-expecter session", ctx do
     continue_request = open_effort_request(ctx, "continue")
+    worker_dir = session_workdir!(ctx, ctx.worker)
 
     {requests, 0} =
       System.cmd(ctx.binary, ["decision-requests", "--status", "open"],
-        cd: ctx.workdir,
+        cd: worker_dir,
         stderr_to_stdout: true
       )
 
-    assert requests =~ continue_request
+    refute requests =~ continue_request
 
     assert_receive {:cli_call,
                     %{
                       verb: "decision-requests",
-                      principal: {:session, "cli-holder"},
+                      principal: {:session, "cli-worker"},
                       params: %{status: "open"}
                     }}
+
+    {exact, 0} =
+      System.cmd(
+        ctx.binary,
+        ["decision-request", "--request", continue_request],
+        cd: worker_dir,
+        stderr_to_stdout: true
+      )
+
+    exact = JSON.decode!(exact)["decisionRequest"]
+    assert exact["id"] == continue_request
+    assert exact["kind"] == "effort"
+    assert exact["question"] == "Continue or dismiss?"
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "decision-request",
+                      principal: {:session, "cli-worker"},
+                      params: %{request: ^continue_request}
+                    }}
+
+    {:ok, [[generations_before]]} =
+      DB.query(
+        ctx.db,
+        "SELECT COUNT(*) FROM effort_checkin_generations WHERE assignmentId = (SELECT assignmentId FROM decision_requests WHERE id = ?1)",
+        [continue_request]
+      )
 
     {continued, 0} =
       System.cmd(
         ctx.binary,
         ["effort-rule", "--request", continue_request, "--action", "continue"],
-        cd: ctx.workdir,
+        cd: worker_dir,
         stderr_to_stdout: true
       )
 
@@ -1097,9 +1125,49 @@ defmodule Tightbeam.CliIntegrationTest do
     assert_receive {:cli_call,
                     %{
                       verb: "effort-rule",
-                      principal: {:session, "cli-holder"},
+                      principal: {:session, "cli-worker"},
                       params: %{request: ^continue_request, action: "continue"}
                     }}
+
+    {:ok, [["session:cli-worker"]]} =
+      DB.query(ctx.db, "SELECT ruledBy FROM decision_requests WHERE id = ?1", [continue_request])
+
+    {:ok, [[generations_after]]} =
+      DB.query(
+        ctx.db,
+        "SELECT COUNT(*) FROM effort_checkin_generations WHERE assignmentId = (SELECT assignmentId FROM decision_requests WHERE id = ?1)",
+        [continue_request]
+      )
+
+    assert generations_after == generations_before + 1
+
+    {retried, 0} =
+      System.cmd(
+        ctx.binary,
+        ["effort-rule", "--request", continue_request, "--action", "continue"],
+        cd: worker_dir,
+        stderr_to_stdout: true
+      )
+
+    assert retried =~ "session:cli-worker"
+
+    {:ok, [[^generations_after]]} =
+      DB.query(
+        ctx.db,
+        "SELECT COUNT(*) FROM effort_checkin_generations WHERE assignmentId = (SELECT assignmentId FROM decision_requests WHERE id = ?1)",
+        [continue_request]
+      )
+
+    {lost, status} =
+      System.cmd(
+        ctx.binary,
+        ["effort-rule", "--request", continue_request, "--action", "continue"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert status != 0
+    assert lost =~ "not_open"
 
     dismiss_request = open_effort_request(ctx, "dismiss")
 

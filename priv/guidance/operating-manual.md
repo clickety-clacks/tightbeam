@@ -101,7 +101,11 @@ Put the question to the principal who can answer it, and get an id back:
 
     tightbeam ask --role owner --question "ship behind a flag, or block on the migration?"
 
-Read the answer with `tightbeam decision-requests` or `tightbeam decision-request --request <id>`.
+Use `tightbeam decision-requests` for your narrow queue. Use
+`tightbeam decision-request --request <complete-id>` to inspect one agent question or effort
+request whose complete id you hold. Treat the named expecter as the preferred responder, not an
+authorization gate. Reading a request is not an instruction to respond. Answer, return, continue,
+or dismiss it only when your own judgment says you should.
 
 THE QUESTION HOLDS NOTHING. Filing it does not pause your assignment, your turn, or your
 obligations — nothing in tightbeam blocks on an open question, by design. You still owe what
@@ -116,7 +120,7 @@ act for you to move on:
 
     tightbeam withdraw --request <id> --reason "worked it out from the spec"
 
-Answer a question that was put to you — and only you, or your owner, can:
+Answer a question when you hold its complete id and your judgment supplies the answer:
 
     tightbeam answer --request <id> --answer "behind a flag; the migration lands next week"
 
