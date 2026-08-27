@@ -1853,9 +1853,10 @@ defmodule FeatureSmoke do
   end
 
   # --- effort-without-effect: durable parent check-in and reassignment ----------
-  # Run the smoke gateway with TIGHTBEAM_EFFORT_CHECKIN_HORIZON_MS=250 (or another
-  # short value). The child is never prompted by this probe; its unavailable/idle
-  # workdir is adjudicated only by the opening user.
+  # The production rail now prods and escalates through ordinary session powers; it
+  # no longer files an effort decision request itself. This isolated smoke therefore
+  # arms that one request fixture directly, then exercises every read and ruling through
+  # the real gateway with real session credentials.
   defp check_effort_without_effect(state) do
     u = unique()
 
@@ -1892,19 +1893,54 @@ defmodule FeatureSmoke do
       })
 
     first_id = first["id"] || first["assignmentId"]
-    request1 = await_effort_request!(parent_state, first_id, nil)
+    request1 = arm_effort_request!(state, first_id, parent_key)
     request1_id = request1["id"]
 
-    continued =
-      ok!(parent_state, "effort-rule", %{"request" => request1_id, "action" => "continue"})
+    delegate_role = "effort-delegate-#{u}"
+    post(state, "role-create", %{"name" => delegate_role})
+    ok!(state, "role-bind", %{"name" => delegate_role, "sessionKey" => first_holder_key})
+
+    delegate_state =
+      %{state | token: session_token(state, first_holder_key)} |> Map.put(:as_session, true)
+
+    exact_before = ok!(delegate_state, "decision-request", %{"request" => request1_id})
+    exact_before = exact_before["decision_request"] || exact_before["decisionRequest"]
 
     assert(
       state,
-      continued["decision"] == "continue",
-      "effort-rule continue did not rule request: #{inspect(continued)}"
+      exact_before["kind"] == "effort" and
+        (exact_before["assignment_id"] || exact_before["assignmentId"]) == first_id and
+        (exact_before["expecter_session_key"] || exact_before["expecterSessionKey"]) == parent_key,
+      "delegate exact-read lost effort request attribution: #{inspect(exact_before)}"
     )
 
-    request2 = await_effort_request!(parent_state, first_id, request1_id)
+    continued =
+      ok!(delegate_state, "effort-rule", %{"request" => request1_id, "action" => "continue"})
+
+    delegate_actor = "session:#{first_holder_key}"
+
+    assert(
+      state,
+      continued["decision"] == "continue" and
+        (continued["ruled_by"] || continued["ruledBy"]) == delegate_actor,
+      "delegate effort-rule continue did not preserve ruler attribution: #{inspect(continued)}"
+    )
+
+    exact_after = ok!(delegate_state, "decision-request", %{"request" => request1_id})
+    exact_after = exact_after["decision_request"] || exact_after["decisionRequest"]
+
+    assert(
+      state,
+      exact_after["status"] == "ruled" and exact_after["decision"] == "continue" and
+        (exact_after["ruled_by"] || exact_after["ruledBy"]) == delegate_actor and
+        (exact_after["expecter_session_key"] || exact_after["expecterSessionKey"]) == parent_key and
+        (exact_after["assignment_id"] || exact_after["assignmentId"]) == first_id,
+      "delegate ruling changed request identity or attribution: #{inspect(exact_after)}"
+    )
+
+    assert_effort_rule_audit!(state, request1_id, delegate_role, delegate_actor)
+
+    request2 = arm_effort_request!(state, first_id, parent_key)
     request2_id = request2["id"]
 
     revoked = ok!(parent_state, "revoke-assignment", %{"assignmentId" => first_id})
@@ -1943,7 +1979,7 @@ defmodule FeatureSmoke do
     second_id = second["id"] || second["assignmentId"]
     assert(state, second_id != first_id, "effort smoke re-dispatch reused the old assignment")
 
-    replacement_request = await_effort_request!(parent_state, second_id, nil)
+    replacement_request = arm_effort_request!(state, second_id, parent_key)
 
     assert(
       state,
@@ -1958,43 +1994,70 @@ defmodule FeatureSmoke do
 
     pass(
       state,
-      "effort check-in: idle request → continue widens → fresh request → revoke supersedes → re-dispatch"
+      "effort check-in: non-expecter delegate exact-reads and rules with audit attribution → continue widens → fresh request → revoke supersedes → re-dispatch"
     )
   end
 
-  defp await_effort_request!(state, assignment_id, prior_id) do
-    deadline = System.monotonic_time(:millisecond) + 30_000
-    await_effort_request!(state, assignment_id, prior_id, deadline)
+  defp assert_effort_rule_audit!(state, request_id, role, actor) do
+    out =
+      sqlite(
+        state,
+        "SELECT origin || '|' || principal FROM events " <>
+          "WHERE kind='verb' AND verb='effort-rule' " <>
+          "AND instr(payload, #{sql_quote("id: #{inspect(request_id)}")}) > 0 " <>
+          "AND instr(payload, #{sql_quote("ruled_by: #{inspect(actor)}")}) > 0"
+      )
+
+    assert(
+      state,
+      out == "agent:#{role}|#{actor}",
+      "delegate effort-rule audit attribution mismatch: #{inspect(out)}"
+    )
   end
 
-  defp await_effort_request!(state, assignment_id, prior_id, deadline) do
-    requests = ok!(state, "decision-requests", %{})
+  defp arm_effort_request!(state, assignment_id, expecter_session_key) do
+    request_id = "dr_smoke_#{unique()}"
+    wake_id = "w_smoke_#{unique()}"
+    now = System.system_time(:millisecond)
+    deadline = now + 60_000
 
-    request =
-      (requests["decision_requests"] || requests["decisionRequests"] || requests)
-      |> List.wrap()
-      |> Enum.find(fn candidate ->
-        candidate["kind"] == "effort" and
-          (candidate["assignment_id"] || candidate["assignmentId"]) == assignment_id and
-          candidate["id"] != prior_id
-      end)
+    out =
+      sqlite(state, """
+      PRAGMA busy_timeout=5000;
+      BEGIN IMMEDIATE;
+      INSERT INTO wakes
+        (wakeId, sessionKey, origin, consumer, dueAt, state, createdAt, assignmentId)
+      VALUES
+        (#{sql_quote(wake_id)}, #{sql_quote(expecter_session_key)}, 'process:tightbeam',
+         'effort_deadline', #{deadline}, 'pending', #{now}, #{sql_quote(assignment_id)});
+      INSERT INTO decision_requests
+        (id, kind, raiserId, ownerUserId, assignmentId, expecterSessionKey, lineageRung,
+         effortGeneration, deadlineWakeId, raisedAt, deadlineAt, question, options, context,
+         status)
+      SELECT
+        #{sql_quote(request_id)}, 'effort', 'process:tightbeam', #{sql_quote(@owner)},
+        #{sql_quote(assignment_id)}, #{sql_quote(expecter_session_key)}, 1, MAX(generation),
+        #{sql_quote(wake_id)}, #{now}, #{deadline}, 'Continue or dismiss?',
+        '["wake","continue","dismiss"]', '{"actions":["wake","continue","dismiss"]}',
+        'open'
+      FROM effort_checkin_generations
+      WHERE assignmentId=#{sql_quote(assignment_id)};
+      SELECT changes();
+      COMMIT;
+      """)
 
-    cond do
-      is_map(request) ->
-        request
+    assert(
+      state,
+      out |> String.split("\n") |> List.last() == "1",
+      "effort request fixture did not arm exactly one request: #{inspect(out)}"
+    )
 
-      System.monotonic_time(:millisecond) >= deadline ->
-        raise(
-          "effort smoke timed out; run the gateway with a short " <>
-            "TIGHTBEAM_EFFORT_CHECKIN_HORIZON_MS (2500 works; the deadline " <>
-            "shares this config, so 250 rung-rotates requests away from the " <>
-            "parent before it can rule)"
-        )
-
-      true ->
-        Process.sleep(100)
-        await_effort_request!(state, assignment_id, prior_id, deadline)
-    end
+    %{
+      "id" => request_id,
+      "assignmentId" => assignment_id,
+      "expecterSessionKey" => expecter_session_key,
+      "status" => "open"
+    }
   end
 
   # --- toplines: the board must reflect the work THIS run just did -----------
