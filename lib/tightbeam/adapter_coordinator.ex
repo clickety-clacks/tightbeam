@@ -139,7 +139,7 @@ defmodule Tightbeam.AdapterCoordinator do
   @spec ready?(GenServer.server(), adapter_key()) :: boolean()
   def ready?(server \\ __MODULE__, key), do: GenServer.call(server, {:ready?, key})
 
-  @doc "The exact coordinator publication stamp for one checked-out adapter generation."
+  @doc "The exact completed-boot publication stamp for one checked-out adapter generation."
   @spec generation_publication(GenServer.server(), adapter_key(), pos_integer()) ::
           {:ok, non_neg_integer()} | {:error, :generation_not_published}
   def generation_publication(server \\ __MODULE__, key, generation) do
@@ -233,7 +233,7 @@ defmodule Tightbeam.AdapterCoordinator do
   def handle_call({:generation_publication, key, generation}, _from, state) do
     reply =
       case state.adapters[key] do
-        %{generation: ^generation, published_at: published_at}
+        %{generation: ^generation, ready: true, published_at: published_at}
         when is_integer(published_at) ->
           {:ok, published_at}
 
@@ -657,7 +657,20 @@ defmodule Tightbeam.AdapterCoordinator do
   def handle_info({:adapter_ready, key, pid}, state) do
     case state.adapters[key] do
       %{pid: ^pid} = entry when is_pid(pid) ->
-        entry = %{entry | failures: 0, circuit: :closed, ready: true, last_failure: nil}
+        published_at =
+          if entry.ready and is_integer(entry.published_at),
+            do: entry.published_at,
+            else: System.system_time(:millisecond)
+
+        entry = %{
+          entry
+          | failures: 0,
+            circuit: :closed,
+            ready: true,
+            published_at: published_at,
+            last_failure: nil
+        }
+
         state = %{state | ready_refs: put_ready_ref(state.ready_refs, entry.monitor)}
         {:noreply, %{state | adapters: Map.put(state.adapters, key, entry)}}
 
@@ -756,7 +769,7 @@ defmodule Tightbeam.AdapterCoordinator do
           | pid: pid,
             monitor: ref,
             generation: generation,
-            published_at: System.system_time(:millisecond),
+            published_at: nil,
             timer: nil,
             ready: false,
             context: normalize_context(adapter_context)

@@ -153,10 +153,8 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     key = {:claude, "default", "testhost"}
     assert {:ok, adapter, generation} = AdapterCoordinator.adapter_for(coordinator, key)
 
-    assert {:ok, published_at} =
+    assert {:error, :generation_not_published} =
              AdapterCoordinator.generation_publication(coordinator, key, generation)
-
-    assert is_integer(published_at)
 
     assert {:error, :generation_not_published} =
              AdapterCoordinator.generation_publication(coordinator, key, generation + 1)
@@ -786,6 +784,9 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
     await_ready!(coordinator, key)
 
+    assert {:ok, initial_published_at} =
+             AdapterCoordinator.generation_publication(coordinator, key, 1)
+
     # Wind readiness back so the credit is observable, then replay the ready
     # message under a FOREIGN pid — the shape of an instance that announced
     # readiness, died, and had a replacement installed before the coordinator
@@ -803,12 +804,20 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     refute state.adapters[key].ready, "a foreign instance's ready credited this entry"
     assert MapSet.size(state.ready_refs) == 0
 
+    assert {:error, :generation_not_published} =
+             AdapterCoordinator.generation_publication(coordinator, key, 1)
+
     # The instance the entry DOES point at is credited, and its monitor ref is
     # what gets remembered — that ref is the identity a later :DOWN asks about.
     send(coordinator, {:adapter_ready, key, adapter})
     state = :sys.get_state(coordinator)
     assert state.adapters[key].ready
     assert MapSet.member?(state.ready_refs, state.adapters[key].monitor)
+
+    assert {:ok, published_at} =
+             AdapterCoordinator.generation_publication(coordinator, key, 1)
+
+    assert published_at >= initial_published_at
   end
 
   test "a ready adapter's death is told even when a replacement already took the entry over",
