@@ -10,6 +10,19 @@ enforced across agents and sessions, not left to each model’s inference.
 
 You RUN tightbeam; you do not depend on it. There is no Hex package.
 
+## External-agent operation skill
+
+Use the [current-line CLI edition](priv/skills/tightbeam-cli/SKILL.md) when an external
+agent operates an existing Tightbeam organization through the command line.
+
+Copy the whole `tightbeam-cli` directory to `.codex/skills/tightbeam-cli/` or
+`.claude/skills/tightbeam-cli/` in the external agent's project. Keep the directory name
+and `SKILL.md` filename unchanged. Start a fresh agent session after the copy so the agent
+rediscovers the skill metadata.
+
+The skill does not install Tightbeam, create a session, supply a credential, operate a
+kungfu bundle, or change a Tightbeam identity. Provision those prerequisites separately.
+
 ## Two ways to install
 
 **From a release package** (below) — a per-platform npm tarball carrying the
