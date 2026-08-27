@@ -34,6 +34,8 @@ defmodule Tightbeam.SchemaShapeTest do
 
   alias Tightbeam.{DB, Model, Org, Schema}
 
+  @shape "coordination-fabric-v1-phase1-v6"
+
   setup do
     name = :"schema_shape_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: name})
@@ -51,6 +53,28 @@ defmodule Tightbeam.SchemaShapeTest do
 
     assert {:ok, [["coordination-fabric-v1-phase1-v6"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
+  end
+
+  test "the harness health foundation is additive and exact", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    assert table_columns(db, "harness_health_observations") ==
+             ~w(id correlationId harness host failureClass evidenceKind sessionKey assignmentId observedAt cause principal incidentId)
+
+    assert table_columns(db, "harness_health_incidents") ==
+             ~w(id harness host failureClass state openedAt openObservationId openedFactId resolvedAt resolutionObservationId resolvedFactId)
+
+    assert table_columns(db, "harness_health_members") == ~w(incidentId sessionKey)
+
+    assert table_columns(db, "harness_health_assignments") ==
+             ~w(incidentId assignmentId sessionKey)
+
+    assert table_columns(db, "turn_repair_attempts") ==
+             ~w(id repairKey sourceSeq attemptSeq assignmentId principal createdAt)
+
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+    assert :ok = Schema.ensure_all(db)
+    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM harness_health_incidents")
   end
 
   test "the shared liveness activation creates one exact additive shape", %{db: db} do

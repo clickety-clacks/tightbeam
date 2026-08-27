@@ -57,6 +57,7 @@ defmodule Tightbeam.GatewayTest do
     EventLog,
     EffortCheckin,
     Gateway,
+    HarnessHealth,
     Identity,
     Idempotency,
     LaneManager,
@@ -1153,6 +1154,137 @@ defmodule Tightbeam.GatewayTest do
       Enum.find(children, &match?({Tightbeam.Supervision, _}, &1))
 
     assert Keyword.fetch!(supervision_opts, :recover) == false
+  end
+
+  test "repair-assignment requires outcome reconciliation and appends one deduped rerun", ctx do
+    session = Org.get(ctx.db, "k1")
+
+    assert {:ok, []} =
+             DB.transaction(ctx.db, fn txn ->
+               DB.Txn.q(
+                 txn,
+                 """
+                 INSERT INTO assignments
+                   (id,subject,holderKey,openedByUser,openedAt,state,holderHarness,holderProvider)
+                 VALUES ('asg_runner_repair','continue work','k1','flynn',1,'open',?1,?2)
+                 """,
+                 [session.harness, session.provider]
+               )
+             end)
+
+    {:ok, source_seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: "k1",
+        message_id: "m-runner-repair",
+        origin: "agent:k1",
+        prompt: "continue work",
+        assignment_id: "asg_runner_repair"
+      })
+
+    {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test-lane")
+
+    :ok =
+      Ledger.finish(ctx.db, source_seq, "failed_unknown", "interrupted: outcome unknown",
+        owner_lease: turn.owner_lease
+      )
+
+    assert {:opened, incident} =
+             HarnessHealth.observe(ctx.db, %{
+               correlation_id: "gateway-repair-interrupted",
+               harness: session.harness,
+               host: session.host,
+               failure_class: "interrupted-outcome-unknown",
+               evidence_kind: "authoritative-provider",
+               session_key: "k1",
+               assignment_id: "asg_runner_repair",
+               observed_at: 10,
+               cause: "restart interrupted turn",
+               principal: "process:tightbeam"
+             })
+
+    lane = :"repair_lane_#{System.unique_integer([:positive])}"
+    {:ok, lane_pid} = LaneDoorbell.start_link({self(), lane})
+    on_exit(fn -> if Process.alive?(lane_pid), do: GenServer.stop(lane_pid) end)
+    handler = Gateway.handlers(gateway_config(ctx.catalog_base, ctx.db, 0))["repair-assignment"]
+
+    call = %{
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      lane_manager: lane,
+      params: %{
+        assignment_id: "asg_runner_repair",
+        action: "rerun",
+        idempotency_key: "repair-one"
+      }
+    }
+
+    assert %{ok: false, code: "outcome_reconciliation_required"} = handler.(call)
+
+    repaired = handler.(put_in(call, [:params, :outcome], "not-completed"))
+    assert repaired.ok
+    assert repaired.incidentId == incident.id
+    assert repaired.sourceTurnSeq == source_seq
+    assert_receive {:ensure_lane, "k1"}
+
+    duplicate = handler.(put_in(call, [:params, :outcome], "not-completed"))
+    assert duplicate.dedupe == "duplicate"
+
+    assert {:ok, [["open"]]} =
+             DB.query(ctx.db, "SELECT state FROM assignments WHERE id='asg_runner_repair'")
+
+    assert {:ok, [[^source_seq, "failed_unknown"], [attempt_seq, "queued"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT seq,status FROM turns WHERE assignmentId='asg_runner_repair' ORDER BY seq"
+             )
+
+    assert attempt_seq == repaired.attemptTurnSeq
+  end
+
+  test "an opener can relaunch a never-launched holder without revoking custody", ctx do
+    session = Org.get(ctx.db, "k1")
+
+    assert {:ok, []} =
+             DB.transaction(ctx.db, fn txn ->
+               DB.Txn.q(
+                 txn,
+                 """
+                 INSERT INTO assignments
+                   (id,subject,holderKey,openedByUser,openedAt,state,holderHarness,holderProvider)
+                 VALUES ('asg_never_launched','start the work','k1','flynn',2,'open',?1,?2)
+                 """,
+                 [session.harness, session.provider]
+               )
+             end)
+
+    lane = :"relaunch_lane_#{System.unique_integer([:positive])}"
+    {:ok, lane_pid} = LaneDoorbell.start_link({self(), lane})
+    on_exit(fn -> if Process.alive?(lane_pid), do: GenServer.stop(lane_pid) end)
+    handler = Gateway.handlers(gateway_config(ctx.catalog_base, ctx.db, 0))["repair-assignment"]
+
+    assert %{ok: true, action: "relaunch"} =
+             handler.(%{
+               origin: "user:flynn",
+               principal: {:user, "flynn"},
+               conn_registry: ctx.registry,
+               lane_manager: lane,
+               params: %{
+                 assignment_id: "asg_never_launched",
+                 action: "relaunch",
+                 idempotency_key: "launch-one"
+               }
+             })
+
+    assert_receive {:ensure_lane, "k1"}
+
+    assert {:ok, [["queued", "asg_never_launched"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT status,assignmentId FROM turns WHERE assignmentId='asg_never_launched'"
+             )
+
+    assert {:ok, [["open"]]} =
+             DB.query(ctx.db, "SELECT state FROM assignments WHERE id='asg_never_launched'")
   end
 
   # Hosts assimilated before the endpoint file existed, and hosts whose org token
@@ -8665,6 +8797,22 @@ defmodule Tightbeam.GatewayTest do
 
     assert lifecycle, "the :prompt turn failure must record a harness_turn_error"
     assert lifecycle.detail =~ "prompt"
+
+    assert HarnessHealth.active(ctx.db) == []
+
+    assert {:ok, [["auth-dead", "terminal-failure", "k1", cause]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT failureClass,evidenceKind,sessionKey,cause
+               FROM harness_health_observations
+               WHERE correlationId=?1
+               """,
+               ["harness-turn:#{turn.seq}:auth-dead"]
+             )
+
+    assert cause =~ "stage=prompt"
+    assert cause =~ "auth expired"
 
     # G3: the operator reads the human message/details as PROSE, never a raw inspected ACP
     # error map. The auth detail survives as text; the map's inspect markers (`=>`, `%{`) do

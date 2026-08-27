@@ -9,6 +9,7 @@ defmodule Tightbeam.SupervisionTest do
     DB,
     EventLog,
     Gateway,
+    HarnessHealth,
     Ledger,
     Org,
     Projection,
@@ -3050,6 +3051,111 @@ defmodule Tightbeam.SupervisionTest do
     assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
   end
 
+  test "a shared harness incident suppresses only affected holders and resolution re-arms them",
+       ctx do
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
+
+    healthy = session(ctx.db, "healthy", ctx.supervisor.session_key)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE sessions SET harness='codex', provider='openai' WHERE sessionKey=?1",
+        [
+          healthy.session_key
+        ]
+      )
+
+    assignment(ctx.db, "asg_healthy", healthy.session_key, "healthy work", 2)
+    insert_entitlement!(ctx.db, "asg_healthy", generation: 1, due_at: 0)
+    open_rate_limit_incident!(ctx)
+
+    assert {:no_match, :harness_unavailable, %{id: "asg_1"}} =
+             Supervision.prod_production_matches?(ctx.db, ctx.holder.session_key, nil)
+
+    assert :harness_unavailable =
+             Supervision.evaluate(ctx.db, ctx.handlers, 3, ctx.holder.session_key, nil)
+
+    affected_terminal = terminal!(ctx.db, ctx.holder.session_key)
+    healthy_terminal = terminal!(ctx.db, healthy.session_key)
+
+    assert {:no_match, :harness_unavailable, %{id: "asg_1"}} =
+             Supervision.prod_production_matches?(
+               ctx.db,
+               ctx.holder.session_key,
+               affected_terminal
+             )
+
+    assert :harness_unavailable =
+             Supervision.evaluate(
+               ctx.db,
+               ctx.handlers,
+               3,
+               ctx.holder.session_key,
+               affected_terminal
+             )
+
+    assert Supervision.watermark(ctx.db, ctx.holder.session_key) == nil
+
+    assert %{attemptCount: 0, prodCount: 0, supervisionState: "armed"} =
+             Supervision.prod_state(ctx.db, "asg_1")
+
+    assert Wakes.list_pending(ctx.db) == []
+
+    assert {:match, %{id: "asg_healthy"}} =
+             Supervision.prod_production_matches?(
+               ctx.db,
+               healthy.session_key,
+               healthy_terminal
+             )
+
+    assert {:prodded, 1} =
+             Supervision.evaluate(
+               ctx.db,
+               ctx.handlers,
+               3,
+               healthy.session_key,
+               healthy_terminal
+             )
+
+    resolve_rate_limit_incident!(ctx, affected_terminal)
+
+    assert {:match, %{id: "asg_1"}} =
+             Supervision.prod_production_matches?(
+               ctx.db,
+               ctx.holder.session_key,
+               affected_terminal
+             )
+
+    assert {:prodded, 1} =
+             Supervision.evaluate(
+               ctx.db,
+               ctx.handlers,
+               3,
+               ctx.holder.session_key,
+               affected_terminal
+             )
+  end
+
+  test "a harness incident discards a claimed branch before dispatch", ctx do
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
+    transient = Map.put(ctx.handlers, "wake", fn _ -> %{code: "server_error"} end)
+    terminal = terminal!(ctx.db, ctx.holder.session_key)
+
+    assert {:refused, "server_error"} =
+             Supervision.evaluate(ctx.db, transient, 3, ctx.holder.session_key, terminal)
+
+    assert %{pendingBranch: "prod"} = Supervision.watermark(ctx.db, ctx.holder.session_key)
+    open_rate_limit_incident!(ctx)
+
+    assert :harness_unavailable =
+             Supervision.evaluate(ctx.db, ctx.handlers, 3, ctx.holder.session_key, terminal)
+
+    assert %{pendingBranch: nil} = Supervision.watermark(ctx.db, ctx.holder.session_key)
+    assert %{prodCount: 0} = Supervision.prod_state(ctx.db, "asg_1")
+    assert Wakes.list_pending(ctx.db) == []
+  end
+
   defp cancel_wake!(db, wake) do
     {requester, principal, session_key} = cancellation_requester(wake.origin)
 
@@ -3364,6 +3470,50 @@ defmodule Tightbeam.SupervisionTest do
         db,
         &ConditionFacts.file_in_txn(&1, %{kind: kind, scope: scope, origin: "session:supervisor"})
       )
+
+    :ok
+  end
+
+  defp open_rate_limit_incident!(ctx) do
+    first = %{
+      harness: "claude",
+      host: "eezo",
+      failure_class: "rate-limit-dead",
+      evidence_kind: "terminal-failure",
+      session_key: ctx.holder.session_key,
+      assignment_id: "asg_1",
+      observed_at: 100,
+      correlation_id: "supervision-rate-limit-holder",
+      cause: "terminal recovery-chain failure",
+      principal: "process:tightbeam"
+    }
+
+    second = %{
+      first
+      | session_key: ctx.supervisor.session_key,
+        assignment_id: nil,
+        observed_at: 101,
+        correlation_id: "supervision-rate-limit-supervisor"
+    }
+
+    assert {:pending, _} = HarnessHealth.observe(ctx.db, first)
+    assert {:opened, _} = HarnessHealth.observe(ctx.db, second)
+    :ok
+  end
+
+  defp resolve_rate_limit_incident!(ctx, terminal_seq) do
+    assert {:resolved, _} =
+             HarnessHealth.resolve(ctx.db, %{
+               harness: "claude",
+               host: "eezo",
+               failure_class: "rate-limit-dead",
+               session_key: ctx.holder.session_key,
+               assignment_id: "asg_1",
+               observed_at: 200,
+               correlation_id: "supervision-normal-turn-#{terminal_seq}",
+               cause: "normal turn delivered",
+               principal: "process:tightbeam"
+             })
 
     :ok
   end

@@ -25,6 +25,7 @@ defmodule Tightbeam.Supervision do
     Escalation,
     EventLog,
     Gateway,
+    HarnessHealth,
     Ledger,
     Org,
     RailEpisodes,
@@ -881,6 +882,7 @@ defmodule Tightbeam.Supervision do
           | :continuation
           | :idle
           | :blocked
+          | :harness_unavailable
           | :duplicate
           | :coalesced
           | :rebased
@@ -902,6 +904,11 @@ defmodule Tightbeam.Supervision do
       {:pending, result} ->
         result
 
+      {:cleared, :deferred} ->
+        if harness_unavailable?(db, session_key),
+          do: :harness_unavailable,
+          else: evaluate_terminal(db, handlers, n, session_key, terminal_seq, interval)
+
       {:cleared, _prior_result} ->
         evaluate_terminal(db, handlers, n, session_key, terminal_seq, interval)
     end
@@ -919,9 +926,12 @@ defmodule Tightbeam.Supervision do
     3. no running or queued turn for the holder: a pending turn means the
        strand is moving;
     4. the holder session is active, not retired;
-    5. a terminal exists at all — the sweep also asks about strands that
+    5. no standing harness-health incident for the holder's shared
+       `(harness, host)` process: the substrate suppresses this harness while
+       healthy harnesses continue;
+    6. a terminal exists at all — the sweep also asks about strands that
        have never ended a turn;
-    6. no standing `work-blocked` fact for the holder: an agent with
+    7. no standing `work-blocked` fact for the holder: an agent with
        authority decided this session is not to be treated as stalled, and
        the production simply does not match — the same absence-of-match as
        a session with no open assignment.
@@ -947,6 +957,7 @@ defmodule Tightbeam.Supervision do
         with :new <- dedupe(watermark(db, session_key), terminal_seq),
              :quiet <- turn_gate(db, session_key),
              :live <- holder_state(db, session_key),
+             :available <- harness_gate(db, session_key),
              :evaluable <- terminal_gate(terminal_seq),
              :unblocked <- block_gate(db, session_key) do
           {:match, assignment}
@@ -956,6 +967,7 @@ defmodule Tightbeam.Supervision do
           :moving -> {:no_match, :strand_moving}
           :retired -> {:no_match, :holder_retired}
           :no_terminal -> {:no_match, :no_terminal, assignment}
+          :unavailable -> {:no_match, :harness_unavailable, assignment}
           :blocked -> {:no_match, :work_blocked, assignment}
         end
     end
@@ -984,6 +996,30 @@ defmodule Tightbeam.Supervision do
 
   defp terminal_gate(nil), do: :no_terminal
   defp terminal_gate(_terminal_seq), do: :evaluable
+
+  defp harness_gate(db, session_key) do
+    if harness_unavailable?(db, session_key), do: :unavailable, else: :available
+  end
+
+  defp harness_unavailable?(db, session_key) do
+    case query(db, "SELECT harness, host FROM sessions WHERE sessionKey=?1", [session_key]) do
+      [[harness, host]] -> HarnessHealth.unavailable?(db, harness, host)
+      [] -> false
+    end
+  end
+
+  defp harness_unavailable_in_txn?(txn, session_key) do
+    case Txn.q(txn, "SELECT harness, host FROM sessions WHERE sessionKey=?1", [session_key]) do
+      [[harness, host]] ->
+        scope = ConditionFacts.harness_scope(harness, host)
+
+        ConditionFacts.standing_in_txn?(txn, "harness-auth-dead", scope) or
+          ConditionFacts.standing_in_txn?(txn, "harness-rate-limit-dead", scope)
+
+      [] ->
+        false
+    end
+  end
 
   defp block_gate(db, session_key) do
     if ConditionFacts.standing?(db, "work-blocked", session_key),
@@ -1066,6 +1102,9 @@ defmodule Tightbeam.Supervision do
 
       {:no_match, :strand_moving} ->
         :busy
+
+      {:no_match, :harness_unavailable, _assignment} ->
+        :harness_unavailable
 
       {:no_match, :holder_retired} ->
         # Act-then-watermark (matches the remedy branch): doorbells are an
@@ -1750,7 +1789,8 @@ defmodule Tightbeam.Supervision do
                 txn,
                 """
                 UPDATE supervision_entitlements
-                SET state='armed', claimClock=NULL, cause=?3,
+                SET state='armed', claimClock=NULL,
+                    cause=CASE WHEN ?3='harness_unavailable' THEN cause ELSE ?3 END,
                     principal='process:tightbeam'
                 WHERE assignmentId=?1 AND generation=?2 AND state='claimed'
                   AND lastAttemptGeneration=?2
@@ -1864,12 +1904,16 @@ defmodule Tightbeam.Supervision do
   # production-machine-v1 §The prod production) The prodder is two-phase —
   # the claim records a durable pending branch, and this drain dispatches it,
   # possibly sweeps or a restart later — so the branch re-reads the standing
-  # work-blocked fact it was matched without and DISCARDS itself if the
-  # holder is now blocked. Nothing is lost: the obligation still stands in
-  # working memory, and the production re-matches from current state after
-  # retraction.
+  # work-blocked and harness-health facts it was matched without. It DISCARDS
+  # itself if either now stands. Nothing is lost: the obligation still stands
+  # in working memory, and the production re-matches from current state after
+  # retraction or normal-turn recovery.
   defp dispatch_wake(db, handlers, pending, assignment, target) do
-    if ConditionFacts.standing?(db, "work-blocked", pending.sessionKey) do
+    suppressed? =
+      ConditionFacts.standing?(db, "work-blocked", pending.sessionKey) or
+        harness_unavailable?(db, pending.sessionKey)
+
+    if suppressed? do
       clear_pending(db, pending)
       {:cleared, nil}
     else
@@ -2808,6 +2852,9 @@ defmodule Tightbeam.Supervision do
 
   defp gate_reason_in_txn(txn, assignment_id, holder) do
     cond do
+      harness_unavailable_in_txn?(txn, holder) ->
+        "harness_unavailable"
+
       Txn.q(
         txn,
         "SELECT 1 FROM turns WHERE sessionKey=?1 AND status IN ('queued','running') LIMIT 1",
@@ -2905,6 +2952,7 @@ defmodule Tightbeam.Supervision do
       |> Assignments.list(%{state: "open"})
       |> Enum.map(& &1.holderKey)
       |> Enum.reject(&ConditionFacts.standing?(state.db, "work-blocked", &1))
+      |> Enum.reject(&harness_unavailable?(state.db, &1))
 
     {:ok, pending_rows} =
       DB.query(
@@ -2965,6 +3013,7 @@ defmodule Tightbeam.Supervision do
       |> Assignments.list(%{state: "open"})
       |> Enum.map(& &1.holderKey)
       |> Enum.reject(&ConditionFacts.standing?(state.db, "work-blocked", &1))
+      |> Enum.reject(&harness_unavailable?(state.db, &1))
 
     {:ok, pending_rows} =
       DB.query(

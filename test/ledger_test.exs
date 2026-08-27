@@ -109,6 +109,50 @@ defmodule Tightbeam.LedgerTest do
     assert t2.prompt == "next"
   end
 
+  test "explicit repair appends one deduplicated attempt without rewriting the terminal", %{
+    db: db
+  } do
+    :ok =
+      DB.execute(db, """
+      INSERT INTO assignments
+        (id,subject,holderKey,openedBySession,openedAt,state,holderHarness,holderProvider)
+      VALUES ('asg_repair','repair me','k1','k1',1,'open','claude','anthropic')
+      """)
+
+    {:ok, source_seq} =
+      Ledger.enqueue(db, %{
+        session_key: "k1",
+        message_id: "m-repair",
+        origin: "agent:test",
+        prompt: "continue the same work",
+        assignment_id: "asg_repair",
+        job_ref: "wi_repair"
+      })
+
+    {:ok, turn} = Ledger.claim_next(db, "k1", "lane")
+
+    :ok =
+      Ledger.finish(db, source_seq, "failed", "adapter unavailable",
+        owner_lease: turn.owner_lease
+      )
+
+    assert {:ok, {:appended, attempt_seq, attempt_id}} =
+             Ledger.repair_terminal(db, source_seq, "asg_repair", "repair-key", "agent:test")
+
+    assert {:ok, {:duplicate, ^attempt_seq, ^attempt_id}} =
+             Ledger.repair_terminal(db, source_seq, "asg_repair", "repair-key", "agent:test")
+
+    assert {:ok,
+            [
+              [^source_seq, "failed", "asg_repair", "continue the same work"],
+              [^attempt_seq, "queued", "asg_repair", "continue the same work"]
+            ]} =
+             DB.query(
+               db,
+               "SELECT seq,status,assignmentId,prompt FROM turns ORDER BY seq"
+             )
+  end
+
   # The stamp is the WHOLE identity, in fields. A context variant and a
   # reasoning level are different questions, and a turn's provenance has to be
   # able to tell `gpt-5.6-sol` at high from the same model at medium, and from

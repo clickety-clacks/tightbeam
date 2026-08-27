@@ -17,7 +17,7 @@ defmodule Tightbeam.Ledger do
   - No automatic retries: `failed_unknown` is terminal; nothing here re-sends.
   """
 
-  alias Tightbeam.{DB, TurnLifecycle}
+  alias Tightbeam.{DB, HarnessHealth, TurnLifecycle}
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.Publisher
 
@@ -75,6 +75,18 @@ defmodule Tightbeam.Ledger do
     ON turns (endedAt) WHERE endedAt IS NOT NULL AND publishedAt IS NULL;
   CREATE INDEX IF NOT EXISTS turns_job_ref ON turns (jobRef);
   CREATE INDEX IF NOT EXISTS turns_assignment_id ON turns (assignmentId);
+
+  CREATE TABLE IF NOT EXISTS turn_repair_attempts (
+    id            TEXT PRIMARY KEY,
+    repairKey     TEXT NOT NULL UNIQUE,
+    sourceSeq     INTEGER NOT NULL REFERENCES turns(seq),
+    attemptSeq    INTEGER NOT NULL UNIQUE REFERENCES turns(seq),
+    assignmentId TEXT NOT NULL REFERENCES assignments(id),
+    principal     TEXT NOT NULL CHECK(length(trim(principal)) > 0),
+    createdAt     INTEGER NOT NULL CHECK(createdAt >= 0)
+  );
+  CREATE INDEX IF NOT EXISTS turn_repair_source
+    ON turn_repair_attempts (sourceSeq, createdAt, id);
   """
 
   @spec ensure_schema(db()) :: :ok | {:error, term()}
@@ -200,6 +212,99 @@ defmodule Tightbeam.Ledger do
 
       {:error, e} ->
         {:error, e}
+    end
+  end
+
+  @doc """
+  Append one explicit retry attempt for a terminal failed turn.
+
+  The terminal source row remains immutable. The new queued row carries the
+  same prompt, assignment, work-item reference, and visible message identity;
+  `turn_repair_attempts` gives the attempt its own durable identity and makes a
+  caller-supplied repair key replay-safe.
+  """
+  @spec repair_terminal(db(), integer(), String.t(), String.t(), String.t()) ::
+          {:ok, {:appended | :duplicate, integer(), String.t()}} | {:error, atom() | term()}
+  def repair_terminal(db \\ Tightbeam.DB, source_seq, assignment_id, repair_key, principal) do
+    case DB.transaction(db, fn txn ->
+           case Txn.q(
+                  txn,
+                  "SELECT attemptSeq,id FROM turn_repair_attempts WHERE repairKey=?1",
+                  [repair_key]
+                ) do
+             [[attempt_seq, attempt_id]] ->
+               {:duplicate, attempt_seq, attempt_id}
+
+             [] ->
+               append_repair_attempt(txn, source_seq, assignment_id, repair_key, principal)
+           end
+         end) do
+      {:ok, {:error, reason}} -> {:error, reason}
+      {:ok, result} -> {:ok, result}
+      {:error, error} -> {:error, error}
+    end
+  end
+
+  defp append_repair_attempt(txn, source_seq, assignment_id, repair_key, principal) do
+    case Txn.q(
+           txn,
+           """
+           SELECT sessionKey,messageId,origin,prompt,roleRef,roleFallback,assignmentId,jobRef
+           FROM turns
+           WHERE seq=?1 AND assignmentId=?2 AND status IN ('failed','failed_unknown')
+           """,
+           [source_seq, assignment_id]
+         ) do
+      [
+        [
+          session_key,
+          message_id,
+          origin,
+          prompt,
+          role_ref,
+          role_fallback,
+          ^assignment_id,
+          job_ref
+        ]
+      ] ->
+        {:ok, attempt_seq} =
+          enqueue_in_txn(txn, %{
+            session_key: session_key,
+            message_id: message_id,
+            origin: origin,
+            prompt: prompt,
+            role_ref: role_ref,
+            role_fallback: role_fallback == 1,
+            assignment_id: assignment_id,
+            job_ref: job_ref,
+            request_ref: repair_key,
+            principal: principal
+          })
+
+        attempt_id = "tra_" <> Tightbeam.Id.uuid4()
+
+        Txn.q(
+          txn,
+          """
+          INSERT INTO turn_repair_attempts
+            (id,repairKey,sourceSeq,attemptSeq,assignmentId,principal,createdAt)
+          VALUES (?1,?2,?3,?4,?5,?6,?7)
+          """,
+          [
+            attempt_id,
+            repair_key,
+            source_seq,
+            attempt_seq,
+            assignment_id,
+            principal,
+            System.system_time(:millisecond)
+          ]
+        )
+
+        {:appended, attempt_seq, attempt_id}
+
+      [] ->
+        {:error, :terminal_turn_not_found}
     end
   end
 
@@ -523,7 +628,7 @@ defmodule Tightbeam.Ledger do
   def recover_running(db \\ Tightbeam.DB) do
     now = System.system_time(:millisecond)
 
-    {:ok, seqs} =
+    {:ok, {seqs, publications}} =
       DB.transaction(db, fn txn ->
         rows = Txn.q(txn, "SELECT seq FROM turns WHERE status = 'running'")
         seqs = Enum.map(rows, fn [seq] -> seq end)
@@ -549,9 +654,24 @@ defmodule Tightbeam.Ledger do
           )
         end)
 
+        publications =
+          Enum.map(seqs, fn seq ->
+            HarnessHealth.observe_terminal_in_txn(
+              txn,
+              seq,
+              "interrupted-outcome-unknown",
+              "boot recovery interrupted the running turn; outcome unknown",
+              "process:tightbeam"
+            )
+          end)
+
         Enum.each(seqs, &Publisher.turn_in_txn(txn, "turn.ended", &1))
-        seqs
+        {seqs, publications}
       end)
+
+    Enum.each(publications, fn publication ->
+      if is_function(publication, 0), do: publication.()
+    end)
 
     seqs
   end

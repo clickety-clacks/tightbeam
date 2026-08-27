@@ -180,7 +180,7 @@ defmodule Tightbeam.SessionLane do
       when not is_nil(reason) do
     EventLog.lifecycle(state.db, "turn_task_crash", state.session_key, inspect(reason))
 
-    finalize(state, seq, crash_outcome(reason),
+    finalize(state, seq, crash_outcome(reason, seq),
       cause: "turn-task-crash",
       principal: "process:tightbeam"
     )
@@ -196,10 +196,26 @@ defmodule Tightbeam.SessionLane do
 
   ## Internals
 
-  defp crash_outcome({%Placement.Refusal{} = refusal, _stacktrace}),
+  defp crash_outcome({%Placement.Refusal{} = refusal, _stacktrace}, _seq),
     do: {:error, refusal.message}
 
-  defp crash_outcome(_reason), do: {:error, :task_crash}
+  defp crash_outcome(reason, seq) do
+    record = fn txn ->
+      Tightbeam.HarnessHealth.observe_terminal_in_txn(
+        txn,
+        seq,
+        "task_crash",
+        "turn task crashed: #{inspect(reason, limit: 20)}",
+        "process:tightbeam"
+      )
+    end
+
+    committed = fn publication ->
+      if is_function(publication, 0), do: publication.()
+    end
+
+    {:error, %{reason: :task_crash, record_in_txn: record, after_commit: committed}}
+  end
 
   defp maybe_start(%{task_ref: ref} = state) when not is_nil(ref), do: state
 
@@ -260,6 +276,14 @@ defmodule Tightbeam.SessionLane do
 
     {terminal, error, publish, in_txn, after_commit} =
       case outcome do
+        {:ok, %{terminal_publish: fun, record_in_txn: action}}
+        when is_function(fun, 1) and is_function(action, 1) ->
+          after_commit = fn recorded ->
+            if is_function(recorded, 0), do: recorded.()
+          end
+
+          {"delivered", nil, fun, action, after_commit}
+
         {:ok, %{terminal_publish: fun}} when is_function(fun, 1) ->
           {"delivered", nil, fun, nil, nil}
 
@@ -291,6 +315,10 @@ defmodule Tightbeam.SessionLane do
         {:error, %{reason: reason, terminal_publish: fun, record_in_txn: action}}
         when is_function(fun, 1) and is_function(action, 1) ->
           {"failed", error_text(reason), fun, action, nil}
+
+        {:error, %{reason: reason, record_in_txn: action, after_commit: committed}}
+        when is_function(action, 1) and is_function(committed, 1) ->
+          {"failed", error_text(reason), nil, action, committed}
 
         {:error, %{reason: reason, terminal_publish: fun}} when is_function(fun, 1) ->
           {"failed", error_text(reason), fun, nil, nil}

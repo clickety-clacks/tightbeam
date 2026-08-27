@@ -80,6 +80,42 @@ defmodule Tightbeam.LaneTest do
     assert Agent.get(agent, &Enum.reverse(&1)) == ["first", "second"]
   end
 
+  test "a delivered runner mutation commits with the terminal CAS and publishes afterward", ctx do
+    parent = self()
+    seq = enqueue!(ctx.db, "k1", "recover")
+
+    runner = fn _turn ->
+      {:ok,
+       %{
+         terminal_publish: fn terminal -> send(parent, {:wire_terminal, terminal}) end,
+         record_in_txn: fn txn ->
+           EventLog.lifecycle_in_txn(txn, "lane_success_record", "k1", "seq=#{seq}")
+           fn -> send(parent, :post_commit) end
+         end
+       }}
+    end
+
+    {:ok, _mgr} =
+      LaneManager.start_link(
+        db: ctx.db,
+        lane_sup: ctx.lane_sup,
+        task_sup: ctx.task_sup,
+        runner: runner,
+        interval: 60_000,
+        name: :"mgr_#{System.unique_integer([:positive])}"
+      )
+
+    assert_receive :post_commit
+    assert_receive {:wire_terminal, "delivered"}
+
+    assert {:ok, [["delivered"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [seq])
+
+    assert Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
+             event.kind == "lane_success_record" and event.subject == "k1"
+           end)
+  end
+
   test "reconciler starts a lane for committed work with NO doorbell (liveness)", ctx do
     {:ok, agent} = Agent.start_link(fn -> [] end)
     # commit work, then start the manager — no nudge was ever sent
