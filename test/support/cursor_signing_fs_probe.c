@@ -79,14 +79,21 @@ int fsync(int fd) {
       getenv("CURSOR_SIGNING_TEST_FAIL_AFTER_RENAME");
   const char *fail_always =
       getenv("CURSOR_SIGNING_TEST_FAIL_DIRECTORY_SYNC_ALWAYS");
+  const char *recovery_sync_arm =
+      getenv("CURSOR_SIGNING_TEST_RECOVERY_SYNC_ARM");
+  const char *fail_recovery_sync =
+      getenv("CURSOR_SIGNING_TEST_FAIL_RECOVERY_SYNC_WHEN_ARMED");
 
   int directory = fstat(fd, &stat_buffer) == 0 && S_ISDIR(stat_buffer.st_mode);
   int regular = fstat(fd, &stat_buffer) == 0 && S_ISREG(stat_buffer.st_mode);
   int active_exists = active_path != NULL && access(active_path, F_OK) == 0;
+  int recovery_sync_armed = recovery_sync_arm != NULL &&
+                            access(recovery_sync_arm, F_OK) == 0;
   int should_fail =
       directory &&
       ((fail_when_active != NULL && active_exists) ||
-       (fail_after_rename != NULL && completed_target_rename != 0));
+       (fail_after_rename != NULL && completed_target_rename != 0) ||
+       (fail_recovery_sync != NULL && recovery_sync_armed));
 
   if (regular && getenv("CURSOR_SIGNING_TEST_FAIL_STAGE_SYNC_ALWAYS") != NULL) {
     touch_marker("CURSOR_SIGNING_TEST_FSYNC_FAILED");
@@ -97,6 +104,12 @@ int fsync(int fd) {
   if (regular && getenv("CURSOR_SIGNING_TEST_STAGE_SYNC_READY") != NULL) {
     touch_marker("CURSOR_SIGNING_TEST_STAGE_SYNC_READY");
     await_marker("CURSOR_SIGNING_TEST_STAGE_SYNC_GO");
+  }
+
+  if (directory && recovery_sync_armed &&
+      getenv("CURSOR_SIGNING_TEST_RECOVERY_SYNC_READY") != NULL) {
+    touch_marker("CURSOR_SIGNING_TEST_RECOVERY_SYNC_READY");
+    await_marker("CURSOR_SIGNING_TEST_RECOVERY_SYNC_GO");
   }
 
   if (directory && completed_target_rename != 0 &&

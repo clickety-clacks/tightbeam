@@ -505,6 +505,16 @@ defmodule Tightbeam.CursorSigningTest do
     refute consumer_output == String.replace(mutator_output, "mutator:", "consumer:")
   end
 
+  test "surviving disconnected VMs recover after the publishing VM dies", ctx do
+    control_dir = Path.join(ctx.base_dir, "disconnected-owner-death-proof")
+    File.mkdir_p!(control_dir)
+    probe = compile_filesystem_probe!(control_dir)
+
+    for recovery_outcome <- [:success, :sync_failure] do
+      assert_disconnected_owner_death_recovery!(ctx, probe, recovery_outcome)
+    end
+  end
+
   test "persistent directory-sync failure refuses recovery and stays quarantined", ctx do
     control_dir = Path.join(ctx.base_dir, "persistent-sync-proof")
     File.mkdir_p!(control_dir)
@@ -1069,6 +1079,177 @@ defmodule Tightbeam.CursorSigningTest do
     end
   end
 
+  defp assert_disconnected_owner_death_recovery!(ctx, probe, recovery_outcome) do
+    fixture = Atom.to_string(recovery_outcome)
+    base_dir = Path.join(ctx.base_dir, "disconnected-owner-death-base-#{fixture}")
+    control_dir = Path.join(ctx.base_dir, "disconnected-owner-death-control-#{fixture}")
+    File.mkdir_p!(control_dir)
+
+    active_path = write_material_fixture!(base_dir)
+    provider = CursorSigning.load!(base_dir)
+    input = "disconnected-owner-death-cursor"
+    old_signature = sign!(provider, input)
+    consumer_ready = Path.join(control_dir, "consumer-ready")
+    consumer_go = Path.join(control_dir, "consumer-go")
+    consumer_result = Path.join(control_dir, "consumer-result")
+    recovery_sync_ready = Path.join(control_dir, "recovery-sync-ready")
+    recovery_sync_go = Path.join(control_dir, "recovery-sync-go")
+    recovery_sync_failed = Path.join(control_dir, "recovery-sync-failed")
+    recovery_sync_arm = Path.join(control_dir, "recovery-sync-arm")
+    mutator_pid = Path.join(control_dir, "mutator-pid")
+    mutator_sync_ready = Path.join(control_dir, "mutator-sync-ready")
+    mutator_sync_go = Path.join(control_dir, "mutator-sync-go")
+
+    consumer =
+      Task.async(fn ->
+        script = """
+        defmodule DisconnectedOwnerDeathConsumer do
+          def run(base_dir, input, outcome, ready, go, sync_arm, result_path) do
+            provider = Tightbeam.CursorSigning.load!(base_dir)
+            {:ok, _old_signature} = Tightbeam.CursorSigning.sign(provider, input)
+            File.write!(sync_arm, "")
+            File.write!(ready, "")
+            await_file(go, 30_000)
+
+            result = {
+              String.to_atom(outcome),
+              Tightbeam.CursorSigning.sign(provider, input),
+              Tightbeam.CursorSigning.sign(provider, input),
+              Tightbeam.CursorSigning.lifecycle(provider)
+            }
+
+            publish(result_path, result)
+          end
+
+          defp publish(path, term) do
+            temporary = path <> ".tmp-" <> System.pid()
+            encoded = term |> :erlang.term_to_binary() |> Base.encode64()
+            File.write!(temporary, encoded, [:binary])
+            File.rename!(temporary, path)
+          end
+
+          defp await_file(_path, 0), do: raise("owner-death consumer timed out")
+
+          defp await_file(path, attempts) do
+            if File.exists?(path) do
+              :ok
+            else
+              Process.sleep(2)
+              await_file(path, attempts - 1)
+            end
+          end
+        end
+
+        DisconnectedOwnerDeathConsumer.run(Enum.at(System.argv(), 0), Enum.at(System.argv(), 1), Enum.at(System.argv(), 2), Enum.at(System.argv(), 3), Enum.at(System.argv(), 4), Enum.at(System.argv(), 5), Enum.at(System.argv(), 6))
+        """
+
+        recovery_environment =
+          case recovery_outcome do
+            :success ->
+              [
+                {"CURSOR_SIGNING_TEST_RECOVERY_SYNC_ARM", recovery_sync_arm},
+                {"CURSOR_SIGNING_TEST_RECOVERY_SYNC_READY", recovery_sync_ready},
+                {"CURSOR_SIGNING_TEST_RECOVERY_SYNC_GO", recovery_sync_go}
+              ]
+
+            :sync_failure ->
+              [
+                {"CURSOR_SIGNING_TEST_RECOVERY_SYNC_ARM", recovery_sync_arm},
+                {"CURSOR_SIGNING_TEST_FAIL_RECOVERY_SYNC_WHEN_ARMED", "1"},
+                {"CURSOR_SIGNING_TEST_FAIL_DIRECTORY_SYNC_ALWAYS", "1"},
+                {"CURSOR_SIGNING_TEST_FSYNC_FAILED", recovery_sync_failed}
+              ]
+          end
+
+        external_instrumented_elixir(
+          script,
+          [
+            base_dir,
+            input,
+            fixture,
+            consumer_ready,
+            consumer_go,
+            recovery_sync_arm,
+            consumer_result
+          ],
+          filesystem_probe_environment(probe, active_path) ++ recovery_environment
+        )
+      end)
+
+    await_file!(consumer_ready)
+
+    mutator =
+      Task.async(fn ->
+        script = """
+        [base_dir, pid_path] = System.argv()
+        temporary = pid_path <> ".tmp-" <> System.pid()
+        File.write!(temporary, System.pid())
+        File.rename!(temporary, pid_path)
+        provider = Tightbeam.CursorSigning.load!(base_dir)
+        Tightbeam.CursorSigning.rotate(provider)
+        """
+
+        external_instrumented_elixir(
+          script,
+          [base_dir, mutator_pid],
+          filesystem_probe_environment(probe, active_path) ++
+            [
+              {"CURSOR_SIGNING_TEST_DIR_SYNC_READY", mutator_sync_ready},
+              {"CURSOR_SIGNING_TEST_DIR_SYNC_GO", mutator_sync_go}
+            ]
+        )
+      end)
+
+    on_exit(fn ->
+      Enum.each([consumer_go, recovery_sync_go, mutator_sync_go], &File.write(&1, ""))
+
+      case File.read(mutator_pid) do
+        {:ok, os_pid} -> kill_os_process(os_pid)
+        {:error, _reason} -> :ok
+      end
+
+      await_process_exit!(consumer.pid)
+      await_process_exit!(mutator.pid)
+    end)
+
+    await_file!(mutator_pid)
+    await_file!(mutator_sync_ready)
+    assert {_, 0} = kill_os_process(File.read!(mutator_pid))
+    {_mutator_output, mutator_status} = Task.await(mutator, 30_000)
+    refute mutator_status == 0
+
+    File.write!(consumer_go, "")
+
+    if recovery_outcome == :success do
+      await_file!(recovery_sync_ready)
+      refute File.exists?(consumer_result)
+      File.write!(recovery_sync_go, "")
+    end
+
+    result = await_encoded_term!(consumer_result)
+    {_consumer_output, 0} = Task.await(consumer, 30_000)
+
+    case {recovery_outcome, result} do
+      {:success, {:success, {:ok, recovered}, {:ok, repeated}, :healthy}} ->
+        assert recovered == repeated
+        refute recovered == old_signature
+        assert sign!(provider, input) == recovered
+
+      {:sync_failure,
+       {:sync_failure, {:error, :cursor_signing_quarantined},
+        {:error, :cursor_signing_quarantined}, :quarantined}} ->
+        assert File.exists?(recovery_sync_failed)
+
+      other ->
+        flunk("unexpected disconnected owner-death result: #{inspect(other)}")
+    end
+  end
+
+  defp kill_os_process(os_pid) do
+    executable = System.find_executable("kill") || raise "kill is unavailable"
+    System.cmd(executable, ["-KILL", String.trim(os_pid)], stderr_to_stdout: true)
+  end
+
   defp assert_mutation_matrix_fixture!(ctx, probe, winner, loser, outcome) do
     fixture = Enum.join([winner, loser, outcome], "-")
     base_dir = Path.join(ctx.base_dir, "matrix-base-#{fixture}")
@@ -1142,9 +1323,9 @@ defmodule Tightbeam.CursorSigningTest do
 
     await_file!(lock_ready)
     File.write!(loser_go, "")
-    await_file!(loser_overlap)
+    loser_overlap_result = await_encoded_term!(loser_overlap)
 
-    assert read_encoded_term!(loser_overlap) ==
+    assert loser_overlap_result ==
              {:error, :cursor_signing_mutation_in_progress}
 
     if winner == :recover and outcome == :recovery_refused do
@@ -1153,13 +1334,13 @@ defmodule Tightbeam.CursorSigningTest do
     end
 
     File.write!(lock_go, "")
-    await_file!(winner_result)
-    assert mutation_matrix_winner_class(read_encoded_term!(winner_result)) == outcome
+    winner_result = await_encoded_term!(winner_result)
+    assert mutation_matrix_winner_class(winner_result) == outcome
 
     File.write!(loser_post_go, "")
-    await_file!(loser_post)
+    loser_post_result = await_encoded_term!(loser_post)
 
-    assert mutation_matrix_post_class(read_encoded_term!(loser_post), winner, outcome) ==
+    assert mutation_matrix_post_class(loser_post_result, winner, outcome) ==
              mutation_matrix_expected_post(winner, outcome)
 
     File.write!(winner_stop, "")
@@ -1212,9 +1393,9 @@ defmodule Tightbeam.CursorSigningTest do
         provider = Tightbeam.CursorSigning.load!(base_dir)
         File.write!(ready, "")
         await_file(go, 30_000)
-        File.write!(overlap, encode(invoke(operation, base_dir, provider)))
+        publish(overlap, invoke(operation, base_dir, provider))
         await_file(post_go, 30_000)
-        File.write!(post, encode(Tightbeam.CursorSigning.sign(provider, "matrix-cursor")))
+        publish(post, Tightbeam.CursorSigning.sign(provider, "matrix-cursor"))
       end
 
       defp invoke("provision", base_dir, _provider),
@@ -1227,6 +1408,13 @@ defmodule Tightbeam.CursorSigningTest do
         do: Tightbeam.CursorSigning.recover(provider)
 
       defp encode(term), do: term |> :erlang.term_to_binary() |> Base.encode64()
+
+      defp publish(path, term) do
+        temporary = path <> ".tmp-" <> System.pid()
+        File.write!(temporary, encode(term), [:binary])
+        File.rename!(temporary, path)
+      end
+
       defp await_file(_path, 0), do: raise("matrix loser timed out")
 
       defp await_file(path, attempts) do
@@ -1251,7 +1439,7 @@ defmodule Tightbeam.CursorSigningTest do
         provider = seed_recovery(provider, operation)
 
         result = invoke(operation, base_dir, provider)
-        File.write!(result_path, result |> :erlang.term_to_binary() |> Base.encode64())
+        publish(result_path, result)
         await_file(stop, 30_000)
       end
 
@@ -1275,6 +1463,13 @@ defmodule Tightbeam.CursorSigningTest do
       defp invoke("recover", _base_dir, provider),
         do: Tightbeam.CursorSigning.recover(provider)
 
+      defp publish(path, term) do
+        temporary = path <> ".tmp-" <> System.pid()
+        encoded = term |> :erlang.term_to_binary() |> Base.encode64()
+        File.write!(temporary, encoded, [:binary])
+        File.rename!(temporary, path)
+      end
+
       defp await_file(_path, 0), do: raise("matrix winner timed out")
 
       defp await_file(path, attempts) do
@@ -1291,11 +1486,32 @@ defmodule Tightbeam.CursorSigningTest do
     """
   end
 
-  defp read_encoded_term!(path) do
-    path
-    |> File.read!()
-    |> Base.decode64!()
-    |> :erlang.binary_to_term([:safe])
+  defp await_encoded_term!(path, attempts \\ 30_000)
+
+  defp await_encoded_term!(_path, 0), do: raise("matrix result publication timed out")
+
+  defp await_encoded_term!(path, attempts) do
+    case read_encoded_term(path) do
+      {:ok, term} ->
+        term
+
+      :retry ->
+        Process.sleep(2)
+        await_encoded_term!(path, attempts - 1)
+    end
+  end
+
+  defp read_encoded_term(path) do
+    with {:ok, encoded} <- File.read(path),
+         {:ok, binary} <- Base.decode64(encoded) do
+      try do
+        {:ok, :erlang.binary_to_term(binary, [:safe])}
+      rescue
+        _error -> :retry
+      end
+    else
+      _failure -> :retry
+    end
   end
 
   defp compile_filesystem_probe!(directory) do

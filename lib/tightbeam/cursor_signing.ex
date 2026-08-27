@@ -437,6 +437,14 @@ defmodule Tightbeam.CursorSigning do
                   {:reply, {:error, reason}, state}
               end
 
+            {:refused, result, state} ->
+              CursorSigning.release_lock(admission_lock)
+              {:reply, result, state}
+
+            {:error, failed_state} when is_map(failed_state) ->
+              CursorSigning.release_lock(admission_lock)
+              {:reply, {:error, :cursor_signing_quarantined}, failed_state}
+
             {:error, reason} ->
               CursorSigning.release_lock(admission_lock)
               {:reply, {:error, reason}, state}
@@ -578,17 +586,16 @@ defmodule Tightbeam.CursorSigning do
       case CursorSigning.acquire_quarantine_probe(state.record_path) do
         {:ok, quarantine_probe} ->
           {result, state} =
-            case refresh_unprovisioned(state) do
-              {:ok, state} -> {operation.(state), state}
-              {:error, state} -> {{:error, :cursor_signing_quarantined}, state}
-            end
+            operation_after_refresh(state, operation)
 
           CursorSigning.release_lock(quarantine_probe)
           CursorSigning.release_lock(admission_lock)
           {result, state}
 
         {:error, reason} when reason in [:absent, :invalid] ->
-          result = operation.(state)
+          {result, state} =
+            operation_after_refresh(state, operation)
+
           CursorSigning.release_lock(admission_lock)
           {result, state}
 
@@ -602,6 +609,14 @@ defmodule Tightbeam.CursorSigning do
       end
     end
 
+    defp operation_after_refresh(state, operation) do
+      case refresh_after_admission(state) do
+        {:ok, state} -> {operation.(state), state}
+        {:refused, result, state} -> {result, state}
+        {:error, state} -> {{:error, :cursor_signing_quarantined}, state}
+      end
+    end
+
     defp cross_process_state(%{quarantine_lock: lock} = state) when not is_nil(lock),
       do: {:ok, state}
 
@@ -609,10 +624,10 @@ defmodule Tightbeam.CursorSigning do
       case CursorSigning.acquire_quarantine_probe(state.record_path) do
         {:ok, quarantine_probe} ->
           CursorSigning.release_lock(quarantine_probe)
-          refresh_unprovisioned(state)
+          refresh_after_admission(state)
 
         {:error, reason} when reason in [:absent, :invalid] ->
-          {:ok, state}
+          refresh_after_admission(state)
 
         {:error, :busy} ->
           {:error, :cursor_signing_quarantined}
@@ -622,23 +637,44 @@ defmodule Tightbeam.CursorSigning do
       end
     end
 
-    defp refresh_unprovisioned(%{lifecycle: :unprovisioned} = state) do
+    defp refresh_after_admission(%{lifecycle: :unprovisioned} = state) do
       case File.lstat(state.record_path) do
         {:error, :enoent} ->
           {:ok, state}
 
         {:ok, _stat} ->
-          case CursorSigning.validate_current(state.record_path, state.owner_uid) do
-            :ok -> {:ok, notify_healthy(%{state | lifecycle: :healthy})}
-            _failure -> {:error, %{state | lifecycle: :quarantined}}
-          end
+          recover_after_admission(state)
 
         {:error, _reason} ->
-          {:error, %{state | lifecycle: :quarantined}}
+          quarantine_after_admission(state)
       end
     end
 
-    defp refresh_unprovisioned(state), do: {:ok, state}
+    defp refresh_after_admission(%{lifecycle: :healthy} = state) do
+      case CursorSigning.canonical_identity(state.record_path, state.owner_uid) do
+        {:ok, _identity} -> recover_after_admission(state)
+        {:error, %Error{} = reason} -> {:refused, {:error, reason}, state}
+        _failure -> {:refused, CursorSigning.error(:unavailable), state}
+      end
+    end
+
+    defp refresh_after_admission(state), do: {:ok, state}
+
+    defp recover_after_admission(state) do
+      case CursorSigning.recover_canonical(state.record_path, state.owner_uid) do
+        {:ok, _identity} ->
+          notify? = state.lifecycle != :healthy
+          state = %{state | lifecycle: :healthy}
+          state = if notify?, do: notify_healthy(state), else: state
+          {:ok, state}
+
+        _failure ->
+          quarantine_after_admission(state)
+      end
+    end
+
+    defp quarantine_after_admission(state),
+      do: {:error, %{state | lifecycle: :quarantined}}
 
     defp mutation_allowed(:provision, :unprovisioned), do: :ok
     defp mutation_allowed(:provision, :healthy), do: CursorSigning.error(:already_provisioned)
@@ -666,7 +702,9 @@ defmodule Tightbeam.CursorSigning do
           :ok ->
             {worker, worker_monitor} =
               spawn_monitor(fn ->
-                result = CursorSigning.sync_parent_once(state.record_path)
+                result =
+                  CursorSigning.recover_canonical(state.record_path, state.owner_uid)
+
                 send(self_observer(), {:directory_synced, mutation.reference, result})
               end)
 
@@ -704,7 +742,7 @@ defmodule Tightbeam.CursorSigning do
       finish_preparation(CursorSigning.error(:unavailable), state)
     end
 
-    defp finish_recovery({:ok, :recovered}, state) do
+    defp finish_recovery({:ok, _identity}, state) do
       if state.mutation.owner_alive do
         state = release_quarantine(state)
         finish_with_lifecycle(state, :ok, :healthy)
@@ -725,7 +763,7 @@ defmodule Tightbeam.CursorSigning do
       end
     end
 
-    defp finish_startup({:healthy, :ok}, state) do
+    defp finish_startup({:healthy, _identity}, state) do
       finish_with_lifecycle(state, :ok, :healthy)
     end
 
@@ -744,7 +782,7 @@ defmodule Tightbeam.CursorSigning do
       finish_with_lifecycle(state, failure, :quarantined, failure)
     end
 
-    defp finish_published_sync(:ok, state) do
+    defp finish_published_sync({:ok, _identity}, state) do
       if state.mutation.owner_alive do
         finish_with_lifecycle(state, :ok, :healthy)
       else
@@ -933,7 +971,7 @@ defmodule Tightbeam.CursorSigning do
 
       {:ok, _stat} ->
         case recover_canonical(record_path, owner_uid) do
-          {:ok, :recovered} -> {:healthy, :ok}
+          {:ok, identity} -> {:healthy, identity}
           {:error, %Error{} = reason} -> {:quarantined, {:error, reason}}
           _other -> {:quarantined, error(:unavailable)}
         end
@@ -1223,6 +1261,15 @@ defmodule Tightbeam.CursorSigning do
     end
   end
 
+  @doc false
+  def canonical_identity(record_path, owner_uid) do
+    with :ok <- validate_directory(Path.dirname(record_path), owner_uid),
+         {:ok, _material, identity} <-
+           read_record_identity(record_path, owner_uid, @read_attempts) do
+      {:ok, identity}
+    end
+  end
+
   defp read_record_identity(_path, _owner_uid, 0), do: error(:unavailable)
 
   defp read_record_identity(path, owner_uid, attempts) do
@@ -1308,7 +1355,8 @@ defmodule Tightbeam.CursorSigning do
      stat.mode, stat.uid}
   end
 
-  defp recover_canonical(record_path, owner_uid) do
+  @doc false
+  def recover_canonical(record_path, owner_uid) do
     directory = Path.dirname(record_path)
 
     with :ok <- validate_directory(directory, owner_uid),
@@ -1319,7 +1367,7 @@ defmodule Tightbeam.CursorSigning do
          :ok <- validate_record_stat(after_sync, owner_uid),
          :ok <- validate_record_size(after_sync),
          true <- record_identity(after_sync) == identity do
-      {:ok, :recovered}
+      {:ok, identity}
     else
       _other -> error(:unavailable)
     end
