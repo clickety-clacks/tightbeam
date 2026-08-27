@@ -315,18 +315,6 @@ defmodule Tightbeam.CredentialRecovery do
     end
   end
 
-  def edge(db, activation_id, {:adapter_generations, adapter_generations})
-      when is_map(adapter_generations) do
-    at = now()
-
-    publications =
-      Map.new(adapter_generations, fn {wire, generation} ->
-        {wire, %{"generation" => generation, "publishedAt" => at}}
-      end)
-
-    edge(db, activation_id, {:adapter_publications, adapter_generations, publications})
-  end
-
   def edge(
         db,
         activation_id,

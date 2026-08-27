@@ -864,6 +864,31 @@ defmodule Tightbeam.CredentialsTest do
       refute File.exists?(staging)
     end
 
+    test "raw adapter generations are rejected without publication provenance", ctx do
+      owner = self()
+
+      {:ok, server} =
+        Credentials.start_link(
+          name: nil,
+          base_dir: ctx.base,
+          machine: "eezo",
+          start: fn :openai, :subscription -> {:ok, %{"codex" => 2}} end,
+          on_credential_present: fn _ -> send(owner, :forbidden_credential_present) end,
+          resume: fn _ -> send(owner, :forbidden_resume) end,
+          publish_sessions: fn _, _ -> send(owner, :forbidden_publish) end
+        )
+
+      assert {:ok, staging, lease_id} = Credentials.begin_onboard(:openai, server)
+      File.write!(Path.join(staging, "auth.json"), ~S({"token":"candidate"}))
+
+      assert {:error, :adapter_publication_proof_required} =
+               Credentials.finish_onboard(:openai, :subscription, lease_id, server)
+
+      refute_receive :forbidden_credential_present
+      refute_receive :forbidden_resume
+      refute_receive :forbidden_publish
+    end
+
     test "a start failure KEEPS the new credential and refuses visibly", ctx do
       owner = self()
 

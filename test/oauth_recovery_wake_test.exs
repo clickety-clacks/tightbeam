@@ -944,7 +944,7 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
              )
 
     second_publications =
-      record_adapter_publication!(ctx.db, second_activation.activation_id, 3)
+      record_adapter_publication!(ctx.db, second_activation.activation_id, 3, 0)
 
     assert {:ok, :ok} =
              CredentialRecovery.edge(
@@ -1041,13 +1041,21 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
     assert {:ok, %{seq: first_seq, owner_lease: first_lease}} =
              Ledger.claim_next(ctx.db, @main, "generation-one-carrier")
 
+    assert {:ok, [[first_claimed_at]]} =
+             DB.query(
+               ctx.db,
+               "SELECT at FROM turn_lifecycle_events WHERE turnSeq=?1 AND kind='claimed'",
+               [first_seq]
+             )
+
     assert {:ok, second} =
              CredentialRecovery.prepare(ctx.db, @host, :anthropic, :subscription)
 
     assert {:ok, :ok} =
              CredentialRecovery.edge(ctx.db, second.activation_id, :credential_installed)
 
-    publications = record_adapter_publication!(ctx.db, second.activation_id, 2)
+    publications =
+      record_adapter_publication!(ctx.db, second.activation_id, 2, first_claimed_at + 1)
 
     assert {:ok, :ok} =
              CredentialRecovery.edge(ctx.db, second.activation_id, :metadata_committed)
@@ -1184,7 +1192,7 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
     assert {:ok, :ok} =
              CredentialRecovery.edge(ctx.db, replayed.activation_id, :credential_installed)
 
-    publications = record_adapter_publication!(ctx.db, replayed.activation_id, 7)
+    publications = record_adapter_publication!(ctx.db, replayed.activation_id, 7, 0)
 
     assert {:ok, :ok} =
              CredentialRecovery.edge(ctx.db, replayed.activation_id, :metadata_committed)
@@ -1210,7 +1218,7 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
     assert {:ok, :ok} =
              CredentialRecovery.edge(ctx.db, activation.activation_id, :credential_installed)
 
-    publications = record_adapter_publication!(ctx.db, activation.activation_id, 7)
+    publications = record_adapter_publication!(ctx.db, activation.activation_id, 7, 0)
 
     assert {:ok, :ok} =
              CredentialRecovery.edge(ctx.db, activation.activation_id, :metadata_committed)
@@ -1257,7 +1265,7 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
     assert {:ok, :ok} =
              CredentialRecovery.edge(ctx.db, activation.activation_id, :credential_installed)
 
-    record_adapter_publication!(ctx.db, activation.activation_id, 7)
+    record_adapter_publication!(ctx.db, activation.activation_id, 7, 0)
 
     assert {:ok, :ok} =
              CredentialRecovery.edge(ctx.db, activation.activation_id, :metadata_committed)
@@ -1282,7 +1290,7 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
     assert {:ok, :ok} =
              CredentialRecovery.edge(ctx.db, activation.activation_id, :credential_installed)
 
-    publications = record_adapter_publication!(ctx.db, activation.activation_id, 2)
+    publications = record_adapter_publication!(ctx.db, activation.activation_id, 2, 0)
 
     assert {:ok, :ok} =
              CredentialRecovery.edge(ctx.db, activation.activation_id, :metadata_committed)
@@ -1404,7 +1412,7 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
     assert {:ok, :ok} =
              CredentialRecovery.edge(ctx.db, activation.activation_id, :credential_installed)
 
-    publications = record_adapter_publication!(ctx.db, activation.activation_id, 3)
+    publications = record_adapter_publication!(ctx.db, activation.activation_id, 3, 0)
 
     assert {:ok, :ok} =
              CredentialRecovery.edge(ctx.db, activation.activation_id, :metadata_committed)
@@ -1657,9 +1665,7 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
              )
   end
 
-  defp record_adapter_publication!(db, activation_id, generation, published_at \\ nil) do
-    published_at = published_at || System.system_time(:millisecond)
-
+  defp record_adapter_publication!(db, activation_id, generation, published_at) do
     publications = %{
       "claude" => %{"generation" => generation, "publishedAt" => published_at}
     }
@@ -1689,13 +1695,33 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
            name: Credentials.server(@host),
            base_dir: ctx.base,
            machine: @host,
-           start: fn _provider, _kind -> {:ok, %{"claude" => 2}} end,
+           start: fn _provider, _kind ->
+             published_at = publication_after_latest_claim!(ctx.db)
+
+             {:ok,
+              %{
+                generations: %{"claude" => 2},
+                publications: %{
+                  "claude" => %{"generation" => 2, "publishedAt" => published_at}
+                }
+              }}
+           end,
            on_credential_present: fn _provider -> :ok end,
            resume: fn _provider -> :ok end
          ],
          opts
        )}
     )
+  end
+
+  defp publication_after_latest_claim!(db) do
+    {:ok, [[published_at]]} =
+      DB.query(
+        db,
+        "SELECT COALESCE(MAX(at) + 1, 0) FROM turn_lifecycle_events WHERE kind='claimed'"
+      )
+
+    published_at
   end
 
   defp start_noop_scheduler! do

@@ -958,15 +958,8 @@ defmodule Tightbeam.Credentials do
       when is_map(generations) and is_map(publications) ->
         {:ok, adapter_proof(generations, publications)}
 
-      {:ok, generations} when is_map(generations) ->
-        at = System.system_time(:millisecond)
-
-        publications =
-          Map.new(generations, fn {wire, generation} ->
-            {wire, %{"generation" => generation, "publishedAt" => at}}
-          end)
-
-        {:ok, adapter_proof(generations, publications)}
+      {:ok, _invalid_proof} ->
+        {:error, :adapter_publication_proof_required}
 
       failure ->
         failure
