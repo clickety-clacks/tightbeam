@@ -627,6 +627,12 @@ COMMANDS:
         printenv ANTHROPIC_API_KEY | tightbeam onboard anthropic --api-key
       The key is validated against the provider before it is banked, and it
       never leaves this machine.
+  onboard cursor --api-key
+      Cursor is API-key only; --api-key is required (no subscription login).
+      The KEY is read from stdin -- never as an argument:
+        printenv CURSOR_API_KEY | tightbeam onboard cursor --api-key
+      The key is validated against the provider before it is banked, and it
+      never leaves this machine.
   onboard github [--hostname github.com] [--remote URL]
       Prove or create this host's GitHub CLI browser/device login, then stamp
       non-secret capability metadata. The credential is banked file-backed
@@ -2777,6 +2783,7 @@ mod tests {
             "identity status [<archetype>]",
             "identity apply (<session> | --all)",
             "onboard openai|anthropic [--api-key]",
+            "onboard cursor --api-key",
             "onboard github [--hostname github.com] [--remote URL]",
             "add-user <userId> [--admin]",
             "config get default-archetype|default-priority",
