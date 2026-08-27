@@ -1,0 +1,34 @@
+{
+  "captureTransport": "real Tightbeam.Wire.Router /agent/dispatch with real Gateway handlers",
+  "responses": {
+    "hidden": {
+      "body": "{\"error\":{\"code\":\"not_found\",\"message\":\"decision request not found\"}}",
+      "status": 404
+    },
+    "impossibleConsumed": {
+      "body": "{\"error\":{\"code\":\"decision_request_integrity_invalid\",\"message\":\"decision request integrity check failed\",\"requestId\":\"dr_b2a7cd69-7a7f-4cf9-ae1b-f7b8c714873d\"}}",
+      "status": 500
+    },
+    "legacy": {
+      "body": "{\"result\":{\"decisionRequest\":{\"actionKey\":\"3525867c40d60628540b29f667e5f819d9cdad28f5a6cc9c22b0f70706b87491\",\"assignmentId\":null,\"consumedAt\":null,\"context\":{\"note\":null,\"supersedes\":null},\"deadlineAt\":1787944249228,\"decision\":\"accept\",\"id\":\"dr_cc5169b9-d3c6-45c1-b84c-fe1dcfbaa1e2\",\"kind\":\"operator\",\"options\":[{\"label\":\"accept\"},{\"label\":\"decline\"}],\"ownerUserId\":\"capture-owner\",\"question\":\"capture legacy?\",\"raisedAt\":1787857849228,\"raiserId\":\"user:capture-owner\",\"raiserSessionKey\":\"capture-raiser\",\"rationale\":\"captured\",\"ruledAt\":1787857849228,\"ruledBy\":\"user:capture-owner\",\"ruledViaSessionKey\":null,\"rulingAttribution\":{\"onBehalfOf\":\"user:capture-owner\",\"performer\":{\"principal\":{\"state\":\"legacy-unknown\"},\"session\":{\"state\":\"legacy-unknown\"}}},\"rulingFactId\":2,\"status\":\"ruled\"}}}",
+      "status": 200
+    },
+    "open": {
+      "body": "{\"result\":{\"decisionRequest\":{\"actionKey\":\"592d45ede6f4e6559293cbcca368c4d3be88cac7f345cffa4c33b55cd2fefd11\",\"assignmentId\":null,\"consumedAt\":null,\"context\":{\"note\":null,\"supersedes\":null},\"deadlineAt\":1787944249216,\"deadlineWakeId\":null,\"decision\":null,\"effortGeneration\":null,\"expecterSessionKey\":null,\"expecterUserId\":null,\"id\":\"dr_0780adcf-0723-4b0b-afb3-b08a4f427fc5\",\"kind\":\"operator\",\"lineageRung\":null,\"options\":[{\"label\":\"accept\"},{\"label\":\"decline\"}],\"ownerUserId\":\"capture-owner\",\"parkWakeId\":null,\"question\":\"capture open?\",\"raisedAt\":1787857849216,\"raiserId\":\"user:capture-owner\",\"raiserSessionKey\":\"capture-raiser\",\"rationale\":null,\"ruledAt\":null,\"ruledBy\":null,\"ruledViaSessionKey\":null,\"rulingFactId\":null,\"status\":\"open\",\"statuteName\":null,\"withdrawnAt\":null,\"withdrawnBy\":null,\"withdrawnReason\":null}}}",
+      "status": 200
+    },
+    "ruled": {
+      "body": "{\"result\":{\"decisionRequest\":{\"actionKey\":\"9fde8842ceed48f15005ed2501776f24e23ae5da45fc1a2521af8a117119be4f\",\"assignmentId\":null,\"consumedAt\":null,\"context\":{\"note\":null,\"supersedes\":null},\"deadlineAt\":1787944249223,\"decision\":\"accept\",\"id\":\"dr_3b0b25c2-0078-40fe-b31c-740a8b4f44f0\",\"kind\":\"operator\",\"options\":[{\"label\":\"accept\"},{\"label\":\"decline\"}],\"ownerUserId\":\"capture-owner\",\"question\":\"capture ruled?\",\"raisedAt\":1787857849223,\"raiserId\":\"user:capture-owner\",\"raiserSessionKey\":\"capture-raiser\",\"rationale\":\"captured\",\"ruledAt\":1787857849224,\"ruledBy\":\"user:capture-owner\",\"ruledViaSessionKey\":null,\"rulingAttribution\":{\"onBehalfOf\":\"user:capture-owner\",\"performer\":{\"principal\":{\"state\":\"known\",\"value\":\"user:capture-owner\"},\"session\":{\"state\":\"none\"}}},\"rulingFactId\":1,\"status\":\"ruled\"}}}",
+      "status": 200
+    },
+    "superseded": {
+      "body": "{\"result\":{\"decisionRequest\":{\"actionKey\":\"dddb9b37517d75f3d3999461c29c1a95df1802304b028dddf841eecb229a3d4f\",\"assignmentId\":null,\"consumedAt\":null,\"context\":{\"note\":null,\"supersedes\":null},\"deadlineAt\":1787944249226,\"deadlineWakeId\":null,\"decision\":null,\"effortGeneration\":null,\"expecterSessionKey\":null,\"expecterUserId\":null,\"id\":\"dr_6302a8ef-436e-4db4-8e0b-04da4b7ad45a\",\"kind\":\"operator\",\"lineageRung\":null,\"options\":[{\"label\":\"accept\"},{\"label\":\"decline\"}],\"ownerUserId\":\"capture-owner\",\"parkWakeId\":null,\"question\":\"capture superseded?\",\"raisedAt\":1787857849226,\"raiserId\":\"user:capture-owner\",\"raiserSessionKey\":\"capture-raiser\",\"rationale\":null,\"ruledAt\":null,\"ruledBy\":null,\"ruledViaSessionKey\":null,\"rulingFactId\":null,\"status\":\"superseded\",\"statuteName\":null,\"withdrawnAt\":null,\"withdrawnBy\":null,\"withdrawnReason\":null}}}",
+      "status": 200
+    },
+    "withdrawn": {
+      "body": "{\"result\":{\"decisionRequest\":{\"actionKey\":\"32000c19e175d846c5bbc26152673a6fef73d24a43f2cef520cefc7a3a730d29\",\"assignmentId\":null,\"consumedAt\":null,\"context\":{\"note\":null,\"supersedes\":null},\"deadlineAt\":1787944249225,\"deadlineWakeId\":null,\"decision\":null,\"effortGeneration\":null,\"expecterSessionKey\":null,\"expecterUserId\":null,\"id\":\"dr_b1c79432-feb4-4ebb-a70d-ddf0fc84bace\",\"kind\":\"operator\",\"lineageRung\":null,\"options\":[{\"label\":\"accept\"},{\"label\":\"decline\"}],\"ownerUserId\":\"capture-owner\",\"parkWakeId\":null,\"question\":\"capture withdrawn?\",\"raisedAt\":1787857849225,\"raiserId\":\"user:capture-owner\",\"raiserSessionKey\":\"capture-raiser\",\"rationale\":null,\"ruledAt\":null,\"ruledBy\":null,\"ruledViaSessionKey\":null,\"rulingFactId\":null,\"status\":\"withdrawn\",\"statuteName\":null,\"withdrawnAt\":1787857849225,\"withdrawnBy\":\"user:capture-owner\",\"withdrawnReason\":\"captured withdrawal\"}}}",
+      "status": 200
+    }
+  },
+  "sourceCommit": "3246e167781957c4d39e4fb9eea1c71f9bd94fca"
+}
