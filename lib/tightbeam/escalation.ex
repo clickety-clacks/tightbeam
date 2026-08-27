@@ -1846,32 +1846,43 @@ defmodule Tightbeam.Escalation do
         "SELECT legacyRulingFactMaxId FROM decision_request_terminal_epoch WHERE id = 0"
       )
 
-    fact_count =
+    fact_rows =
       if is_integer(request.ruling_fact_id) do
-        [[count]] =
-          Txn.q(
-            txn,
-            "SELECT COUNT(*) FROM condition_facts WHERE id = ?1 AND kind = ?2 AND scope = ?3",
-            [request.ruling_fact_id, @terminal_condition_kind, request.id]
-          )
-
-        count
+        Txn.q(
+          txn,
+          "SELECT kind, scope FROM condition_facts WHERE id = ?1 ORDER BY id",
+          [request.ruling_fact_id]
+        )
       else
-        0
+        []
       end
 
-    [[event_count]] =
+    event_rows =
       Txn.q(
         txn,
-        "SELECT COUNT(*) FROM lifecycle_events WHERE kind = 'decision_request_ruled' AND subject = ?1",
+        "SELECT kind, subject FROM lifecycle_events WHERE subject = ?1 ORDER BY id",
         [request.id]
       )
+
+    fact_count =
+      Enum.count(fact_rows, fn [kind, scope] ->
+        kind == @terminal_condition_kind and scope == request.id
+      end)
+
+    event_count =
+      Enum.count(event_rows, fn [kind, subject] ->
+        kind == "decision_request_ruled" and subject == request.id
+      end)
 
     post_activation? =
       is_integer(request.ruling_fact_id) and request.ruling_fact_id > cutoff
 
     session_valid = terminal_session_valid?(request, post_activation?)
-    wake_count = if post_activation?, do: canonical_wake_count_in_txn(txn, request), else: nil
+
+    wake_relation =
+      if post_activation?,
+        do: terminal_wake_relation_in_txn(txn, request),
+        else: terminal_wake_relation_not_required()
 
     checks = %{
       "requestIdentity" =>
@@ -1899,7 +1910,7 @@ defmodule Tightbeam.Escalation do
       "performerSession" => session_valid,
       "lifecycleConsumption" => request.status == "ruled" and is_nil(request.consumed_at),
       "rulingLifecycleEvent" => event_count == 1,
-      "raiserNotificationWake" => not post_activation? or wake_count == 1
+      "raiserNotificationWake" => not post_activation? or wake_relation.canonical_count == 1
     }
 
     failures =
@@ -1912,7 +1923,17 @@ defmodule Tightbeam.Escalation do
       descriptor: %{
         "schemaVersion" => @terminal_schema_version,
         "causeCode" => @terminal_evidence_cause,
-        "checks" => checks,
+        "checks" => %{
+          "members" => terminal_member_shapes(request),
+          "states" => terminal_state_shapes(request, cutoff),
+          "equalities" => terminal_equality_results(request),
+          "relations" => %{
+            "rulingFact" => terminal_fact_relation(fact_rows, request),
+            "rulingLifecycleEvent" => terminal_event_relation(event_rows, request),
+            "raiserNotificationWake" => wake_relation.descriptor
+          },
+          "validity" => checks
+        },
         "failingFields" => failures
       }
     }
@@ -1929,37 +1950,396 @@ defmodule Tightbeam.Escalation do
       is_nil(request.ruled_via_session_state) and
         (is_nil(request.ruled_via_session_key) or non_blank?(request.ruled_via_session_key))
 
-  defp canonical_wake_count_in_txn(txn, request) do
-    creator =
-      if request.ruled_via_session_state == "known", do: request.ruled_via_session_key, else: nil
+  defp terminal_member_shapes(request) do
+    [
+      {"requestId", :id},
+      {"kind", :kind},
+      {"raiserId", :raiser_id},
+      {"raiserSessionKey", :raiser_session_key},
+      {"ownerUserId", :owner_user_id},
+      {"assignmentId", :assignment_id},
+      {"raisedAt", :raised_at},
+      {"deadlineAt", :deadline_at},
+      {"actionKey", :action_key},
+      {"question", :question},
+      {"context", :context},
+      {"status", :status},
+      {"decision", :decision},
+      {"rationale", :rationale},
+      {"ruledBy", :ruled_by},
+      {"ruledViaPrincipal", :ruled_via_principal},
+      {"ruledViaSessionKey", :ruled_via_session_key},
+      {"ruledViaSessionState", :ruled_via_session_state},
+      {"ruledAt", :ruled_at},
+      {"rulingFactId", :ruling_fact_id},
+      {"consumedAt", :consumed_at}
+    ]
+    |> Map.new(fn {name, key} -> {name, structural_member(Map.fetch(request, key))} end)
+    |> Map.put("options", terminal_options_shape(Map.fetch(request, :options)))
+  end
 
-    [[count]] =
+  defp terminal_state_shapes(request, cutoff) do
+    epoch =
+      cond do
+        not is_integer(request.ruling_fact_id) -> "indeterminate"
+        request.ruling_fact_id > cutoff -> "post-activation"
+        true -> "legacy"
+      end
+
+    %{
+      "kind" =>
+        cond do
+          request.kind == "operator" -> "expected"
+          is_binary(request.kind) -> "other"
+          true -> "invalid-type"
+        end,
+      "lifecycle" =>
+        cond do
+          request.status == "ruled" -> "expected-ruled"
+          request.status == "consumed" -> "forbidden-consumed"
+          is_binary(request.status) -> "other"
+          true -> "invalid-type"
+        end,
+      "rulingEpoch" => epoch,
+      "performerPrincipal" => terminal_principal_state(request, epoch),
+      "performerSession" => terminal_session_state(request, epoch)
+    }
+  end
+
+  defp terminal_principal_state(request, "post-activation") do
+    if canonical_principal?(request.ruled_via_principal),
+      do: "known-canonical",
+      else: "invalid"
+  end
+
+  defp terminal_principal_state(request, "legacy") do
+    if is_nil(request.ruled_via_principal), do: "legacy-unknown", else: "invalid"
+  end
+
+  defp terminal_principal_state(_request, "indeterminate"), do: "indeterminate"
+
+  defp terminal_session_state(request, "post-activation") do
+    cond do
+      request.ruled_via_session_state == "known" and
+          non_blank?(request.ruled_via_session_key) ->
+        "known"
+
+      request.ruled_via_session_state == "none" and is_nil(request.ruled_via_session_key) ->
+        "none"
+
+      true ->
+        "invalid"
+    end
+  end
+
+  defp terminal_session_state(request, "legacy") do
+    cond do
+      is_nil(request.ruled_via_session_state) and non_blank?(request.ruled_via_session_key) ->
+        "legacy-known"
+
+      is_nil(request.ruled_via_session_state) and is_nil(request.ruled_via_session_key) ->
+        "legacy-unknown"
+
+      true ->
+        "invalid"
+    end
+  end
+
+  defp terminal_session_state(_request, "indeterminate"), do: "indeterminate"
+
+  defp terminal_equality_results(request) do
+    %{
+      "deadlineAfterRaisedAt" =>
+        is_integer(request.deadline_at) and is_integer(request.raised_at) and
+          request.deadline_at > request.raised_at,
+      "ruledByMatchesOwner" =>
+        non_blank?(request.owner_user_id) and
+          request.ruled_by == "user:" <> request.owner_user_id,
+      "sessionStateMatchesKey" =>
+        terminal_session_valid?(request, not is_nil(request.ruled_via_session_state))
+    }
+  end
+
+  defp terminal_fact_relation(rows, request) do
+    candidates =
+      rows
+      |> Enum.map(fn [kind, scope] ->
+        matches = %{
+          "kindExpected" => kind == @terminal_condition_kind,
+          "scopeMatchesRequest" => scope == request.id
+        }
+
+        %{
+          "members" => %{
+            "kind" => structural_member({:ok, kind}),
+            "scope" => structural_member({:ok, scope})
+          },
+          "equalities" => matches,
+          "canonical" => Enum.all?(matches, &elem(&1, 1))
+        }
+      end)
+      |> Enum.sort_by(&canonical_json/1)
+
+    relation_shape(candidates)
+  end
+
+  defp terminal_event_relation(rows, request) do
+    candidates =
+      rows
+      |> Enum.map(fn [kind, subject] ->
+        matches = %{
+          "kindExpected" => kind == "decision_request_ruled",
+          "subjectMatchesRequest" => subject == request.id
+        }
+
+        %{
+          "members" => %{
+            "kind" => structural_member({:ok, kind}),
+            "subject" => structural_member({:ok, subject})
+          },
+          "equalities" => matches,
+          "canonical" => Enum.all?(matches, &elem(&1, 1))
+        }
+      end)
+      |> Enum.sort_by(&canonical_json/1)
+
+    relation_shape(candidates)
+  end
+
+  defp relation_shape(candidates) do
+    canonical_count = Enum.count(candidates, & &1["canonical"])
+
+    %{
+      "candidateCount" => length(candidates),
+      "candidateCardinality" => cardinality_class(length(candidates)),
+      "canonicalCount" => canonical_count,
+      "canonicalCardinality" => cardinality_class(canonical_count),
+      "candidates" => Enum.map(candidates, &Map.delete(&1, "canonical"))
+    }
+  end
+
+  defp terminal_wake_relation_in_txn(txn, request) do
+    creator =
+      case request.ruled_via_session_state do
+        "known" -> request.ruled_via_session_key
+        "none" -> nil
+        _ -> :invalid_expected
+      end
+
+    expected_due_at =
+      if Enum.all?([request.ruled_at, request.deadline_at, request.raised_at], &is_integer/1),
+        do: request.ruled_at + (request.deadline_at - request.raised_at),
+        else: :invalid_expected
+
+    rows =
       Txn.q(
         txn,
         """
-        SELECT COUNT(*) FROM wakes
-        WHERE sessionKey = ?1 AND targetRole IS NULL AND origin = 'process:tightbeam'
-          AND prompt = ?2 AND consumer = 'prompt' AND conditionKind = ?3
-          AND conditionScope = ?4 AND conditionAfterId < ?5
-          AND creatorSessionKey IS ?6 AND dueAt = ?7 AND targetGate = 0
-          AND reresolve IS NULL AND reresolveSeed IS NULL AND reresolveRung IS NULL
-          AND canceledAt IS NULL
-          AND ((state = 'pending' AND firedAt IS NULL AND firedBy IS NULL) OR
-               (state = 'fired' AND firedAt IS NOT NULL AND firedBy = 'condition'))
+        SELECT sessionKey, targetRole, origin, prompt, consumer, conditionKind,
+               conditionScope, conditionAfterId, creatorSessionKey, dueAt, targetGate,
+               reresolve, reresolveSeed, reresolveRung, state, firedAt, firedBy, canceledAt
+        FROM wakes
+        WHERE conditionScope = ?1 OR prompt = ?2
+        ORDER BY wakeId
         """,
-        [
-          request.raiser_session_key,
-          terminal_notification(request.id),
-          @terminal_condition_kind,
-          request.id,
-          request.ruling_fact_id,
-          creator,
-          request.ruled_at + (request.deadline_at - request.raised_at)
-        ]
+        [request.id, terminal_notification(request.id)]
       )
 
-    count
+    candidates =
+      rows
+      |> Enum.map(&terminal_wake_candidate(&1, request, creator, expected_due_at))
+      |> Enum.sort_by(&canonical_json/1)
+
+    canonical_count = Enum.count(candidates, & &1.canonical)
+
+    %{
+      canonical_count: canonical_count,
+      descriptor: %{
+        "required" => true,
+        "candidateCount" => length(candidates),
+        "candidateCardinality" => cardinality_class(length(candidates)),
+        "canonicalCount" => canonical_count,
+        "canonicalCardinality" => cardinality_class(canonical_count),
+        "candidates" => Enum.map(candidates, &Map.delete(&1, :canonical))
+      }
+    }
   end
+
+  defp terminal_wake_relation_not_required do
+    %{
+      canonical_count: 0,
+      descriptor: %{
+        "required" => false,
+        "candidateCount" => 0,
+        "candidateCardinality" => "not-inspected",
+        "canonicalCount" => 0,
+        "canonicalCardinality" => "not-required",
+        "candidates" => []
+      }
+    }
+  end
+
+  defp terminal_wake_candidate(
+         [
+           session_key,
+           target_role,
+           origin,
+           prompt,
+           consumer,
+           condition_kind,
+           condition_scope,
+           condition_after_id,
+           creator_session_key,
+           due_at,
+           target_gate,
+           reresolve,
+           reresolve_seed,
+           reresolve_rung,
+           state,
+           fired_at,
+           fired_by,
+           canceled_at
+         ],
+         request,
+         creator,
+         expected_due_at
+       ) do
+    valid_fire_state =
+      (state == "pending" and is_nil(fired_at) and is_nil(fired_by)) or
+        (state == "fired" and is_integer(fired_at) and fired_by == "condition")
+
+    matches = %{
+      "sessionMatchesRaiser" => session_key == request.raiser_session_key,
+      "targetRoleAbsent" => is_nil(target_role),
+      "originExpected" => origin == "process:tightbeam",
+      "promptExpected" => prompt == terminal_notification(request.id),
+      "consumerExpected" => consumer == "prompt",
+      "conditionKindExpected" => condition_kind == @terminal_condition_kind,
+      "conditionScopeMatchesRequest" => condition_scope == request.id,
+      "cursorPrecedesFact" =>
+        is_integer(condition_after_id) and is_integer(request.ruling_fact_id) and
+          condition_after_id < request.ruling_fact_id,
+      "creatorMatchesPerformerSession" =>
+        creator != :invalid_expected and creator_session_key == creator,
+      "dueAtMatchesStoredDuration" =>
+        expected_due_at != :invalid_expected and due_at == expected_due_at,
+      "targetGateExpected" => target_gate == 0,
+      "roleReresolutionAbsent" =>
+        is_nil(reresolve) and is_nil(reresolve_seed) and is_nil(reresolve_rung),
+      "notCanceled" => is_nil(canceled_at),
+      "fireStateValid" => valid_fire_state
+    }
+
+    %{
+      :canonical => Enum.all?(matches, &elem(&1, 1)),
+      "members" => %{
+        "sessionKey" => structural_member({:ok, session_key}),
+        "targetRole" => structural_member({:ok, target_role}),
+        "origin" => structural_member({:ok, origin}),
+        "prompt" => structural_member({:ok, prompt}),
+        "consumer" => structural_member({:ok, consumer}),
+        "conditionKind" => structural_member({:ok, condition_kind}),
+        "conditionScope" => structural_member({:ok, condition_scope}),
+        "conditionAfterId" => structural_member({:ok, condition_after_id}),
+        "creatorSessionKey" => structural_member({:ok, creator_session_key}),
+        "dueAt" => structural_member({:ok, due_at}),
+        "targetGate" => structural_member({:ok, target_gate}),
+        "reresolve" => structural_member({:ok, reresolve}),
+        "reresolveSeed" => structural_member({:ok, reresolve_seed}),
+        "reresolveRung" => structural_member({:ok, reresolve_rung}),
+        "state" => structural_member({:ok, state}),
+        "firedAt" => structural_member({:ok, fired_at}),
+        "firedBy" => structural_member({:ok, fired_by}),
+        "canceledAt" => structural_member({:ok, canceled_at})
+      },
+      "states" => %{
+        "wake" => closed_wake_state(state),
+        "firing" => closed_firing_state(fired_by)
+      },
+      "equalities" => matches
+    }
+  end
+
+  defp structural_member(:error), do: %{"presence" => "missing", "type" => "absent"}
+
+  defp structural_member({:ok, value}) do
+    shape = %{"presence" => "present", "type" => structural_type(value)}
+
+    if is_binary(value),
+      do: Map.put(shape, "textClass", structural_text_class(value)),
+      else: shape
+  end
+
+  defp structural_type(:invalid_json), do: "invalid-json"
+  defp structural_type(nil), do: "null"
+  defp structural_type(value) when is_boolean(value), do: "boolean"
+  defp structural_type(value) when is_binary(value), do: "string"
+  defp structural_type(value) when is_integer(value), do: "integer"
+  defp structural_type(value) when is_float(value), do: "number"
+  defp structural_type(value) when is_list(value), do: "array"
+  defp structural_type(value) when is_map(value), do: "object"
+  defp structural_type(_value), do: "other"
+
+  defp structural_text_class(value) do
+    cond do
+      String.trim(value) == "" -> "blank"
+      String.trim(value) == value -> "normalized-nonblank"
+      true -> "non-normalized-nonblank"
+    end
+  end
+
+  defp terminal_options_shape(:error), do: structural_member(:error)
+
+  defp terminal_options_shape({:ok, options}) when is_list(options) do
+    members =
+      options |> Enum.map(&terminal_option_member_shape/1) |> Enum.sort_by(&canonical_json/1)
+
+    labels =
+      Enum.map(options, fn
+        %{"label" => label} = option when map_size(option) == 1 -> label
+        _ -> :invalid
+      end)
+
+    structural_member({:ok, options})
+    |> Map.merge(%{
+      "memberCount" => length(options),
+      "cardinality" => cardinality_class(length(options)),
+      "members" => members,
+      "normalizedLabels" => Enum.all?(labels, &normalized_text?/1),
+      "labelsDistinct" => Enum.uniq(labels) == labels
+    })
+  end
+
+  defp terminal_options_shape({:ok, options}), do: structural_member({:ok, options})
+
+  defp terminal_option_member_shape(option) when is_map(option) do
+    label = Map.fetch(option, "label")
+
+    structural_member({:ok, option})
+    |> Map.merge(%{
+      "memberCount" => map_size(option),
+      "cardinality" => cardinality_class(map_size(option)),
+      "label" => structural_member(label),
+      "soleLabelMember" => map_size(option) == 1 and match?({:ok, _}, label)
+    })
+  end
+
+  defp terminal_option_member_shape(option), do: structural_member({:ok, option})
+
+  defp cardinality_class(0), do: "zero"
+  defp cardinality_class(1), do: "one"
+  defp cardinality_class(_count), do: "multiple"
+
+  defp closed_wake_state("pending"), do: "pending"
+  defp closed_wake_state("fired"), do: "fired"
+  defp closed_wake_state("canceled"), do: "canceled"
+  defp closed_wake_state(nil), do: "absent"
+  defp closed_wake_state(_state), do: "invalid"
+
+  defp closed_firing_state("condition"), do: "condition"
+  defp closed_firing_state("fallback"), do: "fallback"
+  defp closed_firing_state(nil), do: "absent"
+  defp closed_firing_state(_state), do: "invalid"
 
   defp record_integrity_refusal_in_txn(
          txn,

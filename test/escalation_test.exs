@@ -916,34 +916,72 @@ defmodule Tightbeam.EscalationTest do
     assert observer == "session:#{ctx.raiser.session_key}"
     refute fields =~ "integrity?"
 
-    descriptor = %{
-      "schemaVersion" => "terminal-operator-decision-parity-v1",
-      "causeCode" => "terminal-shape-invalid",
-      "checks" => %{
-        "requestIdentity" => true,
-        "ownerOnBehalfOf" => true,
-        "options" => false,
-        "decision" => true,
-        "rationale" => true,
-        "ruledAt" => true,
-        "rulingFactId" => true,
-        "performerPrincipal" => true,
-        "performerSession" => true,
-        "lifecycleConsumption" => true,
-        "rulingLifecycleEvent" => false,
-        "raiserNotificationWake" => true
-      },
-      "failingFields" => ["options", "rulingLifecycleEvent"]
-    }
-
-    expected_digest =
-      descriptor
-      |> canonical_json()
-      |> then(&:crypto.hash(:sha256, &1))
-      |> Base.encode16(case: :lower)
-
-    assert shape_digest == expected_digest
+    assert shape_digest == "aa0f59e13752f749aebffdb85010157c62f6d6be714aa01dcb7265e93134fdd0"
     assert ruled.ruling_fact_id > 0
+  end
+
+  test "structural evidence digests distinguish member classes and relation results", ctx do
+    options_request =
+      Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "options shape?"}))
+
+    _ruled =
+      Escalation.operator_rule(
+        ctx.db,
+        owner_operator_rule(options_request.id, %{decision: "accept"})
+      )
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE decision_requests SET options='not-json' WHERE id=?1", [
+               options_request.id
+             ])
+
+    assert %{code: "decision_request_integrity_invalid"} =
+             Escalation.get(ctx.db, operator_call(ctx.raiser, %{}), options_request.id)
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE decision_requests SET options='[]' WHERE id=?1", [
+               options_request.id
+             ])
+
+    assert %{code: "decision_request_integrity_invalid"} =
+             Escalation.get(ctx.db, operator_call(ctx.raiser, %{}), options_request.id)
+
+    assert {:ok, [[2, 2, 1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*), COUNT(DISTINCT shapeDigest), COUNT(DISTINCT failingFields) FROM decision_request_integrity_evidence WHERE requestId=?1",
+               [options_request.id]
+             )
+
+    fact_request =
+      Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "fact shape?"}))
+
+    ruled =
+      Escalation.operator_rule(
+        ctx.db,
+        owner_operator_rule(fact_request.id, %{decision: "accept"})
+      )
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE condition_facts SET kind='wrong-kind' WHERE id=?1", [
+               ruled.ruling_fact_id
+             ])
+
+    assert %{code: "decision_request_integrity_invalid"} =
+             Escalation.get(ctx.db, operator_call(ctx.raiser, %{}), fact_request.id)
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "DELETE FROM condition_facts WHERE id=?1", [ruled.ruling_fact_id])
+
+    assert %{code: "decision_request_integrity_invalid"} =
+             Escalation.get(ctx.db, operator_call(ctx.raiser, %{}), fact_request.id)
+
+    assert {:ok, [[2, 2, 1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*), COUNT(DISTINCT shapeDigest), COUNT(DISTINCT failingFields) FROM decision_request_integrity_evidence WHERE requestId=?1",
+               [fact_request.id]
+             )
   end
 
   test "an unrelated sibling session cannot borrow owner visibility", ctx do
@@ -1499,24 +1537,6 @@ defmodule Tightbeam.EscalationTest do
         "INSERT INTO assignments (id,subject,holderKey,holderFallback,openedBySession,openedAt,state,outcome,closedAt,closedByUser) VALUES ('#{id}','linked','#{holder_key}',0,'#{holder_key}',1,'#{state}'#{terminal})"
       )
   end
-
-  defp canonical_json(value) when is_map(value) do
-    items =
-      value
-      |> Enum.map(fn {key, item} -> {to_string(key), item} end)
-      |> Enum.sort_by(&elem(&1, 0))
-      |> Enum.map(fn {key, item} -> [JSON.encode!(key), ?:, canonical_json(item)] end)
-      |> Enum.intersperse(?,)
-
-    IO.iodata_to_binary([?{, items, ?}])
-  end
-
-  defp canonical_json(value) when is_list(value) do
-    items = value |> Enum.map(&canonical_json/1) |> Enum.intersperse(?,)
-    IO.iodata_to_binary([?[, items, ?]])
-  end
-
-  defp canonical_json(value), do: JSON.encode!(value)
 
   defp request(ctx, id) do
     Escalation.get(ctx.db, rule_call(id, "allow"), id, owner_user_id: "flynn")
