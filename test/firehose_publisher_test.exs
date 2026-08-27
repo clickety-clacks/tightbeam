@@ -363,6 +363,128 @@ defmodule Tightbeam.Firehose.PublisherTest do
     refute_receive {:firehose_notice, %{"class" => "work_item.created"}}
   end
 
+  test "an exact effort-rule retry emits no second ruled state notice or generation effect" do
+    db = :firehose_effort_rule_retry_db
+    start_supervised!({DB, path: ":memory:", name: db})
+    :ok = Tightbeam.Schema.ensure_all(db)
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('flynn',1,'admin_add',1)"
+      )
+
+    register_testhost(db)
+
+    for {key, name} <- [{"effect-holder", "Effect holder"}, {"effect-observer", "Observer"}] do
+      Org.create(db, %{
+        session_key: key,
+        display_name: name,
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Tightbeam.Model.new("fable")
+      })
+    end
+
+    base_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "tightbeam-firehose-effort-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(base_dir)
+    on_exit(fn -> File.rm_rf!(base_dir) end)
+
+    config = %{
+      db: db,
+      base_dir: base_dir,
+      cwd: base_dir,
+      effort_checkin_horizon_ms: 60_000,
+      wake_tick_ms: 60_000
+    }
+
+    handlers = Gateway.handlers(config)
+
+    assert {:ok, assignment} =
+             Dispatch.dispatch(db, handlers, %{
+               verb: "dispatch",
+               origin: "user:flynn",
+               principal: {:user, "flynn"},
+               session_key: "effect-holder",
+               target_role: nil,
+               role_fallback: false,
+               params: %{subject: "Retry effort ruling", brief: "Prove one state publication."}
+             })
+
+    _dispatch_notices = observed_classes()
+
+    {:ok, [[generation]]} =
+      DB.query(
+        db,
+        "SELECT generation FROM effort_checkin_generations WHERE assignmentId=?1",
+        [assignment.id]
+      )
+
+    deadline =
+      Wakes.schedule(db, %{
+        session_key: "effect-holder",
+        origin: "process:tightbeam",
+        consumer: "effort_deadline",
+        due_at: System.system_time(:millisecond) + 60_000,
+        assignment_id: assignment.id
+      })
+
+    request_id = "dr_effort_retry"
+    now = System.system_time(:millisecond)
+
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO decision_requests
+          (id,kind,raiserId,ownerUserId,assignmentId,expecterSessionKey,lineageRung,
+           effortGeneration,deadlineWakeId,raisedAt,deadlineAt,question,options,context,status)
+        VALUES (?1,'effort','process:tightbeam','flynn',?2,'effect-holder',1,?3,?4,?5,?6,
+                'Continue or dismiss?','["continue","dismiss"]','{"actions":["continue","dismiss"]}','open')
+        """,
+        [request_id, assignment.id, generation, deadline.wake_id, now, now + 60_000]
+      )
+
+    call = %{
+      verb: "effort-rule",
+      origin: "agent:spoofed-alias",
+      principal: {:session, "effect-observer"},
+      session_key: nil,
+      params: %{request: request_id, action: "continue"}
+    }
+
+    assert {:ok, %{ruled_by: "session:effect-observer"}} =
+             Dispatch.dispatch(db, handlers, call)
+
+    assert observed_classes() == ["verb.accepted", "decision_request.ruled"]
+
+    {:ok, [[generation_count]]} =
+      DB.query(db, "SELECT count(*) FROM effort_checkin_generations WHERE assignmentId=?1", [
+        assignment.id
+      ])
+
+    assert {:ok, %{ruled_by: "session:effect-observer"}} =
+             Dispatch.dispatch(db, handlers, call)
+
+    assert observed_classes() == ["verb.accepted"]
+
+    assert {:ok, [[^generation_count]]} =
+             DB.query(
+               db,
+               "SELECT count(*) FROM effort_checkin_generations WHERE assignmentId=?1",
+               [assignment.id]
+             )
+  end
+
   test "an accepted state verb emits its observation and canonical state notice" do
     call = %{
       verb: "work-item-update",

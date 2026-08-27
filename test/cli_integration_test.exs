@@ -968,6 +968,22 @@ defmodule Tightbeam.CliIntegrationTest do
     dir
   end
 
+  defp raw_agent_dispatch(ctx, token, body) do
+    {:ok, {{_version, status, _reason}, _headers, raw_body}} =
+      :httpc.request(
+        :post,
+        {~c"http://127.0.0.1:#{ctx.port}/agent/dispatch",
+         [
+           {~c"authorization", ~c"Bearer #{token}"},
+           {~c"x-tightbeam-cli-version", String.to_charlist(CliCompatibility.required_version())}
+         ], ~c"application/json", JSON.encode!(body)},
+        [],
+        []
+      )
+
+    {status, raw_body |> to_string() |> JSON.decode!()}
+  end
+
   # Regression, found by smoke group 12. `Dispatch.dispatch/3` declares three
   # returns and the router's dispatch_response served two, so an escalating verb
   # reached `case` with no clause: CaseClauseError, an empty body from Bandit,
@@ -1189,6 +1205,267 @@ defmodule Tightbeam.CliIntegrationTest do
                     }}
   end
 
+  test "A-14 raw HTTP pins exact-read and response refusal envelopes", ctx do
+    effort_id = open_effort_request(ctx, "wire-refusal")
+    agent_id = "dr_wire_agent_#{System.unique_integer([:positive])}"
+    now = System.system_time(:millisecond)
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO decision_requests
+                 (id,kind,raiserId,raiserSessionKey,ownerUserId,expecterSessionKey,
+                  expecterUserId,raisedAt,question,context,status)
+               VALUES (?1,'agent','session:cli-holder','cli-holder','flynn','cli-holder',
+                       'flynn',?2,'Which path?','{}','open')
+               """,
+               [agent_id, now]
+             )
+
+    assert {200,
+            %{
+              "result" => %{
+                "decisionRequest" => %{"id" => ^effort_id, "kind" => "effort"}
+              }
+            }} =
+             raw_agent_dispatch(ctx, ctx.worker.cli_token, %{
+               "verb" => "decision-request",
+               "params" => %{"request" => effort_id}
+             })
+
+    not_found = %{
+      "error" => %{"code" => "not_found", "message" => "decision request not found"}
+    }
+
+    assert {404, ^not_found} =
+             raw_agent_dispatch(ctx, ctx.worker.cli_token, %{
+               "verb" => "decision-request",
+               "params" => %{"request" => "dr_absent"}
+             })
+
+    for verb <- ["answer", "return"] do
+      params =
+        if verb == "answer",
+          do: %{"request" => effort_id, "answer" => "not an agent question"},
+          else: %{"request" => effort_id, "reason" => "not an agent question"}
+
+      assert {404, ^not_found} =
+               raw_agent_dispatch(ctx, ctx.worker.cli_token, %{
+                 "verb" => verb,
+                 "params" => params
+               })
+    end
+
+    assert {400,
+            %{
+              "error" => %{
+                "code" => "invalid",
+                "message" => "effort-rule requires an effort request"
+              }
+            }} =
+             raw_agent_dispatch(ctx, ctx.worker.cli_token, %{
+               "verb" => "effort-rule",
+               "params" => %{"request" => agent_id, "action" => "continue"}
+             })
+
+    assert {403,
+            %{
+              "error" => %{
+                "code" => "not_authorized",
+                "message" => "current expecter required"
+              }
+            }} =
+             raw_agent_dispatch(ctx, ctx.worker.cli_token, %{
+               "asUser" => "flynn",
+               "verb" => "effort-rule",
+               "params" => %{"request" => effort_id, "action" => "continue"}
+             })
+
+    for {verb, params} <- [
+          {"decision-request", %{"request" => effort_id}},
+          {"answer", %{"request" => agent_id, "answer" => "yes"}},
+          {"return", %{"request" => agent_id, "reason" => "unclear"}},
+          {"effort-rule", %{"request" => effort_id, "action" => "continue"}}
+        ] do
+      assert {401, %{"error" => %{"code" => "auth_failed"}}} =
+               raw_agent_dispatch(ctx, "not-a-token", %{"verb" => verb, "params" => params})
+    end
+  end
+
+  test "A-15 exact-id security matrix preserves every principal boundary", ctx do
+    for user_id <- ["nobody", "other"] do
+      assert {:ok, _} =
+               DB.query(
+                 ctx.db,
+                 "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES (?1,0,'admin_add',1)",
+                 [user_id]
+               )
+    end
+
+    session_identity = %{}
+    user_identity = %{"asUser" => "nobody"}
+    process_identity = %{"asProcess" => "ci"}
+    role_identity = %{"as" => "cli-holder"}
+
+    invoke = fn token, identity, verb, params ->
+      raw_agent_dispatch(
+        ctx,
+        token,
+        identity |> Map.merge(%{"verb" => verb, "params" => params})
+      )
+    end
+
+    # One authenticated bystander session gains exact-id access and the three
+    # kind-matching response paths. The statute arm remains hidden.
+    agent_read = open_agent_request(ctx)
+    effort_read = open_effort_request(ctx, "matrix-session-read")
+    statute_read = open_statute_request(ctx, "other")
+
+    assert {200, %{"result" => %{"decisionRequest" => %{"id" => ^agent_read}}}} =
+             invoke.(ctx.worker.cli_token, session_identity, "decision-request", %{
+               "request" => agent_read
+             })
+
+    assert {200, %{"result" => %{"decisionRequest" => %{"id" => ^effort_read}}}} =
+             invoke.(ctx.worker.cli_token, session_identity, "decision-request", %{
+               "request" => effort_read
+             })
+
+    assert {404, %{"error" => %{"code" => "not_found", "message" => _}}} =
+             invoke.(ctx.worker.cli_token, session_identity, "decision-request", %{
+               "request" => statute_read
+             })
+
+    answer_id = open_agent_request(ctx)
+
+    assert {200, %{"result" => %{"decisionRequest" => %{"answeredBy" => "session:cli-worker"}}}} =
+             invoke.(ctx.worker.cli_token, session_identity, "answer", %{
+               "request" => answer_id,
+               "answer" => "session answer"
+             })
+
+    return_id = open_agent_request(ctx)
+
+    assert {200, %{"result" => %{"decisionRequest" => %{"returnedBy" => "session:cli-worker"}}}} =
+             invoke.(ctx.worker.cli_token, session_identity, "return", %{
+               "request" => return_id,
+               "reason" => "session needs context"
+             })
+
+    effort_rule_id = open_effort_request(ctx, "matrix-session-rule")
+
+    assert {200, %{"result" => %{"ruledBy" => "session:cli-worker"}}} =
+             invoke.(ctx.worker.cli_token, session_identity, "effort-rule", %{
+               "request" => effort_rule_id,
+               "action" => "continue"
+             })
+
+    # User, process, role-without-session, and unauthenticated callers acquire
+    # no standing. Every refused group leaves requests, events, wakes, and
+    # monitor generations byte-for-byte at the same counts.
+    for {token, identity, exact_status, effort_status} <- [
+          {"tbc_cli_integration", user_identity, 404, 403},
+          {"tbc_cli_integration", process_identity, 404, 403},
+          {"tbc_cli_integration", role_identity, 404, 403},
+          {"not-a-token", %{}, 401, 401}
+        ] do
+      agent_id = open_agent_request(ctx)
+      effort_id = open_effort_request(ctx, "matrix-refused")
+      statute_id = open_statute_request(ctx, "other")
+      before = security_counts(ctx.db)
+
+      for request_id <- [agent_id, effort_id, statute_id] do
+        assert {^exact_status, _envelope} =
+                 invoke.(token, identity, "decision-request", %{"request" => request_id})
+      end
+
+      assert {^exact_status, _envelope} =
+               invoke.(token, identity, "answer", %{
+                 "request" => agent_id,
+                 "answer" => "must refuse"
+               })
+
+      assert {^exact_status, _envelope} =
+               invoke.(token, identity, "return", %{
+                 "request" => agent_id,
+                 "reason" => "must refuse"
+               })
+
+      assert {^effort_status, _envelope} =
+               invoke.(token, identity, "effort-rule", %{
+                 "request" => effort_id,
+                 "action" => "continue"
+               })
+
+      assert security_counts(ctx.db) == before
+
+      assert request_statuses(ctx.db, [agent_id, effort_id, statute_id]) == [
+               "open",
+               "open",
+               "open"
+             ]
+    end
+
+    # Existing stamped human expecters retain their old standing and no more.
+    expecter_identity = %{"asUser" => "other"}
+    user_agent_read = open_agent_request(ctx, expecter_user_id: "other")
+
+    assert {200, %{"result" => %{"decisionRequest" => %{"id" => ^user_agent_read}}}} =
+             invoke.("tbc_cli_integration", expecter_identity, "decision-request", %{
+               "request" => user_agent_read
+             })
+
+    user_answer = open_agent_request(ctx, expecter_user_id: "other")
+
+    assert {200, %{"result" => %{"decisionRequest" => %{"answeredBy" => "user:other"}}}} =
+             invoke.("tbc_cli_integration", expecter_identity, "answer", %{
+               "request" => user_answer,
+               "answer" => "human answer"
+             })
+
+    user_return = open_agent_request(ctx, expecter_user_id: "other")
+
+    assert {200, %{"result" => %{"decisionRequest" => %{"returnedBy" => "user:other"}}}} =
+             invoke.("tbc_cli_integration", expecter_identity, "return", %{
+               "request" => user_return,
+               "reason" => "human needs context"
+             })
+
+    user_effort =
+      open_effort_request(ctx, "matrix-user-rule",
+        expecter_session_key: nil,
+        expecter_user_id: "other"
+      )
+
+    assert {200, %{"result" => %{"ruledBy" => "user:other"}}} =
+             invoke.("tbc_cli_integration", expecter_identity, "effort-rule", %{
+               "request" => user_effort,
+               "action" => "continue"
+             })
+
+    user_statute = open_statute_request(ctx, "other")
+
+    assert {200, %{"result" => %{"decisionRequest" => %{"id" => ^user_statute}}}} =
+             invoke.("tbc_cli_integration", expecter_identity, "decision-request", %{
+               "request" => user_statute
+             })
+
+    before_statute_refusals = security_counts(ctx.db)
+
+    for {verb, params, status} <- [
+          {"answer", %{"request" => user_statute, "answer" => "wrong kind"}, 404},
+          {"return", %{"request" => user_statute, "reason" => "wrong kind"}, 404},
+          {"effort-rule", %{"request" => user_statute, "action" => "continue"}, 400}
+        ] do
+      assert {^status, _envelope} =
+               invoke.("tbc_cli_integration", expecter_identity, verb, params)
+    end
+
+    assert security_counts(ctx.db) == before_statute_refusals
+    assert request_statuses(ctx.db, [user_statute]) == ["open"]
+  end
+
   test "real CLI returns an insufficient question and removes it from the open queue", ctx do
     {asked, 0} =
       System.cmd(
@@ -1364,7 +1641,76 @@ defmodule Tightbeam.CliIntegrationTest do
     assert pairing =~ "supplied together"
   end
 
-  defp open_effort_request(ctx, action) do
+  defp open_agent_request(ctx, opts \\ []) do
+    request_id = "dr_agent_#{System.unique_integer([:positive])}"
+    expecter_session_key = Keyword.get(opts, :expecter_session_key, "cli-holder")
+    expecter_user_id = Keyword.get(opts, :expecter_user_id, "other")
+    now = System.system_time(:millisecond)
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO decision_requests
+                 (id,kind,raiserId,raiserSessionKey,ownerUserId,expecterSessionKey,
+                  expecterUserId,raisedAt,question,context,status)
+               VALUES (?1,'agent','session:cli-holder','cli-holder','flynn',?2,?3,?4,
+                       'Which path?','{}','open')
+               """,
+               [request_id, expecter_session_key, expecter_user_id, now]
+             )
+
+    request_id
+  end
+
+  defp open_statute_request(ctx, owner_user_id) do
+    request_id = "dr_statute_#{System.unique_integer([:positive])}"
+    now = System.system_time(:millisecond)
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO decision_requests
+                 (id,kind,raiserId,ownerUserId,raisedAt,deadlineAt,statuteName,actionKey,
+                  question,context,status)
+               VALUES (?1,'statute','session:cli-holder',?2,?3,?4,'deploy-gate',?5,
+                       'May this ship?','{}','open')
+               """,
+               [request_id, owner_user_id, now, now + 60_000, "action-#{request_id}"]
+             )
+
+    request_id
+  end
+
+  defp security_counts(db) do
+    assert {:ok, [counts]} =
+             DB.query(
+               db,
+               """
+               SELECT
+                 (SELECT COUNT(*) FROM decision_requests),
+                 (SELECT COUNT(*) FROM lifecycle_events),
+                 (SELECT COUNT(*) FROM wakes),
+                 (SELECT COUNT(*) FROM effort_checkin_generations)
+               """
+             )
+
+    counts
+  end
+
+  defp request_statuses(db, request_ids) do
+    Enum.map(request_ids, fn request_id ->
+      assert {:ok, [[status]]} =
+               DB.query(db, "SELECT status FROM decision_requests WHERE id=?1", [request_id])
+
+      status
+    end)
+  end
+
+  defp open_effort_request(ctx, action, opts \\ []) do
+    expecter_session_key = Keyword.get(opts, :expecter_session_key, "cli-holder")
+    expecter_user_id = Keyword.get(opts, :expecter_user_id)
     key = "effort-#{action}-#{System.unique_integer([:positive])}"
 
     {dispatched, 0} =
@@ -1412,14 +1758,16 @@ defmodule Tightbeam.CliIntegrationTest do
         """
         INSERT INTO decision_requests
           (id, kind, raiserId, ownerUserId, assignmentId, expecterSessionKey,
-           lineageRung, effortGeneration, deadlineWakeId, raisedAt, deadlineAt,
+           expecterUserId, lineageRung, effortGeneration, deadlineWakeId, raisedAt, deadlineAt,
            question, options, context, status)
-        VALUES (?1, 'effort', 'process:tightbeam', 'flynn', ?2, 'cli-holder',
-                1, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'open')
+        VALUES (?1, 'effort', 'process:tightbeam', 'flynn', ?2, ?3, ?4,
+                1, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'open')
         """,
         [
           request_id,
           assignment_id,
+          expecter_session_key,
+          expecter_user_id,
           generation,
           wake_id,
           now,

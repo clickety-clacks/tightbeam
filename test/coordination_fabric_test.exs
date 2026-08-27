@@ -1676,7 +1676,7 @@ defmodule Tightbeam.CoordinationFabricTest do
       recover_retired: [{"lib/tightbeam/boot.ex", "start_link/1"}],
       list: [{"lib/tightbeam/gateway.ex", "handler_specs/1"}],
       get: [
-        {"lib/tightbeam/effort_checkin.ex", "visible_statute?/3"},
+        {"lib/tightbeam/effort_checkin.ex", "visible_request?/3"},
         {"lib/tightbeam/gateway.ex", "handler_specs/1"}
       ],
       effort_rule_in_txn: [{"lib/tightbeam/effort_checkin.ex", "rule_in_txn/7"}],

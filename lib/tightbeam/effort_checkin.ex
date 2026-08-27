@@ -335,7 +335,7 @@ defmodule Tightbeam.EffortCheckin do
       is_nil(request) ->
         error("not_found", "decision request not found")
 
-      request.kind == "statute" and not visible_statute?(db, call, request_id) ->
+      request.kind != "effort" and not visible_request?(db, call, request) ->
         error("not_found", "decision request not found")
 
       request.kind != "effort" ->
@@ -350,7 +350,7 @@ defmodule Tightbeam.EffortCheckin do
       request.status == "ruled" and request.decision == action and request.ruled_by == actor ->
         {:ok, :ok} =
           DB.transaction(db, fn txn ->
-            Publisher.maybe_accepted_in_txn(txn, call, request)
+            Publisher.maybe_observed_accepted_in_txn(txn, call)
           end)
 
         request
@@ -1214,7 +1214,9 @@ defmodule Tightbeam.EffortCheckin do
   defp authorized?({:user, user}, request), do: request.expecter_user_id == user
   defp authorized?(_, _request), do: false
 
-  defp visible_statute?(db, call, request_id) do
+  defp visible_request?(_db, %{principal: {:session, _key}}, %{kind: "agent"}), do: true
+
+  defp visible_request?(db, call, request) do
     owner_user_id =
       case call.principal do
         {:session, key} ->
@@ -1230,7 +1232,7 @@ defmodule Tightbeam.EffortCheckin do
           nil
       end
 
-    not is_nil(Escalation.get(db, call, request_id, owner_user_id: owner_user_id))
+    not is_nil(Escalation.get(db, call, request.id, owner_user_id: owner_user_id))
   end
 
   defp invalid_root,
