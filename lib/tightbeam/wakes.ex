@@ -388,7 +388,7 @@ defmodule Tightbeam.Wakes do
     file_policy_skew(txn, wake)
 
     if v1_batch_source?(wake) do
-      policy_ref = NoticeBatcher.record_policy_in_txn(txn, wake)
+      policy_ref = NoticeBatcher.record_policy_in_txn(txn, wake, enabled: true)
 
       case NoticeBatcher.enqueue_or_recover_in_txn(txn, wake.wake_id, policy_ref) do
         %{member_id: _, batch_id: _} -> :ok
@@ -428,7 +428,7 @@ defmodule Tightbeam.Wakes do
   defp apply_delivery_policy(_txn, input, nil, _created_at, _condition_kind),
     do: {nil, Map.fetch!(input, :due_at)}
 
-  defp apply_delivery_policy(_txn, input, class, created_at, condition_kind) do
+  defp apply_delivery_policy(txn, input, class, created_at, condition_kind) do
     policy = delivery_policy(class)
 
     cond do
@@ -464,6 +464,9 @@ defmodule Tightbeam.Wakes do
       policy.immediacy == :digest and not v1_batch_eligible?(input, class, condition_kind) ->
         {@legacy_digest_rule, created_at + policy.ceiling_ms}
 
+      policy.immediacy == :digest and not NoticeBatcher.lane_enabled_in_txn(txn, input) ->
+        {@legacy_digest_rule, created_at + policy.ceiling_ms}
+
       policy.immediacy != :digest ->
         {policy.rule, Map.fetch!(input, :due_at)}
 
@@ -493,15 +496,13 @@ defmodule Tightbeam.Wakes do
     origin = Map.fetch!(input, :origin)
 
     class == "fyi" and not String.starts_with?(origin, "user:") and
-      not String.starts_with?(origin, "agent:") and
       not Map.get(input, :digest, false) and not Map.get(input, :sender_scheduled, false) and
       not is_binary(condition_kind) and Map.get(input, :consumer, "prompt") == "prompt"
   end
 
   defp v1_batch_source?(wake) do
     wake.class == "fyi" and wake.delivery_rule == @digest_rule and not wake.digest and
-      not String.starts_with?(wake.origin, "user:") and
-      not String.starts_with?(wake.origin, "agent:")
+      not String.starts_with?(wake.origin, "user:")
   end
 
   # FAIL QUIET AND VISIBLE (§5 policy-skew rule). An extended class this build
@@ -2234,11 +2235,11 @@ defmodule Tightbeam.Wakes do
 
       if wake.digest, do: NoticeBatcher.delivery_attempted(db, wake.wake_id)
 
-      delivered =
+      delivery =
         case wake.consumer do
           "prompt" ->
             if suppressed_by_recognition?(db, wake) do
-              false
+              :retry
             else
               attempt_delivery(fn -> deliver.(wake) end)
             end
@@ -2254,12 +2255,17 @@ defmodule Tightbeam.Wakes do
             end
         end
 
-      if delivered and wake.consumer == "prompt" do
-        mark_fired(db, wake.wake_id)
-        if wake.digest, do: NoticeBatcher.delivery_delivered(db, wake.wake_id)
-      else
-        if wake.digest,
-          do: NoticeBatcher.delivery_failed_attempt(db, wake.wake_id, :not_committed)
+      case {wake.consumer, delivery} do
+        {"prompt", {:ok, :skipped}} when wake.digest ->
+          NoticeBatcher.delivery_terminal_failure(db, wake.wake_id, :skipped)
+
+        {"prompt", {:ok, _result}} ->
+          mark_fired(db, wake.wake_id)
+          if wake.digest, do: NoticeBatcher.delivery_delivered(db, wake.wake_id)
+
+        _ ->
+          if wake.digest,
+            do: NoticeBatcher.delivery_failed_attempt(db, wake.wake_id, :not_committed)
       end
     end
 
@@ -2431,12 +2437,11 @@ defmodule Tightbeam.Wakes do
 
   defp attempt_delivery(delivery) do
     try do
-      delivery.()
-      true
+      {:ok, delivery.()}
     rescue
-      _ -> false
+      _ -> :retry
     catch
-      :exit, _ -> false
+      :exit, _ -> :retry
     end
   end
 

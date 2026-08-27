@@ -1,7 +1,7 @@
 defmodule Tightbeam.NoticeBatcherTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, NoticeBatcher, Roles, Wakes}
+  alias Tightbeam.{DB, Gateway, NoticeBatcher, Roles, Wakes}
 
   setup do
     id = System.unique_integer([:positive])
@@ -52,7 +52,8 @@ defmodule Tightbeam.NoticeBatcherTest do
     assert Wakes.get(db, user.wake_id).state == "fired"
   end
 
-  test "acceptance 3: urgent classes bypass an open routine lane", %{db: db} do
+  test "acceptance 3: urgent classes bypass while agent-authored fyi joins the selected lane",
+       %{db: db} do
     routine = eligible(db)
 
     for class <- ~w(input-needed blocker algedonic) do
@@ -61,9 +62,10 @@ defmodule Tightbeam.NoticeBatcherTest do
     end
 
     agent_fyi = ordinary(db, "fyi", "pre-v2 agent message")
-    assert NoticeBatcher.source_refs(db, agent_fyi.wake_id) == []
+    assert [%{batch_id: agent_batch}] = NoticeBatcher.source_refs(db, agent_fyi.wake_id)
+    assert agent_batch == batch_id(db, routine)
 
-    assert NoticeBatcher.batch(db, batch_id(db, routine)).member_count == 1
+    assert NoticeBatcher.batch(db, batch_id(db, routine)).member_count == 2
   end
 
   test "acceptance 4: blocker publication leaves the fyi batch unchanged", %{db: db} do
@@ -207,7 +209,7 @@ defmodule Tightbeam.NoticeBatcherTest do
              NoticeBatcher.deliver_batch(reopened, batch_id, batch.delivery_token)
   end
 
-  test "acceptance 14: a failed attempt retries the same carrier and reaches delivered", %{db: db} do
+  test "acceptance 14: transient failure retries while unresolved delivery terminates", %{db: db} do
     source = eligible(db)
     [carrier_id] = Wakes.materialize_digests(db, source.due_at)
     {:ok, _} = DB.query(db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [carrier_id])
@@ -223,6 +225,32 @@ defmodule Tightbeam.NoticeBatcherTest do
     assert batch.delivery_wake_id == carrier_id
     assert batch.state == "delivered"
     assert count(db, "turns", "wakeId=?1", [carrier_id]) == 1
+
+    unresolved = eligible(db, session: "agent:unresolved")
+    [unresolved_carrier] = Wakes.materialize_digests(db, unresolved.due_at)
+    {:ok, _} = DB.query(db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [unresolved_carrier])
+
+    terminal =
+      start_scheduler(db, fn wake ->
+        Gateway.deliver_prompt(wake.session_key, wake.origin, wake.prompt,
+          db: db,
+          wake_id: wake.wake_id,
+          sender: wake.origin,
+          target_gate: if(wake.target_gate == 0, do: nil, else: wake),
+          fire_wake_in_txn: true
+        )
+      end)
+
+    assert :ok = Wakes.fire_due(terminal)
+    failed_batch = NoticeBatcher.batch(db, batch_id(db, unresolved))
+    assert failed_batch.state == "delivery_failed"
+    assert failed_batch.terminal_cause == ":skipped"
+    assert failed_batch.terminal_principal == "process:tightbeam:wake-scheduler"
+    assert failed_batch.retry_count == 0
+    assert Wakes.get(db, unresolved_carrier).state == "fired"
+
+    assert :ok = Wakes.fire_due(terminal)
+    assert NoticeBatcher.batch(db, failed_batch.batch_id).retry_count == 0
   end
 
   test "acceptance 15: post-commit recovery marks terminal without a second edge", %{db: db} do
@@ -321,21 +349,30 @@ defmodule Tightbeam.NoticeBatcherTest do
     assert count(db, "notice_batch_members") == 0
   end
 
-  test "acceptance 21: disabled rollback admission refuses while a sealed batch finishes", %{
+  test "acceptance 21: default-off selection and rollback preserve the ordinary path", %{
     db: db
   } do
-    pre_migration = ordinary(db, nil, "pre-migration")
-    active = eligible(db, session: "agent:rollback")
-    [carrier_id] = Wakes.materialize_digests(db, active.due_at)
+    lane = [session: "agent:rollback"]
+    unselected = fyi(db, lane)
+    assert unselected.delivery_rule == "turn-boundary-digest r1"
+    assert NoticeBatcher.source_refs(db, unselected.wake_id) == []
 
-    disabled =
-      manual_member(db, "session:agent:rollback:disabled", enabled: false, expect_error: true)
+    set_lane_policy(db, lane, true)
+    active = fyi(db, lane)
+    assert active.delivery_rule == NoticeBatcher.rule()
+    assert [%{batch_id: _}] = NoticeBatcher.source_refs(db, active.wake_id)
+    _carrier_ids = Wakes.materialize_digests(db, active.due_at)
+    carrier_id = NoticeBatcher.batch(db, batch_id(db, active)).delivery_wake_id
 
-    assert disabled.code == "batching_disabled"
-    assert NoticeBatcher.source_refs(db, pre_migration.wake_id) == []
+    set_lane_policy(db, lane, false)
+    disabled = fyi(db, Keyword.put(lane, :prompt, "after rollback"))
+
+    assert disabled.delivery_rule == "turn-boundary-digest r1"
+    assert NoticeBatcher.source_refs(db, disabled.wake_id) == []
     NoticeBatcher.delivery_delivered(db, carrier_id)
     assert NoticeBatcher.batch(db, batch_id(db, active)).state == "delivered"
-    assert count(db, "notice_batch_members", "sourceWakeId=?1", [pre_migration.wake_id]) == 0
+    assert count(db, "notice_batch_members", "sourceWakeId=?1", [unselected.wake_id]) == 0
+    assert count(db, "notice_batch_members", "sourceWakeId=?1", [disabled.wake_id]) == 0
   end
 
   test "acceptance 22: a later earlier deadline atomically shortens the lane", %{db: db} do
@@ -350,6 +387,11 @@ defmodule Tightbeam.NoticeBatcherTest do
   end
 
   defp eligible(db, opts \\ []) do
+    set_lane_policy(db, opts, true)
+    fyi(db, opts)
+  end
+
+  defp fyi(db, opts) do
     Wakes.schedule(db, %{
       session_key: Keyword.get(opts, :session, "agent:recipient"),
       target_role: Keyword.get(opts, :target_role),
@@ -359,6 +401,18 @@ defmodule Tightbeam.NoticeBatcherTest do
       due_at: Keyword.get(opts, :due_at, 0),
       class: "fyi"
     })
+  end
+
+  defp set_lane_policy(db, opts, enabled) do
+    NoticeBatcher.set_lane_policy(
+      db,
+      %{
+        session_key: Keyword.get(opts, :session, "agent:recipient"),
+        target_role: Keyword.get(opts, :target_role)
+      },
+      enabled,
+      "agent:test-policy"
+    )
   end
 
   defp ordinary(db, class, prompt) do

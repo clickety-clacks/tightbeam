@@ -1694,6 +1694,13 @@ defmodule Tightbeam.SupervisionTest do
     # not merely when the fyi consumes attention.
     prepare_review_gate(ctx)
 
+    Tightbeam.NoticeBatcher.set_lane_policy(
+      ctx.db,
+      %{session_key: "holder", target_role: nil},
+      true,
+      "agent:test-policy"
+    )
+
     held =
       Wakes.schedule(ctx.db, %{
         session_key: "holder",

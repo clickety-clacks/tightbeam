@@ -10,7 +10,7 @@ defmodule Tightbeam.CoordinationFabricTest do
   """
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Escalation, Roles, Wakes}
+  alias Tightbeam.{DB, Escalation, NoticeBatcher, Roles, Wakes}
 
   setup do
     name = :"db_#{System.unique_integer([:positive])}"
@@ -146,7 +146,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     # firing mechanics govern it, and the delivery-policy row must not claim
     # the batcher held it either.
     conditioned =
-      Wakes.schedule(db, %{
+      schedule_wake(db, %{
         session_key: "agent:po",
         origin: "agent:sender",
         creator_session_key: "agent:sender",
@@ -417,7 +417,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     sender_elected = schedule(db, session: session, class: "fyi", prompt: "sender said fyi")
 
     classifier_elected =
-      Wakes.schedule(db, %{
+      schedule_wake(db, %{
         session_key: session,
         origin: "process:tightbeam",
         creator_session_key: "agent:sender",
@@ -459,7 +459,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert Enum.map(Wakes.digest_members(db, digest_id), & &1.wake_id) == [member.wake_id]
 
     unrelated =
-      Wakes.schedule(db, %{
+      schedule_wake(db, %{
         session_key: session,
         origin: "agent:other",
         prompt: "unrelated traffic, not carried by anything",
@@ -489,7 +489,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     Roles.create!(db, "role-x", "flynn", "s1")
 
     a =
-      Wakes.schedule(db, %{
+      schedule_wake(db, %{
         session_key: "s1",
         target_role: "role-x",
         origin: "agent:sender",
@@ -500,7 +500,7 @@ defmodule Tightbeam.CoordinationFabricTest do
       })
 
     b =
-      Wakes.schedule(db, %{
+      schedule_wake(db, %{
         session_key: "s1",
         target_role: "role-x",
         origin: "agent:sender",
@@ -552,7 +552,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     })
 
     held =
-      Wakes.schedule(db, %{
+      schedule_wake(db, %{
         session_key: "s1",
         target_role: "role-x",
         origin: "agent:sender",
@@ -598,7 +598,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     Roles.create!(db, "role-y", "flynn", "s1")
 
     role_member =
-      Wakes.schedule(db, %{
+      schedule_wake(db, %{
         session_key: "s1",
         target_role: "role-y",
         origin: "agent:sender",
@@ -609,7 +609,7 @@ defmodule Tightbeam.CoordinationFabricTest do
       })
 
     session_member =
-      Wakes.schedule(db, %{
+      schedule_wake(db, %{
         session_key: "s1",
         origin: "agent:sender",
         creator_session_key: "agent:sender",
@@ -670,7 +670,7 @@ defmodule Tightbeam.CoordinationFabricTest do
       )
 
     a =
-      Wakes.schedule(db, %{
+      schedule_wake(db, %{
         session_key: session,
         origin: "agent:sender",
         creator_session_key: "agent:sender",
@@ -681,7 +681,7 @@ defmodule Tightbeam.CoordinationFabricTest do
       })
 
     b =
-      Wakes.schedule(db, %{
+      schedule_wake(db, %{
         session_key: session,
         origin: "agent:sender",
         creator_session_key: "agent:sender",
@@ -725,7 +725,7 @@ defmodule Tightbeam.CoordinationFabricTest do
       )
 
     a =
-      Wakes.schedule(db, %{
+      schedule_wake(db, %{
         session_key: session,
         origin: "agent:sender",
         creator_session_key: "agent:sender",
@@ -736,7 +736,7 @@ defmodule Tightbeam.CoordinationFabricTest do
       })
 
     b =
-      Wakes.schedule(db, %{
+      schedule_wake(db, %{
         session_key: session,
         origin: "agent:sender",
         creator_session_key: "agent:sender",
@@ -783,7 +783,7 @@ defmodule Tightbeam.CoordinationFabricTest do
       )
 
     member =
-      Wakes.schedule(db, %{
+      schedule_wake(db, %{
         session_key: session,
         origin: "agent:sender",
         creator_session_key: "agent:sender",
@@ -794,7 +794,7 @@ defmodule Tightbeam.CoordinationFabricTest do
       })
 
     carrier =
-      Wakes.schedule(db, %{
+      schedule_wake(db, %{
         session_key: session,
         origin: "process:tightbeam",
         prompt: "digest carrier",
@@ -862,7 +862,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     ok_member = schedule(db, session: session, class: "fyi", prompt: "fine")
 
     broken_member =
-      Wakes.schedule(db, %{
+      schedule_wake(db, %{
         session_key: session,
         origin: "process:tightbeam",
         creator_session_key: "agent:sender",
@@ -1131,7 +1131,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     Roles.create!(db, "orphan-role", "roleowner", nil)
 
     member =
-      Wakes.schedule(db, %{
+      schedule_wake(db, %{
         session_key: "agent:filer",
         target_role: "orphan-role",
         origin: "agent:sender",
@@ -1173,7 +1173,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     Roles.create!(db, "rm-role", "roleowner3", nil)
 
     member =
-      Wakes.schedule(db, %{
+      schedule_wake(db, %{
         session_key: "agent:filer3",
         target_role: "rm-role",
         origin: "agent:sender",
@@ -1219,7 +1219,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     Roles.create!(db, "reused-role", "original-owner", nil)
 
     member =
-      Wakes.schedule(db, %{
+      schedule_wake(db, %{
         session_key: "agent:filer4",
         target_role: "reused-role",
         origin: "agent:sender",
@@ -1259,7 +1259,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     Roles.create!(db, "resolved-role", "sessionowner5", "agent:holder5")
 
     member =
-      Wakes.schedule(db, %{
+      schedule_wake(db, %{
         session_key: "agent:holder5",
         target_role: "resolved-role",
         origin: "agent:sender",
@@ -1311,7 +1311,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     Roles.create!(db, "collision-role", "alice bob", nil)
 
     member =
-      Wakes.schedule(db, %{
+      schedule_wake(db, %{
         session_key: "agent:filer6",
         target_role: "collision-role",
         origin: "agent:sender",
@@ -4128,7 +4128,7 @@ defmodule Tightbeam.CoordinationFabricTest do
   end
 
   defp schedule(db, opts) do
-    Wakes.schedule(db, %{
+    schedule_wake(db, %{
       session_key: Keyword.fetch!(opts, :session),
       origin: Keyword.get(opts, :origin, "process:tightbeam"),
       creator_session_key: Keyword.get(opts, :creator, "agent:sender"),
@@ -4138,6 +4138,14 @@ defmodule Tightbeam.CoordinationFabricTest do
       sender_scheduled: Keyword.get(opts, :sender_scheduled, false),
       summon: Keyword.get(opts, :summon, false)
     })
+  end
+
+  defp schedule_wake(db, input) do
+    if input[:class] == "fyi" and input[:digest] != true do
+      NoticeBatcher.set_lane_policy(db, input, true, "agent:test-policy")
+    end
+
+    Wakes.schedule(db, input)
   end
 
   defp turn(db, session_key, opts) do

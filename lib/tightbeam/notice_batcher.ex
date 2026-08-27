@@ -18,6 +18,16 @@ defmodule Tightbeam.NoticeBatcher do
   @states ~w(open sealed delivery_pending delivered delivery_failed canceled)
 
   @ddl """
+  CREATE TABLE IF NOT EXISTS notice_batching_lane_policies (
+    recipientAddress TEXT NOT NULL,
+    visibilityScope TEXT NOT NULL,
+    enabled INTEGER NOT NULL CHECK (enabled IN (0,1)),
+    policyRevision TEXT NOT NULL,
+    selectedBy TEXT NOT NULL,
+    selectedAt INTEGER NOT NULL CHECK (selectedAt >= 0),
+    PRIMARY KEY (recipientAddress, visibilityScope)
+  );
+
   CREATE TABLE IF NOT EXISTS notice_delivery_policies (
     policyRef TEXT PRIMARY KEY,
     sourceWakeId TEXT NOT NULL UNIQUE REFERENCES wakes(wakeId),
@@ -117,17 +127,69 @@ defmodule Tightbeam.NoticeBatcher do
   @spec policy_ref(String.t()) :: String.t()
   def policy_ref(source_wake_id), do: "notice-policy:" <> source_wake_id
 
+  @doc false
+  @spec set_lane_policy(GenServer.server(), map(), boolean(), String.t(), integer()) :: :ok
+  def set_lane_policy(
+        db \\ Tightbeam.DB,
+        recipient,
+        enabled,
+        selected_by,
+        at \\ now()
+      )
+      when is_boolean(enabled) and is_binary(selected_by) do
+    transaction!(db, fn txn ->
+      {recipient_address, visibility_scope} = recipient_lane(recipient)
+
+      Txn.q(
+        txn,
+        """
+        INSERT INTO notice_batching_lane_policies
+          (recipientAddress, visibilityScope, enabled, policyRevision, selectedBy, selectedAt)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        ON CONFLICT(recipientAddress, visibilityScope) DO UPDATE SET
+          enabled=excluded.enabled,
+          policyRevision=excluded.policyRevision,
+          selectedBy=excluded.selectedBy,
+          selectedAt=excluded.selectedAt
+        """,
+        [
+          recipient_address,
+          visibility_scope,
+          if(enabled, do: 1, else: 0),
+          @policy_revision,
+          selected_by,
+          at
+        ]
+      )
+
+      :ok
+    end)
+  end
+
+  @doc false
+  @spec lane_enabled_in_txn(Txn.t(), map()) :: boolean()
+  def lane_enabled_in_txn(%Txn{} = txn, recipient) do
+    {recipient_address, visibility_scope} = recipient_lane(recipient)
+
+    case Txn.q(
+           txn,
+           """
+           SELECT enabled FROM notice_batching_lane_policies
+           WHERE recipientAddress=?1 AND visibilityScope=?2 AND policyRevision=?3
+           """,
+           [recipient_address, visibility_scope, @policy_revision]
+         ) do
+      [[1]] -> true
+      _ -> false
+    end
+  end
+
   @doc "Record the publisher's durable policy decision before admission."
   @spec record_policy_in_txn(Txn.t(), map(), keyword()) :: String.t()
   def record_policy_in_txn(%Txn{} = txn, wake, opts \\ []) do
     ref = policy_ref(wake.wake_id)
-    target_role = wake[:target_role]
-
-    recipient_address =
-      if is_binary(target_role), do: "role:" <> target_role, else: "session:" <> wake.session_key
-
-    visibility_scope =
-      Keyword.get(opts, :visibility_scope, recipient_address <> ":recipient")
+    {recipient_address, default_scope} = recipient_lane(wake)
+    visibility_scope = Keyword.get(opts, :visibility_scope, default_scope)
 
     Txn.q(
       txn,
@@ -143,11 +205,11 @@ defmodule Tightbeam.NoticeBatcher do
         wake.wake_id,
         recipient_address,
         wake.session_key,
-        target_role,
+        wake[:target_role],
         visibility_scope,
         @policy_revision,
         wake.due_at,
-        if(Keyword.get(opts, :enabled, true), do: 1, else: 0),
+        if(Keyword.get(opts, :enabled, false), do: 1, else: 0),
         wake.created_at
       ]
     )
@@ -455,9 +517,6 @@ defmodule Tightbeam.NoticeBatcher do
       String.starts_with?(source.origin, "user:") ->
         refusal("user_source_notice", "user-authored notices never batch")
 
-      String.starts_with?(source.origin, "agent:") ->
-        refusal("agent_source_notice", "agent-to-agent messages are not eligible in v1")
-
       source.class != "fyi" ->
         refusal("ineligible_notice_class", "only non-user fyi notices batch in v1")
 
@@ -467,6 +526,17 @@ defmodule Tightbeam.NoticeBatcher do
   end
 
   defp refusal(code, message), do: {:error, %{code: code, message: message}}
+
+  defp recipient_lane(recipient) do
+    target_role = recipient[:target_role]
+
+    recipient_address =
+      if is_binary(target_role),
+        do: "role:" <> target_role,
+        else: "session:" <> Map.fetch!(recipient, :session_key)
+
+    {recipient_address, Map.get(recipient, :visibility_scope, recipient_address <> ":recipient")}
+  end
 
   defp existing_member(txn, source) do
     case Txn.q(
@@ -900,6 +970,14 @@ defmodule Tightbeam.NoticeBatcher do
   defp mark_delivery_failed_in_txn(txn, wake_id, reason, at) do
     Txn.q(
       txn,
+      "UPDATE wakes SET state='fired', firedAt=?2 WHERE wakeId=?1 AND state='pending'",
+      [wake_id, at]
+    )
+
+    if Txn.changes(txn) == 1, do: Wakes.publish_change_in_txn(txn, "wake.fired", wake_id)
+
+    Txn.q(
+      txn,
       """
       UPDATE notice_batches
       SET state='delivery_failed', deliveredAt=?2, terminalCause=?3,
@@ -918,7 +996,8 @@ defmodule Tightbeam.NoticeBatcher do
       DB.query(
         db,
         """
-        SELECT b.deliveryWakeId
+        SELECT b.deliveryWakeId,
+               EXISTS (SELECT 1 FROM turns t WHERE t.wakeId=b.deliveryWakeId)
         FROM notice_batches b
         LEFT JOIN wakes w ON w.wakeId=b.deliveryWakeId
         WHERE b.state='delivery_pending'
@@ -926,7 +1005,10 @@ defmodule Tightbeam.NoticeBatcher do
         """
       )
 
-    Enum.each(rows, fn [wake_id] -> delivery_delivered(db, wake_id, at) end)
+    Enum.each(rows, fn
+      [wake_id, 1] -> delivery_delivered(db, wake_id, at)
+      [wake_id, 0] -> delivery_terminal_failure(db, wake_id, :not_committed, at)
+    end)
   end
 
   defp active_member_rows(txn, batch_id) do
