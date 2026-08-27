@@ -1,29 +1,23 @@
 defmodule Tightbeam.LaneTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Ledger, EventLog, LaneManager, Placement, SessionLane}
+  alias Tightbeam.{DB, Ledger, EventLog, LaneManager, Placement, Schema, SessionLane}
 
   setup do
     db = :"db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
-    :ok = Ledger.ensure_schema(db)
-    :ok = EventLog.ensure_schema(db)
+    :ok = Schema.ensure_all(db)
 
     :ok =
       DB.execute(db, """
-      CREATE TABLE sessions (
-        sessionKey TEXT PRIMARY KEY,
-        model TEXT NOT NULL,
-        thinkingLevel TEXT,
-        modelContext TEXT,
-        harness TEXT NOT NULL,
-        state TEXT NOT NULL DEFAULT 'active',
-        updatedAt INTEGER NOT NULL DEFAULT 0
-      );
-      INSERT INTO sessions (sessionKey, model, thinkingLevel, harness)
+      INSERT INTO sessions
+        (sessionKey,displayName,ownerUserId,origin,operationalParent,archetype,
+         harness,provider,model,thinkingLevel,host,createdAt,updatedAt)
       VALUES
-        ('k1', 'claude-sonnet-5', 'medium', 'claude'),
-        ('k2', 'claude-sonnet-5', 'medium', 'claude');
+        ('k1','K1','t','user:t','k1','default','claude','anthropic',
+         'claude-sonnet-5','medium','testhost',1,1),
+        ('k2','K2','t','user:t','k1','default','claude','anthropic',
+         'claude-sonnet-5','medium','testhost',2,2);
       """)
 
     reg = start_supervised!({Registry, keys: :unique, name: Tightbeam.LaneRegistry})
@@ -78,6 +72,42 @@ defmodule Tightbeam.LaneTest do
     :ok = LaneManager.reconcile(mgr)
     assert eventually(fn -> Ledger.pending_sessions(ctx.db) == [] end)
     assert Agent.get(agent, &Enum.reverse(&1)) == ["first", "second"]
+  end
+
+  test "a delivered runner mutation commits with the terminal CAS and publishes afterward", ctx do
+    parent = self()
+    seq = enqueue!(ctx.db, "k1", "recover")
+
+    runner = fn _turn ->
+      {:ok,
+       %{
+         terminal_publish: fn terminal -> send(parent, {:wire_terminal, terminal}) end,
+         record_in_txn: fn txn ->
+           EventLog.lifecycle_in_txn(txn, "lane_success_record", "k1", "seq=#{seq}")
+           fn -> send(parent, :post_commit) end
+         end
+       }}
+    end
+
+    {:ok, _mgr} =
+      LaneManager.start_link(
+        db: ctx.db,
+        lane_sup: ctx.lane_sup,
+        task_sup: ctx.task_sup,
+        runner: runner,
+        interval: 60_000,
+        name: :"mgr_#{System.unique_integer([:positive])}"
+      )
+
+    assert_receive :post_commit
+    assert_receive {:wire_terminal, "delivered"}
+
+    assert {:ok, [["delivered"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [seq])
+
+    assert Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
+             event.kind == "lane_success_record" and event.subject == "k1"
+           end)
   end
 
   test "reconciler starts a lane for committed work with NO doorbell (liveness)", ctx do

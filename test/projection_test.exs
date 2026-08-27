@@ -1,7 +1,7 @@
 defmodule Tightbeam.ProjectionTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Projection}
+  alias Tightbeam.{DB, Projection, StateResources}
 
   setup do
     name = :"db_#{System.unique_integer([:positive])}"
@@ -103,6 +103,75 @@ defmodule Tightbeam.ProjectionTest do
     assert marker.client_message_id == nil
     assert marker.reply_to_message_id == nil
     assert marker.reply_to_client_message_id == nil
+    assert marker.message_type == "marker"
+  end
+
+  test "the write seam assigns every current discriminator without reading content", %{db: db} do
+    fixtures = [
+      {"assistant", "assistant", "tightbeam", "assistant"},
+      {"agent", "user", "agent:sender", "agent"},
+      {"process", "assistant", "process:scheduler", "substrate"},
+      {"remedy", "assistant", "remedy:retry-statute", "substrate"},
+      {"human", "user", "user:flynn", nil},
+      {"historical", "assistant", nil, nil}
+    ]
+
+    Enum.each(fixtures, fn {label, role, sender, expected_type} ->
+      input = %{
+        session_key: "types",
+        role: role,
+        sender: sender,
+        content: "identical content"
+      }
+
+      assert {:appended, message} = Projection.append(db, input)
+      assert message.message_type == expected_type, label
+      assert message.role == role, label
+      assert message.sender == sender, label
+      assert message.content == "identical content", label
+    end)
+
+    assert {:ok, {:appended, substrate}} =
+             DB.transaction(db, fn txn ->
+               Projection.append_substrate_in_txn(txn, "types", "identical content")
+             end)
+
+    assert substrate.message_type == "substrate"
+    assert substrate.role == "assistant"
+  end
+
+  test "the shared public serializer omits null and preserves open stored strings", %{db: db} do
+    base = %{
+      session_key: "same",
+      role: "assistant",
+      sender: "process:tightbeam",
+      content: "same content"
+    }
+
+    assert {:appended, marker} = Projection.append(db, Map.put(base, :message_type, "marker"))
+
+    assert {:appended, future} =
+             Projection.append(db, Map.put(base, :message_type, "future-kind"))
+
+    assert {:appended, historical} =
+             Projection.append(db, %{base | sender: nil})
+
+    marker_item = StateResources.message(marker)
+    future_item = StateResources.message(future)
+    historical_item = StateResources.message(historical)
+
+    assert marker_item["messageType"] == "marker"
+    assert future_item["messageType"] == "future-kind"
+    refute Map.has_key?(historical_item, "messageType")
+    refute JSON.encode!(historical_item) =~ "messageType"
+
+    assert marker_item["role"] == future_item["role"]
+    assert future_item["role"] == historical_item["role"]
+    assert marker_item["content"] == future_item["content"]
+    assert future_item["content"] == historical_item["content"]
+
+    assert presented_message_type(future_item) == "assistant"
+    assert presented_message_type(historical_item) == "assistant"
   end
 
   test "after replays in order and an unknown cursor replays from the start", %{db: db} do
@@ -186,4 +255,10 @@ defmodule Tightbeam.ProjectionTest do
 
     assert message =~ "UNIQUE constraint"
   end
+
+  defp presented_message_type(%{"messageType" => type})
+       when type in ~w(assistant substrate marker agent),
+       do: type
+
+  defp presented_message_type(_item), do: "assistant"
 end

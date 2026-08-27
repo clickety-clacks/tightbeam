@@ -33,7 +33,8 @@ defmodule Tightbeam.Schema do
     Tightbeam.WorkState,
     Tightbeam.Productions.BubbleSweeper,
     Tightbeam.HarnessProcess,
-    Tightbeam.AdminProjection
+    Tightbeam.AdminProjection,
+    Tightbeam.HarnessHealth
   ]
 
   # The shape this build writes. Bump it when a production table changes in a
@@ -72,9 +73,12 @@ defmodule Tightbeam.Schema do
   # `CREATE TABLE IF NOT EXISTS`, so a v3 database must refuse by name rather
   # than failing on the first return with a raw column/CHECK error.
   # The operational-parent port adds a required `sessions.operationalParent`
-  # column. The v4 stamp is the one exact predecessor this build upgrades.
-  @shape "coordination-fabric-v1-phase1-v6"
-  @previous_shape "coordination-fabric-v1-phase1-v5"
+  # column. The v4 stamp is the one exact predecessor that upgrade accepts.
+  # The nullable transcript discriminator adds `messages.messageType`; v6 is
+  # its one exact predecessor, and historical rows remain null.
+  @shape "coordination-fabric-v1-phase1-v7"
+  @message_type_previous_shape "coordination-fabric-v1-phase1-v6"
+  @cold_start_previous_shape "coordination-fabric-v1-phase1-v5"
   @operational_parent_shape "coordination-fabric-v1-phase1-v5"
   @operational_parent_previous_shape "coordination-fabric-v1-phase1-v4"
 
@@ -773,8 +777,8 @@ defmodule Tightbeam.Schema do
   missing or unknown stamp is a refusal and a bug report, never an inference.
   Note the direction — the one existence question below is asked to REFUSE,
   never to deduce a shape and accommodate it. The sole accepted predecessor is
-  named by `@previous_shape`; its operational-parent upgrade is exact and
-  transactional. No shape is inferred from stored DDL.
+  named by the exact migration stamps below; each upgrade is transactional.
+  No shape is inferred from stored DDL.
   """
   @spec ensure_all(DB.server()) :: :ok
   def ensure_all(db) do
@@ -850,13 +854,54 @@ defmodule Tightbeam.Schema do
   end
 
   @doc false
+  @spec upgrade_message_type_v1(DB.server()) :: :ok
+  def upgrade_message_type_v1(db) do
+    migration_time = System.system_time(:millisecond)
+
+    case DB.transaction(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@message_type_previous_shape]] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message: "incompatible_message_type_v1: predecessor stamp #{inspect(rows)}"
+           end
+
+           :ok = Txn.exec(txn, "ALTER TABLE messages ADD COLUMN messageType TEXT")
+
+           Txn.q(
+             txn,
+             "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1",
+             [@message_type_previous_shape, @shape, migration_time]
+           )
+
+           if Txn.changes(txn) != 1 do
+             raise ShapeError, message: "incompatible_message_type_v1: stamp race"
+           end
+
+           :ok
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message: "incompatible_message_type_v1: upgrade failed: #{Exception.message(error)}"
+    end
+  end
+
+  @doc false
   @spec upgrade_cold_start_v1(DB.server(), keyword()) :: :ok
   def upgrade_cold_start_v1(db, opts \\ []) when is_list(opts) do
     migration_time = System.system_time(:millisecond)
 
     case DB.foreign_key_rebuild(db, fn txn ->
            case Txn.q(txn, "SELECT shape FROM schema_stamp") do
-             [[@previous_shape]] ->
+             [[@cold_start_previous_shape]] ->
                :ok
 
              rows ->
@@ -940,7 +985,7 @@ defmodule Tightbeam.Schema do
            Txn.q(
              txn,
              "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1",
-             [@previous_shape, @shape, migration_time]
+             [@cold_start_previous_shape, @message_type_previous_shape, migration_time]
            )
 
            if Txn.changes(txn) != 1, do: raise("cold-start stamp race")
@@ -1169,12 +1214,17 @@ defmodule Tightbeam.Schema do
       {:ok, [[@shape]]} ->
         :ok
 
-      {:ok, [[@previous_shape]]} ->
-        upgrade_cold_start_v1(db)
+      {:ok, [[@message_type_previous_shape]]} ->
+        upgrade_message_type_v1(db)
+
+      {:ok, [[@cold_start_previous_shape]]} ->
+        :ok = upgrade_cold_start_v1(db)
+        upgrade_message_type_v1(db)
 
       {:ok, [[@operational_parent_previous_shape]]} ->
         :ok = upgrade_operational_parent_v1(db)
-        upgrade_cold_start_v1(db)
+        :ok = upgrade_cold_start_v1(db)
+        upgrade_message_type_v1(db)
 
       {:ok, []} ->
         # No stamp. Either a database this build is about to create, or one
@@ -1191,8 +1241,8 @@ defmodule Tightbeam.Schema do
           this build: #{@shape}
 
         There is no migration from #{found}. The only supported upgrade sources
-        are #{@operational_parent_previous_shape} and #{@previous_shape}. Move this
-        database aside and let it be recreated.
+        are #{@operational_parent_previous_shape}, #{@cold_start_previous_shape}, and
+        #{@message_type_previous_shape}. Move this database aside and let it be recreated.
         """
 
       # More than one shape stamped. Nothing writes a second row, so this is a

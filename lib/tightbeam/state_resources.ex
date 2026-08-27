@@ -493,7 +493,17 @@ defmodule Tightbeam.StateResources do
   def session(row), do: public(row)
   def role(row), do: row |> public() |> correlate("role", "name")
   def artifact(row), do: public(row)
-  def message(row), do: public(row)
+
+  def message(row) do
+    stored_type = value(row, :message_type)
+    row = public(row)
+
+    case stored_type do
+      nil -> Map.delete(row, "messageType")
+      type when is_binary(type) -> Map.put(row, "messageType", type)
+      _other -> raise ArgumentError, "messageType must be a string when present"
+    end
+  end
 
   def condition_fact(row) do
     row = public(row)

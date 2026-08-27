@@ -501,6 +501,37 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 string_field("reason", reason),
             ],
         )),
+        Command::RepairAssignment {
+            identity,
+            assignment_id,
+            action,
+            model,
+            effort,
+            context,
+            outcome,
+            turn_seq,
+            idempotency_key,
+        } => {
+            let mut params = vec![
+                string_field("assignmentId", assignment_id),
+                string_field("action", action),
+                string_field("idempotencyKey", idempotency_key),
+            ];
+            for (name, value) in [
+                ("model", model),
+                ("effort", effort),
+                ("context", context),
+                ("outcome", outcome),
+            ] {
+                if let Some(value) = value {
+                    params.push(string_field(name, value));
+                }
+            }
+            if let Some(value) = turn_seq {
+                params.push(format!("\"turnSeq\":{value}"));
+            }
+            Ok(request(identity, "repair-assignment", vec![], params))
+        }
         Command::WorkItemCreate {
             identity,
             title,
@@ -1544,6 +1575,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::ReturnRequest { identity, .. }
         | Command::RevokeAssignment { identity, .. }
         | Command::ReopenAssignment { identity, .. }
+        | Command::RepairAssignment { identity, .. }
         | Command::WorkItemCreate { identity, .. }
         | Command::WorkItemGet { identity, .. }
         | Command::WorkItemTrace { identity, .. }

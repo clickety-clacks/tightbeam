@@ -10,7 +10,7 @@ defmodule Tightbeam.Projection do
   older ever wrote a -1, and nothing older reads this table.
   """
 
-  alias Tightbeam.DB
+  alias Tightbeam.{DB, Origin}
   alias Tightbeam.DB.Txn
 
   @type db :: GenServer.server()
@@ -39,6 +39,7 @@ defmodule Tightbeam.Projection do
           id: String.t(),
           session_key: String.t(),
           role: String.t(),
+          message_type: String.t() | nil,
           content: String.t(),
           timestamp: integer(),
           sender: String.t() | nil,
@@ -57,6 +58,7 @@ defmodule Tightbeam.Projection do
     id                     TEXT NOT NULL UNIQUE,
     sessionKey             TEXT NOT NULL,
     role                   TEXT NOT NULL CHECK (role IN ('user','assistant')),
+    messageType            TEXT,
     content                TEXT NOT NULL,
     timestamp              INTEGER NOT NULL,
     sender                 TEXT,
@@ -108,7 +110,7 @@ defmodule Tightbeam.Projection do
           Txn.q(
             txn,
             """
-              SELECT seq, id, sessionKey, role, content, timestamp, sender, deviceId,
+              SELECT seq, id, sessionKey, role, messageType, content, timestamp, sender, deviceId,
                      clientMessageId, replyToMessageId, replyToClientMessageId,
                      llmVisibleMessageId, attachments, attentionTier
               FROM messages
@@ -138,15 +140,16 @@ defmodule Tightbeam.Projection do
         Txn.q(
           txn,
           """
-            INSERT INTO messages (id, sessionKey, role, content, timestamp, sender, deviceId,
+            INSERT INTO messages (id, sessionKey, role, messageType, content, timestamp, sender, deviceId,
               clientMessageId, replyToMessageId, replyToClientMessageId, llmVisibleMessageId, attachments,
               attentionTier)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
           """,
           [
             id,
             Map.fetch!(input, :session_key),
             Map.fetch!(input, :role),
+            message_type(input),
             Map.fetch!(input, :content),
             Map.get(input, :timestamp, System.system_time(:millisecond)),
             Map.get(input, :sender),
@@ -178,6 +181,21 @@ defmodule Tightbeam.Projection do
     append_in_txn(txn, %{
       session_key: session_key,
       role: "assistant",
+      message_type: "marker",
+      content: content,
+      sender: "process:tightbeam",
+      attention_tier: attention_tier(attention)
+    })
+  end
+
+  @doc "Append an ordinary Tightbeam notice without classifying it as a structural boundary."
+  @spec append_substrate_in_txn(Txn.t(), String.t(), String.t(), attention()) ::
+          {:appended, message()}
+  def append_substrate_in_txn(%Txn{} = txn, session_key, content, attention \\ :normal) do
+    append_in_txn(txn, %{
+      session_key: session_key,
+      role: "assistant",
+      message_type: "substrate",
       content: content,
       sender: "process:tightbeam",
       attention_tier: attention_tier(attention)
@@ -206,7 +224,7 @@ defmodule Tightbeam.Projection do
       DB.query(
         db,
         """
-          SELECT seq, id, sessionKey, role, content, timestamp, sender, deviceId,
+          SELECT seq, id, sessionKey, role, messageType, content, timestamp, sender, deviceId,
                  clientMessageId, replyToMessageId, replyToClientMessageId,
                  llmVisibleMessageId, attachments, attentionTier
           FROM messages WHERE id = ?1
@@ -241,7 +259,7 @@ defmodule Tightbeam.Projection do
       DB.query(
         db,
         """
-          SELECT seq, id, sessionKey, role, content, timestamp, sender, deviceId,
+          SELECT seq, id, sessionKey, role, messageType, content, timestamp, sender, deviceId,
                  clientMessageId, replyToMessageId, replyToClientMessageId,
                  llmVisibleMessageId, attachments, attentionTier
           FROM messages WHERE sessionKey = ?1 AND seq > ?2 ORDER BY seq ASC LIMIT ?3
@@ -304,7 +322,7 @@ defmodule Tightbeam.Projection do
     Txn.q(
       txn,
       """
-        SELECT seq, id, sessionKey, role, content, timestamp, sender, deviceId,
+        SELECT seq, id, sessionKey, role, messageType, content, timestamp, sender, deviceId,
                clientMessageId, replyToMessageId, replyToClientMessageId,
                llmVisibleMessageId, attachments, attentionTier
         FROM messages WHERE id = ?1
@@ -318,6 +336,7 @@ defmodule Tightbeam.Projection do
          id,
          session_key,
          role,
+         message_type,
          content,
          timestamp,
          sender,
@@ -334,6 +353,7 @@ defmodule Tightbeam.Projection do
       id: id,
       session_key: session_key,
       role: role,
+      message_type: message_type,
       content: content,
       timestamp: timestamp,
       sender: sender,
@@ -346,6 +366,20 @@ defmodule Tightbeam.Projection do
       attention_tier: attention_tier
     }
   end
+
+  defp message_type(%{message_type: message_type}) when is_binary(message_type),
+    do: message_type
+
+  defp message_type(input) do
+    case Map.get(input, :sender) do
+      "tightbeam" -> "assistant"
+      sender -> message_type_for_origin(Origin.parse(sender))
+    end
+  end
+
+  defp message_type_for_origin({:agent, _handle}), do: "agent"
+  defp message_type_for_origin({class, _name}) when class in [:process, :remedy], do: "substrate"
+  defp message_type_for_origin(_origin), do: nil
 
   defp transaction!(db, fun) do
     case DB.transaction(db, fun) do

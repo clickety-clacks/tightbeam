@@ -57,6 +57,8 @@ defmodule Tightbeam.GatewayTest do
     EventLog,
     EffortCheckin,
     Gateway,
+    HarnessHealth,
+    HarnessProcess,
     Identity,
     Idempotency,
     LaneManager,
@@ -148,6 +150,51 @@ defmodule Tightbeam.GatewayTest do
       GenServer.stop(adapter)
       {:noreply, state}
     end
+  end
+
+  defmodule RepairCoordinatorStub do
+    use GenServer
+
+    def start_link({parent, result}), do: GenServer.start_link(__MODULE__, {parent, result})
+    def init(state), do: {:ok, state}
+
+    def handle_call({:close_adapter, key}, _from, {parent, result} = state) do
+      send(parent, {:repair_close_adapter, key})
+      {:reply, result, state}
+    end
+  end
+
+  defmodule FenceDeleteRaceDB do
+    use GenServer
+
+    def start_link({name, db, parent}),
+      do: GenServer.start_link(__MODULE__, {db, parent}, name: name)
+
+    def init({db, parent}), do: {:ok, %{db: db, parent: parent, armed: true}}
+
+    def handle_call({:query, sql, params} = request, _from, state) do
+      state =
+        if state.armed and params != [] and
+             String.contains?(sql, "DELETE FROM harness_park_fences") and
+             String.contains?(sql, "adapterKey = ?1") do
+          send(state.parent, {:before_reconciled_fence_delete, self()})
+
+          receive do
+            :release_reconciled_fence_delete -> :ok
+          after
+            5_000 -> raise "timed out waiting to release reconciled fence delete"
+          end
+
+          %{state | armed: false}
+        else
+          state
+        end
+
+      {:reply, GenServer.call(state.db, request), state}
+    end
+
+    def handle_call(request, _from, state),
+      do: {:reply, GenServer.call(state.db, request), state}
   end
 
   defmodule AdapterStub do
@@ -1155,6 +1202,447 @@ defmodule Tightbeam.GatewayTest do
     assert Keyword.fetch!(supervision_opts, :recover) == false
   end
 
+  test "repair-assignment requires outcome reconciliation and appends one deduped rerun", ctx do
+    session = Org.get(ctx.db, "k1")
+
+    assert {:ok, []} =
+             DB.transaction(ctx.db, fn txn ->
+               DB.Txn.q(
+                 txn,
+                 """
+                 INSERT INTO assignments
+                   (id,subject,holderKey,openedByUser,openedAt,state,holderHarness,holderProvider)
+                 VALUES ('asg_runner_repair','continue work','k1','flynn',1,'open',?1,?2)
+                 """,
+                 [session.harness, session.provider]
+               )
+             end)
+
+    {:ok, source_seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: "k1",
+        message_id: "m-runner-repair",
+        origin: "agent:k1",
+        prompt: "continue work",
+        assignment_id: "asg_runner_repair"
+      })
+
+    {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test-lane")
+
+    :ok =
+      Ledger.finish(ctx.db, source_seq, "failed_unknown", "interrupted: outcome unknown",
+        owner_lease: turn.owner_lease
+      )
+
+    assert {:opened, incident} =
+             HarnessHealth.observe(ctx.db, %{
+               correlation_id: "gateway-repair-interrupted",
+               harness: session.harness,
+               host: session.host,
+               failure_class: "interrupted-outcome-unknown",
+               evidence_kind: "authoritative-provider",
+               session_key: "k1",
+               assignment_id: "asg_runner_repair",
+               observed_at: 10,
+               cause: "restart interrupted turn",
+               principal: "process:tightbeam"
+             })
+
+    lane = :"repair_lane_#{System.unique_integer([:positive])}"
+    {:ok, lane_pid} = LaneDoorbell.start_link({self(), lane})
+    on_exit(fn -> if Process.alive?(lane_pid), do: GenServer.stop(lane_pid) end)
+    handler = Gateway.handlers(gateway_config(ctx.catalog_base, ctx.db, 0))["repair-assignment"]
+
+    call = %{
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      lane_manager: lane,
+      params: %{
+        assignment_id: "asg_runner_repair",
+        action: "rerun",
+        idempotency_key: "repair-one"
+      }
+    }
+
+    assert %{ok: false, code: "outcome_reconciliation_required"} =
+             handler.(put_in(call, [:params, :idempotency_key], "repair-unreconciled"))
+
+    repaired = handler.(put_in(call, [:params, :outcome], "not-completed"))
+    assert repaired.ok
+    assert repaired.incidentId == incident.id
+    assert repaired.sourceTurnSeq == source_seq
+    assert_receive {:ensure_lane, "k1"}
+
+    duplicate = handler.(put_in(call, [:params, :outcome], "not-completed"))
+    assert duplicate == repaired
+    refute_receive {:ensure_lane, "k1"}, 50
+
+    assert {:ok, [["open"]]} =
+             DB.query(ctx.db, "SELECT state FROM assignments WHERE id='asg_runner_repair'")
+
+    assert {:ok, [[^source_seq, "failed_unknown"], [attempt_seq, "queued"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT seq,status FROM turns WHERE assignmentId='asg_runner_repair' ORDER BY seq"
+             )
+
+    assert attempt_seq == repaired.attemptTurnSeq
+  end
+
+  test "an opener can relaunch a never-launched holder without revoking custody", ctx do
+    session = Org.get(ctx.db, "k1")
+
+    assert {:ok, []} =
+             DB.transaction(ctx.db, fn txn ->
+               DB.Txn.q(
+                 txn,
+                 """
+                 INSERT INTO assignments
+                   (id,subject,holderKey,openedByUser,openedAt,state,holderHarness,holderProvider)
+                 VALUES ('asg_never_launched','start the work','k1','flynn',2,'open',?1,?2)
+                 """,
+                 [session.harness, session.provider]
+               )
+             end)
+
+    lane = :"relaunch_lane_#{System.unique_integer([:positive])}"
+    {:ok, lane_pid} = LaneDoorbell.start_link({self(), lane})
+    on_exit(fn -> if Process.alive?(lane_pid), do: GenServer.stop(lane_pid) end)
+    handler = Gateway.handlers(gateway_config(ctx.catalog_base, ctx.db, 0))["repair-assignment"]
+
+    call = %{
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      conn_registry: ctx.registry,
+      lane_manager: lane,
+      params: %{
+        assignment_id: "asg_never_launched",
+        action: "relaunch",
+        idempotency_key: "launch-one"
+      }
+    }
+
+    assert %{ok: true, action: "relaunch"} = launched = handler.(call)
+    assert handler.(call) == launched
+
+    assert_receive {:ensure_lane, "k1"}
+    refute_receive {:ensure_lane, "k1"}, 50
+
+    assert {:ok, [["queued", "asg_never_launched"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT status,assignmentId FROM turns WHERE assignmentId='asg_never_launched'"
+             )
+
+    assert {:ok, [["open"]]} =
+             DB.query(ctx.db, "SELECT state FROM assignments WHERE id='asg_never_launched'")
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM assignment_repair_attempts WHERE assignmentId='asg_never_launched'"
+             )
+  end
+
+  test "restart is authorized, executes once per key, and replays its terminal result", ctx do
+    repair = failed_repair_route!(ctx, "asg_restart_repair", "adapter_unavailable", 30)
+    {:ok, coordinator} = RepairCoordinatorStub.start_link({self(), :ok})
+
+    handler =
+      ctx.catalog_base
+      |> gateway_config(ctx.db, 0)
+      |> Map.put(:adapter_coordinator, coordinator)
+      |> Gateway.handlers()
+      |> Map.fetch!("repair-assignment")
+
+    unauthorized =
+      handler.(%{
+        origin: "user:zoe",
+        principal: {:user, "zoe"},
+        params: %{
+          assignment_id: repair.assignment_id,
+          action: "restart",
+          idempotency_key: "restart-unauthorized"
+        }
+      })
+
+    assert unauthorized == %{
+             ok: false,
+             code: "not_authorized",
+             message: "assignment repair requires its opener or an admin"
+           }
+
+    refute unauthorized.message =~ repair.incident.id
+
+    call = %{
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      lane_manager: ctx.lane,
+      params: %{
+        assignment_id: repair.assignment_id,
+        action: "restart",
+        idempotency_key: "restart-once"
+      }
+    }
+
+    assert %{ok: true, action: "restart"} = first = handler.(call)
+    assert handler.(call) == first
+    assert_receive {:repair_close_adapter, {:claude, "shared", "testhost"}}
+    refute_receive {:repair_close_adapter, _}, 50
+    assert_receive {:ensure_lane, "k1"}
+    refute_receive {:ensure_lane, "k1"}, 50
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM assignment_repair_attempts WHERE assignmentId=?1",
+               [repair.assignment_id]
+             )
+
+    assert {:ok, [["open"]]} =
+             DB.query(ctx.db, "SELECT state FROM assignments WHERE id=?1", [
+               repair.assignment_id
+             ])
+  end
+
+  test "a failed restart is persisted and replay never repeats the failing side effect", ctx do
+    repair = failed_repair_route!(ctx, "asg_failed_restart", "task_crash", 40)
+    {:ok, coordinator} = RepairCoordinatorStub.start_link({self(), {:error, :still_wedged}})
+
+    handler =
+      ctx.catalog_base
+      |> gateway_config(ctx.db, 0)
+      |> Map.put(:adapter_coordinator, coordinator)
+      |> Gateway.handlers()
+      |> Map.fetch!("repair-assignment")
+
+    call = %{
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      params: %{
+        assignment_id: repair.assignment_id,
+        action: "restart",
+        idempotency_key: "failed-restart-once"
+      }
+    }
+
+    assert %{ok: false, code: "repair_failed"} = first = handler.(call)
+    assert handler.(call) == first
+    assert_receive {:repair_close_adapter, {:claude, "shared", "testhost"}}
+    refute_receive {:repair_close_adapter, _}, 50
+
+    assert HarnessHealth.get(ctx.db, repair.incident.id).state == "open"
+
+    assert {:ok, [["open"]]} =
+             DB.query(ctx.db, "SELECT state FROM assignments WHERE id=?1", [
+               repair.assignment_id
+             ])
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM turn_repair_attempts WHERE assignmentId=?1",
+               [repair.assignment_id]
+             )
+  end
+
+  test "model repair tunes once and exact replay returns the original rerun result", ctx do
+    repair = failed_repair_route!(ctx, "asg_model_repair", "model_unavailable", 50)
+    handler = Gateway.handlers(gateway_config(ctx.catalog_base, ctx.db, 0))["repair-assignment"]
+
+    start_supervised!(
+      {SessionLane,
+       session_key: "k1",
+       db: ctx.db,
+       task_sup: Tightbeam.TurnTaskSupervisor,
+       runner: fn _turn -> {:ok, %{text: "incident notice delivered"}} end}
+    )
+
+    assert eventually(fn ->
+             SessionLane.at_turn_boundary("k1", fn -> :ready end) == {:ok, :ready}
+           end)
+
+    call = %{
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      lane_manager: ctx.lane,
+      params: %{
+        assignment_id: repair.assignment_id,
+        action: "tune",
+        idempotency_key: "model-tune-once",
+        model: "claude-sonnet-4-6"
+      }
+    }
+
+    assert %{ok: true, action: "tune"} = first = handler.(call)
+    assert handler.(call) == first
+    assert Org.get(ctx.db, "k1").model.family == "claude-sonnet-4-6"
+    assert_receive {:ensure_lane, "k1"}
+    refute_receive {:ensure_lane, "k1"}, 50
+
+    retune_markers =
+      Projection.list_after(ctx.db, "k1", nil, 50, 0)
+      |> Enum.filter(&String.contains?(&1.content || "", "[model retune]"))
+
+    assert length(retune_markers) == 1
+  end
+
+  test "rate limit opens a durable no-claim park and explicit resume releases it once", ctx do
+    repair = failed_repair_route!(ctx, "asg_rate_resume", "rate-limit-dead", 60)
+    adapter_key = {:claude, "shared", "testhost"}
+    assert Tightbeam.HarnessProcess.parked?(ctx.db, adapter_key)
+
+    {:ok, blocked_seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: "k1",
+        message_id: "m-rate-blocked",
+        origin: "agent:k1",
+        prompt: "must remain parked",
+        assignment_id: repair.assignment_id
+      })
+
+    parent = self()
+
+    start_supervised!(
+      {SessionLane,
+       session_key: "k1",
+       db: ctx.db,
+       task_sup: Tightbeam.TurnTaskSupervisor,
+       runner: fn turn ->
+         send(parent, {:rate_runner, turn.seq})
+         {:ok, %{text: "recovered"}}
+       end}
+    )
+
+    refute_receive {:rate_runner, _}, 100
+
+    assert {:ok, [["queued"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [blocked_seq])
+
+    adapter_sup = :"rate_limit_adapter_sup_#{System.unique_integer([:positive])}"
+    coordinator = :"rate_limit_coordinator_#{System.unique_integer([:positive])}"
+
+    start_supervised!({DynamicSupervisor, strategy: :one_for_one, name: adapter_sup})
+
+    start_supervised!(
+      {Tightbeam.AdapterCoordinator,
+       adapter_sup: adapter_sup,
+       adapter_context: fn _ -> [] end,
+       adapter_opts: fn _, _ -> flunk("parked work must not launch an adapter") end,
+       db: ctx.db,
+       name: coordinator}
+    )
+
+    assert Tightbeam.HarnessProcess.parked?(ctx.db, adapter_key)
+    assert :ok = SessionLane.nudge("k1")
+    refute_receive {:rate_runner, _}, 100
+
+    assert {:ok, [["queued"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [blocked_seq])
+
+    assert :repair_required =
+             HarnessHealth.resolve(ctx.db, %{
+               correlation_id: "rate-success-before-resume",
+               harness: "claude",
+               host: "testhost",
+               failure_class: "rate-limit-dead",
+               session_key: "k1",
+               assignment_id: nil,
+               observed_at: 61,
+               cause: "a concurrent turn delivered before explicit resume",
+               principal: "agent:k1"
+             })
+
+    assert Tightbeam.HarnessProcess.parked?(ctx.db, adapter_key)
+    assert HarnessHealth.get(ctx.db, repair.incident.id).state == "open"
+
+    {:ok, repair_coordinator} = RepairCoordinatorStub.start_link({self(), :ok})
+
+    handler =
+      ctx.catalog_base
+      |> gateway_config(ctx.db, 0)
+      |> Map.put(:adapter_coordinator, repair_coordinator)
+      |> Gateway.handlers()
+      |> Map.fetch!("repair-assignment")
+
+    call = %{
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      lane_manager: ctx.lane,
+      params: %{
+        assignment_id: repair.assignment_id,
+        action: "resume",
+        idempotency_key: "rate-resume-once"
+      }
+    }
+
+    assert %{ok: true, action: "resume"} = first = handler.(call)
+    assert handler.(call) == first
+    refute Tightbeam.HarnessProcess.parked?(ctx.db, adapter_key)
+    assert_receive {:repair_close_adapter, ^adapter_key}
+    refute_receive {:repair_close_adapter, _}, 50
+
+    assert :ok = SessionLane.nudge("k1")
+    assert_receive {:rate_runner, ^blocked_seq}, 500
+
+    assert eventually(fn ->
+             match?(
+               {:ok, [["delivered"]]},
+               DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [blocked_seq])
+             )
+           end)
+  end
+
+  defp failed_repair_route!(ctx, assignment_id, failure_class, observed_at) do
+    session = Org.get(ctx.db, "k1")
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO assignments
+                 (id,subject,holderKey,openedByUser,openedAt,state,holderHarness,holderProvider)
+               VALUES (?1,'continue held work','k1','flynn',?2,'open',?3,?4)
+               """,
+               [assignment_id, observed_at, session.harness, session.provider]
+             )
+
+    {:ok, source_seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: "k1",
+        message_id: "m-#{assignment_id}",
+        origin: "agent:k1",
+        prompt: "continue held work",
+        assignment_id: assignment_id
+      })
+
+    {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "repair-fixture")
+
+    :ok =
+      Ledger.finish(ctx.db, source_seq, "failed", failure_class, owner_lease: turn.owner_lease)
+
+    assert {:opened, incident} =
+             HarnessHealth.observe(ctx.db, %{
+               correlation_id: "route-#{assignment_id}",
+               harness: session.harness,
+               host: session.host,
+               failure_class: failure_class,
+               evidence_kind: "authoritative-provider",
+               session_key: "k1",
+               assignment_id: assignment_id,
+               observed_at: observed_at,
+               cause: failure_class,
+               principal: "process:tightbeam"
+             })
+
+    %{
+      assignment_id: assignment_id,
+      source_seq: source_seq,
+      incident: incident,
+      session: session
+    }
+  end
+
   # Hosts assimilated before the endpoint file existed, and hosts whose org token
   # has since been rotated, must not need a second ceremony: boot re-provisions
   # every registered satellite, so the operator shell heals on restart.
@@ -1441,6 +1929,122 @@ defmodule Tightbeam.GatewayTest do
       refute encoded =~ "cli_token"
       refute encoded =~ session.cli_token
     end)
+  end
+
+  test "reconciliation cannot delete a rate-limit fence opened at its cleanup boundary", ctx do
+    assignment_id = "asg_rate_reconcile_race"
+    adapter_key = {:claude, "shared", "testhost"}
+    session = Org.get(ctx.db, "k1")
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO assignments
+                 (id,subject,holderKey,openedByUser,openedAt,state,holderHarness,holderProvider)
+               VALUES (?1,'continue held work','k1','flynn',70,'open',?2,?3)
+               """,
+               [assignment_id, session.harness, session.provider]
+             )
+
+    {:ok, source_seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: "k1",
+        message_id: "m-rate-reconcile-race",
+        origin: "agent:k1",
+        prompt: "continue held work",
+        assignment_id: assignment_id
+      })
+
+    {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "rate-reconcile-race")
+
+    :ok =
+      Ledger.finish(ctx.db, source_seq, "failed", "rate-limit-dead",
+        owner_lease: turn.owner_lease
+      )
+
+    Tightbeam.HarnessProcess.prepare_launch(
+      [
+        cmd: ["/bin/true"],
+        stderr_path: Path.join(ctx.catalog_base, "rate-reconcile-race.stderr"),
+        process_identity_dir: ctx.catalog_base,
+        process_helper: "/bin/true"
+      ],
+      ctx.db,
+      adapter_key
+    )
+
+    prior_wait = Application.get_env(:tightbeam, :harness_process_identity_wait_ms)
+    Application.put_env(:tightbeam, :harness_process_identity_wait_ms, 0)
+
+    on_exit(fn ->
+      if prior_wait,
+        do: Application.put_env(:tightbeam, :harness_process_identity_wait_ms, prior_wait),
+        else: Application.delete_env(:tightbeam, :harness_process_identity_wait_ms)
+    end)
+
+    race_db = :"rate_reconcile_race_db_#{System.unique_integer([:positive])}"
+    proxy = start_supervised!({FenceDeleteRaceDB, {race_db, ctx.db, self()}})
+    reconciliation = Task.async(fn -> Tightbeam.HarnessProcess.reconcile(race_db) end)
+
+    assert_receive {:before_reconciled_fence_delete, ^proxy}
+
+    assert {:opened, incident} =
+             HarnessHealth.observe(ctx.db, %{
+               correlation_id: "rate-reconcile-race",
+               harness: session.harness,
+               host: session.host,
+               failure_class: "rate-limit-dead",
+               evidence_kind: "authoritative-provider",
+               session_key: "k1",
+               assignment_id: assignment_id,
+               observed_at: 71,
+               cause: "provider rate limit",
+               principal: "process:tightbeam"
+             })
+
+    assert HarnessProcess.parked?(ctx.db, adapter_key)
+    send(proxy, :release_reconciled_fence_delete)
+    assert Task.await(reconciliation) == :ok
+    assert HarnessProcess.parked?(ctx.db, adapter_key)
+    assert HarnessHealth.get(ctx.db, incident.id).state == "open"
+
+    assert :repair_required =
+             HarnessHealth.resolve(ctx.db, %{
+               correlation_id: "rate-reconcile-race-normal-success",
+               harness: session.harness,
+               host: session.host,
+               failure_class: "rate-limit-dead",
+               session_key: "k1",
+               assignment_id: nil,
+               observed_at: 72,
+               cause: "normal success before explicit resume",
+               principal: "agent:k1"
+             })
+
+    {:ok, repair_coordinator} = RepairCoordinatorStub.start_link({self(), :ok})
+
+    handler =
+      ctx.catalog_base
+      |> gateway_config(ctx.db, 0)
+      |> Map.put(:adapter_coordinator, repair_coordinator)
+      |> Gateway.handlers()
+      |> Map.fetch!("repair-assignment")
+
+    assert %{ok: true, action: "resume"} =
+             handler.(%{
+               origin: "user:flynn",
+               principal: {:user, "flynn"},
+               lane_manager: ctx.lane,
+               params: %{
+                 assignment_id: assignment_id,
+                 action: "resume",
+                 idempotency_key: "rate-reconcile-race-resume"
+               }
+             })
+
+    refute HarnessProcess.parked?(ctx.db, adapter_key)
+    assert_receive {:repair_close_adapter, ^adapter_key}
   end
 
   test "children sweeps newer credentials from abandoned identity homes before adapters", ctx do
@@ -3364,6 +3968,7 @@ defmodule Tightbeam.GatewayTest do
 
     assert [marker] = Projection.list_after(ctx.db, "retune", nil, 50, 0)
     assert marker.sender == "process:tightbeam", "the anti-forgery: no session can type one"
+    assert marker.message_type == "marker"
     assert marker.content =~ "[model retune]"
     assert marker.content =~ "claude-fable-5"
     assert marker.content =~ "claude-sonnet-4-6"
@@ -4406,6 +5011,7 @@ defmodule Tightbeam.GatewayTest do
       |> Enum.find(&String.starts_with?(&1.content || "", "[turn failed]"))
 
     assert marker, "crash recovery must append the turn-failed marker"
+    assert marker.message_type == "substrate"
     assert marker.content =~ "side effects are UNKNOWN, not undone"
     assert marker.content =~ "non-idempotent"
   end
@@ -7567,6 +8173,11 @@ defmodule Tightbeam.GatewayTest do
     marker = Enum.find(frames, &(&1["type"] == "message" and &1["sender"] == "process:tightbeam"))
     assert String.starts_with?(marker["content"], "[context reset]\n")
 
+    assert %{message_type: "marker"} =
+             ctx.db
+             |> Projection.list_after("k1", nil, 100)
+             |> Enum.find(&String.starts_with?(&1.content || "", "[context reset]\n"))
+
     assert Enum.map(Org.pointer_chain(ctx.db, "k1"), & &1.reason) == ["created", "fallback"]
 
     assert [%{kind: "pointer_fallback", subject: "k1"}] =
@@ -8665,6 +9276,22 @@ defmodule Tightbeam.GatewayTest do
 
     assert lifecycle, "the :prompt turn failure must record a harness_turn_error"
     assert lifecycle.detail =~ "prompt"
+
+    assert HarnessHealth.active(ctx.db) == []
+
+    assert {:ok, [["auth-dead", "terminal-failure", "k1", cause]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT failureClass,evidenceKind,sessionKey,cause
+               FROM harness_health_observations
+               WHERE correlationId=?1
+               """,
+               ["harness-turn:#{turn.seq}:auth-dead"]
+             )
+
+    assert cause =~ "stage=prompt"
+    assert cause =~ "auth expired"
 
     # G3: the operator reads the human message/details as PROSE, never a raw inspected ACP
     # error map. The auth detail survives as text; the map's inspect markers (`=>`, `%{`) do
@@ -10519,6 +11146,22 @@ defmodule Tightbeam.GatewayTest do
   # away. That last hop is why the assert_receive stays. Measured under a
   # 5-lane load (load average ~90): 0-106ms against the 1000ms default.
   defp barrier_lane_started(lane), do: :sys.get_state(lane)
+
+  defp eventually(fun, attempts \\ 60)
+
+  defp eventually(fun, attempts) do
+    cond do
+      fun.() ->
+        true
+
+      attempts <= 1 ->
+        false
+
+      true ->
+        Process.sleep(25)
+        eventually(fun, attempts - 1)
+    end
+  end
 
   defp collect_pushes(0, acc), do: Enum.reverse(acc)
 
