@@ -29,7 +29,7 @@ defmodule Tightbeam.Harness.AdapterPatch do
 
     encoded =
       replacements
-      |> Enum.map(fn {before, replacement} -> [before, replacement] end)
+      |> Enum.map(&encode_replacement/1)
       |> JSON.encode!()
       |> Base.encode64()
 
@@ -47,7 +47,7 @@ defmodule Tightbeam.Harness.AdapterPatch do
     const fs=require('fs');#{version_check}const p=#{JSON.encode!(bundle)};
     const rs=JSON.parse(Buffer.from(#{JSON.encode!(encoded)},'base64').toString());
     let s=fs.readFileSync(p,'utf8');
-    for(const [a,b] of rs){if(!s.includes(a)&&!s.includes(b))throw new Error('unsupported #{label} adapter bundle');s=s.replace(a,b)}
+    for(const row of rs){const a=row[0],b=row[1],optional=row[2]&&row[2].optional;if(s.includes(b))continue;if(!s.includes(a)){if(optional)continue;throw new Error('unsupported #{label} adapter bundle');}s=s.replace(a,b);}
     fs.writeFileSync(p,s);
     """
     |> String.replace("\n", "")
@@ -55,7 +55,9 @@ defmodule Tightbeam.Harness.AdapterPatch do
 
   @doc false
   def patch(source, replacements, label, version) do
-    Enum.reduce(replacements, source, fn {before, replacement}, bytes ->
+    Enum.reduce(replacements, source, fn entry, bytes ->
+      {before, replacement, opts} = normalize_replacement(entry)
+
       cond do
         String.contains?(bytes, replacement) ->
           bytes
@@ -63,11 +65,24 @@ defmodule Tightbeam.Harness.AdapterPatch do
         String.contains?(bytes, before) ->
           String.replace(bytes, before, replacement, global: false)
 
+        Keyword.get(opts, :optional, false) ->
+          bytes
+
         true ->
           raise "unsupported #{label} adapter #{version} bundle; patch did not apply"
       end
     end)
   end
+
+  defp normalize_replacement({before, replacement}), do: {before, replacement, []}
+
+  defp normalize_replacement({before, replacement, opts}) when is_list(opts),
+    do: {before, replacement, opts}
+
+  defp encode_replacement({before, replacement}), do: [before, replacement]
+
+  defp encode_replacement({before, replacement, opts}) when is_list(opts),
+    do: [before, replacement, Map.new(opts)]
 
   defp installed_paths(binary_path, package_name, bundle_name, opts) do
     node_modules = binary_path |> Path.dirname() |> Path.dirname()
