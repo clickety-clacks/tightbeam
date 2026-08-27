@@ -318,7 +318,7 @@ defmodule Tightbeam.HarnessProcess do
       :ok = ensure_fence(db, row.adapter_key)
 
       if reconcile_row(db, row) == :ok do
-        :ok = complete_park_name(db, row.adapter_key)
+        :ok = complete_reconciled_park_name(db, row.adapter_key)
       end
     end)
 
@@ -885,14 +885,31 @@ defmodule Tightbeam.HarnessProcess do
     :ok
   end
 
-  defp complete_park_name(db, adapter_key) do
-    {:ok, _} =
-      DB.query(db, "DELETE FROM harness_park_fences WHERE adapterKey = ?1", [adapter_key])
+  defp complete_reconciled_park_name(db, adapter_key) do
+    unless open_rate_limit_incident?(db, adapter_key) do
+      {:ok, _} =
+        DB.query(db, "DELETE FROM harness_park_fences WHERE adapterKey = ?1", [adapter_key])
+    end
 
     :ok
   end
 
   defp clear_orphan_fences(db) do
+    incident_guard =
+      if harness_health_schema?(db) do
+        """
+        AND NOT EXISTS (
+          SELECT 1
+            FROM harness_health_incidents
+           WHERE state = 'open'
+             AND failureClass = 'rate-limit-dead'
+             AND harness || ':shared@' || host = harness_park_fences.adapterKey
+        )
+        """
+      else
+        ""
+      end
+
     {:ok, _} =
       DB.query(
         db,
@@ -905,10 +922,43 @@ defmodule Tightbeam.HarnessProcess do
               AND state IN ('launching','running','park_requested','kill_failed')
               AND resolvedAt IS NULL
          )
+         #{incident_guard}
         """
       )
 
     :ok
+  end
+
+  defp open_rate_limit_incident?(db, adapter_key) do
+    if harness_health_schema?(db) do
+      {:ok, rows} =
+        DB.query(
+          db,
+          """
+          SELECT 1
+            FROM harness_health_incidents
+           WHERE state = 'open'
+             AND failureClass = 'rate-limit-dead'
+             AND harness || ':shared@' || host = ?1
+           LIMIT 1
+          """,
+          [adapter_key]
+        )
+
+      rows != []
+    else
+      false
+    end
+  end
+
+  defp harness_health_schema?(db) do
+    {:ok, [[count]]} =
+      DB.query(
+        db,
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='harness_health_incidents'"
+      )
+
+    count == 1
   end
 
   defp resolve(db, row, state) do

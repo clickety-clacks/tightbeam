@@ -1485,6 +1485,27 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, [["queued"]]} =
              DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [blocked_seq])
 
+    adapter_sup = :"rate_limit_adapter_sup_#{System.unique_integer([:positive])}"
+    coordinator = :"rate_limit_coordinator_#{System.unique_integer([:positive])}"
+
+    start_supervised!({DynamicSupervisor, strategy: :one_for_one, name: adapter_sup})
+
+    start_supervised!(
+      {Tightbeam.AdapterCoordinator,
+       adapter_sup: adapter_sup,
+       adapter_context: fn _ -> [] end,
+       adapter_opts: fn _, _ -> flunk("parked work must not launch an adapter") end,
+       db: ctx.db,
+       name: coordinator}
+    )
+
+    assert Tightbeam.HarnessProcess.parked?(ctx.db, adapter_key)
+    assert :ok = SessionLane.nudge("k1")
+    refute_receive {:rate_runner, _}, 100
+
+    assert {:ok, [["queued"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [blocked_seq])
+
     assert :repair_required =
              HarnessHealth.resolve(ctx.db, %{
                correlation_id: "rate-success-before-resume",
@@ -1499,13 +1520,14 @@ defmodule Tightbeam.GatewayTest do
              })
 
     assert Tightbeam.HarnessProcess.parked?(ctx.db, adapter_key)
+    assert HarnessHealth.get(ctx.db, repair.incident.id).state == "open"
 
-    {:ok, coordinator} = RepairCoordinatorStub.start_link({self(), :ok})
+    {:ok, repair_coordinator} = RepairCoordinatorStub.start_link({self(), :ok})
 
     handler =
       ctx.catalog_base
       |> gateway_config(ctx.db, 0)
-      |> Map.put(:adapter_coordinator, coordinator)
+      |> Map.put(:adapter_coordinator, repair_coordinator)
       |> Gateway.handlers()
       |> Map.fetch!("repair-assignment")
 
