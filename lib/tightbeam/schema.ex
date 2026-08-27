@@ -16,6 +16,7 @@ defmodule Tightbeam.Schema do
     Tightbeam.SubagentMarkers,
     Tightbeam.Escalation,
     Tightbeam.Wakes,
+    Tightbeam.NoticeBatcher,
     Tightbeam.Projection,
     Tightbeam.Org,
     Tightbeam.ColdStart,

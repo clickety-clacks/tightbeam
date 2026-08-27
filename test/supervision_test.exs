@@ -1434,7 +1434,7 @@ defmodule Tightbeam.SupervisionTest do
       Wakes.schedule(ctx.db, %{
         session_key: "holder",
         target_role: nil,
-        origin: "user:flynn",
+        origin: "process:tightbeam",
         prompt: "later",
         due_at: System.system_time(:millisecond) + 60_000
       })
@@ -1698,7 +1698,7 @@ defmodule Tightbeam.SupervisionTest do
       Wakes.schedule(ctx.db, %{
         session_key: "holder",
         target_role: nil,
-        origin: "user:flynn",
+        origin: "process:tightbeam",
         prompt: "unrelated fyi, held by the batcher",
         due_at: System.system_time(:millisecond) + 60_000,
         creator_session_key: "holder",

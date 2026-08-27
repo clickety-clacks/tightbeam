@@ -25,7 +25,7 @@ defmodule Tightbeam.Wakes do
   use GenServer
   require Logger
 
-  alias Tightbeam.{ConditionFacts, DB, Escalation, EventLog, Gateway}
+  alias Tightbeam.{ConditionFacts, DB, Escalation, EventLog, Gateway, NoticeBatcher}
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.Publisher
 
@@ -169,7 +169,8 @@ defmodule Tightbeam.Wakes do
   # the old revision stays honest about which reflex produced it.
   @rules_rev "r1"
 
-  @digest_rule "turn-boundary-digest #{@rules_rev}"
+  @digest_rule "notice-batching-v1 r1"
+  @legacy_digest_rule "turn-boundary-digest r1"
   @immediate_rule "immediate-delivery #{@rules_rev}"
   @bypass_rule "algedonic-bypass #{@rules_rev}"
   @inhibited_rule "batcher-inhibited #{@rules_rev}"
@@ -386,6 +387,15 @@ defmodule Tightbeam.Wakes do
 
     file_policy_skew(txn, wake)
 
+    if v1_batch_source?(wake) do
+      policy_ref = NoticeBatcher.record_policy_in_txn(txn, wake)
+
+      case NoticeBatcher.enqueue_or_recover_in_txn(txn, wake.wake_id, policy_ref) do
+        %{member_id: _, batch_id: _} -> :ok
+        {:error, refusal} -> raise "notice batching admission refused: #{inspect(refusal)}"
+      end
+    end
+
     wake
   end
 
@@ -438,6 +448,22 @@ defmodule Tightbeam.Wakes do
       # rule stays `algedonic-bypass`/`immediate-delivery`, never
       # `batcher-inhibited`. `due_at` is exactly what the caller supplied
       # either way — scheduled or not, an alarm is never delayed BY POLICY.
+      policy.immediacy == :digest and class == "fyi" and
+          String.starts_with?(Map.fetch!(input, :origin), "user:") ->
+        due_at =
+          if Map.get(input, :sender_scheduled, false) or
+               String.starts_with?(Map.fetch!(input, :origin), "user:"),
+             do: Map.fetch!(input, :due_at),
+             else: created_at + policy.ceiling_ms
+
+        {@inhibited_rule, due_at}
+
+      policy.immediacy == :digest and batcher_inhibited?(input, condition_kind) ->
+        {@inhibited_rule, Map.fetch!(input, :due_at)}
+
+      policy.immediacy == :digest and not v1_batch_eligible?(input, class, condition_kind) ->
+        {@legacy_digest_rule, created_at + policy.ceiling_ms}
+
       policy.immediacy != :digest ->
         {policy.rule, Map.fetch!(input, :due_at)}
 
@@ -461,6 +487,21 @@ defmodule Tightbeam.Wakes do
   defp batcher_inhibited?(input, condition_kind) do
     Map.get(input, :sender_scheduled, false) or is_binary(condition_kind) or
       Map.get(input, :consumer, "prompt") != "prompt"
+  end
+
+  defp v1_batch_eligible?(input, class, condition_kind) do
+    origin = Map.fetch!(input, :origin)
+
+    class == "fyi" and not String.starts_with?(origin, "user:") and
+      not String.starts_with?(origin, "agent:") and
+      not Map.get(input, :digest, false) and not Map.get(input, :sender_scheduled, false) and
+      not is_binary(condition_kind) and Map.get(input, :consumer, "prompt") == "prompt"
+  end
+
+  defp v1_batch_source?(wake) do
+    wake.class == "fyi" and wake.delivery_rule == @digest_rule and not wake.digest and
+      not String.starts_with?(wake.origin, "user:") and
+      not String.starts_with?(wake.origin, "agent:")
   end
 
   # FAIL QUIET AND VISIBLE (§5 policy-skew rule). An extended class this build
@@ -688,6 +729,12 @@ defmodule Tightbeam.Wakes do
          {:ok, canceled_at} <- capture_clock(clock),
          {:ok, cancellation} <-
            validate_cancellation(txn, command, wake, primary, canceled_at) do
+      NoticeBatcher.cancel_source_in_txn(
+        txn,
+        wake.wake_id,
+        cancellation_reference(command, canceled_at)
+      )
+
       commit_cancellation(txn, wake, cancellation)
     else
       _ -> false
@@ -695,6 +742,11 @@ defmodule Tightbeam.Wakes do
   end
 
   def cancel_in_txn(%Txn{}, _command, _clock), do: false
+
+  defp cancellation_reference(command, canceled_at) do
+    source = Map.get(command, :causal_source, %{})
+    "#{source[:kind] || "unknown"}:#{source[:id] || "unknown"}:#{canceled_at}"
+  end
 
   defp capture_clock(clock) do
     case clock.() do
@@ -1482,10 +1534,13 @@ defmodule Tightbeam.Wakes do
   @doc false
   @spec materialize_digests(db(), integer()) :: [String.t()]
   def materialize_digests(db, at) do
-    # A candidate LIST only — which groups currently hold any digest-ruled
-    # pending wake at all. Nothing about WHETHER a group is due is decided
-    # here; that judgment happens exactly once, per member, inside the
-    # transaction below, against this same `at`.
+    NoticeBatcher.recover(db, at) ++ legacy_materialize_digests(db, at)
+  end
+
+  # Compatibility only: rows already stamped by the Phase-1 digest rule keep
+  # their versioned path through rollback or upgrade. New admission never
+  # writes this rule.
+  defp legacy_materialize_digests(db, at) do
     {:ok, groups} =
       DB.query(
         db,
@@ -1495,27 +1550,16 @@ defmodule Tightbeam.Wakes do
         WHERE state = 'pending' AND consumer = 'prompt' AND digest = 0
           AND deliveryRule = ?1
         """,
-        [@digest_rule]
+        [@legacy_digest_rule]
       )
 
-    # A role-addressed row's group key is the ROLE (O2), collapsing every
-    # member of that role regardless of which session each one resolved to
-    # at filing time; a session-addressed row's group key is the session,
-    # exactly as before. These are DIFFERENT ADDRESSES even when they
-    # resolve to the same session today, so `Enum.uniq/1` never merges a
-    # role group into a session group or vice versa.
-    group_keys =
-      groups
-      |> Enum.map(fn
-        [target_role, _session_key, class] when is_binary(target_role) ->
-          {:role, target_role, class}
-
-        [nil, session_key, class] ->
-          {:session, session_key, class}
-      end)
-      |> Enum.uniq()
-
-    Enum.flat_map(group_keys, fn group_key ->
+    groups
+    |> Enum.map(fn
+      [role, _session_key, class] when is_binary(role) -> {:role, role, class}
+      [nil, session_key, class] -> {:session, session_key, class}
+    end)
+    |> Enum.uniq()
+    |> Enum.flat_map(fn group_key ->
       case safe_materialize_digest(db, group_key, at) do
         nil -> []
         wake_id -> [wake_id]
@@ -1549,7 +1593,7 @@ defmodule Tightbeam.Wakes do
   # just where and why.
   defp file_materialization_failure(db, group_key, detail) do
     label = group_label(group_key)
-    record = "rule=#{@digest_rule} target=#{label} reason=#{detail}"
+    record = "rule=#{@legacy_digest_rule} target=#{label} reason=#{detail}"
     Logger.error("wake digest materialization failed for #{label}: #{detail}")
     best_effort_lifecycle(db, "wake_digest_materialization_failed", label, record)
     nil
@@ -1582,7 +1626,7 @@ defmodule Tightbeam.Wakes do
         AND deliveryRule = ?1 AND targetRole = ?2 AND class = ?3
       ORDER BY createdAt ASC, rowid ASC
       """,
-      [@digest_rule, role, class]
+      [@legacy_digest_rule, role, class]
     )
   end
 
@@ -1597,7 +1641,7 @@ defmodule Tightbeam.Wakes do
         AND deliveryRule = ?1 AND targetRole IS NULL AND sessionKey = ?2 AND class = ?3
       ORDER BY createdAt ASC, rowid ASC
       """,
-      [@digest_rule, session_key, class]
+      [@legacy_digest_rule, session_key, class]
     )
   end
 
@@ -1884,32 +1928,38 @@ defmodule Tightbeam.Wakes do
   """
   @spec digest_members(db(), String.t()) :: [map()]
   def digest_members(db \\ Tightbeam.DB, digest_wake_id) do
-    {:ok, rows} =
-      DB.query(
-        db,
-        """
-        SELECT w.wakeId, w.prompt, w.class, w.classElection, w.createdAt
-        FROM wake_cancellations c
-        JOIN wakes w ON w.wakeId = c.wakeId
-        WHERE c.replacementWakeId = ?1 AND c.reasonKind = 'superseded'
-          AND c.outcomeKind = 'replacement'
-          AND c.requesterId = 'tightbeam:batcher'
-          AND c.causalSourceKind = 'wake'
-          AND c.causalSourceId = ?1
-        ORDER BY w.createdAt ASC, w.rowid ASC
-        """,
-        [digest_wake_id]
-      )
+    current = NoticeBatcher.carrier_members(db, digest_wake_id)
 
-    Enum.map(rows, fn [wake_id, prompt, class, election, created_at] ->
-      %{
-        wake_id: wake_id,
-        prompt: prompt,
-        class: class,
-        class_election: election,
-        created_at: created_at
-      }
-    end)
+    if current != [] do
+      current
+    else
+      {:ok, rows} =
+        DB.query(
+          db,
+          """
+          SELECT w.wakeId, w.prompt, w.class, w.classElection, w.createdAt
+          FROM wake_cancellations c
+          JOIN wakes w ON w.wakeId = c.wakeId
+          WHERE c.replacementWakeId = ?1 AND c.reasonKind = 'superseded'
+            AND c.outcomeKind = 'replacement'
+            AND c.requesterId = 'tightbeam:batcher'
+            AND c.causalSourceKind = 'wake'
+            AND c.causalSourceId = ?1
+          ORDER BY w.createdAt ASC, w.rowid ASC
+          """,
+          [digest_wake_id]
+        )
+
+      Enum.map(rows, fn [wake_id, prompt, class, election, created_at] ->
+        %{
+          wake_id: wake_id,
+          prompt: prompt,
+          class: class,
+          class_election: election,
+          created_at: created_at
+        }
+      end)
+    end
   end
 
   ## The classed-row read (fabric §12 Q5; §11 acceptance 1)
@@ -2174,12 +2224,15 @@ defmodule Tightbeam.Wakes do
       DB.query(
         db,
         select_wake_sql() <>
-          " WHERE state = 'pending' AND dueAt <= ?1 AND conditionKind IS NULL ORDER BY dueAt ASC",
-        [now()]
+          " WHERE state = 'pending' AND dueAt <= ?1 AND conditionKind IS NULL" <>
+          " AND NOT (digest = 0 AND deliveryRule IS ?2) ORDER BY dueAt ASC",
+        [now(), @digest_rule]
       )
 
     for row <- rows do
       wake = to_wake(row)
+
+      if wake.digest, do: NoticeBatcher.delivery_attempted(db, wake.wake_id)
 
       delivered =
         case wake.consumer do
@@ -2203,6 +2256,10 @@ defmodule Tightbeam.Wakes do
 
       if delivered and wake.consumer == "prompt" do
         mark_fired(db, wake.wake_id)
+        if wake.digest, do: NoticeBatcher.delivery_delivered(db, wake.wake_id)
+      else
+        if wake.digest,
+          do: NoticeBatcher.delivery_failed_attempt(db, wake.wake_id, :not_committed)
       end
     end
 

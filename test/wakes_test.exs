@@ -342,7 +342,7 @@ defmodule Tightbeam.WakesTest do
 
     assert original.class == "fyi"
     assert original.class_election == "sender"
-    assert original.delivery_rule == Wakes.digest_rule()
+    assert original.delivery_rule == "turn-boundary-digest r1"
     refute original.digest
     refute original.summon
 
@@ -385,7 +385,7 @@ defmodule Tightbeam.WakesTest do
     # handled dynamically, by grouping on the row's new `sessionKey` at the
     # next materialization pass — nothing here needs to move `dueAt` for
     # that to be true.
-    assert replacement.delivery_rule == Wakes.digest_rule()
+    assert replacement.delivery_rule == original.delivery_rule
     assert replacement.due_at == original_due_at
     assert replacement.due_at == original.due_at
     refute replacement.due_at == replacement.created_at + ceiling

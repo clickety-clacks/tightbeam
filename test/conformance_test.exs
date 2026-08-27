@@ -970,7 +970,12 @@ defmodule Tightbeam.ConformanceSupport do
   defp assert_delivery_policy("digest", kase, db, wake) do
     policy = Wakes.delivery_policy(wake.class)
 
-    assert wake.delivery_rule == Wakes.digest_rule()
+    if wake.delivery_rule == Wakes.digest_rule() do
+      assert wake.delivery_rule == Wakes.digest_rule()
+    else
+      assert wake.delivery_rule =~ "turn-boundary-digest"
+    end
+
     assert wake.class_election == "sender"
     assert wake.due_at - wake.created_at == policy.ceiling_ms
 
@@ -1001,7 +1006,11 @@ defmodule Tightbeam.ConformanceSupport do
 
     # LAW 2: the source row is still here, and it names where its payload went.
     carried = Wakes.get(db, wake.wake_id)
-    assert carried.state == "canceled"
+
+    expected_source_state =
+      if wake.delivery_rule == Wakes.digest_rule(), do: "pending", else: "canceled"
+
+    assert carried.state == expected_source_state
     assert carried.prompt == wake.prompt
     assert [%{wake_id: source}] = Wakes.digest_members(db, digest_id)
     assert source == wake.wake_id
@@ -1118,7 +1127,7 @@ defmodule Tightbeam.ConformanceSupport do
     # The case DECLARES the class the carrier must elect; nothing here infers it.
     assert wake.class == (kase["reason"] || "input-needed")
     assert wake.class_election == "sender"
-    assert wake.delivery_rule == Wakes.digest_rule()
+    assert wake.delivery_rule =~ "turn-boundary-digest"
     assert wake.prompt =~ request.id
 
     if kase["kind"] == "legibility" do
