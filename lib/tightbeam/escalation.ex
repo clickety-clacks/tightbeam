@@ -26,8 +26,8 @@ defmodule Tightbeam.Escalation do
   @terminal_integrity_code "decision_request_integrity_invalid"
   @terminal_evidence_cause "terminal-shape-invalid"
   @terminal_failure_fields ~w(
-    requestIdentity ownerOnBehalfOf options decision rationale ruledTimeFact
-    rulingFact performerPrincipal performerSession lifecycleConsumption
+    requestIdentity ownerOnBehalfOf options decision rationale ruledAt
+    rulingFactId performerPrincipal performerSession lifecycleConsumption
     rulingLifecycleEvent raiserNotificationWake
   )
 
@@ -450,14 +450,17 @@ defmodule Tightbeam.Escalation do
     request_id = param(call, :request_id) || param(call, :request)
 
     with {:ok, answer} <- normalize_operator_answer(call) do
-      {:ok, {result, fact_id}} =
-        DB.transaction(db, fn txn -> operator_rule_in_txn(txn, call, request_id, answer) end)
+      case DB.transaction(db, fn txn -> operator_rule_in_txn(txn, call, request_id, answer) end) do
+        {:ok, {result, fact_id}} ->
+          if is_integer(fact_id) and Keyword.has_key?(opts, :scheduler) do
+            Wakes.fire_matching(Keyword.fetch!(opts, :scheduler), fact_id)
+          end
 
-      if is_integer(fact_id) and Keyword.has_key?(opts, :scheduler) do
-        Wakes.fire_matching(Keyword.fetch!(opts, :scheduler), fact_id)
+          result
+
+        {:error, error} ->
+          raise error
       end
-
-      result
     else
       {:error, reason} -> reason
     end
@@ -1877,21 +1880,20 @@ defmodule Tightbeam.Escalation do
           non_blank?(request.owner_user_id) and
           (is_nil(request.assignment_id) or non_blank?(request.assignment_id)) and
           non_blank?(request.action_key) and non_blank?(request.question) and
-          non_negative_integer?(request.raised_at) and
-          non_negative_integer?(request.deadline_at) and request.deadline_at > request.raised_at and
+          is_integer(request.raised_at) and
+          is_integer(request.deadline_at) and request.deadline_at > request.raised_at and
           is_map(request.context),
       "ownerOnBehalfOf" =>
-        non_blank?(request.owner_user_id) and
+        non_blank?(request.owner_user_id) and non_blank?(request.raiser_session_key) and
           request.ruled_by == "user:" <> request.owner_user_id,
       "options" => valid_operator_options?(request.options),
       "decision" => normalized_text?(request.decision),
       "rationale" => is_nil(request.rationale) or normalized_text?(request.rationale),
-      "ruledTimeFact" =>
-        non_negative_integer?(request.ruled_at) and positive_integer?(request.ruling_fact_id),
-      "rulingFact" => fact_count == 1,
+      "ruledAt" => is_integer(request.ruled_at),
+      "rulingFactId" => is_integer(request.ruling_fact_id) and fact_count == 1,
       "performerPrincipal" =>
         if(post_activation?,
-          do: non_blank?(request.ruled_via_principal),
+          do: canonical_principal?(request.ruled_via_principal),
           else: is_nil(request.ruled_via_principal)
         ),
       "performerSession" => session_valid,
@@ -1909,6 +1911,7 @@ defmodule Tightbeam.Escalation do
       failures: failures,
       descriptor: %{
         "schemaVersion" => @terminal_schema_version,
+        "causeCode" => @terminal_evidence_cause,
         "checks" => checks,
         "failingFields" => failures
       }
@@ -2053,8 +2056,10 @@ defmodule Tightbeam.Escalation do
   defp canonical_request_id?(_id), do: false
   defp non_blank?(value), do: is_binary(value) and String.trim(value) != ""
   defp normalized_text?(value), do: non_blank?(value) and String.trim(value) == value
-  defp non_negative_integer?(value), do: is_integer(value) and value >= 0
-  defp positive_integer?(value), do: is_integer(value) and value > 0
+
+  defp canonical_principal?("user:" <> suffix), do: non_blank?(suffix)
+  defp canonical_principal?("session:" <> suffix), do: non_blank?(suffix)
+  defp canonical_principal?(_value), do: false
 
   defp valid_operator_options?(options) when is_list(options) and options != [] do
     labels =
@@ -2097,9 +2102,8 @@ defmodule Tightbeam.Escalation do
     }
   end
 
-  defp visibility(db, call, owner_user_id) do
+  defp visibility(_db, call, owner_user_id) do
     raiser = raiser_id(call)
-    caller_owner = caller_owner_user_id(db, call, owner_user_id)
 
     effort =
       case call.principal do
@@ -2114,11 +2118,11 @@ defmodule Tightbeam.Escalation do
         else: {"raiserId = ?", [raiser]}
 
     operator =
-      if is_binary(caller_owner),
-        do:
-          {"(ownerUserId = ? OR (raiserId = ? AND ownerUserId = ?))",
-           [caller_owner, raiser, caller_owner]},
-        else: {"0", []}
+      case call.principal do
+        {:user, user_id} -> {"ownerUserId = ?", [user_id]}
+        {:session, session_key} -> {"raiserSessionKey = ?", [session_key]}
+        _ -> {"0", []}
+      end
 
     {effort_sql, effort_params} =
       case effort do
@@ -2136,18 +2140,6 @@ defmodule Tightbeam.Escalation do
 
     {numbered, params}
   end
-
-  defp caller_owner_user_id(_db, %{principal: {:user, user_id}}, _fallback), do: user_id
-
-  defp caller_owner_user_id(db, %{principal: {:session, session_key}}, _fallback) do
-    case Org.get(db, session_key) do
-      %{owner_user_id: owner_user_id} -> owner_user_id
-      _ -> nil
-    end
-  end
-
-  defp caller_owner_user_id(_db, _call, fallback) when is_binary(fallback), do: fallback
-  defp caller_owner_user_id(_db, _call, _fallback), do: nil
 
   defp shift_params(where) do
     Regex.replace(~r/\?(\d+)/, where, fn _, number ->

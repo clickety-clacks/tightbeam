@@ -1238,7 +1238,7 @@ defmodule Tightbeam.CliIntegrationTest do
                     }}
   end
 
-  test "built CLI renders the real gateway terminal projection and typed integrity identity",
+  test "real gateway dispatch preserves ruled list and exact response equality",
        ctx do
     request =
       Escalation.operator_ask(ctx.db, %{

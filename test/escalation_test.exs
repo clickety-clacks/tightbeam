@@ -915,7 +915,112 @@ defmodule Tightbeam.EscalationTest do
     assert surface == "list"
     assert observer == "session:#{ctx.raiser.session_key}"
     refute fields =~ "integrity?"
+
+    descriptor = %{
+      "schemaVersion" => "terminal-operator-decision-parity-v1",
+      "causeCode" => "terminal-shape-invalid",
+      "checks" => %{
+        "requestIdentity" => true,
+        "ownerOnBehalfOf" => true,
+        "options" => false,
+        "decision" => true,
+        "rationale" => true,
+        "ruledAt" => true,
+        "rulingFactId" => true,
+        "performerPrincipal" => true,
+        "performerSession" => true,
+        "lifecycleConsumption" => true,
+        "rulingLifecycleEvent" => false,
+        "raiserNotificationWake" => true
+      },
+      "failingFields" => ["options", "rulingLifecycleEvent"]
+    }
+
+    expected_digest =
+      descriptor
+      |> canonical_json()
+      |> then(&:crypto.hash(:sha256, &1))
+      |> Base.encode16(case: :lower)
+
+    assert shape_digest == expected_digest
     assert ruled.ruling_fact_id > 0
+  end
+
+  test "an unrelated sibling session cannot borrow owner visibility", ctx do
+    request =
+      Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "private?"}))
+
+    sibling = session(ctx.db, "same-owner-sibling", "flynn")
+    sibling_call = operator_call(sibling, %{})
+
+    owner_call = %{
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      params: %{}
+    }
+
+    assert [] = Escalation.list(ctx.db, sibling_call, "open")
+    assert nil == Escalation.get(ctx.db, sibling_call, request.id)
+    assert [%{id: request_id}] = Escalation.list(ctx.db, owner_call, "open")
+    assert request_id == request.id
+    assert %{id: ^request_id} = Escalation.get(ctx.db, owner_call, request.id)
+    assert [%{id: ^request_id}] = Escalation.list(ctx.db, operator_call(ctx.raiser, %{}), "open")
+
+    _ruled =
+      Escalation.operator_rule(
+        ctx.db,
+        owner_operator_rule(request.id, %{decision: "accept"})
+      )
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO lifecycle_events (ts, kind, subject, detail) VALUES (?1, 'decision_request_ruled', ?2, NULL)",
+               [System.system_time(:millisecond), request.id]
+             )
+
+    assert [] = Escalation.list(ctx.db, sibling_call, "ruled")
+    assert nil == Escalation.get(ctx.db, sibling_call, request.id)
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM decision_request_integrity_evidence WHERE requestId=?1",
+               [request.id]
+             )
+
+    assert %{code: "decision_request_integrity_invalid", request_id: ^request_id} =
+             Escalation.get(ctx.db, owner_call, request.id)
+  end
+
+  test "visibility precedes validation and hidden dirt writes no evidence", ctx do
+    request =
+      Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "hidden dirt?"}))
+
+    _ruled =
+      Escalation.operator_rule(
+        ctx.db,
+        owner_operator_rule(request.id, %{decision: "accept"})
+      )
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO lifecycle_events (ts, kind, subject, detail) VALUES (?1, 'decision_request_ruled', ?2, NULL)",
+               [System.system_time(:millisecond), request.id]
+             )
+
+    foreign = session(ctx.db, "hidden-reader", "other")
+    foreign_call = operator_call(foreign, %{})
+    assert [] = Escalation.list(ctx.db, foreign_call, "ruled")
+    assert nil == Escalation.get(ctx.db, foreign_call, request.id)
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM decision_request_integrity_evidence WHERE requestId=?1",
+               [request.id]
+             )
   end
 
   test "one automatic condition wake is committed and exact replay creates nothing", ctx do
@@ -957,7 +1062,30 @@ defmodule Tightbeam.EscalationTest do
              )
   end
 
-  test "list records every admitted invalid row and names the lexicographic first", ctx do
+  test "ruling wake preserves the request's stored decision duration", ctx do
+    request =
+      Escalation.operator_ask(
+        ctx.db,
+        operator_call(ctx.raiser, %{question: "custom deadline?", deadline: 12_345})
+      )
+
+    ruled =
+      Escalation.operator_rule(
+        ctx.db,
+        owner_operator_rule(request.id, %{decision: "accept"})
+      )
+
+    assert {:ok, [[due_at]]} =
+             DB.query(
+               ctx.db,
+               "SELECT dueAt FROM wakes WHERE conditionKind='escalation-ruled' AND conditionScope=?1",
+               [request.id]
+             )
+
+    assert due_at == ruled.ruled_at + 12_345
+  end
+
+  test "list validates every admitted invalid row and refuses the lexical first id", ctx do
     requests =
       for question <- ["bad one?", "bad two?"] do
         request =
@@ -991,7 +1119,7 @@ defmodule Tightbeam.EscalationTest do
              )
   end
 
-  test "evidence conflicts and unavailable storage are typed without exposing row values", ctx do
+  test "evidence conflicts and write failures are typed and prohibit serialization", ctx do
     request =
       Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "evidence rail?"}))
 
@@ -1029,6 +1157,126 @@ defmodule Tightbeam.EscalationTest do
              code: "decision_request_integrity_evidence_unavailable",
              message: "decision request integrity evidence unavailable"
            } = Escalation.get(ctx.db, operator_call(ctx.raiser, %{}), request.id)
+  end
+
+  test "legacy attribution remains unknown without inferred owner provenance", ctx do
+    direct =
+      Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "legacy direct?"}))
+
+    via =
+      Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "legacy via?"}))
+
+    direct_ruled =
+      Escalation.operator_rule(
+        ctx.db,
+        owner_operator_rule(direct.id, %{decision: "accept"})
+      )
+
+    via_call =
+      owner_operator_rule(via.id, %{decision: "accept"})
+      |> Map.put(:transport_session_key, ctx.raiser.session_key)
+
+    via_ruled = Escalation.operator_rule(ctx.db, via_call)
+    cutoff = max(direct_ruled.ruling_fact_id, via_ruled.ruling_fact_id)
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE decision_request_terminal_epoch SET legacyRulingFactMaxId=?1 WHERE id=0",
+               [cutoff]
+             )
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE decision_requests SET ruledViaPrincipal=NULL,ruledViaSessionState=NULL WHERE id IN (?1,?2)",
+               [direct.id, via.id]
+             )
+
+    assert %{
+             ruling_attribution: %{
+               performer: %{
+                 principal: %{state: "legacy-unknown"},
+                 session: %{state: "legacy-unknown"}
+               }
+             }
+           } = Escalation.get(ctx.db, operator_call(ctx.raiser, %{}), direct.id)
+
+    assert %{
+             ruled_via_session_key: session_key,
+             ruling_attribution: %{
+               performer: %{
+                 principal: %{state: "legacy-unknown"},
+                 session: %{state: "known", key: session_key}
+               }
+             }
+           } = Escalation.get(ctx.db, operator_call(ctx.raiser, %{}), via.id)
+
+    assert session_key == ctx.raiser.session_key
+  end
+
+  test "impossible consumed operator refuses before generic consumption", ctx do
+    request =
+      Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "consume?"}))
+
+    _ruled =
+      Escalation.operator_rule(
+        ctx.db,
+        owner_operator_rule(request.id, %{decision: "accept"})
+      )
+
+    assert :ok = DB.execute(ctx.db, "PRAGMA ignore_check_constraints=ON")
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE decision_requests SET status='consumed',consumedAt=1 WHERE id=?1",
+               [request.id]
+             )
+
+    assert :ok = DB.execute(ctx.db, "PRAGMA ignore_check_constraints=OFF")
+
+    assert %{code: "decision_request_integrity_invalid", request_id: request_id} =
+             Escalation.get(ctx.db, operator_call(ctx.raiser, %{}), request.id)
+
+    assert request_id == request.id
+    refute Escalation.consume(ctx.db, request.id)
+
+    assert {:ok, [["consumed", 1]]} =
+             DB.query(ctx.db, "SELECT status,consumedAt FROM decision_requests WHERE id=?1", [
+               request.id
+             ])
+  end
+
+  test "a failure after wake and fact creation rolls the full ruling back", ctx do
+    request =
+      Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "rollback?"}))
+
+    assert {:ok, [[wake_count, fact_count, event_count]]} =
+             DB.query(
+               ctx.db,
+               "SELECT (SELECT COUNT(*) FROM wakes), (SELECT COUNT(*) FROM condition_facts), (SELECT COUNT(*) FROM lifecycle_events)"
+             )
+
+    assert :ok =
+             DB.execute(
+               ctx.db,
+               "CREATE TRIGGER refuse_operator_ruling_fixture BEFORE UPDATE OF status ON decision_requests WHEN NEW.kind='operator' AND NEW.status='ruled' BEGIN SELECT RAISE(ABORT, 'fixture rollback'); END;"
+             )
+
+    assert_raise DB.Error, ~r/fixture rollback/, fn ->
+      Escalation.operator_rule(
+        ctx.db,
+        owner_operator_rule(request.id, %{decision: "accept"})
+      )
+    end
+
+    assert {:ok, [["open", nil, nil, nil, ^wake_count, ^fact_count, ^event_count]]} =
+             DB.query(
+               ctx.db,
+               "SELECT status,decision,ruledAt,rulingFactId, (SELECT COUNT(*) FROM wakes), (SELECT COUNT(*) FROM condition_facts), (SELECT COUNT(*) FROM lifecycle_events) FROM decision_requests WHERE id=?1",
+               [request.id]
+             )
   end
 
   test "future incomplete terminal transition is refused by the database trigger", ctx do
@@ -1123,15 +1371,21 @@ defmodule Tightbeam.EscalationTest do
              })
   end
 
-  test "operator rows survive retirement, stay owner-visible, and enforce their CHECK arm", ctx do
+  test "operator rows survive retirement, stay user-owner-visible, and enforce their CHECK arm",
+       ctx do
     request =
       Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "survive?"}))
 
-    same_owner = session(ctx.db, "same-owner", "flynn")
     foreign = session(ctx.db, "foreign-reader", "other")
 
+    owner_call = %{
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      params: %{}
+    }
+
     assert [%{id: id, context: %{"note" => nil, "supersedes" => nil}}] =
-             Escalation.list(ctx.db, operator_call(same_owner, %{}), "open")
+             Escalation.list(ctx.db, owner_call, "open")
 
     assert id == request.id
 
@@ -1245,6 +1499,24 @@ defmodule Tightbeam.EscalationTest do
         "INSERT INTO assignments (id,subject,holderKey,holderFallback,openedBySession,openedAt,state,outcome,closedAt,closedByUser) VALUES ('#{id}','linked','#{holder_key}',0,'#{holder_key}',1,'#{state}'#{terminal})"
       )
   end
+
+  defp canonical_json(value) when is_map(value) do
+    items =
+      value
+      |> Enum.map(fn {key, item} -> {to_string(key), item} end)
+      |> Enum.sort_by(&elem(&1, 0))
+      |> Enum.map(fn {key, item} -> [JSON.encode!(key), ?:, canonical_json(item)] end)
+      |> Enum.intersperse(?,)
+
+    IO.iodata_to_binary([?{, items, ?}])
+  end
+
+  defp canonical_json(value) when is_list(value) do
+    items = value |> Enum.map(&canonical_json/1) |> Enum.intersperse(?,)
+    IO.iodata_to_binary([?[, items, ?]])
+  end
+
+  defp canonical_json(value), do: JSON.encode!(value)
 
   defp request(ctx, id) do
     Escalation.get(ctx.db, rule_call(id, "allow"), id, owner_user_id: "flynn")
