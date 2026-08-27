@@ -489,6 +489,50 @@ defmodule Tightbeam.WorkItemsTest do
     assert get(ctx, {:user, "flynn"}, callback_item.id).workItem.body == "committed first"
   end
 
+  test "concurrent body updates resolve in commit order", ctx do
+    item = create(ctx, {:user, "flynn"}, %{title: "Concurrent body"})
+    parent = self()
+    db_pid = Process.whereis(ctx.db)
+
+    first =
+      Task.async(fn ->
+        call =
+          update_call({:user, "flynn"}, item.id, %{body: "first"})
+          |> Map.put(:after_body_write_in_txn, fn _txn ->
+            send(parent, {:first_body_written, self()})
+
+            receive do
+              :commit_first -> :ok
+            end
+          end)
+
+        WorkItems.__handle__(ctx.db, "work-item-update", call)
+      end)
+
+    assert_receive {:first_body_written, ^db_pid}
+    :erlang.trace(db_pid, true, [:receive])
+
+    second =
+      Task.async(fn ->
+        update(ctx, {:user, "other"}, item.id, %{body: "second"})
+      end)
+
+    assert_receive {:trace, ^db_pid, :receive, {:"$gen_call", _from, {:transaction, _fun}}}
+    :erlang.trace(db_pid, false, [:receive])
+    send(db_pid, :commit_first)
+
+    assert %{bodyUpdate: %{changed: true, updatedByUser: "flynn"}} =
+             Task.await(first, 5_000)
+
+    assert %{bodyUpdate: %{changed: true, updatedByUser: "other"}} =
+             Task.await(second, 5_000)
+
+    assert %{workItem: detail} = get(ctx, {:user, "flynn"}, item.id)
+    assert detail.body == "second"
+    assert detail.bodyUpdatedByUser == "other"
+    assert detail.bodyUpdatedBySession == nil
+  end
+
   test "a no-op clear on a legacy item does not create a body row", ctx do
     item = create(ctx, {:user, "flynn"}, %{title: "Legacy"})
 
