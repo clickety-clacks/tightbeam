@@ -807,6 +807,16 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     assert {:error, :generation_not_published} =
              AdapterCoordinator.generation_publication(coordinator, key, 1)
 
+    assert {:error, :generation_publication_timeout} =
+             AdapterCoordinator.await_generation_publication(coordinator, key, 1, 0)
+
+    waiter =
+      Task.async(fn ->
+        AdapterCoordinator.await_generation_publication(coordinator, key, 1, 1_000)
+      end)
+
+    assert Task.yield(waiter, 20) == nil
+
     # The instance the entry DOES point at is credited, and its monitor ref is
     # what gets remembered — that ref is the identity a later :DOWN asks about.
     send(coordinator, {:adapter_ready, key, adapter})
@@ -818,6 +828,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
              AdapterCoordinator.generation_publication(coordinator, key, 1)
 
     assert published_at >= initial_published_at
+    assert Task.await(waiter) == {:ok, published_at}
   end
 
   test "a ready adapter's death is told even when a replacement already took the entry over",

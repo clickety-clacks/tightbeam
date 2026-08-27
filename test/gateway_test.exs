@@ -129,8 +129,21 @@ defmodule Tightbeam.GatewayTest do
     def handle_call({:adapter_for, key, _context}, from, state),
       do: handle_call({:adapter_for, key}, from, state)
 
-    def handle_call({:generation_publication, _key, generation}, _from, state),
-      do: {:reply, {:ok, generation}, state}
+    def handle_call({:generation_publication, key, generation}, _from, {_adapter, parent} = state) do
+      if is_pid(parent), do: send(parent, {:generation_publication, key, generation})
+      {:reply, {:ok, generation}, state}
+    end
+
+    def handle_call(
+          {:await_generation_publication, key, generation, timeout_ms},
+          _from,
+          {_adapter, parent} = state
+        ) do
+      if is_pid(parent),
+        do: send(parent, {:await_generation_publication, key, generation, timeout_ms})
+
+      {:reply, {:ok, generation}, state}
+    end
 
     def handle_call({:acquire_load_slot, _machine, _borrower}, _from, state),
       do: {:reply, make_ref(), state}
@@ -152,6 +165,44 @@ defmodule Tightbeam.GatewayTest do
       if is_pid(parent), do: send(parent, {:close_adapter, key})
       GenServer.stop(adapter)
       {:noreply, state}
+    end
+  end
+
+  defmodule ReadinessCoordinatorStub do
+    use GenServer
+
+    def start_link(parent),
+      do: GenServer.start_link(__MODULE__, parent, name: Tightbeam.AdapterCoordinator)
+
+    def init(parent), do: {:ok, %{parent: parent, waiter: nil}}
+
+    def handle_call({:close_adapter, key}, _from, state) do
+      send(state.parent, {:close_adapter, key})
+      {:reply, :ok, state}
+    end
+
+    def handle_call({:adapter_for, key, _context}, _from, state) do
+      send(state.parent, {:runtime_start, key})
+      {:reply, {:ok, self(), 1}, state}
+    end
+
+    def handle_call(
+          {:await_generation_publication, key, generation, timeout_ms},
+          from,
+          %{waiter: nil} = state
+        ) do
+      send(state.parent, {:publication_waiting, key, generation, timeout_ms})
+      {:noreply, %{state | waiter: {from, key, generation}}}
+    end
+
+    def handle_call({:generation_publication, key, generation}, _from, state) do
+      send(state.parent, {:immediate_publication_read, key, generation})
+      {:reply, {:error, :generation_not_published}, state}
+    end
+
+    def handle_cast(:adapter_ready, %{waiter: {from, _key, _generation}} = state) do
+      GenServer.reply(from, {:ok, 123})
+      {:noreply, %{state | waiter: nil}}
     end
   end
 
@@ -10700,6 +10751,42 @@ defmodule Tightbeam.GatewayTest do
              ])
 
     assert Org.get(ctx.db, fixture_session.session_key).provider == "fixture_provider"
+  end
+
+  test "provider onboarding waits for the completed adapter boot publication", ctx do
+    base_dir = role_test_base("credential-runtime-readiness")
+    config = gateway_config(base_dir, ctx.db, 0)
+    children = Gateway.children(config)
+
+    %{start: {Credentials, :start_link, [credential_opts]}} =
+      Enum.find(children, &match?(%{id: {Credentials, "testhost"}}, &1))
+
+    coordinator = start_supervised!({ReadinessCoordinatorStub, self()})
+
+    opts =
+      credential_opts
+      |> Keyword.put(:name, nil)
+      |> Keyword.put(:resume, fn _provider -> :ok end)
+      |> Keyword.put(:onboarders, %{
+        fixture_provider: fn _state ->
+          {:ok, %{bytes: "fixture-provider-credential", expires_at: nil}}
+        end
+      })
+
+    {:ok, server} = Credentials.start_link(opts)
+    onboard = Task.async(fn -> Credentials.onboard(:fixture_provider, server) end)
+
+    key = {:fixture, "shared", "testhost"}
+    assert_receive {:close_adapter, ^key}
+    assert_receive {:runtime_start, ^key}
+    assert_receive {:publication_waiting, ^key, 1, 1_800_000}
+    assert Task.yield(onboard, 20) == nil
+    refute_receive {:immediate_publication_read, ^key, 1}
+
+    GenServer.cast(coordinator, :adapter_ready)
+
+    assert Task.await(onboard) == :ok
+    assert Credentials.status(:fixture_provider, server) == :onboarded
   end
 
   test "provider onboarding starts every matching harness and aggregates runtime failures",

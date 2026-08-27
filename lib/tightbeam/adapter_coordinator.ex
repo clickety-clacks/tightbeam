@@ -146,6 +146,24 @@ defmodule Tightbeam.AdapterCoordinator do
     GenServer.call(server, {:generation_publication, key, generation})
   end
 
+  @doc "Wait for the existing completed-boot signal to publish one exact generation."
+  @spec await_generation_publication(
+          GenServer.server(),
+          adapter_key(),
+          pos_integer(),
+          non_neg_integer()
+        ) ::
+          {:ok, non_neg_integer()}
+          | {:error, :generation_not_published | :generation_publication_timeout}
+  def await_generation_publication(server \\ __MODULE__, key, generation, timeout_ms)
+      when is_integer(timeout_ms) and timeout_ms >= 0 do
+    GenServer.call(
+      server,
+      {:await_generation_publication, key, generation, timeout_ms},
+      timeout_ms + 1_000
+    )
+  end
+
   @doc "The canonical key string `<harness>:<preset>@<host>`, exactly as /version renders it."
   @spec key_name(adapter_key()) :: String.t()
   def key_name({harness, archetype, host}), do: "#{harness}:#{archetype}@#{host}"
@@ -197,6 +215,7 @@ defmodule Tightbeam.AdapterCoordinator do
        # instance that just died has to be keyed on something unique to it, and
        # its monitor ref is exactly that.
        ready_refs: MapSet.new(),
+       publication_waiters: %{},
        context_requests: %{},
        load_active: %{},
        load_queue: %{}
@@ -231,17 +250,43 @@ defmodule Tightbeam.AdapterCoordinator do
   end
 
   def handle_call({:generation_publication, key, generation}, _from, state) do
-    reply =
-      case state.adapters[key] do
-        %{generation: ^generation, ready: true, published_at: published_at}
-        when is_integer(published_at) ->
-          {:ok, published_at}
+    {:reply, generation_publication_reply(state, key, generation), state}
+  end
 
-        _ ->
-          {:error, :generation_not_published}
-      end
+  def handle_call(
+        {:await_generation_publication, key, generation, timeout_ms},
+        from,
+        state
+      ) do
+    case generation_publication_reply(state, key, generation) do
+      {:ok, _published_at} = published ->
+        {:reply, published, state}
 
-    {:reply, reply, state}
+      {:error, :generation_not_published} ->
+        case state.adapters[key] do
+          %{generation: ^generation, pid: pid, ready: false} when is_pid(pid) ->
+            waiter_ref = make_ref()
+
+            timer =
+              Process.send_after(self(), {:publication_wait_timeout, waiter_ref}, timeout_ms)
+
+            waiter = %{
+              from: from,
+              key: key,
+              generation: generation,
+              timer: timer
+            }
+
+            {:noreply,
+             %{
+               state
+               | publication_waiters: Map.put(state.publication_waiters, waiter_ref, waiter)
+             }}
+
+          _ ->
+            {:reply, {:error, :generation_not_published}, state}
+        end
+    end
   end
 
   def handle_call({:last_failure, key, generation}, _from, state) do
@@ -364,7 +409,16 @@ defmodule Tightbeam.AdapterCoordinator do
 
   defp do_close_adapter(key, state) do
     {:ok, process_row} = Tightbeam.HarnessProcess.begin_park(state.db, key)
+
     state = cancel_pending_starts(key, state)
+
+    state =
+      finish_publication_waiters(
+        state,
+        key,
+        :all,
+        {:error, :generation_not_published}
+      )
 
     exited? =
       case state.adapters[key] do
@@ -642,7 +696,16 @@ defmodule Tightbeam.AdapterCoordinator do
               last_failure: {died_at, reason}
           }
 
-          {:noreply, %{state | adapters: Map.put(state.adapters, key, entry)}}
+          state =
+            state
+            |> Map.put(:adapters, Map.put(state.adapters, key, entry))
+            |> finish_publication_waiters(
+              key,
+              died_at,
+              {:error, :generation_not_published}
+            )
+
+          {:noreply, state}
         end
 
       load_slot = slot_for_monitor(state.load_active, ref) ->
@@ -671,8 +734,13 @@ defmodule Tightbeam.AdapterCoordinator do
             last_failure: nil
         }
 
-        state = %{state | ready_refs: put_ready_ref(state.ready_refs, entry.monitor)}
-        {:noreply, %{state | adapters: Map.put(state.adapters, key, entry)}}
+        state = %{
+          state
+          | adapters: Map.put(state.adapters, key, entry),
+            ready_refs: put_ready_ref(state.ready_refs, entry.monitor)
+        }
+
+        {:noreply, finish_publication_waiters(state, key, entry.generation, {:ok, published_at})}
 
       # A ready message from an instance this entry no longer points at. It
       # died between announcing and being heard; the entry now describes a
@@ -680,6 +748,17 @@ defmodule Tightbeam.AdapterCoordinator do
       # not-yet-serving adapter ready.
       _ ->
         {:noreply, state}
+    end
+  end
+
+  def handle_info({:publication_wait_timeout, waiter_ref}, state) do
+    case Map.pop(state.publication_waiters, waiter_ref) do
+      {nil, waiters} ->
+        {:noreply, %{state | publication_waiters: waiters}}
+
+      {%{from: from}, waiters} ->
+        GenServer.reply(from, {:error, :generation_publication_timeout})
+        {:noreply, %{state | publication_waiters: waiters}}
     end
   end
 
@@ -909,6 +988,31 @@ defmodule Tightbeam.AdapterCoordinator do
     do: MapSet.put(ready_refs, monitor)
 
   defp put_ready_ref(ready_refs, _monitor), do: ready_refs
+
+  defp generation_publication_reply(state, key, generation) do
+    case state.adapters[key] do
+      %{generation: ^generation, ready: true, published_at: published_at}
+      when is_integer(published_at) ->
+        {:ok, published_at}
+
+      _ ->
+        {:error, :generation_not_published}
+    end
+  end
+
+  defp finish_publication_waiters(state, key, generation, result) do
+    {finished, pending} =
+      Enum.split_with(state.publication_waiters, fn {_waiter_ref, waiter} ->
+        waiter.key == key and (generation == :all or waiter.generation == generation)
+      end)
+
+    Enum.each(finished, fn {_waiter_ref, waiter} ->
+      Process.cancel_timer(waiter.timer)
+      GenServer.reply(waiter.from, result)
+    end)
+
+    %{state | publication_waiters: Map.new(pending)}
+  end
 
   defp live_entry?(entry), do: is_pid(entry.pid) and Process.alive?(entry.pid)
   defp checkout(entry), do: {:ok, entry.pid, entry.generation}

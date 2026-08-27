@@ -392,7 +392,9 @@ defmodule Tightbeam.Gateway do
         gate: fn _provider -> :ok end,
         stop: fn provider -> stop_provider_runtime(provider, machine) end,
         park_edge: Tightbeam.CommandEdge.request_to(Tightbeam.AdapterCoordinator),
-        start: fn provider, kind -> start_provider_runtime(provider, kind, machine) end,
+        start: fn provider, kind ->
+          start_provider_runtime(provider, kind, machine, config.onboarding_lease_ms)
+        end,
         resume: fn _provider -> :ok end,
         capture_sessions: fn provider ->
           capture_credential_sessions(db, provider, machine)
@@ -7299,7 +7301,7 @@ defmodule Tightbeam.Gateway do
     "#{provider} credential on #{machine} was re-onboarded; this session may resume."
   end
 
-  defp start_provider_runtime(provider, kind, machine) do
+  defp start_provider_runtime(provider, kind, machine, readiness_timeout_ms) do
     {started, failed} =
       Enum.reduce(harnesses_for_provider(provider), {[], []}, fn module, {started, failed} ->
         key = {module.id(), "shared", machine}
@@ -7310,10 +7312,11 @@ defmodule Tightbeam.Gateway do
                credential_kind: kind
              ) do
           {:ok, _pid, generation} ->
-            case AdapterCoordinator.generation_publication(
+            case AdapterCoordinator.await_generation_publication(
                    Tightbeam.AdapterCoordinator,
                    key,
-                   generation
+                   generation,
+                   readiness_timeout_ms
                  ) do
               {:ok, published_at} ->
                 {[{module.wire_name(), generation, published_at} | started], failed}
