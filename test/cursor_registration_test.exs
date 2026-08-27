@@ -108,29 +108,21 @@ defmodule Tightbeam.CursorRegistrationTest do
     refute "default" == selector.("memory")
   end
 
-  test "remote Cursor launch is refused before planning — gateway-local only" do
+  test "remote Cursor preflight refuses local-only before any credential read" do
     parent = self()
-    target = %{cursor_target() | host_config: %{base_dir: "/remote", ssh: "host"}}
 
     target =
-      Map.put(target, :sh, fn argv ->
+      cursor_target()
+      |> Map.put(:host_config, %{base_dir: "/remote", ssh: "host"})
+      |> Map.put(:sh, fn argv ->
         send(parent, {:remote_check, argv})
         {" remote-secret \n", 0}
       end)
 
-    assert {:ok, checked} =
+    assert {:error, %{code: "DIV-CURSOR-LOCAL-ONLY"}} =
              Cursor.preflight_launch(target, "/managed", credential_kind: :api_key)
 
-    assert_receive {:remote_check, check_argv}
-    assert Enum.join(check_argv, " ") =~ "test -r"
-    assert Enum.join(check_argv, " ") =~ "cat"
-
-    assert {:error, %{code: "DIV-CURSOR-LOCAL-ONLY"}} =
-             Cursor.prepare_launch(
-               target,
-               "/managed",
-               checked ++ [common_env: [], remote_env: [], lineage: "lineage"]
-             )
+    refute_receive {:remote_check, _}
   end
 
   test "Cursor default model is untiered and matches its catalog shape" do
@@ -249,7 +241,7 @@ defmodule Tightbeam.CursorRegistrationTest do
              )
   end
 
-  test "remote whitespace-only API keys fail the one bounded load" do
+  test "remote preflight refuses local-only before any API-key load attempt" do
     parent = self()
     target = %{cursor_target() | host_config: %{base_dir: "/remote", ssh: "host"}}
 
@@ -259,22 +251,28 @@ defmodule Tightbeam.CursorRegistrationTest do
         {"  \n", 0}
       end)
 
-    assert {:error, %{code: "DIV-CURSOR-API-KEY-ONLY"}} =
+    assert {:error, %{code: "DIV-CURSOR-LOCAL-ONLY"}} =
              Cursor.preflight_launch(target, "/managed", credential_kind: :api_key)
 
-    assert_receive {:remote_load, argv}
-    assert Enum.join(argv, " ") =~ "cat"
     refute_receive {:remote_load, _}
   end
 
-  test "remote missing, unreadable, empty, and whitespace keys refuse before planning" do
+  test "remote preflight refuses local-only without probing credential bytes" do
     target = %{cursor_target() | host_config: %{base_dir: "/remote", ssh: "host"}}
 
     for result <- [{"", 1}, {"cat: permission denied", 1}, {"", 0}, {" \n\t", 0}] do
-      target = Map.put(target, :sh, fn _argv -> result end)
+      parent = self()
 
-      assert {:error, %{code: "DIV-CURSOR-API-KEY-ONLY"}} =
+      target =
+        Map.put(target, :sh, fn argv ->
+          send(parent, {:remote_load, argv})
+          result
+        end)
+
+      assert {:error, %{code: "DIV-CURSOR-LOCAL-ONLY"}} =
                Cursor.preflight_launch(target, "/managed", credential_kind: :api_key)
+
+      refute_receive {:remote_load, _}
     end
   end
 

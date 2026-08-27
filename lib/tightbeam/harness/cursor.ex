@@ -86,9 +86,13 @@ defmodule Tightbeam.Harness.Cursor do
 
   @impl true
   def preflight_launch(target, _home, opts) do
-    case Keyword.fetch(opts, :credential_kind) do
-      {:ok, :api_key} -> load_api_key(target, opts)
-      _ -> credential_refusal()
+    if local?(target) do
+      case Keyword.fetch(opts, :credential_kind) do
+        {:ok, :api_key} -> load_api_key(target, opts)
+        _ -> credential_refusal()
+      end
+    else
+      local_only_refusal()
     end
   end
 
@@ -447,15 +451,15 @@ defmodule Tightbeam.Harness.Cursor do
     launch_vectors =
       Enum.map(vectors["prepare_launch"], fn vector ->
         cond do
-          String.ends_with?(vector.case, "_subscription") ->
-            %{vector | support: {:unsupported, "DIV-CURSOR-API-KEY-ONLY"}}
-
           String.starts_with?(vector.case, "remote_") ->
             %{
               vector
               | support: {:unsupported, "DIV-CURSOR-LOCAL-ONLY"},
                 expected: local_only_error
             }
+
+          String.ends_with?(vector.case, "_subscription") ->
+            %{vector | support: {:unsupported, "DIV-CURSOR-API-KEY-ONLY"}}
 
           true ->
             vector
