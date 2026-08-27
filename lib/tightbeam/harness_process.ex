@@ -886,29 +886,24 @@ defmodule Tightbeam.HarnessProcess do
   end
 
   defp complete_reconciled_park_name(db, adapter_key) do
-    unless open_rate_limit_incident?(db, adapter_key) do
-      {:ok, _} =
-        DB.query(db, "DELETE FROM harness_park_fences WHERE adapterKey = ?1", [adapter_key])
-    end
+    incident_guard = rate_limit_incident_guard(db)
+
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        DELETE FROM harness_park_fences
+         WHERE adapterKey = ?1
+         #{incident_guard}
+        """,
+        [adapter_key]
+      )
 
     :ok
   end
 
   defp clear_orphan_fences(db) do
-    incident_guard =
-      if harness_health_schema?(db) do
-        """
-        AND NOT EXISTS (
-          SELECT 1
-            FROM harness_health_incidents
-           WHERE state = 'open'
-             AND failureClass = 'rate-limit-dead'
-             AND harness || ':shared@' || host = harness_park_fences.adapterKey
-        )
-        """
-      else
-        ""
-      end
+    incident_guard = rate_limit_incident_guard(db)
 
     {:ok, _} =
       DB.query(
@@ -929,25 +924,19 @@ defmodule Tightbeam.HarnessProcess do
     :ok
   end
 
-  defp open_rate_limit_incident?(db, adapter_key) do
+  defp rate_limit_incident_guard(db) do
     if harness_health_schema?(db) do
-      {:ok, rows} =
-        DB.query(
-          db,
-          """
-          SELECT 1
-            FROM harness_health_incidents
-           WHERE state = 'open'
-             AND failureClass = 'rate-limit-dead'
-             AND harness || ':shared@' || host = ?1
-           LIMIT 1
-          """,
-          [adapter_key]
-        )
-
-      rows != []
+      """
+      AND NOT EXISTS (
+        SELECT 1
+          FROM harness_health_incidents
+         WHERE state = 'open'
+           AND failureClass = 'rate-limit-dead'
+           AND harness || ':shared@' || host = harness_park_fences.adapterKey
+      )
+      """
     else
-      false
+      ""
     end
   end
 

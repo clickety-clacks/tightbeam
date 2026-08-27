@@ -58,6 +58,7 @@ defmodule Tightbeam.GatewayTest do
     EffortCheckin,
     Gateway,
     HarnessHealth,
+    HarnessProcess,
     Identity,
     Idempotency,
     LaneManager,
@@ -161,6 +162,39 @@ defmodule Tightbeam.GatewayTest do
       send(parent, {:repair_close_adapter, key})
       {:reply, result, state}
     end
+  end
+
+  defmodule FenceDeleteRaceDB do
+    use GenServer
+
+    def start_link({name, db, parent}),
+      do: GenServer.start_link(__MODULE__, {db, parent}, name: name)
+
+    def init({db, parent}), do: {:ok, %{db: db, parent: parent, armed: true}}
+
+    def handle_call({:query, sql, params} = request, _from, state) do
+      state =
+        if state.armed and params != [] and
+             String.contains?(sql, "DELETE FROM harness_park_fences") and
+             String.contains?(sql, "adapterKey = ?1") do
+          send(state.parent, {:before_reconciled_fence_delete, self()})
+
+          receive do
+            :release_reconciled_fence_delete -> :ok
+          after
+            5_000 -> raise "timed out waiting to release reconciled fence delete"
+          end
+
+          %{state | armed: false}
+        else
+          state
+        end
+
+      {:reply, GenServer.call(state.db, request), state}
+    end
+
+    def handle_call(request, _from, state),
+      do: {:reply, GenServer.call(state.db, request), state}
   end
 
   defmodule AdapterStub do
@@ -1895,6 +1929,122 @@ defmodule Tightbeam.GatewayTest do
       refute encoded =~ "cli_token"
       refute encoded =~ session.cli_token
     end)
+  end
+
+  test "reconciliation cannot delete a rate-limit fence opened at its cleanup boundary", ctx do
+    assignment_id = "asg_rate_reconcile_race"
+    adapter_key = {:claude, "shared", "testhost"}
+    session = Org.get(ctx.db, "k1")
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO assignments
+                 (id,subject,holderKey,openedByUser,openedAt,state,holderHarness,holderProvider)
+               VALUES (?1,'continue held work','k1','flynn',70,'open',?2,?3)
+               """,
+               [assignment_id, session.harness, session.provider]
+             )
+
+    {:ok, source_seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: "k1",
+        message_id: "m-rate-reconcile-race",
+        origin: "agent:k1",
+        prompt: "continue held work",
+        assignment_id: assignment_id
+      })
+
+    {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "rate-reconcile-race")
+
+    :ok =
+      Ledger.finish(ctx.db, source_seq, "failed", "rate-limit-dead",
+        owner_lease: turn.owner_lease
+      )
+
+    Tightbeam.HarnessProcess.prepare_launch(
+      [
+        cmd: ["/bin/true"],
+        stderr_path: Path.join(ctx.catalog_base, "rate-reconcile-race.stderr"),
+        process_identity_dir: ctx.catalog_base,
+        process_helper: "/bin/true"
+      ],
+      ctx.db,
+      adapter_key
+    )
+
+    prior_wait = Application.get_env(:tightbeam, :harness_process_identity_wait_ms)
+    Application.put_env(:tightbeam, :harness_process_identity_wait_ms, 0)
+
+    on_exit(fn ->
+      if prior_wait,
+        do: Application.put_env(:tightbeam, :harness_process_identity_wait_ms, prior_wait),
+        else: Application.delete_env(:tightbeam, :harness_process_identity_wait_ms)
+    end)
+
+    race_db = :"rate_reconcile_race_db_#{System.unique_integer([:positive])}"
+    proxy = start_supervised!({FenceDeleteRaceDB, {race_db, ctx.db, self()}})
+    reconciliation = Task.async(fn -> Tightbeam.HarnessProcess.reconcile(race_db) end)
+
+    assert_receive {:before_reconciled_fence_delete, ^proxy}
+
+    assert {:opened, incident} =
+             HarnessHealth.observe(ctx.db, %{
+               correlation_id: "rate-reconcile-race",
+               harness: session.harness,
+               host: session.host,
+               failure_class: "rate-limit-dead",
+               evidence_kind: "authoritative-provider",
+               session_key: "k1",
+               assignment_id: assignment_id,
+               observed_at: 71,
+               cause: "provider rate limit",
+               principal: "process:tightbeam"
+             })
+
+    assert HarnessProcess.parked?(ctx.db, adapter_key)
+    send(proxy, :release_reconciled_fence_delete)
+    assert Task.await(reconciliation) == :ok
+    assert HarnessProcess.parked?(ctx.db, adapter_key)
+    assert HarnessHealth.get(ctx.db, incident.id).state == "open"
+
+    assert :repair_required =
+             HarnessHealth.resolve(ctx.db, %{
+               correlation_id: "rate-reconcile-race-normal-success",
+               harness: session.harness,
+               host: session.host,
+               failure_class: "rate-limit-dead",
+               session_key: "k1",
+               assignment_id: nil,
+               observed_at: 72,
+               cause: "normal success before explicit resume",
+               principal: "agent:k1"
+             })
+
+    {:ok, repair_coordinator} = RepairCoordinatorStub.start_link({self(), :ok})
+
+    handler =
+      ctx.catalog_base
+      |> gateway_config(ctx.db, 0)
+      |> Map.put(:adapter_coordinator, repair_coordinator)
+      |> Gateway.handlers()
+      |> Map.fetch!("repair-assignment")
+
+    assert %{ok: true, action: "resume"} =
+             handler.(%{
+               origin: "user:flynn",
+               principal: {:user, "flynn"},
+               lane_manager: ctx.lane,
+               params: %{
+                 assignment_id: assignment_id,
+                 action: "resume",
+                 idempotency_key: "rate-reconcile-race-resume"
+               }
+             })
+
+    refute HarnessProcess.parked?(ctx.db, adapter_key)
+    assert_receive {:repair_close_adapter, ^adapter_key}
   end
 
   test "children sweeps newer credentials from abandoned identity homes before adapters", ctx do
