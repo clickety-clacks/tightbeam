@@ -21,11 +21,20 @@ defmodule Tightbeam.CursorSigningTest do
     %{base_dir: base_dir}
   end
 
-  test "normal loading refuses missing material until explicit first provisioning", ctx do
-    assert {:error, %Error{reason: :missing_directory}} = CursorSigning.load(ctx.base_dir)
+  test "absent material selects unprovisioned state until explicit first provisioning", ctx do
+    assert {:ok, provider} = CursorSigning.load(ctx.base_dir)
+    assert :unprovisioned = CursorSigning.lifecycle(provider)
+    assert {:error, :cursor_signing_unprovisioned} = CursorSigning.validate(provider)
+    assert {:error, :cursor_signing_unprovisioned} = CursorSigning.sign(provider, "cursor")
+
+    assert {:error, :cursor_signing_unprovisioned} =
+             CursorSigning.verify(provider, "cursor", <<0::256>>)
+
+    assert {:error, :cursor_signing_unprovisioned} = CursorSigning.rotate(provider)
+    assert {:error, :cursor_signing_unprovisioned} = CursorSigning.recover(provider)
 
     assert :ok = CursorSigning.provision(ctx.base_dir)
-    provider = CursorSigning.load!(ctx.base_dir)
+    assert :healthy = CursorSigning.lifecycle(provider)
 
     directory = Path.join(ctx.base_dir, "secrets")
     record = Path.join(directory, "rest-cursor-signing.v1")
@@ -58,6 +67,7 @@ defmodule Tightbeam.CursorSigningTest do
 
     assert Enum.count(results, fn
              {:error, %Error{reason: :already_provisioned}} -> true
+             {:error, :cursor_signing_mutation_in_progress} -> true
              _other -> false
            end) == 7
 
@@ -133,14 +143,15 @@ defmodule Tightbeam.CursorSigningTest do
     assert File.ls!(Path.join(ctx.base_dir, "secrets")) == ["rest-cursor-signing.v1"]
   end
 
-  test "directory durability remains a completion barrier after authority commits", ctx do
+  test "post-publish directory failure is terminal and restart recovers the canonical file",
+       ctx do
     control_dir = Path.join(ctx.base_dir, "fsync-proof")
     File.mkdir_p!(control_dir)
     probe = compile_filesystem_probe!(control_dir)
     active_path = Path.join([ctx.base_dir, "secrets", "rest-cursor-signing.v1"])
     provision_failure = Path.join(control_dir, "provision-fsync-failed")
 
-    assert {"ok", 0} =
+    assert {"indeterminate", 0} =
              external_cursor_operation(ctx.base_dir, "provision",
                probe: probe,
                active_path: active_path,
@@ -151,17 +162,6 @@ defmodule Tightbeam.CursorSigningTest do
     assert File.exists?(provision_failure)
     provider = CursorSigning.load!(ctx.base_dir)
     old_signature = sign!(provider, "fsync-failure-cursor")
-    precommit_failure = Path.join(control_dir, "precommit-fsync-failed")
-
-    assert {"refused", 0} =
-             external_cursor_operation(ctx.base_dir, "rotate-refused",
-               probe: probe,
-               active_path: active_path,
-               failure_marker: precommit_failure,
-               failure_mode: "active-exists"
-             )
-
-    assert File.exists?(precommit_failure)
 
     assert {:ok, true} =
              CursorSigning.verify(provider, "fsync-failure-cursor", old_signature)
@@ -170,7 +170,7 @@ defmodule Tightbeam.CursorSigningTest do
 
     rotation_failure = Path.join(control_dir, "rotation-fsync-failed")
 
-    assert {"ok", 0} =
+    assert {"indeterminate", 0} =
              external_cursor_operation(ctx.base_dir, "rotate",
                probe: probe,
                active_path: active_path,
@@ -189,6 +189,271 @@ defmodule Tightbeam.CursorSigningTest do
 
     assert {:ok, true} =
              CursorSigning.verify(restarted_provider, "fsync-failure-cursor", new_signature)
+  end
+
+  test "indeterminate commit quarantines every consumer until canonical-file recovery", ctx do
+    control_dir = Path.join(ctx.base_dir, "quarantine-proof")
+    File.mkdir_p!(control_dir)
+    probe = compile_filesystem_probe!(control_dir)
+    active_path = Path.join([ctx.base_dir, "secrets", "rest-cursor-signing.v1"])
+    failure_marker = Path.join(control_dir, "directory-fsync-failed")
+
+    write_material_fixture!(ctx.base_dir)
+
+    {provider, host} =
+      start_observer_host!(ctx.base_dir, control_dir, probe, [
+        {"CURSOR_SIGNING_TEST_FAIL_AFTER_RENAME", "1"},
+        {"CURSOR_SIGNING_TEST_FSYNC_FAILED", failure_marker}
+      ])
+
+    router_opts =
+      Router.init(
+        cursor_signing: provider,
+        handlers: %{},
+        base_dir: ctx.base_dir,
+        cli_token: "tbc_quarantine"
+      )
+
+    assert {:indeterminate_commit, :cursor_signing_authority_may_have_advanced} =
+             CursorSigning.rotate(provider)
+
+    assert File.exists?(failure_marker)
+    assert :quarantined = CursorSigning.lifecycle(provider)
+    assert {:error, :cursor_signing_quarantined} = CursorSigning.sign(provider, "cursor")
+
+    assert {:error, :cursor_signing_quarantined} =
+             CursorSigning.verify(provider, "cursor", <<0::256>>)
+
+    assert {:error, :cursor_signing_quarantined} = CursorSigning.provision(ctx.base_dir)
+    assert {:error, :cursor_signing_quarantined} = CursorSigning.rotate(provider)
+
+    response = conn(:get, "/version") |> Router.call(router_opts)
+
+    assert response.status == 500
+    assert Plug.Conn.get_resp_header(response, "cache-control") == ["no-store"]
+    assert JSON.decode!(response.resp_body) == %{"error" => %{"code" => "projection_invalid"}}
+
+    File.write!(active_path, :crypto.strong_rand_bytes(31))
+    File.chmod!(active_path, 0o600)
+    assert {:error, :cursor_signing_recovery_refused} = CursorSigning.recover(provider)
+    assert :quarantined = CursorSigning.lifecycle(provider)
+
+    File.write!(active_path, :crypto.strong_rand_bytes(32))
+    File.chmod!(active_path, 0o600)
+    assert :ok = CursorSigning.recover(provider)
+    assert :healthy = CursorSigning.lifecycle(provider)
+    assert {:ok, _signature} = CursorSigning.sign(provider, "recovered-cursor")
+    assert File.ls!(Path.dirname(active_path)) == ["rest-cursor-signing.v1"]
+
+    stop_observer_host!(host, control_dir)
+  end
+
+  test "persistent directory-sync failure refuses recovery and stays quarantined", ctx do
+    control_dir = Path.join(ctx.base_dir, "persistent-sync-proof")
+    File.mkdir_p!(control_dir)
+    probe = compile_filesystem_probe!(control_dir)
+    active_path = Path.join([ctx.base_dir, "secrets", "rest-cursor-signing.v1"])
+    failure_marker = Path.join(control_dir, "directory-fsync-failed")
+
+    {provider, host} =
+      start_observer_host!(ctx.base_dir, control_dir, probe, [
+        {"CURSOR_SIGNING_TEST_FAIL_WHEN_ACTIVE_EXISTS", "1"},
+        {"CURSOR_SIGNING_TEST_FAIL_DIRECTORY_SYNC_ALWAYS", "1"},
+        {"CURSOR_SIGNING_TEST_FSYNC_FAILED", failure_marker}
+      ])
+
+    assert {:indeterminate_commit, :cursor_signing_authority_may_have_advanced} =
+             CursorSigning.provision(ctx.base_dir)
+
+    assert File.exists?(active_path)
+    assert File.exists?(failure_marker)
+    assert :quarantined = CursorSigning.lifecycle(provider)
+    assert {:error, :cursor_signing_recovery_refused} = CursorSigning.recover(provider)
+    assert :quarantined = CursorSigning.lifecycle(provider)
+    assert {:error, :cursor_signing_quarantined} = CursorSigning.sign(provider, "cursor")
+
+    stop_observer_host!(host, control_dir)
+  end
+
+  test "exclusive mutation admission precedes lifecycle checks across application nodes", ctx do
+    for operation <- [:provision, :rotate] do
+      base_dir = Path.join(ctx.base_dir, Atom.to_string(operation))
+      control_dir = Path.join(ctx.base_dir, "#{operation}-admission")
+      File.mkdir_p!(control_dir)
+
+      if operation == :rotate, do: write_material_fixture!(base_dir)
+
+      probe = compile_filesystem_probe!(control_dir)
+      active_path = Path.join([base_dir, "secrets", "rest-cursor-signing.v1"])
+      stage_ready = Path.join(control_dir, "stage-sync-ready")
+      stage_go = Path.join(control_dir, "stage-sync-go")
+
+      {provider, host} =
+        start_observer_host!(base_dir, control_dir, probe, [
+          {"CURSOR_SIGNING_TEST_STAGE_SYNC_READY", stage_ready},
+          {"CURSOR_SIGNING_TEST_STAGE_SYNC_GO", stage_go}
+        ])
+
+      parent = self()
+
+      owner =
+        spawn(fn ->
+          result =
+            case operation do
+              :provision -> CursorSigning.provision(base_dir)
+              :rotate -> CursorSigning.rotate(provider)
+            end
+
+          send(parent, {:mutation_winner, operation, result})
+        end)
+
+      assert is_pid(owner)
+      await_file!(stage_ready)
+
+      assert {:error, :cursor_signing_mutation_in_progress} =
+               CursorSigning.provision(base_dir)
+
+      assert {:error, :cursor_signing_mutation_in_progress} = CursorSigning.rotate(provider)
+      assert {:error, :cursor_signing_mutation_in_progress} = CursorSigning.recover(provider)
+      assert {:error, :cursor_signing_mutation_in_progress} = CursorSigning.sign(provider, "x")
+
+      File.write!(stage_go, "")
+      assert_receive {:mutation_winner, ^operation, :ok}, 15_000
+      assert :healthy = CursorSigning.lifecycle(provider)
+      assert File.ls!(Path.dirname(active_path)) == ["rest-cursor-signing.v1"]
+
+      stop_observer_host!(host, control_dir)
+    end
+  end
+
+  test "recovery owns mutation admission through success and canonical replacement refusal",
+       ctx do
+    for recovery_outcome <- [:success, :replaced] do
+      base_dir = Path.join(ctx.base_dir, "recovery-#{recovery_outcome}")
+      control_dir = Path.join(ctx.base_dir, "recovery-proof-#{recovery_outcome}")
+      File.mkdir_p!(control_dir)
+      probe = compile_filesystem_probe!(control_dir)
+      active_path = Path.join([base_dir, "secrets", "rest-cursor-signing.v1"])
+      sync_ready = Path.join(control_dir, "directory-sync-ready")
+      sync_go = Path.join(control_dir, "directory-sync-go")
+
+      {provider, host} =
+        start_observer_host!(base_dir, control_dir, probe, [
+          {"CURSOR_SIGNING_TEST_FAIL_AFTER_RENAME", "1"},
+          {"CURSOR_SIGNING_TEST_DIR_SYNC_READY", sync_ready},
+          {"CURSOR_SIGNING_TEST_DIR_SYNC_GO", sync_go}
+        ])
+
+      parent = self()
+
+      provision_owner =
+        spawn(fn -> send(parent, {:recovery_seed, CursorSigning.provision(base_dir)}) end)
+
+      assert is_pid(provision_owner)
+      await_file!(sync_ready)
+      File.write!(sync_go, "")
+
+      assert_receive {:recovery_seed,
+                      {:indeterminate_commit, :cursor_signing_authority_may_have_advanced}},
+                     15_000
+
+      assert :quarantined = CursorSigning.lifecycle(provider)
+      File.rm!(sync_ready)
+      File.rm!(sync_go)
+
+      recovery_owner =
+        spawn(fn -> send(parent, {:recovery_result, CursorSigning.recover(provider)}) end)
+
+      assert is_pid(recovery_owner)
+      await_file!(sync_ready)
+
+      assert {:error, :cursor_signing_mutation_in_progress} =
+               CursorSigning.provision(base_dir)
+
+      assert {:error, :cursor_signing_mutation_in_progress} = CursorSigning.rotate(provider)
+      assert {:error, :cursor_signing_mutation_in_progress} = CursorSigning.recover(provider)
+      assert {:error, :cursor_signing_mutation_in_progress} = CursorSigning.sign(provider, "x")
+
+      if recovery_outcome == :replaced do
+        replacement = Path.join(Path.dirname(active_path), ".replacement")
+        File.write!(replacement, :crypto.strong_rand_bytes(32))
+        File.chmod!(replacement, 0o600)
+        File.rename!(replacement, active_path)
+      end
+
+      File.write!(sync_go, "")
+
+      expected =
+        case recovery_outcome do
+          :success -> :ok
+          :replaced -> {:error, :cursor_signing_recovery_refused}
+        end
+
+      assert_receive {:recovery_result, ^expected}, 15_000
+
+      expected_lifecycle = if recovery_outcome == :success, do: :healthy, else: :quarantined
+      assert ^expected_lifecycle = CursorSigning.lifecycle(provider)
+
+      stop_observer_host!(host, control_dir)
+    end
+  end
+
+  test "owner death after publication quarantines before mutation admission is released", ctx do
+    for operation <- [:provision, :rotate] do
+      base_dir = Path.join(ctx.base_dir, "owner-death-#{operation}")
+      control_dir = Path.join(ctx.base_dir, "owner-death-proof-#{operation}")
+      File.mkdir_p!(control_dir)
+
+      if operation == :rotate, do: write_material_fixture!(base_dir)
+
+      probe = compile_filesystem_probe!(control_dir)
+      active_path = Path.join([base_dir, "secrets", "rest-cursor-signing.v1"])
+      sync_ready = Path.join(control_dir, "directory-sync-ready")
+      sync_go = Path.join(control_dir, "directory-sync-go")
+
+      {provider, host} =
+        start_observer_host!(base_dir, control_dir, probe, [
+          {"CURSOR_SIGNING_TEST_DIR_SYNC_READY", sync_ready},
+          {"CURSOR_SIGNING_TEST_DIR_SYNC_GO", sync_go}
+        ])
+
+      parent = self()
+
+      owner =
+        spawn(fn ->
+          result =
+            case operation do
+              :provision -> CursorSigning.provision(base_dir)
+              :rotate -> CursorSigning.rotate(provider)
+            end
+
+          send(parent, {:dead_owner_result, operation, result})
+        end)
+
+      await_file!(sync_ready)
+
+      assert {:error, :cursor_signing_mutation_in_progress} =
+               CursorSigning.provision(base_dir)
+
+      assert {:error, :cursor_signing_mutation_in_progress} = CursorSigning.rotate(provider)
+      assert {:error, :cursor_signing_mutation_in_progress} = CursorSigning.recover(provider)
+      assert {:error, :cursor_signing_mutation_in_progress} = CursorSigning.sign(provider, "x")
+
+      Process.exit(owner, :kill)
+      await_lifecycle!(provider, :quarantined)
+
+      assert {:error, :cursor_signing_quarantined} = CursorSigning.sign(provider, "x")
+      assert {:error, :cursor_signing_quarantined} = CursorSigning.rotate(provider)
+      assert {:error, :cursor_signing_quarantined} = CursorSigning.provision(base_dir)
+      refute_receive {:dead_owner_result, ^operation, _result}, 100
+
+      File.write!(sync_go, "")
+      assert :ok = CursorSigning.recover(provider)
+      assert :healthy = CursorSigning.lifecycle(provider)
+      assert File.ls!(Path.dirname(active_path)) == ["rest-cursor-signing.v1"]
+
+      stop_observer_host!(host, control_dir)
+    end
   end
 
   test "a failed rotation preserves the old complete record", ctx do
@@ -375,11 +640,13 @@ defmodule Tightbeam.CursorSigningTest do
 
     case operation do
       "provision" ->
-        :ok = Tightbeam.CursorSigning.provision(base_dir)
+        {:indeterminate_commit, :cursor_signing_authority_may_have_advanced} =
+          Tightbeam.CursorSigning.provision(base_dir)
 
       "rotate" ->
         provider = Tightbeam.CursorSigning.load!(base_dir)
-        :ok = Tightbeam.CursorSigning.rotate(provider)
+        {:indeterminate_commit, :cursor_signing_authority_may_have_advanced} =
+          Tightbeam.CursorSigning.rotate(provider)
 
       "rotate-refused" ->
         provider = Tightbeam.CursorSigning.load!(base_dir)
@@ -387,7 +654,7 @@ defmodule Tightbeam.CursorSigningTest do
         IO.binwrite("refused")
     end
 
-    if operation != "rotate-refused", do: IO.binwrite("ok")
+    if operation != "rotate-refused", do: IO.binwrite("indeterminate")
     """
 
     environment =
@@ -588,6 +855,107 @@ defmodule Tightbeam.CursorSigningTest do
     end
   end
 
+  defp await_lifecycle!(provider, expected, attempts \\ 1_000)
+
+  defp await_lifecycle!(_provider, _expected, 0) do
+    raise "cursor lifecycle transition timed out"
+  end
+
+  defp await_lifecycle!(provider, expected, attempts) do
+    if CursorSigning.lifecycle(provider) == expected do
+      :ok
+    else
+      Process.sleep(10)
+      await_lifecycle!(provider, expected, attempts - 1)
+    end
+  end
+
+  defp write_material_fixture!(base_dir) do
+    directory = Path.join(base_dir, "secrets")
+    record = Path.join(directory, "rest-cursor-signing.v1")
+    File.mkdir_p!(directory)
+    File.chmod!(directory, 0o700)
+    File.write!(record, :crypto.strong_rand_bytes(32))
+    File.chmod!(record, 0o600)
+    record
+  end
+
+  defp start_observer_host!(base_dir, control_dir, probe, environment) do
+    unless Node.alive?(), do: raise("cursor observer host requires a distributed test node")
+
+    ready = Path.join(control_dir, "observer-ready")
+    stop = Path.join(control_dir, "observer-stop")
+
+    script = """
+    defmodule CursorSigningObserverHost do
+      def run(parent_node, base_dir, ready, stop) do
+        true = Node.connect(String.to_atom(parent_node))
+        :global.sync()
+        {:ok, _provider} = Tightbeam.CursorSigning.load(base_dir)
+        File.write!(ready, "")
+        await_file(stop, 30_000)
+        IO.binwrite("ok")
+      end
+
+      defp await_file(_path, 0), do: raise("cursor observer host timed out")
+
+      defp await_file(path, attempts) do
+        if File.exists?(path) do
+          :ok
+        else
+          Process.sleep(10)
+          await_file(path, attempts - 1)
+        end
+      end
+    end
+
+    [parent_node, base_dir, ready, stop] = System.argv()
+    CursorSigningObserverHost.run(parent_node, base_dir, ready, stop)
+    """
+
+    host =
+      Task.async(fn ->
+        external_distributed_instrumented_elixir(
+          script,
+          [Atom.to_string(Node.self()), base_dir, ready, stop],
+          filesystem_probe_environment(
+            probe,
+            Path.join([base_dir, "secrets", "rest-cursor-signing.v1"])
+          ) ++
+            environment
+        )
+      end)
+
+    on_exit(fn ->
+      File.write(stop, "")
+      await_process_exit!(host.pid)
+    end)
+
+    await_file!(ready)
+    :global.sync()
+    {CursorSigning.load!(base_dir), host}
+  end
+
+  defp stop_observer_host!(host, control_dir) do
+    File.write!(Path.join(control_dir, "observer-stop"), "")
+    {_output, 0} = Task.await(host, 15_000)
+    :global.sync()
+    :ok
+  end
+
+  defp await_process_exit!(pid, attempts \\ 1_500)
+
+  defp await_process_exit!(_pid, 0), do: raise("cursor observer host did not stop")
+
+  defp await_process_exit!(pid, attempts) do
+    if Process.alive?(pid) do
+      Process.sleep(10)
+      await_process_exit!(pid, attempts - 1)
+    else
+      :ok
+    end
+  end
+
   defp external_elixir(script, arguments) do
     code_paths =
       :code.get_path()
@@ -620,6 +988,50 @@ defmodule Tightbeam.CursorSigningTest do
         bindir,
         "-progname",
         "erl",
+        "--",
+        "-noshell",
+        "-elixir_root",
+        elixir_root,
+        "-pa",
+        Path.join(elixir_root, "ebin"),
+        "-s",
+        "elixir",
+        "start_cli",
+        "--",
+        "--",
+        "-extra"
+      ] ++ code_paths ++ ["-e", script | arguments]
+
+    System.cmd(executable, runtime_arguments, stderr_to_stdout: true, env: environment)
+  end
+
+  defp external_distributed_instrumented_elixir(script, arguments, environment) do
+    root = :code.root_dir() |> List.to_string()
+    erts_version = :erlang.system_info(:version) |> List.to_string()
+    executable = Path.join([root, "erts-#{erts_version}", "bin", "beam.smp"])
+    bindir = Path.dirname(executable)
+    elixir_root = :code.lib_dir(:elixir) |> List.to_string()
+    node_name = "cursor_signing_probe_#{System.unique_integer([:positive])}"
+    cookie = Node.get_cookie() |> Atom.to_string()
+
+    code_paths =
+      :code.get_path()
+      |> Enum.map(&List.to_string/1)
+      |> Enum.flat_map(&["-pa", &1])
+
+    runtime_arguments =
+      [
+        "--",
+        "-root",
+        root,
+        "-bindir",
+        bindir,
+        "-progname",
+        "erl",
+        "-sname",
+        node_name,
+        "-setcookie",
+        cookie,
         "--",
         "-noshell",
         "-elixir_root",

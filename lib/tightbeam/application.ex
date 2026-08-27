@@ -60,9 +60,12 @@ defmodule Tightbeam.Application do
 
   defp start_tree(config) do
     # The server-held cursor signer is composed before any child, including the
-    # listener. Missing or malformed durable material is a typed startup failure;
-    # normal startup never provisions or substitutes it.
-    cursor_signing = Tightbeam.CursorSigning.load!(config.base_dir)
+    # listener. An absent canonical path selects the unprovisioned state, and an
+    # unhealthy state closes startup before the store or listener starts. Normal
+    # startup never provisions or substitutes material.
+    cursor_signing =
+      config.base_dir |> Tightbeam.CursorSigning.load!() |> Tightbeam.CursorSigning.validate!()
+
     config = Map.put(config, :cursor_signing, cursor_signing)
 
     with {:ok, supervisor} <- Supervisor.start_link(children(), root_opts()) do

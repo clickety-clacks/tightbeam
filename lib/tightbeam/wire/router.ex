@@ -70,9 +70,18 @@ defmodule Tightbeam.Wire.Router do
 
   @impl Plug
   def call(conn, opts) do
-    conn
-    |> Plug.Conn.put_private(:tightbeam_deps, Map.new(opts))
-    |> super(opts)
+    deps = Map.new(opts)
+    conn = Plug.Conn.put_private(conn, :tightbeam_deps, deps)
+
+    case Tightbeam.CursorSigning.admit_request(deps.cursor_signing) do
+      :ok ->
+        super(conn, deps)
+
+      {:error, _reason} ->
+        conn
+        |> Plug.Conn.put_resp_header("cache-control", "no-store")
+        |> error(500, "projection_invalid")
+    end
   end
 
   plug(:match)

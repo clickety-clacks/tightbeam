@@ -43,7 +43,8 @@ static int is_target_rename(const char *old_path, const char *new_path) {
 
   return active_path != NULL && old_path != NULL && new_path != NULL &&
          strcmp(new_path, active_path) == 0 &&
-         strstr(old_path, ".rest-cursor-signing.v1.rotate-") != NULL;
+         (strstr(old_path, ".rest-cursor-signing.v1.rotate-") != NULL ||
+          strstr(old_path, ".rest-cursor-signing.v1.provision-") != NULL);
 }
 
 static void before_target_rename(void) {
@@ -74,16 +75,31 @@ int fsync(int fd) {
       getenv("CURSOR_SIGNING_TEST_FAIL_WHEN_ACTIVE_EXISTS");
   const char *fail_after_rename =
       getenv("CURSOR_SIGNING_TEST_FAIL_AFTER_RENAME");
+  const char *fail_always =
+      getenv("CURSOR_SIGNING_TEST_FAIL_DIRECTORY_SYNC_ALWAYS");
 
   int directory = fstat(fd, &stat_buffer) == 0 && S_ISDIR(stat_buffer.st_mode);
+  int regular = fstat(fd, &stat_buffer) == 0 && S_ISREG(stat_buffer.st_mode);
   int active_exists = active_path != NULL && access(active_path, F_OK) == 0;
   int should_fail =
       directory &&
       ((fail_when_active != NULL && active_exists) ||
        (fail_after_rename != NULL && completed_target_rename != 0));
 
+  if (regular && getenv("CURSOR_SIGNING_TEST_STAGE_SYNC_READY") != NULL) {
+    touch_marker("CURSOR_SIGNING_TEST_STAGE_SYNC_READY");
+    await_marker("CURSOR_SIGNING_TEST_STAGE_SYNC_GO");
+  }
+
+  if (directory && completed_target_rename != 0 &&
+      getenv("CURSOR_SIGNING_TEST_DIR_SYNC_READY") != NULL) {
+    touch_marker("CURSOR_SIGNING_TEST_DIR_SYNC_READY");
+    await_marker("CURSOR_SIGNING_TEST_DIR_SYNC_GO");
+  }
+
   if (should_fail &&
-      __sync_bool_compare_and_swap(&failed_directory_sync, 0, 1)) {
+      (fail_always != NULL ||
+       __sync_bool_compare_and_swap(&failed_directory_sync, 0, 1))) {
     touch_marker("CURSOR_SIGNING_TEST_FSYNC_FAILED");
     errno = EIO;
     return -1;

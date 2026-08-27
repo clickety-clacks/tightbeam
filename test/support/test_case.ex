@@ -89,7 +89,17 @@ defmodule Tightbeam.TestCase do
   def cursor_signing!(base_dir) do
     case Tightbeam.CursorSigning.load(base_dir) do
       {:ok, provider} ->
-        provider
+        case Tightbeam.CursorSigning.validate(provider) do
+          :ok ->
+            provider
+
+          {:error, :cursor_signing_unprovisioned} ->
+            :ok = Tightbeam.CursorSigning.provision(base_dir)
+            Tightbeam.CursorSigning.load!(base_dir)
+
+          {:error, reason} ->
+            raise Tightbeam.CursorSigning.Error, reason: reason
+        end
 
       {:error, %Tightbeam.CursorSigning.Error{reason: reason}}
       when reason in [:missing_directory, :missing_material] ->
