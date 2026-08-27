@@ -4,7 +4,7 @@
 //! omission lets the gateway derive the principal from the discovered session
 //! credential.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -723,20 +723,26 @@ const BOOLEAN_FLAGS: &[&str] = &[
 struct Flags {
     positional: Vec<String>,
     flags: HashMap<String, String>,
+    duplicates: HashSet<String>,
 }
 
 fn split_args(args: Vec<String>) -> Flags {
     let mut positional = Vec::new();
     let mut flags = HashMap::new();
+    let mut duplicates = HashSet::new();
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
         if let Some(name) = arg.strip_prefix("--") {
             if BOOLEAN_FLAGS.contains(&name) {
-                flags.insert(name.to_owned(), String::new());
+                if flags.insert(name.to_owned(), String::new()).is_some() {
+                    duplicates.insert(name.to_owned());
+                }
             } else {
                 let value = args.get(index + 1).cloned().unwrap_or_default();
-                flags.insert(name.to_owned(), value);
+                if flags.insert(name.to_owned(), value).is_some() {
+                    duplicates.insert(name.to_owned());
+                }
                 index += 1;
             }
         } else {
@@ -744,11 +750,34 @@ fn split_args(args: Vec<String>) -> Flags {
         }
         index += 1;
     }
-    Flags { positional, flags }
+    Flags {
+        positional,
+        flags,
+        duplicates,
+    }
 }
 
 fn nonempty(flags: &HashMap<String, String>, name: &str) -> Option<String> {
     flags.get(name).filter(|value| !value.is_empty()).cloned()
+}
+
+fn complete_decision_request_id(value: &str) -> bool {
+    let Some(uuid) = value.strip_prefix("dr_") else {
+        return false;
+    };
+    let bytes = uuid.as_bytes();
+
+    bytes.len() == 36
+        && [8, 13, 18, 23]
+            .into_iter()
+            .all(|index| bytes[index] == b'-')
+        && bytes[14] == b'4'
+        && matches!(bytes[19], b'8' | b'9' | b'a' | b'b')
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            matches!(index, 8 | 13 | 18 | 23)
+                || byte.is_ascii_digit()
+                || matches!(byte, b'a'..=b'f')
+        })
 }
 
 /// PRESENCE, for the fields where an empty value means something. `nonempty`
@@ -1328,7 +1357,10 @@ fn parse_with_optional_catalog(
             const ALLOWED: &[&str] = &["request", "as", "as-user", "as-process"];
             let request_id = nonempty(flags, "request");
             if parsed.positional.len() != 1
-                || request_id.is_none()
+                || !request_id
+                    .as_deref()
+                    .is_some_and(complete_decision_request_id)
+                || parsed.duplicates.contains("request")
                 || flags.keys().any(|flag| !ALLOWED.contains(&flag.as_str()))
             {
                 return Err(
@@ -3250,25 +3282,41 @@ mod tests {
 
     #[test]
     fn decision_request_requires_one_exact_request_flag_and_closed_identity_flags() {
+        let request_id = "dr_12345678-1234-4234-9234-123456789abc";
+
         assert_eq!(
             parse(strings(&[
                 "decision-request",
                 "--request",
-                "dr_1",
+                request_id,
                 "--as",
                 "reviewer",
             ])),
             Ok(Command::DecisionRequest {
                 identity: Identity::Role("reviewer".to_owned()),
-                request_id: "dr_1".to_owned(),
+                request_id: request_id.to_owned(),
             })
         );
 
         for args in [
             strings(&["decision-request"]),
-            strings(&["decision-request", "dr_1"]),
+            strings(&["decision-request", request_id]),
             strings(&["decision-request", "--request", ""]),
-            strings(&["decision-request", "--request", "dr_1", "--target", "main"]),
+            strings(&["decision-request", "--request", "dr_12345678"]),
+            strings(&[
+                "decision-request",
+                "--request",
+                request_id,
+                "--request",
+                "dr_87654321-4321-4321-8321-cba987654321",
+            ]),
+            strings(&[
+                "decision-request",
+                "--request",
+                request_id,
+                "--target",
+                "main",
+            ]),
         ] {
             assert_eq!(
                 parse(args),

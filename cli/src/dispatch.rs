@@ -2013,8 +2013,14 @@ mod tests {
             r#"{"as":"parent","verb":"decision-requests","params":{"status":"open"}}"#
         );
         assert_eq!(
-            body(&["decision-request", "--request", "dr_1", "--as", "parent"]),
-            r#"{"as":"parent","verb":"decision-request","params":{"request":"dr_1"}}"#
+            body(&[
+                "decision-request",
+                "--request",
+                "dr_12345678-1234-4234-9234-123456789abc",
+                "--as",
+                "parent",
+            ]),
+            r#"{"as":"parent","verb":"decision-request","params":{"request":"dr_12345678-1234-4234-9234-123456789abc"}}"#
         );
         assert_eq!(
             body(&[
