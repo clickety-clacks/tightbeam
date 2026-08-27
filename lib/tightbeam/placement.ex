@@ -1155,10 +1155,11 @@ defmodule Tightbeam.Placement do
         Map.get(config, :harness_target_overrides, %{})
       )
 
-    kind = credential_kind(config, module.credential_provider(), host, module.wire_name())
     projected_home = Homes.home_path(host_config.base_dir, host, module.id())
 
-    with {:ok, checked_opts} <-
+    with {:ok, _} <- cursor_locality_before_kind(module, target, projected_home),
+         kind = credential_kind(config, module.credential_provider(), host, module.wire_name()),
+         {:ok, checked_opts} <-
            Harness.preflight_launch(module, target, projected_home, credential_kind: kind) do
       build_adapter_opts(
         config,
@@ -1603,6 +1604,18 @@ defmodule Tightbeam.Placement do
   end
 
   defp shell_quote(script), do: "'" <> String.replace(script, "'", "'\\''") <> "'"
+
+  # Remote Cursor is local-only; refuse through harness preflight before any
+  # credential-store kind read (Placement.adapter_opts product entry point).
+  defp cursor_locality_before_kind(Tightbeam.Harness.Cursor, target, projected_home) do
+    if get_in(target, [:host_config, :ssh]) != nil do
+      Tightbeam.Harness.Cursor.preflight_launch(target, projected_home, [])
+    else
+      {:ok, []}
+    end
+  end
+
+  defp cursor_locality_before_kind(_module, _target, _projected_home), do: {:ok, []}
 
   defp credential_kind(config, provider, host, harness) do
     case read_credential_kind(config, provider, host) do

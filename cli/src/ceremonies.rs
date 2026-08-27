@@ -659,10 +659,10 @@ fn read_api_key_from(reader: &mut impl io::Read) -> Result<String, String> {
 /// is the whole value of the refusal. Same shape, and same reason, as
 /// `unnamed_machine`.
 fn api_key_needs_a_pipe(provider: &str) -> String {
-    let (env_var, command) = match provider {
-        "openai" => ("OPENAI_API_KEY", "tightbeam onboard openai --api-key"),
-        "cursor" => ("CURSOR_API_KEY", "tightbeam onboard cursor --api-key"),
-        _ => ("ANTHROPIC_API_KEY", "tightbeam onboard anthropic --api-key"),
+    let (env_var, command) = if provider == "cursor" {
+        ("CURSOR_API_KEY", "tightbeam onboard cursor --api-key")
+    } else {
+        ("ANTHROPIC_API_KEY", "tightbeam onboard anthropic --api-key")
     };
 
     format!(
@@ -2244,6 +2244,11 @@ mod tests {
         assert!(cursor.contains("printenv CURSOR_API_KEY"));
         assert!(cursor.contains("tightbeam onboard cursor --api-key"));
         assert!(!cursor.contains("anthropic"));
+
+        let openai = api_key_needs_a_pipe("openai");
+        assert!(openai.contains("printenv ANTHROPIC_API_KEY"));
+        assert!(openai.contains("tightbeam onboard anthropic --api-key"));
+        assert!(!openai.contains("openai"));
     }
 
     /// A subscription credential is a BEARER token, and sending it as `x-api-key` would

@@ -750,6 +750,34 @@ defmodule Tightbeam.PlacementTest do
     refute File.exists?(Tightbeam.Homes.home_path(base_dir, "testhost", :cursor))
   end
 
+  test "remote Cursor adapter_opts refuses local-only before credential kind read", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    parent = self()
+
+    register_hosts(db, %{
+      "worker" => %{ssh: "cursor@worker", base_dir: "/srv/tb", cli_bin: "/srv/tb/bin"}
+    })
+
+    config = %{
+      base_dir: base_dir,
+      db: db,
+      cwd: "/work",
+      cli_bin: Path.join(base_dir, "bin"),
+      sh: fn _ -> flunk("remote cursor adapter_opts ran target command") end,
+      credential_kind: fn provider, _host ->
+        send(parent, {:credential_kind_read, provider})
+        :api_key
+      end
+    }
+
+    assert {:error, %{code: "DIV-CURSOR-LOCAL-ONLY"}} =
+             Placement.adapter_opts(config, {:cursor, "shared", "worker"})
+
+    refute_receive {:credential_kind_read, _}
+  end
+
   test "adapter_opts preserves the pre-placement local shape", %{base_dir: base_dir, db: db} do
     parent = self()
 
