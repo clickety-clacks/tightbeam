@@ -118,6 +118,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
         Command::Help
         | Command::CommandHelp(_)
         | Command::Doctor { .. }
+        | Command::VisitorKeyringInit { .. }
         | Command::UpdateClients { .. }
         | Command::Assimilate(_) => {
             Err("command does not dispatch through /agent/dispatch".to_owned())
@@ -1396,6 +1397,7 @@ where
             unreachable!("help is handled before dispatch")
         }
         Command::Doctor { json, base_dir } => crate::probe::run(json, base_dir),
+        Command::VisitorKeyringInit { base_dir } => crate::visitor::keyring_init(base_dir),
         Command::AddUser {
             identity,
             user_id,
@@ -1581,6 +1583,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         Command::Help
         | Command::CommandHelp(_)
         | Command::Doctor { .. }
+        | Command::VisitorKeyringInit { .. }
         | Command::ToolCallObserved
         | Command::UpdateClients { .. }
         | Command::Assimilate(_) => None,
