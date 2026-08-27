@@ -2567,55 +2567,119 @@ defmodule Tightbeam.Escalation do
         true -> :legacy
       end
 
-    fact_ok =
-      match?(
-        [[1]],
-        Txn.q(
-          txn,
-          "SELECT COUNT(*) FROM condition_facts WHERE id = ?1 AND kind = 'escalation-ruled' AND scope = ?2",
-          [request.ruling_fact_id, request.id]
-        )
+    fact_shape = ruling_fact_shape_in_txn(txn, request)
+
+    [[event_count]] =
+      Txn.q(
+        txn,
+        "SELECT COUNT(*) FROM lifecycle_events WHERE kind = 'decision_request_ruled' AND subject = ?1",
+        [request.id]
       )
 
-    event_ok =
-      match?(
-        [[1]],
-        Txn.q(
-          txn,
-          "SELECT COUNT(*) FROM lifecycle_events WHERE kind = 'decision_request_ruled' AND subject = ?1",
-          [request.id]
-        )
-      )
+    notification_count =
+      if fact_epoch == :post_activation,
+        do: operator_notification_count_in_txn(txn, request),
+        else: 0
 
-    notification_ok =
-      fact_epoch != :post_activation or
-        operator_notification_count_in_txn(txn, request) == 1
+    request_identity_valid =
+      canonical_request_id?(request.id) and request.kind == "operator" and
+        nonblank?(request.raiser_id) and nonblank?(request.owner_user_id) and
+        nonblank?(request.raiser_session_key) and nonblank?(request.action_key) and
+        nonblank?(request.question) and is_integer(request.raised_at) and
+        is_integer(request.deadline_at) and request.deadline_at > request.raised_at and
+        (is_nil(request.assignment_id) or nonblank?(request.assignment_id)) and
+        is_map(request.context)
+
+    owner_valid = request.ruled_by == "user:" <> to_string(request.owner_user_id)
+    options_valid = operator_options_valid?(request.options)
+    decision_valid = nonblank?(request.decision)
+    rationale_valid = is_nil(request.rationale) or nonblank?(request.rationale)
+    ruled_at_valid = is_integer(request.ruled_at)
+
+    fact_valid =
+      is_integer(request.ruling_fact_id) and
+        fact_shape["canonicalCardinality"] == "one"
+
+    principal_valid = performer_principal_valid?(request, fact_epoch)
+    session_valid = performer_session_valid?(request, fact_epoch)
+    lifecycle_valid = request.status == "ruled" and is_nil(request.consumed_at)
+    event_valid = event_count == 1
+    notification_valid = fact_epoch != :post_activation or notification_count == 1
 
     checks = %{
       "requestIdentity" =>
-        canonical_request_id?(request.id) and request.kind == "operator" and
-          nonblank?(request.raiser_id) and nonblank?(request.owner_user_id) and
-          nonblank?(request.raiser_session_key) and nonblank?(request.action_key) and
-          nonblank?(request.question) and is_integer(request.raised_at) and
-          is_integer(request.deadline_at) and request.deadline_at > request.raised_at and
-          (is_nil(request.assignment_id) or nonblank?(request.assignment_id)) and
-          is_map(request.context),
-      "ownerOnBehalfOf" => request.ruled_by == "user:" <> to_string(request.owner_user_id),
-      "options" => operator_options_valid?(request.options),
-      "decision" => nonblank?(request.decision),
-      "rationale" => is_nil(request.rationale) or is_binary(request.rationale),
-      "ruledAt" => is_integer(request.ruled_at),
-      "rulingFactId" => is_integer(request.ruling_fact_id) and fact_ok,
-      "performerPrincipal" => performer_principal_valid?(request, fact_epoch),
-      "performerSession" => performer_session_valid?(request, fact_epoch),
-      "lifecycleConsumption" => request.status == "ruled" and is_nil(request.consumed_at),
-      "rulingLifecycleEvent" => event_ok,
-      "raiserNotificationWake" => notification_ok
+        structural_check(request_identity_valid, %{
+          "idType" => terminal_type_class(request.id),
+          "idCanonical" => canonical_request_id?(request.id),
+          "kindState" => terminal_kind_state(request.kind),
+          "raiserIdType" => terminal_type_class(request.raiser_id),
+          "ownerUserIdType" => terminal_type_class(request.owner_user_id),
+          "raiserSessionKeyType" => terminal_type_class(request.raiser_session_key),
+          "actionKeyType" => terminal_type_class(request.action_key),
+          "questionType" => terminal_type_class(request.question),
+          "raisedAtType" => terminal_type_class(request.raised_at),
+          "deadlineAtType" => terminal_type_class(request.deadline_at),
+          "deadlineOrder" => terminal_deadline_order(request.raised_at, request.deadline_at),
+          "assignmentIdType" => terminal_optional_nonblank_class(request.assignment_id),
+          "contextType" => terminal_type_class(request.context)
+        }),
+      "ownerOnBehalfOf" =>
+        structural_check(owner_valid, %{
+          "ownerUserIdType" => terminal_type_class(request.owner_user_id),
+          "raiserSessionKeyType" => terminal_type_class(request.raiser_session_key),
+          "ruledByType" => terminal_type_class(request.ruled_by),
+          "ruledByMatchesOwner" => owner_valid
+        }),
+      "options" => structural_check(options_valid, operator_options_shape(request.options)),
+      "decision" =>
+        structural_check(decision_valid, %{
+          "type" => terminal_type_class(request.decision),
+          "normalizedNonblank" => decision_valid
+        }),
+      "rationale" =>
+        structural_check(rationale_valid, %{
+          "type" => terminal_type_class(request.rationale),
+          "contractAccepted" => rationale_valid
+        }),
+      "ruledAt" =>
+        structural_check(ruled_at_valid, %{"type" => terminal_type_class(request.ruled_at)}),
+      "rulingFactId" =>
+        structural_check(
+          fact_valid,
+          Map.put(fact_shape, "idType", terminal_type_class(request.ruling_fact_id))
+        ),
+      "performerPrincipal" =>
+        structural_check(principal_valid, %{
+          "epochState" => terminal_epoch_state(fact_epoch),
+          "type" => terminal_type_class(request.ruled_via_principal),
+          "canonical" => canonical_principal?(request.ruled_via_principal)
+        }),
+      "performerSession" =>
+        structural_check(session_valid, %{
+          "epochState" => terminal_epoch_state(fact_epoch),
+          "stateClass" => terminal_session_state_class(request.ruled_via_session_state),
+          "keyType" => terminal_type_class(request.ruled_via_session_key),
+          "stateKeyConsistent" => terminal_session_state_key_consistent?(request)
+        }),
+      "lifecycleConsumption" =>
+        structural_check(lifecycle_valid, %{
+          "statusState" => terminal_status_state(request.status),
+          "consumedAtType" => terminal_type_class(request.consumed_at)
+        }),
+      "rulingLifecycleEvent" =>
+        structural_check(event_valid, %{
+          "canonicalCardinality" => terminal_cardinality(event_count)
+        }),
+      "raiserNotificationWake" =>
+        structural_check(notification_valid, %{
+          "requirementState" => terminal_wake_requirement_state(fact_epoch),
+          "canonicalCardinality" => terminal_cardinality(notification_count)
+        })
     }
 
     failing_fields =
       @terminal_shape_fields
-      |> Enum.reject(&Map.fetch!(checks, &1))
+      |> Enum.reject(&get_in(checks, [&1, "valid"]))
 
     case failing_fields do
       [] ->
@@ -2626,6 +2690,143 @@ defmodule Tightbeam.Escalation do
         {:error, integrity_error(request.id)}
     end
   end
+
+  defp structural_check(valid, shape), do: Map.put(shape, "valid", valid)
+
+  defp ruling_fact_shape_in_txn(txn, request) do
+    rows =
+      Txn.q(
+        txn,
+        "SELECT kind, scope FROM condition_facts WHERE id = ?1",
+        [request.ruling_fact_id]
+      )
+
+    case rows do
+      [] ->
+        %{
+          "idCardinality" => "zero",
+          "kindRelation" => "absent",
+          "scopeRelation" => "absent",
+          "canonicalCardinality" => "zero"
+        }
+
+      [[kind, scope]] ->
+        kind_match = kind == "escalation-ruled"
+        scope_match = scope == request.id
+
+        %{
+          "idCardinality" => "one",
+          "kindRelation" => terminal_relation_state(kind_match),
+          "scopeRelation" => terminal_relation_state(scope_match),
+          "canonicalCardinality" => if(kind_match and scope_match, do: "one", else: "zero")
+        }
+
+      _rows ->
+        %{
+          "idCardinality" => "many",
+          "kindRelation" => "ambiguous",
+          "scopeRelation" => "ambiguous",
+          "canonicalCardinality" => "many"
+        }
+    end
+  end
+
+  defp operator_options_shape(options) do
+    nonempty = is_list(options) and options != []
+
+    objects =
+      is_list(options) and
+        Enum.all?(options, &is_map/1)
+
+    sole_label_key =
+      objects and
+        Enum.all?(options, fn option -> Map.keys(option) == ["label"] end)
+
+    labels =
+      if sole_label_key,
+        do: Enum.map(options, &Map.fetch!(&1, "label")),
+        else: []
+
+    labels_nonblank =
+      sole_label_key and Enum.all?(labels, &nonblank?/1)
+
+    labels_normalized =
+      labels_nonblank and Enum.all?(labels, &(String.trim(&1) == &1))
+
+    labels_distinct =
+      labels_normalized and Enum.uniq(labels) == labels
+
+    %{
+      "type" => terminal_type_class(options),
+      "nonempty" => nonempty,
+      "membersAreObjects" => objects,
+      "soleLabelKey" => sole_label_key,
+      "labelsNonblankStrings" => labels_nonblank,
+      "labelsNormalized" => labels_normalized,
+      "labelsDistinct" => labels_distinct
+    }
+  end
+
+  defp terminal_type_class(nil), do: "null"
+  defp terminal_type_class(value) when is_binary(value) and value == "", do: "string-empty"
+
+  defp terminal_type_class(value) when is_binary(value) do
+    if String.trim(value) == "", do: "string-blank", else: "string-nonblank"
+  end
+
+  defp terminal_type_class(value) when is_integer(value), do: "integer"
+  defp terminal_type_class(value) when is_float(value), do: "number"
+  defp terminal_type_class(value) when is_boolean(value), do: "boolean"
+  defp terminal_type_class(value) when is_list(value), do: "array"
+  defp terminal_type_class(value) when is_map(value), do: "object"
+  defp terminal_type_class(_value), do: "other"
+
+  defp terminal_optional_nonblank_class(nil), do: "null"
+  defp terminal_optional_nonblank_class(value), do: terminal_type_class(value)
+
+  defp terminal_deadline_order(raised_at, deadline_at)
+       when is_integer(raised_at) and is_integer(deadline_at) do
+    if deadline_at > raised_at, do: "after", else: "not-after"
+  end
+
+  defp terminal_deadline_order(_raised_at, _deadline_at), do: "not-comparable"
+
+  defp terminal_kind_state("operator"), do: "operator"
+  defp terminal_kind_state(_kind), do: "other"
+
+  defp terminal_epoch_state(:post_activation), do: "post-activation"
+  defp terminal_epoch_state(:legacy), do: "legacy"
+  defp terminal_epoch_state(:unknown), do: "unknown"
+
+  defp terminal_session_state_class("known"), do: "known"
+  defp terminal_session_state_class("none"), do: "none"
+  defp terminal_session_state_class(nil), do: "null"
+  defp terminal_session_state_class(_state), do: "other"
+
+  defp terminal_session_state_key_consistent?(request) do
+    (request.ruled_via_session_state == "known" and
+       nonblank?(request.ruled_via_session_key)) or
+      (request.ruled_via_session_state == "none" and
+         is_nil(request.ruled_via_session_key)) or
+      (is_nil(request.ruled_via_session_state) and
+         (is_nil(request.ruled_via_session_key) or nonblank?(request.ruled_via_session_key)))
+  end
+
+  defp terminal_status_state("ruled"), do: "ruled"
+  defp terminal_status_state("consumed"), do: "consumed"
+  defp terminal_status_state(_status), do: "other"
+
+  defp terminal_wake_requirement_state(:post_activation), do: "required"
+  defp terminal_wake_requirement_state(:legacy), do: "not-required-legacy"
+  defp terminal_wake_requirement_state(:unknown), do: "unknown"
+
+  defp terminal_relation_state(true), do: "match"
+  defp terminal_relation_state(false), do: "mismatch"
+
+  defp terminal_cardinality(0), do: "zero"
+  defp terminal_cardinality(1), do: "one"
+  defp terminal_cardinality(count) when is_integer(count) and count > 1, do: "many"
+  defp terminal_cardinality(_count), do: "unknown"
 
   defp operator_notification_count_in_txn(txn, request) do
     prompt = operator_ruling_notification(request.id)

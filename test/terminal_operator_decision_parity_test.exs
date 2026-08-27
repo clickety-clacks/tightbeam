@@ -220,6 +220,138 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
     refute failing_fields =~ "tamper"
   end
 
+  test "integrity descriptor and digest are stable across private values and surfaces", ctx do
+    requests =
+      for question <- ["private alpha?", "private beta?"] do
+        request = invalid_without_event(ctx, question)
+        call = rule_call(request.id, %{decision: "accept"})
+
+        assert %{code: "decision_request_integrity_invalid"} =
+                 Escalation.get(ctx.db, call, request.id, owner_user_id: "flynn")
+
+        request
+      end
+
+    assert %{code: "decision_request_integrity_invalid"} =
+             Escalation.list(
+               ctx.db,
+               rule_call(hd(requests).id, %{decision: "accept"}),
+               "ruled",
+               owner_user_id: "flynn"
+             )
+
+    assert {:ok, evidence_rows} =
+             DB.query(
+               ctx.db,
+               "SELECT requestId,shapeDigest,failingFields FROM decision_request_integrity_evidence ORDER BY requestId"
+             )
+
+    assert [
+             [_first_id, shared_digest, ~s(["rulingLifecycleEvent"])],
+             [_second_id, shared_digest, ~s(["rulingLifecycleEvent"])]
+           ] = evidence_rows
+
+    assert String.match?(shared_digest, ~r/^[0-9a-f]{64}$/)
+  end
+
+  test "integrity descriptor covers member shape equalities states and relation cardinalities",
+       ctx do
+    missing_fact =
+      Escalation.operator_ask(ctx.db, ask_call(ctx.raiser, %{question: "missing fact?"}))
+
+    wrong_kind =
+      Escalation.operator_ask(ctx.db, ask_call(ctx.raiser, %{question: "wrong fact kind?"}))
+
+    for request <- [missing_fact, wrong_kind] do
+      Escalation.operator_rule(
+        ctx.db,
+        rule_call(request.id, %{decision: "accept"}),
+        scheduler: ctx.scheduler
+      )
+    end
+
+    missing_fact_id = ruled_fact_id(ctx.db, missing_fact.id)
+    wrong_kind_id = ruled_fact_id(ctx.db, wrong_kind.id)
+
+    :ok = DB.execute(ctx.db, "DELETE FROM condition_facts WHERE id=#{missing_fact_id}")
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        "UPDATE condition_facts SET kind='operator-decision-ruled' WHERE id=#{wrong_kind_id}"
+      )
+
+    for request <- [missing_fact, wrong_kind] do
+      assert %{code: "decision_request_integrity_invalid"} =
+               Escalation.get(
+                 ctx.db,
+                 rule_call(request.id, %{decision: "accept"}),
+                 request.id,
+                 owner_user_id: "flynn"
+               )
+    end
+
+    assert {:ok, evidence_rows} =
+             DB.query(
+               ctx.db,
+               "SELECT shapeDigest,failingFields FROM decision_request_integrity_evidence WHERE requestId IN (?1,?2) ORDER BY requestId",
+               [missing_fact.id, wrong_kind.id]
+             )
+
+    assert [[missing_digest, fields], [wrong_kind_digest, fields]] = evidence_rows
+    assert JSON.decode!(fields) == ["rulingFactId"]
+    refute missing_digest == wrong_kind_digest
+  end
+
+  test "distinct structural terminal failures produce distinct canonical digests", ctx do
+    null_decision =
+      Escalation.operator_ask(ctx.db, ask_call(ctx.raiser, %{question: "null decision?"}))
+
+    blank_decision =
+      Escalation.operator_ask(ctx.db, ask_call(ctx.raiser, %{question: "blank decision?"}))
+
+    for request <- [null_decision, blank_decision] do
+      Escalation.operator_rule(
+        ctx.db,
+        rule_call(request.id, %{decision: "accept"}),
+        scheduler: ctx.scheduler
+      )
+    end
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        "UPDATE decision_requests SET decision=NULL WHERE id='#{null_decision.id}'"
+      )
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        "UPDATE decision_requests SET decision='' WHERE id='#{blank_decision.id}'"
+      )
+
+    for request <- [null_decision, blank_decision] do
+      assert %{code: "decision_request_integrity_invalid"} =
+               Escalation.get(
+                 ctx.db,
+                 rule_call(request.id, %{decision: "accept"}),
+                 request.id,
+                 owner_user_id: "flynn"
+               )
+    end
+
+    assert {:ok, evidence_rows} =
+             DB.query(
+               ctx.db,
+               "SELECT shapeDigest,failingFields FROM decision_request_integrity_evidence WHERE requestId IN (?1,?2) ORDER BY requestId",
+               [null_decision.id, blank_decision.id]
+             )
+
+    assert [[null_digest, fields], [blank_digest, fields]] = evidence_rows
+    assert JSON.decode!(fields) == ["decision"]
+    refute null_digest == blank_digest
+  end
+
   test "future incomplete terminal transition is refused by the database trigger", ctx do
     request = Escalation.operator_ask(ctx.db, ask_call(ctx.raiser, %{question: "trigger?"}))
 
