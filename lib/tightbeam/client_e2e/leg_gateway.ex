@@ -339,7 +339,7 @@ defmodule Tightbeam.ClientE2E.LegGateway do
   semantics — so the old pid must be gone, the port must actually stop
   answering, and the new pid must differ.
   """
-  @spec restart(t(), keyword()) :: {:ok, t()} | {:error, term()}
+  @spec restart(t(), keyword()) :: {:ok, t()} | {:error, term()} | {:error, term(), t()}
   def restart(%__MODULE__{} = gateway, opts \\ []) do
     old_pid = gateway.os_pid
 
@@ -356,7 +356,7 @@ defmodule Tightbeam.ClientE2E.LegGateway do
           end
 
         {:error, reason, restarted} ->
-          {:error, {:restart_boot_failed, reason, restarted.log_path}}
+          {:error, {:restart_boot_failed, reason, restarted.log_path}, restarted}
       end
     end
   end

@@ -1453,6 +1453,14 @@ defmodule Tightbeam.ClientE2E.Journeys do
       old_pid = ctx.gateway.os_pid
 
       case LegGateway.restart(ctx.gateway) do
+        {:error, reason, gateway} ->
+          ctx = %{ctx | gateway: gateway}
+
+          {ctx,
+           Scorecard.fail("14", "restart resilience", "restart failed: #{inspect(reason)}",
+             journey: "J7"
+           )}
+
         {:error, reason} ->
           {ctx,
            Scorecard.fail("14", "restart resilience", "restart failed: #{inspect(reason)}",
@@ -1608,6 +1616,14 @@ defmodule Tightbeam.ClientE2E.Journeys do
     queued? = await_queued(ctx.base_dir, second, 60_000)
 
     case LegGateway.restart(ctx.gateway) do
+      {:error, reason, gateway} ->
+        ctx = %{ctx | gateway: gateway}
+
+        {ctx,
+         Scorecard.fail("15", "restart queue survival", "restart failed: #{inspect(reason)}",
+           journey: "J7"
+         )}
+
       {:error, reason} ->
         {ctx,
          Scorecard.fail("15", "restart queue survival", "restart failed: #{inspect(reason)}",

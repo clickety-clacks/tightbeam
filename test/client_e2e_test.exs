@@ -1083,6 +1083,47 @@ defmodule Tightbeam.ClientE2ETest do
     end
   end
 
+  describe "leg restart preserves failed boot ownership" do
+    alias Tightbeam.ClientE2E.LegGateway
+
+    test "a failed replacement boot returns the exact handle the caller must tear down" do
+      base_dir =
+        Path.join(
+          System.tmp_dir!(),
+          "tightbeam-client-e2e-restart-failure-#{System.unique_integer([:positive])}"
+        )
+
+      File.mkdir_p!(base_dir)
+      on_exit(fn -> File.rm_rf!(base_dir) end)
+
+      original = %LegGateway{
+        base_dir: base_dir,
+        port: closed_port(),
+        os_pid: nil,
+        os_command: nil,
+        port_ref: nil,
+        log_path: Path.join(base_dir, "gateway.log")
+      }
+
+      assert {:error, {:restart_boot_failed, :timeout, log_path}, restarted} =
+               LegGateway.restart(original,
+                 repo_root: File.cwd!(),
+                 env: [{"TIGHTBEAM_WAKE_TICK_MS", "not-a-positive-integer"}],
+                 boot_timeout_ms: 3_000
+               )
+
+      assert restarted.base_dir == original.base_dir
+      assert restarted.port == original.port
+      assert restarted.log_path == log_path
+      assert is_integer(restarted.os_pid)
+      assert restarted.os_pid > 0
+
+      assert LegGateway.teardown(restarted, exit_timeout_ms: 5_000) == :ok
+      refute LegGateway.ours?(restarted)
+      refute File.exists?(base_dir)
+    end
+  end
+
   describe "leg teardown reports what actually happened" do
     alias Tightbeam.ClientE2E.LegGateway
 

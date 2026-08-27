@@ -35,7 +35,20 @@ defmodule Tightbeam.FirehoseRestartSmoke do
       restart = Task.async(fn -> LegGateway.restart(gateway, repo_root: File.cwd!()) end)
       {:ok, {:closed, 1012}, _ws} = recv_close(ws, 30_000)
       {:ok, {:closed, 1012}, _pre_auth_ws} = recv_close(pre_auth_ws, 30_000)
-      {:ok, restarted} = Task.await(restart, 120_000)
+
+      restarted =
+        case Task.await(restart, 120_000) do
+          {:ok, restarted} ->
+            restarted
+
+          {:error, reason, restarted} ->
+            Process.put(:firehose_restart_gateway, restarted)
+            raise "firehose restart failed: #{inspect(reason)}; run_dir=#{restarted.base_dir}"
+
+          {:error, reason} ->
+            raise "firehose restart failed: #{inspect(reason)}; run_dir=#{gateway.base_dir}"
+        end
+
       Process.put(:firehose_restart_gateway, restarted)
 
       ws = connect(port, device.token)

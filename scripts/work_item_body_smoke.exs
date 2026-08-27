@@ -138,6 +138,11 @@ defmodule Tightbeam.WorkItemBodySmoke do
       {:ok, restarted} ->
         restarted
 
+      {:error, reason, restarted} ->
+        Process.put(:work_item_body_smoke_gateway, restarted)
+
+        raise "work-item body smoke restart failed: #{inspect(reason)}; run_dir=#{restarted.base_dir}"
+
       {:error, reason} ->
         raise "work-item body smoke restart failed: #{inspect(reason)}; run_dir=#{gateway.base_dir}"
     end
