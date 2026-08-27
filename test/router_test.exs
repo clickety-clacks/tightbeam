@@ -9,10 +9,12 @@ defmodule Tightbeam.Wire.RouterTest do
     Credentials,
     DB,
     Devices,
+    ExecutionMap,
     Gateway,
     Org,
     Placement,
     Roles,
+    Toplines,
     Wakes,
     WorkItems,
     WorkState
@@ -418,8 +420,54 @@ defmodule Tightbeam.Wire.RouterTest do
         params: %{subject: "Build it", work_item_id: item.id}
       })
 
+    sentinel = "BODY_MUST_NOT_LEAK_#{System.unique_integer([:positive])}"
+
+    update_result =
+      WorkItems.__handle__(ctx.db, "work-item-update", %{
+        principal: {:user, ctx.device.user_id},
+        params: %{work_item_id: item.id, body: sentinel}
+      })
+
     WorkState.emit(ctx.db, assignment.id, nil)
     WorkState.emit_item(ctx.db, item.id, "composition")
+
+    read_call = %{
+      principal: {:user, ctx.device.user_id},
+      params: %{}
+    }
+
+    projection_results = [
+      create: item,
+      update: update_result,
+      list:
+        WorkItems.__handle__(ctx.db, "work-item-list", %{
+          principal: {:user, ctx.device.user_id},
+          params: %{}
+        }),
+      trace:
+        WorkItems.__handle__(ctx.db, "work-item-trace", %{
+          principal: {:user, ctx.device.user_id},
+          params: %{work_item_id: item.id}
+        }),
+      work_state_list: WorkState.list_items(ctx.db, %{owner_user_id: ctx.device.user_id}),
+      work_state_detail: WorkState.item_detail(ctx.db, item.id),
+      execution_map: ExecutionMap.roster(ctx.db, read_call),
+      topline:
+        Toplines.topline(ctx.db, %{
+          principal: {:user, ctx.device.user_id},
+          params: %{under: item.id}
+        })
+    ]
+
+    for {name, result} <- projection_results do
+      encoded = JSON.encode!(result)
+      refute encoded =~ sentinel, "#{name} copied work-item body text: #{encoded}"
+    end
+
+    assert WorkItems.__handle__(ctx.db, "work-item-get", %{
+             principal: {:user, ctx.device.user_id},
+             params: %{work_item_id: item.id}
+           }).workItem.body == sentinel
 
     work = get_device(ctx, ctx.device, "/api/work?state=all&status=open&sessionKey=holder")
     assert work.status == 200
@@ -449,6 +497,8 @@ defmodule Tightbeam.Wire.RouterTest do
 
     item_detail = get_device(ctx, ctx.device, "/api/work-items/#{item.id}")
     assert item_detail.status == 200
+    refute items.resp_body =~ sentinel
+    refute item_detail.resp_body =~ sentinel
 
     invalid = get_device(ctx, ctx.device, "/api/work?status=blocked")
     assert invalid.status == 400
@@ -457,6 +507,82 @@ defmodule Tightbeam.Wire.RouterTest do
     other = approved_device(ctx.db, "other-device", "Other")
     assert get_device(ctx, other, "/api/work/#{assignment.id}").status == 404
     assert get_device(ctx, other, "/api/work-items/#{item.id}").status == 404
+  end
+
+  test "body get and update preserve the credential-specific refusal matrix", ctx do
+    owner = ctx.device.user_id
+    holder = create_session(ctx.db, "body-refusal-holder", owner)
+    Roles.create!(ctx.db, "body-refusal-role", owner, holder.session_key)
+
+    item =
+      WorkItems.__handle__(ctx.db, "work-item-create", %{
+        principal: {:user, owner},
+        params: %{title: "Protected body"}
+      })
+
+    sentinel = "BODY_REFUSAL_SENTINEL_#{System.unique_integer([:positive])}"
+
+    assert %{bodyUpdate: %{changed: true}} =
+             WorkItems.__handle__(ctx.db, "work-item-update", %{
+               principal: {:user, owner},
+               params: %{work_item_id: item.id, body: sentinel}
+             })
+
+    handlers =
+      ctx.opts
+      |> Keyword.fetch!(:handlers)
+      |> Map.merge(%{
+        "work-item-get" => fn call ->
+          WorkItems.__handle__(ctx.db, "work-item-get", call)
+        end,
+        "work-item-update" => fn call ->
+          WorkItems.__handle__(ctx.db, "work-item-update", call)
+        end
+      })
+
+    real_ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, handlers)}
+
+    refusals = [
+      {"tbc_test", %{asProcess: "cron"}, 403,
+       %{
+         "code" => "process_denied",
+         "message" => "process principals cannot use work-item verbs"
+       }},
+      {holder.cli_token, %{asProcess: "cron"}, 403,
+       %{
+         "code" => "identity_not_yours",
+         "message" => "a session token cannot act as a process"
+       }},
+      {"tbc_test", %{as: "body-refusal-role"}, 403,
+       %{
+         "code" => "principal_required",
+         "message" => "work-item verbs require a user credential or a session token"
+       }},
+      {"tbc_test", %{}, 400,
+       %{"code" => "invalid_message", "message" => "as (role) or asUser required"}}
+    ]
+
+    for {bearer, identity, status, error} <- refusals,
+        {verb, params} <- [
+          {"work-item-get", %{workItemId: item.id}},
+          {"work-item-update", %{workItemId: item.id, body: "must not replace"}}
+        ] do
+      response =
+        dispatch_cli(
+          real_ctx,
+          bearer,
+          Map.merge(identity, %{verb: verb, params: params})
+        )
+
+      assert response.status == status
+      assert JSON.decode!(response.resp_body)["error"] == error
+      refute response.resp_body =~ sentinel
+
+      assert WorkItems.__handle__(ctx.db, "work-item-get", %{
+               principal: {:user, owner},
+               params: %{work_item_id: item.id}
+             }).workItem.body == sentinel
+    end
   end
 
   test "all work-item verbs route, preserve generic target behavior, and map unknown ids", ctx do
