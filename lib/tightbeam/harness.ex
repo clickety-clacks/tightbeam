@@ -136,8 +136,10 @@ defmodule Tightbeam.Harness do
               {:subagent_start | :subagent_stop, map()} | :skip
   @callback fetch_catalog(map()) :: {:ok, [map()]} | {:error, term()}
 
-  @optional_callbacks preflight_launch: 3, warm_home: 2, requires_zero_listeners?: 0,
-                        adapter_provisioning: 0
+  @optional_callbacks preflight_launch: 3,
+                      warm_home: 2,
+                      requires_zero_listeners?: 0,
+                      adapter_provisioning: 0
 
   @spec preflight_launch(module(), target(), String.t(), keyword()) :: preflight_result()
   def preflight_launch(module, target, home, opts) do
