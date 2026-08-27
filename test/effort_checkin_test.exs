@@ -68,6 +68,7 @@ defmodule Tightbeam.EffortCheckinTest do
     config = %{
       db: db,
       base_dir: base_dir,
+      cursor_signing: cursor_signing!(base_dir),
       port: 4_321,
       effort_checkin_horizon_ms: 10,
       cwd: base_dir,
