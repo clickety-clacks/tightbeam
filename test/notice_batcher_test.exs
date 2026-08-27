@@ -485,6 +485,15 @@ defmodule Tightbeam.NoticeBatcherTest do
     assert NoticeBatcher.source_refs(db, overflow.wake_id) == []
   end
 
+  test "the delivery envelope preserves trailing source payload bytes", %{db: db} do
+    payload = "line one\nline two\n \t"
+    source = eligible(db, wake_id: "w_trailing_payload", prompt: payload)
+    [carrier_id] = Wakes.materialize_digests(db, source.due_at)
+    envelope = Wakes.get(db, carrier_id).prompt
+
+    assert envelope =~ rendered_member_header(source.wake_id) <> payload <> "\n\n"
+  end
+
   defp eligible(db, opts \\ []) do
     set_lane_policy(db, opts, true)
     fyi(db, opts)

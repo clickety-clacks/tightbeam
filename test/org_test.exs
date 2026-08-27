@@ -418,6 +418,32 @@ defmodule Tightbeam.OrgTest do
     assert_immutable_retirement_chain(db, original, armed)
   end
 
+  test "retirement after terminal carrier preserves the one fired delivery path", %{db: db} do
+    %{original: original, batch_id: batch_id} =
+      selected_retirement_source(db, "after terminal carrier")
+
+    assert [carrier_id] = Wakes.materialize_digests(db, original.due_at)
+    NoticeBatcher.delivery_terminal_failure(db, carrier_id, :skipped, 1_000)
+
+    terminal = NoticeBatcher.batch(db, batch_id)
+    assert terminal.state == "delivery_failed"
+    assert Wakes.get(db, carrier_id).state == "fired"
+
+    assert %{state: "retired"} = Org.retire(db, "retiring", "user:flynn", 1_000)
+    assert NoticeBatcher.batch(db, batch_id).state == "delivery_failed"
+    assert Wakes.get(db, carrier_id).state == "fired"
+    assert Enum.map(Wakes.digest_members(db, carrier_id), & &1.wake_id) == [original.wake_id]
+
+    assert %{state: "canceled"} = Wakes.get(db, original.wake_id)
+
+    assert %{outcome: "replacement", replacement_wake_id: replacement_wake_id} =
+             cancellation(db, original.wake_id)
+
+    assert %{state: "canceled"} = Wakes.get(db, replacement_wake_id)
+    assert NoticeBatcher.source_refs(db, replacement_wake_id) == []
+    assert {:ok, [[1]]} = DB.query(db, "SELECT count(*) FROM wakes WHERE digest=1")
+  end
+
   test "retirement validates its explicit caller context before state or wake mutation", %{db: db} do
     session = Org.create(db, base(%{session_key: "retiring"}))
 

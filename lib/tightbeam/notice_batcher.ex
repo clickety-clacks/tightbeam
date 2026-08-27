@@ -1233,11 +1233,7 @@ defmodule Tightbeam.NoticeBatcher do
   end
 
   defp render_member([source, sender, cause, class, seq, payload]) do
-    """
-    [#{seq}] source=#{source} sender=#{sender} cause=#{cause} class=#{class}
-    #{payload}
-    """
-    |> String.trim_trailing()
+    "[#{seq}] source=#{source} sender=#{sender} cause=#{cause} class=#{class}\n" <> payload
   end
 
   defp carrier_identity(_txn, session_key, nil), do: {session_key, ""}

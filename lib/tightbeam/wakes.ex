@@ -1221,7 +1221,8 @@ defmodule Tightbeam.Wakes do
          "fired",
          1
        ) do
-    row_exists(txn, "SELECT 1 FROM notice_batches WHERE deliveryWakeId=?1", replacement_id)
+    row_exists(txn, "SELECT 1 FROM notice_batches WHERE deliveryWakeId=?1", replacement_id) ==
+      :ok
   end
 
   defp valid_replacement_state?(_txn, _requester_id, _replacement_id, _state, _digest),
