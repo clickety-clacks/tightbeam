@@ -192,10 +192,10 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
     assert {:ok, [["failed"]]} =
              DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [old_seq])
 
-    assert {:ok, [["could_not_run", ^old_seq]]} =
+    assert {:ok, [["done", "could_not_run", ^old_seq]]} =
              DB.query(
                ctx.db,
-               "SELECT reconciliationState,reconciliationTurnSeq FROM credential_recovery_memberships WHERE activationId=?1",
+               "SELECT reconciliationState,reconciliationResult,reconciliationTurnSeq FROM credential_recovery_memberships WHERE activationId=?1",
                [activation_id]
              )
 
@@ -204,6 +204,61 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
                ctx.db,
                "SELECT state,COUNT(*) FROM credential_recovery_targets JOIN turns ON turns.wakeId=credential_recovery_targets.wakeId WHERE turns.status='queued' GROUP BY state"
              )
+  end
+
+  test "a turn that finishes after the ready snapshot records its observed terminal result",
+       ctx do
+    assert :appended =
+             Gateway.deliver_prompt(@main, "session:test", "old work",
+               db: ctx.db,
+               conn_registry: ctx.registry,
+               lane_manager: ctx.lane
+             )
+
+    assert {:ok, %{seq: old_seq, owner_lease: owner_lease}} =
+             Ledger.claim_next(ctx.db, @main, "old-owner")
+
+    assert {:ok, activation} =
+             CredentialRecovery.prepare(ctx.db, @host, :anthropic, :subscription)
+
+    for edge <- [:credential_installed, :metadata_committed, :adapter_started] do
+      assert {:ok, :ok} = CredentialRecovery.edge(ctx.db, activation.activation_id, edge)
+    end
+
+    assert {:ok, :ok} =
+             CredentialRecovery.mark_ready(ctx.db, activation.activation_id, %{"claude" => 2})
+
+    assert {:ok, %{state: "recovering"}} =
+             CredentialRecovery.activation_ready(
+               ctx.db,
+               activation.activation_id,
+               %{"claude" => 2}
+             )
+
+    assert {:ok, [["pending"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT reconciliationState FROM credential_recovery_memberships WHERE activationId=?1",
+               [activation.activation_id]
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM wakes WHERE consumer='prompt'")
+
+    assert :ok = Ledger.finish(ctx.db, old_seq, "delivered", nil, owner_lease: owner_lease)
+
+    assert {:ok, %{reconciliation_state: "reconciled"}} =
+             CredentialRecovery.reconcile_ready_activation(ctx.db, activation.activation_id)
+
+    assert {:ok, [["done", "delivered"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT reconciliationState,reconciliationResult FROM credential_recovery_memberships WHERE activationId=?1",
+               [activation.activation_id]
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM wakes WHERE consumer='prompt'")
   end
 
   test "reconciliation failure keeps attempt zero, schedules a bounded retry, then recovers",
@@ -242,7 +297,11 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
     assert %{targets: [%{state: "retry_wait", attempt: 0, reconciliation_attempt: 1}]} =
              CredentialRecovery.readback(ctx.db, activation_id)
 
-    assert_wake_count(ctx.db, 2)
+    assert_wake_count(ctx.db, 1)
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM wakes WHERE consumer='prompt'")
+
     :ok = DB.execute(ctx.db, "DROP TRIGGER force_reconciliation_failure")
 
     assert {:ok, [[target_id, retry_wake_id]]} =
@@ -270,8 +329,92 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
     assert {:ok, [["failed"]]} =
              DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [old_seq])
 
-    assert %{targets: [%{state: "pending", attempt: 0, reconciliation: "could_not_run"}]} =
+    assert %{
+             targets: [
+               %{
+                 state: "pending",
+                 attempt: 0,
+                 reconciliation: "done",
+                 reconciliation_result: "could_not_run"
+               }
+             ]
+           } =
              CredentialRecovery.readback(ctx.db, activation_id)
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM wakes WHERE consumer='prompt'")
+  end
+
+  test "attempt three marks pending reconciliation failed before terminalizing its target", ctx do
+    start_credentials!(ctx)
+
+    assert :appended =
+             Gateway.deliver_prompt(@main, "session:test", "old work",
+               db: ctx.db,
+               conn_registry: ctx.registry,
+               lane_manager: ctx.lane
+             )
+
+    assert {:ok, %{seq: old_seq}} = Ledger.claim_next(ctx.db, @main, "old-owner")
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        """
+        CREATE TRIGGER force_reconciliation_failure
+        BEFORE INSERT ON turn_lifecycle_events
+        WHEN NEW.kind='terminal_committed'
+        BEGIN
+          SELECT RAISE(ABORT, 'forced reconciliation failure');
+        END;
+        """
+      )
+
+    response = finish_fresh(onboard_handler(ctx, start_noop_scheduler!()), "subscription")
+    activation_id = response.recovery.activation_id
+
+    assert {:ok, [[target_id, retry_wake_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT credential_recovery_targets.targetId,wakes.wakeId FROM credential_recovery_targets JOIN wakes ON wakes.prompt=credential_recovery_targets.targetId WHERE wakes.consumer='credential_recovery_retry'"
+             )
+
+    Enum.each(1..3, fn _attempt ->
+      assert {:ok, []} =
+               DB.query(
+                 ctx.db,
+                 "UPDATE credential_recovery_targets SET dueAt=0 WHERE targetId=?1",
+                 [
+                   target_id
+                 ]
+               )
+
+      assert {:ok, :ok} =
+               CredentialRecovery.retry_due(ctx.db, %{
+                 condition_scope: target_id,
+                 prompt: target_id,
+                 wake_id: retry_wake_id
+               })
+    end)
+
+    assert {:ok, [["running"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [old_seq])
+
+    assert %{
+             state: "complete",
+             targets: [
+               %{
+                 state: "undeliverable",
+                 resolution: "undeliverable",
+                 reconciliation: "failed",
+                 reconciliation_result: "could_not_run",
+                 reconciliation_attempt: 3
+               }
+             ]
+           } = CredentialRecovery.readback(ctx.db, activation_id)
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM wakes WHERE consumer='prompt'")
   end
 
   test "carrier terminal covers joined generations and completes both activations", ctx do

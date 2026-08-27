@@ -82,7 +82,10 @@ defmodule Tightbeam.CredentialRecovery do
       'open','handled','retired','no_longer_affected','undeliverable'
     )),
     reconciliationState TEXT NOT NULL CHECK (reconciliationState IN (
-      'not_required','pending','could_not_run','outcome_unknown'
+      'not_required','pending','done','failed'
+    )),
+    reconciliationResult TEXT CHECK (reconciliationResult IS NULL OR reconciliationResult IN (
+      'delivered','could_not_run','run_failed','run_canceled','outcome_unknown'
     )),
     reconciliationTurnSeq INTEGER REFERENCES turns(seq),
     resolvedCycle INTEGER,
@@ -276,7 +279,7 @@ defmodule Tightbeam.CredentialRecovery do
                adapter_generation
              )
 
-             materialize_if_needed(txn, activation_id, target_id, true)
+             materialize_if_needed(txn, activation_id, target_id)
            end)
 
            state = if sessions == [], do: "complete", else: "recovering"
@@ -721,6 +724,12 @@ defmodule Tightbeam.CredentialRecovery do
             "attempt=#{next_attempt} dueAt=#{due_at}"
           )
         else
+          Txn.q(
+            txn,
+            "UPDATE credential_recovery_memberships SET reconciliationState='failed',reconciliationResult='could_not_run' WHERE targetId=?1 AND reconciliationState='pending'",
+            [target_id]
+          )
+
           dispose_target(txn, %{id: target_id}, "undeliverable", "reconciliation-attempt-3")
           consume_internal_wake(txn, wake.wake_id)
         end
@@ -743,6 +752,7 @@ defmodule Tightbeam.CredentialRecovery do
             db,
             """
             SELECT m.sessionKey,m.generation,m.resolution,m.reconciliationState,
+                   m.reconciliationResult,
                    t.state,t.cycle,t.attempt,t.reconciliationAttempt,t.turnSeq,t.dueAt,t.failure
             FROM credential_recovery_memberships m
             JOIN credential_recovery_targets t ON t.targetId=m.targetId
@@ -768,6 +778,7 @@ defmodule Tightbeam.CredentialRecovery do
                                 member_gen,
                                 resolution,
                                 reconciliation,
+                                reconciliation_result,
                                 target_state,
                                 cycle,
                                 attempt,
@@ -781,6 +792,7 @@ defmodule Tightbeam.CredentialRecovery do
                 generation: member_gen,
                 resolution: resolution,
                 reconciliation: reconciliation,
+                reconciliation_result: reconciliation_result,
                 state: target_state,
                 cycle: cycle,
                 attempt: attempt,
@@ -960,49 +972,52 @@ defmodule Tightbeam.CredentialRecovery do
   end
 
   defp reconcile_running_in_txn(txn, activation_id, session_key, seq) do
-    lifecycle_started? =
-      Txn.q(
-        txn,
-        "SELECT 1 FROM turn_lifecycle_events WHERE turnSeq=?1 AND ((kind='stage_started' AND stage='prompt') OR kind='prompt_dispatched') LIMIT 1",
-        [seq]
-      ) != []
+    disposition =
+      case Txn.q(
+             txn,
+             """
+             SELECT turns.status,
+                    (SELECT ownerLease FROM turn_lifecycle_events
+                     WHERE turnSeq=turns.seq AND kind='claimed' ORDER BY ordinal DESC LIMIT 1)
+             FROM turns WHERE turns.seq=?1 AND turns.sessionKey=?2
+             """,
+             [seq, session_key]
+           ) do
+        [["running", owner_lease]] when is_binary(owner_lease) ->
+          lifecycle_started? =
+            Txn.q(
+              txn,
+              "SELECT 1 FROM turn_lifecycle_events WHERE turnSeq=?1 AND ((kind='stage_started' AND stage='prompt') OR kind='prompt_dispatched') LIMIT 1",
+              [seq]
+            ) != []
 
-    disposition = if lifecycle_started?, do: "outcome_unknown", else: "could_not_run"
-    terminal = if lifecycle_started?, do: "failed_unknown", else: "failed"
+          disposition = if lifecycle_started?, do: "outcome_unknown", else: "could_not_run"
+          terminal = if lifecycle_started?, do: "failed_unknown", else: "failed"
 
-    case Txn.q(
-           txn,
-           """
-           SELECT turns.status,
-                  (SELECT ownerLease FROM turn_lifecycle_events
-                   WHERE turnSeq=turns.seq AND kind='claimed' ORDER BY ordinal DESC LIMIT 1)
-           FROM turns WHERE turns.seq=?1 AND turns.sessionKey=?2
-           """,
-           [seq, session_key]
-         ) do
-      [["running", owner_lease]] when is_binary(owner_lease) ->
-        true =
-          Ledger.finish_in_txn(
-            txn,
-            seq,
-            terminal,
-            "credential activation reconciled prior adapter generation",
-            cause: "credential-recovery-reconciliation",
-            principal: @process,
-            owner_lease: owner_lease
-          )
+          true =
+            Ledger.finish_in_txn(
+              txn,
+              seq,
+              terminal,
+              "credential activation reconciled prior adapter generation",
+              cause: "credential-recovery-reconciliation",
+              principal: @process,
+              owner_lease: owner_lease
+            )
 
-      [[status, _owner_lease]]
-      when status in ["delivered", "canceled", "failed", "failed_unknown"] ->
-        :ok
+          disposition
 
-      [] ->
-        raise "credential_recovery_reconciliation_turn_missing activation=#{activation_id} turn=#{seq}"
-    end
+        [[status, _owner_lease]]
+        when status in ["delivered", "canceled", "failed", "failed_unknown"] ->
+          terminal_disposition(txn, seq, status)
+
+        [] ->
+          raise "credential_recovery_reconciliation_turn_missing activation=#{activation_id} turn=#{seq}"
+      end
 
     Txn.q(
       txn,
-      "UPDATE credential_recovery_memberships SET reconciliationState=?4 WHERE activationId=?1 AND sessionKey=?2 AND reconciliationTurnSeq=?3 AND reconciliationState='pending'",
+      "UPDATE credential_recovery_memberships SET reconciliationState='done',reconciliationResult=?4 WHERE activationId=?1 AND sessionKey=?2 AND reconciliationTurnSeq=?3 AND reconciliationState='pending'",
       [activation_id, session_key, seq, disposition]
     )
 
@@ -1125,7 +1140,7 @@ defmodule Tightbeam.CredentialRecovery do
     audit(txn, "credential_recovery_#{disposition}", target.id, "boundary=#{boundary}")
   end
 
-  defp materialize_if_needed(txn, activation_id, target_id, allow_reconciliation \\ false) do
+  defp materialize_if_needed(txn, activation_id, target_id) do
     case Txn.q(
            txn,
            "SELECT sessionKey,host,provider,requiredGeneration,state,cycle,attempt,wakeId FROM credential_recovery_targets WHERE targetId=?1",
@@ -1139,7 +1154,7 @@ defmodule Tightbeam.CredentialRecovery do
             [target_id]
           ) != []
 
-        if allow_reconciliation or not pending_reconciliation do
+        if not pending_reconciliation do
           wake_id = carrier_wake_id(target_id, cycle, attempt)
           activation_id = activation_id || newest_open_activation(txn, target_id)
 
