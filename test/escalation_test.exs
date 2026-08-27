@@ -916,11 +916,51 @@ defmodule Tightbeam.EscalationTest do
     assert observer == "session:#{ctx.raiser.session_key}"
     refute fields =~ "integrity?"
 
-    assert shape_digest == "aa0f59e13752f749aebffdb85010157c62f6d6be714aa01dcb7265e93134fdd0"
+    assert shape_digest == "efa9964d4e3857fc094f9b699b19ac1feb91a30b439236e05572b483cb886403"
     assert ruled.ruling_fact_id > 0
   end
 
-  test "structural evidence digests distinguish member classes and relation results", ctx do
+  test "integrity descriptor and digest are stable across private values and surfaces", ctx do
+    requests =
+      for question <- ["private alpha?", "private beta?"] do
+        request =
+          Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: question}))
+
+        _ruled =
+          Escalation.operator_rule(
+            ctx.db,
+            owner_operator_rule(request.id, %{decision: "accept"})
+          )
+
+        assert {:ok, _} =
+                 DB.query(
+                   ctx.db,
+                   "DELETE FROM lifecycle_events WHERE kind='decision_request_ruled' AND subject=?1",
+                   [request.id]
+                 )
+
+        assert %{code: "decision_request_integrity_invalid"} =
+                 Escalation.get(ctx.db, operator_call(ctx.raiser, %{}), request.id)
+
+        request
+      end
+
+    assert %{code: "decision_request_integrity_invalid"} =
+             Escalation.list(ctx.db, operator_call(ctx.raiser, %{}), "ruled")
+
+    assert {:ok, [[shared_digest, fields], [shared_digest, fields]]} =
+             DB.query(
+               ctx.db,
+               "SELECT shapeDigest,failingFields FROM decision_request_integrity_evidence WHERE requestId IN (?1,?2) ORDER BY requestId",
+               Enum.map(requests, & &1.id)
+             )
+
+    assert JSON.decode!(fields) == ["rulingLifecycleEvent"]
+    assert String.match?(shared_digest, ~r/^[0-9a-f]{64}$/)
+  end
+
+  test "integrity descriptor covers member shape equalities states and relation cardinalities",
+       ctx do
     options_request =
       Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "options shape?"}))
 
@@ -982,6 +1022,86 @@ defmodule Tightbeam.EscalationTest do
                "SELECT COUNT(*), COUNT(DISTINCT shapeDigest), COUNT(DISTINCT failingFields) FROM decision_request_integrity_evidence WHERE requestId=?1",
                [fact_request.id]
              )
+  end
+
+  test "distinct structural terminal failures produce distinct canonical digests", ctx do
+    empty_decision =
+      Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "empty decision?"}))
+
+    blank_decision =
+      Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "blank decision?"}))
+
+    for request <- [empty_decision, blank_decision] do
+      _ruled =
+        Escalation.operator_rule(
+          ctx.db,
+          owner_operator_rule(request.id, %{decision: "accept"})
+        )
+    end
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE decision_requests SET decision='' WHERE id=?1", [
+               empty_decision.id
+             ])
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE decision_requests SET decision='   ' WHERE id=?1", [
+               blank_decision.id
+             ])
+
+    for request <- [empty_decision, blank_decision] do
+      assert %{code: "decision_request_integrity_invalid"} =
+               Escalation.get(ctx.db, operator_call(ctx.raiser, %{}), request.id)
+    end
+
+    assert {:ok, [[first_digest, fields], [second_digest, fields]]} =
+             DB.query(
+               ctx.db,
+               "SELECT shapeDigest,failingFields FROM decision_request_integrity_evidence WHERE requestId IN (?1,?2) ORDER BY requestId",
+               [empty_decision.id, blank_decision.id]
+             )
+
+    assert JSON.decode!(fields) == ["decision"]
+    refute first_digest == second_digest
+  end
+
+  test "owner attribution requires the stored raiser session", ctx do
+    request =
+      Escalation.operator_ask(
+        ctx.db,
+        operator_call(ctx.raiser, %{question: "owner attribution?"})
+      )
+
+    _ruled =
+      Escalation.operator_rule(
+        ctx.db,
+        owner_operator_rule(request.id, %{decision: "accept"})
+      )
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE decision_requests SET raiserSessionKey='' WHERE id=?1",
+               [request.id]
+             )
+
+    owner_call = %{origin: "user:flynn", principal: {:user, "flynn"}, params: %{}}
+
+    assert %{code: "decision_request_integrity_invalid"} =
+             Escalation.get(ctx.db, owner_call, request.id)
+
+    assert {:ok, [[fields]]} =
+             DB.query(
+               ctx.db,
+               "SELECT failingFields FROM decision_request_integrity_evidence WHERE requestId=?1",
+               [request.id]
+             )
+
+    assert JSON.decode!(fields) == [
+             "ownerOnBehalfOf",
+             "raiserNotificationWake",
+             "requestIdentity"
+           ]
   end
 
   test "an unrelated sibling session cannot borrow owner visibility", ctx do
