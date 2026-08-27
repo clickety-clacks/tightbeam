@@ -215,6 +215,14 @@ pub enum Command {
         spec_ref_sha256: Option<String>,
         idempotency_key: Option<String>,
     },
+    WorkItemUpdate {
+        identity: Identity,
+        work_item_id: String,
+        title: Option<String>,
+        spec_ref_name: Option<String>,
+        spec_ref_sha256: Option<String>,
+        clear_spec_ref: bool,
+    },
     WorkItemGet {
         identity: Identity,
         work_item_id: String,
@@ -557,6 +565,10 @@ COMMANDS:
       File a work item. Unrouted, it becomes YOUR problem on a deadline: file
       it, then route it (assign/dispatch) or icebox it. --key makes create
       idempotent (same key returns the same item).
+  work-item-update <workItemId> [--title "<title>"] [--spec-ref <name>]
+                   [--spec-sha256 <hex>] [--clear-spec-ref]
+      Patch an existing item's title or current governing spec. Omitted fields
+      stay unchanged; --clear-spec-ref clears both spec-ref fields.
   work-item-get <workItemId>
   work-item-trace <workItemId>
   attend [--high]
@@ -816,7 +828,17 @@ fn opens_entry(line: &str, command: &str) -> bool {
 }
 
 const BOOLEAN_FLAGS: &[&str] = &[
-    "abort", "admin", "all", "api-key", "dry-run", "help", "json", "manifest", "resolve", "rm",
+    "abort",
+    "admin",
+    "all",
+    "api-key",
+    "clear-spec-ref",
+    "dry-run",
+    "help",
+    "json",
+    "manifest",
+    "resolve",
+    "rm",
     "tree",
 ];
 
@@ -1663,6 +1685,43 @@ fn parse_with_optional_catalog(
                 idempotency_key: nonempty(flags, "key"),
             })
         }
+        "work-item-update" => {
+            const ALLOWED: &[&str] = &[
+                "title",
+                "spec-ref",
+                "spec-sha256",
+                "clear-spec-ref",
+                "as",
+                "as-user",
+                "as-process",
+            ];
+
+            if parsed.positional.len() != 2
+                || flags.keys().any(|flag| !ALLOWED.contains(&flag.as_str()))
+            {
+                return Err("usage: tightbeam work-item-update <workItemId> [--title \"...\"] [--spec-ref <name>] [--spec-sha256 <hex>] [--clear-spec-ref]".to_owned());
+            }
+
+            let clear_spec_ref = flags.contains_key("clear-spec-ref");
+            let spec_ref_present = flags.contains_key("spec-ref");
+            let spec_sha_present = flags.contains_key("spec-sha256");
+
+            if clear_spec_ref && (spec_ref_present || spec_sha_present) {
+                return Err(
+                    "usage: --clear-spec-ref conflicts with --spec-ref and --spec-sha256"
+                        .to_owned(),
+                );
+            }
+
+            Ok(Command::WorkItemUpdate {
+                identity: identity(flags)?,
+                work_item_id: parsed.positional[1].clone(),
+                title: flags.get("title").cloned(),
+                spec_ref_name: flags.get("spec-ref").cloned(),
+                spec_ref_sha256: flags.get("spec-sha256").cloned(),
+                clear_spec_ref,
+            })
+        }
         "work-item-get" => {
             if parsed.positional.len() != 2 {
                 return Err("usage: tightbeam work-item-get <workItemId>".to_owned());
@@ -2033,7 +2092,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, decision-request, ask, answer, return, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, decision-request, ask, answer, return, revoke-assignment, reopen-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -2861,6 +2920,7 @@ mod tests {
                 "wake",
                 "work-item-close",
                 "work-item-create",
+                "work-item-update",
                 "work-item-fail",
                 "work-item-get",
                 "attend",
@@ -3446,7 +3506,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, decision-request, ask, answer, return, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, decision-request, ask, answer, return, revoke-assignment, reopen-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned())
         );
     }
 
@@ -3522,7 +3582,6 @@ mod tests {
             "revoke-waiver",
             "withdraw",
             "critical",
-            "work-item-update",
             "work-item-list",
             "assignment-get",
             "init",
@@ -3614,6 +3673,51 @@ mod tests {
             ]))
             .unwrap_err()
             .contains("supplied together")
+        );
+
+        assert!(matches!(
+            parse(strings(&[
+                "work-item-update",
+                "wi_1",
+                "--spec-sha256",
+                "abc",
+                "--as-user",
+                "flynn",
+            ])),
+            Ok(Command::WorkItemUpdate {
+                work_item_id,
+                spec_ref_name: None,
+                spec_ref_sha256: Some(sha),
+                clear_spec_ref: false,
+                ..
+            }) if work_item_id == "wi_1" && sha == "abc"
+        ));
+
+        assert!(
+            parse(strings(&[
+                "work-item-update",
+                "wi_1",
+                "--clear-spec-ref",
+                "--spec-ref",
+                "spec.md",
+                "--as-user",
+                "flynn",
+            ]))
+            .unwrap_err()
+            .contains("conflicts")
+        );
+
+        assert!(
+            parse(strings(&[
+                "work-item-update",
+                "wi_1",
+                "--is-bug",
+                "true",
+                "--as-user",
+                "flynn",
+            ]))
+            .unwrap_err()
+            .starts_with("usage: tightbeam work-item-update")
         );
 
         assert_eq!(
