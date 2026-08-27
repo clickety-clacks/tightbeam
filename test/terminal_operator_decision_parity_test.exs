@@ -158,6 +158,34 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
              "Decision request #{request.id} was ruled. Read it with tightbeam decision-request --request #{request.id}."
   end
 
+  test "exact ruling replay validates a corrupt visible terminal row before interpreting it",
+       ctx do
+    request = Escalation.operator_ask(ctx.db, ask_call(ctx.raiser, %{question: "replay?"}))
+    call = rule_call(request.id, %{decision: "accept"})
+
+    assert %{status: "ruled"} =
+             Escalation.operator_rule(ctx.db, call, scheduler: ctx.scheduler)
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE decision_requests SET options='not-json' WHERE id=?1", [
+               request.id
+             ])
+
+    assert %{code: "decision_request_integrity_invalid", request_id: request_id} =
+             Escalation.operator_rule(ctx.db, call, scheduler: ctx.scheduler)
+
+    assert request_id == request.id
+
+    assert {:ok, [[1, fields]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*),MIN(failingFields) FROM decision_request_integrity_evidence WHERE requestId=?1",
+               [request.id]
+             )
+
+    assert JSON.decode!(fields) == ["options"]
+  end
+
   test "presenting session is preserved beside the performing principal", ctx do
     request = Escalation.operator_ask(ctx.db, ask_call(ctx.raiser, %{question: "relay?"}))
 
@@ -803,6 +831,462 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
              )
   end
 
+  test "operator terminal racers preserve one compare-and-set winner in every order", ctx do
+    orders = [
+      [:rule, :withdraw, :supersede],
+      [:rule, :supersede, :withdraw],
+      [:withdraw, :rule, :supersede],
+      [:withdraw, :supersede, :rule],
+      [:supersede, :rule, :withdraw],
+      [:supersede, :withdraw, :rule]
+    ]
+
+    for {order, index} <- Enum.with_index(orders) do
+      request =
+        Escalation.operator_ask(
+          ctx.db,
+          ask_call(ctx.raiser, %{question: "race #{index}?", note: "barrier #{index}"})
+        )
+
+      operations = %{
+        rule: fn ->
+          Escalation.operator_rule(
+            ctx.db,
+            rule_call(request.id, %{decision: "accept"}),
+            scheduler: ctx.scheduler
+          )
+        end,
+        withdraw: fn ->
+          Escalation.operator_withdraw(
+            ctx.db,
+            rule_call(request.id, %{reason: "withdraw winner"})
+          )
+        end,
+        supersede: fn ->
+          Escalation.operator_ask(
+            ctx.db,
+            ask_call(ctx.raiser, %{
+              question: "race #{index} successor?",
+              supersedes: request.id
+            })
+          )
+        end
+      }
+
+      parent = self()
+
+      racers =
+        Map.new(operations, fn {name, operation} ->
+          task =
+            Task.async(fn ->
+              send(parent, {:terminal_racer_ready, request.id, name})
+              assert_receive {:release_terminal_racer, ^name}
+              operation.()
+            end)
+
+          {name, task}
+        end)
+
+      for name <- Map.keys(racers) do
+        assert_receive {:terminal_racer_ready, request_id, ^name}
+        assert request_id == request.id
+      end
+
+      results =
+        Enum.map(order, fn name ->
+          send(racers[name].pid, {:release_terminal_racer, name})
+          Task.await(racers[name])
+        end)
+
+      winner = hd(order)
+      stored = Escalation.raw_by_id(ctx.db, request.id)
+
+      expected_status =
+        case winner do
+          :rule -> "ruled"
+          :withdraw -> "withdrawn"
+          :supersede -> "superseded"
+        end
+
+      assert stored.status == expected_status
+
+      assert Enum.count(results, &(!Map.has_key?(&1, :code))) == 1
+
+      expected_ruling_effects = if winner == :rule, do: 1, else: 0
+
+      assert {:ok,
+              [[^expected_ruling_effects, ^expected_ruling_effects, ^expected_ruling_effects]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT (SELECT COUNT(*) FROM wakes WHERE conditionKind='escalation-ruled' AND conditionScope=?1), (SELECT COUNT(*) FROM condition_facts WHERE kind='escalation-ruled' AND scope=?1), (SELECT COUNT(*) FROM lifecycle_events WHERE kind='decision_request_ruled' AND subject=?1)",
+                 [request.id]
+               )
+    end
+  end
+
+  test "automatic raiser delivery stays at most once across evaluators restart and replay", ctx do
+    request = Escalation.operator_ask(ctx.db, ask_call(ctx.raiser, %{question: "deliver once?"}))
+
+    ruled =
+      Escalation.operator_rule(
+        ctx.db,
+        rule_call(request.id, %{decision: "accept"}),
+        scheduler: ctx.scheduler
+      )
+
+    assert {:ok, [[wake_id, "fired", "condition"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId,state,firedBy FROM wakes WHERE conditionKind='escalation-ruled' AND conditionScope=?1",
+               [request.id]
+             )
+
+    assert turn_count(ctx.db, wake_id) == 1
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        "UPDATE wakes SET state='pending',firedAt=NULL,firedBy=NULL,dueAt=0 WHERE wakeId='#{wake_id}'"
+      )
+
+    tasks =
+      for evaluator <- 1..8 do
+        Task.async(fn ->
+          if rem(evaluator, 2) == 0,
+            do: Wakes.fire_matching(ctx.scheduler, ruled.ruling_fact_id),
+            else: Wakes.fire_due(ctx.scheduler)
+        end)
+      end
+
+    assert Enum.uniq(Task.await_many(tasks)) == [:ok]
+    assert turn_count(ctx.db, wake_id) == 1
+
+    assert :ok = stop_supervised(Wakes)
+
+    start_supervised!(
+      {Wakes, db: ctx.db, name: ctx.scheduler, tick_ms: 60_000, deliver: fn _wake -> :ok end}
+    )
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        "UPDATE wakes SET state='pending',firedAt=NULL,firedBy=NULL,dueAt=0 WHERE wakeId='#{wake_id}'"
+      )
+
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    assert turn_count(ctx.db, wake_id) == 1
+
+    assert {:ok, [["fired", "condition", prompt]]} =
+             DB.query(ctx.db, "SELECT state,firedBy,prompt FROM wakes WHERE wakeId=?1", [wake_id])
+
+    assert prompt ==
+             "Decision request #{request.id} was ruled. Read it with tightbeam decision-request --request #{request.id}."
+  end
+
+  test "manual raiser mitigation never suppresses the automatic ruling wake", ctx do
+    request = Escalation.operator_ask(ctx.db, ask_call(ctx.raiser, %{question: "manual first?"}))
+
+    manual =
+      Wakes.schedule(ctx.db, %{
+        session_key: ctx.raiser.session_key,
+        origin: "agent:intermediary",
+        prompt: "Manual notice for #{request.id}",
+        due_at: 0,
+        target_gate: 0
+      })
+
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    assert %{state: "fired", condition_kind: nil} = Wakes.get(ctx.db, manual.wake_id)
+
+    Escalation.operator_rule(
+      ctx.db,
+      rule_call(request.id, %{decision: "accept"}),
+      scheduler: ctx.scheduler
+    )
+
+    assert {:ok, [[1, automatic_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*),MIN(wakeId) FROM wakes WHERE conditionKind='escalation-ruled' AND conditionScope=?1",
+               [request.id]
+             )
+
+    refute automatic_id == manual.wake_id
+  end
+
+  test "every automatic wake attribute is part of terminal detail integrity", ctx do
+    mutations = [
+      target_session: fn _ -> "sessionKey='agent:wrong:app'" end,
+      origin: fn _ -> "origin='agent:intermediary'" end,
+      prompt: fn _ -> "prompt='wrong prompt'" end,
+      consumer: fn _ -> "consumer='other'" end,
+      condition_kind: fn _ -> "conditionKind='operator-decision-ruled'" end,
+      condition_scope: fn _ -> "conditionScope='dr_wrong_scope'" end,
+      fact_cursor: fn ruled -> "conditionAfterId=#{ruled.ruling_fact_id}" end,
+      creator_session: fn _ -> "creatorSessionKey='agent:wrong:app'" end,
+      fallback_deadline: fn _ -> "dueAt=dueAt+1" end,
+      target_gate: fn _ -> "targetGate=1" end,
+      role_resolution: fn _ ->
+        "targetRole='raiser',reresolve='lineage',reresolveSeed='raiser',reresolveRung=0"
+      end,
+      firing_state: fn _ -> "state='fired',firedBy='fallback'" end
+    ]
+
+    for {name, mutation_for} <- mutations do
+      request =
+        Escalation.operator_ask(
+          ctx.db,
+          ask_call(ctx.raiser, %{question: "wake attribute #{name}?"})
+        )
+
+      ruled =
+        Escalation.operator_rule(
+          ctx.db,
+          rule_call(request.id, %{decision: "accept"}),
+          scheduler: ctx.scheduler
+        )
+
+      mutation = mutation_for.(ruled)
+
+      :ok =
+        DB.execute(
+          ctx.db,
+          "UPDATE wakes SET #{mutation} WHERE conditionKind='escalation-ruled' AND conditionScope='#{request.id}'"
+        )
+
+      assert %{code: "decision_request_integrity_invalid", request_id: request_id} =
+               Escalation.get(
+                 ctx.db,
+                 rule_call(request.id, %{decision: "accept"}),
+                 request.id,
+                 owner_user_id: "flynn"
+               )
+
+      assert request_id == request.id
+
+      assert {:ok, [[~s(["raiserNotificationWake"])]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT failingFields FROM decision_request_integrity_evidence WHERE requestId=?1",
+                 [request.id]
+               )
+    end
+
+    request =
+      Escalation.operator_ask(ctx.db, ask_call(ctx.raiser, %{question: "wake canceled state?"}))
+
+    Escalation.operator_rule(
+      ctx.db,
+      rule_call(request.id, %{decision: "accept"}),
+      scheduler: ctx.scheduler
+    )
+
+    assert {:ok, [[wake_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId FROM wakes WHERE conditionKind='escalation-ruled' AND conditionScope=?1",
+               [request.id]
+             )
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        "UPDATE wakes SET state='pending',firedAt=NULL,firedBy=NULL WHERE wakeId='#{wake_id}'"
+      )
+
+    assert {:ok, true} =
+             DB.transaction(ctx.db, fn txn ->
+               Wakes.cancel_in_txn(txn, %{
+                 wake_id: wake_id,
+                 requester: %{kind: "process", id: "tightbeam:wake-scheduler"},
+                 reason_kind: "consumer_unavailable",
+                 causal_source: %{kind: "scheduler_delivery", id: wake_id},
+                 outcome: %{kind: "no_replacement"}
+               })
+             end)
+
+    assert %{code: "decision_request_integrity_invalid"} =
+             Escalation.get(
+               ctx.db,
+               rule_call(request.id, %{decision: "accept"}),
+               request.id,
+               owner_user_id: "flynn"
+             )
+
+    assert {:ok, [[~s(["raiserNotificationWake"])]]} =
+             DB.query(
+               ctx.db,
+               "SELECT failingFields FROM decision_request_integrity_evidence WHERE requestId=?1",
+               [request.id]
+             )
+  end
+
+  test "atomic ruling failures roll back every ordered step and recover from nudge loss", ctx do
+    failures = [
+      wake:
+        "CREATE TRIGGER terminal_fail_wake BEFORE INSERT ON wakes WHEN NEW.conditionKind='escalation-ruled' BEGIN SELECT RAISE(ABORT,'fail wake'); END;",
+      fact:
+        "CREATE TRIGGER terminal_fail_fact BEFORE INSERT ON condition_facts WHEN NEW.kind='escalation-ruled' BEGIN SELECT RAISE(ABORT,'fail fact'); END;",
+      compare_and_set:
+        "CREATE TRIGGER terminal_fail_cas BEFORE UPDATE OF status ON decision_requests WHEN NEW.kind='operator' AND NEW.status='ruled' BEGIN SELECT RAISE(ABORT,'fail cas'); END;",
+      lifecycle:
+        "CREATE TRIGGER terminal_fail_event BEFORE INSERT ON lifecycle_events WHEN NEW.kind='decision_request_ruled' BEGIN SELECT RAISE(ABORT,'fail event'); END;",
+      validation:
+        "CREATE TRIGGER terminal_fail_validation AFTER INSERT ON lifecycle_events WHEN NEW.kind='decision_request_ruled' BEGIN UPDATE wakes SET origin='agent:wrong' WHERE conditionKind='escalation-ruled' AND conditionScope=NEW.subject; END;"
+    ]
+
+    for {step, trigger} <- failures do
+      request =
+        Escalation.operator_ask(ctx.db, ask_call(ctx.raiser, %{question: "fail #{step}?"}))
+
+      :ok = DB.execute(ctx.db, trigger)
+
+      assert_raise DB.Error, fn ->
+        Escalation.operator_rule(
+          ctx.db,
+          rule_call(request.id, %{decision: "accept"}),
+          scheduler: ctx.scheduler
+        )
+      end
+
+      :ok = DB.execute(ctx.db, "DROP TRIGGER terminal_fail_#{failure_trigger_suffix(step)}")
+
+      assert {:ok, [["open", 0, 0, 0]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT status, (SELECT COUNT(*) FROM wakes WHERE conditionKind='escalation-ruled' AND conditionScope=?1), (SELECT COUNT(*) FROM condition_facts WHERE kind='escalation-ruled' AND scope=?1), (SELECT COUNT(*) FROM lifecycle_events WHERE kind='decision_request_ruled' AND subject=?1) FROM decision_requests WHERE id=?1",
+                 [request.id]
+               )
+    end
+
+    request = Escalation.operator_ask(ctx.db, ask_call(ctx.raiser, %{question: "nudge loss?"}))
+
+    assert catch_exit(
+             Escalation.operator_rule(
+               ctx.db,
+               rule_call(request.id, %{decision: "accept"}),
+               scheduler: :missing_terminal_scheduler
+             )
+           )
+
+    assert {:ok, [["ruled", fact_id, wake_id, "pending"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT d.status,d.rulingFactId,w.wakeId,w.state FROM decision_requests d JOIN wakes w ON w.conditionKind='escalation-ruled' AND w.conditionScope=d.id WHERE d.id=?1",
+               [request.id]
+             )
+
+    assert :ok = Wakes.fire_matching(ctx.scheduler, fact_id)
+    assert %{state: "fired", fired_by: "condition"} = Wakes.get(ctx.db, wake_id)
+    assert turn_count(ctx.db, wake_id) == 1
+  end
+
+  test "joined terminal traces distinguish known legacy condition and fallback paths", ctx do
+    legacy = Escalation.operator_ask(ctx.db, ask_call(ctx.raiser, %{question: "legacy trace?"}))
+
+    legacy_ruled =
+      Escalation.operator_rule(
+        ctx.db,
+        rule_call(legacy.id, %{decision: "accept"}),
+        scheduler: ctx.scheduler
+      )
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        "UPDATE decision_requests SET ruledViaPrincipal=NULL,ruledViaSessionState=NULL WHERE id='#{legacy.id}'"
+      )
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        "UPDATE decision_request_terminal_epoch SET legacyRulingFactMaxId=#{legacy_ruled.ruling_fact_id} WHERE id=0"
+      )
+
+    known = Escalation.operator_ask(ctx.db, ask_call(ctx.raiser, %{question: "known trace?"}))
+
+    known_ruled =
+      Escalation.operator_rule(
+        ctx.db,
+        rule_call(known.id, %{decision: "accept"}),
+        scheduler: ctx.scheduler
+      )
+
+    wrong_name =
+      Wakes.schedule(ctx.db, %{
+        session_key: ctx.raiser.session_key,
+        origin: "process:tightbeam",
+        prompt: "wrong-name fallback",
+        due_at: 0,
+        condition_kind: "operator-decision-ruled",
+        condition_scope: known.id,
+        target_gate: 0
+      })
+
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    assert %{state: "fired", fired_by: "fallback"} = Wakes.get(ctx.db, wrong_name.wake_id)
+
+    invalid = invalid_without_event(ctx, "trace refusal?")
+
+    assert %{code: "decision_request_integrity_invalid"} =
+             Escalation.get(
+               ctx.db,
+               rule_call(invalid.id, %{decision: "accept"}),
+               invalid.id,
+               owner_user_id: "flynn"
+             )
+
+    known_fact_id = known_ruled.ruling_fact_id
+    known_request_id = known.id
+
+    assert {:ok,
+            [
+              [
+                ^known_fact_id,
+                "escalation-ruled",
+                ^known_request_id,
+                1,
+                wake_id,
+                "condition",
+                1
+              ]
+            ]} =
+             DB.query(
+               ctx.db,
+               "SELECT d.rulingFactId,f.kind,f.scope,(SELECT COUNT(*) FROM lifecycle_events e WHERE e.kind='decision_request_ruled' AND e.subject=d.id),w.wakeId,w.firedBy,(SELECT COUNT(*) FROM turns t WHERE t.wakeId=w.wakeId) FROM decision_requests d JOIN condition_facts f ON f.id=d.rulingFactId JOIN wakes w ON w.conditionKind='escalation-ruled' AND w.conditionScope=d.id WHERE d.id=?1",
+               [known.id]
+             )
+
+    assert turn_count(ctx.db, wake_id) == 1
+
+    assert %{
+             ruling_attribution: %{
+               on_behalf_of: "user:flynn",
+               performer: %{
+                 principal: %{state: "known", value: "user:flynn"},
+                 session: %{state: "none"}
+               }
+             }
+           } = Escalation.get(ctx.db, rule_call(known.id, %{}), known.id, owner_user_id: "flynn")
+
+    assert %{
+             ruling_attribution: %{
+               performer: %{
+                 principal: %{state: "legacy-unknown"},
+                 session: %{state: "legacy-unknown"}
+               }
+             }
+           } =
+             Escalation.get(ctx.db, rule_call(legacy.id, %{}), legacy.id, owner_user_id: "flynn")
+
+    assert {:ok, [[1, ~s(["rulingLifecycleEvent"])]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*),MIN(failingFields) FROM decision_request_integrity_evidence WHERE requestId=?1",
+               [invalid.id]
+             )
+  end
+
   defp session(db, name, owner) do
     Org.create(db, %{
       session_key: "agent:#{name}:app",
@@ -859,4 +1343,15 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
 
     fact_id
   end
+
+  defp turn_count(db, wake_id) do
+    {:ok, [[count]]} = DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [wake_id])
+    count
+  end
+
+  defp failure_trigger_suffix(:wake), do: "wake"
+  defp failure_trigger_suffix(:fact), do: "fact"
+  defp failure_trigger_suffix(:compare_and_set), do: "cas"
+  defp failure_trigger_suffix(:lifecycle), do: "event"
+  defp failure_trigger_suffix(:validation), do: "validation"
 end

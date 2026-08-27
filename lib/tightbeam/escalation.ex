@@ -2395,12 +2395,53 @@ defmodule Tightbeam.Escalation do
         {error("invalid", "agent requests use answer or return"), nil}
 
       request ->
-        with :ok <- operator_owner_authorized(call, request),
-             {:ok, decision} <- operator_decision(request, answer) do
-          rule_operator_request_in_txn(txn, call, request, decision, answer, opts)
+        with :ok <- operator_owner_authorized(call, request) do
+          case request.status do
+            "ruled" ->
+              replay_operator_ruling_in_txn(txn, call, request, answer)
+
+            "consumed" ->
+              case validate_operator_terminal_in_txn(txn, request, "detail", principal_id(call)) do
+                :ok -> {error("not_open", "decision request is not open"), nil}
+                {:error, refusal} -> {refusal, nil}
+              end
+
+            "open" ->
+              with {:ok, decision} <- operator_decision(request, answer) do
+                rule_operator_request_in_txn(txn, call, request, decision, answer, opts)
+              else
+                {:error, reason} -> {reason, nil}
+              end
+
+            _terminal_or_closed ->
+              {error("not_open", "decision request is not open"), nil}
+          end
         else
           {:error, reason} -> {reason, nil}
         end
+    end
+  end
+
+  defp replay_operator_ruling_in_txn(txn, call, request, answer) do
+    performer = principal_id(call)
+
+    case validate_operator_terminal_in_txn(txn, request, "detail", performer) do
+      :ok ->
+        ruled_by = "user:" <> request.owner_user_id
+
+        with {:ok, decision} <- operator_decision(request, answer) do
+          if request.decision == decision and request.rationale == answer.rationale and
+               request.ruled_by == ruled_by do
+            {request, nil}
+          else
+            {error("not_open", "decision request is not open"), nil}
+          end
+        else
+          {:error, reason} -> {reason, nil}
+        end
+
+      {:error, refusal} ->
+        {refusal, nil}
     end
   end
 
@@ -2410,74 +2451,65 @@ defmodule Tightbeam.Escalation do
     performer = principal_id(call)
     via_state = if is_binary(via_session), do: "known", else: "none"
 
-    cond do
-      request.status == "ruled" and request.decision == decision and
-        request.rationale == answer.rationale and request.ruled_by == ruled_by ->
-        case validate_operator_terminal_in_txn(txn, request, "detail", performer) do
-          :ok -> {request, nil}
-          {:error, refusal} -> {refusal, nil}
-        end
+    if request.status == "open" do
+      ruled_at = now()
 
-      request.status != "open" ->
-        {error("not_open", "decision request is not open"), nil}
+      Wakes.schedule_in_txn(txn, %{
+        session_key: request.raiser_session_key,
+        origin: "process:tightbeam",
+        prompt: operator_ruling_notification(request.id),
+        due_at: ruled_at + operator_decision_duration(request),
+        condition_kind: "escalation-ruled",
+        condition_scope: request.id,
+        creator_session_key: via_session,
+        target_gate: 0
+      })
 
-      true ->
-        ruled_at = now()
-
-        Wakes.schedule_in_txn(txn, %{
-          session_key: request.raiser_session_key,
-          origin: "process:tightbeam",
-          prompt: operator_ruling_notification(request.id),
-          due_at: ruled_at + operator_decision_duration(request),
-          condition_kind: "escalation-ruled",
-          condition_scope: request.id,
-          creator_session_key: via_session,
-          target_gate: 0
+      %{fact_id: fact_id} =
+        ConditionFacts.file_in_txn(txn, %{
+          kind: "escalation-ruled",
+          scope: request.id,
+          origin: "process:tightbeam"
         })
 
-        %{fact_id: fact_id} =
-          ConditionFacts.file_in_txn(txn, %{
-            kind: "escalation-ruled",
-            scope: request.id,
-            origin: "process:tightbeam"
-          })
-
-        Txn.q(
-          txn,
-          "UPDATE decision_requests SET status = 'ruled', decision = ?2, rationale = ?3, ruledBy = ?4, ruledViaSessionKey = ?5, ruledViaPrincipal = ?6, ruledViaSessionState = ?7, ruledAt = ?8, rulingFactId = ?9 WHERE id = ?1 AND kind = 'operator' AND status = 'open'",
-          [
-            request.id,
-            decision,
-            answer.rationale,
-            ruled_by,
-            via_session,
-            performer,
-            via_state,
-            ruled_at,
-            fact_id
-          ]
-        )
-
-        if Txn.changes(txn) != 1,
-          do: raise(DB.Error, message: "operator ruling lost its open-row CAS")
-
-        EventLog.lifecycle_in_txn(
-          txn,
-          "decision_request_ruled",
+      Txn.q(
+        txn,
+        "UPDATE decision_requests SET status = 'ruled', decision = ?2, rationale = ?3, ruledBy = ?4, ruledViaSessionKey = ?5, ruledViaPrincipal = ?6, ruledViaSessionState = ?7, ruledAt = ?8, rulingFactId = ?9 WHERE id = ?1 AND kind = 'operator' AND status = 'open'",
+        [
           request.id,
-          "by=#{ruled_by} decision=#{decision} factId=#{fact_id}"
-        )
+          decision,
+          answer.rationale,
+          ruled_by,
+          via_session,
+          performer,
+          via_state,
+          ruled_at,
+          fact_id
+        ]
+      )
 
-        ruled = request_in_txn(txn, request.id)
+      if Txn.changes(txn) != 1,
+        do: raise(DB.Error, message: "operator ruling lost its open-row CAS")
 
-        case validate_operator_terminal_in_txn(txn, ruled, "detail", performer) do
-          :ok ->
-            Publisher.maybe_accepted_in_txn(txn, opts[:firehose_call], ruled)
-            {ruled, fact_id}
+      EventLog.lifecycle_in_txn(
+        txn,
+        "decision_request_ruled",
+        request.id,
+        "by=#{ruled_by} decision=#{decision} factId=#{fact_id}"
+      )
 
-          {:error, refusal} ->
-            raise DB.Error, message: refusal.code
-        end
+      ruled = request_in_txn(txn, request.id)
+
+      case validate_operator_terminal_in_txn(txn, ruled, "detail", performer) do
+        :ok ->
+          Publisher.maybe_accepted_in_txn(txn, opts[:firehose_call], ruled)
+          {ruled, fact_id}
+
+        {:error, refusal} ->
+          raise DB.Error, message: refusal.code
+      end
+    else
+      {error("not_open", "decision request is not open"), nil}
     end
   end
 

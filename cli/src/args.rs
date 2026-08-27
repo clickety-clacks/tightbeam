@@ -4,7 +4,7 @@
 //! omission lets the gateway derive the principal from the discovered session
 //! credential.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -867,20 +867,26 @@ const BOOLEAN_FLAGS: &[&str] = &[
 struct Flags {
     positional: Vec<String>,
     flags: HashMap<String, String>,
+    duplicates: HashSet<String>,
 }
 
 fn split_args(args: Vec<String>) -> Flags {
     let mut positional = Vec::new();
     let mut flags = HashMap::new();
+    let mut duplicates = HashSet::new();
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
         if let Some(name) = arg.strip_prefix("--") {
             if BOOLEAN_FLAGS.contains(&name) {
-                flags.insert(name.to_owned(), String::new());
+                if flags.insert(name.to_owned(), String::new()).is_some() {
+                    duplicates.insert(name.to_owned());
+                }
             } else {
                 let value = args.get(index + 1).cloned().unwrap_or_default();
-                flags.insert(name.to_owned(), value);
+                if flags.insert(name.to_owned(), value).is_some() {
+                    duplicates.insert(name.to_owned());
+                }
                 index += 1;
             }
         } else {
@@ -888,7 +894,11 @@ fn split_args(args: Vec<String>) -> Flags {
         }
         index += 1;
     }
-    Flags { positional, flags }
+    Flags {
+        positional,
+        flags,
+        duplicates,
+    }
 }
 
 fn nonempty(flags: &HashMap<String, String>, name: &str) -> Option<String> {
@@ -1651,6 +1661,7 @@ fn parse_with_optional_catalog(
 
             if parsed.positional.len() != 1
                 || request_id.is_none()
+                || parsed.duplicates.contains("request")
                 || flags.keys().any(|flag| !ALLOWED.contains(&flag.as_str()))
             {
                 return Err(
@@ -3671,6 +3682,7 @@ mod tests {
             vec!["decision-request"],
             vec!["decision-request", "dr_1"],
             vec!["decision-request", "--request", ""],
+            vec!["decision-request", "--request", "dr_1", "--request", "dr_2"],
             vec!["decision-request", "--request", "dr_1", "--target", "main"],
         ] {
             assert_eq!(

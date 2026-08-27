@@ -1639,6 +1639,22 @@ defmodule Tightbeam.Gateway do
           | :invalid_reply_reference
           | :skipped
   def deliver_prompt_in_txn(%DB.Txn{} = txn, session_key, origin, prompt, opts \\ []) do
+    case existing_wake_turn_in_txn(txn, opts[:wake_id]) do
+      nil -> deliver_prompt_once_in_txn(txn, session_key, origin, prompt, opts)
+      duplicate -> duplicate
+    end
+  end
+
+  defp existing_wake_turn_in_txn(_txn, wake_id) when not is_binary(wake_id), do: nil
+
+  defp existing_wake_turn_in_txn(txn, wake_id) do
+    case DB.Txn.q(txn, "SELECT seq FROM turns WHERE wakeId=?1 LIMIT 1", [wake_id]) do
+      [[seq]] -> {:duplicate, %{wake_id: wake_id, turn_seq: seq}}
+      [] -> nil
+    end
+  end
+
+  defp deliver_prompt_once_in_txn(txn, session_key, origin, prompt, opts) do
     # The authenticated post handler is the provenance boundary. Device/client
     # identifiers alone are not evidence: process deliveries also use them for dedupe.
     authenticated_device_message? =
