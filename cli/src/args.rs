@@ -895,6 +895,12 @@ COMMANDS:
         printenv ANTHROPIC_API_KEY | tightbeam onboard anthropic --api-key
       The key is validated against the provider before it is banked, and it
       never leaves this machine.
+  onboard cursor --api-key
+      Cursor is API-key only; --api-key is required (no subscription login).
+      The KEY is read from stdin -- never as an argument:
+        printenv CURSOR_API_KEY | tightbeam onboard cursor --api-key
+      The key is validated against the provider before it is banked, and it
+      never leaves this machine.
 
   add-user <userId> [--admin]
       Add a user, optionally as an admin. An existing admin may run this over
@@ -3608,6 +3614,7 @@ mod tests {
             "identity status [<archetype>]",
             "identity apply (<session> | --all)",
             "onboard openai|anthropic [--api-key]",
+            "onboard cursor --api-key",
             "add-user <userId> [--admin]",
             "config get default-archetype|default-priority",
             "config set default-archetype <name>",
