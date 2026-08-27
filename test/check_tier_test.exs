@@ -40,25 +40,27 @@ defmodule Tightbeam.CheckTierTest do
     assignment = assign(ctx)
 
     invalid = [
-      ["bad1", assignment.id, "verdict", nil, nil, "reviewer", nil, 1],
-      ["bad2", assignment.id, "verdict", "tests-passed", nil, nil, nil, 1],
-      ["bad3", assignment.id, "verdict", "tests-passed", nil, "reviewer", "other", 1],
-      ["bad4", assignment.id, "progress", "tests-passed", nil, "holder", nil, 1],
-      ["bad5", assignment.id, "progress", nil, nil, nil, "flynn", 1]
+      ["bad1", assignment.id, "verdict", nil, nil, "reviewer", nil, nil, 1],
+      ["bad2", assignment.id, "verdict", "tests-passed", nil, nil, nil, nil, 1],
+      ["bad3", assignment.id, "verdict", "tests-passed", nil, "reviewer", "other", nil, 1],
+      ["bad4", assignment.id, "progress", "tests-passed", nil, "holder", nil, "code", 1],
+      ["bad5", assignment.id, "progress", nil, nil, nil, "flynn", "code", 1]
     ]
 
     Enum.each(invalid, fn params ->
       assert {:error, %DB.Error{message: message}} =
                DB.query(
                  ctx.db,
-                 "INSERT INTO attests (id, assignmentId, kind, verdictKind, note, bySession, byUser, ts) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 "INSERT INTO attests (id, assignmentId, kind, verdictKind, note, bySession, byUser, effectKind, ts) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                  params
                )
 
       assert message =~ "CHECK constraint"
     end)
 
-    progress = attest(ctx, {:session, "holder"}, assignment.id, "progress")
+    progress =
+      attest(ctx, {:session, "holder"}, assignment.id, "progress", %{effect_kind: "code"})
+
     assert progress.attest.verdictKind == nil
     assert progress.attest.byUser == nil
     assert progress.attest.bySession == "holder"

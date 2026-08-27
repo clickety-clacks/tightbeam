@@ -7,6 +7,7 @@ defmodule Tightbeam.AssignmentsTest do
     DB,
     Dispatch,
     Gateway,
+    JobTrace,
     Ledger,
     Org,
     Projection,
@@ -1935,11 +1936,24 @@ defmodule Tightbeam.AssignmentsTest do
              )
   end
 
-  test "attest lifecycle, authorization precedence, and terminal race are atomic", ctx do
+  test "A13 A15 typed attest authorization and terminal races are atomic", ctx do
     assignment = handle(ctx, "assign", assign_call({:session, "holder"}, "work"))
+
+    acknowledgment = fn principal ->
+      attest_call(principal, assignment.id, "acknowledgment")
+      |> put_in([:params, :note], "ruling received")
+    end
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM attests WHERE assignmentId=?1", [
+               assignment.id
+             ])
 
     assert %{code: "process_denied"} =
              handle(ctx, "attest", attest_call({:process, "cron"}, assignment.id, "progress"))
+
+    assert %{code: "process_denied"} =
+             handle(ctx, "attest", acknowledgment.({:process, "cron"}))
 
     assert %{code: "principal_required"} =
              handle(ctx, "attest", attest_call(nil, assignment.id, "progress"))
@@ -1950,6 +1964,9 @@ defmodule Tightbeam.AssignmentsTest do
                "attest",
                attest_call({:session, "other-session"}, assignment.id, "progress")
              )
+
+    assert %{code: "not_holder"} =
+             handle(ctx, "attest", acknowledgment.({:session, "other-session"}))
 
     assert %{code: "not_holder"} =
              handle(
@@ -1968,6 +1985,14 @@ defmodule Tightbeam.AssignmentsTest do
     assert %{code: "not_holder"} =
              handle(ctx, "attest", attest_call({:user, "flynn"}, assignment.id, "progress"))
 
+    assert %{code: "not_holder"} =
+             handle(ctx, "attest", acknowledgment.({:user, "flynn"}))
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM attests WHERE assignmentId=?1", [
+               assignment.id
+             ])
+
     assert %{code: "invalid_kind"} =
              handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "bogus"))
 
@@ -1982,6 +2007,10 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert %{code: "unknown_assignment"} =
              handle(ctx, "attest", attest_call({:session, "holder"}, "missing", "progress"))
+
+    acknowledged = handle(ctx, "attest", acknowledgment.({:session, "holder"}))
+    assert acknowledged.assignment.state == "open"
+    assert acknowledged.attest.effectKind == nil
 
     progress = handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "progress"))
     assert progress.assignment.state == "open"
@@ -2020,6 +2049,70 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert count in [0, 1]
     assert (winner[:attest] && count == 1) || (!winner[:attest] && count == 0)
+
+    progress_race = handle(ctx, "assign", assign_call({:session, "holder"}, "progress race"))
+
+    progress_task =
+      Task.async(fn ->
+        handle(ctx, "attest", attest_call({:session, "holder"}, progress_race.id, "progress"))
+      end)
+
+    completion_task =
+      Task.async(fn ->
+        handle(
+          ctx,
+          "attest",
+          attest_call({:session, "holder"}, progress_race.id, "completion")
+        )
+      end)
+
+    progress_results = Task.await_many([progress_task, completion_task])
+    assert Enum.count(progress_results, &(&1[:code] == "assignment_closed")) in [0, 1]
+
+    assert {:ok, [[progress_count, completion_count]]} =
+             DB.query(
+               ctx.db,
+               "SELECT SUM(kind='progress'),SUM(kind='completion') FROM attests WHERE assignmentId=?1",
+               [progress_race.id]
+             )
+
+    assert completion_count == 1
+    assert progress_count in [0, 1]
+
+    acknowledgment_race =
+      handle(ctx, "assign", assign_call({:session, "holder"}, "acknowledgment race"))
+
+    ack_call =
+      attest_call({:session, "holder"}, acknowledgment_race.id, "acknowledgment")
+      |> put_in([:params, :note], "ruling received")
+
+    ack_task = Task.async(fn -> handle(ctx, "attest", ack_call) end)
+
+    revoke_task =
+      Task.async(fn ->
+        handle(
+          ctx,
+          "revoke-assignment",
+          revoke_call({:session, "holder"}, acknowledgment_race.id)
+        )
+      end)
+
+    ack_results = Task.await_many([ack_task, revoke_task])
+    assert Enum.count(ack_results, &(&1[:code] == "assignment_closed")) in [0, 1]
+
+    assert {:ok, [[ack_count]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM attests WHERE assignmentId=?1 AND kind='acknowledgment'",
+               [acknowledgment_race.id]
+             )
+
+    assert ack_count in [0, 1]
+
+    assert {:ok, [["closed"]]} =
+             DB.query(ctx.db, "SELECT state FROM assignments WHERE id=?1", [
+               acknowledgment_race.id
+             ])
 
     terminal = handle(ctx, "assign", assign_call({:session, "holder"}, "terminal"))
     closed = handle(ctx, "attest", attest_call({:session, "holder"}, terminal.id, "surrender"))
@@ -2241,12 +2334,12 @@ defmodule Tightbeam.AssignmentsTest do
         ctx.db,
         """
         INSERT INTO attests
-          (id, assignmentId, kind, verdictKind, note, bySession, byUser, ts)
+          (id, assignmentId, kind, verdictKind, note, bySession, byUser, effectKind, ts)
         VALUES
-          ('att_progress', ?1, 'progress', NULL, NULL, 'holder', NULL, 30),
-          ('att_completion', ?1, 'completion', NULL, NULL, 'holder', NULL, 20),
-          ('att_surrender', ?1, 'surrender', NULL, NULL, 'holder', NULL, 20),
-          ('att_verdict', ?1, 'verdict', 'reviewed-clean', NULL, NULL, 'flynn', 10)
+          ('att_progress', ?1, 'progress', NULL, NULL, 'holder', NULL, 'code', 30),
+          ('att_completion', ?1, 'completion', NULL, NULL, 'holder', NULL, NULL, 20),
+          ('att_surrender', ?1, 'surrender', NULL, NULL, 'holder', NULL, NULL, 20),
+          ('att_verdict', ?1, 'verdict', 'reviewed-clean', NULL, NULL, 'flynn', NULL, 10)
         """,
         [assignment.id]
       )
@@ -2264,6 +2357,516 @@ defmodule Tightbeam.AssignmentsTest do
              {"surrender", 20, "att_surrender"},
              {"progress", 30, "att_progress"}
            ]
+  end
+
+  test "A1-A3 typed progress inherits or explicitly matches every assignment effect kind", ctx do
+    effect_kinds = ~w(code policy release live_mutation evidence review coordination)
+
+    Enum.each(effect_kinds, fn effect_kind ->
+      assignment =
+        assign_call({:user, "flynn"}, "typed #{effect_kind}")
+        |> put_in([:params, :effect_kind], effect_kind)
+        |> then(&handle(ctx, "assign", &1))
+
+      inherited =
+        handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "progress"))
+
+      assert inherited.attest.effectKind == effect_kind
+
+      assert inherited.message ==
+               "progress asserts forward motion on this assignment's deliverable for effectKind=#{effect_kind}"
+
+      explicit =
+        attest_call({:session, "holder"}, assignment.id, "progress")
+        |> put_in([:params, :effect_kind], effect_kind)
+        |> then(&handle(ctx, "attest", &1))
+
+      assert explicit.attest.effectKind == effect_kind
+      assert explicit.assignment.state == "open"
+
+      Enum.each(effect_kinds -- [effect_kind], fn mismatch ->
+        before = Assignments.list_attests(ctx.db, assignment.id)
+        marker_count = length(marker_contents(ctx.db, "holder"))
+
+        refused =
+          attest_call({:session, "holder"}, assignment.id, "progress")
+          |> put_in([:params, :effect_kind], mismatch)
+          |> then(&handle(ctx, "attest", &1))
+
+        assert refused == %{
+                 code: "effect_kind_mismatch",
+                 message:
+                   "progress effectKind #{mismatch} does not match assignment effectKind #{effect_kind}"
+               }
+
+        assert Assignments.list_attests(ctx.db, assignment.id) == before
+        assert length(marker_contents(ctx.db, "holder")) == marker_count
+      end)
+    end)
+  end
+
+  test "A5-A7 acknowledgment and effect scope have typed no-mutation failures", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "acknowledge"))
+
+    for kind <- ~w(progress acknowledgment completion surrender verdict) do
+      call = attest_call({:session, "holder"}, assignment.id, kind)
+
+      call =
+        if kind == "verdict", do: put_in(call, [:params, :verdict_kind], "verified"), else: call
+
+      call =
+        if kind == "acknowledgment", do: put_in(call, [:params, :note], "received"), else: call
+
+      call = put_in(call, [:params, :effect_kind], "unknown")
+
+      assert %{code: "invalid_effect_kind", message: message} = handle(ctx, "attest", call)
+
+      assert message ==
+               "effectKind must be one of code, policy, release, live_mutation, evidence, review, coordination"
+    end
+
+    for kind <- ~w(acknowledgment completion surrender verdict) do
+      call = attest_call({:session, "holder"}, assignment.id, kind)
+
+      call =
+        if kind == "verdict", do: put_in(call, [:params, :verdict_kind], "verified"), else: call
+
+      call =
+        if kind == "acknowledgment", do: put_in(call, [:params, :note], "received"), else: call
+
+      call = put_in(call, [:params, :effect_kind], "code")
+
+      assert handle(ctx, "attest", call) == %{
+               code: "invalid_effect_kind_scope",
+               message: "effectKind is only valid when kind is progress"
+             }
+    end
+
+    for note <- [nil, "   ", String.duplicate("x", 2001)] do
+      call = attest_call({:session, "holder"}, assignment.id, "acknowledgment")
+      call = if is_nil(note), do: call, else: put_in(call, [:params, :note], note)
+
+      assert handle(ctx, "attest", call) == %{
+               code: "invalid_note",
+               message: "note must be 1..2000 non-blank characters"
+             }
+    end
+
+    assert Assignments.list_attests(ctx.db, assignment.id) == []
+  end
+
+  test "A6 A14 A19 acknowledgment and typed progress retain their stored projection values",
+       ctx do
+    item = create_work_item(ctx, "typed projections")
+
+    assignment =
+      handle(
+        ctx,
+        "assign",
+        assign_call({:user, "flynn"}, "project it", nil, item.id)
+      )
+
+    acknowledgment_call =
+      attest_call({:session, "holder"}, assignment.id, "acknowledgment")
+      |> put_in([:params, :note], "ruling received")
+
+    acknowledgment = handle(ctx, "attest", acknowledgment_call)
+    progress = handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "progress"))
+
+    duplicate =
+      handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "progress"))
+
+    assert acknowledgment.message ==
+             "acknowledgment records a ruling receipt or coordination traffic and does not count as effect"
+
+    assert acknowledgment.attest.effectKind == nil
+    assert acknowledgment.assignment.state == "open"
+    assert progress.attest.effectKind == "code"
+    assert duplicate.attest.id != progress.attest.id
+
+    expected_effects = %{
+      acknowledgment.attest.id => nil,
+      progress.attest.id => "code",
+      duplicate.attest.id => "code"
+    }
+
+    assert Map.new(Assignments.list_attests(ctx.db, assignment.id), &{&1.id, &1.effectKind}) ==
+             expected_effects
+
+    assert Map.new(WorkState.detail(ctx.db, assignment.id).attests, &{&1.id, &1.effectKind}) ==
+             expected_effects
+
+    trace_attests =
+      ctx.db
+      |> JobTrace.build(item)
+      |> Map.fetch!(:timeline)
+      |> Enum.filter(&(&1.type == "attest"))
+
+    assert Map.new(trace_attests, &{&1.id, &1.effectKind}) == expected_effects
+
+    assert marker_contents(ctx.db, "holder") |> Enum.take(-3) == [
+             "[acknowledgment filed on #{assignment.id}]",
+             "[progress filed on #{assignment.id}]",
+             "[progress filed on #{assignment.id}]"
+           ]
+  end
+
+  test "A19 full unpaged seen-id recovery survives nonmonotonic order, races, restarts, and failures",
+       ctx do
+    :ok = install_recovery_consumer_tables(ctx.db)
+
+    same_time = handle(ctx, "assign", assign_call({:user, "flynn"}, "same timestamp recovery"))
+
+    :ok =
+      insert_recovery_attest(
+        ctx.db,
+        same_time.id,
+        "att_z_prior",
+        "progress",
+        "code",
+        nil,
+        100
+      )
+
+    :ok = persist_seen(ctx.db, "same-time", same_time.id, ["att_z_prior"])
+
+    :ok =
+      insert_recovery_attest(
+        ctx.db,
+        same_time.id,
+        "att_a_later",
+        "acknowledgment",
+        nil,
+        "Ruling received",
+        100
+      )
+
+    same_time_rows = unpaged_attests(ctx, {:user, "flynn"}, same_time.id)
+    assert Enum.map(same_time_rows, & &1.id) == ["att_a_later", "att_z_prior"]
+
+    assert %{attests: [], next_after: nil, has_more_after: false} =
+             handle(
+               ctx,
+               "attests",
+               call("attests", {:user, "flynn"}, nil, %{
+                 assignment_id: same_time.id,
+                 after: "att_z_prior"
+               })
+             )
+
+    assert {:ok, ["att_a_later"]} =
+             reconcile_consumer(ctx.db, "same-time", same_time.id, same_time_rows, [])
+
+    assert {:ok, []} =
+             reconcile_consumer(ctx.db, "same-time", same_time.id, same_time_rows, [])
+
+    assert recovery_effect_ids(ctx.db, "same-time") == ["att_a_later"]
+
+    clock = handle(ctx, "assign", assign_call({:user, "flynn"}, "clock regression recovery"))
+
+    :ok =
+      insert_recovery_attest(
+        ctx.db,
+        clock.id,
+        "att_clock_prior",
+        "progress",
+        "code",
+        nil,
+        500
+      )
+
+    :ok = persist_seen(ctx.db, "clock", clock.id, ["att_clock_prior"])
+
+    :ok =
+      insert_recovery_attest(
+        ctx.db,
+        clock.id,
+        "att_clock_later",
+        "acknowledgment",
+        nil,
+        "Clock moved backward",
+        200
+      )
+
+    fresh_handlers = Gateway.handlers(%{db: ctx.db, wake_tick_ms: 1_000})
+    recovery_call = recovery_dispatch_call({:user, "flynn"}, clock.id)
+    assert recovery_call.params == %{assignment_id: clock.id}
+
+    assert {:ok, %{attests: clock_rows}} =
+             Dispatch.dispatch(ctx.db, fresh_handlers, recovery_call)
+
+    assert Enum.map(clock_rows, & &1.id) == ["att_clock_later", "att_clock_prior"]
+
+    assert {:ok, %{attests: restarted_same_time_rows}} =
+             Dispatch.dispatch(
+               ctx.db,
+               fresh_handlers,
+               recovery_dispatch_call({:user, "flynn"}, same_time.id)
+             )
+
+    assert Enum.map(restarted_same_time_rows, & &1.id) == ["att_a_later", "att_z_prior"]
+
+    fresh_hub = :"typed_recovery_fresh_hub_#{System.unique_integer([:positive])}"
+    start_supervised!({Tightbeam.Firehose.Hub, name: fresh_hub}, id: fresh_hub)
+    :ok = Tightbeam.Firehose.Hub.subscribe(fresh_hub, self(), "typed", %{})
+    refute_receive {:firehose_notice, _historical_notice}, 50
+
+    last_socket_seq = 1
+    incoming_socket_seq = 3
+    assert incoming_socket_seq > last_socket_seq + 1
+    gap_recovery_call = recovery_dispatch_call({:user, "flynn"}, clock.id)
+    assert gap_recovery_call.params == %{assignment_id: clock.id}
+
+    assert {:ok, %{attests: ^clock_rows}} =
+             Dispatch.dispatch(ctx.db, fresh_handlers, gap_recovery_call)
+
+    assert {:ok, ["att_clock_later"]} =
+             reconcile_consumer(ctx.db, "clock", clock.id, clock_rows, [])
+
+    assert {:ok, []} = reconcile_consumer(ctx.db, "clock", clock.id, clock_rows, [])
+
+    before_race =
+      handle(ctx, "assign", assign_call({:user, "flynn"}, "query before live race"))
+
+    before_query = unpaged_attests(ctx, {:user, "flynn"}, before_race.id)
+
+    :ok =
+      insert_recovery_attest(
+        ctx.db,
+        before_race.id,
+        "att_after_query",
+        "progress",
+        "code",
+        "identical",
+        700
+      )
+
+    [after_query_live] = Assignments.list_attests(ctx.db, before_race.id)
+
+    assert {:ok, ["att_after_query"]} =
+             reconcile_consumer(
+               ctx.db,
+               "race-after",
+               before_race.id,
+               before_query,
+               [after_query_live]
+             )
+
+    before_commit =
+      handle(ctx, "assign", assign_call({:user, "flynn"}, "live before query race"))
+
+    for id <- ["att_duplicate_a", "att_duplicate_b"] do
+      :ok =
+        insert_recovery_attest(
+          ctx.db,
+          before_commit.id,
+          id,
+          "progress",
+          "code",
+          "byte-identical",
+          800
+        )
+    end
+
+    before_commit_rows = unpaged_attests(ctx, {:session, "holder"}, before_commit.id)
+    [buffered | _] = before_commit_rows
+
+    assert {:ok, ["att_duplicate_a", "att_duplicate_b"]} =
+             reconcile_consumer(
+               ctx.db,
+               "race-before",
+               before_commit.id,
+               before_commit_rows,
+               [buffered]
+             )
+
+    assert recovery_effect_ids(ctx.db, "race-before") ==
+             ["att_duplicate_a", "att_duplicate_b"]
+
+    crash = handle(ctx, "assign", assign_call({:user, "flynn"}, "consumer crash boundary"))
+
+    :ok =
+      insert_recovery_attest(
+        ctx.db,
+        crash.id,
+        "att_crash",
+        "progress",
+        "code",
+        nil,
+        900
+      )
+
+    crash_rows = unpaged_attests(ctx, {:user, "flynn"}, crash.id)
+
+    assert {:error, %RuntimeError{message: "forced consumer crash after effect"}} =
+             reconcile_consumer(
+               ctx.db,
+               "crash",
+               crash.id,
+               crash_rows,
+               [],
+               fail_after_effect: "att_crash"
+             )
+
+    assert recovery_seen_ids(ctx.db, "crash", crash.id) == []
+    assert recovery_effect_ids(ctx.db, "crash") == []
+
+    assert {:ok, ["att_crash"]} =
+             reconcile_consumer(ctx.db, "crash", crash.id, crash_rows, [])
+
+    external =
+      handle(ctx, "assign", assign_call({:user, "flynn"}, "external idempotent recovery"))
+
+    :ok =
+      insert_recovery_attest(
+        ctx.db,
+        external.id,
+        "att_external",
+        "acknowledgment",
+        nil,
+        "External effect",
+        1_000
+      )
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO recovery_effects (consumer,attestId,kind,effectKind) VALUES ('external','att_external','acknowledgment',NULL)"
+             )
+
+    assert {:ok, ["att_external"]} =
+             reconcile_consumer(
+               ctx.db,
+               "external",
+               external.id,
+               unpaged_attests(ctx, {:user, "flynn"}, external.id),
+               [],
+               external_idempotent: true
+             )
+
+    assert recovery_effect_ids(ctx.db, "external") == ["att_external"]
+    assert recovery_seen_ids(ctx.db, "external", external.id) == ["att_external"]
+
+    seen_before_failures = full_recovery_seen(ctx.db)
+
+    assert %{code: "principal_required"} =
+             handle(ctx, "attests", call("attests", nil, nil, %{assignment_id: clock.id}))
+
+    assert %{code: "process_denied"} =
+             handle(
+               ctx,
+               "attests",
+               call("attests", {:process, "recovery"}, nil, %{assignment_id: clock.id})
+             )
+
+    assert %{code: "unknown_assignment"} =
+             handle(
+               ctx,
+               "attests",
+               call("attests", {:user, "flynn"}, nil, %{assignment_id: "asg_unknown"})
+             )
+
+    assert {:error, _transport_failure} =
+             :httpc.request(
+               :get,
+               {~c"http://127.0.0.1:1/agent/dispatch", []},
+               [{:timeout, 100}],
+               []
+             )
+
+    assert full_recovery_seen(ctx.db) == seen_before_failures
+
+    other_assignment =
+      handle(ctx, "assign", assign_call({:user, "flynn"}, "foreign recovery scope"))
+
+    :ok =
+      insert_recovery_attest(
+        ctx.db,
+        other_assignment.id,
+        "att_foreign",
+        "progress",
+        "code",
+        nil,
+        1
+      )
+
+    refute Enum.any?(unpaged_attests(ctx, {:user, "flynn"}, clock.id), &(&1.id == "att_foreign"))
+
+    assert Enum.map(unpaged_attests(ctx, {:session, "holder"}, clock.id), & &1.id) ==
+             Enum.map(unpaged_attests(ctx, {:user, "flynn"}, clock.id), & &1.id)
+  end
+
+  test "A4 direct database rails reject every invalid typed attest shape and update", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "database rails"))
+    assignment_id = assignment.id
+
+    invalid_values = [
+      "('bad_kind',?1,'unknown',NULL,NULL,'holder',NULL,NULL,NULL,NULL,NULL,NULL,1)",
+      "('bad_effect',?1,'progress',NULL,NULL,'holder',NULL,NULL,NULL,NULL,NULL,'unknown',1)",
+      "('ack_no_session',?1,'acknowledgment',NULL,'note',NULL,'flynn',NULL,NULL,NULL,NULL,NULL,1)",
+      "('ack_verdict',?1,'acknowledgment','verified','note','holder',NULL,NULL,NULL,NULL,NULL,NULL,1)",
+      "('ack_effect',?1,'acknowledgment',NULL,'note','holder',NULL,NULL,NULL,NULL,NULL,'code',1)",
+      "('ack_note_null',?1,'acknowledgment',NULL,NULL,'holder',NULL,NULL,NULL,NULL,NULL,NULL,1)",
+      "('ack_note_blank',?1,'acknowledgment',NULL,'   ','holder',NULL,NULL,NULL,NULL,NULL,NULL,1)",
+      "('ack_producer',?1,'acknowledgment',NULL,'note','holder',NULL,'p',NULL,NULL,NULL,NULL,1)",
+      "('ack_producer_command',?1,'acknowledgment',NULL,'note','holder',NULL,NULL,'p',NULL,NULL,NULL,1)",
+      "('ack_harness',?1,'acknowledgment',NULL,'note','holder',NULL,NULL,NULL,'codex',NULL,NULL,1)",
+      "('ack_provider',?1,'acknowledgment',NULL,'note','holder',NULL,NULL,NULL,NULL,'openai',NULL,1)",
+      "('completion_effect',?1,'completion',NULL,NULL,'holder',NULL,NULL,NULL,NULL,NULL,'code',1)",
+      "('surrender_effect',?1,'surrender',NULL,NULL,'holder',NULL,NULL,NULL,NULL,NULL,'code',1)",
+      "('verdict_effect',?1,'verdict','verified',NULL,NULL,'flynn',NULL,NULL,NULL,NULL,'code',1)",
+      "('verdict_principals',?1,'verdict','verified',NULL,'holder','flynn',NULL,NULL,NULL,NULL,NULL,1)",
+      "('progress_principal',?1,'progress',NULL,NULL,NULL,'flynn',NULL,NULL,NULL,NULL,'code',1)",
+      "('progress_null',?1,'progress',NULL,NULL,'holder',NULL,NULL,NULL,NULL,NULL,NULL,1)",
+      "('progress_mismatch',?1,'progress',NULL,NULL,'holder',NULL,NULL,NULL,NULL,NULL,'policy',1)"
+    ]
+
+    Enum.each(invalid_values, fn values ->
+      assert {:error, %DB.Error{}} =
+               DB.query(
+                 ctx.db,
+                 "INSERT INTO attests " <>
+                   "(id,assignmentId,kind,verdictKind,note,bySession,byUser,producer," <>
+                   "producerCommand,byHarness,byProvider,effectKind,ts) VALUES #{values}",
+                 [assignment.id]
+               )
+    end)
+
+    assert {:error, %DB.Error{}} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO attests (id,assignmentId,kind,note,bySession,effectKind,ts) " <>
+                 "VALUES ('ack_too_long',?1,'acknowledgment',?2,'holder',NULL,1)",
+               [assignment.id, String.duplicate("x", 2001)]
+             )
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO attests (id,assignmentId,kind,bySession,effectKind,ts) " <>
+                 "VALUES ('valid_progress',?1,'progress','holder','code',2)",
+               [assignment.id]
+             )
+
+    policy_assignment =
+      assign_call({:user, "flynn"}, "policy database rails")
+      |> put_in([:params, :effect_kind], "policy")
+      |> then(&handle(ctx, "assign", &1))
+
+    for sql <- [
+          "UPDATE attests SET effectKind=NULL WHERE id='valid_progress'",
+          "UPDATE attests SET effectKind='policy' WHERE id='valid_progress'",
+          "UPDATE attests SET kind='acknowledgment' WHERE id='valid_progress'",
+          "UPDATE attests SET assignmentId='#{policy_assignment.id}' WHERE id='valid_progress'"
+        ] do
+      assert {:error, %DB.Error{}} = DB.query(ctx.db, sql)
+
+      assert {:ok, [["progress", "code", ^assignment_id]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT kind,effectKind,assignmentId FROM attests WHERE id='valid_progress'"
+               )
+    end
   end
 
   test "accepted handler rolls back when its event append fails", ctx do
@@ -2306,6 +2909,137 @@ defmodule Tightbeam.AssignmentsTest do
          )
 
   defp handle(ctx, verb, call), do: WorkItems.__handle__(ctx.db, verb, %{call | verb: verb})
+
+  defp install_recovery_consumer_tables(db) do
+    DB.execute(db, """
+    CREATE TABLE recovery_seen (
+      consumer TEXT NOT NULL,
+      assignmentId TEXT NOT NULL,
+      attestId TEXT NOT NULL,
+      PRIMARY KEY (consumer, assignmentId, attestId)
+    );
+    CREATE TABLE recovery_effects (
+      consumer TEXT NOT NULL,
+      attestId TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      effectKind TEXT,
+      PRIMARY KEY (consumer, attestId)
+    );
+    """)
+  end
+
+  defp insert_recovery_attest(db, assignment_id, id, kind, effect_kind, note, ts) do
+    assert {:ok, []} =
+             DB.query(
+               db,
+               """
+               INSERT INTO attests
+                 (id,assignmentId,kind,note,bySession,effectKind,ts)
+               VALUES (?1,?2,?3,?4,'holder',?5,?6)
+               """,
+               [id, assignment_id, kind, note, effect_kind, ts]
+             )
+
+    :ok
+  end
+
+  defp persist_seen(db, consumer, assignment_id, ids) do
+    Enum.each(ids, fn id ->
+      assert {:ok, []} =
+               DB.query(
+                 db,
+                 "INSERT INTO recovery_seen (consumer,assignmentId,attestId) VALUES (?1,?2,?3)",
+                 [consumer, assignment_id, id]
+               )
+    end)
+
+    :ok
+  end
+
+  defp unpaged_attests(ctx, principal, assignment_id) do
+    call = recovery_dispatch_call(principal, assignment_id)
+    assert call.params == %{assignment_id: assignment_id}
+    assert %{attests: rows} = handle(ctx, "attests", call)
+    rows
+  end
+
+  defp recovery_dispatch_call(principal, assignment_id),
+    do: call("attests", principal, nil, %{assignment_id: assignment_id})
+
+  defp reconcile_consumer(db, consumer, assignment_id, query_rows, live_buffer, opts \\ []) do
+    by_id = Map.new(query_rows ++ live_buffer, &{&1.id, &1})
+    seen = MapSet.new(recovery_seen_ids(db, consumer, assignment_id))
+
+    unseen_ids =
+      by_id
+      |> Map.keys()
+      |> MapSet.new()
+      |> MapSet.difference(seen)
+      |> Enum.sort()
+
+    DB.transaction(db, fn txn ->
+      Enum.each(unseen_ids, fn id ->
+        attest = Map.fetch!(by_id, id)
+
+        if attest.kind in ["progress", "acknowledgment"] do
+          insert =
+            if Keyword.get(opts, :external_idempotent, false),
+              do: "INSERT OR IGNORE",
+              else: "INSERT"
+
+          DB.Txn.q(
+            txn,
+            "#{insert} INTO recovery_effects (consumer,attestId,kind,effectKind) VALUES (?1,?2,?3,?4)",
+            [consumer, id, attest.kind, attest.effectKind]
+          )
+
+          if Keyword.get(opts, :fail_after_effect) == id do
+            raise "forced consumer crash after effect"
+          end
+        end
+
+        DB.Txn.q(
+          txn,
+          "INSERT INTO recovery_seen (consumer,assignmentId,attestId) VALUES (?1,?2,?3)",
+          [consumer, assignment_id, id]
+        )
+      end)
+
+      unseen_ids
+    end)
+  end
+
+  defp recovery_seen_ids(db, consumer, assignment_id) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT attestId FROM recovery_seen WHERE consumer=?1 AND assignmentId=?2 ORDER BY attestId",
+        [consumer, assignment_id]
+      )
+
+    List.flatten(rows)
+  end
+
+  defp recovery_effect_ids(db, consumer) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT attestId FROM recovery_effects WHERE consumer=?1 ORDER BY attestId",
+        [consumer]
+      )
+
+    List.flatten(rows)
+  end
+
+  defp full_recovery_seen(db) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT consumer,assignmentId,attestId FROM recovery_seen ORDER BY consumer,assignmentId,attestId"
+      )
+
+    rows
+  end
 
   defp create_work_item(ctx, title) do
     handle(

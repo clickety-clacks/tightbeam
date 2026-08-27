@@ -149,6 +149,43 @@ defmodule Tightbeam.ArchetypesTest do
     refute manual =~ "worktree-session"
   end
 
+  test "A20 typed-progress guidance keeps effect claims separate from receipts" do
+    manual = Archetypes.builtin_fragments()["operating-manual.md"]
+
+    assert manual =~ """
+           An assignment's `effectKind` classifies its deliverable as `code`, `policy`,
+           `release`, `live_mutation`, `evidence`, `review`, or `coordination`. File
+           `kind=progress` only for forward motion on that deliverable. Omit
+           `--effect-kind` to inherit the assignment value. File
+           `kind=acknowledgment` when you elect to preserve a ruling receipt or
+           non-effect coordination traffic. If progress has stopped, use
+           `kind=acknowledgment` to record the exact blocker or refusal, its evidence,
+           and the condition that would clear it. Keep the card and schedule a concrete
+           continuation wake. An acknowledgment does not count as assignment effect.
+           """
+
+    assert manual =~ "File matching typed\n  progress when you elect an attest."
+    assert manual =~ "an exact new blocker or refusal. File an acknowledgment"
+    assert manual =~ "Use a continuation wake, not progress."
+    assert manual =~ "Do not request an acknowledgment turn for an ordinary directive"
+    refute manual =~ "Blocked: file the exact blocker as a progress attest"
+
+    bundle = Path.expand("../priv/kungfu/agentic-engineering", __DIR__)
+    unblocking = File.read!(Path.join(bundle, "skills/unblocking/SKILL.md"))
+    recon_lifecycle = File.read!(Path.join(bundle, "skills/recon-lifecycle/SKILL.md"))
+    coder = File.read!(Path.join(bundle, "guidance/coder.md"))
+    orchestrator = File.read!(Path.join(bundle, "guidance/orchestrator.md"))
+    recon_first = File.read!(Path.join(bundle, "skills/recon-first-investigation/SKILL.md"))
+
+    assert unblocking =~ "latest blocker-bearing acknowledgment or terminal"
+    assert unblocking =~ "last historical progress attest as blocker"
+    assert recon_lifecycle =~ "non-effect acknowledgment"
+    refute recon_lifecycle =~ "Findings beyond\n   the question are recorded as progress attests"
+    assert coder =~ "ready-for-review progress attest"
+    assert orchestrator =~ "FIRST progress attest"
+    assert recon_first =~ "--kind progress --note \"<root cause + citations>\""
+  end
+
   test "the shipped bundle loads role guidance and elected shared skills", ctx do
     Identity.init!(ctx.base_dir)
 

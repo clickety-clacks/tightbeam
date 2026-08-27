@@ -75,7 +75,11 @@ defmodule Tightbeam.Schema do
   # column. The v4 stamp is the one exact predecessor that upgrade accepts.
   # The nullable transcript discriminator adds `messages.messageType`; v6 is
   # its one exact predecessor, and historical rows remain null.
-  @shape "coordination-fabric-v1-phase1-v7"
+  # Typed progress attests add their effect discriminator over the landed v7
+  # shape and are this build's one final successor.
+  @shape "coordination-fabric-v1-phase1-v8-typed-progress-attests"
+  @bootstrap_shape "coordination-fabric-v1-phase1-v8-typed-progress-attests-bootstrapping"
+  @typed_progress_previous_shape "coordination-fabric-v1-phase1-v7"
   @message_type_previous_shape "coordination-fabric-v1-phase1-v6"
   @cold_start_previous_shape "coordination-fabric-v1-phase1-v5"
   @operational_parent_shape "coordination-fabric-v1-phase1-v5"
@@ -779,14 +783,31 @@ defmodule Tightbeam.Schema do
   named by the exact migration stamps below; each upgrade is transactional.
   No shape is inferred from stored DDL.
   """
-  @spec ensure_all(DB.server()) :: :ok
-  def ensure_all(db) do
+  @spec ensure_all(DB.server(), keyword()) :: :ok
+  def ensure_all(db, opts \\ []) when is_list(opts) do
+    # Boot is one transition per database. The resource is shared by callers;
+    # self() is the distinct requester id, so a second task cannot re-enter the
+    # first task's lock after observing a predecessor the first is advancing.
+    :global.trans({{__MODULE__, db}, self()}, fn -> ensure_all_locked(db, opts) end)
+  end
+
+  defp ensure_all_locked(db, opts) do
     :ok = ensure_stamp_table(db)
-    :ok = check_shape(db)
+    shape_state = check_shape(db)
+
+    if shape_state == :ready do
+      :ok = validate_typed_progress_attests_v1!(db)
+    end
 
     Enum.each(@schema_modules, fn module ->
       :ok = module.ensure_schema(db)
     end)
+
+    if shape_state == :bootstrapping do
+      :ok = finalize_bootstrap_stamp!(db, opts)
+    end
+
+    :ok = validate_typed_progress_attests_v1!(db)
 
     :ok = Tightbeam.ColdStart.validate!(db)
 
@@ -805,6 +826,96 @@ defmodule Tightbeam.Schema do
         raise ShapeError,
           message:
             "incompatible_supervision_liveness_v1: additive activation failed: #{Exception.message(error)}"
+    end
+  end
+
+  @doc false
+  @spec upgrade_typed_progress_attests_v1(DB.server(), keyword()) :: :ok
+  def upgrade_typed_progress_attests_v1(db, opts \\ []) when is_list(opts) do
+    case DB.foreign_key_rebuild(db, fn txn ->
+           observed = stamp_rows(txn)
+
+           if observed != [[@typed_progress_previous_shape]] do
+             incompatible_typed_progress!(observed_stamp(observed), ["shape_stamp"])
+           end
+
+           predecessor_mismatches = predecessor_successor_mismatches(txn)
+
+           if predecessor_mismatches != [] do
+             incompatible_typed_progress!(
+               @typed_progress_previous_shape,
+               predecessor_mismatches
+             )
+           end
+
+           :ok =
+             Txn.exec(
+               txn,
+               Tightbeam.Assignments.attests_table_ddl(
+                 "attests_typed_progress_v1",
+                 false
+               )
+             )
+
+           Txn.q(
+             txn,
+             """
+             INSERT INTO attests_typed_progress_v1
+               (rowid,id,assignmentId,kind,verdictKind,note,bySession,byUser,producer,
+                producerCommand,byHarness,byProvider,commitRefs,effectKind,ts)
+             SELECT rowid,id,assignmentId,kind,verdictKind,note,bySession,byUser,producer,
+                    producerCommand,byHarness,byProvider,commitRefs,NULL,ts
+             FROM attests ORDER BY rowid
+             """
+           )
+
+           maybe_interrupt_typed_progress_migration!(opts, :after_copy)
+           :ok = Txn.exec(txn, "DROP TABLE attests")
+
+           :ok =
+             Txn.exec(
+               txn,
+               "ALTER TABLE attests_typed_progress_v1 RENAME TO attests"
+             )
+
+           maybe_interrupt_typed_progress_migration!(opts, :after_replace)
+
+           Enum.each(Tightbeam.Assignments.typed_progress_trigger_ddls(), fn {_name, ddl} ->
+             :ok = Txn.exec(txn, ddl)
+           end)
+
+           Txn.q(
+             txn,
+             "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1",
+             [
+               @typed_progress_previous_shape,
+               @shape,
+               System.system_time(:millisecond)
+             ]
+           )
+
+           if Txn.changes(txn) != 1 do
+             incompatible_typed_progress!(@typed_progress_previous_shape, ["shape_stamp"])
+           end
+
+           mismatches = typed_progress_inventory_mismatches(txn)
+
+           if mismatches != [] do
+             incompatible_typed_progress!(@shape, mismatches)
+           end
+
+           :ok
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "incompatible_typed_progress_attests_v1: migration failed: #{Exception.message(error)}"
     end
   end
 
@@ -872,7 +983,7 @@ defmodule Tightbeam.Schema do
            Txn.q(
              txn,
              "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1",
-             [@message_type_previous_shape, @shape, migration_time]
+             [@message_type_previous_shape, @typed_progress_previous_shape, migration_time]
            )
 
            if Txn.changes(txn) != 1 do
@@ -1199,6 +1310,310 @@ defmodule Tightbeam.Schema do
     raise ShapeError, message: "incompatible_supervision_liveness_v1: #{detail}"
   end
 
+  @typed_progress_trigger_names ~w(
+    attests_typed_progress_nonnull_insert
+    attests_typed_progress_match_insert
+    attests_typed_progress_nonnull_update
+    attests_typed_progress_match_update
+  )
+
+  defp validate_typed_progress_attests_v1!(db) do
+    case DB.transaction(db, fn txn ->
+           observed = stamp_rows(txn)
+           mismatches = typed_progress_inventory_mismatches(txn)
+
+           mismatches =
+             if observed == [[@shape]], do: mismatches, else: ["shape_stamp" | mismatches]
+
+           if mismatches != [] do
+             incompatible_typed_progress!(observed_stamp(observed), mismatches)
+           end
+
+           :ok
+         end) do
+      {:ok, :ok} -> :ok
+      {:error, %ShapeError{} = error} -> raise error
+      {:error, error} -> raise error
+    end
+  end
+
+  defp finalize_bootstrap_stamp!(db, opts) do
+    case DB.transaction(db, fn txn ->
+           observed = stamp_rows(txn)
+           mismatches = typed_progress_inventory_mismatches(txn)
+
+           mismatches =
+             if observed == [[@bootstrap_shape]],
+               do: mismatches,
+               else: ["shape_stamp" | mismatches]
+
+           if mismatches != [] do
+             incompatible_typed_progress!(observed_stamp(observed), mismatches)
+           end
+
+           maybe_interrupt_bootstrap_finalization!(opts, :after_inventory)
+
+           Txn.q(
+             txn,
+             "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1",
+             [@bootstrap_shape, @shape, System.system_time(:millisecond)]
+           )
+
+           if Txn.changes(txn) != 1 do
+             incompatible_typed_progress!(observed_stamp(observed), ["shape_stamp"])
+           end
+
+           :ok
+         end) do
+      {:ok, :ok} -> :ok
+      {:error, %ShapeError{} = error} -> raise error
+      {:error, error} -> raise error
+    end
+  end
+
+  defp maybe_interrupt_bootstrap_finalization!(opts, point) do
+    if Keyword.get(opts, :fail_at) == point do
+      raise "forced typed-progress bootstrap interruption at #{point}"
+    end
+
+    :ok
+  end
+
+  defp predecessor_successor_mismatches(source) do
+    legacy_attests_inventory_mismatches(source)
+    |> maybe_mismatch("messages.messageType", not message_type_column_exact?(source))
+    |> then(fn mismatches ->
+      Enum.reduce(@typed_progress_trigger_names, mismatches, fn name, acc ->
+        maybe_mismatch(acc, name, not is_nil(schema_sql(source, "trigger", name)))
+      end)
+    end)
+    |> Enum.sort()
+  end
+
+  defp typed_progress_inventory_mismatches(source) do
+    mismatches =
+      typed_progress_table_mismatches(source)
+      |> maybe_mismatch("messages.messageType", not message_type_column_exact?(source))
+
+    Tightbeam.Assignments.typed_progress_trigger_ddls()
+    |> Enum.reduce(mismatches, fn {name, expected_sql}, acc ->
+      actual = schema_sql(source, "trigger", name)
+
+      malformed =
+        is_nil(actual) or normalize_schema_sql(actual) != normalize_schema_sql(expected_sql)
+
+      maybe_mismatch(acc, name, malformed)
+    end)
+    |> Enum.uniq()
+    |> Enum.sort()
+  end
+
+  defp bootstrap_inventory_mismatches(source) do
+    mismatches =
+      if table_present?(source, "messages") and not message_type_column_exact?(source) do
+        ["messages.messageType"]
+      else
+        []
+      end
+
+    mismatches =
+      if table_present?(source, "attests") do
+        typed_progress_table_mismatches(source) ++ mismatches
+      else
+        mismatches
+      end
+
+    Tightbeam.Assignments.typed_progress_trigger_ddls()
+    |> Enum.reduce(mismatches, fn {name, expected_sql}, acc ->
+      case schema_sql(source, "trigger", name) do
+        nil ->
+          acc
+
+        actual ->
+          maybe_mismatch(
+            acc,
+            name,
+            normalize_schema_sql(actual) != normalize_schema_sql(expected_sql)
+          )
+      end
+    end)
+    |> Enum.uniq()
+    |> Enum.sort()
+  end
+
+  defp typed_progress_table_mismatches(source) do
+    actual_table = schema_sql(source, "table", "attests")
+    normalized = actual_table && normalize_schema_sql(actual_table)
+
+    actual_columns =
+      source
+      |> rows("PRAGMA table_info(attests)")
+      |> Enum.map(&Enum.at(&1, 1))
+
+    expected_columns =
+      ~w(id assignmentId kind verdictKind note bySession byUser producer producerCommand byHarness byProvider commitRefs effectKind ts)
+
+    kind_fragment =
+      "kind TEXT NOT NULL CHECK(kind IN ('progress', 'acknowledgment', 'completion', 'surrender', 'verdict'))"
+      |> normalize_schema_sql()
+
+    effect_fragment =
+      "effectKind TEXT NULL CHECK(effectKind IS NULL OR effectKind IN ('code', 'policy', 'release', 'live_mutation', 'evidence', 'review', 'coordination'))"
+      |> normalize_schema_sql()
+
+    row_fragments =
+      [
+        "kind = 'progress' AND bySession IS NOT NULL AND byUser IS NULL AND verdictKind IS NULL",
+        "kind = 'acknowledgment' AND bySession IS NOT NULL AND byUser IS NULL AND verdictKind IS NULL AND effectKind IS NULL AND note IS NOT NULL",
+        "kind IN ('completion', 'surrender') AND bySession IS NOT NULL AND byUser IS NULL AND verdictKind IS NULL AND effectKind IS NULL",
+        "kind = 'verdict' AND verdictKind IS NOT NULL AND ((bySession IS NOT NULL) != (byUser IS NOT NULL)) AND effectKind IS NULL",
+        "producer IS NULL OR kind = 'verdict'",
+        "producerCommand IS NULL OR producer IS NOT NULL",
+        "byHarness IS NULL OR kind = 'verdict'",
+        "byProvider IS NULL OR kind = 'verdict'",
+        "note IS NULL OR length(trim(note)) BETWEEN 1 AND 2000"
+      ]
+      |> Enum.map(&normalize_schema_sql/1)
+
+    table_missing = is_nil(normalized)
+
+    []
+    |> maybe_mismatch(
+      "attests.effectKind",
+      table_missing or actual_columns != expected_columns or
+        not String.contains?(normalized, effect_fragment)
+    )
+    |> maybe_mismatch(
+      "attests.kind_constraint",
+      table_missing or not String.contains?(normalized, kind_fragment)
+    )
+    |> maybe_mismatch(
+      "attests.row_shape_constraints",
+      table_missing or Enum.any?(row_fragments, &(not String.contains?(normalized, &1)))
+    )
+  end
+
+  defp v6_successor_mismatches(source) do
+    legacy_attests_inventory_mismatches(source)
+    |> maybe_mismatch("messages.messageType", message_type_column_present?(source))
+    |> then(fn mismatches ->
+      Enum.reduce(@typed_progress_trigger_names, mismatches, fn name, acc ->
+        maybe_mismatch(acc, name, not is_nil(schema_sql(source, "trigger", name)))
+      end)
+    end)
+    |> Enum.uniq()
+    |> Enum.sort()
+  end
+
+  defp legacy_attests_inventory_mismatches(source) do
+    normalized =
+      case schema_sql(source, "table", "attests") do
+        sql when is_binary(sql) -> normalize_schema_sql(sql)
+        nil -> nil
+      end
+
+    actual_columns =
+      source
+      |> rows("PRAGMA table_info(attests)")
+      |> Enum.map(&Enum.at(&1, 1))
+
+    expected_columns =
+      ~w(id assignmentId kind verdictKind note bySession byUser producer producerCommand byHarness byProvider commitRefs ts)
+
+    kind_fragment =
+      "kind TEXT NOT NULL CHECK(kind IN ('progress', 'completion', 'surrender', 'verdict'))"
+      |> normalize_schema_sql()
+
+    row_fragments =
+      [
+        "kind IN ('progress', 'completion', 'surrender') AND bySession IS NOT NULL AND byUser IS NULL AND verdictKind IS NULL",
+        "kind = 'verdict' AND verdictKind IS NOT NULL AND ((bySession IS NOT NULL) != (byUser IS NOT NULL))",
+        "producer IS NULL OR kind = 'verdict'",
+        "producerCommand IS NULL OR producer IS NOT NULL",
+        "byHarness IS NULL OR kind = 'verdict'",
+        "byProvider IS NULL OR kind = 'verdict'"
+      ]
+      |> Enum.map(&normalize_schema_sql/1)
+
+    missing = is_nil(normalized)
+
+    []
+    |> maybe_mismatch(
+      "attests.effectKind",
+      missing or actual_columns != expected_columns
+    )
+    |> maybe_mismatch(
+      "attests.kind_constraint",
+      missing or not String.contains?(normalized, kind_fragment)
+    )
+    |> maybe_mismatch(
+      "attests.row_shape_constraints",
+      missing or Enum.any?(row_fragments, &(not String.contains?(normalized, &1)))
+    )
+  end
+
+  defp message_type_column_present?(source) do
+    source
+    |> rows("PRAGMA table_info(messages)")
+    |> Enum.any?(&(Enum.at(&1, 1) == "messageType"))
+  end
+
+  defp table_present?(source, name),
+    do: not is_nil(schema_sql(source, "table", name))
+
+  defp message_type_column_exact?(source) do
+    case Enum.find(
+           rows(source, "PRAGMA table_info(messages)"),
+           &(Enum.at(&1, 1) == "messageType")
+         ) do
+      [_cid, "messageType", type, 0, nil, 0] -> String.upcase(type) == "TEXT"
+      _ -> false
+    end
+  end
+
+  defp maybe_mismatch(mismatches, _name, false), do: mismatches
+  defp maybe_mismatch(mismatches, name, true), do: [name | mismatches]
+
+  defp schema_sql(source, type, name) do
+    case rows(source, "SELECT sql FROM sqlite_master WHERE type=?1 AND name=?2", [type, name]) do
+      [[sql]] when is_binary(sql) -> sql
+      _ -> nil
+    end
+  end
+
+  defp stamp_rows(source), do: rows(source, "SELECT shape FROM schema_stamp")
+
+  defp observed_stamp([]), do: "<missing>"
+  defp observed_stamp([[stamp]]), do: stamp
+
+  defp observed_stamp(rows),
+    do: rows |> List.flatten() |> Enum.map(&to_string/1) |> Enum.sort() |> Enum.join("|")
+
+  defp rows(source, sql, params \\ [])
+
+  defp rows(%Txn{} = txn, sql, params), do: Txn.q(txn, sql, params)
+
+  defp rows(db, sql, params) do
+    {:ok, rows} = DB.query(db, sql, params)
+    rows
+  end
+
+  defp maybe_interrupt_typed_progress_migration!(opts, point) do
+    if Keyword.get(opts, :fail_at) == point do
+      raise "forced typed-progress migration interruption at #{point}"
+    end
+
+    :ok
+  end
+
+  defp incompatible_typed_progress!(observed_stamp, mismatches) do
+    mismatch_text = mismatches |> Enum.uniq() |> Enum.sort() |> Enum.join(",")
+
+    raise ShapeError,
+      message:
+        "database shape #{observed_stamp} is incompatible with typed-progress-attests-v1: #{mismatch_text}"
+  end
+
   defp ensure_stamp_table(db) do
     DB.execute(db, """
     CREATE TABLE IF NOT EXISTS schema_stamp (
@@ -1211,19 +1626,41 @@ defmodule Tightbeam.Schema do
   defp check_shape(db) do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
       {:ok, [[@shape]]} ->
-        :ok
+        :ready
+
+      {:ok, [[@bootstrap_shape]]} ->
+        case bootstrap_inventory_mismatches(db) do
+          [] -> :bootstrapping
+          mismatches -> incompatible_typed_progress!(@bootstrap_shape, mismatches)
+        end
 
       {:ok, [[@message_type_previous_shape]]} ->
-        upgrade_message_type_v1(db)
+        mismatches = v6_successor_mismatches(db)
+
+        if mismatches != [] do
+          incompatible_typed_progress!(@message_type_previous_shape, mismatches)
+        end
+
+        :ok = upgrade_message_type_v1(db)
+        :ok = upgrade_typed_progress_attests_v1(db)
+        :ready
 
       {:ok, [[@cold_start_previous_shape]]} ->
         :ok = upgrade_cold_start_v1(db)
-        upgrade_message_type_v1(db)
+        :ok = upgrade_message_type_v1(db)
+        :ok = upgrade_typed_progress_attests_v1(db)
+        :ready
+
+      {:ok, [[@typed_progress_previous_shape]]} ->
+        :ok = upgrade_typed_progress_attests_v1(db)
+        :ready
 
       {:ok, [[@operational_parent_previous_shape]]} ->
         :ok = upgrade_operational_parent_v1(db)
         :ok = upgrade_cold_start_v1(db)
-        upgrade_message_type_v1(db)
+        :ok = upgrade_message_type_v1(db)
+        :ok = upgrade_typed_progress_attests_v1(db)
+        :ready
 
       {:ok, []} ->
         # No stamp. Either a database this build is about to create, or one
@@ -1233,62 +1670,30 @@ defmodule Tightbeam.Schema do
         unstamped(db)
 
       {:ok, [[found]]} ->
-        raise ShapeError, """
-        this Tightbeam database was written by a different build.
-
-          stamped: #{found}
-          this build: #{@shape}
-
-        There is no migration from #{found}. The only supported upgrade sources
-        are #{@operational_parent_previous_shape}, #{@cold_start_previous_shape}, and
-        #{@message_type_previous_shape}. Move this database aside and let it be recreated.
-        """
+        mismatches = ["shape_stamp" | typed_progress_inventory_mismatches(db)]
+        incompatible_typed_progress!(found, mismatches)
 
       # More than one shape stamped. Nothing writes a second row, so this is a
       # database in a state this build has no reading for — which is a refusal
       # like any other, not an unhandled case falling out as a CaseClauseError.
       {:ok, [_ | _] = rows} ->
-        raise ShapeError, """
-        this Tightbeam database carries MORE THAN ONE shape stamp.
-
-          stamped: #{rows |> List.flatten() |> Enum.join(", ")}
-          this build: #{@shape}
-
-        Nothing in Tightbeam writes a second stamp, so this database was
-        assembled by something else. Move it aside and let it be recreated.
-        """
+        incompatible_typed_progress!(observed_stamp(rows), ["shape_stamp"])
     end
   end
 
   # A FRESH DATABASE MUST NEVER BE REFUSED, which is why the stamp is written
-  # HERE — before a single table exists — rather than after the modules run.
-  # Stamped last, a bootstrap interrupted between `sessions` and the stamp left
-  # an unstamped database WITH sessions, indistinguishable from a genuinely old
-  # one, and the next boot refused a database this build had just created. The
-  # absence class again: "interrupted fresh bootstrap" and "genuine old
-  # database" sharing one representation.
-  #
-  # Stamping first cannot lose that way. Interrupted after the stamp, the next
-  # boot reads its own shape and carries on creating what is missing, which is
-  # exactly what `CREATE TABLE IF NOT EXISTS` is for.
+  # HERE — before a single table exists — with an explicit in-progress value.
+  # That value is the only state allowed to resume missing schema. The final
+  # successor stamp therefore means its complete inventory exists; missing
+  # inventory under that stamp is corruption and must refuse before creation.
   defp unstamped(db) do
     case DB.query(db, "SELECT name FROM sqlite_master WHERE type='table' AND name='sessions'") do
       {:ok, []} ->
         stamp(db)
 
       {:ok, [_ | _]} ->
-        raise ShapeError, """
-        this Tightbeam database predates the structured model identity (#{@shape}).
-
-        Its `sessions` table carries no shape stamp, so its `model` column holds
-        PACKED identifiers — `claude-fable-5[1m]` meaning a 1M-context model —
-        and `thinkingLevel`/`modelContext` were never written. This build reads
-        those three columns as separate fields, so it would take the whole
-        packed string as the model's family and silently run the wrong model.
-
-        There is no migration and nothing here will repair it. Move the database
-        aside and let it be recreated.
-        """
+        mismatches = ["shape_stamp" | typed_progress_inventory_mismatches(db)]
+        incompatible_typed_progress!("<missing>", mismatches)
     end
   end
 
@@ -1297,9 +1702,9 @@ defmodule Tightbeam.Schema do
       DB.query(
         db,
         "INSERT OR IGNORE INTO schema_stamp (shape, stampedAt) VALUES (?1, ?2)",
-        [@shape, System.system_time(:millisecond)]
+        [@bootstrap_shape, System.system_time(:millisecond)]
       )
 
-    :ok
+    :bootstrapping
   end
 end

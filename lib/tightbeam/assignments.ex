@@ -77,34 +77,98 @@ defmodule Tightbeam.Assignments do
   )
   """
 
-  @attests_ddl """
-  CREATE TABLE IF NOT EXISTS attests (
-    id TEXT PRIMARY KEY,
-    assignmentId TEXT NOT NULL REFERENCES assignments(id),
-    kind TEXT NOT NULL CHECK(kind IN ('progress', 'completion', 'surrender', 'verdict')),
-    verdictKind TEXT NULL,
-    note TEXT NULL CHECK(note IS NULL OR length(trim(note)) BETWEEN 1 AND 2000),
-    bySession TEXT NULL REFERENCES sessions(sessionKey),
-    byUser TEXT NULL REFERENCES users(userId),
-    producer TEXT NULL,
-    producerCommand TEXT NULL,
-    byHarness TEXT NULL,
-    byProvider TEXT NULL,
-    commitRefs TEXT NULL,
-    ts INTEGER NOT NULL,
-    CHECK(
-      (kind IN ('progress', 'completion', 'surrender') AND bySession IS NOT NULL AND
-       byUser IS NULL AND verdictKind IS NULL)
-      OR
-      (kind = 'verdict' AND verdictKind IS NOT NULL AND
-       ((bySession IS NOT NULL) != (byUser IS NOT NULL)))
-    ),
-    CHECK(producer IS NULL OR kind = 'verdict'),
-    CHECK(producerCommand IS NULL OR producer IS NOT NULL),
-    CHECK(byHarness IS NULL OR kind = 'verdict'),
-    CHECK(byProvider IS NULL OR kind = 'verdict')
-  )
-  """
+  @doc false
+  def attests_table_ddl(table \\ "attests", if_not_exists \\ true)
+
+  def attests_table_ddl(table, if_not_exists)
+      when table in ["attests", "attests_typed_progress_v1"] and is_boolean(if_not_exists) do
+    create = if if_not_exists, do: "CREATE TABLE IF NOT EXISTS", else: "CREATE TABLE"
+
+    """
+    #{create} #{table} (
+      id TEXT PRIMARY KEY,
+      assignmentId TEXT NOT NULL REFERENCES assignments(id),
+      kind TEXT NOT NULL CHECK(kind IN ('progress', 'acknowledgment', 'completion', 'surrender', 'verdict')),
+      verdictKind TEXT NULL,
+      note TEXT NULL CHECK(note IS NULL OR length(trim(note)) BETWEEN 1 AND 2000),
+      bySession TEXT NULL REFERENCES sessions(sessionKey),
+      byUser TEXT NULL REFERENCES users(userId),
+      producer TEXT NULL,
+      producerCommand TEXT NULL,
+      byHarness TEXT NULL,
+      byProvider TEXT NULL,
+      commitRefs TEXT NULL,
+      effectKind TEXT NULL CHECK(effectKind IS NULL OR effectKind IN (#{@effect_kind_sql})),
+      ts INTEGER NOT NULL,
+      CHECK(
+        (kind = 'progress' AND bySession IS NOT NULL AND byUser IS NULL AND
+         verdictKind IS NULL)
+        OR
+        (kind = 'acknowledgment' AND bySession IS NOT NULL AND byUser IS NULL AND
+         verdictKind IS NULL AND effectKind IS NULL AND note IS NOT NULL)
+        OR
+        (kind IN ('completion', 'surrender') AND bySession IS NOT NULL AND
+         byUser IS NULL AND verdictKind IS NULL AND effectKind IS NULL)
+        OR
+        (kind = 'verdict' AND verdictKind IS NOT NULL AND
+         ((bySession IS NOT NULL) != (byUser IS NOT NULL)) AND effectKind IS NULL)
+      ),
+      CHECK(producer IS NULL OR kind = 'verdict'),
+      CHECK(producerCommand IS NULL OR producer IS NOT NULL),
+      CHECK(byHarness IS NULL OR kind = 'verdict'),
+      CHECK(byProvider IS NULL OR kind = 'verdict')
+    )
+    """
+  end
+
+  @doc false
+  def typed_progress_trigger_ddls(table \\ "attests") when table == "attests" do
+    resolved =
+      "COALESCE((SELECT effectKind FROM assignment_effects WHERE assignmentId = NEW.assignmentId), " <>
+        "(SELECT CASE WHEN reviewsAssignmentId IS NULL THEN 'code' ELSE 'review' END " <>
+        "FROM assignments WHERE id = NEW.assignmentId))"
+
+    [
+      {"attests_typed_progress_nonnull_insert",
+       """
+       CREATE TRIGGER IF NOT EXISTS attests_typed_progress_nonnull_insert
+       BEFORE INSERT ON #{table}
+       WHEN NEW.kind = 'progress' AND NEW.effectKind IS NULL
+       BEGIN
+         SELECT RAISE(ABORT, 'typed progress effectKind is required');
+       END
+       """},
+      {"attests_typed_progress_match_insert",
+       """
+       CREATE TRIGGER IF NOT EXISTS attests_typed_progress_match_insert
+       BEFORE INSERT ON #{table}
+       WHEN NEW.kind = 'progress' AND NEW.effectKind IS NOT NULL
+         AND NEW.effectKind IS NOT #{resolved}
+       BEGIN
+         SELECT RAISE(ABORT, 'typed progress effectKind mismatch');
+       END
+       """},
+      {"attests_typed_progress_nonnull_update",
+       """
+       CREATE TRIGGER IF NOT EXISTS attests_typed_progress_nonnull_update
+       BEFORE UPDATE OF kind, assignmentId, effectKind ON #{table}
+       WHEN NEW.kind = 'progress' AND NEW.effectKind IS NULL
+       BEGIN
+         SELECT RAISE(ABORT, 'typed progress effectKind is required');
+       END
+       """},
+      {"attests_typed_progress_match_update",
+       """
+       CREATE TRIGGER IF NOT EXISTS attests_typed_progress_match_update
+       BEFORE UPDATE OF kind, assignmentId, effectKind ON #{table}
+       WHEN NEW.kind = 'progress' AND NEW.effectKind IS NOT NULL
+         AND NEW.effectKind IS NOT #{resolved}
+       BEGIN
+         SELECT RAISE(ABORT, 'typed progress effectKind mismatch');
+       END
+       """}
+    ]
+  end
 
   @assignment_files_ddl """
   CREATE TABLE IF NOT EXISTS assignment_files (
@@ -164,9 +228,10 @@ defmodule Tightbeam.Assignments do
     # The circular terminal reference requires creating assignments first;
     # SQLite permits the referenced table to arrive in the following DDL.
     :ok = DB.execute(db, @assignments_ddl)
-    :ok = DB.execute(db, @attests_ddl)
+    :ok = DB.execute(db, attests_table_ddl())
     :ok = DB.execute(db, @assignment_files_ddl)
     :ok = DB.execute(db, @assignment_effects_ddl)
+    Enum.each(typed_progress_trigger_ddls(), fn {_name, ddl} -> :ok = DB.execute(db, ddl) end)
     :ok = DB.execute(db, @interruptions_ddl)
     :ok = DB.execute(db, @reopenings_ddl)
     Tightbeam.EffortCheckin.ensure_schema(db)
@@ -488,7 +553,7 @@ defmodule Tightbeam.Assignments do
     {:ok, rows} =
       DB.query(
         db,
-        "SELECT id, assignmentId, kind, verdictKind, note, bySession, byUser, producer, producerCommand, byHarness, byProvider, commitRefs, ts FROM attests WHERE assignmentId = ?1#{range_sql} ORDER BY ts ASC, id ASC#{limit_sql}",
+        "SELECT id, assignmentId, kind, verdictKind, note, bySession, byUser, producer, producerCommand, byHarness, byProvider, commitRefs, effectKind, ts FROM attests WHERE assignmentId = ?1#{range_sql} ORDER BY ts ASC, id ASC#{limit_sql}",
         [assignment_id | range_params] ++ limit_params
       )
 
@@ -1782,18 +1847,44 @@ defmodule Tightbeam.Assignments do
 
           true ->
             with :ok <- valid_kind(call.params[:kind]),
-                 :ok <- valid_note(call.params[:note]),
+                 :ok <- valid_lifecycle_note(call.params[:kind], call.params[:note]),
+                 :ok <- valid_effect_kind(call.params[:effect_kind]),
+                 :ok <- valid_effect_kind_scope(call.params[:kind], call.params[:effect_kind]),
+                 {:ok, effect_kind} <-
+                   resolved_attest_effect_kind(
+                     call.params[:kind],
+                     call.params[:effect_kind],
+                     assignment.effectKind
+                   ),
                  :ok <- absent_verdict_kind(call.params[:verdict_kind]) do
               if Txn.q(txn, "SELECT 1 FROM assignments WHERE id = ?1 AND state = 'open'", [
                    assignment_id
                  ]) != [[1]],
                  do: raise(TransitionRace)
 
-              attest = insert_attest(txn, call, assignment_id)
+              resolved_call = put_in(call, [:params, :effect_kind], effect_kind)
+              attest = insert_attest(txn, resolved_call, assignment_id)
 
-              if call.params.kind == "progress" do
+              if call.params.kind in ["progress", "acknowledgment"] do
                 append_attest_marker(txn, attest)
-                %{assignment: assignment, attest: attest}
+
+                result = %{assignment: assignment, attest: attest}
+
+                case call.params.kind do
+                  "progress" ->
+                    Map.put(
+                      result,
+                      :message,
+                      "progress asserts forward motion on this assignment's deliverable for effectKind=#{effect_kind}"
+                    )
+
+                  "acknowledgment" ->
+                    Map.put(
+                      result,
+                      :message,
+                      "acknowledgment records a ruling receipt or coordination traffic and does not count as effect"
+                    )
+                end
               else
                 outcome =
                   if call.params.kind == "completion", do: "completed", else: "surrendered"
@@ -1860,7 +1951,9 @@ defmodule Tightbeam.Assignments do
 
           true ->
             with :ok <- valid_verdict_kind(call.params[:verdict_kind]),
-                 :ok <- valid_note(call.params[:note]) do
+                 :ok <- valid_note(call.params[:note]),
+                 :ok <- valid_effect_kind(call.params[:effect_kind]),
+                 :ok <- valid_effect_kind_scope("verdict", call.params[:effect_kind]) do
               if Txn.q(txn, "SELECT 1 FROM assignments WHERE id = ?1 AND state = 'open'", [
                    assignment_id
                  ]) != [[1]],
@@ -1947,6 +2040,9 @@ defmodule Tightbeam.Assignments do
         "surrender" ->
           "[surrendered #{attest.assignmentId} — needs user input]"
 
+        "acknowledgment" ->
+          "[acknowledgment filed on #{attest.assignmentId}]"
+
         "progress" ->
           "[progress filed on #{attest.assignmentId}]"
       end
@@ -2009,7 +2105,8 @@ defmodule Tightbeam.Assignments do
       producer_command: nil,
       by_harness: by_harness,
       by_provider: by_provider,
-      commit_refs: call.params[:commit_refs]
+      commit_refs: call.params[:commit_refs],
+      effect_kind: call.params[:effect_kind]
     })
   end
 
@@ -2022,8 +2119,8 @@ defmodule Tightbeam.Assignments do
       """
       INSERT INTO attests
         (id, assignmentId, kind, verdictKind, note, bySession, byUser, producer,
-         producerCommand, byHarness, byProvider, commitRefs, ts)
-      SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13
+         producerCommand, byHarness, byProvider, commitRefs, effectKind, ts)
+      SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14
       WHERE EXISTS (SELECT 1 FROM assignments WHERE id = ?2 AND state = 'open')
       """,
       [
@@ -2039,6 +2136,7 @@ defmodule Tightbeam.Assignments do
         attrs.by_harness,
         attrs.by_provider,
         attrs[:commit_refs] && JSON.encode!(attrs.commit_refs),
+        attrs[:effect_kind],
         ts
       ]
     )
@@ -2058,6 +2156,7 @@ defmodule Tightbeam.Assignments do
       attrs.by_harness,
       attrs.by_provider,
       attrs[:commit_refs] && JSON.encode!(attrs.commit_refs),
+      attrs[:effect_kind],
       ts
     ])
   end
@@ -2194,6 +2293,31 @@ defmodule Tightbeam.Assignments do
   end
 
   defp valid_note(_), do: error("invalid_note", "note must be text")
+
+  defp valid_lifecycle_note("acknowledgment", nil),
+    do: error("invalid_note", "note must be 1..2000 non-blank characters")
+
+  defp valid_lifecycle_note(_kind, note), do: valid_note(note)
+
+  defp valid_effect_kind_scope("progress", _effect_kind), do: :ok
+  defp valid_effect_kind_scope(_kind, nil), do: :ok
+
+  defp valid_effect_kind_scope(_kind, _effect_kind),
+    do: error("invalid_effect_kind_scope", "effectKind is only valid when kind is progress")
+
+  defp resolved_attest_effect_kind("progress", nil, assignment_effect_kind),
+    do: {:ok, assignment_effect_kind}
+
+  defp resolved_attest_effect_kind("progress", effect_kind, effect_kind), do: {:ok, effect_kind}
+
+  defp resolved_attest_effect_kind("progress", supplied, expected),
+    do:
+      error(
+        "effect_kind_mismatch",
+        "progress effectKind #{supplied} does not match assignment effectKind #{expected}"
+      )
+
+  defp resolved_attest_effect_kind(_kind, nil, _assignment_effect_kind), do: {:ok, nil}
 
   defp valid_commit_refs(_db, _kind, nil), do: :ok
 
@@ -2376,8 +2500,15 @@ defmodule Tightbeam.Assignments do
 
   defp shell_quote(value), do: "'" <> String.replace(value, "'", "'\\''") <> "'"
 
-  defp valid_kind(kind) when kind in ["progress", "completion", "surrender"], do: :ok
-  defp valid_kind(_), do: error("invalid_kind", "kind must be progress, completion, or surrender")
+  defp valid_kind(kind) when kind in ["progress", "acknowledgment", "completion", "surrender"],
+    do: :ok
+
+  defp valid_kind(_),
+    do:
+      error(
+        "invalid_kind",
+        "kind must be progress, acknowledgment, completion, or surrender"
+      )
 
   defp absent_verdict_kind(nil), do: :ok
 
@@ -2466,7 +2597,6 @@ defmodule Tightbeam.Assignments do
   defp supervision_transition!(txn, expected, observation) do
     case Supervision.transition_in_txn(txn, observation) do
       ^expected -> expected
-      {:error, reason} -> raise "supervision transition refused: #{inspect(reason)}"
       other -> raise "invalid supervision transition result: #{inspect(other)}"
     end
   end
@@ -2622,6 +2752,7 @@ defmodule Tightbeam.Assignments do
          by_harness,
          by_provider,
          commit_refs,
+         effect_kind,
          ts
        ]) do
     %{
@@ -2637,6 +2768,7 @@ defmodule Tightbeam.Assignments do
       byHarness: by_harness,
       byProvider: by_provider,
       commitRefs: commit_refs && JSON.decode!(commit_refs),
+      effectKind: effect_kind,
       ts: ts
     }
   end

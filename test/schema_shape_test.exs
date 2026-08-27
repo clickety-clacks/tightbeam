@@ -32,9 +32,9 @@ end
 defmodule Tightbeam.SchemaShapeTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Model, Org, Projection, Schema}
+  alias Tightbeam.{Assignments, DB, Model, Org, Projection, Schema}
 
-  @shape "coordination-fabric-v1-phase1-v7"
+  @shape "coordination-fabric-v1-phase1-v8-typed-progress-attests"
 
   setup do
     name = :"schema_shape_#{System.unique_integer([:positive])}"
@@ -45,13 +45,13 @@ defmodule Tightbeam.SchemaShapeTest do
   test "a fresh database is created and stamped", %{db: db} do
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v7"]]} =
+    assert {:ok, [[@shape]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     # Idempotent: booting twice is the ordinary case, not a shape change.
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v7"]]} =
+    assert {:ok, [[@shape]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
   end
 
@@ -91,6 +91,7 @@ defmodule Tightbeam.SchemaShapeTest do
       })
 
     :ok = DB.execute(db, "ALTER TABLE messages DROP COLUMN messageType")
+    :ok = downgrade_typed_progress_attests(db)
 
     {:ok, _} =
       DB.query(
@@ -101,13 +102,298 @@ defmodule Tightbeam.SchemaShapeTest do
     assert :ok = Schema.ensure_all(db)
     assert "messageType" in table_columns(db, "messages")
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v7"]]} =
+    assert {:ok, [[@shape]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     restored = Projection.get(db, historical.id)
     assert restored.message_type == nil
     assert restored.role == historical.role
     assert restored.content == historical.content
+  end
+
+  test "typed-progress predecessor migration preserves explicit rowids and historical rows", %{
+    db: db
+  } do
+    assert :ok = Schema.ensure_all(db)
+
+    {:appended, classified_message} =
+      Projection.append(db, %{
+        session_key: "historical",
+        role: "assistant",
+        sender: "tightbeam",
+        message_type: "marker",
+        content: "classified before typed progress"
+      })
+
+    {:appended, null_message} =
+      Projection.append(db, %{
+        session_key: "historical",
+        role: "assistant",
+        content: "null before typed progress"
+      })
+
+    assert {:ok, before_messages} =
+             DB.query(
+               db,
+               "SELECT rowid,id,sessionKey,role,content,messageType FROM messages ORDER BY rowid"
+             )
+
+    assert {:paired, _device} =
+             claim_org(db, %{
+               device_id: "typed-progress-device",
+               claimed_name: "Flynn",
+               platform: nil,
+               model: nil
+             })
+
+    main_key = Org.personal_session_key("flynn")
+
+    assert {:ok, []} =
+             DB.query(
+               db,
+               """
+               INSERT INTO assignments
+                 (id,holderKey,holderRole,holderFallback,subject,openedAt,openedBySession,state)
+               VALUES ('typed-history',?1,NULL,0,'typed history',1,?1,'open')
+               """,
+               [main_key]
+             )
+
+    assert {:ok, []} =
+             DB.query(
+               db,
+               """
+               INSERT INTO attests
+                 (rowid,id,assignmentId,kind,bySession,effectKind,ts)
+               VALUES (41,'historical-progress','typed-history','progress',?1,'code',2)
+               """,
+               [main_key]
+             )
+
+    assert {:ok, []} =
+             DB.query(
+               db,
+               """
+               INSERT INTO attests
+                 (rowid,id,assignmentId,kind,verdictKind,note,bySession,byUser,effectKind,ts)
+               VALUES
+                 (42,'historical-completion','typed-history','completion',NULL,'done',?1,NULL,NULL,3),
+                 (43,'historical-surrender','typed-history','surrender',NULL,'blocked',?1,NULL,NULL,4),
+                 (44,'historical-verdict','typed-history','verdict','verified','checked',NULL,'flynn',NULL,5)
+               """,
+               [main_key]
+             )
+
+    assert {:ok, before_rows} =
+             DB.query(
+               db,
+               "SELECT rowid,id,assignmentId,kind,verdictKind,note,bySession,byUser,ts FROM attests ORDER BY rowid"
+             )
+
+    downgrade_to_typed_progress_predecessor(db)
+
+    assert {:ok, ^before_rows} =
+             DB.query(
+               db,
+               "SELECT rowid,id,assignmentId,kind,verdictKind,note,bySession,byUser,ts FROM attests ORDER BY rowid"
+             )
+
+    assert {:ok, ^before_messages} =
+             DB.query(
+               db,
+               "SELECT rowid,id,sessionKey,role,content,messageType FROM messages ORDER BY rowid"
+             )
+
+    assert Projection.get(db, classified_message.id).message_type == "marker"
+    assert Projection.get(db, null_message.id).message_type == nil
+
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:ok, [[@shape]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok, ^before_rows} =
+             DB.query(
+               db,
+               "SELECT rowid,id,assignmentId,kind,verdictKind,note,bySession,byUser,ts FROM attests ORDER BY rowid"
+             )
+
+    assert {:ok,
+            [
+              [41, "historical-progress", "progress", nil],
+              [42, "historical-completion", "completion", nil],
+              [43, "historical-surrender", "surrender", nil],
+              [44, "historical-verdict", "verdict", nil]
+            ]} = DB.query(db, "SELECT rowid,id,kind,effectKind FROM attests ORDER BY rowid")
+
+    assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
+
+    assert {:error, %DB.Error{message: "typed progress effectKind is required"}} =
+             DB.query(
+               db,
+               """
+               INSERT INTO attests (id,assignmentId,kind,bySession,effectKind,ts)
+               VALUES ('untyped-new','typed-history','progress',?1,NULL,3)
+               """,
+               [main_key]
+             )
+  end
+
+  test "typed-progress migration interruptions roll back at both owned boundaries", %{db: db} do
+    for fail_at <- [:after_copy, :after_replace] do
+      assert :ok = Schema.ensure_all(db)
+      downgrade_to_typed_progress_predecessor(db)
+
+      error =
+        assert_raise Schema.ShapeError, fn ->
+          Schema.upgrade_typed_progress_attests_v1(db, fail_at: fail_at)
+        end
+
+      assert error.message =~ "forced typed-progress migration interruption at #{fail_at}"
+
+      assert {:ok, [["coordination-fabric-v1-phase1-v7"]]} =
+               DB.query(db, "SELECT shape FROM schema_stamp")
+
+      refute "effectKind" in table_columns(db, "attests")
+      refute table?(db, "attests_typed_progress_v1")
+
+      assert :ok = Schema.ensure_all(db)
+
+      if fail_at == :after_copy do
+        downgrade_to_typed_progress_predecessor(db)
+      end
+    end
+  end
+
+  test "A11 successor inventory refuses each missing trigger and does not repair", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    for {name, ddl} <- Assignments.typed_progress_trigger_ddls() do
+      :ok = DB.execute(db, "DROP TRIGGER #{name}")
+
+      error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
+
+      assert error.message ==
+               "database shape #{@shape} is incompatible with typed-progress-attests-v1: #{name}"
+
+      refute trigger?(db, name)
+      :ok = DB.execute(db, ddl)
+      assert :ok = Schema.ensure_all(db)
+    end
+  end
+
+  test "A11 bootstrap finalization rollback and malformed present object are restart-safe", %{
+    db: db
+  } do
+    error =
+      assert_raise RuntimeError, fn ->
+        Schema.ensure_all(db, fail_at: :after_inventory)
+      end
+
+    assert error.message ==
+             "forced typed-progress bootstrap interruption at after_inventory"
+
+    assert {:ok, [["coordination-fabric-v1-phase1-v8-typed-progress-attests-bootstrapping"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert :ok = Schema.ensure_all(db)
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+
+    malformed = :"schema_bootstrap_malformed_#{System.unique_integer([:positive])}"
+    start_supervised!({DB, path: ":memory:", name: malformed}, id: malformed)
+
+    :ok =
+      DB.execute(malformed, """
+      CREATE TABLE schema_stamp (shape TEXT PRIMARY KEY, stampedAt INTEGER NOT NULL);
+      INSERT INTO schema_stamp VALUES (
+        'coordination-fabric-v1-phase1-v8-typed-progress-attests-bootstrapping', 1
+      );
+      CREATE TABLE messages (messageType INTEGER);
+      """)
+
+    before = full_database_dump(malformed)
+    malformed_error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(malformed) end
+
+    assert malformed_error.message ==
+             "database shape coordination-fabric-v1-phase1-v8-typed-progress-attests-bootstrapping is incompatible with typed-progress-attests-v1: messages.messageType"
+
+    assert full_database_dump(malformed) == before
+  end
+
+  test "A11 concurrent boot from every supported named shape converges byte-idempotently", %{
+    db: _db
+  } do
+    for state <- [:v4, :v5, :v6, :v7, :bootstrap, :final] do
+      name = :"schema_concurrent_#{state}_#{System.unique_integer([:positive])}"
+      start_supervised!({DB, path: ":memory:", name: name}, id: name)
+      prepare_named_shape(name, state)
+
+      tasks = for _ <- 1..2, do: Task.async(fn -> Schema.ensure_all(name) end)
+      assert Enum.map(tasks, &Task.await(&1, 60_000)) == [:ok, :ok], "state #{state}"
+      assert {:ok, [[@shape]]} = DB.query(name, "SELECT shape FROM schema_stamp")
+      assert {:ok, []} = DB.query(name, "PRAGMA foreign_key_check")
+
+      converged = full_database_dump(name)
+      assert :ok = Schema.ensure_all(name)
+      assert full_database_dump(name) == converged, "state #{state}"
+    end
+  end
+
+  test "A11 v6 and v7 successor inventory mismatches refuse without mutation", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+    downgrade_to_typed_progress_predecessor(db)
+    :ok = DB.execute(db, "ALTER TABLE messages DROP COLUMN messageType")
+    before_v7 = full_database_dump(db)
+
+    v7_error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
+
+    assert v7_error.message ==
+             "database shape coordination-fabric-v1-phase1-v7 is incompatible with typed-progress-attests-v1: messages.messageType"
+
+    assert full_database_dump(db) == before_v7
+
+    :ok = DB.execute(db, "ALTER TABLE messages ADD COLUMN messageType TEXT")
+    {:ok, _} = DB.query(db, "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v6'")
+    before_v6 = full_database_dump(db)
+
+    v6_error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
+
+    assert v6_error.message ==
+             "database shape coordination-fabric-v1-phase1-v6 is incompatible with typed-progress-attests-v1: messages.messageType"
+
+    assert full_database_dump(db) == before_v6
+  end
+
+  test "A11 successor inventory refuses a missing attests table without mutation", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+    :ok = DB.execute(db, "DROP TABLE attests")
+    before = schema_dump(db)
+
+    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
+
+    assert error.message =~
+             "database shape #{@shape} is incompatible with typed-progress-attests-v1:"
+
+    assert error.message =~ "attests.effectKind"
+    assert schema_dump(db) == before
+  end
+
+  test "predecessor stamp refuses successor objects instead of inferring a downgrade", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:ok, []} =
+             DB.query(
+               db,
+               "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v7'"
+             )
+
+    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
+
+    assert error.message =~
+             "database shape coordination-fabric-v1-phase1-v7 is incompatible with typed-progress-attests-v1:"
+
+    assert error.message =~ "attests.effectKind"
+    assert error.message =~ "attests_typed_progress_nonnull_insert"
   end
 
   test "the shared liveness activation creates one exact additive shape", %{db: db} do
@@ -289,7 +575,7 @@ defmodule Tightbeam.SchemaShapeTest do
     assert {:ok, ^before_rows} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
     assert {:ok, []} = DB.query(db, "SELECT wakeId FROM wake_cancellations")
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v7"]]} =
+    assert {:ok, [[@shape]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
   end
 
@@ -326,7 +612,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v7"]]} =
+    assert {:ok, [[@shape]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert {:ok,
@@ -406,9 +692,10 @@ defmodule Tightbeam.SchemaShapeTest do
 
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
-    assert error.message =~ "predates the structured model identity"
-    assert error.message =~ "claude-fable-5[1m]"
-    assert error.message =~ "no migration"
+    assert error.message =~
+             "database shape <missing> is incompatible with typed-progress-attests-v1:"
+
+    assert error.message =~ "shape_stamp"
 
     # It REFUSED — it did not repair, and it did not leave the row reinterpreted.
     assert {:ok, [["claude-fable-5[1m]"]]} =
@@ -454,7 +741,7 @@ defmodule Tightbeam.SchemaShapeTest do
       DB.query(db, "INSERT INTO schema_stamp (shape, stampedAt) VALUES ('other-shape', 1)")
 
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
-    assert error.message =~ "MORE THAN ONE shape stamp"
+    assert error.message =~ "is incompatible with typed-progress-attests-v1: shape_stamp"
     assert error.message =~ "other-shape"
   end
 
@@ -465,7 +752,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "some-later-shape"
-    assert error.message =~ "coordination-fabric-v1-phase1-v7"
+    assert error.message =~ "is incompatible with typed-progress-attests-v1: shape_stamp"
   end
 
   # Sol xhigh review round 2, finding 2 (wave 1): `classElection`'s CHECK
@@ -527,8 +814,8 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-classes-v1"
-    assert error.message =~ "coordination-fabric-v1-phase1-v7"
-    assert error.message =~ "no migration"
+    assert error.message =~ "is incompatible with typed-progress-attests-v1:"
+    assert error.message =~ "shape_stamp"
 
     # It REFUSED — it did not repair or widen the constraint in place.
     assert {:ok, [[ddl]]} =
@@ -647,8 +934,8 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-v1-phase1"
-    assert error.message =~ "coordination-fabric-v1-phase1-v7"
-    assert error.message =~ "no migration"
+    assert error.message =~ "is incompatible with typed-progress-attests-v1:"
+    assert error.message =~ "shape_stamp"
 
     # It REFUSED — it did not repair or relax the constraint in place.
     assert {:ok, [[ddl]]} =
@@ -718,8 +1005,8 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-classes-v2"
-    assert error.message =~ "coordination-fabric-v1-phase1-v7"
-    assert error.message =~ "no migration"
+    assert error.message =~ "is incompatible with typed-progress-attests-v1:"
+    assert error.message =~ "shape_stamp"
 
     # It REFUSED — the merged build's decision_requests columns were never
     # even attempted against this database.
@@ -831,8 +1118,8 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-v1-phase1-v2"
-    assert error.message =~ "coordination-fabric-v1-phase1-v7"
-    assert error.message =~ "no migration"
+    assert error.message =~ "is incompatible with typed-progress-attests-v1:"
+    assert error.message =~ "shape_stamp"
 
     # It REFUSED — the merged build's wakes class/delivery columns were never
     # even attempted against this database.
@@ -870,8 +1157,8 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-v1-phase1-v3"
-    assert error.message =~ "coordination-fabric-v1-phase1-v7"
-    assert error.message =~ "no migration"
+    assert error.message =~ "is incompatible with typed-progress-attests-v1:"
+    assert error.message =~ "shape_stamp"
 
     assert {:ok, [[ddl]]} =
              DB.query(
@@ -901,6 +1188,7 @@ defmodule Tightbeam.SchemaShapeTest do
   end
 
   defp downgrade_to_previous_shape(db) do
+    downgrade_to_typed_progress_predecessor(db)
     :ok = DB.execute(db, "DROP TRIGGER users_gateway_owned_insert")
     :ok = DB.execute(db, "DROP TABLE cold_start_receipts")
     :ok = DB.execute(db, "ALTER TABLE users DROP COLUMN creationKind")
@@ -916,9 +1204,166 @@ defmodule Tightbeam.SchemaShapeTest do
     :ok
   end
 
+  defp prepare_named_shape(db, :bootstrap) do
+    :ok =
+      DB.execute(db, """
+      CREATE TABLE schema_stamp (shape TEXT PRIMARY KEY, stampedAt INTEGER NOT NULL);
+      INSERT INTO schema_stamp VALUES (
+        'coordination-fabric-v1-phase1-v8-typed-progress-attests-bootstrapping', 1
+      );
+      """)
+  end
+
+  defp prepare_named_shape(db, state) when state in [:v4, :v5, :v6, :v7, :final] do
+    :ok = Schema.ensure_all(db)
+
+    case state do
+      :final ->
+        :ok
+
+      :v7 ->
+        downgrade_to_typed_progress_predecessor(db)
+
+      :v6 ->
+        downgrade_to_typed_progress_predecessor(db)
+        :ok = DB.execute(db, "ALTER TABLE messages DROP COLUMN messageType")
+
+        {:ok, _} =
+          DB.query(db, "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v6'")
+
+        :ok
+
+      :v5 ->
+        downgrade_to_typed_progress_predecessor(db)
+        :ok = DB.execute(db, "ALTER TABLE messages DROP COLUMN messageType")
+        :ok = DB.execute(db, "DROP TRIGGER users_gateway_owned_insert")
+        :ok = DB.execute(db, "DROP TABLE cold_start_receipts")
+        :ok = DB.execute(db, "ALTER TABLE users DROP COLUMN creationKind")
+
+        {:ok, _} =
+          DB.query(db, "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v5'")
+
+        :ok
+
+      :v4 ->
+        downgrade_to_previous_shape(db)
+    end
+  end
+
+  defp downgrade_to_typed_progress_predecessor(db) do
+    downgrade_typed_progress_attests(db)
+
+    assert {:ok, []} =
+             DB.query(
+               db,
+               "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v7', stampedAt=1"
+             )
+
+    :ok
+  end
+
+  defp downgrade_typed_progress_attests(db) do
+    assert {:ok, :ok} =
+             DB.foreign_key_rebuild(db, fn txn ->
+               for name <- [
+                     "attests_typed_progress_nonnull_insert",
+                     "attests_typed_progress_match_insert",
+                     "attests_typed_progress_nonnull_update",
+                     "attests_typed_progress_match_update"
+                   ] do
+                 :ok = DB.Txn.exec(txn, "DROP TRIGGER #{name}")
+               end
+
+               :ok =
+                 DB.Txn.exec(
+                   txn,
+                   """
+                   CREATE TABLE attests_phase1_v6 (
+                     id TEXT PRIMARY KEY,
+                     assignmentId TEXT NOT NULL REFERENCES assignments(id),
+                     kind TEXT NOT NULL CHECK(kind IN ('progress', 'completion', 'surrender', 'verdict')),
+                     verdictKind TEXT NULL,
+                     note TEXT NULL CHECK(note IS NULL OR length(trim(note)) BETWEEN 1 AND 2000),
+                     bySession TEXT NULL REFERENCES sessions(sessionKey),
+                     byUser TEXT NULL REFERENCES users(userId),
+                     producer TEXT NULL,
+                     producerCommand TEXT NULL,
+                     byHarness TEXT NULL,
+                     byProvider TEXT NULL,
+                     commitRefs TEXT NULL,
+                     ts INTEGER NOT NULL,
+                     CHECK(
+                       (kind IN ('progress', 'completion', 'surrender') AND bySession IS NOT NULL AND
+                        byUser IS NULL AND verdictKind IS NULL)
+                       OR
+                       (kind = 'verdict' AND verdictKind IS NOT NULL AND
+                        ((bySession IS NOT NULL) != (byUser IS NOT NULL)))
+                     ),
+                     CHECK(producer IS NULL OR kind = 'verdict'),
+                     CHECK(producerCommand IS NULL OR producer IS NOT NULL),
+                     CHECK(byHarness IS NULL OR kind = 'verdict'),
+                     CHECK(byProvider IS NULL OR kind = 'verdict')
+                   )
+                   """
+                 )
+
+               DB.Txn.q(
+                 txn,
+                 """
+                 INSERT INTO attests_phase1_v6
+                   (rowid,id,assignmentId,kind,verdictKind,note,bySession,byUser,producer,
+                    producerCommand,byHarness,byProvider,commitRefs,ts)
+                 SELECT rowid,id,assignmentId,kind,verdictKind,note,bySession,byUser,producer,
+                        producerCommand,byHarness,byProvider,commitRefs,ts
+                 FROM attests ORDER BY rowid
+                 """
+               )
+
+               :ok = DB.Txn.exec(txn, "DROP TABLE attests")
+               :ok = DB.Txn.exec(txn, "ALTER TABLE attests_phase1_v6 RENAME TO attests")
+               :ok
+             end)
+
+    :ok
+  end
+
   defp table?(db, name) do
     {:ok, rows} =
       DB.query(db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1", [name])
+
+    rows == [[1]]
+  end
+
+  defp schema_dump(db) do
+    {:ok, objects} =
+      DB.query(
+        db,
+        "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name,tbl_name,sql"
+      )
+
+    {:ok, stamp} = DB.query(db, "SELECT shape,stampedAt FROM schema_stamp ORDER BY shape")
+    {objects, stamp}
+  end
+
+  defp full_database_dump(db) do
+    {:ok, tables} =
+      DB.query(
+        db,
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+      )
+
+    rows =
+      Enum.map(tables, fn [table] ->
+        {:ok, values} = DB.query(db, ~s(SELECT * FROM "#{table}"))
+        {table, values}
+      end)
+
+    {schema_dump(db), rows}
+  end
+
+  defp trigger?(db, name) do
+    {:ok, rows} =
+      DB.query(db, "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name=?1", [name])
 
     rows == [[1]]
   end

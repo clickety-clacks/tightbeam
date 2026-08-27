@@ -720,6 +720,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             identity,
             assignment_id,
             kind,
+            effect_kind,
             verdict,
             note,
             commit_refs,
@@ -730,6 +731,9 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             ];
             if let Some(value) = note {
                 params.push(string_field("note", value));
+            }
+            if let Some(value) = effect_kind {
+                params.push(string_field("effectKind", value));
             }
             if let Some(value) = verdict {
                 params.push(string_field("verdictKind", value));
@@ -2430,6 +2434,32 @@ mod tests {
 
     #[test]
     fn builds_byte_exact_attest_bodies() {
+        assert_eq!(
+            body(&[
+                "attest",
+                "asg_1",
+                "--kind",
+                "progress",
+                "--effect-kind",
+                "code",
+                "--as",
+                "builder",
+            ]),
+            r#"{"as":"builder","verb":"attest","params":{"assignmentId":"asg_1","kind":"progress","effectKind":"code"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "attest",
+                "asg_1",
+                "--kind",
+                "acknowledgment",
+                "--note",
+                "ruling received",
+                "--as",
+                "builder",
+            ]),
+            r#"{"as":"builder","verb":"attest","params":{"assignmentId":"asg_1","kind":"acknowledgment","note":"ruling received"}}"#
+        );
         assert_eq!(
             body(&[
                 "attest",

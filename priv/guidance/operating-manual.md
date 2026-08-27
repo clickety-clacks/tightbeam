@@ -207,8 +207,18 @@ yet enforce this, so the discipline is yours: `--role`, every time you open one.
     tightbeam attest <assignmentId> --kind completion --note "fixed; tests green"
     tightbeam attest <assignmentId> --kind surrender  --note "giving the card back unfinished; what remains is written on the work item"
 
+An assignment's `effectKind` classifies its deliverable as `code`, `policy`,
+`release`, `live_mutation`, `evidence`, `review`, or `coordination`. File
+`kind=progress` only for forward motion on that deliverable. Omit
+`--effect-kind` to inherit the assignment value. File
+`kind=acknowledgment` when you elect to preserve a ruling receipt or
+non-effect coordination traffic. If progress has stopped, use
+`kind=acknowledgment` to record the exact blocker or refusal, its evidence,
+and the condition that would clear it. Keep the card and schedule a concrete
+continuation wake. An acknowledgment does not count as assignment effect.
+
 "Blocked" is a state you report and carry; "surrendered" is a state you end in. Never
-use one to say the other. Blocked: file the exact blocker as a progress attest — the
+use one to say the other. Blocked: file the exact blocker as an acknowledgment — the
 failed operation, the evidence, and what decision, access, or external fact would clear it —
 and keep the card with a continuation wake naming when you check back. Ask a specific agent only
 when answering is that agent's normal work; an unanswered question remains your recorded block,
@@ -273,13 +283,17 @@ While you hold an open assignment, leave a valid durable liveness receipt or sch
 continuation wake to yourself before the turn ends. Create a reporting attest or reporting
 wake only for one of these exceptions:
 
-- a new material result or evidence, such as an artifact, test result, frozen commit, or
-  completed bounded investigation;
-- an exact new blocker or refusal, with the failed operation and evidence the owner needs;
-- a bounded decision request that states the choice and why work depends on it;
+- a new material result that moved the assignment deliverable forward. File matching typed
+  progress when you elect an attest. Use the existing artifact or work-item update path when
+  that is the effect channel;
+- an exact new blocker or refusal. File an acknowledgment with the failed operation, the
+  evidence, and the condition that would clear it. Schedule a continuation wake;
+- a bounded decision request that states the choice and why work depends on it. Use the
+  decision-request command and schedule its continuation wake. You may also file an
+  assignment-local acknowledgment, but it earns no effect;
 - one new, unexpired bounded checkpoint that names the next action or condition and its
-  deadline or scheduled continuation — the boundary rule of "Match the wake to what you
-  wait on" applies.
+  deadline or scheduled continuation. Use a continuation wake, not progress. The boundary
+  rule of "Match the wake to what you wait on" applies.
 
 A continuation wake is a liveness receipt, not a status report. Schedule concrete continuation
 work or a named dependency recheck, and state when it resumes. Do not file "still working,"
@@ -290,10 +304,13 @@ If no reporting exception applies, record the one valid bounded checkpoint when 
 schedule a concrete continuation wake. Do not manufacture a generic progress attest.
 Completion and surrender remain truthful terminal receipts.
 
+Do not request an acknowledgment turn for an ordinary directive or `fyi` delivery. An
+elected acknowledgment row does not prove directive compliance.
+
 A turn with neither a receipt nor a scheduled continuation is a stall. The substrate checks in
 on the holder and escalates unanswered check-ins to the session that spawned it. Workdir writes,
-recorded artifacts, assignment attests, and work-item updates remain the mechanical effect
-channels that keep the liveness bracket moving.
+recorded artifacts, matching typed progress attests, and work-item updates remain the
+mechanical effect channels that keep the liveness bracket moving.
 
 ## Work alongside other agents
 Other agents edit at the same time.

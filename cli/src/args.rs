@@ -284,6 +284,7 @@ pub enum Command {
         identity: Identity,
         assignment_id: String,
         kind: String,
+        effect_kind: Option<String>,
         verdict: Option<String>,
         note: Option<String>,
         commit_refs: Option<Vec<serde_json::Value>>,
@@ -683,11 +684,14 @@ COMMANDS:
   repair-assignment <assignmentId> --action tune|restart|rerun|resume|relaunch --key <key>
       Repair a failed or never-launched holder without revoking its work.
       tune also requires --model; rerun requires --outcome not-completed.
-  attest <assignmentId> --kind progress|completion|surrender|verdict
+  attest <assignmentId> --kind progress|acknowledgment|completion|surrender|verdict
+      [--effect-kind code|policy|release|live_mutation|evidence|review|coordination]
       [--commit-refs '[{"repo":"host:/abs/path","commit":"<commit>"}]']
          [--verdict <kind>] [--note "..."]
       File against an assignment. Verdicts on review cards require the review
       holder; producer-card verdicts may be filed by any session or user.
+      kind=progress asserts forward motion on this assignment's deliverable for its effectKind; omit --effect-kind to inherit it.
+      kind=acknowledgment requires --note, records a ruling receipt or coordination traffic, and does not count as effect.
   attests <assignmentId> [--after <attestId>] [--limit <n>]
       List every attest filed against an assignment. Without --limit you get
       all of them: an audit list that shortens itself silently is worse than a
@@ -1919,6 +1923,7 @@ fn parse_with_optional_catalog(
                 identity: identity(flags)?,
                 assignment_id,
                 kind,
+                effect_kind: nonempty(flags, "effect-kind"),
                 verdict,
                 note: nonempty(flags, "note"),
                 commit_refs,
@@ -3646,6 +3651,15 @@ mod tests {
 
     #[test]
     fn restored_command_usage_rules_are_pinned() {
+        let help = render_help(None);
+
+        assert!(help.contains(
+            "kind=progress asserts forward motion on this assignment's deliverable for its effectKind; omit --effect-kind to inherit it."
+        ));
+        assert!(help.contains(
+            "kind=acknowledgment requires --note, records a ruling receipt or coordination traffic, and does not count as effect."
+        ));
+
         assert!(
             parse(strings(&[
                 "work-item-create",

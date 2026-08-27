@@ -1,7 +1,7 @@
 defmodule Tightbeam.Wire.ChangeSocketTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Gateway}
+  alias Tightbeam.{DB, Dispatch, Gateway, Org}
   alias Tightbeam.Firehose.{Hub, Registry}
   alias Tightbeam.Wire.ChangeSocket
 
@@ -73,6 +73,88 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
 
     assert Enum.map(decoded, & &1["subscriptionId"]) |> Enum.sort() == ["all-work", "work"]
     assert Enum.map(decoded, & &1["seq"]) |> Enum.sort() == [1, 2]
+  end
+
+  test "A19 connected authorized typed attests keep canonical identity and connection-local order",
+       ctx do
+    start_supervised!({Hub, name: Hub}, id: :typed_progress_change_hub)
+    main_key = Org.personal_session_key("flynn")
+    handlers = Gateway.handlers(%{db: ctx.db, wake_tick_ms: 1_000})
+
+    assign = %{
+      verb: "assign",
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      session_key: main_key,
+      target_role: nil,
+      role_fallback: false,
+      params: %{subject: "Recover typed progress", effect_kind: "release"}
+    }
+
+    assert {:ok, assignment} = Dispatch.dispatch(ctx.db, handlers, assign)
+
+    {:ok, socket} =
+      ChangeSocket.init(%{db: ctx.db, firehose_hub: Hub, firehose_heartbeat_ms: 60_000})
+
+    {:push, {:text, _auth}, socket} =
+      inbound(%{"type" => "auth", "token" => ctx.device.token}, socket)
+
+    {:push, {:text, ready}, socket} =
+      inbound(
+        %{
+          "type" => "subscribe",
+          "protocolVersion" => 1,
+          "subscriptionId" => "typed",
+          "filters" => %{
+            "classes" => ["attest.filed"]
+          }
+        },
+        socket
+      )
+
+    assert %{"type" => "subscription_ready", "subscriptionId" => "typed"} =
+             JSON.decode!(ready)
+
+    calls = [
+      %{
+        verb: "attest",
+        origin: "agent:#{main_key}",
+        principal: {:session, main_key},
+        session_key: nil,
+        params: %{assignment_id: assignment.id, kind: "progress"}
+      },
+      %{
+        verb: "attest",
+        origin: "agent:#{main_key}",
+        principal: {:session, main_key},
+        session_key: nil,
+        params: %{
+          assignment_id: assignment.id,
+          kind: "acknowledgment",
+          note: "Ruling received"
+        }
+      }
+    ]
+
+    frames =
+      Enum.map(calls, fn call ->
+        assert {:ok, %{attest: mutation}} = Dispatch.dispatch(ctx.db, handlers, call)
+        assert_receive {:firehose_notice, frame}
+
+        assert {:push, {:text, bytes}, ^socket} =
+                 ChangeSocket.handle_info({:firehose_notice, frame}, socket)
+
+        notice = JSON.decode!(bytes)
+        assert notice["refs"]["attestId"] == mutation.id
+        assert notice["refs"]["assignmentId"] == assignment.id
+        assert notice["payload"]["id"] == mutation.id
+        assert notice["payload"]["kind"] == mutation.kind
+        assert notice["payload"]["effectKind"] == mutation.effectKind
+        {mutation, notice}
+      end)
+
+    assert Enum.map(frames, fn {_mutation, notice} -> notice["seq"] end) == [1, 2]
+    assert Enum.map(frames, fn {mutation, _notice} -> mutation.effectKind end) == ["release", nil]
   end
 
   test "the 101st subscription is a typed invalid_request", ctx do

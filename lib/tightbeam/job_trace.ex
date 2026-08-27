@@ -172,14 +172,14 @@ defmodule Tightbeam.JobTrace do
       DB.query(
         db,
         """
-        SELECT id, assignmentId, kind, verdictKind, commitRefs, ts
+        SELECT id, assignmentId, kind, verdictKind, commitRefs, effectKind, ts
         FROM attests
         WHERE assignmentId IN (#{clause})
         """,
         params
       )
 
-    Enum.map(rows, fn [id, assignment_id, kind, verdict, commit_refs, at] ->
+    Enum.map(rows, fn [id, assignment_id, kind, verdict, commit_refs, effect_kind, at] ->
       %{
         at: at,
         type: "attest",
@@ -187,7 +187,8 @@ defmodule Tightbeam.JobTrace do
         assignmentId: assignment_id,
         kind: kind,
         verdict: verdict,
-        commitRefs: decode(commit_refs)
+        commitRefs: decode(commit_refs),
+        effectKind: effect_kind
       }
     end)
   end

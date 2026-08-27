@@ -325,7 +325,7 @@ defmodule Tightbeam.JobTraceTest do
           ~w(assignmentId at context effort harness id jobRef model status type)a
 
         "attest" ->
-          ~w(assignmentId at commitRefs id kind type verdict)a
+          ~w(assignmentId at commitRefs effectKind id kind type verdict)a
 
         "wake_scheduled" ->
           ~w(assignmentId at dueAt id type)a

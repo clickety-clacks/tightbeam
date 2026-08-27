@@ -19,8 +19,10 @@ missing.
    escalation wake from the substrate's patrol means it noticed before you did. On
    every sweep, each active goal is fed or shot — advanced, or retired with a reason;
    nothing sits half-alive.
-2. **Classify the block.** Read the surrender or the last progress attest and decide
-   which kind it is:
+2. **Classify the block.** Read the latest blocker-bearing acknowledgment or terminal
+   surrender and decide which kind it is. For rows filed before typed progress and
+   acknowledgment existed, also accept the last historical progress attest as blocker
+   evidence:
    - **Wrong assumption** — the agent believes something false about the code, the
      spec, or the environment. Correct it with evidence and wake the agent.
    - **Unneeded gate** — the agent waits for permission or input the work does not
