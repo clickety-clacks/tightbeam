@@ -1077,8 +1077,15 @@ defmodule Tightbeam.Schema do
   @spec ensure_supervision_liveness_v1_in_txn(Txn.t(), non_neg_integer(), keyword()) :: :ok
   def ensure_supervision_liveness_v1_in_txn(%Txn{} = txn, activated_at, opts)
       when is_integer(activated_at) and activated_at >= 0 and is_list(opts) do
-    present = Enum.filter(@supervision_liveness_objects, &owned_object_present?(txn, &1))
-    Enum.each(present, &validate_owned_object!(txn, &1))
+    incompatible = &incompatible_supervision_liveness!/1
+
+    present =
+      Enum.filter(
+        @supervision_liveness_objects,
+        &owned_object_present?(txn, &1, incompatible)
+      )
+
+    Enum.each(present, &validate_owned_object!(txn, &1, incompatible))
 
     case length(present) do
       0 ->
@@ -1086,7 +1093,7 @@ defmodule Tightbeam.Schema do
         |> Enum.with_index(1)
         |> Enum.each(fn {object, index} ->
           :ok = Txn.exec(txn, object.sql)
-          validate_owned_object!(txn, object)
+          validate_owned_object!(txn, object, incompatible)
           maybe_interrupt_activation!(opts, index)
         end)
 
@@ -1117,11 +1124,11 @@ defmodule Tightbeam.Schema do
     validate_activation_epoch!(txn)
 
     Enum.each(@supervision_liveness_enforcement_objects, fn object ->
-      if owned_object_present?(txn, object) do
-        validate_owned_object!(txn, object)
+      if owned_object_present?(txn, object, incompatible) do
+        validate_owned_object!(txn, object, incompatible)
       else
         :ok = Txn.exec(txn, object.sql)
-        validate_owned_object!(txn, object)
+        validate_owned_object!(txn, object, incompatible)
       end
     end)
 
@@ -1132,7 +1139,7 @@ defmodule Tightbeam.Schema do
     incompatible_supervision_liveness!("activation epoch must be a nonnegative integer")
   end
 
-  defp owned_object_present?(txn, %{type: type, name: name}) do
+  defp owned_object_present?(txn, %{type: type, name: name}, incompatible) do
     case Txn.q(
            txn,
            "SELECT 1 FROM sqlite_master WHERE type = ?1 AND name = ?2",
@@ -1140,11 +1147,11 @@ defmodule Tightbeam.Schema do
          ) do
       [] -> false
       [[1]] -> true
-      _rows -> incompatible_supervision_liveness!("duplicate owned object #{name}")
+      _rows -> incompatible.("duplicate owned object #{name}")
     end
   end
 
-  defp validate_owned_object!(txn, %{type: type, name: name, sql: expected_sql}) do
+  defp validate_owned_object!(txn, %{type: type, name: name, sql: expected_sql}, incompatible) do
     case Txn.q(
            txn,
            "SELECT sql FROM sqlite_master WHERE type = ?1 AND name = ?2",
@@ -1154,14 +1161,14 @@ defmodule Tightbeam.Schema do
         if normalize_schema_sql(actual_sql) == normalize_schema_sql(expected_sql) do
           :ok
         else
-          incompatible_supervision_liveness!("malformed owned object #{name}")
+          incompatible.("malformed owned object #{name}")
         end
 
       [] ->
-        incompatible_supervision_liveness!("missing owned object #{name}")
+        incompatible.("missing owned object #{name}")
 
       _rows ->
-        incompatible_supervision_liveness!("duplicate owned object #{name}")
+        incompatible.("duplicate owned object #{name}")
     end
   end
 
