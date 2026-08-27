@@ -1082,47 +1082,58 @@ defmodule Tightbeam.Schema do
   end
 
   defp migrate_operator_decision_v1(db) do
-    case DB.transaction(db, fn txn ->
-           :ok =
-             Txn.exec(
+    # The reviewed predecessor census explicitly admits historically impossible
+    # operator rows. SQLite revalidates table CHECK constraints while adding a
+    # column, so suspend CHECK enforcement for this one exclusive activation
+    # transaction. The migration writes no request row and restores enforcement
+    # before the database can serve a call.
+    :ok = DB.execute(db, "PRAGMA ignore_check_constraints = ON")
+
+    try do
+      case DB.transaction(db, fn txn ->
+             :ok =
+               Txn.exec(
+                 txn,
+                 """
+                 ALTER TABLE decision_requests ADD COLUMN ruledViaPrincipal TEXT;
+                 ALTER TABLE decision_requests ADD COLUMN ruledViaSessionState TEXT
+                   CHECK (ruledViaSessionState IS NULL OR ruledViaSessionState IN ('known','none'));
+                 """
+               )
+
+             :ok =
+               Tightbeam.Escalation.ensure_terminal_parity_in_txn(
+                 txn,
+                 System.system_time(:millisecond)
+               )
+
+             Txn.q(
                txn,
-               """
-               ALTER TABLE decision_requests ADD COLUMN ruledViaPrincipal TEXT;
-               ALTER TABLE decision_requests ADD COLUMN ruledViaSessionState TEXT
-                 CHECK (ruledViaSessionState IS NULL OR ruledViaSessionState IN ('known','none'));
-               """
+               "UPDATE schema_stamp SET shape = ?1, stampedAt = ?2 WHERE shape = ?3",
+               [@shape, System.system_time(:millisecond), @operator_decision_shape]
              )
 
-           :ok =
-             Tightbeam.Escalation.ensure_terminal_parity_in_txn(
-               txn,
-               System.system_time(:millisecond)
-             )
+             if Txn.changes(txn) != 1 do
+               raise ShapeError,
+                 message:
+                   "migration #{@operator_decision_shape} -> #{@shape} lost its exact stamp transition"
+             end
 
-           Txn.q(
-             txn,
-             "UPDATE schema_stamp SET shape = ?1, stampedAt = ?2 WHERE shape = ?3",
-             [@shape, System.system_time(:millisecond), @operator_decision_shape]
-           )
+             :ok
+           end) do
+        {:ok, :ok} ->
+          :ok
 
-           if Txn.changes(txn) != 1 do
-             raise ShapeError,
-               message:
-                 "migration #{@operator_decision_shape} -> #{@shape} lost its exact stamp transition"
-           end
+        {:error, %ShapeError{} = error} ->
+          raise error
 
-           :ok
-         end) do
-      {:ok, :ok} ->
-        :ok
-
-      {:error, %ShapeError{} = error} ->
-        raise error
-
-      {:error, error} ->
-        raise ShapeError,
-          message:
-            "migration #{@operator_decision_shape} -> #{@shape} failed and was rolled back: #{Exception.message(error)}"
+        {:error, error} ->
+          raise ShapeError,
+            message:
+              "migration #{@operator_decision_shape} -> #{@shape} failed and was rolled back: #{Exception.message(error)}"
+      end
+    after
+      :ok = DB.execute(db, "PRAGMA ignore_check_constraints = OFF")
     end
   end
 
