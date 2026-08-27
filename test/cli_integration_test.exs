@@ -1337,6 +1337,16 @@ defmodule Tightbeam.CliIntegrationTest do
                "request" => statute_read
              })
 
+    assert {404, absent_read_envelope} =
+             invoke.(ctx.worker.cli_token, session_identity, "decision-request", %{
+               "request" => "dr_matrix_session_absent"
+             })
+
+    assert {404, ^absent_read_envelope} =
+             invoke.(ctx.worker.cli_token, session_identity, "decision-request", %{
+               "request" => statute_read
+             })
+
     answer_id = open_agent_request(ctx)
 
     assert {200, %{"result" => %{"decisionRequest" => %{"answeredBy" => "session:cli-worker"}}}} =
@@ -1361,42 +1371,102 @@ defmodule Tightbeam.CliIntegrationTest do
                "action" => "continue"
              })
 
+    # The bystander session's direct standing remains kind-scoped. Every
+    # wrong-kind hidden row is indistinguishable from an absent id.
+    before_session_refusals = security_counts(ctx.db)
+
+    for {verb, params_for} <- [
+          {"answer", fn request -> %{"request" => request, "answer" => "wrong kind"} end},
+          {"return", fn request -> %{"request" => request, "reason" => "wrong kind"} end}
+        ] do
+      assert {404, absent_envelope} =
+               invoke.(
+                 ctx.worker.cli_token,
+                 session_identity,
+                 verb,
+                 params_for.("dr_matrix_session_absent")
+               )
+
+      for hidden_id <- [effort_read, statute_read] do
+        assert {404, ^absent_envelope} =
+                 invoke.(
+                   ctx.worker.cli_token,
+                   session_identity,
+                   verb,
+                   params_for.(hidden_id)
+                 )
+      end
+    end
+
+    assert {400,
+            %{
+              "error" => %{
+                "code" => "invalid",
+                "message" => "effort-rule requires an effort request"
+              }
+            }} =
+             invoke.(ctx.worker.cli_token, session_identity, "effort-rule", %{
+               "request" => agent_read,
+               "action" => "continue"
+             })
+
+    assert {404, absent_effort_envelope} =
+             invoke.(ctx.worker.cli_token, session_identity, "effort-rule", %{
+               "request" => "dr_matrix_session_absent",
+               "action" => "continue"
+             })
+
+    assert {404, ^absent_effort_envelope} =
+             invoke.(ctx.worker.cli_token, session_identity, "effort-rule", %{
+               "request" => statute_read,
+               "action" => "continue"
+             })
+
+    assert security_counts(ctx.db) == before_session_refusals
+
     # User, process, role-without-session, and unauthenticated callers acquire
     # no standing. Every refused group leaves requests, events, wakes, and
     # monitor generations byte-for-byte at the same counts.
-    for {token, identity, exact_status, effort_status} <- [
-          {"tbc_cli_integration", user_identity, 404, 403},
-          {"tbc_cli_integration", process_identity, 404, 403},
-          {"tbc_cli_integration", role_identity, 404, 403},
-          {"not-a-token", %{}, 401, 401}
+    for {token, identity, authenticated?} <- [
+          {"tbc_cli_integration", user_identity, true},
+          {"tbc_cli_integration", process_identity, true},
+          {"tbc_cli_integration", role_identity, true},
+          {"not-a-token", %{}, false}
         ] do
       agent_id = open_agent_request(ctx)
       effort_id = open_effort_request(ctx, "matrix-refused")
       statute_id = open_statute_request(ctx, "other")
+      absent_id = "dr_matrix_absent_#{System.unique_integer([:positive])}"
       before = security_counts(ctx.db)
 
-      for request_id <- [agent_id, effort_id, statute_id] do
-        assert {^exact_status, _envelope} =
-                 invoke.(token, identity, "decision-request", %{"request" => request_id})
+      targets = %{agent: agent_id, effort: effort_id, statute: statute_id, absent: absent_id}
+
+      for {verb, params_for} <- [
+            {"decision-request", fn request -> %{"request" => request} end},
+            {"answer", fn request -> %{"request" => request, "answer" => "must refuse"} end},
+            {"return", fn request -> %{"request" => request, "reason" => "must refuse"} end},
+            {"effort-rule", fn request -> %{"request" => request, "action" => "continue"} end}
+          ] do
+        absent_result = invoke.(token, identity, verb, params_for.(targets.absent))
+        expected_absent_status = if authenticated?, do: 404, else: 401
+        assert {^expected_absent_status, %{"error" => %{"code" => _}}} = absent_result
+
+        for kind <- [:agent, :effort, :statute] do
+          result = invoke.(token, identity, verb, params_for.(Map.fetch!(targets, kind)))
+
+          if authenticated? and verb == "effort-rule" and kind == :effort do
+            assert {403,
+                    %{
+                      "error" => %{
+                        "code" => "not_authorized",
+                        "message" => "current expecter required"
+                      }
+                    }} = result
+          else
+            assert result == absent_result
+          end
+        end
       end
-
-      assert {^exact_status, _envelope} =
-               invoke.(token, identity, "answer", %{
-                 "request" => agent_id,
-                 "answer" => "must refuse"
-               })
-
-      assert {^exact_status, _envelope} =
-               invoke.(token, identity, "return", %{
-                 "request" => agent_id,
-                 "reason" => "must refuse"
-               })
-
-      assert {^effort_status, _envelope} =
-               invoke.(token, identity, "effort-rule", %{
-                 "request" => effort_id,
-                 "action" => "continue"
-               })
 
       assert security_counts(ctx.db) == before
 

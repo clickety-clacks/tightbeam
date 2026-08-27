@@ -608,6 +608,86 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert Gateway.handler_effects(%{db: db})["return"] == ["decision_request.returned"]
   end
 
+  test "concurrent exact return retries emit one returned state notice" do
+    db = :firehose_concurrent_decision_return_db
+    start_supervised!({DB, path: ":memory:", name: db})
+    :ok = Tightbeam.Schema.ensure_all(db)
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('flynn',1,'admin_add',1)"
+      )
+
+    register_testhost(db)
+
+    Enum.each(["return-race-asker", "return-race-reader"], fn session_key ->
+      Org.create(db, %{
+        session_key: session_key,
+        display_name: session_key,
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Tightbeam.Model.new("fable")
+      })
+    end)
+
+    handlers = Gateway.handlers(%{db: db})
+
+    assert {:ok, %{decision_request: request}} =
+             Dispatch.dispatch(db, handlers, %{
+               verb: "ask",
+               origin: "agent:return-race-asker",
+               principal: {:session, "return-race-asker"},
+               session_key: "return-race-reader",
+               params: %{question: "Which authority applies?"}
+             })
+
+    _ = observed_classes()
+
+    returned = %{
+      verb: "return",
+      origin: "agent:return-race-reader",
+      principal: {:session, "return-race-reader"},
+      session_key: nil,
+      params: %{request: request.id, reason: "The governing authority is absent."}
+    }
+
+    db_pid = Process.whereis(db)
+    :ok = :sys.suspend(db_pid)
+
+    tasks =
+      for _ <- 1..2 do
+        Task.async(fn -> Dispatch.dispatch(db, handlers, returned) end)
+      end
+
+    try do
+      assert :ok = await_mailbox_size(db_pid, 2)
+    after
+      :ok = :sys.resume(db_pid)
+    end
+
+    assert Enum.all?(Task.await_many(tasks, 5_000), fn
+             {:ok, %{decision_request: %{status: "returned"}}} -> true
+             _ -> false
+           end)
+
+    assert Enum.frequencies(observed_classes()) == %{
+             "decision_request.returned" => 1,
+             "verb.accepted" => 2
+           }
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               db,
+               "SELECT count(*) FROM lifecycle_events WHERE kind = 'decision_request_returned' AND subject = ?1",
+               [request.id]
+             )
+  end
+
   test "ledger transitions hand off turn notices only after their commits" do
     db = :firehose_turn_transition_db
     start_supervised!({DB, path: ":memory:", name: db})
@@ -880,6 +960,21 @@ defmodule Tightbeam.Firehose.PublisherTest do
       model: Tightbeam.Model.new("fable")
     })
   end
+
+  defp await_mailbox_size(pid, expected, attempts \\ 200)
+
+  defp await_mailbox_size(pid, expected, attempts) when attempts > 0 do
+    case Process.info(pid, :message_queue_len) do
+      {:message_queue_len, size} when size >= expected ->
+        :ok
+
+      _ ->
+        Process.sleep(1)
+        await_mailbox_size(pid, expected, attempts - 1)
+    end
+  end
+
+  defp await_mailbox_size(_pid, _expected, 0), do: :timeout
 
   defp receive_notice do
     assert_receive {:firehose_notice, notice}

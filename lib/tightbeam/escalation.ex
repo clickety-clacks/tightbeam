@@ -692,7 +692,7 @@ defmodule Tightbeam.Escalation do
 
           if current.status == "returned" and current.returned_by == returned_by and
                current.return_reason == reason do
-            Publisher.maybe_accepted_in_txn(txn, request.firehose_call, current)
+            Publisher.maybe_observed_accepted_in_txn(txn, request.firehose_call)
             current
           else
             error("not_open", "decision request is not open")
