@@ -1711,6 +1711,60 @@ defmodule Tightbeam.CliIntegrationTest do
     assert pairing =~ "supplied together"
   end
 
+  test "real CLI sends body-only work-item updates with explicit and session identities", ctx do
+    {created, 0} =
+      System.cmd(ctx.binary, ["work-item-create", "--title", "Body target"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    work_item_id = JSON.decode!(created)["id"]
+    assert_receive {:cli_call, %{verb: "work-item-create"}}
+
+    replacement = "  Scope\n✓ \"ship\"\n"
+
+    {_updated, 0} =
+      System.cmd(
+        ctx.binary,
+        ["work-item-update", work_item_id, "--body", replacement, "--as-user", "flynn"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "work-item-update",
+                      principal: {:user, "flynn"},
+                      params: %{work_item_id: ^work_item_id, body: ^replacement}
+                    }}
+
+    {_cleared, 0} =
+      System.cmd(ctx.binary, ["work-item-update", work_item_id, "--clear-body"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "work-item-update",
+                      principal: {:session, "cli-holder"},
+                      params: %{work_item_id: ^work_item_id, body: nil}
+                    }}
+
+    {unsupported, 1} =
+      System.cmd(
+        ctx.binary,
+        ["work-item-update", work_item_id, "--spec-ref", "spec.md"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert String.trim(unsupported) ==
+             "usage: tightbeam work-item-update <workItemId> (--body <text> | --body=<text> | --clear-body)"
+
+    refute_receive {:cli_call, %{verb: "work-item-update"}}, 100
+  end
+
   defp open_agent_request(ctx, opts \\ []) do
     request_id = "dr_agent_#{System.unique_integer([:positive])}"
     expecter_session_key = Keyword.get(opts, :expecter_session_key, "cli-holder")

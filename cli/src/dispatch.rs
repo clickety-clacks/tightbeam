@@ -551,6 +551,22 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             }
             Ok(request(identity, "work-item-create", vec![], params))
         }
+        Command::WorkItemUpdate {
+            identity,
+            work_item_id,
+            body,
+        } => Ok(request(
+            identity,
+            "work-item-update",
+            vec![],
+            vec![
+                string_field("workItemId", work_item_id),
+                match body {
+                    Some(value) => string_field("body", value),
+                    None => "\"body\":null".to_owned(),
+                },
+            ],
+        )),
         Command::WorkItemGet {
             identity,
             work_item_id,
@@ -1577,6 +1593,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::ReopenAssignment { identity, .. }
         | Command::RepairAssignment { identity, .. }
         | Command::WorkItemCreate { identity, .. }
+        | Command::WorkItemUpdate { identity, .. }
         | Command::WorkItemGet { identity, .. }
         | Command::WorkItemTrace { identity, .. }
         | Command::Attend { identity, .. }
@@ -2497,6 +2514,43 @@ mod tests {
         assert_eq!(
             body(&["work-item-get", "wi_1", "--as-user", "flynn"]),
             r#"{"asUser":"flynn","verb":"work-item-get","params":{"workItemId":"wi_1"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "work-item-update",
+                "wi_1",
+                "--body",
+                "text",
+                "--as-user",
+                "flynn",
+            ]),
+            r#"{"asUser":"flynn","verb":"work-item-update","params":{"workItemId":"wi_1","body":"text"}}"#
+        );
+        assert_eq!(
+            body(&["work-item-update", "wi_1", "--body", "", "--as", "builder"]),
+            r#"{"as":"builder","verb":"work-item-update","params":{"workItemId":"wi_1","body":""}}"#
+        );
+        assert_eq!(
+            body(&["work-item-update", "wi_1", "--body="]),
+            r#"{"verb":"work-item-update","params":{"workItemId":"wi_1","body":""}}"#
+        );
+        assert_eq!(
+            body(&[
+                "work-item-update",
+                "wi_1",
+                "--body=--clear-body",
+                "--as-process",
+                "cron",
+            ]),
+            r#"{"asProcess":"cron","verb":"work-item-update","params":{"workItemId":"wi_1","body":"--clear-body"}}"#
+        );
+        assert_eq!(
+            body(&["work-item-update", "wi_1", "--body=--body"]),
+            r#"{"verb":"work-item-update","params":{"workItemId":"wi_1","body":"--body"}}"#
+        );
+        assert_eq!(
+            body(&["work-item-update", "wi_1", "--clear-body"]),
+            r#"{"verb":"work-item-update","params":{"workItemId":"wi_1","body":null}}"#
         );
         assert_eq!(
             body(&["work-item-trace", "wi_1", "--as-user", "flynn"]),
