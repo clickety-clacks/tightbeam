@@ -27,6 +27,8 @@ defmodule Tightbeam.CredentialKindsTest do
     db = :"cred_kinds_db_#{System.unique_integer([:positive])}"
     start_supervised!({Tightbeam.DB, path: ":memory:", name: db})
     :ok = Tightbeam.Placement.ensure_schema(db)
+    :ok = Tightbeam.EventLog.ensure_schema(db)
+    :ok = Tightbeam.CredentialRecovery.ensure_schema(db)
     on_exit(fn -> File.rm_rf!(base) end)
     %{base: base, db: db}
   end
