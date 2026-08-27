@@ -2590,7 +2590,10 @@ defmodule Tightbeam.Escalation do
         (is_nil(request.assignment_id) or nonblank?(request.assignment_id)) and
         is_map(request.context)
 
-    owner_valid = request.ruled_by == "user:" <> to_string(request.owner_user_id)
+    owner_valid =
+      nonblank?(request.owner_user_id) and nonblank?(request.raiser_session_key) and
+        request.ruled_by == "user:" <> request.owner_user_id
+
     options_valid = operator_options_valid?(request.options)
     decision_valid = nonblank?(request.decision)
     rationale_valid = is_nil(request.rationale) or nonblank?(request.rationale)

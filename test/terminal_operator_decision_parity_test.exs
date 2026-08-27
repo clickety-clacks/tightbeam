@@ -352,6 +352,44 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
     refute null_digest == blank_digest
   end
 
+  test "owner attribution requires the stored raiser session", ctx do
+    request =
+      Escalation.operator_ask(ctx.db, ask_call(ctx.raiser, %{question: "owner attribution?"}))
+
+    Escalation.operator_rule(
+      ctx.db,
+      rule_call(request.id, %{decision: "accept"}),
+      scheduler: ctx.scheduler
+    )
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        "UPDATE decision_requests SET raiserSessionKey='' WHERE id='#{request.id}'"
+      )
+
+    assert %{code: "decision_request_integrity_invalid"} =
+             Escalation.get(
+               ctx.db,
+               rule_call(request.id, %{decision: "accept"}),
+               request.id,
+               owner_user_id: "flynn"
+             )
+
+    assert {:ok, [[fields]]} =
+             DB.query(
+               ctx.db,
+               "SELECT failingFields FROM decision_request_integrity_evidence WHERE requestId=?1",
+               [request.id]
+             )
+
+    assert JSON.decode!(fields) == [
+             "ownerOnBehalfOf",
+             "raiserNotificationWake",
+             "requestIdentity"
+           ]
+  end
+
   test "future incomplete terminal transition is refused by the database trigger", ctx do
     request = Escalation.operator_ask(ctx.db, ask_call(ctx.raiser, %{question: "trigger?"}))
 
