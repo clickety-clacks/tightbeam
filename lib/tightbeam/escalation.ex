@@ -422,15 +422,15 @@ defmodule Tightbeam.Escalation do
   end
 
   @doc "Open or re-return one owner-scoped operator decision request."
-  @spec operator_ask(DB.server(), map()) :: map()
-  def operator_ask(db, call) do
+  @spec operator_ask(DB.server(), map(), keyword()) :: map()
+  def operator_ask(db, call, opts \\ []) do
     case Map.get(call, :principal) do
       {:session, session_key} ->
         with %{owner_user_id: owner_user_id} <- Org.get(db, session_key),
              {:ok, ask} <- normalize_operator_ask(call) do
           {:ok, result} =
             DB.transaction(db, fn txn ->
-              operator_ask_in_txn(txn, call, session_key, owner_user_id, ask)
+              operator_ask_in_txn(txn, call, session_key, owner_user_id, ask, opts)
             end)
 
           result
@@ -450,7 +450,9 @@ defmodule Tightbeam.Escalation do
     request_id = param(call, :request_id) || param(call, :request)
 
     with {:ok, answer} <- normalize_operator_answer(call) do
-      case DB.transaction(db, fn txn -> operator_rule_in_txn(txn, call, request_id, answer) end) do
+      case DB.transaction(db, fn txn ->
+             operator_rule_in_txn(txn, call, request_id, answer, opts)
+           end) do
         {:ok, {result, fact_id}} ->
           if is_integer(fact_id) and Keyword.has_key?(opts, :scheduler) do
             Wakes.fire_matching(Keyword.fetch!(opts, :scheduler), fact_id)
@@ -467,14 +469,16 @@ defmodule Tightbeam.Escalation do
   end
 
   @doc "Withdraw one operator request as its owner or same-owner raiser."
-  @spec operator_withdraw(DB.server(), map()) :: map()
-  def operator_withdraw(db, call) do
+  @spec operator_withdraw(DB.server(), map(), keyword()) :: map()
+  def operator_withdraw(db, call, opts \\ []) do
     request_id = param(call, :request_id) || param(call, :request)
 
     with {:ok, reason} <-
            normalized_required(param(call, :reason), "withdrawal reason is required") do
       {:ok, result} =
-        DB.transaction(db, fn txn -> operator_withdraw_in_txn(txn, call, request_id, reason) end)
+        DB.transaction(db, fn txn ->
+          operator_withdraw_in_txn(txn, call, request_id, reason, opts)
+        end)
 
       result
     else
@@ -941,7 +945,7 @@ defmodule Tightbeam.Escalation do
     :crypto.hash(:sha256, canonical_json(canonical)) |> Base.encode16(case: :lower)
   end
 
-  defp operator_ask_in_txn(txn, call, session_key, owner_user_id, ask) do
+  defp operator_ask_in_txn(txn, call, session_key, owner_user_id, ask, opts) do
     raiser_id = Map.fetch!(call, :origin)
     action_key = operator_action_key(ask)
 
@@ -956,7 +960,8 @@ defmodule Tightbeam.Escalation do
             owner_user_id,
             raiser_id,
             action_key,
-            ask
+            ask,
+            opts
           )
         else
           reason -> reason
@@ -973,13 +978,16 @@ defmodule Tightbeam.Escalation do
          owner_user_id,
          raiser_id,
          action_key,
-         ask
+         ask,
+         opts
        ) do
     request_id = "dr_" <> Tightbeam.Id.uuid4()
     raised_at = now()
     deadline_at = raised_at + ask.deadline_ms
 
     if ask.supersedes do
+      terminal_test_step(opts, :before_terminal_cas)
+
       Txn.q(
         txn,
         "UPDATE decision_requests SET status = 'superseded' WHERE id = ?1 AND kind = 'operator' AND status = 'open'",
@@ -1045,7 +1053,7 @@ defmodule Tightbeam.Escalation do
     request
   end
 
-  defp operator_rule_in_txn(txn, call, request_id, answer) do
+  defp operator_rule_in_txn(txn, call, request_id, answer, opts) do
     case request_in_txn_optional(txn, request_id) do
       nil ->
         {error("not_found", "decision request not found"), nil}
@@ -1059,14 +1067,14 @@ defmodule Tightbeam.Escalation do
       request ->
         with :ok <- operator_owner_authorized(call, request),
              {:ok, decision} <- operator_decision(request, answer) do
-          rule_operator_request_in_txn(txn, call, request, decision, answer)
+          rule_operator_request_in_txn(txn, call, request, decision, answer, opts)
         else
           {:error, reason} -> {reason, nil}
         end
     end
   end
 
-  defp rule_operator_request_in_txn(txn, call, request, decision, answer) do
+  defp rule_operator_request_in_txn(txn, call, request, decision, answer, opts) do
     ruled_by = "user:" <> request.owner_user_id
     via = Map.get(call, :transport_session_key)
     via_principal = principal_id(Map.fetch!(call, :principal))
@@ -1093,6 +1101,8 @@ defmodule Tightbeam.Escalation do
         {error("not_open", "decision request is not open"), nil}
 
       true ->
+        terminal_test_step(opts, :after_load)
+        terminal_test_step(opts, :before_terminal_cas)
         ruled_at = now()
 
         Wakes.schedule_in_txn(txn, %{
@@ -1106,12 +1116,16 @@ defmodule Tightbeam.Escalation do
           condition_scope: request.id
         })
 
+        terminal_test_step(opts, :after_schedule)
+
         %{fact_id: fact_id} =
           ConditionFacts.file_in_txn(txn, %{
             kind: @terminal_condition_kind,
             scope: request.id,
             origin: "process:tightbeam"
           })
+
+        terminal_test_step(opts, :after_fact)
 
         Txn.q(
           txn,
@@ -1132,6 +1146,8 @@ defmodule Tightbeam.Escalation do
         if Txn.changes(txn) != 1,
           do: raise(DB.Error, message: "operator ruling lost its open-row CAS")
 
+        terminal_test_step(opts, :after_cas)
+
         EventLog.lifecycle_in_txn(
           txn,
           "decision_request_ruled",
@@ -1139,16 +1155,22 @@ defmodule Tightbeam.Escalation do
           "by=#{ruled_by} decision=#{decision} factId=#{fact_id} mode=#{answer.mode} via=#{via || "direct"}"
         )
 
+        terminal_test_step(opts, :after_event)
+
         ruled = request_in_txn(txn, request.id)
 
         case validate_terminal_request_in_txn(txn, ruled) do
-          %{failures: []} -> {terminal_projection(ruled), fact_id}
-          %{failures: failures} -> raise DB.Error, message: Enum.join(failures, ",")
+          %{failures: []} ->
+            terminal_test_step(opts, :after_validate)
+            {terminal_projection(ruled), fact_id}
+
+          %{failures: failures} ->
+            raise DB.Error, message: Enum.join(failures, ",")
         end
     end
   end
 
-  defp operator_withdraw_in_txn(txn, call, request_id, reason) do
+  defp operator_withdraw_in_txn(txn, call, request_id, reason, opts) do
     case request_in_txn_optional(txn, request_id) do
       nil ->
         error("not_found", "decision request not found")
@@ -1170,6 +1192,8 @@ defmodule Tightbeam.Escalation do
               error("not_open", "decision request is not open")
 
             true ->
+              terminal_test_step(opts, :before_terminal_cas)
+
               Txn.q(
                 txn,
                 "UPDATE decision_requests SET status = 'withdrawn', withdrawnBy = ?2, withdrawnReason = ?3, withdrawnAt = ?4 WHERE id = ?1 AND kind = 'operator' AND status = 'open'",
@@ -2259,6 +2283,13 @@ defmodule Tightbeam.Escalation do
   defp canonical_request_id?(_id), do: false
   defp non_blank?(value), do: is_binary(value) and String.trim(value) != ""
   defp normalized_text?(value), do: non_blank?(value) and String.trim(value) == value
+
+  defp terminal_test_step(opts, step) do
+    case Keyword.get(opts, :transaction_step_hook) do
+      hook when is_function(hook, 1) -> hook.(step)
+      nil -> :ok
+    end
+  end
 
   defp canonical_principal?("user:" <> suffix), do: non_blank?(suffix)
   defp canonical_principal?("session:" <> suffix), do: non_blank?(suffix)
