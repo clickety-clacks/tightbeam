@@ -26,3 +26,18 @@ The compatibility test consumes the stored body bytes. It checks that every
 body is canonical JSON, that the three nonterminal detail shapes retain the
 complete predecessor key set, and that the candidate changes only the reviewed
 terminal, visibility, and integrity behavior.
+
+## A-27a target-conditional proof
+
+The `a27a-019` directory contains the reviewed REST-absent proof arm. Its
+manifest binds the exact active 0.1.9 predecessor and candidate runtime commits,
+the reviewed F4 specification hash, both real release CLI identities, the exact
+route-inventory command and output, and the real gateway invocation path.
+
+The capture harness creates isolated lifecycle fixtures through real gateway
+verbs. It stores raw predecessor and candidate gateway bodies and separate CLI
+stdout, stderr, exit status, and observed wire requests. The candidate capture
+proves local parser rejection, terminal list/detail parity, privacy-preserving
+not-found behavior, and fail-closed impossible-shape handling. The predecessor
+capture records the behavior before those reviewed repairs. Neither arm reads or
+changes live Tightbeam state.
