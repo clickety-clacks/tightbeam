@@ -179,6 +179,10 @@ pub enum Command {
         identity: Identity,
         status: Option<String>,
     },
+    DecisionRequest {
+        identity: Identity,
+        request_id: String,
+    },
     /// File one question at a named principal (coordination-fabric-v1 §7
     /// `input-needed` carrier). The row is data its asker chooses to honor:
     /// filing it blocks nothing, here or on the gateway.
@@ -632,9 +636,15 @@ COMMANDS:
            [--effect-kind <kind>] [--workdir-root <relativePath>] [--key <key>]
       Atomically open an assignment and wake its holder with the card id.
   effort-rule --request <decisionRequestId> --action continue|dismiss
-      Rule an effort-without-effect check-in routed to your principal.
+      Rule an effort-without-effect check-in whose complete id you hold. The
+      current expecter is the preferred responder, not an authorization gate.
   decision-requests [--status open|ruled|consumed|withdrawn|superseded|returned|all]
       List decision requests visible to your principal.
+  decision-request --request <decisionRequestId>
+      Read one agent question or effort request by its complete id. For an
+      agent session, the id is a reference: the request's expecter is the
+      preferred responder, not an authorization gate. Reading a request is
+      not an instruction to respond.
   ask (--session <key> | --role <name> | --user <id>) --question "<text>"
       [--about <assignmentId>]
       Put one question to another principal and get back its id. THE QUESTION
@@ -646,13 +656,14 @@ COMMANDS:
       at their next turn boundary, or within 30 minutes, whichever is first.
         tightbeam ask --role owner --question "ship behind a flag or block?" --as coder
   answer --request <decisionRequestId> --answer "<text>"
-      Answer a question that was put to you. It is an answer, not a ruling: it
-      authorizes nothing and unblocks nothing on its own. Only the principal
-      the question was asked of can answer it.
+      Answer a question whose complete id you hold. It is an answer, not a
+      ruling: it authorizes nothing and unblocks nothing on its own. The named
+      expecter is the preferred responder, not an authorization gate.
   return --request <decisionRequestId> --reason "<text>"
-      Return an open question for insufficient information. The original row
-      and reason remain in history, it leaves the open queue, and its asker
-      must revise or replace it with a new request if an answer is still needed.
+      Return an open question whose complete id you hold for insufficient
+      information. The original row and reason remain in history, it leaves
+      the open queue, and its asker must revise or replace it with a new request
+      if an answer is still needed.
   revoke-assignment <assignmentId>
       Revoke when the assignment handler already authorizes your principal.
   reopen-assignment <assignmentId> --reason "..."
@@ -1557,6 +1568,24 @@ fn parse_with_optional_catalog(
                 status: nonempty(flags, "status"),
             })
         }
+        "decision-request" => {
+            const ALLOWED: &[&str] = &["request", "as", "as-user", "as-process"];
+            let request_id = nonempty(flags, "request");
+
+            if parsed.positional.len() != 1
+                || request_id.is_none()
+                || flags.keys().any(|flag| !ALLOWED.contains(&flag.as_str()))
+            {
+                return Err(
+                    "usage: tightbeam decision-request --request <decisionRequestId>".to_owned(),
+                );
+            }
+
+            Ok(Command::DecisionRequest {
+                identity: identity(flags)?,
+                request_id: request_id.expect("checked above"),
+            })
+        }
         "ask" => {
             let targets = [
                 nonempty(flags, "session").map(Target::Session),
@@ -2023,7 +2052,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, ask, answer, return, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, visitor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, decision-request, ask, answer, return, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, visitor, assimilate, harness-process"
         )),
     }
 }
@@ -2827,6 +2856,7 @@ mod tests {
                 "condition",
                 "config",
                 "coordination-share",
+                "decision-request",
                 "decision-requests",
                 "digest-members",
                 "dispatch",
@@ -3437,8 +3467,37 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, ask, answer, return, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, visitor, assimilate, harness-process".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, decision-request, ask, answer, return, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, visitor, assimilate, harness-process".to_owned())
         );
+    }
+
+    #[test]
+    fn decision_request_requires_one_exact_request_flag_and_closed_identity_flags() {
+        assert_eq!(
+            parse(strings(&[
+                "decision-request",
+                "--request",
+                "dr_1",
+                "--as",
+                "reviewer",
+            ])),
+            Ok(Command::DecisionRequest {
+                identity: Identity::Role("reviewer".to_owned()),
+                request_id: "dr_1".to_owned(),
+            })
+        );
+
+        for args in [
+            vec!["decision-request"],
+            vec!["decision-request", "dr_1"],
+            vec!["decision-request", "--request", ""],
+            vec!["decision-request", "--request", "dr_1", "--target", "main"],
+        ] {
+            assert_eq!(
+                parse(args.into_iter().map(str::to_owned).collect()),
+                Err("usage: tightbeam decision-request --request <decisionRequestId>".to_owned())
+            );
+        }
     }
 
     #[test]
@@ -3483,7 +3542,6 @@ mod tests {
             "waive",
             "revoke-waiver",
             "withdraw",
-            "decision-request",
             "critical",
             "work-item-update",
             "work-item-list",

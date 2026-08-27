@@ -395,6 +395,54 @@ defmodule Tightbeam.Org do
     must_get(txn, session_key)
   end
 
+  @doc false
+  @spec resolve_personal_main_defaults(map()) :: map()
+  def resolve_personal_main_defaults(defaults) do
+    provider = Map.fetch!(defaults, :provider)
+    provider = if is_function(provider, 0), do: provider.(), else: provider
+    Map.put(defaults, :provider, provider)
+  end
+
+  @doc false
+  @spec ensure_personal_main_in_txn(Txn.t(), String.t(), map()) :: session()
+  def ensure_personal_main_in_txn(%Txn{} = txn, user_id, defaults) do
+    key = personal_session_key(user_id)
+
+    case get_in_txn(txn, key) do
+      nil ->
+        provider = Map.fetch!(defaults, :provider)
+
+        if is_function(provider) do
+          raise ArgumentError,
+                "personal Main provider must be resolved before entering a DB transaction"
+        end
+
+        archetype =
+          case Txn.q(txn, "SELECT value FROM org_settings WHERE key = 'default-archetype'") do
+            [[configured]] -> configured
+            [] -> "default"
+          end
+
+        create_in_txn(txn, %{
+          session_key: key,
+          display_name: "Main",
+          kind: "main",
+          is_built_in: true,
+          order_index: 0,
+          owner_user_id: user_id,
+          origin: Map.get(defaults, :origin, "user:#{user_id}"),
+          archetype: archetype,
+          host: Map.get(defaults, :host, Tightbeam.Placement.local_host_name()),
+          harness: defaults |> Map.fetch!(:harness) |> to_string(),
+          provider: to_string(provider),
+          model: Map.fetch!(defaults, :model)
+        })
+
+      session ->
+        session
+    end
+  end
+
   @doc "Fetch an active session by its CLI token, or nil."
   @spec by_cli_token(db(), String.t()) :: session() | nil
   def by_cli_token(db \\ Tightbeam.DB, token) do

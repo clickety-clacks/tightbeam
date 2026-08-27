@@ -1,0 +1,99 @@
+{
+  "format": "tightbeam-captured-v5-fixtures-v1",
+  "sourceCommit": "d00e06aea578d711e608637d38a97872487df15e",
+  "schemaStamp": "coordination-fabric-v1-phase1-v5",
+  "sqliteVersion": "3.50.4 2025-07-30 19:33:53 4d8adfb30e03f9cf27f800a2c1ba3c48fb4ca1b08b0f5ed59a4d5ecbf45e20a3",
+  "journalMode": "wal",
+  "buildCommands": [
+    "/home/mike/.cargo/bin/cargo build --release --manifest-path cli/Cargo.toml",
+    "mise exec -- mix deps.get",
+    "MIX_ENV=prod mise exec -- mix release"
+  ],
+  "captureCommand": "scripts/capture_v5_cold_start.sh CLEAN_A9_SOURCE_CLONE test/fixtures/cold_start",
+  "binaries": {
+    "cli/target/release/tightbeam": {
+      "bytes": 6399024,
+      "sha256": "fce48625145081c98fd0d976e939c8fa357814d4fd8ae34f337c7ced704ef4fd"
+    },
+    "_build/prod/rel/tightbeam_gateway/bin/tightbeam_gateway": {
+      "sha256": "0cd073f830442dcc8007238f2b82cb37e946df594d2d88282f9bc5bff22874bf"
+    },
+    "Elixir.Tightbeam.Schema.beam": {
+      "bytes": 37208,
+      "sha256": "ca27605566127d3e5e3c314f8bcfe377ac3550c49a432d48d330b29b9b5ea3f3"
+    },
+    "tightbeam_gateway.rel": {
+      "bytes": 1095,
+      "sha256": "2c69b156c81bd281329572869b0c612ebe3e7f547dffab60bf47298beeba9c1b"
+    }
+  },
+  "capture": {
+    "empty": "start_gateway $CAPTURE/empty 21473; stop_gateway $CAPTURE/empty 21473",
+    "healthy": "start_gateway $CAPTURE/healthy 21474; pair_flow 21474 captured-device 'Captured Admin' auth; stop_gateway $CAPTURE/healthy 21474",
+    "user-only": "start_gateway $CAPTURE/user-only 21475; TIGHTBEAM_BASE_DIR=$CAPTURE/user-only $CLI add-user captured-admin --as-user captured-admin; stop_gateway $CAPTURE/user-only 21475",
+    "admin-pending": "cp stopped user-only/state.db admin-pending/state.db; start_gateway $CAPTURE/admin-pending 21476; pending_flow 21476; stop_gateway $CAPTURE/admin-pending 21476",
+    "allowlisted-no-main": "start_gateway $CAPTURE/allowlisted-no-main 21477; pair_flow 21477 allowlisted-device 'Captured No Main' no-auth; stop_gateway $CAPTURE/allowlisted-no-main 21477"
+  },
+  "derivations": {
+    "v5-missing-main-parent": {
+      "baseSet": "v5-healthy",
+      "baseStateDbSha256": "70dd48a02b36e8837f49e937226bb9deb7e2fc278315f1339c5ea10586029d7b",
+      "script": "scripts/derive_cold_start_fixtures_v1.sh",
+      "scriptSha256": "673b45772df55b10524b4502bd5996aeaa078a5d353b17b657205654463bdc88",
+      "invocation": "scripts/derive_cold_start_fixtures_v1.sh missing-main-parent test/fixtures/cold_start/v5-healthy test/fixtures/cold_start/v5-missing-main-parent",
+      "foreignKeys": false,
+      "mutation": "set the one active built-in Main operationalParent to agent:missing:cold-start-parent"
+    }
+  },
+  "sets": {
+    "v5-empty": {
+      "census": {"users": 0, "devices": 0, "sessions": 0, "events": 0},
+      "files": {
+        "state.db": {"present": true, "bytes": 675840, "sha256": "9121064a1317c6a93abbfd2c9c05d2051aee53a19396ccf67869d16ae9782585"},
+        "state.db-wal": {"present": false},
+        "state.db-shm": {"present": false}
+      }
+    },
+    "v5-healthy": {
+      "census": {"users": 1, "devices": 1, "sessions": 1, "events": 0},
+      "files": {
+        "state.db": {"present": true, "bytes": 675840, "sha256": "70dd48a02b36e8837f49e937226bb9deb7e2fc278315f1339c5ea10586029d7b"},
+        "state.db-wal": {"present": false},
+        "state.db-shm": {"present": false}
+      }
+    },
+    "v5-user-only": {
+      "census": {"users": 1, "devices": 0, "sessions": 0, "events": 0},
+      "files": {
+        "state.db": {"present": true, "bytes": 675840, "sha256": "a39d7ebcca5a83386ab47e99cd37467a8731e6728b8ec9d7447249e6dd3f1a7b"},
+        "state.db-wal": {"present": false},
+        "state.db-shm": {"present": false}
+      }
+    },
+    "v5-admin-pending": {
+      "census": {"users": 1, "devices": 1, "sessions": 0, "events": 0},
+      "files": {
+        "state.db": {"present": true, "bytes": 675840, "sha256": "6830605e76421b780f2ce5797955baa55c2f7dfa9c5e13d84f0cbf590f03d744"},
+        "state.db-wal": {"present": false},
+        "state.db-shm": {"present": false}
+      }
+    },
+    "v5-allowlisted-no-main": {
+      "census": {"users": 1, "devices": 1, "sessions": 0, "events": 0},
+      "files": {
+        "state.db": {"present": true, "bytes": 675840, "sha256": "8519389c952a0f65730ee7d21d81796050eb1942852a133d083824e0ea37764f"},
+        "state.db-wal": {"present": false},
+        "state.db-shm": {"present": false}
+      }
+    },
+    "v5-missing-main-parent": {
+      "derivedFrom": "v5-healthy",
+      "census": {"users": 1, "devices": 1, "sessions": 1, "events": 0},
+      "files": {
+        "state.db": {"present": true, "bytes": 675840, "sha256": "5323385784b180783a66c6fd5cc63432e097afa0837468ba907ee385924a2c5f"},
+        "state.db-wal": {"present": false},
+        "state.db-shm": {"present": false}
+      }
+    }
+  }
+}

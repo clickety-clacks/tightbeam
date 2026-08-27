@@ -12,7 +12,6 @@ mod lease;
 mod onboard_emit;
 mod preflight;
 mod probe;
-mod users;
 mod visitor;
 
 fn main() {

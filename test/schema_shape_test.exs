@@ -43,13 +43,13 @@ defmodule Tightbeam.SchemaShapeTest do
   test "a fresh database is created and stamped", %{db: db} do
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v5"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v6"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     # Idempotent: booting twice is the ordinary case, not a shape change.
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v5"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v6"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
   end
 
@@ -232,14 +232,22 @@ defmodule Tightbeam.SchemaShapeTest do
     assert {:ok, ^before_rows} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
     assert {:ok, []} = DB.query(db, "SELECT wakeId FROM wake_cancellations")
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v5"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v6"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
   end
 
   test "the exact predecessor upgrades roots to Main and preserves spawn provenance", %{db: db} do
     assert :ok = Schema.ensure_all(db)
 
-    main = session(db, Org.personal_session_key("flynn"), "flynn", kind: "main")
+    assert {:paired, _device} =
+             claim_org(db, %{
+               device_id: "legacy-device",
+               claimed_name: "Flynn",
+               platform: nil,
+               model: nil
+             })
+
+    main = Org.get(db, Org.personal_session_key("flynn"))
     root = session(db, "root", "flynn")
     child = session(db, "child", "flynn", spawned_by: root.session_key)
     main_key = main.session_key
@@ -261,7 +269,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v5"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v6"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert {:ok,
@@ -288,7 +296,16 @@ defmodule Tightbeam.SchemaShapeTest do
 
   test "an interrupted operational-parent upgrade rolls back and retries exactly", %{db: db} do
     assert :ok = Schema.ensure_all(db)
-    main = session(db, Org.personal_session_key("flynn"), "flynn", kind: "main")
+
+    assert {:paired, _device} =
+             claim_org(db, %{
+               device_id: "legacy-device",
+               claimed_name: "Flynn",
+               platform: nil,
+               model: nil
+             })
+
+    main = Org.get(db, Org.personal_session_key("flynn"))
     main_key = main.session_key
     _root = session(db, "root", "flynn")
     downgrade_to_previous_shape(db)
@@ -391,7 +408,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "some-later-shape"
-    assert error.message =~ "coordination-fabric-v1-phase1-v5"
+    assert error.message =~ "coordination-fabric-v1-phase1-v6"
   end
 
   # Sol xhigh review round 2, finding 2 (wave 1): `classElection`'s CHECK
@@ -453,7 +470,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-classes-v1"
-    assert error.message =~ "coordination-fabric-v1-phase1-v5"
+    assert error.message =~ "coordination-fabric-v1-phase1-v6"
     assert error.message =~ "no migration"
 
     # It REFUSED — it did not repair or widen the constraint in place.
@@ -573,7 +590,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-v1-phase1"
-    assert error.message =~ "coordination-fabric-v1-phase1-v5"
+    assert error.message =~ "coordination-fabric-v1-phase1-v6"
     assert error.message =~ "no migration"
 
     # It REFUSED — it did not repair or relax the constraint in place.
@@ -644,7 +661,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-classes-v2"
-    assert error.message =~ "coordination-fabric-v1-phase1-v5"
+    assert error.message =~ "coordination-fabric-v1-phase1-v6"
     assert error.message =~ "no migration"
 
     # It REFUSED — the merged build's decision_requests columns were never
@@ -757,7 +774,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-v1-phase1-v2"
-    assert error.message =~ "coordination-fabric-v1-phase1-v5"
+    assert error.message =~ "coordination-fabric-v1-phase1-v6"
     assert error.message =~ "no migration"
 
     # It REFUSED — the merged build's wakes class/delivery columns were never
@@ -796,7 +813,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-v1-phase1-v3"
-    assert error.message =~ "coordination-fabric-v1-phase1-v5"
+    assert error.message =~ "coordination-fabric-v1-phase1-v6"
     assert error.message =~ "no migration"
 
     assert {:ok, [[ddl]]} =
@@ -827,6 +844,9 @@ defmodule Tightbeam.SchemaShapeTest do
   end
 
   defp downgrade_to_previous_shape(db) do
+    :ok = DB.execute(db, "DROP TRIGGER users_gateway_owned_insert")
+    :ok = DB.execute(db, "DROP TABLE cold_start_receipts")
+    :ok = DB.execute(db, "ALTER TABLE users DROP COLUMN creationKind")
     :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN operationalParent")
 
     {:ok, _} =

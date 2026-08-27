@@ -8,6 +8,7 @@ defmodule Tightbeam.EffortCheckinTest do
     Assignments,
     ConnRegistry,
     DB,
+    Devices,
     EffortCheckin,
     Gateway,
     Ledger,
@@ -48,20 +49,16 @@ defmodule Tightbeam.EffortCheckinTest do
 
     :ok = Tightbeam.Schema.ensure_all(db)
 
-    :ok =
-      DB.execute(
-        db,
-        "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('h1',0,1),('h2',0,1),('admin',1,1)"
-      )
+    {:paired, _device} =
+      claim_org(db, %{device_id: "effort-device", claimed_name: "h1", platform: nil, model: nil})
+
+    Devices.add_user(db, "h2", false)
+    Devices.add_user(db, "admin", true)
 
     host = Placement.local_host_name()
     main_key = Org.personal_session_key("h1")
 
-    main =
-      session(db, main_key, "h1", host, %{
-        kind: "main",
-        is_built_in: true
-      })
+    main = Org.get(db, main_key)
 
     ensure_main_session(db, "h2")
     parent = session(db, "parent", "h1", host)
@@ -1119,6 +1116,116 @@ defmodule Tightbeam.EffortCheckinTest do
            ]) == [[0]]
   end
 
+  test "A-05: a dismiss snapshot change refuses stale and a fresh retry rules once", ctx do
+    observer = session(ctx.db, "dismiss-observer", "h1", Placement.local_host_name())
+    target = dispatch(ctx, {:session, "parent"}, "holder", "dismiss target")
+    moving = dispatch(ctx, {:session, "parent"}, "holder", "concurrent holder motion")
+    request_id = open_effort_request(ctx, target, "parent")
+    raced = :atomics.new(1, [])
+
+    race_config =
+      Map.put(ctx.config, :sh, fn invocation ->
+        if :atomics.compare_exchange(raced, 1, 0, 1) == :ok do
+          prepared =
+            EffortCheckin.prepare_transferred_rearms(
+              ctx.db,
+              ctx.config,
+              ctx.holder,
+              [moving.id]
+            )
+
+          assert {:ok, :ok} =
+                   DB.transaction(ctx.db, fn txn ->
+                     EffortCheckin.apply_prepared_rearms_in_txn(
+                       txn,
+                       ctx.config,
+                       ctx.holder.session_key,
+                       prepared
+                     )
+                   end)
+        end
+
+        System.cmd(hd(invocation), tl(invocation), stderr_to_stdout: true)
+      end)
+
+    call = effort_rule_call(observer.session_key, request_id, "dismiss")
+
+    assert %{code: "stale_effort_snapshot"} = EffortCheckin.rule(ctx.db, race_config, call)
+    assert [["open", nil, nil]] = request_ruling(ctx.db, request_id)
+
+    assert %{status: "ruled", decision: "dismiss", ruled_by: ruled_by} =
+             EffortCheckin.rule(ctx.db, ctx.config, call)
+
+    assert ruled_by == "session:#{observer.session_key}"
+    assert [["ruled", "dismiss", ^ruled_by]] = request_ruling(ctx.db, request_id)
+
+    assert rows(
+             ctx.db,
+             "SELECT COUNT(*) FROM lifecycle_events WHERE kind='decision_request_ruled' AND subject=?1",
+             [request_id]
+           ) == [[0]]
+  end
+
+  test "A-10: deadline and distinct-session rulings preserve one winner in both orders", ctx do
+    continuing = session(ctx.db, "continue-observer", "h1", Placement.local_host_name())
+    dismissing = session(ctx.db, "dismiss-observer-two", "h1", Placement.local_host_name())
+
+    ruling_first = dispatch(ctx, {:session, "parent"}, "holder", "ruling wins first")
+    continue_id = open_effort_request(ctx, ruling_first, "parent")
+    continue_deadline = request_deadline_wake(ctx.db, continue_id)
+    before_continue = generation_count(ctx.db, ruling_first.id)
+
+    assert %{status: "ruled", decision: "continue", ruled_by: continue_actor} =
+             EffortCheckin.rule(
+               ctx.db,
+               ctx.config,
+               effort_rule_call(continuing.session_key, continue_id, "continue")
+             )
+
+    assert continue_actor == "session:#{continuing.session_key}"
+    assert :ok = EffortCheckin.deadline(ctx.db, ctx.config, continue_deadline)
+    assert generation_count(ctx.db, ruling_first.id) == before_continue + 1
+    assert [["ruled", "continue", ^continue_actor]] = request_ruling(ctx.db, continue_id)
+    assert Wakes.get(ctx.db, continue_deadline.wake_id).state == "canceled"
+
+    deadline_first = dispatch(ctx, {:session, "parent"}, "holder", "deadline wins first")
+    dismiss_id = open_effort_request(ctx, deadline_first, "parent")
+    first_deadline = request_deadline_wake(ctx.db, dismiss_id)
+    before_dismiss = generation_count(ctx.db, deadline_first.id)
+
+    assert :ok = EffortCheckin.deadline(ctx.db, ctx.config, first_deadline)
+
+    assert [["open", nil, nil, replacement_wake_id]] =
+             rows(
+               ctx.db,
+               "SELECT status,decision,ruledBy,deadlineWakeId FROM decision_requests WHERE id=?1",
+               [dismiss_id]
+             )
+
+    refute replacement_wake_id == first_deadline.wake_id
+    assert Wakes.get(ctx.db, first_deadline.wake_id).state == "fired"
+
+    assert %{status: "ruled", decision: "dismiss", ruled_by: dismiss_actor} =
+             EffortCheckin.rule(
+               ctx.db,
+               ctx.config,
+               effort_rule_call(dismissing.session_key, dismiss_id, "dismiss")
+             )
+
+    assert dismiss_actor == "session:#{dismissing.session_key}"
+    assert generation_count(ctx.db, deadline_first.id) == before_dismiss + 1
+    assert [["ruled", "dismiss", ^dismiss_actor]] = request_ruling(ctx.db, dismiss_id)
+    assert Wakes.get(ctx.db, replacement_wake_id).state == "canceled"
+
+    for request_id <- [continue_id, dismiss_id] do
+      assert rows(
+               ctx.db,
+               "SELECT COUNT(*) FROM lifecycle_events WHERE kind='decision_request_ruled' AND subject=?1",
+               [request_id]
+             ) == [[0]]
+    end
+  end
+
   defp dispatch(ctx, principal, holder, subject) do
     assignment(ctx, "dispatch", principal, holder, %{subject: subject, brief: subject})
   end
@@ -1194,6 +1301,81 @@ defmodule Tightbeam.EffortCheckinTest do
     do:
       rows(db, "SELECT COUNT(*) FROM decision_requests WHERE assignmentId=?1", [assignment_id]) ==
         [[0]]
+
+  defp open_effort_request(ctx, assignment, expecter_session_key) do
+    [[generation]] =
+      rows(
+        ctx.db,
+        "SELECT MAX(generation) FROM effort_checkin_generations WHERE assignmentId=?1",
+        [assignment.id]
+      )
+
+    deadline =
+      Wakes.schedule(ctx.db, %{
+        session_key: expecter_session_key,
+        origin: "process:tightbeam",
+        consumer: "effort_deadline",
+        due_at: System.system_time(:millisecond) + 60_000,
+        assignment_id: assignment.id
+      })
+
+    request_id = "dr_effort_#{System.unique_integer([:positive])}"
+    now = System.system_time(:millisecond)
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO decision_requests
+                 (id,kind,raiserId,ownerUserId,assignmentId,expecterSessionKey,lineageRung,
+                  effortGeneration,deadlineWakeId,raisedAt,deadlineAt,question,options,context,status)
+               VALUES (?1,'effort','process:tightbeam','h1',?2,?3,1,?4,?5,?6,?7,
+                       'Continue or dismiss?','["continue","dismiss"]',
+                       '{"actions":["continue","dismiss"]}','open')
+               """,
+               [
+                 request_id,
+                 assignment.id,
+                 expecter_session_key,
+                 generation,
+                 deadline.wake_id,
+                 now,
+                 now + 60_000
+               ]
+             )
+
+    request_id
+  end
+
+  defp effort_rule_call(session_key, request_id, action) do
+    %{
+      verb: "effort-rule",
+      origin: "agent:caller-supplied-alias",
+      principal: {:session, session_key},
+      session_key: nil,
+      params: %{request: request_id, action: action}
+    }
+  end
+
+  defp request_deadline_wake(db, request_id) do
+    [[wake_id]] =
+      rows(db, "SELECT deadlineWakeId FROM decision_requests WHERE id=?1", [request_id])
+
+    Wakes.get(db, wake_id)
+  end
+
+  defp request_ruling(db, request_id) do
+    rows(db, "SELECT status,decision,ruledBy FROM decision_requests WHERE id=?1", [request_id])
+  end
+
+  defp generation_count(db, assignment_id) do
+    [[count]] =
+      rows(db, "SELECT COUNT(*) FROM effort_checkin_generations WHERE assignmentId=?1", [
+        assignment_id
+      ])
+
+    count
+  end
 
   defp current_wake(db, assignment_id) do
     [[wake_id]] =

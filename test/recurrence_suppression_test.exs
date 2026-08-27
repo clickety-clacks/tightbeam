@@ -7,7 +7,12 @@ defmodule Tightbeam.RecurrenceSuppressionTest do
     db = :"recurrence_suppression_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Tightbeam.Schema.ensure_all(db)
-    {:ok, _} = DB.query(db, "INSERT INTO users (userId,isAdmin,createdAt) VALUES ('mike',1,1)")
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO users (userId,isAdmin,creationKind, createdAt) VALUES ('mike', 1, 'admin_add', 1)"
+      )
 
     main = session(db, "agent:main:clawline:mike:main", nil, "main")
     parent = session(db, "parent", main.session_key, "custom")

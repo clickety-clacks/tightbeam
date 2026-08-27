@@ -1153,22 +1153,32 @@ defmodule Tightbeam.ConformanceSupport do
   defp assert_question_outcome("answered", kase, db, handlers, _ids, result) do
     request = filed!(kase, result)
 
-    # A bystander is refused `not_found`, not a kind/authority-revealing
-    # `not_asked` (Sol xhigh review, finding 4): an unauthorized caller must
-    # not be able to tell this id apart from a fake one.
-    assert {:error, %{code: "not_found"}} =
-             Dispatch.dispatch(db, handlers, answer_call("bystander", request.id, "not mine"))
-
     assert {:ok, %{decision_request: answered}} =
+             Dispatch.dispatch(
+               db,
+               handlers,
+               answer_call("bystander", request.id, "behind a flag")
+             )
+
+    assert answered.status == "answered"
+    assert answered.answer == "behind a flag"
+    assert answered.answered_by == "session:bystander"
+
+    # The expecter is preferred, not an authorization gate. The same session
+    # and payload retry exactly; another session cannot claim the terminal row.
+    assert {:ok, %{decision_request: ^answered}} =
+             Dispatch.dispatch(
+               db,
+               handlers,
+               answer_call("bystander", request.id, "behind a flag")
+             )
+
+    assert {:error, %{code: "not_open"}} =
              Dispatch.dispatch(
                db,
                handlers,
                answer_call(request.expecter_session_key, request.id, "behind a flag")
              )
-
-    assert answered.status == "answered"
-    assert answered.answer == "behind a flag"
-    assert answered.answered_by == "session:" <> request.expecter_session_key
 
     # AN ANSWER IS NOT A RULING: nothing is spent and no condition fact is filed,
     # so no halted call anywhere can be released by it.
@@ -1211,15 +1221,28 @@ defmodule Tightbeam.ConformanceSupport do
   defp assert_question_outcome("returned", kase, db, handlers, _ids, result) do
     request = filed!(kase, result)
 
-    # An unasked bystander learns no more than a caller probing a fake id.
-    assert {:error, %{code: "not_found"}} =
+    assert {:ok, %{decision_request: returned}} =
              Dispatch.dispatch(
                db,
                handlers,
                return_call("bystander", request.id, "missing the rollback boundary")
              )
 
-    assert {:ok, %{decision_request: returned}} =
+    assert returned.status == "returned"
+    assert returned.question == request.question
+    assert returned.return_reason == "missing the rollback boundary"
+    assert returned.returned_by == "session:bystander"
+    assert is_integer(returned.returned_at)
+    assert returned.answer == nil
+
+    assert {:ok, %{decision_request: ^returned}} =
+             Dispatch.dispatch(
+               db,
+               handlers,
+               return_call("bystander", request.id, "missing the rollback boundary")
+             )
+
+    assert {:error, %{code: "not_open"}} =
              Dispatch.dispatch(
                db,
                handlers,
@@ -1229,13 +1252,6 @@ defmodule Tightbeam.ConformanceSupport do
                  "missing the rollback boundary"
                )
              )
-
-    assert returned.status == "returned"
-    assert returned.question == request.question
-    assert returned.return_reason == "missing the rollback boundary"
-    assert returned.returned_by == "session:" <> request.expecter_session_key
-    assert is_integer(returned.returned_at)
-    assert returned.answer == nil
 
     # Default open retrieval no longer includes the returned row, while the
     # explicit terminal filter preserves its full reasoned history.
@@ -3515,10 +3531,14 @@ defmodule Tightbeam.ConformanceSupport do
        ) do
     Enum.each(Map.get(world, "users", []), fn user ->
       {:ok, _} =
-        DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES (?1, ?2, 1)", [
-          user["id"],
-          if(user["admin"], do: 1, else: 0)
-        ])
+        DB.query(
+          db,
+          "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES (?1, ?2, 'admin_add', 1)",
+          [
+            user["id"],
+            if(user["admin"], do: 1, else: 0)
+          ]
+        )
     end)
 
     world

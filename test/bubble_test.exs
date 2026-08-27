@@ -33,7 +33,10 @@ defmodule Tightbeam.Productions.BubbleTest do
     :ok = Tightbeam.Schema.ensure_all(db)
 
     {:ok, _} =
-      DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1)")
+      DB.query(
+        db,
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 1, 'admin_add', 1)"
+      )
 
     main = session(db, Org.personal_session_key("flynn"), nil, true)
     supervisor = session(db, "supervisor", main.session_key)

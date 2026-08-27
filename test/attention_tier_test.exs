@@ -115,9 +115,13 @@ defmodule Tightbeam.AttentionTierTest do
 
     :ok = Tightbeam.Schema.ensure_all(db)
 
-    :ok = DB.execute(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn',0,1)")
-
-    ensure_main_session(db, "flynn")
+    {:paired, _device} =
+      claim_org(db, %{
+        device_id: "attention-device",
+        claimed_name: "flynn",
+        platform: nil,
+        model: nil
+      })
 
     Org.create(db, %{
       session_key: "k1",

@@ -26,7 +26,13 @@ defmodule Tightbeam.Firehose.PublisherTest do
     db = :firehose_work_item_create_db
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Tightbeam.Schema.ensure_all(db)
-    {:ok, _} = DB.query(db, "INSERT INTO users VALUES ('flynn', 1, 1)")
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('flynn',1,'admin_add',1)"
+      )
+
     register_testhost(db)
 
     handlers = Gateway.handlers(%{db: db})
@@ -72,7 +78,13 @@ defmodule Tightbeam.Firehose.PublisherTest do
     lane = :firehose_post_effect_lane
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Tightbeam.Schema.ensure_all(db)
-    {:ok, _} = DB.query(db, "INSERT INTO users VALUES ('flynn', 1, 1)")
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('flynn',1,'admin_add',1)"
+      )
+
     register_testhost(db)
     start_supervised!({ConnRegistry, name: registry})
     start_supervised!({LaneStub, name: lane})
@@ -122,7 +134,13 @@ defmodule Tightbeam.Firehose.PublisherTest do
     scheduler = :firehose_per_verb_effect_scheduler
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Tightbeam.Schema.ensure_all(db)
-    {:ok, _} = DB.query(db, "INSERT INTO users VALUES ('flynn', 1, 1)")
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('flynn',1,'admin_add',1)"
+      )
+
     register_testhost(db)
     start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
     start_supervised!({LaneStub, name: Tightbeam.LaneManager})
@@ -345,6 +363,128 @@ defmodule Tightbeam.Firehose.PublisherTest do
     refute_receive {:firehose_notice, %{"class" => "work_item.created"}}
   end
 
+  test "an exact effort-rule retry emits no second ruled state notice or generation effect" do
+    db = :firehose_effort_rule_retry_db
+    start_supervised!({DB, path: ":memory:", name: db})
+    :ok = Tightbeam.Schema.ensure_all(db)
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('flynn',1,'admin_add',1)"
+      )
+
+    register_testhost(db)
+
+    for {key, name} <- [{"effect-holder", "Effect holder"}, {"effect-observer", "Observer"}] do
+      Org.create(db, %{
+        session_key: key,
+        display_name: name,
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Tightbeam.Model.new("fable")
+      })
+    end
+
+    base_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "tightbeam-firehose-effort-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(base_dir)
+    on_exit(fn -> File.rm_rf!(base_dir) end)
+
+    config = %{
+      db: db,
+      base_dir: base_dir,
+      cwd: base_dir,
+      effort_checkin_horizon_ms: 60_000,
+      wake_tick_ms: 60_000
+    }
+
+    handlers = Gateway.handlers(config)
+
+    assert {:ok, assignment} =
+             Dispatch.dispatch(db, handlers, %{
+               verb: "dispatch",
+               origin: "user:flynn",
+               principal: {:user, "flynn"},
+               session_key: "effect-holder",
+               target_role: nil,
+               role_fallback: false,
+               params: %{subject: "Retry effort ruling", brief: "Prove one state publication."}
+             })
+
+    _dispatch_notices = observed_classes()
+
+    {:ok, [[generation]]} =
+      DB.query(
+        db,
+        "SELECT generation FROM effort_checkin_generations WHERE assignmentId=?1",
+        [assignment.id]
+      )
+
+    deadline =
+      Wakes.schedule(db, %{
+        session_key: "effect-holder",
+        origin: "process:tightbeam",
+        consumer: "effort_deadline",
+        due_at: System.system_time(:millisecond) + 60_000,
+        assignment_id: assignment.id
+      })
+
+    request_id = "dr_effort_retry"
+    now = System.system_time(:millisecond)
+
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO decision_requests
+          (id,kind,raiserId,ownerUserId,assignmentId,expecterSessionKey,lineageRung,
+           effortGeneration,deadlineWakeId,raisedAt,deadlineAt,question,options,context,status)
+        VALUES (?1,'effort','process:tightbeam','flynn',?2,'effect-holder',1,?3,?4,?5,?6,
+                'Continue or dismiss?','["continue","dismiss"]','{"actions":["continue","dismiss"]}','open')
+        """,
+        [request_id, assignment.id, generation, deadline.wake_id, now, now + 60_000]
+      )
+
+    call = %{
+      verb: "effort-rule",
+      origin: "agent:spoofed-alias",
+      principal: {:session, "effect-observer"},
+      session_key: nil,
+      params: %{request: request_id, action: "continue"}
+    }
+
+    assert {:ok, %{ruled_by: "session:effect-observer"}} =
+             Dispatch.dispatch(db, handlers, call)
+
+    assert observed_classes() == ["verb.accepted", "decision_request.ruled"]
+
+    {:ok, [[generation_count]]} =
+      DB.query(db, "SELECT count(*) FROM effort_checkin_generations WHERE assignmentId=?1", [
+        assignment.id
+      ])
+
+    assert {:ok, %{ruled_by: "session:effect-observer"}} =
+             Dispatch.dispatch(db, handlers, call)
+
+    assert observed_classes() == ["verb.accepted"]
+
+    assert {:ok, [[^generation_count]]} =
+             DB.query(
+               db,
+               "SELECT count(*) FROM effort_checkin_generations WHERE assignmentId=?1",
+               [assignment.id]
+             )
+  end
+
   test "an accepted state verb emits its observation and canonical state notice" do
     call = %{
       verb: "work-item-update",
@@ -412,7 +552,13 @@ defmodule Tightbeam.Firehose.PublisherTest do
     db = :firehose_decision_returned_db
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Tightbeam.Schema.ensure_all(db)
-    {:ok, _} = DB.query(db, "INSERT INTO users VALUES ('flynn', 1, 1)")
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('flynn',1,'admin_add',1)"
+      )
+
     register_testhost(db)
 
     Enum.each(["return-asker", "return-reader"], fn session_key ->
@@ -462,11 +608,97 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert Gateway.handler_effects(%{db: db})["return"] == ["decision_request.returned"]
   end
 
+  test "concurrent exact return retries emit one returned state notice" do
+    db = :firehose_concurrent_decision_return_db
+    start_supervised!({DB, path: ":memory:", name: db})
+    :ok = Tightbeam.Schema.ensure_all(db)
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('flynn',1,'admin_add',1)"
+      )
+
+    register_testhost(db)
+
+    Enum.each(["return-race-asker", "return-race-reader"], fn session_key ->
+      Org.create(db, %{
+        session_key: session_key,
+        display_name: session_key,
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Tightbeam.Model.new("fable")
+      })
+    end)
+
+    handlers = Gateway.handlers(%{db: db})
+
+    assert {:ok, %{decision_request: request}} =
+             Dispatch.dispatch(db, handlers, %{
+               verb: "ask",
+               origin: "agent:return-race-asker",
+               principal: {:session, "return-race-asker"},
+               session_key: "return-race-reader",
+               params: %{question: "Which authority applies?"}
+             })
+
+    _ = observed_classes()
+
+    returned = %{
+      verb: "return",
+      origin: "agent:return-race-reader",
+      principal: {:session, "return-race-reader"},
+      session_key: nil,
+      params: %{request: request.id, reason: "The governing authority is absent."}
+    }
+
+    db_pid = Process.whereis(db)
+    :ok = :sys.suspend(db_pid)
+
+    tasks =
+      for _ <- 1..2 do
+        Task.async(fn -> Dispatch.dispatch(db, handlers, returned) end)
+      end
+
+    try do
+      assert :ok = await_mailbox_size(db_pid, 2)
+    after
+      :ok = :sys.resume(db_pid)
+    end
+
+    assert Enum.all?(Task.await_many(tasks, 5_000), fn
+             {:ok, %{decision_request: %{status: "returned"}}} -> true
+             _ -> false
+           end)
+
+    assert Enum.frequencies(observed_classes()) == %{
+             "decision_request.returned" => 1,
+             "verb.accepted" => 2
+           }
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               db,
+               "SELECT count(*) FROM lifecycle_events WHERE kind = 'decision_request_returned' AND subject = ?1",
+               [request.id]
+             )
+  end
+
   test "ledger transitions hand off turn notices only after their commits" do
     db = :firehose_turn_transition_db
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Tightbeam.Schema.ensure_all(db)
-    {:ok, _} = DB.query(db, "INSERT INTO users VALUES ('flynn', 1, 1)")
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('flynn',1,'admin_add',1)"
+      )
+
     register_testhost(db)
 
     Org.create(db, %{
@@ -587,7 +819,13 @@ defmodule Tightbeam.Firehose.PublisherTest do
     db = :firehose_role_delete_db
     start_supervised!({Tightbeam.DB, path: ":memory:", name: db})
     :ok = Tightbeam.Schema.ensure_all(db)
-    {:ok, _} = Tightbeam.DB.query(db, "INSERT INTO users VALUES ('flynn', 1, 1)")
+
+    {:ok, _} =
+      Tightbeam.DB.query(
+        db,
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('flynn',1,'admin_add',1)"
+      )
+
     %{name: "worker"} = Tightbeam.Roles.create!(db, "worker", "flynn", nil)
 
     call = %{
@@ -722,6 +960,21 @@ defmodule Tightbeam.Firehose.PublisherTest do
       model: Tightbeam.Model.new("fable")
     })
   end
+
+  defp await_mailbox_size(pid, expected, attempts \\ 200)
+
+  defp await_mailbox_size(pid, expected, attempts) when attempts > 0 do
+    case Process.info(pid, :message_queue_len) do
+      {:message_queue_len, size} when size >= expected ->
+        :ok
+
+      _ ->
+        Process.sleep(1)
+        await_mailbox_size(pid, expected, attempts - 1)
+    end
+  end
+
+  defp await_mailbox_size(_pid, _expected, 0), do: :timeout
 
   defp receive_notice do
     assert_receive {:firehose_notice, notice}

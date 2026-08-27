@@ -646,9 +646,13 @@ defmodule Tightbeam.CoordinationFabricTest do
     base = System.system_time(:millisecond)
 
     {:ok, _} =
-      DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('owner', 0, ?1)", [
-        base
-      ])
+      DB.query(
+        db,
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('owner', 0, 'admin_add', ?1)",
+        [
+          base
+        ]
+      )
 
     {:ok, _} =
       DB.query(
@@ -696,9 +700,13 @@ defmodule Tightbeam.CoordinationFabricTest do
     base = System.system_time(:millisecond)
 
     {:ok, _} =
-      DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('owner', 0, ?1)", [
-        base
-      ])
+      DB.query(
+        db,
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('owner', 0, 'admin_add', ?1)",
+        [
+          base
+        ]
+      )
 
     {:ok, _} =
       DB.query(
@@ -750,9 +758,13 @@ defmodule Tightbeam.CoordinationFabricTest do
     base = System.system_time(:millisecond)
 
     {:ok, _} =
-      DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('owner', 0, ?1)", [
-        base
-      ])
+      DB.query(
+        db,
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('owner', 0, 'admin_add', ?1)",
+        [
+          base
+        ]
+      )
 
     {:ok, _} =
       DB.query(
@@ -824,9 +836,13 @@ defmodule Tightbeam.CoordinationFabricTest do
     base = System.system_time(:millisecond)
 
     {:ok, _} =
-      DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('owner', 0, ?1)", [
-        base
-      ])
+      DB.query(
+        db,
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('owner', 0, 'admin_add', ?1)",
+        [
+          base
+        ]
+      )
 
     {:ok, _} =
       DB.query(
@@ -1145,7 +1161,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('roleowner', 0, 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('roleowner', 0, 'admin_add', 1)"
       )
 
     Roles.create!(db, "orphan-role", "roleowner", nil)
@@ -1320,7 +1336,10 @@ defmodule Tightbeam.CoordinationFabricTest do
     # prove the collision cannot happen once the field round-trips through
     # `URI.encode_www_form/1`/`URI.decode_www_form/1`.
     {:ok, _} =
-      DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('alice', 0, 1)")
+      DB.query(
+        db,
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('alice', 0, 'admin_add', 1)"
+      )
 
     seed_session(db, "agent:filer6", "alice bob")
     seed_session(db, "agent:stranger6", "outsider6")
@@ -1656,7 +1675,10 @@ defmodule Tightbeam.CoordinationFabricTest do
       withdraw_episodes: [{"lib/tightbeam/rail_episodes.ex", "handle_call/3"}],
       recover_retired: [{"lib/tightbeam/boot.ex", "start_link/1"}],
       list: [{"lib/tightbeam/gateway.ex", "handler_specs/1"}],
-      get: [{"lib/tightbeam/gateway.ex", "handler_specs/1"}],
+      get: [
+        {"lib/tightbeam/effort_checkin.ex", "visible_request?/3"},
+        {"lib/tightbeam/gateway.ex", "handler_specs/1"}
+      ],
       effort_rule_in_txn: [{"lib/tightbeam/effort_checkin.ex", "rule_in_txn/7"}],
       claim_park_wake_in_txn: [{"lib/tightbeam/supervision.ex", "park_escalation/3"}],
       decision_trace_rows: [{"lib/tightbeam/job_trace.ex", "decision_entries/2"}],
@@ -1666,7 +1688,10 @@ defmodule Tightbeam.CoordinationFabricTest do
         {"lib/tightbeam/wakes.ex", "validate_disposition/3"}
       ],
       statute_name_for_ruling: [{"lib/tightbeam/dispatch.ex", "ruling_statute/2"}],
-      raw_by_id: [{"lib/tightbeam/effort_checkin.ex", "request_row/2"}],
+      raw_by_id: [
+        {"lib/tightbeam/effort_checkin.ex", "request_row/2"},
+        {"lib/tightbeam/gateway.ex", "handler_specs/1"}
+      ],
       raw_by_id_in_txn!: [{"lib/tightbeam/effort_checkin.ex", "request_for_id/2"}]
     }
 
@@ -3300,22 +3325,12 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert snapshot.() == before
   end
 
-  test "the asker's exits are its own, and only the asked principal answers", %{db: db} do
+  test "the expecter is preferred while an exact-id agent session may answer", %{db: db} do
     seed_session(db, "agent:coder", "flynn")
     seed_session(db, "agent:po", "flynn")
     seed_session(db, "agent:stranger", "outsider")
 
     assert {:ok, %{decision_request: request}} = ask(db, "agent:coder", "agent:po", "which way?")
-
-    # Not the asker, not a bystander, not an admin: the principal that was
-    # asked. Refused as `not_found` rather than a kind-revealing `not_asked`
-    # (Sol xhigh review, finding 4) — an unauthorized caller learns nothing an
-    # unauthorized caller probing a fake id would not also learn.
-    assert {:error, %{code: "not_found"}} =
-             answer(db, {:session, "agent:coder"}, request.id, "myself")
-
-    assert {:error, %{code: "not_found"}} =
-             answer(db, {:session, "agent:stranger"}, request.id, "not mine to answer")
 
     # `rule` and `waive` refuse BY NAME rather than quietly doing something.
     assert {:error, %{code: "invalid", message: ruled}} =
@@ -3333,11 +3348,11 @@ defmodule Tightbeam.CoordinationFabricTest do
     before_facts = fact_count(db)
 
     assert {:ok, %{decision_request: answered}} =
-             answer(db, {:session, "agent:po"}, request.id, "behind a flag")
+             answer(db, {:session, "agent:stranger"}, request.id, "behind a flag")
 
     assert answered.status == "answered"
     assert answered.answer == "behind a flag"
-    assert answered.answered_by == "session:agent:po"
+    assert answered.answered_by == "session:agent:stranger"
     assert answered.decision == nil
     assert answered.consumed_at == nil
     assert fact_count(db) == before_facts
@@ -3346,12 +3361,29 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert reply.prompt =~ "behind a flag"
     assert reply.class == nil, "the substrate does not elect a class on a mind's behalf"
 
-    # Answered once is answered: a second answer is refused, not overwritten.
+    # An exact retry by the same canonical principal and payload is idempotent:
+    # no second lifecycle event or wake is emitted.
+    assert {:ok, %{decision_request: ^answered}} =
+             answer(db, {:session, "agent:stranger"}, request.id, "  behind a flag  ")
+
+    assert [_one_reply] = wakes_for(db, "agent:coder")
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               db,
+               "SELECT count(*) FROM lifecycle_events WHERE kind = 'decision_request_answered' AND subject = ?1",
+               [request.id]
+             )
+
+    # A changed payload or a different authenticated session loses the CAS.
     assert {:error, %{code: "not_open"}} =
-             answer(db, {:session, "agent:po"}, request.id, "changed my mind")
+             answer(db, {:session, "agent:stranger"}, request.id, "changed my mind")
+
+    assert {:error, %{code: "not_open"}} =
+             answer(db, {:session, "agent:po"}, request.id, "behind a flag")
   end
 
-  test "answer and rule refuse a fake id, an agent question, and a non-agent request identically to an unauthorized caller",
+  test "answer hides fake and non-agent ids while an exact agent id grants session standing",
        %{db: db} do
     seed_session(db, "agent:coder", "flynn")
     seed_session(db, "agent:po", "flynn")
@@ -3372,15 +3404,13 @@ defmodule Tightbeam.CoordinationFabricTest do
         [statute_id]
       )
 
-    # `answer`: a caller that was never asked cannot tell a fake id, someone
-    # else's question, and a non-agent request apart — ONE refusal for all
-    # three (Sol xhigh review, finding 4). Authority is checked before
-    # existence or kind is revealed.
     assert {:error, %{code: "not_found"}} =
              answer(db, {:session, "agent:outsider"}, "dr_nonexistent", "guess")
 
-    assert {:error, %{code: "not_found"}} =
-             answer(db, {:session, "agent:outsider"}, agent_request.id, "not mine")
+    assert {:ok, %{decision_request: answered}} =
+             answer(db, {:session, "agent:outsider"}, agent_request.id, "exact id is standing")
+
+    assert answered.answered_by == "session:agent:outsider"
 
     assert {:error, %{code: "not_found"}} =
              answer(db, {:session, "agent:outsider"}, statute_id, "not agent-kind")
@@ -3410,9 +3440,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert fake == agent_kind
     assert agent_kind == statute_kind
 
-    # An AUTHORIZED admin still gets the specific, kind-naming refusal for the
-    # agent row — that message is only a leak when the caller has no standing
-    # to be told anything at all.
+    # Rule remains the wrong operation for an agent question.
     assert {:error, %{code: "invalid", message: authorized_agent}} =
              admin_call(db, "rule", %{request: agent_request.id, decision: "allow"})
 
@@ -3452,11 +3480,6 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert {:error, %{code: "invalid"}} =
              return_request(db, {:session, "agent:po"}, request.id, "  ")
 
-    # The same privacy wall as answer: neither an outsider nor a non-agent id
-    # becomes an existence/kind oracle through the new verb.
-    assert {:error, %{code: "not_found"}} =
-             return_request(db, {:session, "agent:stranger"}, request.id, "unclear")
-
     assert {:error, %{code: "not_found"}} =
              return_request(db, {:session, "agent:po"}, "dr_missing", "unclear")
 
@@ -3465,7 +3488,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert {:ok, %{decision_request: returned}} =
              return_request(
                db,
-               {:session, "agent:po"},
+               {:session, "agent:stranger"},
                request.id,
                "  name the migration and rollback boundary  "
              )
@@ -3477,7 +3500,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert returned.raiser_session_key == request.raiser_session_key
     assert returned.expecter_session_key == request.expecter_session_key
     assert returned.return_reason == "name the migration and rollback boundary"
-    assert returned.returned_by == "session:agent:po"
+    assert returned.returned_by == "session:agent:stranger"
     assert is_integer(returned.returned_at)
     assert returned.answer == nil
     assert fact_count(db) == before_facts
@@ -3503,9 +3526,17 @@ defmodule Tightbeam.CoordinationFabricTest do
                [request.id]
              )
 
-    # An exact retry is idempotent: it returns the same row and emits neither a
-    # second event nor a second wake. A changed reason is not an edit of history.
-    assert {:ok, %{decision_request: exact_retry}} =
+    assert {:ok, %{decision_request: ^returned}} =
+             return_request(
+               db,
+               {:session, "agent:stranger"},
+               request.id,
+               "name the migration and rollback boundary"
+             )
+
+    assert [_one_notice] = wakes_for(db, "agent:coder")
+
+    assert {:error, %{code: "not_open"}} =
              return_request(
                db,
                {:session, "agent:po"},
@@ -3513,18 +3544,8 @@ defmodule Tightbeam.CoordinationFabricTest do
                "name the migration and rollback boundary"
              )
 
-    assert exact_retry.returned_at == returned.returned_at
-    assert [_one_notice] = wakes_for(db, "agent:coder")
-
-    assert {:ok, [[1]]} =
-             DB.query(
-               db,
-               "SELECT count(*) FROM lifecycle_events WHERE kind = 'decision_request_returned' AND subject = ?1",
-               [request.id]
-             )
-
     assert {:error, %{code: "not_open"}} =
-             return_request(db, {:session, "agent:po"}, request.id, "different reason")
+             return_request(db, {:session, "agent:stranger"}, request.id, "different reason")
 
     assert {:error, %{code: "not_open"}} =
              answer(db, {:session, "agent:po"}, request.id, "too late")
@@ -3573,6 +3594,59 @@ defmodule Tightbeam.CoordinationFabricTest do
              DB.query(db, "SELECT status FROM decision_requests WHERE id = ?1", [request.id])
 
     assert status in ~w(answered withdrawn returned)
+  end
+
+  test "concurrent exact answer retries converge on one terminal write", %{db: db} do
+    seed_session(db, "agent:coder", "flynn")
+    seed_session(db, "agent:po", "flynn")
+    seed_session(db, "agent:reviewer", "outsider")
+
+    assert {:ok, %{decision_request: request}} =
+             ask(db, "agent:coder", "agent:po", "ship now?")
+
+    barrier = :atomics.new(1, [])
+
+    answer_once = fn ->
+      Task.async(fn ->
+        :atomics.add(barrier, 1, 1)
+        until = System.monotonic_time(:millisecond) + 2_000
+
+        wait = fn wait ->
+          if :atomics.get(barrier, 1) < 2 and System.monotonic_time(:millisecond) < until,
+            do: wait.(wait),
+            else: :ok
+        end
+
+        wait.(wait)
+        answer(db, {:session, "agent:reviewer"}, request.id, "ship behind the flag")
+      end)
+    end
+
+    outcomes = [answer_once.(), answer_once.()] |> Task.await_many(5_000)
+
+    assert Enum.all?(outcomes, fn
+             {:ok,
+              %{
+                decision_request: %{
+                  status: "answered",
+                  answer: "ship behind the flag",
+                  answered_by: "session:agent:reviewer"
+                }
+              }} ->
+               true
+
+             _ ->
+               false
+           end)
+
+    assert [_one_notice] = wakes_for(db, "agent:coder")
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               db,
+               "SELECT count(*) FROM lifecycle_events WHERE kind = 'decision_request_answered' AND subject = ?1",
+               [request.id]
+             )
   end
 
   test "the schema refuses every shape the agent arm forbids", %{db: db} do
@@ -3694,6 +3768,71 @@ defmodule Tightbeam.CoordinationFabricTest do
 
     assert Escalation.list(db, reviewer_call, "open", owner_user_id: "flynn") == []
     assert Escalation.get(db, reviewer_call, request.id, owner_user_id: "flynn") == nil
+
+    assert {:ok, %{decision_request: exact}} =
+             verb(db, {:session, "agent:reviewer"}, "decision-request", %{request: request.id})
+
+    assert exact.id == request.id
+    assert exact.question == request.question
+    assert exact.context == request.context
+
+    assert {:error, %{code: "not_found"}} =
+             verb(db, {:session, "agent:reviewer"}, "decision-request", %{
+               request: String.slice(request.id, 0, 12)
+             })
+
+    assert {:error, %{code: "not_found"}} =
+             verb(db, {:user, "outsider"}, "decision-request", %{request: request.id})
+
+    assert {:error, %{code: "not_found"}} =
+             verb(db, {:process, "ci"}, "decision-request", %{request: request.id})
+
+    assert {:error, %{code: "not_found"}} =
+             answer(db, {:user, "flynn"}, request.id, "user boundaries stay narrow")
+
+    assert {:error, %{code: "not_found"}} =
+             answer(db, {:process, "ci"}, request.id, "processes gain no standing")
+
+    assert {:error, %{code: "invalid"}} =
+             verb(db, {:session, "agent:reviewer"}, "effort-rule", %{
+               request: request.id,
+               action: "continue"
+             })
+
+    statute_id = "dr_exact_hidden_statute"
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO decision_requests (id, kind, raiserId, ownerUserId, raisedAt, deadlineAt, statuteName, actionKey, question, context, status) VALUES (?1, 'statute', 'session:agent:bob-app', 'bob', 1, 999999999999, 'deploy-gate', 'exact-hidden', 'q', '{}', 'open')",
+        [statute_id]
+      )
+
+    assert {:error, %{code: "not_found"}} =
+             verb(db, {:session, "agent:reviewer"}, "decision-request", %{request: statute_id})
+
+    assert {:error, %{code: "not_found"}} =
+             verb(db, {:session, "agent:reviewer"}, "effort-rule", %{
+               request: statute_id,
+               action: "continue"
+             })
+
+    effort_id = "dr_exact_effort"
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO decision_requests (id, kind, raiserId, ownerUserId, assignmentId, expecterSessionKey, lineageRung, effortGeneration, deadlineWakeId, raisedAt, deadlineAt, question, options, context, status) VALUES (?1, 'effort', 'process:tightbeam', 'bob', 'asg_exact_effort', 'agent:bob-app', 1, 1, 'wake_exact_effort', 1, 999999999999, 'Continue or dismiss?', '[\"continue\",\"dismiss\"]', '{\"actions\":[\"continue\",\"dismiss\"]}', 'open')",
+        [effort_id]
+      )
+
+    assert {:ok, %{decision_request: effort}} =
+             verb(db, {:session, "agent:reviewer"}, "decision-request", %{request: effort_id})
+
+    assert effort.id == effort_id
+    assert effort.kind == "effort"
+    assert effort.options == ["continue", "dismiss"]
+    assert Escalation.list(db, reviewer_call, "open", owner_user_id: "flynn") == []
 
     # The owner acting AS itself — a user principal, not merely a session
     # resolving to the same owner — is the one the `ownerUserId` branch exists
@@ -3868,6 +4007,7 @@ defmodule Tightbeam.CoordinationFabricTest do
 
   defp principal_origin({:user, id}), do: "user:#{id}"
   defp principal_origin({:session, key}), do: "agent:#{key}"
+  defp principal_origin({:process, id}), do: "process:#{id}"
 
   # Every seam ③/④ call goes through `Dispatch.dispatch/3` — the chokepoint the
   # wire router uses — so `Rules.decide` sees these verbs exactly as it sees
@@ -3922,7 +4062,10 @@ defmodule Tightbeam.CoordinationFabricTest do
 
   defp admin_call(db, name, params) do
     {:ok, _} =
-      DB.query(db, "INSERT OR IGNORE INTO users (userId, isAdmin, createdAt) VALUES ('root',1,1)")
+      DB.query(
+        db,
+        "INSERT OR IGNORE INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('root', 1, 'admin_add', 1)"
+      )
 
     verb(db, {:user, "root"}, name, params)
   end
@@ -3994,9 +4137,13 @@ defmodule Tightbeam.CoordinationFabricTest do
 
   defp seed_session(db, session_key, owner) do
     {:ok, _} =
-      DB.query(db, "INSERT OR IGNORE INTO users (userId, isAdmin, createdAt) VALUES (?1, 0, 1)", [
-        owner
-      ])
+      DB.query(
+        db,
+        "INSERT OR IGNORE INTO users (userId, isAdmin, creationKind, createdAt) VALUES (?1, 0, 'admin_add', 1)",
+        [
+          owner
+        ]
+      )
 
     ensure_main_session(db, owner)
 
