@@ -7,6 +7,9 @@
 # The directory Mix downloads your dependencies sources to.
 /deps/
 
+# Native cursor-signing lock primitive built by elixir_make.
+/priv/cursor_signing_native.so
+
 # Where third-party dependencies like ExDoc output generated docs.
 /doc/
 
