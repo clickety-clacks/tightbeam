@@ -614,7 +614,7 @@ fn run_api_key_onboarding(
     machine: Option<&str>,
     ceremony: &Ceremony<'_>,
 ) -> Result<(), String> {
-    let key = read_api_key()?;
+    let key = read_api_key(provider)?;
     validate_api_key(provider, &key, machine, ceremony.deadline)?;
     match provider {
         "openai" => bank_openai_api_key(staging, &key, ceremony),
@@ -636,9 +636,9 @@ fn run_api_key_onboarding(
 /// path is non-interactive by design anyway. So the terminal case is refused
 /// with the exact command that works, which is also the form codex's own
 /// `login --with-api-key` documents.
-fn read_api_key() -> Result<String, String> {
+fn read_api_key(provider: &str) -> Result<String, String> {
     if unsafe { libc::isatty(libc::STDIN_FILENO) } == 1 {
-        return Err(api_key_needs_a_pipe());
+        return Err(api_key_needs_a_pipe(provider));
     }
     read_api_key_from(&mut io::stdin())
 }
@@ -658,11 +658,18 @@ fn read_api_key_from(reader: &mut impl io::Read) -> Result<String, String> {
 /// `isatty` directly and a unit test cannot stub that, but the remedy it prints
 /// is the whole value of the refusal. Same shape, and same reason, as
 /// `unnamed_machine`.
-fn api_key_needs_a_pipe() -> String {
-    "--api-key reads the key from stdin and will not read from a terminal, because a key \
-     typed at a prompt ends up in your shell scrollback. Pipe it in instead, e.g.\n  \
-     printenv ANTHROPIC_API_KEY | tightbeam onboard anthropic --api-key"
-        .to_owned()
+fn api_key_needs_a_pipe(provider: &str) -> String {
+    let (env_var, command) = match provider {
+        "openai" => ("OPENAI_API_KEY", "tightbeam onboard openai --api-key"),
+        "cursor" => ("CURSOR_API_KEY", "tightbeam onboard cursor --api-key"),
+        _ => ("ANTHROPIC_API_KEY", "tightbeam onboard anthropic --api-key"),
+    };
+
+    format!(
+        "--api-key reads the key from stdin and will not read from a terminal, because a key \
+         typed at a prompt ends up in your shell scrollback. Pipe it in instead, e.g.\n  \
+         printenv {env_var} | {command}"
+    )
 }
 
 /// One authenticated models call, made from THIS host, before anything is banked.
@@ -2228,11 +2235,15 @@ mod tests {
     /// guessing at an invocation that does not exist anywhere else.
     #[test]
     fn refusing_a_terminal_names_the_pipe_form() {
-        let message = api_key_needs_a_pipe();
+        let anthropic = api_key_needs_a_pipe("anthropic");
+        assert!(anthropic.contains("printenv ANTHROPIC_API_KEY"));
+        assert!(anthropic.contains("tightbeam onboard anthropic --api-key"));
+        assert!(anthropic.contains("scrollback"));
 
-        assert!(message.contains("printenv"));
-        assert!(message.contains("--api-key"));
-        assert!(message.contains("scrollback"));
+        let cursor = api_key_needs_a_pipe("cursor");
+        assert!(cursor.contains("printenv CURSOR_API_KEY"));
+        assert!(cursor.contains("tightbeam onboard cursor --api-key"));
+        assert!(!cursor.contains("anthropic"));
     }
 
     /// A subscription credential is a BEARER token, and sending it as `x-api-key` would
