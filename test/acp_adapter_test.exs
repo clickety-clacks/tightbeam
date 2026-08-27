@@ -443,6 +443,24 @@ defmodule Tightbeam.Acp.AdapterTest do
   });
   """
 
+  # macOS CI can race adapter teardown: a killed adapter may still hold capture
+  # paths when on_exit runs, and File.rm_rf!/1 raises "file already exists".
+  defp cleanup_run_dir!(run_dir) do
+    case File.rm_rf(run_dir) do
+      {:ok, _} ->
+        :ok
+
+      {:error, _, _} ->
+        Process.sleep(100)
+
+        case File.rm_rf(run_dir) do
+          {:ok, _} -> :ok
+          {:error, :enoent, _} -> :ok
+          other -> flunk("failed to clean acp run dir #{run_dir}: #{inspect(other)}")
+        end
+    end
+  end
+
   defp start_adapter(opts \\ []) do
     # Per-run private dir: unique_integer resets across VM restarts, so
     # bare /tmp names collide with stale files from prior/concurrent runs.
@@ -453,7 +471,7 @@ defmodule Tightbeam.Acp.AdapterTest do
       )
 
     File.mkdir_p!(run_dir)
-    on_exit(fn -> File.rm_rf!(run_dir) end)
+    on_exit(fn -> cleanup_run_dir!(run_dir) end)
 
     path = Path.join(run_dir, "fake_harness.js")
     capture_path = Path.join(run_dir, "capture.jsonl")
