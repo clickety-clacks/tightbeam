@@ -155,6 +155,9 @@ defmodule Tightbeam.Firehose.Registry do
             version_source: "admin_projection_versions"
           })
         end)
+        |> Map.update!("message.created", fn row ->
+          %{row | primary_refs: ["messageId", "sessionKey"]}
+        end)
         |> Map.merge(
           Map.new(@admin_rows, &{&1.class, Map.put(&1, :primary_ref, hd(&1.primary_refs))})
         )

@@ -2090,7 +2090,8 @@ defmodule Tightbeam.AssignmentsTest do
     assert revocation.closingAttestId == nil
 
     assert Enum.all?(Projection.list_after(ctx.db, "holder", nil, 100), fn marker ->
-             marker.role == "assistant" and marker.sender == "process:tightbeam"
+             marker.role == "assistant" and marker.sender == "process:tightbeam" and
+               marker.message_type == "substrate"
            end)
   end
 
