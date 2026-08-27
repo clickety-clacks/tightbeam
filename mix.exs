@@ -6,6 +6,8 @@ defmodule Tightbeam.MixProject do
       app: :tightbeam,
       version: cli_version(),
       elixir: "~> 1.19",
+      compilers: [:elixir_make] ++ Mix.compilers(),
+      make_clean: ["clean"],
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
       deps: deps(),
@@ -55,6 +57,7 @@ defmodule Tightbeam.MixProject do
 
   defp deps do
     [
+      {:elixir_make, "~> 0.10", runtime: false},
       {:exqlite, "~> 0.27"},
       # Wire front: Bandit serves Plug (HTTP control plane) + WebSock (Clawline WS).
       # The floor is the advisory boundary, stated as the advisory states it:

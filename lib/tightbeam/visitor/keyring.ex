@@ -7,15 +7,17 @@ defmodule Tightbeam.Visitor.Keyring do
   before key material becomes available to the gateway.
   """
 
-  import Bitwise
-
   alias __MODULE__.UnavailableError
+  alias __MODULE__.Native
+  alias Tightbeam.DB
 
   @schema "visitor-keyring-v1"
+  @visitor_schema "visitor-principal-v3-v1"
+  @previsitor_schema "coordination-fabric-v1-phase1-v6"
   @filename "visitor-keyring-v1.json"
   @derivation_purpose "credential-derivation"
   @digest_purpose "credential-digest"
-  @maximum_bytes 1_048_576
+  @boot_key {__MODULE__, :loaded}
 
   @enforce_keys [:path, :active_derivation_key_id, :active_digest_key_id, :keys]
   defstruct [:path, :active_derivation_key_id, :active_digest_key_id, :keys]
@@ -46,11 +48,15 @@ defmodule Tightbeam.Visitor.Keyring do
   def load(base_dir, opts \\ []) when is_binary(base_dir) and is_list(opts) do
     with {:ok, expected_uid} <- expected_uid(opts),
          path = Path.join([base_dir, "secrets", @filename]),
-         :ok <- validate_directory(Path.dirname(path), expected_uid),
          {:ok, bytes} <- read_validated_file(path, expected_uid),
          {:ok, document} <- decode_strict(bytes),
          {:ok, keyring} <- validate_document(document, path),
-         :ok <- validate_references(keyring, Keyword.get(opts, :referenced_key_ids, [])) do
+         :ok <-
+           validate_references(
+             keyring,
+             Keyword.get(opts, :referenced_derivation_key_ids, []),
+             Keyword.get(opts, :referenced_digest_key_ids, [])
+           ) do
       {:ok, keyring}
     else
       {:missing_key, key_id} -> {:error, unavailable("missing_key", key_id)}
@@ -69,6 +75,49 @@ defmodule Tightbeam.Visitor.Keyring do
     case load(base_dir, opts) do
       {:ok, keyring} -> keyring
       {:error, error} -> raise error
+    end
+  end
+
+  @doc false
+  @spec load_for_boot(Path.t(), DB.server(), keyword()) ::
+          :not_required | {:ok, t()} | {:error, UnavailableError.t()}
+  def load_for_boot(base_dir, db \\ DB, opts \\ []) do
+    :persistent_term.erase(@boot_key)
+    phase = Keyword.get(opts, :phase, :after_schema)
+
+    with {:ok, references} <- database_references(db, phase) do
+      path = Path.join([base_dir, "secrets", @filename])
+
+      if references.required or path_entry_exists?(path) do
+        case load(base_dir,
+               referenced_derivation_key_ids: references.derivation,
+               referenced_digest_key_ids: references.digest
+             ) do
+          {:ok, keyring} ->
+            :persistent_term.put(@boot_key, keyring)
+            {:ok, keyring}
+
+          {:error, error} ->
+            {:error, error}
+        end
+      else
+        :not_required
+      end
+    else
+      _ -> {:error, unavailable("database_references")}
+    end
+  rescue
+    _ -> {:error, unavailable("database_references")}
+  catch
+    _, _ -> {:error, unavailable("database_references")}
+  end
+
+  @doc "Returns the keyring locked into the current gateway boot."
+  @spec current!() :: t()
+  def current! do
+    case :persistent_term.get(@boot_key, nil) do
+      %__MODULE__{} = keyring -> keyring
+      _ -> raise unavailable("not_loaded")
     end
   end
 
@@ -154,74 +203,10 @@ defmodule Tightbeam.Visitor.Keyring do
     end
   end
 
-  defp validate_directory(path, expected_uid) do
-    with {:ok, stat} <- File.lstat(path, time: :posix),
-         true <- stat.type == :directory,
-         true <- stat.uid == expected_uid,
-         true <- permissions(stat) == 0o700 do
-      :ok
-    else
-      _ -> {:error, :invalid_directory}
-    end
-  end
-
   defp read_validated_file(path, expected_uid) do
-    with {:ok, path_stat} <- File.lstat(path, time: :posix),
-         :ok <- validate_regular(path_stat, expected_uid),
-         {:ok, io} <- :file.open(String.to_charlist(path), [:read, :binary, :raw]) do
-      try do
-        with {:ok, before_record} <- :file.read_file_info(io, time: :posix),
-             before = File.Stat.from_record(before_record),
-             :ok <- validate_regular(before, expected_uid),
-             true <- same_inode?(path_stat, before),
-             {:ok, bytes} <- read_bounded(io),
-             {:ok, after_record} <- :file.read_file_info(io, time: :posix),
-             after_stat = File.Stat.from_record(after_record),
-             true <- same_snapshot?(before, after_stat),
-             true <- byte_size(bytes) == after_stat.size do
-          {:ok, bytes}
-        else
-          _ -> {:error, :invalid_file}
-        end
-      after
-        :file.close(io)
-      end
-    else
+    case Native.read(Path.dirname(path), expected_uid) do
+      {:ok, bytes} when is_binary(bytes) -> {:ok, bytes}
       _ -> {:error, :invalid_file}
-    end
-  end
-
-  defp validate_regular(stat, expected_uid) do
-    if stat.type == :regular and stat.uid == expected_uid and permissions(stat) == 0o600,
-      do: :ok,
-      else: {:error, :invalid_file}
-  end
-
-  defp permissions(stat), do: stat.mode &&& 0o7777
-
-  defp same_inode?(left, right) do
-    left.major_device == right.major_device and left.minor_device == right.minor_device and
-      left.inode == right.inode
-  end
-
-  defp same_snapshot?(left, right) do
-    same_inode?(left, right) and left.size == right.size and left.mode == right.mode and
-      left.uid == right.uid and left.mtime == right.mtime and left.ctime == right.ctime
-  end
-
-  defp read_bounded(io) do
-    case :file.read(io, @maximum_bytes + 1) do
-      {:ok, bytes} when byte_size(bytes) <= @maximum_bytes ->
-        case :file.read(io, 1) do
-          :eof -> {:ok, bytes}
-          _ -> {:error, :too_large}
-        end
-
-      :eof ->
-        {:ok, <<>>}
-
-      _ ->
-        {:error, :read_failed}
     end
   end
 
@@ -299,32 +284,88 @@ defmodule Tightbeam.Visitor.Keyring do
 
   defp exact_map(_, _), do: {:error, :not_an_object}
 
-  defp validate_references(%__MODULE__{keys: keys}, references) when is_list(references) do
-    case Enum.find(references, &(not is_binary(&1) or not Map.has_key?(keys, &1))) do
+  defp validate_references(%__MODULE__{keys: keys}, derivation_ids, digest_ids)
+       when is_list(derivation_ids) and is_list(digest_ids) do
+    with :ok <- validate_reference_group(keys, derivation_ids, @derivation_purpose),
+         :ok <- validate_reference_group(keys, digest_ids, @digest_purpose) do
+      :ok
+    end
+  end
+
+  defp validate_references(_, _, _), do: {:error, :invalid_reference}
+
+  defp validate_reference_group(keys, ids, purpose) do
+    case Enum.find(ids, fn id ->
+           not is_binary(id) or not match?(%{purpose: ^purpose}, Map.get(keys, id))
+         end) do
       nil -> :ok
       missing when is_binary(missing) -> {:missing_key, missing}
       _ -> {:error, :invalid_reference}
     end
   end
 
-  defp validate_references(_, _), do: {:error, :invalid_reference}
+  defp database_references(db, phase) when phase in [:before_schema, :after_schema] do
+    case DB.query(db, "SELECT shape FROM schema_stamp") do
+      {:ok, [[@visitor_schema]]} -> referenced_rows(db)
+      {:ok, [[@previsitor_schema]]} -> {:ok, empty_references()}
+      {:error, _} when phase == :before_schema -> {:ok, empty_references()}
+      _ -> {:error, :invalid_schema_stamp}
+    end
+  end
+
+  defp database_references(_, _), do: {:error, :invalid_phase}
+
+  defp referenced_rows(db) do
+    sql = """
+    SELECT derivationKeyId, digestKeyId FROM visitor_invitations
+    UNION ALL
+    SELECT derivationKeyId, digestKeyId FROM visitor_access_sessions
+    """
+
+    case DB.query(db, sql) do
+      {:ok, rows} ->
+        Enum.reduce_while(rows, {:ok, %{required: true, derivation: [], digest: []}}, fn
+          [derivation_id, digest_id], {:ok, references}
+          when is_binary(derivation_id) and is_binary(digest_id) ->
+            {:cont,
+             {:ok,
+              %{
+                references
+                | derivation: [derivation_id | references.derivation],
+                  digest: [digest_id | references.digest]
+              }}}
+
+          _, _ ->
+            {:halt, {:error, :invalid_database_reference}}
+        end)
+
+      _ ->
+        {:error, :database_reference_query_failed}
+    end
+  end
+
+  defp empty_references, do: %{required: false, derivation: [], digest: []}
+
+  defp path_entry_exists?(path) do
+    match?({:ok, _}, File.lstat(path, time: :posix))
+  end
 
   defp unavailable(class, missing_key_id \\ nil),
     do: %UnavailableError{class: class, missing_key_id: missing_key_id}
-end
 
-defimpl Inspect, for: Tightbeam.Visitor.Keyring do
-  import Inspect.Algebra
+  defimpl Inspect, for: __MODULE__ do
+    import Inspect.Algebra
 
-  def inspect(keyring, _opts) do
-    concat([
-      "#Tightbeam.Visitor.Keyring<path=",
-      keyring.path,
-      " activeDerivationKeyId=",
-      keyring.active_derivation_key_id,
-      " activeDigestKeyId=",
-      keyring.active_digest_key_id,
-      " keys=[redacted]>"
-    ])
+    def inspect(keyring, _opts) do
+      concat([
+        "#Tightbeam.Visitor.Keyring<path=",
+        keyring.path,
+        " activeDerivationKeyId=",
+        keyring.active_derivation_key_id,
+        " activeDigestKeyId=",
+        keyring.active_digest_key_id,
+        " keys=[redacted]>"
+      ])
+    end
   end
 end

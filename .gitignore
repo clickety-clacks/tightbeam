@@ -20,6 +20,9 @@ erl_crash.dump
 # Also ignore archive artifacts (built via "mix archive.build").
 *.ez
 
+# Built locally by elixir_make and copied into releases; never commit host binaries.
+/priv/visitor_keyring_nif.so
+
 # Ignore package tarball (built via "mix hex.build").
 tightbeam-*.tar
 

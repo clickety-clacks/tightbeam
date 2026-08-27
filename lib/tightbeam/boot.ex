@@ -12,6 +12,7 @@ defmodule Tightbeam.Boot do
   require Logger
 
   alias Tightbeam.{Escalation, EventLog, Ledger, Schema}
+  alias Tightbeam.Visitor.Keyring
 
   @cold_start_invariants ~w(
     orphan_identity_row
@@ -42,7 +43,9 @@ defmodule Tightbeam.Boot do
   @doc "Run the boot sequence; returns :ignore so no process lingers."
   @spec start_link(String.t()) :: :ignore
   def start_link(base_dir) do
+    load_visitor_keyring!(base_dir, Tightbeam.DB, phase: :before_schema)
     ensure_schema!()
+    load_visitor_keyring!(base_dir, Tightbeam.DB, phase: :after_schema)
     epoch = EventLog.boot()
     Application.put_env(:tightbeam, :boot_epoch, epoch)
     # Boot recovery: any 'running' turn from a prior life is UNKNOWN-terminal.
@@ -54,6 +57,15 @@ defmodule Tightbeam.Boot do
 
     write_harnesses!(base_dir, projections)
     :ignore
+  end
+
+  @doc false
+  def load_visitor_keyring!(base_dir, db \\ Tightbeam.DB, opts \\ []) do
+    case Keyring.load_for_boot(base_dir, db, opts) do
+      {:ok, _keyring} -> :ok
+      :not_required -> :ok
+      {:error, error} -> raise error
+    end
   end
 
   @doc false

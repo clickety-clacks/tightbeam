@@ -157,6 +157,10 @@ fn initialize(base_dir: &Path, hook: &dyn InitHook) -> Result<Created, InitError
     if entry_exists(directory_file.as_raw_fd(), cstr(FINAL_NAME))? {
         if removed_stale {
             fsync_directory(&directory_file)?;
+            return match validate_named_file(&directory_file, cstr(FINAL_NAME), owner, None) {
+                Ok(_) => Err(InitError::Exists),
+                Err(_) => Err(InitError::RaceWinnerInvalid),
+            };
         }
         return Err(InitError::Exists);
     }
@@ -986,6 +990,37 @@ mod tests {
         assert!(validate_document(&final_bytes).is_ok());
         assert_eq!(initialize(&base, &NoHook), Err(InitError::Exists));
         assert_eq!(fs::read(directory.join(FINAL_NAME)).unwrap(), final_bytes);
+        assert_eq!(
+            fs::read_dir(&directory)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry
+                    .file_name()
+                    .as_bytes()
+                    .starts_with(TEMP_PREFIX.as_bytes()))
+                .count(),
+            0
+        );
+        cleanup(&base);
+    }
+
+    #[test]
+    fn a_crash_after_publication_retry_rejects_an_invalid_final_without_modifying_it() {
+        let base = root("crash-after-invalid-final");
+        fs::create_dir(&base).unwrap();
+        assert_eq!(
+            initialize(&base, &CrashAfter),
+            Err(InitError::InjectedCrash)
+        );
+        let directory = base.join("secrets");
+        let final_path = directory.join(FINAL_NAME);
+        write_mode(&final_path, b"invalid", 0o600);
+
+        assert_eq!(
+            initialize(&base, &NoHook),
+            Err(InitError::RaceWinnerInvalid)
+        );
+        assert_eq!(fs::read(&final_path).unwrap(), b"invalid");
         assert_eq!(
             fs::read_dir(&directory)
                 .unwrap()
