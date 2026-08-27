@@ -28,6 +28,8 @@ defmodule Tightbeam.ProviderAdditivityTest do
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Devices.ensure_schema(db)
     :ok = Tightbeam.Placement.ensure_schema(db)
+    :ok = Tightbeam.EventLog.ensure_schema(db)
+    :ok = Tightbeam.CredentialRecovery.ensure_schema(db)
 
     assert %{user_id: "fixture-admin", is_admin: true} =
              Devices.add_user(db, "fixture-admin", false)
@@ -37,7 +39,11 @@ defmodule Tightbeam.ProviderAdditivityTest do
     assert Harness.Fixture.credential_provider() == :fixture_provider
 
     onboard =
-      Gateway.handlers(%{base_dir: base, db: db, onboarding_lease_ms: 1_800_000})["onboard"]
+      Gateway.handlers(%{
+        base_dir: base,
+        db: db,
+        onboarding_lease_ms: 1_800_000
+      })["onboard"]
 
     call = %{origin: "user:fixture-admin", params: %{provider: "fixture-provider"}}
 

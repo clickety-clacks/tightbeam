@@ -117,8 +117,19 @@ defmodule Tightbeam.Credentials do
   @spec finish_onboard(provider(), kind(), String.t(), GenServer.server()) ::
           :ok | {:error, term()}
   def finish_onboard(provider, kind, lease_id, server)
-      when kind in [:api_key, :subscription] and is_binary(lease_id),
-      do: GenServer.call(server, {:finish_onboard, provider, kind, lease_id}, :infinity)
+      when kind in [:api_key, :subscription] and is_binary(lease_id) do
+    case finish_onboard(provider, kind, lease_id, [], server) do
+      {:ok, _adapter_generations} -> :ok
+      failure -> failure
+    end
+  end
+
+  @doc false
+  @spec finish_onboard(provider(), kind(), String.t(), keyword(), GenServer.server()) ::
+          {:ok, %{optional(String.t()) => pos_integer()}} | {:error, term()}
+  def finish_onboard(provider, kind, lease_id, opts, server)
+      when kind in [:api_key, :subscription] and is_binary(lease_id) and is_list(opts),
+      do: GenServer.call(server, {:finish_onboard, provider, kind, lease_id, opts}, :infinity)
 
   @doc "Cancel the identified active onboarding lease without restarting the old credential."
   @spec cancel_onboard(provider(), String.t(), GenServer.server()) :: :ok | {:error, term()}
@@ -439,7 +450,7 @@ defmodule Tightbeam.Credentials do
   end
 
   def handle_call(
-        {:finish_onboard, provider, _kind, _lease_id} = request,
+        {:finish_onboard, provider, _kind, _lease_id, _opts} = request,
         from,
         %{park_pending: pending} = state
       )
@@ -447,12 +458,12 @@ defmodule Tightbeam.Credentials do
     defer_credential_call(provider, request, from, state)
   end
 
-  def handle_call({:finish_onboard, provider, kind, lease_id}, _from, state) do
+  def handle_call({:finish_onboard, provider, kind, lease_id, opts}, _from, state) do
     state = expire_lease(state, provider)
 
     case Map.fetch(state.pending, provider) do
       {:ok, %{id: ^lease_id, path: path}} ->
-        {result, state} = finish_staged_onboard(state, provider, kind, path)
+        {result, state} = finish_staged_onboard(state, provider, kind, path, opts[:recovery_edge])
 
         cleanup_staging!(state, path)
         {:reply, result, update_in(state.pending, &Map.delete(&1, provider))}
@@ -513,7 +524,7 @@ defmodule Tightbeam.Credentials do
            :ok <- state.stop.(provider),
            {:ok, credential} <- Map.fetch!(state.onboarders, provider).(state),
            :ok <- write_credential!(state, provider, credential),
-           :ok <- state.start.(provider, :subscription),
+           {:ok, _adapter_generations} <- start_for_finish(state, provider, :subscription),
            :ok <- mark_onboarded!(state, provider, :subscription, credential),
            :ok <- state.on_credential_present.(provider),
            captured <- capture_sessions(state, provider),
@@ -879,17 +890,18 @@ defmodule Tightbeam.Credentials do
   # with what the operator was told. And a crash at any point after the mark
   # leaves the org readably failed, which is the honest reading of an
   # onboarding that did not finish.
-  defp finish_staged_onboard(state, provider, kind, path) do
+  defp finish_staged_onboard(state, provider, kind, path, recovery_edge) do
     with :ok <- prepare_staged_activation(state, provider, kind),
-         {:ok, credential} <- install_staged!(state, provider, kind, path) do
-      case activate_staged_credential(state, provider, kind, credential) do
-        :ok ->
+         {:ok, credential} <- install_staged!(state, provider, kind, path),
+         :ok <- observe_recovery_edge(recovery_edge, :credential_installed) do
+      case activate_staged_credential(state, provider, kind, credential, recovery_edge) do
+        {:ok, adapter_generations} ->
           result =
             with :ok <- state.on_credential_present.(provider),
                  captured <- capture_sessions(state, provider),
                  :ok <- state.resume.(provider) do
               publish_sessions(state, captured, :onboarded)
-              :ok
+              {:ok, adapter_generations}
             end
 
           {result, update_in(state.present_but_unverified, &Map.delete(&1, provider))}
@@ -917,21 +929,30 @@ defmodule Tightbeam.Credentials do
     end)
   end
 
-  defp activate_staged_credential(state, provider, kind, credential) do
+  defp activate_staged_credential(state, provider, kind, credential, recovery_edge) do
     with :ok <- state.stop.(provider),
-         :ok <- start_for_finish(state, provider, kind),
-         :ok <- mark_onboarded_for_finish(state, provider, kind, credential) do
-      :ok
+         {:ok, adapter_generations} <- start_for_finish(state, provider, kind),
+         :ok <- mark_onboarded_for_finish(state, provider, kind, credential),
+         :ok <- observe_recovery_edge(recovery_edge, :metadata_committed),
+         :ok <- observe_recovery_edge(recovery_edge, :adapter_started) do
+      {:ok, adapter_generations}
     end
   end
 
   defp start_for_finish(state, provider, kind) do
-    state.start.(provider, kind)
+    case state.start.(provider, kind) do
+      :ok -> {:ok, %{}}
+      {:ok, generations} when is_map(generations) -> {:ok, generations}
+      failure -> failure
+    end
   rescue
     error -> {:error, {:credential_start_failed, {:exception, Exception.message(error)}}}
   catch
     caught_kind, reason -> {:error, {:credential_start_failed, {caught_kind, reason}}}
   end
+
+  defp observe_recovery_edge(nil, _edge), do: :ok
+  defp observe_recovery_edge(observer, edge) when is_function(observer, 1), do: observer.(edge)
 
   defp mark_onboarded_for_finish(state, provider, kind, credential) do
     metadata_write_for_finish(fn -> mark_onboarded!(state, provider, kind, credential) end)
