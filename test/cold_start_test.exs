@@ -357,7 +357,7 @@ defmodule Tightbeam.ColdStartTest do
              "action" => "choose pair-first or host-local bootstrap"
            }
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v7"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v8"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
   end
 

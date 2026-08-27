@@ -433,7 +433,7 @@ defmodule Tightbeam.EscalationDeliveryTest do
 
   test "proof 10: every request site arms in-transaction and every turn sink is enumerated" do
     # Every production `decision_requests` insert/retarget site, and the
-    # in-transaction prompt arm each one owes. All four now live in
+    # in-transaction prompt arm each one owes. All five now live in
     # `escalation.ex` (Sol xhigh review round 2, finding 1: every production
     # read AND write of `decision_requests` is centralized behind named,
     # kind-classified functions there) — `EffortCheckin`'s two request sites
@@ -454,7 +454,8 @@ defmodule Tightbeam.EscalationDeliveryTest do
       # carries it commit together, or neither does.
       {"lib/tightbeam/escalation.ex", "file_agent_request/2"},
       {"lib/tightbeam/escalation.ex", "effort_insert_in_txn/2"},
-      {"lib/tightbeam/escalation.ex", "effort_update_generation_in_txn/4"}
+      {"lib/tightbeam/escalation.ex", "effort_update_generation_in_txn/4"},
+      {"lib/tightbeam/escalation.ex", "insert_operator_request_in_txn/6"}
     ]
 
     assert Enum.sort(request_sites) == Enum.sort(decision_request_sites())

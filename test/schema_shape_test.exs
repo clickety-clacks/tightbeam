@@ -34,7 +34,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
   alias Tightbeam.{DB, Model, Org, Projection, Schema}
 
-  @shape "coordination-fabric-v1-phase1-v7"
+  @shape "coordination-fabric-v1-phase1-v8"
 
   setup do
     name = :"schema_shape_#{System.unique_integer([:positive])}"
@@ -45,14 +45,114 @@ defmodule Tightbeam.SchemaShapeTest do
   test "a fresh database is created and stamped", %{db: db} do
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v7"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v8"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     # Idempotent: booting twice is the ordinary case, not a shape change.
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v7"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v8"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
+  end
+
+  test "the exact v7 predecessor activates terminal decision parity once and preserves history",
+       %{
+         db: db
+       } do
+    assert :ok = Schema.ensure_all(db)
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO decision_requests (id,kind,raiserId,ownerUserId,raisedAt,deadlineAt,statuteName,actionKey,question,context,status) VALUES ('dr_pre_terminal','statute','session:legacy','flynn',1,2,'gate','legacy','legacy question','{}','open')"
+      )
+
+    :ok =
+      DB.execute(db, """
+      DROP TRIGGER IF EXISTS decision_request_operator_terminal_insert;
+      DROP TRIGGER IF EXISTS decision_request_operator_terminal_update;
+      INSERT INTO condition_facts (id,ts,kind,scope,origin) VALUES
+        (11,11,'escalation-ruled','dr_legacy_complete','process:tightbeam'),
+        (12,12,'escalation-ruled','dr_legacy_missing_decision','process:tightbeam'),
+        (13,13,'escalation-ruled','dr_legacy_consumed','process:tightbeam');
+      INSERT INTO lifecycle_events (ts,kind,subject,detail) VALUES
+        (11,'decision_request_ruled','dr_legacy_complete','legacy'),
+        (12,'decision_request_ruled','dr_legacy_missing_decision','legacy'),
+        (13,'decision_request_ruled','dr_legacy_consumed','legacy'),
+        (14,'decision_request_ruled','dr_legacy_missing_fact','legacy');
+      INSERT INTO decision_requests
+        (id,kind,raiserId,raiserSessionKey,ownerUserId,raisedAt,deadlineAt,
+         actionKey,question,options,context,status,decision,ruledBy,ruledAt,
+         rulingFactId,consumedAt)
+      VALUES
+        ('dr_legacy_complete','operator','agent:raiser','agent:raiser:legacy','flynn',1,2,
+         'legacy-complete','legacy complete','[{"label":"accept"}]','{}','ruled','accept',
+         'user:flynn',11,11,NULL),
+        ('dr_legacy_missing_decision','operator','agent:raiser','agent:raiser:legacy','flynn',1,2,
+         'legacy-missing-decision','legacy missing decision','[{"label":"accept"}]','{}','ruled',NULL,
+         'user:flynn',12,12,NULL),
+        ('dr_legacy_missing_fact','operator','agent:raiser','agent:raiser:legacy','flynn',1,2,
+         'legacy-missing-fact','legacy missing fact','[{"label":"accept"}]','{}','ruled','accept',
+         'user:flynn',14,999,NULL),
+        ('dr_legacy_consumed','operator','agent:raiser','agent:raiser:legacy','flynn',1,2,
+         'legacy-consumed','legacy consumed','[{"label":"accept"}]','{}','consumed','accept',
+         'user:flynn',13,13,13);
+      DROP TABLE IF EXISTS decision_request_integrity_evidence;
+      DROP TABLE IF EXISTS decision_request_terminal_epoch;
+      UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v7', stampedAt=1;
+      """)
+
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok, [["dr_pre_terminal", "statute", "open", "legacy question"]]} =
+             DB.query(
+               db,
+               "SELECT id,kind,status,question FROM decision_requests WHERE id='dr_pre_terminal'"
+             )
+
+    assert "ruledViaPrincipal" in table_columns(db, "decision_requests")
+    assert "ruledViaSessionState" in table_columns(db, "decision_requests")
+
+    assert {:ok,
+            [
+              [
+                0,
+                "terminal-operator-decision-parity-v1",
+                13,
+                "terminal-operator-decision-parity-v1",
+                "process:tightbeam"
+              ]
+            ]} =
+             DB.query(
+               db,
+               "SELECT id,schemaVersion,legacyRulingFactMaxId,cause,principal FROM decision_request_terminal_epoch"
+             )
+
+    assert {:ok, [["ok"]]} = DB.query(db, "PRAGMA integrity_check")
+    assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
+
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:ok, [[1, 3]]} =
+             DB.query(
+               db,
+               "SELECT (SELECT COUNT(*) FROM decision_request_terminal_epoch), (SELECT COUNT(*) FROM decision_request_integrity_evidence)"
+             )
+
+    assert {:ok,
+            [
+              ["dr_legacy_consumed", "[\"lifecycleConsumption\"]"],
+              ["dr_legacy_missing_decision", "[\"decision\"]"],
+              ["dr_legacy_missing_fact", failing_fact_fields]
+            ]} =
+             DB.query(
+               db,
+               "SELECT requestId,failingFields FROM decision_request_integrity_evidence WHERE firstSurface='migration-preflight' AND observerPrincipal='process:tightbeam' ORDER BY requestId"
+             )
+
+    assert "rulingFactId" in JSON.decode!(failing_fact_fields)
   end
 
   test "the harness health foundation is additive and exact", %{db: db} do
@@ -101,7 +201,7 @@ defmodule Tightbeam.SchemaShapeTest do
     assert :ok = Schema.ensure_all(db)
     assert "messageType" in table_columns(db, "messages")
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v7"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v8"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     restored = Projection.get(db, historical.id)
@@ -289,7 +389,7 @@ defmodule Tightbeam.SchemaShapeTest do
     assert {:ok, ^before_rows} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
     assert {:ok, []} = DB.query(db, "SELECT wakeId FROM wake_cancellations")
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v7"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v8"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
   end
 
@@ -326,7 +426,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v7"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v8"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert {:ok,
@@ -465,7 +565,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "some-later-shape"
-    assert error.message =~ "coordination-fabric-v1-phase1-v7"
+    assert error.message =~ "coordination-fabric-v1-phase1-v8"
   end
 
   # Sol xhigh review round 2, finding 2 (wave 1): `classElection`'s CHECK
@@ -527,7 +627,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-classes-v1"
-    assert error.message =~ "coordination-fabric-v1-phase1-v7"
+    assert error.message =~ "coordination-fabric-v1-phase1-v8"
     assert error.message =~ "no migration"
 
     # It REFUSED — it did not repair or widen the constraint in place.
@@ -647,7 +747,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-v1-phase1"
-    assert error.message =~ "coordination-fabric-v1-phase1-v7"
+    assert error.message =~ "coordination-fabric-v1-phase1-v8"
     assert error.message =~ "no migration"
 
     # It REFUSED — it did not repair or relax the constraint in place.
@@ -718,7 +818,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-classes-v2"
-    assert error.message =~ "coordination-fabric-v1-phase1-v7"
+    assert error.message =~ "coordination-fabric-v1-phase1-v8"
     assert error.message =~ "no migration"
 
     # It REFUSED — the merged build's decision_requests columns were never
@@ -831,7 +931,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-v1-phase1-v2"
-    assert error.message =~ "coordination-fabric-v1-phase1-v7"
+    assert error.message =~ "coordination-fabric-v1-phase1-v8"
     assert error.message =~ "no migration"
 
     # It REFUSED — the merged build's wakes class/delivery columns were never
@@ -870,7 +970,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-v1-phase1-v3"
-    assert error.message =~ "coordination-fabric-v1-phase1-v7"
+    assert error.message =~ "coordination-fabric-v1-phase1-v8"
     assert error.message =~ "no migration"
 
     assert {:ok, [[ddl]]} =

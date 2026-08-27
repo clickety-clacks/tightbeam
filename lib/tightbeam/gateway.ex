@@ -785,18 +785,32 @@ defmodule Tightbeam.Gateway do
       {"return", ["decision_request.returned"]} => fn call ->
         decision_request_result(Escalation.return_request(db, call))
       end,
+      {"operator-ask", ["decision_request.opened"]} => fn call ->
+        decision_request_result(Escalation.operator_ask(db, call))
+      end,
+      {"operator-rule", ["decision_request.ruled"]} => fn call ->
+        decision_request_result(
+          Escalation.operator_rule(db, call,
+            scheduler: Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler),
+            firehose_call: call
+          )
+        )
+      end,
+      {"operator-withdraw", ["decision_request.withdrawn"]} => fn call ->
+        decision_request_result(Escalation.operator_withdraw(db, call))
+      end,
       {"decision-requests", []} => fn call ->
         case Escalation.list_status(call.params[:status]) do
           {:ok, status} ->
             caller = resolve_caller(db, call.origin)
 
-            %{
-              decision_requests:
-                Escalation.list(db, call, status,
-                  owner_user_id: caller && caller.owner_user_id,
-                  admin: admin_origin?(db, call.origin)
-                )
-            }
+            case Escalation.list(db, call, status,
+                   owner_user_id: caller && caller.owner_user_id,
+                   admin: admin_origin?(db, call.origin)
+                 ) do
+              %{code: _} = err -> err
+              requests -> %{decision_requests: requests}
+            end
 
           %{code: _} = err ->
             err
@@ -829,6 +843,7 @@ defmodule Tightbeam.Gateway do
 
         case request do
           nil -> %{code: "not_found", message: "decision request not found"}
+          %{code: _} = err -> err
           request -> %{decision_request: request}
         end
       end,
