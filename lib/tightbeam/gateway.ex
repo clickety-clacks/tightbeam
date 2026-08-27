@@ -4337,17 +4337,24 @@ defmodule Tightbeam.Gateway do
                activation.activation_id
              ) do
           {:ok, reconciliation} ->
-            if recovery.state != "complete" do
+            if recovery.state != "complete" and
+                 reconciliation.reconciliation_state != "retrying" do
               Wakes.fire_due(Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler))
             end
 
             onboarded_result(provider, kind)
             |> Map.merge(%{
               code:
-                if(recovery.state == "complete",
-                  do: "credential_recovery_complete",
-                  else: "credential_recovery_in_progress"
-                ),
+                cond do
+                  recovery.state == "complete" ->
+                    "credential_recovery_complete"
+
+                  reconciliation.reconciliation_state == "retrying" ->
+                    "credential_recovery_reconciliation_retrying"
+
+                  true ->
+                    "credential_recovery_in_progress"
+                end,
               host: machine,
               credential_recovered: true,
               adapters_ready: true,
@@ -4361,7 +4368,7 @@ defmodule Tightbeam.Gateway do
                    activation.activation_id,
                    reason
                  ) do
-              {:ok, :ok} ->
+              {:ok, retry} ->
                 onboarded_result(provider, kind)
                 |> Map.merge(%{
                   code: "credential_recovery_reconciliation_retrying",
@@ -4370,9 +4377,11 @@ defmodule Tightbeam.Gateway do
                   adapters_ready: true,
                   recovery_started: true,
                   recovery:
-                    Map.merge(recovery, %{
+                    recovery
+                    |> Map.merge(retry)
+                    |> Map.merge(%{
                       failure: inspect(reason),
-                      attempt: 1,
+                      reconciliation_state: "retrying",
                       reconciliation_counts:
                         Tightbeam.CredentialRecovery.reconciliation_counts(
                           db,
@@ -4447,46 +4456,74 @@ defmodule Tightbeam.Gateway do
       not (is_binary(activation_id) and activation_id != "") ->
         %{code: "invalid", message: "activationId is required"}
 
-      credential_recovery_readable?(db, activation_id, principal) ->
-        case Tightbeam.CredentialRecovery.readback(db, activation_id) do
-          nil -> %{code: "not_found", message: "credential recovery activation not found"}
-          readback -> %{recovery: readback}
-        end
-
       true ->
-        %{
-          code: "forbidden",
-          message: "credential recovery readback is not visible to this principal"
-        }
+        case credential_recovery_projection(db, activation_id, principal) do
+          {:ok, nil} ->
+            %{code: "not_found", message: "credential recovery activation not found"}
+
+          {:ok, readback} ->
+            %{recovery: readback}
+
+          :forbidden ->
+            %{
+              code: "forbidden",
+              message: "credential recovery readback is not visible to this principal"
+            }
+        end
     end
   end
 
-  defp credential_recovery_readable?(db, activation_id, principal) do
-    principal_binding_admin?(db, principal) or
-      case principal do
-        {:session, session_key} ->
-          match?(
-            {:ok, [[1]]},
-            DB.query(
-              db,
-              "SELECT 1 FROM credential_recovery_memberships WHERE activationId=?1 AND sessionKey=?2 LIMIT 1",
-              [activation_id, session_key]
-            )
+  defp credential_recovery_projection(db, activation_id, principal) do
+    readback = Tightbeam.CredentialRecovery.readback(db, activation_id)
+
+    cond do
+      principal_binding_admin?(db, principal) ->
+        {:ok, readback}
+
+      match?({:session, _}, principal) ->
+        {:session, session_key} = principal
+        project_credential_recovery(readback, [session_key])
+
+      match?({:user, _}, principal) ->
+        {:user, user_id} = principal
+
+        {:ok, rows} =
+          DB.query(
+            db,
+            """
+            SELECT m.sessionKey
+            FROM credential_recovery_memberships m
+            JOIN sessions s ON s.sessionKey=m.sessionKey
+            WHERE m.activationId=?1 AND s.ownerUserId=?2
+            ORDER BY m.sessionKey
+            """,
+            [activation_id, user_id]
           )
 
-        {:user, user_id} ->
-          match?(
-            {:ok, [[1]]},
-            DB.query(
-              db,
-              "SELECT 1 FROM credential_recovery_activations WHERE activationId=?1 AND principal=?2 LIMIT 1",
-              [activation_id, "user:#{user_id}"]
-            )
-          )
+        project_credential_recovery(readback, Enum.map(rows, &hd/1))
 
-        _ ->
-          false
-      end
+      true ->
+        :forbidden
+    end
+  end
+
+  defp project_credential_recovery(nil, _session_keys), do: :forbidden
+  defp project_credential_recovery(_readback, []), do: :forbidden
+
+  defp project_credential_recovery(readback, session_keys) do
+    allowed = MapSet.new(session_keys)
+    targets = Enum.filter(readback.targets, &MapSet.member?(allowed, &1.session_key))
+
+    if targets == [] do
+      :forbidden
+    else
+      {:ok,
+       %{
+         readback
+         | targets: targets,
+           membership_counts: targets |> Enum.map(& &1.resolution) |> Enum.frequencies()
+       }}
+    end
   end
 
   defp onboarding_caller(_db, %{principal: {:user, owner}}) when is_binary(owner),

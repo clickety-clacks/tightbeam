@@ -58,7 +58,10 @@ defmodule Tightbeam.CredentialRecovery do
     )),
     cycle INTEGER NOT NULL CHECK (cycle > 0),
     attempt INTEGER NOT NULL CHECK (attempt BETWEEN 0 AND 3),
-    reconciliationAttempt INTEGER NOT NULL DEFAULT 0 CHECK (reconciliationAttempt BETWEEN 0 AND 3),
+    attemptState TEXT NOT NULL CHECK (attemptState IN (
+      'reserved','materialized','claimed','terminal','not_admitted_cycle_closed'
+    )),
+    reconciliationGeneration INTEGER NOT NULL DEFAULT 0 CHECK (reconciliationGeneration >= 0),
     wakeId TEXT REFERENCES wakes(wakeId),
     turnSeq INTEGER REFERENCES turns(seq),
     coveredGeneration INTEGER CHECK (coveredGeneration > 0),
@@ -77,6 +80,8 @@ defmodule Tightbeam.CredentialRecovery do
     sessionKey TEXT NOT NULL REFERENCES sessions(sessionKey),
     targetId TEXT NOT NULL REFERENCES credential_recovery_targets(targetId),
     generation INTEGER NOT NULL CHECK (generation > 0),
+    snapshotHost TEXT NOT NULL,
+    snapshotHarness TEXT NOT NULL,
     adapterGeneration INTEGER CHECK (adapterGeneration > 0),
     resolution TEXT NOT NULL CHECK (resolution IN (
       'open','handled','retired','no_longer_affected','undeliverable'
@@ -88,6 +93,7 @@ defmodule Tightbeam.CredentialRecovery do
       'delivered','could_not_run','run_failed','run_canceled','outcome_unknown'
     )),
     reconciliationTurnSeq INTEGER REFERENCES turns(seq),
+    reconciliationCycle INTEGER NOT NULL CHECK (reconciliationCycle > 0),
     resolvedCycle INTEGER,
     resolvedTurnSeq INTEGER REFERENCES turns(seq),
     resolvedAt INTEGER,
@@ -143,6 +149,25 @@ defmodule Tightbeam.CredentialRecovery do
     Enum.each(claimed, fn [_target_id, seq] ->
       terminalize_claimed_after_crash(db, seq)
       turn_terminal(db, seq)
+    end)
+
+    {:ok, due_reconciliations} =
+      DB.query(
+        db,
+        """
+        SELECT t.targetId,w.wakeId
+        FROM credential_recovery_targets t
+        JOIN wakes w ON w.conditionScope=t.targetId
+        WHERE t.state='retry_wait' AND t.dueAt<=?1
+          AND t.failure LIKE 'reconciliation_failed:%'
+          AND w.consumer='credential_recovery_retry' AND w.state='pending'
+        ORDER BY t.targetId,w.wakeId
+        """,
+        [now()]
+      )
+
+    Enum.each(due_reconciliations, fn [target_id, wake_id] ->
+      retry_reconciliation(db, %{wake_id: wake_id}, target_id)
     end)
 
     {:ok, pending} =
@@ -275,6 +300,8 @@ defmodule Tightbeam.CredentialRecovery do
                activation_id,
                target_id,
                session_key,
+               host,
+               harness,
                generation,
                adapter_generation
              )
@@ -305,54 +332,47 @@ defmodule Tightbeam.CredentialRecovery do
     end
   end
 
-  @doc "Terminalize every pre-activation running turn without waiting for its old adapter callback."
+  @doc "Reconcile every pending current-cycle membership through its target's one owner."
   def reconcile_ready_activation(db, activation_id) do
-    {:ok, rows} =
+    {:ok, target_rows} =
       DB.query(
         db,
         """
-        SELECT targetId,sessionKey,reconciliationTurnSeq
+        SELECT DISTINCT targetId
         FROM credential_recovery_memberships
         WHERE activationId=?1 AND reconciliationState='pending'
-        ORDER BY targetId,sessionKey
+        ORDER BY targetId
         """,
         [activation_id]
       )
 
-    reconciled =
-      Enum.map(rows, fn [target_id, session_key, seq] ->
-        result =
-          DB.transaction(db, fn txn ->
-            reconcile_running_in_txn(txn, activation_id, session_key, seq)
-          end)
-
-        case result do
-          {:ok, disposition} ->
-            SessionLane.release_terminalized(session_key, seq)
-            {:ok, target_id, disposition}
-
-          {:error, reason} ->
-            {:error, target_id, reason}
-        end
+    outcomes =
+      Enum.map(target_rows, fn [target_id] ->
+        {target_id, reconcile_target(db, target_id)}
       end)
 
-    failures = Enum.filter(reconciled, &match?({:error, _, _}, &1))
+    failures = Enum.filter(outcomes, fn {_target_id, result} -> match?({:error, _}, result) end)
 
     if failures == [] do
-      target_ids = rows |> Enum.map(&hd/1) |> Enum.uniq()
+      retrying =
+        Enum.flat_map(outcomes, fn
+          {_target_id, {:ok, %{state: "retry_wait"} = status}} -> [status]
+          _ -> []
+        end)
 
-      Enum.each(target_ids, fn target_id ->
-        {:ok, :ok} =
-          DB.transaction(db, fn txn ->
-            materialize_if_needed(txn, activation_id, target_id)
-            :ok
-          end)
-      end)
+      reconciled_count =
+        Enum.reduce(outcomes, 0, fn
+          {_target_id, {:ok, %{reconciled_count: count}}}, total -> total + count
+          _, total -> total
+        end)
 
       {:ok,
        %{
-         reconciliation_state: "reconciled",
-         reconciled_count: length(rows),
+         reconciliation_state: if(retrying == [], do: "reconciled", else: "retrying"),
+         reconciled_count: reconciled_count,
+         attempt: retrying |> Enum.map(& &1.attempt) |> Enum.max(fn -> 0 end),
+         due_at:
+           retrying |> Enum.map(& &1.due_at) |> Enum.reject(&is_nil/1) |> Enum.min(fn -> nil end),
          reconciliation_counts: reconciliation_counts(db, activation_id)
        }}
     else
@@ -360,7 +380,7 @@ defmodule Tightbeam.CredentialRecovery do
     end
   end
 
-  @doc "Persist the first bounded reconciliation retry without creating a carrier."
+  @doc "Persist one target-level bounded retry without creating or admitting its carrier."
   def defer_reconciliation(db, activation_id, reason) do
     DB.transaction(db, fn txn ->
       targets =
@@ -370,50 +390,14 @@ defmodule Tightbeam.CredentialRecovery do
           [activation_id]
         )
 
-      Enum.each(targets, fn [target_id] ->
-        [[session_key, cycle]] =
-          Txn.q(
-            txn,
-            "SELECT sessionKey,cycle FROM credential_recovery_targets WHERE targetId=?1",
-            [target_id]
-          )
+      statuses =
+        Enum.map(targets, fn [target_id] -> defer_target_in_txn(txn, target_id, reason) end)
 
-        due_at = now() + hd(@retry_delays)
-        wake_id = reconciliation_wake_id(target_id, cycle, 1)
-
-        Wakes.schedule_in_txn(txn, %{
-          wake_id: wake_id,
-          session_key: session_key,
-          origin: @process,
-          consumer: "credential_recovery_retry",
-          prompt: target_id,
-          due_at: due_at,
-          condition_scope: target_id,
-          target_gate: 1,
-          sender_scheduled: true
-        })
-
-        Txn.q(
-          txn,
-          "UPDATE credential_recovery_targets SET state='retry_wait',reconciliationAttempt=1,dueAt=?2,failure=?3,updatedAt=?4 WHERE targetId=?1 AND state IN ('pending','admitted')",
-          [target_id, due_at, "reconciliation_failed:#{failure_code(reason)}", now()]
-        )
-
-        Txn.q(
-          txn,
-          "UPDATE wakes SET dueAt=?2 WHERE wakeId=(SELECT wakeId FROM credential_recovery_targets WHERE targetId=?1) AND state='pending'",
-          [target_id, due_at + 1]
-        )
-
-        audit(
-          txn,
-          "credential_recovery_reconciliation_retry_wait",
-          target_id,
-          "attempt=1 dueAt=#{due_at}"
-        )
-      end)
-
-      :ok
+      %{
+        attempt: statuses |> Enum.map(& &1.attempt) |> Enum.max(fn -> 0 end),
+        due_at:
+          statuses |> Enum.map(& &1.due_at) |> Enum.reject(&is_nil/1) |> Enum.min(fn -> nil end)
+      }
     end)
   end
 
@@ -475,30 +459,14 @@ defmodule Tightbeam.CredentialRecovery do
            "SELECT targetId,sessionKey,cycle FROM credential_recovery_targets WHERE wakeId=?1 AND state IN ('pending','admitted')",
            [wake_id]
          ) do
-      [[target_id, session_key, cycle]] ->
+      [[target_id, session_key, _cycle]] ->
         disposition =
           case Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey=?1", [session_key]) do
             [["retired"]] -> "retired"
             _ -> "no_longer_affected"
           end
 
-        at = now()
-
-        Txn.q(
-          txn,
-          "UPDATE credential_recovery_targets SET state=?2,failure=?2,updatedAt=?3 WHERE targetId=?1",
-          [target_id, disposition, at]
-        )
-
-        Txn.q(
-          txn,
-          "UPDATE credential_recovery_memberships SET resolution=?2,resolvedCycle=?3,resolvedAt=?4 WHERE targetId=?1 AND resolution='open'",
-          [target_id, disposition, cycle, at]
-        )
-
-        cancel_target_wake(txn, target_id, "target_unresolvable")
-        complete_activations(txn, target_id)
-        audit(txn, "credential_recovery_#{disposition}", target_id, "wakeId=#{wake_id}")
+        dispose_target(txn, %{id: target_id}, disposition, "unavailable:#{wake_id}")
         disposition
 
       [] ->
@@ -518,24 +486,8 @@ defmodule Tightbeam.CredentialRecovery do
           [session_key]
         )
 
-      Enum.each(targets, fn [target_id, cycle] ->
-        at = now()
-
-        Txn.q(
-          txn,
-          "UPDATE credential_recovery_targets SET state='retired',failure='retired',updatedAt=?2 WHERE targetId=?1",
-          [target_id, at]
-        )
-
-        Txn.q(
-          txn,
-          "UPDATE credential_recovery_memberships SET resolution='retired',resolvedCycle=?2,resolvedAt=?3 WHERE targetId=?1 AND resolution='open'",
-          [target_id, cycle, at]
-        )
-
-        cancel_target_wake(txn, target_id, "target_unresolvable")
-        complete_activations(txn, target_id)
-        audit(txn, "credential_recovery_retired", target_id, "session=#{session_key}")
+      Enum.each(targets, fn [target_id, _cycle] ->
+        dispose_target(txn, %{id: target_id}, "retired", "session-retired:#{session_key}")
       end)
 
       :ok
@@ -559,7 +511,7 @@ defmodule Tightbeam.CredentialRecovery do
         else
           Txn.q(
             txn,
-            "UPDATE credential_recovery_targets SET state='claimed',turnSeq=?2,coveredGeneration=?3,updatedAt=?4 WHERE targetId=?1 AND state IN ('pending','admitted')",
+            "UPDATE credential_recovery_targets SET state='claimed',attemptState='claimed',turnSeq=?2,coveredGeneration=?3,updatedAt=?4 WHERE targetId=?1 AND state IN ('pending','admitted')",
             [target_id, seq, generation, now()]
           )
 
@@ -640,7 +592,7 @@ defmodule Tightbeam.CredentialRecovery do
 
           Txn.q(
             txn,
-            "UPDATE credential_recovery_targets SET state='pending',attempt=?2,dueAt=NULL,wakeId=NULL,turnSeq=NULL,coveredGeneration=NULL,updatedAt=?3 WHERE targetId=?1 AND state='retry_wait' AND attempt=?4",
+            "UPDATE credential_recovery_targets SET state='pending',attempt=?2,attemptState='reserved',dueAt=NULL,wakeId=NULL,turnSeq=NULL,coveredGeneration=NULL,updatedAt=?3 WHERE targetId=?1 AND state='retry_wait' AND attempt=?4",
             [target_id, next_attempt, now(), attempt]
           )
 
@@ -659,84 +611,60 @@ defmodule Tightbeam.CredentialRecovery do
   end
 
   defp retry_reconciliation(db, wake, target_id) do
-    {:ok, activation_rows} =
-      DB.query(
-        db,
-        "SELECT activationId FROM credential_recovery_memberships WHERE targetId=?1 AND reconciliationState='pending' ORDER BY generation",
-        [target_id]
-      )
+    current_time = now()
 
-    failures =
-      activation_rows
-      |> Enum.map(fn [activation_id] -> reconcile_ready_activation(db, activation_id) end)
-      |> Enum.filter(&match?({:error, _}, &1))
+    reservation =
+      DB.transaction(db, fn txn ->
+        case Txn.q(
+               txn,
+               "SELECT state,attempt,dueAt,requiredGeneration FROM credential_recovery_targets WHERE targetId=?1",
+               [target_id]
+             ) do
+          [["retry_wait", attempt, due_at, required_generation]]
+          when due_at <= current_time and attempt < 3 ->
+            next_attempt = attempt + 1
 
-    DB.transaction(db, fn txn ->
-      if failures == [] do
-        Txn.q(
-          txn,
-          "UPDATE credential_recovery_targets SET state='pending',dueAt=NULL,failure=NULL,updatedAt=?2 WHERE targetId=?1 AND state='retry_wait'",
-          [target_id, now()]
-        )
+            Txn.q(
+              txn,
+              """
+              UPDATE credential_recovery_targets
+              SET state='pending',attempt=?2,attemptState='reserved',
+                  reconciliationGeneration=?3,dueAt=NULL,failure=NULL,updatedAt=?4
+              WHERE targetId=?1 AND state='retry_wait' AND attempt=?5 AND dueAt=?6
+              """,
+              [target_id, next_attempt, required_generation, now(), attempt, due_at]
+            )
 
-        materialize_if_needed(txn, nil, target_id)
-        consume_internal_wake(txn, wake.wake_id)
-        audit(txn, "credential_recovery_reconciliation_recovered", target_id, nil)
-      else
-        [[attempt]] =
-          Txn.q(
-            txn,
-            "SELECT reconciliationAttempt FROM credential_recovery_targets WHERE targetId=?1",
-            [target_id]
-          )
+            if Txn.changes(txn) != 1, do: raise("credential_recovery_retry_reservation_race")
+            consume_internal_wake(txn, wake.wake_id)
+            audit(txn, "credential_recovery_retry_reserved", target_id, "attempt=#{next_attempt}")
+            {:reserved, next_attempt}
 
-        if attempt < 3 do
-          next_attempt = attempt + 1
-          due_at = now() + Enum.at(@retry_delays, attempt)
-
-          Txn.q(
-            txn,
-            "UPDATE credential_recovery_targets SET reconciliationAttempt=?2,dueAt=?3,failure=?4,updatedAt=?5 WHERE targetId=?1 AND state='retry_wait'",
-            [
-              target_id,
-              next_attempt,
-              due_at,
-              "reconciliation_failed:#{failure_code(failures)}",
-              now()
-            ]
-          )
-
-          Txn.q(txn, "UPDATE wakes SET dueAt=?2 WHERE wakeId=?1 AND state='pending'", [
-            wake.wake_id,
-            due_at
-          ])
-
-          Txn.q(
-            txn,
-            "UPDATE wakes SET dueAt=?2 WHERE wakeId=(SELECT wakeId FROM credential_recovery_targets WHERE targetId=?1) AND state='pending'",
-            [target_id, due_at + 1]
-          )
-
-          audit(
-            txn,
-            "credential_recovery_reconciliation_retry_wait",
-            target_id,
-            "attempt=#{next_attempt} dueAt=#{due_at}"
-          )
-        else
-          Txn.q(
-            txn,
-            "UPDATE credential_recovery_memberships SET reconciliationState='failed',reconciliationResult='could_not_run' WHERE targetId=?1 AND reconciliationState='pending'",
-            [target_id]
-          )
-
-          dispose_target(txn, %{id: target_id}, "undeliverable", "reconciliation-attempt-3")
-          consume_internal_wake(txn, wake.wake_id)
+          _ ->
+            consume_internal_wake(txn, wake.wake_id)
+            :stale
         end
-      end
+      end)
 
-      :ok
-    end)
+    case reservation do
+      {:ok, {:reserved, _attempt}} ->
+        case reconcile_target(db, target_id) do
+          {:ok, _status} ->
+            {:ok, :ok}
+
+          {:error, reason} ->
+            DB.transaction(db, fn txn ->
+              defer_target_in_txn(txn, target_id, reason)
+              :ok
+            end)
+        end
+
+      {:ok, :stale} ->
+        {:ok, :stale}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
   end
 
   @doc "Persistent, privacy-bounded recovery readback."
@@ -751,9 +679,10 @@ defmodule Tightbeam.CredentialRecovery do
           DB.query(
             db,
             """
-            SELECT m.sessionKey,m.generation,m.resolution,m.reconciliationState,
-                   m.reconciliationResult,
-                   t.state,t.cycle,t.attempt,t.reconciliationAttempt,t.turnSeq,t.dueAt,t.failure
+            SELECT m.sessionKey,m.generation,m.snapshotHost,m.snapshotHarness,m.resolution,
+                   m.reconciliationState,m.reconciliationResult,m.reconciliationCycle,
+                   m.reconciliationTurnSeq,t.state,t.cycle,t.attempt,t.attemptState,
+                   t.reconciliationGeneration,t.turnSeq,t.dueAt,t.failure
             FROM credential_recovery_memberships m
             JOIN credential_recovery_targets t ON t.targetId=m.targetId
             WHERE m.activationId=?1 ORDER BY m.sessionKey
@@ -776,13 +705,18 @@ defmodule Tightbeam.CredentialRecovery do
             Enum.map(rows, fn [
                                 session,
                                 member_gen,
+                                snapshot_host,
+                                snapshot_harness,
                                 resolution,
                                 reconciliation,
                                 reconciliation_result,
+                                reconciliation_cycle,
+                                reconciliation_turn_seq,
                                 target_state,
                                 cycle,
                                 attempt,
-                                reconciliation_attempt,
+                                attempt_state,
+                                reconciliation_generation,
                                 turn_seq,
                                 due_at,
                                 target_failure
@@ -790,18 +724,32 @@ defmodule Tightbeam.CredentialRecovery do
               %{
                 session_key: session,
                 generation: member_gen,
+                snapshot_host: snapshot_host,
+                snapshot_harness: snapshot_harness,
                 resolution: resolution,
                 reconciliation: reconciliation,
                 reconciliation_result: reconciliation_result,
+                reconciliation_cycle: reconciliation_cycle,
+                reconciliation_turn_seq: reconciliation_turn_seq,
                 state: target_state,
                 cycle: cycle,
                 attempt: attempt,
-                reconciliation_attempt: reconciliation_attempt,
+                attempt_state: attempt_state,
+                reconciliation_owner: %{
+                  target_id: target_id(host, provider, session),
+                  cycle: cycle,
+                  attempt: attempt,
+                  generation: reconciliation_generation
+                },
                 turn_seq: turn_seq,
                 due_at: due_at,
                 failure: target_failure
               }
-            end)
+            end),
+          membership_counts:
+            rows
+            |> Enum.map(&Enum.at(&1, 4))
+            |> Enum.frequencies()
         }
 
       {:ok, []} ->
@@ -885,8 +833,9 @@ defmodule Tightbeam.CredentialRecovery do
           txn,
           """
           INSERT INTO credential_recovery_targets
-            (targetId,host,provider,sessionKey,requiredGeneration,state,cycle,attempt,updatedAt,cause,principal)
-          VALUES (?1,?2,?3,?4,?5,'pending',1,0,?6,'activation-ready',?7)
+            (targetId,host,provider,sessionKey,requiredGeneration,state,cycle,attempt,
+             attemptState,updatedAt,cause,principal)
+          VALUES (?1,?2,?3,?4,?5,'pending',1,0,'reserved',?6,'activation-ready',?7)
           """,
           [target_id, host, provider, session_key, generation, at, @process]
         )
@@ -906,7 +855,8 @@ defmodule Tightbeam.CredentialRecovery do
           """
           UPDATE credential_recovery_targets
           SET requiredGeneration=?2,state='pending',cycle=?3,attempt=0,wakeId=NULL,
-              turnSeq=NULL,coveredGeneration=NULL,dueAt=NULL,failure=NULL,updatedAt=?4,
+              attemptState='reserved',reconciliationGeneration=0,turnSeq=NULL,
+              coveredGeneration=NULL,dueAt=NULL,failure=NULL,updatedAt=?4,
               cause='later-activation',principal=?5
           WHERE targetId=?1
           """,
@@ -920,27 +870,36 @@ defmodule Tightbeam.CredentialRecovery do
          activation_id,
          target_id,
          session_key,
+         snapshot_host,
+         snapshot_harness,
          generation,
          adapter_generation
        ) do
     {reconciliation, turn_seq} = prior_running(txn, session_key, adapter_generation)
 
+    [[cycle]] =
+      Txn.q(txn, "SELECT cycle FROM credential_recovery_targets WHERE targetId=?1", [target_id])
+
     Txn.q(
       txn,
       """
       INSERT INTO credential_recovery_memberships
-        (activationId,sessionKey,targetId,generation,adapterGeneration,resolution,
-         reconciliationState,reconciliationTurnSeq,cause,principal)
-      VALUES (?1,?2,?3,?4,?5,'open',?6,?7,'activation-membership',?8)
+        (activationId,sessionKey,targetId,generation,snapshotHost,snapshotHarness,
+         adapterGeneration,resolution,reconciliationState,reconciliationTurnSeq,
+         reconciliationCycle,cause,principal)
+      VALUES (?1,?2,?3,?4,?5,?6,?7,'open',?8,?9,?10,'activation-membership',?11)
       """,
       [
         activation_id,
         session_key,
         target_id,
         generation,
+        snapshot_host,
+        snapshot_harness,
         adapter_generation,
         reconciliation,
         turn_seq,
+        cycle,
         @process
       ]
     )
@@ -950,20 +909,15 @@ defmodule Tightbeam.CredentialRecovery do
     case Txn.q(
            txn,
            """
-           SELECT turns.seq,turns.adapterGen,
-                  EXISTS (SELECT 1 FROM credential_recovery_targets t
-                          WHERE t.turnSeq=turns.seq AND t.state='claimed')
+           SELECT turns.seq,turns.adapterGen
            FROM turns WHERE sessionKey=?1 AND status='running' ORDER BY seq LIMIT 1
            """,
            [session_key]
          ) do
-      [[_seq, _generation, 1]] ->
-        {"not_required", nil}
-
-      [[seq, generation, 0]] when is_integer(generation) and generation < adapter_generation ->
+      [[seq, generation]] when is_integer(generation) and generation < adapter_generation ->
         {"pending", seq}
 
-      [[seq, nil, 0]] ->
+      [[seq, nil]] ->
         {"pending", seq}
 
       _ ->
@@ -971,8 +925,87 @@ defmodule Tightbeam.CredentialRecovery do
     end
   end
 
-  defp reconcile_running_in_txn(txn, activation_id, session_key, seq) do
-    disposition =
+  defp reconcile_target(db, target_id) do
+    case DB.transaction(db, fn txn ->
+           [[session_key, state, cycle, attempt, due_at, required_generation]] =
+             Txn.q(
+               txn,
+               "SELECT sessionKey,state,cycle,attempt,dueAt,requiredGeneration FROM credential_recovery_targets WHERE targetId=?1",
+               [target_id]
+             )
+
+           if state == "retry_wait" do
+             %{state: state, attempt: attempt, due_at: due_at, reconciled_count: 0, releases: []}
+           else
+             rows =
+               Txn.q(
+                 txn,
+                 """
+                 SELECT activationId,sessionKey,reconciliationTurnSeq
+                 FROM credential_recovery_memberships
+                 WHERE targetId=?1 AND reconciliationCycle=?2 AND reconciliationState='pending'
+                 ORDER BY reconciliationTurnSeq,activationId
+                 """,
+                 [target_id, cycle]
+               )
+
+             releases =
+               rows
+               |> Enum.group_by(&Enum.at(&1, 2))
+               |> Enum.sort_by(fn {seq, _memberships} -> seq end)
+               |> Enum.map(fn {seq, memberships} ->
+                 reconcile_turn_group_in_txn(
+                   txn,
+                   target_id,
+                   cycle,
+                   session_key,
+                   seq,
+                   memberships
+                 )
+               end)
+
+             Txn.q(
+               txn,
+               "UPDATE credential_recovery_targets SET reconciliationGeneration=?2,failure=NULL,updatedAt=?3 WHERE targetId=?1",
+               [target_id, required_generation, now()]
+             )
+
+             materialize_if_needed(txn, nil, target_id)
+
+             %{
+               state: state,
+               attempt: attempt,
+               due_at: nil,
+               reconciled_count: length(rows),
+               releases: releases
+             }
+           end
+         end) do
+      {:ok, %{releases: releases} = status} ->
+        Enum.each(releases, fn
+          %{terminalized?: true, session_key: session_key, seq: seq} ->
+            SessionLane.release_terminalized(session_key, seq)
+
+          _ ->
+            :ok
+        end)
+
+        {:ok, Map.delete(status, :releases)}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp reconcile_turn_group_in_txn(
+         txn,
+         target_id,
+         cycle,
+         session_key,
+         seq,
+         memberships
+       ) do
+    {reconciliation_state, disposition, terminalized?} =
       case Txn.q(
              txn,
              """
@@ -1005,30 +1038,127 @@ defmodule Tightbeam.CredentialRecovery do
               owner_lease: owner_lease
             )
 
-          disposition
+          {"done", disposition, true}
 
         [[status, _owner_lease]]
         when status in ["delivered", "canceled", "failed", "failed_unknown"] ->
-          terminal_disposition(txn, seq, status)
+          {"done", terminal_disposition(txn, seq, status), false}
 
         [] ->
-          raise "credential_recovery_reconciliation_turn_missing activation=#{activation_id} turn=#{seq}"
+          {"not_required", nil, false}
       end
 
     Txn.q(
       txn,
-      "UPDATE credential_recovery_memberships SET reconciliationState='done',reconciliationResult=?4 WHERE activationId=?1 AND sessionKey=?2 AND reconciliationTurnSeq=?3 AND reconciliationState='pending'",
-      [activation_id, session_key, seq, disposition]
+      "UPDATE credential_recovery_memberships SET reconciliationState=?4,reconciliationResult=?5 WHERE targetId=?1 AND reconciliationCycle=?2 AND reconciliationTurnSeq=?3 AND reconciliationState='pending'",
+      [target_id, cycle, seq, reconciliation_state, disposition]
     )
 
     audit(
       txn,
       "credential_recovery_reconciled",
-      activation_id,
-      "session=#{session_key} turnSeq=#{seq} disposition=#{disposition}"
+      target_id,
+      "cycle=#{cycle} session=#{session_key} turnSeq=#{seq} memberships=#{length(memberships)} disposition=#{disposition || "not_required"}"
     )
 
-    disposition
+    %{session_key: session_key, seq: seq, terminalized?: terminalized?}
+  end
+
+  defp defer_target_in_txn(txn, target_id, reason) do
+    [[session_key, cycle, attempt, state, due_at, required_generation]] =
+      Txn.q(
+        txn,
+        "SELECT sessionKey,cycle,attempt,state,dueAt,requiredGeneration FROM credential_recovery_targets WHERE targetId=?1",
+        [target_id]
+      )
+
+    cond do
+      state == "retry_wait" ->
+        %{attempt: attempt, due_at: due_at}
+
+      attempt < 3 ->
+        next_attempt = attempt + 1
+        retry_at = now() + Enum.at(@retry_delays, attempt)
+        wake_id = reconciliation_wake_id(target_id, cycle, next_attempt)
+
+        cancel_target_wake(txn, target_id, "consumer_unavailable")
+
+        Wakes.schedule_in_txn(txn, %{
+          wake_id: wake_id,
+          session_key: session_key,
+          origin: @process,
+          consumer: "credential_recovery_retry",
+          prompt: target_id,
+          due_at: retry_at,
+          condition_scope: target_id,
+          target_gate: 1,
+          sender_scheduled: true
+        })
+
+        Txn.q(
+          txn,
+          """
+          UPDATE credential_recovery_targets
+          SET state='retry_wait',attemptState='terminal',reconciliationGeneration=?2,
+              wakeId=NULL,dueAt=?3,failure=?4,updatedAt=?5
+          WHERE targetId=?1 AND state IN ('pending','admitted','claimed')
+          """,
+          [
+            target_id,
+            required_generation,
+            retry_at,
+            "reconciliation_failed:#{failure_code(reason)}",
+            now()
+          ]
+        )
+
+        audit(
+          txn,
+          "credential_recovery_reconciliation_retry_wait",
+          target_id,
+          "attempt=#{attempt} nextAttempt=#{next_attempt} dueAt=#{retry_at}"
+        )
+
+        %{attempt: attempt, due_at: retry_at}
+
+      true ->
+        finalize_reconciliation_failure_in_txn(txn, target_id, cycle, required_generation, reason)
+        %{attempt: attempt, due_at: nil}
+    end
+  end
+
+  defp finalize_reconciliation_failure_in_txn(
+         txn,
+         target_id,
+         cycle,
+         reconciliation_generation,
+         reason
+       ) do
+    at = now()
+
+    Txn.q(
+      txn,
+      "UPDATE credential_recovery_memberships SET reconciliationState='failed',reconciliationResult='could_not_run' WHERE targetId=?1 AND reconciliationCycle=?2 AND reconciliationState='pending'",
+      [target_id, cycle]
+    )
+
+    Txn.q(
+      txn,
+      "UPDATE credential_recovery_memberships SET resolution='undeliverable',resolvedCycle=?2,resolvedAt=?3 WHERE targetId=?1 AND resolution='open' AND generation<=?4",
+      [target_id, cycle, at, reconciliation_generation]
+    )
+
+    cancel_target_wake(txn, target_id, "consumer_unavailable")
+    cancel_internal_retry_wakes(txn, target_id, "consumer_unavailable")
+
+    Txn.q(
+      txn,
+      "UPDATE credential_recovery_targets SET state='undeliverable',attemptState='terminal',wakeId=NULL,dueAt=NULL,failure=?2,updatedAt=?3 WHERE targetId=?1",
+      [target_id, "reconciliation_failed:#{failure_code(reason)}", at]
+    )
+
+    complete_activations(txn, target_id)
+    audit(txn, "credential_recovery_undeliverable", target_id, "reconciliation-attempt-3")
   end
 
   defp terminalize_claimed_after_crash(db, seq) do
@@ -1122,10 +1252,19 @@ defmodule Tightbeam.CredentialRecovery do
 
     at = now()
 
+    cancel_target_wake(txn, target.id, "target_unresolvable")
+    cancel_internal_retry_wakes(txn, target.id, "target_unresolvable")
+
     Txn.q(
       txn,
-      "UPDATE credential_recovery_targets SET state=?2,failure=?2,updatedAt=?3 WHERE targetId=?1",
+      "UPDATE credential_recovery_targets SET state=?2,attemptState='terminal',wakeId=NULL,dueAt=NULL,failure=?2,updatedAt=?3 WHERE targetId=?1",
       [target.id, disposition, at]
+    )
+
+    Txn.q(
+      txn,
+      "UPDATE credential_recovery_memberships SET reconciliationState='not_required',reconciliationResult=NULL WHERE targetId=?1 AND reconciliationCycle=?2 AND reconciliationState='pending'",
+      [target.id, cycle]
     )
 
     Txn.q(
@@ -1133,8 +1272,6 @@ defmodule Tightbeam.CredentialRecovery do
       "UPDATE credential_recovery_memberships SET resolution=?2,resolvedCycle=?3,resolvedAt=?4 WHERE targetId=?1 AND resolution='open'",
       [target.id, disposition, cycle, at]
     )
-
-    cancel_target_wake(txn, target.id, "target_unresolvable")
 
     complete_activations(txn, target.id)
     audit(txn, "credential_recovery_#{disposition}", target.id, "boundary=#{boundary}")
@@ -1154,7 +1291,7 @@ defmodule Tightbeam.CredentialRecovery do
             [target_id]
           ) != []
 
-        if not pending_reconciliation do
+        if attempt == 0 or not pending_reconciliation do
           wake_id = carrier_wake_id(target_id, cycle, attempt)
           activation_id = activation_id || newest_open_activation(txn, target_id)
 
@@ -1172,7 +1309,7 @@ defmodule Tightbeam.CredentialRecovery do
 
           Txn.q(
             txn,
-            "UPDATE credential_recovery_targets SET wakeId=?2,updatedAt=?3 WHERE targetId=?1 AND state='pending' AND wakeId IS NULL",
+            "UPDATE credential_recovery_targets SET wakeId=?2,attemptState='materialized',updatedAt=?3 WHERE targetId=?1 AND state='pending' AND wakeId IS NULL",
             [target_id, wake.wake_id, now()]
           )
 
@@ -1233,6 +1370,7 @@ defmodule Tightbeam.CredentialRecovery do
   defp settle_terminal(txn, %{state: "claimed", terminal: "delivered"} = target, seq) do
     covered = target.covered || target.required
     at = now()
+    settle_cycle_reconciliations_in_txn(txn, target, seq, "delivered")
 
     Txn.q(
       txn,
@@ -1243,7 +1381,7 @@ defmodule Tightbeam.CredentialRecovery do
     if target.required > covered do
       Txn.q(
         txn,
-        "UPDATE credential_recovery_targets SET state='pending',handledGeneration=?2,cycle=?3,attempt=0,wakeId=NULL,turnSeq=NULL,coveredGeneration=NULL,updatedAt=?4 WHERE targetId=?1 AND state='claimed'",
+        "UPDATE credential_recovery_targets SET state='pending',handledGeneration=?2,cycle=?3,attempt=0,attemptState='reserved',reconciliationGeneration=0,wakeId=NULL,turnSeq=NULL,coveredGeneration=NULL,updatedAt=?4 WHERE targetId=?1 AND state='claimed'",
         [target.id, covered, target.cycle + 1, at]
       )
 
@@ -1251,7 +1389,7 @@ defmodule Tightbeam.CredentialRecovery do
     else
       Txn.q(
         txn,
-        "UPDATE credential_recovery_targets SET state='handled',handledGeneration=?2,updatedAt=?3 WHERE targetId=?1 AND state='claimed'",
+        "UPDATE credential_recovery_targets SET state='handled',handledGeneration=?2,attemptState='terminal',updatedAt=?3 WHERE targetId=?1 AND state='claimed'",
         [target.id, covered, at]
       )
     end
@@ -1268,6 +1406,7 @@ defmodule Tightbeam.CredentialRecovery do
   defp settle_terminal(txn, %{state: state} = target, seq)
        when state in ["pending", "admitted", "claimed"] do
     disposition = terminal_disposition(txn, seq, target.terminal)
+    settle_cycle_reconciliations_in_txn(txn, target, seq, disposition)
 
     case {disposition, target.attempt} do
       {"could_not_run", attempt} when attempt < 3 ->
@@ -1288,7 +1427,7 @@ defmodule Tightbeam.CredentialRecovery do
 
         Txn.q(
           txn,
-          "UPDATE credential_recovery_targets SET state='retry_wait',dueAt=?2,wakeId=NULL,turnSeq=NULL,coveredGeneration=NULL,failure=?3,updatedAt=?4 WHERE targetId=?1",
+          "UPDATE credential_recovery_targets SET state='retry_wait',attemptState='terminal',dueAt=?2,wakeId=NULL,turnSeq=NULL,coveredGeneration=NULL,failure=?3,updatedAt=?4 WHERE targetId=?1",
           [target.id, due_at, disposition, now()]
         )
 
@@ -1304,7 +1443,7 @@ defmodule Tightbeam.CredentialRecovery do
       _ ->
         Txn.q(
           txn,
-          "UPDATE credential_recovery_targets SET state='undeliverable',failure=?2,updatedAt=?3 WHERE targetId=?1",
+          "UPDATE credential_recovery_targets SET state='undeliverable',attemptState='terminal',failure=?2,updatedAt=?3 WHERE targetId=?1",
           [target.id, disposition, now()]
         )
 
@@ -1328,6 +1467,29 @@ defmodule Tightbeam.CredentialRecovery do
   end
 
   defp settle_terminal(_txn, _target, _seq), do: :stale
+
+  defp settle_cycle_reconciliations_in_txn(txn, target, seq, disposition) do
+    Txn.q(
+      txn,
+      """
+      UPDATE credential_recovery_memberships
+      SET reconciliationState='done',reconciliationResult=?4
+      WHERE targetId=?1 AND reconciliationCycle=?2 AND reconciliationTurnSeq=?3
+        AND reconciliationState='pending'
+      """,
+      [target.id, target.cycle, seq, disposition]
+    )
+
+    Txn.q(
+      txn,
+      """
+      UPDATE credential_recovery_memberships
+      SET reconciliationState='not_required',reconciliationResult=NULL
+      WHERE targetId=?1 AND reconciliationCycle=?2 AND reconciliationState='pending'
+      """,
+      [target.id, target.cycle]
+    )
+  end
 
   defp terminal_disposition(txn, seq, "failed") do
     prompt_started? =
@@ -1353,14 +1515,14 @@ defmodule Tightbeam.CredentialRecovery do
       )
 
     Enum.each(activation_ids, fn [activation_id] ->
-      open? =
+      incomplete? =
         Txn.q(
           txn,
-          "SELECT 1 FROM credential_recovery_memberships WHERE activationId=?1 AND resolution='open' LIMIT 1",
+          "SELECT 1 FROM credential_recovery_memberships WHERE activationId=?1 AND (resolution='open' OR reconciliationState='pending') LIMIT 1",
           [activation_id]
         ) != []
 
-      unless open? do
+      unless incomplete? do
         Txn.q(
           txn,
           "UPDATE credential_recovery_activations SET state='complete',completedAt=?2 WHERE activationId=?1 AND state='recovering'",
@@ -1416,6 +1578,23 @@ defmodule Tightbeam.CredentialRecovery do
       [] ->
         false
     end
+  end
+
+  defp cancel_internal_retry_wakes(txn, target_id, reason_kind) do
+    txn
+    |> Txn.q(
+      "SELECT wakeId FROM wakes WHERE consumer='credential_recovery_retry' AND conditionScope=?1 AND state='pending' ORDER BY wakeId",
+      [target_id]
+    )
+    |> Enum.each(fn [wake_id] ->
+      Wakes.cancel_in_txn(txn, %{
+        wake_id: wake_id,
+        requester: %{kind: "process", id: "tightbeam:wake-scheduler"},
+        reason_kind: reason_kind,
+        causal_source: %{kind: "scheduler_delivery", id: wake_id},
+        outcome: %{kind: "no_replacement"}
+      })
+    end)
   end
 
   defp digest(value) do
