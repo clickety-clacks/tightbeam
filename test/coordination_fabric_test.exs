@@ -3987,7 +3987,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO attests (id, assignmentId, kind, bySession, ts) VALUES (?1, ?2, 'progress', 'agent:coder', ?3)",
+        "INSERT INTO attests (id, assignmentId, kind, bySession, effectKind, ts) VALUES (?1, ?2, 'progress', 'agent:coder', 'code', ?3)",
         [id, assignment_id, ts]
       )
 

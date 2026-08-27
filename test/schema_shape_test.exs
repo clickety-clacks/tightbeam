@@ -193,6 +193,20 @@ defmodule Tightbeam.SchemaShapeTest do
     end
   end
 
+  test "A11 successor inventory refuses a missing attests table without mutation", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+    :ok = DB.execute(db, "DROP TABLE attests")
+    before = schema_dump(db)
+
+    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
+
+    assert error.message =~
+             "database shape coordination-fabric-v1-phase1-v7-typed-progress-attests is incompatible with typed-progress-attests-v1:"
+
+    assert error.message =~ "attests.effectKind"
+    assert schema_dump(db) == before
+  end
+
   test "predecessor stamp refuses successor objects instead of inferring a downgrade", %{db: db} do
     assert :ok = Schema.ensure_all(db)
 
@@ -1100,6 +1114,17 @@ defmodule Tightbeam.SchemaShapeTest do
       DB.query(db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1", [name])
 
     rows == [[1]]
+  end
+
+  defp schema_dump(db) do
+    {:ok, objects} =
+      DB.query(
+        db,
+        "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name,tbl_name,sql"
+      )
+
+    {:ok, stamp} = DB.query(db, "SELECT shape,stampedAt FROM schema_stamp ORDER BY shape")
+    {objects, stamp}
   end
 
   defp trigger?(db, name) do

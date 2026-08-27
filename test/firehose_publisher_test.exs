@@ -426,34 +426,108 @@ defmodule Tightbeam.Firehose.PublisherTest do
            } = receive_notice()
   end
 
-  test "A6 A19 attest firehose resources preserve stored typed progress and null acknowledgment" do
-    for {id, kind, effect_kind} <- [
-          {"att_progress", "progress", "release"},
-          {"att_ack", "acknowledgment", nil}
-        ] do
-      assert :ok =
-               Publisher.committed(
-                 "attest.filed",
-                 %{
-                   id: id,
-                   assignmentId: "asg_typed",
-                   kind: kind,
-                   effectKind: effect_kind,
-                   ts: 9
-                 },
-                 %{"assignmentId" => "asg_typed"}
-               )
+  test "A6 A19 real attest mutations preserve type through live notice and restart replay" do
+    db = :typed_attest_firehose_db
+    start_supervised!({DB, path: ":memory:", name: db})
+    :ok = Tightbeam.Schema.ensure_all(db)
 
-      assert %{
-               "class" => "attest.filed",
-               "refs" => %{"attestId" => ^id},
-               "payload" => %{
-                 "id" => ^id,
-                 "kind" => ^kind,
-                 "effectKind" => ^effect_kind
-               }
-             } = receive_notice()
-    end
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('flynn',1,'admin_add',1)"
+      )
+
+    register_testhost(db)
+
+    Org.create(db, %{
+      session_key: "typed-holder",
+      display_name: "Typed holder",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Tightbeam.Model.new("fable")
+    })
+
+    config = %{db: db, base_dir: System.tmp_dir!(), wake_tick_ms: 1_000}
+    handlers = Gateway.handlers(config)
+
+    assign = %{
+      verb: "assign",
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      session_key: "typed-holder",
+      target_role: nil,
+      role_fallback: false,
+      params: %{subject: "Ship typed progress", effect_kind: "release"}
+    }
+
+    assert {:ok, assignment} = Dispatch.dispatch(db, handlers, assign)
+    _ = observed_classes()
+
+    progress = %{
+      verb: "attest",
+      origin: "agent:typed-holder",
+      principal: {:session, "typed-holder"},
+      session_key: nil,
+      params: %{assignment_id: assignment.id, kind: "progress", note: "Release advanced"}
+    }
+
+    assert {:ok, %{attest: %{id: progress_id, effectKind: "release"}}} =
+             Dispatch.dispatch(db, handlers, progress)
+
+    assert %{"class" => "verb.accepted"} = receive_notice()
+
+    assert %{
+             "class" => "attest.filed",
+             "refs" => %{"attestId" => ^progress_id},
+             "payload" => %{
+               "id" => ^progress_id,
+               "kind" => "progress",
+               "effectKind" => "release"
+             }
+           } = receive_notice()
+
+    acknowledgment =
+      put_in(progress, [:params], %{
+        assignment_id: assignment.id,
+        kind: "acknowledgment",
+        note: "Ruling received"
+      })
+
+    assert {:ok, %{attest: %{id: acknowledgment_id, effectKind: nil}}} =
+             Dispatch.dispatch(db, handlers, acknowledgment)
+
+    assert %{"class" => "verb.accepted"} = receive_notice()
+
+    assert %{
+             "class" => "attest.filed",
+             "refs" => %{"attestId" => ^acknowledgment_id},
+             "payload" => %{
+               "id" => ^acknowledgment_id,
+               "kind" => "acknowledgment",
+               "effectKind" => nil
+             }
+           } = receive_notice()
+
+    restarted_handlers = Gateway.handlers(config)
+
+    replay = %{
+      verb: "attests",
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      session_key: nil,
+      params: %{assignment_id: assignment.id}
+    }
+
+    assert {:ok, %{attests: rows}} = Dispatch.dispatch(db, restarted_handlers, replay)
+
+    assert Map.new(rows, &{&1.id, {&1.kind, &1.effectKind}}) == %{
+             progress_id => {"progress", "release"},
+             acknowledgment_id => {"acknowledgment", nil}
+           }
   end
 
   test "return emits the ruled decision_request.returned class" do

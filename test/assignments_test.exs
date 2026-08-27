@@ -2483,23 +2483,17 @@ defmodule Tightbeam.AssignmentsTest do
     assert progress.attest.effectKind == "code"
     assert duplicate.attest.id != progress.attest.id
 
-    assert Enum.map(Assignments.list_attests(ctx.db, assignment.id), & &1.effectKind) == [
-             nil,
-             "code",
-             "code"
-           ]
+    expected_effects = %{
+      acknowledgment.attest.id => nil,
+      progress.attest.id => "code",
+      duplicate.attest.id => "code"
+    }
 
-    assert Enum.map(Assignments.list_attests(ctx.db, assignment.id), & &1.effectKind) == [
-             nil,
-             "code",
-             "code"
-           ]
+    assert Map.new(Assignments.list_attests(ctx.db, assignment.id), &{&1.id, &1.effectKind}) ==
+             expected_effects
 
-    assert Enum.map(WorkState.detail(ctx.db, assignment.id).attests, & &1.effectKind) == [
-             nil,
-             "code",
-             "code"
-           ]
+    assert Map.new(WorkState.detail(ctx.db, assignment.id).attests, &{&1.id, &1.effectKind}) ==
+             expected_effects
 
     trace_attests =
       ctx.db
@@ -2507,7 +2501,7 @@ defmodule Tightbeam.AssignmentsTest do
       |> Map.fetch!(:timeline)
       |> Enum.filter(&(&1.type == "attest"))
 
-    assert Enum.map(trace_attests, & &1.effectKind) == [nil, "code", "code"]
+    assert Map.new(trace_attests, &{&1.id, &1.effectKind}) == expected_effects
 
     assert marker_contents(ctx.db, "holder") |> Enum.take(-3) == [
              "[acknowledgment filed on #{assignment.id}]",

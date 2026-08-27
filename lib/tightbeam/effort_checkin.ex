@@ -3,8 +3,8 @@ defmodule Tightbeam.EffortCheckin do
   Event-driven effort-without-effect brackets for dispatched assignments.
 
   EFFECT is any of, since the bracket armed: writes in the workdir, an artifact
-  the holder recorded, an attest on the assignment, or an update to the
-  assignment's work item. Turns are effort, never effect — a spinning session
+  the holder recorded, matching typed progress on the assignment, or an update
+  to the assignment's work item. Turns are effort, never effect — a spinning session
   has turns. Git is a change-management system an org may or may not use; it is
   never a requirement for observation, and work done elsewhere (another machine,
   a service, a person) is surfaced by RECORDING AN ARTIFACT, not by probing for

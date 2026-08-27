@@ -305,8 +305,8 @@ elected acknowledgment row does not prove directive compliance.
 
 A turn with neither a receipt nor a scheduled continuation is a stall. The substrate checks in
 on the holder and escalates unanswered check-ins to the session that spawned it. Workdir writes,
-recorded artifacts, assignment attests, and work-item updates remain the mechanical effect
-channels that keep the liveness bracket moving.
+recorded artifacts, matching typed progress attests, and work-item updates remain the
+mechanical effect channels that keep the liveness bracket moving.
 
 ## Work alongside other agents
 Other agents edit at the same time.

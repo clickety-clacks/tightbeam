@@ -464,7 +464,7 @@ defmodule Tightbeam.SupervisionTest do
     {:ok, _} =
       DB.query(
         ctx.db,
-        "INSERT INTO attests (id, assignmentId, kind, bySession, ts) VALUES ('att_1','asg_1','progress','holder',2)"
+        "INSERT INTO attests (id, assignmentId, kind, bySession, effectKind, ts) VALUES ('att_1','asg_1','progress','holder','code',2)"
       )
 
     {:ok, _} =
@@ -667,7 +667,7 @@ defmodule Tightbeam.SupervisionTest do
     {:ok, _} =
       DB.query(
         ctx.db,
-        "INSERT INTO attests (id,assignmentId,kind,note,bySession,ts) VALUES ('att_vague','asg_1','progress','blocked, no state change','holder',?1)",
+        "INSERT INTO attests (id,assignmentId,kind,note,bySession,effectKind,ts) VALUES ('att_vague','asg_1','progress','blocked, no state change','holder','code',?1)",
         [now]
       )
 

@@ -73,6 +73,7 @@ defmodule Tightbeam.Schema do
   # The operational-parent port adds a required `sessions.operationalParent`
   # column. The v4 stamp is the one exact predecessor this build upgrades.
   @shape "coordination-fabric-v1-phase1-v7-typed-progress-attests"
+  @bootstrap_shape @shape <> "-bootstrapping"
   @typed_progress_previous_shape "coordination-fabric-v1-phase1-v6"
   @previous_shape "coordination-fabric-v1-phase1-v5"
   @operational_parent_shape "coordination-fabric-v1-phase1-v5"
@@ -779,12 +780,19 @@ defmodule Tightbeam.Schema do
   @spec ensure_all(DB.server()) :: :ok
   def ensure_all(db) do
     :ok = ensure_stamp_table(db)
-    :ok = check_shape(db)
-    :ok = validate_existing_typed_progress_attests_v1!(db)
+    shape_state = check_shape(db)
+
+    if shape_state == :ready do
+      :ok = validate_typed_progress_attests_v1!(db)
+    end
 
     Enum.each(@schema_modules, fn module ->
       :ok = module.ensure_schema(db)
     end)
+
+    if shape_state == :bootstrapping do
+      :ok = finalize_bootstrap_stamp!(db)
+    end
 
     :ok = validate_typed_progress_attests_v1!(db)
 
@@ -1275,10 +1283,35 @@ defmodule Tightbeam.Schema do
     end
   end
 
-  defp validate_existing_typed_progress_attests_v1!(db) do
-    case DB.query(db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='attests'") do
-      {:ok, []} -> :ok
-      {:ok, [[1]]} -> validate_typed_progress_attests_v1!(db)
+  defp finalize_bootstrap_stamp!(db) do
+    case DB.transaction(db, fn txn ->
+           observed = stamp_rows(txn)
+           mismatches = typed_progress_inventory_mismatches(txn)
+
+           mismatches =
+             if observed == [[@bootstrap_shape]],
+               do: mismatches,
+               else: ["shape_stamp" | mismatches]
+
+           if mismatches != [] do
+             incompatible_typed_progress!(observed_stamp(observed), mismatches)
+           end
+
+           Txn.q(
+             txn,
+             "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1",
+             [@bootstrap_shape, @shape, System.system_time(:millisecond)]
+           )
+
+           if Txn.changes(txn) != 1 do
+             incompatible_typed_progress!(observed_stamp(observed), ["shape_stamp"])
+           end
+
+           :ok
+         end) do
+      {:ok, :ok} -> :ok
+      {:error, %ShapeError{} = error} -> raise error
+      {:error, error} -> raise error
     end
   end
 
@@ -1429,19 +1462,25 @@ defmodule Tightbeam.Schema do
   defp check_shape(db) do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
       {:ok, [[@shape]]} ->
-        :ok
+        :ready
+
+      {:ok, [[@bootstrap_shape]]} ->
+        :bootstrapping
 
       {:ok, [[@typed_progress_previous_shape]]} ->
-        upgrade_typed_progress_attests_v1(db)
+        :ok = upgrade_typed_progress_attests_v1(db)
+        :ready
 
       {:ok, [[@previous_shape]]} ->
         :ok = upgrade_cold_start_v1(db)
-        upgrade_typed_progress_attests_v1(db)
+        :ok = upgrade_typed_progress_attests_v1(db)
+        :ready
 
       {:ok, [[@operational_parent_previous_shape]]} ->
         :ok = upgrade_operational_parent_v1(db)
         :ok = upgrade_cold_start_v1(db)
-        upgrade_typed_progress_attests_v1(db)
+        :ok = upgrade_typed_progress_attests_v1(db)
+        :ready
 
       {:ok, []} ->
         # No stamp. Either a database this build is about to create, or one
@@ -1463,16 +1502,10 @@ defmodule Tightbeam.Schema do
   end
 
   # A FRESH DATABASE MUST NEVER BE REFUSED, which is why the stamp is written
-  # HERE — before a single table exists — rather than after the modules run.
-  # Stamped last, a bootstrap interrupted between `sessions` and the stamp left
-  # an unstamped database WITH sessions, indistinguishable from a genuinely old
-  # one, and the next boot refused a database this build had just created. The
-  # absence class again: "interrupted fresh bootstrap" and "genuine old
-  # database" sharing one representation.
-  #
-  # Stamping first cannot lose that way. Interrupted after the stamp, the next
-  # boot reads its own shape and carries on creating what is missing, which is
-  # exactly what `CREATE TABLE IF NOT EXISTS` is for.
+  # HERE — before a single table exists — with an explicit in-progress value.
+  # That value is the only state allowed to resume missing schema. The final
+  # successor stamp therefore means its complete inventory exists; missing
+  # inventory under that stamp is corruption and must refuse before creation.
   defp unstamped(db) do
     case DB.query(db, "SELECT name FROM sqlite_master WHERE type='table' AND name='sessions'") do
       {:ok, []} ->
@@ -1489,9 +1522,9 @@ defmodule Tightbeam.Schema do
       DB.query(
         db,
         "INSERT OR IGNORE INTO schema_stamp (shape, stampedAt) VALUES (?1, ?2)",
-        [@shape, System.system_time(:millisecond)]
+        [@bootstrap_shape, System.system_time(:millisecond)]
       )
 
-    :ok
+    :bootstrapping
   end
 end
