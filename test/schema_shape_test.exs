@@ -110,6 +110,82 @@ defmodule Tightbeam.SchemaShapeTest do
     assert restored.content == historical.content
   end
 
+  test "work-item bodies activate as one exact additive shape without changing the stamp", %{
+    db: db
+  } do
+    assert :ok = Schema.ensure_all(db)
+
+    assert table_columns(db, "work_item_bodies") ==
+             ~w(workItemId body updatedByUser updatedBySession updatedAt)
+
+    assert table_columns(db, "work_item_body_activation") ==
+             ~w(id activatedAt cause principal)
+
+    assert {:ok, [[0, activated_at, "schema_activation", "process:tightbeam"]]} =
+             DB.query(
+               db,
+               "SELECT id,activatedAt,cause,principal FROM work_item_body_activation"
+             )
+
+    assert is_integer(activated_at) and activated_at >= 0
+
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:ok, [[1, ^activated_at]]} =
+             DB.query(db, "SELECT COUNT(*),MIN(activatedAt) FROM work_item_body_activation")
+  end
+
+  test "an incomplete or malformed work-item body shape refuses without repair", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+    drop_work_item_body_activation(db)
+
+    :ok = DB.execute(db, "CREATE TABLE work_item_bodies (workItemId TEXT PRIMARY KEY)")
+
+    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
+    assert error.message =~ "incompatible_work_item_body_v1"
+    assert error.message =~ "work_item_bodies"
+    assert table_columns(db, "work_item_bodies") == ["workItemId"]
+    refute table?(db, "work_item_body_activation")
+
+    :ok = DB.execute(db, "DROP TABLE work_item_bodies")
+    :ok = DB.execute(db, "CREATE TABLE work_item_body_activation (id INTEGER PRIMARY KEY)")
+
+    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
+    assert error.message =~ "incompatible_work_item_body_v1"
+    assert error.message =~ "work_item_body_activation"
+    refute table?(db, "work_item_bodies")
+  end
+
+  test "every interrupted work-item body activation statement rolls back and retries", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    for statement <- 1..3 do
+      drop_work_item_body_activation(db)
+
+      assert {:error, %RuntimeError{message: "forced activation interruption"}} =
+               DB.transaction(db, fn txn ->
+                 Schema.ensure_work_item_body_v1_in_txn(txn, 50_000,
+                   fail_after_statement: statement
+                 )
+               end)
+
+      refute table?(db, "work_item_bodies")
+      refute table?(db, "work_item_body_activation")
+
+      assert {:ok, :ok} =
+               DB.transaction(db, fn txn ->
+                 Schema.ensure_work_item_body_v1_in_txn(txn, 50_000 + statement)
+               end)
+
+      expected_activated_at = 50_000 + statement
+
+      assert {:ok, [[^expected_activated_at]]} =
+               DB.query(db, "SELECT activatedAt FROM work_item_body_activation")
+    end
+  end
+
   test "the shared liveness activation creates one exact additive shape", %{db: db} do
     assert :ok = Schema.ensure_all(db)
 
@@ -1003,6 +1079,14 @@ defmodule Tightbeam.SchemaShapeTest do
       DROP TABLE IF EXISTS supervision_liveness_epoch;
       DROP TABLE IF EXISTS supervision_liveness_migrations;
       DROP INDEX IF EXISTS wakes_cancellation_state;
+      """)
+  end
+
+  defp drop_work_item_body_activation(db) do
+    :ok =
+      DB.execute(db, """
+      DROP TABLE IF EXISTS work_item_bodies;
+      DROP TABLE IF EXISTS work_item_body_activation;
       """)
   end
 end

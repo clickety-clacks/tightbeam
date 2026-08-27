@@ -81,6 +81,37 @@ defmodule Tightbeam.Schema do
   @operational_parent_shape "coordination-fabric-v1-phase1-v5"
   @operational_parent_previous_shape "coordination-fabric-v1-phase1-v4"
 
+  @work_item_body_objects [
+    %{
+      type: "table",
+      name: "work_item_bodies",
+      sql: """
+      CREATE TABLE IF NOT EXISTS work_item_bodies (
+        workItemId       TEXT PRIMARY KEY REFERENCES work_items(id),
+        body             TEXT,
+        updatedByUser    TEXT REFERENCES users(userId),
+        updatedBySession TEXT REFERENCES sessions(sessionKey),
+        updatedAt        INTEGER NOT NULL CHECK(updatedAt >= 0),
+        CHECK(body IS NULL OR
+              (typeof(body) = 'text' AND length(CAST(body AS BLOB)) <= 65536)),
+        CHECK((updatedByUser IS NOT NULL) != (updatedBySession IS NOT NULL))
+      )
+      """
+    },
+    %{
+      type: "table",
+      name: "work_item_body_activation",
+      sql: """
+      CREATE TABLE IF NOT EXISTS work_item_body_activation (
+        id          INTEGER PRIMARY KEY CHECK(id = 0),
+        activatedAt INTEGER NOT NULL CHECK(activatedAt >= 0),
+        cause       TEXT NOT NULL CHECK(cause = 'schema_activation'),
+        principal   TEXT NOT NULL CHECK(principal = 'process:tightbeam')
+      )
+      """
+    }
+  ]
+
   @supervision_liveness_objects [
     %{
       type: "table",
@@ -806,6 +837,21 @@ defmodule Tightbeam.Schema do
           message:
             "incompatible_supervision_liveness_v1: additive activation failed: #{Exception.message(error)}"
     end
+
+    case DB.transaction(db, fn txn ->
+           ensure_work_item_body_v1_in_txn(txn, activated_at)
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "incompatible_work_item_body_v1: additive activation failed: #{Exception.message(error)}"
+    end
   end
 
   @doc false
@@ -1139,6 +1185,67 @@ defmodule Tightbeam.Schema do
     incompatible_supervision_liveness!("activation epoch must be a nonnegative integer")
   end
 
+  @doc false
+  @spec ensure_work_item_body_v1_in_txn(Txn.t()) :: :ok
+  def ensure_work_item_body_v1_in_txn(%Txn{} = txn) do
+    ensure_work_item_body_v1_in_txn(txn, System.system_time(:millisecond))
+  end
+
+  @doc false
+  @spec ensure_work_item_body_v1_in_txn(Txn.t(), non_neg_integer()) :: :ok
+  def ensure_work_item_body_v1_in_txn(%Txn{} = txn, activated_at) do
+    ensure_work_item_body_v1_in_txn(txn, activated_at, [])
+  end
+
+  @doc false
+  @spec ensure_work_item_body_v1_in_txn(Txn.t(), non_neg_integer(), keyword()) :: :ok
+  def ensure_work_item_body_v1_in_txn(%Txn{} = txn, activated_at, opts)
+      when is_integer(activated_at) and activated_at >= 0 and is_list(opts) do
+    incompatible = &incompatible_work_item_body!/1
+    present = Enum.filter(@work_item_body_objects, &owned_object_present?(txn, &1, incompatible))
+    Enum.each(present, &validate_owned_object!(txn, &1, incompatible))
+
+    case length(present) do
+      0 ->
+        @work_item_body_objects
+        |> Enum.with_index(1)
+        |> Enum.each(fn {object, index} ->
+          :ok = Txn.exec(txn, object.sql)
+          validate_owned_object!(txn, object, incompatible)
+          maybe_interrupt_activation!(opts, index)
+        end)
+
+        Txn.q(
+          txn,
+          """
+          INSERT INTO work_item_body_activation
+            (id, activatedAt, cause, principal)
+          VALUES (0, ?1, 'schema_activation', 'process:tightbeam')
+          """,
+          [activated_at]
+        )
+
+        maybe_interrupt_activation!(opts, length(@work_item_body_objects) + 1)
+
+      count when count == length(@work_item_body_objects) ->
+        :ok
+
+      _count ->
+        missing =
+          @work_item_body_objects
+          |> Kernel.--(present)
+          |> Enum.map_join(", ", & &1.name)
+
+        incompatible.("incomplete additive shape; missing #{missing}")
+    end
+
+    validate_work_item_body_activation!(txn)
+  end
+
+  def ensure_work_item_body_v1_in_txn(%Txn{}, _activated_at, _opts) do
+    incompatible_work_item_body!("activation epoch must be a nonnegative integer")
+  end
+
   defp owned_object_present?(txn, %{type: type, name: name}, incompatible) do
     case Txn.q(
            txn,
@@ -1204,6 +1311,24 @@ defmodule Tightbeam.Schema do
 
   defp incompatible_supervision_liveness!(detail) do
     raise ShapeError, message: "incompatible_supervision_liveness_v1: #{detail}"
+  end
+
+  defp validate_work_item_body_activation!(txn) do
+    case Txn.q(
+           txn,
+           "SELECT id, activatedAt, cause, principal FROM work_item_body_activation ORDER BY id"
+         ) do
+      [[0, activated_at, "schema_activation", "process:tightbeam"]]
+      when is_integer(activated_at) and activated_at >= 0 ->
+        :ok
+
+      _rows ->
+        incompatible_work_item_body!("malformed work_item_body_activation row")
+    end
+  end
+
+  defp incompatible_work_item_body!(detail) do
+    raise ShapeError, message: "incompatible_work_item_body_v1: #{detail}"
   end
 
   defp ensure_stamp_table(db) do
