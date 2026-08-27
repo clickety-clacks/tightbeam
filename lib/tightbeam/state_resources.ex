@@ -485,7 +485,15 @@ defmodule Tightbeam.StateResources do
 
   def work_item(row), do: public(row)
   def assignment(row), do: public(row)
-  def attest(row), do: public(row)
+
+  def attest(row) do
+    effect_kind = row[:effectKind] || row[:effect_kind] || row["effectKind"]
+
+    row
+    |> public()
+    |> Map.put("effectKind", effect_kind)
+  end
+
   def wake(row), do: public(row)
   def production(row), do: row |> public() |> correlate("eventId", "seq")
   def turn(row), do: row |> public() |> correlate("turnSeq", "seq")

@@ -445,6 +445,55 @@ defmodule Tightbeam.CliIntegrationTest do
                       }
                     }}
 
+    {progress_output, 0} =
+      System.cmd(ctx.binary, ["attest", assignment_id, "--kind", "progress"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert %{
+             "message" =>
+               "progress asserts forward motion on this assignment's deliverable for effectKind=code",
+             "attest" => %{"kind" => "progress", "effectKind" => "code"}
+           } = JSON.decode!(progress_output)
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "attest",
+                      params: %{assignment_id: ^assignment_id, kind: "progress"}
+                    }}
+
+    {acknowledgment_output, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "attest",
+          assignment_id,
+          "--kind",
+          "acknowledgment",
+          "--note",
+          "ruling received"
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert %{
+             "message" =>
+               "acknowledgment records a ruling receipt or coordination traffic and does not count as effect",
+             "attest" => %{"kind" => "acknowledgment", "effectKind" => nil}
+           } = JSON.decode!(acknowledgment_output)
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "attest",
+                      params: %{
+                        assignment_id: ^assignment_id,
+                        kind: "acknowledgment",
+                        note: "ruling received"
+                      }
+                    }}
+
     {attested, 0} =
       System.cmd(ctx.binary, ["attest", assignment_id, "--kind", "completion", "--note", "ready"],
         cd: ctx.workdir,

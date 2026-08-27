@@ -324,7 +324,7 @@ defmodule Tightbeam.ColdStartTest do
     log =
       capture_log(fn ->
         error = assert_raise Schema.ShapeError, fn -> Boot.ensure_schema!(db) end
-        assert error.message =~ "written by a different build"
+        assert error.message =~ "is incompatible with typed-progress-attests-v1: shape_stamp"
       end)
 
     refute log =~ "cold-start schema is incompatible"
@@ -357,7 +357,7 @@ defmodule Tightbeam.ColdStartTest do
              "action" => "choose pair-first or host-local bootstrap"
            }
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v6"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v7-typed-progress-attests"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
   end
 

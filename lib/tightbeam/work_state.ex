@@ -253,10 +253,20 @@ defmodule Tightbeam.WorkState do
   defp attests(txn, assignment_id) do
     Txn.q(
       txn,
-      "SELECT id, assignmentId, kind, verdictKind, note, bySession, byUser, ts FROM attests WHERE assignmentId = ?1 ORDER BY ts ASC, id ASC",
+      "SELECT id, assignmentId, kind, verdictKind, note, bySession, byUser, effectKind, ts FROM attests WHERE assignmentId = ?1 ORDER BY ts ASC, id ASC",
       [assignment_id]
     )
-    |> Enum.map(fn [id, assignment_id, kind, verdict_kind, note, by_session, by_user, ts] ->
+    |> Enum.map(fn [
+                     id,
+                     assignment_id,
+                     kind,
+                     verdict_kind,
+                     note,
+                     by_session,
+                     by_user,
+                     effect_kind,
+                     ts
+                   ] ->
       %{
         id: id,
         assignmentId: assignment_id,
@@ -265,6 +275,7 @@ defmodule Tightbeam.WorkState do
         note: note,
         bySession: by_session,
         byUser: by_user,
+        effectKind: effect_kind,
         ts: ts
       }
     end)

@@ -15,8 +15,9 @@ end.
    terminate — reshape it until it can, or return it to the requester. A recon without
    a decidable question is returned for one.
 2. Investigate to the standard of the answer, not exhaustively. The investigation ends
-   when the answer is proven, not when the territory is fully mapped. Findings beyond
-   the question are recorded as progress attests, not pursued.
+   when the answer is proven, not when the territory is fully mapped. Record a finding
+   beyond the assigned question as a non-effect acknowledgment and do not pursue it. Do
+   not call that out-of-scope finding progress.
 3. Answer in exactly one of four forms:
    - **yes** — proven, with the evidence that proves it;
    - **no** — proven, with the evidence that proves it;

@@ -220,7 +220,9 @@ defmodule Tightbeam.EffortCheckinTest do
     assert File.read!(src(ctx, "src/dest.txt")) == "new bytes"
     assert nil == fire_probe(ctx, preserved.id)
     assert [prod] = prods(ctx.db, "holder")
-    assert prod.prompt =~ "no writes, artifacts, attests, or work-item updates"
+
+    assert prod.prompt =~
+             "no writes, artifacts, matching typed progress attests, or work-item updates"
 
     # A stall is turns without effect: turns are reported, never counted.
     stalled = dispatch(ctx, {:session, "parent"}, "holder", "stall")
@@ -239,7 +241,9 @@ defmodule Tightbeam.EffortCheckinTest do
     fire_probe(ctx, stalled.id)
     assert [parent_escalation] = escalation_wakes(ctx.db, stalled.id)
     assert parent_escalation.session_key == "parent"
-    assert parent_escalation.prompt =~ "no writes, artifacts, attests, or work-item updates"
+
+    assert parent_escalation.prompt =~
+             "no writes, artifacts, matching typed progress attests, or work-item updates"
 
     # A replayed probe of an already-probed generation is inert.
     assert :ok = EffortCheckin.probe(ctx.db, ctx.config, wake)
@@ -600,7 +604,10 @@ defmodule Tightbeam.EffortCheckinTest do
     assert prod.session_key == "holder"
     assert prod.assignment_id == silent.id
     assert prod.state == "pending"
-    assert prod.prompt =~ "no writes, artifacts, attests, or work-item updates"
+
+    assert prod.prompt =~
+             "no writes, artifacts, matching typed progress attests, or work-item updates"
+
     assert prod.prompt =~ "artifact-record"
     assert prod.prompt =~ "2 turns taken"
     assert prod.prompt =~ "new material result or evidence"
@@ -667,7 +674,9 @@ defmodule Tightbeam.EffortCheckinTest do
     assert nil == fire_probe(ctx, assignment.id)
 
     assert [prod] = Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == assignment.id))
-    assert prod.prompt =~ "no writes, artifacts, attests, or work-item updates"
+
+    assert prod.prompt =~
+             "no writes, artifacts, matching typed progress attests, or work-item updates"
 
     # And a real work-item UPDATE by the holder still counts, on the same path.
     silent = dispatch_for_item(ctx, {:session, "parent"}, "holder", "second bracket", item.id)
@@ -740,7 +749,10 @@ defmodule Tightbeam.EffortCheckinTest do
     assert [escalation] = escalation_wakes(ctx.db, silent.id)
     assert escalation.session_key == "parent"
     assert escalation.prompt =~ "Child session holder remains inactive"
-    assert escalation.prompt =~ "no writes, artifacts, attests, or work-item updates"
+
+    assert escalation.prompt =~
+             "no writes, artifacts, matching typed progress attests, or work-item updates"
+
     assert escalation.prompt =~ "workspace #{ctx.root}: none"
     assert no_effort_requests?(ctx.db, silent.id)
 
@@ -931,6 +943,161 @@ defmodule Tightbeam.EffortCheckinTest do
     assert nil == fire_probe(ctx, updated.id)
     assert silent_rearm(ctx.db, updated.id)
     assert prods(ctx.db, "holder") == []
+  end
+
+  test "A8-A10 every matching type earns attest effect while acknowledgments and history do not",
+       ctx do
+    for effect_kind <- ~w(code policy release live_mutation evidence review coordination) do
+      matching =
+        assignment(ctx, "dispatch", {:session, "parent"}, "holder", %{
+          subject: "matching #{effect_kind}",
+          brief: "matching #{effect_kind}",
+          effect_kind: effect_kind
+        })
+
+      assignment(ctx, "attest", {:session, "holder"}, nil, %{
+        assignment_id: matching.id,
+        kind: "progress"
+      })
+
+      assert nil == fire_probe(ctx, matching.id)
+
+      assert %{
+               "outcome" => "effect_present",
+               "channels" => %{
+                 "attestChannel" => %{
+                   "matchingTypedProgress" => 1,
+                   "acknowledgments" => 0,
+                   "historicalUntypedProgress" => 0,
+                   "otherAttests" => 0
+                 }
+               }
+             } = generation_evidence(ctx.db, matching.id, 1)
+
+      acknowledgment =
+        assignment(ctx, "dispatch", {:session, "parent"}, "holder", %{
+          subject: "acknowledgment #{effect_kind}",
+          brief: "acknowledgment #{effect_kind}",
+          effect_kind: effect_kind
+        })
+
+      assignment(ctx, "attest", {:session, "holder"}, nil, %{
+        assignment_id: acknowledgment.id,
+        kind: "acknowledgment",
+        note: "ruling received"
+      })
+
+      assert nil == fire_probe(ctx, acknowledgment.id)
+
+      assert %{
+               "outcome" => "zero_effect",
+               "channels" => %{
+                 "attestChannel" => %{
+                   "matchingTypedProgress" => 0,
+                   "acknowledgments" => 1,
+                   "historicalUntypedProgress" => 0,
+                   "otherAttests" => 0
+                 }
+               }
+             } = generation_evidence(ctx.db, acknowledgment.id, 1)
+
+      refute JSON.encode!(generation_evidence(ctx.db, acknowledgment.id, 1)) =~
+               "ruling received"
+    end
+
+    historical = dispatch(ctx, {:session, "parent"}, "holder", "historical progress")
+
+    for {name, _ddl} <- Assignments.typed_progress_trigger_ddls() do
+      :ok = DB.execute(ctx.db, "DROP TRIGGER #{name}")
+    end
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO attests (id,assignmentId,kind,bySession,effectKind,ts) " <>
+                 "VALUES ('historical_progress',?1,'progress','holder',NULL,1)",
+               [historical.id]
+             )
+
+    for {_name, ddl} <- Assignments.typed_progress_trigger_ddls() do
+      :ok = DB.execute(ctx.db, ddl)
+    end
+
+    assert nil == fire_probe(ctx, historical.id)
+
+    assert %{
+             "outcome" => "zero_effect",
+             "channels" => %{
+               "attestChannel" => %{
+                 "matchingTypedProgress" => 0,
+                 "acknowledgments" => 0,
+                 "historicalUntypedProgress" => 1,
+                 "otherAttests" => 0
+               }
+             }
+           } = generation_evidence(ctx.db, historical.id, 1)
+  end
+
+  test "A17 asg_3d219794 regression credits typed progress but never ruling receipts", ctx do
+    assignment =
+      dispatch(
+        ctx,
+        {:session, "parent"},
+        "holder",
+        "asg_3d219794 on wi_ecd8cd9d ruling receipt"
+      )
+
+    assignment(ctx, "attest", {:session, "holder"}, nil, %{
+      assignment_id: assignment.id,
+      kind: "acknowledgment",
+      note: "ruling received"
+    })
+
+    assert nil == fire_probe(ctx, assignment.id)
+    assert generation_evidence(ctx.db, assignment.id, 1)["outcome"] == "zero_effect"
+    assert [_prod] = prods(ctx.db, "holder")
+
+    assignment(ctx, "attest", {:session, "holder"}, nil, %{
+      assignment_id: assignment.id,
+      kind: "progress"
+    })
+
+    assert nil == fire_probe(ctx, assignment.id)
+    assert generation_evidence(ctx.db, assignment.id, 2)["outcome"] == "effect_present"
+  end
+
+  test "A12 effort watermark serialization observes only progress committed before evaluation",
+       ctx do
+    progress_first =
+      dispatch(ctx, {:session, "parent"}, "holder", "progress commits before evaluation")
+
+    assignment(ctx, "attest", {:session, "holder"}, nil, %{
+      assignment_id: progress_first.id,
+      kind: "progress"
+    })
+
+    assert nil == fire_probe(ctx, progress_first.id)
+    assert generation_evidence(ctx.db, progress_first.id, 1)["outcome"] == "effect_present"
+
+    evaluation_first =
+      dispatch(ctx, {:session, "parent"}, "holder", "evaluation commits before progress")
+
+    assert nil == fire_probe(ctx, evaluation_first.id)
+
+    assert %{
+             "outcome" => "zero_effect",
+             "channels" => %{
+               "attestChannel" => %{"matchingTypedProgress" => 0}
+             }
+           } = generation_evidence(ctx.db, evaluation_first.id, 1)
+
+    assignment(ctx, "attest", {:session, "holder"}, nil, %{
+      assignment_id: evaluation_first.id,
+      kind: "progress"
+    })
+
+    assert nil == fire_probe(ctx, evaluation_first.id)
+    assert generation_evidence(ctx.db, evaluation_first.id, 2)["outcome"] == "effect_present"
   end
 
   test "proofs 6 and 8b: parent notification and next rung commit before delivery", ctx do
@@ -1228,6 +1395,17 @@ defmodule Tightbeam.EffortCheckinTest do
   defp rows(db, sql, params) do
     {:ok, rows} = DB.query(db, sql, params)
     rows
+  end
+
+  defp generation_evidence(db, assignment_id, generation) do
+    [[encoded]] =
+      rows(
+        db,
+        "SELECT evidence FROM effort_checkin_generations WHERE assignmentId=?1 AND generation=?2",
+        [assignment_id, generation]
+      )
+
+    JSON.decode!(encoded)
   end
 
   defp cancellation(db, wake_id) do

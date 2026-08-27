@@ -453,6 +453,19 @@ defmodule Tightbeam.EffortCheckin do
             session = session_in_txn(txn, generation.holder_key)
 
             if effect?(channels) do
+              effect_evidence = evidence(generation, channels, "effect_present")
+
+              Txn.q(
+                txn,
+                "UPDATE effort_checkin_generations SET evidence = ?3, baseline = ?4 WHERE assignmentId = ?1 AND generation = ?2",
+                [
+                  generation.assignment_id,
+                  generation.generation,
+                  JSON.encode!(effect_evidence),
+                  encode_observation(inspection)
+                ]
+              )
+
               insert_generation(
                 txn,
                 config,
@@ -922,20 +935,48 @@ defmodule Tightbeam.EffortCheckin do
           "SELECT COUNT(*) FROM artifacts WHERE createdBySession = ?1 AND rowid > ?2",
           [generation.holder_key, generation.artifact_watermark]
         ),
-      attests:
-        count_since(
-          txn,
-          "SELECT COUNT(*) FROM attests WHERE assignmentId = ?1 AND rowid > ?2",
-          [generation.assignment_id, generation.attest_watermark]
-        ),
+      attestChannel: attest_channel(txn, generation),
       workItems: work_item_updates(txn, generation),
       turns: terminal_turns(txn, generation)
     }
   end
 
   defp effect?(channels) do
-    channels.workspace == :writes or channels.artifacts > 0 or channels.attests > 0 or
+    channels.workspace == :writes or channels.artifacts > 0 or
+      channels.attestChannel.matchingTypedProgress > 0 or
       channels.workItems > 0
+  end
+
+  defp attest_channel(txn, generation) do
+    [[matching, acknowledgments, historical, other]] =
+      Txn.q(
+        txn,
+        """
+        SELECT
+          COALESCE(SUM(CASE
+            WHEN f.kind='progress' AND f.effectKind IS NOT NULL
+              AND f.effectKind = COALESCE(e.effectKind,
+                CASE WHEN a.reviewsAssignmentId IS NULL THEN 'code' ELSE 'review' END)
+            THEN 1 ELSE 0 END), 0),
+          COALESCE(SUM(CASE WHEN f.kind='acknowledgment' THEN 1 ELSE 0 END), 0),
+          COALESCE(SUM(CASE
+            WHEN f.kind='progress' AND f.effectKind IS NULL THEN 1 ELSE 0 END), 0),
+          COALESCE(SUM(CASE
+            WHEN f.kind IN ('verdict','completion','surrender') THEN 1 ELSE 0 END), 0)
+        FROM attests f
+        JOIN assignments a ON a.id=f.assignmentId
+        LEFT JOIN assignment_effects e ON e.assignmentId=a.id
+        WHERE f.assignmentId=?1 AND f.rowid>?2
+        """,
+        [generation.assignment_id, generation.attest_watermark]
+      )
+
+    %{
+      matchingTypedProgress: matching,
+      acknowledgments: acknowledgments,
+      historicalUntypedProgress: historical,
+      otherAttests: other
+    }
   end
 
   defp workspace_channel({:error, _}, _inspection), do: :unobservable
@@ -999,15 +1040,15 @@ defmodule Tightbeam.EffortCheckin do
     cursor
   end
 
-  defp evidence(generation, channels) do
+  defp evidence(generation, channels, outcome \\ "zero_effect") do
     %{
       assignmentId: generation.assignment_id,
       effortGeneration: generation.generation,
-      outcome: "zero_effect",
+      outcome: outcome,
       channels: %{
         writes: Atom.to_string(channels.workspace),
         artifacts: channels.artifacts,
-        attests: channels.attests,
+        attestChannel: channels.attestChannel,
         workItems: channels.workItems
       },
       workspace: generation.root,
@@ -1144,7 +1185,7 @@ defmodule Tightbeam.EffortCheckin do
   end
 
   defp channel_sentence(evidence) do
-    "no writes, artifacts, attests, or work-item updates observed since " <>
+    "no writes, artifacts, matching typed progress attests, or work-item updates observed since " <>
       "#{evidence.minutesSinceArmed}m ago (#{evidence.turnsSinceArmed} turns taken; " <>
       "workspace #{evidence.workspace}: #{evidence.channels.writes})."
   end

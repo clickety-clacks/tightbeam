@@ -426,6 +426,36 @@ defmodule Tightbeam.Firehose.PublisherTest do
            } = receive_notice()
   end
 
+  test "A6 A19 attest firehose resources preserve stored typed progress and null acknowledgment" do
+    for {id, kind, effect_kind} <- [
+          {"att_progress", "progress", "release"},
+          {"att_ack", "acknowledgment", nil}
+        ] do
+      assert :ok =
+               Publisher.committed(
+                 "attest.filed",
+                 %{
+                   id: id,
+                   assignmentId: "asg_typed",
+                   kind: kind,
+                   effectKind: effect_kind,
+                   ts: 9
+                 },
+                 %{"assignmentId" => "asg_typed"}
+               )
+
+      assert %{
+               "class" => "attest.filed",
+               "refs" => %{"attestId" => ^id},
+               "payload" => %{
+                 "id" => ^id,
+                 "kind" => ^kind,
+                 "effectKind" => ^effect_kind
+               }
+             } = receive_notice()
+    end
+  end
+
   test "return emits the ruled decision_request.returned class" do
     db = :firehose_decision_returned_db
     start_supervised!({DB, path: ":memory:", name: db})
