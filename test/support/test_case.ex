@@ -87,6 +87,8 @@ defmodule Tightbeam.TestCase do
 
   @doc "Provision or load the real durable cursor-signing provider for a test base dir."
   def cursor_signing!(base_dir) do
+    base_dir = cursor_signing_base_dir(base_dir)
+
     case Tightbeam.CursorSigning.load(base_dir) do
       {:ok, provider} ->
         case Tightbeam.CursorSigning.validate(provider) do
@@ -108,6 +110,14 @@ defmodule Tightbeam.TestCase do
 
       {:error, reason} ->
         raise reason
+    end
+  end
+
+  defp cursor_signing_base_dir(base_dir) do
+    if Path.expand(base_dir) == Path.expand("/tmp") do
+      Path.join(System.tmp_dir!(), "tightbeam-cursor-signing-fixture")
+    else
+      base_dir
     end
   end
 

@@ -3,9 +3,10 @@ defmodule Tightbeam.CursorSigning do
   Owns the server-held material used to authenticate opaque REST cursors.
 
   The canonical record stays on disk. A provider value names a provider-lifetime
-  observer and contains no material. The observer serializes lifecycle changes
-  across connected application nodes, reads one complete record for each HMAC,
-  and fails closed after an indeterminate durability outcome.
+  observer and contains no material. The observer and advisory locks on the
+  canonical directory and record serialize lifecycle changes across application
+  processes, read one complete record for each HMAC, and fail closed after an
+  indeterminate durability outcome.
 
   Canonical-path absence is an explicit unprovisioned bootstrap state. Normal
   startup never generates material. A local owner must provision it explicitly
@@ -13,6 +14,8 @@ defmodule Tightbeam.CursorSigning do
   """
 
   import Bitwise
+
+  alias Tightbeam.CursorSigning.Native
 
   @material_bytes 32
   @domain_separator <<"tightbeam/rest-read-plane-d1/cursor/v1", 0>>
@@ -196,10 +199,21 @@ defmodule Tightbeam.CursorSigning do
 
   def lifecycle(_provider), do: error(:invalid_injection)
 
+  @doc false
+  @spec subscribe(t(), pid()) :: :ok | {:error, Error.t()} | lifecycle_refusal()
+  def subscribe(%__MODULE__{} = provider, subscriber) when is_pid(subscriber) do
+    observer_call(provider, {:subscribe, subscriber}, :invalid_injection)
+  end
+
+  def subscribe(_provider, _subscriber), do: error(:invalid_injection)
+
   defp provider(base_dir) do
     with {:ok, owner_uid} <- effective_uid(),
          {:ok, base_dir} <- base_directory(base_dir),
-         record_path = Path.join([base_dir, "secrets", @record_name]),
+         :ok <- ensure_lock_root(base_dir, owner_uid),
+         directory = Path.join(base_dir, "secrets"),
+         :ok <- ensure_private_directory(directory, owner_uid),
+         record_path = Path.join(directory, @record_name),
          {:ok, observer} <- start_observer(record_path, owner_uid) do
       {:ok, %__MODULE__{record_path: record_path, owner_uid: owner_uid, observer: observer}}
     end
@@ -250,7 +264,9 @@ defmodule Tightbeam.CursorSigning do
          owner_uid: owner_uid,
          lifecycle: :starting,
          startup_result: nil,
-         mutation: nil
+         mutation: nil,
+         quarantine_lock: nil,
+         subscribers: %{}
        }}
     end
 
@@ -261,61 +277,70 @@ defmodule Tightbeam.CursorSigning do
     end
 
     def handle_call(:load_status, from, %{lifecycle: :starting} = state) do
-      reference = make_ref()
-      owner = elem(from, 0)
-      owner_monitor = Process.monitor(owner)
+      case CursorSigning.acquire_mutation_lock(state.record_path) do
+        {:ok, admission_lock} ->
+          reference = make_ref()
+          owner = elem(from, 0)
+          owner_monitor = Process.monitor(owner)
 
-      {worker, worker_monitor} =
-        spawn_monitor(fn ->
-          result = CursorSigning.initial_lifecycle(state.record_path, state.owner_uid)
-          send(self_observer(), {:mutation_prepared, reference, result})
-        end)
+          {worker, worker_monitor} =
+            spawn_monitor(fn ->
+              result = CursorSigning.initial_lifecycle(state.record_path, state.owner_uid)
+              send(self_observer(), {:mutation_prepared, reference, result})
+            end)
 
-      mutation = %{
-        reference: reference,
-        operation: :startup,
-        from: from,
-        owner: owner,
-        owner_monitor: owner_monitor,
-        owner_alive: true,
-        worker: worker,
-        worker_monitor: worker_monitor,
-        phase: :starting,
-        prior_lifecycle: :starting,
-        temporary: nil
-      }
+          mutation = %{
+            reference: reference,
+            operation: :startup,
+            from: from,
+            owner: owner,
+            owner_monitor: owner_monitor,
+            owner_alive: true,
+            worker: worker,
+            worker_monitor: worker_monitor,
+            phase: :starting,
+            prior_lifecycle: :starting,
+            temporary: nil,
+            admission_lock: admission_lock
+          }
 
-      send(worker, {:observer, self()})
-      {:noreply, %{state | mutation: mutation}}
+          send(worker, {:observer, self()})
+          {:noreply, %{state | mutation: mutation}}
+
+        {:error, :busy} ->
+          {:reply, {:error, :cursor_signing_mutation_in_progress}, state}
+
+        {:error, _reason} ->
+          {:reply, CursorSigning.error(:unavailable), %{state | lifecycle: :quarantined}}
+      end
     end
 
     def handle_call(:load_status, _from, state) do
-      result =
-        case state.lifecycle do
-          :healthy ->
-            CursorSigning.validate_current(state.record_path, state.owner_uid)
-
-          :unprovisioned ->
-            :ok
-
-          :quarantined ->
-            state.startup_result || {:error, :cursor_signing_quarantined}
-        end
+      {result, state} =
+        with_read_admission(state, fn state ->
+          case state.lifecycle do
+            :healthy -> CursorSigning.validate_current(state.record_path, state.owner_uid)
+            :unprovisioned -> :ok
+            :quarantined -> state.startup_result || {:error, :cursor_signing_quarantined}
+          end
+        end)
 
       {:reply, result, state}
     end
 
     def handle_call({:validate, record_path, owner_uid}, _from, state) do
-      result =
-        if record_path == state.record_path and owner_uid == state.owner_uid do
-          with :ok <- lifecycle_result(state) do
-            CursorSigning.validate_current(record_path, owner_uid)
-          end
-        else
-          CursorSigning.error(:invalid_injection)
-        end
+      if record_path == state.record_path and owner_uid == state.owner_uid do
+        {result, state} =
+          with_read_admission(state, fn state ->
+            with :ok <- lifecycle_result(state) do
+              CursorSigning.validate_current(record_path, owner_uid)
+            end
+          end)
 
-      {:reply, result, state}
+        {:reply, result, state}
+      else
+        {:reply, CursorSigning.error(:invalid_injection), state}
+      end
     end
 
     def handle_call(:lifecycle, _from, %{mutation: mutation} = state)
@@ -323,43 +348,72 @@ defmodule Tightbeam.CursorSigning do
       {:reply, :mutation_in_progress, state}
     end
 
-    def handle_call(:lifecycle, _from, state), do: {:reply, state.lifecycle, state}
+    def handle_call(:lifecycle, _from, state) do
+      {result, state} = with_read_admission(state, & &1.lifecycle)
 
-    def handle_call(:admit_request, _from, state) do
-      {:reply, lifecycle_result(state), state}
-    end
-
-    def handle_call({:sign, input}, _from, state) do
       result =
-        with :ok <- lifecycle_result(state),
-             {:ok, material} <-
-               CursorSigning.read_record(
-                 state.record_path,
-                 state.owner_uid,
-                 CursorSigning.read_attempts()
-               ) do
-          {:ok, :crypto.mac(:hmac, :sha256, material, [CursorSigning.domain_separator(), input])}
+        case result do
+          {:error, :cursor_signing_mutation_in_progress} -> :mutation_in_progress
+          {:error, :cursor_signing_quarantined} -> :quarantined
+          lifecycle -> lifecycle
         end
 
       {:reply, result, state}
     end
 
-    def handle_call({:verify, input, signature}, _from, state) do
-      result =
-        with :ok <- lifecycle_result(state),
-             {:ok, material} <-
-               CursorSigning.read_record(
-                 state.record_path,
-                 state.owner_uid,
-                 CursorSigning.read_attempts()
-               ) do
-          expected =
-            :crypto.mac(:hmac, :sha256, material, [CursorSigning.domain_separator(), input])
+    def handle_call({:subscribe, subscriber}, _from, state) do
+      monitor = Process.monitor(subscriber)
+      subscribers = Map.put(state.subscribers, monitor, subscriber)
+      state = %{state | subscribers: subscribers}
 
-          {:ok,
-           byte_size(signature) == byte_size(expected) and
-             Plug.Crypto.secure_compare(signature, expected)}
-        end
+      if state.lifecycle == :healthy and is_nil(state.mutation) do
+        send(subscriber, :cursor_signing_healthy)
+      end
+
+      {:reply, :ok, state}
+    end
+
+    def handle_call(:admit_request, _from, state) do
+      {result, state} = with_read_admission(state, &lifecycle_result/1)
+      {:reply, result, state}
+    end
+
+    def handle_call({:sign, input}, _from, state) do
+      {result, state} =
+        with_read_admission(state, fn state ->
+          with :ok <- lifecycle_result(state),
+               {:ok, material} <-
+                 CursorSigning.read_record(
+                   state.record_path,
+                   state.owner_uid,
+                   CursorSigning.read_attempts()
+                 ) do
+            {:ok,
+             :crypto.mac(:hmac, :sha256, material, [CursorSigning.domain_separator(), input])}
+          end
+        end)
+
+      {:reply, result, state}
+    end
+
+    def handle_call({:verify, input, signature}, _from, state) do
+      {result, state} =
+        with_read_admission(state, fn state ->
+          with :ok <- lifecycle_result(state),
+               {:ok, material} <-
+                 CursorSigning.read_record(
+                   state.record_path,
+                   state.owner_uid,
+                   CursorSigning.read_attempts()
+                 ) do
+            expected =
+              :crypto.mac(:hmac, :sha256, material, [CursorSigning.domain_separator(), input])
+
+            {:ok,
+             byte_size(signature) == byte_size(expected) and
+               Plug.Crypto.secure_compare(signature, expected)}
+          end
+        end)
 
       {:reply, result, state}
     end
@@ -370,44 +424,66 @@ defmodule Tightbeam.CursorSigning do
     end
 
     def handle_call({:mutate, operation}, from, state) do
-      case mutation_allowed(operation, state.lifecycle) do
-        :ok ->
-          reference = make_ref()
-          owner = elem(from, 0)
-          owner_monitor = Process.monitor(owner)
+      case CursorSigning.acquire_mutation_lock(state.record_path) do
+        {:ok, admission_lock} ->
+          case cross_process_state(state) do
+            {:ok, state} ->
+              case mutation_allowed(operation, state.lifecycle) do
+                :ok ->
+                  begin_mutation(operation, from, admission_lock, state)
 
-          {worker, worker_monitor} =
-            spawn_monitor(fn ->
-              result =
-                CursorSigning.prepare_mutation(
-                  operation,
-                  state.record_path,
-                  state.owner_uid
-                )
+                {:error, reason} ->
+                  CursorSigning.release_lock(admission_lock)
+                  {:reply, {:error, reason}, state}
+              end
 
-              send(self_observer(), {:mutation_prepared, reference, result})
-            end)
+            {:error, reason} ->
+              CursorSigning.release_lock(admission_lock)
+              {:reply, {:error, reason}, state}
+          end
 
-          mutation = %{
-            reference: reference,
-            operation: operation,
-            from: from,
-            owner: owner,
-            owner_monitor: owner_monitor,
-            owner_alive: true,
-            worker: worker,
-            worker_monitor: worker_monitor,
-            phase: if(operation == :recover, do: :recovering, else: :preparing),
-            prior_lifecycle: state.lifecycle,
-            temporary: nil
-          }
+        {:error, :busy} ->
+          {:reply, {:error, :cursor_signing_mutation_in_progress}, state}
 
-          send(worker, {:observer, self()})
-          {:noreply, %{state | mutation: mutation, startup_result: nil}}
-
-        {:error, reason} ->
-          {:reply, {:error, reason}, state}
+        {:error, _reason} ->
+          {:reply, CursorSigning.error(:unavailable), state}
       end
+    end
+
+    defp begin_mutation(operation, from, admission_lock, state) do
+      reference = make_ref()
+      owner = elem(from, 0)
+      owner_monitor = Process.monitor(owner)
+
+      {worker, worker_monitor} =
+        spawn_monitor(fn ->
+          result =
+            CursorSigning.prepare_mutation(
+              operation,
+              state.record_path,
+              state.owner_uid
+            )
+
+          send(self_observer(), {:mutation_prepared, reference, result})
+        end)
+
+      mutation = %{
+        reference: reference,
+        operation: operation,
+        from: from,
+        owner: owner,
+        owner_monitor: owner_monitor,
+        owner_alive: true,
+        worker: worker,
+        worker_monitor: worker_monitor,
+        phase: if(operation == :recover, do: :recovering, else: :preparing),
+        prior_lifecycle: state.lifecycle,
+        temporary: nil,
+        admission_lock: admission_lock
+      }
+
+      send(worker, {:observer, self()})
+      {:noreply, %{state | mutation: mutation, startup_result: nil}}
     end
 
     @impl true
@@ -460,6 +536,9 @@ defmodule Tightbeam.CursorSigning do
         state.mutation && state.mutation.worker_monitor == monitor ->
           worker_died(state)
 
+        Map.has_key?(state.subscribers, monitor) ->
+          {:noreply, %{state | subscribers: Map.delete(state.subscribers, monitor)}}
+
         true ->
           {:noreply, state}
       end
@@ -472,6 +551,94 @@ defmodule Tightbeam.CursorSigning do
         {:observer, observer} -> observer
       end
     end
+
+    defp with_read_admission(%{mutation: mutation} = state, _operation)
+         when not is_nil(mutation) do
+      {{:error, :cursor_signing_mutation_in_progress}, state}
+    end
+
+    defp with_read_admission(%{lifecycle: :quarantined} = state, operation) do
+      {operation.(state), state}
+    end
+
+    defp with_read_admission(state, operation) do
+      case CursorSigning.acquire_read_lock(state.record_path) do
+        {:ok, admission_lock} ->
+          read_with_quarantine_probe(state, operation, admission_lock)
+
+        {:error, :busy} ->
+          {{:error, :cursor_signing_mutation_in_progress}, state}
+
+        {:error, _reason} ->
+          {CursorSigning.error(:unavailable), state}
+      end
+    end
+
+    defp read_with_quarantine_probe(state, operation, admission_lock) do
+      case CursorSigning.acquire_quarantine_probe(state.record_path) do
+        {:ok, quarantine_probe} ->
+          {result, state} =
+            case refresh_unprovisioned(state) do
+              {:ok, state} -> {operation.(state), state}
+              {:error, state} -> {{:error, :cursor_signing_quarantined}, state}
+            end
+
+          CursorSigning.release_lock(quarantine_probe)
+          CursorSigning.release_lock(admission_lock)
+          {result, state}
+
+        {:error, reason} when reason in [:absent, :invalid] ->
+          result = operation.(state)
+          CursorSigning.release_lock(admission_lock)
+          {result, state}
+
+        {:error, :busy} ->
+          CursorSigning.release_lock(admission_lock)
+          {{:error, :cursor_signing_quarantined}, state}
+
+        {:error, _reason} ->
+          CursorSigning.release_lock(admission_lock)
+          {CursorSigning.error(:unavailable), state}
+      end
+    end
+
+    defp cross_process_state(%{quarantine_lock: lock} = state) when not is_nil(lock),
+      do: {:ok, state}
+
+    defp cross_process_state(state) do
+      case CursorSigning.acquire_quarantine_probe(state.record_path) do
+        {:ok, quarantine_probe} ->
+          CursorSigning.release_lock(quarantine_probe)
+          refresh_unprovisioned(state)
+
+        {:error, reason} when reason in [:absent, :invalid] ->
+          {:ok, state}
+
+        {:error, :busy} ->
+          {:error, :cursor_signing_quarantined}
+
+        {:error, _reason} ->
+          {:error, :cursor_signing_quarantined}
+      end
+    end
+
+    defp refresh_unprovisioned(%{lifecycle: :unprovisioned} = state) do
+      case File.lstat(state.record_path) do
+        {:error, :enoent} ->
+          {:ok, state}
+
+        {:ok, _stat} ->
+          case CursorSigning.validate_current(state.record_path, state.owner_uid) do
+            :ok -> {:ok, notify_healthy(%{state | lifecycle: :healthy})}
+            _failure -> {:error, %{state | lifecycle: :quarantined}}
+          end
+
+        {:error, _reason} ->
+          {:error, %{state | lifecycle: :quarantined}}
+      end
+    end
+
+    defp refresh_unprovisioned(state), do: {:ok, state}
 
     defp mutation_allowed(:provision, :unprovisioned), do: :ok
     defp mutation_allowed(:provision, :healthy), do: CursorSigning.error(:already_provisioned)
@@ -539,6 +706,7 @@ defmodule Tightbeam.CursorSigning do
 
     defp finish_recovery({:ok, :recovered}, state) do
       if state.mutation.owner_alive do
+        state = release_quarantine(state)
         finish_with_lifecycle(state, :ok, :healthy)
       else
         {:noreply, clear_mutation(%{state | lifecycle: :quarantined})}
@@ -566,11 +734,13 @@ defmodule Tightbeam.CursorSigning do
     end
 
     defp finish_startup({:quarantined, {:error, _reason} = failure}, state) do
+      state = establish_quarantine(state)
       finish_with_lifecycle(state, failure, :quarantined, failure)
     end
 
     defp finish_startup(_result, state) do
       failure = CursorSigning.error(:unavailable)
+      state = establish_quarantine(state)
       finish_with_lifecycle(state, failure, :quarantined, failure)
     end
 
@@ -583,12 +753,15 @@ defmodule Tightbeam.CursorSigning do
     end
 
     defp finish_published_sync(_result, state) do
+      state = establish_quarantine(state)
       finish_with_lifecycle(state, CursorSigning.indeterminate(), :quarantined)
     end
 
     defp owner_died(%{mutation: %{phase: :published_unsynchronized} = mutation} = state) do
       Process.demonitor(mutation.worker_monitor, [:flush])
       Process.exit(mutation.worker, :kill)
+
+      state = establish_quarantine(state)
 
       {:noreply,
        state
@@ -603,6 +776,7 @@ defmodule Tightbeam.CursorSigning do
     end
 
     defp worker_died(%{mutation: %{phase: :published_unsynchronized}} = state) do
+      state = establish_quarantine(state)
       finish_with_lifecycle(state, CursorSigning.indeterminate(), :quarantined)
     end
 
@@ -641,6 +815,7 @@ defmodule Tightbeam.CursorSigning do
        state
        |> Map.put(:lifecycle, lifecycle)
        |> Map.put(:startup_result, startup_result)
+       |> maybe_notify_healthy(lifecycle)
        |> Map.put(:mutation, %{mutation | phase: :terminal})}
     end
 
@@ -654,8 +829,82 @@ defmodule Tightbeam.CursorSigning do
 
     defp clear_mutation(%{mutation: mutation} = state) do
       if mutation.owner_monitor, do: Process.demonitor(mutation.owner_monitor, [:flush])
+      CursorSigning.release_lock(mutation.admission_lock)
       %{state | mutation: nil}
     end
+
+    defp establish_quarantine(%{quarantine_lock: lock} = state) when not is_nil(lock),
+      do: state
+
+    defp establish_quarantine(state) do
+      case CursorSigning.acquire_quarantine_lock(state.record_path) do
+        {:ok, quarantine_lock} -> %{state | quarantine_lock: quarantine_lock}
+        {:error, _reason} -> state
+      end
+    end
+
+    defp release_quarantine(%{quarantine_lock: nil} = state), do: state
+
+    defp release_quarantine(%{quarantine_lock: quarantine_lock} = state) do
+      CursorSigning.release_lock(quarantine_lock)
+      %{state | quarantine_lock: nil}
+    end
+
+    defp maybe_notify_healthy(state, :healthy), do: notify_healthy(state)
+    defp maybe_notify_healthy(state, _lifecycle), do: state
+
+    defp notify_healthy(state) do
+      Enum.each(state.subscribers, fn {_monitor, subscriber} ->
+        send(subscriber, :cursor_signing_healthy)
+      end)
+
+      state
+    end
+  end
+
+  @doc false
+  def acquire_mutation_lock(record_path) do
+    Native.acquire(Path.dirname(record_path), :exclusive, :directory)
+  rescue
+    _error -> {:error, :unavailable}
+  catch
+    _kind, _reason -> {:error, :unavailable}
+  end
+
+  @doc false
+  def acquire_read_lock(record_path) do
+    Native.acquire(Path.dirname(record_path), :shared, :directory)
+  rescue
+    _error -> {:error, :unavailable}
+  catch
+    _kind, _reason -> {:error, :unavailable}
+  end
+
+  @doc false
+  def acquire_quarantine_lock(record_path) do
+    Native.acquire(record_path, :exclusive, :record)
+  rescue
+    _error -> {:error, :unavailable}
+  catch
+    _kind, _reason -> {:error, :unavailable}
+  end
+
+  @doc false
+  def acquire_quarantine_probe(record_path) do
+    Native.acquire(record_path, :shared, :record)
+  rescue
+    _error -> {:error, :unavailable}
+  catch
+    _kind, _reason -> {:error, :unavailable}
+  end
+
+  @doc false
+  def release_lock(lock) do
+    Native.release(lock)
+  rescue
+    _error -> :ok
+  catch
+    _kind, _reason -> :ok
   end
 
   @doc false
@@ -748,11 +997,10 @@ defmodule Tightbeam.CursorSigning do
 
   @doc false
   def publish(:provision, temporary, record_path) do
-    with :ok <- refuse_existing(record_path) do
-      case File.rename(temporary, record_path) do
-        :ok -> :ok
-        {:error, _reason} -> error(:provision_failed)
-      end
+    case Native.rename_noreplace(temporary, record_path) do
+      :ok -> :ok
+      {:error, :exists} -> error(:already_provisioned)
+      {:error, _reason} -> error(:provision_failed)
     end
   end
 
@@ -783,6 +1031,24 @@ defmodule Tightbeam.CursorSigning do
     with :ok <- mkdir_base(base_dir),
          :ok <- ensure_private_directory(directory, owner_uid) do
       :ok
+    end
+  end
+
+  defp ensure_lock_root(base_dir, owner_uid) do
+    with :ok <- mkdir_lock_root(base_dir) do
+      case File.lstat(base_dir) do
+        {:ok, %File.Stat{type: :directory, uid: ^owner_uid}} -> :ok
+        {:ok, %File.Stat{type: :directory}} -> error(:wrong_owner)
+        {:ok, _stat} -> error(:invalid_base_dir)
+        {:error, _reason} -> error(:unavailable)
+      end
+    end
+  end
+
+  defp mkdir_lock_root(base_dir) do
+    case File.mkdir_p(base_dir) do
+      :ok -> :ok
+      {:error, _reason} -> error(:unavailable)
     end
   end
 

@@ -5,11 +5,13 @@
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 static volatile int failed_directory_sync = 0;
 static volatile int completed_target_rename = 0;
+static volatile int exclusive_lock_count = 0;
 static _Thread_local int inside_rename = 0;
 
 static void touch_marker(const char *environment_name) {
@@ -86,6 +88,12 @@ int fsync(int fd) {
       ((fail_when_active != NULL && active_exists) ||
        (fail_after_rename != NULL && completed_target_rename != 0));
 
+  if (regular && getenv("CURSOR_SIGNING_TEST_FAIL_STAGE_SYNC_ALWAYS") != NULL) {
+    touch_marker("CURSOR_SIGNING_TEST_FSYNC_FAILED");
+    errno = EIO;
+    return -1;
+  }
+
   if (regular && getenv("CURSOR_SIGNING_TEST_STAGE_SYNC_READY") != NULL) {
     touch_marker("CURSOR_SIGNING_TEST_STAGE_SYNC_READY");
     await_marker("CURSOR_SIGNING_TEST_STAGE_SYNC_GO");
@@ -106,6 +114,28 @@ int fsync(int fd) {
   }
 
   return real_fsync(fd);
+}
+
+int flock(int fd, int operation) {
+  static int (*real_flock)(int, int) = NULL;
+
+  if (real_flock == NULL) {
+    real_flock = dlsym(RTLD_NEXT, "flock");
+  }
+
+  int result = real_flock(fd, operation);
+
+  if (result == 0 && (operation & LOCK_EX) != 0) {
+    int ordinal = __sync_add_and_fetch(&exclusive_lock_count, 1);
+    const char *expected = getenv("CURSOR_SIGNING_TEST_LOCK_ORDINAL");
+
+    if (expected != NULL && ordinal == atoi(expected)) {
+      touch_marker("CURSOR_SIGNING_TEST_LOCK_READY");
+      await_marker("CURSOR_SIGNING_TEST_LOCK_GO");
+    }
+  }
+
+  return result;
 }
 
 int rename(const char *old_path, const char *new_path) {
@@ -156,3 +186,61 @@ int renameat(int old_directory, const char *old_path, int new_directory,
 
   return result;
 }
+
+#if defined(__linux__)
+int renameat2(int old_directory, const char *old_path, int new_directory,
+              const char *new_path, unsigned int flags) {
+  static int (*real_renameat2)(int, const char *, int, const char *,
+                              unsigned int) = NULL;
+
+  if (real_renameat2 == NULL) {
+    real_renameat2 = dlsym(RTLD_NEXT, "renameat2");
+  }
+
+  int target = !inside_rename && is_target_rename(old_path, new_path);
+
+  if (target) {
+    inside_rename = 1;
+    before_target_rename();
+  }
+
+  int result =
+      real_renameat2(old_directory, old_path, new_directory, new_path, flags);
+
+  if (target) {
+    after_target_rename(result);
+    inside_rename = 0;
+  }
+
+  return result;
+}
+#endif
+
+#if defined(__APPLE__)
+int renameatx_np(int old_directory, const char *old_path, int new_directory,
+                 const char *new_path, unsigned int flags) {
+  static int (*real_renameatx_np)(int, const char *, int, const char *,
+                                 unsigned int) = NULL;
+
+  if (real_renameatx_np == NULL) {
+    real_renameatx_np = dlsym(RTLD_NEXT, "renameatx_np");
+  }
+
+  int target = !inside_rename && is_target_rename(old_path, new_path);
+
+  if (target) {
+    inside_rename = 1;
+    before_target_rename();
+  }
+
+  int result = real_renameatx_np(old_directory, old_path, new_directory,
+                                new_path, flags);
+
+  if (target) {
+    after_target_rename(result);
+    inside_rename = 0;
+  }
+
+  return result;
+}
+#endif

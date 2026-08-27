@@ -1,6 +1,6 @@
 defmodule Tightbeam.ApplicationTest do
   use Tightbeam.TestCase, async: false
-  alias Tightbeam.{CursorSigning, DB, Escalation, EventLog, Ledger}
+  alias Tightbeam.{DB, Escalation, EventLog, Ledger}
 
   setup do
     base = Path.join(System.tmp_dir!(), "tb_app_#{System.unique_integer([:positive])}")
@@ -166,39 +166,80 @@ defmodule Tightbeam.ApplicationTest do
     refute File.exists?(Path.join(base, "harnesses.json"))
   end
 
-  test "production entry refuses missing cursor material before starting its store" do
+  test "production entry holds the listener closed until explicit cursor provisioning" do
     base =
       Path.join(System.tmp_dir!(), "tb_app_cursor_refused_#{System.unique_integer([:positive])}")
 
-    assert :initialized = Tightbeam.Identity.init!(base)
+    on_exit(fn -> File.rm_rf!(base) end)
 
-    previous_base = Application.fetch_env!(:tightbeam, :base_dir)
-    previous_autostart = Application.fetch_env!(:tightbeam, :autostart)
-    previous_path = System.get_env("PATH")
-    bin_dir = Path.join(base, "working-cli")
-    codex = Path.join(bin_dir, "codex")
-    File.mkdir_p!(bin_dir)
-    File.write!(codex, "#!/bin/sh\necho 'codex-cli 0.0.0'\n")
-    File.chmod!(codex, 0o755)
+    script = """
+    defmodule CursorBootstrapProbe do
+      def run(base) do
+        Supervisor.stop(Tightbeam.Supervisor)
+        :initialized = Tightbeam.Identity.init!(base)
 
-    Application.put_env(:tightbeam, :base_dir, base)
-    Application.put_env(:tightbeam, :autostart, true)
-    System.put_env("PATH", Enum.join(Enum.reject([bin_dir, previous_path], &is_nil/1), ":"))
+        bin_dir = Path.join(base, "working-cli")
+        codex = Path.join(bin_dir, "codex")
+        File.mkdir_p!(bin_dir)
+        File.write!(codex, "#!/bin/sh\\necho 'codex-cli 0.0.0'\\n")
+        File.chmod!(codex, 0o755)
+        System.put_env("PATH", bin_dir <> ":" <> System.fetch_env!("PATH"))
 
-    on_exit(fn ->
-      Application.put_env(:tightbeam, :base_dir, previous_base)
-      Application.put_env(:tightbeam, :autostart, previous_autostart)
-      restore_path(previous_path)
-      File.rm_rf!(base)
-    end)
+        Application.put_env(:tightbeam, :base_dir, base)
+        Application.put_env(:tightbeam, :autostart, true)
+        Application.put_env(:tightbeam, :port, 0)
 
-    assert_raise CursorSigning.Error, "cursor signing is unavailable", fn ->
-      Tightbeam.Application.start(:normal, [])
+        {:ok, supervisor} = Tightbeam.Application.start(:normal, [])
+        provider = Tightbeam.CursorSigning.load!(base)
+        :unprovisioned = Tightbeam.CursorSigning.lifecycle(provider)
+        {:error, :cursor_signing_unprovisioned} =
+          Tightbeam.CursorSigning.admit_request(provider)
+
+        false = has_child?(supervisor, Bandit)
+        false = File.exists?(Path.join(base, "gateway.json"))
+        IO.binwrite("closed\\n")
+
+        :ok = Tightbeam.CursorSigning.provision(base)
+        await_child(supervisor, Bandit, 1_000)
+        :healthy = Tightbeam.CursorSigning.lifecycle(provider)
+        true = File.exists?(Path.join(base, "gateway.json"))
+        IO.binwrite("admitted\\n")
+        System.halt(0)
+      end
+
+      defp await_child(_supervisor, _id, 0), do: raise("listener admission timed out")
+
+      defp await_child(supervisor, id, attempts) do
+        if has_child?(supervisor, id) do
+          :ok
+        else
+          Process.sleep(10)
+          await_child(supervisor, id, attempts - 1)
+        end
+      end
+
+      defp has_child?(supervisor, id) do
+        Enum.any?(Supervisor.which_children(supervisor), fn
+          {^id, pid, _type, _modules} when is_pid(pid) -> true
+          {_child_id, pid, _type, [^id]} when is_pid(pid) -> true
+          _child -> false
+        end)
+      end
     end
 
-    refute File.exists?(Path.join(base, "state.db"))
-    refute File.exists?(Path.join(base, "gateway.json"))
-    refute File.exists?(Path.join(base, "harnesses.json"))
+    [base] = System.argv()
+    CursorBootstrapProbe.run(base)
+    """
+
+    {output, 0} =
+      System.cmd(System.find_executable("elixir"), ["-S", "mix", "run", "-e", script, base],
+        cd: File.cwd!(),
+        stderr_to_stdout: true,
+        env: [{"MIX_ENV", "test"}]
+      )
+
+    assert output =~ "closed\n"
+    assert output =~ "admitted\n"
   end
 
   defp restore_path(nil), do: System.delete_env("PATH")
