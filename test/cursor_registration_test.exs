@@ -6,7 +6,7 @@ defmodule Tightbeam.CursorRegistrationTest do
 
   test "Cursor registers as the only new shim harness" do
     assert Cursor in Harness.all()
-    refute Tightbeam.Harness.Opencode in Harness.all()
+    refute "opencode" in Enum.map(Harness.all(), & &1.wire_name())
     assert Cursor.adapter_provisioning() == :shim
     assert Harness.requires_zero_listeners?(Cursor)
     refute function_exported?(Cursor, :requires_zero_listeners?, 0)
@@ -131,6 +131,12 @@ defmodule Tightbeam.CursorRegistrationTest do
                "/managed",
                checked ++ [common_env: [], remote_env: [], lineage: "lineage"]
              )
+  end
+
+  test "Cursor default model is untiered and matches its catalog shape" do
+    default = Cursor.default_model()
+    assert default.family == "auto"
+    assert default.effort == nil
   end
 
   test "Cursor advertises only the selectable refs present in authenticated inventory" do
