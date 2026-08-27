@@ -1002,7 +1002,13 @@ defmodule Tightbeam.ConformanceSupport do
     digest = Wakes.get(db, digest_id)
     assert digest.digest
     assert digest.class == wake.class
-    assert digest.prompt =~ Wakes.digest_signature(1)
+
+    expected_signature =
+      if wake.delivery_rule == Wakes.digest_rule(),
+        do: Wakes.digest_signature(1),
+        else: "coalesced by #{wake.delivery_rule} (1 notice)"
+
+    assert digest.prompt =~ expected_signature
 
     # LAW 2: the source row is still here, and it names where its payload went.
     carried = Wakes.get(db, wake.wake_id)
@@ -1018,7 +1024,7 @@ defmodule Tightbeam.ConformanceSupport do
     if kase["kind"] == "legibility" do
       detail = lifecycle_detail(db, "wake_digest_materialized", digest_id)
       assert kase["emits"] == "lifecycle:wake_digest_materialized"
-      assert detail =~ "rule=#{Wakes.digest_rule()}"
+      assert detail =~ "rule=#{wake.delivery_rule}"
       assert detail =~ "trigger=ceiling"
     end
   end

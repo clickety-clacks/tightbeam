@@ -12,6 +12,7 @@ defmodule Tightbeam.SupervisionTest do
     HarnessHealth,
     HarnessProcess,
     Ledger,
+    NoticeBatcher,
     Org,
     Projection,
     RailRemedy,
@@ -1736,6 +1737,35 @@ defmodule Tightbeam.SupervisionTest do
 
     # The held fyi is untouched by any of this — supervision's own decision
     # neither judged it nor held it; delivery timing stayed the batcher's.
+    assert Wakes.get(ctx.db, held.wake_id).state == "pending"
+  end
+
+  test "a default-off legacy fyi wake does not suppress the turn-end remedy", ctx do
+    prepare_review_gate(ctx)
+
+    held =
+      Wakes.schedule(ctx.db, %{
+        session_key: "holder",
+        target_role: nil,
+        origin: "process:tightbeam",
+        prompt: "default-off unrelated fyi",
+        due_at: System.system_time(:millisecond) + 60_000,
+        creator_session_key: "holder",
+        class: "fyi"
+      })
+
+    assert held.delivery_rule == "turn-boundary-digest r1"
+    assert NoticeBatcher.source_refs(ctx.db, held.wake_id) == []
+    assert Wakes.self_pending_count(ctx.db, "holder") == 0
+
+    seq = terminal!(ctx.db, "holder")
+
+    assert {:acted, :rail_remedy} =
+             Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
+
+    assert %{status: "live"} =
+             RailRemedy.episode(ctx.db, "completion-needs-review", "asg_1")
+
     assert Wakes.get(ctx.db, held.wake_id).state == "pending"
   end
 

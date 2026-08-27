@@ -1044,6 +1044,9 @@ defmodule Tightbeam.Org do
                   {:immutable_delivery, %{delivery_wake_id: delivery_wake_id}} ->
                     {:supersede_by_carrier, replacement_wake_id, delivery_wake_id}
 
+                  {:immutable_delivery_pending, %{batch_id: _batch_id}} ->
+                    nil
+
                   {:error, refusal} ->
                     raise "retirement replacement batching refused: #{inspect(refusal)}"
                 end

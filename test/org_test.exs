@@ -406,6 +406,54 @@ defmodule Tightbeam.OrgTest do
     assert_immutable_retirement_chain(db, original, sealed)
   end
 
+  test "retirement keeps an overflow prefix sealed until its original trigger", %{db: db} do
+    %{original: original, batch_id: batch_id} =
+      selected_retirement_source(db, "overflow retirement 1")
+
+    for n <- 2..51 do
+      Wakes.schedule(db, %{
+        session_key: "retiring",
+        target_role: "reviewer",
+        origin: "process:tightbeam",
+        creator_session_key: "agent:sender",
+        prompt: "overflow retirement #{n}",
+        due_at: 0,
+        class: "fyi"
+      })
+    end
+
+    sealed = NoticeBatcher.batch(db, batch_id)
+    assert sealed.state == "sealed"
+    assert sealed.release_cause == "overflow"
+    assert sealed.delivery_wake_id == nil
+
+    assert %{state: "retired"} = Org.retire(db, "retiring", "user:flynn", 1_000)
+    assert NoticeBatcher.batch(db, batch_id).state == "sealed"
+    assert NoticeBatcher.batch(db, batch_id).delivery_wake_id == nil
+    assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM wakes WHERE digest=1")
+
+    assert %{replacement_wake_id: replacement_wake_id} = cancellation(db, original.wake_id)
+    assert Wakes.get(db, replacement_wake_id).state == "pending"
+
+    carrier_ids = NoticeBatcher.recover(db, sealed.due_at)
+    armed = NoticeBatcher.batch(db, batch_id)
+    carrier_id = armed.delivery_wake_id
+
+    assert carrier_id in carrier_ids
+    assert Wakes.get(db, carrier_id).due_at == sealed.due_at
+    assert Wakes.get(db, replacement_wake_id).state == "canceled"
+
+    assert %{
+             requester: "tightbeam:batcher",
+             reason: "superseded",
+             source_id: ^carrier_id,
+             outcome: "replacement",
+             replacement_wake_id: ^carrier_id
+           } = cancellation(db, replacement_wake_id)
+
+    assert Enum.map(Wakes.digest_members(db, carrier_id), & &1.wake_id) |> Enum.count() == 50
+  end
+
   test "retirement after arm preserves the one carrier and closes the replacement", %{db: db} do
     %{original: original, batch_id: batch_id} = selected_retirement_source(db, "after arm")
     assert [carrier_id] = Wakes.materialize_digests(db, original.due_at)

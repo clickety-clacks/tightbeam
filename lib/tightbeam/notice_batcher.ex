@@ -280,7 +280,11 @@ defmodule Tightbeam.NoticeBatcher do
   end
 
   def enqueue_or_recover_in_txn(%Txn{} = txn, {:arm, batch_id}) do
-    arm_in_txn(txn, batch_id)
+    arm_if_due_in_txn(txn, batch_id, now())
+  end
+
+  def enqueue_or_recover_in_txn(%Txn{} = txn, {:arm_if_due, batch_id, at}) do
+    arm_if_due_in_txn(txn, batch_id, at)
   end
 
   def enqueue_or_recover_in_txn(%Txn{} = txn, {:attempt, delivery_wake_id, at}) do
@@ -301,7 +305,11 @@ defmodule Tightbeam.NoticeBatcher do
 
   @doc false
   @spec preserve_retargeted_source_in_txn(Txn.t(), String.t(), String.t()) ::
-          :not_batched | map() | {:immutable_delivery, map()} | {:error, map()}
+          :not_batched
+          | map()
+          | {:immutable_delivery, map()}
+          | {:immutable_delivery_pending, map()}
+          | {:error, map()}
   def preserve_retargeted_source_in_txn(
         %Txn{} = txn,
         source_wake_id,
@@ -359,7 +367,7 @@ defmodule Tightbeam.NoticeBatcher do
         delivery_wake_id =
           case {batch_state, delivery_wake_id} do
             {"sealed", nil} ->
-              case arm_in_txn(txn, batch_id) do
+              case arm_if_due_in_txn(txn, batch_id, now()) do
                 {:new, wake_id} -> wake_id
                 :noop -> delivery_wake_id_in_txn(txn, batch_id)
               end
@@ -371,27 +379,41 @@ defmodule Tightbeam.NoticeBatcher do
               nil
           end
 
-        if is_binary(delivery_wake_id) do
-          lifecycle(
-            txn,
-            "retarget_preserved_by_immutable_delivery",
-            batch_id,
-            member_id,
-            replacement_wake_id,
-            delivery_wake_id
-          )
+        cond do
+          is_binary(delivery_wake_id) ->
+            lifecycle(
+              txn,
+              "retarget_preserved_by_immutable_delivery",
+              batch_id,
+              member_id,
+              replacement_wake_id,
+              delivery_wake_id
+            )
 
-          {:immutable_delivery,
-           %{
-             batch_id: batch_id,
-             batch_state: batch_state,
-             delivery_wake_id: delivery_wake_id
-           }}
-        else
-          refusal(
-            "immutable_delivery_missing_carrier",
-            "a sealed selected source has no durable carrier"
-          )
+            {:immutable_delivery,
+             %{
+               batch_id: batch_id,
+               batch_state: batch_state,
+               delivery_wake_id: delivery_wake_id
+             }}
+
+          overflow_waiting_for_trigger?(txn, batch_id) ->
+            lifecycle(
+              txn,
+              "retarget_preserved_by_immutable_delivery",
+              batch_id,
+              member_id,
+              replacement_wake_id,
+              "pending-original-trigger"
+            )
+
+            {:immutable_delivery_pending, %{batch_id: batch_id, batch_state: batch_state}}
+
+          true ->
+            refusal(
+              "immutable_delivery_missing_carrier",
+              "a sealed selected source has no durable carrier"
+            )
         end
 
       [] ->
@@ -441,6 +463,14 @@ defmodule Tightbeam.NoticeBatcher do
     end
   end
 
+  defp overflow_waiting_for_trigger?(txn, batch_id) do
+    Txn.q(
+      txn,
+      "SELECT 1 FROM notice_batches WHERE batchId=?1 AND state='sealed' AND releaseCause='overflow' AND deliveryWakeId IS NULL",
+      [batch_id]
+    ) == [[1]]
+  end
+
   @doc "Seal due batches, arm sealed batches, and reconcile committed deliveries."
   @spec recover(GenServer.server(), integer()) :: [String.t()]
   def recover(db \\ Tightbeam.DB, at \\ now()) do
@@ -466,7 +496,7 @@ defmodule Tightbeam.NoticeBatcher do
 
     Enum.flat_map(sealed_ids, fn [batch_id] ->
       case transaction!(db, fn txn ->
-             enqueue_or_recover_in_txn(txn, {:arm, batch_id})
+             enqueue_or_recover_in_txn(txn, {:arm_if_due, batch_id, at})
            end) do
         {:new, wake_id} -> [wake_id]
         _ -> []
@@ -981,7 +1011,41 @@ defmodule Tightbeam.NoticeBatcher do
     end
   end
 
-  defp arm_in_txn(txn, batch_id) do
+  # Overflow freezes a bounded prefix; it is not a delivery trigger. Keep the
+  # sealed bytes immutable, then arm only when that prefix's original ceiling
+  # or recipient turn boundary becomes observable.
+  defp arm_if_due_in_txn(txn, batch_id, at) do
+    case Txn.q(
+           txn,
+           """
+           SELECT releaseCause, dueAt, openedAt, sessionKey, targetRole, sealedAt
+           FROM notice_batches WHERE batchId=?1 AND state='sealed'
+           """,
+           [batch_id]
+         ) do
+      [["overflow", due_at, opened_at, session_key, target_role, _sealed_at]] ->
+        boundary = latest_turn_end(txn, session_key, target_role)
+
+        cond do
+          at >= due_at ->
+            arm_in_txn(txn, batch_id, due_at, "ceiling")
+
+          is_integer(boundary) and boundary > opened_at ->
+            arm_in_txn(txn, batch_id, boundary, "turn-boundary")
+
+          true ->
+            :noop
+        end
+
+      [[cause, _due_at, _opened_at, _session_key, _target_role, sealed_at]] ->
+        arm_in_txn(txn, batch_id, sealed_at, cause)
+
+      [] ->
+        :noop
+    end
+  end
+
+  defp arm_in_txn(txn, batch_id, delivery_at, delivery_trigger) do
     case Txn.q(
            txn,
            """
@@ -991,6 +1055,8 @@ defmodule Tightbeam.NoticeBatcher do
            [batch_id]
          ) do
       [[session_key, target_role, envelope, token, nil, sealed_at]] ->
+        delivery_at = delivery_at || sealed_at
+        delivery_trigger = delivery_trigger || release_cause(txn, batch_id)
         wake_id = delivery_wake_id(batch_id)
         existing = Txn.q(txn, "SELECT 1 FROM wakes WHERE wakeId=?1", [wake_id])
         {work_item_id, assignment_id} = shared_work(txn, batch_id)
@@ -1004,7 +1070,7 @@ defmodule Tightbeam.NoticeBatcher do
             target_role: target_role,
             origin: "process:tightbeam",
             prompt: envelope,
-            due_at: sealed_at,
+            due_at: delivery_at,
             class: "fyi",
             digest: true,
             target_gate: 0,
@@ -1023,6 +1089,8 @@ defmodule Tightbeam.NoticeBatcher do
           [batch_id, wake_id, token]
         )
 
+        supersede_deferred_retargets_in_txn(txn, batch_id, wake_id)
+
         lifecycle(txn, "delivery_armed", batch_id, nil, nil, wake_id)
 
         EventLog.lifecycle_in_txn(
@@ -1030,7 +1098,7 @@ defmodule Tightbeam.NoticeBatcher do
           "wake_digest_materialized",
           wake_id,
           "rule=#{@rule} batchId=#{batch_id} members=#{member_count(txn, batch_id)} " <>
-            "trigger=#{release_cause(txn, batch_id)}#{owner_field}"
+            "trigger=#{delivery_trigger}#{owner_field}"
         )
 
         {:new, wake_id}
@@ -1038,6 +1106,38 @@ defmodule Tightbeam.NoticeBatcher do
       [] ->
         :noop
     end
+  end
+
+  defp supersede_deferred_retargets_in_txn(txn, batch_id, delivery_wake_id) do
+    replacements =
+      Txn.q(
+        txn,
+        """
+        SELECT DISTINCT c.replacementWakeId
+        FROM notice_batch_members m
+        JOIN wake_cancellations c ON c.wakeId=m.sourceWakeId
+        JOIN wakes replacement ON replacement.wakeId=c.replacementWakeId
+        WHERE m.batchId=?1 AND m.state='included'
+          AND c.reasonKind='target_retired' AND c.outcomeKind='replacement'
+          AND replacement.state='pending'
+        """,
+        [batch_id]
+      )
+
+    Enum.each(replacements, fn [replacement_wake_id] ->
+      canceled =
+        Wakes.cancel_in_txn(txn, %{
+          wake_id: replacement_wake_id,
+          requester: %{kind: "process", id: "tightbeam:batcher"},
+          reason_kind: "superseded",
+          causal_source: %{kind: "wake", id: delivery_wake_id},
+          outcome: %{kind: "replacement", replacement_wake_id: delivery_wake_id}
+        })
+
+      if not canceled do
+        raise "deferred retirement replacement carrier supersession refused for #{replacement_wake_id}"
+      end
+    end)
   end
 
   defp cancel_member_in_txn(txn, source_wake_id, cancellation_ref) do

@@ -1,7 +1,7 @@
 defmodule Tightbeam.NoticeBatcherTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{AdminProjection, DB, Gateway, NoticeBatcher, Org, Roles, Wakes}
+  alias Tightbeam.{AdminProjection, DB, EventLog, Gateway, NoticeBatcher, Org, Roles, Wakes}
 
   setup do
     id = System.unique_integer([:positive])
@@ -160,6 +160,24 @@ defmodule Tightbeam.NoticeBatcherTest do
 
     assert NoticeBatcher.members(db, second_batch) |> Enum.map(& &1.source_wake_id) ==
              [List.last(sources).wake_id]
+
+    sealed = NoticeBatcher.batch(db, first_batch)
+    assert sealed.state == "sealed"
+    assert sealed.release_cause == "overflow"
+    assert sealed.delivery_wake_id == nil
+
+    assert {:ok, :noop} =
+             DB.transaction(db, fn txn ->
+               NoticeBatcher.enqueue_or_recover_in_txn(txn, {:arm, first_batch})
+             end)
+
+    assert NoticeBatcher.recover(db, sealed.due_at - 1) == []
+    assert NoticeBatcher.batch(db, first_batch).delivery_wake_id == nil
+
+    carrier_ids = NoticeBatcher.recover(db, sealed.due_at)
+    armed = NoticeBatcher.batch(db, first_batch)
+    assert armed.delivery_wake_id in carrier_ids
+    assert Wakes.get(db, armed.delivery_wake_id).due_at == sealed.due_at
   end
 
   test "acceptance 11: the payload limit seals a prefix and never truncates the candidate",
@@ -170,7 +188,34 @@ defmodule Tightbeam.NoticeBatcherTest do
 
     assert batch_id(db, first) != batch_id(db, candidate)
     assert [%{payload: ^payload}] = NoticeBatcher.members(db, batch_id(db, candidate))
-    assert NoticeBatcher.batch(db, batch_id(db, first)).state == "sealed"
+    sealed = NoticeBatcher.batch(db, batch_id(db, first))
+    assert sealed.state == "sealed"
+    assert sealed.release_cause == "overflow"
+    assert NoticeBatcher.recover(db, sealed.due_at - 1) == []
+    assert NoticeBatcher.batch(db, sealed.batch_id).delivery_wake_id == nil
+  end
+
+  test "an overflow-sealed prefix arms at the recipient boundary before its ceiling", %{db: db} do
+    sources = for n <- 1..51, do: eligible(db, prompt: "boundary notice #{n}")
+    first_batch_id = batch_id(db, hd(sources))
+    sealed = NoticeBatcher.batch(db, first_batch_id)
+    boundary = sealed.opened_at + 1
+
+    assert sealed.release_cause == "overflow"
+    assert boundary < sealed.due_at
+    terminal_turn(db, sealed.session_key, boundary)
+
+    carrier_ids = NoticeBatcher.recover(db, boundary)
+    armed = NoticeBatcher.batch(db, first_batch_id)
+
+    assert armed.delivery_wake_id in carrier_ids
+    assert Wakes.get(db, armed.delivery_wake_id).due_at == boundary
+
+    assert Enum.any?(EventLog.lifecycle_events(db), fn event ->
+             event.kind == "wake_digest_materialized" and
+               event.subject == armed.delivery_wake_id and
+               event.detail =~ "trigger=turn-boundary"
+           end)
   end
 
   test "acceptance 12: replay returns one member and one batch", %{db: db} do
@@ -403,6 +448,36 @@ defmodule Tightbeam.NoticeBatcherTest do
     assert NoticeBatcher.batch(db, batch_id(db, active)).state == "delivered"
     assert count(db, "notice_batch_members", "sourceWakeId=?1", [unselected.wake_id]) == 0
     assert count(db, "notice_batch_members", "sourceWakeId=?1", [disabled.wake_id]) == 0
+  end
+
+  test "default-off digest preserves the legacy rule through suppression and provenance", %{
+    db: db
+  } do
+    source =
+      Wakes.schedule(db, %{
+        session_key: "agent:legacy-recipient",
+        origin: "process:tightbeam",
+        creator_session_key: "agent:legacy-recipient",
+        prompt: "default-off legacy payload",
+        due_at: 0,
+        class: "fyi"
+      })
+
+    assert source.delivery_rule == "turn-boundary-digest r1"
+    assert NoticeBatcher.source_refs(db, source.wake_id) == []
+    assert Wakes.self_pending_count(db, source.session_key) == 0
+
+    [carrier_id] = Wakes.materialize_digests(db, source.due_at)
+    carrier = Wakes.get(db, carrier_id)
+
+    assert carrier.delivery_rule == "turn-boundary-digest r1"
+    assert carrier.prompt =~ "coalesced by turn-boundary-digest r1"
+    refute carrier.prompt =~ "coalesced by notice-batching-v1 r1"
+
+    assert Enum.any?(EventLog.lifecycle_events(db), fn event ->
+             event.kind == "wake_digest_materialized" and event.subject == carrier_id and
+               event.detail =~ "rule=turn-boundary-digest r1"
+           end)
   end
 
   test "acceptance 22: a later earlier deadline atomically shortens the lane", %{db: db} do

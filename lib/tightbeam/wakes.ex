@@ -249,8 +249,10 @@ defmodule Tightbeam.Wakes do
 
   @doc "The signature line a digest carries (fabric §8: every bone signs its work)."
   @spec digest_signature(non_neg_integer()) :: String.t()
-  def digest_signature(count) do
-    "coalesced by #{@digest_rule} (#{count} #{if count == 1, do: "notice", else: "notices"})"
+  def digest_signature(count), do: digest_signature(@digest_rule, count)
+
+  defp digest_signature(rule, count) do
+    "coalesced by #{rule} (#{count} #{if count == 1, do: "notice", else: "notices"})"
   end
 
   @doc false
@@ -465,7 +467,7 @@ defmodule Tightbeam.Wakes do
       # produced it, delivered at the moment that rule chose, and never a
       # member of anything: `digest = 1` is what keeps it out of its own group.
       Map.get(input, :digest, false) ->
-        {@digest_rule, Map.fetch!(input, :due_at)}
+        {Map.get(input, :delivery_rule, @digest_rule), Map.fetch!(input, :due_at)}
 
       # THE CLASS CHECK PRECEDES THE INHIBITION BRANCH (Sol xhigh review,
       # finding 1). `immediate` and `bypass` classes were never the batcher's
@@ -1528,10 +1530,11 @@ defmodule Tightbeam.Wakes do
           -- `IS`, not `=`: an unclassed wake's deliveryRule is NULL, and
           -- `NULL = ?2` is NULL (neither true nor false) under SQL's
           -- three-valued logic, which would silently exclude it too. `IS`
-          -- compares NULL correctly and only the true digest-held case matches.
-          AND NOT (digest = 0 AND deliveryRule IS ?2)
+          -- compares NULL correctly and only a held digest source under one
+          -- of the two mechanically distinct rule revisions matches.
+          AND NOT (digest = 0 AND (deliveryRule IS ?2 OR deliveryRule IS ?3))
         """,
-        [session_key, @digest_rule]
+        [session_key, @digest_rule, @legacy_digest_rule]
       )
 
     count
@@ -1588,9 +1591,9 @@ defmodule Tightbeam.Wakes do
     NoticeBatcher.recover(db, at) ++ legacy_materialize_digests(db, at)
   end
 
-  # Compatibility only: rows already stamped by the Phase-1 digest rule keep
-  # their versioned path through rollback or upgrade. New admission never
-  # writes this rule.
+  # Compatibility path: rows stamped by the Phase-1 digest rule, including
+  # default-off and rollback admission, keep that versioned rule through the
+  # carrier and every provenance row.
   defp legacy_materialize_digests(db, at) do
     {:ok, groups} =
       DB.query(
@@ -1811,10 +1814,11 @@ defmodule Tightbeam.Wakes do
           %{
             wake_id: carrier_wake_id,
             origin: "process:tightbeam",
-            prompt: digest_prompt(class, members, carrier_wake_id),
+            prompt: digest_prompt(class, members, carrier_wake_id, @legacy_digest_rule),
             due_at: at,
             class: class,
             digest: true,
+            delivery_rule: @legacy_digest_rule,
             target_gate: 0,
             work_item_id: work_item_id,
             assignment_id: assignment_id
@@ -1850,7 +1854,7 @@ defmodule Tightbeam.Wakes do
       txn,
       "wake_digest_materialized",
       digest.wake_id,
-      "rule=#{@digest_rule} target=#{target_label} class=#{class} members=#{carried} " <>
+      "rule=#{@legacy_digest_rule} target=#{target_label} class=#{class} members=#{carried} " <>
         "trigger=#{reason}" <> pinned_owner_field(pinned_owner)
     )
 
@@ -1942,7 +1946,7 @@ defmodule Tightbeam.Wakes do
   # inhibit (§8 legibility) — and now names the carrier's OWN wake id (O5
   # follow-up), so the recipient can ask `digest-members <id>` about the
   # payload it just received without any surface but the message itself.
-  defp digest_prompt(class, members, wake_id) do
+  defp digest_prompt(class, members, wake_id, rule) do
     body =
       members
       |> Enum.with_index(1)
@@ -1959,7 +1963,7 @@ defmodule Tightbeam.Wakes do
       end)
       |> Enum.join("\n")
 
-    "[digest] #{digest_signature(length(members))} wake #{wake_id}\n\n#{body}"
+    "[digest] #{digest_signature(rule, length(members))} wake #{wake_id}\n\n#{body}"
   end
 
   @doc """
@@ -2276,8 +2280,9 @@ defmodule Tightbeam.Wakes do
         db,
         select_wake_sql() <>
           " WHERE state = 'pending' AND dueAt <= ?1 AND conditionKind IS NULL" <>
-          " AND NOT (digest = 0 AND deliveryRule IS ?2) ORDER BY dueAt ASC",
-        [now(), @digest_rule]
+          " AND NOT (digest = 0 AND (deliveryRule IS ?2 OR deliveryRule IS ?3))" <>
+          " ORDER BY dueAt ASC",
+        [now(), @digest_rule, @legacy_digest_rule]
       )
 
     for row <- rows do
