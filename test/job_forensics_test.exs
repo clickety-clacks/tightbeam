@@ -192,8 +192,8 @@ defmodule Tightbeam.JobForensicsTest do
     # migrate the item.
     assert_keys(
       fetch_item(db, "wi_disp").workItem,
-      ~w(createdAt createdBySession createdByUser failReason id isBug ownerUserId
-         specRefName specRefSha256 state title)a
+      ~w(body bodyUpdatedAt bodyUpdatedBySession bodyUpdatedByUser createdAt createdBySession
+         createdByUser failReason id isBug ownerUserId specRefName specRefSha256 state title)a
     )
   end
 
