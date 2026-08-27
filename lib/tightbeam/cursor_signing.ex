@@ -14,8 +14,10 @@ defmodule Tightbeam.CursorSigning do
   import Bitwise
 
   @material_bytes 32
+  @domain_separator <<"tightbeam/rest-read-plane-d1/cursor/v1", 0>>
   @record_name "rest-cursor-signing.v1"
   @record_mode 0o600
+  @record_mode_mask 0o7777
   @directory_mode 0o700
   @read_attempts 8
 
@@ -41,10 +43,11 @@ defmodule Tightbeam.CursorSigning do
   @spec provision(String.t()) :: :ok | {:error, Error.t()}
   def provision(base_dir) do
     with {:ok, owner_uid} <- effective_uid(),
-         {:ok, _directory, path} <- provision_location(base_dir, owner_uid),
+         {:ok, directory, path} <- provision_location(base_dir, owner_uid),
          :ok <- refuse_existing(path),
          material <- :crypto.strong_rand_bytes(@material_bytes),
          :ok <- create_record(path, material, owner_uid),
+         :ok <- sync_directory(directory),
          {:ok, _material} <- read_record(path, owner_uid, @read_attempts) do
       :ok
     end
@@ -118,7 +121,7 @@ defmodule Tightbeam.CursorSigning do
   def sign(%__MODULE__{} = provider, input) do
     with {:ok, input} <- iodata(input),
          {:ok, material} <- provider_material(provider) do
-      {:ok, :crypto.mac(:hmac, :sha256, material, input)}
+      {:ok, :crypto.mac(:hmac, :sha256, material, [@domain_separator, input])}
     end
   rescue
     _error -> error(:operation_failed)
@@ -205,8 +208,14 @@ defmodule Tightbeam.CursorSigning do
 
   defp mkdir_base(base_dir) do
     case File.mkdir_p(base_dir) do
-      :ok -> :ok
-      {:error, _reason} -> error(:unavailable)
+      :ok ->
+        with :ok <- sync_directory(base_dir),
+             :ok <- sync_directory(Path.dirname(base_dir)) do
+          :ok
+        end
+
+      {:error, _reason} ->
+        error(:unavailable)
     end
   end
 
@@ -219,7 +228,9 @@ defmodule Tightbeam.CursorSigning do
         case File.mkdir(directory) do
           :ok ->
             with :ok <- chmod(directory, @directory_mode),
-                 :ok <- validate_directory(directory, owner_uid) do
+                 :ok <- validate_directory(directory, owner_uid),
+                 :ok <- sync_directory(directory),
+                 :ok <- sync_directory(Path.dirname(directory)) do
               :ok
             end
 
@@ -317,7 +328,7 @@ defmodule Tightbeam.CursorSigning do
          %File.Stat{type: :regular, mode: mode, uid: owner_uid},
          owner_uid
        )
-       when (mode &&& 0o777) == @record_mode,
+       when (mode &&& @record_mode_mask) == @record_mode,
        do: :ok
 
   defp validate_created_stat(%File.Stat{uid: uid}, owner_uid) when uid != owner_uid,
@@ -336,6 +347,18 @@ defmodule Tightbeam.CursorSigning do
     case :file.sync(file) do
       :ok -> :ok
       {:error, _reason} -> error(:unavailable)
+    end
+  end
+
+  defp sync_directory(directory) do
+    case :file.open(String.to_charlist(directory), [:read, :raw, :directory]) do
+      {:ok, file} ->
+        result = sync_record(file)
+        _ = :file.close(file)
+        result
+
+      {:error, _reason} ->
+        error(:unavailable)
     end
   end
 
@@ -394,7 +417,7 @@ defmodule Tightbeam.CursorSigning do
          %File.Stat{type: :regular, mode: mode, uid: owner_uid},
          owner_uid
        )
-       when (mode &&& 0o777) == @record_mode,
+       when (mode &&& @record_mode_mask) == @record_mode,
        do: :ok
 
   defp validate_record_stat(%File.Stat{type: :symlink}, _owner_uid),
@@ -431,9 +454,22 @@ defmodule Tightbeam.CursorSigning do
   end
 
   defp replace_record(temporary, path) do
-    case File.rename(temporary, path) do
-      :ok ->
-        :ok
+    directory = Path.dirname(path)
+
+    case :file.open(String.to_charlist(directory), [:read, :raw, :directory]) do
+      {:ok, directory_file} ->
+        result =
+          case File.rename(temporary, path) do
+            :ok ->
+              sync_record(directory_file)
+
+            {:error, _reason} ->
+              _ = File.rm(temporary)
+              error(:rotation_failed)
+          end
+
+        _ = :file.close(directory_file)
+        result
 
       {:error, _reason} ->
         _ = File.rm(temporary)
