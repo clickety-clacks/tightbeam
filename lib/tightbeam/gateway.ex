@@ -2171,6 +2171,9 @@ defmodule Tightbeam.Gateway do
           # absence fails the whole decode and the model footer never
           # populates (found live; the TS reference omitted it too).
           sessionKey: session_key,
+          operationalParent: session.operational_parent,
+          effectiveParent: session.effective_parent,
+          effectiveParentSource: Atom.to_string(session.effective_parent_source),
           display: %{
             # `model` is the row IDENTITY this seam issues (see `wire_model/1`):
             # the footer displays it verbatim when it cannot match a catalog row,
@@ -2441,6 +2444,8 @@ defmodule Tightbeam.Gateway do
       :origin,
       :spawned_by,
       :operational_parent,
+      :effective_parent,
+      :effective_parent_source,
       :state,
       :created_at
     ])
@@ -4552,15 +4557,26 @@ defmodule Tightbeam.Gateway do
   end
 
   defp caller_in_lineage_above?(db, scope, caller_key, hops \\ 0)
-  defp caller_in_lineage_above?(_db, _scope, _caller_key, hops) when hops > 32, do: false
+
+  defp caller_in_lineage_above?(_db_or_txn, _scope, _caller_key, hops) when hops > 32,
+    do: false
+
+  defp caller_in_lineage_above?(%Txn{} = txn, scope, caller_key, hops) do
+    parent = Org.effective_parent_in_txn(txn, scope).session_key
+
+    cond do
+      parent == caller_key -> true
+      parent == scope -> false
+      true -> caller_in_lineage_above?(txn, parent, caller_key, hops + 1)
+    end
+  rescue
+    ArgumentError -> false
+  end
 
   defp caller_in_lineage_above?(db, scope, caller_key, hops) do
-    case DB.query(db, "SELECT operationalParent FROM sessions WHERE sessionKey = ?1", [scope]) do
-      {:ok, [[parent]]} when is_binary(parent) ->
-        parent == caller_key or caller_in_lineage_above?(db, parent, caller_key, hops + 1)
-
-      _ ->
-        false
+    case DB.transaction(db, fn txn -> caller_in_lineage_above?(txn, scope, caller_key, hops) end) do
+      {:ok, authorized?} -> authorized?
+      {:error, _error} -> false
     end
   end
 
@@ -7591,17 +7607,20 @@ defmodule Tightbeam.Gateway do
     rows =
       Txn.q(
         txn,
-        "SELECT sessionKey, operationalParent FROM sessions WHERE state='active' ORDER BY createdAt, sessionKey"
+        "SELECT sessionKey FROM sessions WHERE state='active' ORDER BY createdAt, sessionKey"
       )
 
-    children = Enum.group_by(rows, &Enum.at(&1, 1))
+    children =
+      Enum.group_by(rows, fn [session_key] ->
+        Org.effective_parent_in_txn(txn, session_key).session_key
+      end)
 
     walk = fn walk, key ->
       descendants =
         children
         |> Map.get(key, [])
-        |> Enum.reject(fn [child_key, _parent] -> child_key == key end)
-        |> Enum.flat_map(fn [child_key, _parent] -> walk.(walk, child_key) end)
+        |> Enum.reject(fn [child_key] -> child_key == key end)
+        |> Enum.flat_map(fn [child_key] -> walk.(walk, child_key) end)
 
       descendants ++ [%{session_key: key}]
     end
@@ -7611,10 +7630,12 @@ defmodule Tightbeam.Gateway do
 
   defp retired_subtree_keys(db, root_key) do
     {:ok, rows} =
-      DB.query(
-        db,
-        "SELECT sessionKey, operationalParent, state FROM sessions ORDER BY createdAt, sessionKey"
-      )
+      DB.transaction(db, fn txn ->
+        Txn.q(txn, "SELECT sessionKey, state FROM sessions ORDER BY createdAt, sessionKey")
+        |> Enum.map(fn [session_key, state] ->
+          [session_key, Org.effective_parent_in_txn(txn, session_key).session_key, state]
+        end)
+      end)
 
     children = Enum.group_by(rows, &Enum.at(&1, 1))
 
@@ -7923,8 +7944,8 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  # The built-in Main stream is seeded on the gateway's own host (see
-  # `Wire.Socket.seed_main_stream/2`), so that is the catalog to read.
+  # Cold start creates the built-in Main on the gateway's own host, so that is
+  # the catalog to read when its provider default is resolved.
   defp default_seed_provider(module, ref) do
     case ModelCatalog.entry(Placement.local_host_name(), module.wire_name(), ref) do
       {%{provider: provider}, _health} -> Atom.to_string(provider)

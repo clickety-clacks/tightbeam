@@ -3722,6 +3722,7 @@ defmodule Tightbeam.SupervisionTest do
       owner_user_id: "flynn",
       origin: "user:flynn",
       spawned_by: spawned_by,
+      operational_parent: spawned_by,
       kind: if(built_in, do: "main", else: "custom"),
       is_built_in: built_in,
       archetype: "default",

@@ -141,6 +141,8 @@ defmodule Tightbeam.Wire.PayloadsTest do
       origin: "user:flynn",
       spawned_by: "agent:main:clawline:flynn:main",
       operational_parent: "agent:main:clawline:flynn:main",
+      effective_parent: "agent:main:clawline:flynn:main",
+      effective_parent_source: :explicit,
       handle: nil,
       archetype: "default",
       harness: "claude",
@@ -162,6 +164,8 @@ defmodule Tightbeam.Wire.PayloadsTest do
       "updatedAt" => 2,
       "adopted" => true,
       "operationalParent" => "agent:main:clawline:flynn:main",
+      "effectiveParent" => "agent:main:clawline:flynn:main",
+      "effectiveParentSource" => "explicit",
       "startedBy" => "user"
     }
 
@@ -184,6 +188,16 @@ defmodule Tightbeam.Wire.PayloadsTest do
     assert stream_without_provenance == %{existing_keys | "startedBy" => "substrate"}
     refute Map.has_key?(stream_without_provenance, "origin")
     refute Map.has_key?(stream_without_provenance, "spawnedBy")
+
+    assert %{
+             "operationalParent" => nil,
+             "effectiveParent" => "agent:main:clawline:flynn:main",
+             "effectiveParentSource" => "owner_main"
+           } =
+             session
+             |> Map.put(:operational_parent, nil)
+             |> Map.put(:effective_parent_source, :owner_main)
+             |> Payloads.stream_session()
 
     assert Payloads.stream_snapshot([stream]) == %{
              "type" => "stream_snapshot",

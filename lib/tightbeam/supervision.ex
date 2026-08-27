@@ -848,21 +848,22 @@ defmodule Tightbeam.Supervision do
   deliver.
   """
   @spec ladder_target(DB.server() | Txn.t(), String.t(), pos_integer()) :: String.t() | nil
-  def ladder_target(db_or_txn, holder_key, rung) do
-    [[owner, operational_parent]] =
-      query(
-        db_or_txn,
-        "SELECT ownerUserId, operationalParent FROM sessions WHERE sessionKey = ?1",
-        [
-          holder_key
-        ]
-      )
+  def ladder_target(%Txn{} = txn, holder_key, rung) do
+    %{owner_user_id: owner, session_key: effective_parent} =
+      Org.effective_parent_in_txn(txn, holder_key)
 
-    chain = lineage(db_or_txn, operational_parent, MapSet.new([holder_key]), [])
+    chain = lineage(txn, effective_parent, MapSet.new([holder_key]), [])
 
     case Enum.at(chain, rung - 1) do
-      nil -> active_personal_key(db_or_txn, owner)
+      nil -> active_personal_key(txn, owner)
       rung_key -> rung_key
+    end
+  end
+
+  def ladder_target(db, holder_key, rung) do
+    case DB.transaction(db, fn txn -> ladder_target(txn, holder_key, rung) end) do
+      {:ok, target} -> target
+      {:error, error} -> raise error
     end
   end
 
@@ -3092,12 +3093,11 @@ defmodule Tightbeam.Supervision do
     if MapSet.member?(visited, session_key) do
       Enum.reverse(acc)
     else
-      case query(db, "SELECT state, operationalParent FROM sessions WHERE sessionKey = ?1", [
-             session_key
-           ]) do
-        [[state, operational_parent]] ->
+      case query(db, "SELECT state FROM sessions WHERE sessionKey = ?1", [session_key]) do
+        [[state]] ->
           next_acc = if state == "active", do: [session_key | acc], else: acc
-          lineage(db, operational_parent, MapSet.put(visited, session_key), next_acc)
+          effective_parent = Org.effective_parent_in_txn(db, session_key).session_key
+          lineage(db, effective_parent, MapSet.put(visited, session_key), next_acc)
 
         [] ->
           Enum.reverse(acc)
@@ -4003,19 +4003,13 @@ defmodule Tightbeam.Supervision do
   end
 
   defp ladder_target_excluding(db_or_txn, holder_key, rung, excluded) do
-    [[owner, operational_parent]] =
-      query(
-        db_or_txn,
-        "SELECT ownerUserId, operationalParent FROM sessions WHERE sessionKey=?1",
-        [
-          holder_key
-        ]
-      )
+    %{owner_user_id: owner, session_key: effective_parent} =
+      Org.effective_parent_in_txn(db_or_txn, holder_key)
 
     chain =
       lineage_excluding(
         db_or_txn,
-        operational_parent,
+        effective_parent,
         excluded,
         MapSet.new([holder_key]),
         []
@@ -4037,18 +4031,18 @@ defmodule Tightbeam.Supervision do
     if MapSet.member?(visited, session_key) do
       Enum.reverse(acc)
     else
-      case query(db_or_txn, "SELECT state, operationalParent FROM sessions WHERE sessionKey=?1", [
-             session_key
-           ]) do
-        [[state, operational_parent]] ->
+      case query(db_or_txn, "SELECT state FROM sessions WHERE sessionKey=?1", [session_key]) do
+        [[state]] ->
           next_acc =
             if state == "active" and session_key != excluded,
               do: [session_key | acc],
               else: acc
 
+          effective_parent = Org.effective_parent_in_txn(db_or_txn, session_key).session_key
+
           lineage_excluding(
             db_or_txn,
-            operational_parent,
+            effective_parent,
             excluded,
             MapSet.put(visited, session_key),
             next_acc

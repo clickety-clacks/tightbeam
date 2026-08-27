@@ -864,7 +864,7 @@ defmodule Tightbeam.EffortCheckin do
     if current.kind != "main" do
       route_session(
         txn,
-        current.operational_parent,
+        current.effective_parent,
         request.owner_user_id,
         request.lineage_rung + 1,
         assignment.holder_key
@@ -885,7 +885,7 @@ defmodule Tightbeam.EffortCheckin do
 
     cond do
       key == holder_key and session.kind != "main" ->
-        route_session(txn, session.operational_parent, owner_user_id, rung + 1, holder_key)
+        route_session(txn, session.effective_parent, owner_user_id, rung + 1, holder_key)
 
       key == holder_key ->
         %{
@@ -906,7 +906,7 @@ defmodule Tightbeam.EffortCheckin do
         }
 
       session.kind != "main" ->
-        route_session(txn, session.operational_parent, owner_user_id, rung + 1, holder_key)
+        route_session(txn, session.effective_parent, owner_user_id, rung + 1, holder_key)
 
       true ->
         %{
@@ -1120,7 +1120,7 @@ defmodule Tightbeam.EffortCheckin do
   defp active_operational_chain!(txn, session) do
     operational_chain!(
       txn,
-      session.operational_parent,
+      session.effective_parent,
       MapSet.new([session.session_key]),
       []
     )
@@ -1128,23 +1128,23 @@ defmodule Tightbeam.EffortCheckin do
 
   defp operational_chain!(txn, key, visited, acc) do
     if MapSet.member?(visited, key) do
-      raise "incompatible_operational_parent_v1: cycle before Main at #{key}"
+      raise "incompatible_nullable_effective_parent_v1: cycle before Main at #{key}"
     end
 
     parent = session_in_txn(txn, key)
     next_acc = if parent.state == "active", do: [key | acc], else: acc
 
     cond do
-      parent.kind == "main" and parent.operational_parent == key and parent.state == "active" ->
+      parent.effective_parent == key and parent.state == "active" ->
         Enum.reverse(next_acc)
 
-      parent.kind == "main" ->
-        raise "incompatible_operational_parent_v1: Main #{key} is not an active self-root"
+      parent.effective_parent == key ->
+        raise "incompatible_nullable_effective_parent_v1: fixed parent #{key} is not active"
 
       true ->
         operational_chain!(
           txn,
-          parent.operational_parent,
+          parent.effective_parent,
           MapSet.put(visited, key),
           next_acc
         )
@@ -1275,22 +1275,7 @@ defmodule Tightbeam.EffortCheckin do
   end
 
   defp session_in_txn(txn, key) do
-    [[key, owner, operational_parent, host, state, built_in, kind]] =
-      Txn.q(
-        txn,
-        "SELECT sessionKey, ownerUserId, operationalParent, host, state, isBuiltIn, kind FROM sessions WHERE sessionKey = ?1",
-        [key]
-      )
-
-    %{
-      session_key: key,
-      owner_user_id: owner,
-      operational_parent: operational_parent,
-      host: host,
-      state: state,
-      is_built_in: built_in == 1,
-      kind: kind
-    }
+    Org.get_in_txn(txn, key) || raise ArgumentError, "unknown session: #{key}"
   end
 
   defp holder_owner(txn, key) do

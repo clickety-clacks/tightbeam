@@ -59,6 +59,7 @@ defmodule Tightbeam.Productions.BubbleTest do
         host: "testhost",
         model: Model.new("fable"),
         spawned_by: spawned_by,
+        operational_parent: spawned_by,
         is_built_in: built_in?
       })
 

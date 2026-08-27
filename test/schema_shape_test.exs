@@ -423,7 +423,6 @@ defmodule Tightbeam.SchemaShapeTest do
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     refute "operationalParent" in table_columns(db, "sessions")
-
     assert :ok = Schema.ensure_all(db)
 
     assert {:ok, [["coordination-fabric-v1-phase1-v8"]]} =
@@ -448,7 +447,7 @@ defmodule Tightbeam.SchemaShapeTest do
         name == "operationalParent"
       end)
 
-    assert Enum.at(column, 3) == 1
+    assert Enum.at(column, 3) == 0
   end
 
   test "an interrupted operational-parent upgrade rolls back and retries exactly", %{db: db} do
@@ -479,11 +478,114 @@ defmodule Tightbeam.SchemaShapeTest do
 
     refute "operationalParent" in table_columns(db, "sessions")
     refute table?(db, "sessions_operational_parent_v1")
-
     assert :ok = Schema.ensure_all(db)
 
     assert {:ok, [[^main_key]]} =
              DB.query(db, "SELECT operationalParent FROM sessions WHERE kind='main'")
+  end
+
+  test "the exact v7 predecessor preserves explicit parents and becomes nullable", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:paired, _device} =
+             claim_org(db, %{
+               device_id: "legacy-device",
+               claimed_name: "Flynn",
+               platform: nil,
+               model: nil
+             })
+
+    main = Org.get(db, Org.personal_session_key("flynn"))
+    root = session(db, "root", "flynn")
+    child = session(db, "child", "flynn", spawned_by: root.session_key)
+
+    %{operational_parent: main_parent} =
+      Org.set_operational_parent(db, root.session_key, main.session_key)
+
+    assert main_parent == main.session_key
+
+    %{operational_parent: child_parent} =
+      Org.set_operational_parent(db, child.session_key, root.session_key)
+
+    assert child_parent == root.session_key
+    downgrade_to_v7(db)
+
+    assert {:ok, [["coordination-fabric-v1-phase1-v7"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+
+    parent_column =
+      Enum.find(table_info(db, "sessions"), fn [_cid, name | _] ->
+        name == "operationalParent"
+      end)
+
+    assert Enum.at(parent_column, 3) == 1
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:ok, [["coordination-fabric-v1-phase1-v8"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok,
+            [
+              [main_key, nil, main_parent],
+              [child_key, root_key, child_parent],
+              [root_key, nil, root_parent]
+            ]} =
+             DB.query(
+               db,
+               "SELECT sessionKey,spawnedBy,operationalParent FROM sessions ORDER BY sessionKey"
+             )
+
+    assert main_key == main.session_key
+    assert main_parent == main.session_key
+    assert child_key == child.session_key
+    assert child_parent == root.session_key
+    assert root_key == root.session_key
+    assert root_parent == main.session_key
+
+    nullable_column =
+      Enum.find(table_info(db, "sessions"), fn [_cid, name | _] ->
+        name == "operationalParent"
+      end)
+
+    assert Enum.at(nullable_column, 3) == 0
+
+    assert %{operational_parent: nil, effective_parent_source: :owner_main} =
+             session(db, "new-null", "flynn")
+  end
+
+  test "each interrupted nullable-parent upgrade rolls back and retries exactly", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:paired, _device} =
+             claim_org(db, %{
+               device_id: "legacy-device",
+               claimed_name: "Flynn",
+               platform: nil,
+               model: nil
+             })
+
+    for point <- [:after_copy, :after_drop, :after_rename, :after_migration, :after_stamp] do
+      downgrade_to_v7(db)
+
+      error =
+        assert_raise Schema.ShapeError, fn ->
+          Schema.upgrade_nullable_effective_parent_v1(db, fail_at: point)
+        end
+
+      assert error.message =~ "forced nullable-effective-parent migration interruption"
+
+      assert {:ok, [["coordination-fabric-v1-phase1-v7"]]} =
+               DB.query(db, "SELECT shape FROM schema_stamp")
+
+      column =
+        Enum.find(table_info(db, "sessions"), fn [_cid, name | _] ->
+          name == "operationalParent"
+        end)
+
+      assert Enum.at(column, 3) == 1
+      refute table?(db, "sessions_effective_parent_v1")
+      assert :ok = Schema.upgrade_nullable_effective_parent_v1(db)
+    end
   end
 
   # The defect this refuses: `CREATE TABLE IF NOT EXISTS` is SILENT about a
@@ -1012,6 +1114,55 @@ defmodule Tightbeam.SchemaShapeTest do
         db,
         "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v4', stampedAt=1"
       )
+
+    :ok
+  end
+
+  defp downgrade_to_v7(db) do
+    {:ok, :ok} =
+      DB.foreign_key_rebuild(db, fn txn ->
+        DB.Txn.q(
+          txn,
+          "UPDATE sessions SET operationalParent='agent:main:clawline:' || ownerUserId || ':main' WHERE operationalParent IS NULL"
+        )
+
+        [[ddl]] =
+          DB.Txn.q(
+            txn,
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='sessions'"
+          )
+
+        predecessor_ddl =
+          ~r/CREATE TABLE(?: IF NOT EXISTS)? "?sessions"?/
+          |> Regex.replace(ddl, "CREATE TABLE sessions_v7")
+          |> then(
+            &Regex.replace(
+              ~r/operationalParent\s+TEXT\s+REFERENCES/,
+              &1,
+              "operationalParent TEXT NOT NULL REFERENCES"
+            )
+          )
+
+        :ok = DB.Txn.exec(txn, predecessor_ddl)
+
+        DB.Txn.q(
+          txn,
+          """
+          INSERT INTO sessions_v7
+          SELECT * FROM sessions ORDER BY createdAt,sessionKey
+          """
+        )
+
+        :ok = DB.Txn.exec(txn, "DROP TABLE sessions")
+        :ok = DB.Txn.exec(txn, "ALTER TABLE sessions_v7 RENAME TO sessions")
+
+        DB.Txn.q(
+          txn,
+          "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v7', stampedAt=1"
+        )
+
+        :ok
+      end)
 
     :ok
   end

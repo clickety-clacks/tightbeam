@@ -477,8 +477,8 @@ defmodule Tightbeam.EscalationDeliveryTest do
              # The fault bubble's notice enqueue (production-machine-v1): a
              # substrate-authored turn to the failing session's nearest active
              # ancestor, deduped by deterministic wakeId.
-             {"lib/tightbeam/productions/bubble.ex", "Gateway.deliver_prompt/4",
-              "enqueue_notice/4"} => 1,
+             {"lib/tightbeam/productions/bubble.ex", "Gateway.deliver_prompt_in_txn/5",
+              "climb_with_cause/3"} => 1,
              {"lib/tightbeam/supervision.ex", "Gateway.deliver_prompt/4",
               "notify_stranded_ancestor/2"} => 1,
              {"lib/tightbeam/supervision.ex", "Gateway.deliver_prompt_in_txn/5",
@@ -674,7 +674,8 @@ defmodule Tightbeam.EscalationDeliveryTest do
       harness: "claude",
       provider: "anthropic",
       model: Model.new("claude-fable-5"),
-      spawned_by: spawned_by
+      spawned_by: spawned_by,
+      operational_parent: spawned_by
     })
   end
 

@@ -26,7 +26,9 @@ defmodule Tightbeam.Org do
           owner_user_id: String.t(),
           origin: String.t(),
           spawned_by: String.t() | nil,
-          operational_parent: String.t(),
+          operational_parent: String.t() | nil,
+          effective_parent: String.t(),
+          effective_parent_source: :explicit | :owner_main,
           handle: String.t() | nil,
           archetype: String.t(),
           overrides: map() | nil,
@@ -71,7 +73,7 @@ defmodule Tightbeam.Org do
     ownerUserId   TEXT NOT NULL,
     origin        TEXT NOT NULL,
     spawnedBy     TEXT,
-    operationalParent TEXT NOT NULL REFERENCES sessions(sessionKey),
+    operationalParent TEXT REFERENCES sessions(sessionKey),
     handle        TEXT UNIQUE,
     archetype     TEXT NOT NULL,
     overrides     TEXT,
@@ -206,6 +208,11 @@ defmodule Tightbeam.Org do
         "CREATE TABLE sessions_operational_parent_v1",
         global: false
       )
+      |> String.replace(
+        "operationalParent TEXT REFERENCES",
+        "operationalParent TEXT NOT NULL REFERENCES",
+        global: false
+      )
       |> String.replace("__TIGHTBEAM_HARNESSES__", harnesses)
       |> String.replace("__TIGHTBEAM_PROVIDERS__", @provider_values)
 
@@ -275,6 +282,75 @@ defmodule Tightbeam.Org do
       {_kind, parent} ->
         validate_migrated_operational_chain!(graph, parent, MapSet.put(visited, key))
     end
+  end
+
+  @doc false
+  @spec migrate_nullable_effective_parent_in_txn(Txn.t(), keyword()) :: :ok
+  def migrate_nullable_effective_parent_in_txn(txn, opts \\ [])
+
+  def migrate_nullable_effective_parent_in_txn(%Txn{} = txn, opts) when is_list(opts) do
+    case Txn.q(txn, "SELECT type FROM sqlite_master WHERE name='sessions_effective_parent_v1'") do
+      [] -> :ok
+      _ -> raise "incompatible_nullable_effective_parent_v1: migration object already exists"
+    end
+
+    harnesses = Enum.map_join(Tightbeam.Harness.all(), ",", &"'#{&1.wire_name()}'")
+
+    replacement_ddl =
+      @sessions_ddl
+      |> String.replace(
+        "CREATE TABLE IF NOT EXISTS sessions",
+        "CREATE TABLE sessions_effective_parent_v1",
+        global: false
+      )
+      |> String.replace("__TIGHTBEAM_HARNESSES__", harnesses)
+      |> String.replace("__TIGHTBEAM_PROVIDERS__", @provider_values)
+
+    :ok = Txn.exec(txn, replacement_ddl)
+
+    Txn.q(
+      txn,
+      """
+      INSERT INTO sessions_effective_parent_v1
+        (sessionKey, displayName, kind, orderIndex, isBuiltIn, adopted,
+         ownerUserId, origin, spawnedBy, operationalParent, handle, archetype,
+         overrides, identityName, identityRevision, cliToken, harness, provider,
+         model, thinkingLevel, modelContext, host, clearedThroughSeq, state,
+         createdAt, updatedAt)
+      SELECT sessionKey, displayName, kind, orderIndex, isBuiltIn, adopted,
+             ownerUserId, origin, spawnedBy, operationalParent, handle, archetype,
+             overrides, identityName, identityRevision, cliToken, harness, provider,
+             model, thinkingLevel, modelContext, host, clearedThroughSeq, state,
+             createdAt, updatedAt
+      FROM sessions
+      ORDER BY createdAt, sessionKey
+      """
+    )
+
+    maybe_interrupt_nullable_effective_parent_migration!(opts, :after_copy)
+    :ok = Txn.exec(txn, "DROP TABLE sessions")
+    maybe_interrupt_nullable_effective_parent_migration!(opts, :after_drop)
+    :ok = Txn.exec(txn, "ALTER TABLE sessions_effective_parent_v1 RENAME TO sessions")
+    maybe_interrupt_nullable_effective_parent_migration!(opts, :after_rename)
+
+    case Txn.q(txn, "PRAGMA foreign_key_check") do
+      [] ->
+        :ok
+
+      rows ->
+        raise "incompatible_nullable_effective_parent_v1: foreign key check #{inspect(rows)}"
+    end
+  end
+
+  def migrate_nullable_effective_parent_in_txn(%Txn{}, _opts) do
+    raise ArgumentError, "nullable-effective-parent migration options must be a keyword list"
+  end
+
+  defp maybe_interrupt_nullable_effective_parent_migration!(opts, point) do
+    if Keyword.get(opts, :fail_at) == point,
+      do: raise("forced nullable-effective-parent migration interruption")
+
+    :ok
   end
 
   @doc "Read an organization setting, or nil when it is unset."
@@ -433,10 +509,7 @@ defmodule Tightbeam.Org do
     owner_user_id = Map.fetch!(input, :owner_user_id)
     spawned_by = Map.get(input, :spawned_by)
 
-    operational_parent =
-      if Map.get(input, :kind, "custom") == "main",
-        do: session_key,
-        else: spawned_by || personal_session_key(owner_user_id)
+    operational_parent = Map.get(input, :operational_parent)
 
     Txn.q(
       txn,
@@ -478,75 +551,57 @@ defmodule Tightbeam.Org do
     must_get(txn, session_key)
   end
 
-  @doc false
-  @spec resolve_personal_main_defaults(map()) :: map()
-  def resolve_personal_main_defaults(defaults) do
-    provider = Map.fetch!(defaults, :provider)
-    provider = if is_function(provider, 0), do: provider.(), else: provider
-    Map.put(defaults, :provider, provider)
-  end
+  @doc """
+  Read the source session in the caller's database transaction. If
+  operationalParent is non-null, return that exact key with source explicit.
+  Otherwise return canonical Main key derived from ownerUserId with source
+  owner_main. Do not read spawnedBy. Do not write.
+  """
+  @spec effective_parent_in_txn(Txn.t(), String.t()) :: %{
+          session_key: String.t(),
+          source: :explicit | :owner_main,
+          owner_user_id: String.t()
+        }
+  def effective_parent_in_txn(%Txn{} = txn, session_key) do
+    case Txn.q(txn, "SELECT ownerUserId, operationalParent FROM sessions WHERE sessionKey=?1", [
+           session_key
+         ]) do
+      [[owner_user_id, nil]] ->
+        %{
+          session_key: personal_session_key(owner_user_id),
+          source: :owner_main,
+          owner_user_id: owner_user_id
+        }
 
-  @doc false
-  @spec ensure_personal_main_in_txn(Txn.t(), String.t(), map()) :: session()
-  def ensure_personal_main_in_txn(%Txn{} = txn, user_id, defaults) do
-    key = personal_session_key(user_id)
+      [[owner_user_id, operational_parent]] ->
+        %{
+          session_key: operational_parent,
+          source: :explicit,
+          owner_user_id: owner_user_id
+        }
 
-    case get_in_txn(txn, key) do
-      nil ->
-        provider = Map.fetch!(defaults, :provider)
-
-        if is_function(provider) do
-          raise ArgumentError,
-                "personal Main provider must be resolved before entering a DB transaction"
-        end
-
-        archetype =
-          case Txn.q(txn, "SELECT value FROM org_settings WHERE key = 'default-archetype'") do
-            [[configured]] -> configured
-            [] -> "default"
-          end
-
-        create_in_txn(txn, %{
-          session_key: key,
-          display_name: "Main",
-          kind: "main",
-          is_built_in: true,
-          order_index: 0,
-          owner_user_id: user_id,
-          origin: Map.get(defaults, :origin, "user:#{user_id}"),
-          archetype: archetype,
-          host: Map.get(defaults, :host, Tightbeam.Placement.local_host_name()),
-          harness: defaults |> Map.fetch!(:harness) |> to_string(),
-          provider: to_string(provider),
-          model: Map.fetch!(defaults, :model)
-        })
-
-      session ->
-        session
+      [] ->
+        raise ArgumentError, "unknown session: #{session_key}"
     end
   end
 
   @doc "Fetch an active session by its CLI token, or nil."
   @spec by_cli_token(db(), String.t()) :: session() | nil
   def by_cli_token(db \\ Tightbeam.DB, token) do
-    {:ok, rows} =
-      DB.query(db, select_session_sql() <> " WHERE cliToken = ?1 AND state = 'active'", [token])
-
-    case rows do
-      [row] -> to_session(row)
-      [] -> nil
-    end
+    transaction!(db, fn txn ->
+      case Txn.q(txn, select_session_sql() <> " WHERE cliToken = ?1 AND state = 'active'", [
+             token
+           ]) do
+        [row] -> to_effective_session(txn, row)
+        [] -> nil
+      end
+    end)
   end
 
   @doc "Fetch a session by key, or nil."
   @spec get(db(), String.t()) :: session() | nil
   def get(db \\ Tightbeam.DB, session_key) do
-    {:ok, rows} = DB.query(db, select_session_sql() <> " WHERE sessionKey = ?1", [session_key])
-
-    case rows do
-      [row] -> to_session(row)
-      [] -> nil
-    end
+    transaction!(db, fn txn -> get_in_txn(txn, session_key) end)
   end
 
   @doc """
@@ -560,7 +615,7 @@ defmodule Tightbeam.Org do
   @spec get_in_txn(Txn.t(), String.t()) :: session() | nil
   def get_in_txn(%Txn{} = txn, session_key) do
     case Txn.q(txn, select_session_sql() <> " WHERE sessionKey = ?1", [session_key]) do
-      [row] -> to_session(row)
+      [row] -> to_effective_session(txn, row)
       [] -> nil
     end
   end
@@ -580,17 +635,21 @@ defmodule Tightbeam.Org do
         {"ownerUserId = ?1 AND state = 'active'", [user_id], "orderIndex, createdAt"}
       end
 
-    {:ok, rows} =
-      DB.query(db, select_session_sql() <> " WHERE #{where} ORDER BY #{order}", params)
-
-    Enum.map(rows, &to_session/1)
+    transaction!(db, fn txn ->
+      txn
+      |> Txn.q(select_session_sql() <> " WHERE #{where} ORDER BY #{order}", params)
+      |> Enum.map(&to_effective_session(txn, &1))
+    end)
   end
 
   @doc "Every session, including retired rows, in deterministic creation order."
   @spec list_all(db()) :: [session()]
   def list_all(db \\ Tightbeam.DB) do
-    {:ok, rows} = DB.query(db, select_session_sql() <> " ORDER BY createdAt, sessionKey")
-    Enum.map(rows, &to_session/1)
+    transaction!(db, fn txn ->
+      txn
+      |> Txn.q(select_session_sql() <> " ORDER BY createdAt, sessionKey")
+      |> Enum.map(&to_effective_session(txn, &1))
+    end)
   end
 
   @doc "An active session carrying an effective identity name, or nil."
@@ -605,28 +664,28 @@ defmodule Tightbeam.Org do
   @doc "All active sessions carrying an effective identity name."
   @spec active_all_by_identity_name(db(), String.t()) :: [session()]
   def active_all_by_identity_name(db \\ Tightbeam.DB, identity_name) do
-    {:ok, rows} =
-      DB.query(
-        db,
+    transaction!(db, fn txn ->
+      txn
+      |> Txn.q(
         select_session_sql() <>
           " WHERE identityName = ?1 AND state = 'active' ORDER BY createdAt, sessionKey",
         [identity_name]
       )
-
-    Enum.map(rows, &to_session/1)
+      |> Enum.map(&to_effective_session(txn, &1))
+    end)
   end
 
   @doc "Every session carrying an identity name, including retired rows."
   @spec all_by_identity_name(db(), String.t()) :: [session()]
   def all_by_identity_name(db \\ Tightbeam.DB, identity_name) do
-    {:ok, rows} =
-      DB.query(
-        db,
+    transaction!(db, fn txn ->
+      txn
+      |> Txn.q(
         select_session_sql() <> " WHERE identityName = ?1 ORDER BY createdAt, sessionKey",
         [identity_name]
       )
-
-    Enum.map(rows, &to_session/1)
+      |> Enum.map(&to_effective_session(txn, &1))
+    end)
   end
 
   @doc "Whether any session row still references an effective identity name."
@@ -1505,26 +1564,17 @@ defmodule Tightbeam.Org do
         raise ArgumentError, "existing operational parent cycle at #{current}"
 
       true ->
-        case Txn.q(
-               txn,
-               "SELECT kind, operationalParent FROM sessions WHERE sessionKey=?1",
-               [current]
-             ) do
-          [["main", ^current]] ->
-            false
+        parent = effective_parent_in_txn(txn, current).session_key
 
-          [[_kind, parent]] ->
-            operational_cycle?(txn, parent, target, MapSet.put(visited, current))
-
-          [] ->
-            raise ArgumentError, "unknown operational parent: #{current}"
-        end
+        if parent == current,
+          do: false,
+          else: operational_cycle?(txn, parent, target, MapSet.put(visited, current))
     end
   end
 
   defp must_get(txn, session_key) do
     case Txn.q(txn, select_session_sql() <> " WHERE sessionKey = ?1", [session_key]) do
-      [row] -> to_session(row)
+      [row] -> to_effective_session(txn, row)
       [] -> raise ArgumentError, "unknown session: #{session_key}"
     end
   end
@@ -1593,6 +1643,15 @@ defmodule Tightbeam.Org do
       created_at: created_at,
       updated_at: updated_at
     }
+  end
+
+  defp to_effective_session(txn, row) do
+    session = to_session(row)
+    effective = effective_parent_in_txn(txn, session.session_key)
+
+    session
+    |> Map.put(:effective_parent, effective.session_key)
+    |> Map.put(:effective_parent_source, effective.source)
   end
 
   defp transaction!(db, fun) do

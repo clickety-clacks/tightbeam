@@ -76,7 +76,10 @@ defmodule Tightbeam.Schema do
   # column. The v4 stamp is the one exact predecessor that upgrade accepts.
   # The nullable transcript discriminator adds `messages.messageType`; v6 is
   # its one exact predecessor, and historical rows remain null.
-  @shape "coordination-fabric-v1-phase1-v8"
+  # Terminal operator decisions advance v7 to v8. Nullable effective parent
+  # then relaxes the stored parent constraint from that exact predecessor.
+  @shape "coordination-fabric-v1-phase1-v9"
+  @nullable_effective_parent_previous_shape "coordination-fabric-v1-phase1-v8"
   @terminal_decision_previous_shape "coordination-fabric-v1-phase1-v7"
   @message_type_previous_shape "coordination-fabric-v1-phase1-v6"
   @cold_start_previous_shape "coordination-fabric-v1-phase1-v5"
@@ -918,7 +921,11 @@ defmodule Tightbeam.Schema do
            Txn.q(
              txn,
              "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1",
-             [@terminal_decision_previous_shape, @shape, migration_time]
+             [
+               @terminal_decision_previous_shape,
+               @nullable_effective_parent_previous_shape,
+               migration_time
+             ]
            )
 
            if Txn.changes(txn) != 1 do
@@ -1110,6 +1117,65 @@ defmodule Tightbeam.Schema do
   end
 
   @doc false
+  @spec upgrade_nullable_effective_parent_v1(DB.server(), keyword()) :: :ok
+  def upgrade_nullable_effective_parent_v1(db, opts \\ []) when is_list(opts) do
+    case DB.foreign_key_rebuild(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@nullable_effective_parent_previous_shape]] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message:
+                   "incompatible_nullable_effective_parent_v1: predecessor stamp #{inspect(rows)}"
+           end
+
+           :ok = Tightbeam.Org.migrate_nullable_effective_parent_in_txn(txn, opts)
+           maybe_interrupt_nullable_effective_parent_migration!(opts, :after_migration)
+
+           Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
+             @nullable_effective_parent_previous_shape,
+             @shape,
+             System.system_time(:millisecond)
+           ])
+
+           if Txn.changes(txn) != 1,
+             do:
+               raise(ShapeError, message: "incompatible_nullable_effective_parent_v1: stamp race")
+
+           maybe_interrupt_nullable_effective_parent_migration!(opts, :after_stamp)
+
+           case Txn.q(txn, "PRAGMA foreign_key_check") do
+             [] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message:
+                   "incompatible_nullable_effective_parent_v1: foreign key check #{inspect(rows)}"
+           end
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "incompatible_nullable_effective_parent_v1: upgrade failed: #{Exception.message(error)}"
+    end
+  end
+
+  defp maybe_interrupt_nullable_effective_parent_migration!(opts, point) do
+    if Keyword.get(opts, :fail_at) == point,
+      do: raise("forced nullable-effective-parent migration interruption")
+
+    :ok
+  end
+
+  @doc false
   @spec ensure_supervision_liveness_v1_in_txn(Txn.t()) :: :ok
   def ensure_supervision_liveness_v1_in_txn(%Txn{} = txn) do
     ensure_supervision_liveness_v1_in_txn(txn, System.system_time(:millisecond))
@@ -1261,23 +1327,30 @@ defmodule Tightbeam.Schema do
       {:ok, [[@shape]]} ->
         :ok
 
+      {:ok, [[@nullable_effective_parent_previous_shape]]} ->
+        upgrade_nullable_effective_parent_v1(db)
+
       {:ok, [[@terminal_decision_previous_shape]]} ->
-        upgrade_terminal_operator_decision_v1(db)
+        :ok = upgrade_terminal_operator_decision_v1(db)
+        upgrade_nullable_effective_parent_v1(db)
 
       {:ok, [[@message_type_previous_shape]]} ->
         :ok = upgrade_message_type_v1(db)
-        upgrade_terminal_operator_decision_v1(db)
+        :ok = upgrade_terminal_operator_decision_v1(db)
+        upgrade_nullable_effective_parent_v1(db)
 
       {:ok, [[@cold_start_previous_shape]]} ->
         :ok = upgrade_cold_start_v1(db)
         :ok = upgrade_message_type_v1(db)
-        upgrade_terminal_operator_decision_v1(db)
+        :ok = upgrade_terminal_operator_decision_v1(db)
+        upgrade_nullable_effective_parent_v1(db)
 
       {:ok, [[@operational_parent_previous_shape]]} ->
         :ok = upgrade_operational_parent_v1(db)
         :ok = upgrade_cold_start_v1(db)
         :ok = upgrade_message_type_v1(db)
-        upgrade_terminal_operator_decision_v1(db)
+        :ok = upgrade_terminal_operator_decision_v1(db)
+        upgrade_nullable_effective_parent_v1(db)
 
       {:ok, []} ->
         # No stamp. Either a database this build is about to create, or one
@@ -1295,7 +1368,8 @@ defmodule Tightbeam.Schema do
 
         There is no migration from #{found}. The only supported upgrade sources
         are #{@operational_parent_previous_shape}, #{@cold_start_previous_shape},
-        #{@message_type_previous_shape}, and #{@terminal_decision_previous_shape}.
+        #{@message_type_previous_shape}, #{@terminal_decision_previous_shape}, and
+        #{@nullable_effective_parent_previous_shape}.
         Move this database aside and let it be recreated.
         """
 

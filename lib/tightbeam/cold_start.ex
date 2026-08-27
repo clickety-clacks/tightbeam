@@ -87,7 +87,7 @@ defmodule Tightbeam.ColdStart do
   @spec pair(DB.server(), map(), map()) ::
           Devices.pair_outcome() | {:error, String.t()}
   def pair(db \\ Tightbeam.DB, input, defaults) do
-    defaults = Org.resolve_personal_main_defaults(defaults)
+    defaults = resolve_defaults(defaults)
 
     case DB.transaction(db, fn txn -> pair_in_txn(txn, input, defaults) end) do
       {:ok, result} ->
@@ -122,12 +122,12 @@ defmodule Tightbeam.ColdStart do
   end
 
   @doc "Reserve the first canonical user and Main for a loopback CLI request."
-  @spec bootstrap_user(DB.server(), String.t(), map()) ::
+  @spec add_first_user(DB.server(), String.t(), map()) ::
           {:ok, map()} | {:error, String.t()}
-  def bootstrap_user(db \\ Tightbeam.DB, user_id, defaults) do
-    defaults = Org.resolve_personal_main_defaults(defaults)
+  def add_first_user(db \\ Tightbeam.DB, user_id, defaults) do
+    defaults = resolve_defaults(defaults)
 
-    case DB.transaction(db, fn txn -> bootstrap_user_in_txn(txn, user_id, defaults) end) do
+    case DB.transaction(db, fn txn -> add_first_user_in_txn(txn, user_id, defaults) end) do
       {:ok, result} ->
         {:ok, result}
 
@@ -143,7 +143,7 @@ defmodule Tightbeam.ColdStart do
   end
 
   @doc false
-  def bootstrap_user_in_txn(%Txn{} = txn, user_id, defaults) do
+  def add_first_user_in_txn(%Txn{} = txn, user_id, defaults) do
     user_id = validate_user_id!(user_id)
 
     case classify_in_txn(txn) do
@@ -278,7 +278,7 @@ defmodule Tightbeam.ColdStart do
       Devices.insert_device_in_txn(txn, Map.put(input, :user_id, user_id), "allowlisted", token)
 
     maybe_fail!(input, 2)
-    root = Org.ensure_personal_main_in_txn(txn, user_id, Map.put(defaults, :origin, @principal))
+    root = create_first_main_in_txn(txn, user_id, defaults)
     maybe_fail!(input, 3)
     ts = now()
     fingerprint = fingerprint(device.device_id, user_id)
@@ -326,7 +326,7 @@ defmodule Tightbeam.ColdStart do
   defp reserve_user_in_txn(txn, user_id, defaults) do
     [[0]] = Txn.q(txn, "SELECT COUNT(*) FROM users")
     Devices.insert_user_in_txn(txn, user_id, true, "gateway_local_bootstrap")
-    root = Org.ensure_personal_main_in_txn(txn, user_id, Map.put(defaults, :origin, @principal))
+    root = create_first_main_in_txn(txn, user_id, defaults)
     ts = now()
 
     event_id =
@@ -462,7 +462,9 @@ defmodule Tightbeam.ColdStart do
         "isAdmin" => true,
         "deviceStatus" => device && device.status,
         "rootKind" => root.kind,
-        "operationalParent" => root.operational_parent
+        "operationalParent" => root.operational_parent,
+        "effectiveParent" => root.effective_parent,
+        "effectiveParentSource" => Atom.to_string(root.effective_parent_source)
       },
       {:process, "tightbeam"},
       ts
@@ -594,7 +596,7 @@ defmodule Tightbeam.ColdStart do
 
   defp personal_main?(root, user_id) do
     root.owner_user_id == user_id and root.session_key == Org.personal_session_key(user_id) and
-      root.kind == "main" and root.is_built_in and root.operational_parent == root.session_key
+      root.kind == "main" and root.is_built_in
   end
 
   defp event_referents_valid?(_txn, %{
@@ -617,7 +619,7 @@ defmodule Tightbeam.ColdStart do
       id,
       "cold-start",
       {:exact, receipt.created_at},
-      event_payload(receipt, "complete", receipt.device_id)
+      event_payload(txn, receipt, "complete", receipt.device_id)
     )
   end
 
@@ -635,7 +637,7 @@ defmodule Tightbeam.ColdStart do
       id,
       "cold-start",
       {:exact, receipt.created_at},
-      event_payload(receipt, "reserved", nil)
+      event_payload(txn, receipt, "reserved", nil)
     )
   end
 
@@ -653,21 +655,24 @@ defmodule Tightbeam.ColdStart do
       claim,
       "cold-start",
       {:exact, receipt.created_at},
-      event_payload(receipt, "reserved", nil)
+      event_payload(txn, receipt, "reserved", nil)
     ) and
       accepted_event_valid?(
         txn,
         device,
         "cold-start-device",
         {:at_or_after, receipt.created_at},
-        event_payload(receipt, "complete", receipt.device_id)
+        event_payload(txn, receipt, "complete", receipt.device_id)
       )
   end
 
   defp event_referents_valid?(_txn, _receipt), do: false
 
-  defp accepted_event_valid?(txn, id, verb, timestamp, expected_payload)
+  defp accepted_event_valid?(txn, id, verb, timestamp, expected_payloads)
        when is_integer(id) do
+    expected_payloads = List.wrap(expected_payloads)
+    expected_root = expected_payloads |> hd() |> Map.fetch!("rootSessionKey")
+
     case Txn.q(
            txn,
            "SELECT ts,kind,verb,origin,principal,sessionKey,payload FROM events WHERE id=?1",
@@ -676,8 +681,8 @@ defmodule Tightbeam.ColdStart do
       [[ts, kind, actual_verb, origin, principal, session_key, payload]] ->
         valid_event_timestamp?(ts, timestamp) and kind == "verb" and actual_verb == verb and
           origin == @principal and principal == @principal and
-          session_key == expected_payload["rootSessionKey"] and
-          payload == inspect(expected_payload)
+          session_key == expected_root and
+          Enum.any?(expected_payloads, &(payload == inspect(&1)))
 
       _ ->
         false
@@ -691,8 +696,8 @@ defmodule Tightbeam.ColdStart do
   defp valid_event_timestamp?(ts, {:at_or_after, minimum}),
     do: is_integer(ts) and ts >= minimum
 
-  defp event_payload(receipt, phase, device_id) do
-    %{
+  defp event_payload(_txn, receipt, phase, device_id) do
+    common = %{
       "receiptId" => 1,
       "cause" => receipt.cause,
       "phase" => phase,
@@ -701,9 +706,45 @@ defmodule Tightbeam.ColdStart do
       "rootSessionKey" => receipt.root_session_key,
       "isAdmin" => true,
       "deviceStatus" => device_id && "allowlisted",
-      "rootKind" => "main",
-      "operationalParent" => receipt.root_session_key
+      "rootKind" => "main"
     }
+
+    [
+      Map.put(common, "operationalParent", receipt.root_session_key),
+      common
+      |> Map.put("operationalParent", nil)
+      |> Map.put("effectiveParent", receipt.root_session_key)
+      |> Map.put("effectiveParentSource", "owner_main")
+    ]
+  end
+
+  defp resolve_defaults(defaults) do
+    provider = Map.fetch!(defaults, :provider)
+    provider = if is_function(provider, 0), do: provider.(), else: provider
+    Map.put(defaults, :provider, provider)
+  end
+
+  defp create_first_main_in_txn(txn, user_id, defaults) do
+    archetype =
+      case Txn.q(txn, "SELECT value FROM org_settings WHERE key='default-archetype'") do
+        [[configured]] -> configured
+        [] -> "default"
+      end
+
+    Org.create_in_txn(txn, %{
+      session_key: Org.personal_session_key(user_id),
+      display_name: "Main",
+      kind: "main",
+      is_built_in: true,
+      order_index: 0,
+      owner_user_id: user_id,
+      origin: @principal,
+      archetype: archetype,
+      host: Map.get(defaults, :host, Tightbeam.Placement.local_host_name()),
+      harness: defaults |> Map.fetch!(:harness) |> to_string(),
+      provider: defaults |> Map.fetch!(:provider) |> to_string(),
+      model: Map.fetch!(defaults, :model)
+    })
   end
 
   defp replay_shape_valid?(%{

@@ -213,12 +213,12 @@ defmodule Tightbeam.Wire.RouterTest do
     assert Devices.user(db, "first") == nil
   end
 
-  test "loopback bootstrap-user reserves the first user and Main through the gateway", ctx do
+  test "loopback add-user reserves the first user and Main through the gateway", ctx do
     {db, opts} = empty_router(ctx, "loopback_bootstrap")
 
     response =
       dispatch_cli(%{ctx | opts: opts}, "tbc_test", %{
-        verb: "bootstrap-user",
+        verb: "add-user",
         params: %{userId: "alice"}
       })
 
@@ -237,14 +237,14 @@ defmodule Tightbeam.Wire.RouterTest do
     assert Devices.user(db, "alice").creation_kind == "gateway_local_bootstrap"
   end
 
-  test "non-loopback bootstrap-user refuses before any database write", ctx do
+  test "non-loopback add-user refuses before any database write", ctx do
     {db, opts} = empty_router(ctx, "remote_bootstrap")
 
     response =
       conn(
         :post,
         "/agent/dispatch",
-        JSON.encode!(%{verb: "bootstrap-user", params: %{userId: "alice"}})
+        JSON.encode!(%{verb: "add-user", params: %{userId: "alice"}})
       )
       |> Map.put(:remote_ip, {10, 0, 0, 8})
       |> put_req_header("authorization", "Bearer tbc_test")

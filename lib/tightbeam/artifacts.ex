@@ -24,7 +24,7 @@ defmodule Tightbeam.Artifacts do
   through `recorded_kinds/3`, which reads neither column.
   """
 
-  alias Tightbeam.{DB, IdPrefix, TurnObservations}
+  alias Tightbeam.{DB, IdPrefix, Org, TurnObservations}
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.Publisher
 
@@ -86,13 +86,15 @@ defmodule Tightbeam.Artifacts do
       {{:session, session_key}, session_key, work_item_id}
       when is_binary(session_key) and is_binary(work_item_id) ->
         artifact_id = "art_" <> (:crypto.strong_rand_bytes(4) |> Base.encode16(case: :lower))
-        parent_session = parent_session(db, session_key)
         {recorded_message_id, evidence} = turn_evidence(db, session_key)
         now = now()
 
         case DB.transaction(db, fn txn ->
                case IdPrefix.resolve_in_txn(txn, :work_item, work_item_id) do
                  {:ok, canonical_id} ->
+                   parent_session =
+                     Org.effective_parent_in_txn(txn, session_key).session_key
+
                    Txn.q(
                      txn,
                      """
@@ -484,15 +486,6 @@ defmodule Tightbeam.Artifacts do
 
       {:error, _reason} ->
         raise ArgumentError, "artifact origin is missing from its session workspace"
-    end
-  end
-
-  defp parent_session(db, session_key) do
-    case DB.query(db, "SELECT operationalParent FROM sessions WHERE sessionKey = ?1", [
-           session_key
-         ]) do
-      {:ok, [[parent]]} -> parent
-      {:ok, []} -> nil
     end
   end
 
