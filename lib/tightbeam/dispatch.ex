@@ -353,6 +353,34 @@ defmodule Tightbeam.Dispatch do
   defp outcome_payload("onboard", _call, {:returned, result}) when is_map(result),
     do: Map.delete(result, :lease_id)
 
+  defp outcome_payload("work-item-update", %{params: params}, {:raised, _exception})
+       when is_map_key(params, :body),
+       do: %{crash: true, code: "server_error", bodyElided: true}
+
+  defp outcome_payload("work-item-get", _call, {:raised, _exception}),
+    do: %{crash: true, code: "server_error", bodyElided: true}
+
+  defp outcome_payload(
+         "work-item-get",
+         _call,
+         {:returned, %{workItem: work_item} = result}
+       )
+       when is_map(work_item) do
+    body = Map.get(work_item, :body)
+
+    result
+    |> Map.put(
+      :workItem,
+      Map.drop(work_item, [
+        :body,
+        :bodyUpdatedByUser,
+        :bodyUpdatedBySession,
+        :bodyUpdatedAt
+      ])
+    )
+    |> Map.put(:bodyRead, work_item_body_descriptor(body))
+  end
+
   defp outcome_payload(verb, call, outcome) do
     if verb in @result_elided do
       elided = %{elided: true, params: Map.get(call, :params, %{})}
@@ -377,6 +405,17 @@ defmodule Tightbeam.Dispatch do
   end
 
   defp elided_count(_result), do: 0
+
+  defp work_item_body_descriptor(nil),
+    do: %{state: "absent", byteLength: 0, sha256: nil}
+
+  defp work_item_body_descriptor(body) do
+    %{
+      state: "present",
+      byteLength: byte_size(body),
+      sha256: :sha256 |> :crypto.hash(body) |> Base.encode16(case: :lower)
+    }
+  end
 
   defp best_effort_denial(db, verb, origin, principal, session_key, error) do
     try do

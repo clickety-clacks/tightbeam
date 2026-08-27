@@ -122,6 +122,137 @@ defmodule Tightbeam.DispatchTest do
     assert payload =~ "boom"
   end
 
+  test "work-item audit payloads describe bodies without copying their text", %{db: db} do
+    sentinel = "DO_NOT_COPY"
+
+    detail = %{
+      workItem: %{
+        id: "wi_1",
+        title: "Body target",
+        body: sentinel,
+        bodyUpdatedByUser: "flynn",
+        bodyUpdatedBySession: nil,
+        bodyUpdatedAt: 123
+      },
+      assignments: [%{id: "asg_1"}]
+    }
+
+    get_call = %{
+      verb: "work-item-get",
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      session_key: nil,
+      params: %{work_item_id: "wi_1"}
+    }
+
+    assert {:ok, ^detail} =
+             Dispatch.dispatch(db, %{"work-item-get" => fn _call -> detail end}, get_call)
+
+    update_result = %{
+      workItem: %{id: "wi_1", title: "Body target"},
+      bodyUpdate: %{
+        state: "present",
+        byteLength: byte_size(sentinel),
+        sha256: :crypto.hash(:sha256, sentinel) |> Base.encode16(case: :lower),
+        changed: true,
+        updatedByUser: "flynn",
+        updatedBySession: nil,
+        updatedAt: 123
+      }
+    }
+
+    update_call = %{
+      verb: "work-item-update",
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      session_key: nil,
+      params: %{work_item_id: "wi_1", body: sentinel}
+    }
+
+    assert {:ok, ^update_result} =
+             Dispatch.dispatch(
+               db,
+               %{"work-item-update" => fn _call -> update_result end},
+               update_call
+             )
+
+    assert {:ok, rows} =
+             DB.query(
+               db,
+               "SELECT verb, origin, principal, payload FROM events ORDER BY id"
+             )
+
+    assert [
+             ["work-item-get", "user:flynn", "user:flynn", get_payload],
+             ["work-item-update", "user:flynn", "user:flynn", update_payload]
+           ] = rows
+
+    refute get_payload =~ sentinel
+    refute update_payload =~ sentinel
+
+    expected_get_payload = %{
+      workItem: %{id: "wi_1", title: "Body target"},
+      assignments: [%{id: "asg_1"}],
+      bodyRead: %{
+        state: "present",
+        byteLength: byte_size(sentinel),
+        sha256: :crypto.hash(:sha256, sentinel) |> Base.encode16(case: :lower)
+      }
+    }
+
+    assert get_payload == inspect(expected_get_payload)
+    assert update_payload == inspect(update_result)
+  end
+
+  test "work-item body crashes keep handler messages out of audit rows", %{db: db} do
+    sentinel = "DO_NOT_COPY"
+
+    for {verb, params} <- [
+          {"work-item-get", %{work_item_id: "wi_1"}},
+          {"work-item-update", %{work_item_id: "wi_1", body: sentinel}}
+        ] do
+      call = %{
+        verb: verb,
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        session_key: nil,
+        params: params
+      }
+
+      handlers = %{verb => fn _call -> raise "handler held #{sentinel}" end}
+
+      assert {:error, %{code: "server_error", message: "handler held " <> ^sentinel}} =
+               Dispatch.dispatch(db, handlers, call)
+    end
+
+    assert {:ok, rows} = DB.query(db, "SELECT payload FROM events ORDER BY id")
+    assert length(rows) == 2
+
+    for [payload] <- rows do
+      refute payload =~ sentinel
+
+      assert payload == inspect(%{crash: true, code: "server_error", bodyElided: true})
+    end
+  end
+
+  test "metadata-only work-item update crashes retain the baseline audit shape", %{db: db} do
+    call = %{
+      verb: "work-item-update",
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      session_key: nil,
+      params: %{work_item_id: "wi_1", title: "Retitled"}
+    }
+
+    handlers = %{"work-item-update" => fn _call -> raise "metadata boom" end}
+
+    assert {:error, %{code: "server_error", message: "metadata boom"}} =
+             Dispatch.dispatch(db, handlers, call)
+
+    assert {:ok, [[payload]]} = DB.query(db, "SELECT payload FROM events")
+    assert payload == inspect(%{code: "server_error", message: "metadata boom"})
+  end
+
   test "ruling CAS loss emits a queryable E1 denial", %{db: db} do
     call = %{
       verb: "post",
