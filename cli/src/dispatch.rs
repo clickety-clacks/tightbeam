@@ -457,6 +457,15 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             }
             Ok(request(identity, "decision-requests", vec![], params))
         }
+        Command::DecisionRequest {
+            identity,
+            request_id,
+        } => Ok(request(
+            identity,
+            "decision-request",
+            vec![],
+            vec![string_field("request", request_id)],
+        )),
         Command::RevokeAssignment {
             identity,
             assignment_id,
@@ -1474,6 +1483,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::OperatorRule { identity, .. }
         | Command::OperatorWithdraw { identity, .. }
         | Command::DecisionRequests { identity, .. }
+        | Command::DecisionRequest { identity, .. }
         | Command::RevokeAssignment { identity, .. }
         | Command::WorkItemCreate { identity, .. }
         | Command::WorkItemGet { identity, .. }
@@ -1996,6 +2006,10 @@ mod tests {
         assert_eq!(
             body(&["decision-requests", "--status", "open", "--as", "parent"]),
             r#"{"as":"parent","verb":"decision-requests","params":{"status":"open"}}"#
+        );
+        assert_eq!(
+            body(&["decision-request", "--request", "dr_1", "--as", "parent"]),
+            r#"{"as":"parent","verb":"decision-request","params":{"request":"dr_1"}}"#
         );
         assert_eq!(
             body(&[

@@ -497,14 +497,14 @@ defmodule Tightbeam.EffortCheckinTest do
     assert bracket_state(ctx.db, second_sibling.id) == "armed"
   end
 
-  test "proofs 6, 11, 12, 13: expecter authority, self/user routing, deadlines and exact menu",
+  test "proofs 6, 11, 12, 13: responder preference, self/user routing, deadlines and exact menu",
        ctx do
     item = dispatch(ctx, {:session, "parent"}, "holder", "session opener")
     request = escalate(ctx, item.id)
 
     assert request.expecter_session_key == "parent"
 
-    assert %{code: "not_authorized"} =
+    assert %{status: "ruled", ruled_by: "session:holder"} =
              EffortCheckin.rule(
                ctx.db,
                ctx.config,
@@ -518,7 +518,7 @@ defmodule Tightbeam.EffortCheckinTest do
                %{effort_call(request.id, "continue", {:session, "parent"}) | principal: nil}
              )
 
-    assert %{status: "ruled"} =
+    assert %{code: "not_open"} =
              EffortCheckin.rule(
                ctx.db,
                ctx.config,
@@ -556,6 +556,13 @@ defmodule Tightbeam.EffortCheckinTest do
     user_item = dispatch(ctx, {:user, "h1"}, "holder", "user")
     user_request = escalate(ctx, user_item.id)
     assert user_request.expecter_user_id == "h1"
+
+    assert %{code: "not_authorized"} =
+             EffortCheckin.rule(
+               ctx.db,
+               ctx.config,
+               effort_call(user_request.id, "dismiss", {:user, "h2"})
+             )
 
     assert Enum.any?(
              Escalation.list(
@@ -599,14 +606,14 @@ defmodule Tightbeam.EffortCheckinTest do
     assert parent_rung.expecter_session_key == "parent"
     assert Wakes.get(ctx.db, parent_rung.deadline_wake_id).state == "pending"
 
-    assert %{code: "not_authorized"} =
+    assert %{status: "ruled", ruled_by: "session:mid"} =
              EffortCheckin.rule(
                ctx.db,
                ctx.config,
                effort_call(parent_rung.id, "dismiss", {:session, "mid"})
              )
 
-    assert %{status: "ruled"} =
+    assert %{code: "not_open"} =
              EffortCheckin.rule(
                ctx.db,
                ctx.config,
@@ -648,7 +655,7 @@ defmodule Tightbeam.EffortCheckinTest do
 
     assert human.context["actions"] == ["wake", "continue", "dismiss"]
 
-    assert %{code: "not_authorized"} =
+    assert %{status: "ruled", ruled_by: "session:parent"} =
              EffortCheckin.rule(
                ctx.db,
                ctx.config,
@@ -660,12 +667,58 @@ defmodule Tightbeam.EffortCheckinTest do
                assignment_id: pinned.id
              })
 
-    assert %{status: "ruled"} =
+    assert %{code: "not_open"} =
              EffortCheckin.rule(
                ctx.db,
                ctx.config,
                effort_call(human.id, "continue", {:user, "h1"})
              )
+  end
+
+  test "two authorized delegates racing one request produce one attributed winner", ctx do
+    item = dispatch(ctx, {:session, "parent"}, "holder", "raced response")
+    request = escalate(ctx, item.id)
+    before = rows(ctx.db, "SELECT COUNT(*) FROM effort_checkin_generations", [])
+    parent = self()
+
+    contenders =
+      for key <- ["parent", "holder"] do
+        Task.async(fn ->
+          send(parent, {:ready, self()})
+
+          receive do
+            :go ->
+              {key,
+               EffortCheckin.rule(
+                 ctx.db,
+                 ctx.config,
+                 effort_call(request.id, "continue", {:session, key})
+               )}
+          end
+        end)
+      end
+
+    pids =
+      for _ <- contenders do
+        assert_receive {:ready, pid}
+        pid
+      end
+
+    Enum.each(pids, &send(&1, :go))
+    results = Enum.map(contenders, &Task.await/1)
+
+    assert [{winner, %{status: "ruled", decision: "continue", ruled_by: actor}}] =
+             Enum.filter(results, fn {_key, result} -> result[:status] == "ruled" end)
+
+    assert actor == "session:" <> winner
+
+    assert [{_loser, %{code: "not_open"}}] =
+             Enum.filter(results, fn {_key, result} -> result[:code] == "not_open" end)
+
+    assert request(ctx.db, request.id).ruled_by == actor
+
+    assert rows(ctx.db, "SELECT COUNT(*) FROM effort_checkin_generations", []) ==
+             Enum.map(before, fn [count] -> [count + 1] end)
   end
 
   test "proof 7: placement satellite probe is bounded and SSH failure is unobservable", ctx do
@@ -1406,12 +1459,13 @@ defmodule Tightbeam.EffortCheckinTest do
         options,
         context,
         status,
-        decision
+        decision,
+        ruled_by
       ]
     ] =
       rows(
         db,
-        "SELECT id,kind,assignmentId,expecterSessionKey,expecterUserId,lineageRung,effortGeneration,deadlineWakeId,question,options,context,status,decision FROM decision_requests WHERE id=?1",
+        "SELECT id,kind,assignmentId,expecterSessionKey,expecterUserId,lineageRung,effortGeneration,deadlineWakeId,question,options,context,status,decision,ruledBy FROM decision_requests WHERE id=?1",
         [id]
       )
 
@@ -1428,7 +1482,8 @@ defmodule Tightbeam.EffortCheckinTest do
       options: JSON.decode!(options),
       context: JSON.decode!(context),
       status: status,
-      decision: decision
+      decision: decision,
+      ruled_by: ruled_by
     }
   end
 

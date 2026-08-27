@@ -751,10 +751,28 @@ defmodule Tightbeam.Gateway do
         caller = resolve_caller(db, call.origin)
         id = call.params[:request_id] || call.params[:request]
 
-        case Escalation.get(db, call, id,
-               owner_user_id: caller && caller.owner_user_id,
-               admin: admin_origin?(db, call.origin)
-             ) do
+        request =
+          case call.principal do
+            {:session, _key} ->
+              case Escalation.raw_by_id(db, id) do
+                %{kind: "effort"} = exact ->
+                  exact
+
+                _ ->
+                  Escalation.get(db, call, id,
+                    owner_user_id: caller && caller.owner_user_id,
+                    admin: admin_origin?(db, call.origin)
+                  )
+              end
+
+            _ ->
+              Escalation.get(db, call, id,
+                owner_user_id: caller && caller.owner_user_id,
+                admin: admin_origin?(db, call.origin)
+              )
+          end
+
+        case request do
           nil -> %{code: "not_found", message: "decision request not found"}
           request -> %{decision_request: request}
         end

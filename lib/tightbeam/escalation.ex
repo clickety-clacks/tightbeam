@@ -728,6 +728,10 @@ defmodule Tightbeam.Escalation do
     end
   end
 
+  @doc "Fetch one decision request by its complete id without changing visibility policy."
+  @spec raw_by_id(DB.server(), String.t() | nil) :: map() | nil
+  def raw_by_id(db, id), do: get_raw(db, id)
+
   @doc "Canonical SHA-256 action fingerprint."
   @spec digest(map()) :: String.t()
   def digest(call) do

@@ -20,7 +20,7 @@ defmodule Tightbeam.EffortCheckin do
   wake.
   """
 
-  alias Tightbeam.{CausalEvents, DB, Org, Placement, Supervision, Wakes}
+  alias Tightbeam.{CausalEvents, DB, Escalation, Org, Placement, Supervision, Wakes}
   alias Tightbeam.DB.Txn
 
   @origin "process:tightbeam"
@@ -328,9 +328,13 @@ defmodule Tightbeam.EffortCheckin do
     request_id = call.params[:request_id] || call.params[:request]
     action = call.params[:action]
     request = request_row(db, request_id)
+    actor = actor_id(call.principal)
 
     cond do
       is_nil(request) ->
+        error("not_found", "decision request not found")
+
+      request.kind != "effort" and not visible_request?(db, call, request) ->
         error("not_found", "decision request not found")
 
       request.kind != "effort" ->
@@ -342,7 +346,7 @@ defmodule Tightbeam.EffortCheckin do
       not authorized?(call.principal, request) ->
         error("not_authorized", "current expecter required")
 
-      request.status == "ruled" and request.decision == action ->
+      request.status == "ruled" and request.decision == action and request.ruled_by == actor ->
         request
 
       request.status != "open" ->
@@ -370,7 +374,7 @@ defmodule Tightbeam.EffortCheckin do
                  config,
                  request,
                  action,
-                 call.origin,
+                 actor,
                  call.principal,
                  fresh
                )
@@ -591,12 +595,16 @@ defmodule Tightbeam.EffortCheckin do
     end
   end
 
-  defp rule_in_txn(txn, config, request, action, origin, principal, fresh) do
+  defp rule_in_txn(txn, config, request, action, actor, principal, fresh) do
     current = request_for_id(txn, request.id)
 
     cond do
       not authorized?(principal, current) ->
         error("not_authorized", "current expecter required")
+
+      current.status == "ruled" and current.decision == action and
+          current.ruled_by == actor ->
+        current
 
       action == "dismiss" and
           not prepared_rearms_current?(
@@ -616,7 +624,7 @@ defmodule Tightbeam.EffortCheckin do
         Txn.q(
           txn,
           "UPDATE decision_requests SET status = 'ruled', decision = ?2, ruledBy = ?3, ruledAt = ?4 WHERE id = ?1 AND status = 'open'",
-          [current.id, action, origin, ruled_at]
+          [current.id, action, actor, ruled_at]
         )
 
         if Txn.changes(txn) == 1 do
@@ -666,7 +674,12 @@ defmodule Tightbeam.EffortCheckin do
 
           request_for_id(txn, current.id)
         else
-          error("not_open", "decision request is not open")
+          winner = request_for_id(txn, current.id)
+
+          if winner.status == "ruled" and winner.decision == action and
+               winner.ruled_by == actor,
+             do: winner,
+             else: error("not_open", "decision request is not open")
         end
 
       true ->
@@ -1266,9 +1279,32 @@ defmodule Tightbeam.EffortCheckin do
     })
   end
 
-  defp authorized?({:session, key}, request), do: request.expecter_session_key == key
+  defp authorized?({:session, _key}, _request), do: true
   defp authorized?({:user, user}, request), do: request.expecter_user_id == user
   defp authorized?(_, _request), do: false
+
+  defp actor_id({:session, key}), do: "session:" <> key
+  defp actor_id({:user, user}), do: "user:" <> user
+  defp actor_id(_principal), do: nil
+
+  defp visible_request?(db, call, request) do
+    owner_user_id =
+      case call.principal do
+        {:session, key} ->
+          case Org.get(db, key) do
+            %{owner_user_id: owner} -> owner
+            _ -> nil
+          end
+
+        {:user, user_id} ->
+          user_id
+
+        _ ->
+          nil
+      end
+
+    not is_nil(Escalation.get(db, call, request.id, owner_user_id: owner_user_id))
+  end
 
   defp invalid_root,
     do: {:error, error("invalid_workdir_root", "workdirRoot must be relative and contain no ..")}
