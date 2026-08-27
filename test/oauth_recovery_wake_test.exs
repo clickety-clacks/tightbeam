@@ -1,8 +1,8 @@
 defmodule Tightbeam.OAuthRecoveryWakeTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{ConnRegistry, CredentialRecovery, Credentials, DB, Devices, Gateway}
-  alias Tightbeam.{Ledger, Model, Org, Wakes}
+  alias Tightbeam.{Assignments, ConnRegistry, CredentialRecovery, Credentials, DB, Devices}
+  alias Tightbeam.{Gateway, LaneManager, Ledger, Model, Org, Wakes}
 
   @host "testhost"
   @owner "recovery-operator"
@@ -132,6 +132,132 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
              )
 
     for session <- Enum.map(sessions, &hd/1), do: assert_received({:lane_started, ^session})
+  end
+
+  test "real lanes deliver every non-Main carrier and each agent receipts its assignment", ctx do
+    sessions = ["agent:product-a", "agent:product-b"]
+
+    Enum.each(sessions, fn session_key ->
+      create_session(
+        ctx.db,
+        session_key,
+        @owner,
+        String.replace_prefix(session_key, "agent:", "")
+      )
+    end)
+
+    assert %{state: "retired"} = Org.retire(ctx.db, @main, "user:#{@owner}", 1_000)
+
+    assignments =
+      Map.new(sessions, fn session_key ->
+        assignment = assign_to_session(ctx.db, session_key)
+        {session_key, assignment.id}
+      end)
+
+    parent = self()
+
+    runner = fn turn ->
+      assignment_id = Map.fetch!(assignments, turn.session_key)
+
+      assert %{id: ^assignment_id, holderKey: holder_key} =
+               Assignments.__handle__(
+                 ctx.db,
+                 "assignment-get",
+                 assignment_call(turn.session_key, %{assignment_id: assignment_id})
+               )
+
+      assert holder_key == turn.session_key
+
+      assert %{attest: %{id: attest_id, kind: "progress", bySession: receipt_session}} =
+               Assignments.__handle__(
+                 ctx.db,
+                 "attest",
+                 assignment_call(turn.session_key, %{
+                   assignment_id: assignment_id,
+                   kind: "progress",
+                   note: "resumed through credential recovery"
+                 })
+               )
+
+      send(
+        parent,
+        {:agent_owned_recovery_receipt, turn.session_key, turn.seq, assignment_id, attest_id,
+         receipt_session}
+      )
+
+      {:ok, %{}}
+    end
+
+    scheduler = start_real_delivery_fabric!(ctx, runner)
+    start_credentials!(ctx)
+    response = finish_fresh(onboard_handler(ctx, scheduler), "subscription")
+    activation_id = response.recovery.activation_id
+
+    assert response.recovery.target_count == 2
+
+    receipts =
+      Map.new(sessions, fn session_key ->
+        assert_receive {:agent_owned_recovery_receipt, ^session_key, turn_seq, assignment_id,
+                        attest_id, ^session_key},
+                       5_000
+
+        {session_key, {turn_seq, assignment_id, attest_id}}
+      end)
+
+    assert eventually(fn ->
+             match?(
+               %{state: "complete", targets: [_, _]},
+               CredentialRecovery.readback(ctx.db, activation_id)
+             )
+           end)
+
+    assert %{
+             state: "complete",
+             targets: [
+               %{session_key: first, state: "handled", resolution: "handled"},
+               %{session_key: second, state: "handled", resolution: "handled"}
+             ]
+           } = CredentialRecovery.readback(ctx.db, activation_id)
+
+    assert Enum.sort([first, second]) == sessions
+
+    assert {:ok, recovery_turns} =
+             DB.query(
+               ctx.db,
+               "SELECT sessionKey,seq,status FROM turns WHERE wakeId IN (SELECT wakeId FROM credential_recovery_targets) ORDER BY sessionKey"
+             )
+
+    assert Enum.map(recovery_turns, fn [session_key, seq, status] ->
+             assert {^seq, _assignment_id, _attest_id} = Map.fetch!(receipts, session_key)
+             {session_key, status}
+           end) == Enum.map(sessions, &{&1, "delivered"})
+
+    assert {:ok, attests} =
+             DB.query(
+               ctx.db,
+               "SELECT assignmentId,bySession,kind FROM attests WHERE assignmentId IN (?1,?2) ORDER BY bySession",
+               Enum.map(sessions, &Map.fetch!(assignments, &1))
+             )
+
+    assert Enum.map(attests, fn [assignment_id, session_key, kind] ->
+             {_turn_seq, ^assignment_id, attest_id} = Map.fetch!(receipts, session_key)
+             assert is_binary(attest_id)
+             {session_key, kind}
+           end) == Enum.map(sessions, &{&1, "progress"})
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM credential_recovery_memberships WHERE activationId=?1 AND resolution='open'",
+               [activation_id]
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM credential_recovery_memberships WHERE activationId=?1 AND sessionKey=?2",
+               [activation_id, @main]
+             )
   end
 
   test "API-key activation uses the same per-session recovery mechanism", ctx do
@@ -714,6 +840,61 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
     name
   end
 
+  defp start_real_delivery_fabric!(ctx, runner) do
+    suffix = System.unique_integer([:positive])
+    scheduler = :"credential_recovery_real_scheduler_#{suffix}"
+    manager = :"credential_recovery_real_manager_#{suffix}"
+    task_sup = :"credential_recovery_real_tasks_#{suffix}"
+    lane_sup = :"credential_recovery_real_lanes_#{suffix}"
+
+    start_supervised!({Registry, keys: :unique, name: Tightbeam.LaneRegistry})
+    start_supervised!({Task.Supervisor, name: task_sup})
+    start_supervised!({DynamicSupervisor, strategy: :one_for_one, name: lane_sup})
+
+    on_terminal = fn _session_key, seq ->
+      case CredentialRecovery.turn_terminal(ctx.db, seq) do
+        {:ok, %{fire?: true}} -> Wakes.fire_due(scheduler)
+        _ -> :ok
+      end
+    end
+
+    start_supervised!(
+      {LaneManager,
+       name: manager,
+       db: ctx.db,
+       lane_sup: lane_sup,
+       task_sup: task_sup,
+       interval: 86_400_000,
+       runner: runner,
+       on_terminal: on_terminal}
+    )
+
+    deliver = fn wake ->
+      Gateway.deliver_prompt(wake.session_key, wake.origin, wake.prompt,
+        db: ctx.db,
+        wake_id: wake.wake_id,
+        sender: wake.origin,
+        target_gate: wake,
+        fire_wake_in_txn: true,
+        conn_registry: ctx.registry,
+        lane_manager: manager
+      )
+    end
+
+    start_supervised!(
+      {Wakes,
+       name: scheduler,
+       db: ctx.db,
+       deliver: deliver,
+       internal_consumers: %{
+         "credential_recovery_retry" => &CredentialRecovery.retry_due(ctx.db, &1)
+       },
+       tick_ms: 86_400_000}
+    )
+
+    scheduler
+  end
+
   defp onboard_handler(ctx, scheduler) do
     Gateway.handlers(%{
       base_dir: ctx.base,
@@ -757,6 +938,41 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
 
   defp principal_origin({:user, id}), do: "user:#{id}"
   defp principal_origin({:session, id}), do: "session:#{id}"
+
+  defp assign_to_session(db, session_key) do
+    Assignments.__handle__(db, "assign", %{
+      verb: "assign",
+      origin: "user:#{@owner}",
+      principal: {:user, @owner},
+      session_key: session_key,
+      target_role: nil,
+      role_fallback: false,
+      supervision_interval_ms: 60_000,
+      params: %{subject: "resume after credential recovery"}
+    })
+  end
+
+  defp assignment_call(session_key, params) do
+    %{
+      origin: "agent:#{session_key}",
+      principal: {:session, session_key},
+      session_key: session_key,
+      params: params
+    }
+  end
+
+  defp eventually(fun, attempts \\ 100)
+
+  defp eventually(fun, attempts) when attempts > 0 do
+    if fun.() do
+      true
+    else
+      Process.sleep(25)
+      eventually(fun, attempts - 1)
+    end
+  end
+
+  defp eventually(_fun, 0), do: false
 
   defp create_session(db, session_key, owner, archetype, opts \\ []) do
     harness = Keyword.get(opts, :harness, "claude")
