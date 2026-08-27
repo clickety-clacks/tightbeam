@@ -2595,8 +2595,8 @@ defmodule Tightbeam.Escalation do
         request.ruled_by == "user:" <> request.owner_user_id
 
     options_valid = operator_options_valid?(request.options)
-    decision_valid = nonblank?(request.decision)
-    rationale_valid = is_nil(request.rationale) or nonblank?(request.rationale)
+    decision_valid = normalized_text?(request.decision)
+    rationale_valid = is_nil(request.rationale) or normalized_text?(request.rationale)
     ruled_at_valid = is_integer(request.ruled_at)
 
     fact_valid =
@@ -3053,6 +3053,11 @@ defmodule Tightbeam.Escalation do
 
   defp nonblank?(value) when is_binary(value), do: String.trim(value) != ""
   defp nonblank?(_value), do: false
+
+  defp normalized_text?(value) when is_binary(value),
+    do: value != "" and String.trim(value) == value
+
+  defp normalized_text?(_value), do: false
 
   defp operator_options_valid?(options) when is_list(options) and options != [] do
     labels =

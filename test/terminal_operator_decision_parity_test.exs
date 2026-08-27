@@ -352,6 +352,61 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
     refute null_digest == blank_digest
   end
 
+  test "terminal decision and rationale require normalized stored text", ctx do
+    padded_decision =
+      Escalation.operator_ask(ctx.db, ask_call(ctx.raiser, %{question: "padded decision?"}))
+
+    padded_rationale =
+      Escalation.operator_ask(ctx.db, ask_call(ctx.raiser, %{question: "padded rationale?"}))
+
+    Escalation.operator_rule(
+      ctx.db,
+      rule_call(padded_decision.id, %{decision: "accept"}),
+      scheduler: ctx.scheduler
+    )
+
+    Escalation.operator_rule(
+      ctx.db,
+      rule_call(padded_rationale.id, %{decision: "accept", rationale: "because"}),
+      scheduler: ctx.scheduler
+    )
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        "UPDATE decision_requests SET decision=' accept ' WHERE id='#{padded_decision.id}'"
+      )
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        "UPDATE decision_requests SET rationale=' because ' WHERE id='#{padded_rationale.id}'"
+      )
+
+    for request <- [padded_decision, padded_rationale] do
+      assert %{code: "decision_request_integrity_invalid"} =
+               Escalation.get(
+                 ctx.db,
+                 rule_call(request.id, %{decision: "accept"}),
+                 request.id,
+                 owner_user_id: "flynn"
+               )
+    end
+
+    assert {:ok, evidence_rows} =
+             DB.query(
+               ctx.db,
+               "SELECT requestId,failingFields FROM decision_request_integrity_evidence WHERE requestId IN (?1,?2) ORDER BY requestId",
+               [padded_decision.id, padded_rationale.id]
+             )
+
+    assert Enum.sort(evidence_rows) ==
+             Enum.sort([
+               [padded_decision.id, ~s(["decision"])],
+               [padded_rationale.id, ~s(["rationale"])]
+             ])
+  end
+
   test "owner attribution requires the stored raiser session", ctx do
     request =
       Escalation.operator_ask(ctx.db, ask_call(ctx.raiser, %{question: "owner attribution?"}))
