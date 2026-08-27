@@ -809,7 +809,9 @@ mod signal_target_gone_tests {
 
 #[cfg(test)]
 mod instance_authority_tests {
-    use super::{ProcessInstance, ProcessStartTime, parse_proc_starttime, verify_process_instance};
+    use super::{
+        ProcessInstance, parse_proc_starttime, read_process_start_time, verify_process_instance,
+    };
 
     #[test]
     fn linux_starttime_is_read_from_proc_stat() {
@@ -819,18 +821,27 @@ mod instance_authority_tests {
 
     #[test]
     fn pgid_reuse_is_refused_when_a_captured_member_moved_groups() {
+        let pid = unsafe { libc::getpid() };
+        let actual_pgid = unsafe { libc::getpgid(pid) };
+        assert_ne!(
+            actual_pgid, -1,
+            "live pid must have a readable process group"
+        );
+        let wrong_pgid = if actual_pgid != 1 { 1 } else { 2 };
+        let start_time = read_process_start_time(pid).expect("live pid start time readable");
         let instance = ProcessInstance {
-            pid: unsafe { libc::getpid() },
-            pgid: 1,
-            start_time: ProcessStartTime {
-                seconds: 0,
-                microseconds: 0,
-            },
+            pid,
+            pgid: wrong_pgid,
+            start_time,
         };
         let error = verify_process_instance(&instance).unwrap_err();
         assert!(
-            error.contains("group reuse") || error.contains("pid reuse"),
-            "{error}"
+            error.contains("group reuse"),
+            "expected group-reuse refusal, got: {error}"
+        );
+        assert!(
+            !error.contains("pid reuse"),
+            "must not pass via pid-reuse branch: {error}"
         );
     }
 }
