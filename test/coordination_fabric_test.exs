@@ -10,7 +10,7 @@ defmodule Tightbeam.CoordinationFabricTest do
   """
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Escalation, NoticeBatcher, Roles, Wakes}
+  alias Tightbeam.{DB, Escalation, Roles, Wakes}
 
   setup do
     name = :"db_#{System.unique_integer([:positive])}"
@@ -248,7 +248,7 @@ defmodule Tightbeam.CoordinationFabricTest do
   test "a turn that ended BEFORE the message arrived is not that message's boundary",
        %{db: db} do
     session = "agent:po"
-    base = System.system_time(:millisecond)
+    base = 1_000
 
     seq = turn(db, session, status: "running", created_at: base - 1_000)
     end_turn(db, seq, base - 500)
@@ -875,7 +875,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     # A second lane proves one linked-work shape cannot affect another lane.
     healthy_member = schedule(db, session: healthy_session, class: "fyi", prompt: "unrelated")
 
-    at = broken_member.created_at + Wakes.delivery_policy("fyi").ceiling_ms
+    at = Enum.max([ok_member.due_at, broken_member.due_at, healthy_member.due_at])
 
     assert carrier_ids = Wakes.materialize_digests(db, at)
     assert length(carrier_ids) == 2
@@ -4142,7 +4142,20 @@ defmodule Tightbeam.CoordinationFabricTest do
 
   defp schedule_wake(db, input) do
     if input[:class] == "fyi" and input[:digest] != true do
-      NoticeBatcher.set_lane_policy(db, input, true, "agent:test-policy")
+      seq = System.unique_integer([:positive, :monotonic])
+
+      {:ok, _policy} =
+        DB.transaction(db, fn txn ->
+          Tightbeam.Org.apply_notice_batching_lane_policy_in_txn(
+            txn,
+            input,
+            true,
+            "notice-batching-test-policy:coordination:#{seq}",
+            "agent:test-policy",
+            "coordination-fixture",
+            seq
+          )
+        end)
     end
 
     Wakes.schedule(db, input)

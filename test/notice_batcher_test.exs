@@ -1,7 +1,7 @@
 defmodule Tightbeam.NoticeBatcherTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Gateway, NoticeBatcher, Roles, Wakes}
+  alias Tightbeam.{AdminProjection, DB, Gateway, NoticeBatcher, Org, Roles, Wakes}
 
   setup do
     id = System.unique_integer([:positive])
@@ -357,14 +357,44 @@ defmodule Tightbeam.NoticeBatcherTest do
     assert unselected.delivery_rule == "turn-boundary-digest r1"
     assert NoticeBatcher.source_refs(db, unselected.wake_id) == []
 
-    set_lane_policy(db, lane, true)
+    selected = set_lane_policy(db, lane, true)
+
+    assert selected.enabled
+    assert selected.policy_revision == NoticeBatcher.policy_revision()
+    assert selected.selected_by == "agent:test-policy"
+    assert selected.cause == "acceptance-fixture"
+    assert selected.policy_ref =~ "notice-batching-test-policy:"
+
+    assert AdminProjection.version(
+             db,
+             "notice batching lane policies",
+             [selected.recipient_address, selected.visibility_scope]
+           ) == 1
+
+    assert {:ok,
+            [[1, revision, policy_ref, "agent:test-policy", "acceptance-fixture", selected_at]]} =
+             DB.query(
+               db,
+               """
+               SELECT enabled, policyRevision, policyRef, selectedBy, cause, selectedAt
+               FROM notice_batching_lane_policies
+               WHERE recipientAddress=?1 AND visibilityScope=?2
+               """,
+               [selected.recipient_address, selected.visibility_scope]
+             )
+
+    assert revision == NoticeBatcher.policy_revision()
+    assert policy_ref == selected.policy_ref
+    assert selected_at == selected.selected_at
+
     active = fyi(db, lane)
     assert active.delivery_rule == NoticeBatcher.rule()
     assert [%{batch_id: _}] = NoticeBatcher.source_refs(db, active.wake_id)
     _carrier_ids = Wakes.materialize_digests(db, active.due_at)
     carrier_id = NoticeBatcher.batch(db, batch_id(db, active)).delivery_wake_id
 
-    set_lane_policy(db, lane, false)
+    disabled_policy = set_lane_policy(db, lane, false)
+    assert disabled_policy.row_version == 2
     disabled = fyi(db, Keyword.put(lane, :prompt, "after rollback"))
 
     assert disabled.delivery_rule == "turn-boundary-digest r1"
@@ -404,15 +434,27 @@ defmodule Tightbeam.NoticeBatcherTest do
   end
 
   defp set_lane_policy(db, opts, enabled) do
-    NoticeBatcher.set_lane_policy(
-      db,
-      %{
-        session_key: Keyword.get(opts, :session, "agent:recipient"),
-        target_role: Keyword.get(opts, :target_role)
-      },
-      enabled,
-      "agent:test-policy"
-    )
+    lane = %{
+      session_key: Keyword.get(opts, :session, "agent:recipient"),
+      target_role: Keyword.get(opts, :target_role)
+    }
+
+    seq = System.unique_integer([:positive, :monotonic])
+
+    {:ok, policy} =
+      DB.transaction(db, fn txn ->
+        Org.apply_notice_batching_lane_policy_in_txn(
+          txn,
+          lane,
+          enabled,
+          "notice-batching-test-policy:#{seq}",
+          "agent:test-policy",
+          "acceptance-fixture",
+          seq
+        )
+      end)
+
+    policy
   end
 
   defp ordinary(db, class, prompt) do

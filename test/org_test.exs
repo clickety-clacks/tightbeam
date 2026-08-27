@@ -4,7 +4,7 @@ defmodule Tightbeam.OrgTest do
 
   doctest Tightbeam.Org
 
-  alias Tightbeam.{DB, Org, Roles, Wakes}
+  alias Tightbeam.{DB, NoticeBatcher, Org, Roles, Wakes}
 
   setup do
     name = :"db_#{System.unique_integer([:positive])}"
@@ -301,6 +301,86 @@ defmodule Tightbeam.OrgTest do
 
     assert {:ok, [[^cancellation_count]]} =
              DB.query(db, "SELECT count(*) FROM wake_cancellations")
+  end
+
+  test "retirement transaction preserves one selected V1 delivery path on the replacement", %{
+    db: db
+  } do
+    main_key = Org.personal_session_key("flynn")
+    Org.create(db, base(%{session_key: "retiring"}))
+    Roles.create!(db, "reviewer", "flynn", "retiring")
+
+    lane = %{session_key: "retiring", target_role: "reviewer"}
+
+    {:ok, _policy} =
+      DB.transaction(db, fn txn ->
+        Org.apply_notice_batching_lane_policy_in_txn(
+          txn,
+          lane,
+          true,
+          "notice-batching-org-retirement-test",
+          "agent:test-policy",
+          "retirement-fixture",
+          1_000
+        )
+      end)
+
+    original =
+      Wakes.schedule(db, %{
+        session_key: "retiring",
+        target_role: "reviewer",
+        origin: "process:tightbeam",
+        creator_session_key: "agent:sender",
+        prompt: "selected source survives retirement",
+        due_at: 0,
+        class: "fyi"
+      })
+
+    assert original.delivery_rule == NoticeBatcher.rule()
+
+    assert [%{member_state: "active", batch_id: batch_id}] =
+             NoticeBatcher.source_refs(db, original.wake_id)
+
+    assert %{state: "retired"} = Org.retire(db, "retiring", "user:flynn", 1_000)
+    assert %{replacement_wake_id: replacement_wake_id} = cancellation(db, original.wake_id)
+
+    replacement = Wakes.get(db, replacement_wake_id)
+    assert replacement.session_key == main_key
+    assert replacement.target_role == "reviewer"
+    assert replacement.delivery_rule == NoticeBatcher.rule()
+    assert replacement.due_at == original.due_at
+
+    assert [%{member_state: "canceled", batch_id: ^batch_id}] =
+             NoticeBatcher.source_refs(db, original.wake_id)
+
+    assert [%{member_state: "active", batch_id: ^batch_id}] =
+             NoticeBatcher.source_refs(db, replacement_wake_id)
+
+    assert [carrier_id] = Wakes.materialize_digests(db, replacement.due_at)
+    assert Enum.map(Wakes.digest_members(db, carrier_id), & &1.wake_id) == [replacement_wake_id]
+
+    {:ok, _} = DB.query(db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [carrier_id])
+    scheduler = :"org_retirement_batch_scheduler_#{System.unique_integer([:positive])}"
+    test_pid = self()
+
+    start_supervised!(
+      {Wakes,
+       name: scheduler,
+       db: db,
+       tick_ms: 60_000,
+       deliver: fn wake ->
+         send(test_pid, {:delivered, wake.wake_id})
+         true
+       end},
+      id: scheduler
+    )
+
+    assert :ok = Wakes.fire_due(scheduler)
+    assert_receive {:delivered, ^carrier_id}
+    refute_receive {:delivered, ^replacement_wake_id}
+    assert Wakes.get(db, carrier_id).state == "fired"
+    assert Wakes.get(db, replacement_wake_id).state == "pending"
+    assert {:ok, [[1]]} = DB.query(db, "SELECT count(*) FROM wakes WHERE digest=1")
   end
 
   test "retirement validates its explicit caller context before state or wake mutation", %{db: db} do

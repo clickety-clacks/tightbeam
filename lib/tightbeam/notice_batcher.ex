@@ -23,9 +23,12 @@ defmodule Tightbeam.NoticeBatcher do
     visibilityScope TEXT NOT NULL,
     enabled INTEGER NOT NULL CHECK (enabled IN (0,1)),
     policyRevision TEXT NOT NULL,
+    policyRef TEXT NOT NULL CHECK (length(trim(policyRef)) > 0),
     selectedBy TEXT NOT NULL,
+    cause TEXT NOT NULL CHECK (length(trim(cause)) > 0),
     selectedAt INTEGER NOT NULL CHECK (selectedAt >= 0),
-    PRIMARY KEY (recipientAddress, visibilityScope)
+    PRIMARY KEY (recipientAddress, visibilityScope),
+    UNIQUE (policyRef)
   );
 
   CREATE TABLE IF NOT EXISTS notice_delivery_policies (
@@ -128,42 +131,66 @@ defmodule Tightbeam.NoticeBatcher do
   def policy_ref(source_wake_id), do: "notice-policy:" <> source_wake_id
 
   @doc false
-  @spec set_lane_policy(GenServer.server(), map(), boolean(), String.t(), integer()) :: :ok
-  def set_lane_policy(
-        db \\ Tightbeam.DB,
+  @spec apply_lane_policy_in_txn(
+          Txn.t(),
+          map(),
+          boolean(),
+          String.t(),
+          String.t(),
+          String.t(),
+          non_neg_integer()
+        ) :: map()
+  def apply_lane_policy_in_txn(
+        %Txn{} = txn,
         recipient,
         enabled,
+        policy_ref,
         selected_by,
-        at \\ now()
+        cause,
+        at
       )
-      when is_boolean(enabled) and is_binary(selected_by) do
-    transaction!(db, fn txn ->
-      {recipient_address, visibility_scope} = recipient_lane(recipient)
+      when is_boolean(enabled) and is_binary(policy_ref) and policy_ref != "" and
+             is_binary(selected_by) and selected_by != "" and is_binary(cause) and cause != "" and
+             is_integer(at) and at >= 0 do
+    {recipient_address, visibility_scope} = recipient_lane(recipient)
 
-      Txn.q(
-        txn,
-        """
-        INSERT INTO notice_batching_lane_policies
-          (recipientAddress, visibilityScope, enabled, policyRevision, selectedBy, selectedAt)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-        ON CONFLICT(recipientAddress, visibilityScope) DO UPDATE SET
-          enabled=excluded.enabled,
-          policyRevision=excluded.policyRevision,
-          selectedBy=excluded.selectedBy,
-          selectedAt=excluded.selectedAt
-        """,
-        [
-          recipient_address,
-          visibility_scope,
-          if(enabled, do: 1, else: 0),
-          @policy_revision,
-          selected_by,
-          at
-        ]
-      )
+    Txn.q(
+      txn,
+      """
+      INSERT INTO notice_batching_lane_policies
+        (recipientAddress, visibilityScope, enabled, policyRevision, policyRef,
+         selectedBy, cause, selectedAt)
+      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+      ON CONFLICT(recipientAddress, visibilityScope) DO UPDATE SET
+        enabled=excluded.enabled,
+        policyRevision=excluded.policyRevision,
+        policyRef=excluded.policyRef,
+        selectedBy=excluded.selectedBy,
+        cause=excluded.cause,
+        selectedAt=excluded.selectedAt
+      """,
+      [
+        recipient_address,
+        visibility_scope,
+        if(enabled, do: 1, else: 0),
+        @policy_revision,
+        policy_ref,
+        selected_by,
+        cause,
+        at
+      ]
+    )
 
-      :ok
-    end)
+    %{
+      recipient_address: recipient_address,
+      visibility_scope: visibility_scope,
+      enabled: enabled,
+      policy_revision: @policy_revision,
+      policy_ref: policy_ref,
+      selected_by: selected_by,
+      cause: cause,
+      selected_at: at
+    }
   end
 
   @doc false
@@ -176,6 +203,9 @@ defmodule Tightbeam.NoticeBatcher do
            """
            SELECT enabled FROM notice_batching_lane_policies
            WHERE recipientAddress=?1 AND visibilityScope=?2 AND policyRevision=?3
+             AND length(trim(policyRef)) > 0
+             AND length(trim(selectedBy)) > 0
+             AND length(trim(cause)) > 0
            """,
            [recipient_address, visibility_scope, @policy_revision]
          ) do
@@ -267,6 +297,64 @@ defmodule Tightbeam.NoticeBatcher do
 
   def enqueue_or_recover_in_txn(%Txn{} = txn, {:delivery_failed, delivery_wake_id, reason, at}) do
     mark_delivery_failed_in_txn(txn, delivery_wake_id, reason, at)
+  end
+
+  @doc false
+  @spec preserve_retargeted_source_in_txn(Txn.t(), String.t(), String.t()) ::
+          :not_batched | map() | {:error, map()}
+  def preserve_retargeted_source_in_txn(
+        %Txn{} = txn,
+        source_wake_id,
+        replacement_wake_id
+      )
+      when is_binary(source_wake_id) and is_binary(replacement_wake_id) do
+    case Txn.q(
+           txn,
+           """
+           SELECT p.visibilityScope, p.deadlineAt
+           FROM notice_delivery_policies p
+           JOIN notice_batch_members m
+             ON m.sourceWakeId=p.sourceWakeId
+            AND m.recipientAddress=p.recipientAddress
+            AND m.visibilityScope=p.visibilityScope
+           JOIN notice_batches b ON b.batchId=m.batchId
+           WHERE p.sourceWakeId=?1 AND p.enabled=1 AND p.policyRevision=?2
+             AND m.state='active' AND b.state='open'
+           """,
+           [source_wake_id, @policy_revision]
+         ) do
+      [[visibility_scope, deadline_at]] ->
+        replacement_policy_ref = policy_ref(replacement_wake_id)
+
+        Txn.q(
+          txn,
+          """
+          INSERT INTO notice_delivery_policies
+            (policyRef, sourceWakeId, recipientAddress, sessionKey, targetRole,
+             visibilityScope, policyRevision, deadlineAt, enabled, createdAt)
+          SELECT ?2, w.wakeId,
+                 CASE WHEN w.targetRole IS NULL
+                      THEN 'session:' || w.sessionKey
+                      ELSE 'role:' || w.targetRole END,
+                 w.sessionKey, w.targetRole, ?3, ?4, ?5, 1, w.createdAt
+          FROM wakes w
+          WHERE w.wakeId=?1 AND w.state='pending'
+          ON CONFLICT(policyRef) DO NOTHING
+          """,
+          [
+            replacement_wake_id,
+            replacement_policy_ref,
+            visibility_scope,
+            @policy_revision,
+            deadline_at
+          ]
+        )
+
+        enqueue_or_recover_in_txn(txn, replacement_wake_id, replacement_policy_ref)
+
+      [] ->
+        :not_batched
+    end
   end
 
   @doc "Seal due batches, arm sealed batches, and reconcile committed deliveries."
