@@ -20,6 +20,7 @@ defmodule Tightbeam.CursorSigning do
   @record_mode_mask 0o7777
   @directory_mode 0o700
   @read_attempts 8
+  @commit_sync_retry_ms 10
 
   defmodule Error do
     @moduledoc false
@@ -46,8 +47,7 @@ defmodule Tightbeam.CursorSigning do
          {:ok, directory, path} <- provision_location(base_dir, owner_uid),
          :ok <- refuse_existing(path),
          material <- :crypto.strong_rand_bytes(@material_bytes),
-         :ok <- create_record(path, material, owner_uid),
-         :ok <- sync_directory(directory),
+         :ok <- create_active_record(directory, path, material, owner_uid),
          {:ok, _material} <- read_record(path, owner_uid, @read_attempts) do
       :ok
     end
@@ -324,6 +324,24 @@ defmodule Tightbeam.CursorSigning do
     end
   end
 
+  defp create_active_record(directory, path, material, owner_uid) do
+    case open_directory(directory) do
+      {:ok, directory_file} ->
+        result =
+          with :ok <- sync_record(directory_file),
+               :ok <- create_record(path, material, owner_uid),
+               :ok <- sync_committed_directory(directory_file) do
+            :ok
+          end
+
+        _ = :file.close(directory_file)
+        result
+
+      {:error, %Error{} = reason} ->
+        {:error, reason}
+    end
+  end
+
   defp validate_created_stat(
          %File.Stat{type: :regular, mode: mode, uid: owner_uid},
          owner_uid
@@ -351,14 +369,36 @@ defmodule Tightbeam.CursorSigning do
   end
 
   defp sync_directory(directory) do
-    case :file.open(String.to_charlist(directory), [:read, :raw, :directory]) do
+    case open_directory(directory) do
       {:ok, file} ->
         result = sync_record(file)
         _ = :file.close(file)
         result
 
+      {:error, %Error{} = reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp open_directory(directory) do
+    case :file.open(String.to_charlist(directory), [:read, :raw, :directory]) do
+      {:ok, file} -> {:ok, file}
+      {:error, _reason} -> error(:unavailable)
+    end
+  end
+
+  # Creating or renaming the active record is the authority commit point. Once
+  # that point is crossed, returning an ordinary failure would lie about which
+  # generation is active. Keep listener admission or rotation completion
+  # blocked until the containing directory confirms the committed namespace.
+  defp sync_committed_directory(directory_file) do
+    case :file.sync(directory_file) do
+      :ok ->
+        :ok
+
       {:error, _reason} ->
-        error(:unavailable)
+        Process.sleep(@commit_sync_retry_ms)
+        sync_committed_directory(directory_file)
     end
   end
 
@@ -456,22 +496,29 @@ defmodule Tightbeam.CursorSigning do
   defp replace_record(temporary, path) do
     directory = Path.dirname(path)
 
-    case :file.open(String.to_charlist(directory), [:read, :raw, :directory]) do
+    case open_directory(directory) do
       {:ok, directory_file} ->
         result =
-          case File.rename(temporary, path) do
+          case sync_record(directory_file) do
             :ok ->
-              sync_record(directory_file)
+              case File.rename(temporary, path) do
+                :ok ->
+                  sync_committed_directory(directory_file)
 
-            {:error, _reason} ->
+                {:error, _reason} ->
+                  _ = File.rm(temporary)
+                  error(:rotation_failed)
+              end
+
+            {:error, %Error{} = reason} ->
               _ = File.rm(temporary)
-              error(:rotation_failed)
+              {:error, reason}
           end
 
         _ = :file.close(directory_file)
         result
 
-      {:error, _reason} ->
+      {:error, %Error{}} ->
         _ = File.rm(temporary)
         error(:rotation_failed)
     end

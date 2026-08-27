@@ -133,6 +133,64 @@ defmodule Tightbeam.CursorSigningTest do
     assert File.ls!(Path.join(ctx.base_dir, "secrets")) == ["rest-cursor-signing.v1"]
   end
 
+  test "directory durability remains a completion barrier after authority commits", ctx do
+    control_dir = Path.join(ctx.base_dir, "fsync-proof")
+    File.mkdir_p!(control_dir)
+    probe = compile_filesystem_probe!(control_dir)
+    active_path = Path.join([ctx.base_dir, "secrets", "rest-cursor-signing.v1"])
+    provision_failure = Path.join(control_dir, "provision-fsync-failed")
+
+    assert {"ok", 0} =
+             external_cursor_operation(ctx.base_dir, "provision",
+               probe: probe,
+               active_path: active_path,
+               failure_marker: provision_failure,
+               failure_mode: "active-exists"
+             )
+
+    assert File.exists?(provision_failure)
+    provider = CursorSigning.load!(ctx.base_dir)
+    old_signature = sign!(provider, "fsync-failure-cursor")
+    precommit_failure = Path.join(control_dir, "precommit-fsync-failed")
+
+    assert {"refused", 0} =
+             external_cursor_operation(ctx.base_dir, "rotate-refused",
+               probe: probe,
+               active_path: active_path,
+               failure_marker: precommit_failure,
+               failure_mode: "active-exists"
+             )
+
+    assert File.exists?(precommit_failure)
+
+    assert {:ok, true} =
+             CursorSigning.verify(provider, "fsync-failure-cursor", old_signature)
+
+    assert File.ls!(Path.dirname(active_path)) == ["rest-cursor-signing.v1"]
+
+    rotation_failure = Path.join(control_dir, "rotation-fsync-failed")
+
+    assert {"ok", 0} =
+             external_cursor_operation(ctx.base_dir, "rotate",
+               probe: probe,
+               active_path: active_path,
+               failure_marker: rotation_failure,
+               failure_mode: "after-rename"
+             )
+
+    assert File.exists?(rotation_failure)
+    restarted_provider = CursorSigning.load!(ctx.base_dir)
+    new_signature = sign!(restarted_provider, "fsync-failure-cursor")
+
+    refute old_signature == new_signature
+
+    assert {:ok, false} =
+             CursorSigning.verify(restarted_provider, "fsync-failure-cursor", old_signature)
+
+    assert {:ok, true} =
+             CursorSigning.verify(restarted_provider, "fsync-failure-cursor", new_signature)
+  end
+
   test "a failed rotation preserves the old complete record", ctx do
     assert :ok = CursorSigning.provision(ctx.base_dir)
     provider = CursorSigning.load!(ctx.base_dir)
@@ -154,6 +212,8 @@ defmodule Tightbeam.CursorSigningTest do
     before_rotation = sign!(provider, "concurrent-cursor")
     control_dir = Path.join(ctx.base_dir, "rotation-proof")
     File.mkdir_p!(control_dir)
+    probe = compile_filesystem_probe!(control_dir)
+    active_path = Path.join([ctx.base_dir, "secrets", "rest-cursor-signing.v1"])
 
     applications =
       for application_id <- ["one", "two"] do
@@ -162,16 +222,28 @@ defmodule Tightbeam.CursorSigningTest do
         end)
       end
 
-    await_marker_count!(control_dir, "ready-", 64)
-    File.write!(Path.join(control_dir, "go"), "")
-    await_marker_count!(control_dir, "pre-", 64)
+    await_marker_count!(control_dir, "worker-ready-", 64)
+    File.write!(Path.join(control_dir, "pre-go"), "")
+    await_marker_count!(control_dir, "worker-pre-", 64)
 
-    File.write!(Path.join(control_dir, "rotating"), "")
-    await_marker_count!(control_dir, "during-", 64)
-    assert :ok = CursorSigning.rotate(provider)
-    File.write!(Path.join(control_dir, "post"), "")
-    await_marker_count!(control_dir, "post-", 64)
-    File.write!(Path.join(control_dir, "stop"), "")
+    rotation =
+      Task.async(fn ->
+        external_rotation_at_boundary(ctx.base_dir, control_dir, probe, active_path)
+      end)
+
+    await_file!(Path.join(control_dir, "rename-ready"))
+    File.write!(Path.join(control_dir, "during-before-go"), "")
+    await_marker_count!(control_dir, "worker-during-before-", 64)
+
+    File.write!(Path.join(control_dir, "rename-go"), "")
+    await_file!(Path.join(control_dir, "rename-done"))
+    File.write!(Path.join(control_dir, "during-after-go"), "")
+    await_marker_count!(control_dir, "worker-during-after-", 64)
+
+    File.write!(Path.join(control_dir, "rename-finish"), "")
+    assert :ok = Task.await(rotation, 30_000)
+    File.write!(Path.join(control_dir, "post-go"), "")
+    await_marker_count!(control_dir, "worker-post-", 64)
 
     after_rotation = sign!(provider, "concurrent-cursor")
     refute after_rotation == before_rotation
@@ -183,12 +255,7 @@ defmodule Tightbeam.CursorSigningTest do
 
     assert Enum.all?(summaries, fn summary ->
              summary.workers == 32 and
-               summary.pre >= 32 and
-               summary.during >= 32 and
-               summary.post >= 32 and
-               summary.old > 0 and
-               summary.new > 0 and
-               summary.invalid == 0
+               summary.valid == 32
            end)
 
     assert {:ok, false} = CursorSigning.verify(provider, "concurrent-cursor", before_rotation)
@@ -302,6 +369,37 @@ defmodule Tightbeam.CursorSigningTest do
     status
   end
 
+  defp external_cursor_operation(base_dir, operation, options) do
+    script = """
+    [base_dir, operation] = System.argv()
+
+    case operation do
+      "provision" ->
+        :ok = Tightbeam.CursorSigning.provision(base_dir)
+
+      "rotate" ->
+        provider = Tightbeam.CursorSigning.load!(base_dir)
+        :ok = Tightbeam.CursorSigning.rotate(provider)
+
+      "rotate-refused" ->
+        provider = Tightbeam.CursorSigning.load!(base_dir)
+        {:error, %Tightbeam.CursorSigning.Error{}} = Tightbeam.CursorSigning.rotate(provider)
+        IO.binwrite("refused")
+    end
+
+    if operation != "rotate-refused", do: IO.binwrite("ok")
+    """
+
+    environment =
+      filesystem_probe_environment(options[:probe], options[:active_path]) ++
+        [
+          {"CURSOR_SIGNING_TEST_FSYNC_FAILED", options[:failure_marker]},
+          {failure_environment_name(options[:failure_mode]), "1"}
+        ]
+
+    external_instrumented_elixir(script, [base_dir, operation], environment)
+  end
+
   defp external_concurrency_summary(base_dir, control_dir, application_id) do
     script = """
     defmodule CursorSigningConcurrencyProbe do
@@ -309,67 +407,52 @@ defmodule Tightbeam.CursorSigningTest do
 
       def run(base_dir, control_dir, application_id) do
         provider = Tightbeam.CursorSigning.load!(base_dir)
-        old_signature = sign!(provider)
 
         tasks =
           for index <- 1..@workers do
             Task.async(fn -> worker(provider, control_dir, application_id, index) end)
           end
 
-        samples = tasks |> Task.await_many(30_000) |> List.flatten()
-        new_signature = sign!(provider)
+        results = Task.await_many(tasks, 30_000)
 
-        summary =
-          Enum.reduce(samples, initial_summary(application_id), fn sample, summary ->
-            classify(sample, old_signature, new_signature, summary)
-          end)
+        summary = %{
+          application: application_id,
+          os_pid: System.pid(),
+          workers: @workers,
+          valid: Enum.count(results, &(&1 == :ok))
+        }
 
         IO.binwrite(summary |> :erlang.term_to_binary() |> Base.encode64())
       end
 
       defp worker(provider, control_dir, application_id, index) do
         File.write!(marker(control_dir, "ready", application_id, index), "")
-        await_file(Path.join(control_dir, "go"), 15_000)
-        collect(provider, control_dir, application_id, index, [])
+        await_file(Path.join(control_dir, "pre-go"), 15_000)
+        old_signature = sign!(provider)
+        {:ok, true} = verify(provider, old_signature)
+        File.write!(marker(control_dir, "pre", application_id, index), "")
+
+        await_file(Path.join(control_dir, "during-before-go"), 15_000)
+        before_rename_signature = sign!(provider)
+        {:ok, true} = verify(provider, before_rename_signature)
+        File.write!(marker(control_dir, "during-before", application_id, index), "")
+
+        await_file(Path.join(control_dir, "during-after-go"), 15_000)
+        {:ok, false} = verify(provider, old_signature)
+        new_signature = sign!(provider)
+        {:ok, true} = verify(provider, new_signature)
+        File.write!(marker(control_dir, "during-after", application_id, index), "")
+
+        await_file(Path.join(control_dir, "post-go"), 15_000)
+        {:ok, false} = verify(provider, old_signature)
+        post_signature = sign!(provider)
+        {:ok, true} = verify(provider, post_signature)
+        File.write!(marker(control_dir, "post", application_id, index), "")
+        :ok
       end
-
-      defp collect(provider, control_dir, application_id, index, samples) do
-        before_phase = phase(control_dir)
-        signature = sign!(provider)
-        after_phase = phase(control_dir)
-
-        mark_phase(control_dir, application_id, index, before_phase, after_phase)
-        samples = [{before_phase, after_phase, signature} | samples]
-
-        if File.exists?(Path.join(control_dir, "stop")) do
-          samples
-        else
-          Process.sleep(1)
-          collect(provider, control_dir, application_id, index, samples)
-        end
-      end
-
-      defp phase(control_dir) do
-        cond do
-          File.exists?(Path.join(control_dir, "post")) -> :post
-          File.exists?(Path.join(control_dir, "rotating")) -> :during
-          true -> :pre
-        end
-      end
-
-      defp mark_phase(control_dir, application_id, index, phase, phase)
-           when phase in [:pre, :during, :post] do
-        path = marker(control_dir, Atom.to_string(phase), application_id, index)
-
-        unless File.exists?(path) do
-          File.write!(path, "")
-        end
-      end
-
-      defp mark_phase(_control_dir, _application_id, _index, _before, _after), do: :ok
 
       defp marker(control_dir, phase, application_id, index) do
-        name = Enum.join([phase, application_id, Integer.to_string(index)], "-")
+        name = Enum.join(["worker", phase, application_id, Integer.to_string(index)], "-")
         Path.join(control_dir, name)
       end
 
@@ -389,43 +472,8 @@ defmodule Tightbeam.CursorSigningTest do
         signature
       end
 
-      defp initial_summary(application_id) do
-        %{
-          application: application_id,
-          os_pid: System.pid(),
-          workers: @workers,
-          pre: 0,
-          during: 0,
-          post: 0,
-          old: 0,
-          new: 0,
-          invalid: 0
-        }
-      end
-
-      defp classify({before_phase, after_phase, signature}, old, new, summary) do
-        phase =
-          cond do
-            before_phase == :pre and after_phase == :pre -> :pre
-            before_phase == :post and after_phase == :post -> :post
-            true -> :during
-          end
-
-        valid =
-          case phase do
-            :pre -> signature == old
-            :post -> signature == new
-            :during -> signature == old or signature == new
-          end
-
-        generation = if signature == old, do: :old, else: :new
-
-        summary
-        |> Map.update!(phase, &(&1 + 1))
-        |> Map.update!(generation, &(&1 + 1))
-        |> then(fn summary ->
-          if valid, do: summary, else: Map.update!(summary, :invalid, &(&1 + 1))
-        end)
+      defp verify(provider, signature) do
+        Tightbeam.CursorSigning.verify(provider, "concurrent-cursor", signature)
       end
     end
 
@@ -438,6 +486,86 @@ defmodule Tightbeam.CursorSigningTest do
     encoded
     |> Base.decode64!()
     |> :erlang.binary_to_term([:safe])
+  end
+
+  defp external_rotation_at_boundary(base_dir, control_dir, probe, active_path) do
+    script = """
+    [base_dir] = System.argv()
+    provider = Tightbeam.CursorSigning.load!(base_dir)
+    :ok = Tightbeam.CursorSigning.rotate(provider)
+    IO.binwrite("ok")
+    """
+
+    environment =
+      filesystem_probe_environment(probe, active_path) ++
+        [
+          {"CURSOR_SIGNING_TEST_RENAME_READY", Path.join(control_dir, "rename-ready")},
+          {"CURSOR_SIGNING_TEST_RENAME_GO", Path.join(control_dir, "rename-go")},
+          {"CURSOR_SIGNING_TEST_RENAME_DONE", Path.join(control_dir, "rename-done")},
+          {"CURSOR_SIGNING_TEST_RENAME_FINISH", Path.join(control_dir, "rename-finish")}
+        ]
+
+    case external_instrumented_elixir(script, [base_dir], environment) do
+      {"ok", 0} -> :ok
+      {_output, _status} -> raise "cursor rotation boundary probe failed"
+    end
+  end
+
+  defp compile_filesystem_probe!(directory) do
+    compiler = System.find_executable("cc") || raise "C compiler is unavailable"
+    source = Path.join(__DIR__, "support/cursor_signing_fs_probe.c")
+
+    {output, arguments} =
+      case :os.type() do
+        {:unix, :darwin} ->
+          {Path.join(directory, "cursor-signing-fs-probe.dylib"),
+           ["-dynamiclib", "-O2", "-Wall", "-o"]}
+
+        {:unix, _name} ->
+          {Path.join(directory, "cursor-signing-fs-probe.so"),
+           ["-shared", "-fPIC", "-O2", "-Wall", "-o"]}
+      end
+
+    link_arguments = if :os.type() == {:unix, :darwin}, do: [], else: ["-ldl"]
+
+    case System.cmd(compiler, arguments ++ [output, source] ++ link_arguments,
+           stderr_to_stdout: true
+         ) do
+      {"", 0} -> output
+      {_diagnostic, _status} -> raise "cursor filesystem probe compilation failed"
+    end
+  end
+
+  defp filesystem_probe_environment(probe, active_path) do
+    loader_environment =
+      case :os.type() do
+        {:unix, :darwin} ->
+          [{"DYLD_INSERT_LIBRARIES", probe}, {"DYLD_FORCE_FLAT_NAMESPACE", "1"}]
+
+        {:unix, _name} ->
+          [{"LD_PRELOAD", probe}]
+      end
+
+    [{"CURSOR_SIGNING_TEST_ACTIVE_PATH", active_path} | loader_environment]
+  end
+
+  defp failure_environment_name("active-exists"),
+    do: "CURSOR_SIGNING_TEST_FAIL_WHEN_ACTIVE_EXISTS"
+
+  defp failure_environment_name("after-rename"),
+    do: "CURSOR_SIGNING_TEST_FAIL_AFTER_RENAME"
+
+  defp await_file!(path, attempts \\ 1_000)
+
+  defp await_file!(_path, 0), do: raise("cursor filesystem boundary timeout")
+
+  defp await_file!(path, attempts) do
+    if File.exists?(path) do
+      :ok
+    else
+      Process.sleep(10)
+      await_file!(path, attempts - 1)
+    end
   end
 
   defp await_marker_count!(control_dir, prefix, expected, attempts \\ 1_000)
@@ -469,5 +597,43 @@ defmodule Tightbeam.CursorSigningTest do
     elixir = System.find_executable("elixir") || raise "elixir is unavailable"
 
     System.cmd(elixir, code_paths ++ ["-e", script | arguments], stderr_to_stdout: true)
+  end
+
+  defp external_instrumented_elixir(script, arguments, environment) do
+    root = :code.root_dir() |> List.to_string()
+    erts_version = :erlang.system_info(:version) |> List.to_string()
+    executable = Path.join([root, "erts-#{erts_version}", "bin", "beam.smp"])
+    bindir = Path.dirname(executable)
+    elixir_root = :code.lib_dir(:elixir) |> List.to_string()
+
+    code_paths =
+      :code.get_path()
+      |> Enum.map(&List.to_string/1)
+      |> Enum.flat_map(&["-pa", &1])
+
+    runtime_arguments =
+      [
+        "--",
+        "-root",
+        root,
+        "-bindir",
+        bindir,
+        "-progname",
+        "erl",
+        "--",
+        "-noshell",
+        "-elixir_root",
+        elixir_root,
+        "-pa",
+        Path.join(elixir_root, "ebin"),
+        "-s",
+        "elixir",
+        "start_cli",
+        "--",
+        "--",
+        "-extra"
+      ] ++ code_paths ++ ["-e", script | arguments]
+
+    System.cmd(executable, runtime_arguments, stderr_to_stdout: true, env: environment)
   end
 end
