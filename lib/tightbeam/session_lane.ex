@@ -88,6 +88,17 @@ defmodule Tightbeam.SessionLane do
     end
   end
 
+  @doc "Release a lane after another component durably terminalized its exact running turn."
+  @spec release_terminalized(String.t(), integer()) :: :ok | :not_running | :no_lane
+  def release_terminalized(session_key, seq) do
+    case Registry.lookup(Tightbeam.LaneRegistry, session_key) do
+      [{pid, _}] -> GenServer.call(pid, {:release_terminalized, seq}, :infinity)
+      [] -> :no_lane
+    end
+  rescue
+    ArgumentError -> :no_lane
+  end
+
   @doc """
   Run `fun` at a turn boundary, or refuse — the lane IS the serialization point.
 
@@ -152,6 +163,21 @@ defmodule Tightbeam.SessionLane do
         {:reply, :not_running, state}
     end
   end
+
+  def handle_call(
+        {:release_terminalized, seq},
+        _from,
+        %{current_seq: seq, task_ref: ref} = state
+      )
+      when not is_nil(ref) do
+    publish_terminal(state, seq)
+    state.on_terminal.(state.session_key, seq)
+    if is_pid(state.task_pid), do: Process.exit(state.task_pid, :kill)
+    {:reply, :ok, state}
+  end
+
+  def handle_call({:release_terminalized, _seq}, _from, state),
+    do: {:reply, :not_running, state}
 
   def handle_call({:at_turn_boundary, _fun}, _from, %{task_ref: ref} = state)
       when not is_nil(ref),

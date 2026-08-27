@@ -160,6 +160,7 @@ defmodule Tightbeam.Gateway do
     # Recover durable liveness before any runtime child can consume wakes or
     # accept traffic. The Supervision child skips its duplicate recovery below.
     :ok = Supervision.recover_liveness!(db, config.wake_tick_ms)
+    :ok = Tightbeam.CredentialRecovery.recover(db)
 
     gateway_path = Path.join(config.base_dir, "gateway.json")
 
@@ -186,10 +187,19 @@ defmodule Tightbeam.Gateway do
     on_terminal = fn session_key, seq ->
       Tightbeam.Productions.BubbleSweeper.recognize(seq)
       Supervision.notify_terminal(session_key, seq)
+
+      case Tightbeam.CredentialRecovery.turn_terminal(db, seq) do
+        {:ok, %{fire?: true}} ->
+          Wakes.fire_due(config[:wake_scheduler] || Tightbeam.WakeScheduler)
+
+        _ ->
+          :ok
+      end
     end
 
     on_retired = fn session_key ->
       Supervision.notify_retired(session_key)
+      Tightbeam.CredentialRecovery.session_retired(db, session_key)
     end
 
     handler_table =
@@ -307,7 +317,8 @@ defmodule Tightbeam.Gateway do
          deliver: deliver,
          internal_consumers: %{
            "effort_probe" => &EffortCheckin.probe(db, config, &1),
-           "effort_deadline" => &EffortCheckin.deadline(db, config, &1)
+           "effort_deadline" => &EffortCheckin.deadline(db, config, &1),
+           "credential_recovery_retry" => &Tightbeam.CredentialRecovery.retry_due(db, &1)
          },
          tick_ms: config.wake_tick_ms,
          name: Tightbeam.WakeScheduler},
@@ -1003,6 +1014,7 @@ defmodule Tightbeam.Gateway do
           )
         end),
       {"onboard", []} => admin_call_handler(db, fn call -> onboard_result(config, call) end),
+      {"credential-recovery", []} => fn call -> credential_recovery_result(db, call) end,
       {"promote-user", ["user.promoted"]} =>
         admin_call_handler(db, fn call ->
           result = Devices.promote_user_with_firehose(db, call.params.user_id, call)
@@ -1631,12 +1643,17 @@ defmodule Tightbeam.Gateway do
 
     case delivery_target(txn, session_key, opts[:target_gate]) do
       nil ->
+        Tightbeam.CredentialRecovery.unavailable_in_txn(txn, opts[:wake_id])
         cancel_unavailable_supervision_controller_in_txn(txn, opts, session_key)
         :skipped
 
       {target, role_ref, role_fallback} when not is_nil(target) ->
-        case resolve_reply_target(txn, target, opts) do
-          {:ok, reply_target} ->
+        case {Tightbeam.CredentialRecovery.admissible_in_txn(txn, opts[:wake_id]),
+              resolve_reply_target(txn, target, opts)} do
+          {false, _reply_target} ->
+            :skipped
+
+          {true, {:ok, reply_target}} ->
             if Ledger.enqueueable_in_txn?(txn, target) do
               case admit_supervision_controller_in_txn(txn, opts, target) do
                 :canceled ->
@@ -1670,7 +1687,7 @@ defmodule Tightbeam.Gateway do
               end
             end
 
-          :error ->
+          {true, :error} ->
             :invalid_reply_reference
         end
     end
@@ -1722,6 +1739,7 @@ defmodule Tightbeam.Gateway do
           case enqueued do
             {:ok, seq} ->
               settle_supervision_controller_in_txn(txn, opts, target, seq)
+              Tightbeam.CredentialRecovery.admit_in_txn(txn, opts[:wake_id], seq)
               fire_wake_in_txn(txn, opts)
 
               # Nag-by-re-arm: a bracket wake that just fired re-arms its
@@ -4212,19 +4230,73 @@ defmodule Tightbeam.Gateway do
   end
 
   defp onboard_phase(config, provider, "finish", machine, kind, lease_id, _reason, caller) do
-    case Tightbeam.Credentials.finish_onboard(
-           provider,
-           kind,
-           lease_id,
-           Tightbeam.Credentials.server(machine)
-         ) do
-      :ok ->
-        finish_onboard_result(config, caller, provider, machine, kind)
+    db = gateway_db(config)
+    principal = onboarding_principal(caller)
+
+    case Tightbeam.CredentialRecovery.prepare(db, machine, provider, kind, principal: principal) do
+      {:ok, activation} ->
+        recovery_edge = fn edge -> recovery_edge(db, activation.activation_id, edge) end
+
+        case Tightbeam.Credentials.finish_onboard(
+               provider,
+               kind,
+               lease_id,
+               [recovery_edge: recovery_edge],
+               Tightbeam.Credentials.server(machine)
+             ) do
+          {:ok, adapter_generations} ->
+            case Tightbeam.CredentialRecovery.mark_ready(
+                   db,
+                   activation.activation_id,
+                   adapter_generations
+                 ) do
+              {:ok, :ok} ->
+                finish_onboard_result(
+                  config,
+                  provider,
+                  machine,
+                  kind,
+                  activation,
+                  adapter_generations
+                )
+
+              {:error, reason} ->
+                %{
+                  code: "credential_recovered_recovery_plan_failed",
+                  message:
+                    "#{provider} #{kind} credential on #{machine} recovered, but activation readiness could not commit: #{describe_error(reason)}",
+                  provider: provider,
+                  host: machine,
+                  credential_recovered: true,
+                  adapters_ready: true,
+                  recovery_started: false,
+                  recovery: %{activation_id: activation.activation_id, state: "adapter_started"}
+                }
+            end
+
+          {:error, reason} ->
+            Tightbeam.CredentialRecovery.fail(db, activation.activation_id, reason)
+
+            %{
+              code: "credential_activation_failed",
+              message: "#{provider} #{kind} credential on #{machine}: #{inspect(reason)}",
+              provider: provider,
+              host: machine,
+              credential_recovered: false,
+              adapters_ready: false,
+              recovery_started: false,
+              recovery: %{activation_id: activation.activation_id, state: "failed"}
+            }
+        end
 
       {:error, reason} ->
         %{
-          code: "needs_onboarding",
-          message: "#{provider} #{kind} credential on #{machine}: #{inspect(reason)}"
+          code: "credential_activation_failed",
+          message:
+            "#{provider} #{kind} credential on #{machine}: recovery prepare failed: #{describe_error(reason)}",
+          provider: provider,
+          host: machine,
+          credential_recovered: false
         }
     end
   end
@@ -4244,76 +4316,178 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp finish_onboard_result(config, caller, provider, machine, :subscription)
-       when provider in [:openai, :anthropic] do
-    case schedule_oauth_recovery_wake(config, caller, provider, machine) do
-      :ok ->
-        onboarded_result(provider, :subscription)
+  defp finish_onboard_result(
+         config,
+         provider,
+         machine,
+         kind,
+         activation,
+         adapter_generations
+       ) do
+    db = gateway_db(config)
+
+    case Tightbeam.CredentialRecovery.activation_ready(
+           db,
+           activation.activation_id,
+           adapter_generations
+         ) do
+      {:ok, recovery} ->
+        case Tightbeam.CredentialRecovery.reconcile_ready_activation(
+               db,
+               activation.activation_id
+             ) do
+          {:ok, reconciliation} ->
+            if recovery.state != "complete" do
+              Wakes.fire_due(Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler))
+            end
+
+            onboarded_result(provider, kind)
+            |> Map.merge(%{
+              code:
+                if(recovery.state == "complete",
+                  do: "credential_recovery_complete",
+                  else: "credential_recovery_in_progress"
+                ),
+              host: machine,
+              credential_recovered: true,
+              adapters_ready: true,
+              recovery_started: true,
+              recovery: Map.merge(recovery, reconciliation)
+            })
+
+          {:error, reason} ->
+            case Tightbeam.CredentialRecovery.defer_reconciliation(
+                   db,
+                   activation.activation_id,
+                   reason
+                 ) do
+              {:ok, :ok} ->
+                onboarded_result(provider, kind)
+                |> Map.merge(%{
+                  code: "credential_recovery_reconciliation_retrying",
+                  host: machine,
+                  credential_recovered: true,
+                  adapters_ready: true,
+                  recovery_started: true,
+                  recovery:
+                    Map.merge(recovery, %{
+                      failure: inspect(reason),
+                      attempt: 1,
+                      reconciliation_counts:
+                        Tightbeam.CredentialRecovery.reconciliation_counts(
+                          db,
+                          activation.activation_id
+                        )
+                    })
+                })
+
+              {:error, retry_reason} ->
+                Tightbeam.CredentialRecovery.fail(
+                  db,
+                  activation.activation_id,
+                  {:reconciliation_retry_plan_failed, retry_reason}
+                )
+
+                %{
+                  code: "credential_recovered_recovery_plan_failed",
+                  provider: provider,
+                  host: machine,
+                  credential_recovered: true,
+                  adapters_ready: true,
+                  recovery_started: true,
+                  recovery: %{activation_id: activation.activation_id, state: "failed"},
+                  message: describe_error(retry_reason)
+                }
+            end
+        end
 
       {:error, reason} ->
         %{
-          code: "credential_recovered_wake_failed",
+          code: "credential_recovered_recovery_plan_failed",
           message:
-            "#{provider} subscription credential on #{machine} recovered, but its Main " <>
-              "recovery wake could not be scheduled: #{describe_error(reason)}",
+            "#{provider} #{kind} credential on #{machine} recovered, but its recovery plan could not commit: #{describe_error(reason)}",
           provider: provider,
           host: machine,
+          credential_kind: wire_credential_kind(kind),
           credential_recovered: true,
-          wake_scheduled: false
+          adapters_ready: true,
+          recovery_started: false,
+          recovery: %{
+            activation_id: activation.activation_id,
+            generation: activation.generation,
+            state: "activation_ready"
+          }
         }
     end
   end
-
-  defp finish_onboard_result(_config, _caller, provider, _machine, :subscription),
-    do: onboarded_result(provider, :subscription)
-
-  defp finish_onboard_result(_config, _caller, provider, _machine, :api_key),
-    do: onboarded_result(provider, :api_key)
 
   # The result the CLI prints names the kind that was banked in the wire
   # vocabulary. `wire_credential_kind/1` is the single translation boundary.
   defp onboarded_result(provider, kind),
     do: %{provider: provider, credential_kind: wire_credential_kind(kind), status: "onboarded"}
 
-  # OAuth recovery is one neutral event instruction to the authenticated
-  # operator's native Main. Main, not the credential substrate, reads Kung Fu
-  # manifests and selects live agents. API-key completion never reaches here.
-  defp schedule_oauth_recovery_wake(
-         config,
-         %{owner_user_id: owner},
-         provider,
-         machine
-       )
-       when is_binary(owner) do
-    prompt =
-      "The OAuth token for #{provider} on #{machine} was refreshed. " <>
-        "Read the manifests for every installed or learned Kung Fu. " <>
-        "Read each manifest's declared main archetype. " <>
-        "Find live agents with those archetypes. " <>
-        "Notify each that the OAuth token was refreshed, and require each to inspect and " <>
-        "resume any stalled agent graph."
-
-    case DB.transaction(gateway_db(config), fn txn ->
-           Wakes.schedule_in_txn(txn, %{
-             session_key: Org.personal_session_key(owner),
-             origin: "process:tightbeam",
-             prompt: prompt,
-             consumer: "prompt",
-             due_at: System.system_time(:millisecond),
-             target_gate: 1
-           })
-         end) do
-      {:ok, _wake} ->
-        Wakes.fire_due(Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler))
-        :ok
-
-      {:error, reason} ->
-        {:error, reason}
+  defp recovery_edge(db, activation_id, edge) do
+    case Tightbeam.CredentialRecovery.edge(db, activation_id, edge) do
+      {:ok, :ok} -> :ok
+      {:error, reason} -> {:error, {:credential_recovery_edge_failed, edge, reason}}
     end
   end
 
-  defp schedule_oauth_recovery_wake(_config, _caller, _provider, _machine),
-    do: {:error, :authenticated_operator_unavailable}
+  defp onboarding_principal(%{caller_session: %{session_key: session_key}}),
+    do: "session:#{session_key}"
+
+  defp onboarding_principal(%{owner_user_id: owner}) when is_binary(owner), do: "user:#{owner}"
+  defp onboarding_principal(_caller), do: "process:tightbeam"
+
+  defp credential_recovery_result(db, call) do
+    activation_id = call.params[:activation_id]
+    principal = identity_query_principal(db, call)
+
+    cond do
+      not (is_binary(activation_id) and activation_id != "") ->
+        %{code: "invalid", message: "activationId is required"}
+
+      credential_recovery_readable?(db, activation_id, principal) ->
+        case Tightbeam.CredentialRecovery.readback(db, activation_id) do
+          nil -> %{code: "not_found", message: "credential recovery activation not found"}
+          readback -> %{recovery: readback}
+        end
+
+      true ->
+        %{
+          code: "forbidden",
+          message: "credential recovery readback is not visible to this principal"
+        }
+    end
+  end
+
+  defp credential_recovery_readable?(db, activation_id, principal) do
+    principal_binding_admin?(db, principal) or
+      case principal do
+        {:session, session_key} ->
+          match?(
+            {:ok, [[1]]},
+            DB.query(
+              db,
+              "SELECT 1 FROM credential_recovery_memberships WHERE activationId=?1 AND sessionKey=?2 LIMIT 1",
+              [activation_id, session_key]
+            )
+          )
+
+        {:user, user_id} ->
+          match?(
+            {:ok, [[1]]},
+            DB.query(
+              db,
+              "SELECT 1 FROM credential_recovery_activations WHERE activationId=?1 AND principal=?2 LIMIT 1",
+              [activation_id, "user:#{user_id}"]
+            )
+          )
+
+        _ ->
+          false
+      end
+  end
 
   defp onboarding_caller(_db, %{principal: {:user, owner}}) when is_binary(owner),
     do: %{owner_user_id: owner, caller_session: nil}
@@ -7083,8 +7257,8 @@ defmodule Tightbeam.Gateway do
                key,
                credential_kind: kind
              ) do
-          {:ok, _pid, _generation} ->
-            {[module.wire_name() | started], failed}
+          {:ok, _pid, generation} ->
+            {[{module.wire_name(), generation} | started], failed}
 
           {:error, reason} ->
             {started, [%{harness: module.wire_name(), reason: reason} | failed]}
@@ -7093,11 +7267,12 @@ defmodule Tightbeam.Gateway do
 
     case Enum.reverse(failed) do
       [] ->
-        :ok
+        {:ok, Map.new(started)}
 
       failed ->
         {:error,
-         {:provider_runtime_start_failed, %{started: Enum.reverse(started), failed: failed}}}
+         {:provider_runtime_start_failed,
+          %{started: started |> Enum.reverse() |> Enum.map(&elem(&1, 0)), failed: failed}}}
     end
   end
 

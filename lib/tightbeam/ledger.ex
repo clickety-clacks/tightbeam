@@ -536,17 +536,48 @@ defmodule Tightbeam.Ledger do
                 at: now
               })
 
-              Publisher.turn_in_txn(txn, "turn.started", seq)
+              case Tightbeam.CredentialRecovery.claim_in_txn(txn, wake_id, seq) do
+                {:dispose, disposition} ->
+                  true =
+                    finish_in_txn(
+                      txn,
+                      seq,
+                      "canceled",
+                      "credential recovery target #{disposition} before inference",
+                      cause: "credential-recovery-claim-disposition",
+                      principal: "process:tightbeam",
+                      owner_lease: owner_lease
+                    )
 
-              {:ok,
-               %{
-                 seq: seq,
-                 message_id: message_id,
-                 origin: origin,
-                 prompt: prompt,
-                 wake_id: wake_id,
-                 owner_lease: owner_lease
-               }}
+                  :none
+
+                {:retry, reason} ->
+                  true =
+                    finish_in_txn(
+                      txn,
+                      seq,
+                      "failed",
+                      "credential recovery carrier could not claim: #{reason}",
+                      cause: "credential-recovery-claim-deferred",
+                      principal: "process:tightbeam",
+                      owner_lease: owner_lease
+                    )
+
+                  :none
+
+                _admitted_or_ordinary ->
+                  Publisher.turn_in_txn(txn, "turn.started", seq)
+
+                  {:ok,
+                   %{
+                     seq: seq,
+                     message_id: message_id,
+                     origin: origin,
+                     prompt: prompt,
+                     wake_id: wake_id,
+                     owner_lease: owner_lease
+                   }}
+              end
             else
               no_claim(txn, session_key)
             end
