@@ -920,6 +920,32 @@ defmodule Tightbeam.EscalationTest do
     assert ruled.ruling_fact_id > 0
   end
 
+  test "exact ruling replay validates a corrupt visible terminal row before parsing it", ctx do
+    request = Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "replay?"}))
+    call = owner_operator_rule(request.id, %{decision: "accept"})
+
+    assert %{status: "ruled"} = Escalation.operator_rule(ctx.db, call, scheduler: ctx.scheduler)
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE decision_requests SET options='not-json' WHERE id=?1", [
+               request.id
+             ])
+
+    request_id = request.id
+
+    assert %{code: "decision_request_integrity_invalid", request_id: ^request_id} =
+             Escalation.operator_rule(ctx.db, call, scheduler: ctx.scheduler)
+
+    assert {:ok, [[1, fields]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*),MIN(failingFields) FROM decision_request_integrity_evidence WHERE requestId=?1",
+               [request.id]
+             )
+
+    assert JSON.decode!(fields) == ["options"]
+  end
+
   test "integrity descriptor and digest are stable across private values and surfaces", ctx do
     requests =
       for question <- ["private alpha?", "private beta?"] do

@@ -1065,12 +1065,66 @@ defmodule Tightbeam.Escalation do
         {error("invalid", "effort requests use effort-rule"), nil}
 
       request ->
-        with :ok <- operator_owner_authorized(call, request),
-             {:ok, decision} <- operator_decision(request, answer) do
-          rule_operator_request_in_txn(txn, call, request, decision, answer, opts)
+        with :ok <- operator_owner_authorized(call, request) do
+          case request.status do
+            "ruled" ->
+              replay_operator_ruling_in_txn(txn, call, request, answer)
+
+            "consumed" ->
+              case validate_terminal_request_in_txn(txn, request) do
+                %{failures: []} ->
+                  {error("not_open", "decision request is not open"), nil}
+
+                validation ->
+                  {record_integrity_refusal_in_txn(
+                     txn,
+                     request.id,
+                     validation,
+                     :detail,
+                     observer_principal(call)
+                   ), nil}
+              end
+
+            "open" ->
+              with {:ok, decision} <- operator_decision(request, answer) do
+                rule_operator_request_in_txn(txn, call, request, decision, answer, opts)
+              else
+                {:error, reason} -> {reason, nil}
+              end
+
+            _terminal_or_closed ->
+              {error("not_open", "decision request is not open"), nil}
+          end
         else
           {:error, reason} -> {reason, nil}
         end
+    end
+  end
+
+  defp replay_operator_ruling_in_txn(txn, call, request, answer) do
+    case validate_terminal_request_in_txn(txn, request) do
+      %{failures: []} ->
+        ruled_by = "user:" <> request.owner_user_id
+
+        with {:ok, decision} <- operator_decision(request, answer) do
+          if request.decision == decision and request.rationale == answer.rationale and
+               request.ruled_by == ruled_by do
+            {terminal_projection(request), nil}
+          else
+            {error("not_open", "decision request is not open"), nil}
+          end
+        else
+          {:error, reason} -> {reason, nil}
+        end
+
+      validation ->
+        {record_integrity_refusal_in_txn(
+           txn,
+           request.id,
+           validation,
+           :detail,
+           observer_principal(call)
+         ), nil}
     end
   end
 

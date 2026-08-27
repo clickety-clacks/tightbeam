@@ -352,6 +352,13 @@ defmodule Tightbeam.EscalationDeliveryTest do
                sender: synthetic.origin
              )
 
+    assert :duplicate =
+             Gateway.deliver_prompt(synthetic.session_key, synthetic.origin, synthetic.prompt,
+               db: ctx.db,
+               wake_id: synthetic.wake_id,
+               sender: synthetic.origin
+             )
+
     assert Wakes.get(ctx.db, synthetic.wake_id).state == "pending"
     assert count(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId = ?1", [synthetic.wake_id]) == 1
 
