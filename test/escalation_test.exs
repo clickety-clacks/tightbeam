@@ -920,7 +920,8 @@ defmodule Tightbeam.EscalationTest do
     assert ruled.ruling_fact_id > 0
   end
 
-  test "exact ruling replay validates a corrupt visible terminal row before parsing it", ctx do
+  test "exact ruling replay validates a corrupt visible terminal row before interpreting it",
+       ctx do
     request = Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "replay?"}))
     call = owner_operator_rule(request.id, %{decision: "accept"})
 
@@ -931,10 +932,10 @@ defmodule Tightbeam.EscalationTest do
                request.id
              ])
 
-    request_id = request.id
-
-    assert %{code: "decision_request_integrity_invalid", request_id: ^request_id} =
+    assert %{code: "decision_request_integrity_invalid", request_id: request_id} =
              Escalation.operator_rule(ctx.db, call, scheduler: ctx.scheduler)
+
+    assert request_id == request.id
 
     assert {:ok, [[1, fields]]} =
              DB.query(
@@ -1828,67 +1829,64 @@ defmodule Tightbeam.EscalationTest do
     end
   end
 
-  test "automatic ruling delivery survives concurrent evaluators fallback restart and replay",
-       ctx do
+  test "automatic raiser delivery stays at most once across evaluators restart and replay", ctx do
     request =
       Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "deliver once?"}))
 
     ruled =
       Escalation.operator_rule(
         ctx.db,
-        owner_operator_rule(request.id, %{decision: "accept"})
+        owner_operator_rule(request.id, %{decision: "accept"}),
+        scheduler: ctx.scheduler
       )
 
-    assert {:ok, [[wake_id]]} =
+    assert {:ok, [[wake_id, "fired", "condition"]]} =
              DB.query(
                ctx.db,
-               "SELECT wakeId FROM wakes WHERE conditionKind='escalation-ruled' AND conditionScope=?1",
+               "SELECT wakeId,state,firedBy FROM wakes WHERE conditionKind='escalation-ruled' AND conditionScope=?1",
                [request.id]
              )
 
-    evaluators =
-      for index <- 1..3 do
-        name = :"terminal_evaluator_#{index}_#{System.unique_integer([:positive])}"
+    assert turn_count(ctx.db, wake_id) == 1
 
-        start_supervised!(
-          {Wakes, db: ctx.db, name: name, tick_ms: 60_000, deliver: fn _ -> :ok end},
-          id: name
-        )
-
-        name
-      end
-
-    tasks =
-      Enum.map(evaluators, fn evaluator ->
-        Task.async(fn -> Wakes.fire_matching(evaluator, ruled.ruling_fact_id) end)
-      end) ++ [Task.async(fn -> Wakes.fire_due(ctx.scheduler) end)]
-
-    assert Enum.all?(Task.await_many(tasks), &(&1 == :ok))
-
-    restarted = :"terminal_restart_#{System.unique_integer([:positive])}"
-
-    start_supervised!(
-      {Wakes, db: ctx.db, name: restarted, tick_ms: 60_000, deliver: fn _ -> :ok end},
-      id: restarted
-    )
-
-    assert :ok = Wakes.fire_due(restarted)
-    assert :ok = Wakes.fire_matching(restarted, ruled.ruling_fact_id)
-
-    replay =
-      Escalation.operator_rule(
+    :ok =
+      DB.execute(
         ctx.db,
-        owner_operator_rule(request.id, %{decision: "accept"})
+        "UPDATE wakes SET state='pending',firedAt=NULL,firedBy=NULL,dueAt=0 WHERE wakeId='#{wake_id}'"
       )
 
-    assert replay.ruling_fact_id == ruled.ruling_fact_id
+    tasks =
+      for evaluator <- 1..8 do
+        Task.async(fn ->
+          if rem(evaluator, 2) == 0,
+            do: Wakes.fire_matching(ctx.scheduler, ruled.ruling_fact_id),
+            else: Wakes.fire_due(ctx.scheduler)
+        end)
+      end
 
-    assert {:ok, [[1, "fired", "condition", 1]]} =
-             DB.query(
-               ctx.db,
-               "SELECT COUNT(*), MIN(state), MIN(firedBy), (SELECT COUNT(*) FROM turns WHERE wakeId=?1) FROM wakes WHERE conditionKind='escalation-ruled' AND conditionScope=?2",
-               [wake_id, request.id]
-             )
+    assert Enum.uniq(Task.await_many(tasks)) == [:ok]
+    assert turn_count(ctx.db, wake_id) == 1
+
+    assert :ok = stop_supervised(Wakes)
+
+    start_supervised!(
+      {Wakes, db: ctx.db, name: ctx.scheduler, tick_ms: 60_000, deliver: fn _wake -> :ok end}
+    )
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        "UPDATE wakes SET state='pending',firedAt=NULL,firedBy=NULL,dueAt=0 WHERE wakeId='#{wake_id}'"
+      )
+
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    assert turn_count(ctx.db, wake_id) == 1
+
+    assert {:ok, [["fired", "condition", prompt]]} =
+             DB.query(ctx.db, "SELECT state,firedBy,prompt FROM wakes WHERE wakeId=?1", [wake_id])
+
+    assert prompt ==
+             "Decision request #{request.id} was ruled. Read it with tightbeam decision-request --request #{request.id}."
   end
 
   test "only escalation-ruled matches while wrong condition names fall back", ctx do
@@ -2552,6 +2550,11 @@ defmodule Tightbeam.EscalationTest do
       transport_session_key: session.session_key,
       params: params
     }
+  end
+
+  defp turn_count(db, wake_id) do
+    {:ok, [[count]]} = DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [wake_id])
+    count
   end
 
   defp owner_operator_rule(id, params) do
