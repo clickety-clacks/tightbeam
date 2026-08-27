@@ -479,6 +479,109 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
              )
   end
 
+  test "a reconciliation-only retry closes its old attempt before the later cycle carrier",
+       ctx do
+    start_credentials!(ctx)
+    scheduler = start_real_scheduler!(ctx)
+    handler = onboard_handler(ctx, scheduler)
+    first = finish_fresh(handler, "subscription")
+
+    assert {:ok, %{seq: carrier_seq, owner_lease: owner_lease}} =
+             Ledger.claim_next(ctx.db, @main, "generation-one-carrier")
+
+    now = System.system_time(:millisecond)
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO turn_lifecycle_events
+                 (turnSeq,ordinal,at,eventKey,kind,outcome,cause,principal,ownerLease,
+                  producerEventId,detail)
+               VALUES (?1,(SELECT COALESCE(MAX(ordinal),0)+1 FROM turn_lifecycle_events WHERE turnSeq=?1),
+                       ?2,'prompt:dispatched','prompt_dispatched','dispatched',
+                       'test:prompt-admission','process:tightbeam',?3,
+                       'test:prompt-dispatched','{\"v\":1}')
+               """,
+               [carrier_seq, now, owner_lease]
+             )
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        """
+        CREATE TRIGGER force_claimed_reconciliation_failure
+        BEFORE INSERT ON turn_lifecycle_events
+        WHEN NEW.kind='terminal_committed'
+        BEGIN
+          SELECT RAISE(ABORT, 'forced claimed reconciliation failure');
+        END;
+        """
+      )
+
+    second = finish_fresh(handler, "subscription")
+    assert %{code: "credential_recovery_reconciliation_retrying"} = second
+    :ok = DB.execute(ctx.db, "DROP TRIGGER force_claimed_reconciliation_failure")
+
+    assert {:ok, [[target_id, retry_wake_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT t.targetId,w.wakeId FROM credential_recovery_targets t JOIN wakes w ON w.conditionScope=t.targetId WHERE w.consumer='credential_recovery_retry' AND w.state='pending'"
+             )
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "UPDATE credential_recovery_targets SET dueAt=0 WHERE targetId=?1",
+               [
+                 target_id
+               ]
+             )
+
+    assert {:ok, :ok} =
+             CredentialRecovery.retry_due(ctx.db, %{
+               condition_scope: target_id,
+               prompt: target_id,
+               wake_id: retry_wake_id
+             })
+
+    assert {:ok, [["pending", 1, "not_admitted_cycle_closed", 0]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT state,attempt,attemptState,
+                      (SELECT COUNT(*) FROM wakes WHERE consumer='prompt' AND state='pending')
+               FROM credential_recovery_targets WHERE targetId=?1
+               """,
+               [target_id]
+             )
+
+    assert {:ok, %{fire?: true, state: "pending"}} =
+             CredentialRecovery.turn_terminal(ctx.db, carrier_seq)
+
+    assert %{
+             targets: [
+               %{cycle: 2, attempt: 0, attempt_state: "materialized", state: "pending"}
+             ]
+           } = CredentialRecovery.readback(ctx.db, second.recovery.activation_id)
+
+    assert %{state: "complete", targets: [%{resolution: "undeliverable"}]} =
+             CredentialRecovery.readback(ctx.db, first.recovery.activation_id)
+
+    assert {:ok, [[1, 1]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT
+                 (SELECT COUNT(*) FROM wakes WHERE consumer='prompt' AND state='pending'),
+                 (SELECT COUNT(*) FROM credential_recovery_transition_audit
+                  WHERE kind='credential_recovery_attempt_not_admitted_cycle_closed'
+                    AND causeKind='turn_terminal' AND causeRowId=?1)
+               """,
+               [to_string(carrier_seq)]
+             )
+  end
+
   test "attempt three marks pending reconciliation failed before terminalizing its target", ctx do
     start_credentials!(ctx)
 
@@ -887,8 +990,7 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
     assert %{state: "failed", failure: failure} =
              CredentialRecovery.readback(ctx.db, interrupted.activation_id)
 
-    assert failure =~ "credential_activation_interrupted"
-    assert failure =~ "metadata_committed"
+    assert failure == "adapter_generations_missing_after_metadata_committed"
 
     assert {:ok, replayed} =
              CredentialRecovery.prepare(ctx.db, @host, :anthropic, :subscription)
@@ -916,6 +1018,158 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
            } = CredentialRecovery.readback(ctx.db, replayed.activation_id)
 
     assert_wake_count(ctx.db, 1)
+  end
+
+  test "boot replay continues metadata committed when persisted adapter state proves it",
+       ctx do
+    assert {:ok, activation} =
+             CredentialRecovery.prepare(ctx.db, @host, :anthropic, :subscription)
+
+    for edge <- [:credential_installed, :metadata_committed] do
+      assert {:ok, :ok} = CredentialRecovery.edge(ctx.db, activation.activation_id, edge)
+    end
+
+    assert {:ok, :ok} =
+             CredentialRecovery.edge(
+               ctx.db,
+               activation.activation_id,
+               {:adapter_generations, %{"claude" => 7}}
+             )
+
+    assert :ok = CredentialRecovery.recover(ctx.db)
+
+    assert %{
+             state: "recovering",
+             aggregate: "credential_recovery_in_progress",
+             targets: [%{resolution: "open", attempt_state: "materialized"}]
+           } = CredentialRecovery.readback(ctx.db, activation.activation_id)
+
+    assert {:ok,
+            [
+              ["credential_recovery_adapter_started"],
+              ["credential_recovery_activation_ready"],
+              ["credential_recovery_ready"]
+            ]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT kind FROM credential_recovery_transition_audit
+               WHERE subject=?1 AND kind IN (
+                 'credential_recovery_adapter_started',
+                 'credential_recovery_activation_ready',
+                 'credential_recovery_ready'
+               ) ORDER BY id
+               """,
+               [activation.activation_id]
+             )
+  end
+
+  test "a post-publication nil-generation claim receives a typed pre-inference refusal", ctx do
+    assert {:ok, activation} =
+             CredentialRecovery.prepare(ctx.db, @host, :anthropic, :subscription)
+
+    for edge <- [:credential_installed, :metadata_committed] do
+      assert {:ok, :ok} = CredentialRecovery.edge(ctx.db, activation.activation_id, edge)
+    end
+
+    assert {:ok, :ok} =
+             CredentialRecovery.edge(
+               ctx.db,
+               activation.activation_id,
+               {:adapter_generations, %{"claude" => 2}}
+             )
+
+    Process.sleep(2)
+
+    assert :appended =
+             Gateway.deliver_prompt(@main, "session:test", "post-publication work",
+               db: ctx.db,
+               conn_registry: ctx.registry,
+               lane_manager: ctx.lane
+             )
+
+    assert {:ok, %{seq: seq}} = Ledger.claim_next(ctx.db, @main, "post-publication-owner")
+
+    assert {:ok, :ok} =
+             CredentialRecovery.edge(ctx.db, activation.activation_id, :adapter_started)
+
+    assert {:ok, :ok} =
+             CredentialRecovery.mark_ready(ctx.db, activation.activation_id, %{"claude" => 2})
+
+    assert {:ok, %{state: "recovering"}} =
+             CredentialRecovery.activation_ready(
+               ctx.db,
+               activation.activation_id,
+               %{"claude" => 2}
+             )
+
+    assert {:ok, [["failed", nil, error, "not_required", nil]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT turns.status,turns.adapterGen,turns.error,
+                      m.reconciliationState,m.reconciliationTurnSeq
+               FROM turns
+               JOIN credential_recovery_memberships m ON m.sessionKey=turns.sessionKey
+               WHERE turns.seq=?1 AND m.activationId=?2
+               """,
+               [seq, activation.activation_id]
+             )
+
+    assert error =~ "generation_missing"
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE consumer='prompt' AND state='pending'"
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM credential_recovery_transition_audit WHERE kind='credential_recovery_generation_missing' AND causeKind='turn_claim' AND causeRowId=?1",
+               [to_string(seq)]
+             )
+  end
+
+  test "recovery transition audit records cause row and principal", ctx do
+    assert {:ok, activation} =
+             CredentialRecovery.prepare(ctx.db, @host, :anthropic, :subscription)
+
+    for edge <- [:credential_installed, :metadata_committed] do
+      assert {:ok, :ok} = CredentialRecovery.edge(ctx.db, activation.activation_id, edge)
+    end
+
+    assert {:ok, :ok} =
+             CredentialRecovery.edge(
+               ctx.db,
+               activation.activation_id,
+               {:adapter_generations, %{"claude" => 3}}
+             )
+
+    assert {:ok, :ok} =
+             CredentialRecovery.edge(ctx.db, activation.activation_id, :adapter_started)
+
+    assert {:ok, :ok} =
+             CredentialRecovery.mark_ready(ctx.db, activation.activation_id, %{"claude" => 3})
+
+    assert {:ok, %{state: "recovering"}} =
+             CredentialRecovery.activation_ready(
+               ctx.db,
+               activation.activation_id,
+               %{"claude" => 3}
+             )
+
+    assert {:ok, [[count, 0]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT COUNT(*),SUM(CASE WHEN causeKind='' OR causeRowId='' OR principal='' THEN 1 ELSE 0 END)
+               FROM credential_recovery_transition_audit
+               """
+             )
+
+    assert count >= 8
   end
 
   test "retirement before delivery durably dispositions the exact target", ctx do

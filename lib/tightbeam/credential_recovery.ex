@@ -38,6 +38,7 @@ defmodule Tightbeam.CredentialRecovery do
     completedAt INTEGER,
     failure TEXT,
     adapterGenerations TEXT,
+    adapterPublishedAt INTEGER,
     cause TEXT NOT NULL,
     principal TEXT NOT NULL,
     UNIQUE (host, provider, generation)
@@ -103,6 +104,19 @@ defmodule Tightbeam.CredentialRecovery do
   );
   CREATE INDEX IF NOT EXISTS credential_recovery_membership_target
     ON credential_recovery_memberships (targetId, generation, resolution);
+
+  CREATE TABLE IF NOT EXISTS credential_recovery_transition_audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    causeKind TEXT NOT NULL,
+    causeRowId TEXT NOT NULL,
+    principal TEXT NOT NULL,
+    detail TEXT
+  );
+  CREATE INDEX IF NOT EXISTS credential_recovery_transition_audit_subject
+    ON credential_recovery_transition_audit (subject, id);
   """
 
   def ensure_schema(db \\ Tightbeam.DB), do: DB.execute(db, @ddl)
@@ -116,6 +130,21 @@ defmodule Tightbeam.CredentialRecovery do
       )
 
     Enum.each(interrupted, fn
+      [activation_id, "metadata_committed", encoded_generations] ->
+        case JSON.decode(encoded_generations || "") do
+          {:ok, generations} when is_map(generations) and map_size(generations) > 0 ->
+            with {:ok, :ok} <- edge(db, activation_id, :adapter_started),
+                 {:ok, :ok} <- mark_ready(db, activation_id, generations) do
+              :ok
+            else
+              {:error, reason} ->
+                fail(db, activation_id, {:boot_metadata_committed_replay_failed, reason})
+            end
+
+          _ ->
+            fail(db, activation_id, :adapter_generations_missing_after_metadata_committed)
+        end
+
       [activation_id, "adapter_started", encoded_generations] ->
         case JSON.decode(encoded_generations || "") do
           {:ok, generations} when is_map(generations) ->
@@ -269,8 +298,8 @@ defmodule Tightbeam.CredentialRecovery do
     DB.transaction(db, fn txn ->
       Txn.q(
         txn,
-        "UPDATE credential_recovery_activations SET adapterGenerations=?2 WHERE activationId=?1 AND state='metadata_committed'",
-        [activation_id, encoded]
+        "UPDATE credential_recovery_activations SET adapterGenerations=?2,adapterPublishedAt=?3 WHERE activationId=?1 AND state='metadata_committed'",
+        [activation_id, encoded, now()]
       )
 
       if Txn.changes(txn) != 1,
@@ -288,12 +317,13 @@ defmodule Tightbeam.CredentialRecovery do
   def mark_ready(db, activation_id, adapter_generations) when is_map(adapter_generations) do
     affected_harnesses(adapter_generations)
     encoded = JSON.encode!(adapter_generations)
+    at = now()
 
     DB.transaction(db, fn txn ->
       Txn.q(
         txn,
-        "UPDATE credential_recovery_activations SET state='activation_ready',readyAt=?2,adapterGenerations=?3 WHERE activationId=?1 AND state='adapter_started'",
-        [activation_id, now(), encoded]
+        "UPDATE credential_recovery_activations SET state='activation_ready',readyAt=?2,adapterGenerations=?3,adapterPublishedAt=COALESCE(adapterPublishedAt,?2) WHERE activationId=?1 AND state='adapter_started'",
+        [activation_id, at, encoded]
       )
 
       if Txn.changes(txn) != 1,
@@ -335,25 +365,28 @@ defmodule Tightbeam.CredentialRecovery do
 
            sessions = affected_sessions(txn, host, provider, harnesses)
 
-           Enum.each(sessions, fn [session_key, harness] ->
-             adapter_generation = Map.fetch!(adapter_generations, harness)
-             target_id = target_id(host, provider, session_key)
+           releases =
+             Enum.flat_map(sessions, fn [session_key, harness] ->
+               adapter_generation = Map.fetch!(adapter_generations, harness)
+               target_id = target_id(host, provider, session_key)
 
-             ensure_target(txn, target_id, host, provider, session_key, generation, at)
+               ensure_target(txn, target_id, host, provider, session_key, generation, at)
 
-             ensure_membership(
-               txn,
-               activation_id,
-               target_id,
-               session_key,
-               host,
-               harness,
-               generation,
-               adapter_generation
-             )
+               release =
+                 ensure_membership(
+                   txn,
+                   activation_id,
+                   target_id,
+                   session_key,
+                   host,
+                   harness,
+                   generation,
+                   adapter_generation
+                 )
 
-             materialize_if_needed(txn, activation_id, target_id)
-           end)
+               materialize_if_needed(txn, activation_id, target_id)
+               if release, do: [release], else: []
+             end)
 
            state = if sessions == [], do: "complete", else: "recovering"
            completed_at = if state == "complete", do: at, else: nil
@@ -379,11 +412,19 @@ defmodule Tightbeam.CredentialRecovery do
                  do: "credential_recovery_complete",
                  else: "credential_recovery_in_progress"
                ),
-             target_count: length(sessions)
+             target_count: length(sessions),
+             releases: releases
            }
          end) do
-      {:ok, result} -> {:ok, result}
-      {:error, reason} -> {:error, {:recovery_publication_failed, reason}}
+      {:ok, %{releases: releases} = result} ->
+        Enum.each(releases, fn %{session_key: session_key, seq: seq} ->
+          SessionLane.release_terminalized(session_key, seq)
+        end)
+
+        {:ok, Map.delete(result, :releases)}
+
+      {:error, reason} ->
+        {:error, {:recovery_publication_failed, reason}}
     end
   end
 
@@ -945,7 +986,12 @@ defmodule Tightbeam.CredentialRecovery do
          generation,
          adapter_generation
        ) do
-    {reconciliation, turn_seq} = prior_running(txn, session_key, adapter_generation)
+    {reconciliation, turn_seq, release} =
+      case prior_running(txn, activation_id, session_key, adapter_generation) do
+        {:pending, seq} -> {"pending", seq, nil}
+        {:generation_missing, seq} -> {"not_required", nil, %{session_key: session_key, seq: seq}}
+        :not_required -> {"not_required", nil, nil}
+      end
 
     [[cycle]] =
       Txn.q(txn, "SELECT cycle FROM credential_recovery_targets WHERE targetId=?1", [target_id])
@@ -973,34 +1019,76 @@ defmodule Tightbeam.CredentialRecovery do
         @process
       ]
     )
+
+    if release do
+      [[owner_lease]] =
+        Txn.q(
+          txn,
+          "SELECT ownerLease FROM turn_lifecycle_events WHERE turnSeq=?1 AND kind='claimed' ORDER BY ordinal DESC LIMIT 1",
+          [release.seq]
+        )
+
+      true =
+        Ledger.finish_in_txn(
+          txn,
+          release.seq,
+          "failed",
+          "generation_missing: adapter generation was not stamped before inference",
+          cause: "credential-recovery-generation-missing",
+          principal: @process,
+          owner_lease: owner_lease
+        )
+
+      audit(
+        txn,
+        "credential_recovery_generation_missing",
+        target_id,
+        "turnSeq=#{release.seq}",
+        "turn_claim",
+        to_string(release.seq)
+      )
+    end
+
+    release
   end
 
-  defp prior_running(txn, session_key, adapter_generation) do
+  defp prior_running(txn, activation_id, session_key, adapter_generation) do
     case Txn.q(
            txn,
            """
-           SELECT turns.seq,turns.adapterGen
+           SELECT turns.seq,turns.adapterGen,
+                  (SELECT at FROM turn_lifecycle_events
+                   WHERE turnSeq=turns.seq AND kind='claimed'
+                   ORDER BY ordinal DESC LIMIT 1),
+                  (SELECT adapterPublishedAt FROM credential_recovery_activations
+                   WHERE activationId=?2)
            FROM turns WHERE sessionKey=?1 AND status='running' ORDER BY seq LIMIT 1
            """,
-           [session_key]
+           [session_key, activation_id]
          ) do
-      [[seq, generation]] when is_integer(generation) and generation < adapter_generation ->
-        {"pending", seq}
+      [[seq, generation, _claimed_at, _published_at]]
+      when is_integer(generation) and generation < adapter_generation ->
+        {:pending, seq}
 
-      [[seq, nil]] ->
-        {"pending", seq}
+      [[seq, nil, claimed_at, published_at]]
+      when is_integer(claimed_at) and is_integer(published_at) and claimed_at <= published_at ->
+        {:pending, seq}
+
+      [[seq, nil, claimed_at, published_at]]
+      when is_integer(claimed_at) and is_integer(published_at) and claimed_at > published_at ->
+        {:generation_missing, seq}
 
       _ ->
-        {"not_required", nil}
+        :not_required
     end
   end
 
   defp reconcile_target(db, target_id) do
     case DB.transaction(db, fn txn ->
-           [[session_key, state, cycle, attempt, due_at, required_generation]] =
+           [[session_key, state, cycle, attempt, due_at, required_generation, carrier_turn_seq]] =
              Txn.q(
                txn,
-               "SELECT sessionKey,state,cycle,attempt,dueAt,requiredGeneration FROM credential_recovery_targets WHERE targetId=?1",
+               "SELECT sessionKey,state,cycle,attempt,dueAt,requiredGeneration,turnSeq FROM credential_recovery_targets WHERE targetId=?1",
                [target_id]
              )
 
@@ -1040,7 +1128,34 @@ defmodule Tightbeam.CredentialRecovery do
                [target_id, required_generation, now()]
              )
 
-             materialize_if_needed(txn, nil, target_id)
+             terminalized_claim? =
+               is_integer(carrier_turn_seq) and
+                 Enum.any?(releases, &(&1.terminalized? and &1.seq == carrier_turn_seq))
+
+             if terminalized_claim? do
+               Txn.q(
+                 txn,
+                 "UPDATE credential_recovery_targets SET attemptState='not_admitted_cycle_closed',updatedAt=?3 WHERE targetId=?1 AND cycle=?2 AND state='pending' AND attemptState='reserved' AND wakeId IS NULL",
+                 [target_id, cycle, now()]
+               )
+
+               cause_turn =
+                 Enum.find_value(releases, fn release ->
+                   if release.terminalized? and release.seq == carrier_turn_seq,
+                     do: to_string(release.seq)
+                 end)
+
+               audit(
+                 txn,
+                 "credential_recovery_attempt_not_admitted_cycle_closed",
+                 target_id,
+                 "cycle=#{cycle} attempt=#{attempt}",
+                 "turn_terminal",
+                 cause_turn
+               )
+             else
+               materialize_if_needed(txn, nil, target_id)
+             end
 
              %{
                state: state,
@@ -1719,8 +1834,25 @@ defmodule Tightbeam.CredentialRecovery do
     |> binary_part(0, 24)
   end
 
-  defp audit(txn, kind, subject, detail),
-    do: EventLog.lifecycle_in_txn(txn, kind, subject, detail)
+  defp audit(
+         txn,
+         kind,
+         subject,
+         detail,
+         cause_kind \\ "recovery_transition",
+         cause_row_id \\ nil,
+         principal \\ @process
+       ) do
+    cause_row_id = cause_row_id || subject
+
+    Txn.q(
+      txn,
+      "INSERT INTO credential_recovery_transition_audit (ts,kind,subject,causeKind,causeRowId,principal,detail) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+      [now(), kind, subject, cause_kind, to_string(cause_row_id), principal, detail]
+    )
+
+    EventLog.lifecycle_in_txn(txn, kind, subject, detail)
+  end
 
   defp failure_code(value) when is_atom(value), do: Atom.to_string(value)
   defp failure_code({tag, _detail}) when is_atom(tag), do: Atom.to_string(tag)
