@@ -1065,6 +1065,69 @@ defmodule Tightbeam.EscalationTest do
     refute first_digest == second_digest
   end
 
+  test "terminal decision and rationale require normalized stored text", ctx do
+    padded_decision =
+      Escalation.operator_ask(
+        ctx.db,
+        operator_call(ctx.raiser, %{question: "padded decision?"})
+      )
+
+    padded_rationale =
+      Escalation.operator_ask(
+        ctx.db,
+        operator_call(ctx.raiser, %{question: "padded rationale?"})
+      )
+
+    _ruled =
+      Escalation.operator_rule(
+        ctx.db,
+        owner_operator_rule(padded_decision.id, %{decision: "accept"}),
+        scheduler: ctx.scheduler
+      )
+
+    _ruled =
+      Escalation.operator_rule(
+        ctx.db,
+        owner_operator_rule(padded_rationale.id, %{
+          decision: "accept",
+          rationale: "because"
+        }),
+        scheduler: ctx.scheduler
+      )
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE decision_requests SET decision=' accept ' WHERE id=?1",
+               [padded_decision.id]
+             )
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE decision_requests SET rationale=' because ' WHERE id=?1",
+               [padded_rationale.id]
+             )
+
+    for request <- [padded_decision, padded_rationale] do
+      assert %{code: "decision_request_integrity_invalid"} =
+               Escalation.get(ctx.db, owner_operator_rule(request.id, %{}), request.id)
+    end
+
+    assert {:ok, evidence_rows} =
+             DB.query(
+               ctx.db,
+               "SELECT requestId,failingFields FROM decision_request_integrity_evidence WHERE requestId IN (?1,?2) ORDER BY requestId",
+               [padded_decision.id, padded_rationale.id]
+             )
+
+    assert Enum.sort(evidence_rows) ==
+             Enum.sort([
+               [padded_decision.id, ~s(["decision"])],
+               [padded_rationale.id, ~s(["rationale"])]
+             ])
+  end
+
   test "owner attribution requires the stored raiser session", ctx do
     request =
       Escalation.operator_ask(
