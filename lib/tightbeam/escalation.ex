@@ -1804,7 +1804,7 @@ defmodule Tightbeam.Escalation do
           :assignment_id
         ])
       else
-        request
+        Map.drop(request, [:ruled_via_principal, :ruled_via_session_state])
       end
     end
   end

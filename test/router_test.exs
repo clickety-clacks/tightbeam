@@ -20,6 +20,14 @@ defmodule Tightbeam.Wire.RouterTest do
 
   alias Tightbeam.Wire.Router
 
+  @nonterminal_operator_detail_keys ~w(
+    actionKey assignmentId consumedAt context deadlineAt deadlineWakeId decision
+    effortGeneration expecterSessionKey expecterUserId id kind lineageRung options
+    ownerUserId parkWakeId question raiserId raiserSessionKey raisedAt rationale
+    ruledAt ruledBy ruledViaSessionKey rulingFactId statuteName status withdrawnAt
+    withdrawnBy withdrawnReason
+  )
+
   defmodule NudgeSink do
     use GenServer
 
@@ -197,6 +205,20 @@ defmodule Tightbeam.Wire.RouterTest do
     assert asked["status"] == "open"
     assert is_binary(dr_id = asked["id"])
 
+    open_detail =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "decision-request",
+        asUser: owner,
+        params: %{request: dr_id}
+      })
+
+    assert open_detail.status == 200
+    open_row = JSON.decode!(open_detail.resp_body)["result"]["decisionRequest"]
+    assert Enum.sort(Map.keys(open_row)) == Enum.sort(@nonterminal_operator_detail_keys)
+    refute Map.has_key?(open_row, "ruledViaPrincipal")
+    refute Map.has_key?(open_row, "ruledViaSessionState")
+    refute Map.has_key?(open_row, "rulingAttribution")
+
     # list — as the owner over the org transport; the open request appears
     listed =
       dispatch_cli(ctx, "tbc_test", %{verb: "decision-requests", asUser: owner, params: %{}})
@@ -305,6 +327,56 @@ defmodule Tightbeam.Wire.RouterTest do
 
     assert withdrawn.status == 200
     assert JSON.decode!(withdrawn.resp_body)["result"]["status"] == "withdrawn"
+
+    withdrawn_detail =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "decision-request",
+        asUser: owner,
+        params: %{request: dr2}
+      })
+
+    assert withdrawn_detail.status == 200
+    withdrawn_row = JSON.decode!(withdrawn_detail.resp_body)["result"]["decisionRequest"]
+    assert withdrawn_row["status"] == "withdrawn"
+    assert Enum.sort(Map.keys(withdrawn_row)) == Enum.sort(@nonterminal_operator_detail_keys)
+    refute Map.has_key?(withdrawn_row, "ruledViaPrincipal")
+    refute Map.has_key?(withdrawn_row, "ruledViaSessionState")
+    refute Map.has_key?(withdrawn_row, "rulingAttribution")
+
+    superseded_ask =
+      dispatch_cli(ctx, raiser.cli_token, %{
+        verb: "operator-ask",
+        params: %{question: "old superseded question?", options: [%{label: "a"}, %{label: "b"}]}
+      })
+
+    superseded_id = JSON.decode!(superseded_ask.resp_body)["result"]["id"]
+
+    replacement =
+      dispatch_cli(ctx, raiser.cli_token, %{
+        verb: "operator-ask",
+        params: %{
+          question: "replacement question?",
+          options: [%{label: "a"}, %{label: "b"}],
+          supersedes: superseded_id
+        }
+      })
+
+    assert replacement.status == 200
+
+    superseded_detail =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "decision-request",
+        asUser: owner,
+        params: %{request: superseded_id}
+      })
+
+    assert superseded_detail.status == 200
+    superseded_row = JSON.decode!(superseded_detail.resp_body)["result"]["decisionRequest"]
+    assert superseded_row["status"] == "superseded"
+    assert Enum.sort(Map.keys(superseded_row)) == Enum.sort(@nonterminal_operator_detail_keys)
+    refute Map.has_key?(superseded_row, "ruledViaPrincipal")
+    refute Map.has_key?(superseded_row, "ruledViaSessionState")
+    refute Map.has_key?(superseded_row, "rulingAttribution")
 
     # The negative side of the SAME seam. The defect was the allowlist gate: a
     # verb it omits is refused here, before any handler, with this exact shape —
