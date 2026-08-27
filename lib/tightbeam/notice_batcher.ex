@@ -301,7 +301,7 @@ defmodule Tightbeam.NoticeBatcher do
 
   @doc false
   @spec preserve_retargeted_source_in_txn(Txn.t(), String.t(), String.t()) ::
-          :not_batched | map() | {:error, map()}
+          :not_batched | map() | {:immutable_delivery, map()} | {:error, map()}
   def preserve_retargeted_source_in_txn(
         %Txn{} = txn,
         source_wake_id,
@@ -311,7 +311,8 @@ defmodule Tightbeam.NoticeBatcher do
     case Txn.q(
            txn,
            """
-           SELECT p.visibilityScope, p.deadlineAt
+           SELECT p.visibilityScope, p.deadlineAt, m.memberId, m.batchId,
+                  m.state, b.state, b.deliveryWakeId
            FROM notice_delivery_policies p
            JOIN notice_batch_members m
              ON m.sourceWakeId=p.sourceWakeId
@@ -319,41 +320,124 @@ defmodule Tightbeam.NoticeBatcher do
             AND m.visibilityScope=p.visibilityScope
            JOIN notice_batches b ON b.batchId=m.batchId
            WHERE p.sourceWakeId=?1 AND p.enabled=1 AND p.policyRevision=?2
-             AND m.state='active' AND b.state='open'
+             AND ((m.state='active' AND b.state='open')
+                  OR (m.state='included' AND b.state IN
+                      ('sealed','delivery_pending','delivered','delivery_failed')))
            """,
            [source_wake_id, @policy_revision]
          ) do
-      [[visibility_scope, deadline_at]] ->
-        replacement_policy_ref = policy_ref(replacement_wake_id)
-
-        Txn.q(
-          txn,
-          """
-          INSERT INTO notice_delivery_policies
-            (policyRef, sourceWakeId, recipientAddress, sessionKey, targetRole,
-             visibilityScope, policyRevision, deadlineAt, enabled, createdAt)
-          SELECT ?2, w.wakeId,
-                 CASE WHEN w.targetRole IS NULL
-                      THEN 'session:' || w.sessionKey
-                      ELSE 'role:' || w.targetRole END,
-                 w.sessionKey, w.targetRole, ?3, ?4, ?5, 1, w.createdAt
-          FROM wakes w
-          WHERE w.wakeId=?1 AND w.state='pending'
-          ON CONFLICT(policyRef) DO NOTHING
-          """,
-          [
+      [[visibility_scope, deadline_at, _member_id, _batch_id, "active", "open", nil]] ->
+        replacement_policy_ref =
+          copy_retargeted_policy_in_txn(
+            txn,
             replacement_wake_id,
-            replacement_policy_ref,
             visibility_scope,
-            @policy_revision,
             deadline_at
-          ]
-        )
+          )
 
         enqueue_or_recover_in_txn(txn, replacement_wake_id, replacement_policy_ref)
 
+      [
+        [
+          visibility_scope,
+          deadline_at,
+          member_id,
+          batch_id,
+          "included",
+          batch_state,
+          delivery_wake_id
+        ]
+      ] ->
+        _replacement_policy_ref =
+          copy_retargeted_policy_in_txn(
+            txn,
+            replacement_wake_id,
+            visibility_scope,
+            deadline_at
+          )
+
+        delivery_wake_id =
+          case {batch_state, delivery_wake_id} do
+            {"sealed", nil} ->
+              case arm_in_txn(txn, batch_id) do
+                {:new, wake_id} -> wake_id
+                :noop -> delivery_wake_id_in_txn(txn, batch_id)
+              end
+
+            {_state, wake_id} when is_binary(wake_id) ->
+              wake_id
+
+            _ ->
+              nil
+          end
+
+        if is_binary(delivery_wake_id) do
+          lifecycle(
+            txn,
+            "retarget_preserved_by_immutable_delivery",
+            batch_id,
+            member_id,
+            replacement_wake_id,
+            delivery_wake_id
+          )
+
+          {:immutable_delivery,
+           %{
+             batch_id: batch_id,
+             batch_state: batch_state,
+             delivery_wake_id: delivery_wake_id
+           }}
+        else
+          refusal(
+            "immutable_delivery_missing_carrier",
+            "a sealed selected source has no durable carrier"
+          )
+        end
+
       [] ->
         :not_batched
+    end
+  end
+
+  defp copy_retargeted_policy_in_txn(
+         txn,
+         replacement_wake_id,
+         visibility_scope,
+         deadline_at
+       ) do
+    replacement_policy_ref = policy_ref(replacement_wake_id)
+
+    Txn.q(
+      txn,
+      """
+      INSERT INTO notice_delivery_policies
+        (policyRef, sourceWakeId, recipientAddress, sessionKey, targetRole,
+         visibilityScope, policyRevision, deadlineAt, enabled, createdAt)
+      SELECT ?2, w.wakeId,
+             CASE WHEN w.targetRole IS NULL
+                  THEN 'session:' || w.sessionKey
+                  ELSE 'role:' || w.targetRole END,
+             w.sessionKey, w.targetRole, ?3, ?4, ?5, 1, w.createdAt
+      FROM wakes w
+      WHERE w.wakeId=?1 AND w.state='pending'
+      ON CONFLICT(policyRef) DO NOTHING
+      """,
+      [
+        replacement_wake_id,
+        replacement_policy_ref,
+        visibility_scope,
+        @policy_revision,
+        deadline_at
+      ]
+    )
+
+    replacement_policy_ref
+  end
+
+  defp delivery_wake_id_in_txn(txn, batch_id) do
+    case Txn.q(txn, "SELECT deliveryWakeId FROM notice_batches WHERE batchId=?1", [batch_id]) do
+      [[wake_id]] when is_binary(wake_id) -> wake_id
+      _ -> nil
     end
   end
 
@@ -645,10 +729,11 @@ defmodule Tightbeam.NoticeBatcher do
     rendered_bytes = rendered_member_bytes(source, next_publication_seq(txn, source))
 
     if rendered_bytes > @max_rendered_bytes do
-      refusal(
-        "member_payload_too_large",
-        "one source notice exceeds the v1 rendered payload floor"
-      )
+      {:bypass,
+       %{
+         code: "member_payload_too_large",
+         message: "one source notice exceeds the v1 rendered payload floor"
+       }}
     else
       batch = open_batch(txn, source)
 

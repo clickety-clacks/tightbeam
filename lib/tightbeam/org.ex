@@ -955,9 +955,13 @@ defmodule Tightbeam.Org do
         )
       end
 
+    {after_cancellation, command} = Map.pop(command, :after_cancellation)
+
     if not Wakes.cancel_in_txn(txn, Map.put(command, :wake_id, wake_id)) do
       raise "typed retirement cancellation refused for #{wake_id}"
     end
+
+    finalize_retirement_replacement_in_txn!(txn, after_cancellation)
   end
 
   defp retirement_assignment_disposition?(_txn, nil, _session_key), do: false
@@ -1025,34 +1029,66 @@ defmodule Tightbeam.Org do
         replacement_target ->
           case Wakes.retarget_in_txn(txn, wake_id, replacement_target) do
             %{wake_id: replacement_wake_id} ->
-              case NoticeBatcher.preserve_retargeted_source_in_txn(
-                     txn,
-                     wake_id,
-                     replacement_wake_id
-                   ) do
-                :not_batched ->
-                  :ok
+              after_cancellation =
+                case NoticeBatcher.preserve_retargeted_source_in_txn(
+                       txn,
+                       wake_id,
+                       replacement_wake_id
+                     ) do
+                  :not_batched ->
+                    nil
 
-                %{member_id: _, batch_id: _} ->
-                  :ok
+                  %{member_id: _, batch_id: _} ->
+                    nil
 
-                {:error, refusal} ->
-                  raise "retirement replacement batching refused: #{inspect(refusal)}"
-              end
+                  {:immutable_delivery, %{delivery_wake_id: delivery_wake_id}} ->
+                    {:supersede_by_carrier, replacement_wake_id, delivery_wake_id}
 
-              %{kind: "replacement", replacement_wake_id: replacement_wake_id}
+                  {:error, refusal} ->
+                    raise "retirement replacement batching refused: #{inspect(refusal)}"
+                end
+
+              %{
+                kind: "replacement",
+                replacement_wake_id: replacement_wake_id,
+                after_cancellation: after_cancellation
+              }
 
             :error ->
               raise "retirement replacement refused for #{wake_id}"
           end
       end
 
+    {after_cancellation, outcome} = Map.pop(outcome, :after_cancellation)
+
     %{
       requester: %{kind: "process", id: "tightbeam:retirement"},
       reason_kind: "target_retired",
       causal_source: %{kind: "session_transition", id: session_key},
-      outcome: outcome
+      outcome: outcome,
+      after_cancellation: after_cancellation
     }
+  end
+
+  defp finalize_retirement_replacement_in_txn!(_txn, nil), do: :ok
+
+  defp finalize_retirement_replacement_in_txn!(
+         txn,
+         {:supersede_by_carrier, replacement_wake_id, delivery_wake_id}
+       ) do
+    command = %{
+      wake_id: replacement_wake_id,
+      requester: %{kind: "process", id: "tightbeam:batcher"},
+      reason_kind: "superseded",
+      causal_source: %{kind: "wake", id: delivery_wake_id},
+      outcome: %{kind: "replacement", replacement_wake_id: delivery_wake_id}
+    }
+
+    if Wakes.cancel_in_txn(txn, command) do
+      :ok
+    else
+      raise "retirement replacement carrier supersession refused for #{replacement_wake_id}"
+    end
   end
 
   defp retirement_replacement_target_for_work(

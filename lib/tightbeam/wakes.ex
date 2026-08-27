@@ -391,12 +391,41 @@ defmodule Tightbeam.Wakes do
       policy_ref = NoticeBatcher.record_policy_in_txn(txn, wake, enabled: true)
 
       case NoticeBatcher.enqueue_or_recover_in_txn(txn, wake.wake_id, policy_ref) do
-        %{member_id: _, batch_id: _} -> :ok
-        {:error, refusal} -> raise "notice batching admission refused: #{inspect(refusal)}"
-      end
-    end
+        %{member_id: _, batch_id: _} ->
+          wake
 
-    wake
+        {:bypass, refusal} ->
+          bypass_v1_batching_in_txn(txn, wake, policy_ref, refusal)
+
+        {:error, refusal} ->
+          raise "notice batching admission refused: #{inspect(refusal)}"
+      end
+    else
+      wake
+    end
+  end
+
+  defp bypass_v1_batching_in_txn(txn, wake, policy_ref, refusal) do
+    Txn.q(
+      txn,
+      "UPDATE wakes SET deliveryRule=?2 WHERE wakeId=?1 AND state='pending'",
+      [wake.wake_id, @legacy_digest_rule]
+    )
+
+    Txn.q(
+      txn,
+      "UPDATE notice_delivery_policies SET enabled=0 WHERE policyRef=?1 AND sourceWakeId=?2",
+      [policy_ref, wake.wake_id]
+    )
+
+    EventLog.lifecycle_in_txn(
+      txn,
+      "notice_batching_admission_bypassed",
+      wake.wake_id,
+      "rule=#{@digest_rule} fallback=#{@legacy_digest_rule} code=#{refusal.code}"
+    )
+
+    %{wake | delivery_rule: @legacy_digest_rule}
   end
 
   # The class this wake carries, and who put it there. A caller that names
@@ -1144,7 +1173,7 @@ defmodule Tightbeam.Wakes do
            "SELECT wakeId, origin, state, conditionKind, work_item_id, assignmentId, digest FROM wakes WHERE wakeId=?1",
            [replacement_id]
          ) do
-      [[^replacement_id, origin, "pending", condition_kind, work_item_id, assignment_id, digest]] ->
+      [[^replacement_id, origin, state, condition_kind, work_item_id, assignment_id, digest]] ->
         replacement = %{
           wake_id: replacement_id,
           origin: origin,
@@ -1153,8 +1182,12 @@ defmodule Tightbeam.Wakes do
           assignment_id: assignment_id
         }
 
-        case primary_work(txn, replacement) do
-          {:ok, replacement_primary} ->
+        case {valid_replacement_state?(txn, requester_id, replacement_id, state, digest),
+              primary_work(txn, replacement)} do
+          {false, _} ->
+            :error
+
+          {true, {:ok, replacement_primary}} ->
             cond do
               is_nil(primary.kind) ->
                 :ok
@@ -1169,7 +1202,7 @@ defmodule Tightbeam.Wakes do
                 :error
             end
 
-          :error ->
+          {true, :error} ->
             :error
         end
 
@@ -1177,6 +1210,22 @@ defmodule Tightbeam.Wakes do
         :error
     end
   end
+
+  defp valid_replacement_state?(_txn, _requester_id, _replacement_id, "pending", _digest),
+    do: true
+
+  defp valid_replacement_state?(
+         txn,
+         "tightbeam:batcher",
+         replacement_id,
+         "fired",
+         1
+       ) do
+    row_exists(txn, "SELECT 1 FROM notice_batches WHERE deliveryWakeId=?1", replacement_id)
+  end
+
+  defp valid_replacement_state?(_txn, _requester_id, _replacement_id, _state, _digest),
+    do: false
 
   # O4 ROOT CAUSE, THE NAMED EXEMPTION — not a general bypass. A digest
   # carrier's own linked work is inherited from its group when every linked

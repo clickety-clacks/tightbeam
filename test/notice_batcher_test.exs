@@ -416,13 +416,82 @@ defmodule Tightbeam.NoticeBatcherTest do
     assert Wakes.get(db, carrier_id).due_at == 4_000
   end
 
+  test "a selected 65,536-byte source stays durable on the ordinary fallback lane", %{db: db} do
+    lane = [session: "agent:payload-floor"]
+    set_lane_policy(db, lane, true)
+
+    source =
+      fyi(
+        db,
+        Keyword.merge(lane,
+          wake_id: "w_payload_floor",
+          prompt: String.duplicate("x", 65_536)
+        )
+      )
+
+    assert byte_size(source.prompt) == 65_536
+    assert source.delivery_rule == "turn-boundary-digest r1"
+    assert Wakes.get(db, source.wake_id).state == "pending"
+    assert NoticeBatcher.source_refs(db, source.wake_id) == []
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               db,
+               "SELECT enabled FROM notice_delivery_policies WHERE sourceWakeId=?1",
+               [source.wake_id]
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               db,
+               "SELECT enabled FROM notice_batching_lane_policies WHERE recipientAddress=?1",
+               ["session:agent:payload-floor"]
+             )
+
+    later = fyi(db, Keyword.put(lane, :prompt, "fits after fallback"))
+    assert later.delivery_rule == NoticeBatcher.rule()
+    assert [%{member_state: "active"}] = NoticeBatcher.source_refs(db, later.wake_id)
+  end
+
+  test "the rendered V1 member boundary admits 65,536 bytes and bypasses the next byte", %{
+    db: db
+  } do
+    fitting_id = "w_rendered_boundary_fit"
+    overflow_id = "w_rendered_boundary_over"
+    fitting_header = rendered_member_header(fitting_id)
+    overflow_header = rendered_member_header(overflow_id)
+
+    fitting =
+      eligible(db,
+        session: "agent:rendered-fit",
+        wake_id: fitting_id,
+        prompt: String.duplicate("a", 65_536 - byte_size(fitting_header))
+      )
+
+    assert [%{member_state: "active", batch_id: fitting_batch_id}] =
+             NoticeBatcher.source_refs(db, fitting.wake_id)
+
+    assert [%{rendered_bytes: 65_536}] = NoticeBatcher.members(db, fitting_batch_id)
+
+    overflow =
+      eligible(db,
+        session: "agent:rendered-over",
+        wake_id: overflow_id,
+        prompt: String.duplicate("b", 65_537 - byte_size(overflow_header))
+      )
+
+    assert overflow.delivery_rule == "turn-boundary-digest r1"
+    assert Wakes.get(db, overflow.wake_id).state == "pending"
+    assert NoticeBatcher.source_refs(db, overflow.wake_id) == []
+  end
+
   defp eligible(db, opts \\ []) do
     set_lane_policy(db, opts, true)
     fyi(db, opts)
   end
 
   defp fyi(db, opts) do
-    Wakes.schedule(db, %{
+    input = %{
       session_key: Keyword.get(opts, :session, "agent:recipient"),
       target_role: Keyword.get(opts, :target_role),
       origin: Keyword.get(opts, :origin, "process:tightbeam"),
@@ -430,7 +499,19 @@ defmodule Tightbeam.NoticeBatcherTest do
       prompt: Keyword.get(opts, :prompt, "routine"),
       due_at: Keyword.get(opts, :due_at, 0),
       class: "fyi"
-    })
+    }
+
+    input =
+      case Keyword.fetch(opts, :wake_id) do
+        {:ok, wake_id} -> Map.put(input, :wake_id, wake_id)
+        :error -> input
+      end
+
+    Wakes.schedule(db, input)
+  end
+
+  defp rendered_member_header(wake_id) do
+    "[1] source=#{wake_id} sender=process:tightbeam cause=wake class=fyi\n"
   end
 
   defp set_lane_policy(db, opts, enabled) do
