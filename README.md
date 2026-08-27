@@ -34,6 +34,21 @@ Three properties make that safe to trust:
 Tightbeam is a standalone service: install it and run it, the way you would
 a database.
 
+## External-agent operation skill
+
+Choose one transport edition for an external agent:
+
+- [Current-line CLI edition](priv/skills/tightbeam-cli/SKILL.md)
+- [REST 0.2.0 edition](priv/skills/tightbeam-rest-0-2-0/SKILL.md)
+
+Copy that edition's whole directory to `.codex/skills/<skill-name>/` or
+`.claude/skills/<skill-name>/` in the external agent's project. Keep the directory name
+and `SKILL.md` filename unchanged. Start a fresh agent session after the copy so the agent
+rediscovers the skill metadata.
+
+The skill does not install Tightbeam, create a session, supply a credential, operate a
+kungfu bundle, or change a Tightbeam identity. Provision those prerequisites separately.
+
 ## Two ways to install
 
 **From a release package** (below) — a per-platform npm tarball carrying the
