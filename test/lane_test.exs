@@ -1,29 +1,23 @@
 defmodule Tightbeam.LaneTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Ledger, EventLog, LaneManager, Placement, SessionLane}
+  alias Tightbeam.{DB, Ledger, EventLog, LaneManager, Placement, Schema, SessionLane}
 
   setup do
     db = :"db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
-    :ok = Ledger.ensure_schema(db)
-    :ok = EventLog.ensure_schema(db)
+    :ok = Schema.ensure_all(db)
 
     :ok =
       DB.execute(db, """
-      CREATE TABLE sessions (
-        sessionKey TEXT PRIMARY KEY,
-        model TEXT NOT NULL,
-        thinkingLevel TEXT,
-        modelContext TEXT,
-        harness TEXT NOT NULL,
-        state TEXT NOT NULL DEFAULT 'active',
-        updatedAt INTEGER NOT NULL DEFAULT 0
-      );
-      INSERT INTO sessions (sessionKey, model, thinkingLevel, harness)
+      INSERT INTO sessions
+        (sessionKey,displayName,ownerUserId,origin,operationalParent,archetype,
+         harness,provider,model,thinkingLevel,host,createdAt,updatedAt)
       VALUES
-        ('k1', 'claude-sonnet-5', 'medium', 'claude'),
-        ('k2', 'claude-sonnet-5', 'medium', 'claude');
+        ('k1','K1','t','user:t','k1','default','claude','anthropic',
+         'claude-sonnet-5','medium','testhost',1,1),
+        ('k2','K2','t','user:t','k1','default','claude','anthropic',
+         'claude-sonnet-5','medium','testhost',2,2);
       """)
 
     reg = start_supervised!({Registry, keys: :unique, name: Tightbeam.LaneRegistry})

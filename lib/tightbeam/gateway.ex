@@ -74,6 +74,7 @@ defmodule Tightbeam.Gateway do
     EventLog,
     Harness,
     HarnessHealth,
+    HarnessProcess,
     Homes,
     Identity,
     IdPrefix,
@@ -1219,13 +1220,101 @@ defmodule Tightbeam.Gateway do
 
     with {:ok, assignment} <- repair_assignment(db, assignment_id),
          :ok <- repair_authorized(db, call, assignment),
-         {:ok, session} <- repair_holder(db, assignment),
-         {:ok, incident} <- repair_incident(db, assignment, session, p[:action]),
-         result <- execute_assignment_repair(config, db, call, assignment, session, incident),
-         :ok <- record_repair_result(db, call, assignment, incident, result) do
-      result
+         {:ok, repair_key, fingerprint} <- repair_request(p),
+         principal = TurnLifecycle.principal(call.principal),
+         {:ok, claim} <-
+           Ledger.begin_assignment_repair(
+             db,
+             assignment.id,
+             repair_key,
+             fingerprint,
+             p[:action],
+             principal
+           ) do
+      case claim do
+        {:replay, result} ->
+          result
+
+        {:in_progress, attempt_id} ->
+          %{
+            ok: false,
+            code: "repair_in_progress",
+            message:
+              "repair attempt #{attempt_id} is already claimed; its outcome must be reconciled before another effect"
+          }
+
+        {:claimed, attempt_id} ->
+          execute_claimed_assignment_repair(
+            config,
+            db,
+            call,
+            assignment,
+            attempt_id
+          )
+      end
     else
-      {:error, code, message} -> %{ok: false, code: code, message: message}
+      {:error, :repair_key_conflict} ->
+        %{
+          ok: false,
+          code: "repair_key_conflict",
+          message: "repair key is already bound to a different request for this assignment"
+        }
+
+      {:error, error} ->
+        %{ok: false, code: "repair_state_failed", message: inspect(error)}
+
+      {:error, code, message} ->
+        %{ok: false, code: code, message: message}
+    end
+  end
+
+  defp repair_request(p) do
+    repair_key = p[:idempotency_key]
+    action = p[:action]
+
+    cond do
+      not is_binary(repair_key) or repair_key == "" ->
+        {:error, "idempotency_key_required", "repair requires --key"}
+
+      action not in ["tune", "restart", "rerun", "resume", "relaunch"] ->
+        {:error, "invalid_request", "repair requires a sanctioned --action"}
+
+      true ->
+        fingerprint =
+          JSON.encode!([
+            action,
+            p[:model],
+            p[:effort],
+            p[:context],
+            p[:outcome],
+            p[:turn_seq]
+          ])
+
+        {:ok, repair_key, fingerprint}
+    end
+  end
+
+  defp execute_claimed_assignment_repair(config, db, call, assignment, attempt_id) do
+    {result, incident} =
+      with {:ok, session} <- repair_holder(db, assignment),
+           {:ok, incident} <- repair_incident(db, assignment, session, call.params[:action]) do
+        {execute_assignment_repair(config, db, call, assignment, session, incident), incident}
+      else
+        {:error, code, message} -> {%{ok: false, code: code, message: message}, nil}
+      end
+
+    case Ledger.finish_assignment_repair(db, attempt_id, result) do
+      :ok ->
+        if incident, do: record_repair_result(db, call, assignment, incident, result)
+        result
+
+      {:error, reason} ->
+        %{
+          ok: false,
+          code: "repair_state_failed",
+          message:
+            "repair effect outcome could not be persisted; attempt #{attempt_id} remains claimed: #{inspect(reason)}"
+        }
     end
   end
 
@@ -1326,14 +1415,14 @@ defmodule Tightbeam.Gateway do
         tune_result(
           config,
           db,
-          %{
-            call
-            | session_key: session.session_key,
-              params:
-                %{setting: "set_model", model: model}
-                |> maybe_put(:effort, call.params[:effort])
-                |> maybe_put(:context, call.params[:context])
-          }
+          call
+          |> Map.put(:session_key, session.session_key)
+          |> Map.put(
+            :params,
+            %{setting: "set_model", model: model}
+            |> maybe_put(:effort, call.params[:effort])
+            |> maybe_put(:context, call.params[:context])
+          )
           |> Map.put(:repair_assignment_id, assignment.id)
         )
 
@@ -1356,8 +1445,15 @@ defmodule Tightbeam.Gateway do
     key = {Harness.parse!(session.harness).id(), "shared", session.host}
 
     case AdapterCoordinator.close_adapter(coordinator, key) do
-      :ok -> rerun_latest(db, call, assignment, incident)
-      {:error, reason} -> %{ok: false, code: "repair_failed", message: inspect(reason)}
+      :ok ->
+        if incident.failure_class == "rate-limit-dead" do
+          :ok = HarnessProcess.complete_park(db, key)
+        end
+
+        rerun_latest(db, call, assignment, incident)
+
+      {:error, reason} ->
+        %{ok: false, code: "repair_failed", message: inspect(reason)}
     end
   end
 
@@ -5847,7 +5943,7 @@ defmodule Tightbeam.Gateway do
   # lost) but it would run on an engine its author never chose. `pending_count`
   # closes that window from INSIDE the held boundary, so no turn can be
   # enqueued between the count and the swap.
-  defp at_tune_boundary(config, db, session_key, fun) do
+  defp at_tune_boundary(config, db, session_key, fun, opts \\ []) do
     at_session_turn_boundary(config, session_key, fn ->
       # Probe seam (same idiom as `on_swap_interlock`): lets a test enqueue
       # durable work inside the boundary and prove the count still refuses.
@@ -5857,7 +5953,11 @@ defmodule Tightbeam.Gateway do
         _ -> :ok
       end
 
-      if Ledger.pending_count(db, session_key) > 0,
+      # An opener-authorized model-unavailable repair deliberately elects the
+      # model that already-queued work will use; the ordinary tune path still
+      # refuses that substitution. The shared lane boundary continues to bar
+      # a running turn in both cases.
+      if opts[:allow_queued] != true and Ledger.pending_count(db, session_key) > 0,
         do: {:tune_refused, :turn_in_progress},
         else: fun.()
     end)
@@ -6288,12 +6388,20 @@ defmodule Tightbeam.Gateway do
         _ -> :ok
       end
 
+      allow_queued = repair_tune_authorized?(db, call, session)
+
       boundary =
-        at_tune_boundary(config, db, session.session_key, fn ->
-          run_session_mutation(session.session_key, fn ->
-            apply_tuned_model(config, db, call, session, new_ref, routed.provider, basis)
-          end)
-        end)
+        at_tune_boundary(
+          config,
+          db,
+          session.session_key,
+          fn ->
+            run_session_mutation(session.session_key, fn ->
+              apply_tuned_model(config, db, call, session, new_ref, routed.provider, basis)
+            end)
+          end,
+          allow_queued: allow_queued
+        )
 
       case boundary do
         {:ok, :ok} ->

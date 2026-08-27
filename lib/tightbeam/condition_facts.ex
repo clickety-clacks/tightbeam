@@ -53,6 +53,10 @@ defmodule Tightbeam.ConditionFacts do
     {"interrupted-outcome-unknown", :assert} => "harness-interrupted-outcome-unknown",
     {"interrupted-outcome-unknown", :retract} => "harness-interrupted-outcome-reconciled"
   }
+  @harness_failure_classes ~w(
+    auth-dead rate-limit-dead adapter_unavailable model_unavailable task_crash
+    interrupted-outcome-unknown
+  )
 
   @ddl """
   CREATE TABLE IF NOT EXISTS condition_facts (
@@ -261,11 +265,22 @@ defmodule Tightbeam.ConditionFacts do
   @spec harness_unavailable?(DB.server(), String.t(), String.t()) :: boolean()
   def harness_unavailable?(db, harness, host) do
     Enum.any?(
-      ~w(auth-dead rate-limit-dead adapter_unavailable model_unavailable task_crash interrupted-outcome-unknown),
+      @harness_failure_classes,
       fn failure_class ->
         harness_failure_standing?(db, harness, host, failure_class)
       end
     )
+  end
+
+  @doc "The transaction-owned form of the all-class harness availability gate."
+  @spec harness_unavailable_in_txn?(Txn.t(), String.t(), String.t()) :: boolean()
+  def harness_unavailable_in_txn?(%Txn{} = txn, harness, host) do
+    scope = harness_scope(harness, host)
+
+    Enum.any?(@harness_failure_classes, fn failure_class ->
+      assert_kind = Map.fetch!(@harness_health_kinds, {failure_class, :assert})
+      standing_in_txn?(txn, assert_kind, scope)
+    end)
   end
 
   @doc "File one harness-health assertion or retraction inside its incident transaction."

@@ -1008,13 +1008,11 @@ defmodule Tightbeam.Supervision do
     end
   end
 
-  defp harness_unavailable_in_txn?(txn, session_key) do
+  @doc false
+  def harness_unavailable_in_txn?(txn, session_key) do
     case Txn.q(txn, "SELECT harness, host FROM sessions WHERE sessionKey=?1", [session_key]) do
       [[harness, host]] ->
-        scope = ConditionFacts.harness_scope(harness, host)
-
-        ConditionFacts.standing_in_txn?(txn, "harness-auth-dead", scope) or
-          ConditionFacts.standing_in_txn?(txn, "harness-rate-limit-dead", scope)
+        ConditionFacts.harness_unavailable_in_txn?(txn, harness, host)
 
       [] ->
         false

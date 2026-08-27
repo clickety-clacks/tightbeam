@@ -14,7 +14,7 @@ defmodule Tightbeam.HarnessHealth do
   recycling remain outside this module.
   """
 
-  alias Tightbeam.{ConditionFacts, DB, EventLog, Id, Org}
+  alias Tightbeam.{ConditionFacts, DB, EventLog, Harness, HarnessProcess, Id, Org}
   alias Tightbeam.DB.Txn
 
   @failure_classes ~w(
@@ -484,21 +484,28 @@ defmodule Tightbeam.HarnessHealth do
   end
 
   @doc "Resolve one class-specific open incident on normal-turn success."
-  @spec resolve(DB.server(), map()) :: {:resolved | :duplicate, map()} | :already_healthy
+  @spec resolve(DB.server(), map()) ::
+          {:resolved | :duplicate, map()} | :already_healthy | :repair_required
   def resolve(db \\ DB, input) do
     input = input |> Map.put(:evidence_kind, "normal-turn-success") |> normalize_common!()
     transaction!(db, &resolve_in_txn(&1, input))
   end
 
   @doc "The class-specific resolution mutation inside a caller-owned transaction."
-  @spec resolve_in_txn(Txn.t(), map()) :: {:resolved | :duplicate, map()} | :already_healthy
+  @spec resolve_in_txn(Txn.t(), map()) ::
+          {:resolved | :duplicate, map()} | :already_healthy | :repair_required
   def resolve_in_txn(%Txn{} = txn, input) do
     input = input |> Map.put(:evidence_kind, "normal-turn-success") |> normalize_common!()
     validate_session_membership!(txn, input)
 
-    case observation_by_correlation(txn, input.correlation_id) do
-      nil -> resolve_open(txn, input)
-      prior -> duplicate_or_refuse!(txn, prior, input, "normal-turn-success")
+    if input.failure_class == "rate-limit-dead" and
+         HarnessProcess.parked_in_txn?(txn, adapter_key(input.harness, input.host)) do
+      :repair_required
+    else
+      case observation_by_correlation(txn, input.correlation_id) do
+        nil -> resolve_open(txn, input)
+        prior -> duplicate_or_refuse!(txn, prior, input, "normal-turn-success")
+      end
     end
   end
 
@@ -605,6 +612,10 @@ defmodule Tightbeam.HarnessHealth do
       ]
     )
 
+    if input.failure_class == "rate-limit-dead" do
+      HarnessProcess.begin_park_in_txn(txn, adapter_key(input.harness, input.host))
+    end
+
     snapshot_affected_work(txn, incident_id, input)
 
     observations_to_attach(txn, input)
@@ -663,6 +674,10 @@ defmodule Tightbeam.HarnessHealth do
 
         if Txn.changes(txn) != 1, do: raise("harness health incident resolution race")
 
+        if input.failure_class == "rate-limit-dead" do
+          HarnessProcess.complete_park_in_txn(txn, adapter_key(input.harness, input.host))
+        end
+
         EventLog.lifecycle_in_txn(
           txn,
           "harness_health_incident_resolved",
@@ -696,6 +711,8 @@ defmodule Tightbeam.HarnessHealth do
 
     count
   end
+
+  defp adapter_key(harness, host), do: {Harness.parse!(harness).id(), "shared", host}
 
   defp observations_to_attach(txn, input) do
     authoritative =

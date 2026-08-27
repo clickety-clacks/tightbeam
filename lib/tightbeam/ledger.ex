@@ -78,15 +78,38 @@ defmodule Tightbeam.Ledger do
 
   CREATE TABLE IF NOT EXISTS turn_repair_attempts (
     id            TEXT PRIMARY KEY,
-    repairKey     TEXT NOT NULL UNIQUE,
+    repairKey     TEXT NOT NULL,
     sourceSeq     INTEGER NOT NULL REFERENCES turns(seq),
     attemptSeq    INTEGER NOT NULL UNIQUE REFERENCES turns(seq),
     assignmentId TEXT NOT NULL REFERENCES assignments(id),
     principal     TEXT NOT NULL CHECK(length(trim(principal)) > 0),
-    createdAt     INTEGER NOT NULL CHECK(createdAt >= 0)
+    createdAt     INTEGER NOT NULL CHECK(createdAt >= 0),
+    UNIQUE (assignmentId, repairKey)
   );
   CREATE INDEX IF NOT EXISTS turn_repair_source
     ON turn_repair_attempts (sourceSeq, createdAt, id);
+
+  CREATE TABLE IF NOT EXISTS assignment_repair_attempts (
+    id                 TEXT PRIMARY KEY,
+    assignmentId       TEXT NOT NULL REFERENCES assignments(id),
+    repairKey          TEXT NOT NULL,
+    requestFingerprint TEXT NOT NULL CHECK(length(trim(requestFingerprint)) > 0),
+    action             TEXT NOT NULL CHECK(action IN
+                       ('tune','restart','rerun','resume','relaunch')),
+    principal          TEXT NOT NULL CHECK(length(trim(principal)) > 0),
+    state              TEXT NOT NULL CHECK(state IN ('claimed','succeeded','failed')),
+    resultJson         TEXT,
+    createdAt          INTEGER NOT NULL CHECK(createdAt >= 0),
+    completedAt        INTEGER,
+    UNIQUE (assignmentId, repairKey),
+    CHECK(
+      (state = 'claimed' AND resultJson IS NULL AND completedAt IS NULL)
+      OR
+      (state IN ('succeeded','failed') AND resultJson IS NOT NULL AND completedAt >= createdAt)
+    )
+  );
+  CREATE INDEX IF NOT EXISTS assignment_repair_history
+    ON assignment_repair_attempts (assignmentId, createdAt, id);
   """
 
   @spec ensure_schema(db()) :: :ok | {:error, term()}
@@ -216,6 +239,112 @@ defmodule Tightbeam.Ledger do
   end
 
   @doc """
+  Claim one assignment repair before any external side effect.
+
+  The assignment scopes the caller key. An exact replay returns the persisted
+  terminal result; a conflicting request is refused, and an interrupted claim
+  remains claimed so recovery never repeats an outcome-unknown side effect.
+  """
+  @spec begin_assignment_repair(
+          db(),
+          String.t(),
+          String.t(),
+          String.t(),
+          String.t(),
+          String.t()
+        ) ::
+          {:ok, {:claimed, String.t()} | {:replay, map()} | {:in_progress, String.t()}}
+          | {:error, :repair_key_conflict | term()}
+  def begin_assignment_repair(
+        db \\ Tightbeam.DB,
+        assignment_id,
+        repair_key,
+        request_fingerprint,
+        action,
+        principal
+      ) do
+    case DB.transaction(db, fn txn ->
+           case Txn.q(
+                  txn,
+                  """
+                  SELECT id,requestFingerprint,state,resultJson
+                  FROM assignment_repair_attempts
+                  WHERE assignmentId=?1 AND repairKey=?2
+                  """,
+                  [assignment_id, repair_key]
+                ) do
+             [[id, ^request_fingerprint, "claimed", nil]] ->
+               {:in_progress, id}
+
+             [[_id, ^request_fingerprint, state, result_json]]
+             when state in ["succeeded", "failed"] and is_binary(result_json) ->
+               {:replay, decode_repair_result(result_json)}
+
+             [[_id, _other_fingerprint, _state, _result_json]] ->
+               {:error, :repair_key_conflict}
+
+             [] ->
+               id = "ara_" <> Tightbeam.Id.uuid4()
+
+               Txn.q(
+                 txn,
+                 """
+                 INSERT INTO assignment_repair_attempts
+                   (id,assignmentId,repairKey,requestFingerprint,action,principal,state,createdAt)
+                 VALUES (?1,?2,?3,?4,?5,?6,'claimed',?7)
+                 """,
+                 [
+                   id,
+                   assignment_id,
+                   repair_key,
+                   request_fingerprint,
+                   action,
+                   principal,
+                   System.system_time(:millisecond)
+                 ]
+               )
+
+               {:claimed, id}
+           end
+         end) do
+      {:ok, {:error, reason}} -> {:error, reason}
+      {:ok, result} -> {:ok, result}
+      {:error, error} -> {:error, error}
+    end
+  end
+
+  @doc "Persist the terminal repair result that every exact replay returns."
+  @spec finish_assignment_repair(db(), String.t(), map()) :: :ok | {:error, term()}
+  def finish_assignment_repair(db \\ Tightbeam.DB, attempt_id, result) when is_map(result) do
+    state = if result[:ok] == true, do: "succeeded", else: "failed"
+    result_json = JSON.encode!(result)
+
+    case DB.transaction(db, fn txn ->
+           Txn.q(
+             txn,
+             """
+             UPDATE assignment_repair_attempts
+             SET state=?2,resultJson=?3,completedAt=?4
+             WHERE id=?1 AND state='claimed'
+             """,
+             [attempt_id, state, result_json, System.system_time(:millisecond)]
+           )
+
+           if Txn.changes(txn) == 1, do: :ok, else: {:error, :repair_attempt_not_claimed}
+         end) do
+      {:ok, :ok} -> :ok
+      {:ok, {:error, reason}} -> {:error, reason}
+      {:error, error} -> {:error, error}
+    end
+  end
+
+  defp decode_repair_result(result_json) do
+    result_json
+    |> JSON.decode!()
+    |> Map.new(fn {key, value} -> {String.to_existing_atom(key), value} end)
+  end
+
+  @doc """
   Append one explicit retry attempt for a terminal failed turn.
 
   The terminal source row remains immutable. The new queued row carries the
@@ -229,8 +358,11 @@ defmodule Tightbeam.Ledger do
     case DB.transaction(db, fn txn ->
            case Txn.q(
                   txn,
-                  "SELECT attemptSeq,id FROM turn_repair_attempts WHERE repairKey=?1",
-                  [repair_key]
+                  """
+                  SELECT attemptSeq,id FROM turn_repair_attempts
+                  WHERE assignmentId=?1 AND repairKey=?2
+                  """,
+                  [assignment_id, repair_key]
                 ) do
              [[attempt_seq, attempt_id]] ->
                {:duplicate, attempt_seq, attempt_id}

@@ -151,6 +151,18 @@ defmodule Tightbeam.GatewayTest do
     end
   end
 
+  defmodule RepairCoordinatorStub do
+    use GenServer
+
+    def start_link({parent, result}), do: GenServer.start_link(__MODULE__, {parent, result})
+    def init(state), do: {:ok, state}
+
+    def handle_call({:close_adapter, key}, _from, {parent, result} = state) do
+      send(parent, {:repair_close_adapter, key})
+      {:reply, result, state}
+    end
+  end
+
   defmodule AdapterStub do
     use GenServer
     def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
@@ -1218,7 +1230,8 @@ defmodule Tightbeam.GatewayTest do
       }
     }
 
-    assert %{ok: false, code: "outcome_reconciliation_required"} = handler.(call)
+    assert %{ok: false, code: "outcome_reconciliation_required"} =
+             handler.(put_in(call, [:params, :idempotency_key], "repair-unreconciled"))
 
     repaired = handler.(put_in(call, [:params, :outcome], "not-completed"))
     assert repaired.ok
@@ -1227,7 +1240,8 @@ defmodule Tightbeam.GatewayTest do
     assert_receive {:ensure_lane, "k1"}
 
     duplicate = handler.(put_in(call, [:params, :outcome], "not-completed"))
-    assert duplicate.dedupe == "duplicate"
+    assert duplicate == repaired
+    refute_receive {:ensure_lane, "k1"}, 50
 
     assert {:ok, [["open"]]} =
              DB.query(ctx.db, "SELECT state FROM assignments WHERE id='asg_runner_repair'")
@@ -1262,20 +1276,23 @@ defmodule Tightbeam.GatewayTest do
     on_exit(fn -> if Process.alive?(lane_pid), do: GenServer.stop(lane_pid) end)
     handler = Gateway.handlers(gateway_config(ctx.catalog_base, ctx.db, 0))["repair-assignment"]
 
-    assert %{ok: true, action: "relaunch"} =
-             handler.(%{
-               origin: "user:flynn",
-               principal: {:user, "flynn"},
-               conn_registry: ctx.registry,
-               lane_manager: lane,
-               params: %{
-                 assignment_id: "asg_never_launched",
-                 action: "relaunch",
-                 idempotency_key: "launch-one"
-               }
-             })
+    call = %{
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      conn_registry: ctx.registry,
+      lane_manager: lane,
+      params: %{
+        assignment_id: "asg_never_launched",
+        action: "relaunch",
+        idempotency_key: "launch-one"
+      }
+    }
+
+    assert %{ok: true, action: "relaunch"} = launched = handler.(call)
+    assert handler.(call) == launched
 
     assert_receive {:ensure_lane, "k1"}
+    refute_receive {:ensure_lane, "k1"}, 50
 
     assert {:ok, [["queued", "asg_never_launched"]]} =
              DB.query(
@@ -1285,6 +1302,289 @@ defmodule Tightbeam.GatewayTest do
 
     assert {:ok, [["open"]]} =
              DB.query(ctx.db, "SELECT state FROM assignments WHERE id='asg_never_launched'")
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM assignment_repair_attempts WHERE assignmentId='asg_never_launched'"
+             )
+  end
+
+  test "restart is authorized, executes once per key, and replays its terminal result", ctx do
+    repair = failed_repair_route!(ctx, "asg_restart_repair", "adapter_unavailable", 30)
+    {:ok, coordinator} = RepairCoordinatorStub.start_link({self(), :ok})
+
+    handler =
+      ctx.catalog_base
+      |> gateway_config(ctx.db, 0)
+      |> Map.put(:adapter_coordinator, coordinator)
+      |> Gateway.handlers()
+      |> Map.fetch!("repair-assignment")
+
+    unauthorized =
+      handler.(%{
+        origin: "user:zoe",
+        principal: {:user, "zoe"},
+        params: %{
+          assignment_id: repair.assignment_id,
+          action: "restart",
+          idempotency_key: "restart-unauthorized"
+        }
+      })
+
+    assert unauthorized == %{
+             ok: false,
+             code: "not_authorized",
+             message: "assignment repair requires its opener or an admin"
+           }
+
+    refute unauthorized.message =~ repair.incident.id
+
+    call = %{
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      lane_manager: ctx.lane,
+      params: %{
+        assignment_id: repair.assignment_id,
+        action: "restart",
+        idempotency_key: "restart-once"
+      }
+    }
+
+    assert %{ok: true, action: "restart"} = first = handler.(call)
+    assert handler.(call) == first
+    assert_receive {:repair_close_adapter, {:claude, "shared", "testhost"}}
+    refute_receive {:repair_close_adapter, _}, 50
+    assert_receive {:ensure_lane, "k1"}
+    refute_receive {:ensure_lane, "k1"}, 50
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM assignment_repair_attempts WHERE assignmentId=?1",
+               [repair.assignment_id]
+             )
+
+    assert {:ok, [["open"]]} =
+             DB.query(ctx.db, "SELECT state FROM assignments WHERE id=?1", [
+               repair.assignment_id
+             ])
+  end
+
+  test "a failed restart is persisted and replay never repeats the failing side effect", ctx do
+    repair = failed_repair_route!(ctx, "asg_failed_restart", "task_crash", 40)
+    {:ok, coordinator} = RepairCoordinatorStub.start_link({self(), {:error, :still_wedged}})
+
+    handler =
+      ctx.catalog_base
+      |> gateway_config(ctx.db, 0)
+      |> Map.put(:adapter_coordinator, coordinator)
+      |> Gateway.handlers()
+      |> Map.fetch!("repair-assignment")
+
+    call = %{
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      params: %{
+        assignment_id: repair.assignment_id,
+        action: "restart",
+        idempotency_key: "failed-restart-once"
+      }
+    }
+
+    assert %{ok: false, code: "repair_failed"} = first = handler.(call)
+    assert handler.(call) == first
+    assert_receive {:repair_close_adapter, {:claude, "shared", "testhost"}}
+    refute_receive {:repair_close_adapter, _}, 50
+
+    assert HarnessHealth.get(ctx.db, repair.incident.id).state == "open"
+
+    assert {:ok, [["open"]]} =
+             DB.query(ctx.db, "SELECT state FROM assignments WHERE id=?1", [
+               repair.assignment_id
+             ])
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM turn_repair_attempts WHERE assignmentId=?1",
+               [repair.assignment_id]
+             )
+  end
+
+  test "model repair tunes once and exact replay returns the original rerun result", ctx do
+    repair = failed_repair_route!(ctx, "asg_model_repair", "model_unavailable", 50)
+    handler = Gateway.handlers(gateway_config(ctx.catalog_base, ctx.db, 0))["repair-assignment"]
+
+    start_supervised!(
+      {SessionLane,
+       session_key: "k1",
+       db: ctx.db,
+       task_sup: Tightbeam.TurnTaskSupervisor,
+       runner: fn _turn -> {:ok, %{text: "incident notice delivered"}} end}
+    )
+
+    assert eventually(fn ->
+             SessionLane.at_turn_boundary("k1", fn -> :ready end) == {:ok, :ready}
+           end)
+
+    call = %{
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      lane_manager: ctx.lane,
+      params: %{
+        assignment_id: repair.assignment_id,
+        action: "tune",
+        idempotency_key: "model-tune-once",
+        model: "claude-sonnet-4-6"
+      }
+    }
+
+    assert %{ok: true, action: "tune"} = first = handler.(call)
+    assert handler.(call) == first
+    assert Org.get(ctx.db, "k1").model.family == "claude-sonnet-4-6"
+    assert_receive {:ensure_lane, "k1"}
+    refute_receive {:ensure_lane, "k1"}, 50
+
+    retune_markers =
+      Projection.list_after(ctx.db, "k1", nil, 50, 0)
+      |> Enum.filter(&String.contains?(&1.content || "", "[model retune]"))
+
+    assert length(retune_markers) == 1
+  end
+
+  test "rate limit opens a durable no-claim park and explicit resume releases it once", ctx do
+    repair = failed_repair_route!(ctx, "asg_rate_resume", "rate-limit-dead", 60)
+    adapter_key = {:claude, "shared", "testhost"}
+    assert Tightbeam.HarnessProcess.parked?(ctx.db, adapter_key)
+
+    {:ok, blocked_seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: "k1",
+        message_id: "m-rate-blocked",
+        origin: "agent:k1",
+        prompt: "must remain parked",
+        assignment_id: repair.assignment_id
+      })
+
+    parent = self()
+
+    start_supervised!(
+      {SessionLane,
+       session_key: "k1",
+       db: ctx.db,
+       task_sup: Tightbeam.TurnTaskSupervisor,
+       runner: fn turn ->
+         send(parent, {:rate_runner, turn.seq})
+         {:ok, %{text: "recovered"}}
+       end}
+    )
+
+    refute_receive {:rate_runner, _}, 100
+
+    assert {:ok, [["queued"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [blocked_seq])
+
+    assert :repair_required =
+             HarnessHealth.resolve(ctx.db, %{
+               correlation_id: "rate-success-before-resume",
+               harness: "claude",
+               host: "testhost",
+               failure_class: "rate-limit-dead",
+               session_key: "k1",
+               assignment_id: nil,
+               observed_at: 61,
+               cause: "a concurrent turn delivered before explicit resume",
+               principal: "agent:k1"
+             })
+
+    assert Tightbeam.HarnessProcess.parked?(ctx.db, adapter_key)
+
+    {:ok, coordinator} = RepairCoordinatorStub.start_link({self(), :ok})
+
+    handler =
+      ctx.catalog_base
+      |> gateway_config(ctx.db, 0)
+      |> Map.put(:adapter_coordinator, coordinator)
+      |> Gateway.handlers()
+      |> Map.fetch!("repair-assignment")
+
+    call = %{
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      lane_manager: ctx.lane,
+      params: %{
+        assignment_id: repair.assignment_id,
+        action: "resume",
+        idempotency_key: "rate-resume-once"
+      }
+    }
+
+    assert %{ok: true, action: "resume"} = first = handler.(call)
+    assert handler.(call) == first
+    refute Tightbeam.HarnessProcess.parked?(ctx.db, adapter_key)
+    assert_receive {:repair_close_adapter, ^adapter_key}
+    refute_receive {:repair_close_adapter, _}, 50
+
+    assert :ok = SessionLane.nudge("k1")
+    assert_receive {:rate_runner, ^blocked_seq}, 500
+
+    assert eventually(fn ->
+             match?(
+               {:ok, [["delivered"]]},
+               DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [blocked_seq])
+             )
+           end)
+  end
+
+  defp failed_repair_route!(ctx, assignment_id, failure_class, observed_at) do
+    session = Org.get(ctx.db, "k1")
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO assignments
+                 (id,subject,holderKey,openedByUser,openedAt,state,holderHarness,holderProvider)
+               VALUES (?1,'continue held work','k1','flynn',?2,'open',?3,?4)
+               """,
+               [assignment_id, observed_at, session.harness, session.provider]
+             )
+
+    {:ok, source_seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: "k1",
+        message_id: "m-#{assignment_id}",
+        origin: "agent:k1",
+        prompt: "continue held work",
+        assignment_id: assignment_id
+      })
+
+    {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "repair-fixture")
+
+    :ok =
+      Ledger.finish(ctx.db, source_seq, "failed", failure_class, owner_lease: turn.owner_lease)
+
+    assert {:opened, incident} =
+             HarnessHealth.observe(ctx.db, %{
+               correlation_id: "route-#{assignment_id}",
+               harness: session.harness,
+               host: session.host,
+               failure_class: failure_class,
+               evidence_kind: "authoritative-provider",
+               session_key: "k1",
+               assignment_id: assignment_id,
+               observed_at: observed_at,
+               cause: failure_class,
+               principal: "process:tightbeam"
+             })
+
+    %{
+      assignment_id: assignment_id,
+      source_seq: source_seq,
+      incident: incident,
+      session: session
+    }
   end
 
   # Hosts assimilated before the endpoint file existed, and hosts whose org token
@@ -10667,6 +10967,22 @@ defmodule Tightbeam.GatewayTest do
   # away. That last hop is why the assert_receive stays. Measured under a
   # 5-lane load (load average ~90): 0-106ms against the 1000ms default.
   defp barrier_lane_started(lane), do: :sys.get_state(lane)
+
+  defp eventually(fun, attempts \\ 60)
+
+  defp eventually(fun, attempts) do
+    cond do
+      fun.() ->
+        true
+
+      attempts <= 1 ->
+        false
+
+      true ->
+        Process.sleep(25)
+        eventually(fun, attempts - 1)
+    end
+  end
 
   defp collect_pushes(0, acc), do: Enum.reverse(acc)
 

@@ -153,6 +153,104 @@ defmodule Tightbeam.LedgerTest do
              )
   end
 
+  test "assignment repair claims before effects and replays one terminal result", %{db: db} do
+    :ok =
+      DB.execute(db, """
+      INSERT INTO assignments
+        (id,subject,holderKey,openedBySession,openedAt,state,holderHarness,holderProvider)
+      VALUES
+        ('asg_operation_one','repair one','k1','k1',1,'open','claude','anthropic'),
+        ('asg_operation_two','repair two','k1','k1',2,'open','claude','anthropic')
+      """)
+
+    assert {:ok, {:claimed, attempt_id}} =
+             Ledger.begin_assignment_repair(
+               db,
+               "asg_operation_one",
+               "same-key",
+               ~s(["restart",null]),
+               "restart",
+               "agent:test"
+             )
+
+    assert {:ok, {:in_progress, ^attempt_id}} =
+             Ledger.begin_assignment_repair(
+               db,
+               "asg_operation_one",
+               "same-key",
+               ~s(["restart",null]),
+               "restart",
+               "agent:test"
+             )
+
+    result = %{ok: false, code: "repair_failed", message: "adapter stayed down"}
+    assert :ok = Ledger.finish_assignment_repair(db, attempt_id, result)
+
+    assert {:ok, {:replay, ^result}} =
+             Ledger.begin_assignment_repair(
+               db,
+               "asg_operation_one",
+               "same-key",
+               ~s(["restart",null]),
+               "restart",
+               "agent:test"
+             )
+
+    assert {:error, :repair_key_conflict} =
+             Ledger.begin_assignment_repair(
+               db,
+               "asg_operation_one",
+               "same-key",
+               ~s(["resume",null]),
+               "resume",
+               "agent:test"
+             )
+
+    assert {:ok, {:claimed, other_attempt_id}} =
+             Ledger.begin_assignment_repair(
+               db,
+               "asg_operation_two",
+               "same-key",
+               ~s(["restart",null]),
+               "restart",
+               "agent:test"
+             )
+
+    assert other_attempt_id != attempt_id
+  end
+
+  test "concurrent assignment repair callers elect exactly one effect owner", %{db: db} do
+    :ok =
+      DB.execute(db, """
+      INSERT INTO assignments
+        (id,subject,holderKey,openedBySession,openedAt,state,holderHarness,holderProvider)
+      VALUES ('asg_operation_race','repair race','k1','k1',1,'open','claude','anthropic')
+      """)
+
+    results =
+      1..8
+      |> Task.async_stream(
+        fn _ ->
+          Ledger.begin_assignment_repair(
+            db,
+            "asg_operation_race",
+            "race-key",
+            ~s(["restart",null]),
+            "restart",
+            "agent:test"
+          )
+        end,
+        max_concurrency: 8,
+        ordered: false
+      )
+      |> Enum.map(fn {:ok, result} -> result end)
+
+    assert [{:ok, {:claimed, attempt_id}}] =
+             Enum.filter(results, &match?({:ok, {:claimed, _}}, &1))
+
+    assert Enum.count(results, &match?({:ok, {:in_progress, ^attempt_id}}, &1)) == 7
+  end
+
   # The stamp is the WHOLE identity, in fields. A context variant and a
   # reasoning level are different questions, and a turn's provenance has to be
   # able to tell `gpt-5.6-sol` at high from the same model at medium, and from
