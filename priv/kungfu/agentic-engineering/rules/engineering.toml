@@ -57,7 +57,7 @@ effect = "deny"
 deny_when = [
   { fact = "assignment.is_producing_card", op = "eq", value = true },
   { fact = "assignment.state", op = "eq", value = "open" },
-  { fact = "assignment.holder_archetype", op = "eq", value = "coder" },
+  { fact = "assignment.effect_kind", op = "eq", value = "code" },
   { fact = "assignment.holder_noted_verdict_kinds", op = "not_in", value = ["tests-passed"] },
 ]
 
