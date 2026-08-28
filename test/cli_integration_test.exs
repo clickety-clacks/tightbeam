@@ -985,6 +985,174 @@ defmodule Tightbeam.CliIntegrationTest do
     {status, raw_body |> to_string() |> JSON.decode!()}
   end
 
+  defp seed_terminal_response_fixtures!(ctx) do
+    now = 1_780_000_000_000
+    deadline = now + 86_400_000
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE decision_request_terminal_epoch SET legacyRulingFactMaxId=90000 WHERE id=0"
+             )
+
+    for {id, scope} <- [
+          {90_000, "dr_00000000-0000-4000-8000-000000000005"},
+          {90_001, "dr_00000000-0000-4000-8000-000000000002"},
+          {90_002, "dr_00000000-0000-4000-8000-000000000007"}
+        ] do
+      assert {:ok, _} =
+               DB.query(
+                 ctx.db,
+                 "INSERT INTO condition_facts (id,ts,kind,scope,origin) VALUES (?1,?2,'escalation-ruled',?3,'process:tightbeam')",
+                 [id, now + id, scope]
+               )
+    end
+
+    common = fn id, owner, raiser_session, status ->
+      assert {:ok, _} =
+               DB.query(
+                 ctx.db,
+                 "INSERT INTO decision_requests (id,kind,raiserId,raiserSessionKey,ownerUserId,raisedAt,deadlineAt,actionKey,question,options,context,status) VALUES (?1,'operator','agent:capture',?2,?3,?4,?5,?6,?7,'[{\"label\":\"accept\"},{\"label\":\"dismiss\"}]','{\"capture\":true}',?8)",
+                 [
+                   id,
+                   raiser_session,
+                   owner,
+                   now,
+                   deadline,
+                   "capture:#{id}",
+                   "Capture #{id}?",
+                   status
+                 ]
+               )
+    end
+
+    common.("dr_00000000-0000-4000-8000-000000000001", "flynn", ctx.session.session_key, "open")
+
+    common.(
+      "dr_00000000-0000-4000-8000-000000000003",
+      "flynn",
+      ctx.session.session_key,
+      "withdrawn"
+    )
+
+    common.(
+      "dr_00000000-0000-4000-8000-000000000004",
+      "flynn",
+      ctx.session.session_key,
+      "superseded"
+    )
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE decision_requests SET withdrawnBy='user:flynn',withdrawnReason='capture complete',withdrawnAt=?2 WHERE id=?1",
+               ["dr_00000000-0000-4000-8000-000000000003", now + 20]
+             )
+
+    common.("dr_00000000-0000-4000-8000-000000000005", "flynn", ctx.session.session_key, "open")
+    common.("dr_00000000-0000-4000-8000-000000000002", "flynn", ctx.session.session_key, "open")
+    common.("dr_00000000-0000-4000-8000-000000000007", "flynn", ctx.session.session_key, "open")
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE decision_requests SET status='ruled',decision='accept',rationale=NULL,ruledBy='user:flynn',ruledViaPrincipal='user:flynn',ruledViaSessionState='none',ruledAt=?2,rulingFactId=90000 WHERE id=?1",
+               ["dr_00000000-0000-4000-8000-000000000005", now + 100]
+             )
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE decision_requests SET ruledViaPrincipal=NULL,ruledViaSessionState=NULL WHERE id='dr_00000000-0000-4000-8000-000000000005'"
+             )
+
+    for {id, fact_id, ruled_at, status, consumed_at} <- [
+          {"dr_00000000-0000-4000-8000-000000000002", 90_001, now + 200, "ruled", nil},
+          {"dr_00000000-0000-4000-8000-000000000007", 90_002, now + 300, "consumed", now + 400}
+        ] do
+      assert {:ok, _} =
+               DB.query(
+                 ctx.db,
+                 "UPDATE decision_requests SET status=?2,decision='accept',rationale='captured',ruledBy='user:flynn',ruledViaPrincipal='user:flynn',ruledViaSessionState='none',ruledAt=?3,rulingFactId=?4,consumedAt=?5 WHERE id=?1",
+                 [id, status, ruled_at, fact_id, consumed_at]
+               )
+    end
+
+    for id <- [
+          "dr_00000000-0000-4000-8000-000000000005",
+          "dr_00000000-0000-4000-8000-000000000002",
+          "dr_00000000-0000-4000-8000-000000000007"
+        ] do
+      assert {:ok, _} =
+               DB.query(
+                 ctx.db,
+                 "INSERT INTO lifecycle_events (ts,kind,subject,detail) VALUES (?1,'decision_request_ruled',?2,NULL)",
+                 [now + 500, id]
+               )
+    end
+
+    for {id, cursor, ruled_at} <- [
+          {"dr_00000000-0000-4000-8000-000000000002", 90_000, now + 200},
+          {"dr_00000000-0000-4000-8000-000000000007", 90_001, now + 300}
+        ] do
+      prompt =
+        "Decision request #{id} was ruled. Read it with tightbeam decision-request --request #{id}."
+
+      assert {:ok, _} =
+               DB.query(
+                 ctx.db,
+                 "INSERT INTO wakes (wakeId,sessionKey,origin,prompt,consumer,dueAt,state,createdAt,conditionKind,conditionScope,conditionAfterId,creatorSessionKey,targetGate) VALUES (?1,?2,'process:tightbeam',?3,'prompt',?4,'pending',?5,'escalation-ruled',?6,?7,NULL,0)",
+                 [
+                   "w_capture_#{id}",
+                   ctx.session.session_key,
+                   prompt,
+                   ruled_at + 86_400_000,
+                   now,
+                   id,
+                   cursor
+                 ]
+               )
+    end
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('capture-other',0,'admin_add',1)"
+             )
+
+    ensure_main_session(ctx.db, "capture-other")
+
+    hidden =
+      Org.create(ctx.db, %{
+        session_key: "cli-capture-hidden",
+        display_name: "Hidden capture",
+        owner_user_id: "capture-other",
+        origin: "user:capture-other",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+
+    common.(
+      "dr_00000000-0000-4000-8000-000000000006",
+      "capture-other",
+      hidden.session_key,
+      "open"
+    )
+
+    [
+      {"open", "dr_00000000-0000-4000-8000-000000000001"},
+      {"ruled", "dr_00000000-0000-4000-8000-000000000002"},
+      {"withdrawn", "dr_00000000-0000-4000-8000-000000000003"},
+      {"superseded", "dr_00000000-0000-4000-8000-000000000004"},
+      {"legacy", "dr_00000000-0000-4000-8000-000000000005"},
+      {"hidden", "dr_00000000-0000-4000-8000-000000000006"},
+      {"impossibleConsumed", "dr_00000000-0000-4000-8000-000000000007"}
+    ]
+  end
+
   # Regression, found by smoke group 12. `Dispatch.dispatch/3` declares three
   # returns and the router's dispatch_response served two, so an escalating verb
   # reached `case` with no clause: CaseClauseError, an empty body from Bandit,
@@ -1204,6 +1372,81 @@ defmodule Tightbeam.CliIntegrationTest do
                       principal: {:session, "cli-holder"},
                       params: %{request: ^dismiss_request, action: "dismiss"}
                     }}
+  end
+
+  test "real CLI rejects duplicate exact-request flags before dispatch", ctx do
+    first_request = "dr_11111111-1111-4111-8111-111111111111"
+    second_request = "dr_22222222-2222-4222-8222-222222222222"
+
+    {output, status} =
+      System.cmd(
+        ctx.binary,
+        ["decision-request", "--request", first_request, "--request", second_request],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert status != 0
+    assert output =~ "usage: tightbeam decision-request --request <decisionRequestId>"
+    refute_receive {:cli_call, _call}
+  end
+
+  test "A-27 checked fixture is captured from release CLI and real HTTP responses", ctx do
+    baseline =
+      __DIR__
+      |> then(&Path.expand("fixtures/terminal_operator_real_gateway_baseline.json", &1))
+      |> File.read!()
+      |> JSON.decode!()
+
+    assert baseline["sourceRevision"] == "d38cd7823511a4b6ee5bb3d8180a1628fcb2ac3b"
+
+    assert Enum.sort(Map.keys(baseline["capture"])) ==
+             ~w(hidden impossibleConsumed legacy open ruled superseded withdrawn)
+
+    assert Enum.all?(baseline["capture"], fn {_name, captured} ->
+             captured["http"] == %{
+               "status" => 404,
+               "body" => %{
+                 "error" => %{
+                   "code" => "not_found",
+                   "message" => "decision request not found"
+                 }
+               }
+             } and captured["releaseCli"]["status"] == 1
+           end)
+
+    fixture_ids = seed_terminal_response_fixtures!(ctx)
+
+    actual =
+      Map.new(fixture_ids, fn {name, request_id} ->
+        {http_status, http_body} =
+          raw_agent_dispatch(ctx, ctx.session.cli_token, %{
+            "verb" => "decision-request",
+            "params" => %{"request" => request_id}
+          })
+
+        {cli_output, cli_status} =
+          System.cmd(ctx.binary, ["decision-request", "--request", request_id],
+            cd: ctx.workdir,
+            stderr_to_stdout: true
+          )
+
+        {name,
+         %{
+           "requestId" => request_id,
+           "http" => %{"status" => http_status, "body" => http_body},
+           "releaseCli" => %{"status" => cli_status, "output" => cli_output}
+         }}
+      end)
+
+    fixture_path =
+      Path.expand("fixtures/terminal_operator_real_gateway_candidate.json", __DIR__)
+
+    if File.exists?(fixture_path) do
+      assert actual == fixture_path |> File.read!() |> JSON.decode!()
+    else
+      flunk("capture fixture missing; real response was:\n#{JSON.encode!(actual)}")
+    end
   end
 
   test "A-14 raw HTTP pins exact-read and response refusal envelopes", ctx do
@@ -1820,7 +2063,7 @@ defmodule Tightbeam.CliIntegrationTest do
         [assignment_id]
       )
 
-    request_id = "dr_#{action}_#{System.unique_integer([:positive])}"
+    request_id = "dr_" <> Tightbeam.Id.uuid4()
     now = System.system_time(:millisecond)
 
     {:ok, _} =

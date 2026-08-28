@@ -4,7 +4,7 @@
 //! omission lets the gateway derive the principal from the discovered session
 //! credential.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -171,6 +171,27 @@ pub enum Command {
         identity: Identity,
         request_id: String,
         action: String,
+    },
+    OperatorAsk {
+        identity: Identity,
+        question: String,
+        note: Option<String>,
+        options: Option<Vec<String>>,
+        assignment_id: Option<String>,
+        deadline_ms: Option<String>,
+        supersedes: Option<String>,
+    },
+    OperatorRule {
+        identity: Identity,
+        request_id: String,
+        decision: Option<String>,
+        response: Option<String>,
+        rationale: Option<String>,
+    },
+    OperatorWithdraw {
+        identity: Identity,
+        request_id: String,
+        reason: String,
     },
     DecisionRequests {
         identity: Identity,
@@ -646,6 +667,14 @@ COMMANDS:
   effort-rule --request <decisionRequestId> --action continue|dismiss
       Rule an effort-without-effect check-in whose complete id you hold. The
       current expecter is the preferred responder, not an authorization gate.
+  operator-ask --question <q> [--note <t>] [--options a,b,c]
+               [--assignment <asgId>] [--deadline <dur>] [--supersedes <dr_id>]
+      File an owner-scoped operator decision request.
+  operator-rule <dr_id> (--decision <label> | --response <text>)
+                [--rationale <text>]
+      Record the operator's resolution. Main and presenting proxies never run this command.
+  operator-withdraw <dr_id> --reason <text>
+      Withdraw an operator decision request as its owner or original asker.
   decision-requests [--status open|ruled|consumed|withdrawn|superseded|returned|all]
       List decision requests visible to your principal.
   decision-request --request <decisionRequestId>
@@ -838,20 +867,26 @@ const BOOLEAN_FLAGS: &[&str] = &[
 struct Flags {
     positional: Vec<String>,
     flags: HashMap<String, String>,
+    duplicates: HashSet<String>,
 }
 
 fn split_args(args: Vec<String>) -> Flags {
     let mut positional = Vec::new();
     let mut flags = HashMap::new();
+    let mut duplicates = HashSet::new();
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
         if let Some(name) = arg.strip_prefix("--") {
             if BOOLEAN_FLAGS.contains(&name) {
-                flags.insert(name.to_owned(), String::new());
+                if flags.insert(name.to_owned(), String::new()).is_some() {
+                    duplicates.insert(name.to_owned());
+                }
             } else {
                 let value = args.get(index + 1).cloned().unwrap_or_default();
-                flags.insert(name.to_owned(), value);
+                if flags.insert(name.to_owned(), value).is_some() {
+                    duplicates.insert(name.to_owned());
+                }
                 index += 1;
             }
         } else {
@@ -859,11 +894,34 @@ fn split_args(args: Vec<String>) -> Flags {
         }
         index += 1;
     }
-    Flags { positional, flags }
+    Flags {
+        positional,
+        flags,
+        duplicates,
+    }
 }
 
 fn nonempty(flags: &HashMap<String, String>, name: &str) -> Option<String> {
     flags.get(name).filter(|value| !value.is_empty()).cloned()
+}
+
+fn complete_decision_request_id(value: &str) -> bool {
+    let Some(uuid) = value.strip_prefix("dr_") else {
+        return false;
+    };
+    let bytes = uuid.as_bytes();
+
+    bytes.len() == 36
+        && [8, 13, 18, 23]
+            .into_iter()
+            .all(|index| bytes[index] == b'-')
+        && bytes[14] == b'4'
+        && matches!(bytes[19], b'8' | b'9' | b'a' | b'b')
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            matches!(index, 8 | 13 | 18 | 23)
+                || byte.is_ascii_digit()
+                || matches!(byte, b'a'..=b'f')
+        })
 }
 
 const TUNE_USAGE: &str = "usage: tightbeam tune --session <key> (--harness <harness> --model <model> | --model <model> | --effort <level>) [--effort <level>] [--context <variant>]";
@@ -1552,6 +1610,59 @@ fn parse_with_optional_catalog(
                 action,
             })
         }
+        "operator-ask" => {
+            if parsed.positional.len() != 1 {
+                return Err("usage: tightbeam operator-ask --question <q> [--note <t>] [--options a,b,c] [--assignment <asgId>] [--deadline <dur>] [--supersedes <dr_id>]".to_owned());
+            }
+            let question =
+                nonempty(flags, "question").ok_or_else(|| "--question is required".to_owned())?;
+            let options = flags
+                .get("options")
+                .map(|value| value.split(',').map(str::to_owned).collect::<Vec<_>>());
+            let deadline_ms = flags
+                .get("deadline")
+                .map(|value| parse_duration("deadline", value))
+                .transpose()?;
+            Ok(Command::OperatorAsk {
+                identity: identity(flags)?,
+                question,
+                note: nonempty(flags, "note"),
+                options,
+                assignment_id: nonempty(flags, "assignment"),
+                deadline_ms,
+                supersedes: nonempty(flags, "supersedes"),
+            })
+        }
+        "operator-rule" => {
+            if parsed.positional.len() != 2 {
+                return Err("usage: tightbeam operator-rule <dr_id> (--decision <label> | --response <text>) [--rationale <text>]".to_owned());
+            }
+            let decision = flags.get("decision").cloned();
+            let response = flags.get("response").cloned();
+            if decision.is_some() == response.is_some() {
+                return Err(
+                    "operator-rule requires exactly one of --decision or --response".to_owned(),
+                );
+            }
+            Ok(Command::OperatorRule {
+                identity: identity(flags)?,
+                request_id: parsed.positional[1].clone(),
+                decision,
+                response,
+                rationale: nonempty(flags, "rationale"),
+            })
+        }
+        "operator-withdraw" => {
+            if parsed.positional.len() != 2 {
+                return Err("usage: tightbeam operator-withdraw <dr_id> --reason <text>".to_owned());
+            }
+            Ok(Command::OperatorWithdraw {
+                identity: identity(flags)?,
+                request_id: parsed.positional[1].clone(),
+                reason: nonempty(flags, "reason")
+                    .ok_or_else(|| "--reason is required".to_owned())?,
+            })
+        }
         "decision-requests" => {
             if parsed.positional.len() != 1 {
                 return Err(
@@ -1568,7 +1679,10 @@ fn parse_with_optional_catalog(
             let request_id = nonempty(flags, "request");
 
             if parsed.positional.len() != 1
-                || request_id.is_none()
+                || !request_id
+                    .as_deref()
+                    .is_some_and(complete_decision_request_id)
+                || parsed.duplicates.contains("request")
                 || flags.keys().any(|flag| !ALLOWED.contains(&flag.as_str()))
             {
                 return Err(
@@ -2076,7 +2190,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, decision-request, ask, answer, return, revoke-assignment, reopen-assignment, repair-assignment, work-item-create, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, ask, answer, return, revoke-assignment, reopen-assignment, repair-assignment, work-item-create, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -2895,6 +3009,9 @@ mod tests {
                 "learn",
                 "list",
                 "onboard",
+                "operator-ask",
+                "operator-rule",
+                "operator-withdraw",
                 "retire",
                 "return",
                 "reopen-assignment",
@@ -3490,34 +3607,122 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, decision-request, ask, answer, return, revoke-assignment, reopen-assignment, repair-assignment, work-item-create, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, ask, answer, return, revoke-assignment, reopen-assignment, repair-assignment, work-item-create, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned())
         );
     }
 
     #[test]
+    fn operator_decision_commands_parse_the_exact_surface() {
+        assert_eq!(
+            parse(strings(&[
+                "operator-ask",
+                "--question",
+                "ship window?",
+                "--note",
+                "release train",
+                "--options",
+                "accept,wait",
+                "--assignment",
+                "asg_1",
+                "--deadline",
+                "2h",
+                "--supersedes",
+                "dr_old",
+                "--as",
+                "coder:release",
+            ])),
+            Ok(Command::OperatorAsk {
+                identity: Identity::Role("coder:release".to_owned()),
+                question: "ship window?".to_owned(),
+                note: Some("release train".to_owned()),
+                options: Some(vec!["accept".to_owned(), "wait".to_owned()]),
+                assignment_id: Some("asg_1".to_owned()),
+                deadline_ms: Some("7200000".to_owned()),
+                supersedes: Some("dr_old".to_owned()),
+            })
+        );
+
+        assert_eq!(
+            parse(strings(&[
+                "operator-rule",
+                "dr_1",
+                "--response",
+                "ship after 013",
+                "--rationale",
+                "dependency first",
+                "--as-user",
+                "mike",
+            ])),
+            Ok(Command::OperatorRule {
+                identity: Identity::User("mike".to_owned()),
+                request_id: "dr_1".to_owned(),
+                decision: None,
+                response: Some("ship after 013".to_owned()),
+                rationale: Some("dependency first".to_owned()),
+            })
+        );
+    }
+
+    #[test]
+    fn operator_rule_requires_one_answer_form() {
+        for args in [
+            strings(&["operator-rule", "dr_1"]),
+            strings(&[
+                "operator-rule",
+                "dr_1",
+                "--decision",
+                "accept",
+                "--response",
+                "yes",
+            ]),
+        ] {
+            assert_eq!(
+                parse(args),
+                Err("operator-rule requires exactly one of --decision or --response".to_owned())
+            );
+        }
+    }
+
+    #[test]
     fn decision_request_requires_one_exact_request_flag_and_closed_identity_flags() {
+        let request_id = "dr_12345678-1234-4234-9234-123456789abc";
+
         assert_eq!(
             parse(strings(&[
                 "decision-request",
                 "--request",
-                "dr_1",
+                request_id,
                 "--as",
                 "reviewer",
             ])),
             Ok(Command::DecisionRequest {
                 identity: Identity::Role("reviewer".to_owned()),
-                request_id: "dr_1".to_owned(),
+                request_id: request_id.to_owned(),
             })
         );
 
         for args in [
-            vec!["decision-request"],
-            vec!["decision-request", "dr_1"],
-            vec!["decision-request", "--request", ""],
-            vec!["decision-request", "--request", "dr_1", "--target", "main"],
+            strings(&["decision-request"]),
+            strings(&["decision-request", request_id]),
+            strings(&["decision-request", "--request", ""]),
+            strings(&["decision-request", "--request", "dr_12345678"]),
+            strings(&[
+                "decision-request",
+                "--request",
+                request_id,
+                "--request",
+                "dr_87654321-4321-4321-8321-cba987654321",
+            ]),
+            strings(&[
+                "decision-request",
+                "--request",
+                request_id,
+                "--target",
+                "main",
+            ]),
         ] {
             assert_eq!(
-                parse(args.into_iter().map(str::to_owned).collect()),
+                parse(args),
                 Err("usage: tightbeam decision-request --request <decisionRequestId>".to_owned())
             );
         }

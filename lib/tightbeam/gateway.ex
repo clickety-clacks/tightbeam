@@ -792,18 +792,32 @@ defmodule Tightbeam.Gateway do
       {"return", ["decision_request.returned"]} => fn call ->
         decision_request_result(Escalation.return_request(db, call))
       end,
+      {"operator-ask", ["decision_request.opened"]} => fn call ->
+        decision_request_result(Escalation.operator_ask(db, call))
+      end,
+      {"operator-rule", ["decision_request.ruled"]} => fn call ->
+        decision_request_result(
+          Escalation.operator_rule(db, call,
+            scheduler: Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler),
+            firehose_call: call
+          )
+        )
+      end,
+      {"operator-withdraw", ["decision_request.withdrawn"]} => fn call ->
+        decision_request_result(Escalation.operator_withdraw(db, call))
+      end,
       {"decision-requests", []} => fn call ->
         case Escalation.list_status(call.params[:status]) do
           {:ok, status} ->
             caller = resolve_caller(db, call.origin)
 
-            %{
-              decision_requests:
-                Escalation.list(db, call, status,
-                  owner_user_id: caller && caller.owner_user_id,
-                  admin: admin_origin?(db, call.origin)
-                )
-            }
+            case Escalation.list(db, call, status,
+                   owner_user_id: caller && caller.owner_user_id,
+                   admin: admin_origin?(db, call.origin)
+                 ) do
+              %{code: _} = err -> err
+              requests -> %{decision_requests: requests}
+            end
 
           %{code: _} = err ->
             err
@@ -836,6 +850,7 @@ defmodule Tightbeam.Gateway do
 
         case request do
           nil -> %{code: "not_found", message: "decision request not found"}
+          %{code: _} = err -> err
           request -> %{decision_request: request}
         end
       end,
@@ -1624,6 +1639,22 @@ defmodule Tightbeam.Gateway do
           | :invalid_reply_reference
           | :skipped
   def deliver_prompt_in_txn(%DB.Txn{} = txn, session_key, origin, prompt, opts \\ []) do
+    case existing_wake_turn_in_txn(txn, opts[:wake_id]) do
+      nil -> deliver_prompt_once_in_txn(txn, session_key, origin, prompt, opts)
+      duplicate -> duplicate
+    end
+  end
+
+  defp existing_wake_turn_in_txn(_txn, wake_id) when not is_binary(wake_id), do: nil
+
+  defp existing_wake_turn_in_txn(txn, wake_id) do
+    case DB.Txn.q(txn, "SELECT seq FROM turns WHERE wakeId=?1 LIMIT 1", [wake_id]) do
+      [[seq]] -> {:duplicate, %{wake_id: wake_id, turn_seq: seq}}
+      [] -> nil
+    end
+  end
+
+  defp deliver_prompt_once_in_txn(txn, session_key, origin, prompt, opts) do
     # The authenticated post handler is the provenance boundary. Device/client
     # identifiers alone are not evidence: process deliveries also use them for dedupe.
     authenticated_device_message? =

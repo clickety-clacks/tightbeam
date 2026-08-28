@@ -76,7 +76,8 @@ defmodule Tightbeam.Schema do
   # column. The v4 stamp is the one exact predecessor that upgrade accepts.
   # The nullable transcript discriminator adds `messages.messageType`; v6 is
   # its one exact predecessor, and historical rows remain null.
-  @shape "coordination-fabric-v1-phase1-v7"
+  @shape "coordination-fabric-v1-phase1-v8"
+  @terminal_decision_previous_shape "coordination-fabric-v1-phase1-v7"
   @message_type_previous_shape "coordination-fabric-v1-phase1-v6"
   @cold_start_previous_shape "coordination-fabric-v1-phase1-v5"
   @operational_parent_shape "coordination-fabric-v1-phase1-v5"
@@ -789,6 +790,8 @@ defmodule Tightbeam.Schema do
       :ok = module.ensure_schema(db)
     end)
 
+    :ok = Tightbeam.Escalation.ensure_terminal_epoch(db)
+
     :ok = Tightbeam.ColdStart.validate!(db)
 
     activated_at = System.system_time(:millisecond)
@@ -873,7 +876,7 @@ defmodule Tightbeam.Schema do
            Txn.q(
              txn,
              "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1",
-             [@message_type_previous_shape, @shape, migration_time]
+             [@message_type_previous_shape, @terminal_decision_previous_shape, migration_time]
            )
 
            if Txn.changes(txn) != 1 do
@@ -891,6 +894,50 @@ defmodule Tightbeam.Schema do
       {:error, error} ->
         raise ShapeError,
           message: "incompatible_message_type_v1: upgrade failed: #{Exception.message(error)}"
+    end
+  end
+
+  @doc false
+  @spec upgrade_terminal_operator_decision_v1(DB.server()) :: :ok
+  def upgrade_terminal_operator_decision_v1(db) do
+    migration_time = System.system_time(:millisecond)
+
+    case DB.foreign_key_rebuild(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@terminal_decision_previous_shape]] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message:
+                   "incompatible_terminal_operator_decision_v1: predecessor stamp #{inspect(rows)}"
+           end
+
+           :ok = Tightbeam.Escalation.migrate_terminal_operator_decision_v1_in_txn(txn)
+
+           Txn.q(
+             txn,
+             "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1",
+             [@terminal_decision_previous_shape, @shape, migration_time]
+           )
+
+           if Txn.changes(txn) != 1 do
+             raise ShapeError,
+               message: "incompatible_terminal_operator_decision_v1: stamp race"
+           end
+
+           :ok
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "incompatible_terminal_operator_decision_v1: upgrade failed: #{Exception.message(error)}"
     end
   end
 
@@ -1214,17 +1261,23 @@ defmodule Tightbeam.Schema do
       {:ok, [[@shape]]} ->
         :ok
 
+      {:ok, [[@terminal_decision_previous_shape]]} ->
+        upgrade_terminal_operator_decision_v1(db)
+
       {:ok, [[@message_type_previous_shape]]} ->
-        upgrade_message_type_v1(db)
+        :ok = upgrade_message_type_v1(db)
+        upgrade_terminal_operator_decision_v1(db)
 
       {:ok, [[@cold_start_previous_shape]]} ->
         :ok = upgrade_cold_start_v1(db)
-        upgrade_message_type_v1(db)
+        :ok = upgrade_message_type_v1(db)
+        upgrade_terminal_operator_decision_v1(db)
 
       {:ok, [[@operational_parent_previous_shape]]} ->
         :ok = upgrade_operational_parent_v1(db)
         :ok = upgrade_cold_start_v1(db)
-        upgrade_message_type_v1(db)
+        :ok = upgrade_message_type_v1(db)
+        upgrade_terminal_operator_decision_v1(db)
 
       {:ok, []} ->
         # No stamp. Either a database this build is about to create, or one
@@ -1241,8 +1294,9 @@ defmodule Tightbeam.Schema do
           this build: #{@shape}
 
         There is no migration from #{found}. The only supported upgrade sources
-        are #{@operational_parent_previous_shape}, #{@cold_start_previous_shape}, and
-        #{@message_type_previous_shape}. Move this database aside and let it be recreated.
+        are #{@operational_parent_previous_shape}, #{@cold_start_previous_shape},
+        #{@message_type_previous_shape}, and #{@terminal_decision_previous_shape}.
+        Move this database aside and let it be recreated.
         """
 
       # More than one shape stamped. Nothing writes a second row, so this is a
