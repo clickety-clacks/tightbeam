@@ -17,7 +17,7 @@ defmodule Tightbeam.Harness.Cursor do
   @bundle_sha256 "6aceb24b7c7ecddb1993946ebb18a7dd4d025842e6efda955eb0c13255b1e5f0"
   @credential_file "cli-config.json"
   @api_key_file "api-key"
-  @rails_file "hooks.json"
+  @rails_file ".cursor/hooks.json"
 
   # The catalog must not advertise what the adapter will refuse. `cursor-agent
   # --list-models` publishes ~200 refs; ACP `session/new` exposes a closed enum
@@ -106,6 +106,7 @@ defmodule Tightbeam.Harness.Cursor do
             {:ok,
              [
                readiness_rendezvous: true,
+               cursor_execution_identity: true,
                cmd: [adapter_binary(target)],
                env: [
                  {"CURSOR_CONFIG_DIR", home},
@@ -121,6 +122,19 @@ defmodule Tightbeam.Harness.Cursor do
       else
         local_only_refusal()
       end
+    end
+  end
+
+  @doc false
+  def execution_base(home_override), do: Path.join(execution_home(home_override), ".tightbeam")
+
+  @doc false
+  def execution_home(home_override) when is_binary(home_override), do: home_override
+
+  def execution_home(nil) do
+    case :os.type() do
+      {:unix, :darwin} -> "/Users/tightbeam-cursor"
+      {:unix, _} -> "/home/tightbeam-cursor"
     end
   end
 

@@ -406,7 +406,9 @@ defmodule Tightbeam.Homes do
   defp write_rails(_home, _filename, nil), do: :ok
 
   defp write_rails(home, filename, content) do
-    File.write!(Path.join(home, filename), content)
+    path = Path.join(home, filename)
+    File.mkdir_p!(Path.dirname(path))
+    File.write!(path, content)
   end
 
   defp project_baseline_skills(home) do

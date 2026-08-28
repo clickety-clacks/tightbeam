@@ -392,7 +392,7 @@ defmodule Tightbeam.CursorRegistrationTest do
   test "Cursor owns only its non-secret config and compiled hooks" do
     owned = Cursor.owned_home_entries()
     assert "cli-config.json" in owned
-    assert "hooks.json" in owned
+    assert ".cursor/hooks.json" in owned
 
     base =
       Path.join(System.tmp_dir!(), "cursor-registration-#{System.unique_integer([:positive])}")
@@ -419,7 +419,10 @@ defmodule Tightbeam.CursorRegistrationTest do
                rails: %{"hooks" => %{"PreToolUse" => []}}
              })
 
-    assert JSON.decode!(File.read!(Path.join(home, "hooks.json"))) == %{"hooks" => %{}}
+    assert JSON.decode!(File.read!(Path.join([home, ".cursor", "hooks.json"]))) == %{
+             "hooks" => %{}
+           }
+
     refute File.exists?(Path.join(home, "api-key"))
   end
 
