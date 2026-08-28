@@ -63,6 +63,7 @@ defmodule Tightbeam.GatewayTest do
     LaneManager,
     Ledger,
     ModelCatalog,
+    NoticeBatcher,
     Org,
     Placement,
     Projection,
@@ -1824,6 +1825,132 @@ defmodule Tightbeam.GatewayTest do
              event.kind == "wake_unresolved" and event.subject == deleted.wake_id and
                event.detail == "role reviewer no longer exists"
            end)
+  end
+
+  test "removed role makes a notice batch terminally fail instead of claiming delivery", ctx do
+    base_dir = role_test_base("batched-role-removal")
+    config = gateway_config(base_dir, ctx.db, 0)
+    {Wakes, wake_opts} = Gateway.children(config) |> Enum.find(&match?({Wakes, _}, &1))
+    scheduler = :"batched_role_wakes_#{System.unique_integer([:positive])}"
+
+    start_supervised!(%{
+      id: :batched_role_conn_registry,
+      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+    })
+
+    start_supervised!({Wakes, Keyword.put(wake_opts, :name, scheduler)})
+
+    recipient = create_session(ctx.db, "agent:batch-recipient", "flynn")
+    Roles.create!(ctx.db, "batch-recipient", "flynn", recipient.session_key)
+
+    {:ok, _policy} =
+      DB.transaction(ctx.db, fn txn ->
+        Org.apply_notice_batching_lane_policy_in_txn(
+          txn,
+          %{session_key: recipient.session_key, target_role: "batch-recipient"},
+          true,
+          "notice-batching-test-policy:role-removal",
+          "agent:test-policy",
+          "role-removal-regression",
+          1
+        )
+      end)
+
+    source =
+      Wakes.schedule(ctx.db, %{
+        session_key: recipient.session_key,
+        target_role: "batch-recipient",
+        origin: "process:tightbeam",
+        prompt: "batched role delivery",
+        due_at: 0,
+        class: "fyi"
+      })
+
+    [carrier_id] = Wakes.materialize_digests(ctx.db, source.due_at)
+    [%{batch_id: batch_id}] = NoticeBatcher.source_refs(ctx.db, source.wake_id)
+    assert :ok = Roles.rm(ctx.db, "batch-recipient")
+    {:ok, _} = DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [carrier_id])
+
+    assert :ok = Wakes.fire_due(scheduler)
+    assert Wakes.get(ctx.db, carrier_id).state == "fired"
+
+    assert %{state: "delivery_failed", terminal_cause: ":skipped"} =
+             NoticeBatcher.batch(ctx.db, batch_id)
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [carrier_id])
+  end
+
+  test "inspect exposes batch refs and denies a batch when any source is unauthorized", ctx do
+    base_dir = role_test_base("notice-batch-inspect")
+    Archetypes.load!(base_dir)
+    other = create_session(ctx.db, "agent:batch-other-owner", "tron")
+
+    {:ok, _policy} =
+      DB.transaction(ctx.db, fn txn ->
+        Org.apply_notice_batching_lane_policy_in_txn(
+          txn,
+          %{session_key: "k1", target_role: nil},
+          true,
+          "notice-batching-test-policy:inspect",
+          "agent:test-policy",
+          "inspect-authorization-regression",
+          1
+        )
+      end)
+
+    first =
+      Wakes.schedule(ctx.db, %{
+        session_key: "k1",
+        origin: "process:tightbeam",
+        prompt: "first authorized member",
+        due_at: 0,
+        class: "fyi"
+      })
+
+    second =
+      Wakes.schedule(ctx.db, %{
+        session_key: "k1",
+        origin: "process:tightbeam",
+        prompt: "second authorized member",
+        due_at: 0,
+        class: "fyi"
+      })
+
+    [%{batch_id: batch_id}] = NoticeBatcher.source_refs(ctx.db, first.wake_id)
+    inspect = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["inspect"]
+
+    readable =
+      inspect.(%{
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        session_key: nil,
+        params: %{batch_id: batch_id}
+      })
+
+    assert %{member_count: 2, members: members} = readable.batch
+    assert Enum.map(members, & &1.source_wake_id) == [first.wake_id, second.wake_id]
+
+    assert %{batch_refs: [%{batch_id: ^batch_id}]} =
+             Enum.find(readable.wakes, &(&1.wake_id == first.wake_id))
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE wakes SET sessionKey=?2 WHERE wakeId=?1", [
+        second.wake_id,
+        other.session_key
+      ])
+
+    denied =
+      inspect.(%{
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        session_key: nil,
+        params: %{batch_id: batch_id}
+      })
+
+    assert denied.batch == nil
+    assert Enum.any?(denied.wakes, &(&1.wake_id == first.wake_id))
+    refute Enum.any?(denied.wakes, &(&1.wake_id == second.wake_id))
   end
 
   test "Gateway.children effort consumer routes a due dispatch bracket through Wakes once", ctx do
