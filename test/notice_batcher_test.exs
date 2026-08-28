@@ -351,12 +351,18 @@ defmodule Tightbeam.NoticeBatcherTest do
   end
 
   test "acceptance 18: visibility scopes split one role lane and gate batch reads", %{db: db} do
-    first = manual_member(db, "role:shared:scope-a", target_role: "shared")
-    second = manual_member(db, "role:shared:scope-b", target_role: "shared")
+    seed_session(db, "agent:scope-a", "owner-a")
+    seed_session(db, "agent:scope-b", "owner-b")
+
+    first =
+      manual_member(db, "role:shared:scope-a", target_role: "shared", session: "agent:scope-a")
+
+    second =
+      manual_member(db, "role:shared:scope-b", target_role: "shared", session: "agent:scope-b")
 
     assert first.batch_id != second.batch_id
-    assert NoticeBatcher.read_batch(db, first.batch_id, "role:shared:scope-a").member_count == 1
-    assert NoticeBatcher.read_batch(db, second.batch_id, "role:shared:scope-a") == nil
+    assert NoticeBatcher.read_batch(db, first.batch_id, {:user, "owner-a"}).member_count == 1
+    assert NoticeBatcher.read_batch(db, second.batch_id, {:user, "owner-a"}) == nil
   end
 
   test "acceptance 19: an exec-desk role receives the ordinary carrier without desk state",
