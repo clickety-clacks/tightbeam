@@ -132,6 +132,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             condition_kind,
             condition_scope,
             idempotency_key,
+            class,
         } => {
             let target = match target {
                 Target::Session(value) => string_field("sessionKey", value),
@@ -149,6 +150,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 ("conditionKind", condition_kind),
                 ("conditionScope", condition_scope),
                 ("idempotencyKey", idempotency_key),
+                ("class", class),
             ] {
                 if let Some(value) = value {
                     params.push(string_field(name, value));
@@ -1764,6 +1766,39 @@ mod tests {
                 "flynn"
             ]),
             r#"{"asUser":"flynn","verb":"wake","userId":"mike","params":{"prompt":"go","at":16}}"#
+        );
+        assert_eq!(
+            body(&[
+                "wake", "--role", "owner", "--prompt", "finished", "--class", "fyi", "--as",
+                "coder",
+            ]),
+            r#"{"as":"coder","verb":"wake","role":"owner","params":{"prompt":"finished","class":"fyi"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "wake",
+                "--role",
+                "owner",
+                "--prompt",
+                "extension",
+                "--class",
+                "kungfu:deploy-window",
+                "--as",
+                "coder",
+            ]),
+            r#"{"as":"coder","verb":"wake","role":"owner","params":{"prompt":"extension","class":"kungfu:deploy-window"}}"#
+        );
+        assert_eq!(
+            args::parse(
+                [
+                    "wake", "--role", "owner", "--prompt", "go", "--class", "", "--as", "coder",
+                ]
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect()
+            )
+            .unwrap_err(),
+            "--class requires a class name"
         );
     }
 

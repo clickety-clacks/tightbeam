@@ -650,6 +650,9 @@ defmodule Tightbeam.Gateway do
           not (is_binary(p[:prompt]) and p.prompt != "") ->
             %{code: "invalid", message: "a wake must carry a prompt"}
 
+          Map.has_key?(p, :class) and not (is_binary(p[:class]) and p[:class] != "") ->
+            %{code: "invalid", message: "--class requires a class name"}
+
           not valid_reresolve?(p) ->
             %{code: "invalid", message: "reresolve lineage requires seed and rung"}
 
@@ -3730,6 +3733,10 @@ defmodule Tightbeam.Gateway do
         condition_kind: condition_kind,
         condition_scope: condition_scope,
         creator_session_key: creator_session_key(call[:principal]),
+        # A class is the sender's election. An explicit time is also the
+        # sender's election and inhibits batching without discarding the class.
+        class: p[:class],
+        sender_scheduled: not is_nil(p[:at]) or not is_nil(p[:after_ms]),
         reresolve: p[:reresolve],
         reresolve_seed: p[:reresolve_seed],
         reresolve_rung: p[:reresolve_rung],
@@ -3810,11 +3817,27 @@ defmodule Tightbeam.Gateway do
   defp creator_session_key(_principal), do: nil
 
   defp select_wake_in_txn_sql do
-    "SELECT wakeId, dueAt, state FROM wakes WHERE wakeId = ?1"
+    "SELECT wakeId, dueAt, state, class, deliveryRule FROM wakes WHERE wakeId = ?1"
   end
 
-  defp wake_from_in_txn_row([wake_id, due_at, state]),
-    do: %{wake_id: wake_id, due_at: due_at, state: state}
+  defp wake_from_in_txn_row([wake_id, due_at, state, class, delivery_rule]),
+    do: %{
+      wake_id: wake_id,
+      due_at: due_at,
+      state: state,
+      class: class,
+      delivery_rule: delivery_rule
+    }
+
+  defp wake_response(%{class: class} = wake) when is_binary(class) do
+    %{
+      wake_id: wake.wake_id,
+      due_at: wake.due_at,
+      state: wake.state,
+      class: class,
+      delivery_rule: wake[:delivery_rule]
+    }
+  end
 
   defp wake_response(wake) do
     %{wake_id: wake.wake_id, due_at: wake.due_at, state: wake.state}

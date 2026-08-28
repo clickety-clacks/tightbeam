@@ -16,6 +16,8 @@ defmodule Tightbeam.Schema do
     Tightbeam.SubagentMarkers,
     Tightbeam.Escalation,
     Tightbeam.Wakes,
+    Tightbeam.NoticeBatcher,
+    Tightbeam.AdminProjection,
     Tightbeam.Projection,
     Tightbeam.Org,
     Tightbeam.CriticalLeases,
@@ -37,9 +39,49 @@ defmodule Tightbeam.Schema do
   # The shape this build writes. Bump it when a production table changes in a
   # way that makes an older database unreadable, and give the refusal below a
   # sentence saying what changed.
-  @shape "terminal-operator-decision-parity-v1"
+  @shape "notice-batching-v1-019"
+  @terminal_decision_shape "terminal-operator-decision-parity-v1"
   @operator_decision_shape "operator-decision-requests-v1"
   @model_identity_shape "model-identity-v1"
+
+  # Exact target for the one stamped predecessor. Legacy wakes acquire no
+  # classification or batching state: every old row copies with NULL class
+  # provenance and false digest/summon flags.
+  @notice_batching_wakes_ddl """
+  CREATE TABLE wakes_notice_batching_v1 (
+    wakeId     TEXT PRIMARY KEY,
+    sessionKey TEXT NOT NULL,
+    targetRole TEXT,
+    origin     TEXT NOT NULL,
+    prompt     TEXT,
+    consumer   TEXT NOT NULL DEFAULT 'prompt',
+    dueAt      INTEGER NOT NULL,
+    state      TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','fired','canceled')),
+    createdAt  INTEGER NOT NULL,
+    firedAt    INTEGER,
+    reresolve  TEXT NULL CHECK (reresolve IN ('lineage')),
+    reresolveSeed TEXT NULL,
+    reresolveRung INTEGER NULL,
+    conditionKind TEXT NULL,
+    conditionScope TEXT NULL,
+    conditionAfterId INTEGER NULL,
+    firedBy TEXT NULL CHECK (firedBy IN ('condition','fallback')),
+    creatorSessionKey TEXT NULL,
+    rumination INTEGER NOT NULL DEFAULT 0,
+    work_item_id TEXT,
+    assignmentId TEXT,
+    canceledAt INTEGER,
+    targetGate INTEGER NOT NULL DEFAULT 1,
+    class TEXT,
+    classElection TEXT CHECK (classElection IN ('sender','classifier','batcher')),
+    deliveryRule TEXT,
+    digest INTEGER NOT NULL DEFAULT 0 CHECK (digest IN (0,1)),
+    summon INTEGER NOT NULL DEFAULT 0 CHECK (summon IN (0,1)),
+    CHECK (consumer != 'prompt' OR prompt IS NOT NULL),
+    CHECK ((class IS NULL) = (classElection IS NULL)),
+    CHECK (digest = 0 OR class IS NOT NULL)
+  );
+  """
 
   # The one predecessor shape this build can migrate. This is deliberately a
   # complete target table, not an ALTER inferred from sqlite_master: the stamp
@@ -398,11 +440,16 @@ defmodule Tightbeam.Schema do
               (reasonKind = 'obligation_disposed' AND
                causalSourceKind IN ('work_item_transition','decision_request','monitor_generation') AND
                outcomeKind = 'disposition')))
-            OR
-            (requesterId = 'tightbeam:supervision' AND reasonKind = 'superseded' AND
-             causalSourceKind = 'progress_attest' AND outcomeKind = 'no_replacement')
-            OR
-            (requesterId = 'tightbeam:retirement' AND
+          OR
+          (requesterId = 'tightbeam:supervision' AND reasonKind = 'superseded' AND
+           causalSourceKind = 'progress_attest' AND outcomeKind = 'no_replacement')
+          OR
+          -- The batcher consumes exactly one member by naming the digest wake
+          -- that replaces it. No other cancellation shape is admitted.
+          (requesterId = 'tightbeam:batcher' AND reasonKind = 'superseded' AND
+           causalSourceKind = 'wake' AND outcomeKind = 'replacement')
+          OR
+          (requesterId = 'tightbeam:retirement' AND
              ((reasonKind = 'target_retired' AND causalSourceKind = 'session_transition' AND
                outcomeKind IN ('replacement','no_replacement'))
               OR
@@ -1039,11 +1086,16 @@ defmodule Tightbeam.Schema do
       {:ok, [[@shape]]} ->
         :ok
 
+      {:ok, [[@terminal_decision_shape]]} ->
+        migrate_notice_batching_v1_019(db)
+
       {:ok, [[@operator_decision_shape]]} ->
-        migrate_operator_decision_v1(db)
+        :ok = migrate_operator_decision_v1(db)
+        migrate_notice_batching_v1_019(db)
 
       {:ok, [[@model_identity_shape]]} ->
-        migrate_model_identity_v1(db)
+        :ok = migrate_model_identity_v1(db)
+        migrate_notice_batching_v1_019(db)
 
       {:ok, []} ->
         # No stamp. Either a database this build is about to create, or one
@@ -1059,7 +1111,8 @@ defmodule Tightbeam.Schema do
           stamped: #{found}
           this build: #{@shape}
 
-        This build can migrate only #{@model_identity_shape} or #{@operator_decision_shape} to #{@shape}.
+        This build can migrate #{@model_identity_shape} or #{@operator_decision_shape}
+        to #{@terminal_decision_shape}, then #{@terminal_decision_shape} to #{@shape}.
 
         No migration is defined for the stamped shape above. Keep the database
         in place and run a Tightbeam build that recognizes that exact stamp.
@@ -1110,13 +1163,17 @@ defmodule Tightbeam.Schema do
              Txn.q(
                txn,
                "UPDATE schema_stamp SET shape = ?1, stampedAt = ?2 WHERE shape = ?3",
-               [@shape, System.system_time(:millisecond), @operator_decision_shape]
+               [
+                 @terminal_decision_shape,
+                 System.system_time(:millisecond),
+                 @operator_decision_shape
+               ]
              )
 
              if Txn.changes(txn) != 1 do
                raise ShapeError,
                  message:
-                   "migration #{@operator_decision_shape} -> #{@shape} lost its exact stamp transition"
+                   "migration #{@operator_decision_shape} -> #{@terminal_decision_shape} lost its exact stamp transition"
              end
 
              :ok
@@ -1130,7 +1187,7 @@ defmodule Tightbeam.Schema do
         {:error, error} ->
           raise ShapeError,
             message:
-              "migration #{@operator_decision_shape} -> #{@shape} failed and was rolled back: #{Exception.message(error)}"
+              "migration #{@operator_decision_shape} -> #{@terminal_decision_shape} failed and was rolled back: #{Exception.message(error)}"
       end
     after
       :ok = DB.execute(db, "PRAGMA ignore_check_constraints = OFF")
@@ -1155,7 +1212,7 @@ defmodule Tightbeam.Schema do
         {:error, error} ->
           raise ShapeError,
             message:
-              "migration #{@model_identity_shape} -> #{@shape} failed and was rolled back: #{Exception.message(error)}"
+              "migration #{@model_identity_shape} -> #{@terminal_decision_shape} failed and was rolled back: #{Exception.message(error)}"
       end
     after
       :ok = DB.execute(db, "PRAGMA foreign_keys = ON")
@@ -1210,7 +1267,7 @@ defmodule Tightbeam.Schema do
     if Txn.changes(txn) != decision_request_count do
       raise ShapeError,
         message:
-          "migration #{@model_identity_shape} -> #{@shape} copied #{Txn.changes(txn)} of #{decision_request_count} decision requests"
+          "migration #{@model_identity_shape} -> #{@terminal_decision_shape} copied #{Txn.changes(txn)} of #{decision_request_count} decision requests"
     end
 
     [[^decision_request_count]] = Txn.q(txn, "SELECT COUNT(*) FROM decision_requests_new")
@@ -1239,7 +1296,7 @@ defmodule Tightbeam.Schema do
     if Txn.changes(txn) != message_count do
       raise ShapeError,
         message:
-          "migration #{@model_identity_shape} -> #{@shape} copied #{Txn.changes(txn)} of #{message_count} messages"
+          "migration #{@model_identity_shape} -> #{@terminal_decision_shape} copied #{Txn.changes(txn)} of #{message_count} messages"
     end
 
     [[^message_count]] = Txn.q(txn, "SELECT COUNT(*) FROM messages_new")
@@ -1266,18 +1323,226 @@ defmodule Tightbeam.Schema do
       rows ->
         raise ShapeError,
           message:
-            "migration #{@model_identity_shape} -> #{@shape} left invalid foreign keys: #{inspect(rows)}"
+            "migration #{@model_identity_shape} -> #{@terminal_decision_shape} left invalid foreign keys: #{inspect(rows)}"
     end
 
     Txn.q(
       txn,
       "UPDATE schema_stamp SET shape = ?1, stampedAt = ?2 WHERE shape = ?3",
-      [@shape, System.system_time(:millisecond), @model_identity_shape]
+      [@terminal_decision_shape, System.system_time(:millisecond), @model_identity_shape]
     )
 
     if Txn.changes(txn) != 1 do
       raise ShapeError,
-        message: "migration #{@model_identity_shape} -> #{@shape} lost its exact stamp transition"
+        message:
+          "migration #{@model_identity_shape} -> #{@terminal_decision_shape} lost its exact stamp transition"
+    end
+
+    :ok
+  end
+
+  defp migrate_notice_batching_v1_019(db) do
+    # The database owner serializes this call. Disable enforcement only around
+    # the exact table replacement, then prove every foreign key before commit.
+    :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
+
+    try do
+      case DB.transaction(db, &migrate_notice_batching_v1_019_in_txn/1) do
+        {:ok, :ok} ->
+          :ok
+
+        {:error, %ShapeError{} = error} ->
+          raise error
+
+        {:error, error} ->
+          raise ShapeError,
+            message:
+              "migration #{@terminal_decision_shape} -> #{@shape} failed and was rolled back: #{Exception.message(error)}"
+      end
+    after
+      :ok = DB.execute(db, "PRAGMA foreign_keys = ON")
+    end
+  end
+
+  defp migrate_notice_batching_v1_019_in_txn(%Txn{} = txn) do
+    [[wake_count]] = Txn.q(txn, "SELECT COUNT(*) FROM wakes")
+
+    cancellation_object =
+      Enum.find(@supervision_liveness_objects, &(&1.name == "wake_cancellations"))
+
+    cancellation_count =
+      if owned_object_present?(txn, cancellation_object) do
+        [[count]] = Txn.q(txn, "SELECT COUNT(*) FROM wake_cancellations")
+        count
+      end
+
+    :ok = Txn.exec(txn, @notice_batching_wakes_ddl)
+
+    Txn.q(
+      txn,
+      """
+      INSERT INTO wakes_notice_batching_v1 (
+        wakeId, sessionKey, targetRole, origin, prompt, consumer, dueAt, state,
+        createdAt, firedAt, reresolve, reresolveSeed, reresolveRung,
+        conditionKind, conditionScope, conditionAfterId, firedBy,
+        creatorSessionKey, rumination, work_item_id, assignmentId, canceledAt,
+        targetGate, class, classElection, deliveryRule, digest, summon
+      )
+      SELECT
+        wakeId, sessionKey, targetRole, origin, prompt, consumer, dueAt, state,
+        createdAt, firedAt, reresolve, reresolveSeed, reresolveRung,
+        conditionKind, conditionScope, conditionAfterId, firedBy,
+        creatorSessionKey, rumination, work_item_id, assignmentId, canceledAt,
+        targetGate, NULL, NULL, NULL, 0, 0
+      FROM wakes
+      """
+    )
+
+    if Txn.changes(txn) != wake_count do
+      raise ShapeError,
+        message:
+          "migration #{@terminal_decision_shape} -> #{@shape} copied #{Txn.changes(txn)} of #{wake_count} wakes"
+    end
+
+    [[^wake_count]] = Txn.q(txn, "SELECT COUNT(*) FROM wakes_notice_batching_v1")
+
+    case Txn.q(
+           txn,
+           """
+           SELECT wakeId FROM wakes_notice_batching_v1
+           WHERE class IS NOT NULL OR classElection IS NOT NULL OR deliveryRule IS NOT NULL
+              OR digest != 0 OR summon != 0
+           LIMIT 1
+           """
+         ) do
+      [] ->
+        :ok
+
+      rows ->
+        raise ShapeError,
+          message:
+            "migration #{@terminal_decision_shape} -> #{@shape} classified legacy wakes: #{inspect(rows)}"
+    end
+
+    wake_bound_objects =
+      (@supervision_liveness_objects ++ @supervision_liveness_enforcement_objects)
+      |> Enum.filter(fn object ->
+        object.type in ["index", "trigger"] and String.contains?(object.sql, "wakes")
+      end)
+      |> Enum.filter(&owned_object_present?(txn, &1))
+
+    Enum.each(wake_bound_objects, fn object ->
+      :ok = Txn.exec(txn, "DROP #{String.upcase(object.type)} IF EXISTS #{object.name}")
+    end)
+
+    :ok =
+      Txn.exec(
+        txn,
+        """
+        DROP INDEX wakes_due;
+        DROP INDEX wakes_condition;
+        DROP TABLE wakes;
+        ALTER TABLE wakes_notice_batching_v1 RENAME TO wakes;
+        CREATE INDEX wakes_due ON wakes (state, dueAt);
+        CREATE INDEX wakes_delivery ON wakes (state, deliveryRule, sessionKey, class);
+        CREATE INDEX wakes_condition ON wakes (state, conditionKind, conditionScope);
+        """
+      )
+
+    if cancellation_count do
+      target_ddl =
+        String.replace(
+          cancellation_object.sql,
+          "CREATE TABLE IF NOT EXISTS wake_cancellations",
+          "CREATE TABLE IF NOT EXISTS wake_cancellations_notice_batching_v1",
+          global: false
+        )
+
+      :ok = Txn.exec(txn, target_ddl)
+
+      Txn.q(
+        txn,
+        """
+        INSERT INTO wake_cancellations_notice_batching_v1 (
+          wakeId, wakeState, canceledAt, requesterKind, requesterId, reasonKind,
+          causalSourceKind, causalSourceId, outcomeKind, replacementWakeId,
+          dispositionKind, dispositionId, primaryWorkKind, primaryWorkId,
+          workImpactKind, livenessTriggerKind, livenessTriggerId, actionNeeded
+        )
+        SELECT
+          wakeId, wakeState, canceledAt, requesterKind, requesterId, reasonKind,
+          causalSourceKind, causalSourceId, outcomeKind, replacementWakeId,
+          dispositionKind, dispositionId, primaryWorkKind, primaryWorkId,
+          workImpactKind, livenessTriggerKind, livenessTriggerId, actionNeeded
+        FROM wake_cancellations
+        """
+      )
+
+      if Txn.changes(txn) != cancellation_count do
+        raise ShapeError,
+          message:
+            "migration #{@terminal_decision_shape} -> #{@shape} copied #{Txn.changes(txn)} of #{cancellation_count} wake cancellations"
+      end
+
+      :ok =
+        Txn.exec(
+          txn,
+          """
+          DROP TABLE wake_cancellations;
+          """
+        )
+
+      :ok = Txn.exec(txn, cancellation_object.sql)
+
+      Txn.q(
+        txn,
+        """
+        INSERT INTO wake_cancellations (
+          wakeId, wakeState, canceledAt, requesterKind, requesterId, reasonKind,
+          causalSourceKind, causalSourceId, outcomeKind, replacementWakeId,
+          dispositionKind, dispositionId, primaryWorkKind, primaryWorkId,
+          workImpactKind, livenessTriggerKind, livenessTriggerId, actionNeeded
+        )
+        SELECT
+          wakeId, wakeState, canceledAt, requesterKind, requesterId, reasonKind,
+          causalSourceKind, causalSourceId, outcomeKind, replacementWakeId,
+          dispositionKind, dispositionId, primaryWorkKind, primaryWorkId,
+          workImpactKind, livenessTriggerKind, livenessTriggerId, actionNeeded
+        FROM wake_cancellations_notice_batching_v1
+        """
+      )
+
+      if Txn.changes(txn) != cancellation_count do
+        raise ShapeError,
+          message:
+            "migration #{@terminal_decision_shape} -> #{@shape} restored #{Txn.changes(txn)} of #{cancellation_count} wake cancellations"
+      end
+
+      :ok = Txn.exec(txn, "DROP TABLE wake_cancellations_notice_batching_v1")
+    end
+
+    Enum.each(wake_bound_objects, fn object -> :ok = Txn.exec(txn, object.sql) end)
+
+    case Txn.q(txn, "PRAGMA foreign_key_check") do
+      [] ->
+        :ok
+
+      rows ->
+        raise ShapeError,
+          message:
+            "migration #{@terminal_decision_shape} -> #{@shape} left invalid foreign keys: #{inspect(rows)}"
+    end
+
+    Txn.q(
+      txn,
+      "UPDATE schema_stamp SET shape = ?1, stampedAt = ?2 WHERE shape = ?3",
+      [@shape, System.system_time(:millisecond), @terminal_decision_shape]
+    )
+
+    if Txn.changes(txn) != 1 do
+      raise ShapeError,
+        message:
+          "migration #{@terminal_decision_shape} -> #{@shape} lost its exact stamp transition"
     end
 
     :ok
