@@ -16,6 +16,8 @@ defmodule Tightbeam.HarnessProcess do
   @macos_lsof_path "/usr/sbin/lsof"
   # Debian/Ubuntu install lsof at /usr/bin; some distros keep the sbin legacy path.
   @linux_lsof_paths ["/usr/bin/lsof", "/usr/sbin/lsof"]
+  @cursor_account "tightbeam-cursor"
+  @cursor_launcher "/usr/local/libexec/tightbeam-cursor-launcher"
   @old_schema_refusal "The database carries a pre-release harness_processes shape; it is not upgraded by design. Reset the database and restart Tightbeam."
 
   @process_ddl """
@@ -114,6 +116,7 @@ defmodule Tightbeam.HarnessProcess do
         Path.dirname(stderr_path)
 
     identity_path = Path.join([root, "harness-processes", launch_id <> ".identity"])
+    dedicated_cursor? = Keyword.get(opts, :cursor_execution_identity, false)
     if is_nil(ssh), do: File.mkdir_p!(Path.dirname(identity_path))
 
     case DB.transaction(db, fn txn ->
@@ -172,7 +175,15 @@ defmodule Tightbeam.HarnessProcess do
     opts
     |> Keyword.put(
       :cmd,
-      wrap_command(Keyword.fetch!(opts, :cmd), ssh, helper_path, identity_path, launch_id)
+      wrap_command(
+        {key, dedicated_cursor?},
+        Keyword.fetch!(opts, :cmd),
+        ssh,
+        helper_path,
+        identity_path,
+        launch_id,
+        root
+      )
     )
     |> Keyword.put(:harness_process_launch_id, launch_id)
   end
@@ -785,13 +796,20 @@ defmodule Tightbeam.HarnessProcess do
       warning in lines
   end
 
-  defp run_group_command(%{ssh: nil} = row, timeout_ms) do
-    bounded_command(
-      row.helper_path,
-      ["harness-group" | group_args(row)],
-      timeout_ms
-    )
+  defp run_group_command(
+         %{ssh: nil, harness: "cursor", identity_path: identity_path} = row,
+         timeout_ms
+       )
+       when is_binary(identity_path) do
+    if cursor_base(identity_path) == Tightbeam.Harness.Cursor.execution_base(nil) do
+      run_cursor_group_command(row, timeout_ms)
+    else
+      run_local_group_command(row, timeout_ms)
+    end
   end
+
+  defp run_group_command(%{ssh: nil} = row, timeout_ms),
+    do: run_local_group_command(row, timeout_ms)
 
   defp run_group_command(%{ssh: destination} = row, timeout_ms) do
     bounded_command(
@@ -807,6 +825,32 @@ defmodule Tightbeam.HarnessProcess do
     )
   end
 
+  defp run_cursor_group_command(row, timeout_ms) do
+    bounded_command(
+      "/usr/bin/sudo",
+      cursor_sudo_args() ++
+        [
+          @cursor_launcher,
+          "cursor-exec",
+          "group",
+          cursor_base(row.identity_path),
+          cursor_org_base(row.helper_path),
+          operator_uid(),
+          operator_home()
+          | group_args(row)
+        ],
+      timeout_ms
+    )
+  end
+
+  defp run_local_group_command(row, timeout_ms) do
+    bounded_command(
+      row.helper_path,
+      ["harness-group" | group_args(row)],
+      timeout_ms
+    )
+  end
+
   defp group_args(row) do
     [
       Integer.to_string(row.process_group_id),
@@ -816,11 +860,48 @@ defmodule Tightbeam.HarnessProcess do
     ]
   end
 
-  defp wrap_command(cmd, nil, helper_path, identity_path, launch_id) do
+  defp wrap_command(
+         {{:cursor, _preset, _host}, true},
+         cmd,
+         nil,
+         helper_path,
+         identity_path,
+         launch_id,
+         root
+       ) do
+    [
+      "/usr/bin/sudo"
+      | cursor_sudo_args() ++
+          [
+            @cursor_launcher,
+            "cursor-exec",
+            "launch",
+            root,
+            cursor_org_base(helper_path),
+            operator_uid(),
+            operator_home(),
+            "--",
+            identity_path,
+            launch_id,
+            "--"
+            | cmd
+          ]
+    ]
+  end
+
+  defp wrap_command(_key_and_mode, cmd, nil, helper_path, identity_path, launch_id, _root) do
     [helper_path, "harness-exec", identity_path, launch_id, "--" | cmd]
   end
 
-  defp wrap_command(["ssh" | rest], destination, helper_path, identity_path, launch_id) do
+  defp wrap_command(
+         _key_and_mode,
+         ["ssh" | rest],
+         destination,
+         helper_path,
+         identity_path,
+         launch_id,
+         _root
+       ) do
     {prefix, remote} = Enum.split_while(rest, &(&1 != destination))
 
     case remote do
@@ -842,6 +923,27 @@ defmodule Tightbeam.HarnessProcess do
       _ ->
         raise ArgumentError, "remote harness command does not contain its SSH destination"
     end
+  end
+
+  defp cursor_sudo_args, do: ["-n", "-H", "-u", @cursor_account, "--"]
+
+  defp operator_uid do
+    {uid, 0} = System.cmd("/usr/bin/id", ["-u"])
+    String.trim(uid)
+  end
+
+  defp operator_home, do: System.user_home!()
+
+  defp cursor_base(identity_path) do
+    identity_path
+    |> Path.dirname()
+    |> Path.dirname()
+  end
+
+  defp cursor_org_base(helper_path) do
+    helper_path
+    |> Path.dirname()
+    |> Path.dirname()
   end
 
   defp bounded_command(executable, args, timeout_ms) do

@@ -1248,13 +1248,18 @@ defmodule Tightbeam.Placement do
         sh_out: Map.get(config, :sh_out)
       ] ++ checked_opts
 
+    process_identity_dir =
+      if harness == :cursor and is_nil(host_config.ssh),
+        do: Tightbeam.Harness.Cursor.execution_base(Map.get(config, :cursor_execution_home)),
+        else: host_config.base_dir
+
     base = [
       harness: harness,
       home: home,
       cwd: config.cwd,
       stderr_path: stderr_path,
       process_ssh: host_config.ssh,
-      process_identity_dir: host_config.base_dir,
+      process_identity_dir: process_identity_dir,
       process_helper: Path.join(host_config[:cli_bin] || config.cli_bin, "tightbeam"),
       on_auth_event: auth_event_handler(config, host, module),
       on_subagent_event: subagent_event_handler(config, host, module),
@@ -1558,7 +1563,12 @@ defmodule Tightbeam.Placement do
   def deliver_home(config, {harness, _identity_name, host}, opts \\ []) do
     host_config = Map.fetch!(hosts_for(config), host)
     module = Harness.module!(harness)
-    home = Homes.home_path(host_config.base_dir, host, harness)
+
+    home =
+      if harness == :cursor and is_nil(host_config.ssh),
+        do: Tightbeam.Harness.Cursor.execution_home(Map.get(config, :cursor_execution_home)),
+        else: Homes.home_path(host_config.base_dir, host, harness)
+
     sh = Keyword.get(opts, :sh, &system_cmd/1)
 
     sh_out =

@@ -412,6 +412,49 @@ defmodule Tightbeam.HarnessProcessTest do
     assert is_binary(launch_id)
   end
 
+  test "local Cursor launch switches identity before the session helper records it", ctx do
+    opts =
+      HarnessProcess.prepare_launch(
+        [
+          cmd: [Path.join(ctx.test_dir, "adapters/cursor-agent")],
+          cursor_execution_identity: true,
+          process_helper: @helper,
+          process_identity_dir: ctx.test_dir
+        ],
+        ctx.db,
+        {:cursor, "shared", "testhost"}
+      )
+
+    assert [
+             "/usr/bin/sudo",
+             "-n",
+             "-H",
+             "-u",
+             "tightbeam-cursor",
+             "--",
+             "/usr/local/libexec/tightbeam-cursor-launcher",
+             "cursor-exec",
+             "launch",
+             base,
+             org_base,
+             operator_uid,
+             operator_home,
+             "--",
+             identity_path,
+             launch_id,
+             "--",
+             adapter
+           ] = Keyword.fetch!(opts, :cmd)
+
+    assert base == ctx.test_dir
+    assert org_base == @helper |> Path.dirname() |> Path.dirname()
+    assert operator_uid == System.cmd("/usr/bin/id", ["-u"]) |> elem(0) |> String.trim()
+    assert operator_home == System.user_home!()
+    assert identity_path =~ "/harness-processes/"
+    assert is_binary(launch_id)
+    assert adapter == Path.join(ctx.test_dir, "adapters/cursor-agent")
+  end
+
   test "identity capture cannot mutate an already-resolved launch", ctx do
     opts =
       HarnessProcess.prepare_launch(

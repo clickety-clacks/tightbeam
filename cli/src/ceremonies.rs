@@ -134,6 +134,35 @@ where
     S: Fn(&Endpoint, &RequestSpec, Option<Instant>) -> Result<Option<serde_json::Value>, String>,
     H: Fn(&Endpoint, Instant) -> Result<Option<HarnessCatalog>, String>,
 {
+    onboard_with_cursor_prerequisite(
+        identity,
+        provider,
+        api_key,
+        endpoint,
+        send_request,
+        load_harnesses,
+        crate::cursor_execution_identity::require_onboard_prerequisite,
+    )
+}
+
+fn onboard_with_cursor_prerequisite<S, H, P>(
+    identity: &Identity,
+    provider: &str,
+    api_key: bool,
+    endpoint: &Endpoint,
+    send_request: S,
+    load_harnesses: H,
+    cursor_prerequisite: P,
+) -> Result<(), String>
+where
+    S: Fn(&Endpoint, &RequestSpec, Option<Instant>) -> Result<Option<serde_json::Value>, String>,
+    H: Fn(&Endpoint, Instant) -> Result<Option<HarnessCatalog>, String>,
+    P: Fn() -> Result<(), String>,
+{
+    if provider == "cursor" {
+        cursor_prerequisite()?;
+    }
+
     let kind = if api_key { "apiKey" } else { "subscription" };
     let machine = onboard_machine(
         std::env::var("TIGHTBEAM_MACHINE")
@@ -2219,6 +2248,27 @@ fn target_from_probe(output: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cursor_prerequisite_refuses_before_the_gateway_begins_or_reads_a_key() {
+        let endpoint = Endpoint {
+            base: "http://unused.invalid".to_owned(),
+            token: "unused".to_owned(),
+            origin: crate::dispatch::Origin::Provisioned,
+        };
+        let error = onboard_with_cursor_prerequisite(
+            &Identity::User("operator".to_owned()),
+            "cursor",
+            true,
+            &endpoint,
+            |_, _, _| panic!("gateway begin must not run before the prerequisite"),
+            |_, _| panic!("harness lookup must not run before the prerequisite"),
+            || Err("dedicated Cursor identity is absent".to_owned()),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "dedicated Cursor identity is absent");
+    }
 
     /// Serializes the tests that drive `emit_delivery`, because `write_delivery_file` writes into
     /// the process-wide current directory (the shared crate root under `cargo test`) and each such

@@ -691,6 +691,7 @@ defmodule Tightbeam.PlacementTest do
       db: db,
       cwd: "/work",
       cli_bin: Path.join(base_dir, "bin"),
+      cursor_execution_home: Path.join(base_dir, "cursor-execution-test-home"),
       credential_kind: :api_key,
       harness_target_overrides: %{
         find_executable: fn _ -> Path.join([base_dir, "2026.08.11-e8db854", "cursor-agent"]) end,
@@ -710,7 +711,7 @@ defmodule Tightbeam.PlacementTest do
 
     for module <- Tightbeam.Harness.all() do
       opts = Placement.adapter_opts!(config, {module.id(), "shared", "testhost"})
-      binary = hd(opts[:cmd])
+      binary = if module.id() == :cursor, do: List.last(opts[:cmd]), else: hd(opts[:cmd])
 
       assert String.ends_with?(
                binary,
@@ -1425,6 +1426,22 @@ defmodule Tightbeam.PlacementTest do
                ]
              }
            }
+  end
+
+  test "local Cursor projection uses the dedicated account's real home" do
+    expected_home =
+      case :os.type() do
+        {:unix, :darwin} -> "/Users/tightbeam-cursor"
+        {:unix, _} -> "/home/tightbeam-cursor"
+      end
+
+    assert Tightbeam.Harness.Cursor.execution_home(nil) == expected_home
+
+    assert Tightbeam.Harness.Cursor.execution_base(nil) ==
+             Path.join(expected_home, ".tightbeam")
+
+    assert Tightbeam.Harness.Cursor.execution_home("/test/cursor-home") ==
+             "/test/cursor-home"
   end
 
   # wi_263814d3 — accepted-then-dead: the claude adapter's offered/accepted model
