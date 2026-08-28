@@ -117,6 +117,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
     match command {
         Command::Help
         | Command::CommandHelp(_)
+        | Command::IdentityCurrent
         | Command::Doctor { .. }
         | Command::UpdateClients { .. }
         | Command::Assimilate(_) => {
@@ -1521,6 +1522,7 @@ where
         Command::Help | Command::CommandHelp(_) => {
             unreachable!("help is handled before dispatch")
         }
+        Command::IdentityCurrent => print_current_session_identity(),
         Command::Doctor { json, base_dir } => crate::probe::run(json, base_dir),
         Command::AddUser {
             identity,
@@ -1681,11 +1683,53 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::HarnessProcesses { identity } => Some(identity),
         Command::Help
         | Command::CommandHelp(_)
+        | Command::IdentityCurrent
         | Command::Doctor { .. }
         | Command::ToolCallObserved
         | Command::UpdateClients { .. }
         | Command::Assimilate(_) => None,
     }
+}
+
+fn print_current_session_identity() -> Result<(), String> {
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    let session_key = current_session_key_from(&cwd)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({"sessionKey": session_key}))
+            .expect("session identity serializes")
+    );
+    Ok(())
+}
+
+fn current_session_key_from(cwd: &Path) -> Result<String, String> {
+    for directory in cwd.ancestors() {
+        let path = directory.join(".tightbeam-session");
+        if !path.exists() {
+            continue;
+        }
+
+        let encoded = fs::read_to_string(&path)
+            .map_err(|error| format!("malformed session file '{}': {error}", path.display()))?;
+        let config: Value = serde_json::from_str(&encoded)
+            .map_err(|error| format!("malformed session file '{}': {error}", path.display()))?;
+        return config
+            .get("sessionKey")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                format!(
+                    "malformed session file '{}': missing sessionKey",
+                    path.display()
+                )
+            });
+    }
+
+    Err(format!(
+        "session identity unavailable: no .tightbeam-session was found walking up from '{}' to the filesystem root",
+        cwd.display()
+    ))
 }
 
 #[cfg(test)]
@@ -3067,6 +3111,71 @@ mod tests {
                     .display()
                     .to_string()
             )
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn current_identity_reads_only_the_nearest_session_key() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("tightbeam_cli_identity_{unique}"));
+        let cwd = root.join("nested").join("work");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::write(
+            root.join(".tightbeam-session"),
+            r#"{"url":"https://ancestor.example","token":"ancestor-must-not-escape","sessionKey":"agent:coder:x s_ancestor"}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("nested").join(".tightbeam-session"),
+            r#"{"url":"https://nested.example","token":"nested-must-not-escape","sessionKey":"agent:coder:x s_nested"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            current_session_key_from(&cwd),
+            Ok("agent:coder:x s_nested".to_owned())
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn current_identity_refuses_missing_or_malformed_session_identity() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("tightbeam_cli_bad_identity_{unique}"));
+        let cwd = root.join("nested");
+        fs::create_dir_all(&cwd).unwrap();
+
+        assert!(
+            current_session_key_from(&cwd)
+                .unwrap_err()
+                .starts_with("session identity unavailable")
+        );
+
+        fs::write(
+            root.join(".tightbeam-session"),
+            r#"{"url":"https://gateway.example","token":"must-not-escape"}"#,
+        )
+        .unwrap();
+        assert!(
+            current_session_key_from(&cwd)
+                .unwrap_err()
+                .contains("missing sessionKey")
+        );
+
+        fs::write(root.join(".tightbeam-session"), "{").unwrap();
+        assert!(
+            current_session_key_from(&cwd)
+                .unwrap_err()
+                .starts_with("malformed session file")
         );
 
         fs::remove_dir_all(root).unwrap();
