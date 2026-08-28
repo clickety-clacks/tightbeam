@@ -478,7 +478,8 @@ defmodule Tightbeam.Wire.Router do
   end
 
   defp dispatch_agent_request(conn, :org, "add-user", body)
-       when not is_map_key(body, "asUser") and not is_map_key(body, "asSession") do
+       when not is_map_key(body, "as") and not is_map_key(body, "asUser") and
+              not is_map_key(body, "asProcess") and not is_map_key(body, "asSession") do
     with :ok <- loopback_bootstrap(conn),
          {:ok, user_id} <- required_string(get_in(body, ["params", "userId"])),
          {:ok, result} <-
