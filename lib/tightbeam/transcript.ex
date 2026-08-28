@@ -22,6 +22,7 @@ defmodule Tightbeam.Transcript do
   """
 
   alias Tightbeam.{DB, Org}
+  alias Tightbeam.DB.Txn
 
   @default_limit 50
   @max_limit 500
@@ -122,6 +123,9 @@ defmodule Tightbeam.Transcript do
         %{
           session_key: session.session_key,
           display_name: session.display_name,
+          operational_parent: session.operational_parent,
+          effective_parent: session.effective_parent,
+          effective_parent_source: session.effective_parent_source,
           messages: entries,
           oldest_id: (entries != [] && List.first(entries).id) || nil,
           newest_id: (entries != [] && List.last(entries).id) || nil,
@@ -301,7 +305,16 @@ defmodule Tightbeam.Transcript do
       |> candidate_rows(name)
       |> Enum.filter(&readable?(caller, &1))
       |> Enum.map(
-        &Map.take(&1, [:session_key, :display_name, :state, :owner_user_id, :last_activity_at])
+        &Map.take(&1, [
+          :session_key,
+          :display_name,
+          :state,
+          :owner_user_id,
+          :operational_parent,
+          :effective_parent,
+          :effective_parent_source,
+          :last_activity_at
+        ])
       )
 
     %{candidates: candidates}
@@ -313,32 +326,40 @@ defmodule Tightbeam.Transcript do
   # why the seq-only discipline governs entries and not this ranking.
   defp candidate_rows(db, name) do
     {:ok, rows} =
-      DB.query(
-        db,
-        """
-        SELECT s.sessionKey, s.displayName, s.state, s.ownerUserId,
-               COALESCE(
-                 (SELECT m.timestamp FROM messages AS m
-                  WHERE m.sessionKey = s.sessionKey AND m.seq > s.clearedThroughSeq
-                  ORDER BY m.seq DESC LIMIT 1),
-                 s.createdAt
-               ) AS lastActivityAt
-        FROM sessions AS s
-        WHERE lower(s.displayName) LIKE lower(?1) ESCAPE '\\'
-        ORDER BY lastActivityAt DESC, s.sessionKey ASC
-        """,
-        ["%" <> escape_like(name) <> "%"]
-      )
+      DB.transaction(db, fn txn ->
+        Txn.q(
+          txn,
+          """
+          SELECT s.sessionKey, s.displayName, s.state, s.ownerUserId, s.operationalParent,
+                 COALESCE(
+                   (SELECT m.timestamp FROM messages AS m
+                    WHERE m.sessionKey = s.sessionKey AND m.seq > s.clearedThroughSeq
+                    ORDER BY m.seq DESC LIMIT 1),
+                   s.createdAt
+                 ) AS lastActivityAt
+          FROM sessions AS s
+          WHERE lower(s.displayName) LIKE lower(?1) ESCAPE '\\'
+          ORDER BY lastActivityAt DESC, s.sessionKey ASC
+          """,
+          ["%" <> escape_like(name) <> "%"]
+        )
+        |> Enum.map(fn [key, display_name, state, owner, operational_parent, last_activity_at] ->
+          parent = Org.effective_parent_in_txn(txn, key)
 
-    Enum.map(rows, fn [key, display_name, state, owner, last_activity_at] ->
-      %{
-        session_key: key,
-        display_name: display_name,
-        state: state,
-        owner_user_id: owner,
-        last_activity_at: last_activity_at
-      }
-    end)
+          %{
+            session_key: key,
+            display_name: display_name,
+            state: state,
+            owner_user_id: owner,
+            operational_parent: operational_parent,
+            effective_parent: parent.session_key,
+            effective_parent_source: parent.source,
+            last_activity_at: last_activity_at
+          }
+        end)
+      end)
+
+    rows
   end
 
   # `%` and `_` in the caller's name are LITERAL, never wildcards.

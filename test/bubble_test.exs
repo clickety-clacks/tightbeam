@@ -55,6 +55,7 @@ defmodule Tightbeam.Productions.BubbleTest do
         host: "testhost",
         model: Model.new("fable"),
         spawned_by: spawned_by,
+        operational_parent: spawned_by,
         is_built_in: built_in?
       })
 
@@ -135,7 +136,8 @@ defmodule Tightbeam.Productions.BubbleTest do
         provider: "anthropic",
         host: "healthy-host",
         model: Model.new("fable"),
-        spawned_by: ctx.supervisor.session_key
+        spawned_by: ctx.supervisor.session_key,
+        operational_parent: ctx.supervisor.session_key
       })
 
     healthy_seq = fail_turn!(ctx.db, healthy.session_key)
@@ -231,12 +233,12 @@ defmodule Tightbeam.Productions.BubbleTest do
     assert ref == "bubble:#{cause_seq}"
   end
 
-  test "a parentless session's failure marks its own stream and climbs nowhere", ctx do
+  test "an owner Main session's failure is terminal for its owner", ctx do
     seq = fail_turn!(ctx.db, ctx.main.session_key)
     :ok = Bubble.recognize_terminal(ctx.db, seq)
 
     assert notice_turn(ctx.db, "supervisor") == []
-    refute ConditionFacts.standing?(ctx.db, "user-alerted", "flynn")
+    assert ConditionFacts.standing?(ctx.db, "user-alerted", "flynn")
   end
 
   test "the first delivered turn for an alerted owner clears the alert", ctx do

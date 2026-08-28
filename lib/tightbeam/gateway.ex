@@ -1566,6 +1566,9 @@ defmodule Tightbeam.Gateway do
           # absence fails the whole decode and the model footer never
           # populates (found live; the TS reference omitted it too).
           sessionKey: session_key,
+          operationalParent: session.operational_parent,
+          effectiveParent: session.effective_parent,
+          effectiveParentSource: Atom.to_string(session.effective_parent_source),
           display: %{
             # `model` is the row IDENTITY this seam issues (see `wire_model/1`):
             # the footer displays it verbatim when it cannot match a catalog row,
@@ -1889,6 +1892,9 @@ defmodule Tightbeam.Gateway do
       :harness,
       :origin,
       :spawned_by,
+      :operational_parent,
+      :effective_parent,
+      :effective_parent_source,
       :state,
       :created_at
     ])
@@ -2748,14 +2754,14 @@ defmodule Tightbeam.Gateway do
            revision
          end) do
       {:referenced, references} ->
-        unlearn_referenced_result(name, references)
+        unlearn_referenced_result(db, name, references)
 
       {:released, revision} ->
         %{state: "published", kungfu: name, live_revision: revision}
     end
   end
 
-  defp unlearn_referenced_result(name, references) do
+  defp unlearn_referenced_result(db, name, references) do
     sessions = Enum.filter(references, &(&1.kind == "session"))
     setting = Enum.find(references, &(&1.kind == "setting"))
     session_names = Enum.map(sessions, & &1.session_key)
@@ -2774,7 +2780,27 @@ defmodule Tightbeam.Gateway do
       sessions:
         Enum.map(
           sessions,
-          &%{session_key: &1.session_key, state: &1.state, archetype: &1.archetype}
+          fn reference ->
+            case Org.get(db, reference.session_key) do
+              nil ->
+                %{
+                  session_key: reference.session_key,
+                  state: reference.state,
+                  archetype: reference.archetype
+                }
+
+              session ->
+                session
+                |> Map.take([
+                  :session_key,
+                  :state,
+                  :archetype,
+                  :operational_parent,
+                  :effective_parent,
+                  :effective_parent_source
+                ])
+            end
+          end
         ),
       setting: setting && setting.archetype,
       references: references
@@ -2907,7 +2933,10 @@ defmodule Tightbeam.Gateway do
         %{
           session_key: session.session_key,
           identity_revision: session.identity_revision,
-          identity_stale: session.identity_revision != live
+          identity_stale: session.identity_revision != live,
+          operational_parent: session.operational_parent,
+          effective_parent: session.effective_parent,
+          effective_parent_source: session.effective_parent_source
         }
       end)
 
@@ -3350,7 +3379,7 @@ defmodule Tightbeam.Gateway do
 
   # Authority for asserting `work-blocked`/`work-unblocked` over a session
   # (spec production-machine-v1 §Standing facts): the scope names an existing
-  # session, and the caller is above it in the spawnedBy lineage, or is the
+  # session, and the caller is above it in the effective-parent lineage, or is the
   # scope session's owner (as a user principal), or is an admin. A session
   # asserting over ITSELF is refused — the judgment "stop treating this
   # session as stalled" belongs to whoever supervises it, not to it.
@@ -3373,15 +3402,26 @@ defmodule Tightbeam.Gateway do
   end
 
   defp caller_in_lineage_above?(db, scope, caller_key, hops \\ 0)
-  defp caller_in_lineage_above?(_db, _scope, _caller_key, hops) when hops > 32, do: false
+
+  defp caller_in_lineage_above?(_db_or_txn, _scope, _caller_key, hops) when hops > 32,
+    do: false
+
+  defp caller_in_lineage_above?(%Txn{} = txn, scope, caller_key, hops) do
+    parent = Org.effective_parent_in_txn(txn, scope).session_key
+
+    cond do
+      parent == caller_key -> true
+      parent == scope -> false
+      true -> caller_in_lineage_above?(txn, parent, caller_key, hops + 1)
+    end
+  rescue
+    ArgumentError -> false
+  end
 
   defp caller_in_lineage_above?(db, scope, caller_key, hops) do
-    case DB.query(db, "SELECT spawnedBy FROM sessions WHERE sessionKey = ?1", [scope]) do
-      {:ok, [[parent]]} when is_binary(parent) ->
-        parent == caller_key or caller_in_lineage_above?(db, parent, caller_key, hops + 1)
-
-      _ ->
-        false
+    case DB.transaction(db, fn txn -> caller_in_lineage_above?(txn, scope, caller_key, hops) end) do
+      {:ok, authorized?} -> authorized?
+      {:error, _error} -> false
     end
   end
 
@@ -3776,15 +3816,23 @@ defmodule Tightbeam.Gateway do
   # principal, just like the assignment carrier above.
   defp schedule_supervision_controller_in_txn(
          txn,
-         %{principal: {:process, "tightbeam"}, params: %{supervision_wake_kind: wake_kind}},
+         %{
+           principal: {:process, "tightbeam"},
+           params: %{
+             supervision_wake_kind: wake_kind,
+             supervision_terminal_seq: root_turn_seq
+           }
+         },
          wake
        )
-       when wake_kind in ["prod", "escalation"] do
+       when wake_kind in ["prod", "escalation"] and is_integer(root_turn_seq) and
+              root_turn_seq > 0 do
     case Supervision.transition_in_txn(txn, %{
            kind: "controller_scheduled",
            wake_id: wake.wake_id,
            assignment_id: wake.assignment_id,
-           wake_kind: wake_kind
+           wake_kind: wake_kind,
+           root_turn_seq: root_turn_seq
          }) do
       {:armed, _generation} ->
         :ok
@@ -3803,7 +3851,11 @@ defmodule Tightbeam.Gateway do
          %{principal: {:process, "tightbeam"}, params: %{supervision_wake_kind: wake_kind}},
          _wake
        ) do
-    raise "incompatible_supervision_liveness_v1: unknown controller kind #{inspect(wake_kind)}"
+    if wake_kind in ["prod", "escalation"] do
+      raise "incompatible_supervision_liveness_v1: controller root turn is required"
+    else
+      raise "incompatible_supervision_liveness_v1: unknown controller kind #{inspect(wake_kind)}"
+    end
   end
 
   defp schedule_supervision_controller_in_txn(_txn, _call, _wake), do: :ok
@@ -5800,7 +5852,7 @@ defmodule Tightbeam.Gateway do
 
   defp critical_result(config, db, call) do
     with {:session, session_key} <- call[:principal],
-         %{state: "active"} <- Org.get(db, session_key),
+         %{state: "active"} = session <- Org.get(db, session_key),
          duration when is_integer(duration) and duration > 0 <- call.params[:for_ms],
          reason when is_binary(reason) and reason != "" <- call.params[:reason] do
       hard_cap = Map.get(config, :critical_lease_hard_cap_ms, 14_400_000)
@@ -5808,6 +5860,9 @@ defmodule Tightbeam.Gateway do
 
       %{
         session_key: session_key,
+        operational_parent: session.operational_parent,
+        effective_parent: session.effective_parent,
+        effective_parent_source: session.effective_parent_source,
         reason: lease.reason,
         expires_at: lease.expires_at,
         hard_deadline: lease.hard_deadline
@@ -5822,16 +5877,20 @@ defmodule Tightbeam.Gateway do
     rows =
       Txn.q(
         txn,
-        "SELECT sessionKey, spawnedBy FROM sessions WHERE state='active' ORDER BY createdAt, sessionKey"
+        "SELECT sessionKey FROM sessions WHERE state='active' ORDER BY createdAt, sessionKey"
       )
 
-    children = Enum.group_by(rows, &Enum.at(&1, 1))
+    children =
+      Enum.group_by(rows, fn [session_key] ->
+        Org.effective_parent_in_txn(txn, session_key).session_key
+      end)
 
     walk = fn walk, key ->
       descendants =
         children
         |> Map.get(key, [])
-        |> Enum.flat_map(fn [child_key, _parent] -> walk.(walk, child_key) end)
+        |> Enum.reject(fn [child_key] -> child_key == key end)
+        |> Enum.flat_map(fn [child_key] -> walk.(walk, child_key) end)
 
       descendants ++ [%{session_key: key}]
     end
@@ -5841,10 +5900,12 @@ defmodule Tightbeam.Gateway do
 
   defp retired_subtree_keys(db, root_key) do
     {:ok, rows} =
-      DB.query(
-        db,
-        "SELECT sessionKey, spawnedBy, state FROM sessions ORDER BY createdAt, sessionKey"
-      )
+      DB.transaction(db, fn txn ->
+        Txn.q(txn, "SELECT sessionKey, state FROM sessions ORDER BY createdAt, sessionKey")
+        |> Enum.map(fn [session_key, state] ->
+          [session_key, Org.effective_parent_in_txn(txn, session_key).session_key, state]
+        end)
+      end)
 
     children = Enum.group_by(rows, &Enum.at(&1, 1))
 
@@ -5874,7 +5935,7 @@ defmodule Tightbeam.Gateway do
          supervision_interval_ms,
          drain_reason
        ) do
-    # Invariant: this spawnedBy walk visits each active member of the target's
+    # Invariant: this effective-parent walk visits each active member of the target's
     # transitive subtree exactly once, parent-last. This is the lifecycle
     # seam's canonical subtree ordering; do not duplicate it.
     subtree = retire_subtree_in_txn(txn, root_key)

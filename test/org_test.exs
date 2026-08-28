@@ -56,6 +56,27 @@ defmodule Tightbeam.OrgTest do
     assert rows == [[1, 1, "active"]]
   end
 
+  test "nullable operational parent resolves explicitly or to the owner's Main", %{db: db} do
+    main_key = Org.personal_session_key("flynn")
+    Org.create(db, base(%{session_key: main_key, kind: "main", is_built_in: true}))
+
+    fallback = Org.create(db, base(%{session_key: "fallback", spawned_by: "provenance-only"}))
+
+    assert fallback.operational_parent == nil
+    assert fallback.effective_parent == main_key
+    assert fallback.effective_parent_source == :owner_main
+    assert fallback.spawned_by == "provenance-only"
+
+    explicit = Org.create(db, base(%{session_key: "explicit", operational_parent: "fallback"}))
+
+    assert explicit.operational_parent == "fallback"
+    assert explicit.effective_parent == "fallback"
+    assert explicit.effective_parent_source == :explicit
+
+    assert {:error, %ArgumentError{message: "unknown session: absent"}} =
+             DB.transaction(db, fn txn -> Org.effective_parent_in_txn(txn, "absent") end)
+  end
+
   test "overrides and derived identity names round-trip and active reconstruction ignores retired rows",
        %{
          db: db

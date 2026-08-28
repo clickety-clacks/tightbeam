@@ -39,7 +39,8 @@ defmodule Tightbeam.Schema do
   # The shape this build writes. Bump it when a production table changes in a
   # way that makes an older database unreadable, and give the refusal below a
   # sentence saying what changed.
-  @shape "notice-batching-v1-019"
+  @shape "nullable-effective-parent-v1-019"
+  @notice_batching_shape "notice-batching-v1-019"
   @terminal_decision_shape "terminal-operator-decision-parity-v1"
   @operator_decision_shape "operator-decision-requests-v1"
   @model_identity_shape "model-identity-v1"
@@ -300,6 +301,7 @@ defmodule Tightbeam.Schema do
         ),
         retirementPrincipal TEXT,
         retirementActionNeeded INTEGER CHECK (retirementActionNeeded IN (0,1)),
+        rootTurnSeq INTEGER REFERENCES turns(seq),
         CHECK (
           (controllerOrigin IS NULL AND wakeKind IS NULL AND controllerState IS NULL AND
            chargedGeneration IS NULL)
@@ -689,7 +691,17 @@ defmodule Tightbeam.Schema do
               OR
               (NEW.wakeKind='escalation' AND w.reresolve='lineage'
                AND w.reresolveSeed IS NOT NULL AND w.reresolveRung > 0)
-            )
+          )
+        )
+      )
+      OR (
+        NEW.controllerOrigin='scheduled'
+        AND (
+          NEW.rootTurnSeq IS NULL
+          OR NOT EXISTS (
+            SELECT 1 FROM turns t
+            WHERE t.seq=NEW.rootTurnSeq
+          )
         )
       )
       BEGIN
@@ -723,6 +735,7 @@ defmodule Tightbeam.Schema do
           AND NEW.retirementCause IS OLD.retirementCause
           AND NEW.retirementPrincipal IS OLD.retirementPrincipal
           AND NEW.retirementActionNeeded IS OLD.retirementActionNeeded
+          AND NEW.rootTurnSeq IS OLD.rootTurnSeq
           AND NEW.controllerState='settled'
         )
       BEGIN
@@ -831,7 +844,7 @@ defmodule Tightbeam.Schema do
       sql: """
       CREATE TRIGGER IF NOT EXISTS supervision_fired_lineage_sidecar_identity_immutable
       BEFORE UPDATE OF wakeId, assignmentId, controllerOrigin, wakeKind, controllerState,
-                       chargedGeneration
+                       chargedGeneration, rootTurnSeq
       ON supervision_liveness_sidecar
       WHEN EXISTS (
         SELECT 1 FROM wakes w
@@ -879,6 +892,123 @@ defmodule Tightbeam.Schema do
       )
       BEGIN
         SELECT RAISE(ABORT, 'fired supervision lineage turn is required');
+      END
+      """
+    },
+    %{
+      type: "trigger",
+      name: "supervision_controller_root_immutable_update",
+      sql: """
+      CREATE TRIGGER IF NOT EXISTS supervision_controller_root_immutable_update
+      BEFORE UPDATE OF rootTurnSeq
+      ON supervision_liveness_sidecar
+      WHEN OLD.controllerOrigin IS NOT NULL
+        AND NEW.rootTurnSeq IS NOT OLD.rootTurnSeq
+      BEGIN
+        SELECT RAISE(ABORT, 'supervision controller root link is immutable');
+      END
+      """
+    },
+    %{
+      type: "trigger",
+      name: "supervision_controller_root_immutable_delete",
+      sql: """
+      CREATE TRIGGER IF NOT EXISTS supervision_controller_root_immutable_delete
+      BEFORE DELETE ON supervision_liveness_sidecar
+      WHEN OLD.controllerOrigin IS NOT NULL
+        AND NOT (
+          OLD.controllerOrigin='scheduled' AND OLD.controllerState='pending'
+          AND EXISTS (
+            SELECT 1 FROM wakes w
+            WHERE w.wakeId=OLD.wakeId AND w.assignmentId=OLD.assignmentId
+              AND w.state='pending'
+            )
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM wakes w
+          WHERE w.wakeId=OLD.wakeId AND w.assignmentId=OLD.assignmentId
+            AND w.state='fired' AND w.consumer='prompt'
+            AND w.origin='process:tightbeam' AND w.reresolve='lineage'
+        )
+      BEGIN
+        SELECT RAISE(ABORT, 'supervision controller root link is required');
+      END
+      """
+    },
+    %{
+      type: "trigger",
+      name: "supervision_controller_wake_identity_immutable",
+      sql: """
+      CREATE TRIGGER IF NOT EXISTS supervision_controller_wake_identity_immutable
+      BEFORE UPDATE OF wakeId, sessionKey, assignmentId ON wakes
+      WHEN EXISTS (
+        SELECT 1 FROM supervision_liveness_sidecar s
+        WHERE s.wakeId=OLD.wakeId AND s.assignmentId=OLD.assignmentId
+          AND s.controllerOrigin IS NOT NULL
+      )
+        AND NOT EXISTS (
+          SELECT 1 FROM supervision_liveness_sidecar s
+          WHERE s.wakeId=OLD.wakeId AND s.assignmentId=OLD.assignmentId
+            AND s.controllerOrigin='scheduled' AND s.controllerState='pending'
+            AND EXISTS (
+              SELECT 1 FROM wakes w
+              WHERE w.wakeId=OLD.wakeId AND w.assignmentId=OLD.assignmentId
+                AND w.state='pending'
+            )
+        )
+        AND (
+          NEW.wakeId IS NOT OLD.wakeId OR NEW.sessionKey IS NOT OLD.sessionKey
+          OR NEW.assignmentId IS NOT OLD.assignmentId
+        )
+      BEGIN
+        SELECT RAISE(ABORT, 'supervision controller wake identity is immutable');
+      END
+      """
+    },
+    %{
+      type: "trigger",
+      name: "supervision_controller_wake_immutable_delete",
+      sql: """
+      CREATE TRIGGER IF NOT EXISTS supervision_controller_wake_immutable_delete
+      BEFORE DELETE ON wakes
+      WHEN EXISTS (
+        SELECT 1 FROM supervision_liveness_sidecar s
+        WHERE s.wakeId=OLD.wakeId AND s.assignmentId=OLD.assignmentId
+          AND s.controllerOrigin IS NOT NULL
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'supervision controller wake is required');
+      END
+      """
+    },
+    %{
+      type: "trigger",
+      name: "supervision_controller_root_turn_immutable_update",
+      sql: """
+      CREATE TRIGGER IF NOT EXISTS supervision_controller_root_turn_immutable_update
+      BEFORE UPDATE OF seq, assignmentId ON turns
+      WHEN EXISTS (
+        SELECT 1 FROM supervision_liveness_sidecar s
+        WHERE s.rootTurnSeq=OLD.seq AND s.assignmentId=OLD.assignmentId
+      )
+        AND (NEW.seq IS NOT OLD.seq OR NEW.assignmentId IS NOT OLD.assignmentId)
+      BEGIN
+        SELECT RAISE(ABORT, 'supervision controller root turn identity is immutable');
+      END
+      """
+    },
+    %{
+      type: "trigger",
+      name: "supervision_controller_root_turn_immutable_delete",
+      sql: """
+      CREATE TRIGGER IF NOT EXISTS supervision_controller_root_turn_immutable_delete
+      BEFORE DELETE ON turns
+      WHEN EXISTS (
+        SELECT 1 FROM supervision_liveness_sidecar s
+        WHERE s.rootTurnSeq=OLD.seq AND s.assignmentId=OLD.assignmentId
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'supervision controller root turn is required');
       END
       """
     }
@@ -1086,16 +1216,22 @@ defmodule Tightbeam.Schema do
       {:ok, [[@shape]]} ->
         :ok
 
+      {:ok, [[@notice_batching_shape]]} ->
+        upgrade_nullable_effective_parent_v1(db)
+
       {:ok, [[@terminal_decision_shape]]} ->
-        migrate_notice_batching_v1_019(db)
+        :ok = migrate_notice_batching_v1_019(db)
+        upgrade_nullable_effective_parent_v1(db)
 
       {:ok, [[@operator_decision_shape]]} ->
         :ok = migrate_operator_decision_v1(db)
-        migrate_notice_batching_v1_019(db)
+        :ok = migrate_notice_batching_v1_019(db)
+        upgrade_nullable_effective_parent_v1(db)
 
       {:ok, [[@model_identity_shape]]} ->
         :ok = migrate_model_identity_v1(db)
-        migrate_notice_batching_v1_019(db)
+        :ok = migrate_notice_batching_v1_019(db)
+        upgrade_nullable_effective_parent_v1(db)
 
       {:ok, []} ->
         # No stamp. Either a database this build is about to create, or one
@@ -1112,7 +1248,8 @@ defmodule Tightbeam.Schema do
           this build: #{@shape}
 
         This build can migrate #{@model_identity_shape} or #{@operator_decision_shape}
-        to #{@terminal_decision_shape}, then #{@terminal_decision_shape} to #{@shape}.
+        to #{@terminal_decision_shape}, then #{@terminal_decision_shape} to
+        #{@notice_batching_shape}, then #{@notice_batching_shape} to #{@shape}.
 
         No migration is defined for the stamped shape above. Keep the database
         in place and run a Tightbeam build that recognizes that exact stamp.
@@ -1341,6 +1478,194 @@ defmodule Tightbeam.Schema do
     :ok
   end
 
+  @doc false
+  @spec upgrade_nullable_effective_parent_v1(DB.server(), keyword()) :: :ok
+  def upgrade_nullable_effective_parent_v1(db, opts \\ []) when is_list(opts) do
+    :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
+
+    try do
+      case DB.transaction(db, fn txn ->
+             case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+               [[@notice_batching_shape]] ->
+                 :ok
+
+               rows ->
+                 raise ShapeError,
+                   message:
+                     "incompatible_nullable_effective_parent_v1: predecessor stamp #{inspect(rows)}"
+             end
+
+             :ok = migrate_controller_root_link_in_txn(txn, opts)
+             maybe_interrupt_nullable_effective_parent_migration!(opts, :after_root_link)
+
+             :ok = migrate_operational_parent_in_txn(txn, opts)
+             maybe_interrupt_nullable_effective_parent_migration!(opts, :after_migration)
+
+             Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
+               @notice_batching_shape,
+               @shape,
+               System.system_time(:millisecond)
+             ])
+
+             if Txn.changes(txn) != 1,
+               do:
+                 raise(ShapeError,
+                   message: "incompatible_nullable_effective_parent_v1: stamp race"
+                 )
+
+             maybe_interrupt_nullable_effective_parent_migration!(opts, :after_stamp)
+
+             case Txn.q(txn, "PRAGMA foreign_key_check") do
+               [] ->
+                 :ok
+
+               rows ->
+                 raise ShapeError,
+                   message:
+                     "incompatible_nullable_effective_parent_v1: foreign key check #{inspect(rows)}"
+             end
+           end) do
+        {:ok, :ok} ->
+          :ok
+
+        {:error, %ShapeError{} = error} ->
+          raise error
+
+        {:error, error} ->
+          raise ShapeError,
+            message:
+              "incompatible_nullable_effective_parent_v1: upgrade failed: #{Exception.message(error)}"
+      end
+    after
+      :ok = DB.execute(db, "PRAGMA foreign_keys = ON")
+    end
+  end
+
+  defp maybe_interrupt_nullable_effective_parent_migration!(opts, point) do
+    if Keyword.get(opts, :fail_at) == point,
+      do: raise("forced nullable-effective-parent migration interruption")
+
+    :ok
+  end
+
+  defp migrate_operational_parent_in_txn(txn, opts) do
+    columns =
+      Txn.q(txn, "PRAGMA table_info(sessions)")
+      |> Enum.map(fn [_cid, name | _rest] -> name end)
+
+    unless "operationalParent" in columns do
+      :ok =
+        Txn.exec(
+          txn,
+          "ALTER TABLE sessions ADD COLUMN operationalParent TEXT REFERENCES sessions(sessionKey)"
+        )
+
+      maybe_interrupt_nullable_effective_parent_migration!(opts, :after_operational_parent)
+    end
+
+    case Txn.q(txn, "SELECT sessionKey FROM sessions WHERE operationalParent IS NOT NULL LIMIT 1") do
+      [] ->
+        :ok
+
+      rows ->
+        raise ShapeError,
+          message:
+            "incompatible_nullable_effective_parent_v1: legacy parent was inferred #{inspect(rows)}"
+    end
+  end
+
+  defp migrate_controller_root_link_in_txn(txn, opts) do
+    case Txn.q(
+           txn,
+           "SELECT 1 FROM sqlite_master WHERE type='table' AND name='supervision_liveness_sidecar'"
+         ) do
+      [] ->
+        # Terminal-decision predecessors can have intentionally removed the
+        # activation sidecar. The activation pass below recreates it from the
+        # current DDL, including rootTurnSeq.
+        :ok
+
+      _ ->
+        migrate_existing_controller_root_link_in_txn(txn, opts)
+    end
+  end
+
+  defp migrate_existing_controller_root_link_in_txn(txn, opts) do
+    predecessor_columns =
+      Txn.q(txn, "PRAGMA table_info(supervision_liveness_sidecar)")
+      |> Enum.map(fn [_cid, name | _rest] -> name end)
+
+    if "rootTurnSeq" in predecessor_columns do
+      :ok
+    else
+      copied_columns = [
+        "wakeId",
+        "assignmentId",
+        "controllerOrigin",
+        "wakeKind",
+        "controllerState",
+        "chargedGeneration",
+        "transferEvidenceId",
+        "retirementEpoch",
+        "retiringSessionKey",
+        "retirementOutcomeKind",
+        "retirementOutcomeId",
+        "retirementTargetSessionKey",
+        "retirementCause",
+        "retirementPrincipal",
+        "retirementActionNeeded"
+      ]
+
+      column_list = Enum.join(copied_columns, ", ")
+
+      :ok =
+        Txn.exec(
+          txn,
+          "CREATE TEMP TABLE nullable_effective_parent_sidecar_v1 AS SELECT #{column_list} FROM supervision_liveness_sidecar"
+        )
+
+      maybe_interrupt_nullable_effective_parent_migration!(opts, :after_root_copy)
+
+      dependent_objects =
+        (@supervision_liveness_objects ++ @supervision_liveness_enforcement_objects)
+        |> Enum.filter(fn object ->
+          object.name != "supervision_liveness_sidecar" and
+            String.contains?(object.sql, "supervision_liveness_sidecar") and
+            owned_object_present?(txn, object)
+        end)
+
+      Enum.each(dependent_objects, fn object ->
+        :ok = Txn.exec(txn, "DROP #{String.upcase(object.type)} IF EXISTS #{object.name}")
+      end)
+
+      :ok = Txn.exec(txn, "DROP TABLE supervision_liveness_sidecar")
+      maybe_interrupt_nullable_effective_parent_migration!(opts, :after_root_drop)
+
+      sidecar =
+        Enum.find(@supervision_liveness_objects, fn object ->
+          object.name == "supervision_liveness_sidecar"
+        end)
+
+      :ok = Txn.exec(txn, sidecar.sql)
+
+      Txn.q(
+        txn,
+        "INSERT INTO supervision_liveness_sidecar (#{column_list}) SELECT #{column_list} FROM nullable_effective_parent_sidecar_v1"
+      )
+
+      :ok = Txn.exec(txn, "DROP TABLE nullable_effective_parent_sidecar_v1")
+
+      Enum.each(dependent_objects, fn object ->
+        :ok = Txn.exec(txn, object.sql)
+        validate_owned_object!(txn, object)
+      end)
+
+      validate_owned_object!(txn, sidecar)
+      maybe_interrupt_nullable_effective_parent_migration!(opts, :after_root_restore)
+      :ok
+    end
+  end
+
   defp migrate_notice_batching_v1_019(db) do
     # The database owner serializes this call. Disable enforcement only around
     # the exact table replacement, then prove every foreign key before commit.
@@ -1357,7 +1682,7 @@ defmodule Tightbeam.Schema do
         {:error, error} ->
           raise ShapeError,
             message:
-              "migration #{@terminal_decision_shape} -> #{@shape} failed and was rolled back: #{Exception.message(error)}"
+              "migration #{@terminal_decision_shape} -> #{@notice_batching_shape} failed and was rolled back: #{Exception.message(error)}"
       end
     after
       :ok = DB.execute(db, "PRAGMA foreign_keys = ON")
@@ -1401,7 +1726,7 @@ defmodule Tightbeam.Schema do
     if Txn.changes(txn) != wake_count do
       raise ShapeError,
         message:
-          "migration #{@terminal_decision_shape} -> #{@shape} copied #{Txn.changes(txn)} of #{wake_count} wakes"
+          "migration #{@terminal_decision_shape} -> #{@notice_batching_shape} copied #{Txn.changes(txn)} of #{wake_count} wakes"
     end
 
     [[^wake_count]] = Txn.q(txn, "SELECT COUNT(*) FROM wakes_notice_batching_v1")
@@ -1421,7 +1746,7 @@ defmodule Tightbeam.Schema do
       rows ->
         raise ShapeError,
           message:
-            "migration #{@terminal_decision_shape} -> #{@shape} classified legacy wakes: #{inspect(rows)}"
+            "migration #{@terminal_decision_shape} -> #{@notice_batching_shape} classified legacy wakes: #{inspect(rows)}"
     end
 
     wake_bound_objects =
@@ -1481,7 +1806,7 @@ defmodule Tightbeam.Schema do
       if Txn.changes(txn) != cancellation_count do
         raise ShapeError,
           message:
-            "migration #{@terminal_decision_shape} -> #{@shape} copied #{Txn.changes(txn)} of #{cancellation_count} wake cancellations"
+            "migration #{@terminal_decision_shape} -> #{@notice_batching_shape} copied #{Txn.changes(txn)} of #{cancellation_count} wake cancellations"
       end
 
       :ok =
@@ -1515,7 +1840,7 @@ defmodule Tightbeam.Schema do
       if Txn.changes(txn) != cancellation_count do
         raise ShapeError,
           message:
-            "migration #{@terminal_decision_shape} -> #{@shape} restored #{Txn.changes(txn)} of #{cancellation_count} wake cancellations"
+            "migration #{@terminal_decision_shape} -> #{@notice_batching_shape} restored #{Txn.changes(txn)} of #{cancellation_count} wake cancellations"
       end
 
       :ok = Txn.exec(txn, "DROP TABLE wake_cancellations_notice_batching_v1")
@@ -1530,19 +1855,19 @@ defmodule Tightbeam.Schema do
       rows ->
         raise ShapeError,
           message:
-            "migration #{@terminal_decision_shape} -> #{@shape} left invalid foreign keys: #{inspect(rows)}"
+            "migration #{@terminal_decision_shape} -> #{@notice_batching_shape} left invalid foreign keys: #{inspect(rows)}"
     end
 
     Txn.q(
       txn,
       "UPDATE schema_stamp SET shape = ?1, stampedAt = ?2 WHERE shape = ?3",
-      [@shape, System.system_time(:millisecond), @terminal_decision_shape]
+      [@notice_batching_shape, System.system_time(:millisecond), @terminal_decision_shape]
     )
 
     if Txn.changes(txn) != 1 do
       raise ShapeError,
         message:
-          "migration #{@terminal_decision_shape} -> #{@shape} lost its exact stamp transition"
+          "migration #{@terminal_decision_shape} -> #{@notice_batching_shape} lost its exact stamp transition"
     end
 
     :ok

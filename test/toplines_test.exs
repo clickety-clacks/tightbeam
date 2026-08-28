@@ -87,7 +87,13 @@ defmodule Tightbeam.ToplinesTest do
         call({:session, "s_flynn"}, %{title: "Session intent", idempotency_key: "create-2"}, 11)
       )
 
-    assert session_created.topline.createdActor == %{kind: "session", ref: "s_flynn"}
+    assert session_created.topline.createdActor == %{
+             kind: "session",
+             ref: "s_flynn",
+             operationalParent: nil,
+             effectiveParent: Org.personal_session_key("flynn"),
+             effectiveParentSource: "owner_main"
+           }
   end
 
   test "membership episodes retain reasons, attribution, history, and keyed replay", ctx do

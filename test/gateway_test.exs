@@ -1853,7 +1853,10 @@ defmodule Tightbeam.GatewayTest do
     create_session(ctx.db, "effort-parent", "flynn")
 
     :ok =
-      DB.execute(ctx.db, "UPDATE sessions SET spawnedBy='effort-parent' WHERE sessionKey='k1'")
+      DB.execute(
+        ctx.db,
+        "UPDATE sessions SET operationalParent='effort-parent' WHERE sessionKey='k1'"
+      )
 
     assignment =
       Gateway.handlers(config)["dispatch"].(%{

@@ -24,7 +24,7 @@ defmodule Tightbeam.Artifacts do
   through `recorded_kinds/3`, which reads neither column.
   """
 
-  alias Tightbeam.{DB, TurnObservations}
+  alias Tightbeam.{DB, Org, TurnObservations}
 
   @outside_workspace "artifact origin is outside its session workspace"
 
@@ -451,10 +451,14 @@ defmodule Tightbeam.Artifacts do
   end
 
   defp parent_session(db, session_key) do
-    case DB.query(db, "SELECT spawnedBy FROM sessions WHERE sessionKey = ?1", [session_key]) do
-      {:ok, [[parent]]} -> parent
-      {:ok, []} -> nil
-    end
+    {:ok, parent} =
+      DB.transaction(db, fn txn ->
+        %{session_key: parent} = Org.effective_parent_in_txn(txn, session_key)
+
+        if Org.get_in_txn(txn, parent), do: parent
+      end)
+
+    parent
   end
 
   defp sanitize(session_key), do: String.replace(session_key, ~r/[^A-Za-z0-9._-]/, "_")

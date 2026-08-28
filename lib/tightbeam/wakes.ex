@@ -623,14 +623,14 @@ defmodule Tightbeam.Wakes do
         case Txn.q(
                txn,
                """
-               SELECT assignmentId, controllerOrigin, wakeKind, chargedGeneration
+               SELECT assignmentId, controllerOrigin, wakeKind, chargedGeneration, rootTurnSeq
                FROM supervision_liveness_sidecar
                WHERE wakeId=?1 AND controllerOrigin='scheduled'
                  AND controllerState='pending'
                """,
                [wake_id]
              ) do
-          [[assignment_id, controller_origin, wake_kind, charged_generation]] ->
+          [[assignment_id, controller_origin, wake_kind, charged_generation, root_turn_seq]] ->
             Txn.q(
               txn,
               """
@@ -646,15 +646,16 @@ defmodule Tightbeam.Wakes do
               """
               INSERT INTO supervision_liveness_sidecar
                 (wakeId, assignmentId, controllerOrigin, wakeKind,
-                 controllerState, chargedGeneration)
-              VALUES (?1, ?2, ?3, ?4, 'pending', ?5)
+                 controllerState, chargedGeneration, rootTurnSeq)
+              VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6)
               """,
               [
                 replacement_id,
                 assignment_id,
                 controller_origin,
                 wake_kind,
-                charged_generation
+                charged_generation,
+                root_turn_seq
               ]
             )
 

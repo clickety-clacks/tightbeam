@@ -146,6 +146,9 @@ defmodule Tightbeam.RecurrenceSuppressionTest do
   end
 
   test "threshold audits unavailable operational parent and falls back to Main", ctx do
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE sessions SET operationalParent=NULL WHERE sessionKey='target'")
+
     config = config(2)
     first = occurrence(ctx.target.session_key, "asg_threshold", "r1", 1)
     assert :dispatch = RecurrenceSuppression.prepare_first(ctx.db, first, "dispatch-threshold")
@@ -621,6 +624,7 @@ defmodule Tightbeam.RecurrenceSuppressionTest do
       owner_user_id: "mike",
       origin: "user:mike",
       spawned_by: spawned_by,
+      operational_parent: spawned_by,
       archetype: "coder",
       host: Tightbeam.Placement.local_host_name(),
       harness: "codex",

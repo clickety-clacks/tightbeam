@@ -40,7 +40,7 @@ defmodule Tightbeam.ExecutionMap do
      through any item-attributed carrier.
   """
 
-  alias Tightbeam.{CausalEvents, DB}
+  alias Tightbeam.{CausalEvents, DB, Org}
 
   @edge_basis "concurrent_turn"
   @coverage_basis "conservative_shared"
@@ -305,7 +305,7 @@ defmodule Tightbeam.ExecutionMap do
       state: item.state,
       fail_reason: item.fail_reason,
       bracket1_armed: not is_nil(item.routing_wake_id),
-      origin: %{principal: principal(item), created_by: created_by(item)},
+      origin: origin(world, item),
       creation_context: %{recorded: item.context_known, turn_seq: item.created_in_turn_seq},
       parent: Map.fetch!(world.parents, item.id),
       finished_at: finished_at(world, item),
@@ -345,8 +345,16 @@ defmodule Tightbeam.ExecutionMap do
   defp principal(%{created_by_user: user}) when is_binary(user), do: "user"
   defp principal(_item), do: "session"
 
-  defp created_by(%{created_by_user: user}) when is_binary(user), do: user
-  defp created_by(%{created_by_session: session}), do: session
+  defp origin(_world, %{created_by_user: user}) when is_binary(user),
+    do: %{principal: "user", created_by: user}
+
+  defp origin(world, %{created_by_session: session_key}) do
+    %{
+      principal: "session",
+      created_by: session_key,
+      session: Map.get(world.session_parents, session_key)
+    }
+  end
 
   # The timestamp of the LATEST disposition_transition whose `toState` equals the
   # item's CURRENT terminal state. Null for an open item even with prior
@@ -629,7 +637,8 @@ defmodule Tightbeam.ExecutionMap do
       open_requests: open_requests(db),
       pending_wake_sessions: pending_wake_sessions(db),
       dispositions: dispositions(db),
-      session_owners: session_owners(db)
+      session_owners: session_owners(db),
+      session_parents: session_parents(db)
     }
   end
 
@@ -880,6 +889,15 @@ defmodule Tightbeam.ExecutionMap do
   defp session_owners(db) do
     {:ok, rows} = DB.query(db, "SELECT sessionKey, ownerUserId FROM sessions")
     Map.new(rows, fn [key, owner] -> {key, owner} end)
+  end
+
+  defp session_parents(db) do
+    db
+    |> Org.list_all()
+    |> Map.new(fn session ->
+      {session.session_key,
+       Map.take(session, [:operational_parent, :effective_parent, :effective_parent_source])}
+    end)
   end
 
   ## Caller resolution — the same owner-or-admin shape work-item-trace uses

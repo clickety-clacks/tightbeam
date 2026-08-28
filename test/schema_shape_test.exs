@@ -34,7 +34,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
   alias Tightbeam.{Assignments, DB, Schema}
 
-  @shape "notice-batching-v1-019"
+  @shape "nullable-effective-parent-v1-019"
   @terminal_decision_shape "terminal-operator-decision-parity-v1"
   @operator_decision_shape "operator-decision-requests-v1"
   @model_identity_shape "model-identity-v1"
@@ -118,6 +118,8 @@ defmodule Tightbeam.SchemaShapeTest do
   test "a fresh database is created and stamped", %{db: db} do
     assert :ok = Schema.ensure_all(db)
     assert "executionId" in table_columns(db, "command_executions")
+    assert "operationalParent" in table_columns(db, "sessions")
+    assert "rootTurnSeq" in table_columns(db, "supervision_liveness_sidecar")
 
     assert {:ok, [[@shape]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
@@ -136,6 +138,12 @@ defmodule Tightbeam.SchemaShapeTest do
 
     assert operator_index =~ "(ownerUserId, raiserId, actionKey)"
     assert operator_index =~ ~r/WHERE\s+kind\s*=\s*'operator'\s+AND\s+status\s*=\s*'open'/
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               db,
+               "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name='supervision_controller_root_immutable_update'"
+             )
   end
 
   test "model-identity-v1 migrates exact requests, messages, and wakes", %{db: db} do
@@ -547,7 +555,7 @@ defmodule Tightbeam.SchemaShapeTest do
              ~w(attestId assignmentId attestTs generation recoveryBaseline cause principal)
 
     assert table_columns(db, "supervision_liveness_sidecar") ==
-             ~w(wakeId assignmentId controllerOrigin wakeKind controllerState chargedGeneration transferEvidenceId retirementEpoch retiringSessionKey retirementOutcomeKind retirementOutcomeId retirementTargetSessionKey retirementCause retirementPrincipal retirementActionNeeded)
+             ~w(wakeId assignmentId controllerOrigin wakeKind controllerState chargedGeneration transferEvidenceId retirementEpoch retiringSessionKey retirementOutcomeKind retirementOutcomeId retirementTargetSessionKey retirementCause retirementPrincipal retirementActionNeeded rootTurnSeq)
 
     assert table_columns(db, "wake_cancellations") ==
              ~w(wakeId wakeState canceledAt requesterKind requesterId reasonKind causalSourceKind causalSourceId outcomeKind replacementWakeId dispositionKind dispositionId primaryWorkKind primaryWorkId workImpactKind livenessTriggerKind livenessTriggerId actionNeeded)
@@ -1091,6 +1099,12 @@ defmodule Tightbeam.SchemaShapeTest do
       DROP TRIGGER IF EXISTS supervision_fired_lineage_sidecar_identity_immutable;
       DROP TRIGGER IF EXISTS supervision_fired_lineage_sidecar_required_delete;
       DROP TRIGGER IF EXISTS supervision_lineage_fire_requires_sidecar;
+      DROP TRIGGER IF EXISTS supervision_controller_root_immutable_update;
+      DROP TRIGGER IF EXISTS supervision_controller_root_immutable_delete;
+      DROP TRIGGER IF EXISTS supervision_controller_wake_identity_immutable;
+      DROP TRIGGER IF EXISTS supervision_controller_wake_immutable_delete;
+      DROP TRIGGER IF EXISTS supervision_controller_root_turn_immutable_update;
+      DROP TRIGGER IF EXISTS supervision_controller_root_turn_immutable_delete;
       DROP TRIGGER IF EXISTS wakes_typed_cancellation_required;
       DROP TRIGGER IF EXISTS wake_cancellations_pending_insert;
       DROP TABLE IF EXISTS wake_cancellations;

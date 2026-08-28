@@ -1103,7 +1103,10 @@ defmodule Tightbeam.SupervisionTest do
     assert wake.reresolve_rung == 1
 
     {:ok, _} =
-      DB.query(ctx.db, "UPDATE sessions SET spawnedBy = 'holder' WHERE sessionKey = 'supervisor'")
+      DB.query(
+        ctx.db,
+        "UPDATE sessions SET operationalParent = 'holder' WHERE sessionKey = 'supervisor'"
+      )
 
     assert Supervision.ladder_target(ctx.db, "holder", 1) == "supervisor"
     assert Supervision.ladder_target(ctx.db, "holder", 2) == ctx.main.session_key
@@ -1119,6 +1122,11 @@ defmodule Tightbeam.SupervisionTest do
   test "the ladder answers nobody rather than composing a key for a session that has no row",
        ctx do
     assert Supervision.ladder_target(ctx.db, "holder", 2) == ctx.main.session_key
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE sessions SET operationalParent=NULL WHERE operationalParent=?1", [
+        ctx.main.session_key
+      ])
 
     {:ok, _} =
       DB.query(ctx.db, "DELETE FROM sessions WHERE sessionKey = ?1", [ctx.main.session_key])
@@ -1159,6 +1167,11 @@ defmodule Tightbeam.SupervisionTest do
     retire!(ctx.db, "supervisor")
 
     {:ok, _} =
+      DB.query(ctx.db, "UPDATE sessions SET operationalParent=NULL WHERE operationalParent=?1", [
+        ctx.main.session_key
+      ])
+
+    {:ok, _} =
       DB.query(ctx.db, "DELETE FROM sessions WHERE sessionKey = ?1", [ctx.main.session_key])
 
     Supervision.evaluate(ctx.db, ctx.handlers, 0, "holder", seq)
@@ -1171,6 +1184,11 @@ defmodule Tightbeam.SupervisionTest do
   # `process:tightbeam` re-resolving a lineage whose owner has no main session.
   test "a lineage notice for an owner with no main session enqueues nothing and is named", ctx do
     retire!(ctx.db, "supervisor")
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE sessions SET operationalParent=NULL WHERE operationalParent=?1", [
+        ctx.main.session_key
+      ])
 
     {:ok, _} =
       DB.query(ctx.db, "DELETE FROM sessions WHERE sessionKey = ?1", [ctx.main.session_key])
@@ -2091,6 +2109,7 @@ defmodule Tightbeam.SupervisionTest do
     )
 
     wake = ctx.handlers["wake"]
+    root_turn_seq = terminal!(ctx.db, "holder")
 
     assert_raise RuntimeError, ~r/controller schedule :duplicate/, fn ->
       wake.(%{
@@ -2102,7 +2121,8 @@ defmodule Tightbeam.SupervisionTest do
           after_ms: 0,
           nudge: false,
           assignment_id: "asg_1",
-          supervision_wake_kind: "prod"
+          supervision_wake_kind: "prod",
+          supervision_terminal_seq: root_turn_seq
         }
       })
     end
@@ -2117,6 +2137,7 @@ defmodule Tightbeam.SupervisionTest do
   test "a supervision controller without an entitlement rolls back its wake row", ctx do
     {:ok, _} = DB.query(ctx.db, "DELETE FROM supervision_entitlements WHERE assignmentId='asg_1'")
     wake = ctx.handlers["wake"]
+    root_turn_seq = terminal!(ctx.db, "holder")
 
     assert_raise RuntimeError, ~r/controller schedule :duplicate/, fn ->
       wake.(%{
@@ -2128,7 +2149,8 @@ defmodule Tightbeam.SupervisionTest do
           after_ms: 0,
           nudge: false,
           assignment_id: "asg_1",
-          supervision_wake_kind: "prod"
+          supervision_wake_kind: "prod",
+          supervision_terminal_seq: root_turn_seq
         }
       })
     end
@@ -2572,7 +2594,10 @@ defmodule Tightbeam.SupervisionTest do
 
   test "N=0 cross-assignment re-entry exceeds N+1 and then quiesces at Main", ctx do
     {:ok, _} =
-      DB.query(ctx.db, "UPDATE sessions SET spawnedBy='holder' WHERE sessionKey='supervisor'")
+      DB.query(
+        ctx.db,
+        "UPDATE sessions SET operationalParent='holder' WHERE sessionKey='supervisor'"
+      )
 
     assignment(ctx.db, "asg_2", "supervisor", "second", 2)
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
@@ -2611,7 +2636,9 @@ defmodule Tightbeam.SupervisionTest do
 
   test "past-sink open assignment emits one escalation per external terminal and duplicate re-entry is inert",
        ctx do
-    {:ok, _} = DB.query(ctx.db, "UPDATE sessions SET spawnedBy=NULL WHERE sessionKey='holder'")
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE sessions SET operationalParent=NULL WHERE sessionKey='holder'")
+
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
 
     first = terminal!(ctx.db, "holder")
@@ -2642,7 +2669,9 @@ defmodule Tightbeam.SupervisionTest do
       session(ctx.db, target, ctx.main.session_key)
 
       {:ok, _} =
-        DB.query(ctx.db, "UPDATE sessions SET spawnedBy=?1 WHERE sessionKey='holder'", [target])
+        DB.query(ctx.db, "UPDATE sessions SET operationalParent=?1 WHERE sessionKey='holder'", [
+          target
+        ])
 
       gate = %{reresolve: "lineage", reresolve_seed: "holder", reresolve_rung: 1}
 
@@ -3326,6 +3355,7 @@ defmodule Tightbeam.SupervisionTest do
       owner_user_id: "flynn",
       origin: "user:flynn",
       spawned_by: spawned_by,
+      operational_parent: spawned_by,
       kind: if(built_in, do: "main", else: "custom"),
       is_built_in: built_in,
       archetype: "default",

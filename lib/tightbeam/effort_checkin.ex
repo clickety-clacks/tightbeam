@@ -981,17 +981,13 @@ defmodule Tightbeam.EffortCheckin do
       assignment.opened_by_session == assignment.holder_key ->
         holder = session_in_txn(txn, assignment.holder_key)
 
-        if holder.spawned_by do
-          route_session(txn, holder.spawned_by, holder.owner_user_id, 1, assignment.holder_key)
-        else
-          %{
-            session_key: nil,
-            user_id: holder.owner_user_id,
-            owner_user_id: holder.owner_user_id,
-            principal_user_id: holder.owner_user_id,
-            rung: 1
-          }
-        end
+        route_session(
+          txn,
+          holder.effective_parent,
+          holder.owner_user_id,
+          1,
+          assignment.holder_key
+        )
 
       true ->
         opener = session_in_txn(txn, assignment.opened_by_session)
@@ -1014,62 +1010,54 @@ defmodule Tightbeam.EffortCheckin do
     current = session_in_txn(txn, request.expecter_session_key)
     assignment = assignment_in_txn(txn, request.assignment_id)
 
-    if current.spawned_by do
-      route_session(
-        txn,
-        current.spawned_by,
-        request.owner_user_id,
-        request.lineage_rung + 1,
-        assignment.holder_key
-      )
-    else
-      %{
-        session_key: nil,
-        user_id: request.owner_user_id,
-        owner_user_id: request.owner_user_id,
-        principal_user_id: request.owner_user_id,
-        rung: request.lineage_rung + 1
-      }
-    end
+    route_session(
+      txn,
+      current.effective_parent,
+      request.owner_user_id,
+      request.lineage_rung + 1,
+      assignment.holder_key
+    )
   end
 
   defp route_session(txn, key, owner_user_id, rung, holder_key) do
-    session = session_in_txn(txn, key)
+    case Org.get_in_txn(txn, key) do
+      nil ->
+        user_expecter(owner_user_id, rung)
 
-    cond do
-      key == holder_key and session.spawned_by ->
-        route_session(txn, session.spawned_by, owner_user_id, rung + 1, holder_key)
+      session ->
+        cond do
+          key == holder_key and session.kind != "main" ->
+            route_session(txn, session.effective_parent, owner_user_id, rung + 1, holder_key)
 
-      key == holder_key ->
-        %{
-          session_key: nil,
-          user_id: owner_user_id,
-          owner_user_id: owner_user_id,
-          principal_user_id: owner_user_id,
-          rung: rung + 1
-        }
+          key == holder_key ->
+            user_expecter(owner_user_id, rung + 1)
 
-      session.state == "active" ->
-        %{
-          session_key: key,
-          user_id: nil,
-          owner_user_id: owner_user_id,
-          principal_user_id: session.owner_user_id,
-          rung: rung
-        }
+          session.state == "active" ->
+            %{
+              session_key: key,
+              user_id: nil,
+              owner_user_id: owner_user_id,
+              principal_user_id: session.owner_user_id,
+              rung: rung
+            }
 
-      session.spawned_by ->
-        route_session(txn, session.spawned_by, owner_user_id, rung + 1, holder_key)
+          session.kind != "main" ->
+            route_session(txn, session.effective_parent, owner_user_id, rung + 1, holder_key)
 
-      true ->
-        %{
-          session_key: nil,
-          user_id: owner_user_id,
-          owner_user_id: owner_user_id,
-          principal_user_id: owner_user_id,
-          rung: rung + 1
-        }
+          true ->
+            user_expecter(owner_user_id, rung + 1)
+        end
     end
+  end
+
+  defp user_expecter(owner_user_id, rung) do
+    %{
+      session_key: nil,
+      user_id: owner_user_id,
+      owner_user_id: owner_user_id,
+      principal_user_id: owner_user_id,
+      rung: rung
+    }
   end
 
   # The four channels, all read in the verdict's own transaction. Turns ride
@@ -1346,21 +1334,7 @@ defmodule Tightbeam.EffortCheckin do
   end
 
   defp session_in_txn(txn, key) do
-    [[key, owner, spawned_by, host, state, built_in]] =
-      Txn.q(
-        txn,
-        "SELECT sessionKey, ownerUserId, spawnedBy, host, state, isBuiltIn FROM sessions WHERE sessionKey = ?1",
-        [key]
-      )
-
-    %{
-      session_key: key,
-      owner_user_id: owner,
-      spawned_by: spawned_by,
-      host: host,
-      state: state,
-      is_built_in: built_in == 1
-    }
+    Org.get_in_txn(txn, key) || raise ArgumentError, "unknown session: #{key}"
   end
 
   defp holder_owner(txn, key) do

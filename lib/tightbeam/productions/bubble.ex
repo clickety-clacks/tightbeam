@@ -129,48 +129,62 @@ defmodule Tightbeam.Productions.Bubble do
   # RHS. Find the nearest ACTIVE ancestor of the session the terminal landed
   # in and enqueue the notice there; with none left, the terminal rung fires.
   # TWO UNLIKE ABSENCES, kept apart (review B2 — collapsing them silenced a
-  # whole class of fault): `:parentless` means the session has no spawnedBy
+  # whole class of fault): `:parentless` means the session row is missing
   # at all — its own marker already told the only audience there is, so a
   # fresh cause ends silently (spec §Fault bubbling 2). `:exhausted` means it
   # HAS a lineage and no rung of it is active — a retired rung can never run
   # a turn, so this is the climb ending, and the climb ending is the alert
   # (spec §5), whether what died here was a notice or the cause itself.
   defp climb(db, turn) do
-    case next_active_ancestor(db, turn.session_key) do
-      :parentless ->
-        if turn.notice?, do: terminal_alert(db, turn), else: :ok
-
-      :exhausted ->
-        terminal_alert(db, turn)
-
-      {:ok, recipient} ->
-        enqueue_notice(db, turn, recipient)
-    end
-  end
-
-  defp enqueue_notice(db, turn, recipient) do
     case cause_row(db, turn.cause_seq) do
-      {:ok, cause} -> enqueue_notice(db, turn, recipient, cause)
+      {:ok, cause} -> climb_with_cause(db, turn, cause)
       :missing -> report_missing_cause(db, turn)
     end
   end
 
-  defp enqueue_notice(db, turn, recipient, cause) do
+  defp climb_with_cause(db, turn, cause) do
     prompt =
       "Turn #{turn.cause_seq} in #{cause.session_key} could not run: " <>
         "#{cause.error || "reason unrecorded"}. You are the nearest ancestor " <>
         "shown able to run a turn. What to do about it is your judgment."
 
-    result =
-      Gateway.deliver_prompt(recipient, "process:tightbeam", prompt,
-        db: db,
-        sender: "process:tightbeam",
-        device_id: "process:tightbeam",
-        client_message_id: "bubble:#{turn.cause_seq}:#{recipient}",
-        wake_id: "bubble:#{turn.cause_seq}:#{recipient}",
-        request_ref: "bubble:#{turn.cause_seq}"
-      )
+    {:ok, result} =
+      DB.transaction(db, fn txn ->
+        case next_active_ancestor_in_txn(txn, turn.session_key) do
+          {:ok, recipient} ->
+            delivery =
+              Gateway.deliver_prompt_in_txn(
+                txn,
+                recipient,
+                "process:tightbeam",
+                prompt,
+                sender: "process:tightbeam",
+                device_id: "process:tightbeam",
+                client_message_id: "bubble:#{turn.cause_seq}:#{recipient}",
+                wake_id: "bubble:#{turn.cause_seq}:#{recipient}",
+                request_ref: "bubble:#{turn.cause_seq}"
+              )
 
+            {:delivery, recipient, delivery}
+
+          absence ->
+            absence
+        end
+      end)
+
+    case result do
+      :parentless ->
+        if turn.notice?, do: terminal_alert(db, turn, cause), else: :ok
+
+      :exhausted ->
+        terminal_alert(db, turn, cause)
+
+      {:delivery, recipient, delivery} ->
+        handle_notice_delivery(db, turn, recipient, Gateway.complete_delivery(db, delivery))
+    end
+  end
+
+  defp handle_notice_delivery(db, turn, recipient, result) do
     case result do
       # :duplicate is the dedupe working — a crash between recognition and
       # enqueue re-attempted into the UNIQUE key, exactly as designed.
@@ -187,13 +201,6 @@ defmodule Tightbeam.Productions.Bubble do
   # fact files second — a crash between them re-alerts on the next failure (a
   # duplicate sentence), where the other order would file suppression without
   # anyone having been told (a silent fault, the one unforgivable outcome).
-  defp terminal_alert(db, turn) do
-    case cause_row(db, turn.cause_seq) do
-      {:ok, cause} -> terminal_alert(db, turn, cause)
-      :missing -> report_missing_cause(db, turn)
-    end
-  end
-
   # ONE TRANSACTION (spec §5, literally: "in the same transaction it files
   # user-alerted"): the lifecycle record, the marker in the owner's main
   # stream, and the standing fact commit together — no window where the fact
@@ -371,37 +378,43 @@ defmodule Tightbeam.Productions.Bubble do
     end
   end
 
-  # First ancestor with an ACTIVE session row, walking spawnedBy. A missing
+  # First ancestor with an ACTIVE session row, walking effective parent. A missing
   # or retired rung is climbed past — it can never run a turn, which is the
   # same fact a canceled notice proves, learned one enqueue cheaper. The two
   # empty answers are DIFFERENT facts and stay different values: a session
-  # with no spawnedBy is `:parentless`; a session whose lineage exists but
+  # with no row is `:parentless`; a session whose lineage exists but
   # holds no active rung is `:exhausted`.
-  defp next_active_ancestor(db, session_key, hops \\ 0)
+  defp next_active_ancestor_in_txn(txn, session_key, hops \\ 0)
 
-  defp next_active_ancestor(_db, _session_key, hops) when hops > @lineage_hop_limit,
+  defp next_active_ancestor_in_txn(_txn, _session_key, hops) when hops > @lineage_hop_limit,
     do: :exhausted
 
-  defp next_active_ancestor(db, session_key, hops) do
-    case DB.query(db, "SELECT spawnedBy FROM sessions WHERE sessionKey = ?1", [session_key]) do
-      {:ok, [[parent]]} when is_binary(parent) ->
-        case DB.query(db, "SELECT state FROM sessions WHERE sessionKey = ?1", [parent]) do
-          {:ok, [["active"]]} -> {:ok, parent}
-          _ -> exhausted_past(db, parent, hops)
-        end
-
-      _ when hops == 0 ->
+  defp next_active_ancestor_in_txn(txn, session_key, hops) do
+    case Org.get_in_txn(txn, session_key) do
+      nil when hops == 0 ->
         :parentless
 
-      _ ->
+      nil ->
         :exhausted
+
+      _session ->
+        parent = Org.effective_parent_in_txn(txn, session_key).session_key
+
+        if parent == session_key do
+          :exhausted
+        else
+          case Org.get_in_txn(txn, parent) do
+            %{state: "active"} -> {:ok, parent}
+            _ -> exhausted_past(txn, parent, hops)
+          end
+        end
     end
   end
 
   # Climbing past a dead rung: whatever the rest of the walk answers, this
   # lineage EXISTS, so an empty tail is exhaustion, never parentlessness.
-  defp exhausted_past(db, parent, hops) do
-    case next_active_ancestor(db, parent, hops + 1) do
+  defp exhausted_past(txn, parent, hops) do
+    case next_active_ancestor_in_txn(txn, parent, hops + 1) do
       :parentless -> :exhausted
       other -> other
     end

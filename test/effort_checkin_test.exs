@@ -1599,6 +1599,8 @@ defmodule Tightbeam.EffortCheckinTest do
   end
 
   defp session(db, key, owner, host, overrides \\ %{}) do
+    overrides = Map.put_new(overrides, :operational_parent, Map.get(overrides, :spawned_by))
+
     Org.create(
       db,
       Map.merge(

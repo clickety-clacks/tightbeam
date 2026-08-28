@@ -12,7 +12,7 @@ defmodule Tightbeam.Toplines do
   and `topline/2`, which delegate to `Tightbeam.ExecutionMap`.
   """
 
-  alias Tightbeam.DB
+  alias Tightbeam.{DB, Org}
   alias Tightbeam.DB.Txn
 
   @white_space [
@@ -375,7 +375,7 @@ defmodule Tightbeam.Toplines do
           owner_params ++ state_params
         )
 
-      %{toplines: Enum.map(rows, &summary/1)}
+      %{toplines: Enum.map(rows, &summary(db, &1))}
     end
   end
 
@@ -403,8 +403,7 @@ defmodule Tightbeam.Toplines do
 
         [row] ->
           detail =
-            row
-            |> summary()
+            summary(db, row)
             |> Map.put(:workMemberships, active_memberships(db, topline_id))
             |> Map.put(:concerns, [])
 
@@ -431,16 +430,27 @@ defmodule Tightbeam.Toplines do
 
   defp summary_in_txn(txn, topline_id) do
     [row] = Txn.q(txn, summary_sql("WHERE t.id = ?1"), [topline_id])
-    summary(row)
+    summary(txn, row)
   end
 
-  defp summary([id, owner, title, state, actor_kind, actor_ref, created, updated, closed, count]) do
+  defp summary(db_or_txn, [
+         id,
+         owner,
+         title,
+         state,
+         actor_kind,
+         actor_ref,
+         created,
+         updated,
+         closed,
+         count
+       ]) do
     %{
       id: id,
       ownerUserId: owner,
       title: title,
       state: state,
-      createdActor: actor(actor_kind, actor_ref),
+      createdActor: actor(db_or_txn, actor_kind, actor_ref),
       createdAt: created,
       updatedAt: updated,
       closedAt: closed,
@@ -459,12 +469,12 @@ defmodule Tightbeam.Toplines do
         [topline_id]
       )
 
-    Enum.map(rows, &membership/1)
+    Enum.map(rows, &membership(db, &1))
   end
 
   defp membership_in_txn(txn, membership_id) do
     [row] = Txn.q(txn, membership_sql("WHERE m.id = ?1"), [membership_id])
-    membership(row)
+    membership(txn, row)
   end
 
   defp membership_sql(where) do
@@ -479,7 +489,7 @@ defmodule Tightbeam.Toplines do
     """
   end
 
-  defp membership([
+  defp membership(db_or_txn, [
          id,
          topline_id,
          work_item_id,
@@ -501,10 +511,10 @@ defmodule Tightbeam.Toplines do
       workItemId: work_item_id,
       ownerUserId: owner,
       linkReason: link_reason,
-      linkedActor: actor(linked_kind, linked_ref),
+      linkedActor: actor(db_or_txn, linked_kind, linked_ref),
       linkedAt: linked_at,
       unlinkReason: unlink_reason,
-      unlinkedActor: actor(unlinked_kind, unlinked_ref),
+      unlinkedActor: actor(db_or_txn, unlinked_kind, unlinked_ref),
       unlinkedAt: unlinked_at,
       workItemTitle: work_title,
       workItemState: work_state
@@ -525,12 +535,22 @@ defmodule Tightbeam.Toplines do
         [topline_id]
       )
 
-    Enum.map(rows, &event/1)
+    Enum.map(rows, &event(db, &1))
   end
 
-  defp event([topline_id, seq, kind, membership_id, actor_kind, actor_ref, reason, at, detail]) do
+  defp event(db_or_txn, [
+         topline_id,
+         seq,
+         kind,
+         membership_id,
+         actor_kind,
+         actor_ref,
+         reason,
+         at,
+         detail
+       ]) do
     %{
-      actor: actor(actor_kind, actor_ref),
+      actor: actor(db_or_txn, actor_kind, actor_ref),
       at: at,
       concernId: nil,
       concernReferenceId: nil,
@@ -930,8 +950,30 @@ defmodule Tightbeam.Toplines do
   defp normalize_string(value), do: :unicode.characters_to_nfc_binary(value)
   defp scalar_length(value), do: value |> String.to_charlist() |> length()
 
-  defp actor(nil, nil), do: nil
-  defp actor(kind, ref), do: %{kind: kind, ref: ref}
+  defp actor(_db_or_txn, nil, nil), do: nil
+
+  defp actor(db_or_txn, "session", ref) do
+    session =
+      case db_or_txn do
+        %Txn{} = txn -> Org.get_in_txn(txn, ref)
+        db -> Org.get(db, ref)
+      end
+
+    %{kind: "session", ref: ref}
+    |> Map.merge(
+      if session do
+        %{
+          operationalParent: session.operational_parent,
+          effectiveParent: session.effective_parent,
+          effectiveParentSource: Atom.to_string(session.effective_parent_source)
+        }
+      else
+        %{}
+      end
+    )
+  end
+
+  defp actor(_db_or_txn, kind, ref), do: %{kind: kind, ref: ref}
 
   defp mutation_time(_call), do: System.system_time(:millisecond)
   defp id(prefix), do: prefix <> Tightbeam.Id.uuid4()
