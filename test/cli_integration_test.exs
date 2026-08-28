@@ -1403,7 +1403,7 @@ defmodule Tightbeam.CliIntegrationTest do
         [assignment_id]
       )
 
-    request_id = "dr_#{action}_#{System.unique_integer([:positive])}"
+    request_id = "dr_" <> Tightbeam.Id.uuid4()
     now = System.system_time(:millisecond)
 
     {:ok, _} =
