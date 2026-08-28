@@ -996,9 +996,9 @@ defmodule Tightbeam.CliIntegrationTest do
              )
 
     for {id, scope} <- [
-          {90_000, "dr_capture_legacy"},
-          {90_001, "dr_capture_ruled"},
-          {90_002, "dr_capture_impossible_consumed"}
+          {90_000, "dr_00000000-0000-4000-8000-000000000005"},
+          {90_001, "dr_00000000-0000-4000-8000-000000000002"},
+          {90_002, "dr_00000000-0000-4000-8000-000000000007"}
         ] do
       assert {:ok, _} =
                DB.query(
@@ -1026,37 +1026,49 @@ defmodule Tightbeam.CliIntegrationTest do
                )
     end
 
-    common.("dr_capture_open", "flynn", ctx.session.session_key, "open")
-    common.("dr_capture_withdrawn", "flynn", ctx.session.session_key, "withdrawn")
-    common.("dr_capture_superseded", "flynn", ctx.session.session_key, "superseded")
+    common.("dr_00000000-0000-4000-8000-000000000001", "flynn", ctx.session.session_key, "open")
+
+    common.(
+      "dr_00000000-0000-4000-8000-000000000003",
+      "flynn",
+      ctx.session.session_key,
+      "withdrawn"
+    )
+
+    common.(
+      "dr_00000000-0000-4000-8000-000000000004",
+      "flynn",
+      ctx.session.session_key,
+      "superseded"
+    )
 
     assert {:ok, _} =
              DB.query(
                ctx.db,
                "UPDATE decision_requests SET withdrawnBy='user:flynn',withdrawnReason='capture complete',withdrawnAt=?2 WHERE id=?1",
-               ["dr_capture_withdrawn", now + 20]
+               ["dr_00000000-0000-4000-8000-000000000003", now + 20]
              )
 
-    common.("dr_capture_legacy", "flynn", ctx.session.session_key, "open")
-    common.("dr_capture_ruled", "flynn", ctx.session.session_key, "open")
-    common.("dr_capture_impossible_consumed", "flynn", ctx.session.session_key, "open")
+    common.("dr_00000000-0000-4000-8000-000000000005", "flynn", ctx.session.session_key, "open")
+    common.("dr_00000000-0000-4000-8000-000000000002", "flynn", ctx.session.session_key, "open")
+    common.("dr_00000000-0000-4000-8000-000000000007", "flynn", ctx.session.session_key, "open")
 
     assert {:ok, _} =
              DB.query(
                ctx.db,
                "UPDATE decision_requests SET status='ruled',decision='accept',rationale=NULL,ruledBy='user:flynn',ruledViaPrincipal='user:flynn',ruledViaSessionState='none',ruledAt=?2,rulingFactId=90000 WHERE id=?1",
-               ["dr_capture_legacy", now + 100]
+               ["dr_00000000-0000-4000-8000-000000000005", now + 100]
              )
 
     assert {:ok, _} =
              DB.query(
                ctx.db,
-               "UPDATE decision_requests SET ruledViaPrincipal=NULL,ruledViaSessionState=NULL WHERE id='dr_capture_legacy'"
+               "UPDATE decision_requests SET ruledViaPrincipal=NULL,ruledViaSessionState=NULL WHERE id='dr_00000000-0000-4000-8000-000000000005'"
              )
 
     for {id, fact_id, ruled_at, status, consumed_at} <- [
-          {"dr_capture_ruled", 90_001, now + 200, "ruled", nil},
-          {"dr_capture_impossible_consumed", 90_002, now + 300, "consumed", now + 400}
+          {"dr_00000000-0000-4000-8000-000000000002", 90_001, now + 200, "ruled", nil},
+          {"dr_00000000-0000-4000-8000-000000000007", 90_002, now + 300, "consumed", now + 400}
         ] do
       assert {:ok, _} =
                DB.query(
@@ -1066,7 +1078,11 @@ defmodule Tightbeam.CliIntegrationTest do
                )
     end
 
-    for id <- ["dr_capture_legacy", "dr_capture_ruled", "dr_capture_impossible_consumed"] do
+    for id <- [
+          "dr_00000000-0000-4000-8000-000000000005",
+          "dr_00000000-0000-4000-8000-000000000002",
+          "dr_00000000-0000-4000-8000-000000000007"
+        ] do
       assert {:ok, _} =
                DB.query(
                  ctx.db,
@@ -1076,8 +1092,8 @@ defmodule Tightbeam.CliIntegrationTest do
     end
 
     for {id, cursor, ruled_at} <- [
-          {"dr_capture_ruled", 90_000, now + 200},
-          {"dr_capture_impossible_consumed", 90_001, now + 300}
+          {"dr_00000000-0000-4000-8000-000000000002", 90_000, now + 200},
+          {"dr_00000000-0000-4000-8000-000000000007", 90_001, now + 300}
         ] do
       prompt =
         "Decision request #{id} was ruled. Read it with tightbeam decision-request --request #{id}."
@@ -1119,16 +1135,21 @@ defmodule Tightbeam.CliIntegrationTest do
         model: Model.new("fable")
       })
 
-    common.("dr_capture_hidden", "capture-other", hidden.session_key, "open")
+    common.(
+      "dr_00000000-0000-4000-8000-000000000006",
+      "capture-other",
+      hidden.session_key,
+      "open"
+    )
 
     [
-      {"open", "dr_capture_open"},
-      {"ruled", "dr_capture_ruled"},
-      {"withdrawn", "dr_capture_withdrawn"},
-      {"superseded", "dr_capture_superseded"},
-      {"legacy", "dr_capture_legacy"},
-      {"hidden", "dr_capture_hidden"},
-      {"impossibleConsumed", "dr_capture_impossible_consumed"}
+      {"open", "dr_00000000-0000-4000-8000-000000000001"},
+      {"ruled", "dr_00000000-0000-4000-8000-000000000002"},
+      {"withdrawn", "dr_00000000-0000-4000-8000-000000000003"},
+      {"superseded", "dr_00000000-0000-4000-8000-000000000004"},
+      {"legacy", "dr_00000000-0000-4000-8000-000000000005"},
+      {"hidden", "dr_00000000-0000-4000-8000-000000000006"},
+      {"impossibleConsumed", "dr_00000000-0000-4000-8000-000000000007"}
     ]
   end
 
@@ -1354,10 +1375,13 @@ defmodule Tightbeam.CliIntegrationTest do
   end
 
   test "real CLI rejects duplicate exact-request flags before dispatch", ctx do
+    first_request = "dr_11111111-1111-4111-8111-111111111111"
+    second_request = "dr_22222222-2222-4222-8222-222222222222"
+
     {output, status} =
       System.cmd(
         ctx.binary,
-        ["decision-request", "--request", "dr_first", "--request", "dr_second"],
+        ["decision-request", "--request", first_request, "--request", second_request],
         cd: ctx.workdir,
         stderr_to_stdout: true
       )
@@ -2039,7 +2063,7 @@ defmodule Tightbeam.CliIntegrationTest do
         [assignment_id]
       )
 
-    request_id = "dr_#{action}_#{System.unique_integer([:positive])}"
+    request_id = "dr_" <> Tightbeam.Id.uuid4()
     now = System.system_time(:millisecond)
 
     {:ok, _} =
