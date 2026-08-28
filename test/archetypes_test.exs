@@ -164,6 +164,7 @@ defmodule Tightbeam.ArchetypesTest do
              "worktree-session",
              "tightbeam-dispatching",
              "product-discovery",
+             "unblocking",
              "human-communication"
            ]
 
@@ -215,8 +216,11 @@ defmodule Tightbeam.ArchetypesTest do
     assert Map.keys(product_owner.skills) == [
              "human-communication",
              "product-discovery",
+             "unblocking",
              "worktree-session"
            ]
+
+    assert product_owner.skills["unblocking"] == unblocking
 
     assert product_owner.skills["worktree-session"] =~
              "Clone your own copy, into your own workdir"
