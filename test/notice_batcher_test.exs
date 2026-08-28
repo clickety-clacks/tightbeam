@@ -350,13 +350,78 @@ defmodule Tightbeam.NoticeBatcherTest do
     assert [%{state: "included"}] = NoticeBatcher.members(db, batch_id(db, sealed))
   end
 
-  test "acceptance 18: visibility scopes split one role lane and gate batch reads", %{db: db} do
-    first = manual_member(db, "role:shared:scope-a", target_role: "shared")
-    second = manual_member(db, "role:shared:scope-b", target_role: "shared")
+  test "authorized user, session, and process principals can read a complete batch", %{db: db} do
+    seed_session(db, "agent:scope-a", "owner-a")
+
+    first =
+      manual_member(db, "role:shared:scope-a",
+        target_role: "shared",
+        session: "agent:scope-a",
+        origin: "process:scheduler"
+      )
+
+    assert NoticeBatcher.read_batch(db, first.batch_id, {:user, "owner-a"}).member_count == 1
+
+    assert NoticeBatcher.read_batch(db, first.batch_id, {:session, "agent:scope-a"}).member_count ==
+             1
+
+    assert NoticeBatcher.read_batch(db, first.batch_id, {:process, "scheduler"}).member_count == 1
+  end
+
+  test "acceptance 18: a principal cannot read a batch from another visibility scope", %{db: db} do
+    seed_session(db, "agent:scope-a", "owner-a")
+    seed_session(db, "agent:scope-b", "owner-b")
+
+    first =
+      manual_member(db, "role:shared:scope-a", target_role: "shared", session: "agent:scope-a")
+
+    second =
+      manual_member(db, "role:shared:scope-b", target_role: "shared", session: "agent:scope-b")
 
     assert first.batch_id != second.batch_id
-    assert NoticeBatcher.read_batch(db, first.batch_id, "role:shared:scope-a").member_count == 1
-    assert NoticeBatcher.read_batch(db, second.batch_id, "role:shared:scope-a") == nil
+    assert NoticeBatcher.read_batch(db, first.batch_id, {:user, "owner-a"}).member_count == 1
+    assert NoticeBatcher.read_batch(db, second.batch_id, {:user, "owner-a"}) == nil
+    assert NoticeBatcher.read_batch(db, second.batch_id, {:session, "agent:scope-a"}) == nil
+  end
+
+  test "a batch read is denied when any member is outside the principal's visibility", %{db: db} do
+    seed_session(db, "agent:scope-a", "owner-a")
+    seed_session(db, "agent:scope-b", "owner-b")
+
+    first =
+      manual_member(db, "role:shared:scope-a",
+        target_role: "shared",
+        session: "agent:scope-a",
+        origin: "process:scheduler"
+      )
+
+    second =
+      manual_member(db, "role:shared:scope-a",
+        target_role: "shared",
+        session: "agent:scope-a",
+        origin: "process:scheduler"
+      )
+
+    assert first.batch_id == second.batch_id
+
+    {:ok, _} =
+      DB.query(db, "UPDATE wakes SET sessionKey=?2, origin='process:other' WHERE wakeId=?1", [
+        second.source_wake_id,
+        "agent:scope-b"
+      ])
+
+    assert NoticeBatcher.read_batch(db, first.batch_id, {:user, "owner-a"}) == nil
+    assert NoticeBatcher.read_batch(db, first.batch_id, {:session, "agent:scope-a"}) == nil
+    assert NoticeBatcher.read_batch(db, first.batch_id, {:process, "scheduler"}) == nil
+  end
+
+  test "a caller cannot forge authorization with the stored visibility scope", %{db: db} do
+    seed_session(db, "agent:scope-a", "owner-a")
+
+    first =
+      manual_member(db, "role:shared:scope-a", target_role: "shared", session: "agent:scope-a")
+
+    assert NoticeBatcher.read_batch(db, first.batch_id, "role:shared:scope-a") == nil
   end
 
   test "acceptance 19: an exec-desk role receives the ordinary carrier without desk state",
@@ -638,7 +703,7 @@ defmodule Tightbeam.NoticeBatcherTest do
       Wakes.schedule(db, %{
         session_key: Keyword.get(opts, :session, "agent:recipient"),
         target_role: Keyword.get(opts, :target_role),
-        origin: "process:tightbeam",
+        origin: Keyword.get(opts, :origin, "process:tightbeam"),
         creator_session_key: "agent:sender",
         prompt: Keyword.get(opts, :prompt, "manual"),
         due_at: Keyword.get(opts, :due_at, 10_000),
@@ -659,7 +724,9 @@ defmodule Tightbeam.NoticeBatcherTest do
         NoticeBatcher.enqueue_or_recover_in_txn(txn, wake.wake_id, ref)
       end)
 
-    if Keyword.get(opts, :expect_error, false), do: elem(result, 1), else: result
+    if Keyword.get(opts, :expect_error, false),
+      do: elem(result, 1),
+      else: Map.put(result, :source_wake_id, wake.wake_id)
   end
 
   defp batch_id(db, source) do

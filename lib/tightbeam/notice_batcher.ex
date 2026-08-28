@@ -571,14 +571,20 @@ defmodule Tightbeam.NoticeBatcher do
     end
   end
 
-  @spec read_batch(GenServer.server(), String.t(), String.t()) :: map() | nil
-  def read_batch(db \\ Tightbeam.DB, batch_id, visibility_scope) do
+  @doc "Read a batch only when the authenticated principal can read every source wake."
+  @spec read_batch(GenServer.server(), String.t(), term()) :: map() | nil
+  def read_batch(db \\ Tightbeam.DB, batch_id, principal) do
     case batch(db, batch_id) do
-      %{visibility_scope: ^visibility_scope} = value ->
-        Map.put(value, :members, members(db, batch_id))
-
-      _ ->
+      nil ->
         nil
+
+      value ->
+        batch_members = members(db, batch_id)
+
+        if batch_members != [] and
+             Enum.all?(batch_members, &source_readable?(db, &1.source_wake_id, principal)) do
+          Map.put(value, :members, batch_members)
+        end
     end
   end
 
@@ -623,6 +629,54 @@ defmodule Tightbeam.NoticeBatcher do
         batch_state: batch_state
       }
     end)
+  end
+
+  defp source_readable?(db, source_wake_id, {:user, user_id})
+       when is_binary(user_id) and user_id != "" do
+    row_exists?(
+      db,
+      """
+      SELECT 1
+      FROM wakes source
+      JOIN sessions recipient ON recipient.sessionKey=source.sessionKey
+      WHERE source.wakeId=?1 AND recipient.ownerUserId=?2 AND recipient.state='active'
+      """,
+      [source_wake_id, user_id]
+    )
+  end
+
+  defp source_readable?(db, source_wake_id, {:session, caller_session_key})
+       when is_binary(caller_session_key) and caller_session_key != "" do
+    row_exists?(
+      db,
+      """
+      SELECT 1
+      FROM wakes source
+      JOIN sessions recipient ON recipient.sessionKey=source.sessionKey
+      JOIN sessions caller ON caller.sessionKey=?2
+      WHERE source.wakeId=?1 AND recipient.ownerUserId=caller.ownerUserId
+        AND recipient.state='active' AND caller.state='active'
+      """,
+      [source_wake_id, caller_session_key]
+    )
+  end
+
+  defp source_readable?(db, source_wake_id, {:process, process_id})
+       when is_binary(process_id) and process_id != "" do
+    row_exists?(
+      db,
+      "SELECT 1 FROM wakes WHERE wakeId=?1 AND origin=?2",
+      [source_wake_id, "process:" <> process_id]
+    )
+  end
+
+  defp source_readable?(_db, _source_wake_id, _principal), do: false
+
+  defp row_exists?(db, sql, params) do
+    case DB.query(db, sql, params) do
+      {:ok, [[1]]} -> true
+      {:ok, []} -> false
+    end
   end
 
   @spec carrier_members(GenServer.server(), String.t()) :: [map()]
