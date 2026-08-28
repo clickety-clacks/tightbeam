@@ -222,6 +222,48 @@ defmodule Tightbeam.ArchetypesTest do
 
     assert product_owner.skills["unblocking"] == unblocking
 
+    neutral_default =
+      Application.app_dir(:tightbeam, "priv/seed/archetypes/default.toml")
+      |> File.read!()
+
+    default_payload =
+      Application.app_dir(
+        :tightbeam,
+        "priv/identity-payloads/agentic-engineering-default-unblocking.toml"
+      )
+      |> File.read!()
+
+    assert default_payload ==
+             String.replace(
+               neutral_default,
+               ~s(skills = ["tightbeam-onboarding"]),
+               ~s(skills = ["tightbeam-onboarding", "unblocking"])
+             )
+
+    revision = Identity.edit!(ctx.base_dir, "default", :manifest, default_payload, "user:flynn")
+    assert is_binary(revision)
+
+    for harness <- [:codex, :claude] do
+      default =
+        Identity.snapshot_at!(
+          ctx.base_dir,
+          Identity.live_revision!(ctx.base_dir),
+          "default",
+          harness
+        )
+
+      owner =
+        Identity.snapshot_at!(
+          ctx.base_dir,
+          Identity.live_revision!(ctx.base_dir),
+          "product-owner",
+          harness
+        )
+
+      assert default.skills["unblocking"] == owner.skills["unblocking"]
+      refute default.skills["unblocking"] =~ "What changed on the deliverable since my last look?"
+    end
+
     assert product_owner.skills["worktree-session"] =~
              "Clone your own copy, into your own workdir"
 
