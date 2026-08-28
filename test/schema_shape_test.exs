@@ -32,9 +32,9 @@ end
 defmodule Tightbeam.SchemaShapeTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Model, Org, Projection, Schema}
+  alias Tightbeam.{DB, Model, Org, Projection, Schema, Supervision}
 
-  @shape "coordination-fabric-v1-phase1-v8"
+  @shape "coordination-fabric-v1-phase1-v9"
 
   setup do
     name = :"schema_shape_#{System.unique_integer([:positive])}"
@@ -45,13 +45,13 @@ defmodule Tightbeam.SchemaShapeTest do
   test "a fresh database is created and stamped", %{db: db} do
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v8"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v9"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     # Idempotent: booting twice is the ordinary case, not a shape change.
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v8"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v9"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
   end
 
@@ -60,6 +60,7 @@ defmodule Tightbeam.SchemaShapeTest do
          db: db
        } do
     assert :ok = Schema.ensure_all(db)
+    downgrade_to_v8(db)
 
     {:ok, _} =
       DB.query(
@@ -191,6 +192,7 @@ defmodule Tightbeam.SchemaShapeTest do
       })
 
     :ok = DB.execute(db, "ALTER TABLE messages DROP COLUMN messageType")
+    remove_controller_root_link(db)
 
     {:ok, _} =
       DB.query(
@@ -201,7 +203,7 @@ defmodule Tightbeam.SchemaShapeTest do
     assert :ok = Schema.ensure_all(db)
     assert "messageType" in table_columns(db, "messages")
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v8"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v9"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     restored = Projection.get(db, historical.id)
@@ -220,7 +222,8 @@ defmodule Tightbeam.SchemaShapeTest do
              ~w(attestId assignmentId attestTs generation recoveryBaseline cause principal)
 
     assert table_columns(db, "supervision_liveness_sidecar") ==
-             ~w(wakeId assignmentId controllerOrigin wakeKind controllerState chargedGeneration transferEvidenceId retirementEpoch retiringSessionKey retirementOutcomeKind retirementOutcomeId retirementTargetSessionKey retirementCause retirementPrincipal retirementActionNeeded)
+             ~w(wakeId assignmentId controllerOrigin wakeKind controllerState chargedGeneration transferEvidenceId retirementEpoch retiringSessionKey retirementOutcomeKind retirementOutcomeId retirementTargetSessionKey retirementCause retirementPrincipal retirementActionNeeded) ++
+               ["rootTurnSeq"]
 
     assert table_columns(db, "wake_cancellations") ==
              ~w(wakeId wakeState canceledAt requesterKind requesterId reasonKind causalSourceKind causalSourceId outcomeKind replacementWakeId dispositionKind dispositionId primaryWorkKind primaryWorkId workImpactKind livenessTriggerKind livenessTriggerId actionNeeded)
@@ -389,7 +392,7 @@ defmodule Tightbeam.SchemaShapeTest do
     assert {:ok, ^before_rows} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
     assert {:ok, []} = DB.query(db, "SELECT wakeId FROM wake_cancellations")
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v8"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v9"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
   end
 
@@ -423,10 +426,9 @@ defmodule Tightbeam.SchemaShapeTest do
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     refute "operationalParent" in table_columns(db, "sessions")
-
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v8"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v9"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert {:ok,
@@ -448,7 +450,7 @@ defmodule Tightbeam.SchemaShapeTest do
         name == "operationalParent"
       end)
 
-    assert Enum.at(column, 3) == 1
+    assert Enum.at(column, 3) == 0
   end
 
   test "an interrupted operational-parent upgrade rolls back and retries exactly", %{db: db} do
@@ -479,11 +481,174 @@ defmodule Tightbeam.SchemaShapeTest do
 
     refute "operationalParent" in table_columns(db, "sessions")
     refute table?(db, "sessions_operational_parent_v1")
-
     assert :ok = Schema.ensure_all(db)
 
     assert {:ok, [[^main_key]]} =
              DB.query(db, "SELECT operationalParent FROM sessions WHERE kind='main'")
+  end
+
+  test "the exact v8 predecessor preserves explicit parents and becomes nullable", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:paired, _device} =
+             claim_org(db, %{
+               device_id: "legacy-device",
+               claimed_name: "Flynn",
+               platform: nil,
+               model: nil
+             })
+
+    main = Org.get(db, Org.personal_session_key("flynn"))
+    root = session(db, "root", "flynn")
+    child = session(db, "child", "flynn", spawned_by: root.session_key)
+
+    %{operational_parent: main_parent} =
+      Org.set_operational_parent(db, root.session_key, main.session_key)
+
+    assert main_parent == main.session_key
+
+    %{operational_parent: child_parent} =
+      Org.set_operational_parent(db, child.session_key, root.session_key)
+
+    assert child_parent == root.session_key
+    downgrade_to_v8(db)
+
+    assert {:ok, [["coordination-fabric-v1-phase1-v8"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+
+    parent_column =
+      Enum.find(table_info(db, "sessions"), fn [_cid, name | _] ->
+        name == "operationalParent"
+      end)
+
+    assert Enum.at(parent_column, 3) == 1
+
+    :ok =
+      DB.execute(
+        db,
+        """
+        INSERT INTO assignments
+          (id,subject,holderKey,openedByUser,openedAt)
+        VALUES ('asg_historical_root','historical controller','child','flynn',1);
+        INSERT INTO wakes
+          (wakeId,sessionKey,origin,prompt,consumer,dueAt,state,createdAt,assignmentId)
+        VALUES
+          ('w_historical_root','root','process:tightbeam','historical','prompt',0,'pending',1,
+           'asg_historical_root');
+        INSERT INTO supervision_liveness_sidecar
+          (wakeId,assignmentId,controllerOrigin,wakeKind,controllerState,chargedGeneration)
+        VALUES
+          ('w_historical_root','asg_historical_root','scheduled','prod','pending',1);
+        """
+      )
+
+    assert {:ok, [historical_before]} =
+             DB.query(
+               db,
+               "SELECT * FROM supervision_liveness_sidecar WHERE wakeId='w_historical_root'"
+             )
+
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:ok, [["coordination-fabric-v1-phase1-v9"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok,
+            [
+              [main_key, nil, main_parent],
+              [child_key, root_key, child_parent],
+              [root_key, nil, root_parent]
+            ]} =
+             DB.query(
+               db,
+               "SELECT sessionKey,spawnedBy,operationalParent FROM sessions ORDER BY sessionKey"
+             )
+
+    assert main_key == main.session_key
+    assert main_parent == main.session_key
+    assert child_key == child.session_key
+    assert child_parent == root.session_key
+    assert root_key == root.session_key
+    assert root_parent == main.session_key
+
+    nullable_column =
+      Enum.find(table_info(db, "sessions"), fn [_cid, name | _] ->
+        name == "operationalParent"
+      end)
+
+    assert Enum.at(nullable_column, 3) == 0
+
+    assert {:ok, [historical_after]} =
+             DB.query(
+               db,
+               "SELECT * FROM supervision_liveness_sidecar WHERE wakeId='w_historical_root'"
+             )
+
+    assert Enum.take(historical_after, length(historical_before)) == historical_before
+    assert List.last(historical_after) == nil
+
+    assert {:ok, :historical_unknown} =
+             DB.transaction(db, fn txn ->
+               Supervision.controller_coverage_in_txn(txn, "asg_historical_root", 1)
+             end)
+
+    for _ <- 1..10 do
+      assert :ok = Schema.ensure_all(db)
+
+      assert {:ok, [[nil]]} =
+               DB.query(
+                 db,
+                 "SELECT rootTurnSeq FROM supervision_liveness_sidecar WHERE wakeId='w_historical_root'"
+               )
+    end
+
+    assert %{operational_parent: nil, effective_parent_source: :owner_main} =
+             session(db, "new-null", "flynn")
+  end
+
+  test "each interrupted nullable-parent upgrade rolls back and retries exactly", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:paired, _device} =
+             claim_org(db, %{
+               device_id: "legacy-device",
+               claimed_name: "Flynn",
+               platform: nil,
+               model: nil
+             })
+
+    for point <- [
+          :after_root_copy,
+          :after_root_drop,
+          :after_root_restore,
+          :after_root_link,
+          :after_copy,
+          :after_drop,
+          :after_rename,
+          :after_migration,
+          :after_stamp
+        ] do
+      downgrade_to_v8(db)
+
+      error =
+        assert_raise Schema.ShapeError, fn ->
+          Schema.upgrade_nullable_effective_parent_v1(db, fail_at: point)
+        end
+
+      assert error.message =~ "forced nullable-effective-parent migration interruption"
+
+      assert {:ok, [["coordination-fabric-v1-phase1-v8"]]} =
+               DB.query(db, "SELECT shape FROM schema_stamp")
+
+      column =
+        Enum.find(table_info(db, "sessions"), fn [_cid, name | _] ->
+          name == "operationalParent"
+        end)
+
+      assert Enum.at(column, 3) == 1
+      refute table?(db, "sessions_effective_parent_v1")
+      assert :ok = Schema.upgrade_nullable_effective_parent_v1(db)
+    end
   end
 
   # The defect this refuses: `CREATE TABLE IF NOT EXISTS` is SILENT about a
@@ -565,7 +730,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "some-later-shape"
-    assert error.message =~ "coordination-fabric-v1-phase1-v8"
+    assert error.message =~ "coordination-fabric-v1-phase1-v9"
   end
 
   # Sol xhigh review round 2, finding 2 (wave 1): `classElection`'s CHECK
@@ -627,7 +792,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-classes-v1"
-    assert error.message =~ "coordination-fabric-v1-phase1-v8"
+    assert error.message =~ "coordination-fabric-v1-phase1-v9"
     assert error.message =~ "no migration"
 
     # It REFUSED — it did not repair or widen the constraint in place.
@@ -747,7 +912,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-v1-phase1"
-    assert error.message =~ "coordination-fabric-v1-phase1-v8"
+    assert error.message =~ "coordination-fabric-v1-phase1-v9"
     assert error.message =~ "no migration"
 
     # It REFUSED — it did not repair or relax the constraint in place.
@@ -818,7 +983,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-classes-v2"
-    assert error.message =~ "coordination-fabric-v1-phase1-v8"
+    assert error.message =~ "coordination-fabric-v1-phase1-v9"
     assert error.message =~ "no migration"
 
     # It REFUSED — the merged build's decision_requests columns were never
@@ -931,7 +1096,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-v1-phase1-v2"
-    assert error.message =~ "coordination-fabric-v1-phase1-v8"
+    assert error.message =~ "coordination-fabric-v1-phase1-v9"
     assert error.message =~ "no migration"
 
     # It REFUSED — the merged build's wakes class/delivery columns were never
@@ -970,7 +1135,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-v1-phase1-v3"
-    assert error.message =~ "coordination-fabric-v1-phase1-v8"
+    assert error.message =~ "coordination-fabric-v1-phase1-v9"
     assert error.message =~ "no migration"
 
     assert {:ok, [[ddl]]} =
@@ -1001,6 +1166,7 @@ defmodule Tightbeam.SchemaShapeTest do
   end
 
   defp downgrade_to_previous_shape(db) do
+    remove_controller_root_link(db)
     :ok = DB.execute(db, "DROP TRIGGER users_gateway_owned_insert")
     :ok = DB.execute(db, "DROP TABLE cold_start_receipts")
     :ok = DB.execute(db, "ALTER TABLE users DROP COLUMN creationKind")
@@ -1012,6 +1178,80 @@ defmodule Tightbeam.SchemaShapeTest do
         db,
         "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v4', stampedAt=1"
       )
+
+    :ok
+  end
+
+  defp downgrade_to_v8(db) do
+    remove_controller_root_link(db)
+
+    {:ok, :ok} =
+      DB.foreign_key_rebuild(db, fn txn ->
+        DB.Txn.q(
+          txn,
+          "UPDATE sessions SET operationalParent='agent:main:clawline:' || ownerUserId || ':main' WHERE operationalParent IS NULL"
+        )
+
+        [[ddl]] =
+          DB.Txn.q(
+            txn,
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='sessions'"
+          )
+
+        predecessor_ddl =
+          ~r/CREATE TABLE(?: IF NOT EXISTS)? "?sessions"?/
+          |> Regex.replace(ddl, "CREATE TABLE sessions_v8")
+          |> then(
+            &Regex.replace(
+              ~r/operationalParent\s+TEXT\s+REFERENCES/,
+              &1,
+              "operationalParent TEXT NOT NULL REFERENCES"
+            )
+          )
+
+        :ok = DB.Txn.exec(txn, predecessor_ddl)
+
+        DB.Txn.q(
+          txn,
+          """
+          INSERT INTO sessions_v8
+          SELECT * FROM sessions ORDER BY createdAt,sessionKey
+          """
+        )
+
+        :ok = DB.Txn.exec(txn, "DROP TABLE sessions")
+        :ok = DB.Txn.exec(txn, "ALTER TABLE sessions_v8 RENAME TO sessions")
+
+        DB.Txn.q(
+          txn,
+          "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v8', stampedAt=1"
+        )
+
+        :ok
+      end)
+
+    :ok
+  end
+
+  defp remove_controller_root_link(db) do
+    {:ok, :ok} =
+      DB.foreign_key_rebuild(db, fn txn ->
+        DB.Txn.q(
+          txn,
+          "SELECT type, name FROM sqlite_master WHERE type IN ('index','trigger') AND sql LIKE '%rootTurnSeq%'"
+        )
+        |> Enum.each(fn [type, name] ->
+          :ok = DB.Txn.exec(txn, "DROP #{String.upcase(type)} IF EXISTS #{name}")
+        end)
+
+        :ok =
+          DB.Txn.exec(
+            txn,
+            "ALTER TABLE supervision_liveness_sidecar DROP COLUMN rootTurnSeq"
+          )
+
+        :ok
+      end)
 
     :ok
   end

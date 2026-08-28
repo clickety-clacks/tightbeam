@@ -294,6 +294,71 @@ defmodule Tightbeam.Supervision do
     end
   end
 
+  @doc """
+  Derive exact supervision coverage for one assignment terminal.
+
+  Only the immutable `(assignmentId, rootTurnSeq)` controller link can cover
+  the source. Historical null links and links for another terminal fail safe.
+  """
+  @spec controller_coverage_in_txn(Txn.t(), String.t(), pos_integer()) ::
+          :resolved_existing
+          | :pending
+          | :historical_unknown
+          | :different_root
+          | :none
+          | {:prior_recipients, [String.t()]}
+  def controller_coverage_in_txn(%Txn{} = txn, assignment_id, turn_seq)
+      when is_binary(assignment_id) and is_integer(turn_seq) and turn_seq > 0 do
+    rows =
+      Txn.q(
+        txn,
+        """
+        SELECT s.rootTurnSeq, w.sessionKey, w.state, t.status
+        FROM supervision_liveness_sidecar s
+        JOIN wakes w ON w.wakeId=s.wakeId AND w.assignmentId=s.assignmentId
+        LEFT JOIN turns t ON t.wakeId=w.wakeId AND t.assignmentId=w.assignmentId
+                         AND t.sessionKey=w.sessionKey
+        WHERE s.assignmentId=?1 AND s.controllerOrigin IS NOT NULL
+        ORDER BY w.createdAt, w.wakeId
+        """,
+        [assignment_id]
+      )
+
+    exact = Enum.filter(rows, fn [root_turn_seq | _] -> root_turn_seq == turn_seq end)
+
+    prior_recipients =
+      exact
+      |> Enum.filter(fn [_root, _recipient, _wake_state, status] ->
+        status in ["failed", "failed_unknown", "canceled"]
+      end)
+      |> Enum.map(fn [_root, recipient, _wake_state, _status] -> recipient end)
+      |> Enum.uniq()
+
+    cond do
+      Enum.any?(exact, fn [_root, _recipient, _wake_state, status] ->
+        status == "delivered"
+      end) ->
+        :resolved_existing
+
+      Enum.any?(exact, fn [_root, _recipient, wake_state, status] ->
+        wake_state == "pending" or status in ["queued", "running"]
+      end) ->
+        :pending
+
+      prior_recipients != [] ->
+        {:prior_recipients, prior_recipients}
+
+      Enum.any?(rows, fn [root_turn_seq | _] -> is_nil(root_turn_seq) end) ->
+        :historical_unknown
+
+      Enum.any?(rows, fn [root_turn_seq | _] -> root_turn_seq != turn_seq end) ->
+        :different_root
+
+      true ->
+        :none
+    end
+  end
+
   def transition_in_txn(%Txn{} = txn, %{
         kind: "parent_target_retired",
         session_key: session_key,
@@ -358,9 +423,11 @@ defmodule Tightbeam.Supervision do
         kind: "controller_scheduled",
         wake_id: wake_id,
         assignment_id: assignment_id,
-        wake_kind: wake_kind
+        wake_kind: wake_kind,
+        root_turn_seq: root_turn_seq
       })
-      when wake_kind in ["prod", "escalation"] do
+      when wake_kind in ["prod", "escalation"] and is_integer(root_turn_seq) and
+             root_turn_seq > 0 do
     case Txn.q(
            txn,
            """
@@ -392,10 +459,10 @@ defmodule Tightbeam.Supervision do
           """
           INSERT INTO supervision_liveness_sidecar
             (wakeId, assignmentId, controllerOrigin, wakeKind, controllerState,
-             chargedGeneration)
-          VALUES (?1, ?2, 'scheduled', ?3, 'pending', ?4)
+             chargedGeneration, rootTurnSeq)
+          VALUES (?1, ?2, 'scheduled', ?3, 'pending', ?4, ?5)
           """,
-          [wake_id, assignment_id, wake_kind, next_generation]
+          [wake_id, assignment_id, wake_kind, next_generation, root_turn_seq]
         )
 
         Txn.q(
@@ -848,21 +915,22 @@ defmodule Tightbeam.Supervision do
   deliver.
   """
   @spec ladder_target(DB.server() | Txn.t(), String.t(), pos_integer()) :: String.t() | nil
-  def ladder_target(db_or_txn, holder_key, rung) do
-    [[owner, operational_parent]] =
-      query(
-        db_or_txn,
-        "SELECT ownerUserId, operationalParent FROM sessions WHERE sessionKey = ?1",
-        [
-          holder_key
-        ]
-      )
+  def ladder_target(%Txn{} = txn, holder_key, rung) do
+    %{owner_user_id: owner, session_key: effective_parent} =
+      Org.effective_parent_in_txn(txn, holder_key)
 
-    chain = lineage(db_or_txn, operational_parent, MapSet.new([holder_key]), [])
+    chain = lineage(txn, effective_parent, MapSet.new([holder_key]), [])
 
     case Enum.at(chain, rung - 1) do
-      nil -> active_personal_key(db_or_txn, owner)
+      nil -> active_personal_key(txn, owner)
       rung_key -> rung_key
+    end
+  end
+
+  def ladder_target(db, holder_key, rung) do
+    case DB.transaction(db, fn txn -> ladder_target(txn, holder_key, rung) end) do
+      {:ok, target} -> target
+      {:error, error} -> raise error
     end
   end
 
@@ -3092,12 +3160,11 @@ defmodule Tightbeam.Supervision do
     if MapSet.member?(visited, session_key) do
       Enum.reverse(acc)
     else
-      case query(db, "SELECT state, operationalParent FROM sessions WHERE sessionKey = ?1", [
-             session_key
-           ]) do
-        [[state, operational_parent]] ->
+      case query(db, "SELECT state FROM sessions WHERE sessionKey = ?1", [session_key]) do
+        [[state]] ->
           next_acc = if state == "active", do: [session_key | acc], else: acc
-          lineage(db, operational_parent, MapSet.put(visited, session_key), next_acc)
+          effective_parent = Org.effective_parent_in_txn(db, session_key).session_key
+          lineage(db, effective_parent, MapSet.put(visited, session_key), next_acc)
 
         [] ->
           Enum.reverse(acc)
@@ -3496,16 +3563,7 @@ defmodule Tightbeam.Supervision do
         reresolve_rung: candidate.reresolve_rung
       })
 
-    Txn.q(
-      txn,
-      """
-      INSERT INTO supervision_liveness_sidecar
-        (wakeId, assignmentId, controllerOrigin, wakeKind, controllerState,
-         chargedGeneration)
-      VALUES (?1, ?2, 'retirement_elevation', 'escalation', 'settled', NULL)
-      """,
-      [wake.wake_id, assignment_id]
-    )
+    insert_retirement_controller_in_txn(txn, wake.wake_id, assignment_id, transfer.wake_id)
 
     case Gateway.deliver_prompt_in_txn(
            txn,
@@ -3872,16 +3930,7 @@ defmodule Tightbeam.Supervision do
           reresolve_rung: transfer.reresolve_rung
         })
 
-      Txn.q(
-        txn,
-        """
-        INSERT INTO supervision_liveness_sidecar
-          (wakeId, assignmentId, controllerOrigin, wakeKind, controllerState,
-           chargedGeneration)
-        VALUES (?1, ?2, 'retirement_elevation', 'escalation', 'settled', NULL)
-        """,
-        [wake.wake_id, assignment_id]
-      )
+      insert_retirement_controller_in_txn(txn, wake.wake_id, assignment_id, transfer.wake_id)
 
       case Gateway.deliver_prompt_in_txn(
              txn,
@@ -3931,6 +3980,34 @@ defmodule Tightbeam.Supervision do
       "UPDATE turns SET status='canceled', endedAt=?2 WHERE seq=?1 AND status='queued'",
       [transfer.turn_seq, retirement_epoch]
     )
+  end
+
+  defp insert_retirement_controller_in_txn(
+         txn,
+         wake_id,
+         assignment_id,
+         source_wake_id
+       ) do
+    Txn.q(
+      txn,
+      """
+      INSERT INTO supervision_liveness_sidecar
+        (wakeId, assignmentId, controllerOrigin, wakeKind, controllerState,
+         chargedGeneration, rootTurnSeq)
+      SELECT ?1, ?2, 'retirement_elevation', 'escalation', 'settled', NULL,
+             source.rootTurnSeq
+      FROM supervision_liveness_sidecar source
+      WHERE source.wakeId=?3 AND source.assignmentId=?2
+        AND source.controllerOrigin IS NOT NULL
+      """,
+      [wake_id, assignment_id, source_wake_id]
+    )
+
+    if Txn.changes(txn) != 1 do
+      raise "incompatible_supervision_liveness_v1: retirement controller root link missing"
+    end
+
+    :ok
   end
 
   defp store_retirement_outcome_in_txn(
@@ -4003,19 +4080,13 @@ defmodule Tightbeam.Supervision do
   end
 
   defp ladder_target_excluding(db_or_txn, holder_key, rung, excluded) do
-    [[owner, operational_parent]] =
-      query(
-        db_or_txn,
-        "SELECT ownerUserId, operationalParent FROM sessions WHERE sessionKey=?1",
-        [
-          holder_key
-        ]
-      )
+    %{owner_user_id: owner, session_key: effective_parent} =
+      Org.effective_parent_in_txn(db_or_txn, holder_key)
 
     chain =
       lineage_excluding(
         db_or_txn,
-        operational_parent,
+        effective_parent,
         excluded,
         MapSet.new([holder_key]),
         []
@@ -4037,18 +4108,18 @@ defmodule Tightbeam.Supervision do
     if MapSet.member?(visited, session_key) do
       Enum.reverse(acc)
     else
-      case query(db_or_txn, "SELECT state, operationalParent FROM sessions WHERE sessionKey=?1", [
-             session_key
-           ]) do
-        [[state, operational_parent]] ->
+      case query(db_or_txn, "SELECT state FROM sessions WHERE sessionKey=?1", [session_key]) do
+        [[state]] ->
           next_acc =
             if state == "active" and session_key != excluded,
               do: [session_key | acc],
               else: acc
 
+          effective_parent = Org.effective_parent_in_txn(db_or_txn, session_key).session_key
+
           lineage_excluding(
             db_or_txn,
-            operational_parent,
+            effective_parent,
             excluded,
             MapSet.put(visited, session_key),
             next_acc

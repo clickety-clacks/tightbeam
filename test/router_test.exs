@@ -213,12 +213,41 @@ defmodule Tightbeam.Wire.RouterTest do
     assert Devices.user(db, "first") == nil
   end
 
-  test "loopback bootstrap-user reserves the first user and Main through the gateway", ctx do
+  test "an empty org cannot use role or process identity to claim the first user", ctx do
+    {db, opts} = empty_router(ctx, "identity_bootstrap")
+
+    cases = [
+      {%{as: "unbound"}, 400,
+       %{"code" => "invalid_message", "message" => "unknown or unbound role: unbound"}},
+      {%{asProcess: "tightbeam"}, 403,
+       %{
+         "code" => "reserved_origin",
+         "message" => "process:tightbeam is reserved to the substrate"
+       }},
+      {%{asProcess: "installer"}, 403, %{"code" => "forbidden", "message" => "admin required"}}
+    ]
+
+    for {identity, status, error} <- cases do
+      response =
+        dispatch_cli(
+          %{ctx | opts: opts},
+          "tbc_test",
+          Map.merge(identity, %{verb: "add-user", params: %{userId: "first", isAdmin: true}})
+        )
+
+      assert response.status == status
+      assert JSON.decode!(response.resp_body) == %{"error" => error}
+      assert Devices.user(db, "first") == nil
+      assert Org.get(db, Org.personal_session_key("first")) == nil
+    end
+  end
+
+  test "loopback add-user reserves the first user and Main through the gateway", ctx do
     {db, opts} = empty_router(ctx, "loopback_bootstrap")
 
     response =
       dispatch_cli(%{ctx | opts: opts}, "tbc_test", %{
-        verb: "bootstrap-user",
+        verb: "add-user",
         params: %{userId: "alice"}
       })
 
@@ -237,14 +266,14 @@ defmodule Tightbeam.Wire.RouterTest do
     assert Devices.user(db, "alice").creation_kind == "gateway_local_bootstrap"
   end
 
-  test "non-loopback bootstrap-user refuses before any database write", ctx do
+  test "non-loopback add-user refuses before any database write", ctx do
     {db, opts} = empty_router(ctx, "remote_bootstrap")
 
     response =
       conn(
         :post,
         "/agent/dispatch",
-        JSON.encode!(%{verb: "bootstrap-user", params: %{userId: "alice"}})
+        JSON.encode!(%{verb: "add-user", params: %{userId: "alice"}})
       )
       |> Map.put(:remote_ip, {10, 0, 0, 8})
       |> put_req_header("authorization", "Bearer tbc_test")

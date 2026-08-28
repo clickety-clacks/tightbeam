@@ -43,8 +43,8 @@ defmodule Tightbeam.Wire.Socket do
     pair_result; close.
   - auth: token → Devices.by_token; failure reasons: pending device →
     device_not_approved, allowlisted-but-stale-token → token_revoked, unknown
-    → auth_failed. Success: seed the main stream if absent (defaults come
-    from the gateway config — NEVER hardcoded here), register, replay, live.
+    → auth_failed. Success: register, replay, live. Authentication never
+    manufactures or repairs a missing Main stream.
   - message: id must start with "c_" (else invalid_message); content ≤ 64KiB
     utf8 (else payload_too_large); session ownership enforced (not_found);
     zero or one reply entry in the existing references array resolves by
@@ -58,7 +58,7 @@ defmodule Tightbeam.Wire.Socket do
 
   @behaviour WebSock
 
-  alias Tightbeam.{ColdStart, ConnRegistry, DB, Devices, Dispatch, Org, Projection}
+  alias Tightbeam.{ColdStart, ConnRegistry, Devices, Dispatch, Org, Projection}
   alias Tightbeam.Wire.Payloads
 
   @max_content_bytes 64 * 1024
@@ -322,8 +322,6 @@ defmodule Tightbeam.Wire.Socket do
   end
 
   defp auth_success(msg, device, token, subscriptions, %{conn_ref: nil} = state) do
-    if MapSet.member?(subscriptions, "chat"), do: seed_main_stream(device.user_id, state)
-
     {:ok, conn_ref, _replaced} =
       ConnRegistry.register(conn_registry(state), %{
         pid: self(),
@@ -337,7 +335,6 @@ defmodule Tightbeam.Wire.Socket do
   end
 
   defp auth_success(msg, device, token, subscriptions, state) do
-    if MapSet.member?(subscriptions, "chat"), do: seed_main_stream(device.user_id, state)
     auth_replay(msg, device, token, state.conn_ref, subscriptions, state)
   end
 
@@ -518,24 +515,6 @@ defmodule Tightbeam.Wire.Socket do
 
   defp valid_reference_entry?(%{"kind" => kind}) when is_binary(kind) and kind != "", do: true
   defp valid_reference_entry?(_entry), do: false
-
-  defp seed_main_stream(user_id, state) do
-    key = Org.personal_session_key(user_id)
-
-    unless Org.get(db(state), key) do
-      defaults = state.deps |> Map.fetch!(:defaults) |> Org.resolve_personal_main_defaults()
-
-      try do
-        {:ok, _session} =
-          DB.transaction(db(state), fn txn ->
-            Org.ensure_personal_main_in_txn(txn, user_id, defaults)
-          end)
-      rescue
-        error in Tightbeam.DB.Error ->
-          if Org.get(db(state), key), do: :ok, else: reraise(error, __STACKTRACE__)
-      end
-    end
-  end
 
   defp replay_cursors(msg, user_id, state) do
     cursors =

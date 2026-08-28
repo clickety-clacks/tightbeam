@@ -1539,7 +1539,7 @@ where
 
                 request(
                     &identity,
-                    "bootstrap-user",
+                    "add-user",
                     vec![],
                     vec![string_field("userId", &user_id)],
                 )

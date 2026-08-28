@@ -29,7 +29,9 @@ defmodule Tightbeam.ColdStartTest do
     root = Org.get(db, Org.personal_session_key("alice"))
     assert root.kind == "main"
     assert root.is_built_in
-    assert root.operational_parent == root.session_key
+    assert root.operational_parent == nil
+    assert root.effective_parent == root.session_key
+    assert root.effective_parent_source == :owner_main
     assert root.origin == "process:tightbeam"
 
     assert %{
@@ -46,7 +48,9 @@ defmodule Tightbeam.ColdStartTest do
     refute payload =~ "claimedName"
     refute payload =~ "replaySecret"
 
-    assert payload =~ ~s("operationalParent" => "#{root.session_key}")
+    assert payload =~ ~s("operationalParent" => nil)
+    assert payload =~ ~s("effectiveParent" => "#{root.session_key}")
+    assert payload =~ ~s("effectiveParentSource" => "owner_main")
   end
 
   test "each pair-first write fence rolls the transaction back", %{db: db} do
@@ -137,7 +141,7 @@ defmodule Tightbeam.ColdStartTest do
   test "host-local bootstrap and pair-first race converges through transaction order", %{db: db} do
     results =
       concurrent([
-        fn -> ColdStart.bootstrap_user(db, "alice", @defaults) end,
+        fn -> ColdStart.add_first_user(db, "alice", @defaults) end,
         fn -> ColdStart.pair(db, pair_input("d1", "Alice"), @defaults) end
       ])
 
@@ -231,11 +235,11 @@ defmodule Tightbeam.ColdStartTest do
   test "host-local reservation is idempotent and only the same normalized user completes it", %{
     db: db
   } do
-    assert {:ok, first} = ColdStart.bootstrap_user(db, "alice", @defaults)
+    assert {:ok, first} = ColdStart.add_first_user(db, "alice", @defaults)
     assert first.phase == "reserved"
     assert first.isAdmin
-    assert {:ok, ^first} = ColdStart.bootstrap_user(db, "alice", @defaults)
-    assert {:error, "bootstrap_closed"} = ColdStart.bootstrap_user(db, "bob", @defaults)
+    assert {:ok, ^first} = ColdStart.add_first_user(db, "alice", @defaults)
+    assert {:error, "bootstrap_closed"} = ColdStart.add_first_user(db, "bob", @defaults)
 
     assert {:error, "bootstrap_closed"} =
              ColdStart.pair(db, pair_input("wrong", "Bob"), @defaults)
@@ -258,7 +262,7 @@ defmodule Tightbeam.ColdStartTest do
       END;
       """)
 
-    assert {:error, "bootstrap_failed"} = ColdStart.bootstrap_user(db, "alice", @defaults)
+    assert {:error, "bootstrap_failed"} = ColdStart.add_first_user(db, "alice", @defaults)
     assert identity_census(db) == [0, 0, 0, 0, 0]
   end
 
@@ -275,7 +279,7 @@ defmodule Tightbeam.ColdStartTest do
       END;
       """)
 
-    assert {:error, "bootstrap_failed"} = ColdStart.bootstrap_user(db, "alice", @defaults)
+    assert {:error, "bootstrap_failed"} = ColdStart.add_first_user(db, "alice", @defaults)
     assert identity_census(db) == [0, 0, 0, 0, 0]
   end
 
@@ -293,7 +297,7 @@ defmodule Tightbeam.ColdStartTest do
       END;
       """)
 
-    assert {:error, "bootstrap_failed"} = ColdStart.bootstrap_user(db, "alice", @defaults)
+    assert {:error, "bootstrap_failed"} = ColdStart.add_first_user(db, "alice", @defaults)
     assert identity_census(db) == [0, 0, 0, 0, 0]
   end
 
@@ -357,7 +361,7 @@ defmodule Tightbeam.ColdStartTest do
              "action" => "choose pair-first or host-local bootstrap"
            }
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v8"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v9"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
   end
 
@@ -406,7 +410,7 @@ defmodule Tightbeam.ColdStartTest do
     })
 
     :ok = Schema.ensure_all(other)
-    assert {:ok, %{phase: "reserved"}} = ColdStart.bootstrap_user(other, "alice", @defaults)
+    assert {:ok, %{phase: "reserved"}} = ColdStart.add_first_user(other, "alice", @defaults)
     assert {:paired, _device} = ColdStart.pair(other, pair_input("d1", "Alice"), @defaults)
 
     assert {:ok, [[reserved_event_id, device_event_id]]} =

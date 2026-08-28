@@ -37,6 +37,7 @@ defmodule Tightbeam.GatewayTest do
   @cold_runner_prompt_timeout 60_000
 
   @archetype_reference_writers [
+    {:cold_start_main, "lib/tightbeam/cold_start.ex", "Org.create_in_txn"},
     {:typed_spawn, "lib/tightbeam/gateway.ex", "Org.create_in_txn"},
     {:default_setting, "lib/tightbeam/gateway.ex", "Org.put_setting_projected_in_txn"},
     {:identity_repoint, "lib/tightbeam/gateway.ex", "Org.repoint_archetype_in_txn"}
@@ -1762,7 +1763,7 @@ defmodule Tightbeam.GatewayTest do
     assert token != ""
   end
 
-  test "fresh auth seeds Main while the model catalog is genuinely empty", ctx do
+  test "fresh auth does not manufacture a missing Main while the model catalog is empty", ctx do
     base_dir = role_test_base("fresh-auth-empty-catalog")
     children = Gateway.children(gateway_config(base_dir, ctx.db, 0))
 
@@ -1789,8 +1790,7 @@ defmodule Tightbeam.GatewayTest do
     assert {:push, _frames, _state} =
              Tightbeam.Wire.Socket.handle_in({JSON.encode!(auth), opcode: :text}, socket)
 
-    assert %{harness: "claude", provider: "anthropic", model: %Model{family: "claude-fable-5"}} =
-             Org.get(ctx.db, Org.personal_session_key(device.user_id))
+    assert Org.get(ctx.db, Org.personal_session_key(device.user_id)) == nil
   end
 
   # Both spellings of the routability question reach the running catalog: the
@@ -11033,6 +11033,7 @@ defmodule Tightbeam.GatewayTest do
       owner_user_id: owner_user_id,
       origin: "user:#{owner_user_id}",
       spawned_by: spawned_by,
+      operational_parent: spawned_by,
       archetype: "default",
       host: "testhost",
       harness: "claude",

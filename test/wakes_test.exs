@@ -254,12 +254,25 @@ defmodule Tightbeam.WakesTest do
       DB.query(
         db,
         """
+        INSERT INTO turns
+          (sessionKey,messageId,origin,prompt,assignmentId,status,createdAt,endedAt)
+        VALUES
+          ('retiring','root-retarget','user:flynn','root','asg_retarget','delivered',1,2)
+        """
+      )
+
+    assert {:ok, [[root_turn_seq]]} = DB.query(db, "SELECT last_insert_rowid()")
+
+    {:ok, _} =
+      DB.query(
+        db,
+        """
         INSERT INTO supervision_liveness_sidecar
           (wakeId, assignmentId, controllerOrigin, wakeKind, controllerState,
-           chargedGeneration)
-        VALUES (?1, 'asg_retarget', 'scheduled', 'escalation', 'pending', 2)
+           chargedGeneration, rootTurnSeq)
+        VALUES (?1, 'asg_retarget', 'scheduled', 'escalation', 'pending', 2, ?2)
         """,
-        [original.wake_id]
+        [original.wake_id, root_turn_seq]
       )
 
     assert {:ok, replacement} =
@@ -316,14 +329,16 @@ defmodule Tightbeam.WakesTest do
     assert {:ok, sidecars} =
              DB.query(
                db,
-               "SELECT wakeId, controllerState, chargedGeneration FROM supervision_liveness_sidecar"
+               "SELECT wakeId, controllerState, chargedGeneration, rootTurnSeq FROM supervision_liveness_sidecar"
              )
 
     states =
-      Map.new(sidecars, fn [wake_id, state, generation] -> {wake_id, {state, generation}} end)
+      Map.new(sidecars, fn [wake_id, state, generation, root] ->
+        {wake_id, {state, generation, root}}
+      end)
 
-    assert states[original.wake_id] == {"settled", 2}
-    assert states[replacement.wake_id] == {"pending", 2}
+    assert states[original.wake_id] == {"settled", 2, root_turn_seq}
+    assert states[replacement.wake_id] == {"pending", 2, root_turn_seq}
   end
 
   test "O1: retarget carries the sender's class election AND the original ceiling verbatim — never restarts it",

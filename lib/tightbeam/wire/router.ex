@@ -477,11 +477,13 @@ defmodule Tightbeam.Wire.Router do
     json(conn, 200, %{"result" => ColdStart.state(db(conn))})
   end
 
-  defp dispatch_agent_request(conn, :org, "bootstrap-user", body) do
+  defp dispatch_agent_request(conn, :org, "add-user", body)
+       when not is_map_key(body, "as") and not is_map_key(body, "asUser") and
+              not is_map_key(body, "asProcess") and not is_map_key(body, "asSession") do
     with :ok <- loopback_bootstrap(conn),
          {:ok, user_id} <- required_string(get_in(body, ["params", "userId"])),
          {:ok, result} <-
-           ColdStart.bootstrap_user(db(conn), user_id, Map.fetch!(deps(conn), :defaults)) do
+           ColdStart.add_first_user(db(conn), user_id, Map.fetch!(deps(conn), :defaults)) do
       json(conn, 200, %{"result" => result})
     else
       {:error, "bootstrap_closed"} ->
@@ -496,10 +498,6 @@ defmodule Tightbeam.Wire.Router do
       {:error, status, code, message} ->
         error(conn, status, code, message)
     end
-  end
-
-  defp dispatch_agent_request(conn, _auth, "bootstrap-user", _body) do
-    error(conn, 403, "forbidden", "local bootstrap required")
   end
 
   defp dispatch_agent_request(conn, auth, verb, body) do

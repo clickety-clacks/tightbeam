@@ -52,7 +52,9 @@ defmodule Tightbeam.OrgTest do
              state: "active",
              is_built_in: true,
              adopted: true,
-             operational_parent: ^key
+             operational_parent: nil,
+             effective_parent: ^key,
+             effective_parent_source: :owner_main
            } = session
 
     assert Org.get(db, key).display_name == "Main"
@@ -63,23 +65,31 @@ defmodule Tightbeam.OrgTest do
     assert rows == [[1, 1, "active"]]
   end
 
-  test "operational parent is total, mutable, and independent of spawn provenance", %{
-    db: db,
-    main: main
-  } do
+  test "stored parent is nullable, effective parent is total, and spawn provenance is independent",
+       %{
+         db: db,
+         main: main
+       } do
     main_key = main.session_key
     first = Org.create(db, base(%{session_key: "first"}))
 
     child =
       Org.create(
         db,
-        base(%{session_key: "child", spawned_by: first.session_key})
+        base(%{
+          session_key: "child",
+          spawned_by: first.session_key,
+          operational_parent: first.session_key
+        })
       )
 
-    assert main.operational_parent == main_key
-    assert first.operational_parent == main_key
+    assert main.operational_parent == nil
+    assert main.effective_parent == main_key
+    assert first.operational_parent == nil
+    assert first.effective_parent == main_key
     assert child.spawned_by == first.session_key
     assert child.operational_parent == first.session_key
+    assert child.effective_parent == first.session_key
 
     assert_raise ArgumentError, ~r/create a cycle/, fn ->
       Org.set_operational_parent(db, first.session_key, child.session_key)
@@ -97,10 +107,12 @@ defmodule Tightbeam.OrgTest do
       Org.set_operational_parent(db, main_key, first.session_key)
     end
 
-    derived =
-      Org.create(db, base(%{session_key: "derived", operational_parent: "derived"}))
+    explicit =
+      Org.create(db, base(%{session_key: "explicit", operational_parent: main_key}))
 
-    assert derived.operational_parent == main_key
+    assert explicit.operational_parent == main_key
+    assert explicit.effective_parent == main_key
+    assert explicit.effective_parent_source == :explicit
 
     {:ok, foreign_keys} = DB.query(db, "PRAGMA foreign_key_list(sessions)")
 
@@ -108,6 +120,41 @@ defmodule Tightbeam.OrgTest do
              [_id, _seq, "sessions", "operationalParent", "sessionKey" | _rest] -> true
              _row -> false
            end)
+  end
+
+  test "the transaction resolver returns explicit and owner-main sources and names a missing source",
+       %{db: db, main: main} do
+    explicit =
+      Org.create(
+        db,
+        base(%{session_key: "explicit-child", operational_parent: main.session_key})
+      )
+
+    null = Org.create(db, base(%{session_key: "null-child", spawned_by: "provenance-only"}))
+
+    assert {:ok,
+            {%{
+               session_key: main_key,
+               source: :explicit,
+               owner_user_id: "flynn"
+             },
+             %{
+               session_key: main_key,
+               source: :owner_main,
+               owner_user_id: "flynn"
+             }}} =
+             DB.transaction(db, fn txn ->
+               {
+                 Org.effective_parent_in_txn(txn, explicit.session_key),
+                 Org.effective_parent_in_txn(txn, null.session_key)
+               }
+             end)
+
+    assert main_key == main.session_key
+    assert null.spawned_by == "provenance-only"
+
+    assert {:error, %ArgumentError{message: "unknown session: missing"}} =
+             DB.transaction(db, fn txn -> Org.effective_parent_in_txn(txn, "missing") end)
   end
 
   test "overrides and derived identity names round-trip and active reconstruction ignores retired rows",
