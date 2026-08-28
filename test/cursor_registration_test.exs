@@ -346,7 +346,7 @@ defmodule Tightbeam.CursorRegistrationTest do
   test "remote command, canonicalization, and hash failures refuse at every seam" do
     parent = self()
 
-    for failure <- [:command, :realpath, :launcher_hash, :bundle_hash] do
+    for failure <- [:realpath, :launcher_hash, :bundle_hash] do
       target = %{
         base_dir: "/remote",
         host_name: "vector",
@@ -356,12 +356,6 @@ defmodule Tightbeam.CursorRegistrationTest do
           send(parent, {:remote_integrity_command, failure, command})
 
           cond do
-            failure == :command and command =~ "command -v" ->
-              {"", 127}
-
-            command =~ "command -v" ->
-              {"/remote/2026.08.11-e8db854/cursor-agent\n", 0}
-
             failure == :realpath and command =~ "realpath" ->
               {"", 1}
 

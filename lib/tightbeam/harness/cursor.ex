@@ -616,12 +616,16 @@ defmodule Tightbeam.Harness.Cursor do
 
   defp resolve_launcher(%{find_executable: find}), do: find.(cli_binary())
 
-  defp resolve_launcher(target) do
-    if local?(target) do
-      System.find_executable(cli_binary())
-    else
-      remote_value(target, "command -v #{Support.shell_quote(cli_binary())}")
-    end
+  defp resolve_launcher(_target) do
+    Path.join([
+      execution_home(nil),
+      ".local",
+      "share",
+      "cursor-agent",
+      "versions",
+      @adapter_version,
+      "cursor-agent"
+    ])
   end
 
   defp remote_realpath(target, path),
