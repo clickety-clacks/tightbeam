@@ -124,6 +124,7 @@ pub fn onboard<S, H>(
     identity: &Identity,
     provider: &str,
     api_key: bool,
+    daemon_credential: bool,
     local_endpoint: Option<&str>,
     provider_name: Option<&str>,
     endpoint: &Endpoint,
@@ -134,7 +135,7 @@ where
     S: Fn(&Endpoint, &RequestSpec, Option<Instant>) -> Result<Option<serde_json::Value>, String>,
     H: Fn(&Endpoint, Instant) -> Result<Option<HarnessCatalog>, String>,
 {
-    let kind = if provider == "local-openai" || api_key {
+    let kind = if provider == "local-openai" || api_key || daemon_credential {
         "apiKey"
     } else {
         "subscription"
@@ -153,6 +154,7 @@ where
         machine.as_deref(),
         None,
         None,
+        daemon_credential.then_some("daemonCredential"),
     );
     let ready = send_request(endpoint, &begin, None)?;
     let deadline = ready.as_ref().map_or_else(
@@ -202,6 +204,44 @@ where
             ));
         }
     };
+
+    if daemon_credential {
+        let finish = dispatch::build_onboard_phase_request(
+            identity,
+            provider,
+            "finish",
+            kind,
+            machine.as_deref(),
+            Some(lease_id),
+            None,
+            None,
+        );
+        let outcome = match send_request(ceremony.endpoint, &finish, Some(ceremony.deadline)) {
+            Ok(reply) => onboarded_outcome(reply),
+            Err(reason) => Err(reason),
+        };
+        return match outcome {
+            Ok(result) => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result).expect("JSON value serializes")
+                );
+                Ok(())
+            }
+            Err(reason) => Err(cancel_after_begin(
+                identity,
+                provider,
+                kind,
+                machine.as_deref(),
+                Some(lease_id),
+                None,
+                &reason,
+                &ceremony,
+                &send_request,
+            )),
+        };
+    }
+
     let staging = match staging_path(&ready) {
         Ok(staging) => staging,
         Err(reason) => {
@@ -282,6 +322,7 @@ where
         kind,
         machine.as_deref(),
         Some(lease_id),
+        None,
         None,
     );
     let outcome = match send_request(ceremony.endpoint, &finish, Some(ceremony.deadline)) {
@@ -364,7 +405,7 @@ where
     S: Fn(&Endpoint, &RequestSpec, Option<Instant>) -> Result<Option<serde_json::Value>, String>,
 {
     let cancel = dispatch::build_onboard_phase_request(
-        identity, provider, "cancel", kind, machine, lease_id, classified,
+        identity, provider, "cancel", kind, machine, lease_id, classified, None,
     );
     match send_request(ceremony.endpoint, &cancel, Some(ceremony.deadline)) {
         // Matching on a SENTENCE, which makes `dispatch::ceremony_expired`'s wording part
@@ -2473,6 +2514,59 @@ mod tests {
     /// in the next.
     static DELIVERY_CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    #[test]
+    fn daemon_credential_onboarding_never_requests_or_receives_staging_path() {
+        let endpoint = Endpoint {
+            base: "http://daemon-credential-fixture.invalid".to_owned(),
+            token: "fixture-token".to_owned(),
+            origin: crate::dispatch::Origin::Provisioned,
+        };
+        let sent = std::sync::Mutex::new(Vec::new());
+
+        onboard(
+            &Identity::User("fixture-user".to_owned()),
+            "opencode-go",
+            false,
+            true,
+            None,
+            None,
+            &endpoint,
+            |_, request, _| {
+                let body: serde_json::Value = serde_json::from_str(&request.body_json).unwrap();
+                sent.lock().unwrap().push(body.clone());
+                match body
+                    .pointer("/params/phase")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    Some("begin") => Ok(Some(serde_json::json!({
+                        "status": "ready",
+                        "leaseId": "fixture-lease",
+                        "leaseTtlMs": 300_000
+                    }))),
+                    Some("finish") => Ok(Some(serde_json::json!({
+                        "status": "onboarded",
+                        "credentialKind": "apiKey"
+                    }))),
+                    phase => panic!("unexpected daemon onboarding phase: {phase:?}"),
+                }
+            },
+            |_, _| Ok(None),
+        )
+        .expect("daemon credential ceremony completes without local staging");
+
+        let sent = sent.into_inner().unwrap();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0]["params"]["source"], "daemonCredential");
+        assert!(
+            sent.iter()
+                .all(|body| body.pointer("/params/stagingPath").is_none())
+        );
+        assert!(
+            sent.iter()
+                .all(|body| !body.to_string().contains("fake-daemon-key"))
+        );
+    }
+
     /// The refusal is the whole value of not reading a key from a terminal, so
     /// the sentence is pinned rather than the `isatty` branch that produces it
     /// (which a unit test cannot stub). It must name the pipe form, because that
@@ -2848,6 +2942,7 @@ mod tests {
             let result = onboard(
                 &Identity::User("signal-fixture".to_owned()),
                 "openai",
+                false,
                 false,
                 None,
                 None,

@@ -325,6 +325,7 @@ pub enum Command {
         identity: Identity,
         provider: String,
         api_key: bool,
+        daemon_credential: bool,
         endpoint: Option<String>,
         provider_name: Option<String>,
         hostname: Option<String>,
@@ -650,10 +651,12 @@ COMMANDS:
         printenv ANTHROPIC_API_KEY | tightbeam onboard anthropic --api-key
       The key is validated against the provider before it is banked, and it
       never leaves this machine.
-  onboard opencode-go --api-key
-      Bank an OpenCode Go API key for Pi. The key is read from stdin, validated
-      by one live Pi-shaped model request, and stored in Pi's native auth.json
-      form. OpenCode Go has no subscription onboarding path here.
+  onboard opencode-go (--api-key | --daemon-credential)
+      Bank an OpenCode Go API key for Pi. --api-key reads and validates the key
+      from stdin. --daemon-credential asks the gateway daemon to read the fixed
+      owner-private opencode-go-api-key file from its configured credentials
+      directory; no key or staging path crosses the CLI wire. OpenCode Go has no
+      subscription onboarding path here.
   onboard local-openai --name NAME --endpoint URL [--api-key]
       Bank a host-scoped local OpenAI-compatible provider. The endpoint base URL
       is required. An API key is optional and, when present, is read from stdin
@@ -773,6 +776,7 @@ const BOOLEAN_FLAGS: &[&str] = &[
     "all",
     "api-key",
     "clear-spec-ref",
+    "daemon-credential",
     "dry-run",
     "help",
     "json",
@@ -2175,7 +2179,7 @@ fn parse_identity_command(
 fn parse_onboard(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Command, String> {
     if parsed.positional.len() != 2 {
         return Err(
-            "usage: tightbeam onboard <provider> [--endpoint URL] [--api-key] [--hostname HOST]"
+            "usage: tightbeam onboard <provider> [--endpoint URL] [--api-key | --daemon-credential] [--hostname HOST]"
                 .to_owned(),
         );
     }
@@ -2192,6 +2196,7 @@ fn parse_onboard(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Comm
     }
     let allowed = [
         "api-key",
+        "daemon-credential",
         "endpoint",
         "name",
         "hostname",
@@ -2202,7 +2207,7 @@ fn parse_onboard(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Comm
     ];
     if flags.keys().any(|flag| !allowed.contains(&flag.as_str())) {
         return Err(
-            "usage: tightbeam onboard <provider> [--endpoint URL] [--api-key] [--hostname HOST]"
+            "usage: tightbeam onboard <provider> [--endpoint URL] [--api-key | --daemon-credential] [--hostname HOST]"
                 .to_owned(),
         );
     }
@@ -2210,15 +2215,24 @@ fn parse_onboard(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Comm
     let provider_name = nonempty(flags, "name");
     let hostname = nonempty(flags, "hostname");
     let remote = nonempty(flags, "remote");
+    let daemon_credential = flags.contains_key("daemon-credential");
+    if daemon_credential && flags.contains_key("api-key") {
+        return Err("--daemon-credential and --api-key are mutually exclusive".to_owned());
+    }
+    if daemon_credential && provider != "opencode-go" {
+        return Err(
+            "--daemon-credential is only valid for tightbeam onboard opencode-go".to_owned(),
+        );
+    }
     if provider == "github" && flags.contains_key("api-key") {
         return Err(
             "tightbeam onboard github does not accept --api-key; use GitHub CLI browser/device auth"
                 .to_owned(),
         );
     }
-    if provider == "opencode-go" && !flags.contains_key("api-key") {
+    if provider == "opencode-go" && !flags.contains_key("api-key") && !daemon_credential {
         return Err(
-            "tightbeam onboard opencode-go requires --api-key; OpenCode Go has no subscription onboarding path"
+            "tightbeam onboard opencode-go requires --api-key or --daemon-credential; OpenCode Go has no subscription onboarding path"
                 .to_owned(),
         );
     }
@@ -2259,6 +2273,7 @@ fn parse_onboard(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Comm
         identity: identity(flags)?,
         provider,
         api_key: flags.contains_key("api-key"),
+        daemon_credential,
         endpoint,
         provider_name,
         hostname,
@@ -2683,6 +2698,7 @@ mod tests {
                 identity: Identity::User("flynn".to_owned()),
                 provider: "fixture-provider".to_owned(),
                 api_key: false,
+                daemon_credential: false,
                 endpoint: None,
                 provider_name: None,
                 hostname: None,
@@ -2704,6 +2720,7 @@ mod tests {
                 identity: Identity::Session,
                 provider: "github".to_owned(),
                 api_key: false,
+                daemon_credential: false,
                 endpoint: None,
                 provider_name: None,
                 hostname: Some("github.example".to_owned()),
@@ -2721,6 +2738,7 @@ mod tests {
                 identity: Identity::Session,
                 provider: "github".to_owned(),
                 api_key: false,
+                daemon_credential: false,
                 endpoint: None,
                 provider_name: None,
                 hostname: None,
@@ -2761,6 +2779,7 @@ mod tests {
                 identity: Identity::User("flynn".to_owned()),
                 provider: "opencode-go".to_owned(),
                 api_key: true,
+                daemon_credential: false,
                 endpoint: None,
                 provider_name: None,
                 hostname: None,
@@ -2770,9 +2789,39 @@ mod tests {
         assert_eq!(
             parse(strings(&["onboard", "opencode-go"])),
             Err(
-                "tightbeam onboard opencode-go requires --api-key; OpenCode Go has no subscription onboarding path"
+                "tightbeam onboard opencode-go requires --api-key or --daemon-credential; OpenCode Go has no subscription onboarding path"
                     .to_owned()
             )
+        );
+
+        assert_eq!(
+            parse(strings(&[
+                "onboard",
+                "opencode-go",
+                "--daemon-credential",
+                "--as-user",
+                "flynn"
+            ])),
+            Ok(Command::Onboard {
+                identity: Identity::User("flynn".to_owned()),
+                provider: "opencode-go".to_owned(),
+                api_key: false,
+                daemon_credential: true,
+                endpoint: None,
+                provider_name: None,
+                hostname: None,
+                remote: None,
+            })
+        );
+
+        assert_eq!(
+            parse(strings(&[
+                "onboard",
+                "opencode-go",
+                "--api-key",
+                "--daemon-credential"
+            ])),
+            Err("--daemon-credential and --api-key are mutually exclusive".to_owned())
         );
     }
 
@@ -2793,6 +2842,7 @@ mod tests {
                 identity: Identity::User("flynn".to_owned()),
                 provider: "local-openai".to_owned(),
                 api_key: false,
+                daemon_credential: false,
                 endpoint: Some("https://spark.example/v1".to_owned()),
                 provider_name: Some("spark".to_owned()),
                 hostname: None,
@@ -2957,7 +3007,7 @@ mod tests {
             "identity status [<archetype>]",
             "identity apply (<session> | --all)",
             "onboard openai|anthropic [--api-key]",
-            "onboard opencode-go --api-key",
+            "onboard opencode-go (--api-key | --daemon-credential)",
             "onboard local-openai --name NAME --endpoint URL [--api-key]",
             "onboard github [--hostname github.com] [--remote URL]",
             "add-user <userId> [--admin]",
@@ -4050,6 +4100,7 @@ mod tests {
                     identity: Identity::User("flynn".to_owned()),
                     provider: "openai".to_owned(),
                     api_key: false,
+                    daemon_credential: false,
                     endpoint: None,
                     provider_name: None,
                     hostname: None,

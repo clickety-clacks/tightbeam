@@ -32,6 +32,24 @@ subscription. Each session reports its own as `display.credentialKind`
 `--api-key` will not read from a terminal — a key typed at a prompt lands in
 shell scrollback.
 
+For a daemon that cannot read a login keychain, a human can seed OpenCode Go
+once without passing the key through an agent or CLI request:
+
+1. Create an owner-private directory with mode `0700`.
+2. Use a human-controlled credential tool to write the key to
+   `opencode-go-api-key` in that directory.
+3. Set the file mode to `0600` or `0400`.
+4. Set `TIGHTBEAM_CREDENTIALS_DIRECTORY` on the gateway service to the absolute
+   directory path. A systemd unit can use its standard `CREDENTIALS_DIRECTORY`
+   instead.
+5. Run `tightbeam onboard opencode-go --daemon-credential --as-user <userId>`.
+
+The daemon refuses relative directories, symlinks, non-regular files,
+group/world permissions, remote-host delivery, and providers other than
+OpenCode Go. The source file remains in place for later daemon restarts. The
+request and response carry only the source name and an onboarding lease. Run a
+real Pi turn after onboarding to prove provider liveness.
+
 Both paths validate against the provider BEFORE banking. A rejection names the
 provider, the host and the kind, and leaves the existing credential untouched.
 An `onboarded` result from the CLI is therefore a claim about the ceremony, not

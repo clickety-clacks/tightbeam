@@ -121,7 +121,8 @@ defmodule Tightbeam.Gateway do
           escalation_decision_deadline_ms: pos_integer(),
           effort_checkin_horizon_ms: pos_integer(),
           critical_lease_hard_cap_ms: pos_integer(),
-          onboarding_lease_ms: pos_integer()
+          onboarding_lease_ms: pos_integer(),
+          credentials_directory: String.t() | nil
         }
 
   @doc """
@@ -369,6 +370,7 @@ defmodule Tightbeam.Gateway do
       [
         name: Tightbeam.Credentials.server(machine),
         base_dir: host.base_dir,
+        credentials_directory: Map.get(config, :credentials_directory),
         staging_base_dir: config.base_dir,
         machine: machine,
         ssh: host.ssh,
@@ -3654,7 +3656,8 @@ defmodule Tightbeam.Gateway do
     machine = params[:machine] || Placement.local_host_name()
 
     with true <- Map.has_key?(Placement.hosts(config.base_dir, gateway_db(config)), machine),
-         {:ok, kind} <- provider_onboarding_kind(provider, params[:kind]) do
+         {:ok, kind} <- provider_onboarding_kind(provider, params[:kind]),
+         {:ok, source} <- onboarding_source(provider, phase, params[:source]) do
       config
       |> onboard_phase(
         provider_atom(provider),
@@ -3662,7 +3665,8 @@ defmodule Tightbeam.Gateway do
         machine,
         kind,
         params[:lease_id],
-        params[:reason]
+        params[:reason],
+        source
       )
       |> with_owner_user_id(phase, gateway_db(config), call.origin)
     else
@@ -3681,6 +3685,18 @@ defmodule Tightbeam.Gateway do
           message:
             "unknown credential kind #{inspect(params[:kind])}; expected apiKey or subscription"
         }
+
+      {:error, :daemon_credential_source_unsupported} ->
+        %{
+          code: "invalid_message",
+          message: "daemon credential delivery is supported only for opencode-go begin"
+        }
+
+      {:error, :unknown_credential_source} ->
+        %{
+          code: "invalid_message",
+          message: "unknown credential source #{inspect(params[:source])}"
+        }
     end
   end
 
@@ -3691,7 +3707,16 @@ defmodule Tightbeam.Gateway do
     }
   end
 
-  defp onboard_phase(config, provider, "begin", machine, kind, _lease_id, _reason) do
+  defp onboard_phase(
+         config,
+         provider,
+         "begin",
+         machine,
+         kind,
+         _lease_id,
+         _reason,
+         :interactive
+       ) do
     case Tightbeam.Credentials.begin_onboard(provider, Tightbeam.Credentials.server(machine)) do
       {:ok, path, lease_id} ->
         # The lease TTL rides the reply so the CLI's ceremony watchdog and the
@@ -3719,7 +3744,44 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp onboard_phase(_config, provider, "finish", machine, kind, lease_id, _reason) do
+  defp onboard_phase(
+         config,
+         provider,
+         "begin",
+         machine,
+         kind,
+         _lease_id,
+         _reason,
+         :daemon_credential
+       ) do
+    case Tightbeam.Credentials.begin_daemon_onboard(
+           provider,
+           Tightbeam.Credentials.server(machine)
+         ) do
+      {:ok, lease_id} ->
+        %{
+          provider: provider,
+          kind: wire_credential_kind(kind),
+          status: "ready",
+          lease_id: lease_id,
+          lease_ttl_ms: config.onboarding_lease_ms
+        }
+
+      {:error, reason} ->
+        %{code: "needs_onboarding", message: inspect(reason)}
+    end
+  end
+
+  defp onboard_phase(
+         _config,
+         provider,
+         "finish",
+         machine,
+         kind,
+         lease_id,
+         _reason,
+         _source
+       ) do
     case Tightbeam.Credentials.finish_onboard(
            provider,
            kind,
@@ -3743,7 +3805,16 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp onboard_phase(_config, provider, "cancel", machine, _kind, lease_id, reason) do
+  defp onboard_phase(
+         _config,
+         provider,
+         "cancel",
+         machine,
+         _kind,
+         lease_id,
+         reason,
+         _source
+       ) do
     case Tightbeam.Credentials.cancel_onboard(
            provider,
            lease_id,
@@ -3796,6 +3867,17 @@ defmodule Tightbeam.Gateway do
   defp provider_onboarding_kind("local-openai", "subscription"), do: {:error, :api_key_only}
   defp provider_onboarding_kind("local-openai", _kind), do: {:ok, :api_key}
   defp provider_onboarding_kind(_provider, kind), do: onboarding_kind(kind)
+
+  defp onboarding_source(_provider, _phase, nil), do: {:ok, :interactive}
+
+  defp onboarding_source("opencode-go", "begin", "daemonCredential"),
+    do: {:ok, :daemon_credential}
+
+  defp onboarding_source(_provider, _phase, "daemonCredential"),
+    do: {:error, :daemon_credential_source_unsupported}
+
+  defp onboarding_source(_provider, _phase, _source),
+    do: {:error, :unknown_credential_source}
 
   defp provider_atom("openai"), do: :openai
   defp provider_atom("anthropic"), do: :anthropic

@@ -374,6 +374,18 @@ vendor's own `login` does not onboard Tightbeam:
 printenv OPENCODE_API_KEY | <base_dir>/bin/tightbeam onboard opencode-go --api-key
 ```
 
+For a daemon-owned OpenCode Go credential, configure an absolute
+`TIGHTBEAM_CREDENTIALS_DIRECTORY` on the gateway service. A human writes the
+key to its fixed `opencode-go-api-key` file with directory mode `0700` and file
+mode `0600` or `0400`. Then run:
+
+```sh
+<base_dir>/bin/tightbeam onboard opencode-go --daemon-credential --as-user <userId>
+```
+
+The key does not enter the CLI process, request, response, or event record.
+systemd services may supply the standard `CREDENTIALS_DIRECTORY` instead.
+
 `<userId>` is the admin created by that first pairing. From a
 release install `tightbeam` is already on PATH, so the `<base_dir>/bin/` prefix
 is only needed on a source install.

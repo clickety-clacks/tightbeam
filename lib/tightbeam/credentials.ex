@@ -106,6 +106,12 @@ defmodule Tightbeam.Credentials do
   def begin_onboard(provider, server \\ __MODULE__),
     do: GenServer.call(server, {:begin_onboard, provider}, :infinity)
 
+  @doc "Begin an onboarding lease from the daemon's fixed credential directory."
+  @spec begin_daemon_onboard(provider(), GenServer.server()) ::
+          {:ok, String.t()} | {:error, term()}
+  def begin_daemon_onboard(provider, server \\ __MODULE__),
+    do: GenServer.call(server, {:begin_daemon_onboard, provider}, :infinity)
+
   @doc """
   Install the credential produced in the identified active onboarding lease, as `kind`.
 
@@ -342,6 +348,7 @@ defmodule Tightbeam.Credentials do
     {:ok,
      %{
        base_dir: Keyword.fetch!(opts, :base_dir),
+       credentials_directory: Keyword.get(opts, :credentials_directory),
        staging_base_dir: Keyword.get(opts, :staging_base_dir, Keyword.fetch!(opts, :base_dir)),
        log_event: Keyword.get(opts, :log_event, fn _kind, _subject, _detail -> :ok end),
        machine: machine,
@@ -484,6 +491,43 @@ defmodule Tightbeam.Credentials do
       }
 
       {:reply, {:ok, path, lease_id}, put_in(state.pending[provider], lease)}
+    else
+      {:error, _reason} = error -> {:reply, error, state}
+    end
+  end
+
+  def handle_call(
+        {:begin_daemon_onboard, provider} = request,
+        from,
+        %{park_pending: pending} = state
+      )
+      when is_map_key(pending, provider) do
+    defer_credential_call(provider, request, from, state)
+  end
+
+  def handle_call({:begin_daemon_onboard, provider}, _from, state) do
+    state = expire_lease(state, provider)
+    {previous, pending} = Map.pop(state.pending, provider)
+    state = %{state | pending: pending}
+
+    if previous, do: cleanup_staging!(state, previous.path)
+
+    with :ok <- state.gate.(provider),
+         :ok <- daemon_credential_supported(state, provider),
+         {:ok, bytes} <- read_daemon_credential(state.credentials_directory, provider) do
+      path = onboarding_staging_path(state, provider)
+      lease_id = Tightbeam.Id.uuid4()
+      :ok = prepare_staging!(state, path)
+      :ok = File.chmod(path, 0o700)
+      :ok = atomic_write!(staged_path(provider, path), bytes)
+
+      lease = %{
+        id: lease_id,
+        path: path,
+        expires_at: state.now.() + div(state.onboarding_lease_ms, 1000)
+      }
+
+      {:reply, {:ok, lease_id}, put_in(state.pending[provider], lease)}
     else
       {:error, _reason} = error -> {:reply, error, state}
     end
@@ -1406,6 +1450,67 @@ defmodule Tightbeam.Credentials do
   end
 
   defp installed_metadata(_provider, :subscription), do: %{expires_at: nil}
+
+  defp daemon_credential_supported(%{ssh: nil}, :opencode_go), do: :ok
+
+  defp daemon_credential_supported(%{ssh: nil}, _provider),
+    do: {:error, :daemon_credential_provider_unsupported}
+
+  defp daemon_credential_supported(_state, _provider),
+    do: {:error, :daemon_credential_requires_local_host}
+
+  defp read_daemon_credential(nil, _provider),
+    do: {:error, :daemon_credentials_directory_unconfigured}
+
+  defp read_daemon_credential(directory, :opencode_go) when is_binary(directory) do
+    with :absolute <- Path.type(directory),
+         {:ok, directory_stat} <- File.lstat(directory),
+         :ok <- private_directory(directory_stat),
+         path = Path.join(directory, "opencode-go-api-key"),
+         {:ok, before} <- File.lstat(path),
+         :ok <- private_regular_file(before),
+         {:ok, key} <- File.read(path),
+         {:ok, after_read} <- File.lstat(path),
+         :ok <- unchanged_file(before, after_read),
+         {:ok, key} <- nonempty_utf8_key(key) do
+      {:ok, JSON.encode!(%{"opencode-go" => %{"type" => "api_key", "key" => key}})}
+    else
+      :relative -> {:error, :daemon_credentials_directory_not_absolute}
+      {:error, reason} -> {:error, {:daemon_credential_unavailable, reason}}
+    end
+  end
+
+  defp private_directory(%File.Stat{type: :directory, mode: mode}) do
+    if Bitwise.band(mode, 0o077) == 0,
+      do: :ok,
+      else: {:error, :credentials_directory_not_private}
+  end
+
+  defp private_directory(%File.Stat{type: type}),
+    do: {:error, {:credentials_directory_not_regular_directory, type}}
+
+  defp private_regular_file(%File.Stat{type: :regular, mode: mode}) do
+    if Bitwise.band(mode, 0o077) == 0,
+      do: :ok,
+      else: {:error, :credential_file_not_private}
+  end
+
+  defp private_regular_file(%File.Stat{type: type}),
+    do: {:error, {:credential_file_not_regular, type}}
+
+  defp unchanged_file(
+         %File.Stat{inode: inode, major_device: device, size: size, mtime: mtime},
+         %File.Stat{inode: inode, major_device: device, size: size, mtime: mtime}
+       ),
+       do: :ok
+
+  defp unchanged_file(_before, _after), do: {:error, :credential_file_changed_during_read}
+
+  defp nonempty_utf8_key(key) when is_binary(key) do
+    if String.valid?(key) and String.trim(key) != "",
+      do: {:ok, String.trim(key)},
+      else: {:error, :credential_file_empty_or_not_utf8}
+  end
 
   defp staged_path(:openai, path), do: Path.join(path, "auth.json")
   defp staged_path(:anthropic, path), do: Path.join(path, ".credentials.json")

@@ -1600,6 +1600,95 @@ defmodule Tightbeam.CredentialsTest do
     end
   end
 
+  describe "daemon credential delivery" do
+    test "stages a fixed OpenCode Go credential without returning a path", ctx do
+      credentials_directory = Path.join(ctx.base, "daemon-credentials")
+      File.mkdir_p!(credentials_directory)
+      File.chmod!(credentials_directory, 0o700)
+      source = Path.join(credentials_directory, "opencode-go-api-key")
+      File.write!(source, "fake-daemon-key\n")
+      File.chmod!(source, 0o600)
+
+      {:ok, server} =
+        Credentials.start_link(
+          name: nil,
+          base_dir: ctx.base,
+          credentials_directory: credentials_directory,
+          machine: "eezo"
+        )
+
+      assert {:ok, lease_id} = Credentials.begin_daemon_onboard(:opencode_go, server)
+      assert is_binary(lease_id)
+      staging = :sys.get_state(server).pending.opencode_go.path
+      assert File.dir?(staging)
+      assert :ok = Credentials.finish_onboard(:opencode_go, :api_key, lease_id, server)
+      refute File.exists?(staging)
+
+      store = Path.join([ctx.base, "auth", "pi", "auth.json"])
+
+      assert JSON.decode!(File.read!(store)) == %{
+               "opencode-go" => %{"type" => "api_key", "key" => "fake-daemon-key"}
+             }
+
+      assert File.read!(source) == "fake-daemon-key\n"
+      assert File.stat!(store).mode |> Bitwise.band(0o777) == 0o600
+    end
+
+    test "refuses a symlink or permissions visible to another user", ctx do
+      credentials_directory = Path.join(ctx.base, "daemon-credentials")
+      File.mkdir_p!(credentials_directory)
+      File.chmod!(credentials_directory, 0o700)
+      target = Path.join(ctx.base, "target-key")
+      File.write!(target, "fake-daemon-key")
+      File.chmod!(target, 0o600)
+      source = Path.join(credentials_directory, "opencode-go-api-key")
+      File.ln_s!(target, source)
+
+      {:ok, server} =
+        Credentials.start_link(
+          name: nil,
+          base_dir: ctx.base,
+          credentials_directory: credentials_directory,
+          machine: "eezo"
+        )
+
+      File.chmod!(credentials_directory, 0o750)
+
+      assert {:error, {:daemon_credential_unavailable, :credentials_directory_not_private}} =
+               Credentials.begin_daemon_onboard(:opencode_go, server)
+
+      File.chmod!(credentials_directory, 0o700)
+
+      assert {:error, {:daemon_credential_unavailable, {:credential_file_not_regular, :symlink}}} =
+               Credentials.begin_daemon_onboard(:opencode_go, server)
+
+      File.rm!(source)
+      File.write!(source, "fake-daemon-key")
+      File.chmod!(source, 0o640)
+
+      assert {:error, {:daemon_credential_unavailable, :credential_file_not_private}} =
+               Credentials.begin_daemon_onboard(:opencode_go, server)
+    end
+
+    test "refuses daemon delivery to a remote credential owner", ctx do
+      credentials_directory = Path.join(ctx.base, "daemon-credentials")
+      File.mkdir_p!(credentials_directory)
+      File.chmod!(credentials_directory, 0o700)
+
+      {:ok, server} =
+        Credentials.start_link(
+          name: nil,
+          base_dir: ctx.base,
+          credentials_directory: credentials_directory,
+          machine: "worker",
+          ssh: "worker"
+        )
+
+      assert {:error, :daemon_credential_requires_local_host} =
+               Credentials.begin_daemon_onboard(:opencode_go, server)
+    end
+  end
+
   defp credential_metadata(base, harness) do
     [base, "auth", harness, ".tightbeam", "credential.json"]
     |> Path.join()
