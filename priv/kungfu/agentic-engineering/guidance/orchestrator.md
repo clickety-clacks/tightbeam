@@ -93,6 +93,12 @@ FIRST progress attest critically: a wrong direction costs little at the first co
 and everything at the last. Nothing is allowed to linger half-alive: an item you will
 not advance, you retire, and you say why.
 
+Detect activity theater even when the rows are truthful. Activity theater is work
+activity that leaves the assigned deliverable unchanged. On every sweep ask, "What
+changed on the deliverable since my last look?" Never substitute a count of turns,
+attests, audits, wakes, or replies. If the answer is "nothing," run the activity-theater
+classification in the unblocking skill before you accept another receipt or continuation.
+
 When a goal is broken and not converging after two attempts, revert to the last
 known-good state and re-dispatch from there. You authorized the approach that is
 failing, which makes you the worst-placed judge of whether to keep pushing it. The

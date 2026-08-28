@@ -12,6 +12,43 @@ mode is answering "leave it with me," absorbing the block, and becoming the bott
 for work you assigned. Classify first; hand most blocks back with what the agent was
 missing.
 
+## Classify activity theater
+
+Activity theater is truthful work activity that leaves the assigned deliverable
+unchanged. Detect it by asking, "What changed on the deliverable since my last look?"
+Never substitute how many turns, attests, audits, wakes, or replies occurred. Classify
+the evidence before you clear a block or authorize more of the same activity:
+
+- **RECEIPT-FILING** — the holder files truthful attests about activity that did not
+  move the deliverable. `asg_3d219794` filed ruling acknowledgments as progress for
+  five days.
+- **AUDIT-LOOPING** — the holder schedules more evidence gathering while ordered work
+  stays untouched. Historical lane D3 spent 13 hours on dependency audits; audit
+  specimen G5 reached a "fourth fallback audit"; specimen G6 reached a "ninth
+  recurrence."
+- **PROD-ANSWERING** — each turn answers the liveness prompt and does nothing else.
+  `asg_852fc8f1` produced eleven consecutive one-turn windows with zero receipts.
+- **SCOPE-NARROWING AT CLOSE** — the holder delivers adjacent or partial work and
+  stamps the original card complete. `wi_113442f5` closed with "Completed D3 spec
+  authoring and push only" although its deliverable included implementation.
+- **RUBBER-STAMP SUPERVISION** — the supervisor absorbs repeated stall signals and
+  authorizes continuation without changing the lane. More than 30 operator continues
+  accumulated on unmoving lanes on 2026-08-26.
+
+Treat the shared signature as decisive: every row can be truthful while the
+deliverable does not move. Stop authorizing more activity of the same class. Name the
+unchanged deliverable boundary and choose a different next action or end the lane.
+
+Use the tracked mechanical countermeasures only after you verify that their reviewed
+bytes reached the running substrate. The typed-progress work item
+`wi_990f7b7e-837b-4aba-8f2e-ac6617327d78` is designed to remove effect credit from
+RECEIPT-FILING, AUDIT-LOOPING, and PROD-ANSWERING. The completion-deliverable work
+item `wi_f46d2e83-e152-429f-93c7-3c51989bd391` is designed to prevent
+SCOPE-NARROWING AT CLOSE.
+The adjudication ledger `wi_8d1dcdb7-363a-4049-9381-aa100ab2c716` is the record for
+RUBBER-STAMP SUPERVISION. Until each mechanism ships, classification and intervention
+remain the supervisor's judgment; do not describe a tracked contract as an active rail.
+
 1. **Detect stalls.** Sweep your own obligations with
    `tightbeam assignments --role <your-role>`, and the assignments you opened for your
    agents by their recorded ids with `tightbeam attests <assignmentId>`. An assignment

@@ -181,6 +181,27 @@ defmodule Tightbeam.ArchetypesTest do
 
     assert coder.guidance =~ "Nontrivial bugs start with a causal verdict"
 
+    orchestrator =
+      Identity.snapshot_at!(
+        ctx.base_dir,
+        Identity.live_revision!(ctx.base_dir),
+        "orchestrator",
+        :codex
+      )
+
+    assert String.replace(orchestrator.guidance, "\n", " ") =~
+             ~s(What changed on the deliverable since my last look?)
+
+    unblocking = orchestrator.skills["unblocking"]
+    assert unblocking =~ "RECEIPT-FILING"
+    assert unblocking =~ "AUDIT-LOOPING"
+    assert unblocking =~ "PROD-ANSWERING"
+    assert unblocking =~ "SCOPE-NARROWING AT CLOSE"
+    assert unblocking =~ "RUBBER-STAMP SUPERVISION"
+    assert unblocking =~ "wi_990f7b7e-837b-4aba-8f2e-ac6617327d78"
+    assert unblocking =~ "wi_f46d2e83-e152-429f-93c7-3c51989bd391"
+    assert unblocking =~ "wi_8d1dcdb7-363a-4049-9381-aa100ab2c716"
+
     product_owner =
       Identity.snapshot_at!(
         ctx.base_dir,
