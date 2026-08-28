@@ -173,6 +173,7 @@ defmodule Tightbeam.Schema do
         ),
         retirementPrincipal TEXT,
         retirementActionNeeded INTEGER CHECK (retirementActionNeeded IN (0,1)),
+        rootTurnSeq INTEGER REFERENCES turns(seq),
         CHECK (
           (controllerOrigin IS NULL AND wakeKind IS NULL AND controllerState IS NULL AND
            chargedGeneration IS NULL)
@@ -569,6 +570,16 @@ defmodule Tightbeam.Schema do
             )
         )
       )
+      OR (
+        NEW.controllerOrigin='scheduled'
+        AND (
+          NEW.rootTurnSeq IS NULL
+          OR NOT EXISTS (
+            SELECT 1 FROM turns t
+            WHERE t.seq=NEW.rootTurnSeq AND t.assignmentId=NEW.assignmentId
+          )
+        )
+      )
       BEGIN
         SELECT RAISE(ABORT, 'supervision sidecar requires coherent pending wake');
       END
@@ -600,6 +611,7 @@ defmodule Tightbeam.Schema do
           AND NEW.retirementCause IS OLD.retirementCause
           AND NEW.retirementPrincipal IS OLD.retirementPrincipal
           AND NEW.retirementActionNeeded IS OLD.retirementActionNeeded
+          AND NEW.rootTurnSeq IS OLD.rootTurnSeq
           AND NEW.controllerState='settled'
         )
       BEGIN
@@ -708,7 +720,7 @@ defmodule Tightbeam.Schema do
       sql: """
       CREATE TRIGGER IF NOT EXISTS supervision_fired_lineage_sidecar_identity_immutable
       BEFORE UPDATE OF wakeId, assignmentId, controllerOrigin, wakeKind, controllerState,
-                       chargedGeneration
+                       chargedGeneration, rootTurnSeq
       ON supervision_liveness_sidecar
       WHEN EXISTS (
         SELECT 1 FROM wakes w
@@ -756,6 +768,146 @@ defmodule Tightbeam.Schema do
       )
       BEGIN
         SELECT RAISE(ABORT, 'fired supervision lineage turn is required');
+      END
+      """
+    },
+    %{
+      type: "trigger",
+      name: "supervision_controller_root_immutable_update",
+      sql: """
+      CREATE TRIGGER IF NOT EXISTS supervision_controller_root_immutable_update
+      BEFORE UPDATE OF wakeId, assignmentId, controllerOrigin, wakeKind, rootTurnSeq
+      ON supervision_liveness_sidecar
+      WHEN OLD.controllerOrigin IS NOT NULL
+        AND (
+          NEW.wakeId IS NOT OLD.wakeId OR NEW.assignmentId IS NOT OLD.assignmentId
+          OR NEW.controllerOrigin IS NOT OLD.controllerOrigin
+          OR NEW.wakeKind IS NOT OLD.wakeKind
+          OR NEW.rootTurnSeq IS NOT OLD.rootTurnSeq
+        )
+      BEGIN
+        SELECT RAISE(ABORT, 'supervision controller root link is immutable');
+      END
+      """
+    },
+    %{
+      type: "trigger",
+      name: "supervision_controller_root_immutable_delete",
+      sql: """
+      CREATE TRIGGER IF NOT EXISTS supervision_controller_root_immutable_delete
+      BEFORE DELETE ON supervision_liveness_sidecar
+      WHEN OLD.controllerOrigin IS NOT NULL
+      BEGIN
+        SELECT RAISE(ABORT, 'supervision controller root link is required');
+      END
+      """
+    },
+    %{
+      type: "trigger",
+      name: "supervision_controller_wake_identity_immutable",
+      sql: """
+      CREATE TRIGGER IF NOT EXISTS supervision_controller_wake_identity_immutable
+      BEFORE UPDATE OF wakeId, sessionKey, assignmentId ON wakes
+      WHEN EXISTS (
+        SELECT 1 FROM supervision_liveness_sidecar s
+        WHERE s.wakeId=OLD.wakeId AND s.assignmentId=OLD.assignmentId
+          AND s.controllerOrigin IS NOT NULL
+      )
+        AND (
+          NEW.wakeId IS NOT OLD.wakeId OR NEW.sessionKey IS NOT OLD.sessionKey
+          OR NEW.assignmentId IS NOT OLD.assignmentId
+        )
+      BEGIN
+        SELECT RAISE(ABORT, 'supervision controller wake identity is immutable');
+      END
+      """
+    },
+    %{
+      type: "trigger",
+      name: "supervision_controller_wake_immutable_delete",
+      sql: """
+      CREATE TRIGGER IF NOT EXISTS supervision_controller_wake_immutable_delete
+      BEFORE DELETE ON wakes
+      WHEN EXISTS (
+        SELECT 1 FROM supervision_liveness_sidecar s
+        WHERE s.wakeId=OLD.wakeId AND s.assignmentId=OLD.assignmentId
+          AND s.controllerOrigin IS NOT NULL
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'supervision controller wake is required');
+      END
+      """
+    },
+    %{
+      type: "trigger",
+      name: "supervision_controller_root_turn_immutable_update",
+      sql: """
+      CREATE TRIGGER IF NOT EXISTS supervision_controller_root_turn_immutable_update
+      BEFORE UPDATE OF seq, assignmentId ON turns
+      WHEN EXISTS (
+        SELECT 1 FROM supervision_liveness_sidecar s
+        WHERE s.rootTurnSeq=OLD.seq AND s.assignmentId=OLD.assignmentId
+      )
+        AND (NEW.seq IS NOT OLD.seq OR NEW.assignmentId IS NOT OLD.assignmentId)
+      BEGIN
+        SELECT RAISE(ABORT, 'supervision controller root turn identity is immutable');
+      END
+      """
+    },
+    %{
+      type: "trigger",
+      name: "supervision_controller_root_turn_immutable_delete",
+      sql: """
+      CREATE TRIGGER IF NOT EXISTS supervision_controller_root_turn_immutable_delete
+      BEFORE DELETE ON turns
+      WHEN EXISTS (
+        SELECT 1 FROM supervision_liveness_sidecar s
+        WHERE s.rootTurnSeq=OLD.seq AND s.assignmentId=OLD.assignmentId
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'supervision controller root turn is required');
+      END
+      """
+    },
+    %{
+      type: "trigger",
+      name: "supervision_controller_turn_identity_immutable_update",
+      sql: """
+      CREATE TRIGGER IF NOT EXISTS supervision_controller_turn_identity_immutable_update
+      BEFORE UPDATE OF seq, sessionKey, wakeId, assignmentId ON turns
+      WHEN EXISTS (
+        SELECT 1
+        FROM supervision_liveness_sidecar s
+        JOIN wakes w ON w.wakeId=s.wakeId AND w.assignmentId=s.assignmentId
+        WHERE s.controllerOrigin IS NOT NULL
+          AND OLD.wakeId=w.wakeId AND OLD.assignmentId=w.assignmentId
+          AND OLD.sessionKey=w.sessionKey
+      )
+        AND (
+          NEW.seq IS NOT OLD.seq OR NEW.sessionKey IS NOT OLD.sessionKey
+          OR NEW.wakeId IS NOT OLD.wakeId OR NEW.assignmentId IS NOT OLD.assignmentId
+        )
+      BEGIN
+        SELECT RAISE(ABORT, 'supervision controller turn identity is immutable');
+      END
+      """
+    },
+    %{
+      type: "trigger",
+      name: "supervision_controller_turn_immutable_delete",
+      sql: """
+      CREATE TRIGGER IF NOT EXISTS supervision_controller_turn_immutable_delete
+      BEFORE DELETE ON turns
+      WHEN EXISTS (
+        SELECT 1
+        FROM supervision_liveness_sidecar s
+        JOIN wakes w ON w.wakeId=s.wakeId AND w.assignmentId=s.assignmentId
+        WHERE s.controllerOrigin IS NOT NULL
+          AND OLD.wakeId=w.wakeId AND OLD.assignmentId=w.assignmentId
+          AND OLD.sessionKey=w.sessionKey
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'supervision controller turn is required');
       END
       """
     }
@@ -1130,6 +1282,9 @@ defmodule Tightbeam.Schema do
                    "incompatible_nullable_effective_parent_v1: predecessor stamp #{inspect(rows)}"
            end
 
+           :ok = migrate_controller_root_link_in_txn(txn, opts)
+           maybe_interrupt_nullable_effective_parent_migration!(opts, :after_root_link)
+
            :ok = Tightbeam.Org.migrate_nullable_effective_parent_in_txn(txn, opts)
            maybe_interrupt_nullable_effective_parent_migration!(opts, :after_migration)
 
@@ -1172,6 +1327,82 @@ defmodule Tightbeam.Schema do
     if Keyword.get(opts, :fail_at) == point,
       do: raise("forced nullable-effective-parent migration interruption")
 
+    :ok
+  end
+
+  defp migrate_controller_root_link_in_txn(txn, opts) do
+    predecessor_columns =
+      Txn.q(txn, "PRAGMA table_info(supervision_liveness_sidecar)")
+      |> Enum.map(fn [_cid, name | _rest] -> name end)
+
+    if "rootTurnSeq" in predecessor_columns do
+      raise ShapeError,
+        message: "incompatible_nullable_effective_parent_v1: predecessor already has rootTurnSeq"
+    end
+
+    copied_columns = [
+      "wakeId",
+      "assignmentId",
+      "controllerOrigin",
+      "wakeKind",
+      "controllerState",
+      "chargedGeneration",
+      "transferEvidenceId",
+      "retirementEpoch",
+      "retiringSessionKey",
+      "retirementOutcomeKind",
+      "retirementOutcomeId",
+      "retirementTargetSessionKey",
+      "retirementCause",
+      "retirementPrincipal",
+      "retirementActionNeeded"
+    ]
+
+    column_list = Enum.join(copied_columns, ", ")
+
+    :ok =
+      Txn.exec(
+        txn,
+        "CREATE TEMP TABLE nullable_effective_parent_sidecar_v1 AS SELECT #{column_list} FROM supervision_liveness_sidecar"
+      )
+
+    maybe_interrupt_nullable_effective_parent_migration!(opts, :after_root_copy)
+
+    dependent_objects =
+      (@supervision_liveness_objects ++ @supervision_liveness_enforcement_objects)
+      |> Enum.filter(fn object ->
+        object.name != "supervision_liveness_sidecar" and
+          String.contains?(object.sql, "supervision_liveness_sidecar")
+      end)
+
+    Enum.each(dependent_objects, fn object ->
+      :ok = Txn.exec(txn, "DROP #{String.upcase(object.type)} IF EXISTS #{object.name}")
+    end)
+
+    :ok = Txn.exec(txn, "DROP TABLE supervision_liveness_sidecar")
+    maybe_interrupt_nullable_effective_parent_migration!(opts, :after_root_drop)
+
+    sidecar =
+      Enum.find(@supervision_liveness_objects, fn object ->
+        object.name == "supervision_liveness_sidecar"
+      end)
+
+    :ok = Txn.exec(txn, sidecar.sql)
+
+    Txn.q(
+      txn,
+      "INSERT INTO supervision_liveness_sidecar (#{column_list}) SELECT #{column_list} FROM nullable_effective_parent_sidecar_v1"
+    )
+
+    :ok = Txn.exec(txn, "DROP TABLE nullable_effective_parent_sidecar_v1")
+
+    Enum.each(dependent_objects, fn object ->
+      :ok = Txn.exec(txn, object.sql)
+      validate_owned_object!(txn, object)
+    end)
+
+    validate_owned_object!(txn, sidecar)
+    maybe_interrupt_nullable_effective_parent_migration!(opts, :after_root_restore)
     :ok
   end
 

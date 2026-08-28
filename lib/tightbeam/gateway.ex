@@ -5127,15 +5127,23 @@ defmodule Tightbeam.Gateway do
   # principal, just like the assignment carrier above.
   defp schedule_supervision_controller_in_txn(
          txn,
-         %{principal: {:process, "tightbeam"}, params: %{supervision_wake_kind: wake_kind}},
+         %{
+           principal: {:process, "tightbeam"},
+           params: %{
+             supervision_wake_kind: wake_kind,
+             supervision_terminal_seq: root_turn_seq
+           }
+         },
          wake
        )
-       when wake_kind in ["prod", "escalation"] do
+       when wake_kind in ["prod", "escalation"] and is_integer(root_turn_seq) and
+              root_turn_seq > 0 do
     case Supervision.transition_in_txn(txn, %{
            kind: "controller_scheduled",
            wake_id: wake.wake_id,
            assignment_id: wake.assignment_id,
-           wake_kind: wake_kind
+           wake_kind: wake_kind,
+           root_turn_seq: root_turn_seq
          }) do
       {:armed, _generation} ->
         :ok
@@ -5154,7 +5162,11 @@ defmodule Tightbeam.Gateway do
          %{principal: {:process, "tightbeam"}, params: %{supervision_wake_kind: wake_kind}},
          _wake
        ) do
-    raise "incompatible_supervision_liveness_v1: unknown controller kind #{inspect(wake_kind)}"
+    if wake_kind in ["prod", "escalation"] do
+      raise "incompatible_supervision_liveness_v1: controller root turn is required"
+    else
+      raise "incompatible_supervision_liveness_v1: unknown controller kind #{inspect(wake_kind)}"
+    end
   end
 
   defp schedule_supervision_controller_in_txn(_txn, _call, _wake), do: :ok

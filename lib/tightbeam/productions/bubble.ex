@@ -37,7 +37,8 @@ defmodule Tightbeam.Productions.Bubble do
     Gateway,
     HarnessHealth,
     Org,
-    Projection
+    Projection,
+    Supervision
   }
 
   alias Tightbeam.Wire.Payloads
@@ -150,29 +151,35 @@ defmodule Tightbeam.Productions.Bubble do
 
     {:ok, result} =
       DB.transaction(db, fn txn ->
-        case next_active_ancestor_in_txn(txn, turn.session_key) do
-          {:ok, recipient} ->
-            delivery =
-              Gateway.deliver_prompt_in_txn(
-                txn,
-                recipient,
-                "process:tightbeam",
-                prompt,
-                sender: "process:tightbeam",
-                device_id: "process:tightbeam",
-                client_message_id: "bubble:#{turn.cause_seq}:#{recipient}",
-                wake_id: "bubble:#{turn.cause_seq}:#{recipient}",
-                request_ref: "bubble:#{turn.cause_seq}"
-              )
+        coverage = controller_coverage_in_txn(txn, cause)
 
-            {:delivery, recipient, delivery}
+        excluded =
+          case coverage do
+            {:prior_recipients, recipients} -> MapSet.new(recipients)
+            _ -> MapSet.new()
+          end
 
-          absence ->
-            absence
+        case coverage do
+          :resolved_existing ->
+            :resolved_existing
+
+          :pending ->
+            :pending
+
+          _ ->
+            deliver_to_next_ancestor_in_txn(
+              txn,
+              turn,
+              prompt,
+              excluded
+            )
         end
       end)
 
     case result do
+      result when result in [:resolved_existing, :pending] ->
+        :ok
+
       :parentless ->
         if turn.notice?, do: terminal_alert(db, turn, cause), else: :ok
 
@@ -183,6 +190,35 @@ defmodule Tightbeam.Productions.Bubble do
         handle_notice_delivery(db, turn, recipient, Gateway.complete_delivery(db, delivery))
     end
   end
+
+  defp deliver_to_next_ancestor_in_txn(txn, turn, prompt, excluded) do
+    case next_active_ancestor_in_txn(txn, turn.session_key, excluded) do
+      {:ok, recipient} ->
+        delivery =
+          Gateway.deliver_prompt_in_txn(
+            txn,
+            recipient,
+            "process:tightbeam",
+            prompt,
+            sender: "process:tightbeam",
+            device_id: "process:tightbeam",
+            client_message_id: "bubble:#{turn.cause_seq}:#{recipient}",
+            wake_id: "bubble:#{turn.cause_seq}:#{recipient}",
+            request_ref: "bubble:#{turn.cause_seq}"
+          )
+
+        {:delivery, recipient, delivery}
+
+      absence ->
+        absence
+    end
+  end
+
+  defp controller_coverage_in_txn(txn, %{assignment_id: assignment_id, turn_seq: turn_seq})
+       when is_binary(assignment_id),
+       do: Supervision.controller_coverage_in_txn(txn, assignment_id, turn_seq)
+
+  defp controller_coverage_in_txn(_txn, _cause), do: :none
 
   defp handle_notice_delivery(db, turn, recipient, result) do
     case result do
@@ -363,7 +399,7 @@ defmodule Tightbeam.Productions.Bubble do
       DB.query(
         db,
         """
-        SELECT t.sessionKey,t.error,s.harness,s.host
+        SELECT t.seq,t.sessionKey,t.assignmentId,t.error,s.harness,s.host
         FROM turns t JOIN sessions s ON s.sessionKey=t.sessionKey
         WHERE t.seq=?1
         """,
@@ -371,8 +407,16 @@ defmodule Tightbeam.Productions.Bubble do
       )
 
     case rows do
-      [[session_key, error, harness, host]] ->
-        {:ok, %{session_key: session_key, error: error, harness: harness, host: host}}
+      [[turn_seq, session_key, assignment_id, error, harness, host]] ->
+        {:ok,
+         %{
+           turn_seq: turn_seq,
+           session_key: session_key,
+           assignment_id: assignment_id,
+           error: error,
+           harness: harness,
+           host: host
+         }}
 
       [] ->
         :missing
@@ -385,12 +429,14 @@ defmodule Tightbeam.Productions.Bubble do
   # empty answers are DIFFERENT facts and stay different values: a session
   # with no row is `:parentless`; a session whose lineage exists but
   # holds no active rung is `:exhausted`.
-  defp next_active_ancestor_in_txn(txn, session_key, hops \\ 0)
+  defp next_active_ancestor_in_txn(txn, session_key, excluded),
+    do: next_active_ancestor_in_txn(txn, session_key, excluded, 0)
 
-  defp next_active_ancestor_in_txn(_txn, _session_key, hops) when hops > @lineage_hop_limit,
-    do: :exhausted
+  defp next_active_ancestor_in_txn(_txn, _session_key, _excluded, hops)
+       when hops > @lineage_hop_limit,
+       do: :exhausted
 
-  defp next_active_ancestor_in_txn(txn, session_key, hops) do
+  defp next_active_ancestor_in_txn(txn, session_key, excluded, hops) do
     case Org.get_in_txn(txn, session_key) do
       nil when hops == 0 ->
         :parentless
@@ -405,8 +451,13 @@ defmodule Tightbeam.Productions.Bubble do
           :exhausted
         else
           case Org.get_in_txn(txn, parent) do
-            %{state: "active"} -> {:ok, parent}
-            _ -> exhausted_past(txn, parent, hops)
+            %{state: "active"} ->
+              if MapSet.member?(excluded, parent),
+                do: exhausted_past(txn, parent, excluded, hops),
+                else: {:ok, parent}
+
+            _ ->
+              exhausted_past(txn, parent, excluded, hops)
           end
         end
     end
@@ -414,8 +465,8 @@ defmodule Tightbeam.Productions.Bubble do
 
   # Climbing past a dead rung: whatever the rest of the walk answers, this
   # lineage EXISTS, so an empty tail is exhaustion, never parentlessness.
-  defp exhausted_past(txn, parent, hops) do
-    case next_active_ancestor_in_txn(txn, parent, hops + 1) do
+  defp exhausted_past(txn, parent, excluded, hops) do
+    case next_active_ancestor_in_txn(txn, parent, excluded, hops + 1) do
       :parentless -> :exhausted
       other -> other
     end

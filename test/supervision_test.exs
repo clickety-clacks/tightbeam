@@ -1261,14 +1261,15 @@ defmodule Tightbeam.SupervisionTest do
                 "retirement_elevation",
                 "escalation",
                 "settled",
-                nil
+                nil,
+                ^terminal_seq
               ]
             ]} =
              DB.query(
                ctx.db,
                """
                SELECT w.wakeId, t.sessionKey, w.state, s.controllerOrigin, s.wakeKind,
-                      s.controllerState, s.chargedGeneration
+                      s.controllerState, s.chargedGeneration, s.rootTurnSeq
                FROM turns t
                JOIN wakes w ON w.wakeId=t.wakeId
                JOIN supervision_liveness_sidecar s ON s.wakeId=w.wakeId
@@ -1278,6 +1279,16 @@ defmodule Tightbeam.SupervisionTest do
              )
 
     assert successor_wake_id != source_wake.wake_id
+
+    assert {:ok, %{seq: ^successor_turn_seq, owner_lease: successor_lease}} =
+             Ledger.claim_next(ctx.db, main_key, "retirement-root-coverage")
+
+    assert :ok =
+             Ledger.finish(ctx.db, successor_turn_seq, "delivered", nil,
+               owner_lease: successor_lease
+             )
+
+    assert controller_coverage(ctx.db, "asg_1", terminal_seq) == :resolved_existing
 
     assert %{
              supervisionState: "parent_elevated",
@@ -1291,7 +1302,7 @@ defmodule Tightbeam.SupervisionTest do
              supervisionActionNeeded: true
            } = Supervision.prod_state(ctx.db, "asg_1")
 
-    assert {:ok, [[2, 2]]} =
+    assert {:ok, [[3, 2]]} =
              DB.query(
                ctx.db,
                "SELECT COUNT(*), COUNT(DISTINCT wakeId) FROM turns WHERE assignmentId='asg_1'"
@@ -1300,7 +1311,7 @@ defmodule Tightbeam.SupervisionTest do
     assert :ok = stop_supervised(Supervision)
     _replay = start_liveness!(ctx, sweep_ms: 60_000)
 
-    assert {:ok, [[2, 2]]} =
+    assert {:ok, [[3, 2]]} =
              DB.query(
                ctx.db,
                "SELECT COUNT(*), COUNT(DISTINCT wakeId) FROM turns WHERE assignmentId='asg_1'"
@@ -2112,12 +2123,32 @@ defmodule Tightbeam.SupervisionTest do
     # jobRef stays NULL here because this assignment belongs to no work item.
     assert prod.assignment_id == "asg_1"
 
+    assert {:ok, [[^prod_seq]]} =
+             DB.query(
+               ctx.db,
+               "SELECT rootTurnSeq FROM supervision_liveness_sidecar WHERE wakeId=?1",
+               [prod.wake_id]
+             )
+
+    assert controller_coverage(ctx.db, "asg_1", prod_seq) == :pending
+
     assert {:ok, [["asg_1", nil]]} =
              DB.query(
                ctx.db,
                "SELECT assignmentId, jobRef FROM turns WHERE wakeId = ?1",
                [prod.wake_id]
              )
+
+    assert {:ok, %{seq: prod_turn_seq, owner_lease: prod_lease}} =
+             Ledger.claim_next(ctx.db, "holder", "exact-controller-coverage")
+
+    assert :ok =
+             Ledger.finish(ctx.db, prod_turn_seq, "delivered", nil, owner_lease: prod_lease)
+
+    assert controller_coverage(ctx.db, "asg_1", prod_seq) == :resolved_existing
+
+    different_root_seq = terminal!(ctx.db, "holder")
+    assert controller_coverage(ctx.db, "asg_1", different_root_seq) == :different_root
 
     session(ctx.db, "escalating-holder", ctx.supervisor.session_key)
     assignment(ctx.db, "asg_escalation", "escalating-holder", "investigate", 3)
@@ -2129,12 +2160,32 @@ defmodule Tightbeam.SupervisionTest do
 
     [escalation] = Wakes.list_pending(ctx.db)
 
-    assert {:ok, [["escalation", "pending", 2]]} =
+    assert {:ok, [["escalation", "pending", 2, ^escalation_seq]]} =
              DB.query(
                ctx.db,
-               "SELECT wakeKind,controllerState,chargedGeneration FROM supervision_liveness_sidecar WHERE wakeId=?1",
+               "SELECT wakeKind,controllerState,chargedGeneration,rootTurnSeq FROM supervision_liveness_sidecar WHERE wakeId=?1",
                [escalation.wake_id]
              )
+
+    assert controller_coverage(ctx.db, "asg_escalation", escalation_seq) == :pending
+
+    assert {:error, %DB.Error{}} =
+             DB.query(
+               ctx.db,
+               "UPDATE supervision_liveness_sidecar SET rootTurnSeq=?2 WHERE wakeId=?1",
+               [escalation.wake_id, prod_seq]
+             )
+
+    assert {:error, %DB.Error{}} =
+             DB.query(ctx.db, "DELETE FROM wakes WHERE wakeId=?1", [escalation.wake_id])
+
+    assert {:error, %DB.Error{}} =
+             DB.query(ctx.db, "UPDATE turns SET assignmentId='asg_1' WHERE seq=?1", [
+               escalation_seq
+             ])
+
+    assert {:error, %DB.Error{}} =
+             DB.query(ctx.db, "DELETE FROM turns WHERE seq=?1", [escalation_seq])
 
     assert {:error, %DB.Error{message: pending_sidecar_update}} =
              DB.query(
@@ -2143,7 +2194,7 @@ defmodule Tightbeam.SupervisionTest do
                [escalation.wake_id]
              )
 
-    assert pending_sidecar_update =~ "pending supervision controller permits settlement only"
+    assert pending_sidecar_update =~ "immutable"
 
     assert {:error, %DB.Error{message: pending_sidecar_delete}} =
              DB.query(
@@ -2152,7 +2203,7 @@ defmodule Tightbeam.SupervisionTest do
                [escalation.wake_id]
              )
 
-    assert pending_sidecar_delete =~ "pending supervision controller sidecar is required"
+    assert pending_sidecar_delete =~ "required"
 
     assert {:error, %DB.Error{message: pending_wake_update}} =
              DB.query(
@@ -2161,7 +2212,7 @@ defmodule Tightbeam.SupervisionTest do
                [escalation.wake_id]
              )
 
-    assert pending_wake_update =~ "pending supervision controller wake identity is immutable"
+    assert pending_wake_update =~ "supervision controller wake identity is immutable"
 
     incoherent =
       Wakes.schedule(ctx.db, %{
@@ -2212,7 +2263,7 @@ defmodule Tightbeam.SupervisionTest do
                [escalation.wake_id]
              )
 
-    assert delete_message =~ "fired supervision lineage sidecar is required"
+    assert delete_message =~ "supervision controller root link is required"
 
     assert {:error, %DB.Error{message: update_message}} =
              DB.query(
@@ -2221,7 +2272,7 @@ defmodule Tightbeam.SupervisionTest do
                [escalation.wake_id]
              )
 
-    assert update_message =~ "fired supervision lineage sidecar identity is immutable"
+    assert update_message =~ "supervision controller root link is immutable"
 
     assert {:error, %DB.Error{message: state_message}} =
              DB.query(
@@ -2244,12 +2295,12 @@ defmodule Tightbeam.SupervisionTest do
                [escalation.wake_id]
              )
 
-    assert turn_update_message =~ "fired supervision lineage turn attribution is immutable"
+    assert turn_update_message =~ "supervision controller turn identity is immutable"
 
     assert {:error, %DB.Error{message: turn_delete_message}} =
              DB.query(ctx.db, "DELETE FROM turns WHERE wakeId=?1", [escalation.wake_id])
 
-    assert turn_delete_message =~ "fired supervision lineage turn is required"
+    assert turn_delete_message =~ "supervision controller turn is required"
 
     assert {:ok, [["escalation", "settled"]]} =
              DB.query(
@@ -2257,6 +2308,17 @@ defmodule Tightbeam.SupervisionTest do
                "SELECT wakeKind,controllerState FROM supervision_liveness_sidecar WHERE wakeId=?1",
                [escalation.wake_id]
              )
+
+    assert {:ok, %{seq: controller_turn_seq, owner_lease: controller_lease}} =
+             Ledger.claim_next(ctx.db, "supervisor", "failed-controller-coverage")
+
+    assert :ok =
+             Ledger.finish(ctx.db, controller_turn_seq, "failed", "recipient unavailable",
+               owner_lease: controller_lease
+             )
+
+    assert controller_coverage(ctx.db, "asg_escalation", escalation_seq) ==
+             {:prior_recipients, ["supervisor"]}
   end
 
   test "invalid reply resolution leaves a pending supervision controller untouched", ctx do
@@ -2370,6 +2432,7 @@ defmodule Tightbeam.SupervisionTest do
       interval: 60_000
     )
 
+    root_turn_seq = terminal!(ctx.db, "holder")
     wake = ctx.handlers["wake"]
 
     assert_raise RuntimeError, ~r/controller schedule :duplicate/, fn ->
@@ -2382,7 +2445,8 @@ defmodule Tightbeam.SupervisionTest do
           after_ms: 0,
           nudge: false,
           assignment_id: "asg_1",
-          supervision_wake_kind: "prod"
+          supervision_wake_kind: "prod",
+          supervision_terminal_seq: root_turn_seq
         }
       })
     end
@@ -2395,6 +2459,7 @@ defmodule Tightbeam.SupervisionTest do
   end
 
   test "a supervision controller without an entitlement rolls back its wake row", ctx do
+    root_turn_seq = terminal!(ctx.db, "holder")
     {:ok, _} = DB.query(ctx.db, "DELETE FROM supervision_entitlements WHERE assignmentId='asg_1'")
     wake = ctx.handlers["wake"]
 
@@ -2408,7 +2473,8 @@ defmodule Tightbeam.SupervisionTest do
           after_ms: 0,
           nudge: false,
           assignment_id: "asg_1",
-          supervision_wake_kind: "prod"
+          supervision_wake_kind: "prod",
+          supervision_terminal_seq: root_turn_seq
         }
       })
     end
@@ -3354,6 +3420,15 @@ defmodule Tightbeam.SupervisionTest do
       )
   end
 
+  defp controller_coverage(db, assignment_id, turn_seq) do
+    {:ok, coverage} =
+      DB.transaction(db, fn txn ->
+        Supervision.controller_coverage_in_txn(txn, assignment_id, turn_seq)
+      end)
+
+    coverage
+  end
+
   defp insert_entitlement!(db, assignment_id, opts) do
     generation = Keyword.fetch!(opts, :generation)
     due_at = Keyword.fetch!(opts, :due_at)
@@ -3398,12 +3473,23 @@ defmodule Tightbeam.SupervisionTest do
   defp terminal!(db, session_key) do
     message_id = "m_#{System.unique_integer([:positive])}"
 
+    assignment_id =
+      case DB.query(
+             db,
+             "SELECT id FROM assignments WHERE holderKey=?1 AND state='open' ORDER BY openedAt,id LIMIT 1",
+             [session_key]
+           ) do
+        {:ok, [[id]]} -> id
+        {:ok, []} -> nil
+      end
+
     {:ok, seq} =
       Ledger.enqueue(db, %{
         session_key: session_key,
         message_id: message_id,
         origin: "user:flynn",
-        prompt: "external"
+        prompt: "external",
+        assignment_id: assignment_id
       })
 
     assert {:ok, %{seq: ^seq, owner_lease: owner_lease}} =

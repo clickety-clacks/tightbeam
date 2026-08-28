@@ -32,7 +32,7 @@ end
 defmodule Tightbeam.SchemaShapeTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Model, Org, Projection, Schema}
+  alias Tightbeam.{DB, Model, Org, Projection, Schema, Supervision}
 
   @shape "coordination-fabric-v1-phase1-v8"
 
@@ -191,6 +191,7 @@ defmodule Tightbeam.SchemaShapeTest do
       })
 
     :ok = DB.execute(db, "ALTER TABLE messages DROP COLUMN messageType")
+    remove_controller_root_link(db)
 
     {:ok, _} =
       DB.query(
@@ -220,7 +221,8 @@ defmodule Tightbeam.SchemaShapeTest do
              ~w(attestId assignmentId attestTs generation recoveryBaseline cause principal)
 
     assert table_columns(db, "supervision_liveness_sidecar") ==
-             ~w(wakeId assignmentId controllerOrigin wakeKind controllerState chargedGeneration transferEvidenceId retirementEpoch retiringSessionKey retirementOutcomeKind retirementOutcomeId retirementTargetSessionKey retirementCause retirementPrincipal retirementActionNeeded)
+             ~w(wakeId assignmentId controllerOrigin wakeKind controllerState chargedGeneration transferEvidenceId retirementEpoch retiringSessionKey retirementOutcomeKind retirementOutcomeId retirementTargetSessionKey retirementCause retirementPrincipal retirementActionNeeded) ++
+               ["rootTurnSeq"]
 
     assert table_columns(db, "wake_cancellations") ==
              ~w(wakeId wakeState canceledAt requesterKind requesterId reasonKind causalSourceKind causalSourceId outcomeKind replacementWakeId dispositionKind dispositionId primaryWorkKind primaryWorkId workImpactKind livenessTriggerKind livenessTriggerId actionNeeded)
@@ -519,6 +521,32 @@ defmodule Tightbeam.SchemaShapeTest do
       end)
 
     assert Enum.at(parent_column, 3) == 1
+
+    :ok =
+      DB.execute(
+        db,
+        """
+        INSERT INTO assignments
+          (id,subject,holderKey,openedByUser,openedAt)
+        VALUES ('asg_historical_root','historical controller','child','flynn',1);
+        INSERT INTO wakes
+          (wakeId,sessionKey,origin,prompt,consumer,dueAt,state,createdAt,assignmentId)
+        VALUES
+          ('w_historical_root','root','process:tightbeam','historical','prompt',0,'pending',1,
+           'asg_historical_root');
+        INSERT INTO supervision_liveness_sidecar
+          (wakeId,assignmentId,controllerOrigin,wakeKind,controllerState,chargedGeneration)
+        VALUES
+          ('w_historical_root','asg_historical_root','scheduled','prod','pending',1);
+        """
+      )
+
+    assert {:ok, [historical_before]} =
+             DB.query(
+               db,
+               "SELECT * FROM supervision_liveness_sidecar WHERE wakeId='w_historical_root'"
+             )
+
     assert :ok = Schema.ensure_all(db)
 
     assert {:ok, [["coordination-fabric-v1-phase1-v8"]]} =
@@ -549,6 +577,30 @@ defmodule Tightbeam.SchemaShapeTest do
 
     assert Enum.at(nullable_column, 3) == 0
 
+    assert {:ok, [historical_after]} =
+             DB.query(
+               db,
+               "SELECT * FROM supervision_liveness_sidecar WHERE wakeId='w_historical_root'"
+             )
+
+    assert Enum.take(historical_after, length(historical_before)) == historical_before
+    assert List.last(historical_after) == nil
+
+    assert {:ok, :historical_unknown} =
+             DB.transaction(db, fn txn ->
+               Supervision.controller_coverage_in_txn(txn, "asg_historical_root", 1)
+             end)
+
+    for _ <- 1..10 do
+      assert :ok = Schema.ensure_all(db)
+
+      assert {:ok, [[nil]]} =
+               DB.query(
+                 db,
+                 "SELECT rootTurnSeq FROM supervision_liveness_sidecar WHERE wakeId='w_historical_root'"
+               )
+    end
+
     assert %{operational_parent: nil, effective_parent_source: :owner_main} =
              session(db, "new-null", "flynn")
   end
@@ -564,7 +616,17 @@ defmodule Tightbeam.SchemaShapeTest do
                model: nil
              })
 
-    for point <- [:after_copy, :after_drop, :after_rename, :after_migration, :after_stamp] do
+    for point <- [
+          :after_root_copy,
+          :after_root_drop,
+          :after_root_restore,
+          :after_root_link,
+          :after_copy,
+          :after_drop,
+          :after_rename,
+          :after_migration,
+          :after_stamp
+        ] do
       downgrade_to_v7(db)
 
       error =
@@ -1103,6 +1165,7 @@ defmodule Tightbeam.SchemaShapeTest do
   end
 
   defp downgrade_to_previous_shape(db) do
+    remove_controller_root_link(db)
     :ok = DB.execute(db, "DROP TRIGGER users_gateway_owned_insert")
     :ok = DB.execute(db, "DROP TABLE cold_start_receipts")
     :ok = DB.execute(db, "ALTER TABLE users DROP COLUMN creationKind")
@@ -1119,6 +1182,8 @@ defmodule Tightbeam.SchemaShapeTest do
   end
 
   defp downgrade_to_v7(db) do
+    remove_controller_root_link(db)
+
     {:ok, :ok} =
       DB.foreign_key_rebuild(db, fn txn ->
         DB.Txn.q(
@@ -1160,6 +1225,29 @@ defmodule Tightbeam.SchemaShapeTest do
           txn,
           "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v7', stampedAt=1"
         )
+
+        :ok
+      end)
+
+    :ok
+  end
+
+  defp remove_controller_root_link(db) do
+    {:ok, :ok} =
+      DB.foreign_key_rebuild(db, fn txn ->
+        DB.Txn.q(
+          txn,
+          "SELECT type, name FROM sqlite_master WHERE type IN ('index','trigger') AND sql LIKE '%rootTurnSeq%'"
+        )
+        |> Enum.each(fn [type, name] ->
+          :ok = DB.Txn.exec(txn, "DROP #{String.upcase(type)} IF EXISTS #{name}")
+        end)
+
+        :ok =
+          DB.Txn.exec(
+            txn,
+            "ALTER TABLE supervision_liveness_sidecar DROP COLUMN rootTurnSeq"
+          )
 
         :ok
       end)
