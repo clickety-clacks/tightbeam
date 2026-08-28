@@ -34,7 +34,8 @@ defmodule Tightbeam.SchemaShapeTest do
 
   alias Tightbeam.{Assignments, DB, Schema}
 
-  @shape "terminal-operator-decision-parity-v1"
+  @shape "notice-batching-v1-019"
+  @terminal_decision_shape "terminal-operator-decision-parity-v1"
   @operator_decision_shape "operator-decision-requests-v1"
   @model_identity_shape "model-identity-v1"
   @be61_shape "model-identity-message-envelope-v2"
@@ -200,7 +201,8 @@ defmodule Tightbeam.SchemaShapeTest do
         "SELECT #{model_identity_request_columns()} FROM decision_requests ORDER BY id"
       )
 
-    {:ok, wakes_before} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
+    {:ok, wakes_before} =
+      DB.query(db, "SELECT #{legacy_wake_columns()} FROM wakes ORDER BY wakeId")
 
     {:ok, messages_before} =
       DB.query(db, "SELECT #{model_identity_message_columns()} FROM messages ORDER BY seq")
@@ -218,7 +220,14 @@ defmodule Tightbeam.SchemaShapeTest do
     assert {:ok, [[nil], [nil]]} =
              DB.query(db, "SELECT ruledViaSessionKey FROM decision_requests ORDER BY id")
 
-    assert {:ok, ^wakes_before} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
+    assert {:ok, ^wakes_before} =
+             DB.query(db, "SELECT #{legacy_wake_columns()} FROM wakes ORDER BY wakeId")
+
+    assert {:ok, [[nil, nil, nil, 0, 0], [nil, nil, nil, 0, 0]]} =
+             DB.query(
+               db,
+               "SELECT class, classElection, deliveryRule, digest, summon FROM wakes ORDER BY wakeId"
+             )
 
     assert {:ok, ^messages_before} =
              DB.query(db, "SELECT #{model_identity_message_columns()} FROM messages ORDER BY seq")
@@ -263,7 +272,8 @@ defmodule Tightbeam.SchemaShapeTest do
                "SELECT #{model_identity_request_columns()} FROM decision_requests ORDER BY id"
              )
 
-    assert {:ok, ^wakes_before} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
+    assert {:ok, ^wakes_before} =
+             DB.query(db, "SELECT #{legacy_wake_columns()} FROM wakes ORDER BY wakeId")
 
     assert {:ok, ^messages_before} =
              DB.query(db, "SELECT #{model_identity_message_columns()} FROM messages ORDER BY seq")
@@ -343,7 +353,7 @@ defmodule Tightbeam.SchemaShapeTest do
     assert {:ok, ^before} =
              DB.query(db, "SELECT #{predecessor_columns} FROM decision_requests ORDER BY id")
 
-    assert {:ok, [[46, @shape, @shape, "process:tightbeam"]]} =
+    assert {:ok, [[46, @terminal_decision_shape, @terminal_decision_shape, "process:tightbeam"]]} =
              DB.query(
                db,
                "SELECT legacyRulingFactMaxId,schemaVersion,cause,principal FROM decision_request_terminal_epoch WHERE id=0"
@@ -446,7 +456,7 @@ defmodule Tightbeam.SchemaShapeTest do
     assert :ok = Schema.ensure_all(second)
     assert {:ok, [[@shape]]} = DB.query(second, "SELECT shape FROM schema_stamp")
 
-    assert {:ok, [[@shape, 0]]} =
+    assert {:ok, [[@terminal_decision_shape, 0]]} =
              DB.query(
                second,
                "SELECT schemaVersion, legacyRulingFactMaxId FROM decision_request_terminal_epoch WHERE id=0"
@@ -731,9 +741,10 @@ defmodule Tightbeam.SchemaShapeTest do
     assert {:ok, []} = DB.query(db, "SELECT id FROM supervision_liveness_epoch")
   end
 
-  test "upgraded historical wake rows stay byte-stable and gain no inferred carrier", %{db: db} do
+  test "terminal-decision predecessor wakes migrate exactly without inferred carriers", %{db: db} do
     assert :ok = Schema.ensure_all(db)
     drop_liveness_activation(db)
+    downgrade_wakes_to_terminal_decision(db)
 
     :ok =
       DB.execute(db, """
@@ -745,12 +756,27 @@ defmodule Tightbeam.SchemaShapeTest do
         ('w_canceled','session-a','process:tightbeam','canceled',90,'canceled',12,NULL,92)
       """)
 
-    {:ok, before_rows} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
+    {:ok, before_rows} =
+      DB.query(db, "SELECT #{legacy_wake_columns()} FROM wakes ORDER BY wakeId")
 
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, ^before_rows} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
+    assert {:ok, ^before_rows} =
+             DB.query(db, "SELECT #{legacy_wake_columns()} FROM wakes ORDER BY wakeId")
+
+    assert {:ok,
+            [
+              [nil, nil, nil, 0, 0],
+              [nil, nil, nil, 0, 0],
+              [nil, nil, nil, 0, 0]
+            ]} =
+             DB.query(
+               db,
+               "SELECT class, classElection, deliveryRule, digest, summon FROM wakes ORDER BY wakeId"
+             )
+
     assert {:ok, []} = DB.query(db, "SELECT wakeId FROM wake_cancellations")
+    assert {:ok, []} = DB.query(db, "SELECT batchId FROM notice_batches")
 
     assert {:ok, [[@shape]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
@@ -774,8 +800,10 @@ defmodule Tightbeam.SchemaShapeTest do
     assert error.message =~ @be61_shape
     assert error.message =~ @shape
 
-    assert error.message =~
-             "can migrate only #{@model_identity_shape} or #{@operator_decision_shape} to #{@shape}"
+    assert error.message =~ @model_identity_shape
+    assert error.message =~ @operator_decision_shape
+    assert error.message =~ @terminal_decision_shape
+    assert error.message =~ @shape
 
     assert {:ok, [[@be61_shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
     refute "ruledViaSessionKey" in table_columns(db, "decision_requests")
@@ -901,6 +929,66 @@ defmodule Tightbeam.SchemaShapeTest do
       """)
 
     :ok
+  end
+
+  defp downgrade_wakes_to_terminal_decision(db) do
+    :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
+
+    try do
+      :ok =
+        DB.execute(db, """
+        DROP TABLE notice_batch_members;
+        DROP TABLE notice_batches;
+        DROP TABLE notice_delivery_policies;
+        DROP TABLE notice_batching_lane_policies;
+        DROP TABLE admin_projection_versions;
+        DROP INDEX wakes_due;
+        DROP INDEX wakes_delivery;
+        DROP INDEX wakes_condition;
+        DROP TABLE wakes;
+        CREATE TABLE wakes (
+          wakeId     TEXT PRIMARY KEY,
+          sessionKey TEXT NOT NULL,
+          targetRole TEXT,
+          origin     TEXT NOT NULL,
+          prompt     TEXT,
+          consumer   TEXT NOT NULL DEFAULT 'prompt',
+          dueAt      INTEGER NOT NULL,
+          state      TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','fired','canceled')),
+          createdAt  INTEGER NOT NULL,
+          firedAt    INTEGER,
+          reresolve  TEXT NULL CHECK (reresolve IN ('lineage')),
+          reresolveSeed TEXT NULL,
+          reresolveRung INTEGER NULL,
+          conditionKind TEXT NULL,
+          conditionScope TEXT NULL,
+          conditionAfterId INTEGER NULL,
+          firedBy TEXT NULL CHECK (firedBy IN ('condition','fallback')),
+          creatorSessionKey TEXT NULL,
+          rumination INTEGER NOT NULL DEFAULT 0,
+          work_item_id TEXT,
+          assignmentId TEXT,
+          canceledAt INTEGER,
+          targetGate INTEGER NOT NULL DEFAULT 1,
+          CHECK (consumer != 'prompt' OR prompt IS NOT NULL)
+        );
+        CREATE INDEX wakes_due ON wakes (state, dueAt);
+        CREATE INDEX wakes_condition ON wakes (state, conditionKind, conditionScope);
+        UPDATE schema_stamp SET shape = '#{@terminal_decision_shape}', stampedAt = 1;
+        """)
+    after
+      :ok = DB.execute(db, "PRAGMA foreign_keys = ON")
+    end
+  end
+
+  defp legacy_wake_columns do
+    """
+    wakeId, sessionKey, targetRole, origin, prompt, consumer, dueAt, state,
+    createdAt, firedAt, reresolve, reresolveSeed, reresolveRung,
+    conditionKind, conditionScope, conditionAfterId, firedBy,
+    creatorSessionKey, rumination, work_item_id, assignmentId, canceledAt,
+    targetGate
+    """
   end
 
   defp model_identity_request_columns do

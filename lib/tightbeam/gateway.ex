@@ -80,6 +80,7 @@ defmodule Tightbeam.Gateway do
     Ledger,
     Model,
     ModelCatalog,
+    NoticeBatcher,
     Org,
     Projection,
     Rails,
@@ -251,12 +252,15 @@ defmodule Tightbeam.Gateway do
               )
 
             {:error, %{code: "unknown_role"}} ->
-              EventLog.lifecycle(
-                db,
-                "wake_unresolved",
-                wake.wake_id,
-                "role #{role} no longer exists"
-              )
+              :ok =
+                EventLog.lifecycle(
+                  db,
+                  "wake_unresolved",
+                  wake.wake_id,
+                  "role #{role} no longer exists"
+                )
+
+              :skipped
           end
 
         nil ->
@@ -649,6 +653,9 @@ defmodule Tightbeam.Gateway do
 
           not (is_binary(p[:prompt]) and p.prompt != "") ->
             %{code: "invalid", message: "a wake must carry a prompt"}
+
+          Map.has_key?(p, :class) and not (is_binary(p[:class]) and p[:class] != "") ->
+            %{code: "invalid", message: "--class requires a class name"}
 
           not valid_reresolve?(p) ->
             %{code: "invalid", message: "reresolve lineage requires seed and rung"}
@@ -3489,18 +3496,24 @@ defmodule Tightbeam.Gateway do
       nil ->
         %{code: "unknown_caller"}
 
-      %{owner_user_id: nil} ->
+      %{owner_user_id: nil} = caller ->
         wakes =
           Wakes.list_pending(db)
           |> Enum.filter(&(&1.origin == call.origin))
           |> Enum.map(&Map.take(&1, [:wake_id, :session_key, :due_at, :prompt]))
+          |> Enum.map(&inspect_wake(db, &1))
 
-        Map.put(%{wakes: wakes}, :roles, role_list_result(db).roles)
+        %{wakes: wakes, roles: role_list_result(db).roles}
+        |> maybe_put_inspected_batch(db, call, caller)
 
       caller ->
         sessions = Org.list_for_user(db, caller.owner_user_id, false)
         keys = MapSet.new(sessions, & &1.session_key)
-        wakes = Wakes.list_pending(db) |> Enum.filter(&MapSet.member?(keys, &1.session_key))
+
+        wakes =
+          Wakes.list_pending(db)
+          |> Enum.filter(&MapSet.member?(keys, &1.session_key))
+          |> Enum.map(&inspect_wake(db, &1))
 
         # Discovery beats documentation: the org's SHAPE — what archetypes
         # exist (and their WHERE), what hosts are known, what model refs are
@@ -3532,17 +3545,52 @@ defmodule Tightbeam.Gateway do
           models: org_shape.models
         }
 
-        if admin_origin?(db, call.origin) do
-          pending =
-            Devices.list_pending(db)
-            |> Enum.map(&Map.take(&1, [:device_id, :claimed_name, :user_id, :platform, :model]))
+        result =
+          if admin_origin?(db, call.origin) do
+            pending =
+              Devices.list_pending(db)
+              |> Enum.map(&Map.take(&1, [:device_id, :claimed_name, :user_id, :platform, :model]))
 
-          Map.put(result, :pending_devices, pending)
-        else
-          result
-        end
+            Map.put(result, :pending_devices, pending)
+          else
+            result
+          end
+
+        maybe_put_inspected_batch(result, db, call, caller)
     end
   end
+
+  defp inspect_wake(db, wake) do
+    case NoticeBatcher.source_refs(db, wake.wake_id) do
+      [] -> wake
+      refs -> Map.put(wake, :batch_refs, refs)
+    end
+  end
+
+  defp maybe_put_inspected_batch(result, db, call, caller) do
+    case call.params[:batch_id] do
+      batch_id when is_binary(batch_id) and batch_id != "" ->
+        principal = inspect_principal(call, caller)
+        Map.put(result, :batch, NoticeBatcher.read_batch(db, batch_id, principal))
+
+      _ ->
+        result
+    end
+  end
+
+  defp inspect_principal(%{principal: {kind, id} = principal}, _caller)
+       when kind in [:user, :session, :process] and is_binary(id) and id != "",
+       do: principal
+
+  defp inspect_principal(%{origin: "user:" <> user_id}, _caller), do: {:user, user_id}
+
+  defp inspect_principal(%{origin: "process:" <> process_id}, _caller),
+    do: {:process, process_id}
+
+  defp inspect_principal(_call, %{caller_session: %{session_key: session_key}}),
+    do: {:session, session_key}
+
+  defp inspect_principal(_call, _caller), do: nil
 
   defp facts_read_result(db, call) do
     p = call.params
@@ -3730,6 +3778,10 @@ defmodule Tightbeam.Gateway do
         condition_kind: condition_kind,
         condition_scope: condition_scope,
         creator_session_key: creator_session_key(call[:principal]),
+        # A class is the sender's election. An explicit time is also the
+        # sender's election and inhibits batching without discarding the class.
+        class: p[:class],
+        sender_scheduled: not is_nil(p[:at]) or not is_nil(p[:after_ms]),
         reresolve: p[:reresolve],
         reresolve_seed: p[:reresolve_seed],
         reresolve_rung: p[:reresolve_rung],
@@ -3810,11 +3862,27 @@ defmodule Tightbeam.Gateway do
   defp creator_session_key(_principal), do: nil
 
   defp select_wake_in_txn_sql do
-    "SELECT wakeId, dueAt, state FROM wakes WHERE wakeId = ?1"
+    "SELECT wakeId, dueAt, state, class, deliveryRule FROM wakes WHERE wakeId = ?1"
   end
 
-  defp wake_from_in_txn_row([wake_id, due_at, state]),
-    do: %{wake_id: wake_id, due_at: due_at, state: state}
+  defp wake_from_in_txn_row([wake_id, due_at, state, class, delivery_rule]),
+    do: %{
+      wake_id: wake_id,
+      due_at: due_at,
+      state: state,
+      class: class,
+      delivery_rule: delivery_rule
+    }
+
+  defp wake_response(%{class: class} = wake) when is_binary(class) do
+    %{
+      wake_id: wake.wake_id,
+      due_at: wake.due_at,
+      state: wake.state,
+      class: class,
+      delivery_rule: wake[:delivery_rule]
+    }
+  end
 
   defp wake_response(wake) do
     %{wake_id: wake.wake_id, due_at: wake.due_at, state: wake.state}

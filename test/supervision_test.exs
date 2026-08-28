@@ -11,6 +11,7 @@ defmodule Tightbeam.SupervisionTest do
     Gateway,
     HarnessHealth,
     Ledger,
+    NoticeBatcher,
     Org,
     Projection,
     RailRemedy,
@@ -1477,6 +1478,77 @@ defmodule Tightbeam.SupervisionTest do
 
     assert Wakes.get(ctx.db, reminder.wake_id).state == "pending"
     assert Supervision.prod_state(ctx.db, "asg_1") == nil
+  end
+
+  test "an unrelated selected classed fyi wake does not suppress the turn-end remedy", ctx do
+    prepare_review_gate(ctx)
+
+    {:ok, _policy} =
+      DB.transaction(ctx.db, fn txn ->
+        Org.apply_notice_batching_lane_policy_in_txn(
+          txn,
+          %{session_key: "holder", target_role: nil},
+          true,
+          "notice-batching-test-policy:supervision-held-fyi",
+          "agent:test-policy",
+          "supervision-fixture",
+          1
+        )
+      end)
+
+    held =
+      Wakes.schedule(ctx.db, %{
+        session_key: "holder",
+        target_role: nil,
+        origin: "process:tightbeam",
+        prompt: "unrelated fyi, held by the batcher",
+        due_at: System.system_time(:millisecond) + 60_000,
+        creator_session_key: "holder",
+        class: "fyi"
+      })
+
+    assert held.delivery_rule == Wakes.digest_rule()
+    refute held.digest
+    assert Wakes.self_pending_count(ctx.db, "holder") == 0
+
+    seq = terminal!(ctx.db, "holder")
+
+    assert {:acted, :rail_remedy} =
+             Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
+
+    assert %{status: "live"} =
+             RailRemedy.episode(ctx.db, "completion-needs-review", "asg_1")
+
+    assert Wakes.get(ctx.db, held.wake_id).state == "pending"
+  end
+
+  test "a default-off legacy fyi wake does not suppress the turn-end remedy", ctx do
+    prepare_review_gate(ctx)
+
+    held =
+      Wakes.schedule(ctx.db, %{
+        session_key: "holder",
+        target_role: nil,
+        origin: "process:tightbeam",
+        prompt: "default-off unrelated fyi",
+        due_at: System.system_time(:millisecond) + 60_000,
+        creator_session_key: "holder",
+        class: "fyi"
+      })
+
+    assert held.delivery_rule == "turn-boundary-digest r1"
+    assert NoticeBatcher.source_refs(ctx.db, held.wake_id) == []
+    assert Wakes.self_pending_count(ctx.db, "holder") == 0
+
+    seq = terminal!(ctx.db, "holder")
+
+    assert {:acted, :rail_remedy} =
+             Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
+
+    assert %{status: "live"} =
+             RailRemedy.episode(ctx.db, "completion-needs-review", "asg_1")
+
+    assert Wakes.get(ctx.db, held.wake_id).state == "pending"
   end
 
   test "turn-end denial without a remedy records re-obligate and uses the normal prod", ctx do

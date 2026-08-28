@@ -66,6 +66,9 @@ pub enum Command {
         condition_kind: Option<String>,
         condition_scope: Option<String>,
         idempotency_key: Option<String>,
+        /// Sender-elected delivery class. The vocabulary is extensible, so the
+        /// CLI validates only that a supplied name is non-empty.
+        class: Option<String>,
     },
     Condition {
         identity: Identity,
@@ -421,6 +424,7 @@ TARGET (for commands that take one — pass exactly one):
 COMMANDS:
   wake (--session <key> | --role <name> | --user <id>) --prompt "<text>"
        [--after 30s|5m|2h] [--at <epochMs>]
+       [--class fyi|status-query|input-needed|blocker|algedonic]
       Condition wake:
         tightbeam wake (--session <key> | --role <name> | --user <id>)
           --when-fact <kind> [--when-scope <scope>]
@@ -436,6 +440,9 @@ COMMANDS:
       The fallback timer detects silence only; it does not select an action.
       --prompt is the caller's explicit instruction override.
       Tightbeam carries it without rewriting it.
+      --class elects the receiver's delivery policy. Without --class the wake
+      follows the existing one-notice path. An explicit --after or --at keeps
+      the sender's chosen delivery time.
         tightbeam wake --role reviewer --prompt "review PR 12" --as coder
         tightbeam wake --session agent:coder:app --prompt "check CI" --after 5m --as coder
         tightbeam wake --role owner --when-fact build-finished --when-scope app \
@@ -1104,6 +1111,9 @@ fn parse_with_optional_catalog(
                 return Err("--fallback-after and --at are mutually exclusive".to_owned());
             }
             let idempotency_key = condition_kind.as_ref().and_then(|_| nonempty(flags, "key"));
+            if flags.get("class").is_some_and(String::is_empty) {
+                return Err("--class requires a class name".to_owned());
+            }
             Ok(Command::Wake {
                 identity: identity(flags)?,
                 target: targets.into_iter().next().expect("exactly one target"),
@@ -1113,6 +1123,7 @@ fn parse_with_optional_catalog(
                 condition_kind,
                 condition_scope,
                 idempotency_key,
+                class: nonempty(flags, "class"),
             })
         }
         "condition" => {
@@ -2928,6 +2939,7 @@ mod tests {
                 condition_kind: Some("build-finished".to_owned()),
                 condition_scope: Some("app".to_owned()),
                 idempotency_key: Some("wake-1".to_owned()),
+                class: None,
             })
         );
         assert_eq!(
@@ -2953,6 +2965,7 @@ mod tests {
                 condition_kind: Some("review-landed".to_owned()),
                 condition_scope: None,
                 idempotency_key: None,
+                class: None,
             })
         );
         assert_eq!(
@@ -3496,6 +3509,7 @@ mod tests {
                     condition_kind: None,
                     condition_scope: None,
                     idempotency_key: None,
+                    class: None,
                 },
             ),
             (
