@@ -37,6 +37,7 @@ defmodule Tightbeam.FirehoseSmokeTest do
       Router.init(
         db: db,
         base_dir: base_dir,
+        cursor_signing: cursor_signing!(base_dir),
         handlers: handlers,
         cli_token: "tbc_firehose_smoke",
         firehose_hub: Hub,

@@ -433,7 +433,7 @@ defmodule Tightbeam.EscalationDeliveryTest do
 
   test "proof 10: every request site arms in-transaction and every turn sink is enumerated" do
     # Every production `decision_requests` insert/retarget site, and the
-    # in-transaction prompt arm each one owes. All four now live in
+    # in-transaction prompt arm each one owes. All five now live in
     # `escalation.ex` (Sol xhigh review round 2, finding 1: every production
     # read AND write of `decision_requests` is centralized behind named,
     # kind-classified functions there) — `EffortCheckin`'s two request sites
@@ -454,7 +454,8 @@ defmodule Tightbeam.EscalationDeliveryTest do
       # carries it commit together, or neither does.
       {"lib/tightbeam/escalation.ex", "file_agent_request/2"},
       {"lib/tightbeam/escalation.ex", "effort_insert_in_txn/2"},
-      {"lib/tightbeam/escalation.ex", "effort_update_generation_in_txn/4"}
+      {"lib/tightbeam/escalation.ex", "effort_update_generation_in_txn/4"},
+      {"lib/tightbeam/escalation.ex", "insert_operator_request_in_txn/6"}
     ]
 
     assert Enum.sort(request_sites) == Enum.sort(decision_request_sites())
@@ -470,6 +471,8 @@ defmodule Tightbeam.EscalationDeliveryTest do
              {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt/4",
               "children_after_preflight/1"} => 2,
              {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt/4", "handler_specs/1"} => 1,
+             {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt/4",
+              "execute_assignment_repair/6"} => 1,
              {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt/4", "notify_session/4"} => 1,
              # The fault bubble's notice enqueue (production-machine-v1): a
              # substrate-authored turn to the failing session's nearest active
@@ -494,7 +497,9 @@ defmodule Tightbeam.EscalationDeliveryTest do
              # private. Still exactly one turn sink; it simply has a name now.
              {"lib/tightbeam/gateway.ex", "Ledger.enqueue_in_txn/2",
               "append_and_enqueue_in_txn/7"} => 1,
-             {"lib/tightbeam/ledger.ex", "Ledger.enqueue_in_txn/2", "enqueue/2"} => 1
+             {"lib/tightbeam/ledger.ex", "Ledger.enqueue_in_txn/2", "enqueue/2"} => 1,
+             {"lib/tightbeam/ledger.ex", "Ledger.enqueue_in_txn/2", "append_repair_attempt/5"} =>
+               1
            }
 
     # `Ledger.enqueue/2` has zero production call sites: the wrapper exists for
@@ -676,6 +681,7 @@ defmodule Tightbeam.EscalationDeliveryTest do
   defp config(base_dir, db) do
     %{
       base_dir: base_dir,
+      cursor_signing: cursor_signing!(base_dir),
       cwd: base_dir,
       port: 0,
       default_harness: :claude,

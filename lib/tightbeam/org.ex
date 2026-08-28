@@ -4,7 +4,7 @@ defmodule Tightbeam.Org do
   and append-only harness-session pointer chains.
   """
 
-  alias Tightbeam.{AdminProjection, DB, Supervision, Wakes}
+  alias Tightbeam.{AdminProjection, DB, EventLog, NoticeBatcher, Supervision, Wakes}
   alias Tightbeam.DB.Txn
   alias Tightbeam.Model
 
@@ -325,6 +325,89 @@ defmodule Tightbeam.Org do
     end
 
     %{changed: changed, projection: Tightbeam.StateResources.query_config(txn, key)}
+  end
+
+  @doc false
+  @spec apply_notice_batching_lane_policy(
+          map(),
+          boolean(),
+          String.t(),
+          String.t(),
+          String.t(),
+          non_neg_integer()
+        ) :: map()
+  def apply_notice_batching_lane_policy(
+        recipient_lane,
+        enabled,
+        policy_ref,
+        selected_by,
+        cause,
+        at
+      ) do
+    transaction!(Tightbeam.DB, fn txn ->
+      apply_notice_batching_lane_policy_in_txn(
+        txn,
+        recipient_lane,
+        enabled,
+        policy_ref,
+        selected_by,
+        cause,
+        at
+      )
+    end)
+  end
+
+  @doc false
+  @spec apply_notice_batching_lane_policy_in_txn(
+          Txn.t(),
+          map(),
+          boolean(),
+          String.t(),
+          String.t(),
+          String.t(),
+          non_neg_integer()
+        ) :: map()
+  def apply_notice_batching_lane_policy_in_txn(
+        %Txn{} = txn,
+        recipient_lane,
+        enabled,
+        policy_ref,
+        selected_by,
+        cause,
+        at
+      ) do
+    policy =
+      NoticeBatcher.apply_lane_policy_in_txn(
+        txn,
+        recipient_lane,
+        enabled,
+        policy_ref,
+        selected_by,
+        cause,
+        at
+      )
+
+    projection_key = [policy.recipient_address, policy.visibility_scope]
+
+    row_version =
+      AdminProjection.allocate_in_txn(
+        txn,
+        "notice batching lane policies",
+        projection_key,
+        at,
+        item: JSON.encode!(policy)
+      )
+
+    EventLog.lifecycle_in_txn(
+      txn,
+      "notice_batching_lane_policy_applied",
+      policy_ref,
+      "recipientAddress=#{policy.recipient_address} visibilityScope=#{policy.visibility_scope} " <>
+        "enabled=#{enabled} revision=#{policy.policy_revision} selectedBy=#{selected_by} " <>
+        "cause=#{cause} selectedAt=#{at}"
+    )
+
+    Map.put(policy, :row_version, row_version)
   end
 
   @doc """
@@ -872,9 +955,13 @@ defmodule Tightbeam.Org do
         )
       end
 
+    {after_cancellation, command} = Map.pop(command, :after_cancellation)
+
     if not Wakes.cancel_in_txn(txn, Map.put(command, :wake_id, wake_id)) do
       raise "typed retirement cancellation refused for #{wake_id}"
     end
+
+    finalize_retirement_replacement_in_txn!(txn, after_cancellation)
   end
 
   defp retirement_assignment_disposition?(_txn, nil, _session_key), do: false
@@ -942,19 +1029,69 @@ defmodule Tightbeam.Org do
         replacement_target ->
           case Wakes.retarget_in_txn(txn, wake_id, replacement_target) do
             %{wake_id: replacement_wake_id} ->
-              %{kind: "replacement", replacement_wake_id: replacement_wake_id}
+              after_cancellation =
+                case NoticeBatcher.preserve_retargeted_source_in_txn(
+                       txn,
+                       wake_id,
+                       replacement_wake_id
+                     ) do
+                  :not_batched ->
+                    nil
+
+                  %{member_id: _, batch_id: _} ->
+                    nil
+
+                  {:immutable_delivery, %{delivery_wake_id: delivery_wake_id}} ->
+                    {:supersede_by_carrier, replacement_wake_id, delivery_wake_id}
+
+                  {:immutable_delivery_pending, %{batch_id: _batch_id}} ->
+                    nil
+
+                  {:error, refusal} ->
+                    raise "retirement replacement batching refused: #{inspect(refusal)}"
+                end
+
+              %{
+                kind: "replacement",
+                replacement_wake_id: replacement_wake_id,
+                after_cancellation: after_cancellation
+              }
 
             :error ->
               raise "retirement replacement refused for #{wake_id}"
           end
       end
 
+    {after_cancellation, outcome} = Map.pop(outcome, :after_cancellation)
+
     %{
       requester: %{kind: "process", id: "tightbeam:retirement"},
       reason_kind: "target_retired",
       causal_source: %{kind: "session_transition", id: session_key},
-      outcome: outcome
+      outcome: outcome,
+      after_cancellation: after_cancellation
     }
+  end
+
+  defp finalize_retirement_replacement_in_txn!(_txn, nil), do: :ok
+
+  defp finalize_retirement_replacement_in_txn!(
+         txn,
+         {:supersede_by_carrier, replacement_wake_id, delivery_wake_id}
+       ) do
+    command = %{
+      wake_id: replacement_wake_id,
+      requester: %{kind: "process", id: "tightbeam:batcher"},
+      reason_kind: "superseded",
+      causal_source: %{kind: "wake", id: delivery_wake_id},
+      outcome: %{kind: "replacement", replacement_wake_id: delivery_wake_id}
+    }
+
+    if Wakes.cancel_in_txn(txn, command) do
+      :ok
+    else
+      raise "retirement replacement carrier supersession refused for #{replacement_wake_id}"
+    end
   end
 
   defp retirement_replacement_target_for_work(

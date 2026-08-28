@@ -91,6 +91,7 @@ defmodule Tightbeam.RecordNoticeTest do
     assert marker.content == "[adapter down]\n\nThe engine stopped."
     assert marker.sender == "process:tightbeam"
     assert marker.role == "assistant"
+    assert marker.message_type == "substrate"
     assert marker.attention_tier == 0
 
     seq = marker.seq
@@ -194,6 +195,42 @@ defmodule Tightbeam.RecordNoticeTest do
     assert lifecycle_kinds(ctx.db) == ["adapter_down"]
     assert [_] = Projection.list_after(ctx.db, "work", nil, 10)
     assert [_] = Projection.list_after(ctx.db, "second", nil, 10)
+  end
+
+  test "a caller-owned notice publishes only after commit and rolls back as one act", ctx do
+    connect(ctx.registry, "txn-notice")
+
+    assert {:error, %RuntimeError{message: "abort notice"}} =
+             DB.transaction(ctx.db, fn txn ->
+               EventLog.notice_in_txn(txn, "probe", "rolled-back", "detail",
+                 audience: {:session, "work"},
+                 attention: :high,
+                 message: "[rolled back]\n\nThis must not survive."
+               )
+
+               raise "abort notice"
+             end)
+
+    assert EventLog.lifecycle_events(ctx.db) == []
+    assert Projection.list_after(ctx.db, "work", nil, 10) == []
+    refute_received {:push_message, _, _, _}
+
+    assert {:ok, publication} =
+             DB.transaction(ctx.db, fn txn ->
+               EventLog.notice_in_txn(txn, "probe", "committed", "detail",
+                 audience: {:session, "work"},
+                 attention: :high,
+                 message: "[committed]\n\nPublish after commit."
+               )
+             end)
+
+    assert [_marker] = Projection.list_after(ctx.db, "work", nil, 10)
+    refute_received {:push_message, _, _, _}
+
+    assert :ok = EventLog.complete_notice(publication, conn_registry: ctx.registry)
+
+    assert_receive {:push_message, "work", _seq,
+                    %{"content" => "[committed]\n\nPublish after commit."}}
   end
 
   test "record_only writes the row and interrupts nobody", ctx do

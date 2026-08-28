@@ -24,6 +24,9 @@ defmodule Tightbeam.Firehose.Publisher do
     "answer" => {"decision_request.ruled", &StateResources.decision_request/1},
     "rule" => {"decision_request.ruled", &StateResources.decision_request/1},
     "effort-rule" => {"decision_request.ruled", &StateResources.decision_request/1},
+    "operator-ask" => {"decision_request.opened", &StateResources.decision_request/1},
+    "operator-rule" => {"decision_request.ruled", &StateResources.decision_request/1},
+    "operator-withdraw" => {"decision_request.withdrawn", &StateResources.decision_request/1},
     "return" => {"decision_request.returned", &StateResources.decision_request/1},
     "withdraw" => {"decision_request.withdrawn", &StateResources.decision_request/1},
     "approve-device" => {"device.approved", &StateResources.device/1},
@@ -41,7 +44,7 @@ defmodule Tightbeam.Firehose.Publisher do
   }
 
   @transactional_verbs MapSet.new(
-                         ~w(work-item-create work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail assign dispatch attest reopen-assignment revoke-assignment wake condition artifact-record read-marker-set read-marker-clear critical role-create role-bind role-rm spawn retire ask answer return rule effort-rule withdraw approve-device deny-device revoke-device add-user promote-user config host-env-set host-env-unset register-host identity-edit identity-relearn learn unlearn kungfu-scaffold)
+                         ~w(work-item-create work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail assign dispatch attest reopen-assignment revoke-assignment wake condition artifact-record read-marker-set read-marker-clear critical role-create role-bind role-rm spawn retire ask answer return rule effort-rule operator-ask operator-rule operator-withdraw withdraw approve-device deny-device revoke-device add-user promote-user config host-env-set host-env-unset register-host identity-edit identity-relearn learn unlearn kungfu-scaffold)
                        )
 
   @spec accepted(map(), term()) :: :ok

@@ -216,7 +216,7 @@ defmodule Tightbeam.Assignments do
         [assignment_id, session_key, ts]
       )
 
-      append_marker(txn, session_key, "[assignment interrupted by retire: #{assignment_id}]")
+      append_notice(txn, session_key, "[assignment interrupted by retire: #{assignment_id}]")
       Tightbeam.WorkItems.arm_slate_in_txn(txn, work_item_id)
 
       liveness_trigger = disposition_liveness_trigger!(txn, work_item_id)
@@ -1951,15 +1951,15 @@ defmodule Tightbeam.Assignments do
           "[progress filed on #{attest.assignmentId}]"
       end
 
-    append_marker(txn, attest.bySession, text)
+    append_notice(txn, attest.bySession, text)
   end
 
   defp append_assignment_marker(txn, assignment, :opened) do
-    append_marker(txn, assignment.holderKey, "[assignment opened: #{assignment.id}]")
+    append_notice(txn, assignment.holderKey, "[assignment opened: #{assignment.id}]")
   end
 
   defp append_assignment_marker(txn, assignment, :closed) do
-    append_marker(
+    append_notice(
       txn,
       assignment.holderKey,
       "[assignment closed: #{assignment.id} — #{assignment.outcome}]"
@@ -1967,7 +1967,7 @@ defmodule Tightbeam.Assignments do
   end
 
   defp append_assignment_marker(txn, assignment, :revoked) do
-    append_marker(txn, assignment.holderKey, "[assignment revoked: #{assignment.id}]")
+    append_notice(txn, assignment.holderKey, "[assignment revoked: #{assignment.id}]")
   end
 
   # Carries actor + reason (Sol xhigh review, finding 6) — the plain
@@ -1975,15 +1975,15 @@ defmodule Tightbeam.Assignments do
   # an agent reading its own transcript unable to answer "who reopened this and
   # why" without a separate read, even though the database has both answers.
   defp append_assignment_marker(txn, assignment, :reopened, actor, reason) do
-    append_marker(
+    append_notice(
       txn,
       assignment.holderKey,
       "[assignment reopened: #{assignment.id} by #{actor} — #{reason}]"
     )
   end
 
-  defp append_marker(txn, session_key, text) do
-    best_effort(fn -> Projection.append_marker_in_txn(txn, session_key, text) end)
+  defp append_notice(txn, session_key, text) do
+    best_effort(fn -> Projection.append_substrate_in_txn(txn, session_key, text) end)
   end
 
   defp revoke_allowed?(txn, {:user, user}, assignment) do

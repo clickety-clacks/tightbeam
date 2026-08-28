@@ -1,0 +1,1357 @@
+defmodule Tightbeam.TerminalOperatorDecisionParityTest do
+  use Tightbeam.TestCase, async: false
+
+  alias Tightbeam.{
+    ConnRegistry,
+    DB,
+    Dispatch,
+    Escalation,
+    EventLog,
+    Gateway,
+    Model,
+    Org,
+    StateResources,
+    Wakes
+  }
+
+  defmodule LaneDoorbell do
+    use GenServer
+
+    def start_link(parent),
+      do: GenServer.start_link(__MODULE__, parent, name: Tightbeam.LaneManager)
+
+    def init(parent), do: {:ok, parent}
+
+    def handle_call({:ensure_lane, session_key}, _from, parent) do
+      send(parent, {:lane_nudged, session_key})
+      {:reply, :ok, parent}
+    end
+  end
+
+  setup do
+    db = :"terminal_operator_db_#{System.unique_integer([:positive])}"
+    scheduler = :"terminal_operator_scheduler_#{System.unique_integer([:positive])}"
+    start_supervised!({DB, path: ":memory:", name: db})
+    :ok = ensure_all_schemas(db)
+    ensure_main_session(db, "flynn")
+    raiser = session(db, "raiser", "flynn")
+    start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
+    start_supervised!({LaneDoorbell, self()})
+
+    start_supervised!(
+      {Wakes, db: db, name: scheduler, tick_ms: 60_000, deliver: fn _wake -> :ok end}
+    )
+
+    %{db: db, scheduler: scheduler, raiser: raiser}
+  end
+
+  test "ruled operator list and exact reads share the complete terminal projection", ctx do
+    request =
+      Escalation.operator_ask(
+        ctx.db,
+        ask_call(ctx.raiser, %{
+          question: " choose one ",
+          options: [%{label: "alpha"}, %{label: "beta"}]
+        })
+      )
+
+    rule = rule_call(request.id, %{decision: "alpha"})
+
+    assert %{status: "ruled", decision: "alpha"} =
+             ruled =
+             Escalation.operator_rule(ctx.db, rule, scheduler: ctx.scheduler)
+
+    refute Map.has_key?(ruled, :ruled_via_principal)
+    refute Map.has_key?(ruled, :ruled_via_session_state)
+
+    firehose_item =
+      ctx.db
+      |> Escalation.raw_by_id(request.id)
+      |> StateResources.decision_request()
+
+    assert firehose_item["rulingAttribution"]["performer"]["principal"]["state"] == "known"
+    refute Map.has_key?(firehose_item, "ruledViaPrincipal")
+    refute Map.has_key?(firehose_item, "ruledViaSessionState")
+
+    [listed] = Escalation.list(ctx.db, rule, "ruled", owner_user_id: "flynn")
+    detailed = Escalation.get(ctx.db, rule, request.id, owner_user_id: "flynn")
+
+    assert listed == detailed
+
+    assert %{
+             id: id,
+             kind: "operator",
+             status: "ruled",
+             question: "choose one",
+             options: [%{"label" => "alpha"}, %{"label" => "beta"}],
+             raiser_id: "agent:raiser",
+             raiser_session_key: raiser_key,
+             owner_user_id: "flynn",
+             assignment_id: nil,
+             decision: "alpha",
+             rationale: nil,
+             ruled_by: "user:flynn",
+             ruled_via_session_key: nil,
+             consumed_at: nil,
+             ruling_attribution: %{
+               on_behalf_of: "user:flynn",
+               performer: %{
+                 principal: %{state: "known", value: "user:flynn"},
+                 session: %{state: "none"}
+               }
+             }
+           } = detailed
+
+    assert id == request.id
+    assert raiser_key == ctx.raiser.session_key
+    assert is_integer(detailed.raised_at)
+    assert is_integer(detailed.deadline_at)
+    assert is_integer(detailed.ruled_at)
+    assert is_integer(detailed.ruling_fact_id)
+  end
+
+  test "one automatic condition wake is committed and exact replay creates nothing", ctx do
+    request = Escalation.operator_ask(ctx.db, ask_call(ctx.raiser, %{question: "ship?"}))
+    call = rule_call(request.id, %{response: "yes", rationale: "ordered"})
+
+    first = Escalation.operator_rule(ctx.db, call, scheduler: ctx.scheduler)
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE conditionKind='escalation-ruled' AND conditionScope=?1",
+               [request.id]
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM condition_facts WHERE kind='escalation-ruled' AND scope=?1",
+               [request.id]
+             )
+
+    assert Enum.count(EventLog.lifecycle_events(ctx.db), fn event ->
+             event.kind == "decision_request_ruled" and event.subject == request.id
+           end) == 1
+
+    replay = Escalation.operator_rule(ctx.db, call, scheduler: ctx.scheduler)
+    assert replay.id == first.id
+    assert replay.ruling_fact_id == first.ruling_fact_id
+
+    assert {:ok, [[1, 1, 1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT (SELECT COUNT(*) FROM wakes WHERE conditionKind='escalation-ruled' AND conditionScope=?1), (SELECT COUNT(*) FROM condition_facts WHERE kind='escalation-ruled' AND scope=?1), (SELECT COUNT(*) FROM lifecycle_events WHERE kind='decision_request_ruled' AND subject=?1)",
+               [request.id]
+             )
+
+    assert {:ok, [["fired", fired_at, "condition", prompt]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,firedAt,firedBy,prompt FROM wakes WHERE conditionKind='escalation-ruled' AND conditionScope=?1",
+               [request.id]
+             )
+
+    assert is_integer(fired_at)
+
+    assert prompt ==
+             "Decision request #{request.id} was ruled. Read it with tightbeam decision-request --request #{request.id}."
+  end
+
+  test "exact ruling replay validates a corrupt visible terminal row before interpreting it",
+       ctx do
+    request = Escalation.operator_ask(ctx.db, ask_call(ctx.raiser, %{question: "replay?"}))
+    call = rule_call(request.id, %{decision: "accept"})
+
+    assert %{status: "ruled"} =
+             Escalation.operator_rule(ctx.db, call, scheduler: ctx.scheduler)
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE decision_requests SET options='not-json' WHERE id=?1", [
+               request.id
+             ])
+
+    assert %{code: "decision_request_integrity_invalid", request_id: request_id} =
+             Escalation.operator_rule(ctx.db, call, scheduler: ctx.scheduler)
+
+    assert request_id == request.id
+
+    assert {:ok, [[1, fields]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*),MIN(failingFields) FROM decision_request_integrity_evidence WHERE requestId=?1",
+               [request.id]
+             )
+
+    assert JSON.decode!(fields) == ["options"]
+  end
+
+  test "presenting session is preserved beside the performing principal", ctx do
+    request = Escalation.operator_ask(ctx.db, ask_call(ctx.raiser, %{question: "relay?"}))
+
+    call =
+      rule_call(request.id, %{response: "after 013"})
+      |> Map.put(:transport_session_key, ctx.raiser.session_key)
+
+    assert %{ruled_via_session_key: session_key} =
+             Escalation.operator_rule(ctx.db, call, scheduler: ctx.scheduler)
+
+    assert session_key == ctx.raiser.session_key
+
+    assert %{
+             ruling_attribution: %{
+               performer: %{
+                 principal: %{state: "known", value: "user:flynn"},
+                 session: %{state: "known", key: ^session_key}
+               }
+             }
+           } = Escalation.get(ctx.db, call, request.id, owner_user_id: "flynn")
+  end
+
+  test "visible impossible terminal shape refuses and records privacy-safe evidence", ctx do
+    request = Escalation.operator_ask(ctx.db, ask_call(ctx.raiser, %{question: "tamper?"}))
+    call = rule_call(request.id, %{decision: "accept"})
+    ruled = Escalation.operator_rule(ctx.db, call, scheduler: ctx.scheduler)
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO lifecycle_events (ts, kind, subject, detail) VALUES (?1, 'decision_request_ruled', ?2, NULL)",
+               [System.system_time(:millisecond), request.id]
+             )
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE decision_requests SET options='not-json' WHERE id=?1",
+               [request.id]
+             )
+
+    ensure_main_session(ctx.db, "other")
+    foreign = session(ctx.db, "integrity-foreign", "other")
+    assert [] = Escalation.list(ctx.db, ask_call(foreign, %{}), "ruled")
+    assert nil == Escalation.get(ctx.db, ask_call(foreign, %{}), request.id)
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM decision_request_integrity_evidence WHERE requestId=?1",
+               [request.id]
+             )
+
+    assert %{
+             code: "decision_request_integrity_invalid",
+             request_id: request_id
+           } = Escalation.list(ctx.db, ask_call(ctx.raiser, %{}), "ruled")
+
+    assert request_id == request.id
+
+    assert {:ok, [[1, shape_digest, failing_fields, cause, surface, observer]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*), MIN(shapeDigest), MIN(failingFields), MIN(causeCode), MIN(firstSurface), MIN(observerPrincipal) FROM decision_request_integrity_evidence WHERE requestId=?1",
+               [request.id]
+             )
+
+    assert JSON.decode!(failing_fields) == ["options", "rulingLifecycleEvent"]
+    assert cause == "terminal-shape-invalid"
+    assert surface == "list"
+    assert observer == "session:#{ctx.raiser.session_key}"
+    assert shape_digest == "efa9964d4e3857fc094f9b699b19ac1feb91a30b439236e05572b483cb886403"
+    refute failing_fields =~ "flynn"
+    refute failing_fields =~ "tamper"
+    assert ruled.ruling_fact_id > 0
+  end
+
+  test "integrity descriptor and digest are stable across private values and surfaces", ctx do
+    requests =
+      for question <- ["private alpha?", "private beta?"] do
+        request = invalid_without_event(ctx, question)
+        call = rule_call(request.id, %{decision: "accept"})
+
+        assert %{code: "decision_request_integrity_invalid"} =
+                 Escalation.get(ctx.db, call, request.id, owner_user_id: "flynn")
+
+        request
+      end
+
+    assert %{code: "decision_request_integrity_invalid"} =
+             Escalation.list(
+               ctx.db,
+               rule_call(hd(requests).id, %{decision: "accept"}),
+               "ruled",
+               owner_user_id: "flynn"
+             )
+
+    assert {:ok, evidence_rows} =
+             DB.query(
+               ctx.db,
+               "SELECT requestId,shapeDigest,failingFields FROM decision_request_integrity_evidence ORDER BY requestId"
+             )
+
+    assert [
+             [_first_id, shared_digest, ~s(["rulingLifecycleEvent"])],
+             [_second_id, shared_digest, ~s(["rulingLifecycleEvent"])]
+           ] = evidence_rows
+
+    assert String.match?(shared_digest, ~r/^[0-9a-f]{64}$/)
+  end
+
+  test "integrity descriptor covers member shape equalities states and relation cardinalities",
+       ctx do
+    missing_fact =
+      Escalation.operator_ask(ctx.db, ask_call(ctx.raiser, %{question: "missing fact?"}))
+
+    wrong_kind =
+      Escalation.operator_ask(ctx.db, ask_call(ctx.raiser, %{question: "wrong fact kind?"}))
+
+    for request <- [missing_fact, wrong_kind] do
+      Escalation.operator_rule(
+        ctx.db,
+        rule_call(request.id, %{decision: "accept"}),
+        scheduler: ctx.scheduler
+      )
+    end
+
+    missing_fact_id = ruled_fact_id(ctx.db, missing_fact.id)
+    wrong_kind_id = ruled_fact_id(ctx.db, wrong_kind.id)
+
+    :ok = DB.execute(ctx.db, "DELETE FROM condition_facts WHERE id=#{missing_fact_id}")
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        "UPDATE condition_facts SET kind='operator-decision-ruled' WHERE id=#{wrong_kind_id}"
+      )
+
+    for request <- [missing_fact, wrong_kind] do
+      assert %{code: "decision_request_integrity_invalid"} =
+               Escalation.get(
+                 ctx.db,
+                 rule_call(request.id, %{decision: "accept"}),
+                 request.id,
+                 owner_user_id: "flynn"
+               )
+    end
+
+    assert {:ok, evidence_rows} =
+             DB.query(
+               ctx.db,
+               "SELECT shapeDigest,failingFields FROM decision_request_integrity_evidence WHERE requestId IN (?1,?2) ORDER BY requestId",
+               [missing_fact.id, wrong_kind.id]
+             )
+
+    assert [[missing_digest, fields], [wrong_kind_digest, fields]] = evidence_rows
+    assert JSON.decode!(fields) == ["rulingFactId"]
+    refute missing_digest == wrong_kind_digest
+  end
+
+  test "distinct structural terminal failures produce distinct canonical digests", ctx do
+    null_decision =
+      Escalation.operator_ask(ctx.db, ask_call(ctx.raiser, %{question: "null decision?"}))
+
+    blank_decision =
+      Escalation.operator_ask(ctx.db, ask_call(ctx.raiser, %{question: "blank decision?"}))
+
+    for request <- [null_decision, blank_decision] do
+      Escalation.operator_rule(
+        ctx.db,
+        rule_call(request.id, %{decision: "accept"}),
+        scheduler: ctx.scheduler
+      )
+    end
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        "UPDATE decision_requests SET decision=NULL WHERE id='#{null_decision.id}'"
+      )
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        "UPDATE decision_requests SET decision='' WHERE id='#{blank_decision.id}'"
+      )
+
+    for request <- [null_decision, blank_decision] do
+      assert %{code: "decision_request_integrity_invalid"} =
+               Escalation.get(
+                 ctx.db,
+                 rule_call(request.id, %{decision: "accept"}),
+                 request.id,
+                 owner_user_id: "flynn"
+               )
+    end
+
+    assert {:ok, evidence_rows} =
+             DB.query(
+               ctx.db,
+               "SELECT shapeDigest,failingFields FROM decision_request_integrity_evidence WHERE requestId IN (?1,?2) ORDER BY requestId",
+               [null_decision.id, blank_decision.id]
+             )
+
+    assert [[null_digest, fields], [blank_digest, fields]] = evidence_rows
+    assert JSON.decode!(fields) == ["decision"]
+    refute null_digest == blank_digest
+  end
+
+  test "terminal decision and rationale require normalized stored text", ctx do
+    padded_decision =
+      Escalation.operator_ask(ctx.db, ask_call(ctx.raiser, %{question: "padded decision?"}))
+
+    padded_rationale =
+      Escalation.operator_ask(ctx.db, ask_call(ctx.raiser, %{question: "padded rationale?"}))
+
+    Escalation.operator_rule(
+      ctx.db,
+      rule_call(padded_decision.id, %{decision: "accept"}),
+      scheduler: ctx.scheduler
+    )
+
+    Escalation.operator_rule(
+      ctx.db,
+      rule_call(padded_rationale.id, %{decision: "accept", rationale: "because"}),
+      scheduler: ctx.scheduler
+    )
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        "UPDATE decision_requests SET decision=' accept ' WHERE id='#{padded_decision.id}'"
+      )
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        "UPDATE decision_requests SET rationale=' because ' WHERE id='#{padded_rationale.id}'"
+      )
+
+    for request <- [padded_decision, padded_rationale] do
+      assert %{code: "decision_request_integrity_invalid"} =
+               Escalation.get(
+                 ctx.db,
+                 rule_call(request.id, %{decision: "accept"}),
+                 request.id,
+                 owner_user_id: "flynn"
+               )
+    end
+
+    assert {:ok, evidence_rows} =
+             DB.query(
+               ctx.db,
+               "SELECT requestId,failingFields FROM decision_request_integrity_evidence WHERE requestId IN (?1,?2) ORDER BY requestId",
+               [padded_decision.id, padded_rationale.id]
+             )
+
+    assert Enum.sort(evidence_rows) ==
+             Enum.sort([
+               [padded_decision.id, ~s(["decision"])],
+               [padded_rationale.id, ~s(["rationale"])]
+             ])
+  end
+
+  test "owner attribution requires the stored raiser session", ctx do
+    request =
+      Escalation.operator_ask(ctx.db, ask_call(ctx.raiser, %{question: "owner attribution?"}))
+
+    Escalation.operator_rule(
+      ctx.db,
+      rule_call(request.id, %{decision: "accept"}),
+      scheduler: ctx.scheduler
+    )
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        "UPDATE decision_requests SET raiserSessionKey='' WHERE id='#{request.id}'"
+      )
+
+    assert %{code: "decision_request_integrity_invalid"} =
+             Escalation.get(
+               ctx.db,
+               rule_call(request.id, %{decision: "accept"}),
+               request.id,
+               owner_user_id: "flynn"
+             )
+
+    assert {:ok, [[fields]]} =
+             DB.query(
+               ctx.db,
+               "SELECT failingFields FROM decision_request_integrity_evidence WHERE requestId=?1",
+               [request.id]
+             )
+
+    assert JSON.decode!(fields) == [
+             "ownerOnBehalfOf",
+             "raiserNotificationWake",
+             "requestIdentity"
+           ]
+  end
+
+  test "future incomplete terminal transition is refused by the database trigger", ctx do
+    request = Escalation.operator_ask(ctx.db, ask_call(ctx.raiser, %{question: "trigger?"}))
+
+    for attribution <- [
+          "",
+          ",ruledViaPrincipal='user:flynn'",
+          ",ruledViaPrincipal='user:flynn',ruledViaSessionState='known'",
+          ",ruledViaPrincipal='user:flynn',ruledViaSessionState='none',ruledViaSessionKey='agent:presenter'",
+          ",ruledViaSessionState='none'"
+        ] do
+      assert {:error, %DB.Error{message: message}} =
+               DB.query(
+                 ctx.db,
+                 "UPDATE decision_requests SET status='ruled',decision='accept',ruledBy='user:flynn',ruledAt=1,rulingFactId=1#{attribution} WHERE id=?1",
+                 [request.id]
+               )
+
+      assert message =~ "decision_request_integrity_invalid"
+    end
+
+    assert {:ok, [["open"]]} =
+             DB.query(ctx.db, "SELECT status FROM decision_requests WHERE id=?1", [request.id])
+
+    assert {:error, %DB.Error{message: insert_message}} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO decision_requests (id,kind,raiserId,raiserSessionKey,ownerUserId,raisedAt,deadlineAt,actionKey,question,options,context,status,decision,ruledBy,ruledAt,rulingFactId) VALUES ('dr_incomplete_insert','operator','agent:raiser','agent:raiser:app','flynn',1,2,'insert','insert?','[{\"label\":\"accept\"}]','{}','ruled','accept','user:flynn',1,1)"
+             )
+
+    assert insert_message =~ "decision_request_integrity_invalid"
+  end
+
+  test "ruling wake preserves the request's stored decision duration", ctx do
+    request =
+      Escalation.operator_ask(
+        ctx.db,
+        ask_call(ctx.raiser, %{question: "custom deadline?", deadline: 12_345})
+      )
+
+    ruled =
+      Escalation.operator_rule(
+        ctx.db,
+        rule_call(request.id, %{decision: "accept"}),
+        scheduler: ctx.scheduler
+      )
+
+    assert {:ok, [[due_at]]} =
+             DB.query(
+               ctx.db,
+               "SELECT dueAt FROM wakes WHERE conditionKind='escalation-ruled' AND conditionScope=?1",
+               [request.id]
+             )
+
+    assert due_at == ruled.ruled_at + 12_345
+  end
+
+  test "list validates every admitted invalid row and refuses the lexical first id", ctx do
+    requests =
+      for question <- ["batch one?", "batch two?", "batch three?"] do
+        request = Escalation.operator_ask(ctx.db, ask_call(ctx.raiser, %{question: question}))
+
+        Escalation.operator_rule(
+          ctx.db,
+          rule_call(request.id, %{decision: "accept"}),
+          scheduler: ctx.scheduler
+        )
+
+        request
+      end
+
+    [missing_event, missing_fact, _valid] = requests
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        "DELETE FROM lifecycle_events WHERE kind='decision_request_ruled' AND subject='#{missing_event.id}'"
+      )
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        "DELETE FROM condition_facts WHERE id=#{missing_fact.ruling_fact_id || ruled_fact_id(ctx.db, missing_fact.id)}"
+      )
+
+    expected = Enum.min([missing_event.id, missing_fact.id])
+
+    assert %{code: "decision_request_integrity_invalid", request_id: ^expected} =
+             Escalation.list(
+               ctx.db,
+               rule_call(expected, %{decision: "accept"}),
+               "ruled",
+               owner_user_id: "flynn"
+             )
+
+    assert {:ok, evidence_rows} =
+             DB.query(
+               ctx.db,
+               "SELECT DISTINCT requestId FROM decision_request_integrity_evidence ORDER BY requestId"
+             )
+
+    assert Enum.map(evidence_rows, &hd/1) == Enum.sort([missing_event.id, missing_fact.id])
+  end
+
+  test "visibility precedes validation and hidden dirt writes no evidence", ctx do
+    ensure_main_session(ctx.db, "alice")
+    alice_raiser = session(ctx.db, "alice-raiser", "alice")
+    request = Escalation.operator_ask(ctx.db, ask_call(alice_raiser, %{question: "private?"}))
+    alice_call = rule_call(request.id, %{decision: "accept"}, "alice")
+    Escalation.operator_rule(ctx.db, alice_call, scheduler: ctx.scheduler)
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        "DELETE FROM lifecycle_events WHERE kind='decision_request_ruled' AND subject='#{request.id}'"
+      )
+
+    flynn_call = rule_call(request.id, %{decision: "accept"})
+    assert Escalation.get(ctx.db, flynn_call, request.id, owner_user_id: "flynn") == nil
+
+    refute Enum.any?(
+             Escalation.list(ctx.db, flynn_call, "ruled", owner_user_id: "flynn"),
+             &(&1.id == request.id)
+           )
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM decision_request_integrity_evidence WHERE requestId=?1",
+               [request.id]
+             )
+  end
+
+  test "an unrelated sibling session cannot borrow owner visibility", ctx do
+    reviewer = session(ctx.db, "reviewer", "flynn")
+    request = invalid_without_event(ctx, "sibling private?")
+    reviewer_call = ask_call(reviewer, %{})
+
+    assert Escalation.get(ctx.db, reviewer_call, request.id, owner_user_id: "flynn") == nil
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM decision_request_integrity_evidence WHERE requestId=?1",
+               [request.id]
+             )
+
+    assert %{code: "decision_request_integrity_invalid", request_id: request_id} =
+             Escalation.get(
+               ctx.db,
+               ask_call(ctx.raiser, %{}),
+               request.id,
+               owner_user_id: "flynn"
+             )
+
+    assert request_id == request.id
+  end
+
+  test "legacy attribution remains unknown without inferred owner provenance", ctx do
+    direct = Escalation.operator_ask(ctx.db, ask_call(ctx.raiser, %{question: "legacy direct?"}))
+    via = Escalation.operator_ask(ctx.db, ask_call(ctx.raiser, %{question: "legacy via?"}))
+
+    direct_call = rule_call(direct.id, %{decision: "accept"})
+
+    via_call =
+      Map.put(
+        rule_call(via.id, %{decision: "accept"}),
+        :transport_session_key,
+        ctx.raiser.session_key
+      )
+
+    direct_ruled = Escalation.operator_rule(ctx.db, direct_call, scheduler: ctx.scheduler)
+    via_ruled = Escalation.operator_rule(ctx.db, via_call, scheduler: ctx.scheduler)
+    cutoff = max(direct_ruled.ruling_fact_id, via_ruled.ruling_fact_id)
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        "UPDATE decision_requests SET ruledViaPrincipal=NULL,ruledViaSessionState=NULL WHERE id IN ('#{direct.id}','#{via.id}')"
+      )
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        "UPDATE decision_request_terminal_epoch SET legacyRulingFactMaxId=#{cutoff} WHERE id=0"
+      )
+
+    assert %{
+             ruling_attribution: %{
+               performer: %{
+                 principal: %{state: "legacy-unknown"},
+                 session: %{state: "legacy-unknown"}
+               }
+             }
+           } = Escalation.get(ctx.db, direct_call, direct.id, owner_user_id: "flynn")
+
+    assert %{
+             ruled_via_session_key: session_key,
+             ruling_attribution: %{
+               performer: %{
+                 principal: %{state: "legacy-unknown"},
+                 session: %{state: "known", key: session_key}
+               }
+             }
+           } = Escalation.get(ctx.db, via_call, via.id, owner_user_id: "flynn")
+
+    assert session_key == ctx.raiser.session_key
+  end
+
+  test "impossible consumed operator refuses before generic consumption", ctx do
+    request = Escalation.operator_ask(ctx.db, ask_call(ctx.raiser, %{question: "consume?"}))
+
+    Escalation.operator_rule(ctx.db, rule_call(request.id, %{decision: "accept"}),
+      scheduler: ctx.scheduler
+    )
+
+    :ok = DB.execute(ctx.db, "PRAGMA ignore_check_constraints=ON")
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        "UPDATE decision_requests SET status='consumed',consumedAt=1 WHERE id='#{request.id}'"
+      )
+
+    :ok = DB.execute(ctx.db, "PRAGMA ignore_check_constraints=OFF")
+
+    assert %{code: "decision_request_integrity_invalid", request_id: request_id} =
+             Escalation.consume(ctx.db, request.id)
+
+    assert request_id == request.id
+
+    assert {:ok, [["consumed", 1]]} =
+             DB.query(ctx.db, "SELECT status,consumedAt FROM decision_requests WHERE id=?1", [
+               request.id
+             ])
+  end
+
+  test "evidence conflicts and write failures are typed and prohibit serialization", ctx do
+    conflict_request = invalid_without_event(ctx, "evidence conflict?")
+    call = rule_call(conflict_request.id, %{decision: "accept"})
+
+    assert %{code: "decision_request_integrity_invalid"} =
+             Escalation.get(ctx.db, call, conflict_request.id, owner_user_id: "flynn")
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        "UPDATE decision_request_integrity_evidence SET causeCode='fixture-conflict' WHERE requestId='#{conflict_request.id}'"
+      )
+
+    assert %{code: "decision_request_integrity_evidence_conflict"} =
+             Escalation.get(ctx.db, call, conflict_request.id, owner_user_id: "flynn")
+
+    unavailable_request = invalid_without_event(ctx, "evidence unavailable?")
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        "CREATE TRIGGER refuse_integrity_evidence BEFORE INSERT ON decision_request_integrity_evidence BEGIN SELECT RAISE(ABORT, 'fixture unavailable'); END;"
+      )
+
+    assert %{code: "decision_request_integrity_evidence_unavailable"} =
+             Escalation.get(
+               ctx.db,
+               call,
+               unavailable_request.id,
+               owner_user_id: "flynn"
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM decision_request_integrity_evidence WHERE requestId=?1",
+               [unavailable_request.id]
+             )
+  end
+
+  test "real gateway dispatch preserves ruled list and exact response equality", ctx do
+    handlers = Gateway.handlers(%{db: ctx.db, wake_scheduler: ctx.scheduler, wake_tick_ms: 1_000})
+
+    assert {:ok, %{decision_request: request}} =
+             Dispatch.dispatch(
+               ctx.db,
+               handlers,
+               ask_call(ctx.raiser, %{question: "gateway parity?"})
+             )
+
+    assert {:ok, %{decision_request: %{status: "ruled"}}} =
+             Dispatch.dispatch(
+               ctx.db,
+               handlers,
+               rule_call(request.id, %{response: "yes", rationale: "complete"})
+             )
+
+    read_call = rule_call(request.id, %{decision: "accept"})
+
+    assert {:ok, %{decision_requests: [listed]}} =
+             Dispatch.dispatch(
+               ctx.db,
+               handlers,
+               %{read_call | verb: "decision-requests", params: %{status: "ruled"}}
+             )
+
+    assert {:ok, %{decision_request: detailed}} =
+             Dispatch.dispatch(
+               ctx.db,
+               handlers,
+               %{read_call | verb: "decision-request", params: %{request: request.id}}
+             )
+
+    assert listed == detailed
+  end
+
+  test "a failure after wake and fact creation rolls the full ruling back", ctx do
+    request = Escalation.operator_ask(ctx.db, ask_call(ctx.raiser, %{question: "rollback?"}))
+
+    assert {:ok, [[wake_count, fact_count, event_count]]} =
+             DB.query(
+               ctx.db,
+               "SELECT (SELECT COUNT(*) FROM wakes), (SELECT COUNT(*) FROM condition_facts), (SELECT COUNT(*) FROM lifecycle_events)"
+             )
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        "CREATE TRIGGER refuse_operator_ruling_fixture BEFORE UPDATE OF status ON decision_requests WHEN NEW.kind='operator' AND NEW.status='ruled' BEGIN SELECT RAISE(ABORT, 'fixture rollback'); END;"
+      )
+
+    assert_raise DB.Error, ~r/fixture rollback/, fn ->
+      Escalation.operator_rule(
+        ctx.db,
+        rule_call(request.id, %{decision: "accept"}),
+        scheduler: ctx.scheduler
+      )
+    end
+
+    assert {:ok, [["open", nil, nil, nil, ^wake_count, ^fact_count, ^event_count]]} =
+             DB.query(
+               ctx.db,
+               "SELECT status,decision,ruledAt,rulingFactId, (SELECT COUNT(*) FROM wakes), (SELECT COUNT(*) FROM condition_facts), (SELECT COUNT(*) FROM lifecycle_events) FROM decision_requests WHERE id=?1",
+               [request.id]
+             )
+  end
+
+  test "operator terminal racers preserve one compare-and-set winner in every order", ctx do
+    orders = [
+      [:rule, :withdraw, :supersede],
+      [:rule, :supersede, :withdraw],
+      [:withdraw, :rule, :supersede],
+      [:withdraw, :supersede, :rule],
+      [:supersede, :rule, :withdraw],
+      [:supersede, :withdraw, :rule]
+    ]
+
+    for {order, index} <- Enum.with_index(orders) do
+      request =
+        Escalation.operator_ask(
+          ctx.db,
+          ask_call(ctx.raiser, %{question: "race #{index}?", note: "barrier #{index}"})
+        )
+
+      operations = %{
+        rule: fn ->
+          Escalation.operator_rule(
+            ctx.db,
+            rule_call(request.id, %{decision: "accept"}),
+            scheduler: ctx.scheduler
+          )
+        end,
+        withdraw: fn ->
+          Escalation.operator_withdraw(
+            ctx.db,
+            rule_call(request.id, %{reason: "withdraw winner"})
+          )
+        end,
+        supersede: fn ->
+          Escalation.operator_ask(
+            ctx.db,
+            ask_call(ctx.raiser, %{
+              question: "race #{index} successor?",
+              supersedes: request.id
+            })
+          )
+        end
+      }
+
+      parent = self()
+
+      racers =
+        Map.new(operations, fn {name, operation} ->
+          task =
+            Task.async(fn ->
+              send(parent, {:terminal_racer_ready, request.id, name})
+              assert_receive {:release_terminal_racer, ^name}
+              operation.()
+            end)
+
+          {name, task}
+        end)
+
+      for name <- Map.keys(racers) do
+        assert_receive {:terminal_racer_ready, request_id, ^name}
+        assert request_id == request.id
+      end
+
+      results =
+        Enum.map(order, fn name ->
+          send(racers[name].pid, {:release_terminal_racer, name})
+          Task.await(racers[name])
+        end)
+
+      winner = hd(order)
+      stored = Escalation.raw_by_id(ctx.db, request.id)
+
+      expected_status =
+        case winner do
+          :rule -> "ruled"
+          :withdraw -> "withdrawn"
+          :supersede -> "superseded"
+        end
+
+      assert stored.status == expected_status
+
+      assert Enum.count(results, &(!Map.has_key?(&1, :code))) == 1
+
+      expected_ruling_effects = if winner == :rule, do: 1, else: 0
+
+      assert {:ok,
+              [[^expected_ruling_effects, ^expected_ruling_effects, ^expected_ruling_effects]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT (SELECT COUNT(*) FROM wakes WHERE conditionKind='escalation-ruled' AND conditionScope=?1), (SELECT COUNT(*) FROM condition_facts WHERE kind='escalation-ruled' AND scope=?1), (SELECT COUNT(*) FROM lifecycle_events WHERE kind='decision_request_ruled' AND subject=?1)",
+                 [request.id]
+               )
+    end
+  end
+
+  test "automatic raiser delivery stays at most once across evaluators restart and replay", ctx do
+    request = Escalation.operator_ask(ctx.db, ask_call(ctx.raiser, %{question: "deliver once?"}))
+
+    ruled =
+      Escalation.operator_rule(
+        ctx.db,
+        rule_call(request.id, %{decision: "accept"}),
+        scheduler: ctx.scheduler
+      )
+
+    assert {:ok, [[wake_id, "fired", "condition"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId,state,firedBy FROM wakes WHERE conditionKind='escalation-ruled' AND conditionScope=?1",
+               [request.id]
+             )
+
+    assert turn_count(ctx.db, wake_id) == 1
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        "UPDATE wakes SET state='pending',firedAt=NULL,firedBy=NULL,dueAt=0 WHERE wakeId='#{wake_id}'"
+      )
+
+    tasks =
+      for evaluator <- 1..8 do
+        Task.async(fn ->
+          if rem(evaluator, 2) == 0,
+            do: Wakes.fire_matching(ctx.scheduler, ruled.ruling_fact_id),
+            else: Wakes.fire_due(ctx.scheduler)
+        end)
+      end
+
+    assert Enum.uniq(Task.await_many(tasks)) == [:ok]
+    assert turn_count(ctx.db, wake_id) == 1
+
+    assert :ok = stop_supervised(Wakes)
+
+    start_supervised!(
+      {Wakes, db: ctx.db, name: ctx.scheduler, tick_ms: 60_000, deliver: fn _wake -> :ok end}
+    )
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        "UPDATE wakes SET state='pending',firedAt=NULL,firedBy=NULL,dueAt=0 WHERE wakeId='#{wake_id}'"
+      )
+
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    assert turn_count(ctx.db, wake_id) == 1
+
+    assert {:ok, [["fired", "condition", prompt]]} =
+             DB.query(ctx.db, "SELECT state,firedBy,prompt FROM wakes WHERE wakeId=?1", [wake_id])
+
+    assert prompt ==
+             "Decision request #{request.id} was ruled. Read it with tightbeam decision-request --request #{request.id}."
+  end
+
+  test "manual raiser mitigation never suppresses the automatic ruling wake", ctx do
+    request = Escalation.operator_ask(ctx.db, ask_call(ctx.raiser, %{question: "manual first?"}))
+
+    manual =
+      Wakes.schedule(ctx.db, %{
+        session_key: ctx.raiser.session_key,
+        origin: "agent:intermediary",
+        prompt: "Manual notice for #{request.id}",
+        due_at: 0,
+        target_gate: 0
+      })
+
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    assert %{state: "fired", condition_kind: nil} = Wakes.get(ctx.db, manual.wake_id)
+
+    Escalation.operator_rule(
+      ctx.db,
+      rule_call(request.id, %{decision: "accept"}),
+      scheduler: ctx.scheduler
+    )
+
+    assert {:ok, [[1, automatic_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*),MIN(wakeId) FROM wakes WHERE conditionKind='escalation-ruled' AND conditionScope=?1",
+               [request.id]
+             )
+
+    refute automatic_id == manual.wake_id
+  end
+
+  test "every automatic wake attribute is part of terminal detail integrity", ctx do
+    mutations = [
+      target_session: fn _ -> "sessionKey='agent:wrong:app'" end,
+      origin: fn _ -> "origin='agent:intermediary'" end,
+      prompt: fn _ -> "prompt='wrong prompt'" end,
+      consumer: fn _ -> "consumer='other'" end,
+      condition_kind: fn _ -> "conditionKind='operator-decision-ruled'" end,
+      condition_scope: fn _ -> "conditionScope='dr_wrong_scope'" end,
+      fact_cursor: fn ruled -> "conditionAfterId=#{ruled.ruling_fact_id}" end,
+      creator_session: fn _ -> "creatorSessionKey='agent:wrong:app'" end,
+      fallback_deadline: fn _ -> "dueAt=dueAt+1" end,
+      target_gate: fn _ -> "targetGate=1" end,
+      role_resolution: fn _ ->
+        "targetRole='raiser',reresolve='lineage',reresolveSeed='raiser',reresolveRung=0"
+      end,
+      firing_state: fn _ -> "state='fired',firedBy='fallback'" end
+    ]
+
+    for {name, mutation_for} <- mutations do
+      request =
+        Escalation.operator_ask(
+          ctx.db,
+          ask_call(ctx.raiser, %{question: "wake attribute #{name}?"})
+        )
+
+      ruled =
+        Escalation.operator_rule(
+          ctx.db,
+          rule_call(request.id, %{decision: "accept"}),
+          scheduler: ctx.scheduler
+        )
+
+      mutation = mutation_for.(ruled)
+
+      :ok =
+        DB.execute(
+          ctx.db,
+          "UPDATE wakes SET #{mutation} WHERE conditionKind='escalation-ruled' AND conditionScope='#{request.id}'"
+        )
+
+      assert %{code: "decision_request_integrity_invalid", request_id: request_id} =
+               Escalation.get(
+                 ctx.db,
+                 rule_call(request.id, %{decision: "accept"}),
+                 request.id,
+                 owner_user_id: "flynn"
+               )
+
+      assert request_id == request.id
+
+      assert {:ok, [[~s(["raiserNotificationWake"])]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT failingFields FROM decision_request_integrity_evidence WHERE requestId=?1",
+                 [request.id]
+               )
+    end
+
+    request =
+      Escalation.operator_ask(ctx.db, ask_call(ctx.raiser, %{question: "wake canceled state?"}))
+
+    Escalation.operator_rule(
+      ctx.db,
+      rule_call(request.id, %{decision: "accept"}),
+      scheduler: ctx.scheduler
+    )
+
+    assert {:ok, [[wake_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId FROM wakes WHERE conditionKind='escalation-ruled' AND conditionScope=?1",
+               [request.id]
+             )
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        "UPDATE wakes SET state='pending',firedAt=NULL,firedBy=NULL WHERE wakeId='#{wake_id}'"
+      )
+
+    assert {:ok, true} =
+             DB.transaction(ctx.db, fn txn ->
+               Wakes.cancel_in_txn(txn, %{
+                 wake_id: wake_id,
+                 requester: %{kind: "process", id: "tightbeam:wake-scheduler"},
+                 reason_kind: "consumer_unavailable",
+                 causal_source: %{kind: "scheduler_delivery", id: wake_id},
+                 outcome: %{kind: "no_replacement"}
+               })
+             end)
+
+    assert %{code: "decision_request_integrity_invalid"} =
+             Escalation.get(
+               ctx.db,
+               rule_call(request.id, %{decision: "accept"}),
+               request.id,
+               owner_user_id: "flynn"
+             )
+
+    assert {:ok, [[~s(["raiserNotificationWake"])]]} =
+             DB.query(
+               ctx.db,
+               "SELECT failingFields FROM decision_request_integrity_evidence WHERE requestId=?1",
+               [request.id]
+             )
+  end
+
+  test "atomic ruling failures roll back every ordered step and recover from nudge loss", ctx do
+    failures = [
+      wake:
+        "CREATE TRIGGER terminal_fail_wake BEFORE INSERT ON wakes WHEN NEW.conditionKind='escalation-ruled' BEGIN SELECT RAISE(ABORT,'fail wake'); END;",
+      fact:
+        "CREATE TRIGGER terminal_fail_fact BEFORE INSERT ON condition_facts WHEN NEW.kind='escalation-ruled' BEGIN SELECT RAISE(ABORT,'fail fact'); END;",
+      compare_and_set:
+        "CREATE TRIGGER terminal_fail_cas BEFORE UPDATE OF status ON decision_requests WHEN NEW.kind='operator' AND NEW.status='ruled' BEGIN SELECT RAISE(ABORT,'fail cas'); END;",
+      lifecycle:
+        "CREATE TRIGGER terminal_fail_event BEFORE INSERT ON lifecycle_events WHEN NEW.kind='decision_request_ruled' BEGIN SELECT RAISE(ABORT,'fail event'); END;",
+      validation:
+        "CREATE TRIGGER terminal_fail_validation AFTER INSERT ON lifecycle_events WHEN NEW.kind='decision_request_ruled' BEGIN UPDATE wakes SET origin='agent:wrong' WHERE conditionKind='escalation-ruled' AND conditionScope=NEW.subject; END;"
+    ]
+
+    for {step, trigger} <- failures do
+      request =
+        Escalation.operator_ask(ctx.db, ask_call(ctx.raiser, %{question: "fail #{step}?"}))
+
+      :ok = DB.execute(ctx.db, trigger)
+
+      assert_raise DB.Error, fn ->
+        Escalation.operator_rule(
+          ctx.db,
+          rule_call(request.id, %{decision: "accept"}),
+          scheduler: ctx.scheduler
+        )
+      end
+
+      :ok = DB.execute(ctx.db, "DROP TRIGGER terminal_fail_#{failure_trigger_suffix(step)}")
+
+      assert {:ok, [["open", 0, 0, 0]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT status, (SELECT COUNT(*) FROM wakes WHERE conditionKind='escalation-ruled' AND conditionScope=?1), (SELECT COUNT(*) FROM condition_facts WHERE kind='escalation-ruled' AND scope=?1), (SELECT COUNT(*) FROM lifecycle_events WHERE kind='decision_request_ruled' AND subject=?1) FROM decision_requests WHERE id=?1",
+                 [request.id]
+               )
+    end
+
+    request = Escalation.operator_ask(ctx.db, ask_call(ctx.raiser, %{question: "nudge loss?"}))
+
+    assert catch_exit(
+             Escalation.operator_rule(
+               ctx.db,
+               rule_call(request.id, %{decision: "accept"}),
+               scheduler: :missing_terminal_scheduler
+             )
+           )
+
+    assert {:ok, [["ruled", fact_id, wake_id, "pending"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT d.status,d.rulingFactId,w.wakeId,w.state FROM decision_requests d JOIN wakes w ON w.conditionKind='escalation-ruled' AND w.conditionScope=d.id WHERE d.id=?1",
+               [request.id]
+             )
+
+    assert :ok = Wakes.fire_matching(ctx.scheduler, fact_id)
+    assert %{state: "fired", fired_by: "condition"} = Wakes.get(ctx.db, wake_id)
+    assert turn_count(ctx.db, wake_id) == 1
+  end
+
+  test "joined terminal traces distinguish known legacy condition and fallback paths", ctx do
+    legacy = Escalation.operator_ask(ctx.db, ask_call(ctx.raiser, %{question: "legacy trace?"}))
+
+    legacy_ruled =
+      Escalation.operator_rule(
+        ctx.db,
+        rule_call(legacy.id, %{decision: "accept"}),
+        scheduler: ctx.scheduler
+      )
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        "UPDATE decision_requests SET ruledViaPrincipal=NULL,ruledViaSessionState=NULL WHERE id='#{legacy.id}'"
+      )
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        "UPDATE decision_request_terminal_epoch SET legacyRulingFactMaxId=#{legacy_ruled.ruling_fact_id} WHERE id=0"
+      )
+
+    known = Escalation.operator_ask(ctx.db, ask_call(ctx.raiser, %{question: "known trace?"}))
+
+    known_ruled =
+      Escalation.operator_rule(
+        ctx.db,
+        rule_call(known.id, %{decision: "accept"}),
+        scheduler: ctx.scheduler
+      )
+
+    wrong_name =
+      Wakes.schedule(ctx.db, %{
+        session_key: ctx.raiser.session_key,
+        origin: "process:tightbeam",
+        prompt: "wrong-name fallback",
+        due_at: 0,
+        condition_kind: "operator-decision-ruled",
+        condition_scope: known.id,
+        target_gate: 0
+      })
+
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    assert %{state: "fired", fired_by: "fallback"} = Wakes.get(ctx.db, wrong_name.wake_id)
+
+    invalid = invalid_without_event(ctx, "trace refusal?")
+
+    assert %{code: "decision_request_integrity_invalid"} =
+             Escalation.get(
+               ctx.db,
+               rule_call(invalid.id, %{decision: "accept"}),
+               invalid.id,
+               owner_user_id: "flynn"
+             )
+
+    known_fact_id = known_ruled.ruling_fact_id
+    known_request_id = known.id
+
+    assert {:ok,
+            [
+              [
+                ^known_fact_id,
+                "escalation-ruled",
+                ^known_request_id,
+                1,
+                wake_id,
+                "condition",
+                1
+              ]
+            ]} =
+             DB.query(
+               ctx.db,
+               "SELECT d.rulingFactId,f.kind,f.scope,(SELECT COUNT(*) FROM lifecycle_events e WHERE e.kind='decision_request_ruled' AND e.subject=d.id),w.wakeId,w.firedBy,(SELECT COUNT(*) FROM turns t WHERE t.wakeId=w.wakeId) FROM decision_requests d JOIN condition_facts f ON f.id=d.rulingFactId JOIN wakes w ON w.conditionKind='escalation-ruled' AND w.conditionScope=d.id WHERE d.id=?1",
+               [known.id]
+             )
+
+    assert turn_count(ctx.db, wake_id) == 1
+
+    assert %{
+             ruling_attribution: %{
+               on_behalf_of: "user:flynn",
+               performer: %{
+                 principal: %{state: "known", value: "user:flynn"},
+                 session: %{state: "none"}
+               }
+             }
+           } = Escalation.get(ctx.db, rule_call(known.id, %{}), known.id, owner_user_id: "flynn")
+
+    assert %{
+             ruling_attribution: %{
+               performer: %{
+                 principal: %{state: "legacy-unknown"},
+                 session: %{state: "legacy-unknown"}
+               }
+             }
+           } =
+             Escalation.get(ctx.db, rule_call(legacy.id, %{}), legacy.id, owner_user_id: "flynn")
+
+    assert {:ok, [[1, ~s(["rulingLifecycleEvent"])]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*),MIN(failingFields) FROM decision_request_integrity_evidence WHERE requestId=?1",
+               [invalid.id]
+             )
+  end
+
+  defp session(db, name, owner) do
+    Org.create(db, %{
+      session_key: "agent:#{name}:app",
+      display_name: name,
+      owner_user_id: owner,
+      origin: "user:#{owner}",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("fable")
+    })
+  end
+
+  defp ask_call(session, params) do
+    %{
+      verb: "operator-ask",
+      origin: "agent:raiser",
+      principal: {:session, session.session_key},
+      transport_session_key: session.session_key,
+      params: params
+    }
+  end
+
+  defp rule_call(id, params, owner \\ "flynn") do
+    %{
+      verb: "operator-rule",
+      origin: "user:#{owner}",
+      principal: {:user, owner},
+      transport_session_key: nil,
+      params: Map.put(params, :request, id)
+    }
+  end
+
+  defp invalid_without_event(ctx, question) do
+    request = Escalation.operator_ask(ctx.db, ask_call(ctx.raiser, %{question: question}))
+
+    Escalation.operator_rule(ctx.db, rule_call(request.id, %{decision: "accept"}),
+      scheduler: ctx.scheduler
+    )
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        "DELETE FROM lifecycle_events WHERE kind='decision_request_ruled' AND subject='#{request.id}'"
+      )
+
+    request
+  end
+
+  defp ruled_fact_id(db, request_id) do
+    {:ok, [[fact_id]]} =
+      DB.query(db, "SELECT rulingFactId FROM decision_requests WHERE id=?1", [request_id])
+
+    fact_id
+  end
+
+  defp turn_count(db, wake_id) do
+    {:ok, [[count]]} = DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [wake_id])
+    count
+  end
+
+  defp failure_trigger_suffix(:wake), do: "wake"
+  defp failure_trigger_suffix(:fact), do: "fact"
+  defp failure_trigger_suffix(:compare_and_set), do: "cas"
+  defp failure_trigger_suffix(:lifecycle), do: "event"
+  defp failure_trigger_suffix(:validation), do: "validation"
+end

@@ -13,7 +13,13 @@ defmodule Tightbeam.Visitor.Keyring do
 
   @schema "visitor-keyring-v1"
   @visitor_schema "visitor-principal-v3-v1"
-  @previsitor_schema "coordination-fabric-v1-phase1-v6"
+  @current_previsitor_schema "coordination-fabric-v1-phase1-v8"
+  @previsitor_predecessor_schemas ~w(
+    coordination-fabric-v1-phase1-v7
+    coordination-fabric-v1-phase1-v6
+    coordination-fabric-v1-phase1-v5
+    coordination-fabric-v1-phase1-v4
+  )
   @filename "visitor-keyring-v1.json"
   @derivation_purpose "credential-derivation"
   @digest_purpose "credential-digest"
@@ -306,10 +312,21 @@ defmodule Tightbeam.Visitor.Keyring do
 
   defp database_references(db, phase) when phase in [:before_schema, :after_schema] do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
-      {:ok, [[@visitor_schema]]} -> referenced_rows(db)
-      {:ok, [[@previsitor_schema]]} -> {:ok, empty_references()}
-      {:error, _} when phase == :before_schema -> {:ok, empty_references()}
-      _ -> {:error, :invalid_schema_stamp}
+      {:ok, [[@visitor_schema]]} ->
+        referenced_rows(db)
+
+      {:ok, [[@current_previsitor_schema]]} ->
+        {:ok, empty_references()}
+
+      {:ok, [[shape]]}
+      when phase == :before_schema and shape in @previsitor_predecessor_schemas ->
+        {:ok, empty_references()}
+
+      {:error, _} when phase == :before_schema ->
+        {:ok, empty_references()}
+
+      _ ->
+        {:error, :invalid_schema_stamp}
     end
   end
 

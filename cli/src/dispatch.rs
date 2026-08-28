@@ -416,6 +416,72 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 string_field("action", action),
             ],
         )),
+        Command::OperatorAsk {
+            identity,
+            question,
+            note,
+            options,
+            assignment_id,
+            deadline_ms,
+            supersedes,
+        } => {
+            let mut params = vec![string_field("question", question)];
+            if let Some(value) = note {
+                params.push(string_field("note", value));
+            }
+            if let Some(labels) = options {
+                let options = labels
+                    .iter()
+                    .map(|label| serde_json::json!({"label": label}))
+                    .collect::<Vec<_>>();
+                params.push(format!(
+                    "\"options\":{}",
+                    serde_json::to_string(&options).expect("operator option labels serialize")
+                ));
+            }
+            if let Some(value) = assignment_id {
+                params.push(string_field("assignment", value));
+            }
+            if let Some(value) = deadline_ms {
+                params.push(format!("\"deadline\":{value}"));
+            }
+            if let Some(value) = supersedes {
+                params.push(string_field("supersedes", value));
+            }
+            Ok(request(identity, "operator-ask", vec![], params))
+        }
+        Command::OperatorRule {
+            identity,
+            request_id,
+            decision,
+            response,
+            rationale,
+        } => {
+            let mut params = vec![string_field("request", request_id)];
+            if let Some(value) = decision {
+                params.push(string_field("decision", value));
+            }
+            if let Some(value) = response {
+                params.push(string_field("response", value));
+            }
+            if let Some(value) = rationale {
+                params.push(string_field("rationale", value));
+            }
+            Ok(request(identity, "operator-rule", vec![], params))
+        }
+        Command::OperatorWithdraw {
+            identity,
+            request_id,
+            reason,
+        } => Ok(request(
+            identity,
+            "operator-withdraw",
+            vec![],
+            vec![
+                string_field("request", request_id),
+                string_field("reason", reason),
+            ],
+        )),
         Command::DecisionRequests { identity, status } => {
             let mut params = Vec::new();
             if let Some(value) = status {
@@ -502,6 +568,37 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 string_field("reason", reason),
             ],
         )),
+        Command::RepairAssignment {
+            identity,
+            assignment_id,
+            action,
+            model,
+            effort,
+            context,
+            outcome,
+            turn_seq,
+            idempotency_key,
+        } => {
+            let mut params = vec![
+                string_field("assignmentId", assignment_id),
+                string_field("action", action),
+                string_field("idempotencyKey", idempotency_key),
+            ];
+            for (name, value) in [
+                ("model", model),
+                ("effort", effort),
+                ("context", context),
+                ("outcome", outcome),
+            ] {
+                if let Some(value) = value {
+                    params.push(string_field(name, value));
+                }
+            }
+            if let Some(value) = turn_seq {
+                params.push(format!("\"turnSeq\":{value}"));
+            }
+            Ok(request(identity, "repair-assignment", vec![], params))
+        }
         Command::WorkItemCreate {
             identity,
             title,
@@ -1539,6 +1636,9 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::Assign { identity, .. }
         | Command::Dispatch { identity, .. }
         | Command::EffortRule { identity, .. }
+        | Command::OperatorAsk { identity, .. }
+        | Command::OperatorRule { identity, .. }
+        | Command::OperatorWithdraw { identity, .. }
         | Command::DecisionRequests { identity, .. }
         | Command::DecisionRequest { identity, .. }
         | Command::Ask { identity, .. }
@@ -1546,6 +1646,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::ReturnRequest { identity, .. }
         | Command::RevokeAssignment { identity, .. }
         | Command::ReopenAssignment { identity, .. }
+        | Command::RepairAssignment { identity, .. }
         | Command::WorkItemCreate { identity, .. }
         | Command::WorkItemGet { identity, .. }
         | Command::WorkItemTrace { identity, .. }
@@ -2367,8 +2468,14 @@ mod tests {
             r#"{"as":"parent","verb":"decision-requests","params":{"status":"open"}}"#
         );
         assert_eq!(
-            body(&["decision-request", "--request", "dr_1", "--as", "parent",]),
-            r#"{"as":"parent","verb":"decision-request","params":{"request":"dr_1"}}"#
+            body(&[
+                "decision-request",
+                "--request",
+                "dr_12345678-1234-4234-9234-123456789abc",
+                "--as",
+                "parent",
+            ]),
+            r#"{"as":"parent","verb":"decision-request","params":{"request":"dr_12345678-1234-4234-9234-123456789abc"}}"#
         );
         assert_eq!(
             body(&["revoke-assignment", "asg_1", "--as", "parent",]),

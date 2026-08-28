@@ -13,6 +13,13 @@ defmodule Tightbeam.Visitor.KeyringTest do
   @retained_digest :binary.copy(<<0x44>>, 32)
   @retained_derivation_id "vdk_retained"
   @retained_digest_id "vgk_retained"
+  @current_previsitor_schema "coordination-fabric-v1-phase1-v8"
+  @previsitor_predecessor_schemas ~w(
+    coordination-fabric-v1-phase1-v7
+    coordination-fabric-v1-phase1-v6
+    coordination-fabric-v1-phase1-v5
+    coordination-fabric-v1-phase1-v4
+  )
 
   setup do
     base = Path.join(System.tmp_dir!(), "tightbeam-keyring-#{System.unique_integer([:positive])}")
@@ -233,6 +240,51 @@ defmodule Tightbeam.Visitor.KeyringTest do
     GenServer.stop(db)
   end
 
+  test "A18 Boot admits the captured v5 predecessor before migration and locks the keyring after it",
+       ctx do
+    write_keyring(ctx.path)
+    source = Path.join([__DIR__, "fixtures", "cold_start", "v5-healthy", "state.db"])
+    target = Path.join(ctx.base, "captured-v5.db")
+    File.cp!(source, target)
+    db = start_db(target, "captured_v5")
+
+    assert {:ok, [["coordination-fabric-v1-phase1-v5"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert :ok = Boot.load_visitor_keyring!(ctx.base, db, phase: :before_schema)
+    assert %Keyring{} = Keyring.current!()
+    assert :ok = Boot.ensure_schema!(db)
+
+    assert {:ok, [[@current_previsitor_schema]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert :ok = Boot.load_visitor_keyring!(ctx.base, db, phase: :after_schema)
+    assert Keyring.key_ids(Keyring.current!()) == [@derivation_id, @digest_id]
+
+    GenServer.stop(db)
+  end
+
+  test "A18 Boot admits only the current lawful predecessor chain before schema migration", ctx do
+    write_keyring(ctx.path)
+
+    Enum.each(@previsitor_predecessor_schemas, fn shape ->
+      db = start_stamped_db(ctx.base, shape)
+
+      assert :ok = Boot.load_visitor_keyring!(ctx.base, db, phase: :before_schema)
+
+      assert_raise UnavailableError, ~r/database_references/, fn ->
+        Boot.load_visitor_keyring!(ctx.base, db, phase: :after_schema)
+      end
+
+      GenServer.stop(db)
+    end)
+
+    current = start_stamped_db(ctx.base, @current_previsitor_schema)
+    assert :ok = Boot.load_visitor_keyring!(ctx.base, current, phase: :before_schema)
+    assert :ok = Boot.load_visitor_keyring!(ctx.base, current, phase: :after_schema)
+    GenServer.stop(current)
+  end
+
   test "A18 missing pair half, symlink, wrong owner, and unsafe modes all refuse one redacted class",
        ctx do
     uid = File.stat!(ctx.secrets).uid
@@ -377,8 +429,7 @@ defmodule Tightbeam.Visitor.KeyringTest do
   end
 
   defp start_reference_db(path, suffix) do
-    name = :"visitor_keyring_#{suffix}_#{System.unique_integer([:positive])}"
-    {:ok, db} = DB.start_link(path: path, name: name)
+    db = start_db(path, suffix)
 
     if suffix == "original" do
       :ok =
@@ -402,6 +453,23 @@ defmodule Tightbeam.Visitor.KeyringTest do
         )
     end
 
+    db
+  end
+
+  defp start_stamped_db(base, shape) do
+    path = Path.join(base, "#{shape}-#{System.unique_integer([:positive])}.db")
+    db = start_db(path, "stamped")
+    :ok = DB.execute(db, "CREATE TABLE schema_stamp (shape TEXT PRIMARY KEY, stampedAt INTEGER)")
+
+    {:ok, []} =
+      DB.query(db, "INSERT INTO schema_stamp (shape, stampedAt) VALUES (?1, 0)", [shape])
+
+    db
+  end
+
+  defp start_db(path, suffix) do
+    name = :"visitor_keyring_#{suffix}_#{System.unique_integer([:positive])}"
+    {:ok, db} = DB.start_link(path: path, name: name)
     db
   end
 

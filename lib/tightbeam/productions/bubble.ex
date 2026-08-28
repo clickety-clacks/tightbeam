@@ -29,7 +29,17 @@ defmodule Tightbeam.Productions.Bubble do
   capacity exists, and retracts it. Recovery is recognized, never declared.
   """
 
-  alias Tightbeam.{ConditionFacts, ConnRegistry, DB, EventLog, Gateway, Org, Projection}
+  alias Tightbeam.{
+    ConditionFacts,
+    ConnRegistry,
+    DB,
+    EventLog,
+    Gateway,
+    HarnessHealth,
+    Org,
+    Projection
+  }
+
   alias Tightbeam.Wire.Payloads
 
   require Logger
@@ -100,8 +110,15 @@ defmodule Tightbeam.Productions.Bubble do
   @spec bubble_production_matches?(DB.server(), String.t(), map()) :: boolean()
   def bubble_production_matches?(db, terminal, turn) do
     terminal_admits?(terminal, turn.notice?) and
-      not ConditionFacts.standing?(db, "user-alerted", turn.owner)
+      not ConditionFacts.standing?(db, "user-alerted", turn.owner) and
+      not harness_unavailable?(db, turn)
   end
+
+  defp harness_unavailable?(db, %{harness: harness, host: host})
+       when is_binary(harness) and is_binary(host),
+       do: HarnessHealth.unavailable?(db, harness, host)
+
+  defp harness_unavailable?(_db, _legacy_turn), do: false
 
   defp terminal_admits?(terminal, notice?) do
     if notice?,
@@ -214,7 +231,9 @@ defmodule Tightbeam.Productions.Bubble do
         # the alert becomes product surface when a main session exists.
         case DB.Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey = ?1", [main_key]) do
           [["active"]] ->
-            {:appended, marker} = Projection.append_marker_in_txn(txn, main_key, message, :high)
+            {:appended, marker} =
+              Projection.append_substrate_in_txn(txn, main_key, message, :high)
+
             Tightbeam.Firehose.Publisher.message_in_txn(txn, main_key, marker, turn.owner)
             {:ok, marker}
 
@@ -269,7 +288,7 @@ defmodule Tightbeam.Productions.Bubble do
       DB.query(
         db,
         """
-        SELECT t.sessionKey, t.requestRef, s.ownerUserId, t.status
+        SELECT t.sessionKey, t.requestRef, s.ownerUserId, t.status, s.harness, s.host
         FROM turns AS t JOIN sessions AS s ON s.sessionKey = t.sessionKey
         WHERE t.seq = ?1
         """,
@@ -277,7 +296,7 @@ defmodule Tightbeam.Productions.Bubble do
       )
 
     case rows do
-      [[session_key, request_ref, owner, status]] ->
+      [[session_key, request_ref, owner, status, current_harness, current_host]] ->
         case parse_cause_seq(request_ref, seq) do
           :malformed ->
             Logger.error(
@@ -290,12 +309,24 @@ defmodule Tightbeam.Productions.Bubble do
             nil
 
           {kind, cause_seq} ->
+            {harness, host} =
+              if kind == :notice do
+                case cause_row(db, cause_seq) do
+                  {:ok, cause} -> {cause.harness, cause.host}
+                  :missing -> {current_harness, current_host}
+                end
+              else
+                {current_harness, current_host}
+              end
+
             %{
               session_key: session_key,
               owner: owner,
               status: status,
               cause_seq: cause_seq,
-              notice?: kind == :notice
+              notice?: kind == :notice,
+              harness: harness,
+              host: host
             }
         end
 
@@ -322,11 +353,22 @@ defmodule Tightbeam.Productions.Bubble do
   # truth to a parent or a user.
   defp cause_row(db, cause_seq) do
     {:ok, rows} =
-      DB.query(db, "SELECT sessionKey, error FROM turns WHERE seq = ?1", [cause_seq])
+      DB.query(
+        db,
+        """
+        SELECT t.sessionKey,t.error,s.harness,s.host
+        FROM turns t JOIN sessions s ON s.sessionKey=t.sessionKey
+        WHERE t.seq=?1
+        """,
+        [cause_seq]
+      )
 
     case rows do
-      [[session_key, error]] -> {:ok, %{session_key: session_key, error: error}}
-      [] -> :missing
+      [[session_key, error, harness, host]] ->
+        {:ok, %{session_key: session_key, error: error, harness: harness, host: host}}
+
+      [] ->
+        :missing
     end
   end
 

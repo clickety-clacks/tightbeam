@@ -27,7 +27,7 @@ The authority is `visitor-principal-v3.md` at tightbeam-specs commit
 | A15 | Broker authority and pending limit | Required; not implemented | — |
 | A16 | Known-denial audit and public absence | Required; not implemented | — |
 | A17 | Wire, discovery, and secret input | Required; not implemented | — |
-| A18 | Keyring restart, backup, and missing-key refusal | Automated for Card 1 keyring initialization, boot loading, typed database-key references, restart, pair restore, deterministic retry/authentication, missing-half refusal, filesystem safety, and secret non-disclosure. Visitor routes remain absent until later cards. | `cli/src/visitor.rs`, `cli/tests/visitor_keyring.rs`, `test/visitor_keyring_test.exs` |
+| A18 | Keyring restart, backup, and missing-key refusal | Automated for Card 1 keyring initialization, pre-migration loading across the current lawful schema predecessor chain, post-migration locking, typed database-key references, restart, pair restore, deterministic retry/authentication, missing-half refusal, filesystem safety, and secret non-disclosure. Visitor routes remain absent until later cards. | `cli/src/visitor.rs`, `cli/tests/visitor_keyring.rs`, `test/visitor_keyring_test.exs` |
 | A19 | Scoped operation collisions | Required; not implemented | — |
 | A20 | Terminal transition closure | Required; not implemented | — |
 | A21 | Realized intermediary collision cannot recur | Required; not implemented | — |
