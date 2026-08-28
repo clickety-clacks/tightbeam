@@ -1549,8 +1549,21 @@ fn print_current_session_identity() -> Result<(), String> {
 fn current_session_key_from(cwd: &Path) -> Result<String, String> {
     for directory in cwd.ancestors() {
         let path = directory.join(".tightbeam-session");
-        if !path.exists() {
-            continue;
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!(
+                    "malformed session file '{}': {error}",
+                    path.display()
+                ));
+            }
+        };
+        if !metadata.file_type().is_file() {
+            return Err(format!(
+                "malformed session file '{}': expected a regular file",
+                path.display()
+            ));
         }
 
         let encoded = fs::read_to_string(&path)
@@ -2737,6 +2750,33 @@ mod tests {
             current_session_key_from(&cwd),
             Ok("agent:coder:x s_nested".to_owned())
         );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_identity_refuses_a_broken_nearest_session_marker() {
+        use std::os::unix::fs::symlink;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("tightbeam_cli_broken_identity_{unique}"));
+        let nested = root.join("nested");
+        let cwd = nested.join("work");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::write(
+            root.join(".tightbeam-session"),
+            r#"{"sessionKey":"agent:coder:x s_ancestor"}"#,
+        )
+        .unwrap();
+        symlink("missing-session.json", nested.join(".tightbeam-session")).unwrap();
+
+        let error = current_session_key_from(&cwd).unwrap_err();
+        assert!(error.contains("expected a regular file"));
+        assert!(error.contains(&nested.join(".tightbeam-session").display().to_string()));
 
         fs::remove_dir_all(root).unwrap();
     }
