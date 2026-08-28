@@ -1171,6 +1171,70 @@ defmodule Tightbeam.RulesTest do
     assert review_count(ctx.db, producer.id) == 1
   end
 
+  test "shipped review receipt rail follows the producer effect, not its holder or label", ctx do
+    reviewer = session(ctx.db, "effect-reviewer", "reviewer", archetype: "reviewer")
+
+    {:ok, _} =
+      DB.query(ctx.db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1)")
+
+    put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    cases = [
+      {"code held by coder", "coder", "code", true},
+      {"code held by product owner", "product-owner", "code", true},
+      {"policy held by product owner", "product-owner", "policy", false},
+      {"policy held by coder", "coder", "policy", false},
+      {"documentation classified as policy", "coder", "policy", false}
+    ]
+
+    for {label, holder_archetype, effect_kind, needs_receipt?} <- cases do
+      holder =
+        session(ctx.db, "effect-holder-#{label}", "flynn", archetype: holder_archetype)
+
+      producer =
+        assignment(ctx, holder.session_key, {:user, "flynn"},
+          effect_kind: effect_kind,
+          subject: label
+        )
+
+      review_call =
+        p3_call("assign", {:user, "reviewer"}, %{
+          subject: "review #{label}",
+          reviews_assignment_id: producer.id,
+          idempotency_key: nil,
+          files: nil
+        })
+        |> Map.put(:session_key, reviewer.session_key)
+
+      if needs_receipt? do
+        assert {:error,
+                %{
+                  code: "rule_denied",
+                  rule: "code-review-requires-passing-tests",
+                  ref: producer_id
+                }} = Dispatch.dispatch(ctx.db, ctx.handlers, review_call)
+
+        assert producer_id == producer.id
+        assert review_count(ctx.db, producer.id) == 0
+
+        verdict(
+          ctx,
+          holder.session_key,
+          producer.id,
+          "tests-passed",
+          "gibson:/repo effect123; mix test test/rules_test.exs; passed: #{label}"
+        )
+      end
+
+      assert {:ok, %{reviewsAssignmentId: producer_id, effectKind: "review"}} =
+               Dispatch.dispatch(ctx.db, ctx.handlers, review_call)
+
+      assert producer_id == producer.id
+      assert review_count(ctx.db, producer.id) == 1
+    end
+  end
+
   test "shipped completion remedy waits for the holder receipt and creates one review", ctx do
     holder = session(ctx.db, "receipt-remedy-holder", "flynn", archetype: "coder")
     reviewer = session(ctx.db, "receipt-remedy-reviewer", "flynn", archetype: "reviewer")
@@ -1238,7 +1302,9 @@ defmodule Tightbeam.RulesTest do
     reviewer = session(ctx.db, "receipt-exempt-reviewer", "reviewer", archetype: "reviewer")
     closed = assignment(ctx, coder.session_key, {:user, "flynn"})
     open_coder = assignment(ctx, coder.session_key, {:user, "flynn"})
-    noncode = assignment(ctx, noncoder.session_key, {:user, "flynn"})
+
+    policy =
+      assignment(ctx, noncoder.session_key, {:user, "flynn"}, effect_kind: "policy")
 
     orchestration =
       assignment(ctx, noncoder.session_key, {:user, "flynn"}, effect_kind: "evidence")
@@ -1290,7 +1356,7 @@ defmodule Tightbeam.RulesTest do
     assert {:ok, %{reviewsAssignmentId: nil}} =
              Dispatch.dispatch(ctx.db, ctx.handlers, ordinary)
 
-    for producer <- [noncode, closed] do
+    for producer <- [policy, closed] do
       call =
         p3_call("assign", {:user, "reviewer"}, %{
           subject: "exempt review",
@@ -1334,7 +1400,7 @@ defmodule Tightbeam.RulesTest do
   defp assignment(ctx, holder_key, opener, opts \\ []) do
     call =
       p3_call("assign", opener, %{
-        subject: "P3 assignment #{System.unique_integer([:positive])}",
+        subject: opts[:subject] || "P3 assignment #{System.unique_integer([:positive])}",
         idempotency_key: nil,
         reviews_assignment_id: opts[:reviews],
         effect_kind: opts[:effect_kind],
