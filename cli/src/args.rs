@@ -726,9 +726,10 @@ COMMANDS:
       tune also requires --model; rerun requires --outcome not-completed.
   attest <assignmentId> --kind progress|completion|surrender|verdict
       [--commit-refs '[{"repo":"host:/abs/path","commit":"<commit>"}]']
-         [--verdict <kind>] [--note "..."]
+         [--verdict <kind>] [--note "..."] [--key <idempotencyKey>]
       File against an assignment. Verdicts on review cards require the review
-      holder; producer-card verdicts may be filed by any session or user.
+      holder; producer-card verdicts may be filed by any session or user. A key
+      is valid only for completion.
   attests <assignmentId> [--after <attestId>] [--limit <n>]
       List every attest filed against an assignment. Without --limit you get
       all of them: an audit list that shortens itself silently is worse than a
@@ -2588,6 +2589,13 @@ mod tests {
             !entry.contains("DISCOVERY:") && !entry.contains("  doctor "),
             "the entry must stop at its own last line: {entry}"
         );
+    }
+
+    #[test]
+    fn attest_help_names_completion_idempotency_key() {
+        let entry = render_command_help(None, "attest").unwrap();
+        assert!(entry.contains("[--key <idempotencyKey>]"));
+        assert!(entry.contains("A key\n      is valid only for completion."));
     }
 
     #[test]

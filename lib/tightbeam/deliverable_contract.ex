@@ -150,9 +150,7 @@ defmodule Tightbeam.DeliverableContract do
   def ensure_schema(db \\ Tightbeam.DB) do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
       {:ok, [[@shape]]} ->
-        if contract_objects_present?(db),
-          do: validate_existing_schema!(db),
-          else: create_and_validate_schema!(db)
+        validate_existing_schema!(db)
 
       {:ok, [[_predecessor]]} ->
         :ok
@@ -165,28 +163,18 @@ defmodule Tightbeam.DeliverableContract do
     end
   end
 
+  @doc false
+  def bootstrap_schema(db \\ Tightbeam.DB), do: create_and_validate_schema!(db)
+
   defp create_and_validate_schema!(db) do
     Enum.each(@ddl, fn ddl -> :ok = DB.execute(db, ddl) end)
     validate_existing_schema!(db)
   end
 
-  defp contract_objects_present?(db) do
-    placeholders = Enum.map_join(@contract_objects, ",", fn _ -> "?" end)
-
-    case DB.query(
-           db,
-           "SELECT 1 FROM sqlite_master WHERE name IN (#{placeholders}) LIMIT 1",
-           @contract_objects
-         ) do
-      {:ok, []} -> false
-      {:ok, [[1]]} -> true
-    end
-  end
-
   defp validate_existing_schema!(db) do
     case DB.transaction(db, fn txn ->
            require_complete_schema!(txn)
-           validate_in_txn!(txn)
+           validate_in_txn!(txn, true)
          end) do
       {:ok, :ok} -> :ok
       {:error, %Inconsistent{} = error} -> raise error
@@ -959,7 +947,7 @@ defmodule Tightbeam.DeliverableContract do
     error in MutationError -> inconsistent!(error.response.message)
   end
 
-  defp validate_in_txn!(txn, verify_product_owners \\ false) do
+  defp validate_in_txn!(txn, verify_product_owners) do
     validate_hashes!(txn)
     validate_cardinality!(txn)
     validate_bindings!(txn)

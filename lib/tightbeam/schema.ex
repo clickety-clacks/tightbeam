@@ -941,10 +941,14 @@ defmodule Tightbeam.Schema do
   @spec ensure_all(DB.server()) :: :ok
   def ensure_all(db) do
     :ok = ensure_stamp_table(db)
-    :ok = check_shape(db)
+    shape_state = check_shape(db)
 
     Enum.each(@schema_modules, fn module ->
-      :ok = module.ensure_schema(db)
+      if shape_state == :fresh and module == Tightbeam.DeliverableContract do
+        :ok = Tightbeam.DeliverableContract.bootstrap_schema(db)
+      else
+        :ok = module.ensure_schema(db)
+      end
     end)
 
     :ok = Tightbeam.Escalation.ensure_terminal_epoch(db)
@@ -1669,12 +1673,15 @@ defmodule Tightbeam.Schema do
   # database" sharing one representation.
   #
   # Stamping first cannot lose that way. Interrupted after the stamp, the next
-  # boot reads its own shape and carries on creating what is missing, which is
-  # exactly what `CREATE TABLE IF NOT EXISTS` is for.
+  # boot reads its own shape. Ordinary additive schema creation can continue,
+  # while a contract whose accepted stamp requires an all-or-nothing object set
+  # refuses any missing object instead of silently recreating authoritative
+  # state.
   defp unstamped(db) do
     case DB.query(db, "SELECT name FROM sqlite_master WHERE type='table' AND name='sessions'") do
       {:ok, []} ->
-        stamp(db)
+        :ok = stamp(db)
+        :fresh
 
       {:ok, [_ | _]} ->
         raise ShapeError, """
