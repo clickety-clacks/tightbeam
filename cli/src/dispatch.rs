@@ -4,10 +4,11 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use crate::args::{Command, Identity, Target, ToplineSelection, TuneControl};
+use crate::args::{ActivationCommand, Command, Identity, Target, ToplineSelection, TuneControl};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestSpec {
+    pub method: &'static str,
     pub path: &'static str,
     pub body_json: String,
 }
@@ -70,6 +71,240 @@ fn string_field(name: &str, value: &str) -> String {
     format!("\"{name}\":{}", quoted(value))
 }
 
+fn json_field(name: &str, value: &Value) -> String {
+    format!(
+        "\"{name}\":{}",
+        serde_json::to_string(value).expect("parsed JSON serializes")
+    )
+}
+
+fn optional_string_field(fields: &mut Vec<String>, name: &str, value: &Option<String>) {
+    if let Some(value) = value {
+        fields.push(string_field(name, value));
+    }
+}
+
+fn activation_request(identity: &Identity, command: &ActivationCommand) -> RequestSpec {
+    let (verb, params) = match command {
+        ActivationCommand::Declare {
+            assignment,
+            owner,
+            domain,
+            correlation,
+            input,
+            target,
+            prior,
+            relation,
+            key,
+        } => {
+            let mut params = vec![
+                string_field("rootAssignmentId", assignment),
+                string_field("ownerUserId", owner),
+                string_field("domain", domain),
+                string_field("correlationKey", correlation),
+                json_field("preparedInput", input),
+                json_field("target", target),
+                string_field("idempotencyKey", key),
+            ];
+            optional_string_field(&mut params, "priorActivationId", prior);
+            optional_string_field(&mut params, "relation", relation);
+            ("activation-declare", params)
+        }
+        ActivationCommand::Authority {
+            activation,
+            after,
+            assignment,
+            authorizer,
+            basis,
+            decision,
+            key,
+        } => {
+            let mut params = vec![
+                string_field("activationId", activation),
+                string_field("predecessorEventId", after),
+                json_field("authorizer", authorizer),
+                json_field("basis", basis),
+                json_field("decision", decision),
+                string_field("idempotencyKey", key),
+            ];
+            optional_string_field(&mut params, "actorAssignmentId", assignment);
+            ("activation-authority", params)
+        }
+        ActivationCommand::Attempt {
+            activation,
+            after,
+            assignment,
+            authority_events,
+            executor,
+            external_attempt,
+            target_state_before,
+            key,
+        } => (
+            "activation-attempt",
+            vec![
+                string_field("activationId", activation),
+                string_field("predecessorEventId", after),
+                string_field("actorAssignmentId", assignment),
+                json_field("authorityEventIds", &serde_json::json!(authority_events)),
+                json_field("executor", executor),
+                json_field("externalAttempt", external_attempt),
+                json_field("targetStateBefore", target_state_before),
+                string_field("idempotencyKey", key),
+            ],
+        ),
+        ActivationCommand::Observe {
+            activation,
+            after,
+            assignment,
+            attempt,
+            certainty,
+            result,
+            target_state_after,
+            outputs,
+            evidence,
+            external_occurred_at,
+            key,
+        } => {
+            let mut params = recovery_params(
+                activation,
+                after,
+                assignment,
+                certainty,
+                result,
+                target_state_after,
+                outputs,
+                evidence,
+                external_occurred_at,
+                key,
+            );
+            params.push(string_field("attemptEventId", attempt));
+            ("activation-observe", params)
+        }
+        ActivationCommand::Reconcile {
+            activation,
+            after,
+            assignment,
+            observation,
+            certainty,
+            result,
+            target_state_after,
+            outputs,
+            evidence,
+            external_occurred_at,
+            key,
+        } => {
+            let mut params = recovery_params(
+                activation,
+                after,
+                assignment,
+                certainty,
+                result,
+                target_state_after,
+                outputs,
+                evidence,
+                external_occurred_at,
+                key,
+            );
+            params.push(string_field("observedEventId", observation));
+            ("activation-reconcile", params)
+        }
+        ActivationCommand::Withdraw {
+            activation,
+            after,
+            assignment,
+            reason,
+            basis,
+            key,
+        } => {
+            let mut params = vec![
+                string_field("activationId", activation),
+                string_field("predecessorEventId", after),
+                json_field("reason", reason),
+                json_field("basis", basis),
+                string_field("idempotencyKey", key),
+            ];
+            optional_string_field(&mut params, "actorAssignmentId", assignment);
+            ("activation-withdraw", params)
+        }
+        ActivationCommand::Renotify {
+            activation,
+            after,
+            noticed_event,
+            replaces_wake,
+            key,
+        } => (
+            "activation-renotify",
+            vec![
+                string_field("activationId", activation),
+                string_field("predecessorEventId", after),
+                string_field("noticedEventId", noticed_event),
+                string_field("replacesWakeId", replaces_wake),
+                string_field("idempotencyKey", key),
+            ],
+        ),
+        ActivationCommand::Ack {
+            activation,
+            after,
+            noticed_event,
+            wake,
+            key,
+        } => (
+            "activation-ack",
+            vec![
+                string_field("activationId", activation),
+                string_field("predecessorEventId", after),
+                string_field("noticedEventId", noticed_event),
+                string_field("acknowledgedWakeId", wake),
+                string_field("idempotencyKey", key),
+            ],
+        ),
+        ActivationCommand::Status { activation } => (
+            "activation-status",
+            vec![string_field("activationId", activation)],
+        ),
+        ActivationCommand::List {
+            assignment,
+            work_item,
+            correlation,
+        } => {
+            let mut params = Vec::new();
+            optional_string_field(&mut params, "assignmentId", assignment);
+            optional_string_field(&mut params, "workItemId", work_item);
+            optional_string_field(&mut params, "correlationKey", correlation);
+            ("activations", params)
+        }
+    };
+    request(identity, verb, vec![], params)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn recovery_params(
+    activation: &str,
+    after: &str,
+    assignment: &Option<String>,
+    certainty: &str,
+    result: &Value,
+    target_state_after: &Value,
+    outputs: &Value,
+    evidence: &Value,
+    external_occurred_at: &Value,
+    key: &str,
+) -> Vec<String> {
+    let mut params = vec![
+        string_field("activationId", activation),
+        string_field("predecessorEventId", after),
+        string_field("certainty", certainty),
+        json_field("result", result),
+        json_field("targetStateAfter", target_state_after),
+        json_field("outputs", outputs),
+        json_field("evidence", evidence),
+        json_field("externalOccurredAtMs", external_occurred_at),
+        string_field("idempotencyKey", key),
+    ];
+    optional_string_field(&mut params, "actorAssignmentId", assignment);
+    params
+}
+
 /// Roster filters, shared verbatim by `toplines` and `topline --under` — the
 /// spec says "the same roster filters", so there is one builder, not two lists.
 fn filter_params(filters: &crate::args::ToplineFilters) -> Vec<String> {
@@ -107,6 +342,7 @@ fn request(
     body.append(&mut fields);
     body.push(params_field(params));
     RequestSpec {
+        method: "POST",
         path: "/agent/dispatch",
         body_json: object(body),
     }
@@ -210,10 +446,12 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             }
             Ok(request(identity, "artifacts", vec![], params))
         }
+        Command::Activation { identity, command } => Ok(activation_request(identity, command)),
         // Not a verb and not on /agent/dispatch: it changes no domain state, it
         // tells the gateway to look at this session's running turn NOW, while the
         // command it observed has not run yet.
         Command::ToolCallObserved => Ok(RequestSpec {
+            method: "POST",
             path: "/agent/tool-call-observed",
             body_json: "{}".to_owned(),
         }),
@@ -1400,9 +1638,13 @@ fn send_once(
     request: &RequestSpec,
     timeout: Option<Duration>,
 ) -> Result<Option<Value>, SendAttemptError> {
-    let call = gateway_request("POST", endpoint, request.path, timeout)
-        .set("content-type", "application/json")
-        .send_string(&request.body_json);
+    let builder = gateway_request(request.method, endpoint, request.path, timeout)
+        .set("content-type", "application/json");
+    let call = if request.method == "GET" {
+        builder.call()
+    } else {
+        builder.send_string(&request.body_json)
+    };
 
     let (status, response) = match call {
         Ok(response) => (response.status(), response),
@@ -1417,7 +1659,24 @@ fn send_once(
     let encoded = response
         .into_string()
         .map_err(|error| SendAttemptError::Final(error.to_string()))?;
-    parse_response(status, &encoded).map_err(SendAttemptError::Final)
+    if request.path == "/version" {
+        parse_version_response(status, &encoded).map_err(SendAttemptError::Final)
+    } else {
+        parse_response(status, &encoded).map_err(SendAttemptError::Final)
+    }
+}
+
+fn parse_version_response(status: u16, encoded: &str) -> Result<Option<Value>, String> {
+    let value: Value = serde_json::from_str(encoded).map_err(|error| error.to_string())?;
+    if (200..300).contains(&status) {
+        Ok(Some(value))
+    } else {
+        Err(value
+            .pointer("/error/code")
+            .and_then(Value::as_str)
+            .unwrap_or("undefined")
+            .to_owned())
+    }
 }
 
 pub(crate) fn gateway_request(
@@ -1468,6 +1727,13 @@ pub(crate) fn parse_response(status: u16, encoded: &str) -> Result<Option<Value>
             .and_then(Value::as_str)
             .unwrap_or("undefined");
         let message = json.pointer("/error/message").and_then(Value::as_str);
+        if code == "activation_head_changed" {
+            let current = json
+                .pointer("/error/currentHead")
+                .and_then(Value::as_str)
+                .unwrap_or("undefined");
+            return Err(format!("activation_head_changed: currentHead={current}"));
+        }
         return Err(match message {
             Some(message) if !message.is_empty() => format!("{code}: {message}"),
             _ => code.to_owned(),
@@ -1614,6 +1880,26 @@ where
             if let Some(identity) = command_identity(&command) {
                 require_session_endpoint(identity, &endpoint)?;
             }
+            if matches!(command, Command::Activation { .. }) {
+                let version = RequestSpec {
+                    method: "GET",
+                    path: "/version",
+                    body_json: String::new(),
+                };
+                let advertised = send_request(&endpoint, &version, None)?;
+                let present = advertised
+                    .as_ref()
+                    .and_then(|value| value.get("features"))
+                    .and_then(Value::as_array)
+                    .is_some_and(|features| {
+                        features
+                            .iter()
+                            .any(|feature| feature.as_str() == Some("activation-events-v1"))
+                    });
+                if !present {
+                    return Err("capability_missing: activation-events-v1".to_owned());
+                }
+            }
             let request = build_request(&command)?;
             if let Some(result) = send_request(&endpoint, &request, None)? {
                 println!(
@@ -1657,6 +1943,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::Condition { identity, .. }
         | Command::ArtifactRecord { identity, .. }
         | Command::Artifacts { identity, .. }
+        | Command::Activation { identity, .. }
         | Command::Spawn { identity, .. }
         | Command::List { identity }
         | Command::Tune { identity, .. }
@@ -1774,6 +2061,105 @@ mod tests {
 
     fn body(values: &[&str]) -> String {
         build_request(&parse(values)).unwrap().body_json
+    }
+
+    #[test]
+    fn builds_closed_activation_request_bodies() {
+        assert_eq!(
+            body(&[
+                "activation-declare",
+                "--assignment",
+                "asg_1",
+                "--owner",
+                "owner",
+                "--domain",
+                "example",
+                "--correlation",
+                "c1",
+                "--input",
+                r#"{"namespace":"x","id":"i","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
+                "--target",
+                r#"{"namespace":"x","id":"t","sha256":null}"#,
+                "--key",
+                "k1",
+                "--as",
+                "coder"
+            ]),
+            r#"{"as":"coder","verb":"activation-declare","params":{"rootAssignmentId":"asg_1","ownerUserId":"owner","domain":"example","correlationKey":"c1","preparedInput":{"id":"i","namespace":"x","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"target":{"id":"t","namespace":"x","sha256":null},"idempotencyKey":"k1"}}"#
+        );
+
+        assert_eq!(
+            body(&[
+                "activation-status",
+                "--activation",
+                "act_1",
+                "--as-user",
+                "owner"
+            ]),
+            r#"{"asUser":"owner","verb":"activation-status","params":{"activationId":"act_1"}}"#
+        );
+    }
+
+    #[test]
+    fn activation_dispatch_requires_the_advertised_capability_first() {
+        let command = parse(&[
+            "activation-status",
+            "--activation",
+            "act_1",
+            "--as-user",
+            "owner",
+        ]);
+        let endpoint = || {
+            Ok(Endpoint {
+                base: "https://gateway".to_owned(),
+                token: "tbc_test".to_owned(),
+                origin: Origin::Named,
+            })
+        };
+
+        let error = run_with(
+            command.clone(),
+            endpoint,
+            |_, request, _| {
+                assert_eq!(request.path, "/version");
+                assert_eq!(request.method, "GET");
+                Ok(Some(serde_json::json!({"protocolVersion": 1})))
+            },
+            |_, _| panic!("harness loader must not be called"),
+        )
+        .unwrap_err();
+        assert_eq!(error, "capability_missing: activation-events-v1");
+
+        let calls = std::cell::RefCell::new(Vec::new());
+        run_with(
+            command,
+            endpoint,
+            |_, request, _| {
+                calls.borrow_mut().push(request.path);
+                if request.path == "/version" {
+                    Ok(Some(serde_json::json!({
+                        "protocolVersion": 1,
+                        "features": ["activation-events-v1"]
+                    })))
+                } else {
+                    Ok(None)
+                }
+            },
+            |_, _| panic!("harness loader must not be called"),
+        )
+        .unwrap();
+        assert_eq!(calls.into_inner(), ["/version", "/agent/dispatch"]);
+    }
+
+    #[test]
+    fn stale_activation_head_reports_the_winning_head() {
+        assert_eq!(
+            parse_response(
+                409,
+                r#"{"error":{"code":"activation_head_changed","currentHead":"aev_winner"}}"#
+            ),
+            Err("activation_head_changed: currentHead=aev_winner".to_owned())
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 defmodule Tightbeam.JobTrace do
   @moduledoc "Pinned, read-only work-item trace artifact."
 
-  alias Tightbeam.{CausalEvents, DB, Escalation}
+  alias Tightbeam.{Activations, CausalEvents, DB, Escalation}
 
   defmodule MissingCancellationProvenance do
     @moduledoc false
@@ -22,9 +22,10 @@ defmodule Tightbeam.JobTrace do
     "wake_canceled" => 3,
     "decision_request" => 4,
     "causal_event" => 5,
-    "effort_generation" => 6,
-    "attest" => 7,
-    "turn_end" => 8
+    "activation_event" => 6,
+    "effort_generation" => 7,
+    "attest" => 8,
+    "turn_end" => 9
   }
 
   @spec build(DB.server(), map()) :: map()
@@ -47,7 +48,8 @@ defmodule Tightbeam.JobTrace do
            wake_entries(db, item.id, assignment_ids) ++
            decision_entries(db, assignment_ids) ++
            effort_entries(db, assignment_ids) ++
-           causal_entries(db, item.id, assignment_ids))
+           causal_entries(db, item.id, assignment_ids) ++
+           Activations.trace_entries(db, item.id))
         |> Enum.sort_by(fn entry ->
           {entry.at, Map.fetch!(@type_rank, entry.type), entry.id}
         end)

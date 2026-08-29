@@ -101,6 +101,10 @@ defmodule Tightbeam.Wire.RouterTest do
         send(parent, {:call, call})
         %{artifacts: []}
       end,
+      "activation-status" => fn call ->
+        send(parent, {:call, call})
+        %{activation_id: call.params.activation_id, state: "declared", events: []}
+      end,
       "identity-status" => fn call ->
         send(parent, {:call, call})
         %{live: "abc123", conflict: false}
@@ -320,6 +324,34 @@ defmodule Tightbeam.Wire.RouterTest do
     assert is_integer(body["build"]) and body["build"] > 0
     assert body["build"] == Tightbeam.BuildStamp.build()
     assert body["sha"] == Tightbeam.BuildStamp.sha()
+    assert body["protocolVersion"] == 1
+    assert body["features"] == ["activation-events-v1"]
+  end
+
+  test "activation wire verbs are non-target calls with camel-case params", ctx do
+    response =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "activation-status",
+        asUser: "flynn",
+        params: %{activationId: "act_example"}
+      })
+
+    assert response.status == 200
+    assert_receive {:call, call}
+    assert call.verb == "activation-status"
+    assert call.principal == {:user, "flynn"}
+    assert call.params == %{activation_id: "act_example"}
+
+    refused =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "activation-status",
+        asUser: "flynn",
+        sessionKey: Org.personal_session_key("flynn"),
+        params: %{activationId: "act_example"}
+      })
+
+    assert refused.status == 400
+    assert JSON.decode!(refused.resp_body)["error"]["code"] == "invalid_message"
   end
 
   test "the change socket requires protocolVersion 1 at upgrade", ctx do

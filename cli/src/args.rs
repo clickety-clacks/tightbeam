@@ -9,6 +9,7 @@ use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::harnesses::HarnessCatalog;
+use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Identity {
@@ -23,6 +24,96 @@ pub enum Target {
     Session(String),
     Role(String),
     User(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ActivationCommand {
+    Declare {
+        assignment: String,
+        owner: String,
+        domain: String,
+        correlation: String,
+        input: Value,
+        target: Value,
+        prior: Option<String>,
+        relation: Option<String>,
+        key: String,
+    },
+    Authority {
+        activation: String,
+        after: String,
+        assignment: Option<String>,
+        authorizer: Value,
+        basis: Value,
+        decision: Value,
+        key: String,
+    },
+    Attempt {
+        activation: String,
+        after: String,
+        assignment: String,
+        authority_events: Vec<String>,
+        executor: Value,
+        external_attempt: Value,
+        target_state_before: Value,
+        key: String,
+    },
+    Observe {
+        activation: String,
+        after: String,
+        assignment: Option<String>,
+        attempt: String,
+        certainty: String,
+        result: Value,
+        target_state_after: Value,
+        outputs: Value,
+        evidence: Value,
+        external_occurred_at: Value,
+        key: String,
+    },
+    Reconcile {
+        activation: String,
+        after: String,
+        assignment: Option<String>,
+        observation: String,
+        certainty: String,
+        result: Value,
+        target_state_after: Value,
+        outputs: Value,
+        evidence: Value,
+        external_occurred_at: Value,
+        key: String,
+    },
+    Withdraw {
+        activation: String,
+        after: String,
+        assignment: Option<String>,
+        reason: Value,
+        basis: Value,
+        key: String,
+    },
+    Renotify {
+        activation: String,
+        after: String,
+        noticed_event: String,
+        replaces_wake: String,
+        key: String,
+    },
+    Ack {
+        activation: String,
+        after: String,
+        noticed_event: String,
+        wake: String,
+        key: String,
+    },
+    Status {
+        activation: String,
+    },
+    List {
+        assignment: Option<String>,
+        work_item: Option<String>,
+        correlation: Option<String>,
+    },
 }
 
 /// The ONE runtime control a `tune` call changes.
@@ -110,6 +201,10 @@ pub enum Command {
         identity: Identity,
         work_item_id: Option<String>,
         session_key: Option<String>,
+    },
+    Activation {
+        identity: Identity,
+        command: ActivationCommand,
     },
     /// Substrate-reserved: the PreToolUse hook reporting that this session is
     /// about to run `artifact-record`. Carries no identity flag because the
@@ -540,6 +635,30 @@ COMMANDS:
       Record a deliberate artifact pointer for the calling session.
   artifacts [--work-item <workItemId>] [--session <key>]
       List artifact rows matching every supplied exact filter.
+
+  activation-declare --assignment A --owner U --domain N --correlation C
+      --input RESOURCE_JSON --target RESOURCE_JSON
+      [--prior ACT --relation retry-of|compensates|supersedes] --key K
+  activation-authority --activation ACT --after EVENT [--assignment A]
+      --authorizer IDENTITY_JSON --basis RESOURCE_JSON --decision CODE_JSON --key K
+  activation-attempt --activation ACT --after EVENT --assignment A
+      --authority-events ID[,ID...] --executor IDENTITY_JSON
+      --external-attempt RESOURCE_JSON --target-state-before RESOURCE_JSON|null --key K
+  activation-observe --activation ACT --after EVENT [--assignment A]
+      --attempt EVENT --certainty determinate|indeterminate --result CODE_JSON
+      --target-state-after RESOURCE_JSON|null --outputs RESOURCE_JSON_ARRAY
+      --evidence RESOURCE_JSON --external-occurred-at MS|null --key K
+  activation-reconcile --activation ACT --after EVENT [--assignment A]
+      --observation EVENT --certainty determinate|irrecoverable --result CODE_JSON
+      --target-state-after RESOURCE_JSON|null --outputs RESOURCE_JSON_ARRAY
+      --evidence RESOURCE_JSON --external-occurred-at MS|null --key K
+  activation-withdraw --activation ACT --after EVENT [--assignment A]
+      --reason CODE_JSON --basis RESOURCE_JSON --key K
+  activation-renotify --activation ACT --after EVENT --noticed-event EVENT
+      --replaces-wake W --key K
+  activation-ack --activation ACT --after EVENT --noticed-event EVENT --wake W --key K
+  activation-status --activation ACT
+  activations [--assignment A | --work-item WI | --correlation C]
 
   spawn --display "<name>" [--name <role>] [--archetype <a>]
         [--harness {{HARNESSES_PIPE}}] [--model <model>] [--effort <level>]
@@ -1216,6 +1335,266 @@ fn generated_key() -> String {
     format!("cli_{millis}_{}", String::from_utf8_lossy(&suffix))
 }
 
+fn activation_json(flags: &HashMap<String, String>, name: &str) -> Result<Value, String> {
+    let encoded = nonempty(flags, name).ok_or_else(|| format!("--{name} is required"))?;
+    serde_json::from_str(&encoded).map_err(|_| format!("--{name} requires JSON"))
+}
+
+fn activation_required(flags: &HashMap<String, String>, name: &str) -> Result<String, String> {
+    nonempty(flags, name).ok_or_else(|| format!("--{name} is required"))
+}
+
+fn parse_activation(
+    name: &str,
+    parsed: &Flags,
+    flags: &HashMap<String, String>,
+) -> Result<Command, String> {
+    if parsed.positional.len() != 1 {
+        return Err(format!("usage: tightbeam {name} [flags]"));
+    }
+
+    let command_flags: &[&str] = match name {
+        "activation-declare" => &[
+            "assignment",
+            "owner",
+            "domain",
+            "correlation",
+            "input",
+            "target",
+            "prior",
+            "relation",
+            "key",
+        ],
+        "activation-authority" => &[
+            "activation",
+            "after",
+            "assignment",
+            "authorizer",
+            "basis",
+            "decision",
+            "key",
+        ],
+        "activation-attempt" => &[
+            "activation",
+            "after",
+            "assignment",
+            "authority-events",
+            "executor",
+            "external-attempt",
+            "target-state-before",
+            "key",
+        ],
+        "activation-observe" => &[
+            "activation",
+            "after",
+            "assignment",
+            "attempt",
+            "certainty",
+            "result",
+            "target-state-after",
+            "outputs",
+            "evidence",
+            "external-occurred-at",
+            "key",
+        ],
+        "activation-reconcile" => &[
+            "activation",
+            "after",
+            "assignment",
+            "observation",
+            "certainty",
+            "result",
+            "target-state-after",
+            "outputs",
+            "evidence",
+            "external-occurred-at",
+            "key",
+        ],
+        "activation-withdraw" => &[
+            "activation",
+            "after",
+            "assignment",
+            "reason",
+            "basis",
+            "key",
+        ],
+        "activation-renotify" => &[
+            "activation",
+            "after",
+            "noticed-event",
+            "replaces-wake",
+            "key",
+        ],
+        "activation-ack" => &["activation", "after", "noticed-event", "wake", "key"],
+        "activation-status" => &["activation"],
+        "activations" => &["assignment", "work-item", "correlation"],
+        _ => unreachable!("closed activation command set"),
+    };
+    if flags.keys().any(|flag| {
+        !command_flags.contains(&flag.as_str())
+            && !matches!(flag.as_str(), "as" | "as-user" | "as-process")
+    }) {
+        return Err(format!("usage: tightbeam {name} [flags]"));
+    }
+
+    let identity = identity(flags)?;
+    let command = match name {
+        "activation-declare" => {
+            let prior = nonempty(flags, "prior");
+            let relation = nonempty(flags, "relation");
+            if prior.is_some() != relation.is_some()
+                || relation.as_deref().is_some_and(|value| {
+                    !matches!(value, "retry-of" | "compensates" | "supersedes")
+                })
+            {
+                return Err("--prior and --relation must be supplied together; relation is retry-of, compensates, or supersedes".to_owned());
+            }
+            ActivationCommand::Declare {
+                assignment: activation_required(flags, "assignment")?,
+                owner: activation_required(flags, "owner")?,
+                domain: activation_required(flags, "domain")?,
+                correlation: activation_required(flags, "correlation")?,
+                input: activation_json(flags, "input")?,
+                target: activation_json(flags, "target")?,
+                prior,
+                relation,
+                key: activation_required(flags, "key")?,
+            }
+        }
+        "activation-authority" => ActivationCommand::Authority {
+            activation: activation_required(flags, "activation")?,
+            after: activation_required(flags, "after")?,
+            assignment: nonempty(flags, "assignment"),
+            authorizer: activation_json(flags, "authorizer")?,
+            basis: activation_json(flags, "basis")?,
+            decision: activation_json(flags, "decision")?,
+            key: activation_required(flags, "key")?,
+        },
+        "activation-attempt" => {
+            let authority_events = activation_required(flags, "authority-events")?
+                .split(',')
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            if authority_events.iter().any(String::is_empty) {
+                return Err(
+                    "--authority-events requires a non-empty comma-separated list".to_owned(),
+                );
+            }
+            ActivationCommand::Attempt {
+                activation: activation_required(flags, "activation")?,
+                after: activation_required(flags, "after")?,
+                assignment: activation_required(flags, "assignment")?,
+                authority_events,
+                executor: activation_json(flags, "executor")?,
+                external_attempt: activation_json(flags, "external-attempt")?,
+                target_state_before: activation_json(flags, "target-state-before")?,
+                key: activation_required(flags, "key")?,
+            }
+        }
+        "activation-observe" | "activation-reconcile" => {
+            let certainty = activation_required(flags, "certainty")?;
+            let external_occurred_at = activation_json(flags, "external-occurred-at")?;
+            if !external_occurred_at.is_null()
+                && external_occurred_at
+                    .as_u64()
+                    .is_none_or(|value| value > i64::MAX as u64)
+            {
+                return Err("--external-occurred-at requires an integer from 0 through 9223372036854775807 or null".to_owned());
+            }
+            let common = (
+                activation_required(flags, "activation")?,
+                activation_required(flags, "after")?,
+                nonempty(flags, "assignment"),
+                certainty,
+                activation_json(flags, "result")?,
+                activation_json(flags, "target-state-after")?,
+                activation_json(flags, "outputs")?,
+                activation_json(flags, "evidence")?,
+                external_occurred_at,
+                activation_required(flags, "key")?,
+            );
+            if name == "activation-observe" {
+                ActivationCommand::Observe {
+                    activation: common.0,
+                    after: common.1,
+                    assignment: common.2,
+                    attempt: activation_required(flags, "attempt")?,
+                    certainty: common.3,
+                    result: common.4,
+                    target_state_after: common.5,
+                    outputs: common.6,
+                    evidence: common.7,
+                    external_occurred_at: common.8,
+                    key: common.9,
+                }
+            } else {
+                ActivationCommand::Reconcile {
+                    activation: common.0,
+                    after: common.1,
+                    assignment: common.2,
+                    observation: activation_required(flags, "observation")?,
+                    certainty: common.3,
+                    result: common.4,
+                    target_state_after: common.5,
+                    outputs: common.6,
+                    evidence: common.7,
+                    external_occurred_at: common.8,
+                    key: common.9,
+                }
+            }
+        }
+        "activation-withdraw" => ActivationCommand::Withdraw {
+            activation: activation_required(flags, "activation")?,
+            after: activation_required(flags, "after")?,
+            assignment: nonempty(flags, "assignment"),
+            reason: activation_json(flags, "reason")?,
+            basis: activation_json(flags, "basis")?,
+            key: activation_required(flags, "key")?,
+        },
+        "activation-renotify" => ActivationCommand::Renotify {
+            activation: activation_required(flags, "activation")?,
+            after: activation_required(flags, "after")?,
+            noticed_event: activation_required(flags, "noticed-event")?,
+            replaces_wake: activation_required(flags, "replaces-wake")?,
+            key: activation_required(flags, "key")?,
+        },
+        "activation-ack" => ActivationCommand::Ack {
+            activation: activation_required(flags, "activation")?,
+            after: activation_required(flags, "after")?,
+            noticed_event: activation_required(flags, "noticed-event")?,
+            wake: activation_required(flags, "wake")?,
+            key: activation_required(flags, "key")?,
+        },
+        "activation-status" => ActivationCommand::Status {
+            activation: activation_required(flags, "activation")?,
+        },
+        "activations" => {
+            let assignment = nonempty(flags, "assignment");
+            let work_item = nonempty(flags, "work-item");
+            let correlation = nonempty(flags, "correlation");
+            if [
+                assignment.as_ref(),
+                work_item.as_ref(),
+                correlation.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .count()
+                > 1
+            {
+                return Err("activations accepts at most one filter".to_owned());
+            }
+            ActivationCommand::List {
+                assignment,
+                work_item,
+                correlation,
+            }
+        }
+        _ => unreachable!("closed activation command set"),
+    };
+    Ok(Command::Activation { identity, command })
+}
+
 pub fn parse(args: Vec<String>) -> Result<Command, String> {
     parse_with_optional_catalog(args, None)
 }
@@ -1251,6 +1630,16 @@ fn parse_with_optional_catalog(
 
     let flags = &parsed.flags;
     match command.expect("checked above") {
+        name @ ("activation-declare"
+        | "activation-authority"
+        | "activation-attempt"
+        | "activation-observe"
+        | "activation-reconcile"
+        | "activation-withdraw"
+        | "activation-renotify"
+        | "activation-ack"
+        | "activation-status"
+        | "activations") => parse_activation(name, &parsed, flags),
         "doctor" => {
             let base_dir = nonempty(flags, "base-dir");
             if parsed.positional.len() != 1
@@ -2228,7 +2617,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, ask, answer, return, revoke-assignment, reopen-assignment, repair-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, ask, answer, return, revoke-assignment, reopen-assignment, repair-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, activation-declare, activation-authority, activation-attempt, activation-observe, activation-reconcile, activation-withdraw, activation-renotify, activation-ack, activation-status, activations, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -2477,6 +2866,68 @@ mod tests {
         ] {
             assert_eq!(parse(args), Ok(Command::Help));
         }
+    }
+
+    #[test]
+    fn activation_commands_parse_closed_json_and_relation_shapes() {
+        assert!(matches!(
+            parse(strings(&[
+                "activation-declare",
+                "--assignment", "asg_1",
+                "--owner", "owner",
+                "--domain", "example",
+                "--correlation", "c1",
+                "--input", r#"{"namespace":"x","id":"i","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
+                "--target", r#"{"namespace":"x","id":"t","sha256":null}"#,
+                "--key", "k1",
+                "--as", "coder"
+            ])),
+            Ok(Command::Activation {
+                identity: Identity::Role(role),
+                command: ActivationCommand::Declare { assignment, domain, .. }
+            }) if role == "coder" && assignment == "asg_1" && domain == "example"
+        ));
+
+        assert!(
+            parse(strings(&[
+                "activation-declare",
+                "--assignment",
+                "a",
+                "--owner",
+                "u",
+                "--domain",
+                "d",
+                "--correlation",
+                "c",
+                "--input",
+                "not-json",
+                "--target",
+                "null",
+                "--key",
+                "k"
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse(strings(&[
+                "activation-status",
+                "--activation",
+                "act_1",
+                "--event-id",
+                "forged"
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse(strings(&[
+                "activations",
+                "--assignment",
+                "a",
+                "--work-item",
+                "wi"
+            ]))
+            .is_err()
+        );
     }
 
     #[test]
@@ -3048,6 +3499,16 @@ mod tests {
             headings,
             [
                 "answer",
+                "activation-ack",
+                "activation-attempt",
+                "activation-authority",
+                "activation-declare",
+                "activation-observe",
+                "activation-reconcile",
+                "activation-renotify",
+                "activation-status",
+                "activation-withdraw",
+                "activations",
                 "ask",
                 "assimilate",
                 "assign",
@@ -3709,7 +4170,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, ask, answer, return, revoke-assignment, reopen-assignment, repair-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, ask, answer, return, revoke-assignment, reopen-assignment, repair-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, activation-declare, activation-authority, activation-attempt, activation-observe, activation-reconcile, activation-withdraw, activation-renotify, activation-ack, activation-status, activations, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned())
         );
     }
 
