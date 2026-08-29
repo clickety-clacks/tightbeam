@@ -664,15 +664,16 @@ impl DeploymentFs {
         let (parent, name) = parent_and_name(path)?;
         let dir = self.parent_dir(&parent)?;
         let name = c_string(&name)?;
-        let fd = unsafe {
-            libc::openat(
+        let mut metadata = unsafe { std::mem::zeroed::<libc::stat>() };
+        let result = unsafe {
+            libc::fstatat(
                 dir.as_raw_fd(),
                 name.as_ptr(),
-                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                &mut metadata,
+                libc::AT_SYMLINK_NOFOLLOW,
             )
         };
-        if fd >= 0 {
-            unsafe { libc::close(fd) };
+        if result == 0 {
             return Ok(true);
         }
         let error = std::io::Error::last_os_error();
@@ -1465,6 +1466,20 @@ mod tests {
             fs.publish_immutable(Path::new("intents/one.json"), b"two", 0o444),
             Err(FsError::ImmutableCollision(_))
         ));
+    }
+
+    #[test]
+    fn confined_existence_check_does_not_follow_the_final_symlink() {
+        let (_directory, fs) = fixture();
+        fs.ensure_dir(Path::new("objects"), 0o755).unwrap();
+        std::os::unix::fs::symlink(
+            "/definitely-missing-tightbeam-target",
+            fs.root().join("objects/link"),
+        )
+        .unwrap();
+
+        assert!(fs.exists_confined(Path::new("objects/link")).unwrap());
+        assert!(!fs.exists_confined(Path::new("objects/missing")).unwrap());
     }
 
     #[test]
