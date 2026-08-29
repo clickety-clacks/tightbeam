@@ -653,7 +653,7 @@ defmodule Tightbeam.Org do
       txn,
       """
       SELECT w.wakeId, w.sessionKey, w.targetRole, w.reresolve, w.reresolveSeed,
-             w.reresolveRung, w.work_item_id, w.assignmentId
+             w.reresolveRung, w.work_item_id, w.assignmentId, w.consumer
       FROM wakes w
       LEFT JOIN roles r ON r.name=w.targetRole
       WHERE w.state='pending' AND w.targetGate=1
@@ -678,7 +678,8 @@ defmodule Tightbeam.Org do
            reresolve_seed,
            reresolve_rung,
            work_item_id,
-           assignment_id
+           assignment_id,
+           consumer
          ]
        ) do
     command =
@@ -698,7 +699,8 @@ defmodule Tightbeam.Org do
           reresolve_seed,
           reresolve_rung,
           work_item_id,
-          assignment_id
+          assignment_id,
+          consumer
         )
       end
 
@@ -706,6 +708,14 @@ defmodule Tightbeam.Org do
 
     if not Wakes.cancel_in_txn(txn, Map.put(command, :wake_id, wake_id)) do
       raise "typed retirement cancellation refused for #{wake_id}"
+    end
+
+    if consumer == "effort_probe" do
+      Txn.q(
+        txn,
+        "UPDATE effort_checkin_generations SET state='canceled' WHERE wakeId=?1 AND state='armed'",
+        [wake_id]
+      )
     end
 
     finalize_retirement_replacement_in_txn!(txn, after_cancellation)
@@ -755,7 +765,8 @@ defmodule Tightbeam.Org do
          reresolve_seed,
          reresolve_rung,
          work_item_id,
-         assignment_id
+         assignment_id,
+         _consumer
        ) do
     outcome =
       case retirement_replacement_target(

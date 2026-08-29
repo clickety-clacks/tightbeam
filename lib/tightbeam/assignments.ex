@@ -479,10 +479,15 @@ defmodule Tightbeam.Assignments do
   def __handle__(db, "assignments", call), do: assignments_result(db, call)
 
   defp assign_result(db, call) do
+    config = effort_config(db, call)
+
     open_assignment_result(
       db,
       call,
-      fn _txn, assignment -> {:created, assignment, nil} end,
+      fn txn, assignment ->
+        EffortCheckin.arm_in_txn(txn, config, assignment)
+        {:created, assignment, nil}
+      end,
       fn -> :ok end,
       "assign"
     )

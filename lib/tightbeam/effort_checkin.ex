@@ -124,6 +124,32 @@ defmodule Tightbeam.EffortCheckin do
     insert_generation(txn, config, assignment.id, session, root, baseline, generation, 1, 0)
   end
 
+  @doc "Arm an assignment that has no dispatch-time workspace preparation."
+  @spec arm_in_txn(Txn.t(), map(), map()) :: map()
+  def arm_in_txn(%Txn{} = txn, config, assignment) do
+    session = session_in_txn(txn, assignment.holderKey)
+    root = unobserved_root(config, session)
+
+    [[generation]] =
+      Txn.q(
+        txn,
+        "SELECT COALESCE(MAX(generation), 0) + 1 FROM effort_checkin_generations WHERE assignmentId = ?1",
+        [assignment.id]
+      )
+
+    insert_generation(
+      txn,
+      config,
+      assignment.id,
+      session,
+      root,
+      {:error, "workspace activity is not a card activity channel"},
+      generation,
+      1,
+      0
+    )
+  end
+
   @doc "Capture monitored assignments on a holder against a destination placement."
   @spec prepare_holder_rearms(DB.server(), map(), map()) :: [map()]
   def prepare_holder_rearms(db, config, destination_session) do
@@ -777,7 +803,6 @@ defmodule Tightbeam.EffortCheckin do
         deadline_at,
         "Assignment #{generation.assignment_id} effort check-in outcome: #{evidence.outcome}. " <>
           "The holder was prodded and stayed silent. Channels checked since arm — " <>
-          "workspace writes: #{evidence.channels.writes} (#{evidence.workspace}); " <>
           "artifacts recorded: #{evidence.channels.artifacts}; " <>
           "attests: #{evidence.channels.attests}; " <>
           "work-item updates: #{evidence.channels.workItems}. " <>
@@ -1175,17 +1200,11 @@ defmodule Tightbeam.EffortCheckin do
     end
   end
 
-  # The four channels, all read in the verdict's own transaction. Turns ride
+  # The three activity channels, all read in the verdict's own transaction. Turns ride
   # along as EFFORT — they are reported, never counted as effect.
-  defp channels(txn, generation, inspection) do
+  defp channels(txn, generation, _inspection) do
     %{
-      workspace: workspace_channel(generation.baseline, inspection),
-      artifacts:
-        count_since(
-          txn,
-          "SELECT COUNT(*) FROM artifacts WHERE createdBySession = ?1 AND rowid > ?2",
-          [generation.holder_key, generation.artifact_watermark]
-        ),
+      artifacts: artifact_updates(txn, generation),
       attests:
         count_since(
           txn,
@@ -1198,19 +1217,24 @@ defmodule Tightbeam.EffortCheckin do
   end
 
   defp effect?(channels) do
-    channels.workspace == :writes or channels.artifacts > 0 or channels.attests > 0 or
-      channels.workItems > 0
+    channels.artifacts > 0 or channels.attests > 0 or channels.workItems > 0
   end
 
-  defp workspace_channel({:error, _}, _inspection), do: :unobservable
-  defp workspace_channel(_baseline, {:error, _}), do: :unobservable
+  defp artifact_updates(txn, generation) do
+    case Txn.q(txn, "SELECT workItemId FROM assignments WHERE id = ?1", [
+           generation.assignment_id
+         ]) do
+      [[item]] when is_binary(item) ->
+        count_since(
+          txn,
+          "SELECT COUNT(*) FROM artifacts WHERE workItemId = ?1 AND createdBySession = ?2 AND rowid > ?3",
+          [item, generation.holder_key, generation.artifact_watermark]
+        )
 
-  defp workspace_channel({:ok, baseline}, {:ok, current}) do
-    cond do
-      current.prior != "observed" -> :unobservable
-      current.writes > 0 -> :writes
-      current.digest != baseline.digest -> :writes
-      true -> :none
+      _ ->
+        # Artifacts always belong to a work item. An unthreaded card therefore
+        # has an exact empty artifact set instead of borrowing holder-wide work.
+        0
     end
   end
 
@@ -1269,12 +1293,10 @@ defmodule Tightbeam.EffortCheckin do
       effortGeneration: generation.generation,
       outcome: "zero_effect",
       channels: %{
-        writes: Atom.to_string(channels.workspace),
         artifacts: channels.artifacts,
         attests: channels.attests,
         workItems: channels.workItems
       },
-      workspace: generation.root,
       agentProdded: generation.agent_prodded == 1,
       turnsSinceArmed: channels.turns,
       minutesSinceArmed: div(max(now() - generation.armed_at, 0), 60_000)
@@ -1304,9 +1326,8 @@ defmodule Tightbeam.EffortCheckin do
   end
 
   defp channel_sentence(evidence) do
-    "no writes, artifacts, attests, or work-item updates observed since " <>
-      "#{evidence.minutesSinceArmed}m ago (#{evidence.turnsSinceArmed} turns taken; " <>
-      "workspace #{evidence.workspace}: #{evidence.channels.writes})."
+    "no artifacts, attests, or work-item updates observed since " <>
+      "#{evidence.minutesSinceArmed}m ago (#{evidence.turnsSinceArmed} turns taken)."
   end
 
   defp advanced_baseline(_baseline, {:ok, _observation} = inspection), do: inspection
@@ -1347,6 +1368,15 @@ defmodule Tightbeam.EffortCheckin do
   defp root_path(config, session, root) do
     base = Placement.workdir_path(config, session)
     if root in [nil, ""], do: base, else: Path.join(base, root)
+  end
+
+  defp unobserved_root(config, session) do
+    digest =
+      :crypto.hash(:sha256, session.session_key)
+      |> Base.encode16(case: :lower)
+      |> binary_part(0, 12)
+
+    Path.join([config.base_dir, "work", digest])
   end
 
   defp relative_root(config, generation) do
