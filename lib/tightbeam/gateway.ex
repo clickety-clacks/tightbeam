@@ -60,6 +60,7 @@ defmodule Tightbeam.Gateway do
 
   alias Tightbeam.{
     AdapterCoordinator,
+    Activations,
     AdminProjection,
     Archetypes,
     Artifacts,
@@ -760,6 +761,16 @@ defmodule Tightbeam.Gateway do
         Artifacts.get(db, call.params[:artifact_id]) || %{code: "not_found"}
       end,
       {"artifacts", []} => fn call -> Artifacts.list_result(db, call.params) end,
+      {"activation-declare", []} => fn call -> Activations.handle(db, call.verb, call) end,
+      {"activation-authority", []} => fn call -> Activations.handle(db, call.verb, call) end,
+      {"activation-attempt", []} => fn call -> Activations.handle(db, call.verb, call) end,
+      {"activation-observe", []} => fn call -> Activations.handle(db, call.verb, call) end,
+      {"activation-reconcile", []} => fn call -> Activations.handle(db, call.verb, call) end,
+      {"activation-withdraw", []} => fn call -> Activations.handle(db, call.verb, call) end,
+      {"activation-renotify", []} => fn call -> Activations.handle(db, call.verb, call) end,
+      {"activation-ack", []} => fn call -> Activations.handle(db, call.verb, call) end,
+      {"activation-status", []} => fn call -> Activations.handle(db, call.verb, call) end,
+      {"activations", []} => fn call -> Activations.handle(db, call.verb, call) end,
       {"rule", ["decision_request.ruled"]} => fn call ->
         Escalation.rule(db, call,
           authorized: admin_origin?(db, call.origin),
