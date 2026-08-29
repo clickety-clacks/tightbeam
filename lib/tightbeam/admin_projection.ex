@@ -42,6 +42,19 @@ defmodule Tightbeam.AdminProjection do
     occurredAt INTEGER NOT NULL,
     PRIMARY KEY (resource, primaryKey)
   );
+  CREATE TABLE IF NOT EXISTS identity_publication_markers (
+    invocationId      TEXT NOT NULL,
+    expectedPriorLive TEXT NOT NULL,
+    candidateRevision TEXT,
+    treeFingerprint   TEXT NOT NULL,
+    principal         TEXT NOT NULL,
+    validationResult  TEXT NOT NULL CHECK (validationResult IN ('accepted', 'denied')),
+    cause             TEXT,
+    state             TEXT NOT NULL CHECK (state IN ('pending', 'accepted', 'denied')),
+    createdAt         INTEGER NOT NULL,
+    updatedAt         INTEGER NOT NULL,
+    PRIMARY KEY (invocationId, expectedPriorLive)
+  );
   """
 
   @doc "Create the additive projection schema and seed floors for existing DB rows."
@@ -59,6 +72,146 @@ defmodule Tightbeam.AdminProjection do
 
   @doc false
   def ensure_storage(db \\ DB), do: DB.execute(db, @ddl)
+
+  @doc "Read one durable identity validation-publication marker."
+  def identity_publication_marker(source, invocation_id, expected_prior) do
+    case query(
+           source,
+           """
+           SELECT invocationId, expectedPriorLive, candidateRevision, treeFingerprint,
+                  principal, validationResult, cause, state, createdAt, updatedAt
+           FROM identity_publication_markers
+           WHERE invocationId = ?1 AND expectedPriorLive = ?2
+           """,
+           [invocation_id, expected_prior]
+         ) do
+      [
+        [
+          invocation,
+          expected,
+          candidate,
+          fingerprint,
+          principal,
+          result,
+          cause,
+          state,
+          created,
+          updated
+        ]
+      ] ->
+        %{
+          invocation_id: invocation,
+          expected_prior: expected,
+          candidate_revision: candidate,
+          tree_fingerprint: fingerprint,
+          principal: principal,
+          validation_result: result,
+          cause: cause,
+          state: state,
+          created_at: created,
+          updated_at: updated
+        }
+
+      [] ->
+        nil
+    end
+  end
+
+  @doc "Read the one marker for an invocation before replaying a mutation."
+  def identity_publication_marker_by_invocation(source, invocation_id) do
+    case query(
+           source,
+           "SELECT expectedPriorLive FROM identity_publication_markers WHERE invocationId = ?1",
+           [invocation_id]
+         ) do
+      [[expected_prior]] -> identity_publication_marker(source, invocation_id, expected_prior)
+      [] -> nil
+    end
+  end
+
+  @doc "Create the sole pending marker after candidate-tree validation succeeds."
+  def begin_identity_publication(db, invocation_id, candidate, principal) do
+    case DB.transaction(db, fn txn ->
+           begin_identity_publication_in_txn(txn, invocation_id, candidate, principal)
+         end) do
+      {:ok, marker} -> {:ok, marker}
+      {:error, error} -> {:error, error}
+    end
+  end
+
+  @doc false
+  def begin_identity_publication_in_txn(
+        %Txn{} = txn,
+        invocation_id,
+        candidate,
+        principal
+      ) do
+    now = System.system_time(:millisecond)
+
+    Txn.q(
+      txn,
+      """
+      INSERT OR IGNORE INTO identity_publication_markers
+        (invocationId, expectedPriorLive, candidateRevision, treeFingerprint,
+         principal, validationResult, cause, state, createdAt, updatedAt)
+      VALUES (?1, ?2, ?3, ?4, ?5, 'accepted', NULL, 'pending', ?6, ?6)
+      """,
+      [
+        invocation_id,
+        candidate.expected_prior,
+        candidate.candidate_revision,
+        candidate.tree_fingerprint,
+        principal,
+        now
+      ]
+    )
+
+    identity_publication_marker(txn, invocation_id, candidate.expected_prior)
+  end
+
+  @doc "Finalize a pending identity marker exactly once."
+  def finish_identity_publication_in_txn(%Txn{} = txn, marker, state, cause \\ nil)
+      when state in ["accepted", "denied"] do
+    validation_result = if state == "accepted", do: "accepted", else: "denied"
+
+    Txn.q(
+      txn,
+      """
+      UPDATE identity_publication_markers
+      SET validationResult = ?3, cause = ?4, state = ?3, updatedAt = ?5
+      WHERE invocationId = ?1 AND expectedPriorLive = ?2 AND state = 'pending'
+      """,
+      [
+        marker.invocation_id,
+        marker.expected_prior,
+        validation_result,
+        cause,
+        System.system_time(:millisecond)
+      ]
+    )
+
+    :ok
+  end
+
+  @doc "Record a pre-commit typed validation denial without a candidate revision."
+  def deny_identity_validation(db, invocation_id, expected_prior, fingerprint, principal, cause) do
+    now = System.system_time(:millisecond)
+
+    DB.transaction(db, fn txn ->
+      Txn.q(
+        txn,
+        """
+        INSERT OR IGNORE INTO identity_publication_markers
+          (invocationId, expectedPriorLive, candidateRevision, treeFingerprint,
+           principal, validationResult, cause, state, createdAt, updatedAt)
+        VALUES (?1, ?2, NULL, ?3, ?4, 'denied', ?5, 'denied', ?6, ?6)
+        """,
+        [invocation_id, expected_prior, fingerprint, principal, cause, now]
+      )
+
+      identity_publication_marker(txn, invocation_id, expected_prior)
+    end)
+  end
 
   @doc "Canonical storage key for one or more immutable primary-key parts."
   @spec key(String.t() | [String.t()]) :: String.t()
