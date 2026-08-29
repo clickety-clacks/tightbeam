@@ -153,6 +153,57 @@ fn open_dir_at(parent: RawFd, component: &str) -> Result<OwnedFd, FsError> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
+fn absolute_components(path: &Path, subject: &str) -> Result<Vec<String>, FsError> {
+    if !path.is_absolute() {
+        return Err(FsError::InvalidPath(format!(
+            "{subject} must be absolute: {}",
+            path.display()
+        )));
+    }
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(component) => components.push(
+                component
+                    .to_str()
+                    .ok_or_else(|| {
+                        FsError::InvalidPath(format!(
+                            "{subject} has non-UTF8 component: {}",
+                            path.display()
+                        ))
+                    })?
+                    .to_owned(),
+            ),
+            _ => {
+                return Err(FsError::InvalidPath(format!(
+                    "{subject} has non-normal component: {}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Ok(components)
+}
+
+fn open_absolute_directory_without_following_ancestors(
+    path: &Path,
+) -> Result<(PathBuf, OwnedFd), FsError> {
+    let components = absolute_components(path, "deployment root")?;
+    let root = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open("/")
+        .map_err(|error| io("open deployment root descriptor", "/", error))?;
+    let mut directory: OwnedFd = root.into();
+    let mut normalized = PathBuf::from("/");
+    for component in components {
+        directory = open_dir_at(directory.as_raw_fd(), &component)?;
+        normalized.push(component);
+    }
+    Ok((normalized, directory))
+}
+
 fn open_optional_dir_at(parent: RawFd, component: &str) -> Result<Option<OwnedFd>, FsError> {
     match open_dir_at(parent, component) {
         Ok(directory) => Ok(Some(directory)),
@@ -543,23 +594,20 @@ pub struct DeploymentFs {
 impl DeploymentFs {
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, FsError> {
         let root = root.into();
-        if !root.is_absolute() {
-            return Err(FsError::InvalidPath(format!(
-                "deployment root must be absolute: {}",
-                root.display()
-            )));
-        }
-        let root = fs::canonicalize(&root)
-            .map_err(|error| io("canonicalize deployment root", &root, error))?;
-        let file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-            .open(&root)
-            .map_err(|error| io("open deployment root", &root, error))?;
-        let host_identity = read_host_identity(&host_identity_path(&root))?;
+        let (root, root_fd) = open_absolute_directory_without_following_ancestors(&root)?;
+        #[cfg(not(test))]
+        let host_identity = read_host_identity(Path::new("/etc/tightbeam/deploy-host-id"))?;
+        #[cfg(test)]
+        let host_identity = read_host_identity_beneath(
+            root_fd.as_raw_fd(),
+            &root,
+            Path::new("deploy-host-id"),
+            &root.join("deploy-host-id"),
+            unsafe { libc::geteuid() },
+        )?;
         Ok(Self {
             root,
-            root_fd: file.into(),
+            root_fd,
             host_identity,
         })
     }
@@ -1080,90 +1128,46 @@ impl DeploymentFs {
     }
 }
 
-fn host_identity_path(_root: &Path) -> PathBuf {
-    #[cfg(test)]
-    if _root != Path::new("/opt/tightbeam") {
-        return _root.join("deploy-host-id");
-    }
-    PathBuf::from("/etc/tightbeam/deploy-host-id")
-}
-
 fn read_host_identity(path: &Path) -> Result<HostIdentity, FsError> {
-    let mut file = open_host_identity_without_following_ancestors(path)?;
-    let metadata = file
-        .metadata()
-        .map_err(|error| io("stat host identity descriptor", path, error))?;
-    if !metadata.is_file() || metadata.permissions().mode() & 0o7777 != 0o400 {
-        return Err(FsError::InvalidPointer(format!(
-            "host identity must be a regular root-owned mode-0400 file: {}",
-            path.display()
-        )));
+    let components = absolute_components(path, "host identity")?;
+    let mut relative = PathBuf::new();
+    for component in components {
+        relative.push(component);
     }
-    #[cfg(not(test))]
-    if metadata.uid() != 0 {
-        return Err(FsError::InvalidPointer(format!(
-            "host identity is not root-owned: {}",
-            path.display()
-        )));
-    }
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .map_err(|error| io("read host identity", path, error))?;
-    if bytes.len() != 32 {
-        return Err(FsError::InvalidPointer(
-            "host identity must contain exactly 32 bytes".to_owned(),
-        ));
-    }
-    Ok(HostIdentity::from_bytes(&bytes))
-}
-
-fn open_host_identity_without_following_ancestors(path: &Path) -> Result<File, FsError> {
-    if !path.is_absolute() {
-        return Err(FsError::InvalidPath(format!(
-            "host identity must be absolute: {}",
-            path.display()
-        )));
-    }
-    let mut components = Vec::new();
-    for component in path.components() {
-        match component {
-            Component::RootDir => {}
-            Component::Normal(component) => components.push(
-                component
-                    .to_str()
-                    .ok_or_else(|| {
-                        FsError::InvalidPath(format!(
-                            "host identity has non-UTF8 component: {}",
-                            path.display()
-                        ))
-                    })?
-                    .to_owned(),
-            ),
-            _ => {
-                return Err(FsError::InvalidPath(format!(
-                    "host identity has non-normal component: {}",
-                    path.display()
-                )));
-            }
-        }
-    }
-    let (name, parents) = components.split_last().ok_or_else(|| {
-        FsError::InvalidPath(format!("host identity has no name: {}", path.display()))
-    })?;
     let root = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
         .open("/")
         .map_err(|error| io("open host identity root descriptor", "/", error))?;
-    let mut directory: OwnedFd = root.into();
-    let mut traversed = PathBuf::from("/");
-    #[cfg(not(test))]
-    validate_host_identity_ancestor(directory.as_raw_fd(), &traversed)?;
+    read_host_identity_beneath(root.as_raw_fd(), Path::new("/"), &relative, path, 0)
+}
+
+fn read_host_identity_beneath(
+    root_fd: RawFd,
+    root_path: &Path,
+    relative: &Path,
+    display_path: &Path,
+    trusted_uid: u32,
+) -> Result<HostIdentity, FsError> {
+    let components = relative_components(relative)?;
+    let (name, parents) = components
+        .split_last()
+        .expect("relative_components returns at least one component");
+    let duplicate = unsafe { libc::dup(root_fd) };
+    if duplicate < 0 {
+        return Err(io(
+            "duplicate host identity root descriptor",
+            root_path,
+            std::io::Error::last_os_error(),
+        ));
+    }
+    let mut directory = unsafe { OwnedFd::from_raw_fd(duplicate) };
+    let mut traversed = root_path.to_path_buf();
+    validate_host_identity_ancestor(directory.as_raw_fd(), &traversed, trusted_uid)?;
     for parent in parents {
         directory = open_dir_at(directory.as_raw_fd(), parent)?;
         traversed.push(parent);
-        #[cfg(not(test))]
-        validate_host_identity_ancestor(directory.as_raw_fd(), &traversed)?;
+        validate_host_identity_ancestor(directory.as_raw_fd(), &traversed, trusted_uid)?;
     }
     let name = c_string(name)?;
     let fd = unsafe {
@@ -1176,15 +1180,59 @@ fn open_host_identity_without_following_ancestors(path: &Path) -> Result<File, F
     if fd < 0 {
         return Err(io(
             "open host identity through confined descriptors",
-            path,
+            display_path,
             std::io::Error::last_os_error(),
         ));
     }
-    Ok(unsafe { File::from_raw_fd(fd) })
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    let metadata = file
+        .metadata()
+        .map_err(|error| io("stat host identity descriptor", display_path, error))?;
+    validate_host_identity_file(
+        metadata.is_file(),
+        metadata.permissions().mode(),
+        metadata.uid(),
+        trusted_uid,
+        display_path,
+    )?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| io("read host identity", display_path, error))?;
+    if bytes.len() != 32 {
+        return Err(FsError::InvalidPointer(
+            "host identity must contain exactly 32 bytes".to_owned(),
+        ));
+    }
+    Ok(HostIdentity::from_bytes(&bytes))
 }
 
-#[cfg(not(test))]
-fn validate_host_identity_ancestor(fd: RawFd, path: &Path) -> Result<(), FsError> {
+fn validate_host_identity_file(
+    is_file: bool,
+    mode: u32,
+    uid: u32,
+    trusted_uid: u32,
+    path: &Path,
+) -> Result<(), FsError> {
+    if !is_file || mode & 0o7777 != 0o400 {
+        return Err(FsError::InvalidPointer(format!(
+            "host identity must be a regular root-owned mode-0400 file: {}",
+            path.display()
+        )));
+    }
+    if uid != trusted_uid {
+        return Err(FsError::InvalidPointer(format!(
+            "host identity is not root-owned: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_host_identity_ancestor(
+    fd: RawFd,
+    path: &Path,
+    trusted_uid: u32,
+) -> Result<(), FsError> {
     let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
     if unsafe { libc::fstat(fd, &mut stat) } != 0 {
         return Err(io(
@@ -1193,7 +1241,16 @@ fn validate_host_identity_ancestor(fd: RawFd, path: &Path) -> Result<(), FsError
             std::io::Error::last_os_error(),
         ));
     }
-    if stat.st_uid != 0 || (stat.st_mode as u32 & 0o022) != 0 {
+    validate_host_identity_ancestor_values(stat.st_uid, stat.st_mode as u32, trusted_uid, path)
+}
+
+fn validate_host_identity_ancestor_values(
+    uid: u32,
+    mode: u32,
+    trusted_uid: u32,
+    path: &Path,
+) -> Result<(), FsError> {
+    if uid != trusted_uid || (mode & 0o022) != 0 {
         return Err(FsError::InvalidPointer(format!(
             "host identity ancestor must be root-owned and not group/world writable: {}",
             path.display()
@@ -1337,6 +1394,7 @@ mod tests {
             TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
         fs::write(path.join("deploy-host-id"), [7_u8; 32]).unwrap();
         fs::set_permissions(
             path.join("deploy-host-id"),
@@ -1356,6 +1414,40 @@ mod tests {
     fn relative_paths_reject_absolute_and_parent_components() {
         assert!(relative_components(Path::new("/etc/passwd")).is_err());
         assert!(relative_components(Path::new("safe/../escape")).is_err());
+    }
+
+    #[test]
+    fn deployment_root_reader_rejects_a_symlink() {
+        let directory = tempdir();
+        let real = directory.0.with_extension("real");
+        fs::rename(&directory.0, &real).unwrap();
+        std::os::unix::fs::symlink(&real, &directory.0).unwrap();
+        let result = DeploymentFs::open(&directory.0);
+        fs::remove_file(&directory.0).unwrap();
+        fs::rename(&real, &directory.0).unwrap();
+        assert!(matches!(result, Err(FsError::Io { .. })));
+    }
+
+    #[test]
+    fn deployment_root_reader_rejects_a_symlinked_ancestor() {
+        let directory = tempdir();
+        let real = directory.0.join("real");
+        let deployment = real.join("deployment");
+        fs::create_dir(&real).unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::create_dir(&deployment).unwrap();
+        fs::set_permissions(&deployment, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(deployment.join("deploy-host-id"), [7_u8; 32]).unwrap();
+        fs::set_permissions(
+            deployment.join("deploy-host-id"),
+            fs::Permissions::from_mode(0o400),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&real, directory.0.join("alias")).unwrap();
+        assert!(matches!(
+            DeploymentFs::open(directory.0.join("alias/deployment")),
+            Err(FsError::Io { .. })
+        ));
     }
 
     #[test]
@@ -1487,6 +1579,43 @@ mod tests {
     }
 
     #[test]
+    fn host_identity_reader_rejects_a_non_0400_file() {
+        let (directory, _fs) = fixture();
+        let path = directory.0.join("deploy-host-id");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(matches!(
+            DeploymentFs::open(&directory.0),
+            Err(FsError::InvalidPointer(reason)) if reason.contains("mode-0400")
+        ));
+    }
+
+    #[test]
+    fn host_identity_policy_rejects_a_non_root_owner() {
+        assert!(matches!(
+            validate_host_identity_file(
+                true,
+                libc::S_IFREG | 0o400,
+                1,
+                0,
+                Path::new("/etc/tightbeam/deploy-host-id"),
+            ),
+            Err(FsError::InvalidPointer(reason)) if reason.contains("not root-owned")
+        ));
+    }
+
+    #[test]
+    fn host_identity_policy_rejects_unsafe_ancestors() {
+        assert!(matches!(
+            validate_host_identity_ancestor_values(1, libc::S_IFDIR | 0o755, 0, Path::new("/etc")),
+            Err(FsError::InvalidPointer(reason)) if reason.contains("root-owned")
+        ));
+        assert!(matches!(
+            validate_host_identity_ancestor_values(0, libc::S_IFDIR | 0o775, 0, Path::new("/etc")),
+            Err(FsError::InvalidPointer(reason)) if reason.contains("not group/world writable")
+        ));
+    }
+
+    #[test]
     fn host_identity_reader_rejects_a_symlink_even_when_its_target_is_valid() {
         let (directory, _fs) = fixture();
         let real = directory.0.join("real-host-id");
@@ -1500,14 +1629,24 @@ mod tests {
 
     #[test]
     fn host_identity_reader_rejects_a_symlinked_ancestor() {
-        let (directory, _fs) = fixture();
-        let alias = directory.0.parent().unwrap().join(format!(
-            "tightbeam-deploy-host-id-alias-{}",
-            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::os::unix::fs::symlink(&directory.0, &alias).unwrap();
-        let result = read_host_identity(&alias.join("deploy-host-id"));
-        let _ = fs::remove_file(&alias);
+        let (directory, deployment_fs) = fixture();
+        let real = directory.0.join("identity");
+        fs::create_dir(&real).unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(real.join("deploy-host-id"), [7_u8; 32]).unwrap();
+        fs::set_permissions(
+            real.join("deploy-host-id"),
+            fs::Permissions::from_mode(0o400),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&real, directory.0.join("alias")).unwrap();
+        let result = read_host_identity_beneath(
+            deployment_fs.root_fd.as_raw_fd(),
+            &directory.0,
+            Path::new("alias/deploy-host-id"),
+            &directory.0.join("alias/deploy-host-id"),
+            unsafe { libc::geteuid() },
+        );
         assert!(matches!(result, Err(FsError::Io { .. })));
     }
 

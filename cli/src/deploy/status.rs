@@ -833,6 +833,7 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
         fs::write(path.join("deploy-host-id"), [7_u8; 32]).unwrap();
         fs::set_permissions(
             path.join("deploy-host-id"),
@@ -840,6 +841,11 @@ mod tests {
         )
         .unwrap();
         TempDir(path)
+    }
+
+    fn write_file_with_mode(path: &Path, bytes: impl AsRef<[u8]>, mode: u32) {
+        fs::write(path, bytes).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
     }
 
     fn succession_fixture(generations: &[(&str, Option<&str>)], active: &str) -> (TempDir, Digest) {
@@ -865,13 +871,13 @@ mod tests {
             release_manifest,
         )
         .unwrap();
-        fs::write(
-            directory
+        write_file_with_mode(
+            &directory
                 .0
                 .join(format!("releases/sha256-{digest}/tightbeam/bin")),
             payload,
-        )
-        .unwrap();
+            0o644,
+        );
         for (generation, prior) in generations {
             let generation_root = directory.0.join(format!("generations/{generation}"));
             fs::create_dir_all(&generation_root).unwrap();
@@ -966,13 +972,13 @@ mod tests {
             release_manifest,
         )
         .unwrap();
-        fs::write(
-            directory
+        write_file_with_mode(
+            &directory
                 .0
                 .join(format!("releases/sha256-{digest}/tightbeam/bin")),
             payload,
-        )
-        .unwrap();
+            0o644,
+        );
         fs::create_dir_all(directory.0.join("generations/g0")).unwrap();
         fs::write(
             directory.0.join("generations/g0/manifest.json"),
@@ -1057,7 +1063,7 @@ mod tests {
         let release_root = directory.0.join(format!("releases/sha256-{digest}"));
         fs::create_dir_all(release_root.join("tightbeam")).unwrap();
         fs::write(release_root.join("release-manifest.json"), release_manifest).unwrap();
-        fs::write(release_root.join("tightbeam/bin"), payload).unwrap();
+        write_file_with_mode(&release_root.join("tightbeam/bin"), payload, 0o644);
         for (generation, prior) in [("g1", None), ("g2", Some("g1"))] {
             let generation_root = directory.0.join(format!("generations/{generation}"));
             fs::create_dir_all(&generation_root).unwrap();

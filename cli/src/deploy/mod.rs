@@ -230,7 +230,14 @@ impl DeployManager {
         Ok(())
     }
 
-    pub(crate) fn gc_guard(&self) -> Result<(), FsError> {
+    pub(crate) fn with_gc_lock<T, F>(&self, operation: F) -> Result<T, FsError>
+    where
+        F: FnOnce(&DeploymentLock) -> Result<T, FsError>,
+    {
+        // The lock spans both the hold decision and the caller's deletion
+        // operation. A deployment mutation cannot publish a new intent in the
+        // interval because there is no unlocked interval to race.
+        let lock = self.lock()?;
         let status = self.status()?;
         if status.gc_hold {
             return Err(FsError::InvalidPointer(format!(
@@ -242,7 +249,7 @@ impl DeployManager {
                     .unwrap_or("unresolved deployment state")
             )));
         }
-        Ok(())
+        operation(&lock)
     }
 
     fn read_activation_intent(&self) -> Result<Option<ActivationIntent>, FsError> {
@@ -495,6 +502,7 @@ mod tests {
                 .as_nanos()
         ));
         stdfs::create_dir(&path).unwrap();
+        stdfs::set_permissions(&path, stdfs::Permissions::from_mode(0o700)).unwrap();
         stdfs::write(path.join("deploy-host-id"), [7_u8; 32]).unwrap();
         stdfs::set_permissions(
             path.join("deploy-host-id"),
@@ -1184,7 +1192,7 @@ mod tests {
     }
 
     #[test]
-    fn gc_guard_refuses_before_deletion_when_recovery_has_an_unresolved_intent() {
+    fn gc_operation_refuses_before_deletion_when_recovery_has_an_unresolved_intent() {
         let directory = tempdir();
         let manager = DeployManager::open(&directory.0).unwrap();
         manager.fs.ensure_dir(Path::new("intents"), 0o755).unwrap();
@@ -1192,16 +1200,37 @@ mod tests {
         let unrelated = directory.0.join("releases/unrelated-object");
         stdfs::create_dir_all(unrelated.parent().unwrap()).unwrap();
         stdfs::write(&unrelated, b"preserve").unwrap();
-        let deletion = (|| -> Result<(), FsError> {
-            manager.gc_guard()?;
+        let deletion = manager.with_gc_lock(|_lock| {
             stdfs::remove_file(&unrelated)
                 .map_err(|error| FsError::InvalidPointer(format!("test GC deletion: {error}")))
-        })();
+        });
         assert!(matches!(
             deletion,
             Err(FsError::InvalidPointer(reason)) if reason.contains("GC refused")
         ));
         assert!(directory.0.join("intents/tx.json").exists());
         assert!(unrelated.exists());
+    }
+
+    #[test]
+    fn gc_deletion_holds_the_deploy_lock_from_guard_through_delete() {
+        let directory = tempdir();
+        let manager = DeployManager::open(&directory.0).unwrap();
+        let contender = DeployManager::open(&directory.0).unwrap();
+        let unrelated = directory.0.join("releases/unrelated-object");
+        stdfs::create_dir_all(unrelated.parent().unwrap()).unwrap();
+        stdfs::write(&unrelated, b"delete").unwrap();
+
+        manager
+            .with_gc_lock(|lock| {
+                lock.belongs_to(&manager.fs)?;
+                assert!(matches!(contender.lock(), Err(FsError::Busy)));
+                stdfs::remove_file(&unrelated)
+                    .map_err(|error| FsError::InvalidPointer(format!("test GC deletion: {error}")))
+            })
+            .unwrap();
+
+        assert!(!unrelated.exists());
+        contender.lock().unwrap();
     }
 }
