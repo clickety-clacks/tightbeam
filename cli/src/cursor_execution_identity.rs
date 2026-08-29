@@ -185,9 +185,9 @@ fn admin_instructions_for(
              sudo chgrp tightbeam-workspace {base}/work\n\
              sudo chmod -R g+rwX {base}/work\n\
              sudo chmod 2770 {base}/work\n\
-             sudo mkdir -p {base}/homes/{machine}/cursor/.tightbeam/harness-processes\n\
+             sudo mkdir -p {base}/homes/{machine}/cursor/.tightbeam/harness-processes {base}/homes/{machine}/cursor/acp-sessions\n\
              sudo chown -R $USER:tightbeam-workspace {base}/homes/{machine}/cursor\n\
-             sudo chmod 2770 {base}/homes/{machine}/cursor/.tightbeam {base}/homes/{machine}/cursor/.tightbeam/harness-processes\n\
+             sudo chmod 2770 {base}/homes/{machine}/cursor {base}/homes/{machine}/cursor/.tightbeam {base}/homes/{machine}/cursor/.tightbeam/harness-processes {base}/homes/{machine}/cursor/acp-sessions\n\
              sudo chgrp tightbeam-workspace {base}/auth\n\
              sudo chmod 0710 {base}/auth\n\
              sudo chgrp -R tightbeam-workspace {base}/auth/github\n\
@@ -226,9 +226,9 @@ fn admin_instructions_for(
              sudo chgrp tightbeam-workspace {base}/work\n\
              sudo chmod -R g+rwX {base}/work\n\
              sudo chmod 2770 {base}/work\n\
-             sudo mkdir -p {base}/homes/{machine}/cursor/.tightbeam/harness-processes\n\
+             sudo mkdir -p {base}/homes/{machine}/cursor/.tightbeam/harness-processes {base}/homes/{machine}/cursor/acp-sessions\n\
              sudo chown -R $USER:tightbeam-workspace {base}/homes/{machine}/cursor\n\
-             sudo chmod 2770 {base}/homes/{machine}/cursor/.tightbeam {base}/homes/{machine}/cursor/.tightbeam/harness-processes\n\
+             sudo chmod 2770 {base}/homes/{machine}/cursor {base}/homes/{machine}/cursor/.tightbeam {base}/homes/{machine}/cursor/.tightbeam/harness-processes {base}/homes/{machine}/cursor/acp-sessions\n\
              sudo chgrp tightbeam-workspace {base}/auth\n\
              sudo chmod 0710 {base}/auth\n\
              sudo chgrp -R tightbeam-workspace {base}/auth/github\n\
@@ -643,6 +643,8 @@ mod tests {
             assert_eq!(instructions.contains("IsHidden 1"), macos);
             assert!(instructions.contains("/build/tightbeam"));
             assert!(instructions.contains("/homes/test-machine/cursor"));
+            assert!(instructions.contains("/homes/test-machine/cursor/acp-sessions"));
+            assert!(instructions.contains("chmod 2770 /srv/tightbeam/homes/test-machine/cursor "));
             assert!(instructions.contains("chown -R root:tightbeam-workspace"));
             assert!(!instructions.contains("GH_CONFIG_DIR PATH"));
             assert!(!instructions.contains("!secure_path"));
