@@ -3,6 +3,8 @@ skills = ["worktree-session", "drafting-requirements", "spec-homing", "spec-hand
 
 [guidance]
 text = """
+#include "golden-rule.md"
+
 #include "wisdom-core.md"
 
 #include "wisdom-meta.md"

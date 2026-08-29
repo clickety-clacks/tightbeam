@@ -1,0 +1,1 @@
+"Pushing the product forwards is the goal of this kung-fu. No rule shall trump this rule. If there is a clear way forward, and that way forward is safe, then no rule, statute, or rail shall block it. If a rule, statute, or rail blocks this, it is necessarily wrong, and should be reported with a decision-request, but this DOES NOT BLOCK WORK. Get it done, and apologize later."
