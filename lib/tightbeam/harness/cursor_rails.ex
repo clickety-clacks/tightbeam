@@ -93,7 +93,7 @@ defmodule Tightbeam.Harness.CursorRails do
   before-execution hook.
   """
   @spec compile(map() | nil) :: map()
-  def compile(nil), do: %{"hooks" => %{}}
+  def compile(nil), do: %{"version" => 1, "hooks" => %{}}
 
   def compile(%{"hooks" => %{"PreToolUse" => entries}}) when is_list(entries) do
     hooks =
@@ -103,7 +103,7 @@ defmodule Tightbeam.Harness.CursorRails do
         Map.update(acc, event, cursor_cmds, &(&1 ++ cursor_cmds))
       end)
 
-    %{"hooks" => hooks}
+    %{"version" => 1, "hooks" => hooks}
   end
 
   @doc """

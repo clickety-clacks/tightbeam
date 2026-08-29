@@ -453,6 +453,7 @@ defmodule Tightbeam.CursorRegistrationTest do
     assert File.stat!(projected_config).gid == File.stat!(home).gid
 
     assert JSON.decode!(File.read!(Path.join([home, ".cursor", "hooks.json"]))) == %{
+             "version" => 1,
              "hooks" => %{}
            }
 

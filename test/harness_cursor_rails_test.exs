@@ -44,11 +44,14 @@ defmodule Tightbeam.Harness.CursorRailsTest do
 
   describe "compile/1 shape and routing" do
     test "nil rails compile to an empty hooks config" do
-      assert CursorRails.compile(nil) == %{"hooks" => %{}}
+      assert CursorRails.compile(nil) == %{"version" => 1, "hooks" => %{}}
     end
 
     test "an empty PreToolUse list compiles to an empty hooks config" do
-      assert CursorRails.compile(%{"hooks" => %{"PreToolUse" => []}}) == %{"hooks" => %{}}
+      assert CursorRails.compile(%{"hooks" => %{"PreToolUse" => []}}) == %{
+               "version" => 1,
+               "hooks" => %{}
+             }
     end
 
     test "Bash routes to beforeShellExecution and the wrap is applied" do
@@ -61,6 +64,8 @@ defmodule Tightbeam.Harness.CursorRailsTest do
       }
 
       %{"hooks" => hooks} = CursorRails.compile(pre)
+
+      assert CursorRails.compile(pre)["version"] == 1
 
       assert Map.keys(hooks) == ["beforeShellExecution"]
       assert [%{"command" => shell_cmd}] = hooks["beforeShellExecution"]
