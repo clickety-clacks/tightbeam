@@ -3076,7 +3076,13 @@ defmodule Tightbeam.Escalation do
 
   defp integrity_transaction_error!(error), do: raise(error)
 
-  defp canonical_request_id?("dr_" <> suffix), do: nonblank?(suffix)
+  defp canonical_request_id?(id) when is_binary(id),
+    do:
+      Regex.match?(
+        ~r/\Adr_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\z/,
+        id
+      )
+
   defp canonical_request_id?(_id), do: false
 
   defp canonical_principal?("user:" <> suffix), do: nonblank?(suffix)

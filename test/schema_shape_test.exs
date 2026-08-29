@@ -73,29 +73,29 @@ defmodule Tightbeam.SchemaShapeTest do
       DROP TRIGGER IF EXISTS decision_request_operator_terminal_insert;
       DROP TRIGGER IF EXISTS decision_request_operator_terminal_update;
       INSERT INTO condition_facts (id,ts,kind,scope,origin) VALUES
-        (11,11,'escalation-ruled','dr_legacy_complete','process:tightbeam'),
-        (12,12,'escalation-ruled','dr_legacy_missing_decision','process:tightbeam'),
-        (13,13,'escalation-ruled','dr_legacy_consumed','process:tightbeam');
+        (11,11,'escalation-ruled','dr_00000000-0000-4000-8000-000000000004','process:tightbeam'),
+        (12,12,'escalation-ruled','dr_00000000-0000-4000-8000-000000000002','process:tightbeam'),
+        (13,13,'escalation-ruled','dr_00000000-0000-4000-8000-000000000001','process:tightbeam');
       INSERT INTO lifecycle_events (ts,kind,subject,detail) VALUES
-        (11,'decision_request_ruled','dr_legacy_complete','legacy'),
-        (12,'decision_request_ruled','dr_legacy_missing_decision','legacy'),
-        (13,'decision_request_ruled','dr_legacy_consumed','legacy'),
-        (14,'decision_request_ruled','dr_legacy_missing_fact','legacy');
+        (11,'decision_request_ruled','dr_00000000-0000-4000-8000-000000000004','legacy'),
+        (12,'decision_request_ruled','dr_00000000-0000-4000-8000-000000000002','legacy'),
+        (13,'decision_request_ruled','dr_00000000-0000-4000-8000-000000000001','legacy'),
+        (14,'decision_request_ruled','dr_00000000-0000-4000-8000-000000000003','legacy');
       INSERT INTO decision_requests
         (id,kind,raiserId,raiserSessionKey,ownerUserId,raisedAt,deadlineAt,
          actionKey,question,options,context,status,decision,ruledBy,ruledAt,
          rulingFactId,consumedAt)
       VALUES
-        ('dr_legacy_complete','operator','agent:raiser','agent:raiser:legacy','flynn',1,2,
+        ('dr_00000000-0000-4000-8000-000000000004','operator','agent:raiser','agent:raiser:legacy','flynn',1,2,
          'legacy-complete','legacy complete','[{"label":"accept"}]','{}','ruled','accept',
          'user:flynn',11,11,NULL),
-        ('dr_legacy_missing_decision','operator','agent:raiser','agent:raiser:legacy','flynn',1,2,
+        ('dr_00000000-0000-4000-8000-000000000002','operator','agent:raiser','agent:raiser:legacy','flynn',1,2,
          'legacy-missing-decision','legacy missing decision','[{"label":"accept"}]','{}','ruled',NULL,
          'user:flynn',12,12,NULL),
-        ('dr_legacy_missing_fact','operator','agent:raiser','agent:raiser:legacy','flynn',1,2,
+        ('dr_00000000-0000-4000-8000-000000000003','operator','agent:raiser','agent:raiser:legacy','flynn',1,2,
          'legacy-missing-fact','legacy missing fact','[{"label":"accept"}]','{}','ruled','accept',
          'user:flynn',14,999,NULL),
-        ('dr_legacy_consumed','operator','agent:raiser','agent:raiser:legacy','flynn',1,2,
+        ('dr_00000000-0000-4000-8000-000000000001','operator','agent:raiser','agent:raiser:legacy','flynn',1,2,
          'legacy-consumed','legacy consumed','[{"label":"accept"}]','{}','consumed','accept',
          'user:flynn',13,13,13);
       DROP TABLE IF EXISTS decision_request_integrity_evidence;
@@ -144,9 +144,9 @@ defmodule Tightbeam.SchemaShapeTest do
 
     assert {:ok,
             [
-              ["dr_legacy_consumed", "[\"lifecycleConsumption\"]"],
-              ["dr_legacy_missing_decision", "[\"decision\"]"],
-              ["dr_legacy_missing_fact", failing_fact_fields]
+              ["dr_00000000-0000-4000-8000-000000000001", "[\"lifecycleConsumption\"]"],
+              ["dr_00000000-0000-4000-8000-000000000002", "[\"decision\"]"],
+              ["dr_00000000-0000-4000-8000-000000000003", failing_fact_fields]
             ]} =
              DB.query(
                db,
