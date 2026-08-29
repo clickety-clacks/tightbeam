@@ -568,7 +568,8 @@ COMMANDS:
       File an owner-scoped operator decision request.
   operator-rule <dr_id> (--decision <label> | --response <text>)
                 [--rationale <text>]
-      Record the operator's resolution. Main and presenting proxies never run this command.
+      Record the operator's resolution. A session that presented the request runs it
+      only on the operator's explicit delegation, quoted in --rationale.
   operator-withdraw <dr_id> --reason <text>
       Withdraw an operator decision request as its owner or original asker.
   decision-requests [--status open|ruled|consumed|withdrawn|superseded|all]
