@@ -690,7 +690,8 @@ defmodule Tightbeam.GatewayTest do
     %{db: db, registry: registry, lane: lane, catalog_base: catalog_base, main_key: main_key}
   end
 
-  test "assignment handlers inject the configured supervision interval before mutation", ctx do
+  test "assignment handlers inject configured supervision and effort settings before mutation",
+       ctx do
     ensure_global_registry()
     base_dir = role_test_base("gateway-supervision-interval")
 
@@ -702,6 +703,7 @@ defmodule Tightbeam.GatewayTest do
       Gateway.handlers(
         gateway_config(base_dir, ctx.db, 0)
         |> Map.put(:wake_tick_ms, 1_234)
+        |> Map.put(:effort_checkin_horizon_ms, 123)
       )
 
     common = %{
@@ -731,6 +733,15 @@ defmodule Tightbeam.GatewayTest do
                })
              )
 
+    assert {:ok, [[123, effort_root]]} =
+             DB.query(
+               ctx.db,
+               "SELECT baseHorizonMs,root FROM effort_checkin_generations WHERE assignmentId=?1",
+               [assign_id]
+             )
+
+    assert Path.dirname(effort_root) == Path.join(base_dir, "work")
+
     for assignment_id <- [assign_id, dispatch_id] do
       assert {:ok, [[1_234, 1_234]]} =
                DB.query(
@@ -744,6 +755,36 @@ defmodule Tightbeam.GatewayTest do
                  [assignment_id]
                )
     end
+
+    assert %{state: "closed"} =
+             handlers["revoke-assignment"].(
+               Map.merge(common, %{
+                 verb: "revoke-assignment",
+                 params: %{assignment_id: assign_id}
+               })
+             )
+
+    assert %{state: "open"} =
+             handlers["reopen-assignment"].(
+               Map.merge(common, %{
+                 verb: "reopen-assignment",
+                 params: %{assignment_id: assign_id, reason: "prove configured effort rearm"}
+               })
+             )
+
+    assert {:ok,
+            [
+              [1, "canceled", 123, initial_effort_root],
+              [2, "armed", 123, reopened_effort_root]
+            ]} =
+             DB.query(
+               ctx.db,
+               "SELECT generation,state,baseHorizonMs,root FROM effort_checkin_generations WHERE assignmentId=?1 ORDER BY generation",
+               [assign_id]
+             )
+
+    assert initial_effort_root == reopened_effort_root
+    assert Path.dirname(reopened_effort_root) == Path.join(base_dir, "work")
   end
 
   test "retire refuses built-in mains — the fallback target is permanent", ctx do
@@ -4259,6 +4300,32 @@ defmodule Tightbeam.GatewayTest do
              })
 
     assert Org.get_setting(ctx.db, "default-archetype") == "coder"
+
+    assert %{setting: "default-priority", value: 4} =
+             config.(%{
+               origin: "user:flynn",
+               params: %{action: "get", setting: "default-priority"}
+             })
+
+    assert %{code: "invalid_priority"} =
+             config.(%{
+               origin: "user:flynn",
+               params: %{action: "set", setting: "default-priority", value: 9}
+             })
+
+    assert %{code: "forbidden", message: "admin required"} =
+             config.(%{
+               origin: "user:not-admin",
+               params: %{action: "set", setting: "default-priority", value: 6}
+             })
+
+    assert %{setting: "default-priority", value: 6, changed: true} =
+             config.(%{
+               origin: "user:flynn",
+               params: %{action: "set", setting: "default-priority", value: 6}
+             })
+
+    assert Org.get_setting(ctx.db, "default-priority") == "6"
   end
 
   test "spawn readiness denial creates no session, role, or idempotency row", ctx do

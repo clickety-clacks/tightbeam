@@ -1054,7 +1054,7 @@ defmodule Tightbeam.StateResources do
   defp config_row([key, value, updated_at, row_version]) do
     %{
       key: key,
-      value: if(key == "default-archetype", do: value, else: nil),
+      value: if(key in ["default-archetype", "default-priority"], do: value, else: nil),
       updated_at: updated_at,
       row_version: row_version
     }

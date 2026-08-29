@@ -1093,7 +1093,9 @@ defmodule Tightbeam.Gateway do
         WorkItems.__handle__(
           db,
           "work-item-update",
-          Map.put(call, :on_work_item_change, item_change)
+          call
+          |> Map.put(:on_work_item_change, item_change)
+          |> Map.put(:effort_config, config)
         )
       end,
       {"work-item-icebox", ["work_item.iceboxed"]} =>
@@ -1110,6 +1112,7 @@ defmodule Tightbeam.Gateway do
           |> Map.put(:supervision_interval_ms, Map.fetch!(config, :wake_tick_ms))
           |> Map.put(:on_assignment_change, assignment_change)
           |> Map.put(:on_work_item_change, item_change)
+          |> Map.put(:effort_config, config)
 
         Assignments.__handle__(db, "assign", call)
       end,
@@ -1152,8 +1155,10 @@ defmodule Tightbeam.Gateway do
           call
           |> Map.put(:on_assignment_change, assignment_change)
           # A reopened card is armed exactly like a freshly assigned one, so it
-          # needs the same supervision interval `assign` and `dispatch` get.
+          # needs the same supervision and effort configuration `assign` and
+          # `dispatch` get.
           |> Map.put(:supervision_interval_ms, Map.fetch!(config, :wake_tick_ms))
+          |> Map.put(:effort_config, config)
         )
       end,
       {"repair-assignment", ["message.created"]} => fn call ->
@@ -4598,6 +4603,16 @@ defmodule Tightbeam.Gateway do
     }
   end
 
+  defp config_result(db, %{params: %{action: "get", setting: "default-priority"}}) do
+    item = StateResources.query_config(db, "default-priority")
+
+    %{
+      setting: "default-priority",
+      value: parse_default_priority(Org.get_setting(db, "default-priority")),
+      config: item && StateResources.config(item)
+    }
+  end
+
   defp config_result(
          db,
          %{
@@ -4611,7 +4626,7 @@ defmodule Tightbeam.Gateway do
     case DB.transaction(db, fn txn ->
            if Archetypes.get(archetype_name) do
              result =
-               Org.put_setting_projected_in_txn(txn, "default-archetype", archetype_name)
+               put_setting_projected_in_txn(txn, "default-archetype", archetype_name)
 
              Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
 
@@ -4645,9 +4660,56 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp config_result(_db, _call) do
-    %{code: "invalid", message: "config supports get/set default-archetype"}
+  defp config_result(
+         db,
+         %{params: %{action: "set", setting: "default-priority", value: priority}} = call
+       ) do
+    if is_integer(priority) and priority in 0..8 do
+      value = Integer.to_string(priority)
+
+      case DB.transaction(db, fn txn ->
+             result = put_setting_projected_in_txn(txn, "default-priority", value)
+             Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
+
+             if result.changed do
+               Tightbeam.Firehose.Publisher.committed_in_txn(
+                 txn,
+                 "config.updated",
+                 result.projection,
+                 %{"key" => "default-priority"}
+               )
+             end
+
+             result
+           end) do
+        {:ok, result} ->
+          %{
+            setting: "default-priority",
+            value: priority,
+            config: StateResources.config(result.projection),
+            changed: result.changed
+          }
+
+        {:error, error} ->
+          raise error
+      end
+    else
+      %{code: "invalid_priority", message: "priority must be an integer from 0 through 8"}
+    end
   end
+
+  defp config_result(_db, _call) do
+    %{
+      code: "invalid",
+      message: "config supports get/set default-archetype or default-priority"
+    }
+  end
+
+  defp parse_default_priority(nil), do: 4
+  defp parse_default_priority(value), do: String.to_integer(value)
+
+  defp put_setting_projected_in_txn(txn, key, value),
+    do: Org.put_setting_projected_in_txn(txn, key, value)
 
   defp admin_handler(db, fun) do
     fn call ->

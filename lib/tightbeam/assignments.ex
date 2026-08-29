@@ -122,6 +122,13 @@ defmodule Tightbeam.Assignments do
   )
   """
 
+  @assignment_priorities_ddl """
+  CREATE TABLE IF NOT EXISTS assignment_priorities (
+    assignmentId TEXT PRIMARY KEY REFERENCES assignments(id),
+    priority INTEGER NOT NULL
+  )
+  """
+
   @interruptions_ddl """
   CREATE TABLE IF NOT EXISTS assignment_interruptions (
     assignmentId TEXT PRIMARY KEY REFERENCES assignments(id),
@@ -167,6 +174,7 @@ defmodule Tightbeam.Assignments do
     :ok = DB.execute(db, @attests_ddl)
     :ok = DB.execute(db, @assignment_files_ddl)
     :ok = DB.execute(db, @assignment_effects_ddl)
+    :ok = DB.execute(db, @assignment_priorities_ddl)
     :ok = DB.execute(db, @interruptions_ddl)
     :ok = DB.execute(db, @reopenings_ddl)
     Tightbeam.EffortCheckin.ensure_schema(db)
@@ -615,10 +623,15 @@ defmodule Tightbeam.Assignments do
   def __handle__(db, "assignments", call), do: assignments_result(db, call)
 
   defp assign_result(db, call) do
+    config = effort_config(db, call)
+
     open_assignment_result(
       db,
       call,
-      fn _txn, assignment -> {:created, assignment, nil} end,
+      fn txn, assignment ->
+        EffortCheckin.arm_in_txn(txn, config, assignment)
+        {:created, assignment, nil}
+      end,
       fn -> :ok end,
       "assign"
     )
@@ -1185,6 +1198,34 @@ defmodule Tightbeam.Assignments do
           _ -> {supplied, :error}
         end
 
+      effort_config = effort_config(db, call)
+
+      prepared_effort_arm =
+        case from do
+          {assignment_id, {:ok, _}} ->
+            may_prepare? =
+              transaction(db, fn txn ->
+                case fetch_assignment(txn, assignment_id) do
+                  %{state: "closed"} = assignment ->
+                    reopen_allowed?(txn, call.principal, assignment)
+
+                  _ ->
+                    false
+                end
+              end)
+
+            if may_prepare?,
+              do: EffortCheckin.prepare_reopen_arm(db, effort_config, assignment_id)
+
+          _ ->
+            nil
+        end
+
+      call =
+        call
+        |> Map.put(:effort_config, effort_config)
+        |> Map.put(:prepared_effort_arm, prepared_effort_arm)
+
       result =
         transaction(db, fn txn ->
           visible? = fn id ->
@@ -1292,6 +1333,13 @@ defmodule Tightbeam.Assignments do
 
     if Txn.changes(txn) != 1, do: raise(TransitionRace)
     reopened = fetch_assignment!(txn, assignment_id)
+
+    EffortCheckin.arm_reopened_in_txn(
+      txn,
+      call.effort_config,
+      reopened,
+      call.prepared_effort_arm
+    )
 
     # A terminal disposition DELETEs the entitlement row, so this arms a fresh
     # generation exactly as `assign` does — a reopened card is watched like any
@@ -1644,6 +1692,12 @@ defmodule Tightbeam.Assignments do
           txn,
           "INSERT INTO assignment_effects (assignmentId, effectKind) VALUES (?1, ?2)",
           [id, effective_effect_kind(reviews_assignment_id, call.params[:effect_kind])]
+        )
+
+        Txn.q(
+          txn,
+          "INSERT INTO assignment_priorities (assignmentId, priority) VALUES (?1, ?2)",
+          [id, inherited_priority_in_txn(txn, work_item_id)]
         )
 
         Enum.each(files, fn path ->
@@ -2179,7 +2233,7 @@ defmodule Tightbeam.Assignments do
       db: db,
       port: Application.get_env(:tightbeam, :port, 11_373),
       effort_checkin_horizon_ms:
-        Application.get_env(:tightbeam, :effort_checkin_horizon_ms, 900_000)
+        Application.get_env(:tightbeam, :effort_checkin_horizon_ms, 14_400_000)
     }
 
     Map.merge(defaults, Map.get(call, :effort_config, %{}))
@@ -2562,7 +2616,10 @@ defmodule Tightbeam.Assignments do
       "openedAt, state, outcome, closedAt, closedByUser, closedBySession, closingAttestId" <>
       ", workItemId, reviewsAssignmentId, holderHarness, holderProvider, " <>
       "COALESCE((SELECT effectKind FROM assignment_effects WHERE assignmentId = assignments.id), " <>
-      "CASE WHEN reviewsAssignmentId IS NULL THEN 'code' ELSE 'review' END)"
+      "CASE WHEN reviewsAssignmentId IS NULL THEN 'code' ELSE 'review' END), " <>
+      "COALESCE((SELECT priority FROM assignment_priorities WHERE assignmentId=assignments.id), " <>
+      "(SELECT priority FROM work_item_priorities WHERE workItemId=assignments.workItemId), " <>
+      "CAST(COALESCE((SELECT value FROM org_settings WHERE key='default-priority'),'4') AS INTEGER))"
   end
 
   defp assignment([
@@ -2584,7 +2641,8 @@ defmodule Tightbeam.Assignments do
          reviews_assignment_id,
          holder_harness,
          holder_provider,
-         effect_kind
+         effect_kind,
+         priority
        ]) do
     %{
       id: id,
@@ -2605,8 +2663,24 @@ defmodule Tightbeam.Assignments do
       reviewsAssignmentId: reviews_assignment_id,
       holderHarness: holder_harness,
       holderProvider: holder_provider,
-      effectKind: effect_kind
+      effectKind: effect_kind,
+      priority: priority
     }
+  end
+
+  defp inherited_priority_in_txn(txn, work_item_id) do
+    case Txn.q(
+           txn,
+           """
+           SELECT COALESCE(
+             (SELECT priority FROM work_item_priorities WHERE workItemId=?1),
+             CAST(COALESCE((SELECT value FROM org_settings WHERE key='default-priority'),'4') AS INTEGER)
+           )
+           """,
+           [work_item_id]
+         ) do
+      [[priority]] -> priority
+    end
   end
 
   defp attest([

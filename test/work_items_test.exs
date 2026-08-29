@@ -94,6 +94,21 @@ defmodule Tightbeam.WorkItemsTest do
     assert Enum.any?(assignment_fks, fn [_id, _seq, table, from, to | _] ->
              table == "work_items" and from == "workItemId" and to == "id"
            end)
+
+    assert {:ok, priority_columns} = DB.query(db, "PRAGMA table_info(work_item_priorities)")
+
+    assert Enum.map(priority_columns, fn [_cid, name | _] -> name end) == [
+             "workItemId",
+             "priority"
+           ]
+
+    assert {:ok, assignment_priority_columns} =
+             DB.query(db, "PRAGMA table_info(assignment_priorities)")
+
+    assert Enum.map(assignment_priority_columns, fn [_cid, name | _] -> name end) == [
+             "assignmentId",
+             "priority"
+           ]
   end
 
   test "create validates every field and records session or user creator", ctx do
@@ -140,6 +155,16 @@ defmodule Tightbeam.WorkItemsTest do
     assert session.specRefName == "spec.md"
     assert session.specRefSha256 == @sha
     assert session.isBug
+
+    assert user.priority == 4
+
+    explicit = create(ctx, {:user, "flynn"}, %{title: "Urgent", priority: 7})
+    assert explicit.priority == 7
+
+    for invalid <- [-1, 9, "4"] do
+      assert %{code: "invalid_priority"} =
+               create(ctx, {:user, "flynn"}, %{title: "Invalid priority", priority: invalid})
+    end
   end
 
   test "Proof 1: an item created during a running turn carries that seq with known = 1; created with no running turn carries NULL with known = 1",
@@ -226,6 +251,15 @@ defmodule Tightbeam.WorkItemsTest do
     assert titled.specRefName == "spec.md"
     assert titled.specRefSha256 == @sha2
     assert update(ctx, {:user, "flynn"}, pinned.id, %{title: "Retitled"}) == titled
+
+    reprioritized = update(ctx, {:user, "flynn"}, pinned.id, %{priority: 6})
+    assert reprioritized.priority == 6
+
+    inherited = assign(ctx, "holder", "priority inheritance", pinned.id)
+    assert inherited.priority == 6
+
+    assert %{code: "invalid_priority"} =
+             update(ctx, {:user, "flynn"}, pinned.id, %{priority: 10})
 
     assert %{code: "invalid_spec_ref"} =
              update(ctx, {:user, "flynn"}, pinned.id, %{

@@ -18,6 +18,8 @@ defmodule Tightbeam.EffortCheckinTest do
     WorkItems
   }
 
+  alias Tightbeam.ConditionFacts
+
   defmodule LaneDoorbell do
     @moduledoc false
     use GenServer
@@ -95,13 +97,18 @@ defmodule Tightbeam.EffortCheckinTest do
     }
   end
 
-  test "proof 1: dispatch arms one bracket; bare assign does not; roots validate; all closes cancel",
+  test "proof 1: assign and dispatch each arm one bracket; roots validate; all closes cancel",
        ctx do
     bare = assignment(ctx, "assign", {:user, "h1"}, "holder", %{subject: "bare"})
 
-    assert rows(ctx.db, "SELECT COUNT(*) FROM effort_checkin_generations WHERE assignmentId=?1", [
-             bare.id
-           ]) == [[0]]
+    assert [[1, "armed", bare_wake_id]] =
+             rows(
+               ctx.db,
+               "SELECT generation,state,wakeId FROM effort_checkin_generations WHERE assignmentId=?1",
+               [bare.id]
+             )
+
+    assert %{consumer: "effort_probe", state: "pending"} = Wakes.get(ctx.db, bare_wake_id)
 
     for bad <- ["/absolute", "../escape", "a/../escape"] do
       assert %{code: "invalid_workdir_root"} =
@@ -169,59 +176,184 @@ defmodule Tightbeam.EffortCheckinTest do
     assert bracket_state(ctx.db, retired.id) == "canceled"
   end
 
-  test "acceptance 4 and 5: writes are detected with no git anywhere; a stall is not effect",
+  test "priority inherits from the work item, scales the four-hour window, and reprioritizes live probes",
        ctx do
-    # Acceptance 4: this workspace has no repository under it at all. Every case
-    # below is a WRITE, and none of them produces `unobservable` or a nag.
-    refute File.exists?(Path.join(ctx.root, ".git"))
+    config = Map.put(ctx.config, :effort_checkin_horizon_ms, 14_400_000)
+    ctx = %{ctx | config: config}
 
-    modified = dispatch(ctx, {:session, "parent"}, "holder", "modified file")
-    File.write!(Path.join(ctx.root, "src/tracked.txt"), "changed\n")
-    assert nil == fire_probe(ctx, modified.id)
-    assert silent_rearm(ctx.db, modified.id)
+    horizons =
+      for {priority, expected} <- [{3, 28_800_000}, {4, 14_400_000}, {5, 7_200_000}],
+          into: %{} do
+        item =
+          WorkItems.__handle__(ctx.db, "work-item-create", %{
+            verb: "work-item-create",
+            origin: "user:h1",
+            principal: {:user, "h1"},
+            session_key: nil,
+            params: %{title: "priority #{priority}", priority: priority}
+          })
+
+        assignment =
+          dispatch_for_item(ctx, {:session, "parent"}, "holder", "priority #{priority}", item.id)
+
+        assert assignment.priority == priority
+
+        assert [[^priority]] =
+                 rows(
+                   ctx.db,
+                   "SELECT priority FROM assignment_priorities WHERE assignmentId=?1",
+                   [
+                     assignment.id
+                   ]
+                 )
+
+        assert [[^expected, ^expected]] =
+                 rows(
+                   ctx.db,
+                   """
+                   SELECT g.baseHorizonMs,w.dueAt-g.armedAt
+                   FROM effort_checkin_generations AS g
+                   JOIN wakes AS w ON w.wakeId=g.wakeId
+                   WHERE g.assignmentId=?1 AND g.state='armed'
+                   """,
+                   [assignment.id]
+                 )
+
+        {priority, {item, assignment}}
+      end
+
+    {item, assignment} = horizons[4]
+
+    updated =
+      Gateway.handlers(ctx.config)["work-item-update"].(%{
+        verb: "work-item-update",
+        origin: "agent:holder",
+        principal: {:session, "holder"},
+        session_key: "holder",
+        params: %{work_item_id: item.id, priority: 6}
+      })
+
+    assert updated.priority == 6
+
+    assert [[6, 3_600_000, 3_600_000]] =
+             rows(
+               ctx.db,
+               """
+               SELECT ap.priority,g.baseHorizonMs,w.dueAt-g.armedAt
+               FROM assignment_priorities AS ap
+               JOIN effort_checkin_generations AS g ON g.assignmentId=ap.assignmentId
+               JOIN wakes AS w ON w.wakeId=g.wakeId
+               WHERE ap.assignmentId=?1 AND g.state='armed'
+               """,
+               [assignment.id]
+             )
+
+    closed_item =
+      WorkItems.__handle__(ctx.db, "work-item-create", %{
+        verb: "work-item-create",
+        origin: "user:h1",
+        principal: {:user, "h1"},
+        session_key: nil,
+        params: %{title: "closed priority", priority: 4}
+      })
+
+    closed =
+      dispatch_for_item(
+        ctx,
+        {:session, "parent"},
+        "holder",
+        "closed priority",
+        closed_item.id
+      )
+
+    assignment(ctx, "attest", {:session, "holder"}, nil, %{
+      assignment_id: closed.id,
+      kind: "completion"
+    })
+
+    assert bracket_state(ctx.db, closed.id) == "canceled"
+
+    assert %{priority: 6} =
+             Gateway.handlers(ctx.config)["work-item-update"].(%{
+               verb: "work-item-update",
+               origin: "agent:holder",
+               principal: {:session, "holder"},
+               session_key: "holder",
+               params: %{work_item_id: closed_item.id, priority: 6}
+             })
+
+    assert [[6]] =
+             rows(
+               ctx.db,
+               "SELECT priority FROM assignment_priorities WHERE assignmentId=?1",
+               [closed.id]
+             )
+
+    reopened =
+      assignment(ctx, "reopen-assignment", {:session, "parent"}, nil, %{
+        assignment_id: closed.id,
+        reason: "the card carries work again"
+      })
+
+    assert reopened.state == "open"
+
+    assert [[2, "armed", 3_600_000, 3_600_000]] =
+             rows(
+               ctx.db,
+               """
+               SELECT g.generation,g.state,g.baseHorizonMs,w.dueAt-g.armedAt
+               FROM effort_checkin_generations AS g
+               JOIN wakes AS w ON w.wakeId=g.wakeId
+               WHERE g.assignmentId=?1
+               ORDER BY g.generation DESC LIMIT 1
+               """,
+               [closed.id]
+             )
+  end
+
+  test "a standing work-blocked fact suppresses the check and an ineligible icebox cancels it",
+       ctx do
+    blocked = dispatch(ctx, {:session, "parent"}, "holder", "blocked")
+
+    {:ok, %{kind: "work-blocked"}} =
+      DB.transaction(ctx.db, fn txn ->
+        ConditionFacts.file_in_txn(txn, %{
+          kind: "work-blocked",
+          scope: "holder",
+          origin: "agent:holder"
+        })
+      end)
+
+    assert nil == fire_probe(ctx, blocked.id)
+    assert silent_rearm(ctx.db, blocked.id)
     assert prods(ctx.db, "holder") == []
 
-    created = dispatch(ctx, {:session, "parent"}, "holder", "created file")
-    File.write!(Path.join(ctx.root, "created.tmp"), "effect")
-    assert nil == fire_probe(ctx, created.id)
-    assert silent_rearm(ctx.db, created.id)
+    item = work_item!(ctx.db, "legacy icebox")
+    legacy = dispatch_for_item(ctx, {:session, "parent"}, "holder", "legacy icebox", item.id)
+    :ok = DB.execute(ctx.db, "UPDATE work_items SET state='iceboxed' WHERE id='#{item.id}'")
+    wake = current_wake(ctx.db, legacy.id)
 
-    deleted = dispatch(ctx, {:session, "parent"}, "holder", "deleted file")
-    File.rm!(Path.join(ctx.root, "created.tmp"))
-    assert nil == fire_probe(ctx, deleted.id)
-    assert silent_rearm(ctx.db, deleted.id)
+    assert nil == fire_probe(ctx, legacy.id)
+    assert bracket_state(ctx.db, legacy.id) == "canceled"
+    assert Wakes.get(ctx.db, wake.wake_id).state == "fired"
+    assert prods(ctx.db, "holder") == []
+  end
 
-    nested = dispatch(ctx, {:session, "parent"}, "holder", "nested write")
-    File.mkdir_p!(Path.join(ctx.root, "deep/deeper"))
-    File.write!(Path.join(ctx.root, "deep/deeper/note.md"), "nested")
-    assert nil == fire_probe(ctx, nested.id)
-    assert silent_rearm(ctx.db, nested.id)
+  test "acceptance 4 and 5: workspace writes are not activity; a stall is not effect",
+       ctx do
+    # Filesystem activity is not one of the four authorized card activities.
+    # A write therefore cannot hide an otherwise inactive card.
+    modified = dispatch(ctx, {:session, "parent"}, "holder", "workspace-only activity")
+    File.write!(Path.join(ctx.root, "src/tracked.txt"), "changed\n")
+    assert nil == fire_probe(ctx, modified.id)
+    assert [prod] = Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == modified.id))
+    assert prod.prompt =~ "no artifacts, attests, or work-item updates"
+    refute prod.prompt =~ "writes"
+    refute prod.prompt =~ "workspace"
 
-    # A repository under the root is neither required nor special: git motion is
-    # only ever visible here as the writes git makes.
-    git_root = Path.join(ctx.root, "repo")
-    init_repo(git_root)
-    committed = dispatch(ctx, {:session, "parent"}, "holder", "commit")
-    File.write!(Path.join(git_root, "tracked.txt"), "committed\n")
-    git!(git_root, ["add", "tracked.txt"])
-    git!(git_root, ["commit", "-m", "effect"])
-    assert nil == fire_probe(ctx, committed.id)
-    assert silent_rearm(ctx.db, committed.id)
-
-    # ACCEPTED MISS-CASE (documented, not fixed): an mtime-preserving copy of a
-    # file that is already listed writes bytes the probe cannot see. It fails
-    # SAFE — one prod, answered by an attest. A copy to a NEW path is caught by
-    # the listing, so the miss needs an existing destination.
-    File.write!(Path.join(ctx.root, "src/dest.txt"), "old")
-    File.write!(Path.join(ctx.root, "src/source.txt"), "new bytes")
-    File.touch!(Path.join(ctx.root, "src/source.txt"), 1_700_000_000)
-    File.touch!(Path.join(ctx.root, "src/dest.txt"), 1_700_000_000)
-    preserved = dispatch(ctx, {:session, "parent"}, "holder", "mtime-preserving copy")
-    {_out, 0} = System.cmd("cp", ["-p", src(ctx, "src/source.txt"), src(ctx, "src/dest.txt")])
-    assert File.read!(src(ctx, "src/dest.txt")) == "new bytes"
-    assert nil == fire_probe(ctx, preserved.id)
-    assert [prod] = prods(ctx.db, "holder")
-    assert prod.prompt =~ "no writes, artifacts, attests, or work-item updates"
+    File.write!(Path.join(ctx.root, "created.tmp"), "more workspace activity")
+    assert nil == fire_probe(ctx, modified.id)
+    assert [%{session_key: "parent"}] = escalation_wakes(ctx.db, modified.id)
 
     # A stall is turns without effect: turns are reported, never counted.
     stalled = dispatch(ctx, {:session, "parent"}, "holder", "stall")
@@ -240,7 +372,7 @@ defmodule Tightbeam.EffortCheckinTest do
     fire_probe(ctx, stalled.id)
     assert [parent_escalation] = escalation_wakes(ctx.db, stalled.id)
     assert parent_escalation.session_key == "parent"
-    assert parent_escalation.prompt =~ "no writes, artifacts, attests, or work-item updates"
+    assert parent_escalation.prompt =~ "no artifacts, attests, or work-item updates"
 
     # A replayed probe of an already-probed generation is inert.
     assert :ok = EffortCheckin.probe(ctx.db, ctx.config, wake)
@@ -248,14 +380,6 @@ defmodule Tightbeam.EffortCheckinTest do
     assert rows(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE assignmentId=?1", [
              stalled.id
            ]) == [[0]]
-
-    # An absent workspace is stated as a fact on the channel it belongs to, not
-    # raised as its own alarm.
-    missing = dispatch(ctx, {:session, "parent"}, "holder", "missing")
-    File.rm_rf!(ctx.root)
-    parent_escalation = escalate(ctx, missing.id)
-    assert parent_escalation.session_key == "parent"
-    assert parent_escalation.prompt =~ "workspace #{ctx.root}: unobservable"
   end
 
   test "proof 4: internal wakes create no turn and stay out of pending/inspection", ctx do
@@ -358,7 +482,7 @@ defmodule Tightbeam.EffortCheckinTest do
     assert :counters.get(calls, 1) == 1
   end
 
-  test "proof 8: a busy org editing across multiple horizons emits zero visible artifacts", ctx do
+  test "proof 8: holder-wide workspace activity cannot suppress card inactivity", ctx do
     assignments =
       for index <- 1..3 do
         dispatch(ctx, {:session, "parent"}, "holder", "busy #{index}")
@@ -375,9 +499,8 @@ defmodule Tightbeam.EffortCheckinTest do
 
     assert rows(ctx.db, "SELECT COUNT(*) FROM condition_facts", []) == [[0]]
 
-    # A working agent is not prodded either: the prod is a rung of the alarm,
-    # not a heartbeat.
-    assert prods(ctx.db, "holder") == []
+    assert Enum.sort(Enum.map(prods(ctx.db, "holder"), & &1.assignment_id)) ==
+             Enum.sort(Enum.map(assignments, & &1.id))
   end
 
   test "proofs 5 and 8b: effect resets the parent rung and Main terminates escalation", ctx do
@@ -392,8 +515,13 @@ defmodule Tightbeam.EffortCheckinTest do
                [item.id]
              )
 
-    # Any real effect resets the streak, including its parent-ladder position.
-    File.write!(Path.join(ctx.root, "src/tracked.txt"), "reset\n")
+    # An assignment-local attest resets the streak, including its parent-ladder position.
+    assignment(ctx, "attest", {:session, "holder"}, nil, %{
+      assignment_id: item.id,
+      kind: "progress",
+      note: "material assignment progress"
+    })
+
     assert nil == fire_probe(ctx, item.id)
     assert silent_rearm(ctx.db, item.id, 4)
 
@@ -571,7 +699,8 @@ defmodule Tightbeam.EffortCheckinTest do
       })
 
     assert nil == fire_probe(%{ctx | config: changing_remote}, item.id)
-    assert silent_rearm(ctx.db, item.id)
+    assert [prod] = Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == item.id))
+    assert prod.prompt =~ "no artifacts, attests, or work-item updates"
 
     failed_config = Map.put(ctx.config, :sh, fn _ -> {"ssh unavailable", 255} end)
 
@@ -583,7 +712,7 @@ defmodule Tightbeam.EffortCheckinTest do
 
     escalation = escalate(%{ctx | config: failed_config}, failed.id)
     assert escalation.session_key == "parent"
-    assert escalation.prompt =~ "unobservable"
+    assert escalation.prompt =~ "no artifacts, attests, or work-item updates"
     assert no_effort_requests?(ctx.db, failed.id)
   end
 
@@ -601,7 +730,7 @@ defmodule Tightbeam.EffortCheckinTest do
     assert prod.session_key == "holder"
     assert prod.assignment_id == silent.id
     assert prod.state == "pending"
-    assert prod.prompt =~ "no writes, artifacts, attests, or work-item updates"
+    assert prod.prompt =~ "no artifacts, attests, or work-item updates"
     assert prod.prompt =~ "artifact-record"
     assert prod.prompt =~ "2 turns taken"
     assert prod.prompt =~ "new material result or evidence"
@@ -629,6 +758,34 @@ defmodule Tightbeam.EffortCheckinTest do
     assert nil == fire_probe(ctx, recorded.id)
     assert silent_rearm(ctx.db, recorded.id)
     assert Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == recorded.id)) == []
+  end
+
+  test "artifacts count only for the card's work item and unthreaded cards have none", ctx do
+    item = work_item!(ctx.db, "artifact scope")
+    other_item = work_item!(ctx.db, "unrelated artifact scope")
+
+    scoped = dispatch_for_item(ctx, {:session, "parent"}, "holder", "scoped", item.id)
+    artifact!(ctx.db, "holder", other_item.id, "other-card.md")
+
+    assert nil == fire_probe(ctx, scoped.id)
+
+    assert [_prod] =
+             Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == scoped.id))
+
+    matching = dispatch_for_item(ctx, {:session, "parent"}, "holder", "matching", item.id)
+    artifact!(ctx.db, "holder", item.id, "this-card.md")
+
+    assert nil == fire_probe(ctx, matching.id)
+    assert silent_rearm(ctx.db, matching.id)
+    assert Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == matching.id)) == []
+
+    unthreaded = assignment(ctx, "assign", {:user, "h1"}, "holder", %{subject: "unthreaded"})
+    artifact!(ctx.db, "holder", item.id, "still-threaded.md")
+
+    assert nil == fire_probe(ctx, unthreaded.id)
+
+    assert [_prod] =
+             Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == unthreaded.id))
   end
 
   test "acceptance 1 on the PRODUCTION path: the dispatch's own doorbell is not the holder's work",
@@ -668,7 +825,7 @@ defmodule Tightbeam.EffortCheckinTest do
     assert nil == fire_probe(ctx, assignment.id)
 
     assert [prod] = Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == assignment.id))
-    assert prod.prompt =~ "no writes, artifacts, attests, or work-item updates"
+    assert prod.prompt =~ "no artifacts, attests, or work-item updates"
 
     # And a real work-item UPDATE by the holder still counts, on the same path.
     silent = dispatch_for_item(ctx, {:session, "parent"}, "holder", "second bracket", item.id)
@@ -741,8 +898,7 @@ defmodule Tightbeam.EffortCheckinTest do
     assert [escalation] = escalation_wakes(ctx.db, silent.id)
     assert escalation.session_key == "parent"
     assert escalation.prompt =~ "Child session holder remains inactive"
-    assert escalation.prompt =~ "no writes, artifacts, attests, or work-item updates"
-    assert escalation.prompt =~ "workspace #{ctx.root}: none"
+    assert escalation.prompt =~ "no artifacts, attests, or work-item updates"
     assert no_effort_requests?(ctx.db, silent.id)
 
     # One prod per silent streak, not one per bracket.
@@ -1052,9 +1208,12 @@ defmodule Tightbeam.EffortCheckinTest do
 
     assert replacement_wake_id == replacement_wake.wake_id
 
-    assert rows(ctx.db, "SELECT COUNT(*) FROM effort_checkin_generations WHERE assignmentId=?1", [
-             bare.id
-           ]) == [[0]]
+    assert [[2, "satellite"]] =
+             rows(
+               ctx.db,
+               "SELECT generation,host FROM effort_checkin_generations WHERE assignmentId=?1 AND state='armed'",
+               [bare.id]
+             )
 
     assert [[host, root]] =
              rows(
@@ -1112,9 +1271,12 @@ defmodule Tightbeam.EffortCheckinTest do
                [item.id]
              )
 
-    assert rows(ctx.db, "SELECT COUNT(*) FROM effort_checkin_generations WHERE assignmentId=?1", [
-             bare.id
-           ]) == [[0]]
+    assert [[3, ^replacement_key]] =
+             rows(
+               ctx.db,
+               "SELECT generation,holderKey FROM effort_checkin_generations WHERE assignmentId=?1 AND state='armed'",
+               [bare.id]
+             )
   end
 
   test "A-05: a dismiss snapshot change refuses stale and a fresh retry rules once", ctx do
@@ -1524,21 +1686,6 @@ defmodule Tightbeam.EffortCheckinTest do
       )
 
     JSON.decode!(baseline)["observation"]["stamp"]
-  end
-
-  defp init_repo(path) do
-    File.mkdir_p!(path)
-    git!(path, ["init"])
-    git!(path, ["config", "user.email", "test@example.invalid"])
-    git!(path, ["config", "user.name", "Test"])
-    File.write!(Path.join(path, "tracked.txt"), "baseline\n")
-    git!(path, ["add", "tracked.txt"])
-    git!(path, ["commit", "-m", "baseline"])
-  end
-
-  defp git!(path, args) do
-    {_output, 0} = System.cmd("git", ["-C", path | args], stderr_to_stdout: true)
-    :ok
   end
 
   # The prod is a wake to the HOLDER; the owner request's notification is a wake
