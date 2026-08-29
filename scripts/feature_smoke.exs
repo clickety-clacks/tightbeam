@@ -268,16 +268,7 @@ defmodule FeatureSmoke do
        entries
        |> replace_bytes(".claude.json", "[]")
        |> runtime_case(%{}, "claude", "pre-wake", cwd, now, now), "FX_JSON_SHAPE"},
-      {"AC-24",
-       runtime_case(
-         %{},
-         "codex",
-         "pre-wake",
-         [synthetic_entry("plugin-cache", :regular, 0o600, "x")],
-         cwd,
-         now,
-         now
-       ), "FX_CODEX_RUNTIME_PATH"},
+      {"AC-24", codex_runtime_scope_case(cwd, now), :pass},
       {"AC-25", repeated_first_failure(entries, cwd, now), "FX_MODE"},
       {"AC-26", full_evidence_file_case(entries), :pass},
       {"AC-27", cleanup_refusal_case(entries, cwd, now), :pass},
@@ -605,7 +596,7 @@ defmodule FeatureSmoke do
       nil ->
         case snapshot_home(home, runtime?) do
           {:ok, entries, snapshot_finished_at}
-          when snapshot_finished_at < spawn_started_at ->
+          when harness == "claude" and snapshot_finished_at < spawn_started_at ->
             runtime_entries = Enum.filter(entries, &runtime?.(&1.raw_path))
 
             finish_home_refusal!(
@@ -618,7 +609,7 @@ defmodule FeatureSmoke do
             )
 
           {:error, path, entries, snapshot_finished_at}
-          when snapshot_finished_at < spawn_started_at ->
+          when harness == "claude" and snapshot_finished_at < spawn_started_at ->
             partial = partial_phase_entries(entries, expected_home, ancestors, path)
 
             finish_home_refusal!(
@@ -987,6 +978,74 @@ defmodule FeatureSmoke do
     end
   end
 
+  defp codex_runtime_scope_case(cwd, now) do
+    delta_result =
+      runtime_case(
+        %{},
+        "codex",
+        "pre-wake",
+        [synthetic_entry("plugin-cache", :regular, 0o600, "x")],
+        cwd,
+        now,
+        now
+      )
+
+    if delta_result == "FX_CODEX_RUNTIME_PATH" and codex_clock_scope_case() == :pass,
+      do: :pass,
+      else: :failed
+  end
+
+  defp codex_clock_scope_case do
+    with_case_dir(fn root ->
+      path = Path.join(root, @home_evidence_name)
+      reset_case_trace!()
+
+      result =
+        with_home_evidence!(
+          root,
+          fn evidence ->
+            state = %{
+              leg: %{wire_name: "codex"},
+              evidence: %{evidence | sequence: 6, phase_index: 5}
+            }
+
+            try do
+              validate_runtime_home!(
+                state,
+                root,
+                MapSet.new([@home_evidence_name]),
+                "agent:fixture",
+                "/unused",
+                System.system_time(:millisecond) + 60_000,
+                "pre-wake"
+              )
+            catch
+              {:home_case_refusal, refusal} -> refusal
+            end
+          end,
+          home_ops(%{refusal: &case_refusal!/6})
+        )
+
+      record = path |> File.read!() |> String.trim() |> JSON.decode!()
+      clock = Enum.at(record["checks"], 2)
+      snapshot = Enum.at(record["checks"], 3)
+      codex_delta = Enum.at(record["checks"], 6)
+
+      if match?(%{evidence: %{sequence: 7, phase_index: 6}}, result) and
+           record["result"] == "pass" and record["cause"] == "validated" and
+           record["entries"] == [] and
+           clock == %{
+             "id" => "clock_order",
+             "applicable" => false,
+             "evaluated" => false,
+             "passed" => nil
+           } and snapshot["applicable"] and snapshot["evaluated"] and snapshot["passed"] and
+           codex_delta["applicable"] and codex_delta["evaluated"] and codex_delta["passed"],
+         do: :pass,
+         else: :failed
+    end)
+  end
+
   defp full_evidence_file_case(entries) do
     with_passing_evidence(entries, fn path, bytes, records ->
       {:ok, info} = :file.read_link_info(path)
@@ -1245,32 +1304,83 @@ defmodule FeatureSmoke do
   end
 
   defp evidence_exclusive_create_case do
+    outcomes = Enum.map([:regular, :fifo], &existing_evidence_path_case/1)
+    if outcomes == [:pass, :pass], do: :pass, else: :failed
+  end
+
+  defp existing_evidence_path_case(kind) do
     with_case_dir(fn root ->
       path = Path.join(root, @home_evidence_name)
-      File.write!(path, "preexisting")
+
+      case kind do
+        :regular -> File.write!(path, "preexisting")
+        :fifo -> {"", 0} = System.cmd("mkfifo", [path])
+      end
+
       File.chmod!(path, 0o640)
       {:ok, before} = :file.read_link_info(path)
-      reset_case_trace!()
-
-      refusal =
-        catch_case_refusal(fn ->
-          with_home_evidence!(
-            root,
-            fn _evidence -> trace_case(:run_start) end,
-            traced_evidence_ops()
-          )
-        end)
+      outcome = bounded_existing_path_refusal(root)
 
       {:ok, after_info} = :file.read_link_info(path)
 
-      if refusal.code == "FX_EVIDENCE" and refusal.phase == "run-start" and
-           File.read(path) == {:ok, "preexisting"} and
-           regular_identity(before) == regular_identity(after_info) and
-           file_info(before, :mode) == file_info(after_info, :mode) and
-           count_case(:run_start) == 0 and count_case(:refusal) == 1,
-         do: :pass,
-         else: :failed
+      occupant_unchanged? =
+        case kind do
+          :regular -> File.read(path) == {:ok, "preexisting"}
+          :fifo -> file_info(before, :type) == :other and file_info(after_info, :type) == :other
+        end
+
+      case outcome do
+        {:ok, refusal, trace} ->
+          if refusal.code == "FX_EVIDENCE" and refusal.phase == "run-start" and
+               occupant_unchanged? and
+               regular_identity(before) == regular_identity(after_info) and
+               file_info(before, :mode) == file_info(after_info, :mode) and
+               Enum.count(trace, &(&1 == :run_start)) == 0 and
+               Enum.count(trace, &(&1 == :refusal)) == 1,
+             do: :pass,
+             else: :failed
+
+        _ ->
+          :failed
+      end
     end)
+  end
+
+  defp bounded_existing_path_refusal(root) do
+    parent = self()
+    ref = make_ref()
+
+    {pid, monitor} =
+      spawn_monitor(fn ->
+        reset_case_trace!()
+
+        refusal =
+          catch_case_refusal(fn ->
+            with_home_evidence!(
+              root,
+              fn _evidence -> trace_case(:run_start) end,
+              traced_evidence_ops()
+            )
+          end)
+
+        send(parent, {ref, refusal, case_trace()})
+      end)
+
+    receive do
+      {^ref, refusal, trace} ->
+        Process.demonitor(monitor, [:flush])
+        {:ok, refusal, trace}
+
+      {:DOWN, ^monitor, :process, ^pid, reason} ->
+        {:error, reason}
+    after
+      2_000 ->
+        Process.exit(pid, :kill)
+
+        receive do
+          {:DOWN, ^monitor, :process, ^pid, _reason} -> :timeout
+        end
+    end
   end
 
   defp evidence_sink_failure_case do
@@ -1708,13 +1818,21 @@ defmodule FeatureSmoke do
   end
 
   defp create_evidence_file(path) do
-    case System.cmd(
-           "sh",
-           ["-c", "umask 077; set -C; : > \"$1\"", "feature-smoke-evidence", path],
-           stderr_to_stdout: true
-         ) do
-      {_output, 0} -> :ok
-      {_output, _status} -> {:error, :create_failed}
+    try do
+      case System.cmd(
+             "node",
+             [
+               "-e",
+               ~S'const fs=require("fs"); const fd=fs.openSync(process.argv[1], "wx", 0o600); fs.closeSync(fd);',
+               path
+             ],
+             stderr_to_stdout: true
+           ) do
+        {_output, 0} -> :ok
+        {_output, _status} -> {:error, :create_failed}
+      end
+    rescue
+      ErlangError -> {:error, :create_failed}
     end
   end
 
