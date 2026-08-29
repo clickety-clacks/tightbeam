@@ -4318,8 +4318,10 @@ defmodule Tightbeam.ConformanceTest do
     # fixture, live-engine-switch. Green on both axes, so it raises the total
     # and the active count and leaves the ACTIVATED counts alone. The class is
     # green too, so it adds no class registration either.
-    assert length(@fixtures) == 71
-    assert active_fixtures == 61
+    # The KUNGFU retirement-preservation guard adds one GREEN C1 fixture. It
+    # raises the total and active counts only; the mechanism ships with it.
+    assert length(@fixtures) == 72
+    assert active_fixtures == 62
     assert exact_skips == 10
     assert activated_fixture_tests == 43
     assert activated_class_tests == 5

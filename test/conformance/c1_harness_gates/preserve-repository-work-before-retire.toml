@@ -1,0 +1,10 @@
+[fixture]
+class = "C1"
+name = "preserve-repository-work-before-retire"
+phase = "green"
+blocking_phase = ""
+kind = "harness-gate"
+source = "Shipped engineering.toml"
+legibility = "gate:preserve-repository-work-before-retire"
+shipped_ref = "engineering.toml:preserve-repository-work-before-retire"
+pattern = "tool_input[^:]*:[^:]*command[^:]*:[^[:alnum:]_./-]*(((then|do|else|elif)[[:space:]]+)?([[:alpha:]_][[:alnum:]_]*=([^[:space:];&|(){}'\"\\\\]|'[^']*'|\\\\\"[^\"]*\\\\\"|\\\\\\\\.)*[[:space:]]+)*([[:alnum:]_.-]+/)*tightbeam[[:space:]]+retire([[:space:]]|$)|([^'\"\\\\]|'[^']*'|\\\\\"[^\"]*\\\\\"|\\\\\\\\.)*([;&|(){}]|\\\\n)[[:space:]]*((then|do|else|elif)[[:space:]]+)?([[:alpha:]_][[:alnum:]_]*=([^[:space:];&|(){}'\"\\\\]|'[^']*'|\\\\\"[^\"]*\\\\\"|\\\\\\\\.)*[[:space:]]+)*([[:alnum:]_.-]+/)*tightbeam[[:space:]]+retire([[:space:]]|$))"
