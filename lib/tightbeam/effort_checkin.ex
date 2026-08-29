@@ -1,23 +1,22 @@
 defmodule Tightbeam.EffortCheckin do
   @moduledoc """
-  Event-driven effort-without-effect brackets for dispatched assignments.
+  Event-driven effort-without-effect brackets for assignments.
 
-  EFFECT is any of, since the bracket armed: writes in the workdir, an artifact
-  the holder recorded, an attest on the assignment, or an update to the
-  assignment's work item. Turns are effort, never effect — a spinning session
-  has turns. Git is a change-management system an org may or may not use; it is
-  never a requirement for observation, and work done elsewhere (another machine,
-  a service, a person) is surfaced by RECORDING AN ARTIFACT, not by probing for
-  it.
+  EFFECT is any of, since the bracket armed: an artifact the holder recorded for
+  the assignment's work item, an attest on the assignment, or an update to that
+  work item. Turns and workspace writes are effort, never effect. Work done
+  elsewhere (another machine, a service, a person) is surfaced by RECORDING AN
+  ARTIFACT on the card's work item.
 
-  Zero effect on every channel prods the AGENT first — one wake naming the four
+  Zero effect on every channel prods the AGENT first — one wake naming the three
   channels. Continued silence climbs the holder's active operational parents
   and terminates at Main. This production reports agent inactivity to agents;
   it never manufactures an operator decision.
 
-  Filesystem observation is performed before the callback transaction. The
-  transaction then CASes the exact generation/wake pair and either re-arms,
-  prods, or schedules the next parent escalation.
+  A placement observation is prepared before the callback transaction for rearm
+  compatibility; it never counts as activity. The transaction then CASes the
+  exact generation/wake pair and either re-arms, prods, or schedules the next
+  parent escalation.
   """
 
   alias Tightbeam.{
