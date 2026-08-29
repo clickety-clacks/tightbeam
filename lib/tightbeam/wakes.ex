@@ -791,17 +791,18 @@ defmodule Tightbeam.Wakes do
   defp pending_wake(txn, %{wake_id: wake_id}) when is_binary(wake_id) do
     case Txn.q(
            txn,
-           "SELECT wakeId, origin, state, conditionKind, work_item_id, assignmentId FROM wakes WHERE wakeId=?1",
+           "SELECT wakeId, origin, state, conditionKind, work_item_id, assignmentId, consumer FROM wakes WHERE wakeId=?1",
            [wake_id]
          ) do
-      [[^wake_id, origin, "pending", condition_kind, work_item_id, assignment_id]] ->
+      [[^wake_id, origin, "pending", condition_kind, work_item_id, assignment_id, consumer]] ->
         {:ok,
          %{
            wake_id: wake_id,
            origin: origin,
            condition_kind: condition_kind,
            work_item_id: work_item_id,
-           assignment_id: assignment_id
+           assignment_id: assignment_id,
+           consumer: consumer
          }}
 
       _ ->
@@ -1277,6 +1278,7 @@ defmodule Tightbeam.Wakes do
            ),
          true <-
            holder_state == "active" or
+             (holder_state == "retired" and wake.consumer == "effort_probe") or
              current_controller_carries_entitlement?(txn, wake, assignment_id, generation),
          true <-
            {primary.kind, primary.id} == {"assignment", assignment_id} or

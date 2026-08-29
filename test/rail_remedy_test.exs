@@ -171,7 +171,11 @@ defmodule Tightbeam.RailRemedyTest do
     assert {:error, %{producer: ^review_id}} =
              Dispatch.dispatch(ctx.db, ctx.handlers, first)
 
-    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM wakes")
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM wakes WHERE COALESCE(consumer, '') != 'effort_probe'"
+             )
 
     assert %{rewake_count: 0} =
              RailRemedy.episode(ctx.db, "completion-needs-review", assignment.id)
@@ -191,7 +195,11 @@ defmodule Tightbeam.RailRemedyTest do
                [assignment.id]
              )
 
-    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM wakes")
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM wakes WHERE COALESCE(consumer, '') != 'effort_probe'"
+             )
 
     assert {:ok, [[1]]} =
              DB.query(

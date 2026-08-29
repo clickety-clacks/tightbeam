@@ -2479,7 +2479,8 @@ defmodule Tightbeam.ConformanceSupport do
                "SELECT COUNT(*) FROM wakes WHERE consumer = 'prompt' AND conditionKind IS NULL AND targetGate = 0"
              )
 
-    assert {:ok, [[2]]} = DB.query(db, "SELECT COUNT(*) FROM wakes")
+    assert {:ok, [[2]]} =
+             DB.query(db, "SELECT COUNT(*) FROM wakes WHERE consumer <> 'effort_probe'")
   end
 
   def run_park_wake_reuse_contract(fixture) do
