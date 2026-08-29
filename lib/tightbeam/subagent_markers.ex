@@ -36,7 +36,7 @@ defmodule Tightbeam.SubagentMarkers do
 
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
   def ensure_schema(db \\ DB) do
-    harnesses = Enum.map_join(Tightbeam.Harness.all(), ",", &"'#{&1.wire_name()}'")
+    harnesses = Enum.map_join(Tightbeam.Harness.known(), ",", &"'#{&1.wire_name()}'")
     DB.execute(db, String.replace(@ddl, "__TIGHTBEAM_HARNESSES__", harnesses))
   end
 

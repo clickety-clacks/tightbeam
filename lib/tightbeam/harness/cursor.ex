@@ -1,9 +1,9 @@
 defmodule Tightbeam.Harness.Cursor do
   @moduledoc """
-  Cursor harness — gateway-local shim ACP adapter only.
+  Cursor harness — dormant, gateway-local ACP adapter using the dedicated execution identity.
 
-  Remote zero-listener assertion is unimplemented (`HarnessProcess.assert_zero_listeners/3`
-  refuses ssh rows), so launch planning refuses non-local targets until that probe exists.
+  Registration requires an explicit enablement election. Launch planning refuses non-local
+  targets before any credential access.
   """
   @behaviour Tightbeam.Harness
 
@@ -58,9 +58,6 @@ defmodule Tightbeam.Harness.Cursor do
   def install_package, do: "cursor-agent"
 
   @impl true
-  def adapter_provisioning, do: :shim
-
-  @impl true
   def cli_binary, do: "cursor-agent"
 
   @doc false
@@ -79,8 +76,8 @@ defmodule Tightbeam.Harness.Cursor do
 
   @impl true
   def ensure_adapter(target) do
-    with {:ok, %{launcher: launcher}} <- verify_installed_cli(target) do
-      Tightbeam.Spinup.ensure_shim_adapter(target, adapter_binary(target), launcher, ["acp"])
+    with {:ok, _installed} <- verify_installed_cli(target) do
+      {:ok, "Cursor execution launcher present"}
     end
   end
 
@@ -658,17 +655,6 @@ defmodule Tightbeam.Harness.Cursor do
   defp local_sha256(path) do
     with {:ok, bytes} <- File.read(path),
          do: Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
-  end
-
-  defp adapter_binary(target) do
-    Map.get(target, :adapter_binary) ||
-      Path.join([
-        target.host_config.base_dir,
-        "adapters",
-        "node_modules",
-        ".bin",
-        install_package()
-      ])
   end
 
   defp local?(target), do: get_in(target, [:host_config, :ssh]) == nil

@@ -146,7 +146,7 @@ defmodule Tightbeam.Credentials do
   @doc "Classify only pinned terminal evidence. Unknown is always non-terminal."
   @spec terminal_evidence?(provider(), term()) :: boolean()
   def terminal_evidence?(provider, evidence) do
-    case Enum.find(Harness.all(), &(&1.credential_provider() == provider)) do
+    case Enum.find(Harness.known(), &(&1.credential_provider() == provider)) do
       nil -> false
       module -> module.classify_auth_event(evidence) == :terminal
     end
@@ -864,7 +864,7 @@ defmodule Tightbeam.Credentials do
   end
 
   defp harnesses_for_provider(provider),
-    do: Enum.filter(Harness.all(), &(&1.credential_provider() == provider))
+    do: Enum.filter(Harness.known(), &(&1.credential_provider() == provider))
 
   defp default_park_targets(machine) do
     Harness.all()

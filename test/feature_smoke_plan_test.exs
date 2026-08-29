@@ -54,7 +54,8 @@ defmodule Tightbeam.FeatureSmokePlanTest do
   end
 
   test "the documented Cursor model input makes the registered leg plannable" do
-    cursor = Enum.find(Harness.all(), &(&1.wire_name() == "cursor"))
+    refute Tightbeam.Harness.Cursor in Harness.all()
+    cursor = Tightbeam.Harness.Cursor
 
     [leg] =
       FeatureSmokePlan.legs([cursor], fn

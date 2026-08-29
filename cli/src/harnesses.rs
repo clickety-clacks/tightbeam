@@ -45,6 +45,7 @@ fn parse(encoded: &str) -> Result<HarnessCatalog, String> {
     let rows: Vec<Value> = serde_json::from_str(encoded).map_err(|error| error.to_string())?;
     let harnesses = rows
         .into_iter()
+        .filter(|row| row.get("enabled").and_then(Value::as_bool) != Some(false))
         .map(|row| {
             let string = |key: &str| {
                 row.get(key)
@@ -312,10 +313,9 @@ mod tests {
     #[test]
     fn shipped_local_registry_is_available_before_any_gateway_boot() {
         let catalog = local_registry().unwrap();
-        assert_eq!(catalog.names(), vec!["claude", "codex", "cursor"]);
+        assert_eq!(catalog.names(), vec!["claude", "codex"]);
         assert_eq!(catalog.harnesses[0].cli_binary, "claude");
         assert_eq!(catalog.harnesses[1].cli_binary, "codex");
-        assert_eq!(catalog.harnesses[2].cli_binary, "cursor-agent");
     }
 
     #[test]
@@ -330,7 +330,7 @@ mod tests {
 
         match load_for_doctor(&root) {
             DoctorCatalog::Offline { catalog, .. } => {
-                assert_eq!(catalog.names(), vec!["claude", "codex", "cursor"]);
+                assert_eq!(catalog.names(), vec!["claude", "codex"]);
             }
             _ => panic!("an absent gateway must use the shipped local registry"),
         }
