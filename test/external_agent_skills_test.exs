@@ -200,6 +200,13 @@ defmodule Tightbeam.ExternalAgentSkillsTest do
     end
 
     assert cli =~ "`decision_pending`"
+    assert cli =~ "Main and presenting proxies never run `tightbeam operator-rule`"
+
+    assert cli =~
+             "A non-presenting relay may record the\nchoice only after the operator gives an explicit instruction"
+
+    assert cli =~ "names that identifier"
+    refute cli =~ ~r/^tightbeam operator-rule(?:\s|$)/m
 
     {help, 0} = System.cmd(release_cli(), ["--help"], stderr_to_stdout: true)
 

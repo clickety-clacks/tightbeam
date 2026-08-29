@@ -117,7 +117,7 @@ that an agent holds that card. Before reporting the document complete:
 
 Do not treat an unstaffed implementation list as forward motion.
 
-## Present and record owner decisions
+## Present owner decisions
 
 Start with `tightbeam decision-requests --status open --as-user <user>`. Distinguish the
 request kinds:
@@ -128,14 +128,9 @@ request kinds:
   `tightbeam effort-rule --request <decision-request-id> --action continue|dismiss
   --as-user <user>` only after the user chooses that action.
 
-Record an operator choice with its exact listed label:
-
-```sh
-tightbeam operator-rule <decision-request-id> --decision <exact-label> --as-user <user>
-```
-
-Use `--response` only when the user supplies a free-form answer. Read the request again
-after the mutation when the effect matters.
+Main and presenting proxies never run `tightbeam operator-rule`. Return the user's exact
+choice together with the decision-request identifier. A non-presenting relay may record the
+choice only after the operator gives an explicit instruction that names that identifier.
 
 ## Record only authorized results
 
