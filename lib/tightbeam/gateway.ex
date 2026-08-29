@@ -1155,8 +1155,10 @@ defmodule Tightbeam.Gateway do
           call
           |> Map.put(:on_assignment_change, assignment_change)
           # A reopened card is armed exactly like a freshly assigned one, so it
-          # needs the same supervision interval `assign` and `dispatch` get.
+          # needs the same supervision and effort configuration `assign` and
+          # `dispatch` get.
           |> Map.put(:supervision_interval_ms, Map.fetch!(config, :wake_tick_ms))
+          |> Map.put(:effort_config, config)
         )
       end,
       {"repair-assignment", ["message.created"]} => fn call ->

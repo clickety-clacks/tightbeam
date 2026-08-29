@@ -755,6 +755,36 @@ defmodule Tightbeam.GatewayTest do
                  [assignment_id]
                )
     end
+
+    assert %{state: "closed"} =
+             handlers["revoke-assignment"].(
+               Map.merge(common, %{
+                 verb: "revoke-assignment",
+                 params: %{assignment_id: assign_id}
+               })
+             )
+
+    assert %{state: "open"} =
+             handlers["reopen-assignment"].(
+               Map.merge(common, %{
+                 verb: "reopen-assignment",
+                 params: %{assignment_id: assign_id, reason: "prove configured effort rearm"}
+               })
+             )
+
+    assert {:ok,
+            [
+              [1, "canceled", 123, initial_effort_root],
+              [2, "armed", 123, reopened_effort_root]
+            ]} =
+             DB.query(
+               ctx.db,
+               "SELECT generation,state,baseHorizonMs,root FROM effort_checkin_generations WHERE assignmentId=?1 ORDER BY generation",
+               [assign_id]
+             )
+
+    assert initial_effort_root == reopened_effort_root
+    assert Path.dirname(reopened_effort_root) == Path.join(base_dir, "work")
   end
 
   test "retire refuses built-in mains — the fallback target is permanent", ctx do
