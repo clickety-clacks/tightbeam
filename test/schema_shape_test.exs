@@ -1155,13 +1155,20 @@ defmodule Tightbeam.SchemaShapeTest do
     build = Path.join(Path.dirname(source), "build")
     deps = Path.join(File.cwd!(), "deps")
 
-    System.cmd(
-      System.find_executable("mix") || raise("mix is required for predecessor capture"),
-      ["run", "--no-start", "-e", expression],
-      cd: source,
-      env: [{"MIX_BUILD_PATH", build}, {"MIX_DEPS_PATH", deps}],
-      stderr_to_stdout: true
-    )
+    {output, status} =
+      System.cmd(
+        System.find_executable("mix") || raise("mix is required for predecessor capture"),
+        ["run", "--no-start", "-e", expression],
+        cd: source,
+        # The outer gate runs in Mix's test environment. Keep the exact predecessor
+        # child there too. Otherwise a clean host can look for an unbuilt dev-only
+        # dependency tree even though it is proving a test fixture.
+        env: [{"MIX_ENV", "test"}, {"MIX_BUILD_PATH", build}, {"MIX_DEPS_PATH", deps}],
+        stderr_to_stdout: true
+      )
+
+    assert status == 0, output
+    {output, status}
   end
 
   defp downgrade_to_notice_batching(db) do
