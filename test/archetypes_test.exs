@@ -246,7 +246,7 @@ defmodule Tightbeam.ArchetypesTest do
              end)
 
     assert retirement_gate.pattern ==
-             "(^|[^/[:alnum:]_-])tightbeam[[:space:]]+retire([[:space:]]|$)"
+             "(tool_input[^:]*:[^:]*command[^:]*:[^[:alnum:]_./-]*|[;&|][[:space:]]*)([[:alnum:]_.-]+/)*tightbeam[[:space:]]+retire([[:space:]]|$)"
 
     %{"hooks" => %{"PreToolUse" => entries}} = Rails.hook_settings()
 
@@ -270,6 +270,31 @@ defmodule Tightbeam.ArchetypesTest do
 
     assert denial =~ "[gate: preserve-repository-work-before-retire]"
     assert denial =~ "repository bytes have durable custody"
+
+    for relative_command <- [
+          "./tightbeam retire --session child",
+          "bin/tightbeam retire --session child"
+        ] do
+      relative_call =
+        ~s({"tool_name":"Bash","tool_input":{"command":"#{relative_command}"}})
+
+      assert {_denial, 2} =
+               System.cmd(
+                 "sh",
+                 ["-c", ~s(printf '%s' "$TB_RETIRE_GATE_INPUT" | ) <> command],
+                 env: [{"TB_RETIRE_GATE_INPUT", relative_call}],
+                 stderr_to_stdout: true
+               )
+    end
+
+    mention_call =
+      ~s({"tool_name":"Bash","tool_input":{"command":"echo tightbeam retire --session child"}})
+
+    assert {"", 0} =
+             System.cmd("sh", ["-c", ~s(printf '%s' "$TB_RETIRE_GATE_INPUT" | ) <> command],
+               env: [{"TB_RETIRE_GATE_INPUT", mention_call}],
+               stderr_to_stdout: true
+             )
 
     proved_call =
       ~s({"tool_name":"Bash","tool_input":{"command":"/opt/tightbeam/bin/tightbeam retire --session child"}})
