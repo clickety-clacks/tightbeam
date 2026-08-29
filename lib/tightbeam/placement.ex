@@ -1194,7 +1194,7 @@ defmodule Tightbeam.Placement do
       |> then(&if(config[:sh], do: Keyword.put(&1, :sh, config.sh), else: &1))
       |> then(&if(config[:sh_out], do: Keyword.put(&1, :sh_out, config.sh_out), else: &1))
 
-    home = deliver_home(config, key, deliver_opts)
+    {home, cursor_rails_sha256} = deliver_home_with_metadata(config, key, deliver_opts)
 
     stderr_path =
       Path.join(config.base_dir, "adapter-#{harness}:#{identity_name}@#{host}.stderr.log")
@@ -1252,9 +1252,7 @@ defmodule Tightbeam.Placement do
           Keyword.put(
             opts,
             :cursor_rails_sha256,
-            Tightbeam.Harness.Cursor.execution_rails_sha256(
-              Map.get(config, :cursor_execution_home)
-            )
+            cursor_rails_sha256
           )
         else
           opts
@@ -1574,7 +1572,14 @@ defmodule Tightbeam.Placement do
   selection).
   """
   @spec deliver_home(map(), adapter_key(), keyword()) :: String.t()
-  def deliver_home(config, {harness, _identity_name, host}, opts \\ []) do
+  def deliver_home(config, {_harness, _identity_name, _host} = key, opts \\ []) do
+    {home, _cursor_rails_sha256} =
+      deliver_home_with_metadata(config, key, opts)
+
+    home
+  end
+
+  defp deliver_home_with_metadata(config, {harness, _identity_name, host}, opts) do
     host_config = Map.fetch!(hosts_for(config), host)
     module = Harness.module!(harness)
 
@@ -1622,14 +1627,15 @@ defmodule Tightbeam.Placement do
         }
       )
 
-    if harness == :cursor do
-      Tightbeam.Harness.Cursor.project_execution_rails!(
-        Map.get(config, :cursor_execution_home),
-        rails
-      )
-    end
+    cursor_rails_sha256 =
+      if harness == :cursor do
+        Tightbeam.Harness.Cursor.project_execution_rails!(
+          Map.get(config, :cursor_execution_home),
+          rails
+        )
+      end
 
-    Map.fetch!(result, :home_path)
+    {Map.fetch!(result, :home_path), cursor_rails_sha256}
   end
 
   defp effective_identity_fingerprint(effective) do

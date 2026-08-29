@@ -157,12 +157,8 @@ fn onboard_with_cursor_prerequisite<S, H, P>(
 where
     S: Fn(&Endpoint, &RequestSpec, Option<Instant>) -> Result<Option<serde_json::Value>, String>,
     H: Fn(&Endpoint, Instant) -> Result<Option<HarnessCatalog>, String>,
-    P: Fn() -> Result<(), String>,
+    P: Fn(&str) -> Result<(), String>,
 {
-    if provider == "cursor" {
-        cursor_prerequisite()?;
-    }
-
     let kind = if api_key { "apiKey" } else { "subscription" };
     let machine = onboard_machine(
         std::env::var("TIGHTBEAM_MACHINE")
@@ -170,6 +166,10 @@ where
             .filter(|name| !name.is_empty()),
         dispatch::provisioned(),
     )?;
+    if provider == "cursor" {
+        let cursor_machine = machine.clone().unwrap_or_else(this_host);
+        cursor_prerequisite(&cursor_machine)?;
+    }
     let begin = dispatch::build_onboard_phase_request(
         identity,
         provider,
@@ -2263,7 +2263,7 @@ mod tests {
             &endpoint,
             |_, _, _| panic!("gateway begin must not run before the prerequisite"),
             |_, _| panic!("harness lookup must not run before the prerequisite"),
-            || Err("dedicated Cursor identity is absent".to_owned()),
+            |_| Err("dedicated Cursor identity is absent".to_owned()),
         )
         .unwrap_err();
 

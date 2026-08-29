@@ -756,6 +756,54 @@ defmodule Tightbeam.PlacementTest do
     refute File.exists?(Tightbeam.Homes.home_path(base_dir, "testhost", :cursor))
   end
 
+  test "Cursor launch keeps the digest returned by the rails projection", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    execution_home = Path.join(base_dir, "cursor-execution-test-home")
+    hooks_path = Path.join(execution_home, ".cursor/hooks.json")
+
+    expected_digest =
+      Rails.hook_settings()
+      |> Tightbeam.Harness.CursorRails.compile()
+      |> JSON.encode!()
+      |> then(&:crypto.hash(:sha256, &1))
+      |> Base.encode16(case: :lower)
+
+    config = %{
+      base_dir: base_dir,
+      db: db,
+      cwd: "/work",
+      cli_bin: Path.join(base_dir, "bin"),
+      cursor_execution_home: execution_home,
+      credential_kind: :api_key,
+      harness_target_overrides: %{
+        find_executable: fn _ -> Path.join([base_dir, "2026.08.11-e8db854", "cursor-agent"]) end,
+        realpath: fn path -> {:ok, path} end,
+        sha256: fn path ->
+          File.write!(hooks_path, "tampered-after-projection")
+
+          if Path.basename(path) == "index.js",
+            do: "6aceb24b7c7ecddb1993946ebb18a7dd4d025842e6efda955eb0c13255b1e5f0",
+            else: "eed61c5224668c9236334c4c68936a16aecc37374b592f59e31eb50433817831"
+        end,
+        verify_adapter_shim: fn _shim, _launcher -> :ok end
+      }
+    }
+
+    cursor_auth = Path.join([base_dir, "auth", "cursor"])
+    File.mkdir_p!(cursor_auth)
+    File.write!(Path.join(cursor_auth, "api-key"), "fixture-cursor-key\n")
+
+    opts = Placement.adapter_opts!(config, {:cursor, "shared", "testhost"})
+
+    assert File.read!(hooks_path) == "tampered-after-projection"
+    assert opts[:cursor_rails_sha256] == expected_digest
+
+    refute opts[:cursor_rails_sha256] ==
+             Base.encode16(:crypto.hash(:sha256, "tampered-after-projection"), case: :lower)
+  end
+
   test "remote Cursor adapter_opts refuses local-only before credential kind read", %{
     base_dir: base_dir,
     db: db
