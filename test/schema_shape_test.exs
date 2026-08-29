@@ -1154,6 +1154,14 @@ defmodule Tightbeam.SchemaShapeTest do
 
     build = Path.join(Path.dirname(source), "build")
     deps = Path.join(File.cwd!(), "deps")
+    private_app_dir = Path.join([build, "lib", "tightbeam", "priv"])
+
+    # Mix normally copies priv into an application build. The isolated build used
+    # for this old binary has no prior application output, and Tightbeam.Harness
+    # reads this exact bundle while it compiles. Copy only the exact predecessor
+    # priv tree so the child is self-contained on a clean host.
+    File.mkdir_p!(private_app_dir)
+    File.cp_r!(Path.join(source, "priv"), private_app_dir)
 
     {output, status} =
       System.cmd(
