@@ -218,6 +218,29 @@ defmodule Tightbeam.ArchetypesTest do
            )
   end
 
+  test "the worktree skill preserves dirty repository work before retirement", ctx do
+    Identity.init!(ctx.base_dir)
+
+    assert {:ok, _revision} =
+             Identity.learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
+
+    worktree_skill =
+      Identity.snapshot_at!(
+        ctx.base_dir,
+        Identity.live_revision!(ctx.base_dir),
+        "product-owner",
+        :codex
+      ).skills["worktree-session"]
+
+    assert worktree_skill =~ "Preserve local-only work before retirement"
+    assert worktree_skill =~ "tracked, untracked, and ignored files"
+    assert worktree_skill =~ "every commit that must survive is pushed"
+    assert worktree_skill =~ "package the complete repository into a recovery archive"
+    assert worktree_skill =~ "tightbeam artifact-record"
+    assert worktree_skill =~ "does not prove byte custody"
+    assert worktree_skill =~ "do not retire the session"
+  end
+
   # Every archetype x both harnesses, and each `snapshot_at!` is a chain of
   # SEQUENTIAL git forks (rev-parse for the required refs, ls-tree for the
   # guidance set, then a `git show` per fragment, manifest and skill). A single
