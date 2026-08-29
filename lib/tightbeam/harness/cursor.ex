@@ -218,6 +218,7 @@ defmodule Tightbeam.Harness.Cursor do
 
     Tightbeam.Homes.reconcile(target, home, %{desired | rails: rails},
       credential_names: [@credential_file],
+      credential_projection: :copy_readable,
       rails_filename: @rails_file,
       preserve_manifest_dir: true
     )

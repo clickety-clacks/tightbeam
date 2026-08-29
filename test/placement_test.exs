@@ -1342,8 +1342,10 @@ defmodule Tightbeam.PlacementTest do
     assert sessions_stat.gid == projection_stat.gid
 
     credential = Path.join(projected, "cli-config.json")
-    assert {:ok, %File.Stat{type: :symlink}} = File.lstat(credential)
-    assert File.read_link!(credential) == Path.join(base_dir, "auth/cursor/cli-config.json")
+    assert {:ok, %File.Stat{type: :regular}} = File.lstat(credential)
+    assert File.read!(credential) == File.read!(auth_file)
+    assert Bitwise.band(File.stat!(credential).mode, 0o777) == 0o640
+    assert File.stat!(credential).gid == projection_stat.gid
     assert Bitwise.band(File.stat!(auth_dir).mode, 0o777) == 0o700
     assert Bitwise.band(File.stat!(auth_file).mode, 0o777) == 0o600
   end
