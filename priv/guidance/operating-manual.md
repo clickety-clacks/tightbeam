@@ -199,6 +199,17 @@ never paste credential bytes into a durable record.
 
     tightbeam assign --subject "fix the resume crash" --role implementer --work-item <workItemId>
 
+An assignment normally delivers its exact subject. Add `--delivers-work-item` only when
+the obligation delivers the whole card. Completion copies that stored identity. A note
+cannot narrow or replace it. Close a card by naming the current completion:
+
+    tightbeam work-item-close <workItemId> --completion-attest <attestId>
+
+A different deliverable cannot close the card silently. Only the exact captured card
+product-owner session can record an explicit narrower close. `work-item-update --title`
+changes display text only. It never changes the original deliverable name, id, or hash.
+If the original deliverable is wrong, fail or icebox the card and create a replacement.
+
 Open the card against a role, never a bare session key. The card records the role it
 was opened against; opened against a session key alone it records none, and
 `assignments --role` — and every role-history question after it — cannot see it. A

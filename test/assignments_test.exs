@@ -1499,8 +1499,11 @@ defmodule Tightbeam.AssignmentsTest do
     _ =
       handle(
         ctx,
-        "work-item-close",
-        work_item_call("work-item-close", {:user, "flynn"}, %{work_item_id: item.id})
+        "work-item-fail",
+        work_item_call("work-item-fail", {:user, "flynn"}, %{
+          work_item_id: item.id,
+          reason: "terminal fixture"
+        })
       )
 
     assert_reopen_refused!(ctx, {:user, "flynn"}, carded.id, "why", "work_item_not_open")

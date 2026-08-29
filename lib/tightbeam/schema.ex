@@ -25,6 +25,7 @@ defmodule Tightbeam.Schema do
     Tightbeam.ReadMarkers,
     Tightbeam.WorkItems,
     Tightbeam.Assignments,
+    Tightbeam.DeliverableContract,
     Tightbeam.EffortCheckin,
     Tightbeam.Placement,
     Tightbeam.RecurrenceSuppression,
@@ -78,7 +79,8 @@ defmodule Tightbeam.Schema do
   # its one exact predecessor, and historical rows remain null.
   # Terminal operator decisions advance v7 to v8. Nullable effective parent
   # then relaxes the stored parent constraint from that exact predecessor.
-  @shape "coordination-fabric-v1-phase1-v9"
+  @shape "coordination-fabric-v1-phase1-v10"
+  @deliverable_contract_previous_shape "coordination-fabric-v1-phase1-v9"
   @nullable_effective_parent_previous_shape "coordination-fabric-v1-phase1-v8"
   @terminal_decision_previous_shape "coordination-fabric-v1-phase1-v7"
   @message_type_previous_shape "coordination-fabric-v1-phase1-v6"
@@ -1290,7 +1292,7 @@ defmodule Tightbeam.Schema do
 
            Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
              @nullable_effective_parent_previous_shape,
-             @shape,
+             @deliverable_contract_previous_shape,
              System.system_time(:millisecond)
            ])
 
@@ -1558,30 +1560,67 @@ defmodule Tightbeam.Schema do
       {:ok, [[@shape]]} ->
         :ok
 
+      {:ok, [[@deliverable_contract_previous_shape]]} ->
+        Tightbeam.DeliverableContract.upgrade_v1(
+          db,
+          @deliverable_contract_previous_shape,
+          @shape
+        )
+
       {:ok, [[@nullable_effective_parent_previous_shape]]} ->
-        upgrade_nullable_effective_parent_v1(db)
+        :ok = upgrade_nullable_effective_parent_v1(db)
+
+        Tightbeam.DeliverableContract.upgrade_v1(
+          db,
+          @deliverable_contract_previous_shape,
+          @shape
+        )
 
       {:ok, [[@terminal_decision_previous_shape]]} ->
         :ok = upgrade_terminal_operator_decision_v1(db)
-        upgrade_nullable_effective_parent_v1(db)
+        :ok = upgrade_nullable_effective_parent_v1(db)
+
+        Tightbeam.DeliverableContract.upgrade_v1(
+          db,
+          @deliverable_contract_previous_shape,
+          @shape
+        )
 
       {:ok, [[@message_type_previous_shape]]} ->
         :ok = upgrade_message_type_v1(db)
         :ok = upgrade_terminal_operator_decision_v1(db)
-        upgrade_nullable_effective_parent_v1(db)
+        :ok = upgrade_nullable_effective_parent_v1(db)
+
+        Tightbeam.DeliverableContract.upgrade_v1(
+          db,
+          @deliverable_contract_previous_shape,
+          @shape
+        )
 
       {:ok, [[@cold_start_previous_shape]]} ->
         :ok = upgrade_cold_start_v1(db)
         :ok = upgrade_message_type_v1(db)
         :ok = upgrade_terminal_operator_decision_v1(db)
-        upgrade_nullable_effective_parent_v1(db)
+        :ok = upgrade_nullable_effective_parent_v1(db)
+
+        Tightbeam.DeliverableContract.upgrade_v1(
+          db,
+          @deliverable_contract_previous_shape,
+          @shape
+        )
 
       {:ok, [[@operational_parent_previous_shape]]} ->
         :ok = upgrade_operational_parent_v1(db)
         :ok = upgrade_cold_start_v1(db)
         :ok = upgrade_message_type_v1(db)
         :ok = upgrade_terminal_operator_decision_v1(db)
-        upgrade_nullable_effective_parent_v1(db)
+        :ok = upgrade_nullable_effective_parent_v1(db)
+
+        Tightbeam.DeliverableContract.upgrade_v1(
+          db,
+          @deliverable_contract_previous_shape,
+          @shape
+        )
 
       {:ok, []} ->
         # No stamp. Either a database this build is about to create, or one
@@ -1600,7 +1639,8 @@ defmodule Tightbeam.Schema do
         There is no migration from #{found}. The only supported upgrade sources
         are #{@operational_parent_previous_shape}, #{@cold_start_previous_shape},
         #{@message_type_previous_shape}, #{@terminal_decision_previous_shape}, and
-        #{@nullable_effective_parent_previous_shape}.
+        #{@nullable_effective_parent_previous_shape}, and
+        #{@deliverable_contract_previous_shape}.
         Move this database aside and let it be recreated.
         """
 

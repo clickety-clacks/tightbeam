@@ -158,6 +158,7 @@ pub enum Command {
         reviews: Option<String>,
         effect_kind: Option<String>,
         files: Option<Vec<String>>,
+        delivers_work_item: bool,
     },
     Dispatch {
         identity: Identity,
@@ -168,6 +169,7 @@ pub enum Command {
         workdir_root: Option<String>,
         brief: String,
         idempotency_key: Option<String>,
+        delivers_work_item: bool,
     },
     EffortRule {
         identity: Identity,
@@ -297,6 +299,9 @@ pub enum Command {
     WorkItemClose {
         identity: Identity,
         work_item_id: String,
+        completion_attest_id: String,
+        owner_ruling_reason: Option<String>,
+        idempotency_key: Option<String>,
     },
     WorkItemFail {
         identity: Identity,
@@ -310,6 +315,7 @@ pub enum Command {
         verdict: Option<String>,
         note: Option<String>,
         commit_refs: Option<Vec<serde_json::Value>>,
+        idempotency_key: Option<String>,
     },
     Attests {
         identity: Identity,
@@ -652,19 +658,23 @@ COMMANDS:
       Shelve an unstaffed item (open → iceboxed). Requires zero open
       assignments; work-item-reopen resumes it.
   work-item-reopen <workItemId>
-  work-item-close <workItemId>
-      Conclude an item (→ closed). Requires zero open assignments.
+  work-item-close <workItemId> --completion-attest <attestId>
+                  [--owner-ruling-reason <text>] [--key <key>]
+      Conclude an item from one current completion claim. A different
+      deliverable requires the exact card product-owner session's ruling.
   work-item-fail <workItemId> [--reason <text>]
       Rule an item failed (→ failed); --reason is recorded on the item.
   assign --subject "<work>" (--session <key> | --role <name>)
          [--key <key>] [--work-item <workItemId>]
          [--reviews <assignmentId>] [--effect-kind <kind>]
+         [--delivers-work-item]
          [--files '["lib/a.ex","test/a_test.exs"]']
       Open an obligation held by a session; a work item is the durable thread
-      across assignments.
+      across assignments. Use --delivers-work-item only for the whole card.
   dispatch (--to <sessionKey> | --holder <sessionKey>) --subject "<work>"
            --brief "<one sentence>" [--work-item <workItemId>]
            [--effect-kind <kind>] [--workdir-root <relativePath>] [--key <key>]
+           [--delivers-work-item]
       Atomically open an assignment and wake its holder with the card id.
   effort-rule --request <decisionRequestId> --action continue|dismiss
       Rule an effort-without-effect check-in whose complete id you hold. The
@@ -864,7 +874,17 @@ fn opens_entry(line: &str, command: &str) -> bool {
 }
 
 const BOOLEAN_FLAGS: &[&str] = &[
-    "abort", "admin", "all", "api-key", "dry-run", "help", "json", "manifest", "resolve", "rm",
+    "abort",
+    "admin",
+    "all",
+    "api-key",
+    "delivers-work-item",
+    "dry-run",
+    "help",
+    "json",
+    "manifest",
+    "resolve",
+    "rm",
     "tree",
 ];
 
@@ -1572,6 +1592,7 @@ fn parse_with_optional_catalog(
                 reviews: nonempty(flags, "reviews"),
                 effect_kind: nonempty(flags, "effect-kind"),
                 files,
+                delivers_work_item: flags.contains_key("delivers-work-item"),
             })
         }
         "dispatch" => {
@@ -1594,6 +1615,7 @@ fn parse_with_optional_catalog(
                 workdir_root: nonempty(flags, "workdir-root"),
                 brief,
                 idempotency_key: nonempty(flags, "key"),
+                delivers_work_item: flags.contains_key("delivers-work-item"),
             })
         }
         "effort-rule" => {
@@ -1996,11 +2018,19 @@ fn parse_with_optional_catalog(
         }
         "work-item-close" => {
             if parsed.positional.len() != 2 {
-                return Err("usage: tightbeam work-item-close <workItemId>".to_owned());
+                return Err(
+                    "usage: tightbeam work-item-close <workItemId> --completion-attest <attestId>"
+                        .to_owned(),
+                );
             }
+            let completion_attest_id = nonempty(flags, "completion-attest")
+                .ok_or_else(|| "--completion-attest is required".to_owned())?;
             Ok(Command::WorkItemClose {
                 identity: identity(flags)?,
                 work_item_id: parsed.positional[1].clone(),
+                completion_attest_id,
+                owner_ruling_reason: nonempty(flags, "owner-ruling-reason"),
+                idempotency_key: nonempty(flags, "key"),
             })
         }
         "work-item-fail" => {
@@ -2028,6 +2058,10 @@ fn parse_with_optional_catalog(
             if kind != "verdict" && verdict.is_some() {
                 return Err("--verdict is only valid when --kind is verdict".to_owned());
             }
+            let idempotency_key = nonempty(flags, "key");
+            if kind != "completion" && idempotency_key.is_some() {
+                return Err("--key is only valid when --kind is completion".to_owned());
+            }
             let commit_refs = nonempty(flags, "commit-refs")
                 .map(|encoded| {
                     serde_json::from_str::<Vec<serde_json::Value>>(&encoded)
@@ -2041,6 +2075,7 @@ fn parse_with_optional_catalog(
                 verdict,
                 note: nonempty(flags, "note"),
                 commit_refs,
+                idempotency_key,
             })
         }
         "coordination-share" => {
