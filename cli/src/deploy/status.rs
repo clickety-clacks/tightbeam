@@ -814,6 +814,9 @@ mod tests {
     use crate::deploy::model::Digest;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     struct TempDir(PathBuf);
 
@@ -827,10 +830,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "tightbeam-deploy-status-test-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir(&path).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
