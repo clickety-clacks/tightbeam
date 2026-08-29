@@ -49,6 +49,10 @@
 # denial, which is exactly what keeps that leg falsifiable.
 
 defmodule FeatureSmoke do
+  require Record
+
+  Record.defrecordp(:file_info, Record.extract(:file_info, from_lib: "kernel/include/file.hrl"))
+
   defmodule Failure do
     defexception [:message]
   end
@@ -65,43 +69,268 @@ defmodule FeatureSmoke do
   # Slack over one observer wait: lane queueing, adapter spawn, and the poll interval.
   @lane_slack_ms 60_000
 
+  @home_evidence_schema "tightbeam.feature_smoke.home_evidence.v1"
+  @home_evidence_name "feature-smoke-home-evidence.jsonl"
+  @home_phase_plan [
+    {"all", "run-start"},
+    {"claude", "pre-spawn"},
+    {"claude", "pre-wake"},
+    {"claude", "post-turn"},
+    {"codex", "pre-spawn"},
+    {"codex", "pre-wake"},
+    {"codex", "post-turn"}
+  ]
+  @home_check_ids ~w(
+    phase_order fixture_state clock_order snapshot_acquired baseline_equal path_set_equal
+    codex_delta_empty entry_type_equal entry_mode_equal sidecar_size_bounded json_utf8_valid
+    json_syntax_valid json_unique_members claude_json_object sidecar_member_set_equal
+    sidecar_member_types_equal filename_pid_equal session_id_shape expected_cwd_equal
+    proc_start_shape version_shape peer_protocol_equal kind_equal entrypoint_equal
+    name_nonempty name_source_equal backup_epoch_in_interval started_at_in_interval
+    identity_matches_pre_wake
+  )
+  @sidecar_members MapSet.new(~w(
+    pid sessionId cwd startedAt procStart version peerProtocol kind entrypoint name nameSource
+  ))
+  @uuid_re ~r/\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/
+  @positive_decimal_re ~r/\A[1-9][0-9]*\z/
+  @semver_re ~r/\A(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?\z/
+  @backup_re ~r/\Abackups\/\.claude\.json\.backup\.([0-9]{13})\z/
+  @sidecar_re ~r/\Asessions\/([1-9][0-9]*)\.json\z/
+
   def run do
     base_dir = System.get_env("TIGHTBEAM_BASE_DIR") || Path.expand("~/.tightbeam-beam")
     install_smoke_rule!(base_dir)
     gw = base_dir |> Path.join("gateway.json") |> File.read!() |> JSON.decode!()
     Process.put(:salt, Integer.to_string(System.os_time(:second)) <> "-")
 
-    announce_selection!(Tightbeam.FeatureSmokePlan.selection(Tightbeam.Harness.all()))
+    selection = Tightbeam.FeatureSmokePlan.selection(Tightbeam.Harness.all())
+    announce_selection!(selection)
+    legs = Tightbeam.FeatureSmokePlan.legs(Tightbeam.Harness.all())
 
-    Tightbeam.FeatureSmokePlan.legs(Tightbeam.Harness.all())
-    |> Enum.each(fn leg ->
-      IO.puts("\nfeature-smoke leg #{leg.wire_name} model=#{leg.model}")
-      preflight!(leg, base_dir)
+    with_home_evidence!(base_dir, fn evidence ->
+      evidence = validate_run_start!(base_dir, legs, evidence)
 
-      %{
-        port: gw["port"],
-        token: gw["cliToken"],
-        base_dir: base_dir,
-        pass: 0,
-        leg: leg,
-        providers: Tightbeam.FeatureSmokePlan.provider_names(Tightbeam.Harness.all())
-      }
-      |> sweep_open_work_items()
-      |> check_local_deployment()
-      |> check_identity_surface()
-      |> check_onboard_surface()
-      |> check_facts_read()
-      |> check_config_default_archetype()
-      |> check_work_item_and_assignment_get()
-      |> check_dispatch_opens_assignment()
-      |> check_effort_without_effect()
-      |> check_flagship_review_loop()
-      |> check_escalation_to_owner()
-      |> check_toplines_board()
-      |> check_gate_chain_enforced()
-      |> check_carrier_on_real_turn()
-      |> finish_leg()
+      Enum.reduce(legs, evidence, fn leg, evidence ->
+        IO.puts("\nfeature-smoke leg #{leg.wire_name} model=#{leg.model}")
+        preflight!(leg, base_dir)
+
+        state =
+          %{
+            port: gw["port"],
+            token: gw["cliToken"],
+            base_dir: base_dir,
+            pass: 0,
+            leg: leg,
+            evidence: evidence,
+            providers: Tightbeam.FeatureSmokePlan.provider_names(Tightbeam.Harness.all())
+          }
+          |> sweep_open_work_items()
+          |> check_local_deployment()
+          |> check_identity_surface()
+          |> check_onboard_surface()
+          |> check_facts_read()
+          |> check_config_default_archetype()
+          |> check_work_item_and_assignment_get()
+          |> check_dispatch_opens_assignment()
+          |> check_effort_without_effect()
+          |> check_flagship_review_loop()
+          |> check_escalation_to_owner()
+          |> check_toplines_board()
+          |> check_gate_chain_enforced()
+          |> check_carrier_on_real_turn()
+
+        finish_leg(state)
+        state.evidence
+      end)
     end)
+  end
+
+  # Pure deterministic coverage for the contract rows. This mode never opens a
+  # gateway, creates a fixture, or touches a projected home.
+  def run_home_cases! do
+    now = 1_786_000_000_000
+    cwd = "/fixture/work/0123456789ab"
+    entries = synthetic_claude_entries(now, cwd)
+    {nil, identity} = runtime_failure(%{}, "claude", "pre-wake", entries, cwd, now, now)
+    sidecar_path = "sessions/123.json"
+
+    cases = [
+      {"AC-01", candidate_code(run_start_failure(["claude", "codex"], "1|1|0|0|0")), :pass},
+      {"AC-02", candidate_code(run_start_failure(["claude", "codex"], "1|1|1|0|0")),
+       "FX_FIXTURE_STATE"},
+      {"AC-03", snapshot_walk_case(), :pass},
+      {"AC-04", runtime_case(%{}, "claude", "pre-wake", entries, cwd, now, now), :pass},
+      {"AC-05", runtime_case(%{}, "claude", "pre-wake", entries, cwd, now, now), :pass},
+      {"AC-06",
+       entries
+       |> rename_entry(sidecar_path, "sessions/0123.json")
+       |> runtime_case(%{}, "claude", "pre-wake", cwd, now, now), "FX_PATH_SET"},
+      {"AC-07",
+       entries
+       |> replace_json(sidecar_path, &Map.put(&1, "pid", 124))
+       |> runtime_case(%{}, "claude", "pre-wake", cwd, now, now), "FX_SIDECAR_SEMANTIC"},
+      {"AC-08",
+       entries
+       |> replace_bytes(sidecar_path, <<255>>)
+       |> runtime_case(%{}, "claude", "pre-wake", cwd, now, now), "FX_JSON"},
+      {"AC-09",
+       entries
+       |> replace_bytes(sidecar_path, "{")
+       |> runtime_case(%{}, "claude", "pre-wake", cwd, now, now), "FX_JSON"},
+      {"AC-10",
+       entries
+       |> replace_bytes(sidecar_path, "{\"pid\":123,\"pid\":123}")
+       |> runtime_case(%{}, "claude", "pre-wake", cwd, now, now), "FX_JSON"},
+      {"AC-11",
+       entries
+       |> replace_json(sidecar_path, &Map.delete(&1, "name"))
+       |> runtime_case(%{}, "claude", "pre-wake", cwd, now, now), "FX_SIDECAR_SCHEMA"},
+      {"AC-12",
+       entries
+       |> replace_json(sidecar_path, &Map.put(&1, "extra", true))
+       |> runtime_case(%{}, "claude", "pre-wake", cwd, now, now), "FX_SIDECAR_SCHEMA"},
+      {"AC-13",
+       entries
+       |> replace_json(sidecar_path, &Map.put(&1, "pid", "123"))
+       |> runtime_case(%{}, "claude", "pre-wake", cwd, now, now), "FX_SIDECAR_SCHEMA"},
+      {"AC-14",
+       entries
+       |> replace_json(sidecar_path, &Map.put(&1, "cwd", "/wrong"))
+       |> runtime_case(%{}, "claude", "pre-wake", cwd, now, now), "FX_SIDECAR_SEMANTIC"},
+      {"AC-15",
+       entries
+       |> rename_entry(
+         "backups/.claude.json.backup.#{now}",
+         "backups/.claude.json.backup.#{now - 1}"
+       )
+       |> runtime_case(%{}, "claude", "pre-wake", cwd, now, now), "FX_FRESHNESS"},
+      {"AC-16",
+       runtime_case(
+         %{},
+         "claude",
+         "pre-wake",
+         entries ++ [synthetic_entry("sessions/124.json", :regular, 0o644, "{}")],
+         cwd,
+         now,
+         now
+       ), "FX_PATH_SET"},
+      {"AC-17",
+       entries
+       |> rename_entry(
+         "backups/.claude.json.backup.#{now}",
+         "backups/.claude.json.backup.#{now + 1}"
+       )
+       |> runtime_case(%{}, "claude", "post-turn", cwd, now, now + 1, %{
+         home_sidecar_identity: identity
+       }), :pass},
+      {"AC-18",
+       entries
+       |> replace_json(
+         sidecar_path,
+         &Map.put(&1, "sessionId", "11111111-1111-1111-1111-111111111111")
+       )
+       |> runtime_case(%{}, "claude", "post-turn", cwd, now, now, %{
+         home_sidecar_identity: identity
+       }), "FX_IDENTITY_DRIFT"},
+      {"AC-19",
+       runtime_case(
+         %{},
+         "claude",
+         "pre-wake",
+         entries ++ [synthetic_entry("sessions/nested/2.json", :regular, 0o644, "{}")],
+         cwd,
+         now,
+         now
+       ), "FX_PATH_SET"},
+      {"AC-20",
+       entries
+       |> replace_entry(
+         sidecar_path,
+         &%{&1 | type: :symlink, mode: 0o777, size: nil, sha256: nil, bytes: nil}
+       )
+       |> runtime_case(%{}, "claude", "pre-wake", cwd, now, now), "FX_TYPE"},
+      {"AC-21",
+       entries
+       |> replace_entry(".claude.json", &%{&1 | mode: 0o644})
+       |> runtime_case(%{}, "claude", "pre-wake", cwd, now, now), "FX_MODE"},
+      {"AC-22",
+       entries
+       |> replace_bytes(sidecar_path, :binary.copy("x", 4097))
+       |> runtime_case(%{}, "claude", "pre-wake", cwd, now, now), "FX_SIZE"},
+      {"AC-23",
+       entries
+       |> replace_bytes(".claude.json", "[]")
+       |> runtime_case(%{}, "claude", "pre-wake", cwd, now, now), "FX_JSON_SHAPE"},
+      {"AC-24",
+       runtime_case(
+         %{},
+         "codex",
+         "pre-wake",
+         [synthetic_entry("plugin-cache", :regular, 0o600, "x")],
+         cwd,
+         now,
+         now
+       ), "FX_CODEX_RUNTIME_PATH"},
+      {"AC-25", repeated_first_failure(entries, cwd, now), "FX_MODE"},
+      {"AC-26", evidence_record_case(entries), :pass},
+      {"AC-27", no_mutation_case(entries, cwd, now), :pass},
+      {"AC-28", Path.basename(__ENV__.file) == "feature_smoke.exs", true},
+      {"AC-29", @home_phase_plan,
+       [
+         {"all", "run-start"},
+         {"claude", "pre-spawn"},
+         {"claude", "pre-wake"},
+         {"claude", "post-turn"},
+         {"codex", "pre-spawn"},
+         {"codex", "pre-wake"},
+         {"codex", "post-turn"}
+       ]},
+      {"AC-30",
+       runtime_case(
+         %{},
+         "claude",
+         "pre-wake",
+         entries ++ [synthetic_entry("new-runtime", :regular, 0o600, "{}")],
+         cwd,
+         now,
+         now
+       ), "FX_PATH_SET"},
+      {"AC-31", Path.basename(__ENV__.file) == "feature_smoke.exs", true},
+      {"AC-32", wrong_cwd_evidence_case(entries, cwd, now), :pass},
+      {"AC-33", candidate_code(home_failure(0, "FX_EVIDENCE", "C-10", @home_evidence_name)),
+       "FX_EVIDENCE"},
+      {"AC-34", candidate_code(home_failure(0, "FX_EVIDENCE", "C-10", @home_evidence_name)),
+       "FX_EVIDENCE"},
+      {"AC-35",
+       entries
+       |> Enum.reject(&(&1.raw_path == "sessions"))
+       |> Kernel.++([synthetic_entry("unexpected", :regular, 0o600, "{}")])
+       |> runtime_case(%{}, "claude", "pre-wake", cwd, now, now), "FX_PATH_SET"},
+      {"AC-36", snapshot_root_failure_case(), :pass},
+      {"AC-37",
+       partial_snapshot_case(
+         %{raw_path: "sessions/2.json", type: nil, mode: nil, size: nil, sha256: nil, bytes: nil},
+         nil
+       ), :pass},
+      {"AC-38", partial_snapshot_case(synthetic_entry(".claude.json", :regular, 0o600, nil), nil),
+       :pass},
+      {"AC-39", partial_snapshot_case(synthetic_entry(sidecar_path, :regular, 0o644, nil), nil),
+       :pass},
+      {"AC-40", partial_snapshot_case(synthetic_entry(sidecar_path, :regular, 0o644, nil), nil),
+       :pass},
+      {"AC-41", identity_mismatch_case(), :pass},
+      {"AC-42",
+       partial_snapshot_case(synthetic_entry(sidecar_path, :regular, 0o644, "{}"), :present),
+       :pass}
+    ]
+
+    Enum.each(cases, fn {id, actual, expected} ->
+      if actual != expected,
+        do: raise(Failure, message: "#{id} expected #{inspect(expected)}, got #{inspect(actual)}")
+    end)
+
+    IO.puts("feature-smoke HOME validator deterministic cases: 42/42 PASS")
   end
 
   defp preflight!(leg, base_dir) do
@@ -119,6 +348,11 @@ defmodule FeatureSmoke do
   defp check_local_deployment(state) do
     harness = state.leg.harness.id()
     machine = Tightbeam.Placement.local_host_name()
+    home = Tightbeam.Homes.home_path(state.base_dir, machine, harness)
+    expected_home = MapSet.new(Tightbeam.Homes.owned_entries(harness))
+
+    state = validate_pre_spawn!(state, home, expected_home)
+    spawn_started_at = System.system_time(:millisecond)
 
     session =
       ok!(state, "spawn", %{
@@ -128,103 +362,101 @@ defmodule FeatureSmoke do
       })
 
     session_key = get_in(session, ["stream", "sessionKey"]) || session["sessionKey"]
-    home = Tightbeam.Homes.home_path(state.base_dir, machine, harness)
-    expected_home = MapSet.new(Tightbeam.Homes.owned_entries(harness))
-    before_home = if File.dir?(home), do: MapSet.new(leaf_entries(home)), else: MapSet.new()
     sentinel = Path.join(home, ".feature-smoke-durable-#{unique()}")
 
     cwd = local_workdir_path(state.base_dir, session_key)
 
-    try do
-      redeploy!(state, session_key, session_harness!(state, session_key))
+    state =
+      try do
+        redeploy!(state, session_key, session_harness!(state, session_key))
 
-      assert(state, File.dir?(home), "local deployment HOME missing: #{home}")
+        state =
+          validate_runtime_home!(
+            state,
+            home,
+            expected_home,
+            session_key,
+            cwd,
+            spawn_started_at,
+            "pre-wake"
+          )
 
-      actual_home = home |> leaf_entries() |> MapSet.new()
+        snapshot = Tightbeam.Identity.snapshot!(state.base_dir, "reviewer", harness)
 
-      expected_home
-      |> MapSet.difference(actual_home)
-      |> Enum.each(fn relative ->
         assert(
           state,
-          false,
-          "local deployment HOME missing owned path: #{Path.join(home, relative)}"
+          map_size(snapshot.skills) > 0,
+          "local deployment elected no skills for reviewer at #{cwd}"
         )
-      end)
 
-      actual_home
-      |> MapSet.difference(before_home)
-      |> MapSet.difference(expected_home)
-      |> Enum.each(fn relative ->
+        ok!(state, "wake", %{
+          "sessionKey" => session_key,
+          "prompt" => "Reply with exactly: LOCAL DEPLOYMENT READY",
+          "idempotencyKey" => "local-deploy-wake-#{unique()}"
+        })
+
+        await_materialized_skills!(state, cwd, snapshot.skills)
+
+        # One SESSION-principal work-item create, deliberately placed INSIDE this
+        # group's running-turn window (after the wake, before the turn boundary) —
+        # the only window in the run where a session lane has a turn in flight.
+        # A user-principal create can never be stamped, because only a session lane
+        # can have a running turn; this is what gives the toplines board a node whose
+        # creation context was actually RECORDED against a turn.
+        #
+        # WHAT THIS DOES NOT REACH: `linked`. The only running turn in this window
+        # comes from a plain `wake`, which carries neither `jobRef` nor
+        # `assignmentId`, so derivation finds no candidate and correctly reports
+        # `from_turn`. Reaching `linked` live would need the create to happen inside
+        # the DISPATCH group, whose holder turn carries `assignmentId` — so read the
+        # four accepted statuses below as four accepted, not four proven.
+        #
+        # A session acting under its OWN credential needs a bound role for the router
+        # to derive its origin — an unbound one is refused `no_role` (found by the
+        # first live run of this check, not by reading the code).
+        role = "local-deploy-#{unique()}"
+        post(state, "role-create", %{"name" => role})
+        ok!(state, "role-bind", %{"name" => role, "sessionKey" => session_key})
+
+        ok!(
+          %{state | token: session_token(state, session_key)} |> Map.put(:as_session, true),
+          "work-item-create",
+          %{
+            "title" => "smoke agent-created wi #{unique()}",
+            "idempotencyKey" => "awi-#{unique()}"
+          }
+        )
+
+        await_turn_boundary!(state, session_key)
+
+        state =
+          validate_runtime_home!(
+            state,
+            home,
+            expected_home,
+            session_key,
+            cwd,
+            spawn_started_at,
+            "post-turn"
+          )
+
+        sentinel_bytes = "durable-local-deployment-#{unique()}\n"
+        File.write!(sentinel, sentinel_bytes)
+        redeliver!(state, session_key)
+
         assert(
           state,
-          false,
-          "local deployment HOME contains stray path: #{Path.join(home, relative)}"
+          File.read(sentinel) == {:ok, sentinel_bytes},
+          "local deployment durable state changed during redelivery: #{sentinel}"
         )
-      end)
-
-      snapshot = Tightbeam.Identity.snapshot!(state.base_dir, "reviewer", harness)
-
-      assert(
-        state,
-        map_size(snapshot.skills) > 0,
-        "local deployment elected no skills for reviewer at #{cwd}"
-      )
-
-      ok!(state, "wake", %{
-        "sessionKey" => session_key,
-        "prompt" => "Reply with exactly: LOCAL DEPLOYMENT READY",
-        "idempotencyKey" => "local-deploy-wake-#{unique()}"
-      })
-
-      await_materialized_skills!(state, cwd, snapshot.skills)
-
-      # One SESSION-principal work-item create, deliberately placed INSIDE this
-      # group's running-turn window (after the wake, before the turn boundary) —
-      # the only window in the run where a session lane has a turn in flight.
-      # A user-principal create can never be stamped, because only a session lane
-      # can have a running turn; this is what gives the toplines board a node whose
-      # creation context was actually RECORDED against a turn.
-      #
-      # WHAT THIS DOES NOT REACH: `linked`. The only running turn in this window
-      # comes from a plain `wake`, which carries neither `jobRef` nor
-      # `assignmentId`, so derivation finds no candidate and correctly reports
-      # `from_turn`. Reaching `linked` live would need the create to happen inside
-      # the DISPATCH group, whose holder turn carries `assignmentId` — so read the
-      # four accepted statuses below as four accepted, not four proven.
-      #
-      # A session acting under its OWN credential needs a bound role for the router
-      # to derive its origin — an unbound one is refused `no_role` (found by the
-      # first live run of this check, not by reading the code).
-      role = "local-deploy-#{unique()}"
-      post(state, "role-create", %{"name" => role})
-      ok!(state, "role-bind", %{"name" => role, "sessionKey" => session_key})
-
-      ok!(
-        %{state | token: session_token(state, session_key)} |> Map.put(:as_session, true),
-        "work-item-create",
-        %{"title" => "smoke agent-created wi #{unique()}", "idempotencyKey" => "awi-#{unique()}"}
-      )
-
-      await_turn_boundary!(state, session_key)
-
-      sentinel_bytes = "durable-local-deployment-#{unique()}\n"
-      File.write!(sentinel, sentinel_bytes)
-      redeliver!(state, session_key)
-
-      assert(
-        state,
-        File.read(sentinel) == {:ok, sentinel_bytes},
-        "local deployment durable state changed during redelivery: #{sentinel}"
-      )
-    after
-      File.rm(sentinel)
-      retire(state, session)
-    end
+      after
+        File.rm(sentinel)
+        retire(state, session)
+      end
 
     pass(
       state,
-      "local deployment HOME path + exact owned projection + cwd skills + no strays + durable redelivery"
+      "local deployment HOME path + exact owned projection + bounded runtime + cwd skills + durable redelivery"
     )
   end
 
@@ -256,6 +488,1001 @@ defmodule FeatureSmoke do
       |> binary_part(0, 12)
 
     Path.join([base_dir, "work", digest])
+  end
+
+  # The retained fixture evidence is deliberately outside either projected home.
+  # Runtime cleanup may remove a sidecar; this handle is therefore opened once before
+  # run-start validation and synced after every phase judgment.
+  defp with_home_evidence!(base_dir, fun) do
+    path = Path.join(base_dir, @home_evidence_name)
+
+    case :file.open(path, [:write, :exclusive, :binary, :raw]) do
+      {:ok, io} ->
+        created? =
+          File.chmod(path, 0o600) == :ok and
+            match?(
+              {:ok, info}
+              when file_info(info, :type) == :regular and
+                     Bitwise.band(file_info(info, :mode), 0o7777) == 0o600,
+              :file.read_link_info(path)
+            )
+
+        if created? do
+          try do
+            fun.(%{io: io, sequence: 1, phase_index: 0})
+          after
+            :file.close(io)
+          end
+        else
+          :file.close(io)
+          evidence_refusal!("all", "run-start", "run-start")
+        end
+
+      {:error, _reason} ->
+        evidence_refusal!("all", "run-start", "run-start")
+    end
+  end
+
+  defp validate_run_start!(base_dir, legs, evidence) do
+    selected = Enum.map(legs, & &1.wire_name)
+
+    counts =
+      case System.cmd("sqlite3", [
+             Path.join(base_dir, "state.db"),
+             "SELECT COUNT(*), COALESCE(SUM(isAdmin),0), " <>
+               "(SELECT COUNT(*) FROM sessions), " <>
+               "(SELECT COUNT(*) FROM work_items), " <>
+               "(SELECT COUNT(*) FROM turns) FROM users"
+           ]) do
+        {out, 0} -> String.trim(out)
+        _ -> ""
+      end
+
+    candidate =
+      phase_candidate(evidence, "all", "run-start") || run_start_failure(selected, counts)
+
+    finish_home_phase!(evidence, "all", "run-start", "run-start", [], candidate)
+  end
+
+  defp run_start_failure(["claude", "codex"], "1|1|0|0|0"), do: nil
+  defp run_start_failure(_selected, _counts), do: home_failure(2, "FX_FIXTURE_STATE", "C-01", "-")
+
+  defp validate_pre_spawn!(state, home, expected_home) do
+    harness = state.leg.wire_name
+    phase = "pre-spawn"
+    principal = "pre-spawn"
+
+    case phase_candidate(state.evidence, harness, phase) do
+      nil ->
+        ancestors = baseline_ancestors(expected_home)
+
+        case snapshot_home(home, fn _relative -> false end) do
+          {:ok, entries, _finished_at} ->
+            evidence_entries = Enum.reject(entries, &MapSet.member?(ancestors, &1.raw_path))
+            observed = MapSet.new(evidence_entries, & &1.raw_path)
+
+            candidate =
+              if observed == expected_home,
+                do: nil,
+                else: home_failure(5, "FX_BASELINE", "C-01", "-")
+
+            evidence =
+              finish_home_phase!(
+                state.evidence,
+                harness,
+                phase,
+                principal,
+                evidence_entries,
+                candidate
+              )
+
+            %{state | evidence: evidence}
+
+          {:error, path, entries, _finished_at} ->
+            partial = partial_pre_spawn_entries(entries, ancestors, path)
+
+            finish_home_refusal!(
+              state,
+              harness,
+              phase,
+              principal,
+              partial,
+              home_failure(4, "FX_SNAPSHOT", "C-08", path)
+            )
+        end
+
+      candidate ->
+        finish_home_refusal!(state, harness, phase, principal, [], candidate)
+    end
+  end
+
+  defp validate_runtime_home!(
+         state,
+         home,
+         expected_home,
+         session_key,
+         expected_cwd,
+         spawn_started_at,
+         phase
+       ) do
+    harness = state.leg.wire_name
+    ancestors = baseline_ancestors(expected_home)
+
+    runtime? = fn relative ->
+      not MapSet.member?(expected_home, relative) and not MapSet.member?(ancestors, relative)
+    end
+
+    case phase_candidate(state.evidence, harness, phase) do
+      nil ->
+        case snapshot_home(home, runtime?) do
+          {:ok, entries, snapshot_finished_at}
+          when snapshot_finished_at < spawn_started_at ->
+            runtime_entries = Enum.filter(entries, &runtime?.(&1.raw_path))
+
+            finish_home_refusal!(
+              state,
+              harness,
+              phase,
+              session_key,
+              runtime_entries,
+              home_failure(3, "FX_CLOCK", "C-05", "-")
+            )
+
+          {:error, path, entries, snapshot_finished_at}
+          when snapshot_finished_at < spawn_started_at ->
+            partial = partial_phase_entries(entries, expected_home, ancestors, path)
+
+            finish_home_refusal!(
+              state,
+              harness,
+              phase,
+              session_key,
+              partial,
+              home_failure(3, "FX_CLOCK", "C-05", "-")
+            )
+
+          {:ok, entries, snapshot_finished_at} ->
+            runtime_entries = Enum.filter(entries, &runtime?.(&1.raw_path))
+
+            {candidate, identity} =
+              runtime_failure(
+                state,
+                harness,
+                phase,
+                runtime_entries,
+                expected_cwd,
+                spawn_started_at,
+                snapshot_finished_at
+              )
+
+            evidence =
+              finish_home_phase!(
+                state.evidence,
+                harness,
+                phase,
+                session_key,
+                runtime_entries,
+                candidate
+              )
+
+            state
+            |> Map.put(:evidence, evidence)
+            |> then(fn next ->
+              if phase == "pre-wake" and harness == "claude",
+                do: Map.put(next, :home_sidecar_identity, identity),
+                else: next
+            end)
+
+          {:error, path, entries, _snapshot_finished_at} ->
+            partial = partial_phase_entries(entries, expected_home, ancestors, path)
+
+            finish_home_refusal!(
+              state,
+              harness,
+              phase,
+              session_key,
+              partial,
+              home_failure(4, "FX_SNAPSHOT", "C-08", path)
+            )
+        end
+
+      candidate ->
+        finish_home_refusal!(state, harness, phase, session_key, [], candidate)
+    end
+  end
+
+  defp finish_home_refusal!(state, harness, phase, principal, entries, candidate) do
+    finish_home_phase!(state.evidence, harness, phase, principal, entries, candidate)
+    state
+  end
+
+  defp phase_candidate(evidence, harness, phase) do
+    if Enum.at(@home_phase_plan, evidence.phase_index) == {harness, phase},
+      do: nil,
+      else: home_failure(1, "FX_PHASE", "C-01", "-")
+  end
+
+  defp runtime_failure(_state, "codex", _phase, entries, _cwd, _started, _finished) do
+    candidate =
+      if entries == [],
+        do: nil,
+        else:
+          home_failure(
+            7,
+            "FX_CODEX_RUNTIME_PATH",
+            "C-07",
+            Enum.min_by(entries, & &1.raw_path).raw_path
+          )
+
+    {candidate, nil}
+  end
+
+  defp runtime_failure(state, "claude", phase, entries, expected_cwd, started, finished) do
+    sorted = Enum.sort_by(entries, & &1.raw_path)
+
+    with {:ok, backup, sidecar} <- claude_path_set(sorted),
+         nil <- type_failure(sorted, backup.raw_path, sidecar.raw_path),
+         nil <- mode_failure(sorted, backup.raw_path, sidecar.raw_path),
+         nil <- size_failure(sidecar),
+         json_entries <- Enum.filter(sorted, &(&1.type == :regular)),
+         analyses <- Map.new(json_entries, &{&1.raw_path, json_analysis(&1.bytes)}),
+         nil <- json_failure(json_entries, analyses),
+         nil <- claude_json_shape_failure(analyses[".claude.json"]),
+         {:ok, sidecar_json} <- sidecar_schema(analyses[sidecar.raw_path], sidecar.raw_path),
+         nil <- sidecar_semantic_failure(sidecar, sidecar_json, expected_cwd),
+         nil <- freshness_failure(backup, sidecar, sidecar_json, started, finished),
+         identity <- sidecar_identity(sidecar_json),
+         nil <- identity_failure(state, phase, identity) do
+      {nil, identity}
+    else
+      {:error, candidate} -> {candidate, nil}
+      %{} = candidate -> {candidate, nil}
+    end
+  end
+
+  defp claude_path_set(entries) do
+    paths = Enum.map(entries, & &1.raw_path)
+    backups = Enum.filter(entries, &Regex.match?(@backup_re, &1.raw_path))
+    sidecars = Enum.filter(entries, &Regex.match?(@sidecar_re, &1.raw_path))
+
+    if length(entries) == 5 and ".claude.json" in paths and "backups" in paths and
+         "sessions" in paths and length(backups) == 1 and length(sidecars) == 1 do
+      {:ok, hd(backups), hd(sidecars)}
+    else
+      {:error, home_failure(6, "FX_PATH_SET", "C-02", "-")}
+    end
+  end
+
+  defp type_failure(entries, backup, sidecar) do
+    expected = %{
+      ".claude.json" => :regular,
+      "backups" => :directory,
+      backup => :regular,
+      "sessions" => :directory,
+      sidecar => :regular
+    }
+
+    first_path_failure(entries, fn entry ->
+      if entry.type == expected[entry.raw_path],
+        do: nil,
+        else: home_failure(8, "FX_TYPE", "C-02", entry.raw_path)
+    end)
+  end
+
+  defp mode_failure(entries, backup, sidecar) do
+    expected = %{
+      ".claude.json" => 0o600,
+      "backups" => 0o755,
+      backup => 0o600,
+      "sessions" => 0o700,
+      sidecar => 0o644
+    }
+
+    first_path_failure(entries, fn entry ->
+      if entry.mode == expected[entry.raw_path],
+        do: nil,
+        else: home_failure(9, "FX_MODE", "C-02", entry.raw_path)
+    end)
+  end
+
+  defp size_failure(sidecar) do
+    if is_integer(sidecar.size) and sidecar.size in 1..4096,
+      do: nil,
+      else: home_failure(10, "FX_SIZE", "C-02", sidecar.raw_path)
+  end
+
+  defp json_failure(entries, analyses) do
+    first_path_failure(entries, fn entry ->
+      analysis = analyses[entry.raw_path]
+      clause = if Regex.match?(@sidecar_re, entry.raw_path), do: "C-04", else: "C-02"
+
+      cond do
+        not analysis.utf8 -> home_failure(11, "FX_JSON", clause, entry.raw_path)
+        not analysis.syntax -> home_failure(12, "FX_JSON", clause, entry.raw_path)
+        not analysis.unique -> home_failure(13, "FX_JSON", clause, entry.raw_path)
+        true -> nil
+      end
+    end)
+  end
+
+  defp claude_json_shape_failure(%{value: value}) when is_map(value), do: nil
+
+  defp claude_json_shape_failure(_analysis),
+    do: home_failure(14, "FX_JSON_SHAPE", "C-02", ".claude.json")
+
+  defp sidecar_schema(%{value: value}, path) when is_map(value) do
+    cond do
+      MapSet.new(Map.keys(value)) != @sidecar_members ->
+        {:error, home_failure(15, "FX_SIDECAR_SCHEMA", "C-04", path)}
+
+      not sidecar_member_types?(value) ->
+        {:error, home_failure(16, "FX_SIDECAR_SCHEMA", "C-04", path)}
+
+      true ->
+        {:ok, value}
+    end
+  end
+
+  defp sidecar_schema(_analysis, path),
+    do: {:error, home_failure(15, "FX_SIDECAR_SCHEMA", "C-04", path)}
+
+  defp sidecar_member_types?(value) do
+    is_integer(value["pid"]) and is_binary(value["sessionId"]) and
+      is_binary(value["cwd"]) and is_integer(value["startedAt"]) and
+      is_binary(value["procStart"]) and is_binary(value["version"]) and
+      is_integer(value["peerProtocol"]) and is_binary(value["kind"]) and
+      is_binary(value["entrypoint"]) and is_binary(value["name"]) and
+      is_binary(value["nameSource"])
+  end
+
+  defp sidecar_semantic_failure(sidecar, value, expected_cwd) do
+    [stem] = Regex.run(@sidecar_re, sidecar.raw_path, capture: :all_but_first)
+
+    [
+      {17, "C-03",
+       is_integer(value["pid"]) and value["pid"] > 0 and Integer.to_string(value["pid"]) == stem},
+      {18, "C-04", Regex.match?(@uuid_re, value["sessionId"])},
+      {19, "C-04", value["cwd"] == expected_cwd},
+      {20, "C-04", Regex.match?(@positive_decimal_re, value["procStart"])},
+      {21, "C-04", Regex.match?(@semver_re, value["version"])},
+      {22, "C-04", value["peerProtocol"] == 1},
+      {23, "C-04", value["kind"] == "interactive"},
+      {24, "C-04", value["entrypoint"] == "sdk-ts"},
+      {25, "C-04", value["name"] != ""},
+      {26, "C-04", value["nameSource"] == "derived"}
+    ]
+    |> Enum.find_value(fn {check, clause, passed?} ->
+      unless passed?, do: home_failure(check, "FX_SIDECAR_SEMANTIC", clause, sidecar.raw_path)
+    end)
+  end
+
+  defp freshness_failure(backup, sidecar_entry, sidecar, started, finished) do
+    [epoch] = Regex.run(@backup_re, backup.raw_path, capture: :all_but_first)
+    backup_epoch = String.to_integer(epoch)
+
+    cond do
+      backup_epoch < started or backup_epoch > finished ->
+        home_failure(27, "FX_FRESHNESS", "C-05", backup.raw_path)
+
+      sidecar["startedAt"] < started or sidecar["startedAt"] > finished ->
+        home_failure(28, "FX_FRESHNESS", "C-05", sidecar_entry.raw_path)
+
+      true ->
+        nil
+    end
+  end
+
+  defp sidecar_identity(value) do
+    Map.take(value, ~w(pid sessionId cwd startedAt procStart))
+  end
+
+  defp identity_failure(_state, "pre-wake", _identity), do: nil
+
+  defp identity_failure(state, "post-turn", identity) do
+    if Map.get(state, :home_sidecar_identity) == identity,
+      do: nil,
+      else: home_failure(29, "FX_IDENTITY_DRIFT", "C-06", "sessions/#{identity["pid"]}.json")
+  end
+
+  defp first_path_failure(entries, fun) do
+    entries
+    |> Enum.sort_by(& &1.raw_path)
+    |> Enum.find_value(fun)
+  end
+
+  defp runtime_case(state, harness, phase, entries, cwd, started, finished)
+       when is_map(state) and is_list(entries) do
+    runtime_failure(state, harness, phase, entries, cwd, started, finished)
+    |> elem(0)
+    |> candidate_code()
+  end
+
+  defp runtime_case(entries, state, harness, phase, cwd, started, finished)
+       when is_list(entries) and is_map(state) do
+    runtime_case(state, harness, phase, entries, cwd, started, finished)
+  end
+
+  defp runtime_case(entries, _state, harness, phase, cwd, started, finished, phase_state)
+       when is_list(entries) and is_map(phase_state) do
+    runtime_case(phase_state, harness, phase, entries, cwd, started, finished)
+  end
+
+  defp candidate_code(nil), do: :pass
+  defp candidate_code(candidate), do: candidate.code
+
+  defp synthetic_claude_entries(now, cwd) do
+    sidecar = %{
+      "pid" => 123,
+      "sessionId" => "00000000-0000-0000-0000-000000000001",
+      "cwd" => cwd,
+      "startedAt" => now,
+      "procStart" => "1",
+      "version" => "2.1.232",
+      "peerProtocol" => 1,
+      "kind" => "interactive",
+      "entrypoint" => "sdk-ts",
+      "name" => "fixture",
+      "nameSource" => "derived"
+    }
+
+    [
+      synthetic_entry(".claude.json", :regular, 0o600, "{}"),
+      synthetic_entry("backups", :directory, 0o755, nil),
+      synthetic_entry("backups/.claude.json.backup.#{now}", :regular, 0o600, "{}"),
+      synthetic_entry("sessions", :directory, 0o700, nil),
+      synthetic_entry("sessions/123.json", :regular, 0o644, JSON.encode!(sidecar))
+    ]
+  end
+
+  defp synthetic_entry(path, type, mode, nil) do
+    %{
+      raw_path: path,
+      type: type,
+      mode: mode,
+      size: if(type == :regular, do: 1, else: nil),
+      sha256: nil,
+      bytes: nil
+    }
+  end
+
+  defp synthetic_entry(path, type, mode, bytes) do
+    %{
+      raw_path: path,
+      type: type,
+      mode: mode,
+      size: byte_size(bytes),
+      sha256: :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower),
+      bytes: bytes
+    }
+  end
+
+  defp replace_entry(entries, path, fun) do
+    Enum.map(entries, fn entry -> if entry.raw_path == path, do: fun.(entry), else: entry end)
+  end
+
+  defp rename_entry(entries, old, new) do
+    replace_entry(entries, old, &%{&1 | raw_path: new})
+  end
+
+  defp replace_bytes(entries, path, bytes) do
+    replace_entry(entries, path, fn entry ->
+      if is_binary(bytes) do
+        %{
+          entry
+          | bytes: bytes,
+            size: byte_size(bytes),
+            sha256: :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
+        }
+      else
+        %{entry | bytes: nil, sha256: nil}
+      end
+    end)
+  end
+
+  defp replace_json(entries, path, fun) do
+    entry = Enum.find(entries, &(&1.raw_path == path))
+    replace_bytes(entries, path, entry.bytes |> JSON.decode!() |> fun.() |> JSON.encode!())
+  end
+
+  defp repeated_first_failure(entries, cwd, now) do
+    invalid =
+      entries
+      |> replace_entry(".claude.json", &%{&1 | mode: 0o644})
+      |> replace_json("sessions/123.json", &Map.put(&1, "cwd", "/wrong"))
+
+    1..3
+    |> Enum.map(fn _ -> runtime_case(%{}, "claude", "pre-wake", invalid, cwd, now, now) end)
+    |> Enum.uniq()
+    |> case do
+      [code] -> code
+      _ -> :nondeterministic
+    end
+  end
+
+  defp evidence_record_case(entries) do
+    record =
+      home_evidence_record(
+        %{sequence: 3},
+        "claude",
+        "pre-wake",
+        "agent:fixture",
+        entries,
+        nil
+      )
+      |> IO.iodata_to_binary()
+
+    decoded = JSON.decode!(record)
+
+    if String.starts_with?(
+         record,
+         "{\"schema\":\"#{@home_evidence_schema}\",\"sequence\":3,\"harness\":\"claude\",\"phase\":\"pre-wake\""
+       ) and length(decoded["entries"]) == 5 and length(decoded["checks"]) == 29,
+       do: :pass,
+       else: :failed
+  end
+
+  defp no_mutation_case(entries, cwd, now) do
+    before = :erlang.term_to_binary(entries)
+    runtime_case(%{}, "claude", "pre-wake", entries, cwd, now, now)
+    if :erlang.term_to_binary(entries) == before, do: :pass, else: :mutated
+  end
+
+  defp wrong_cwd_evidence_case(entries, cwd, now) do
+    invalid = replace_json(entries, "sessions/123.json", &Map.put(&1, "cwd", "/wrong"))
+    {candidate, _identity} = runtime_failure(%{}, "claude", "pre-wake", invalid, cwd, now, now)
+    checks = home_checks("claude", "pre-wake", candidate)
+    wrong = Enum.at(checks, 18)
+    later = Enum.at(checks, 19)
+
+    if candidate.clause == "C-04" and wrong.evaluated and wrong.passed == false and
+         later.evaluated == false and later.passed == nil,
+       do: :pass,
+       else: :failed
+  end
+
+  defp snapshot_root_failure_case do
+    case snapshot_home("/tightbeam-feature-smoke-path-that-does-not-exist", fn _ -> true end) do
+      {:error, "-", [], _finished_at} -> :pass
+      _ -> :failed
+    end
+  end
+
+  defp snapshot_walk_case do
+    root =
+      Path.join(System.tmp_dir!(), "tightbeam-home-case-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(Path.join(root, "sessions"))
+    File.write!(Path.join(root, ".claude.json"), "{}")
+    File.write!(Path.join(root, "sessions/123.json"), "{\"pid\":123}")
+
+    try do
+      case snapshot_home(root, fn relative -> String.ends_with?(relative, ".json") end) do
+        {:ok, entries, _finished_at} ->
+          paths = Enum.map(entries, & &1.raw_path)
+
+          if paths == [".claude.json", "sessions", "sessions/123.json"] and
+               Enum.all?(Enum.filter(entries, &(&1.type == :regular)), &is_binary(&1.sha256)),
+             do: :pass,
+             else: :failed
+
+        _ ->
+          :failed
+      end
+    after
+      File.rm_rf!(root)
+    end
+  end
+
+  defp partial_snapshot_case(entry, sha_state) do
+    expected = if sha_state == :present, do: is_binary(entry.sha256), else: is_nil(entry.sha256)
+    if expected and entry.type in [nil, :regular], do: :pass, else: :failed
+  end
+
+  defp identity_mismatch_case do
+    initial = file_info(type: :regular, major_device: 1, minor_device: 2, inode: 3)
+    opened = file_info(type: :regular, major_device: 1, minor_device: 2, inode: 4)
+
+    case {regular_identity(initial), regular_identity(opened)} do
+      {{:ok, first}, {:ok, second}} when first != second -> :pass
+      _ -> :failed
+    end
+  end
+
+  defp baseline_ancestors(expected_home) do
+    expected_home
+    |> Enum.flat_map(fn relative ->
+      relative
+      |> :filename.split()
+      |> Enum.drop(-1)
+      |> Enum.scan(fn part, prefix -> prefix <> "/" <> part end)
+    end)
+    |> MapSet.new()
+  end
+
+  defp partial_phase_entries(entries, expected_home, ancestors, failed_path) do
+    runtime =
+      Enum.filter(entries, fn entry ->
+        not MapSet.member?(expected_home, entry.raw_path) and
+          not MapSet.member?(ancestors, entry.raw_path)
+      end)
+
+    case Enum.find(entries, &(&1.raw_path == failed_path)) do
+      nil ->
+        runtime
+
+      failed ->
+        if Enum.any?(runtime, &(&1.raw_path == failed_path)),
+          do: runtime,
+          else: runtime ++ [failed]
+    end
+  end
+
+  defp partial_pre_spawn_entries(entries, ancestors, failed_path) do
+    visible = Enum.reject(entries, &MapSet.member?(ancestors, &1.raw_path))
+
+    case Enum.find(entries, &(&1.raw_path == failed_path)) do
+      nil ->
+        visible
+
+      failed ->
+        if Enum.any?(visible, &(&1.raw_path == failed_path)),
+          do: visible,
+          else: visible ++ [failed]
+    end
+  end
+
+  defp snapshot_home(home, capture?) do
+    result = walk_home(home, "", capture?, [])
+    finished_at = System.system_time(:millisecond)
+
+    case result do
+      {:ok, entries} -> {:ok, entries, finished_at}
+      {:error, path, entries} -> {:error, path, entries, finished_at}
+    end
+  end
+
+  defp walk_home(path, relative, capture?, entries) do
+    case :file.list_dir(path) do
+      {:ok, names} ->
+        names
+        |> Enum.map(&raw_filename/1)
+        |> Enum.sort()
+        |> Enum.reduce_while({:ok, entries}, fn name, {:ok, acc} ->
+          child = :filename.join(path, name)
+          child_relative = if relative == "", do: name, else: relative <> "/" <> name
+
+          case inspect_home_entry(child, child_relative, capture?) do
+            {:ok, entry} when entry.type == :directory ->
+              case walk_home(child, child_relative, capture?, acc ++ [entry]) do
+                {:ok, nested} -> {:cont, {:ok, nested}}
+                {:error, failed, partial} -> {:halt, {:error, failed, partial}}
+              end
+
+            {:ok, entry} ->
+              {:cont, {:ok, acc ++ [entry]}}
+
+            {:error, entry} ->
+              {:halt, {:error, child_relative, acc ++ [entry]}}
+          end
+        end)
+
+      {:error, _reason} when relative == "" ->
+        {:error, "-", entries}
+
+      {:error, _reason} ->
+        {:error, relative, entries}
+    end
+  end
+
+  defp raw_filename(name) when is_binary(name), do: name
+  defp raw_filename(name) when is_list(name), do: :unicode.characters_to_binary(name)
+
+  defp inspect_home_entry(path, relative, capture?) do
+    case :file.read_link_info(path) do
+      {:ok, info} ->
+        entry = home_entry(relative, info)
+
+        if entry.type == :regular and capture?.(relative) do
+          capture_home_file(path, entry, info)
+        else
+          {:ok, entry}
+        end
+
+      {:error, _reason} ->
+        {:error, %{raw_path: relative, type: nil, mode: nil, size: nil, sha256: nil, bytes: nil}}
+    end
+  end
+
+  defp home_entry(relative, info) do
+    type =
+      case file_info(info, :type) do
+        :directory -> :directory
+        :regular -> :regular
+        :symlink -> :symlink
+        _ -> :other
+      end
+
+    %{
+      raw_path: relative,
+      type: type,
+      mode: Bitwise.band(file_info(info, :mode), 0o7777),
+      size: if(type == :regular, do: file_info(info, :size), else: nil),
+      sha256: nil,
+      bytes: nil
+    }
+  end
+
+  defp capture_home_file(path, entry, initial_info) do
+    case :file.open(path, [:read, :binary, :raw]) do
+      {:ok, io} ->
+        try do
+          with {:ok, opened_info} <- :file.read_file_info(io),
+               true <- file_info(opened_info, :type) == :regular,
+               {:ok, initial_identity} <- regular_identity(initial_info),
+               {:ok, ^initial_identity} <- regular_identity(opened_info) do
+            case read_home_file(io, []) do
+              {:ok, bytes} ->
+                captured = %{
+                  entry
+                  | size: byte_size(bytes),
+                    sha256: :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower),
+                    bytes: bytes
+                }
+
+                with {:ok, final_info} <- :file.read_link_info(path),
+                     true <- file_info(final_info, :type) == :regular,
+                     {:ok, ^initial_identity} <- regular_identity(final_info) do
+                  {:ok, captured}
+                else
+                  _ -> {:error, captured}
+                end
+
+              {:error, _reason} ->
+                {:error, entry}
+            end
+          else
+            _ -> {:error, entry}
+          end
+        after
+          :file.close(io)
+        end
+
+      {:error, _reason} ->
+        {:error, entry}
+    end
+  end
+
+  defp read_home_file(io, acc) do
+    case :file.read(io, 65_536) do
+      {:ok, bytes} -> read_home_file(io, [bytes | acc])
+      :eof -> {:ok, acc |> Enum.reverse() |> IO.iodata_to_binary()}
+      {:error, _reason} -> {:error, :read}
+    end
+  end
+
+  defp regular_identity(info) do
+    identity =
+      {file_info(info, :major_device), file_info(info, :minor_device), file_info(info, :inode)}
+
+    if identity |> Tuple.to_list() |> Enum.all?(&is_integer/1),
+      do: {:ok, identity},
+      else: {:error, :identity}
+  end
+
+  defp json_analysis(nil), do: %{utf8: false, syntax: false, unique: false, value: nil}
+
+  defp json_analysis(bytes) do
+    if String.valid?(bytes) do
+      decoders = [
+        object_start: fn _old -> [] end,
+        object_push: fn key, value, acc -> [{key, value} | acc] end,
+        object_finish: fn acc, old -> {{:json_object, Enum.reverse(acc)}, old} end
+      ]
+
+      case JSON.decode(bytes, nil, decoders) do
+        {value, nil, rest} ->
+          if String.trim(rest) == "" do
+            case normalize_json(value) do
+              {:ok, normalized} -> %{utf8: true, syntax: true, unique: true, value: normalized}
+              :duplicate -> %{utf8: true, syntax: true, unique: false, value: nil}
+            end
+          else
+            %{utf8: true, syntax: false, unique: false, value: nil}
+          end
+
+        {:error, _reason} ->
+          %{utf8: true, syntax: false, unique: false, value: nil}
+      end
+    else
+      %{utf8: false, syntax: false, unique: false, value: nil}
+    end
+  end
+
+  defp normalize_json({:json_object, pairs}) do
+    keys = Enum.map(pairs, &elem(&1, 0))
+
+    if length(keys) == MapSet.size(MapSet.new(keys)) do
+      Enum.reduce_while(pairs, {:ok, %{}}, fn {key, value}, {:ok, acc} ->
+        case normalize_json(value) do
+          {:ok, normalized} -> {:cont, {:ok, Map.put(acc, key, normalized)}}
+          :duplicate -> {:halt, :duplicate}
+        end
+      end)
+    else
+      :duplicate
+    end
+  end
+
+  defp normalize_json(values) when is_list(values) do
+    Enum.reduce_while(values, {:ok, []}, fn value, {:ok, acc} ->
+      case normalize_json(value) do
+        {:ok, normalized} -> {:cont, {:ok, [normalized | acc]}}
+        :duplicate -> {:halt, :duplicate}
+      end
+    end)
+    |> case do
+      {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
+      :duplicate -> :duplicate
+    end
+  end
+
+  defp normalize_json(value), do: {:ok, value}
+
+  defp home_failure(check, code, clause, path) do
+    %{check: check, code: code, clause: clause, path: path}
+  end
+
+  defp finish_home_phase!(evidence, harness, phase, principal, entries, candidate) do
+    record = home_evidence_record(evidence, harness, phase, principal, entries, candidate)
+
+    case :file.write(evidence.io, [record, "\n"]) do
+      :ok ->
+        case :file.sync(evidence.io) do
+          :ok ->
+            next = %{
+              evidence
+              | sequence: evidence.sequence + 1,
+                phase_index: evidence.phase_index + 1
+            }
+
+            if candidate do
+              refusal_line!(
+                candidate.code,
+                harness,
+                phase,
+                principal,
+                candidate.path,
+                candidate.clause
+              )
+            end
+
+            next
+
+          {:error, _reason} ->
+            evidence_refusal!(harness, phase, principal)
+        end
+
+      {:error, _reason} ->
+        evidence_refusal!(harness, phase, principal)
+    end
+  end
+
+  defp home_evidence_record(evidence, harness, phase, principal, entries, candidate) do
+    fields = [
+      {"schema", @home_evidence_schema},
+      {"sequence", evidence.sequence},
+      {"harness", harness},
+      {"phase", phase},
+      {"principal", evidence_token(principal)},
+      {"result", if(candidate, do: "refused", else: "pass")},
+      {"cause", if(candidate, do: candidate.clause, else: "validated")},
+      {"entries", {:entries, Enum.sort_by(entries, & &1.raw_path)}},
+      {"checks", {:checks, home_checks(harness, phase, candidate)}}
+    ]
+
+    encode_ordered_object(fields)
+  end
+
+  defp home_checks(harness, phase, candidate) do
+    applicable = applicable_home_checks(harness, phase)
+
+    Enum.with_index(@home_check_ids, 1)
+    |> Enum.map(fn {id, index} ->
+      applies? = MapSet.member?(applicable, index)
+
+      {evaluated?, passed} =
+        cond do
+          not applies? -> {false, nil}
+          is_nil(candidate) -> {true, true}
+          index < candidate.check -> {true, true}
+          index == candidate.check -> {true, false}
+          true -> {false, nil}
+        end
+
+      %{id: id, applicable: applies?, evaluated: evaluated?, passed: passed}
+    end)
+  end
+
+  defp applicable_home_checks(_harness, "run-start"), do: MapSet.new(1..2)
+  defp applicable_home_checks(_harness, "pre-spawn"), do: MapSet.new([1, 4, 5])
+
+  defp applicable_home_checks("codex", phase) when phase in ["pre-wake", "post-turn"],
+    do: MapSet.new([1, 4, 7])
+
+  defp applicable_home_checks("claude", "pre-wake"),
+    do: MapSet.new([1, 3, 4] ++ Enum.to_list(6..28))
+
+  defp applicable_home_checks("claude", "post-turn"),
+    do: MapSet.new([1, 3, 4] ++ Enum.to_list(6..29))
+
+  defp encode_ordered_object(fields) do
+    [
+      "{",
+      fields
+      |> Enum.map(fn {key, value} ->
+        [JSON.encode_to_iodata!(key), ":", encode_home_value(value)]
+      end)
+      |> Enum.intersperse(","),
+      "}"
+    ]
+  end
+
+  defp encode_home_value({:entries, entries}) do
+    ["[", entries |> Enum.map(&encode_home_entry/1) |> Enum.intersperse(","), "]"]
+  end
+
+  defp encode_home_value({:checks, checks}) do
+    ["[", checks |> Enum.map(&encode_home_check/1) |> Enum.intersperse(","), "]"]
+  end
+
+  defp encode_home_value(value), do: JSON.encode_to_iodata!(value)
+
+  defp encode_home_entry(entry) do
+    encode_ordered_object([
+      {"path", evidence_token(entry.raw_path)},
+      {"type", if(entry.type, do: Atom.to_string(entry.type), else: nil)},
+      {"mode",
+       if(entry.mode,
+         do: entry.mode |> Integer.to_string(8) |> String.pad_leading(4, "0"),
+         else: nil
+       )},
+      {"size", entry.size},
+      {"sha256", entry.sha256}
+    ])
+  end
+
+  defp encode_home_check(check) do
+    encode_ordered_object([
+      {"id", check.id},
+      {"applicable", check.applicable},
+      {"evaluated", check.evaluated},
+      {"passed", check.passed}
+    ])
+  end
+
+  defp evidence_token("-"), do: "-"
+
+  defp evidence_token(bytes) do
+    for <<byte <- bytes>>, into: "" do
+      if byte in ?A..?Z or byte in ?a..?z or byte in ?0..?9 or byte in ~c"._/-" do
+        <<byte>>
+      else
+        "%" <> Base.encode16(<<byte>>)
+      end
+    end
+  end
+
+  defp evidence_refusal!(harness, phase, principal) do
+    refusal_line!("FX_EVIDENCE", harness, phase, principal, @home_evidence_name, "C-10")
+  end
+
+  defp refusal_line!(code, harness, phase, principal, path, clause) do
+    IO.puts(
+      "feature-smoke fixture HOME REFUSED code=#{code} harness=#{harness} phase=#{phase} " <>
+        "principal=#{evidence_token(principal)} path=#{evidence_token(path)} clause=#{clause}"
+    )
+
+    raise Failure, message: "fixture HOME refused #{code} at #{phase}"
   end
 
   defp install_smoke_rule!(base_dir) do
@@ -2514,7 +3741,9 @@ defmodule FeatureSmoke do
 end
 
 try do
-  FeatureSmoke.run()
+  if System.get_env("TIGHTBEAM_SMOKE_HOME_CASES_ONLY") == "1",
+    do: FeatureSmoke.run_home_cases!(),
+    else: FeatureSmoke.run()
 rescue
   error in FeatureSmoke.Failure ->
     IO.puts("  FAIL  #{error.message}")
