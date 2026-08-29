@@ -88,13 +88,112 @@ defmodule Tightbeam.DeliverableContractTest do
     end)
   end
 
-  test "the fixed v9 base does not install the separately gated optional completion rail", ctx do
-    # The reviewed homing spec makes these rows conditional on the separate
-    # completion-escalation proposal landing. That proposal explicitly keeps
-    # implementation unauthorized, and fixed base 724e5c96 has none of its
-    # schema. The authoritative-write probes below therefore cover every write
-    # applicable to this exact base; parent/report-to/deadline probes belong to
-    # the rail's own implementation and acceptance suite when it is installed.
+  test "A5 exact fixed-base source proves the installed completion producer set", ctx do
+    archive =
+      Path.join(__DIR__, "fixtures/deliverable_contract/phase1_v9_lib.tar.gz")
+      |> File.read!()
+
+    assert :sha256 |> :crypto.hash(archive) |> Base.encode16(case: :lower) ==
+             "282fa3bb92c0eb6795a26722c14092ba3b4a4edbbdca80d26d7a3fb9faaacc64"
+
+    assert {:ok, entries} = :erl_tar.extract({:binary, archive}, [:memory, :compressed])
+
+    fixed_base_sources =
+      Map.new(entries, fn {path, bytes} -> {List.to_string(path), bytes} end)
+
+    # This archive is produced from the complete lib/ tree at exact base
+    # 724e5c96f9513b37e937dc52eb014ba1ef2d1b5e (tree
+    # 41da8ae7ddee96e01c42ac482052862fba7041e9). Inspecting every production
+    # source file makes an empty optional-rail set an exact-source result, not
+    # an inference from a test that happened not to configure one.
+    exact_source =
+      fixed_base_sources
+      |> Enum.sort()
+      |> Enum.map_join("\n", fn {path, bytes} -> path <> "\n" <> bytes end)
+
+    refute exact_source =~ "CompletionEscalation"
+    refute exact_source =~ "completion_escalation"
+
+    assert fixed_base_sources
+           |> Map.keys()
+           |> Enum.filter(&String.starts_with?(&1, "lib/tightbeam/productions/"))
+           |> Enum.sort() == [
+             "lib/tightbeam/productions/bubble.ex",
+             "lib/tightbeam/productions/bubble_sweeper.ex",
+             "lib/tightbeam/productions/catalog_rederive.ex"
+           ]
+
+    assignments = Map.fetch!(fixed_base_sources, "lib/tightbeam/assignments.ex")
+    work_items = Map.fetch!(fixed_base_sources, "lib/tightbeam/work_items.ex")
+    supervision = Map.fetch!(fixed_base_sources, "lib/tightbeam/supervision.ex")
+    effort = Map.fetch!(fixed_base_sources, "lib/tightbeam/effort_checkin.ex")
+    schema = Map.fetch!(fixed_base_sources, "lib/tightbeam/schema.ex")
+
+    contract =
+      File.read!(Path.join([__DIR__, "..", "lib", "tightbeam", "deliverable_contract.ex"]))
+
+    # Each entry records the real module/handler seam for the authoritative
+    # writes exercised by the rollback matrices below. The first four contract
+    # writes are added by this candidate. Every remaining producer is reached
+    # by the fixed base's ordinary Assignments attest entry point.
+    producer_seams = [
+      {"completion_attest", "Tightbeam.Assignments.lifecycle_attest_in_txn/2"},
+      {"completion_claim", "Tightbeam.DeliverableContract.record_completion_claim_in_txn/3"},
+      {"assignment_close", "Tightbeam.Assignments.lifecycle_attest_in_txn/2"},
+      {"completion_receipt", "Tightbeam.DeliverableContract.store_completion_receipt_in_txn/5"},
+      {"slate_wake", "Tightbeam.WorkItems.arm_slate_in_txn/2"},
+      {"slate_pointer", "Tightbeam.WorkItems.arm_slate_in_txn/2"},
+      {"supervision_transition", "Tightbeam.Supervision.transition_in_txn/2"},
+      {"supervision_lifecycle", "Tightbeam.Supervision.transition_in_txn/2"},
+      {"effort_wake_cancel", "Tightbeam.EffortCheckin.cancel_in_txn/3"},
+      {"effort_cancellation_receipt", "Tightbeam.EffortCheckin.cancel_in_txn/3"},
+      {"effort_generation_cancel", "Tightbeam.EffortCheckin.cancel_in_txn/3"},
+      {"effort_request_supersede", "Tightbeam.EffortCheckin.cancel_in_txn/3"},
+      {"effort_deadline_wake_cancel", "Tightbeam.EffortCheckin.cancel_in_txn/3"},
+      {"effort_deadline_cancellation_receipt", "Tightbeam.EffortCheckin.cancel_in_txn/3"}
+    ]
+
+    assert Enum.map(producer_seams, &elem(&1, 0)) == [
+             "completion_attest",
+             "completion_claim",
+             "assignment_close",
+             "completion_receipt",
+             "slate_wake",
+             "slate_pointer",
+             "supervision_transition",
+             "supervision_lifecycle",
+             "effort_wake_cancel",
+             "effort_cancellation_receipt",
+             "effort_generation_cancel",
+             "effort_request_supersede",
+             "effort_deadline_wake_cancel",
+             "effort_deadline_cancellation_receipt"
+           ]
+
+    assert assignments =~ "defp lifecycle_attest_in_txn(txn, call)"
+    assert assignments =~ "attest = insert_attest(txn, call, assignment_id)"
+    assert assignments =~ "UPDATE assignments SET state = 'closed'"
+
+    assert assignments =~
+             "Tightbeam.WorkItems.arm_slate_in_txn(txn, closed_assignment.workItemId)"
+
+    assert assignments =~ "supervision_transition!(txn, :terminal_disposition"
+    assert assignments =~ "EffortCheckin.cancel_in_txn("
+    assert work_items =~ "def arm_slate_in_txn(%Txn{} = txn, work_item_id)"
+    assert work_items =~ "wake =\n            Wakes.schedule_in_txn"
+    assert work_items =~ "UPDATE work_items SET slateWakeId = ?2"
+    assert supervision =~ "def transition_in_txn(%Txn{} = txn"
+    assert effort =~ "def cancel_in_txn(%Txn{} = txn, assignment_id, command)"
+    assert effort =~ "UPDATE effort_checkin_generations SET state = 'canceled'"
+    assert effort =~ "dispose_requests_in_txn(txn, assignment_id, command)"
+    assert schema =~ ~s(@shape "coordination-fabric-v1-phase1-v9")
+    assert contract =~ "def record_completion_claim_in_txn(txn, assignment_id, attest)"
+
+    assert contract =~
+             "def store_completion_receipt_in_txn(txn, principal, key, fingerprint, response)"
+
+    # Runtime schema readback agrees with the exact-source enumeration. This is
+    # compatibility evidence only; it is not used to manufacture a rail.
     assert rows!(
              ctx.db,
              "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('completion_escalations','completion_escalation_wakes') ORDER BY name"
@@ -616,6 +715,113 @@ defmodule Tightbeam.DeliverableContractTest do
              close(ctx, {:user, "flynn"}, card.id, second.attest.id)
 
     assert {:ok, [[2, 2]]} = completion_counts(ctx.db, assignment.id)
+  end
+
+  test "legacy terminal reopen reuses activation lineage and captures it only when missing",
+       ctx do
+    card = create_card(ctx, "Legacy terminal reopen lineage")
+    captured = assign(ctx, card.id, "Captured during activation", false)
+    missing = assign(ctx, card.id, "Missing during activation", false)
+
+    _ = complete(ctx, captured.id, "terminal before activation")
+    _ = complete(ctx, missing.id, "terminal before activation")
+
+    strip_contract_to_v9!(ctx.db)
+
+    assert :ok =
+             DeliverableContract.upgrade_v1(
+               ctx.db,
+               "coordination-fabric-v1-phase1-v9",
+               "coordination-fabric-v1-phase1-v10"
+             )
+
+    captured_lineage =
+      rows!(
+        ctx.db,
+        "SELECT assignmentId,workItemId,holderSessionKey,captureKind FROM assignment_product_lineage_captures WHERE assignmentId=?1",
+        [captured.id]
+      )
+
+    captured_ancestry =
+      rows!(
+        ctx.db,
+        "SELECT productOwnerSessionKey,distance FROM assignment_product_owner_ancestry WHERE assignmentId=?1 ORDER BY distance",
+        [captured.id]
+      )
+
+    assert captured_lineage == [[captured.id, card.id, "holder", "activation"]]
+    assert captured_ancestry != []
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "DELETE FROM assignment_product_owner_ancestry WHERE assignmentId=?1",
+               [missing.id]
+             )
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "DELETE FROM assignment_product_lineage_captures WHERE assignmentId=?1",
+               [missing.id]
+             )
+
+    reopen = fn assignment, reason ->
+      Assignments.__handle__(
+        ctx.db,
+        "reopen-assignment",
+        call("reopen-assignment", {:user, "flynn"}, nil, %{
+          assignment_id: assignment.id,
+          reason: reason
+        })
+        |> Map.put(:supervision_interval_ms, 1_000)
+      )
+    end
+
+    assert %{state: "open"} = reopen.(captured, "reuse the activation lineage")
+
+    assert captured_lineage ==
+             rows!(
+               ctx.db,
+               "SELECT assignmentId,workItemId,holderSessionKey,captureKind FROM assignment_product_lineage_captures WHERE assignmentId=?1",
+               [captured.id]
+             )
+
+    assert captured_ancestry ==
+             rows!(
+               ctx.db,
+               "SELECT productOwnerSessionKey,distance FROM assignment_product_owner_ancestry WHERE assignmentId=?1 ORDER BY distance",
+               [captured.id]
+             )
+
+    assert %{state: "open"} = reopen.(missing, "replace the absent activation lineage")
+
+    assert [[missing.id, card.id, "holder", "assignment_open"]] ==
+             rows!(
+               ctx.db,
+               "SELECT assignmentId,workItemId,holderSessionKey,captureKind FROM assignment_product_lineage_captures WHERE assignmentId=?1",
+               [missing.id]
+             )
+
+    assert rows!(
+             ctx.db,
+             "SELECT productOwnerSessionKey,distance FROM assignment_product_owner_ancestry WHERE assignmentId=?1 ORDER BY distance",
+             [missing.id]
+           ) != []
+
+    expected_bindings =
+      [captured.id, missing.id]
+      |> Enum.sort()
+      |> Enum.map(&[&1, "assignment"])
+
+    assert expected_bindings ==
+             rows!(
+               ctx.db,
+               "SELECT assignmentId,sourceKind FROM assignment_deliverables WHERE assignmentId IN (?1,?2) ORDER BY assignmentId",
+               Enum.sort([captured.id, missing.id])
+             )
+
+    assert :ok = DeliverableContract.ensure_schema(ctx.db)
   end
 
   test "close replay and scoped keys preserve one immutable closure", ctx do
