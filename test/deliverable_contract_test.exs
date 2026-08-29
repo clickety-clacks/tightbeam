@@ -88,131 +88,21 @@ defmodule Tightbeam.DeliverableContractTest do
     end)
   end
 
-  test "keyed completion rolls back every installed optional rail and existing write", ctx do
+  test "the fixed v9 base does not install the separately gated optional completion rail", ctx do
+    # The reviewed homing spec makes these rows conditional on the separate
+    # completion-escalation proposal landing. That proposal explicitly keeps
+    # implementation unauthorized, and fixed base 724e5c96 has none of its
+    # schema. The authoritative-write probes below therefore cover every write
+    # applicable to this exact base; parent/report-to/deadline probes belong to
+    # the rail's own implementation and acceptance suite when it is installed.
     assert rows!(
              ctx.db,
              "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('completion_escalations','completion_escalation_wakes') ORDER BY name"
            ) == []
 
-    register_hosts(ctx.db, %{
-      "testhost" => %{ssh: nil, base_dir: System.tmp_dir!(), cli_bin: nil}
-    })
-
-    session(ctx.db, "completion-report-to", "flynn", %{spawned_by: "product-owner"})
-    card = create_card(ctx, "Atomic completion with every optional rail")
-
-    assignment =
-      dispatch_to(ctx, card.id, "Complete the whole card through every rail", true, "holder")
-
-    install_optional_completion_rail!(ctx.db, assignment.id, "completion-report-to")
-
-    assert Enum.any?(rows!(ctx.db, "PRAGMA table_info(assignments)"), fn row ->
+    refute Enum.any?(rows!(ctx.db, "PRAGMA table_info(assignments)"), fn row ->
              Enum.at(row, 1) == "completionReportToSessionKey"
            end)
-
-    assert rows!(
-             ctx.db,
-             "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('completion_escalations','completion_escalation_wakes') ORDER BY name"
-           ) == [["completion_escalation_wakes"], ["completion_escalations"]]
-
-    [[effort_wake_id]] =
-      rows!(
-        ctx.db,
-        "SELECT wakeId FROM effort_checkin_generations WHERE assignmentId=?1 AND state='armed'",
-        [assignment.id]
-      )
-
-    request_id = open_effort_request!(ctx.db, assignment.id, "product-owner")
-
-    [[effort_deadline_wake_id]] =
-      rows!(ctx.db, "SELECT deadlineWakeId FROM decision_requests WHERE id=?1", [request_id])
-
-    probes = [
-      {"completion_attest", "BEFORE INSERT ON attests WHEN NEW.kind='completion'"},
-      {"completion_claim", "BEFORE INSERT ON completion_claims"},
-      {"assignment_close", "BEFORE UPDATE ON assignments WHEN NEW.outcome='completed'"},
-      {"completion_escalation", "BEFORE INSERT ON completion_escalations"},
-      {"completion_parent_wake",
-       "BEFORE INSERT ON wakes WHEN NEW.consumer='completion_parent_notice'"},
-      {"completion_parent_membership",
-       "BEFORE INSERT ON completion_escalation_wakes WHEN NEW.kind='parent-notice'"},
-      {"completion_report_to_wake",
-       "BEFORE INSERT ON wakes WHEN NEW.consumer='completion_report_to_notice'"},
-      {"completion_report_to_membership",
-       "BEFORE INSERT ON completion_escalation_wakes WHEN NEW.kind='report-to-notice'"},
-      {"completion_deadline_wake",
-       "BEFORE INSERT ON wakes WHEN NEW.consumer='completion_disposition_deadline'"},
-      {"completion_deadline_membership",
-       "BEFORE INSERT ON completion_escalation_wakes WHEN NEW.kind='deadline'"},
-      {"completion_escalation_lifecycle",
-       "BEFORE INSERT ON lifecycle_events WHEN NEW.kind='completion_escalation_opened'"},
-      {"slate_wake", "BEFORE INSERT ON wakes WHEN NEW.prompt LIKE 'slate clear on %'"},
-      {"slate_pointer", "BEFORE UPDATE ON work_items WHEN NEW.slateWakeId IS NOT NULL"},
-      {"supervision_transition", "BEFORE DELETE ON supervision_entitlements"},
-      {"supervision_lifecycle",
-       "BEFORE INSERT ON lifecycle_events WHEN NEW.kind='supervision_entitlement_cleared'"},
-      {"effort_wake_cancel",
-       "BEFORE UPDATE ON wakes WHEN OLD.wakeId='#{effort_wake_id}' AND NEW.state='canceled'"},
-      {"effort_cancellation_receipt",
-       "BEFORE INSERT ON wake_cancellations WHEN NEW.wakeId='#{effort_wake_id}'"},
-      {"effort_generation_cancel",
-       "BEFORE UPDATE ON effort_checkin_generations WHEN NEW.state='canceled'"},
-      {"effort_request_supersede",
-       "BEFORE UPDATE ON decision_requests WHEN OLD.id='#{request_id}' AND NEW.status='superseded'"},
-      {"effort_deadline_wake_cancel",
-       "BEFORE UPDATE ON wakes WHEN OLD.wakeId='#{effort_deadline_wake_id}' AND NEW.state='canceled'"},
-      {"effort_deadline_cancellation_receipt",
-       "BEFORE INSERT ON wake_cancellations WHEN NEW.wakeId='#{effort_deadline_wake_id}'"},
-      {"completion_receipt",
-       "BEFORE INSERT ON deliverable_contract_idempotency WHEN NEW.operation='attest-completion'"}
-    ]
-
-    Enum.each(probes, fn {name, event} ->
-      trigger = "completion_all_rails_probe_#{name}"
-      before = optional_completion_snapshot(ctx.db, assignment.id, card.id)
-
-      :ok =
-        DB.execute(
-          ctx.db,
-          "CREATE TRIGGER #{trigger} #{event} BEGIN SELECT RAISE(ABORT, '#{name}'); END"
-        )
-
-      assert_raise Tightbeam.DB.Error, ~r/#{name}/, fn ->
-        complete(ctx, assignment.id, "complete through every rail", "all-rails-key")
-      end
-
-      assert optional_completion_snapshot(ctx.db, assignment.id, card.id) == before
-
-      assert [["open", nil, nil]] =
-               rows!(
-                 ctx.db,
-                 "SELECT state,outcome,closingAttestId FROM assignments WHERE id=?1",
-                 [
-                   assignment.id
-                 ]
-               )
-
-      :ok = DB.execute(ctx.db, "DROP TRIGGER #{trigger}")
-    end)
-
-    committed = complete(ctx, assignment.id, "complete through every rail", "all-rails-key")
-    replay = complete(ctx, assignment.id, "complete through every rail", "all-rails-key")
-
-    assert committed.attest.id == replay.attest.id
-
-    assert [["scheduled", "scheduled", "open", 0]] =
-             rows!(
-               ctx.db,
-               "SELECT parentRouteStatus,reportToRouteStatus,status,remainingOpenAssignments FROM completion_escalations WHERE assignmentId=?1",
-               [assignment.id]
-             )
-
-    assert [["deadline"], ["parent-notice"], ["report-to-notice"]] =
-             rows!(
-               ctx.db,
-               "SELECT kind FROM completion_escalation_wakes WHERE completionId IN (SELECT id FROM completion_escalations WHERE assignmentId=?1) ORDER BY kind",
-               [assignment.id]
-             )
   end
 
   test "boot refuses ancestry that promotes an ordinary ancestor to product owner", ctx do
@@ -495,12 +385,6 @@ defmodule Tightbeam.DeliverableContractTest do
     session(ctx.db, "retired-parent", "flynn", %{spawned_by: "product-owner"})
     Org.set_operational_parent(ctx.db, "holder", "retired-parent")
 
-    assert {:ok, _} =
-             DB.query(
-               ctx.db,
-               "UPDATE sessions SET spawnedBy='retired-parent' WHERE sessionKey='holder'"
-             )
-
     :ok =
       DB.execute(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey='retired-parent'")
 
@@ -509,15 +393,15 @@ defmodule Tightbeam.DeliverableContractTest do
     assignment =
       dispatch_to(ctx, card.id, "Complete without a live direct parent", true, "holder")
 
-    install_optional_completion_rail!(ctx.db, assignment.id, nil)
     request_id = open_effort_request!(ctx.db, assignment.id, "product-owner")
 
     for {name, event} <- [
-          {"parent_unavailable_escalation", "BEFORE INSERT ON completion_escalations"},
+          {"parent_unavailable_request",
+           "BEFORE UPDATE ON decision_requests WHEN OLD.id='#{request_id}' AND NEW.status='superseded'"},
           {"parent_unavailable_lifecycle",
-           "BEFORE INSERT ON lifecycle_events WHEN NEW.kind='completion_escalation_undeliverable'"}
+           "BEFORE INSERT ON lifecycle_events WHEN NEW.kind='supervision_entitlement_cleared'"}
         ] do
-      before = optional_completion_snapshot(ctx.db, assignment.id, card.id)
+      before = completion_snapshot(ctx.db, assignment.id, card.id)
       trigger = "completion_probe_#{name}"
 
       :ok =
@@ -530,60 +414,16 @@ defmodule Tightbeam.DeliverableContractTest do
         complete(ctx, assignment.id, "complete with retired direct parent", name)
       end
 
-      assert optional_completion_snapshot(ctx.db, assignment.id, card.id) == before
-
-      assert [["open", nil, nil]] =
-               rows!(
-                 ctx.db,
-                 "SELECT state,outcome,closingAttestId FROM assignments WHERE id=?1",
-                 [
-                   assignment.id
-                 ]
-               )
-
+      assert completion_snapshot(ctx.db, assignment.id, card.id) == before
       :ok = DB.execute(ctx.db, "DROP TRIGGER #{trigger}")
     end
-
-    committed =
-      complete(
-        ctx,
-        assignment.id,
-        "complete with retired direct parent",
-        "parent-unavailable-success"
-      )
-
-    assert committed.assignment.state == "closed"
-
-    assert [["unavailable", "not-declared", "open"]] =
-             rows!(
-               ctx.db,
-               "SELECT parentRouteStatus,reportToRouteStatus,status FROM completion_escalations WHERE assignmentId=?1",
-               [assignment.id]
-             )
-
-    assert [["deadline"]] =
-             rows!(
-               ctx.db,
-               "SELECT kind FROM completion_escalation_wakes WHERE completionId IN (SELECT id FROM completion_escalations WHERE assignmentId=?1) ORDER BY kind",
-               [assignment.id]
-             )
 
     assert [] ==
              rows!(
                ctx.db,
-               "SELECT kind FROM completion_escalation_wakes WHERE completionId IN (SELECT id FROM completion_escalations WHERE assignmentId=?1) AND kind IN ('parent-notice','report-to-notice')",
+               "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND consumer NOT IN ('effort_probe','effort_deadline') ORDER BY wakeId",
                [assignment.id]
              )
-
-    assert [["completion_escalation_undeliverable"]] =
-             rows!(
-               ctx.db,
-               "SELECT kind FROM lifecycle_events WHERE subject IN (SELECT id FROM completion_escalations WHERE assignmentId=?1)",
-               [assignment.id]
-             )
-
-    assert [["superseded"]] =
-             rows!(ctx.db, "SELECT status FROM decision_requests WHERE id=?1", [request_id])
   end
 
   test "each post-commit completion marker may fail without changing authoritative reads", ctx do
@@ -1926,312 +1766,6 @@ defmodule Tightbeam.DeliverableContractTest do
       """,
       [assignment_id]
     )
-  end
-
-  defp install_optional_completion_rail!(db, assignment_id, report_to_session_key) do
-    :ok =
-      DB.execute(
-        db,
-        "ALTER TABLE assignments ADD COLUMN completionReportToSessionKey TEXT NULL REFERENCES sessions(sessionKey)"
-      )
-
-    :ok =
-      DB.execute(
-        db,
-        """
-        CREATE TABLE completion_escalations (
-          id                        TEXT PRIMARY KEY,
-          dedupeKey                 TEXT NOT NULL UNIQUE,
-          assignmentId              TEXT NOT NULL UNIQUE REFERENCES assignments(id),
-          workItemId                TEXT NULL REFERENCES work_items(id),
-          childSessionKey           TEXT NOT NULL REFERENCES sessions(sessionKey),
-          remainingOpenAssignments INTEGER NOT NULL CHECK (remainingOpenAssignments >= 0),
-          closingAttestId           TEXT NOT NULL UNIQUE REFERENCES attests(id),
-          outcome                   TEXT NOT NULL CHECK (outcome = 'completed'),
-          causeBySession            TEXT NOT NULL REFERENCES sessions(sessionKey),
-          ownerUserId               TEXT NOT NULL REFERENCES users(userId),
-          rootMainHolder            INTEGER NOT NULL CHECK (rootMainHolder IN (0,1)),
-          immediateParentSessionKey TEXT NULL,
-          parentSessionKey          TEXT NULL,
-          parentRouteStatus         TEXT NOT NULL CHECK (
-            parentRouteStatus IN ('scheduled','unavailable','root-self')
-          ),
-          reportToSessionKey        TEXT NULL REFERENCES sessions(sessionKey),
-          reportToRouteStatus       TEXT NOT NULL CHECK (
-            reportToRouteStatus IN ('not-declared','scheduled','shared-parent','unavailable')
-          ),
-          generation                INTEGER NOT NULL DEFAULT 0 CHECK (generation >= 0),
-          currentParentNoticeWakeId TEXT NULL UNIQUE REFERENCES wakes(wakeId)
-            DEFERRABLE INITIALLY DEFERRED,
-          reportToNoticeWakeId      TEXT NULL UNIQUE REFERENCES wakes(wakeId)
-            DEFERRABLE INITIALLY DEFERRED,
-          deadlineWakeId            TEXT NULL UNIQUE REFERENCES wakes(wakeId)
-            DEFERRABLE INITIALLY DEFERRED,
-          actionDeadlineAt          INTEGER NULL,
-          status                    TEXT NOT NULL CHECK (
-            status IN ('notice-only','open','acknowledged','retained_root','superseded')
-          ),
-          decision                  TEXT NULL CHECK (decision IN ('retain','park','retire')),
-          actedBySession            TEXT NULL REFERENCES sessions(sessionKey),
-          actedByUser               TEXT NULL REFERENCES users(userId),
-          actedAt                   INTEGER NULL,
-          supersededReason          TEXT NULL CHECK (
-            supersededReason IN ('new-assignment','child-retired')
-          ),
-          supersededByAssignmentId  TEXT NULL REFERENCES assignments(id),
-          supersededAt              INTEGER NULL,
-          createdAt                 INTEGER NOT NULL,
-          CHECK (causeBySession = childSessionKey),
-          CHECK (dedupeKey = 'completion:' || closingAttestId),
-          CHECK (
-            (parentRouteStatus = 'scheduled' AND rootMainHolder = 0
-              AND parentSessionKey IS NOT NULL
-              AND parentSessionKey IS immediateParentSessionKey
-              AND currentParentNoticeWakeId IS NOT NULL)
-            OR
-            (parentRouteStatus = 'unavailable' AND rootMainHolder = 0
-              AND parentSessionKey IS immediateParentSessionKey
-              AND currentParentNoticeWakeId IS NULL)
-            OR
-            (parentRouteStatus = 'root-self' AND rootMainHolder = 1
-              AND parentSessionKey = childSessionKey
-              AND currentParentNoticeWakeId IS NOT NULL)
-          ),
-          CHECK (
-            (reportToRouteStatus = 'not-declared'
-              AND reportToSessionKey IS NULL AND reportToNoticeWakeId IS NULL)
-            OR
-            (reportToRouteStatus = 'scheduled'
-              AND reportToSessionKey IS NOT NULL AND reportToNoticeWakeId IS NOT NULL
-              AND reportToSessionKey IS NOT parentSessionKey)
-            OR
-            (reportToRouteStatus = 'shared-parent'
-              AND reportToSessionKey IS NOT NULL AND reportToNoticeWakeId IS NULL
-              AND parentRouteStatus IN ('scheduled','root-self')
-              AND reportToSessionKey IS parentSessionKey)
-            OR
-            (reportToRouteStatus = 'unavailable'
-              AND reportToSessionKey IS NOT NULL AND reportToNoticeWakeId IS NULL)
-          ),
-          CHECK (
-            status = 'notice-only'
-              AND remainingOpenAssignments >= 1
-              AND decision IS NULL AND actionDeadlineAt IS NULL AND deadlineWakeId IS NULL
-              AND actedBySession IS NULL AND actedByUser IS NULL AND actedAt IS NULL
-              AND supersededReason IS NULL AND supersededByAssignmentId IS NULL AND supersededAt IS NULL
-            OR status = 'open'
-              AND remainingOpenAssignments = 0
-              AND decision IS NULL AND actionDeadlineAt IS NOT NULL AND deadlineWakeId IS NOT NULL
-              AND actedBySession IS NULL AND actedByUser IS NULL AND actedAt IS NULL
-              AND supersededReason IS NULL AND supersededByAssignmentId IS NULL AND supersededAt IS NULL
-            OR status = 'acknowledged'
-              AND rootMainHolder = 0
-              AND remainingOpenAssignments = 0
-              AND decision IS NOT NULL AND actionDeadlineAt IS NOT NULL AND deadlineWakeId IS NULL
-              AND ((actedBySession IS NOT NULL) != (actedByUser IS NOT NULL)) AND actedAt IS NOT NULL
-              AND supersededReason IS NULL AND supersededByAssignmentId IS NULL AND supersededAt IS NULL
-            OR status = 'retained_root'
-              AND rootMainHolder = 1
-              AND remainingOpenAssignments = 0
-              AND decision = 'retain' AND actionDeadlineAt IS NOT NULL AND deadlineWakeId IS NULL
-              AND ((actedBySession IS NOT NULL) != (actedByUser IS NOT NULL)) AND actedAt IS NOT NULL
-              AND supersededReason IS NULL AND supersededByAssignmentId IS NULL AND supersededAt IS NULL
-            OR status = 'superseded'
-              AND remainingOpenAssignments = 0
-              AND decision IS NULL AND actionDeadlineAt IS NOT NULL AND deadlineWakeId IS NULL
-              AND actedBySession IS NULL AND actedByUser IS NULL AND actedAt IS NULL AND supersededAt IS NOT NULL
-              AND (
-                (supersededReason = 'new-assignment' AND supersededByAssignmentId IS NOT NULL)
-                OR
-                (supersededReason = 'child-retired' AND supersededByAssignmentId IS NULL)
-              )
-          )
-        );
-        CREATE INDEX completion_escalations_child_status
-          ON completion_escalations(childSessionKey, status);
-        CREATE UNIQUE INDEX completion_escalations_one_open_child
-          ON completion_escalations(childSessionKey) WHERE status = 'open';
-
-        CREATE TABLE completion_escalation_wakes (
-          wakeId       TEXT PRIMARY KEY REFERENCES wakes(wakeId),
-          completionId TEXT NOT NULL REFERENCES completion_escalations(id),
-          generation   INTEGER NOT NULL CHECK (generation >= 0),
-          kind         TEXT NOT NULL CHECK (kind IN ('parent-notice','report-to-notice','deadline')),
-          UNIQUE (completionId, generation, kind)
-        );
-        CREATE INDEX completion_escalation_wakes_completion
-          ON completion_escalation_wakes(completionId, generation, kind);
-        """
-      )
-
-    assert {:ok, _} =
-             DB.query(
-               db,
-               "UPDATE assignments SET completionReportToSessionKey=?2 WHERE id=?1",
-               [assignment_id, report_to_session_key]
-             )
-
-    :ok = DB.execute(db, optional_completion_active_trigger_sql())
-    :ok = DB.execute(db, optional_completion_parent_unavailable_trigger_sql())
-  end
-
-  defp optional_completion_active_trigger_sql do
-    """
-    CREATE TRIGGER optional_completion_active_rail
-    AFTER UPDATE OF state,outcome,closingAttestId ON assignments
-    WHEN OLD.state='open' AND NEW.state='closed' AND NEW.outcome='completed'
-      AND NEW.completionReportToSessionKey IS NOT NULL
-      AND EXISTS (
-        SELECT 1 FROM sessions parent
-        WHERE parent.sessionKey=(SELECT spawnedBy FROM sessions WHERE sessionKey=NEW.holderKey)
-          AND parent.state='active'
-          AND parent.ownerUserId=(SELECT ownerUserId FROM sessions WHERE sessionKey=NEW.holderKey)
-      )
-    BEGIN
-      INSERT INTO completion_escalations (
-        id,dedupeKey,assignmentId,workItemId,childSessionKey,remainingOpenAssignments,
-        closingAttestId,outcome,causeBySession,ownerUserId,rootMainHolder,
-        immediateParentSessionKey,parentSessionKey,parentRouteStatus,
-        reportToSessionKey,reportToRouteStatus,generation,currentParentNoticeWakeId,
-        reportToNoticeWakeId,deadlineWakeId,actionDeadlineAt,status,createdAt
-      ) VALUES (
-        'ce_' || NEW.closingAttestId,'completion:' || NEW.closingAttestId,NEW.id,
-        NEW.workItemId,NEW.holderKey,
-        (SELECT count(*) FROM assignments WHERE holderKey=NEW.holderKey AND state='open'),
-        NEW.closingAttestId,'completed',NEW.closedBySession,
-        (SELECT ownerUserId FROM sessions WHERE sessionKey=NEW.holderKey),0,
-        (SELECT spawnedBy FROM sessions WHERE sessionKey=NEW.holderKey),
-        (SELECT spawnedBy FROM sessions WHERE sessionKey=NEW.holderKey),'scheduled',
-        NEW.completionReportToSessionKey,'scheduled',0,
-        'w_completion_parent_' || NEW.closingAttestId,
-        'w_completion_report_' || NEW.closingAttestId,
-        'w_completion_deadline_' || NEW.closingAttestId,
-        NEW.closedAt + 60000,'open',NEW.closedAt
-      );
-
-      INSERT INTO wakes (wakeId,sessionKey,origin,prompt,consumer,dueAt,createdAt)
-      VALUES (
-        'w_completion_parent_' || NEW.closingAttestId,
-        (SELECT spawnedBy FROM sessions WHERE sessionKey=NEW.holderKey),
-        'process:tightbeam','completion parent notice','completion_parent_notice',
-        NEW.closedAt,NEW.closedAt
-      );
-      INSERT INTO completion_escalation_wakes (wakeId,completionId,generation,kind)
-      VALUES (
-        'w_completion_parent_' || NEW.closingAttestId,
-        'ce_' || NEW.closingAttestId,0,'parent-notice'
-      );
-
-      INSERT INTO wakes (wakeId,sessionKey,origin,prompt,consumer,dueAt,createdAt)
-      VALUES (
-        'w_completion_report_' || NEW.closingAttestId,
-        NEW.completionReportToSessionKey,
-        'process:tightbeam','completion report-to notice','completion_report_to_notice',
-        NEW.closedAt,NEW.closedAt
-      );
-      INSERT INTO completion_escalation_wakes (wakeId,completionId,generation,kind)
-      VALUES (
-        'w_completion_report_' || NEW.closingAttestId,
-        'ce_' || NEW.closingAttestId,0,'report-to-notice'
-      );
-
-      INSERT INTO wakes (wakeId,sessionKey,origin,prompt,consumer,dueAt,createdAt)
-      VALUES (
-        'w_completion_deadline_' || NEW.closingAttestId,
-        NEW.holderKey,
-        'process:tightbeam','completion disposition deadline','completion_disposition_deadline',
-        NEW.closedAt + 60000,NEW.closedAt
-      );
-      INSERT INTO completion_escalation_wakes (wakeId,completionId,generation,kind)
-      VALUES (
-        'w_completion_deadline_' || NEW.closingAttestId,
-        'ce_' || NEW.closingAttestId,0,'deadline'
-      );
-
-      INSERT INTO lifecycle_events (ts,kind,subject,detail)
-      VALUES (NEW.closedAt,'completion_escalation_opened','ce_' || NEW.closingAttestId,NULL);
-    END
-    """
-  end
-
-  defp optional_completion_parent_unavailable_trigger_sql do
-    """
-    CREATE TRIGGER optional_completion_parent_unavailable_rail
-    AFTER UPDATE OF state,outcome,closingAttestId ON assignments
-    WHEN OLD.state='open' AND NEW.state='closed' AND NEW.outcome='completed'
-      AND NOT EXISTS (
-        SELECT 1 FROM sessions parent
-        WHERE parent.sessionKey=(SELECT spawnedBy FROM sessions WHERE sessionKey=NEW.holderKey)
-          AND parent.state='active'
-          AND parent.ownerUserId=(SELECT ownerUserId FROM sessions WHERE sessionKey=NEW.holderKey)
-      )
-    BEGIN
-      INSERT INTO completion_escalations (
-        id,dedupeKey,assignmentId,workItemId,childSessionKey,remainingOpenAssignments,
-        closingAttestId,outcome,causeBySession,ownerUserId,rootMainHolder,
-        immediateParentSessionKey,parentSessionKey,parentRouteStatus,
-        reportToSessionKey,reportToRouteStatus,generation,currentParentNoticeWakeId,
-        reportToNoticeWakeId,deadlineWakeId,actionDeadlineAt,status,createdAt
-      ) VALUES (
-        'ce_' || NEW.closingAttestId,'completion:' || NEW.closingAttestId,NEW.id,
-        NEW.workItemId,NEW.holderKey,
-        (SELECT count(*) FROM assignments WHERE holderKey=NEW.holderKey AND state='open'),
-        NEW.closingAttestId,'completed',NEW.closedBySession,
-        (SELECT ownerUserId FROM sessions WHERE sessionKey=NEW.holderKey),0,
-        (SELECT spawnedBy FROM sessions WHERE sessionKey=NEW.holderKey),
-        (SELECT spawnedBy FROM sessions WHERE sessionKey=NEW.holderKey),'unavailable',
-        NULL,'not-declared',0,NULL,NULL,
-        'w_completion_deadline_' || NEW.closingAttestId,
-        NEW.closedAt + 60000,'open',NEW.closedAt
-      );
-
-      INSERT INTO wakes (wakeId,sessionKey,origin,prompt,consumer,dueAt,createdAt)
-      VALUES (
-        'w_completion_deadline_' || NEW.closingAttestId,
-        NEW.holderKey,
-        'process:tightbeam','completion disposition deadline','completion_disposition_deadline',
-        NEW.closedAt + 60000,NEW.closedAt
-      );
-      INSERT INTO completion_escalation_wakes (wakeId,completionId,generation,kind)
-      VALUES (
-        'w_completion_deadline_' || NEW.closingAttestId,
-        'ce_' || NEW.closingAttestId,0,'deadline'
-      );
-
-      INSERT INTO lifecycle_events (ts,kind,subject,detail)
-      VALUES (
-        NEW.closedAt,'completion_escalation_undeliverable','ce_' || NEW.closingAttestId,
-        'channel=parent resolution=parent-unavailable reason=parent-inactive generation=0 principal=process:tightbeam:completion-escalation'
-      );
-    END
-    """
-  end
-
-  defp optional_completion_snapshot(db, assignment_id, work_item_id) do
-    Map.merge(completion_snapshot(db, assignment_id, work_item_id), %{
-      completion_escalations:
-        rows!(db, "SELECT * FROM completion_escalations WHERE assignmentId=?1 ORDER BY id", [
-          assignment_id
-        ]),
-      completion_escalation_wakes:
-        rows!(
-          db,
-          "SELECT * FROM completion_escalation_wakes WHERE completionId IN (SELECT id FROM completion_escalations WHERE assignmentId=?1) ORDER BY wakeId",
-          [assignment_id]
-        ),
-      completion_wakes:
-        rows!(
-          db,
-          "SELECT * FROM wakes WHERE wakeId IN (SELECT wakeId FROM completion_escalation_wakes WHERE completionId IN (SELECT id FROM completion_escalations WHERE assignmentId=?1)) ORDER BY wakeId",
-          [assignment_id]
-        ),
-      completion_lifecycle:
-        rows!(
-          db,
-          "SELECT * FROM lifecycle_events WHERE subject IN (SELECT id FROM completion_escalations WHERE assignmentId=?1) ORDER BY id",
-          [assignment_id]
-        )
-    })
   end
 
   defp completion_snapshot(db, assignment_id, work_item_id) do
