@@ -41,6 +41,7 @@ defmodule Tightbeam.AdapterCoordinator do
   """
 
   use GenServer
+  require Logger
 
   @adapter_readiness_timeout 185_000
   @adapter_checkout_timeout 190_000
@@ -856,7 +857,7 @@ defmodule Tightbeam.AdapterCoordinator do
         state
       end
 
-    if settle?, do: settle_launch_generation(state.db, key)
+    if settle?, do: reconcile_launch_generation(state.db, key)
     state
   end
 
@@ -864,13 +865,24 @@ defmodule Tightbeam.AdapterCoordinator do
     Enum.filter(waiters, fn {_monitor, {pid, _tag}} -> Process.alive?(pid) end)
   end
 
-  defp settle_launch_generation(db, key) do
-    case Tightbeam.HarnessProcess.settle_proven_dead(db, key) do
-      :ok -> :ok
-      :already_resolved -> :ok
+  defp reconcile_launch_generation(db, key) do
+    # Terminating the BEAM adapter proves only that its owner died. The
+    # harness-exec process group can outlive that owner, especially while the
+    # child is still blocked in initialize. Reconcile the durable launch before
+    # starting its authoritative replacement so the old process tree is killed
+    # or remains fenced on a loud cleanup failure.
+    case Tightbeam.HarnessProcess.reconcile_key(db, key) do
+      :ok ->
+        :ok
+
+      :already_resolved ->
+        :ok
+
+      {:error, reason} ->
+        Logger.error(
+          "adapter readiness generation cleanup failed for #{key_name(key)}: #{inspect(reason)}"
+        )
     end
-  rescue
-    _ -> :ok
   end
 
   defp start_adapter_unfenced(key, entry, state, opts) do
