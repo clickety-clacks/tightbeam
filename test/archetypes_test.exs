@@ -246,7 +246,7 @@ defmodule Tightbeam.ArchetypesTest do
              end)
 
     assert retirement_gate.pattern ==
-             "(tool_input[^:]*:[^:]*command[^:]*:[^[:alnum:]_./-]*|[;&|][[:space:]]*|\\\\n[[:space:]]*)((then|do|else|elif)[[:space:]]+)?([[:alnum:]_.-]+/)*tightbeam[[:space:]]+retire([[:space:]]|$)"
+             "tool_input[^:]*:[^:]*command[^:]*:[^[:alnum:]_./-]*(((then|do|else|elif)[[:space:]]+)?([[:alpha:]_][[:alnum:]_]*=[^[:space:];&|(){}]+[[:space:]]+)*([[:alnum:]_.-]+/)*tightbeam[[:space:]]+retire([[:space:]]|$)|([^'\"]|'[^']*'|\"[^\"]*\")*([;&|(){}]|\\\\n)[[:space:]]*((then|do|else|elif)[[:space:]]+)?([[:alpha:]_][[:alnum:]_]*=[^[:space:];&|(){}]+[[:space:]]+)*([[:alnum:]_.-]+/)*tightbeam[[:space:]]+retire([[:space:]]|$))"
 
     %{"hooks" => %{"PreToolUse" => entries}} = Rails.hook_settings()
 
@@ -275,7 +275,10 @@ defmodule Tightbeam.ArchetypesTest do
           "./tightbeam retire --session child",
           "bin/tightbeam retire --session child",
           "tightbeam list\\ntightbeam retire --session child",
-          "if true; then tightbeam retire --session child; fi"
+          "if true; then tightbeam retire --session child; fi",
+          "case x in x) tightbeam retire --session child;; esac",
+          "f() { tightbeam retire --session child; }; f",
+          "TB_MODE=review tightbeam retire --session child"
         ] do
       relative_call =
         ~s({"tool_name":"Bash","tool_input":{"command":"#{relative_command}"}})
@@ -295,6 +298,15 @@ defmodule Tightbeam.ArchetypesTest do
     assert {"", 0} =
              System.cmd("sh", ["-c", ~s(printf '%s' "$TB_RETIRE_GATE_INPUT" | ) <> command],
                env: [{"TB_RETIRE_GATE_INPUT", mention_call}],
+               stderr_to_stdout: true
+             )
+
+    quoted_multiline_call =
+      ~s({"tool_name":"Bash","tool_input":{"command":"printf 'safe\\ntightbeam retire --session child'"}})
+
+    assert {"", 0} =
+             System.cmd("sh", ["-c", ~s(printf '%s' "$TB_RETIRE_GATE_INPUT" | ) <> command],
+               env: [{"TB_RETIRE_GATE_INPUT", quoted_multiline_call}],
                stderr_to_stdout: true
              )
 
