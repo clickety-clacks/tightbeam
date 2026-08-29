@@ -2333,13 +2333,13 @@ defmodule Tightbeam.GatewayTest do
         class: "fyi"
       })
 
-    [%{batch_id: batch_id}] = NoticeBatcher.source_refs(ctx.db, first.wake_id)
+    [source_ref = %{batch_id: batch_id}] = NoticeBatcher.source_refs(ctx.db, first.wake_id)
     inspect = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["inspect"]
 
     readable =
       inspect.(%{
-        origin: "user:flynn",
-        principal: {:user, "flynn"},
+        origin: "process:tightbeam",
+        principal: {:process, "tightbeam"},
         session_key: nil,
         params: %{batch_id: batch_id}
       })
@@ -2351,21 +2351,25 @@ defmodule Tightbeam.GatewayTest do
              Enum.find(readable.wakes, &(&1.wake_id == first.wake_id))
 
     {:ok, _} =
-      DB.query(ctx.db, "UPDATE wakes SET sessionKey=?2 WHERE wakeId=?1", [
+      DB.query(ctx.db, "UPDATE wakes SET sessionKey=?2, origin='process:other' WHERE wakeId=?1", [
         second.wake_id,
         other.session_key
       ])
 
     denied =
       inspect.(%{
-        origin: "user:flynn",
-        principal: {:user, "flynn"},
+        origin: "process:tightbeam",
+        principal: {:process, "tightbeam"},
         session_key: nil,
         params: %{batch_id: batch_id}
       })
 
     assert denied.batch == nil
-    assert Enum.any?(denied.wakes, &(&1.wake_id == first.wake_id))
+    denied_visible_wake = Enum.find(denied.wakes, &(&1.wake_id == first.wake_id))
+    assert denied_visible_wake
+    refute Map.has_key?(denied_visible_wake, :batch_refs)
+    refute inspect(denied) =~ batch_id
+    refute inspect(denied) =~ source_ref.member_id
     refute Enum.any?(denied.wakes, &(&1.wake_id == second.wake_id))
   end
 

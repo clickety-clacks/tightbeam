@@ -4725,11 +4725,13 @@ defmodule Tightbeam.Gateway do
         %{code: "unknown_caller"}
 
       %{owner_user_id: nil} = caller ->
+        principal = inspect_principal(call, caller)
+
         wakes =
           Wakes.list_pending(db)
           |> Enum.filter(&(&1.origin == call.origin))
           |> Enum.map(&Map.take(&1, [:wake_id, :session_key, :due_at, :prompt]))
-          |> Enum.map(&inspect_wake(db, &1))
+          |> Enum.map(&inspect_wake(db, &1, principal))
 
         %{wakes: wakes, roles: role_list_result(db).roles}
         |> maybe_put_inspected_batch(db, call, caller)
@@ -4737,11 +4739,12 @@ defmodule Tightbeam.Gateway do
       caller ->
         sessions = Org.list_for_user(db, caller.owner_user_id, false)
         keys = MapSet.new(sessions, & &1.session_key)
+        principal = inspect_principal(call, caller)
 
         wakes =
           Wakes.list_pending(db)
           |> Enum.filter(&MapSet.member?(keys, &1.session_key))
-          |> Enum.map(&inspect_wake(db, &1))
+          |> Enum.map(&inspect_wake(db, &1, principal))
 
         # F9 (Sol xhigh review): the sanctioned discovery path for a digest
         # carrier's OWN wake id, surviving a cross-harness barrier that hides
@@ -4800,8 +4803,15 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp inspect_wake(db, wake) do
-    case NoticeBatcher.source_refs(db, wake.wake_id) do
+  defp inspect_wake(db, wake, principal) do
+    refs =
+      db
+      |> NoticeBatcher.source_refs(wake.wake_id)
+      |> Enum.filter(fn ref ->
+        NoticeBatcher.read_batch(db, ref.batch_id, principal) != nil
+      end)
+
+    case refs do
       [] -> wake
       refs -> Map.put(wake, :batch_refs, refs)
     end
