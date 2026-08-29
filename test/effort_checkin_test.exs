@@ -257,6 +257,29 @@ defmodule Tightbeam.EffortCheckinTest do
                """,
                [assignment.id]
              )
+
+    assignment(ctx, "attest", {:session, "holder"}, nil, %{
+      assignment_id: assignment.id,
+      kind: "completion"
+    })
+
+    assert bracket_state(ctx.db, assignment.id) == "canceled"
+
+    assert %{priority: 2} =
+             Gateway.handlers(ctx.config)["work-item-update"].(%{
+               verb: "work-item-update",
+               origin: "agent:holder",
+               principal: {:session, "holder"},
+               session_key: "holder",
+               params: %{work_item_id: item.id, priority: 2}
+             })
+
+    assert [[2]] =
+             rows(
+               ctx.db,
+               "SELECT priority FROM assignment_priorities WHERE assignmentId=?1",
+               [assignment.id]
+             )
   end
 
   test "a standing work-blocked fact suppresses the check and an ineligible icebox cancels it",
