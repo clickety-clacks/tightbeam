@@ -244,6 +244,138 @@ defmodule Tightbeam.AdapterCoordinatorTest do
              [{"running", nil}, {"exited", replaced.resolved_at}]
   end
 
+  test "coordinator shutdown reaps the live harness process group before its supervisor", ctx do
+    script = Path.join(ctx.test_dir, "shutdown_reap.js")
+    File.write!(script, @fake)
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn _, _ ->
+           [
+             harness: :claude,
+             cmd: [System.find_executable("node"), script],
+             home: ctx.test_dir,
+             cwd: ctx.test_dir,
+             process_identity_dir: ctx.test_dir,
+             process_helper: @process_helper
+           ]
+         end,
+         db: ctx.db,
+         name: :shutdown_reap_coordinator}
+      )
+
+    key = {:claude, "shared", "testhost"}
+    assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+    assert Process.alive?(adapter)
+
+    assert wait_until(fn ->
+             match?(
+               [%{state: "running", resolved_at: nil}],
+               Tightbeam.HarnessProcess.list(ctx.db)
+             )
+           end)
+
+    assert :ok = GenServer.stop(coordinator, :shutdown, 30_000)
+    assert DynamicSupervisor.count_children(ctx.sup).active == 0
+
+    assert [%{state: "exited", resolved_at: resolved_at}] =
+             Tightbeam.HarnessProcess.list(ctx.db)
+
+    assert is_integer(resolved_at)
+  end
+
+  test "supervisor shutdown runs Cursor group cleanup through the dedicated launcher", ctx do
+    parent = self()
+    name = :supervised_cursor_cleanup_coordinator
+    key = {:cursor, "default", "testhost"}
+    script = Path.join(ctx.test_dir, "supervised_cursor_cleanup.js")
+    File.write!(script, @fake)
+
+    previous_runner =
+      Application.get_env(:tightbeam, :harness_process_command_runner_for_test)
+
+    Application.put_env(
+      :tightbeam,
+      :harness_process_command_runner_for_test,
+      fn executable, args, timeout ->
+        if executable == "/usr/bin/sudo" do
+          send(parent, {:cleanup_command, executable, args, timeout})
+          {"", 0}
+        else
+          System.cmd(executable, args, stderr_to_stdout: true)
+        end
+      end
+    )
+
+    on_exit(fn ->
+      if previous_runner do
+        Application.put_env(
+          :tightbeam,
+          :harness_process_command_runner_for_test,
+          previous_runner
+        )
+      else
+        Application.delete_env(:tightbeam, :harness_process_command_runner_for_test)
+      end
+    end)
+
+    {:ok, owner} =
+      Supervisor.start_link(
+        [
+          {AdapterCoordinator,
+           adapter_sup: ctx.sup,
+           adapter_context: fn _ -> [] end,
+           adapter_opts: fn _, _ ->
+             [
+               harness: :cursor,
+               cmd: [System.find_executable("node"), script],
+               home: ctx.test_dir,
+               cwd: ctx.test_dir,
+               process_identity_dir: ctx.test_dir,
+               process_helper: @process_helper
+             ]
+           end,
+           db: ctx.db,
+           name: name}
+        ],
+        strategy: :one_for_one
+      )
+
+    Process.unlink(owner)
+
+    on_exit(fn -> if Process.alive?(owner), do: Supervisor.stop(owner) end)
+
+    assert {:ok, _adapter, 1} = AdapterCoordinator.adapter_for(name, key)
+
+    assert wait_until(fn ->
+             match?([%{state: "running"}], Tightbeam.HarnessProcess.list(ctx.db))
+           end)
+
+    assert :ok = Supervisor.stop(owner, :shutdown, 30_000)
+
+    assert_receive {:cleanup_command, "/usr/bin/sudo", args, _timeout}
+
+    assert [
+             "-n",
+             "-H",
+             "-u",
+             "tightbeam-cursor",
+             "--",
+             "/usr/local/libexec/tightbeam-cursor-launcher",
+             "cursor-exec",
+             "group"
+             | _identity_args
+           ] = args
+
+    assert [%{state: "exited", resolved_at: resolved_at}] =
+             Tightbeam.HarnessProcess.list(ctx.db)
+
+    assert is_integer(resolved_at)
+  end
+
   test "hung readiness task times out, removes its child state, and flushes caller", ctx do
     coordinator =
       start_supervised!(
