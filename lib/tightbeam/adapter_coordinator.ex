@@ -66,6 +66,20 @@ defmodule Tightbeam.AdapterCoordinator do
     GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
   end
 
+  @doc false
+  def child_spec(opts) do
+    %{
+      id: Keyword.get(opts, :name, __MODULE__),
+      start: {__MODULE__, :start_link, [opts]},
+      type: :worker,
+      restart: :permanent,
+      # Gateway shutdown must settle durable process groups before the adapter
+      # supervisor disappears. The normal worker default (5s) is shorter than
+      # the reviewed close grace and can strand a privileged harness child.
+      shutdown: 30_000
+    }
+  end
+
   @doc """
   The adapter for a key, starting it lazily on first use. Returns the pid AND
   the current generation (the lane stamps it against the turn). Degraded key →
@@ -172,6 +186,11 @@ defmodule Tightbeam.AdapterCoordinator do
 
   @impl true
   def init(opts) do
+    # A supervisor shuts down a worker with an exit signal. Trap it so OTP runs
+    # terminate/2 and the coordinator can settle every durable harness group
+    # before AdapterSupervisor disappears.
+    Process.flag(:trap_exit, true)
+
     db = Keyword.get(opts, :db, Tightbeam.DB)
     :ok = Tightbeam.HarnessProcess.ensure_schema(db)
     :ok = Tightbeam.HarnessProcess.reconcile(db)
@@ -200,6 +219,29 @@ defmodule Tightbeam.AdapterCoordinator do
        load_active: %{},
        load_queue: %{}
      }}
+  end
+
+  @impl true
+  def terminate(_reason, state) do
+    Enum.each(state.adapters, fn {key, entry} ->
+      if is_pid(entry.readiness_task) and Process.alive?(entry.readiness_task),
+        do: Process.exit(entry.readiness_task, :kill)
+
+      if is_pid(entry.pid) and Process.alive?(entry.pid),
+        do: DynamicSupervisor.terminate_child(state.adapter_sup, entry.pid)
+
+      case Tightbeam.HarnessProcess.reconcile_key(state.db, key) do
+        result when result in [:ok, :already_resolved] ->
+          :ok
+
+        {:error, reason} ->
+          Logger.error(
+            "adapter shutdown process cleanup failed for #{key_name(key)}: #{inspect(reason)}"
+          )
+      end
+    end)
+
+    :ok
   end
 
   @impl true
@@ -658,6 +700,8 @@ defmodule Tightbeam.AdapterCoordinator do
         {:noreply, remove_waiter_monitor(ref, state)}
     end
   end
+
+  def handle_info({:EXIT, _pid, _reason}, state), do: {:noreply, state}
 
   def handle_info({:adapter_ready, key, pid, generation, token}, state) do
     case state.adapters[key] do

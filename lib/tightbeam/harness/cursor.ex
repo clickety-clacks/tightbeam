@@ -150,8 +150,8 @@ defmodule Tightbeam.Harness.Cursor do
     # Cursor 2026.08.11 writes ACP session state beneath CURSOR_CONFIG_DIR.
     # The dedicated execution account reaches this operator-owned projection
     # through tightbeam-workspace. Keep the writable surface to the projection
-    # root and the runtime directory; cli-config.json remains a read-only auth
-    # projection because launches select the in-memory credential store.
+    # root and the runtime directory. cli-config.json is projected separately as
+    # a non-secret 0640 copy; the API key remains environment-only.
     runtime_dirs = [home, Path.join(home, "acp-sessions")]
 
     Enum.each(runtime_dirs, fn path ->

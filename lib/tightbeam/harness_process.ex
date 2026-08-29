@@ -806,6 +806,13 @@ defmodule Tightbeam.HarnessProcess do
   end
 
   defp bounded_command(executable, args, timeout_ms) do
+    case Application.get_env(:tightbeam, :harness_process_command_runner_for_test) do
+      runner when is_function(runner, 3) -> runner.(executable, args, timeout_ms)
+      nil -> bounded_command_real(executable, args, timeout_ms)
+    end
+  end
+
+  defp bounded_command_real(executable, args, timeout_ms) do
     # `:spawn_executable` NEVER searches PATH -- it wants a real path and raises
     # `:enoent` for a bare name. Callers pass "ssh", so every remote identity read and
     # every remote `harness-group` failed before it was attempted, and the rescue below
