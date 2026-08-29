@@ -391,6 +391,15 @@ impl DeployManager {
                 observed_root.as_str()
             )));
         }
+        if let ExpectedActive::Virgin { deployment_root } = &expected_active
+            && deployment_root != &observed_root
+        {
+            return Err(FsError::InvalidPointer(format!(
+                "activation intent names deployment root {}, observed {}",
+                deployment_root.as_str(),
+                observed_root.as_str()
+            )));
+        }
         Ok(Some(ActivationIntent {
             transaction_id,
             action,
@@ -858,6 +867,59 @@ mod tests {
                 .as_deref()
                 .is_some_and(|reason| reason.contains("target is invalid"))
         );
+    }
+
+    fn assert_u0_mismatched_root_is_held(after_rename: bool) {
+        let directory = active_fixture();
+        let manager = DeployManager::open(&directory.0).unwrap();
+        let current = manager.fs.read_active().unwrap().unwrap();
+        stdfs::remove_file(directory.0.join("active")).unwrap();
+        let target = Pointer {
+            generation: model::GenerationId::new("g2").unwrap(),
+            release: current.release,
+        };
+        add_generation(&manager, "g2", &target.release, None);
+        let mismatched = ExpectedActive::virgin(model::DeploymentRootIdentity::from_digest(
+            model::Digest::from_bytes(b"another-deployment-root"),
+        ));
+        write_activation_intent(
+            &manager,
+            "tx-u0-mismatched-root",
+            "first-cutover",
+            &mismatched,
+            None,
+            &target,
+        );
+        if after_rename {
+            manager
+                .fs
+                .replace_relative_symlink(Path::new("active"), Path::new("generations/g2"))
+                .unwrap();
+        }
+
+        let recovery = manager.recover().unwrap();
+        assert_eq!(recovery.class, RecoveryClass::ActivationIndeterminate);
+        assert!(
+            recovery
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("names deployment root"))
+        );
+        assert!(manager.fs.read_audit().unwrap().is_empty());
+        assert_eq!(
+            manager.fs.read_active().unwrap(),
+            after_rename.then_some(target)
+        );
+    }
+
+    #[test]
+    fn recover_holds_a_pre_rename_u0_intent_for_another_deployment_root() {
+        assert_u0_mismatched_root_is_held(false);
+    }
+
+    #[test]
+    fn recover_holds_a_post_rename_u0_intent_for_another_deployment_root_before_audit_append() {
+        assert_u0_mismatched_root_is_held(true);
     }
 
     #[test]
