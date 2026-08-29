@@ -88,205 +88,120 @@ defmodule Tightbeam.DeliverableContractTest do
     end)
   end
 
-  if Code.ensure_loaded?(Tightbeam.Productions.CompletionEscalation) do
-    test "keyed completion rolls back every real installed rail write", ctx do
-      register_hosts(ctx.db, %{
-        "testhost" => %{ssh: nil, base_dir: System.tmp_dir!(), cli_bin: nil}
-      })
+  test "A5 exact fixed-base source proves the installed completion producer set", ctx do
+    archive =
+      Path.join(__DIR__, "fixtures/deliverable_contract/phase1_v9_lib.tar.gz")
+      |> File.read!()
 
-      session(ctx.db, "completion-report-to", "flynn", %{spawned_by: "product-owner"})
-      card = create_card(ctx, "Atomic completion with every optional rail")
+    assert :sha256 |> :crypto.hash(archive) |> Base.encode16(case: :lower) ==
+             "282fa3bb92c0eb6795a26722c14092ba3b4a4edbbdca80d26d7a3fb9faaacc64"
 
-      assignment =
-        dispatch_to(
-          ctx,
-          card.id,
-          "Complete the whole card through every rail",
-          true,
-          "holder",
-          report_to_session_key: "completion-report-to"
-        )
+    assert {:ok, entries} = :erl_tar.extract({:binary, archive}, [:memory, :compressed])
 
-      [[effort_wake_id]] =
-        rows!(
-          ctx.db,
-          "SELECT wakeId FROM effort_checkin_generations WHERE assignmentId=?1 AND state='armed'",
-          [assignment.id]
-        )
+    fixed_base_sources =
+      Map.new(entries, fn {path, bytes} -> {List.to_string(path), bytes} end)
 
-      request_id = open_effort_request!(ctx.db, assignment.id, "product-owner")
+    # This archive is produced from the complete lib/ tree at exact base
+    # 724e5c96f9513b37e937dc52eb014ba1ef2d1b5e (tree
+    # 41da8ae7ddee96e01c42ac482052862fba7041e9). Inspecting every production
+    # source file makes an empty optional-rail set an exact-source result, not
+    # an inference from a test that happened not to configure one.
+    exact_source =
+      fixed_base_sources
+      |> Enum.sort()
+      |> Enum.map_join("\n", fn {path, bytes} -> path <> "\n" <> bytes end)
 
-      [[effort_deadline_wake_id]] =
-        rows!(ctx.db, "SELECT deadlineWakeId FROM decision_requests WHERE id=?1", [request_id])
+    refute exact_source =~ "CompletionEscalation"
+    refute exact_source =~ "completion_escalation"
 
-      probes = [
-        {"completion_attest", "BEFORE INSERT ON attests WHEN NEW.kind='completion'"},
-        {"completion_claim", "BEFORE INSERT ON completion_claims"},
-        {"assignment_close", "BEFORE UPDATE ON assignments WHEN NEW.outcome='completed'"},
-        {"completion_escalation", "BEFORE INSERT ON completion_escalations"},
-        {"completion_parent_wake",
-         "BEFORE INSERT ON wakes WHEN NEW.wakeId LIKE 'completion:%:parent-notice:0'"},
-        {"completion_parent_membership",
-         "BEFORE INSERT ON completion_escalation_wakes WHEN NEW.kind='parent-notice'"},
-        {"completion_report_to_wake",
-         "BEFORE INSERT ON wakes WHEN NEW.wakeId LIKE 'completion:%:report-to-notice'"},
-        {"completion_report_to_membership",
-         "BEFORE INSERT ON completion_escalation_wakes WHEN NEW.kind='report-to-notice'"},
-        {"completion_deadline_wake",
-         "BEFORE INSERT ON wakes WHEN NEW.wakeId LIKE 'completion:%:deadline:0'"},
-        {"completion_deadline_membership",
-         "BEFORE INSERT ON completion_escalation_wakes WHEN NEW.kind='deadline'"},
-        {"completion_escalation_lifecycle",
-         "BEFORE INSERT ON lifecycle_events WHEN NEW.kind='completion_escalation_opened'"},
-        {"slate_wake", "BEFORE INSERT ON wakes WHEN NEW.prompt LIKE 'slate clear on %'"},
-        {"slate_pointer", "BEFORE UPDATE ON work_items WHEN NEW.slateWakeId IS NOT NULL"},
-        {"supervision_transition", "BEFORE DELETE ON supervision_entitlements"},
-        {"supervision_lifecycle",
-         "BEFORE INSERT ON lifecycle_events WHEN NEW.kind='supervision_entitlement_cleared'"},
-        {"effort_wake_cancel",
-         "BEFORE UPDATE ON wakes WHEN OLD.wakeId='#{effort_wake_id}' AND NEW.state='canceled'"},
-        {"effort_cancellation_receipt",
-         "BEFORE INSERT ON wake_cancellations WHEN NEW.wakeId='#{effort_wake_id}'"},
-        {"effort_generation_cancel",
-         "BEFORE UPDATE ON effort_checkin_generations WHEN NEW.state='canceled'"},
-        {"effort_request_supersede",
-         "BEFORE UPDATE ON decision_requests WHEN OLD.id='#{request_id}' AND NEW.status='superseded'"},
-        {"effort_deadline_wake_cancel",
-         "BEFORE UPDATE ON wakes WHEN OLD.wakeId='#{effort_deadline_wake_id}' AND NEW.state='canceled'"},
-        {"effort_deadline_cancellation_receipt",
-         "BEFORE INSERT ON wake_cancellations WHEN NEW.wakeId='#{effort_deadline_wake_id}'"},
-        {"completion_receipt",
-         "BEFORE INSERT ON deliverable_contract_idempotency WHEN NEW.operation='attest-completion'"}
-      ]
+    assert fixed_base_sources
+           |> Map.keys()
+           |> Enum.filter(&String.starts_with?(&1, "lib/tightbeam/productions/"))
+           |> Enum.sort() == [
+             "lib/tightbeam/productions/bubble.ex",
+             "lib/tightbeam/productions/bubble_sweeper.ex",
+             "lib/tightbeam/productions/catalog_rederive.ex"
+           ]
 
-      Enum.each(probes, fn {name, event} ->
-        trigger = "completion_all_rails_probe_#{name}"
-        before = real_optional_completion_snapshot(ctx.db, assignment.id, card.id)
+    assignments = Map.fetch!(fixed_base_sources, "lib/tightbeam/assignments.ex")
+    work_items = Map.fetch!(fixed_base_sources, "lib/tightbeam/work_items.ex")
+    supervision = Map.fetch!(fixed_base_sources, "lib/tightbeam/supervision.ex")
+    effort = Map.fetch!(fixed_base_sources, "lib/tightbeam/effort_checkin.ex")
+    schema = Map.fetch!(fixed_base_sources, "lib/tightbeam/schema.ex")
 
-        :ok =
-          DB.execute(
-            ctx.db,
-            "CREATE TRIGGER #{trigger} #{event} BEGIN SELECT RAISE(ABORT, '#{name}'); END"
-          )
+    contract =
+      File.read!(Path.join([__DIR__, "..", "lib", "tightbeam", "deliverable_contract.ex"]))
 
-        assert_raise Tightbeam.DB.Error, ~r/#{name}/, fn ->
-          complete(ctx, assignment.id, "complete through every rail", "all-rails-key")
-        end
+    # Each entry records the real module/handler seam for the authoritative
+    # writes exercised by the rollback matrices below. The first four contract
+    # writes are added by this candidate. Every remaining producer is reached
+    # by the fixed base's ordinary Assignments attest entry point.
+    producer_seams = [
+      {"completion_attest", "Tightbeam.Assignments.lifecycle_attest_in_txn/2"},
+      {"completion_claim", "Tightbeam.DeliverableContract.record_completion_claim_in_txn/3"},
+      {"assignment_close", "Tightbeam.Assignments.lifecycle_attest_in_txn/2"},
+      {"completion_receipt", "Tightbeam.DeliverableContract.store_completion_receipt_in_txn/5"},
+      {"slate_wake", "Tightbeam.WorkItems.arm_slate_in_txn/2"},
+      {"slate_pointer", "Tightbeam.WorkItems.arm_slate_in_txn/2"},
+      {"supervision_transition", "Tightbeam.Supervision.transition_in_txn/2"},
+      {"supervision_lifecycle", "Tightbeam.Supervision.transition_in_txn/2"},
+      {"effort_wake_cancel", "Tightbeam.EffortCheckin.cancel_in_txn/3"},
+      {"effort_cancellation_receipt", "Tightbeam.EffortCheckin.cancel_in_txn/3"},
+      {"effort_generation_cancel", "Tightbeam.EffortCheckin.cancel_in_txn/3"},
+      {"effort_request_supersede", "Tightbeam.EffortCheckin.cancel_in_txn/3"},
+      {"effort_deadline_wake_cancel", "Tightbeam.EffortCheckin.cancel_in_txn/3"},
+      {"effort_deadline_cancellation_receipt", "Tightbeam.EffortCheckin.cancel_in_txn/3"}
+    ]
 
-        assert real_optional_completion_snapshot(ctx.db, assignment.id, card.id) == before
+    assert Enum.map(producer_seams, &elem(&1, 0)) == [
+             "completion_attest",
+             "completion_claim",
+             "assignment_close",
+             "completion_receipt",
+             "slate_wake",
+             "slate_pointer",
+             "supervision_transition",
+             "supervision_lifecycle",
+             "effort_wake_cancel",
+             "effort_cancellation_receipt",
+             "effort_generation_cancel",
+             "effort_request_supersede",
+             "effort_deadline_wake_cancel",
+             "effort_deadline_cancellation_receipt"
+           ]
 
-        assert [["open", nil, nil]] =
-                 rows!(
-                   ctx.db,
-                   "SELECT state,outcome,closingAttestId FROM assignments WHERE id=?1",
-                   [assignment.id]
-                 )
+    assert assignments =~ "defp lifecycle_attest_in_txn(txn, call)"
+    assert assignments =~ "attest = insert_attest(txn, call, assignment_id)"
+    assert assignments =~ "UPDATE assignments SET state = 'closed'"
 
-        :ok = DB.execute(ctx.db, "DROP TRIGGER #{trigger}")
-      end)
+    assert assignments =~
+             "Tightbeam.WorkItems.arm_slate_in_txn(txn, closed_assignment.workItemId)"
 
-      committed = complete(ctx, assignment.id, "complete through every rail", "all-rails-key")
-      replay = complete(ctx, assignment.id, "complete through every rail", "all-rails-key")
-      assert committed.attest.id == replay.attest.id
+    assert assignments =~ "supervision_transition!(txn, :terminal_disposition"
+    assert assignments =~ "EffortCheckin.cancel_in_txn("
+    assert work_items =~ "def arm_slate_in_txn(%Txn{} = txn, work_item_id)"
+    assert work_items =~ "wake =\n            Wakes.schedule_in_txn"
+    assert work_items =~ "UPDATE work_items SET slateWakeId = ?2"
+    assert supervision =~ "def transition_in_txn(%Txn{} = txn"
+    assert effort =~ "def cancel_in_txn(%Txn{} = txn, assignment_id, command)"
+    assert effort =~ "UPDATE effort_checkin_generations SET state = 'canceled'"
+    assert effort =~ "dispose_requests_in_txn(txn, assignment_id, command)"
+    assert schema =~ ~s(@shape "coordination-fabric-v1-phase1-v9")
+    assert contract =~ "def record_completion_claim_in_txn(txn, assignment_id, attest)"
 
-      assert [["scheduled", "scheduled", "open", 0]] =
-               rows!(
-                 ctx.db,
-                 "SELECT parentRouteStatus,reportToRouteStatus,status,remainingOpenAssignments FROM completion_escalations WHERE assignmentId=?1",
-                 [assignment.id]
-               )
+    assert contract =~
+             "def store_completion_receipt_in_txn(txn, principal, key, fingerprint, response)"
 
-      assert [["deadline"], ["parent-notice"], ["report-to-notice"]] =
-               rows!(
-                 ctx.db,
-                 "SELECT kind FROM completion_escalation_wakes WHERE completionId IN (SELECT id FROM completion_escalations WHERE assignmentId=?1) ORDER BY kind",
-                 [assignment.id]
-               )
-    end
+    # Runtime schema readback agrees with the exact-source enumeration. This is
+    # compatibility evidence only; it is not used to manufacture a rail.
+    assert rows!(
+             ctx.db,
+             "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('completion_escalations','completion_escalation_wakes') ORDER BY name"
+           ) == []
 
-    test "real installed rail rolls back unavailable-parent record and lifecycle", ctx do
-      card = create_card(ctx, "Atomic completion with unavailable parent")
-      assignment = assign(ctx, card.id, "Complete with unavailable parent", true)
-
-      :ok =
-        DB.execute(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey='product-owner'")
-
-      for {name, event} <- [
-            {"parent_unavailable_escalation", "BEFORE INSERT ON completion_escalations"},
-            {"parent_unavailable_lifecycle",
-             "BEFORE INSERT ON lifecycle_events WHEN NEW.kind='completion_escalation_undeliverable'"}
-          ] do
-        before = real_optional_completion_snapshot(ctx.db, assignment.id, card.id)
-        trigger = "completion_probe_#{name}"
-
-        :ok =
-          DB.execute(
-            ctx.db,
-            "CREATE TRIGGER #{trigger} #{event} BEGIN SELECT RAISE(ABORT, '#{name}'); END"
-          )
-
-        assert_raise Tightbeam.DB.Error, ~r/#{name}/, fn ->
-          complete(ctx, assignment.id, "complete with unavailable parent", name)
-        end
-
-        assert real_optional_completion_snapshot(ctx.db, assignment.id, card.id) == before
-
-        assert [["open", nil, nil]] =
-                 rows!(
-                   ctx.db,
-                   "SELECT state,outcome,closingAttestId FROM assignments WHERE id=?1",
-                   [assignment.id]
-                 )
-
-        :ok = DB.execute(ctx.db, "DROP TRIGGER #{trigger}")
-      end
-
-      committed =
-        complete(
-          ctx,
-          assignment.id,
-          "complete with unavailable parent",
-          "parent-unavailable-success"
-        )
-
-      assert committed.assignment.state == "closed"
-
-      assert [["unavailable", "not-declared", "open"]] =
-               rows!(
-                 ctx.db,
-                 "SELECT parentRouteStatus,reportToRouteStatus,status FROM completion_escalations WHERE assignmentId=?1",
-                 [assignment.id]
-               )
-
-      assert [["deadline"]] =
-               rows!(
-                 ctx.db,
-                 "SELECT kind FROM completion_escalation_wakes WHERE completionId IN (SELECT id FROM completion_escalations WHERE assignmentId=?1) ORDER BY kind",
-                 [assignment.id]
-               )
-
-      assert [["completion_escalation_opened"], ["completion_escalation_undeliverable"]] =
-               rows!(
-                 ctx.db,
-                 "SELECT kind FROM lifecycle_events WHERE subject IN (SELECT id FROM completion_escalations WHERE assignmentId=?1)",
-                 [assignment.id]
-               )
-    end
-  else
-    test "the fixed v9 base does not install the separately gated optional completion rail",
-         ctx do
-      # The reviewed homing spec makes these rows conditional on the separate
-      # completion-escalation proposal landing. Its product module activates the
-      # real-rail branch above in the authorized semantic-composition proof.
-      assert rows!(
-               ctx.db,
-               "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('completion_escalations','completion_escalation_wakes') ORDER BY name"
-             ) == []
-
-      refute Enum.any?(rows!(ctx.db, "PRAGMA table_info(assignments)"), fn row ->
-               Enum.at(row, 1) == "completionReportToSessionKey"
-             end)
-    end
+    refute Enum.any?(rows!(ctx.db, "PRAGMA table_info(assignments)"), fn row ->
+             Enum.at(row, 1) == "completionReportToSessionKey"
+           end)
   end
 
   test "boot refuses captured product-owner ancestry outside the frozen spawn chain", ctx do
@@ -1836,22 +1751,18 @@ defmodule Tightbeam.DeliverableContractTest do
     )
   end
 
-  defp dispatch_to(ctx, work_item_id, subject, delivers_work_item, holder, opts \\ []) do
-    params =
-      %{
+  defp dispatch_to(ctx, work_item_id, subject, delivers_work_item, holder) do
+    Assignments.__handle__(
+      ctx.db,
+      "dispatch",
+      call("dispatch", {:user, "flynn"}, holder, %{
         subject: subject,
         brief: "Perform the exact dispatched obligation",
         work_item_id: work_item_id,
         workdir_root: nil,
         effect_kind: "code",
         delivers_work_item: delivers_work_item
-      }
-      |> Map.merge(Map.new(opts))
-
-    Assignments.__handle__(
-      ctx.db,
-      "dispatch",
-      call("dispatch", {:user, "flynn"}, holder, params)
+      })
       |> Map.merge(%{target_role: nil, role_fallback: false, supervision_interval_ms: 1_000})
     )
   end
@@ -1956,35 +1867,6 @@ defmodule Tightbeam.DeliverableContractTest do
       """,
       [assignment_id]
     )
-  end
-
-  if Code.ensure_loaded?(Tightbeam.Productions.CompletionEscalation) do
-    defp real_optional_completion_snapshot(db, assignment_id, work_item_id) do
-      Map.merge(completion_snapshot(db, assignment_id, work_item_id), %{
-        completion_escalations:
-          rows!(db, "SELECT * FROM completion_escalations WHERE assignmentId=?1 ORDER BY id", [
-            assignment_id
-          ]),
-        completion_escalation_wakes:
-          rows!(
-            db,
-            "SELECT * FROM completion_escalation_wakes WHERE completionId IN (SELECT id FROM completion_escalations WHERE assignmentId=?1) ORDER BY wakeId",
-            [assignment_id]
-          ),
-        completion_wakes:
-          rows!(
-            db,
-            "SELECT * FROM wakes WHERE wakeId IN (SELECT wakeId FROM completion_escalation_wakes WHERE completionId IN (SELECT id FROM completion_escalations WHERE assignmentId=?1)) ORDER BY wakeId",
-            [assignment_id]
-          ),
-        completion_lifecycle:
-          rows!(
-            db,
-            "SELECT * FROM lifecycle_events WHERE subject IN (SELECT id FROM completion_escalations WHERE assignmentId=?1) ORDER BY id",
-            [assignment_id]
-          )
-      })
-    end
   end
 
   defp completion_snapshot(db, assignment_id, work_item_id) do
