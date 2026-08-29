@@ -1213,24 +1213,46 @@ mod tests {
     }
 
     #[test]
-    fn gc_deletion_holds_the_deploy_lock_from_guard_through_delete() {
+    fn gc_deletion_barrier_excludes_a_concurrent_intent_writer() {
         let directory = tempdir();
-        let manager = DeployManager::open(&directory.0).unwrap();
-        let contender = DeployManager::open(&directory.0).unwrap();
         let unrelated = directory.0.join("releases/unrelated-object");
         stdfs::create_dir_all(unrelated.parent().unwrap()).unwrap();
         stdfs::write(&unrelated, b"delete").unwrap();
+        let entered_deletion = std::sync::Barrier::new(2);
+        let release_deletion = std::sync::Barrier::new(2);
 
-        manager
-            .with_gc_lock(|lock| {
-                lock.belongs_to(&manager.fs)?;
-                assert!(matches!(contender.lock(), Err(FsError::Busy)));
-                stdfs::remove_file(&unrelated)
-                    .map_err(|error| FsError::InvalidPointer(format!("test GC deletion: {error}")))
-            })
-            .unwrap();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let manager = DeployManager::open(&directory.0).unwrap();
+                manager
+                    .with_gc_lock(|lock| {
+                        lock.belongs_to(&manager.fs)?;
+                        entered_deletion.wait();
+                        release_deletion.wait();
+                        stdfs::remove_file(&unrelated).map_err(|error| {
+                            FsError::InvalidPointer(format!("test GC deletion: {error}"))
+                        })
+                    })
+                    .unwrap();
+            });
+
+            entered_deletion.wait();
+            let contender = DeployManager::open(&directory.0).unwrap();
+            let intent_writer = (|| -> Result<(), FsError> {
+                let _lock = contender.lock()?;
+                stdfs::create_dir_all(directory.0.join("intents")).map_err(|error| {
+                    FsError::InvalidPointer(format!("test intent directory: {error}"))
+                })?;
+                stdfs::write(directory.0.join("intents/tx-racing.json"), b"{}\n").map_err(|error| {
+                    FsError::InvalidPointer(format!("test intent publication: {error}"))
+                })
+            })();
+            assert!(matches!(intent_writer, Err(FsError::Busy)));
+            assert!(!directory.0.join("intents/tx-racing.json").exists());
+            release_deletion.wait();
+        });
 
         assert!(!unrelated.exists());
-        contender.lock().unwrap();
+        DeployManager::open(&directory.0).unwrap().lock().unwrap();
     }
 }

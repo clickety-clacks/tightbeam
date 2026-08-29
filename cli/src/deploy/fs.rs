@@ -1590,6 +1590,32 @@ mod tests {
     }
 
     #[test]
+    fn host_identity_reader_rejects_a_writable_ancestor_descriptor() {
+        let (directory, _fs) = fixture();
+        fs::set_permissions(&directory.0, fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(matches!(
+            DeploymentFs::open(&directory.0),
+            Err(FsError::InvalidPointer(reason)) if reason.contains("not group/world writable")
+        ));
+    }
+
+    #[test]
+    fn host_identity_reader_rejects_an_untrusted_ancestor_owner() {
+        let (directory, deployment_fs) = fixture();
+        let trusted_uid = unsafe { libc::geteuid() }.wrapping_add(1);
+        assert!(matches!(
+            read_host_identity_beneath(
+                deployment_fs.root_fd.as_raw_fd(),
+                &directory.0,
+                Path::new("deploy-host-id"),
+                &directory.0.join("deploy-host-id"),
+                trusted_uid,
+            ),
+            Err(FsError::InvalidPointer(reason)) if reason.contains("root-owned")
+        ));
+    }
+
+    #[test]
     fn host_identity_policy_rejects_a_non_root_owner() {
         assert!(matches!(
             validate_host_identity_file(
