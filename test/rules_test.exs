@@ -1147,11 +1147,13 @@ defmodule Tightbeam.RulesTest do
              Dispatch.dispatch(ctx.db, ctx.handlers, artifact_completion)
   end
 
-  test "shipped code-review rail requires the open coder holder's nonblank test receipt", ctx do
+  test "shipped code-review rail requires the open code producer's nonblank test receipt", ctx do
     holder = session(ctx.db, "receipt-holder", "flynn", archetype: "coder")
     other = session(ctx.db, "receipt-other", "other", archetype: "coder")
     reviewer = session(ctx.db, "receipt-reviewer", "reviewer", archetype: "reviewer")
-    producer = assignment(ctx, holder.session_key, {:user, "flynn"})
+
+    producer =
+      assignment(ctx, holder.session_key, {:user, "flynn"}, effect_kind: "code")
 
     put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
@@ -1198,13 +1200,84 @@ defmodule Tightbeam.RulesTest do
     assert review_count(ctx.db, producer.id) == 1
   end
 
+  test "review receipt gate follows producer effect kind, including documentation policy", ctx do
+    coder = session(ctx.db, "effect-kind-coder", "flynn", archetype: "coder")
+
+    orchestrator =
+      session(ctx.db, "effect-kind-orchestrator", "flynn", archetype: "orchestrator")
+
+    reviewer =
+      session(ctx.db, "effect-kind-reviewer", "reviewer", archetype: "reviewer")
+
+    code =
+      assignment(ctx, orchestrator.session_key, {:user, "flynn"}, effect_kind: "code")
+
+    policy = assignment(ctx, coder.session_key, {:user, "flynn"}, effect_kind: "policy")
+
+    documentation_policy =
+      assignment(ctx, coder.session_key, {:user, "flynn"},
+        subject: "document the reviewed policy",
+        effect_kind: "policy"
+      )
+
+    put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    review_call = fn producer, subject ->
+      p3_call("assign", {:user, "reviewer"}, %{
+        subject: subject,
+        reviews_assignment_id: producer.id,
+        idempotency_key: nil,
+        files: nil
+      })
+      |> Map.put(:session_key, reviewer.session_key)
+    end
+
+    code_review = review_call.(code, "review code held by an orchestrator")
+
+    assert {:error,
+            %{
+              code: "rule_denied",
+              rule: "code-review-requires-passing-tests",
+              ref: code_id
+            }} = Dispatch.dispatch(ctx.db, ctx.handlers, code_review)
+
+    assert code_id == code.id
+    assert review_count(ctx.db, code.id) == 0
+
+    verdict(
+      ctx,
+      orchestrator.session_key,
+      code.id,
+      "tests-passed",
+      "gibson:/repo code123; mix test test/rules_test.exs; passed: 1 test"
+    )
+
+    assert {:ok, %{reviewsAssignmentId: ^code_id, effectKind: "review"}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, code_review)
+
+    for {producer, subject} <- [
+          {policy, "review policy held by a coder"},
+          {documentation_policy, "review documentation classified as policy"}
+        ] do
+      producer_id = producer.id
+
+      assert {:ok, %{reviewsAssignmentId: ^producer_id, effectKind: "review"}} =
+               Dispatch.dispatch(ctx.db, ctx.handlers, review_call.(producer, subject))
+
+      assert review_count(ctx.db, producer.id) == 1
+    end
+  end
+
   test "typed completion keeps code reviewed while receipt exemptions stay narrow", ctx do
     coder = session(ctx.db, "receipt-closed", "flynn", archetype: "coder")
     noncoder = session(ctx.db, "receipt-orchestrator", "flynn", archetype: "orchestrator")
     reviewer = session(ctx.db, "receipt-exempt-reviewer", "reviewer", archetype: "reviewer")
     closed = assignment(ctx, coder.session_key, {:user, "flynn"})
     open_coder = assignment(ctx, coder.session_key, {:user, "flynn"})
-    noncode = assignment(ctx, noncoder.session_key, {:user, "flynn"})
+
+    policy =
+      assignment(ctx, noncoder.session_key, {:user, "flynn"}, effect_kind: "policy")
 
     orchestration =
       assignment(ctx, noncoder.session_key, {:user, "flynn"}, effect_kind: "evidence")
@@ -1256,7 +1329,7 @@ defmodule Tightbeam.RulesTest do
     assert {:ok, %{reviewsAssignmentId: nil}} =
              Dispatch.dispatch(ctx.db, ctx.handlers, ordinary)
 
-    for producer <- [noncode, closed] do
+    for producer <- [policy, closed] do
       call =
         p3_call("assign", {:user, "reviewer"}, %{
           subject: "exempt review",
@@ -1300,7 +1373,7 @@ defmodule Tightbeam.RulesTest do
   defp assignment(ctx, holder_key, opener, opts \\ []) do
     call =
       p3_call("assign", opener, %{
-        subject: "P3 assignment #{System.unique_integer([:positive])}",
+        subject: opts[:subject] || "P3 assignment #{System.unique_integer([:positive])}",
         idempotency_key: nil,
         reviews_assignment_id: opts[:reviews],
         effect_kind: opts[:effect_kind],
