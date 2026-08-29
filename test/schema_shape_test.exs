@@ -1089,11 +1089,13 @@ defmodule Tightbeam.SchemaShapeTest do
         "nullable-effective-parent-7eec-#{System.unique_integer([:positive])}"
       )
 
-    source = Path.join(root, "source")
-    db_path = Path.join(root, "predecessor.sqlite3")
     repo = File.cwd!()
 
     File.mkdir_p!(root)
+    {physical_root, 0} = System.cmd("pwd", ["-P"], cd: root, stderr_to_stdout: true)
+    root = String.trim(physical_root)
+    source = Path.join(root, "source")
+    db_path = Path.join(root, "predecessor.sqlite3")
 
     {output, 0} =
       System.cmd(
@@ -1154,24 +1156,32 @@ defmodule Tightbeam.SchemaShapeTest do
 
     build = Path.join(Path.dirname(source), "build")
     deps = Path.join(File.cwd!(), "deps")
-    private_app_dir = Path.join([build, "lib", "tightbeam", "priv"])
+    mix = System.find_executable("mix") || raise("mix is required for predecessor capture")
+    env = [{"MIX_ENV", "test"}, {"MIX_BUILD_PATH", build}, {"MIX_DEPS_PATH", deps}]
 
-    # Mix normally copies priv into an application build. The isolated build used
-    # for this old binary has no prior application output, and Tightbeam.Harness
-    # reads this exact bundle while it compiles. Copy only the exact predecessor
-    # priv tree so the child is self-contained on a clean host.
-    File.mkdir_p!(private_app_dir)
-    File.cp_r!(Path.join(source, "priv"), private_app_dir)
+    # Seed the exact predecessor's application structure through Mix so its tracked
+    # priv tree reaches the isolated output before Harness reads it during compile.
+    {compile_output, compile_status} =
+      System.cmd(mix, ["do", "compile.app", "--force", "+", "compile"],
+        cd: source,
+        env: env,
+        stderr_to_stdout: true
+      )
+
+    assert compile_status == 0, compile_output
+
+    assert File.read!(Path.join([build, "lib", "tightbeam", "priv", "harness_bundle.json"])) ==
+             File.read!(Path.join(source, "priv/harness_bundle.json"))
 
     {output, status} =
       System.cmd(
-        System.find_executable("mix") || raise("mix is required for predecessor capture"),
-        ["run", "--no-start", "-e", expression],
+        mix,
+        ["run", "--no-compile", "--no-start", "-e", expression],
         cd: source,
         # The outer gate runs in Mix's test environment. Keep the exact predecessor
         # child there too. Otherwise a clean host can look for an unbuilt dev-only
         # dependency tree even though it is proving a test fixture.
-        env: [{"MIX_ENV", "test"}, {"MIX_BUILD_PATH", build}, {"MIX_DEPS_PATH", deps}],
+        env: env,
         stderr_to_stdout: true
       )
 
