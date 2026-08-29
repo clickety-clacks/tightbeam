@@ -604,6 +604,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             title,
             spec_ref_name,
             spec_ref_sha256,
+            priority,
             idempotency_key,
         } => {
             let mut params = vec![string_field("title", title)];
@@ -613,11 +614,27 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             if let Some(value) = spec_ref_sha256 {
                 params.push(string_field("specRefSha256", value));
             }
+            if let Some(value) = priority {
+                params.push(format!("\"priority\":{value}"));
+            }
             if let Some(value) = idempotency_key {
                 params.push(string_field("idempotencyKey", value));
             }
             Ok(request(identity, "work-item-create", vec![], params))
         }
+        Command::WorkItemUpdate {
+            identity,
+            work_item_id,
+            priority,
+        } => Ok(request(
+            identity,
+            "work-item-update",
+            vec![],
+            vec![
+                string_field("workItemId", work_item_id),
+                format!("\"priority\":{priority}"),
+            ],
+        )),
         Command::WorkItemGet {
             identity,
             work_item_id,
@@ -984,16 +1001,23 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             identity,
             setting,
             value,
-        } => Ok(request(
-            identity,
-            "config",
-            vec![],
-            vec![
-                string_field("action", "set"),
-                string_field("setting", setting),
-                string_field("value", value),
-            ],
-        )),
+        } => {
+            let encoded_value = if setting == "default-priority" {
+                format!("\"value\":{value}")
+            } else {
+                string_field("value", value)
+            };
+            Ok(request(
+                identity,
+                "config",
+                vec![],
+                vec![
+                    string_field("action", "set"),
+                    string_field("setting", setting),
+                    encoded_value,
+                ],
+            ))
+        }
         Command::HostEnvSet {
             identity,
             host,
@@ -1648,6 +1672,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::ReopenAssignment { identity, .. }
         | Command::RepairAssignment { identity, .. }
         | Command::WorkItemCreate { identity, .. }
+        | Command::WorkItemUpdate { identity, .. }
         | Command::WorkItemGet { identity, .. }
         | Command::WorkItemTrace { identity, .. }
         | Command::Attend { identity, .. }
@@ -2634,6 +2659,29 @@ mod tests {
             r#"{"asUser":"flynn","verb":"work-item-create","params":{"title":"Ship","idempotencyKey":"k1"}}"#
         );
         assert_eq!(
+            body(&[
+                "work-item-create",
+                "--title",
+                "Urgent",
+                "--priority",
+                "7",
+                "--as-user",
+                "flynn"
+            ]),
+            r#"{"asUser":"flynn","verb":"work-item-create","params":{"title":"Urgent","priority":7}}"#
+        );
+        assert_eq!(
+            body(&[
+                "work-item-update",
+                "wi_1",
+                "--priority",
+                "2",
+                "--as-user",
+                "flynn"
+            ]),
+            r#"{"asUser":"flynn","verb":"work-item-update","params":{"workItemId":"wi_1","priority":2}}"#
+        );
+        assert_eq!(
             body(&["work-item-icebox", "wi_1", "--as-user", "flynn"]),
             r#"{"asUser":"flynn","verb":"work-item-icebox","params":{"workItemId":"wi_1"}}"#
         );
@@ -2674,6 +2722,21 @@ mod tests {
                 "flynn",
             ]),
             r#"{"asUser":"flynn","verb":"config","params":{"action":"set","setting":"default-archetype","value":"coder"}}"#
+        );
+        assert_eq!(
+            body(&["config", "get", "default-priority", "--as-user", "flynn"]),
+            r#"{"asUser":"flynn","verb":"config","params":{"action":"get","setting":"default-priority"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "config",
+                "set",
+                "default-priority",
+                "6",
+                "--as-user",
+                "flynn"
+            ]),
+            r#"{"asUser":"flynn","verb":"config","params":{"action":"set","setting":"default-priority","value":6}}"#
         );
     }
 

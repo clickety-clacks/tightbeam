@@ -20,12 +20,23 @@ defmodule Tightbeam.EffortCheckin do
   prods, or schedules the next parent escalation.
   """
 
-  alias Tightbeam.{CausalEvents, DB, Escalation, Org, Placement, Supervision, Wakes}
+  alias Tightbeam.{
+    CausalEvents,
+    ConditionFacts,
+    DB,
+    Escalation,
+    Org,
+    Placement,
+    Supervision,
+    Wakes
+  }
+
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.Publisher
 
   @origin "process:tightbeam"
-  @default_horizon_ms 900_000
+  @default_horizon_ms 14_400_000
+  @default_priority 4
   @default_deadline_ms 86_400_000
 
   @ddl """
@@ -437,14 +448,20 @@ defmodule Tightbeam.EffortCheckin do
   defp probe_in_txn(txn, config, wake, inspection) do
     case generation_for_wake_in_txn(txn, wake.wake_id) do
       %{state: "armed"} = generation ->
-        open? =
+        eligible? =
           Txn.q(
             txn,
-            "SELECT 1 FROM assignments WHERE id = ?1 AND state = 'open'",
+            """
+            SELECT 1
+            FROM assignments AS a
+            LEFT JOIN work_items AS w ON w.id=a.workItemId
+            WHERE a.id=?1 AND a.state='open'
+              AND (a.workItemId IS NULL OR w.state!='iceboxed')
+            """,
             [generation.assignment_id]
           ) == [[1]]
 
-        if open? do
+        if eligible? do
           Txn.q(
             txn,
             "UPDATE effort_checkin_generations SET state = 'probed' WHERE assignmentId = ?1 AND generation = ?2 AND wakeId = ?3 AND state = 'armed'",
@@ -453,68 +470,97 @@ defmodule Tightbeam.EffortCheckin do
 
           if Txn.changes(txn) == 1 do
             mark_wake_fired(txn, wake.wake_id)
-            channels = channels(txn, generation, inspection)
             session = session_in_txn(txn, generation.holder_key)
 
-            if effect?(channels) do
+            if ConditionFacts.standing_in_txn?(
+                 txn,
+                 "work-blocked",
+                 generation.holder_key
+               ) do
               insert_generation(
                 txn,
                 config,
                 generation.assignment_id,
                 session,
                 generation.root,
-                inspection,
+                advanced_baseline(generation.baseline, inspection),
                 generation.generation + 1,
-                1,
-                0
+                generation.multiplier,
+                generation.agent_prodded
               )
 
               nil
             else
-              evidence = evidence(generation, channels)
+              channels = channels(txn, generation, inspection)
 
-              # The observation consumed this generation's stamp and laid the
-              # next one, so the row advances to it even when nothing moved:
-              # a later `continue` re-arms against a stamp that still exists.
-              Txn.q(
-                txn,
-                "UPDATE effort_checkin_generations SET evidence = ?3, baseline = ?4 WHERE assignmentId = ?1 AND generation = ?2",
-                [
-                  generation.assignment_id,
-                  generation.generation,
-                  JSON.encode!(evidence),
-                  encode_observation(advanced_baseline(generation.baseline, inspection))
-                ]
-              )
-
-              if generation.agent_prodded == 0 do
-                prod_holder_in_txn(txn, generation, evidence)
-
+              if effect?(channels) do
                 insert_generation(
                   txn,
                   config,
                   generation.assignment_id,
                   session,
                   generation.root,
-                  advanced_baseline(generation.baseline, inspection),
+                  inspection,
                   generation.generation + 1,
-                  generation.multiplier,
-                  1
+                  1,
+                  0
                 )
 
                 nil
               else
-                escalate_parent_in_txn(
+                evidence = evidence(generation, channels)
+
+                # The observation consumed this generation's stamp and laid the
+                # next one, so the row advances to it even when nothing moved:
+                # a later `continue` re-arms against a stamp that still exists.
+                Txn.q(
                   txn,
-                  config,
-                  generation,
-                  evidence,
-                  session,
-                  advanced_baseline(generation.baseline, inspection)
+                  "UPDATE effort_checkin_generations SET evidence = ?3, baseline = ?4 WHERE assignmentId = ?1 AND generation = ?2",
+                  [
+                    generation.assignment_id,
+                    generation.generation,
+                    JSON.encode!(evidence),
+                    encode_observation(advanced_baseline(generation.baseline, inspection))
+                  ]
                 )
+
+                if generation.agent_prodded == 0 do
+                  prod_holder_in_txn(txn, generation, evidence)
+
+                  insert_generation(
+                    txn,
+                    config,
+                    generation.assignment_id,
+                    session,
+                    generation.root,
+                    advanced_baseline(generation.baseline, inspection),
+                    generation.generation + 1,
+                    generation.multiplier,
+                    1
+                  )
+
+                  nil
+                else
+                  escalate_parent_in_txn(
+                    txn,
+                    config,
+                    generation,
+                    evidence,
+                    session,
+                    advanced_baseline(generation.baseline, inspection)
+                  )
+                end
               end
             end
           end
+        else
+          mark_wake_fired(txn, wake.wake_id)
+
+          Txn.q(
+            txn,
+            "UPDATE effort_checkin_generations SET state='canceled' WHERE assignmentId=?1 AND generation=?2 AND wakeId=?3 AND state='armed'",
+            [generation.assignment_id, generation.generation, wake.wake_id]
+          )
         end
 
       _ ->
@@ -698,7 +744,7 @@ defmodule Tightbeam.EffortCheckin do
          agent_prodded
        ) do
     armed_at = now()
-    horizon = horizon_ms(config)
+    horizon = horizon_ms(txn, config, assignment_id)
 
     [[watermark]] =
       Txn.q(txn, "SELECT COALESCE(MAX(seq), 0) FROM turns WHERE sessionKey = ?1", [
@@ -749,6 +795,63 @@ defmodule Tightbeam.EffortCheckin do
     )
 
     generation_for_assignment_in_txn(txn, assignment_id, generation)
+  end
+
+  @doc "Apply a work-item priority change to its inherited assignment priorities and live probes."
+  @spec reprioritize_work_item_in_txn(Txn.t(), map(), String.t(), integer()) :: :ok
+  def reprioritize_work_item_in_txn(%Txn{} = txn, config, work_item_id, priority) do
+    Txn.q(
+      txn,
+      """
+      INSERT INTO assignment_priorities (assignmentId, priority)
+      SELECT id, ?2 FROM assignments WHERE workItemId=?1
+      ON CONFLICT(assignmentId) DO UPDATE SET priority=excluded.priority
+      """,
+      [work_item_id, priority]
+    )
+
+    horizon = horizon_for_priority(txn, config, priority)
+
+    Txn.q(
+      txn,
+      """
+      UPDATE wakes
+      SET dueAt=(
+        SELECT g.armedAt + (?2 * g.multiplier)
+        FROM effort_checkin_generations AS g
+        WHERE g.wakeId=wakes.wakeId AND g.state='armed'
+      )
+      WHERE wakeId IN (
+        SELECT g.wakeId
+        FROM effort_checkin_generations AS g
+        JOIN assignments AS a ON a.id=g.assignmentId
+        WHERE a.workItemId=?1 AND a.state='open' AND g.state='armed'
+          AND g.generation=(
+            SELECT MAX(g2.generation) FROM effort_checkin_generations AS g2
+            WHERE g2.assignmentId=g.assignmentId
+          )
+      ) AND state='pending'
+      """,
+      [work_item_id, horizon]
+    )
+
+    Txn.q(
+      txn,
+      """
+      UPDATE effort_checkin_generations
+      SET baseHorizonMs=?2
+      WHERE assignmentId IN (
+        SELECT id FROM assignments WHERE workItemId=?1 AND state='open'
+      ) AND state='armed'
+        AND generation=(
+          SELECT MAX(g2.generation) FROM effort_checkin_generations AS g2
+          WHERE g2.assignmentId=effort_checkin_generations.assignmentId
+        )
+      """,
+      [work_item_id, horizon]
+    )
+
+    :ok
   end
 
   defp supersede_requests_in_txn(txn, assignment_id, command) do
@@ -1238,13 +1341,51 @@ defmodule Tightbeam.EffortCheckin do
   defp invalid_root,
     do: {:error, error("invalid_workdir_root", "workdirRoot must be relative and contain no ..")}
 
-  defp horizon_ms(config),
-    do:
+  defp horizon_ms(txn, config, assignment_id) do
+    priority = assignment_priority_in_txn(txn, assignment_id)
+    horizon_for_priority(txn, config, priority)
+  end
+
+  defp horizon_for_priority(txn, config, priority) do
+    base =
       Map.get(
         config,
         :effort_checkin_horizon_ms,
         Application.get_env(:tightbeam, :effort_checkin_horizon_ms, @default_horizon_ms)
       )
+
+    default_priority = default_priority_in_txn(txn)
+    steps = priority - default_priority
+
+    if steps >= 0,
+      do: max(div(base, Integer.pow(2, steps)), 1),
+      else: base * Integer.pow(2, -steps)
+  end
+
+  defp assignment_priority_in_txn(txn, assignment_id) do
+    case Txn.q(
+           txn,
+           """
+           SELECT COALESCE(
+             (SELECT priority FROM assignment_priorities WHERE assignmentId=a.id),
+             (SELECT priority FROM work_item_priorities WHERE workItemId=a.workItemId),
+             CAST(COALESCE((SELECT value FROM org_settings WHERE key='default-priority'),'4') AS INTEGER)
+           )
+           FROM assignments AS a WHERE a.id=?1
+           """,
+           [assignment_id]
+         ) do
+      [[priority]] -> priority
+      [] -> default_priority_in_txn(txn)
+    end
+  end
+
+  defp default_priority_in_txn(txn) do
+    case Txn.q(txn, "SELECT value FROM org_settings WHERE key='default-priority'") do
+      [[value]] -> String.to_integer(value)
+      [] -> @default_priority
+    end
+  end
 
   defp deadline_ms(config),
     do:
