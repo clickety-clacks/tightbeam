@@ -190,7 +190,13 @@ pub enum Command {
         title: String,
         spec_ref_name: Option<String>,
         spec_ref_sha256: Option<String>,
+        priority: Option<String>,
         idempotency_key: Option<String>,
+    },
+    WorkItemUpdate {
+        identity: Identity,
+        work_item_id: String,
+        priority: String,
     },
     WorkItemGet {
         identity: Identity,
@@ -495,10 +501,12 @@ COMMANDS:
       refusal: omit --harness for a same-harness model change.
 
   work-item-create --title "<title>" [--spec-ref <name> --spec-sha256 <hex>]
-                   [--key <idempotencyKey>]
+                   [--priority <0..8>] [--key <idempotencyKey>]
       File a work item. Unrouted, it becomes YOUR problem on a deadline: file
       it, then route it (assign/dispatch) or icebox it. --key makes create
       idempotent (same key returns the same item).
+  work-item-update <workItemId> --priority <0..8>
+      Raise or lower the work item's priority. Open cards inherit the change.
   work-item-get <workItemId>
   work-item-trace <workItemId>
   attend [--high]
@@ -626,8 +634,9 @@ COMMANDS:
       Add a user, optionally as an admin. An existing admin may run this over
       the ordinary gateway path. On an empty local org, the first user is
       created directly and becomes admin by the existing cold-start rule.
-  config get default-archetype                   read the default spawn archetype
+  config get default-archetype|default-priority  read an organization default
   config set default-archetype <name>            set the default spawn archetype
+  config set default-priority <0..8>              set the default card priority
   host-env-set --host <host> --harness <harness> NAME=VALUE
       Set one host- and harness-scoped environment overlay. The result states
       when the adapter will observe the new value.
@@ -1412,7 +1421,21 @@ fn parse_with_optional_catalog(
                 title: nonempty(flags, "title").ok_or_else(|| "--title is required".to_owned())?,
                 spec_ref_name,
                 spec_ref_sha256,
+                priority: priority_flag(flags)?,
                 idempotency_key: nonempty(flags, "key"),
+            })
+        }
+        "work-item-update" => {
+            if parsed.positional.len() != 2 {
+                return Err(
+                    "usage: tightbeam work-item-update <workItemId> --priority <0..8>".to_owned(),
+                );
+            }
+            Ok(Command::WorkItemUpdate {
+                identity: identity(flags)?,
+                work_item_id: parsed.positional[1].clone(),
+                priority: priority_flag(flags)?
+                    .ok_or_else(|| "--priority is required".to_owned())?,
             })
         }
         "work-item-get" => {
@@ -1729,7 +1752,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, host-toolchain-set, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, host-toolchain-set, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -1902,6 +1925,19 @@ fn parse_harness_process(
     }
 }
 
+fn priority_flag(flags: &HashMap<String, String>) -> Result<Option<String>, String> {
+    nonempty(flags, "priority")
+        .map(|value| {
+            let priority = value.parse::<u8>().ok();
+            if priority.is_some_and(|priority| priority <= 8) {
+                Ok(value)
+            } else {
+                Err("priority must be an integer from 0 through 8".to_owned())
+            }
+        })
+        .transpose()
+}
+
 fn parse_config(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Command, String> {
     match (
         parsed.positional.get(1).map(String::as_str),
@@ -1909,17 +1945,28 @@ fn parse_config(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Comma
         parsed.positional.get(3),
         parsed.positional.get(4),
     ) {
-        (Some("get"), Some("default-archetype"), None, None) => Ok(Command::ConfigGet {
+        (Some("get"), Some(setting @ ("default-archetype" | "default-priority")), None, None) => Ok(Command::ConfigGet {
             identity: identity(flags)?,
-            setting: "default-archetype".to_owned(),
+            setting: setting.to_owned(),
         }),
         (Some("set"), Some("default-archetype"), Some(value), None) => Ok(Command::ConfigSet {
             identity: identity(flags)?,
             setting: "default-archetype".to_owned(),
             value: value.clone(),
         }),
+        (Some("set"), Some("default-priority"), Some(value), None) => {
+            let priority = value.parse::<u8>().ok();
+            if priority.is_none_or(|priority| priority > 8) {
+                return Err("default-priority must be an integer from 0 through 8".to_owned());
+            }
+            Ok(Command::ConfigSet {
+                identity: identity(flags)?,
+                setting: "default-priority".to_owned(),
+                value: value.clone(),
+            })
+        }
         _ => Err(
-            "usage: tightbeam config get default-archetype | config set default-archetype <name>"
+            "usage: tightbeam config get default-archetype|default-priority | config set default-archetype <name> | config set default-priority <0..8>"
                 .to_owned(),
         ),
     }
@@ -2653,6 +2700,7 @@ mod tests {
                 "work-item-create",
                 "work-item-fail",
                 "work-item-get",
+                "work-item-update",
                 "attend",
                 "transcript",
                 "tune",
@@ -2675,8 +2723,9 @@ mod tests {
             "onboard openai|anthropic [--api-key]",
             "onboard github [--hostname github.com] [--remote URL]",
             "add-user <userId> [--admin]",
-            "config get default-archetype",
+            "config get default-archetype|default-priority",
             "config set default-archetype <name>",
+            "config set default-priority <0..8>",
             "host-env-set --host <host> --harness <harness> NAME=VALUE",
             "host-env-list [--host <host>] [--harness <harness>]",
             "host-env-unset --host <host> --harness <harness> NAME",
@@ -3203,7 +3252,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, host-toolchain-set, doctor, assimilate, harness-process".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, host-toolchain-set, doctor, assimilate, harness-process".to_owned())
         );
     }
 
@@ -3351,7 +3400,6 @@ mod tests {
             "withdraw",
             "operator-supersede",
             "critical",
-            "work-item-update",
             "work-item-list",
             "assignment-get",
             "init",

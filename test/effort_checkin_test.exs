@@ -18,6 +18,8 @@ defmodule Tightbeam.EffortCheckinTest do
     WorkItems
   }
 
+  alias Tightbeam.ConditionFacts
+
   defmodule LaneDoorbell do
     @moduledoc false
     use GenServer
@@ -182,6 +184,107 @@ defmodule Tightbeam.EffortCheckinTest do
 
     assert retired_source_id == retired.id
     assert retired_disposition_id == retired.id
+  end
+
+  test "priority inherits from the work item, scales the four-hour window, and reprioritizes live probes",
+       ctx do
+    config = Map.put(ctx.config, :effort_checkin_horizon_ms, 14_400_000)
+    ctx = %{ctx | config: config}
+
+    horizons =
+      for {priority, expected} <- [{3, 28_800_000}, {4, 14_400_000}, {5, 7_200_000}],
+          into: %{} do
+        item =
+          WorkItems.__handle__(ctx.db, "work-item-create", %{
+            verb: "work-item-create",
+            origin: "user:h1",
+            principal: {:user, "h1"},
+            session_key: nil,
+            params: %{title: "priority #{priority}", priority: priority}
+          })
+
+        assignment =
+          dispatch_for_item(ctx, {:session, "parent"}, "holder", "priority #{priority}", item.id)
+
+        assert assignment.priority == priority
+
+        assert [[^priority]] =
+                 rows(
+                   ctx.db,
+                   "SELECT priority FROM assignment_priorities WHERE assignmentId=?1",
+                   [
+                     assignment.id
+                   ]
+                 )
+
+        assert [[^expected, ^expected]] =
+                 rows(
+                   ctx.db,
+                   """
+                   SELECT g.baseHorizonMs,w.dueAt-g.armedAt
+                   FROM effort_checkin_generations AS g
+                   JOIN wakes AS w ON w.wakeId=g.wakeId
+                   WHERE g.assignmentId=?1 AND g.state='armed'
+                   """,
+                   [assignment.id]
+                 )
+
+        {priority, {item, assignment}}
+      end
+
+    {item, assignment} = horizons[4]
+
+    updated =
+      Gateway.handlers(ctx.config)["work-item-update"].(%{
+        verb: "work-item-update",
+        origin: "agent:holder",
+        principal: {:session, "holder"},
+        session_key: "holder",
+        params: %{work_item_id: item.id, priority: 6}
+      })
+
+    assert updated.priority == 6
+
+    assert [[6, 3_600_000, 3_600_000]] =
+             rows(
+               ctx.db,
+               """
+               SELECT ap.priority,g.baseHorizonMs,w.dueAt-g.armedAt
+               FROM assignment_priorities AS ap
+               JOIN effort_checkin_generations AS g ON g.assignmentId=ap.assignmentId
+               JOIN wakes AS w ON w.wakeId=g.wakeId
+               WHERE ap.assignmentId=?1 AND g.state='armed'
+               """,
+               [assignment.id]
+             )
+  end
+
+  test "a standing work-blocked fact suppresses the check and an ineligible icebox cancels it",
+       ctx do
+    blocked = dispatch(ctx, {:session, "parent"}, "holder", "blocked")
+
+    {:ok, %{kind: "work-blocked"}} =
+      DB.transaction(ctx.db, fn txn ->
+        ConditionFacts.file_in_txn(txn, %{
+          kind: "work-blocked",
+          scope: "holder",
+          origin: "agent:holder"
+        })
+      end)
+
+    assert nil == fire_probe(ctx, blocked.id)
+    assert silent_rearm(ctx.db, blocked.id)
+    assert prods(ctx.db, "holder") == []
+
+    item = work_item!(ctx.db, "legacy icebox")
+    legacy = dispatch_for_item(ctx, {:session, "parent"}, "holder", "legacy icebox", item.id)
+    :ok = DB.execute(ctx.db, "UPDATE work_items SET state='iceboxed' WHERE id='#{item.id}'")
+    wake = current_wake(ctx.db, legacy.id)
+
+    assert nil == fire_probe(ctx, legacy.id)
+    assert bracket_state(ctx.db, legacy.id) == "canceled"
+    assert Wakes.get(ctx.db, wake.wake_id).state == "fired"
+    assert prods(ctx.db, "holder") == []
   end
 
   test "acceptance 4 and 5: writes are detected with no git anywhere; a stall is not effect",

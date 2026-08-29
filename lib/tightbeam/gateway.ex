@@ -974,7 +974,9 @@ defmodule Tightbeam.Gateway do
         WorkItems.__handle__(
           db,
           "work-item-update",
-          Map.put(call, :on_work_item_change, item_change)
+          call
+          |> Map.put(:on_work_item_change, item_change)
+          |> Map.put(:effort_config, config)
         )
       end,
       "work-item-icebox" => work_item_disposition(db, "work-item-icebox", item_change),
@@ -3410,7 +3412,7 @@ defmodule Tightbeam.Gateway do
        }) do
     case DB.transaction(db, fn txn ->
            if Archetypes.get(archetype_name) do
-             Org.put_setting_in_txn(txn, "default-archetype", archetype_name)
+             put_setting_in_txn(txn, "default-archetype", archetype_name)
            else
              {:error, :unknown_archetype}
            end
@@ -3426,9 +3428,42 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp config_result(_db, _params) do
-    %{code: "invalid", message: "config supports get/set default-archetype"}
+  defp config_result(db, %{action: "get", setting: "default-priority"}) do
+    %{
+      setting: "default-priority",
+      value: parse_default_priority(Org.get_setting(db, "default-priority"))
+    }
   end
+
+  defp config_result(db, %{action: "set", setting: "default-priority", value: priority}) do
+    if is_integer(priority) and priority in 0..8 do
+      value = Integer.to_string(priority)
+
+      case DB.transaction(db, fn txn ->
+             put_setting_in_txn(txn, "default-priority", value)
+           end) do
+        {:ok, :ok} ->
+          %{setting: "default-priority", value: priority, changed: true}
+
+        {:error, error} ->
+          raise error
+      end
+    else
+      %{code: "invalid_priority", message: "priority must be an integer from 0 through 8"}
+    end
+  end
+
+  defp config_result(_db, _call) do
+    %{
+      code: "invalid",
+      message: "config supports get/set default-archetype or default-priority"
+    }
+  end
+
+  defp parse_default_priority(nil), do: 4
+  defp parse_default_priority(value), do: String.to_integer(value)
+
+  defp put_setting_in_txn(txn, key, value), do: Org.put_setting_in_txn(txn, key, value)
 
   defp admin_handler(db, fun) do
     fn call ->

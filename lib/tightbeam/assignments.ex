@@ -111,6 +111,13 @@ defmodule Tightbeam.Assignments do
   )
   """
 
+  @assignment_priorities_ddl """
+  CREATE TABLE IF NOT EXISTS assignment_priorities (
+    assignmentId TEXT PRIMARY KEY REFERENCES assignments(id),
+    priority INTEGER NOT NULL
+  )
+  """
+
   @interruptions_ddl """
   CREATE TABLE IF NOT EXISTS assignment_interruptions (
     assignmentId TEXT PRIMARY KEY REFERENCES assignments(id),
@@ -129,6 +136,7 @@ defmodule Tightbeam.Assignments do
     :ok = DB.execute(db, @attests_ddl)
     :ok = DB.execute(db, @assignment_files_ddl)
     :ok = DB.execute(db, @assignment_effects_ddl)
+    :ok = DB.execute(db, @assignment_priorities_ddl)
     :ok = DB.execute(db, @interruptions_ddl)
     Tightbeam.EffortCheckin.ensure_schema(db)
   end
@@ -1026,6 +1034,12 @@ defmodule Tightbeam.Assignments do
           [id, effective_effect_kind(reviews_assignment_id, call.params[:effect_kind])]
         )
 
+        Txn.q(
+          txn,
+          "INSERT INTO assignment_priorities (assignmentId, priority) VALUES (?1, ?2)",
+          [id, inherited_priority_in_txn(txn, work_item_id)]
+        )
+
         Enum.each(files, fn path ->
           Txn.q(
             txn,
@@ -1539,7 +1553,7 @@ defmodule Tightbeam.Assignments do
       db: db,
       port: Application.get_env(:tightbeam, :port, 11_373),
       effort_checkin_horizon_ms:
-        Application.get_env(:tightbeam, :effort_checkin_horizon_ms, 900_000)
+        Application.get_env(:tightbeam, :effort_checkin_horizon_ms, 14_400_000)
     }
 
     Map.merge(defaults, Map.get(call, :effort_config, %{}))
@@ -1867,7 +1881,10 @@ defmodule Tightbeam.Assignments do
       "openedAt, state, outcome, closedAt, closedByUser, closedBySession, closingAttestId" <>
       ", workItemId, reviewsAssignmentId, holderHarness, holderProvider, " <>
       "COALESCE((SELECT effectKind FROM assignment_effects WHERE assignmentId = assignments.id), " <>
-      "CASE WHEN reviewsAssignmentId IS NULL THEN 'code' ELSE 'review' END)"
+      "CASE WHEN reviewsAssignmentId IS NULL THEN 'code' ELSE 'review' END), " <>
+      "COALESCE((SELECT priority FROM assignment_priorities WHERE assignmentId=assignments.id), " <>
+      "(SELECT priority FROM work_item_priorities WHERE workItemId=assignments.workItemId), " <>
+      "CAST(COALESCE((SELECT value FROM org_settings WHERE key='default-priority'),'4') AS INTEGER))"
   end
 
   defp assignment([
@@ -1889,7 +1906,8 @@ defmodule Tightbeam.Assignments do
          reviews_assignment_id,
          holder_harness,
          holder_provider,
-         effect_kind
+         effect_kind,
+         priority
        ]) do
     %{
       id: id,
@@ -1910,8 +1928,24 @@ defmodule Tightbeam.Assignments do
       reviewsAssignmentId: reviews_assignment_id,
       holderHarness: holder_harness,
       holderProvider: holder_provider,
-      effectKind: effect_kind
+      effectKind: effect_kind,
+      priority: priority
     }
+  end
+
+  defp inherited_priority_in_txn(txn, work_item_id) do
+    case Txn.q(
+           txn,
+           """
+           SELECT COALESCE(
+             (SELECT priority FROM work_item_priorities WHERE workItemId=?1),
+             CAST(COALESCE((SELECT value FROM org_settings WHERE key='default-priority'),'4') AS INTEGER)
+           )
+           """,
+           [work_item_id]
+         ) do
+      [[priority]] -> priority
+    end
   end
 
   defp attest([

@@ -47,7 +47,12 @@ defmodule Tightbeam.WorkState do
       SELECT 1 FROM attests f WHERE f.assignmentId = a.id
     ) THEN 'open'
     ELSE 'active'
-  END
+  END,
+  COALESCE(
+    (SELECT priority FROM assignment_priorities WHERE assignmentId=a.id),
+    (SELECT priority FROM work_item_priorities WHERE workItemId=a.workItemId),
+    CAST(COALESCE((SELECT value FROM org_settings WHERE key='default-priority'),'4') AS INTEGER)
+  )
   """
 
   @doc "Create both observability doorbell tables."
@@ -326,7 +331,9 @@ defmodule Tightbeam.WorkState do
   defp item_columns,
     do:
       "id, title, specRefName, specRefSha256, isBug, ownerUserId, state, failReason, " <>
-        "createdByUser, createdBySession, createdAt"
+        "createdByUser, createdBySession, createdAt, " <>
+        "COALESCE((SELECT priority FROM work_item_priorities p WHERE p.workItemId=work_items.id), " <>
+        "CAST(COALESCE((SELECT value FROM org_settings WHERE key='default-priority'),'4') AS INTEGER))"
 
   defp assignment([
          id,
@@ -345,7 +352,8 @@ defmodule Tightbeam.WorkState do
          closing_attest_id,
          work_item_id,
          holder_state,
-         status
+         status,
+         priority
        ]) do
     %{
       id: id,
@@ -364,7 +372,8 @@ defmodule Tightbeam.WorkState do
       closingAttestId: closing_attest_id,
       workItemId: work_item_id,
       holderState: holder_state,
-      status: status
+      status: status,
+      priority: priority
     }
   end
 
@@ -379,7 +388,8 @@ defmodule Tightbeam.WorkState do
          fail_reason,
          user,
          session,
-         created_at
+         created_at,
+         priority
        ]) do
     %{
       id: id,
@@ -392,7 +402,8 @@ defmodule Tightbeam.WorkState do
       failReason: fail_reason,
       createdByUser: user,
       createdBySession: session,
-      createdAt: created_at
+      createdAt: created_at,
+      priority: priority
     }
   end
 
