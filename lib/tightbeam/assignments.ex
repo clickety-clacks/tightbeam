@@ -1193,6 +1193,34 @@ defmodule Tightbeam.Assignments do
           _ -> {supplied, :error}
         end
 
+      effort_config = effort_config(db, call)
+
+      prepared_effort_arm =
+        case from do
+          {assignment_id, {:ok, _}} ->
+            may_prepare? =
+              transaction(db, fn txn ->
+                case fetch_assignment(txn, assignment_id) do
+                  %{state: "closed"} = assignment ->
+                    reopen_allowed?(txn, call.principal, assignment)
+
+                  _ ->
+                    false
+                end
+              end)
+
+            if may_prepare?,
+              do: EffortCheckin.prepare_reopen_arm(db, effort_config, assignment_id)
+
+          _ ->
+            nil
+        end
+
+      call =
+        call
+        |> Map.put(:effort_config, effort_config)
+        |> Map.put(:prepared_effort_arm, prepared_effort_arm)
+
       result =
         transaction(db, fn txn ->
           visible? = fn id ->
@@ -1300,6 +1328,13 @@ defmodule Tightbeam.Assignments do
 
     if Txn.changes(txn) != 1, do: raise(TransitionRace)
     reopened = fetch_assignment!(txn, assignment_id)
+
+    EffortCheckin.arm_reopened_in_txn(
+      txn,
+      call.effort_config,
+      reopened,
+      call.prepared_effort_arm
+    )
 
     # A terminal disposition DELETEs the entitlement row, so this arms a fresh
     # generation exactly as `assign` does — a reopened card is watched like any
