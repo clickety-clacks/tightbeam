@@ -563,11 +563,16 @@ fn read_link_at(dir: RawFd, name: &str, path: &Path) -> Result<PathBuf, FsError>
             )
         };
         if count < 0 {
-            return Err(io(
-                "read confined symlink",
-                path,
-                std::io::Error::last_os_error(),
-            ));
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINVAL) && entry_is_symlink_at(dir, &name, path)?
+            {
+                // Darwin may report EINVAL when readlinkat races a symlink-for-
+                // symlink rename. Re-observe the entry through the same dirfd and
+                // retry only while it is still a symlink; another entry type
+                // remains an invalid pointer instead of becoming retryable.
+                continue;
+            }
+            return Err(io("read confined symlink", path, error));
         }
         let count = count as usize;
         if count < buffer.len() {
@@ -582,6 +587,18 @@ fn read_link_at(dir: RawFd, name: &str, path: &Path) -> Result<PathBuf, FsError>
             )));
         }
     }
+}
+
+fn entry_is_symlink_at(dir: RawFd, name: &CStr, path: &Path) -> Result<bool, FsError> {
+    let mut metadata = unsafe { std::mem::zeroed::<libc::stat>() };
+    if unsafe { libc::fstatat(dir, name.as_ptr(), &mut metadata, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+        return Err(io(
+            "inspect confined symlink",
+            path,
+            std::io::Error::last_os_error(),
+        ));
+    }
+    Ok(metadata.st_mode as u32 & libc::S_IFMT as u32 == libc::S_IFLNK as u32)
 }
 
 #[derive(Debug)]
@@ -1572,10 +1589,10 @@ mod tests {
     }
 
     #[test]
-    fn same_filesystem_classifies_a_separate_proc_mount_as_cross_device() {
+    fn same_filesystem_classifies_a_separate_dev_mount_as_cross_device() {
         let (_directory, fs) = fixture();
         assert!(matches!(
-            fs.same_filesystem(Path::new("/proc")),
+            fs.same_filesystem(Path::new("/dev")),
             Err(FsError::CrossDevice { .. })
         ));
     }
@@ -1785,5 +1802,15 @@ mod tests {
         });
         writer.join().unwrap();
         reader.join().unwrap();
+    }
+
+    #[test]
+    fn active_reader_does_not_retry_a_non_symlink_entry() {
+        let (directory, fs) = fixture();
+        fs::write(directory.0.join("active"), b"not-a-symlink").unwrap();
+        assert!(matches!(
+            fs.read_active(),
+            Err(FsError::Io { source, .. }) if source.raw_os_error() == Some(libc::EINVAL)
+        ));
     }
 }

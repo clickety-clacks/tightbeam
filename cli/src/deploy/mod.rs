@@ -988,7 +988,7 @@ mod tests {
         let expected =
             ExpectedActive::generation(current.generation.clone(), current.release.clone());
         assert!(matches!(
-            manager.replace_active_for_test(&lock, &expected, &target, Path::new("/proc")),
+            manager.replace_active_for_test(&lock, &expected, &target, Path::new("/dev")),
             Err(FsError::CrossDevice { .. })
         ));
         assert_eq!(manager.fs.read_active().unwrap(), Some(current));
