@@ -171,7 +171,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
            send(parent, {:authoritative_child_opts, kind})
 
            [
-             harness: :claude,
+             harness: :cursor,
              readiness_rendezvous: true,
              cmd: [System.find_executable("node"), if(kind == :api_key, do: fast, else: slow)],
              home: ctx.test_dir,
@@ -184,7 +184,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
          name: :authoritative_child_replacement_coordinator}
       )
 
-    key = {:claude, "shared", "testhost"}
+    key = {:cursor, "shared", "testhost"}
     first = Task.async(fn -> AdapterCoordinator.adapter_for(coordinator, key) end)
     assert_receive {:authoritative_child_opts, :subscription}
 
