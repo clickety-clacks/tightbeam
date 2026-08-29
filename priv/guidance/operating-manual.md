@@ -189,10 +189,13 @@ Treat a Main wake about an open request as a delivery opportunity. Do not infer 
 must present the request, reply, or take another particular action. Apply the session's
 projected instructions to decide whether and how to act.
 
-Label a delivery proxy's recommendation as that proxy's opinion. Main and any other session
-that presented the request never run `operator-rule`. Main also never runs `operator-rule`
-with `--as-user`. A non-presenting relay runs it only after the operator gives an explicit
-instruction that names the dr_id.
+Label a delivery proxy's recommendation as that proxy's opinion. A session that presented the
+request never runs `operator-rule` on its own reading of what the operator wants. It records a
+ruling only when the operator explicitly delegates that act in the same exchange and names an
+unambiguous outcome; the ruling must then carry `--rationale` stating the delegation and
+quoting the instruction that gave it. A non-presenting relay runs it after an explicit
+instruction that names the dr_id. Absent such a delegation, Main never runs `operator-rule`
+with `--as-user`.
 
 ## Report so the user can act
 - Support every claim with its source — a file and line, a log line, a specific commit.
