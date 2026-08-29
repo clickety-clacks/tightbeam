@@ -20,10 +20,31 @@ defmodule Tightbeam.CursorSigningTest do
     File.mkdir_p!(control_dir)
     on_exit(fn -> File.rm_rf!(control_dir) end)
     probe = compile_filesystem_probe!(control_dir)
+    fcntl_probe = compile_fcntl_forwarding_probe!(control_dir)
     base_dir = Path.join(control_dir, "base")
     active_path = Path.join([base_dir, "secrets", "rest-cursor-signing.v1"])
     ready_marker = Path.join(control_dir, "probe-ready")
     failure_marker = Path.join(control_dir, "stage-sync-failed")
+    unrelated_failure_marker = Path.join(control_dir, "unrelated-sync-failed")
+    unrelated_path = Path.join(control_dir, "unrelated")
+    fcntl_ready_marker = Path.join(control_dir, "fcntl-probe-ready")
+    fcntl_path = Path.join(control_dir, "fcntl-path")
+
+    if fcntl_probe != nil do
+      fcntl_environment =
+        filesystem_probe_environment(probe, active_path) ++
+          [{"CURSOR_SIGNING_TEST_PROBE_READY", fcntl_ready_marker}]
+
+      case run_reaped_executable(fcntl_probe, [fcntl_path], fcntl_environment) do
+        {"fcntl-forwarding-ok", 0} ->
+          unless File.exists?(fcntl_ready_marker) do
+            raise "cursor filesystem fcntl preflight did not load the probe"
+          end
+
+        {output, status} ->
+          raise "cursor filesystem fcntl forwarding preflight failed: status=#{status} output=#{inspect(output)}"
+      end
+    end
 
     script = """
     [base_dir] = System.argv()
@@ -47,6 +68,37 @@ defmodule Tightbeam.CursorSigningTest do
 
       {output, status} ->
         raise "cursor filesystem probe preflight failed: status=#{status} output=#{inspect(output)}"
+    end
+
+    unrelated_script = """
+    [path] = System.argv()
+    {:ok, file} = File.open(path, [:write, :binary])
+    :ok = IO.binwrite(file, "unrelated")
+    :ok = :file.sync(file)
+    :ok = File.close(file)
+    IO.binwrite("unrelated-synced")
+    """
+
+    unrelated_environment =
+      filesystem_probe_environment(probe, active_path) ++
+        [
+          {"CURSOR_SIGNING_TEST_PROBE_READY", ready_marker},
+          {"CURSOR_SIGNING_TEST_FAIL_STAGE_SYNC_ALWAYS", "1"},
+          {"CURSOR_SIGNING_TEST_FSYNC_FAILED", unrelated_failure_marker}
+        ]
+
+    case external_instrumented_elixir(
+           unrelated_script,
+           [unrelated_path],
+           unrelated_environment
+         ) do
+      {"unrelated-synced", 0} ->
+        if File.exists?(unrelated_failure_marker) do
+          raise "cursor filesystem probe preflight faulted an unrelated file"
+        end
+
+      {output, status} ->
+        raise "cursor filesystem probe confinement preflight failed: status=#{status} output=#{inspect(output)}"
     end
 
     :ok
@@ -1578,6 +1630,111 @@ defmodule Tightbeam.CursorSigningTest do
          ) do
       {"", 0} -> output
       {_diagnostic, _status} -> raise "cursor filesystem probe compilation failed"
+    end
+  end
+
+  defp compile_fcntl_forwarding_probe!(directory) do
+    case :os.type() do
+      {:unix, :darwin} ->
+        source = Path.join(directory, "fcntl-forwarding-probe.c")
+        executable = Path.join(directory, "fcntl-forwarding-probe")
+
+        File.write!(source, """
+        #include <fcntl.h>
+        #include <limits.h>
+        #include <unistd.h>
+
+        int main(int argc, char **argv) {
+          int descriptors[2] = {-1, -1};
+          int path_fd = -1;
+          char path[PATH_MAX];
+          static const char success[] = "fcntl-forwarding-ok";
+          int status = 10;
+
+          if (argc != 2) {
+            goto done;
+          }
+
+          status = 11;
+          if (pipe(descriptors) != 0) {
+            goto done;
+          }
+
+          status = 12;
+          if (fcntl(descriptors[0], F_SETFD, FD_CLOEXEC) != 0) {
+            goto done;
+          }
+
+          status = 13;
+          if ((fcntl(descriptors[0], F_GETFD) & FD_CLOEXEC) == 0) {
+            goto done;
+          }
+
+          status = 14;
+          if (fcntl(descriptors[1], F_SETNOSIGPIPE, 1) != 0) {
+            goto done;
+          }
+
+          status = 15;
+          if (fcntl(descriptors[1], F_GETNOSIGPIPE) != 1) {
+            goto done;
+          }
+
+          status = 16;
+          path_fd = open(argv[1], O_CREAT | O_RDWR, 0600);
+
+          if (path_fd < 0) {
+            goto done;
+          }
+
+          status = 17;
+          if (fcntl(path_fd, F_GETPATH, path) != 0) {
+            goto done;
+          }
+
+          status = 18;
+          if (path[0] != '/') {
+            goto done;
+          }
+
+          status = 19;
+          if (write(STDOUT_FILENO, success, sizeof(success) - 1) !=
+              (ssize_t)(sizeof(success) - 1)) {
+            goto done;
+          }
+
+          status = 0;
+
+        done:
+          if (path_fd >= 0) {
+            close(path_fd);
+          }
+
+          if (descriptors[0] >= 0) {
+            close(descriptors[0]);
+          }
+
+          if (descriptors[1] >= 0) {
+            close(descriptors[1]);
+          }
+
+          return status;
+        }
+        """)
+
+        compiler = System.find_executable("cc") || raise "C compiler is unavailable"
+
+        case System.cmd(
+               compiler,
+               ["-std=c11", "-Wall", "-Wextra", "-Werror", source, "-o", executable],
+               stderr_to_stdout: true
+             ) do
+          {"", 0} -> executable
+          {output, status} -> raise "fcntl forwarding probe compile failed: #{status}: #{output}"
+        end
+
+      {:unix, _name} ->
+        nil
     end
   end
 
