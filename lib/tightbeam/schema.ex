@@ -85,7 +85,10 @@ defmodule Tightbeam.Schema do
   # mechanical status from its sole durable input and advances v11 to v12.
   # Ruled-decision integrity then rebuilds `decision_requests` from that exact
   # shape, so a ruled status cannot exist without its decision, ruler, and time.
-  @shape "coordination-fabric-v1-phase1-v13"
+  # Cursor provider support widens the two persisted harness/provider CHECKs
+  # from the exact v13 predecessor without changing any main-owned column.
+  @shape "coordination-fabric-v1-phase1-v14"
+  @cursor_provider_previous_shape "coordination-fabric-v1-phase1-v13"
   @ruled_decision_integrity_previous_shape "coordination-fabric-v1-phase1-v12"
   @session_mechanical_status_previous_shape "coordination-fabric-v1-phase1-v11"
   @effort_request_exit_previous_shape "coordination-fabric-v1-phase1-v10"
@@ -96,6 +99,18 @@ defmodule Tightbeam.Schema do
   @cold_start_previous_shape "coordination-fabric-v1-phase1-v5"
   @operational_parent_shape "coordination-fabric-v1-phase1-v5"
   @operational_parent_previous_shape "coordination-fabric-v1-phase1-v4"
+
+  @cursor_session_columns "sessionKey,displayName,kind,orderIndex,isBuiltIn,adopted," <>
+                            "ownerUserId,origin,spawnedBy,operationalParent,handle,archetype," <>
+                            "overrides,identityName,identityRevision,identityRenderContract," <>
+                            "identityGuidanceDigest,cliToken,harness,provider,model,thinkingLevel," <>
+                            "modelContext,host,clearedThroughSeq,state,mechanicalStatus,createdAt,updatedAt"
+  @cursor_marker_columns "id,kind,principal,subagentRef,sourceEventRef,harness,at,assignmentId"
+  @cursor_provider_values "'anthropic','openai','cursor'" <>
+                            if(Application.compile_env(:tightbeam, :fixture_harness, false),
+                              do: ",'fixture_provider'",
+                              else: ""
+                            )
 
   @supervision_liveness_objects [
     %{
@@ -1818,33 +1833,42 @@ defmodule Tightbeam.Schema do
       {:ok, [[@shape]]} ->
         :ok
 
+      {:ok, [[@cursor_provider_previous_shape]]} ->
+        migrate_cursor_provider_v1_020(db)
+
       {:ok, [[@ruled_decision_integrity_previous_shape]]} ->
-        upgrade_ruled_decision_integrity_v1(db)
+        :ok = upgrade_ruled_decision_integrity_v1(db)
+        migrate_cursor_provider_v1_020(db)
 
       {:ok, [[@session_mechanical_status_previous_shape]]} ->
-        upgrade_session_mechanical_status_v1(db)
+        :ok = upgrade_session_mechanical_status_v1(db)
+        migrate_cursor_provider_v1_020(db)
 
       {:ok, [[@effort_request_exit_previous_shape]]} ->
         :ok = upgrade_effort_request_exit_v1(db)
-        upgrade_session_mechanical_status_v1(db)
+        :ok = upgrade_session_mechanical_status_v1(db)
+        migrate_cursor_provider_v1_020(db)
 
       {:ok, [[@identity_render_stamp_previous_shape]]} ->
         :ok = upgrade_identity_render_stamp_v1(db)
         :ok = upgrade_effort_request_exit_v1(db)
-        upgrade_session_mechanical_status_v1(db)
+        :ok = upgrade_session_mechanical_status_v1(db)
+        migrate_cursor_provider_v1_020(db)
 
       {:ok, [[@nullable_effective_parent_previous_shape]]} ->
         :ok = upgrade_nullable_effective_parent_v1(db)
         :ok = upgrade_identity_render_stamp_v1(db)
         :ok = upgrade_effort_request_exit_v1(db)
-        upgrade_session_mechanical_status_v1(db)
+        :ok = upgrade_session_mechanical_status_v1(db)
+        migrate_cursor_provider_v1_020(db)
 
       {:ok, [[@terminal_decision_previous_shape]]} ->
         :ok = upgrade_terminal_operator_decision_v1(db)
         :ok = upgrade_nullable_effective_parent_v1(db)
         :ok = upgrade_identity_render_stamp_v1(db)
         :ok = upgrade_effort_request_exit_v1(db)
-        upgrade_session_mechanical_status_v1(db)
+        :ok = upgrade_session_mechanical_status_v1(db)
+        migrate_cursor_provider_v1_020(db)
 
       {:ok, [[@message_type_previous_shape]]} ->
         :ok = upgrade_message_type_v1(db)
@@ -1852,7 +1876,8 @@ defmodule Tightbeam.Schema do
         :ok = upgrade_nullable_effective_parent_v1(db)
         :ok = upgrade_identity_render_stamp_v1(db)
         :ok = upgrade_effort_request_exit_v1(db)
-        upgrade_session_mechanical_status_v1(db)
+        :ok = upgrade_session_mechanical_status_v1(db)
+        migrate_cursor_provider_v1_020(db)
 
       {:ok, [[@cold_start_previous_shape]]} ->
         :ok = upgrade_cold_start_v1(db)
@@ -1861,7 +1886,8 @@ defmodule Tightbeam.Schema do
         :ok = upgrade_nullable_effective_parent_v1(db)
         :ok = upgrade_identity_render_stamp_v1(db)
         :ok = upgrade_effort_request_exit_v1(db)
-        upgrade_session_mechanical_status_v1(db)
+        :ok = upgrade_session_mechanical_status_v1(db)
+        migrate_cursor_provider_v1_020(db)
 
       {:ok, [[@operational_parent_previous_shape]]} ->
         :ok = upgrade_operational_parent_v1(db)
@@ -1871,7 +1897,8 @@ defmodule Tightbeam.Schema do
         :ok = upgrade_nullable_effective_parent_v1(db)
         :ok = upgrade_identity_render_stamp_v1(db)
         :ok = upgrade_effort_request_exit_v1(db)
-        upgrade_session_mechanical_status_v1(db)
+        :ok = upgrade_session_mechanical_status_v1(db)
+        migrate_cursor_provider_v1_020(db)
 
       {:ok, []} ->
         # No stamp. Either a database this build is about to create, or one
@@ -1894,7 +1921,8 @@ defmodule Tightbeam.Schema do
         #{@identity_render_stamp_previous_shape},
         #{@effort_request_exit_previous_shape}, and
         #{@session_mechanical_status_previous_shape}, and
-        #{@ruled_decision_integrity_previous_shape}.
+        #{@ruled_decision_integrity_previous_shape}, and
+        #{@cursor_provider_previous_shape}.
         Move this database aside and let it be recreated.
         """
 
@@ -1912,6 +1940,163 @@ defmodule Tightbeam.Schema do
         assembled by something else. Move it aside and let it be recreated.
         """
     end
+  end
+
+  defp migrate_cursor_provider_v1_020(db) do
+    :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
+
+    try do
+      case DB.transaction(db, &migrate_cursor_provider_v1_020_in_txn/1) do
+        {:ok, :ok} ->
+          :ok
+
+        {:error, %ShapeError{} = error} ->
+          raise error
+
+        {:error, error} ->
+          raise ShapeError,
+            message:
+              "migration #{@cursor_provider_previous_shape} -> #{@shape} failed and was rolled back: #{Exception.message(error)}"
+      end
+    after
+      :ok = DB.execute(db, "PRAGMA foreign_keys = ON")
+    end
+  end
+
+  defp migrate_cursor_provider_v1_020_in_txn(%Txn{} = txn) do
+    harnesses = Enum.map_join(Tightbeam.Harness.all(), ",", &"'#{&1.wire_name()}'")
+
+    :ok =
+      Txn.exec(
+        txn,
+        """
+        CREATE TABLE sessions_cursor_provider_v1_020 (
+          sessionKey TEXT PRIMARY KEY, displayName TEXT NOT NULL,
+          kind TEXT NOT NULL DEFAULT 'custom' CHECK (kind IN ('main','dm','custom')),
+          orderIndex INTEGER NOT NULL DEFAULT 0, isBuiltIn INTEGER NOT NULL DEFAULT 0,
+          adopted INTEGER NOT NULL DEFAULT 0, ownerUserId TEXT NOT NULL, origin TEXT NOT NULL,
+          spawnedBy TEXT, operationalParent TEXT REFERENCES sessions_cursor_provider_v1_020(sessionKey),
+          handle TEXT UNIQUE, archetype TEXT NOT NULL, overrides TEXT, identityName TEXT,
+          identityRevision TEXT, identityRenderContract TEXT, identityGuidanceDigest TEXT,
+          cliToken TEXT, harness TEXT NOT NULL CHECK (harness IN (#{harnesses})),
+          provider TEXT NOT NULL CHECK (provider IN (#{@cursor_provider_values})),
+          model TEXT NOT NULL, thinkingLevel TEXT, modelContext TEXT,
+          host TEXT NOT NULL DEFAULT 'local', clearedThroughSeq INTEGER NOT NULL DEFAULT 0,
+          state TEXT NOT NULL DEFAULT 'active' CHECK (state IN ('active','retired')),
+          mechanicalStatus TEXT NOT NULL DEFAULT 'idle'
+            CHECK (mechanicalStatus IN ('idle','running')),
+          createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL
+        );
+        CREATE TABLE subagent_markers_cursor_provider_v1_020 (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          kind TEXT NOT NULL CHECK (kind IN ('subagent_start','subagent_stop')),
+          principal TEXT NOT NULL REFERENCES sessions_cursor_provider_v1_020(sessionKey),
+          subagentRef TEXT NOT NULL, sourceEventRef TEXT NOT NULL,
+          harness TEXT NOT NULL CHECK (harness IN (#{harnesses})),
+          at INTEGER NOT NULL, assignmentId TEXT, UNIQUE (kind, sourceEventRef)
+        );
+        """
+      )
+
+    [[session_count]] = Txn.q(txn, "SELECT COUNT(*) FROM sessions")
+    [[marker_count]] = Txn.q(txn, "SELECT COUNT(*) FROM subagent_markers")
+
+    marker_sequence =
+      case Txn.q(txn, "SELECT seq FROM sqlite_sequence WHERE name='subagent_markers'") do
+        [] -> 0
+        [[sequence]] -> sequence
+      end
+
+    copy_exact_table!(
+      txn,
+      "sessions",
+      "sessions_cursor_provider_v1_020",
+      @cursor_session_columns,
+      session_count
+    )
+
+    copy_exact_table!(
+      txn,
+      "subagent_markers",
+      "subagent_markers_cursor_provider_v1_020",
+      @cursor_marker_columns,
+      marker_count
+    )
+
+    :ok =
+      Txn.exec(
+        txn,
+        """
+        DROP INDEX IF EXISTS subagent_markers_one_stop;
+        DROP INDEX IF EXISTS subagent_markers_principal;
+        DROP TABLE subagent_markers;
+        DROP INDEX IF EXISTS sessions_owner;
+        DROP INDEX IF EXISTS sessions_cli_token;
+        DROP TABLE sessions;
+        ALTER TABLE sessions_cursor_provider_v1_020 RENAME TO sessions;
+        ALTER TABLE subagent_markers_cursor_provider_v1_020 RENAME TO subagent_markers;
+        CREATE INDEX sessions_owner ON sessions (ownerUserId, state);
+        CREATE UNIQUE INDEX sessions_cli_token ON sessions(cliToken);
+        CREATE UNIQUE INDEX subagent_markers_one_stop
+          ON subagent_markers (subagentRef) WHERE kind = 'subagent_stop';
+        CREATE INDEX subagent_markers_principal ON subagent_markers (principal, id);
+        """
+      )
+
+    [[rebuilt_marker_sequence]] =
+      Txn.q(txn, "SELECT COALESCE(MAX(id), 0) FROM subagent_markers")
+
+    marker_sequence = max(marker_sequence, rebuilt_marker_sequence)
+
+    Txn.q(txn, "UPDATE sqlite_sequence SET seq=?1 WHERE name='subagent_markers'", [
+      marker_sequence
+    ])
+
+    if Txn.changes(txn) == 0 do
+      Txn.q(txn, "INSERT INTO sqlite_sequence(name, seq) VALUES ('subagent_markers', ?1)", [
+        marker_sequence
+      ])
+    end
+
+    case Txn.q(txn, "PRAGMA foreign_key_check") do
+      [] -> :ok
+      rows -> incompatible_cursor_provider!("left invalid foreign keys: #{inspect(rows)}")
+    end
+
+    Txn.q(txn, "UPDATE schema_stamp SET shape=?1, stampedAt=?2 WHERE shape=?3", [
+      @shape,
+      System.system_time(:millisecond),
+      @cursor_provider_previous_shape
+    ])
+
+    if Txn.changes(txn) != 1,
+      do: incompatible_cursor_provider!("lost its exact stamp transition")
+
+    :ok
+  end
+
+  defp copy_exact_table!(txn, source, target, columns, expected_count) do
+    Txn.q(txn, "INSERT INTO #{target} (#{columns}) SELECT #{columns} FROM #{source}")
+
+    if Txn.changes(txn) != expected_count,
+      do:
+        incompatible_cursor_provider!(
+          "copied #{Txn.changes(txn)} of #{expected_count} rows from #{source}"
+        )
+
+    case Txn.q(txn, "SELECT #{columns} FROM #{source} EXCEPT SELECT #{columns} FROM #{target}") do
+      [] -> :ok
+      rows -> incompatible_cursor_provider!("changed #{source} rows: #{inspect(rows)}")
+    end
+
+    case Txn.q(txn, "SELECT #{columns} FROM #{target} EXCEPT SELECT #{columns} FROM #{source}") do
+      [] -> :ok
+      rows -> incompatible_cursor_provider!("invented #{target} rows: #{inspect(rows)}")
+    end
+  end
+
+  defp incompatible_cursor_provider!(detail) do
+    raise ShapeError, message: "incompatible_cursor_provider_v1_020: #{detail}"
   end
 
   # A FRESH DATABASE MUST NEVER BE REFUSED, which is why the stamp is written

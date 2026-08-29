@@ -34,7 +34,8 @@ defmodule Tightbeam.SchemaShapeTest do
 
   alias Tightbeam.{DB, Model, Org, Projection, Schema, Supervision}
 
-  @shape "coordination-fabric-v1-phase1-v13"
+  @shape "coordination-fabric-v1-phase1-v14"
+  @cursor_provider_previous_shape "coordination-fabric-v1-phase1-v13"
 
   setup do
     name = :"schema_shape_#{System.unique_integer([:positive])}"
@@ -53,6 +54,75 @@ defmodule Tightbeam.SchemaShapeTest do
 
     assert {:ok, [[@shape]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert :ok =
+             DB.execute(db, """
+             INSERT INTO users (userId, isAdmin, createdAt) VALUES ('george', 1, 1);
+             INSERT INTO sessions
+               (sessionKey, displayName, ownerUserId, origin, archetype, harness,
+                provider, model, createdAt, updatedAt)
+             VALUES ('cursor-session', 'cursor', 'george', 'user:george', 'coder',
+                     'cursor', 'cursor', 'auto', 1, 1);
+             INSERT INTO subagent_markers
+               (kind, principal, subagentRef, sourceEventRef, harness, at)
+             VALUES ('subagent_start', 'cursor-session', 'sub', 'event', 'cursor', 1);
+             """)
+  end
+
+  test "the exact v13 predecessor widens Cursor provider constraints and preserves rows", %{
+    db: db
+  } do
+    assert :ok = Schema.ensure_all(db)
+
+    assert :ok =
+             DB.execute(db, """
+             INSERT INTO users (userId, isAdmin, createdAt) VALUES ('mike', 1, 1);
+             INSERT INTO sessions
+               (sessionKey, displayName, ownerUserId, origin, archetype, harness,
+                provider, model, createdAt, updatedAt)
+             VALUES ('existing', 'existing', 'mike', 'user:mike', 'coder',
+                     'codex', 'openai', 'fixture-model', 1, 1);
+             INSERT INTO subagent_markers
+               (kind, principal, subagentRef, sourceEventRef, harness, at)
+             VALUES ('subagent_start', 'existing', 'sub-existing', 'event-existing',
+                     'codex', 2);
+             INSERT INTO subagent_markers
+               (id, kind, principal, subagentRef, sourceEventRef, harness, at)
+             VALUES (100, 'subagent_start', 'existing', 'sub-deleted', 'event-deleted',
+                     'codex', 3);
+             DELETE FROM subagent_markers WHERE id = 100;
+             UPDATE schema_stamp SET shape='#{@cursor_provider_previous_shape}', stampedAt=1;
+             """)
+
+    assert :ok = Schema.ensure_all(db)
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok, [["existing", "codex", "openai", "idle"]]} =
+             DB.query(
+               db,
+               "SELECT sessionKey,harness,provider,mechanicalStatus FROM sessions"
+             )
+
+    assert {:ok, [["sub-existing", "codex"]]} =
+             DB.query(db, "SELECT subagentRef,harness FROM subagent_markers")
+
+    assert :ok =
+             DB.execute(db, """
+             INSERT INTO sessions
+               (sessionKey, displayName, ownerUserId, origin, archetype, harness,
+                provider, model, createdAt, updatedAt)
+             VALUES ('cursor-after-migration', 'cursor', 'mike', 'user:mike', 'coder',
+                     'cursor', 'cursor', 'auto', 3, 3);
+             INSERT INTO subagent_markers
+               (kind, principal, subagentRef, sourceEventRef, harness, at)
+             VALUES ('subagent_start', 'cursor-after-migration', 'sub-cursor',
+                     'event-cursor', 'cursor', 4);
+             """)
+
+    assert {:ok, [[next_marker_id]]} =
+             DB.query(db, "SELECT id FROM subagent_markers WHERE subagentRef='sub-cursor'")
+
+    assert next_marker_id > 100
   end
 
   test "the exact v9 predecessor gains nullable identity render stamps", %{db: db} do
