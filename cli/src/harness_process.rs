@@ -11,14 +11,18 @@ use std::path::Path;
 use std::process::Command;
 
 pub fn session_exec(args: &[String]) -> Result<i32, String> {
-    session_exec_with_mode(args, 0o600)
+    session_exec_with_mode(args, 0o600, None)
 }
 
 pub fn cursor_session_exec(args: &[String]) -> Result<i32, String> {
-    session_exec_with_mode(args, 0o640)
+    session_exec_with_mode(args, 0o640, Some("/usr/bin:/bin:/usr/sbin:/sbin"))
 }
 
-fn session_exec_with_mode(args: &[String], identity_mode: u32) -> Result<i32, String> {
+fn session_exec_with_mode(
+    args: &[String],
+    identity_mode: u32,
+    fixed_path: Option<&str>,
+) -> Result<i32, String> {
     let separator = args.iter().position(|arg| arg == "--").ok_or_else(|| {
         "usage: tightbeam harness-exec <identity-path> <launch-id> -- <command> [args...]"
             .to_string()
@@ -79,9 +83,12 @@ fn session_exec_with_mode(args: &[String], identity_mode: u32) -> Result<i32, St
         .and_then(|_| identity.sync_all())
         .map_err(|error| format!("harness identity could not be written: {error}"))?;
 
-    let error = Command::new(&args[separator + 1])
-        .args(&args[separator + 2..])
-        .exec();
+    let mut command = Command::new(&args[separator + 1]);
+    command.args(&args[separator + 2..]);
+    if let Some(path) = fixed_path {
+        command.env("PATH", path);
+    }
+    let error = command.exec();
 
     Err(format!("harness command could not be executed: {error}"))
 }
@@ -346,5 +353,30 @@ mod tests {
         assert_eq!(fs::read_to_string(&target).unwrap(), "target identity");
         fs::remove_file(path).unwrap();
         fs::remove_file(target).unwrap();
+    }
+
+    #[test]
+    fn cursor_session_exec_replaces_the_inherited_path() {
+        let identity = test_path("cursor-identity");
+        let output = test_path("cursor-path");
+        let script = format!("printf %s \"$PATH\" > {}", output.display());
+
+        assert_eq!(
+            cursor_session_exec(&[
+                identity.to_string_lossy().into_owned(),
+                "launch".into(),
+                "--".into(),
+                "/bin/sh".into(),
+                "-c".into(),
+                script,
+            ]),
+            Ok(0)
+        );
+        assert_eq!(
+            fs::read_to_string(&output).unwrap(),
+            "/usr/bin:/bin:/usr/sbin:/sbin"
+        );
+        fs::remove_file(identity).unwrap();
+        fs::remove_file(output).unwrap();
     }
 }

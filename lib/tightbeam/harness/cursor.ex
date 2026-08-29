@@ -660,14 +660,6 @@ defmodule Tightbeam.Harness.Cursor do
          do: Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
   end
 
-  @doc false
-  def execution_rails_sha256(home_override) do
-    execution_home(home_override)
-    |> Path.join(@rails_file)
-    |> File.read!()
-    |> then(&Base.encode16(:crypto.hash(:sha256, &1), case: :lower))
-  end
-
   defp adapter_binary(target) do
     Map.get(target, :adapter_binary) ||
       Path.join([

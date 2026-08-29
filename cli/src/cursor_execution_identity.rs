@@ -21,7 +21,7 @@ pub fn launcher_command_allowed(args: &[String]) -> bool {
     args.first().is_some_and(|arg| arg == "cursor-exec")
 }
 
-pub fn require_onboard_prerequisite() -> Result<(), String> {
+pub fn require_onboard_prerequisite(machine: &str) -> Result<(), String> {
     let base = crate::base_dir::resolve();
     let operator_uid = unsafe { libc::geteuid() }.to_string();
     #[allow(deprecated)]
@@ -61,7 +61,7 @@ pub fn require_onboard_prerequisite() -> Result<(), String> {
     result.map_err(|reason| {
         format!(
             "{reason}\n\n{}",
-            admin_instructions(&base, &operator_home, &executable)
+            admin_instructions(&base, &operator_home, &executable, machine)
         )
     })
 }
@@ -87,11 +87,11 @@ fn verify_dedicated_cursor_install(account: &Account) -> Result<(), String> {
         })?;
         if metadata.file_type().is_symlink()
             || !metadata.is_file()
-            || metadata.uid() != account.uid
+            || metadata.uid() != 0
             || metadata.permissions().mode() & 0o022 != 0
         {
             return Err(format!(
-                "dedicated Cursor bundle file {} must be owned by {ACCOUNT}, must not be a symlink, and must not be group/world writable",
+                "dedicated Cursor bundle file {} must be owned by root, must not be a symlink, and must not be group/world writable",
                 path.display()
             ));
         }
@@ -135,7 +135,12 @@ fn verify_account_policy() -> Result<(), String> {
     Ok(())
 }
 
-fn admin_instructions(base: &Path, operator_home: &Path, executable: &Path) -> String {
+fn admin_instructions(
+    base: &Path,
+    operator_home: &Path,
+    executable: &Path,
+    machine: &str,
+) -> String {
     if cfg!(target_os = "macos") {
         format!(
             "An administrator must provision the dedicated Cursor identity. Tightbeam never runs these commands itself:\n\n\
@@ -157,14 +162,16 @@ fn admin_instructions(base: &Path, operator_home: &Path, executable: &Path) -> S
              sudo -u {ACCOUNT} -H /usr/bin/ssh-keygen -q -t ed25519 -N '' -C tightbeam-cursor -f /Users/{ACCOUNT}/.ssh/id_ed25519\n\
              sudo mkdir -p /Users/{ACCOUNT}/.tightbeam /Users/{ACCOUNT}/.cursor {base}/work\n\
              sudo chown -R {ACCOUNT}:tightbeam-workspace /Users/{ACCOUNT}\n\
+             sudo chown -R root:tightbeam-workspace /Users/{ACCOUNT}/.local/share/cursor-agent/versions/{CURSOR_VERSION}\n\
+             sudo chmod -R go-w /Users/{ACCOUNT}/.local/share/cursor-agent/versions/{CURSOR_VERSION}\n\
              sudo chmod 0710 /Users/{ACCOUNT}\n\
              sudo chmod 2770 /Users/{ACCOUNT}/.tightbeam /Users/{ACCOUNT}/.cursor\n\
              sudo chgrp tightbeam-workspace {base}/work\n\
              sudo chmod -R g+rwX {base}/work\n\
              sudo chmod 2770 {base}/work\n\
-             sudo mkdir -p {base}/homes/gd-mbp/cursor/.tightbeam/harness-processes\n\
-             sudo chown -R $USER:tightbeam-workspace {base}/homes/gd-mbp/cursor\n\
-             sudo chmod 2770 {base}/homes/gd-mbp/cursor/.tightbeam {base}/homes/gd-mbp/cursor/.tightbeam/harness-processes\n\
+             sudo mkdir -p {base}/homes/{machine}/cursor/.tightbeam/harness-processes\n\
+             sudo chown -R $USER:tightbeam-workspace {base}/homes/{machine}/cursor\n\
+             sudo chmod 2770 {base}/homes/{machine}/cursor/.tightbeam {base}/homes/{machine}/cursor/.tightbeam/harness-processes\n\
              sudo chgrp tightbeam-workspace {base}/auth\n\
              sudo chmod 0710 {base}/auth\n\
              sudo chgrp -R tightbeam-workspace {base}/auth/github\n\
@@ -174,12 +181,13 @@ fn admin_instructions(base: &Path, operator_home: &Path, executable: &Path) -> S
              test ! -e {operator_home}/.pi || sudo chmod 0700 {operator_home}/.pi\n\
              sudo mkdir -p /usr/local/libexec\n\
              sudo install -o root -g wheel -m 0755 {executable} {LAUNCHER}\n\
-             printf 'Defaults!{LAUNCHER} env_keep += \"CURSOR_API_KEY AGENT_CLI_CREDENTIAL_STORE CURSOR_CONFIG_DIR TIGHTBEAM_HOME TIGHTBEAM_MACHINE TIGHTBEAM_LINEAGE GH_CONFIG_DIR PATH\"\\nDefaults!{LAUNCHER} !secure_path\\n%tightbeam-workspace ALL=({ACCOUNT}) NOPASSWD: {LAUNCHER} *\\n' | sudo tee /etc/sudoers.d/tightbeam-cursor >/dev/null\n\
+             printf 'Defaults!{LAUNCHER} env_keep += \"CURSOR_API_KEY AGENT_CLI_CREDENTIAL_STORE CURSOR_CONFIG_DIR TIGHTBEAM_HOME TIGHTBEAM_MACHINE TIGHTBEAM_LINEAGE GH_CONFIG_DIR\"\\n%tightbeam-workspace ALL=({ACCOUNT}) NOPASSWD: {LAUNCHER} *\\n' | sudo tee /etc/sudoers.d/tightbeam-cursor >/dev/null\n\
              sudo chmod 0440 /etc/sudoers.d/tightbeam-cursor\n\
              sudo visudo -cf /etc/sudoers.d/tightbeam-cursor",
             base = base.display(),
             operator_home = operator_home.display(),
-            executable = executable.display()
+            executable = executable.display(),
+            machine = machine
         )
     } else {
         format!(
@@ -195,14 +203,16 @@ fn admin_instructions(base: &Path, operator_home: &Path, executable: &Path) -> S
              sudo -u {ACCOUNT} -H /usr/bin/ssh-keygen -q -t ed25519 -N '' -C tightbeam-cursor -f /home/{ACCOUNT}/.ssh/id_ed25519\n\
              sudo mkdir -p /home/{ACCOUNT}/.tightbeam /home/{ACCOUNT}/.cursor {base}/work\n\
              sudo chown -R {ACCOUNT}:tightbeam-workspace /home/{ACCOUNT}\n\
+             sudo chown -R root:tightbeam-workspace /home/{ACCOUNT}/.local/share/cursor-agent/versions/{CURSOR_VERSION}\n\
+             sudo chmod -R go-w /home/{ACCOUNT}/.local/share/cursor-agent/versions/{CURSOR_VERSION}\n\
              sudo chmod 0710 /home/{ACCOUNT}\n\
              sudo chmod 2770 /home/{ACCOUNT}/.tightbeam /home/{ACCOUNT}/.cursor\n\
              sudo chgrp tightbeam-workspace {base}/work\n\
              sudo chmod -R g+rwX {base}/work\n\
              sudo chmod 2770 {base}/work\n\
-             sudo mkdir -p {base}/homes/sirius/cursor/.tightbeam/harness-processes\n\
-             sudo chown -R $USER:tightbeam-workspace {base}/homes/sirius/cursor\n\
-             sudo chmod 2770 {base}/homes/sirius/cursor/.tightbeam {base}/homes/sirius/cursor/.tightbeam/harness-processes\n\
+             sudo mkdir -p {base}/homes/{machine}/cursor/.tightbeam/harness-processes\n\
+             sudo chown -R $USER:tightbeam-workspace {base}/homes/{machine}/cursor\n\
+             sudo chmod 2770 {base}/homes/{machine}/cursor/.tightbeam {base}/homes/{machine}/cursor/.tightbeam/harness-processes\n\
              sudo chgrp tightbeam-workspace {base}/auth\n\
              sudo chmod 0710 {base}/auth\n\
              sudo chgrp -R tightbeam-workspace {base}/auth/github\n\
@@ -212,12 +222,13 @@ fn admin_instructions(base: &Path, operator_home: &Path, executable: &Path) -> S
              test ! -e {operator_home}/.pi || sudo chmod 0700 {operator_home}/.pi\n\
              sudo mkdir -p /usr/local/libexec\n\
              sudo install -o root -g root -m 0755 {executable} {LAUNCHER}\n\
-             printf 'Defaults!{LAUNCHER} env_keep += \"CURSOR_API_KEY AGENT_CLI_CREDENTIAL_STORE CURSOR_CONFIG_DIR TIGHTBEAM_HOME TIGHTBEAM_MACHINE TIGHTBEAM_LINEAGE GH_CONFIG_DIR PATH\"\\nDefaults!{LAUNCHER} !secure_path\\n%tightbeam-workspace ALL=({ACCOUNT}) NOPASSWD: {LAUNCHER} *\\n' | sudo tee /etc/sudoers.d/tightbeam-cursor >/dev/null\n\
+             printf 'Defaults!{LAUNCHER} env_keep += \"CURSOR_API_KEY AGENT_CLI_CREDENTIAL_STORE CURSOR_CONFIG_DIR TIGHTBEAM_HOME TIGHTBEAM_MACHINE TIGHTBEAM_LINEAGE GH_CONFIG_DIR\"\\n%tightbeam-workspace ALL=({ACCOUNT}) NOPASSWD: {LAUNCHER} *\\n' | sudo tee /etc/sudoers.d/tightbeam-cursor >/dev/null\n\
              sudo chmod 0440 /etc/sudoers.d/tightbeam-cursor\n\
              sudo visudo -cf /etc/sudoers.d/tightbeam-cursor",
             base = base.display(),
             operator_home = operator_home.display(),
-            executable = executable.display()
+            executable = executable.display(),
+            machine = machine
         )
     }
 }
@@ -481,7 +492,6 @@ fn canonical_directory(path: &Path, label: &str) -> Result<PathBuf, String> {
 struct Account {
     name: String,
     home: PathBuf,
-    uid: u32,
 }
 
 fn account_named(name: &str) -> Result<Account, String> {
@@ -534,11 +544,7 @@ fn account_from_passwd(pwd: &libc::passwd) -> Result<Account, String> {
             .to_string_lossy()
             .into_owned(),
     );
-    Ok(Account {
-        name,
-        home,
-        uid: pwd.pw_uid,
-    })
+    Ok(Account { name, home })
 }
 
 fn usage() -> &'static str {
@@ -607,6 +613,7 @@ mod tests {
             Path::new("/srv/tightbeam"),
             Path::new("/Users/operator"),
             Path::new("/build/tightbeam"),
+            "test-machine",
         );
         assert!(!instructions.contains("HOME="));
         assert!(instructions.contains(ACCOUNT));
@@ -617,6 +624,10 @@ mod tests {
         assert!(instructions.contains("/Users/operator/.cursor"));
         assert!(instructions.contains("IsHidden 1"));
         assert!(instructions.contains("/build/tightbeam"));
+        assert!(instructions.contains("/homes/test-machine/cursor"));
+        assert!(instructions.contains("chown -R root:tightbeam-workspace"));
+        assert!(!instructions.contains("GH_CONFIG_DIR PATH"));
+        assert!(!instructions.contains("!secure_path"));
     }
 
     #[test]
