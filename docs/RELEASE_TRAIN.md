@@ -9,12 +9,13 @@ The 0.1 line uses per-version scratchpad branches. The highest `0.1.*` branch (c
 tip, run proof at that tag SHA, spin the successor branch from the same tip, and never move
 the released version branch again.
 
-## 0.1.9 nullable effective-parent change
+## Parent routing for existing 0.1.9 sessions changes on upgrade
 
-Existing sessions keep `spawnedBy` as provenance. Their operational parent is nullable:
-when it is absent, readers resolve the owner’s canonical Main key without creating a Main
-row. This makes historical sessions visible through the same parent contract as newly
-linked sessions while preserving the original spawn record.
+Every pre-feature session receives a null stored operational parent. The shared resolver
+then selects its owner’s Main for parent escalation. Delivery still requires that Main row
+to exist and be eligible; otherwise the consumer records its named missing-target result.
+`spawnedBy` remains unchanged as provenance. No personal Main row is created during the
+migration.
 
 The old `release-candidate/*` mechanism and `0.1.x` series branch are retired. Do not create,
 advance, or retain candidate branches. The contract below remains only to explain historical

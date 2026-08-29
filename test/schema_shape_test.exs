@@ -39,6 +39,7 @@ defmodule Tightbeam.SchemaShapeTest do
   @operator_decision_shape "operator-decision-requests-v1"
   @model_identity_shape "model-identity-v1"
   @be61_shape "model-identity-message-envelope-v2"
+  @notice_batching_predecessor "7eec98b7848340ae00e2b564a4eb97c0f429a445"
 
   # Captured from Schema.ensure_all/1 at be61cfc98df6b18c0cc280adeca42cba3fbf14b5.
   # Keep the old table exact: its missing ruledViaSessionKey column is why this
@@ -152,48 +153,40 @@ defmodule Tightbeam.SchemaShapeTest do
              )
   end
 
-  test "the exact batching predecessor preserves a historical null controller root", %{db: db} do
-    assert :ok = Schema.ensure_all(db)
+  test "the exact 7eec98b predecessor migrates and refuses the successor stamp before writes" do
+    %{db_path: db_path, source: source, cleanup: cleanup} = predecessor_capture!()
+    on_exit(cleanup)
 
-    :ok = DB.execute(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1)")
-    _root = session(db, "root", "flynn")
-    _child = session(db, "child", "flynn", spawned_by: "root")
+    name = :"schema_shape_predecessor_#{System.unique_integer([:positive])}"
+    {:ok, pid} = DB.start_link(path: db_path, name: name)
 
-    downgrade_to_notice_batching(db)
+    try do
+      refute "operationalParent" in table_columns(name, "sessions")
+      refute "rootTurnSeq" in table_columns(name, "supervision_liveness_sidecar")
 
-    :ok =
-      DB.execute(db, """
-      INSERT INTO assignments (id,subject,holderKey,openedByUser,openedAt)
-      VALUES ('asg_historical_root','historical controller','child','flynn',1);
-      INSERT INTO wakes
-        (wakeId,sessionKey,origin,prompt,consumer,dueAt,state,createdAt,assignmentId)
-      VALUES
-        ('w_historical_root','root','process:tightbeam','historical','prompt',0,'pending',1,
-         'asg_historical_root');
-      INSERT INTO supervision_liveness_sidecar
-        (wakeId,assignmentId,controllerOrigin,wakeKind,controllerState,chargedGeneration)
-      VALUES
-        ('w_historical_root','asg_historical_root','scheduled','prod','pending',1);
-      """)
+      assert {:ok, []} =
+               DB.query(
+                 name,
+                 "SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'supervision_controller_%'"
+               )
 
-    assert :ok = Schema.ensure_all(db)
-    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
-    assert "operationalParent" in table_columns(db, "sessions")
-    assert "rootTurnSeq" in table_columns(db, "supervision_liveness_sidecar")
+      assert :ok = Schema.ensure_all(name)
+      assert {:ok, [[@shape]]} = DB.query(name, "SELECT shape FROM schema_stamp")
+      assert "operationalParent" in table_columns(name, "sessions")
+      assert "rootTurnSeq" in table_columns(name, "supervision_liveness_sidecar")
+    after
+      if Process.alive?(pid), do: GenServer.stop(pid)
+    end
 
-    assert {:ok, [[nil]]} =
-             DB.query(
-               db,
-               "SELECT rootTurnSeq FROM supervision_liveness_sidecar WHERE wakeId='w_historical_root'"
-             )
+    successor_digest = :crypto.hash(:sha256, File.read!(db_path)) |> Base.encode16(case: :lower)
+    {output, 0} = predecessor_refusal!(source, db_path)
 
-    assert :ok = Schema.ensure_all(db)
+    assert output =~ "REFUSAL=this Tightbeam database was written by a different build."
+    assert output =~ "stamped: #{@shape}"
+    assert output =~ "this build: notice-batching-v1-019"
 
-    assert {:ok, [[nil]]} =
-             DB.query(
-               db,
-               "SELECT rootTurnSeq FROM supervision_liveness_sidecar WHERE wakeId='w_historical_root'"
-             )
+    assert successor_digest ==
+             :crypto.hash(:sha256, File.read!(db_path)) |> Base.encode16(case: :lower)
   end
 
   test "every nullable effective-parent migration interruption rolls back and retries", %{db: db} do
@@ -1084,6 +1077,91 @@ defmodule Tightbeam.SchemaShapeTest do
       provider: "anthropic",
       model: Model.new("fable")
     })
+  end
+
+  # The predecessor capture above is the AC-10 proof. This helper starts from
+  # today's in-memory shape only to inject failure at each successor migration
+  # boundary; it is not an assertion about the predecessor binary.
+  defp predecessor_capture! do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "nullable-effective-parent-7eec-#{System.unique_integer([:positive])}"
+      )
+
+    source = Path.join(root, "source")
+    db_path = Path.join(root, "predecessor.sqlite3")
+    repo = File.cwd!()
+
+    File.mkdir_p!(root)
+
+    {output, 0} =
+      System.cmd(
+        "git",
+        ["worktree", "add", "--detach", source, @notice_batching_predecessor],
+        cd: repo,
+        stderr_to_stdout: true
+      )
+
+    assert output =~ "HEAD is now at 7eec98b7"
+
+    try do
+      assert {_, 0} = predecessor_schema!(source, db_path, :capture)
+
+      %{
+        db_path: db_path,
+        source: source,
+        cleanup: fn ->
+          _ = System.cmd("git", ["worktree", "remove", "--force", source], cd: repo)
+          File.rm_rf!(root)
+        end
+      }
+    rescue
+      error ->
+        _ = System.cmd("git", ["worktree", "remove", "--force", source], cd: repo)
+        File.rm_rf!(root)
+        reraise error, __STACKTRACE__
+    end
+  end
+
+  defp predecessor_refusal!(source, db_path), do: predecessor_schema!(source, db_path, :refuse)
+
+  defp predecessor_schema!(source, db_path, mode) do
+    expression =
+      case mode do
+        :capture ->
+          """
+          path = #{inspect(db_path)}
+          {:ok, pid} = Tightbeam.DB.start_link(path: path, name: :nullable_parent_predecessor)
+          :ok = Tightbeam.Schema.ensure_all(:nullable_parent_predecessor)
+          :ok = GenServer.stop(pid)
+          """
+
+        :refuse ->
+          """
+          path = #{inspect(db_path)}
+          {:ok, pid} = Tightbeam.DB.start_link(path: path, name: :nullable_parent_predecessor)
+          try do
+            Tightbeam.Schema.ensure_all(:nullable_parent_predecessor)
+            raise "predecessor accepted successor shape"
+          rescue
+            error in Tightbeam.Schema.ShapeError -> IO.puts("REFUSAL=" <> Exception.message(error))
+          after
+            GenServer.stop(pid)
+          end
+          """
+      end
+
+    build = Path.join(Path.dirname(source), "build")
+    deps = Path.join(File.cwd!(), "deps")
+
+    System.cmd(
+      System.find_executable("mix") || raise("mix is required for predecessor capture"),
+      ["run", "--no-start", "-e", expression],
+      cd: source,
+      env: [{"MIX_BUILD_PATH", build}, {"MIX_DEPS_PATH", deps}],
+      stderr_to_stdout: true
+    )
   end
 
   defp downgrade_to_notice_batching(db) do
