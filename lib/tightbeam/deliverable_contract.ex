@@ -346,6 +346,10 @@ defmodule Tightbeam.DeliverableContract do
         delivers_work_item,
         capture_kind \\ "assignment_open"
       ) do
+    bind_assignment(txn, assignment, delivers_work_item, capture_kind, true)
+  end
+
+  defp bind_assignment(txn, assignment, delivers_work_item, capture_kind, capture_lineage?) do
     assignment_id = map_value(assignment, :id)
     work_item_id = map_value(assignment, :workItemId)
     holder = map_value(assignment, :holderKey)
@@ -365,7 +369,9 @@ defmodule Tightbeam.DeliverableContract do
               [assignment_id, deliverable_id, work_item_id]
             )
 
-            capture_lineage!(txn, assignment_id, work_item_id, holder, capture_kind)
+            if capture_lineage?,
+              do: capture_lineage!(txn, assignment_id, work_item_id, holder, capture_kind)
+
             :ok
 
           _ ->
@@ -391,7 +397,7 @@ defmodule Tightbeam.DeliverableContract do
           [assignment_id, id]
         )
 
-        if work_item_id,
+        if not is_nil(work_item_id) and capture_lineage?,
           do: capture_lineage!(txn, assignment_id, work_item_id, holder, capture_kind)
 
         :ok
@@ -401,15 +407,42 @@ defmodule Tightbeam.DeliverableContract do
   @doc false
   def ensure_reopen_binding_in_txn(txn, assignment) do
     assignment_id = map_value(assignment, :id)
+    work_item_id = map_value(assignment, :workItemId)
 
     if Txn.q(txn, "SELECT 1 FROM assignment_deliverables WHERE assignmentId=?1", [assignment_id]) ==
          [] do
-      case bind_assignment_in_txn(txn, assignment, false) do
+      capture_lineage? = reopen_capture_required?(txn, assignment_id, work_item_id)
+
+      case bind_assignment(txn, assignment, false, "assignment_open", capture_lineage?) do
         :ok -> :ok
         error -> raise MutationError, response: error
       end
     else
       :ok
+    end
+  end
+
+  defp reopen_capture_required?(_txn, _assignment_id, nil), do: false
+
+  defp reopen_capture_required?(txn, assignment_id, work_item_id) do
+    case Txn.q(
+           txn,
+           "SELECT workItemId FROM assignment_product_lineage_captures WHERE assignmentId=?1",
+           [assignment_id]
+         ) do
+      [] ->
+        true
+
+      [[^work_item_id]] ->
+        false
+
+      _ ->
+        raise MutationError,
+          response:
+            error(
+              "deliverable_contract_inconsistent",
+              "lineage capture does not match #{assignment_id}"
+            )
     end
   end
 

@@ -717,6 +717,113 @@ defmodule Tightbeam.DeliverableContractTest do
     assert {:ok, [[2, 2]]} = completion_counts(ctx.db, assignment.id)
   end
 
+  test "legacy terminal reopen reuses activation lineage and captures it only when missing",
+       ctx do
+    card = create_card(ctx, "Legacy terminal reopen lineage")
+    captured = assign(ctx, card.id, "Captured during activation", false)
+    missing = assign(ctx, card.id, "Missing during activation", false)
+
+    _ = complete(ctx, captured.id, "terminal before activation")
+    _ = complete(ctx, missing.id, "terminal before activation")
+
+    strip_contract_to_v9!(ctx.db)
+
+    assert :ok =
+             DeliverableContract.upgrade_v1(
+               ctx.db,
+               "coordination-fabric-v1-phase1-v9",
+               "coordination-fabric-v1-phase1-v10"
+             )
+
+    captured_lineage =
+      rows!(
+        ctx.db,
+        "SELECT assignmentId,workItemId,holderSessionKey,captureKind FROM assignment_product_lineage_captures WHERE assignmentId=?1",
+        [captured.id]
+      )
+
+    captured_ancestry =
+      rows!(
+        ctx.db,
+        "SELECT productOwnerSessionKey,distance FROM assignment_product_owner_ancestry WHERE assignmentId=?1 ORDER BY distance",
+        [captured.id]
+      )
+
+    assert captured_lineage == [[captured.id, card.id, "holder", "activation"]]
+    assert captured_ancestry != []
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "DELETE FROM assignment_product_owner_ancestry WHERE assignmentId=?1",
+               [missing.id]
+             )
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "DELETE FROM assignment_product_lineage_captures WHERE assignmentId=?1",
+               [missing.id]
+             )
+
+    reopen = fn assignment, reason ->
+      Assignments.__handle__(
+        ctx.db,
+        "reopen-assignment",
+        call("reopen-assignment", {:user, "flynn"}, nil, %{
+          assignment_id: assignment.id,
+          reason: reason
+        })
+        |> Map.put(:supervision_interval_ms, 1_000)
+      )
+    end
+
+    assert %{state: "open"} = reopen.(captured, "reuse the activation lineage")
+
+    assert captured_lineage ==
+             rows!(
+               ctx.db,
+               "SELECT assignmentId,workItemId,holderSessionKey,captureKind FROM assignment_product_lineage_captures WHERE assignmentId=?1",
+               [captured.id]
+             )
+
+    assert captured_ancestry ==
+             rows!(
+               ctx.db,
+               "SELECT productOwnerSessionKey,distance FROM assignment_product_owner_ancestry WHERE assignmentId=?1 ORDER BY distance",
+               [captured.id]
+             )
+
+    assert %{state: "open"} = reopen.(missing, "replace the absent activation lineage")
+
+    assert [[missing.id, card.id, "holder", "assignment_open"]] ==
+             rows!(
+               ctx.db,
+               "SELECT assignmentId,workItemId,holderSessionKey,captureKind FROM assignment_product_lineage_captures WHERE assignmentId=?1",
+               [missing.id]
+             )
+
+    assert rows!(
+             ctx.db,
+             "SELECT productOwnerSessionKey,distance FROM assignment_product_owner_ancestry WHERE assignmentId=?1 ORDER BY distance",
+             [missing.id]
+           ) != []
+
+    expected_bindings =
+      [captured.id, missing.id]
+      |> Enum.sort()
+      |> Enum.map(&[&1, "assignment"])
+
+    assert expected_bindings ==
+             rows!(
+               ctx.db,
+               "SELECT assignmentId,sourceKind FROM assignment_deliverables WHERE assignmentId IN (?1,?2) ORDER BY assignmentId",
+               Enum.sort([captured.id, missing.id])
+             )
+
+    assert :ok = DeliverableContract.ensure_schema(ctx.db)
+  end
+
   test "close replay and scoped keys preserve one immutable closure", ctx do
     card = create_card(ctx, "Close retry")
     assignment = assign(ctx, card.id, "Whole card", true)
