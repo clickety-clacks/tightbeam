@@ -141,7 +141,23 @@ fn admin_instructions(
     executable: &Path,
     machine: &str,
 ) -> String {
-    if cfg!(target_os = "macos") {
+    admin_instructions_for(
+        base,
+        operator_home,
+        executable,
+        machine,
+        cfg!(target_os = "macos"),
+    )
+}
+
+fn admin_instructions_for(
+    base: &Path,
+    operator_home: &Path,
+    executable: &Path,
+    machine: &str,
+    macos: bool,
+) -> String {
+    if macos {
         format!(
             "An administrator must provision the dedicated Cursor identity. Tightbeam never runs these commands itself:\n\n\
              sudo dscl . -create /Users/{ACCOUNT}\n\
@@ -609,25 +625,28 @@ mod tests {
 
     #[test]
     fn admin_instructions_never_override_home_and_cover_both_platforms() {
-        let instructions = admin_instructions(
-            Path::new("/srv/tightbeam"),
-            Path::new("/Users/operator"),
-            Path::new("/build/tightbeam"),
-            "test-machine",
-        );
-        assert!(!instructions.contains("HOME="));
-        assert!(instructions.contains(ACCOUNT));
-        assert!(instructions.contains(LAUNCHER));
-        assert!(instructions.contains("tightbeam-workspace"));
-        assert!(instructions.contains("visudo"));
-        assert!(instructions.contains(CURSOR_VERSION));
-        assert!(instructions.contains("/Users/operator/.cursor"));
-        assert!(instructions.contains("IsHidden 1"));
-        assert!(instructions.contains("/build/tightbeam"));
-        assert!(instructions.contains("/homes/test-machine/cursor"));
-        assert!(instructions.contains("chown -R root:tightbeam-workspace"));
-        assert!(!instructions.contains("GH_CONFIG_DIR PATH"));
-        assert!(!instructions.contains("!secure_path"));
+        for (macos, operator_home) in [(true, "/Users/operator"), (false, "/home/operator")] {
+            let instructions = admin_instructions_for(
+                Path::new("/srv/tightbeam"),
+                Path::new(operator_home),
+                Path::new("/build/tightbeam"),
+                "test-machine",
+                macos,
+            );
+            assert!(!instructions.contains("HOME="));
+            assert!(instructions.contains(ACCOUNT));
+            assert!(instructions.contains(LAUNCHER));
+            assert!(instructions.contains("tightbeam-workspace"));
+            assert!(instructions.contains("visudo"));
+            assert!(instructions.contains(CURSOR_VERSION));
+            assert!(instructions.contains(&format!("{operator_home}/.cursor")));
+            assert_eq!(instructions.contains("IsHidden 1"), macos);
+            assert!(instructions.contains("/build/tightbeam"));
+            assert!(instructions.contains("/homes/test-machine/cursor"));
+            assert!(instructions.contains("chown -R root:tightbeam-workspace"));
+            assert!(!instructions.contains("GH_CONFIG_DIR PATH"));
+            assert!(!instructions.contains("!secure_path"));
+        }
     }
 
     #[test]

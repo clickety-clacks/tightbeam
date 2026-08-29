@@ -159,12 +159,40 @@ where
     H: Fn(&Endpoint, Instant) -> Result<Option<HarnessCatalog>, String>,
     P: Fn(&str) -> Result<(), String>,
 {
+    onboard_with_cursor_prerequisite_and_provisioning(
+        identity,
+        provider,
+        api_key,
+        endpoint,
+        send_request,
+        load_harnesses,
+        cursor_prerequisite,
+        dispatch::provisioned(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn onboard_with_cursor_prerequisite_and_provisioning<S, H, P>(
+    identity: &Identity,
+    provider: &str,
+    api_key: bool,
+    endpoint: &Endpoint,
+    send_request: S,
+    load_harnesses: H,
+    cursor_prerequisite: P,
+    provisioned: dispatch::Provisioned,
+) -> Result<(), String>
+where
+    S: Fn(&Endpoint, &RequestSpec, Option<Instant>) -> Result<Option<serde_json::Value>, String>,
+    H: Fn(&Endpoint, Instant) -> Result<Option<HarnessCatalog>, String>,
+    P: Fn(&str) -> Result<(), String>,
+{
     let kind = if api_key { "apiKey" } else { "subscription" };
     let machine = onboard_machine(
         std::env::var("TIGHTBEAM_MACHINE")
             .ok()
             .filter(|name| !name.is_empty()),
-        dispatch::provisioned(),
+        provisioned,
     )?;
     if provider == "cursor" {
         let cursor_machine = machine.clone().unwrap_or_else(this_host);
@@ -2256,7 +2284,7 @@ mod tests {
             token: "unused".to_owned(),
             origin: crate::dispatch::Origin::Provisioned,
         };
-        let error = onboard_with_cursor_prerequisite(
+        let error = onboard_with_cursor_prerequisite_and_provisioning(
             &Identity::User("operator".to_owned()),
             "cursor",
             true,
@@ -2264,6 +2292,7 @@ mod tests {
             |_, _, _| panic!("gateway begin must not run before the prerequisite"),
             |_, _| panic!("harness lookup must not run before the prerequisite"),
             |_| Err("dedicated Cursor identity is absent".to_owned()),
+            dispatch::Provisioned::GatewayHost,
         )
         .unwrap_err();
 
