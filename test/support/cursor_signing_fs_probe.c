@@ -3,16 +3,37 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#if defined(__APPLE__)
+#include <sys/syscall.h>
+#endif
 #include <unistd.h>
 
 static volatile int failed_directory_sync = 0;
 static volatile int completed_target_rename = 0;
 static volatile int exclusive_lock_count = 0;
 static _Thread_local int inside_rename = 0;
+
+#if defined(__APPLE__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#define PROBE_FUNCTION(name) cursor_signing_probe_##name
+#define DYLD_INTERPOSE(replacement, replacee)                                 \
+  __attribute__((used)) static struct {                                       \
+    const void *replacement;                                                  \
+    const void *replacee;                                                     \
+  } interpose_##replacement __attribute__((section("__DATA,__interpose"))) = { \
+      (const void *)(unsigned long)&replacement,                              \
+      (const void *)(unsigned long)&replacee};
+#else
+#define PROBE_FUNCTION(name) name
+#endif
 
 static void touch_marker(const char *environment_name) {
   const char *path = getenv(environment_name);
@@ -26,6 +47,10 @@ static void touch_marker(const char *environment_name) {
   if (fd >= 0) {
     close(fd);
   }
+}
+
+__attribute__((constructor)) static void probe_loaded(void) {
+  touch_marker("CURSOR_SIGNING_TEST_PROBE_READY");
 }
 
 static void await_marker(const char *environment_name) {
@@ -64,13 +89,7 @@ static void after_target_rename(int result) {
   await_marker("CURSOR_SIGNING_TEST_RENAME_FINISH");
 }
 
-int fsync(int fd) {
-  static int (*real_fsync)(int) = NULL;
-
-  if (real_fsync == NULL) {
-    real_fsync = dlsym(RTLD_NEXT, "fsync");
-  }
-
+static int before_sync(int fd) {
   struct stat stat_buffer;
   const char *active_path = getenv("CURSOR_SIGNING_TEST_ACTIVE_PATH");
   const char *fail_when_active =
@@ -126,17 +145,73 @@ int fsync(int fd) {
     return -1;
   }
 
-  return real_fsync(fd);
+  return 0;
 }
 
-int flock(int fd, int operation) {
+int PROBE_FUNCTION(fsync)(int fd) {
+  if (before_sync(fd) != 0) {
+    return -1;
+  }
+
+#if defined(__APPLE__)
+  return (int)syscall(SYS_fsync, fd);
+#else
+  static int (*real_fsync)(int) = NULL;
+
+  if (real_fsync == NULL) {
+    real_fsync = dlsym(RTLD_NEXT, "fsync");
+  }
+
+  return real_fsync(fd);
+#endif
+}
+
+#if defined(__APPLE__)
+int PROBE_FUNCTION(fcntl)(int fd, int command, ...) {
+  uintptr_t argument = 0;
+
+  if ((command == F_FULLFSYNC || command == F_BARRIERFSYNC) &&
+      before_sync(fd) != 0) {
+    return -1;
+  }
+
+  switch (command) {
+  case F_GETFD:
+  case F_GETFL:
+  case F_GETOWN:
+  case F_FLUSH_DATA:
+  case F_CHKCLEAN:
+  case F_FULLFSYNC:
+  case F_BARRIERFSYNC:
+    break;
+
+  default: {
+    va_list arguments;
+    va_start(arguments, command);
+    argument = va_arg(arguments, uintptr_t);
+    va_end(arguments);
+    break;
+  }
+  }
+
+  return (int)syscall(SYS_fcntl, fd, command, argument);
+}
+#endif
+
+int PROBE_FUNCTION(flock)(int fd, int operation) {
+#if !defined(__APPLE__)
   static int (*real_flock)(int, int) = NULL;
 
   if (real_flock == NULL) {
     real_flock = dlsym(RTLD_NEXT, "flock");
   }
+#endif
 
+#if defined(__APPLE__)
+  int result = (int)syscall(SYS_flock, fd, operation);
+#else
   int result = real_flock(fd, operation);
+#endif
 
   if (result == 0 && (operation & LOCK_EX) != 0) {
     int ordinal = __sync_add_and_fetch(&exclusive_lock_count, 1);
@@ -151,12 +226,14 @@ int flock(int fd, int operation) {
   return result;
 }
 
-int rename(const char *old_path, const char *new_path) {
+int PROBE_FUNCTION(rename)(const char *old_path, const char *new_path) {
+#if !defined(__APPLE__)
   static int (*real_rename)(const char *, const char *) = NULL;
 
   if (real_rename == NULL) {
     real_rename = dlsym(RTLD_NEXT, "rename");
   }
+#endif
 
   int target = !inside_rename && is_target_rename(old_path, new_path);
 
@@ -165,7 +242,11 @@ int rename(const char *old_path, const char *new_path) {
     before_target_rename();
   }
 
+#if defined(__APPLE__)
+  int result = (int)syscall(SYS_rename, old_path, new_path);
+#else
   int result = real_rename(old_path, new_path);
+#endif
 
   if (target) {
     after_target_rename(result);
@@ -175,13 +256,15 @@ int rename(const char *old_path, const char *new_path) {
   return result;
 }
 
-int renameat(int old_directory, const char *old_path, int new_directory,
-             const char *new_path) {
+int PROBE_FUNCTION(renameat)(int old_directory, const char *old_path,
+                             int new_directory, const char *new_path) {
+#if !defined(__APPLE__)
   static int (*real_renameat)(int, const char *, int, const char *) = NULL;
 
   if (real_renameat == NULL) {
     real_renameat = dlsym(RTLD_NEXT, "renameat");
   }
+#endif
 
   int target = !inside_rename && is_target_rename(old_path, new_path);
 
@@ -190,7 +273,13 @@ int renameat(int old_directory, const char *old_path, int new_directory,
     before_target_rename();
   }
 
+#if defined(__APPLE__)
+  int result =
+      (int)syscall(SYS_renameat, old_directory, old_path, new_directory,
+                   new_path);
+#else
   int result = real_renameat(old_directory, old_path, new_directory, new_path);
+#endif
 
   if (target) {
     after_target_rename(result);
@@ -230,15 +319,9 @@ int renameat2(int old_directory, const char *old_path, int new_directory,
 #endif
 
 #if defined(__APPLE__)
-int renameatx_np(int old_directory, const char *old_path, int new_directory,
-                 const char *new_path, unsigned int flags) {
-  static int (*real_renameatx_np)(int, const char *, int, const char *,
-                                 unsigned int) = NULL;
-
-  if (real_renameatx_np == NULL) {
-    real_renameatx_np = dlsym(RTLD_NEXT, "renameatx_np");
-  }
-
+int PROBE_FUNCTION(renameatx_np)(int old_directory, const char *old_path,
+                                 int new_directory, const char *new_path,
+                                 unsigned int flags) {
   int target = !inside_rename && is_target_rename(old_path, new_path);
 
   if (target) {
@@ -246,8 +329,9 @@ int renameatx_np(int old_directory, const char *old_path, int new_directory,
     before_target_rename();
   }
 
-  int result = real_renameatx_np(old_directory, old_path, new_directory,
-                                new_path, flags);
+  int result =
+      (int)syscall(SYS_renameatx_np, old_directory, old_path, new_directory,
+                   new_path, flags);
 
   if (target) {
     after_target_rename(result);
@@ -256,4 +340,12 @@ int renameatx_np(int old_directory, const char *old_path, int new_directory,
 
   return result;
 }
+
+DYLD_INTERPOSE(cursor_signing_probe_fsync, fsync)
+DYLD_INTERPOSE(cursor_signing_probe_fcntl, fcntl)
+DYLD_INTERPOSE(cursor_signing_probe_flock, flock)
+DYLD_INTERPOSE(cursor_signing_probe_rename, rename)
+DYLD_INTERPOSE(cursor_signing_probe_renameat, renameat)
+DYLD_INTERPOSE(cursor_signing_probe_renameatx_np, renameatx_np)
+#pragma clang diagnostic pop
 #endif

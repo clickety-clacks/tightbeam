@@ -10,6 +10,48 @@ defmodule Tightbeam.CursorSigningTest do
 
   @domain_separator <<"tightbeam/rest-read-plane-d1/cursor/v1", 0>>
 
+  setup_all do
+    control_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "tightbeam-cursor-signing-probe-preflight-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(control_dir)
+    on_exit(fn -> File.rm_rf!(control_dir) end)
+    probe = compile_filesystem_probe!(control_dir)
+    base_dir = Path.join(control_dir, "base")
+    active_path = Path.join([base_dir, "secrets", "rest-cursor-signing.v1"])
+    ready_marker = Path.join(control_dir, "probe-ready")
+    failure_marker = Path.join(control_dir, "stage-sync-failed")
+
+    script = """
+    [base_dir] = System.argv()
+    {:error, %Tightbeam.CursorSigning.Error{}} = Tightbeam.CursorSigning.provision(base_dir)
+    IO.binwrite("refused")
+    """
+
+    environment =
+      filesystem_probe_environment(probe, active_path) ++
+        [
+          {"CURSOR_SIGNING_TEST_PROBE_READY", ready_marker},
+          {"CURSOR_SIGNING_TEST_FAIL_STAGE_SYNC_ALWAYS", "1"},
+          {"CURSOR_SIGNING_TEST_FSYNC_FAILED", failure_marker}
+        ]
+
+    case external_instrumented_elixir(script, [base_dir], environment) do
+      {"refused", 0} ->
+        unless File.exists?(ready_marker) and File.exists?(failure_marker) do
+          raise "cursor filesystem probe preflight did not activate fault injection"
+        end
+
+      {output, status} ->
+        raise "cursor filesystem probe preflight failed: status=#{status} output=#{inspect(output)}"
+    end
+
+    :ok
+  end
+
   setup do
     base_dir =
       Path.join(
@@ -1543,7 +1585,7 @@ defmodule Tightbeam.CursorSigningTest do
     loader_environment =
       case :os.type() do
         {:unix, :darwin} ->
-          [{"DYLD_INSERT_LIBRARIES", probe}, {"DYLD_FORCE_FLAT_NAMESPACE", "1"}]
+          [{"DYLD_INSERT_LIBRARIES", probe}]
 
         {:unix, _name} ->
           [{"LD_PRELOAD", probe}]
@@ -1703,7 +1745,7 @@ defmodule Tightbeam.CursorSigningTest do
 
     elixir = System.find_executable("elixir") || raise "elixir is unavailable"
 
-    System.cmd(elixir, code_paths ++ ["-e", script | arguments], stderr_to_stdout: true)
+    run_reaped_executable(elixir, code_paths ++ ["-e", script | arguments])
   end
 
   defp external_instrumented_elixir(script, arguments, environment) do
@@ -1741,7 +1783,7 @@ defmodule Tightbeam.CursorSigningTest do
         "-extra"
       ] ++ code_paths ++ ["-e", script | arguments]
 
-    System.cmd(executable, runtime_arguments, stderr_to_stdout: true, env: environment)
+    run_reaped_executable(executable, runtime_arguments, environment)
   end
 
   defp external_distributed_instrumented_elixir(script, arguments, environment) do
@@ -1785,6 +1827,39 @@ defmodule Tightbeam.CursorSigningTest do
         "-extra"
       ] ++ code_paths ++ ["-e", script | arguments]
 
-    System.cmd(executable, runtime_arguments, stderr_to_stdout: true, env: environment)
+    run_reaped_executable(executable, runtime_arguments, environment)
+  end
+
+  defp run_reaped_executable(executable, arguments, environment \\ []) do
+    options = [
+      :binary,
+      :exit_status,
+      :stderr_to_stdout,
+      {:args, arguments},
+      {:env,
+       Enum.map(environment, fn {name, value} ->
+         {String.to_charlist(name), String.to_charlist(value)}
+       end)}
+    ]
+
+    port = Port.open({:spawn_executable, executable}, options)
+
+    try do
+      collect_external_output(port, [])
+    after
+      if Port.info(port) != nil do
+        Port.close(port)
+      end
+    end
+  end
+
+  defp collect_external_output(port, chunks) do
+    receive do
+      {^port, {:data, data}} ->
+        collect_external_output(port, [data | chunks])
+
+      {^port, {:exit_status, status}} ->
+        {chunks |> Enum.reverse() |> IO.iodata_to_binary(), status}
+    end
   end
 end
