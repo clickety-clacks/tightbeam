@@ -989,6 +989,7 @@ defmodule Tightbeam.Gateway do
           |> Map.put(:supervision_interval_ms, Map.fetch!(config, :wake_tick_ms))
           |> Map.put(:on_assignment_change, assignment_change)
           |> Map.put(:on_work_item_change, item_change)
+          |> Map.put(:effort_config, config)
 
         Assignments.__handle__(db, "assign", call)
       end,

@@ -644,7 +644,8 @@ defmodule Tightbeam.GatewayTest do
     %{db: db, registry: registry, lane: lane, catalog_base: catalog_base, device: device}
   end
 
-  test "assignment handlers inject the configured supervision interval before mutation", ctx do
+  test "assignment handlers inject configured supervision and effort settings before mutation",
+       ctx do
     ensure_global_registry()
     base_dir = role_test_base("gateway-supervision-interval")
 
@@ -656,6 +657,7 @@ defmodule Tightbeam.GatewayTest do
       Gateway.handlers(
         gateway_config(base_dir, ctx.db, 0)
         |> Map.put(:wake_tick_ms, 1_234)
+        |> Map.put(:effort_checkin_horizon_ms, 123)
       )
 
     common = %{
@@ -684,6 +686,15 @@ defmodule Tightbeam.GatewayTest do
                  }
                })
              )
+
+    assert {:ok, [[123, effort_root]]} =
+             DB.query(
+               ctx.db,
+               "SELECT baseHorizonMs,root FROM effort_checkin_generations WHERE assignmentId=?1",
+               [assign_id]
+             )
+
+    assert Path.dirname(effort_root) == Path.join(base_dir, "work")
 
     for assignment_id <- [assign_id, dispatch_id] do
       assert {:ok, [[1_234, 1_234]]} =
