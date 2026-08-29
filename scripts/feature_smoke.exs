@@ -269,7 +269,8 @@ defmodule FeatureSmoke do
        |> replace_bytes(".claude.json", "[]")
        |> runtime_case(%{}, "claude", "pre-wake", cwd, now, now), "FX_JSON_SHAPE"},
       {"AC-24", codex_runtime_scope_case(cwd, now), :pass},
-      {"AC-25", repeated_first_failure(entries, cwd, now), "FX_MODE"},
+      {"AC-25", repeated_first_failure(entries, cwd, now),
+       %{code: "FX_MODE", phase: "pre-wake", path: ".claude.json", clause: "C-02"}},
       {"AC-26", full_evidence_file_case(entries), :pass},
       {"AC-27", cleanup_refusal_case(entries, cwd, now), :pass},
       {"AC-28", implementation_custody_case(), :pass},
@@ -472,30 +473,26 @@ defmodule FeatureSmoke do
     path = Path.join(base_dir, @home_evidence_name)
 
     case ops.create_evidence.(path) do
-      :ok ->
-        case ops.open_evidence.(path) do
-          {:ok, io} ->
-            created? =
-              match?(
-                {:ok, info}
-                when file_info(info, :type) == :regular and
-                       Bitwise.band(file_info(info, :mode), 0o7777) == 0o600,
-                ops.lstat.(path)
-              )
+      {:ok, io} ->
+        created? =
+          with {:ok, handle_info} <- ops.read_info.(io),
+               {:ok, path_info} <- ops.lstat.(path) do
+            file_info(handle_info, :type) == :regular and
+              Bitwise.band(file_info(handle_info, :mode), 0o7777) == 0o600 and
+              regular_identity(handle_info) == regular_identity(path_info)
+          else
+            _ -> false
+          end
 
-            if created? do
-              try do
-                fun.(%{io: io, sequence: 1, phase_index: 0, ops: ops})
-              after
-                ops.close.(io)
-              end
-            else
-              ops.close.(io)
-              emit_evidence_refusal!(ops, "all", "run-start", "run-start")
-            end
-
-          {:error, _reason} ->
-            emit_evidence_refusal!(ops, "all", "run-start", "run-start")
+        if created? do
+          try do
+            fun.(%{io: io, sequence: 1, phase_index: 0, ops: ops})
+          after
+            ops.close.(io)
+          end
+        else
+          ops.close.(io)
+          emit_evidence_refusal!(ops, "all", "run-start", "run-start")
         end
 
       {:error, _reason} ->
@@ -886,6 +883,21 @@ defmodule FeatureSmoke do
     runtime_case(phase_state, harness, phase, entries, cwd, started, finished)
   end
 
+  defp runtime_case_result(state, harness, phase, entries, cwd, started, finished) do
+    case runtime_failure(state, harness, phase, entries, cwd, started, finished) do
+      {nil, _identity} ->
+        :pass
+
+      {candidate, _identity} ->
+        %{
+          code: candidate.code,
+          phase: phase,
+          path: evidence_token(candidate.path),
+          clause: candidate.clause
+        }
+    end
+  end
+
   defp candidate_code(nil), do: :pass
   defp candidate_code(candidate), do: candidate.code
 
@@ -970,10 +982,12 @@ defmodule FeatureSmoke do
       |> replace_json("sessions/123.json", &Map.put(&1, "cwd", "/wrong"))
 
     1..3
-    |> Enum.map(fn _ -> runtime_case(%{}, "claude", "pre-wake", invalid, cwd, now, now) end)
+    |> Enum.map(fn _ ->
+      runtime_case_result(%{}, "claude", "pre-wake", invalid, cwd, now, now)
+    end)
     |> Enum.uniq()
     |> case do
-      [code] -> code
+      [result] -> result
       _ -> :nondeterministic
     end
   end
@@ -1107,10 +1121,10 @@ defmodule FeatureSmoke do
         home_ops(%{
           create_evidence: fn path ->
             case default_ops.create_evidence.(path) do
-              :ok ->
-                {:ok, info} = :file.read_link_info(path)
+              {:ok, io} = created ->
+                {:ok, info} = :file.read_file_info(io)
                 trace_case({:created_mode, Bitwise.band(file_info(info, :mode), 0o7777)})
-                :ok
+                created
 
               error ->
                 error
@@ -1805,7 +1819,6 @@ defmodule FeatureSmoke do
   defp home_ops do
     %{
       create_evidence: &create_evidence_file/1,
-      open_evidence: fn path -> :file.open(path, [:read, :write, :binary, :raw]) end,
       list_dir: &:file.list_dir_all/1,
       lstat: &:file.read_link_info/1,
       open_read: fn path -> :file.open(path, [:read, :binary, :raw]) end,
@@ -1818,21 +1831,34 @@ defmodule FeatureSmoke do
   end
 
   defp create_evidence_file(path) do
-    try do
-      case System.cmd(
-             "node",
-             [
-               "-e",
-               ~S'const fs=require("fs"); const fd=fs.openSync(process.argv[1], "wx", 0o600); fs.closeSync(fd);',
-               path
-             ],
-             stderr_to_stdout: true
-           ) do
-        {_output, 0} -> :ok
-        {_output, _status} -> {:error, :create_failed}
-      end
-    rescue
-      ErlangError -> {:error, :create_failed}
+    case :file.open(path, [:read, :write, :exclusive, :binary, :raw]) do
+      {:ok, io} ->
+        case secure_evidence_mode(io) do
+          :ok ->
+            {:ok, io}
+
+          {:error, reason} ->
+            :file.close(io)
+            {:error, reason}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp secure_evidence_mode(io) do
+    with handle when is_binary(handle) <- :prim_file.get_handle(io),
+         endian when endian in [:little, :big] <- :erlang.system_info(:endian),
+         fd <- :binary.decode_unsigned(handle, endian),
+         :ok <- :file.change_mode(~c"/proc/self/fd/#{fd}", 0o600),
+         {:ok, info} <- :file.read_file_info(io),
+         true <-
+           file_info(info, :type) == :regular and
+             Bitwise.band(file_info(info, :mode), 0o7777) == 0o600 do
+      :ok
+    else
+      _ -> {:error, :secure_mode_failed}
     end
   end
 
