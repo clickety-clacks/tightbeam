@@ -80,6 +80,14 @@ defmodule FeatureSmoke do
     {"codex", "pre-wake"},
     {"codex", "post-turn"}
   ]
+  @codex_waiver_phase_plan [
+    {"all", "run-start"},
+    {"codex", "pre-spawn"},
+    {"codex", "pre-wake"},
+    {"codex", "post-turn"}
+  ]
+  @claude_waiver_decision "dr_7383a755-820d-4f1e-b882-4f16b08a103f"
+  @claude_waiver_wake "s_1e05ddc2-e04f-47f3-8273-2964c38719c8"
   @home_check_ids ~w(
     phase_order fixture_state clock_order snapshot_acquired baseline_equal path_set_equal
     codex_delta_empty entry_type_equal entry_mode_equal sidecar_size_bounded json_utf8_valid
@@ -113,8 +121,12 @@ defmodule FeatureSmoke do
     selection = Tightbeam.FeatureSmokePlan.selection(Tightbeam.Harness.all())
     announce_selection!(selection)
     legs = Tightbeam.FeatureSmokePlan.legs(Tightbeam.Harness.all())
+    selected = Enum.map(legs, & &1.wire_name)
+    claude_waiver = System.get_env("TIGHTBEAM_SMOKE_CLAUDE_WAIVER")
+    phase_plan = home_phase_plan(selected, claude_waiver)
+    announce_claude_waiver!(selected, claude_waiver)
 
-    with_home_evidence!(base_dir, fn evidence ->
+    with_home_evidence!(base_dir, phase_plan, claude_waiver, fn evidence ->
       evidence = validate_run_start!(base_dir, legs, evidence)
 
       Enum.reduce(legs, evidence, fn leg, evidence ->
@@ -299,7 +311,22 @@ defmodule FeatureSmoke do
         do: raise(Failure, message: "#{id} expected #{inspect(expected)}, got #{inspect(actual)}")
     end)
 
+    waiver_cases = [
+      {"named waiver admits Codex-only clean fixture",
+       candidate_code(run_start_failure(["codex"], "1|1|0|0|0", @claude_waiver_decision)), :pass},
+      {"missing waiver refuses Codex-only fixture",
+       candidate_code(run_start_failure(["codex"], "1|1|0|0|0", nil)), "FX_FIXTURE_STATE"},
+      {"named waiver selects the four observable Codex phases",
+       home_phase_plan(["codex"], @claude_waiver_decision), @codex_waiver_phase_plan}
+    ]
+
+    Enum.each(waiver_cases, fn {id, actual, expected} ->
+      if actual != expected,
+        do: raise(Failure, message: "#{id} expected #{inspect(expected)}, got #{inspect(actual)}")
+    end)
+
     IO.puts("feature-smoke HOME validator deterministic cases: 42/42 PASS")
+    IO.puts("feature-smoke named Claude waiver cases: 3/3 PASS")
   end
 
   defp preflight!(leg, base_dir) do
@@ -465,11 +492,15 @@ defmodule FeatureSmoke do
   # The retained fixture evidence is deliberately outside either projected home.
   # Runtime cleanup may remove a sidecar; this handle is therefore opened once before
   # run-start validation and synced after every phase judgment.
-  defp with_home_evidence!(base_dir, fun) do
-    with_home_evidence!(base_dir, fun, home_ops())
+  defp with_home_evidence!(base_dir, fun, ops) do
+    with_home_evidence!(base_dir, @home_phase_plan, nil, fun, ops)
   end
 
-  defp with_home_evidence!(base_dir, fun, ops) do
+  defp with_home_evidence!(base_dir, phase_plan, claude_waiver, fun) do
+    with_home_evidence!(base_dir, phase_plan, claude_waiver, fun, home_ops())
+  end
+
+  defp with_home_evidence!(base_dir, phase_plan, claude_waiver, fun, ops) do
     path = Path.join(base_dir, @home_evidence_name)
 
     case ops.create_evidence.(path) do
@@ -488,7 +519,14 @@ defmodule FeatureSmoke do
 
         if created? do
           try do
-            fun.(%{io: io, sequence: 1, phase_index: 0, ops: ops})
+            fun.(%{
+              io: io,
+              sequence: 1,
+              phase_index: 0,
+              phase_plan: phase_plan,
+              claude_waiver: claude_waiver,
+              ops: ops
+            })
           after
             ops.close.(io)
           end
@@ -518,13 +556,20 @@ defmodule FeatureSmoke do
       end
 
     candidate =
-      phase_candidate(evidence, "all", "run-start") || run_start_failure(selected, counts)
+      phase_candidate(evidence, "all", "run-start") ||
+        run_start_failure(selected, counts, Map.get(evidence, :claude_waiver))
 
     finish_home_phase!(evidence, "all", "run-start", "run-start", [], candidate)
   end
 
-  defp run_start_failure(["claude", "codex"], "1|1|0|0|0"), do: nil
-  defp run_start_failure(_selected, _counts), do: home_failure(2, "FX_FIXTURE_STATE", "C-01", "-")
+  defp run_start_failure(selected, counts), do: run_start_failure(selected, counts, nil)
+
+  defp run_start_failure(["claude", "codex"], "1|1|0|0|0", _claude_waiver), do: nil
+
+  defp run_start_failure(["codex"], "1|1|0|0|0", @claude_waiver_decision), do: nil
+
+  defp run_start_failure(_selected, _counts, _claude_waiver),
+    do: home_failure(2, "FX_FIXTURE_STATE", "C-01", "-")
 
   defp validate_pre_spawn!(state, home, expected_home) do
     harness = state.leg.wire_name
@@ -676,10 +721,14 @@ defmodule FeatureSmoke do
   end
 
   defp phase_candidate(evidence, harness, phase) do
-    if Enum.at(@home_phase_plan, evidence.phase_index) == {harness, phase},
-      do: nil,
-      else: home_failure(1, "FX_PHASE", "C-01", "-")
+    if Enum.at(Map.get(evidence, :phase_plan, @home_phase_plan), evidence.phase_index) ==
+         {harness, phase},
+       do: nil,
+       else: home_failure(1, "FX_PHASE", "C-01", "-")
   end
+
+  defp home_phase_plan(["codex"], @claude_waiver_decision), do: @codex_waiver_phase_plan
+  defp home_phase_plan(_selected, _claude_waiver), do: @home_phase_plan
 
   defp runtime_failure(_state, "codex", _phase, entries, _cwd, _started, _finished) do
     candidate =
@@ -4468,6 +4517,16 @@ defmodule FeatureSmoke do
         "nothing about the leg(s) it did not run."
     )
   end
+
+  defp announce_claude_waiver!(["codex"], @claude_waiver_decision) do
+    IO.puts(
+      "NAMED WAIVER: Claude leg waived by #{@claude_waiver_decision}; " <>
+        "authority wake #{@claude_waiver_wake} and the decision rationale govern. " <>
+        "The waiver expires when a valid org Anthropic credential exists."
+    )
+  end
+
+  defp announce_claude_waiver!(_selected, _claude_waiver), do: :ok
 
   defp unique, do: "#{Process.get(:salt, "")}#{System.unique_integer([:positive])}"
 end
