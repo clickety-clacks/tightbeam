@@ -11,6 +11,14 @@ use std::path::Path;
 use std::process::Command;
 
 pub fn session_exec(args: &[String]) -> Result<i32, String> {
+    session_exec_with_mode(args, 0o600)
+}
+
+pub fn cursor_session_exec(args: &[String]) -> Result<i32, String> {
+    session_exec_with_mode(args, 0o640)
+}
+
+fn session_exec_with_mode(args: &[String], identity_mode: u32) -> Result<i32, String> {
     let separator = args.iter().position(|arg| arg == "--").ok_or_else(|| {
         "usage: tightbeam harness-exec <identity-path> <launch-id> -- <command> [args...]"
             .to_string()
@@ -33,7 +41,7 @@ pub fn session_exec(args: &[String]) -> Result<i32, String> {
     let mut identity = OpenOptions::new()
         .create_new(true)
         .write(true)
-        .mode(0o600)
+        .mode(identity_mode)
         .open(identity_path)
         .map_err(|error| format!("harness identity could not be opened: {error}"))?;
 

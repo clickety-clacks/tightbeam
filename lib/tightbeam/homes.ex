@@ -118,7 +118,12 @@ defmodule Tightbeam.Homes do
     Enum.each(credential_names, &File.rm(Path.join(home, &1)))
 
     unless File.read(manifest_path) == {:ok, manifest} do
-      remove_owned_projection(home, rails_filename)
+      remove_owned_projection(
+        home,
+        rails_filename,
+        Keyword.get(mechanics, :preserve_manifest_dir, false)
+      )
+
       write_rails(home, rails_filename, Map.get(desired, :rails))
       File.mkdir_p!(Path.dirname(manifest_path))
       File.write!(manifest_path, manifest)
@@ -398,8 +403,8 @@ defmodule Tightbeam.Homes do
   defp auth_dir(base_dir, module),
     do: Tightbeam.Credentials.store_dir(base_dir, module.credential_provider())
 
-  defp remove_owned_projection(home, rails_filename) do
-    File.rm_rf!(Path.join(home, ".tightbeam"))
+  defp remove_owned_projection(home, rails_filename, preserve_manifest_dir?) do
+    unless preserve_manifest_dir?, do: File.rm_rf!(Path.join(home, ".tightbeam"))
     File.rm_rf!(Path.join(home, rails_filename))
   end
 

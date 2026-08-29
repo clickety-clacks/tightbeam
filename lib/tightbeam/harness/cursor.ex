@@ -98,8 +98,7 @@ defmodule Tightbeam.Harness.Cursor do
 
   @impl true
   def prepare_launch(target, home, opts) do
-    with {:ok, %{launcher: launcher}} <- verify_installed_cli(target),
-         :ok <- verify_adapter_shim(target, launcher) do
+    with {:ok, %{launcher: launcher}} <- verify_installed_cli(target) do
       if local?(target) do
         case Keyword.fetch(opts, :cursor_api_key) do
           {:ok, key} ->
@@ -107,7 +106,8 @@ defmodule Tightbeam.Harness.Cursor do
              [
                readiness_rendezvous: true,
                cursor_execution_identity: true,
-               cmd: [adapter_binary(target)],
+               cursor_rails_sha256: Keyword.fetch!(opts, :cursor_rails_sha256),
+               cmd: [launcher, "acp"],
                env: [
                  {"CURSOR_CONFIG_DIR", home},
                  {"AGENT_CLI_CREDENTIAL_STORE", "memory"},
@@ -136,6 +136,15 @@ defmodule Tightbeam.Harness.Cursor do
       {:unix, :darwin} -> "/Users/tightbeam-cursor"
       {:unix, _} -> "/home/tightbeam-cursor"
     end
+  end
+
+  @doc false
+  def project_execution_rails!(home_override, settings) do
+    path = Path.join(execution_home(home_override), @rails_file)
+    bytes = settings |> CursorRails.compile() |> JSON.encode!()
+    File.mkdir_p!(Path.dirname(path))
+    File.write!(path, bytes)
+    Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
   end
 
   @impl true
@@ -184,7 +193,8 @@ defmodule Tightbeam.Harness.Cursor do
 
     Tightbeam.Homes.reconcile(target, home, %{desired | rails: rails},
       credential_names: [@credential_file],
-      rails_filename: @rails_file
+      rails_filename: @rails_file,
+      preserve_manifest_dir: true
     )
   end
 
@@ -650,42 +660,12 @@ defmodule Tightbeam.Harness.Cursor do
          do: Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
   end
 
-  defp verify_adapter_shim(target, launcher) do
-    case Map.get(target, :verify_adapter_shim) do
-      verify when is_function(verify, 2) -> verify.(adapter_binary(target), launcher)
-      nil -> verify_adapter_shim_on_target(target, launcher)
-    end
-  end
-
-  defp verify_adapter_shim_on_target(target, launcher) do
-    shim = adapter_binary(target)
-    expected = "#!/bin/sh\nexec \"#{launcher}\" acp \"$@\"\n"
-
-    if local?(target) do
-      with {:ok, ^expected} <- File.read(shim),
-           {:ok, stat} <- File.stat(shim),
-           true <- Bitwise.band(stat.mode, 0o111) != 0 do
-        :ok
-      else
-        _ -> integrity_refusal()
-      end
-    else
-      expected_hash = Base.encode16(:crypto.hash(:sha256, expected), case: :lower)
-
-      script =
-        "test -x #{Support.shell_quote(shim)} && " <>
-          "test \"$(shasum -a 256 #{Support.shell_quote(shim)} | cut -d' ' -f1)\" = " <>
-          Support.shell_quote(expected_hash)
-
-      command =
-        ["ssh" | Support.ssh_opts()] ++
-          [target.host_config.ssh, "sh", "-c", Support.shell_quote(script)]
-
-      case target.sh.(command) do
-        {_output, 0} -> :ok
-        _ -> integrity_refusal()
-      end
-    end
+  @doc false
+  def execution_rails_sha256(home_override) do
+    execution_home(home_override)
+    |> Path.join(@rails_file)
+    |> File.read!()
+    |> then(&Base.encode16(:crypto.hash(:sha256, &1), case: :lower))
   end
 
   defp adapter_binary(target) do

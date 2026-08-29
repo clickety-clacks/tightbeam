@@ -1246,11 +1246,25 @@ defmodule Tightbeam.Placement do
         statutes: Rails.statutes?(),
         ensure_workdir: &ensure_workdir/4,
         sh_out: Map.get(config, :sh_out)
-      ] ++ checked_opts
+      ]
+      |> then(fn opts ->
+        if harness == :cursor do
+          Keyword.put(
+            opts,
+            :cursor_rails_sha256,
+            Tightbeam.Harness.Cursor.execution_rails_sha256(
+              Map.get(config, :cursor_execution_home)
+            )
+          )
+        else
+          opts
+        end
+      end)
+      |> Kernel.++(checked_opts)
 
     process_identity_dir =
       if harness == :cursor and is_nil(host_config.ssh),
-        do: Tightbeam.Harness.Cursor.execution_base(Map.get(config, :cursor_execution_home)),
+        do: Path.join(home, ".tightbeam"),
         else: host_config.base_dir
 
     base = [
@@ -1564,10 +1578,11 @@ defmodule Tightbeam.Placement do
     host_config = Map.fetch!(hosts_for(config), host)
     module = Harness.module!(harness)
 
-    home =
-      if harness == :cursor and is_nil(host_config.ssh),
-        do: Tightbeam.Harness.Cursor.execution_home(Map.get(config, :cursor_execution_home)),
-        else: Homes.home_path(host_config.base_dir, host, harness)
+    if harness == :cursor and not is_nil(host_config.ssh) do
+      raise ArgumentError, "Cursor execution identity is local-only; SSH hosts are unsupported"
+    end
+
+    home = Homes.home_path(host_config.base_dir, host, harness)
 
     sh = Keyword.get(opts, :sh, &system_cmd/1)
 
@@ -1576,34 +1591,45 @@ defmodule Tightbeam.Placement do
         if Keyword.has_key?(opts, :sh), do: sh, else: &system_cmd_out/1
       end)
 
-    module.reconcile_home(
-      %{
-        base_dir: config.base_dir,
-        host_config: host_config,
-        host_name: host,
-        sh: sh,
-        sh_out: sh_out
-      },
-      home,
-      %{
-        harness: harness,
-        machine: host,
-        rails: Rails.hook_settings(),
-        # The pinned model tracks the SESSION'S resolved selection when the caller
-        # supplies one (`:model`), falling back to the org default only when there
-        # is no session context (adapter cold-boot). The claude adapter's offered
-        # /accepted model set follows this home pin (wi_263814d3), so pinning the
-        # selected model is what makes the adapter accept it at session/new — the
-        # cure for the accepted-then-dead class.
-        default_model: Keyword.get(opts, :model) || Map.get(config, :default_model),
-        auth_dir:
-          Tightbeam.Credentials.store_dir(
-            host_config.base_dir,
-            module.credential_provider()
-          )
-      }
-    )
-    |> Map.fetch!(:home_path)
+    rails = Rails.hook_settings()
+
+    result =
+      module.reconcile_home(
+        %{
+          base_dir: config.base_dir,
+          host_config: host_config,
+          host_name: host,
+          sh: sh,
+          sh_out: sh_out
+        },
+        home,
+        %{
+          harness: harness,
+          machine: host,
+          rails: rails,
+          # The pinned model tracks the SESSION'S resolved selection when the caller
+          # supplies one (`:model`), falling back to the org default only when there
+          # is no session context (adapter cold-boot). The claude adapter's offered
+          # /accepted model set follows this home pin (wi_263814d3), so pinning the
+          # selected model is what makes the adapter accept it at session/new — the
+          # cure for the accepted-then-dead class.
+          default_model: Keyword.get(opts, :model) || Map.get(config, :default_model),
+          auth_dir:
+            Tightbeam.Credentials.store_dir(
+              host_config.base_dir,
+              module.credential_provider()
+            )
+        }
+      )
+
+    if harness == :cursor do
+      Tightbeam.Harness.Cursor.project_execution_rails!(
+        Map.get(config, :cursor_execution_home),
+        rails
+      )
+    end
+
+    Map.fetch!(result, :home_path)
   end
 
   defp effective_identity_fingerprint(effective) do

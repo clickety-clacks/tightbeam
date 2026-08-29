@@ -65,11 +65,18 @@ defmodule Tightbeam.CursorRegistrationTest do
              Cursor.prepare_launch(
                target,
                "/managed",
-               checked ++ [common_env: [], remote_env: [], lineage: "lineage"]
+               checked ++
+                 [
+                   common_env: [],
+                   remote_env: [],
+                   lineage: "lineage",
+                   cursor_rails_sha256: String.duplicate("a", 64)
+                 ]
              )
 
     assert {"CURSOR_API_KEY", "secret"} in plan[:env]
     assert {"AGENT_CLI_CREDENTIAL_STORE", "memory"} in plan[:env]
+    assert plan[:cmd] == ["/tmp/2026.08.11-e8db854/cursor-agent", "acp"]
     refute Enum.join(plan[:cmd], " ") =~ "security"
     refute Enum.join(plan[:cmd], " ") =~ "secret"
   end
@@ -207,13 +214,14 @@ defmodule Tightbeam.CursorRegistrationTest do
     assert {:error, %{code: "cursor_cli_integrity_mismatch"}} =
              Cursor.prepare_launch(target, "/managed",
                cursor_api_key: "secret",
+               cursor_rails_sha256: String.duplicate("a", 64),
                common_env: [],
                remote_env: [],
                lineage: "lineage"
              )
   end
 
-  test "Cursor refuses a tampered managed shim immediately before launch" do
+  test "Cursor launch bypasses a tampered operator-writable managed shim" do
     base = Path.join(System.tmp_dir!(), "cursor-shim-#{System.unique_integer([:positive])}")
     launcher = Path.join([base, "2026.08.11-e8db854", "cursor-agent"])
     shim = Path.join(base, "cursor-agent-acp")
@@ -232,13 +240,17 @@ defmodule Tightbeam.CursorRegistrationTest do
 
     target = Map.delete(target, :verify_adapter_shim)
 
-    assert {:error, %{code: "cursor_cli_integrity_mismatch"}} =
+    assert {:ok, plan} =
              Cursor.prepare_launch(target, "/managed",
                cursor_api_key: "secret",
+               cursor_rails_sha256: String.duplicate("a", 64),
                common_env: [],
                remote_env: [],
                lineage: "lineage"
              )
+
+    assert plan[:cmd] == [launcher, "acp"]
+    refute shim in plan[:cmd]
   end
 
   test "remote preflight refuses local-only before any API-key load attempt" do
@@ -394,6 +406,8 @@ defmodule Tightbeam.CursorRegistrationTest do
     home = Path.join(base, "home")
     auth = Path.join([base, "auth", "cursor"])
     File.mkdir_p!(auth)
+    File.mkdir_p!(Path.join(home, ".tightbeam"))
+    File.write!(Path.join(home, ".tightbeam/execution-owned"), "preserve")
     File.write!(Path.join(auth, "cli-config.json"), ~s({"authInfo":{"email":"user@example.com"}}))
 
     target = %{
@@ -418,6 +432,7 @@ defmodule Tightbeam.CursorRegistrationTest do
            }
 
     refute File.exists?(Path.join(home, "api-key"))
+    assert File.read!(Path.join(home, ".tightbeam/execution-owned")) == "preserve"
   end
 
   defp cursor_target do

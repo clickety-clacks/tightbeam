@@ -325,6 +325,7 @@ defmodule Tightbeam.Harness.Support do
         statutes: rails == :railed,
         credential_kind: kind,
         cursor_api_key_loader: fn _ -> {:ok, "vector-token"} end,
+        cursor_rails_sha256: String.duplicate("a", 64),
         ensure_workdir: fn _host, _cwd, _content, _opts -> :ok end,
         sh_out: nil
       ]
@@ -357,7 +358,7 @@ defmodule Tightbeam.Harness.Support do
       if profile.wire_name == "cursor" do
         if local? do
           [
-            cmd: [adapter],
+            cmd: [Path.join(base, profile.pinned_cli_path), "acp"],
             env: [
               {"CURSOR_CONFIG_DIR", home},
               {"AGENT_CLI_CREDENTIAL_STORE", "memory"},
@@ -366,18 +367,12 @@ defmodule Tightbeam.Harness.Support do
             ]
           ]
         else
-          [
-            cmd:
-              ["ssh" | ssh_opts()] ++
-                ["-o", "SendEnv=CURSOR_API_KEY", "vector@remote", "exec", "env"] ++
-                [
-                  "AGENT_CLI_CREDENTIAL_STORE=memory",
-                  "CURSOR_CONFIG_DIR=#{shell_quote(home)}",
-                  "REMOTE=1",
-                  adapter
-                ],
-            env: [{"CURSOR_API_KEY", "vector-token"}, {"TIGHTBEAM_LINEAGE", "tb-vector"}]
-          ]
+          {:error,
+           %{
+             code: "DIV-CURSOR-LOCAL-ONLY",
+             message:
+               "Cursor shim harness is gateway-local only until remote zero-listener probe exists"
+           }}
         end
       else
         expected_standard_launch(profile, locality, kind, base, home, adapter)

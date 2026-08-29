@@ -1,3 +1,4 @@
+use sha2::{Digest, Sha256};
 use std::ffi::CStr;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
@@ -9,11 +10,23 @@ pub const ACCOUNT: &str = "tightbeam-cursor";
 pub const LAUNCHER: &str = "/usr/local/libexec/tightbeam-cursor-launcher";
 const CURSOR_VERSION: &str = "2026.08.11-e8db854";
 
+pub fn running_as_launcher() -> bool {
+    let Ok(actual) = std::env::current_exe().and_then(fs::canonicalize) else {
+        return false;
+    };
+    fs::canonicalize(LAUNCHER).is_ok_and(|launcher| actual == launcher)
+}
+
+pub fn launcher_command_allowed(args: &[String]) -> bool {
+    args.first().is_some_and(|arg| arg == "cursor-exec")
+}
+
 pub fn require_onboard_prerequisite() -> Result<(), String> {
     let base = crate::base_dir::resolve();
     let operator_uid = unsafe { libc::geteuid() }.to_string();
     #[allow(deprecated)]
     let operator_home = std::env::home_dir().unwrap_or_default();
+    let executable = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("tightbeam"));
 
     let result = (|| {
         let account = account_named(ACCOUNT)?;
@@ -45,7 +58,12 @@ pub fn require_onboard_prerequisite() -> Result<(), String> {
         Ok(())
     })();
 
-    result.map_err(|reason| format!("{reason}\n\n{}", admin_instructions(&base, &operator_home)))
+    result.map_err(|reason| {
+        format!(
+            "{reason}\n\n{}",
+            admin_instructions(&base, &operator_home, &executable)
+        )
+    })
 }
 
 fn verify_dedicated_cursor_install(account: &Account) -> Result<(), String> {
@@ -117,7 +135,7 @@ fn verify_account_policy() -> Result<(), String> {
     Ok(())
 }
 
-fn admin_instructions(base: &Path, operator_home: &Path) -> String {
+fn admin_instructions(base: &Path, operator_home: &Path, executable: &Path) -> String {
     if cfg!(target_os = "macos") {
         format!(
             "An administrator must provision the dedicated Cursor identity. Tightbeam never runs these commands itself:\n\n\
@@ -127,6 +145,7 @@ fn admin_instructions(base: &Path, operator_home: &Path) -> String {
              sudo dscl . -create /Users/{ACCOUNT} UniqueID 503\n\
              sudo dscl . -create /Users/{ACCOUNT} PrimaryGroupID 20\n\
              sudo dscl . -create /Users/{ACCOUNT} NFSHomeDirectory /Users/{ACCOUNT}\n\
+             sudo dscl . -create /Users/{ACCOUNT} IsHidden 1\n\
              sudo createhomedir -c -u {ACCOUNT}\n\
              sudo dseditgroup -o create tightbeam-workspace\n\
              sudo dseditgroup -o edit -a $USER -t user tightbeam-workspace\n\
@@ -143,6 +162,9 @@ fn admin_instructions(base: &Path, operator_home: &Path) -> String {
              sudo chgrp tightbeam-workspace {base}/work\n\
              sudo chmod -R g+rwX {base}/work\n\
              sudo chmod 2770 {base}/work\n\
+             sudo mkdir -p {base}/homes/gd-mbp/cursor/.tightbeam/harness-processes\n\
+             sudo chown -R $USER:tightbeam-workspace {base}/homes/gd-mbp/cursor\n\
+             sudo chmod 2770 {base}/homes/gd-mbp/cursor/.tightbeam {base}/homes/gd-mbp/cursor/.tightbeam/harness-processes\n\
              sudo chgrp tightbeam-workspace {base}/auth\n\
              sudo chmod 0710 {base}/auth\n\
              sudo chgrp -R tightbeam-workspace {base}/auth/github\n\
@@ -150,12 +172,14 @@ fn admin_instructions(base: &Path, operator_home: &Path) -> String {
              test ! -e {operator_home}/.cursor || sudo chmod 0700 {operator_home}/.cursor\n\
              test ! -e {operator_home}/.agents || sudo chmod 0700 {operator_home}/.agents\n\
              test ! -e {operator_home}/.pi || sudo chmod 0700 {operator_home}/.pi\n\
-             sudo install -o root -g wheel -m 0755 $(command -v tightbeam) {LAUNCHER}\n\
+             sudo mkdir -p /usr/local/libexec\n\
+             sudo install -o root -g wheel -m 0755 {executable} {LAUNCHER}\n\
              printf 'Defaults!{LAUNCHER} env_keep += \"CURSOR_API_KEY AGENT_CLI_CREDENTIAL_STORE CURSOR_CONFIG_DIR TIGHTBEAM_HOME TIGHTBEAM_MACHINE TIGHTBEAM_LINEAGE GH_CONFIG_DIR PATH\"\\nDefaults!{LAUNCHER} !secure_path\\n%tightbeam-workspace ALL=({ACCOUNT}) NOPASSWD: {LAUNCHER} *\\n' | sudo tee /etc/sudoers.d/tightbeam-cursor >/dev/null\n\
              sudo chmod 0440 /etc/sudoers.d/tightbeam-cursor\n\
              sudo visudo -cf /etc/sudoers.d/tightbeam-cursor",
             base = base.display(),
-            operator_home = operator_home.display()
+            operator_home = operator_home.display(),
+            executable = executable.display()
         )
     } else {
         format!(
@@ -176,6 +200,9 @@ fn admin_instructions(base: &Path, operator_home: &Path) -> String {
              sudo chgrp tightbeam-workspace {base}/work\n\
              sudo chmod -R g+rwX {base}/work\n\
              sudo chmod 2770 {base}/work\n\
+             sudo mkdir -p {base}/homes/sirius/cursor/.tightbeam/harness-processes\n\
+             sudo chown -R $USER:tightbeam-workspace {base}/homes/sirius/cursor\n\
+             sudo chmod 2770 {base}/homes/sirius/cursor/.tightbeam {base}/homes/sirius/cursor/.tightbeam/harness-processes\n\
              sudo chgrp tightbeam-workspace {base}/auth\n\
              sudo chmod 0710 {base}/auth\n\
              sudo chgrp -R tightbeam-workspace {base}/auth/github\n\
@@ -183,12 +210,14 @@ fn admin_instructions(base: &Path, operator_home: &Path) -> String {
              test ! -e {operator_home}/.cursor || sudo chmod 0700 {operator_home}/.cursor\n\
              test ! -e {operator_home}/.agents || sudo chmod 0700 {operator_home}/.agents\n\
              test ! -e {operator_home}/.pi || sudo chmod 0700 {operator_home}/.pi\n\
-             sudo install -o root -g root -m 0755 $(command -v tightbeam) {LAUNCHER}\n\
+             sudo mkdir -p /usr/local/libexec\n\
+             sudo install -o root -g root -m 0755 {executable} {LAUNCHER}\n\
              printf 'Defaults!{LAUNCHER} env_keep += \"CURSOR_API_KEY AGENT_CLI_CREDENTIAL_STORE CURSOR_CONFIG_DIR TIGHTBEAM_HOME TIGHTBEAM_MACHINE TIGHTBEAM_LINEAGE GH_CONFIG_DIR PATH\"\\nDefaults!{LAUNCHER} !secure_path\\n%tightbeam-workspace ALL=({ACCOUNT}) NOPASSWD: {LAUNCHER} *\\n' | sudo tee /etc/sudoers.d/tightbeam-cursor >/dev/null\n\
              sudo chmod 0440 /etc/sudoers.d/tightbeam-cursor\n\
              sudo visudo -cf /etc/sudoers.d/tightbeam-cursor",
             base = base.display(),
-            operator_home = operator_home.display()
+            operator_home = operator_home.display(),
+            executable = executable.display()
         )
     }
 }
@@ -203,9 +232,9 @@ pub fn run(args: &[String]) -> Result<i32, String> {
             Ok(0)
         }
         "launch" => {
-            let command = verify_args(rest)?;
+            let command = verify_launch_args(rest)?;
             verify_launch_command(Path::new(&rest[0]), Path::new(&rest[1]), command)?;
-            crate::harness_process::session_exec(command)
+            crate::harness_process::cursor_session_exec(command)
         }
         "group" => {
             if rest.len() != 8 {
@@ -218,13 +247,21 @@ pub fn run(args: &[String]) -> Result<i32, String> {
     }
 }
 
-fn verify_launch_command(base: &Path, org_base: &Path, command: &[String]) -> Result<(), String> {
-    if command.len() < 4 || command[2] != "--" {
+fn verify_launch_command(base: &Path, _org_base: &Path, command: &[String]) -> Result<(), String> {
+    if command.len() != 5 || command[2] != "--" || command[4] != "acp" {
         return Err(usage().to_owned());
     }
     let identity = Path::new(&command[0]);
-    let expected_identity_parent = base.join("harness-processes");
-    if identity.parent() != Some(expected_identity_parent.as_path()) {
+    let identity_parent = identity.parent().ok_or_else(|| usage().to_owned())?;
+    let org_base = fs::canonicalize(_org_base).map_err(|error| {
+        format!("cursor execution identity refused: operator managed base: {error}")
+    })?;
+    let identity_parent = fs::canonicalize(identity_parent).map_err(|error| {
+        format!("cursor execution identity refused: identity directory: {error}")
+    })?;
+    if !identity_parent.starts_with(org_base.join("homes"))
+        || !identity_parent.ends_with(Path::new("cursor/.tightbeam/harness-processes"))
+    {
         return Err(
             "cursor execution identity refused: identity path is outside the managed base".into(),
         );
@@ -232,16 +269,43 @@ fn verify_launch_command(base: &Path, org_base: &Path, command: &[String]) -> Re
     let executable = fs::canonicalize(&command[3]).map_err(|error| {
         format!("cursor execution identity refused: adapter executable: {error}")
     })?;
-    let expected = fs::canonicalize(org_base.join("adapters/node_modules/.bin/cursor-agent"))
-        .map_err(|error| {
-            format!("cursor execution identity refused: managed Cursor adapter: {error}")
-        })?;
+    let expected = fs::canonicalize(
+        base.parent()
+            .ok_or_else(|| {
+                "cursor execution identity refused: managed base has no home".to_owned()
+            })?
+            .join(".local/share/cursor-agent/versions")
+            .join(CURSOR_VERSION)
+            .join("cursor-agent"),
+    )
+    .map_err(|error| {
+        format!("cursor execution identity refused: managed Cursor adapter: {error}")
+    })?;
     if executable != expected {
         return Err(
             "cursor execution identity refused: command is not the managed Cursor adapter".into(),
         );
     }
     Ok(())
+}
+
+fn verify_launch_args(args: &[String]) -> Result<&[String], String> {
+    if args.len() < 6 || args[5] != "--" {
+        return Err(usage().to_owned());
+    }
+    verify_identity(Path::new(&args[0]), Path::new(&args[1]), &args[2], &args[3])?;
+    let expected = &args[4];
+    if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("cursor execution identity refused: managed hook hash is invalid".into());
+    }
+    let hooks = account_named(ACCOUNT)?.home.join(".cursor/hooks.json");
+    let bytes = fs::read(&hooks).map_err(|error| {
+        format!("cursor execution identity refused: managed hooks are unreadable: {error}")
+    })?;
+    if format!("{:x}", Sha256::digest(&bytes)) != expected.to_ascii_lowercase() {
+        return Err("cursor execution identity refused: managed hook hash differs from the compiled projection".into());
+    }
+    Ok(&args[6..])
 }
 
 fn verify_args(args: &[String]) -> Result<&[String], String> {
@@ -292,6 +356,7 @@ fn verify_identity(
     }
     let actual_uid = unsafe { libc::geteuid() };
     let account = account_for_uid(actual_uid)?;
+    verify_dedicated_cursor_install(&account)?;
 
     if actual_uid == 0 || actual_uid == operator_uid {
         return Err(format!(
@@ -486,52 +551,63 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn fixture() -> PathBuf {
+    fn fixture() -> (PathBuf, PathBuf, PathBuf) {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let org = std::env::temp_dir().join(format!("tightbeam-cursor-identity-{nonce}"));
-        let base = org.join("cursor-execution");
-        fs::create_dir_all(base.join("harness-processes")).unwrap();
-        fs::create_dir_all(org.join("adapters/node_modules/.bin")).unwrap();
-        let adapter = org.join("adapters/node_modules/.bin/cursor-agent");
+        let base = org.join("exec-home/.tightbeam");
+        let identity_dir = org.join("homes/test/cursor/.tightbeam/harness-processes");
+        fs::create_dir_all(&base).unwrap();
+        fs::create_dir_all(&identity_dir).unwrap();
+        let adapter_dir = base
+            .parent()
+            .unwrap()
+            .join(".local/share/cursor-agent/versions")
+            .join(CURSOR_VERSION);
+        fs::create_dir_all(&adapter_dir).unwrap();
+        let adapter = adapter_dir.join("cursor-agent");
         fs::write(&adapter, "#!/bin/sh\n").unwrap();
         fs::set_permissions(&adapter, fs::Permissions::from_mode(0o755)).unwrap();
-        base
+        (base, org, identity_dir)
     }
 
     #[test]
     fn launch_command_must_use_the_managed_identity_and_adapter_paths() {
-        let base = fixture();
+        let (base, org, identity_dir) = fixture();
         let command = vec![
-            base.join("harness-processes/launch.identity")
-                .display()
-                .to_string(),
+            identity_dir.join("launch.identity").display().to_string(),
             "launch-id".to_owned(),
             "--".to_owned(),
             base.parent()
                 .unwrap()
-                .join("adapters/node_modules/.bin/cursor-agent")
+                .join(".local/share/cursor-agent/versions")
+                .join(CURSOR_VERSION)
+                .join("cursor-agent")
                 .display()
                 .to_string(),
+            "acp".to_owned(),
         ];
-        assert!(verify_launch_command(&base, base.parent().unwrap(), &command).is_ok());
+        assert!(verify_launch_command(&base, &org, &command).is_ok());
 
         let mut escaped = command.clone();
-        escaped[0] = base.join("elsewhere/launch.identity").display().to_string();
-        assert!(verify_launch_command(&base, base.parent().unwrap(), &escaped).is_err());
+        escaped[0] = org.join("elsewhere/launch.identity").display().to_string();
+        assert!(verify_launch_command(&base, &org, &escaped).is_err());
 
         let mut arbitrary = command;
         arbitrary[3] = "/bin/sh".to_owned();
-        assert!(verify_launch_command(&base, base.parent().unwrap(), &arbitrary).is_err());
-        fs::remove_dir_all(base.parent().unwrap()).unwrap();
+        assert!(verify_launch_command(&base, &org, &arbitrary).is_err());
+        fs::remove_dir_all(&org).unwrap();
     }
 
     #[test]
     fn admin_instructions_never_override_home_and_cover_both_platforms() {
-        let instructions =
-            admin_instructions(Path::new("/srv/tightbeam"), Path::new("/Users/operator"));
+        let instructions = admin_instructions(
+            Path::new("/srv/tightbeam"),
+            Path::new("/Users/operator"),
+            Path::new("/build/tightbeam"),
+        );
         assert!(!instructions.contains("HOME="));
         assert!(instructions.contains(ACCOUNT));
         assert!(instructions.contains(LAUNCHER));
@@ -539,5 +615,15 @@ mod tests {
         assert!(instructions.contains("visudo"));
         assert!(instructions.contains(CURSOR_VERSION));
         assert!(instructions.contains("/Users/operator/.cursor"));
+        assert!(instructions.contains("IsHidden 1"));
+        assert!(instructions.contains("/build/tightbeam"));
+    }
+
+    #[test]
+    fn installed_launcher_allows_only_cursor_exec() {
+        assert!(launcher_command_allowed(&["cursor-exec".to_owned()]));
+        for command in ["harness-exec", "rail-exec", "command-exec", "doctor"] {
+            assert!(!launcher_command_allowed(&[command.to_owned()]));
+        }
     }
 }

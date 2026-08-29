@@ -711,13 +711,18 @@ defmodule Tightbeam.PlacementTest do
 
     for module <- Tightbeam.Harness.all() do
       opts = Placement.adapter_opts!(config, {module.id(), "shared", "testhost"})
-      binary = if module.id() == :cursor, do: List.last(opts[:cmd]), else: hd(opts[:cmd])
+      binary = hd(opts[:cmd])
 
-      assert String.ends_with?(
-               binary,
-               Path.join(["adapters", "node_modules", ".bin", Path.basename(binary)])
-             ),
-             "#{module.wire_name()} local adapter is not under <base_dir>/adapters: #{binary}"
+      if module.id() == :cursor do
+        assert opts[:cmd] == [binary, "acp"]
+        assert Path.basename(Path.dirname(binary)) == "2026.08.11-e8db854"
+      else
+        assert String.ends_with?(
+                 binary,
+                 Path.join(["adapters", "node_modules", ".bin", Path.basename(binary)])
+               ),
+               "#{module.wire_name()} local adapter is not under <base_dir>/adapters: #{binary}"
+      end
 
       # The base_dir's unique final segment, rather than a prefix compare: macOS
       # resolves /var through /private and the two sides disagree on which form.
@@ -1442,6 +1447,34 @@ defmodule Tightbeam.PlacementTest do
 
     assert Tightbeam.Harness.Cursor.execution_home("/test/cursor-home") ==
              "/test/cursor-home"
+  end
+
+  test "Cursor delivery keeps the Homes projection outside the execution account home", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    execution_home = Path.join(base_dir, "dedicated-cursor-home")
+    File.mkdir_p!(Path.join(execution_home, ".cursor"))
+    File.mkdir_p!(Path.join(execution_home, ".tightbeam"))
+    sentinel = Path.join(execution_home, ".tightbeam/execution-owned")
+    File.write!(sentinel, "preserve")
+
+    config = %{
+      base_dir: base_dir,
+      db: db,
+      cwd: "/work",
+      cli_bin: "/local/bin",
+      default_model: Model.new("auto"),
+      cursor_execution_home: execution_home
+    }
+
+    projected = Placement.deliver_home(config, {:cursor, "default", "testhost"})
+
+    assert projected == Homes.home_path(base_dir, "testhost", :cursor)
+    refute projected == execution_home
+    assert File.read!(sentinel) == "preserve"
+    assert File.regular?(Path.join(execution_home, ".cursor/hooks.json"))
+    refute File.exists?(Path.join(execution_home, "cli-config.json"))
   end
 
   # wi_263814d3 — accepted-then-dead: the claude adapter's offered/accepted model

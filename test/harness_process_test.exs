@@ -416,8 +416,9 @@ defmodule Tightbeam.HarnessProcessTest do
     opts =
       HarnessProcess.prepare_launch(
         [
-          cmd: [Path.join(ctx.test_dir, "adapters/cursor-agent")],
+          cmd: [Path.join(ctx.test_dir, "adapters/cursor-agent"), "acp"],
           cursor_execution_identity: true,
+          cursor_rails_sha256: String.duplicate("a", 64),
           process_helper: @helper,
           process_identity_dir: ctx.test_dir
         ],
@@ -439,20 +440,41 @@ defmodule Tightbeam.HarnessProcessTest do
              org_base,
              operator_uid,
              operator_home,
+             rails_sha256,
              "--",
              identity_path,
              launch_id,
              "--",
-             adapter
+             adapter,
+             "acp"
            ] = Keyword.fetch!(opts, :cmd)
 
-    assert base == ctx.test_dir
+    assert base == Tightbeam.Harness.Cursor.execution_base(nil)
     assert org_base == @helper |> Path.dirname() |> Path.dirname()
     assert operator_uid == System.cmd("/usr/bin/id", ["-u"]) |> elem(0) |> String.trim()
     assert operator_home == System.user_home!()
+    assert rails_sha256 == String.duplicate("a", 64)
     assert identity_path =~ "/harness-processes/"
     assert is_binary(launch_id)
     assert adapter == Path.join(ctx.test_dir, "adapters/cursor-agent")
+    assert Bitwise.band(File.stat!(Path.dirname(identity_path)).mode, 0o7777) == 0o2770
+  end
+
+  test "Cursor execution identity refuses an SSH launch before wrapping it", ctx do
+    assert_raise ArgumentError, ~r/local-only; SSH hosts are unsupported/, fn ->
+      HarnessProcess.prepare_launch(
+        [
+          cmd: ["ssh", "worker", "cursor-agent", "acp"],
+          process_ssh: "worker",
+          cursor_execution_identity: true,
+          cursor_rails_sha256: String.duplicate("a", 64),
+          process_helper: @helper,
+          process_identity_dir: "/remote/cursor"
+        ],
+        ctx.db,
+        {:cursor, "shared", "worker"}
+      )
+    end
   end
 
   test "identity capture cannot mutate an already-resolved launch", ctx do
