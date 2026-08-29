@@ -9,6 +9,7 @@ defmodule Tightbeam.ArchetypesTest do
     on_exit(fn ->
       File.rm_rf!(base_dir)
       :persistent_term.erase(Tightbeam.Archetypes)
+      :persistent_term.erase(Tightbeam.Rails)
     end)
 
     %{base_dir: base_dir}
@@ -167,7 +168,7 @@ defmodule Tightbeam.ArchetypesTest do
              "human-communication"
            ]
 
-    for role <- ~w(coder orchestrator product-owner reviewer) do
+    for role <- ~w(coder orchestrator product-owner recon reviewer spec-writer) do
       assert "worktree-session" in loaded[role].skills
     end
 
@@ -224,21 +225,60 @@ defmodule Tightbeam.ArchetypesTest do
     assert {:ok, _revision} =
              Identity.learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
 
-    worktree_skill =
-      Identity.snapshot_at!(
-        ctx.base_dir,
-        Identity.live_revision!(ctx.base_dir),
-        "product-owner",
-        :codex
-      ).skills["worktree-session"]
+    revision = Identity.live_revision!(ctx.base_dir)
 
-    assert worktree_skill =~ "Preserve local-only work before retirement"
-    assert worktree_skill =~ "tracked, untracked, and ignored files"
-    assert worktree_skill =~ "every commit that must survive is pushed"
-    assert worktree_skill =~ "package the complete repository into a recovery archive"
-    assert worktree_skill =~ "tightbeam artifact-record"
-    assert worktree_skill =~ "does not prove byte custody"
-    assert worktree_skill =~ "do not retire the session"
+    for role <- ~w(coder orchestrator product-owner recon reviewer spec-writer) do
+      worktree_skill =
+        Identity.snapshot_at!(ctx.base_dir, revision, role, :codex).skills["worktree-session"]
+
+      assert worktree_skill =~ "Preserve local-only work before retirement"
+      assert worktree_skill =~ "tracked, untracked, and ignored files"
+      assert worktree_skill =~ "every commit that must survive is pushed"
+      assert worktree_skill =~ "package the complete repository into a recovery archive"
+      assert worktree_skill =~ "tightbeam artifact-record"
+      assert worktree_skill =~ "does not prove byte custody"
+      assert worktree_skill =~ "do not retire the session"
+    end
+
+    assert retirement_gate =
+             Enum.find(Rails.load!(ctx.base_dir), fn statute ->
+               statute.name == "preserve-repository-work-before-retire"
+             end)
+
+    assert retirement_gate.pattern ==
+             "(^|[^/[:alnum:]_-])tightbeam[[:space:]]+retire([[:space:]]|$)"
+
+    %{"hooks" => %{"PreToolUse" => entries}} = Rails.hook_settings()
+
+    retirement_entry =
+      Enum.find(entries, fn entry ->
+        [%{"command" => command}] = entry["hooks"]
+        command =~ "[gate: preserve-repository-work-before-retire]"
+      end)
+
+    assert retirement_entry
+    [%{"command" => command}] = retirement_entry["hooks"]
+
+    direct_call =
+      ~s({"tool_name":"Bash","tool_input":{"command":"tightbeam retire --session child"}})
+
+    {denial, 2} =
+      System.cmd("sh", ["-c", ~s(printf '%s' "$TB_RETIRE_GATE_INPUT" | ) <> command],
+        env: [{"TB_RETIRE_GATE_INPUT", direct_call}],
+        stderr_to_stdout: true
+      )
+
+    assert denial =~ "[gate: preserve-repository-work-before-retire]"
+    assert denial =~ "repository bytes have durable custody"
+
+    proved_call =
+      ~s({"tool_name":"Bash","tool_input":{"command":"/opt/tightbeam/bin/tightbeam retire --session child"}})
+
+    assert {"", 0} =
+             System.cmd("sh", ["-c", ~s(printf '%s' "$TB_RETIRE_GATE_INPUT" | ) <> command],
+               env: [{"TB_RETIRE_GATE_INPUT", proved_call}],
+               stderr_to_stdout: true
+             )
   end
 
   # Every archetype x both harnesses, and each `snapshot_at!` is a chain of

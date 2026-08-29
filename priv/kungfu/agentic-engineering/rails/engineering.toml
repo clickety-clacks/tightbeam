@@ -39,3 +39,16 @@ mode = "gate"
 tool = "Bash"
 pattern = "git[[:space:]]+restore"
 text = "You ran git restore; destructive git is forbidden on any worktree because it discards another agent's uncommitted work."
+
+# Seed-owned archetypes cannot lawfully elect bundle skills. This global KUNGFU
+# gate gives those identities the same retirement stop while leaving the
+# substrate and the operator-owned seed manifests untouched. The resolved-path
+# form is the deliberate post-proof ceremony; rails are accident-grade, so this
+# is a two-step stop, not a claim of adversarial containment.
+[[statute]]
+name = "preserve-repository-work-before-retire"
+on = "tool-call"
+mode = "gate"
+tool = "Bash"
+pattern = "(^|[^/[:alnum:]_-])tightbeam[[:space:]]+retire([[:space:]]|$)"
+text = "Direct retirement is blocked until repository bytes have durable custody. Inspect the target's complete workspace, including local commits and tracked, untracked, and ignored files. Push every commit that must survive. If local-only work remains, archive the complete repository outside the target workspace and record the archive on the work item. If you cannot inspect or preserve it, do not retire. After proof, invoke the resolved absolute tightbeam CLI path instead of the bare command."
