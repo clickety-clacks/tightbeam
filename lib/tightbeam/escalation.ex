@@ -2333,8 +2333,15 @@ defmodule Tightbeam.Escalation do
       message: "decision request integrity evidence #{suffix}"
     }
 
-  defp canonical_request_id?("dr_" <> rest), do: String.trim(rest) != ""
+  defp canonical_request_id?(id) when is_binary(id),
+    do:
+      Regex.match?(
+        ~r/\Adr_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\z/,
+        id
+      )
+
   defp canonical_request_id?(_id), do: false
+
   defp non_blank?(value), do: is_binary(value) and String.trim(value) != ""
   defp normalized_text?(value), do: non_blank?(value) and String.trim(value) == value
 

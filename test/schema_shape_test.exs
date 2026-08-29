@@ -288,48 +288,48 @@ defmodule Tightbeam.SchemaShapeTest do
       DROP TRIGGER decision_requests_terminal_update_guard;
       PRAGMA ignore_check_constraints=ON;
       INSERT INTO condition_facts (id,ts,kind,scope,origin) VALUES
-        (41,10,'escalation-ruled','dr_legacy_session','process:tightbeam'),
-        (42,11,'escalation-ruled','dr_legacy_no_session','process:tightbeam'),
-        (43,12,'escalation-ruled','dr_missing_decision','process:tightbeam'),
-        (44,13,'escalation-ruled','dr_missing_owner','process:tightbeam'),
-        (45,14,'escalation-ruled','dr_consumed','process:tightbeam'),
-        (46,15,'wrong-ruling-kind','dr_wrong_fact','process:tightbeam');
+        (41,10,'escalation-ruled','dr_00000000-0000-4000-8000-000000000006','process:tightbeam'),
+        (42,11,'escalation-ruled','dr_00000000-0000-4000-8000-000000000007','process:tightbeam'),
+        (43,12,'escalation-ruled','dr_00000000-0000-4000-8000-000000000002','process:tightbeam'),
+        (44,13,'escalation-ruled','dr_00000000-0000-4000-8000-000000000004','process:tightbeam'),
+        (45,14,'escalation-ruled','dr_00000000-0000-4000-8000-000000000001','process:tightbeam'),
+        (46,15,'wrong-ruling-kind','dr_00000000-0000-4000-8000-000000000005','process:tightbeam');
       INSERT INTO lifecycle_events (ts,kind,subject,detail) VALUES
-        (10,'decision_request_ruled','dr_legacy_session',NULL),
-        (11,'decision_request_ruled','dr_legacy_no_session',NULL),
-        (12,'decision_request_ruled','dr_missing_decision',NULL),
-        (13,'decision_request_ruled','dr_missing_owner',NULL),
-        (14,'decision_request_ruled','dr_consumed',NULL),
-        (15,'decision_request_ruled','dr_missing_fact',NULL),
-        (16,'decision_request_ruled','dr_wrong_fact',NULL);
+        (10,'decision_request_ruled','dr_00000000-0000-4000-8000-000000000006',NULL),
+        (11,'decision_request_ruled','dr_00000000-0000-4000-8000-000000000007',NULL),
+        (12,'decision_request_ruled','dr_00000000-0000-4000-8000-000000000002',NULL),
+        (13,'decision_request_ruled','dr_00000000-0000-4000-8000-000000000004',NULL),
+        (14,'decision_request_ruled','dr_00000000-0000-4000-8000-000000000001',NULL),
+        (15,'decision_request_ruled','dr_00000000-0000-4000-8000-000000000003',NULL),
+        (16,'decision_request_ruled','dr_00000000-0000-4000-8000-000000000005',NULL);
       INSERT INTO decision_requests
         (id,kind,raiserId,raiserSessionKey,ownerUserId,raisedAt,deadlineAt,
          actionKey,question,options,context,status,decision,rationale,ruledBy,
          ruledViaPrincipal,ruledViaSessionKey,ruledViaSessionState,ruledAt,
          rulingFactId,consumedAt)
       VALUES
-        ('dr_legacy_session','operator','agent:legacy','agent:legacy:session','mike',1,86400001,
+        ('dr_00000000-0000-4000-8000-000000000006','operator','agent:legacy','agent:legacy:session','mike',1,86400001,
          'legacy-session','legacy session?','[{"label":"yes"}]','{}','ruled','yes',NULL,
          'user:mike','user:mike','agent:presenter:legacy','known',10,41,NULL),
-        ('dr_legacy_no_session','operator','agent:legacy','agent:legacy:session','mike',2,86400002,
+        ('dr_00000000-0000-4000-8000-000000000007','operator','agent:legacy','agent:legacy:session','mike',2,86400002,
          'legacy-no-session','legacy no session?','[{"label":"yes"}]','{}','ruled','yes',NULL,
          'user:mike','user:mike',NULL,'none',11,42,NULL),
-        ('dr_missing_decision','operator','agent:legacy','agent:legacy:session','mike',3,86400003,
+        ('dr_00000000-0000-4000-8000-000000000002','operator','agent:legacy','agent:legacy:session','mike',3,86400003,
          'missing-decision','missing decision?','[{"label":"yes"}]','{}','ruled',NULL,NULL,
          'user:mike',NULL,NULL,NULL,12,43,NULL),
-        ('dr_missing_owner','operator','agent:legacy','agent:legacy:session','',4,86400004,
+        ('dr_00000000-0000-4000-8000-000000000004','operator','agent:legacy','agent:legacy:session','',4,86400004,
          'missing-owner','missing owner?','[{"label":"yes"}]','{}','ruled','yes',NULL,
          'user:',NULL,NULL,NULL,13,44,NULL),
-        ('dr_consumed','operator','agent:legacy','agent:legacy:session','mike',5,86400005,
+        ('dr_00000000-0000-4000-8000-000000000001','operator','agent:legacy','agent:legacy:session','mike',5,86400005,
          'consumed','consumed?','[{"label":"yes"}]','{}','consumed','yes',NULL,
          'user:mike',NULL,NULL,NULL,14,45,14),
-        ('dr_missing_fact','operator','agent:legacy','agent:legacy:session','mike',6,86400006,
+        ('dr_00000000-0000-4000-8000-000000000003','operator','agent:legacy','agent:legacy:session','mike',6,86400006,
          'missing-fact','missing fact?','[{"label":"yes"}]','{}','ruled','yes',NULL,
          'user:mike',NULL,NULL,NULL,15,999,NULL),
-        ('dr_wrong_fact','operator','agent:legacy','agent:legacy:session','mike',7,86400007,
+        ('dr_00000000-0000-4000-8000-000000000005','operator','agent:legacy','agent:legacy:session','mike',7,86400007,
          'wrong-fact','wrong fact?','[{"label":"yes"}]','{}','ruled','yes',NULL,
          'user:mike',NULL,NULL,NULL,16,46,NULL),
-        ('dr_future_open','operator','agent:legacy','agent:legacy:session','mike',8,86400008,
+        ('dr_00000000-0000-4000-8000-000000000008','operator','agent:legacy','agent:legacy:session','mike',8,86400008,
          'future-open','future open?','[{"label":"yes"}]','{}','open',NULL,NULL,
          NULL,NULL,NULL,NULL,NULL,NULL,NULL);
       PRAGMA ignore_check_constraints=OFF;
@@ -368,7 +368,7 @@ defmodule Tightbeam.SchemaShapeTest do
                  session: %{state: "known", key: "agent:presenter:legacy"}
                }
              }
-           } = Tightbeam.Escalation.get(db, call, "dr_legacy_session")
+           } = Tightbeam.Escalation.get(db, call, "dr_00000000-0000-4000-8000-000000000006")
 
     assert %{
              ruling_attribution: %{
@@ -377,10 +377,10 @@ defmodule Tightbeam.SchemaShapeTest do
                  session: %{state: "legacy-unknown"}
                }
              }
-           } = Tightbeam.Escalation.get(db, call, "dr_legacy_no_session")
+           } = Tightbeam.Escalation.get(db, call, "dr_00000000-0000-4000-8000-000000000007")
 
     expected_invalid =
-      ~w(dr_consumed dr_missing_decision dr_missing_fact dr_missing_owner dr_wrong_fact)
+      ~w(dr_00000000-0000-4000-8000-000000000001 dr_00000000-0000-4000-8000-000000000002 dr_00000000-0000-4000-8000-000000000003 dr_00000000-0000-4000-8000-000000000004 dr_00000000-0000-4000-8000-000000000005)
 
     assert {:ok, evidence} =
              DB.query(
@@ -394,13 +394,18 @@ defmodule Tightbeam.SchemaShapeTest do
              surface == "migration-preflight" and principal == "process:tightbeam"
            end)
 
-    for id <- ~w(dr_missing_decision dr_missing_fact dr_wrong_fact dr_consumed) do
+    for id <-
+          ~w(dr_00000000-0000-4000-8000-000000000002 dr_00000000-0000-4000-8000-000000000003 dr_00000000-0000-4000-8000-000000000005 dr_00000000-0000-4000-8000-000000000001) do
       assert %{code: "decision_request_integrity_invalid", request_id: ^id} =
                Tightbeam.Escalation.get(db, call, id)
     end
 
-    assert %{id: "dr_future_open", status: "open"} =
-             Tightbeam.Escalation.get(db, call, "dr_future_open")
+    assert %{id: "dr_00000000-0000-4000-8000-000000000008", status: "open"} =
+             Tightbeam.Escalation.get(
+               db,
+               call,
+               "dr_00000000-0000-4000-8000-000000000008"
+             )
 
     assert :ok = Schema.ensure_all(db)
 
@@ -413,19 +418,22 @@ defmodule Tightbeam.SchemaShapeTest do
     assert {:ok, _} =
              DB.query(
                db,
-               "INSERT INTO condition_facts (id,ts,kind,scope,origin) VALUES (47,17,'escalation-ruled','dr_future_open','process:tightbeam')"
+               "INSERT INTO condition_facts (id,ts,kind,scope,origin) VALUES (47,17,'escalation-ruled','dr_00000000-0000-4000-8000-000000000008','process:tightbeam')"
              )
 
     assert {:error, future_error} =
              DB.query(
                db,
-               "UPDATE decision_requests SET status='ruled',decision='yes',ruledBy='user:mike',ruledAt=17,rulingFactId=47 WHERE id='dr_future_open'"
+               "UPDATE decision_requests SET status='ruled',decision='yes',ruledBy='user:mike',ruledAt=17,rulingFactId=47 WHERE id='dr_00000000-0000-4000-8000-000000000008'"
              )
 
     assert Exception.message(future_error) =~ "decision_request_integrity_invalid"
 
     assert {:ok, [["open"]]} =
-             DB.query(db, "SELECT status FROM decision_requests WHERE id='dr_future_open'")
+             DB.query(
+               db,
+               "SELECT status FROM decision_requests WHERE id='dr_00000000-0000-4000-8000-000000000008'"
+             )
   end
 
   test "operator-decision migration survives a database-owner restart", %{db: _setup_db} do
