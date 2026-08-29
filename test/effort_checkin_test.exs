@@ -242,6 +242,68 @@ defmodule Tightbeam.EffortCheckinTest do
                """,
                [assignment.id]
              )
+
+    closed_item =
+      WorkItems.__handle__(ctx.db, "work-item-create", %{
+        verb: "work-item-create",
+        origin: "user:h1",
+        principal: {:user, "h1"},
+        session_key: nil,
+        params: %{title: "closed priority", priority: 4}
+      })
+
+    closed =
+      dispatch_for_item(
+        ctx,
+        {:session, "parent"},
+        "holder",
+        "closed priority",
+        closed_item.id
+      )
+
+    assignment(ctx, "attest", {:session, "holder"}, nil, %{
+      assignment_id: closed.id,
+      kind: "completion"
+    })
+
+    assert bracket_state(ctx.db, closed.id) == "canceled"
+
+    assert %{priority: 6} =
+             Gateway.handlers(ctx.config)["work-item-update"].(%{
+               verb: "work-item-update",
+               origin: "agent:holder",
+               principal: {:session, "holder"},
+               session_key: "holder",
+               params: %{work_item_id: closed_item.id, priority: 6}
+             })
+
+    assert [[6]] =
+             rows(
+               ctx.db,
+               "SELECT priority FROM assignment_priorities WHERE assignmentId=?1",
+               [closed.id]
+             )
+
+    reopened =
+      assignment(ctx, "reopen-assignment", {:session, "parent"}, nil, %{
+        assignment_id: closed.id,
+        reason: "the card carries work again"
+      })
+
+    assert reopened.state == "open"
+
+    assert [[2, "armed", 3_600_000, 3_600_000]] =
+             rows(
+               ctx.db,
+               """
+               SELECT g.generation,g.state,g.baseHorizonMs,w.dueAt-g.armedAt
+               FROM effort_checkin_generations AS g
+               JOIN wakes AS w ON w.wakeId=g.wakeId
+               WHERE g.assignmentId=?1
+               ORDER BY g.generation DESC LIMIT 1
+               """,
+               [closed.id]
+             )
   end
 
   test "a standing work-blocked fact suppresses the check and an ineligible icebox cancels it",
