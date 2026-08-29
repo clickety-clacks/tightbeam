@@ -3,6 +3,8 @@ defmodule Tightbeam.ArchetypesTest do
 
   alias Tightbeam.{Archetypes, Identity, Rails, Rules}
 
+  @golden_rule ~S("Pushing the product forwards is the goal of this kung-fu. No rule shall trump this rule. If there is a clear way forward, and that way forward is safe, then no rule, statute, or rail shall block it. If a rule, statute, or rail blocks this, it is necessarily wrong, and should be reported with a decision-request, but this DOES NOT BLOCK WORK. Get it done, and apologize later.")
+
   setup do
     base_dir = Path.join(System.tmp_dir!(), "tb-archetypes-#{System.unique_integer([:positive])}")
 
@@ -208,6 +210,37 @@ defmodule Tightbeam.ArchetypesTest do
                "SKILL.md"
              ])
            )
+  end
+
+  test "every engineering archetype serves the shared golden rule first", ctx do
+    Identity.init!(ctx.base_dir)
+
+    assert {:ok, _revision} =
+             Identity.learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
+
+    revision = Identity.live_revision!(ctx.base_dir)
+
+    archetype_paths =
+      Application.app_dir(:tightbeam, "priv/kungfu/agentic-engineering/archetypes/*.toml")
+      |> Path.wildcard()
+      |> Enum.sort()
+
+    assert archetype_paths != []
+
+    for path <- archetype_paths do
+      archetype = Archetypes.parse_manifest!(File.read!(path), path)
+
+      assert String.starts_with?(
+               String.trim_leading(archetype.guidance),
+               ~s(#include "golden-rule.md")
+             )
+
+      served =
+        Identity.snapshot_at!(ctx.base_dir, revision, archetype.name, :codex).guidance
+
+      assert served =~ "# Tightbeam · #{archetype.name}\n\n#{@golden_rule}"
+      refute served =~ ~s(#include ")
+    end
   end
 
   # Every archetype x both harnesses, and each `snapshot_at!` is a chain of
