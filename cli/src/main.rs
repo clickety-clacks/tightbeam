@@ -5,6 +5,7 @@ mod catalog_probe;
 mod ceremonies;
 mod child_process;
 mod contain;
+mod deploy;
 mod dispatch;
 mod harness_process;
 mod harnesses;
