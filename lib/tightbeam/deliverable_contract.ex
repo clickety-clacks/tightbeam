@@ -174,7 +174,7 @@ defmodule Tightbeam.DeliverableContract do
   defp validate_existing_schema!(db) do
     case DB.transaction(db, fn txn ->
            require_complete_schema!(txn)
-           validate_in_txn!(txn, true)
+           validate_in_txn!(txn)
          end) do
       {:ok, :ok} -> :ok
       {:error, %Inconsistent{} = error} -> raise error
@@ -199,7 +199,7 @@ defmodule Tightbeam.DeliverableContract do
            interrupt!(opts, :after_assignment_backfill)
            backfill_lineage(txn)
            interrupt!(opts, :after_product_lineage_capture)
-           validate_in_txn!(txn, true)
+           validate_in_txn!(txn)
            interrupt!(opts, :after_validation)
            interrupt!(opts, :before_stamp_update)
 
@@ -947,11 +947,11 @@ defmodule Tightbeam.DeliverableContract do
     error in MutationError -> inconsistent!(error.response.message)
   end
 
-  defp validate_in_txn!(txn, verify_product_owners) do
+  defp validate_in_txn!(txn) do
     validate_hashes!(txn)
     validate_cardinality!(txn)
     validate_bindings!(txn)
-    validate_lineage!(txn, verify_product_owners)
+    validate_lineage!(txn)
     validate_claims_and_closures!(txn)
     :ok
   end
@@ -1119,7 +1119,7 @@ defmodule Tightbeam.DeliverableContract do
     end)
   end
 
-  defp validate_lineage!(txn, verify_product_owners) do
+  defp validate_lineage!(txn) do
     required =
       Txn.q(
         txn,
@@ -1157,17 +1157,6 @@ defmodule Tightbeam.DeliverableContract do
           "SELECT productOwnerSessionKey,distance FROM assignment_product_owner_ancestry WHERE assignmentId=?1 ORDER BY distance",
           [assignment_id]
         )
-
-      if verify_product_owners do
-        expected =
-          chain
-          |> Enum.filter(&(&1.kind == "custom" and &1.archetype == "product-owner"))
-          |> Enum.map(&[&1.key, &1.distance])
-          |> Enum.sort_by(&List.last/1)
-
-        if actual != expected,
-          do: inconsistent!("assignment_product_owner_ancestry #{assignment_id}")
-      end
 
       Enum.each(actual, fn [key, distance] ->
         if expected_by_key[key] != distance,

@@ -105,7 +105,7 @@ defmodule Tightbeam.DeliverableContractTest do
            end)
   end
 
-  test "boot refuses ancestry that promotes an ordinary ancestor to product owner", ctx do
+  test "boot refuses captured product-owner ancestry outside the frozen spawn chain", ctx do
     main = Org.personal_session_key("flynn")
     session(ctx.db, "ordinary-ancestor", "flynn", %{spawned_by: main})
     session(ctx.db, "ordinary-child", "flynn", %{spawned_by: "ordinary-ancestor"})
@@ -116,7 +116,7 @@ defmodule Tightbeam.DeliverableContractTest do
     assert {:ok, _} =
              DB.query(
                ctx.db,
-               "INSERT INTO assignment_product_owner_ancestry (assignmentId,productOwnerSessionKey,distance) VALUES (?1,'ordinary-ancestor',1)",
+               "INSERT INTO assignment_product_owner_ancestry (assignmentId,productOwnerSessionKey,distance) VALUES (?1,'other-holder',1)",
                [assignment.id]
              )
 
@@ -557,6 +557,8 @@ defmodule Tightbeam.DeliverableContractTest do
 
     {:ok, _} =
       DB.query(ctx.db, "UPDATE sessions SET archetype='default' WHERE sessionKey='product-owner'")
+
+    assert :ok = DeliverableContract.ensure_schema(ctx.db)
 
     assert %{ok: true, workItem: closed} =
              close(
